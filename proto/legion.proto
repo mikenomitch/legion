@@ -1645,6 +1645,16 @@ message TaskIndexUsage {
   // Why no index served when one might have been expected to — e.g.
   // "no usable index: gpu needs [region]". Empty otherwise.
   string reason = 9;
+
+  // When bounded candidate scoring engaged for any of this task's
+  // placements (the fleet-size threshold in the manager's
+  // `schedulerSettings.score_sample` was met), the number of eligible
+  // nodes actually scored per placement: the placement is the best of
+  // this many uniformly drawn feasible candidates rather than of every
+  // feasible node. 0 means every placement was scored exactly.
+  // Feasibility (constraints, permits, resources) is never sampled — a
+  // sampled placement is always a valid one.
+  uint32 score_sampled = 10;
 }
 
 // Planned allocation display item.

@@ -1453,12 +1453,28 @@ async fn plan_job(arg_matches: &ArgMatches) -> R<()> {
             .iter()
             .filter_map(|usage| {
                 if usage.index.is_empty() {
-                    if usage.reason.is_empty() {
+                    if usage.reason.is_empty() && usage.score_sampled == 0 {
                         return None;
                     }
-                    return Some(format!("{}: scan — {}", usage.task_name, usage.reason));
+                    let mut line = format!("{}: scan", usage.task_name);
+                    if !usage.reason.is_empty() {
+                        line.push_str(&format!(" — {}", usage.reason));
+                    }
+                    if usage.score_sampled > 0 {
+                        line.push_str(&format!(
+                            "; scored best of {} sampled nodes",
+                            usage.score_sampled
+                        ));
+                    }
+                    return Some(line);
                 }
                 let mut notes = Vec::new();
+                if usage.score_sampled > 0 {
+                    notes.push(format!(
+                        "scored best of {} sampled nodes",
+                        usage.score_sampled
+                    ));
+                }
                 if usage.truncated {
                     notes.push("truncated".to_string());
                 }

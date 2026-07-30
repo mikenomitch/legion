@@ -3226,6 +3226,7 @@ impl Manager for ManagerDaemonService {
                 fell_back: usage.fell_back,
                 shadow_agreement: usage.shadow_agreement,
                 reason: usage.reason.unwrap_or_default(),
+                score_sampled: usage.score_sampled.unwrap_or_default() as u32,
             })
             .collect();
 

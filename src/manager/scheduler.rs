@@ -8,7 +8,7 @@ use serde_json::Value;
 
 use libloading::Library;
 use rand::seq::SliceRandom;
-use rand::{rngs::StdRng, SeedableRng};
+use rand::{rngs::StdRng, Rng, SeedableRng};
 
 use crate::constraints::{AffinitySet, ConstraintSet, DistinctTracker, PermitSet};
 use crate::prelude::*;
@@ -132,6 +132,12 @@ pub struct TaskIndexUsage {
     pub shadow_agreement: Option<bool>,
     /// Why no index served, when one was expected to (`None` otherwise).
     pub reason: Option<String>,
+    /// `Some(sample)` when bounded candidate scoring
+    /// (`schedulerSettings.score_sample`) engaged for any of this task's
+    /// placements: the placement was chosen as the best of `sample`
+    /// uniformly drawn eligible nodes instead of exact scoring over all of
+    /// them. `None` = every placement scored exactly.
+    pub score_sampled: Option<usize>,
 }
 
 impl TaskIndexUsage {
@@ -146,6 +152,7 @@ impl TaskIndexUsage {
             fell_back: false,
             shadow_agreement: None,
             reason: None,
+            score_sampled: None,
         }
     }
 }
@@ -175,6 +182,20 @@ struct CapacitySnapshot {
 enum NodesConsidered {
     Count(u64),
     Percent(f64),
+}
+
+/// Bounded candidate scoring (`schedulerSettings.score_sample`,
+/// bounded-candidate-scoring plan): below `min_nodes` eligible candidates a
+/// placement scores every one of them (exactly today's behavior); at or
+/// above it, scoring runs on `sample` uniformly drawn candidates —
+/// best-of-k selection, which keeps per-placement cost flat as the fleet
+/// grows. Feasibility (constraints, permits, resources, distinct) is never
+/// sampled: a drawn candidate is always a valid placement, only the score
+/// *ranking* is approximate.
+#[derive(Debug, Clone, Copy)]
+struct ScoreSample {
+    min_nodes: usize,
+    sample: usize,
 }
 
 /// Plan-time free-capacity ledger. Pools are `Arc`'d straight off the
@@ -1149,6 +1170,7 @@ impl<'a> Scheduler<'a> {
         let mut planned: HashMap<String, usize> = HashMap::new();
         let weights = self.scheduler_weights()?;
         let nodes_considered_setting = self.nodes_considered_setting()?;
+        let score_sample_setting = self.score_sample_setting()?;
         let mut reschedule_rng = if matches!(mode, PlanMode::Reschedule) {
             Some(reschedule_rng())
         } else {
@@ -1400,6 +1422,7 @@ impl<'a> Scheduler<'a> {
                         &mut planned,
                         &mut reschedule_rng,
                         nodes_considered_setting.as_ref(),
+                        score_sample_setting.as_ref(),
                         &mut nodes_considered_rng,
                         &node_lookup,
                         &mut resource_ledger,
@@ -1446,6 +1469,7 @@ impl<'a> Scheduler<'a> {
                     &mut planned,
                     &mut reschedule_rng,
                     nodes_considered_setting.as_ref(),
+                    score_sample_setting.as_ref(),
                     &mut nodes_considered_rng,
                     &node_lookup,
                     &mut resource_ledger,
@@ -1765,6 +1789,7 @@ impl<'a> Scheduler<'a> {
         planned: &mut HashMap<String, usize>,
         reschedule_rng: &mut Option<StdRng>,
         nodes_considered_setting: Option<&NodesConsidered>,
+        score_sample_setting: Option<&ScoreSample>,
         nodes_considered_rng: &mut StdRng,
         node_lookup: &HashMap<&'b str, &'b Node>,
         resource_ledger: &mut ResourceLedger,
@@ -1959,6 +1984,8 @@ impl<'a> Scheduler<'a> {
                         eligible,
                         reschedule_rng,
                         nodes_considered_setting,
+                        score_sample_setting,
+                        &mut plan.index_usage.score_sampled,
                         nodes_considered_rng,
                         task_id,
                         task_config,
@@ -1980,6 +2007,8 @@ impl<'a> Scheduler<'a> {
                     eligible,
                     reschedule_rng,
                     nodes_considered_setting,
+                    score_sample_setting,
+                    &mut plan.index_usage.score_sampled,
                     nodes_considered_rng,
                     task_id,
                     task_config,
@@ -2028,11 +2057,14 @@ impl<'a> Scheduler<'a> {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn select_node_id(
         &self,
         eligible: Vec<&Node>,
         reschedule_rng: &mut Option<StdRng>,
         nodes_considered_setting: Option<&NodesConsidered>,
+        score_sample_setting: Option<&ScoreSample>,
+        score_sampled: &mut Option<usize>,
         nodes_considered_rng: &mut StdRng,
         task_id: i64,
         task_config: &TaskConfig,
@@ -2051,6 +2083,12 @@ impl<'a> Scheduler<'a> {
             nodes_considered_setting,
             nodes_considered_rng,
         )?;
+        let eligible = Self::apply_score_sample(
+            eligible,
+            score_sample_setting,
+            nodes_considered_rng,
+            score_sampled,
+        );
 
         if matches!(self.policy.name(), "bin_pack" | "spread") {
             let selected = if let Some(rng) = reschedule_rng.as_mut() {
@@ -2537,6 +2575,71 @@ impl<'a> Scheduler<'a> {
         }
 
         Some(tracker)
+    }
+
+    /// Bounded candidate scoring: when armed and the eligible list is at
+    /// least `min_nodes`, score `sample` uniformly drawn candidates instead
+    /// of all of them (best-of-k). Below the threshold the list is returned
+    /// untouched — bit-for-bit today's exact scoring. Records the sample
+    /// size in `score_sampled` for the `job plan` explain surface.
+    fn apply_score_sample<'b>(
+        eligible: Vec<&'b Node>,
+        setting: Option<&ScoreSample>,
+        rng: &mut StdRng,
+        score_sampled: &mut Option<usize>,
+    ) -> Vec<&'b Node> {
+        let Some(setting) = setting else {
+            return eligible;
+        };
+        if eligible.len() < setting.min_nodes || eligible.len() <= setting.sample {
+            return eligible;
+        }
+        let mut eligible = eligible;
+        // Partial Fisher-Yates: the first `sample` slots become a uniform
+        // draw without replacement; the tail is never shuffled.
+        for index in 0..setting.sample {
+            let other = rng.gen_range(index..eligible.len());
+            eligible.swap(index, other);
+        }
+        eligible.truncate(setting.sample);
+        *score_sampled = Some(setting.sample);
+        eligible
+    }
+
+    /// `schedulerSettings.score_sample` — bounded candidate scoring
+    /// (`{ min_nodes, sample }`), off unless configured. Only meaningful
+    /// for the built-in scoring policies, like `nodes_considered`.
+    fn score_sample_setting(&self) -> R<Option<ScoreSample>> {
+        if !matches!(self.policy.name(), "bin_pack" | "spread") {
+            return Ok(None);
+        }
+        let Some(settings) = self.store.scheduler_settings.as_ref() else {
+            return Ok(None);
+        };
+        let Some(raw) = settings.get("score_sample") else {
+            return Ok(None);
+        };
+        let map = raw
+            .as_object()
+            .context("schedulerSettings.score_sample must be an object { min_nodes, sample }")?;
+        let sample =
+            map.get("sample")
+                .and_then(Value::as_u64)
+                .context("score_sample.sample must be a positive integer")? as usize;
+        let min_nodes =
+            map.get("min_nodes")
+                .and_then(Value::as_u64)
+                .context("score_sample.min_nodes must be a positive integer")? as usize;
+        if sample < 2 {
+            bail!("score_sample.sample must be at least 2");
+        }
+        if min_nodes < sample {
+            bail!(
+                "score_sample.min_nodes ({min_nodes}) must be at least score_sample.sample \
+                 ({sample}): below the threshold scoring is exact"
+            );
+        }
+        Ok(Some(ScoreSample { min_nodes, sample }))
     }
 
     /// `schedulerSettings.lazy_version_sample` — default true. The escape
@@ -5372,6 +5475,138 @@ mod tests {
             "the lazy-sampled apply must have bumped the node epoch"
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn score_sample_stays_exact_below_the_threshold() -> R<()> {
+        let store = setup_store_with_scheduler(
+            "bin_pack",
+            Some(json!({ "score_sample": { "min_nodes": 64, "sample": 8 } })),
+        )?;
+        for index in 0..6 {
+            store.insert_node(make_node_msg(&format!("node-{index}"), json!({})))?;
+        }
+        let job_config_id = submit_job(
+            &store,
+            "sample-below",
+            vec![TaskConfig {
+                count: TaskCount::new(4),
+                ..TaskConfig::new("api", "noop")
+            }],
+        )?;
+        let scheduler = Scheduler::new(&store)?;
+        let (placements, report) =
+            scheduler.plan_only_with_report(&job_config_id, PlanMode::Fresh)?;
+        assert_eq!(placements.len(), 4);
+        assert!(
+            report.iter().all(|usage| usage.score_sampled.is_none()),
+            "below min_nodes scoring must be exact: {report:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn score_sample_engages_above_the_threshold_and_reports_it() -> R<()> {
+        let store = setup_store_with_scheduler(
+            "bin_pack",
+            Some(json!({ "score_sample": { "min_nodes": 8, "sample": 3 } })),
+        )?;
+        for index in 0..12 {
+            store.insert_node(make_node_msg(&format!("node-{index:02}"), json!({})))?;
+        }
+        let job_config_id = submit_job(
+            &store,
+            "sample-above",
+            vec![TaskConfig {
+                count: TaskCount::new(5),
+                ..TaskConfig::new("api", "noop")
+            }],
+        )?;
+        let scheduler = Scheduler::new(&store)?;
+        let (placements, report) =
+            scheduler.plan_only_with_report(&job_config_id, PlanMode::Fresh)?;
+        assert_eq!(placements.len(), 5);
+        assert_eq!(
+            report.first().and_then(|usage| usage.score_sampled),
+            Some(3),
+            "sampling must engage and be reported: {report:?}"
+        );
+        // Every sampled placement is still a real node from the fleet.
+        for placement in &placements {
+            assert!(placement.node_id.starts_with("node-"));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn score_sample_settings_are_validated() -> R<()> {
+        for bad in [
+            json!({ "score_sample": { "min_nodes": 8, "sample": 1 } }),
+            json!({ "score_sample": { "min_nodes": 4, "sample": 8 } }),
+            json!({ "score_sample": { "sample": 8 } }),
+            json!({ "score_sample": "128" }),
+        ] {
+            let store = setup_store_with_scheduler("bin_pack", Some(bad.clone()))?;
+            store.insert_node(make_node_msg("node-a", json!({})))?;
+            let job_config_id =
+                submit_job(&store, "sample-bad", vec![TaskConfig::new("api", "noop")])?;
+            let scheduler = Scheduler::new(&store)?;
+            assert!(
+                scheduler
+                    .plan_only(&job_config_id, PlanMode::Fresh)
+                    .is_err(),
+                "malformed setting must be rejected: {bad}"
+            );
+        }
+        Ok(())
+    }
+
+    /// The bounded-candidate-scoring quality gate: best-of-k bin packing
+    /// must stay within a bound of exact packing (power-of-k-choices), and
+    /// far from uniform-random placement. 100 independent one-GiB tasks
+    /// (distinct tasks and groups, so automatic anti-affinity does not
+    /// engage) over 40 eight-GiB nodes: exact bin_pack packs onto
+    /// ceil(100/8) = 13 nodes; uniform random would touch essentially the
+    /// whole fleet (~37 of 40). The sampled run must place everything and
+    /// stay ≤ 32 nodes — loose enough to hold with high probability under
+    /// an unseeded RNG, tight enough that a regression to unsampled
+    /// uniform behavior fails.
+    #[test]
+    fn score_sample_bin_pack_quality_stays_bounded() -> R<()> {
+        let placements_for = |settings: Option<Value>| -> R<usize> {
+            let store = setup_store_with_scheduler("bin_pack", settings)?;
+            for index in 0..40 {
+                store.insert_node(make_node_msg(&format!("node-{index:02}"), json!({})))?;
+            }
+            let tasks = (0..100)
+                .map(|index| TaskConfig {
+                    group: format!("group-{index}"),
+                    resources: json!({ "memory": 1024 }),
+                    ..TaskConfig::new(&format!("task-{index}"), "noop")
+                })
+                .collect();
+            let job_config_id = submit_job(&store, "quality", tasks)?;
+            let scheduler = Scheduler::new(&store)?;
+            let placements = scheduler.plan_only(&job_config_id, PlanMode::Fresh)?;
+            assert_eq!(placements.len(), 100, "every allocation must place");
+            let nodes_used: HashSet<&str> = placements
+                .iter()
+                .map(|placement| placement.node_id.as_str())
+                .collect();
+            Ok(nodes_used.len())
+        };
+
+        let exact = placements_for(None)?;
+        assert_eq!(exact, 13, "exact bin_pack packs onto ceil(100/8) nodes");
+
+        let sampled = placements_for(Some(
+            json!({ "score_sample": { "min_nodes": 8, "sample": 8 } }),
+        ))?;
+        assert!(
+            sampled <= 32,
+            "best-of-8 packing must stay within the quality bound: used {sampled} nodes"
+        );
         Ok(())
     }
 
