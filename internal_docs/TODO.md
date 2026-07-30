@@ -28,6 +28,17 @@ How to use it:
 
 ## Scheduling & placement
 
+- [ ] **Late-binding plan apply** — plans carry a ranked candidate list per
+      placement and the applier binds to the first candidate whose node epoch
+      is unchanged, so parallel submits racing for the same node cost a rank
+      instead of a conflict retry — [plan](plans/late-binding-plan-apply-plan.md)
+      (PLANNED: contention benchmark → requeue-not-fail backstop → candidate
+      walk for single-placement plans → coupling components). Fixes the
+      parallel-sandbox pathology: today concurrent Fresh-mode planners all
+      pick the same argmax node, and an eval that loses
+      `plan_conflict_max_retries` (default 3) races is failed terminally and
+      never retried. Phase 0 also delivers the raft-mode concurrent-planning
+      test tracked below.
 - [ ] Worker groups + taint/toleration equivalent. Node pools exist as an ACL
       and config concept but nothing scheduling-side consumes them.
 - [ ] Priorities and eviction/preemption, with eviction toggled at the pool level
