@@ -55,10 +55,14 @@ impl WorkerCredentials {
         request
     }
 
-    fn store_node_token(&self, token: Option<String>) {
+    pub(crate) fn store_node_token(&self, token: Option<String>) {
         if let Ok(mut current) = self.node_token.write() {
             *current = token;
         }
+    }
+
+    pub(crate) fn join_secret(&self) -> Option<&String> {
+        self.join_secret.as_ref()
     }
 }
 
@@ -289,7 +293,7 @@ async fn run_worker_with_manager(
 }
 
 #[instrument(err, skip_all)]
-async fn connect_manager_with_retry(manager_addr: &str) -> R<ManagerClient<Channel>> {
+pub(crate) async fn connect_manager_with_retry(manager_addr: &str) -> R<ManagerClient<Channel>> {
     let mut backoff = Duration::from_millis(200);
     let max_backoff = Duration::from_secs(5);
 
