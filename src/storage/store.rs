@@ -146,6 +146,21 @@ pub struct SchedulingReadModel {
     /// PUBLISHED after them), so a torn view can only make the CAS
     /// conservative (a spurious reject + retry), never permissive.
     pub scope_epochs: HashMap<String, i64>,
+    /// Publish counter for allocation-visible state: bumped (under the same
+    /// write lock) every time `allocations_by_node`/`scope_epochs` are
+    /// published — the per-scope refresh funnel, node removal, and full
+    /// model rebuilds (which carry the previous value forward, +1).
+    ///
+    /// This is what makes the LAZY optimistic-concurrency sample sound
+    /// (plan-path scale levers, D4): the scheduler reads `(capacity,
+    /// generation)` under one guard, plans, then reads `(epochs,
+    /// generation)` under one guard. An unchanged generation proves no
+    /// allocation publish happened in between, so the late epoch sample is
+    /// exactly what a pre-capacity sample would have returned — the "sample
+    /// no later than the capacity read" fence invariant holds. A moved
+    /// generation proves nothing either way, so the scheduler falls back to
+    /// the eager whole-fleet sample.
+    pub generation: u64,
 }
 
 #[derive(Debug)]
@@ -183,8 +198,10 @@ pub struct DeclaredService {
 }
 
 /// What [`Store::plan_capacity_snapshot`] hands the scheduler: current
-/// allocations by node plus the cached free pools, cloned under one guard.
-pub(crate) type PlanCapacityParts = (SharedNodeAllocations, HashMap<String, ResourcePool>);
+/// allocations by node plus the cached free pools, cloned under one guard,
+/// and the read-model generation those were published at (the lazy
+/// version-sample fence — see [`SchedulingReadModel::generation`]).
+pub(crate) type PlanCapacityParts = (SharedNodeAllocations, HashMap<String, ResourcePool>, u64);
 
 #[derive(Debug, Clone)]
 pub struct PlanSubmission {
@@ -1584,6 +1601,9 @@ impl Store {
             indexes: IndexSet::new(Arc::clone(&self.index_settings)),
             node_pools: HashMap::new(),
             scope_epochs,
+            // Placeholder: `refresh_read_model` overwrites this with the
+            // previous model's counter + 1 when it publishes the rebuild.
+            generation: 0,
         };
         let id_refs: Vec<&str> = node_ids.iter().map(String::as_str).collect();
         Self::reproject_model_nodes(&mut model, &self.resource_policy, &id_refs);
@@ -1639,7 +1659,12 @@ impl Store {
         }
         let model = self.load_read_model()?;
         let mut guard = self.read_model_writer()?;
+        // A full rebuild is an allocation publish like any other: carry the
+        // counter forward (+1) so a plan spanning the rebuild falls back to
+        // the eager sample instead of trusting a pre-rebuild capacity read.
+        let next_generation = guard.generation.wrapping_add(1);
         *guard = model;
+        guard.generation = next_generation;
         Ok(())
     }
 
@@ -1703,6 +1728,8 @@ impl Store {
         guard.allocations_by_node.remove(id);
         guard.indexes.remove_node(id);
         guard.node_pools.remove(id);
+        // Removing a node removes its allocations from the capacity view.
+        guard.generation = guard.generation.wrapping_add(1);
         Ok(())
     }
 
@@ -1756,6 +1783,10 @@ impl Store {
         for (key, epoch) in epochs {
             guard.scope_epochs.insert(key, epoch);
         }
+        // Every allocation/epoch publish funnels through here; the bump is
+        // what lets in-flight lazy-sample plans detect this publish (see
+        // `SchedulingReadModel::generation`).
+        guard.generation = guard.generation.wrapping_add(1);
         let affected: Vec<&str> = node_ids.iter().map(String::as_str).collect();
         Self::reproject_model_nodes(&mut guard, &self.resource_policy, &affected);
         Ok(())
@@ -1864,13 +1895,21 @@ impl Store {
 
     /// The scheduler's per-plan capacity snapshot: current allocations and
     /// the cached free pools, cloned under ONE read guard so they can never
-    /// disagree with each other. Taken after the plan's epoch sample (the
-    /// fence rule: sample no later than the capacity read), so any mutation
-    /// that lands after this snapshot bumps an epoch the apply-time
-    /// compare-and-set checks.
+    /// disagree with each other, plus the generation they were published at.
+    ///
+    /// The fence rule is "epoch sample no later than the capacity read".
+    /// The eager path satisfies it by sampling before calling this; the
+    /// lazy path satisfies it retroactively — it samples *after* planning
+    /// via [`Store::expected_versions_if_unchanged`], which only returns a
+    /// sample if the generation still equals the one returned here (proving
+    /// the late sample equals a pre-capacity one).
     pub(crate) fn plan_capacity_snapshot(&self) -> R<PlanCapacityParts> {
         let guard = self.read_model_reader()?;
-        Ok((guard.allocations_by_node.clone(), guard.node_pools.clone()))
+        Ok((
+            guard.allocations_by_node.clone(),
+            guard.node_pools.clone(),
+            guard.generation,
+        ))
     }
 
     /// Runs one scheduling-index candidate query under the read-model lock
@@ -1968,6 +2007,51 @@ impl Store {
             versions.insert(key, epoch);
         }
         Ok(versions)
+    }
+
+    /// The LAZY optimistic-concurrency sample (plan-path scale levers, D4):
+    /// epochs for exactly the scopes a finished plan touches — job config
+    /// plus affected nodes — instead of the whole candidate fleet.
+    ///
+    /// Sampling *after* planning is only sound if nothing was published
+    /// between the capacity read the plan was built against and this
+    /// sample; the generation check proves exactly that (both reads happen
+    /// under the read-model guard, and every publish bumps the counter
+    /// under the write guard — see [`SchedulingReadModel::generation`]).
+    /// Returns `None` when the generation moved: the caller must fall back
+    /// to the eager pre-planning sample
+    /// ([`Self::allocation_version_vector_for_candidates`]) and re-plan.
+    ///
+    /// Missing mirror entries sample `0` with the same conservative
+    /// semantics as the eager path.
+    pub fn expected_versions_if_unchanged(
+        &self,
+        job_config_id: &str,
+        affected_nodes: &HashSet<String>,
+        generation: u64,
+    ) -> R<Option<BTreeMap<String, i64>>> {
+        let guard = self.read_model_reader()?;
+        if guard.generation != generation {
+            return Ok(None);
+        }
+        let mut versions = BTreeMap::new();
+        let job_key = Self::scope_vector_key("job_config", job_config_id);
+        versions.insert(
+            job_key.clone(),
+            guard.scope_epochs.get(&job_key).copied().unwrap_or(0),
+        );
+        for node_id in affected_nodes {
+            let key = Self::scope_vector_key("node", node_id);
+            let epoch = guard.scope_epochs.get(&key).copied().unwrap_or(0);
+            versions.insert(key, epoch);
+        }
+        Ok(Some(versions))
+    }
+
+    /// Current read-model generation (see
+    /// [`SchedulingReadModel::generation`]).
+    pub fn read_model_generation(&self) -> R<u64> {
+        Ok(self.read_model_reader()?.generation)
     }
 
     fn allocation_epoch_for_scope(&self, scope_type: &str, scope_id: &str) -> R<i64> {
@@ -14034,6 +14118,94 @@ mod tests {
         assert_eq!(after, per_scope, "batched read must match per-scope reads");
         assert_eq!(after.get("node:node-a").copied(), Some(1));
         assert_eq!(after.get("node:node-b").copied(), Some(0));
+
+        Ok(())
+    }
+
+    #[test]
+    fn read_model_generation_bumps_on_allocation_publish() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "ready"))?;
+
+        let job = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "job-generation".into(),
+            tasks: vec![TaskConfig::new("task", "noop")],
+            version: None,
+        };
+        store.handle_job_submit(
+            &job,
+            &[Submission {
+                path: "job.jsonnet".into(),
+                content: "job".into(),
+                is_primary: true,
+            }],
+        )?;
+        let task_id = task_id_for(&store, "task", "job-generation")?;
+
+        let quiet_a = store.read_model_generation()?;
+        let quiet_b = store.read_model_generation()?;
+        assert_eq!(quiet_a, quiet_b, "reads alone must not move the counter");
+
+        store.place_alloc("node-a", task_id)?;
+        let after_place = store.read_model_generation()?;
+        assert!(
+            after_place > quiet_b,
+            "an allocation publish must bump the generation"
+        );
+
+        // A full rebuild is a publish too (it may change anything).
+        store.refresh_read_model()?;
+        let after_refresh = store.read_model_generation()?;
+        assert!(after_refresh > after_place);
+
+        Ok(())
+    }
+
+    #[test]
+    fn lazy_expected_versions_match_eager_when_quiet_and_bail_on_publish() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "ready"))?;
+        store.insert_node(make_node_msg("node-b", "ready"))?;
+
+        let job = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "job-lazy".into(),
+            tasks: vec![TaskConfig::new("task", "noop")],
+            version: None,
+        };
+        store.handle_job_submit(
+            &job,
+            &[Submission {
+                path: "job.jsonnet".into(),
+                content: "job".into(),
+                is_primary: true,
+            }],
+        )?;
+        let job_config_id = store.get_job_config("job-lazy")?.id();
+        let task_id = task_id_for(&store, "task", "job-lazy")?;
+        store.place_alloc("node-a", task_id)?;
+
+        // Quiet read model: the late sample is available and equals the
+        // eager path's selection for the same affected scopes.
+        let generation = store.read_model_generation()?;
+        let affected = HashSet::from(["node-a".to_string()]);
+        let lazy = store
+            .expected_versions_if_unchanged(&job_config_id, &affected, generation)?
+            .expect("generation unchanged: the lazy sample must be available");
+        let eager = store.allocation_version_vector(&job_config_id, &affected)?;
+        assert_eq!(lazy, eager, "lazy sample must equal the eager sample");
+
+        // A publish between the capacity read and the late sample voids it.
+        store.place_alloc("node-b", task_id)?;
+        assert!(
+            store
+                .expected_versions_if_unchanged(&job_config_id, &affected, generation)?
+                .is_none(),
+            "a moved generation must force the eager fallback"
+        );
 
         Ok(())
     }

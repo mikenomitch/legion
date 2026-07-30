@@ -165,6 +165,10 @@ struct CapacitySnapshot {
     allocations_by_node: SharedNodeAllocations,
     pools: HashMap<String, ResourcePool>,
     freed_nodes: HashSet<String>,
+    /// Read-model generation this snapshot was published at — what the
+    /// lazy version sample compares against at submit time (see
+    /// `Store::expected_versions_if_unchanged`).
+    generation: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -601,7 +605,7 @@ impl<'a> Scheduler<'a> {
         &self,
         should_drop: Option<&dyn Fn(&Allocation) -> bool>,
     ) -> R<CapacitySnapshot> {
-        let (mut allocations_by_node, pools) = self.store.plan_capacity_snapshot()?;
+        let (mut allocations_by_node, pools, generation) = self.store.plan_capacity_snapshot()?;
         let mut freed_nodes = HashSet::new();
         if let Some(should_drop) = should_drop {
             for (node_id, allocations) in allocations_by_node.iter_mut() {
@@ -619,6 +623,7 @@ impl<'a> Scheduler<'a> {
             allocations_by_node,
             pools,
             freed_nodes,
+            generation,
         })
     }
 
@@ -736,147 +741,199 @@ impl<'a> Scheduler<'a> {
         let started = std::time::Instant::now();
         let mut timings = PlanTimings::default();
         info!(%job_config_id, mode = mode.as_str(), target_override = task_targets.is_some(), "Starting scheduler plan_and_apply");
-        let mut nodes = self.available_nodes()?;
-        if let Some(excluded) = excluded_nodes {
-            nodes.retain(|node| !excluded.contains(&node.id));
-        }
-        timings.available_nodes_us = started.elapsed().as_micros() as u64;
-        if nodes.is_empty() {
-            bail!("No nodes available to place allocations");
-        }
 
-        // Optimistic-concurrency fence, sampled HERE — before the capacity
-        // snapshot below (`capacity_snapshot`) that `build_plan` places
-        // against.
+        // Optimistic-concurrency fence. Every transaction that mutates a
+        // scope's allocations bumps that scope's epoch
+        // (`bump_epochs_for_allocations_tx`), and `apply_plan_submission`
+        // re-reads these epochs inside its write transaction and refuses the
+        // plan if any of them moved. So what the epochs fence is: "nothing
+        // changed the allocations I planned against between the moment I
+        // read them and the moment I write". That only holds if the epoch
+        // sample is taken no later than the capacity read the plan is built
+        // against — a sample taken after planning could see a *post-bump*
+        // value from a competing plan, pass the compare-and-set, and commit
+        // placements against capacity that no longer exists.
         //
-        // Every transaction that mutates a scope's allocations bumps that
-        // scope's epoch (`bump_epochs_for_allocations_tx`), and
-        // `apply_plan_submission` re-reads these epochs inside its write
-        // transaction and refuses the plan if any of them moved. So what the
-        // epochs fence is: "nothing changed the allocations I planned against
-        // between the moment I read them and the moment I write". That only
-        // holds if the sample is taken no later than the capacity read. If it
-        // were taken after planning (as it once was), a competing plan that
-        // applied in the window between the capacity read and the sample would
-        // already have bumped the epoch, so this plan would sample the
-        // *post-bump* value, pass the compare-and-set, and commit placements
-        // computed against capacity that no longer exists — oversubscribing the
-        // node. Sampling first makes that case fail the compare-and-set
-        // instead, and the caller retries against a fresh snapshot.
+        // Two ways to satisfy that, chosen per attempt:
         //
-        // The affected node set is only known after planning, so sample every
-        // candidate node now and select the affected subset at submit time —
-        // never re-read. That is one batched query rather than one per node;
-        // see `Store::allocation_version_vector_for_candidates`.
-        let candidate_node_ids: Vec<&str> = nodes.iter().map(|node| node.id.as_str()).collect();
-        let version_sample_started = std::time::Instant::now();
-        let candidate_versions = self
-            .store
-            .allocation_version_vector_for_candidates(job_config_id, &candidate_node_ids)?;
-        timings.version_sample_us = version_sample_started.elapsed().as_micros() as u64;
-
-        let task_fetch_started = std::time::Instant::now();
-        let all_tasks = self
-            .store
-            .cached_task_configs_for_job_config(job_config_id)?;
-        let mut tasks = self.tasks_for_plan_from_store(job_config_id)?;
-        if task_targets.is_none() && matches!(mode, PlanMode::Reschedule) {
-            if let Some(job_id) = self.store.job_id_for_job_config(job_config_id)? {
-                Self::apply_slot_staged_counts(self.store, &job_id, job_config_id, &mut tasks)?;
+        // - LAZY (the default): plan first, then sample epochs for exactly
+        //   the affected scopes, accepting the sample only if the
+        //   read-model generation is unchanged since the capacity read —
+        //   which proves the late sample equals one taken at the capacity
+        //   read (`Store::expected_versions_if_unchanged`). O(affected)
+        //   instead of O(fleet). If the generation moved, fall through to
+        //   one EAGER attempt.
+        // - EAGER (the fallback, and unconditionally when
+        //   `schedulerSettings.lazy_version_sample: false`): sample every
+        //   candidate node BEFORE the capacity read and select the affected
+        //   subset at submit time — never re-read. Safe regardless of what
+        //   commits mid-plan, at O(fleet) cost.
+        let mut eager_sample = !self.lazy_version_sample_enabled();
+        let (placement_pairs, affected_nodes, expected_versions) = loop {
+            let available_started = std::time::Instant::now();
+            let mut nodes = self.available_nodes()?;
+            if let Some(excluded) = excluded_nodes {
+                nodes.retain(|node| !excluded.contains(&node.id));
             }
-        }
-        timings.task_fetch_us = task_fetch_started.elapsed().as_micros() as u64;
+            timings.available_nodes_us = available_started.elapsed().as_micros() as u64;
+            if nodes.is_empty() {
+                bail!("No nodes available to place allocations");
+            }
 
-        // A `Fresh` plan replaces the job's allocations wholesale: whichever
-        // handler asked for it either already dropped the previous ones
-        // (`job_update`) or drops them the moment this plan applies
-        // (`job_submit`). Counting them against node capacity here would
-        // demand headroom for two copies of the job and fail a plain
-        // resubmit of anything using more than half a node — and it would
-        // contradict `plan_only` / `plan_for_config`, which drop them and so
-        // report a plan the apply path then refuses.
-        let replaced_job_id = if matches!(mode, PlanMode::Fresh) {
-            self.store.job_id_for_job_config(job_config_id)?
-        } else {
-            None
-        };
-        let drop_replaced = |allocation: &Allocation| {
-            Some(allocation.job_id.as_str()) == replaced_job_id.as_deref()
-        };
-        let capacity_snapshot_started = std::time::Instant::now();
-        let snapshot =
-            self.capacity_snapshot(replaced_job_id.is_some().then_some(&drop_replaced))?;
-        timings.capacity_snapshot_us = capacity_snapshot_started.elapsed().as_micros() as u64;
-        let existing_counts =
-            Self::existing_alloc_counts_by_task(job_config_id, &snapshot.allocations_by_node);
-        if let Some(task_targets) = task_targets {
-            for (task_id, _config, desired) in &mut tasks {
-                if let Some(target) = task_targets.get(task_id) {
-                    *desired = (*target).min(*desired);
-                } else if matches!(mode, PlanMode::Reschedule) {
-                    *desired = existing_counts.get(task_id).copied().unwrap_or_default();
+            let candidate_versions = if eager_sample {
+                let candidate_node_ids: Vec<&str> =
+                    nodes.iter().map(|node| node.id.as_str()).collect();
+                let version_sample_started = std::time::Instant::now();
+                let versions = self
+                    .store
+                    .allocation_version_vector_for_candidates(job_config_id, &candidate_node_ids)?;
+                timings.version_sample_us = version_sample_started.elapsed().as_micros() as u64;
+                Some(versions)
+            } else {
+                None
+            };
+
+            let task_fetch_started = std::time::Instant::now();
+            let all_tasks = self
+                .store
+                .cached_task_configs_for_job_config(job_config_id)?;
+            let mut tasks = self.tasks_for_plan_from_store(job_config_id)?;
+            if task_targets.is_none() && matches!(mode, PlanMode::Reschedule) {
+                if let Some(job_id) = self.store.job_id_for_job_config(job_config_id)? {
+                    Self::apply_slot_staged_counts(self.store, &job_id, job_config_id, &mut tasks)?;
                 }
             }
-        }
+            timings.task_fetch_us = task_fetch_started.elapsed().as_micros() as u64;
 
-        let required_counts = Self::required_counts_for_mode(
-            &tasks,
-            mode.clone(),
-            job_config_id,
-            &snapshot.allocations_by_node,
-        );
+            // A `Fresh` plan replaces the job's allocations wholesale: whichever
+            // handler asked for it either already dropped the previous ones
+            // (`job_update`) or drops them the moment this plan applies
+            // (`job_submit`). Counting them against node capacity here would
+            // demand headroom for two copies of the job and fail a plain
+            // resubmit of anything using more than half a node — and it would
+            // contradict `plan_only` / `plan_for_config`, which drop them and so
+            // report a plan the apply path then refuses.
+            let replaced_job_id = if matches!(mode, PlanMode::Fresh) {
+                self.store.job_id_for_job_config(job_config_id)?
+            } else {
+                None
+            };
+            let drop_replaced = |allocation: &Allocation| {
+                Some(allocation.job_id.as_str()) == replaced_job_id.as_deref()
+            };
+            let capacity_snapshot_started = std::time::Instant::now();
+            let snapshot =
+                self.capacity_snapshot(replaced_job_id.is_some().then_some(&drop_replaced))?;
+            timings.capacity_snapshot_us = capacity_snapshot_started.elapsed().as_micros() as u64;
+            let snapshot_generation = snapshot.generation;
+            let existing_counts =
+                Self::existing_alloc_counts_by_task(job_config_id, &snapshot.allocations_by_node);
+            if let Some(task_targets) = task_targets {
+                for (task_id, _config, desired) in &mut tasks {
+                    if let Some(target) = task_targets.get(task_id) {
+                        *desired = (*target).min(*desired);
+                    } else if matches!(mode, PlanMode::Reschedule) {
+                        *desired = existing_counts.get(task_id).copied().unwrap_or_default();
+                    }
+                }
+            }
 
-        let build_started = std::time::Instant::now();
-        let BuiltPlan {
-            placements,
-            index_report,
-        } = self.build_plan(
-            job_config_id,
-            nodes,
-            tasks,
-            all_tasks,
-            required_counts,
-            snapshot,
-            mode.clone(),
-            task_targets,
-        )?;
-        timings.build_plan_us = build_started.elapsed().as_micros() as u64;
-        let indexed_tasks = index_report
-            .iter()
-            .filter(|usage| usage.index.is_some())
-            .count();
-        debug!(
-            %job_config_id,
-            mode = mode.as_str(),
-            placement_count = placements.len(),
-            indexed_tasks,
-            planned_tasks = index_report.len(),
-            build_plan_ms = build_started.elapsed().as_millis() as u64,
-            "Scheduler build_plan completed"
-        );
-        if placements.is_empty() {
-            info!(%job_config_id, "No placements generated during plan_and_apply");
-            timings.total_us = started.elapsed().as_micros() as u64;
-            timings.observe();
-            return Ok(PlanOutcome {
-                allocations: Vec::new(),
-                deltas: Vec::new(),
-                timings,
-            });
-        }
+            let required_counts = Self::required_counts_for_mode(
+                &tasks,
+                mode.clone(),
+                job_config_id,
+                &snapshot.allocations_by_node,
+            );
 
-        let placement_pairs = placements
-            .iter()
-            .map(|placement| (placement.node_id.clone(), placement.task_config_id))
-            .collect::<Vec<_>>();
-        let affected_nodes = placements
-            .iter()
-            .map(|placement| placement.node_id.clone())
-            .collect::<HashSet<_>>();
-        // Select from the pre-planning sample; re-reading here would reopen the
-        // race the sample above exists to close.
-        let expected_versions =
-            Self::expected_versions_for(job_config_id, &candidate_versions, &affected_nodes);
+            let build_started = std::time::Instant::now();
+            let BuiltPlan {
+                placements,
+                index_report,
+            } = self.build_plan(
+                job_config_id,
+                nodes,
+                tasks,
+                all_tasks,
+                required_counts,
+                snapshot,
+                mode.clone(),
+                task_targets,
+            )?;
+            timings.build_plan_us = build_started.elapsed().as_micros() as u64;
+            let indexed_tasks = index_report
+                .iter()
+                .filter(|usage| usage.index.is_some())
+                .count();
+            debug!(
+                %job_config_id,
+                mode = mode.as_str(),
+                placement_count = placements.len(),
+                indexed_tasks,
+                planned_tasks = index_report.len(),
+                build_plan_ms = build_started.elapsed().as_millis() as u64,
+                "Scheduler build_plan completed"
+            );
+            if placements.is_empty() {
+                info!(%job_config_id, "No placements generated during plan_and_apply");
+                timings.total_us = started.elapsed().as_micros() as u64;
+                timings.observe();
+                return Ok(PlanOutcome {
+                    allocations: Vec::new(),
+                    deltas: Vec::new(),
+                    timings,
+                });
+            }
+
+            let placement_pairs = placements
+                .iter()
+                .map(|placement| (placement.node_id.clone(), placement.task_config_id))
+                .collect::<Vec<_>>();
+            let affected_nodes = placements
+                .iter()
+                .map(|placement| placement.node_id.clone())
+                .collect::<HashSet<_>>();
+            let expected_versions = match candidate_versions.as_ref() {
+                // Eager: select from the pre-planning sample; re-reading here
+                // would reopen the race the sample exists to close.
+                Some(candidate_versions) => {
+                    Self::expected_versions_for(job_config_id, candidate_versions, &affected_nodes)
+                }
+                // Lazy: sample now, for exactly the affected scopes — sound
+                // only if the generation check proves nothing was published
+                // since the capacity read.
+                None => {
+                    let version_sample_started = std::time::Instant::now();
+                    match self.store.expected_versions_if_unchanged(
+                        job_config_id,
+                        &affected_nodes,
+                        snapshot_generation,
+                    )? {
+                        Some(versions) => {
+                            timings.version_sample_us =
+                                version_sample_started.elapsed().as_micros() as u64;
+                            versions
+                        }
+                        None => {
+                            // The read model changed while this plan was being
+                            // built, so the late sample proves nothing. Re-plan
+                            // once with the eager sample (the unconditionally
+                            // safe path); that attempt cannot land back here.
+                            crate::manager::telemetry::metrics()
+                                .scheduler_lazy_sample_fallback_total
+                                .inc();
+                            debug!(
+                                %job_config_id,
+                                mode = mode.as_str(),
+                                "Read model changed mid-plan; retrying with the eager version sample"
+                            );
+                            eager_sample = true;
+                            continue;
+                        }
+                    }
+                }
+            };
+            break (placement_pairs, affected_nodes, expected_versions);
+        };
         // One replicated op for insert + apply: on raft backends the split
         // form paid a second quorum round-trip per plan (see
         // `Store::submit_and_apply_plan`).
@@ -1076,6 +1133,7 @@ impl<'a> Scheduler<'a> {
             allocations_by_node,
             pools,
             freed_nodes,
+            generation: _,
         } = capacity;
         // The body reads allocations by reference throughout (the owned map
         // outlives the plan); the pools move into the ledger below.
@@ -2476,6 +2534,19 @@ impl<'a> Scheduler<'a> {
         }
 
         Some(tracker)
+    }
+
+    /// `schedulerSettings.lazy_version_sample` — default true. The escape
+    /// hatch back to the eager (pre-planning, O-fleet) epoch sample; the
+    /// lazy path falls back to eager on its own whenever it cannot prove
+    /// equivalence, so this exists for operators, not correctness.
+    fn lazy_version_sample_enabled(&self) -> bool {
+        self.store
+            .scheduler_settings
+            .as_ref()
+            .and_then(|settings| settings.get("lazy_version_sample"))
+            .and_then(Value::as_bool)
+            .unwrap_or(true)
     }
 
     fn nodes_considered_setting(&self) -> R<Option<NodesConsidered>> {
@@ -5256,6 +5327,59 @@ mod tests {
 
         assert_eq!(applied, 1, "only one plan may claim the node");
         assert_eq!(store.allocs_for_node("node-a")?.len(), 1);
+
+        Ok(())
+    }
+
+    #[test]
+    fn lazy_version_sample_is_the_default_and_fences_a_second_job() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", json!({})))?;
+
+        let scheduler = Scheduler::new(&store)?;
+        assert!(scheduler.lazy_version_sample_enabled());
+
+        let first = submit_job(&store, "job-lazy-a", vec![TaskConfig::new("api", "noop")])?;
+        let outcome = scheduler.plan_and_apply(&first, PlanMode::Fresh)?;
+        assert_eq!(outcome.allocations.len(), 1);
+
+        // The applied plan carried expected versions from the LATE sample;
+        // it must have fenced normally — a stale re-apply of the same
+        // submission shape for a second job sees the bumped node epoch.
+        let second = submit_job(&store, "job-lazy-b", vec![TaskConfig::new("api", "noop")])?;
+        let stale = BTreeMap::from([
+            (format!("job_config:{second}"), 0),
+            ("node:node-a".to_string(), 0),
+        ]);
+        let submission = store.insert_plan_submission(
+            &second,
+            "fresh",
+            &[("node-a".to_string(), task_id_for(&store, &second, "api")?)],
+            &stale,
+        )?;
+        assert!(
+            matches!(
+                store.apply_plan_submission(&submission)?,
+                crate::storage::store::PlanApplyOutcome::Rejected { .. }
+            ),
+            "the lazy-sampled apply must have bumped the node epoch"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn eager_version_sample_setting_restores_the_pre_planning_sample() -> R<()> {
+        let store =
+            setup_store_with_scheduler("bin_pack", Some(json!({ "lazy_version_sample": false })))?;
+        store.insert_node(make_node_msg("node-a", json!({})))?;
+
+        let scheduler = Scheduler::new(&store)?;
+        assert!(!scheduler.lazy_version_sample_enabled());
+
+        let job_config_id = submit_job(&store, "job-eager", vec![TaskConfig::new("api", "noop")])?;
+        let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
+        assert_eq!(outcome.allocations.len(), 1);
 
         Ok(())
     }
