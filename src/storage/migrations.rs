@@ -926,6 +926,28 @@ pub fn get_migrations() -> Migrations<'static> {
              WHERE service IS NOT NULL AND json_valid(service);",
         )
         .down("DROP INDEX IF EXISTS idx_task_config_service_name;"),
+        // Integer heartbeat clock for the liveness scan (heartbeat-scale
+        // plan §4): the manager's 2s liveness tick compares every node's
+        // last heartbeat against a cutoff, and parsing the RFC3339 text
+        // column per node per tick is 10k parses every 2s at 10k workers.
+        // Heartbeats now write both columns; the scan compares integers and
+        // falls back to parsing the text only for rows written before this
+        // migration (NULL unix), which age out on their next heartbeat. The
+        // text column stays — it is the human/API-facing representation.
+        M::up("ALTER TABLE node_health ADD COLUMN last_heartbeat_unix INTEGER;").down(""),
+        // The per-heartbeat volume-destroy feed (`volumes_to_destroy_for_node`)
+        // filters on state = 'destroying' but its node disjunction defeats
+        // any full-column index; a partial index keeps the per-heartbeat
+        // query O(destroying rows) — almost always zero — instead of a
+        // volume-table scan per heartbeat (heartbeat-scale plan §3).
+        M::up(
+            "CREATE INDEX IF NOT EXISTS idx_volume_destroying
+             ON volume(state) WHERE state = 'destroying';",
+        )
+        .down("DROP INDEX IF EXISTS idx_volume_destroying;"),
+        // Worker-type heartbeat cadence (heartbeat-scale plan §5): NULL =
+        // the built-in default (2s). Served to workers at pre-registration.
+        M::up("ALTER TABLE worker_type ADD COLUMN heartbeat_seconds INTEGER;").down(""),
     ])
 }
 

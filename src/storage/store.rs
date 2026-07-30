@@ -296,6 +296,10 @@ pub struct Store {
     // per-plan savepoint isolation inside. Shared across clones so every
     // eval worker feeds the same queue.
     plan_coalescer: Arc<crate::storage::coalesce::Coalescer<PlanApplyRequest, PlanApplyReply>>,
+    // Heartbeat group commit (heartbeat-scale plan §2): concurrent
+    // update_node_heartbeat callers coalesce into one status-lane op
+    // stamping every batched node id.
+    heartbeat_coalescer: Arc<crate::storage::coalesce::Coalescer<String, ()>>,
 }
 
 /// Result of [`Store::state_backup`]: where the backup landed, its size,
@@ -526,6 +530,10 @@ const EVENT_BROADCAST_CAPACITY: usize = 1_024;
 const EVENT_RETAINED_ROWS: i64 = 10_000;
 // Prune once every N inserts to keep the hot emit path cheap.
 const EVENT_PRUNE_INTERVAL: i64 = 256;
+// Heartbeats coalescing into one status-lane commit are capped per batch
+// (heartbeat-scale plan §2): 128 single-row upserts is a small changeset,
+// and the cap bounds both the IN-list and the raft entry size.
+const HEARTBEAT_BATCH_MAX: usize = 128;
 // Middle bits of a scheduler_event id carrying the per-process sequence:
 // the high bits carry unix milliseconds and the low `Lane::ID_STRIDE_BITS`
 // carry the minting lane's residue (see `next_scheduler_event_id`).
@@ -589,6 +597,9 @@ impl Store {
             allocation_health_orphan_candidates: Arc::new(std::sync::Mutex::new(HashSet::new())),
             plan_coalescer: Arc::new(crate::storage::coalesce::Coalescer::new(
                 Self::plan_apply_batch_max(config.scheduler_settings.as_ref()),
+            )),
+            heartbeat_coalescer: Arc::new(crate::storage::coalesce::Coalescer::new(
+                HEARTBEAT_BATCH_MAX,
             )),
         };
 
@@ -2992,6 +3003,7 @@ impl Store {
             max_allocations,
             artifacts,
             host_volumes: row.get(9)?,
+            heartbeat_seconds: row.get(10)?,
         })
     }
 
@@ -3744,18 +3756,25 @@ impl Store {
     }
 
     #[instrument(err, skip_all)]
-    pub fn get_node_ids_and_heartbeats(&self) -> R<Vec<(String, String)>> {
+    /// Every active node's id and last heartbeat, for the liveness tick:
+    /// the RFC3339 text plus the integer unix clock heartbeats also write
+    /// (heartbeat-scale plan §4). The unix value is `None` only for rows
+    /// last written before the column existed — the tick falls back to
+    /// parsing the text for those, and they age out on their next
+    /// heartbeat.
+    pub fn get_node_ids_and_heartbeats(&self) -> R<Vec<(String, String, Option<i64>)>> {
         let conn = self.read_connection()?;
         // Anchored on `node` (a node_health row orphaned by node removal
         // must not resurrect a ghost); a registered node without a health
         // row hydrates the registration defaults, exactly as before the
         // split (status 'active', empty heartbeat).
-        let sql = "SELECT node.id, COALESCE(node_health.last_heartbeat, '')
+        let sql = "SELECT node.id, COALESCE(node_health.last_heartbeat, ''), node_health.last_heartbeat_unix
                    FROM node LEFT JOIN node_health ON node_health.node_id = node.id
                    WHERE COALESCE(node_health.status, 'active') = 'active'";
         let mut stmt = conn.prepare(sql)?;
-        let nodes_id_and_hb =
-            Self::collect_rows(stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?)?;
+        let nodes_id_and_hb = Self::collect_rows(
+            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?,
+        )?;
 
         Ok(nodes_id_and_hb)
     }
@@ -3915,7 +3934,37 @@ impl Store {
                 return;
             }
         };
+        if node_ids.is_empty() {
+            return;
+        }
+        // One query for every lost node's pending/in-flight reschedule eval
+        // instead of one EXISTS probe per node per tick (heartbeat-scale
+        // plan §4): the semantics are identical — re-enqueue whenever no
+        // eval is queued — but a 2,000-node partition costs one query per
+        // tick, not 2,000.
+        let already_queued: HashSet<String> = {
+            let queued = (|| -> R<Vec<String>> {
+                let conn = self.read_connection()?;
+                let mut stmt = conn.prepare(
+                    "SELECT DISTINCT node_id FROM eval
+                     WHERE status IN ('pending', 'in_flight')
+                       AND type = 'node_lost_reschedule' AND node_id IS NOT NULL;",
+                )?;
+                let queued = Self::collect_rows(stmt.query_map([], |row| row.get(0))?)?;
+                Ok(queued)
+            })();
+            match queued {
+                Ok(queued) => queued.into_iter().collect(),
+                Err(err) => {
+                    warn!(error = ?err, "Failed listing queued lost-node reschedules");
+                    return;
+                }
+            }
+        };
         for node_id in node_ids {
+            if already_queued.contains(&node_id) {
+                continue;
+            }
             if let Err(err) = self.enqueue_lost_node_reschedule(&node_id) {
                 warn!(
                     %node_id,
@@ -4161,15 +4210,95 @@ impl Store {
         Ok(node)
     }
 
+    /// Record one worker heartbeat. Concurrent callers GROUP-COMMIT
+    /// (heartbeat-scale plan §2): heartbeats queued while a commit is in
+    /// flight batch into one status-lane replicated op — one raft
+    /// propose/quorum round stamping every batched node — via the same
+    /// leader-elect coalescer the plan-apply path uses. A lone heartbeat
+    /// commits exactly as before.
+    ///
+    /// Forwarding (plan §8, D2) is preserved: a heartbeat is new
+    /// information no reconciler can re-derive, and workers dial ONE
+    /// manager forever — a standing rejection here marks healthy nodes
+    /// lost within seconds and self-fences their stateful allocations.
+    /// When this node does not lead the status lane the write is forwarded
+    /// to the lane leader; the worker's RPC surface is unchanged.
     #[instrument(err, skip_all)]
-    /// Record a worker heartbeat. Forwarding wrapper (plan §8, D2): a
-    /// heartbeat is new information no reconciler can re-derive, and
-    /// workers dial ONE manager forever — a standing rejection here marks
-    /// healthy nodes lost within seconds and self-fences their stateful
-    /// allocations. When this node does not lead the status lane the write
-    /// is forwarded to the lane leader; the worker's RPC surface is
-    /// unchanged.
     pub fn update_node_heartbeat(&self, id: String) -> R<()> {
+        let coalescer = Arc::clone(&self.heartbeat_coalescer);
+        coalescer.submit(id, |batch| self.run_heartbeat_batch(batch))
+    }
+
+    /// Batch leader body for heartbeat group commit: dedupe the drained
+    /// node ids and stamp them all in one replicated op. Per-id verdicts
+    /// are preserved: an unregistered node's heartbeat still errors
+    /// `NotFound` for exactly that caller (a ghost worker must not think
+    /// it is healthy — its self-fence clock feeds off heartbeat success),
+    /// while registered batch-mates succeed. On a typed `NotRaftLeader`
+    /// rejection every id forwards individually through the existing
+    /// single-heartbeat forward (wire-compatible with managers that
+    /// predate the batched op).
+    fn run_heartbeat_batch(&self, batch: Vec<String>) -> Vec<R<()>> {
+        if batch.len() == 1 {
+            let id = batch.into_iter().next().expect("length checked");
+            return vec![self.update_node_heartbeat_forwarding(id)];
+        }
+        let unique: Vec<String> = batch
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<String>>()
+            .into_iter()
+            .collect();
+        let ids = unique.clone();
+        let shared: Result<BTreeSet<String>, String> =
+            match self.replicated(Lane::Status, "update_node_heartbeats", move |s| {
+                s.update_node_heartbeats_apply(&ids)
+            }) {
+                Ok(ghosts) => Ok(ghosts),
+                Err(err) if crate::storage::raft::driver::NotRaftLeader::in_chain(&err) => {
+                    // Leadership moved: forward per id so the on-wire op stays
+                    // the one every manager version understands.
+                    let mut ghosts = BTreeSet::new();
+                    let mut failures: Vec<String> = Vec::new();
+                    for id in &unique {
+                        match self.update_node_heartbeat_forwarding(id.clone()) {
+                            Ok(()) => {}
+                            Err(err)
+                                if matches!(
+                                    err.downcast_ref::<StorageError>(),
+                                    Some(StorageError::NotFound { .. })
+                                ) =>
+                            {
+                                ghosts.insert(id.clone());
+                            }
+                            Err(err) => failures.push(format!("{id}: {err:#}")),
+                        }
+                    }
+                    if failures.is_empty() {
+                        Ok(ghosts)
+                    } else {
+                        Err(format!(
+                            "forwarded heartbeat batch had failures: {}",
+                            failures.join("; ")
+                        ))
+                    }
+                }
+                Err(err) => Err(format!("{err:#}")),
+            };
+        batch
+            .iter()
+            .map(|id| match &shared {
+                Ok(ghosts) if ghosts.contains(id) => Err(anyhow::Error::new(
+                    StorageError::not_found("node", id.clone()),
+                )),
+                Ok(_) => Ok(()),
+                Err(message) => Err(anyhow!(message.clone())),
+            })
+            .collect()
+    }
+
+    /// The pre-batching single-heartbeat op, with leader forwarding.
+    fn update_node_heartbeat_forwarding(&self, id: String) -> R<()> {
         match self.update_node_heartbeat_local(id.clone()) {
             Err(err) if crate::storage::raft::driver::NotRaftLeader::in_chain(&err) => self
                 .forward_after_rejection(
@@ -4184,43 +4313,140 @@ impl Store {
     /// `ForwardLaneWrite` executor (never re-forwards — rule 2 of
     /// `raft::forward`).
     pub(crate) fn update_node_heartbeat_local(&self, id: String) -> R<()> {
-        self.replicated(Lane::Status, "update_node_heartbeat", move |s| {
-            s.update_node_heartbeat_apply(id)
-        })
+        let ghost = {
+            let id = id.clone();
+            self.replicated(Lane::Status, "update_node_heartbeat", move |s| {
+                s.update_node_heartbeats_apply(std::slice::from_ref(&id))
+            })?
+        };
+        if !ghost.is_empty() {
+            return Err(anyhow::Error::new(StorageError::not_found("node", id)));
+        }
+        Ok(())
     }
 
-    fn update_node_heartbeat_apply(&self, id: String) -> R<()> {
-        let timestamp_now = OffsetDateTime::now_utc().format(&Rfc3339)?;
+    /// Stamp one heartbeat timestamp for a batch of nodes, and reproject
+    /// only the nodes whose liveness status actually TRANSITIONED. Returns
+    /// the ids that are not registered nodes (whose heartbeat is a no-op
+    /// the caller reports as `NotFound`, exactly as the single op did).
+    ///
+    /// Heartbeats upsert node_health (plan §7-C2, C-1): the first
+    /// heartbeat after a registration whose seed was lost creates the row;
+    /// selecting FROM node keeps heartbeats from unregistered nodes a
+    /// no-op, like the pre-split UPDATE. Both timestamp columns are
+    /// written: RFC3339 text (the human/API representation) and the unix
+    /// integer the liveness tick compares (heartbeat-scale plan §4).
+    ///
+    /// INVARIANT for future readers (heartbeat-scale plan §3): a heartbeat
+    /// that only refreshes the timestamp of an already-active node does
+    /// NOT re-read or reproject the cached `Node` — the scheduler read
+    /// model does not consume `last_heartbeat`, and every API/liveness
+    /// reader gets it from the database. Anything that starts consuming
+    /// `last_heartbeat` from the cached read model must remove this skip
+    /// (and pay the read-model write lock per heartbeat that it implies).
+    /// Status transitions (lost/missing -> active) always reproject.
+    fn update_node_heartbeats_apply(&self, ids: &[String]) -> R<BTreeSet<String>> {
+        let now = OffsetDateTime::now_utc();
+        let timestamp_now = now.format(&Rfc3339)?;
+        let unix_now = now.unix_timestamp();
 
-        let conn = self.write_connection()?;
-        // Heartbeats upsert node_health (plan §7-C2, C-1): the first
-        // heartbeat after a registration whose seed was lost creates the
-        // row; the EXISTS guard keeps heartbeats from unregistered nodes a
-        // no-op, like the pre-split UPDATE.
-        let sql = r#"
-        INSERT INTO node_health (node_id, status, last_heartbeat, lost_at, health_checks)
-        SELECT :id, 'active', :ts, NULL, '{}'
-        WHERE EXISTS (SELECT 1 FROM node WHERE id = :id)
-        ON CONFLICT(node_id) DO UPDATE SET
-            last_heartbeat = excluded.last_heartbeat, status = 'active', lost_at = NULL;
-"#;
-        info!(
-            "Updating heartbeat for node {} with TS: {}",
-            id, timestamp_now
+        let placeholders = std::iter::repeat_n("?", ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        // Pre-read (on the write connection, so an enclosing capture's own
+        // earlier writes are visible): which of these ids exist, and which
+        // are not currently active (those transition below and must
+        // reproject).
+        let mut present: BTreeSet<String> = BTreeSet::new();
+        let mut transitioning: BTreeSet<String> = BTreeSet::new();
+        {
+            let conn = self.write_connection()?;
+            let sql = format!(
+                "SELECT node.id, COALESCE(node_health.status, '') FROM node
+                 LEFT JOIN node_health ON node_health.node_id = node.id
+                 WHERE node.id IN ({placeholders})"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let rows: Vec<(String, String)> =
+                Self::collect_rows(stmt.query_map(params_from_iter(ids.iter()), |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                })?)?;
+            for (id, status) in rows {
+                if status != "active" {
+                    transitioning.insert(id.clone());
+                }
+                present.insert(id);
+            }
+        }
+        let ghosts: BTreeSet<String> = ids
+            .iter()
+            .filter(|id| !present.contains(*id))
+            .cloned()
+            .collect();
+        // Also reproject any present node whose CACHED view is not
+        // available: a concurrent mark-lost can land its cache update after
+        // this write (that interleaving pre-dates batching), and the
+        // DB-status check alone would then skip forever while the cache
+        // still says lost. Consulting the cache makes the next heartbeat
+        // converge, exactly as the unconditional reprojection used to.
+        if !capture::in_capture() {
+            let guard = self.read_model_reader()?;
+            for id in &present {
+                match guard.nodes.get(id) {
+                    Some(node) if node.availability == "available" => {}
+                    _ => {
+                        transitioning.insert(id.clone());
+                    }
+                }
+            }
+        }
+
+        {
+            let conn = self.write_connection()?;
+            let sql = format!(
+                "INSERT INTO node_health (node_id, status, last_heartbeat, last_heartbeat_unix, lost_at, health_checks)
+                 SELECT id, 'active', ?1, ?2, NULL, '{{}}' FROM node WHERE id IN ({placeholders})
+                 ON CONFLICT(node_id) DO UPDATE SET
+                     last_heartbeat = excluded.last_heartbeat,
+                     last_heartbeat_unix = excluded.last_heartbeat_unix,
+                     status = 'active', lost_at = NULL;"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let params = rusqlite::params_from_iter(
+                [
+                    &timestamp_now as &dyn rusqlite::types::ToSql,
+                    &unix_now as &dyn rusqlite::types::ToSql,
+                ]
+                .into_iter()
+                .chain(ids.iter().map(|id| id as &dyn rusqlite::types::ToSql)),
+            );
+            stmt.execute(params)?;
+        }
+        debug!(
+            heartbeats = ids.len(),
+            transitions = transitioning.len(),
+            ghosts = ghosts.len(),
+            "Stamped node heartbeats"
         );
 
-        let params = named_params! {
-            ":id": id,
-            ":ts": timestamp_now,
-        };
+        for id in &transitioning {
+            // A node removed between the pre-read and here is treated the
+            // way the projection path treats it: dropped from the cache.
+            match self.get_node(id) {
+                Ok(node) => self.cache_node(node)?,
+                Err(err)
+                    if matches!(
+                        err.downcast_ref::<StorageError>(),
+                        Some(StorageError::NotFound { .. })
+                    ) =>
+                {
+                    self.cache_remove_node(id)?;
+                }
+                Err(err) => return Err(err),
+            }
+        }
 
-        conn.execute(sql, params)?;
-
-        drop(conn);
-        let node = self.get_node(&id)?;
-        self.cache_node(node)?;
-
-        Ok(())
+        Ok(ghosts)
     }
 
     #[instrument(err, skip_all)]
@@ -4327,6 +4553,7 @@ impl Store {
             ":max_allocations": config.max_allocations,
             ":artifacts": config.artifacts,
             ":host_volumes": config.host_volumes,
+            ":heartbeat_seconds": config.heartbeat_seconds,
         };
 
         let config = conn.query_row(&INSERT_WORKER_TYPE, params, |row| {
@@ -5911,6 +6138,34 @@ impl Store {
                     // liveness hydrates from the node ⟕ node_health join
                     // (plan §7-C2, C-1) — so both tables funnel into one
                     // re-read of the joined row by node id.
+                    //
+                    // EXCEPT a bare heartbeat refresh (heartbeat-scale plan
+                    // §3): a node_health UPDATE whose only changed columns
+                    // are the heartbeat timestamps is invisible to the
+                    // scheduler read model (see the invariant on
+                    // `update_node_heartbeats_apply`), and at heartbeat
+                    // rates the per-apply reprojection is the cost that
+                    // starves read-model readers. Session changesets carry
+                    // only columns whose value actually changed, so this is
+                    // exact: any status/lost_at/health_checks movement still
+                    // reprojects.
+                    if table == "node_health" && action == Action::SQLITE_UPDATE {
+                        let status_idx =
+                            self.changeset_column_index(&mut column_cache, &table, "status")?;
+                        let lost_at_idx =
+                            self.changeset_column_index(&mut column_cache, &table, "lost_at")?;
+                        let checks_idx = self.changeset_column_index(
+                            &mut column_cache,
+                            &table,
+                            "health_checks",
+                        )?;
+                        let liveness_changed = item.new_value(status_idx).is_ok()
+                            || item.new_value(lost_at_idx).is_ok()
+                            || item.new_value(checks_idx).is_ok();
+                        if !liveness_changed {
+                            continue;
+                        }
+                    }
                     let pk_column = if table == "node" { "id" } else { "node_id" };
                     let idx = self.changeset_column_index(&mut column_cache, &table, pk_column)?;
                     // The PK is present in the insert's new record and in the
@@ -12482,6 +12737,133 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn batched_heartbeats_stamp_every_node_once() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("hb-a", "active"))?;
+        store.insert_node(make_node_msg("hb-b", "active"))?;
+        store.insert_node(make_node_msg("hb-c", "active"))?;
+
+        // Duplicates dedupe; an unregistered id stays a no-op that errors
+        // NotFound for exactly that caller, as the single op always did (a
+        // ghost worker must not believe it is healthy).
+        let results = store.run_heartbeat_batch(vec![
+            "hb-a".to_string(),
+            "hb-b".to_string(),
+            "hb-b".to_string(),
+            "hb-c".to_string(),
+            "hb-ghost".to_string(),
+        ]);
+        assert_eq!(results.len(), 5);
+        for result in &results[..4] {
+            assert!(result.is_ok(), "batched heartbeat failed: {result:?}");
+        }
+        assert!(
+            matches!(
+                results[4]
+                    .as_ref()
+                    .err()
+                    .and_then(|err| err.downcast_ref::<StorageError>()),
+                Some(StorageError::NotFound { .. })
+            ),
+            "ghost heartbeat must keep its typed NotFound: {:?}",
+            results[4]
+        );
+
+        let conn = store.read_connection()?;
+        let stamped: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM node_health
+             WHERE node_id IN ('hb-a','hb-b','hb-c')
+               AND last_heartbeat != '' AND last_heartbeat_unix IS NOT NULL;",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(stamped, 3, "every real node gets both timestamp columns");
+        let ghosts: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM node_health WHERE node_id = 'hb-ghost';",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(ghosts, 0, "unregistered ids must stay a no-op");
+        Ok(())
+    }
+
+    #[test]
+    fn heartbeat_transition_reprojects_and_bare_refresh_skips() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("hb-t", "active"))?;
+        store.update_node_heartbeat("hb-t".to_string())?;
+
+        // Bare refresh of an active node: the cached Node must not be
+        // rebuilt (the skip this heartbeat path exists for).
+        let before = store.scheduling_read_model()?;
+        let cached_before = before.nodes.get("hb-t").cloned().context("cached")?;
+        store.update_node_heartbeat("hb-t".to_string())?;
+        let after = store.scheduling_read_model()?;
+        let cached_after = after.nodes.get("hb-t").cloned().context("cached")?;
+        assert!(
+            Arc::ptr_eq(&cached_before, &cached_after),
+            "an active node's bare heartbeat refresh must not reproject the cached node"
+        );
+
+        // Lost -> active transition: the heartbeat must reproject the
+        // cached node (its status flips), unlike the bare refresh above.
+        // (Availability stays with `mark_node_ready` — heartbeats only own
+        // liveness status.)
+        store.mark_nodes_as_lost(&["hb-t".to_string()])?;
+        let lost_cached = store
+            .scheduling_read_model()?
+            .nodes
+            .get("hb-t")
+            .cloned()
+            .context("cached")?;
+        assert_eq!(lost_cached.status, "lost");
+        store.update_node_heartbeat("hb-t".to_string())?;
+        let recovered_cached = store
+            .scheduling_read_model()?
+            .nodes
+            .get("hb-t")
+            .cloned()
+            .context("cached")?;
+        assert_eq!(
+            recovered_cached.status, "active",
+            "a lost node's heartbeat must reproject the cached node"
+        );
+        assert_eq!(store.node_lost_at("hb-t")?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_heartbeats_coalesce_and_all_stamp() -> R<()> {
+        let store = setup_store()?;
+        let mut ids = Vec::new();
+        for index in 0..16 {
+            let id = format!("hb-conc-{index}");
+            store.insert_node(make_node_msg(&id, "active"))?;
+            ids.push(id);
+        }
+        let handles: Vec<_> = ids
+            .iter()
+            .cloned()
+            .map(|id| {
+                let store = store.clone();
+                std::thread::spawn(move || store.update_node_heartbeat(id))
+            })
+            .collect();
+        for handle in handles {
+            handle.join().expect("heartbeat thread panicked")?;
+        }
+        let conn = store.read_connection()?;
+        let stamped: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM node_health
+             WHERE node_id LIKE 'hb-conc-%' AND last_heartbeat_unix IS NOT NULL;",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(stamped, 16);
+        Ok(())
+    }
+
     /// The cached-pool invariant behind `ResourceLedger::from_snapshot`
     /// (scheduler-plan-snapshot plan): after ANY sequence of read-model
     /// mutations, every available node's cached pool equals a from-scratch
@@ -12630,7 +13012,7 @@ mod tests {
         // The defaults keep the node visible to the lost-checker feed...
         assert_eq!(
             store.get_node_ids_and_heartbeats()?,
-            vec![("node-one".to_string(), String::new())]
+            vec![("node-one".to_string(), String::new(), None)]
         );
 
         // ...and the first heartbeat (an upsert) creates the row again.
@@ -12936,6 +13318,7 @@ mod tests {
             reserved_resources: "{}".into(),
             max_allocations: None,
             artifacts: String::new(),
+            heartbeat_seconds: Some(5),
         };
 
         let returned_config = store.insert_worker_type(&worker_config)?;
@@ -12944,6 +13327,7 @@ mod tests {
         let returned_config = store.get_worker_type("test".to_string())?;
         assert_eq!(returned_config.name, worker_config.name);
         assert_eq!(returned_config.pool, worker_config.pool);
+        assert_eq!(returned_config.heartbeat_seconds, Some(5));
         let val = returned_config
             .attributes
             .get("test")
@@ -12969,12 +13353,14 @@ mod tests {
             reserved_resources: "{}".into(),
             max_allocations: None,
             artifacts: String::new(),
+            heartbeat_seconds: None,
         };
 
         store.insert_worker_type(&worker_config)?;
 
         let returned_config = store.get_worker_type(worker_config.name.clone())?;
         assert!(returned_config.additional_node_checks.is_empty());
+        assert_eq!(returned_config.heartbeat_seconds, None);
 
         Ok(())
     }

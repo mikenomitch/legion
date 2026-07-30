@@ -4658,6 +4658,7 @@ impl Manager for ManagerDaemonService {
             max_allocations: worker_config.max_allocations,
             artifacts: worker_config.artifacts,
             host_volumes: worker_config.host_volumes,
+            heartbeat_seconds: worker_config.heartbeat_seconds,
         };
 
         let reply = WorkerPreRegisterReply {
