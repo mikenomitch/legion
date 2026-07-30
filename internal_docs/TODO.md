@@ -199,19 +199,27 @@ How to use it:
 Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
 
 - [ ] A **WASM** runtime
-- [ ] **`container`: exec on Linux, signal delivery, graceful stop** —
-      [plan](plans/container-runtime-exec-and-signals-plan.md) (PLANNED).
-      Today `legion exec`/actions/UI/MCP fail against container tasks on Linux
-      (exec was deferred for the OCI runtimes), no platform can signal a
-      container task (`changeMode: signal` rejected at admission), and Linux
-      teardown is `delete --force` (SIGKILL) with no grace window.
+- [ ] **`container` core gaps: exec on Linux, signals, cgroup limits, file
+      delivery** — [plan](plans/container-runtime-exec-and-signals-plan.md)
+      (PLANNED). Today `legion exec`/actions/UI/MCP fail against container
+      tasks on Linux (exec was deferred for the OCI runtimes), no platform can
+      signal a container task (`changeMode: signal` rejected at admission),
+      Linux teardown is `delete --force` (SIGKILL) with no grace window,
+      declared `resources.memory`/`cores` set no cgroup limits on Linux, and
+      the unmounted task dir blocks KV/identity *file* delivery and file/tree
+      artifacts.
   - [ ] Phase 1 — exec via `<runtime> exec` for youki/runc/crun
   - [ ] Phase 2 — `TaskPlugin::signal()` seam + `container kill`/`<runtime> kill`
   - [ ] Phase 3 — graceful Linux stop (SIGTERM → 10 s → `delete --force`)
+  - [ ] Phase 4 — Linux cgroup limits from declared resources
+        (`linux.resources` in the bundle spec; memory hard limit, cores → CFS
+        quota; OOM-kill annotation)
+  - [ ] Phase 5 — task dir mounted at `/legion/task` + translated env; flips
+        KV file injection, identity file delivery, and file/tree artifacts to
+        supported (container file paths must live under the mount)
   - Deliberately out of scope there (still open, see the plan's non-goals):
-    Linux cgroup limits, mounting the task dir into the container (KV/identity
-    *file* delivery, file/tree artifacts), `stopSignal`/`stopGracePeriod`
-    jobspec knobs
+    `stopSignal`/`stopGracePeriod` jobspec knobs, Linux port mapping/network
+    namespaces, cpuset pinning, alloc-dir sharing
 - [ ] `exec`: unveil support
 - [ ] `exec`: network namespaces (netavark? CNI?) — see *Networking* below
 - [ ] **Sandbox snapshots, fast start, and forking** —

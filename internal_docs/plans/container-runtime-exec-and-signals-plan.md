@@ -1,25 +1,33 @@
-# Container Runtime: Exec on Linux, Signal Delivery, and Graceful Stop
+# Container Runtime Core Gaps: Exec on Linux, Signals, Cgroup Limits, and File Delivery
 
 > **Judgement calls:** [../calls/container-runtime-exec-and-signals-plan_calls.md](../calls/container-runtime-exec-and-signals-plan_calls.md)
 
 **Status: PLANNED.**
 
-Two gaps in the `container` task runtime, one plan, because they share the same
+The `container` task runtime's four remaining core gaps, one plan, one goal:
+Linux production parity with the macOS dev experience, and a capability table
+without ❌s in its core rows. Sequenced so the first three phases share one
 mechanism (shelling out to a runtime subcommand addressed by container name)
-and the same goal (Linux production parity with the macOS dev experience):
+and the last two extend the bundle/launch surface the runtime already owns:
 
 1. **Exec does not work on Linux.** `legion exec`, the UI terminal, MCP
    one-shot exec, *and declared actions* all fail against container tasks on
    Linux — the OS the workloads actually ship on. This was deferred as Q1 of
    the exec plan ([exec-and-actions-plan.md](exec-and-actions-plan.md)).
-2. **The runtime cannot deliver signals — the missing core feature.** No
-   platform can signal a container task: `changeMode: signal` identities are
-   rejected at admission, and Linux teardown is `delete --force` (SIGKILL) with
-   no graceful-shutdown window at all.
+2. **The runtime cannot deliver signals.** No platform can signal a container
+   task: `changeMode: signal` identities are rejected at admission, and Linux
+   teardown is `delete --force` (SIGKILL) with no graceful-shutdown window at
+   all.
+3. **Linux containers run unconstrained.** Declared `resources.memory` /
+   `resources.cores` size the guest VM on macOS but set no cgroup limits on
+   Linux — the scheduler reserves capacity the kernel never enforces.
+4. **The task directory is invisible inside the container**, which is the one
+   limitation behind three capability-table ❌s at once: KV *file* injection,
+   identity *file* delivery, and file/tree artifacts.
 
-Deliberately deferred (see Non-goals): Linux cgroup limits, mounting the task
-directory into the container (KV/identity *file* delivery, file/tree
-artifacts), jobspec `stopSignal`/`stopGracePeriod` knobs.
+Deliberately deferred (see Non-goals): jobspec `stopSignal`/`stopGracePeriod`
+knobs, Linux port mapping / network namespaces, cpuset pinning, alloc-dir
+sharing between tasks.
 
 ---
 
@@ -57,6 +65,27 @@ run` / `<runtime> run`), not the workload. Signaling it kills the supervisor
 and leaves the container running — so the runtime honestly reports
 "unsupported" rather than doing the wrong thing.
 
+**Resource limits.** A job declaring `resources: { memory: 256, cores: 2 }`
+gets exactly that guest VM on macOS — and *nothing* on Linux: the generated
+bundle's `linux.resources` carries only the device cgroup rule
+(`src/task_plugins/oci_bundle.rs:481`). The scheduler subtracts the
+declaration from the node's capacity, but the kernel enforces nothing, so one
+leaking container can consume the whole node and take every co-scheduled
+allocation down with it. The scheduler's bookkeeping and the node's reality
+disagree — on the platform where multiple containers actually share a kernel.
+
+**File delivery.** The worker stages artifacts, renders KV files, and writes
+identity tokens into the allocation's *host* task directory — and the
+container cannot see any of it: the runtime mounts only declared `volumes[]`,
+and worker-injected env (`LEGION_TASK_DIR`, `LEGION_ARTIFACT_*`) names host
+paths that are meaningless inside, so it is deliberately not applied. The
+result is two admission-time rejections for container tasks
+(`kv_injections.files`, identity `file` delivery — `src/task_plugins/mod.rs:537`,
+`:498`) plus file/tree artifacts that are *accepted* and then stage to a
+directory the workload can never read. Today's workaround is baking config into the image or abusing a
+volume — both of which bypass the refresh machinery (KV re-render, identity
+rotation) that file delivery exists to provide.
+
 ## 2. Prior art
 
 - **Docker** ([docs](https://docs.docker.com/reference/cli/docker/container/stop/)):
@@ -86,6 +115,31 @@ and leaves the container running — so the runtime honestly reports
   shape. **Reject:** the streaming-URL indirection — Legion's frame protocol
   and worker-side PTY already exist and work
   ([docs/exec-and-actions.md](../../docs/exec-and-actions.md)).
+- **Resource limits — docker, Nomad, K8s, and the OCI spec.** Docker's
+  `--cpus=N` is implemented as CFS bandwidth (`cpu.quota = N × cpu.period`),
+  not pinning; `--memory` is a hard cgroup limit. Nomad's docker driver does
+  the same for `cpu`/`memory`, and its `resources.cores` *reserves whole
+  cores* via cpuset — which requires the client to account core assignments
+  across every allocation on the node. K8s adds requests-vs-limits and QoS
+  classes on top. The OCI runtime spec carries all of it declaratively in
+  `linux.resources` — the runtime creates the cgroup and applies limits;
+  Legion only has to write JSON it already generates.
+  **Take:** docker's quota semantics for `cores` (matches what macOS `--cpus`
+  already means for the same field) and hard memory limits. **Reject:** cpuset
+  pinning (a cluster-wide core-accounting subsystem for a benefit Legion's
+  scheduler doesn't model yet) and the K8s requests/limits split (Legion has
+  one `resources` block; keeping it one concept is the simplicity bet).
+- **Task filesystem into containers — Nomad, docker, K8s.** Nomad mounts the
+  alloc/task/secrets dirs into every docker container at canonical in-container
+  paths (`/alloc`, `/local`, `/secrets`) and points `NOMAD_TASK_DIR` at the
+  *in-container* path — jobs never see host paths. Docker's single-file bind
+  mounts are a famous pitfall: an atomic-rename update replaces the inode and
+  the container keeps the stale file. K8s solves refresh atomicity with
+  projected volumes and symlink swapping — correct, and heavy. **Take:**
+  Nomad's canonical mount point + env translation, and *directory-level*
+  mounting so host-side atomic renames stay visible (which is also why we
+  reject per-file mounts). **Reject:** K8s-style projection machinery, and
+  Nomad's three-directory split — Legion has one task dir today, so one mount.
 
 ## 3. Jobs to be done
 
@@ -103,11 +157,24 @@ and leaves the container running — so the runtime honestly reports
   lost.
 - When my identity token refreshes, I want my process told to re-read it (a
   signal), so I don't take a full restart every few hours.
+- When I declare memory for my container, I want a leak in *my* service to
+  kill *my* container, so it doesn't become the neighboring team's incident.
+- When my app expects a config file or a data file at startup, I want to
+  declare it in the jobspec and read it from a well-known path inside the
+  container, so I don't rebuild the image for every config change.
 
 **Cluster operator**
 - When I promise "what works on the mac dev cluster works in prod," I want the
   container runtime's capability table to be the same on both, so I stop
   explaining the asymmetry.
+- When I pack multiple teams' containers onto a node, I want the limits the
+  scheduler placed against to be the limits the kernel enforces, so one bad
+  deploy can't take out the node.
+
+**Security / platform admin**
+- When a service needs a rotating credential, I want it delivered as a file
+  the process re-reads on a signal, so it never sits in the environment where
+  any `inspect` or `/proc` reader can lift it.
 
 **Autonomous agent**
 - When I diagnose a job over MCP, I want one-shot exec to work regardless of
@@ -125,6 +192,15 @@ and leaves the container running — so the runtime honestly reports
 3. A job declares `identity { changeMode: 'signal', changeSignal: 'SIGHUP' }`
    on a container task. Submission is accepted; on token refresh the app gets
    SIGHUP inside the container.
+4. A container task declares `resources: { memory: 256 }` and leaks. On Linux
+   the kernel OOM-kills it at 256 MiB; the allocation fails with a message
+   naming the memory limit, the restart policy takes over, and the node's
+   other allocations never notice.
+5. A job declares a KV-rendered config file at `/legion/task/config/app.toml`
+   and an identity file at `/legion/task/identity/token`, with
+   `changeMode: signal`. The container reads both at the declared paths; when
+   the KV key changes or the token rotates, the files are atomically replaced
+   and the app gets its SIGHUP — no restart, no image rebuild.
 
 ## 4. Goals and non-goals
 
@@ -137,24 +213,39 @@ and leaves the container running — so the runtime honestly reports
   accepted for container tasks.
 - Linux container teardown becomes graceful: SIGTERM → bounded wait →
   `delete --force`.
+- Declared `resources.memory` / `resources.cores` are kernel-enforced on
+  Linux via the bundle's `linux.resources` — the same fields that already
+  size the macOS guest, with the same declared-only semantics.
+- The task directory is mounted into the container at a canonical path, and
+  `supports_kv_file_injection()` / `supports_identity_file()` flip to true:
+  KV file injection, identity file delivery, and file/tree artifacts work in
+  containers on both platforms, refresh included.
 - The capability tables in
   [docs/task-runtime-container.md](../../docs/task-runtime-container.md),
   [docs/exec-and-actions.md](../../docs/exec-and-actions.md), and
-  [docs/workload-identity.md](../../docs/workload-identity.md) lose three ❌s.
+  [docs/workload-identity.md](../../docs/workload-identity.md) lose six ❌s.
 
 **Non-goals** (each stays on
-[TODO.md](../TODO.md) / the capability table as an honest ❌)
+[TODO.md](../TODO.md) / the public docs as an honest limitation)
 
-- **Linux cgroup resource limits and port mapping.** Real, adjacent, and
-  *independent*: they live in the bundle's `config.json` generation
-  (`oci_bundle.rs`), not in the runtime-subcommand seam this plan builds on.
-  Bundling them here would couple two unrelated review surfaces.
-- **Mounting the task directory into the container** (unblocks KV/identity
-  *file* delivery and file/tree artifacts). Needs a volume-plumbing design of
-  its own; explicitly deferred by the artifact and identity plans already.
 - **Jobspec `stopSignal` / `stopGracePeriod` knobs and a `legion alloc signal`
   CLI verb.** New user-facing surface; deferred until a job actually needs a
   non-default value (§11 Q3). The fixed docker-style default ships first.
+- **Linux port mapping / private network namespaces.** Containers keep host
+  networking; that's the networking plan's territory, not a bundle tweak.
+- **Cpuset pinning for `cores`.** Kernel-level core *reservation* needs
+  node-wide core accounting the scheduler doesn't model; CFS bandwidth gives
+  the enforcement without the subsystem (§6.4).
+- **Mapping `resources.cpu` (MHz) to `cpu.weight`.** Stays scheduling-only on
+  every platform, as today (§11 Q4).
+- **File-delivery destinations outside the task-dir mount.** One mount, one
+  rule (§6.5); per-file bind mounts and K8s-style projection are rejected, not
+  postponed.
+- **Alloc-dir sharing between tasks** — tracked by
+  [shared-alloc-dir-proposal.md](shared-alloc-dir-proposal.md), blocked on
+  multi-task allocations.
+- **A read-only secrets split of the mount** (Nomad's `/secrets`): revisit
+  when Legion grows a distinct secrets dir; today there is one task dir.
 - **Detach/reattach exec sessions.** Same call as the exec plan: sessions die
   with the connection.
 - The `sandbox` microVM guest-agent exec path — tracked by the sandbox plan.
@@ -189,6 +280,36 @@ and leaves the container running — so the runtime honestly reports
 - **Container identity.** Every allocation's container is named
   `legion-<alloc-id>` (`container.rs:141`) on both platforms, so any runtime
   subcommand can address it without new state.
+- **The bundle spec is Legion's to extend.** `build_spec`
+  (`src/task_plugins/oci_bundle.rs:428`) generates the whole OCI runtime
+  `config.json`; its `linux.resources` today holds only the device-cgroup
+  deny rule (`oci_bundle.rs:481`). The runtime (runc/crun/youki) creates the
+  cgroup and applies whatever resources the spec declares — no new process
+  management needed. `resource_amount` (`container.rs:160`) already parses
+  `memory`/`cores` for the macOS flags; the exec runtime already stakes out
+  the cgroup-v2-only position (`exec.rs:475`).
+- **Volumes are the template for the task-dir mount.** The worker resolves
+  volume env to *in-task destinations* for isolating runtimes — the
+  `in_task_view` match in `mount_allocation_volumes`
+  (`src/worker/task_manager.rs:911`) and `TaskInstance::volume_env`
+  (`mod.rs:184`) — and the plugin turns `instance.volumes` into
+  `--volume host:dest` args (macOS, `container.rs:230`) or `rbind` mount
+  entries (`volume_mounts`, `oci_bundle.rs:409`). The task-dir mount is one
+  more entry through the same two code paths.
+- **Worker-injected env exists but is withheld.** `instance.extra_env` carries
+  `LEGION_ALLOC_DIR`, `LEGION_TASK_DIR`, `LEGION_ARTIFACT_<NAME>`
+  (`task_manager.rs:865`) with *host* paths; the container plugin deliberately
+  merges only `volume_env()` (`container.rs:447`). `${artifact.<name>}`
+  interpolation into the runtime config is also host-path substitution
+  (`substitute_artifact_tokens`, `task_manager.rs:874`).
+- **File destinations are free-form paths today.** `kv_injections.files[]`
+  declares a `path` (`src/structs/job.rs:1703`); identity `file` delivery
+  declares one too, absolute by convention (e.g.
+  `/var/run/legion/identity/<name>/token`,
+  `src/structs/workload_identity.rs:829`) — sensible for the exec runtime's
+  host filesystem, unreachable inside a container. Identity naming already
+  enforces a traversal-safe charset at admission *and* re-checks on the worker
+  (`workload_identity.rs:266`) — the precedent §6.5's path rule follows.
 
 ## 6. Proposed design
 
@@ -281,23 +402,184 @@ its own resolution.
 macOS keeps delegating to `container stop` (already TERM-then-wait). `destroy`
 keeps delegating to `stop`.
 
+### 6.4 Linux cgroup limits from the resources the job already declares
+
+No new jobspec surface. The same two fields that size the macOS guest gain
+their Linux meaning, written into the generated `config.json` by `build_spec`
+(which gains the task's `resources` as a parameter):
+
+```jsonnet
+resources: { memory: 256, cores: 2 }   // MiB, core count — as today
+```
+
+becomes
+
+```json
+"linux": {
+  "cgroupsPath": "legion/legion-<alloc-id>",
+  "resources": {
+    "devices": [ ... ],                          // unchanged
+    "memory": { "limit": 268435456, "swap": 268435456 },
+    "cpu":    { "quota": 200000, "period": 100000 }
+  }
+}
+```
+
+The mappings, each deliberate:
+
+- **`memory` (MiB) → `memory.limit` bytes, hard.** Exceeding it is a kernel
+  OOM kill of the container's cgroup — the failure lands on the task that
+  leaked, not the node. `memory.swap` is set *equal* to the limit, so swap
+  cannot be used to escape it (the K8s semantic; docker's default of
+  2×limit-in-swap makes limits soft in practice, which defeats the point of
+  scheduling against them).
+- **`cores` → CFS bandwidth, not pinning.** `quota = cores × period` with the
+  kernel-default 100 ms period — exactly how docker implements `--cpus=N`,
+  and the same *meaning* the field already has on macOS ("N CPUs' worth"),
+  just enforced by throttling instead of by VM sizing. Fractional values work
+  naturally (`cores: 0.5` → quota 50000); the macOS arm keeps its rounding.
+  Cpuset reservation is the rejected alternative (see prior art): it needs
+  the worker to own a node-wide core-assignment map, and the scheduler
+  doesn't model individual cores anywhere else.
+- **`cpu` (MHz) stays scheduling-only** on Linux exactly as it is on macOS —
+  one asymmetric field would be worse than one unenforced one (§11 Q4).
+- **Declared-only, like macOS:** a job that declares nothing gets no
+  `memory`/`cpu` entries and runs unconstrained — scheduler defaults are not
+  folded in, mirroring the existing macOS call. The asymmetry that *remains*
+  is the runtime's own: an unsized macOS guest still gets Apple's 1 GiB/4-CPU
+  VM default, while an unsized Linux container is genuinely unlimited.
+- **`cgroupsPath` is set explicitly** (`legion/legion-<alloc-id>`, cgroupfs
+  form) so operators can find a task's cgroup by allocation id with no
+  runtime-specific default knowledge. The systemd cgroup driver
+  (`:slice:prefix:name` form) is out of scope until someone runs Legion under
+  systemd-managed cgroup delegation and needs it.
+
+**Requirements and failure modes.** Limits require the cgroup v2 unified
+hierarchy — the position the exec runtime already takes for cgroup joining —
+and the memory/cpu controllers delegated to whatever user the runtime runs
+as. Both failure shapes surface as the runtime's own error at container
+create, which `start()` already propagates with context; the public doc gets
+a failure-modes row for each (missing controllers → actionable
+"enable cgroup v2 / delegation" guidance). **OOM diagnostics:** on a nonzero
+exit, the plugin best-effort reads the cgroup's `memory.events` `oom_kill`
+counter before teardown and, when it fired, annotates the failure record
+("container exceeded its 256 MiB memory limit and was OOM-killed") — exit
+code 137 alone sends the author hunting through dmesg.
+
+### 6.5 Mount the task directory; file delivery follows
+
+**The mount.** Every container task gets its host task directory bind-mounted
+read-write at one canonical in-container path:
+
+```
+/legion/task
+```
+
+- **Linux:** one more `rbind` entry from `volume_mounts`'s pattern, appended
+  *before* declared volumes (so an explicit volume can still shadow it, same
+  rule the mount list already follows for its defaults).
+- **macOS:** one more `--volume <host-task-dir>:/legion/task` on the `run`
+  argv, through the code path volumes already use.
+
+The *directory* is mounted, never individual files: the worker's refresh
+machinery (KV re-render, identity rotation) replaces files atomically by
+rename, which stays visible through a directory bind mount and silently
+breaks through a per-file one (the docker pitfall from prior art). One
+verification item rides the e2e tests: Apple `container`'s virtiofs must
+propagate host-side renames promptly; if it doesn't, that's a documented
+macOS limitation, not a design change.
+
+**Env translation.** The container plugin stops discarding worker-injected
+env and instead merges a *translated* view, extending the exact convention
+volumes established (in-task destinations for isolating runtimes):
+
+- `LEGION_TASK_DIR=/legion/task`;
+- `LEGION_ARTIFACT_<NAME>` values have the host task-dir prefix swapped for
+  `/legion/task` (an artifact staged outside the task dir would be omitted,
+  not leaked as a dead host path — cannot happen today, defense anyway);
+- `${artifact.<name>}` config interpolation uses the same translated paths
+  for container tasks, keyed off the existing `in_task_view` match in the
+  worker (`task_manager.rs:911`);
+- `LEGION_ALLOC_DIR` stays withheld — the alloc dir is not mounted, and
+  pointing env at an invisible path is the bug this section exists to fix.
+  It returns if/when the shared-alloc-dir proposal lands.
+
+**File delivery.** With the mount in place, the two admission gates flip
+(`supports_kv_file_injection`, `supports_identity_file` → true) and file/tree
+artifacts become readable where they already stage. One new rule makes the
+declared paths honest — **for container tasks, a file-delivery destination
+must resolve under `/legion/task`** (relative paths resolve against it):
+
+```jsonnet
+kvInjections: { files: [
+  { path: 'config/app.toml', file: { template: '...' } },  // → /legion/task/config/app.toml
+] },
+identities: [{
+  name: 'api',
+  file: { path: '/legion/task/identity/token' },           // absolute form, in range
+  changeMode: 'signal', changeSignal: 'SIGHUP',
+}]
+```
+
+An out-of-range path is rejected at submit with the fix in the message:
+
+```
+task api identity "api": file.path "/var/run/legion/token" is outside the
+container task directory; use a path under /legion/task (or a relative path),
+or switch to env delivery
+```
+
+The worker re-checks the resolved path before any join (defense in depth —
+the same two-layer stance identity naming already takes for traversal).
+On the host side nothing moves: the worker keeps writing to
+`<task_dir>/<relative>`, and the mount does the rest. The exec runtime is
+untouched — its host-absolute paths remain valid because its filesystem *is*
+the host's. This is the one place a jobspec is not verbatim-portable between
+the two runtimes; the error message and the docs both say so plainly.
+
+**Refresh, end to end.** Phase 2's signal seam plus this mount completes the
+loop scenario 5 describes: host-side atomic rewrite inside the mounted dir →
+visible in-container → `changeMode: signal` delivers `changeSignal` via
+`<runtime> kill`. No container restart for a token rotation or a KV flip.
+
+**Security posture.** The mount exposes the allocation's own private task
+directory and nothing else; the log dir is not mounted (captured stdout/stderr
+can carry secrets and stays owner-restricted on the host). `noNewPrivileges`,
+masked paths, and the capability set are unchanged. A read-only secrets split
+is a named non-goal until Legion has a distinct secrets dir to split out.
+
 ## 7. Proto, struct, config, and persistence changes
 
 - **None to the proto, wire format, or persistence.** The exec frame protocol,
   `ExecAllocation`, and worker state are untouched.
-- **No new jobspec fields** — nothing for `configs/jobs/maximal.jsonnet`.
+- **No new jobspec fields** — `resources.memory`/`cores`, `kv_injections.files`,
+  identity `file`, and `artifacts` all exist; this plan changes what they *do*
+  for container tasks, so `configs/jobs/maximal.jsonnet` is unchanged (its
+  comments on the container-task example get the new semantics).
 - `TaskPlugin` gains the defaulted `signal()` method (dylib plugins stay
   source-compatible; the registry's existing version gating covers the rebuild
   requirement, same as the exec plan's ABI addition).
-- Docs: capability tables in `docs/task-runtime-container.md` (`Signal
-  delivery` → ✅, exec row → ✅ Linux), `docs/exec-and-actions.md` (the
-  `container (youki)` row), `docs/workload-identity.md` (§ runtime matrix:
-  container signal → ✅); `internal_docs/TODO.md` per phase.
+- `build_bundle`/`build_spec` gain the task's `resources` (internal signature
+  change only); capability flips in the container plugin:
+  `supports_kv_file_injection`, `supports_identity_file`, `supports_signal`
+  → true.
+- **One new validation rule** (a *tightening* only for specs that were
+  rejected outright before): container-task file-delivery paths must resolve
+  under `/legion/task` (§6.5) — enforced at admission, re-checked on the
+  worker.
+- Docs: capability tables in `docs/task-runtime-container.md` (signal, KV
+  file, identity file, Linux limits, Linux exec rows; the "Resources and
+  Ports" and "Current Scope and Limitations" sections), `docs/exec-and-actions.md`
+  (the `container (youki)` row), `docs/workload-identity.md` (runtime matrix +
+  container file paths), `docs/kv-store.md` (container file injection),
+  `docs/artifacts.md` (file/tree artifacts in containers);
+  `internal_docs/TODO.md` per phase.
 
 ## 8. Implementation phases
 
-Each ships alone, in any order after Phase 1; 2 and 3 are independent of each
-other.
+Each ships alone. 1 goes first (it revives the dead OCI argv path the others
+lean on for confidence); 2–5 are mutually independent, listed in the order
+that front-loads user value.
 
 - **Phase 1 — Linux OCI exec.** `supports_exec()` flip, OCI argv dialect in
   `build_exec_command` (+ env mapping, `--` separator), unit tests, e2e
@@ -312,13 +594,36 @@ other.
   one is force-deleted at the deadline, docs. Builds on Phase 2's `kill`
   helper but ships independently (it can shell out directly if 2 hasn't
   landed). *Value: no more data-loss stops on Linux.*
+- **Phase 4 — Linux cgroup limits.** `resources` threaded into
+  `build_spec`, the `memory`/`cpu` mappings + `cgroupsPath`, OOM annotation
+  from `memory.events`, unit tests over the generated spec, e2e OOM/throttle
+  tests, docs (including the failure-modes rows). Entirely inside
+  `oci_bundle.rs`/`container.rs`. *Value: the scheduler's arithmetic becomes
+  the kernel's; noisy neighbors die alone.*
+- **Phase 5 — task-dir mount + file delivery.** The `/legion/task` mount on
+  both platforms, translated env + `${artifact.*}` interpolation, the
+  path-range validation with its error message, capability flips
+  (`supports_kv_file_injection`, `supports_identity_file`), e2e file-visibility
+  and refresh tests, docs across the four affected pages. Touches worker core
+  only at the existing `in_task_view` seam. *Value: three capability-table
+  rows at once — config files, tokens, and data artifacts inside containers,
+  with rotation.*
 
 ## 9. Testing plan
 
-- **Unit (every phase, CI-safe):** argv construction — OCI exec includes
-  `--tty`/`--`/`--env` and never `--interactive`; Apple arm unchanged (no
-  `--`); signal argv per platform; stop sequence ordering (kill before
-  delete). Mirrors the existing `build_apple_launch` test style.
+- **Unit (every phase, CI-safe):**
+  - argv construction — OCI exec includes `--tty`/`--`/`--env` and never
+    `--interactive`; Apple arm unchanged (no `--`); signal argv per platform;
+    stop sequence ordering (kill before delete). Mirrors the existing
+    `build_apple_launch` test style.
+  - generated `config.json` — memory limit/swap byte math, quota/period from
+    fractional and whole `cores`, no `memory`/`cpu` entries when nothing is
+    declared, `cgroupsPath` shape, devices rule untouched.
+  - mounts and env — `/legion/task` mount present on both arms and ordered
+    before declared volumes; `LEGION_TASK_DIR` and `LEGION_ARTIFACT_*`
+    translation (including the omit-when-outside case); path-range validation
+    accepts relative + in-range absolute, rejects out-of-range with the
+    documented message.
 - **E2E, `#[ignore]`d behind a real runtime** (extending the existing
   `oci_runtime_*` suite; run with
   `LEGION_OCI_RUNTIME=runc cargo test --lib oci_runtime -- --ignored`):
@@ -327,27 +632,47 @@ other.
   - signal: a SIGHUP-trapping script observably reacts;
   - graceful stop: TERM-trapping container exits inside the window (and
     `delete --force` finds it already gone); TERM-ignoring container is gone
-    by ~grace+ε.
+    by ~grace+ε;
+  - limits: a memory-hog container dies at its declared limit with the OOM
+    annotation in the failure record; `nproc`-style spin under `cores: 1`
+    shows throttling (cgroup `cpu.stat` `nr_throttled > 0` — cheaper and less
+    flaky than wall-clock assertions);
+  - files: a staged file artifact and a KV-rendered file are readable at
+    their `/legion/task` paths from inside the container; a host-side atomic
+    rewrite is visible inside without restart (the rename-propagation check —
+    on macOS this is also the virtiofs verification from §6.5).
   - Matrix: runc (primary), crun, youki — same tests, `LEGION_OCI_RUNTIME`
     selects; divergences become documented limitations, not silent skips.
 - **Regression:** full `cargo test --all --locked`; `cargo test --test
   acl_endpoints` (no new endpoints — must stay green untouched); the identity
-  admission test inversion.
+  admission test inversion; existing volume-mount tests unchanged (the
+  task-dir mount must not reorder or shadow declared volumes).
 - Not a scheduler change — no benchmark numbers required.
 
 ## 10. Rollout and backward compatibility
 
-- No feature gate. All three phases change worker-local behavior only; no
-  manager/worker version handshake concerns (an old manager talking to a new
-  worker simply finds exec working where it used to error).
-- Two **visible behavior changes** to release-note:
+- No feature gate. Every phase changes worker-local behavior only (plus, for
+  Phase 5, an admission rule on the manager); no manager/worker version
+  handshake concerns (an old manager talking to a new worker simply finds
+  exec working where it used to error).
+- Four **visible behavior changes** to release-note:
   1. Linux container stop delivers SIGTERM and waits up to 10 s before the
      force-delete. Rescheduling a hung container is up to 10 s slower than
      today's instant SIGKILL — the correct trade, and the docker default
      everyone already operates under.
   2. `changeMode: signal` container jobs that used to be rejected at submit
-     now deploy.
-- Existing jobs, specs, and clusters need no action.
+     now deploy; likewise KV-file and identity-file container jobs (Phase 5).
+  3. **Declared limits become real on Linux.** A container job declaring
+     `memory: 256` while actually using more ran fine yesterday and is
+     OOM-killed today. This is the declared contract finally being enforced —
+     the release note says so plainly, and the OOM annotation tells the
+     author which limit fired and where it came from. Jobs declaring nothing
+     see no change.
+  4. Container tasks start receiving `LEGION_TASK_DIR` / `LEGION_ARTIFACT_*`
+     (in-container values) and a `/legion/task` mount. An image that already
+     has a `/legion` path would be shadowed — improbable, called out in the
+     release note regardless.
+- Existing jobs, specs, and clusters otherwise need no action.
 
 ## 11. Open questions
 
@@ -367,6 +692,23 @@ other.
   not this plan, should decide names and defaults (they belong at task level,
   next to `resources`, and would go through their own mini-plan since they are
   new jobspec surface for *every* runtime).
+- **Q4 — map `resources.cpu` (MHz) to `cpu.weight`?** Nomad does (MHz →
+  shares), and it only matters under contention. *Lean:* no — the field is
+  scheduling-only on macOS, and one field meaning different things per
+  platform costs more explanation than proportional weight buys. Revisit with
+  evidence of contention complaints on packed nodes.
+- **Q5 — is `/legion/task` the right canonical path?** Nomad's `/local` is
+  shorter; `/legion/task` is unmistakably Legion's and leaves room for
+  siblings (`/legion/alloc`, `/legion/secrets`) if the deferred splits ever
+  land. *Lean:* `/legion/task` — provenance beats brevity for a path users
+  will grep for, and it is a constant we can never comfortably change once
+  jobs hardcode it, so pick the self-describing one.
+- **Q6 — should the env-delivery identity backing file (`<ENV>_FILE`) be
+  exposed in containers?** It lives under the worker's own root today, not
+  the task dir. *Lean:* out of scope — env delivery works by value at launch;
+  containers that want a refreshable on-disk token should use file delivery,
+  which this plan makes work. Reconsider only if a real SDK needs the
+  `_FILE` convention specifically.
 
 ## 12. Acceptance criteria
 
@@ -380,3 +722,14 @@ other.
 - **Phase 3:** the two e2e stop tests (graceful exit, forced deadline) pass;
   `stop` on an already-exited container remains error-free; docs no longer
   call Linux stop "delete --force" only.
+- **Phase 4:** scenario 4 works end to end on a Linux worker — the memory hog
+  is OOM-killed at its declared limit with the annotated failure record, the
+  spin test shows CFS throttling, an undeclared job's spec carries no
+  `memory`/`cpu` entries, and the capability table's "Memory / CPU limits"
+  row reads ✅ for Linux with the cgroup-v2 requirement documented.
+- **Phase 5:** scenario 5 works end to end on both platforms — declared KV
+  file, identity file, and a file artifact all readable at `/legion/task`
+  paths inside the container, a rotation visible without restart; the
+  out-of-range path is rejected at submit with the documented error; the
+  capability table's KV-file / identity-file / artifact rows read ✅ with the
+  path rule stated.
