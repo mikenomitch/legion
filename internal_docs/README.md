@@ -110,6 +110,7 @@ by project impact. The full template and a worked example:
 - [multi-cluster-federation-plan_calls.md](calls/multi-cluster-federation-plan_calls.md)
 - [multi-raft-persistence-plan_calls.md](calls/multi-raft-persistence-plan_calls.md)
 - [persistence-plan_calls.md](calls/persistence-plan_calls.md)
+- [pre-benchmark-hardening_calls.md](calls/pre-benchmark-hardening_calls.md)
 - [preemption-and-eviction-plan_calls.md](calls/preemption-and-eviction-plan_calls.md)
 - [service-discovery-final-plan_calls.md](calls/service-discovery-final-plan_calls.md)
 - [shared-alloc-dir-proposal_calls.md](calls/shared-alloc-dir-proposal_calls.md)
