@@ -490,6 +490,8 @@ pub struct Metrics {
     pub scheduler_index_maintenance_seconds: Arc<Histogram>,
     /// `legion_scheduler_plan_phase_seconds{phase}`
     pub scheduler_plan_phase_seconds: Arc<HistogramVec>,
+    /// `legion_scheduler_lazy_sample_fallback_total`
+    pub scheduler_lazy_sample_fallback_total: Arc<Counter>,
     /// Render order for the exposition endpoint.
     families: Vec<Arc<dyn RenderMetric>>,
 }
@@ -629,6 +631,15 @@ impl Metrics {
             series: Series::new(),
         });
 
+        let scheduler_lazy_sample_fallback_total = Arc::new(Counter {
+            meta: FamilyMeta {
+                name: "legion_scheduler_lazy_sample_fallback_total",
+                help: "Plans that re-ran with the eager epoch sample because the read model changed mid-plan.",
+                labels: &[],
+            },
+            cell: CounterCell::default(),
+        });
+
         let families: Vec<Arc<dyn RenderMetric>> = vec![
             Arc::clone(&allocations) as Arc<dyn RenderMetric>,
             Arc::clone(&eval_queue_depth) as Arc<dyn RenderMetric>,
@@ -644,6 +655,7 @@ impl Metrics {
             Arc::clone(&scheduler_index_maintenance_seconds) as Arc<dyn RenderMetric>,
             Arc::clone(&scheduler_index_queries_total) as Arc<dyn RenderMetric>,
             Arc::clone(&scheduler_index_shadow_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&scheduler_lazy_sample_fallback_total) as Arc<dyn RenderMetric>,
             Arc::clone(&scheduler_plan_phase_seconds) as Arc<dyn RenderMetric>,
             Arc::clone(&store_write_lock_wait_seconds) as Arc<dyn RenderMetric>,
         ];
@@ -665,6 +677,7 @@ impl Metrics {
             scheduler_index_shadow_total,
             scheduler_index_maintenance_seconds,
             scheduler_plan_phase_seconds,
+            scheduler_lazy_sample_fallback_total,
             families,
         }
     }

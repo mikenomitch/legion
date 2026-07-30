@@ -258,6 +258,16 @@ async fn run_worker_with_manager(
     // heartbeat reply tells it which loopback listeners to run and where each
     // one may send traffic. Idle (and free) until a task declares upstreams.
     let forwarder = Arc::new(UpstreamForwarder::new());
+    // Heartbeat cadence: worker-type config (`heartbeatSeconds`, clamped to
+    // 1..=30) or the built-in default. The manager's lost window stays 10s,
+    // so intervals above ~3s trade detection margin for load — the manager
+    // warns when serving such a config (docs/architecture-managers-workers.md).
+    let heartbeat_interval = Duration::from_secs(
+        config
+            .heartbeat_seconds
+            .map(|seconds| u64::from(seconds).clamp(1, 30))
+            .unwrap_or(WORKER_HEARTBEAT_DURATION_SEC),
+    );
     let heartbeat_fut = start_heartbeats(
         name.clone(),
         client.clone(),
@@ -267,6 +277,7 @@ async fn run_worker_with_manager(
         credentials.clone(),
         registration,
         forwarder,
+        heartbeat_interval,
     );
     let self_fence_fut = start_self_fence_watchdog(task_manager.clone(), last_successful_heartbeat);
     let checks_fut = start_node_checks(
@@ -391,6 +402,17 @@ async fn create_manager_client(
 // promptly — the self-fence clock keeps running regardless.
 const HEARTBEAT_RETRY_MIN: Duration = Duration::from_millis(500);
 const HEARTBEAT_RETRY_MAX: Duration = Duration::from_secs(10);
+
+/// The heartbeat sleep, jittered ±10% so a fleet that (re)started together
+/// does not stay phase-locked forever — 10k workers heartbeating in the
+/// same instant is a self-inflicted thundering herd (heartbeat-scale plan
+/// §5). Also what lets the manager-side heartbeat group commit form
+/// batches from *steady-state* arrivals rather than only from bursts.
+fn jittered_heartbeat_interval(interval: Duration) -> Duration {
+    use rand::Rng;
+    let jitter = rand::thread_rng().gen_range(0.9..=1.1);
+    interval.mul_f64(jitter)
+}
 // How often the self-fence watchdog re-checks `last_successful_heartbeat`
 // against each running allocation's window.
 const SELF_FENCE_CHECK_INTERVAL: Duration = Duration::from_secs(1);
@@ -414,6 +436,7 @@ async fn start_heartbeats(
     credentials: Arc<WorkerCredentials>,
     registration: RegistrationPayload,
     forwarder: Arc<UpstreamForwarder>,
+    heartbeat_interval: Duration,
 ) -> R<()> {
     let mut backoff = HEARTBEAT_RETRY_MIN;
 
@@ -433,10 +456,7 @@ async fn start_heartbeats(
                     .lock()
                     .expect("heartbeat clock lock") = std::time::Instant::now();
                 backoff = HEARTBEAT_RETRY_MIN;
-                tokio::time::sleep(tokio::time::Duration::from_secs(
-                    WORKER_HEARTBEAT_DURATION_SEC,
-                ))
-                .await;
+                tokio::time::sleep(jittered_heartbeat_interval(heartbeat_interval)).await;
             }
             // The node token can be revoked/rotated (for example ACLs were
             // just enabled, or the manager state was reset). Re-register with
@@ -913,6 +933,7 @@ mod tests {
                 health_checks: "[]".into(),
             },
             Arc::new(UpstreamForwarder::new()),
+            Duration::from_secs(WORKER_HEARTBEAT_DURATION_SEC),
         ));
 
         // Long enough for several failed attempts (first retry after 500ms).
