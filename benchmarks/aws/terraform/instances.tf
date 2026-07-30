@@ -1,0 +1,175 @@
+# Canonical's official Ubuntu 24.04 AMI pointer — resolved at apply time,
+# never a hardcoded AMI id. Pinned x86_64 to match the instance types.
+data "aws_ssm_parameter" "ubuntu" {
+  name = "/aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id"
+}
+
+resource "aws_key_pair" "bench" {
+  key_name   = "${var.project}-key"
+  public_key = var.ssh_public_key
+}
+
+locals {
+  node_exporter_version = "1.8.2"
+
+  bootstrap_b64 = base64encode(templatefile("${path.module}/cloud-init/common.sh.tftpl", {
+    node_exporter_version = local.node_exporter_version
+  }))
+}
+
+# --- Control plane: 3 on-demand boxes, stable private IPs ---------------
+# The same three boxes host every system serially (Legion A, Legion B,
+# Nomad, K8s) — identical hardware is the credibility argument, so these
+# are never recreated between campaigns. lifecycle.ignore_changes on the
+# AMI keeps a mid-campaign `apply` (e.g. scaling workers) from replacing
+# them under a new Ubuntu point release.
+resource "aws_instance" "control_plane" {
+  count = var.control_plane_count
+
+  ami                    = data.aws_ssm_parameter.ubuntu.value
+  instance_type          = var.control_plane_type
+  subnet_id              = aws_subnet.bench.id
+  private_ip             = local.control_plane_private_ips[count.index]
+  vpc_security_group_ids = [aws_security_group.bench.id]
+  key_name               = aws_key_pair.bench.key_name
+  iam_instance_profile   = aws_iam_instance_profile.bench.name
+
+  root_block_device {
+    volume_type = "gp3"
+    volume_size = var.control_plane_disk_gb
+  }
+
+  user_data = templatefile("${path.module}/cloud-init/instance.yaml.tftpl", {
+    role           = "control-plane"
+    hostname       = "${var.project}-cp-${count.index}"
+    bootstrap_b64  = local.bootstrap_b64
+    install_docker = false
+  })
+
+  lifecycle {
+    ignore_changes = [ami]
+  }
+
+  tags = {
+    Name = "${var.project}-cp-${count.index}"
+    Role = "control-plane"
+  }
+}
+
+# --- Load / metrics box -------------------------------------------------
+# Prometheus + Grafana + the workload driver. Never colocated with the
+# control plane so measurement and load generation don't steal the CPU
+# being measured.
+resource "aws_instance" "loadgen" {
+  ami                    = data.aws_ssm_parameter.ubuntu.value
+  instance_type          = var.loadgen_type
+  subnet_id              = aws_subnet.bench.id
+  private_ip             = local.loadgen_private_ip
+  vpc_security_group_ids = [aws_security_group.bench.id]
+  key_name               = aws_key_pair.bench.key_name
+  iam_instance_profile   = aws_iam_instance_profile.bench.name
+
+  root_block_device {
+    volume_type = "gp3"
+    volume_size = var.loadgen_disk_gb
+  }
+
+  user_data = templatefile("${path.module}/cloud-init/instance.yaml.tftpl", {
+    role           = "loadgen"
+    hostname       = "${var.project}-loadgen"
+    bootstrap_b64  = local.bootstrap_b64
+    install_docker = true
+  })
+
+  lifecycle {
+    ignore_changes = [ami]
+  }
+
+  tags = {
+    Name = "${var.project}-loadgen"
+    Role = "loadgen"
+  }
+}
+
+# --- Simulated-worker fleet: spot ASG -----------------------------------
+# Fake nodes are the one place spot is safe: an interruption is just a
+# fleet blip the campaign already models as churn (the sim fleet
+# re-registers from the replacement instance). Scale steps are
+# `terraform apply -var worker_instances=N`.
+resource "aws_launch_template" "worker" {
+  name_prefix   = "${var.project}-worker-"
+  image_id      = data.aws_ssm_parameter.ubuntu.value
+  key_name      = aws_key_pair.bench.key_name
+  ebs_optimized = true
+
+  iam_instance_profile {
+    name = aws_iam_instance_profile.bench.name
+  }
+
+  network_interfaces {
+    subnet_id                   = aws_subnet.bench.id
+    security_groups             = [aws_security_group.bench.id]
+    associate_public_ip_address = true
+  }
+
+  block_device_mappings {
+    device_name = "/dev/sda1"
+
+    ebs {
+      volume_type = "gp3"
+      volume_size = var.worker_disk_gb
+    }
+  }
+
+  user_data = base64encode(templatefile("${path.module}/cloud-init/instance.yaml.tftpl", {
+    role           = "sim-worker"
+    hostname       = "${var.project}-worker"
+    bootstrap_b64  = local.bootstrap_b64
+    install_docker = false
+  }))
+
+  tag_specifications {
+    resource_type = "instance"
+
+    tags = {
+      Name = "${var.project}-worker"
+      Role = "sim-worker"
+    }
+  }
+}
+
+resource "aws_autoscaling_group" "workers" {
+  name                = "${var.project}-workers"
+  desired_capacity    = var.worker_instances
+  min_size            = 0
+  max_size            = 20 # 20k-node validation burst ceiling
+  vpc_zone_identifier = [aws_subnet.bench.id]
+
+  mixed_instances_policy {
+    instances_distribution {
+      on_demand_percentage_above_base_capacity = 0 # all spot
+      spot_allocation_strategy                 = "price-capacity-optimized"
+    }
+
+    launch_template {
+      launch_template_specification {
+        launch_template_id = aws_launch_template.worker.id
+        version            = "$Latest"
+      }
+
+      dynamic "override" {
+        for_each = var.worker_instance_types
+
+        content {
+          instance_type = override.value
+        }
+      }
+    }
+  }
+
+  tag {
+    key                 = "Role"
+    value               = "sim-worker"
+    propagate_at_launch = true
+  }
+}

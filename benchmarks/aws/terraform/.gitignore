@@ -1,0 +1,5 @@
+# Local state only — move to the S3 backend (main.tf) for shared use.
+.terraform/
+terraform.tfstate
+terraform.tfstate.backup
+terraform.tfvars

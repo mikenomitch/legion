@@ -139,6 +139,29 @@ CI behavior:
   raft clusters and is too heavy for per-PR CI. Its `plan_timings_are_populated_and_coherent`
   smoke test does run in normal CI and pins the phase instrumentation.
 
+### AWS comparative benchmark rig
+
+`benchmarks/aws/` holds the full-system comparison rig: Legion (raft
+lanes and streaming persistence), Nomad, and Kubernetes measured on
+identical AWS hardware with simulated worker fleets (Legion's
+[`--simulate`](worker-simulation.md), nomad-nodesim, KWOK). The
+directory's `README.md` is the runbook; the local, no-AWS validation
+loop is:
+
+```bash
+# Driver counting/latency math against known-good fixtures:
+python3 -m unittest discover benchmarks/aws/driver/tests
+
+# Full local loop: manager + simulated fleet + translated workload +
+# the real driver (also builds plugins):
+benchmarks/aws/scripts/local-smoke.sh
+```
+
+CI runs the fixture tests, `terraform validate`, and shell syntax checks
+whenever `benchmarks/aws/**` changes; nothing in CI touches AWS. The
+end-to-end sim-fleet wire test is `tests/worker_simulation.rs` (runs in
+the normal `cargo test` suite).
+
 ## Plugin-Related Test Notes
 
 Dynamic plugin tests may depend on plugin build presence.

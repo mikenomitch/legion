@@ -134,8 +134,32 @@ How to use it:
       availability-sync + eval enqueues after a mass failure; an ACL
       token-identity cache for worker-plane RPC rates.
 - [ ] AWS comparative benchmark vs Nomad/K8s
-      ([plan](plans/aws-comparative-benchmark-plan.md)): phase 0 is the
-      `legion start worker --simulate N` gap; nothing built yet.
+      ([plan](plans/aws-comparative-benchmark-plan.md),
+      [calls](calls/aws-comparative-benchmark-plan_calls.md)) — phases
+      0-1 built and locally validated 2026-07-30; campaigns (phases 2-5)
+      await an AWS account:
+  - [x] Phase 0: `legion start worker --simulate N`
+        ([mini-plan](plans/worker-simulation-plan.md),
+        [docs](../docs/worker-simulation.md)) — one process, N wire-real
+        nodes from a `node_profiles` file, real cadences, stub dispatch
+        server; end-to-end test `tests/worker_simulation.rs`.
+  - [x] Phase 1 rig, everything short of the cloud:
+        [`benchmarks/aws/`](../benchmarks/aws/README.md) — Terraform
+        (validate-clean; system-agnostic boxes + spot sim fleet + S3),
+        per-system configs (Legion A lanes / Legion B streaming+S3 lease
+        / Nomad / kubeadm+KWOK), scenario→jobs translator, measuring
+        driver with fixture-tested counting math and a `watch`
+        fault-drill mode, campaign runner + collect/fairness-record
+        scripts, piggyback experiment scripts (storm, failover,
+        streaming-RPO, 24h soak, upgrade-under-load), Grafana boards,
+        projection fitting (`analysis/fit_curves.py`), CI gate
+        (fixture tests + terraform validate), and the local no-AWS smoke
+        (`scripts/local-smoke.sh`).
+  - [ ] Phase 1 exit on real AWS: `bringup.sh` + 1k-node
+        `run-campaign.sh --system legion-a --smoke` (needs an account).
+  - [ ] Phases 2-5: Legion A/B campaigns, Nomad (verify nodesim `mock`
+        driver + install script), K8s (verify kubeadm/KWOK install +
+        watch parsing), 20k validation burst, analysis + REPORT.md.
 - [ ] Scheduling-index follow-ups deferred from
       [plan](plans/scheduling-index-plan.md) (see its calls doc):
       index-served candidates for multi-task **group** co-placement (v1
