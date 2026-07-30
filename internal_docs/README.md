@@ -59,6 +59,7 @@ When one is required and what goes in it:
 | [durability-and-ops-execution-plan.md](plans/durability-and-ops-execution-plan.md) | executed (workstreams A/B/C/D + adversarial verification, 2026-07-28); lanes topology opt-in |
 | [gang-scheduling-plan.md](plans/gang-scheduling-plan.md) | planned |
 | [job-templates-plan.md](plans/job-templates-plan.md) | in execution |
+| [job-updated-at-plan.md](plans/job-updated-at-plan.md) | shipped (detail-page header + node column label deferred) |
 | [kv-reactive-task-updates-plan.md](plans/kv-reactive-task-updates-plan.md) | shipped |
 | [late-binding-plan-apply-plan.md](plans/late-binding-plan-apply-plan.md) | planned |
 | [persistence-plan.md](plans/persistence-plan.md) | phases 0–1, 3 done |
@@ -106,6 +107,7 @@ by project impact. The full template and a worked example:
 - [exec-and-actions-plan_calls.md](calls/exec-and-actions-plan_calls.md)
 - [gang-scheduling-plan_calls.md](calls/gang-scheduling-plan_calls.md)
 - [job-templates-plan_calls.md](calls/job-templates-plan_calls.md)
+- [job-updated-at-plan_calls.md](calls/job-updated-at-plan_calls.md)
 - [kv-reactive-task-updates-plan_calls.md](calls/kv-reactive-task-updates-plan_calls.md)
 - [multi-cluster-federation-plan_calls.md](calls/multi-cluster-federation-plan_calls.md)
 - [multi-raft-persistence-plan_calls.md](calls/multi-raft-persistence-plan_calls.md)

@@ -948,6 +948,24 @@ pub fn get_migrations() -> Migrations<'static> {
         // Worker-type heartbeat cadence (heartbeat-scale plan §5): NULL =
         // the built-in default (2s). Served to workers at pre-registration.
         M::up("ALTER TABLE worker_type ADD COLUMN heartbeat_seconds INTEGER;").down(""),
+        // Job mtime (job-updated-at plan §2). The job row only ever carried
+        // `created_at`, so every surface that wanted "when did this job last
+        // change" — the UI's Updated column most visibly — showed the
+        // submission time instead, and a job stopped or resubmitted months
+        // later still read as untouched. Unix seconds, matching
+        // `job.created_at`; NULL only until the backfill below runs.
+        M::up("ALTER TABLE job ADD COLUMN updated_at INTEGER;").down(""),
+        // Backfill: pre-migration rows have no mtime to recover, and their
+        // creation time is the only honest lower bound. Guarded on
+        // `typeof(created_at)` so a row whose created_at was written as text
+        // (only the pre-rename migration fixtures do this) leaves updated_at
+        // NULL rather than poisoning an INTEGER column with a string —
+        // `job_from_row` falls back to created_at for those.
+        M::up(
+            "UPDATE job SET updated_at = created_at
+             WHERE updated_at IS NULL AND typeof(created_at) = 'integer';",
+        )
+        .down(""),
     ])
 }
 
@@ -1025,6 +1043,67 @@ mod migrations_test {
             .err()
             .is_some();
         assert!(has_kind, "`kind` column should no longer exist");
+
+        Ok(())
+    }
+
+    /// A cluster created before `job.updated_at` existed must come out of the
+    /// migration with a usable mtime rather than a NULL or an epoch-zero
+    /// timestamp — the UI's Updated column reads it directly, and "Jan 1
+    /// 1970" is a worse lie than "never changed since submission".
+    #[test]
+    fn job_updated_at_backfills_from_created_at() -> anyhow::Result<()> {
+        let migrations = get_migrations();
+
+        // Walk to the newest version that predates the column, rather than
+        // hard-coding an index, so appending migrations cannot silently turn
+        // this into a test of nothing.
+        let mut probe = Connection::open_in_memory()?;
+        migrations.to_latest(&mut probe)?;
+        let latest: usize = probe.query_row("PRAGMA user_version;", [], |row| row.get(0))?;
+        let has_updated_at = |conn: &Connection| -> anyhow::Result<bool> {
+            let mut stmt = conn.prepare("PRAGMA table_info(job);")?;
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                if row.get::<_, String>(1)? == "updated_at" {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        };
+        let mut pre_column_version = None;
+        for version in 1..=latest {
+            let mut probe = Connection::open_in_memory()?;
+            migrations.to_version(&mut probe, version)?;
+            if !has_updated_at(&probe)? {
+                pre_column_version = Some(version);
+            }
+        }
+        let pre_column_version =
+            pre_column_version.expect("no migration version predates `job.updated_at`");
+
+        let mut conn = Connection::open_in_memory()?;
+        migrations.to_version(&mut conn, pre_column_version)?;
+        // Unix seconds, the form `submit_job_config` has always written.
+        conn.execute(
+            "INSERT INTO job (id, name, status, created_at)
+             VALUES ('legacy', 'legacy', 'done', 1735689600);",
+            [],
+        )?;
+
+        migrations.to_latest(&mut conn)?;
+
+        let (created_at, updated_at): (i64, Option<i64>) = conn.query_row(
+            "SELECT created_at, updated_at FROM job WHERE id = 'legacy';",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(created_at, 1_735_689_600, "created_at is left untouched");
+        assert_eq!(
+            updated_at,
+            Some(1_735_689_600),
+            "a pre-column job's mtime backfills to its creation time"
+        );
 
         Ok(())
     }

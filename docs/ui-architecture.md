@@ -144,7 +144,12 @@ an `afterId` cursor so no events are missed across disconnects.
 
 - `Homepage.tsx`: ledger cards and active rollout summary.
 - `Nodes.tsx`: node inventory, attributes, resource usage visualization, allocation summaries.
-- `Jobs.tsx`: job list + on-demand spec retrieval. The job detail view
+- `Jobs.tsx`: job list + on-demand spec retrieval. The shared "Updated" column
+  shows `Job.updated_at` — the job record's mtime, which moves on spec
+  submissions and status transitions but *not* on allocation churn (see
+  [Job Timestamps](jobs-tasks-and-scheduling.md#job-timestamps-created_at-and-updated_at)).
+  Sorted newest-change-first by default, matching Rollouts, Templates, and
+  Manager. The job detail view
   (`pages/details/JobDetail.tsx`) marks stateful tasks with a
   "stateful · slot/keyed" badge (plus storage path) and, for jobs with
   stateful tasks or live `ListInstances` rows, renders a polled read-only
