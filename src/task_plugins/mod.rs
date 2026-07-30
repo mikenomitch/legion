@@ -14,6 +14,7 @@ use std::process::{Child, Command};
 
 mod container;
 mod exec;
+pub mod exec_isolation;
 mod exec_session;
 mod microvm;
 mod oci_bundle;
@@ -289,6 +290,21 @@ pub trait TaskPlugin: Send + Sync {
     /// Whether this runtime can deliver a Unix signal to the running task (needed
     /// for an identity with `changeMode: signal`).
     fn supports_signal(&self) -> bool {
+        false
+    }
+
+    /// Whether the task's execution is a host process this worker tracks —
+    /// `TaskInstance.child` (a process we spawned) or `TaskInstance.pid` (one
+    /// we re-adopted after a worker restart). True means the worker's task
+    /// supervisor polls it for exit, reaps it, and applies the task's
+    /// `restart` policy (see `internal_docs/plans/host-process-supervision-plan.md`).
+    ///
+    /// Default `false`: a runtime that tracks no process would otherwise be
+    /// polled by a supervisor that can never observe its exit, and a `batch`
+    /// task of that runtime would never reach a terminal state. Runtimes whose
+    /// model is "one host process we spawned" (`exec`, `container`, `sandbox`)
+    /// override this to `true`.
+    fn supervises_process(&self) -> bool {
         false
     }
 

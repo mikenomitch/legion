@@ -61,6 +61,8 @@ When one is required and what goes in it:
 | [exec-and-actions-plan.md](plans/exec-and-actions-plan.md) | shipped (all five phases) |
 | [durability-and-ops-execution-plan.md](plans/durability-and-ops-execution-plan.md) | executed (workstreams A/B/C/D + adversarial verification, 2026-07-28); lanes topology opt-in |
 | [gang-scheduling-plan.md](plans/gang-scheduling-plan.md) | planned |
+| [host-convergence-plan.md](plans/host-convergence-plan.md) | planned |
+| [host-process-supervision-plan.md](plans/host-process-supervision-plan.md) | in execution (phases 1–3 landed; phase 4 uncommitted) |
 | [job-templates-plan.md](plans/job-templates-plan.md) | in execution |
 | [kv-reactive-task-updates-plan.md](plans/kv-reactive-task-updates-plan.md) | shipped |
 | [late-binding-plan-apply-plan.md](plans/late-binding-plan-apply-plan.md) | planned |
@@ -105,6 +107,8 @@ by project impact. The full template and a worked example:
 - [container-task-kind-macos_calls.md](calls/container-task-kind-macos_calls.md)
 - [exec-and-actions-plan_calls.md](calls/exec-and-actions-plan_calls.md)
 - [gang-scheduling-plan_calls.md](calls/gang-scheduling-plan_calls.md)
+- [host-convergence-plan_calls.md](calls/host-convergence-plan_calls.md)
+- [host-process-supervision-plan_calls.md](calls/host-process-supervision-plan_calls.md)
 - [job-templates-plan_calls.md](calls/job-templates-plan_calls.md)
 - [kv-reactive-task-updates-plan_calls.md](calls/kv-reactive-task-updates-plan_calls.md)
 - [multi-cluster-federation-plan_calls.md](calls/multi-cluster-federation-plan_calls.md)

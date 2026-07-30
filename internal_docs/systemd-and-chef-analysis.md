@@ -1,8 +1,15 @@
 # Legion as a systemd replacement, and as a Chef replacement
 
-Gap analysis, not a plan. No code is proposed as committed here — where a
-direction looks worth taking, it says which plan would have to be written
-first. Written against `main` as of 2026-07-30.
+Gap analysis, not a plan. Written against `main` as of 2026-07-30.
+
+> **Update (2026-07-30).** §§3.1–3.3 have since been closed by the
+> [host process supervision plan](plans/host-process-supervision-plan.md)
+> (phases 1–3: process reaping and exit-status semantics, worker-owned cgroups,
+> `exec` hardening — see [docs/task-supervision.md](../docs/task-supervision.md)).
+> §3.4 (activation and readiness) is recorded there as *possible, not planned*.
+> The Chef path in §6 is now specified in the
+> [host convergence plan](plans/host-convergence-plan.md). The text below is
+> left as the analysis that produced both plans; read it as of the date above.
 
 The question this answers: *could Legion be used instead of systemd, and
 instead of Chef, and if not, what would have to change?*

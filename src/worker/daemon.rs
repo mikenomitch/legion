@@ -17,6 +17,7 @@ use crate::worker::{
     state::WorkerStateStore,
     task_health::spawn_health_monitor,
     task_manager::{launch_task_allocation, WorkerTaskManager},
+    task_supervisor::start_task_supervisor,
 };
 
 use futures::join;
@@ -156,6 +157,10 @@ async fn run_worker_with_manager(
     // need the node id (it goes into every plugin request) plus the operator's
     // hostVolumes declarations from the worker config.
     let host_volumes = parse_host_volumes(&config.host_volumes);
+    // Task runtimes run in-process as dylibs and take no config of their own,
+    // so cross-cutting worker settings reach them through the environment —
+    // the same channel `sandbox` uses for LEGION_SANDBOX_KERNEL.
+    apply_resource_enforcement_env(&config.resource_enforcement);
     let restored_allocations = {
         let mut manager = task_manager.lock().expect("task manager");
         manager.load_builtin_plugins();
@@ -277,11 +282,15 @@ async fn run_worker_with_manager(
         credentials,
     );
     let log_maintenance_fut = start_log_maintenance(task_manager.clone());
+    // Notices task processes exiting, reaps them, and applies each task's
+    // `restart` policy (see docs/task-supervision.md).
+    let supervisor_fut = start_task_supervisor(task_manager.clone());
     let _res = join!(
         heartbeat_fut,
         self_fence_fut,
         checks_fut,
         log_maintenance_fut,
+        supervisor_fut,
         worker_server_fut
     );
 
@@ -306,6 +315,36 @@ async fn connect_manager_with_retry(manager_addr: &str) -> R<ManagerClient<Chann
                 backoff = std::cmp::min(backoff * 2, max_backoff);
             }
         }
+    }
+}
+
+/// Publishes the worker's `resourceEnforcement` settings into the environment
+/// the task runtimes read (see `docs/task-supervision.md`). An empty or
+/// unparseable payload leaves enforcement off, which is the default and the
+/// behavior every worker had before this existed.
+fn apply_resource_enforcement_env(raw: &str) {
+    let config = if raw.trim().is_empty() {
+        crate::structs::WorkerResourceEnforcementConfig::default()
+    } else {
+        match serde_json::from_str::<crate::structs::WorkerResourceEnforcementConfig>(raw) {
+            Ok(config) => config,
+            Err(err) => {
+                warn!(error = ?err, "Invalid worker resourceEnforcement config; enforcement off");
+                crate::structs::WorkerResourceEnforcementConfig::default()
+            }
+        }
+    };
+
+    if config.enabled {
+        info!(
+            cgroup_parent = %config.cgroup_parent,
+            "Resource enforcement enabled: exec tasks run in worker-owned cgroups"
+        );
+        std::env::set_var(crate::constants::ENV_RESOURCE_ENFORCEMENT, "1");
+        std::env::set_var(crate::constants::ENV_CGROUP_PARENT, &config.cgroup_parent);
+    } else {
+        std::env::remove_var(crate::constants::ENV_RESOURCE_ENFORCEMENT);
+        std::env::remove_var(crate::constants::ENV_CGROUP_PARENT);
     }
 }
 
@@ -481,7 +520,7 @@ async fn heartbeat_tick(
 
     {
         let start = std::time::Instant::now();
-        let (allocations, failures, allocation_health, volume_reports) = {
+        let (allocations, failures, terminations, allocation_health, volume_reports) = {
             let mut manager = task_manager.lock().expect("task manager");
             let failures = manager
                 .drain_failures()
@@ -492,17 +531,20 @@ async fn heartbeat_tick(
                     artifact_states: failure.artifact_states,
                 })
                 .collect::<Vec<_>>();
+            let terminations = manager.drain_terminations();
             let allocation_health = manager.allocation_health_snapshot();
             let volume_reports = manager.drain_volume_reports();
             (
                 manager.allocations_snapshot(),
                 failures,
+                terminations,
                 allocation_health,
                 volume_reports,
             )
         };
         let running = allocations.clone();
         let failures_for_redrive = failures.clone();
+        let terminations_for_redrive = terminations.clone();
         let volume_reports_for_redrive = volume_reports.clone();
 
         let req = credentials.attach(tonic::Request::new(HeartbeatRequest {
@@ -511,6 +553,16 @@ async fn heartbeat_tick(
             failed_allocations: failures,
             allocation_health,
             volume_reports,
+            terminated_allocations: terminations
+                .into_iter()
+                .map(|report| crate::structs::TerminatedAllocation {
+                    allocation_id: report.allocation_id,
+                    success: report.success,
+                    exit_code: report.exit_code,
+                    signal: report.signal,
+                    message: report.message,
+                })
+                .collect(),
         }));
 
         let response = match client_clone.heartbeat(req).await {
@@ -523,6 +575,9 @@ async fn heartbeat_tick(
                 for failure in failures_for_redrive {
                     manager.record_failure(failure.allocation_id, failure.reason);
                 }
+                // Same for terminal outcomes: a batch task's completion lost
+                // to a dead connection would leave the job "running" forever.
+                manager.requeue_terminations(terminations_for_redrive);
                 // Same for volume outcomes: a destroy confirmation lost to a
                 // dead connection would leave the manager re-dispatching a
                 // reclaim forever.

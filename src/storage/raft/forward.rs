@@ -106,6 +106,9 @@ pub(crate) enum ForwardableLaneWrite {
     RecordVolumeError { volume_id: String, error: String },
     /// `Store::mark_volume_destroyed` — scheduler lane.
     MarkVolumeDestroyed { volume_id: String },
+    /// `Store::complete_allocation` — scheduler lane. Returns the completed
+    /// allocation, when one existed.
+    CompleteAllocation { allocation_id: i64, success: bool },
 }
 
 impl ForwardableLaneWrite {
@@ -125,7 +128,8 @@ impl ForwardableLaneWrite {
             | ForwardableLaneWrite::SeedKeyedInstances { .. }
             | ForwardableLaneWrite::RecordVolumeMounted { .. }
             | ForwardableLaneWrite::RecordVolumeError { .. }
-            | ForwardableLaneWrite::MarkVolumeDestroyed { .. } => Lane::Scheduler,
+            | ForwardableLaneWrite::MarkVolumeDestroyed { .. }
+            | ForwardableLaneWrite::CompleteAllocation { .. } => Lane::Scheduler,
         }
     }
 
@@ -147,6 +151,7 @@ impl ForwardableLaneWrite {
             ForwardableLaneWrite::RecordVolumeMounted { .. } => "record_volume_mounted",
             ForwardableLaneWrite::RecordVolumeError { .. } => "record_volume_error",
             ForwardableLaneWrite::MarkVolumeDestroyed { .. } => "mark_volume_destroyed",
+            ForwardableLaneWrite::CompleteAllocation { .. } => "complete_allocation",
         }
     }
 }
@@ -253,6 +258,10 @@ pub(crate) fn execute(store: &Store, op: ForwardableLaneWrite) -> ForwardOutcome
         ForwardableLaneWrite::MarkVolumeDestroyed { volume_id } => {
             done(store.mark_volume_destroyed_local(&volume_id))
         }
+        ForwardableLaneWrite::CompleteAllocation {
+            allocation_id,
+            success,
+        } => done(store.complete_allocation_local(allocation_id, success)),
     }
 }
 
@@ -309,6 +318,10 @@ mod tests {
             },
             ForwardableLaneWrite::MarkVolumeDestroyed {
                 volume_id: "v1".into(),
+            },
+            ForwardableLaneWrite::CompleteAllocation {
+                allocation_id: 9,
+                success: true,
             },
         ];
         for op in ops {

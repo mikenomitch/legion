@@ -13,6 +13,7 @@ Full index: [docs/README.md](docs/README.md).
 - [Jobs, Tasks, and Scheduling](docs/jobs-tasks-and-scheduling.md)
 - [Job Templates (reusable specs, typed variables, delegated submission)](docs/job-templates.md)
 - [Task Runtime Plugins](docs/task-runtime-plugins.md)
+- [Task Supervision (exits, restarts, resource limits, hardening)](docs/task-supervision.md)
 - [Task Runtime: exec](docs/task-runtime-exec.md)
 - [Task Runtime: container](docs/task-runtime-container.md)
 - [Task Runtime: sandbox (microVM)](docs/task-runtime-sandbox.md)

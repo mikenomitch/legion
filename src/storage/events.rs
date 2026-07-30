@@ -362,6 +362,37 @@ pub mod drafts {
         }))
     }
 
+    /// `allocation.terminated` — a task process exited and the allocation
+    /// reached a terminal state without being rescheduled (see
+    /// docs/task-supervision.md). `success` distinguishes "the batch task
+    /// finished" from "it terminated without succeeding".
+    pub fn allocation_terminated(
+        allocation_id: i64,
+        node_id: &str,
+        job_id: &str,
+        job_config_id: &str,
+        task_config_id: i64,
+        success: bool,
+        message: &str,
+    ) -> EventDraft {
+        let text = format!("Allocation {allocation_id} terminated on node {node_id}: {message}");
+        let draft = if success {
+            EventDraft::info("allocation.terminated", text)
+        } else {
+            EventDraft::warn("allocation.terminated", text)
+        };
+        draft
+            .job(job_id)
+            .node(node_id)
+            .allocation(allocation_id)
+            .meta(json!({
+                "success": success,
+                "message": message,
+                "taskConfigId": task_config_id,
+                "jobConfigId": job_config_id,
+            }))
+    }
+
     /// `node.registered` — a worker registered (or re-registered).
     pub fn node_registered(node: &Node) -> EventDraft {
         EventDraft::info(
@@ -804,6 +835,29 @@ impl EventRecorder<'_> {
         self.emit_opt(drafts::allocations_removed_for_job_config(
             job_config_id,
             removed,
+        ));
+    }
+
+    /// Emit [`drafts::allocation_terminated`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn allocation_terminated(
+        self,
+        allocation_id: i64,
+        node_id: &str,
+        job_id: &str,
+        job_config_id: &str,
+        task_config_id: i64,
+        success: bool,
+        message: &str,
+    ) {
+        self.emit(drafts::allocation_terminated(
+            allocation_id,
+            node_id,
+            job_id,
+            job_config_id,
+            task_config_id,
+            success,
+            message,
         ));
     }
 

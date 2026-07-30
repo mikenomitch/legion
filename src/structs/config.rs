@@ -1375,6 +1375,40 @@ pub struct WorkerConfigAlt {
     /// (see docs/volumes.md), keyed by the name jobs claim.
     #[serde(default)]
     pub host_volumes: Option<HashMap<String, crate::volumes::HostVolumeConfig>>,
+    /// Whether this worker turns a task's declared `resources` into real
+    /// kernel limits for host processes (see docs/task-supervision.md). Off
+    /// unless declared.
+    #[serde(default)]
+    pub resource_enforcement: Option<WorkerResourceEnforcementConfig>,
+}
+
+/// Worker `resourceEnforcement` block: cgroup v2 limits for `exec` tasks.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkerResourceEnforcementConfig {
+    /// Enforce `resources` as cgroup limits. Default false — a declaration
+    /// that was only ever a scheduling estimate should not start OOM-killing
+    /// workloads because the cluster upgraded.
+    #[serde(default)]
+    pub enabled: bool,
+    /// cgroup v2 path (relative to `/sys/fs/cgroup`) under which this worker
+    /// creates one subtree per allocation. Must already exist, with `+memory`
+    /// and `+cpu` in its `cgroup.subtree_control`.
+    #[serde(default = "default_cgroup_parent")]
+    pub cgroup_parent: String,
+}
+
+fn default_cgroup_parent() -> String {
+    "legion".to_string()
+}
+
+impl Default for WorkerResourceEnforcementConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            cgroup_parent: default_cgroup_parent(),
+        }
+    }
 }
 
 /// Default concurrent artifact fetches per worker.

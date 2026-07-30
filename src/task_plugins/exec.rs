@@ -1,5 +1,9 @@
 use crate::prelude::*;
 use crate::structs::{Allocation, TaskConfig};
+use crate::task_plugins::exec_isolation::{
+    cap_last_cap, capabilities_to_drop, enforcement_enabled, parse_umask, remove_managed_cgroup,
+    ExecHardeningConfig,
+};
 use crate::task_plugins::{
     configure_task_log_capture, derived_schema, reap_task_process, spawn_pipe, spawn_pty,
     spawn_task_process, ExecOptions, ExecSession, ExecSupport, TaskInstance, TaskPlugin,
@@ -56,8 +60,17 @@ struct ExecTaskConfig {
     oom_score_adj: Option<i32>,
 
     /// Optional Linux cgroup v2 subpath (for example `workloads/demo`).
+    ///
+    /// This *joins* a cgroup somebody else created and limited. It also opts
+    /// this task out of worker-owned enforcement: an explicit cgroup wins over
+    /// `resourceEnforcement` (see docs/task-supervision.md).
     #[serde(default)]
     cgroup: Option<String>,
+
+    /// Optional process hardening (linux): no-new-privs, capability drops, a
+    /// private /tmp, umask, nice. See docs/task-supervision.md.
+    #[serde(default)]
+    hardening: Option<ExecHardeningConfig>,
 
     /// Optional Landlock path restrictions (Linux only).
     #[serde(default)]
@@ -142,6 +155,10 @@ impl ExecTaskConfig {
             let _ = landlock.to_runtime()?;
         }
 
+        if let Some(hardening) = self.hardening.as_ref() {
+            hardening.validate()?;
+        }
+
         Ok(())
     }
 
@@ -172,6 +189,9 @@ impl ExecTaskConfig {
             landlock,
             oom_score_adj,
             cgroup,
+            managed_cgroup: None,
+            hardening: self.hardening.clone(),
+            user: None,
         })
     }
 }
@@ -180,7 +200,18 @@ impl ExecTaskConfig {
 struct ExecLinuxOptions {
     landlock: Option<LandlockOptions>,
     oom_score_adj: Option<i32>,
+    /// Explicit `config.cgroup`: join a cgroup the operator already made.
     cgroup: Option<String>,
+    /// Worker-owned cgroup created for this allocation, relative to
+    /// `/sys/fs/cgroup`. Only set when the worker enforces resources and the
+    /// task did not name a cgroup of its own.
+    managed_cgroup: Option<std::path::PathBuf>,
+    hardening: Option<ExecHardeningConfig>,
+    /// User to switch to inside the child, when the plugin owns the switch
+    /// (privileged hardening steps must run before dropping privileges, and
+    /// `Command::uid` drops them before pre-exec closures run).
+    #[cfg_attr(not(unix), allow(dead_code))]
+    user: Option<UserSpec>,
 }
 
 /// Parsed on every platform so a landlock jobspec validates the same way for a
@@ -225,6 +256,19 @@ impl TaskPlugin for ExecTaskPlugin {
         derived_schema::<ExecTaskConfig>()
     }
 
+    /// Runs the typed parse, not just the derived JSON schema — the same
+    /// argument the sandbox runtime makes: the config carries a `#[serde(flatten)]`
+    /// catch-all for forward compatibility, so a schema-only check accepts a
+    /// bad umask, an unknown capability, or both `oom_adj` and `oom_score_adj`,
+    /// and the job only fails when a task tries to start on some node. Parsing
+    /// here moves every check in [`ExecTaskConfig::validate`] to submit time,
+    /// where `legion job validate` and an agent can still act on it.
+    fn validate_config(&self, config: &Value) -> R<()> {
+        crate::task_plugins::validate_schema(&self.schema(), config)?;
+        ExecTaskConfig::from_value(config)?;
+        Ok(())
+    }
+
     fn readiness(&self) -> Map<String, Value> {
         let mut map = Map::new();
         map.insert("exec".into(), Value::String("pass".into()));
@@ -248,6 +292,11 @@ impl TaskPlugin for ExecTaskPlugin {
     }
 
     fn supports_signal(&self) -> bool {
+        true
+    }
+
+    /// `exec` is the canonical "one host process we spawned" runtime.
+    fn supervises_process(&self) -> bool {
         true
     }
 
@@ -337,6 +386,18 @@ impl TaskPlugin for ExecTaskPlugin {
             .context("exec task command must include at least one entry")?;
 
         let mut linux_options = config.linux_options()?;
+        // Worker-owned resource enforcement: create this allocation's cgroup
+        // and write the task's `resources` into it as real limits. An explicit
+        // `config.cgroup` opts out — the operator named a cgroup they manage.
+        #[cfg(target_os = "linux")]
+        if enforcement_enabled() && linux_options.cgroup.is_none() {
+            linux_options.managed_cgroup =
+                crate::task_plugins::exec_isolation::prepare_managed_cgroup(
+                    allocation.id,
+                    &task.name,
+                    &task.resources,
+                );
+        }
         // Artifacts stage into the task directory; a landlocked task must be
         // able to read them, so the task dir rides along automatically.
         if let (Some(landlock), Some(task_dir)) =
@@ -382,8 +443,24 @@ impl TaskPlugin for ExecTaskPlugin {
         }
         #[cfg(unix)]
         if let Some(user) = config.user_spec()? {
-            cmd.uid(user.uid);
-            cmd.gid(user.gid);
+            // Privileged hardening (mount namespaces, capability drops) must
+            // run *before* the process drops to the task user, and std applies
+            // `Command::uid`/`gid` before pre-exec closures. So when hardening
+            // needs privilege, the plugin performs the switch itself at the
+            // right point in its own pre-exec sequence.
+            // The managed cgroup is created by the worker and is not writable
+            // by the task user, so joining it is privileged work too.
+            let plugin_owns_user_switch = linux_options.managed_cgroup.is_some()
+                || linux_options
+                    .hardening
+                    .as_ref()
+                    .is_some_and(ExecHardeningConfig::needs_privileged_setup);
+            if plugin_owns_user_switch {
+                linux_options.user = Some(user.clone());
+            } else {
+                cmd.uid(user.uid);
+                cmd.gid(user.gid);
+            }
             // The worker creates alloc/task dirs owner-only (its own user) as
             // the isolation boundary between allocations on a node. Hand this
             // allocation's tree to the task user, or the dropped-privilege
@@ -431,6 +508,12 @@ impl TaskPlugin for ExecTaskPlugin {
         instance: &mut TaskInstance,
     ) -> R<()> {
         reap_task_process(allocation.id, &task.name, instance, "exec");
+        // Best-effort, and only ever removes a cgroup this worker created:
+        // the path is derived from the allocation, not from anything the task
+        // asked for (an explicit `config.cgroup` is the operator's to manage).
+        if enforcement_enabled() {
+            remove_managed_cgroup(allocation.id, &task.name);
+        }
         Ok(())
     }
 
@@ -459,28 +542,87 @@ fn configure_linux_process_options(
     let has_landlock = options.landlock.is_some();
     let oom_score_adj = options.oom_score_adj;
     let cgroup = options.cgroup.clone();
+    let managed_cgroup = options.managed_cgroup.clone();
     let options = options.clone();
     let task_name = task_name.to_string();
     let allocation_id = *allocation_id;
     unsafe {
         cmd.pre_exec(move || {
+            // Ordered by privilege: everything that needs the worker's
+            // capabilities runs before the process drops to the task user, and
+            // the unprivileged restrictions go on last so they cover the exec.
             if let Some(score) = options.oom_score_adj {
                 std::fs::write("/proc/self/oom_score_adj", score.to_string())
                     .map_err(std::io::Error::other)?;
             }
 
-            if let Some(ref cgroup) = options.cgroup {
+            // 1. Join a cgroup — explicit `config.cgroup` first, else the one
+            //    the worker created for this allocation.
+            let cgroup_target = options
+                .cgroup
+                .as_ref()
+                .map(std::path::PathBuf::from)
+                .or_else(|| options.managed_cgroup.clone());
+            if let Some(cgroup) = cgroup_target {
                 let unified = Path::new("/sys/fs/cgroup/cgroup.controllers");
                 if !unified.exists() {
                     return Err(std::io::Error::other("exec task cgroup requires cgroup v2"));
                 }
-                let cgroup_procs = Path::new("/sys/fs/cgroup")
+                let cgroup_procs = Path::new(crate::task_plugins::exec_isolation::CGROUP_ROOT)
                     .join(cgroup)
                     .join("cgroup.procs");
                 std::fs::write(cgroup_procs, std::process::id().to_string())
                     .map_err(std::io::Error::other)?;
             }
 
+            if let Some(ref hardening) = options.hardening {
+                // 2. Private /tmp: unshare the mount namespace, make it
+                //    private so nothing propagates back to the host, then
+                //    mount a fresh tmpfs over /tmp.
+                if hardening.private_tmp {
+                    apply_private_tmp()?;
+                }
+
+                // 3. Drop capabilities from the bounding set (needs
+                //    CAP_SETPCAP, so before the user switch).
+                if let Some(ref capabilities) = hardening.capabilities {
+                    let last = cap_last_cap();
+                    for bit in capabilities_to_drop(capabilities, last) {
+                        // PR_CAPBSET_DROP. A capability this kernel does not
+                        // have is not an error worth failing a task over.
+                        libc::prctl(libc::PR_CAPBSET_DROP, bit as libc::c_ulong, 0, 0, 0);
+                    }
+                }
+            }
+
+            // 4. Become the task user, now that the privileged work is done.
+            if let Some(ref user) = options.user {
+                if libc::setgid(user.gid) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::setuid(user.uid) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+
+            if let Some(ref hardening) = options.hardening {
+                // 5. No new privileges, then the cosmetic knobs.
+                if hardening.no_new_privileges
+                    && libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if let Some(ref umask) = hardening.umask {
+                    let mode = parse_umask(umask).map_err(std::io::Error::other)?;
+                    libc::umask(mode as libc::mode_t);
+                }
+                if let Some(nice) = hardening.nice {
+                    libc::setpriority(libc::PRIO_PROCESS, 0, nice);
+                }
+            }
+
+            // 6. Landlock last: it restricts this process for good, including
+            //    paths the steps above needed.
             if let Some(ref landlock) = options.landlock {
                 apply_landlock(landlock).map_err(std::io::Error::other)?;
             }
@@ -494,8 +636,55 @@ fn configure_linux_process_options(
         has_landlock,
         oom_score_adj,
         cgroup = cgroup.as_deref().unwrap_or(""),
+        managed_cgroup = managed_cgroup
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_default(),
         "Configured Linux process options for exec task"
     );
+    Ok(())
+}
+
+/// Give the child its own `/tmp`: a private mount namespace with a fresh
+/// tmpfs over it. Runs in the forked child, before the privilege drop.
+#[cfg(target_os = "linux")]
+fn apply_private_tmp() -> std::io::Result<()> {
+    use std::ffi::CString;
+
+    let none = CString::new("none").expect("static cstr");
+    let root = CString::new("/").expect("static cstr");
+    let tmpfs = CString::new("tmpfs").expect("static cstr");
+    let tmp = CString::new("/tmp").expect("static cstr");
+    let empty = CString::new("").expect("static cstr");
+
+    if unsafe { libc::unshare(libc::CLONE_NEWNS) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // Nothing this task does to its mounts may propagate back to the host.
+    if unsafe {
+        libc::mount(
+            none.as_ptr(),
+            root.as_ptr(),
+            std::ptr::null(),
+            libc::MS_REC | libc::MS_PRIVATE,
+            std::ptr::null(),
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    if unsafe {
+        libc::mount(
+            tmpfs.as_ptr(),
+            tmp.as_ptr(),
+            tmpfs.as_ptr(),
+            libc::MS_NOSUID | libc::MS_NODEV,
+            empty.as_ptr() as *const libc::c_void,
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
     Ok(())
 }
 
@@ -514,6 +703,9 @@ fn configure_linux_process_options(
     }
     if options.cgroup.is_some() {
         warn!(allocation_id, task_name = %task_name, "cgroup assignment is only supported on Linux and will be ignored");
+    }
+    if options.hardening.is_some() {
+        warn!(allocation_id, task_name = %task_name, "process hardening is only supported on Linux and will be ignored");
     }
     Ok(())
 }
@@ -618,6 +810,50 @@ mod tests {
         assert_eq!(options.cgroup.as_deref(), Some("workloads/demo"));
         assert!(options.landlock.is_some());
         Ok(())
+    }
+
+    #[test]
+    fn hardening_parses_and_validates_from_the_jobspec() -> R<()> {
+        let plugin = ExecTaskPlugin;
+        let config = json!({
+            "command": ["echo", "hello"],
+            "user": "nobody",
+            "hardening": {
+                "noNewPrivileges": true,
+                "privateTmp": true,
+                "capabilities": { "drop": ["all"] },
+                "umask": "0027",
+                "nice": 5,
+            }
+        });
+
+        plugin.validate_config(&config)?;
+        let options = plugin.config_linux_options(&config)?;
+        let hardening = options.hardening.expect("hardening parsed");
+        assert!(hardening.no_new_privileges);
+        assert!(hardening.private_tmp);
+        assert_eq!(hardening.umask.as_deref(), Some("0027"));
+        assert_eq!(hardening.nice, Some(5));
+        // Namespaces and capability drops need privilege, so the plugin owns
+        // the user switch for this task rather than letting std drop first.
+        assert!(hardening.needs_privileged_setup());
+        Ok(())
+    }
+
+    #[test]
+    fn hardening_rejects_values_the_kernel_would() {
+        let plugin = ExecTaskPlugin;
+        let config = json!({
+            "command": ["echo"],
+            "hardening": { "capabilities": { "drop": ["cap_teleport"] } }
+        });
+        let err = plugin
+            .validate_config(&config)
+            .expect_err("unknown capability");
+        assert!(
+            err.to_string().contains("cap_teleport"),
+            "error should name the offending capability, got: {err}"
+        );
     }
 
     #[cfg(unix)]

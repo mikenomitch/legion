@@ -841,6 +841,21 @@ message WorkerConfig {
   // Default: empty string (the `host` driver reports itself unavailable on
   // this node, and jobs claiming it are rejected at admission).
   string host_volumes = 10;
+
+  // JSON-encoded resource-enforcement settings for this worker (see
+  // docs/task-supervision.md). Shape:
+  // `{"enabled":true,"cgroupParent":"legion"}`.
+  //
+  // When enabled, a Linux worker puts each `exec` task in a cgroup v2 subtree
+  // it creates under `cgroupParent` and writes the task's `resources` there as
+  // real limits (`memory.max`, `cpu.max`), instead of treating them as
+  // scheduling arithmetic only. Off by default: turning declared resources
+  // into kernel limits can OOM-kill a workload whose declaration was only ever
+  // an estimate, so it is a deliberate per-worker choice.
+  //
+  // Default: empty string (enforcement off; `resources` stays advisory for
+  // `exec` tasks).
+  string resource_enforcement = 11;
 }
 
 // Reply payload for WorkerPreRegister.
@@ -2343,6 +2358,20 @@ message HeartbeatRequest {
   //
   // Default: empty list.
   repeated VolumeReport volume_reports = 5;
+
+  // Allocations whose task process reached a terminal state since the last
+  // heartbeat *without* failing — the task exited with a status its `restart`
+  // policy treats as done (see docs/task-supervision.md). Failures travel in
+  // `failed_allocations` instead, because the manager reschedules those.
+  //
+  // This is what makes a batch task's success real: the manager marks the
+  // allocation complete and the task successful only when a worker says the
+  // process exited successfully, instead of assuming it at placement.
+  //
+  // Sent only by workers at protocol version 2 and above.
+  //
+  // Default: empty list.
+  repeated TerminatedAllocation terminated_allocations = 6;
 }
 
 // Reply payload for Heartbeat.
@@ -2499,6 +2528,33 @@ message FailedAllocation {
   //
   // Unset for non-artifact failures.
   optional string artifact_states = 3;
+}
+
+// A terminal, non-failure allocation outcome reported by a worker: the task's
+// process exited and the task's `restart` policy says that is the end of it
+// (see docs/task-supervision.md).
+message TerminatedAllocation {
+  // Allocation that reached the terminal state.
+  int64 allocation_id = 1;
+
+  // True when the exit status was one the task counts as success
+  // (`restart.successExitCodes`, default `[0]`). A task whose policy is
+  // `never` can also terminate unsuccessfully; the manager marks the
+  // allocation complete either way and records the status.
+  bool success = 2;
+
+  // Process exit code. Unset when the process was killed by a signal, or when
+  // the worker only re-adopted the pid after a restart and never had a handle
+  // to reap.
+  optional int32 exit_code = 3;
+
+  // Signal that killed the process, when it was killed by one (Unix only).
+  optional int32 signal = 4;
+
+  // Human-readable rendering of the same facts, e.g. `exited with status 0`
+  // or `killed by signal 9`. Carried so events and the UI do not have to
+  // re-derive wording from the numbers.
+  string message = 5;
 }
 
 // Allocation health snapshot item from worker to manager.

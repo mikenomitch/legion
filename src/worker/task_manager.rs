@@ -23,6 +23,45 @@ pub struct FailedAllocationReport {
     pub artifact_states: Option<String>,
 }
 
+/// A terminal (non-failure) allocation outcome the worker owes the manager:
+/// the task's process exited and the task's `restart` policy says this is the
+/// end of it. Failures travel the older [`FailedAllocationReport`] path
+/// instead, because the manager already reschedules those.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminatedAllocationReport {
+    pub allocation_id: i64,
+    /// Exit status was in the task's `successExitCodes`.
+    pub success: bool,
+    pub exit_code: Option<i32>,
+    pub signal: Option<i32>,
+    /// Human-readable, e.g. `exited with status 0`.
+    pub message: String,
+}
+
+/// One observed task-process exit, as seen by the worker's supervisor poll.
+/// `exit_code`/`signal` are both `None` when the worker only knew the pid (an
+/// allocation re-adopted after a worker restart): the process is gone, but its
+/// status died with the parent that could have reaped it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskExit {
+    pub allocation_id: i64,
+    pub task_name: String,
+    pub exit_code: Option<i32>,
+    pub signal: Option<i32>,
+}
+
+impl TaskExit {
+    /// Human-readable rendering used in health status, failure reasons, and
+    /// the terminal report.
+    pub fn describe(&self) -> String {
+        match (self.exit_code, self.signal) {
+            (Some(code), _) => format!("exited with status {code}"),
+            (None, Some(signal)) => format!("killed by signal {signal}"),
+            (None, None) => "process is gone (exit status unknown)".to_string(),
+        }
+    }
+}
+
 /// A staging job handed to a dedicated thread: everything needed to fetch a
 /// task's artifacts without holding the task-manager lock.
 pub struct StagingJob {
@@ -51,6 +90,19 @@ pub struct WorkerTaskManager {
     health_monitors: HashMap<i64, HealthMonitorHandle>,
     allocation_health: HashMap<i64, AllocationHealth>,
     failed: Vec<FailedAllocationReport>,
+    /// Terminal (non-failure) outcomes owed to the manager on the next
+    /// heartbeat.
+    terminated_reports: Vec<TerminatedAllocationReport>,
+    /// Allocations whose process exited and will not be relaunched here. They
+    /// stay in `instances`/`allocations` so the heartbeat keeps reporting them
+    /// as this node's (the manager must not re-dispatch a finished allocation
+    /// onto us), but the supervisor never polls them again.
+    terminated: HashMap<i64, TaskExit>,
+    /// Local restart attempts per allocation, shared by *both* restart paths:
+    /// health-check failures and process exits. One budget, so a flapping task
+    /// gets `on_unhealthy.restart_count` restarts in total rather than that
+    /// many per path.
+    restart_history: HashMap<i64, Vec<std::time::Instant>>,
     // Per-allocation self-fence windows (stateful tasks only; see
     // `TaskAllocation.self_terminate_after_seconds`). The watchdog kills any
     // allocation whose window is exceeded by the time since the last
@@ -104,6 +156,9 @@ impl WorkerTaskManager {
             health_monitors: HashMap::new(),
             allocation_health: HashMap::new(),
             failed: Vec::new(),
+            terminated_reports: Vec::new(),
+            terminated: HashMap::new(),
+            restart_history: HashMap::new(),
             self_fence_windows: HashMap::new(),
             state_store,
             alloc_root,
@@ -356,6 +411,174 @@ impl WorkerTaskManager {
         entries
     }
 
+    /// Poll every supervised, non-terminal allocation for process exit.
+    ///
+    /// This is also where task children are **reaped**: `try_wait` on the
+    /// handle we own collects the exit status and stops the zombie from
+    /// outliving the task. Allocations we only know by pid (re-adopted after a
+    /// worker restart) are checked with a liveness probe instead — their status
+    /// is unknowable, so they are reported as an exit with no code.
+    pub fn poll_task_exits(&mut self) -> Vec<TaskExit> {
+        let mut exits = Vec::new();
+        let candidates = self
+            .instances
+            .keys()
+            .copied()
+            .filter(|allocation_id| !self.terminated.contains_key(allocation_id))
+            .collect::<Vec<_>>();
+
+        for allocation_id in candidates {
+            let Some(task) = self.task_configs.get(&allocation_id) else {
+                continue;
+            };
+            let task_name = task.name.clone();
+            let supervised = self
+                .registry
+                .plugin(&task.runtime)
+                .is_some_and(|plugin| plugin.supervises_process());
+            if !supervised {
+                continue;
+            }
+            let Some(instance) = self.instances.get_mut(&allocation_id) else {
+                continue;
+            };
+
+            let exit = if let Some(child) = instance.child.as_mut() {
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        instance.pid = None;
+                        instance.child = None;
+                        Some(exit_from_status(&status))
+                    }
+                    Ok(None) => None,
+                    Err(err) => {
+                        warn!(
+                            allocation_id,
+                            task_name = %task_name,
+                            error = ?err,
+                            "Failed to poll task process; treating it as still running"
+                        );
+                        None
+                    }
+                }
+            } else if let Some(pid) = instance.pid {
+                if pid_is_running(pid) {
+                    None
+                } else {
+                    instance.pid = None;
+                    Some((None, None))
+                }
+            } else {
+                // Nothing started yet (staging artifacts), or a runtime that
+                // reports no process. Neither is an exit.
+                None
+            };
+
+            if let Some((exit_code, signal)) = exit {
+                exits.push(TaskExit {
+                    allocation_id,
+                    task_name,
+                    exit_code,
+                    signal,
+                });
+            }
+        }
+
+        for exit in &exits {
+            self.terminated.insert(exit.allocation_id, exit.clone());
+        }
+        exits
+    }
+
+    /// The task config for a live allocation, if this worker still holds it.
+    pub fn task_config(&self, allocation_id: i64) -> Option<&TaskConfig> {
+        self.task_configs.get(&allocation_id)
+    }
+
+    /// Clear an allocation's terminal flag so the supervisor watches it again.
+    /// Called when a restart relaunches the process.
+    pub fn clear_termination(&mut self, allocation_id: i64) {
+        self.terminated.remove(&allocation_id);
+    }
+
+    /// Whether an allocation may be restarted locally right now, against the
+    /// shared budget (`count` restarts within `period`). Prunes attempts that
+    /// have aged out of the window.
+    pub fn can_restart_allocation(
+        &mut self,
+        allocation_id: i64,
+        count: u32,
+        period: std::time::Duration,
+    ) -> bool {
+        if count == 0 {
+            return false;
+        }
+        let now = std::time::Instant::now();
+        let history = self.restart_history.entry(allocation_id).or_default();
+        history.retain(|attempt| now.duration_since(*attempt) <= period);
+        (history.len() as u32) < count
+    }
+
+    /// Record a restart attempt against the shared budget.
+    pub fn record_restart_attempt(&mut self, allocation_id: i64) {
+        self.restart_history
+            .entry(allocation_id)
+            .or_default()
+            .push(std::time::Instant::now());
+    }
+
+    /// Queue a terminal (non-failure) outcome for the next heartbeat and mark
+    /// the allocation done locally.
+    pub fn record_termination(&mut self, allocation_id: i64, exit: &TaskExit, success: bool) {
+        if let Some(monitor) = self.health_monitors.remove(&allocation_id) {
+            monitor.shutdown();
+        }
+        self.terminated.insert(allocation_id, exit.clone());
+        self.set_allocation_health(allocation_id, success, exit.describe());
+        self.terminated_reports.push(TerminatedAllocationReport {
+            allocation_id,
+            success,
+            exit_code: exit.exit_code,
+            signal: exit.signal,
+            message: exit.describe(),
+        });
+        self.persist_state();
+    }
+
+    /// Report a batch task on an unsupervisable runtime as complete at start.
+    /// See the call site in `start_prepared_allocation`.
+    fn record_unsupervised_completion(&mut self, allocation_id: i64, runtime: &str) {
+        let message =
+            format!("runtime `{runtime}` reports no exit status; treated as complete at start");
+        self.terminated.insert(
+            allocation_id,
+            TaskExit {
+                allocation_id,
+                task_name: String::new(),
+                exit_code: None,
+                signal: None,
+            },
+        );
+        self.set_allocation_health(allocation_id, true, message.clone());
+        self.terminated_reports.push(TerminatedAllocationReport {
+            allocation_id,
+            success: true,
+            exit_code: None,
+            signal: None,
+            message,
+        });
+    }
+
+    pub fn drain_terminations(&mut self) -> Vec<TerminatedAllocationReport> {
+        std::mem::take(&mut self.terminated_reports)
+    }
+
+    /// Put drained terminal reports back after a failed heartbeat, so a dead
+    /// connection cannot swallow a batch task's completion.
+    pub fn requeue_terminations(&mut self, reports: Vec<TerminatedAllocationReport>) {
+        self.terminated_reports.extend(reports);
+    }
+
     pub fn drain_failures(&mut self) -> Vec<FailedAllocationReport> {
         std::mem::take(&mut self.failed)
     }
@@ -430,6 +653,8 @@ impl WorkerTaskManager {
         self.task_configs.remove(&allocation_id);
         self.allocation_health.remove(&allocation_id);
         self.self_fence_windows.remove(&allocation_id);
+        self.terminated.remove(&allocation_id);
+        self.restart_history.remove(&allocation_id);
         // Capture the final board snapshot before clearing it: the failure
         // report is the last (and race-free) carrier of per-artifact failure
         // detail to the manager's event stream.
@@ -595,6 +820,8 @@ impl WorkerTaskManager {
         self.task_configs.remove(&allocation_id);
         self.allocation_health.remove(&allocation_id);
         self.self_fence_windows.remove(&allocation_id);
+        self.terminated.remove(&allocation_id);
+        self.restart_history.remove(&allocation_id);
         self.artifact_status.remove(allocation_id);
         if remove_dirs {
             self.volume_specs.remove(&allocation_id);
@@ -731,11 +958,22 @@ impl WorkerTaskManager {
         );
         plugin.start(allocation, task, instance)?;
 
+        let supervised = plugin.supervises_process();
+
         self.allocations.insert(allocation.id, allocation.clone());
         self.task_configs.insert(allocation.id, task.clone());
         self.set_allocation_health(allocation.id, false, "starting");
         self.notify_log_sinks_started(allocation, task);
         self.persist_state();
+
+        // A batch task on a runtime that tracks no process can never report
+        // an exit, and the manager is now waiting for one before it will call
+        // the task successful. Say so explicitly at start — the same
+        // optimistic answer the manager used to assume, but stated by the
+        // worker that knows it cannot do better.
+        if !supervised && matches!(task.lifecycle, crate::structs::TaskLifecycle::Batch) {
+            self.record_unsupervised_completion(allocation.id, &task.runtime);
+        }
 
         Ok(())
     }
@@ -958,6 +1196,9 @@ impl WorkerTaskManager {
 
         plugin.stop(allocation, task, instance)?;
         plugin.start(allocation, task, instance)?;
+        // A relaunched process is a live process again: drop the terminal flag
+        // so the supervisor resumes watching this allocation.
+        self.terminated.remove(&allocation_id);
         self.set_allocation_health(allocation_id, false, "restarting");
         self.persist_state();
         Ok(())
@@ -1104,6 +1345,21 @@ impl WorkerTaskManager {
 
 /// Resolve a signal name like "SIGHUP"/"HUP" and deliver it to `pid`.
 #[cfg(unix)]
+/// Split a finished child's status into `(exit_code, signal)`. Unix reports a
+/// signal death as `code: None`, which is exactly the distinction the restart
+/// policy and the operator both want to see.
+fn exit_from_status(status: &std::process::ExitStatus) -> (Option<i32>, Option<i32>) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        (status.code(), status.signal())
+    }
+    #[cfg(not(unix))]
+    {
+        (status.code(), None)
+    }
+}
+
 fn send_signal(pid: u32, signal: &str) -> R<()> {
     let signum = parse_signal(signal)?;
     // SAFETY: plain kill(2) with a validated signal number.
@@ -1339,6 +1595,110 @@ mod tests {
         let mut manager = WorkerTaskManager::with_state_store(state_store);
         manager.load_builtin_plugins();
         manager
+    }
+
+    /// The supervisor's eyes: a process that has exited must be seen exactly
+    /// once, with its status, and reaped in the process (no zombie left).
+    #[test]
+    fn poll_task_exits_reports_a_finished_process_once() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let mut manager = manager_in(&temp_dir);
+        let task = TaskConfig {
+            config: json!({"command": ["sh", "-c", "exit 3"]}),
+            ..TaskConfig::new("exec-task", "exec")
+        };
+        manager.run_allocation(&alloc(), &task)?;
+
+        let mut exits = Vec::new();
+        for _ in 0..100 {
+            exits = manager.poll_task_exits();
+            if !exits.is_empty() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        assert_eq!(exits.len(), 1, "expected exactly one exit report");
+        assert_eq!(exits[0].allocation_id, alloc().id);
+        assert_eq!(exits[0].exit_code, Some(3));
+        assert_eq!(exits[0].describe(), "exited with status 3");
+        // Terminal allocations are reported once, never re-reported.
+        assert!(manager.poll_task_exits().is_empty());
+        Ok(())
+    }
+
+    /// A running process is not an exit, and a runtime that tracks no process
+    /// is never polled at all.
+    #[test]
+    fn poll_task_exits_ignores_live_and_unsupervised_allocations() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let mut manager = manager_in(&temp_dir);
+        let task = TaskConfig {
+            config: json!({"command": ["sleep", "30"]}),
+            ..TaskConfig::new("exec-task", "exec")
+        };
+        manager.run_allocation(&alloc(), &task)?;
+        assert!(manager.poll_task_exits().is_empty());
+
+        // Same allocation, but the registry has no plugin claiming to
+        // supervise a process for this runtime.
+        manager.task_configs.insert(
+            alloc().id,
+            TaskConfig {
+                ..TaskConfig::new("ghost", "not-a-real-runtime")
+            },
+        );
+        assert!(manager.poll_task_exits().is_empty());
+
+        manager.stop_allocation(alloc().id)?;
+        Ok(())
+    }
+
+    /// One budget, both paths: the exit supervisor and the health monitor
+    /// spend the same allowance.
+    #[test]
+    fn restart_budget_is_shared_and_time_windowed() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let mut manager = manager_in(&temp_dir);
+        let period = Duration::from_secs(60);
+
+        assert!(manager.can_restart_allocation(1, 2, period));
+        manager.record_restart_attempt(1);
+        assert!(manager.can_restart_allocation(1, 2, period));
+        manager.record_restart_attempt(1);
+        assert!(!manager.can_restart_allocation(1, 2, period));
+
+        // A budget of zero never permits a restart, and attempts age out.
+        assert!(!manager.can_restart_allocation(2, 0, period));
+        assert!(manager.can_restart_allocation(1, 2, Duration::from_millis(0)));
+    }
+
+    /// A batch task on a runtime that cannot report exits gets its completion
+    /// stated at start, so the manager never waits forever for a report that
+    /// cannot come.
+    #[test]
+    fn unsupervised_batch_tasks_report_completion_at_start() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let mut manager = manager_in(&temp_dir);
+        let mut task = TaskConfig {
+            config: json!({"command": ["true"]}),
+            ..TaskConfig::new("exec-task", "exec")
+        };
+        task.lifecycle = crate::structs::TaskLifecycle::Batch;
+
+        // exec supervises its process, so nothing is reported at start.
+        manager.run_allocation(&alloc(), &task)?;
+        assert!(manager.drain_terminations().is_empty());
+
+        // The unsupervised path, exercised directly: the runtime name is in
+        // the message so an operator can see why the answer is optimistic.
+        manager.record_unsupervised_completion(alloc().id, "noop");
+        let reports = manager.drain_terminations();
+        assert_eq!(reports.len(), 1);
+        assert!(reports[0].success);
+        assert!(reports[0].message.contains("noop"));
+        assert!(manager.drain_terminations().is_empty());
+        Ok(())
     }
 
     #[test]
