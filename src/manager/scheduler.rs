@@ -1500,10 +1500,9 @@ impl<'a> Scheduler<'a> {
             let root = find(&mut parent, index);
             *component_sizes.entry(root).or_default() += 1;
         }
-        for index in 0..placements.len() {
+        for (index, placement) in placements.iter_mut().enumerate() {
             let root = find(&mut parent, index);
             if component_sizes.get(&root).copied().unwrap_or(0) > 1 {
-                let placement = &mut placements[index];
                 placement.candidates = vec![placement.node_id.clone()];
             }
         }
@@ -2252,17 +2251,22 @@ impl<'a> Scheduler<'a> {
             list.push(band.swap_remove(chosen).0);
         }
 
-        if list.len() < k {
-            below.sort_by(|left, right| {
+        // Partial selection, not a full sort: this fallback runs whenever the
+        // band is thinner than the list (the common bin_pack case), and the
+        // below-band set is nearly the whole fleet — O(n log n) per placement
+        // was measurable at 10k nodes where O(n + m log m) is free.
+        let need = k.saturating_sub(list.len()).min(below.len());
+        if need > 0 {
+            let descending = |left: &(&Node, f64), right: &(&Node, f64)| {
                 right
                     .1
                     .partial_cmp(&left.1)
                     .unwrap_or(std::cmp::Ordering::Equal)
-            });
+            };
+            below.select_nth_unstable_by(need - 1, descending);
+            below.truncate(need);
+            below.sort_by(descending);
             for (node, _) in below {
-                if list.len() >= k {
-                    break;
-                }
                 list.push(node);
             }
         }
