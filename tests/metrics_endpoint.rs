@@ -244,6 +244,9 @@ async fn healthz_readyz_and_metrics_serve_on_ephemeral_port() -> R<()> {
     telemetry::metrics()
         .store_write_lock_wait_seconds
         .observe(0.003);
+    telemetry::metrics()
+        .scheduler_plan_phase_seconds
+        .observe(&["build_plan"], 0.004);
 
     let after = http_get(addr, "/metrics").await?;
     assert_eq!(after.status, 200);
@@ -280,6 +283,13 @@ async fn healthz_readyz_and_metrics_serve_on_ephemeral_port() -> R<()> {
     assert!(after
         .body
         .contains("legion_evals_processed_total{kind=\"job_submit\",status=\"ok\"}"));
+    // Labeled histogram family (scheduler plan phases).
+    assert!(after
+        .body
+        .contains("# TYPE legion_scheduler_plan_phase_seconds histogram"));
+    assert!(after
+        .body
+        .contains("legion_scheduler_plan_phase_seconds_bucket{phase=\"build_plan\",le=\"+Inf\"}"));
 
     Ok(())
 }

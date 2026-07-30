@@ -1,0 +1,33 @@
+{
+  "name": "mixed-heterogeneous",
+  "scheduling_policy": "bin_pack",
+  "iterations": 5,
+  "node_profiles": [
+    { "name": "web", "count": 250, "memory_gb": 32, "cpus": 8,
+      "attrs": { "class": "web", "region": "us-east" } },
+    { "name": "batch", "count": 150, "memory_gb": 64, "cpus": 16,
+      "attrs": { "class": "batch", "region": "us-east" } },
+    { "name": "edge", "count": 84, "memory_gb": 16, "cpus": 4,
+      "attrs": { "class": "web", "region": "eu-west" } },
+    { "name": "gpu", "count": 16, "memory_gb": 128, "cpus": 32,
+      "attrs": { "class": "gpu", "gpu": "a100", "region": "us-east" } }
+  ],
+  "job_types": [
+    { "name": "svc", "count": 25, "tasks_per_job": 2, "task_count_per_task": 4,
+      "resources": { "cpu": 500, "memory": 1024 },
+      "constraints": { "class": "web" } },
+    { "name": "worker", "count": 10, "tasks_per_job": 1, "task_count_per_task": 12,
+      "resources": { "cpu": 1000, "memory": 2048 },
+      "constraints": { "class": "batch" } },
+    { "name": "train", "count": 3, "tasks_per_job": 1, "task_count_per_task": 4,
+      "resources": { "cpu": 4000, "memory": 16384 },
+      "constraints": { "gpu": "a100" } },
+    { "name": "edge-cache", "count": 8, "tasks_per_job": 1, "task_count_per_task": 6,
+      "resources": { "cpu": 250, "memory": 512 },
+      "constraints": { "region": "eu-west" } }
+  ],
+  "scheduler_settings": { "indexes": { "topo": ["pool", "region"] } },
+  "churn_every": 2,
+  "churn_nodes": 10,
+  "slo": { "min_evals_per_sec": 5.0, "max_p99_latency_ms": 1000.0 }
+}

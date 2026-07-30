@@ -488,6 +488,8 @@ pub struct Metrics {
     pub scheduler_index_shadow_total: Arc<CounterVec>,
     /// `legion_scheduler_index_maintenance_seconds`
     pub scheduler_index_maintenance_seconds: Arc<Histogram>,
+    /// `legion_scheduler_plan_phase_seconds{phase}`
+    pub scheduler_plan_phase_seconds: Arc<HistogramVec>,
     /// Render order for the exposition endpoint.
     families: Vec<Arc<dyn RenderMetric>>,
 }
@@ -617,6 +619,15 @@ impl Metrics {
             },
             cell: HistogramCell::new(DURATION_BUCKETS),
         });
+        let scheduler_plan_phase_seconds = Arc::new(HistogramVec {
+            meta: FamilyMeta {
+                name: "legion_scheduler_plan_phase_seconds",
+                help: "Per-phase wall-clock of scheduler plan_and_apply (available_nodes|version_sample|task_fetch|capacity_snapshot|build_plan|apply|total).",
+                labels: &["phase"],
+            },
+            bounds: DURATION_BUCKETS,
+            series: Series::new(),
+        });
 
         let families: Vec<Arc<dyn RenderMetric>> = vec![
             Arc::clone(&allocations) as Arc<dyn RenderMetric>,
@@ -633,6 +644,7 @@ impl Metrics {
             Arc::clone(&scheduler_index_maintenance_seconds) as Arc<dyn RenderMetric>,
             Arc::clone(&scheduler_index_queries_total) as Arc<dyn RenderMetric>,
             Arc::clone(&scheduler_index_shadow_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&scheduler_plan_phase_seconds) as Arc<dyn RenderMetric>,
             Arc::clone(&store_write_lock_wait_seconds) as Arc<dyn RenderMetric>,
         ];
 
@@ -652,6 +664,7 @@ impl Metrics {
             scheduler_index_candidates,
             scheduler_index_shadow_total,
             scheduler_index_maintenance_seconds,
+            scheduler_plan_phase_seconds,
             families,
         }
     }
