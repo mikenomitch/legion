@@ -223,6 +223,27 @@ pub struct PlanSubmission {
     pub expected_versions: BTreeMap<String, i64>,
 }
 
+/// One placement in a plan submission: the task plus its RANKED candidate
+/// nodes (late-binding plan §6.1). Rank 0 is the planner's argmax pick;
+/// the apply walk binds to the first candidate whose node epoch is
+/// unchanged since the planner sampled it. A single-candidate list is
+/// exactly a pre-late-binding placement.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PlanPlacement {
+    pub task_id: i64,
+    pub candidates: Vec<String>,
+}
+
+impl PlanPlacement {
+    /// A fixed single-node placement (today's shape; no fallback).
+    pub fn pinned(node_id: impl Into<String>, task_id: i64) -> Self {
+        PlanPlacement {
+            task_id,
+            candidates: vec![node_id.into()],
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum PlanApplyOutcome {
     Applied(Vec<Allocation>),
@@ -239,7 +260,7 @@ pub enum PlanApplyOutcome {
 struct PlanApplyRequest {
     job_config_id: String,
     mode: String,
-    placements: Vec<(String, i64)>,
+    placements: Vec<PlanPlacement>,
     expected_versions: BTreeMap<String, i64>,
 }
 
@@ -2135,6 +2156,14 @@ impl Store {
         Ok(value)
     }
 
+    /// Text sibling of [`Self::bench_scalar`]. Hidden: not a stable API.
+    #[doc(hidden)]
+    pub fn bench_scalar_text(&self, sql: &str) -> R<String> {
+        let conn = self.read_connection()?;
+        let value = conn.query_row(sql, [], |row| row.get::<_, String>(0))?;
+        Ok(value)
+    }
+
     fn allocation_epoch_for_scope(&self, scope_type: &str, scope_id: &str) -> R<i64> {
         let conn = self.read_connection()?;
         let epoch: Option<i64> = conn
@@ -2233,6 +2262,9 @@ impl Store {
         Ok(())
     }
 
+    /// Stage a plan submission with fixed single-node placements (the
+    /// pre-late-binding shape). Kept for callers that genuinely stage;
+    /// the production path is [`Self::submit_and_apply_plan`].
     pub fn insert_plan_submission(
         &self,
         job_config_id: &str,
@@ -2242,22 +2274,70 @@ impl Store {
     ) -> R<PlanSubmission> {
         let job_config_id = job_config_id.to_owned();
         let mode = mode.to_owned();
-        let placements = placements.to_vec();
+        let placements: Vec<PlanPlacement> = placements
+            .iter()
+            .map(|(node_id, task_id)| PlanPlacement::pinned(node_id.clone(), *task_id))
+            .collect();
         let expected_versions = expected_versions.clone();
         self.replicated(Lane::Scheduler, "insert_plan_submission", move |s| {
             s.insert_plan_submission_apply(&job_config_id, &mode, &placements, &expected_versions)
         })
     }
 
+    /// Serialize placements for the `plan_submission` row. Single-candidate
+    /// lists write the v1 shape (`[[node_id, task_id], …]`) so a cluster
+    /// with candidates disabled emits byte-for-byte pre-late-binding rows
+    /// (the mixed-version rollout hatch); anything with a real fallback
+    /// list writes format 2. Both shapes stay readable forever.
+    fn placements_to_json(placements: &[PlanPlacement]) -> R<String> {
+        if placements
+            .iter()
+            .all(|placement| placement.candidates.len() == 1)
+        {
+            let v1: Vec<(&str, i64)> = placements
+                .iter()
+                .map(|placement| (placement.candidates[0].as_str(), placement.task_id))
+                .collect();
+            return Ok(serde_json::to_string(&v1)?);
+        }
+        Ok(serde_json::to_string(&serde_json::json!({
+            "format": 2,
+            "placements": placements,
+        }))?)
+    }
+
+    /// Parse either placements shape out of a `plan_submission` row.
+    fn parse_plan_placements(raw: &str) -> R<Vec<PlanPlacement>> {
+        let value: Value = serde_json::from_str(raw)?;
+        if let Some(placements) = value.get("placements") {
+            let placements: Vec<PlanPlacement> = serde_json::from_value(placements.clone())
+                .context(
+                    "malformed format-2 plan_submission placements (newer manager version?)",
+                )?;
+            for placement in &placements {
+                if placement.candidates.is_empty() {
+                    bail!("plan_submission placement carries no candidates");
+                }
+            }
+            return Ok(placements);
+        }
+        let v1: Vec<(String, i64)> =
+            serde_json::from_value(value).context("malformed plan_submission placements")?;
+        Ok(v1
+            .into_iter()
+            .map(|(node_id, task_id)| PlanPlacement::pinned(node_id, task_id))
+            .collect())
+    }
+
     fn insert_plan_submission_apply(
         &self,
         job_config_id: &str,
         mode: &str,
-        placements: &[(String, i64)],
+        placements: &[PlanPlacement],
         expected_versions: &BTreeMap<String, i64>,
     ) -> R<PlanSubmission> {
         let created_at = OffsetDateTime::now_utc().format(&Rfc3339)?;
-        let placements_json = serde_json::to_string(placements)?;
+        let placements_json = Self::placements_to_json(placements)?;
         let expected_vector_json = serde_json::to_string(expected_versions)?;
         let expected_job_epoch = *expected_versions
             .get(&Self::scope_vector_key("job_config", job_config_id))
@@ -2304,7 +2384,7 @@ impl Store {
         &self,
         job_config_id: &str,
         mode: &str,
-        placements: &[(String, i64)],
+        placements: &[PlanPlacement],
         expected_versions: &BTreeMap<String, i64>,
     ) -> R<(PlanSubmission, PlanApplyOutcome)> {
         let request = PlanApplyRequest {
@@ -2451,7 +2531,7 @@ impl Store {
         &self,
         job_config_id: &str,
         mode: &str,
-        placements: &[(String, i64)],
+        placements: &[PlanPlacement],
         expected_versions: &BTreeMap<String, i64>,
     ) -> R<(PlanSubmission, PlanApplyOutcome)> {
         let submission =
@@ -2541,52 +2621,23 @@ impl Store {
         let mut conn = self.write_connection()?;
         let tx = Self::write_tx(&mut conn)?;
 
-        let latest_versions = self.scope_vector_epochs_tx(&tx, &submission.expected_versions)?;
-        if latest_versions != submission.expected_versions {
-            let latest_job_epoch = latest_versions
-                .get(&Self::scope_vector_key(
-                    "job_config",
-                    &submission.job_config_id,
-                ))
-                .copied()
-                .unwrap_or_default();
+        // The JOB-CONFIG epoch stays a hard, all-or-nothing gate: it is
+        // what serializes two plans for the same job config, and candidate
+        // lists must not weaken it (late-binding plan §6.1). Node-scope
+        // freshness is checked per candidate inside the walk below.
+        let job_scope_key = Self::scope_vector_key("job_config", &submission.job_config_id);
+        let expected_job_epoch = submission
+            .expected_versions
+            .get(&job_scope_key)
+            .copied()
+            .unwrap_or_default();
+        let latest_job_epoch = self.scope_epoch_tx(&tx, "job_config", &submission.job_config_id)?;
+        if latest_job_epoch != expected_job_epoch {
             let reason = format!(
                 "plan epoch for job config {} is stale; expected {}, latest {}",
-                submission.job_config_id,
-                submission
-                    .expected_versions
-                    .get(&Self::scope_vector_key(
-                        "job_config",
-                        &submission.job_config_id
-                    ))
-                    .copied()
-                    .unwrap_or_default(),
-                latest_job_epoch
+                submission.job_config_id, expected_job_epoch, latest_job_epoch
             );
-            tx.execute(
-                "UPDATE plan_submission SET status = 'rejected', rejection_reason = ?1 WHERE id = ?2;",
-                params![reason, submission.id],
-            )?;
-            let rejected_event = self.stage_event_locked(
-                &tx,
-                drafts::plan_rejected(&submission.job_config_id, &reason),
-            );
-            tx.commit()?;
-            self.publish_staged(rejected_event);
-            warn!(
-                submission_id = submission.id,
-                job_config_id = %submission.job_config_id,
-                latest_scope_count = latest_versions.len(),
-                duration_ms = tx_started.elapsed().as_millis() as u64,
-                "Rejected plan submission due to stale version vector"
-            );
-            crate::manager::telemetry::metrics()
-                .plan_apply_total
-                .inc(&["rejected"]);
-            return Ok(PlanApplyOutcome::Rejected {
-                reason,
-                latest_versions,
-            });
+            return self.reject_plan_submission_tx(tx, tx_started, submission, reason);
         }
 
         let placements_json: String = tx.query_row(
@@ -2594,13 +2645,13 @@ impl Store {
             [submission.id],
             |row| row.get(0),
         )?;
-        let placements: Vec<(String, i64)> = serde_json::from_str(&placements_json)?;
+        let placements = Self::parse_plan_placements(&placements_json)?;
 
         let mut nodes_by_id: HashMap<String, Node> = HashMap::new();
         if !placements.is_empty() {
             let node_ids: Vec<String> = placements
                 .iter()
-                .map(|(node_id, _)| node_id.clone())
+                .flat_map(|placement| placement.candidates.iter().cloned())
                 .collect::<HashSet<_>>()
                 .into_iter()
                 .collect();
@@ -2620,95 +2671,126 @@ impl Store {
             }
         }
 
+        // The candidate walk (late-binding plan §6.1), inside a nested
+        // savepoint so a placement that exhausts its list rolls back every
+        // batch-mate placement this plan already bound (no partial commit
+        // in v1) while the `rejected` row update below still commits.
+        tx.execute_batch("SAVEPOINT legion_plan_walk;")?;
         let mut allocations = Vec::new();
+        let mut candidate_ranks: Vec<usize> = Vec::new();
         let mut task_states: HashMap<i64, AllocationTaskState> = HashMap::new();
-        for (node_id, task_id) in &placements {
-            let state = match task_states.entry(*task_id) {
+        let mut walk_failure: Option<String> = None;
+        'placements: for placement in &placements {
+            let task_id = placement.task_id;
+            let state = match task_states.entry(task_id) {
                 Entry::Occupied(entry) => entry.into_mut(),
                 Entry::Vacant(entry) => {
-                    entry.insert(self.load_allocation_task_state(&tx, *task_id)?)
+                    entry.insert(self.load_allocation_task_state(&tx, task_id)?)
                 }
             };
 
-            let node = nodes_by_id.get(node_id).with_context(|| {
-                format!(
-                    "Node {node_id} not found while applying plan {}",
-                    submission.id
-                )
-            })?;
-            // Availability is re-validated on the FRESH node row, not only
-            // constraints/permit (adversarial finding, 2026-07-28): a
-            // cordon (`set_node_availability`, control lane) or a node loss
-            // landing between the planner's snapshot and this apply bumps
-            // no allocation epoch — the CAS structurally cannot see it — so
-            // without this check a plan placed onto a node the operator
-            // just drained, and nothing ever reconciled the placement away.
-            let unavailable = node.availability != "available";
-            if unavailable
-                || !state
+            // Why a candidate is skipped, kept for the rejection reason
+            // when the whole list runs dry.
+            let mut last_skip = String::new();
+            let candidate_count = placement.candidates.len();
+            for (rank, node_id) in placement.candidates.iter().enumerate() {
+                let is_last = rank + 1 == candidate_count;
+
+                // "Free" means "epoch unchanged since the planner sampled
+                // it" — the fit proof carried forward from plan time. A
+                // touched-but-still-fits node is skipped conservatively;
+                // no capacity math happens here.
+                let expected_epoch = submission
+                    .expected_versions
+                    .get(&Self::scope_vector_key("node", node_id))
+                    .copied()
+                    .unwrap_or_default();
+                let latest_epoch = self.scope_epoch_tx(&tx, "node", node_id)?;
+                if latest_epoch != expected_epoch {
+                    last_skip =
+                        format!("node {node_id} epoch moved ({expected_epoch} -> {latest_epoch})");
+                    continue;
+                }
+
+                let Some(node) = nodes_by_id.get(node_id) else {
+                    last_skip = format!("node {node_id} no longer exists");
+                    continue;
+                };
+                // Availability is re-validated on the FRESH node row, not
+                // only constraints/permit (adversarial finding,
+                // 2026-07-28): a cordon or node loss landing between the
+                // planner's snapshot and this apply bumps no allocation
+                // epoch — the walk structurally cannot see it in the epoch
+                // check — so without this a plan placed onto a node the
+                // operator just drained. Under late binding the race costs
+                // a fallback rank instead of a rejection.
+                if node.availability != "available" {
+                    last_skip = format!(
+                        "node {} is {} (cordoned, draining, or lost since the plan snapshot)",
+                        node_id, node.availability
+                    );
+                    continue;
+                }
+                if !state
                     .constraints
                     .is_satisfied(node, state.distinct.as_ref())
-                || !state.permit.is_permitted(node)
-            {
-                let reason = if unavailable {
-                    format!(
-                        "Node {} is {} (cordoned, draining, or lost since the plan snapshot)",
-                        node_id, node.availability
-                    )
-                } else {
-                    format!(
-                        "Node {} does not satisfy constraints for task {}",
-                        node_id, task_id
-                    )
-                };
-                tx.execute(
-                    "UPDATE plan_submission SET status = 'rejected', rejection_reason = ?1 WHERE id = ?2;",
-                    params![reason, submission.id],
-                )?;
-                let latest_versions =
-                    self.scope_vector_epochs_tx(&tx, &submission.expected_versions)?;
-                let rejected_event = self.stage_event_locked(
+                    || !state.permit.is_permitted(node)
+                {
+                    last_skip =
+                        format!("node {node_id} does not satisfy constraints for task {task_id}");
+                    continue;
+                }
+
+                // Static-port collisions (and other per-node network
+                // assignment failures) skip to the next candidate — one
+                // more reject class converted to a fallback. The LAST
+                // candidate propagates the error instead, preserving the
+                // pre-late-binding error surface for genuinely broken
+                // network configs (a Rejected here would send a doomed
+                // plan into the conflict-requeue loop forever).
+                let network = match self.assign_allocation_network(
                     &tx,
-                    drafts::plan_rejected(&submission.job_config_id, &reason),
-                );
-                tx.commit()?;
-                self.publish_staged(rejected_event);
-                warn!(
-                    submission_id = submission.id,
-                    job_config_id = %submission.job_config_id,
-                    duration_ms = tx_started.elapsed().as_millis() as u64,
-                    "Rejected plan submission after validation during apply"
-                );
-                crate::manager::telemetry::metrics()
-                    .plan_apply_total
-                    .inc(&["rejected"]);
-                return Ok(PlanApplyOutcome::Rejected {
-                    reason,
-                    latest_versions,
-                });
+                    node_id,
+                    task_id,
+                    state.network_raw.clone(),
+                    state.connect_raw.clone(),
+                ) {
+                    Ok(network) => network,
+                    Err(err) if !is_last => {
+                        last_skip = format!("node {node_id} network assignment: {err:#}");
+                        continue;
+                    }
+                    Err(err) => return Err(err),
+                };
+
+                if let Some(tracker) = state.distinct.as_mut() {
+                    tracker.insert_from_node(node);
+                }
+                let allocation = self.insert_allocation_with_data(
+                    &tx,
+                    node_id,
+                    task_id,
+                    &state.job_config_id,
+                    &state.resources,
+                    network.as_ref(),
+                )?;
+                allocations.push(allocation);
+                candidate_ranks.push(rank);
+                continue 'placements;
             }
 
-            if let Some(tracker) = state.distinct.as_mut() {
-                tracker.insert_from_node(node);
-            }
-
-            let network = self.assign_allocation_network(
-                &tx,
-                node_id,
-                *task_id,
-                state.network_raw.clone(),
-                state.connect_raw.clone(),
-            )?;
-            let allocation = self.insert_allocation_with_data(
-                &tx,
-                node_id,
-                *task_id,
-                &state.job_config_id,
-                &state.resources,
-                network.as_ref(),
-            )?;
-            allocations.push(allocation);
+            walk_failure = Some(format!(
+                "all {candidate_count} candidate(s) for task {task_id} are stale or invalid \
+                 (last: {last_skip})"
+            ));
+            break;
         }
+
+        if let Some(reason) = walk_failure {
+            tx.execute_batch("ROLLBACK TO legion_plan_walk; RELEASE legion_plan_walk;")?;
+            return self.reject_plan_submission_tx(tx, tx_started, submission, reason);
+        }
+        tx.execute_batch("RELEASE legion_plan_walk;")?;
 
         if !allocations.is_empty() {
             self.bump_epochs_for_allocations_tx(&tx, &allocations)?;
@@ -2718,15 +2800,24 @@ impl Store {
             "UPDATE plan_submission SET status = 'applied', rejection_reason = NULL WHERE id = ?1;",
             [submission.id],
         )?;
-        let placed_event = drafts::allocations_placed(&submission.job_config_id, &allocations)
-            .and_then(|draft| self.stage_event_locked(&tx, draft));
+        let placed_event =
+            drafts::allocations_placed(&submission.job_config_id, &allocations, &candidate_ranks)
+                .and_then(|draft| self.stage_event_locked(&tx, draft));
         tx.commit()?;
         self.publish_staged(placed_event);
+        let fallbacks = candidate_ranks.iter().filter(|rank| **rank > 0).count();
+        {
+            let metrics = crate::manager::telemetry::metrics();
+            for rank in &candidate_ranks {
+                metrics.scheduler_plan_candidate_rank.observe(*rank as f64);
+            }
+        }
         info!(
             submission_id = submission.id,
             job_config_id = %submission.job_config_id,
             placement_count = placements.len(),
             applied_allocations = allocations.len(),
+            fallbacks,
             duration_ms = tx_started.elapsed().as_millis(),
             "Applied plan submission transaction"
         );
@@ -2737,6 +2828,42 @@ impl Store {
             .inc(&["applied"]);
 
         Ok(PlanApplyOutcome::Applied(allocations))
+    }
+
+    /// Shared rejection tail for `apply_plan_submission_apply`: record the
+    /// rejection on the submission row, stage the event, commit, and hand
+    /// back the fresh epochs for the sampler's mirror self-heal.
+    fn reject_plan_submission_tx(
+        &self,
+        tx: rusqlite::Savepoint<'_>,
+        tx_started: Instant,
+        submission: &PlanSubmission,
+        reason: String,
+    ) -> R<PlanApplyOutcome> {
+        tx.execute(
+            "UPDATE plan_submission SET status = 'rejected', rejection_reason = ?1 WHERE id = ?2;",
+            params![reason, submission.id],
+        )?;
+        let latest_versions = self.scope_vector_epochs_tx(&tx, &submission.expected_versions)?;
+        let rejected_event = self.stage_event_locked(
+            &tx,
+            drafts::plan_rejected(&submission.job_config_id, &reason),
+        );
+        tx.commit()?;
+        self.publish_staged(rejected_event);
+        warn!(
+            submission_id = submission.id,
+            job_config_id = %submission.job_config_id,
+            duration_ms = tx_started.elapsed().as_millis() as u64,
+            "Rejected plan submission: {reason}"
+        );
+        crate::manager::telemetry::metrics()
+            .plan_apply_total
+            .inc(&["rejected"]);
+        Ok(PlanApplyOutcome::Rejected {
+            reason,
+            latest_versions,
+        })
     }
 
     pub(crate) fn collect_rows<T, I>(iter: I) -> R<Vec<T>>
@@ -14877,19 +15004,19 @@ mod tests {
             PlanApplyRequest {
                 job_config_id: job_a.clone(),
                 mode: "fresh".into(),
-                placements: vec![("node-a".to_string(), task_a)],
+                placements: vec![PlanPlacement::pinned("node-a", task_a)],
                 expected_versions: versions_a,
             },
             PlanApplyRequest {
                 job_config_id: job_b.clone(),
                 mode: "fresh".into(),
-                placements: vec![("node-c".to_string(), 999_999)],
+                placements: vec![PlanPlacement::pinned("node-c", 999_999)],
                 expected_versions: versions_b,
             },
             PlanApplyRequest {
                 job_config_id: job_c.clone(),
                 mode: "fresh".into(),
-                placements: vec![("node-b".to_string(), task_c)],
+                placements: vec![PlanPlacement::pinned("node-b", task_c)],
                 expected_versions: versions_c,
             },
         ]);
@@ -14912,6 +15039,193 @@ mod tests {
     }
 
     #[test]
+    fn walk_binds_first_fresh_candidate_after_race() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "ready"))?;
+        store.insert_node(make_node_msg("node-b", "ready"))?;
+        let (job_a, task_a) = submit_named_job(&store, "walk-race-a")?;
+        let (job_b, task_b) = submit_named_job(&store, "walk-race-b")?;
+
+        // Job B samples with both candidates fresh...
+        let versions_b = store.allocation_version_vector(
+            &job_b,
+            &HashSet::from(["node-a".to_string(), "node-b".to_string()]),
+        )?;
+        // ...then job A wins node-a first (bumping its epoch).
+        let versions_a =
+            store.allocation_version_vector(&job_a, &HashSet::from(["node-a".to_string()]))?;
+        let (_, outcome_a) = store.submit_and_apply_plan(
+            &job_a,
+            "fresh",
+            &[PlanPlacement::pinned("node-a", task_a)],
+            &versions_a,
+        )?;
+        assert!(matches!(outcome_a, PlanApplyOutcome::Applied(_)));
+
+        // B's walk must slide to rank 1 instead of conflicting.
+        let (_, outcome_b) = store.submit_and_apply_plan(
+            &job_b,
+            "fresh",
+            &[PlanPlacement {
+                task_id: task_b,
+                candidates: vec!["node-a".to_string(), "node-b".to_string()],
+            }],
+            &versions_b,
+        )?;
+        let PlanApplyOutcome::Applied(allocations) = outcome_b else {
+            panic!("the walk must bind a fallback, not reject: {outcome_b:?}");
+        };
+        assert_eq!(allocations.len(), 1);
+        assert_eq!(allocations[0].node_id, "node-b", "must bind rank 1");
+        Ok(())
+    }
+
+    #[test]
+    fn walk_rejects_when_every_candidate_is_stale() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "ready"))?;
+        let (job_a, task_a) = submit_named_job(&store, "walk-stale-a")?;
+        let (job_b, task_b) = submit_named_job(&store, "walk-stale-b")?;
+
+        let versions_b =
+            store.allocation_version_vector(&job_b, &HashSet::from(["node-a".to_string()]))?;
+        let versions_a =
+            store.allocation_version_vector(&job_a, &HashSet::from(["node-a".to_string()]))?;
+        let (_, outcome_a) = store.submit_and_apply_plan(
+            &job_a,
+            "fresh",
+            &[PlanPlacement::pinned("node-a", task_a)],
+            &versions_a,
+        )?;
+        assert!(matches!(outcome_a, PlanApplyOutcome::Applied(_)));
+
+        let (_, outcome_b) = store.submit_and_apply_plan(
+            &job_b,
+            "fresh",
+            &[PlanPlacement {
+                task_id: task_b,
+                candidates: vec!["node-a".to_string()],
+            }],
+            &versions_b,
+        )?;
+        assert!(
+            matches!(outcome_b, PlanApplyOutcome::Rejected { .. }),
+            "an exhausted candidate list must reject: {outcome_b:?}"
+        );
+        assert_eq!(store.allocs_for_node("node-a")?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn walk_skips_a_cordoned_candidate() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "ready"))?;
+        store.insert_node(make_node_msg("node-b", "ready"))?;
+        let (job, task_id) = submit_named_job(&store, "walk-cordon")?;
+
+        let versions = store.allocation_version_vector(
+            &job,
+            &HashSet::from(["node-a".to_string(), "node-b".to_string()]),
+        )?;
+        // A cordon bumps no allocation epoch — the epoch check cannot see
+        // it; the fresh-row re-validation must skip the candidate instead
+        // of rejecting the plan (pre-late-binding behavior).
+        store.set_node_availability("node-a", "drained")?;
+
+        let (_, outcome) = store.submit_and_apply_plan(
+            &job,
+            "fresh",
+            &[PlanPlacement {
+                task_id,
+                candidates: vec!["node-a".to_string(), "node-b".to_string()],
+            }],
+            &versions,
+        )?;
+        let PlanApplyOutcome::Applied(allocations) = outcome else {
+            panic!("cordon must cost a rank, not a rejection: {outcome:?}");
+        };
+        assert_eq!(allocations[0].node_id, "node-b");
+        assert!(store.allocs_for_node("node-a")?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn walk_keeps_the_job_config_epoch_hard() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "ready"))?;
+        store.insert_node(make_node_msg("node-b", "ready"))?;
+        let (job, task_id) = submit_named_job(&store, "walk-job-epoch")?;
+
+        let versions = store.allocation_version_vector(
+            &job,
+            &HashSet::from(["node-a".to_string(), "node-b".to_string()]),
+        )?;
+        // The SAME job config applies something else: its epoch moves, and
+        // no amount of fresh node candidates may bypass that.
+        store.place_alloc("node-b", task_id)?;
+
+        let (_, outcome) = store.submit_and_apply_plan(
+            &job,
+            "fresh",
+            &[PlanPlacement {
+                task_id,
+                candidates: vec!["node-a".to_string(), "node-b".to_string()],
+            }],
+            &versions,
+        )?;
+        assert!(
+            matches!(outcome, PlanApplyOutcome::Rejected { .. }),
+            "a stale job-config epoch must reject regardless of candidates: {outcome:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn walk_rollback_leaves_no_partial_placements() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "ready"))?;
+        store.insert_node(make_node_msg("node-b", "ready"))?;
+        let (job_a, task_a) = submit_named_job(&store, "walk-partial-a")?;
+        let (job_b, task_b) = submit_named_job(&store, "walk-partial-b")?;
+
+        // Two placements: the first binds node-a fine, the second's only
+        // candidate (node-b) goes stale — the whole plan must reject and
+        // the FIRST placement's allocation must roll back.
+        let versions = store.allocation_version_vector(
+            &job_a,
+            &HashSet::from(["node-a".to_string(), "node-b".to_string()]),
+        )?;
+        let versions_b =
+            store.allocation_version_vector(&job_b, &HashSet::from(["node-b".to_string()]))?;
+        let (_, outcome_b) = store.submit_and_apply_plan(
+            &job_b,
+            "fresh",
+            &[PlanPlacement::pinned("node-b", task_b)],
+            &versions_b,
+        )?;
+        assert!(matches!(outcome_b, PlanApplyOutcome::Applied(_)));
+
+        let (_, outcome) = store.submit_and_apply_plan(
+            &job_a,
+            "fresh",
+            &[
+                PlanPlacement::pinned("node-a", task_a),
+                PlanPlacement::pinned("node-b", task_a),
+            ],
+            &versions,
+        )?;
+        assert!(
+            matches!(outcome, PlanApplyOutcome::Rejected { .. }),
+            "{outcome:?}"
+        );
+        assert!(
+            store.allocs_for_node("node-a")?.is_empty(),
+            "the bound-then-rolled-back placement must leave nothing behind"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn plan_batch_keeps_per_plan_cas_verdicts() -> R<()> {
         let store = setup_store()?;
         store.insert_node(make_node_msg("node-a", "ready"))?;
@@ -14928,7 +15242,7 @@ mod tests {
         let results = store.run_plan_apply_batch(vec![PlanApplyRequest {
             job_config_id: job_b.clone(),
             mode: "fresh".into(),
-            placements: vec![("node-a".to_string(), task_b)],
+            placements: vec![PlanPlacement::pinned("node-a", task_b)],
             expected_versions: stale,
         }]);
         assert!(
@@ -14964,7 +15278,7 @@ mod tests {
                     store.submit_and_apply_plan(
                         &job_config_id,
                         "fresh",
-                        &[(node, task_id)],
+                        &[PlanPlacement::pinned(node, task_id)],
                         &versions,
                     )
                 })
@@ -15440,7 +15754,7 @@ mod tests {
         // Empty inputs are no-ops, so callers don't need their own guards.
         store.events().allocations_removed_from_node("node-a", &[]);
         store.events().allocations_removed_for_job("demo", 0);
-        assert!(drafts::allocations_placed("cfg-1", &[]).is_none());
+        assert!(drafts::allocations_placed("cfg-1", &[], &[]).is_none());
         assert!(drafts::job_submit_outcome(
             "demo",
             &JobSubmitOutcome::Unchanged {

@@ -15,7 +15,7 @@ use crate::prelude::*;
 use crate::resources::{ResourcePolicy, ResourcePool, ResourceRequest, ResourceValue};
 use crate::scheduling_index::{IndexMode, IndexQueryOutcome};
 use crate::storage::errors::StorageError;
-use crate::storage::store::{PlanApplyOutcome, SharedNodeAllocations, Store};
+use crate::storage::store::{PlanApplyOutcome, PlanPlacement, SharedNodeAllocations, Store};
 use crate::structs::{
     Allocation, JobConfig, Node, TaskConfig, TaskDependencyCondition, TaskLifecycle,
     TaskStatusState,
@@ -31,6 +31,11 @@ const RESCHEDULE_SCORE_JITTER_THRESHOLD: f64 = 0.01;
 pub struct PlannedAllocation {
     pub node_id: String,
     pub task_config_id: i64,
+    /// Ranked fallback candidates for the late-binding apply walk
+    /// (`node_id` is rank 0; see docs/scheduler-and-eval-loop.md). Empty
+    /// when the placement is fixed to `node_id` — coupled placements,
+    /// pinned storage, plugin policies, or `plan_candidates: 0`.
+    pub candidates: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -196,6 +201,19 @@ enum NodesConsidered {
 struct ScoreSample {
     min_nodes: usize,
     sample: usize,
+}
+
+/// Late-binding candidate lists (`schedulerSettings.plan_candidates`,
+/// late-binding plan §6.2-6.3): eligible placements submit `count` ranked
+/// candidates — rank 0 is the true argmax pick (uncontended plans pay
+/// zero quality tax), ranks 1..k-1 are drawn from the near-tie `band` so
+/// racing planners decorrelate — and the apply walk binds to the first
+/// candidate whose node epoch is unchanged. `plan_candidates: 0` restores
+/// fixed single-node submissions.
+#[derive(Debug, Clone, Copy)]
+struct PlanCandidates {
+    count: usize,
+    band: f64,
 }
 
 /// Plan-time free-capacity ledger. Pools are `Arc`'d straight off the
@@ -908,13 +926,28 @@ impl<'a> Scheduler<'a> {
                 });
             }
 
-            let placement_pairs = placements
+            let placement_pairs: Vec<PlanPlacement> = placements
                 .iter()
-                .map(|placement| (placement.node_id.clone(), placement.task_config_id))
-                .collect::<Vec<_>>();
-            let affected_nodes = placements
+                .map(|placement| {
+                    if placement.candidates.is_empty() {
+                        PlanPlacement::pinned(placement.node_id.clone(), placement.task_config_id)
+                    } else {
+                        debug_assert_eq!(
+                            placement.candidates[0], placement.node_id,
+                            "rank 0 must be the planner's pick"
+                        );
+                        PlanPlacement {
+                            task_id: placement.task_config_id,
+                            candidates: placement.candidates.clone(),
+                        }
+                    }
+                })
+                .collect();
+            // The fence must cover every node the apply walk may bind —
+            // the union of the candidate lists, not just the rank-0 picks.
+            let affected_nodes = placement_pairs
                 .iter()
-                .map(|placement| placement.node_id.clone())
+                .flat_map(|placement| placement.candidates.iter().cloned())
                 .collect::<HashSet<_>>();
             let expected_versions = match candidate_versions.as_ref() {
                 // Eager: select from the pre-planning sample; re-reading here
@@ -1171,6 +1204,16 @@ impl<'a> Scheduler<'a> {
         let weights = self.scheduler_weights()?;
         let nodes_considered_setting = self.nodes_considered_setting()?;
         let score_sample_setting = self.score_sample_setting()?;
+        // Late-binding candidate lists, Phase 2 scope: single-placement
+        // plans only — one placement has no batch-mate whose fallback
+        // could interact with it (no coupling analysis needed). The
+        // motivating workload (sandbox bursts of single-task jobs) is
+        // exactly this shape. Phase 3 widens this to singleton coupling
+        // components of multi-placement plans.
+        let total_required: u64 = required_counts.values().map(|count| *count as u64).sum();
+        let plan_candidates_setting = self
+            .plan_candidates_setting()?
+            .filter(|_| total_required == 1);
         let mut reschedule_rng = if matches!(mode, PlanMode::Reschedule) {
             Some(reschedule_rng())
         } else {
@@ -1423,6 +1466,7 @@ impl<'a> Scheduler<'a> {
                         &mut reschedule_rng,
                         nodes_considered_setting.as_ref(),
                         score_sample_setting.as_ref(),
+                        plan_candidates_setting.as_ref(),
                         &mut nodes_considered_rng,
                         &node_lookup,
                         &mut resource_ledger,
@@ -1470,6 +1514,7 @@ impl<'a> Scheduler<'a> {
                     &mut reschedule_rng,
                     nodes_considered_setting.as_ref(),
                     score_sample_setting.as_ref(),
+                    plan_candidates_setting.as_ref(),
                     &mut nodes_considered_rng,
                     &node_lookup,
                     &mut resource_ledger,
@@ -1790,6 +1835,7 @@ impl<'a> Scheduler<'a> {
         reschedule_rng: &mut Option<StdRng>,
         nodes_considered_setting: Option<&NodesConsidered>,
         score_sample_setting: Option<&ScoreSample>,
+        plan_candidates: Option<&PlanCandidates>,
         nodes_considered_rng: &mut StdRng,
         node_lookup: &HashMap<&'b str, &'b Node>,
         resource_ledger: &mut ResourceLedger,
@@ -1965,6 +2011,12 @@ impl<'a> Scheduler<'a> {
                 }
             };
 
+            // Fallback candidates for the late-binding walk, filled by the
+            // plain (uncoupled) selection path below. Group members never
+            // collect (the group is one selection unit), and a pinned
+            // placement's eligible list is one node, so its "list" is the
+            // pin itself — safe by construction.
+            let mut fallback_candidates: Vec<String> = Vec::new();
             let node_id = if let Some(group_key) = group_key {
                 if let Some(existing) = group_assignments.get(group_key) {
                     let is_eligible = eligible
@@ -1980,12 +2032,15 @@ impl<'a> Scheduler<'a> {
                     }
                     existing.clone()
                 } else {
+                    let mut group_discard = Vec::new();
                     let selected = self.select_node_id(
                         eligible,
                         reschedule_rng,
                         nodes_considered_setting,
                         score_sample_setting,
                         &mut plan.index_usage.score_sampled,
+                        None,
+                        &mut group_discard,
                         nodes_considered_rng,
                         task_id,
                         task_config,
@@ -2009,6 +2064,8 @@ impl<'a> Scheduler<'a> {
                     nodes_considered_setting,
                     score_sample_setting,
                     &mut plan.index_usage.score_sampled,
+                    plan_candidates,
+                    &mut fallback_candidates,
                     nodes_considered_rng,
                     task_id,
                     task_config,
@@ -2051,6 +2108,7 @@ impl<'a> Scheduler<'a> {
             placements.push(PlannedAllocation {
                 node_id,
                 task_config_id: task_id,
+                candidates: fallback_candidates,
             });
         }
 
@@ -2065,6 +2123,8 @@ impl<'a> Scheduler<'a> {
         nodes_considered_setting: Option<&NodesConsidered>,
         score_sample_setting: Option<&ScoreSample>,
         score_sampled: &mut Option<usize>,
+        plan_candidates: Option<&PlanCandidates>,
+        candidates_out: &mut Vec<String>,
         nodes_considered_rng: &mut StdRng,
         task_id: i64,
         task_config: &TaskConfig,
@@ -2089,6 +2149,29 @@ impl<'a> Scheduler<'a> {
             nodes_considered_rng,
             score_sampled,
         );
+
+        // Late-binding candidate collection (Fresh-mode built-in policies
+        // only): score the eligible set once and derive both the selected
+        // node (rank 0 — identical to the fused selector's argmax-with-tie-
+        // shuffle) and the ranked fallback list.
+        if let Some(settings) = plan_candidates {
+            if reschedule_rng.is_none() && matches!(self.policy.name(), "bin_pack" | "spread") {
+                let scored =
+                    score_nodes_with_cache(&eligible, affinity_set, scoring_cache, weights);
+                if let Some(candidates) =
+                    Self::ranked_candidates(scored, settings, nodes_considered_rng)
+                {
+                    let head = candidates[0].clone();
+                    *candidates_out = candidates;
+                    return Ok(head);
+                }
+                bail!(
+                    "Scheduling policy {} failed to place task {}",
+                    self.policy.name(),
+                    task_config.name
+                );
+            }
+        }
 
         if matches!(self.policy.name(), "bin_pack" | "spread") {
             let selected = if let Some(rng) = reschedule_rng.as_mut() {
@@ -2655,6 +2738,109 @@ impl<'a> Scheduler<'a> {
             );
         }
         Ok(Some(ScoreSample { min_nodes, sample }))
+    }
+
+    /// `schedulerSettings.plan_candidates` — late-binding candidate lists.
+    /// Int shorthand (`8`; `0` disables) or full form
+    /// (`{ count: 8, band: 0.01 }`). Defaults ON with count 8: the
+    /// semantics are conservative by construction (rank 0 is today's
+    /// pick; a list of length 1 IS today's plan). Only the built-in
+    /// scoring policies produce lists; plugin policies stay fixed.
+    fn plan_candidates_setting(&self) -> R<Option<PlanCandidates>> {
+        const DEFAULT_COUNT: usize = 8;
+        const MAX_COUNT: usize = 32;
+        if !matches!(self.policy.name(), "bin_pack" | "spread") {
+            return Ok(None);
+        }
+        let raw = self
+            .store
+            .scheduler_settings
+            .as_ref()
+            .and_then(|settings| settings.get("plan_candidates"));
+        let (count, band) = match raw {
+            None => (DEFAULT_COUNT, RESCHEDULE_SCORE_JITTER_THRESHOLD),
+            Some(Value::Number(count)) => (
+                count
+                    .as_u64()
+                    .context("plan_candidates must be a non-negative integer")?
+                    as usize,
+                RESCHEDULE_SCORE_JITTER_THRESHOLD,
+            ),
+            Some(Value::Object(map)) => {
+                let count = map
+                    .get("count")
+                    .and_then(Value::as_u64)
+                    .context("plan_candidates.count must be a non-negative integer")?
+                    as usize;
+                let band = map
+                    .get("band")
+                    .map(|value| {
+                        value
+                            .as_f64()
+                            .context("plan_candidates.band must be a number")
+                    })
+                    .transpose()?
+                    .unwrap_or(RESCHEDULE_SCORE_JITTER_THRESHOLD);
+                if !(0.0..=1.0).contains(&band) {
+                    bail!("plan_candidates.band must be between 0 and 1");
+                }
+                (count, band)
+            }
+            Some(_) => bail!("plan_candidates must be an integer or {{ count, band }}"),
+        };
+        if count == 0 {
+            return Ok(None);
+        }
+        Ok(Some(PlanCandidates {
+            count: count.min(MAX_COUNT),
+            band,
+        }))
+    }
+
+    /// Build the ranked candidate list from a scored eligible set
+    /// (late-binding plan §6.2) and return the head (the placement's
+    /// node). Rank 0 is the true argmax with today's exact-tie shuffle;
+    /// ranks 1..k-1 are drawn uniformly from the near-tie band (within
+    /// `band` of the best score), extended down the ranking in score
+    /// order when the band is thinner than k. Uniform-within-band rather
+    /// than score-weighted: band membership already bounds the quality
+    /// loss, and inside a 1% band weighting is noise (recorded call).
+    fn ranked_candidates(
+        mut scored: Vec<(&Node, f64)>,
+        settings: &PlanCandidates,
+        rng: &mut StdRng,
+    ) -> Option<Vec<String>> {
+        if scored.is_empty() {
+            return None;
+        }
+        let best = scored
+            .iter()
+            .fold(f64::NEG_INFINITY, |best, (_, score)| best.max(*score));
+        // Descending by score; stable order before the shuffles below.
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        // Head: uniform over exact ties, exactly like select_cached_node.
+        let tie_count = scored
+            .iter()
+            .take_while(|(_, score)| (score - best).abs() <= 1e-9)
+            .count();
+        let head_index = rng.gen_range(0..tie_count);
+        // `remove`, not `swap_remove`: the descending order must survive
+        // for the band cut and the score-order extension below.
+        let head = scored.remove(head_index).0.id.clone();
+
+        // Tail: shuffle the near-tie band, then extend in score order.
+        let band_len = scored
+            .iter()
+            .take_while(|(_, score)| *score >= best - settings.band)
+            .count();
+        scored[..band_len].shuffle(rng);
+        let mut candidates = Vec::with_capacity(settings.count);
+        candidates.push(head);
+        for (node, _) in scored.into_iter().take(settings.count.saturating_sub(1)) {
+            candidates.push(node.id.clone());
+        }
+        Some(candidates)
     }
 
     /// `schedulerSettings.lazy_version_sample` — default true. The escape
@@ -5650,6 +5836,116 @@ mod tests {
             sampled <= 32,
             "best-of-8 packing must stay within the quality bound: used {sampled} nodes"
         );
+        Ok(())
+    }
+
+    fn submission_placements_json(store: &Store) -> R<String> {
+        Ok(store.bench_scalar_text(
+            "SELECT placements FROM plan_submission ORDER BY id DESC LIMIT 1;",
+        )?)
+    }
+
+    #[test]
+    fn single_placement_plans_submit_candidate_lists() -> R<()> {
+        let store = setup_store()?;
+        for index in 0..12 {
+            store.insert_node(make_node_msg(&format!("node-{index:02}"), json!({})))?;
+        }
+        let job_config_id =
+            submit_job(&store, "cand-single", vec![TaskConfig::new("api", "noop")])?;
+        let scheduler = Scheduler::new(&store)?;
+        let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
+        assert_eq!(outcome.allocations.len(), 1);
+
+        let raw = submission_placements_json(&store)?;
+        let parsed: Value = serde_json::from_str(&raw)?;
+        assert_eq!(parsed.get("format").and_then(Value::as_u64), Some(2));
+        let candidates = parsed["placements"][0]["candidates"]
+            .as_array()
+            .context("candidates array")?;
+        assert_eq!(candidates.len(), 8, "default plan_candidates count");
+        // Rank 0 is the node the (uncontended) apply bound.
+        assert_eq!(
+            candidates[0].as_str(),
+            Some(outcome.allocations[0].node_id.as_str()),
+            "uncontended placements bind rank 0"
+        );
+        // No duplicates in the list.
+        let unique: HashSet<&str> = candidates.iter().filter_map(Value::as_str).collect();
+        assert_eq!(unique.len(), candidates.len());
+        Ok(())
+    }
+
+    #[test]
+    fn plan_candidates_zero_restores_v1_submissions() -> R<()> {
+        let store = setup_store_with_scheduler("bin_pack", Some(json!({ "plan_candidates": 0 })))?;
+        for index in 0..12 {
+            store.insert_node(make_node_msg(&format!("node-{index:02}"), json!({})))?;
+        }
+        let job_config_id = submit_job(&store, "cand-off", vec![TaskConfig::new("api", "noop")])?;
+        let scheduler = Scheduler::new(&store)?;
+        let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
+        assert_eq!(outcome.allocations.len(), 1);
+
+        let raw = submission_placements_json(&store)?;
+        let parsed: Value = serde_json::from_str(&raw)?;
+        assert!(
+            parsed.is_array(),
+            "plan_candidates: 0 must emit the v1 placements shape: {raw}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn multi_placement_plans_keep_singleton_lists_in_phase_two() -> R<()> {
+        let store = setup_store()?;
+        for index in 0..12 {
+            store.insert_node(make_node_msg(&format!("node-{index:02}"), json!({})))?;
+        }
+        let job_config_id = submit_job(
+            &store,
+            "cand-multi",
+            vec![TaskConfig {
+                count: TaskCount::new(3),
+                ..TaskConfig::new("api", "noop")
+            }],
+        )?;
+        let scheduler = Scheduler::new(&store)?;
+        let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
+        assert_eq!(outcome.allocations.len(), 3);
+
+        let raw = submission_placements_json(&store)?;
+        let parsed: Value = serde_json::from_str(&raw)?;
+        assert!(
+            parsed.is_array(),
+            "multi-placement plans stay all-or-nothing (singleton lists, v1 shape): {raw}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn candidates_do_not_change_the_uncontended_pick() -> R<()> {
+        // A unique argmax: one node already carries load, so bin_pack must
+        // pick it — with candidate lists on AND off.
+        let pick_with = |settings: Option<Value>| -> R<String> {
+            let store = setup_store_with_scheduler("bin_pack", settings)?;
+            for index in 0..6 {
+                store.insert_node(make_node_msg(&format!("node-{index:02}"), json!({})))?;
+            }
+            let seed_config =
+                submit_job(&store, "cand-seed", vec![TaskConfig::new("seed", "noop")])?;
+            let seed_task = task_id_for(&store, &seed_config, "seed")?;
+            store.place_alloc("node-03", seed_task)?;
+
+            let job_config_id =
+                submit_job(&store, "cand-pick", vec![TaskConfig::new("api", "noop")])?;
+            let scheduler = Scheduler::new(&store)?;
+            let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
+            Ok(outcome.allocations[0].node_id.clone())
+        };
+
+        assert_eq!(pick_with(None)?, "node-03");
+        assert_eq!(pick_with(Some(json!({ "plan_candidates": 0 })))?, "node-03");
         Ok(())
     }
 

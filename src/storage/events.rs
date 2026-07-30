@@ -232,19 +232,30 @@ pub mod drafts {
 
     /// `allocation.placed` — a plan was applied. One event per apply with up
     /// to 20 placements detailed in metadata. `None` when nothing was placed.
-    pub fn allocations_placed(job_config_id: &str, placed: &[Allocation]) -> Option<EventDraft> {
+    /// `candidate_ranks` aligns with `placed`: the late-binding rank each
+    /// placement bound at (0 = the planner's first choice; >0 = a
+    /// fallback). Empty when rank tracking is unavailable (legacy staged
+    /// applies).
+    pub fn allocations_placed(
+        job_config_id: &str,
+        placed: &[Allocation],
+        candidate_ranks: &[usize],
+    ) -> Option<EventDraft> {
         let first = placed.first()?;
         let placements: Vec<Value> = placed
             .iter()
+            .enumerate()
             .take(20)
-            .map(|alloc| {
+            .map(|(index, alloc)| {
                 json!({
                     "allocationId": alloc.id,
                     "nodeId": alloc.node_id,
                     "taskConfigId": alloc.task_config_id,
+                    "candidateRank": candidate_ranks.get(index).copied().unwrap_or(0),
                 })
             })
             .collect();
+        let fallbacks = candidate_ranks.iter().filter(|rank| **rank > 0).count();
         Some(
             EventDraft::info(
                 "allocation.placed",
@@ -258,6 +269,7 @@ pub mod drafts {
             .meta(json!({
                 "jobConfigId": job_config_id,
                 "count": placed.len(),
+                "fallbacks": fallbacks,
                 "placements": placements,
             })),
         )

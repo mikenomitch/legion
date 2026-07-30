@@ -348,7 +348,9 @@ fn concurrent_plan_applies_group_commit_with_isolation() -> R<()> {
                     store.submit_and_apply_plan(
                         &job_config_id,
                         "fresh",
-                        &[(node_id, task_id)],
+                        &[legion::storage::store::PlanPlacement::pinned(
+                            node_id, task_id,
+                        )],
                         &versions,
                     ),
                 )
