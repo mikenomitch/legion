@@ -86,7 +86,10 @@ fn write_profiles(dir: &TempDir) -> R<String> {
         })
         .to_string(),
     )?;
-    Ok(path.to_str().context("profiles path is not utf-8")?.to_string())
+    Ok(path
+        .to_str()
+        .context("profiles path is not utf-8")?
+        .to_string())
 }
 
 async fn launch_fleet(dir: &TempDir, manager_addr: String, count: usize) -> R<SimFleetRun> {
@@ -136,7 +139,10 @@ async fn simulated_fleet_registers_schedules_and_acks() -> R<()> {
         web[0].fingerprint_attrs["memory_total"],
         json!((8u64 * 1024 * 1024 * 1024).to_string())
     );
-    assert_eq!(util[0].fingerprint_attrs["cpus"]["cpu-1"]["frequency"], json!("3000"));
+    assert_eq!(
+        util[0].fingerprint_attrs["cpus"]["cpu-1"]["frequency"],
+        json!("3000")
+    );
     assert!(util[0].fingerprint_attrs["cpus"].get("cpu-2").is_none());
 
     // Schedule a constrained noop job; allocations must land on web nodes

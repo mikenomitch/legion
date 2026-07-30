@@ -1,0 +1,81 @@
+{
+  "title": "Campaign Overview (all systems)",
+  "uid": "campaign-overview",
+  "tags": ["benchmark"],
+  "timezone": "utc",
+  "schemaVersion": 39,
+  "refresh": "10s",
+  "time": { "from": "now-3h", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Legion: placements applied/s",
+      "gridPos": { "x": 0, "y": 0, "w": 8, "h": 8 },
+      "targets": [
+        {
+          "expr": "sum(rate(legion_plan_apply_total{outcome=\"applied\"}[1m]))",
+          "legendFormat": "legion",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Nomad: plan applies/s (nearest-equivalent)",
+      "description": "nomad.nomad.plan.* family; the analysis notebook maps phase families across systems — this panel is the live sanity check, not the result.",
+      "gridPos": { "x": 8, "y": 0, "w": 8, "h": 8 },
+      "targets": [
+        {
+          "expr": "sum(rate(nomad_nomad_plan_apply_count[1m]))",
+          "legendFormat": "nomad",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "K8s: scheduler binding p99 (nearest-equivalent)",
+      "gridPos": { "x": 16, "y": 0, "w": 8, "h": 8 },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum by (extension_point, le) (rate(scheduler_framework_extension_point_duration_seconds_bucket[1m])))",
+          "legendFormat": "{{extension_point}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Control-plane CPU (whoever is running)",
+      "gridPos": { "x": 0, "y": 8, "w": 12, "h": 8 },
+      "fieldConfig": { "defaults": { "unit": "percentunit", "max": 4 }, "overrides": [] },
+      "targets": [
+        {
+          "expr": "sum by (instance_name) (rate(node_cpu_seconds_total{mode!=\"idle\", role=\"control-plane\"}[1m]))",
+          "legendFormat": "{{instance_name}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Sim-worker instance CPU (fleet health)",
+      "description": "Sim fleets must never be the bottleneck; if these approach saturation, add instances, not excuses.",
+      "gridPos": { "x": 12, "y": 8, "w": 12, "h": 8 },
+      "fieldConfig": { "defaults": { "unit": "percentunit", "max": 8 }, "overrides": [] },
+      "targets": [
+        {
+          "expr": "sum by (instance_name) (rate(node_cpu_seconds_total{mode!=\"idle\", role=\"sim-worker\"}[1m]))",
+          "legendFormat": "{{instance_name}}",
+          "refId": "A"
+        }
+      ]
+    }
+  ]
+}

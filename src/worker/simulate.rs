@@ -192,7 +192,11 @@ fn fingerprint_for(profile: &SimNodeProfile) -> Value {
 /// attrs (profile wins), then the resource/limit keys the scheduler reads,
 /// then the markers every sim node carries — `simulated: true` and the
 /// shared `workerAddress` of this process's stub server.
-fn config_attrs_for(profile: &SimNodeProfile, config: &WorkerConfig, worker_address: &str) -> Value {
+fn config_attrs_for(
+    profile: &SimNodeProfile,
+    config: &WorkerConfig,
+    worker_address: &str,
+) -> Value {
     let mut attrs = Map::new();
     for (key, value) in &config.attributes {
         attrs.insert(key.clone(), Value::String(value.clone()));
@@ -462,14 +466,21 @@ pub async fn launch_simulated_fleet(
         }))
         .await
         .context("pre-registration failed (is the worker type known to the manager?)")?;
-    let config = pre_register.into_inner().config.context("No config found")?;
+    let config = pre_register
+        .into_inner()
+        .config
+        .context("No config found")?;
 
     // Stub worker server on an ephemeral port; every node in this process
     // advertises it as its workerAddress.
     let listener = tokio::net::TcpListener::bind("0.0.0.0:0")
         .await
         .context("failed to bind the stub worker port")?;
-    let worker_address = format!("http://{}:{}", opts.advertise_host, listener.local_addr()?.port());
+    let worker_address = format!(
+        "http://{}:{}",
+        opts.advertise_host,
+        listener.local_addr()?.port()
+    );
 
     // Build the fleet.
     let mut nodes: HashMap<String, Arc<SimNode>> = HashMap::new();

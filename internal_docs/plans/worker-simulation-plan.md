@@ -1,6 +1,11 @@
 # Worker Simulation (`legion start worker --simulate N`)
 
-**Status: PLANNED**
+**Status: SHIPPED** — all three phases landed together (engine +
+campaign knobs + docs, 2026-07-30): `src/worker/simulate.rs`, CLI flags
+on `start worker`, `tests/worker_simulation.rs`,
+`docs/worker-simulation.md`. Deliberately deferred: nothing from the
+plan; the open questions resolved as leaned (one pre-register, no
+kill-percent RPC).
 
 > **Judgement calls:** [`../calls/worker-simulation-plan_calls.md`](../calls/worker-simulation-plan_calls.md)
 
