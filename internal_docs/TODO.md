@@ -153,6 +153,17 @@ How to use it:
       planners against raft's commit-then-project ordering — the exact
       window the epoch mirror closes. The mirror's coherence is structural,
       so this is regression insurance, not a known gap.
+- [ ] Let a node override its builtin resource capacity (`cpu`, `memory`, `cores`)
+    - `ResourcePool::from_node` skips builtin names when reading a node's
+      `resources` block, so `resources: { cpu: 40000 }` in a worker config is
+      silently ignored rather than applied or rejected. Capacity can only come
+      from the fingerprint today, which leaves no escape hatch when a platform
+      fingerprints badly (see the Apple Silicon CPU frequency case) and no way
+      to deliberately under- or over-subscribe a node.
+    - Decide whether an override replaces the fingerprint or is a separate
+      ceiling, and how it composes with `reservedResources`. Whichever way it
+      lands, an ignored key should warn or fail validation instead of passing
+      silently.
 
 ## Task runtimes
 
