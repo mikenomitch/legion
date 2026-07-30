@@ -177,13 +177,14 @@ How to use it:
       no epoch coupling, so a pin invalidated mid-plan (e.g.
       `volume delete --force`) can still direct a placement; later
       reconciliation covers it. Low severity, same pass.
-- [ ] A raft-mode CONCURRENT-planning oversubscription test through the
-      real `Scheduler::plan_and_apply` path. The local_disk concurrency
-      test exists (`concurrent_plans_cannot_oversubscribe_a_node`) and the
-      raft batteries exercise plan CAS mechanics, but no test drives two
-      planners against raft's commit-then-project ordering — the exact
-      window the epoch mirror closes. The mirror's coherence is structural,
-      so this is regression insurance, not a known gap.
+- [x] A raft-mode CONCURRENT-planning oversubscription test through the
+      real `Scheduler::plan_and_apply` path (2026-07-30):
+      `concurrent_planners_cannot_oversubscribe_under_raft[_lanes]` in
+      [tests/raft_apply_roundtrip.rs](../tests/raft_apply_roundtrip.rs)
+      drives two barrier-released planners against raft's
+      commit-then-project ordering under both topologies — the exact
+      window the epoch mirror closes. Regression insurance; the local_disk
+      twin is `concurrent_plans_cannot_oversubscribe_a_node`.
 - [ ] Let a node override its builtin resource capacity (`cpu`, `memory`, `cores`)
     - `ResourcePool::from_node` skips builtin names when reading a node's
       `resources` block, so `resources: { cpu: 40000 }` in a worker config is
