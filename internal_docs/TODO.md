@@ -306,6 +306,14 @@ No plan yet — this needs one before any code.
 
 Plans: [persistence-plan.md](plans/persistence-plan.md), [multi-raft-persistence-plan.md](plans/multi-raft-persistence-plan.md) · docs: [state-store.md](../docs/state-store.md), [raft-operations.md](../docs/raft-operations.md), [persistence-streaming.md](../docs/persistence-streaming.md)
 
+- [ ] `raft_lanes::killing_the_all_lane_leader_reconverges_onto_one_survivor`
+      is timing-sensitive under parallel test load: green in isolation
+      (9/9 on a 4-vCPU container, 2026-07-30) but failed once during a full
+      `cargo test --all` where ~20 test binaries starve its election
+      timers. The test already accepts split outcomes by design; consider a
+      longer election budget when `cargo test` runs the whole workspace, or
+      serializing the cluster-gated suites.
+
 - [x] **Real Raft persistence** — quorum-committed writes, per-lane log stores,
       snapshots/compaction, real membership
       ([#137](https://github.com/mikenomitch/legion/pull/137)). Ships
