@@ -181,6 +181,53 @@ Anything else under the `legion_raft_*` prefix (snapshot timings,
 per-peer replication lag, ...) remains **reserved** for the raft engine —
 no other subsystem may claim the prefix.
 
+### Worker
+
+Workers can expose their own Prometheus listener, opt-in via the
+`LEGION_WORKER_TELEMETRY_PORT` environment variable (a port number; `0`
+binds an ephemeral port, logged at startup). It is an env var rather than a
+config field deliberately: workers joined with a bare token have no config
+file, and hosts packing many worker processes need a distinct port per
+process anyway. The listener binds `0.0.0.0:<port>` and serves `/metrics`
+and `/healthz` only — a worker has no store or quorum to probe, so there is
+no `/readyz`; the manager's node health/heartbeat state is the cluster's
+view of worker readiness. Default: disabled.
+
+- **`legion_worker_heartbeats_total{outcome}`** (counter) — heartbeat
+  round-trips attempted, by outcome (`ok` | `error` | `unauthenticated`).
+  A rising `error` rate is the worker-side view of manager unreachability;
+  `unauthenticated` means the node credential was revoked/rotated and the
+  worker is re-registering.
+- **`legion_worker_heartbeat_duration_seconds`** (histogram) — wall-clock
+  of one heartbeat round-trip (status report + reconcile against the
+  manager's reply). In a scale test this is how you prove the workers are
+  not the bottleneck.
+- **`legion_worker_allocations_running`** (gauge) — allocations this worker
+  currently runs, as reported on its last heartbeat.
+- **`legion_worker_allocation_failures_reported_total`** (counter) —
+  allocation failures this worker has reported to the manager.
+
+## OTLP metrics push
+
+Both the manager's and the worker's registries can additionally be
+**pushed** over OTLP/HTTP (protobuf) to any OTLP-capable backend — the
+same opt-in convention as trace export (docs/observability.md):
+
+- `OTEL_EXPORTER_OTLP_ENDPOINT` — base collector URL; `/v1/metrics` is
+  appended for the metrics signal.
+- `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` — exact metrics endpoint, used
+  verbatim.
+- `OTEL_METRIC_EXPORT_INTERVAL` — export interval in milliseconds
+  (default 60000).
+- `LEGION_OTLP=1` — force-enable at the default endpoint.
+
+Each tick exports every registry the process actually initialized (a
+worker-only process pushes no manager families and vice versa) with
+cumulative temporality and full histogram buckets. Failed exports are
+logged at debug and retried on the next tick — the push is never allowed
+to back-pressure the daemon. The pull `/metrics` listeners are unaffected
+and can run alongside.
+
 ## Scrape configuration example
 
 ```yaml
@@ -189,6 +236,10 @@ scrape_configs:
     metrics_path: /metrics
     static_configs:
       - targets: ["10.0.0.5:4749"] # server.port + 2 (or telemetry.port)
+  - job_name: legion-workers
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["10.0.1.7:9091"] # LEGION_WORKER_TELEMETRY_PORT, if enabled
 ```
 
 Probe wiring (e.g. under systemd or Kubernetes):

@@ -249,6 +249,33 @@ async fn run_worker_with_manager(
     register_self(client.clone(), &registration, &credentials).await?;
     info!(worker_name = %name, "Worker registered with manager");
 
+    // Worker telemetry: opt-in Prometheus listener (/metrics + /healthz,
+    // `legion_worker_*` families) so a fleet can prove its workers are not
+    // the bottleneck. Env-var rather than config: workers joined with a bare
+    // token have no config file, and packed multi-worker hosts need
+    // per-process ports anyway (port 0 = ephemeral, logged on bind). See
+    // docs/metrics.md.
+    if let Ok(port) = std::env::var("LEGION_WORKER_TELEMETRY_PORT") {
+        match port.trim().parse::<u16>() {
+            Ok(port) => {
+                let telemetry_addr: std::net::SocketAddr = ([0, 0, 0, 0], port).into();
+                tokio::spawn(async move {
+                    if let Err(err) =
+                        crate::manager::telemetry::serve_worker_telemetry(telemetry_addr).await
+                    {
+                        error!(error = ?err, "worker telemetry listener exited");
+                    }
+                });
+            }
+            Err(_) => warn!(
+                value = %port,
+                "Ignoring LEGION_WORKER_TELEMETRY_PORT: not a valid port number"
+            ),
+        }
+    }
+    // OTLP metrics push (opt-in via the OTEL_* env vars; no-op otherwise).
+    crate::otel::start_metrics_push();
+
     // Registration just succeeded, so "now" is an honest last-contact time;
     // every successful heartbeat refreshes it. The self-fence watchdog kills
     // stateful allocations whose `selfTerminateAfter` window outlives this
@@ -441,7 +468,8 @@ async fn start_heartbeats(
     let mut backoff = HEARTBEAT_RETRY_MIN;
 
     loop {
-        match heartbeat_tick(
+        let tick_started = std::time::Instant::now();
+        let tick_result = heartbeat_tick(
             &name,
             &client,
             &task_manager,
@@ -449,8 +477,23 @@ async fn start_heartbeats(
             &credentials,
             &forwarder,
         )
-        .await
-        {
+        .await;
+        let worker_metrics = crate::manager::telemetry::worker_metrics();
+        worker_metrics
+            .heartbeat_duration_seconds
+            .observe(tick_started.elapsed().as_secs_f64());
+        worker_metrics.heartbeats_total.inc(&[match &tick_result {
+            Ok(()) => "ok",
+            Err(err)
+                if err
+                    .downcast_ref::<tonic::Status>()
+                    .is_some_and(|status| status.code() == tonic::Code::Unauthenticated) =>
+            {
+                "unauthenticated"
+            }
+            Err(_) => "error",
+        }]);
+        match tick_result {
             Ok(()) => {
                 *last_successful_heartbeat
                     .lock()
@@ -524,6 +567,16 @@ async fn heartbeat_tick(
         let running = allocations.clone();
         let failures_for_redrive = failures.clone();
         let volume_reports_for_redrive = volume_reports.clone();
+
+        let worker_metrics = crate::manager::telemetry::worker_metrics();
+        worker_metrics
+            .allocations_running
+            .set(allocations.len() as i64);
+        if !failures.is_empty() {
+            worker_metrics
+                .allocation_failures_reported_total
+                .add(failures.len() as u64);
+        }
 
         let req = credentials.attach(tonic::Request::new(HeartbeatRequest {
             id: name.to_string(),

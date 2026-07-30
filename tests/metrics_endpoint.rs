@@ -294,6 +294,58 @@ async fn healthz_readyz_and_metrics_serve_on_ephemeral_port() -> R<()> {
     Ok(())
 }
 
+/// The WORKER telemetry listener: `/metrics` serves the `legion_worker_*`
+/// registry in valid exposition format, `/healthz` answers, `/readyz` does
+/// not exist (a worker has no store or quorum to probe), and instrumented
+/// values show up.
+#[tokio::test]
+async fn worker_metrics_listener_serves_worker_registry() -> R<()> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    tokio::spawn(async move {
+        let _ = telemetry::serve_worker_telemetry_on(listener).await;
+    });
+
+    telemetry::worker_metrics().heartbeats_total.inc(&["ok"]);
+    telemetry::worker_metrics().allocations_running.set(3);
+    telemetry::worker_metrics()
+        .heartbeat_duration_seconds
+        .observe(0.012);
+
+    let healthz = http_get(addr, "/healthz").await?;
+    assert_eq!(healthz.status, 200);
+
+    let readyz = http_get(addr, "/readyz").await?;
+    assert_eq!(readyz.status, 404, "workers expose no readiness probe");
+
+    let metrics = http_get(addr, "/metrics").await?;
+    assert_eq!(metrics.status, 200);
+    assert_eq!(
+        metrics.header("content-type"),
+        Some("text/plain; version=0.0.4")
+    );
+    for line in metrics.body.lines() {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        assert_exposition_line(line);
+    }
+    assert!(metrics
+        .body
+        .contains("legion_worker_heartbeats_total{outcome=\"ok\"}"));
+    assert_eq!(
+        parse_sample(&metrics.body, "legion_worker_allocations_running "),
+        Some(3.0)
+    );
+    assert!(metrics
+        .body
+        .contains("legion_worker_heartbeat_duration_seconds_bucket{le=\"+Inf\"}"));
+    // Manager families must NOT leak onto the worker listener.
+    assert!(!metrics.body.contains("legion_evals_processed_total"));
+
+    Ok(())
+}
+
 /// Forced readiness failure: a telemetry state that requires raft (as a
 /// raft-mode manager would set) against a local-disk store, whose persistence
 /// driver reports no raft status and therefore no known leader. Removing the

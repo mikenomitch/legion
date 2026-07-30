@@ -583,10 +583,10 @@ In priority order (plan §6, updated 2026-07-28):
    on the control leader.
 5. The `legion_raft_*` engine series are emitted (quorum shape, per-lane
    term/indexes/apply-lag/leadership, and the capture-vs-propose latency
-   histograms — docs/metrics.md); snapshot timings and per-peer
+   histograms), OTLP metrics push and the opt-in worker `/metrics`
+   listener exist (docs/metrics.md); snapshot timings and per-peer
    replication lag remain reserved, and a Raft health UI page is still
-   open. Worker-side `/metrics` + OTLP metrics push are tracked in
-   TODO.md (Observability).
+   open.
 6. Raft autopilot — speculative, default-off.
 
 Also: `step-down`/`transfer-leader` await an openraft with a

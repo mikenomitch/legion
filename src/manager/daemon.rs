@@ -355,6 +355,9 @@ pub async fn run_manager(config: ManagerConfig, run_worker: bool) -> R<()> {
             "Telemetry is disabled (telemetry.enabled=false); /metrics and health probes are off"
         );
     }
+    // OTLP metrics push (opt-in via the OTEL_* env vars, like trace export;
+    // no-op when unconfigured). Independent of the scrape listener above.
+    crate::otel::start_metrics_push();
 
     let tls_identity = load_server_tls_identity(&full_config.server.tls)?;
     let server_builder = match tls_identity {

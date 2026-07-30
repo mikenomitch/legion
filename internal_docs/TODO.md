@@ -469,7 +469,17 @@ docs: [observability.md](../docs/observability.md), [logging.md](../docs/logging
 - [ ] A trace viewer in the UI (make it dev-only at first)
 - [x] Metrics endpoint and health probes — Prometheus `/metrics`, `/healthz`,
       `/readyz` ([docs/metrics.md](../docs/metrics.md), [#137](https://github.com/mikenomitch/legion/pull/137)).
-      Broader instrumentation (worker-side metrics, OTLP metric push) still open.
+- [x] Worker-side `/metrics` + OTLP metrics push (2026-07-30): opt-in
+      worker Prometheus listener (`LEGION_WORKER_TELEMETRY_PORT`;
+      `legion_worker_*` heartbeat/allocation families) and an OTLP/HTTP
+      metrics push for both registries (`OTEL_*` env conventions,
+      cumulative temporality, full histogram buckets) —
+      [docs/metrics.md](../docs/metrics.md),
+      [docs/observability.md](../docs/observability.md). Per-task runtime
+      metrics on workers still open (below).
+- [ ] Worker per-task runtime metrics (CPU/memory usage per allocation) —
+      also wanted by autoscaler phase 2, which collects usage via
+      heartbeats; build together.
 - [x] Refresh [docs/observability.md](../docs/observability.md) — corrected; it
       had claimed OTLP export did not exist while [src/otel.rs](../src/otel.rs)
       ships it ([#137](https://github.com/mikenomitch/legion/pull/137))

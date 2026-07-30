@@ -1,5 +1,8 @@
-//! Manager telemetry: a dependency-free metrics registry plus the HTTP
-//! listener that exposes it.
+//! Legion telemetry: a dependency-free metrics registry plus the HTTP
+//! listeners that expose it. Hosts BOTH process registries — the manager's
+//! (`legion_*`) and the worker's (`legion_worker_*`, served by its own
+//! opt-in listener) — and the structured snapshot API the OTLP metrics
+//! push (`otel.rs`) exports from.
 //!
 //! The registry is hand-rolled on atomics (no prometheus crate) and renders
 //! the Prometheus text exposition format (version 0.0.4). Metric families are
@@ -263,6 +266,61 @@ fn render_header(out: &mut String, meta: &FamilyMeta, kind: &str) {
 
 trait RenderMetric: Send + Sync {
     fn render_into(&self, out: &mut String);
+    /// Structured snapshot of the family, for exporters that need data
+    /// rather than exposition text (the OTLP metrics push in `otel.rs`).
+    fn snapshot_family(&self) -> FamilySnapshot;
+}
+
+/// What kind of series a [`FamilySnapshot`] carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotKind {
+    Counter,
+    Gauge,
+    Histogram,
+}
+
+/// One family's structured snapshot: identity plus every live series.
+pub struct FamilySnapshot {
+    pub name: &'static str,
+    pub help: &'static str,
+    pub kind: SnapshotKind,
+    pub label_names: &'static [&'static str],
+    pub samples: Vec<SampleSnapshot>,
+}
+
+/// One series' snapshot within a family.
+pub struct SampleSnapshot {
+    /// One value per `label_names` entry; empty for unlabeled families.
+    pub label_values: Vec<String>,
+    pub value: SampleValue,
+}
+
+pub enum SampleValue {
+    Counter(u64),
+    Gauge(i64),
+    Histogram {
+        bounds: &'static [f64],
+        /// Per-bucket (NON-cumulative) counts, one per bound plus a final
+        /// overflow slot — the OTLP `bucket_counts` shape.
+        bucket_counts: Vec<u64>,
+        count: u64,
+        sum: f64,
+    },
+}
+
+impl HistogramCell {
+    fn snapshot_value(&self) -> SampleValue {
+        SampleValue::Histogram {
+            bounds: self.bounds,
+            bucket_counts: self
+                .buckets
+                .iter()
+                .map(|bucket| bucket.load(Ordering::Relaxed))
+                .collect(),
+            count: self.count(),
+            sum: self.sum(),
+        }
+    }
 }
 
 /// Counter family with labels.
@@ -294,6 +352,24 @@ impl RenderMetric for CounterVec {
         for (values, cell) in self.series.snapshot() {
             let labels = render_label_block(self.meta.labels, &values, None);
             out.push_str(&format!("{}{} {}\n", self.meta.name, labels, cell.get()));
+        }
+    }
+
+    fn snapshot_family(&self) -> FamilySnapshot {
+        FamilySnapshot {
+            name: self.meta.name,
+            help: self.meta.help,
+            kind: SnapshotKind::Counter,
+            label_names: self.meta.labels,
+            samples: self
+                .series
+                .snapshot()
+                .into_iter()
+                .map(|(label_values, cell)| SampleSnapshot {
+                    label_values,
+                    value: SampleValue::Counter(cell.get()),
+                })
+                .collect(),
         }
     }
 }
@@ -332,6 +408,24 @@ impl RenderMetric for GaugeVec {
         for (values, cell) in self.series.snapshot() {
             let labels = render_label_block(self.meta.labels, &values, None);
             out.push_str(&format!("{}{} {}\n", self.meta.name, labels, cell.get()));
+        }
+    }
+
+    fn snapshot_family(&self) -> FamilySnapshot {
+        FamilySnapshot {
+            name: self.meta.name,
+            help: self.meta.help,
+            kind: SnapshotKind::Gauge,
+            label_names: self.meta.labels,
+            samples: self
+                .series
+                .snapshot()
+                .into_iter()
+                .map(|(label_values, cell)| SampleSnapshot {
+                    label_values,
+                    value: SampleValue::Gauge(cell.get()),
+                })
+                .collect(),
         }
     }
 }
@@ -379,6 +473,24 @@ impl RenderMetric for HistogramVec {
             render_histogram_series(out, &self.meta, &values, &cell);
         }
     }
+
+    fn snapshot_family(&self) -> FamilySnapshot {
+        FamilySnapshot {
+            name: self.meta.name,
+            help: self.meta.help,
+            kind: SnapshotKind::Histogram,
+            label_names: self.meta.labels,
+            samples: self
+                .series
+                .snapshot()
+                .into_iter()
+                .map(|(label_values, cell)| SampleSnapshot {
+                    label_values,
+                    value: cell.snapshot_value(),
+                })
+                .collect(),
+        }
+    }
 }
 
 /// Unlabeled counter.
@@ -392,6 +504,10 @@ impl Counter {
         self.cell.inc();
     }
 
+    pub fn add(&self, n: u64) {
+        self.cell.add(n);
+    }
+
     pub fn get(&self) -> u64 {
         self.cell.get()
     }
@@ -401,6 +517,19 @@ impl RenderMetric for Counter {
     fn render_into(&self, out: &mut String) {
         render_header(out, &self.meta, "counter");
         out.push_str(&format!("{} {}\n", self.meta.name, self.cell.get()));
+    }
+
+    fn snapshot_family(&self) -> FamilySnapshot {
+        FamilySnapshot {
+            name: self.meta.name,
+            help: self.meta.help,
+            kind: SnapshotKind::Counter,
+            label_names: self.meta.labels,
+            samples: vec![SampleSnapshot {
+                label_values: Vec::new(),
+                value: SampleValue::Counter(self.cell.get()),
+            }],
+        }
     }
 }
 
@@ -425,6 +554,19 @@ impl RenderMetric for Gauge {
         render_header(out, &self.meta, "gauge");
         out.push_str(&format!("{} {}\n", self.meta.name, self.cell.get()));
     }
+
+    fn snapshot_family(&self) -> FamilySnapshot {
+        FamilySnapshot {
+            name: self.meta.name,
+            help: self.meta.help,
+            kind: SnapshotKind::Gauge,
+            label_names: self.meta.labels,
+            samples: vec![SampleSnapshot {
+                label_values: Vec::new(),
+                value: SampleValue::Gauge(self.cell.get()),
+            }],
+        }
+    }
 }
 
 /// Unlabeled histogram.
@@ -443,6 +585,19 @@ impl RenderMetric for Histogram {
     fn render_into(&self, out: &mut String) {
         render_header(out, &self.meta, "histogram");
         render_histogram_series(out, &self.meta, &[], &self.cell);
+    }
+
+    fn snapshot_family(&self) -> FamilySnapshot {
+        FamilySnapshot {
+            name: self.meta.name,
+            help: self.meta.help,
+            kind: SnapshotKind::Histogram,
+            label_names: self.meta.labels,
+            samples: vec![SampleSnapshot {
+                label_values: Vec::new(),
+                value: self.cell.snapshot_value(),
+            }],
+        }
     }
 }
 
@@ -798,6 +953,110 @@ pub fn render() -> String {
     out
 }
 
+/// Structured snapshots of every family in every registry this process has
+/// actually initialized (manager and/or worker) — the OTLP metrics push
+/// input. Registries are lazily created at their first instrumented call
+/// site, so a worker-only process exports no manager families and vice
+/// versa.
+pub fn snapshot_initialized_families() -> Vec<FamilySnapshot> {
+    let mut snapshots = Vec::new();
+    if let Some(manager) = METRICS.get() {
+        snapshots.extend(manager.families.iter().map(|f| f.snapshot_family()));
+    }
+    if let Some(worker) = WORKER_METRICS.get() {
+        snapshots.extend(worker.families.iter().map(|f| f.snapshot_family()));
+    }
+    snapshots
+}
+
+// ---------------------------------------------------------------------------
+// Worker registry
+// ---------------------------------------------------------------------------
+
+/// Metric families the WORKER process exports (`legion_worker_*`). Same
+/// machinery as the manager registry, separate global: a combined
+/// manager+worker process serves both registries from their own listeners,
+/// and the OTLP push exports whichever registries the process initialized.
+pub struct WorkerMetrics {
+    /// `legion_worker_heartbeats_total{outcome}`
+    pub heartbeats_total: Arc<CounterVec>,
+    /// `legion_worker_heartbeat_duration_seconds`
+    pub heartbeat_duration_seconds: Arc<Histogram>,
+    /// `legion_worker_allocations_running`
+    pub allocations_running: Arc<Gauge>,
+    /// `legion_worker_allocation_failures_reported_total`
+    pub allocation_failures_reported_total: Arc<Counter>,
+    families: Vec<Arc<dyn RenderMetric>>,
+}
+
+impl WorkerMetrics {
+    fn new() -> Self {
+        let heartbeats_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_worker_heartbeats_total",
+                help: "Heartbeat round-trips attempted by this worker, by outcome (ok|error|unauthenticated).",
+                labels: &["outcome"],
+            },
+            series: Series::new(),
+        });
+        let heartbeat_duration_seconds = Arc::new(Histogram {
+            meta: FamilyMeta {
+                name: "legion_worker_heartbeat_duration_seconds",
+                help: "Wall-clock of one heartbeat round-trip (report + reconcile against the manager's reply).",
+                labels: &[],
+            },
+            cell: HistogramCell::new(DURATION_BUCKETS),
+        });
+        let allocations_running = Arc::new(Gauge {
+            meta: FamilyMeta {
+                name: "legion_worker_allocations_running",
+                help: "Allocations this worker currently runs, as reported on its last heartbeat.",
+                labels: &[],
+            },
+            cell: GaugeCell::default(),
+        });
+        let allocation_failures_reported_total = Arc::new(Counter {
+            meta: FamilyMeta {
+                name: "legion_worker_allocation_failures_reported_total",
+                help: "Allocation failures this worker has reported to the manager.",
+                labels: &[],
+            },
+            cell: CounterCell::default(),
+        });
+
+        let families: Vec<Arc<dyn RenderMetric>> = vec![
+            Arc::clone(&allocation_failures_reported_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&allocations_running) as Arc<dyn RenderMetric>,
+            Arc::clone(&heartbeat_duration_seconds) as Arc<dyn RenderMetric>,
+            Arc::clone(&heartbeats_total) as Arc<dyn RenderMetric>,
+        ];
+
+        WorkerMetrics {
+            heartbeats_total,
+            heartbeat_duration_seconds,
+            allocations_running,
+            allocation_failures_reported_total,
+            families,
+        }
+    }
+}
+
+static WORKER_METRICS: OnceLock<WorkerMetrics> = OnceLock::new();
+
+/// The process-global WORKER metric registry (created on first use).
+pub fn worker_metrics() -> &'static WorkerMetrics {
+    WORKER_METRICS.get_or_init(WorkerMetrics::new)
+}
+
+/// Renders the worker registry in the Prometheus text exposition format.
+pub fn render_worker() -> String {
+    let mut out = String::with_capacity(1024);
+    for family in &worker_metrics().families {
+        family.render_into(&mut out);
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // gRPC instrumentation layer
 // ---------------------------------------------------------------------------
@@ -963,6 +1222,60 @@ pub async fn serve_telemetry_on(listener: tokio::net::TcpListener, state: Teleme
             }
         });
     }
+}
+
+/// Run the WORKER telemetry listener until the process exits: `/metrics`
+/// (the `legion_worker_*` registry) and `/healthz`. No `/readyz` — a worker
+/// has no store or quorum to probe; liveness is what its supervisor needs,
+/// and the manager's view of readiness is the node's health/heartbeat state.
+/// Opt-in via `LEGION_WORKER_TELEMETRY_PORT` (see docs/metrics.md).
+pub async fn serve_worker_telemetry(addr: SocketAddr) -> R<()> {
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("failed to bind worker telemetry listener on {addr}"))?;
+    let local = listener.local_addr()?;
+    info!(addr = %local, "Worker telemetry listener started (/metrics, /healthz)");
+    serve_worker_telemetry_on(listener).await
+}
+
+/// Serve worker telemetry on an already-bound listener (tests bind port 0
+/// and read back the local address before calling this).
+pub async fn serve_worker_telemetry_on(listener: tokio::net::TcpListener) -> R<()> {
+    loop {
+        let (stream, _peer) = match listener.accept().await {
+            Ok(pair) => pair,
+            Err(err) => {
+                warn!(error = ?err, "worker telemetry accept failed");
+                continue;
+            }
+        };
+        let io = TokioIo::new(stream);
+        tokio::spawn(async move {
+            let service = hyper::service::service_fn(handle_worker);
+            if let Err(err) = hyper::server::conn::http1::Builder::new()
+                .serve_connection(io, service)
+                .await
+            {
+                debug!(error = ?err, "worker telemetry connection closed");
+            }
+        });
+    }
+}
+
+async fn handle_worker(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, Infallible> {
+    if req.method() != hyper::Method::GET {
+        return Ok(text_response(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "text/plain",
+            "method not allowed\n".into(),
+        ));
+    }
+    let resp = match req.uri().path() {
+        "/metrics" => text_response(StatusCode::OK, METRICS_CONTENT_TYPE, render_worker()),
+        "/healthz" => text_response(StatusCode::OK, "text/plain", "ok\n".into()),
+        _ => text_response(StatusCode::NOT_FOUND, "text/plain", "not found\n".into()),
+    };
+    Ok(resp)
 }
 
 fn text_response(status: StatusCode, content_type: &str, body: String) -> Response<Full<Bytes>> {
