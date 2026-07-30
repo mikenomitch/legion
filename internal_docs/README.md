@@ -65,6 +65,9 @@ When one is required and what goes in it:
 | [preemption-and-eviction-plan.md](plans/preemption-and-eviction-plan.md) | planned |
 | [multi-cluster-federation-plan.md](plans/multi-cluster-federation-plan.md) | planned |
 | [multi-raft-persistence-plan.md](plans/multi-raft-persistence-plan.md) | planned |
+| [scheduler-performance-plan.md](plans/scheduler-performance-plan.md) | in execution |
+| [scheduler-architecture-review-plan.md](plans/scheduler-architecture-review-plan.md) | planned (proposals; no code) |
+| [aws-comparative-benchmark-plan.md](plans/aws-comparative-benchmark-plan.md) | planned |
 | [scheduler-plan-snapshot-plan.md](plans/scheduler-plan-snapshot-plan.md) | shipped |
 | [scheduling-index-plan.md](plans/scheduling-index-plan.md) | shipped (phases 0–3; group-path + backlog deferred) |
 | [service-discovery-final-plan.md](plans/service-discovery-final-plan.md) | authoritative; v1 in progress |

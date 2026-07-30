@@ -357,3 +357,27 @@ plan never promised.
 **Why (extensibility, simplicity).** Reschedule bursts after a node loss
 race exactly like submit bursts, and the machinery is shared; changing
 the plugin ABI is a compatibility decision that deserves its own plan.
+
+## 16. The candidate walk rides the fused single-op apply (merge with the scheduler-performance work)
+
+**Call.** The scheduler-performance PR fused plan-submission insert +
+apply into one replicated op (`Store::submit_and_apply_plan`) while this
+plan was in flight. The merge composes them: the production path calls
+`submit_and_apply_plan_with_candidates` (format-2 insert + candidate walk
+in one op; format-1 fused op when `plan_candidates: 0`), so the walk's
+per-candidate epoch checks run inside the single quorum round-trip the
+fusion left. The split two-step candidates API
+(`insert_plan_submission_with_candidates` + `apply_plan_submission`)
+stays for callers that genuinely stage submissions, and for tests.
+
+**Alternatives.** Keep candidates on the two-op path and let only the
+kill-switch path use the fusion — simpler merge, but the headline
+workload (burst submits on raft) would pay the extra quorum round-trip
+exactly where contention throughput matters most.
+
+**Trade-off.** One more replicated op name (`submit_and_apply_plan_with_
+candidates`) in the seam classification.
+
+**Why (performance, simplicity).** Both changes exist to make the same
+hot path cheaper; composing them is the only shape where neither undoes
+the other's win.

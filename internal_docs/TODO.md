@@ -83,9 +83,33 @@ How to use it:
       [plan](plans/scheduler-plan-snapshot-plan.md), numbers in
       [benchmarks/scheduler/README.md](../benchmarks/scheduler/README.md)).
       The allocations map is shared per node the same way
-      (`SharedNodeAllocations`, copy-on-write). No O(cluster) per-plan
-      deep clone remains on the plan path; next candidates would come
-      from fresh profiling, not this list.
+      (`SharedNodeAllocations`, copy-on-write). Phase timings now say where
+      the rest goes ([plan](plans/scheduler-performance-plan.md)): the
+      plan-submission insert is fused into the apply (one quorum commit,
+      2026-07-29); the remaining measured items are the O(fleet)
+      `version_sample` and per-plan snapshot rebuild — both proposed as
+      D4/D6 in the
+      [architecture review](plans/scheduler-architecture-review-plan.md).
+- [x] Scheduler performance measurement stack
+      ([plan](plans/scheduler-performance-plan.md),
+      [calls](calls/scheduler-performance-plan_calls.md),
+      [docs](../docs/testing-and-benchmarks.md)) — scenario schema v2
+      (heterogeneous `node_profiles` + mixed `job_types` with
+      resources/constraints, per-scenario SLOs), four realistic scenarios,
+      shared runner, the scenario × backend matrix
+      (`tests/scheduler_scale_benchmark.rs`: local_disk / raft1 / raft3 /
+      streaming) with recorded release numbers, `PlanTimings` phase
+      instrumentation + `legion_scheduler_plan_phase_seconds`
+      ([docs/metrics.md](../docs/metrics.md)), and the fused
+      `submit_and_apply_plan` (before/after in
+      [benchmarks/scheduler/README.md](../benchmarks/scheduler/README.md)).
+- [ ] Architecture review proposals for scale
+      ([plan](plans/scheduler-architecture-review-plan.md)): D4 lazy
+      version sample, D5 apply group commit, D1 bounded candidate scoring,
+      D6 eval-batch snapshot reuse — ranked, none started.
+- [ ] AWS comparative benchmark vs Nomad/K8s
+      ([plan](plans/aws-comparative-benchmark-plan.md)): phase 0 is the
+      `legion start worker --simulate N` gap; nothing built yet.
 - [ ] Scheduling-index follow-ups deferred from
       [plan](plans/scheduling-index-plan.md) (see its calls doc):
       index-served candidates for multi-task **group** co-placement (v1

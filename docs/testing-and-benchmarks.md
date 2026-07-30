@@ -35,10 +35,14 @@ Benchmark targets:
 
 - `benches/scheduler_bench.rs` (Criterion)
 - `benches/eval_critical_path_bench.rs` (Criterion)
-- `tests/scheduler_benchmark_slo.rs` (repeatable scenario + SLO gate)
+- `tests/scheduler_benchmark_slo.rs` (scenario runner + SLO gate, CI)
+- `tests/scheduler_scale_benchmark.rs` (scenario × persistence-backend
+  matrix, manual)
 - `tests/plan_contention.rs` (concurrent-submit contention harness)
 - Scenario definitions in `benchmarks/scheduler/scenarios/*.json`
-- SLO thresholds in `benchmarks/scheduler/slo.json`
+- SLO thresholds in `benchmarks/scheduler/slo.json` (global), overridable
+  per scenario via the scenario's `slo` block
+- Shared runner code in `tests/benchmark_support/mod.rs`
 
 What they measure:
 
@@ -60,6 +64,22 @@ What they measure:
   non-ignored tests are the CI regression; the `#[ignore]`d
   `contention_matrix` prints the full grid recorded in
   `benchmarks/scheduler/README.md`.
+- `scheduler_benchmark_slo` / `scheduler_scale_benchmark`: scenario-driven
+  whole-plan runs. Scenarios describe realistic fleets and workloads:
+  `node_profiles` (heterogeneous node classes: count, memory, cpus,
+  attrs like region/class/gpu) and `job_types` (mixed workloads with
+  `resources` and `constraints`), plus optional `scheduler_settings`
+  (e.g. arming scheduling indexes) and per-scenario `slo` bounds. Legacy
+  uniform fields (`node_count`, `job_count`, ...) still parse.
+  - Both runners report throughput, p50/p95/p99 latency, conflict rate,
+    correctness (full placement + constraint conformance), and the mean
+    per-phase breakdown from `PlanTimings` (the same phases as the
+    `legion_scheduler_plan_phase_seconds` metric — [metrics.md](metrics.md)).
+  - The scale matrix additionally runs every scenario against each
+    requested persistence backend: `local_disk`, `raft1` (single-node
+    raft), `raft3` (3-node in-process cluster over real tonic transport),
+    and `streaming` (rustyriver, `file://` replica). Results are printed
+    and written as JSON to `target/benchmark-results/`.
 
 Run commands:
 
@@ -67,6 +87,17 @@ Run commands:
 - `cargo bench --bench eval_critical_path_bench`
 - `cargo test --test scheduler_benchmark_slo -- --ignored --nocapture`
 - `cargo test --test plan_contention -- --ignored --nocapture`
+- Full backend matrix (use a release build for recorded numbers):
+
+```bash
+LEGION_BENCH_BACKENDS=local_disk,raft1,raft3,streaming cargo test --release --test scheduler_scale_benchmark -- --ignored --nocapture
+```
+
+- Subsets via `LEGION_BENCH_BACKENDS` and `LEGION_BENCH_SCENARIOS`
+  (comma-separated scenario names).
+
+Recorded results live in `benchmarks/scheduler/README.md`, with the host
+and build profile noted alongside every table.
 
 ### Measuring scheduler event-stream overhead
 
@@ -100,7 +131,10 @@ Scenario files encode:
 
 CI behavior:
 
-- `.github/workflows/ci.yml` runs the SLO benchmark gate only when scheduler-impacting files are changed (`src/manager/scheduler.rs`, `src/storage/store.rs`, `src/manager/daemon.rs`, benchmark scenarios, or the gate test itself).
+- `.github/workflows/ci.yml` runs the SLO benchmark gate only when scheduler-impacting files are changed (`src/manager/scheduler.rs`, `src/storage/store.rs`, `src/manager/daemon.rs`, benchmark scenarios, the shared runner in `tests/benchmark_support/`, or the gate test itself).
+- The backend matrix (`scheduler_scale_benchmark`) is manual — it stands up
+  raft clusters and is too heavy for per-PR CI. Its `plan_timings_are_populated_and_coherent`
+  smoke test does run in normal CI and pins the phase instrumentation.
 
 ## Plugin-Related Test Notes
 

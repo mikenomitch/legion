@@ -2191,11 +2191,130 @@ impl Store {
         })
     }
 
+    /// Insert a plan submission and apply it in ONE replicated op (one
+    /// write transaction boundary, one raft propose → quorum commit →
+    /// apply). The production scheduler path (`plan_and_apply`) always
+    /// wants both halves back-to-back, and on raft backends the split
+    /// two-step form pays a second full quorum round-trip for a row that
+    /// is consumed microseconds after it is written — measured at 0.3-2.1
+    /// ms per plan in the 2026-07-29 backend matrix
+    /// (`benchmarks/scheduler/README.md`). The two-step API below stays
+    /// for callers that genuinely stage submissions.
+    pub fn submit_and_apply_plan(
+        &self,
+        job_config_id: &str,
+        mode: &str,
+        placements: &[(String, i64)],
+        expected_versions: &BTreeMap<String, i64>,
+    ) -> R<(PlanSubmission, PlanApplyOutcome)> {
+        let job_config_id = job_config_id.to_owned();
+        let mode = mode.to_owned();
+        let placements = placements.to_vec();
+        let expected_versions = expected_versions.clone();
+        let (submission, outcome) =
+            self.replicated(Lane::Scheduler, "submit_and_apply_plan", move |s| {
+                s.submit_and_apply_plan_apply(
+                    &job_config_id,
+                    &mode,
+                    &placements,
+                    &expected_versions,
+                )
+            })?;
+        self.plan_apply_bookkeeping(&outcome)?;
+        Ok((submission, outcome))
+    }
+
+    fn submit_and_apply_plan_apply(
+        &self,
+        job_config_id: &str,
+        mode: &str,
+        placements: &[(String, i64)],
+        expected_versions: &BTreeMap<String, i64>,
+    ) -> R<(PlanSubmission, PlanApplyOutcome)> {
+        let placements_json = serde_json::to_string(placements)?;
+        let submission = self.insert_plan_submission_apply(
+            job_config_id,
+            mode,
+            &placements_json,
+            expected_versions,
+        )?;
+        let outcome = self.apply_plan_submission_apply(&submission)?;
+        Ok((submission, outcome))
+    }
+
+    /// [`Self::submit_and_apply_plan`] for format-2 (candidate list)
+    /// submissions: insert the submission and run the candidate walk in ONE
+    /// replicated op (docs/late-binding-plan-apply.md). This is the
+    /// production path whenever `schedulerSettings.plan_candidates` is on.
+    pub fn submit_and_apply_plan_with_candidates(
+        &self,
+        job_config_id: &str,
+        mode: &str,
+        placements: &[PlanSubmissionPlacement],
+        expected_versions: &BTreeMap<String, i64>,
+    ) -> R<(PlanSubmission, PlanApplyOutcome)> {
+        for placement in placements {
+            if placement.candidates.is_empty() {
+                bail!(
+                    "plan submission placement for task {} has no candidates",
+                    placement.task_id
+                );
+            }
+        }
+        let job_config_id = job_config_id.to_owned();
+        let mode = mode.to_owned();
+        let placements = placements.to_vec();
+        let expected_versions = expected_versions.clone();
+        let (submission, outcome) = self.replicated(
+            Lane::Scheduler,
+            "submit_and_apply_plan_with_candidates",
+            move |s| {
+                s.submit_and_apply_plan_with_candidates_apply(
+                    &job_config_id,
+                    &mode,
+                    &placements,
+                    &expected_versions,
+                )
+            },
+        )?;
+        self.plan_apply_bookkeeping(&outcome)?;
+        Ok((submission, outcome))
+    }
+
+    fn submit_and_apply_plan_with_candidates_apply(
+        &self,
+        job_config_id: &str,
+        mode: &str,
+        placements: &[PlanSubmissionPlacement],
+        expected_versions: &BTreeMap<String, i64>,
+    ) -> R<(PlanSubmission, PlanApplyOutcome)> {
+        let placements_json = serde_json::to_string(&serde_json::json!({
+            "format": 2,
+            "placements": placements,
+        }))?;
+        let submission = self.insert_plan_submission_apply(
+            job_config_id,
+            mode,
+            &placements_json,
+            expected_versions,
+        )?;
+        let outcome = self.apply_plan_submission_apply(&submission)?;
+        Ok((submission, outcome))
+    }
+
     pub fn apply_plan_submission(&self, submission: &PlanSubmission) -> R<PlanApplyOutcome> {
         let submission = submission.clone();
         let outcome = self.replicated(Lane::Scheduler, "apply_plan_submission", move |s| {
             s.apply_plan_submission_apply(&submission)
         })?;
+        self.plan_apply_bookkeeping(&outcome)?;
+        Ok(outcome)
+    }
+
+    /// Post-apply bookkeeping shared by `apply_plan_submission` and
+    /// `submit_and_apply_plan`: epoch-mirror self-heal on rejection,
+    /// status-lane task_status projection on success.
+    fn plan_apply_bookkeeping(&self, outcome: &PlanApplyOutcome) -> R<()> {
         // Self-heal the epoch mirror on rejection: the CAS just proved the
         // sampler's mirror was behind the database for these scopes (a
         // competing plan applied, or a write path bumped an epoch without a
@@ -2205,7 +2324,7 @@ impl Store {
         // forever.
         if let PlanApplyOutcome::Rejected {
             latest_versions, ..
-        } = &outcome
+        } = outcome
         {
             let mut node_ids = BTreeSet::new();
             let mut job_config_ids = BTreeSet::new();
@@ -2236,7 +2355,7 @@ impl Store {
         // derivable — the status leader's seed reconciler and the workers'
         // own status reports converge them — so a typed `NotRaftLeader`
         // here is warn-and-continue; any other error still fails.
-        if let PlanApplyOutcome::Applied(applied) = &outcome {
+        if let PlanApplyOutcome::Applied(applied) = outcome {
             if let Err(err) = self.update_task_statuses_for_allocations(&applied.allocations) {
                 if !crate::storage::raft::driver::NotRaftLeader::in_chain(&err) {
                     return Err(err);
@@ -2250,7 +2369,7 @@ impl Store {
                 );
             }
         }
-        Ok(outcome)
+        Ok(())
     }
 
     /// Parse the `plan_submission.placements` JSON column. Format 2 rows

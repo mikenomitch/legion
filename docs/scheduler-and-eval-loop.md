@@ -95,6 +95,12 @@ Legion maintains an epoch per `job_config_id` in `allocation_epoch_partition`.
 
 This keeps conflicts localized so unrelated jobs can schedule in parallel without invalidating each other's plans.
 
+The plan submission and its apply run as **one replicated store op**
+(`Store::submit_and_apply_plan` / `submit_and_apply_plan_with_candidates`):
+one write-transaction boundary, and on raft one
+propose→quorum-commit→apply instead of two. The epoch sample is still
+taken before the capacity snapshot; only the write round-trips are fused.
+
 ### Candidate lists (late-binding apply)
 
 Since the late-binding change
@@ -107,6 +113,16 @@ Coupled placements (overlapping lists, shared `distinct` keys, multi-task
 groups) keep exact all-or-nothing semantics. Defaults on
 (`schedulerSettings.plan_candidates: 8`); `0` disables it and restores
 single-node submissions.
+
+### Observing where plan time goes
+
+Every `plan_and_apply` records a per-phase wall-clock breakdown
+(`PlanTimings` on the outcome): node snapshot, epoch sample, task fetch,
+capacity snapshot, `build_plan`, and the fused apply. It is logged per
+plan at debug, exported as the `legion_scheduler_plan_phase_seconds{phase}`
+histogram ([metrics.md](metrics.md)), and aggregated by the benchmark
+runners ([testing-and-benchmarks.md](testing-and-benchmarks.md)). When
+scheduling latency moves, find the phase that moved first.
 
 ### Conflict handling
 

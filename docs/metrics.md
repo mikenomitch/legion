@@ -79,6 +79,18 @@ into a single series with every label set to `"other"`.
 - **`legion_eval_conflict_requeues_total`** (counter) — evals released back
   to the pending queue after exhausting their plan-conflict retry budget,
   instead of failing terminally (the requeue backstop).
+- **`legion_scheduler_plan_phase_seconds{phase}`** (histogram) — per-phase
+  wall-clock of every `plan_and_apply`, phases in execution order:
+  `available_nodes` (node snapshot fetch), `version_sample` (the
+  optimistic-concurrency epoch sample), `task_fetch` (task-config load),
+  `capacity_snapshot` (allocations + free pools), `build_plan` (candidate
+  construction, scoring, placement), `apply` (plan-submission insert +
+  epoch compare-and-set + the candidate walk's allocation writes, one
+  replicated op — on raft this includes propose→quorum-commit→apply), and
+  `total` (the whole call). This is the first place to look when
+  scheduling latency moves: compare the phase that grew against the
+  others before profiling. The benchmark runners aggregate the same
+  phases (docs/testing-and-benchmarks.md).
 
 ### Scheduling indexes
 

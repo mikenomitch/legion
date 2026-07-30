@@ -1,0 +1,24 @@
+{
+  "name": "web-fleet",
+  "scheduling_policy": "spread",
+  "iterations": 6,
+  "node_profiles": [
+    { "name": "web-east", "count": 120, "memory_gb": 32, "cpus": 8,
+      "attrs": { "class": "web", "region": "us-east" } },
+    { "name": "web-west", "count": 80, "memory_gb": 32, "cpus": 8,
+      "attrs": { "class": "web", "region": "us-west" } },
+    { "name": "util", "count": 40, "memory_gb": 16, "cpus": 4,
+      "attrs": { "class": "util", "region": "us-east" } }
+  ],
+  "job_types": [
+    { "name": "api", "count": 20, "tasks_per_job": 2, "task_count_per_task": 4,
+      "resources": { "cpu": 500, "memory": 1024 },
+      "constraints": { "class": "web" } },
+    { "name": "cron", "count": 10, "tasks_per_job": 1, "task_count_per_task": 2,
+      "resources": { "cpu": 250, "memory": 512 },
+      "constraints": { "class": "util" } }
+  ],
+  "churn_every": 3,
+  "churn_nodes": 6,
+  "slo": { "min_evals_per_sec": 10.0, "max_p99_latency_ms": 500.0 }
+}
