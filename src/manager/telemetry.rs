@@ -492,6 +492,10 @@ pub struct Metrics {
     pub scheduler_plan_phase_seconds: Arc<HistogramVec>,
     /// `legion_scheduler_lazy_sample_fallback_total`
     pub scheduler_lazy_sample_fallback_total: Arc<Counter>,
+    /// `legion_scheduler_conflict_requeues_total`
+    pub scheduler_conflict_requeues_total: Arc<Counter>,
+    /// `legion_scheduler_plan_candidate_rank`
+    pub scheduler_plan_candidate_rank: Arc<Histogram>,
     /// Render order for the exposition endpoint.
     families: Vec<Arc<dyn RenderMetric>>,
 }
@@ -639,6 +643,22 @@ impl Metrics {
             },
             cell: CounterCell::default(),
         });
+        let scheduler_conflict_requeues_total = Arc::new(Counter {
+            meta: FamilyMeta {
+                name: "legion_scheduler_conflict_requeues_total",
+                help: "Evals requeued after exhausting plan-conflict retries (the never-drop-work backstop).",
+                labels: &[],
+            },
+            cell: CounterCell::default(),
+        });
+        let scheduler_plan_candidate_rank = Arc::new(Histogram {
+            meta: FamilyMeta {
+                name: "legion_scheduler_plan_candidate_rank",
+                help: "Candidate rank each placement bound at during plan apply (0 = first choice; >0 = late-binding fallback).",
+                labels: &[],
+            },
+            cell: HistogramCell::new(&[0.0, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0]),
+        });
 
         let families: Vec<Arc<dyn RenderMetric>> = vec![
             Arc::clone(&allocations) as Arc<dyn RenderMetric>,
@@ -655,7 +675,9 @@ impl Metrics {
             Arc::clone(&scheduler_index_maintenance_seconds) as Arc<dyn RenderMetric>,
             Arc::clone(&scheduler_index_queries_total) as Arc<dyn RenderMetric>,
             Arc::clone(&scheduler_index_shadow_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&scheduler_conflict_requeues_total) as Arc<dyn RenderMetric>,
             Arc::clone(&scheduler_lazy_sample_fallback_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&scheduler_plan_candidate_rank) as Arc<dyn RenderMetric>,
             Arc::clone(&scheduler_plan_phase_seconds) as Arc<dyn RenderMetric>,
             Arc::clone(&store_write_lock_wait_seconds) as Arc<dyn RenderMetric>,
         ];
@@ -678,6 +700,8 @@ impl Metrics {
             scheduler_index_maintenance_seconds,
             scheduler_plan_phase_seconds,
             scheduler_lazy_sample_fallback_total,
+            scheduler_conflict_requeues_total,
+            scheduler_plan_candidate_rank,
             families,
         }
     }

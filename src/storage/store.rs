@@ -2125,6 +2125,16 @@ impl Store {
         Ok(self.read_model_reader()?.generation)
     }
 
+    /// Scalar read-only query helper for the benchmark harnesses
+    /// (`tests/*_benchmark.rs`), which report row counts the public API
+    /// has no reason to expose. Hidden: not a stable API.
+    #[doc(hidden)]
+    pub fn bench_scalar(&self, sql: &str) -> R<i64> {
+        let conn = self.read_connection()?;
+        let value = conn.query_row(sql, [], |row| row.get::<_, i64>(0))?;
+        Ok(value)
+    }
+
     fn allocation_epoch_for_scope(&self, scope_type: &str, scope_id: &str) -> R<i64> {
         let conn = self.read_connection()?;
         let epoch: Option<i64> = conn

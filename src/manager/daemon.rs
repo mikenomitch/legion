@@ -1576,7 +1576,11 @@ mod tests {
     }
 }
 
-fn handle_claimed_eval(store: &Store, worker_id: usize, eval: &Eval) {
+/// Public for the contention benchmark
+/// (`tests/contention_benchmark.rs`), which drives claimed evals through
+/// exactly the dispatch semantics the eval workers use; not part of any
+/// stable API.
+pub fn handle_claimed_eval(store: &Store, worker_id: usize, eval: &Eval) {
     let started = std::time::Instant::now();
     info!(
         worker_id,
@@ -1624,6 +1628,32 @@ fn handle_claimed_eval(store: &Store, worker_id: usize, eval: &Eval) {
                 );
             }
         }
+        // A plan conflict that survived every retry is TRANSIENT by
+        // definition — someone else's plan kept winning the epoch CAS. The
+        // backstop (late-binding plan, Phase 1): release the eval back to
+        // pending with a delay instead of terminally failing it, because
+        // failed evals are never retried and the job would silently never
+        // place. Saturated pools thus show as visibly pending-and-retrying
+        // work; terminal failure remains for every non-conflict error.
+        Err(e) if error_is_plan_conflict(&e) => {
+            let delay = plan_conflict_requeue_delay(store);
+            warn!(
+                worker_id,
+                eval_id = %eval.id,
+                kind = %eval.kind,
+                requeue_delay_ms = delay.as_millis() as u64,
+                "Eval exhausted plan-conflict retries; requeueing instead of failing: {e:#}"
+            );
+            crate::manager::telemetry::metrics()
+                .scheduler_conflict_requeues_total
+                .inc();
+            if let Err(release_err) = store.release_eval_for_retry(&eval.id, delay) {
+                error!(
+                    worker_id,
+                    "Error requeueing conflicted eval {}: {:?}", eval.id, release_err
+                );
+            }
+        }
         Err(e) => {
             error!(worker_id, eval_id = %eval.id, elapsed_ms = started.elapsed().as_millis() as u64, "Error handling eval {}: {:?}", eval.id, e);
             let failed = drafts::eval_failed(eval, &e, started.elapsed());
@@ -1637,6 +1667,35 @@ fn handle_claimed_eval(store: &Store, worker_id: usize, eval: &Eval) {
             }
         }
     }
+}
+
+/// Whether an eval-handler error is (or wraps) a plan-apply optimistic
+/// concurrency conflict — the transient loss `handle_claimed_eval`
+/// requeues instead of terminally failing.
+fn error_is_plan_conflict(error: &anyhow::Error) -> bool {
+    crate::storage::errors::StorageError::from_anyhow(error).is_some_and(|storage| {
+        matches!(
+            storage,
+            crate::storage::errors::StorageError::Conflict { .. }
+        )
+    })
+}
+
+/// `schedulerSettings.plan_conflict_requeue_delay_ms` — how long a
+/// conflict-exhausted eval waits before re-entering the queue. Default
+/// 1000 ms, clamped to 50..=60_000, jittered ±25% so a burst of losers
+/// does not re-collide in lockstep.
+fn plan_conflict_requeue_delay(store: &Store) -> Duration {
+    use rand::Rng;
+    let base_ms = store
+        .scheduler_settings
+        .as_ref()
+        .and_then(|settings| settings.get("plan_conflict_requeue_delay_ms"))
+        .and_then(|value| value.as_u64())
+        .unwrap_or(1_000)
+        .clamp(50, 60_000);
+    let jitter = rand::thread_rng().gen_range(0.75..=1.25);
+    Duration::from_millis(base_ms).mul_f64(jitter)
 }
 
 /// Whether an eval-handler error is (or wraps) a raft `NotRaftLeader`
