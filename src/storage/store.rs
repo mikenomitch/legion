@@ -1985,17 +1985,20 @@ impl Store {
 
     /// Runs one scheduling-index candidate query under the read-model lock
     /// (docs/scheduling-indexes.md). Cheap: index selection plus one shard
-    /// walk; the caller re-verifies every returned candidate.
+    /// walk; the caller re-verifies every returned candidate. `ordered:
+    /// false` skips the shard's nearest-fit cell sort for callers that
+    /// re-order the candidates themselves (the untruncated scheduler path).
     pub fn scheduling_index_query(
         &self,
         bindings: &HashMap<String, Value>,
         request: &HashMap<String, f64>,
         budget: Option<usize>,
+        ordered: bool,
     ) -> R<crate::scheduling_index::IndexQueryOutcome> {
         Ok(self
             .read_model_reader()?
             .indexes
-            .query(bindings, request, budget))
+            .query_with_order(bindings, request, budget, ordered))
     }
 
     pub fn allocation_epoch_for_job_config(&self, job_config_id: &str) -> R<i64> {

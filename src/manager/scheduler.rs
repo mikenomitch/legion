@@ -207,13 +207,24 @@ struct ResourceLedger {
 }
 
 struct TaskPlan<'a> {
-    constraint_set: ConstraintSet,
-    permit_set: PermitSet,
+    /// The task's hard filters (constraints, permit), parsed once per plan
+    /// in `build_plan` and shared with the group-filter pass.
+    filters: Arc<(ConstraintSet, PermitSet)>,
     affinity_set: AffinitySet,
     task_request: ResourceRequest,
     base_eligible: Vec<&'a Node>,
     distinct_tracker: Option<DistinctTracker>,
     index_usage: TaskIndexUsage,
+}
+
+impl TaskPlan<'_> {
+    fn constraint_set(&self) -> &ConstraintSet {
+        &self.filters.0
+    }
+
+    fn permit_set(&self) -> &PermitSet {
+        &self.filters.1
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -533,6 +544,13 @@ pub struct Scheduler<'a> {
     policy: Box<dyn SchedulingPolicy>,
     #[allow(dead_code)]
     policy_lib: Option<Library>,
+    /// Settings parsed ONCE at construction (`scheduler_settings` is fixed
+    /// for the store's lifetime): `build_plan` used to re-walk the settings
+    /// JSON on every plan. Malformed settings therefore fail at
+    /// `Scheduler::new` rather than at the first plan.
+    weights: SchedulerWeights,
+    nodes_considered: Option<NodesConsidered>,
+    score_sample: Option<ScoreSample>,
 }
 
 #[derive(Debug, Clone)]
@@ -547,11 +565,20 @@ impl<'a> Scheduler<'a> {
     pub fn new(store: &'a Store) -> R<Self> {
         let (policy_lib, policy) = load_policy(&store.scheduling_policy)?;
 
-        Ok(Scheduler {
+        // Two-phase: the parsers below read `self.policy`/`self.store`, so
+        // construct with the policy's default weights first and overwrite.
+        let mut scheduler = Scheduler {
+            weights: SchedulerWeights::for_policy(policy.name()),
             store,
             policy,
             policy_lib,
-        })
+            nodes_considered: None,
+            score_sample: None,
+        };
+        scheduler.weights = scheduler.scheduler_weights()?;
+        scheduler.nodes_considered = scheduler.nodes_considered_setting()?;
+        scheduler.score_sample = scheduler.score_sample_setting()?;
+        Ok(scheduler)
     }
 
     #[instrument(skip_all)]
@@ -1168,9 +1195,9 @@ impl<'a> Scheduler<'a> {
         // scan is cheaper than any bookkeeping (docs/scheduling-indexes.md).
         let index_armed = self.store.index_settings.armed_for(nodes.len());
         let mut planned: HashMap<String, usize> = HashMap::new();
-        let weights = self.scheduler_weights()?;
-        let nodes_considered_setting = self.nodes_considered_setting()?;
-        let score_sample_setting = self.score_sample_setting()?;
+        let weights = self.weights;
+        let nodes_considered_setting = self.nodes_considered;
+        let score_sample_setting = self.score_sample;
         let mut reschedule_rng = if matches!(mode, PlanMode::Reschedule) {
             Some(reschedule_rng())
         } else {
@@ -1196,8 +1223,12 @@ impl<'a> Scheduler<'a> {
         let mut group_sizes: HashMap<String, usize> = HashMap::new();
         // Hard filters (constraints + permit) of every member of a group. A
         // multi-task group is placed on a single node, so that node must
-        // satisfy all of them.
-        let mut group_filters: HashMap<String, Vec<(ConstraintSet, PermitSet)>> = HashMap::new();
+        // satisfy all of them. Arc'd and shared with `build_task_plan` via
+        // `parsed_filters`, so each task's constraints/permit parse exactly
+        // once per plan.
+        let mut group_filters: HashMap<String, Vec<Arc<(ConstraintSet, PermitSet)>>> =
+            HashMap::new();
+        let mut parsed_filters: HashMap<i64, Arc<(ConstraintSet, PermitSet)>> = HashMap::new();
         let mut task_group_map: HashMap<i64, (String, Option<String>)> = HashMap::new();
         let mut task_id_to_group: HashMap<i64, String> = HashMap::new();
         let task_name_to_id: HashMap<String, i64> = all_tasks
@@ -1232,10 +1263,12 @@ impl<'a> Scheduler<'a> {
                 })?;
             let permit_set = PermitSet::new(&task_config.permit)
                 .with_context(|| format!("Failed to parse permit for task {}", task_config.name))?;
+            let filters = Arc::new((constraint_set, permit_set));
             group_filters
                 .entry(task_config.group.clone())
                 .or_default()
-                .push((constraint_set, permit_set));
+                .push(Arc::clone(&filters));
+            parsed_filters.insert(*task_id, filters);
             task_group_map.insert(*task_id, (task_config.group.clone(), per_key));
             task_id_to_group.insert(*task_id, task_config.group.clone());
         }
@@ -1300,8 +1333,8 @@ impl<'a> Scheduler<'a> {
                 .and_then(|value| value.clone());
             let mut grouped: HashMap<String, Vec<&Node>> = HashMap::new();
             for node in nodes.iter().map(|node| &**node) {
-                if !filters.iter().all(|(constraint, permit)| {
-                    constraint.is_satisfied(node, None) && permit.is_permitted(node)
+                if !filters.iter().all(|filters| {
+                    filters.0.is_satisfied(node, None) && filters.1.is_permitted(node)
                 }) {
                     continue;
                 }
@@ -1345,6 +1378,7 @@ impl<'a> Scheduler<'a> {
                 needed,
                 index_armed,
                 in_multi_task_group,
+                &parsed_filters,
             )?;
 
             let base_eligible = plan.base_eligible.clone();
@@ -1553,33 +1587,37 @@ impl<'a> Scheduler<'a> {
             })
             .collect();
 
-        let candidates =
-            match self
-                .store
-                .scheduling_index_query(&bindings, &request_amounts, None)?
-            {
-                IndexQueryOutcome::Disabled => {
-                    return Ok(Self::scan_base_eligible(
-                        node_refs(nodes),
-                        constraint_set,
-                        permit_set,
-                        required_drivers,
-                    ));
-                }
-                IndexQueryOutcome::Unusable { reason } => {
-                    metrics
-                        .scheduler_index_queries_total
-                        .inc(&["none", "unusable"]);
-                    usage.reason = Some(reason);
-                    return Ok(Self::scan_base_eligible(
-                        node_refs(nodes),
-                        constraint_set,
-                        permit_set,
-                        required_drivers,
-                    ));
-                }
-                IndexQueryOutcome::Candidates(candidates) => candidates,
-            };
+        // Ordering matters only when the verified list may be truncated to
+        // the best-first budget below; the untruncated path re-sorts by
+        // node id, so the shard's nearest-fit cell sort would be wasted.
+        let candidates = match self.store.scheduling_index_query(
+            &bindings,
+            &request_amounts,
+            None,
+            allow_truncation,
+        )? {
+            IndexQueryOutcome::Disabled => {
+                return Ok(Self::scan_base_eligible(
+                    node_refs(nodes),
+                    constraint_set,
+                    permit_set,
+                    required_drivers,
+                ));
+            }
+            IndexQueryOutcome::Unusable { reason } => {
+                metrics
+                    .scheduler_index_queries_total
+                    .inc(&["none", "unusable"]);
+                usage.reason = Some(reason);
+                return Ok(Self::scan_base_eligible(
+                    node_refs(nodes),
+                    constraint_set,
+                    permit_set,
+                    required_drivers,
+                ));
+            }
+            IndexQueryOutcome::Candidates(candidates) => candidates,
+        };
 
         let mut verified: Vec<&'b Node> = candidates
             .node_ids
@@ -1676,6 +1714,7 @@ impl<'a> Scheduler<'a> {
         Ok(verified)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build_task_plan<'b>(
         &self,
         task_id: i64,
@@ -1687,24 +1726,30 @@ impl<'a> Scheduler<'a> {
         needed: u32,
         index_armed: bool,
         in_multi_task_group: bool,
+        parsed_filters: &HashMap<i64, Arc<(ConstraintSet, PermitSet)>>,
     ) -> R<TaskPlan<'b>> {
         let task_resources =
             resource_policy.normalize_task_resources(&task_config.resources, true)?;
         let task_request = ResourceRequest::from_value(&task_resources)?;
 
-        let constraint_set = ConstraintSet::new(&task_config.constraints).with_context(|| {
-            format!("Failed to parse constraints for task {}", task_config.name)
-        })?;
-        let permit_set = PermitSet::new(&task_config.permit)
-            .with_context(|| format!("Failed to parse permit for task {}", task_config.name))?;
+        // Parsed once per plan by `build_plan`'s group-filter pass;
+        // re-parsing here (the old shape) doubled the per-task JSON walk.
+        let filters = match parsed_filters.get(&task_id) {
+            Some(filters) => Arc::clone(filters),
+            None => Arc::new((
+                ConstraintSet::new(&task_config.constraints).with_context(|| {
+                    format!("Failed to parse constraints for task {}", task_config.name)
+                })?,
+                PermitSet::new(&task_config.permit).with_context(|| {
+                    format!("Failed to parse permit for task {}", task_config.name)
+                })?,
+            )),
+        };
+        let (constraint_set, permit_set) = (&filters.0, &filters.1);
         let affinity_set = AffinitySet::new(&task_config.affinities)
             .with_context(|| format!("Failed to parse affinities for task {}", task_config.name))?;
-        let distinct_tracker = Self::build_distinct_tracker(
-            &constraint_set,
-            task_id,
-            allocations_by_node,
-            node_lookup,
-        );
+        let distinct_tracker =
+            Self::build_distinct_tracker(constraint_set, task_id, allocations_by_node, node_lookup);
         // Storage is a hard placement requirement: a node without the task's
         // volume driver (or with it installed-but-unusable) can never run the
         // task, so filter it out here rather than letting the task start and
@@ -1726,8 +1771,8 @@ impl<'a> Scheduler<'a> {
             self.indexed_base_eligible(
                 nodes,
                 node_lookup,
-                &constraint_set,
-                &permit_set,
+                constraint_set,
+                permit_set,
                 &task_request,
                 &required_drivers,
                 needed,
@@ -1737,8 +1782,8 @@ impl<'a> Scheduler<'a> {
         } else {
             Self::scan_base_eligible(
                 node_refs(nodes),
-                &constraint_set,
-                &permit_set,
+                constraint_set,
+                permit_set,
                 &required_drivers,
             )
         };
@@ -1765,8 +1810,7 @@ impl<'a> Scheduler<'a> {
         }
 
         Ok(TaskPlan {
-            constraint_set,
-            permit_set,
+            filters,
             affinity_set,
             task_request,
             base_eligible,
@@ -1843,8 +1887,8 @@ impl<'a> Scheduler<'a> {
         for _ in 0..count {
             let mut eligible = Self::eligible_nodes(
                 &candidates,
-                &plan.constraint_set,
-                &plan.permit_set,
+                plan.constraint_set(),
+                plan.permit_set(),
                 plan.distinct_tracker.as_ref(),
                 &scoring_cache,
             );
@@ -1857,8 +1901,8 @@ impl<'a> Scheduler<'a> {
                 let required_drivers = task_config.required_volume_drivers();
                 let mut widened = Self::scan_base_eligible(
                     node_lookup.values().copied(),
-                    &plan.constraint_set,
-                    &plan.permit_set,
+                    plan.constraint_set(),
+                    plan.permit_set(),
                     &required_drivers,
                 );
                 widened.sort_by(|a, b| a.id.cmp(&b.id));
@@ -1894,8 +1938,8 @@ impl<'a> Scheduler<'a> {
                 );
                 eligible = Self::eligible_nodes(
                     &candidates,
-                    &plan.constraint_set,
-                    &plan.permit_set,
+                    plan.constraint_set(),
+                    plan.permit_set(),
                     plan.distinct_tracker.as_ref(),
                     &scoring_cache,
                 );
@@ -5706,13 +5750,12 @@ mod tests {
         ] {
             let store = setup_store_with_scheduler("bin_pack", Some(bad.clone()))?;
             store.insert_node(make_node_msg("node-a", json!({})))?;
-            let job_config_id =
-                submit_job(&store, "sample-bad", vec![TaskConfig::new("api", "noop")])?;
-            let scheduler = Scheduler::new(&store)?;
+            submit_job(&store, "sample-bad", vec![TaskConfig::new("api", "noop")])?;
+            // Settings parse once at construction now, so a malformed
+            // setting fails Scheduler::new (fail-fast) instead of the
+            // first plan.
             assert!(
-                scheduler
-                    .plan_only(&job_config_id, PlanMode::Fresh)
-                    .is_err(),
+                Scheduler::new(&store).is_err(),
                 "malformed setting must be rejected: {bad}"
             );
         }

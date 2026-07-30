@@ -83,12 +83,13 @@ How to use it:
       2026-07-29); the O(fleet) `version_sample` is lazy (D4) and plan
       applies group-commit (D5), 2026-07-30; eval handling (including
       `plan_with_conflict_retries`' backoff sleeps) runs on the blocking
-      pool instead of parking tokio runtime workers (2026-07-30).
-      Remaining measured candidates: per-task duplicated
-      `ConstraintSet`/`PermitSet` parsing (`build_plan` group filters vs
-      `build_task_plan`), per-plan `scheduler_settings` JSON walks
-      (`weights`/`nodes_considered`), and the index shard-sort under
-      `budget: None`.
+      pool instead of parking tokio runtime workers (2026-07-30); the
+      remaining measured candidates all landed 2026-07-30 — shared
+      per-task `ConstraintSet`/`PermitSet` parsing, settings parsed once
+      at `Scheduler::new`, and the index shard-sort skipped when the
+      caller discards the order (before/after in
+      [benchmarks/scheduler/README.md](../benchmarks/scheduler/README.md)).
+      Further wins want profiling, not this list.
 - [x] Scheduler performance measurement stack
       ([plan](plans/scheduler-performance-plan.md),
       [calls](calls/scheduler-performance-plan_calls.md),

@@ -590,12 +590,29 @@ impl IndexSet {
 
     /// Selects an index for the given bindings/request and walks its shard.
     /// `budget` truncates the ordered candidates; `None` returns the whole
-    /// shard (the equivalence-preserving mode).
+    /// shard (the equivalence-preserving mode). Candidates come back
+    /// best-first per the index's order.
     pub fn query(
         &self,
         bindings: &HashMap<String, Value>,
         request: &HashMap<String, f64>,
         budget: Option<usize>,
+    ) -> IndexQueryOutcome {
+        self.query_with_order(bindings, request, budget, true)
+    }
+
+    /// [`IndexSet::query`], with the nearest-fit cell ordering optional.
+    /// A caller that re-orders the candidates itself (the scheduler's
+    /// untruncated path sorts verified candidates by node id) passes
+    /// `ordered: false` and skips the shard's cell sort entirely — under
+    /// `budget: None` the sort's only effect was an ordering the caller
+    /// threw away.
+    pub fn query_with_order(
+        &self,
+        bindings: &HashMap<String, Value>,
+        request: &HashMap<String, f64>,
+        budget: Option<usize>,
+        ordered: bool,
     ) -> IndexQueryOutcome {
         if self.settings.indexes.is_empty() || self.settings.min_nodes == 0 {
             return IndexQueryOutcome::Disabled;
@@ -649,37 +666,47 @@ impl IndexSet {
         // Order every occupied cell: the orthant (every bucket covers the
         // request's) first by weighted distance — ascending for tight,
         // descending for loose — then the provably-non-fitting tail, closest
-        // first. Cell key breaks ties so output is deterministic.
+        // first. Cell key breaks ties so output is deterministic. Skipped
+        // entirely for unordered queries (the caller re-orders).
         let mut cells: Vec<(&Vec<u16>, &Vec<String>)> = shard.cells.iter().collect();
-        let ranked = |cell: &[u16]| -> (u8, f64) {
-            let fits = cell
-                .iter()
-                .zip(request_cell.iter())
-                .all(|(have, want)| have >= want);
-            let distance: f64 = cell
-                .iter()
-                .zip(request_cell.iter())
-                .zip(spec.dims.iter())
-                .map(|((have, want), dim)| dim.weight * (f64::from(*have) - f64::from(*want)).abs())
-                .sum();
-            if fits {
-                let distance = match spec.order {
-                    IndexOrder::Tight => distance,
-                    IndexOrder::Loose => -distance,
-                };
-                (0, distance)
-            } else {
-                (1, distance)
-            }
-        };
-        cells.sort_by(|a, b| {
-            let (fit_a, dist_a) = ranked(a.0);
-            let (fit_b, dist_b) = ranked(b.0);
-            fit_a
-                .cmp(&fit_b)
-                .then(dist_a.total_cmp(&dist_b))
-                .then(a.0.cmp(b.0))
-        });
+        if ordered {
+            let ranked = |cell: &[u16]| -> (u8, f64) {
+                let fits = cell
+                    .iter()
+                    .zip(request_cell.iter())
+                    .all(|(have, want)| have >= want);
+                let distance: f64 = cell
+                    .iter()
+                    .zip(request_cell.iter())
+                    .zip(spec.dims.iter())
+                    .map(|((have, want), dim)| {
+                        dim.weight * (f64::from(*have) - f64::from(*want)).abs()
+                    })
+                    .sum();
+                if fits {
+                    let distance = match spec.order {
+                        IndexOrder::Tight => distance,
+                        IndexOrder::Loose => -distance,
+                    };
+                    (0, distance)
+                } else {
+                    (1, distance)
+                }
+            };
+            // Rank once per cell, not once per comparison: the comparator
+            // used to recompute both sides' ranks O(n log n) times.
+            let mut ranked_cells: Vec<((u8, f64), (&Vec<u16>, &Vec<String>))> = cells
+                .into_iter()
+                .map(|cell| (ranked(cell.0), cell))
+                .collect();
+            ranked_cells.sort_by(|a, b| {
+                (a.0 .0)
+                    .cmp(&b.0 .0)
+                    .then(a.0 .1.total_cmp(&b.0 .1))
+                    .then(a.1 .0.cmp(b.1 .0))
+            });
+            cells = ranked_cells.into_iter().map(|(_, cell)| cell).collect();
+        }
 
         let partition_size: usize = cells.iter().map(|(_, ids)| ids.len()).sum();
         let mut node_ids = Vec::with_capacity(budget.unwrap_or(partition_size).min(partition_size));
@@ -1100,6 +1127,35 @@ mod tests {
             candidates.node_ids,
             vec!["large", "medium", "small", "none"]
         );
+    }
+
+    /// An unordered query is the ordered query minus the cell sort: same
+    /// candidate SET, same partition size, no truncation — only the
+    /// best-first ordering is dropped (the scheduler's untruncated path
+    /// re-sorts by node id anyway).
+    #[test]
+    fn unordered_query_returns_the_same_candidate_set() {
+        let (set, _) = set_for(
+            json!({ "indexes": { "fit": false, "vram": ["pool", "resources.vram"] } }),
+            fit_nodes(),
+        );
+        let bindings = HashMap::from([("pool".to_string(), json!("default"))]);
+        let request = HashMap::from([("vram".to_string(), 512.0)]);
+        let IndexQueryOutcome::Candidates(ordered) = set.query(&bindings, &request, None) else {
+            panic!("expected candidates");
+        };
+        let IndexQueryOutcome::Candidates(unordered) =
+            set.query_with_order(&bindings, &request, None, false)
+        else {
+            panic!("expected candidates");
+        };
+        let mut ordered_ids = ordered.node_ids.clone();
+        let mut unordered_ids = unordered.node_ids.clone();
+        ordered_ids.sort();
+        unordered_ids.sort();
+        assert_eq!(ordered_ids, unordered_ids);
+        assert_eq!(unordered.partition_size, ordered.partition_size);
+        assert!(!unordered.truncated);
     }
 
     #[test]
