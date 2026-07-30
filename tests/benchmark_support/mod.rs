@@ -611,43 +611,45 @@ pub fn run_scenario_concurrent(
             .map(|jobs| {
                 let store = store.clone();
                 let jobs = jobs.to_vec();
-                std::thread::spawn(move || -> anyhow::Result<(Vec<f64>, Vec<PlanTimings>, u64, u64)> {
-                    let mut latencies = Vec::new();
-                    let mut timings = Vec::new();
-                    let mut conflicts = 0u64;
-                    let mut attempts = 0u64;
-                    for job_config_id in &jobs {
-                        attempts += 1;
-                        let mut retries = 0usize;
-                        loop {
-                            let scheduler = Scheduler::new(&store)?;
-                            let started = Instant::now();
-                            match scheduler.plan_and_apply(job_config_id, PlanMode::Fresh) {
-                                Ok(outcome) => {
-                                    latencies.push(started.elapsed().as_secs_f64() * 1_000.0);
-                                    timings.push(outcome.timings);
-                                    break;
-                                }
-                                Err(err) => {
-                                    if let Some(StorageError::Conflict { .. }) =
-                                        err.downcast_ref::<StorageError>()
-                                    {
-                                        conflicts += 1;
-                                        retries += 1;
-                                        if retries <= CONFLICT_RETRIES {
-                                            continue;
-                                        }
-                                        // Exhausted: leave the gap for the
-                                        // correctness check to surface.
+                std::thread::spawn(
+                    move || -> anyhow::Result<(Vec<f64>, Vec<PlanTimings>, u64, u64)> {
+                        let mut latencies = Vec::new();
+                        let mut timings = Vec::new();
+                        let mut conflicts = 0u64;
+                        let mut attempts = 0u64;
+                        for job_config_id in &jobs {
+                            attempts += 1;
+                            let mut retries = 0usize;
+                            loop {
+                                let scheduler = Scheduler::new(&store)?;
+                                let started = Instant::now();
+                                match scheduler.plan_and_apply(job_config_id, PlanMode::Fresh) {
+                                    Ok(outcome) => {
+                                        latencies.push(started.elapsed().as_secs_f64() * 1_000.0);
+                                        timings.push(outcome.timings);
                                         break;
                                     }
-                                    return Err(err);
+                                    Err(err) => {
+                                        if let Some(StorageError::Conflict { .. }) =
+                                            err.downcast_ref::<StorageError>()
+                                        {
+                                            conflicts += 1;
+                                            retries += 1;
+                                            if retries <= CONFLICT_RETRIES {
+                                                continue;
+                                            }
+                                            // Exhausted: leave the gap for the
+                                            // correctness check to surface.
+                                            break;
+                                        }
+                                        return Err(err);
+                                    }
                                 }
                             }
                         }
-                    }
-                    Ok((latencies, timings, conflicts, attempts))
-                })
+                        Ok((latencies, timings, conflicts, attempts))
+                    },
+                )
             })
             .collect();
         for handle in handles {

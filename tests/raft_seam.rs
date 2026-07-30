@@ -107,6 +107,7 @@ const CLASSIFIED_MUTATIONS: &[&str] = &[
     "apply_allocation_plan",
     "apply_plan_submission",
     "submit_and_apply_plan",
+    "submit_and_apply_plans",
     "create_keyed_instance",
     "create_rollout",
     "destroy_job_scheduler_cleanup",
@@ -162,6 +163,7 @@ const CLASSIFIED_MUTATIONS: &[&str] = &[
     "set_task_status",
     "update_node_health_checks",
     "update_node_heartbeat",
+    "update_node_heartbeats",
     "update_task_statuses_for_allocations",
     "upsert_allocation_health_snapshots",
 ];
@@ -184,6 +186,11 @@ const DELEGATED_BODIES: &[&str] = &[
     // Plan §8 D1 reconciler: inlines its INSERT..SELECT closure and shares
     // seed_task_statuses_apply's semantics (ON CONFLICT DO NOTHING seed).
     "seed_missing_task_statuses",
+    // D5 group commit: the batch op's closure runs submit_and_apply_plan_apply
+    // per plan inside per-plan savepoints; the single-heartbeat op shares
+    // update_node_heartbeats_apply with the batched form.
+    "submit_and_apply_plans",
+    "update_node_heartbeat",
 ];
 
 /// Public mutating methods that are deliberately NOT replicated — they route
@@ -264,6 +271,7 @@ fn lane_for(method: &str) -> Lane {
         | "set_eval_status"
         | "apply_plan_submission"
         | "submit_and_apply_plan"
+        | "submit_and_apply_plans"
         | "create_keyed_instance"
         | "create_rollout"
         | "destroy_job_scheduler_cleanup"
@@ -309,6 +317,7 @@ fn lane_for(method: &str) -> Lane {
         | "set_task_status"
         | "update_node_health_checks"
         | "update_node_heartbeat"
+        | "update_node_heartbeats"
         | "update_task_statuses_for_allocations"
         | "upsert_allocation_health_snapshots" => Lane::Status,
         other => panic!(

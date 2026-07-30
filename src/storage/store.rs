@@ -14933,7 +14933,7 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_plan_submitters_coalesce_and_all_apply() -> R<()> {
+    fn concurrent_plan_submitters_coalesce_and_every_plan_lands() -> R<()> {
         let store = setup_store()?;
         let mut requests = Vec::new();
         for index in 0..8 {
