@@ -1,4 +1,5 @@
 pub mod acl_store;
+pub(crate) mod coalesce;
 pub mod errors;
 pub mod events;
 pub mod migrations;

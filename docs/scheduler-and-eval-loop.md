@@ -97,9 +97,43 @@ This keeps conflicts localized so unrelated jobs can schedule in parallel withou
 
 The plan submission and its apply run as **one replicated store op**
 (`Store::submit_and_apply_plan`): one write-transaction boundary, and on
-raft one propose→quorum-commit→apply instead of two. The epoch sample is
-still taken before the capacity snapshot; only the write round-trips are
-fused.
+raft one propose→quorum-commit→apply instead of two.
+
+### The epoch sample is lazy by default
+
+The fence rule is that epochs must be sampled *no later than* the
+capacity snapshot the plan is built against. Sampling every candidate
+node up front satisfies that unconditionally but costs O(fleet) per
+plan. By default the scheduler instead plans first and samples epochs
+for exactly the scopes the plan touches (the job config plus the placed
+nodes), accepting the late sample only when the read model's
+**generation counter** — bumped on every allocation publish — proves
+nothing changed since the capacity read. When something did change
+mid-plan, the scheduler re-plans once with the eager whole-fleet sample
+(unconditionally safe), counted by the
+`legion_scheduler_lazy_sample_fallback_total` metric.
+
+`schedulerSettings.lazy_version_sample: false` restores the eager sample
+on every plan. Correctness never depends on this setting — the lazy path
+falls back on its own whenever it cannot prove equivalence.
+
+### Group commit
+
+Concurrent plan applies (parallel eval workers) coalesce into **one**
+store commit: plans queued while a commit is in flight batch into a
+single replicated op — one write transaction, and on raft one
+propose→quorum round for the whole batch — with every plan keeping its
+own epoch-CAS verdict inside a per-plan savepoint. A plan that fails
+mid-apply rolls back alone; its batch-mates commit. A lone plan takes
+the single-plan path unchanged, so idle-cluster latency is unaffected.
+
+- `schedulerSettings.plan_apply_coalescing: false` restores one commit
+  per plan.
+- `schedulerSettings.plan_apply_batch_max` (default 16, max 128) caps
+  plans per batch.
+
+Worker heartbeats batch the same way on the status lane (see
+[architecture-managers-workers.md](architecture-managers-workers.md)).
 
 ### Observing where plan time goes
 
@@ -141,7 +175,11 @@ If you observe frequent conflict retries, increase this setting modestly and als
 
 - `node.availability == "available"`
 
-Nodes are sorted by ID before planning.
+Nodes are sorted by ID before planning. The sorted list and each node's
+free-capacity pool are cached in the scheduler read model and shared by
+reference, so a plan's snapshot costs refcount bumps rather than a
+fleet-sized filter/sort/copy; any node mutation invalidates the cached
+list and the next plan rebuilds it.
 
 Per task, the candidate set is then built one of two ways:
 
@@ -170,9 +208,48 @@ Selection policy:
 
 - built-in `bin_pack` or `spread`, or loaded scheduler plugin
 - optional `nodes_considered` random subset before scoring
+- optional bounded candidate scoring (`score_sample`, below)
 - optional score jitter on reschedule mode for less deterministic stickiness
 
 Resource fitting is enforced before node can be selected.
+
+### Bounded candidate scoring (`score_sample`)
+
+By default every placement scores **every** feasible node — exact
+placement, at a per-placement cost that grows with fleet size. On large
+fleets, `schedulerSettings.score_sample` bounds it:
+
+```jsonnet
+{
+  schedulerSettings: {
+    score_sample: { min_nodes: 1024, sample: 128 },
+  },
+}
+```
+
+Below `min_nodes` eligible candidates, behavior is exactly the default
+(exact scoring). At or above it, the placement scores `sample` uniformly
+drawn candidates and takes the best — best-of-k selection, which keeps
+per-placement cost flat at any fleet size. Two properties hold by
+construction:
+
+- **Feasibility is never sampled.** Constraints, permits, distinct
+  rules, and resource fit always run in full; a sampled candidate is
+  always a valid placement. Only the score *ranking* is approximate.
+- **The trade is visible.** `job plan` explain output notes
+  `scored best of N sampled nodes` on any task whose placements were
+  sampled, and the packing-quality cost is bounded by the
+  power-of-k-choices property (the repository carries a regression test
+  asserting the bound; the measured numbers live in
+  `benchmarks/scheduler/README.md`).
+
+Validation: `sample >= 2` and `min_nodes >= sample`, rejected at plan
+time otherwise. Only the built-in `bin_pack`/`spread` policies sample;
+plugin policies always receive the full eligible list. When both
+`nodes_considered` and `score_sample` are set, `nodes_considered`
+applies first (it is a hard cap); combining them is not recommended.
+This knob is off unless configured — exact scoring is the default at
+every fleet size.
 
 ## Dependency-Aware Task Readiness
 

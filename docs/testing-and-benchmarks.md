@@ -86,6 +86,19 @@ LEGION_BENCH_BACKENDS=local_disk,raft1,raft3,streaming cargo test --release --te
 - Subsets via `LEGION_BENCH_BACKENDS` and `LEGION_BENCH_SCENARIOS`
   (comma-separated scenario names).
 
+- Heartbeat scale matrix (`tests/heartbeat_scale_benchmark.rs`): fleet
+  size × backend; measures heartbeat throughput (N driver threads
+  heartbeating a fleet partition flat-out), p50/p99 heartbeat latency,
+  and the wall-clock of one liveness tick at that fleet size:
+
+```bash
+LEGION_BENCH_BACKENDS=local_disk,raft1 LEGION_HEARTBEAT_NODES=1000,5000 \
+  cargo test --release --test heartbeat_scale_benchmark -- --ignored --nocapture
+```
+
+  Knobs: `LEGION_HEARTBEAT_THREADS` (default 8) and
+  `LEGION_HEARTBEAT_SECONDS` (measurement window per cell, default 3).
+
 Recorded results live in `benchmarks/scheduler/README.md`, with the host
 and build profile noted alongside every table.
 

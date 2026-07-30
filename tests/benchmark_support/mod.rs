@@ -578,6 +578,106 @@ pub fn run_scenario_on(
     })
 }
 
+/// `run_scenario_on` with N concurrent submitters — the driver shape that
+/// exercises the plan-apply group commit (plan-path scale levers, D5).
+/// Each iteration partitions the jobs across `workers` threads; every
+/// thread plans and applies its jobs with bounded conflict retries (what
+/// the production eval path does), so contention shows up as conflict
+/// rate and retry latency rather than missing allocations.
+pub fn run_scenario_concurrent(
+    store: &Store,
+    scenario: &SchedulerScenario,
+    workers: usize,
+) -> anyhow::Result<ScenarioMetrics> {
+    const CONFLICT_RETRIES: usize = 8;
+    if workers <= 1 {
+        return run_scenario_on(store, scenario);
+    }
+    insert_fleet(store, scenario)?;
+    let job_config_ids = submit_jobs(store, scenario)?;
+
+    let mut latencies_ms: Vec<f64> = Vec::new();
+    let mut timing_samples: Vec<PlanTimings> = Vec::new();
+    let mut conflicts = 0u64;
+    let mut attempts = 0u64;
+    let benchmark_started = Instant::now();
+
+    for iteration in 0..scenario.iterations {
+        apply_churn(store, scenario, iteration)?;
+
+        let chunk = job_config_ids.len().div_ceil(workers);
+        let handles: Vec<_> = job_config_ids
+            .chunks(chunk.max(1))
+            .map(|jobs| {
+                let store = store.clone();
+                let jobs = jobs.to_vec();
+                std::thread::spawn(
+                    move || -> anyhow::Result<(Vec<f64>, Vec<PlanTimings>, u64, u64)> {
+                        let mut latencies = Vec::new();
+                        let mut timings = Vec::new();
+                        let mut conflicts = 0u64;
+                        let mut attempts = 0u64;
+                        for job_config_id in &jobs {
+                            attempts += 1;
+                            let mut retries = 0usize;
+                            loop {
+                                let scheduler = Scheduler::new(&store)?;
+                                let started = Instant::now();
+                                match scheduler.plan_and_apply(job_config_id, PlanMode::Fresh) {
+                                    Ok(outcome) => {
+                                        latencies.push(started.elapsed().as_secs_f64() * 1_000.0);
+                                        timings.push(outcome.timings);
+                                        break;
+                                    }
+                                    Err(err) => {
+                                        if let Some(StorageError::Conflict { .. }) =
+                                            err.downcast_ref::<StorageError>()
+                                        {
+                                            conflicts += 1;
+                                            retries += 1;
+                                            if retries <= CONFLICT_RETRIES {
+                                                continue;
+                                            }
+                                            // Exhausted: leave the gap for the
+                                            // correctness check to surface.
+                                            break;
+                                        }
+                                        return Err(err);
+                                    }
+                                }
+                            }
+                        }
+                        Ok((latencies, timings, conflicts, attempts))
+                    },
+                )
+            })
+            .collect();
+        for handle in handles {
+            let (worker_latencies, worker_timings, worker_conflicts, worker_attempts) =
+                handle.join().expect("scenario worker panicked")?;
+            latencies_ms.extend(worker_latencies);
+            timing_samples.extend(worker_timings);
+            conflicts += worker_conflicts;
+            attempts += worker_attempts;
+        }
+    }
+
+    let elapsed_secs = benchmark_started.elapsed().as_secs_f64().max(0.001);
+    let evals_per_sec = attempts as f64 / elapsed_secs;
+    let conflict_rejection_rate = conflicts as f64 / attempts.max(1) as f64;
+    let correctness_ratio = validate_correctness(store, &job_config_ids, scenario)?;
+
+    Ok(ScenarioMetrics {
+        evals_per_sec,
+        p50_latency_ms: pctl(&latencies_ms, 0.50),
+        p95_latency_ms: pctl(&latencies_ms, 0.95),
+        p99_latency_ms: pctl(&latencies_ms, 0.99),
+        conflict_rejection_rate,
+        correctness_ratio,
+        phase_means_us: PhaseMeans::from_samples(&timing_samples),
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Backends
 // ---------------------------------------------------------------------------
@@ -664,6 +764,23 @@ impl BackendHandle {
 }
 
 fn base_config(dir: &Path, scenario: &SchedulerScenario) -> anyhow::Result<ManagerConfigFull> {
+    // `LEGION_BENCH_SCHEDULER_SETTINGS` overlays keys onto the scenario's
+    // schedulerSettings — how an A/B toggles a lever (e.g.
+    // '{"plan_apply_coalescing":false}') without editing scenario files.
+    let mut scheduler_settings = scenario.scheduler_settings.clone();
+    if let Ok(raw) = std::env::var("LEGION_BENCH_SCHEDULER_SETTINGS") {
+        let overlay: Value = serde_json::from_str(&raw)
+            .map_err(|err| anyhow::anyhow!("bad LEGION_BENCH_SCHEDULER_SETTINGS: {err}"))?;
+        let mut merged = scheduler_settings
+            .as_ref()
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        if let Value::Object(overlay) = overlay {
+            merged.extend(overlay);
+        }
+        scheduler_settings = Some(Value::Object(merged));
+    }
     Ok(ManagerConfigFull {
         store_path: dir
             .join("store")
@@ -676,7 +793,7 @@ fn base_config(dir: &Path, scenario: &SchedulerScenario) -> anyhow::Result<Manag
             "memory": 0,
             "allocations": 1000
         })),
-        scheduler_settings: scenario.scheduler_settings.clone(),
+        scheduler_settings,
         ..Default::default()
     })
 }

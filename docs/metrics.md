@@ -82,6 +82,12 @@ into a single series with every label set to `"other"`.
   compare the phase that grew against the others before profiling. The
   benchmark runners aggregate the same phases
   (docs/testing-and-benchmarks.md).
+- **`legion_scheduler_lazy_sample_fallback_total`** (counter) — plans that
+  re-ran with the eager (whole-fleet) optimistic-concurrency sample
+  because the read model changed while the plan was being built (see the
+  lazy epoch sample in docs/scheduler-and-eval-loop.md). A steadily high
+  rate relative to plan volume means heavy concurrent churn; correctness
+  is unaffected either way.
 
 ### Scheduling indexes
 

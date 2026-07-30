@@ -56,6 +56,13 @@ fn scheduler_scale_benchmark_matrix() -> R<()> {
     let scenarios = requested_scenarios()?;
     let backends = requested_backends();
     assert!(!scenarios.is_empty(), "no scenarios matched");
+    // LEGION_BENCH_CONCURRENCY=N drives each cell with N concurrent
+    // submitters (bounded conflict retries, like the production eval
+    // path) — the shape that exercises the plan-apply group commit.
+    let concurrency: usize = std::env::var("LEGION_BENCH_CONCURRENCY")
+        .ok()
+        .and_then(|raw| raw.parse().ok())
+        .unwrap_or(1);
 
     let mut results = Vec::new();
     println!(
@@ -66,7 +73,11 @@ fn scheduler_scale_benchmark_matrix() -> R<()> {
     for scenario in &scenarios {
         for backend in &backends {
             let handle = setup_backend(*backend, scenario)?;
-            let metrics = run_scenario_on(handle.store(), scenario)?;
+            let metrics = if concurrency > 1 {
+                benchmark_support::run_scenario_concurrent(handle.store(), scenario, concurrency)?
+            } else {
+                run_scenario_on(handle.store(), scenario)?
+            };
             println!(
                 "{:<22} {:<10} {:>9.2} {:>9.2} {:>9.2} {:>9.2} {:>8.2} {:>7.3}",
                 scenario.name,
@@ -93,6 +104,7 @@ fn scheduler_scale_benchmark_matrix() -> R<()> {
             results.push(serde_json::json!({
                 "scenario": scenario.name,
                 "backend": backend.label(),
+                "concurrency": concurrency,
                 "evals_per_sec": metrics.evals_per_sec,
                 "p50_latency_ms": metrics.p50_latency_ms,
                 "p95_latency_ms": metrics.p95_latency_ms,

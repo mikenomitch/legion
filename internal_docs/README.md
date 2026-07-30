@@ -66,9 +66,12 @@ When one is required and what goes in it:
 | [multi-cluster-federation-plan.md](plans/multi-cluster-federation-plan.md) | planned |
 | [multi-raft-persistence-plan.md](plans/multi-raft-persistence-plan.md) | planned |
 | [scheduler-performance-plan.md](plans/scheduler-performance-plan.md) | in execution |
-| [scheduler-architecture-review-plan.md](plans/scheduler-architecture-review-plan.md) | planned (proposals; no code) |
+| [scheduler-architecture-review-plan.md](plans/scheduler-architecture-review-plan.md) | proposals accepted; D1/D4/D5/D6 graduated into the two plans below, D8's local slice into the heartbeat plan |
+| [plan-path-scale-levers-plan.md](plans/plan-path-scale-levers-plan.md) | shipped (D4/D5/D6, 2026-07-30) |
+| [bounded-candidate-scoring-plan.md](plans/bounded-candidate-scoring-plan.md) | shipped (opt-in `score_sample`, 2026-07-30) |
+| [heartbeat-scale-plan.md](plans/heartbeat-scale-plan.md) | shipped (benchmark + batching + liveness + cadence, 2026-07-30) |
 | [aws-comparative-benchmark-plan.md](plans/aws-comparative-benchmark-plan.md) | in execution (phases 0-1; campaigns await AWS account) |
-| [worker-simulation-plan.md](plans/worker-simulation-plan.md) | in execution |
+| [worker-simulation-plan.md](plans/worker-simulation-plan.md) | shipped (2026-07-30) |
 | [scheduler-plan-snapshot-plan.md](plans/scheduler-plan-snapshot-plan.md) | shipped |
 | [scheduling-index-plan.md](plans/scheduling-index-plan.md) | shipped (phases 0–3; group-path + backlog deferred) |
 | [service-discovery-final-plan.md](plans/service-discovery-final-plan.md) | authoritative; v1 in progress |

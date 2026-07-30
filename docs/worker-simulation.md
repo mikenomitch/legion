@@ -78,11 +78,13 @@ constraint (for example `constraints: { simulated: { operator: "is_not_set" } }`
 
 ## Behavior and fidelity
 
-- **Same wire, same cadence.** Registration, 2s heartbeats, 30s
-  health-check reports, exponential retry with re-registration on
-  `Unauthenticated` — the constants and semantics are shared with the
-  real worker, not reimplemented. The manager's lost-node detection
-  (no heartbeat for 10s) applies to simulated nodes unchanged.
+- **Same wire, same cadence.** Registration, heartbeats at the
+  worker-type's cadence (`heartbeatSeconds`, default 2s, clamped and
+  ±10%-jittered by the same code as a real worker — see
+  [architecture-managers-workers.md](architecture-managers-workers.md)),
+  30s health-check reports, exponential retry with re-registration on
+  `Unauthenticated`. The manager's lost-node detection (no heartbeat
+  for 10s) applies to simulated nodes unchanged.
 - **Shared channels.** Nodes multiplex over a small pool of gRPC
   channels (one per 256 nodes, max 16), so one process holds a
   handful of connections regardless of fleet size.

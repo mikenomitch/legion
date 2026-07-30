@@ -2,8 +2,9 @@
 //! over shared gRPC channels (`legion start worker --simulate N`).
 //!
 //! Each simulated node speaks the unmodified worker-plane wire contract at
-//! real-worker cadences — pre-register, register, heartbeat every
-//! `WORKER_HEARTBEAT_DURATION_SEC`, health-check report every
+//! real-worker cadences — pre-register, register, heartbeats at the
+//! worker-type's cadence (`heartbeatSeconds`, resolved and jittered by the
+//! same `daemon` helpers a real worker uses), health-check report every
 //! `WORKER_NODE_CHECK_DURATION_SEC`, re-register on `Unauthenticated` — so
 //! manager-side load per simulated node matches load per real idle node.
 //! No task ever executes: dispatched allocations are recorded and echoed in
@@ -21,7 +22,10 @@ use crate::structs::{
     PostWorkReply, PostWorkRequest, RestartWorkerReply, RestartWorkerRequest, WorkerConfig,
     WorkerPreRegisterRequest, WorkerRegisterRequest,
 };
-use crate::worker::daemon::{connect_manager_with_retry, WorkerCredentials};
+use crate::worker::daemon::{
+    connect_manager_with_retry, heartbeat_interval_for, jittered_heartbeat_interval,
+    WorkerCredentials,
+};
 
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -269,6 +273,10 @@ impl SimNode {
 /// the summary log line.
 struct SimFleet {
     nodes: HashMap<String, Arc<SimNode>>,
+    /// Resolved like a real worker's (worker-type `heartbeatSeconds` via
+    /// `daemon::heartbeat_interval_for`), and jittered per sleep the same
+    /// way — the cadence contract is shared, not forked.
+    heartbeat_interval: Duration,
     registered: AtomicU64,
     heartbeats_ok: AtomicU64,
     heartbeats_failed: AtomicU64,
@@ -504,6 +512,7 @@ pub async fn launch_simulated_fleet(
     }
     let fleet = Arc::new(SimFleet {
         nodes,
+        heartbeat_interval: heartbeat_interval_for(&config),
         registered: AtomicU64::new(0),
         heartbeats_ok: AtomicU64::new(0),
         heartbeats_failed: AtomicU64::new(0),
@@ -572,9 +581,11 @@ async fn run_sim_node(
         }
     }
 
-    let heartbeat_interval = Duration::from_secs(WORKER_HEARTBEAT_DURATION_SEC);
-    let ticks_per_health_check =
-        (WORKER_NODE_CHECK_DURATION_SEC / WORKER_HEARTBEAT_DURATION_SEC.max(1)).max(1);
+    let heartbeat_interval = fleet.heartbeat_interval;
+    let ticks_per_health_check = ((WORKER_NODE_CHECK_DURATION_SEC as f64
+        / heartbeat_interval.as_secs_f64().max(0.001))
+    .round() as u64)
+        .max(1);
     let mut backoff = SIM_RETRY_MIN;
     let mut tick: u64 = 0;
     loop {
@@ -594,7 +605,7 @@ async fn run_sim_node(
                     }
                 }
                 tick += 1;
-                tokio::time::sleep(heartbeat_interval).await;
+                tokio::time::sleep(jittered_heartbeat_interval(heartbeat_interval)).await;
             }
             Err(status) if status.code() == tonic::Code::Unauthenticated => {
                 warn!(node = %node.name, "Sim heartbeat unauthenticated; re-registering");
@@ -672,7 +683,7 @@ async fn run_summary_loop(fleet: Arc<SimFleet>, opts: SimulateOptions) {
         // Every live node heartbeats once per interval; the expected rate
         // tells the reader at a glance whether the fleet is keeping up.
         let expected = fleet.registered.load(Ordering::Relaxed) as f64
-            / WORKER_HEARTBEAT_DURATION_SEC.max(1) as f64;
+            / fleet.heartbeat_interval.as_secs_f64().max(0.001);
         info!(
             nodes_registered = fleet.registered.load(Ordering::Relaxed),
             nodes_target = opts.count,
@@ -805,10 +816,26 @@ mod tests {
 
     #[test]
     fn sim_cadence_is_the_real_worker_cadence() {
-        // The liveness path is shared, not forked: the manager's 10s
-        // lost-node sweep must apply to sim nodes exactly as to real ones,
-        // which holds as long as the sim heartbeat period stays the real
-        // worker's constant, comfortably under the loss window.
-        assert!(WORKER_HEARTBEAT_DURATION_SEC as i64 * 2 <= DEF_LOST_NODE_AT_SEC);
+        // The cadence path is shared, not forked: the sim fleet resolves
+        // its heartbeat interval through the same daemon helper as a real
+        // worker — worker-type `heartbeatSeconds`, clamped 1..=30, default
+        // WORKER_HEARTBEAT_DURATION_SEC — so the manager's 10s lost-node
+        // sweep applies to sim nodes exactly as to real ones.
+        let default_interval = heartbeat_interval_for(&WorkerConfig::default());
+        assert_eq!(
+            default_interval,
+            Duration::from_secs(WORKER_HEARTBEAT_DURATION_SEC)
+        );
+        assert!(default_interval.as_secs() as i64 * 2 <= DEF_LOST_NODE_AT_SEC);
+
+        let configured = WorkerConfig {
+            heartbeat_seconds: Some(120),
+            ..WorkerConfig::default()
+        };
+        assert_eq!(
+            heartbeat_interval_for(&configured),
+            Duration::from_secs(30),
+            "sim fleets follow the same clamp as real workers"
+        );
     }
 }
