@@ -1,6 +1,15 @@
 # AWS Comparative Benchmark: Legion vs Nomad vs Kubernetes
 
-**Status: PLANNED**
+**Status: IN EXECUTION** — phase 0 shipped
+([worker-simulation-plan.md](worker-simulation-plan.md), 2026-07-30);
+phase 1's rig is fully prepared and locally validated in
+`benchmarks/aws/` (Terraform `validate`-clean, campaign/experiment
+scripts, translator + driver with a fixture-tested dry-run gate,
+`scripts/local-smoke.sh` green end-to-end against a real manager + sim
+fleet) but **not yet applied to a real AWS account** — phase 1's exit
+criterion (1k-node cloud smoke) awaits one. Phases 2-5 not started;
+the Nomad/K8s install scripts and driver adapters are written but
+marked TO-VERIFY until their phases run.
 
 > **Judgement calls:** [`../calls/aws-comparative-benchmark-plan_calls.md`](../calls/aws-comparative-benchmark-plan_calls.md)
 

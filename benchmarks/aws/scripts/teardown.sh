@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# Tear the whole rig down before it costs real money. Destroys every
+# instance AND the S3 bucket (force_destroy) — campaign archives you
+# have not synced out die with it, which is why this script syncs them
+# first unless told not to.
+#
+# Usage: teardown.sh [--no-sync] [--yes]
+set -euo pipefail
+source "$(dirname "$0")/env.sh"
+
+SYNC=true CONFIRM=true
+for arg in "$@"; do
+    case "$arg" in
+    --no-sync) SYNC=false ;;
+    --yes) CONFIRM=false ;;
+    esac
+done
+
+if load_rig 2>/dev/null; then
+    if $SYNC; then
+        log "syncing campaign archives from s3://$BUCKET/campaigns/ to $RESULTS_ROOT/s3-mirror/"
+        mkdir -p "$RESULTS_ROOT/s3-mirror"
+        aws s3 sync --region "$REGION" "s3://$BUCKET/campaigns/" "$RESULTS_ROOT/s3-mirror/" || true
+    fi
+fi
+
+if $CONFIRM; then
+    read -r -p "Destroy the entire benchmark rig (instances + bucket)? [y/N] " answer
+    [[ "$answer" == [yY]* ]] || {
+        echo "aborted"
+        exit 1
+    }
+fi
+
+terraform -chdir="$TF_DIR" destroy -auto-approve -input=false
+log "rig destroyed"

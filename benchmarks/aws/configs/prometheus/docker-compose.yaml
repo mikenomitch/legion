@@ -1,0 +1,43 @@
+# Observability stack for the loadgen box: Prometheus + Grafana, images
+# pinned. scripts/install-loadgen.sh copies this directory tree to
+# /opt/bench/observability on the loadgen instance and runs
+# `docker compose up -d` there.
+#
+# Layout on the instance:
+#   /opt/bench/observability/prometheus.yml        (rendered from the .tpl)
+#   /opt/bench/observability/targets/*.json        (gen-targets.sh output)
+#   /opt/bench/observability/grafana/provisioning  (this repo's configs)
+#   /opt/bench/observability/dashboards            (benchmarks/aws/dashboards)
+services:
+  prometheus:
+    image: prom/prometheus:v2.53.1
+    network_mode: host # scrapes private-IP targets directly
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./targets:/etc/prometheus/targets:ro
+      - prometheus-data:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      # A campaign spans days at most; keep everything until teardown.
+      - --storage.tsdb.retention.time=30d
+      - --web.enable-lifecycle # scripts reload via POST /-/reload
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.1.4
+    network_mode: host
+    environment:
+      # Single-operator benchmark box behind an admin_cidr security
+      # group; anonymous admin beats credential juggling in a runbook.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    restart: unless-stopped
+
+volumes:
+  prometheus-data:
+  grafana-data:

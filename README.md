@@ -32,6 +32,7 @@ Full index: [docs/README.md](docs/README.md).
 - [Exec & Actions (run commands in a workload, interactive PTY, actions)](docs/exec-and-actions.md)
 - [Workload Identity (OIDC)](docs/workload-identity.md)
 - [Testing and Benchmarks](docs/testing-and-benchmarks.md)
+- [Worker Simulation (fake node fleets for load testing)](docs/worker-simulation.md)
 - [Codebase Conventions](docs/codebase-conventions.md)
 - [Agent Readiness (MCP, structured output, agent workflow)](docs/agent-readiness.md)
 

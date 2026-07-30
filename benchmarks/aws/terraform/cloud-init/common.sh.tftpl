@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# Shared first-boot setup for every rig instance (rendered into each
+# role's cloud-config). Installs node_exporter so control-plane cost
+# (CPU/mem per manager) is scraped identically on every box, and the
+# awscli the campaign scripts use to pull binaries/push results.
+set -euo pipefail
+
+NODE_EXPORTER_VERSION="${node_exporter_version}"
+
+DEBIAN_FRONTEND=noninteractive apt-get update -y
+DEBIAN_FRONTEND=noninteractive apt-get install -y chrony jq unzip awscli gettext-base
+
+# node_exporter: pinned release, dedicated user, systemd-managed.
+useradd --no-create-home --shell /usr/sbin/nologin node_exporter || true
+curl -fsSL -o /tmp/node_exporter.tar.gz \
+  "https://github.com/prometheus/node_exporter/releases/download/v$${NODE_EXPORTER_VERSION}/node_exporter-$${NODE_EXPORTER_VERSION}.linux-amd64.tar.gz"
+tar -xzf /tmp/node_exporter.tar.gz -C /tmp
+install -m 0755 "/tmp/node_exporter-$${NODE_EXPORTER_VERSION}.linux-amd64/node_exporter" /usr/local/bin/node_exporter
+rm -rf /tmp/node_exporter.tar.gz "/tmp/node_exporter-$${NODE_EXPORTER_VERSION}.linux-amd64"
+
+cat > /etc/systemd/system/node_exporter.service <<'UNIT'
+[Unit]
+Description=Prometheus node_exporter
+After=network-online.target
+
+[Service]
+User=node_exporter
+ExecStart=/usr/local/bin/node_exporter
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+systemctl daemon-reload
+systemctl enable --now node_exporter
+
+# Directories the campaign scripts install into.
+mkdir -p /opt/legion/bin /opt/legion/configs /var/lib/legion

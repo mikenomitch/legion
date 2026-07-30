@@ -111,6 +111,23 @@ function TaskDetailContent() {
     ),
   )
 
+  // Allocations the exec panel may target. The manager rejects exec into an
+  // allocation whose task is not this page's task, so a sibling task's
+  // allocation is a dead panel — and on a multi-task job it renders this
+  // task's whole action form set once per sibling allocation. Filter to this
+  // task whenever the task↔allocation mapping is available; a job-scoped token
+  // without `state:read` gets an empty map, and there we still show the job's
+  // allocations rather than an empty section (the manager is the real gate).
+  const execAllocations = createMemo(() => {
+    const runtime = data()?.allocationHealth
+    const allocations = data()?.jobAllocations ?? []
+    if (!runtime || runtime.size === 0) return allocations
+    return allocations.filter((alloc) => {
+      const known = runtime.get(Number(alloc.id))
+      return known === undefined || known.taskName === taskName()
+    })
+  })
+
   return (
     <Show when={!data.loading} fallback={<div class="py-6"><Spinner label="Loading task…" /></div>}>
       <Show when={!data.error && data()} fallback={<Note tone="danger">Failed to load task details.</Note>}>
@@ -500,11 +517,11 @@ function TaskDetailContent() {
 
             <SectionCard title="Exec & actions" description="Run commands or declared actions inside this task's running allocations.">
               <Show
-                when={data()!.jobAllocations.length > 0}
+                when={execAllocations().length > 0}
                 fallback={<EmptyState icon="terminal" title="No running allocations" body="Once an allocation is running you can open a shell or trigger actions here." />}
               >
                 <div class="space-y-2.5">
-                  <For each={data()!.jobAllocations}>
+                  <For each={execAllocations()}>
                     {(alloc) => (
                       <div class="rounded-lg border border-line bg-surface2/40 p-3">
                         <div class="flex flex-wrap items-center justify-between gap-2">
