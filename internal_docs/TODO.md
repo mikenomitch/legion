@@ -81,13 +81,14 @@ How to use it:
       cached sorted node list + Arc'd pool values, 2026-07-30); the
       plan-submission insert is fused into the apply (one quorum commit,
       2026-07-29); the O(fleet) `version_sample` is lazy (D4) and plan
-      applies group-commit (D5), 2026-07-30. Remaining measured candidates:
-      per-task duplicated `ConstraintSet`/`PermitSet` parsing
-      (`build_plan` group filters vs `build_task_plan`), per-plan
-      `scheduler_settings` JSON walks (`weights`/`nodes_considered`), the
-      index shard-sort under `budget: None`, and the blocking
-      `thread::sleep` in `plan_with_conflict_retries` on the async eval
-      path.
+      applies group-commit (D5), 2026-07-30; eval handling (including
+      `plan_with_conflict_retries`' backoff sleeps) runs on the blocking
+      pool instead of parking tokio runtime workers (2026-07-30).
+      Remaining measured candidates: per-task duplicated
+      `ConstraintSet`/`PermitSet` parsing (`build_plan` group filters vs
+      `build_task_plan`), per-plan `scheduler_settings` JSON walks
+      (`weights`/`nodes_considered`), and the index shard-sort under
+      `budget: None`.
 - [x] Scheduler performance measurement stack
       ([plan](plans/scheduler-performance-plan.md),
       [calls](calls/scheduler-performance-plan_calls.md),
@@ -389,9 +390,9 @@ Plans: [persistence-plan.md](plans/persistence-plan.md), [multi-raft-persistence
         (`create_instance`) that duplicates the instance. Fold the record
         into the mutating op's own capture (it is JC-28 commutative, so any
         lane may carry it). Found by the 2026-07-28 split inventory.
-  - [ ] Eval NotRaftLeader retries are a flat 5s forever; with the churn
-        loops fixed this only delays split-parked evals, but backoff +
-        jitter would quiet the logs.
+  - [x] Eval NotRaftLeader retries back off exponentially (5s base → 60s
+        cap, 1s jitter, in-process attempt tracking that resets on
+        completion or failover) instead of a flat 5s forever (2026-07-30).
   - [ ] `destroy_job` under a standing split half-applies from the status/
         scheduler side (cleanups land, control delete rejected) until a
         retry against the control leader completes it. Consider reordering
