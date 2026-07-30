@@ -59,6 +59,7 @@ When one is required and what goes in it:
 | [durability-and-ops-execution-plan.md](plans/durability-and-ops-execution-plan.md) | executed (workstreams A/B/C/D + adversarial verification, 2026-07-28); lanes topology opt-in |
 | [job-templates-plan.md](plans/job-templates-plan.md) | in execution |
 | [kv-reactive-task-updates-plan.md](plans/kv-reactive-task-updates-plan.md) | shipped |
+| [late-binding-plan-apply-plan.md](plans/late-binding-plan-apply-plan.md) | planned |
 | [persistence-plan.md](plans/persistence-plan.md) | phases 0–1, 3 done |
 | [preemption-and-eviction-plan.md](plans/preemption-and-eviction-plan.md) | planned |
 | [multi-cluster-federation-plan.md](plans/multi-cluster-federation-plan.md) | planned |
