@@ -2371,29 +2371,14 @@ impl Store {
         )?;
         let placements = Self::parse_plan_submission_placements(&placements_json)?;
 
-        let mut nodes_by_id: HashMap<String, Node> = HashMap::new();
-        if !placements.is_empty() {
-            let node_ids: Vec<String> = placements
-                .iter()
-                .flat_map(|placement| placement.candidates.iter().cloned())
-                .collect::<HashSet<_>>()
-                .into_iter()
-                .collect();
-            let placeholders = std::iter::repeat_n("?", node_ids.len())
-                .collect::<Vec<_>>()
-                .join(",");
-            let sql = format!(
-                "SELECT {NODE_JOINED_ATTRS} {NODE_JOINED_FROM} WHERE node.id IN ({placeholders});"
-            );
-            let mut stmt = tx.prepare(&sql)?;
-            let rows = stmt.query_map(params_from_iter(node_ids.iter()), |row| {
-                self.node_from_row(row)
-            })?;
-            for row in rows {
-                let node = row?;
-                nodes_by_id.insert(node.id.clone(), node);
-            }
-        }
+        // Node rows load LAZILY, per candidate actually attempted, memoized
+        // for the plan. The walk usually binds rank 0, so eagerly loading
+        // the whole candidate union would parse ~k× more node-attr JSON
+        // than the pre-candidate code for nothing (measurable at 10k
+        // nodes); a placement only pays for the rows its skips touched.
+        let mut nodes_by_id: HashMap<String, Option<Node>> = HashMap::new();
+        let node_row_sql =
+            format!("SELECT {NODE_JOINED_ATTRS} {NODE_JOINED_FROM} WHERE node.id = ?1;");
 
         let mut allocations = Vec::new();
         let mut candidate_ranks: Vec<usize> = Vec::new();
@@ -2439,7 +2424,16 @@ impl Store {
                 // the operator just drained, and nothing ever reconciled the
                 // placement away. With candidates, the same race costs a
                 // fallback rank instead of a rejection.
-                let Some(node) = nodes_by_id.get(node_id) else {
+                let node = match nodes_by_id.entry(node_id.clone()) {
+                    Entry::Occupied(entry) => entry.into_mut(),
+                    Entry::Vacant(entry) => {
+                        let row = tx
+                            .query_row(&node_row_sql, [node_id], |row| self.node_from_row(row))
+                            .optional()?;
+                        entry.insert(row)
+                    }
+                };
+                let Some(node) = node else {
                     if first_skip_reason.is_none() {
                         first_skip_reason = Some(format!("node {node_id} no longer exists"));
                     }

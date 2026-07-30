@@ -87,3 +87,34 @@ and the requeue backstop absorbs what the retry budget does not: zero
 failed evals in every cell, both modes. The `k=0` rows also show the
 Phase 1 backstop working alone (requeues > 0 at N=128, still zero
 drops).
+
+## Criterion guard — late-binding candidate lists (2026-07-29)
+
+Same-machine interleaved runs (base = the merge-base of the late-binding
+branch), `cargo bench --bench scheduler_bench`. Two findings shaped the
+final shape of the change:
+
+- An early cut of the apply path eagerly prefetched node rows for the
+  whole candidate UNION and measured ~1.9× slower on the 10k-node
+  plan-and-apply cell; rows now load lazily per candidate actually
+  attempted (the walk usually binds rank 0), which returned the cell to
+  parity. The below-band fallback also uses partial selection instead of
+  a full per-placement sort.
+- What remains is the honest price of building ranked lists at plan time:
+
+| Bench | Shape | Base | Late-binding |
+| --- | --- | --- | --- |
+| `candidate_construction` | 12 tasks × 2, 1k nodes, indexes off / on | 1.37 / 1.35 ms | 1.51 ms (+10%) / 1.50 ms (+11%) |
+| `candidate_construction` | 12 tasks × 2, 5k nodes, indexes off / on | 8.39 / 6.54 ms | 8.71 ms (+4%) / 6.85 ms (+5%) |
+| `candidate_construction` | 12 tasks × 2, 10k nodes, indexes off / on | 19.7 / 14.6 ms | 20.2 ms (+3%) / 14.8 ms (+2%) |
+| `scheduler_speed` (plan-and-apply) | 10 jobs × 10 allocs, 1k nodes | 6.18 ms | 6.28 ms (+1.6%) |
+| `scheduler_speed` (plan-and-apply) | 10 jobs × 10 allocs, 10k nodes | 71.4 ms | 80.0 / 67.3 ms (two rounds; parity within run noise) |
+
+Reading: single-planner, uncontended plan/apply cost is unchanged within
+noise on the end-to-end cells; plan-only construction pays a few percent
+(highest on small fleets, where the absolute cost is ~1.5 ms) for the
+band partition, tail sampling, and per-placement candidate vectors.
+Against the contention table above — conflicts eliminated at headroom,
+2–5× faster time-to-all-placed under bursts — the trade is decisively
+worth it. Revisit only if profiling shows the tail sampling on the plan
+path of a latency-sensitive fleet.
