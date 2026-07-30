@@ -5484,6 +5484,120 @@ mod tests {
         Ok(())
     }
 
+    /// Apply-time re-validation of node resource TOTALS (TODO from the
+    /// 2026-07-28 adversarial pass): a worker re-registration that shrinks
+    /// capacity between the plan snapshot and the apply bumps no allocation
+    /// epoch — the version CAS structurally cannot see it — so the apply
+    /// transaction itself must rebuild the node's free pool and reject the
+    /// stale placement.
+    #[test]
+    fn apply_rejects_when_node_capacity_shrank_since_the_plan_snapshot() -> R<()> {
+        let store = setup_store()?;
+        // 8192 MiB of fingerprinted memory: the 6000 MiB task fits.
+        store.insert_node(make_node_msg("node-a", json!({})))?;
+
+        let job_config_id = submit_job(
+            &store,
+            "shrink-race",
+            vec![TaskConfig {
+                resources: json!({ "memory": 6000 }),
+                ..TaskConfig::new("api", "noop")
+            }],
+        )?;
+        let task_id = task_id_for(&store, &job_config_id, "api")?;
+
+        // The submission a planner snapshotting the 8192 MiB node would
+        // produce, with expected versions matching the CURRENT epochs so
+        // the compare-and-set passes — proving the rejection below comes
+        // from the capacity recheck, not the epoch fence.
+        let expected = BTreeMap::from([
+            (format!("job_config:{job_config_id}"), 0),
+            ("node:node-a".to_string(), 0),
+        ]);
+        let submission = store.insert_plan_submission(
+            &job_config_id,
+            "fresh",
+            &[("node-a".to_string(), task_id)],
+            &expected,
+        )?;
+
+        // Node re-registers with 2 GiB before the apply. Registration is a
+        // control-lane upsert that bumps no allocation epoch.
+        store.insert_node(make_node_msg_with_sources(
+            "node-a",
+            json!({}),
+            json!({ "memory_total": "2147483648" }),
+            json!({}),
+        ))?;
+
+        match store.apply_plan_submission(&submission)? {
+            crate::storage::store::PlanApplyOutcome::Rejected { reason, .. } => {
+                assert!(
+                    reason.contains("no longer has capacity"),
+                    "rejection must name the capacity recheck: {reason}"
+                );
+            }
+            crate::storage::store::PlanApplyOutcome::Applied(allocations) => {
+                panic!(
+                    "plan applied {} placements onto a node that shrank below the task's ask",
+                    allocations.len()
+                )
+            }
+        }
+        assert!(store.allocs_for_node("node-a")?.is_empty());
+
+        Ok(())
+    }
+
+    /// The recheck must mirror the planner's ledger exactly for a Fresh
+    /// plan: the planned JOB's surviving allocation rows (a job_submit
+    /// deletes the previous config's rows only after the apply) are
+    /// excluded from the reconstruction, so a same-capacity re-apply is
+    /// not spuriously rejected as over capacity.
+    /// `fresh_replan_ignores_the_jobs_own_outgoing_allocations` covers the
+    /// cross-config (v1 → v2) half of the same property.
+    #[test]
+    fn apply_capacity_recheck_does_not_double_count_a_fresh_plans_own_config() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", json!({})))?;
+
+        // First plan fills most of the node: 6000 of 8192 MiB.
+        let job_config_id = submit_job(
+            &store,
+            "self-replace",
+            vec![TaskConfig {
+                resources: json!({ "memory": 6000 }),
+                ..TaskConfig::new("api", "noop")
+            }],
+        )?;
+        let scheduler = Scheduler::new(&store)?;
+        let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
+        assert_eq!(outcome.allocations.len(), 1);
+
+        // A second Fresh plan for the SAME config (the planner drops the
+        // config's own allocations from its ledger). If the apply-time
+        // reconstruction counted the surviving row, 6000 + 6000 > 8192
+        // would reject a plan the planner legitimately built.
+        let task_id = task_id_for(&store, &job_config_id, "api")?;
+        let epochs = store.allocation_version_vector_for_candidates(&job_config_id, &["node-a"])?;
+        let submission = store.insert_plan_submission(
+            &job_config_id,
+            "fresh",
+            &[("node-a".to_string(), task_id)],
+            &epochs,
+        )?;
+        match store.apply_plan_submission(&submission)? {
+            crate::storage::store::PlanApplyOutcome::Applied(allocations) => {
+                assert_eq!(allocations.len(), 1);
+            }
+            crate::storage::store::PlanApplyOutcome::Rejected { reason, .. } => {
+                panic!("fresh-mode self-replacement must not be double counted: {reason}")
+            }
+        }
+
+        Ok(())
+    }
+
     #[test]
     fn lazy_version_sample_is_the_default_and_fences_a_second_job() -> R<()> {
         let store = setup_store()?;

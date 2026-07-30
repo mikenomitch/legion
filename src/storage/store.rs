@@ -3,7 +3,7 @@
 
 use crate::constraints::{ConstraintSet, DistinctTracker, PermitSet};
 use crate::prelude::*;
-use crate::resources::{ResourcePolicy, ResourcePool};
+use crate::resources::{ResourcePolicy, ResourcePool, ResourceRequest};
 use crate::scheduling_index::{IndexSet, IndexSettings};
 use crate::storage::errors::StorageError;
 use crate::storage::events::{drafts, EventDraft, SchedulerEventFilter, SchedulerEventRecord};
@@ -2579,10 +2579,10 @@ impl Store {
             });
         }
 
-        let placements_json: String = tx.query_row(
-            "SELECT placements FROM plan_submission WHERE id = ?1;",
+        let (placements_json, plan_mode): (String, String) = tx.query_row(
+            "SELECT placements, mode FROM plan_submission WHERE id = ?1;",
             [submission.id],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
         let placements: Vec<(String, i64)> = serde_json::from_str(&placements_json)?;
 
@@ -2610,8 +2610,50 @@ impl Store {
             }
         }
 
+        // Free pools reconstructed INSIDE the apply transaction, from the
+        // fresh node rows and the allocation rows this transaction can see
+        // (the same rows the read model projects — no status filter). This
+        // closes the last unfenced plan input (2026-07-28 adversarial
+        // pass): a worker re-registration that SHRINKS capacity — or
+        // changes `reservedResources` / `maxAllocations` — between the
+        // planner's snapshot and this apply bumps no allocation epoch, so
+        // the version CAS above structurally cannot see it, and without
+        // this recheck the plan commits placements exceeding the node's
+        // new totals. Ports were already apply-safe (re-read in
+        // `assign_allocation_network`); resources now match.
+        let mut free_pools: HashMap<String, ResourcePool> = HashMap::new();
+        {
+            // Mirror the planner's ledger view: a Fresh plan replaces the
+            // JOB's allocations wholesale, so `plan_and_apply` drops every
+            // allocation of the planned config's job before planning
+            // (`drop_replaced`) — `handle_job_submit` only deletes the
+            // previous config's rows after this apply, so those rows are
+            // still in the table here and must not be double counted.
+            // Reschedule plans drop nothing.
+            let mut stmt = tx.prepare(
+                "SELECT a.id, a.resources FROM allocation a \
+                 WHERE a.node_id = ?1 AND (?2 = 0 OR a.job_config_id NOT IN (\
+                     SELECT id FROM job_config WHERE job_id = \
+                         (SELECT job_id FROM job_config WHERE id = ?3)));",
+            )?;
+            let drop_own = i64::from(plan_mode == "fresh");
+            for (node_id, node) in &nodes_by_id {
+                let rows = Self::collect_rows(stmt.query_map(
+                    params![node_id, drop_own, submission.job_config_id],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Value>(1)?)),
+                )?)?;
+                let pool = ResourcePool::free_from_rows(
+                    node,
+                    rows.iter().map(|(id, resources)| (*id, resources)),
+                    &self.resource_policy,
+                );
+                free_pools.insert(node_id.clone(), pool);
+            }
+        }
+
         let mut allocations = Vec::new();
         let mut task_states: HashMap<i64, AllocationTaskState> = HashMap::new();
+        let mut task_requests: HashMap<i64, ResourceRequest> = HashMap::new();
         for (node_id, task_id) in &placements {
             let state = match task_states.entry(*task_id) {
                 Entry::Occupied(entry) => entry.into_mut(),
@@ -2634,7 +2676,26 @@ impl Store {
             // without this check a plan placed onto a node the operator
             // just drained, and nothing ever reconciled the placement away.
             let unavailable = node.availability != "available";
+            let request = match task_requests.entry(*task_id) {
+                Entry::Occupied(entry) => Some(entry.into_mut()),
+                Entry::Vacant(entry) => self
+                    .resource_policy
+                    .normalize_task_resources(&state.resources, false)
+                    .and_then(|normalized| ResourceRequest::from_value(&normalized))
+                    .ok()
+                    .map(|request| entry.insert(request)),
+            };
+            let over_capacity = match request.as_ref() {
+                Some(request) => !free_pools
+                    .get(node_id.as_str())
+                    .is_some_and(|pool| pool.can_fit(request)),
+                // Unparseable task resources fit nowhere — the same
+                // fits-nothing posture as `ResourcePool::free_from_rows`
+                // takes for an unparseable node or allocation row.
+                None => true,
+            };
             if unavailable
+                || over_capacity
                 || !state
                     .constraints
                     .is_satisfied(node, state.distinct.as_ref())
@@ -2644,6 +2705,11 @@ impl Store {
                     format!(
                         "Node {} is {} (cordoned, draining, or lost since the plan snapshot)",
                         node_id, node.availability
+                    )
+                } else if over_capacity {
+                    format!(
+                        "Node {} no longer has capacity for task {} (its resource totals changed since the plan snapshot)",
+                        node_id, task_id
                     )
                 } else {
                     format!(
@@ -2676,6 +2742,15 @@ impl Store {
                     reason,
                     latest_versions,
                 });
+            }
+
+            // Debit this placement so later placements in the SAME plan see
+            // the reduced pool — the in-tx mirror of the planner's ledger
+            // consume.
+            if let (Some(request), Some(pool)) =
+                (request.as_deref(), free_pools.get_mut(node_id.as_str()))
+            {
+                pool.consume(request);
             }
 
             if let Some(tracker) = state.distinct.as_mut() {

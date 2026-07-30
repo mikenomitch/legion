@@ -162,16 +162,17 @@ How to use it:
       *availability* on the fresh row, closing the cordon/lost race the
       epoch CAS structurally cannot see.
       [Calls #4](calls/durability-and-ops-execution-plan_calls.md)
-- [ ] Apply-time re-validation of node resource TOTALS: a worker
-      re-registration that shrinks capacity (or `reservedResources` /
-      `maxAllocations` changes) between plan snapshot and apply bumps no
-      allocation epoch and is not re-checked at apply — a plan can commit
-      placements exceeding the node's new capacity. Ports are apply-safe
-      (re-read in the apply tx); resources are the odd one out. Needs
-      ledger reconstruction inside the apply tx (cheaper now that
-      `node_pools` caches free capacity), or an epoch bump on
-      resource-affecting node updates (cross-lane under `lanes` — wants a
-      plan). Found by the 2026-07-28 adversarial pass.
+- [x] Apply-time re-validation of node resource TOTALS (2026-07-30): the
+      plan-apply transaction reconstructs each placement node's free pool
+      from the fresh node row and the allocation rows the transaction can
+      see (`ResourcePool::free_from_rows`), mirroring the planner's ledger
+      (Fresh plans exclude the replaced job's own rows), and rejects
+      placements a capacity shrink no longer fits — closing the window
+      where a worker re-registration shrinking capacity (or
+      `reservedResources`/`maxAllocations` changes) between snapshot and
+      apply bumped no epoch and was never re-checked. Ports were already
+      apply-safe; resources now match. Found by the 2026-07-28 adversarial
+      pass.
 - [ ] Volume-pin staleness in planning: pins are read mid-plan-build with
       no epoch coupling, so a pin invalidated mid-plan (e.g.
       `volume delete --force`) can still direct a placement; later
