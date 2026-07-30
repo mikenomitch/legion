@@ -129,9 +129,11 @@ pub struct SchedulingReadModel {
     /// Free resource capacity per **available** node — fingerprinted
     /// capacity minus every current allocation's usage — recomputed for the
     /// affected node by the same reprojection pass that maintains
-    /// `indexes`. The plan-time `ResourceLedger` clones these instead of
-    /// re-parsing every node's JSON per plan.
-    pub(crate) node_pools: HashMap<String, ResourcePool>,
+    /// `indexes`. Values are `Arc`'d so the per-plan snapshot clone is a
+    /// refcount bump per node instead of a deep `ResourcePool` copy; the
+    /// plan-time `ResourceLedger` copies-on-write only the pools it
+    /// actually debits.
+    pub(crate) node_pools: HashMap<String, Arc<ResourcePool>>,
     /// Mirror of `allocation_epoch_partition`, keyed by
     /// `Store::scope_vector_key`, kept COHERENT with `allocations_by_node`
     /// (adversarial finding, 2026-07-28 — the plan-fence gap): an epoch
@@ -161,6 +163,13 @@ pub struct SchedulingReadModel {
     /// generation proves nothing either way, so the scheduler falls back to
     /// the eager whole-fleet sample.
     pub generation: u64,
+    /// The availability-filtered, id-sorted node list every plan starts
+    /// from, cached so a plan is a `Vec<Arc<Node>>` clone (refcount bumps)
+    /// instead of an O(fleet log fleet) filter + sort. Invalidated (set to
+    /// `None`) by every `nodes` mutation and rebuilt lazily on the next
+    /// plan, so churny fleets pay at most what they paid before this cache
+    /// existed.
+    pub(crate) available_nodes_cache: Option<Arc<Vec<Arc<Node>>>>,
 }
 
 #[derive(Debug)]
@@ -201,7 +210,11 @@ pub struct DeclaredService {
 /// allocations by node plus the cached free pools, cloned under one guard,
 /// and the read-model generation those were published at (the lazy
 /// version-sample fence — see [`SchedulingReadModel::generation`]).
-pub(crate) type PlanCapacityParts = (SharedNodeAllocations, HashMap<String, ResourcePool>, u64);
+pub(crate) type PlanCapacityParts = (
+    SharedNodeAllocations,
+    HashMap<String, Arc<ResourcePool>>,
+    u64,
+);
 
 #[derive(Debug, Clone)]
 pub struct PlanSubmission {
@@ -1604,6 +1617,7 @@ impl Store {
             // Placeholder: `refresh_read_model` overwrites this with the
             // previous model's counter + 1 when it publishes the rebuild.
             generation: 0,
+            available_nodes_cache: None,
         };
         let id_refs: Vec<&str> = node_ids.iter().map(String::as_str).collect();
         Self::reproject_model_nodes(&mut model, &self.resource_policy, &id_refs);
@@ -1637,7 +1651,9 @@ impl Store {
                         .unwrap_or(&[]);
                     let pool = ResourcePool::free_for_node(node, allocations, policy);
                     model.indexes.reindex_node(node, &pool);
-                    model.node_pools.insert((*node_id).to_string(), pool);
+                    model
+                        .node_pools
+                        .insert((*node_id).to_string(), Arc::new(pool));
                 }
                 _ => {
                     model.node_pools.remove(*node_id);
@@ -1684,6 +1700,7 @@ impl Store {
         let mut guard = self.read_model_writer()?;
         let node_id = node.id.clone();
         guard.nodes.insert(node_id.clone(), Arc::new(node));
+        guard.available_nodes_cache = None;
         Self::reproject_model_nodes(&mut guard, &self.resource_policy, &[node_id.as_str()]);
         Ok(())
     }
@@ -1698,6 +1715,7 @@ impl Store {
             .get_mut(node_id)
             .with_context(|| format!("Missing cached node {node_id}"))?;
         Arc::make_mut(cached).dynamic_attrs = dynamic_attrs;
+        guard.available_nodes_cache = None;
         Self::reproject_model_nodes(&mut guard, &self.resource_policy, &[node_id]);
         Ok(())
     }
@@ -1714,6 +1732,7 @@ impl Store {
                 node.availability = "unavailable".to_string();
             }
         }
+        guard.available_nodes_cache = None;
         let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
         Self::reproject_model_nodes(&mut guard, &self.resource_policy, &id_refs);
         Ok(())
@@ -1728,6 +1747,7 @@ impl Store {
         guard.allocations_by_node.remove(id);
         guard.indexes.remove_node(id);
         guard.node_pools.remove(id);
+        guard.available_nodes_cache = None;
         // Removing a node removes its allocations from the capacity view.
         guard.generation = guard.generation.wrapping_add(1);
         Ok(())
@@ -1880,17 +1900,35 @@ impl Store {
     }
 
     /// The scheduler's per-plan node snapshot: every available node, sorted
-    /// by id, as `Arc`s — one read-lock pass, refcount bumps only.
+    /// by id, as `Arc`s. Served from the read model's cached list when the
+    /// node set is unchanged since the last plan (the overwhelmingly common
+    /// case — one `Vec` of refcount bumps); rebuilt lazily after any node
+    /// mutation invalidates it.
     pub fn available_node_arcs(&self) -> R<Vec<Arc<Node>>> {
-        let guard = self.read_model_reader()?;
-        let mut nodes: Vec<Arc<Node>> = guard
-            .nodes
-            .values()
-            .filter(|node| node.availability == "available")
-            .cloned()
-            .collect();
-        nodes.sort_by(|a, b| a.id.cmp(&b.id));
-        Ok(nodes)
+        {
+            let guard = self.read_model_reader()?;
+            if let Some(cache) = guard.available_nodes_cache.as_ref() {
+                return Ok(Vec::clone(cache));
+            }
+        }
+        let mut guard = self.read_model_writer()?;
+        // Re-check: another plan may have rebuilt it while we waited.
+        if guard.available_nodes_cache.is_none() {
+            let mut nodes: Vec<Arc<Node>> = guard
+                .nodes
+                .values()
+                .filter(|node| node.availability == "available")
+                .cloned()
+                .collect();
+            nodes.sort_by(|a, b| a.id.cmp(&b.id));
+            guard.available_nodes_cache = Some(Arc::new(nodes));
+        }
+        Ok(Vec::clone(
+            guard
+                .available_nodes_cache
+                .as_ref()
+                .expect("cache rebuilt above"),
+        ))
     }
 
     /// The scheduler's per-plan capacity snapshot: current allocations and
@@ -12252,6 +12290,41 @@ mod tests {
         let node = model.nodes.get("node-one").context("missing cached node")?;
         assert_eq!(node.status, "lost");
         assert_eq!(node.availability, "unavailable");
+
+        Ok(())
+    }
+
+    #[test]
+    fn available_node_cache_tracks_node_mutations() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("cache-a", "active"))?;
+        store.insert_node(make_node_msg("cache-b", "active"))?;
+
+        let first = store.available_node_arcs()?;
+        assert_eq!(
+            first.iter().map(|n| n.id.as_str()).collect::<Vec<_>>(),
+            vec!["cache-a", "cache-b"],
+            "sorted by id"
+        );
+        // Second read is served from the cache and must be identical.
+        let second = store.available_node_arcs()?;
+        assert_eq!(second.len(), 2);
+        assert!(
+            Arc::ptr_eq(&first[0], &second[0]),
+            "cache serves the same Arcs"
+        );
+
+        // A lost node must drop out on the next read.
+        store.mark_nodes_as_lost(&["cache-a".to_string()])?;
+        let after_lost = store.available_node_arcs()?;
+        assert_eq!(
+            after_lost.iter().map(|n| n.id.as_str()).collect::<Vec<_>>(),
+            vec!["cache-b"]
+        );
+
+        // A removed node must drop out too.
+        store.remove_node("cache-b")?;
+        assert!(store.available_node_arcs()?.is_empty());
 
         Ok(())
     }

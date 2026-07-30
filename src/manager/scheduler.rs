@@ -163,7 +163,7 @@ struct BuiltPlan {
 /// ledger recomputes exactly those nodes from scratch.
 struct CapacitySnapshot {
     allocations_by_node: SharedNodeAllocations,
-    pools: HashMap<String, ResourcePool>,
+    pools: HashMap<String, Arc<ResourcePool>>,
     freed_nodes: HashSet<String>,
     /// Read-model generation this snapshot was published at — what the
     /// lazy version sample compares against at submit time (see
@@ -177,9 +177,12 @@ enum NodesConsidered {
     Percent(f64),
 }
 
+/// Plan-time free-capacity ledger. Pools are `Arc`'d straight off the
+/// read-model snapshot; `consume` copies-on-write only the pools this plan
+/// actually debits, so building the ledger never deep-clones the fleet.
 #[derive(Debug, Clone)]
 struct ResourceLedger {
-    pools: HashMap<String, ResourcePool>,
+    pools: HashMap<String, Arc<ResourcePool>>,
 }
 
 struct TaskPlan<'a> {
@@ -2930,7 +2933,7 @@ impl ResourceLedger {
     /// candidate node with no cached pool (removed or drained between the
     /// node and capacity snapshots) simply fits nothing.
     fn from_snapshot(
-        mut pools: HashMap<String, ResourcePool>,
+        mut pools: HashMap<String, Arc<ResourcePool>>,
         freed_nodes: &HashSet<String>,
         node_lookup: &HashMap<&str, &Node>,
         allocations_by_node: &SharedNodeAllocations,
@@ -2946,7 +2949,7 @@ impl ResourceLedger {
                 .unwrap_or(&[]);
             pools.insert(
                 node_id.clone(),
-                ResourcePool::free_for_node(node, allocations, policy),
+                Arc::new(ResourcePool::free_for_node(node, allocations, policy)),
             );
         }
         ResourceLedger { pools }
@@ -2967,7 +2970,8 @@ impl ResourceLedger {
         if !pool.can_fit(request) {
             bail!("node {node_id} does not have required resources");
         }
-        pool.consume(request);
+        // Copy-on-write: only pools a plan debits are ever deep-cloned.
+        Arc::make_mut(pool).consume(request);
         Ok(())
     }
 }
@@ -4002,7 +4006,7 @@ mod tests {
         let mut distinct_tracker = DistinctTracker::new(&constraint_set.distinct_keys());
         let mut pools = HashMap::new();
         for node in &nodes {
-            pools.insert(node.id.clone(), ResourcePool::from_node(node)?);
+            pools.insert(node.id.clone(), Arc::new(ResourcePool::from_node(node)?));
         }
         let mut resource_ledger = ResourceLedger { pools };
         let request =
@@ -4269,7 +4273,10 @@ mod tests {
         let request =
             ResourceRequest::from_value(&json!({"memory": 256, "cpu": 100, "allocations": 1}))?;
         let mut pools = HashMap::new();
-        pools.insert("node-a".to_string(), ResourcePool::from_node(&nodes[0])?);
+        pools.insert(
+            "node-a".to_string(),
+            Arc::new(ResourcePool::from_node(&nodes[0])?),
+        );
         let mut ledger = ResourceLedger { pools };
         let allocations_by_node = SharedNodeAllocations::new();
         let mut planned: HashMap<String, usize> = HashMap::new();
