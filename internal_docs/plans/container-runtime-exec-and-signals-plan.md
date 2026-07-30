@@ -6,9 +6,10 @@
 
 The `container` task runtime's four remaining core gaps, one plan, one goal:
 Linux production parity with the macOS dev experience, and a capability table
-without ❌s in its core rows. Sequenced so the first three phases share one
+without ❌s in its core rows. Sequenced so the early phases share one
 mechanism (shelling out to a runtime subcommand addressed by container name)
-and the last two extend the bundle/launch surface the runtime already owns:
+and the later ones extend the bundle/cgroup and launch surfaces the runtime
+already owns:
 
 1. **Exec does not work on Linux.** `legion exec`, the UI terminal, MCP
    one-shot exec, *and declared actions* all fail against container tasks on
@@ -20,14 +21,20 @@ and the last two extend the bundle/launch surface the runtime already owns:
    all.
 3. **Linux containers run unconstrained.** Declared `resources.memory` /
    `resources.cores` size the guest VM on macOS but set no cgroup limits on
-   Linux — the scheduler reserves capacity the kernel never enforces.
+   Linux, and `resources.cpu` (MHz) is enforced nowhere — the scheduler
+   reserves capacity the kernel never sees. The fix is Nomad's model: hard
+   memory limits, `cores` as *exclusive pinned cores* (cpuset), and MHz as
+   proportional `cpu.weight`.
 4. **The task directory is invisible inside the container**, which is the one
    limitation behind three capability-table ❌s at once: KV *file* injection,
    identity *file* delivery, and file/tree artifacts.
 
-Deliberately deferred (see Non-goals): jobspec `stopSignal`/`stopGracePeriod`
-knobs, Linux port mapping / network namespaces, cpuset pinning, alloc-dir
-sharing between tasks.
+Graceful teardown ships with task-level `stopSignal` / `stopGracePeriod`
+jobspec knobs (defaults `SIGTERM` / `10s`), honored by the container runtime
+on both platforms and by the exec runtime.
+
+Deliberately deferred (see Non-goals): Linux port mapping / network
+namespaces, NUMA/SMT-aware core placement, alloc-dir sharing between tasks.
 
 ---
 
@@ -71,8 +78,11 @@ bundle's `linux.resources` carries only the device cgroup rule
 (`src/task_plugins/oci_bundle.rs:481`). The scheduler subtracts the
 declaration from the node's capacity, but the kernel enforces nothing, so one
 leaking container can consume the whole node and take every co-scheduled
-allocation down with it. The scheduler's bookkeeping and the node's reality
-disagree — on the platform where multiple containers actually share a kernel.
+allocation down with it. `resources.cpu` (MHz) is worse still — it is
+scheduling arithmetic on *every* platform, so two containers that declared
+100 and 4000 MHz contend as equals the moment the node is busy. The
+scheduler's bookkeeping and the node's reality disagree — on the platform
+where multiple containers actually share a kernel.
 
 **File delivery.** The worker stages artifacts, renders KV files, and writes
 identity tokens into the allocation's *host* task directory — and the
@@ -90,10 +100,13 @@ rotation) that file delivery exists to provide.
 
 - **Docker** ([docs](https://docs.docker.com/reference/cli/docker/container/stop/)):
   `docker exec -it`, and `docker stop` = SIGTERM, wait 10 s (`-t`), then
-  SIGKILL; `docker kill --signal` for arbitrary signals. The 10-second
+  SIGKILL; `docker kill --signal` for arbitrary signals; images can declare
+  `STOPSIGNAL`, which `stop` honors when no override is given. The 10-second
   TERM→KILL default is the industry's shared muscle memory. **Take:** the
-  default; the exec UX. **Reject:** per-command `-t` tuning for now (no knob
-  until someone needs it).
+  defaults, the exec UX, and honoring the image's `StopSignal` as the middle
+  layer of the default chain. **Reject:** per-*invocation* `-t` tuning — the
+  knob belongs on the task in the jobspec, where it is declared once and
+  audited, not retyped per stop.
 - **runc / crun / youki** (OCI runtime CLIs): `exec [--tty] <id> <cmd…>` runs a
   process inside the container, building its process spec from the bundle's
   `config.json` (env/cwd/user inherited, argv replaced) unless `--process` is
@@ -105,30 +118,38 @@ rotation) that file delivery exists to provide.
 - **Nomad** ([alloc exec](https://developer.hashicorp.com/nomad/docs/commands/alloc/exec),
   [`kill_signal`/`kill_timeout`](https://developer.hashicorp.com/nomad/docs/job-specification/task)):
   per-driver exec capability, `nomad alloc signal`, and per-task
-  `kill_signal`/`kill_timeout` jobspec knobs. **Take:** the per-runtime
-  capability report (Legion already has `ExecSupport`) and graceful-kill
-  semantics. **Reject for now:** the jobspec knobs and a user-facing signal
-  verb — surface we can add later without breaking anything (non-goals).
+  `kill_signal`/`kill_timeout` jobspec knobs (defaults SIGINT—sic—and 5 s,
+  client-side `max_kill_timeout` cap). **Take:** the per-runtime capability
+  report (Legion already has `ExecSupport`), graceful-kill semantics, and the
+  two task-level knobs — as `stopSignal`/`stopGracePeriod`, with docker's
+  friendlier SIGTERM/10 s defaults and an admission-time cap instead of a
+  client config knob. **Reject for now:** a user-facing `alloc signal` verb —
+  additive later, and `changeSignal` already covers the declared-refresh case.
 - **Kubernetes** (CRI `Exec`/`ExecSync`, `terminationGracePeriodSeconds`):
   kubelet asks the CRI for a streaming exec URL; termination is
   TERM → grace period → KILL, with preStop hooks. **Take:** the termination
   shape. **Reject:** the streaming-URL indirection — Legion's frame protocol
   and worker-side PTY already exist and work
   ([docs/exec-and-actions.md](../../docs/exec-and-actions.md)).
-- **Resource limits — docker, Nomad, K8s, and the OCI spec.** Docker's
-  `--cpus=N` is implemented as CFS bandwidth (`cpu.quota = N × cpu.period`),
-  not pinning; `--memory` is a hard cgroup limit. Nomad's docker driver does
-  the same for `cpu`/`memory`, and its `resources.cores` *reserves whole
-  cores* via cpuset — which requires the client to account core assignments
-  across every allocation on the node. K8s adds requests-vs-limits and QoS
-  classes on top. The OCI runtime spec carries all of it declaratively in
-  `linux.resources` — the runtime creates the cgroup and applies limits;
-  Legion only has to write JSON it already generates.
-  **Take:** docker's quota semantics for `cores` (matches what macOS `--cpus`
-  already means for the same field) and hard memory limits. **Reject:** cpuset
-  pinning (a cluster-wide core-accounting subsystem for a benefit Legion's
-  scheduler doesn't model yet) and the K8s requests/limits split (Legion has
-  one `resources` block; keeping it one concept is the simplicity bet).
+- **Resource limits — Nomad, docker, K8s, and the OCI spec.** Nomad's model
+  ([cpuset management](https://developer.hashicorp.com/nomad/docs/concepts/cpu)):
+  the client partitions usable CPUs into a **share slice** and a **reserve
+  slice**; a task declaring `cores` gets whole CPUs moved from share to
+  reserve, exclusively; every other task lives in the share slice with
+  `cpu.weight` derived from its declared MHz, so contention degrades
+  *proportionally to what was declared*. The scheduler counts cores
+  numerically — the *client* picks which physical cores. Docker's `--cpus=N`
+  is CFS bandwidth (quota/period) with no exclusivity; `--memory` is a hard
+  cgroup limit everywhere. K8s adds requests-vs-limits and QoS classes. The
+  OCI runtime spec carries all of it declaratively in `linux.resources` — the
+  runtime creates the cgroup and applies whatever the spec says.
+  **Take:** Nomad's model wholesale — share/reserve cpuset partition,
+  worker-side core allocator, MHz → `cpu.weight` — plus hard memory limits.
+  **Reject:** docker-style CFS quota for `cores` (throttling admits tail
+  latency that pinning exists to remove, and it leaves MHz meaningless), the
+  K8s requests/limits split (Legion has one `resources` block; keeping it one
+  concept is the simplicity bet), and Nomad's NUMA-aware placement (deferred,
+  see non-goals).
 - **Task filesystem into containers — Nomad, docker, K8s.** Nomad mounts the
   alloc/task/secrets dirs into every docker container at canonical in-container
   paths (`/alloc`, `/local`, `/secrets`) and points `NOMAD_TASK_DIR` at the
@@ -159,6 +180,12 @@ rotation) that file delivery exists to provide.
   signal), so I don't take a full restart every few hours.
 - When I declare memory for my container, I want a leak in *my* service to
   kill *my* container, so it doesn't become the neighboring team's incident.
+- When my service is latency-sensitive, I want the cores I declared to be
+  *mine* — not shared with whatever else landed on the node — so my p99
+  doesn't depend on my neighbors' load.
+- When my database needs more than ten seconds to checkpoint on shutdown, I
+  want to say so in the jobspec, so a routine reschedule doesn't force-kill it
+  mid-flush.
 - When my app expects a config file or a data file at startup, I want to
   declare it in the jobspec and read it from a well-known path inside the
   container, so I don't rebuild the image for every config change.
@@ -170,6 +197,9 @@ rotation) that file delivery exists to provide.
 - When I pack multiple teams' containers onto a node, I want the limits the
   scheduler placed against to be the limits the kernel enforces, so one bad
   deploy can't take out the node.
+- When the node is saturated, I want CPU to degrade in proportion to what
+  each job declared, so the 4000-MHz service doesn't lose a coin flip to the
+  100-MHz cron job.
 
 **Security / platform admin**
 - When a service needs a rotating credential, I want it delivered as a file
@@ -185,10 +215,11 @@ rotation) that file delivery exists to provide.
 1. An engineer runs `legion exec --job api -it -- /bin/sh` against a job on a
    Linux worker running youki. A shell opens inside the container, `env` shows
    the task's env, `exit 3` propagates exit code 3 to their terminal.
-2. A rollout replaces an allocation. The old container gets SIGTERM, the app
-   closes its listeners and exits within the grace window, and the worker
-   reaps it — `delete --force` never fires. A hung container is force-deleted
-   after 10 s.
+2. A rollout replaces an allocation. The old container gets its `stopSignal`
+   (default SIGTERM), the app closes its listeners and exits within
+   `stopGracePeriod`, and the worker reaps it — `delete --force` never fires.
+   A hung container is force-deleted at the deadline. A database task that
+   declared `stopGracePeriod: '90s'` gets its full checkpoint window.
 3. A job declares `identity { changeMode: 'signal', changeSignal: 'SIGHUP' }`
    on a container task. Submission is accepted; on token refresh the app gets
    SIGHUP inside the container.
@@ -201,6 +232,12 @@ rotation) that file delivery exists to provide.
    `changeMode: signal`. The container reads both at the declared paths; when
    the KV key changes or the token rotates, the files are atomically replaced
    and the app gets its SIGHUP — no restart, no image rebuild.
+6. A latency-sensitive service declares `resources: { cores: 2 }` on a Linux
+   node. The worker assigns it two specific cores, removes them from every
+   other container's CPU set, and `grep Cpus_allowed_list /proc/self/status`
+   inside the container shows exactly those two. A batch job on the same node
+   declaring `cpu: 500` shares the remaining cores at a weight proportional
+   to 500 MHz.
 
 ## 4. Goals and non-goals
 
@@ -211,11 +248,14 @@ rotation) that file delivery exists to provide.
 - The container runtime reports `supports_signal() == true` and delivers
   signals to the container init on both platforms; `changeMode: signal` is
   accepted for container tasks.
-- Linux container teardown becomes graceful: SIGTERM → bounded wait →
-  `delete --force`.
-- Declared `resources.memory` / `resources.cores` are kernel-enforced on
-  Linux via the bundle's `linux.resources` — the same fields that already
-  size the macOS guest, with the same declared-only semantics.
+- Container teardown becomes graceful and *declarable*: task-level
+  `stopSignal` / `stopGracePeriod` jobspec fields (defaults `SIGTERM` /
+  `10s`), honored by the container runtime on both platforms and by the exec
+  runtime; Linux stop becomes signal → bounded wait → `delete --force`.
+- Declared resources are kernel-enforced on Linux with Nomad's semantics:
+  `memory` a hard limit, `cores` exclusive pinned CPUs (worker-assigned
+  cpuset, share/reserve partition), `cpu` (MHz) proportional `cpu.weight` —
+  so no `resources` field is scheduling-only on Linux anymore.
 - The task directory is mounted into the container at a canonical path, and
   `supports_kv_file_injection()` / `supports_identity_file()` flip to true:
   KV file injection, identity file delivery, and file/tree artifacts work in
@@ -228,16 +268,21 @@ rotation) that file delivery exists to provide.
 **Non-goals** (each stays on
 [TODO.md](../TODO.md) / the public docs as an honest limitation)
 
-- **Jobspec `stopSignal` / `stopGracePeriod` knobs and a `legion alloc signal`
-  CLI verb.** New user-facing surface; deferred until a job actually needs a
-  non-default value (§11 Q3). The fixed docker-style default ships first.
+- **A `legion alloc signal` CLI verb.** Additive later; `changeSignal` covers
+  the declared-refresh case and `stopSignal` the teardown case.
 - **Linux port mapping / private network namespaces.** Containers keep host
   networking; that's the networking plan's territory, not a bundle tweak.
-- **Cpuset pinning for `cores`.** Kernel-level core *reservation* needs
-  node-wide core accounting the scheduler doesn't model; CFS bandwidth gives
-  the enforcement without the subsystem (§6.4).
-- **Mapping `resources.cpu` (MHz) to `cpu.weight`.** Stays scheduling-only on
-  every platform, as today (§11 Q4).
+- **NUMA/SMT-aware core placement.** The core allocator hands out whole
+  logical CPUs with no topology awareness — no NUMA-node affinity, no
+  SMT-sibling avoidance. Nomad gates NUMA behind Enterprise for a reason;
+  revisit with a workload that measurably needs it.
+- **Excluding non-container workloads from reserved cores.** The
+  share/reserve partition governs Legion's *container* cgroups; exec-runtime
+  tasks and arbitrary host processes are outside it and may still run on
+  reserved cores (§11 Q4 tracks folding exec tasks in).
+- **CPU enforcement on macOS beyond guest sizing.** Apple `container` has no
+  weight or pinning analogue; `cpu` (MHz) remains scheduling-only there, and
+  `cores` keeps meaning VM size, not exclusivity.
 - **File-delivery destinations outside the task-dir mount.** One mount, one
   rule (§6.5); per-file bind mounts and K8s-style projection are rejected, not
   postponed.
@@ -386,41 +431,102 @@ The signal-name vocabulary stays the existing `parse_signal` set; the plugin
 passes the *name* through to the CLI rather than a number, so the runtime does
 its own resolution.
 
-### 6.3 Graceful teardown on Linux
+### 6.3 Graceful teardown, declared in the jobspec
 
-`stop()`'s Linux arm becomes the docker shape, with a fixed default:
-
-1. `<runtime> kill legion-<alloc> SIGTERM` — ignore "not running" errors (a
-   finished batch task is already gone).
-2. Poll `<runtime> state legion-<alloc>` until it reports stopped/absent, up
-   to `CONTAINER_STOP_GRACE` = **10 s** (docker's default; a constant, not a
-   knob — §11 Q3).
-3. `<runtime> delete --force legion-<alloc>` — unconditionally, as the reaper
-   for the stopped container *and* the killer for a hung one.
-4. Reap the foreground supervisor child, as today.
-
-macOS keeps delegating to `container stop` (already TERM-then-wait). `destroy`
-keeps delegating to `stop`.
-
-### 6.4 Linux cgroup limits from the resources the job already declares
-
-No new jobspec surface. The same two fields that size the macOS guest gain
-their Linux meaning, written into the generated `config.json` by `build_spec`
-(which gains the task's `resources` as a parameter):
+Two new **task-level** fields — the only new jobspec surface in this plan:
 
 ```jsonnet
-resources: { memory: 256, cores: 2 }   // MiB, core count — as today
+task: {
+  name: 'db',
+  runtime: 'container',
+  config: { image: 'postgres:16', command: ['postgres'] },
+  stopSignal: 'SIGINT',          // default 'SIGTERM'
+  stopGracePeriod: '90s',        // default '10s' (duration string, as actions' timeout)
+}
 ```
 
-becomes
+- **`stopSignal`** — the signal delivered when Legion stops the task.
+  Validated at admission against the existing `parse_signal` vocabulary
+  (`task_manager.rs:1126`). The default chain on the Linux container path is
+  docker's: jobspec `stopSignal` → the image config's `StopSignal` (Legion
+  parses the image config already) → `SIGTERM`. Apple `container stop` and
+  the exec runtime use jobspec-or-`SIGTERM` (Apple's runtime applies the
+  image's stop signal itself).
+- **`stopGracePeriod`** — how long the task gets between the signal and the
+  hard kill. Duration string, same format as action `timeout`. Validated
+  positive and capped at admission — **5 m** — so a wedged task cannot stall
+  drains and reschedules indefinitely (the cap plays the role of Nomad's
+  client-side `max_kill_timeout`, but as one cluster-wide admission rule
+  instead of a per-client knob; §11 Q3 holds the cap value).
+
+Both fields are task-level (they sit next to `resources`, not inside the
+runtime `config`) because the semantics are runtime-independent; each runtime
+honors them with its own mechanism:
+
+- **container, Linux:** `<runtime> kill legion-<alloc> <stopSignal>` — ignore
+  "not running" errors (a finished batch task is already gone) — then poll
+  `<runtime> state legion-<alloc>` until stopped/absent, up to
+  `stopGracePeriod`, then `<runtime> delete --force legion-<alloc>`
+  unconditionally (the reaper for the stopped container *and* the killer for
+  a hung one), then reap the foreground supervisor child as today.
+- **container, macOS:** `container stop --signal <stopSignal>
+  --time <secs> legion-<alloc>` (flag spellings verified on hardware in this
+  phase — same caveat as Q2).
+- **exec:** `reap_task_process` grows the same shape — deliver `stopSignal`
+  to the tracked PID, wait up to `stopGracePeriod`, then SIGKILL. Today's
+  behavior is the degenerate case (`stopGracePeriod: '0s'` semantics), so
+  the exec runtime gets graceful stop as a side effect of the same fields.
+- **noop / runtimes with nothing to signal:** the fields are accepted and
+  inert, documented as such.
+
+`destroy` keeps delegating to `stop`. The preemption plan's "graceful stop"
+phase (its eviction path) consumes these same fields rather than growing its
+own — coordinate there, don't duplicate.
+
+### 6.4 Linux cgroup enforcement, Nomad's model: hard memory, pinned cores, weighted MHz
+
+No new jobspec surface — the three `resources` fields the scheduler already
+reads gain their kernel meaning on Linux. The worker partitions the node's
+usable CPUs Nomad-style into two parent cgroups:
+
+```
+legion/
+├── share/      cpuset.cpus = usable − reserved     ← unpinned tasks live here
+│   └── legion-<alloc>   cpu.weight from declared MHz
+└── reserve/
+    └── legion-<alloc>   cpuset.cpus = its assigned cores, exclusively
+```
+
+A task declaring `cores` gets whole CPUs moved out of the share slice; every
+other container task lives under `share/` and inherits its shrinking cpuset
+automatically (cgroup v2 cpusets are hierarchical — one write to
+`legion/share/cpuset.cpus` re-fences every tenant at once, no per-container
+updates). The generated spec:
+
+```jsonnet
+resources: { memory: 256, cores: 2 }    // MiB, whole cores — pinned task
+resources: { memory: 128, cpu: 500 }    // MiB, MHz — shared task
+```
+
+becomes, respectively:
 
 ```json
 "linux": {
-  "cgroupsPath": "legion/legion-<alloc-id>",
+  "cgroupsPath": "legion/reserve/legion-<alloc>",
   "resources": {
-    "devices": [ ... ],                          // unchanged
+    "devices": [ ... ],                                   // unchanged
     "memory": { "limit": 268435456, "swap": 268435456 },
-    "cpu":    { "quota": 200000, "period": 100000 }
+    "cpu":    { "cpus": "3,7" }                           // worker-assigned
+  }
+}
+```
+
+```json
+"linux": {
+  "cgroupsPath": "legion/share/legion-<alloc>",
+  "resources": {
+    "memory": { "limit": 134217728, "swap": 134217728 },
+    "cpu":    { "shares": 500 }                           // runtime → cpu.weight
   }
 }
 ```
@@ -433,38 +539,53 @@ The mappings, each deliberate:
   cannot be used to escape it (the K8s semantic; docker's default of
   2×limit-in-swap makes limits soft in practice, which defeats the point of
   scheduling against them).
-- **`cores` → CFS bandwidth, not pinning.** `quota = cores × period` with the
-  kernel-default 100 ms period — exactly how docker implements `--cpus=N`,
-  and the same *meaning* the field already has on macOS ("N CPUs' worth"),
-  just enforced by throttling instead of by VM sizing. Fractional values work
-  naturally (`cores: 0.5` → quota 50000); the macOS arm keeps its rounding.
-  Cpuset reservation is the rejected alternative (see prior art): it needs
-  the worker to own a node-wide core-assignment map, and the scheduler
-  doesn't model individual cores anywhere else.
-- **`cpu` (MHz) stays scheduling-only** on Linux exactly as it is on macOS —
-  one asymmetric field would be worse than one unenforced one (§11 Q4).
+- **`cores` → exclusive pinned CPUs.** The **worker** owns core assignment,
+  exactly as in Nomad: the scheduler keeps counting `cores` numerically, and
+  at start the worker's core allocator picks specific free logical CPUs
+  (lowest-numbered free), writes them into the spec's `cpu.cpus`, removes
+  them from `legion/share/cpuset.cpus`, and records the assignment in its
+  persisted allocation state (restored on worker restart, released on
+  stop/destroy). Exhaustion — the scheduler's count says yes but no whole
+  cores are free (fingerprint drift, offlined CPUs) — fails the allocation
+  with an error naming the assigned/free sets, feeding the normal
+  `on_unhealthy` move machinery rather than wedging.
+  **Validation:** `cores` on a container task must be a whole number (a
+  cpuset cannot hold half a core; macOS rounds today, which was quietly
+  lossy — now `cores: 1.5` is rejected at submit), and a container task
+  declares `cores` *or* `cpu`, not both (Nomad's rule; two CPU contracts on
+  one task have no coherent meaning).
+- **`cpu` (MHz) → proportional weight.** Written as OCI `cpu.shares` = MHz
+  (Nomad's convention), which cgroup-v2 runtimes convert to `cpu.weight`
+  via the standard mapping (`weight = 1 + ((shares − 2) × 9999) / 262142` —
+  the same formula systemd and Nomad use). Weight only bites under
+  contention: an idle node lets everyone burst, a saturated one degrades each
+  task in proportion to its declaration. MHz stops being scheduling-only on
+  Linux; on macOS it stays unenforced (no Apple analogue — see non-goals).
 - **Declared-only, like macOS:** a job that declares nothing gets no
-  `memory`/`cpu` entries and runs unconstrained — scheduler defaults are not
-  folded in, mirroring the existing macOS call. The asymmetry that *remains*
-  is the runtime's own: an unsized macOS guest still gets Apple's 1 GiB/4-CPU
-  VM default, while an unsized Linux container is genuinely unlimited.
-- **`cgroupsPath` is set explicitly** (`legion/legion-<alloc-id>`, cgroupfs
-  form) so operators can find a task's cgroup by allocation id with no
-  runtime-specific default knowledge. The systemd cgroup driver
-  (`:slice:prefix:name` form) is out of scope until someone runs Legion under
-  systemd-managed cgroup delegation and needs it.
+  `memory`/`cpu` entries, lands in the share slice at the default weight, and
+  is otherwise unconstrained — scheduler defaults are not folded in,
+  mirroring the existing macOS call.
+- **`cgroupsPath` is explicit** (`legion/share/…` / `legion/reserve/…`,
+  cgroupfs form) so operators can find a task's cgroup by allocation id and
+  the share/reserve split is visible in the hierarchy. The systemd cgroup
+  driver (`:slice:prefix:name` form) stays out of scope until someone runs
+  Legion under systemd-managed delegation and needs it.
 
-**Requirements and failure modes.** Limits require the cgroup v2 unified
-hierarchy — the position the exec runtime already takes for cgroup joining —
-and the memory/cpu controllers delegated to whatever user the runtime runs
-as. Both failure shapes surface as the runtime's own error at container
-create, which `start()` already propagates with context; the public doc gets
-a failure-modes row for each (missing controllers → actionable
-"enable cgroup v2 / delegation" guidance). **OOM diagnostics:** on a nonzero
-exit, the plugin best-effort reads the cgroup's `memory.events` `oom_kill`
-counter before teardown and, when it fired, annotates the failure record
-("container exceeded its 256 MiB memory limit and was OOM-killed") — exit
-code 137 alone sends the author hunting through dmesg.
+**Requirements and failure modes.** Everything here requires the cgroup v2
+unified hierarchy — the position the exec runtime already takes — with the
+cpuset/cpu/memory controllers delegated to the runtime's user; failures
+surface as the runtime's own error at container create, which `start()`
+propagates with context, and the public doc gets an actionable failure-modes
+row for each. The worker fingerprints usable CPUs from its own
+`cpuset.cpus.effective` at startup (not `nproc` — the worker itself may be
+confined). **Exclusivity scope, stated honestly:** the share/reserve fence
+governs Legion's container cgroups; exec-runtime tasks and unrelated host
+processes are outside the hierarchy and may still touch reserved cores
+(non-goals; §11 Q4). **OOM diagnostics:** on a nonzero exit, the plugin
+best-effort reads the cgroup's `memory.events` `oom_kill` counter before
+teardown and, when it fired, annotates the failure record ("container
+exceeded its 256 MiB memory limit and was OOM-killed") — exit code 137 alone
+sends the author hunting through dmesg.
 
 ### 6.5 Mount the task directory; file delivery follows
 
@@ -550,23 +671,32 @@ is a named non-goal until Legion has a distinct secrets dir to split out.
 
 ## 7. Proto, struct, config, and persistence changes
 
-- **None to the proto, wire format, or persistence.** The exec frame protocol,
-  `ExecAllocation`, and worker state are untouched.
-- **No new jobspec fields** — `resources.memory`/`cores`, `kv_injections.files`,
-  identity `file`, and `artifacts` all exist; this plan changes what they *do*
-  for container tasks, so `configs/jobs/maximal.jsonnet` is unchanged (its
-  comments on the container-task example get the new semantics).
+- **None to the proto or wire format.** The exec frame protocol,
+  `ExecAllocation`, and the manager↔worker RPC surface are untouched (the
+  jobspec rides as JSON inside the existing job-config payload).
+- **Two new jobspec fields** — task-level `stopSignal` and `stopGracePeriod`
+  (§6.3). Both go into `configs/jobs/maximal.jsonnet` with their defaults and
+  the cap in comments. `resources.memory`/`cores`/`cpu`,
+  `kv_injections.files`, identity `file`, and `artifacts` all exist already —
+  this plan changes what they *do* for container tasks, and the
+  maximal-jsonnet comments on the container example get the new semantics.
+- **Worker-local state gains one field:** the persisted allocation record
+  (`PersistedAllocation`) carries the pinned cores assigned to the
+  allocation, `serde`-defaulted so records written before the change load
+  unchanged. Worker restart rebuilds the core allocator and the share mask
+  from these records.
 - `TaskPlugin` gains the defaulted `signal()` method (dylib plugins stay
   source-compatible; the registry's existing version gating covers the rebuild
   requirement, same as the exec plan's ABI addition).
-- `build_bundle`/`build_spec` gain the task's `resources` (internal signature
-  change only); capability flips in the container plugin:
+- `build_bundle`/`build_spec` gain the task's `resources` and assigned cores
+  (internal signature change only); capability flips in the container plugin:
   `supports_kv_file_injection`, `supports_identity_file`, `supports_signal`
   → true.
-- **One new validation rule** (a *tightening* only for specs that were
-  rejected outright before): container-task file-delivery paths must resolve
-  under `/legion/task` (§6.5) — enforced at admission, re-checked on the
-  worker.
+- **New validation rules:** `stopSignal` from the `parse_signal` vocabulary;
+  `stopGracePeriod` a positive duration ≤ the cap; container-task `cores`
+  must be a whole number; container tasks declare `cores` or `cpu`, not both;
+  container-task file-delivery paths must resolve under `/legion/task`
+  (§6.5) — all enforced at admission, the path rule re-checked on the worker.
 - Docs: capability tables in `docs/task-runtime-container.md` (signal, KV
   file, identity file, Linux limits, Linux exec rows; the "Resources and
   Ports" and "Current Scope and Limitations" sections), `docs/exec-and-actions.md`
@@ -578,8 +708,8 @@ is a named non-goal until Legion has a distinct secrets dir to split out.
 ## 8. Implementation phases
 
 Each ships alone. 1 goes first (it revives the dead OCI argv path the others
-lean on for confidence); 2–5 are mutually independent, listed in the order
-that front-loads user value.
+lean on for confidence); 2–6 are mutually independent except that 5 wants 4's
+spec plumbing, listed in the order that front-loads user value.
 
 - **Phase 1 — Linux OCI exec.** `supports_exec()` flip, OCI argv dialect in
   `build_exec_command` (+ env mapping, `--` separator), unit tests, e2e
@@ -589,18 +719,30 @@ that front-loads user value.
   routing, container override for both platforms, admission-gate flip and test
   inversion, docs. *Value: `changeMode: signal` on containers; the seam any
   future runtime (sandbox guest agent) implements.*
-- **Phase 3 — graceful Linux stop.** TERM → bounded wait → `delete --force`,
-  e2e test that a TERM-trapping container exits gracefully and a TERM-ignoring
-  one is force-deleted at the deadline, docs. Builds on Phase 2's `kill`
-  helper but ships independently (it can shell out directly if 2 hasn't
-  landed). *Value: no more data-loss stops on Linux.*
-- **Phase 4 — Linux cgroup limits.** `resources` threaded into
-  `build_spec`, the `memory`/`cpu` mappings + `cgroupsPath`, OOM annotation
-  from `memory.events`, unit tests over the generated spec, e2e OOM/throttle
-  tests, docs (including the failure-modes rows). Entirely inside
-  `oci_bundle.rs`/`container.rs`. *Value: the scheduler's arithmetic becomes
-  the kernel's; noisy neighbors die alone.*
-- **Phase 5 — task-dir mount + file delivery.** The `/legion/task` mount on
+- **Phase 3 — graceful stop + the `stopSignal`/`stopGracePeriod` fields.**
+  The two task fields with validation, defaults, and the admission cap; the
+  Linux signal → bounded-wait → `delete --force` sequence; the Apple
+  `stop --signal --time` arm; the exec runtime's signal → wait → SIGKILL in
+  `reap_task_process`; `maximal.jsonnet`; e2e tests (trap-and-exit inside the
+  window, ignore-and-force-kill at the deadline, a long `stopGracePeriod`
+  honored); docs. Builds on Phase 2's `kill` helper but ships independently
+  (it can shell out directly if 2 hasn't landed). *Value: no more data-loss
+  stops, and drains the job author can actually size.*
+- **Phase 4 — memory limits + CPU weight.** `resources` threaded into
+  `build_spec`; the `memory` hard-limit/swap mapping; `cpu` MHz →
+  `cpu.shares`; the `legion/share` parent cgroup and `cgroupsPath`; OOM
+  annotation from `memory.events`; the `cores`-xor-`cpu` and whole-`cores`
+  validation rules (landing here so Phase 5 changes behavior, not the
+  accepted spec surface); unit tests over the generated spec; e2e OOM test;
+  docs. *Value: memory becomes real and MHz stops being scheduling-only —
+  before pinning even lands.*
+- **Phase 5 — exclusive cores (cpuset pinning).** The worker core allocator
+  (fingerprint from `cpuset.cpus.effective`, lowest-free assignment, release
+  on stop/destroy, restart recovery via the persisted-record field); the
+  `legion/reserve` slice and share-mask maintenance; `cpu.cpus` in the spec;
+  the exhaustion failure path; e2e pinning tests. *Value: `cores` means
+  "these CPUs are yours" on Linux, like Nomad.*
+- **Phase 6 — task-dir mount + file delivery.** The `/legion/task` mount on
   both platforms, translated env + `${artifact.*}` interpolation, the
   path-range validation with its error message, capability flips
   (`supports_kv_file_injection`, `supports_identity_file`), e2e file-visibility
@@ -614,11 +756,19 @@ that front-loads user value.
 - **Unit (every phase, CI-safe):**
   - argv construction — OCI exec includes `--tty`/`--`/`--env` and never
     `--interactive`; Apple arm unchanged (no `--`); signal argv per platform;
-    stop sequence ordering (kill before delete). Mirrors the existing
+    stop sequence ordering (kill before delete) and the `stopSignal` /
+    `stopGracePeriod` values flowing into it. Mirrors the existing
     `build_apple_launch` test style.
-  - generated `config.json` — memory limit/swap byte math, quota/period from
-    fractional and whole `cores`, no `memory`/`cpu` entries when nothing is
-    declared, `cgroupsPath` shape, devices rule untouched.
+  - jobspec validation — `stopSignal` vocabulary, `stopGracePeriod`
+    positive-and-capped, whole-number `cores`, `cores`-xor-`cpu`, each with
+    its documented error message.
+  - generated `config.json` — memory limit/swap byte math; `cpu.shares` from
+    MHz; `cpu.cpus` from assigned cores; `cgroupsPath` share vs. reserve; no
+    `memory`/`cpu` entries when nothing is declared; devices rule untouched.
+  - the core allocator — assignment (lowest free), release, double-release
+    idempotence, exhaustion error naming free/assigned sets, share-mask
+    arithmetic, and restart recovery from persisted records (including
+    records without the field).
   - mounts and env — `/legion/task` mount present on both arms and ordered
     before declared volumes; `LEGION_TASK_DIR` and `LEGION_ARTIFACT_*`
     translation (including the omit-when-outside case); path-range validation
@@ -630,13 +780,19 @@ that front-loads user value.
   - exec one-shot: output captured, exit code propagated, task env visible;
   - exec tty: shell round-trip through a PTY, resize, Ctrl-C;
   - signal: a SIGHUP-trapping script observably reacts;
-  - graceful stop: TERM-trapping container exits inside the window (and
-    `delete --force` finds it already gone); TERM-ignoring container is gone
-    by ~grace+ε;
+  - graceful stop: a container trapping its declared `stopSignal` exits
+    inside the window (and `delete --force` finds it already gone); a
+    signal-ignoring container is gone by ~grace+ε; a non-default
+    `stopGracePeriod: '30s'` is honored; the exec runtime passes the same
+    trio;
   - limits: a memory-hog container dies at its declared limit with the OOM
-    annotation in the failure record; `nproc`-style spin under `cores: 1`
-    shows throttling (cgroup `cpu.stat` `nr_throttled > 0` — cheaper and less
-    flaky than wall-clock assertions);
+    annotation in the failure record; a `cpu: 500` container's cgroup shows
+    the expected `cpu.weight` (file-content assertion — weight ratios under
+    load are too flaky for CI);
+  - pinning: `Cpus_allowed_list` inside a `cores: 2` container equals its
+    two assigned CPUs; a concurrently running share-slice container's
+    effective cpuset excludes them; stopping the pinned task returns the
+    cores to the share slice; a worker restart preserves the assignment;
   - files: a staged file artifact and a KV-rendered file are readable at
     their `/legion/task` paths from inside the container; a host-side atomic
     rewrite is visible inside without restart (the rename-propagation check —
@@ -651,24 +807,32 @@ that front-loads user value.
 
 ## 10. Rollout and backward compatibility
 
-- No feature gate. Every phase changes worker-local behavior only (plus, for
-  Phase 5, an admission rule on the manager); no manager/worker version
+- No feature gate. Every phase changes worker-local behavior only, plus
+  admission rules on the manager (Phases 3–6); no manager/worker version
   handshake concerns (an old manager talking to a new worker simply finds
-  exec working where it used to error).
-- Four **visible behavior changes** to release-note:
-  1. Linux container stop delivers SIGTERM and waits up to 10 s before the
-     force-delete. Rescheduling a hung container is up to 10 s slower than
+  exec working where it used to error; the new jobspec fields are inert JSON
+  to an old worker).
+- **Visible behavior changes** to release-note:
+  1. Container (and exec-runtime) stop delivers `stopSignal` and waits up to
+     `stopGracePeriod` (SIGTERM / 10 s undeclared) before the hard kill.
+     Rescheduling a hung container is up to the grace period slower than
      today's instant SIGKILL — the correct trade, and the docker default
      everyone already operates under.
   2. `changeMode: signal` container jobs that used to be rejected at submit
-     now deploy; likewise KV-file and identity-file container jobs (Phase 5).
+     now deploy; likewise KV-file and identity-file container jobs (Phase 6).
   3. **Declared limits become real on Linux.** A container job declaring
      `memory: 256` while actually using more ran fine yesterday and is
-     OOM-killed today. This is the declared contract finally being enforced —
-     the release note says so plainly, and the OOM annotation tells the
-     author which limit fired and where it came from. Jobs declaring nothing
-     see no change.
-  4. Container tasks start receiving `LEGION_TASK_DIR` / `LEGION_ARTIFACT_*`
+     OOM-killed today; a `cores` job is pinned to specific CPUs instead of
+     floating; a `cpu` (MHz) job's share of a saturated node now tracks its
+     declaration. This is the declared contract finally being enforced — the
+     release note says so plainly, and the OOM annotation tells the author
+     which limit fired. Jobs declaring nothing see no change.
+  4. **Two validation tightenings can reject previously-accepted specs at
+     re-submit:** a container task declaring fractional `cores` (silently
+     rounded on macOS before, ignored on Linux), and one declaring both
+     `cores` and `cpu`. Both errors name the fix; running allocations are
+     untouched until their next submit.
+  5. Container tasks start receiving `LEGION_TASK_DIR` / `LEGION_ARTIFACT_*`
      (in-container values) and a `/legion/task` mount. An image that already
      has a `/legion` path would be shadowed — improbable, called out in the
      release note regardless.
@@ -681,22 +845,23 @@ that front-loads user value.
   then fail when the session opens. *Lean:* don't probe — all three supported
   runtimes have `exec`, the failure is clearly attributed, and a per-node
   `exec --help` probe is a startup cost for a hypothetical.
-- **Q2 — does Apple `container kill` cover the full signal-name set?** The
-  subcommand exists; the accepted name spellings need verifying on real
-  hardware during Phase 2. *Lean:* pass `SIG`-stripped names and normalize in
-  the plugin if needed; worst case macOS maps unsupported names to a clear
-  error.
-- **Q3 — jobspec `stopSignal` / `stopGracePeriod`?** *Lean:* not until a
-  workload demonstrably needs a non-default. When it does, the fields slot
-  into `stop()`/`signal()` without reshaping anything here — and that request,
-  not this plan, should decide names and defaults (they belong at task level,
-  next to `resources`, and would go through their own mini-plan since they are
-  new jobspec surface for *every* runtime).
-- **Q4 — map `resources.cpu` (MHz) to `cpu.weight`?** Nomad does (MHz →
-  shares), and it only matters under contention. *Lean:* no — the field is
-  scheduling-only on macOS, and one field meaning different things per
-  platform costs more explanation than proportional weight buys. Revisit with
-  evidence of contention complaints on packed nodes.
+- **Q2 — do Apple `container kill --signal` and `container stop --signal
+  --time` cover the needed flag/name set?** The subcommands exist; exact
+  spellings need verifying on real hardware during Phases 2–3. *Lean:* pass
+  `SIG`-stripped names and normalize in the plugin if needed; worst case
+  macOS maps unsupported names to a clear error.
+- **Q3 — is 5 minutes the right admission cap for `stopGracePeriod`?** The
+  cap exists so a wedged task cannot stall drains and reschedules
+  indefinitely; the value is a taste call (Nomad's client default caps at
+  30 s, K8s commonly runs minutes). *Lean:* 5 m — long enough for a database
+  checkpoint, short enough that a node drain still converges; revisit against
+  the preemption plan's eviction deadlines when that lands.
+- **Q4 — should exec-runtime tasks join the share slice, so reserved cores
+  are exclusive node-wide?** The exec runtime already has opt-in cgroup
+  joining, so the plumbing half-exists. *Lean:* later, and only if a real
+  colocated deployment needs it — it drags the exec runtime's cgroup story
+  (currently "join what the job names") into worker-managed territory, which
+  is its own small design.
 - **Q5 — is `/legion/task` the right canonical path?** Nomad's `/local` is
   shorter; `/legion/task` is unmistakably Legion's and leaves room for
   siblings (`/legion/alloc`, `/legion/secrets`) if the deferred splits ever
@@ -719,15 +884,25 @@ that front-loads user value.
 - **Phase 2:** a container job with a `changeMode: signal` identity is
   accepted and its process observably receives the signal on refresh, on both
   platforms; third-party dylib task plugins build unchanged.
-- **Phase 3:** the two e2e stop tests (graceful exit, forced deadline) pass;
-  `stop` on an already-exited container remains error-free; docs no longer
-  call Linux stop "delete --force" only.
+- **Phase 3:** scenario 2 works end to end — declared `stopSignal` and
+  `stopGracePeriod` honored on both container platforms and the exec runtime,
+  the signal-ignoring container force-killed at the deadline; the two fields
+  validate (vocabulary, cap) with the documented errors and appear in
+  `maximal.jsonnet`; `stop` on an already-exited container remains
+  error-free; docs no longer call Linux stop "delete --force" only.
 - **Phase 4:** scenario 4 works end to end on a Linux worker — the memory hog
-  is OOM-killed at its declared limit with the annotated failure record, the
-  spin test shows CFS throttling, an undeclared job's spec carries no
-  `memory`/`cpu` entries, and the capability table's "Memory / CPU limits"
-  row reads ✅ for Linux with the cgroup-v2 requirement documented.
-- **Phase 5:** scenario 5 works end to end on both platforms — declared KV
+  is OOM-killed at its declared limit with the annotated failure record, a
+  `cpu: 500` container's cgroup carries the mapped weight, an undeclared
+  job's spec carries no `memory`/`cpu` entries, fractional-`cores` and
+  `cores`+`cpu` specs are rejected at submit, and the capability table's
+  "Memory / CPU limits" row reads ✅ for Linux with the cgroup-v2 requirement
+  documented.
+- **Phase 5:** scenario 6 works end to end on a Linux worker — the pinned
+  container sees exactly its assigned CPUs, concurrent share-slice containers
+  exclude them, the cores return on stop, and the assignment survives a
+  worker restart; core exhaustion fails the allocation with the documented
+  error instead of wedging.
+- **Phase 6:** scenario 5 works end to end on both platforms — declared KV
   file, identity file, and a file artifact all readable at `/legion/task`
   paths inside the container, a rotation visible without restart; the
   out-of-range path is rejected at submit with the documented error; the

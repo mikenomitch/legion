@@ -3,36 +3,40 @@
 Decisions made while writing
 [the plan](../plans/container-runtime-exec-and-signals-plan.md). Ordered by
 project impact, highest first; the entry number is its rank. (Planning-stage
-calls — implementation will append its own as phases execute.)
+calls — implementation will append its own as phases execute. Entries 3 and 4
+record reversals of earlier planning calls, made at the product owner's
+direction; the superseded designs appear as the losing alternatives.)
 
-## 1. One plan carries all four gaps, with exec + signals sequenced ahead of limits + file delivery
+## 1. One plan carries all the container runtime's core gaps, with exec + signals sequenced first
 
 **The call.** The original request was "add exec — it's also missing some
 other core feature," and the plan's first cut scoped exactly that pair
 (signal delivery as the identified second feature), naming cgroup limits and
-the task-dir mount as non-goals. On review the request was widened to include
-both alternatives, so the plan now covers all four as phases 1–5 of a single
-document — sequenced exec → signals → graceful stop → limits → files.
+the task-dir mount as non-goals. The scope was then widened twice on review:
+first to include both alternatives, then to Nomad-parity CPU enforcement and
+the graceful-kill jobspec knobs. The plan now covers it all as phases 1–6 of
+a single document — sequenced exec → signals → stop knobs → memory/weight →
+pinning → files.
 
-**The alternatives.** (a) The original two-gap scope, with limits and file
-delivery as separate future plans — smaller document, each plan one review
-surface; (b) leading with cgroup limits or the task-dir mount instead of
-signals as "the other core feature": limits are arguably *the* point of a
-container orchestrator, and the mount clears three capability rows at once.
+**The alternatives.** (a) The original two-gap scope, with the rest as
+separate future plans — smaller document, each plan one review surface;
+(b) leading with cgroup limits or the task-dir mount instead of signals as
+"the other core feature."
 
-**The trade-off.** One plan now spans two unrelated mechanical seams (runtime
-subcommands vs. bundle/launch generation), so its phases will land as several
-PRs against one design doc, and a stall in one workstream makes the whole
-plan read as stalled. The phase independence requirement does the containment.
+**The trade-off.** One plan now spans three mechanical seams (runtime
+subcommands, bundle/cgroup generation plus a worker-side allocator, and mount
+plumbing), so its phases will land as several PRs against one design doc, and
+a stall in one workstream makes the whole plan read as stalled. The phase
+independence requirement does the containment.
 
-**Why.** The four gaps share one user-facing story — the container runtime's
+**Why.** The gaps share one user-facing story — the container runtime's
 capability table, and macOS-dev/Linux-prod parity — and splitting that story
-across three documents would scatter the argument for how the pieces compose
-(file delivery is only fully valuable *with* the signal seam: rotation
-without restart). Signals still lead the sequencing because they are the only
-gap that is ❌ on every platform and the only one that is actively
-data-losing today (Linux stop is an unconditional SIGKILL), and because they
-ride the same mechanism exec revives. Simplicity of the story won over
+across documents would scatter the argument for how the pieces compose (file
+delivery is only fully valuable *with* the signal seam; pinning is only
+honest *with* the share-slice weighting). Signals still lead the sequencing
+because they are the only gap that was ❌ on every platform and the only one
+actively data-losing (Linux stop was an unconditional SIGKILL), and because
+they ride the same mechanism exec revives. Simplicity of the story won over
 smallness of the document.
 
 ## 2. The task dir mounts at one canonical path, and container file destinations must resolve under it
@@ -70,7 +74,84 @@ system that today has one task dir — `/legion/task` leaves the namespace room
 exact precedent volumes already set (in-task destinations for isolating
 runtimes), so this extends an existing convention rather than inventing one.
 
-## 3. Signals become a defaulted `TaskPlugin::signal()` trait method, not a container special case
+## 3. CPU enforcement is Nomad's model: `cores` → exclusive cpuset via share/reserve slices, `cpu` (MHz) → `cpu.weight`
+
+**The call.** On Linux the worker partitions usable CPUs into a `legion/share`
+and a `legion/reserve` parent cgroup. `resources.cores` means whole CPUs
+assigned by a worker-side core allocator and removed from the share slice's
+cpuset (exclusive among Legion's container workloads); `resources.cpu` (MHz)
+becomes proportional `cpu.weight` (via OCI `cpu.shares` = MHz, the standard
+shares→weight conversion) for share-slice tasks. Two validation rules ride
+along: container `cores` must be whole numbers, and a container task declares
+`cores` *or* `cpu`, never both. This **reverses the plan's earlier call**
+(CFS bandwidth for `cores`, MHz staying scheduling-only), at the product
+owner's direction.
+
+**The alternatives.** (a) The superseded design: `cores` as docker-style CFS
+quota (`quota = cores × period`), no pinning, no weight — one spec-generation
+change, no worker subsystem, fractional cores supported, MHz left as
+scheduling arithmetic; (b) pinning without exclusion — write `cpu.cpus` on
+the pinned container only, skip the share-slice maintenance — cheaper, but
+"exclusive" would be a polite fiction; (c) weight *and* quota together
+(K8s-ish requests/limits) — rejected with the same one-`resources`-block
+argument as before.
+
+**The trade-off.** The worker grows a real subsystem: CPU fingerprinting,
+an assignment map persisted in worker state and rebuilt on restart, a shared
+mask rewritten on every pinned start/stop, and an exhaustion failure path.
+Fractional `cores` and `cores`+`cpu` specs that were previously accepted now
+fail validation. Exclusivity is scoped to Legion-managed container cgroups —
+exec-runtime tasks and host processes can still touch reserved cores (plan
+Q4). And `cores` now means something different on Linux (exclusivity) than
+on macOS (VM sizing) — the asymmetry the CFS design avoided.
+
+**Why.** Performance, and making the jobspec mean what it says. Bandwidth
+throttling admits the exact tail-latency jitter that people declare `cores`
+to escape, and leaving MHz unenforced meant a saturated node degraded the
+4000-MHz service and the 100-MHz cron job equally — the scheduler's
+arithmetic and the kernel's behavior told different stories. Nomad's model is
+the proven shape of "declared CPU is real CPU," and the hierarchical-cpuset
+trick (one write to the share slice re-fences every tenant) keeps the
+implementation a fraction of what it looks like. The simplicity cost is real
+and was consciously paid — recorded here because the earlier entry argued the
+other side.
+
+## 4. `stopSignal` / `stopGracePeriod` ship now as task-level jobspec fields, defaults SIGTERM / 10 s, capped at admission
+
+**The call.** Graceful teardown is declarable per task: `stopSignal`
+(validated against the existing signal vocabulary; on the Linux container
+path the default chain is jobspec → image `StopSignal` → SIGTERM) and
+`stopGracePeriod` (duration string, default `10s`, admission-capped — lean
+5 m). Honored by the container runtime on both platforms and by the exec
+runtime; inert on runtimes with nothing to signal. This **reverses the
+plan's earlier call** (a fixed SIGTERM/10 s constant, knobs deferred), at the
+product owner's direction.
+
+**The alternatives.** (a) The superseded design: constants only, fields
+deferred until demanded — no new surface, no cap to pick, but a database
+needing a 90-second checkpoint simply couldn't have it; (b) Nomad's exact
+names and shape (`kill_signal`/`kill_timeout` + a per-client
+`max_kill_timeout` config) — familiar, but "kill signal" describes the
+mechanism, "stop" describes the intent, and a per-client cap is a knob per
+node where one admission rule does; (c) runtime-`config`-level fields —
+would make the semantics container-specific when they are not.
+
+**The trade-off.** Two more fields in the universal task schema that every
+current and future runtime must define semantics for (even if "inert"), a
+cap value that is now API surface, and `maximal.jsonnet`/docs/validation
+carrying them forever. Defaults preserve existing behavior, so the cost is
+surface, not migration.
+
+**Why.** Real workloads genuinely need non-default drains (the checkpoint
+case), and the fields land at task level next to `resources` because the
+*intent* — "give my process this signal and this long" — is
+runtime-independent, extensibility's cheapest win. Keeping docker's
+SIGTERM/10 s defaults means a job that declares nothing behaves exactly as
+the fixed-constant design would have; the knobs only appear when reached
+for. The admission cap keeps the operator promise the constant used to make:
+no task can hold a drain hostage.
+
+## 5. Signals become a defaulted `TaskPlugin::signal()` trait method, not a container special case
 
 **The call.** `WorkerTaskManager::signal_allocation` routes through a new
 trait method whose default is today's `kill(2)`-the-tracked-PID behavior;
@@ -91,55 +172,6 @@ guest-agent signal path implements the same method instead of growing a second
 special case, and worker core stays runtime-agnostic (the same argument that
 put `exec()` on the trait in the exec plan). Simplicity of the *system* beat
 smallness of the *diff*.
-
-## 4. `cores` maps to CFS bandwidth (docker's `--cpus` semantics), not cpuset pinning; `cpu` (MHz) stays scheduling-only
-
-**The call.** On Linux, `resources.cores: N` becomes
-`cpu.quota = N × 100000 / period 100000` in the bundle spec — throttling to
-"N CPUs' worth," fractional values included — and `memory` becomes a hard
-limit with `swap` pinned equal to it. `resources.cpu` (MHz) maps to nothing,
-exactly as on macOS.
-
-**The alternatives.** (a) Cpuset reservation for `cores` (Nomad's model):
-exclusive cores, no throttling-induced tail latency; (b) mapping MHz to
-`cpu.weight`/shares (also Nomad) so contention degrades proportionally;
-(c) docker's swap default (2×limit) instead of swap = limit.
-
-**The trade-off.** Bandwidth throttling admits scheduling jitter that pinned
-cores would prevent (a quota-exhausted task waits for the next period), and
-an MHz-declaring job still gets no kernel enforcement at all. Swap = limit is
-stricter than docker; a workload relying on swap headroom OOMs where docker
-would page.
-
-**Why.** Consistency and simplicity over a subsystem. `cores` already *means*
-"N CPUs' worth" on macOS (`--cpus` sizes the guest); CFS quota is the same
-meaning enforced the same way docker enforces it, while cpuset would require
-the worker to own a node-wide core-assignment map the scheduler doesn't model
-anywhere. Per-platform divergence in what `cpu` means (weight on Linux,
-nothing on macOS) would cost more explanation than proportional weight buys —
-kept symmetric, revisit with contention evidence (plan Q4). Swap = limit is
-the K8s semantic: a limit the kernel can page around is not a limit the
-scheduler can trust.
-
-## 5. Graceful stop ships with a fixed SIGTERM/10 s default — no jobspec knobs
-
-**The call.** Linux teardown becomes TERM → wait ≤ 10 s (a constant) →
-`delete --force`. No `stopSignal`/`stopGracePeriod` jobspec fields, no env
-override.
-
-**The alternative.** Ship Nomad-style `kill_signal`/`kill_timeout` task fields
-now, while the teardown code is open — it is where they would land anyway.
-
-**The trade-off.** A workload needing a longer drain (a database checkpoint,
-a long-poll server) cannot express it and gets force-killed at 10 s. Evidence
-that would revisit this: the first real job that documents needing >10 s.
-
-**Why.** Simplicity/ease — Legion's headline goal is fewest knobs that could
-possibly work, and docker's 10-second default is the behavior every operator
-already assumes. New jobspec surface is a per-runtime contract (`exec` and
-`sandbox` would need to honor it too), deserves its own small plan, and is
-purely additive later; shipping the safe default first fixes the data-loss bug
-without committing to field names under time pressure.
 
 ## 6. OCI exec support is reported true without probing the runtime binary
 

@@ -223,27 +223,32 @@ How to use it:
 Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
 
 - [ ] A **WASM** runtime
-- [ ] **`container` core gaps: exec on Linux, signals, cgroup limits, file
-      delivery** — [plan](plans/container-runtime-exec-and-signals-plan.md)
-      (PLANNED). Today `legion exec`/actions/UI/MCP fail against container
-      tasks on Linux (exec was deferred for the OCI runtimes), no platform can
-      signal a container task (`changeMode: signal` rejected at admission),
-      Linux teardown is `delete --force` (SIGKILL) with no grace window,
-      declared `resources.memory`/`cores` set no cgroup limits on Linux, and
-      the unmounted task dir blocks KV/identity *file* delivery and file/tree
-      artifacts.
+- [ ] **`container` core gaps: exec on Linux, signals + stop knobs, Nomad-style
+      CPU/memory enforcement, file delivery** —
+      [plan](plans/container-runtime-exec-and-signals-plan.md) (PLANNED).
+      Today `legion exec`/actions/UI/MCP fail against container tasks on Linux
+      (exec was deferred for the OCI runtimes), no platform can signal a
+      container task (`changeMode: signal` rejected at admission), teardown
+      has no grace window or knobs (Linux is `delete --force`, SIGKILL),
+      declared `resources` set no cgroup limits on Linux (`cpu` MHz enforced
+      nowhere), and the unmounted task dir blocks KV/identity *file* delivery
+      and file/tree artifacts.
   - [ ] Phase 1 — exec via `<runtime> exec` for youki/runc/crun
   - [ ] Phase 2 — `TaskPlugin::signal()` seam + `container kill`/`<runtime> kill`
-  - [ ] Phase 3 — graceful Linux stop (SIGTERM → 10 s → `delete --force`)
-  - [ ] Phase 4 — Linux cgroup limits from declared resources
-        (`linux.resources` in the bundle spec; memory hard limit, cores → CFS
-        quota; OOM-kill annotation)
-  - [ ] Phase 5 — task dir mounted at `/legion/task` + translated env; flips
+  - [ ] Phase 3 — graceful stop + task-level `stopSignal`/`stopGracePeriod`
+        fields (defaults SIGTERM/10 s, admission-capped; container both
+        platforms + exec runtime)
+  - [ ] Phase 4 — Linux memory hard limits + `cpu` MHz → `cpu.weight`
+        (share-slice cgroup, OOM-kill annotation, `cores`-xor-`cpu` and
+        whole-`cores` validation)
+  - [ ] Phase 5 — exclusive `cores` via cpuset pinning (worker core
+        allocator, `legion/share`/`legion/reserve` slices, restart recovery)
+  - [ ] Phase 6 — task dir mounted at `/legion/task` + translated env; flips
         KV file injection, identity file delivery, and file/tree artifacts to
         supported (container file paths must live under the mount)
   - Deliberately out of scope there (still open, see the plan's non-goals):
-    `stopSignal`/`stopGracePeriod` jobspec knobs, Linux port mapping/network
-    namespaces, cpuset pinning, alloc-dir sharing
+    Linux port mapping/network namespaces, NUMA/SMT-aware core placement,
+    excluding exec-runtime tasks from reserved cores, alloc-dir sharing
 - [ ] `exec`: unveil support
 - [ ] `exec`: network namespaces (netavark? CNI?) — see *Networking* below
 - [ ] **Sandbox snapshots, fast start, and forking** —
