@@ -38,6 +38,7 @@ impl Eval {
             "rollout_tick" => self.handle_rollout_tick(store),
             "job_stop" => self.handle_job_stop(store),
             "job_reschedule" => self.handle_job_reschedule(store),
+            "job_scale" => self.handle_job_scale(store),
             other => bail!("Unsupported eval kind: {other}"),
         }
     }
@@ -265,6 +266,33 @@ impl Eval {
             "Job {} rescheduled with {} placements",
             self.job_id,
             outcome.allocations.len()
+        ))
+    }
+
+    /// Reconcile a job's allocation set to its EFFECTIVE desired counts
+    /// after a `legion job scale` (docs/autoscaling.md). Scale-in first:
+    /// surplus allocations above each task's effective count are retired
+    /// (highest slots first for slot-mode stateful tasks — their instances
+    /// terminate through `slot_still_desired_tx`'s override-aware check —
+    /// newest-first for stateless). Then scale-out: a Reschedule-mode plan
+    /// places only the shortfall, leaving existing allocations alone.
+    /// Idempotent — a re-run converges to the same counts.
+    fn handle_job_scale(&self, store: &Store) -> R<String> {
+        if self.job_id.trim().is_empty() || self.job_config_id.trim().is_empty() {
+            bail!("Eval job_scale missing identifiers");
+        }
+
+        let retired = store.retire_surplus_allocations(&self.job_config_id)?;
+        let outcome = self.schedule_job_allocations(store, PlanMode::Reschedule)?;
+        if !outcome.deltas.is_empty() {
+            info!(?outcome.deltas, "Job scale allocation deltas");
+        }
+
+        Ok(format!(
+            "Job {} scaled: {} placed, {} retired",
+            self.job_id,
+            outcome.allocations.len(),
+            retired.len()
         ))
     }
 
@@ -577,6 +605,175 @@ mod tests {
             dynamic_attrs: json!({}),
             health_checks: json!({}),
         }
+    }
+
+    /// `legion job scale` end to end at the eval layer
+    /// (docs/autoscaling.md): a count override changes the effective
+    /// desired count with NO new config version; the `job_scale` eval
+    /// converges the allocation set both ways (scale-out places only the
+    /// shortfall, scale-in retires surplus); and resubmits arbitrate
+    /// ownership via `base_count` — an unchanged spec count keeps the
+    /// override, a changed one returns the count to the spec.
+    #[test]
+    fn job_scale_eval_converges_and_resubmits_arbitrate() -> R<()> {
+        let store = setup_store()?;
+        for node in ["node-1", "node-2"] {
+            Eval {
+                id: node.into(),
+                status: "pending".into(),
+                kind: "node_join".into(),
+                job_id: String::new(),
+                job_config_id: String::new(),
+                node_name: node.into(),
+                priority: 50,
+            }
+            .handle(&store)?;
+        }
+
+        let submission = Submission {
+            path: "web.jsonnet".into(),
+            content: "v1".into(),
+            is_primary: true,
+        };
+        let job = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "web".into(),
+            tasks: vec![TaskConfig {
+                count: TaskCount::new(2),
+                resources: json!({ "memory": 128 }),
+                config: json!({ "message": "v1" }),
+                ..TaskConfig::new("api", "service")
+            }],
+            version: None,
+        };
+        store.handle_job_submit(&job, &[submission.clone()])?;
+        let job_config_id = store.get_job_config("web")?.id();
+        let submit_eval = Eval {
+            id: "e-submit".into(),
+            status: "pending".into(),
+            kind: "job_submit".into(),
+            job_id: "web".into(),
+            job_config_id: job_config_id.clone(),
+            node_name: String::new(),
+            priority: 50,
+        };
+        submit_eval.handle(&store)?;
+        assert_eq!(store.allocs_for_job("web")?.len(), 2);
+
+        // Scale OUT to 5: only the shortfall is placed, on the same config.
+        store.set_task_scale_override("web", "default", "api", 5, 2, "operator", "test", "t")?;
+        let existing_ids: std::collections::HashSet<i64> = store
+            .allocs_for_job("web")?
+            .iter()
+            .map(|alloc| alloc.id)
+            .collect();
+        let scale_eval = Eval {
+            id: "e-scale".into(),
+            status: "pending".into(),
+            kind: "job_scale".into(),
+            job_id: "web".into(),
+            job_config_id: job_config_id.clone(),
+            node_name: String::new(),
+            priority: 50,
+        };
+        scale_eval.handle(&store)?;
+        let allocs = store.allocs_for_job("web")?;
+        assert_eq!(allocs.len(), 5, "scale-out converges to the override");
+        assert!(
+            existing_ids
+                .iter()
+                .all(|id| allocs.iter().any(|alloc| alloc.id == *id)),
+            "scale-out must not churn existing allocations"
+        );
+        assert_eq!(
+            store.get_job_config("web")?.id(),
+            job_config_id,
+            "scaling must not mint a new config version"
+        );
+
+        // Scale IN to 1: surplus retired newest-first.
+        store.set_task_scale_override("web", "default", "api", 1, 2, "operator", "test", "t")?;
+        scale_eval.handle(&store)?;
+        let remaining = store.allocs_for_job("web")?;
+        assert_eq!(remaining.len(), 1, "scale-in converges to the override");
+        assert_eq!(
+            remaining[0].id,
+            *existing_ids.iter().min().context("existing ids")?,
+            "scale-in retires newest allocations first"
+        );
+
+        // Resubmit with the SAME spec count (other fields changed): the
+        // override survives the deploy.
+        let v2 = JobConfig {
+            tasks: vec![TaskConfig {
+                count: TaskCount::new(2),
+                resources: json!({ "memory": 128 }),
+                config: json!({ "message": "v2" }),
+                ..TaskConfig::new("api", "service")
+            }],
+            ..job.clone()
+        };
+        store.handle_job_submit(&v2, &[submission.clone()])?;
+        let scale = store
+            .task_scale_for("web", "default", "api")?
+            .context("override must survive a resubmit with unchanged count")?;
+        assert_eq!(scale.count, Some(1));
+
+        // Resubmit that CHANGES the spec count: new intent, override
+        // cleared, the spec owns the count again.
+        let v3 = JobConfig {
+            tasks: vec![TaskConfig {
+                count: TaskCount::new(4),
+                resources: json!({ "memory": 128 }),
+                config: json!({ "message": "v3" }),
+                ..TaskConfig::new("api", "service")
+            }],
+            ..job.clone()
+        };
+        store.handle_job_submit(&v3, &[submission])?;
+        assert!(
+            store.task_scale_for("web", "default", "api")?.is_none(),
+            "a resubmit changing the spec count reclaims ownership"
+        );
+        assert_eq!(
+            store.effective_task_count("web", "default", "api", 4)?,
+            4,
+            "effective count returns to the spec"
+        );
+
+        Ok(())
+    }
+
+    /// The deferred scale-in lifecycle (docs/autoscaling.md): a pending
+    /// count leaves the effective count untouched until promotion, and
+    /// clearing drops the row entirely.
+    #[test]
+    fn pending_scale_in_waits_until_promoted() -> R<()> {
+        let store = setup_store()?;
+        store.set_task_scale_pending("web", "default", "api", 2, 6, "operator", "shrink", "t")?;
+
+        let scale = store
+            .task_scale_for("web", "default", "api")?
+            .context("pending row")?;
+        assert_eq!(scale.count, None);
+        assert_eq!(scale.pending_count, Some(2));
+        assert_eq!(
+            store.effective_task_count("web", "default", "api", 6)?,
+            6,
+            "a pending scale-in must not change the effective count"
+        );
+
+        let promoted = store.promote_pending_task_scales("web")?;
+        assert_eq!(promoted.len(), 1);
+        assert_eq!(promoted[0].count, Some(2));
+        assert_eq!(promoted[0].pending_count, None);
+        assert_eq!(store.effective_task_count("web", "default", "api", 6)?, 2);
+
+        assert!(store.clear_task_scale("web", "default", "api")?);
+        assert_eq!(store.effective_task_count("web", "default", "api", 6)?, 6);
+        assert!(!store.clear_task_scale("web", "default", "api")?);
+        Ok(())
     }
 
     #[test]

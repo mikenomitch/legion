@@ -948,6 +948,32 @@ pub fn get_migrations() -> Migrations<'static> {
         // Worker-type heartbeat cadence (heartbeat-scale plan §5): NULL =
         // the built-in default (2s). Served to workers at pre-registration.
         M::up("ALTER TABLE worker_type ADD COLUMN heartbeat_seconds INTEGER;").down(""),
+        // Count overrides (`legion job scale`, autoscaler plan §6.1): a
+        // task's effective desired count, layered over the spec without a
+        // new job config version. Keyed by the version-stable task tuple
+        // (the same handle slot retirement and keyed instances use), NOT
+        // the version-scoped task_config id, so overrides survive
+        // resubmits. `base_count` records the spec count the override was
+        // laid over — the resubmit-ownership arbiter (docs/autoscaling.md).
+        // `pending_count` holds a scale-in recorded during an active
+        // rollout, promoted to `count` when the rollout finishes; `count`
+        // is NULL while only a pending scale-in exists.
+        M::up(
+            "CREATE TABLE IF NOT EXISTS task_scale (
+            job_id STRING NOT NULL,
+            task_group STRING NOT NULL,
+            task_name STRING NOT NULL,
+            count INTEGER,
+            pending_count INTEGER,
+            base_count INTEGER NOT NULL,
+            source STRING NOT NULL,
+            reason STRING NOT NULL DEFAULT '',
+            principal STRING NOT NULL DEFAULT '',
+            updated_at TIMESTAMP NOT NULL,
+            PRIMARY KEY (job_id, task_group, task_name)
+        )",
+        )
+        .down("DROP TABLE IF EXISTS task_scale;"),
     ])
 }
 

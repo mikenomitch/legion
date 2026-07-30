@@ -275,6 +275,15 @@ pub fn handle_rollout_tick(eval: &Eval, store: &Store) -> R<String> {
         Some(&outcome.message),
     )?;
 
+    // A rollout reaching a terminal status releases any deferred scale-ins
+    // (docs/autoscaling.md): pending counts promote to applied and a
+    // `job_scale` eval reconciles the allocation set. A NotRaftLeader here
+    // propagates like the rest of this handler — the released eval retries
+    // the whole tick.
+    if is_terminal_rollout_status(&outcome.status) {
+        store.apply_pending_scales_after_rollout(&rollout.job_id, &rollout.to_job_config_id)?;
+    }
+
     if let Some(delay) = outcome.next_delay {
         if !is_terminal_rollout_status(&outcome.status)
             && !matches!(
@@ -405,6 +414,8 @@ pub fn stop_rollout(store: &Store, rollout_id: i64, revert: bool, priority: i64)
         "Rollout stopped"
     };
     store.update_rollout_status(rollout.id, "cancelled", false, Some(message))?;
+    // A cancelled rollout releases deferred scale-ins too.
+    store.apply_pending_scales_after_rollout(&rollout.job_id, &rollout.to_job_config_id)?;
     let metadata = json!({
         "status": "cancelled",
         "revert": revert,
@@ -1582,7 +1593,13 @@ fn build_group_plans(
                 {
                     store.count_live_keyed_instances(&rollout.job_id, &group, &name)?
                 }
-                Some((_, task)) => task.count.num,
+                // EFFECTIVE count, not the raw spec: a `legion job scale`
+                // scale-OUT mid-rollout grows the step targets on the next
+                // tick (docs/autoscaling.md; scale-in is recorded pending
+                // and never shrinks a live rollout's targets).
+                Some((_, task)) => {
+                    store.effective_task_count(&rollout.job_id, &group, &name, task.count.num)?
+                }
                 None => 0,
             };
             base_count = base_count.max(desired_new);
@@ -1600,8 +1617,17 @@ fn build_group_plans(
                     .is_some_and(|stateful| stateful.mode == crate::structs::InstanceMode::Slot)
                 {
                     // At most one slot-mode stateful task per group
-                    // (enforced at job admission).
-                    slot_task = Some((task.name.clone(), task.count.num));
+                    // (enforced at job admission). Effective count, same
+                    // reasoning as `desired_new` above.
+                    slot_task = Some((
+                        task.name.clone(),
+                        store.effective_task_count(
+                            &rollout.job_id,
+                            &group,
+                            &name,
+                            task.count.num,
+                        )?,
+                    ));
                 }
             }
 

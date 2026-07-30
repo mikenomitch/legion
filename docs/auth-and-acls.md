@@ -48,6 +48,7 @@ legion acl whoami
 | `exec` | exec into a running allocation | — | open a session (`host: true` for host-level runtimes) |
 | `action` | run declared actions on an allocation | — | run an action (scope with `action_names`) |
 | `template` | job templates | list/inspect | publish versions, delete (scope with `templates`) |
+| `scale` | task count overrides ([Scaling Jobs](autoscaling.md)) | scale status | `job scale` / reset (scope by job name) — deliberately separate from `job:write`, so a principal can resize without redeploy rights |
 
 Actions are `read` and `write` (`write` does not imply `read`; grant both).
 `state:read` is powerful — it can read every table in the state store —

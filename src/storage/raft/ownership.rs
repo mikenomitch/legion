@@ -166,6 +166,16 @@ const TABLE_OWNERS: &[(&str, Owner)] = &[
     ("acl_token", Owner::Lane(Lane::Control)),
     ("acl_user", Owner::Lane(Lane::Control)),
     ("join_token", Owner::Lane(Lane::Control)),
+    // Count overrides (`legion job scale`) are operator/autoscaler INTENT,
+    // like the job specs they layer over — and their lifecycle is coupled
+    // to the submit path: `handle_job_submit` arbitrates override
+    // ownership (`base_count`) inside the same control-lane op that writes
+    // the new config, which a scheduler-owned table would forbid (the plan
+    // leaned scheduler-lane; see the autoscaler calls doc for the
+    // deviation). The scheduler only READS effective counts; the
+    // reconciling `job_scale` eval is its own sequential scheduler-lane
+    // enqueue, exactly the JC-33 wrapper-sequential shape stop_job uses.
+    ("task_scale", Owner::Lane(Lane::Control)),
     // ── scheduler lane: placement + rollout progression ──────────────────
     ("allocation", Owner::Lane(Lane::Scheduler)),
     ("allocation_epoch", Owner::Lane(Lane::Scheduler)),

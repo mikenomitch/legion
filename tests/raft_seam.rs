@@ -82,6 +82,13 @@ const CLASSIFIED_MUTATIONS: &[&str] = &[
     "replace_job_kv_references",
     "request_job_restart",
     "set_node_availability",
+    // Count overrides (`legion job scale`): operator/autoscaler intent,
+    // control-owned so the submit-time ownership arbitration rides the
+    // job-submit capture (see storage::raft::ownership on `task_scale`).
+    "set_task_scale_override",
+    "set_task_scale_pending",
+    "clear_task_scale",
+    "promote_pending_task_scales",
     "stop_job",
     "sync_node_availability",
     "update_node_dyamic",
@@ -126,6 +133,8 @@ const CLASSIFIED_MUTATIONS: &[&str] = &[
     "remove_allocs_for_job",
     "remove_allocs_for_job_config",
     "remove_allocs_for_node",
+    // The scale-in half of the `job_scale` eval (docs/autoscaling.md).
+    "retire_surplus_allocations",
     "seed_keyed_instances",
     "set_instance_current_alloc",
     "set_instance_state",
@@ -250,6 +259,10 @@ fn lane_for(method: &str) -> Lane {
         | "replace_job_kv_references"
         | "request_job_restart"
         | "set_node_availability"
+        | "set_task_scale_override"
+        | "set_task_scale_pending"
+        | "clear_task_scale"
+        | "promote_pending_task_scales"
         | "stop_job"
         | "sync_node_availability"
         | "update_node_dyamic"
@@ -290,6 +303,7 @@ fn lane_for(method: &str) -> Lane {
         | "remove_allocs_for_job"
         | "remove_allocs_for_job_config"
         | "remove_allocs_for_node"
+        | "retire_surplus_allocations"
         | "seed_keyed_instances"
         | "set_instance_current_alloc"
         | "set_instance_state"

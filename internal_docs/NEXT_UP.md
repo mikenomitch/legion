@@ -1,33 +1,46 @@
 # Next Up: Current Focus
 
-The durability plan's workstreams
-([plans/durability-and-ops-execution-plan.md](plans/durability-and-ops-execution-plan.md))
-are **done**, including the 2026-07-28 round:
+The pre-benchmark hardening batch (2026-07-30,
+[calls](calls/pre-benchmark-hardening_calls.md)) is **done**: everything the
+AWS comparative benchmark
+([plans/aws-comparative-benchmark-plan.md](plans/aws-comparative-benchmark-plan.md))
+wanted fixed or observable before a campaign, minus the deliberately
+skipped items.
 
-- **Workstreams A + B** (2026-07-23): real Raft persistence (changeset
-  replication, membership, snapshots, backup/restore) and operational
-  table stakes (cordon/drain, version handshake, telemetry listener).
-- **Workstream C** (2026-07-24): `topology: lanes` unblocked —
-  single-writer table ownership, per-lane snapshots, voter-parity checks.
-- **Workstream D + adversarial verification** (2026-07-28): standing-split
-  resilience (worker-plane lane-write forwarding, accepted submits with
-  per-lane reconcilers, honest `/readyz`), the lane-isolation A/B numbers,
-  and the fix set from four skeptic sweeps (governor catch-up cap,
-  remove-member hardening, seed-snapshot purge gate, orphan-sweep grace,
-  plan-fence epoch mirror). Calls:
-  [calls/durability-and-ops-execution-plan_calls.md](calls/durability-and-ops-execution-plan_calls.md).
+- **Correctness under benchmark-shaped load**: apply-time re-validation of
+  node resource totals (the last unfenced plan input), raft-mode
+  concurrent-planning oversubscription tests (both topologies), eval
+  handling on the blocking pool, NotRaftLeader release backoff.
+- **Measurement**: the full `legion_raft_*` engine series with
+  capture-vs-propose bottleneck attribution, the opt-in worker `/metrics`
+  listener, OTLP metrics push for both registries
+  ([docs/metrics.md](../docs/metrics.md)).
+- **Scheduler plan-path cleanups** with before/after numbers
+  ([benchmarks/scheduler/README.md](../benchmarks/scheduler/README.md)) —
+  the TODO's "slowest bits" list is now empty; further wins want profiling.
+- **Autoscaler phase 1** — `legion job scale`
+  ([docs/autoscaling.md](../docs/autoscaling.md)): count overrides without
+  a new version or rollout, the `scale` ACL resource, the `job_scale`
+  eval. Gives the benchmark driver version-churn-free load control.
 
 ## The follow-up queue (in priority order)
 
-1. Per-lane tuning knobs, bottleneck tracing, Raft health UI — and finally
-   emitting the reserved `legion_raft_*` Prometheus series.
-2. Apply-time re-validation of node resource totals (the one plan-fence
-   input still unfenced — see TODO.md, Scheduling).
-3. Worker mTLS / per-node credentials (also upgrades raft transport auth
-   beyond the shared cluster secret).
-4. Idempotency records folded into their mutating op's capture (retry
+1. **`legion start worker --simulate N`** (AWS benchmark plan phase 0, own
+   mini-plan) — the one hard blocker for the campaign; deliberately NOT
+   started in this batch.
+2. Late-binding plan apply
+   ([plan](plans/late-binding-plan-apply-plan.md)) — skipped in this batch
+   by explicit decision; the contention benchmark (its phase 0) is the
+   entry point.
+3. Node pools consumed scheduling-side, gang scheduling, sysbatch — the
+   feature-parity set the comparative campaign's fairness record will be
+   read against (all planned, tracked in TODO.md § Scheduling).
+4. Per-lane tuning knobs + a Raft health UI page (the rest of the old
+   "knobs, tracing, UI" item).
+5. Worker mTLS / per-node credentials (also upgrades raft transport auth).
+6. Idempotency records folded into their mutating op's capture (retry
    atomicity — TODO.md, Persistence).
-5. OTLP metrics push + worker-side `/metrics`.
-6. Raft autopilot — speculative, default-off.
+7. Autoscaler phase 2 (usage collection) — shares the worker-metrics
+   surface started here; build with per-task runtime metrics.
 
 Higher-level backlog: [TODO.md](TODO.md).

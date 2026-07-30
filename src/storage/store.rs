@@ -223,6 +223,28 @@ pub struct PlanSubmission {
     pub expected_versions: BTreeMap<String, i64>,
 }
 
+/// One task's count override (`legion job scale`, docs/autoscaling.md),
+/// keyed by the version-stable task tuple so it survives resubmits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskScale {
+    pub job_id: String,
+    pub task_group: String,
+    pub task_name: String,
+    /// The applied override; `None` while only a pending scale-in exists.
+    pub count: Option<u32>,
+    /// A scale-in recorded during an active rollout, promoted into `count`
+    /// when the rollout reaches a terminal status.
+    pub pending_count: Option<u32>,
+    /// The spec count the override was laid over — the resubmit-ownership
+    /// arbiter (see `handle_job_submit_apply`).
+    pub base_count: u32,
+    /// `operator` today; `autoscaler` when the policy evaluator ships.
+    pub source: String,
+    pub reason: String,
+    pub principal: String,
+    pub updated_at: String,
+}
+
 #[derive(Debug, Clone)]
 pub enum PlanApplyOutcome {
     Applied(Vec<Allocation>),
@@ -5025,6 +5047,8 @@ impl Store {
         "#;
 
         tx.execute(delete_sql, [name])?;
+        // Count overrides die with the job (control-owned, same capture).
+        tx.execute("DELETE FROM task_scale WHERE job_id = ?;", [&job.id])?;
 
         for submission_hash in submission_hashes {
             let reference_count: i64 = tx.query_row(
@@ -5664,6 +5688,51 @@ impl Store {
 
         tx.execute(&INSERT_JOB_UPDATE, job_update_params)?;
 
+        // Count-override ownership arbitration (docs/autoscaling.md): an
+        // override records the spec count it was laid over (`base_count`).
+        // A resubmit whose spec count CHANGED expresses new intent — the
+        // override (and any pending scale-in) is cleared and the spec
+        // wins; an unchanged spec count leaves the override in place, so
+        // "my scale sticks across deploys" and "editing the spec does
+        // what it says" are both true. Overrides for tasks the new
+        // version no longer declares are orphans and cleared too.
+        // `task_scale` is control-owned precisely so this rides the same
+        // capture as the config write.
+        let mut scale_reset_events = Vec::new();
+        for t in &config.tasks {
+            let existing: Option<i64> = tx
+                .query_row(
+                    "SELECT base_count FROM task_scale \
+                     WHERE job_id = ?1 AND task_group = ?2 AND task_name = ?3;",
+                    params![job.id, t.group, t.name],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(base_count) = existing {
+                if i64::from(t.count.num) != base_count {
+                    tx.execute(
+                        "DELETE FROM task_scale \
+                         WHERE job_id = ?1 AND task_group = ?2 AND task_name = ?3;",
+                        params![job.id, t.group, t.name],
+                    )?;
+                    scale_reset_events.push(drafts::scale_reset(
+                        &job.id,
+                        &t.group,
+                        &t.name,
+                        "resubmit changed the spec count; the spec owns the count again",
+                    ));
+                }
+            }
+        }
+        tx.execute(
+            "DELETE FROM task_scale WHERE job_id = ?1 AND NOT EXISTS (\
+                 SELECT 1 FROM task_config \
+                 WHERE task_config.job_config_id = ?2 \
+                 AND task_config.group_name = task_scale.task_group \
+                 AND task_config.name = task_scale.task_name);",
+            params![job.id, job_config_id],
+        )?;
+
         // Initial task_status rows are seeded by the status-lane half of
         // the submit composite (`seed_task_statuses`, plan §7-C2, C-2) —
         // task_status is status-owned and must not ride this control-lane
@@ -5677,9 +5746,16 @@ impl Store {
         let submit_event =
             drafts::job_submit_outcome(&job.id, &outcome, next_version, config.tasks.len())
                 .and_then(|draft| self.stage_event_locked(&tx, draft));
+        let scale_reset_events: Vec<_> = scale_reset_events
+            .into_iter()
+            .filter_map(|draft| self.stage_event_locked(&tx, draft))
+            .collect();
         tx.commit()
             .map_err(|_| anyhow!("Error committing transaction"))?;
         self.publish_staged(submit_event);
+        for staged in scale_reset_events {
+            self.publish_staged(Some(staged));
+        }
         drop(conn);
 
         let cached_tasks = self.get_task_configs_for_job_config(outcome.job_config_id())?;
@@ -7683,10 +7759,19 @@ impl Store {
             return Ok((true, true));
         };
 
+        // COALESCE overlays a `legion job scale` override onto the spec
+        // count (docs/autoscaling.md) — this is how slot scale-in flows:
+        // the override shrinks the desired range, `retire_surplus_allocations`
+        // deletes the highest slots' allocations, and this check terminates
+        // their instances (honoring `retainOnScaleIn` below).
         let latest_task: Option<(i64, Option<String>)> = tx
             .query_row(
-                "SELECT task_config.count, task_config.stateful FROM task_config \
+                "SELECT COALESCE(task_scale.count, task_config.count), task_config.stateful \
+                 FROM task_config \
                  INNER JOIN job_config ON job_config.id = task_config.job_config_id \
+                 LEFT JOIN task_scale ON task_scale.job_id = task_config.job_id \
+                 AND task_scale.task_group = task_config.group_name \
+                 AND task_scale.task_name = task_config.name \
                  WHERE task_config.job_id = ?1 AND task_config.group_name = ?2 \
                  AND task_config.name = ?3 \
                  ORDER BY job_config.version DESC LIMIT 1;",
@@ -8477,6 +8562,376 @@ impl Store {
             .allocations_removed_for_job_config(job_config_id, &allocations);
 
         Ok(allocations)
+    }
+
+    // ── Count overrides (`legion job scale`, docs/autoscaling.md) ────────
+
+    /// Set (or update) a task's count override: the applied count wins over
+    /// the spec's `count.num` for every reader of desired count. Clears any
+    /// pending scale-in (a fresh override is newer intent). `base_count`
+    /// must be the CURRENT spec count — it is the resubmit-ownership
+    /// arbiter (`handle_job_submit_apply` clears the override when a
+    /// resubmit changes the spec count away from it).
+    #[instrument(err, skip(self, reason, principal))]
+    pub fn set_task_scale_override(
+        &self,
+        job_id: &str,
+        task_group: &str,
+        task_name: &str,
+        count: u32,
+        base_count: u32,
+        source: &str,
+        reason: &str,
+        principal: &str,
+    ) -> R<()> {
+        let (job_id, task_group, task_name) = (
+            job_id.to_owned(),
+            task_group.to_owned(),
+            task_name.to_owned(),
+        );
+        let (source, reason, principal) =
+            (source.to_owned(), reason.to_owned(), principal.to_owned());
+        self.replicated(Lane::Control, "set_task_scale_override", move |s| {
+            s.set_task_scale_override_apply(
+                &job_id,
+                &task_group,
+                &task_name,
+                count,
+                base_count,
+                &source,
+                &reason,
+                &principal,
+            )
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn set_task_scale_override_apply(
+        &self,
+        job_id: &str,
+        task_group: &str,
+        task_name: &str,
+        count: u32,
+        base_count: u32,
+        source: &str,
+        reason: &str,
+        principal: &str,
+    ) -> R<()> {
+        let now = Self::now_rfc3339()?;
+        let conn = self.write_connection()?;
+        conn.execute(
+            "INSERT OR REPLACE INTO task_scale \
+             (job_id, task_group, task_name, count, pending_count, base_count, source, reason, principal, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7, ?8, ?9);",
+            params![job_id, task_group, task_name, count, base_count, source, reason, principal, now],
+        )?;
+        Ok(())
+    }
+
+    /// Record a scale-in that must WAIT for the active rollout to finish
+    /// (docs/autoscaling.md, the ECS rule: scale-out applies mid-rollout,
+    /// scale-in defers). Keeps any applied override untouched; the pending
+    /// count is promoted by [`Store::promote_pending_task_scales`] when the
+    /// rollout reaches a terminal status.
+    #[instrument(err, skip(self, reason, principal))]
+    pub fn set_task_scale_pending(
+        &self,
+        job_id: &str,
+        task_group: &str,
+        task_name: &str,
+        pending: u32,
+        base_count: u32,
+        source: &str,
+        reason: &str,
+        principal: &str,
+    ) -> R<()> {
+        let (job_id, task_group, task_name) = (
+            job_id.to_owned(),
+            task_group.to_owned(),
+            task_name.to_owned(),
+        );
+        let (source, reason, principal) =
+            (source.to_owned(), reason.to_owned(), principal.to_owned());
+        self.replicated(Lane::Control, "set_task_scale_pending", move |s| {
+            s.set_task_scale_pending_apply(
+                &job_id,
+                &task_group,
+                &task_name,
+                pending,
+                base_count,
+                &source,
+                &reason,
+                &principal,
+            )
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn set_task_scale_pending_apply(
+        &self,
+        job_id: &str,
+        task_group: &str,
+        task_name: &str,
+        pending: u32,
+        base_count: u32,
+        source: &str,
+        reason: &str,
+        principal: &str,
+    ) -> R<()> {
+        let now = Self::now_rfc3339()?;
+        let conn = self.write_connection()?;
+        // Upsert preserving the applied `count` when a row already exists.
+        conn.execute(
+            "INSERT INTO task_scale \
+             (job_id, task_group, task_name, count, pending_count, base_count, source, reason, principal, updated_at) \
+             VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, ?7, ?8, ?9) \
+             ON CONFLICT(job_id, task_group, task_name) DO UPDATE SET \
+             pending_count = ?4, base_count = ?5, source = ?6, reason = ?7, principal = ?8, updated_at = ?9;",
+            params![job_id, task_group, task_name, pending, base_count, source, reason, principal, now],
+        )?;
+        Ok(())
+    }
+
+    /// Drop a task's override (and any pending scale-in), returning count
+    /// ownership to the job spec. Returns whether a row existed.
+    #[instrument(err, skip(self))]
+    pub fn clear_task_scale(&self, job_id: &str, task_group: &str, task_name: &str) -> R<bool> {
+        let (job_id, task_group, task_name) = (
+            job_id.to_owned(),
+            task_group.to_owned(),
+            task_name.to_owned(),
+        );
+        self.replicated(Lane::Control, "clear_task_scale", move |s| {
+            s.clear_task_scale_apply(&job_id, &task_group, &task_name)
+        })
+    }
+
+    fn clear_task_scale_apply(&self, job_id: &str, task_group: &str, task_name: &str) -> R<bool> {
+        let conn = self.write_connection()?;
+        let removed = conn.execute(
+            "DELETE FROM task_scale WHERE job_id = ?1 AND task_group = ?2 AND task_name = ?3;",
+            params![job_id, task_group, task_name],
+        )?;
+        Ok(removed > 0)
+    }
+
+    /// Promote every pending scale-in for a job into its applied count —
+    /// called when a rollout reaches a terminal status. Returns the
+    /// promoted rows (post-promotion), so the caller can emit events and
+    /// enqueue the reconciling `job_scale` eval.
+    #[instrument(err, skip(self))]
+    pub fn promote_pending_task_scales(&self, job_id: &str) -> R<Vec<TaskScale>> {
+        let job_id = job_id.to_owned();
+        self.replicated(Lane::Control, "promote_pending_task_scales", move |s| {
+            s.promote_pending_task_scales_apply(&job_id)
+        })
+    }
+
+    fn promote_pending_task_scales_apply(&self, job_id: &str) -> R<Vec<TaskScale>> {
+        let now = Self::now_rfc3339()?;
+        let conn = self.write_connection()?;
+        let mut stmt = conn.prepare(
+            "UPDATE task_scale SET count = pending_count, pending_count = NULL, updated_at = ?2 \
+             WHERE job_id = ?1 AND pending_count IS NOT NULL \
+             RETURNING job_id, task_group, task_name, count, pending_count, base_count, source, reason, principal, updated_at;",
+        )?;
+        let promoted =
+            Self::collect_rows(stmt.query_map(params![job_id, now], Self::task_scale_from_row)?)?;
+        Ok(promoted)
+    }
+
+    fn task_scale_from_row(row: &Row<'_>) -> Result<TaskScale, rusqlite::Error> {
+        Ok(TaskScale {
+            job_id: row.get(0)?,
+            task_group: row.get(1)?,
+            task_name: row.get(2)?,
+            count: row.get::<_, Option<i64>>(3)?.map(|count| count as u32),
+            pending_count: row.get::<_, Option<i64>>(4)?.map(|count| count as u32),
+            base_count: row.get::<_, i64>(5)? as u32,
+            source: row.get(6)?,
+            reason: row.get(7)?,
+            principal: row.get(8)?,
+            updated_at: row.get(9)?,
+        })
+    }
+
+    /// The override row for one task, if any.
+    pub fn task_scale_for(
+        &self,
+        job_id: &str,
+        task_group: &str,
+        task_name: &str,
+    ) -> R<Option<TaskScale>> {
+        let conn = self.read_connection()?;
+        Ok(conn
+            .query_row(
+                "SELECT job_id, task_group, task_name, count, pending_count, base_count, source, reason, principal, updated_at \
+                 FROM task_scale WHERE job_id = ?1 AND task_group = ?2 AND task_name = ?3;",
+                params![job_id, task_group, task_name],
+                Self::task_scale_from_row,
+            )
+            .optional()?)
+    }
+
+    /// Every override row for a job.
+    pub fn task_scales_for_job(&self, job_id: &str) -> R<Vec<TaskScale>> {
+        let conn = self.read_connection()?;
+        let mut stmt = conn.prepare(
+            "SELECT job_id, task_group, task_name, count, pending_count, base_count, source, reason, principal, updated_at \
+             FROM task_scale WHERE job_id = ?1 ORDER BY task_group, task_name;",
+        )?;
+        let scales = Self::collect_rows(stmt.query_map([job_id], Self::task_scale_from_row)?)?;
+        Ok(scales)
+    }
+
+    /// EFFECTIVE desired count for a task: the applied override when one
+    /// exists, else the given spec count. The one accessor every consumer
+    /// of desired count goes through (scheduler plans, slot retirement via
+    /// the SQL COALESCE in `slot_still_desired_tx`, rollout group plans,
+    /// surplus retirement).
+    pub fn effective_task_count(
+        &self,
+        job_id: &str,
+        task_group: &str,
+        task_name: &str,
+        spec_count: u32,
+    ) -> R<u32> {
+        Ok(self
+            .task_scale_for(job_id, task_group, task_name)?
+            // Overrides only bind to the spec count they were laid over
+            // (`base_count`); submitted configs always satisfy this (the
+            // submit arbitration clears mismatches), and it keeps dry-run
+            // plans over an EDITED spec honest about what a submit would
+            // converge to.
+            .filter(|scale| scale.base_count == spec_count)
+            .and_then(|scale| scale.count)
+            .unwrap_or(spec_count))
+    }
+
+    /// Retire surplus allocations for one job config down to each task's
+    /// effective desired count — the scale-in half of the `job_scale` eval.
+    /// Slot-mode stateful tasks lose their highest slot indices (the
+    /// released instances are terminated or set rescheduling by
+    /// `release_instance_bindings_tx` via `slot_still_desired_tx`, which
+    /// honors `stateful.storage.retainOnScaleIn`); stateless tasks lose
+    /// their newest allocations first. Returns the removed allocations.
+    #[instrument(err, skip_all)]
+    pub fn retire_surplus_allocations(&self, job_config_id: &str) -> R<Vec<Allocation>> {
+        let job_config_id = job_config_id.to_owned();
+        self.replicated(Lane::Scheduler, "retire_surplus_allocations", move |s| {
+            s.retire_surplus_allocations_apply(&job_config_id)
+        })
+    }
+
+    fn retire_surplus_allocations_apply(&self, job_config_id: &str) -> R<Vec<Allocation>> {
+        let Some(job_id) = self.job_id_for_job_config(job_config_id)? else {
+            return Ok(Vec::new());
+        };
+        let tasks = self.get_task_configs_for_job_config(job_config_id)?;
+        let allocations = self.allocs_for_job_config(job_config_id)?;
+
+        // Slot indexes for slot-mode ordering, one query for the config.
+        let mut slot_by_allocation: HashMap<i64, i64> = HashMap::new();
+        {
+            let conn = self.read_connection()?;
+            let mut stmt = conn.prepare(
+                "SELECT a.id, i.slot_index FROM allocation a \
+                 INNER JOIN instance i ON i.instance_id = a.instance_id \
+                 WHERE a.job_config_id = ?1 AND i.slot_index IS NOT NULL;",
+            )?;
+            let rows = Self::collect_rows(stmt.query_map([job_config_id], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+            })?)?;
+            slot_by_allocation.extend(rows);
+        }
+
+        let mut surplus: Vec<Allocation> = Vec::new();
+        for (task_id, task) in &tasks {
+            let keyed = task
+                .stateful
+                .as_ref()
+                .is_some_and(|stateful| stateful.mode == InstanceMode::Keyed);
+            // Keyed tasks have no count; count.per converges per group —
+            // both are rejected at the ScaleTask RPC and skipped here.
+            if keyed || task.count.per.is_some() {
+                continue;
+            }
+            let effective =
+                self.effective_task_count(&job_id, &task.group, &task.name, task.count.num)?;
+            let mut task_allocs: Vec<&Allocation> = allocations
+                .iter()
+                .filter(|allocation| allocation.task_config_id == *task_id)
+                .collect();
+            if task_allocs.len() <= effective as usize {
+                continue;
+            }
+            let slot_mode = task
+                .stateful
+                .as_ref()
+                .is_some_and(|stateful| stateful.mode == InstanceMode::Slot);
+            if slot_mode {
+                task_allocs.sort_by_key(|allocation| {
+                    std::cmp::Reverse(
+                        slot_by_allocation
+                            .get(&allocation.id)
+                            .copied()
+                            .unwrap_or(i64::MIN),
+                    )
+                });
+            } else {
+                task_allocs.sort_by_key(|allocation| std::cmp::Reverse(allocation.id));
+            }
+            let excess = task_allocs.len() - effective as usize;
+            surplus.extend(task_allocs.into_iter().take(excess).cloned());
+        }
+
+        if surplus.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut conn = self.write_connection()?;
+        let tx = Self::write_tx(&mut conn)?;
+        for allocation in &surplus {
+            tx.execute("DELETE FROM allocation WHERE id = ?;", [allocation.id])?;
+        }
+        self.release_instance_bindings_tx(&tx, &surplus)?;
+        self.bump_epochs_for_allocations_tx(&tx, &surplus)?;
+        tx.commit()?;
+        drop(conn);
+
+        self.cache_remove_allocations(&surplus)?;
+        self.events()
+            .allocations_removed_for_job_config(job_config_id, &surplus);
+
+        Ok(surplus)
+    }
+
+    /// Promote pending scale-ins after a rollout reached a terminal status,
+    /// emit their events, and enqueue the reconciling `job_scale` eval.
+    /// Composite of two sequential single-lane ops (Control promote →
+    /// Scheduler enqueue), the JC-33 wrapper-sequential shape.
+    pub fn apply_pending_scales_after_rollout(
+        &self,
+        job_id: &str,
+        job_config_id: &str,
+    ) -> R<usize> {
+        let promoted = self.promote_pending_task_scales(job_id)?;
+        if promoted.is_empty() {
+            return Ok(0);
+        }
+        for scale in &promoted {
+            self.events().scale_applied(
+                job_id,
+                &scale.task_group,
+                &scale.task_name,
+                None,
+                scale.count.unwrap_or_default(),
+                &scale.source,
+                "deferred scale-in applied after rollout",
+            );
+        }
+        self.enqueue_eval("job_scale", Some(job_id), Some(job_config_id), None, None)?;
+        Ok(promoted.len())
     }
 
     /// Bring a job config back to its desired allocation counts.

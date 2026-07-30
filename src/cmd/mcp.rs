@@ -14,8 +14,9 @@
 //! ## Safety
 //!
 //! By default only read-only / introspection tools are exposed. Mutating tools
-//! (`legion_job_run`, `legion_job_stop`, `legion_job_destroy`,
-//! `legion_instance_create`, `legion_instance_stop`, `legion_instance_start`,
+//! (`legion_job_run`, `legion_job_stop`, `legion_job_scale`,
+//! `legion_job_destroy`, `legion_instance_create`, `legion_instance_stop`,
+//! `legion_instance_start`,
 //! `legion_instance_destroy`) are gated behind `--allow-write`, mirroring the
 //! `read_only_safe` flag in the capabilities catalog. Even with
 //! `--allow-write`, `legion_state_query` always runs in read-only mode (no SQL
@@ -400,6 +401,31 @@ fn tool_defs() -> Vec<ToolDef> {
                 "additionalProperties": false
             }),
             mutates: true,
+        },
+        ToolDef {
+            name: "legion_job_scale",
+            description: "Change a task's count without a new job version or rollout (count override; docs/autoscaling.md). Pass count for a target, or reset=true to return ownership to the spec. Mutating.",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "Job name." },
+                    "count": { "type": "integer", "minimum": 0, "description": "Desired replica count. Omit with reset=true." },
+                    "reset": { "type": "boolean", "description": "Drop the override; the spec owns the count again." },
+                    "group": { "type": "string", "description": "Task group, when the job has more than one scalable task." },
+                    "task": { "type": "string", "description": "Task name, when the job has more than one scalable task." },
+                    "reason": { "type": "string", "description": "Audit note recorded with the override." },
+                    "idempotency_key": { "type": "string", "description": "Optional key to dedupe retries." }
+                },
+                "required": ["name"],
+                "additionalProperties": false
+            }),
+            mutates: true,
+        },
+        ToolDef {
+            name: "legion_job_scale_status",
+            description: "Per-task spec vs override vs effective counts for a job (read-only).",
+            input_schema: name_arg_schema,
+            mutates: false,
         },
         ToolDef {
             name: "legion_job_destroy",
@@ -1111,6 +1137,34 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
             }))
             .await
         }
+        "legion_job_scale" => {
+            let name = str_arg(&args, "name")?;
+            let count = args
+                .get("count")
+                .and_then(|value| value.as_u64())
+                .map(|count| count as u32);
+            let reset = args
+                .get("reset")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false);
+            let mut client = connect().await?;
+            grpc(client.scale_task(crate::structs::ScaleTaskRequest {
+                name,
+                task_group: opt_str_arg(&args, "group"),
+                task_name: opt_str_arg(&args, "task"),
+                count,
+                reset,
+                reason: opt_str_arg(&args, "reason"),
+                idempotency_key: opt_str_arg(&args, "idempotency_key"),
+            }))
+            .await
+        }
+        "legion_job_scale_status" => {
+            let name = str_arg(&args, "name")?;
+            let mut client = connect().await?;
+            grpc(client.get_job_scale_status(crate::structs::GetJobScaleStatusRequest { name }))
+                .await
+        }
         "legion_job_destroy" => {
             let name = str_arg(&args, "name")?;
             let idempotency_key = opt_str_arg(&args, "idempotency_key");
@@ -1357,6 +1411,7 @@ mod tests {
         let names: Vec<&str> = available_tools(true).iter().map(|t| t.name).collect();
         assert!(names.contains(&"legion_job_run"));
         assert!(names.contains(&"legion_job_stop"));
+        assert!(names.contains(&"legion_job_scale"));
         assert!(names.contains(&"legion_instance_create"));
         assert!(names.contains(&"legion_instance_stop"));
         assert!(names.contains(&"legion_instance_start"));

@@ -694,6 +694,9 @@ impl<'a> Scheduler<'a> {
 
         let status_map = HashMap::new();
         let mut tasks = Self::tasks_for_plan(job_config, &status_map)?;
+        // Count overrides apply to dry-run plans too, so `job plan` previews
+        // what a submit would actually converge to (job id == job name).
+        Self::apply_count_overrides(self.store, &job_config.name, &mut tasks)?;
         // Keyed tasks plan against live instances, not count.num, even for
         // not-yet-submitted configs (a fresh job simply has zero instances).
         Self::apply_keyed_instance_counts(self.store, &job_config.name, &mut tasks)?;
@@ -2225,9 +2228,36 @@ impl<'a> Scheduler<'a> {
 
         let mut tasks = Self::ready_tasks(tasks, &status_map)?;
         if let Some(job_id) = self.store.job_id_for_job_config(job_config_id)? {
+            // Overrides first, keyed counts second: keyed tasks' desired
+            // comes from live instances and must win (scaling keyed tasks
+            // is rejected at the ScaleTask RPC anyway).
+            Self::apply_count_overrides(self.store, &job_id, &mut tasks)?;
             Self::apply_keyed_instance_counts(self.store, &job_id, &mut tasks)?;
         }
         Ok(tasks)
+    }
+
+    /// Overlay `legion job scale` count overrides (docs/autoscaling.md):
+    /// the effective desired count is the override when one exists, else
+    /// the spec count already in the tuple. Keyed tasks (instance-driven)
+    /// and `count.per` tasks (group-converging) are skipped — both are
+    /// rejected at the ScaleTask RPC.
+    fn apply_count_overrides(
+        store: &Store,
+        job_id: &str,
+        tasks: &mut [(i64, TaskConfig, u32)],
+    ) -> R<()> {
+        for (_task_id, task, desired) in tasks.iter_mut() {
+            let keyed = task
+                .stateful
+                .as_ref()
+                .is_some_and(|stateful| stateful.mode == crate::structs::InstanceMode::Keyed);
+            if keyed || task.count.per.is_some() {
+                continue;
+            }
+            *desired = store.effective_task_count(job_id, &task.group, &task.name, *desired)?;
+        }
+        Ok(())
     }
 
     /// Replace `count.num`-derived desired counts with live keyed-instance

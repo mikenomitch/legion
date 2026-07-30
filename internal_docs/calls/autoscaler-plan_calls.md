@@ -119,7 +119,34 @@ survives deploys" and "editing the spec does what it says" — hold
 simultaneously. It is server-side apply's field ownership reduced to one
 stored integer and one comparison.
 
-## 5. Rollouts and scaling: scale-out applies, scale-in defers (the ECS rule)
+## 5. `task_scale` is CONTROL-lane, not scheduler-lane (implementation deviation from plan §6.1)
+
+**Call.** (Implementation, 2026-07-30.) The `task_scale` table and its four
+ops (`set_task_scale_override`, `set_task_scale_pending`,
+`clear_task_scale`, `promote_pending_task_scales`) ride the **Control**
+lane, where the plan said "scale writes ride the Scheduler lane". The
+reconciling `job_scale` eval enqueue stays a separate sequential
+scheduler-lane op (the stop_job shape), and `retire_surplus_allocations`
+(touching `allocation`) is scheduler-lane.
+
+**The alternative.** The plan's lane: scheduler-owned, letting the override
+write and the eval enqueue share one capture.
+
+**The trade-off.** A `job scale` is two sequential proposals (control write
++ scheduler enqueue) instead of one; under divergent lane leadership the
+override can land while the eval enqueue is rejected and retried by the
+caller.
+
+**Why.** The submit-time ownership arbitration (`base_count`, entry 4)
+must run inside `handle_job_submit_apply`'s transaction — which is a
+control-lane capture, and the single-writer ownership guard rejects
+foreign-lane writes inside a capture. A scheduler-owned `task_scale` would
+have forced the arbitration into a deferred reconciler (split-window
+inconsistency between spec and override) or a cross-lane composite the
+lanes design forbids. Overrides are operator intent, like the specs they
+layer over; intent lives on Control. The scheduler only reads them.
+
+## 6. Rollouts and scaling: scale-out applies, scale-in defers (the ECS rule)
 
 **Call.** During an active rollout, a scale-out takes effect on the next
 rollout tick (step targets recompute from effective count); a scale-in is
@@ -147,7 +174,34 @@ gets scale-out for free — and it is the behavior ECS shipped as the
 operationally-correct default: capacity up always, disruption down never
 mid-deploy.
 
-## 6. Node scale-up keys on unplaceable work, not a utilization threshold
+## 7. Deferred scale-in is a `pending_count` column, promoted on terminal rollout status
+
+**Call.** (Implementation, 2026-07-30.) A scale-in during an active rollout
+writes `task_scale.pending_count` (leaving any applied `count` untouched);
+every terminal rollout transition (`completed`, `failed`, `cancelled`,
+`completed_incomplete` — including operator `rollout stop`) promotes
+pending → applied and enqueues the `job_scale` eval. Effective-count
+readers ignore `pending_count` entirely.
+
+**The alternatives.** (a) Write the override immediately and let rollout
+ticks see the reduced count — but ticks recompute targets from effective
+count, so the "defer" rule (entry 6) would be a lie: targets would shrink
+mid-rollout. (b) Reject scale-in during rollouts (Nomad's 400) — entry 6
+already rejected that. (c) Keep the pending intent in manager memory —
+lost on failover, silently dropping an acknowledged operator action.
+
+**The trade-off.** A second nullable column with promotion plumbing on
+every terminal rollout path, and a rollout cancelled by a RESUBMIT starts
+a new rollout immediately — the pending scale-in then waits for *that*
+rollout too (consistent with the rule, but a user watching may be
+surprised; the scale-status surface shows the pending count).
+
+**Why.** It is the only shape where the recorded intent is durable
+(replicated row), the defer rule is actually true (readers never see the
+pending value), and promotion is exactly once (the UPDATE ... RETURNING
+flips pending to applied atomically).
+
+## 8. Node scale-up keys on unplaceable work, not a utilization threshold
 
 **Call.** The primary cluster-scaling signal is the scheduler's own placement
 shortfall (`required − placed`, with the failing constraint/resource shape),
@@ -169,7 +223,7 @@ signal: no threshold to tune, no APM dependency, and it works from zero nodes
 Karpenter lesson, and it composes with Legion's existing eval machinery
 instead of a parallel metrics pipeline.
 
-## 7. Node providers speak the exec ABI, not dylibs
+## 9. Node providers speak the exec ABI, not dylibs
 
 **Call.** The provider contract (`status` / `scale_up` / `terminate`) is a
 volume-style exec plugin: op as argv, JSON on stdin/stdout, timeout. v1 ships
@@ -192,7 +246,7 @@ not take the manager with it (dylib panics kill the host —
 in Terraform or the `aws` CLI with a shell script instead of waiting for us to
 compile their cloud's SDK into a dylib.
 
-## 8. Scaling gets its own ACL resource instead of riding `job:write`
+## 10. Scaling gets its own ACL resource instead of riding `job:write`
 
 **Call.** New `scale` resource (read/write, job-name scope). The split-out
 agent's recommended policy is `scale:write + job:read + node:read`, explicitly
@@ -211,7 +265,7 @@ capacity-oncall teammate need; without the resource, least privilege for the
 agent job is impossible and a compromised autoscaler is a full deploy
 credential. Cheap now, breaking later.
 
-## 9. Usage samples ride the heartbeat's existing status write; windows live in evaluator memory
+## 11. Usage samples ride the heartbeat's existing status write; windows live in evaluator memory
 
 **Call.** Per-allocation CPU/memory lands as optional fields on
 `AllocationHealth`, widening the `allocation_health` last-value row the
@@ -234,7 +288,7 @@ critical path and no retention/pruning subsystem to operate, while replication
 keeps the split-out agent and every manager able to read the same last values.
 The failover pause errs in the safe direction by construction.
 
-## 10. `min` defaults to 1, and `min: 0` must name its wake signal
+## 12. `min` defaults to 1, and `min: 0` must name its wake signal
 
 **Call.** Scale-to-zero is opt-in twice: `min: 0` plus at least one check with
 an `activation` threshold on a source that exists at zero replicas. Validation
@@ -261,7 +315,7 @@ to teach the KEDA lesson that 0→1 is a different mechanism from 1→N; shippin
 a knob that silently strands workloads at zero would spend the simplicity
 budget on support threads instead.
 
-## 11. UI: first-party pages now, a link-only extension primitive, panels deferred
+## 13. UI: first-party pages now, a link-only extension primitive, panels deferred
 
 **Call.** The autoscaler's UI is native SPA pages. The only generic mechanism
 in this plan is `ui: { link: ... }` — an "Apps" sidebar section linking out to
@@ -285,7 +339,7 @@ is how it ships wrong. The link primitive delivers most of the discoverability
 for none of the attack surface, and being first-party, the autoscaler never
 needed the mechanism anyway.
 
-## 12. v1 refuses `scaling` on keyed and `count.per` tasks
+## 14. v1 refuses `scaling` on keyed and `count.per` tasks
 
 **Call.** Validation rejects a `scaling` block on keyed-stateful tasks (no
 count to drive; instance lifecycle is the API's) and on `count: { per: ... }`

@@ -74,6 +74,8 @@ Even with `--allow-write`, `legion_state_query` is forced to read-only.
 | `legion_template_render` | no | Dry-run a template: validate variables, return the rendered jobspec without submitting. |
 | `legion_job_run` | **yes** | Submit/update a job from rendered JSON. |
 | `legion_job_stop` | **yes** | Stop a job. |
+| `legion_job_scale` | **yes** | Change a task's count without a new job version or rollout ([autoscaling.md](autoscaling.md)); supports `idempotency_key`. |
+| `legion_job_scale_status` | no | Per-task spec vs override vs effective counts. |
 | `legion_job_destroy` | **yes** | Destroy a job. |
 | `legion_template_run` | **yes** | Render a template with variables and submit the job (supports `idempotency_key`). |
 | `legion_template_upsert` | **yes** | Store Jsonnet as the next immutable version of a template. |

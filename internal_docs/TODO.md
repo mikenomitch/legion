@@ -19,6 +19,7 @@ How to use it:
 
 | PR | What it lands | Notes |
 | --- | --- | --- |
+| (branch `claude/pre-benchmark-features-mlgzyx`) | Pre-benchmark hardening: apply-time resource re-validation, raft engine metrics, worker /metrics + OTLP push, eval-path fixes, scheduler plan-path cleanups, `legion job scale` (autoscaler phase 1) | [calls](calls/pre-benchmark-hardening_calls.md) · [autoscaler calls #5/#7](calls/autoscaler-plan_calls.md) |
 | [#162](https://github.com/mikenomitch/legion/pull/162) | Lanes hardening: worker-write forwarding, split-tolerant submits, adversarial fixes | Plan §8 + calls doc in [durability-and-ops-execution-plan.md](plans/durability-and-ops-execution-plan.md) |
 | [#143](https://github.com/mikenomitch/legion/pull/143) | Note the node-level builtin resource override gap | Docs only; the fix itself is a todo below |
 | [#84](https://github.com/mikenomitch/legion/pull/84) | Instrument DB hot paths, batch task-status updates | Old; rebase or close |
@@ -506,10 +507,23 @@ The Pack/Helm equivalent. Job templates are in flight on
 Each of these should run inside the core binary *and* be splittable into its own
 job, so day 1 is simple and day N is performant. Each needs its own plan.
 
-- [ ] **Autoscaler** — [plan](plans/autoscaler-plan.md) (PLANNED) ·
+- [ ] **Autoscaler** — [plan](plans/autoscaler-plan.md) (IN EXECUTION) ·
       [calls](calls/autoscaler-plan_calls.md)
-  - [ ] Phase 1 — `legion job scale`: count overrides outside the job version,
-        `job_scale` eval, `scale` ACL resource, resubmit-ownership rules
+  - [x] Phase 1 — `legion job scale` (2026-07-30,
+        [docs/autoscaling.md](../docs/autoscaling.md)): `task_scale` count
+        overrides outside the job version (control-lane; see calls #5),
+        effective counts in every desired-count reader (scheduler plans,
+        slot retirement, rollout group plans), the `job_scale` eval
+        (retire surplus + reschedule shortfall), the ECS rollout rule with
+        `pending_count` promotion on terminal rollouts (calls #7),
+        `base_count` resubmit arbitration, the `scale` ACL resource,
+        ScaleTask/GetJobScaleStatus RPCs, CLI (`legion job scale`), MCP
+        tools, events. Deferred within phase 1: counts in
+        `legion job info` (scale status is the view), an ACL-scenario
+        test proving `scale:write` cannot RunJob (the endpoint matrix
+        covers the deny side), and regenerating `ui/src/gen/legion_pb.ts`
+        (no UI surface consumes the new RPCs yet; run the ui/README
+        protoc command when the scaling panel is built).
   - [ ] Phase 2 — per-allocation CPU/memory usage collection (heartbeat →
         `allocation_health`), request-vs-usage in CLI/UI
   - [ ] Phase 3 — task autoscaler MVP: `scaling { min, max, target }` block,

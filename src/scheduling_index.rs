@@ -695,7 +695,8 @@ impl IndexSet {
             };
             // Rank once per cell, not once per comparison: the comparator
             // used to recompute both sides' ranks O(n log n) times.
-            let mut ranked_cells: Vec<((u8, f64), (&Vec<u16>, &Vec<String>))> = cells
+            type RankedCell<'c> = ((u8, f64), (&'c Vec<u16>, &'c Vec<String>));
+            let mut ranked_cells: Vec<RankedCell<'_>> = cells
                 .into_iter()
                 .map(|cell| (ranked(cell.0), cell))
                 .collect();
