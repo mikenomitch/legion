@@ -1,0 +1,20 @@
+{
+  "name": "batch-burst",
+  "scheduling_policy": "bin_pack",
+  "iterations": 6,
+  "node_profiles": [
+    { "name": "batch", "count": 120, "memory_gb": 64, "cpus": 16,
+      "attrs": { "class": "batch" } }
+  ],
+  "job_types": [
+    { "name": "etl", "count": 12, "tasks_per_job": 1, "task_count_per_task": 20,
+      "resources": { "cpu": 1000, "memory": 2048 },
+      "constraints": { "class": "batch" } },
+    { "name": "index", "count": 4, "tasks_per_job": 2, "task_count_per_task": 8,
+      "resources": { "cpu": 2000, "memory": 4096 },
+      "constraints": { "class": "batch" } }
+  ],
+  "churn_every": 0,
+  "churn_nodes": 0,
+  "slo": { "min_evals_per_sec": 8.0, "max_p99_latency_ms": 750.0 }
+}

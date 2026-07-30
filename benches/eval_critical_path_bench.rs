@@ -75,6 +75,12 @@ fn eval_critical_path_latency_benchmark(c: &mut Criterion) {
                             let expected_versions = store
                                 .allocation_version_vector(&job_config_id, &HashSet::new())
                                 .expect("version vector");
+                            // Deliberately the STAGED two-step form (insert,
+                            // then apply after the claim) so the claim sits
+                            // between two store writes, maximizing write-lock
+                            // interleaving. The production scheduler path
+                            // fuses these into one op
+                            // (`Store::submit_and_apply_plan`).
                             let submission = store
                                 .insert_plan_submission(
                                     &job_config_id,

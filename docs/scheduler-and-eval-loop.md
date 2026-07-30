@@ -95,6 +95,22 @@ Legion maintains an epoch per `job_config_id` in `allocation_epoch_partition`.
 
 This keeps conflicts localized so unrelated jobs can schedule in parallel without invalidating each other's plans.
 
+The plan submission and its apply run as **one replicated store op**
+(`Store::submit_and_apply_plan`): one write-transaction boundary, and on
+raft one propose→quorum-commit→apply instead of two. The epoch sample is
+still taken before the capacity snapshot; only the write round-trips are
+fused.
+
+### Observing where plan time goes
+
+Every `plan_and_apply` records a per-phase wall-clock breakdown
+(`PlanTimings` on the outcome): node snapshot, epoch sample, task fetch,
+capacity snapshot, `build_plan`, and the fused apply. It is logged per
+plan at debug, exported as the `legion_scheduler_plan_phase_seconds{phase}`
+histogram ([metrics.md](metrics.md)), and aggregated by the benchmark
+runners ([testing-and-benchmarks.md](testing-and-benchmarks.md)). When
+scheduling latency moves, find the phase that moved first.
+
 ### Conflict handling
 
 A stale epoch causes plan rejection with a conflict error. The eval handler retries conflicts with bounded attempts via `Eval::plan_with_conflict_retries`.

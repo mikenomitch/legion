@@ -106,6 +106,7 @@ const CLASSIFIED_MUTATIONS: &[&str] = &[
     "set_eval_status",
     "apply_allocation_plan",
     "apply_plan_submission",
+    "submit_and_apply_plan",
     "create_keyed_instance",
     "create_rollout",
     "destroy_job_scheduler_cleanup",
@@ -262,6 +263,7 @@ fn lane_for(method: &str) -> Lane {
         | "requeue_in_flight_evals"
         | "set_eval_status"
         | "apply_plan_submission"
+        | "submit_and_apply_plan"
         | "create_keyed_instance"
         | "create_rollout"
         | "destroy_job_scheduler_cleanup"

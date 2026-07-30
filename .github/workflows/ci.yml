@@ -80,6 +80,7 @@ jobs:
               - 'src/manager/daemon.rs'
               - 'benchmarks/scheduler/**'
               - 'tests/scheduler_benchmark_slo.rs'
+              - 'tests/benchmark_support/**'
 
       - name: Install Rust toolchain
         if: steps.changes.outputs.scheduler == 'true'

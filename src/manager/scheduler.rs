@@ -59,6 +59,56 @@ impl PlanMode {
 pub struct PlanOutcome {
     pub allocations: Vec<Allocation>,
     pub deltas: Vec<LedgerDelta>,
+    /// Where the plan's wall-clock went, phase by phase (µs). Logged on
+    /// completion, observed into `legion_scheduler_plan_phase_seconds`,
+    /// and aggregated by the benchmark runners
+    /// (docs/testing-and-benchmarks.md).
+    pub timings: PlanTimings,
+}
+
+/// Per-phase wall-clock breakdown of one `plan_and_apply`, in microseconds.
+/// Phases are disjoint and in execution order; `total_us` covers the whole
+/// call, so `total_us - sum(phases)` is glue (mode bookkeeping, delta
+/// computation, logging).
+#[derive(Debug, Clone, Default)]
+pub struct PlanTimings {
+    /// Node snapshot fetch (`available_node_arcs`).
+    pub available_nodes_us: u64,
+    /// Optimistic-concurrency epoch sample over candidate nodes.
+    pub version_sample_us: u64,
+    /// Task-config load (cached configs + per-plan task list).
+    pub task_fetch_us: u64,
+    /// Capacity snapshot (allocations by node + free pools).
+    pub capacity_snapshot_us: u64,
+    /// Candidate construction, scoring, and placement (`build_plan`).
+    pub build_plan_us: u64,
+    /// `submit_and_apply_plan`: submission insert, epoch compare-and-set,
+    /// and allocation writes in one replicated op — on raft backends this
+    /// includes propose→quorum-commit→apply.
+    pub apply_us: u64,
+    /// Whole `plan_and_apply` call.
+    pub total_us: u64,
+}
+
+impl PlanTimings {
+    /// Observe every phase into the
+    /// `legion_scheduler_plan_phase_seconds{phase}` histogram family.
+    fn observe(&self) {
+        let metrics = crate::manager::telemetry::metrics();
+        for (phase, us) in [
+            ("available_nodes", self.available_nodes_us),
+            ("version_sample", self.version_sample_us),
+            ("task_fetch", self.task_fetch_us),
+            ("capacity_snapshot", self.capacity_snapshot_us),
+            ("build_plan", self.build_plan_us),
+            ("apply", self.apply_us),
+            ("total", self.total_us),
+        ] {
+            metrics
+                .scheduler_plan_phase_seconds
+                .observe(&[phase], us as f64 / 1_000_000.0);
+        }
+    }
 }
 
 /// How candidate construction went for one planned task — the scheduling
@@ -684,11 +734,13 @@ impl<'a> Scheduler<'a> {
         task_targets: Option<&HashMap<i64, u32>>,
     ) -> R<PlanOutcome> {
         let started = std::time::Instant::now();
+        let mut timings = PlanTimings::default();
         info!(%job_config_id, mode = mode.as_str(), target_override = task_targets.is_some(), "Starting scheduler plan_and_apply");
         let mut nodes = self.available_nodes()?;
         if let Some(excluded) = excluded_nodes {
             nodes.retain(|node| !excluded.contains(&node.id));
         }
+        timings.available_nodes_us = started.elapsed().as_micros() as u64;
         if nodes.is_empty() {
             bail!("No nodes available to place allocations");
         }
@@ -717,10 +769,13 @@ impl<'a> Scheduler<'a> {
         // never re-read. That is one batched query rather than one per node;
         // see `Store::allocation_version_vector_for_candidates`.
         let candidate_node_ids: Vec<&str> = nodes.iter().map(|node| node.id.as_str()).collect();
+        let version_sample_started = std::time::Instant::now();
         let candidate_versions = self
             .store
             .allocation_version_vector_for_candidates(job_config_id, &candidate_node_ids)?;
+        timings.version_sample_us = version_sample_started.elapsed().as_micros() as u64;
 
+        let task_fetch_started = std::time::Instant::now();
         let all_tasks = self
             .store
             .cached_task_configs_for_job_config(job_config_id)?;
@@ -730,6 +785,7 @@ impl<'a> Scheduler<'a> {
                 Self::apply_slot_staged_counts(self.store, &job_id, job_config_id, &mut tasks)?;
             }
         }
+        timings.task_fetch_us = task_fetch_started.elapsed().as_micros() as u64;
 
         // A `Fresh` plan replaces the job's allocations wholesale: whichever
         // handler asked for it either already dropped the previous ones
@@ -747,8 +803,10 @@ impl<'a> Scheduler<'a> {
         let drop_replaced = |allocation: &Allocation| {
             Some(allocation.job_id.as_str()) == replaced_job_id.as_deref()
         };
+        let capacity_snapshot_started = std::time::Instant::now();
         let snapshot =
             self.capacity_snapshot(replaced_job_id.is_some().then_some(&drop_replaced))?;
+        timings.capacity_snapshot_us = capacity_snapshot_started.elapsed().as_micros() as u64;
         let existing_counts =
             Self::existing_alloc_counts_by_task(job_config_id, &snapshot.allocations_by_node);
         if let Some(task_targets) = task_targets {
@@ -782,6 +840,7 @@ impl<'a> Scheduler<'a> {
             mode.clone(),
             task_targets,
         )?;
+        timings.build_plan_us = build_started.elapsed().as_micros() as u64;
         let indexed_tasks = index_report
             .iter()
             .filter(|usage| usage.index.is_some())
@@ -797,9 +856,12 @@ impl<'a> Scheduler<'a> {
         );
         if placements.is_empty() {
             info!(%job_config_id, "No placements generated during plan_and_apply");
+            timings.total_us = started.elapsed().as_micros() as u64;
+            timings.observe();
             return Ok(PlanOutcome {
                 allocations: Vec::new(),
                 deltas: Vec::new(),
+                timings,
             });
         }
 
@@ -815,14 +877,17 @@ impl<'a> Scheduler<'a> {
         // race the sample above exists to close.
         let expected_versions =
             Self::expected_versions_for(job_config_id, &candidate_versions, &affected_nodes);
-        let submission = self.store.insert_plan_submission(
+        // One replicated op for insert + apply: on raft backends the split
+        // form paid a second quorum round-trip per plan (see
+        // `Store::submit_and_apply_plan`).
+        let apply_started = std::time::Instant::now();
+        let (submission, apply_outcome) = self.store.submit_and_apply_plan(
             job_config_id,
             mode.as_str(),
             &placement_pairs,
             &expected_versions,
         )?;
-        let apply_started = std::time::Instant::now();
-        let allocations = match self.store.apply_plan_submission(&submission)? {
+        let allocations = match apply_outcome {
             PlanApplyOutcome::Applied(allocations) => allocations,
             PlanApplyOutcome::Rejected {
                 reason,
@@ -850,11 +915,15 @@ impl<'a> Scheduler<'a> {
                 }));
             }
         };
+        timings.apply_us = apply_started.elapsed().as_micros() as u64;
         let deltas = Self::allocations_delta(&affected_nodes, &allocations);
+        timings.total_us = started.elapsed().as_micros() as u64;
+        timings.observe();
 
         let outcome = PlanOutcome {
             allocations,
             deltas,
+            timings,
         };
         info!(
             %job_config_id,
@@ -863,6 +932,12 @@ impl<'a> Scheduler<'a> {
             affected_nodes = outcome.deltas.len(),
             apply_plan_submission_ms = apply_started.elapsed().as_millis() as u64,
             elapsed_ms = started.elapsed().as_millis() as u64,
+            available_nodes_us = outcome.timings.available_nodes_us,
+            version_sample_us = outcome.timings.version_sample_us,
+            task_fetch_us = outcome.timings.task_fetch_us,
+            capacity_snapshot_us = outcome.timings.capacity_snapshot_us,
+            build_plan_us = outcome.timings.build_plan_us,
+            apply_us = outcome.timings.apply_us,
             "Completed scheduler plan_and_apply"
         );
         Ok(outcome)

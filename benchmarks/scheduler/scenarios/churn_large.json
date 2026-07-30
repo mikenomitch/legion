@@ -1,0 +1,23 @@
+{
+  "name": "churn-large",
+  "scheduling_policy": "bin_pack",
+  "iterations": 4,
+  "node_profiles": [
+    { "name": "east", "count": 600, "memory_gb": 32, "cpus": 8,
+      "attrs": { "class": "general", "region": "us-east" } },
+    { "name": "west", "count": 400, "memory_gb": 32, "cpus": 8,
+      "attrs": { "class": "general", "region": "us-west" } }
+  ],
+  "job_types": [
+    { "name": "east-svc", "count": 12, "tasks_per_job": 2, "task_count_per_task": 6,
+      "resources": { "cpu": 500, "memory": 1024 },
+      "constraints": { "region": "us-east" } },
+    { "name": "west-svc", "count": 8, "tasks_per_job": 2, "task_count_per_task": 6,
+      "resources": { "cpu": 500, "memory": 1024 },
+      "constraints": { "region": "us-west" } }
+  ],
+  "scheduler_settings": { "indexes": { "topo": ["pool", "region"] } },
+  "churn_every": 1,
+  "churn_nodes": 25,
+  "slo": { "min_evals_per_sec": 3.0, "max_p99_latency_ms": 2000.0 }
+}
