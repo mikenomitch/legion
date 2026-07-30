@@ -172,6 +172,7 @@ fn task_allocation(
         task_artifacts: artifacts.to_string(),
         task_resources: String::new(),
         network: String::new(),
+        task_connect: String::new(),
     }
 }
 

@@ -191,15 +191,17 @@ All deferred from the volume plan v1:
 
 Plan: [service-discovery-final-plan.md](plans/service-discovery-final-plan.md) · docs: [service-discovery.md](../docs/service-discovery.md)
 
-v1 (catalog, ports, env, `list`/`resolve`/`doctor`) shipped. The v2 mesh, in the
+v1 (catalog, ports, env, `list`/`resolve`/`doctor`) shipped, and so has the
+connect layer: `connect.upstreams`, the per-node L4 forwarder, pluggable
+balancing, and control-plane intentions. What is left of the v2 mesh, in the
 plan's own adoption order:
 
 - [ ] Node-local DNS + template functions (no-NAT resolver, TCP fallback,
       `ndots:1`, coalesce/splay/fail-static)
 - [ ] Datapath plugin ABI + bridge/CNI shim (`mode: 'auto'`)
-- [ ] Per-node L4 forwarder + mTLS + **intentions** ("declare which other jobs
-      may reach my service") — needs workload identity, which has shipped
-- [ ] `connect.upstreams` — dial localhost, mesh routes it
+- [ ] **mTLS between forwarders**, so `service.allow` intentions rest on
+      cryptographic workload identity (which has shipped) rather than on the
+      control plane filtering the endpoint feed
 - [ ] L7 waypoint (retries, timeouts, canary split), then sandboxed WASM
       middleware filters
 - [ ] Mesh observability: RED metrics + service graph, `doctor` gaining
@@ -612,6 +614,21 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
 - [x] Query address and port from other services
 - [x] Catalog as a projection (no registration RPC, no drift, only-healthy)
 - [x] `legion service list | resolve | doctor`; works identically on Linux and macOS
+- [x] Connect to another service by name, load balanced, without writing any
+      client code: `connect.upstreams` -> `$LEGION_UPSTREAM_<SVC>`, a node-local
+      loopback forwarder, and `round_robin`/`random`/`least_conn` (pluggable —
+      one trait impl plus one registry row)
+- [x] Declare which other jobs may reach my service (`service.allow`, matched
+      against the consuming job id). Enforced on the **connect path only**: the
+      manager filters the per-node endpoint feed, so a denied consumer's
+      forwarder has nothing to dial. Not cryptographic identity — a task that
+      already knows a backend's `address:port` can still dial it directly, and
+      that hop is unauthenticated. mTLS below is what closes it.
+- [x] `legion service resolve --one`, `service` entries in the capability
+      catalog, and `legion_service_list`/`legion_service_resolve` MCP tools.
+      Note `service list -j` / `resolve -j` now emit the standard `{ok, data}`
+      envelope instead of a bare array (`jq '.[0]'` -> `jq '.data[0]'`, or use
+      `--one`, which needs no `jq`).
 
 ## Stateful workloads & volumes
 

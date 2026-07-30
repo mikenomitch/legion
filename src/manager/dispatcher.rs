@@ -158,6 +158,13 @@ pub fn build_task_allocation(
     } else {
         serde_json::to_string(&task.artifacts)?
     };
+    // Declared upstreams only — the loopback ports they were assigned live on
+    // `network.upstreams`. Empty string (not "{}") when the task declares no
+    // upstreams, so jobs that do not use connect stay byte-identical.
+    let task_connect = match task.connect.as_ref().filter(|connect| !connect.is_empty()) {
+        Some(connect) => serde_json::to_string(connect)?,
+        None => String::new(),
+    };
     // Same rule for volumes: jobs without storage are unchanged on the wire.
     let task_volumes = if volumes.is_empty() {
         String::new()
@@ -185,6 +192,7 @@ pub fn build_task_allocation(
         task_identities,
         self_terminate_after_seconds,
         task_artifacts,
+        task_connect,
         task_volumes,
         task_resources,
     })
@@ -432,6 +440,49 @@ mod tests {
             &[],
         )?;
         assert_eq!(built.self_terminate_after_seconds, 30);
+        Ok(())
+    }
+
+    #[test]
+    fn tasks_without_upstreams_carry_an_empty_connect_payload() -> R<()> {
+        // Jobs that do not use connect must stay byte-identical on the wire —
+        // an empty string, never "{}" — and an explicitly empty block counts
+        // as "no upstreams" so it cannot make the manager do endpoint work.
+        let task = TaskConfig {
+            config: json!({ "command": ["true"] }),
+            ..TaskConfig::new("web", "exec")
+        };
+        let built = build_task_allocation(&task, &allocation(None), None, &[])?;
+        assert_eq!(built.task_connect, "");
+
+        let task = TaskConfig {
+            connect: Some(crate::structs::ConnectConfig::default()),
+            ..task
+        };
+        let built = build_task_allocation(&task, &allocation(None), None, &[])?;
+        assert_eq!(built.task_connect, "");
+        Ok(())
+    }
+
+    #[test]
+    fn declared_upstreams_are_serialized_onto_the_allocation() -> R<()> {
+        let connect: crate::structs::ConnectConfig = serde_json::from_value(json!({
+            "upstreams": [
+                { "service": "db" },
+                { "service": "cache", "localPort": 6379, "balance": "least_conn" },
+            ]
+        }))?;
+        let task = TaskConfig {
+            config: json!({ "command": ["true"] }),
+            connect: Some(connect.clone()),
+            ..TaskConfig::new("api", "exec")
+        };
+
+        let built = build_task_allocation(&task, &allocation(None), None, &[])?;
+        let decoded: crate::structs::ConnectConfig = serde_json::from_str(&built.task_connect)?;
+        assert_eq!(decoded, connect);
+        // camelCase on the wire, like the rest of the jobspec.
+        assert!(built.task_connect.contains("\"localPort\":6379"));
         Ok(())
     }
 

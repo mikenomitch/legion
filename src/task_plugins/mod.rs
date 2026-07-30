@@ -53,9 +53,10 @@ pub fn spawn_task_process(cmd: &mut Command) -> R<Child> {
     cmd.spawn().context("Failed to spawn task process")
 }
 
-/// Legion-provided environment for a task: allocation identity plus any
-/// assigned ports (`LEGION_PORT_*`, `LEGION_ADDR_*`, ...). Task plugins apply
-/// these before user-declared env so user values win on key conflicts.
+/// Legion-provided environment for a task: allocation identity, any assigned
+/// ports (`LEGION_PORT_*`, `LEGION_ADDR_*`, ...) and any declared upstreams
+/// (`LEGION_UPSTREAM_*`, `LEGION_UPSTREAM_PORT_*`). Task plugins apply these
+/// before user-declared env so user values win on key conflicts.
 pub fn allocation_env(allocation: &Allocation, task: &TaskConfig) -> Vec<(String, String)> {
     let mut pairs = vec![
         ("LEGION_ALLOC_ID".to_string(), allocation.id.to_string()),
@@ -452,6 +453,7 @@ pub fn validate_job_config(config: &JobConfig) -> R<()> {
         task.validate_checks()?;
         task.validate_kv_injections()?;
         task.validate_network()?;
+        task.validate_connect()?;
         task.validate_stateful()?;
         task.validate_volumes()?;
         task.validate_identities()?;

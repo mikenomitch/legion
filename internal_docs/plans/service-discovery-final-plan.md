@@ -86,6 +86,61 @@ forwarder), intentions (v2, needs workload identity + forwarder), cross-service 
 injection (never — the K8s env-var E2BIG lesson), drain-before-SIGTERM (v2, rollout
 integration).
 
+### 2a. Shipped after v1: "Connect v1" (upstreams + forwarder + balancing)
+
+Two of those v2 items landed early, in a deliberately reduced form, because they
+turned out not to need the rest of the mesh. User-facing docs:
+[docs/service-discovery.md](../../docs/service-discovery.md#connecting-to-services-the-connect-block).
+
+**Shipped:**
+- **`connect.upstreams`** on a task: `{ service, localPort?, balance? }`. Loopback ports
+  are assigned at placement out of the *same* per-node used-port set as host ports
+  (statics across both lists first, then dynamics from one cursor), persisted on
+  `AllocNetwork.upstreams`, and injected as `LEGION_UPSTREAM_<SVC>` /
+  `LEGION_UPSTREAM_PORT_<SVC>`.
+- **Per-node L4 forwarder** (`src/worker/forwarder.rs`): one loopback TCP listener per
+  `(allocation, upstream service)`; dial with a 2s timeout, fail over across up to 3
+  candidates, then `copy_bidirectional`. Never a per-task sidecar — the anti-pattern §1
+  calls out. Bind failures warn once and retry on the next heartbeat; nothing here can
+  kill the heartbeat loop.
+- **Pluggable balancing** (`src/worker/balance.rs`): `Balancer` trait + registry;
+  `round_robin` (default), `random`, `least_conn`. The wire carries the strategy *name*,
+  so a new strategy is one impl + one row in the `BALANCERS` table — no proto change, no
+  migration. That table is the only name list: config validation reads it too, so a
+  name and an implementation cannot drift apart.
+- **Endpoint feed on the heartbeat** (`HeartbeatReply.upstream_endpoints`, every
+  `WORKER_HEARTBEAT_DURATION_SEC` = 2s): healthy endpoints only, already
+  intention-filtered, one entry per (allocation, service). Fast path returns an empty
+  vector without touching the store when no desired allocation declares upstreams, so
+  the §6 budget for nodes running plain jobs is literally zero extra queries.
+- **Fail-static**, exactly as the critique required: endpoints are swapped only after a
+  *successful* heartbeat, so a manager outage keeps the last known good set; an explicit
+  empty list is authoritative.
+- **Intentions (`service.allow`)** — but only the control-plane half (see below).
+- **Agent/CLI surface**: `legion service resolve <svc> --one` (a single random
+  `address:port`, so scripts skip `jq`), `--json` on all three subcommands through the
+  standard output envelope, `doctor` reporting the service's `allow` list, the three
+  `service.*` entries in the capability catalog, and read-only MCP tools
+  `legion_service_list` / `legion_service_resolve`.
+
+**Deliberately still v2:**
+- **mTLS / workload-identity-backed intentions.** `service.allow` today is enforced by
+  the manager filtering the endpoint feed plus the forwarder having nothing to dial. It
+  is *not* cryptographic identity: it does not stop a task that already knows a
+  backend's `address:port`, and the forwarder-to-backend hop is unauthenticated and
+  unencrypted. Legion now has workload identity, so this is the natural next step, and
+  `service.allow` is already the policy input it will read.
+- **DNS + template functions** — item 1 of §8; connect covers the "dial a service"
+  case without a resolver, but not name-based config or non-upstream lookups.
+- **Datapath plugin ABI + bridge/CNI shim** — item 2 of §8. The forwarder is
+  deliberately pure userspace loopback TCP (no netns, no iptables, no `SO_REUSEPORT`)
+  so it behaves identically on macOS and Linux; isolation still needs the plugin.
+- **L7 waypoint + WASM middleware** — item 4. Balancing today is per *connection*, not
+  per request, and there are no mid-stream retries.
+- **Observability service graph** — item 5. The forwarder logs per connection at
+  `debug` and emits no RED metrics yet; `doctor` still reasons about the catalog only,
+  not live connect traffic.
+
 ---
 
 ## 3. Grounded integration map (from code recon)
@@ -252,8 +307,8 @@ cargo run -- join <TOKEN>
 cargo run -- job run configs/jobs/service-demo.jsonnet
 
 # V1 env vars: task got its port and bound it
-cargo run -- service resolve web -j        # → [{"address":"127.0.0.1","port":2XXXX,...}]
-curl "$(cargo run -q -- service resolve web -j | jq -r '.[0] | "\(.address):\(.port)"')"
+cargo run -- service resolve web -j        # → {"ok":true,"data":[{"address":"127.0.0.1",...}]}
+curl "http://$(cargo run -q -- service resolve web --one)"
 # → HTTP 200 directory listing from python http.server
 
 # V2 only-healthy: kill the server process (not via legion)
@@ -291,6 +346,11 @@ Adoption path stays exactly as designed post-critique, now DX-annotated:
    ports; per-node, never per-task — no sidecar lifecycle class of bugs; SLO'd,
    zero-drop reloads. *DX: adoption = one block; `doctor` learns to name intention
    denials (the Hubble "which policy denied it" lesson).*
+   → **Partly shipped** (see §2a): the forwarder, `connect.upstreams`, pluggable
+   balancing, and control-plane-enforced intentions are in, and `doctor` prints a
+   service's `allow` list. Still open: mTLS, so intentions rest on workload identity
+   rather than on the endpoint feed; and naming *which* consumer a specific connection
+   was denied for, which needs the datapath telemetry from item 5.
 4. **L7 waypoint** then **WASM middleware**: opt-in, bounded, fail-policied.
 5. **Observability**: RED metrics + service graph from the data path Legion already
    owns; `doctor` gains live-traffic evidence.

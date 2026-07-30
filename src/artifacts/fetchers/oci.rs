@@ -417,7 +417,7 @@ mod tests {
             checksum: None,
             media_type: None,
             credential: None,
-            limits: &limits,
+            limits,
         }
     }
 

@@ -28,7 +28,18 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler
 
+      # `cargo test --all` links ~29 test binaries, and at full debuginfo the
+      # target dir reaches ~23 GiB — more than the ~14 GiB an ubuntu-latest
+      # runner has free. The job then dies mid-link with
+      # `ld terminated with signal 7 [Bus error]`, or the runner disappears
+      # outright (step stuck `in_progress`, logs 404). Dropping debuginfo takes
+      # the same tree to ~3.5 GiB and links faster; only backtrace detail is
+      # lost, never test behavior. Use `line-tables-only` instead of `0` if
+      # file/line in panic backtraces is worth the extra size.
       - name: Run cargo tests
+        env:
+          CARGO_PROFILE_DEV_DEBUG: 0
+          CARGO_PROFILE_TEST_DEBUG: 0
         run: cargo test --all --locked
 
   cargo-clippy:

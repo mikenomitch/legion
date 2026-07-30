@@ -104,7 +104,7 @@ fn submit_jobs(store: &Store, jobs: &[JobConfig]) -> anyhow::Result<Vec<String>>
         is_primary: true,
     };
     for job in jobs {
-        store.handle_job_submit(job, &[submission.clone()])?;
+        store.handle_job_submit(job, std::slice::from_ref(&submission))?;
         ids.push(store.get_job_config(&job.name)?.id());
     }
     Ok(ids)

@@ -1,6 +1,8 @@
 pub mod artifact_credentials;
+pub mod balance;
 pub mod daemon;
 pub mod exec;
+pub mod forwarder;
 pub mod identity;
 pub mod log_sink;
 pub mod logs;

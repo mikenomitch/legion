@@ -5,7 +5,7 @@
 //   legion service list
 //   legion service resolve web
 //   legion service doctor web
-//   curl "$(legion service resolve web -j | jq -r '.[0] | "\(.address):\(.port)"')"
+//   curl "http://$(legion service resolve web --one)"
 {
     name: "service-demo",
     tasks: [

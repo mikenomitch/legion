@@ -4585,6 +4585,11 @@ impl Manager for ManagerDaemonService {
 
         let desired_allocations = build_desired_allocations(&self.store, &id, &req.allocation_ids)
             .map_err(|e| map_store_error("Error building desired allocations", e))?;
+        // Endpoint feed for the node-local upstream forwarders. Costs nothing
+        // (no store access at all) when no desired allocation uses connect, and
+        // is infallible by construction: a connect-layer problem must never
+        // stop this node from reconciling its allocations.
+        let upstream_endpoints = build_upstream_endpoints(&self.store, &desired_allocations);
         // Reclaim work for this node. Re-sent every heartbeat until the worker
         // confirms, so a worker that dies mid-destroy simply retries.
         let volume_destroy = build_volume_destroy_requests(&self.store, &id);
@@ -4592,6 +4597,7 @@ impl Manager for ManagerDaemonService {
         let reply = HeartbeatReply {
             message: "ack".into(),
             desired_allocations,
+            upstream_endpoints,
             volume_destroy,
         };
 
@@ -5438,6 +5444,10 @@ impl Manager for ManagerDaemonService {
                     healthy_count: 0,
                     total_count: 0,
                     tags: entry.tags,
+                    // Intentions come from the same task config the rest of the
+                    // summary does, so `doctor` can explain a denied consumer
+                    // with plain job:read.
+                    allow: entry.allow,
                     meta: entry.meta.into_iter().collect(),
                 });
         }
@@ -5451,6 +5461,7 @@ impl Manager for ManagerDaemonService {
                     healthy_count: 0,
                     total_count: 0,
                     tags: endpoint.tags.clone(),
+                    allow: endpoint.allow.clone(),
                     meta: endpoint.meta.clone().into_iter().collect(),
                 });
             summary.total_count += 1;
@@ -7000,6 +7011,128 @@ fn build_desired_allocations(
     }
 
     Ok(allocations)
+}
+
+/// Resolve the current endpoint set for every upstream declared by this node's
+/// desired allocations — the service-discovery feed the worker's loopback
+/// forwarders are driven from.
+///
+/// Fast path: allocations carry their `connect` block on the wire, so when no
+/// desired allocation declares upstreams this returns an empty vector without
+/// touching the store. Nodes running only plain jobs therefore pay zero extra
+/// queries per heartbeat (heartbeats run every
+/// `WORKER_HEARTBEAT_DURATION_SEC`, so this is the hot path).
+///
+/// Otherwise each *distinct* `(upstream service, consuming job)` pair is
+/// resolved once and memoized: the store lookup is an indexed seek over just
+/// that service's rows (see [`Store::service_endpoints`]), and the resulting
+/// wire list is shared by every allocation of the same job — a node running
+/// `count: 40` of one client task would otherwise rebuild the identical list 40
+/// times, every 2s. Endpoints are filtered to healthy ones and gated by the
+/// target service's `service.allow` intentions against the *consuming*
+/// allocation's job id; a denied consumer gets an empty list rather than an
+/// error.
+///
+/// The feed is **additive and never fatal** — which is why it returns a plain
+/// `Vec` and not an `R<_>`. A store failure (or an unparseable stored payload)
+/// omits that upstream's entry instead of failing the heartbeat: the worker only
+/// calls `set_endpoints` for entries actually present in the reply, so an
+/// omitted upstream keeps its last known good endpoints — the same fail-static
+/// property, without taking the node's whole allocation reconciliation (and,
+/// after each stateful task's fence window, its running allocations) down with
+/// it.
+fn build_upstream_endpoints(
+    store: &Store,
+    desired: &[crate::structs::TaskAllocation],
+) -> Vec<crate::structs::UpstreamEndpoints> {
+    if desired
+        .iter()
+        .all(|allocation| allocation.task_connect.trim().is_empty())
+    {
+        return Vec::new();
+    }
+
+    // Keyed by (service, consuming job id) because intentions are per consumer:
+    // the same service yields a different list to a permitted and a denied job.
+    let mut resolved: HashMap<(String, String), Vec<ServiceEndpoint>> = HashMap::new();
+    let mut upstreams = Vec::new();
+
+    for allocation in desired {
+        if allocation.task_connect.trim().is_empty() {
+            continue;
+        }
+        // A payload we wrote ourselves failing to parse is a manager bug, and
+        // retrying cannot fix it — skip this allocation's upstreams rather than
+        // fail the heartbeat and stall reconciliation for the whole node.
+        let connect: crate::structs::ConnectConfig =
+            match serde_json::from_str(&allocation.task_connect) {
+                Ok(connect) => connect,
+                Err(err) => {
+                    warn!(
+                        allocation_id = allocation.allocation_id,
+                        error = ?err,
+                        "Skipping upstream endpoints; invalid connect payload"
+                    );
+                    continue;
+                }
+            };
+        for upstream in &connect.upstreams {
+            let key = (upstream.service.clone(), allocation.job_id.clone());
+            if !resolved.contains_key(&key) {
+                let rows = match store.service_endpoints(Some(&upstream.service)) {
+                    Ok(rows) => rows,
+                    Err(err) => {
+                        // Same reasoning as the corrupt-payload arm above:
+                        // omitting this upstream leaves the forwarder on its
+                        // last known good endpoints, while failing here would
+                        // stall this node's reconciliation entirely.
+                        warn!(
+                            allocation_id = allocation.allocation_id,
+                            service = %upstream.service,
+                            error = ?err,
+                            "Skipping upstream endpoints; service lookup failed"
+                        );
+                        continue;
+                    }
+                };
+                let endpoints = rows
+                    .into_iter()
+                    .filter(|row| {
+                        row.healthy && crate::structs::allow_permits(&row.allow, &allocation.job_id)
+                    })
+                    .map(|row| ServiceEndpoint {
+                        service: row.service,
+                        job_id: row.job_id,
+                        task_name: row.task_name,
+                        allocation_id: row.allocation_id,
+                        node_id: row.node_id,
+                        address: row.address.unwrap_or_default(),
+                        port: u32::from(row.port.unwrap_or(0)),
+                        healthy: row.healthy,
+                        health_status: row.health_status,
+                        tags: row.tags,
+                        meta: row.meta.into_iter().collect(),
+                        port_label: row.port_label.unwrap_or_default(),
+                    })
+                    .collect::<Vec<_>>();
+                resolved.insert(key.clone(), endpoints);
+            }
+            let endpoints = resolved.get(&key).cloned().unwrap_or_default();
+            debug!(
+                allocation_id = allocation.allocation_id,
+                service = %upstream.service,
+                endpoints = endpoints.len(),
+                "Resolved upstream endpoints"
+            );
+            upstreams.push(crate::structs::UpstreamEndpoints {
+                allocation_id: allocation.allocation_id,
+                service: upstream.service.clone(),
+                endpoints,
+            });
+        }
+    }
+
+    upstreams
 }
 
 /// Apply the volume operation outcomes a worker reported.
@@ -9919,6 +10052,245 @@ mod tests {
         let desired = build_desired_allocations(&store, "node-a", &[allocation.id])?;
         assert_eq!(desired.len(), 1);
 
+        Ok(())
+    }
+
+    //
+    // CONNECT: UPSTREAM ENDPOINT FEED (see docs/service-discovery.md)
+    //
+
+    /// Submit a one-task job publishing `<name>` on a static port, place it on
+    /// `node-a`, and (optionally) mark it healthy. Distinct ports keep several
+    /// services co-resident on one node.
+    fn seed_upstream_service(
+        store: &Store,
+        name: &str,
+        port: u16,
+        allow: &[&str],
+        healthy: bool,
+    ) -> R<()> {
+        let mut task = TaskConfig::new(name, "noop");
+        task.service = Some(serde_json::from_value(json!({
+            "port": port,
+            "allow": allow,
+        }))?);
+        let job = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: format!("svc-{name}"),
+            tasks: vec![task],
+            version: None,
+        };
+        store.handle_job_submit(&job, &[submission()])?;
+        let job_config_id = store.get_job_config(&job.name)?.id();
+        let task_id = store.get_task_configs_for_job_config(&job_config_id)?[0].0;
+        let allocation = store.place_alloc("node-a", task_id)?;
+        if healthy {
+            store.upsert_allocation_health_snapshots(
+                "node-a",
+                &[AllocationHealth {
+                    allocation_id: allocation.id,
+                    healthy: true,
+                    status: "healthy".into(),
+                    artifact_states: None,
+                }],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// A desired allocation for `job_id` declaring one upstream. Only the
+    /// fields the endpoint feed reads are populated.
+    fn consumer_allocation(
+        allocation_id: i64,
+        job_id: &str,
+        service: &str,
+    ) -> crate::structs::TaskAllocation {
+        crate::structs::TaskAllocation {
+            allocation_id,
+            job_id: job_id.into(),
+            task_connect: json!({ "upstreams": [{ "service": service }] }).to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn upstream_endpoints_fast_path_never_touches_the_store() -> R<()> {
+        // Heartbeats run every 2s on every node, so jobs that declare no
+        // upstreams must cost exactly zero store reads. `read_index` counts
+        // every read connection checkout, so it is the honest witness.
+        let store = setup_store()?;
+        insert_node(&store, "node-a")?;
+        seed_upstream_service(&store, "web", 18080, &[], true)?;
+
+        let plain = crate::structs::TaskAllocation {
+            allocation_id: 1,
+            job_id: "plain".into(),
+            ..Default::default()
+        };
+        let reads_before = store.read_index.load(std::sync::atomic::Ordering::Relaxed);
+        let endpoints = build_upstream_endpoints(&store, std::slice::from_ref(&plain));
+        assert!(endpoints.is_empty());
+        assert_eq!(
+            store.read_index.load(std::sync::atomic::Ordering::Relaxed),
+            reads_before,
+            "fast path must not read the store"
+        );
+
+        // An empty desired set is the same story.
+        let endpoints = build_upstream_endpoints(&store, &[]);
+        assert!(endpoints.is_empty());
+        assert_eq!(
+            store.read_index.load(std::sync::atomic::Ordering::Relaxed),
+            reads_before
+        );
+
+        // …but one allocation with upstreams does put the store to work.
+        let consumer = consumer_allocation(2, "consumer", "web");
+        let endpoints = build_upstream_endpoints(&store, &[plain, consumer]);
+        assert_eq!(endpoints.len(), 1);
+        assert_eq!(endpoints[0].allocation_id, 2);
+        assert_eq!(endpoints[0].service, "web");
+        assert_eq!(endpoints[0].endpoints.len(), 1);
+        assert!(
+            store.read_index.load(std::sync::atomic::Ordering::Relaxed) > reads_before,
+            "resolving an upstream must read the store"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn upstream_endpoints_are_healthy_only_and_memoized_per_service_and_consumer() -> R<()> {
+        let store = setup_store()?;
+        insert_node(&store, "node-a")?;
+        seed_upstream_service(&store, "web", 18081, &[], true)?;
+        seed_upstream_service(&store, "starting", 18082, &[], false)?;
+
+        // A node running `count: N` of one client task asks for the same
+        // (service, job) pair N times per heartbeat; it must be resolved once.
+        let desired = vec![
+            consumer_allocation(1, "consumer", "web"),
+            consumer_allocation(2, "consumer", "web"),
+            consumer_allocation(3, "consumer", "starting"),
+        ];
+        let reads_before = store.read_index.load(std::sync::atomic::Ordering::Relaxed);
+        let endpoints = build_upstream_endpoints(&store, &desired);
+        let reads = store.read_index.load(std::sync::atomic::Ordering::Relaxed) - reads_before;
+
+        assert_eq!(endpoints.len(), 3);
+        assert_eq!(endpoints[0].endpoints.len(), 1);
+        assert_eq!(endpoints[1].endpoints.len(), 1);
+        // No health snapshot yet => not healthy => not dialable.
+        assert!(endpoints[2].endpoints.is_empty());
+        assert_eq!(reads, 2, "each distinct upstream service is resolved once");
+
+        let endpoint = &endpoints[0].endpoints[0];
+        assert_eq!(endpoint.service, "web");
+        assert_eq!(endpoint.port, 18081);
+        assert!(endpoint.healthy);
+
+        // Two *different* consuming jobs cannot share a memo entry: intentions
+        // are evaluated per consumer, so each gets its own lookup.
+        let desired = vec![
+            consumer_allocation(1, "consumer-a", "web"),
+            consumer_allocation(2, "consumer-a", "web"),
+            consumer_allocation(3, "consumer-b", "web"),
+        ];
+        let reads_before = store.read_index.load(std::sync::atomic::Ordering::Relaxed);
+        let endpoints = build_upstream_endpoints(&store, &desired);
+        let reads = store.read_index.load(std::sync::atomic::Ordering::Relaxed) - reads_before;
+        assert_eq!(endpoints.len(), 3);
+        assert_eq!(reads, 2, "one lookup per (service, consuming job) pair");
+        Ok(())
+    }
+
+    #[test]
+    fn upstream_endpoints_apply_service_intentions() -> R<()> {
+        let store = setup_store()?;
+        insert_node(&store, "node-a")?;
+        // No `allow` => open to everyone (the pre-connect behavior).
+        seed_upstream_service(&store, "open", 18090, &[], true)?;
+        // Explicit wildcard => also open to everyone.
+        seed_upstream_service(&store, "star", 18091, &["*"], true)?;
+        // Named consumers only.
+        seed_upstream_service(&store, "gated", 18092, &["gateway"], true)?;
+
+        let visible = |job_id: &str, service: &str| -> R<usize> {
+            let desired = vec![consumer_allocation(1, job_id, service)];
+            let endpoints = build_upstream_endpoints(&store, &desired);
+            assert_eq!(endpoints.len(), 1, "one entry per declared upstream");
+            Ok(endpoints[0].endpoints.len())
+        };
+
+        assert_eq!(visible("anyone", "open")?, 1);
+        assert_eq!(visible("anyone", "star")?, 1);
+        assert_eq!(visible("gateway", "gated")?, 1);
+        // Denied consumers get an empty list, never an error.
+        assert_eq!(visible("intruder", "gated")?, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn a_corrupt_connect_payload_does_not_fail_the_heartbeat() -> R<()> {
+        // The endpoint feed is additive; one unparseable payload must not stop
+        // the node from reconciling its allocations (or resolving the others).
+        let store = setup_store()?;
+        insert_node(&store, "node-a")?;
+        seed_upstream_service(&store, "web", 18095, &[], true)?;
+
+        let corrupt = crate::structs::TaskAllocation {
+            allocation_id: 1,
+            job_id: "broken".into(),
+            task_connect: "{not json".into(),
+            ..Default::default()
+        };
+        let healthy = consumer_allocation(2, "consumer", "web");
+        let endpoints = build_upstream_endpoints(&store, &[corrupt, healthy]);
+
+        assert_eq!(endpoints.len(), 1);
+        assert_eq!(endpoints[0].allocation_id, 2);
+        assert_eq!(endpoints[0].endpoints.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn a_failing_service_lookup_does_not_fail_the_heartbeat() -> R<()> {
+        // A store-level failure is the other half of the additive contract: if
+        // it propagated, `heartbeat` would return Internal and the node would
+        // stop starting, stopping and health-reporting allocations entirely —
+        // over a connect-only problem. Omitting the entry instead leaves the
+        // forwarder on its last known good endpoints (the worker only applies
+        // upstreams present in the reply).
+        let store = setup_store()?;
+        insert_node(&store, "node-a")?;
+        seed_upstream_service(&store, "broken", 18096, &[], true)?;
+        seed_upstream_service(&store, "fine", 18097, &[], true)?;
+
+        // Make `service_endpoints(Some("broken"))` fail the way a bad row does:
+        // an allocation network that will not deserialize.
+        {
+            let conn = store.write_connection()?;
+            conn.execute(
+                "UPDATE allocation SET network = 'not json' WHERE task_config_id IN
+                 (SELECT id FROM task_config WHERE name = 'broken');",
+                [],
+            )?;
+        }
+        assert!(
+            store.service_endpoints(Some("broken")).is_err(),
+            "test setup must actually break the lookup"
+        );
+
+        let desired = vec![
+            consumer_allocation(1, "consumer", "broken"),
+            consumer_allocation(2, "consumer", "fine"),
+        ];
+        let endpoints = build_upstream_endpoints(&store, &desired);
+
+        assert_eq!(endpoints.len(), 1, "the failing upstream is omitted");
+        assert_eq!(endpoints[0].allocation_id, 2);
+        assert_eq!(endpoints[0].service, "fine");
+        assert_eq!(endpoints[0].endpoints.len(), 1);
         Ok(())
     }
 

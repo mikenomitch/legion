@@ -31,10 +31,10 @@ use crate::structs::{
     GetJobInfoRequest, GetJobSpecRequest, GetJobTemplateRequest, GetLedgerRequest, GetNodesRequest,
     GetRolloutStatusRequest, GetStateStoreSchemaRequest, GetVolumeRequest, JobConfig,
     ListEventsRequest, ListInstancesRequest, ListJobActionsRequest, ListJobTemplatesRequest,
-    ListJobsRequest, ListRolloutsRequest, ListVolumeDriversRequest, ListVolumesRequest,
-    QueryStateStoreRequest, RenderJobTemplateRequest, ReplaceInstanceRequest, RunJobRequest,
-    RunJobTemplateRequest, SetNodeAvailabilityRequest, StartInstanceRequest, StopInstanceRequest,
-    StopJobRequest, UpsertJobTemplateRequest,
+    ListJobsRequest, ListRolloutsRequest, ListServicesRequest, ListVolumeDriversRequest,
+    ListVolumesRequest, QueryStateStoreRequest, RenderJobTemplateRequest, ReplaceInstanceRequest,
+    ResolveServiceRequest, RunJobRequest, RunJobTemplateRequest, SetNodeAvailabilityRequest,
+    StartInstanceRequest, StopInstanceRequest, StopJobRequest, UpsertJobTemplateRequest,
 };
 use crate::task_plugins::validate_job_config;
 use serde::Serialize;
@@ -290,6 +290,26 @@ fn tool_defs() -> Vec<ToolDef> {
                     "max_bytes": { "type": "integer", "description": "Max bytes per stream (0 = worker default cap)." },
                     "tail": { "type": "boolean", "description": "Return trailing bytes instead of leading bytes." }
                 },
+                "additionalProperties": false
+            }),
+            mutates: false,
+        },
+        ToolDef {
+            name: "legion_service_list",
+            description: "List declared services with their healthy/total endpoint counts. Use this to discover what a job can connect to.",
+            input_schema: empty_schema,
+            mutates: false,
+        },
+        ToolDef {
+            name: "legion_service_resolve",
+            description: "Resolve a service to its endpoint addresses (address, port, allocation, node, health). Healthy endpoints only unless include_unhealthy is set.",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "service": { "type": "string", "description": "Service name (service.name, defaulting to the task name)." },
+                    "include_unhealthy": { "type": "boolean", "description": "Also return endpoints failing health checks (default false)." }
+                },
+                "required": ["service"],
                 "additionalProperties": false
             }),
             mutates: false,
@@ -973,6 +993,23 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
             }))
             .await
         }
+        "legion_service_list" => {
+            let mut client = connect().await?;
+            grpc(client.list_services(ListServicesRequest {})).await
+        }
+        "legion_service_resolve" => {
+            let service = str_arg(&args, "service")?;
+            let include_unhealthy = args
+                .get("include_unhealthy")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let mut client = connect().await?;
+            grpc(client.resolve_service(ResolveServiceRequest {
+                service,
+                include_unhealthy,
+            }))
+            .await
+        }
         "legion_state_query" => {
             let sql = str_arg(&args, "sql")?;
             let mut client = connect().await?;
@@ -1282,6 +1319,37 @@ mod tests {
     fn job_logs_tool_is_read_only() {
         let names: Vec<&str> = available_tools(false).iter().map(|t| t.name).collect();
         assert!(names.contains(&"legion_job_logs"));
+    }
+
+    #[test]
+    fn service_discovery_tools_are_read_only() {
+        let names: Vec<&str> = available_tools(false).iter().map(|t| t.name).collect();
+        assert!(names.contains(&"legion_service_list"));
+        assert!(names.contains(&"legion_service_resolve"));
+    }
+
+    #[test]
+    fn service_resolve_schema_requires_the_service_name() {
+        let tool = tool_defs()
+            .into_iter()
+            .find(|tool| tool.name == "legion_service_resolve")
+            .expect("legion_service_resolve");
+        let schema = (tool.input_schema)();
+        assert_eq!(schema["required"], json!(["service"]));
+        assert!(schema["properties"]["include_unhealthy"].is_object());
+    }
+
+    #[tokio::test]
+    async fn service_resolve_rejects_a_missing_service_argument() {
+        let req = json!({
+            "jsonrpc": "2.0", "id": 6, "method": "tools/call",
+            "params": { "name": "legion_service_resolve", "arguments": {} }
+        })
+        .to_string();
+        let resp = handle_message(&req, false).await.expect("response");
+        assert_eq!(resp["result"]["isError"], true);
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("service"), "{text}");
     }
 
     #[test]

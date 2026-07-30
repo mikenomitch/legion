@@ -818,6 +818,7 @@ mod tests {
         }))?;
         let mut allocation = alloc();
         allocation.network = Some(crate::structs::network::AllocNetwork {
+            upstreams: Vec::new(),
             address: Some("127.0.0.1".into()),
             ports: vec![
                 crate::structs::network::AllocPort {
