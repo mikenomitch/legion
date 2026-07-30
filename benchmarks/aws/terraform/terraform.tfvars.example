@@ -1,0 +1,9 @@
+# Copy to terraform.tfvars and fill in. Only these two have no default.
+admin_cidr     = "203.0.113.7/32" # your IP
+ssh_public_key = "ssh-ed25519 AAAA... you@laptop"
+
+# Scale the sim-worker fleet per step (1k=1, 2k=2, 5k=4, 10k=8, 20k=16):
+# worker_instances = 1
+
+# region = "us-east-1"
+# project = "legion-bench"

@@ -36,13 +36,12 @@ pub fn fingerprint_node(additional_node_checks: Vec<String>) -> Map<String, Valu
 
     additional_node_checks
         .iter()
-        .map(|name| fp_plugin_name_to_path(name))
-        .for_each(|path| match call_dynamic(&path) {
+        .for_each(|name| match call_dynamic(name) {
             Ok((_lib, fp)) => {
                 ret.extend(fp.fingerprint());
             }
             Err(e) => {
-                warn!("Error loading fingerprinter at path {path}, {e}");
+                warn!("Error loading fingerprinter {name}, {e}");
             }
         });
 
@@ -64,13 +63,12 @@ pub fn run_health_checks(
 
     additional_node_checks
         .iter()
-        .map(|name| fp_plugin_name_to_path(name))
-        .for_each(|path| match call_dynamic(&path) {
+        .for_each(|name| match call_dynamic(name) {
             Ok((_lib, fp)) => {
                 ret.extend(fp.health_check());
             }
             Err(e) => {
-                error!("Error loading fingerprinter: {e}");
+                error!("Error loading fingerprinter {name}: {e}");
             }
         });
 
@@ -81,6 +79,10 @@ pub fn run_health_checks(
     ret
 }
 
+/// The resolved dylib path for a node-check plugin — test-only, used to
+/// decide whether the example plugin's assertions can run (same pattern
+/// as `task_plugins::task_plugin_name_to_path`).
+#[cfg(test)]
 fn fp_plugin_name_to_path(name: &str) -> String {
     let plugin_root = plugin_root_dir();
     plugin_paths("node_checks", name, &plugin_root)
@@ -89,25 +91,21 @@ fn fp_plugin_name_to_path(name: &str) -> String {
         .into_owned()
 }
 
+/// Load a node-check plugin by NAME: manifest from the plugin's root,
+/// dylib from wherever `plugin_paths` resolves it (in-tree or the
+/// workspace `plugin-build` layout). Never derive the root from the
+/// dylib path — the two live in different trees under the workspace
+/// build layout.
 #[instrument(err, skip_all)]
-fn call_dynamic(path: &str) -> R<(Library, Box<dyn NodeChecker>)> {
-    let plugin_path = std::path::Path::new(path);
-    let Some(plugin_root) = plugin_path
-        .parent()
-        .and_then(|v| v.parent())
-        .and_then(|v| v.parent())
-    else {
-        bail!("invalid node_check plugin path {}", path);
-    };
-    let name = plugin_root
-        .file_name()
-        .and_then(|v| v.to_str())
-        .context("invalid node_check plugin name")?;
-    validate_manifest("node_checks", name, plugin_root)
+fn call_dynamic(name: &str) -> R<(Library, Box<dyn NodeChecker>)> {
+    let plugin_root = plugin_root_dir();
+    let paths = plugin_paths("node_checks", name, &plugin_root);
+    validate_manifest("node_checks", name, &paths.root)
         .with_context(|| format!("invalid node_check plugin manifest for {}", name))?;
 
     unsafe {
-        let lib = Library::new(path)?;
+        let lib = Library::new(&paths.dylib)
+            .with_context(|| format!("load node_check plugin {}", paths.dylib.display()))?;
         let fp = {
             let func: Symbol<unsafe extern "C" fn() -> Box<dyn NodeChecker>> = lib.get(b"get")?;
             func()
