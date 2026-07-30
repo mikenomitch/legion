@@ -15181,6 +15181,66 @@ mod tests {
     }
 
     #[test]
+    fn disjoint_candidate_lists_fall_back_independently() -> R<()> {
+        let store = setup_store()?;
+        for id in ["web-1", "web-2", "batch-1", "batch-2"] {
+            store.insert_node(make_node_msg(id, "ready"))?;
+        }
+        let (job, task_id) = submit_named_job(&store, "walk-hetero")?;
+        let (job_other, task_other) = submit_named_job(&store, "walk-hetero-racer")?;
+
+        let versions = store.allocation_version_vector(
+            &job,
+            &HashSet::from([
+                "web-1".to_string(),
+                "web-2".to_string(),
+                "batch-1".to_string(),
+                "batch-2".to_string(),
+            ]),
+        )?;
+        // A racer takes web-1 (the first placement's rank 0); the second
+        // placement's list is untouched.
+        let versions_other =
+            store.allocation_version_vector(&job_other, &HashSet::from(["web-1".to_string()]))?;
+        let (_, racer) = store.submit_and_apply_plan(
+            &job_other,
+            "fresh",
+            &[PlanPlacement::pinned("web-1", task_other)],
+            &versions_other,
+        )?;
+        assert!(matches!(racer, PlanApplyOutcome::Applied(_)));
+
+        let (_, outcome) = store.submit_and_apply_plan(
+            &job,
+            "fresh",
+            &[
+                PlanPlacement {
+                    task_id,
+                    candidates: vec!["web-1".to_string(), "web-2".to_string()],
+                },
+                PlanPlacement {
+                    task_id,
+                    candidates: vec!["batch-1".to_string(), "batch-2".to_string()],
+                },
+            ],
+            &versions,
+        )?;
+        let PlanApplyOutcome::Applied(allocations) = outcome else {
+            panic!("independent components must fall back, not reject: {outcome:?}");
+        };
+        let nodes: Vec<&str> = allocations
+            .iter()
+            .map(|allocation| allocation.node_id.as_str())
+            .collect();
+        assert_eq!(
+            nodes,
+            vec!["web-2", "batch-1"],
+            "first placement slides to rank 1, second binds rank 0"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn walk_rollback_leaves_no_partial_placements() -> R<()> {
         let store = setup_store()?;
         store.insert_node(make_node_msg("node-a", "ready"))?;

@@ -926,12 +926,37 @@ impl<'a> Scheduler<'a> {
                 });
             }
 
+            // Coupling components, conservative form (late-binding plan
+            // §6.4): a node referenced by two placements couples them —
+            // both fell into one component and keep today's all-or-nothing
+            // semantics on their exact chosen node. A placement keeps its
+            // fallback list only when EVERY candidate on it is referenced
+            // by no other placement, so independent walks can never stack
+            // two placements onto one node the planner budgeted once.
+            let mut node_references: HashMap<&str, usize> = HashMap::new();
+            for placement in &placements {
+                if placement.candidates.is_empty() {
+                    *node_references
+                        .entry(placement.node_id.as_str())
+                        .or_default() += 1;
+                } else {
+                    for candidate in &placement.candidates {
+                        *node_references.entry(candidate.as_str()).or_default() += 1;
+                    }
+                }
+            }
             let placement_pairs: Vec<PlanPlacement> = placements
                 .iter()
                 .map(|placement| {
-                    if placement.candidates.is_empty() {
-                        PlanPlacement::pinned(placement.node_id.clone(), placement.task_config_id)
-                    } else {
+                    let disjoint = !placement.candidates.is_empty()
+                        && placement.candidates.iter().all(|candidate| {
+                            node_references
+                                .get(candidate.as_str())
+                                .copied()
+                                .unwrap_or_default()
+                                == 1
+                        });
+                    if disjoint {
                         debug_assert_eq!(
                             placement.candidates[0], placement.node_id,
                             "rank 0 must be the planner's pick"
@@ -940,6 +965,8 @@ impl<'a> Scheduler<'a> {
                             task_id: placement.task_config_id,
                             candidates: placement.candidates.clone(),
                         }
+                    } else {
+                        PlanPlacement::pinned(placement.node_id.clone(), placement.task_config_id)
                     }
                 })
                 .collect();
@@ -1204,16 +1231,14 @@ impl<'a> Scheduler<'a> {
         let weights = self.scheduler_weights()?;
         let nodes_considered_setting = self.nodes_considered_setting()?;
         let score_sample_setting = self.score_sample_setting()?;
-        // Late-binding candidate lists, Phase 2 scope: single-placement
-        // plans only — one placement has no batch-mate whose fallback
-        // could interact with it (no coupling analysis needed). The
-        // motivating workload (sandbox bursts of single-task jobs) is
-        // exactly this shape. Phase 3 widens this to singleton coupling
-        // components of multi-placement plans.
-        let total_required: u64 = required_counts.values().map(|count| *count as u64).sum();
-        let plan_candidates_setting = self
-            .plan_candidates_setting()?
-            .filter(|_| total_required == 1);
+        // Late-binding candidate lists. Which placements may carry a
+        // fallback list is decided in two layers: per-task gating inside
+        // `place_task_allocations` (only uncoupled-by-construction
+        // placements collect — count 1, no group, no distinct keys, no
+        // volumes), and the cross-placement disjointness strip at submit
+        // time in `plan_and_apply_internal` (coupling components, §6.4 of
+        // the late-binding plan).
+        let plan_candidates_setting = self.plan_candidates_setting()?;
         let mut reschedule_rng = if matches!(mode, PlanMode::Reschedule) {
             Some(reschedule_rng())
         } else {
@@ -1845,6 +1870,21 @@ impl<'a> Scheduler<'a> {
         group_key: Option<&GroupKey>,
         group_assignments: &mut HashMap<GroupKey, String>,
     ) -> R<()> {
+        // Late-binding gate, per task (late-binding plan §6.4): only a
+        // placement that is uncoupled BY CONSTRUCTION may carry a fallback
+        // list — its task places exactly one allocation in this plan, sits
+        // in no co-placement group, declares no `distinct` constraint
+        // (distinct couples on the attribute even across disjoint nodes),
+        // and claims no volumes (pinned data and per-plan disk accounting
+        // must not move at apply time). Everything else keeps today's
+        // fixed placement. Cross-placement candidate overlap is stripped
+        // by the caller at submit time.
+        let plan_candidates = plan_candidates.filter(|_| {
+            count == 1
+                && group_key.is_none()
+                && plan.distinct_tracker.is_none()
+                && task_config.volumes.is_empty()
+        });
         // Owned so the truncated-index refill below can widen it mid-task.
         let mut candidates: Vec<&'b Node> = candidates.to_vec();
         let mut scoring_cache = PlanScoringCache::from_plan(
@@ -5919,6 +5959,103 @@ mod tests {
         assert!(
             parsed.is_array(),
             "multi-placement plans stay all-or-nothing (singleton lists, v1 shape): {raw}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn heterogeneous_tasks_carry_disjoint_candidate_lists() -> R<()> {
+        let store = setup_store()?;
+        for index in 0..6 {
+            store.insert_node(make_node_msg(
+                &format!("web-{index}"),
+                json!({ "class": "web" }),
+            ))?;
+            store.insert_node(make_node_msg(
+                &format!("batch-{index}"),
+                json!({ "class": "batch" }),
+            ))?;
+        }
+        let job_config_id = submit_job(
+            &store,
+            "cand-hetero",
+            vec![
+                TaskConfig {
+                    group: "g-web".into(),
+                    constraints: json!({ "class": "web" }),
+                    ..TaskConfig::new("web", "noop")
+                },
+                TaskConfig {
+                    group: "g-batch".into(),
+                    constraints: json!({ "class": "batch" }),
+                    ..TaskConfig::new("batch", "noop")
+                },
+            ],
+        )?;
+        let scheduler = Scheduler::new(&store)?;
+        let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
+        assert_eq!(outcome.allocations.len(), 2);
+
+        let raw = submission_placements_json(&store)?;
+        let parsed: Value = serde_json::from_str(&raw)?;
+        assert_eq!(
+            parsed.get("format").and_then(Value::as_u64),
+            Some(2),
+            "disjoint-pool placements keep their fallback lists: {raw}"
+        );
+        let placements = parsed["placements"].as_array().context("placements")?;
+        assert_eq!(placements.len(), 2);
+        let lists: Vec<HashSet<String>> = placements
+            .iter()
+            .map(|placement| {
+                placement["candidates"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|value| value.as_str().unwrap().to_string())
+                    .collect()
+            })
+            .collect();
+        assert!(lists[0].len() > 1 && lists[1].len() > 1, "{raw}");
+        assert!(
+            lists[0].is_disjoint(&lists[1]),
+            "coupled (overlapping) lists must have been stripped: {raw}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn overlapping_candidate_lists_strip_to_singletons() -> R<()> {
+        let store = setup_store()?;
+        for index in 0..12 {
+            store.insert_node(make_node_msg(&format!("node-{index:02}"), json!({})))?;
+        }
+        // Two unconstrained count-1 tasks draw from the same pool: their
+        // lists overlap, so both placements must fall back to fixed nodes
+        // (all-or-nothing), which serializes as the v1 shape.
+        let job_config_id = submit_job(
+            &store,
+            "cand-overlap",
+            vec![
+                TaskConfig {
+                    group: "g-a".into(),
+                    ..TaskConfig::new("a", "noop")
+                },
+                TaskConfig {
+                    group: "g-b".into(),
+                    ..TaskConfig::new("b", "noop")
+                },
+            ],
+        )?;
+        let scheduler = Scheduler::new(&store)?;
+        let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
+        assert_eq!(outcome.allocations.len(), 2);
+
+        let raw = submission_placements_json(&store)?;
+        let parsed: Value = serde_json::from_str(&raw)?;
+        assert!(
+            parsed.is_array(),
+            "overlapping lists must strip to singleton placements: {raw}"
         );
         Ok(())
     }
