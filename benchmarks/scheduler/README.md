@@ -187,7 +187,35 @@ concurrent submitters (bounded conflict retries, like the production
 eval path); `LEGION_BENCH_SCHEDULER_SETTINGS` toggles the lever for the
 A/B. Back-to-back runs:
 
-<!-- D5_AB_TABLE -->
+4 concurrent submitters, raft backends, `steady-small` (12 nodes / 4
+jobs, the contended cell) and `web-fleet` (240 nodes / 30 jobs):
+
+| Scenario | Backend | evals/s off → on | p50 ms off → on | p99 ms off → on | conflicts/attempt (both) |
+| --- | --- | --- | --- | --- | --- |
+| steady-small | raft1 | 33.2 → **51.4** | 45.9 → **15.1** | 80.4 → 32.1 | 1.29 |
+| steady-small | raft3 | 15.6 → 19.5 | 99.1 → **41.2** | 158.5 → 93.0 | 1.25 |
+| web-fleet | raft1 | 63.9 → 63.3 | 45.9 → 30.1 | 72.3 → 79.4 | 0.32 / 0.47 |
+| web-fleet | raft3 | 30.0 → 34.9 | 92.1 → **64.9** | 155.5 → 124.5 | 0.36 |
+
+Readings — with measurement honesty first:
+
+- **p50 plan latency fell 2.4–3x** on the contended cells: concurrent
+  applies share one quorum commit instead of queueing solo fsyncs. That
+  is the group commit doing exactly what it was built for.
+- **Throughput gained 16–55%, not the plan's ≥2x target.** The ceiling
+  is not commit rate — it is optimistic-concurrency contention:
+  conflict rates are high (1.25+ retries per plan on steady-small,
+  where 4 bin_pack planners all pick the same argmax node) and
+  *identical with the lever on and off*, so batching neither causes nor
+  can fix them. Re-planning burns the latency the batch saved. This is
+  the parallel-planner pathology the late-binding plan
+  (`internal_docs/plans/late-binding-plan-apply-plan.md`) exists for;
+  group commit and late binding compose.
+- The purest measure of the coalescer mechanism is the heartbeat table
+  above (same primitive, no CAS in the loop): 5.3–6.7x at 8 threads.
+- Correctness 1.000 in every cell, both arms (bounded conflict retries,
+  as production's eval path does).
+
 
 ## Heartbeat path (heartbeat-scale plan) — 2026-07-30
 

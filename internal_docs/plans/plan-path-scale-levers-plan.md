@@ -260,8 +260,21 @@ compatibility concern (all state shapes unchanged).
 
 - Phase 1: `version_sample` phase mean at the `churn-large` scenario
   (1k nodes) drops by ≥10x; fence tests green.
+  **Measured: ~50x (229µs → 5µs local, 309µs → 5µs raft3), and no
+  longer fleet-proportional. Fence suite green.** ✓
 - Phase 2: `available_nodes` + `capacity_snapshot` phase means drop by
   ≥5x at 1k nodes; equivalence tests green.
+  **Measured: 4.5x local / 5.8x raft3 at churn-large — the node-list
+  cache's worst case (churn invalidates it every iteration); quiet
+  fleets measure `nodes` at 0–1µs. Accepted.** ✓
 - Phase 3: with 4-8 concurrent submitters on raft1/raft3, plan throughput
   improves materially (target ≥2x on raft3) with conflict rate and
   correctness ratio unchanged; batch-isolation tests green.
+  **Measured: p50 plan latency 2.4–3x better, throughput +16–55%, NOT
+  the ≥2x throughput target — the ceiling is optimistic-concurrency
+  contention (conflict rates identical on/off), which batching cannot
+  address and late binding will. Conflict rate and correctness
+  unchanged as required; isolation tests green. Recorded honestly in
+  `benchmarks/scheduler/README.md`; the coalescer mechanism itself
+  measures 5.3–6.7x on the CAS-free heartbeat path.** Partially met —
+  accepted with the late-binding plan as the named follow-up.
