@@ -3,7 +3,7 @@
 Decisions made while writing
 [the plan](../plans/container-runtime-exec-and-signals-plan.md). Ordered by
 project impact, highest first; the entry number is its rank. (Planning-stage
-calls — implementation will append its own as phases execute. Entries 3 and 4
+calls — implementation will append its own as phases execute. Entries 4 and 5
 record reversals of earlier planning calls, made at the product owner's
 direction; the superseded designs appear as the losing alternatives.)
 
@@ -74,7 +74,55 @@ system that today has one task dir — `/legion/task` leaves the namespace room
 exact precedent volumes already set (in-task destinations for isolating
 runtimes), so this extends an existing convention rather than inventing one.
 
-## 3. CPU enforcement is Nomad's model: `cores` → exclusive cpuset via share/reserve slices, `cpu` (MHz) → `cpu.weight`
+## 3. Resource enforcement is a worker-core subsystem behind a three-mode plugin interface, not container-runtime code
+
+**The call.** CPU/memory enforcement lives in worker core — CPU
+fingerprinting, the core allocator, both slice masks, persistence, restart
+recovery, release — and task runtimes consume it through one defaulted trait
+method, `resource_enforcement() -> Unsupported | WorkerCgroup |
+RuntimeApplied`, plus a worker-computed `ResourceAssignment` hung on the
+instance. `WorkerCgroup` runtimes (the `exec` runtime, folded in by this
+plan) get their cgroup created and sized by the worker and adopt with two
+lines: return the mode, spawn through `join_assignment_cgroup`.
+`RuntimeApplied` runtimes (the `container` runtime; `sandbox` next) receive
+the assignment and apply it their own way.
+
+**The alternatives.** (a) Keep enforcement inside the container runtime, and
+have the exec runtime grow its own parallel implementation when its turn
+comes — smallest diff now, and the two runtimes' mechanisms genuinely differ
+(OCI spec field vs. `pre_exec` cgroup join); (b) one mode, not three: worker
+core creates and populates the cgroup for *every* governed runtime, and the
+container runtime simply points `cgroupsPath` at it — fewer concepts, but it
+forces every runtime into the cgroup-shaped hole and leaves a microVM
+runtime (which pins vCPU threads, and whose "memory limit" is guest size) no
+honest way to participate; (c) a full `ResourcePlugin` ABI in the style of
+the volume plugin system — maximum extensibility, and vastly more surface
+than two consumers justify.
+
+**The trade-off.** Three modes is one more concept than the minimum, and the
+boundary between `WorkerCgroup` and `RuntimeApplied` is a judgement each
+plugin author has to make (the docs answer it with a single question: does
+your task run as a host process the worker can spawn into a cgroup?). The
+interface is also being designed against two consumers, so the sandbox
+adoption may still force a refinement — deliberately left as plan Q4 rather
+than pre-solved with a speculative fourth mode.
+
+**Why.** Extensibility, and correctness that only a shared subsystem can
+deliver. Alternative (a) is the one that actually fails: exclusivity is a
+*node-wide* property, so two runtimes each keeping their own core accounting
+cannot promise it — a core "reserved" by a container and handed out again by
+the exec runtime is worse than no pinning at all, because the jobspec now
+lies. Once accounting must be shared, the only question is what the runtimes
+receive, and the three modes are the smallest honest answer: `Unsupported`
+keeps unported plugins working exactly as today (the default, so the dylib
+ABI stays source-compatible), `WorkerCgroup` makes adoption nearly free for
+the common host-process case, and `RuntimeApplied` keeps the worker's hands
+off cgroup files a runtime already owns. This mirrors the split Legion
+already made for volumes — core resolves and accounts, the runtime consumes
+`MountedVolume` its own way — so it adds a familiar seam rather than a new
+paradigm.
+
+## 4. CPU enforcement is Nomad's model: `cores` → exclusive cpuset via share/reserve slices, `cpu` (MHz) → `cpu.weight`
 
 **The call.** On Linux the worker partitions usable CPUs into a `legion/share`
 and a `legion/reserve` parent cgroup. `resources.cores` means whole CPUs
@@ -97,13 +145,16 @@ the pinned container only, skip the share-slice maintenance — cheaper, but
 argument as before.
 
 **The trade-off.** The worker grows a real subsystem: CPU fingerprinting,
-an assignment map persisted in worker state and rebuilt on restart, a shared
-mask rewritten on every pinned start/stop, and an exhaustion failure path.
-Fractional `cores` and `cores`+`cpu` specs that were previously accepted now
-fail validation. Exclusivity is scoped to Legion-managed container cgroups —
-exec-runtime tasks and host processes can still touch reserved cores (plan
-Q4). And `cores` now means something different on Linux (exclusivity) than
-on macOS (VM sizing) — the asymmetry the CFS design avoided.
+an assignment map persisted in worker state and rebuilt on restart, two
+slice masks rewritten on every pinned start/stop, and an exhaustion failure
+path (entry 3 is the interface that keeps it from also becoming per-runtime
+duplication). Fractional `cores` and `cores`+`cpu` specs that were
+previously accepted now fail validation. Exclusivity holds across governed
+runtimes but not against processes outside Legion entirely — node daemons
+and SSH sessions can still land on reserved cores, which no node-level
+mechanism short of full-machine partitioning would fix. And `cores` now
+means something different on Linux (exclusivity) than on macOS (VM sizing) —
+the asymmetry the CFS design avoided.
 
 **Why.** Performance, and making the jobspec mean what it says. Bandwidth
 throttling admits the exact tail-latency jitter that people declare `cores`
@@ -116,7 +167,7 @@ implementation a fraction of what it looks like. The simplicity cost is real
 and was consciously paid — recorded here because the earlier entry argued the
 other side.
 
-## 4. `stopSignal` / `stopGracePeriod` ship now as task-level jobspec fields, defaults SIGTERM / 10 s, capped at admission
+## 5. `stopSignal` / `stopGracePeriod` ship now as task-level jobspec fields, defaults SIGTERM / 10 s, capped at admission
 
 **The call.** Graceful teardown is declarable per task: `stopSignal`
 (validated against the existing signal vocabulary; on the Linux container
@@ -151,7 +202,7 @@ the fixed-constant design would have; the knobs only appear when reached
 for. The admission cap keeps the operator promise the constant used to make:
 no task can hold a drain hostage.
 
-## 5. Signals become a defaulted `TaskPlugin::signal()` trait method, not a container special case
+## 6. Signals become a defaulted `TaskPlugin::signal()` trait method, not a container special case
 
 **The call.** `WorkerTaskManager::signal_allocation` routes through a new
 trait method whose default is today's `kill(2)`-the-tracked-PID behavior;
@@ -173,7 +224,7 @@ special case, and worker core stays runtime-agnostic (the same argument that
 put `exec()` on the trait in the exec plan). Simplicity of the *system* beat
 smallness of the *diff*.
 
-## 6. OCI exec support is reported true without probing the runtime binary
+## 7. OCI exec support is reported true without probing the runtime binary
 
 **The call.** `ExecSupport{exec: true, pty: true}` for the Linux OCI path is
 asserted from runtime detection alone; a hypothetical OCI runtime lacking

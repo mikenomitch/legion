@@ -238,17 +238,27 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
   - [ ] Phase 3 — graceful stop + task-level `stopSignal`/`stopGracePeriod`
         fields (defaults SIGTERM/10 s, admission-capped; container both
         platforms + exec runtime)
-  - [ ] Phase 4 — Linux memory hard limits + `cpu` MHz → `cpu.weight`
+  - [ ] Phase 4 — the `resource_enforcement()` interface (`Unsupported`/
+        `WorkerCgroup`/`RuntimeApplied` + worker-computed `ResourceAssignment`)
+        with Linux memory hard limits and `cpu` MHz → `cpu.weight`
         (share-slice cgroup, OOM-kill annotation, `cores`-xor-`cpu` and
         whole-`cores` validation)
   - [ ] Phase 5 — exclusive `cores` via cpuset pinning (worker core
         allocator, `legion/share`/`legion/reserve` slices, restart recovery)
-  - [ ] Phase 6 — task dir mounted at `/legion/task` + translated env; flips
+  - [ ] Phase 6 — `exec` runtime adopts the interface (`WorkerCgroup`): one
+        node-wide fence for container + exec tasks, real memory limits for
+        exec, `cgroup.kill` teardown; explicit `config.cgroup` still wins
+  - [ ] Phase 7 — task dir mounted at `/legion/task` + translated env; flips
         KV file injection, identity file delivery, and file/tree artifacts to
         supported (container file paths must live under the mount)
+  - [ ] Follow-on (not in the plan): `sandbox` adopts `resource_enforcement()`
+        as a `RuntimeApplied` consumer — pin vCPU threads to the assignment's
+        cores, size the guest from its memory limit. The honest test of
+        whether the three modes are the right cut (plan Q4).
   - Deliberately out of scope there (still open, see the plan's non-goals):
     Linux port mapping/network namespaces, NUMA/SMT-aware core placement,
-    excluding exec-runtime tasks from reserved cores, alloc-dir sharing
+    fencing non-Legion host processes off reserved cores, a delegated
+    (non-root) cgroup hierarchy root, alloc-dir sharing
 - [ ] `exec`: unveil support
 - [ ] `exec`: network namespaces (netavark? CNI?) — see *Networking* below
 - [ ] **Sandbox snapshots, fast start, and forking** —
@@ -265,7 +275,10 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
         `instance create --from-snapshot --count N`)
   - [ ] Phase 6 — lazy memory (UFFD handler, remote page sources)
 - [ ] Split a task runtime's implementation into parts — isolation vs. runner vs.
-      artifact consumption? (idea, needs a plan)
+      artifact consumption? (idea, needs a plan). The container-runtime plan's
+      `resource_enforcement()` interface carves off the first slice of this —
+      resource placement moves to worker core, runtimes consume a computed
+      assignment — so revisit this idea once that has two real consumers.
 - [ ] Shared files between tasks in the same allocation —
       [proposal](plans/shared-alloc-dir-proposal.md), unimplemented, and blocked
       on allocations holding more than one task

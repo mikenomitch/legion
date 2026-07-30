@@ -1,4 +1,4 @@
-# Container Runtime Core Gaps: Exec on Linux, Signals, Cgroup Limits, and File Delivery
+# Container Runtime Core Gaps: Exec on Linux, Signals, Resource Enforcement, and File Delivery
 
 > **Judgement calls:** [../calls/container-runtime-exec-and-signals-plan_calls.md](../calls/container-runtime-exec-and-signals-plan_calls.md)
 
@@ -9,7 +9,13 @@ Linux production parity with the macOS dev experience, and a capability table
 without ❌s in its core rows. Sequenced so the early phases share one
 mechanism (shelling out to a runtime subcommand addressed by container name)
 and the later ones extend the bundle/cgroup and launch surfaces the runtime
-already owns:
+already owns.
+
+Gap 3 outgrew the container runtime during design and is built as a
+**worker-core subsystem with a task-runtime interface**: the `exec` runtime
+adopts it in this plan (phase 6), and any runtime — in-tree or dylib — opts
+in with one trait method. That is the plan's one piece of new extensibility
+surface, and the phase list reflects it.
 
 1. **Exec does not work on Linux.** `legion exec`, the UI terminal, MCP
    one-shot exec, *and declared actions* all fail against container tasks on
@@ -19,12 +25,15 @@ already owns:
    task: `changeMode: signal` identities are rejected at admission, and Linux
    teardown is `delete --force` (SIGKILL) with no graceful-shutdown window at
    all.
-3. **Linux containers run unconstrained.** Declared `resources.memory` /
+3. **Linux workloads run unconstrained.** Declared `resources.memory` /
    `resources.cores` size the guest VM on macOS but set no cgroup limits on
    Linux, and `resources.cpu` (MHz) is enforced nowhere — the scheduler
    reserves capacity the kernel never sees. The fix is Nomad's model: hard
    memory limits, `cores` as *exclusive pinned cores* (cpuset), and MHz as
-   proportional `cpu.weight`.
+   proportional `cpu.weight` — built as a **worker-owned subsystem behind a
+   runtime-agnostic interface** (`resource_enforcement()`), consumed by the
+   container runtime, adopted by the exec runtime in the same plan, and open
+   to any task-runtime plugin.
 4. **The task directory is invisible inside the container**, which is the one
    limitation behind three capability-table ❌s at once: KV *file* injection,
    identity *file* delivery, and file/tree artifacts.
@@ -200,6 +209,18 @@ rotation) that file delivery exists to provide.
 - When the node is saturated, I want CPU to degrade in proportion to what
   each job declared, so the 4000-MHz service doesn't lose a coin flip to the
   100-MHz cron job.
+- When I run container and exec tasks on the same node, I want one set of
+  rules governing them both, so a core reserved by one workload is actually
+  off-limits to the other.
+
+**Runtime plugin author**
+- When I build a custom task runtime, I want to opt into the node's CPU and
+  memory accounting with one declaration, so my tasks are governed like the
+  built-ins without me reimplementing an allocator.
+- When my runtime manages its own isolation (a VM, a different cgroup
+  driver), I want to receive the worker's decision and apply it my own way,
+  so I get correct cluster-wide accounting without fighting the worker for
+  the same cgroup files.
 
 **Security / platform admin**
 - When a service needs a rotating credential, I want it delivered as a file
@@ -234,10 +255,14 @@ rotation) that file delivery exists to provide.
    and the app gets its SIGHUP — no restart, no image rebuild.
 6. A latency-sensitive service declares `resources: { cores: 2 }` on a Linux
    node. The worker assigns it two specific cores, removes them from every
-   other container's CPU set, and `grep Cpus_allowed_list /proc/self/status`
-   inside the container shows exactly those two. A batch job on the same node
-   declaring `cpu: 500` shares the remaining cores at a weight proportional
-   to 500 MHz.
+   other governed task's CPU set, and `grep Cpus_allowed_list
+   /proc/self/status` inside the container shows exactly those two. A batch
+   job on the same node declaring `cpu: 500` shares the remaining cores at a
+   weight proportional to 500 MHz.
+7. The same node also runs an `exec`-runtime log shipper. It lives in the
+   share slice automatically — it cannot touch the pinned service's two
+   cores, and its own declared `memory` is now a real limit. Nothing in its
+   jobspec changed.
 
 ## 4. Goals and non-goals
 
@@ -256,6 +281,13 @@ rotation) that file delivery exists to provide.
   `memory` a hard limit, `cores` exclusive pinned CPUs (worker-assigned
   cpuset, share/reserve partition), `cpu` (MHz) proportional `cpu.weight` —
   so no `resources` field is scheduling-only on Linux anymore.
+- Enforcement is a **worker-core subsystem with a plugin contract**, not
+  container-runtime plumbing: `resource_enforcement()` on the trait
+  (`Unsupported` / `WorkerCgroup` / `RuntimeApplied`), a worker-computed
+  `ResourceAssignment` on the instance, and a one-call spawn helper — the
+  exec runtime adopts it in this plan, so reserved cores are exclusive
+  across *all* governed workloads on the node, and a custom runtime opts in
+  with one method plus one helper call.
 - The task directory is mounted into the container at a canonical path, and
   `supports_kv_file_injection()` / `supports_identity_file()` flip to true:
   KV file injection, identity file delivery, and file/tree artifacts work in
@@ -276,10 +308,16 @@ rotation) that file delivery exists to provide.
   logical CPUs with no topology awareness — no NUMA-node affinity, no
   SMT-sibling avoidance. Nomad gates NUMA behind Enterprise for a reason;
   revisit with a workload that measurably needs it.
-- **Excluding non-container workloads from reserved cores.** The
-  share/reserve partition governs Legion's *container* cgroups; exec-runtime
-  tasks and arbitrary host processes are outside it and may still run on
-  reserved cores (§11 Q4 tracks folding exec tasks in).
+- **Fencing processes outside Legion.** The share/reserve partition governs
+  every runtime that opts into `resource_enforcement()` — node daemons, SSH
+  sessions, and tasks on `Unsupported` runtimes remain beyond it. Inherent
+  to a shared host, not closable by the interface.
+- **`sandbox` adopting the enforcement interface.** The microVM runtime is
+  the designed-for next adopter (`RuntimeApplied`, pinning vCPU threads) but
+  ships nothing here (§11 Q4).
+- **A non-root / delegated-subtree hierarchy root.** v1 assumes the standard
+  root worker creating `legion/` at the cgroup root; a configurable root for
+  delegated setups is future work.
 - **CPU enforcement on macOS beyond guest sizing.** Apple `container` has no
   weight or pinning analogue; `cpu` (MHz) remains scheduling-only there, and
   `cores` keeps meaning VM size, not exclusivity.
@@ -331,8 +369,11 @@ rotation) that file delivery exists to provide.
   deny rule (`oci_bundle.rs:481`). The runtime (runc/crun/youki) creates the
   cgroup and applies whatever resources the spec declares — no new process
   management needed. `resource_amount` (`container.rs:160`) already parses
-  `memory`/`cores` for the macOS flags; the exec runtime already stakes out
-  the cgroup-v2-only position (`exec.rs:475`).
+  `memory`/`cores` for the macOS flags. The exec runtime already has the
+  join mechanism the `WorkerCgroup` mode generalizes: its optional
+  `config.cgroup` field writes the child into a named cgroup via a
+  `pre_exec` hook, cgroup-v2-only (`exec.rs:472`) — today the *job* names
+  the cgroup and nobody creates or sizes it; §6.4 has the worker do both.
 - **Volumes are the template for the task-dir mount.** The worker resolves
   volume env to *in-task destinations* for isolating runtimes — the
   `in_task_view` match in `mount_allocation_volumes`
@@ -476,6 +517,11 @@ honors them with its own mechanism:
   to the tracked PID, wait up to `stopGracePeriod`, then SIGKILL. Today's
   behavior is the degenerate case (`stopGracePeriod: '0s'` semantics), so
   the exec runtime gets graceful stop as a side effect of the same fields.
+  Once §6.4's enforcement lands (phase 6), the *hard-kill* step upgrades to
+  the task cgroup's `cgroup.kill`, which reaps double-forked descendants the
+  tracked PID misses. The graceful step stays a PID signal either way:
+  cgroup v2 exposes `cgroup.kill` only (SIGKILL), with no way to broadcast
+  an arbitrary signal to a cgroup's members.
 - **noop / runtimes with nothing to signal:** the fields are accepted and
   inert, documented as such.
 
@@ -483,25 +529,112 @@ honors them with its own mechanism:
 phase (its eviction path) consumes these same fields rather than growing its
 own — coordinate there, don't duplicate.
 
-### 6.4 Linux cgroup enforcement, Nomad's model: hard memory, pinned cores, weighted MHz
+### 6.4 Linux cgroup enforcement, Nomad's model: hard memory, pinned cores, weighted MHz — behind a runtime-agnostic interface
 
 No new jobspec surface — the three `resources` fields the scheduler already
-reads gain their kernel meaning on Linux. The worker partitions the node's
-usable CPUs Nomad-style into two parent cgroups:
+reads gain their kernel meaning on Linux, for **every runtime that opts in**,
+not just `container`. Like Nomad — whose client-side cpuset manager governs
+all task drivers through one mechanism — the enforcement lives in **worker
+core**, and task runtimes consume it through a small contract.
+
+**The subsystem.** The worker partitions the node's usable CPUs Nomad-style
+into two parent cgroups it creates and owns:
 
 ```
 legion/
 ├── share/      cpuset.cpus = usable − reserved     ← unpinned tasks live here
 │   └── legion-<alloc>   cpu.weight from declared MHz
-└── reserve/
+└── reserve/    cpuset.cpus = union of reservations
     └── legion-<alloc>   cpuset.cpus = its assigned cores, exclusively
 ```
 
 A task declaring `cores` gets whole CPUs moved out of the share slice; every
-other container task lives under `share/` and inherits its shrinking cpuset
+other opted-in task lives under `share/` and inherits its shrinking cpuset
 automatically (cgroup v2 cpusets are hierarchical — one write to
-`legion/share/cpuset.cpus` re-fences every tenant at once, no per-container
-updates). The generated spec:
+`legion/share/cpuset.cpus` re-fences every tenant at once, no per-task
+updates; the allocator maintains the `reserve/` union mask alongside it).
+Before `prepare()` — the same lifecycle point where volumes are mounted and
+attached — the worker computes each allocation's **assignment** and hangs it
+on the instance:
+
+```rust
+/// Computed by worker core on Linux for every runtime whose
+/// `resource_enforcement()` is not Unsupported; None elsewhere.
+pub struct ResourceAssignment {
+    pub slice: Slice,                    // Share | Reserve
+    /// Cgroup for this task, relative to the cgroup root
+    /// (`legion/share/legion-<alloc>` / `legion/reserve/legion-<alloc>`).
+    pub cgroup_path: PathBuf,
+    pub cores: Option<Vec<u32>>,         // Reserve: worker-assigned logical CPUs
+    pub cpu_weight: Option<u64>,         // Share: from declared MHz
+    pub memory_limit_bytes: Option<u64>, // from declared memory
+}
+```
+
+**The contract runtimes adopt.** One defaulted trait method, in the style of
+`supports_*` and `exec_support()`:
+
+```rust
+/// How this runtime participates in worker-enforced resource placement.
+pub enum ResourceEnforcement {
+    /// Not governed (the default): no assignment is computed. Honest for
+    /// runtimes with nothing to confine (noop) and for unported plugins.
+    Unsupported,
+    /// Worker core creates the assignment's cgroup, writes its limits
+    /// (cpuset.cpus / cpu.weight / memory.max+swap.max), and the runtime
+    /// spawns its process into it — for runtimes whose task IS a host
+    /// process. Adopting is two lines: return this, and spawn through
+    /// `join_assignment_cgroup(&mut cmd, &instance)` (a pre_exec join of
+    /// the target cgroup, the same race-free mechanism the exec runtime's
+    /// explicit `cgroup` config already uses).
+    WorkerCgroup,
+    /// The runtime applies the assignment itself, by its own means — the
+    /// container runtime writes it into the OCI spec; a microVM runtime
+    /// would pin vCPU threads. Worker core computes and accounts, but
+    /// touches no cgroup for this task.
+    RuntimeApplied,
+}
+
+fn resource_enforcement(&self) -> ResourceEnforcement {
+    ResourceEnforcement::Unsupported
+}
+```
+
+Worker core owns everything hard — fingerprinting, the allocator, both slice
+masks, persistence and restart recovery, release on destroy — so an adopting
+runtime never touches accounting. `WorkerCgroup` runtimes additionally get
+**whole-tree teardown for free**: because the task's processes all live in a
+Legion-owned cgroup, the hard-kill step of `stop()` writes `cgroup.kill`
+instead of `kill(pid)`, catching double-forked descendants that the current
+tracked-PID reaping can orphan.
+
+**Consumption, per built-in:**
+
+- **`container` → `RuntimeApplied`.** The assignment lands in the generated
+  OCI spec — `cgroupsPath` from `assignment.cgroup_path`, `cpu.cpus` /
+  `cpu.shares` / `memory` from the assignment fields — and the runtime binary
+  creates the cgroup at that path, which places it inside the worker's
+  hierarchy so the share mask governs it. This is the design already shown
+  below; only the values' *source* moves into worker core.
+- **`exec` → `WorkerCgroup` — folded in.** Exec tasks join the same
+  hierarchy, so a core reserved by any task is exclusive against *all*
+  governed workloads on the node, and exec tasks gain enforcement they never
+  had: `cores` pins them, `cpu` (MHz) weights them, and `memory` becomes a
+  real `memory.max` (previously scheduling-only for exec, too). Two
+  interactions with existing exec config, both resolved for back-compat:
+  an explicit `config.cgroup` **wins** and opts the task out of the Legion
+  hierarchy (it keeps meaning what it means today — join the cgroup the job
+  named); declaring `cores` *together with* an explicit `cgroup` is rejected
+  at admission, since Legion cannot promise exclusivity inside a cgroup it
+  does not manage. `user`, landlock, and `oom_score_adj` compose unchanged
+  (the cgroup join is one more pre_exec step, ordered before setuid, exactly
+  as the existing join works).
+- **`noop`, `sandbox`, dylib plugins → `Unsupported`** until they opt in;
+  admission keeps accepting their `resources` as scheduling-only, as today.
+  The sandbox runtime is the obvious next `RuntimeApplied` adopter (pin the
+  VMM's vCPU threads to `assignment.cores` — §11 Q4).
+
+The generated container spec:
 
 ```jsonnet
 resources: { memory: 256, cores: 2 }    // MiB, whole cores — pinned task
@@ -539,21 +672,18 @@ The mappings, each deliberate:
   cannot be used to escape it (the K8s semantic; docker's default of
   2×limit-in-swap makes limits soft in practice, which defeats the point of
   scheduling against them).
-- **`cores` → exclusive pinned CPUs.** The **worker** owns core assignment,
-  exactly as in Nomad: the scheduler keeps counting `cores` numerically, and
-  at start the worker's core allocator picks specific free logical CPUs
-  (lowest-numbered free), writes them into the spec's `cpu.cpus`, removes
-  them from `legion/share/cpuset.cpus`, and records the assignment in its
-  persisted allocation state (restored on worker restart, released on
-  stop/destroy). Exhaustion — the scheduler's count says yes but no whole
-  cores are free (fingerprint drift, offlined CPUs) — fails the allocation
-  with an error naming the assigned/free sets, feeding the normal
+- **`cores` → exclusive pinned CPUs.** The scheduler keeps counting `cores`
+  numerically; at start the worker's core allocator picks specific free
+  logical CPUs (lowest-numbered free) and the assignment flows to the runtime
+  as described above. Exhaustion — the scheduler's count says yes but no
+  whole cores are free (fingerprint drift, offlined CPUs) — fails the
+  allocation with an error naming the assigned/free sets, feeding the normal
   `on_unhealthy` move machinery rather than wedging.
-  **Validation:** `cores` on a container task must be a whole number (a
-  cpuset cannot hold half a core; macOS rounds today, which was quietly
-  lossy — now `cores: 1.5` is rejected at submit), and a container task
-  declares `cores` *or* `cpu`, not both (Nomad's rule; two CPU contracts on
-  one task have no coherent meaning).
+  **Validation, on every governed runtime (`container` and `exec` alike):**
+  `cores` must be a whole number (a cpuset cannot hold half a core; macOS
+  rounds today, which was quietly lossy — now `cores: 1.5` is rejected at
+  submit), and a task declares `cores` *or* `cpu`, not both (Nomad's rule;
+  two CPU contracts on one task have no coherent meaning).
 - **`cpu` (MHz) → proportional weight.** Written as OCI `cpu.shares` = MHz
   (Nomad's convention), which cgroup-v2 runtimes convert to `cpu.weight`
   via the standard mapping (`weight = 1 + ((shares − 2) × 9999) / 262142` —
@@ -572,20 +702,26 @@ The mappings, each deliberate:
   Legion under systemd-managed delegation and needs it.
 
 **Requirements and failure modes.** Everything here requires the cgroup v2
-unified hierarchy — the position the exec runtime already takes — with the
-cpuset/cpu/memory controllers delegated to the runtime's user; failures
-surface as the runtime's own error at container create, which `start()`
-propagates with context, and the public doc gets an actionable failure-modes
-row for each. The worker fingerprints usable CPUs from its own
-`cpuset.cpus.effective` at startup (not `nproc` — the worker itself may be
-confined). **Exclusivity scope, stated honestly:** the share/reserve fence
-governs Legion's container cgroups; exec-runtime tasks and unrelated host
-processes are outside the hierarchy and may still touch reserved cores
-(non-goals; §11 Q4). **OOM diagnostics:** on a nonzero exit, the plugin
-best-effort reads the cgroup's `memory.events` `oom_kill` counter before
-teardown and, when it fired, annotates the failure record ("container
-exceeded its 256 MiB memory limit and was OOM-killed") — exit code 137 alone
-sends the author hunting through dmesg.
+unified hierarchy — the position the exec runtime already takes — and a
+worker able to create and write the `legion/` subtree at the cgroup root
+(the standard root-worker deployment; the worker enables the
+cpuset/cpu/memory controllers in the parents' `subtree_control`, and a
+configurable hierarchy root for delegated non-root setups is deliberately
+future work). Failures surface as the creating side's error — the runtime's
+own at container create for `RuntimeApplied`, the worker's cgroup write for
+`WorkerCgroup` — propagated with context by `start()`, and the public doc
+gets an actionable failure-modes row for each. The worker fingerprints
+usable CPUs from its own `cpuset.cpus.effective` at startup (not `nproc` —
+the worker itself may be confined). **Exclusivity scope, stated honestly:**
+the share/reserve fence governs every runtime that opts in — `container` and
+`exec` after this plan — but processes outside Legion entirely (node
+daemons, SSH sessions) and tasks on `Unsupported` runtimes are beyond it and
+may still touch reserved cores. That residue is inherent to running on a
+shared host, not a gap the interface can close. **OOM diagnostics:** on a
+nonzero exit, the worker best-effort reads the cgroup's `memory.events`
+`oom_kill` counter before teardown and, when it fired, annotates the failure
+record ("task exceeded its 256 MiB memory limit and was OOM-killed") — exit
+code 137 alone sends the author hunting through dmesg.
 
 ### 6.5 Mount the task directory; file delivery follows
 
@@ -681,20 +817,28 @@ is a named non-goal until Legion has a distinct secrets dir to split out.
   this plan changes what they *do* for container tasks, and the
   maximal-jsonnet comments on the container example get the new semantics.
 - **Worker-local state gains one field:** the persisted allocation record
-  (`PersistedAllocation`) carries the pinned cores assigned to the
-  allocation, `serde`-defaulted so records written before the change load
-  unchanged. Worker restart rebuilds the core allocator and the share mask
-  from these records.
-- `TaskPlugin` gains the defaulted `signal()` method (dylib plugins stay
-  source-compatible; the registry's existing version gating covers the rebuild
-  requirement, same as the exec plan's ABI addition).
-- `build_bundle`/`build_spec` gain the task's `resources` and assigned cores
-  (internal signature change only); capability flips in the container plugin:
+  (`PersistedAllocation`) carries the allocation's `ResourceAssignment`,
+  `serde`-defaulted so records written before the change load unchanged.
+  Worker restart rebuilds the core allocator and both slice masks from these
+  records — the assignment is the unit of persistence, so a future adopter
+  needs no new state.
+- `TaskPlugin` gains two defaulted methods — `signal()` and
+  `resource_enforcement()` — and `TaskInstance` gains
+  `resource_assignment: Option<ResourceAssignment>`, filled by worker core
+  before `prepare()` (dylib plugins stay source-compatible via the defaults;
+  the registry's existing version gating covers the rebuild requirement, same
+  as the exec plan's ABI addition). A shared `join_assignment_cgroup` helper
+  joins the `spawn_pty`/`spawn_pipe`/`configure_task_log_capture` family.
+- `build_bundle`/`build_spec` gain the task's assignment (internal signature
+  change only); capability flips in the container plugin:
   `supports_kv_file_injection`, `supports_identity_file`, `supports_signal`
-  → true.
+  → true; `resource_enforcement()` returns `RuntimeApplied` for `container`
+  and `WorkerCgroup` for `exec`.
 - **New validation rules:** `stopSignal` from the `parse_signal` vocabulary;
-  `stopGracePeriod` a positive duration ≤ the cap; container-task `cores`
-  must be a whole number; container tasks declare `cores` or `cpu`, not both;
+  `stopGracePeriod` a positive duration ≤ the cap; on governed runtimes
+  (`container`, `exec`) `cores` must be a whole number and `cores` xor
+  `cpu`; an exec task combining `cores` with an explicit `config.cgroup` is
+  rejected (no exclusivity inside a cgroup Legion doesn't manage);
   container-task file-delivery paths must resolve under `/legion/task`
   (§6.5) — all enforced at admission, the path rule re-checked on the worker.
 - Docs: capability tables in `docs/task-runtime-container.md` (signal, KV
@@ -702,14 +846,19 @@ is a named non-goal until Legion has a distinct secrets dir to split out.
   Ports" and "Current Scope and Limitations" sections), `docs/exec-and-actions.md`
   (the `container (youki)` row), `docs/workload-identity.md` (runtime matrix +
   container file paths), `docs/kv-store.md` (container file injection),
-  `docs/artifacts.md` (file/tree artifacts in containers);
-  `internal_docs/TODO.md` per phase.
+  `docs/artifacts.md` (file/tree artifacts in containers),
+  `docs/task-runtime-exec.md` (the runtime is now governed; `cgroup`
+  precedence), and **a new "Resource enforcement" section in
+  `docs/task-runtime-plugins.md`** — the three modes, the assignment struct,
+  the two-line `WorkerCgroup` adoption recipe, and what worker core promises
+  to do on the plugin's behalf; `internal_docs/TODO.md` per phase.
 
 ## 8. Implementation phases
 
 Each ships alone. 1 goes first (it revives the dead OCI argv path the others
-lean on for confidence); 2–6 are mutually independent except that 5 wants 4's
-spec plumbing, listed in the order that front-loads user value.
+lean on for confidence); the rest are mutually independent except that 5
+wants 4's assignment plumbing and 6 wants 5's allocator, listed in the order
+that front-loads user value.
 
 - **Phase 1 — Linux OCI exec.** `supports_exec()` flip, OCI argv dialect in
   `build_exec_command` (+ env mapping, `--` separator), unit tests, e2e
@@ -728,21 +877,33 @@ spec plumbing, listed in the order that front-loads user value.
   honored); docs. Builds on Phase 2's `kill` helper but ships independently
   (it can shell out directly if 2 hasn't landed). *Value: no more data-loss
   stops, and drains the job author can actually size.*
-- **Phase 4 — memory limits + CPU weight.** `resources` threaded into
-  `build_spec`; the `memory` hard-limit/swap mapping; `cpu` MHz →
-  `cpu.shares`; the `legion/share` parent cgroup and `cgroupsPath`; OOM
-  annotation from `memory.events`; the `cores`-xor-`cpu` and whole-`cores`
-  validation rules (landing here so Phase 5 changes behavior, not the
-  accepted spec surface); unit tests over the generated spec; e2e OOM test;
-  docs. *Value: memory becomes real and MHz stops being scheduling-only —
-  before pinning even lands.*
+- **Phase 4 — the enforcement interface + memory limits + CPU weight.**
+  `resource_enforcement()` on the trait, `ResourceAssignment` on the
+  instance, worker-core computation before `prepare()`; the `legion/share`
+  parent cgroup; the `memory` hard-limit/swap mapping and `cpu` MHz →
+  `cpu.shares` consumed by the container runtime (`RuntimeApplied`, via
+  `build_spec` + `cgroupsPath`); OOM annotation from `memory.events`; the
+  `cores`-xor-`cpu` and whole-`cores` validation rules (landing here so
+  later phases change behavior, not the accepted spec surface); unit tests
+  over the generated spec; e2e OOM test; docs. *Value: the contract exists,
+  memory becomes real, and MHz stops being scheduling-only — before pinning
+  even lands.*
 - **Phase 5 — exclusive cores (cpuset pinning).** The worker core allocator
   (fingerprint from `cpuset.cpus.effective`, lowest-free assignment, release
   on stop/destroy, restart recovery via the persisted-record field); the
-  `legion/reserve` slice and share-mask maintenance; `cpu.cpus` in the spec;
+  `legion/reserve` slice and both-mask maintenance; `cpu.cpus` in the spec;
   the exhaustion failure path; e2e pinning tests. *Value: `cores` means
   "these CPUs are yours" on Linux, like Nomad.*
-- **Phase 6 — task-dir mount + file delivery.** The `/legion/task` mount on
+- **Phase 6 — the exec runtime folds in (`WorkerCgroup`).** Worker-created
+  task cgroups sized from the assignment; the `join_assignment_cgroup`
+  spawn helper and the exec runtime calling it; the explicit-`config.cgroup`
+  precedence rule and the `cores`+`cgroup` rejection; `cgroup.kill`-based
+  hard kill for governed process trees; e2e mixed-node tests (scenario 7);
+  `docs/task-runtime-exec.md` and the plugin-authoring page document the
+  contract. *Value: reserved cores are exclusive across all governed
+  workloads; exec tasks gain real memory limits; the interface is proven by
+  a second, differently-shaped consumer.*
+- **Phase 7 — task-dir mount + file delivery.** The `/legion/task` mount on
   both platforms, translated env + `${artifact.*}` interpolation, the
   path-range validation with its error message, capability flips
   (`supports_kv_file_injection`, `supports_identity_file`), e2e file-visibility
@@ -760,13 +921,21 @@ spec plumbing, listed in the order that front-loads user value.
     `stopGracePeriod` values flowing into it. Mirrors the existing
     `build_apple_launch` test style.
   - jobspec validation — `stopSignal` vocabulary, `stopGracePeriod`
-    positive-and-capped, whole-number `cores`, `cores`-xor-`cpu`, each with
-    its documented error message.
+    positive-and-capped, whole-number `cores`, `cores`-xor-`cpu`,
+    `cores`-with-explicit-`cgroup` on exec, each with its documented error
+    message.
+  - the enforcement interface — an `Unsupported` runtime gets no assignment
+    computed and no cgroup created; a `RuntimeApplied` one gets an
+    assignment and worker core touches no cgroup files for it; a
+    `WorkerCgroup` one gets its cgroup created and populated before
+    `prepare()`. A **contract test generic over the trait** asserts these
+    three shapes, so the next adopter (in-tree or dylib) inherits the suite
+    rather than writing one.
   - generated `config.json` — memory limit/swap byte math; `cpu.shares` from
     MHz; `cpu.cpus` from assigned cores; `cgroupsPath` share vs. reserve; no
     `memory`/`cpu` entries when nothing is declared; devices rule untouched.
   - the core allocator — assignment (lowest free), release, double-release
-    idempotence, exhaustion error naming free/assigned sets, share-mask
+    idempotence, exhaustion error naming free/assigned sets, both-mask
     arithmetic, and restart recovery from persisted records (including
     records without the field).
   - mounts and env — `/legion/task` mount present on both arms and ordered
@@ -793,6 +962,13 @@ spec plumbing, listed in the order that front-loads user value.
     two assigned CPUs; a concurrently running share-slice container's
     effective cpuset excludes them; stopping the pinned task returns the
     cores to the share slice; a worker restart preserves the assignment;
+  - **mixed-runtime enforcement (scenario 7):** a pinned container task and
+    an `exec` task on one worker — the exec task's `Cpus_allowed_list`
+    excludes the container's reserved cores and vice versa, its declared
+    `memory` shows up as `memory.max` on its worker-created cgroup, and an
+    exec task with an explicit `config.cgroup` lands there instead
+    (back-compat). A double-forked child of an exec task is reaped by
+    `cgroup.kill` where the old tracked-PID path would have orphaned it;
   - files: a staged file artifact and a KV-rendered file are readable at
     their `/legion/task` paths from inside the container; a host-side atomic
     rewrite is visible inside without restart (the rename-propagation check —
@@ -802,16 +978,22 @@ spec plumbing, listed in the order that front-loads user value.
 - **Regression:** full `cargo test --all --locked`; `cargo test --test
   acl_endpoints` (no new endpoints — must stay green untouched); the identity
   admission test inversion; existing volume-mount tests unchanged (the
-  task-dir mount must not reorder or shadow declared volumes).
+  task-dir mount must not reorder or shadow declared volumes); the exec
+  runtime's existing cgroup/landlock/user tests unchanged (the assignment
+  join must compose with them, not replace them); the reference dylib task
+  plugin in `plugins/tasks/` builds and loads without implementing either new
+  trait method.
 - Not a scheduler change — no benchmark numbers required.
 
 ## 10. Rollout and backward compatibility
 
 - No feature gate. Every phase changes worker-local behavior only, plus
-  admission rules on the manager (Phases 3–6); no manager/worker version
+  admission rules on the manager (Phases 3–7); no manager/worker version
   handshake concerns (an old manager talking to a new worker simply finds
   exec working where it used to error; the new jobspec fields are inert JSON
-  to an old worker).
+  to an old worker). Third-party dylib task plugins keep working untouched —
+  both new trait methods are defaulted, and `Unsupported` means an unported
+  plugin behaves exactly as it does today.
 - **Visible behavior changes** to release-note:
   1. Container (and exec-runtime) stop delivers `stopSignal` and waits up to
      `stopGracePeriod` (SIGTERM / 10 s undeclared) before the hard kill.
@@ -819,19 +1001,23 @@ spec plumbing, listed in the order that front-loads user value.
      today's instant SIGKILL — the correct trade, and the docker default
      everyone already operates under.
   2. `changeMode: signal` container jobs that used to be rejected at submit
-     now deploy; likewise KV-file and identity-file container jobs (Phase 6).
-  3. **Declared limits become real on Linux.** A container job declaring
-     `memory: 256` while actually using more ran fine yesterday and is
-     OOM-killed today; a `cores` job is pinned to specific CPUs instead of
-     floating; a `cpu` (MHz) job's share of a saturated node now tracks its
-     declaration. This is the declared contract finally being enforced — the
-     release note says so plainly, and the OOM annotation tells the author
-     which limit fired. Jobs declaring nothing see no change.
-  4. **Two validation tightenings can reject previously-accepted specs at
-     re-submit:** a container task declaring fractional `cores` (silently
-     rounded on macOS before, ignored on Linux), and one declaring both
-     `cores` and `cpu`. Both errors name the fix; running allocations are
-     untouched until their next submit.
+     now deploy; likewise KV-file and identity-file container jobs (Phase 7).
+  3. **Declared limits become real on Linux, for container *and* exec
+     tasks.** A job declaring `memory: 256` while actually using more ran
+     fine yesterday and is OOM-killed today; a `cores` job is pinned to
+     specific CPUs instead of floating; a `cpu` (MHz) job's share of a
+     saturated node now tracks its declaration. This is the declared
+     contract finally being enforced — the release note says so plainly, and
+     the OOM annotation tells the author which limit fired. Jobs declaring
+     nothing see no change. Exec tasks additionally move into a
+     Legion-managed cgroup unless they name one themselves, which changes
+     where an operator looks for them in the hierarchy (and makes their
+     descendants reliably reaped).
+  4. **Validation tightenings can reject previously-accepted specs at
+     re-submit:** fractional `cores` (silently rounded on macOS before,
+     ignored on Linux), `cores` together with `cpu`, and — on exec tasks —
+     `cores` together with an explicit `config.cgroup`. Every error names
+     the fix; running allocations are untouched until their next submit.
   5. Container tasks start receiving `LEGION_TASK_DIR` / `LEGION_ARTIFACT_*`
      (in-container values) and a `/legion/task` mount. An image that already
      has a `/legion` path would be shadowed — improbable, called out in the
@@ -856,12 +1042,23 @@ spec plumbing, listed in the order that front-loads user value.
   30 s, K8s commonly runs minutes). *Lean:* 5 m — long enough for a database
   checkpoint, short enough that a node drain still converges; revisit against
   the preemption plan's eviction deadlines when that lands.
-- **Q4 — should exec-runtime tasks join the share slice, so reserved cores
-  are exclusive node-wide?** The exec runtime already has opt-in cgroup
-  joining, so the plumbing half-exists. *Lean:* later, and only if a real
-  colocated deployment needs it — it drags the exec runtime's cgroup story
-  (currently "join what the job names") into worker-managed territory, which
-  is its own small design.
+- **Q4 — which runtime adopts `resource_enforcement()` next, and does the
+  interface survive it?** `sandbox` is the designed-for case
+  (`RuntimeApplied`, pinning the VMM's vCPU threads to `assignment.cores`
+  and sizing the guest from `memory_limit_bytes`), and it is the honest test
+  of whether the three modes are the right cut — a microVM's "memory limit"
+  is guest size, not a cgroup ceiling, so the assignment may need to say
+  which it means. *Lean:* ship the interface with two consumers of different
+  shapes (`RuntimeApplied` container + `WorkerCgroup` exec), and let the
+  sandbox adoption — its own change — be what forces any refinement, rather
+  than speculating a third mode now.
+- **Q4b — should `WorkerCgroup` tasks also get the OOM annotation and
+  `cgroup.kill` teardown when they declared no resources?** Worker core
+  could create a cgroup for every governed task regardless, purely for
+  process-tree containment. *Lean:* yes, and it is nearly free — but it
+  makes "declared nothing" no longer mean "worker touches nothing," so
+  confirm during Phase 6 that the empty-cgroup case is genuinely
+  side-effect-free before committing.
 - **Q5 — is `/legion/task` the right canonical path?** Nomad's `/local` is
   shorter; `/legion/task` is unmistakably Legion's and leaves room for
   siblings (`/legion/alloc`, `/legion/secrets`) if the deferred splits ever
@@ -896,13 +1093,20 @@ spec plumbing, listed in the order that front-loads user value.
   job's spec carries no `memory`/`cpu` entries, fractional-`cores` and
   `cores`+`cpu` specs are rejected at submit, and the capability table's
   "Memory / CPU limits" row reads ✅ for Linux with the cgroup-v2 requirement
-  documented.
+  documented. The interface contract test passes for all three modes, and
+  `docs/task-runtime-plugins.md` documents the adoption recipe.
 - **Phase 5:** scenario 6 works end to end on a Linux worker — the pinned
   container sees exactly its assigned CPUs, concurrent share-slice containers
   exclude them, the cores return on stop, and the assignment survives a
   worker restart; core exhaustion fails the allocation with the documented
   error instead of wedging.
-- **Phase 6:** scenario 5 works end to end on both platforms — declared KV
+- **Phase 6:** scenario 7 works end to end — an exec task and a pinned
+  container task on one worker mutually exclude each other's cores, the exec
+  task's declared `memory` is enforced as `memory.max`, an exec task naming
+  its own `config.cgroup` still lands there, `cores`+`cgroup` is rejected at
+  submit, and a double-forked exec descendant is reaped on stop. The exec
+  runtime's existing user/landlock/cgroup tests still pass unchanged.
+- **Phase 7:** scenario 5 works end to end on both platforms — declared KV
   file, identity file, and a file artifact all readable at `/legion/task`
   paths inside the container, a rotation visible without restart; the
   out-of-range path is rejected at submit with the documented error; the
