@@ -2783,6 +2783,15 @@ impl Store {
         Ok(OffsetDateTime::now_utc().format(&Rfc3339)?)
     }
 
+    /// Unix seconds, the storage form of `job.created_at` / `job.updated_at`.
+    ///
+    /// Safe inside a replicated apply: raft replicates the resulting row
+    /// values, not a re-execution of the closure, so followers never compute
+    /// their own `now` (see `storage/raft/capture.rs`).
+    fn now_unix() -> i64 {
+        OffsetDateTime::now_utc().unix_timestamp()
+    }
+
     /// RFC3339 with a fixed-width, nine-digit subsecond field.
     ///
     /// `Rfc3339` trims trailing zeros from the subsecond field, so its output
@@ -2855,11 +2864,16 @@ impl Store {
     //
 
     fn job_from_row(&self, row: &Row<'_>) -> Result<Job, rusqlite::Error> {
+        let created_at: i64 = row.get(3)?;
         let job = Job {
             id: row.get(0)?,
             name: row.get(1)?,
             status: row.get(2)?,
-            created_at: row.get(3)?,
+            created_at,
+            // NULL only for a row the backfill deliberately skipped (a
+            // text `created_at`); creation time is the honest floor for
+            // "last changed" when no mtime was ever recorded.
+            updated_at: row.get::<_, Option<i64>>(4)?.unwrap_or(created_at),
         };
 
         Ok(job)
@@ -4603,12 +4617,14 @@ impl Store {
 
     fn stop_job_apply(&self, name: &str) -> R<()> {
         let conn = self.write_connection()?;
+        // The mtime moves with the status in one statement so the two can
+        // never disagree, and so it only moves on rows this write touched.
         let sql = r#"
         UPDATE job
-        SET status = 'stopped'
-        WHERE name = ?;
+        SET status = 'stopped', updated_at = ?2
+        WHERE name = ?1;
 "#;
-        conn.execute(sql, [name])?;
+        conn.execute(sql, params![name, Self::now_unix()])?;
         drop(conn);
 
         // TODO: Create a job_update record
@@ -4645,10 +4661,10 @@ impl Store {
         let conn = self.write_connection()?;
         let sql = r#"
         UPDATE job
-        SET status = 'failed'
-        WHERE id = ?;
+        SET status = 'failed', updated_at = ?2
+        WHERE id = ?1;
 "#;
-        conn.execute(sql, [job_id])?;
+        conn.execute(sql, params![job_id, Self::now_unix()])?;
         drop(conn);
 
         self.events().job_failed(job_id);
@@ -4701,7 +4717,10 @@ impl Store {
 
     fn mark_job_failed_for_kv_apply(&self, job_id: &str) -> R<()> {
         let conn = self.write_connection()?;
-        conn.execute("UPDATE job SET status = 'failed' WHERE id = ?;", [job_id])?;
+        conn.execute(
+            "UPDATE job SET status = 'failed', updated_at = ?2 WHERE id = ?1;",
+            params![job_id, Self::now_unix()],
+        )?;
         Ok(())
     }
 
@@ -4773,8 +4792,9 @@ impl Store {
     fn clear_job_failed_status_apply(&self, job_id: &str) -> R<bool> {
         let conn = self.write_connection()?;
         let updated = conn.execute(
-            "UPDATE job SET status = 'done' WHERE id = ?1 AND status = 'failed';",
-            [job_id],
+            "UPDATE job SET status = 'done', updated_at = ?2 \
+             WHERE id = ?1 AND status = 'failed';",
+            params![job_id, Self::now_unix()],
         )?;
         Ok(updated > 0)
     }
@@ -4797,8 +4817,9 @@ impl Store {
     fn clear_job_stopped_status_apply(&self, job_id: &str) -> R<bool> {
         let conn = self.write_connection()?;
         let updated = conn.execute(
-            "UPDATE job SET status = 'done' WHERE id = ?1 AND status = 'stopped';",
-            [job_id],
+            "UPDATE job SET status = 'done', updated_at = ?2 \
+             WHERE id = ?1 AND status = 'stopped';",
+            params![job_id, Self::now_unix()],
         )?;
         Ok(updated > 0)
     }
@@ -4816,9 +4837,12 @@ impl Store {
         let job_id = job_id.to_owned();
         self.replicated(Lane::Control, "request_job_restart", move |s| {
             let conn = s.write_connection()?;
+            // An acknowledged restart is a change to the job, so it moves
+            // the mtime; the marker's own clear (below) does not — that is
+            // the eval consuming its own bookkeeping, not a user action.
             conn.execute(
-                "UPDATE job SET restart_requested_at = ?2 WHERE id = ?1;",
-                params![job_id, Self::now_rfc3339()?],
+                "UPDATE job SET restart_requested_at = ?2, updated_at = ?3 WHERE id = ?1;",
+                params![job_id, Self::now_rfc3339()?, Self::now_unix()],
             )?;
             Ok(())
         })
@@ -5448,12 +5472,22 @@ impl Store {
                     ":name": config.name,
                     ":status": "done",
                     ":created_at": now,
+                    ":updated_at": now,
                 };
 
                 tx.query_row(&INSERT_JOB, job_params, |row| self.job_from_row(row))
             }
             Err(error) => Err(error),
         }?;
+
+        // A new spec version is a change to the job, so the existing row's
+        // mtime moves with it. Skipped on the insert branch, which already
+        // stamped `updated_at` — and skipped entirely when the config is
+        // unchanged, because that path returned `Unchanged` above.
+        tx.execute(
+            "UPDATE job SET updated_at = ?2 WHERE id = ?1;",
+            params![job.id, now],
+        )?;
 
         let now = time::OffsetDateTime::now_utc();
         let mut meta = if config.rollout.is_none() && config.rollout_by_group.is_empty() {
@@ -17440,6 +17474,180 @@ mod tests {
     //     let _store = setup_store()?;
     //     Ok(())
     // }
+
+    //
+    // job mtime (`job.updated_at`) — see the job-updated-at plan.
+    //
+
+    /// Submit `name` with one noop task whose runtime marker is `marker`, so
+    /// two calls with different markers are two distinct spec versions.
+    fn submit_versioned_job(store: &Store, name: &str, marker: &str) -> R<()> {
+        let task = TaskConfig::new(marker, "noop");
+        let job = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: name.into(),
+            tasks: vec![task],
+            version: None,
+        };
+        store.handle_job_submit(
+            &job,
+            &[Submission {
+                path: "job.jsonnet".into(),
+                content: format!("{{ marker: '{marker}' }}"),
+                is_primary: true,
+            }],
+        )?;
+        Ok(())
+    }
+
+    /// Drag a job's timestamps into the past so a mtime bump is observable
+    /// without sleeping — the column is whole seconds, so a same-second
+    /// write is indistinguishable from no write at all.
+    fn backdate_job(store: &Store, name: &str, seconds_ago: i64) -> R<i64> {
+        let then = OffsetDateTime::now_utc().unix_timestamp() - seconds_ago;
+        let conn = store.write_connection()?;
+        conn.execute(
+            "UPDATE job SET created_at = ?2, updated_at = ?2 WHERE id = ?1;",
+            params![name, then],
+        )?;
+        Ok(then)
+    }
+
+    #[test]
+    fn a_new_job_reports_the_same_created_and_updated_time() -> R<()> {
+        let store = setup_store()?;
+        submit_versioned_job(&store, "mtime-new", "v1")?;
+
+        let job = store.get_job("mtime-new")?;
+        assert_eq!(
+            job.created_at, job.updated_at,
+            "a job that has never changed has not been updated since it was created"
+        );
+        assert!(
+            job.created_at > 0,
+            "timestamp is real, got {}",
+            job.created_at
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn submitting_a_new_spec_version_moves_updated_at_but_not_created_at() -> R<()> {
+        let store = setup_store()?;
+        submit_versioned_job(&store, "mtime-resubmit", "v1")?;
+        let then = backdate_job(&store, "mtime-resubmit", 3_600)?;
+
+        submit_versioned_job(&store, "mtime-resubmit", "v2")?;
+
+        let job = store.get_job("mtime-resubmit")?;
+        assert_eq!(
+            job.created_at, then,
+            "created_at is the job's birth time and a resubmit must not move it"
+        );
+        assert!(
+            job.updated_at > then,
+            "a new spec version is a change to the job: {} !> {then}",
+            job.updated_at
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resubmitting_an_unchanged_spec_leaves_updated_at_alone() -> R<()> {
+        let store = setup_store()?;
+        submit_versioned_job(&store, "mtime-unchanged", "v1")?;
+        let then = backdate_job(&store, "mtime-unchanged", 3_600)?;
+
+        // Byte-identical resubmit: the store short-circuits to `Unchanged`,
+        // and nothing about the job actually changed.
+        submit_versioned_job(&store, "mtime-unchanged", "v1")?;
+
+        let job = store.get_job("mtime-unchanged")?;
+        assert_eq!(
+            job.updated_at, then,
+            "an unchanged resubmit is not a change"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn job_status_transitions_move_updated_at() -> R<()> {
+        let store = setup_store()?;
+        submit_versioned_job(&store, "mtime-status", "v1")?;
+
+        let then = backdate_job(&store, "mtime-status", 3_600)?;
+        store.stop_job("mtime-status")?;
+        let stopped = store.get_job("mtime-status")?;
+        assert_eq!(stopped.status, "stopped");
+        assert!(stopped.updated_at > then, "stop moves the mtime");
+        assert_eq!(stopped.created_at, then, "stop leaves created_at alone");
+
+        let then = backdate_job(&store, "mtime-status", 3_600)?;
+        assert!(store.clear_job_stopped_status("mtime-status")?);
+        assert!(
+            store.get_job("mtime-status")?.updated_at > then,
+            "revival moves the mtime"
+        );
+
+        let then = backdate_job(&store, "mtime-status", 3_600)?;
+        store.mark_job_failed("mtime-status")?;
+        assert!(
+            store.get_job("mtime-status")?.updated_at > then,
+            "failure moves the mtime"
+        );
+
+        let then = backdate_job(&store, "mtime-status", 3_600)?;
+        assert!(store.clear_job_failed_status("mtime-status")?);
+        assert!(
+            store.get_job("mtime-status")?.updated_at > then,
+            "recovery moves the mtime"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_no_op_status_clear_leaves_updated_at_alone() -> R<()> {
+        // `clear_job_*_status` is called speculatively on every recovery
+        // path. When it matches no row it must not tick the mtime, or every
+        // healthy job in the cluster would read as freshly touched.
+        let store = setup_store()?;
+        submit_versioned_job(&store, "mtime-noop", "v1")?;
+        let then = backdate_job(&store, "mtime-noop", 3_600)?;
+
+        assert!(!store.clear_job_failed_status("mtime-noop")?);
+        assert!(!store.clear_job_stopped_status("mtime-noop")?);
+
+        assert_eq!(
+            store.get_job("mtime-noop")?.updated_at,
+            then,
+            "a status clear that changed nothing is not an update"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn allocation_churn_does_not_move_a_jobs_updated_at() -> R<()> {
+        // The mtime describes the job record, not the workload underneath
+        // it: placements come and go on their own clock and would otherwise
+        // keep every job permanently "just updated".
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "ready"))?;
+        submit_versioned_job(&store, "mtime-churn", "v1")?;
+        let then = backdate_job(&store, "mtime-churn", 3_600)?;
+
+        let task_id = task_id_for(&store, "v1", "mtime-churn")?;
+        let alloc = store.place_alloc("node-a", task_id)?;
+        store.remove_allocation_by_id(alloc.id)?;
+        store.place_alloc("node-a", task_id)?;
+
+        assert_eq!(
+            store.get_job("mtime-churn")?.updated_at,
+            then,
+            "placing and replacing an allocation is not a change to the job"
+        );
+        Ok(())
+    }
 
     fn service_task(name: &str) -> TaskConfig {
         let mut task = TaskConfig::new(name, "noop");

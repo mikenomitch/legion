@@ -612,6 +612,24 @@ Deferred from [ui-jump-hints-plan.md](plans/ui-jump-hints-plan.md):
       the reserved-key list, not measured
       ([calls entry 1](calls/ui-jump-hints-plan_calls.md))
 
+- [ ] `ui/src/gen/legion_pb.ts` has drifted from `proto/legion.proto` — it is
+      missing `WorkerConfig.heartbeat_seconds`, `TaskAllocation.task_connect`,
+      `HeartbeatReply.upstream_endpoints` + the whole `UpstreamEndpoints`
+      message, `ServiceSummary.allow`, and `PlannedAllocation.score_sampled`.
+      Nothing in the UI reads them yet, so it typechecks; regenerate with
+      `protoc -I proto --es_out=ui/src/gen --es_opt=target=ts proto/legion.proto`
+      (needs `ui/node_modules/.bin` on PATH) and add it to CI, or the next
+      person to need one of those fields will hand-write it too
+
+Deferred from [job-updated-at-plan.md](plans/job-updated-at-plan.md):
+
+- [ ] Per-page label for `SharedIndex`'s last column. It is hard-coded to
+      "Updated", but Nodes puts `last_heartbeat` under it — a different signal
+      wearing the same name ([calls entry 2](calls/job-updated-at-plan_calls.md))
+- [ ] Show created/updated on the job detail page header. The index was where
+      the wrong value was being read, so the header was left alone; it is a
+      layout change with its own design surface
+
 ## Cross-cutting
 
 - [ ] **Audit every name decision in depth.** Important, and gets harder the
@@ -876,3 +894,10 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
       ([plan](plans/ui-jump-hints-plan.md),
       [calls](calls/ui-jump-hints-plan_calls.md)). Rows past the tenth, the
       Overview dashboard, and detail-page tables are open items above.
+- [x] Job mtime — the Jobs index "Updated" column showed `created_at`, because
+      jobs had no `updated_at` anywhere in the system. Real column, stamped on
+      spec submissions and status transitions but not on allocation churn;
+      `ListJobs` sorts by it by default and `job list` renders both timestamps
+      readably ([plan](plans/job-updated-at-plan.md),
+      [calls](calls/job-updated-at-plan_calls.md),
+      [docs](../docs/jobs-tasks-and-scheduling.md#job-timestamps-created_at-and-updated_at)).
