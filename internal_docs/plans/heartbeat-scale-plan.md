@@ -1,7 +1,13 @@
 # Heartbeat Path at Scale (benchmark + optimization pass)
 
-**Status: IN EXECUTION** — the local-measurable slice of architecture-review
-item D8 ([`scheduler-architecture-review-plan.md`](scheduler-architecture-review-plan.md)).
+**Status: SHIPPED** (2026-07-30, all four phases; §4's recheck fix
+shipped as a batched query rather than leader memory — judgement call
+#5) — the local-measurable slice of architecture-review item D8
+([`scheduler-architecture-review-plan.md`](scheduler-architecture-review-plan.md)).
+Deliberately deferred, still open: per-node lost windows negotiated at
+registration, batching `mark_nodes_as_lost`'s per-node tail after mass
+failures, an ACL token-identity cache, and D8's architecture decision
+itself (awaits AWS-test data).
 D8's *deferral* was about deciding between big architectures
 (gossip liveness, worker-side batching protocols) — that decision still
 waits for AWS-test data. This plan is the pass that removes the
@@ -162,10 +168,11 @@ today. Timestamp skew within a batch is bounded by the batch window
   before the migration have NULL unix values: the reader falls back to
   parsing the text column once, so old rows age out naturally.
 - `recheck_lost_nodes` keeps its safety-net role but stops re-querying
-  eval existence for every lost node every tick: it remembers (in
-  leader-local memory) which lost nodes it has already ensured a
-  reschedule for, and only re-runs the existence check when that memory
-  is cold (leader change, restart) or the node re-transitions.
+  eval existence for every lost node every tick. *(As designed here: a
+  leader-local "already ensured" memory. As shipped: one batched
+  pending-evals query per tick instead — the per-tick re-enqueue turned
+  out to be load-bearing for `onLost.replaceAfter` re-drives, which the
+  memory would have broken. See judgement call #5.)*
 
 ### 5. Worker cadence
 

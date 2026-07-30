@@ -92,7 +92,30 @@ Plan: [`../plans/plan-path-scale-levers-plan.md`](../plans/plan-path-scale-lever
   (fsync amortization), which the raft-pipeline seam would not.
   (Performance where measured; smallest correct surface.)
 
-## 6. Heartbeat batching reuses the same coalescer pattern (see heartbeat plan)
+## 6. Local backends run batch members back-to-back — no outer transaction
+
+- **The call:** on `local_disk`/`streaming`, a plan batch executes its
+  members sequentially exactly as the pre-D5 code did (each plan's own
+  savepoint commit), rather than wrapping the batch in one outer
+  transaction; the raft win (one capture → one propose per batch) is
+  where the amortization lands.
+- **Alternatives:** an outer savepoint on local backends too, committing
+  the whole batch once.
+- **Trade-off:** local backends get no commit amortization from D5 —
+  measured acceptable because WAL mode with `synchronous = NORMAL` makes
+  local commits cheap (the baseline shows local apply dominated by
+  statement work, not fsync).
+- **Why:** the read-model refresh after each local apply reads committed
+  state through separate read connections; under an uncommitted outer
+  transaction those reads would see PRE-batch state and publish a stale
+  read model (a correctness bug, not a slowdown). Deferring cache
+  updates to batch end would fix that at the cost of restructuring the
+  apply path this plan explicitly kept intact. Raft mode has no such
+  hazard (cache updates are suppressed during capture and re-derived
+  from the committed changeset). (Correctness first; optimize where the
+  measurements point — raft.)
+
+## 7. Heartbeat batching reuses the same coalescer pattern (see heartbeat plan)
 
 - **The call:** one leader-elect drain-batch primitive, used by both
   plan applies and heartbeats, rather than two bespoke queues.

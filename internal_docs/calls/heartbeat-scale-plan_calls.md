@@ -75,21 +75,73 @@ Plan: [`../plans/heartbeat-scale-plan.md`](../plans/heartbeat-scale-plan.md)
   deliberately deferred to the D8 architecture decision; noted in the
   plan as deferred. (Ease now, extensibility preserved.)
 
-## 5. `recheck_lost_nodes` gets leader-local memory, not a schema flag
+## 5. `recheck_lost_nodes`: one batched query per tick, NOT the plan's leader-local memory (plan deviation)
 
-- **The call:** remember "reschedule already ensured" for lost nodes in
-  leader memory (cleared on transition or leadership change), instead of
-  persisting a `reschedule_enqueued` marker on `node_health`.
-- **Alternatives:** a persisted flag column; leaving the per-tick
-  re-query in place.
-- **Trade-off:** a fresh leader re-runs the existence check once per
-  lost node (the check is the safety net; the memory only suppresses
-  *repeats*), costing one redundant query per lost node per leadership
-  change.
-- **Why:** the check is idempotent and cheap once — what hurts is
-  running it for every lost node every 2 seconds forever. Leader-local
-  memory removes the steady-state cost with no migration and no new
-  replicated state to keep consistent; the persisted flag would need
-  invalidation rules for exactly the transitions the memory handles
-  trivially. (Simplicity; the failure mode degrades to today's
-  behavior.)
+- **The call:** the per-tick cost fix is a single query listing every
+  pending/in-flight `node_lost_reschedule` eval, diffed in memory
+  against the lost set — not the plan's "remember which lost nodes were
+  already ensured" leader-local memory.
+- **Alternatives:** the plan's suppress-repeats memory; leaving one
+  `EXISTS` probe per lost node per tick.
+- **Trade-off:** the tick still re-enqueues a reschedule eval for every
+  lost node whose previous eval completed — by design (see why) — so a
+  large partition keeps generating evals every tick until nodes recover
+  or nothing is left to free.
+- **Why the deviation:** implementation reading showed the per-tick
+  re-enqueue is load-bearing, not waste — a completed reschedule pass
+  must be re-driven so stateful allocations whose `onLost.replaceAfter`
+  threshold elapses *later* get replaced without operator action
+  (`enqueue_lost_node_reschedule`'s own doc says so). The plan's memory
+  would have silently broken `replaceAfter`. The batched query keeps the
+  semantics bit-for-bit and still removes the O(lost-nodes) query storm
+  — a 2,000-node partition costs one query per tick instead of 2,000.
+  (Correctness over the plan's letter; the plan's *goal* — cheap ticks —
+  is met.)
+
+## 6. Batched heartbeats keep per-id NotFound verdicts
+
+- **The call:** a heartbeat batch returns each caller its own verdict:
+  registered nodes succeed, an unregistered ("ghost") node's heartbeat
+  errors typed `NotFound` exactly as the single op always did.
+- **Alternatives:** one shared batch verdict (all-succeed unless the
+  batch fails); treating ghosts as silent no-ops.
+- **Trade-off:** the batched apply tracks a ghost set and the batch
+  runner maps results per id — a little machinery a shared verdict
+  would not need.
+- **Why:** a worker whose node was removed must not believe it is
+  healthy — its self-fence clock advances on heartbeat *success*, and a
+  ghost that keeps "succeeding" would keep orphaned stateful tasks alive
+  past their fence window. The typed error also keeps the RPC surface's
+  NotFound mapping intact. (Correctness of the fencing contract over
+  batching simplicity.)
+
+## 7. Heartbeat coalescing has no config knob
+
+- **The call:** heartbeat group commit is unconditional; only the
+  plan-apply coalescer got an escape hatch.
+- **Alternatives:** a `heartbeat_coalescing: false` setting for
+  symmetry.
+- **Trade-off:** an operator cannot restore strictly-serial heartbeat
+  commits without downgrading.
+- **Why:** a batch of one *is* the old path (same replicated op shape),
+  batching preserves per-caller semantics including error verdicts, and
+  heartbeats have no equivalent of the plan path's per-plan isolation
+  subtleties that might justify a kill switch. Every knob is surface to
+  document and test. (Simplicity; the escape hatch would guard against
+  nothing nameable.)
+
+## 8. The reprojection skip consults the cached view, not just the database
+
+- **The call:** a heartbeat skips the read-model reprojection only when
+  the node is active in the DB *and* available in the cached read model;
+  a mismatch always reprojects.
+- **Alternatives:** DB-status check alone (the plan's letter).
+- **Trade-off:** one read-model read-lock acquisition per heartbeat
+  batch (cheap; shared, not exclusive).
+- **Why:** a concurrent mark-lost can publish its cache update after the
+  heartbeat's DB write; with a DB-only check the next heartbeat sees
+  "already active" and skips forever while the cache still says lost —
+  a permanently wrong scheduler view. Consulting the cache converges it
+  on the next beat, which is exactly the guarantee the old
+  unconditional reprojection gave. (Correctness under the race the old
+  code healed by accident.)

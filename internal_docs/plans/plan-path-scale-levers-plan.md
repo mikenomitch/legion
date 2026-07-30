@@ -1,9 +1,14 @@
 # Plan-Path Scale Levers (lazy version sample, group commit, cheap snapshots)
 
-**Status: IN EXECUTION** — graduates proposals D4, D5, and D6 from
+**Status: SHIPPED** (2026-07-30, all three phases) — graduates proposals
+D4, D5, and D6 from
 [`scheduler-architecture-review-plan.md`](scheduler-architecture-review-plan.md)
 into one implementation plan; they share machinery (the read-model
 generation counter) and tests (the oversubscription fence suite).
+Before/after numbers in `benchmarks/scheduler/README.md`; public doc in
+`docs/scheduler-and-eval-loop.md`. Deliberately deferred: local-backend
+commit amortization for plan batches (judgement call #6), status-lane
+batching of the post-apply `task_status` projection.
 
 > **Judgement calls:** [`../calls/plan-path-scale-levers-plan_calls.md`](../calls/plan-path-scale-levers-plan_calls.md)
 

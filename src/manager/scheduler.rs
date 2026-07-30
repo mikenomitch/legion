@@ -2450,6 +2450,11 @@ impl<'a> Scheduler<'a> {
         top.first().copied()
     }
 
+    /// The per-placement hot loop: pick the best-scoring node, breaking
+    /// exact-score ties uniformly at random. Fused into one scoring pass
+    /// (after the cheap load-bounds pass) with reservoir tie-breaking —
+    /// the same selection distribution as score-all/sort/shuffle, without
+    /// allocating a scored vector per placement.
     fn select_cached_node<'b>(
         &self,
         eligible: &[&'b Node],
@@ -2457,26 +2462,36 @@ impl<'a> Scheduler<'a> {
         scoring_cache: &PlanScoringCache,
         weights: SchedulerWeights,
     ) -> Option<&'b Node> {
-        let scored = score_nodes_with_cache(eligible, affinity_set, scoring_cache, weights);
-        if scored.is_empty() {
+        if eligible.is_empty() {
             return None;
         }
-
-        let best_score = scored
-            .iter()
-            .fold(f64::NEG_INFINITY, |best, (_, score)| best.max(*score));
-        let mut top_nodes = scored
-            .into_iter()
-            .filter_map(|(node, score)| {
-                if (score - best_score).abs() <= 1e-9 {
-                    Some(node)
-                } else {
-                    None
+        let bounds = cached_load_bounds(eligible, scoring_cache);
+        let mut rng = rand::thread_rng();
+        let mut best: Option<(&'b Node, f64)> = None;
+        let mut tie_count = 0usize;
+        for node in eligible.iter().copied() {
+            let score = score_node_with_cache(node, affinity_set, scoring_cache, weights, bounds);
+            match best {
+                None => {
+                    best = Some((node, score));
+                    tie_count = 1;
                 }
-            })
-            .collect::<Vec<_>>();
-        top_nodes.shuffle(&mut rand::thread_rng());
-        top_nodes.into_iter().next()
+                Some((_, best_score)) if score > best_score + 1e-9 => {
+                    best = Some((node, score));
+                    tie_count = 1;
+                }
+                Some((_, best_score)) if (score - best_score).abs() <= 1e-9 => {
+                    // Uniform over the tie group: replace the incumbent
+                    // with probability 1/n at the n-th tied candidate.
+                    tie_count += 1;
+                    if rng.gen_range(0..tie_count) == 0 {
+                        best = Some((node, best_score));
+                    }
+                }
+                Some(_) => {}
+            }
+        }
+        best.map(|(node, _)| node)
     }
 
     fn select_cached_node_with_jitter<'b>(
@@ -2917,16 +2932,16 @@ fn score_nodes_for_context<'a>(ctx: &SchedulingContext<'a>) -> Vec<(&'a Node, f6
         .collect()
 }
 
-fn score_nodes_with_cache<'a>(
-    eligible: &[&'a Node],
-    affinity_set: &AffinitySet,
-    scoring_cache: &PlanScoringCache,
-    weights: SchedulerWeights,
-) -> Vec<(&'a Node, f64)> {
-    if eligible.is_empty() {
-        return Vec::new();
-    }
+/// Min/max assigned load over `eligible` plus the normalization range —
+/// the cheap first pass both the fused selector and the batch scorer share.
+#[derive(Debug, Clone, Copy)]
+struct CachedLoadBounds {
+    min_load: f64,
+    max_load: f64,
+    range: f64,
+}
 
+fn cached_load_bounds(eligible: &[&Node], scoring_cache: &PlanScoringCache) -> CachedLoadBounds {
     let mut min_load: Option<usize> = None;
     let mut max_load: Option<usize> = None;
     for node in eligible {
@@ -2938,41 +2953,69 @@ fn score_nodes_with_cache<'a>(
         min_load = Some(min_load.map_or(load, |min| min.min(load)));
         max_load = Some(max_load.map_or(load, |max| max.max(load)));
     }
-
     let min_load = min_load.unwrap_or_default() as f64;
     let max_load = max_load.unwrap_or_default() as f64;
-    let range = (max_load - min_load).max(0.0);
+    CachedLoadBounds {
+        min_load,
+        max_load,
+        range: (max_load - min_load).max(0.0),
+    }
+}
 
+/// One node's score under the cached plan state — the body both the fused
+/// single-pass selector and the batch scorer run per candidate.
+fn score_node_with_cache(
+    node: &Node,
+    affinity_set: &AffinitySet,
+    scoring_cache: &PlanScoringCache,
+    weights: SchedulerWeights,
+    bounds: CachedLoadBounds,
+) -> f64 {
+    let state = scoring_cache.node_states.get(node.id.as_str());
+    let load = state.map(|s| s.assigned_count).unwrap_or_default() as f64;
+    let (spread_score, bin_pack_score) = if bounds.range > 0.0 {
+        (
+            (bounds.max_load - load) / bounds.range,
+            (load - bounds.min_load) / bounds.range,
+        )
+    } else {
+        (0.0, 0.0)
+    };
+    let affinity_score = state
+        .map(|s| s.base_affinity + scoring_cache.affinity.colocation_score(s))
+        .unwrap_or_else(|| affinity_set.score(node));
+    let anti_affinity_penalty = state
+        .map(|s| s.same_task_allocations.max(s.same_group_allocations) as f64)
+        .unwrap_or_else(|| {
+            if scoring_cache.group_name.is_some() {
+                1.0
+            } else {
+                0.0
+            }
+        });
+    weights.affinity * affinity_score
+        + weights.spread * spread_score
+        + weights.bin_pack * bin_pack_score
+        - weights.automatic_anti_affinity * anti_affinity_penalty
+}
+
+fn score_nodes_with_cache<'a>(
+    eligible: &[&'a Node],
+    affinity_set: &AffinitySet,
+    scoring_cache: &PlanScoringCache,
+    weights: SchedulerWeights,
+) -> Vec<(&'a Node, f64)> {
+    if eligible.is_empty() {
+        return Vec::new();
+    }
+    let bounds = cached_load_bounds(eligible, scoring_cache);
     eligible
         .iter()
         .copied()
         .map(|node| {
-            let state = scoring_cache.node_states.get(node.id.as_str());
-            let load = state.map(|s| s.assigned_count).unwrap_or_default() as f64;
-            let (spread_score, bin_pack_score) = if range > 0.0 {
-                ((max_load - load) / range, (load - min_load) / range)
-            } else {
-                (0.0, 0.0)
-            };
-            let affinity_score = state
-                .map(|s| s.base_affinity + scoring_cache.affinity.colocation_score(s))
-                .unwrap_or_else(|| affinity_set.score(node));
-            let anti_affinity_penalty = state
-                .map(|s| s.same_task_allocations.max(s.same_group_allocations) as f64)
-                .unwrap_or_else(|| {
-                    if scoring_cache.group_name.is_some() {
-                        1.0
-                    } else {
-                        0.0
-                    }
-                });
-
             (
                 node,
-                weights.affinity * affinity_score
-                    + weights.spread * spread_score
-                    + weights.bin_pack * bin_pack_score
-                    - weights.automatic_anti_affinity * anti_affinity_penalty,
+                score_node_with_cache(node, affinity_set, scoring_cache, weights, bounds),
             )
         })
         .collect()

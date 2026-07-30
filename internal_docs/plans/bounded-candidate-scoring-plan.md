@@ -1,7 +1,12 @@
 # Bounded Candidate Scoring (opt-in score sampling)
 
-**Status: IN EXECUTION** — graduates proposal D1 from
+**Status: SHIPPED** (2026-07-30, both phases) — graduates proposal D1
+from
 [`scheduler-architecture-review-plan.md`](scheduler-architecture-review-plan.md).
+Public doc in `docs/scheduler-and-eval-loop.md` ("Bounded candidate
+scoring"); the packing-quality gate is
+`score_sample_bin_pack_quality_stays_bounded` in
+`src/manager/scheduler.rs`. Default remains exact scoring (opt-in knob).
 
 > **Judgement calls:** [`../calls/bounded-candidate-scoring-plan_calls.md`](../calls/bounded-candidate-scoring-plan_calls.md)
 

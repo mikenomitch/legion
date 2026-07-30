@@ -67,9 +67,9 @@ When one is required and what goes in it:
 | [multi-raft-persistence-plan.md](plans/multi-raft-persistence-plan.md) | planned |
 | [scheduler-performance-plan.md](plans/scheduler-performance-plan.md) | in execution |
 | [scheduler-architecture-review-plan.md](plans/scheduler-architecture-review-plan.md) | proposals accepted; D1/D4/D5/D6 graduated into the two plans below, D8's local slice into the heartbeat plan |
-| [plan-path-scale-levers-plan.md](plans/plan-path-scale-levers-plan.md) | in execution |
-| [bounded-candidate-scoring-plan.md](plans/bounded-candidate-scoring-plan.md) | in execution |
-| [heartbeat-scale-plan.md](plans/heartbeat-scale-plan.md) | in execution |
+| [plan-path-scale-levers-plan.md](plans/plan-path-scale-levers-plan.md) | shipped (D4/D5/D6, 2026-07-30) |
+| [bounded-candidate-scoring-plan.md](plans/bounded-candidate-scoring-plan.md) | shipped (opt-in `score_sample`, 2026-07-30) |
+| [heartbeat-scale-plan.md](plans/heartbeat-scale-plan.md) | shipped (benchmark + batching + liveness + cadence, 2026-07-30) |
 | [aws-comparative-benchmark-plan.md](plans/aws-comparative-benchmark-plan.md) | planned |
 | [scheduler-plan-snapshot-plan.md](plans/scheduler-plan-snapshot-plan.md) | shipped |
 | [scheduling-index-plan.md](plans/scheduling-index-plan.md) | shipped (phases 0–3; group-path + backlog deferred) |
