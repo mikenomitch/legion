@@ -15,7 +15,7 @@ from the CLI, the MCP server, the UI, and raw gRPC.
 | `eval.completed` | info | An eval handler finished successfully. |
 | `eval.failed` | error | An eval handler returned an error. |
 | `allocation.placed` | info | A plan was applied; one event per apply, with placement details in metadata. |
-| `allocation.removed` | info/warn | Allocations were removed (job stop/update: info; node loss: warn). |
+| `allocation.removed` | info/warn | Allocations were removed (job stop/update: info; node loss: warn). Metadata carries `cause` — `stop`, `update`, `drain`, `reschedule`, `destroy`, or `node_lost` — omitted when no cause was recorded. See [Stop Causes](graceful-stop.md). |
 | `allocation.failed` | warn | A worker reported an allocation failure (includes the reason). |
 | `allocation.plan_rejected` | warn | A placement plan was rejected by optimistic concurrency (will be retried). |
 | `artifact.staging` | info | An allocation began staging its [artifacts](artifacts.md) (artifact list in metadata). |

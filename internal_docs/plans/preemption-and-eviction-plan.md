@@ -2,10 +2,37 @@
 
 > **Judgement calls:** [`calls/preemption-and-eviction-plan_calls.md`](../calls/preemption-and-eviction-plan_calls.md)
 
-**Status: PLANNED.** Nothing here is built. Deliberately deferred from v1:
-fair-share / hierarchical queues, oversubscription and node-pressure eviction,
-suspend-based preemption, descheduler-style rebalancing, network/device-aware
-victim selection, and a preemption plugin seam (each is a named non-goal below).
+**Status: IN EXECUTION.** Phase 1 is split into 1a (stop causes) and 1b
+(graceful termination); **Phase 1a has shipped** — see
+[`docs/graceful-stop.md`](../../docs/graceful-stop.md). Phases 1b, 2, 3 and 4
+are not built. Deliberately deferred from v1: fair-share / hierarchical
+queues, oversubscription and node-pressure eviction, suspend-based preemption,
+descheduler-style rebalancing, network/device-aware victim selection, and a
+preemption plugin seam (each is a named non-goal below).
+
+**Phase 1 was split during implementation.** The original Phase 1 bundled the
+stop *cause* with the stop *ladder*. Two findings forced them apart:
+
+1. **Grace cannot be added where `stop()` is called today.** The worker's
+   `reconcile_allocations` runs while holding the task-manager mutex, inside
+   the async heartbeat loop (`src/worker/daemon.rs`). A `stop()` that waits
+   for a deadline holds that lock — the one heartbeats, the self-fence
+   watchdog, health reporting and log maintenance all need — for up to
+   `killAfter`. At a 2s heartbeat cadence, a 30s grace window would let the
+   manager declare the node lost and reschedule everything on it, which is
+   strictly worse than the hard kill it replaces. Graceful stop therefore
+   needs a *terminating set* on the worker (signal, record deadline, return;
+   a reaper finishes the job), not merely a richer argument to `stop()`.
+2. **The cause needed no grace to be useful, and the notice file needed grace
+   to be useful at all.** A stop notice written immediately before SIGKILL is
+   a file no task can read. So the cause, the wire delivery and the event
+   metadata shipped as 1a; the ladder, the notice file and
+   `stop { signal, killAfter }` are 1b.
+
+See [Phase 1a](#phase-1a--stop-causes-shipped) and
+[Phase 1b](#phase-1b--graceful-termination) below, and the
+[judgement calls](../calls/preemption-and-eviction-plan_calls.md) for the
+reasoning.
 
 ## Problem Statement
 
@@ -271,10 +298,16 @@ capacity frees up. Nobody edits or stops the batch job by hand.
 
 **S2 — Every stop becomes clean (even with preemption never used).** An
 operator drains a node for a kernel upgrade. Today each task is hard-killed
-mid-write. After Phase 1 alone, every task gets its `stop.signal` and
+mid-write. After Phase 1b, every task gets its `stop.signal` and
 `stop.killAfter` window — drain, rollout replacement, `job stop`, and
 reschedule all use the same contract, and a task can flush, checkpoint, or
 drain connections.
+
+**S2a — Every stop becomes explicable (shipped).** The same operator, after
+the fact, asks why a task disappeared. `legion events list --kind
+allocation.removed` answers `drain` rather than leaving them to correlate
+timestamps against a maintenance window; the worker's own log says the same.
+This is Phase 1a, and it needed none of the grace machinery.
 
 **S3 — Preview before displacing anyone.** CI (or an agent over MCP) runs
 `legion job plan api.jsonnet` before submitting and sees exactly which
@@ -288,10 +321,13 @@ replicas and no more; the scheduler looks elsewhere for the rest.
 
 ## Goals
 
-- A **graceful-stop contract** on every platform-initiated termination:
-  configurable signal and `killAfter` per task, a machine-readable stop
-  notice with the cause, one pipeline shared by job stop, rollout
-  replacement, drain, reschedule, and preemption.
+- A **stop cause** on every platform-initiated termination, recorded with the
+  removal and delivered to the worker that ran the task, shared by job stop,
+  rollout replacement, drain, reschedule, destroy, node loss, and preemption.
+  *(Phase 1a — shipped.)*
+- A **graceful-stop contract** on top of it: configurable signal and
+  `killAfter` per task, a machine-readable stop notice file, one ladder for
+  every cause. *(Phase 1b.)*
 - **Job priority as four named bands** (`critical` / `high` / `normal` /
   `low`), driving both eval-queue order and preemption, meaningful the
   moment it is set.
@@ -483,10 +519,47 @@ the mesh's "drain-before-SIGTERM" item (TODO) needs anyway.
   to Nomad's model ([#11434](https://github.com/hashicorp/nomad/issues/11434)).
   `legion job run --priority N` and `--asap` remain as explicit eval-queue
   overrides (they do not change the job's band).
-- **Governance, minimal v1**: submitting a `critical` job requires
-  `operator:write` (one added check in the RunJob handler; the band is in
-  the parsed body, so the two-step `authenticate_acl` + `enforce` form
-  applies). `high` is open by default. Per-namespace band caps are Phase 4.
+- **Governance: a `bands` selector on `job` ACL rules.** Which bands a caller
+  may submit is expressed in the ACL vocabulary that already exists, following
+  the `templates` / `action_names` / `pools` selector precedent:
+
+  ```json
+  {"resources": ["job"], "actions": ["write"], "namespaces": ["prod"], "bands": ["critical", "high"]}
+  ```
+
+  Rejected alternative: gating `critical` behind `operator:write`, which was
+  this plan's original proposal. `operator` is documented as "raft, manager
+  configs, observability" — so it would make everyone who can submit a
+  critical job a raft administrator and vice versa, conflating cluster
+  administration with workload importance. It is also all-or-nothing: no way
+  to say "team A may use `critical` in their namespace". The selector costs
+  more up front and is the same work as Phase 4's per-namespace band caps,
+  done once in the right place. See the
+  [judgement calls](../calls/preemption-and-eviction-plan_calls.md).
+
+  Three things this must get right, none of which the original one-line
+  proposal had to think about:
+
+  - **Normalize the band before enforcing.** Selector semantics are
+    documented in `src/structs/acl.rs`: *"a rule with a selector never matches
+    a request without the attribute"*. Since absent `priority` means `normal`,
+    RunJob must populate the band attribute (defaulted) before `enforce`, or
+    band rules silently grant nothing and existing policies silently stop
+    matching.
+  - **Gate the update and template paths, not just RunJob.** A job edited to a
+    higher band after submit, or a template that renders `priority: 'critical'`,
+    bypasses a RunJob-only check. The `templates` selector docs are explicit
+    that submitting *through* a template is gated separately, so the band
+    check has to run post-render.
+  - **Test it where a regression will be caught.** `every_manager_rpc_is_classified`
+    will not: this is *conditional* enforcement inside an existing endpoint, so
+    dropping the check leaves the suite green. Needs an explicit test (a
+    non-privileged token submitting `critical` gets PermissionDenied) living
+    next to the endpoint table in `tests/acl_endpoints.rs`.
+
+  `high` and below stay open by default: the band only becomes a privilege
+  where a policy says so. This subsumes Phase 4's band caps, so Open Question
+  5 is resolved.
 - Future system jobs (TODO § Job types) slot in at `critical` when they
   exist; the band exists first.
 
@@ -645,9 +718,13 @@ Proto (`proto/legion.proto`, every field documented publicly per repo rule):
 - `JobConfig` message += `priority` (string band; absent = `normal`).
 - Plan RPC response += repeated `PlannedPreemption { node_id, job_name,
   task_name, count, band, kill_after }`.
-- No new RPCs → no new entries needed in `tests/acl_endpoints.rs` except
-  the added `critical`-band enforcement inside RunJob (covered by a unit
-  test on the handler).
+- No new RPCs, so `every_manager_rpc_is_classified` needs no new rows. It
+  will NOT catch a dropped band check either — that check is conditional
+  enforcement inside existing endpoints — so `tests/acl_endpoints.rs` gains
+  explicit band cases (non-privileged token + `critical` → PermissionDenied,
+  on RunJob *and* on the update and template-render paths).
+- `AclRule` += `bands` selector (+ `has_scope_selectors`), and the band
+  attribute is populated on the request scope before `enforce`.
 
 Structs and store:
 
@@ -673,13 +750,77 @@ Structs and store:
 
 ## Implementation Phases
 
-### Phase 1 — Graceful stop everywhere
-`stop { signal, killAfter }`, `StopContext` ABI, exec/container/noop
-ladders, stop-notice file + `LEGION_STOP_NOTICE_PATH`, stops-before-starts
-reconcile ordering, `allocation.stopping` event, docs
-(`docs/task-runtime-plugins.md` capability note + a new public page section).
-**Win standalone:** every stop in Legion — rollout, drain, job stop,
-reschedule — becomes clean instead of a hard kill. No preemption required.
+### Phase 1a — Stop causes (SHIPPED)
+
+Shipped. Public doc: [`docs/graceful-stop.md`](../../docs/graceful-stop.md).
+
+- `StopCause` vocabulary (`stop` / `update` / `drain` / `reschedule` /
+  `destroy` / `node_lost` / `preempted` / `unknown`) in `src/structs/stop.rs`.
+  `preempted` is defined but unused, so workers deployed now already
+  understand it when Phase 3 lands.
+- `StopContext` + `TaskPlugin::stop_with`, whose default delegates to
+  `stop()`. **Deliberately not an ABI break** — out-of-tree plugins compiled
+  against the old trait keep working. `StopContext` is `#[non_exhaustive]` so
+  1b can add `signal` and `deadline` without touching call sites again.
+- `allocation_stop_notice` table, written **in the same transaction as the
+  `DELETE`** at all eight removal sites, so a notice can never describe a stop
+  that was rolled back. Scheduler-lane owned (every writer proposes on that
+  lane); expiry rides those same transactions rather than the heartbeat read
+  path, which keeps a write — and in raft mode a proposal — off the hottest
+  path in the system.
+- `HeartbeatReply.stop_notices` delivers them; the worker mirrors the set
+  wholesale and consumes each cause at the stop it describes.
+- `cause` in `allocation.removed` event metadata; one worker log line per stop.
+- `ForwardableLaneWrite::RemoveAllocationById` carries the cause, `#[serde(default)]`
+  so a forward from an older manager still applies.
+
+**Win standalone:** "why did my task go away?" has an answer — in the event
+journal and in worker logs — for drain, rollout replacement, `job stop`,
+destroy and node loss. Nothing waits on preemption.
+
+**Explicitly not in 1a:** any change to *when* a task dies. Termination is
+still immediate.
+
+### Phase 1b — Graceful termination
+
+The stop ladder, which 1a deliberately left out. Ordered by what blocks what:
+
+1. **A terminating set on the worker.** `stop_with` signals and records a
+   deadline, then returns; a reaper (or the next reconcile tick) does the
+   SIGKILL and the teardown. This is the load-bearing piece — see the mutex
+   argument at the top of this plan. Teardown must move behind actual process
+   exit, which matters most for `volumes.unmount_for_allocation`: the existing
+   "release storage after the process is gone, never before" comment in
+   `stop_allocation_inner` is currently true only because SIGKILL is
+   synchronous. Grace decouples "stop returned" from "process is gone", and
+   unmounting under a live task is how a database gets corrupted.
+2. **`stop { signal, killAfter }`** on `TaskConfig` (+ validation capping
+   `killAfter` at 5m, + `configs/jobs/maximal.jsonnet`). `StopContext` gains
+   the two fields.
+3. **Runtime ladders**: exec implements signal → wait-to-deadline → SIGKILL;
+   container maps to the runtime's stop-with-timeout (the OCI path's
+   `delete --force` is the asymmetry to fix); noop ignores it.
+4. **The stop-notice file** + `LEGION_STOP_NOTICE_PATH`. Deferred from 1a
+   because a notice written immediately before SIGKILL is a file no task can
+   read; it only becomes useful once there is a window in which to read it.
+5. **`allocation.stopping` event.** Also deferred from 1a on purpose: with no
+   grace there is no "stopping" state — a stop is instantaneous, and an event
+   announcing an interval that does not exist is noise.
+6. **Stops-before-starts** reconcile ordering, which Phase 3 needs so a node
+   never runs victim and preemptor concurrently.
+
+**Open question for 1b, from the review that split this phase:** stops-before-starts
+puts the victim's shutdown on the preemptor's critical path, so a task that
+ignores SIGTERM delays an incident-response scale-up by up to `killAfter`. The
+5m cap is the only backstop today. Decide between a shorter preemption-specific
+grace and starting the preemptor once capacity is *accounted* rather than
+*physically free*.
+
+**Version-skew note for 1b** (1a needs none — an old worker simply ignores
+`stop_notices`): stops-before-starts is worker-side, so a new manager with an
+old worker may start the preemptor while the victim still runs — a transient
+oversubscription, not merely a graceless stop. Gate `enforce` on a minimum
+worker protocol version, or make the plan tolerate the overlap.
 
 ### Phase 2 — Priority bands
 `priority` on JobConfig (+ column, proto, validation), band → eval-priority
@@ -698,10 +839,13 @@ mode, events + metrics, the no-placement error text, public doc
 Scheduling) as a prerequisite or co-landing. **Win:** S1 end to end.
 
 ### Phase 4 — Governance and operations polish
-Per-namespace band caps (config map + submit validation), preemption
-history on the UI job page, `legion node drain` gaining optional rate
-limiting via the same disruption vocabulary (evaluate then — deliberately
+Preemption history on the UI job page, `legion node drain` gaining optional
+rate limiting via the same disruption vocabulary (evaluate then — deliberately
 not v1), fair-share revisit note. Each item independently droppable.
+
+Per-namespace band caps are **no longer a Phase 4 item**: the `bands` ACL
+selector in Phase 2 delivers them, scoped by namespace and by job name, with
+no second policy surface.
 
 ## Testing Plan
 
@@ -790,24 +934,45 @@ Regression:
 4. **Notice delivery beyond the file+signal** (e.g. an env-pointed FIFO or
    an exec-style hook): defer until a real consumer (the mesh's
    drain-before-SIGTERM) exists. Lean: file is enough for v1.
-5. **Per-namespace band caps shape** (Phase 4): config map
-   (`priority.maxBandByNamespace`) vs ACL-native. Lean: config map first;
-   ACL integration when namespaces grow real policy objects.
+5. ~~**Per-namespace band caps shape** (Phase 4): config map
+   (`priority.maxBandByNamespace`) vs ACL-native.~~ **Resolved: ACL-native.**
+   A `bands` selector on `job` rules (see § Job priority) covers both the
+   `critical` gate and per-namespace caps in one surface, so no config map is
+   added. The original lean toward a config map was wrong: it would have
+   shipped a second policy vocabulary alongside ACLs, then needed migrating
+   onto them the moment anyone asked for per-team rather than per-namespace
+   scoping.
+
+6. **Should the per-pool preemption toggle be ACL-adjacent rather than
+   manager config?** `disabledPools` lives in `schedulerSettings`, so a
+   pool-scoped operator cannot exempt their own pool without cluster-config
+   access — even though `pools` already exists as an ACL selector. Lean:
+   config for v1, named here so the asymmetry is a decision rather than an
+   oversight.
 
 ## Acceptance Criteria
 
-- **Phase 1:** a task with `stop { killAfter: '5s' }` receives SIGTERM and
-  exits cleanly on `job stop`, rollout replacement, drain, and reschedule;
-  a task ignoring SIGTERM is SIGKILLed at the deadline; the notice file
-  names the correct cause; a preempting reconcile starts the new task only
-  after victims exit; no change for tasks without `stop`.
-- **Phase 2:** two pending evals dequeue in band order; `critical` without
-  `operator:write` is rejected at submit with a clear error; `job list`
-  shows bands; submitting `high` with preemption off prints the warning.
+- **Phase 1a (met):** `job stop`, rollout replacement, drain, destroy and node
+  loss each record their own cause; the owning node receives it on the next
+  heartbeat and logs it; `allocation.removed` metadata carries it; a stop with
+  no notice still stops (`unknown`); a plugin implementing only `stop()` still
+  compiles and still stops.
+- **Phase 1b:** a task with `stop { killAfter: '5s' }` receives SIGTERM and
+  exits cleanly on `job stop`, rollout replacement, drain, and reschedule; a
+  task ignoring SIGTERM is SIGKILLed at the deadline; the notice file names
+  the correct cause; a preempting reconcile starts the new task only after
+  victims exit; no change for tasks without `stop`; **and the heartbeat keeps
+  its cadence throughout a 30s grace window** (the regression that split the
+  phase).
+- **Phase 2:** two pending evals dequeue in band order; a token whose policy
+  does not allow the `critical` band is rejected at submit with a clear error,
+  on RunJob *and* via a template that renders `critical`; `job list` shows
+  bands; submitting `high` with preemption off prints the warning.
 - **Phase 3:** S1 passes end to end; `job plan` preview equals enforce-mode
   behavior; observe mode evicts nothing and emits `preempt_planned`;
   `minAvailable` floors hold under concurrent plans; benches show no
   regression when preemption never triggers; `docs/preemption-and-eviction.md`
   exists and covers surface, defaults, failure modes, and limitations.
-- **Phase 4:** a namespace capped at `normal` cannot submit `high`; UI shows
-  a victim job's preemption history.
+- **Phase 4:** UI shows a victim job's preemption history. (The namespace-cap
+  criterion moved to Phase 2 with the `bands` selector: a policy scoped to
+  `namespaces: ["team-a"]`, `bands: ["normal"]` cannot submit `high`.)

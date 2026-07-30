@@ -42,9 +42,43 @@ How to use it:
 - [ ] Worker groups + taint/toleration equivalent. Node pools exist as an ACL
       and config concept but nothing scheduling-side consumes them.
 - [ ] Priorities and eviction/preemption, with eviction toggled at the pool level
-      — [plan](plans/preemption-and-eviction-plan.md) (PLANNED: graceful stop →
-      priority bands → plan-atomic preemption → governance; pool toggle is
-      `schedulerSettings.preemption.disabledPools`)
+      — [plan](plans/preemption-and-eviction-plan.md) (IN EXECUTION: stop causes
+      → graceful termination → priority bands → plan-atomic preemption →
+      governance; pool toggle is `schedulerSettings.preemption.disabledPools`)
+  - [x] **Phase 1a — stop causes.** Every allocation removal records *why*
+        (`stop`/`update`/`drain`/`reschedule`/`destroy`/`node_lost`), delivered
+        to the owning worker on its next heartbeat and carried in
+        `allocation.removed` event metadata.
+        [plan §Phase 1a](plans/preemption-and-eviction-plan.md) ·
+        [docs](../docs/graceful-stop.md)
+  - [ ] **Phase 1b — graceful termination.** `stop { signal, killAfter }`,
+        per-runtime SIGTERM→SIGKILL ladders, the `LEGION_STOP_NOTICE_PATH`
+        file, `allocation.stopping`, stops-before-starts reconcile ordering.
+        **Blocked on a worker-side terminating set**: `reconcile_allocations`
+        runs under the task-manager mutex inside the heartbeat loop, so a
+        blocking grace wait would stall heartbeats and the self-fence watchdog
+        and get the node declared lost. `stop_with` must signal and return,
+        with a reaper doing the SIGKILL — and teardown (notably
+        `volumes.unmount_for_allocation`) must move behind actual process
+        exit. [plan §Phase 1b](plans/preemption-and-eviction-plan.md)
+  - [ ] Decide Phase 1b's grace-vs-latency question: stops-before-starts puts a
+        victim's shutdown on the preemptor's critical path, so a task ignoring
+        SIGTERM delays an incident-response scale-up by up to `killAfter`.
+        Either a shorter preemption-specific grace, or start the preemptor once
+        capacity is *accounted* rather than *physically free*.
+  - [ ] Add a plugin ABI version symbol. `plugins/tasks/` loads a bare
+        `extern "C" fn() -> Box<dyn TaskPlugin>` with no version guard, so a
+        stale third-party dylib mismatches silently instead of failing loudly.
+        Phase 1a dodged this by not breaking the ABI (`stop_with` defaults to
+        `stop`); the next trait change will not have that option.
+  - [ ] Band governance ships as a `bands` selector on `job` ACL rules, not
+        `operator:write` — which also delivers per-namespace band caps, so
+        that is no longer a separate Phase 4 item. Needs band normalization
+        before `enforce` (a selector never matches a request lacking the
+        attribute), coverage on the update and template-render paths, and
+        explicit cases in `tests/acl_endpoints.rs` — the
+        `every_manager_rpc_is_classified` test cannot catch a dropped
+        conditional check inside an existing endpoint.
   - [x] At least think through fair-share policies — find the 80/20 rather than
         building a full hierarchical scheduler. Thought through in the plan's
         prior art + non-goals: the 80/20 is priority bands now, per-namespace

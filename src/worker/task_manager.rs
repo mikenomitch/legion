@@ -1,10 +1,10 @@
 use crate::artifacts::{ArtifactStager, ArtifactStatusBoard, CredentialSource, StagedArtifact};
 use crate::prelude::*;
 use crate::structs::{
-    substitute_artifact_tokens, Allocation, AllocationHealth, TaskAllocation, TaskConfig,
-    TaskOnUnhealthyConfig, VolumeMount, VolumeReport, WorkerArtifactFetchConfigFull,
+    substitute_artifact_tokens, Allocation, AllocationHealth, StopCause, TaskAllocation,
+    TaskConfig, TaskOnUnhealthyConfig, VolumeMount, VolumeReport, WorkerArtifactFetchConfigFull,
 };
-use crate::task_plugins::{TaskInstance, TaskPluginRegistry};
+use crate::task_plugins::{StopContext, TaskInstance, TaskPluginRegistry};
 use crate::worker::log_sink::{default_sinks, LogResource, LogSink};
 use crate::worker::logs::{read_allocation_logs, CapturedStream};
 use crate::worker::state::{pid_is_running, PersistedAllocation, WorkerStateStore};
@@ -56,6 +56,16 @@ pub struct WorkerTaskManager {
     // allocation whose window is exceeded by the time since the last
     // successful manager heartbeat.
     self_fence_windows: HashMap<i64, std::time::Duration>,
+    /// Why the manager is stopping each allocation, from the most recent
+    /// heartbeat reply (see `HeartbeatReply.stop_notices`).
+    ///
+    /// Advisory: an allocation removed from the desired set with no entry
+    /// here stops with [`StopCause::Unknown`] rather than waiting for one.
+    /// An entry is consumed by the stop it describes; everything else is
+    /// bounded by [`Self::set_stop_causes`] replacing the map wholesale on
+    /// each heartbeat, so this worker holds exactly what the manager
+    /// currently knows and needs no expiry logic of its own.
+    stop_causes: HashMap<i64, StopCause>,
     state_store: WorkerStateStore,
     /// Root of per-allocation directories: `<state dir>/allocs/<alloc_id>/<task>/`.
     alloc_root: PathBuf,
@@ -105,6 +115,7 @@ impl WorkerTaskManager {
             allocation_health: HashMap::new(),
             failed: Vec::new(),
             self_fence_windows: HashMap::new(),
+            stop_causes: HashMap::new(),
             state_store,
             alloc_root,
             artifact_status: ArtifactStatusBoard::new(),
@@ -430,6 +441,9 @@ impl WorkerTaskManager {
         self.task_configs.remove(&allocation_id);
         self.allocation_health.remove(&allocation_id);
         self.self_fence_windows.remove(&allocation_id);
+        // A task that failed on its own was never stopped by the platform,
+        // so any pending notice for it describes a stop that will not happen.
+        self.stop_causes.remove(&allocation_id);
         // Capture the final board snapshot before clearing it: the failure
         // report is the last (and race-free) carrier of per-artifact failure
         // detail to the manager's event stream.
@@ -546,6 +560,28 @@ impl WorkerTaskManager {
             .collect()
     }
 
+    /// Mirror the manager's current stop-notice set (`HeartbeatReply
+    /// .stop_notices`) into this worker.
+    ///
+    /// Replaces the map wholesale rather than merging, which is what keeps it
+    /// bounded without any worker-side expiry: the manager re-sends every
+    /// live notice on every heartbeat and prunes its own by age, so the
+    /// worker's copy is simply whatever the manager currently knows. It also
+    /// avoids the obvious merge bug — a notice arriving *before* the
+    /// allocation actually leaves the desired set (the read model refreshes
+    /// just after the removal commits) must survive until the stop, and a
+    /// notice the manager has retracted must not linger to mislabel a later,
+    /// unrelated stop of the same allocation.
+    pub fn set_stop_causes(&mut self, causes: HashMap<i64, StopCause>) {
+        self.stop_causes = causes;
+    }
+
+    /// The cause recorded for an allocation, if the manager sent one.
+    #[cfg(test)]
+    pub(crate) fn stop_cause_for(&self, allocation_id: i64) -> Option<StopCause> {
+        self.stop_causes.get(&allocation_id).copied()
+    }
+
     fn stop_allocation(&mut self, allocation_id: i64) -> R<()> {
         self.stop_allocation_inner(allocation_id, true)
     }
@@ -559,15 +595,30 @@ impl WorkerTaskManager {
             monitor.shutdown();
         }
 
+        // Consume the notice: a cause describes one stop, and the allocation
+        // is gone by the end of this function.
+        let cause = self
+            .stop_causes
+            .remove(&allocation_id)
+            .unwrap_or(StopCause::Unknown);
+        let stop_ctx = StopContext::new(cause);
+
         let allocation = self.allocations.get(&allocation_id).cloned();
         let task = self.task_configs.get(&allocation_id).cloned();
         if let (Some(allocation), Some(task)) = (allocation.as_ref(), task.as_ref()) {
+            info!(
+                allocation_id,
+                task_name = %task.name,
+                cause = %cause,
+                "Stopping allocation"
+            );
             if let Some(plugin) = self.registry.plugin(&task.runtime) {
                 if let Some(instance) = self.instances.get_mut(&allocation_id) {
-                    if let Err(err) = plugin.stop(allocation, task, instance) {
+                    if let Err(err) = plugin.stop_with(allocation, task, instance, &stop_ctx) {
                         warn!(
                             allocation_id,
                             task_name = %task.name,
+                            cause = %cause,
                             error = ?err,
                             "Failed to stop allocation instance"
                         );
@@ -1499,6 +1550,80 @@ mod tests {
         assert!(!manager.instances.contains_key(&allocation.id));
         assert!(!manager.allocation_health.contains_key(&allocation.id));
 
+        Ok(())
+    }
+
+    /// Put an allocation into the maps `reconcile_allocations` reads, so that
+    /// reconciling to an empty desired set stops it.
+    fn seed_running_allocation(manager: &mut WorkerTaskManager, allocation: &Allocation) {
+        manager
+            .instances
+            .insert(allocation.id, TaskInstance::default());
+        manager
+            .allocations
+            .insert(allocation.id, allocation.clone());
+        manager
+            .task_configs
+            .insert(allocation.id, TaskConfig::new("noop-task", "noop"));
+    }
+
+    #[test]
+    fn stop_cause_is_consumed_by_the_stop_it_describes() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let state_store = WorkerStateStore::new(temp_dir.path().join("worker_state.json"));
+        let mut manager = WorkerTaskManager::with_state_store(state_store);
+
+        let allocation = alloc();
+        seed_running_allocation(&mut manager, &allocation);
+        manager.set_stop_causes(HashMap::from([(allocation.id, StopCause::Drain)]));
+        assert_eq!(
+            manager.stop_cause_for(allocation.id),
+            Some(StopCause::Drain)
+        );
+
+        let _ = manager.reconcile_allocations(&[]);
+
+        // The notice described one stop, and that stop has happened.
+        assert_eq!(
+            manager.stop_cause_for(allocation.id),
+            None,
+            "a consumed notice must not linger to label a later stop"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_stop_without_a_notice_still_stops() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let state_store = WorkerStateStore::new(temp_dir.path().join("worker_state.json"));
+        let mut manager = WorkerTaskManager::with_state_store(state_store);
+
+        let allocation = alloc();
+        seed_running_allocation(&mut manager, &allocation);
+
+        // No `set_stop_causes` call at all — an old manager, or a notice that
+        // has not arrived yet. The allocation must still go away: causes are
+        // advisory, and a stop is never gated on one.
+        let _ = manager.reconcile_allocations(&[]);
+        assert!(!manager.allocations.contains_key(&allocation.id));
+        assert!(!manager.instances.contains_key(&allocation.id));
+        Ok(())
+    }
+
+    #[test]
+    fn stop_causes_are_replaced_wholesale_not_merged() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let state_store = WorkerStateStore::new(temp_dir.path().join("worker_state.json"));
+        let mut manager = WorkerTaskManager::with_state_store(state_store);
+
+        manager.set_stop_causes(HashMap::from([(1, StopCause::Drain), (2, StopCause::Stop)]));
+        // The manager retracted the notice for 1 and changed 2's cause. The
+        // worker mirrors the manager's current set rather than accumulating,
+        // which is what keeps the map bounded with no worker-side expiry.
+        manager.set_stop_causes(HashMap::from([(2, StopCause::Update)]));
+
+        assert_eq!(manager.stop_cause_for(1), None, "retracted notice is gone");
+        assert_eq!(manager.stop_cause_for(2), Some(StopCause::Update));
         Ok(())
     }
 
