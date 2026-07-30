@@ -54,6 +54,8 @@ take resources back. Concretely, today:
   rollout replacement, a drain, a `job stop`, and a reschedule all terminate
   tasks with no notice. There is no `killAfter`, no SIGTERM→SIGKILL ladder,
   no way for a task to flush, checkpoint, or drain connections.
+  *(Still true after Phase 1a — that phase made stops **explicable**, not
+  gentler. The kill is as hard as it was; Phase 1b is what changes it.)*
 - **The TODO already names this gap**: "Priorities and eviction/preemption,
   with eviction toggled at the pool level" and "at least think through
   fair-share policies — find the 80/20" (`internal_docs/TODO.md`).
@@ -63,7 +65,8 @@ clusters (or separate pools sized for peak), and accept that any platform-
 initiated stop may corrupt or lose in-flight work.
 
 This plan adds three things, in dependency order: a **graceful-stop contract**
-for every platform-initiated termination; a **job priority** expressed as a
+for every platform-initiated termination (whose first half — the stop cause —
+has shipped); a **job priority** expressed as a
 small set of named bands; and **scheduler preemption** — when a higher-band
 job cannot place, the scheduler evicts lower-band allocations atomically
 inside the placement plan, with grace, requeue, and full observability.
