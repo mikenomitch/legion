@@ -88,6 +88,17 @@ into a single series with every label set to `"other"`.
   lazy epoch sample in docs/scheduler-and-eval-loop.md). A steadily high
   rate relative to plan volume means heavy concurrent churn; correctness
   is unaffected either way.
+- **`legion_scheduler_plan_candidate_rank`** (histogram) — the
+  late-binding candidate rank each placement bound at during plan apply
+  (0 = the planner's first choice; >0 = a fallback absorbed a race — see
+  "Late binding" in docs/scheduler-and-eval-loop.md). Mass above 0 is
+  contention being absorbed; plan rejections *alongside* high ranks mean
+  candidate lists are running dry (a physically contended pool).
+- **`legion_scheduler_conflict_requeues_total`** (counter) — evals
+  released back to pending after exhausting plan-conflict retries (the
+  never-drop-work backstop). A steadily climbing count means plans keep
+  losing races even with fallbacks — look at pool saturation before
+  scheduler settings.
 
 ### Scheduling indexes
 

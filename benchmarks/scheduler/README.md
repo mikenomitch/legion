@@ -250,3 +250,54 @@ Readings:
   short at driver-limited batch sizes — with real arrival concurrency
   (batch 128) the same commit rate (~100 commits/s observed) covers
   ~12,800 hb/s. `heartbeatSeconds` remains the fleet-wide knob on top.
+
+## Late-binding plan apply (candidate lists + requeue backstop) — 2026-07-30
+
+**Host: 4-vCPU Linux container (Claude Code remote env), release build.**
+`tests/contention_benchmark.rs`: N single-allocation job submits race
+one pool through the real eval pipeline (8 claim workers), pools
+`tight` (capacity == demand) and `headroom` (4x). Before
+(`contention-1785423771.json`, pre-late-binding) vs after
+(`contention-1785427379.json`, phases 0-3: requeue backstop +
+`plan_candidates: 8` default):
+
+| Backend | Pool | N | dropped before → after | conflicts before → after | all-placed ms before → after |
+| --- | --- | --- | --- | --- | --- |
+| local | tight | 8 | 0 → 0 | 7 → 7 | 150 → 201 |
+| local | tight | 32 | 0 → 0 | 8 → 2 | 88 → 105 |
+| local | tight | 128 | **2 → 0** | **25 → 4** | **DNF → 274** |
+| local | headroom | 8 | 0 → 0 | 4 → **0** | 68 → 10 |
+| local | headroom | 32 | 0 → 0 | 8 → **0** | 197 → 42 |
+| local | headroom | 128 | **4 → 0** | **28 → 0** | **DNF → 249** |
+| raft1 | tight | 128 | (not run) → 0 | → 3 | → 1907 |
+| raft1 | headroom | 128 | (not run) → 0 | → **0** | → 2477 |
+
+Readings:
+
+- **The sharp edge is gone.** Baseline at N=128 dropped 2-4 jobs
+  *permanently* (conflict-exhausted evals fail terminally and are never
+  retried) — even with 4x headroom. After: zero drops in every cell,
+  on both backends; a conflict loser slides down its candidate list at
+  apply, and an exhausted plan requeues instead of dying.
+- **Headroom bursts stop conflicting at all**: submissions == N (every
+  plan applied on its FIRST submission — 100% of placements bound
+  within the k=8 list, meeting the "≥95% within rank ≤3" acceptance
+  bar with a conflict count of literally zero), and time-to-all-placed
+  dropped up to 4.7x (197 → 42 ms at N=32).
+- The tight pool keeps a handful of conflicts by design — when capacity
+  equals demand, some lists genuinely run dry; the backstop turns those
+  into visible retries that all converge (128/128 placed in 274 ms).
+- **The uncontended cost of candidates** (same binary, back-to-back
+  A/B via `LEGION_BENCH_SCHEDULER_SETTINGS='{"plan_candidates":0}'`,
+  steady-small local — the stable cell): total 1523 → 1630 µs/plan
+  (+7%: +38 µs building the ranked list, +60 µs on the format-2 apply
+  walk). `plan_candidates: 0` recovers it exactly. Multi-placement
+  scale scenarios collect no lists; their `build_plan` phase measured
+  flat (±10%, both directions) against the pre-late-binding run, and
+  `apply` moved within this host's demonstrated same-code run drift
+  (batch-burst swung 3.18 → 3.63 ms across four identical-code runs
+  this afternoon).
+- Correctness: the oversubscription check (nodes never exceed capacity)
+  held in every cell of every run; the fence suites run unmodified, and
+  a new raft-mode concurrent-planning race test pins the
+  commit-then-project window.

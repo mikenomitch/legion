@@ -25,6 +25,15 @@
     // lazy_version_sample: true,   // false = eager O(fleet) epoch sample per plan
     // plan_apply_coalescing: true, // false = one commit/raft propose per plan
     // plan_apply_batch_max: 16,    // max plans per group commit (1-128)
+    // Late binding (docs/scheduler-and-eval-loop.md): eligible placements
+    // submit this many ranked candidates and the apply binds the first
+    // still-fresh one, so racing planners cost a rank instead of a
+    // conflict retry. 0 disables (fixed single-node submissions — also the
+    // mixed-version rollout hatch). Full form: { count: 8, band: 0.01 }.
+    // plan_candidates: 8,
+    // How long a conflict-exhausted eval waits before re-entering the
+    // queue (it requeues instead of failing; jittered).
+    // plan_conflict_requeue_delay_ms: 1000,
     // Bounded candidate scoring (docs/scheduler-and-eval-loop.md): off
     // unless configured. At or above `min_nodes` eligible candidates a
     // placement scores the best of `sample` uniformly drawn feasible nodes

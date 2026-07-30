@@ -180,3 +180,103 @@ Making the optimistic lane cheap first (this plan) and measuring what
 remains keeps Legion at one scheduling concept unless data proves two
 are needed — the differentiator claim is "simplest scheduler to run,"
 not "most lanes."
+
+## 7. Coupling is a reference count over candidate nodes, not an explicit component graph (implementation)
+
+**Call.** As shipped, coupling has two layers: per-task construction
+gating (a placement collects a list only when its task places exactly
+one allocation, no group, no `distinct` keys, no volumes), and a
+submit-time strip — a placement keeps its list only when every node on
+it is referenced by no other placement in the plan. No union-find, no
+explicit edge types.
+
+**Alternatives.** The plan's literal §6.4: build the coupling graph,
+take connected components, walk singletons.
+
+**Trade-off.** The reference-count rule is exactly the singleton
+condition of the component decomposition (a placement is a singleton
+iff nothing it references is shared), so nothing is lost for v1 — but
+Phase 4's striped-lists work, which needs the actual components, will
+have to build the graph then.
+
+**Why.** One O(total candidates) pass with a hash map, no graph
+machinery to test, identical semantics for what v1 does with the answer
+(walk singletons, pin everything else). Simplicity now; the graph pays
+its way only when something consumes components as components.
+
+## 8. The tail samples uniformly within the band, not score-weighted (implementation)
+
+**Call.** Ranks 1..k−1 are a uniform shuffle of the near-tie band
+(extended down the ranking in score order when the band is thin),
+resolving the plan's open question toward the simpler option.
+
+**Alternatives.** Score-weighted sampling within the band.
+
+**Trade-off.** Inside the band the quality ordering is ignored; a
+0.9-band-width-worse node is as likely a rank-1 as a 0.1-worse one.
+
+**Why.** Band membership already bounds the quality loss to `band`
+(default 0.01 of normalized score) — weighting inside a 1% band is
+noise, and uniform maximizes decorrelation, which is the property the
+tail exists for. Cheap to revisit if the rank histogram ever argues.
+
+## 9. A network-assignment failure only skips when a later candidate remains (implementation)
+
+**Call.** During the walk, `assign_allocation_network` errors (static
+port collisions and anything else) skip to the next candidate — except
+on the LAST candidate, where the raw error propagates exactly as it did
+pre-late-binding.
+
+**Alternatives.** Convert every assignment failure to a candidate skip,
+with an exhausted list becoming a `Rejected` (conflict-shaped) outcome.
+
+**Trade-off.** A port collision on a single-candidate placement still
+fails the plan with an error rather than falling back (there is nothing
+to fall back to anyway).
+
+**Why.** Phase 1 made conflict-shaped outcomes requeue forever. A
+genuinely broken network config that surfaced as `Rejected` would send
+a doomed plan into the requeue loop for eternity, invisible to the
+operator. Keeping the terminal error class for the exhausted case
+preserves the existing failure surface for real misconfigurations while
+still converting mid-list collisions into fallbacks.
+
+## 10. Ranks surface in events, metrics, and logs — not in the `job plan` proto (implementation)
+
+**Call.** `allocation.placed` events carry `candidateRank` per
+placement and a `fallbacks` count; the
+`legion_scheduler_plan_candidate_rank` histogram and the apply log line
+carry the same. The `job plan` explain payload gains no candidate
+preview field.
+
+**Alternatives.** A `TaskIndexUsage`-style proto field with the
+candidate list preview (the plan's §6.6 sketch).
+
+**Trade-off.** `job plan` cannot show the would-be fallback list before
+submit; the on-call story leans on events and the rank histogram.
+
+**Why.** The plan's own §7 states "Proto: none" — §6.6's preview
+contradicted it. Ranks are an *apply-time* fact; `plan_only` computes no
+submission, so a plan-time preview would show a list the apply may never
+see. The observability jobs-to-be-done (which fallback ranks are
+landing; contention vs capacity) are answered by the event/metric
+surfaces. Revisit alongside Phase 4 if operators ask for the preview.
+
+## 11. Format-2 emission keys on list shape, not on the knob (implementation)
+
+**Call.** A submission serializes as v1 whenever every placement list is
+a singleton — coupled plans, reschedule plans, plugin policies — even
+with `plan_candidates` on; format 2 is emitted only when a real fallback
+list exists. (`plan_candidates: 0` therefore emits v1 always, as the
+rollout hatch promises.)
+
+**Alternatives.** Emit format 2 for everything once the knob is on.
+
+**Trade-off.** Two live serializations instead of one; readers must
+handle both forever (they must anyway, for rows written across a
+version boundary).
+
+**Why.** Rows that need no fallback semantics carry none — less format
+churn in the store, byte-identical rows for every all-or-nothing plan,
+and a smaller blast radius in the mixed-version window (only plans that
+actually use late binding are unreadable by a pre-upgrade manager).

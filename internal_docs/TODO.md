@@ -28,17 +28,25 @@ How to use it:
 
 ## Scheduling & placement
 
-- [ ] **Late-binding plan apply** — plans carry a ranked candidate list per
-      placement and the applier binds to the first candidate whose node epoch
-      is unchanged, so parallel submits racing for the same node cost a rank
-      instead of a conflict retry — [plan](plans/late-binding-plan-apply-plan.md)
-      (PLANNED: contention benchmark → requeue-not-fail backstop → candidate
-      walk for single-placement plans → coupling components). Fixes the
-      parallel-sandbox pathology: today concurrent Fresh-mode planners all
-      pick the same argmax node, and an eval that loses
-      `plan_conflict_max_retries` (default 3) races is failed terminally and
-      never retried. Phase 0 also delivers the raft-mode concurrent-planning
-      test tracked below.
+- [x] **Late-binding plan apply** — shipped 2026-07-30, Phases 0–3
+      ([plan](plans/late-binding-plan-apply-plan.md),
+      [calls](calls/late-binding-plan-apply-plan_calls.md) incl.
+      implementation entries 7–11,
+      [docs](../docs/scheduler-and-eval-loop.md) "Late binding"): the
+      contention benchmark (`tests/contention_benchmark.rs`), the
+      requeue-not-fail backstop (conflict-exhausted evals release back to
+      pending — no work silently dropped), format-2 submissions with the
+      commit-time candidate walk, and coupling components (uncoupled
+      placements of multi-task plans fall back independently; anything
+      coupled stays all-or-nothing). Measured on this host: a 128-way
+      headroom burst goes from 28 conflicts + 4 permanently dropped jobs
+      to 0 conflicts + 0 drops
+      ([benchmarks/scheduler/README.md](../benchmarks/scheduler/README.md)).
+      Deferred to Phase 4 (backlog, in the plan): capacity-aware
+      candidate skipping, per-component partial commit, striped disjoint
+      lists for identical replicas, a serialized/batched lane for
+      physically-full pools; also a `job plan` candidate preview (calls
+      entry #10).
 - [ ] Worker groups + taint/toleration equivalent. Node pools exist as an ACL
       and config concept but nothing scheduling-side consumes them.
 - [ ] Priorities and eviction/preemption, with eviction toggled at the pool level

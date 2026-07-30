@@ -2,11 +2,16 @@
 
 > **Judgement calls:** [`calls/late-binding-plan-apply-plan_calls.md`](../calls/late-binding-plan-apply-plan_calls.md)
 
-**Status: PLANNED.** Nothing here is built. Deliberately deferred to the
-backlog phase (§8, Phase 4): capacity-aware candidate skipping,
-per-component partial commit, striped disjoint candidate lists for
-identical replicas, and any serialized/batched lane for physically-full
-pools.
+**Status: SHIPPED** (2026-07-30, Phases 0–3; implementation calls #7–11
+in the calls doc record the deviations, notably: coupling shipped as the
+reference-count strip rather than an explicit component graph, uniform
+tail sampling, and rank observability via events/metrics instead of a
+`job plan` proto field). Deliberately deferred to the backlog phase
+(§8, Phase 4): capacity-aware candidate skipping, per-component partial
+commit, striped disjoint candidate lists for identical replicas, and
+any serialized/batched lane for physically-full pools. Public doc:
+"Late binding" in `docs/scheduler-and-eval-loop.md`; numbers in
+`benchmarks/scheduler/README.md`.
 
 ## Problem Statement
 

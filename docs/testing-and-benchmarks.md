@@ -86,6 +86,17 @@ LEGION_BENCH_BACKENDS=local_disk,raft1,raft3,streaming cargo test --release --te
 - Subsets via `LEGION_BENCH_BACKENDS` and `LEGION_BENCH_SCENARIOS`
   (comma-separated scenario names).
 
+- Contention matrix (`tests/contention_benchmark.rs`): N-way concurrent
+  single-allocation submits race one pool through the real eval pipeline;
+  reports conflict rejections, dropped (terminally failed) evals,
+  placements, and time-to-all-placed — the late-binding plan's
+  acceptance numbers:
+
+```bash
+LEGION_CONTENTION_N=8,32,128 LEGION_CONTENTION_POOLS=tight,headroom \
+  cargo test --release --test contention_benchmark -- --ignored --nocapture
+```
+
 - Heartbeat scale matrix (`tests/heartbeat_scale_benchmark.rs`): fleet
   size × backend; measures heartbeat throughput (N driver threads
   heartbeating a fleet partition flat-out), p50/p99 heartbeat latency,

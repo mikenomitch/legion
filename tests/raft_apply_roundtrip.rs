@@ -384,3 +384,57 @@ fn concurrent_plan_applies_group_commit_with_isolation() -> R<()> {
     }
     Ok(())
 }
+
+/// Two planners race through the REAL `Scheduler::plan_and_apply` path on a
+/// raft store — planning against the epoch mirror, applying through
+/// capture → propose → commit-then-project. One node has room for exactly
+/// one 6 GiB allocation; whatever the interleaving (epoch CAS rejection,
+/// late-binding walk, group commit), exactly one plan may place. This is
+/// the raft-mode sibling of the local
+/// `concurrent_plans_cannot_oversubscribe_a_node` test: regression
+/// insurance for the commit-then-project window the epoch mirror closes.
+#[test]
+fn concurrent_planners_cannot_oversubscribe_under_raft() -> R<()> {
+    use legion::manager::scheduler::{PlanMode, Scheduler};
+
+    let dir = tempfile::tempdir()?;
+    let store = Store::start_storage(&raft_config(dir.path(), "single")?)?;
+    store.insert_node(NodeMsg::from(test_node("race-node")))?;
+
+    let mut config_ids = Vec::new();
+    for name in ["race-job-a", "race-job-b"] {
+        let job = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: name.to_string(),
+            tasks: vec![TaskConfig {
+                resources: legion::prelude::json!({ "memory": 3000 }),
+                ..TaskConfig::new("api", "noop")
+            }],
+            version: None,
+        };
+        store.handle_job_submit(&job, &[submission(name)])?;
+        config_ids.push(store.get_job_config(name)?.id());
+    }
+
+    let handles: Vec<_> = config_ids
+        .into_iter()
+        .map(|job_config_id| {
+            let store = store.clone();
+            std::thread::spawn(move || {
+                let scheduler = Scheduler::new(&store)?;
+                scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)
+            })
+        })
+        .collect();
+
+    let mut applied = 0;
+    for handle in handles {
+        if let Ok(Ok(outcome)) = handle.join() {
+            applied += outcome.allocations.len();
+        }
+    }
+    assert_eq!(applied, 1, "only one plan may claim the node under raft");
+    assert_eq!(store.allocs_for_node("race-node")?.len(), 1);
+    Ok(())
+}

@@ -145,9 +145,80 @@ histogram ([metrics.md](metrics.md)), and aggregated by the benchmark
 runners ([testing-and-benchmarks.md](testing-and-benchmarks.md)). When
 scheduling latency moves, find the phase that moved first.
 
+### Late binding: candidate lists with commit-time node choice
+
+Concurrent planners reading the same snapshot compute the same scores
+and pick the same argmax node; without a countermeasure, a burst of N
+independent submits degrades into serial conflict-retry rounds. Legion's
+answer is **late binding** (Sparrow-style, adapted to the store's apply
+transaction): an eligible placement submits a *ranked candidate list*
+instead of a single node, and the apply transaction binds to the **first
+candidate whose node epoch is unchanged** since the planner sampled it.
+A race then costs a rank instead of a conflict retry: racer one binds
+the shared first choice, racer two sees its epoch moved and slides to
+its next candidate, and so on — self-resolving, no coordination.
+
+- Rank 0 is the planner's true argmax pick (with the usual exact-tie
+  shuffle), so **uncontended placements bind rank 0 and pay zero quality
+  tax**. Ranks 1..k−1 are drawn from the near-tie score band so racing
+  planners decorrelate.
+- The epoch is the fit proof: "unchanged" means no allocation was added
+  or removed on that node since the planner verified fit there. A node
+  that was touched but still fits is skipped conservatively — never a
+  correctness risk, at most a near-equivalent lower rank.
+- The per-candidate re-validation (availability, constraints, permits,
+  network/static-port assignment) also *skips to the next candidate* on
+  failure, so a cordon or port collision landing mid-race costs a rank
+  instead of a rejection.
+- The **job-config epoch stays a hard, all-or-nothing gate** — it is
+  what serializes two plans for the same job config.
+- **Coupled placements never fall back.** A placement carries a list
+  only when its task places exactly one allocation in the plan, sits in
+  no co-placement group, declares no `distinct` constraint, claims no
+  volumes, and its list shares no node with any other placement in the
+  plan. Everything else (count-N services, groups, pinned storage,
+  plugin-policy placements, Reschedule mode) keeps the fixed single-node
+  submission and all-or-nothing semantics. A plan whose placement
+  exhausts its whole list is rejected and retried/requeued as a normal
+  conflict.
+
+Configuration (`schedulerSettings`):
+
+```jsonnet
+{
+  schedulerSettings: {
+    plan_candidates: 8,       // candidates per eligible placement; 0 disables
+    // plan_candidates: { count: 8, band: 0.01 },  // full form
+    plan_conflict_requeue_delay_ms: 1000,  // see "Conflict handling"
+  },
+}
+```
+
+`plan_candidates: 0` restores single-node submissions byte-for-byte —
+also the mixed-version rollout hatch: format-2 submissions require every
+manager to run a version that can parse them (the usual same-version
+upgrade window; see [upgrades.md](upgrades.md)).
+
+Observability: `allocation.placed` events carry a `candidateRank` per
+placement and a `fallbacks` count; the
+`legion_scheduler_plan_candidate_rank` histogram
+([metrics.md](metrics.md)) shows how often placements land off their
+first choice. A sustained nonzero conflict-rejection rate *with*
+candidates on means the pool is physically contended (one node fits),
+not scheduler-contended.
+
 ### Conflict handling
 
 A stale epoch causes plan rejection with a conflict error. The eval handler retries conflicts with bounded attempts via `Eval::plan_with_conflict_retries`.
+
+**Conflict exhaustion requeues — it never drops work.** An eval that
+loses every retry is released back to `pending` with a jittered delay
+(`schedulerSettings.plan_conflict_requeue_delay_ms`, default 1000 ms)
+rather than terminally failed: a conflict is transient by definition,
+and a saturated pool shows as visibly pending-and-retrying work in the
+eval queue instead of a silently missing job. Terminal failure remains
+for non-conflict errors. Requeues are counted by
+`legion_scheduler_conflict_requeues_total`.
 
 ### Tuning conflict retries
 

@@ -60,7 +60,7 @@ When one is required and what goes in it:
 | [gang-scheduling-plan.md](plans/gang-scheduling-plan.md) | planned |
 | [job-templates-plan.md](plans/job-templates-plan.md) | in execution |
 | [kv-reactive-task-updates-plan.md](plans/kv-reactive-task-updates-plan.md) | shipped |
-| [late-binding-plan-apply-plan.md](plans/late-binding-plan-apply-plan.md) | planned |
+| [late-binding-plan-apply-plan.md](plans/late-binding-plan-apply-plan.md) | shipped (phases 0–3, 2026-07-30; phase 4 backlog) |
 | [persistence-plan.md](plans/persistence-plan.md) | phases 0–1, 3 done |
 | [preemption-and-eviction-plan.md](plans/preemption-and-eviction-plan.md) | planned |
 | [multi-cluster-federation-plan.md](plans/multi-cluster-federation-plan.md) | planned |
