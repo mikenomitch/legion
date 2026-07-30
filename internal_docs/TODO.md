@@ -137,8 +137,32 @@ How to use it:
       availability-sync + eval enqueues after a mass failure; an ACL
       token-identity cache for worker-plane RPC rates.
 - [ ] AWS comparative benchmark vs Nomad/K8s
-      ([plan](plans/aws-comparative-benchmark-plan.md)): phase 0 is the
-      `legion start worker --simulate N` gap; nothing built yet.
+      ([plan](plans/aws-comparative-benchmark-plan.md),
+      [calls](calls/aws-comparative-benchmark-plan_calls.md)) — phases
+      0-1 built and locally validated 2026-07-30; campaigns (phases 2-5)
+      await an AWS account:
+  - [x] Phase 0: `legion start worker --simulate N`
+        ([mini-plan](plans/worker-simulation-plan.md),
+        [docs](../docs/worker-simulation.md)) — one process, N wire-real
+        nodes from a `node_profiles` file, real cadences, stub dispatch
+        server; end-to-end test `tests/worker_simulation.rs`.
+  - [x] Phase 1 rig, everything short of the cloud:
+        [`benchmarks/aws/`](../benchmarks/aws/README.md) — Terraform
+        (validate-clean; system-agnostic boxes + spot sim fleet + S3),
+        per-system configs (Legion A lanes / Legion B streaming+S3 lease
+        / Nomad / kubeadm+KWOK), scenario→jobs translator, measuring
+        driver with fixture-tested counting math and a `watch`
+        fault-drill mode, campaign runner + collect/fairness-record
+        scripts, piggyback experiment scripts (storm, failover,
+        streaming-RPO, 24h soak, upgrade-under-load), Grafana boards,
+        projection fitting (`analysis/fit_curves.py`), CI gate
+        (fixture tests + terraform validate), and the local no-AWS smoke
+        (`scripts/local-smoke.sh`).
+  - [ ] Phase 1 exit on real AWS: `bringup.sh` + 1k-node
+        `run-campaign.sh --system legion-a --smoke` (needs an account).
+  - [ ] Phases 2-5: Legion A/B campaigns, Nomad (verify nodesim `mock`
+        driver + install script), K8s (verify kubeadm/KWOK install +
+        watch parsing), 20k validation burst, analysis + REPORT.md.
 - [ ] Scheduling-index follow-ups deferred from
       [plan](plans/scheduling-index-plan.md) (see its calls doc):
       index-served candidates for multi-task **group** co-placement (v1
@@ -482,6 +506,16 @@ docs: [observability.md](../docs/observability.md), [logging.md](../docs/logging
 - [ ] Worker per-task runtime metrics (CPU/memory usage per allocation) —
       also wanted by autoscaler phase 2, which collects usage via
       heartbeats; build together.
+- [ ] Feed simulated fleets into the `legion_worker_*` families. Found
+      merging the worker-telemetry and `--simulate N` branches (2026-07-30):
+      [simulate.rs](../src/worker/simulate.rs) runs its own heartbeat loop
+      with private `heartbeats_ok`/`heartbeats_failed` atomics and never
+      starts the worker telemetry listener, so a simulated host exposes no
+      metrics — exactly the fleets the AWS campaign scrapes. Either have the
+      fleet loop update the shared registry (one process, N nodes: prefer
+      counters and a fleet-size gauge over per-node series) or give the
+      harness its own `/metrics`. Noted in
+      [docs/metrics.md](../docs/metrics.md) § Worker.
 - [x] Refresh [docs/observability.md](../docs/observability.md) — corrected; it
       had claimed OTLP export did not exist while [src/otel.rs](../src/otel.rs)
       ships it ([#137](https://github.com/mikenomitch/legion/pull/137))
@@ -590,6 +624,24 @@ Deferred from [ui-jump-hints-plan.md](plans/ui-jump-hints-plan.md):
       Chromium's reserved set, but "the page wins `⌘`+digit" is asserted from
       the reserved-key list, not measured
       ([calls entry 1](calls/ui-jump-hints-plan_calls.md))
+
+- [ ] `ui/src/gen/legion_pb.ts` has drifted from `proto/legion.proto` — it is
+      missing `WorkerConfig.heartbeat_seconds`, `TaskAllocation.task_connect`,
+      `HeartbeatReply.upstream_endpoints` + the whole `UpstreamEndpoints`
+      message, `ServiceSummary.allow`, and `PlannedAllocation.score_sampled`.
+      Nothing in the UI reads them yet, so it typechecks; regenerate with
+      `protoc -I proto --es_out=ui/src/gen --es_opt=target=ts proto/legion.proto`
+      (needs `ui/node_modules/.bin` on PATH) and add it to CI, or the next
+      person to need one of those fields will hand-write it too
+
+Deferred from [job-updated-at-plan.md](plans/job-updated-at-plan.md):
+
+- [ ] Per-page label for `SharedIndex`'s last column. It is hard-coded to
+      "Updated", but Nodes puts `last_heartbeat` under it — a different signal
+      wearing the same name ([calls entry 2](calls/job-updated-at-plan_calls.md))
+- [ ] Show created/updated on the job detail page header. The index was where
+      the wrong value was being read, so the header was left alone; it is a
+      layout change with its own design surface
 
 ## Cross-cutting
 
@@ -855,3 +907,10 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
       ([plan](plans/ui-jump-hints-plan.md),
       [calls](calls/ui-jump-hints-plan_calls.md)). Rows past the tenth, the
       Overview dashboard, and detail-page tables are open items above.
+- [x] Job mtime — the Jobs index "Updated" column showed `created_at`, because
+      jobs had no `updated_at` anywhere in the system. Real column, stamped on
+      spec submissions and status transitions but not on allocation churn;
+      `ListJobs` sorts by it by default and `job list` renders both timestamps
+      readably ([plan](plans/job-updated-at-plan.md),
+      [calls](calls/job-updated-at-plan_calls.md),
+      [docs](../docs/jobs-tasks-and-scheduling.md#job-timestamps-created_at-and-updated_at)).

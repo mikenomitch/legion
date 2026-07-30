@@ -357,3 +357,30 @@ want them (the stateful plan already deferred keyed autoscaling once).
 and a loud validation error is reversible while a guessed default is not. The
 checks/strategy machinery reuses cleanly whenever the answer is designed, so
 deferring costs mechanism nothing.
+
+## 15. Scaling does not move the job's `updated_at`
+
+**Call.** (Implementation, 2026-07-30, surfaced merging with the
+job-mtime work.) `legion job scale` writes the override row's own
+`updated_at` but leaves `job.updated_at` alone, so the UI's "Updated"
+column and `ListJobs sort_by: updated_at` do not move when a job is
+scaled.
+
+**The alternative.** Touch `job.updated_at` on every scale — a scale *is*
+a change to the job's effective shape, and an operator scanning the jobs
+list for "what changed recently" would arguably want to see it.
+
+**The trade-off.** The jobs list can show a job as untouched for weeks
+while its replica count moved this morning. The recency signal for
+scaling lives elsewhere: the `scale.applied` event, and the override
+row's timestamp via `legion job scale <name>`.
+
+**Why.** The job-mtime plan defines that column narrowly and explicitly —
+"it moves for spec submissions and status transitions, and *only* for
+those" ([job-updated-at-plan.md](../plans/job-updated-at-plan.md) §4) —
+and this feature's entire premise (entry 1) is that scaling is *not* a
+spec submission. Bumping it would make the count override behave like a
+version bump in the one surface where users read version churn, undoing
+the distinction both plans exist to draw. Revisit if operators report
+missing scale activity in the jobs list; the cheap fix is a scale column
+there, not overloading the mtime.

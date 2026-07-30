@@ -223,15 +223,19 @@ lazy_static! {
 //
 
 pub const JOB_ATTRS: &str = r#"
-id, name, status, created_at
+id, name, status, created_at, updated_at
 "#;
 
+// Upsert path only. `created_at` is deliberately absent: it is the job's
+// birth time and an upsert against an existing row must not move it (the
+// insert below is only reached when the row is missing, but a concurrent
+// submit can still land on the conflict branch).
 pub const JOB_PARAM_SET: &str = r#"
-name = :name, status = :status, created_at = :created_at
+name = :name, status = :status, updated_at = :updated_at
 "#;
 
 pub const JOB_ATTRS_VALS: &str = r#"
-:id, :name, :status, :created_at
+:id, :name, :status, :created_at, :updated_at
 "#;
 
 lazy_static! {

@@ -7,7 +7,7 @@ import { formatRelativeTime } from '../utils/format'
 
 function JobsContent() {
   const [search, setSearch] = createSignal('')
-  const [sort, setSort] = createSignal('created_at:desc')
+  const [sort, setSort] = createSignal('updated_at:desc')
   const [page, setPage] = createSignal(1)
   const [pageSize, setPageSize] = createSignal(20)
   const searchQuery = debounced(search)
@@ -53,6 +53,7 @@ function JobsContent() {
       sort={sort()}
       onSort={setSort}
       sortOptions={[
+        { label: 'Updated (newest)', value: 'updated_at:desc' },
         { label: 'Created (newest)', value: 'created_at:desc' },
         { label: 'Created (oldest)', value: 'created_at:asc' },
         { label: 'Name (A-Z)', value: 'name:asc' },
@@ -64,7 +65,9 @@ function JobsContent() {
         id: job.id,
         title: job.name || job.id,
         status: job.status || 'unknown',
-        updatedAt: formatRelativeTime(job.createdAt),
+        // The column is "Updated": show the job's mtime, not its birth time.
+        // Equal to createdAt until the job is resubmitted or changes status.
+        updatedAt: formatRelativeTime(job.updatedAt),
         href: `/jobs/${encodeURIComponent(job.name || job.id)}`,
         cells: {
           allocations: <span class="tabular-nums">{jobAllocationCounts().get(job.id) ?? 0}</span>,

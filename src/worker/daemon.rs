@@ -3,8 +3,8 @@ use crate::prelude::*;
 use crate::structs::token::JoinToken;
 use crate::structs::{
     manager_client::ManagerClient, worker_server::WorkerServer, AllocNetwork, HealthCheckRequest,
-    HeartbeatReply, HeartbeatRequest, TaskAllocation, UpstreamEndpoints, WorkerPreRegisterReply,
-    WorkerPreRegisterRequest, WorkerRegisterRequest,
+    HeartbeatReply, HeartbeatRequest, TaskAllocation, UpstreamEndpoints, WorkerConfig,
+    WorkerPreRegisterReply, WorkerPreRegisterRequest, WorkerRegisterRequest,
 };
 use crate::util::random_string;
 use crate::worker::{
@@ -55,10 +55,14 @@ impl WorkerCredentials {
         request
     }
 
-    fn store_node_token(&self, token: Option<String>) {
+    pub(crate) fn store_node_token(&self, token: Option<String>) {
         if let Ok(mut current) = self.node_token.write() {
             *current = token;
         }
+    }
+
+    pub(crate) fn join_secret(&self) -> Option<&String> {
+        self.join_secret.as_ref()
     }
 }
 
@@ -222,6 +226,10 @@ async fn run_worker_with_manager(
         .readiness_checks();
     let health_checks = run_health_checks(config.additional_node_checks.clone(), Some(readiness));
 
+    // Resolved before `config` is picked apart below (the helper borrows
+    // the whole struct).
+    let heartbeat_interval = heartbeat_interval_for(&config);
+
     let mut config_attrs = Map::new();
     for (key, value) in config.attributes {
         config_attrs.insert(key, Value::String(value));
@@ -285,16 +293,6 @@ async fn run_worker_with_manager(
     // heartbeat reply tells it which loopback listeners to run and where each
     // one may send traffic. Idle (and free) until a task declares upstreams.
     let forwarder = Arc::new(UpstreamForwarder::new());
-    // Heartbeat cadence: worker-type config (`heartbeatSeconds`, clamped to
-    // 1..=30) or the built-in default. The manager's lost window stays 10s,
-    // so intervals above ~3s trade detection margin for load — the manager
-    // warns when serving such a config (docs/architecture-managers-workers.md).
-    let heartbeat_interval = Duration::from_secs(
-        config
-            .heartbeat_seconds
-            .map(|seconds| u64::from(seconds).clamp(1, 30))
-            .unwrap_or(WORKER_HEARTBEAT_DURATION_SEC),
-    );
     let heartbeat_fut = start_heartbeats(
         name.clone(),
         client.clone(),
@@ -327,7 +325,7 @@ async fn run_worker_with_manager(
 }
 
 #[instrument(err, skip_all)]
-async fn connect_manager_with_retry(manager_addr: &str) -> R<ManagerClient<Channel>> {
+pub(crate) async fn connect_manager_with_retry(manager_addr: &str) -> R<ManagerClient<Channel>> {
     let mut backoff = Duration::from_millis(200);
     let max_backoff = Duration::from_secs(5);
 
@@ -430,12 +428,28 @@ async fn create_manager_client(
 const HEARTBEAT_RETRY_MIN: Duration = Duration::from_millis(500);
 const HEARTBEAT_RETRY_MAX: Duration = Duration::from_secs(10);
 
+/// Heartbeat cadence: worker-type config (`heartbeatSeconds`, clamped to
+/// 1..=30) or the built-in default. The manager's lost window stays 10s,
+/// so intervals above ~3s trade detection margin for load — the manager
+/// warns when serving such a config (docs/architecture-managers-workers.md).
+/// Shared with the simulated-fleet mode (`worker::simulate`), whose
+/// fairness contract is "same cadence resolution as a real worker".
+pub(crate) fn heartbeat_interval_for(config: &WorkerConfig) -> Duration {
+    Duration::from_secs(
+        config
+            .heartbeat_seconds
+            .map(|seconds| u64::from(seconds).clamp(1, 30))
+            .unwrap_or(WORKER_HEARTBEAT_DURATION_SEC),
+    )
+}
+
 /// The heartbeat sleep, jittered ±10% so a fleet that (re)started together
 /// does not stay phase-locked forever — 10k workers heartbeating in the
 /// same instant is a self-inflicted thundering herd (heartbeat-scale plan
 /// §5). Also what lets the manager-side heartbeat group commit form
 /// batches from *steady-state* arrivals rather than only from bursts.
-fn jittered_heartbeat_interval(interval: Duration) -> Duration {
+/// Shared with the simulated-fleet mode for the same fairness reason.
+pub(crate) fn jittered_heartbeat_interval(interval: Duration) -> Duration {
     use rand::Rng;
     let jitter = rand::thread_rng().gen_range(0.9..=1.1);
     interval.mul_f64(jitter)

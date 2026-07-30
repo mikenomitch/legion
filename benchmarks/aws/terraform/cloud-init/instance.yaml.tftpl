@@ -1,0 +1,23 @@
+#cloud-config
+# ${role} instance for the Legion AWS benchmark rig. Kept deliberately
+# thin: cloud-init only makes the box observable (node_exporter) and
+# reachable for the campaign scripts, which install the actual system
+# under test (Legion / Nomad / K8s) over SSH — see ../../scripts/.
+hostname: ${hostname}
+preserve_hostname: false
+
+write_files:
+  - path: /opt/bench/role
+    content: "${role}\n"
+    permissions: "0644"
+  - path: /opt/bench/bootstrap.sh
+    permissions: "0755"
+    encoding: b64
+    content: ${bootstrap_b64}
+
+runcmd:
+  - ["/opt/bench/bootstrap.sh"]
+%{ if install_docker ~}
+  # Loadgen only: Prometheus + Grafana run as containers (../configs).
+  - ["bash", "-c", "DEBIAN_FRONTEND=noninteractive apt-get install -y docker.io docker-compose-v2 && systemctl enable --now docker && usermod -aG docker ubuntu"]
+%{ endif ~}

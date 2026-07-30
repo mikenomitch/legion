@@ -23,11 +23,18 @@ skipped items.
   a new version or rollout, the `scale` ACL resource, the `job_scale`
   eval. Gives the benchmark driver version-churn-free load control.
 
+**Landed in parallel on main** (merged in 2026-07-30): `legion start worker
+--simulate N` ([plan](plans/worker-simulation-plan.md)) and the AWS
+benchmark rig's phase 1 — so the campaign's phase-0 blocker is *gone*, and
+the remaining gate is an AWS account, not code. Jobs also gained a real
+`updated_at`.
+
 ## The follow-up queue (in priority order)
 
-1. **`legion start worker --simulate N`** (AWS benchmark plan phase 0, own
-   mini-plan) — the one hard blocker for the campaign; deliberately NOT
-   started in this batch.
+1. **Feed simulated fleets into the `legion_worker_*` families** — surfaced
+   by the merge: the fleet loop keeps private heartbeat counters and starts
+   no telemetry listener, so the very hosts the campaign scrapes expose no
+   worker metrics (TODO.md § Observability).
 2. Late-binding plan apply
    ([plan](plans/late-binding-plan-apply-plan.md)) — skipped in this batch
    by explicit decision; the contention benchmark (its phase 0) is the

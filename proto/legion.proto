@@ -2335,9 +2335,9 @@ message ListJobsRequest {
   // Free-text search against job name, ID, and status.
   optional string query = 1;
 
-  // Sort key. Supported values: `name`, `status`, `created_at`.
+  // Sort key. Supported values: `name`, `status`, `created_at`, `updated_at`.
   //
-  // Default: `created_at`.
+  // Default: `updated_at`.
   optional string sort_by = 2;
 
   // Sort direction. Supported values: `asc`, `desc`.
@@ -2369,8 +2369,20 @@ message Job {
   // Current values written by manager include: done, stopped, failed.
   string status = 3;
 
-  // Unix timestamp (seconds) when job was created.
+  // Unix timestamp (seconds) when job was created. Immutable for the life of
+  // the job — resubmitting a new spec version does not move it.
   int64 created_at = 4;
+
+  // Unix timestamp (seconds) of the last change to the job, and the value the
+  // UI's "Updated" column shows. Stamped when a new spec version is submitted
+  // and on every status transition the manager records (`stopped`, `failed`,
+  // recovery back to `done`, and an acknowledged restart request). Never
+  // moved by allocation churn, heartbeats, or reads.
+  //
+  // Equals `created_at` for a job that has not changed since submission, and
+  // for rows written by a manager older than the column (backfilled once at
+  // migration time).
+  int64 updated_at = 5;
 }
 
 // Reply payload for ListJobs.

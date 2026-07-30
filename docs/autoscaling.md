@@ -87,6 +87,14 @@ A resubmit that only changes `count` (with no override involved) still
 creates a new version and a rollout, exactly as before — spec changes make
 versions; `job scale` doesn't.
 
+For the same reason, scaling does **not** move the job's `updated_at`, so
+the jobs list's "Updated" column stays where the last spec submission or
+status transition left it (that column tracks those, and only those — see
+[jobs-tasks-and-scheduling.md](jobs-tasks-and-scheduling.md)). Scale
+activity is recorded on its own surfaces instead: the `scale.applied`,
+`scale.deferred`, and `scale.reset` events, and the override's own
+timestamp in `legion job scale <name>`.
+
 ## Access control
 
 Scaling is its own ACL resource: **`scale`** (actions `read`/`write`, scoped

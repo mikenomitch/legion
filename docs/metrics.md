@@ -207,6 +207,14 @@ view of worker readiness. Default: disabled.
 - **`legion_worker_allocation_failures_reported_total`** (counter) —
   allocation failures this worker has reported to the manager.
 
+**Simulated fleets are not covered.** `legion start worker --simulate N`
+([worker-simulation](../internal_docs/plans/worker-simulation-plan.md))
+runs its own heartbeat loop for the whole fleet and does not start this
+listener or feed these families — its per-fleet counters are reported by
+the simulation harness instead. Scraping a simulated worker host yields
+nothing; use the manager's `legion_heartbeats_total` for the fleet-wide
+view until the two are wired together.
+
 ## OTLP metrics push
 
 Both the manager's and the worker's registries can additionally be
