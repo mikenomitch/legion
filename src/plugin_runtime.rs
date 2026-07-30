@@ -142,9 +142,9 @@ mod tests {
         // Neither layout present: the canonical in-tree path is reported.
         std::fs::create_dir_all(plugin_root.join("tasks").join("noop"))?;
         let paths = plugin_paths("tasks", "noop", &plugin_root);
-        assert!(paths.dylib.ends_with(
-            Path::new("plugins/tasks/noop/target/release").join(&dylib_name)
-        ));
+        assert!(paths
+            .dylib
+            .ends_with(Path::new("plugins/tasks/noop/target/release").join(&dylib_name)));
 
         // Only the workspace (LEGION_BUILD_PLUGINS) layout present: found.
         let workspace = base
