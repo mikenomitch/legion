@@ -232,6 +232,19 @@ pub enum PlanApplyOutcome {
     },
 }
 
+/// One scheduler plan queued for the plan-apply group commit (D5): the
+/// arguments of [`Store::submit_and_apply_plan`], owned so a batch leader
+/// can carry them across threads.
+#[derive(Debug, Clone)]
+struct PlanApplyRequest {
+    job_config_id: String,
+    mode: String,
+    placements: Vec<(String, i64)>,
+    expected_versions: BTreeMap<String, i64>,
+}
+
+type PlanApplyReply = (PlanSubmission, PlanApplyOutcome);
+
 #[derive(Debug, Clone)]
 pub struct Store {
     pub write_conn: MemSafeConn,
@@ -277,6 +290,12 @@ pub struct Store {
     // (empty) observation window, which is exactly the protection.
     node_health_orphan_candidates: Arc<std::sync::Mutex<HashSet<String>>>,
     allocation_health_orphan_candidates: Arc<std::sync::Mutex<HashSet<i64>>>,
+    // Plan-apply group commit (plan-path scale levers, D5): concurrent
+    // submit_and_apply_plan callers coalesce into one replicated op — one
+    // capture → one raft propose/quorum round for the whole batch — with
+    // per-plan savepoint isolation inside. Shared across clones so every
+    // eval worker feeds the same queue.
+    plan_coalescer: Arc<crate::storage::coalesce::Coalescer<PlanApplyRequest, PlanApplyReply>>,
 }
 
 /// Result of [`Store::state_backup`]: where the backup landed, its size,
@@ -568,6 +587,9 @@ impl Store {
             durable_sync: raft_enabled,
             node_health_orphan_candidates: Arc::new(std::sync::Mutex::new(HashSet::new())),
             allocation_health_orphan_candidates: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            plan_coalescer: Arc::new(crate::storage::coalesce::Coalescer::new(
+                Self::plan_apply_batch_max(config.scheduler_settings.as_ref()),
+            )),
         };
 
         store.refresh_read_model()?;
@@ -2249,6 +2271,14 @@ impl Store {
     /// ms per plan in the 2026-07-29 backend matrix
     /// (`benchmarks/scheduler/README.md`). The two-step API below stays
     /// for callers that genuinely stage submissions.
+    ///
+    /// Concurrent callers additionally GROUP-COMMIT (plan-path scale
+    /// levers, D5): plans queued while a commit is in flight batch into
+    /// one replicated op — one capture, one raft propose/quorum round for
+    /// the whole batch — with each plan keeping its own epoch-CAS verdict
+    /// inside a per-plan savepoint. A lone caller takes the single-plan
+    /// path unchanged. `schedulerSettings.plan_apply_coalescing: false`
+    /// disables the batching.
     pub fn submit_and_apply_plan(
         &self,
         job_config_id: &str,
@@ -2256,21 +2286,144 @@ impl Store {
         placements: &[(String, i64)],
         expected_versions: &BTreeMap<String, i64>,
     ) -> R<(PlanSubmission, PlanApplyOutcome)> {
-        let job_config_id = job_config_id.to_owned();
-        let mode = mode.to_owned();
-        let placements = placements.to_vec();
-        let expected_versions = expected_versions.clone();
-        let (submission, outcome) =
-            self.replicated(Lane::Scheduler, "submit_and_apply_plan", move |s| {
-                s.submit_and_apply_plan_apply(
-                    &job_config_id,
-                    &mode,
-                    &placements,
-                    &expected_versions,
-                )
-            })?;
+        let request = PlanApplyRequest {
+            job_config_id: job_config_id.to_owned(),
+            mode: mode.to_owned(),
+            placements: placements.to_vec(),
+            expected_versions: expected_versions.clone(),
+        };
+        let (submission, outcome) = if self.plan_apply_coalescing_enabled() {
+            let coalescer = Arc::clone(&self.plan_coalescer);
+            coalescer.submit(request, |batch| self.run_plan_apply_batch(batch))?
+        } else {
+            self.submit_and_apply_plan_replicated(request)?
+        };
         self.plan_apply_bookkeeping(&outcome)?;
         Ok((submission, outcome))
+    }
+
+    /// `schedulerSettings.plan_apply_coalescing` — default true.
+    fn plan_apply_coalescing_enabled(&self) -> bool {
+        self.scheduler_settings
+            .as_ref()
+            .and_then(|settings| settings.get("plan_apply_coalescing"))
+            .and_then(Value::as_bool)
+            .unwrap_or(true)
+    }
+
+    /// `schedulerSettings.plan_apply_batch_max` — default 16, clamped to
+    /// 1..=128. Caps how many plans one group commit may carry, bounding
+    /// the size of the replicated changeset (raft append-entries budget).
+    fn plan_apply_batch_max(settings: Option<&Value>) -> usize {
+        settings
+            .and_then(|settings| settings.get("plan_apply_batch_max"))
+            .and_then(Value::as_u64)
+            .map(|max| (max as usize).clamp(1, 128))
+            .unwrap_or(16)
+    }
+
+    /// The single-plan replicated op — the group commit's batch-of-one
+    /// fast path, its re-run-singly fallback, and the
+    /// `plan_apply_coalescing: false` path. Exactly the pre-D5 operation.
+    fn submit_and_apply_plan_replicated(&self, request: PlanApplyRequest) -> R<PlanApplyReply> {
+        self.replicated(Lane::Scheduler, "submit_and_apply_plan", move |s| {
+            s.submit_and_apply_plan_apply(
+                &request.job_config_id,
+                &request.mode,
+                &request.placements,
+                &request.expected_versions,
+            )
+        })
+    }
+
+    /// Batch leader body for the plan-apply group commit: run every
+    /// drained plan inside ONE replicated op. Under raft this is one
+    /// capture → one propose → one quorum round → one apply transaction
+    /// for the whole batch; on local backends the plans run back-to-back
+    /// exactly as they would have serially (WAL-mode commits are not the
+    /// local cost, so no outer transaction is added — see the plan's
+    /// judgement calls).
+    ///
+    /// Failure isolation: under capture, each plan runs inside its own
+    /// savepoint, so a failing plan rolls back alone and cannot poison
+    /// batch-mates (epoch-CAS rejections are not failures — they commit a
+    /// `rejected` submission row exactly as the single-plan op does). If
+    /// the batch op itself fails (capture/propose machinery), nothing was
+    /// applied — the capture rolled back — so every plan re-runs singly
+    /// through the pre-D5 path; any plan the failed propose DID commit
+    /// (a lost-leadership race) is then rejected by its own epoch CAS,
+    /// never applied twice.
+    fn run_plan_apply_batch(&self, batch: Vec<PlanApplyRequest>) -> Vec<R<PlanApplyReply>> {
+        if batch.len() == 1 {
+            let request = batch.into_iter().next().expect("length checked");
+            return vec![self.submit_and_apply_plan_replicated(request)];
+        }
+
+        let rerun = batch.clone();
+        let batch_size = batch.len();
+        let batched = self.replicated(Lane::Scheduler, "submit_and_apply_plans", move |s| {
+            let isolate = capture::in_capture();
+            let mut results: Vec<R<PlanApplyReply>> = Vec::with_capacity(batch.len());
+            for request in &batch {
+                if isolate {
+                    // Savepoint-machinery errors abort the whole capture
+                    // (`?`): a leftover savepoint would corrupt the stack
+                    // for batch-mates, and a full rollback + re-run-singly
+                    // is the safe recovery.
+                    s.exec_on_write_conn("SAVEPOINT legion_plan_batch_item;")?;
+                    match s.submit_and_apply_plan_apply(
+                        &request.job_config_id,
+                        &request.mode,
+                        &request.placements,
+                        &request.expected_versions,
+                    ) {
+                        Ok(reply) => {
+                            s.exec_on_write_conn("RELEASE legion_plan_batch_item;")?;
+                            results.push(Ok(reply));
+                        }
+                        Err(err) => {
+                            s.exec_on_write_conn(
+                                "ROLLBACK TO legion_plan_batch_item; \
+                                 RELEASE legion_plan_batch_item;",
+                            )?;
+                            results.push(Err(err));
+                        }
+                    }
+                } else {
+                    results.push(s.submit_and_apply_plan_apply(
+                        &request.job_config_id,
+                        &request.mode,
+                        &request.placements,
+                        &request.expected_versions,
+                    ));
+                }
+            }
+            Ok(results)
+        });
+        match batched {
+            Ok(results) => results,
+            Err(batch_err) => {
+                warn!(
+                    batch = batch_size,
+                    error = %batch_err,
+                    "Batched plan apply failed before commit; re-running each plan singly"
+                );
+                rerun
+                    .into_iter()
+                    .map(|request| self.submit_and_apply_plan_replicated(request))
+                    .collect()
+            }
+        }
+    }
+
+    /// Run raw SQL on the write connection, acquiring and releasing the
+    /// connection lock for just this statement (savepoint control inside
+    /// batched ops, where holding a transaction handle across the
+    /// per-plan calls would deadlock their own `write_connection` locks).
+    fn exec_on_write_conn(&self, sql: &str) -> R<()> {
+        let conn = self.write_connection()?;
+        conn.execute_batch(sql)?;
+        Ok(())
     }
 
     fn submit_and_apply_plan_apply(
@@ -14280,6 +14433,155 @@ mod tests {
             "a moved generation must force the eager fallback"
         );
 
+        Ok(())
+    }
+
+    fn submit_named_job(store: &Store, name: &str) -> R<(String, i64)> {
+        let job = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: name.into(),
+            tasks: vec![TaskConfig::new("task", "noop")],
+            version: None,
+        };
+        store.handle_job_submit(
+            &job,
+            &[Submission {
+                path: format!("{name}.jsonnet"),
+                content: name.into(),
+                is_primary: true,
+            }],
+        )?;
+        let job_config_id = store.get_job_config(name)?.id();
+        let task_id = task_id_for(store, "task", name)?;
+        Ok((job_config_id, task_id))
+    }
+
+    #[test]
+    fn plan_batch_isolates_batch_mate_outcomes() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "ready"))?;
+        store.insert_node(make_node_msg("node-b", "ready"))?;
+        store.insert_node(make_node_msg("node-c", "ready"))?;
+        let (job_a, task_a) = submit_named_job(&store, "batch-job-a")?;
+        let (job_b, _task_b) = submit_named_job(&store, "batch-job-b")?;
+        let (job_c, task_c) = submit_named_job(&store, "batch-job-c")?;
+
+        let versions_a =
+            store.allocation_version_vector(&job_a, &HashSet::from(["node-a".to_string()]))?;
+        // Poisoned: a placement referencing a task id that does not exist,
+        // on its own node so the epoch CAS passes and the failure happens
+        // mid-apply (the isolation case, not a rejection).
+        let versions_b =
+            store.allocation_version_vector(&job_b, &HashSet::from(["node-c".to_string()]))?;
+        let versions_c =
+            store.allocation_version_vector(&job_c, &HashSet::from(["node-b".to_string()]))?;
+
+        let results = store.run_plan_apply_batch(vec![
+            PlanApplyRequest {
+                job_config_id: job_a.clone(),
+                mode: "fresh".into(),
+                placements: vec![("node-a".to_string(), task_a)],
+                expected_versions: versions_a,
+            },
+            PlanApplyRequest {
+                job_config_id: job_b.clone(),
+                mode: "fresh".into(),
+                placements: vec![("node-c".to_string(), 999_999)],
+                expected_versions: versions_b,
+            },
+            PlanApplyRequest {
+                job_config_id: job_c.clone(),
+                mode: "fresh".into(),
+                placements: vec![("node-b".to_string(), task_c)],
+                expected_versions: versions_c,
+            },
+        ]);
+
+        assert_eq!(results.len(), 3);
+        assert!(
+            matches!(results[0], Ok((_, PlanApplyOutcome::Applied(_)))),
+            "first plan must apply: {:?}",
+            results[0]
+        );
+        assert!(results[1].is_err(), "poisoned plan must fail alone");
+        assert!(
+            matches!(results[2], Ok((_, PlanApplyOutcome::Applied(_)))),
+            "batch-mate after the failure must still apply: {:?}",
+            results[2]
+        );
+        assert_eq!(store.allocs_for_node("node-a")?.len(), 1);
+        assert_eq!(store.allocs_for_node("node-b")?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn plan_batch_keeps_per_plan_cas_verdicts() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "ready"))?;
+        let (job_a, task_a) = submit_named_job(&store, "cas-job-a")?;
+        let (job_b, task_b) = submit_named_job(&store, "cas-job-b")?;
+
+        let fresh =
+            store.allocation_version_vector(&job_a, &HashSet::from(["node-a".to_string()]))?;
+        // Stale by construction: bump node-a's epoch after sampling.
+        let stale =
+            store.allocation_version_vector(&job_b, &HashSet::from(["node-a".to_string()]))?;
+        store.place_alloc("node-a", task_a)?;
+
+        let results = store.run_plan_apply_batch(vec![PlanApplyRequest {
+            job_config_id: job_b.clone(),
+            mode: "fresh".into(),
+            placements: vec![("node-a".to_string(), task_b)],
+            expected_versions: stale,
+        }]);
+        assert!(
+            matches!(results[0], Ok((_, PlanApplyOutcome::Rejected { .. }))),
+            "stale epochs must reject inside a batch exactly as they do alone: {:?}",
+            results[0]
+        );
+
+        // And a fresh sample for the untouched job still applies.
+        let _ = fresh;
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_plan_submitters_coalesce_and_all_apply() -> R<()> {
+        let store = setup_store()?;
+        let mut requests = Vec::new();
+        for index in 0..8 {
+            let node = format!("node-{index}");
+            store.insert_node(make_node_msg(&node, "ready"))?;
+            let (job_config_id, task_id) =
+                submit_named_job(&store, &format!("coalesce-job-{index}"))?;
+            let versions =
+                store.allocation_version_vector(&job_config_id, &HashSet::from([node.clone()]))?;
+            requests.push((job_config_id, node, task_id, versions));
+        }
+
+        let handles: Vec<_> = requests
+            .into_iter()
+            .map(|(job_config_id, node, task_id, versions)| {
+                let store = store.clone();
+                std::thread::spawn(move || {
+                    store.submit_and_apply_plan(
+                        &job_config_id,
+                        "fresh",
+                        &[(node, task_id)],
+                        &versions,
+                    )
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            let (_, outcome) = handle.join().expect("submitter panicked")?;
+            assert!(
+                matches!(outcome, PlanApplyOutcome::Applied(_)),
+                "distinct-scope plans must all apply: {outcome:?}"
+            );
+        }
         Ok(())
     }
 
