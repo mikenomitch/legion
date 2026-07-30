@@ -1620,6 +1620,39 @@ export const RaftTransport = {
       O: JoinRaftClusterReply,
       kind: MethodKind.Unary,
     },
+    /**
+     * Executes one named single-lane store write on this manager, which must
+     * currently lead the lane named by `group_id` (plan §8, D2 — standing-split
+     * resilience).
+     *
+     * A manager that receives a worker-plane write (a heartbeat, a health
+     * report, an allocation failure report) but does not lead the owning lane
+     * forwards the operation here instead of failing the worker: the request
+     * payload is a serde_json-encoded `ForwardableLaneWrite` — a closed enum
+     * of forwardable operations carrying their FULL arguments (the executor
+     * never derives payload from its own, possibly-lagging replica) — and the
+     * reply payload is a serde_json-encoded `ForwardOutcome`: the operation's
+     * JSON-encoded return value on success, a typed not-the-leader outcome
+     * (with this node's own leader hint) when the receiving manager does not
+     * lead the lane either, or an error message. The receiver executes the
+     * operation's non-forwarding variant, so a stale hint produces one typed
+     * rejection back to the origin rather than a forwarding loop.
+     *
+     * Also the worker-continuity path in `single` topology: workers dial one
+     * fixed manager, so after a failover the demoted ex-leader forwards their
+     * liveness to the new leader instead of rejecting every heartbeat (which
+     * previously marked healthy workers lost and self-fenced their stateful
+     * allocations).
+     * ACL: manager-plane internal, authenticated by cluster secret metadata.
+     *
+     * @generated from rpc legion.RaftTransport.ForwardLaneWrite
+     */
+    forwardLaneWrite: {
+      name: "ForwardLaneWrite",
+      I: RaftLaneRequest,
+      O: RaftLaneReply,
+      kind: MethodKind.Unary,
+    },
   }
 } as const;
 

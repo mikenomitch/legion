@@ -20,6 +20,17 @@
   // telemetry: { enabled: true, port: 4749 },
   schedulerSettings: {
     plan_conflict_max_retries: 3,
+    // Late-binding plan apply (docs/late-binding-plan-apply.md): ranked
+    // candidates per placement; the apply binds the first candidate whose
+    // node epoch is unchanged, so concurrent submits cost a fallback rank
+    // instead of a conflict retry. Defaults on at 8. 0 disables candidate
+    // lists (single-node submissions — the mixed-version kill switch).
+    // plan_candidates: 8,
+    // Full form: plan_candidates: { count: 8, band: 0.01 },
+    //
+    // Delay (ms, jittered) before a conflict-exhausted eval is retried;
+    // exhaustion requeues the eval instead of failing it terminally.
+    // plan_conflict_requeue_delay_ms: 1000,
     // Declarable scheduling indexes (docs/scheduling-indexes.md): ad-hoc
     // candidate generation for the scheduler. A built-in `fit` index
     // (nearest-fit over free cpu/memory/disk within the task's pool) is

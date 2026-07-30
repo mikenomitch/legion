@@ -14,7 +14,8 @@ from the CLI, the MCP server, the UI, and raw gRPC.
 | `eval.enqueued` | info | An eval was added to the queue. |
 | `eval.completed` | info | An eval handler finished successfully. |
 | `eval.failed` | error | An eval handler returned an error. |
-| `allocation.placed` | info | A plan was applied; one event per apply, with placement details in metadata. |
+| `eval.requeued` | warn | An eval exhausted its plan-conflict retries and was released back to pending with a delay instead of failing (docs/late-binding-plan-apply.md). |
+| `allocation.placed` | info | A plan was applied; one event per apply, with placement details in metadata — including `candidateRank` per placement (0 = first choice) and a `fallbacks` count. |
 | `allocation.removed` | info/warn | Allocations were removed (job stop/update: info; node loss: warn). |
 | `allocation.failed` | warn | A worker reported an allocation failure (includes the reason). |
 | `allocation.plan_rejected` | warn | A placement plan was rejected by optimistic concurrency (will be retried). |
@@ -58,7 +59,7 @@ legion events follow --kind rollout --json   # NDJSON: one envelope per line
 ```
 
 `--kind` matches exactly or by category prefix: `--kind eval` matches
-`eval.enqueued`, `eval.completed`, and `eval.failed`.
+`eval.enqueued`, `eval.completed`, `eval.failed`, and `eval.requeued`.
 
 ### Cursor-based polling (CLI and MCP)
 

@@ -36,6 +36,7 @@ Benchmark targets:
 - `benches/scheduler_bench.rs` (Criterion)
 - `benches/eval_critical_path_bench.rs` (Criterion)
 - `tests/scheduler_benchmark_slo.rs` (repeatable scenario + SLO gate)
+- `tests/plan_contention.rs` (concurrent-submit contention harness)
 - Scenario definitions in `benchmarks/scheduler/scenarios/*.json`
 - SLO thresholds in `benchmarks/scheduler/slo.json`
 
@@ -51,12 +52,21 @@ What they measure:
     this group (see AGENTS.md).
 - `eval_critical_path_bench`: end-to-end enqueue -> claim -> apply -> complete
   latency under 1/4/8 concurrent eval workers (write-lock contention).
+- `plan_contention`: N-way concurrent single-allocation submits against one
+  pool, pumped by real eval workers — measures conflict rejections,
+  requeues, fallback binds, dropped evals, and time-to-all-placed, with
+  candidate lists on vs off
+  ([late-binding-plan-apply.md](late-binding-plan-apply.md)). The
+  non-ignored tests are the CI regression; the `#[ignore]`d
+  `contention_matrix` prints the full grid recorded in
+  `benchmarks/scheduler/README.md`.
 
 Run commands:
 
 - `cargo bench --bench scheduler_bench`
 - `cargo bench --bench eval_critical_path_bench`
 - `cargo test --test scheduler_benchmark_slo -- --ignored --nocapture`
+- `cargo test --test plan_contention -- --ignored --nocapture`
 
 ### Measuring scheduler event-stream overhead
 

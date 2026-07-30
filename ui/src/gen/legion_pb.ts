@@ -3425,6 +3425,21 @@ export class PlannedAllocation extends Message<PlannedAllocation> {
    */
   taskName = "";
 
+  /**
+   * Ranked candidate node IDs for this placement, best first; the first
+   * entry is always node_id. At apply time the store binds the placement to
+   * the first candidate whose node epoch is unchanged since planning, so
+   * under contention the allocation may land on a lower-ranked
+   * (near-equivalent by score) candidate instead of node_id. A single entry
+   * means no fallback: the placement applies to node_id or the plan is
+   * rejected and retried. Empty only when the manager predates candidate
+   * lists. Controlled by schedulerSettings.plan_candidates; see
+   * docs/late-binding-plan-apply.md.
+   *
+   * @generated from field: repeated string candidate_nodes = 4;
+   */
+  candidateNodes: string[] = [];
+
   constructor(data?: PartialMessage<PlannedAllocation>) {
     super();
     proto3.util.initPartial(data, this);
@@ -3436,6 +3451,7 @@ export class PlannedAllocation extends Message<PlannedAllocation> {
     { no: 1, name: "node_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 2, name: "task_config_id", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
     { no: 3, name: "task_name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "candidate_nodes", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): PlannedAllocation {
@@ -6001,6 +6017,26 @@ export class HeartbeatReply extends Message<HeartbeatReply> {
    */
   volumeDestroy: VolumeDestroyRequest[] = [];
 
+  /**
+   * Current endpoint set for every upstream declared by the desired
+   * allocations on this node (see `TaskAllocation.task_connect`). This is the
+   * service-discovery feed for the node-local forwarders: the worker applies
+   * it to the running forwarders and the next accepted connection is balanced
+   * across the addresses listed here.
+   *
+   * One entry per (allocation, upstream service) pair, refreshed on every
+   * heartbeat — that is, every `WORKER_HEARTBEAT_DURATION_SEC` (2s), which is
+   * the endpoint refresh cadence a consumer observes after a backend comes up,
+   * goes unhealthy, or moves.
+   *
+   * Default: empty list when no desired allocation declares upstreams. The
+   * manager performs no catalog work at all in that case, so nodes running
+   * only plain jobs pay nothing for this field.
+   *
+   * @generated from field: repeated legion.UpstreamEndpoints upstream_endpoints = 4;
+   */
+  upstreamEndpoints: UpstreamEndpoints[] = [];
+
   constructor(data?: PartialMessage<HeartbeatReply>) {
     super();
     proto3.util.initPartial(data, this);
@@ -6012,6 +6048,7 @@ export class HeartbeatReply extends Message<HeartbeatReply> {
     { no: 1, name: "message", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 2, name: "desired_allocations", kind: "message", T: TaskAllocation, repeated: true },
     { no: 3, name: "volume_destroy", kind: "message", T: VolumeDestroyRequest, repeated: true },
+    { no: 4, name: "upstream_endpoints", kind: "message", T: UpstreamEndpoints, repeated: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): HeartbeatReply {
@@ -6028,6 +6065,89 @@ export class HeartbeatReply extends Message<HeartbeatReply> {
 
   static equals(a: HeartbeatReply | PlainMessage<HeartbeatReply> | undefined, b: HeartbeatReply | PlainMessage<HeartbeatReply> | undefined): boolean {
     return proto3.util.equals(HeartbeatReply, a, b);
+  }
+}
+
+/**
+ * The endpoints one allocation may currently reach for one upstream service.
+ *
+ * Sent in `HeartbeatReply.upstream_endpoints`, this is the manager's answer to
+ * "where should this allocation's forwarder for service X send traffic right
+ * now". It is a snapshot, not a delta: each heartbeat carries the full list.
+ *
+ * @generated from message legion.UpstreamEndpoints
+ */
+export class UpstreamEndpoints extends Message<UpstreamEndpoints> {
+  /**
+   * Allocation consuming the service — the allocation whose task declared this
+   * upstream in its `connect` block. Identifies which node-local forwarder the
+   * endpoint list applies to.
+   *
+   * @generated from field: int64 allocation_id = 1;
+   */
+  allocationId = protoInt64.zero;
+
+  /**
+   * Upstream service name, exactly as written in the task's
+   * `connect.upstreams[].service`. Echoed so the worker can match the list to
+   * one of its listeners without relying on ordering.
+   *
+   * @generated from field: string service = 2;
+   */
+  service = "";
+
+  /**
+   * Endpoints the consumer may dial, already filtered by the manager:
+   *
+   * - **healthy only** — an endpoint appears when its latest health snapshot is
+   *   healthy *and* its node is alive, the same liveness rule `ResolveService`
+   *   applies. Unhealthy or lost backends are simply absent.
+   * - **intention filtered** — when the target service declares
+   *   `service.allow`, an endpoint is visible only if that list is empty,
+   *   contains `"*"`, or contains the consuming allocation's job id. A denied
+   *   consumer receives an empty list rather than an error.
+   *
+   * Endpoint fields carry the same meaning as in `ResolveServiceReply`; a
+   * consumer dials `address:port`, and skips entries whose `address` is empty
+   * or whose `port` is 0 (the backing node advertises no address yet).
+   *
+   * An empty list is authoritative and means "send no traffic": it is how a
+   * scaled-to-zero, unhealthy, or intention-denied service is reported.
+   * Workers only replace their endpoint list on a *successful* heartbeat, so a
+   * manager outage leaves the last known good set in place (fail-static)
+   * rather than blackholing traffic.
+   *
+   * @generated from field: repeated legion.ServiceEndpoint endpoints = 3;
+   */
+  endpoints: ServiceEndpoint[] = [];
+
+  constructor(data?: PartialMessage<UpstreamEndpoints>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.UpstreamEndpoints";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "allocation_id", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 2, name: "service", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "endpoints", kind: "message", T: ServiceEndpoint, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): UpstreamEndpoints {
+    return new UpstreamEndpoints().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): UpstreamEndpoints {
+    return new UpstreamEndpoints().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): UpstreamEndpoints {
+    return new UpstreamEndpoints().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: UpstreamEndpoints | PlainMessage<UpstreamEndpoints> | undefined, b: UpstreamEndpoints | PlainMessage<UpstreamEndpoints> | undefined): boolean {
+    return proto3.util.equals(UpstreamEndpoints, a, b);
   }
 }
 
@@ -9533,6 +9653,25 @@ export class ServiceSummary extends Message<ServiceSummary> {
    */
   meta: { [key: string]: string } = {};
 
+  /**
+   * Connect intentions declared in the task's `service.allow`: the job IDs
+   * permitted to reach this service through a `connect.upstreams` entry.
+   *
+   * Empty — the default — means *every* job may connect, and so does a single
+   * `"*"` entry; the two are reported verbatim rather than normalized so
+   * tooling can tell "no policy declared" from "explicitly open". Intentions
+   * gate the connect datapath only: they filter the endpoint list a consuming
+   * allocation receives in `HeartbeatReply.upstream_endpoints`, and never
+   * affect who may *read* the catalog through ListServices/ResolveService.
+   *
+   * Reported here so a read-only caller (`job:read`) can explain why its
+   * consumer resolves to nothing — `legion service doctor` prints this list —
+   * without needing state-store access to the underlying task config.
+   *
+   * @generated from field: repeated string allow = 8;
+   */
+  allow: string[] = [];
+
   constructor(data?: PartialMessage<ServiceSummary>) {
     super();
     proto3.util.initPartial(data, this);
@@ -9548,6 +9687,7 @@ export class ServiceSummary extends Message<ServiceSummary> {
     { no: 5, name: "total_count", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
     { no: 6, name: "tags", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
     { no: 7, name: "meta", kind: "map", K: 9 /* ScalarType.STRING */, V: {kind: "scalar", T: 9 /* ScalarType.STRING */} },
+    { no: 8, name: "allow", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ServiceSummary {
@@ -12636,14 +12776,39 @@ export class TaskAllocation extends Message<TaskAllocation> {
   taskOnUnhealthy = "";
 
   /**
-   * JSON-encoded assigned network payload (address + ports) for this
-   * allocation, matching the `AllocNetwork` shape. Workers use it to inject
-   * `LEGION_PORT_*` / `LEGION_ADDR_*` environment variables into the task.
-   * Empty string when the task declares no network block.
+   * JSON-encoded assigned network payload (address + ports + upstreams) for
+   * this allocation, matching the `AllocNetwork` shape. Workers use it to
+   * inject `LEGION_PORT_*` / `LEGION_ADDR_*` environment variables into the
+   * task, and — when the task declares upstreams — the `upstreams` array
+   * (`[{"service":"db","localPort":20003,"balance":"round_robin"}]`) carries
+   * the loopback ports the node-local forwarders listen on, surfaced to the
+   * task as `LEGION_UPSTREAM_*`.
+   *
+   * Empty string when the task declares no network block and no upstreams.
    *
    * @generated from field: string network = 14;
    */
   network = "";
+
+  /**
+   * JSON-encoded `connect` block declared by the task, matching the
+   * `ConnectConfig` shape: `{"upstreams":[{"service":"db"},
+   * {"service":"cache","localPort":6379,"balance":"least_conn"}]}`.
+   *
+   * This is the *declared* form (which services the task dials and with which
+   * balancing strategy); the *assigned* loopback ports live in `network`
+   * alongside the task's host ports, because both come out of the same
+   * per-node port space. The worker starts one loopback TCP forwarder per
+   * upstream and load-balances new connections across that service's healthy
+   * endpoints, which the manager refreshes every heartbeat in
+   * `HeartbeatReply.upstream_endpoints`.
+   *
+   * Empty string (not `{}`) when the task declares no upstreams, so jobs that
+   * do not use connect stay byte-identical on the wire.
+   *
+   * @generated from field: string task_connect = 17;
+   */
+  taskConnect = "";
 
   /**
    * JSON-encoded list of normalized artifact specs for this task.
@@ -12757,6 +12922,7 @@ export class TaskAllocation extends Message<TaskAllocation> {
     { no: 9, name: "task_checks", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 10, name: "task_on_unhealthy", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 14, name: "network", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 17, name: "task_connect", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 11, name: "task_artifacts", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 12, name: "task_identities", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 13, name: "self_terminate_after_seconds", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },

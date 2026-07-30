@@ -1558,7 +1558,11 @@ mod tests {
     }
 }
 
-fn handle_claimed_eval(store: &Store, worker_id: usize, eval: &Eval) {
+/// Handle one claimed eval and settle its row: complete on success, release
+/// for retry on foreign-lane rejections and plan-conflict exhaustion, fail
+/// terminally otherwise. Public so integration tests (the plan-contention
+/// harness) can drive the real worker logic, requeue backstop included.
+pub fn handle_claimed_eval(store: &Store, worker_id: usize, eval: &Eval) {
     let started = std::time::Instant::now();
     info!(
         worker_id,
@@ -1603,6 +1607,36 @@ fn handle_claimed_eval(store: &Store, worker_id: usize, eval: &Eval) {
                 error!(
                     worker_id,
                     "Error releasing eval {} for retry: {:?}", eval.id, release_err
+                );
+            }
+        }
+        // Plan-conflict exhaustion is transient by definition: the plan lost
+        // optimistic-concurrency races, not validity. Terminally failing the
+        // eval here is how acknowledged work used to vanish (failed evals are
+        // never retried — a submit that lost `plan_conflict_max_retries`
+        // races silently never placed), so release it back to pending with a
+        // jittered delay instead. The requeue rides one scheduler-lane op
+        // with its `eval.requeued` event, so saturation shows as visibly
+        // waiting work (docs/late-binding-plan-apply.md).
+        Err(e) if Eval::error_is_plan_conflict(&e) => {
+            let delay = Eval::plan_conflict_requeue_delay(store);
+            warn!(
+                worker_id,
+                eval_id = %eval.id,
+                kind = %eval.kind,
+                delay_ms = delay.as_millis() as u64,
+                "Eval exhausted plan-conflict retries; requeueing: {e:#}"
+            );
+            crate::manager::telemetry::metrics()
+                .eval_conflict_requeues_total
+                .inc();
+            let requeued = drafts::eval_requeued(eval, &e, delay);
+            if let Err(release_err) =
+                store.release_eval_for_retry_with_event(&eval.id, delay, requeued)
+            {
+                error!(
+                    worker_id,
+                    "Error requeueing eval {} after plan conflict: {:?}", eval.id, release_err
                 );
             }
         }

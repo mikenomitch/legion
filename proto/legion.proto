@@ -1657,6 +1657,17 @@ message PlannedAllocation {
 
   // Task name for readability.
   string task_name = 3;
+
+  // Ranked candidate node IDs for this placement, best first; the first
+  // entry is always node_id. At apply time the store binds the placement to
+  // the first candidate whose node epoch is unchanged since planning, so
+  // under contention the allocation may land on a lower-ranked
+  // (near-equivalent by score) candidate instead of node_id. A single entry
+  // means no fallback: the placement applies to node_id or the plan is
+  // rejected and retried. Empty only when the manager predates candidate
+  // lists. Controlled by schedulerSettings.plan_candidates; see
+  // docs/late-binding-plan-apply.md.
+  repeated string candidate_nodes = 4;
 }
 
 // Request payload for StopJob.

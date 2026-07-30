@@ -28,17 +28,20 @@ How to use it:
 
 ## Scheduling & placement
 
-- [ ] **Late-binding plan apply** — plans carry a ranked candidate list per
-      placement and the applier binds to the first candidate whose node epoch
-      is unchanged, so parallel submits racing for the same node cost a rank
-      instead of a conflict retry — [plan](plans/late-binding-plan-apply-plan.md)
-      (PLANNED: contention benchmark → requeue-not-fail backstop → candidate
-      walk for single-placement plans → coupling components). Fixes the
-      parallel-sandbox pathology: today concurrent Fresh-mode planners all
-      pick the same argmax node, and an eval that loses
-      `plan_conflict_max_retries` (default 3) races is failed terminally and
-      never retried. Phase 0 also delivers the raft-mode concurrent-planning
-      test tracked below.
+- [ ] **Late-binding plan apply, Phase 4 backlog** (each optional, gated on
+      the fallback-rank / `plan_apply_total{rejected}` metrics the shipped
+      phases added): capacity-aware candidate skipping, per-component partial
+      commit + eval refill, striped disjoint candidate lists for identical
+      replicas, and a serialized/batched apply lane for physically-full
+      pools — [plan §8](plans/late-binding-plan-apply-plan.md). The shipped
+      phases are in Done below.
+- [ ] **Capacity exhaustion still fails evals terminally.** The late-binding
+      requeue backstop only covers *conflict* errors; a replan that finds no
+      eligible capacity at all ("no available nodes …") still ends the eval
+      in `failed`. Blocked-and-retried capacity waits are the gang-scheduling
+      plan's blocked-eval machinery
+      ([plan](plans/gang-scheduling-plan.md)) — when that lands, consider
+      routing plain single-task capacity failures through it too.
 - [ ] Worker groups + taint/toleration equivalent. Node pools exist as an ACL
       and config concept but nothing scheduling-side consumes them.
 - [ ] Priorities and eviction/preemption, with eviction toggled at the pool level
@@ -569,6 +572,22 @@ docs: [scheduler-and-eval-loop.md](../docs/scheduler-and-eval-loop.md), [jobs-ta
       changes, and `benches/scheduler_bench.rs` grew a
       `candidate_construction` group that isolates candidate-set cost
       (indexes on vs off) across fleet sizes.
+- [x] **Late-binding plan apply** (phases 0–3) — plans carry a ranked
+      candidate list per placement (format-2 submissions) and the applier
+      binds each placement to the first candidate whose node epoch is
+      unchanged, so parallel submits racing for one node cost a fallback
+      rank instead of a conflict retry; coupled placements (overlapping
+      lists, `distinct` tasks, multi-task groups) keep exact all-or-nothing
+      semantics. Conflict-exhausted evals now requeue with jittered backoff
+      (`eval.requeued`) instead of failing terminally. Includes the
+      `plan_candidates` setting (default 8; 0 = kill switch + format-1
+      emission), `job plan` candidate preview, `candidateRank`/`fallbacks`
+      event metadata, the rank histogram + `fallback` outcome metrics, and
+      the `tests/plan_contention.rs` burst harness (also the raft-mode
+      concurrent-planning regression) —
+      [plan](plans/late-binding-plan-apply-plan.md),
+      [docs/late-binding-plan-apply.md](../docs/late-binding-plan-apply.md).
+      Phase 4 backlog and the capacity-exhaustion gap are open items above.
 
 ## Task runtimes
 

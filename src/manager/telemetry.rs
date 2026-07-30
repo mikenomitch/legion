@@ -468,6 +468,10 @@ pub struct Metrics {
     pub eval_queue_depth: Arc<Gauge>,
     /// `legion_plan_apply_total{outcome}`
     pub plan_apply_total: Arc<CounterVec>,
+    /// `legion_scheduler_plan_candidate_rank`
+    pub scheduler_plan_candidate_rank: Arc<Histogram>,
+    /// `legion_eval_conflict_requeues_total`
+    pub eval_conflict_requeues_total: Arc<Counter>,
     /// `legion_heartbeats_total`
     pub heartbeats_total: Arc<Counter>,
     /// `legion_nodes{status}`
@@ -534,6 +538,22 @@ impl Metrics {
                 labels: &["outcome"],
             },
             series: Series::new(),
+        });
+        let scheduler_plan_candidate_rank = Arc::new(Histogram {
+            meta: FamilyMeta {
+                name: "legion_scheduler_plan_candidate_rank",
+                help: "Candidate rank each applied placement bound at (0 = the planner's first choice; higher ranks mean a conflict was absorbed by falling back).",
+                labels: &[],
+            },
+            cell: HistogramCell::new(COUNT_BUCKETS),
+        });
+        let eval_conflict_requeues_total = Arc::new(Counter {
+            meta: FamilyMeta {
+                name: "legion_eval_conflict_requeues_total",
+                help: "Evals released back to the pending queue after exhausting plan-conflict retries, instead of failing terminally.",
+                labels: &[],
+            },
+            cell: CounterCell::default(),
         });
         let heartbeats_total = Arc::new(Counter {
             meta: FamilyMeta {
@@ -626,6 +646,7 @@ impl Metrics {
             Arc::clone(&grpc_requests_total) as Arc<dyn RenderMetric>,
             Arc::clone(&heartbeats_total) as Arc<dyn RenderMetric>,
             Arc::clone(&nodes) as Arc<dyn RenderMetric>,
+            Arc::clone(&eval_conflict_requeues_total) as Arc<dyn RenderMetric>,
             Arc::clone(&plan_apply_total) as Arc<dyn RenderMetric>,
             Arc::clone(&raft_quorum) as Arc<dyn RenderMetric>,
             Arc::clone(&raft_voters) as Arc<dyn RenderMetric>,
@@ -633,6 +654,7 @@ impl Metrics {
             Arc::clone(&scheduler_index_maintenance_seconds) as Arc<dyn RenderMetric>,
             Arc::clone(&scheduler_index_queries_total) as Arc<dyn RenderMetric>,
             Arc::clone(&scheduler_index_shadow_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&scheduler_plan_candidate_rank) as Arc<dyn RenderMetric>,
             Arc::clone(&store_write_lock_wait_seconds) as Arc<dyn RenderMetric>,
         ];
 
@@ -642,6 +664,8 @@ impl Metrics {
             evals_processed_total,
             eval_queue_depth,
             plan_apply_total,
+            scheduler_plan_candidate_rank,
+            eval_conflict_requeues_total,
             heartbeats_total,
             nodes,
             allocations,

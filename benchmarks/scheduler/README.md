@@ -58,3 +58,32 @@ cell (33.6 vs 42.4 ms) instead of ~11%. The 12-task 1k cell measures
 6.7 ms (off) / 7.1 ms (on) — small fleets remain index-neutral, which is
 why `index_min_nodes` exists. No remaining O(cluster) deep clone sits on
 the plan path; further wins want profiling, not this list.
+
+## Plan contention — late-binding candidate lists (2026-07-29)
+
+`cargo test --test plan_contention -- --ignored --nocapture`
+(dev container; N single-allocation `job_submit` evals pumped by 8 real
+eval workers against one bin_pack pool, one seeded allocation so the
+argmax is deterministic; `k` is `schedulerSettings.plan_candidates`, so
+`k=0` is the pre-candidate behavior in the same binary). Baseline and
+after are the same run — the kill switch *is* the baseline. See
+[docs/late-binding-plan-apply.md](../../docs/late-binding-plan-apply.md).
+
+| N | pool | k=0 conflicts | k=8 conflicts | k=8 fallback binds | k=0 → k=8 time-to-all-placed |
+| --- | --- | --- | --- | --- | --- |
+| 8 | 6 (small) | 9 | 2 | 6 | 191 ms → 76 ms |
+| 8 | 64 (headroom) | 9 | **0** | 7 | 249 ms → 47 ms |
+| 32 | 6 (small) | 16 | 2 | 19 | 320 ms → 75 ms |
+| 32 | 64 (headroom) | 17 | **0** | 22 | 248 ms → 88 ms |
+| 128 | 6 (small) | 41 | 2 | 70 | 617 ms → 325 ms |
+| 128 | 64 (headroom) | 58 | **0** | 82 | 827 ms → 349 ms |
+
+Reading: at headroom, candidate lists remove conflict rejections
+entirely — every race is absorbed as a fallback bind (rank > 0) inside
+the near-tie band — and time-to-all-placed drops 2–5×. On the small
+pool, the residual conflicts are walks whose whole candidate set went
+stale within the snapshot-to-apply window (the pool only has 6 nodes),
+and the requeue backstop absorbs what the retry budget does not: zero
+failed evals in every cell, both modes. The `k=0` rows also show the
+Phase 1 backstop working alone (requeues > 0 at N=128, still zero
+drops).

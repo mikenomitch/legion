@@ -67,9 +67,18 @@ into a single series with every label set to `"other"`.
   queue, including delayed evals not yet ready. Updated transactionally on
   enqueue, claim, and startup requeue.
 - **`legion_plan_apply_total{outcome}`** (counter) — scheduler plan
-  submissions applied to the store; `outcome` is `applied` or `rejected`
-  (rejections are optimistic-concurrency epoch conflicts or late constraint
-  failures — see docs/scheduler-and-eval-loop.md).
+  submissions applied to the store; `outcome` is `applied` (every placement
+  bound its first-choice candidate), `fallback` (applied, but at least one
+  placement bound a lower-ranked candidate because of a race), or
+  `rejected` (optimistic-concurrency epoch conflicts or late constraint
+  failures). The outcomes are mutually exclusive — see
+  [late-binding-plan-apply.md](late-binding-plan-apply.md).
+- **`legion_scheduler_plan_candidate_rank`** (histogram) — candidate rank
+  each applied placement bound at (0 = the planner's first choice; higher
+  ranks mean the apply walk absorbed a race by falling back).
+- **`legion_eval_conflict_requeues_total`** (counter) — evals released back
+  to the pending queue after exhausting their plan-conflict retry budget,
+  instead of failing terminally (the requeue backstop).
 
 ### Scheduling indexes
 

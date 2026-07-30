@@ -96,6 +96,12 @@ other. During a rolling manager upgrade the plane tolerates skew:
 - Payloads inside the transport are versioned by `PROTOCOL_VERSION`;
   undecodable payloads name mixed manager protocol versions in their
   error.
+- Plan submissions carry ranked candidate lists as a format-2 row
+  ([late-binding-plan-apply.md](late-binding-plan-apply.md)) that
+  pre-candidate managers cannot parse. The standard same-version upgrade
+  order covers this; for a mixed-version manager fleet held longer than
+  an upgrade window, set `schedulerSettings.plan_candidates: 0` until
+  every peer is level — it holds format-2 emission off entirely.
 
 ## Raft persistence upgrades
 

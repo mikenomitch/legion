@@ -45,7 +45,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use legion::prelude::{json, Context, R};
-use legion::storage::store::{PlanApplyOutcome, Store};
+use legion::storage::store::{PlanApplyOutcome, PlanSubmissionPlacement, Store};
 use legion::structs::config::{ManagerConfigFull, PersistenceType};
 use legion::structs::job::{JobConfig, TaskConfig};
 use legion::structs::{KvValueType, Node, NodeMsg, Submission};
@@ -1077,6 +1077,96 @@ fn laggard_converges_via_lane_scoped_install_snapshot() -> R<()> {
 
 /// (d) Cross-lane consistency: control-lane config updates racing
 /// scheduler-lane placement resolve as read-after-commit or a clean
+/// A format-2 (candidate list) plan submission applies through the raft
+/// scheduler lane: the stale rank-0 candidate is skipped, the fallback
+/// binds, and every replica converges on the same bound allocation —
+/// commit-time choice happens inside the replicated apply, so followers
+/// hold the walk's result, not the planner's first pick
+/// (docs/late-binding-plan-apply.md).
+#[test]
+fn candidate_plan_submission_falls_back_and_converges() -> R<()> {
+    let _serial = cluster_gate();
+    init_trace();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()?;
+    let dir = tempfile::tempdir()?;
+    let (a, b, c) = start_cluster(&rt, dir.path(), 10_000)?;
+
+    a.store().insert_node(test_node_msg("cand-node-a"))?;
+    a.store().insert_node(test_node_msg("cand-node-b"))?;
+    let outcome = a
+        .store()
+        .handle_job_submit(&test_job("cand-job", 1), &[submission("cand-job", "v1")])?;
+    let job_config_id = outcome.job_config_id().to_string();
+    let tasks = a.store().get_task_configs_for_job_config(&job_config_id)?;
+    let (task_id, _) = *tasks.first().context("job must have a task config")?;
+
+    let rival = a.store().handle_job_submit(
+        &test_job("cand-rival", 1),
+        &[submission("cand-rival", "v1")],
+    )?;
+    let rival_config = rival.job_config_id().to_string();
+    let rival_tasks = a.store().get_task_configs_for_job_config(&rival_config)?;
+    let (rival_task, _) = *rival_tasks
+        .first()
+        .context("rival job must have a task config")?;
+
+    // Sample the vector, then let a rival land on the rank-0 candidate
+    // before the apply — the walk must slide to rank 1 instead of
+    // rejecting.
+    let versions = BTreeMap::from([
+        (
+            format!("job_config:{job_config_id}"),
+            a.store().allocation_epoch_for_job_config(&job_config_id)?,
+        ),
+        ("node:cand-node-a".to_string(), 0),
+        ("node:cand-node-b".to_string(), 0),
+    ]);
+    let plan = a.store().insert_plan_submission_with_candidates(
+        &job_config_id,
+        "fresh",
+        &[PlanSubmissionPlacement {
+            task_id,
+            candidates: vec!["cand-node-a".to_string(), "cand-node-b".to_string()],
+        }],
+        &versions,
+    )?;
+    a.store().place_alloc("cand-node-a", rival_task)?;
+
+    match a.store().apply_plan_submission(&plan)? {
+        PlanApplyOutcome::Applied(applied) => {
+            assert_eq!(applied.allocations.len(), 1);
+            assert_eq!(
+                applied.allocations[0].node_id, "cand-node-b",
+                "the walk must bind the fallback candidate"
+            );
+            assert_eq!(applied.candidate_ranks, vec![1]);
+        }
+        PlanApplyOutcome::Rejected { reason, .. } => {
+            panic!("candidate walk must absorb the race: {reason}")
+        }
+    }
+
+    let all = [&a, &b, &c];
+    wait_for(
+        Duration::from_secs(120),
+        "replicas converge after the fallback bind",
+        || hashes_converged(&all),
+    );
+    for follower in [&b, &c] {
+        let bound = follower
+            .store()
+            .allocs_for_node("cand-node-b")?
+            .iter()
+            .filter(|alloc| alloc.job_config_id == job_config_id)
+            .count();
+        assert_eq!(bound, 1, "followers must hold the walk's bound node");
+    }
+    Ok(())
+}
+
 /// epoch-CAS rejection + retry — and replicas never diverge.
 #[test]
 fn cross_lane_config_update_racing_placement_never_diverges() -> R<()> {

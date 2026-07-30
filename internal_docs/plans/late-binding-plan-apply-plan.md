@@ -2,11 +2,15 @@
 
 > **Judgement calls:** [`calls/late-binding-plan-apply-plan_calls.md`](../calls/late-binding-plan-apply-plan_calls.md)
 
-**Status: PLANNED.** Nothing here is built. Deliberately deferred to the
-backlog phase (§8, Phase 4): capacity-aware candidate skipping,
-per-component partial commit, striped disjoint candidate lists for
-identical replicas, and any serialized/batched lane for physically-full
-pools.
+**Status: SHIPPED** (phases 0–3, 2026-07-29). Public doc:
+[docs/late-binding-plan-apply.md](../../docs/late-binding-plan-apply.md).
+Implementation deviations are recorded in the judgement-calls doc.
+Deliberately deferred to the backlog phase (§8, Phase 4): capacity-aware
+candidate skipping, per-component partial commit, striped disjoint
+candidate lists for identical replicas, and any serialized/batched lane
+for physically-full pools. Known gap kept out of scope: capacity
+exhaustion (a replan finding no eligible nodes) still fails the eval
+terminally — blocked-eval waits belong to the gang-scheduling plan.
 
 ## Problem Statement
 
