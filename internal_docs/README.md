@@ -66,7 +66,10 @@ When one is required and what goes in it:
 | [multi-cluster-federation-plan.md](plans/multi-cluster-federation-plan.md) | planned |
 | [multi-raft-persistence-plan.md](plans/multi-raft-persistence-plan.md) | planned |
 | [scheduler-performance-plan.md](plans/scheduler-performance-plan.md) | in execution |
-| [scheduler-architecture-review-plan.md](plans/scheduler-architecture-review-plan.md) | planned (proposals; no code) |
+| [scheduler-architecture-review-plan.md](plans/scheduler-architecture-review-plan.md) | proposals accepted; D1/D4/D5/D6 graduated into the two plans below, D8's local slice into the heartbeat plan |
+| [plan-path-scale-levers-plan.md](plans/plan-path-scale-levers-plan.md) | in execution |
+| [bounded-candidate-scoring-plan.md](plans/bounded-candidate-scoring-plan.md) | in execution |
+| [heartbeat-scale-plan.md](plans/heartbeat-scale-plan.md) | in execution |
 | [aws-comparative-benchmark-plan.md](plans/aws-comparative-benchmark-plan.md) | planned |
 | [scheduler-plan-snapshot-plan.md](plans/scheduler-plan-snapshot-plan.md) | shipped |
 | [scheduling-index-plan.md](plans/scheduling-index-plan.md) | shipped (phases 0–3; group-path + backlog deferred) |

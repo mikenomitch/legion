@@ -1,9 +1,15 @@
 # Scheduler Architecture Review for Scale (proposals)
 
-**Status: PLANNED** — this is a proposals document: it evaluates
-architectural decisions against the "fastest scheduler at scale" goal and
-proposes the big levers, with costs and benefits. No code ships from this
-plan directly; each accepted proposal graduates into its own plan.
+**Status: PROPOSALS ACCEPTED / GRADUATED** — this is a proposals
+document: it evaluates architectural decisions against the "fastest
+scheduler at scale" goal and proposes the big levers, with costs and
+benefits. No code ships from this plan directly. D4/D5/D6 graduated into
+[`plan-path-scale-levers-plan.md`](plan-path-scale-levers-plan.md), D1
+into [`bounded-candidate-scoring-plan.md`](bounded-candidate-scoring-plan.md),
+and the locally-measurable slice of D8 into
+[`heartbeat-scale-plan.md`](heartbeat-scale-plan.md). D2 (keep single
+scheduler, seam designed) and D3 (keep SQLite) remain the recorded
+keep-decisions; D8's architecture choice still waits on AWS-test data.
 
 > **Judgement calls:** [`../calls/scheduler-architecture-review-plan_calls.md`](../calls/scheduler-architecture-review-plan_calls.md)
 
