@@ -722,6 +722,7 @@ mod tests {
             is_primary: true,
         };
         let job = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "web".into(),
@@ -907,6 +908,7 @@ mod tests {
             ..TaskConfig::new("task-one", "service")
         };
         let job_one_config = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: job_one_name.clone(),
@@ -960,6 +962,7 @@ mod tests {
             ..TaskConfig::new("task-two", "service")
         };
         let job_two_config = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: job_two_name.clone(),
@@ -1054,6 +1057,7 @@ mod tests {
             ..TaskConfig::new("db", "service")
         };
         let job_config = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: job_name.clone(),
@@ -1137,6 +1141,7 @@ mod tests {
             ..TaskConfig::new("sandbox", "service")
         };
         let job_config = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: job_name.clone(),
@@ -1238,6 +1243,7 @@ mod tests {
             ..TaskConfig::new("api", "service")
         };
         let job_config = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: job_name.clone(),
@@ -1299,6 +1305,7 @@ mod tests {
         };
 
         let job_config = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: job_name.clone(),
@@ -1336,6 +1343,7 @@ mod tests {
             ..base_task.clone()
         };
         let unchanged_config = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: job_name.clone(),
@@ -1367,6 +1375,7 @@ mod tests {
             ..unchanged_task.clone()
         };
         let moved_config = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: job_name.clone(),
@@ -1398,6 +1407,7 @@ mod tests {
             ..moved_task
         };
         let removed_config = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: job_name.clone(),

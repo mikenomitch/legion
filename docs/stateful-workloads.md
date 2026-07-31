@@ -215,6 +215,23 @@ manager can't reach the node — the workload may still be running. Stateful
 allocations on lost nodes are therefore gated behind a loss-confirmation
 window before step 1 happens at all; see the next section.
 
+### Preemption
+
+A stateful allocation on **cluster-reachable** storage (`nfs`, and future
+network drivers) is preemptible. Preemption stops it exactly the way a rollout
+replacement does — a clean, manager-driven stop with the task's `stop` ladder —
+and its replacement reattaches the same storage handle wherever it lands, by
+the same reschedule path above.
+
+A stateful allocation on **node-local** storage (`local-dir`) is **never** a
+preemption victim, categorically. Evicting one either frees nothing (the
+instance can only be recreated on the node its data is on) or abandons the
+data. The rule follows the same principle as drain's held-stateful behavior:
+the platform never force-moves protected state. The consequence to plan around
+is that a node filled with low-band, node-pinned stateful work is
+un-preemptible; the placement error says so. See
+[preemption-and-eviction.md](preemption-and-eviction.md).
+
 ## Node loss and fencing (at-most-one)
 
 Single-writer systems need certainty that slot N's old allocation is dead

@@ -30,12 +30,12 @@ use crate::storage::queries::{
     UPSERT_MANAGER_CONFIG,
 };
 use crate::structs::{
-    slot_instance_id, Allocation, AllocationHealth, Eval, Instance, InstanceMode, InstanceState,
-    Job, JobConfig, JobTemplateProvenance, KvEntry, KvLock, KvValueType, LedgerEntry,
-    ManagerConfigFull, ManagerNodeConfig, Node, NodeMsg, ReplaceAfter, ResolvedOnLostPolicy,
-    Rollout, RolloutConfig, SigningKeyRecord, StatefulConfig, StatefulOnLostConfig, StopCause,
-    Submission, TaskCheck, TaskConfig, TaskCount, TaskDependency, TaskLifecycle,
-    TaskOnUnhealthyConfig, TaskSchedule, TaskStatusState, Volume, WorkerConfig,
+    slot_instance_id, Allocation, AllocationHealth, Band, Eval, Instance, InstanceMode,
+    InstanceState, Job, JobConfig, JobTemplateProvenance, KvEntry, KvLock, KvValueType,
+    LedgerEntry, ManagerConfigFull, ManagerNodeConfig, Node, NodeMsg, ReplaceAfter,
+    ResolvedOnLostPolicy, Rollout, RolloutConfig, SigningKeyRecord, StatefulConfig,
+    StatefulOnLostConfig, StopCause, Submission, TaskCheck, TaskConfig, TaskCount, TaskDependency,
+    TaskLifecycle, TaskOnUnhealthyConfig, TaskSchedule, TaskStatusState, Volume, WorkerConfig,
 };
 use crate::util::random_string;
 
@@ -247,6 +247,61 @@ pub struct AppliedPlan {
     pub candidate_ranks: Vec<usize>,
 }
 
+/// One allocation's preemption-relevant metadata, straight off the join in
+/// [`Store::preemption_victim_metadata`]. Normalized into a
+/// `VictimCandidate` by the planner, which owns the resource parsing.
+#[derive(Debug, Clone)]
+pub struct PreemptionVictimRow {
+    pub allocation_id: i64,
+    pub node_id: String,
+    pub job_id: String,
+    pub job_config_id: String,
+    pub task_config_id: i64,
+    pub task_name: String,
+    /// The allocation's own resource claim — what evicting it would return
+    /// to the node.
+    pub resources: Value,
+    /// Placement time in unix seconds. `None` for rows written before
+    /// allocation timestamps existed.
+    pub created_at_unix: Option<i64>,
+    /// The task's declared count, which `disruption.minAvailable` percentages
+    /// resolve against.
+    pub task_count: u32,
+    pub disruption_json: Option<String>,
+    pub stop_json: Option<String>,
+    /// The owning job config's priority band.
+    pub band: Band,
+    /// True when this allocation's instance holds node-local storage.
+    pub node_pinned: bool,
+}
+
+/// What one plan's eviction half did, so the apply path can finish the
+/// non-transactional bookkeeping after the commit.
+#[derive(Default)]
+struct AppliedEvictions {
+    /// The victim rows that were actually deleted. A victim that had already
+    /// disappeared by apply time (a `job stop` landed first) is simply
+    /// absent — a plan's eviction list is a decision, not a lock.
+    victims: Vec<Allocation>,
+    /// `allocation.preempted` events, staged in the transaction and
+    /// published after it commits.
+    events: Vec<SchedulerEventRecord>,
+    /// `(pool, band, count)` rows for `legion_preemptions_total`.
+    metric_rows: Vec<(String, String, u64)>,
+}
+
+/// One live stop notice, as the heartbeat feed serves it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredStopNotice {
+    pub allocation_id: i64,
+    pub cause: StopCause,
+    /// Job that displaced this allocation; empty for every cause but
+    /// [`StopCause::Preempted`].
+    pub preemptor_job: String,
+    /// That job's band; empty when `preemptor_job` is.
+    pub preemptor_band: String,
+}
+
 /// One task's count override (`legion job scale`, docs/autoscaling.md),
 /// keyed by the version-stable task tuple so it survives resubmits.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -287,6 +342,29 @@ struct PlanApplyRequest {
     mode: String,
     placements: PlanPlacements,
     expected_versions: BTreeMap<String, i64>,
+    /// Allocations this plan evicts to pay for `placements`. Carried on the
+    /// same request, applied in the same transaction, fenced by the same
+    /// `expected_versions` compare-and-set.
+    evictions: Vec<PlanEviction>,
+}
+
+/// One allocation a plan will evict, as it rides the `plan_submission` row.
+///
+/// Deliberately a snapshot rather than a reference: the plan is a durable
+/// record of a decision, and by the time it applies the allocation may be
+/// gone (a job stop, a node loss). Apply re-reads the live rows and skips
+/// what has already disappeared, so a vanished victim is a no-op, never an
+/// error.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanEviction {
+    pub allocation_id: i64,
+    pub node_id: String,
+    pub job_id: String,
+    pub job_config_id: String,
+    pub task_config_id: i64,
+    /// The victim's band at plan time, for the event and the notice.
+    pub band: String,
 }
 
 /// The two plan-submission shapes, so both take the same group-commit path
@@ -1635,7 +1713,7 @@ impl Store {
 
         let mut task_stmt = conn.prepare(
             r#"
-            SELECT id, name, runtime, count, count_per, group_name, lifecycle, schedule, depends_on, config, resources, constraints, permit, affinities, checks, on_unhealthy, kv_injections, job_config_id, identities, stateful, artifacts, network, service, actions, volumes, connect, restart
+            SELECT id, name, runtime, count, count_per, group_name, lifecycle, schedule, depends_on, config, resources, constraints, permit, affinities, checks, on_unhealthy, kv_injections, job_config_id, identities, stateful, artifacts, network, service, actions, volumes, connect, restart, stop, disruption
             FROM task_config;
             "#,
         )?;
@@ -1675,6 +1753,8 @@ impl Store {
                 volumes: self.parse_volumes_column(24, row.get(24)?)?,
                 connect: parse_json_column(25, row.get(25)?)?,
                 restart: parse_json_column(26, row.get(26)?)?,
+                stop: parse_json_column(27, row.get(27)?)?,
+                disruption: parse_json_column(28, row.get(28)?)?,
             };
             let job_config_id: String = row.get(17)?;
             Ok((job_config_id, id, task))
@@ -2051,6 +2131,84 @@ impl Store {
         ))
     }
 
+    /// The owning job name and priority band of a job config.
+    ///
+    /// One row read on the plan path, so it is a single statement rather than
+    /// a full `get_job_config` (which also loads every task). A config that
+    /// has vanished reads as the default band under its own id — planning for
+    /// a config that no longer exists fails for other reasons, and inventing
+    /// a high band here would be the dangerous direction to guess in.
+    pub fn job_band_for_job_config(&self, job_config_id: &str) -> R<(String, Band)> {
+        let conn = self.read_connection()?;
+        let row: Option<(String, String)> = conn
+            .query_row(
+                "SELECT job_id, priority FROM job_config WHERE id = ?;",
+                [job_config_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        Ok(match row {
+            Some((job_id, band)) => (job_id, Band::from_stored(&band)),
+            None => (job_config_id.to_string(), Band::default()),
+        })
+    }
+
+    /// Per-allocation metadata the preemption pass needs, for the
+    /// allocations on a set of candidate nodes.
+    ///
+    /// Run **lazily**: the planner only calls this after normal placement has
+    /// already failed for a task whose band can preempt, so a cluster that
+    /// never preempts pays nothing. One statement rather than a per-node loop
+    /// — the join is over `allocation` (indexed by node) and two config
+    /// tables, and the whole point is to keep the rare path from becoming a
+    /// per-node fan-out.
+    ///
+    /// The band, the `disruption` floor and `stop.killAfter` come from
+    /// config rows rather than from the plan's in-memory snapshot, which
+    /// carries only [`Allocation`]s.
+    pub fn preemption_victim_metadata(&self, node_ids: &[&str]) -> R<Vec<PreemptionVictimRow>> {
+        if node_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = std::iter::repeat_n("?", node_ids.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT a.id, a.node_id, a.job_config_id, a.task_config_id, a.created_at_unix, \
+                    a.resources, \
+                    tc.name, tc.job_id, tc.count, tc.disruption, tc.stop, jc.priority, \
+                    EXISTS( \
+                        SELECT 1 FROM volume v \
+                        WHERE v.instance_id = a.instance_id AND v.node_local = 1 \
+                    ) AS node_pinned \
+             FROM allocation a \
+             INNER JOIN task_config tc ON tc.id = a.task_config_id \
+             INNER JOIN job_config jc ON jc.id = a.job_config_id \
+             WHERE a.node_id IN ({placeholders});"
+        );
+        let conn = self.read_connection()?;
+        let mut stmt = conn.prepare(&sql)?;
+        let rows =
+            Self::collect_rows(stmt.query_map(params_from_iter(node_ids.iter()), |row| {
+                Ok(PreemptionVictimRow {
+                    allocation_id: row.get(0)?,
+                    node_id: row.get(1)?,
+                    job_config_id: row.get(2)?,
+                    task_config_id: row.get(3)?,
+                    created_at_unix: row.get(4)?,
+                    resources: row.get(5)?,
+                    task_name: row.get(6)?,
+                    job_id: row.get(7)?,
+                    task_count: row.get::<_, i64>(8)? as u32,
+                    disruption_json: row.get(9)?,
+                    stop_json: row.get(10)?,
+                    band: Band::from_stored(&row.get::<_, String>(11)?),
+                    node_pinned: row.get::<_, i64>(12)? != 0,
+                })
+            })?)?;
+        Ok(rows)
+    }
+
     /// Runs one scheduling-index candidate query under the read-model lock
     /// (docs/scheduling-indexes.md). Cheap: index selection plus one shard
     /// walk; the caller re-verifies every returned candidate. `ordered:
@@ -2317,6 +2475,7 @@ impl Store {
                 &mode,
                 &placements_json,
                 &expected_versions,
+                &[],
             )
         })
     }
@@ -2358,6 +2517,7 @@ impl Store {
                     &mode,
                     &placements_json,
                     &expected_versions,
+                    &[],
                 )
             },
         )
@@ -2369,22 +2529,25 @@ impl Store {
         mode: &str,
         placements_json: &str,
         expected_versions: &BTreeMap<String, i64>,
+        evictions: &[PlanEviction],
     ) -> R<PlanSubmission> {
         let created_at = OffsetDateTime::now_utc().format(&Rfc3339)?;
+        let evictions_json = serde_json::to_string(evictions)?;
         let expected_vector_json = serde_json::to_string(expected_versions)?;
         let expected_job_epoch = *expected_versions
             .get(&Self::scope_vector_key("job_config", job_config_id))
             .unwrap_or(&0);
         let conn = self.write_connection()?;
         let id = conn.query_row(
-            "INSERT INTO plan_submission(job_config_id, mode, placements, expected_epoch, expected_version_vector, status, created_at) VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6) RETURNING id;",
+            "INSERT INTO plan_submission(job_config_id, mode, placements, expected_epoch, expected_version_vector, status, created_at, evictions) VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6, ?7) RETURNING id;",
             params![
                 job_config_id,
                 mode,
                 placements_json,
                 expected_job_epoch,
                 expected_vector_json,
-                created_at
+                created_at,
+                evictions_json
             ],
             |row| row.get(0),
         )?;
@@ -2419,12 +2582,14 @@ impl Store {
         mode: &str,
         placements: &[(String, i64)],
         expected_versions: &BTreeMap<String, i64>,
+        evictions: &[PlanEviction],
     ) -> R<(PlanSubmission, PlanApplyOutcome)> {
         let request = PlanApplyRequest {
             job_config_id: job_config_id.to_owned(),
             mode: mode.to_owned(),
             placements: PlanPlacements::Nodes(placements.to_vec()),
             expected_versions: expected_versions.clone(),
+            evictions: evictions.to_vec(),
         };
         let (submission, outcome) = if self.plan_apply_coalescing_enabled() {
             let coalescer = Arc::clone(&self.plan_coalescer);
@@ -2470,6 +2635,7 @@ impl Store {
                         &request.mode,
                         &request.placements,
                         &request.expected_versions,
+                        &request.evictions,
                     )
                 })
             }
@@ -2482,6 +2648,7 @@ impl Store {
                         &request.mode,
                         &request.placements,
                         &request.expected_versions,
+                        &request.evictions,
                     )
                 },
             ),
@@ -2497,12 +2664,14 @@ impl Store {
                 &request.mode,
                 &request.placements,
                 &request.expected_versions,
+                &request.evictions,
             ),
             PlanPlacements::Candidates(_) => self.submit_and_apply_plan_with_candidates_apply(
                 &request.job_config_id,
                 &request.mode,
                 &request.placements,
                 &request.expected_versions,
+                &request.evictions,
             ),
         }
     }
@@ -2593,6 +2762,7 @@ impl Store {
         mode: &str,
         placements: &PlanPlacements,
         expected_versions: &BTreeMap<String, i64>,
+        evictions: &[PlanEviction],
     ) -> R<(PlanSubmission, PlanApplyOutcome)> {
         let placements_json = placements.to_json()?;
         let submission = self.insert_plan_submission_apply(
@@ -2600,6 +2770,7 @@ impl Store {
             mode,
             &placements_json,
             expected_versions,
+            evictions,
         )?;
         let outcome = self.apply_plan_submission_apply(&submission)?;
         Ok((submission, outcome))
@@ -2615,6 +2786,7 @@ impl Store {
         mode: &str,
         placements: &[PlanSubmissionPlacement],
         expected_versions: &BTreeMap<String, i64>,
+        evictions: &[PlanEviction],
     ) -> R<(PlanSubmission, PlanApplyOutcome)> {
         for placement in placements {
             if placement.candidates.is_empty() {
@@ -2629,6 +2801,7 @@ impl Store {
             mode: mode.to_owned(),
             placements: PlanPlacements::Candidates(placements.to_vec()),
             expected_versions: expected_versions.clone(),
+            evictions: evictions.to_vec(),
         };
         let (submission, outcome) = if self.plan_apply_coalescing_enabled() {
             let coalescer = Arc::clone(&self.plan_coalescer);
@@ -2649,8 +2822,15 @@ impl Store {
         mode: &str,
         placements: &PlanPlacements,
         expected_versions: &BTreeMap<String, i64>,
+        evictions: &[PlanEviction],
     ) -> R<(PlanSubmission, PlanApplyOutcome)> {
-        self.submit_and_apply_plan_apply(job_config_id, mode, placements, expected_versions)
+        self.submit_and_apply_plan_apply(
+            job_config_id,
+            mode,
+            placements,
+            expected_versions,
+            evictions,
+        )
     }
 
     pub fn apply_plan_submission(&self, submission: &PlanSubmission) -> R<PlanApplyOutcome> {
@@ -2788,7 +2968,20 @@ impl Store {
         let mut conn = self.write_connection()?;
         let tx = Self::write_tx(&mut conn)?;
 
-        let reject = |tx: rusqlite::Savepoint<'_>, reason: String| -> R<PlanApplyOutcome> {
+        // `reverted_evictions` is `Some(n)` once this plan has staged
+        // evictions inside the `legion_plan_evictions` savepoint: a rejection
+        // still COMMITS (it persists the rejected row and its event), so the
+        // victims must be rolled back first — a plan that is not happening
+        // may not displace anything.
+        let reject = |tx: rusqlite::Savepoint<'_>,
+                      reason: String,
+                      reverted_evictions: Option<usize>|
+         -> R<PlanApplyOutcome> {
+            if reverted_evictions.is_some() {
+                tx.execute_batch(
+                    "ROLLBACK TO legion_plan_evictions; RELEASE legion_plan_evictions;",
+                )?;
+            }
             tx.execute(
                 "UPDATE plan_submission SET status = 'rejected', rejection_reason = ?1 WHERE id = ?2;",
                 params![reason, submission.id],
@@ -2804,6 +2997,7 @@ impl Store {
             warn!(
                 submission_id = submission.id,
                 job_config_id = %submission.job_config_id,
+                reverted_evictions = reverted_evictions.unwrap_or_default(),
                 duration_ms = tx_started.elapsed().as_millis() as u64,
                 "Rejected plan submission: {reason}"
             );
@@ -2831,15 +3025,58 @@ impl Store {
                 "plan epoch for job config {} is stale; expected {}, latest {}",
                 submission.job_config_id, expected_job_epoch, latest_job_epoch
             );
-            return reject(tx, reason);
+            return reject(tx, reason, None);
         }
 
-        let (placements_json, plan_mode): (String, String) = tx.query_row(
-            "SELECT placements, mode FROM plan_submission WHERE id = ?1;",
+        let (placements_json, plan_mode, evictions_json): (String, String, String) = tx.query_row(
+            "SELECT placements, mode, evictions FROM plan_submission WHERE id = ?1;",
             [submission.id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
         let placements = Self::parse_plan_submission_placements(&placements_json)?;
+        let evictions: Vec<PlanEviction> = serde_json::from_str(&evictions_json)?;
+
+        // ---- Preemption: victims leave before the placements they paid for
+        // arrive, inside this same transaction.
+        //
+        // Order matters three times over. The DELETEs run before the
+        // free-pool reconstruction below, so the placement's capacity check
+        // sees the capacity the eviction freed — without that, a plan would
+        // evict and then reject itself for being over capacity. They also run
+        // before the candidate walk's per-node epoch checks, and evicting
+        // BUMPS those nodes' epochs — this plan's own writes, not a competing
+        // plan's — so the pre-eviction epochs are captured just below and the
+        // walk compares against those. Without that a preemptive plan would
+        // conflict with itself and reject every time. And they run inside
+        // this transaction, so there is no instant in which the freed
+        // capacity exists un-owned: the epoch compare-and-set above already
+        // proved nothing else touched these nodes, and any competing plan
+        // that samples between this commit and the read-model refresh
+        // conflicts rather than double-spending. That is the whole
+        // correctness claim of the design (Volcano #5022 is the bug this
+        // shape cannot have).
+        // Fenced by a savepoint, because the per-placement validation below
+        // can still REJECT this plan — and a rejection commits (it persists
+        // the rejected submission row and its event). Without the savepoint
+        // that commit would keep the evictions and drop the placements they
+        // paid for, which is precisely the failure this design claims it
+        // cannot have. On rejection the savepoint is rolled back, so the
+        // victims are still running when the plan is retried.
+        // Epochs as of transaction start for the nodes this plan evicts on:
+        // the walk's fence asks "did anything ELSE change this node since I
+        // planned", and our own evictions are not something else.
+        let mut pre_eviction_node_epochs: HashMap<String, i64> = HashMap::new();
+        for eviction in &evictions {
+            if let Entry::Vacant(entry) = pre_eviction_node_epochs.entry(eviction.node_id.clone()) {
+                let epoch = self.scope_epoch_tx(&tx, "node", &eviction.node_id)?;
+                entry.insert(epoch);
+            }
+        }
+        let eviction_savepoint = !evictions.is_empty();
+        if eviction_savepoint {
+            tx.execute_batch("SAVEPOINT legion_plan_evictions;")?;
+        }
+        let preempted = self.apply_plan_evictions_tx(&tx, submission, &evictions)?;
 
         // Node rows load LAZILY, per candidate actually attempted, memoized
         // for the plan. The walk usually binds rank 0, so eagerly loading
@@ -2908,7 +3145,10 @@ impl Store {
                     .get(&node_scope_key)
                     .copied()
                     .unwrap_or_default();
-                let latest_epoch = self.scope_epoch_tx(&tx, "node", node_id)?;
+                let latest_epoch = match pre_eviction_node_epochs.get(node_id) {
+                    Some(epoch) => *epoch,
+                    None => self.scope_epoch_tx(&tx, "node", node_id)?,
+                };
                 if latest_epoch != expected_epoch {
                     if first_skip_reason.is_none() {
                         first_skip_reason = Some(format!(
@@ -3050,12 +3290,19 @@ impl Store {
                     first_skip_reason
                         .unwrap_or_else(|| "no candidates listed".to_string()),
                 );
-                return reject(tx, reason);
+                return reject(
+                    tx,
+                    reason,
+                    eviction_savepoint.then_some(preempted.victims.len()),
+                );
             }
         }
 
         if !allocations.is_empty() {
             self.bump_epochs_for_allocations_tx(&tx, &allocations)?;
+        }
+        if eviction_savepoint {
+            tx.execute_batch("RELEASE legion_plan_evictions;")?;
         }
 
         tx.execute(
@@ -3067,6 +3314,9 @@ impl Store {
                 .and_then(|draft| self.stage_event_locked(&tx, draft));
         tx.commit()?;
         self.publish_staged(placed_event);
+        for event in preempted.events {
+            self.publish_staged(Some(event));
+        }
         let fallbacks = candidate_ranks.iter().filter(|rank| **rank > 0).count();
         info!(
             submission_id = submission.id,
@@ -3074,10 +3324,17 @@ impl Store {
             placement_count = placements.len(),
             applied_allocations = allocations.len(),
             fallbacks,
+            preempted_allocations = preempted.victims.len(),
             duration_ms = tx_started.elapsed().as_millis(),
             "Applied plan submission transaction"
         );
 
+        // Mirror maintenance in the same order as every other path: drop the
+        // evicted rows before adding the placements that replaced them, so
+        // the mirror never briefly shows both.
+        if !preempted.victims.is_empty() {
+            self.cache_remove_allocations(&preempted.victims)?;
+        }
         self.cache_add_allocations(&allocations)?;
         let metrics = crate::manager::telemetry::metrics();
         for rank in &candidate_ranks {
@@ -3090,6 +3347,13 @@ impl Store {
         metrics
             .plan_apply_total
             .inc(&[if fallbacks > 0 { "fallback" } else { "applied" }]);
+        if !preempted.victims.is_empty() {
+            let metrics = crate::manager::telemetry::metrics();
+            for (pool, band, count) in preempted.metric_rows {
+                metrics.preemptions_total.inc_by(&[&pool, &band], count);
+            }
+            metrics.preemption_plans_total.inc(&["placed"]);
+        }
 
         Ok(PlanApplyOutcome::Applied(AppliedPlan {
             allocations,
@@ -3124,6 +3388,261 @@ impl Store {
             rows.iter().map(|(id, resources)| (*id, resources)),
             &self.resource_policy,
         ))
+    }
+
+    /// Commit a plan's evictions: delete the victims, release their
+    /// instances, bump their epochs, record their stop notices, requeue their
+    /// jobs, and stage the events — all inside the caller's transaction.
+    ///
+    /// Every one of those is in the same transaction on purpose:
+    ///
+    /// - **Deletes**, so the freed capacity is spent by this plan's
+    ///   placements and by nothing else.
+    /// - **Requeue evals**, so a victim's job cannot be forgotten by a crash
+    ///   between the eviction and the follow-up. Requeue is driven by the
+    ///   job's *desired count*, not by remembering the eviction, which is why
+    ///   the Nomad #9890 class of bug (preempted batch allocations never
+    ///   replaced) cannot exist here: batch victims requeue exactly like
+    ///   service ones, and `regenerate_scheduling_evals` converges any job
+    ///   left under-count after a failover.
+    /// - **Stop notices**, so the owning worker learns the cause — and the
+    ///   preemptor — on its next heartbeat and hands the task a notice file.
+    /// - **Events**, staged (never emitted inline) per the event stream's
+    ///   performance rules.
+    fn apply_plan_evictions_tx(
+        &self,
+        tx: &Connection,
+        submission: &PlanSubmission,
+        evictions: &[PlanEviction],
+    ) -> R<AppliedEvictions> {
+        if evictions.is_empty() {
+            return Ok(AppliedEvictions::default());
+        }
+
+        // Re-read the victims from the live table. The plan named allocation
+        // ids; between planning and apply one may have been stopped or
+        // destroyed by another path. Evicting what is already gone is a
+        // no-op, and the placement that "paid" for it still has the capacity,
+        // because the row it needed freed is gone either way.
+        let ids: Vec<i64> = evictions
+            .iter()
+            .map(|victim| victim.allocation_id)
+            .collect();
+        let placeholders = std::iter::repeat_n("?", ids.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let attrs = crate::storage::queries::ALLOCATION_WITH_JOB_ATTRS;
+        let sql = format!(
+            "SELECT {attrs} FROM allocation \
+             INNER JOIN job_config ON job_config.id = allocation.job_config_id \
+             WHERE allocation.id IN ({placeholders});"
+        );
+        let mut stmt = tx.prepare(&sql)?;
+        let victims = Self::collect_rows(stmt.query_map(params_from_iter(ids.iter()), |row| {
+            self.allocation_from_row(row)
+        })?)?;
+        drop(stmt);
+        if victims.is_empty() {
+            return Ok(AppliedEvictions::default());
+        }
+
+        for victim in &victims {
+            tx.execute("DELETE FROM allocation WHERE id = ?;", [victim.id])?;
+        }
+        self.release_instance_bindings_tx(tx, &victims)?;
+        self.bump_epochs_for_allocations_tx(tx, &victims)?;
+
+        // Who took the capacity, read from the config this plan is placing.
+        let (preemptor_job, preemptor_band): (String, Band) = tx
+            .query_row(
+                "SELECT job_id, priority FROM job_config WHERE id = ?;",
+                [&submission.job_config_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        Band::from_stored(&row.get::<_, String>(1)?),
+                    ))
+                },
+            )
+            .optional()?
+            .unwrap_or_else(|| (submission.job_config_id.clone(), Band::default()));
+
+        self.record_stop_notices_with_preemptor_tx(
+            tx,
+            &victims,
+            StopCause::Preempted,
+            Some((preemptor_job.as_str(), preemptor_band)),
+        )?;
+        let mut events = Vec::new();
+        if let Some(event) = self.stage_stopping_event_tx(tx, &victims, StopCause::Preempted) {
+            events.push(event);
+        }
+
+        // One `job_reschedule` eval per victim job config, at the victim's
+        // own band priority so a displaced `low` job does not jump the queue
+        // ahead of the work that displaced it.
+        let mut requeued: BTreeSet<&str> = BTreeSet::new();
+        for victim in &victims {
+            requeued.insert(victim.job_config_id.as_str());
+        }
+        for job_config_id in requeued {
+            let band = evictions
+                .iter()
+                .find(|eviction| eviction.job_config_id == job_config_id)
+                .map(|eviction| Band::from_stored(&eviction.band))
+                .unwrap_or_default();
+            let job_id = victims
+                .iter()
+                .find(|victim| victim.job_config_id == job_config_id)
+                .map(|victim| victim.job_id.clone())
+                .unwrap_or_default();
+            self.enqueue_eval_tx(
+                tx,
+                "job_reschedule",
+                Some(&job_id),
+                Some(job_config_id),
+                band.eval_priority(),
+            )?;
+        }
+
+        // One event per victim job, so the journal reads as "who lost what to
+        // whom" rather than as one undifferentiated batch.
+        let mut by_job: BTreeMap<&str, Vec<Allocation>> = BTreeMap::new();
+        for victim in &victims {
+            by_job
+                .entry(victim.job_config_id.as_str())
+                .or_default()
+                .push(victim.clone());
+        }
+        for (job_config_id, group) in by_job {
+            let band = evictions
+                .iter()
+                .find(|eviction| eviction.job_config_id == job_config_id)
+                .map(|eviction| Band::from_stored(&eviction.band))
+                .unwrap_or_default();
+            if let Some(event) =
+                drafts::allocations_preempted(&group, band, &preemptor_job, preemptor_band)
+                    .and_then(|draft| self.stage_event_locked(tx, draft))
+            {
+                events.push(event);
+            }
+        }
+
+        // Metric rows, keyed by the victim's pool and band — the two axes an
+        // operator slices preemption rate by.
+        let mut metric_counts: BTreeMap<(String, String), u64> = BTreeMap::new();
+        for victim in &victims {
+            let pool: String = tx
+                .query_row(
+                    "SELECT pool FROM node WHERE id = ?;",
+                    [&victim.node_id],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .unwrap_or_else(|| "default".to_string());
+            let band = evictions
+                .iter()
+                .find(|eviction| eviction.allocation_id == victim.id)
+                .map(|eviction| eviction.band.clone())
+                .unwrap_or_else(|| Band::default().as_str().to_string());
+            *metric_counts.entry((pool, band)).or_default() += 1;
+        }
+
+        Ok(AppliedEvictions {
+            victims,
+            events,
+            metric_rows: metric_counts
+                .into_iter()
+                .map(|((pool, band), count)| (pool, band, count))
+                .collect(),
+        })
+    }
+
+    /// The eval-queue priority implied by a job's priority band.
+    ///
+    /// Prefers the exact config the eval names; falls back to the job's
+    /// latest config when only a job id is given (a `job_reschedule` for a
+    /// job, say). `None` when neither resolves — the caller then uses the
+    /// manager's `default_priority`, which is exactly what an un-banded
+    /// cluster did before bands existed.
+    fn band_eval_priority_tx(
+        &self,
+        tx: &Connection,
+        job_id: Option<&str>,
+        job_config_id: Option<&str>,
+    ) -> Option<i64> {
+        let band: Option<String> = if let Some(job_config_id) = job_config_id {
+            tx.query_row(
+                "SELECT priority FROM job_config WHERE id = ?;",
+                [job_config_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+        } else if let Some(job_id) = job_id {
+            tx.query_row(
+                "SELECT priority FROM job_config WHERE job_id = ? ORDER BY version DESC LIMIT 1;",
+                [job_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+        } else {
+            None
+        };
+        band.map(|band| Band::from_stored(&band).eval_priority())
+    }
+
+    /// Enqueue an eval inside an existing transaction.
+    ///
+    /// The public `enqueue_eval*` family opens its own write transaction,
+    /// which would deadlock (and, worse, break atomicity) when called from
+    /// inside the plan-apply transaction. Victim requeue must ride that
+    /// transaction, so it goes through here.
+    fn enqueue_eval_tx(
+        &self,
+        tx: &Connection,
+        kind: &str,
+        job_id: Option<&str>,
+        job_config_id: Option<&str>,
+        priority: i64,
+    ) -> R<()> {
+        let params = named_params! {
+            ":id": None::<i64>,
+            ":status": "pending",
+            ":type": kind,
+            ":job_id": job_id.filter(|value| !value.trim().is_empty()),
+            ":job_config_id": job_config_id.filter(|value| !value.trim().is_empty()),
+            ":node_id": None::<String>,
+            ":priority": priority,
+            ":ready_at": Self::sortable_now()?,
+        };
+        tx.execute(&INSERT_EVAL, params)?;
+        Ok(())
+    }
+
+    /// Journal what `observe` mode would have done.
+    ///
+    /// Best-effort and outside any transaction: nothing downstream depends on
+    /// it, and a plan must not fail because its evidence event could not be
+    /// written.
+    pub(crate) fn record_observed_preemptions(
+        &self,
+        job_config_id: &str,
+        preemptor_job: &str,
+        preemptor_band: Band,
+        victims: &[crate::manager::scheduler::PlannedPreemption],
+    ) {
+        crate::manager::telemetry::metrics()
+            .preemption_plans_total
+            .inc(&["observe"]);
+        if let Some(draft) =
+            drafts::preemption_planned(job_config_id, preemptor_job, preemptor_band, victims)
+        {
+            self.emit_event(draft);
+        }
     }
 
     pub(crate) fn collect_rows<T, I>(iter: I) -> R<Vec<T>>
@@ -3270,6 +3789,11 @@ impl Store {
             // text `created_at`); creation time is the honest floor for
             // "last changed" when no mtime was ever recorded.
             updated_at: row.get::<_, Option<i64>>(4)?.unwrap_or(created_at),
+            // Empty only for a job with no config rows at all — a job row
+            // written and not yet given a spec. The default is not asserted
+            // here because "no config" and "config says normal" are
+            // genuinely different states to a reader.
+            priority: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
         };
 
         Ok(job)
@@ -3629,6 +4153,8 @@ impl Store {
             volumes: self.parse_volumes_column(25, row.get(25)?)?,
             connect: parse_json_column(26, row.get(26)?)?,
             restart: parse_json_column(27, row.get(27)?)?,
+            stop: parse_json_column(28, row.get(28)?)?,
+            disruption: parse_json_column(29, row.get(29)?)?,
         };
 
         Ok(task_config)
@@ -4130,8 +4656,9 @@ impl Store {
         // be delivered — recorded anyway because "almost never" is not
         // "never": a node removed while still heartbeating (a decommission
         // racing its own worker) does read them.
-        self.record_stop_notices_tx(&tx, &allocs, StopCause::NodeLost)?;
+        let stopping_event = self.record_stop_notices_tx(&tx, &allocs, StopCause::NodeLost)?;
         tx.commit()?;
+        self.publish_staged(stopping_event);
         drop(conn);
 
         // Refresh by allocation SCOPES, not just the node: the bump above
@@ -5336,11 +5863,13 @@ impl Store {
         tx.execute("DELETE FROM instance WHERE job_id = ?1;", [job_id])?;
         tx.execute("DELETE FROM rollout_event WHERE job_id = ?1;", [job_id])?;
         tx.execute("DELETE FROM rollout WHERE job_id = ?1;", [job_id])?;
+        let mut stopping_event = None;
         if !allocs.is_empty() {
             self.bump_epochs_for_allocations_tx(&tx, &allocs)?;
-            self.record_stop_notices_tx(&tx, &allocs, StopCause::Destroy)?;
+            stopping_event = self.record_stop_notices_tx(&tx, &allocs, StopCause::Destroy)?;
         }
         tx.commit()?;
+        self.publish_staged(stopping_event);
         drop(conn);
         if !allocs.is_empty() {
             self.cache_remove_allocations(&allocs)?;
@@ -5453,6 +5982,7 @@ impl Store {
                 let jc = JobConfig {
                     name: row.get(1)?,
                     tasks: tasks_to_replace,
+                    priority: Band::from_stored(&row.get::<_, String>(7)?),
                     rollout,
                     rollout_by_group,
                     version: Some(row.get(4)?),
@@ -5489,6 +6019,7 @@ impl Store {
                 let jc = JobConfig {
                     name: row.get(1)?,
                     tasks: tasks_to_replace,
+                    priority: Band::from_stored(&row.get::<_, String>(7)?),
                     rollout,
                     rollout_by_group,
                     version: Some(row.get(4)?),
@@ -5910,6 +6441,7 @@ impl Store {
             ":version": next_version,
             ":created_at": now,
             ":job_id": job.id,
+            ":priority": config.priority.as_str(),
         };
 
         let (_config, job_config_id): (JobConfig, String) =
@@ -5918,6 +6450,7 @@ impl Store {
                 Ok((
                     JobConfig {
                         name: row.get(1)?,
+                        priority: config.priority,
                         rollout: config.rollout.clone(),
                         rollout_by_group: config.rollout_by_group.clone(),
                         version: Some(row.get(4)?),
@@ -5961,6 +6494,12 @@ impl Store {
                 Some(serde_json::to_string(&t.volumes)?)
             };
             let restart = t.restart.as_ref().map(serde_json::to_string).transpose()?;
+            let stop = t.stop.as_ref().map(serde_json::to_string).transpose()?;
+            let disruption = t
+                .disruption
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?;
             let schedule = t.schedule.as_ref().map(ToString::to_string);
             let task_params = named_params! {
                 ":name": t.name,
@@ -5990,6 +6529,8 @@ impl Store {
                 ":volumes": volumes,
                 ":connect": connect,
                 ":restart": restart,
+                ":stop": stop,
+                ":disruption": disruption,
             };
 
             let task_id: i64 = tx.query_row(&INSERT_TASK, task_params, |row| row.get(0))?;
@@ -7746,6 +8287,11 @@ impl Store {
             ":task_config_id": task_id,
             ":instance_id": instance_id,
             ":network": network_json,
+            // Placement time, for `preemption.victimExemptAge`: an
+            // allocation that just started is never a victim, which is what
+            // keeps a preemption from immediately undoing the placement a
+            // previous one made.
+            ":created_at_unix": OffsetDateTime::now_utc().unix_timestamp(),
         };
 
         let allocation = tx.query_row(&INSERT_ALLOCATION, params, |row| {
@@ -8056,11 +8602,32 @@ impl Store {
     /// [`StopCause::Unknown`] writes nothing — an unknown cause and no
     /// recorded cause are the same fact, and the worker defaults to
     /// `Unknown` anyway.
+    /// Record why these allocations are stopping, and stage the
+    /// `allocation.stopping` event that announces their grace window.
+    ///
+    /// Returns the staged event for the caller to publish after commit —
+    /// staged rather than emitted inline because these are removal-path
+    /// transactions and the event stream's performance rules require it.
+    #[must_use = "the staged allocation.stopping event must be published after commit"]
     fn record_stop_notices_tx(
         &self,
         tx: &Connection,
         removed: &[Allocation],
         cause: StopCause,
+    ) -> R<Option<SchedulerEventRecord>> {
+        self.record_stop_notices_with_preemptor_tx(tx, removed, cause, None)?;
+        Ok(self.stage_stopping_event_tx(tx, removed, cause))
+    }
+
+    /// [`Self::record_stop_notices_tx`], additionally recording *who* took
+    /// the capacity. Only preemption has an answer, so every other caller
+    /// goes through the two-argument form.
+    fn record_stop_notices_with_preemptor_tx(
+        &self,
+        tx: &Connection,
+        removed: &[Allocation],
+        cause: StopCause,
+        preemptor: Option<(&str, Band)>,
     ) -> R<()> {
         if removed.is_empty() || !cause.is_known() {
             return Ok(());
@@ -8080,18 +8647,100 @@ impl Store {
             params![now_unix - STOP_NOTICE_RETENTION_SECS],
         )?;
 
+        let (preemptor_job, preemptor_band) = match preemptor {
+            Some((job, band)) => (Some(job.to_string()), Some(band.as_str().to_string())),
+            None => (None, None),
+        };
+
         for alloc in removed {
             // REPLACE, not INSERT: an allocation id is unique and a second
             // removal of the same id (a retried apply, say) should carry the
             // latest cause rather than fail the transaction it rides in.
             tx.execute(
                 "INSERT OR REPLACE INTO allocation_stop_notice
-                 (allocation_id, node_id, cause, created_at, created_at_unix)
-                 VALUES (?1, ?2, ?3, ?4, ?5);",
-                params![alloc.id, alloc.node_id, cause.as_str(), now, now_unix],
+                 (allocation_id, node_id, cause, created_at, created_at_unix,
+                  preemptor_job, preemptor_band)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7);",
+                params![
+                    alloc.id,
+                    alloc.node_id,
+                    cause.as_str(),
+                    now,
+                    now_unix,
+                    preemptor_job,
+                    preemptor_band
+                ],
             )?;
         }
         Ok(())
+    }
+
+    /// Stage the `allocation.stopping` event for a set of removals.
+    ///
+    /// Separate from [`Self::record_stop_notices_tx`] because the caller owns
+    /// event publication: staged events must be handed to `publish_staged`
+    /// *after* the transaction commits, and the removal paths already do that
+    /// for their own `allocation.removed` drafts.
+    ///
+    /// The grace window in the event is the manager's *expectation*, derived
+    /// from each task's `stop.killAfter`. The worker owns the real clock —
+    /// its window opens when it actually delivers the signal, which is up to
+    /// one heartbeat later.
+    fn stage_stopping_event_tx(
+        &self,
+        tx: &Connection,
+        removed: &[Allocation],
+        cause: StopCause,
+    ) -> Option<SchedulerEventRecord> {
+        if removed.is_empty() || !cause.is_known() {
+            return None;
+        }
+        // One statement for the whole batch: `task_config` rows outlive the
+        // allocations that reference them (they belong to the job config), so
+        // this is safe whether the caller has already issued its DELETEs or
+        // not.
+        let grace = self
+            .stop_grace_by_task_tx(tx, removed)
+            .unwrap_or_else(|err| {
+                debug!(error = ?err, "Failed reading stop ladders for allocation.stopping");
+                HashMap::new()
+            });
+        drafts::allocations_stopping(removed, cause, &grace)
+            .and_then(|draft| self.stage_event_locked(tx, draft))
+    }
+
+    /// `stop.killAfter` seconds per task config id, for the allocations
+    /// given. Tasks with no `stop` block fall back to the built-in default.
+    fn stop_grace_by_task_tx(
+        &self,
+        tx: &Connection,
+        removed: &[Allocation],
+    ) -> R<HashMap<i64, u64>> {
+        let task_ids: BTreeSet<i64> = removed
+            .iter()
+            .map(|alloc| alloc.task_config_id)
+            .collect::<BTreeSet<_>>();
+        if task_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let placeholders = std::iter::repeat_n("?", task_ids.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!("SELECT id, stop FROM task_config WHERE id IN ({placeholders});");
+        let mut stmt = tx.prepare(&sql)?;
+        let rows =
+            Self::collect_rows(stmt.query_map(params_from_iter(task_ids.iter()), |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?))
+            })?)?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, raw)| {
+                let stop = raw
+                    .and_then(|raw| serde_json::from_str::<crate::structs::StopConfig>(&raw).ok())
+                    .unwrap_or_default();
+                (id, stop.kill_after.as_secs())
+            })
+            .collect())
     }
 
     /// The live stop notices for one node, for its heartbeat reply.
@@ -8101,24 +8750,27 @@ impl Store {
     /// [`Self::record_stop_notices_tx`], which is already a scheduler-lane
     /// write). Notices past the retention window are filtered out here so a
     /// prune that has not run yet cannot resurrect a stale cause.
-    pub fn stop_notices_for_node(&self, node_id: &str) -> R<Vec<(i64, StopCause)>> {
+    pub fn stop_notices_for_node(&self, node_id: &str) -> R<Vec<StoredStopNotice>> {
         let cutoff = OffsetDateTime::now_utc().unix_timestamp() - STOP_NOTICE_RETENTION_SECS;
 
         let conn = self.read_connection()?;
         let mut stmt = conn.prepare(
-            "SELECT allocation_id, cause FROM allocation_stop_notice
+            "SELECT allocation_id, cause, preemptor_job, preemptor_band
+             FROM allocation_stop_notice
              WHERE node_id = ?1 AND created_at_unix >= ?2;",
         )?;
         let notices = Self::collect_rows(stmt.query_map(params![node_id, cutoff], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            Ok(StoredStopNotice {
+                allocation_id: row.get::<_, i64>(0)?,
+                cause: StopCause::from_wire(&row.get::<_, String>(1)?),
+                preemptor_job: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                preemptor_band: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
+            })
         })?)?;
         drop(stmt);
         drop(conn);
 
-        Ok(notices
-            .into_iter()
-            .map(|(id, cause)| (id, StopCause::from_wire(&cause)))
-            .collect())
+        Ok(notices)
     }
 
     /// After allocation rows are deleted, transition the instances they
@@ -8943,8 +9595,10 @@ impl Store {
         tx.execute("DELETE FROM allocation WHERE id = ?;", [allocation_id])?;
         self.release_instance_bindings_tx(&tx, std::slice::from_ref(&allocation))?;
         self.bump_job_config_epoch_tx(&tx, &allocation.job_config_id)?;
-        self.record_stop_notices_tx(&tx, std::slice::from_ref(&allocation), cause)?;
+        let stopping_event =
+            self.record_stop_notices_tx(&tx, std::slice::from_ref(&allocation), cause)?;
         tx.commit()?;
+        self.publish_staged(stopping_event);
 
         self.cache_remove_allocations(std::slice::from_ref(&allocation))?;
 
@@ -9078,8 +9732,9 @@ impl Store {
         tx.execute(sql, params)?;
         self.release_instance_bindings_tx(&tx, &allocations)?;
         self.bump_epochs_for_allocations_tx(&tx, &allocations)?;
-        self.record_stop_notices_tx(&tx, &allocations, StopCause::Stop)?;
+        let stopping_event = self.record_stop_notices_tx(&tx, &allocations, StopCause::Stop)?;
         tx.commit()?;
+        self.publish_staged(stopping_event);
         drop(conn);
 
         self.cache_remove_allocations(&allocations)?;
@@ -9114,8 +9769,9 @@ impl Store {
         self.bump_job_config_epoch_tx(&tx, job_config_id)?;
         // A superseded job config's allocations are cleaned up because a
         // newer config replaced them.
-        self.record_stop_notices_tx(&tx, &allocations, StopCause::Update)?;
+        let stopping_event = self.record_stop_notices_tx(&tx, &allocations, StopCause::Update)?;
         tx.commit()?;
+        self.publish_staged(stopping_event);
         drop(conn);
 
         self.cache_remove_allocations(&allocations)?;
@@ -9459,10 +10115,11 @@ impl Store {
         // Every removal records WHY, in the same transaction that removes it
         // (preemption plan § Phase 1a). Scale-in gets its own cause rather
         // than borrowing `Update`: no new job config version exists here.
-        self.record_stop_notices_tx(&tx, &surplus, StopCause::ScaleIn)?;
+        let stopping_event = self.record_stop_notices_tx(&tx, &surplus, StopCause::ScaleIn)?;
         self.release_instance_bindings_tx(&tx, &surplus)?;
         self.bump_epochs_for_allocations_tx(&tx, &surplus)?;
         tx.commit()?;
+        self.publish_staged(stopping_event);
         drop(conn);
 
         self.cache_remove_allocations(&surplus)?;
@@ -9710,8 +10367,9 @@ impl Store {
         }
         self.release_instance_bindings_tx(&tx, allocs)?;
         self.bump_epochs_for_allocations_tx(&tx, allocs)?;
-        self.record_stop_notices_tx(&tx, allocs, cause)?;
+        let stopping_event = self.record_stop_notices_tx(&tx, allocs, cause)?;
         tx.commit()?;
+        self.publish_staged(stopping_event);
 
         self.cache_remove_allocations(allocs)?;
 
@@ -10470,8 +11128,9 @@ impl Store {
             params![now, instance_id],
         )?;
         self.bump_epochs_for_allocations_tx(&tx, &allocations)?;
-        self.record_stop_notices_tx(&tx, &allocations, StopCause::Destroy)?;
+        let stopping_event = self.record_stop_notices_tx(&tx, &allocations, StopCause::Destroy)?;
         tx.commit()?;
+        self.publish_staged(stopping_event);
 
         self.cache_remove_allocations(&allocations)?;
 
@@ -10566,8 +11225,9 @@ impl Store {
             params![now, instance_id],
         )?;
         self.bump_epochs_for_allocations_tx(&tx, &allocations)?;
-        self.record_stop_notices_tx(&tx, &allocations, StopCause::Stop)?;
+        let stopping_event = self.record_stop_notices_tx(&tx, &allocations, StopCause::Stop)?;
         tx.commit()?;
+        self.publish_staged(stopping_event);
 
         self.cache_remove_allocations(&allocations)?;
 
@@ -11516,6 +12176,17 @@ impl Store {
         let ready_at =
             Self::sortable_timestamp(OffsetDateTime::now_utc() + time::Duration::try_from(delay)?)?;
 
+        // One field, both meanings: with no explicit override the eval
+        // inherits its job's priority band, so importance orders the queue
+        // AND governs preemption. An explicit `--priority`/`--asap` still
+        // wins — it is a per-submission queue override, not a band change.
+        let priority = match priority {
+            Some(explicit) => explicit,
+            None => self
+                .band_eval_priority_tx(&tx, job_id_value.as_deref(), job_config_id_value.as_deref())
+                .unwrap_or(self.default_eval_priority),
+        };
+
         let params = named_params! {
             ":id": None::<i64>,
             ":status": "pending",
@@ -11523,7 +12194,7 @@ impl Store {
             ":job_id": job_id_value,
             ":job_config_id": job_config_id_value,
             ":node_id": node_id_value,
-            ":priority": priority.unwrap_or(self.default_eval_priority),
+            ":priority": priority,
             ":ready_at": ready_at,
         };
 
@@ -11537,7 +12208,7 @@ impl Store {
             job_id: job_id_value.unwrap_or_default(),
             job_config_id: job_config_id_value.unwrap_or_default(),
             node_name: node_id_value.unwrap_or_default(),
-            priority: priority.unwrap_or(self.default_eval_priority),
+            priority,
         };
 
         // The `eval.enqueued` event rides the SAME transaction as the eval
@@ -14089,6 +14760,7 @@ mod tests {
 
         // Place allocations through the real plan/apply path.
         let job = JobConfig {
+            priority: Default::default(),
             name: "pool-prop".into(),
             tasks: vec![TaskConfig {
                 count: TaskCount::new(2),
@@ -14253,6 +14925,7 @@ mod tests {
             ..task("worker")
         };
         let job = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "identity-persist".into(),
@@ -14300,6 +14973,7 @@ mod tests {
             timeout: None,
         }];
         let job = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "actions-persist".into(),
@@ -14324,6 +14998,7 @@ mod tests {
     fn tasks_without_identities_round_trip_empty() -> R<()> {
         let store = setup_store()?;
         let job = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "no-identity-persist".into(),
@@ -14350,6 +15025,7 @@ mod tests {
         store.insert_node(make_node_msg("node-one", "ready"))?;
 
         let job = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "cache-allocs".into(),
@@ -14396,6 +15072,7 @@ mod tests {
         let store = setup_store()?;
 
         let job = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "cache-tasks".into(),
@@ -14423,6 +15100,7 @@ mod tests {
         assert_eq!(tasks[0].1.name, "alpha");
 
         let updated_job = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: job.name.clone(),
@@ -14567,6 +15245,7 @@ mod tests {
         store.insert_node(make_node_msg("node-two", "active"))?;
 
         let job = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "lost-reschedule".into(),
@@ -14903,6 +15582,7 @@ mod tests {
         let task_configs = vec![task_one.clone(), task_two.clone()];
         let job_name = "test".to_string();
         let job_config = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: job_name.clone(),
@@ -14970,6 +15650,7 @@ mod tests {
 
         let job_name = "rollback-job".to_string();
         let job_config = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: job_name.clone(),
@@ -15016,6 +15697,7 @@ mod tests {
 
         let orig_task_configs = vec![orig_task.clone()];
         let job_config = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "jobname".into(),
@@ -15130,6 +15812,7 @@ mod tests {
 
         let orig_task_configs = vec![orig_task.clone()];
         let job_config = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "jobname".into(),
@@ -15174,6 +15857,7 @@ mod tests {
             ..TaskConfig::new("job-one-task-2", "driver-b")
         };
         let job_one_config = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: job_one_name.clone(),
@@ -15198,6 +15882,7 @@ mod tests {
             ..TaskConfig::new("job-two-task-1", "driver-c")
         };
         let job_two_config = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: job_two_name.clone(),
@@ -15296,6 +15981,7 @@ mod tests {
 
         let job_name = "solo-job".to_string();
         let job_config = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: job_name.clone(),
@@ -15354,6 +16040,7 @@ mod tests {
         let tasks = vec![TaskConfig::new("task-shared", "runtime")];
 
         let job_one_config = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "job-one".into(),
@@ -15362,6 +16049,7 @@ mod tests {
         };
 
         let job_two_config = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "job-two".into(),
@@ -15661,6 +16349,7 @@ mod tests {
         store.insert_node(make_node_msg("node-b", "ready"))?;
 
         let job_one = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "job-one".into(),
@@ -15668,6 +16357,7 @@ mod tests {
             version: None,
         };
         let job_two = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "job-two".into(),
@@ -15737,6 +16427,7 @@ mod tests {
         store.insert_node(make_node_msg("node-a", "ready"))?;
 
         let job = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "job-epoch".into(),
@@ -15768,6 +16459,7 @@ mod tests {
         store.insert_node(make_node_msg("node-a", "ready"))?;
 
         let job_v1 = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "job-migrate".into(),
@@ -15790,6 +16482,7 @@ mod tests {
         let mut v2_task = TaskConfig::new("task", "noop");
         v2_task.config = json!({"changed": true});
         let job_v2 = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "job-migrate".into(),
@@ -15829,6 +16522,7 @@ mod tests {
         store.insert_node(make_node_msg("node-b", "ready"))?;
 
         let job = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "job-candidates".into(),
@@ -15898,6 +16592,7 @@ mod tests {
         store.insert_node(make_node_msg("node-a", "ready"))?;
 
         let job = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "job-generation".into(),
@@ -15940,6 +16635,7 @@ mod tests {
         store.insert_node(make_node_msg("node-b", "ready"))?;
 
         let job = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "job-lazy".into(),
@@ -15982,6 +16678,7 @@ mod tests {
 
     fn submit_named_job(store: &Store, name: &str) -> R<(String, i64)> {
         let job = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: name.into(),
@@ -16027,18 +16724,21 @@ mod tests {
                 mode: "fresh".into(),
                 placements: PlanPlacements::Nodes(vec![("node-a".to_string(), task_a)]),
                 expected_versions: versions_a,
+                evictions: Vec::new(),
             },
             PlanApplyRequest {
                 job_config_id: job_b.clone(),
                 mode: "fresh".into(),
                 placements: PlanPlacements::Nodes(vec![("node-c".to_string(), 999_999)]),
                 expected_versions: versions_b,
+                evictions: Vec::new(),
             },
             PlanApplyRequest {
                 job_config_id: job_c.clone(),
                 mode: "fresh".into(),
                 placements: PlanPlacements::Nodes(vec![("node-b".to_string(), task_c)]),
                 expected_versions: versions_c,
+                evictions: Vec::new(),
             },
         ]);
 
@@ -16078,6 +16778,7 @@ mod tests {
             mode: "fresh".into(),
             placements: PlanPlacements::Nodes(vec![("node-a".to_string(), task_b)]),
             expected_versions: stale,
+            evictions: Vec::new(),
         }]);
         assert!(
             matches!(results[0], Ok((_, PlanApplyOutcome::Rejected { .. }))),
@@ -16114,6 +16815,7 @@ mod tests {
                         "fresh",
                         &[(node, task_id)],
                         &versions,
+                        &[],
                     )
                 })
             })
@@ -16135,6 +16837,7 @@ mod tests {
         store.insert_node(make_node_msg("node-a", "ready"))?;
 
         let job = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "job-stale".into(),
@@ -16189,6 +16892,7 @@ mod tests {
         store.insert_node(make_node_msg("node-a", "ready"))?;
 
         let make_job = |name: &str, task_name: &str| JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: name.into(),
@@ -16251,6 +16955,7 @@ mod tests {
             task
         };
         let job = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "job-constraints".into(),
@@ -16311,6 +17016,7 @@ mod tests {
             rollout_by_group: Default::default(),
             name: name.into(),
             tasks: vec![task],
+            priority: Band::default(),
             version: None,
         };
         store.handle_job_submit(
@@ -16608,6 +17314,7 @@ mod tests {
         store.insert_node(make_node_msg("node-a", "ready"))?;
 
         let job = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "status-demo".into(),
@@ -16665,6 +17372,7 @@ mod tests {
         store.insert_node(node)?;
 
         let job = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "batch-exit-demo".into(),
@@ -16737,6 +17445,7 @@ mod tests {
         store.insert_node(make_node_msg("node-a", "ready"))?;
 
         let job = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "artifact-events".into(),
@@ -16815,6 +17524,7 @@ mod tests {
     /// Seed a one-task job and place an allocation for it on `node_id`.
     fn seed_placed_allocation(store: &Store, job_name: &str, node_id: &str) -> R<Allocation> {
         let job = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: job_name.into(),
@@ -16843,6 +17553,7 @@ mod tests {
         store.insert_node(make_node_msg("node-a", "ready"))?;
 
         let job = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "scale-cause".into(),
@@ -16882,7 +17593,11 @@ mod tests {
         assert_eq!(retired[0].id, second.id.max(first.id));
 
         assert_eq!(
-            store.stop_notices_for_node("node-a")?,
+            store
+                .stop_notices_for_node("node-a")?
+                .into_iter()
+                .map(|notice| (notice.allocation_id, notice.cause))
+                .collect::<Vec<_>>(),
             vec![(retired[0].id, StopCause::ScaleIn)],
             "a scaled-in allocation reports scale_in, not update"
         );
@@ -16901,7 +17616,11 @@ mod tests {
 
         store.remove_allocation_by_id_because(allocation.id, StopCause::Drain)?;
 
-        let notices = store.stop_notices_for_node("node-a")?;
+        let notices = store
+            .stop_notices_for_node("node-a")?
+            .into_iter()
+            .map(|notice| (notice.allocation_id, notice.cause))
+            .collect::<Vec<_>>();
         assert_eq!(
             notices,
             vec![(allocation.id, StopCause::Drain)],
@@ -16978,7 +17697,11 @@ mod tests {
         )?;
         assert_eq!(remaining, 0, "the expired row was pruned by the next write");
         assert_eq!(
-            store.stop_notices_for_node("node-a")?,
+            store
+                .stop_notices_for_node("node-a")?
+                .into_iter()
+                .map(|notice| (notice.allocation_id, notice.cause))
+                .collect::<Vec<_>>(),
             vec![(second.id, StopCause::Stop)],
             "the live notice survives the prune"
         );
@@ -16995,7 +17718,11 @@ mod tests {
         // indistinguishable from a drain or an update on the wire.
         store.remove_allocs_for_job("cause-demo")?;
         assert_eq!(
-            store.stop_notices_for_node("node-a")?,
+            store
+                .stop_notices_for_node("node-a")?
+                .into_iter()
+                .map(|notice| (notice.allocation_id, notice.cause))
+                .collect::<Vec<_>>(),
             vec![(allocation.id, StopCause::Stop)]
         );
 
@@ -17017,6 +17744,7 @@ mod tests {
         store.insert_node(make_node_msg("node-b", "ready"))?;
 
         let job = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "health-demo".into(),
@@ -17286,6 +18014,7 @@ mod tests {
         store.insert_node(NodeMsg::from(make_node("events-node")))?;
 
         let job = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "events-job".into(),
@@ -17323,6 +18052,7 @@ mod tests {
         let store = setup_store()?;
 
         let v1 = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "rollout-events".into(),
@@ -17336,6 +18066,7 @@ mod tests {
         let v1_id = store.get_job_config(&v1.name)?.id();
 
         let v2 = JobConfig {
+            priority: Default::default(),
             rollout: Some(RolloutConfig {
                 replacement: Some(crate::structs::RolloutReplacement::CreateFirst),
                 ..RolloutConfig::default()
@@ -17413,6 +18144,7 @@ mod tests {
         store.insert_node(make_node_msg("node-b", "ready"))?;
 
         let v1 = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "reconcile-incomplete".into(),
@@ -17430,6 +18162,7 @@ mod tests {
         let v1_id = store.get_job_config(&v1.name)?.id();
 
         let v2 = JobConfig {
+            priority: Default::default(),
             rollout: Some(RolloutConfig::default()),
             rollout_by_group: Default::default(),
             name: "reconcile-incomplete".into(),
@@ -17484,6 +18217,7 @@ mod tests {
         store.insert_node(make_node_msg("node-b", "ready"))?;
 
         let v1 = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "reconcile-incomplete-loop".into(),
@@ -17501,6 +18235,7 @@ mod tests {
         let v1_id = store.get_job_config(&v1.name)?.id();
 
         let v2 = JobConfig {
+            priority: Default::default(),
             rollout: Some(RolloutConfig::default()),
             rollout_by_group: Default::default(),
             name: "reconcile-incomplete-loop".into(),
@@ -17568,6 +18303,7 @@ mod tests {
 
     fn submit_job(store: &Store, name: &str, tasks: Vec<TaskConfig>) -> R<String> {
         let config = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: name.into(),
@@ -18920,6 +19656,7 @@ mod tests {
     fn submit_versioned_job(store: &Store, name: &str, marker: &str) -> R<()> {
         let task = TaskConfig::new(marker, "noop");
         let job = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: name.into(),
@@ -19104,6 +19841,7 @@ mod tests {
 
     fn submit_service_job(store: &Store, name: &str, tasks: Vec<TaskConfig>) -> R<()> {
         let job = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: name.into(),
@@ -19394,6 +20132,7 @@ mod tests {
     fn template_provenance_rides_job_config_meta() -> R<()> {
         let store = setup_store()?;
         let config = JobConfig {
+            priority: Default::default(),
             name: "tpl-job".into(),
             rollout: None,
             rollout_by_group: BTreeMap::new(),
@@ -19920,6 +20659,7 @@ mod tests {
         for store in [&src, &dst] {
             store.insert_node(make_node_msg("node-a", "ready"))?;
             let job = JobConfig {
+                priority: Default::default(),
                 rollout: None,
                 rollout_by_group: Default::default(),
                 name: "proj-demo".into(),
@@ -19969,6 +20709,7 @@ mod tests {
     fn an_unchanged_resubmit_reseeds_missing_task_statuses() -> R<()> {
         let store = setup_store()?;
         let job = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "reseed-demo".into(),

@@ -1337,6 +1337,7 @@ mod tests {
             last_heartbeat: "2026-01-01 00:00:00 +00:00:00".into(),
         })?;
         let job = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "claims-job".into(),

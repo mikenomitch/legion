@@ -81,6 +81,7 @@ fn submit_job(store: &Store, name: &str) -> R<()> {
             resources: json!({ "memory": 200 }),
             ..TaskConfig::new("api", "noop")
         }],
+        priority: Default::default(),
         version: None,
     };
     store.handle_job_submit(

@@ -483,3 +483,34 @@ distinguished by one branch on the setting.
 path — it is what an operator falls back to under mixed versions. (b)
 stays a backlog item, tracked with the candidate-construction benchmark
 numbers that would justify it.
+
+## 21. Preemptive placements are pinned; the walk reads pre-eviction epochs
+
+**Call.** Preemption landed on `main` while this branch was open. The merge
+composes them two ways. A placement that only fits because victims were
+chosen for it keeps a **singleton** candidate list — the planner already
+narrows `eligible` to the node whose victims paid for it, so this falls out
+of the existing construction rather than being a special case. And because
+the plan's evictions commit inside the same transaction as the walk, and
+evicting bumps the victim nodes' allocation epochs, the walk compares each
+candidate against the node's epoch **as of transaction start**, captured
+for the eviction nodes just before the deletes.
+
+**Alternatives.** (a) Let preemptive placements carry a full candidate list
+— they would then be free to bind a node the evictions did not free, while
+the victims still died on the original node. Wrong in the way this feature
+must never be wrong. (b) Run the walk's epoch checks before applying the
+evictions — but the walk's capacity recheck (entry 17) has to see the
+capacity the evictions freed, so the evictions must come first.
+(c) Skip the epoch check for eviction nodes entirely — that would drop the
+fence exactly where a competing plan is most likely to have raced.
+
+**Trade-off.** One extra epoch read per eviction node (a set of one or two
+in practice), and a rule the reader has to know: "our own writes are not
+someone else's writes".
+
+**Why (correctness, simplicity).** The fence asks whether anything *else*
+changed the node since planning; a plan's own evictions are not something
+else. Reading the pre-eviction value states that in code, and keeps every
+other candidate on the same rule as before.
+

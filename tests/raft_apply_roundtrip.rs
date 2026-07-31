@@ -69,6 +69,7 @@ fn test_node(id: &str) -> Node {
 
 fn test_job(name: &str) -> JobConfig {
     JobConfig {
+        priority: Default::default(),
         rollout: None,
         rollout_by_group: Default::default(),
         name: name.to_string(),
@@ -350,6 +351,7 @@ fn concurrent_plan_applies_group_commit_with_isolation() -> R<()> {
                         "fresh",
                         &[(node_id, task_id)],
                         &versions,
+                        &[],
                     ),
                 )
             })
@@ -446,6 +448,7 @@ fn concurrent_planners_cannot_oversubscribe(topology: &str) -> R<()> {
         let mut task = TaskConfig::new("svc", "noop");
         task.resources = json!({ "memory": 3000 });
         let job = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: name.to_string(),

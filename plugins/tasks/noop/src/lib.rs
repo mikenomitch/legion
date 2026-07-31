@@ -85,6 +85,11 @@ impl TaskPlugin for NoopTaskPlugin {
     }
 }
 
+// Declares which TaskPlugin vtable this dylib was built against. Without it
+// the worker refuses to load the plugin rather than calling into a layout it
+// cannot verify (see docs/task-runtime-plugins.md).
+legion::declare_task_plugin_abi!();
+
 #[no_mangle]
 pub extern "C" fn get() -> Box<dyn TaskPlugin> {
     Box::new(NoopTaskPlugin::default())

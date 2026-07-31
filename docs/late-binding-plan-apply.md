@@ -49,6 +49,14 @@ manager-level `schedulerSettings`.
   sampling) runs at plan time on the planning manager. Apply is a pure
   function of the submission and committed state, so raft replicas hold
   identical results.
+- **Preemptive placements carry a singleton list.** When a placement only
+  fits because the planner chose to displace lower-band work
+  ([preemption-and-eviction.md](preemption-and-eviction.md)), it is pinned
+  to the node whose victims it paid for — there is no fallback, because a
+  fallback would land the placement on a node the eviction did not free.
+  The plan's evictions are applied in the same transaction as the walk, and
+  the walk compares each candidate's epoch against its value *before* those
+  evictions, so a preemptive plan never conflicts with itself.
 - **Candidate submissions group-commit like any other plan.** Plans
   queued while a commit is in flight batch into one replicated op, each
   keeping its own verdict inside a per-plan savepoint (see

@@ -54,6 +54,25 @@ What they measure:
     indexes off vs on ([scheduling-indexes.md](scheduling-indexes.md)), at
     1k/5k/10k nodes. Scheduler changes ship with before/after numbers from
     this group (see AGENTS.md).
+
+    **Measure the noise floor before believing a delta.** On a shared or
+    virtualized host this group's 5k/10k cases routinely swing ±10% run to
+    run, and Criterion will report that swing as "Performance has regressed"
+    with `p = 0.00` — the p-value tests whether two *samples* differ, not
+    whether the *code* does. Run the base commit against its own saved
+    baseline first:
+
+    ```console
+    $ git checkout <base> && cargo bench --bench scheduler_bench -- \
+        candidate_construction --save-baseline base
+    $ cargo bench --bench scheduler_bench -- candidate_construction --baseline base
+    # base vs base: whatever this reports is noise, not signal
+    $ git checkout <branch> && cargo bench --bench scheduler_bench -- \
+        candidate_construction --baseline base
+    ```
+
+    A change is only real if it exceeds that floor. Report both, and say which
+    it is.
 - `eval_critical_path_bench`: end-to-end enqueue -> claim -> apply -> complete
   latency under 1/4/8 concurrent eval workers (write-lock contention).
 - `plan_contention`: N-way concurrent single-allocation submits against one

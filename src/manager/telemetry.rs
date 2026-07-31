@@ -333,8 +333,18 @@ impl CounterVec {
     /// Increment the series identified by `labels` (one value per declared
     /// label name, in order).
     pub fn inc(&self, labels: &[&str]) {
+        self.inc_by(labels, 1);
+    }
+
+    /// Add `count` to the series identified by `labels`. For batched events
+    /// (a plan evicting several allocations of one job) where one increment
+    /// per item would be pure overhead.
+    pub fn inc_by(&self, labels: &[&str], count: u64) {
         debug_assert_eq!(labels.len(), self.meta.labels.len());
-        self.series.cell(labels, CounterCell::default).inc();
+        let cell = self.series.cell(labels, CounterCell::default);
+        for _ in 0..count {
+            cell.inc();
+        }
     }
 
     /// Current value of a series (0 when it does not exist). Test/inspection
@@ -628,6 +638,11 @@ pub struct Metrics {
     pub scheduler_plan_candidate_rank: Arc<Histogram>,
     /// `legion_eval_conflict_requeues_total`
     pub eval_conflict_requeues_total: Arc<Counter>,
+    /// `legion_preemptions_total{pool,band}` — victims actually evicted.
+    pub preemptions_total: Arc<CounterVec>,
+    /// `legion_preemption_plans_total{outcome}` — preemption passes that
+    /// reached a decision: `placed`, `observe`, or `no_victims`.
+    pub preemption_plans_total: Arc<CounterVec>,
     /// `legion_heartbeats_total`
     pub heartbeats_total: Arc<Counter>,
     /// `legion_nodes{status}`
@@ -730,6 +745,22 @@ impl Metrics {
                 labels: &[],
             },
             cell: CounterCell::default(),
+        });
+        let preemptions_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_preemptions_total",
+                help: "Allocations evicted by scheduler preemption, by the victim's node pool and priority band.",
+                labels: &["pool", "band"],
+            },
+            series: Series::new(),
+        });
+        let preemption_plans_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_preemption_plans_total",
+                help: "Preemption passes that reached a decision, by outcome (placed|observe|no_victims).",
+                labels: &["outcome"],
+            },
+            series: Series::new(),
         });
         let heartbeats_total = Arc::new(Counter {
             meta: FamilyMeta {
@@ -908,6 +939,8 @@ impl Metrics {
             Arc::clone(&nodes) as Arc<dyn RenderMetric>,
             Arc::clone(&eval_conflict_requeues_total) as Arc<dyn RenderMetric>,
             Arc::clone(&plan_apply_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&preemption_plans_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&preemptions_total) as Arc<dyn RenderMetric>,
             Arc::clone(&raft_applied_index) as Arc<dyn RenderMetric>,
             Arc::clone(&raft_apply_lag) as Arc<dyn RenderMetric>,
             Arc::clone(&raft_capture_seconds) as Arc<dyn RenderMetric>,
@@ -936,6 +969,8 @@ impl Metrics {
             plan_apply_total,
             scheduler_plan_candidate_rank,
             eval_conflict_requeues_total,
+            preemptions_total,
+            preemption_plans_total,
             heartbeats_total,
             nodes,
             allocations,

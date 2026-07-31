@@ -573,6 +573,7 @@ fn test_job(name: &str, count: u32) -> JobConfig {
     let mut task = TaskConfig::new("svc", "noop");
     task.count = legion::structs::job::TaskCount::new(count);
     JobConfig {
+        priority: Default::default(),
         rollout: None,
         rollout_by_group: Default::default(),
         name: name.to_string(),

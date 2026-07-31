@@ -86,6 +86,7 @@ fn make_jobs(total_allocations: usize) -> Vec<JobConfig> {
             ..TaskConfig::new(format!("task-{job_idx}"), "noop")
         };
         jobs.push(JobConfig {
+            priority: Default::default(),
             name: format!("bench-job-{job_idx}"),
             tasks: vec![task],
             rollout: None,
@@ -195,6 +196,7 @@ fn make_constrained_job(task_count: usize, per_task: u32) -> JobConfig {
         })
         .collect();
     JobConfig {
+        priority: Default::default(),
         name: "bench-candidates".into(),
         tasks,
         rollout: None,

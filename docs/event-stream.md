@@ -16,7 +16,10 @@ from the CLI, the MCP server, the UI, and raw gRPC.
 | `eval.failed` | error | An eval handler returned an error. |
 | `eval.requeued` | warn | An eval exhausted its plan-conflict retries and was released back to pending with a delay instead of failing (docs/late-binding-plan-apply.md). |
 | `allocation.placed` | info | A plan was applied; one event per apply, with placement details in metadata — including `candidateRank` per placement (0 = first choice) and a `fallbacks` count. |
-| `allocation.removed` | info/warn | Allocations were removed (job stop/update: info; node loss: warn). Metadata carries `cause` — `stop`, `update`, `drain`, `reschedule`, `destroy`, or `node_lost` — omitted when no cause was recorded. See [Stop Causes](graceful-stop.md). |
+| `allocation.removed` | info/warn | Allocations were removed (job stop/update: info; node loss: warn). Metadata carries `cause` — `stop`, `update`, `drain`, `reschedule`, `destroy`, `node_lost`, `scale_in`, or `preempted` — omitted when no cause was recorded. See [Graceful Stop](graceful-stop.md). |
+| `allocation.stopping` | info | Allocations entered their grace window. Metadata carries `cause`, `maxGraceSeconds`, and per-allocation `graceSeconds`. The window is the manager's expectation; the worker's real clock starts when it delivers the signal. See [Graceful Stop](graceful-stop.md). |
+| `allocation.preempted` | warn | Allocations were displaced to make room for higher-band work. Metadata carries the victim's `band` plus `preemptorJob` and `preemptorBand` — the bidirectional link. One event per victim job. See [Preemption and Eviction](preemption-and-eviction.md). |
+| `allocation.preempt_planned` | info | `preemption.mode: observe` only: the victim selection ran and committed nothing. Metadata lists the `victims` enforce mode would have taken. |
 | `allocation.failed` | warn | A worker reported an allocation failure (includes the reason). |
 | `allocation.terminated` | info/warn | A task's process exited and the allocation reached a terminal state without being rescheduled (info when the exit was a success, warn otherwise). Metadata carries `success` and the exit message — see [Task Supervision](task-supervision.md). |
 | `allocation.plan_rejected` | warn | A placement plan was rejected by optimistic concurrency (will be retried). |

@@ -19,7 +19,6 @@ How to use it:
 
 | PR | What it lands | Notes |
 | --- | --- | --- |
-| (branch `claude/pre-benchmark-features-mlgzyx`) | Pre-benchmark hardening: apply-time resource re-validation, raft engine metrics, worker /metrics + OTLP push, eval-path fixes, scheduler plan-path cleanups, `legion job scale` (autoscaler phase 1) | [calls](calls/pre-benchmark-hardening_calls.md) · [autoscaler calls #5/#7](calls/autoscaler-plan_calls.md) |
 | [#162](https://github.com/mikenomitch/legion/pull/162) | Lanes hardening: worker-write forwarding, split-tolerant submits, adversarial fixes | Plan §8 + calls doc in [durability-and-ops-execution-plan.md](plans/durability-and-ops-execution-plan.md) |
 | [#143](https://github.com/mikenomitch/legion/pull/143) | Note the node-level builtin resource override gap | Docs only; the fix itself is a todo below |
 | [#84](https://github.com/mikenomitch/legion/pull/84) | Instrument DB hot paths, batch task-status updates | Old; rebase or close |
@@ -51,49 +50,36 @@ How to use it:
       routing plain single-task capacity failures through it too.
 - [ ] Worker groups + taint/toleration equivalent. Node pools exist as an ACL
       and config concept but nothing scheduling-side consumes them.
-- [ ] Priorities and eviction/preemption, with eviction toggled at the pool level
-      — [plan](plans/preemption-and-eviction-plan.md) (IN EXECUTION: stop causes
-      → graceful termination → priority bands → plan-atomic preemption →
-      governance; pool toggle is `schedulerSettings.preemption.disabledPools`)
-  - [x] **Phase 1a — stop causes.** Every allocation removal records *why*
-        (`stop`/`update`/`drain`/`reschedule`/`destroy`/`node_lost`), delivered
-        to the owning worker on its next heartbeat and carried in
-        `allocation.removed` event metadata.
-        [plan §Phase 1a](plans/preemption-and-eviction-plan.md) ·
-        [docs](../docs/graceful-stop.md)
-  - [ ] **Phase 1b — graceful termination.** `stop { signal, killAfter }`,
-        per-runtime SIGTERM→SIGKILL ladders, the `LEGION_STOP_NOTICE_PATH`
-        file, `allocation.stopping`, stops-before-starts reconcile ordering.
-        **Blocked on a worker-side terminating set**: `reconcile_allocations`
-        runs under the task-manager mutex inside the heartbeat loop, so a
-        blocking grace wait would stall heartbeats and the self-fence watchdog
-        and get the node declared lost. `stop_with` must signal and return,
-        with a reaper doing the SIGKILL — and teardown (notably
-        `volumes.unmount_for_allocation`) must move behind actual process
-        exit. [plan §Phase 1b](plans/preemption-and-eviction-plan.md)
-  - [ ] Decide Phase 1b's grace-vs-latency question: stops-before-starts puts a
-        victim's shutdown on the preemptor's critical path, so a task ignoring
-        SIGTERM delays an incident-response scale-up by up to `killAfter`.
-        Either a shorter preemption-specific grace, or start the preemptor once
-        capacity is *accounted* rather than *physically free*.
-  - [ ] Add a plugin ABI version symbol. `plugins/tasks/` loads a bare
-        `extern "C" fn() -> Box<dyn TaskPlugin>` with no version guard, so a
-        stale third-party dylib mismatches silently instead of failing loudly.
-        Phase 1a dodged this by not breaking the ABI (`stop_with` defaults to
-        `stop`); the next trait change will not have that option.
-  - [ ] Band governance ships as a `bands` selector on `job` ACL rules, not
-        `operator:write` — which also delivers per-namespace band caps, so
-        that is no longer a separate Phase 4 item. Needs band normalization
-        before `enforce` (a selector never matches a request lacking the
-        attribute), coverage on the update and template-render paths, and
-        explicit cases in `tests/acl_endpoints.rs` — the
-        `every_manager_rpc_is_classified` test cannot catch a dropped
-        conditional check inside an existing endpoint.
-  - [x] At least think through fair-share policies — find the 80/20 rather than
-        building a full hierarchical scheduler. Thought through in the plan's
-        prior art + non-goals: the 80/20 is priority bands now, per-namespace
-        band caps later (phase 4); fair-share/hierarchical queues explicitly
-        deferred (Kueue's policy-matrix issue history is the argument against).
+- [ ] Preemption follow-ups — the feature shipped
+      ([plan](plans/preemption-and-eviction-plan.md) ·
+      [docs](../docs/preemption-and-eviction.md)); these are what it left open.
+  - [ ] Decide whether the per-pool preemption toggle should be ACL-adjacent
+        rather than manager config. `disabledPools` lives in
+        `schedulerSettings`, so a pool-scoped operator cannot exempt their own
+        pool without cluster-config access — even though `pools` already
+        exists as an ACL selector. Named as a decision, not an oversight
+        ([plan §Open Questions 6](plans/preemption-and-eviction-plan.md)).
+  - [ ] Victim metadata is loaded by a store query on the preemption path
+        rather than carried on the in-memory `Allocation` rows, so a plan that
+        preempts pays a round trip inside planning. Deliberate — widening
+        `Allocation` for four fields used by one code path would touch the
+        read model, the caches, the raft changesets and the wire — but if
+        `legion_scheduler_plan_phase_seconds{phase="build_plan"}` grows on a
+        preempting cluster, that is the fix
+        ([call 18](calls/preemption-and-eviction-plan_calls.md)).
+  - [ ] Preemption for a multi-task group being placed fresh preempts for its
+        first member; if a later member then cannot fit, the whole plan fails
+        and commits nothing. Safe, but a group that *could* have been placed
+        by evicting more is not.
+  - [ ] `legion node drain` rate limiting via the disruption vocabulary was a
+        Phase 4 candidate and was **evaluated and not taken**: drain has its
+        own deadline-bounded semantics, and giving it a budget re-opens the
+        cluster-wedge risk `disruption.minAvailable` is deliberately scoped to
+        avoid ([call 10](calls/preemption-and-eviction-plan_calls.md)).
+        Revisit only with a concrete operator request.
+  - [ ] Revisit fair share only with real multi-tenant demand. Bands +
+        per-namespace band caps (the `bands` ACL selector) are the 80/20;
+        hierarchical queues stay a non-goal.
 - [ ] Gang scheduling — `gang` on a task makes its replicas place
       all-or-nothing, with capacity failures becoming blocked-and-retried
       evals (woken on `node_join`) instead of terminal eval failures —
@@ -829,6 +815,51 @@ Deferred from [job-updated-at-plan.md](plans/job-updated-at-plan.md):
 
 docs: [scheduler-and-eval-loop.md](../docs/scheduler-and-eval-loop.md), [jobs-tasks-and-scheduling.md](../docs/jobs-tasks-and-scheduling.md)
 
+- [x] **Priorities and eviction/preemption, with eviction toggled at the pool
+      level.** Six named priority bands (`critical` / `high` / `elevated` /
+      `normal` / `low` / `background`) driving both eval-queue order and
+      preemption; victims chosen during planning and committed — deleted,
+      requeued, journalled — in the same epoch-CAS transaction that inserts
+      the preemptor's allocations. Strictly cross-band, minimum victim age,
+      minimal victim sets, `disruption.minAvailable` as a hard floor on
+      voluntary disruption only, `enforce`/`observe`/`off` modes and
+      `schedulerSettings.preemption.disabledPools` for the pool toggle,
+      `job plan` preview, `allocation.preempted` events with a
+      victim↔preemptor link, and `legion_preemptions_total`.
+      [plan](plans/preemption-and-eviction-plan.md) ·
+      [calls](calls/preemption-and-eviction-plan_calls.md) ·
+      [docs](../docs/preemption-and-eviction.md)
+  - [x] Phase 1a — stop causes. Every allocation removal records *why*,
+        delivered to the owning worker and carried in `allocation.removed`
+        metadata. [docs](../docs/graceful-stop.md)
+  - [x] Phase 1b — graceful termination. `stop { signal, killAfter }`,
+        per-runtime stop ladders, `LEGION_STOP_NOTICE_PATH`,
+        `allocation.stopping`, stops-before-starts reconcile ordering, and the
+        worker-side terminating set + reaper the blocking-`stop()` hazard
+        required. [docs](../docs/graceful-stop.md)
+  - [x] Phase 1b's grace-vs-latency question, resolved by taking neither
+        option: no preemption-specific grace (it would make the ladder
+        cause-dependent) and no accounted-not-free start (it would let a
+        container runtime run victim and preemptor on the same reserved
+        memory). The 5m `killAfter` cap is the backstop; documented as a known
+        limitation.
+  - [x] Plugin ABI version symbol. `declare_task_plugin_abi!()` is now
+        required of every task plugin, so a stale dylib fails at load with a
+        message naming the rebuild instead of mismatching silently.
+        [docs](../docs/task-runtime-plugins.md)
+  - [x] Phase 2 — priority bands, governed by a `bands` selector on `job` ACL
+        rules (not `operator:write`), normalized before enforcement and
+        covering the template-render path, with explicit cases in
+        `tests/acl_endpoints.rs`. Delivers per-namespace band caps, so that is
+        no longer a separate item. [docs](../docs/auth-and-acls.md)
+  - [x] Phase 3 — plan-atomic preemption. [docs](../docs/preemption-and-eviction.md)
+  - [x] Phase 4's UI item — preemption history on the job page, the band badge
+        on the job header, and the `priority` column in `job list`.
+  - [x] At least think through fair-share policies — find the 80/20 rather than
+        building a full hierarchical scheduler. The 80/20 is priority bands
+        plus per-namespace band caps via the `bands` ACL selector;
+        fair-share/hierarchical queues stay an explicit non-goal (Kueue's
+        policy-matrix issue history is the argument against).
 - [x] Ledger command — see every node and what's on it from the CLI
 - [x] A framework for scheduler plugins
 - [x] A "random" scheduler
