@@ -34,9 +34,9 @@ use crate::structs::{
     ListEventsRequest, ListInstancesRequest, ListJobActionsRequest, ListJobTemplatesRequest,
     ListJobsRequest, ListRolloutsRequest, ListServicesRequest, ListVolumeDriversRequest,
     ListVolumesRequest, PlanJobRequest, QueryStateStoreRequest, RenderJobTemplateRequest,
-    ReplaceInstanceRequest,
-    ResolveServiceRequest, RunJobRequest, RunJobTemplateRequest, SetNodeAvailabilityRequest,
-    StartInstanceRequest, StopInstanceRequest, StopJobRequest, UpsertJobTemplateRequest,
+    ReplaceInstanceRequest, ResolveServiceRequest, RunJobRequest, RunJobTemplateRequest,
+    SetNodeAvailabilityRequest, StartInstanceRequest, StopInstanceRequest, StopJobRequest,
+    UpsertJobTemplateRequest,
 };
 use crate::task_plugins::validate_job_config;
 use serde::Serialize;

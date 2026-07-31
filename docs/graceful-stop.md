@@ -147,7 +147,25 @@ by the platform, so there is no platform stop to explain.
 
 ## Where you can see it
 
-**In the event journal.** `allocation.removed` events carry the cause in their
+**In the event journal.** Two kinds cover a stop. `allocation.stopping` (info)
+says the processes have entered their grace window and names it; it is emitted
+for **every** cause, because every platform stop goes through the same ladder:
+
+```console
+$ legion events list --kind allocation.stopping -j | jq '.data.events[0]'
+{
+  "kind": "allocation.stopping",
+  "level": "info",
+  "jobId": "batch-transcode",
+  "message": "Stopping 3 allocation(s) for job batch-transcode (drain), up to 30s grace",
+  "metadata": {
+    "count": 3, "cause": "drain", "maxGraceSeconds": 30,
+    "allocations": [{"allocationId": 412, "nodeId": "node-d", "taskConfigId": 7, "graceSeconds": 30}]
+  }
+}
+```
+
+`allocation.removed` says the rows are gone, and carries the cause in its
 metadata:
 
 ```console
@@ -232,6 +250,12 @@ Stop-cause delivery is **best effort and advisory**. Specifically:
 - **Unrecognized causes degrade to `unknown`.** A newer manager may send a
   cause an older worker has never heard of; the worker stops the allocation
   anyway. This is what lets causes be added without a coordinated upgrade.
+
+The **ladder** is not advisory in the same way. A task always gets its signal
+and its window — the ladder is worker-local, built from the task's own config,
+and needs nothing from the manager. What can be lost is the *cause* written
+into the notice file: a stop whose notice has not arrived is still graceful,
+it just reports `unknown` and carries no preemptor link.
 
 ## Interaction with adjacent features
 

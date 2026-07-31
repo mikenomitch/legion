@@ -62,6 +62,41 @@ registration.
 | 2 | Workers report task-process exits (`terminated_allocations` on the heartbeat), which is what makes a batch task's `Success` come from an exit code — see [Task Supervision](task-supervision.md) | The manager sees the node's advertised `protocolVersion` and keeps the pre-2 behavior for batch tasks placed there: the task is marked `Success` at placement, as it always was. Nothing stalls mid-rollout; new placements get the honest behavior once the worker is upgraded. |
 | 1 | The versioned handshake itself | Workers reporting `0` are pre-versioning builds and are accepted with a warning |
 
+## Graceful stop and preemption under skew
+
+Neither feature bumps `protocol_version`, and both degrade rather than fail —
+but the degradation is worth knowing before you enable `enforce`:
+
+- **An old worker ignores the stop ladder** and hard-kills as it always did.
+  Its tasks get no signal, no grace, and no
+  `LEGION_STOP_NOTICE_PATH` file. Preemption still works; victims are just
+  killed abruptly ([graceful-stop.md](graceful-stop.md)).
+- **An old worker does not order stops before starts**, so a new manager can
+  place a preemptor there while the victim is still running. That is a
+  transient oversubscription, not merely a graceless stop — a container task
+  can briefly hold memory the preemptor was placed against.
+
+Both are reasons to **upgrade workers before enabling
+`schedulerSettings.preemption.mode: enforce`** on a mixed fleet, or to run
+`observe` until the fleet is uniform
+([preemption-and-eviction.md](preemption-and-eviction.md)). Preemption is
+deliberately not gated on a minimum worker protocol version: a gate would make
+it silently inert on any fleet with one stale worker, which is worse than a
+documented window.
+
+Priority bands need nothing from the worker at all — they live entirely in the
+manager's planner and eval queue — so they are unaffected by worker skew.
+
+## Task-plugin ABI
+
+Task runtimes loaded from `plugins/tasks/<name>/` are **not** covered by
+`protocol_version`; they are dynamically linked into the worker and must be
+rebuilt against the Legion version they run under. Each declares the vtable
+generation it was compiled against, and a mismatch (or a missing declaration)
+is refused at load with a message naming the rebuild. See
+[task-runtime-plugins.md](task-runtime-plugins.md). Rebuild out-of-tree task
+plugins as part of any worker upgrade.
+
 ## Build-version skew expectations
 
 `build_version` is informational and never causes rejection — only

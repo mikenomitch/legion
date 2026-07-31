@@ -3150,6 +3150,10 @@ impl Store {
             StopCause::Preempted,
             Some((preemptor_job.as_str(), preemptor_band)),
         )?;
+        let mut events = Vec::new();
+        if let Some(event) = self.stage_stopping_event_tx(tx, &victims, StopCause::Preempted) {
+            events.push(event);
+        }
 
         // One `job_reschedule` eval per victim job config, at the victim's
         // own band priority so a displaced `low` job does not jump the queue
@@ -3187,7 +3191,6 @@ impl Store {
                 .or_default()
                 .push(victim.clone());
         }
-        let mut events = Vec::new();
         for (job_config_id, group) in by_job {
             let band = evictions
                 .iter()
@@ -3200,9 +3203,6 @@ impl Store {
             {
                 events.push(event);
             }
-        }
-        if let Some(event) = self.stage_stopping_event_tx(tx, &victims, StopCause::Preempted) {
-            events.push(event);
         }
 
         // Metric rows, keyed by the victim's pool and band — the two axes an
@@ -4333,8 +4333,9 @@ impl Store {
         // be delivered — recorded anyway because "almost never" is not
         // "never": a node removed while still heartbeating (a decommission
         // racing its own worker) does read them.
-        self.record_stop_notices_tx(&tx, &allocs, StopCause::NodeLost)?;
+        let stopping_event = self.record_stop_notices_tx(&tx, &allocs, StopCause::NodeLost)?;
         tx.commit()?;
+        self.publish_staged(stopping_event);
         drop(conn);
 
         // Refresh by allocation SCOPES, not just the node: the bump above
@@ -5539,11 +5540,13 @@ impl Store {
         tx.execute("DELETE FROM instance WHERE job_id = ?1;", [job_id])?;
         tx.execute("DELETE FROM rollout_event WHERE job_id = ?1;", [job_id])?;
         tx.execute("DELETE FROM rollout WHERE job_id = ?1;", [job_id])?;
+        let mut stopping_event = None;
         if !allocs.is_empty() {
             self.bump_epochs_for_allocations_tx(&tx, &allocs)?;
-            self.record_stop_notices_tx(&tx, &allocs, StopCause::Destroy)?;
+            stopping_event = self.record_stop_notices_tx(&tx, &allocs, StopCause::Destroy)?;
         }
         tx.commit()?;
+        self.publish_staged(stopping_event);
         drop(conn);
         if !allocs.is_empty() {
             self.cache_remove_allocations(&allocs)?;
@@ -8276,13 +8279,21 @@ impl Store {
     /// [`StopCause::Unknown`] writes nothing — an unknown cause and no
     /// recorded cause are the same fact, and the worker defaults to
     /// `Unknown` anyway.
+    /// Record why these allocations are stopping, and stage the
+    /// `allocation.stopping` event that announces their grace window.
+    ///
+    /// Returns the staged event for the caller to publish after commit —
+    /// staged rather than emitted inline because these are removal-path
+    /// transactions and the event stream's performance rules require it.
+    #[must_use = "the staged allocation.stopping event must be published after commit"]
     fn record_stop_notices_tx(
         &self,
         tx: &Connection,
         removed: &[Allocation],
         cause: StopCause,
-    ) -> R<()> {
-        self.record_stop_notices_with_preemptor_tx(tx, removed, cause, None)
+    ) -> R<Option<SchedulerEventRecord>> {
+        self.record_stop_notices_with_preemptor_tx(tx, removed, cause, None)?;
+        Ok(self.stage_stopping_event_tx(tx, removed, cause))
     }
 
     /// [`Self::record_stop_notices_tx`], additionally recording *who* took
@@ -9261,8 +9272,10 @@ impl Store {
         tx.execute("DELETE FROM allocation WHERE id = ?;", [allocation_id])?;
         self.release_instance_bindings_tx(&tx, std::slice::from_ref(&allocation))?;
         self.bump_job_config_epoch_tx(&tx, &allocation.job_config_id)?;
-        self.record_stop_notices_tx(&tx, std::slice::from_ref(&allocation), cause)?;
+        let stopping_event =
+            self.record_stop_notices_tx(&tx, std::slice::from_ref(&allocation), cause)?;
         tx.commit()?;
+        self.publish_staged(stopping_event);
 
         self.cache_remove_allocations(std::slice::from_ref(&allocation))?;
 
@@ -9396,8 +9409,9 @@ impl Store {
         tx.execute(sql, params)?;
         self.release_instance_bindings_tx(&tx, &allocations)?;
         self.bump_epochs_for_allocations_tx(&tx, &allocations)?;
-        self.record_stop_notices_tx(&tx, &allocations, StopCause::Stop)?;
+        let stopping_event = self.record_stop_notices_tx(&tx, &allocations, StopCause::Stop)?;
         tx.commit()?;
+        self.publish_staged(stopping_event);
         drop(conn);
 
         self.cache_remove_allocations(&allocations)?;
@@ -9432,8 +9446,9 @@ impl Store {
         self.bump_job_config_epoch_tx(&tx, job_config_id)?;
         // A superseded job config's allocations are cleaned up because a
         // newer config replaced them.
-        self.record_stop_notices_tx(&tx, &allocations, StopCause::Update)?;
+        let stopping_event = self.record_stop_notices_tx(&tx, &allocations, StopCause::Update)?;
         tx.commit()?;
+        self.publish_staged(stopping_event);
         drop(conn);
 
         self.cache_remove_allocations(&allocations)?;
@@ -9777,10 +9792,11 @@ impl Store {
         // Every removal records WHY, in the same transaction that removes it
         // (preemption plan § Phase 1a). Scale-in gets its own cause rather
         // than borrowing `Update`: no new job config version exists here.
-        self.record_stop_notices_tx(&tx, &surplus, StopCause::ScaleIn)?;
+        let stopping_event = self.record_stop_notices_tx(&tx, &surplus, StopCause::ScaleIn)?;
         self.release_instance_bindings_tx(&tx, &surplus)?;
         self.bump_epochs_for_allocations_tx(&tx, &surplus)?;
         tx.commit()?;
+        self.publish_staged(stopping_event);
         drop(conn);
 
         self.cache_remove_allocations(&surplus)?;
@@ -10028,8 +10044,9 @@ impl Store {
         }
         self.release_instance_bindings_tx(&tx, allocs)?;
         self.bump_epochs_for_allocations_tx(&tx, allocs)?;
-        self.record_stop_notices_tx(&tx, allocs, cause)?;
+        let stopping_event = self.record_stop_notices_tx(&tx, allocs, cause)?;
         tx.commit()?;
+        self.publish_staged(stopping_event);
 
         self.cache_remove_allocations(allocs)?;
 
@@ -10788,8 +10805,9 @@ impl Store {
             params![now, instance_id],
         )?;
         self.bump_epochs_for_allocations_tx(&tx, &allocations)?;
-        self.record_stop_notices_tx(&tx, &allocations, StopCause::Destroy)?;
+        let stopping_event = self.record_stop_notices_tx(&tx, &allocations, StopCause::Destroy)?;
         tx.commit()?;
+        self.publish_staged(stopping_event);
 
         self.cache_remove_allocations(&allocations)?;
 
@@ -10884,8 +10902,9 @@ impl Store {
             params![now, instance_id],
         )?;
         self.bump_epochs_for_allocations_tx(&tx, &allocations)?;
-        self.record_stop_notices_tx(&tx, &allocations, StopCause::Stop)?;
+        let stopping_event = self.record_stop_notices_tx(&tx, &allocations, StopCause::Stop)?;
         tx.commit()?;
+        self.publish_staged(stopping_event);
 
         self.cache_remove_allocations(&allocations)?;
 

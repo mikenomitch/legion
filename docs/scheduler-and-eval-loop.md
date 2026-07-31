@@ -35,6 +35,14 @@ When queue is empty, workers block on either:
 Eval ordering:
 
 - Priority desc, then ID asc.
+- An eval submitted without an explicit priority inherits the one implied by
+  its job's **priority band** (`critical` 90, `high` 70, `elevated` 60,
+  `normal` 50, `low` 30, `background` 15), falling back to the manager's
+  `defaultPriority` when no band resolves. So importance orders the queue and
+  governs preemption through one field — see
+  [preemption-and-eviction.md](preemption-and-eviction.md). `legion job run
+  --priority N` / `--asap` still override the queue position for a single
+  submission without changing the band.
 
 Dedup-on-claim behavior:
 
@@ -216,6 +224,13 @@ Per task, the candidate set is then built one of two ways:
   the scan applies. The scan remains the authoritative fallback (unusable
   index, empty coverage, or a truncated list running dry), and `job plan`
   reports which path served each task.
+
+When neither path yields a node with room, and the job's band outranks work
+running on a node it is otherwise allowed on, a **preemption pass** runs:
+victims are chosen, and if one is found the placement and the evictions it
+pays for commit in the same epoch-CAS transaction. The pass runs *only* after
+normal feasibility has failed, so a cluster that never preempts pays nothing
+for it. See [preemption-and-eviction.md](preemption-and-eviction.md).
 
 ## Placement Constraints and Scoring
 
