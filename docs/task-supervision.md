@@ -172,71 +172,29 @@ adopts — is documented in
 
 ## Graceful stop
 
-Stopping a task delivers a signal and waits before it kills. Both halves are
-declarable per task, next to `resources` (not inside the runtime `config` —
-the intent is runtime-independent):
+Stopping a task delivers a signal and waits before it kills, declared per task
+in the `stop` block:
 
 ```jsonnet
 task: {
   name: 'db',
   runtime: 'exec',
   config: { command: ['/usr/bin/postgres'] },
-  stopSignal: 'SIGINT',       // default: SIGTERM
-  stopGracePeriod: '90s',     // default: 10s; capped at 5m at admission
+  stop: { signal: 'SIGINT', killAfter: '90s' },   // defaults: SIGTERM, 30s
 }
 ```
 
-- **`stopSignal`** comes from Legion's vocabulary — `SIGTERM`, `SIGINT`,
-  `SIGQUIT`, `SIGHUP`, `SIGUSR1`, `SIGUSR2`, `SIGCONT`, `SIGWINCH` (spelling
-  case-insensitive, `SIG` prefix optional). `SIGKILL` is deliberately not
-  declarable: it cannot be caught, so declaring it would only disable the
-  drain the field exists to provide.
-- **`stopGracePeriod`** is a duration string, validated positive and capped at
-  **5 minutes** at admission, so a wedged task cannot hold a drain or a
-  reschedule open indefinitely.
+Stopping is two-phase, and that split is what keeps the grace wait off the
+heartbeat path: `reconcile_allocations` signals and returns under the
+task-manager lock, and the **task supervisor's tick** — the same loop this
+page describes — reaps whatever has exited or timed out. A task Legion
+deliberately stopped does not feed the `restart` policy: it did not crash.
 
-Per runtime:
-
-- **`exec`:** deliver the signal to the tracked pid, poll for exit up to the
-  grace period, then kill. Under worker-owned enforcement the hard-kill step
-  also writes `cgroup.kill`, reaping double-forked descendants.
-- **`container`:** the runtime signals the container's *init* and waits — see
-  [Task Runtime: container](task-runtime-container.md#graceful-stop), which
-  also documents the Linux `stopSignal` default chain (jobspec → the image's
-  `STOPSIGNAL` → `SIGTERM`).
-- **Runtimes with nothing to signal** (`noop`, unported plugins): both fields
-  are accepted and inert.
-
-A task that exits inside the window is never force-killed. One that ignores
-the signal is killed at the deadline — so rescheduling a hung task is up to
-the grace period slower than an instant SIGKILL, which is the correct trade
-and the docker default everyone already operates under.
-
-### Stopping is two-phase
-
-The worker never waits out a grace period on its heartbeat path. Reconciling
-the manager's desired set runs under the worker's task-manager lock inside the
-heartbeat loop, and a blocking wait there would stall heartbeats and the
-self-fence watchdog — long enough to get the node declared lost, and its
-stateful allocations fenced, purely because one task was draining.
-
-So a stop is split:
-
-1. **Signal and record** — reconcile shuts the allocation's health monitor
-   down, delivers its `stopSignal`, notes the deadline, and returns
-   immediately.
-2. **Reap** — the task supervisor's tick (which runs off the heartbeat path)
-   finds allocations whose process has exited or whose deadline has passed,
-   and runs the runtime's teardown, storage release, and directory cleanup.
-
-While an allocation is draining it stays in the worker's maps, so the
-heartbeat keeps reporting it as this node's and the manager will not
-re-dispatch it mid-teardown. Its exit does **not** feed the `restart` policy —
-a task Legion deliberately stopped did not crash.
-
-An in-place re-dispatch (a config change reusing the same allocation id)
-drains the previous instance the same way, on the launch thread, with the
-task-manager lock released between polls.
+**The ladder, the per-runtime support table, the stop notice file, and the
+stop causes are documented in [Graceful stop](graceful-stop.md).** The Linux
+`container` runtime's signal default chain (jobspec → the image's own
+`STOPSIGNAL` → `SIGTERM`) is in
+[Task Runtime: container](task-runtime-container.md#graceful-stop).
 
 ## Process hardening
 

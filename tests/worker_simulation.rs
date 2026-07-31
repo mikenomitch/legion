@@ -151,6 +151,7 @@ async fn simulated_fleet_registers_schedules_and_acks() -> R<()> {
     task.count = TaskCount::new(3);
     task.constraints = json!({ "class": "web" });
     let job = JobConfig {
+        priority: Default::default(),
         name: "sim-it-job".into(),
         tasks: vec![task],
         rollout: None,

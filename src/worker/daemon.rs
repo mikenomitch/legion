@@ -773,10 +773,27 @@ async fn heartbeat_tick(
                     )
                 })
                 .collect();
+            // Preemptor links ride the same feed; only preemption notices
+            // carry one, so this map is empty on every other cause.
+            let stop_preemptors = reply
+                .stop_notices
+                .iter()
+                .filter(|notice| !notice.preemptor_job.is_empty())
+                .map(|notice| {
+                    (
+                        notice.allocation_id,
+                        crate::structs::StopNoticePreemptor {
+                            job: notice.preemptor_job.clone(),
+                            band: notice.preemptor_band.clone(),
+                        },
+                    )
+                })
+                .collect();
 
             let new_allocations = {
                 let mut manager = task_manager.lock().expect("task manager");
                 manager.set_stop_causes(stop_causes);
+                manager.set_stop_preemptors(stop_preemptors);
                 manager.reconcile_allocations(&desired)
             };
             if !new_allocations.is_empty() {

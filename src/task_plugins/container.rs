@@ -489,15 +489,17 @@ fn build_exec_command(
 const IMAGE_STOP_SIGNAL_KEY: &str = "imageStopSignal";
 
 /// The signal to deliver when stopping this container, docker's default
-/// chain: the jobspec's `stopSignal`, else the image config's `StopSignal`,
+/// chain: the jobspec's `stop.signal`, else the image config's `StopSignal`,
 /// else `SIGTERM`.
 ///
+/// This is why "undeclared" has to survive the trip to the worker as a state
+/// distinct from "declared SIGTERM": only the silent case consults the image.
 /// An image declaring a signal outside Legion's vocabulary is ignored rather
 /// than failing the stop — an unstoppable container is a worse outcome than a
 /// SIGTERM the image did not ask for.
 fn container_stop_signal(task: &TaskConfig, instance: &TaskInstance) -> String {
-    if task.stop_signal.is_some() {
-        return task.resolved_stop_signal();
+    if let Some(stop) = task.stop.as_ref() {
+        return stop.signal.clone();
     }
     instance
         .state
@@ -513,100 +515,10 @@ fn container_stop_signal(task: &TaskConfig, instance: &TaskInstance) -> String {
         .unwrap_or_else(|| crate::signals::DEFAULT_STOP_SIGNAL.to_string())
 }
 
-/// Whether the OCI runtime still knows about this container. `state` exits
-/// non-zero for an unknown container, which is exactly the "already gone"
-/// case teardown polls for.
-fn oci_container_exists(binary: &str, name: &str) -> bool {
-    Command::new(binary)
-        .args(["state", name])
-        .output()
-        .is_ok_and(|output| output.status.success())
-}
-
 #[derive(Default)]
 pub struct ContainerTaskPlugin;
 
-impl ContainerTaskPlugin {
-    /// Tear the container down gracefully, then reap the supervisor child.
-    ///
-    /// Both runtimes keep the container alive when the launching CLI is
-    /// killed (Apple `container` is daemon-backed; an OCI runtime reparents
-    /// the container init when the foreground `run` is killed), so the
-    /// container is always addressed by name first.
-    ///
-    /// - **Linux/OCI:** `kill <name> <signal>` (ignoring "not running" — a
-    ///   finished batch container is already gone), then poll `state` until
-    ///   it is stopped or absent, up to the grace period, then
-    ///   `delete --force` unconditionally: the reaper for a stopped container
-    ///   and the killer for a hung one, in one call.
-    /// - **macOS/Apple:** `stop --signal <signal> --time <secs>`, which does
-    ///   the same ladder inside the daemon.
-    fn teardown(
-        &self,
-        allocation: &Allocation,
-        task: &TaskConfig,
-        instance: &mut TaskInstance,
-        ctx: &crate::task_plugins::StopContext,
-    ) -> R<()> {
-        if let Ok(oci_runtime) = ContainerRuntime::detect() {
-            let name = container_name(allocation);
-            let signal = container_stop_signal(task, instance);
-            let grace = ctx.grace_period;
-            info!(
-                allocation_id = allocation.id,
-                task_name = %task.name,
-                %signal,
-                grace_period_secs = grace.as_secs_f64(),
-                "Stopping container"
-            );
-            match &oci_runtime {
-                ContainerRuntime::AppleContainer => {
-                    // Apple's `stop` signals init and waits, so the whole
-                    // ladder is one call; `--rm` on the launch reaps it.
-                    let output = Command::new(APPLE_CONTAINER_BIN)
-                        .args([
-                            "stop",
-                            "--signal",
-                            &signal,
-                            "--time",
-                            &grace.as_secs().max(1).to_string(),
-                            &name,
-                        ])
-                        .output();
-                    if let Ok(output) = output {
-                        if !output.status.success() {
-                            debug!(
-                                allocation_id = allocation.id,
-                                stderr = %String::from_utf8_lossy(&output.stderr).trim(),
-                                "container stop reported a failure (already gone is normal)"
-                            );
-                        }
-                    }
-                }
-                ContainerRuntime::Oci { binary } => {
-                    // Errors here are the normal "container is not running"
-                    // case for a finished batch task.
-                    let _ = Command::new(binary).args(["kill", &name, &signal]).output();
-                    let deadline = std::time::Instant::now() + grace;
-                    while std::time::Instant::now() < deadline {
-                        if !oci_container_exists(binary, &name) {
-                            break;
-                        }
-                        std::thread::sleep(std::time::Duration::from_millis(100));
-                    }
-                    // Unconditional: reaps the stopped container's bundle
-                    // state, and kills one that ignored the signal.
-                    let _ = Command::new(binary)
-                        .args(["delete", "--force", &name])
-                        .output();
-                }
-            }
-        }
-
-        reap_task_process(allocation.id, &task.name, instance, "container");
-        Ok(())
-    }
-}
+impl ContainerTaskPlugin {}
 
 impl TaskPlugin for ContainerTaskPlugin {
     fn name(&self) -> &'static str {
@@ -953,27 +865,121 @@ impl TaskPlugin for ContainerTaskPlugin {
         Ok(())
     }
 
-    fn stop(
-        &self,
-        allocation: &Allocation,
-        task: &TaskConfig,
-        instance: &mut TaskInstance,
-    ) -> R<()> {
-        // Paths that stop a task without a manager-supplied cause (restart,
-        // destroy) still honor the task's declared stop ladder.
-        let ctx =
-            crate::task_plugins::StopContext::for_task(crate::structs::StopCause::Unknown, task);
-        self.teardown(allocation, task, instance, &ctx)
-    }
-
+    /// Deliver the stop notice **into the container**, not to the launching
+    /// CLI: both runtimes keep the container alive when the foreground
+    /// process is signalled, so signalling the tracked host process would
+    /// notify nobody. The container's init (PID 1 in its namespace) is the
+    /// process the workload actually runs as.
     fn stop_with(
         &self,
         allocation: &Allocation,
         task: &TaskConfig,
         instance: &mut TaskInstance,
         ctx: &crate::task_plugins::StopContext,
+    ) -> R<bool> {
+        let Ok(oci_runtime) = ContainerRuntime::detect() else {
+            return Ok(false);
+        };
+        let name = container_name(allocation);
+        // `ctx.signal` is the worker's resolved ladder, which cannot know
+        // about the image: when the jobspec declared no `stop` block, docker's
+        // chain says the image's own STOPSIGNAL wins before SIGTERM.
+        let signal = container_stop_signal(task, instance);
+        let grace_secs = ctx.grace.as_secs().max(1).to_string();
+        let (program, args): (&str, Vec<String>) = match &oci_runtime {
+            // `runc`/`youki`-style `kill` signals the container init and
+            // returns immediately, which is exactly the contract here — the
+            // worker's reaper owns the deadline.
+            ContainerRuntime::Oci { binary } => (
+                binary.as_str(),
+                vec![
+                    "kill".to_string(),
+                    name.clone(),
+                    // The OCI CLI takes the bare name (`TERM`), not `SIGTERM`.
+                    signal.trim_start_matches("SIG").to_string(),
+                ],
+            ),
+            // Apple's `container stop` signals and then waits out its own
+            // timeout, so it is run detached below rather than inline. It
+            // owns the ladder end-to-end; Legion's `stop.signal` reaches it,
+            // but the runtime may SIGKILL before Legion's deadline if
+            // `killAfter` is longer than what `--time` accepts.
+            ContainerRuntime::AppleContainer => (
+                APPLE_CONTAINER_BIN,
+                vec![
+                    "stop".to_string(),
+                    "--signal".to_string(),
+                    signal.clone(),
+                    "--time".to_string(),
+                    grace_secs,
+                    name.clone(),
+                ],
+            ),
+        };
+        info!(
+            allocation_id = allocation.id,
+            task_name = %task.name,
+            oci_runtime = program,
+            %signal,
+            grace_secs = ctx.grace.as_secs(),
+            cause = %ctx.cause,
+            "Signalling container to stop"
+        );
+        // Spawned, never waited on: `stop_with` runs under the worker's
+        // task-manager mutex and must not hold it for the grace window.
+        // Failures are ignored on purpose — an already-exited container is a
+        // successful stop, and the reaper cleans up either way.
+        match Command::new(program)
+            .args(&args)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(_child) => Ok(true),
+            Err(err) => {
+                warn!(
+                    allocation_id = allocation.id,
+                    task_name = %task.name,
+                    error = %err,
+                    "Failed to signal container; falling back to a hard stop"
+                );
+                Ok(false)
+            }
+        }
+    }
+
+    fn stop(
+        &self,
+        allocation: &Allocation,
+        task: &TaskConfig,
+        instance: &mut TaskInstance,
     ) -> R<()> {
-        self.teardown(allocation, task, instance, ctx)
+        // Both runtimes keep the container alive when the launching CLI is
+        // killed (Apple `container` is daemon-backed; an OCI runtime reparents
+        // the container init when the foreground `run` is killed). Tear it down
+        // explicitly by name first. Best-effort: an already-exited `--rm` /
+        // deleted container is gone, which is success.
+        if let Ok(oci_runtime) = ContainerRuntime::detect() {
+            let name = container_name(allocation);
+            let (program, args): (&str, Vec<&str>) = match &oci_runtime {
+                // `stop` signals the container's init and waits, so the
+                // workload gets a chance to shut down; `--rm` then reaps it.
+                ContainerRuntime::AppleContainer => (APPLE_CONTAINER_BIN, vec!["stop", &name]),
+                ContainerRuntime::Oci { binary } => {
+                    (binary.as_str(), vec!["delete", "--force", &name])
+                }
+            };
+            info!(
+                allocation_id = allocation.id,
+                task_name = %task.name,
+                oci_runtime = program,
+                "Tearing down container by name"
+            );
+            let _ = Command::new(program).args(&args).output();
+        }
+
+        reap_task_process(allocation.id, &task.name, instance, "container");
+        Ok(())
     }
 
     fn destroy(
@@ -1832,7 +1838,10 @@ mod tests {
         assert_eq!(container_stop_signal(&bare, &image_signal), "SIGQUIT");
 
         let declared = TaskConfig {
-            stop_signal: Some("SIGINT".into()),
+            stop: Some(crate::structs::StopConfig {
+                signal: "SIGINT".into(),
+                ..Default::default()
+            }),
             ..bare.clone()
         };
         assert_eq!(
@@ -1867,8 +1876,10 @@ mod tests {
                 "trap 'echo draining; exit 0' INT; while :; do sleep 0.2; done"
             ]),
         );
-        task.stop_signal = Some("SIGINT".into());
-        task.stop_grace_period = Some("30s".into());
+        task.stop = Some(crate::structs::StopConfig {
+            signal: "SIGINT".into(),
+            kill_after: std::time::Duration::from_secs(30),
+        });
 
         let tmp = tempfile::tempdir()?;
         let mut instance = TaskInstance {
@@ -1914,7 +1925,10 @@ mod tests {
             "ignoretest",
             json!(["/bin/sh", "-c", "trap '' TERM; while :; do sleep 0.2; done"]),
         );
-        task.stop_grace_period = Some("3s".into());
+        task.stop = Some(crate::structs::StopConfig {
+            signal: "SIGTERM".into(),
+            kill_after: std::time::Duration::from_secs(3),
+        });
 
         let tmp = tempfile::tempdir()?;
         let mut instance = TaskInstance {

@@ -484,6 +484,7 @@ fn test_node_msg(id: &str) -> NodeMsg {
 
 fn test_job(name: &str) -> JobConfig {
     JobConfig {
+        priority: Default::default(),
         rollout: None,
         rollout_by_group: Default::default(),
         name: name.to_string(),

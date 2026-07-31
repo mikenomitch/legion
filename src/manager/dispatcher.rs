@@ -177,17 +177,15 @@ pub fn build_task_allocation(
         Some(resources) if !resources.is_empty() => serde_json::to_string(&task.resources)?,
         _ => String::new(),
     };
-    // The declared stop ladder. Empty/0 mean "undeclared" so the worker
-    // applies the runtime's own default chain, and jobs that never touch
-    // these fields stay byte-identical on the wire.
-    let task_stop_signal = task
-        .stop_signal
-        .as_deref()
-        .map(|_| task.resolved_stop_signal())
-        .unwrap_or_default();
-    let task_stop_grace_period_seconds = match task.stop_grace_period.as_deref() {
-        Some(_) => task.resolved_stop_grace_period().as_secs(),
-        None => 0,
+    // The declared stop ladder, carried because the worker rebuilds its
+    // TaskConfig from these fields and would otherwise default every stop.
+    // Empty means "undeclared", which the container runtime distinguishes
+    // from a declared SIGTERM: only the silent case consults the image's own
+    // STOPSIGNAL. Jobs that never declare `stop` stay byte-identical on the
+    // wire.
+    let task_stop = match task.stop.as_ref() {
+        Some(stop) => serde_json::to_string(stop).context("Failed to serialize task stop")?,
+        None => String::new(),
     };
     Ok(TaskAllocation {
         allocation_id: allocation.id,
@@ -207,8 +205,7 @@ pub fn build_task_allocation(
         task_connect,
         task_volumes,
         task_resources,
-        task_stop_signal,
-        task_stop_grace_period_seconds,
+        task_stop,
     })
 }
 

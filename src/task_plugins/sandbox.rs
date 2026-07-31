@@ -992,6 +992,27 @@ impl TaskPlugin for SandboxTaskPlugin {
         Ok(())
     }
 
+    /// **No graceful stop.** A sandbox is a guest OS behind a VMM process;
+    /// signalling the VMM terminates the hypervisor, it does not ask the
+    /// workload inside to shut down, and Legion has no in-guest agent to
+    /// relay a notice to. Rather than pretend — signalling the VMM and
+    /// calling the resulting hard stop "graceful" — this runtime declines the
+    /// notice, and the worker tears the allocation down immediately, exactly
+    /// as it did before graceful stop existed.
+    ///
+    /// The consequence is user-visible and documented in
+    /// `docs/graceful-stop.md`: `stop { signal, killAfter }` has no effect on
+    /// `sandbox` tasks.
+    fn stop_with(
+        &self,
+        _allocation: &Allocation,
+        _task: &TaskConfig,
+        _instance: &mut TaskInstance,
+        _ctx: &crate::task_plugins::StopContext,
+    ) -> R<bool> {
+        Ok(false)
+    }
+
     fn stop(
         &self,
         allocation: &Allocation,

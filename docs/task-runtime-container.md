@@ -73,11 +73,8 @@ Optional:
   `/legion/task/<path>`. This is the shape `kvInjections.files` renders into
   — see [The task directory](#the-task-directory-legiontask).
 
-Two **task-level** fields (siblings of `resources`, not runtime config) also
-apply here — see [Graceful stop](#graceful-stop):
-
-- `stopSignal`: the signal delivered when Legion stops the task.
-- `stopGracePeriod`: how long it gets before the hard kill.
+The task-level `stop` block (a sibling of `resources`, not runtime config)
+also applies here — see [Graceful stop](#graceful-stop).
 
 The command follows the image reference directly — flags and all. There is no
 `--` terminator: Apple's argument parser reads `--` as the target executable
@@ -153,22 +150,28 @@ task: {
   name: 'db',
   runtime: 'container',
   config: { image: 'postgres:16', command: ['postgres'] },
-  stopSignal: 'SIGINT',       // default: SIGTERM
-  stopGracePeriod: '90s',     // default: 10s; capped at 5m at admission
+  stop: { signal: 'SIGINT', killAfter: '90s' },   // defaults: SIGTERM, 30s
 }
 ```
 
-- **`stopSignal`** comes from Legion's signal vocabulary — `SIGTERM`,
-  `SIGINT`, `SIGQUIT`, `SIGHUP`, `SIGUSR1`, `SIGUSR2`, `SIGCONT`, `SIGWINCH`
-  (spelling is case-insensitive and the `SIG` prefix optional). `SIGKILL` is
-  deliberately not declarable: it cannot be caught, so declaring it would only
-  disable the drain the field exists to provide. On the **Linux** path the
-  default chain is docker's — the jobspec's `stopSignal`, then the image's own
-  `STOPSIGNAL`, then `SIGTERM`. Apple `container` applies the image's stop
-  signal itself, so the macOS chain is jobspec-or-`SIGTERM`.
-- **`stopGracePeriod`** is a duration string, validated positive and capped at
-  **5 minutes** at admission — long enough for a database checkpoint, short
-  enough that a node drain still converges. Nothing declared means 10s.
+The block itself — its vocabulary, its defaults, and the 5-minute cap — is
+documented in [Graceful stop](graceful-stop.md#the-ladder). What is specific
+to this runtime is **where the signal is delivered** and **what happens when
+the jobspec is silent**:
+
+- **The signal goes to the container's init**, not to the launching CLI.
+  Both platforms keep the container alive when the foreground process is
+  signalled, so signalling the tracked host process would notify nobody.
+- **The Linux default chain is docker's** — the jobspec's `stop.signal`, then
+  the image's own `STOPSIGNAL`, then `SIGTERM`. This is why an *undeclared*
+  `stop` block is a distinct state from one that declares `SIGTERM`: only the
+  silent case consults the image. An image declaring a signal outside
+  Legion's vocabulary is ignored rather than failing the stop — an
+  unstoppable container is worse than a `SIGTERM` the image did not ask for.
+- **Apple `container` applies the image's stop signal itself**, so the macOS
+  chain is jobspec-or-`SIGTERM`, and the runtime owns the ladder end to end:
+  it may SIGKILL on its own schedule if `killAfter` is longer than its
+  `--time` accepts.
 
 The mechanism per platform:
 
@@ -303,7 +306,7 @@ images (see [docs/artifacts.md](artifacts.md)):
 | KV file injection | ✅ — destinations must resolve under `/legion/task` |
 | Identity env / file delivery | ✅ / ✅ — file destinations under `/legion/task` |
 | Signal delivery | ✅ — to the container init, both platforms |
-| Graceful stop (`stopSignal` / `stopGracePeriod`) | ✅ both platforms |
+| Graceful stop (`stop { signal, killAfter }`) | ✅ both platforms |
 | Memory / CPU limits | ✅ macOS (guest sizing); ✅ Linux with `resourceEnforcement.enabled` (cgroup v2) — see [docs/resource-enforcement.md](resource-enforcement.md) |
 | Exclusive cores (`resources.cores`) | ✅ Linux (cpuset pinning); macOS sizes the guest instead |
 | Port publishing | ✅ macOS; n/a on Linux (host networking) |
@@ -363,7 +366,7 @@ LEGION_OCI_RUNTIME=runc cargo test --lib oci_runtime -- --ignored --nocapture
   guest size rather than exclusivity — Apple `container` has no weight or
   pinning analogue.
 - There is no `legion alloc signal` verb: signals are delivered by declared
-  policy (`changeSignal` on refresh, `stopSignal` on teardown), not on demand.
+  policy (`changeSignal` on refresh, `stop.signal` on teardown), not on demand.
 - Private-registry image auth and digest pinning require the artifact pipeline
   (`containerImageDesugar`); the runtime's own fallback pull is anonymous.
 - zstd-compressed image layers are rejected (gzip and uncompressed supported).

@@ -163,6 +163,7 @@ impl Cluster {
 
 fn stateful_job(name: &str, count: u32, driver: &str, params: Option<Value>) -> JobConfig {
     JobConfig {
+        priority: Default::default(),
         name: name.to_string(),
         tasks: vec![TaskConfig {
             count: TaskCount {
@@ -475,6 +476,7 @@ fn stateless_jobs_create_no_volumes() -> R<()> {
     let mut cluster = Cluster::new()?;
     cluster.add_node(NODE_A)?;
     cluster.submit(JobConfig {
+        priority: Default::default(),
         name: "web".into(),
         tasks: vec![TaskConfig {
             count: TaskCount { num: 2, per: None },

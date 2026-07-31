@@ -2202,6 +2202,7 @@ mod tests {
         insert_node(&store, "node-b")?;
 
         let v1 = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "in-place-demo".into(),
@@ -2218,6 +2219,7 @@ mod tests {
         let _old_alloc = store.place_alloc("node-a", v1_task_id)?;
 
         let v2 = JobConfig {
+            priority: Default::default(),
             rollout: Some(RolloutConfig {
                 in_place: Some(true),
                 ..Default::default()
@@ -2268,6 +2270,7 @@ mod tests {
         insert_node(&store, "node-b")?;
 
         let v1 = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "in-place-satisfied".into(),
@@ -2284,6 +2287,7 @@ mod tests {
         let _old_alloc = store.place_alloc("node-a", v1_task_id)?;
 
         let v2 = JobConfig {
+            priority: Default::default(),
             rollout: Some(RolloutConfig {
                 in_place: Some(true),
                 ..Default::default()
@@ -2334,6 +2338,7 @@ mod tests {
         insert_node(&store, "node-a")?;
 
         let job = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "health-gate".into(),
@@ -2414,6 +2419,7 @@ mod tests {
         insert_node(&store, "node-a")?;
 
         let v1 = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "advance-events".into(),
@@ -2427,6 +2433,7 @@ mod tests {
         let v1_id = store.get_job_config(&v1.name)?.id();
 
         let v2 = JobConfig {
+            priority: Default::default(),
             rollout: Some(RolloutConfig {
                 progression: Some(RolloutProgression::Manual),
                 ..Default::default()

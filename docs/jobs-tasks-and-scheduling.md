@@ -16,6 +16,11 @@ change how the spec is produced and who is allowed to submit it.
 - `task` (single-task shorthand)
 - `tasks` as list
 - `tasks` as map
+- `priority` — the job's importance band (`critical` / `high` / `elevated` /
+  `normal` / `low` / `background`, default `normal`). It orders the eval queue
+  *and* decides what this job may displace when the cluster is full, and what
+  may displace it. See
+  [preemption-and-eviction.md](preemption-and-eviction.md).
 
 Task names:
 
@@ -25,6 +30,12 @@ Task names:
 ## Task Fields That Affect Placement
 
 Important `TaskConfig` fields:
+
+- `stop` — the signal and grace window used to terminate this task, for every
+  cause ([graceful-stop.md](graceful-stop.md)).
+- `disruption.minAvailable` — a floor on how many of this task's allocations
+  *voluntary* disruption (preemption) may leave running
+  ([preemption-and-eviction.md](preemption-and-eviction.md)).
 
 - `count`:
   - integer count

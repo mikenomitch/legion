@@ -42,52 +42,36 @@ How to use it:
       test tracked below.
 - [ ] Worker groups + taint/toleration equivalent. Node pools exist as an ACL
       and config concept but nothing scheduling-side consumes them.
-- [ ] Priorities and eviction/preemption, with eviction toggled at the pool level
-      — [plan](plans/preemption-and-eviction-plan.md) (IN EXECUTION: stop causes
-      → graceful termination → priority bands → plan-atomic preemption →
-      governance; pool toggle is `schedulerSettings.preemption.disabledPools`)
-  - [x] **Phase 1a — stop causes.** Every allocation removal records *why*
-        (`stop`/`update`/`drain`/`reschedule`/`destroy`/`node_lost`), delivered
-        to the owning worker on its next heartbeat and carried in
-        `allocation.removed` event metadata.
-        [plan §Phase 1a](plans/preemption-and-eviction-plan.md) ·
-        [docs](../docs/graceful-stop.md)
-  - [ ] **Phase 1b — graceful termination.** The **mechanism now exists** and
-        was built by the container-runtime plan
-        ([calls 5, 8b](calls/container-runtime-exec-and-signals-plan_calls.md),
-        [docs](../docs/task-supervision.md#stopping-is-two-phase)): task-level
-        `stopSignal` / `stopGracePeriod` (this plan's `stop { signal,
-        killAfter }` under different names), per-runtime signal→wait→kill
-        ladders, the worker-side terminating set, and teardown moved behind
-        actual process exit — `reconcile_allocations` signals and returns, the
-        task supervisor's tick reaps. **Consume those fields; do not grow a
-        second set.** What is still open here: the
-        `LEGION_STOP_NOTICE_PATH` file, the `allocation.stopping` event, and
-        stops-before-starts reconcile ordering.
-        [plan §Phase 1b](plans/preemption-and-eviction-plan.md)
-  - [ ] Decide Phase 1b's grace-vs-latency question: stops-before-starts puts a
-        victim's shutdown on the preemptor's critical path, so a task ignoring
-        SIGTERM delays an incident-response scale-up by up to `killAfter`.
-        Either a shorter preemption-specific grace, or start the preemptor once
-        capacity is *accounted* rather than *physically free*.
-  - [ ] Add a plugin ABI version symbol. `plugins/tasks/` loads a bare
-        `extern "C" fn() -> Box<dyn TaskPlugin>` with no version guard, so a
-        stale third-party dylib mismatches silently instead of failing loudly.
-        Phase 1a dodged this by not breaking the ABI (`stop_with` defaults to
-        `stop`); the next trait change will not have that option.
-  - [ ] Band governance ships as a `bands` selector on `job` ACL rules, not
-        `operator:write` — which also delivers per-namespace band caps, so
-        that is no longer a separate Phase 4 item. Needs band normalization
-        before `enforce` (a selector never matches a request lacking the
-        attribute), coverage on the update and template-render paths, and
-        explicit cases in `tests/acl_endpoints.rs` — the
-        `every_manager_rpc_is_classified` test cannot catch a dropped
-        conditional check inside an existing endpoint.
-  - [x] At least think through fair-share policies — find the 80/20 rather than
-        building a full hierarchical scheduler. Thought through in the plan's
-        prior art + non-goals: the 80/20 is priority bands now, per-namespace
-        band caps later (phase 4); fair-share/hierarchical queues explicitly
-        deferred (Kueue's policy-matrix issue history is the argument against).
+- [ ] Preemption follow-ups — the feature shipped
+      ([plan](plans/preemption-and-eviction-plan.md) ·
+      [docs](../docs/preemption-and-eviction.md)); these are what it left open.
+  - [ ] Decide whether the per-pool preemption toggle should be ACL-adjacent
+        rather than manager config. `disabledPools` lives in
+        `schedulerSettings`, so a pool-scoped operator cannot exempt their own
+        pool without cluster-config access — even though `pools` already
+        exists as an ACL selector. Named as a decision, not an oversight
+        ([plan §Open Questions 6](plans/preemption-and-eviction-plan.md)).
+  - [ ] Victim metadata is loaded by a store query on the preemption path
+        rather than carried on the in-memory `Allocation` rows, so a plan that
+        preempts pays a round trip inside planning. Deliberate — widening
+        `Allocation` for four fields used by one code path would touch the
+        read model, the caches, the raft changesets and the wire — but if
+        `legion_scheduler_plan_phase_seconds{phase="build_plan"}` grows on a
+        preempting cluster, that is the fix
+        ([call 18](calls/preemption-and-eviction-plan_calls.md)).
+  - [ ] Preemption for a multi-task group being placed fresh preempts for its
+        first member; if a later member then cannot fit, the whole plan fails
+        and commits nothing. Safe, but a group that *could* have been placed
+        by evicting more is not.
+  - [ ] `legion node drain` rate limiting via the disruption vocabulary was a
+        Phase 4 candidate and was **evaluated and not taken**: drain has its
+        own deadline-bounded semantics, and giving it a budget re-opens the
+        cluster-wedge risk `disruption.minAvailable` is deliberately scoped to
+        avoid ([call 10](calls/preemption-and-eviction-plan_calls.md)).
+        Revisit only with a concrete operator request.
+  - [ ] Revisit fair share only with real multi-tenant demand. Bands +
+        per-namespace band caps (the `bands` ACL selector) are the 80/20;
+        hierarchical queues stay a non-goal.
 - [ ] Gang scheduling — `gang` on a task makes its replicas place
       all-or-nothing, with capacity failures becoming blocked-and-retried
       evals (woken on `node_join`) instead of terminal eval failures —
@@ -813,6 +797,51 @@ Deferred from [job-updated-at-plan.md](plans/job-updated-at-plan.md):
 
 docs: [scheduler-and-eval-loop.md](../docs/scheduler-and-eval-loop.md), [jobs-tasks-and-scheduling.md](../docs/jobs-tasks-and-scheduling.md)
 
+- [x] **Priorities and eviction/preemption, with eviction toggled at the pool
+      level.** Six named priority bands (`critical` / `high` / `elevated` /
+      `normal` / `low` / `background`) driving both eval-queue order and
+      preemption; victims chosen during planning and committed — deleted,
+      requeued, journalled — in the same epoch-CAS transaction that inserts
+      the preemptor's allocations. Strictly cross-band, minimum victim age,
+      minimal victim sets, `disruption.minAvailable` as a hard floor on
+      voluntary disruption only, `enforce`/`observe`/`off` modes and
+      `schedulerSettings.preemption.disabledPools` for the pool toggle,
+      `job plan` preview, `allocation.preempted` events with a
+      victim↔preemptor link, and `legion_preemptions_total`.
+      [plan](plans/preemption-and-eviction-plan.md) ·
+      [calls](calls/preemption-and-eviction-plan_calls.md) ·
+      [docs](../docs/preemption-and-eviction.md)
+  - [x] Phase 1a — stop causes. Every allocation removal records *why*,
+        delivered to the owning worker and carried in `allocation.removed`
+        metadata. [docs](../docs/graceful-stop.md)
+  - [x] Phase 1b — graceful termination. `stop { signal, killAfter }`,
+        per-runtime stop ladders, `LEGION_STOP_NOTICE_PATH`,
+        `allocation.stopping`, stops-before-starts reconcile ordering, and the
+        worker-side terminating set + reaper the blocking-`stop()` hazard
+        required. [docs](../docs/graceful-stop.md)
+  - [x] Phase 1b's grace-vs-latency question, resolved by taking neither
+        option: no preemption-specific grace (it would make the ladder
+        cause-dependent) and no accounted-not-free start (it would let a
+        container runtime run victim and preemptor on the same reserved
+        memory). The 5m `killAfter` cap is the backstop; documented as a known
+        limitation.
+  - [x] Plugin ABI version symbol. `declare_task_plugin_abi!()` is now
+        required of every task plugin, so a stale dylib fails at load with a
+        message naming the rebuild instead of mismatching silently.
+        [docs](../docs/task-runtime-plugins.md)
+  - [x] Phase 2 — priority bands, governed by a `bands` selector on `job` ACL
+        rules (not `operator:write`), normalized before enforcement and
+        covering the template-render path, with explicit cases in
+        `tests/acl_endpoints.rs`. Delivers per-namespace band caps, so that is
+        no longer a separate item. [docs](../docs/auth-and-acls.md)
+  - [x] Phase 3 — plan-atomic preemption. [docs](../docs/preemption-and-eviction.md)
+  - [x] Phase 4's UI item — preemption history on the job page, the band badge
+        on the job header, and the `priority` column in `job list`.
+  - [x] At least think through fair-share policies — find the 80/20 rather than
+        building a full hierarchical scheduler. The 80/20 is priority bands
+        plus per-namespace band caps via the `bands` ACL selector;
+        fair-share/hierarchical queues stay an explicit non-goal (Kueue's
+        policy-matrix issue history is the argument against).
 - [x] Ledger command — see every node and what's on it from the CLI
 - [x] A framework for scheduler plugins
 - [x] A "random" scheduler
@@ -871,8 +900,10 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
       in microVMs for untrusted code and agent workspaces
 - [x] **The `container` runtime's four core gaps, closed** (2026-07-31) —
       [plan](plans/container-runtime-exec-and-signals-plan.md) ·
-      [calls](calls/container-runtime-exec-and-signals-plan_calls.md), all
-      seven phases:
+      [calls](calls/container-runtime-exec-and-signals-plan_calls.md). Six of
+      its seven phases; Phase 3 (graceful stop) was **superseded before merge**
+      by the preemption plan's Phase 1b, which shipped the same ladder as
+      `stop { signal, killAfter }` — see the Phase 3 entry below:
   - [x] Phase 1 — exec on Linux via `<runtime> exec` for youki/runc/crun, so
         `legion exec`, actions, the UI terminal, and MCP exec work on the OS
         the workloads ship on ([docs](../docs/exec-and-actions.md))
@@ -881,12 +912,17 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
         (`container kill` / `<runtime> kill`); `changeMode: signal` identities
         on container tasks are accepted
         ([docs](../docs/workload-identity.md))
-  - [x] Phase 3 — graceful stop with task-level `stopSignal` /
-        `stopGracePeriod` (defaults SIGTERM / 10 s, capped at 5 m at
-        admission), honored by both container platforms and the exec runtime;
-        Linux teardown is signal → bounded wait → `delete --force` instead of
-        an unconditional SIGKILL
-        ([docs](../docs/task-supervision.md#graceful-stop))
+  - [~] Phase 3 — graceful stop. **Superseded, not shipped as designed.** The
+        branch built `stopSignal` / `stopGracePeriod`; preemption's Phase 1b
+        landed on `main` first with the same feature as
+        `stop { signal, killAfter }`, one ladder for every stop cause. The
+        duplicate surface was dropped at merge rather than shipped alongside
+        — two jobspec fields for one behavior is the incoherence this repo
+        keeps out. What the branch *kept* is the runtime-side half Phase 1b
+        did not cover: the Linux container teardown ladder (signal → bounded
+        wait → `delete --force` instead of an unconditional SIGKILL)
+        ([docs](../docs/graceful-stop.md),
+        [calls 19](calls/container-runtime-exec-and-signals-plan_calls.md))
   - [x] Phase 4 — the `resource_enforcement()` interface (`Unsupported` /
         `WorkerCgroup` / `RuntimeApplied` + a worker-computed
         `ResourceAssignment`), Linux memory hard limits, `cpu` MHz →
@@ -910,12 +946,12 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
     worker config rather than shipping ungated, and it *replaces* the exec
     runtime's own per-allocation cgroup path (which conflated `cpus` with
     `cores` and used a CFS quota) — see calls 8, 10, and 16.
-  - **Stopping became two-phase** so the grace wait never runs under the
-    task-manager lock the heartbeat loop needs: `reconcile_allocations`
-    signals and returns, the task supervisor's tick reaps. This is the
-    worker-side terminating set the preemption plan's Phase 1b was blocked on
-    ([calls 8b](calls/container-runtime-exec-and-signals-plan_calls.md),
-    [docs](../docs/task-supervision.md#stopping-is-two-phase)).
+  - The two-phase stop this branch also built (signal under the lock, reap on
+    the supervisor's tick) arrived independently in preemption's Phase 1b and
+    is `main`'s implementation now; the branch keeps only its resource-release
+    step, ordered strictly behind the reap so a cgroup is never removed while
+    it still holds a live process
+    ([calls 19](calls/container-runtime-exec-and-signals-plan_calls.md)).
 
 ## Artifacts
 

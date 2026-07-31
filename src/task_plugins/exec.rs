@@ -245,42 +245,6 @@ impl ExecTaskPlugin {
     fn config_linux_options(&self, config: &Value) -> R<ExecLinuxOptions> {
         self.parse_config(config)?.linux_options()
     }
-
-    /// Stop the task process the way its jobspec asked: deliver `stopSignal`,
-    /// wait up to `stopGracePeriod`, then kill. Today's instant-kill behavior
-    /// is the degenerate case of this ladder (`stopGracePeriod: 0`), so a task
-    /// that declares nothing gets the 10-second drain and nothing else
-    /// changes.
-    fn teardown(
-        &self,
-        allocation: &Allocation,
-        task: &TaskConfig,
-        instance: &mut TaskInstance,
-        ctx: &crate::task_plugins::StopContext,
-    ) -> R<()> {
-        crate::task_plugins::graceful_reap_task_process(
-            allocation.id,
-            &task.name,
-            instance,
-            "exec",
-            ctx,
-        );
-        // Whole-tree teardown, the second thing `WorkerCgroup` buys: a
-        // double-forked descendant that reparented away from the tracked pid
-        // still lives in this cgroup, so `cgroup.kill` reaps it where
-        // `kill(pid)` would have orphaned it. After the graceful ladder, so
-        // a task that drained cleanly is never SIGKILLed for the privilege.
-        if let Some(assignment) = instance.resource_assignment.as_ref() {
-            crate::worker::resources::kill_cgroup(assignment);
-        }
-        // The cgroup directory itself is worker core's to remove (it owns the
-        // allocator and the slice masks); this only cleans up the legacy
-        // per-allocation cgroup from before the hierarchy existed.
-        if enforcement_enabled() && instance.resource_assignment.is_none() {
-            remove_managed_cgroup(allocation.id, &task.name);
-        }
-        Ok(())
-    }
 }
 
 impl TaskPlugin for ExecTaskPlugin {
@@ -555,25 +519,32 @@ impl TaskPlugin for ExecTaskPlugin {
         Ok(())
     }
 
+    /// The hard path. The graceful notice is the trait default
+    /// (`signal_task_process` to the tracked process group); the worker's
+    /// reaper calls this once the task has exited or its window has closed.
     fn stop(
         &self,
         allocation: &Allocation,
         task: &TaskConfig,
         instance: &mut TaskInstance,
     ) -> R<()> {
-        let ctx =
-            crate::task_plugins::StopContext::for_task(crate::structs::StopCause::Unknown, task);
-        self.teardown(allocation, task, instance, &ctx)
-    }
-
-    fn stop_with(
-        &self,
-        allocation: &Allocation,
-        task: &TaskConfig,
-        instance: &mut TaskInstance,
-        ctx: &crate::task_plugins::StopContext,
-    ) -> R<()> {
-        self.teardown(allocation, task, instance, ctx)
+        crate::task_plugins::reap_task_process(allocation.id, &task.name, instance, "exec");
+        // Whole-tree teardown, the second thing `WorkerCgroup` buys: a
+        // double-forked descendant that reparented away from the tracked pid
+        // still lives in this cgroup, so `cgroup.kill` reaps it where
+        // `kill(pid)` would have orphaned it. Strictly after the reap, so a
+        // task that drained cleanly inside its window is never SIGKILLed for
+        // the privilege.
+        if let Some(assignment) = instance.resource_assignment.as_ref() {
+            crate::worker::resources::kill_cgroup(assignment);
+        }
+        // The cgroup directory itself is worker core's to remove (it owns the
+        // allocator and the slice masks); this only cleans up the legacy
+        // per-allocation cgroup from before the hierarchy existed.
+        if enforcement_enabled() && instance.resource_assignment.is_none() {
+            remove_managed_cgroup(allocation.id, &task.name);
+        }
+        Ok(())
     }
 
     fn destroy(
@@ -934,12 +905,13 @@ mod tests {
         Ok(())
     }
 
-    /// A process that handles its stop signal exits inside the window, and
-    /// the ladder stops waiting the moment it does rather than burning the
-    /// whole grace period.
+    /// The stop **notice** is delivered and returns immediately: `stop_with`
+    /// runs under the worker's task-manager lock, so a runtime that blocked
+    /// here for the grace window would stall heartbeats. A trapping process
+    /// then exits on its own, inside the window, without anyone killing it.
     #[cfg(unix)]
     #[test]
-    fn graceful_stop_lets_a_trapping_process_drain() -> R<()> {
+    fn stop_with_signals_promptly_and_lets_a_trapping_process_drain() -> R<()> {
         let plugin = ExecTaskPlugin;
         let allocation = crate::structs::Allocation {
             id: 4242,
@@ -956,35 +928,66 @@ mod tests {
             config: json!({
                 "command": ["/bin/sh", "-c", "trap 'exit 0' TERM; while :; do sleep 0.1; done"],
             }),
-            stop_grace_period: Some("30s".into()),
+            stop: Some(crate::structs::StopConfig {
+                signal: "SIGTERM".into(),
+                kill_after: std::time::Duration::from_secs(30),
+            }),
             ..TaskConfig::new("drain", "exec")
         };
 
         let mut instance = TaskInstance::default();
         plugin.start(&allocation, &task, &mut instance)?;
         assert!(instance.pid.is_some(), "task process started");
-        // Let the shell reach its `trap` before signaling it, or the test
-        // measures a startup race instead of the stop ladder.
+        // Let the shell reach its `trap` before signalling it, or the test
+        // measures a startup race instead of the stop path.
         std::thread::sleep(std::time::Duration::from_millis(300));
 
+        let ctx = crate::task_plugins::StopContext::with_ladder(
+            crate::structs::StopCause::Unknown,
+            "SIGTERM",
+            std::time::Duration::from_secs(30),
+        );
         let started = std::time::Instant::now();
-        plugin.stop(&allocation, &task, &mut instance)?;
+        let signalled = plugin.stop_with(&allocation, &task, &mut instance, &ctx)?;
         let elapsed = started.elapsed();
 
+        assert!(signalled, "a tracked host process can be signalled");
         assert!(
-            elapsed < std::time::Duration::from_secs(10),
-            "the ladder must return as soon as the process exits, took {elapsed:?}"
+            elapsed < std::time::Duration::from_secs(1),
+            "the notice must not wait out the window, took {elapsed:?}"
         );
-        assert!(instance.pid.is_none(), "the process was reaped");
+        // Still tracked: the notice is not the kill, and the worker's reaper
+        // owns the handle until the process actually goes away.
+        assert!(
+            instance.pid.is_some(),
+            "the process is draining, not reaped"
+        );
+
+        // It drains on its own, well inside the 30s window. Polled through
+        // the child handle, not `kill(pid, 0)`: an exited-but-unreaped child
+        // is a zombie, and a liveness probe would call it alive forever.
+        let mut exited = false;
+        for _ in 0..200 {
+            if !matches!(
+                instance.child.as_mut().expect("child handle").try_wait(),
+                Ok(None)
+            ) {
+                exited = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(exited, "a trapping process exits on its stop signal");
+        plugin.stop(&allocation, &task, &mut instance)?;
         Ok(())
     }
 
-    /// And a process that ignores the signal is killed at the deadline — the
-    /// window is a promise to the workload, not to the operator waiting on a
-    /// drain.
+    /// And `stop` is the hard step: a process that ignored the notice is
+    /// killed, promptly. The window belongs to the worker's reaper, so this
+    /// call must not wait one out either.
     #[cfg(unix)]
     #[test]
-    fn graceful_stop_force_kills_at_the_deadline() -> R<()> {
+    fn stop_hard_kills_a_process_that_ignored_the_notice() -> R<()> {
         let plugin = ExecTaskPlugin;
         let allocation = crate::structs::Allocation {
             id: 4243,
@@ -1001,27 +1004,39 @@ mod tests {
             config: json!({
                 "command": ["/bin/sh", "-c", "trap '' TERM; while :; do sleep 0.1; done"],
             }),
-            stop_grace_period: Some("1s".into()),
+            stop: Some(crate::structs::StopConfig {
+                signal: "SIGTERM".into(),
+                kill_after: std::time::Duration::from_secs(1),
+            }),
             ..TaskConfig::new("stubborn", "exec")
         };
 
         let mut instance = TaskInstance::default();
         plugin.start(&allocation, &task, &mut instance)?;
         std::thread::sleep(std::time::Duration::from_millis(300));
+        let pid = instance.pid.expect("pid");
+
+        let ctx = crate::task_plugins::StopContext::with_ladder(
+            crate::structs::StopCause::Unknown,
+            "SIGTERM",
+            std::time::Duration::from_secs(1),
+        );
+        plugin.stop_with(&allocation, &task, &mut instance, &ctx)?;
+        // It traps TERM, so it is still alive when the reaper gives up.
+        assert!(
+            crate::signals::pid_alive(pid),
+            "the task ignored its notice"
+        );
 
         let started = std::time::Instant::now();
         plugin.stop(&allocation, &task, &mut instance)?;
         let elapsed = started.elapsed();
 
         assert!(
-            elapsed >= std::time::Duration::from_secs(1),
-            "the declared window must be honored in full, took {elapsed:?}"
+            elapsed < std::time::Duration::from_secs(5),
+            "the hard kill must not wait out a window, took {elapsed:?}"
         );
-        assert!(
-            elapsed < std::time::Duration::from_secs(15),
-            "and the kill must land at the deadline, took {elapsed:?}"
-        );
-        assert!(instance.pid.is_none(), "the process was killed and reaped");
+        assert!(instance.pid.is_none(), "the process was reaped");
         Ok(())
     }
 

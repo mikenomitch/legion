@@ -4,7 +4,9 @@ use crate::structs::{
     substitute_artifact_tokens, Allocation, AllocationHealth, StopCause, TaskAllocation,
     TaskConfig, TaskOnUnhealthyConfig, VolumeMount, VolumeReport, WorkerArtifactFetchConfigFull,
 };
-use crate::task_plugins::{ResourceEnforcement, StopContext, TaskInstance, TaskPluginRegistry};
+use crate::task_plugins::{
+    ResourceAssignment, ResourceEnforcement, StopContext, TaskInstance, TaskPluginRegistry,
+};
 use crate::worker::log_sink::{default_sinks, LogResource, LogSink};
 use crate::worker::logs::{read_allocation_logs, CapturedStream};
 use crate::worker::resources::NodeResourceGovernor;
@@ -77,17 +79,31 @@ impl TaskExit {
     }
 }
 
-/// An allocation that has been signaled and is draining.
-struct PendingTermination {
-    /// When the grace period runs out and the hard kill happens regardless.
+/// One allocation inside its grace window: signalled, not yet reaped.
+///
+/// Everything the teardown needs is moved in here, because the allocation is
+/// already out of the live maps by the time it lands.
+pub struct TerminatingAllocation {
+    allocation: Allocation,
+    task: TaskConfig,
+    instance: TaskInstance,
+    /// Why it is stopping, for the reap log line.
+    cause: StopCause,
+    /// When the grace window closes and the reaper hard-destroys it.
     deadline: std::time::Instant,
-    /// The context the teardown runs with. Its `grace_period` is zero — the
-    /// signal was already delivered and the wait already happened — so the
-    /// runtime's `stop_with` goes straight to its hard-kill step.
-    ctx: StopContext,
-    /// Whether to remove the allocation's directories. `false` for an
-    /// in-place re-dispatch, which reuses already-staged artifacts.
+    /// Whether teardown removes the allocation directory (false for an
+    /// in-place re-dispatch that will reuse the staged artifacts).
     remove_dirs: bool,
+}
+
+/// Why [`WorkerTaskManager::reap_terminating`] finished an allocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReapOutcome {
+    /// The task exited inside its grace window — the good path.
+    Exited,
+    /// The grace window closed with the process still running, so it was
+    /// SIGKILLed.
+    Killed,
 }
 
 /// A staging job handed to a dedicated thread: everything needed to fetch a
@@ -146,6 +162,27 @@ pub struct WorkerTaskManager {
     /// each heartbeat, so this worker holds exactly what the manager
     /// currently knows and needs no expiry logic of its own.
     stop_causes: HashMap<i64, StopCause>,
+    /// Who displaced each preempted allocation, from the same heartbeat feed
+    /// as [`Self::stop_causes`]. Written into the stop notice so a task can
+    /// tell "the platform wanted my capacity for job X" from "my operator
+    /// stopped me", which is the bidirectional link Kueue had to retrofit.
+    /// Only ever populated for [`StopCause::Preempted`].
+    preemptors: HashMap<i64, crate::structs::StopNoticePreemptor>,
+    /// Allocations that have been signalled and are inside their grace
+    /// window. They are out of `instances`/`allocations` already (the manager
+    /// no longer wants them, and the heartbeat must not report them as this
+    /// node's running work), but their process is still alive and their
+    /// storage is still mounted.
+    ///
+    /// This set is the load-bearing piece of graceful stop. `stop()` cannot
+    /// simply wait for a deadline: `reconcile_allocations` runs under this
+    /// struct's mutex inside the async heartbeat loop, so a blocking stop
+    /// would hold the lock heartbeats, the self-fence watchdog and health
+    /// reporting all need — at a 2s cadence a 30s grace would let the manager
+    /// declare the node lost and reschedule everything on it. So the stop
+    /// *signals and returns*, and [`Self::reap_terminating`] finishes the job
+    /// from the supervisor loop.
+    terminating: HashMap<i64, TerminatingAllocation>,
     state_store: WorkerStateStore,
     /// Root of per-allocation directories: `<state dir>/allocs/<alloc_id>/<task>/`.
     alloc_root: PathBuf,
@@ -164,18 +201,6 @@ pub struct WorkerTaskManager {
     /// Resolved mount lists per allocation, kept so a worker restart can
     /// re-mount exactly what the manager last dispatched.
     volume_specs: HashMap<i64, Vec<VolumeMount>>,
-    /// Allocations that have been signaled and are draining, with the
-    /// deadline their `stopGracePeriod` gives them and the context their
-    /// teardown will use.
-    ///
-    /// This is what keeps the grace wait **off the heartbeat path**:
-    /// `reconcile_allocations` runs under this manager's mutex inside the
-    /// heartbeat loop, so a blocking wait there would stall heartbeats and the
-    /// self-fence watchdog and get the node declared lost. Stopping is
-    /// therefore two-phase — signal and record here, reap from the task
-    /// supervisor's tick — and an allocation stays in `instances` until it is
-    /// actually gone, so the heartbeat keeps reporting it as this node's.
-    terminating: HashMap<i64, PendingTermination>,
     /// The node's CPU/memory accounting and cgroup hierarchy (see
     /// `src/worker/resources.rs`). Disabled unless the worker was started
     /// with `resourceEnforcement.enabled`, in which case it governs every
@@ -216,6 +241,8 @@ impl WorkerTaskManager {
             restart_history: HashMap::new(),
             self_fence_windows: HashMap::new(),
             stop_causes: HashMap::new(),
+            preemptors: HashMap::new(),
+            terminating: HashMap::new(),
             state_store,
             alloc_root,
             artifact_status: ArtifactStatusBoard::new(),
@@ -234,7 +261,6 @@ impl WorkerTaskManager {
                 },
             )),
             volume_specs: HashMap::new(),
-            terminating: HashMap::new(),
             resources: NodeResourceGovernor::from_env(),
         }
     }
@@ -744,6 +770,16 @@ impl WorkerTaskManager {
         instance
             .extra_env
             .insert("LEGION_TASK_DIR".into(), task_dir.display().to_string());
+        // Exported at start, written at stop: a task that wants to react
+        // programmatically to being stopped reads this path from its own
+        // environment and needs no other coordination.
+        instance.extra_env.insert(
+            crate::structs::STOP_NOTICE_PATH_ENV.into(),
+            task_dir
+                .join(crate::structs::STOP_NOTICE_FILE)
+                .display()
+                .to_string(),
+        );
         instance.alloc_dir = Some(alloc_dir);
         instance.task_dir = Some(task_dir);
         Ok(instance)
@@ -878,6 +914,20 @@ impl WorkerTaskManager {
     /// Stops allocations the manager no longer wants and returns the new
     /// allocations the caller should hand to [`launch_task_allocation`]
     /// (staging-aware launch must happen without holding this lock).
+    ///
+    /// **Stops order before starts.** Removals are applied first, and while
+    /// anything on this node is still inside its grace window no new
+    /// allocation is launched. That is what makes plan-carried eviction safe
+    /// physically: the manager's plan is atomic *logically* (victims and
+    /// preemptor commit in one transaction), and this serializes the physical
+    /// handover, so the node is never running victim and preemptor
+    /// concurrently past the grace window. The cost — a new allocation
+    /// landing on a node with slow-stopping neighbours inherits their grace
+    /// as start latency — is bounded by the `stop.killAfter` cap and is
+    /// recorded as a judgement call.
+    ///
+    /// Held-back allocations are not lost: they stay in the manager's desired
+    /// set, so the next heartbeat's reconcile returns them again.
     pub fn reconcile_allocations(&mut self, allocations: &[TaskAllocation]) -> Vec<TaskAllocation> {
         let desired_ids = allocations
             .iter()
@@ -888,14 +938,31 @@ impl WorkerTaskManager {
             if desired_ids.contains(&allocation_id) {
                 continue;
             }
-            self.begin_stop_allocation(allocation_id, true);
+            if let Err(err) = self.stop_allocation(allocation_id) {
+                warn!(
+                    allocation_id,
+                    error = ?err,
+                    "Failed to stop undesired allocation"
+                );
+            }
         }
 
-        allocations
+        let pending: Vec<TaskAllocation> = allocations
             .iter()
             .filter(|allocation| !self.instances.contains_key(&allocation.allocation_id))
+            .filter(|allocation| !self.terminating.contains_key(&allocation.allocation_id))
             .cloned()
-            .collect()
+            .collect();
+
+        if !pending.is_empty() && self.has_terminating() {
+            debug!(
+                held = pending.len(),
+                terminating = self.terminating.len(),
+                "Holding new allocations until in-grace allocations exit"
+            );
+            return Vec::new();
+        }
+        pending
     }
 
     /// Mirror the manager's current stop-notice set (`HeartbeatReply
@@ -914,244 +981,313 @@ impl WorkerTaskManager {
         self.stop_causes = causes;
     }
 
+    /// Mirror the manager's preemptor links, on the same replace-wholesale
+    /// terms as [`Self::set_stop_causes`].
+    pub fn set_stop_preemptors(
+        &mut self,
+        preemptors: HashMap<i64, crate::structs::StopNoticePreemptor>,
+    ) {
+        self.preemptors = preemptors;
+    }
+
     /// The cause recorded for an allocation, if the manager sent one.
     #[cfg(test)]
     pub(crate) fn stop_cause_for(&self, allocation_id: i64) -> Option<StopCause> {
         self.stop_causes.get(&allocation_id).copied()
     }
 
-    /// Phase one of stopping an allocation: shut its health monitor down,
-    /// deliver its `stopSignal`, and record the deadline its
-    /// `stopGracePeriod` buys it. Returns the deadline, or `None` when there
-    /// was nothing to stop.
+    fn stop_allocation(&mut self, allocation_id: i64) -> R<()> {
+        self.stop_allocation_inner(allocation_id, true)
+    }
+
+    /// Begins stopping an allocation and forgets it as *running* work.
     ///
-    /// Deliberately non-blocking. The caller — `reconcile_allocations` under
-    /// the heartbeat's lock, or an in-place re-dispatch — must be free to
-    /// return immediately; [`Self::finish_ready_terminations`] does the
-    /// waiting from the task supervisor's tick.
-    pub fn begin_stop_allocation(
-        &mut self,
-        allocation_id: i64,
-        remove_dirs: bool,
-    ) -> Option<std::time::Instant> {
-        if !self.instances.contains_key(&allocation_id) {
-            return None;
-        }
-        if let Some(pending) = self.terminating.get(&allocation_id) {
-            // Already draining; the deadline stands.
-            return Some(pending.deadline);
-        }
+    /// Returns without waiting. When the task's runtime accepted a stop
+    /// notice, the allocation moves into [`Self::terminating`] with its
+    /// deadline and [`Self::reap_terminating`] finishes it; otherwise the
+    /// teardown happens inline, exactly as it did before graceful stop.
+    ///
+    /// `remove_dirs: false` keeps the task directory in place so an immediate
+    /// relaunch of the same allocation (in-place re-dispatch) can reuse
+    /// already-staged artifacts via the staging manifest.
+    fn stop_allocation_inner(&mut self, allocation_id: i64, remove_dirs: bool) -> R<()> {
         if let Some(monitor) = self.health_monitors.remove(&allocation_id) {
             monitor.shutdown();
         }
 
-        // Consume the notice: a cause describes one stop, and this is it.
+        // Consume the notice: a cause describes one stop, and the allocation
+        // leaves the live set by the end of this function.
         let cause = self
             .stop_causes
             .remove(&allocation_id)
             .unwrap_or(StopCause::Unknown);
-        let task = self.task_configs.get(&allocation_id).cloned();
-        let ctx = match task.as_ref() {
-            Some(task) => StopContext::for_task(cause, task),
-            None => StopContext::new(cause),
-        };
-        // A runtime with nothing to signal gets no drain window: waiting out
-        // a grace period it cannot use would only make its teardown slower
-        // than it is today. `stopSignal`/`stopGracePeriod` are accepted and
-        // inert on such a runtime, which is what the docs promise.
-        let signalable = task
-            .as_ref()
-            .and_then(|task| self.registry.plugin(&task.runtime))
-            .is_some_and(|plugin| plugin.supports_signal());
-        let deadline = if signalable {
-            std::time::Instant::now() + ctx.grace_period
-        } else {
-            std::time::Instant::now()
-        };
 
-        if let (Some(allocation), Some(task)) =
-            (self.allocations.get(&allocation_id).cloned(), task.as_ref())
-        {
-            info!(
-                allocation_id,
-                task_name = %task.name,
-                cause = %cause,
-                signal = %ctx.signal,
-                signalable,
-                grace_period_secs = ctx.grace_period.as_secs_f64(),
-                "Stopping allocation"
-            );
-            if signalable {
-                if let Some(plugin) = self.registry.plugin(&task.runtime) {
-                    if let Some(instance) = self.instances.get_mut(&allocation_id) {
-                        // Best-effort: a task that has already exited goes
-                        // straight to the reap, which is not an error worth
-                        // failing a stop over.
-                        if let Err(err) = plugin.signal(&allocation, task, instance, &ctx.signal) {
-                            debug!(
-                                allocation_id,
-                                task_name = %task.name,
-                                signal = %ctx.signal,
-                                error = %err,
-                                "Stop signal not delivered; the task will be reaped at the deadline"
-                            );
-                        }
-                    }
-                }
-            }
-        }
-
-        self.terminating.insert(
-            allocation_id,
-            PendingTermination {
-                deadline,
-                // The wait happens here, in the supervisor's tick, so the
-                // runtime's own ladder must not wait again.
-                ctx: StopContext {
-                    grace_period: std::time::Duration::ZERO,
-                    ..ctx
-                },
-                remove_dirs,
-            },
-        );
-        Some(deadline)
-    }
-
-    /// Whether a draining allocation is ready to be reaped: its process is
-    /// gone, or its grace period has run out.
-    ///
-    /// Takes `&mut self` because liveness is checked through the child handle
-    /// when this worker owns one. A `kill(pid, 0)` probe would report an
-    /// exited-but-unreaped child as *alive* — it is a zombie until someone
-    /// waits on it — and every drained task would then burn its full grace
-    /// period before teardown.
-    pub fn termination_ready(&mut self, allocation_id: i64) -> bool {
-        let Some(pending) = self.terminating.get(&allocation_id) else {
-            // Not draining: either never started, or already finished.
-            return true;
-        };
-        if std::time::Instant::now() >= pending.deadline {
-            return true;
-        }
-        match self.instances.get_mut(&allocation_id) {
-            Some(instance) => match instance.child.as_mut() {
-                // `try_wait` caches the status, so the reap below still gets it.
-                Some(child) => !matches!(child.try_wait(), Ok(None)),
-                None => match instance.pid {
-                    Some(pid) => !crate::signals::pid_alive(pid),
-                    None => true,
-                },
-            },
-            None => true,
-        }
-    }
-
-    /// Reap every draining allocation whose process is gone or whose grace
-    /// period has expired. Called from the task supervisor's tick, which runs
-    /// off the heartbeat path.
-    pub fn finish_ready_terminations(&mut self) {
-        let draining = self.terminating.keys().copied().collect::<Vec<_>>();
-        for allocation_id in draining {
-            if self.termination_ready(allocation_id) {
-                self.finish_stop_allocation(allocation_id);
-            }
-        }
-    }
-
-    /// Phase two: run the runtime's teardown, release everything the
-    /// allocation held, and forget it.
-    pub fn finish_stop_allocation(&mut self, allocation_id: i64) {
-        let Some(pending) = self.terminating.remove(&allocation_id) else {
-            return;
-        };
-        if let Err(err) =
-            self.stop_allocation_inner(allocation_id, pending.remove_dirs, &pending.ctx)
-        {
-            warn!(allocation_id, error = ?err, "Failed to tear down stopped allocation");
-        }
-    }
-
-    /// Stops an allocation's process and forgets it. `remove_dirs: false`
-    /// keeps the task directory in place so an immediate relaunch of the
-    /// same allocation (in-place re-dispatch) can reuse already-staged
-    /// artifacts via the staging manifest.
-    fn stop_allocation_inner(
-        &mut self,
-        allocation_id: i64,
-        remove_dirs: bool,
-        stop_ctx: &StopContext,
-    ) -> R<()> {
-        if let Some(monitor) = self.health_monitors.remove(&allocation_id) {
-            monitor.shutdown();
-        }
-        // A notice describes one stop, and this is its end.
-        self.stop_causes.remove(&allocation_id);
-        self.terminating.remove(&allocation_id);
-
-        let allocation = self.allocations.get(&allocation_id).cloned();
-        let task = self.task_configs.get(&allocation_id).cloned();
-        let cause = stop_ctx.cause;
-        if let (Some(allocation), Some(task)) = (allocation.as_ref(), task.as_ref()) {
-            info!(
-                allocation_id,
-                task_name = %task.name,
-                cause = %cause,
-                "Tearing down allocation"
-            );
-            if let Some(plugin) = self.registry.plugin(&task.runtime) {
-                if let Some(instance) = self.instances.get_mut(&allocation_id) {
-                    if let Err(err) = plugin.stop_with(allocation, task, instance, stop_ctx) {
-                        warn!(
-                            allocation_id,
-                            task_name = %task.name,
-                            cause = %cause,
-                            error = ?err,
-                            "Failed to stop allocation instance"
-                        );
-                    }
-                    if let Err(err) = plugin.destroy(allocation, task, instance) {
-                        warn!(
-                            allocation_id,
-                            task_name = %task.name,
-                            error = ?err,
-                            "Failed to destroy allocation instance"
-                        );
-                    }
-                }
-            }
-        }
-
-        // Release storage after the process is gone, never before: unmounting
-        // under a live task is how you corrupt a database. Best-effort — the
-        // data survives an unmount by contract, and a stuck driver must not
-        // block teardown.
-        self.volumes.unmount_for_allocation(allocation_id);
-
-        // Return this allocation's cores to the share slice and drop its
-        // cgroup, also strictly after the process is gone.
-        let assignment = self
-            .instances
-            .get(&allocation_id)
-            .and_then(|instance| instance.resource_assignment.clone());
-        self.resources.release(allocation_id, assignment.as_ref());
-
-        self.instances.remove(&allocation_id);
-        self.allocations.remove(&allocation_id);
-        self.task_configs.remove(&allocation_id);
+        // Drop the live-set bookkeeping first, so nothing downstream (a
+        // heartbeat racing the reap, the supervisor's exit poll) still counts
+        // this allocation as running while it drains.
+        let allocation = self.allocations.remove(&allocation_id);
+        let task = self.task_configs.remove(&allocation_id);
+        let instance = self.instances.remove(&allocation_id);
         self.allocation_health.remove(&allocation_id);
         self.self_fence_windows.remove(&allocation_id);
         self.terminated.remove(&allocation_id);
         self.restart_history.remove(&allocation_id);
         self.artifact_status.remove(allocation_id);
+
+        let (Some(allocation), Some(task), Some(mut instance)) = (allocation, task, instance)
+        else {
+            // Nothing was ever started for this id; there is no process to
+            // wait on, so complete the teardown now. No assignment to release
+            // — `release` still clears any reservation booked against the id.
+            self.finish_teardown(allocation_id, remove_dirs, None);
+            return Ok(());
+        };
+
+        let stop = task.stop_config();
+        let ctx = StopContext::with_ladder(cause, &stop.signal, stop.kill_after);
+        // The notice lands BEFORE the signal, always: a task that wakes on
+        // SIGTERM and immediately reads the file must find it there.
+        self.write_stop_notice(&allocation, &task, &instance, &ctx);
+
+        info!(
+            allocation_id,
+            task_name = %task.name,
+            cause = %cause,
+            signal = %ctx.signal,
+            grace_secs = ctx.grace.as_secs(),
+            "Stopping allocation"
+        );
+
+        let signalled = match self.registry.plugin(&task.runtime) {
+            Some(plugin) => plugin
+                .stop_with(&allocation, &task, &mut instance, &ctx)
+                .unwrap_or_else(|err| {
+                    warn!(
+                        allocation_id,
+                        task_name = %task.name,
+                        cause = %cause,
+                        error = ?err,
+                        "Failed to signal allocation instance; stopping it hard"
+                    );
+                    false
+                }),
+            None => false,
+        };
+
+        if signalled {
+            self.terminating.insert(
+                allocation_id,
+                TerminatingAllocation {
+                    allocation,
+                    task,
+                    instance,
+                    cause,
+                    deadline: ctx.deadline,
+                    remove_dirs,
+                },
+            );
+            self.persist_state();
+            return Ok(());
+        }
+
+        // No notice was delivered (a runtime with no graceful path, no
+        // tracked process, or a failed signal): tear down immediately.
+        self.destroy_and_finish(
+            allocation_id,
+            &allocation,
+            &task,
+            &mut instance,
+            remove_dirs,
+        );
+        Ok(())
+    }
+
+    /// Write the task's stop notice into its task directory, best-effort.
+    ///
+    /// Failures are logged and swallowed on purpose: the notice is an
+    /// advisory convenience, and a full disk (or a task dir a hardened task
+    /// user made unwritable) must never turn a stop into a stuck allocation.
+    fn write_stop_notice(
+        &self,
+        allocation: &Allocation,
+        task: &TaskConfig,
+        instance: &TaskInstance,
+        ctx: &StopContext,
+    ) {
+        let Some(path) = instance
+            .extra_env
+            .get(crate::structs::STOP_NOTICE_PATH_ENV)
+            .map(PathBuf::from)
+        else {
+            return;
+        };
+        let deadline = time::OffsetDateTime::now_utc()
+            + time::Duration::try_from(ctx.grace).unwrap_or(time::Duration::ZERO);
+        let notice = crate::structs::TaskStopNotice {
+            cause: ctx.cause,
+            deadline: deadline
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap_or_default(),
+            signal: ctx.signal.clone(),
+            grace_seconds: ctx.grace.as_secs(),
+            preemptor: self.preemptors.get(&allocation.id).cloned(),
+        };
+        let write = serde_json::to_vec_pretty(&notice)
+            .map_err(std::io::Error::other)
+            .and_then(|bytes| std::fs::write(&path, bytes));
+        if let Err(err) = write {
+            warn!(
+                allocation_id = allocation.id,
+                task_name = %task.name,
+                path = %path.display(),
+                error = ?err,
+                "Failed to write stop notice; stopping anyway"
+            );
+        }
+    }
+
+    /// Run the runtime's `destroy`, then release storage and directories.
+    fn destroy_and_finish(
+        &mut self,
+        allocation_id: i64,
+        allocation: &Allocation,
+        task: &TaskConfig,
+        instance: &mut TaskInstance,
+        remove_dirs: bool,
+    ) {
+        if let Some(plugin) = self.registry.plugin(&task.runtime) {
+            if let Err(err) = plugin.destroy(allocation, task, instance) {
+                warn!(
+                    allocation_id,
+                    task_name = %task.name,
+                    error = ?err,
+                    "Failed to destroy allocation instance"
+                );
+            }
+        }
+        let assignment = instance.resource_assignment.clone();
+        self.finish_teardown(allocation_id, remove_dirs, assignment.as_ref());
+    }
+
+    /// The last teardown step, shared by the immediate and the reaped paths.
+    fn finish_teardown(
+        &mut self,
+        allocation_id: i64,
+        remove_dirs: bool,
+        assignment: Option<&ResourceAssignment>,
+    ) {
+        // Release storage after the process is gone, never before: unmounting
+        // under a live task is how you corrupt a database. Grace is exactly
+        // what decoupled "stop returned" from "process is gone", so this must
+        // stay behind the reap rather than beside the signal. Best-effort —
+        // the data survives an unmount by contract, and a stuck driver must
+        // not block teardown.
+        self.volumes.unmount_for_allocation(allocation_id);
+
+        // Return this allocation's reserved cores to the share slice and drop
+        // its cgroup — for exactly the same reason, and so strictly behind
+        // the reap too: a cgroup still holding a live process will not be
+        // removed, and cores handed back early could be reserved by an
+        // incoming task while the outgoing one is still on them.
+        self.resources.release(allocation_id, assignment);
+
+        self.preemptors.remove(&allocation_id);
         if remove_dirs {
             self.volume_specs.remove(&allocation_id);
-        }
-        if remove_dirs {
             self.cleanup_alloc_dir(allocation_id);
         }
         self.persist_state();
+    }
 
-        Ok(())
+    /// Finish every terminating allocation whose process has exited, and hard
+    /// kill every one whose grace window has closed. Driven by the worker's
+    /// task supervisor (once a second), never by the heartbeat path.
+    ///
+    /// Returns what happened to each, newest ids last, for logging and tests.
+    pub fn reap_terminating(&mut self) -> Vec<(i64, ReapOutcome)> {
+        if self.terminating.is_empty() {
+            return Vec::new();
+        }
+        let now = std::time::Instant::now();
+        let mut ready: Vec<(i64, ReapOutcome)> = Vec::new();
+        for (allocation_id, entry) in self.terminating.iter_mut() {
+            if !Self::instance_process_alive(&mut entry.instance) {
+                ready.push((*allocation_id, ReapOutcome::Exited));
+            } else if now >= entry.deadline {
+                ready.push((*allocation_id, ReapOutcome::Killed));
+            }
+        }
+        ready.sort_unstable_by_key(|(allocation_id, _)| *allocation_id);
+
+        for (allocation_id, outcome) in &ready {
+            let Some(mut entry) = self.terminating.remove(allocation_id) else {
+                continue;
+            };
+            match outcome {
+                ReapOutcome::Exited => info!(
+                    allocation_id = *allocation_id,
+                    task_name = %entry.task.name,
+                    cause = %entry.cause,
+                    "Allocation exited within its grace period"
+                ),
+                ReapOutcome::Killed => warn!(
+                    allocation_id = *allocation_id,
+                    task_name = %entry.task.name,
+                    cause = %entry.cause,
+                    "Allocation ignored its stop signal; killing at the grace deadline"
+                ),
+            }
+            // `destroy` is the hard stop either way. After a clean exit it is
+            // pure teardown (image scratch, cgroup, container row); after a
+            // timeout it is also the SIGKILL.
+            let allocation = entry.allocation.clone();
+            let task = entry.task.clone();
+            let remove_dirs = entry.remove_dirs;
+            self.destroy_and_finish(
+                *allocation_id,
+                &allocation,
+                &task,
+                &mut entry.instance,
+                remove_dirs,
+            );
+        }
+        ready
+    }
+
+    /// Whether a terminating instance's process is still running. Reaps the
+    /// child handle when it has exited so the pid is not left claimed.
+    fn instance_process_alive(instance: &mut TaskInstance) -> bool {
+        if let Some(child) = instance.child.as_mut() {
+            return match child.try_wait() {
+                Ok(Some(_status)) => {
+                    instance.child = None;
+                    instance.pid = None;
+                    false
+                }
+                Ok(None) => true,
+                // An un-waitable child is not evidence of a live process; the
+                // deadline still bounds the wait either way.
+                Err(_) => false,
+            };
+        }
+        match instance.pid {
+            Some(pid) => pid_is_running(pid),
+            None => false,
+        }
+    }
+
+    /// Whether any allocation is still inside its grace window. The worker
+    /// holds new launches while this is true (see
+    /// [`Self::reconcile_allocations`]).
+    pub fn has_terminating(&self) -> bool {
+        !self.terminating.is_empty()
+    }
+
+    /// Allocation ids currently draining, for tests and diagnostics.
+    pub fn terminating_ids(&self) -> Vec<i64> {
+        let mut ids = self.terminating.keys().copied().collect::<Vec<_>>();
+        ids.sort_unstable();
+        ids
     }
 
     /// Whether an allocation is still wanted (used by staging threads to
@@ -1332,22 +1468,18 @@ impl WorkerTaskManager {
             .insert(alloc.id, parse_volume_mounts(allocation)?);
         // A re-dispatch of an id we already run is an in-place update (for
         // example a config change reusing the allocation). The previous
-        // instance was already drained by `launch_task_allocation` before
-        // this call — outside the task-manager lock, so the grace wait never
-        // blocks a heartbeat. Reaching here with the id still present means
-        // the drain could not complete; tear it down now rather than
-        // launching over a live process.
+        // instance is normally gone already: `reconcile_allocations` holds a
+        // re-dispatch back while anything is still terminating. Reaching here
+        // with the id present means that did not happen, so tear it down now
+        // rather than launching over a live process. `remove_dirs: false`
+        // keeps the staged artifacts for the relaunch.
         if self.instances.contains_key(&alloc.id) {
             warn!(
                 allocation_id = alloc.id,
                 task_name = %task.name,
-                "Re-dispatched allocation was still present after its drain; forcing teardown"
+                "Re-dispatched allocation was still present; forcing teardown"
             );
-            let ctx = StopContext {
-                grace_period: std::time::Duration::ZERO,
-                ..StopContext::new(StopCause::Unknown)
-            };
-            if let Err(err) = self.stop_allocation_inner(alloc.id, false, &ctx) {
+            if let Err(err) = self.stop_allocation_inner(alloc.id, false) {
                 warn!(
                     allocation_id = alloc.id,
                     error = ?err,
@@ -1741,48 +1873,6 @@ fn exit_from_status(status: &std::process::ExitStatus) -> (Option<i32>, Option<i
     }
 }
 
-/// How often the re-dispatch drain re-checks whether the previous instance
-/// has exited.
-const DRAIN_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
-
-/// Drain a previous instance of `allocation_id` before relaunching over it.
-///
-/// An in-place re-dispatch (a config change reusing the allocation) must not
-/// start a new process while the old one still holds the task's ports, files,
-/// and cgroup. The old instance therefore gets its declared `stopSignal` and
-/// `stopGracePeriod` like any other stop — but the wait happens **here**,
-/// with the task-manager lock released between polls, because this runs on a
-/// blocking launch thread whose lock the heartbeat loop also needs.
-fn drain_previous_instance(manager: &Arc<Mutex<WorkerTaskManager>>, allocation_id: i64) {
-    let deadline = {
-        let mut guard = manager.lock().expect("task manager");
-        guard.begin_stop_allocation(allocation_id, false)
-    };
-    let Some(deadline) = deadline else {
-        return;
-    };
-    info!(
-        allocation_id,
-        "Re-dispatched allocation; draining previous instance before relaunch"
-    );
-    loop {
-        {
-            let mut guard = manager.lock().expect("task manager");
-            if guard.termination_ready(allocation_id) {
-                break;
-            }
-        }
-        if std::time::Instant::now() >= deadline {
-            break;
-        }
-        std::thread::sleep(DRAIN_POLL_INTERVAL);
-    }
-    manager
-        .lock()
-        .expect("task manager")
-        .finish_stop_allocation(allocation_id);
-}
-
 /// Launches one allocation end to end: synchronous start for artifact-less
 /// tasks, a dedicated staging thread for artifact-bearing ones. Failures land
 /// in `record_failure` (heartbeat -> manager `on_unhealthy` move logic), the
@@ -1792,7 +1882,6 @@ pub fn launch_task_allocation(
     manager: &Arc<Mutex<WorkerTaskManager>>,
     allocation: &TaskAllocation,
 ) -> R<()> {
-    drain_previous_instance(manager, allocation.allocation_id);
     let outcome = {
         let mut guard = manager.lock().expect("task manager");
         match guard.begin_task_allocation(allocation) {
@@ -1928,15 +2017,13 @@ fn task_from_allocation(allocation: &TaskAllocation) -> R<(Allocation, TaskConfi
         serde_json::from_str(&allocation.task_resources).context("Invalid task resources JSON")?
     };
 
-    // The declared stop ladder. Empty/0 mean the task declared none, which is
+    // The declared stop ladder. Empty means the task declared none, which is
     // not the same as declaring the default: the container runtime consults
-    // the image's own `StopSignal` only when the jobspec was silent.
-    let stop_signal = Some(allocation.task_stop_signal.trim())
-        .filter(|value| !value.is_empty())
-        .map(str::to_string);
-    let stop_grace_period = match allocation.task_stop_grace_period_seconds {
-        0 => None,
-        seconds => Some(format!("{seconds}s")),
+    // the image's own `STOPSIGNAL` only when the jobspec was silent.
+    let stop = if allocation.task_stop.trim().is_empty() {
+        None
+    } else {
+        Some(serde_json::from_str(&allocation.task_stop).context("Invalid task stop JSON")?)
     };
 
     let task = TaskConfig {
@@ -1947,8 +2034,7 @@ fn task_from_allocation(allocation: &TaskAllocation) -> R<(Allocation, TaskConfi
         artifacts,
         connect,
         resources,
-        stop_signal,
-        stop_grace_period,
+        stop,
         ..TaskConfig::new(&allocation.task_name, &allocation.task_runtime)
     };
     let alloc = Allocation {
@@ -2052,8 +2138,7 @@ mod tests {
         );
         assert!(manager.poll_task_exits().is_empty());
 
-        manager.begin_stop_allocation(alloc().id, true);
-        manager.finish_stop_allocation(alloc().id);
+        manager.stop_allocation(alloc().id)?;
         Ok(())
     }
 
@@ -2195,16 +2280,152 @@ mod tests {
 
         let alloc_dir = temp_dir.path().join("allocs").join("5");
         assert!(alloc_dir.is_dir());
-        // Stopping is two-phase: reconcile signals and records the deadline,
-        // the supervisor's tick reaps. The directory survives the drain and
-        // is removed by the reap.
+
+        // Graceful stop is two-phase. The reconcile signals and returns, so
+        // the allocation is out of the running set but its directory (and,
+        // crucially, its volumes) are still held.
         let _ = manager.reconcile_allocations(&[]);
-        assert!(
-            alloc_dir.is_dir(),
-            "the alloc dir must survive while the task is draining"
+        assert_eq!(
+            manager.terminating_ids(),
+            vec![5],
+            "a signalled allocation waits in the terminating set"
         );
-        manager.finish_ready_terminations();
-        assert!(!alloc_dir.exists(), "alloc dir must be cleaned on stop");
+        assert!(
+            alloc_dir.exists(),
+            "teardown must wait for the process to exit — unmounting under a live task \
+             is how a database gets corrupted"
+        );
+
+        // The reaper finishes it. `true` exits immediately, so this is the
+        // exited path, not the deadline path.
+        let reaped = loop {
+            let reaped = manager.reap_terminating();
+            if !reaped.is_empty() {
+                break reaped;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert_eq!(reaped, vec![(5, ReapOutcome::Exited)]);
+        assert!(!alloc_dir.exists(), "alloc dir must be cleaned once reaped");
+        assert!(manager.terminating_ids().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn a_task_that_ignores_its_stop_signal_is_killed_at_the_deadline() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let mut manager = manager_in(&temp_dir);
+        // Traps SIGTERM and keeps running: the case `killAfter` exists for.
+        let task = TaskConfig {
+            config: json!({"command": ["sh", "-c", "trap '' TERM; sleep 30"]}),
+            stop: Some(crate::structs::StopConfig {
+                signal: "SIGTERM".into(),
+                kill_after: std::time::Duration::ZERO,
+            }),
+            ..TaskConfig::new("stubborn", "exec")
+        };
+        manager.run_allocation(&alloc(), &task)?;
+
+        let _ = manager.reconcile_allocations(&[]);
+        assert_eq!(manager.terminating_ids(), vec![5]);
+
+        // A zero grace window is already expired, so the very first reap
+        // takes it — no sleeping, no flakiness.
+        let reaped = manager.reap_terminating();
+        assert_eq!(
+            reaped,
+            vec![(5, ReapOutcome::Killed)],
+            "a task still running at the deadline is killed, not waited on forever"
+        );
+        assert!(manager.terminating_ids().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn stops_order_before_starts_on_a_node_with_draining_work() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let mut manager = manager_in(&temp_dir);
+        let task = TaskConfig {
+            config: json!({"command": ["sh", "-c", "trap '' TERM; sleep 30"]}),
+            // Zero grace so the reap below is deterministic; the ordering
+            // rule under test is the same at any window length.
+            stop: Some(crate::structs::StopConfig {
+                signal: "SIGTERM".into(),
+                kill_after: std::time::Duration::ZERO,
+            }),
+            ..TaskConfig::new("victim", "exec")
+        };
+        manager.run_allocation(&alloc(), &task)?;
+
+        // The manager's next desired set drops allocation 5 and adds 6 — the
+        // shape a preemption plan produces, since victim and preemptor commit
+        // together and arrive in one heartbeat diff.
+        let preemptor = TaskAllocation {
+            allocation_id: 6,
+            ..Default::default()
+        };
+        let launch = manager.reconcile_allocations(&[preemptor.clone()]);
+        assert!(
+            launch.is_empty(),
+            "the preemptor must not start while the victim is still running"
+        );
+        assert_eq!(manager.terminating_ids(), vec![5]);
+
+        // Once the victim is gone the next heartbeat's reconcile releases it.
+        // (The manager keeps re-offering the allocation, so nothing is lost.)
+        manager.reap_terminating();
+        assert!(manager.terminating_ids().is_empty());
+        let launch = manager.reconcile_allocations(&[preemptor]);
+        assert_eq!(
+            launch.iter().map(|a| a.allocation_id).collect::<Vec<_>>(),
+            vec![6],
+            "the held-back allocation is offered again once the node is clear"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn every_task_gets_a_stop_notice_path_it_can_read() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let mut manager = manager_in(&temp_dir);
+        let task = TaskConfig {
+            config: json!({"command": ["sh", "-c", "sleep 30"]}),
+            ..TaskConfig::new("noticed", "exec")
+        };
+        manager.run_allocation(&alloc(), &task)?;
+
+        let notice_path = manager
+            .instances
+            .get(&5)
+            .and_then(|instance| instance.extra_env.get(crate::structs::STOP_NOTICE_PATH_ENV))
+            .cloned()
+            .expect("every task is told where its stop notice will be");
+        assert!(
+            !std::path::Path::new(&notice_path).exists(),
+            "the notice is written at stop, not at start"
+        );
+
+        manager.set_stop_causes(HashMap::from([(5, StopCause::Preempted)]));
+        manager.set_stop_preemptors(HashMap::from([(
+            5,
+            crate::structs::StopNoticePreemptor {
+                job: "api".into(),
+                band: "high".into(),
+            },
+        )]));
+        let _ = manager.reconcile_allocations(&[]);
+
+        let notice: crate::structs::TaskStopNotice =
+            serde_json::from_slice(&std::fs::read(&notice_path)?)?;
+        assert_eq!(notice.cause, StopCause::Preempted);
+        assert_eq!(notice.signal, "SIGTERM");
+        assert_eq!(notice.grace_seconds, 30, "the built-in default ladder");
+        assert_eq!(
+            notice.preemptor.as_ref().map(|p| p.job.as_str()),
+            Some("api"),
+            "a preempted task learns who took its capacity"
+        );
+        manager.reap_terminating();
         Ok(())
     }
 
@@ -2265,14 +2486,7 @@ mod tests {
 
         assert!(manager.allocations.contains_key(&allocation.id));
         assert!(manager.allocation_health.contains_key(&allocation.id));
-
         let _ = manager.reconcile_allocations(&[]);
-        // The allocation stays in the maps while it drains, so the heartbeat
-        // keeps reporting it as this node's — the manager must not re-dispatch
-        // it onto us mid-teardown.
-        assert!(manager.allocations.contains_key(&allocation.id));
-
-        manager.finish_ready_terminations();
         assert!(!manager.allocations.contains_key(&allocation.id));
         assert!(!manager.instances.contains_key(&allocation.id));
         assert!(!manager.allocation_health.contains_key(&allocation.id));
@@ -2332,26 +2546,28 @@ mod tests {
         // has not arrived yet. The allocation must still go away: causes are
         // advisory, and a stop is never gated on one.
         let _ = manager.reconcile_allocations(&[]);
-        manager.finish_ready_terminations();
         assert!(!manager.allocations.contains_key(&allocation.id));
         assert!(!manager.instances.contains_key(&allocation.id));
         Ok(())
     }
 
-    /// The grace wait must never run under the task-manager lock: it is held
-    /// by the heartbeat loop, and a stalled heartbeat gets the node declared
-    /// lost (and its stateful allocations self-fenced). `reconcile` therefore
-    /// signals and returns; the reap happens on the supervisor's tick.
+    /// The regression guard for the heartbeat stall: reconcile must return
+    /// immediately even when the grace window is long. Every other stop test
+    /// uses a zero window, so none of them would catch a blocking wait
+    /// creeping back into `stop_with` — this one uses five minutes.
     #[test]
     fn reconcile_never_waits_out_a_grace_period() -> R<()> {
         let temp_dir = TempDir::new()?;
         let mut manager = manager_in(&temp_dir);
         let task = TaskConfig {
-            // Ignores SIGTERM, so only the deadline can end it.
+            // Ignores SIGTERM, so only the deadline could ever end it.
             config: json!({
                 "command": ["/bin/sh", "-c", "trap '' TERM; while :; do sleep 0.1; done"],
             }),
-            stop_grace_period: Some("5m".into()),
+            stop: Some(crate::structs::StopConfig {
+                signal: "SIGTERM".into(),
+                kill_after: Duration::from_secs(300),
+            }),
             ..TaskConfig::new("stubborn", "exec")
         };
         manager.run_allocation(&alloc(), &task)?;
@@ -2364,19 +2580,16 @@ mod tests {
             elapsed < Duration::from_secs(2),
             "reconcile must return immediately, took {elapsed:?}"
         );
-        assert!(
-            manager.instances.contains_key(&alloc().id),
+        assert_eq!(
+            manager.terminating_ids(),
+            vec![alloc().id],
             "the allocation is draining, not gone"
         );
 
-        // Not ready yet either — the deadline is five minutes out and the
+        // Not reapable yet either: the deadline is five minutes out and the
         // process is ignoring the signal.
-        manager.finish_ready_terminations();
-        assert!(manager.instances.contains_key(&alloc().id));
-
-        // Forcing the second phase reaps it.
-        manager.finish_stop_allocation(alloc().id);
-        assert!(!manager.instances.contains_key(&alloc().id));
+        assert!(manager.reap_terminating().is_empty());
+        assert_eq!(manager.terminating_ids(), vec![alloc().id]);
         Ok(())
     }
 
@@ -2390,32 +2603,39 @@ mod tests {
             config: json!({
                 "command": ["/bin/sh", "-c", "trap 'exit 0' TERM; while :; do sleep 0.1; done"],
             }),
-            stop_grace_period: Some("5m".into()),
+            stop: Some(crate::structs::StopConfig {
+                signal: "SIGTERM".into(),
+                kill_after: Duration::from_secs(300),
+            }),
             ..TaskConfig::new("drain", "exec")
         };
         manager.run_allocation(&alloc(), &task)?;
         thread::sleep(Duration::from_millis(300));
 
         let _ = manager.reconcile_allocations(&[]);
-        // Give the shell a moment to handle the signal it was just sent.
-        let mut reaped = false;
+        // The window is five minutes, so anything reaped here was reaped for
+        // exiting, not for timing out.
+        let mut outcome = None;
         for _ in 0..100 {
-            manager.finish_ready_terminations();
-            if !manager.instances.contains_key(&alloc().id) {
-                reaped = true;
+            if let Some(reaped) = manager.reap_terminating().first().copied() {
+                outcome = Some(reaped);
                 break;
             }
             thread::sleep(Duration::from_millis(20));
         }
-        assert!(reaped, "a task that honored its stop signal must be reaped");
+        assert_eq!(
+            outcome,
+            Some((alloc().id, ReapOutcome::Exited)),
+            "a task that honored its stop signal must be reaped on exit, not at the deadline"
+        );
         Ok(())
     }
 
-    /// A runtime with nothing to signal gets no drain window: waiting one out
-    /// would only make its teardown slower than it is today. The fields stay
-    /// accepted — they are simply inert, which is what the docs promise.
+    /// A runtime that cannot deliver a stop notice declines it, and the
+    /// worker tears the allocation down immediately rather than holding it
+    /// for a window nothing can use.
     #[test]
-    fn a_runtime_that_cannot_signal_is_reaped_without_a_drain() -> R<()> {
+    fn a_runtime_that_cannot_signal_is_torn_down_without_a_drain() -> R<()> {
         let temp_dir = TempDir::new()?;
         let mut manager = manager_in(&temp_dir);
 
@@ -2429,21 +2649,23 @@ mod tests {
         manager.task_configs.insert(
             allocation.id,
             TaskConfig {
-                // `sandbox` reports supports_signal() == false: reaching
-                // inside a guest needs an agent it does not have.
-                stop_grace_period: Some("5m".into()),
+                // `sandbox` declines the notice: reaching inside a guest
+                // needs an in-VM agent it does not have.
+                stop: Some(crate::structs::StopConfig {
+                    signal: "SIGTERM".into(),
+                    kill_after: Duration::from_secs(300),
+                }),
                 config: json!({"image": "alpine", "command": ["/bin/sh", "-c", "sleep 1"]}),
                 ..TaskConfig::new("box", "sandbox")
             },
         );
         manager.registry.load_plugin("sandbox", false)?;
 
-        manager.begin_stop_allocation(allocation.id, true);
+        let _ = manager.reconcile_allocations(&[]);
         assert!(
-            manager.termination_ready(allocation.id),
-            "no signal to wait on means no window to wait out"
+            manager.terminating_ids().is_empty(),
+            "a declined notice means no drain window to wait out"
         );
-        manager.finish_ready_terminations();
         assert!(!manager.instances.contains_key(&allocation.id));
         Ok(())
     }

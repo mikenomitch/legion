@@ -44,16 +44,18 @@ Optional:
   - configure process options,
   - spawn child,
   - store child and PID in runtime.
-- `stop` runs the task's stop ladder: deliver its `stopSignal` (default
-  `SIGTERM`), wait up to its `stopGracePeriod` (default `10s`, capped at 5m at
-  admission) for the process to exit on its own, then kill the tracked child
-  handle — or, failing that, by PID lookup. A process that exits inside the
-  window is never force-killed; one that ignores the signal is killed at the
-  deadline. Both fields are task-level, next to `resources`; see
-  [Task Supervision](task-supervision.md).
-- Under worker-owned enforcement, the hard-kill step additionally writes
+- The **stop notice** is the trait default: the task's `stop.signal` is
+  delivered to the process *group* (tasks are spawned into their own session,
+  so a shell-wrapped task's children are reached too), and the call returns
+  immediately. The worker holds the allocation until it exits or its
+  `stop.killAfter` window closes — see [Graceful stop](graceful-stop.md).
+- `stop` is the **hard** step the worker's reaper calls at that point: kill
+  the tracked child handle, or failing that by PID lookup. A process that
+  exited inside its window is already gone and is never force-killed.
+- Under worker-owned enforcement, that step additionally writes
   `cgroup.kill`, which reaps double-forked descendants that reparented away
-  from the tracked pid.
+  from the tracked pid — strictly after the reap, so a task that drained
+  cleanly is never SIGKILLed for the privilege.
 - `destroy` delegates to `stop`.
 
 Spawn helper sets a new session (`setsid`) on Unix so task processes survive worker restarts and are signal-isolated from worker process handling.
@@ -83,7 +85,7 @@ Spawn helper sets a new session (`setsid`) on Unix so task processes survive wor
 | KV file injection | ✅ |
 | Identity env / file delivery | ✅ / ✅ |
 | Signal delivery | ✅ |
-| Graceful stop (`stopSignal` / `stopGracePeriod`) | ✅ |
+| Graceful stop (`stop { signal, killAfter }`) | ✅ |
 | Memory / CPU limits, exclusive cores | ✅ Linux with `resourceEnforcement.enabled` — see [docs/resource-enforcement.md](resource-enforcement.md) |
 | Exit reporting / restart policy | ✅ (see [Task Supervision](task-supervision.md)) |
 | Artifacts | ✅ (File/Tree + interpolation + env) |

@@ -2,14 +2,24 @@
 
 > **Judgement calls:** [../calls/container-runtime-exec-and-signals-plan_calls.md](../calls/container-runtime-exec-and-signals-plan_calls.md)
 
-**Status: SHIPPED** (2026-07-31). All seven phases landed together.
+**Status: SHIPPED** (2026-07-31), six of seven phases. **Phase 3 (graceful
+stop) was superseded before merge** by the preemption plan's Phase 1b, which
+landed on `main` first with the same feature under a different surface —
+`stop { signal, killAfter }` instead of this plan's `stopSignal` /
+`stopGracePeriod`, and one ladder for every stop cause rather than a
+per-runtime one. This plan's duplicate surface was dropped at the merge; see
+[calls entry 19](../calls/container-runtime-exec-and-signals-plan_calls.md).
+What survived from Phase 3 is the part Phase 1b does not cover: the
+`container` runtime's own delivery (signal the container *init*, not the
+launching CLI) and the Linux image-`STOPSIGNAL` default chain.
 
 Deviations from the plan as written, each recorded in the
 [judgement calls](../calls/container-runtime-exec-and-signals-plan_calls.md)
-(entries 8–11): the wire *does* gain two `TaskAllocation` fields (§7 claimed
+(entries 8–11, 19): the wire *does* gain a `TaskAllocation` field (§7 claimed
 none were needed — the worker never receives the jobspec, only the dispatched
-allocation); the enforcement subsystem reuses the existing opt-in
-`resourceEnforcement` worker config as its gate rather than shipping
+allocation, which is why `main`'s own `stop` block was reaching no worker
+until this branch carried it); the enforcement subsystem reuses the existing
+opt-in `resourceEnforcement` worker config as its gate rather than shipping
 ungated; the `cores`-xor-`cpu` rule turned out to already exist in the
 scheduler's resource normalization; and `resources.cpus` is the scheduler's
 alias for `cpu` (MHz), **not** for `cores`, so it does not request a cpuset.
@@ -17,6 +27,7 @@ alias for `cpu` (MHz), **not** for `cores`, so it does not request a cpuset.
 Public documentation: [docs/task-runtime-container.md](../../docs/task-runtime-container.md),
 [docs/resource-enforcement.md](../../docs/resource-enforcement.md) (new),
 [docs/task-supervision.md](../../docs/task-supervision.md),
+[docs/graceful-stop.md](../../docs/graceful-stop.md),
 [docs/task-runtime-plugins.md](../../docs/task-runtime-plugins.md).
 
 The `container` task runtime's four remaining core gaps, one plan, one goal:

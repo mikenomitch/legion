@@ -240,16 +240,16 @@ fn exec_task_stages_http_artifact_and_runs_from_task_dir() -> R<()> {
     }
 
     // Manager drops the allocation -> the worker signals it, then reaps it
-    // on the next supervisor tick (the grace wait never runs under the
-    // task-manager lock, which the heartbeat loop also needs).
-    {
-        let mut guard = manager.lock().unwrap();
-        let _ = guard.reconcile_allocations(&[]);
-        guard.finish_ready_terminations();
-    }
+    // once the process is gone. Teardown deliberately waits for the exit:
+    // the alloc dir (and any volumes under it) must not be removed while a
+    // task can still be writing to them (docs/graceful-stop.md).
+    let _ = manager.lock().unwrap().reconcile_allocations(&[]);
     assert!(
-        !temp_dir.path().join("allocs").join("21").exists(),
-        "alloc dir removed on destroy"
+        wait_until(Duration::from_secs(15), || {
+            manager.lock().unwrap().reap_terminating();
+            !temp_dir.path().join("allocs").join("21").exists()
+        }),
+        "alloc dir removed once the stopped task has exited"
     );
 
     server.join().ok();

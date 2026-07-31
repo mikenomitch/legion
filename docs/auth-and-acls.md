@@ -72,9 +72,9 @@ A policy is a named JSON array of rules:
 - `effect` is `allow` (default) or `deny`.
 - Scope selectors narrow a rule with `*`-globs: `names` (job names),
   `namespaces` (jobs live in `default` until namespaces land), `pools`
-  (node pools), `paths` (KV keys), `actionNames` (declared actions), and
-  `templates` (job-template names). A rule with a selector only matches
-  requests carrying that attribute.
+  (node pools), `paths` (KV keys), `actionNames` (declared actions),
+  `templates` (job-template names), and `bands` (job priority bands). A rule
+  with a selector only matches requests carrying that attribute.
 - List endpoints filter to what the caller can read: a token scoped to
   `paths: ["team-a/*"]` sees only `team-a/` keys in `legion kv list`.
 
@@ -94,6 +94,47 @@ The account can run `render`, and see and stop the jobs that template
 created, but cannot submit an arbitrary spec. See
 [Job Templates](job-templates.md) for the full model, including the
 collision guard and which endpoints carry the template attribute.
+
+**Restricting which priority bands an account may claim.** A job's
+`priority` band decides what it can displace
+([Preemption and Eviction](preemption-and-eviction.md)), so an ungoverned top
+band means nothing — everyone sets it. The `bands` selector on `job` rules is
+the gate:
+
+```jsonnet
+[
+  // prod owners may claim anything, including the never-preempted top band
+  { resources: ["job"], actions: ["write"], namespaces: ["prod"],
+    bands: ["critical", "high", "elevated", "normal", "low", "background"] },
+  // everyone else tops out at `high`
+  { resources: ["job"], actions: ["read", "write"],
+    bands: ["high", "elevated", "normal", "low", "background"] },
+]
+```
+
+Three things worth knowing:
+
+- A rule that **omits** `bands` covers every band. Bands are open by default
+  and become a privilege only where a policy says so.
+- An **unbanded** job is a `normal` job: the submit path defaults the band
+  before enforcing, so a `bands` policy still matches ordinary submissions
+  rather than silently granting nothing.
+- The gate covers submitting **through a template** that renders a band, not
+  just raw `legion job run`. Rendering is not a way around it.
+
+A refused submit names the band:
+
+```console
+$ legion job run api.jsonnet   # priority: 'critical'
+error: permission denied: this token's policy does not allow submitting jobs
+in the `critical` priority band (see the `bands` selector in
+docs/auth-and-acls.md)
+```
+
+Deliberately **not** `operator:write`: `operator` means raft, manager configs
+and observability, so gating bands on it would make everyone who may submit a
+critical job a raft administrator, and it could not express "team A may use
+`critical` in their namespace".
 
 Manage with `legion acl policy apply|list|get|delete`. Files can be JSON or
 Jsonnet (either a bare rules array or `{description, rules}`).

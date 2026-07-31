@@ -502,6 +502,35 @@ impl ResourcePool {
         self.apply_usage(request);
     }
 
+    /// Give a request's resources back — the inverse of [`Self::consume`].
+    ///
+    /// Used by preemption to model "what would this node's free capacity be
+    /// if these victims were gone", without mutating the plan's ledger until
+    /// the victim set is actually chosen.
+    ///
+    /// A resource the pool does not track is *not* invented: an untracked
+    /// amount stays untracked (the node reported no capacity for it, and
+    /// returning a victim's usage cannot conjure any), and items are only
+    /// returned to a set that exists.
+    pub(crate) fn release(&mut self, request: &ResourceRequest) {
+        for (name, usage) in &request.values {
+            match usage {
+                ResourceValue::Amount(amount) => {
+                    if let Some(ResourceValue::Amount(available)) = self.values.get_mut(name) {
+                        *available += amount;
+                    }
+                }
+                ResourceValue::Items(items) => {
+                    if let Some(ResourceValue::Items(available)) = self.values.get_mut(name) {
+                        for item in items {
+                            available.insert(item.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     pub(crate) fn apply_usage(&mut self, request: &ResourceRequest) {
         for (name, demand) in &request.values {
             match demand {

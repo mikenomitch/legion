@@ -358,6 +358,9 @@ lapse.
 
 ## 12. `stopGracePeriod: '0s'` is rejected rather than meaning "kill immediately"
 
+> **Superseded at merge** by [entry 19](#19-phase-3s-stopsignal--stopgraceperiod-surface-is-dropped-in-favour-of-mains-stop--signal-killafter-): this describes the dropped `stopSignal` / `stopGracePeriod` design, kept as the record of why it was built.
+
+
 **The call.** A zero grace period fails at submit ("must be greater than 0"),
 pointing at omitting the field for the 10s default.
 
@@ -378,6 +381,9 @@ uniform; it is simply not reachable from a jobspec.
 
 ## 13. `SIGKILL` is not in the declarable signal vocabulary
 
+> **Superseded at merge** by [entry 19](#19-phase-3s-stopsignal--stopgraceperiod-surface-is-dropped-in-favour-of-mains-stop--signal-killafter-): this describes the dropped `stopSignal` / `stopGracePeriod` design, kept as the record of why it was built.
+
+
 **The call.** `crate::signals` accepts eight signals (`SIGTERM`, `SIGINT`,
 `SIGQUIT`, `SIGHUP`, `SIGUSR1`, `SIGUSR2`, `SIGCONT`, `SIGWINCH`) — the set
 that already existed for `changeSignal` — and `stopSignal: 'SIGKILL'` is
@@ -397,6 +403,9 @@ vocabulary across `stopSignal` and `changeSignal` also means one place to
 extend and one error message shape.
 
 ## 14. Signal *and* graceful-stop policy both flow through `StopContext`
+
+> **Superseded at merge** by [entry 19](#19-phase-3s-stopsignal--stopgraceperiod-surface-is-dropped-in-favour-of-mains-stop--signal-killafter-): this describes the dropped `stopSignal` / `stopGracePeriod` design, kept as the record of why it was built.
+
 
 **The call.** `StopContext` grew `signal` and `grace_period` alongside its
 existing `cause`, resolved once by the worker from the task config, and
@@ -474,6 +483,9 @@ The path change is release-noted.
 
 ## 8b. Stopping became two-phase so the grace wait never blocks a heartbeat
 
+> **Superseded at merge** by [entry 19](#19-phase-3s-stopsignal--stopgraceperiod-surface-is-dropped-in-favour-of-mains-stop--signal-killafter-): this describes the dropped `stopSignal` / `stopGracePeriod` design, kept as the record of why it was built.
+
+
 *(Ranked with entry 8 — the two together are the execution-stage calls with
 real operational consequences. Numbered 8b rather than renumbering the entries
 below, which are cited by number in the plan's status header.)*
@@ -513,3 +525,84 @@ core still believes it owns the allocation, and gives release-ordering
 one owner and reuses a loop that already exists — and it is the same shape the
 preemption plan's eviction path will need, so that work inherits it rather
 than building a third mechanism.
+
+---
+
+## Merge-stage calls (2026-07-31)
+
+Made while merging `main` after the preemption plan (#176) landed. That plan's
+Phase 1b shipped this plan's Phase 3 under a different surface, so the entries
+below record what was dropped and why.
+
+## 19. Phase 3's `stopSignal` / `stopGracePeriod` surface is dropped in favour of `main`'s `stop { signal, killAfter }`
+
+**The call.** The graceful-stop surface this plan designed — task-level
+`stopSignal` and `stopGracePeriod` scalars, a 10-second default, an
+eight-signal vocabulary, `task_config.stop_signal` / `stop_grace_period`
+columns, and a per-runtime signal→wait→kill ladder run inside `stop_with` —
+was **deleted at the merge**. The branch now consumes `main`'s
+`stop { signal, killAfter }` block (30-second default, six-signal vocabulary,
+one `stop JSONB` column, one ladder for every stop cause). Entries 12, 13, 14
+and 8b above describe the dropped design; they are kept as the record of why
+it was built, not as a description of what shipped.
+
+**The alternatives.** (a) Keep both surfaces, mapping one onto the other —
+`stopSignal` as a documented alias for `stop.signal`; (b) keep this plan's
+surface and delete `main`'s, since this branch's ladder was per-runtime and
+covered the container path `main`'s did not; (c) take `main`'s field names but
+keep this plan's 10-second default and wider vocabulary.
+
+**The trade-off.** A phase of designed, built, tested and documented work is
+gone, and this plan's status line has to say so rather than claiming seven
+phases. Two behaviors the plan argued for are lost with it: the 10-second
+default (docker's, and what an operator's fingers expect) becomes 30 seconds,
+and `SIGCONT` / `SIGWINCH` stop signals become undeclarable.
+
+**Why.** Simplicity, and it is not close. Two jobspec fields that mean the
+same thing is the single most expensive kind of surface duplication a config
+language can carry: every doc has to explain both, every example has to pick
+one, and the precedence rule between them becomes a thing users get wrong
+forever. `main` is the merge target and shipped first, so its spelling wins by
+default; and its design is better on the merits independent of that — one
+ladder for every stop cause (`job stop`, rollout, drain, reschedule,
+scale-in, preemption) rather than a ladder each runtime re-derives, a
+`deadline` on `StopContext` so a runtime can hand an absolute instant to a
+stop-with-timeout API, and an explicit `Ok(false)` "I cannot signal" return
+so a runtime that declines is torn down immediately instead of waiting out a
+window nothing can use. Alternative (a) is the duplication with extra steps.
+Alternative (c) trades a genuinely better default for a worse one purely to
+preserve this plan's authorship, and re-opens a vocabulary `main` deliberately
+narrowed (`SIGCONT` and `SIGWINCH` are not *termination* signals; declaring
+one as a stop notice asks for a drain that never comes).
+
+## 20. The branch keeps its wire plumbing, because `main`'s `stop` block was reaching no worker
+
+**The call.** `TaskAllocation` still gains a field — now one `string
+task_stop` carrying `main`'s `StopConfig` as JSON, replacing this plan's two
+scalars — and the dispatcher and worker still serialize and rebuild it.
+
+**The alternatives.** (a) Drop the wire work with the rest of Phase 3, on the
+principle that `main` owns graceful stop now; (b) widen `Allocation` instead;
+(c) have the worker fetch the task config from the manager on stop.
+
+**The trade-off.** This branch now carries a change to a subsystem it does not
+own, and a reviewer of a "container runtime" PR has to evaluate a proto field
+belonging to the preemption plan.
+
+**Why.** Alternative (a) is the tempting one and it is wrong: `main`'s
+`TaskAllocation` has no stop field, and the worker rebuilds its `TaskConfig`
+purely from that message — so on `main` as merged, a task declaring
+`stop { signal: 'SIGINT', killAfter: '90s' }` has it stored, validated,
+and then **silently ignored**, with every stop using the default ladder. The
+field is live in the jobspec and inert in practice. This plan had already
+built exactly the plumbing that closes it (calls entry 9, for its own two
+scalars), so carrying it over costs one field and fixes a shipped feature that
+does not currently work. Alternative (b) touches the read model, the caches,
+the raft changesets and the wire for one consumer; (c) puts a manager round
+trip on the stop path, which is the one path that must not depend on the
+manager being reachable.
+
+A consequence worth stating: "undeclared" has to survive the trip as a state
+distinct from "declared `SIGTERM`", because the Linux container chain consults
+the image's own `STOPSIGNAL` only when the jobspec was silent. That is why the
+field is an empty string rather than a serialized default.

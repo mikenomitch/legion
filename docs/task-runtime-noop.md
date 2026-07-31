@@ -28,9 +28,10 @@ declares `artifacts` is rejected with an actionable error at
 
 ## Stop and resource fields
 
-`noop` tracks no process and confines nothing, so the task-level `stopSignal`
-and `stopGracePeriod` fields are **accepted and inert** on a `noop` task —
-there is nothing to signal and nothing to wait for. Likewise its
+`noop` tracks no process and confines nothing, so the task-level `stop`
+block is **accepted and inert** on a `noop` task: there is nothing to signal,
+so the runtime declines the notice and the allocation is torn down
+immediately rather than waiting out a window nothing can use. Likewise its
 `resource_enforcement()` is `Unsupported`, so `resources` stay scheduling-only
 and the worker touches no cgroup for it (see
 [docs/resource-enforcement.md](resource-enforcement.md)).
