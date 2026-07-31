@@ -1,10 +1,13 @@
 use crate::prelude::*;
 use crate::storage::raft::driver::MultiRaftDriver;
+use crate::storage::s3_credentials::build_credential_provider;
 use crate::storage::store::Store;
 use crate::structs::{
-    PersistenceConfigFull, PersistenceType, StreamingLeaseProvider,
+    PersistenceConfigFull, PersistenceType, StreamingCredentialsConfigFull, StreamingLeaseProvider,
     StreamingObjectStorageLeaseConfigFull, StreamingPersistenceConfigFull,
 };
+
+use object_store::aws::AwsCredentialProvider;
 
 use object_store::aws::AmazonS3Builder;
 use object_store::ObjectStore;
@@ -236,6 +239,7 @@ impl StreamingPersistenceDriver {
         let replica_url = self.cfg.replica_url.clone();
         let interval = parse_sync_interval(&self.cfg.sync_interval);
         let shutdown = Arc::clone(&self.shutdown);
+        let credentials = self.cfg.credentials.clone();
 
         std::thread::Builder::new()
             .name("persistence-replica-sync".to_string())
@@ -248,7 +252,9 @@ impl StreamingPersistenceDriver {
                     }
                 };
                 rt.block_on(async move {
-                    if let Err(err) = run_replica_loop(db, replica_url, interval, shutdown).await {
+                    if let Err(err) =
+                        run_replica_loop(db, replica_url, interval, credentials, shutdown).await
+                    {
                         error!(error = ?err, "rustyriver replication loop exited");
                     }
                 });
@@ -257,6 +263,7 @@ impl StreamingPersistenceDriver {
 
         info!(
             interval_secs = interval.as_secs_f64(),
+            credentials_provider = self.cfg.credentials.provider.as_str(),
             "Started rustyriver streaming replication"
         );
         Ok(())
@@ -265,6 +272,7 @@ impl StreamingPersistenceDriver {
     fn start_object_storage_lease_loop(&self) -> R<()> {
         let lease_cfg = self.cfg.lease.clone();
         let object_cfg = lease_cfg.object_storage.clone();
+        let credentials = self.cfg.credentials.clone();
         let role_primary = Arc::clone(&self.role_primary);
         let lease_held = Arc::clone(&self.lease_held);
         let shutdown = Arc::clone(&self.shutdown);
@@ -283,6 +291,7 @@ impl StreamingPersistenceDriver {
                 rt.block_on(async move {
                     if let Err(err) = object_storage_lease_loop(
                         object_cfg,
+                        credentials,
                         lease_cfg.key,
                         owner,
                         lease_cfg.ttl_seconds,
@@ -384,6 +393,7 @@ async fn run_replica_loop(
     db: Db,
     replica_url: String,
     interval: StdDuration,
+    credentials: StreamingCredentialsConfigFull,
     shutdown: Arc<AtomicBool>,
 ) -> R<()> {
     if is_object_store_url(&replica_url) {
@@ -391,11 +401,64 @@ async fn run_replica_loop(
             .with_context(|| format!("invalid streaming replica URL: {replica_url}"))?;
         let config = ObjectStoreConfig::from_url(&parsed)
             .with_context(|| format!("invalid streaming replica URL: {replica_url}"))?;
-        replica_sync_loop(db, ObjectStoreClient::new(config), interval, shutdown).await
+        let client = match build_credential_provider(&credentials)? {
+            // `environment`: leave rustyriver to build its own store from the
+            // URL, so configs written before this block behave identically.
+            None => ObjectStoreClient::new(config),
+            // Otherwise Legion owns the store, so the same credential provider
+            // signs both the replica uploads and the lease CAS.
+            Some(provider) => {
+                let store = build_replica_store(&config, provider)?;
+                ObjectStoreClient::with_store(config, store)
+            }
+        };
+        replica_sync_loop(db, client, interval, shutdown).await
     } else {
         let client = FileReplicaClient::new(file_replica_path(&replica_url));
         replica_sync_loop(db, client, interval, shutdown).await
     }
+}
+
+/// Build the replica's S3 store with a Legion-owned credential provider.
+///
+/// This mirrors rustyriver's own private `ObjectStoreConfig::build_store`
+/// (bucket, region default, path-style toggle, endpoint + `allow_http`) — it
+/// has to, because the only public seam for injecting credentials is
+/// `ObjectStoreClient::with_store`, which takes a fully built store. The
+/// static keys in the config are deliberately *not* applied here: reaching
+/// this function at all means an explicit provider outranks them.
+fn build_replica_store(
+    config: &ObjectStoreConfig,
+    provider: AwsCredentialProvider,
+) -> R<Arc<dyn ObjectStore>> {
+    if config.bucket.is_empty() {
+        bail!("streaming replica URL has no bucket");
+    }
+    let region = if config.region.is_empty() {
+        "us-east-1".to_string()
+    } else {
+        config.region.clone()
+    };
+
+    let mut builder = AmazonS3Builder::new()
+        .with_bucket_name(&config.bucket)
+        .with_region(region)
+        .with_virtual_hosted_style_request(!config.force_path_style)
+        .with_credentials(provider);
+
+    if !config.endpoint.is_empty() {
+        let allow_http = config.endpoint.starts_with("http://")
+            || config.skip_verify
+            || rustyriver::replica_url::is_local_endpoint(&config.endpoint);
+        builder = builder
+            .with_endpoint(&config.endpoint)
+            .with_allow_http(allow_http);
+    }
+
+    let store = builder
+        .build()
+        .context("failed to build S3 store for streaming replication")?;
+    Ok(Arc::new(store))
 }
 
 /// Generic sync loop: capture the WAL into a local LTX file, upload new LTX
@@ -438,8 +501,17 @@ async fn sync_once<C: ReplicaClient>(replica: &mut Replica<C>) -> R<()> {
 // ── Object-storage lease fencing (rustyriver S3Leaser) ────────────────────────
 
 /// Build the S3-compatible object store that backs the lease lock object.
+///
+/// Credential precedence, narrowest first: the lease's own static keys win for
+/// the lease, then the shared `credentials` block, then whatever
+/// `object_store` resolves itself. The narrow-wins order is what keeps every
+/// pre-existing `lease.objectStorage` config working untouched;
+/// [`StreamingPersistenceConfigFull::validate`] separately rejects the one
+/// combination where the split is a bug rather than a preference (federated
+/// replica, static-keyed lease).
 fn build_lease_store(
     object_cfg: &StreamingObjectStorageLeaseConfigFull,
+    credentials: &StreamingCredentialsConfigFull,
 ) -> R<Arc<dyn ObjectStore>> {
     let mut builder = AmazonS3Builder::new()
         .with_bucket_name(object_cfg.bucket.clone())
@@ -448,11 +520,18 @@ fn build_lease_store(
     if let Some(endpoint) = &object_cfg.endpoint {
         builder = builder.with_endpoint(endpoint.clone());
     }
-    if let Some(access_key) = &object_cfg.access_key_id {
-        builder = builder.with_access_key_id(access_key.clone());
-    }
-    if let Some(secret) = &object_cfg.secret_access_key {
-        builder = builder.with_secret_access_key(secret.clone());
+
+    let lease_has_static_keys =
+        object_cfg.access_key_id.is_some() || object_cfg.secret_access_key.is_some();
+    if lease_has_static_keys {
+        if let Some(access_key) = &object_cfg.access_key_id {
+            builder = builder.with_access_key_id(access_key.clone());
+        }
+        if let Some(secret) = &object_cfg.secret_access_key {
+            builder = builder.with_secret_access_key(secret.clone());
+        }
+    } else if let Some(provider) = build_credential_provider(credentials)? {
+        builder = builder.with_credentials(provider);
     }
 
     let store = builder
@@ -517,6 +596,7 @@ async fn lease_step<L: Leaser>(leaser: &L, held: Option<Lease>) -> LeaseTransiti
 #[allow(clippy::too_many_arguments)]
 async fn object_storage_lease_loop(
     object_cfg: StreamingObjectStorageLeaseConfigFull,
+    credentials: StreamingCredentialsConfigFull,
     key: String,
     owner: String,
     ttl_seconds: u64,
@@ -529,7 +609,7 @@ async fn object_storage_lease_loop(
         bail!("streaming.objectStorage lease requires bucket");
     }
 
-    let store = build_lease_store(&object_cfg)?;
+    let store = build_lease_store(&object_cfg, &credentials)?;
     let ttl = StdDuration::from_secs(ttl_seconds.max(2));
     let renew = StdDuration::from_secs(renew_interval_seconds.max(1));
     let leaser = S3Leaser::new(store)

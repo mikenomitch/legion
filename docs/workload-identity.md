@@ -452,6 +452,56 @@ warm fetches the same way (a warm pull happens before any task exists).
 > `auth.identity` for artifacts still needs the fetching allocation's id
 > threaded into the request and remains pending.)
 
+## Manager identity — and why Legion does not issue it
+
+Tasks and worker nodes receive identities that Legion *issues*. The manager
+itself is the other way round: where it needs a federated credential — today,
+to ship its state to object storage under
+[streaming persistence](persistence-streaming.md) — it **presents an identity
+issued by the platform it runs on**, and Legion never signs one for itself.
+
+```jsonnet
+// manager.jsonnet — the manager's own workload identity
+persistence: {
+  type: 'streaming',
+  streaming: {
+    replicaUrl: 's3://acme-legion-state/prod',
+    credentials: {
+      provider: 'webIdentity',
+      webIdentity: {
+        tokenFile: '/var/run/secrets/eks.amazonaws.com/serviceaccount/token',
+        roleArn: 'arn:aws:iam::123456789012:role/legion-manager-state',
+      },
+    },
+  },
+},
+```
+
+The token can come from EKS IRSA, GKE workload identity federation, a SPIRE
+JWT-SVID, Vault's identity token backend — anything that writes a JWT to a file.
+Legion exchanges it for short-lived credentials via `AssumeRoleWithWebIdentity`
+and refreshes it in-process.
+
+There is deliberately **no `managerIdentities` block**, and the reason is worth
+stating because the symmetry with `nodeIdentities` makes one look natural:
+
+- Legion's ES256 signing key lives in the SQLite store that streaming
+  persistence backs up. A self-issued credential would mean reading the store
+  is enough to destroy its backups — the opposite of what a backup is for.
+- A restore runs before any store exists, so there would be no key and no
+  token. A self-issued identity can never authenticate disaster recovery.
+- Relying parties validate a token by fetching the manager's JWKS over HTTPS,
+  so the manager's ability to back itself up would depend on the manager being
+  reachable.
+
+The general rule: **an identity may not be issued by the system it is used to
+protect.** Worker node identities satisfy it — the manager is a separate trust
+root from the worker. The manager's own state backups cannot satisfy it against
+the manager's own issuer.
+
+Full configuration, provider setup, IAM policy, and failure modes are in
+[docs/persistence-streaming.md](persistence-streaming.md#credentials).
+
 ## Provider integration cookbook
 
 In every case the relying party is configured to trust Legion's issuer

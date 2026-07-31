@@ -115,6 +115,30 @@
     streaming: {
       replicaUrl: "",
       syncInterval: "1s",
+      // One credential source for both the WAL uploads and the lease object.
+      // "environment" (the default) reads AWS_*, falling back to LITESTREAM_*,
+      // from the manager's process env — the historical behavior.
+      credentials: {
+        provider: "environment",  // environment | static | webIdentity
+        // "static": literal keys in this file.
+        // static: {
+        //   accessKeyId: std.extVar("R2_ACCESS_KEY_ID"),
+        //   secretAccessKey: std.extVar("R2_SECRET_ACCESS_KEY"),
+        // },
+        //
+        // "webIdentity": the manager's own workload identity. A JWT written by
+        // the *platform* (EKS IRSA, GKE, a SPIRE JWT-SVID, Vault's identity
+        // token backend) is exchanged for short-lived credentials via STS
+        // AssumeRoleWithWebIdentity. Legion never signs this token itself —
+        // see docs/persistence-streaming.md#credentials for why.
+        // webIdentity: {
+        //   tokenFile: "/var/run/secrets/eks.amazonaws.com/serviceaccount/token",
+        //   roleArn: "arn:aws:iam::123456789012:role/legion-manager-state",
+        //   sessionName: "legion-manager",  // optional; shows up in CloudTrail
+        //   durationSeconds: 3600,          // optional; 900..43200
+        //   stsRegion: "us-east-1",         // optional; regional STS endpoint
+        // },
+      },
       lease: {
         provider: "none",
         key: "leases/default/primary.json",

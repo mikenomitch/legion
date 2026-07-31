@@ -68,6 +68,7 @@ When one is required and what goes in it:
 | [job-updated-at-plan.md](plans/job-updated-at-plan.md) | shipped (detail-page header + node column label deferred) |
 | [kv-reactive-task-updates-plan.md](plans/kv-reactive-task-updates-plan.md) | shipped |
 | [late-binding-plan-apply-plan.md](plans/late-binding-plan-apply-plan.md) | planned |
+| [manager-workload-identity-plan.md](plans/manager-workload-identity-plan.md) | in execution (phase 1 shipped: credential providers for streaming persistence; restore + introspection deferred) |
 | [persistence-plan.md](plans/persistence-plan.md) | phases 0–1, 3 done |
 | [preemption-and-eviction-plan.md](plans/preemption-and-eviction-plan.md) | in execution (phase 1a shipped: stop causes) |
 | [multi-cluster-federation-plan.md](plans/multi-cluster-federation-plan.md) | planned |
@@ -122,6 +123,7 @@ by project impact. The full template and a worked example:
 - [job-templates-plan_calls.md](calls/job-templates-plan_calls.md)
 - [job-updated-at-plan_calls.md](calls/job-updated-at-plan_calls.md)
 - [kv-reactive-task-updates-plan_calls.md](calls/kv-reactive-task-updates-plan_calls.md)
+- [manager-workload-identity-plan_calls.md](calls/manager-workload-identity-plan_calls.md)
 - [multi-cluster-federation-plan_calls.md](calls/multi-cluster-federation-plan_calls.md)
 - [multi-raft-persistence-plan_calls.md](calls/multi-raft-persistence-plan_calls.md)
 - [persistence-plan_calls.md](calls/persistence-plan_calls.md)

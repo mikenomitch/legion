@@ -453,8 +453,28 @@ No plan yet — this needs one before any code.
 
 ## Persistence & cluster operations
 
-Plans: [persistence-plan.md](plans/persistence-plan.md), [multi-raft-persistence-plan.md](plans/multi-raft-persistence-plan.md) · docs: [state-store.md](../docs/state-store.md), [raft-operations.md](../docs/raft-operations.md), [persistence-streaming.md](../docs/persistence-streaming.md)
+Plans: [persistence-plan.md](plans/persistence-plan.md), [multi-raft-persistence-plan.md](plans/multi-raft-persistence-plan.md), [manager-workload-identity-plan.md](plans/manager-workload-identity-plan.md) · docs: [state-store.md](../docs/state-store.md), [raft-operations.md](../docs/raft-operations.md), [persistence-streaming.md](../docs/persistence-streaming.md)
 
+- [ ] **Restore should use the streaming credentials block.** `legion start
+      manager --restore-from` still takes a local path, so pulling a replica
+      down from object storage is a manual out-of-band step with its own
+      credential. Teach it to accept a replica URL and pull through
+      `rustyriver::restore` with the phase-1 provider — this is the credential
+      path that most needs to work without Legion running.
+      [Plan §9 phase 2](plans/manager-workload-identity-plan.md) ·
+      [calls #8](calls/manager-workload-identity-plan_calls.md)
+- [ ] **No credential introspection for streaming persistence.** The effective
+      provider only appears in the startup log line; there is no way to read
+      back "webIdentity, refreshed 4m ago, expires in 51m". Wants a field on the
+      persistence status RPC (and therefore proto comments + an agent surface).
+      [Plan §9 phase 3](plans/manager-workload-identity-plan.md)
+- [ ] **`environment` is not the full AWS credential chain.** No provider
+      consults instance profiles, ECS task roles, or `~/.aws/credentials` —
+      `environment` is only the static `AWS_*`/`LITESTREAM_*` env vars, kept
+      that way deliberately so an upgrade cannot silently change which
+      principal a cluster authenticates as. A fourth `default` provider is the
+      honest way to offer the chain.
+      [Calls #3](calls/manager-workload-identity-plan_calls.md)
 - [ ] `raft_lanes::killing_the_all_lane_leader_reconverges_onto_one_survivor`
       is timing-sensitive under parallel test load: green in isolation
       (9/9 on a 4-vCPU container, 2026-07-30) but failed once during a full
@@ -955,6 +975,20 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
 - [x] Streaming SQLite replication, Litestream-style, with optional lease failover
 - [x] Raft control plane: leader election, failover controls, membership,
       observability, CLI and UI operations
+- [x] **Manager workload identity for state replication** — one
+      `persistence.streaming.credentials` block feeding both the WAL uploads and
+      the lease object, with an `environment` (default, unchanged behavior),
+      `static`, and `webIdentity` provider. `webIdentity` exchanges a
+      platform-issued OIDC token file (EKS IRSA, GKE, a SPIRE JWT-SVID, Vault)
+      for short-lived credentials via `AssumeRoleWithWebIdentity`. Legion
+      deliberately does **not** issue this identity itself — the signing key
+      lives in the store being backed up, restore has no store to sign from, and
+      STS would have to reach the manager's own JWKS.
+      [plan](plans/manager-workload-identity-plan.md) ·
+      [calls](calls/manager-workload-identity-plan_calls.md) ·
+      [docs](../docs/persistence-streaming.md#credentials).
+      Deferred: restore, credential introspection, the full AWS chain — open
+      items under "Persistence & cluster operations" above.
 
 ## Workload identity
 
@@ -963,6 +997,13 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
 - [x] Manager as an OIDC issuer: keys, discovery, JWKS, rotation
 - [x] Token issuance RPC, job-spec API, worker delivery, change mode
 - [x] Node identity tokens and control-plane identity (phase 7)
+- [x] Manager-side identity *consumption* — the manager presents a
+      platform-issued OIDC token to federate into object storage for state
+      replication, rather than holding a static key. There is deliberately no
+      `managerIdentities` block; see
+      [plan §6](plans/manager-workload-identity-plan.md) ·
+      [calls #1](calls/manager-workload-identity-plan_calls.md) ·
+      [docs](../docs/workload-identity.md#manager-identity--and-why-legion-does-not-issue-it)
 
 ## Auth & ACLs
 

@@ -225,3 +225,28 @@ fn config_path_arg() -> Arg {
         .help("Path to the manager configuration file")
         .value_hint(ValueHint::FilePath)
 }
+
+#[cfg(test)]
+mod start_test {
+    use super::*;
+
+    /// The shipped manager config is the first thing a new operator runs and
+    /// the reference every doc points at, so a jsonnet typo or a field that
+    /// no longer deserializes should fail here rather than at their terminal.
+    /// Unit tests run with the crate root as CWD.
+    #[test]
+    fn shipped_manager_config_evaluates_and_deserializes_test() {
+        let config = parse_config(crate::constants::DEF_CONFIG_PATH).expect("sample config");
+        let full = config.with_defaults();
+        // Streaming credentials default to the historical env lookup even
+        // though the sample now carries the block explicitly.
+        assert_eq!(
+            full.persistence.streaming.credentials.provider,
+            crate::structs::StreamingCredentialsProvider::Environment
+        );
+        full.persistence
+            .streaming
+            .validate()
+            .expect("sample streaming config is valid");
+    }
+}

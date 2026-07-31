@@ -763,6 +763,16 @@ impl Default for RaftPersistenceConfig {
     }
 }
 
+/// Default `RoleSessionName` for the manager's `AssumeRoleWithWebIdentity`
+/// exchange. Appears in the provider's audit log (CloudTrail), so it names the
+/// component rather than the host.
+pub const DEF_WEB_IDENTITY_SESSION_NAME: &str = "legion-manager";
+/// Default requested session lifetime for web-identity credentials (1 hour).
+pub const DEF_WEB_IDENTITY_DURATION_SECONDS: u32 = 3600;
+/// AWS's own bounds on `DurationSeconds` for `AssumeRoleWithWebIdentity`.
+pub const MIN_WEB_IDENTITY_DURATION_SECONDS: u32 = 900;
+pub const MAX_WEB_IDENTITY_DURATION_SECONDS: u32 = 43_200;
+
 /// Default root directory for raft engine state (logs + cluster identity).
 pub const DEF_RAFT_DATA_DIR: &str = ".legion/raft";
 /// Default raft topology: one group carries every lane (plan JC-2).
@@ -906,6 +916,7 @@ pub struct PersistenceConfigFull {
 pub struct StreamingPersistenceConfig {
     pub replica_url: Option<String>,
     pub sync_interval: Option<String>,
+    pub credentials: Option<StreamingCredentialsConfig>,
     pub lease: Option<StreamingLeaseConfig>,
 }
 
@@ -914,6 +925,7 @@ pub struct StreamingPersistenceConfig {
 pub struct StreamingPersistenceConfigFull {
     pub replica_url: String,
     pub sync_interval: String,
+    pub credentials: StreamingCredentialsConfigFull,
     pub lease: StreamingLeaseConfigFull,
 }
 
@@ -963,6 +975,117 @@ impl Default for RaftPersistenceConfigFull {
             heartbeat_interval_ms: DEF_RAFT_HEARTBEAT_INTERVAL_MS,
             election_timeout_min_ms: DEF_RAFT_ELECTION_TIMEOUT_MIN_MS,
             election_timeout_max_ms: DEF_RAFT_ELECTION_TIMEOUT_MAX_MS,
+        }
+    }
+}
+
+/// Where the manager gets the S3-compatible credentials it uses to ship WAL
+/// segments to `replicaUrl` and to contend for the object-storage lease.
+///
+/// This is the manager's half of workload identity: the manager *presents* an
+/// identity, it never issues one for itself. See
+/// `internal_docs/plans/manager-workload-identity-plan.md` §6 for why the
+/// manager deliberately does not federate through Legion's own OIDC issuer.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum StreamingCredentialsProvider {
+    /// `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` from the manager's
+    /// process environment, falling back to `LITESTREAM_*`. The historical
+    /// behavior, and the default so existing configs are unchanged.
+    #[default]
+    Environment,
+    /// Literal keys from the config file.
+    Static,
+    /// A platform-issued OIDC token read from disk and exchanged for
+    /// short-lived session credentials via `AssumeRoleWithWebIdentity` (EKS
+    /// IRSA, GKE workload identity, a SPIRE JWT-SVID, or anything else that
+    /// writes a JWT to a file).
+    WebIdentity,
+}
+
+impl StreamingCredentialsProvider {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            StreamingCredentialsProvider::Environment => "environment",
+            StreamingCredentialsProvider::Static => "static",
+            StreamingCredentialsProvider::WebIdentity => "webIdentity",
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct StreamingCredentialsConfig {
+    #[serde(default)]
+    pub provider: StreamingCredentialsProvider,
+    pub r#static: Option<StaticS3CredentialsConfig>,
+    pub web_identity: Option<WebIdentityCredentialsConfig>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct StreamingCredentialsConfigFull {
+    pub provider: StreamingCredentialsProvider,
+    pub r#static: Option<StaticS3CredentialsConfigFull>,
+    pub web_identity: Option<WebIdentityCredentialsConfigFull>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct StaticS3CredentialsConfig {
+    pub access_key_id: Option<String>,
+    pub secret_access_key: Option<String>,
+    pub session_token: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct StaticS3CredentialsConfigFull {
+    pub access_key_id: String,
+    pub secret_access_key: String,
+    pub session_token: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct WebIdentityCredentialsConfig {
+    pub token_file: Option<String>,
+    pub role_arn: Option<String>,
+    pub session_name: Option<String>,
+    pub duration_seconds: Option<u32>,
+    pub sts_region: Option<String>,
+    pub sts_endpoint: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct WebIdentityCredentialsConfigFull {
+    /// Path to the OIDC token file, re-read on every exchange (projected
+    /// service-account tokens rotate underneath us).
+    pub token_file: String,
+    /// The role to assume with that token.
+    pub role_arn: String,
+    /// `RoleSessionName` — shows up in CloudTrail; defaults to
+    /// `legion-manager`.
+    pub session_name: String,
+    /// Requested session lifetime, 900..=43200 seconds (AWS's own bounds).
+    pub duration_seconds: u32,
+    /// Region used to derive the regional STS endpoint when `sts_endpoint` is
+    /// unset.
+    pub sts_region: Option<String>,
+    /// Full STS endpoint override, for non-AWS token brokers and tests.
+    pub sts_endpoint: Option<String>,
+}
+
+impl Default for WebIdentityCredentialsConfigFull {
+    fn default() -> Self {
+        Self {
+            token_file: String::new(),
+            role_arn: String::new(),
+            session_name: DEF_WEB_IDENTITY_SESSION_NAME.to_string(),
+            duration_seconds: DEF_WEB_IDENTITY_DURATION_SECONDS,
+            sts_region: None,
+            sts_endpoint: None,
         }
     }
 }
@@ -1167,6 +1290,7 @@ impl Default for StreamingPersistenceConfigFull {
         Self {
             replica_url: String::new(),
             sync_interval: "1s".to_string(),
+            credentials: StreamingCredentialsConfigFull::default(),
             lease: StreamingLeaseConfigFull::default(),
         }
     }
@@ -1180,11 +1304,129 @@ impl StreamingPersistenceConfig {
                 .sync_interval
                 .clone()
                 .unwrap_or_else(|| "1s".to_string()),
+            credentials: self
+                .credentials
+                .as_ref()
+                .map(StreamingCredentialsConfig::with_defaults)
+                .unwrap_or_default(),
             lease: self
                 .lease
                 .as_ref()
                 .map(StreamingLeaseConfig::with_defaults)
                 .unwrap_or_default(),
+        }
+    }
+}
+
+impl StreamingCredentialsConfig {
+    pub fn with_defaults(&self) -> StreamingCredentialsConfigFull {
+        StreamingCredentialsConfigFull {
+            provider: self.provider.clone(),
+            r#static: self
+                .r#static
+                .as_ref()
+                .map(StaticS3CredentialsConfig::with_defaults),
+            web_identity: self
+                .web_identity
+                .as_ref()
+                .map(WebIdentityCredentialsConfig::with_defaults),
+        }
+    }
+}
+
+impl StaticS3CredentialsConfig {
+    pub fn with_defaults(&self) -> StaticS3CredentialsConfigFull {
+        StaticS3CredentialsConfigFull {
+            access_key_id: self.access_key_id.clone().unwrap_or_default(),
+            secret_access_key: self.secret_access_key.clone().unwrap_or_default(),
+            session_token: self.session_token.clone(),
+        }
+    }
+}
+
+impl WebIdentityCredentialsConfig {
+    pub fn with_defaults(&self) -> WebIdentityCredentialsConfigFull {
+        WebIdentityCredentialsConfigFull {
+            token_file: self.token_file.clone().unwrap_or_default(),
+            role_arn: self.role_arn.clone().unwrap_or_default(),
+            session_name: self
+                .session_name
+                .clone()
+                .unwrap_or_else(|| DEF_WEB_IDENTITY_SESSION_NAME.to_string()),
+            duration_seconds: self
+                .duration_seconds
+                .unwrap_or(DEF_WEB_IDENTITY_DURATION_SECONDS),
+            sts_region: self.sts_region.clone(),
+            sts_endpoint: self.sts_endpoint.clone(),
+        }
+    }
+}
+
+impl StreamingPersistenceConfigFull {
+    /// Startup validation for the whole streaming block. Called from manager
+    /// boot so a misconfigured credential source fails fast instead of at the
+    /// first sync cycle, an hour into a quiet night.
+    pub fn validate(&self) -> R<()> {
+        self.credentials.validate()?;
+
+        // A federated replica next to a static-keyed lease is exactly the
+        // split-credential state this feature exists to remove, so it is a
+        // hard failure rather than a warning.
+        let lease_has_static_keys = self.lease.object_storage.access_key_id.is_some()
+            || self.lease.object_storage.secret_access_key.is_some();
+        if self.credentials.provider == StreamingCredentialsProvider::WebIdentity
+            && lease_has_static_keys
+        {
+            bail!(
+                "persistence.streaming.credentials.provider is 'webIdentity' but \
+                 persistence.streaming.lease.objectStorage still sets accessKeyId/secretAccessKey; \
+                 remove the lease keys so the lease uses the same federated credential as the replica"
+            );
+        }
+        Ok(())
+    }
+}
+
+impl StreamingCredentialsConfigFull {
+    pub fn validate(&self) -> R<()> {
+        match self.provider {
+            StreamingCredentialsProvider::Environment => Ok(()),
+            StreamingCredentialsProvider::Static => {
+                let cfg = self.r#static.as_ref().context(
+                    "persistence.streaming.credentials.provider is 'static' but no \
+                     credentials.static block was given",
+                )?;
+                if cfg.access_key_id.trim().is_empty() || cfg.secret_access_key.trim().is_empty() {
+                    bail!(
+                        "persistence.streaming.credentials.static requires both accessKeyId \
+                         and secretAccessKey"
+                    );
+                }
+                Ok(())
+            }
+            StreamingCredentialsProvider::WebIdentity => {
+                let cfg = self.web_identity.as_ref().context(
+                    "persistence.streaming.credentials.provider is 'webIdentity' but no \
+                     credentials.webIdentity block was given",
+                )?;
+                if cfg.token_file.trim().is_empty() {
+                    bail!("persistence.streaming.credentials.webIdentity requires tokenFile");
+                }
+                if cfg.role_arn.trim().is_empty() {
+                    bail!("persistence.streaming.credentials.webIdentity requires roleArn");
+                }
+                if cfg.duration_seconds < MIN_WEB_IDENTITY_DURATION_SECONDS
+                    || cfg.duration_seconds > MAX_WEB_IDENTITY_DURATION_SECONDS
+                {
+                    bail!(
+                        "persistence.streaming.credentials.webIdentity.durationSeconds must be \
+                         between {MIN_WEB_IDENTITY_DURATION_SECONDS} and \
+                         {MAX_WEB_IDENTITY_DURATION_SECONDS} (got {})",
+                        cfg.duration_seconds
+                    );
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -1297,7 +1539,41 @@ impl From<StreamingPersistenceConfigFull> for StreamingPersistenceConfig {
         Self {
             replica_url: Some(value.replica_url),
             sync_interval: Some(value.sync_interval),
+            credentials: Some(value.credentials.into()),
             lease: Some(value.lease.into()),
+        }
+    }
+}
+
+impl From<StreamingCredentialsConfigFull> for StreamingCredentialsConfig {
+    fn from(value: StreamingCredentialsConfigFull) -> Self {
+        Self {
+            provider: value.provider,
+            r#static: value.r#static.map(Into::into),
+            web_identity: value.web_identity.map(Into::into),
+        }
+    }
+}
+
+impl From<StaticS3CredentialsConfigFull> for StaticS3CredentialsConfig {
+    fn from(value: StaticS3CredentialsConfigFull) -> Self {
+        Self {
+            access_key_id: Some(value.access_key_id),
+            secret_access_key: Some(value.secret_access_key),
+            session_token: value.session_token,
+        }
+    }
+}
+
+impl From<WebIdentityCredentialsConfigFull> for WebIdentityCredentialsConfig {
+    fn from(value: WebIdentityCredentialsConfigFull) -> Self {
+        Self {
+            token_file: Some(value.token_file),
+            role_arn: Some(value.role_arn),
+            session_name: Some(value.session_name),
+            duration_seconds: Some(value.duration_seconds),
+            sts_region: value.sts_region,
+            sts_endpoint: value.sts_endpoint,
         }
     }
 }
@@ -1622,5 +1898,180 @@ mod tests {
             !full.container_image_desugar,
             "desugar off until cache plan"
         );
+    }
+
+    // ── streaming persistence credentials ────────────────────────────────
+
+    fn web_identity_credentials() -> StreamingCredentialsConfig {
+        StreamingCredentialsConfig {
+            provider: StreamingCredentialsProvider::WebIdentity,
+            r#static: None,
+            web_identity: Some(WebIdentityCredentialsConfig {
+                token_file: Some("/var/run/secrets/token".into()),
+                role_arn: Some("arn:aws:iam::1:role/legion-manager-state".into()),
+                ..Default::default()
+            }),
+        }
+    }
+
+    #[test]
+    fn absent_credentials_block_keeps_the_historical_behavior_test() {
+        let streaming = StreamingPersistenceConfig {
+            replica_url: Some("s3://bucket/prefix".into()),
+            ..Default::default()
+        }
+        .with_defaults();
+
+        assert_eq!(
+            streaming.credentials.provider,
+            StreamingCredentialsProvider::Environment
+        );
+        assert!(streaming.credentials.r#static.is_none());
+        assert!(streaming.credentials.web_identity.is_none());
+        streaming.validate().expect("default config is valid");
+    }
+
+    #[test]
+    fn web_identity_defaults_fill_session_name_and_duration_test() {
+        let full = web_identity_credentials().with_defaults();
+        let web = full.web_identity.as_ref().expect("web identity block");
+        assert_eq!(web.session_name, DEF_WEB_IDENTITY_SESSION_NAME);
+        assert_eq!(web.duration_seconds, DEF_WEB_IDENTITY_DURATION_SECONDS);
+        assert!(web.sts_region.is_none());
+        full.validate().expect("valid");
+    }
+
+    #[test]
+    fn credentials_survive_the_full_to_config_round_trip_test() {
+        let original = StreamingPersistenceConfig {
+            replica_url: Some("s3://bucket/prefix".into()),
+            credentials: Some(web_identity_credentials()),
+            ..Default::default()
+        }
+        .with_defaults();
+
+        let round_tripped = StreamingPersistenceConfig::from(original.clone()).with_defaults();
+        assert_eq!(
+            round_tripped.credentials.provider,
+            StreamingCredentialsProvider::WebIdentity
+        );
+        let web = round_tripped
+            .credentials
+            .web_identity
+            .expect("web identity");
+        assert_eq!(web.role_arn, "arn:aws:iam::1:role/legion-manager-state");
+        assert_eq!(web.token_file, "/var/run/secrets/token");
+        assert_eq!(web.duration_seconds, DEF_WEB_IDENTITY_DURATION_SECONDS);
+    }
+
+    #[test]
+    fn web_identity_requires_token_file_and_role_arn_test() {
+        let mut cfg = web_identity_credentials();
+        cfg.web_identity.as_mut().unwrap().role_arn = None;
+        let err = cfg.with_defaults().validate().expect_err("needs roleArn");
+        assert!(err.to_string().contains("roleArn"), "{err}");
+
+        let mut cfg = web_identity_credentials();
+        cfg.web_identity.as_mut().unwrap().token_file = None;
+        let err = cfg.with_defaults().validate().expect_err("needs tokenFile");
+        assert!(err.to_string().contains("tokenFile"), "{err}");
+
+        let cfg = StreamingCredentialsConfig {
+            provider: StreamingCredentialsProvider::WebIdentity,
+            r#static: None,
+            web_identity: None,
+        };
+        let err = cfg.with_defaults().validate().expect_err("needs the block");
+        assert!(err.to_string().contains("webIdentity"), "{err}");
+    }
+
+    #[test]
+    fn web_identity_duration_is_bounded_by_aws_limits_test() {
+        for bad in [
+            MIN_WEB_IDENTITY_DURATION_SECONDS - 1,
+            MAX_WEB_IDENTITY_DURATION_SECONDS + 1,
+        ] {
+            let mut cfg = web_identity_credentials();
+            cfg.web_identity.as_mut().unwrap().duration_seconds = Some(bad);
+            let err = cfg
+                .with_defaults()
+                .validate()
+                .expect_err("out of range rejected");
+            assert!(err.to_string().contains("durationSeconds"), "{err}");
+        }
+
+        for ok in [
+            MIN_WEB_IDENTITY_DURATION_SECONDS,
+            MAX_WEB_IDENTITY_DURATION_SECONDS,
+        ] {
+            let mut cfg = web_identity_credentials();
+            cfg.web_identity.as_mut().unwrap().duration_seconds = Some(ok);
+            cfg.with_defaults()
+                .validate()
+                .expect("bounds are inclusive");
+        }
+    }
+
+    #[test]
+    fn static_credentials_require_both_keys_test() {
+        let cfg = StreamingCredentialsConfig {
+            provider: StreamingCredentialsProvider::Static,
+            r#static: Some(StaticS3CredentialsConfig {
+                access_key_id: Some("AKIAEXAMPLE".into()),
+                secret_access_key: None,
+                session_token: None,
+            }),
+            web_identity: None,
+        };
+        let err = cfg.with_defaults().validate().expect_err("needs both keys");
+        assert!(err.to_string().contains("secretAccessKey"), "{err}");
+
+        let cfg = StreamingCredentialsConfig {
+            provider: StreamingCredentialsProvider::Static,
+            r#static: None,
+            web_identity: None,
+        };
+        assert!(cfg.with_defaults().validate().is_err());
+    }
+
+    #[test]
+    fn federated_replica_with_static_keyed_lease_is_rejected_test() {
+        let lease = StreamingLeaseConfig {
+            provider: StreamingLeaseProvider::ObjectStorage,
+            object_storage: Some(StreamingObjectStorageLeaseConfig {
+                bucket: Some("bucket".into()),
+                access_key_id: Some("AKIAEXAMPLE".into()),
+                secret_access_key: Some("secret".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let streaming = StreamingPersistenceConfig {
+            replica_url: Some("s3://bucket/prefix".into()),
+            credentials: Some(web_identity_credentials()),
+            lease: Some(lease.clone()),
+            ..Default::default()
+        }
+        .with_defaults();
+
+        let err = streaming
+            .validate()
+            .expect_err("split credentials rejected");
+        let message = err.to_string();
+        // The error has to name both sites — an operator reading it should not
+        // have to guess which half to delete.
+        assert!(message.contains("webIdentity"), "{message}");
+        assert!(message.contains("lease.objectStorage"), "{message}");
+
+        // The same lease keys are fine while the replica is not federated:
+        // that is every pre-existing config, and it must keep working.
+        let unchanged = StreamingPersistenceConfig {
+            replica_url: Some("s3://bucket/prefix".into()),
+            lease: Some(lease),
+            ..Default::default()
+        }
+        .with_defaults();
+        unchanged.validate().expect("existing configs still valid");
     }
 }

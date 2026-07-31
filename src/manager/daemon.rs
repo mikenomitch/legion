@@ -77,6 +77,15 @@ pub async fn run_manager(config: ManagerConfig, run_worker: bool) -> R<()> {
         &full_config.artifacts,
         &node_identity_names,
     )?;
+    // Same reasoning for the manager's own object-storage credentials: a
+    // missing roleArn or an out-of-range session duration should stop boot,
+    // not surface as a failed WAL upload an hour later.
+    if matches!(
+        full_config.persistence.r#type,
+        crate::structs::PersistenceType::Streaming
+    ) {
+        full_config.persistence.streaming.validate()?;
+    }
     let manager_node_id = format!("{}:{}", full_config.server.host, full_config.server.port);
     let store = Store::start_storage(&full_config)?;
     // Startup-time mutations are leader-only in raft mode (they replicate

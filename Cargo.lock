@@ -1961,6 +1961,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "argon2",
+ "async-trait",
  "base64 0.22.1",
  "bytes",
  "chrono",
@@ -1995,6 +1996,7 @@ dependencies = [
  "opentelemetry_sdk",
  "portable-pty",
  "prost",
+ "quick-xml",
  "rand 0.8.5",
  "rcgen",
  "regex",
