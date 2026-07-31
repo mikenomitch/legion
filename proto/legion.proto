@@ -2444,6 +2444,58 @@ message HeartbeatReply {
   // manager performs no catalog work at all in that case, so nodes running
   // only plain jobs pay nothing for this field.
   repeated UpstreamEndpoints upstream_endpoints = 4;
+
+  // Why the manager is stopping allocations on this node.
+  //
+  // Workers learn that an allocation should stop by noticing it is *absent*
+  // from `desired_allocations` — an absence carries no reason, so a drain, a
+  // rollout replacement, a `job stop` and a reschedule were historically
+  // indistinguishable to the worker and to anything reading its logs. This
+  // field supplies the missing reason, letting the worker hand a
+  // `StopCause` to the task runtime and log why each task went away.
+  //
+  // Delivery is **best effort and advisory**. The manager records a notice in
+  // the same transaction that removes the allocation, re-sends every live
+  // notice on each heartbeat, and prunes notices by age
+  // (`STOP_NOTICE_RETENTION_SECS`, 10 minutes). A worker that reconciles
+  // before the notice reaches it — or one talking to a manager older than
+  // this field — stops the allocation with cause `unknown` rather than
+  // waiting. A stop is never delayed or skipped for want of a notice.
+  //
+  // The list is a snapshot, not a delta: each heartbeat carries every notice
+  // the manager currently holds for this node, and the worker replaces its
+  // copy wholesale.
+  //
+  // Default: empty list when no allocation on this node was recently removed.
+  repeated StopNotice stop_notices = 5;
+}
+
+// Why one allocation is being stopped.
+//
+// Sent in `HeartbeatReply.stop_notices`. See that field for delivery
+// semantics and `docs/graceful-stop.md` for the full contract.
+message StopNotice {
+  // Allocation the manager removed. Matches an ID the worker previously
+  // received in `HeartbeatReply.desired_allocations`.
+  int64 allocation_id = 1;
+
+  // Why it was removed. One of:
+  //
+  // - `stop` — the job, or a keyed instance of it, was stopped by a user.
+  // - `update` — replaced by a newer job config (a rollout or in-place
+  //   update).
+  // - `drain` — the node is draining and its work is moving elsewhere.
+  // - `reschedule` — moved by the scheduler (failure recovery, `onLost`
+  //   handling, or a scheduler-driven move).
+  // - `destroy` — the job was destroyed outright.
+  // - `node_lost` — the node was removed or declared lost, clearing its
+  //   allocations.
+  // - `preempted` — displaced to make room for higher-priority work.
+  //   Reserved; nothing emits this until preemption ships.
+  //
+  // Workers treat an unrecognized value as `unknown` and stop the allocation
+  // anyway, so the manager may add causes without a coordinated upgrade.
+  string cause = 2;
 }
 
 // The endpoints one allocation may currently reach for one upstream service.

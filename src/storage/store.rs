@@ -1,7 +1,9 @@
 // A few low-level persistence helpers take many columns by parameter.
 #![allow(clippy::too_many_arguments)]
 
-use crate::constants::{ALLOCATION_STATUS_COMPLETE, ALLOCATION_STATUS_FAILED};
+use crate::constants::{
+    ALLOCATION_STATUS_COMPLETE, ALLOCATION_STATUS_FAILED, STOP_NOTICE_RETENTION_SECS,
+};
 use crate::constraints::{ConstraintSet, DistinctTracker, PermitSet};
 use crate::prelude::*;
 use crate::resources::{ResourcePolicy, ResourcePool};
@@ -31,9 +33,9 @@ use crate::structs::{
     slot_instance_id, Allocation, AllocationHealth, Eval, Instance, InstanceMode, InstanceState,
     Job, JobConfig, JobTemplateProvenance, KvEntry, KvLock, KvValueType, LedgerEntry,
     ManagerConfigFull, ManagerNodeConfig, Node, NodeMsg, ReplaceAfter, ResolvedOnLostPolicy,
-    Rollout, RolloutConfig, SigningKeyRecord, StatefulConfig, StatefulOnLostConfig, Submission,
-    TaskCheck, TaskConfig, TaskCount, TaskDependency, TaskLifecycle, TaskOnUnhealthyConfig,
-    TaskSchedule, TaskStatusState, Volume, WorkerConfig,
+    Rollout, RolloutConfig, SigningKeyRecord, StatefulConfig, StatefulOnLostConfig, StopCause,
+    Submission, TaskCheck, TaskConfig, TaskCount, TaskDependency, TaskLifecycle,
+    TaskOnUnhealthyConfig, TaskSchedule, TaskStatusState, Volume, WorkerConfig,
 };
 use crate::util::random_string;
 
@@ -3701,7 +3703,7 @@ impl Store {
         }
 
         let evicted = removable.len();
-        let affected_job_configs = self.remove_allocations(&removable)?;
+        let affected_job_configs = self.remove_allocations(&removable, StopCause::Drain)?;
         for job_config_id in affected_job_configs {
             self.reconcile_job_config_allocations(&job_config_id)?;
         }
@@ -3731,6 +3733,11 @@ impl Store {
         tx.execute("DELETE FROM allocation WHERE node_id = ?;", [node_id])?;
         self.release_instance_bindings_tx(&tx, &allocs)?;
         self.bump_epochs_for_allocations_tx(&tx, &allocs)?;
+        // The node itself is going away, so these notices will almost never
+        // be delivered — recorded anyway because "almost never" is not
+        // "never": a node removed while still heartbeating (a decommission
+        // racing its own worker) does read them.
+        self.record_stop_notices_tx(&tx, &allocs, StopCause::NodeLost)?;
         tx.commit()?;
         drop(conn);
 
@@ -3740,7 +3747,7 @@ impl Store {
         self.cache_remove_allocations(&allocs)?;
 
         self.events()
-            .allocations_removed_from_node(node_id, &allocs);
+            .allocations_removed_from_node(node_id, &allocs, StopCause::NodeLost);
 
         Ok(allocs)
     }
@@ -4938,6 +4945,7 @@ impl Store {
         tx.execute("DELETE FROM rollout WHERE job_id = ?1;", [job_id])?;
         if !allocs.is_empty() {
             self.bump_epochs_for_allocations_tx(&tx, &allocs)?;
+            self.record_stop_notices_tx(&tx, &allocs, StopCause::Destroy)?;
         }
         tx.commit()?;
         drop(conn);
@@ -7590,6 +7598,82 @@ impl Store {
         Ok(instance.instance_id)
     }
 
+    /// Record why a set of allocations is being removed, in the same
+    /// transaction that removes them.
+    ///
+    /// Same-transaction is the whole point: a notice can then never describe
+    /// a stop that was rolled back, and never arrive claiming a stop that has
+    /// not been decided yet. The heartbeat feed
+    /// ([`Self::stop_notices_for_node`]) reads them straight back out.
+    ///
+    /// [`StopCause::Unknown`] writes nothing — an unknown cause and no
+    /// recorded cause are the same fact, and the worker defaults to
+    /// `Unknown` anyway.
+    fn record_stop_notices_tx(
+        &self,
+        tx: &Connection,
+        removed: &[Allocation],
+        cause: StopCause,
+    ) -> R<()> {
+        if removed.is_empty() || !cause.is_known() {
+            return Ok(());
+        }
+        let now = Self::now_rfc3339()?;
+        let now_unix = OffsetDateTime::now_utc().unix_timestamp();
+
+        // Expire old notices here rather than on the heartbeat read path.
+        // This transaction is already a scheduler-lane write, so the delete
+        // costs no extra raft proposal and stays inside the lane that owns
+        // the table; pruning on read would have put a write (and, in raft
+        // mode, a proposal) on the hottest path in the system. A table with
+        // no removals is not growing, so tying the prune to removals cannot
+        // let it run away.
+        tx.execute(
+            "DELETE FROM allocation_stop_notice WHERE created_at_unix < ?1;",
+            params![now_unix - STOP_NOTICE_RETENTION_SECS],
+        )?;
+
+        for alloc in removed {
+            // REPLACE, not INSERT: an allocation id is unique and a second
+            // removal of the same id (a retried apply, say) should carry the
+            // latest cause rather than fail the transaction it rides in.
+            tx.execute(
+                "INSERT OR REPLACE INTO allocation_stop_notice
+                 (allocation_id, node_id, cause, created_at, created_at_unix)
+                 VALUES (?1, ?2, ?3, ?4, ?5);",
+                params![alloc.id, alloc.node_id, cause.as_str(), now, now_unix],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// The live stop notices for one node, for its heartbeat reply.
+    ///
+    /// Read-only by construction: this runs on every heartbeat from every
+    /// node, so it must not write (expiry happens in
+    /// [`Self::record_stop_notices_tx`], which is already a scheduler-lane
+    /// write). Notices past the retention window are filtered out here so a
+    /// prune that has not run yet cannot resurrect a stale cause.
+    pub fn stop_notices_for_node(&self, node_id: &str) -> R<Vec<(i64, StopCause)>> {
+        let cutoff = OffsetDateTime::now_utc().unix_timestamp() - STOP_NOTICE_RETENTION_SECS;
+
+        let conn = self.read_connection()?;
+        let mut stmt = conn.prepare(
+            "SELECT allocation_id, cause FROM allocation_stop_notice
+             WHERE node_id = ?1 AND created_at_unix >= ?2;",
+        )?;
+        let notices = Self::collect_rows(stmt.query_map(params![node_id, cutoff], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?)?;
+        drop(stmt);
+        drop(conn);
+
+        Ok(notices
+            .into_iter()
+            .map(|(id, cause)| (id, StopCause::from_wire(&cause)))
+            .collect())
+    }
+
     /// After allocation rows are deleted, transition the instances they
     /// fulfilled. Instances still referenced by another live allocation (for
     /// example the already-placed replacement during a config update) keep
@@ -8347,13 +8431,30 @@ impl Store {
             .collect())
     }
 
+    /// Remove one allocation without recording why.
+    ///
+    /// The worker-failure-report path: the task is already gone, so there is
+    /// no stop to explain. Callers that *are* stopping live work should use
+    /// [`Self::remove_allocation_by_id_because`] so the owning worker learns
+    /// the reason.
     #[instrument(err, skip_all)]
     pub fn remove_allocation_by_id(&self, allocation_id: i64) -> R<Option<Allocation>> {
-        match self.remove_allocation_by_id_local(allocation_id) {
+        self.remove_allocation_by_id_because(allocation_id, StopCause::Unknown)
+    }
+
+    /// Remove one allocation, recording why for the owning worker.
+    #[instrument(err, skip_all)]
+    pub fn remove_allocation_by_id_because(
+        &self,
+        allocation_id: i64,
+        cause: StopCause,
+    ) -> R<Option<Allocation>> {
+        match self.remove_allocation_by_id_local(allocation_id, cause) {
             Err(err) if crate::storage::raft::driver::NotRaftLeader::in_chain(&err) => self
                 .forward_after_rejection(
                     crate::storage::raft::forward::ForwardableLaneWrite::RemoveAllocationById {
                         allocation_id,
+                        cause,
                     },
                     err,
                 ),
@@ -8364,13 +8465,18 @@ impl Store {
     pub(crate) fn remove_allocation_by_id_local(
         &self,
         allocation_id: i64,
+        cause: StopCause,
     ) -> R<Option<Allocation>> {
         self.replicated(Lane::Scheduler, "remove_allocation_by_id", move |s| {
-            s.remove_allocation_by_id_apply(allocation_id)
+            s.remove_allocation_by_id_apply(allocation_id, cause)
         })
     }
 
-    fn remove_allocation_by_id_apply(&self, allocation_id: i64) -> R<Option<Allocation>> {
+    fn remove_allocation_by_id_apply(
+        &self,
+        allocation_id: i64,
+        cause: StopCause,
+    ) -> R<Option<Allocation>> {
         let allocation = self.get_allocation_by_id(allocation_id)?;
         let Some(allocation) = allocation else {
             return Ok(None);
@@ -8381,6 +8487,7 @@ impl Store {
         tx.execute("DELETE FROM allocation WHERE id = ?;", [allocation_id])?;
         self.release_instance_bindings_tx(&tx, std::slice::from_ref(&allocation))?;
         self.bump_job_config_epoch_tx(&tx, &allocation.job_config_id)?;
+        self.record_stop_notices_tx(&tx, std::slice::from_ref(&allocation), cause)?;
         tx.commit()?;
 
         self.cache_remove_allocations(std::slice::from_ref(&allocation))?;
@@ -8515,13 +8622,14 @@ impl Store {
         tx.execute(sql, params)?;
         self.release_instance_bindings_tx(&tx, &allocations)?;
         self.bump_epochs_for_allocations_tx(&tx, &allocations)?;
+        self.record_stop_notices_tx(&tx, &allocations, StopCause::Stop)?;
         tx.commit()?;
         drop(conn);
 
         self.cache_remove_allocations(&allocations)?;
 
         self.events()
-            .allocations_removed_for_job(job_id, allocations.len());
+            .allocations_removed_for_job(job_id, allocations.len(), StopCause::Stop);
 
         Ok(())
     }
@@ -8548,6 +8656,9 @@ impl Store {
         )?;
         self.release_instance_bindings_tx(&tx, &allocations)?;
         self.bump_job_config_epoch_tx(&tx, job_config_id)?;
+        // A superseded job config's allocations are cleaned up because a
+        // newer config replaced them.
+        self.record_stop_notices_tx(&tx, &allocations, StopCause::Update)?;
         tx.commit()?;
         drop(conn);
 
@@ -8656,7 +8767,7 @@ impl Store {
             return Ok(());
         }
 
-        let affected_job_configs = self.remove_allocations(&removable)?;
+        let affected_job_configs = self.remove_allocations(&removable, StopCause::NodeLost)?;
         for job_config_id in affected_job_configs {
             self.reconcile_job_config_allocations(&job_config_id)?;
         }
@@ -8743,17 +8854,25 @@ impl Store {
     /// Remove specific allocation rows (releasing instance bindings and
     /// bumping epochs, like every other allocation-removal path) and return
     /// the affected job config ids.
-    pub(crate) fn remove_allocations(&self, allocs: &[Allocation]) -> R<HashSet<String>> {
+    pub(crate) fn remove_allocations(
+        &self,
+        allocs: &[Allocation],
+        cause: StopCause,
+    ) -> R<HashSet<String>> {
         if allocs.is_empty() {
             return Ok(HashSet::new());
         }
         let allocs = allocs.to_vec();
         self.replicated(Lane::Scheduler, "remove_allocations", move |s| {
-            s.remove_allocations_apply(&allocs)
+            s.remove_allocations_apply(&allocs, cause)
         })
     }
 
-    fn remove_allocations_apply(&self, allocs: &[Allocation]) -> R<HashSet<String>> {
+    fn remove_allocations_apply(
+        &self,
+        allocs: &[Allocation],
+        cause: StopCause,
+    ) -> R<HashSet<String>> {
         let mut conn = self.write_connection()?;
         let tx = Self::write_tx(&mut conn)?;
         for alloc in allocs {
@@ -8761,6 +8880,7 @@ impl Store {
         }
         self.release_instance_bindings_tx(&tx, allocs)?;
         self.bump_epochs_for_allocations_tx(&tx, allocs)?;
+        self.record_stop_notices_tx(&tx, allocs, cause)?;
         tx.commit()?;
 
         self.cache_remove_allocations(allocs)?;
@@ -9520,6 +9640,7 @@ impl Store {
             params![now, instance_id],
         )?;
         self.bump_epochs_for_allocations_tx(&tx, &allocations)?;
+        self.record_stop_notices_tx(&tx, &allocations, StopCause::Destroy)?;
         tx.commit()?;
 
         self.cache_remove_allocations(&allocations)?;
@@ -9615,6 +9736,7 @@ impl Store {
             params![now, instance_id],
         )?;
         self.bump_epochs_for_allocations_tx(&tx, &allocations)?;
+        self.record_stop_notices_tx(&tx, &allocations, StopCause::Stop)?;
         tx.commit()?;
 
         self.cache_remove_allocations(&allocations)?;
@@ -15516,6 +15638,148 @@ mod tests {
         Ok(())
     }
 
+    /// Seed a one-task job and place an allocation for it on `node_id`.
+    fn seed_placed_allocation(store: &Store, job_name: &str, node_id: &str) -> R<Allocation> {
+        let job = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: job_name.into(),
+            tasks: vec![TaskConfig::new("web", "noop")],
+            version: None,
+        };
+        store.handle_job_submit(
+            &job,
+            &[Submission {
+                path: "job.jsonnet".into(),
+                content: "{}".into(),
+                is_primary: true,
+            }],
+        )?;
+        let task_id = task_id_for(store, "web", &job.name)?;
+        store.place_alloc(node_id, task_id)
+    }
+
+    #[test]
+    fn stop_notice_records_the_cause_and_serves_it_to_the_owning_node() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "ready"))?;
+        store.insert_node(make_node_msg("node-b", "ready"))?;
+        let allocation = seed_placed_allocation(&store, "notice-demo", "node-a")?;
+
+        // Nothing removed yet: no notices.
+        assert!(store.stop_notices_for_node("node-a")?.is_empty());
+
+        store.remove_allocation_by_id_because(allocation.id, StopCause::Drain)?;
+
+        let notices = store.stop_notices_for_node("node-a")?;
+        assert_eq!(
+            notices,
+            vec![(allocation.id, StopCause::Drain)],
+            "the owning node learns why its allocation went away"
+        );
+        // Notices are addressed to one node; a different node must not see
+        // another node's stops.
+        assert!(
+            store.stop_notices_for_node("node-b")?.is_empty(),
+            "notices are scoped to the node that owned the allocation"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn stop_notice_is_absent_when_the_cause_is_unknown() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "ready"))?;
+        let allocation = seed_placed_allocation(&store, "unknown-demo", "node-a")?;
+
+        // The worker-failure-report path: the task died on its own, so there
+        // is no platform stop to explain. Recording `unknown` would be noise
+        // — the worker defaults to it anyway.
+        store.remove_allocation_by_id(allocation.id)?;
+
+        assert!(
+            store.stop_notices_for_node("node-a")?.is_empty(),
+            "an unknown cause records nothing"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn stop_notices_expire_and_are_pruned_by_later_removals() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "ready"))?;
+        // Both allocations are placed before either is removed: allocation
+        // ids are plain rowids and get REUSED after a delete, so seeding them
+        // one at a time would hand both the same id and quietly turn this
+        // into a test of `INSERT OR REPLACE`.
+        let first = seed_placed_allocation(&store, "expiry-demo-1", "node-a")?;
+        let second = seed_placed_allocation(&store, "expiry-demo-2", "node-a")?;
+        assert_ne!(first.id, second.id);
+
+        store.remove_allocation_by_id_because(first.id, StopCause::Stop)?;
+        assert_eq!(store.stop_notices_for_node("node-a")?.len(), 1);
+
+        // Backdate the notice past the retention window. The read path must
+        // filter it even before anything prunes it, so a stale cause can
+        // never be served.
+        {
+            let conn = store.write_connection()?;
+            conn.execute(
+                "UPDATE allocation_stop_notice SET created_at_unix = ?1 WHERE allocation_id = ?2;",
+                params![
+                    OffsetDateTime::now_utc().unix_timestamp() - STOP_NOTICE_RETENTION_SECS - 1,
+                    first.id
+                ],
+            )?;
+        }
+        assert!(
+            store.stop_notices_for_node("node-a")?.is_empty(),
+            "an expired notice is filtered on read"
+        );
+
+        // The next removal's transaction is what actually deletes it: expiry
+        // rides scheduler-lane writes, never the heartbeat read path.
+        store.remove_allocation_by_id_because(second.id, StopCause::Stop)?;
+
+        let remaining: i64 = store.read_connection()?.query_row(
+            "SELECT COUNT(*) FROM allocation_stop_notice WHERE allocation_id = ?1;",
+            params![first.id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(remaining, 0, "the expired row was pruned by the next write");
+        assert_eq!(
+            store.stop_notices_for_node("node-a")?,
+            vec![(second.id, StopCause::Stop)],
+            "the live notice survives the prune"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn job_stop_and_drain_record_distinguishable_causes() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "ready"))?;
+        let allocation = seed_placed_allocation(&store, "cause-demo", "node-a")?;
+
+        // `job stop` — the whole point of Phase 1a is that this is no longer
+        // indistinguishable from a drain or an update on the wire.
+        store.remove_allocs_for_job("cause-demo")?;
+        assert_eq!(
+            store.stop_notices_for_node("node-a")?,
+            vec![(allocation.id, StopCause::Stop)]
+        );
+
+        // And the event journal carries it too.
+        let events = store.list_scheduler_events(&SchedulerEventFilter::default())?;
+        let removed = events
+            .iter()
+            .find(|event| event.kind == "allocation.removed")
+            .context("a removal event should have been recorded")?;
+        let meta: Value = serde_json::from_str(&removed.metadata_json)?;
+        assert_eq!(meta["cause"], json!("stop"));
+        Ok(())
+    }
+
     #[test]
     fn allocation_health_snapshots_upsert_and_cleanup() -> R<()> {
         let store = setup_store()?;
@@ -15667,8 +15931,12 @@ mod tests {
         let store = setup_store()?;
 
         // Empty inputs are no-ops, so callers don't need their own guards.
-        store.events().allocations_removed_from_node("node-a", &[]);
-        store.events().allocations_removed_for_job("demo", 0);
+        store
+            .events()
+            .allocations_removed_from_node("node-a", &[], StopCause::NodeLost);
+        store
+            .events()
+            .allocations_removed_for_job("demo", 0, StopCause::Stop);
         assert!(drafts::allocations_placed("cfg-1", &[]).is_none());
         assert!(drafts::job_submit_outcome(
             "demo",

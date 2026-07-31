@@ -46,8 +46,18 @@ Lifecycle hooks:
 - `readiness()`
 - `prepare()`
 - `start()`
-- `stop()`
+- `stop()` / `stop_with()`
 - `destroy()`
+
+The worker calls `stop_with(allocation, task, instance, ctx)`, where `ctx` is
+a `StopContext` carrying the [stop cause](graceful-stop.md) — why the platform
+is stopping this allocation. Its default implementation delegates to `stop()`,
+so a runtime that does not care about the cause implements only `stop()`, and
+**plugins compiled against the trait before `stop_with` existed keep working
+unchanged**. No in-tree runtime overrides it today: the cause is delivered and
+logged, but termination is still immediate for every runtime. `StopContext` is
+`#[non_exhaustive]` because it gains a signal and a deadline when graceful
+termination ships.
 
 Capability declarations (each has a default, so an existing plugin keeps
 compiling):

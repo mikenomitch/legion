@@ -675,10 +675,27 @@ async fn heartbeat_tick(
             }
             desired.retain(|allocation| !failed_prepare.contains(&allocation.allocation_id));
 
-            let new_allocations = task_manager
-                .lock()
-                .expect("task manager")
-                .reconcile_allocations(&desired);
+            // Why the manager is stopping things, delivered before the
+            // reconcile that acts on it: `reconcile_allocations` consumes
+            // these as it stops each undesired allocation, so a notice that
+            // landed after the reconcile would describe a stop that already
+            // happened.
+            let stop_causes = reply
+                .stop_notices
+                .iter()
+                .map(|notice| {
+                    (
+                        notice.allocation_id,
+                        crate::structs::StopCause::from_wire(&notice.cause),
+                    )
+                })
+                .collect();
+
+            let new_allocations = {
+                let mut manager = task_manager.lock().expect("task manager");
+                manager.set_stop_causes(stop_causes);
+                manager.reconcile_allocations(&desired)
+            };
             if !new_allocations.is_empty() {
                 // Refresh loops are keyed by allocation id and start slightly
                 // before the task process registers (the launch below is
@@ -1198,6 +1215,7 @@ mod tests {
             message: "ack".into(),
             desired_allocations: vec![connect_allocation(11, "db", local_port)],
             volume_destroy: Vec::new(),
+            stop_notices: Vec::new(),
             upstream_endpoints: vec![UpstreamEndpoints {
                 allocation_id: 11,
                 service: "db".into(),

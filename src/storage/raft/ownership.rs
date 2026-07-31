@@ -171,6 +171,18 @@ const TABLE_OWNERS: &[(&str, Owner)] = &[
     ("allocation_epoch", Owner::Lane(Lane::Scheduler)),
     ("allocation_epoch_partition", Owner::Lane(Lane::Scheduler)),
     ("plan_submission", Owner::Lane(Lane::Scheduler)),
+    // `allocation_stop_notice` records WHY an allocation was removed, for the
+    // owning worker's next heartbeat. Every writer is an allocation-removal
+    // op, and all eight of them — `remove_allocations`,
+    // `remove_allocation_by_id`, `remove_allocs_for_node`,
+    // `remove_allocs_for_job`, `remove_allocs_for_job_config`,
+    // `destroy_job_scheduler_cleanup`, and the keyed-instance stop/destroy
+    // pair — propose on the scheduler lane, writing the notice in the same
+    // transaction as the DELETE it describes. Expiry rides those same
+    // transactions, so nothing outside this lane ever writes the table. NOT
+    // commutative: the insert is an upsert (`INSERT OR REPLACE`), which the
+    // commutative class forbids.
+    ("allocation_stop_notice", Owner::Lane(Lane::Scheduler)),
     ("instance", Owner::Lane(Lane::Scheduler)),
     // `volume` rides the scheduler lane: a volume's lifecycle is bound to its
     // instance (`instance` is already scheduler-owned, and `place_alloc`
