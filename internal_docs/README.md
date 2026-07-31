@@ -59,6 +59,7 @@ When one is required and what goes in it:
 | [autoscaler-plan.md](plans/autoscaler-plan.md) | planned |
 | [auth-acl-plan.md](plans/auth-acl-plan.md) | phases 1–4 executed |
 | [container-runtime-exec-and-signals-plan.md](plans/container-runtime-exec-and-signals-plan.md) | planned |
+| [dispatch-outbox-plan.md](plans/dispatch-outbox-plan.md) | planned |
 | [exec-and-actions-plan.md](plans/exec-and-actions-plan.md) | shipped (all five phases) |
 | [durability-and-ops-execution-plan.md](plans/durability-and-ops-execution-plan.md) | executed (workstreams A/B/C/D + adversarial verification, 2026-07-28); lanes topology opt-in |
 | [edge-boot-plan.md](plans/edge-boot-plan.md) | planned |
@@ -78,6 +79,7 @@ When one is required and what goes in it:
 | [plan-path-scale-levers-plan.md](plans/plan-path-scale-levers-plan.md) | shipped (D4/D5/D6, 2026-07-30) |
 | [bounded-candidate-scoring-plan.md](plans/bounded-candidate-scoring-plan.md) | shipped (opt-in `score_sample`, 2026-07-30) |
 | [heartbeat-scale-plan.md](plans/heartbeat-scale-plan.md) | shipped (benchmark + batching + liveness + cadence, 2026-07-30) |
+| [scheduler-sharding-plan.md](plans/scheduler-sharding-plan.md) | planned (graduates the in-process half of D2) |
 | [aws-comparative-benchmark-plan.md](plans/aws-comparative-benchmark-plan.md) | in execution (phases 0-1; campaigns await AWS account) |
 | [worker-simulation-plan.md](plans/worker-simulation-plan.md) | shipped (2026-07-30) |
 | [scheduler-plan-snapshot-plan.md](plans/scheduler-plan-snapshot-plan.md) | shipped |
@@ -115,6 +117,7 @@ by project impact. The full template and a worked example:
 - [bounded-candidate-scoring-plan_calls.md](calls/bounded-candidate-scoring-plan_calls.md)
 - [container-runtime-exec-and-signals-plan_calls.md](calls/container-runtime-exec-and-signals-plan_calls.md)
 - [container-task-kind-macos_calls.md](calls/container-task-kind-macos_calls.md)
+- [dispatch-outbox-plan_calls.md](calls/dispatch-outbox-plan_calls.md)
 - [edge-boot-plan_calls.md](calls/edge-boot-plan_calls.md)
 - [exec-and-actions-plan_calls.md](calls/exec-and-actions-plan_calls.md)
 - [gang-scheduling-plan_calls.md](calls/gang-scheduling-plan_calls.md)
@@ -130,6 +133,7 @@ by project impact. The full template and a worked example:
 - [plan-path-scale-levers-plan_calls.md](calls/plan-path-scale-levers-plan_calls.md)
 - [pre-benchmark-hardening_calls.md](calls/pre-benchmark-hardening_calls.md)
 - [preemption-and-eviction-plan_calls.md](calls/preemption-and-eviction-plan_calls.md)
+- [scheduler-sharding-plan_calls.md](calls/scheduler-sharding-plan_calls.md)
 - [service-discovery-final-plan_calls.md](calls/service-discovery-final-plan_calls.md)
 - [shared-alloc-dir-proposal_calls.md](calls/shared-alloc-dir-proposal_calls.md)
 - [stateful-workloads-and-instance-identity-plan_calls.md](calls/stateful-workloads-and-instance-identity-plan_calls.md)

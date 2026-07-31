@@ -53,8 +53,38 @@ How to use it:
       unreachable. Ratification reuses the existing plan apply, so the
       at-most-one-live-allocation invariant is unchanged. Phase 0 is a
       measurement phase and is allowed to kill the later phases.
+- [ ] **Sharded scheduling** — eval workers claim from shard-local queues and
+      plan against a shard-local node slice, so N workers stop issuing N
+      competing consensus rounds against one queue head and planners in
+      different shards cannot collide —
+      [plan](plans/scheduler-sharding-plan.md) (PLANNED: contention benchmark
+      → shard-local claim → shard-local read model → rebalance + `auto`).
+      Graduates the in-process half of architecture-review item D2; D2 step 2
+      (cross-manager planners) stays deferred on AWS-test data. Shard key is
+      pool subdivided by node hash, because pool alone gives the median
+      single-pool cluster one shard and no win
+      ([call 1](calls/scheduler-sharding-plan_calls.md)). Sequenced behind
+      late-binding plan apply: the measured contention cell (12 nodes, 4
+      planners, 1.25+ retries/plan) is one shard under any scheme here, so
+      sharding would not have moved it — Phase 0 is allowed to kill the plan.
+- [ ] **Durable dispatch outbox** — allocation commands are written in the
+      plan-apply transaction and delivered by a long-polled `PollWork` with
+      per-node sequence numbers and ack-on-next-poll, so delivery latency is
+      bounded by RTT instead of the heartbeat tick —
+      [plan](plans/dispatch-outbox-plan.md) (PLANNED: measure the current path
+      → outbox in shadow → delivery → heartbeat sheds desired state →
+      publish). Today `dispatch_allocations`
+      ([src/manager/dispatcher.rs:11](../src/manager/dispatcher.rs)) drops an
+      allocation on RPC failure with only a `warn!`, and the 2s heartbeat
+      re-sends every node's *entire* desired set forever as the backstop.
+      Desired-state reconcile is deliberately kept as the recovery path
+      ([call 1](calls/dispatch-outbox-plan_calls.md)). Phase 0 ships
+      `legion_dispatch_push_dropped_total` — the failure we currently only log
+      — and is allowed to kill the plan.
 - [ ] Worker groups + taint/toleration equivalent. Node pools exist as an ACL
-      and config concept but nothing scheduling-side consumes them.
+      and config concept but nothing scheduling-side consumes them. The
+      sharding plan above is the first thing that would
+      ([plan §1](plans/scheduler-sharding-plan.md)).
 - [ ] Preemption follow-ups — the feature shipped
       ([plan](plans/preemption-and-eviction-plan.md) ·
       [docs](../docs/preemption-and-eviction.md)); these are what it left open.
@@ -124,7 +154,11 @@ How to use it:
       at `Scheduler::new`, and the index shard-sort skipped when the
       caller discards the order (before/after in
       [benchmarks/scheduler/README.md](../benchmarks/scheduler/README.md)).
-      Further wins want profiling, not this list.
+      Further wins want profiling, not this list — the remaining *measured*
+      ceiling is contention, not per-plan cost (D5 returned 16–55% throughput
+      against a 2.4–3x p50 win because conflicts/plan are identical with the
+      lever on and off), which is what the late-binding and sharding plans
+      above attack.
 - [x] Scheduler performance measurement stack
       ([plan](plans/scheduler-performance-plan.md),
       [calls](calls/scheduler-performance-plan_calls.md),
