@@ -194,12 +194,25 @@ async fn run_worker_with_manager(
         // process; seed their refresh loops with an already-expired token so
         // they re-issue immediately.
         if !task.identities.is_empty() {
+            // Same file-delivery mapping the original launch used, so a
+            // refresh rewrites the file the workload is actually reading.
+            let delivery_base = task_manager
+                .lock()
+                .expect("task manager")
+                .file_delivery_base(allocation.id, &task.name, &task.runtime)
+                .map(
+                    |(in_task_root, host_task_dir)| crate::worker::identity::FileDeliveryBase {
+                        in_task_root,
+                        host_task_dir,
+                    },
+                );
             let prepared = task
                 .identities
                 .iter()
                 .map(|identity| PreparedIdentity {
                     identity: identity.clone(),
                     expires_at: 0,
+                    delivery_base: delivery_base.clone(),
                 })
                 .collect();
             identity_manager.spawn_refreshers(allocation.id, prepared, task_manager.clone());
@@ -711,7 +724,24 @@ async fn heartbeat_tick(
                 .iter_mut()
                 .filter(|allocation| !running_set.contains(&allocation.allocation_id))
             {
-                match identity_manager.prepare_task_allocation(allocation).await {
+                let delivery_base = task_manager
+                    .lock()
+                    .expect("task manager")
+                    .file_delivery_base(
+                        allocation.allocation_id,
+                        &allocation.task_name,
+                        &allocation.task_runtime,
+                    )
+                    .map(|(in_task_root, host_task_dir)| {
+                        crate::worker::identity::FileDeliveryBase {
+                            in_task_root,
+                            host_task_dir,
+                        }
+                    });
+                match identity_manager
+                    .prepare_task_allocation(allocation, delivery_base)
+                    .await
+                {
                     Ok(prepared) => {
                         prepared_by_alloc.insert(allocation.allocation_id, prepared);
                     }

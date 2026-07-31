@@ -3,12 +3,13 @@
 //! Two things live here, both Linux-only in effect and both parsed
 //! everywhere so a jobspec validates identically on a macOS laptop:
 //!
-//! - **Worker-owned cgroups.** When the worker is started with
-//!   `resourceEnforcement.enabled`, each `exec` allocation gets a cgroup v2
-//!   subtree that Legion creates, writes the task's `resources` into as real
-//!   limits, and removes when the allocation stops. Before this, `resources`
-//!   was scheduling arithmetic and the `cgroup` field could only *join* a
-//!   cgroup somebody else had already created and limited.
+//! - **Legacy cgroup cleanup.** Worker-owned cgroups moved to worker core
+//!   (`src/worker/resources.rs`), which now places `exec` *and* `container`
+//!   tasks in one node-wide `legion/share` + `legion/reserve` hierarchy — see
+//!   `docs/resource-enforcement.md`. What remains here is
+//!   [`remove_managed_cgroup`], which tears down the per-allocation cgroups a
+//!   *previous* worker version created (`legion/alloc-<id>-<task>`), so an
+//!   upgrade does not orphan them.
 //! - **The `hardening` block.** `noNewPrivileges`, capability bounding-set
 //!   drops, a private `/tmp`, `umask`, and `nice` — the isolation floor
 //!   containers already had.
@@ -221,91 +222,6 @@ pub fn managed_cgroup_path(parent: &str, allocation_id: i64, task_name: &str) ->
     PathBuf::from(parent).join(format!("alloc-{allocation_id}-{task}"))
 }
 
-/// The cgroup v2 limit files a task's `resources` translate to.
-///
-/// `memory` is MiB (the jobspec unit) and becomes `memory.max` in bytes.
-/// `cpus`/`cores` is a core count and becomes `cpu.max` as
-/// `<quota> <period>` microseconds. Anything absent is simply not written, so
-/// a task that declares only memory is not silently pinned to a CPU share.
-pub fn limit_files(resources: &Value) -> Vec<(&'static str, String)> {
-    const CPU_PERIOD_US: f64 = 100_000.0;
-    let mut limits = Vec::new();
-
-    if let Some(memory_mib) = resources.get("memory").and_then(Value::as_f64) {
-        if memory_mib > 0.0 {
-            let bytes = (memory_mib * 1024.0 * 1024.0).round() as u64;
-            limits.push(("memory.max", bytes.to_string()));
-        }
-    }
-
-    let cores = resources
-        .get("cpus")
-        .and_then(Value::as_f64)
-        .or_else(|| resources.get("cores").and_then(Value::as_f64));
-    if let Some(cores) = cores {
-        if cores > 0.0 {
-            let quota = (cores * CPU_PERIOD_US).round() as u64;
-            limits.push(("cpu.max", format!("{quota} {}", CPU_PERIOD_US as u64)));
-        }
-    }
-
-    limits
-}
-
-/// Create the allocation's cgroup and write its limits. Returns the path
-/// relative to [`CGROUP_ROOT`], or `None` when this node cannot enforce —
-/// which is a warning, never a failure: enforcement must not be the reason a
-/// workload will not run.
-#[cfg(target_os = "linux")]
-pub fn prepare_managed_cgroup(
-    allocation_id: i64,
-    task_name: &str,
-    resources: &Value,
-) -> Option<PathBuf> {
-    let limits = limit_files(resources);
-    if limits.is_empty() {
-        return None;
-    }
-
-    let unified = std::path::Path::new(CGROUP_ROOT).join("cgroup.controllers");
-    if !unified.exists() {
-        warn!(
-            allocation_id,
-            task_name,
-            "Resource enforcement requested but this node has no cgroup v2; running unconfined"
-        );
-        return None;
-    }
-
-    let relative = managed_cgroup_path(&cgroup_parent(), allocation_id, task_name);
-    let absolute = std::path::Path::new(CGROUP_ROOT).join(&relative);
-    if let Err(err) = std::fs::create_dir_all(&absolute) {
-        warn!(
-            allocation_id,
-            task_name,
-            error = ?err,
-            path = %absolute.display(),
-            "Failed to create task cgroup; running unconfined"
-        );
-        return None;
-    }
-
-    for (file, value) in limits {
-        if let Err(err) = std::fs::write(absolute.join(file), &value) {
-            warn!(
-                allocation_id,
-                task_name,
-                error = ?err,
-                file,
-                value = %value,
-                "Failed to write cgroup limit; the task runs without this limit"
-            );
-        }
-    }
-
-    Some(relative)
-}
-
 /// Remove an allocation's cgroup. Best-effort: an rmdir that fails because a
 /// process is still in the group is normal during teardown, and the next
 /// start of the same allocation id reuses the directory anyway.
@@ -332,29 +248,6 @@ pub fn remove_managed_cgroup(_allocation_id: i64, _task_name: &str) {}
 #[cfg(test)]
 mod exec_isolation_test {
     use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn resources_become_cgroup_limits() {
-        let limits = limit_files(&json!({ "memory": 512, "cpus": 1.5 }));
-        assert_eq!(
-            limits,
-            vec![
-                ("memory.max", (512u64 * 1024 * 1024).to_string()),
-                ("cpu.max", "150000 100000".to_string()),
-            ]
-        );
-    }
-
-    #[test]
-    fn absent_or_zero_resources_write_no_limit() {
-        assert!(limit_files(&json!({})).is_empty());
-        assert!(limit_files(&json!({ "memory": 0, "cpus": 0 })).is_empty());
-        // Declaring only memory must not imply a CPU limit.
-        assert_eq!(limit_files(&json!({ "memory": 64 })).len(), 1);
-        // `cores` is the container runtime's spelling of the same thing.
-        assert_eq!(limit_files(&json!({ "cores": 2 })).len(), 1);
-    }
 
     #[test]
     fn managed_cgroup_paths_are_deterministic_and_sanitized() {

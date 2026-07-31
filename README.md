@@ -18,6 +18,7 @@ Full index: [docs/README.md](docs/README.md).
 - [Task Runtime: container](docs/task-runtime-container.md)
 - [Task Runtime: sandbox (microVM)](docs/task-runtime-sandbox.md)
 - [Task Runtime: noop](docs/task-runtime-noop.md)
+- [Resource Enforcement (hard memory limits, exclusive cores, CPU weight)](docs/resource-enforcement.md)
 - [Artifacts (images, files, git, S3, OCI/ORAS)](docs/artifacts.md)
 - [Stateful Workloads & Instance Identity](docs/stateful-workloads.md)
 - [Rollouts](docs/rollouts.md) and [Rollout Strategy Plugins](docs/rollout-strategy-plugins.md)

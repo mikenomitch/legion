@@ -271,10 +271,15 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
       [calls](calls/host-process-supervision-plan_calls.md) ·
       [docs](../docs/task-supervision.md)
 - [x] **Worker-owned cgroups for `exec`** — opt-in `resourceEnforcement` on the
-      worker config turns a task's `resources` into `memory.max`/`cpu.max` in a
-      cgroup Legion creates and removes per allocation; an explicit
-      `config.cgroup` still means "join this one"
-      ([docs](../docs/task-supervision.md#resource-enforcement-cgroups))
+      worker config turns a task's `resources` into real kernel limits; an
+      explicit `config.cgroup` still means "join this one"
+      ([docs](../docs/task-supervision.md#resource-enforcement-cgroups)).
+      **Superseded in place** (2026-07-31) by the container-runtime plan's
+      node-wide subsystem: the same config knob now governs `exec` *and*
+      `container` through one `legion/share` + `legion/reserve` hierarchy,
+      with `cpu.weight` in place of the old `cpu.max` quota and cpuset
+      pinning for `cores` ([docs](../docs/resource-enforcement.md),
+      [calls 16](calls/container-runtime-exec-and-signals-plan_calls.md)).
 - [x] **`exec` hardening block** — `noNewPrivileges`, capability bounding-set
       drops, `privateTmp`, `umask`, `nice`, applied in privilege order around
       the user switch ([docs](../docs/task-supervision.md#process-hardening))
@@ -298,53 +303,38 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
       [calls](calls/host-convergence-plan_calls.md) (PLANNED: file-shaped
       resources → system resources → node-config jobs → why-run/drift →
       `host` ACL resource). Phase 1 depends on the exit-status work above.
-- [ ] **`container` core gaps: exec on Linux, signals + stop knobs, Nomad-style
-      CPU/memory enforcement, file delivery** —
-      [plan](plans/container-runtime-exec-and-signals-plan.md) (PLANNED).
-      Today `legion exec`/actions/UI/MCP fail against container tasks on Linux
-      (exec was deferred for the OCI runtimes), no platform can signal a
-      container task (`changeMode: signal` rejected at admission), teardown
-      has no grace window or knobs (Linux is `delete --force`, SIGKILL),
-      declared `resources` set no cgroup limits on Linux (`cpu` MHz enforced
-      nowhere), and the unmounted task dir blocks KV/identity *file* delivery
-      and file/tree artifacts.
-  - [ ] Phase 1 — exec via `<runtime> exec` for youki/runc/crun
-  - [ ] Phase 2 — `TaskPlugin::signal()` seam + `container kill`/`<runtime> kill`
-  - [ ] Phase 3 — graceful stop + task-level `stopSignal`/`stopGracePeriod`
-        fields (defaults SIGTERM/10 s, admission-capped; container both
-        platforms + exec runtime)
-  - [ ] Phase 4 — the `resource_enforcement()` interface (`Unsupported`/
-        `WorkerCgroup`/`RuntimeApplied` + worker-computed `ResourceAssignment`)
-        with Linux memory hard limits and `cpu` MHz → `cpu.weight`
-        (share-slice cgroup, OOM-kill annotation, `cores`-xor-`cpu` and
-        whole-`cores` validation)
-  - [ ] Phase 5 — exclusive `cores` via cpuset pinning (worker core
-        allocator, `legion/share`/`legion/reserve` slices, restart recovery)
-  - [ ] Phase 6 — `exec` runtime adopts the interface (`WorkerCgroup`): one
-        node-wide fence for container + exec tasks, real memory limits for
-        exec, `cgroup.kill` teardown; explicit `config.cgroup` still wins
-  - [ ] Phase 7 — task dir mounted at `/legion/task` + translated env; flips
-        KV file injection, identity file delivery, and file/tree artifacts to
-        supported (container file paths must live under the mount)
-  - [ ] Follow-on (not in the plan): `sandbox` adopts `resource_enforcement()`
-        as a `RuntimeApplied` consumer — pin vCPU threads to the assignment's
-        cores, size the guest from its memory limit. The honest test of
-        whether the three modes are the right cut (plan Q4).
-  - Deliberately out of scope there (still open, see the plan's non-goals):
-    Linux port mapping/network namespaces, NUMA/SMT-aware core placement,
-    fencing non-Legion host processes off reserved cores, a delegated
-    (non-root) cgroup hierarchy root, alloc-dir sharing
-  - **Overlaps shipped work — reconcile before building phase 6.** `exec`
-    already creates and sizes a per-allocation cgroup from `resources`, opt-in
-    per worker via `resourceEnforcement` in the worker config
-    ([host process supervision plan](plans/host-process-supervision-plan.md)
-    §6.5, [docs](../docs/task-supervision.md#resource-enforcement-cgroups),
-    `src/task_plugins/exec_isolation.rs`). Phase 6 should adopt that code as
-    the `WorkerCgroup` implementation rather than write a second one, and
-    decide one opt-in story for both runtimes: the exec work is off by default
-    per worker (a `resources` block was only ever a scheduling estimate), which
-    the container plan's default-on stance has to either match or explicitly
-    overrule.
+- [ ] **`sandbox` adopts `resource_enforcement()`** as a `RuntimeApplied`
+      consumer — pin the VMM's vCPU threads to the assignment's cores, size the
+      guest from its memory limit. Surfaced by the container-runtime plan
+      ([plan Q4](plans/container-runtime-exec-and-signals-plan.md#11-open-questions),
+      [docs](../docs/resource-enforcement.md)) as the honest test of whether
+      the three modes are the right cut: a microVM's "memory limit" is guest
+      size, not a cgroup ceiling, so the assignment may need to say which it
+      means. Until it lands, `sandbox` tasks are ungoverned — their `resources`
+      size the guest and are otherwise scheduling-only, and they can land on
+      cores another task reserved.
+- [ ] **Linux container port mapping / private network namespaces.** Containers
+      keep host networking; assigned ports reach them without mapping, but
+      there is no isolation. Named non-goal of the container-runtime plan —
+      it belongs to the networking work below.
+- [ ] **NUMA/SMT-aware core placement.** The core allocator hands out whole
+      logical CPUs lowest-free-first with no topology awareness: no NUMA-node
+      affinity, no SMT-sibling avoidance. Nomad gates this behind Enterprise;
+      revisit with a workload that measurably needs it
+      ([docs](../docs/resource-enforcement.md#not-implemented)).
+- [ ] **A delegated (non-root) cgroup hierarchy root.** Enforcement assumes a
+      root worker creating `legion/` at the cgroup root; a configurable root
+      for delegated setups is unbuilt
+      ([docs](../docs/resource-enforcement.md#turning-it-on)).
+- [ ] **`legion alloc signal`** — an on-demand signal verb. The plumbing now
+      exists (`TaskPlugin::signal`, routed through the registry); today signals
+      are only delivered by declared policy (`changeSignal` on identity
+      refresh, `stopSignal` on teardown). Additive; named non-goal of the
+      container-runtime plan.
+- [ ] **The `sandbox` runtime still cannot exec, signal, or deliver identity
+      files** — all three need the guest agent the sandbox plan owns. The
+      container runtime's `TaskPlugin::signal` override is the seam its
+      guest-agent path would implement.
 - [ ] `exec`: unveil support
 - [ ] `exec`: network namespaces (netavark? CNI?) — see *Networking* below
 - [ ] **Sandbox snapshots, fast start, and forking** —
@@ -921,6 +911,60 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
       ([oci_bundle.rs](../src/task_plugins/oci_bundle.rs)).
 - [x] A **sandbox** runtime ([docs](../docs/task-runtime-sandbox.md)) — OCI images
       in microVMs for untrusted code and agent workspaces
+- [x] **The `container` runtime's four core gaps, closed** (2026-07-31) —
+      [plan](plans/container-runtime-exec-and-signals-plan.md) ·
+      [calls](calls/container-runtime-exec-and-signals-plan_calls.md). Six of
+      its seven phases; Phase 3 (graceful stop) was **superseded before merge**
+      by the preemption plan's Phase 1b, which shipped the same ladder as
+      `stop { signal, killAfter }` — see the Phase 3 entry below:
+  - [x] Phase 1 — exec on Linux via `<runtime> exec` for youki/runc/crun, so
+        `legion exec`, actions, the UI terminal, and MCP exec work on the OS
+        the workloads ship on ([docs](../docs/exec-and-actions.md))
+  - [x] Phase 2 — `TaskPlugin::signal()` seam with a tracked-pid default, and
+        a container override that signals the container *init*
+        (`container kill` / `<runtime> kill`); `changeMode: signal` identities
+        on container tasks are accepted
+        ([docs](../docs/workload-identity.md))
+  - [~] Phase 3 — graceful stop. **Superseded, not shipped as designed.** The
+        branch built `stopSignal` / `stopGracePeriod`; preemption's Phase 1b
+        landed on `main` first with the same feature as
+        `stop { signal, killAfter }`, one ladder for every stop cause. The
+        duplicate surface was dropped at merge rather than shipped alongside
+        — two jobspec fields for one behavior is the incoherence this repo
+        keeps out. What the branch *kept* is the runtime-side half Phase 1b
+        did not cover: the Linux container teardown ladder (signal → bounded
+        wait → `delete --force` instead of an unconditional SIGKILL)
+        ([docs](../docs/graceful-stop.md),
+        [calls 19](calls/container-runtime-exec-and-signals-plan_calls.md))
+  - [x] Phase 4 — the `resource_enforcement()` interface (`Unsupported` /
+        `WorkerCgroup` / `RuntimeApplied` + a worker-computed
+        `ResourceAssignment`), Linux memory hard limits, `cpu` MHz →
+        `cpu.weight`, OOM-kill annotation from `memory.events`, and the
+        whole-`cores` / `cores`-xor-`cpu` validation rules
+        ([docs](../docs/resource-enforcement.md))
+  - [x] Phase 5 — exclusive `cores` via cpuset pinning: worker core allocator,
+        `legion/share` + `legion/reserve` slices, exhaustion failure path,
+        assignment persisted and rebuilt on worker restart
+  - [x] Phase 6 — the `exec` runtime adopts the interface (`WorkerCgroup`), so
+        one node-wide fence governs container *and* exec tasks, exec gains
+        real memory limits, and teardown reaps double-forked descendants via
+        `cgroup.kill`; an explicit `config.cgroup` still wins
+        ([docs](../docs/task-runtime-exec.md))
+  - [x] Phase 7 — the task dir is mounted at `/legion/task` with translated
+        env, flipping KV file injection, identity file delivery, and file/tree
+        artifacts to supported in containers — refresh included, because the
+        directory is mounted rather than individual files
+        ([docs](../docs/task-runtime-container.md#the-task-directory-legiontask))
+  - Enforcement is gated on the pre-existing opt-in `resourceEnforcement`
+    worker config rather than shipping ungated, and it *replaces* the exec
+    runtime's own per-allocation cgroup path (which conflated `cpus` with
+    `cores` and used a CFS quota) — see calls 8, 10, and 16.
+  - The two-phase stop this branch also built (signal under the lock, reap on
+    the supervisor's tick) arrived independently in preemption's Phase 1b and
+    is `main`'s implementation now; the branch keeps only its resource-release
+    step, ordered strictly behind the reap so a cgroup is never removed while
+    it still holds a live process
+    ([calls 19](calls/container-runtime-exec-and-signals-plan_calls.md)).
 
 ## Artifacts
 

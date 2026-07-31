@@ -173,6 +173,7 @@ fn task_allocation(
         task_resources: String::new(),
         network: String::new(),
         task_connect: String::new(),
+        ..Default::default()
     }
 }
 

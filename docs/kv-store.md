@@ -220,9 +220,27 @@ require an unsupported capability are rejected with an explicit error
 | Kind        | env injection | file injection |
 |-------------|---------------|----------------|
 | `exec`      | yes           | yes            |
-| `container` | yes           | no             |
+| `container` | yes           | yes — `path` must resolve under `/legion/task` |
 | `noop`      | no            | no             |
 | plugins     | per `supports_kv_env_injection` / `supports_kv_file_injection` |
+
+**Container file paths.** A container task sees the allocation's task
+directory bind-mounted at `/legion/task` and nothing else of the host, so a
+rendered file's `path` must resolve under it (relative paths resolve against
+it). An out-of-range path is rejected at submit:
+
+```jsonnet
+kvInjections: { files: [
+  { path: 'config/app.toml', file: { template: 'tenant={{ kv "tenant/id" }}\n' } },
+  //  -> readable inside the container at /legion/task/config/app.toml
+] },
+```
+
+Because the *directory* is mounted rather than individual files, a re-render
+(an atomic rewrite-and-rename on the host) is visible to the running container
+without a restart — which is what makes `onChange` policies other than
+`restart` meaningful for container tasks. See
+[docs/task-runtime-container.md](task-runtime-container.md).
 
 ### Env precedence
 

@@ -4,9 +4,12 @@ use crate::structs::{
     substitute_artifact_tokens, Allocation, AllocationHealth, StopCause, TaskAllocation,
     TaskConfig, TaskOnUnhealthyConfig, VolumeMount, VolumeReport, WorkerArtifactFetchConfigFull,
 };
-use crate::task_plugins::{StopContext, TaskInstance, TaskPluginRegistry};
+use crate::task_plugins::{
+    ResourceAssignment, ResourceEnforcement, StopContext, TaskInstance, TaskPluginRegistry,
+};
 use crate::worker::log_sink::{default_sinks, LogResource, LogSink};
 use crate::worker::logs::{read_allocation_logs, CapturedStream};
+use crate::worker::resources::NodeResourceGovernor;
 use crate::worker::state::{pid_is_running, PersistedAllocation, WorkerStateStore};
 use crate::worker::task_health::{spawn_health_monitor, HealthMonitorHandle};
 use crate::worker::volumes::{volume_env, WorkerVolumeManager};
@@ -48,16 +51,30 @@ pub struct TaskExit {
     pub task_name: String,
     pub exit_code: Option<i32>,
     pub signal: Option<i32>,
+    /// The declared memory limit, in bytes, when the kernel OOM-killed
+    /// something in this task's cgroup before it exited.
+    ///
+    /// Read from `memory.events` at exit for governed allocations, because
+    /// exit code 137 on its own sends the job author hunting through dmesg —
+    /// this is what lets [`Self::describe`] name the limit that fired.
+    pub oom_killed_at_bytes: Option<u64>,
 }
 
 impl TaskExit {
     /// Human-readable rendering used in health status, failure reasons, and
     /// the terminal report.
     pub fn describe(&self) -> String {
-        match (self.exit_code, self.signal) {
+        let status = match (self.exit_code, self.signal) {
             (Some(code), _) => format!("exited with status {code}"),
             (None, Some(signal)) => format!("killed by signal {signal}"),
             (None, None) => "process is gone (exit status unknown)".to_string(),
+        };
+        match self.oom_killed_at_bytes {
+            Some(bytes) => format!(
+                "{status}; task exceeded its {} MiB memory limit and was OOM-killed",
+                bytes / (1024 * 1024)
+            ),
+            None => status,
         }
     }
 }
@@ -184,6 +201,11 @@ pub struct WorkerTaskManager {
     /// Resolved mount lists per allocation, kept so a worker restart can
     /// re-mount exactly what the manager last dispatched.
     volume_specs: HashMap<i64, Vec<VolumeMount>>,
+    /// The node's CPU/memory accounting and cgroup hierarchy (see
+    /// `src/worker/resources.rs`). Disabled unless the worker was started
+    /// with `resourceEnforcement.enabled`, in which case it governs every
+    /// runtime that opted into the enforcement interface.
+    resources: NodeResourceGovernor,
 }
 
 impl Default for WorkerTaskManager {
@@ -239,6 +261,7 @@ impl WorkerTaskManager {
                 },
             )),
             volume_specs: HashMap::new(),
+            resources: NodeResourceGovernor::from_env(),
         }
     }
 
@@ -451,15 +474,42 @@ impl WorkerTaskManager {
         Ok(())
     }
 
-    /// Deliver a Unix signal (e.g. "SIGHUP") to the allocation's process —
-    /// the `changeMode: signal` pathway for refreshed identity tokens.
-    pub fn signal_allocation(&self, allocation_id: i64, signal: &str) -> R<()> {
-        let pid = self
-            .allocation_pid(allocation_id)
-            .context("Allocation has no tracked pid to signal")?;
-        send_signal(pid, signal)
+    /// Deliver a Unix signal (e.g. "SIGHUP") to the allocation — the
+    /// `changeMode: signal` pathway for refreshed identity tokens.
+    ///
+    /// Routed through the task runtime, not `kill(2)`: for an isolating
+    /// runtime the tracked pid is a supervisor, and only the plugin knows how
+    /// to reach the workload (see [`crate::task_plugins::TaskPlugin::signal`]).
+    /// The default trait impl is exactly the old behavior, so host-process
+    /// runtimes are unaffected.
+    pub fn signal_allocation(&mut self, allocation_id: i64, signal: &str) -> R<()> {
+        let allocation = self
+            .allocations
+            .get(&allocation_id)
+            .cloned()
+            .context("Allocation not found for signal")?;
+        let task = self
+            .task_configs
+            .get(&allocation_id)
+            .cloned()
+            .context("Task config missing for signal")?;
+        let plugin = self
+            .registry
+            .plugin(&task.runtime)
+            .with_context(|| format!("Task plugin {} not loaded for signal", task.runtime))?;
+        let instance = self
+            .instances
+            .get_mut(&allocation_id)
+            .context("Task instance missing for signal")?;
+        plugin
+            .signal(&allocation, &task, instance, signal)
             .with_context(|| format!("Failed to deliver {signal} to allocation {allocation_id}"))?;
-        info!(allocation_id, signal, pid, "Signaled allocation process");
+        info!(
+            allocation_id,
+            signal,
+            task_runtime = %task.runtime,
+            "Signaled allocation"
+        );
         Ok(())
     }
 
@@ -486,6 +536,9 @@ impl WorkerTaskManager {
             .keys()
             .copied()
             .filter(|allocation_id| !self.terminated.contains_key(allocation_id))
+            // An allocation we are deliberately draining is not a task that
+            // crashed: its exit must not feed the restart policy.
+            .filter(|allocation_id| !self.terminating.contains_key(allocation_id))
             .collect::<Vec<_>>();
 
         for allocation_id in candidates {
@@ -536,11 +589,24 @@ impl WorkerTaskManager {
             };
 
             if let Some((exit_code, signal)) = exit {
+                // Read the cgroup's OOM counter *before* teardown removes it.
+                // Best-effort and cheap: one small read, and only for
+                // governed allocations that carry a memory limit.
+                let oom_killed_at_bytes =
+                    instance
+                        .resource_assignment
+                        .as_ref()
+                        .and_then(|assignment| {
+                            let limit = assignment.memory_limit_bytes?;
+                            (crate::worker::resources::oom_kill_count(assignment) > 0)
+                                .then_some(limit)
+                        });
                 exits.push(TaskExit {
                     allocation_id,
                     task_name,
                     exit_code,
                     signal,
+                    oom_killed_at_bytes,
                 });
             }
         }
@@ -618,6 +684,7 @@ impl WorkerTaskManager {
                 task_name: String::new(),
                 exit_code: None,
                 signal: None,
+                oom_killed_at_bytes: None,
             },
         );
         self.set_allocation_health(allocation_id, true, message.clone());
@@ -646,6 +713,28 @@ impl WorkerTaskManager {
 
     fn alloc_dir(&self, allocation_id: i64) -> PathBuf {
         self.alloc_root.join(allocation_id.to_string())
+    }
+
+    /// Where an allocation's declared file destinations land on the host,
+    /// for a runtime that mounts its task directory somewhere else.
+    ///
+    /// `Some((in_task_root, host_task_dir))` for such a runtime (the
+    /// `container` runtime's `/legion/task`), `None` for one whose filesystem
+    /// *is* the host's (`exec`), where a declared absolute path is already
+    /// the real path. Used by identity delivery, which writes token files
+    /// before the task starts and must put them where the workload will
+    /// actually look.
+    pub fn file_delivery_base(
+        &mut self,
+        allocation_id: i64,
+        task_name: &str,
+        runtime: &str,
+    ) -> Option<(&'static str, PathBuf)> {
+        if self.registry.load_plugin(runtime, false).is_err() {
+            return None;
+        }
+        let root = self.registry.plugin(runtime)?.file_delivery_root()?;
+        Some((root, self.alloc_dir(allocation_id).join(task_name)))
     }
 
     fn cleanup_alloc_dir(&self, allocation_id: i64) {
@@ -718,6 +807,11 @@ impl WorkerTaskManager {
             }
         }
         self.volumes.unmount_for_allocation(allocation_id);
+        let assignment = self
+            .instances
+            .get(&allocation_id)
+            .and_then(|instance| instance.resource_assignment.clone());
+        self.resources.release(allocation_id, assignment.as_ref());
         self.volume_specs.remove(&allocation_id);
         self.instances.remove(&allocation_id);
         self.allocations.remove(&allocation_id);
@@ -725,6 +819,7 @@ impl WorkerTaskManager {
         self.allocation_health.remove(&allocation_id);
         self.self_fence_windows.remove(&allocation_id);
         self.terminated.remove(&allocation_id);
+        self.terminating.remove(&allocation_id);
         self.restart_history.remove(&allocation_id);
         // A task that failed on its own was never stopped by the platform,
         // so any pending notice for it describes a stop that will not happen.
@@ -942,8 +1037,9 @@ impl WorkerTaskManager {
         let (Some(allocation), Some(task), Some(mut instance)) = (allocation, task, instance)
         else {
             // Nothing was ever started for this id; there is no process to
-            // wait on, so complete the teardown now.
-            self.finish_teardown(allocation_id, remove_dirs);
+            // wait on, so complete the teardown now. No assignment to release
+            // — `release` still clears any reservation booked against the id.
+            self.finish_teardown(allocation_id, remove_dirs, None);
             return Ok(());
         };
 
@@ -1069,11 +1165,17 @@ impl WorkerTaskManager {
                 );
             }
         }
-        self.finish_teardown(allocation_id, remove_dirs);
+        let assignment = instance.resource_assignment.clone();
+        self.finish_teardown(allocation_id, remove_dirs, assignment.as_ref());
     }
 
     /// The last teardown step, shared by the immediate and the reaped paths.
-    fn finish_teardown(&mut self, allocation_id: i64, remove_dirs: bool) {
+    fn finish_teardown(
+        &mut self,
+        allocation_id: i64,
+        remove_dirs: bool,
+        assignment: Option<&ResourceAssignment>,
+    ) {
         // Release storage after the process is gone, never before: unmounting
         // under a live task is how you corrupt a database. Grace is exactly
         // what decoupled "stop returned" from "process is gone", so this must
@@ -1081,6 +1183,13 @@ impl WorkerTaskManager {
         // the data survives an unmount by contract, and a stuck driver must
         // not block teardown.
         self.volumes.unmount_for_allocation(allocation_id);
+
+        // Return this allocation's reserved cores to the share slice and drop
+        // its cgroup — for exactly the same reason, and so strictly behind
+        // the reap too: a cgroup still holding a live process will not be
+        // removed, and cores handed back early could be reserved by an
+        // incoming task while the outgoing one is still on them.
+        self.resources.release(allocation_id, assignment);
 
         self.preemptors.remove(&allocation_id);
         if remove_dirs {
@@ -1267,6 +1376,24 @@ impl WorkerTaskManager {
         // reschedules and the operator sees the driver's error.
         self.mount_allocation_volumes(allocation)?;
 
+        // Resource placement next, and before `prepare()`: a task must never
+        // observe its CPU/memory limits arriving after it started. Runtimes
+        // that did not opt in get `None` and are untouched.
+        let enforcement = self
+            .registry
+            .plugin(&task.runtime)
+            .map(|plugin| plugin.resource_enforcement())
+            .unwrap_or(ResourceEnforcement::Unsupported);
+        let assignment = self
+            .resources
+            .assign(allocation.id, task, enforcement)
+            .with_context(|| {
+                format!(
+                    "failed to place task {} within this node's resource limits",
+                    task.name
+                )
+            })?;
+
         let plugin = self
             .registry
             .plugin(&task.runtime)
@@ -1277,6 +1404,7 @@ impl WorkerTaskManager {
             .get_mut(&allocation.id)
             .context("Task instance missing")?;
         instance.log_dir = Some(log_dir);
+        instance.resource_assignment = assignment;
 
         let staged = instance.staged_artifacts.clone();
         for artifact in &staged {
@@ -1339,15 +1467,17 @@ impl WorkerTaskManager {
         self.volume_specs
             .insert(alloc.id, parse_volume_mounts(allocation)?);
         // A re-dispatch of an id we already run is an in-place update (for
-        // example a config change reusing the allocation): stop the old
-        // process but keep the task directory — when the artifact list is
-        // unchanged, staging reuses the already-fetched content via the
-        // staging manifest instead of refetching.
+        // example a config change reusing the allocation). The previous
+        // instance is normally gone already: `reconcile_allocations` holds a
+        // re-dispatch back while anything is still terminating. Reaching here
+        // with the id present means that did not happen, so tear it down now
+        // rather than launching over a live process. `remove_dirs: false`
+        // keeps the staged artifacts for the relaunch.
         if self.instances.contains_key(&alloc.id) {
-            info!(
+            warn!(
                 allocation_id = alloc.id,
                 task_name = %task.name,
-                "Re-dispatched allocation; stopping previous instance before relaunch"
+                "Re-dispatched allocation was still present; forcing teardown"
             );
             if let Err(err) = self.stop_allocation_inner(alloc.id, false) {
                 warn!(
@@ -1438,17 +1568,41 @@ impl WorkerTaskManager {
         task: &TaskConfig,
         staged: Vec<StagedArtifact>,
     ) -> R<()> {
+        // A runtime that mounts the task dir sees staged artifacts at the
+        // in-task path, not the host one — the same rule volume env already
+        // follows. `${artifact.<name>}` interpolation must agree with
+        // `LEGION_ARTIFACT_<NAME>`, so both are translated from one place.
+        let in_task_root = self
+            .registry
+            .plugin(&task.runtime)
+            .and_then(|plugin| plugin.file_delivery_root());
         let mut artifact_paths: HashMap<String, String> = HashMap::new();
         let instance = self
             .instances
             .get_mut(&allocation.id)
             .context("Task instance missing for staged allocation")?;
+        let task_dir = instance.task_dir.clone();
         for artifact in &staged {
             if let Some(name) = artifact.name.as_deref() {
-                let path = artifact.reference_path().display().to_string();
+                let host_path = artifact.reference_path();
                 let env_name = format!("LEGION_ARTIFACT_{}", name.to_uppercase().replace('-', "_"));
-                instance.extra_env.insert(env_name, path.clone());
-                artifact_paths.insert(name.to_string(), path);
+                // The env var keeps the host path here; the runtime plugin
+                // translates it at start (it is the one that knows its own
+                // mount). Interpolation cannot be deferred that way — the
+                // rendered config is what the plugin parses — so it is
+                // translated now.
+                instance
+                    .extra_env
+                    .insert(env_name, host_path.display().to_string());
+                let in_task_path = match (in_task_root, task_dir.as_ref()) {
+                    (Some(root), Some(task_dir)) => host_path
+                        .strip_prefix(task_dir)
+                        .ok()
+                        .map(|relative| PathBuf::from(root).join(relative).display().to_string())
+                        .unwrap_or_else(|| host_path.display().to_string()),
+                    _ => host_path.display().to_string(),
+                };
+                artifact_paths.insert(name.to_string(), in_task_path);
             }
         }
         instance.staged_artifacts = staged;
@@ -1607,6 +1761,13 @@ impl WorkerTaskManager {
                 .insert("LEGION_TASK_DIR".into(), task_dir.display().to_string());
             instance.alloc_dir = Some(alloc_dir);
             instance.task_dir = Some(task_dir);
+            // Re-adopt the CPU/memory assignment this worker handed out
+            // before it restarted, so the allocator does not hand a running
+            // task's exclusive cores to somebody else.
+            if let Some(assignment) = record.resource_assignment.as_ref() {
+                self.resources.restore(record.allocation.id, assignment);
+                instance.resource_assignment = Some(assignment.clone());
+            }
             self.instances.insert(record.allocation.id, instance);
             self.allocations
                 .insert(record.allocation.id, record.allocation.clone());
@@ -1637,6 +1798,9 @@ impl WorkerTaskManager {
             restored.push((record.allocation, record.task));
         }
 
+        // One mask write for the whole restored set, after every
+        // reservation is back in the allocator's view.
+        self.resources.resync_masks();
         self.persist_state_with(&active);
 
         Ok(restored)
@@ -1668,6 +1832,10 @@ impl WorkerTaskManager {
                 allocation: allocation.clone(),
                 task: task.clone(),
                 pid,
+                resource_assignment: self
+                    .instances
+                    .get(allocation_id)
+                    .and_then(|instance| instance.resource_assignment.clone()),
                 self_terminate_after_secs: self
                     .self_fence_windows
                     .get(allocation_id)
@@ -1690,8 +1858,6 @@ impl WorkerTaskManager {
     }
 }
 
-/// Resolve a signal name like "SIGHUP"/"HUP" and deliver it to `pid`.
-#[cfg(unix)]
 /// Split a finished child's status into `(exit_code, signal)`. Unix reports a
 /// signal death as `code: None`, which is exactly the distinction the restart
 /// policy and the operator both want to see.
@@ -1705,41 +1871,6 @@ fn exit_from_status(status: &std::process::ExitStatus) -> (Option<i32>, Option<i
     {
         (status.code(), None)
     }
-}
-
-fn send_signal(pid: u32, signal: &str) -> R<()> {
-    let signum = parse_signal(signal)?;
-    // SAFETY: plain kill(2) with a validated signal number.
-    let rc = unsafe { libc::kill(pid as libc::pid_t, signum) };
-    if rc != 0 {
-        bail!(
-            "kill({pid}, {signal}) failed: {}",
-            std::io::Error::last_os_error()
-        );
-    }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn send_signal(_pid: u32, signal: &str) -> R<()> {
-    bail!("signal delivery ({signal}) is not supported on this platform");
-}
-
-#[cfg(unix)]
-fn parse_signal(name: &str) -> R<libc::c_int> {
-    let normalized = name.trim().to_ascii_uppercase();
-    let stripped = normalized.strip_prefix("SIG").unwrap_or(&normalized);
-    Ok(match stripped {
-        "HUP" => libc::SIGHUP,
-        "INT" => libc::SIGINT,
-        "QUIT" => libc::SIGQUIT,
-        "TERM" => libc::SIGTERM,
-        "USR1" => libc::SIGUSR1,
-        "USR2" => libc::SIGUSR2,
-        "CONT" => libc::SIGCONT,
-        "WINCH" => libc::SIGWINCH,
-        other => bail!("unsupported signal {other:?}"),
-    })
 }
 
 /// Launches one allocation end to end: synchronous start for artifact-less
@@ -1886,6 +2017,15 @@ fn task_from_allocation(allocation: &TaskAllocation) -> R<(Allocation, TaskConfi
         serde_json::from_str(&allocation.task_resources).context("Invalid task resources JSON")?
     };
 
+    // The declared stop ladder. Empty means the task declared none, which is
+    // not the same as declaring the default: the container runtime consults
+    // the image's own `STOPSIGNAL` only when the jobspec was silent.
+    let stop = if allocation.task_stop.trim().is_empty() {
+        None
+    } else {
+        Some(serde_json::from_str(&allocation.task_stop).context("Invalid task stop JSON")?)
+    };
+
     let task = TaskConfig {
         config: task_config,
         checks,
@@ -1894,6 +2034,7 @@ fn task_from_allocation(allocation: &TaskAllocation) -> R<(Allocation, TaskConfi
         artifacts,
         connect,
         resources,
+        stop,
         ..TaskConfig::new(&allocation.task_name, &allocation.task_runtime)
     };
     let alloc = Allocation {
@@ -2410,6 +2551,125 @@ mod tests {
         Ok(())
     }
 
+    /// The regression guard for the heartbeat stall: reconcile must return
+    /// immediately even when the grace window is long. Every other stop test
+    /// uses a zero window, so none of them would catch a blocking wait
+    /// creeping back into `stop_with` — this one uses five minutes.
+    #[test]
+    fn reconcile_never_waits_out_a_grace_period() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let mut manager = manager_in(&temp_dir);
+        let task = TaskConfig {
+            // Ignores SIGTERM, so only the deadline could ever end it.
+            config: json!({
+                "command": ["/bin/sh", "-c", "trap '' TERM; while :; do sleep 0.1; done"],
+            }),
+            stop: Some(crate::structs::StopConfig {
+                signal: "SIGTERM".into(),
+                kill_after: Duration::from_secs(300),
+            }),
+            ..TaskConfig::new("stubborn", "exec")
+        };
+        manager.run_allocation(&alloc(), &task)?;
+        thread::sleep(Duration::from_millis(300));
+
+        let started = std::time::Instant::now();
+        let _ = manager.reconcile_allocations(&[]);
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "reconcile must return immediately, took {elapsed:?}"
+        );
+        assert_eq!(
+            manager.terminating_ids(),
+            vec![alloc().id],
+            "the allocation is draining, not gone"
+        );
+
+        // Not reapable yet either: the deadline is five minutes out and the
+        // process is ignoring the signal.
+        assert!(manager.reap_terminating().is_empty());
+        assert_eq!(manager.terminating_ids(), vec![alloc().id]);
+        Ok(())
+    }
+
+    /// The other half: a task that exits on its signal is reaped by the very
+    /// next supervisor tick rather than waiting out its window.
+    #[test]
+    fn a_drained_task_is_reaped_as_soon_as_it_exits() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let mut manager = manager_in(&temp_dir);
+        let task = TaskConfig {
+            config: json!({
+                "command": ["/bin/sh", "-c", "trap 'exit 0' TERM; while :; do sleep 0.1; done"],
+            }),
+            stop: Some(crate::structs::StopConfig {
+                signal: "SIGTERM".into(),
+                kill_after: Duration::from_secs(300),
+            }),
+            ..TaskConfig::new("drain", "exec")
+        };
+        manager.run_allocation(&alloc(), &task)?;
+        thread::sleep(Duration::from_millis(300));
+
+        let _ = manager.reconcile_allocations(&[]);
+        // The window is five minutes, so anything reaped here was reaped for
+        // exiting, not for timing out.
+        let mut outcome = None;
+        for _ in 0..100 {
+            if let Some(reaped) = manager.reap_terminating().first().copied() {
+                outcome = Some(reaped);
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            outcome,
+            Some((alloc().id, ReapOutcome::Exited)),
+            "a task that honored its stop signal must be reaped on exit, not at the deadline"
+        );
+        Ok(())
+    }
+
+    /// A runtime that cannot deliver a stop notice declines it, and the
+    /// worker tears the allocation down immediately rather than holding it
+    /// for a window nothing can use.
+    #[test]
+    fn a_runtime_that_cannot_signal_is_torn_down_without_a_drain() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let mut manager = manager_in(&temp_dir);
+
+        let allocation = alloc();
+        manager
+            .instances
+            .insert(allocation.id, TaskInstance::default());
+        manager
+            .allocations
+            .insert(allocation.id, allocation.clone());
+        manager.task_configs.insert(
+            allocation.id,
+            TaskConfig {
+                // `sandbox` declines the notice: reaching inside a guest
+                // needs an in-VM agent it does not have.
+                stop: Some(crate::structs::StopConfig {
+                    signal: "SIGTERM".into(),
+                    kill_after: Duration::from_secs(300),
+                }),
+                config: json!({"image": "alpine", "command": ["/bin/sh", "-c", "sleep 1"]}),
+                ..TaskConfig::new("box", "sandbox")
+            },
+        );
+        manager.registry.load_plugin("sandbox", false)?;
+
+        let _ = manager.reconcile_allocations(&[]);
+        assert!(
+            manager.terminating_ids().is_empty(),
+            "a declined notice means no drain window to wait out"
+        );
+        assert!(!manager.instances.contains_key(&allocation.id));
+        Ok(())
+    }
+
     #[test]
     fn stop_causes_are_replaced_wholesale_not_merged() -> R<()> {
         let temp_dir = TempDir::new()?;
@@ -2451,6 +2711,7 @@ mod tests {
 
             network: String::new(),
             task_connect: String::new(),
+            ..Default::default()
         };
         let new = manager.reconcile_allocations(std::slice::from_ref(&ta));
         assert_eq!(new.len(), 1);
@@ -2568,6 +2829,7 @@ mod tests {
             task_resources: String::new(),
             network: String::new(),
             task_connect: String::new(),
+            ..Default::default()
         };
         let outcome = manager.begin_task_allocation(&ta)?;
         let job = match outcome {
@@ -2613,6 +2875,7 @@ mod tests {
 
             network: String::new(),
             task_connect: String::new(),
+            ..Default::default()
         };
 
         let outcome = manager.begin_task_allocation(&ta)?;

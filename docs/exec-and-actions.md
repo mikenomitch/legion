@@ -131,7 +131,7 @@ error against a runtime that does not support it.
 | --- | --- | --- | --- |
 | `exec` | ✅ | ✅ | Runs a sibling host process with the task's env/cwd. **Host-level** — requires the `host` ACL grant. |
 | `container` (Apple `container`) | ✅ | ✅ | `container exec` inside the container's namespaces (sandboxed). |
-| `container` (youki) | ❌ | ❌ | Deferred; reports unsupported. |
+| `container` (youki / runc / crun) | ✅ | ✅ | `<runtime> exec` inside the container's namespaces (sandboxed). The process spec comes from the bundle Legion generated, so env, cwd, and user match the task exactly; argv is replaced and the exit status is the process's own. |
 | `sandbox` (microVM) | ❌ | ❌ | Deferred; exec into a guest needs a vsock agent. Reports unsupported rather than failing at session open. |
 | `sandbox` (macOS dev mode) | ✅ | ✅ | `container exec` into the sandbox's VM-backed container. |
 | `noop` / custom plugins | ❌ | ❌ | Opt in by implementing `exec_support()` + `exec()`. |

@@ -4589,6 +4589,21 @@ message TaskAllocation {
   //
   // Empty string when the task declares no resources.
   string task_resources = 16;
+
+  // The task's declared stop ladder (`stop { signal, killAfter }`) as JSON,
+  // e.g. `{"signal":"SIGINT","killAfter":"90s"}`.
+  //
+  // Carried on the allocation because the worker never sees a jobspec: it
+  // rebuilds a TaskConfig from these scalar fields, so a task-level block not
+  // on this message does not exist on the worker and every stop would silently
+  // use the default ladder.
+  //
+  // Empty string when the task declared none, which is NOT the same as
+  // declaring the default: the `container` runtime on Linux consults the
+  // image's own `STOPSIGNAL` before falling back to `SIGTERM`, and can only do
+  // that when it knows the jobspec was silent. Runtimes with nothing to signal
+  // (`noop`) ignore the field entirely.
+  string task_stop = 18;
 }
 
 // Request payload for PostWork.
