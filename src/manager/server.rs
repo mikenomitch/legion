@@ -65,11 +65,11 @@ use crate::structs::{
     RunJobRequest, RunJobTemplateReply, RunJobTemplateRequest, SavedStateQuery, SchedulerEvent,
     ServiceEndpoint, ServiceSummary, SetNodeAvailabilityReply, SetNodeAvailabilityRequest,
     StartInstanceReply, StartInstanceRequest, StopInstanceReply, StopInstanceRequest, StopJobReply,
-    StopJobRequest, StopRolloutReply, StopRolloutRequest, StreamEventsRequest, Submission,
-    TaskConfig, TaskOnUnhealthyConfig, UpdateNodeDynamicReply, UpdateNodeDynamicRequest,
-    UpsertJobTemplateReply, UpsertJobTemplateRequest, UpsertSavedStateQueryReply,
-    UpsertSavedStateQueryRequest, WorkerConfig, WorkerPreRegisterReply, WorkerPreRegisterRequest,
-    WorkerRegisterReply, WorkerRegisterRequest,
+    StopJobRequest, StopNotice, StopRolloutReply, StopRolloutRequest, StreamEventsRequest,
+    Submission, TaskConfig, TaskOnUnhealthyConfig, UpdateNodeDynamicReply,
+    UpdateNodeDynamicRequest, UpsertJobTemplateReply, UpsertJobTemplateRequest,
+    UpsertSavedStateQueryReply, UpsertSavedStateQueryRequest, WorkerConfig, WorkerPreRegisterReply,
+    WorkerPreRegisterRequest, WorkerRegisterReply, WorkerRegisterRequest,
 };
 use crate::structs::{
     AuthMethodInfo, BootstrapAclReply, BootstrapAclRequest, CreateAclTokenReply,
@@ -79,8 +79,8 @@ use crate::structs::{
     GetAclPolicyRequest, GetAuthMethodsReply, GetAuthMethodsRequest, ListAclPoliciesReply,
     ListAclPoliciesRequest, ListAclTokensReply, ListAclTokensRequest, ListAclUsersReply,
     ListAclUsersRequest, ListJoinTokensReply, ListJoinTokensRequest, LoginReply, LoginRequest,
-    UpsertAclPolicyReply, UpsertAclPolicyRequest, UpsertAclUserReply, UpsertAclUserRequest,
-    WhoAmIReply, WhoAmIRequest,
+    StopCause, UpsertAclPolicyReply, UpsertAclPolicyRequest, UpsertAclUserReply,
+    UpsertAclUserRequest, WhoAmIReply, WhoAmIRequest,
 };
 use crate::task_plugins::validate_job_config;
 use crate::tracing_util::{o11y_enabled, read_recent_observability};
@@ -1829,7 +1829,7 @@ fn remove_stale_allocations_for_new_rollout(
             continue;
         }
         store
-            .remove_allocation_by_id(allocation.id)
+            .remove_allocation_by_id_because(allocation.id, StopCause::Update)
             .map_err(|e| map_store_error("Error removing stale allocation", e))?;
     }
 
@@ -4059,7 +4059,7 @@ impl Manager for ManagerDaemonService {
         // Free the gated allocation (instance -> rescheduling, id and
         // storage handle retained) and re-place excluding the lost node.
         self.store
-            .remove_allocation_by_id(allocation.id)
+            .remove_allocation_by_id_because(allocation.id, StopCause::Reschedule)
             .map_err(|e| map_store_error("Error removing gated allocation", e))?;
         let config = self
             .store
@@ -4600,12 +4600,29 @@ impl Manager for ManagerDaemonService {
         // Reclaim work for this node. Re-sent every heartbeat until the worker
         // confirms, so a worker that dies mid-destroy simply retries.
         let volume_destroy = build_volume_destroy_requests(&self.store, &id);
+        // Why this node's recently-removed allocations went away. Advisory:
+        // a lookup failure costs the worker a cause, never a reconcile, so
+        // it is logged and dropped rather than failing the heartbeat.
+        let stop_notices = match self.store.stop_notices_for_node(&id) {
+            Ok(notices) => notices
+                .into_iter()
+                .map(|(allocation_id, cause)| StopNotice {
+                    allocation_id,
+                    cause: cause.as_str().to_string(),
+                })
+                .collect(),
+            Err(err) => {
+                debug!(node_id = %id, error = ?err, "Error loading stop notices");
+                Vec::new()
+            }
+        };
 
         let reply = HeartbeatReply {
             message: "ack".into(),
             desired_allocations,
             upstream_endpoints,
             volume_destroy,
+            stop_notices,
         };
 
         Ok(Response::new(reply))

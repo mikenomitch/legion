@@ -966,6 +966,39 @@ pub fn get_migrations() -> Migrations<'static> {
              WHERE updated_at IS NULL AND typeof(created_at) = 'integer';",
         )
         .down(""),
+        // Stop causes (preemption-and-eviction plan § Phase 1a). Written in
+        // the same transaction that removes an allocation, so a notice can
+        // never claim a stop that did not happen, and read by the heartbeat
+        // that tells the owning node its allocation is gone.
+        //
+        // Ordered after the job-mtime pair above deliberately: those shipped
+        // to `main` first, so any store that has run that code already counts
+        // them as applied. `rusqlite_migration` tracks the applied *count*,
+        // so inserting these ahead of them would make such a store skip these
+        // two and re-run the job-mtime pair.
+        //
+        // No foreign key to `allocation`: the row this describes is deleted
+        // by the very transaction that inserts the notice. Rows are pruned by
+        // age (`STOP_NOTICE_RETENTION_SECS`) rather than by acknowledgement —
+        // the data is advisory, so bounded staleness beats a delivery
+        // protocol.
+        M::up(
+            "CREATE TABLE IF NOT EXISTS allocation_stop_notice (
+            allocation_id INTEGER PRIMARY KEY,
+            node_id STRING NOT NULL,
+            cause STRING NOT NULL,
+            created_at TIMESTAMP NOT NULL,
+            created_at_unix INTEGER NOT NULL
+        )",
+        )
+        .down("DROP TABLE IF EXISTS allocation_stop_notice;"),
+        // The per-heartbeat notice feed selects by node; without this every
+        // heartbeat scans the table.
+        M::up(
+            "CREATE INDEX IF NOT EXISTS idx_allocation_stop_notice_node
+             ON allocation_stop_notice(node_id);",
+        )
+        .down("DROP INDEX IF EXISTS idx_allocation_stop_notice_node;"),
     ])
 }
 

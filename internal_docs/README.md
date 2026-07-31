@@ -63,7 +63,7 @@ When one is required and what goes in it:
 | [kv-reactive-task-updates-plan.md](plans/kv-reactive-task-updates-plan.md) | shipped |
 | [late-binding-plan-apply-plan.md](plans/late-binding-plan-apply-plan.md) | planned |
 | [persistence-plan.md](plans/persistence-plan.md) | phases 0–1, 3 done |
-| [preemption-and-eviction-plan.md](plans/preemption-and-eviction-plan.md) | planned |
+| [preemption-and-eviction-plan.md](plans/preemption-and-eviction-plan.md) | in execution (phase 1a shipped: stop causes) |
 | [multi-cluster-federation-plan.md](plans/multi-cluster-federation-plan.md) | planned |
 | [multi-raft-persistence-plan.md](plans/multi-raft-persistence-plan.md) | planned |
 | [scheduler-performance-plan.md](plans/scheduler-performance-plan.md) | in execution |

@@ -45,6 +45,13 @@ pub const DEF_WORKER_SERVER_PORT: u64 = 4848;
 pub const DEF_WORKER_STATE_DIR: &str = ".legion/workers";
 pub const DEF_WORKER_STATE_PATH: &str = ".legion/workers/default/worker_state.json";
 
+// How long the manager keeps a stop notice (why an allocation was removed)
+// before pruning it. Notices are advisory metadata delivered on the next
+// heartbeat — at a 2s cadence a worker sees one within one tick, so this is
+// slack for a partitioned or restarting worker, not a delivery window. See
+// `docs/graceful-stop.md`.
+pub const STOP_NOTICE_RETENTION_SECS: i64 = 600;
+
 // Default per-stream cap (bytes) when reading captured task logs and no explicit
 // limit is requested. 256 KiB keeps replies small enough for an agent context.
 pub const DEF_TASK_LOG_MAX_BYTES: i64 = 256 * 1024;

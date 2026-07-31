@@ -20,6 +20,7 @@ Full index: [docs/README.md](docs/README.md).
 - [Artifacts (images, files, git, S3, OCI/ORAS)](docs/artifacts.md)
 - [Stateful Workloads & Instance Identity](docs/stateful-workloads.md)
 - [Rollouts](docs/rollouts.md) and [Rollout Strategy Plugins](docs/rollout-strategy-plugins.md)
+- [Stop Causes](docs/graceful-stop.md)
 - [Service Discovery](docs/service-discovery.md)
 - [State Store](docs/state-store.md)
 - [Streaming Persistence](docs/persistence-streaming.md) and [Running Raft](docs/raft-operations.md)
