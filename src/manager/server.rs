@@ -1659,6 +1659,26 @@ impl ManagerDaemonService {
         Some(payload)
     }
 
+    /// The live, unratified claim for an instance, and the node holding it.
+    ///
+    /// Reads the same in-memory per-node reports `legion node claims` serves,
+    /// so it inherits the same freshness contract: current within one
+    /// heartbeat, empty (never wrong) after a manager failover.
+    fn provisional_claim_for(
+        &self,
+        instance_id: &str,
+    ) -> (Option<crate::structs::ProvisionalClaimReport>, String) {
+        let Ok(guard) = self.provisional_claims.lock() else {
+            return (None, String::new());
+        };
+        for (node_id, claims) in guard.iter() {
+            if let Some(claim) = claims.iter().find(|claim| claim.instance_id == instance_id) {
+                return (Some(claim.clone()), node_id.clone());
+            }
+        }
+        (None, String::new())
+    }
+
     /// Verdicts for claims a node is still holding that this manager has
     /// already decided (`HeartbeatReply.claim_verdicts`).
     ///
@@ -4659,8 +4679,15 @@ impl Manager for ManagerDaemonService {
             &AclScope::job(&instance.job_id),
         )?;
 
+        // A live, unratified claim for this instance (docs/edge-boot.md). An
+        // instance with no allocation and a sandbox demonstrably running on a
+        // node is otherwise inexplicable; this is the state that explains it.
+        let (provisional, provisional_node_id) = self.provisional_claim_for(&inner.instance_id);
+
         Ok(Response::new(GetInstanceReply {
             instance: Some(map_instance_info(&self.store, instance)),
+            provisional,
+            provisional_node_id,
         }))
     }
 

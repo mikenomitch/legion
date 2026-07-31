@@ -190,7 +190,7 @@ fn tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "legion_instance_get",
-            description: "Inspect one stateful instance by id (state, slot, current allocation, storage handle).",
+            description: "Inspect one stateful instance by id (state, slot, current allocation, storage handle). Also reports a live PROVISIONAL claim when a node has started this instance but the placement is not durable yet (docs/edge-boot.md) — do not build on a provisional instance, it may still be killed.",
             input_schema: || json!({
                 "type": "object",
                 "properties": { "instance_id": { "type": "string", "description": "Instance id." } },

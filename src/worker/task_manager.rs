@@ -105,6 +105,16 @@ pub struct StagingJob {
     board: ArtifactStatusBoard,
 }
 
+/// The outcome of ratifying a claim.
+pub struct Ratified {
+    pub claim: ClaimRecord,
+    /// Set when this ratification *started* the workload (a `stage`-gated
+    /// claim), so the caller must spawn its health monitor. `None` for a claim
+    /// that was already running, and for a duplicate verdict — both already
+    /// have one, and a second would double-count restarts.
+    pub start_health_monitor: Option<(Allocation, TaskConfig)>,
+}
+
 /// What `begin_task_allocation` did with a new allocation.
 pub enum BeginOutcome {
     /// No artifacts: the task was prepared and started synchronously.
@@ -1553,11 +1563,7 @@ impl WorkerTaskManager {
     /// Opens the network for a claim held at gate `boot`, and starts a claim
     /// that was held at gate `stage` (which prepared everything and stopped
     /// short of `start`). Returns the claim as it now stands.
-    pub fn ratify_claim(
-        &mut self,
-        claim_id: &str,
-        final_payload: &TaskAllocation,
-    ) -> R<ClaimRecord> {
+    pub fn ratify_claim(&mut self, claim_id: &str, final_payload: &TaskAllocation) -> R<Ratified> {
         let claim = self
             .claims
             .get(claim_id)
@@ -1565,8 +1571,12 @@ impl WorkerTaskManager {
             .with_context(|| format!("no claim {claim_id} on this node"))?;
         if claim.is_ratified() {
             // A duplicate verdict (the reply and the heartbeat catch-up both
-            // landed) is a no-op, not an error.
-            return Ok(claim);
+            // landed) is a no-op, not an error — and must not start a second
+            // health monitor for work that already has one.
+            return Ok(Ratified {
+                claim,
+                start_health_monitor: None,
+            });
         }
         let allocation_id = final_payload.allocation_id;
 
@@ -1583,11 +1593,16 @@ impl WorkerTaskManager {
         self.allocations.insert(local_key, allocation.clone());
         self.task_configs.insert(local_key, task.clone());
 
+        // A `stage`-gated claim starts its workload here, so its health
+        // monitor starts here too — the launch path deliberately did not
+        // spawn one for work that was not running.
+        let mut start_health_monitor = None;
         match claim.gate {
             Gate::Stage => {
                 // Everything expensive already happened; this is the start
                 // the gate was holding back.
                 self.start_registered_allocation(&allocation, &task, Gate::Off)?;
+                start_health_monitor = Some((allocation.clone(), task.clone()));
             }
             Gate::Boot => {
                 let plugin = self
@@ -1619,7 +1634,10 @@ impl WorkerTaskManager {
             gate = %claim.gate,
             "Ratified provisional allocation"
         );
-        Ok(ratified)
+        Ok(Ratified {
+            claim: ratified,
+            start_health_monitor,
+        })
     }
 
     /// Kill a provisional allocation: refused, expired, or withdrawn.
@@ -2753,8 +2771,50 @@ mod tests {
         committed.allocation_id = 8123;
         manager.ratify_claim("clm_a", &committed)?;
         let again = manager.ratify_claim("clm_a", &committed)?;
-        assert_eq!(again.allocation_id, Some(8123));
+        assert_eq!(again.claim.allocation_id, Some(8123));
+        assert!(
+            again.start_health_monitor.is_none(),
+            "a duplicate verdict must not start a second health monitor"
+        );
         assert_eq!(manager.allocations_snapshot(), vec![8123]);
+        Ok(())
+    }
+
+    #[test]
+    fn ratifying_a_stage_gated_claim_starts_it_and_asks_for_a_health_monitor() -> R<()> {
+        // The `stage` gate is a pause between prepare and start, so this is
+        // the point at which the workload becomes real — and the point at
+        // which it needs supervising.
+        let temp_dir = TempDir::new()?;
+        let mut manager = manager_in(&temp_dir);
+        let admitted = manager.admit_claim(claim_record("clm_a", "user-42", Gate::Stage))?;
+        manager
+            .begin_task_allocation_gated(&provisional_payload(admitted.local_key), Gate::Stage)?;
+
+        let mut committed = provisional_payload(admitted.local_key);
+        committed.allocation_id = 8123;
+        let ratified = manager.ratify_claim("clm_a", &committed)?;
+        assert!(
+            ratified.start_health_monitor.is_some(),
+            "a stage-gated claim starts at ratification and must be monitored"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn ratifying_a_boot_gated_claim_does_not_restart_its_monitor() -> R<()> {
+        // A `boot`-gated claim was already running (and already monitored);
+        // ratification only opens its network.
+        let temp_dir = TempDir::new()?;
+        let mut manager = manager_in(&temp_dir);
+        let admitted = manager.admit_claim(claim_record("clm_a", "user-42", Gate::Boot))?;
+        manager
+            .begin_task_allocation_gated(&provisional_payload(admitted.local_key), Gate::Boot)?;
+
+        let mut committed = provisional_payload(admitted.local_key);
+        committed.allocation_id = 8123;
+        let ratified = manager.ratify_claim("clm_a", &committed)?;
+        assert!(ratified.start_health_monitor.is_none());
         Ok(())
     }
 

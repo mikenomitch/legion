@@ -2241,6 +2241,23 @@ message GetInstanceReply {
   // The requested instance. Manager returns NotFound instead of returning
   // this field unset.
   InstanceInfo instance = 1;
+
+  // A node has started this instance but the placement is not durable yet
+  // (docs/edge-boot.md). Set only while a claim is live and unratified; the
+  // moment it is confirmed the instance has an ordinary `current_alloc_id`
+  // and this goes away.
+  //
+  // This is what makes "started but not yet confirmed" a state an operator or
+  // an agent can see, rather than an instance that inexplicably has no
+  // allocation while a sandbox is demonstrably running on a node.
+  //
+  // Derived from the reporting node's last heartbeat and held in manager
+  // memory, so after a manager failover it is unset until that node's next
+  // heartbeat — briefly incomplete, never wrong.
+  ProvisionalClaimReport provisional = 2;
+
+  // Node holding that claim. Empty when `provisional` is unset.
+  string provisional_node_id = 3;
 }
 
 // === VOLUME MESSAGES (see docs/volumes.md) ===
