@@ -1872,6 +1872,27 @@ async fn load_initial_data(store: &Store, config: &ManagerConfig) -> R<()> {
             }
         };
 
+        // Enforcement settings ride as JSON, like artifacts and host volumes.
+        let resource_enforcement = match wcp.resource_enforcement.as_ref() {
+            None => String::new(),
+            Some(enforcement) => {
+                if enforcement.cgroup_parent.trim().is_empty() {
+                    bail!(
+                        "worker config {path_str}: resourceEnforcement.cgroupParent must not be \
+                         empty"
+                    );
+                }
+                if enforcement.cgroup_parent.starts_with('/') {
+                    bail!(
+                        "worker config {path_str}: resourceEnforcement.cgroupParent is relative \
+                         to /sys/fs/cgroup, got {:?}",
+                        enforcement.cgroup_parent
+                    );
+                }
+                serde_json::to_string(enforcement)?
+            }
+        };
+
         if let Some(seconds) = wcp.heartbeat_seconds {
             if !(1..=30).contains(&seconds) {
                 bail!(
@@ -1888,6 +1909,7 @@ async fn load_initial_data(store: &Store, config: &ManagerConfig) -> R<()> {
                 );
             }
         }
+
         let wc = WorkerConfigMsg {
             name: wcp.worker_type.clone(),
             pool: wcp.pool.unwrap_or("default".into()),
@@ -1900,6 +1922,7 @@ async fn load_initial_data(store: &Store, config: &ManagerConfig) -> R<()> {
             artifacts,
             host_volumes,
             heartbeat_seconds: wcp.heartbeat_seconds,
+            resource_enforcement,
         };
 
         store.insert_worker_type(&wc)?;

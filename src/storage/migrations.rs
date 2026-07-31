@@ -553,6 +553,10 @@ pub fn get_migrations() -> Migrations<'static> {
         // from `stateful.storage` is NOT here — it lives in the stateful
         // column and materializes through the instance's storage handle.
         M::up("ALTER TABLE task_config ADD COLUMN volumes JSONB;").down(""),
+        // Exit-driven restart policy for a task (host process supervision
+        // plan). JSON-encoded TaskRestartConfig; NULL/absent == the lifecycle
+        // default (`always` for service/sidecar, `onFailure` for batch).
+        M::up("ALTER TABLE task_config ADD COLUMN restart JSONB;").down(""),
         // Volumes: the manager's record of storage a plugin has (or will)
         // materialize. See docs/volumes.md.
         //
@@ -597,6 +601,13 @@ pub fn get_migrations() -> Migrations<'static> {
         // (JSON map of name -> {path, readOnly, create}); empty == none.
         M::up("ALTER TABLE worker_type ADD COLUMN host_volumes TEXT NOT NULL DEFAULT '';")
             .down(""),
+        // Per-worker resource enforcement (host process supervision plan).
+        // JSON-encoded WorkerResourceEnforcementConfig; empty == off, which is
+        // what every existing worker type gets.
+        M::up(
+            "ALTER TABLE worker_type ADD COLUMN resource_enforcement TEXT NOT NULL DEFAULT '';",
+        )
+        .down(""),
         // How a volume is handed to its consumer: `filesystem` (a directory) or
         // `block` (a device/disk image). Recorded rather than re-derived so a
         // future restore/clone knows the shape without re-probing the plugin.
@@ -966,6 +977,39 @@ pub fn get_migrations() -> Migrations<'static> {
              WHERE updated_at IS NULL AND typeof(created_at) = 'integer';",
         )
         .down(""),
+        // Stop causes (preemption-and-eviction plan § Phase 1a). Written in
+        // the same transaction that removes an allocation, so a notice can
+        // never claim a stop that did not happen, and read by the heartbeat
+        // that tells the owning node its allocation is gone.
+        //
+        // Ordered after the job-mtime pair above deliberately: those shipped
+        // to `main` first, so any store that has run that code already counts
+        // them as applied. `rusqlite_migration` tracks the applied *count*,
+        // so inserting these ahead of them would make such a store skip these
+        // two and re-run the job-mtime pair.
+        //
+        // No foreign key to `allocation`: the row this describes is deleted
+        // by the very transaction that inserts the notice. Rows are pruned by
+        // age (`STOP_NOTICE_RETENTION_SECS`) rather than by acknowledgement —
+        // the data is advisory, so bounded staleness beats a delivery
+        // protocol.
+        M::up(
+            "CREATE TABLE IF NOT EXISTS allocation_stop_notice (
+            allocation_id INTEGER PRIMARY KEY,
+            node_id STRING NOT NULL,
+            cause STRING NOT NULL,
+            created_at TIMESTAMP NOT NULL,
+            created_at_unix INTEGER NOT NULL
+        )",
+        )
+        .down("DROP TABLE IF EXISTS allocation_stop_notice;"),
+        // The per-heartbeat notice feed selects by node; without this every
+        // heartbeat scans the table.
+        M::up(
+            "CREATE INDEX IF NOT EXISTS idx_allocation_stop_notice_node
+             ON allocation_stop_notice(node_id);",
+        )
+        .down("DROP INDEX IF EXISTS idx_allocation_stop_notice_node;"),
         // Count overrides (`legion job scale`, autoscaler plan §6.1): a
         // task's effective desired count, layered over the spec without a
         // new job config version. Keyed by the version-stable task tuple
@@ -977,10 +1021,10 @@ pub fn get_migrations() -> Migrations<'static> {
         // rollout, promoted to `count` when the rollout finishes; `count`
         // is NULL while only a pending scale-in exists.
         //
-        // Appended AFTER the job-mtime pair on purpose: migrations are
-        // versioned by position, and those two already shipped on main, so
-        // this branch's table takes the next index rather than renumbering
-        // schemas that are already applied in the wild.
+        // Kept LAST for the same reason the stop-notice pair above gives:
+        // `rusqlite_migration` tracks the applied count, so a migration that
+        // has already shipped to `main` must keep its position. Anything
+        // added on a branch goes after everything already on `main`.
         M::up(
             "CREATE TABLE IF NOT EXISTS task_scale (
             job_id STRING NOT NULL,

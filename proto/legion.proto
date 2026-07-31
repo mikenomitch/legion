@@ -869,6 +869,21 @@ message WorkerConfig {
   //
   // Default: unset (workers use the built-in 2s default).
   optional uint32 heartbeat_seconds = 11;
+
+  // JSON-encoded resource-enforcement settings for this worker (see
+  // docs/task-supervision.md). Shape:
+  // `{"enabled":true,"cgroupParent":"legion"}`.
+  //
+  // When enabled, a Linux worker puts each `exec` task in a cgroup v2 subtree
+  // it creates under `cgroupParent` and writes the task's `resources` there as
+  // real limits (`memory.max`, `cpu.max`), instead of treating them as
+  // scheduling arithmetic only. Off by default: turning declared resources
+  // into kernel limits can OOM-kill a workload whose declaration was only ever
+  // an estimate, so it is a deliberate per-worker choice.
+  //
+  // Default: empty string (enforcement off; `resources` stays advisory for
+  // `exec` tasks).
+  string resource_enforcement = 12;
 }
 
 // Reply payload for WorkerPreRegister.
@@ -2485,6 +2500,20 @@ message HeartbeatRequest {
   //
   // Default: empty list.
   repeated VolumeReport volume_reports = 5;
+
+  // Allocations whose task process reached a terminal state since the last
+  // heartbeat *without* failing — the task exited with a status its `restart`
+  // policy treats as done (see docs/task-supervision.md). Failures travel in
+  // `failed_allocations` instead, because the manager reschedules those.
+  //
+  // This is what makes a batch task's success real: the manager marks the
+  // allocation complete and the task successful only when a worker says the
+  // process exited successfully, instead of assuming it at placement.
+  //
+  // Sent only by workers at protocol version 2 and above.
+  //
+  // Default: empty list.
+  repeated TerminatedAllocation terminated_allocations = 6;
 }
 
 // Reply payload for Heartbeat.
@@ -2524,6 +2553,58 @@ message HeartbeatReply {
   // manager performs no catalog work at all in that case, so nodes running
   // only plain jobs pay nothing for this field.
   repeated UpstreamEndpoints upstream_endpoints = 4;
+
+  // Why the manager is stopping allocations on this node.
+  //
+  // Workers learn that an allocation should stop by noticing it is *absent*
+  // from `desired_allocations` — an absence carries no reason, so a drain, a
+  // rollout replacement, a `job stop` and a reschedule were historically
+  // indistinguishable to the worker and to anything reading its logs. This
+  // field supplies the missing reason, letting the worker hand a
+  // `StopCause` to the task runtime and log why each task went away.
+  //
+  // Delivery is **best effort and advisory**. The manager records a notice in
+  // the same transaction that removes the allocation, re-sends every live
+  // notice on each heartbeat, and prunes notices by age
+  // (`STOP_NOTICE_RETENTION_SECS`, 10 minutes). A worker that reconciles
+  // before the notice reaches it — or one talking to a manager older than
+  // this field — stops the allocation with cause `unknown` rather than
+  // waiting. A stop is never delayed or skipped for want of a notice.
+  //
+  // The list is a snapshot, not a delta: each heartbeat carries every notice
+  // the manager currently holds for this node, and the worker replaces its
+  // copy wholesale.
+  //
+  // Default: empty list when no allocation on this node was recently removed.
+  repeated StopNotice stop_notices = 5;
+}
+
+// Why one allocation is being stopped.
+//
+// Sent in `HeartbeatReply.stop_notices`. See that field for delivery
+// semantics and `docs/graceful-stop.md` for the full contract.
+message StopNotice {
+  // Allocation the manager removed. Matches an ID the worker previously
+  // received in `HeartbeatReply.desired_allocations`.
+  int64 allocation_id = 1;
+
+  // Why it was removed. One of:
+  //
+  // - `stop` — the job, or a keyed instance of it, was stopped by a user.
+  // - `update` — replaced by a newer job config (a rollout or in-place
+  //   update).
+  // - `drain` — the node is draining and its work is moving elsewhere.
+  // - `reschedule` — moved by the scheduler (failure recovery, `onLost`
+  //   handling, or a scheduler-driven move).
+  // - `destroy` — the job was destroyed outright.
+  // - `node_lost` — the node was removed or declared lost, clearing its
+  //   allocations.
+  // - `preempted` — displaced to make room for higher-priority work.
+  //   Reserved; nothing emits this until preemption ships.
+  //
+  // Workers treat an unrecognized value as `unknown` and stop the allocation
+  // anyway, so the manager may add causes without a coordinated upgrade.
+  string cause = 2;
 }
 
 // The endpoints one allocation may currently reach for one upstream service.
@@ -2641,6 +2722,33 @@ message FailedAllocation {
   //
   // Unset for non-artifact failures.
   optional string artifact_states = 3;
+}
+
+// A terminal, non-failure allocation outcome reported by a worker: the task's
+// process exited and the task's `restart` policy says that is the end of it
+// (see docs/task-supervision.md).
+message TerminatedAllocation {
+  // Allocation that reached the terminal state.
+  int64 allocation_id = 1;
+
+  // True when the exit status was one the task counts as success
+  // (`restart.successExitCodes`, default `[0]`). A task whose policy is
+  // `never` can also terminate unsuccessfully; the manager marks the
+  // allocation complete either way and records the status.
+  bool success = 2;
+
+  // Process exit code. Unset when the process was killed by a signal, or when
+  // the worker only re-adopted the pid after a restart and never had a handle
+  // to reap.
+  optional int32 exit_code = 3;
+
+  // Signal that killed the process, when it was killed by one (Unix only).
+  optional int32 signal = 4;
+
+  // Human-readable rendering of the same facts, e.g. `exited with status 0`
+  // or `killed by signal 9`. Carried so events and the UI do not have to
+  // re-derive wording from the numbers.
+  string message = 5;
 }
 
 // Allocation health snapshot item from worker to manager.

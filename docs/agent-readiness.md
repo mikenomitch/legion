@@ -140,6 +140,12 @@ legion job validate ./configs/jobs/demo.jsonnet --json
 The schema embeds the built-in task-runtime config schemas (`exec`, `container`, …)
 under `taskRuntimes`, derived from the typed Rust structs.
 
+Runtime configs are checked *typed*, not just against their JSON schema, so
+mistakes an agent could not otherwise see — an unknown capability name in
+`exec`'s `hardening` block, a non-octal `umask`, `oom_adj` and `oom_score_adj`
+both set — come back from `job validate` rather than from a task that fails to
+start on some node ten seconds later.
+
 ### Job templates: authoring by parameter instead of by spec
 
 When a cluster publishes [job templates](job-templates.md), an agent does not

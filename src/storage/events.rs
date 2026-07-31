@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use crate::artifacts::status::{ArtifactState, ArtifactStatus};
 use crate::storage::store::{JobSubmitOutcome, Store};
-use crate::structs::{Allocation, Eval, Node};
+use crate::structs::{Allocation, Eval, Node, StopCause};
 
 /// Severity levels used by scheduler events.
 pub const EVENT_LEVEL_INFO: &str = "info";
@@ -278,6 +278,7 @@ pub mod drafts {
     pub fn allocations_removed_from_node(
         node_id: &str,
         removed: &[Allocation],
+        cause: StopCause,
     ) -> Option<EventDraft> {
         if removed.is_empty() {
             return None;
@@ -287,6 +288,10 @@ pub mod drafts {
                 *jobs.entry(alloc.job_id.as_str()).or_default() += 1;
                 jobs
             });
+        let mut meta = json!({ "count": removed.len(), "jobs": affected_jobs });
+        if cause.is_known() {
+            meta["cause"] = json!(cause.as_str());
+        }
         Some(
             EventDraft::warn(
                 "allocation.removed",
@@ -296,15 +301,27 @@ pub mod drafts {
                 ),
             )
             .node(node_id)
-            .meta(json!({ "count": removed.len(), "jobs": affected_jobs })),
+            .meta(meta),
         )
     }
 
     /// `allocation.removed` (info) — a job's allocations were removed (stop
     /// or update path). `None` when nothing was removed.
-    pub fn allocations_removed_for_job(job_id: &str, removed_count: usize) -> Option<EventDraft> {
+    ///
+    /// `cause` names the reason so the journal distinguishes a `job stop`
+    /// from an update or a drain; it is omitted from the metadata when
+    /// unknown rather than recorded as the string `"unknown"`.
+    pub fn allocations_removed_for_job(
+        job_id: &str,
+        removed_count: usize,
+        cause: StopCause,
+    ) -> Option<EventDraft> {
         if removed_count == 0 {
             return None;
+        }
+        let mut meta = json!({ "count": removed_count });
+        if cause.is_known() {
+            meta["cause"] = json!(cause.as_str());
         }
         Some(
             EventDraft::info(
@@ -312,7 +329,7 @@ pub mod drafts {
                 format!("Removed {removed_count} allocation(s) for job {job_id}"),
             )
             .job(job_id)
-            .meta(json!({ "count": removed_count })),
+            .meta(meta),
         )
     }
 
@@ -335,6 +352,7 @@ pub mod drafts {
             .meta(json!({
                 "count": removed.len(),
                 "jobConfigId": job_config_id,
+                "cause": StopCause::Update.as_str(),
             })),
         )
     }
@@ -360,6 +378,37 @@ pub mod drafts {
             "taskConfigId": task_config_id,
             "jobConfigId": job_config_id,
         }))
+    }
+
+    /// `allocation.terminated` — a task process exited and the allocation
+    /// reached a terminal state without being rescheduled (see
+    /// docs/task-supervision.md). `success` distinguishes "the batch task
+    /// finished" from "it terminated without succeeding".
+    pub fn allocation_terminated(
+        allocation_id: i64,
+        node_id: &str,
+        job_id: &str,
+        job_config_id: &str,
+        task_config_id: i64,
+        success: bool,
+        message: &str,
+    ) -> EventDraft {
+        let text = format!("Allocation {allocation_id} terminated on node {node_id}: {message}");
+        let draft = if success {
+            EventDraft::info("allocation.terminated", text)
+        } else {
+            EventDraft::warn("allocation.terminated", text)
+        };
+        draft
+            .job(job_id)
+            .node(node_id)
+            .allocation(allocation_id)
+            .meta(json!({
+                "success": success,
+                "message": message,
+                "taskConfigId": task_config_id,
+                "jobConfigId": job_config_id,
+            }))
     }
 
     /// `node.registered` — a worker registered (or re-registered).
@@ -866,18 +915,52 @@ impl EventRecorder<'_> {
         self.emit(drafts::scheduler_recovered(requeued_evals));
     }
 
-    pub fn allocations_removed_from_node(self, node_id: &str, removed: &[Allocation]) {
-        self.emit_opt(drafts::allocations_removed_from_node(node_id, removed));
+    pub fn allocations_removed_from_node(
+        self,
+        node_id: &str,
+        removed: &[Allocation],
+        cause: StopCause,
+    ) {
+        self.emit_opt(drafts::allocations_removed_from_node(
+            node_id, removed, cause,
+        ));
     }
 
-    pub fn allocations_removed_for_job(self, job_id: &str, removed_count: usize) {
-        self.emit_opt(drafts::allocations_removed_for_job(job_id, removed_count));
+    pub fn allocations_removed_for_job(self, job_id: &str, removed_count: usize, cause: StopCause) {
+        self.emit_opt(drafts::allocations_removed_for_job(
+            job_id,
+            removed_count,
+            cause,
+        ));
     }
 
     pub fn allocations_removed_for_job_config(self, job_config_id: &str, removed: &[Allocation]) {
         self.emit_opt(drafts::allocations_removed_for_job_config(
             job_config_id,
             removed,
+        ));
+    }
+
+    /// Emit [`drafts::allocation_terminated`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn allocation_terminated(
+        self,
+        allocation_id: i64,
+        node_id: &str,
+        job_id: &str,
+        job_config_id: &str,
+        task_config_id: i64,
+        success: bool,
+        message: &str,
+    ) {
+        self.emit(drafts::allocation_terminated(
+            allocation_id,
+            node_id,
+            job_id,
+            job_config_id,
+            task_config_id,
+            success,
+            message,
         ));
     }
 

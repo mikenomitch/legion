@@ -43,9 +43,43 @@ How to use it:
 - [ ] Worker groups + taint/toleration equivalent. Node pools exist as an ACL
       and config concept but nothing scheduling-side consumes them.
 - [ ] Priorities and eviction/preemption, with eviction toggled at the pool level
-      — [plan](plans/preemption-and-eviction-plan.md) (PLANNED: graceful stop →
-      priority bands → plan-atomic preemption → governance; pool toggle is
-      `schedulerSettings.preemption.disabledPools`)
+      — [plan](plans/preemption-and-eviction-plan.md) (IN EXECUTION: stop causes
+      → graceful termination → priority bands → plan-atomic preemption →
+      governance; pool toggle is `schedulerSettings.preemption.disabledPools`)
+  - [x] **Phase 1a — stop causes.** Every allocation removal records *why*
+        (`stop`/`update`/`drain`/`reschedule`/`destroy`/`node_lost`), delivered
+        to the owning worker on its next heartbeat and carried in
+        `allocation.removed` event metadata.
+        [plan §Phase 1a](plans/preemption-and-eviction-plan.md) ·
+        [docs](../docs/graceful-stop.md)
+  - [ ] **Phase 1b — graceful termination.** `stop { signal, killAfter }`,
+        per-runtime SIGTERM→SIGKILL ladders, the `LEGION_STOP_NOTICE_PATH`
+        file, `allocation.stopping`, stops-before-starts reconcile ordering.
+        **Blocked on a worker-side terminating set**: `reconcile_allocations`
+        runs under the task-manager mutex inside the heartbeat loop, so a
+        blocking grace wait would stall heartbeats and the self-fence watchdog
+        and get the node declared lost. `stop_with` must signal and return,
+        with a reaper doing the SIGKILL — and teardown (notably
+        `volumes.unmount_for_allocation`) must move behind actual process
+        exit. [plan §Phase 1b](plans/preemption-and-eviction-plan.md)
+  - [ ] Decide Phase 1b's grace-vs-latency question: stops-before-starts puts a
+        victim's shutdown on the preemptor's critical path, so a task ignoring
+        SIGTERM delays an incident-response scale-up by up to `killAfter`.
+        Either a shorter preemption-specific grace, or start the preemptor once
+        capacity is *accounted* rather than *physically free*.
+  - [ ] Add a plugin ABI version symbol. `plugins/tasks/` loads a bare
+        `extern "C" fn() -> Box<dyn TaskPlugin>` with no version guard, so a
+        stale third-party dylib mismatches silently instead of failing loudly.
+        Phase 1a dodged this by not breaking the ABI (`stop_with` defaults to
+        `stop`); the next trait change will not have that option.
+  - [ ] Band governance ships as a `bands` selector on `job` ACL rules, not
+        `operator:write` — which also delivers per-namespace band caps, so
+        that is no longer a separate Phase 4 item. Needs band normalization
+        before `enforce` (a selector never matches a request lacking the
+        attribute), coverage on the update and template-render paths, and
+        explicit cases in `tests/acl_endpoints.rs` — the
+        `every_manager_rpc_is_classified` test cannot catch a dropped
+        conditional check inside an existing endpoint.
   - [x] At least think through fair-share policies — find the 80/20 rather than
         building a full hierarchical scheduler. Thought through in the plan's
         prior art + non-goals: the 80/20 is priority bands now, per-namespace
@@ -227,7 +261,90 @@ How to use it:
 
 Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
 
+- [x] **Task process supervision** — the worker reaps task children, applies a
+      new `restart` policy (`always | onFailure | never`, `delay`,
+      `successExitCodes`) sharing one budget with health-check restarts, and
+      reports terminal outcomes so a batch task's `Success` comes from its exit
+      code instead of its placement (`PROTOCOL_VERSION` 2, with a per-node
+      legacy fallback for older workers) —
+      [plan](plans/host-process-supervision-plan.md) ·
+      [calls](calls/host-process-supervision-plan_calls.md) ·
+      [docs](../docs/task-supervision.md)
+- [x] **Worker-owned cgroups for `exec`** — opt-in `resourceEnforcement` on the
+      worker config turns a task's `resources` into `memory.max`/`cpu.max` in a
+      cgroup Legion creates and removes per allocation; an explicit
+      `config.cgroup` still means "join this one"
+      ([docs](../docs/task-supervision.md#resource-enforcement-cgroups))
+- [x] **`exec` hardening block** — `noNewPrivileges`, capability bounding-set
+      drops, `privateTmp`, `umask`, `nice`, applied in privilege order around
+      the user switch ([docs](../docs/task-supervision.md#process-hardening))
+- [ ] Deferred from the supervision plan: privileged runtime tests for the cgroup
+      and hardening paths (CI covers derivation, validation, and the unconfined
+      fallback; the root-only paths are manual against a Linux worker container);
+      PID/IPC/UTS namespaces and seccomp for
+      `exec` (a PID namespace needs a double-fork, which changes the pid the
+      worker tracks — see
+      [calls entry 10](calls/host-process-supervision-plan_calls.md)); enforce
+      `resources.disk`; scheduler preference for enforcing nodes.
+- [ ] Possible, not planned: activation and readiness for `exec` — an
+      `sd_notify`-compatible readiness socket, `WatchdogSec`-style pings, and
+      socket activation via pre-bound fds
+      ([plan §8 phase 4](plans/host-process-supervision-plan.md))
 - [ ] A **WASM** runtime
+- [ ] A **`converge`** runtime — idempotent host resources (package, file,
+      template, directory, user, service, mount) with per-resource
+      `unchanged | changed | failed` reporting, i.e. the Chef-replacement shape —
+      [plan](plans/host-convergence-plan.md) ·
+      [calls](calls/host-convergence-plan_calls.md) (PLANNED: file-shaped
+      resources → system resources → node-config jobs → why-run/drift →
+      `host` ACL resource). Phase 1 depends on the exit-status work above.
+- [ ] **`container` core gaps: exec on Linux, signals + stop knobs, Nomad-style
+      CPU/memory enforcement, file delivery** —
+      [plan](plans/container-runtime-exec-and-signals-plan.md) (PLANNED).
+      Today `legion exec`/actions/UI/MCP fail against container tasks on Linux
+      (exec was deferred for the OCI runtimes), no platform can signal a
+      container task (`changeMode: signal` rejected at admission), teardown
+      has no grace window or knobs (Linux is `delete --force`, SIGKILL),
+      declared `resources` set no cgroup limits on Linux (`cpu` MHz enforced
+      nowhere), and the unmounted task dir blocks KV/identity *file* delivery
+      and file/tree artifacts.
+  - [ ] Phase 1 — exec via `<runtime> exec` for youki/runc/crun
+  - [ ] Phase 2 — `TaskPlugin::signal()` seam + `container kill`/`<runtime> kill`
+  - [ ] Phase 3 — graceful stop + task-level `stopSignal`/`stopGracePeriod`
+        fields (defaults SIGTERM/10 s, admission-capped; container both
+        platforms + exec runtime)
+  - [ ] Phase 4 — the `resource_enforcement()` interface (`Unsupported`/
+        `WorkerCgroup`/`RuntimeApplied` + worker-computed `ResourceAssignment`)
+        with Linux memory hard limits and `cpu` MHz → `cpu.weight`
+        (share-slice cgroup, OOM-kill annotation, `cores`-xor-`cpu` and
+        whole-`cores` validation)
+  - [ ] Phase 5 — exclusive `cores` via cpuset pinning (worker core
+        allocator, `legion/share`/`legion/reserve` slices, restart recovery)
+  - [ ] Phase 6 — `exec` runtime adopts the interface (`WorkerCgroup`): one
+        node-wide fence for container + exec tasks, real memory limits for
+        exec, `cgroup.kill` teardown; explicit `config.cgroup` still wins
+  - [ ] Phase 7 — task dir mounted at `/legion/task` + translated env; flips
+        KV file injection, identity file delivery, and file/tree artifacts to
+        supported (container file paths must live under the mount)
+  - [ ] Follow-on (not in the plan): `sandbox` adopts `resource_enforcement()`
+        as a `RuntimeApplied` consumer — pin vCPU threads to the assignment's
+        cores, size the guest from its memory limit. The honest test of
+        whether the three modes are the right cut (plan Q4).
+  - Deliberately out of scope there (still open, see the plan's non-goals):
+    Linux port mapping/network namespaces, NUMA/SMT-aware core placement,
+    fencing non-Legion host processes off reserved cores, a delegated
+    (non-root) cgroup hierarchy root, alloc-dir sharing
+  - **Overlaps shipped work — reconcile before building phase 6.** `exec`
+    already creates and sizes a per-allocation cgroup from `resources`, opt-in
+    per worker via `resourceEnforcement` in the worker config
+    ([host process supervision plan](plans/host-process-supervision-plan.md)
+    §6.5, [docs](../docs/task-supervision.md#resource-enforcement-cgroups),
+    `src/task_plugins/exec_isolation.rs`). Phase 6 should adopt that code as
+    the `WorkerCgroup` implementation rather than write a second one, and
+    decide one opt-in story for both runtimes: the exec work is off by default
+    per worker (a `resources` block was only ever a scheduling estimate), which
+    the container plan's default-on stance has to either match or explicitly
+    overrule.
 - [ ] `exec`: unveil support
 - [ ] `exec`: network namespaces (netavark? CNI?) — see *Networking* below
 - [ ] **Sandbox snapshots, fast start, and forking** —
@@ -244,7 +361,10 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
         `instance create --from-snapshot --count N`)
   - [ ] Phase 6 — lazy memory (UFFD handler, remote page sources)
 - [ ] Split a task runtime's implementation into parts — isolation vs. runner vs.
-      artifact consumption? (idea, needs a plan)
+      artifact consumption? (idea, needs a plan). The container-runtime plan's
+      `resource_enforcement()` interface carves off the first slice of this —
+      resource placement moves to worker core, runtimes consume a computed
+      assignment — so revisit this idea once that has two real consumers.
 - [ ] Shared files between tasks in the same allocation —
       [proposal](plans/shared-alloc-dir-proposal.md), unimplemented, and blocked
       on allocations holding more than one task
@@ -449,7 +569,10 @@ Plans: [persistence-plan.md](plans/persistence-plan.md), [multi-raft-persistence
       ([#137](https://github.com/mikenomitch/legion/pull/137))
 - [ ] **Node configuration jobs** — like sysbatch, but also runs on join and can
       add dynamic node metadata (CNI setup, volumes, artifacts, Ansible-shaped
-      work). Needs a plan.
+      work). Specified as phase 3 of the
+      [host convergence plan](plans/host-convergence-plan.md) (`nodeConfig`
+      with `onJoin`, `gateReadiness`, `publishAttrs`), which subsumes the
+      sysbatch/system-job items below.
 - [ ] Reconfigure a worker from the manager with CRUD commands
   - [ ] Existing nodes of a changed type need the update pushed to them, which
         implies nodes store a reference to their type
@@ -460,7 +583,8 @@ Plans: [persistence-plan.md](plans/persistence-plan.md), [multi-raft-persistence
 
 - [ ] **Sysbatch** — run once on every node
 - [ ] **System job** — N per X (1 per metal, 2 per region, …). Is this really a
-      job type, or just a richer `count`?
+      job type, or just a richer `count`? (`count: {num: 1, per: "id"}`
+      approximates it today but does not converge newly joined nodes.)
 
 ## Auth, TLS & security
 
@@ -552,7 +676,9 @@ job, so day 1 is simple and day N is performant. Each needs its own plan.
         `pending_count` promotion on terminal rollouts (calls #7),
         `base_count` resubmit arbitration, the `scale` ACL resource,
         ScaleTask/GetJobScaleStatus RPCs, CLI (`legion job scale`), MCP
-        tools, events. Deferred within phase 1: counts in
+        tools, events, and the `scale_in` stop cause reported to the
+        worker whose allocation was retired (added merging with Phase 1a
+        of the preemption plan — calls #16). Deferred within phase 1: counts in
         `legion job info` (scale status is the view), an ACL-scenario
         test proving `scale:write` cannot RunJob (the endpoint matrix
         covers the deny side), and regenerating `ui/src/gen/legion_pb.ts`

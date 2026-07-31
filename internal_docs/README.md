@@ -28,6 +28,9 @@ architecture and behavior docs are public.
   Legion different from K8s and Nomad (part idea list, part roadmap).
 - [stateful-vs-nomad-k8s.md](stateful-vs-nomad-k8s.md) — honest gap analysis of
   the stateful primitives against StatefulSets and Nomad.
+- [systemd-and-chef-analysis.md](systemd-and-chef-analysis.md) — could Legion
+  replace systemd and/or Chef? What works today, the four gaps that block the
+  service-supervisor claim, and the `converge`-runtime shape for host config.
 
 ## Notes
 
@@ -55,15 +58,18 @@ When one is required and what goes in it:
 | [artifact-cache-and-prewarm-plan.md](plans/artifact-cache-and-prewarm-plan.md) | planned |
 | [autoscaler-plan.md](plans/autoscaler-plan.md) | planned |
 | [auth-acl-plan.md](plans/auth-acl-plan.md) | phases 1–4 executed |
+| [container-runtime-exec-and-signals-plan.md](plans/container-runtime-exec-and-signals-plan.md) | planned |
 | [exec-and-actions-plan.md](plans/exec-and-actions-plan.md) | shipped (all five phases) |
 | [durability-and-ops-execution-plan.md](plans/durability-and-ops-execution-plan.md) | executed (workstreams A/B/C/D + adversarial verification, 2026-07-28); lanes topology opt-in |
 | [gang-scheduling-plan.md](plans/gang-scheduling-plan.md) | planned |
+| [host-convergence-plan.md](plans/host-convergence-plan.md) | planned |
+| [host-process-supervision-plan.md](plans/host-process-supervision-plan.md) | in execution (phases 1–3 landed; phase 4 uncommitted) |
 | [job-templates-plan.md](plans/job-templates-plan.md) | in execution |
 | [job-updated-at-plan.md](plans/job-updated-at-plan.md) | shipped (detail-page header + node column label deferred) |
 | [kv-reactive-task-updates-plan.md](plans/kv-reactive-task-updates-plan.md) | shipped |
 | [late-binding-plan-apply-plan.md](plans/late-binding-plan-apply-plan.md) | planned |
 | [persistence-plan.md](plans/persistence-plan.md) | phases 0–1, 3 done |
-| [preemption-and-eviction-plan.md](plans/preemption-and-eviction-plan.md) | planned |
+| [preemption-and-eviction-plan.md](plans/preemption-and-eviction-plan.md) | in execution (phase 1a shipped: stop causes) |
 | [multi-cluster-federation-plan.md](plans/multi-cluster-federation-plan.md) | planned |
 | [multi-raft-persistence-plan.md](plans/multi-raft-persistence-plan.md) | planned |
 | [scheduler-performance-plan.md](plans/scheduler-performance-plan.md) | in execution |
@@ -106,10 +112,13 @@ by project impact. The full template and a worked example:
 - [auth-acl-plan_calls.md](calls/auth-acl-plan_calls.md)
 - [aws-comparative-benchmark-plan_calls.md](calls/aws-comparative-benchmark-plan_calls.md)
 - [bounded-candidate-scoring-plan_calls.md](calls/bounded-candidate-scoring-plan_calls.md)
+- [container-runtime-exec-and-signals-plan_calls.md](calls/container-runtime-exec-and-signals-plan_calls.md)
 - [container-task-kind-macos_calls.md](calls/container-task-kind-macos_calls.md)
 - [exec-and-actions-plan_calls.md](calls/exec-and-actions-plan_calls.md)
 - [gang-scheduling-plan_calls.md](calls/gang-scheduling-plan_calls.md)
 - [heartbeat-scale-plan_calls.md](calls/heartbeat-scale-plan_calls.md)
+- [host-convergence-plan_calls.md](calls/host-convergence-plan_calls.md)
+- [host-process-supervision-plan_calls.md](calls/host-process-supervision-plan_calls.md)
 - [job-templates-plan_calls.md](calls/job-templates-plan_calls.md)
 - [job-updated-at-plan_calls.md](calls/job-updated-at-plan_calls.md)
 - [kv-reactive-task-updates-plan_calls.md](calls/kv-reactive-task-updates-plan_calls.md)

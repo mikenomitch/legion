@@ -17,7 +17,8 @@ use crate::prelude::{bail, debug, instrument, warn, Context, R};
 use crate::storage::store::{AllocationHealthSnapshot, Store};
 use crate::structs::{
     Allocation, Eval, JobConfig, Rollout, RolloutCapacityTimeoutAction, RolloutConfig,
-    RolloutDeadlineAction, RolloutProgression, RolloutReplacement, TaskConfig, TaskLifecycle,
+    RolloutDeadlineAction, RolloutProgression, RolloutReplacement, StopCause, TaskConfig,
+    TaskLifecycle,
 };
 
 const DEFAULT_RETRY_DELAY: Duration = Duration::from_secs(2);
@@ -1430,7 +1431,7 @@ fn retire_old_allocations_for_group(
         };
 
         for allocation in old_allocs.into_iter().take(to_remove) {
-            let _ = store.remove_allocation_by_id(allocation.id)?;
+            let _ = store.remove_allocation_by_id_because(allocation.id, StopCause::Update)?;
             outcome.removed += 1;
             if let (Some(indices), Some(instance_id)) =
                 (slot_indices.as_ref(), allocation.instance_id.as_deref())

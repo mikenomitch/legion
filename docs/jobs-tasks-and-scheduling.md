@@ -39,6 +39,10 @@ Important `TaskConfig` fields:
 - `lifecycle`: `service`, `batch`, `sidecar`
 - `schedule`: only valid for `batch`
 - `checks` and `on_unhealthy`: health and restart/reschedule policy
+- `restart`: what happens when the task *process* exits (`always` /
+  `onFailure` / `never`, delay, `successExitCodes`). Shares the
+  `on_unhealthy` restart budget; see
+  [Task Supervision](task-supervision.md).
 - `stateful`: opt-in stable instance identity for the task's replicas. In
   `slot` mode each replica gets an ordinal slot `0..count-1` whose instance id
   and storage handle survive reschedules; replacements reuse the same slot.
@@ -230,6 +234,16 @@ unknown nodes, and requires `node:write` on the node's pool.
 
 ## Health Checks, Restarting, and Rescheduling
 
+### Process exits
+
+A worker's task supervisor polls each running allocation's process, reaps it on
+exit, and applies the task's `restart` policy — restart in place, terminal
+success, or failure into the reschedule path below. This is also what makes a
+batch task's `Success` real (the exit code decides it, not the placement), so
+`dependsOn: { condition: "success" }` means "exited 0". The full semantics,
+including the version-skew rule for workers that predate exit reporting, are in
+[Task Supervision](task-supervision.md).
+
 ### Worker-side health loop
 
 For each allocation with checks:
@@ -244,7 +258,8 @@ When unhealthy threshold is reached:
 
 ### Manager-side move logic
 
-Worker reports failed allocations in heartbeat.
+Worker reports failed allocations in heartbeat (from a failed health check, a
+failed restart, or a bad exit).
 Manager then:
 
 1. removes failed allocation row

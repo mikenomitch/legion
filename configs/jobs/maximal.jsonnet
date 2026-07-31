@@ -278,6 +278,20 @@
                 move_period: "30m",
                 move_delay: "30s",
             },
+            // What happens when the task PROCESS exits, as opposed to a health
+            // check failing (see docs/task-supervision.md). Both paths spend
+            // the same local restart budget above; this block only decides
+            // whether an exit is worth restarting for.
+            restart: {
+                // always | onFailure | never. Default: "always" for
+                // service/sidecar, "onFailure" for batch.
+                policy: "always",
+                // Wait before relaunching. Defaults to
+                // on_unhealthy.restart_delay when omitted.
+                delay: "5s",
+                // Exit codes counted as success. Default [0].
+                successExitCodes: [0],
+            },
             affinities: [
                 {
                     key: "zone",
@@ -400,6 +414,25 @@
                 landlock: {
                     read_only_paths: ["/usr", "/bin"],
                     read_write_paths: ["/tmp"],
+                },
+                // Process hardening (Linux; ignored with a warning elsewhere).
+                // See docs/task-supervision.md.
+                hardening: {
+                    // prctl(PR_SET_NO_NEW_PRIVS): no privilege gain through
+                    // setuid binaries or file capabilities, ever.
+                    noNewPrivileges: true,
+                    // Private mount namespace + a tmpfs over /tmp, invisible
+                    // to every other task on the node. Needs a worker with
+                    // CAP_SYS_ADMIN.
+                    privateTmp: true,
+                    // Bounding-set drops. ["all"] drops everything; named
+                    // capabilities work with or without the CAP_ prefix.
+                    // Needs CAP_SETPCAP on the worker.
+                    capabilities: { drop: ["all"] },
+                    // Octal file-mode creation mask.
+                    umask: "0027",
+                    // Scheduling niceness, -20..=19.
+                    nice: 5,
                 },
             },
             resources: {

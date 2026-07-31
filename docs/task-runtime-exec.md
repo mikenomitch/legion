@@ -29,9 +29,15 @@ Optional:
 - `landlock` (linux):
   - `read_only_paths`
   - `read_write_paths`
+- `hardening` (linux): `noNewPrivileges`, `privateTmp`,
+  `capabilities: { drop: [...] }`, `umask`, `nice` — see
+  [Task Supervision](task-supervision.md#process-hardening).
 
 ## Runtime Behavior
 
+- `validate_config` runs the *typed* parse at submit, not just the JSON schema,
+  so a bad `umask`, an unknown capability, or both `oom_adj` and `oom_score_adj`
+  fail in `legion job validate` rather than on some node at start.
 - `prepare`: logging only.
 - `start`:
   - parse config,
@@ -70,6 +76,7 @@ Spawn helper sets a new session (`setsid`) on Unix so task processes survive wor
 | KV file injection | ✅ |
 | Identity env / file delivery | ✅ / ✅ |
 | Signal delivery | ✅ |
+| Exit reporting / restart policy | ✅ (see [Task Supervision](task-supervision.md)) |
 | Artifacts | ✅ (File/Tree + interpolation + env) |
 | Exec / interactive PTY | ✅ / ✅ — **host-level** (see [docs/exec-and-actions.md](exec-and-actions.md)) |
 
@@ -82,4 +89,12 @@ Because it is a process on the host (even under landlock), it carries the
 
 - Landlock features are Linux-only and conditional.
 - Health checks are external (worker health monitor), not part of exec plugin logic.
+- **Process exit** is observed by the worker's task supervisor, which reaps the
+  child and applies the task's `restart` policy — see
+  [Task Supervision](task-supervision.md).
+- **Resource limits.** `config.cgroup` *joins* an existing cgroup. For Legion to
+  create one and write `resources` into it as real limits, enable
+  `resourceEnforcement` on the worker
+  ([Task Supervision](task-supervision.md#resource-enforcement-cgroups)); an
+  explicit `cgroup` opts the task out.
 

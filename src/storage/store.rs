@@ -1,6 +1,9 @@
 // A few low-level persistence helpers take many columns by parameter.
 #![allow(clippy::too_many_arguments)]
 
+use crate::constants::{
+    ALLOCATION_STATUS_COMPLETE, ALLOCATION_STATUS_FAILED, STOP_NOTICE_RETENTION_SECS,
+};
 use crate::constraints::{ConstraintSet, DistinctTracker, PermitSet};
 use crate::prelude::*;
 use crate::resources::{ResourcePolicy, ResourcePool, ResourceRequest};
@@ -30,9 +33,9 @@ use crate::structs::{
     slot_instance_id, Allocation, AllocationHealth, Eval, Instance, InstanceMode, InstanceState,
     Job, JobConfig, JobTemplateProvenance, KvEntry, KvLock, KvValueType, LedgerEntry,
     ManagerConfigFull, ManagerNodeConfig, Node, NodeMsg, ReplaceAfter, ResolvedOnLostPolicy,
-    Rollout, RolloutConfig, SigningKeyRecord, StatefulConfig, StatefulOnLostConfig, Submission,
-    TaskCheck, TaskConfig, TaskCount, TaskDependency, TaskLifecycle, TaskOnUnhealthyConfig,
-    TaskSchedule, TaskStatusState, Volume, WorkerConfig,
+    Rollout, RolloutConfig, SigningKeyRecord, StatefulConfig, StatefulOnLostConfig, StopCause,
+    Submission, TaskCheck, TaskConfig, TaskCount, TaskDependency, TaskLifecycle,
+    TaskOnUnhealthyConfig, TaskSchedule, TaskStatusState, Volume, WorkerConfig,
 };
 use crate::util::random_string;
 
@@ -1590,7 +1593,7 @@ impl Store {
 
         let mut task_stmt = conn.prepare(
             r#"
-            SELECT id, name, runtime, count, count_per, group_name, lifecycle, schedule, depends_on, config, resources, constraints, permit, affinities, checks, on_unhealthy, kv_injections, job_config_id, identities, stateful, artifacts, network, service, actions, volumes, connect
+            SELECT id, name, runtime, count, count_per, group_name, lifecycle, schedule, depends_on, config, resources, constraints, permit, affinities, checks, on_unhealthy, kv_injections, job_config_id, identities, stateful, artifacts, network, service, actions, volumes, connect, restart
             FROM task_config;
             "#,
         )?;
@@ -1629,6 +1632,7 @@ impl Store {
                 actions: self.parse_actions_column(23, row.get(23)?)?,
                 volumes: self.parse_volumes_column(24, row.get(24)?)?,
                 connect: parse_json_column(25, row.get(25)?)?,
+                restart: parse_json_column(26, row.get(26)?)?,
             };
             let job_config_id: String = row.get(17)?;
             Ok((job_config_id, id, task))
@@ -3118,6 +3122,7 @@ impl Store {
             artifacts,
             host_volumes: row.get(9)?,
             heartbeat_seconds: row.get(10)?,
+            resource_enforcement: row.get(11)?,
         })
     }
 
@@ -3330,6 +3335,7 @@ impl Store {
             actions: self.parse_actions_column(24, row.get(24)?)?,
             volumes: self.parse_volumes_column(25, row.get(25)?)?,
             connect: parse_json_column(26, row.get(26)?)?,
+            restart: parse_json_column(27, row.get(27)?)?,
         };
 
         Ok(task_config)
@@ -3797,7 +3803,7 @@ impl Store {
         }
 
         let evicted = removable.len();
-        let affected_job_configs = self.remove_allocations(&removable)?;
+        let affected_job_configs = self.remove_allocations(&removable, StopCause::Drain)?;
         for job_config_id in affected_job_configs {
             self.reconcile_job_config_allocations(&job_config_id)?;
         }
@@ -3827,6 +3833,11 @@ impl Store {
         tx.execute("DELETE FROM allocation WHERE node_id = ?;", [node_id])?;
         self.release_instance_bindings_tx(&tx, &allocs)?;
         self.bump_epochs_for_allocations_tx(&tx, &allocs)?;
+        // The node itself is going away, so these notices will almost never
+        // be delivered — recorded anyway because "almost never" is not
+        // "never": a node removed while still heartbeating (a decommission
+        // racing its own worker) does read them.
+        self.record_stop_notices_tx(&tx, &allocs, StopCause::NodeLost)?;
         tx.commit()?;
         drop(conn);
 
@@ -3836,7 +3847,7 @@ impl Store {
         self.cache_remove_allocations(&allocs)?;
 
         self.events()
-            .allocations_removed_from_node(node_id, &allocs);
+            .allocations_removed_from_node(node_id, &allocs, StopCause::NodeLost);
 
         Ok(allocs)
     }
@@ -4668,6 +4679,7 @@ impl Store {
             ":artifacts": config.artifacts,
             ":host_volumes": config.host_volumes,
             ":heartbeat_seconds": config.heartbeat_seconds,
+            ":resource_enforcement": config.resource_enforcement,
         };
 
         let config = conn.query_row(&INSERT_WORKER_TYPE, params, |row| {
@@ -5033,6 +5045,7 @@ impl Store {
         tx.execute("DELETE FROM rollout WHERE job_id = ?1;", [job_id])?;
         if !allocs.is_empty() {
             self.bump_epochs_for_allocations_tx(&tx, &allocs)?;
+            self.record_stop_notices_tx(&tx, &allocs, StopCause::Destroy)?;
         }
         tx.commit()?;
         drop(conn);
@@ -5654,6 +5667,7 @@ impl Store {
             } else {
                 Some(serde_json::to_string(&t.volumes)?)
             };
+            let restart = t.restart.as_ref().map(serde_json::to_string).transpose()?;
             let schedule = t.schedule.as_ref().map(ToString::to_string);
             let task_params = named_params! {
                 ":name": t.name,
@@ -5682,6 +5696,7 @@ impl Store {
                 ":actions": actions,
                 ":volumes": volumes,
                 ":connect": connect,
+                ":restart": restart,
             };
 
             let task_id: i64 = tx.query_row(&INSERT_TASK, task_params, |row| row.get(0))?;
@@ -7168,11 +7183,49 @@ impl Store {
         Ok(())
     }
 
-    fn task_status_for_lifecycle(lifecycle: &TaskLifecycle) -> TaskStatusState {
+    /// Task status to stamp when an allocation is placed.
+    ///
+    /// A batch task is `Running` until a worker reports that its process
+    /// exited — that report is what makes `dependsOn: { condition: "success" }`
+    /// mean "exited 0" rather than "was placed" (see docs/task-supervision.md).
+    ///
+    /// `supervised_node` is false for workers too old to send exit reports
+    /// (protocol version < 2). Those nodes will never report a termination, so
+    /// their batch tasks keep the legacy optimistic `Success` — otherwise a
+    /// mid-upgrade cluster (managers upgrade first) would stall every DAG
+    /// waiting on a batch task.
+    fn task_status_for_lifecycle(
+        lifecycle: &TaskLifecycle,
+        supervised_node: bool,
+    ) -> TaskStatusState {
         match lifecycle {
+            TaskLifecycle::Batch if supervised_node => TaskStatusState::Running,
             TaskLifecycle::Batch => TaskStatusState::Success,
             TaskLifecycle::Service | TaskLifecycle::Sidecar => TaskStatusState::Running,
         }
+    }
+
+    /// Whether a node's worker reports task exits (protocol version 2+). Reads
+    /// the version recorded in the node's dynamic attrs at registration;
+    /// anything unreadable is treated as an old worker, which is the
+    /// conservative direction (keeps today's behavior).
+    fn node_reports_exits_tx(tx: &Connection, node_id: &str) -> bool {
+        let raw: Option<String> = tx
+            .query_row(
+                "SELECT dynamic_attrs FROM node WHERE id = ?;",
+                params![node_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .ok()
+            .flatten();
+        let Some(raw) = raw else {
+            return false;
+        };
+        serde_json::from_str::<Value>(&raw)
+            .ok()
+            .and_then(|attrs| attrs.get("protocolVersion").and_then(Value::as_u64))
+            .is_some_and(|version| version >= 2)
     }
 
     fn apply_task_status_updates_tx(
@@ -7212,6 +7265,8 @@ impl Store {
         let tx = Self::write_tx(&mut conn)?;
         let mut task_cache: HashMap<String, HashMap<i64, TaskConfig>> = HashMap::new();
         let mut updates: HashMap<i64, TaskStatusState> = HashMap::new();
+        // One node lookup per distinct node, not per allocation.
+        let mut node_supervision: HashMap<String, bool> = HashMap::new();
 
         for allocation in allocations {
             let tasks = task_cache
@@ -7227,9 +7282,12 @@ impl Store {
                 .get(&allocation.task_config_id)
                 .with_context(|| format!("Missing task config {}", allocation.task_config_id))?;
 
+            let supervised_node = *node_supervision
+                .entry(allocation.node_id.clone())
+                .or_insert_with(|| Self::node_reports_exits_tx(&tx, &allocation.node_id));
             updates.insert(
                 allocation.task_config_id,
-                Self::task_status_for_lifecycle(&task.lifecycle),
+                Self::task_status_for_lifecycle(&task.lifecycle, supervised_node),
             );
         }
 
@@ -7692,6 +7750,82 @@ impl Store {
         }
 
         Ok(instance.instance_id)
+    }
+
+    /// Record why a set of allocations is being removed, in the same
+    /// transaction that removes them.
+    ///
+    /// Same-transaction is the whole point: a notice can then never describe
+    /// a stop that was rolled back, and never arrive claiming a stop that has
+    /// not been decided yet. The heartbeat feed
+    /// ([`Self::stop_notices_for_node`]) reads them straight back out.
+    ///
+    /// [`StopCause::Unknown`] writes nothing — an unknown cause and no
+    /// recorded cause are the same fact, and the worker defaults to
+    /// `Unknown` anyway.
+    fn record_stop_notices_tx(
+        &self,
+        tx: &Connection,
+        removed: &[Allocation],
+        cause: StopCause,
+    ) -> R<()> {
+        if removed.is_empty() || !cause.is_known() {
+            return Ok(());
+        }
+        let now = Self::now_rfc3339()?;
+        let now_unix = OffsetDateTime::now_utc().unix_timestamp();
+
+        // Expire old notices here rather than on the heartbeat read path.
+        // This transaction is already a scheduler-lane write, so the delete
+        // costs no extra raft proposal and stays inside the lane that owns
+        // the table; pruning on read would have put a write (and, in raft
+        // mode, a proposal) on the hottest path in the system. A table with
+        // no removals is not growing, so tying the prune to removals cannot
+        // let it run away.
+        tx.execute(
+            "DELETE FROM allocation_stop_notice WHERE created_at_unix < ?1;",
+            params![now_unix - STOP_NOTICE_RETENTION_SECS],
+        )?;
+
+        for alloc in removed {
+            // REPLACE, not INSERT: an allocation id is unique and a second
+            // removal of the same id (a retried apply, say) should carry the
+            // latest cause rather than fail the transaction it rides in.
+            tx.execute(
+                "INSERT OR REPLACE INTO allocation_stop_notice
+                 (allocation_id, node_id, cause, created_at, created_at_unix)
+                 VALUES (?1, ?2, ?3, ?4, ?5);",
+                params![alloc.id, alloc.node_id, cause.as_str(), now, now_unix],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// The live stop notices for one node, for its heartbeat reply.
+    ///
+    /// Read-only by construction: this runs on every heartbeat from every
+    /// node, so it must not write (expiry happens in
+    /// [`Self::record_stop_notices_tx`], which is already a scheduler-lane
+    /// write). Notices past the retention window are filtered out here so a
+    /// prune that has not run yet cannot resurrect a stale cause.
+    pub fn stop_notices_for_node(&self, node_id: &str) -> R<Vec<(i64, StopCause)>> {
+        let cutoff = OffsetDateTime::now_utc().unix_timestamp() - STOP_NOTICE_RETENTION_SECS;
+
+        let conn = self.read_connection()?;
+        let mut stmt = conn.prepare(
+            "SELECT allocation_id, cause FROM allocation_stop_notice
+             WHERE node_id = ?1 AND created_at_unix >= ?2;",
+        )?;
+        let notices = Self::collect_rows(stmt.query_map(params![node_id, cutoff], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?)?;
+        drop(stmt);
+        drop(conn);
+
+        Ok(notices
+            .into_iter()
+            .map(|(id, cause)| (id, StopCause::from_wire(&cause)))
+            .collect())
     }
 
     /// After allocation rows are deleted, transition the instances they
@@ -8460,13 +8594,30 @@ impl Store {
             .collect())
     }
 
+    /// Remove one allocation without recording why.
+    ///
+    /// The worker-failure-report path: the task is already gone, so there is
+    /// no stop to explain. Callers that *are* stopping live work should use
+    /// [`Self::remove_allocation_by_id_because`] so the owning worker learns
+    /// the reason.
     #[instrument(err, skip_all)]
     pub fn remove_allocation_by_id(&self, allocation_id: i64) -> R<Option<Allocation>> {
-        match self.remove_allocation_by_id_local(allocation_id) {
+        self.remove_allocation_by_id_because(allocation_id, StopCause::Unknown)
+    }
+
+    /// Remove one allocation, recording why for the owning worker.
+    #[instrument(err, skip_all)]
+    pub fn remove_allocation_by_id_because(
+        &self,
+        allocation_id: i64,
+        cause: StopCause,
+    ) -> R<Option<Allocation>> {
+        match self.remove_allocation_by_id_local(allocation_id, cause) {
             Err(err) if crate::storage::raft::driver::NotRaftLeader::in_chain(&err) => self
                 .forward_after_rejection(
                     crate::storage::raft::forward::ForwardableLaneWrite::RemoveAllocationById {
                         allocation_id,
+                        cause,
                     },
                     err,
                 ),
@@ -8477,13 +8628,18 @@ impl Store {
     pub(crate) fn remove_allocation_by_id_local(
         &self,
         allocation_id: i64,
+        cause: StopCause,
     ) -> R<Option<Allocation>> {
         self.replicated(Lane::Scheduler, "remove_allocation_by_id", move |s| {
-            s.remove_allocation_by_id_apply(allocation_id)
+            s.remove_allocation_by_id_apply(allocation_id, cause)
         })
     }
 
-    fn remove_allocation_by_id_apply(&self, allocation_id: i64) -> R<Option<Allocation>> {
+    fn remove_allocation_by_id_apply(
+        &self,
+        allocation_id: i64,
+        cause: StopCause,
+    ) -> R<Option<Allocation>> {
         let allocation = self.get_allocation_by_id(allocation_id)?;
         let Some(allocation) = allocation else {
             return Ok(None);
@@ -8494,11 +8650,86 @@ impl Store {
         tx.execute("DELETE FROM allocation WHERE id = ?;", [allocation_id])?;
         self.release_instance_bindings_tx(&tx, std::slice::from_ref(&allocation))?;
         self.bump_job_config_epoch_tx(&tx, &allocation.job_config_id)?;
+        self.record_stop_notices_tx(&tx, std::slice::from_ref(&allocation), cause)?;
         tx.commit()?;
 
         self.cache_remove_allocations(std::slice::from_ref(&allocation))?;
 
         Ok(Some(allocation))
+    }
+
+    /// Record a terminal, non-failure outcome for an allocation: its task's
+    /// process exited and the task's `restart` policy says that is the end of
+    /// it (see docs/task-supervision.md).
+    ///
+    /// The row is marked `complete` rather than deleted. Deleting it would
+    /// leave the task's desired count unmet, and the very next reconcile would
+    /// place the batch task again — an infinite re-run loop. A completed
+    /// allocation still occupies its slot; it is the worker that knows not to
+    /// relaunch the process.
+    ///
+    /// The task's status follows the outcome: `Success` for a successful exit,
+    /// `Failed` otherwise (a `restart: { policy: "never" }` task that exits
+    /// non-zero terminates without going through the reschedule path).
+    pub fn complete_allocation(&self, allocation_id: i64, success: bool) -> R<Option<Allocation>> {
+        match self.complete_allocation_local(allocation_id, success) {
+            Err(err) if crate::storage::raft::driver::NotRaftLeader::in_chain(&err) => self
+                .forward_after_rejection(
+                    crate::storage::raft::forward::ForwardableLaneWrite::CompleteAllocation {
+                        allocation_id,
+                        success,
+                    },
+                    err,
+                ),
+            other => other,
+        }
+    }
+
+    pub(crate) fn complete_allocation_local(
+        &self,
+        allocation_id: i64,
+        success: bool,
+    ) -> R<Option<Allocation>> {
+        self.replicated(Lane::Scheduler, "complete_allocation", move |s| {
+            s.complete_allocation_apply(allocation_id, success)
+        })
+    }
+
+    fn complete_allocation_apply(
+        &self,
+        allocation_id: i64,
+        success: bool,
+    ) -> R<Option<Allocation>> {
+        let Some(allocation) = self.get_allocation_by_id(allocation_id)? else {
+            return Ok(None);
+        };
+
+        let status = if success {
+            ALLOCATION_STATUS_COMPLETE
+        } else {
+            ALLOCATION_STATUS_FAILED
+        };
+        let task_status = if success {
+            TaskStatusState::Success
+        } else {
+            TaskStatusState::Failed
+        };
+
+        let mut conn = self.write_connection()?;
+        let tx = Self::write_tx(&mut conn)?;
+        tx.execute(
+            "UPDATE allocation SET status = ? WHERE id = ?;",
+            params![status, allocation_id],
+        )?;
+        let mut updates = HashMap::new();
+        updates.insert(allocation.task_config_id, task_status);
+        self.apply_task_status_updates_tx(&tx, &updates)?;
+        tx.commit()?;
+
+        Ok(Some(Allocation {
+            status: status.to_string(),
+            ..allocation
+        }))
     }
 
     #[instrument(err, skip_all)]
@@ -8554,13 +8785,14 @@ impl Store {
         tx.execute(sql, params)?;
         self.release_instance_bindings_tx(&tx, &allocations)?;
         self.bump_epochs_for_allocations_tx(&tx, &allocations)?;
+        self.record_stop_notices_tx(&tx, &allocations, StopCause::Stop)?;
         tx.commit()?;
         drop(conn);
 
         self.cache_remove_allocations(&allocations)?;
 
         self.events()
-            .allocations_removed_for_job(job_id, allocations.len());
+            .allocations_removed_for_job(job_id, allocations.len(), StopCause::Stop);
 
         Ok(())
     }
@@ -8587,6 +8819,9 @@ impl Store {
         )?;
         self.release_instance_bindings_tx(&tx, &allocations)?;
         self.bump_job_config_epoch_tx(&tx, job_config_id)?;
+        // A superseded job config's allocations are cleaned up because a
+        // newer config replaced them.
+        self.record_stop_notices_tx(&tx, &allocations, StopCause::Update)?;
         tx.commit()?;
         drop(conn);
 
@@ -8928,6 +9163,10 @@ impl Store {
         for allocation in &surplus {
             tx.execute("DELETE FROM allocation WHERE id = ?;", [allocation.id])?;
         }
+        // Every removal records WHY, in the same transaction that removes it
+        // (preemption plan § Phase 1a). Scale-in gets its own cause rather
+        // than borrowing `Update`: no new job config version exists here.
+        self.record_stop_notices_tx(&tx, &surplus, StopCause::ScaleIn)?;
         self.release_instance_bindings_tx(&tx, &surplus)?;
         self.bump_epochs_for_allocations_tx(&tx, &surplus)?;
         tx.commit()?;
@@ -9065,7 +9304,7 @@ impl Store {
             return Ok(());
         }
 
-        let affected_job_configs = self.remove_allocations(&removable)?;
+        let affected_job_configs = self.remove_allocations(&removable, StopCause::NodeLost)?;
         for job_config_id in affected_job_configs {
             self.reconcile_job_config_allocations(&job_config_id)?;
         }
@@ -9152,17 +9391,25 @@ impl Store {
     /// Remove specific allocation rows (releasing instance bindings and
     /// bumping epochs, like every other allocation-removal path) and return
     /// the affected job config ids.
-    pub(crate) fn remove_allocations(&self, allocs: &[Allocation]) -> R<HashSet<String>> {
+    pub(crate) fn remove_allocations(
+        &self,
+        allocs: &[Allocation],
+        cause: StopCause,
+    ) -> R<HashSet<String>> {
         if allocs.is_empty() {
             return Ok(HashSet::new());
         }
         let allocs = allocs.to_vec();
         self.replicated(Lane::Scheduler, "remove_allocations", move |s| {
-            s.remove_allocations_apply(&allocs)
+            s.remove_allocations_apply(&allocs, cause)
         })
     }
 
-    fn remove_allocations_apply(&self, allocs: &[Allocation]) -> R<HashSet<String>> {
+    fn remove_allocations_apply(
+        &self,
+        allocs: &[Allocation],
+        cause: StopCause,
+    ) -> R<HashSet<String>> {
         let mut conn = self.write_connection()?;
         let tx = Self::write_tx(&mut conn)?;
         for alloc in allocs {
@@ -9170,6 +9417,7 @@ impl Store {
         }
         self.release_instance_bindings_tx(&tx, allocs)?;
         self.bump_epochs_for_allocations_tx(&tx, allocs)?;
+        self.record_stop_notices_tx(&tx, allocs, cause)?;
         tx.commit()?;
 
         self.cache_remove_allocations(allocs)?;
@@ -9929,6 +10177,7 @@ impl Store {
             params![now, instance_id],
         )?;
         self.bump_epochs_for_allocations_tx(&tx, &allocations)?;
+        self.record_stop_notices_tx(&tx, &allocations, StopCause::Destroy)?;
         tx.commit()?;
 
         self.cache_remove_allocations(&allocations)?;
@@ -10024,6 +10273,7 @@ impl Store {
             params![now, instance_id],
         )?;
         self.bump_epochs_for_allocations_tx(&tx, &allocations)?;
+        self.record_stop_notices_tx(&tx, &allocations, StopCause::Stop)?;
         tx.commit()?;
 
         self.cache_remove_allocations(&allocations)?;
@@ -13876,6 +14126,7 @@ mod tests {
 
         let worker_config = WorkerConfig {
             host_volumes: String::new(),
+            resource_enforcement: String::new(),
             name: "test".to_string(),
             pool: "default".to_string(),
             additional_node_checks: vec![],
@@ -13911,6 +14162,7 @@ mod tests {
 
         let worker_config = WorkerConfig {
             host_volumes: String::new(),
+            resource_enforcement: String::new(),
             name: "empty".to_string(),
             pool: "default".to_string(),
             additional_node_checks: vec![],
@@ -15757,8 +16009,87 @@ mod tests {
         let statuses = store.task_statuses_for_job_config(&job_config_id)?;
         let prep_id = task_id_for(&store, "prep", &job.name)?;
         let api_id = task_id_for(&store, "api", &job.name)?;
+        // node-a advertises no protocol version, so it is a pre-exit-report
+        // worker and its batch task keeps the legacy optimistic Success.
         assert_eq!(statuses.get(&prep_id), Some(&TaskStatusState::Success));
         assert_eq!(statuses.get(&api_id), Some(&TaskStatusState::Running));
+
+        Ok(())
+    }
+
+    /// On a worker that reports exits, a batch task is `Running` until the
+    /// process actually exits — that is what makes `condition: "success"`
+    /// mean "exited 0" instead of "was placed".
+    #[test]
+    fn batch_task_status_waits_for_a_real_exit_on_supervising_workers() -> R<()> {
+        let store = setup_store()?;
+        let mut node = make_node_msg("node-a", "ready");
+        node.dynamic_attrs = json!({ "protocolVersion": 2 }).to_string();
+        store.insert_node(node)?;
+
+        let job = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "batch-exit-demo".into(),
+            tasks: vec![TaskConfig {
+                lifecycle: TaskLifecycle::Batch,
+                ..TaskConfig::new("prep", "exec")
+            }],
+            version: None,
+        };
+        store.handle_job_submit(
+            &job,
+            &[Submission {
+                path: "job.jsonnet".into(),
+                content: "job".into(),
+                is_primary: true,
+            }],
+        )?;
+        let job_config_id = store.get_job_config(&job.name)?.id();
+        let prep_id = task_id_for(&store, "prep", &job.name)?;
+
+        let scheduler = Scheduler::new(&store)?;
+        let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
+        store.update_task_statuses_for_allocations(&outcome.allocations)?;
+
+        let statuses = store.task_statuses_for_job_config(&job_config_id)?;
+        assert_eq!(
+            statuses.get(&prep_id),
+            Some(&TaskStatusState::Running),
+            "a placed batch task has not succeeded yet"
+        );
+
+        // The worker reports the process exited 0.
+        let allocation_id = outcome.allocations[0].id;
+        let completed = store
+            .complete_allocation(allocation_id, true)?
+            .expect("allocation exists");
+        assert_eq!(completed.status, "complete");
+        assert_eq!(
+            store
+                .task_statuses_for_job_config(&job_config_id)?
+                .get(&prep_id),
+            Some(&TaskStatusState::Success)
+        );
+        // The row survives: deleting it would leave the desired count unmet
+        // and re-run the batch task immediately.
+        assert!(store.get_allocation_by_id(allocation_id)?.is_some());
+
+        // A non-zero exit fails the task instead.
+        store.complete_allocation(allocation_id, false)?;
+        assert_eq!(
+            store
+                .task_statuses_for_job_config(&job_config_id)?
+                .get(&prep_id),
+            Some(&TaskStatusState::Failed)
+        );
+        assert_eq!(
+            store
+                .get_allocation_by_id(allocation_id)?
+                .expect("allocation exists")
+                .status,
+            "failed"
+        );
 
         Ok(())
     }
@@ -15841,6 +16172,204 @@ mod tests {
             }],
         )?;
         assert_eq!(artifact_events(&store)?.len(), 2);
+        Ok(())
+    }
+
+    /// Seed a one-task job and place an allocation for it on `node_id`.
+    fn seed_placed_allocation(store: &Store, job_name: &str, node_id: &str) -> R<Allocation> {
+        let job = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: job_name.into(),
+            tasks: vec![TaskConfig::new("web", "noop")],
+            version: None,
+        };
+        store.handle_job_submit(
+            &job,
+            &[Submission {
+                path: "job.jsonnet".into(),
+                content: "{}".into(),
+                is_primary: true,
+            }],
+        )?;
+        let task_id = task_id_for(store, "web", &job.name)?;
+        store.place_alloc(node_id, task_id)
+    }
+
+    /// Scale-in is a platform-initiated removal like any other, so it must
+    /// record WHY (preemption plan § Phase 1a) — and with its own cause, not
+    /// `update`: no new job config version exists, which is the entire point
+    /// of the count-override surface (docs/autoscaling.md).
+    #[test]
+    fn scale_in_records_its_own_stop_cause() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "ready"))?;
+
+        let job = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "scale-cause".into(),
+            tasks: vec![TaskConfig {
+                count: TaskCount::new(2),
+                ..TaskConfig::new("web", "noop")
+            }],
+            version: None,
+        };
+        store.handle_job_submit(
+            &job,
+            &[Submission {
+                path: "job.jsonnet".into(),
+                content: "{}".into(),
+                is_primary: true,
+            }],
+        )?;
+        let job_config_id = store.get_job_config("scale-cause")?.id();
+        let task_id = task_id_for(&store, "web", "scale-cause")?;
+        let first = store.place_alloc("node-a", task_id)?;
+        let second = store.place_alloc("node-a", task_id)?;
+        assert!(store.stop_notices_for_node("node-a")?.is_empty());
+
+        // Scale 2 -> 1: the newest allocation is retired.
+        store.set_task_scale_override(
+            "scale-cause",
+            "default",
+            "web",
+            1,
+            2,
+            "operator",
+            "test",
+            "t",
+        )?;
+        let retired = store.retire_surplus_allocations(&job_config_id)?;
+        assert_eq!(retired.len(), 1);
+        assert_eq!(retired[0].id, second.id.max(first.id));
+
+        assert_eq!(
+            store.stop_notices_for_node("node-a")?,
+            vec![(retired[0].id, StopCause::ScaleIn)],
+            "a scaled-in allocation reports scale_in, not update"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn stop_notice_records_the_cause_and_serves_it_to_the_owning_node() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "ready"))?;
+        store.insert_node(make_node_msg("node-b", "ready"))?;
+        let allocation = seed_placed_allocation(&store, "notice-demo", "node-a")?;
+
+        // Nothing removed yet: no notices.
+        assert!(store.stop_notices_for_node("node-a")?.is_empty());
+
+        store.remove_allocation_by_id_because(allocation.id, StopCause::Drain)?;
+
+        let notices = store.stop_notices_for_node("node-a")?;
+        assert_eq!(
+            notices,
+            vec![(allocation.id, StopCause::Drain)],
+            "the owning node learns why its allocation went away"
+        );
+        // Notices are addressed to one node; a different node must not see
+        // another node's stops.
+        assert!(
+            store.stop_notices_for_node("node-b")?.is_empty(),
+            "notices are scoped to the node that owned the allocation"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn stop_notice_is_absent_when_the_cause_is_unknown() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "ready"))?;
+        let allocation = seed_placed_allocation(&store, "unknown-demo", "node-a")?;
+
+        // The worker-failure-report path: the task died on its own, so there
+        // is no platform stop to explain. Recording `unknown` would be noise
+        // — the worker defaults to it anyway.
+        store.remove_allocation_by_id(allocation.id)?;
+
+        assert!(
+            store.stop_notices_for_node("node-a")?.is_empty(),
+            "an unknown cause records nothing"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn stop_notices_expire_and_are_pruned_by_later_removals() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "ready"))?;
+        // Both allocations are placed before either is removed: allocation
+        // ids are plain rowids and get REUSED after a delete, so seeding them
+        // one at a time would hand both the same id and quietly turn this
+        // into a test of `INSERT OR REPLACE`.
+        let first = seed_placed_allocation(&store, "expiry-demo-1", "node-a")?;
+        let second = seed_placed_allocation(&store, "expiry-demo-2", "node-a")?;
+        assert_ne!(first.id, second.id);
+
+        store.remove_allocation_by_id_because(first.id, StopCause::Stop)?;
+        assert_eq!(store.stop_notices_for_node("node-a")?.len(), 1);
+
+        // Backdate the notice past the retention window. The read path must
+        // filter it even before anything prunes it, so a stale cause can
+        // never be served.
+        {
+            let conn = store.write_connection()?;
+            conn.execute(
+                "UPDATE allocation_stop_notice SET created_at_unix = ?1 WHERE allocation_id = ?2;",
+                params![
+                    OffsetDateTime::now_utc().unix_timestamp() - STOP_NOTICE_RETENTION_SECS - 1,
+                    first.id
+                ],
+            )?;
+        }
+        assert!(
+            store.stop_notices_for_node("node-a")?.is_empty(),
+            "an expired notice is filtered on read"
+        );
+
+        // The next removal's transaction is what actually deletes it: expiry
+        // rides scheduler-lane writes, never the heartbeat read path.
+        store.remove_allocation_by_id_because(second.id, StopCause::Stop)?;
+
+        let remaining: i64 = store.read_connection()?.query_row(
+            "SELECT COUNT(*) FROM allocation_stop_notice WHERE allocation_id = ?1;",
+            params![first.id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(remaining, 0, "the expired row was pruned by the next write");
+        assert_eq!(
+            store.stop_notices_for_node("node-a")?,
+            vec![(second.id, StopCause::Stop)],
+            "the live notice survives the prune"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn job_stop_and_drain_record_distinguishable_causes() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "ready"))?;
+        let allocation = seed_placed_allocation(&store, "cause-demo", "node-a")?;
+
+        // `job stop` — the whole point of Phase 1a is that this is no longer
+        // indistinguishable from a drain or an update on the wire.
+        store.remove_allocs_for_job("cause-demo")?;
+        assert_eq!(
+            store.stop_notices_for_node("node-a")?,
+            vec![(allocation.id, StopCause::Stop)]
+        );
+
+        // And the event journal carries it too.
+        let events = store.list_scheduler_events(&SchedulerEventFilter::default())?;
+        let removed = events
+            .iter()
+            .find(|event| event.kind == "allocation.removed")
+            .context("a removal event should have been recorded")?;
+        let meta: Value = serde_json::from_str(&removed.metadata_json)?;
+        assert_eq!(meta["cause"], json!("stop"));
         Ok(())
     }
 
@@ -15995,8 +16524,12 @@ mod tests {
         let store = setup_store()?;
 
         // Empty inputs are no-ops, so callers don't need their own guards.
-        store.events().allocations_removed_from_node("node-a", &[]);
-        store.events().allocations_removed_for_job("demo", 0);
+        store
+            .events()
+            .allocations_removed_from_node("node-a", &[], StopCause::NodeLost);
+        store
+            .events()
+            .allocations_removed_for_job("demo", 0, StopCause::Stop);
         assert!(drafts::allocations_placed("cfg-1", &[]).is_none());
         assert!(drafts::job_submit_outcome(
             "demo",

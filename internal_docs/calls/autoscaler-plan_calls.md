@@ -384,3 +384,30 @@ version bump in the one surface where users read version churn, undoing
 the distinction both plans exist to draw. Revisit if operators report
 missing scale activity in the jobs list; the cheap fix is a scale column
 there, not overloading the mtime.
+
+## 16. Scale-in reports its own stop cause rather than reusing `update`
+
+**Call.** (Implementation, 2026-07-30, surfaced merging with the stop-causes
+work.) Allocations retired by a scale-in record `StopCause::ScaleIn` — a new
+variant — and `retire_surplus_allocations` writes the notice in the same
+transaction that deletes the rows, like every other removal path.
+
+**The alternatives.** (a) Reuse `StopCause::Update`, the nearest existing
+variant, and add nothing to the vocabulary. (b) Leave the scale-in path
+recording no cause at all, letting it fall through to `unknown` — which is a
+documented, legitimate value.
+
+**The trade-off.** A wider wire vocabulary: an older worker that has never
+heard of `scale_in` maps it to `Unknown` and stops the task anyway. Every
+future removal path now also has to remember to record a cause, and there is
+no test that forces it (the invariant is a convention, not a compile error).
+
+**Why.** `update` means "replaced by a newer job config", and the entire
+premise of the count-override surface (entry 1) is that scaling produces no
+new config version — telling a task it is being replaced by a version that
+does not exist is a lie the task may act on. Option (b) silently violates the
+invariant the stop-causes work had just established, and `unknown` is meant
+for version skew and races, not for a path that knows perfectly well why it
+is removing something. The enum's own documentation settles the shape: "Add
+variants rather than repurposing existing ones," and the `from_wire`
+`Unknown` fallback exists precisely so adding one is safe under skew.

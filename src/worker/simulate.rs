@@ -659,6 +659,8 @@ async fn heartbeat_sim_node(
         failed_allocations: Vec::new(),
         allocation_health: Vec::new(),
         volume_reports: Vec::new(),
+        // Simulated nodes run no processes, so nothing ever terminates.
+        terminated_allocations: Vec::new(),
     }));
     let reply = client.clone().heartbeat(req).await?.into_inner();
     let desired: Vec<i64> = reply

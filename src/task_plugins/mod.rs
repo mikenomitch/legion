@@ -2,8 +2,8 @@ use crate::manager::rollout_strategy::validate_rollout_strategy_name;
 use crate::plugin_runtime::{plugin_paths, validate_manifest};
 use crate::prelude::*;
 use crate::structs::{
-    Allocation, InstanceMode, JobConfig, RolloutReplacement, TaskConfig, TaskDependencyCondition,
-    TaskLifecycle,
+    Allocation, InstanceMode, JobConfig, RolloutReplacement, StopCause, TaskConfig,
+    TaskDependencyCondition, TaskLifecycle,
 };
 use crate::util::plugin_root_dir;
 use jsonschema::JSONSchema;
@@ -14,6 +14,7 @@ use std::process::{Child, Command};
 
 mod container;
 mod exec;
+pub mod exec_isolation;
 mod exec_session;
 mod microvm;
 mod oci_bundle;
@@ -106,6 +107,26 @@ fn open_log_file(path: &std::path::Path) -> R<std::fs::File> {
         .append(true)
         .open(path)
         .with_context(|| format!("failed to open log file {}", path.display()))
+}
+
+/// Why a task is being stopped, handed to [`TaskPlugin::stop_with`].
+///
+/// Phase 1a carries the cause and nothing else — the shutdown itself is still
+/// immediate for every in-tree runtime. The struct exists now, ahead of the
+/// behavior, so the cause has a stable home to travel in and so Phase 1b can
+/// add `signal` and `deadline` without touching a single call site again.
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub struct StopContext {
+    /// Why the platform is stopping this allocation.
+    pub cause: StopCause,
+}
+
+impl StopContext {
+    /// A context carrying just a cause.
+    pub fn new(cause: StopCause) -> Self {
+        Self { cause }
+    }
 }
 
 /// Stops a task's tracked process: the child handle when this worker spawned
@@ -292,6 +313,21 @@ pub trait TaskPlugin: Send + Sync {
         false
     }
 
+    /// Whether the task's execution is a host process this worker tracks —
+    /// `TaskInstance.child` (a process we spawned) or `TaskInstance.pid` (one
+    /// we re-adopted after a worker restart). True means the worker's task
+    /// supervisor polls it for exit, reaps it, and applies the task's
+    /// `restart` policy (see `internal_docs/plans/host-process-supervision-plan.md`).
+    ///
+    /// Default `false`: a runtime that tracks no process would otherwise be
+    /// polled by a supervisor that can never observe its exit, and a `batch`
+    /// task of that runtime would never reach a terminal state. Runtimes whose
+    /// model is "one host process we spawned" (`exec`, `container`, `sandbox`)
+    /// override this to `true`.
+    fn supervises_process(&self) -> bool {
+        false
+    }
+
     /// Capability gate for the `artifacts` task field, mirroring
     /// `supports_kv_env_injection` and friends. Admission rejects
     /// artifact-bearing specs for runtimes that return false. Runtimes that return
@@ -375,6 +411,28 @@ pub trait TaskPlugin: Send + Sync {
         _instance: &mut TaskInstance,
     ) -> R<()> {
         Ok(())
+    }
+
+    /// Stop an allocation, told *why* it is being stopped.
+    ///
+    /// This is the form the worker calls. The default delegates to
+    /// [`TaskPlugin::stop`], so a runtime that does not care about the cause
+    /// — and every out-of-tree plugin compiled before this method existed —
+    /// keeps working untouched.
+    ///
+    /// Runtimes override this when the cause changes how they shut down. In
+    /// Phase 1a nothing does: [`StopContext`] carries the cause only, and
+    /// termination is still immediate for every in-tree runtime. Phase 1b
+    /// extends the context with a signal and a deadline, at which point the
+    /// exec and container runtimes grow real stop ladders here.
+    fn stop_with(
+        &self,
+        allocation: &Allocation,
+        task: &TaskConfig,
+        instance: &mut TaskInstance,
+        _ctx: &StopContext,
+    ) -> R<()> {
+        self.stop(allocation, task, instance)
     }
 
     fn destroy(
@@ -867,6 +925,53 @@ mod tests {
 
         let mode = std::fs::metadata(&log_dir)?.permissions().mode() & 0o777;
         assert_eq!(mode, 0o700, "log dir must be owner-only, got {mode:o}");
+        Ok(())
+    }
+
+    /// A plugin written before `stop_with` existed: it implements only
+    /// `stop`, exactly as every out-of-tree plugin compiled against the old
+    /// trait does.
+    #[derive(Default)]
+    struct LegacyStopPlugin {
+        stopped: std::sync::atomic::AtomicBool,
+    }
+
+    impl TaskPlugin for LegacyStopPlugin {
+        fn name(&self) -> &'static str {
+            "legacy-stop"
+        }
+
+        fn stop(
+            &self,
+            _allocation: &Allocation,
+            _task: &TaskConfig,
+            _instance: &mut TaskInstance,
+        ) -> R<()> {
+            self.stopped
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn stop_with_falls_back_to_stop_for_plugins_that_do_not_override_it() -> R<()> {
+        // The ABI promise of Phase 1a: adding the cause did NOT break any
+        // plugin. A runtime that only knows `stop` is still stopped.
+        let plugin = LegacyStopPlugin::default();
+        let mut instance = TaskInstance::default();
+        let ctx = StopContext::new(crate::structs::StopCause::Preempted);
+
+        plugin.stop_with(
+            &alloc(),
+            &TaskConfig::new("legacy-task", "legacy-stop"),
+            &mut instance,
+            &ctx,
+        )?;
+
+        assert!(
+            plugin.stopped.load(std::sync::atomic::Ordering::SeqCst),
+            "stop_with must delegate to stop when a plugin does not override it"
+        );
         Ok(())
     }
 

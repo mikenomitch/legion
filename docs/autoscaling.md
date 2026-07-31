@@ -112,6 +112,10 @@ the right to *redeploy*. See [auth-and-acls.md](auth-and-acls.md).
   record — the event journal is capped and best-effort.
 - `legion job scale <name>` with no `--count` prints the current override,
   spec count, and effective count.
+- Allocations retired by a scale-in report the `scale_in` stop cause to the
+  worker that ran them, and carry it in `allocation.removed` event metadata
+  ([graceful-stop.md](graceful-stop.md)) — so a task can tell "my replica
+  count shrank" apart from "I am being replaced by a new version".
 
 ## Failure modes
 
