@@ -593,6 +593,12 @@ pub(crate) fn build_jobspec_schema() -> Value {
             "task": { "$ref": "#/$defs/task", "description": "A single task (shorthand for tasks: [task])." },
             "tasks": { "type": "array", "items": { "$ref": "#/$defs/task" }, "description": "List of tasks." },
             "version": { "type": "integer", "description": "Optional jobspec version." },
+            "priority": {
+                "type": "string",
+                "enum": ["critical", "high", "elevated", "normal", "low", "background"],
+                "default": "normal",
+                "description": "Priority band, most important first. Orders the eval queue AND governs preemption: an allocation is only ever displaced by a job in a STRICTLY higher band, never a peer. Choosing a band below `normal` is the consent to be displaced. Claiming a band may require an ACL `bands` grant. See docs/preemption-and-eviction.md."
+            },
             "rollout": { "$ref": "#/$defs/rollout", "description": "Default rollout strategy for the job." },
             "rolloutByGroup": {
                 "type": "object",
@@ -628,7 +634,37 @@ pub(crate) fn build_jobspec_schema() -> Value {
                         }},
                         "description": "Task dependencies that gate start."
                     },
-                    "schedule": { "description": "Batch-only schedule (cron string or {every: duration})." }
+                    "schedule": { "description": "Batch-only schedule (cron string or {every: duration})." },
+                    "stop": {
+                        "type": "object",
+                        "description": "How the platform terminates this task, for every cause (job stop, rollout replacement, drain, reschedule, scale-in, preemption). See docs/graceful-stop.md.",
+                        "properties": {
+                            "signal": {
+                                "type": "string",
+                                "enum": ["SIGTERM", "SIGINT", "SIGQUIT", "SIGHUP", "SIGUSR1", "SIGUSR2"],
+                                "default": "SIGTERM",
+                                "description": "Notice signal, sent to the task's process group. SIGKILL is deliberately not offered: it is the end of the ladder, not a notice."
+                            },
+                            "killAfter": {
+                                "type": "string",
+                                "default": "30s",
+                                "description": "Grace between the signal and SIGKILL, e.g. \"30s\". Capped at 5m — grace may slow a drain, never wedge one."
+                            }
+                        }
+                    },
+                    "disruption": {
+                        "type": "object",
+                        "description": "Floor on how many of this task's allocations VOLUNTARY disruption (preemption) may leave running. Does not bind drain, node loss or job stop. See docs/preemption-and-eviction.md.",
+                        "properties": {
+                            "minAvailable": {
+                                "description": "Absolute count (2) or percent of count (\"50%\", rounded up). Default 0.",
+                                "oneOf": [
+                                    { "type": "integer", "minimum": 0 },
+                                    { "type": "string" }
+                                ]
+                            }
+                        }
+                    }
                 }
             },
             "rollout": {
@@ -648,7 +684,11 @@ pub(crate) fn priority_arg() -> Arg {
     Arg::new("priority")
         .long("priority")
         .value_name("PRIORITY")
-        .help("Priority to use for the request (higher runs sooner)")
+        .help(
+            "Eval-queue priority for this request only (higher runs sooner). Overrides the \
+             position implied by the job's `priority` band; it does not change the band, so \
+             it has no effect on preemption",
+        )
         .value_parser(value_parser!(i64))
         .conflicts_with("asap")
 }
@@ -1646,6 +1686,47 @@ async fn plan_job(arg_matches: &ArgMatches) -> R<()> {
             println!("Scheduling index:");
             for line in index_lines {
                 println!("  {line}");
+            }
+        }
+        // Who this submit would displace. Printed last and unmissably,
+        // because it is the one thing in a plan that costs somebody else
+        // something (S3 in the preemption plan: the submit becomes a
+        // decision, not a surprise).
+        if reply.preemptions.is_empty() {
+            if reply.preemption_mode == "off" {
+                println!(
+                    "Preemption: off for this cluster; a higher-band job cannot displace \
+                     lower-band work"
+                );
+            }
+        } else {
+            let verb = if reply.preemption_mode == "observe" {
+                "would preempt (mode: observe — nothing is evicted)"
+            } else {
+                "would preempt"
+            };
+            println!("Preemption: {verb}");
+            // Group by node so the output reads the way an operator thinks
+            // about it: "on node-d, these go".
+            let mut by_node: std::collections::BTreeMap<&str, Vec<&_>> =
+                std::collections::BTreeMap::new();
+            for victim in &reply.preemptions {
+                by_node
+                    .entry(victim.node_id.as_str())
+                    .or_default()
+                    .push(victim);
+            }
+            for (node_id, victims) in by_node {
+                for victim in victims {
+                    println!(
+                        "  {node_id}: {}/{} (alloc {}, priority {}) — {}s grace, requeued",
+                        victim.job_id,
+                        victim.task_name,
+                        victim.allocation_id,
+                        victim.band,
+                        victim.kill_after_seconds
+                    );
+                }
             }
         }
     }

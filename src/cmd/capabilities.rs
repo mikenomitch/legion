@@ -68,7 +68,7 @@ pub fn catalog() -> Vec<Capability> {
             name: "job.plan",
             cli: "legion job plan <PATH>",
             grpc: Some("Manager/PlanJob"),
-            summary: "Dry-run: preview which nodes allocations would land on.",
+            summary: "Dry-run: preview which nodes allocations would land on, and which running allocations the submit would preempt.",
             mutates: false,
             read_only_safe: true,
         },

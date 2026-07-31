@@ -249,6 +249,7 @@ fn test_node(id: &str) -> Node {
 
 fn test_job(name: &str, count: u32, version: u32) -> JobConfig {
     JobConfig {
+        priority: Default::default(),
         rollout: None,
         rollout_by_group: Default::default(),
         name: name.to_string(),

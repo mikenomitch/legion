@@ -80,6 +80,7 @@ fn submit_job(store: &Store, job: &JobConfig) -> String {
 
 fn job_named(name: &str, tasks: Vec<TaskConfig>) -> JobConfig {
     JobConfig {
+        priority: Default::default(),
         name: name.to_string(),
         tasks,
         rollout: None,
@@ -161,7 +162,7 @@ fn shadow_equivalence_holds_across_constraint_shapes() {
     let mut shadowed_tasks = 0;
     for job in &jobs {
         let id = submit_job(&store, job);
-        let (plan, report) = scheduler
+        let (plan, report, _preemptions) = scheduler
             .plan_only_with_report(&id, PlanMode::Fresh)
             .expect("plan");
         assert!(!plan.is_empty(), "{} must place", job.name);
@@ -210,7 +211,7 @@ fn truncation_kicks_in_and_still_places() {
     );
     let id = submit_job(&store, &job);
     let scheduler = Scheduler::new(&store).expect("scheduler");
-    let (plan, report) = scheduler
+    let (plan, report, _preemptions) = scheduler
         .plan_only_with_report(&id, PlanMode::Fresh)
         .expect("plan");
     assert_eq!(plan.len(), 3);
@@ -244,7 +245,7 @@ fn shadow_mode_stays_authoritative_and_agrees() {
     );
     let id = submit_job(&store, &job);
     let scheduler = Scheduler::new(&store).expect("scheduler");
-    let (plan, report) = scheduler
+    let (plan, report, _preemptions) = scheduler
         .plan_only_with_report(&id, PlanMode::Fresh)
         .expect("plan");
     assert_eq!(plan.len(), 4);
@@ -271,7 +272,7 @@ fn unusable_index_reports_a_reason_and_scans() {
     );
     let id = submit_job(&store, &job);
     let scheduler = Scheduler::new(&store).expect("scheduler");
-    let (plan, report) = scheduler
+    let (plan, report, _preemptions) = scheduler
         .plan_only_with_report(&id, PlanMode::Fresh)
         .expect("plan");
     assert_eq!(plan.len(), 2);
@@ -298,7 +299,7 @@ fn default_fit_index_arms_only_above_the_threshold() {
     );
     let id = submit_job(&store, &job);
     let scheduler = Scheduler::new(&store).expect("scheduler");
-    let (_, report) = scheduler
+    let (_, report, _preemptions) = scheduler
         .plan_only_with_report(&id, PlanMode::Fresh)
         .expect("plan");
     let usage = &report[0];
@@ -312,7 +313,7 @@ fn default_fit_index_arms_only_above_the_threshold() {
     }
     let id = submit_job(&store, &job);
     let scheduler = Scheduler::new(&store).expect("scheduler");
-    let (plan, report) = scheduler
+    let (plan, report, _preemptions) = scheduler
         .plan_only_with_report(&id, PlanMode::Fresh)
         .expect("plan");
     assert_eq!(plan.len(), 2);

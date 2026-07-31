@@ -33,9 +33,10 @@ use crate::structs::{
     GetRolloutStatusRequest, GetStateStoreSchemaRequest, GetVolumeRequest, JobConfig,
     ListEventsRequest, ListInstancesRequest, ListJobActionsRequest, ListJobTemplatesRequest,
     ListJobsRequest, ListRolloutsRequest, ListServicesRequest, ListVolumeDriversRequest,
-    ListVolumesRequest, QueryStateStoreRequest, RenderJobTemplateRequest, ReplaceInstanceRequest,
-    ResolveServiceRequest, RunJobRequest, RunJobTemplateRequest, SetNodeAvailabilityRequest,
-    StartInstanceRequest, StopInstanceRequest, StopJobRequest, UpsertJobTemplateRequest,
+    ListVolumesRequest, PlanJobRequest, QueryStateStoreRequest, RenderJobTemplateRequest,
+    ReplaceInstanceRequest, ResolveServiceRequest, RunJobRequest, RunJobTemplateRequest,
+    SetNodeAvailabilityRequest, StartInstanceRequest, StopInstanceRequest, StopJobRequest,
+    UpsertJobTemplateRequest,
 };
 use crate::task_plugins::validate_job_config;
 use serde::Serialize;
@@ -130,6 +131,17 @@ fn tool_defs() -> Vec<ToolDef> {
         ToolDef {
             name: "legion_job_validate",
             description: "Validate a rendered jobspec (JSON) without submitting it.",
+            input_schema: || json!({
+                "type": "object",
+                "properties": { "spec_json": { "type": "string", "description": "Rendered jobspec as a JSON string." } },
+                "required": ["spec_json"],
+                "additionalProperties": false
+            }),
+            mutates: false,
+        },
+        ToolDef {
+            name: "legion_job_plan",
+            description: "Dry-run a rendered jobspec: which nodes its allocations would land on, and — the reason to run this before submitting — which RUNNING allocations the submit would preempt, with their job, task, priority band and grace window. A non-empty `preemptions` list means the submit costs somebody else something; treat it as requiring confirmation. `preemption_mode` says whether an empty list means \"nothing would be displaced\" or \"preemption is off\".",
             input_schema: || json!({
                 "type": "object",
                 "properties": { "spec_json": { "type": "string", "description": "Rendered jobspec as a JSON string." } },
@@ -721,6 +733,11 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
         }
         "legion_job_schema" => Ok(crate::cmd::job::build_jobspec_schema()),
         "legion_job_validate" => validate_tool(args),
+        "legion_job_plan" => {
+            let parsed_jobspec = str_arg(&args, "spec_json")?;
+            let mut client = connect().await?;
+            grpc(client.plan_job(PlanJobRequest { parsed_jobspec })).await
+        }
         "legion_job_list" => {
             let mut client = connect().await?;
             grpc(client.list_jobs(ListJobsRequest::default())).await

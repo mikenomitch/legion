@@ -309,6 +309,7 @@ pub fn submit_jobs(store: &Store, scenario: &SchedulerScenario) -> anyhow::Resul
             }
 
             let job = JobConfig {
+                priority: Default::default(),
                 name: format!("bench-{}-{job_idx}", job_type.name),
                 tasks,
                 rollout: None,

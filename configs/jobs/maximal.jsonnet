@@ -1,6 +1,22 @@
 {
     name: "maximal-demo",
     version: 1,
+    // How important this job is, relative to everything else on the cluster
+    // (docs/preemption-and-eviction.md). One of, most important first:
+    //
+    //   critical   — never preempted; gate it with an ACL `bands` selector
+    //   high       — production work that pages someone when it stops
+    //   elevated   — matters more than the default, not on the paging path
+    //   normal     — the default; everything that does not say otherwise
+    //   low        — may be displaced when the cluster is full
+    //   background — first to go; no completion expectation at all
+    //
+    // The band does two things with one field: it sets the job's default
+    // eval-queue priority (90/70/60/50/30/15), and it governs preemption.
+    // Preemption is strictly CROSS-band — an allocation is only ever a victim
+    // of a job in a STRICTLY higher band, never a peer — so choosing a band
+    // below `normal` is the consent to be displaced.
+    priority: "high",
     rollout: {
         strategy: "default",
         progression: "auto",
@@ -291,6 +307,30 @@
                 delay: "5s",
                 // Exit codes counted as success. Default [0].
                 successExitCodes: [0],
+            },
+            // How the platform terminates this task, whoever initiates it:
+            // `job stop`, a rollout replacement, a drain, a reschedule, a
+            // scale-in, or preemption all use this one ladder
+            // (docs/graceful-stop.md). Both fields are optional.
+            stop: {
+                // The notice signal. One of SIGTERM (default), SIGINT,
+                // SIGQUIT, SIGHUP, SIGUSR1, SIGUSR2. SIGKILL is deliberately
+                // not offered: it is the end of the ladder, not a notice.
+                signal: "SIGTERM",
+                // Grace between the signal and SIGKILL. Default 30s, capped
+                // at 5m — grace may slow a drain, never wedge one.
+                killAfter: "30s",
+            },
+            // A floor on how many of this task's allocations VOLUNTARY
+            // disruption may take (docs/preemption-and-eviction.md).
+            // Preemption is the only consumer today. Deliberately does not
+            // bind drain, node loss or `job stop`: a floor that can block
+            // maintenance is the documented cluster-wedge.
+            disruption: {
+                // Absolute count (2) or percent of count ("50%"). Percentages
+                // round UP: "50%" of 5 protects 3. Default 0 — choosing a
+                // preemptible band donates the whole task.
+                minAvailable: "50%",
             },
             affinities: [
                 {

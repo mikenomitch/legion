@@ -70,6 +70,21 @@ into a single series with every label set to `"other"`.
   submissions applied to the store; `outcome` is `applied` or `rejected`
   (rejections are optimistic-concurrency epoch conflicts or late constraint
   failures — see docs/scheduler-and-eval-loop.md).
+- **`legion_preemptions_total{pool, band}`** (counter) — allocations evicted
+  by scheduler preemption, labelled by the victim's node pool and its
+  priority band. Rate on this is the number to alert on: preemption of
+  production-adjacent bands should be rare, and a rising rate in a `low` band
+  is a capacity signal rather than an incident
+  (docs/preemption-and-eviction.md).
+- **`legion_preemption_plans_total{outcome}`** (counter) — preemption passes
+  that reached a decision. `placed` means victims were evicted and the
+  preemptor placed; `observe` means the pass ran under
+  `preemption.mode: observe` and committed nothing; `no_victims` means
+  preemption was enabled, ran, and still found nothing it was allowed to take.
+  Comparing `observe` against zero is how an operator sizes the blast radius
+  before switching to `enforce`; a rising `no_victims` is a capacity signal —
+  work is failing to place and the scheduler has already exhausted its
+  displacement options.
 - **`legion_scheduler_plan_phase_seconds{phase}`** (histogram) — per-phase
   wall-clock of every `plan_and_apply`, phases in execution order:
   `available_nodes` (node snapshot fetch), `version_sample` (the

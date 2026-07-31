@@ -31,6 +31,47 @@ pub use schema_docs::{
     validate_builtin_task_plugin_schemas,
 };
 
+/// Generation of the `TaskPlugin` vtable that a dynamically loaded plugin
+/// must have been compiled against.
+///
+/// `plugins/tasks/` is a public extension point loaded through a bare
+/// `extern "C" fn() -> Box<dyn TaskPlugin>`, which carries no type
+/// information: a dylib built against an older trait layout would load
+/// happily and then call the wrong slots. Bumping this constant — and the
+/// [`declare_task_plugin_abi!`] symbol every plugin exports — turns that
+/// silent corruption into a load-time error naming the fix.
+///
+/// - `1` — the trait as of Phase 1a (`stop_with(..) -> R<()>`), which no
+///   plugin ever needed to override because the cause was informational.
+/// - `2` — graceful stop (Phase 1b): `stop_with` returns `R<bool>` ("a notice
+///   was delivered; the process is still running") and [`StopContext`] gained
+///   `signal`, `deadline` and `grace`.
+pub const TASK_PLUGIN_ABI_VERSION: u32 = 2;
+
+/// Symbol name the loader looks for. A plugin declares it with
+/// [`declare_task_plugin_abi!`].
+const TASK_PLUGIN_ABI_SYMBOL: &[u8] = b"legion_task_plugin_abi_version";
+
+/// Export the task-plugin ABI generation this plugin was compiled against.
+/// Every dylib under `plugins/tasks/<name>/` must invoke this once, next to
+/// its `get` constructor.
+///
+/// ```ignore
+/// legion::declare_task_plugin_abi!();
+///
+/// #[no_mangle]
+/// pub extern "C" fn get() -> Box<dyn TaskPlugin> { Box::new(MyPlugin) }
+/// ```
+#[macro_export]
+macro_rules! declare_task_plugin_abi {
+    () => {
+        #[no_mangle]
+        pub extern "C" fn legion_task_plugin_abi_version() -> u32 {
+            $crate::task_plugins::TASK_PLUGIN_ABI_VERSION
+        }
+    };
+}
+
 pub fn spawn_task_process(cmd: &mut Command) -> R<Child> {
     #[cfg(unix)]
     {
@@ -109,23 +150,142 @@ fn open_log_file(path: &std::path::Path) -> R<std::fs::File> {
         .with_context(|| format!("failed to open log file {}", path.display()))
 }
 
-/// Why a task is being stopped, handed to [`TaskPlugin::stop_with`].
+/// Why — and how — a task is being stopped, handed to
+/// [`TaskPlugin::stop_with`].
 ///
-/// Phase 1a carries the cause and nothing else — the shutdown itself is still
-/// immediate for every in-tree runtime. The struct exists now, ahead of the
-/// behavior, so the cause has a stable home to travel in and so Phase 1b can
-/// add `signal` and `deadline` without touching a single call site again.
-#[derive(Debug, Clone, Default)]
+/// `stop_with` is the **notice**, not the kill: a runtime delivers `signal`
+/// and returns promptly. The worker keeps the allocation in a terminating set
+/// until the process actually exits, or until `deadline` passes and
+/// [`TaskPlugin::destroy`] takes it out hard. A runtime must never block for
+/// the grace window itself — `stop_with` runs under the task-manager mutex
+/// that the heartbeat, the self-fence watchdog and health reporting all need
+/// (see `internal_docs/plans/preemption-and-eviction-plan.md` § Phase 1b).
+#[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct StopContext {
     /// Why the platform is stopping this allocation.
     pub cause: StopCause,
+    /// The notice signal to deliver (`stop.signal`, default `SIGTERM`).
+    pub signal: String,
+    /// When the grace window closes. After this instant the worker's reaper
+    /// hard-destroys whatever is left.
+    pub deadline: std::time::Instant,
+    /// How long the grace window is, from the moment the signal is sent.
+    /// Carried alongside `deadline` because it is the value a runtime hands
+    /// to a stop-with-timeout API (`runc kill` + wait, a container CLI's
+    /// `--time`), where an absolute instant is not expressible.
+    pub grace: std::time::Duration,
+}
+
+impl Default for StopContext {
+    fn default() -> Self {
+        Self::new(StopCause::default())
+    }
 }
 
 impl StopContext {
-    /// A context carrying just a cause.
+    /// A context with the default ladder (`SIGTERM`, 30s), for callers that
+    /// have no task config to hand — test helpers and the legacy `stop()`
+    /// bridge.
     pub fn new(cause: StopCause) -> Self {
-        Self { cause }
+        Self::with_ladder(cause, "SIGTERM", std::time::Duration::from_secs(30))
+    }
+
+    /// A context carrying an explicit ladder, as the worker builds it from
+    /// the task's `stop` block.
+    pub fn with_ladder(cause: StopCause, signal: &str, grace: std::time::Duration) -> Self {
+        Self {
+            cause,
+            signal: signal.to_string(),
+            deadline: std::time::Instant::now() + grace,
+            grace,
+        }
+    }
+
+    /// Whether the grace window has closed.
+    pub fn expired(&self) -> bool {
+        std::time::Instant::now() >= self.deadline
+    }
+}
+
+/// The portable signal numbers behind [`crate::structs::STOP_SIGNALS`].
+/// Kept here rather than pulled from `libc` so the mapping is identical on
+/// every platform the worker builds for, including the non-Unix builds where
+/// signalling degrades to a hard kill.
+pub(crate) fn stop_signal_number(signal: &str) -> Option<i32> {
+    match signal {
+        "SIGHUP" => Some(1),
+        "SIGINT" => Some(2),
+        "SIGQUIT" => Some(3),
+        "SIGTERM" => Some(15),
+        "SIGUSR1" => Some(10),
+        "SIGUSR2" => Some(12),
+        _ => None,
+    }
+}
+
+/// Deliver a stop notice signal to a task's tracked process, without waiting.
+///
+/// Returns `true` when a signal was actually delivered. `false` means the
+/// caller should fall back to a hard stop: there is no process to signal, the
+/// platform has no signals, or the signal name is not one Legion delivers.
+///
+/// Unlike [`reap_task_process`] this leaves `instance.child` / `instance.pid`
+/// in place — the process is still running, the worker's supervisor still
+/// polls it for exit, and the reaper still needs the handle to kill it at the
+/// deadline.
+pub(crate) fn signal_task_process(
+    allocation_id: i64,
+    task_name: &str,
+    instance: &TaskInstance,
+    runtime: &str,
+    signal: &str,
+) -> bool {
+    let Some(pid) = instance
+        .child
+        .as_ref()
+        .map(|child| child.id())
+        .or(instance.pid)
+    else {
+        return false;
+    };
+    let Some(number) = stop_signal_number(signal) else {
+        warn!(
+            allocation_id,
+            task_name, runtime, signal, "Unknown stop signal; falling back to a hard stop"
+        );
+        return false;
+    };
+
+    #[cfg(unix)]
+    {
+        // Tasks are spawned into their own session (`setsid` in
+        // `spawn_task_process`), so signalling the process GROUP reaches a
+        // shell-wrapped task's children too — the common case where the
+        // tracked pid is `sh -c` and the real workload is its child. A
+        // negative pid is the POSIX spelling for "the group".
+        let delivered = unsafe { libc::kill(-(pid as i32), number) } == 0
+            || unsafe { libc::kill(pid as i32, number) } == 0;
+        if delivered {
+            info!(
+                allocation_id,
+                task_name, runtime, pid, signal, "Sent stop signal to task process"
+            );
+        } else {
+            // ESRCH — already gone. That is a successful stop, and the
+            // reaper will notice the exit on its next tick.
+            debug!(
+                allocation_id,
+                task_name, runtime, pid, signal, "Task process was already gone when signalled"
+            );
+        }
+        // Either way there is nothing left to hard-kill right now.
+        true
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (allocation_id, task_name, runtime, number, pid);
+        false
     }
 }
 
@@ -413,26 +573,48 @@ pub trait TaskPlugin: Send + Sync {
         Ok(())
     }
 
-    /// Stop an allocation, told *why* it is being stopped.
+    /// Begin stopping an allocation, told *why* and *how*.
     ///
-    /// This is the form the worker calls. The default delegates to
-    /// [`TaskPlugin::stop`], so a runtime that does not care about the cause
-    /// — and every out-of-tree plugin compiled before this method existed —
-    /// keeps working untouched.
+    /// This is the form the worker calls, and it is the **notice**, not the
+    /// kill: deliver `ctx.signal` and return promptly. Returning `Ok(true)`
+    /// means "a notice was delivered, the process is still running" — the
+    /// worker then holds the allocation in its terminating set until the
+    /// process exits or `ctx.deadline` passes, and calls
+    /// [`TaskPlugin::destroy`] at whichever comes first. `Ok(false)` means
+    /// the runtime could not signal (no tracked process, no signal support)
+    /// and the worker should tear down immediately, exactly as it did before
+    /// graceful stop existed.
     ///
-    /// Runtimes override this when the cause changes how they shut down. In
-    /// Phase 1a nothing does: [`StopContext`] carries the cause only, and
-    /// termination is still immediate for every in-tree runtime. Phase 1b
-    /// extends the context with a signal and a deadline, at which point the
-    /// exec and container runtimes grow real stop ladders here.
+    /// **Never block for the grace window here.** `stop_with` runs under the
+    /// worker's task-manager mutex, which the heartbeat, the self-fence
+    /// watchdog, health reporting and log maintenance all need; holding it
+    /// for 30s would let the manager declare the node lost and reschedule
+    /// everything on it.
+    ///
+    /// The default delivers the signal through the shared host-process path,
+    /// which is right for every runtime whose execution model is "one process
+    /// we spawned". A runtime with its own shutdown protocol (containers,
+    /// microVMs) overrides. An out-of-tree plugin compiled before this method
+    /// existed keeps its old behavior: it inherits this default, which falls
+    /// back to `Ok(false)` -> immediate `stop()` + `destroy()` when it tracks
+    /// no host process.
     fn stop_with(
         &self,
         allocation: &Allocation,
         task: &TaskConfig,
         instance: &mut TaskInstance,
-        _ctx: &StopContext,
-    ) -> R<()> {
-        self.stop(allocation, task, instance)
+        ctx: &StopContext,
+    ) -> R<bool> {
+        if !self.supervises_process() {
+            return Ok(false);
+        }
+        Ok(signal_task_process(
+            allocation.id,
+            &task.name,
+            instance,
+            self.name(),
+            &ctx.signal,
+        ))
     }
 
     fn destroy(
@@ -517,6 +699,8 @@ pub fn validate_job_config(config: &JobConfig) -> R<()> {
         task.validate_identities()?;
         task.validate_artifacts()?;
         task.validate_actions()?;
+        task.validate_stop()?;
+        task.validate_disruption()?;
         if !task.artifacts.is_empty() {
             registry.load_plugin(&task.runtime, false)?;
             let plugin = registry
@@ -838,6 +1022,7 @@ fn load_task_plugin(name: &str) -> R<LoadedTaskPlugin> {
             let path = paths.dylib.to_string_lossy().into_owned();
             unsafe {
                 let lib = Library::new(&path)?;
+                check_task_plugin_abi(&lib, other)?;
                 let plugin = {
                     let func: Symbol<unsafe extern "C" fn() -> Box<dyn TaskPlugin>> =
                         lib.get(b"get")?;
@@ -846,6 +1031,33 @@ fn load_task_plugin(name: &str) -> R<LoadedTaskPlugin> {
                 Ok(LoadedTaskPlugin::new(plugin, Some(lib)))
             }
         }
+    }
+}
+
+/// Refuse a dylib whose `TaskPlugin` vtable predates this build.
+///
+/// A missing symbol is treated as a mismatch, not as "assume compatible":
+/// every plugin that predates [`TASK_PLUGIN_ABI_VERSION`] also predates the
+/// trait changes the constant exists to guard, so the two cases need the same
+/// answer. Both produce an error that names the rebuild.
+unsafe fn check_task_plugin_abi(lib: &Library, name: &str) -> R<()> {
+    let declared: Option<u32> = lib
+        .get::<unsafe extern "C" fn() -> u32>(TASK_PLUGIN_ABI_SYMBOL)
+        .ok()
+        .map(|symbol| symbol());
+    match declared {
+        Some(version) if version == TASK_PLUGIN_ABI_VERSION => Ok(()),
+        Some(version) => bail!(
+            "task plugin {name} was built against task-plugin ABI {version}, but this \
+             manager/worker speaks ABI {TASK_PLUGIN_ABI_VERSION}. Rebuild the plugin against \
+             this Legion version (see docs/task-runtime-plugins.md)"
+        ),
+        None => bail!(
+            "task plugin {name} declares no task-plugin ABI version, so it predates ABI \
+             {TASK_PLUGIN_ABI_VERSION} and its TaskPlugin vtable cannot be trusted. Add \
+             `legion::declare_task_plugin_abi!();` beside the plugin's `get` constructor and \
+             rebuild (see docs/task-runtime-plugins.md)"
+        ),
     }
 }
 
@@ -954,14 +1166,19 @@ mod tests {
     }
 
     #[test]
-    fn stop_with_falls_back_to_stop_for_plugins_that_do_not_override_it() -> R<()> {
-        // The ABI promise of Phase 1a: adding the cause did NOT break any
-        // plugin. A runtime that only knows `stop` is still stopped.
+    fn a_plugin_that_supervises_no_process_declines_the_stop_notice() -> R<()> {
+        // Phase 1b changed what `stop_with` means: it is now "deliver the
+        // notice and return", reporting whether a notice was actually
+        // delivered. A runtime that tracks no host process cannot deliver
+        // one, and says so — which is the signal the worker uses to tear the
+        // allocation down immediately, exactly as it did before grace
+        // existed. `stop()` is still what stops it; the difference is that
+        // the worker now calls it via `destroy` rather than via `stop_with`.
         let plugin = LegacyStopPlugin::default();
         let mut instance = TaskInstance::default();
         let ctx = StopContext::new(crate::structs::StopCause::Preempted);
 
-        plugin.stop_with(
+        let signalled = plugin.stop_with(
             &alloc(),
             &TaskConfig::new("legacy-task", "legacy-stop"),
             &mut instance,
@@ -969,10 +1186,55 @@ mod tests {
         )?;
 
         assert!(
-            plugin.stopped.load(std::sync::atomic::Ordering::SeqCst),
-            "stop_with must delegate to stop when a plugin does not override it"
+            !signalled,
+            "a runtime with no tracked process must report that no notice was delivered"
         );
         Ok(())
+    }
+
+    #[test]
+    fn the_stop_context_carries_the_whole_ladder() {
+        let ctx = StopContext::with_ladder(
+            crate::structs::StopCause::Preempted,
+            "SIGQUIT",
+            std::time::Duration::from_secs(45),
+        );
+        assert_eq!(ctx.signal, "SIGQUIT");
+        assert_eq!(ctx.grace, std::time::Duration::from_secs(45));
+        assert!(!ctx.expired(), "a fresh 45s window is not expired");
+
+        // The zero-grace case is the degenerate ladder a `killAfter: 0s`
+        // would produce: the deadline is already here, so the reaper takes it
+        // on its next tick rather than waiting.
+        let immediate = StopContext::with_ladder(
+            crate::structs::StopCause::Stop,
+            "SIGTERM",
+            std::time::Duration::ZERO,
+        );
+        assert!(immediate.expired());
+    }
+
+    #[test]
+    fn stop_signals_map_to_their_portable_numbers() {
+        // The mapping is hard-coded rather than pulled from libc so it is
+        // identical on every platform the worker builds for.
+        assert_eq!(stop_signal_number("SIGTERM"), Some(15));
+        assert_eq!(stop_signal_number("SIGINT"), Some(2));
+        assert_eq!(stop_signal_number("SIGQUIT"), Some(3));
+        assert_eq!(stop_signal_number("SIGHUP"), Some(1));
+        assert_eq!(stop_signal_number("SIGUSR1"), Some(10));
+        assert_eq!(stop_signal_number("SIGUSR2"), Some(12));
+        // SIGKILL is deliberately absent: it is the END of the ladder, not a
+        // notice, and letting a task ask for it as `stop.signal` would mean
+        // opting into no grace at all while looking like it had some.
+        assert_eq!(stop_signal_number("SIGKILL"), None);
+        // Every signal the jobspec accepts must be deliverable.
+        for signal in crate::structs::STOP_SIGNALS {
+            assert!(
+                stop_signal_number(signal).is_some(),
+                "{signal} is offered in the jobspec but cannot be delivered"
+            );
+        }
     }
 
     #[test]
@@ -1055,6 +1317,7 @@ mod tests {
     #[test]
     fn service_task_cannot_depend_on_service_completion() {
         let config = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "invalid".into(),
@@ -1116,6 +1379,7 @@ mod tests {
     #[test]
     fn non_batch_task_cannot_define_schedule() {
         let config = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "invalid".into(),
@@ -1137,6 +1401,7 @@ mod tests {
     #[test]
     fn sidecar_requires_primary_in_group() {
         let config = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "invalid".into(),
@@ -1156,6 +1421,7 @@ mod tests {
     #[test]
     fn validates_default_rollout_strategy() -> R<()> {
         let config = JobConfig {
+            priority: Default::default(),
             rollout: Some(crate::structs::RolloutConfig {
                 strategy: Some("default".into()),
                 ..Default::default()
@@ -1176,6 +1442,7 @@ mod tests {
     #[test]
     fn rejects_unknown_rollout_strategy() {
         let config = JobConfig {
+            priority: Default::default(),
             rollout: Some(crate::structs::RolloutConfig {
                 strategy: Some("does-not-exist".into()),
                 ..Default::default()
@@ -1211,6 +1478,7 @@ mod tests {
     #[test]
     fn rejects_create_first_rollout_on_stateful_task() {
         let config = JobConfig {
+            priority: Default::default(),
             rollout: Some(crate::structs::RolloutConfig {
                 replacement: Some(RolloutReplacement::CreateFirst),
                 ..Default::default()
@@ -1233,6 +1501,7 @@ mod tests {
     fn allows_stop_first_rollout_on_stateful_task() -> R<()> {
         // Default (stop-first) replacement on a stateful task is fine.
         let config = JobConfig {
+            priority: Default::default(),
             rollout: Some(crate::structs::RolloutConfig {
                 replacement: Some(RolloutReplacement::DestroyFirst),
                 ..Default::default()
@@ -1246,6 +1515,7 @@ mod tests {
 
         // No rollout block at all is also fine.
         let no_rollout = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "stateful-norollout".into(),
@@ -1266,6 +1536,7 @@ mod tests {
     #[test]
     fn accepts_sequential_slots_rollout_on_slot_group() -> R<()> {
         let config = JobConfig {
+            priority: Default::default(),
             rollout: Some(crate::structs::RolloutConfig {
                 slots: Some(sequential_slots(Some(1))),
                 ..Default::default()
@@ -1282,6 +1553,7 @@ mod tests {
     fn rejects_slots_rollout_on_group_without_slot_task() {
         // Stateless group.
         let config = JobConfig {
+            priority: Default::default(),
             rollout: Some(crate::structs::RolloutConfig {
                 slots: Some(sequential_slots(None)),
                 ..Default::default()
@@ -1302,6 +1574,7 @@ mod tests {
 
         // Keyed-mode stateful group is also not a slot pool.
         let keyed = JobConfig {
+            priority: Default::default(),
             rollout: Some(crate::structs::RolloutConfig {
                 slots: Some(sequential_slots(None)),
                 ..Default::default()
@@ -1329,6 +1602,7 @@ mod tests {
     fn rejects_update_from_at_or_above_slot_count() {
         // stateful_slot_task() has count 2; updateFrom 2 would update nothing.
         let config = JobConfig {
+            priority: Default::default(),
             rollout: Some(crate::structs::RolloutConfig {
                 slots: Some(sequential_slots(Some(2))),
                 ..Default::default()
@@ -1350,6 +1624,7 @@ mod tests {
         // Global slots apply to every group; the stateless `web` group makes
         // the spec invalid, with a pointer at rolloutByGroup scoping.
         let config = JobConfig {
+            priority: Default::default(),
             rollout: Some(crate::structs::RolloutConfig {
                 slots: Some(sequential_slots(None)),
                 ..Default::default()
@@ -1374,6 +1649,7 @@ mod tests {
 
         // Scoping the slots block to the slot group fixes it.
         let scoped = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: std::collections::BTreeMap::from([(
                 "default".to_string(),
@@ -1408,6 +1684,7 @@ mod tests {
 
     fn job_with(task: TaskConfig) -> JobConfig {
         JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "identity-job".into(),

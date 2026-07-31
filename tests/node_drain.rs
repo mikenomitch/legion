@@ -190,6 +190,7 @@ fn make_node(id: &str) -> Node {
 
 fn stateless_job(name: &str, count: u32, constraints: serde_json::Value) -> JobConfig {
     JobConfig {
+        priority: Default::default(),
         rollout: None,
         rollout_by_group: Default::default(),
         name: name.to_string(),

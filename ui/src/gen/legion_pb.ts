@@ -213,6 +213,40 @@ export class WorkerConfig extends Message<WorkerConfig> {
    */
   hostVolumes = "";
 
+  /**
+   * How often this worker heartbeats the manager, in seconds (worker-type
+   * config `heartbeatSeconds`). Workers clamp the value to 1..=30 and add
+   * ±10% jitter per beat. The manager marks a node lost after 10s without
+   * a heartbeat, so values above ~3 trade detection margin for load; the
+   * manager logs a warning when serving such a config. At large fleets the
+   * cadence is the manager-load knob: 10k workers at the default 2s is
+   * 5,000 heartbeats/second.
+   *
+   * Default: unset (workers use the built-in 2s default).
+   *
+   * @generated from field: optional uint32 heartbeat_seconds = 11;
+   */
+  heartbeatSeconds?: number;
+
+  /**
+   * JSON-encoded resource-enforcement settings for this worker (see
+   * docs/task-supervision.md). Shape:
+   * `{"enabled":true,"cgroupParent":"legion"}`.
+   *
+   * When enabled, a Linux worker puts each `exec` task in a cgroup v2 subtree
+   * it creates under `cgroupParent` and writes the task's `resources` there as
+   * real limits (`memory.max`, `cpu.max`), instead of treating them as
+   * scheduling arithmetic only. Off by default: turning declared resources
+   * into kernel limits can OOM-kill a workload whose declaration was only ever
+   * an estimate, so it is a deliberate per-worker choice.
+   *
+   * Default: empty string (enforcement off; `resources` stays advisory for
+   * `exec` tasks).
+   *
+   * @generated from field: string resource_enforcement = 12;
+   */
+  resourceEnforcement = "";
+
   constructor(data?: PartialMessage<WorkerConfig>) {
     super();
     proto3.util.initPartial(data, this);
@@ -231,6 +265,8 @@ export class WorkerConfig extends Message<WorkerConfig> {
     { no: 8, name: "max_allocations", kind: "scalar", T: 13 /* ScalarType.UINT32 */, opt: true },
     { no: 9, name: "artifacts", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 10, name: "host_volumes", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 11, name: "heartbeat_seconds", kind: "scalar", T: 13 /* ScalarType.UINT32 */, opt: true },
+    { no: 12, name: "resource_enforcement", kind: "scalar", T: 9 /* ScalarType.STRING */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): WorkerConfig {
@@ -571,11 +607,16 @@ export class RunJobRequest extends Message<RunJobRequest> {
   submissions: Submission[] = [];
 
   /**
-   * Optional eval priority override.
+   * Optional eval-queue priority override for THIS submission.
    *
-   * Higher values are processed sooner in the eval queue.
-   * Default when omitted: manager `default_priority`
-   * (`50` in built-in config defaults).
+   * Higher values are processed sooner in the eval queue. This overrides the
+   * queue position only; it does not change the job's priority band, and so
+   * it has no effect on preemption.
+   *
+   * Default when omitted: the eval priority implied by the jobspec's
+   * `priority` band — `critical` 90, `high` 70, `elevated` 60, `normal` 50,
+   * `low` 30, `background` 15 — falling back to the manager's
+   * `defaultPriority` (50) for a job whose band cannot be resolved.
    *
    * @generated from field: optional int64 priority = 3;
    */
@@ -3250,6 +3291,34 @@ export class PlanJobReply extends Message<PlanJobReply> {
    */
   indexUsage: TaskIndexUsage[] = [];
 
+  /**
+   * Allocations this plan would displace to make room for `allocations`.
+   *
+   * Empty when the plan places without preemption, which is the common case:
+   * the preemption pass only runs for a task that could not otherwise be
+   * placed. Populated in `enforce` mode (what a submit would evict) and in
+   * `observe` mode (what enforce mode *would* evict, given that observe
+   * commits nothing) — so the preview answers the same question either way.
+   *
+   * This is a plan against a snapshot, not a reservation. The real submit
+   * re-plans, so the victims it takes may differ if the cluster moved in
+   * between. See docs/preemption-and-eviction.md.
+   *
+   * @generated from field: repeated legion.PlannedPreemption preemptions = 6;
+   */
+  preemptions: PlannedPreemption[] = [];
+
+  /**
+   * The cluster's preemption mode at plan time: `enforce`, `observe` or
+   * `off`. Present so a client can explain an empty `preemptions` list —
+   * "nothing needed displacing" and "preemption is off" look identical
+   * otherwise, which is exactly the discoverability failure this field
+   * exists to prevent.
+   *
+   * @generated from field: string preemption_mode = 7;
+   */
+  preemptionMode = "";
+
   constructor(data?: PartialMessage<PlanJobReply>) {
     super();
     proto3.util.initPartial(data, this);
@@ -3263,6 +3332,8 @@ export class PlanJobReply extends Message<PlanJobReply> {
     { no: 3, name: "matches_existing", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
     { no: 4, name: "same_content", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
     { no: 5, name: "index_usage", kind: "message", T: TaskIndexUsage, repeated: true },
+    { no: 6, name: "preemptions", kind: "message", T: PlannedPreemption, repeated: true },
+    { no: 7, name: "preemption_mode", kind: "scalar", T: 9 /* ScalarType.STRING */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): PlanJobReply {
@@ -3279,6 +3350,89 @@ export class PlanJobReply extends Message<PlanJobReply> {
 
   static equals(a: PlanJobReply | PlainMessage<PlanJobReply> | undefined, b: PlanJobReply | PlainMessage<PlanJobReply> | undefined): boolean {
     return proto3.util.equals(PlanJobReply, a, b);
+  }
+}
+
+/**
+ * One allocation a plan would displace.
+ *
+ * @generated from message legion.PlannedPreemption
+ */
+export class PlannedPreemption extends Message<PlannedPreemption> {
+  /**
+   * Node the victim runs on, which is also the node the preemptor would be
+   * placed on: preemption only ever frees the node it places onto.
+   *
+   * @generated from field: string node_id = 1;
+   */
+  nodeId = "";
+
+  /**
+   * Victim's job name.
+   *
+   * @generated from field: string job_id = 2;
+   */
+  jobId = "";
+
+  /**
+   * Victim's task name.
+   *
+   * @generated from field: string task_name = 3;
+   */
+  taskName = "";
+
+  /**
+   * Victim's priority band. Always strictly below the preempting job's.
+   *
+   * @generated from field: string band = 4;
+   */
+  band = "";
+
+  /**
+   * Victim's allocation ID.
+   *
+   * @generated from field: int64 allocation_id = 5;
+   */
+  allocationId = protoInt64.zero;
+
+  /**
+   * The victim's `stop.killAfter` in seconds — how long it gets between the
+   * stop signal and SIGKILL (docs/graceful-stop.md).
+   *
+   * @generated from field: uint64 kill_after_seconds = 6;
+   */
+  killAfterSeconds = protoInt64.zero;
+
+  constructor(data?: PartialMessage<PlannedPreemption>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.PlannedPreemption";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "node_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "job_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "task_name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "band", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 5, name: "allocation_id", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 6, name: "kill_after_seconds", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): PlannedPreemption {
+    return new PlannedPreemption().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): PlannedPreemption {
+    return new PlannedPreemption().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): PlannedPreemption {
+    return new PlannedPreemption().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: PlannedPreemption | PlainMessage<PlannedPreemption> | undefined, b: PlannedPreemption | PlainMessage<PlannedPreemption> | undefined): boolean {
+    return proto3.util.equals(PlannedPreemption, a, b);
   }
 }
 
@@ -3362,6 +3516,20 @@ export class TaskIndexUsage extends Message<TaskIndexUsage> {
    */
   reason = "";
 
+  /**
+   * When bounded candidate scoring engaged for any of this task's
+   * placements (the fleet-size threshold in the manager's
+   * `schedulerSettings.score_sample` was met), the number of eligible
+   * nodes actually scored per placement: the placement is the best of
+   * this many uniformly drawn feasible candidates rather than of every
+   * feasible node. 0 means every placement was scored exactly.
+   * Feasibility (constraints, permits, resources) is never sampled — a
+   * sampled placement is always a valid one.
+   *
+   * @generated from field: uint32 score_sampled = 10;
+   */
+  scoreSampled = 0;
+
   constructor(data?: PartialMessage<TaskIndexUsage>) {
     super();
     proto3.util.initPartial(data, this);
@@ -3379,6 +3547,7 @@ export class TaskIndexUsage extends Message<TaskIndexUsage> {
     { no: 7, name: "fell_back", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
     { no: 8, name: "shadow_agreement", kind: "scalar", T: 8 /* ScalarType.BOOL */, opt: true },
     { no: 9, name: "reason", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 10, name: "score_sampled", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): TaskIndexUsage {
@@ -3564,6 +3733,353 @@ export class StopJobReply extends Message<StopJobReply> {
 
   static equals(a: StopJobReply | PlainMessage<StopJobReply> | undefined, b: StopJobReply | PlainMessage<StopJobReply> | undefined): boolean {
     return proto3.util.equals(StopJobReply, a, b);
+  }
+}
+
+/**
+ * Request payload for ScaleTask (docs/autoscaling.md).
+ *
+ * @generated from message legion.ScaleTaskRequest
+ */
+export class ScaleTaskRequest extends Message<ScaleTaskRequest> {
+  /**
+   * Job name.
+   *
+   * @generated from field: string name = 1;
+   */
+  name = "";
+
+  /**
+   * Task group, when the job has more than one scalable task. Optional:
+   * a job with exactly one scalable task needs neither selector; an
+   * ambiguous request is rejected with the candidate list.
+   *
+   * @generated from field: optional string task_group = 2;
+   */
+  taskGroup?: string;
+
+  /**
+   * Task name, same rules as `task_group`.
+   *
+   * @generated from field: optional string task_name = 3;
+   */
+  taskName?: string;
+
+  /**
+   * The desired count. Required unless `reset` is set. Keyed stateful
+   * tasks (no count) and `count: { per: ... }` tasks are rejected.
+   *
+   * @generated from field: optional uint32 count = 4;
+   */
+  count?: number;
+
+  /**
+   * Drop the override (and any pending scale-in) and return ownership of
+   * the count to the job spec. Mutually exclusive with `count`.
+   *
+   * @generated from field: bool reset = 5;
+   */
+  reset = false;
+
+  /**
+   * Free-text audit note recorded on the override and in the
+   * `scale.applied` event.
+   *
+   * @generated from field: optional string reason = 6;
+   */
+  reason?: string;
+
+  /**
+   * Optional idempotency key. See `RunJobRequest.idempotency_key`.
+   *
+   * @generated from field: optional string idempotency_key = 7;
+   */
+  idempotencyKey?: string;
+
+  constructor(data?: PartialMessage<ScaleTaskRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ScaleTaskRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "task_group", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 3, name: "task_name", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 4, name: "count", kind: "scalar", T: 13 /* ScalarType.UINT32 */, opt: true },
+    { no: 5, name: "reset", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 6, name: "reason", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 7, name: "idempotency_key", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ScaleTaskRequest {
+    return new ScaleTaskRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ScaleTaskRequest {
+    return new ScaleTaskRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ScaleTaskRequest {
+    return new ScaleTaskRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ScaleTaskRequest | PlainMessage<ScaleTaskRequest> | undefined, b: ScaleTaskRequest | PlainMessage<ScaleTaskRequest> | undefined): boolean {
+    return proto3.util.equals(ScaleTaskRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for ScaleTask.
+ *
+ * @generated from message legion.ScaleTaskReply
+ */
+export class ScaleTaskReply extends Message<ScaleTaskReply> {
+  /**
+   * Human-readable outcome, e.g.
+   * `"web/default/web: 4 -> 6 (spec count 2; override active)"` or the
+   * deferral notice
+   * `"deferred: rollout web-7 is in progress; scale-in to 2 applies when it completes"`.
+   *
+   * @generated from field: string message = 1;
+   */
+  message = "";
+
+  /**
+   * True when replayed from a recorded result for the request's
+   * `idempotency_key` rather than applied fresh.
+   *
+   * @generated from field: bool deduplicated = 2;
+   */
+  deduplicated = false;
+
+  /**
+   * True when the request was a scale-in during an active rollout and was
+   * recorded as pending rather than applied (see ScaleTask's RPC comment).
+   *
+   * @generated from field: bool deferred = 3;
+   */
+  deferred = false;
+
+  constructor(data?: PartialMessage<ScaleTaskReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ScaleTaskReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "message", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "deduplicated", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 3, name: "deferred", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ScaleTaskReply {
+    return new ScaleTaskReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ScaleTaskReply {
+    return new ScaleTaskReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ScaleTaskReply {
+    return new ScaleTaskReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ScaleTaskReply | PlainMessage<ScaleTaskReply> | undefined, b: ScaleTaskReply | PlainMessage<ScaleTaskReply> | undefined): boolean {
+    return proto3.util.equals(ScaleTaskReply, a, b);
+  }
+}
+
+/**
+ * Request payload for GetJobScaleStatus.
+ *
+ * @generated from message legion.GetJobScaleStatusRequest
+ */
+export class GetJobScaleStatusRequest extends Message<GetJobScaleStatusRequest> {
+  /**
+   * Job name.
+   *
+   * @generated from field: string name = 1;
+   */
+  name = "";
+
+  constructor(data?: PartialMessage<GetJobScaleStatusRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetJobScaleStatusRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetJobScaleStatusRequest {
+    return new GetJobScaleStatusRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetJobScaleStatusRequest {
+    return new GetJobScaleStatusRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetJobScaleStatusRequest {
+    return new GetJobScaleStatusRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetJobScaleStatusRequest | PlainMessage<GetJobScaleStatusRequest> | undefined, b: GetJobScaleStatusRequest | PlainMessage<GetJobScaleStatusRequest> | undefined): boolean {
+    return proto3.util.equals(GetJobScaleStatusRequest, a, b);
+  }
+}
+
+/**
+ * One task's scale state (GetJobScaleStatus).
+ *
+ * @generated from message legion.TaskScaleStatus
+ */
+export class TaskScaleStatus extends Message<TaskScaleStatus> {
+  /**
+   * Task group name.
+   *
+   * @generated from field: string task_group = 1;
+   */
+  taskGroup = "";
+
+  /**
+   * Task name.
+   *
+   * @generated from field: string task_name = 2;
+   */
+  taskName = "";
+
+  /**
+   * The spec's `count.num` in the latest job config version.
+   *
+   * @generated from field: uint32 spec_count = 3;
+   */
+  specCount = 0;
+
+  /**
+   * The applied override count, when one exists.
+   *
+   * @generated from field: optional uint32 override_count = 4;
+   */
+  overrideCount?: number;
+
+  /**
+   * A recorded scale-in waiting for the active rollout to finish, when
+   * one exists.
+   *
+   * @generated from field: optional uint32 pending_count = 5;
+   */
+  pendingCount?: number;
+
+  /**
+   * The count the scheduler currently converges to
+   * (`override_count` if set, else `spec_count`).
+   *
+   * @generated from field: uint32 effective_count = 6;
+   */
+  effectiveCount = 0;
+
+  /**
+   * Who set the override: `operator` today; `autoscaler` when the policy
+   * evaluator ships.
+   *
+   * @generated from field: string source = 7;
+   */
+  source = "";
+
+  /**
+   * The audit note recorded with the override, if any.
+   *
+   * @generated from field: string reason = 8;
+   */
+  reason = "";
+
+  /**
+   * RFC 3339 timestamp of the last override write; empty when no
+   * override exists.
+   *
+   * @generated from field: string updated_at = 9;
+   */
+  updatedAt = "";
+
+  constructor(data?: PartialMessage<TaskScaleStatus>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.TaskScaleStatus";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "task_group", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "task_name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "spec_count", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 4, name: "override_count", kind: "scalar", T: 13 /* ScalarType.UINT32 */, opt: true },
+    { no: 5, name: "pending_count", kind: "scalar", T: 13 /* ScalarType.UINT32 */, opt: true },
+    { no: 6, name: "effective_count", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 7, name: "source", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 8, name: "reason", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 9, name: "updated_at", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): TaskScaleStatus {
+    return new TaskScaleStatus().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): TaskScaleStatus {
+    return new TaskScaleStatus().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): TaskScaleStatus {
+    return new TaskScaleStatus().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: TaskScaleStatus | PlainMessage<TaskScaleStatus> | undefined, b: TaskScaleStatus | PlainMessage<TaskScaleStatus> | undefined): boolean {
+    return proto3.util.equals(TaskScaleStatus, a, b);
+  }
+}
+
+/**
+ * Reply payload for GetJobScaleStatus.
+ *
+ * @generated from message legion.GetJobScaleStatusReply
+ */
+export class GetJobScaleStatusReply extends Message<GetJobScaleStatusReply> {
+  /**
+   * One entry per task in the job's latest config, spec-order.
+   *
+   * @generated from field: repeated legion.TaskScaleStatus tasks = 1;
+   */
+  tasks: TaskScaleStatus[] = [];
+
+  constructor(data?: PartialMessage<GetJobScaleStatusReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetJobScaleStatusReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "tasks", kind: "message", T: TaskScaleStatus, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetJobScaleStatusReply {
+    return new GetJobScaleStatusReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetJobScaleStatusReply {
+    return new GetJobScaleStatusReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetJobScaleStatusReply {
+    return new GetJobScaleStatusReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetJobScaleStatusReply | PlainMessage<GetJobScaleStatusReply> | undefined, b: GetJobScaleStatusReply | PlainMessage<GetJobScaleStatusReply> | undefined): boolean {
+    return proto3.util.equals(GetJobScaleStatusReply, a, b);
   }
 }
 
@@ -5566,6 +6082,19 @@ export class Job extends Message<Job> {
    */
   updatedAt = protoInt64.zero;
 
+  /**
+   * Priority band of the job's latest config: `critical`, `high`,
+   * `elevated`, `normal` (the default), `low`, or `background`.
+   *
+   * The band orders the eval queue and governs preemption: an allocation may
+   * only ever be displaced by a job in a STRICTLY higher band, never by a
+   * peer. See docs/preemption-and-eviction.md. Empty only when read from a
+   * manager that predates bands.
+   *
+   * @generated from field: string priority = 6;
+   */
+  priority = "";
+
   constructor(data?: PartialMessage<Job>) {
     super();
     proto3.util.initPartial(data, this);
@@ -5579,6 +6108,7 @@ export class Job extends Message<Job> {
     { no: 3, name: "status", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 4, name: "created_at", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
     { no: 5, name: "updated_at", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 6, name: "priority", kind: "scalar", T: 9 /* ScalarType.STRING */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): Job {
@@ -5948,6 +6478,24 @@ export class HeartbeatRequest extends Message<HeartbeatRequest> {
    */
   volumeReports: VolumeReport[] = [];
 
+  /**
+   * Allocations whose task process reached a terminal state since the last
+   * heartbeat *without* failing — the task exited with a status its `restart`
+   * policy treats as done (see docs/task-supervision.md). Failures travel in
+   * `failed_allocations` instead, because the manager reschedules those.
+   *
+   * This is what makes a batch task's success real: the manager marks the
+   * allocation complete and the task successful only when a worker says the
+   * process exited successfully, instead of assuming it at placement.
+   *
+   * Sent only by workers at protocol version 2 and above.
+   *
+   * Default: empty list.
+   *
+   * @generated from field: repeated legion.TerminatedAllocation terminated_allocations = 6;
+   */
+  terminatedAllocations: TerminatedAllocation[] = [];
+
   constructor(data?: PartialMessage<HeartbeatRequest>) {
     super();
     proto3.util.initPartial(data, this);
@@ -5961,6 +6509,7 @@ export class HeartbeatRequest extends Message<HeartbeatRequest> {
     { no: 3, name: "failed_allocations", kind: "message", T: FailedAllocation, repeated: true },
     { no: 4, name: "allocation_health", kind: "message", T: AllocationHealth, repeated: true },
     { no: 5, name: "volume_reports", kind: "message", T: VolumeReport, repeated: true },
+    { no: 6, name: "terminated_allocations", kind: "message", T: TerminatedAllocation, repeated: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): HeartbeatRequest {
@@ -6018,6 +6567,54 @@ export class HeartbeatReply extends Message<HeartbeatReply> {
    */
   volumeDestroy: VolumeDestroyRequest[] = [];
 
+  /**
+   * Current endpoint set for every upstream declared by the desired
+   * allocations on this node (see `TaskAllocation.task_connect`). This is the
+   * service-discovery feed for the node-local forwarders: the worker applies
+   * it to the running forwarders and the next accepted connection is balanced
+   * across the addresses listed here.
+   *
+   * One entry per (allocation, upstream service) pair, refreshed on every
+   * heartbeat — that is, every `WORKER_HEARTBEAT_DURATION_SEC` (2s), which is
+   * the endpoint refresh cadence a consumer observes after a backend comes up,
+   * goes unhealthy, or moves.
+   *
+   * Default: empty list when no desired allocation declares upstreams. The
+   * manager performs no catalog work at all in that case, so nodes running
+   * only plain jobs pay nothing for this field.
+   *
+   * @generated from field: repeated legion.UpstreamEndpoints upstream_endpoints = 4;
+   */
+  upstreamEndpoints: UpstreamEndpoints[] = [];
+
+  /**
+   * Why the manager is stopping allocations on this node.
+   *
+   * Workers learn that an allocation should stop by noticing it is *absent*
+   * from `desired_allocations` — an absence carries no reason, so a drain, a
+   * rollout replacement, a `job stop` and a reschedule were historically
+   * indistinguishable to the worker and to anything reading its logs. This
+   * field supplies the missing reason, letting the worker hand a
+   * `StopCause` to the task runtime and log why each task went away.
+   *
+   * Delivery is **best effort and advisory**. The manager records a notice in
+   * the same transaction that removes the allocation, re-sends every live
+   * notice on each heartbeat, and prunes notices by age
+   * (`STOP_NOTICE_RETENTION_SECS`, 10 minutes). A worker that reconciles
+   * before the notice reaches it — or one talking to a manager older than
+   * this field — stops the allocation with cause `unknown` rather than
+   * waiting. A stop is never delayed or skipped for want of a notice.
+   *
+   * The list is a snapshot, not a delta: each heartbeat carries every notice
+   * the manager currently holds for this node, and the worker replaces its
+   * copy wholesale.
+   *
+   * Default: empty list when no allocation on this node was recently removed.
+   *
+   * @generated from field: repeated legion.StopNotice stop_notices = 5;
+   */
+  stopNotices: StopNotice[] = [];
+
   constructor(data?: PartialMessage<HeartbeatReply>) {
     super();
     proto3.util.initPartial(data, this);
@@ -6029,6 +6626,8 @@ export class HeartbeatReply extends Message<HeartbeatReply> {
     { no: 1, name: "message", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 2, name: "desired_allocations", kind: "message", T: TaskAllocation, repeated: true },
     { no: 3, name: "volume_destroy", kind: "message", T: VolumeDestroyRequest, repeated: true },
+    { no: 4, name: "upstream_endpoints", kind: "message", T: UpstreamEndpoints, repeated: true },
+    { no: 5, name: "stop_notices", kind: "message", T: StopNotice, repeated: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): HeartbeatReply {
@@ -6045,6 +6644,183 @@ export class HeartbeatReply extends Message<HeartbeatReply> {
 
   static equals(a: HeartbeatReply | PlainMessage<HeartbeatReply> | undefined, b: HeartbeatReply | PlainMessage<HeartbeatReply> | undefined): boolean {
     return proto3.util.equals(HeartbeatReply, a, b);
+  }
+}
+
+/**
+ * Why one allocation is being stopped.
+ *
+ * Sent in `HeartbeatReply.stop_notices`. See that field for delivery
+ * semantics and `docs/graceful-stop.md` for the full contract.
+ *
+ * @generated from message legion.StopNotice
+ */
+export class StopNotice extends Message<StopNotice> {
+  /**
+   * Allocation the manager removed. Matches an ID the worker previously
+   * received in `HeartbeatReply.desired_allocations`.
+   *
+   * @generated from field: int64 allocation_id = 1;
+   */
+  allocationId = protoInt64.zero;
+
+  /**
+   * Why it was removed. One of:
+   *
+   * - `stop` — the job, or a keyed instance of it, was stopped by a user.
+   * - `update` — replaced by a newer job config (a rollout or in-place
+   *   update).
+   * - `drain` — the node is draining and its work is moving elsewhere.
+   * - `reschedule` — moved by the scheduler (failure recovery, `onLost`
+   *   handling, or a scheduler-driven move).
+   * - `destroy` — the job was destroyed outright.
+   * - `node_lost` — the node was removed or declared lost, clearing its
+   *   allocations.
+   * - `preempted` — displaced to make room for higher-priority work
+   *   (docs/preemption-and-eviction.md).
+   * - `scale_in` — the task's count was lowered by `legion job scale` and
+   *   this allocation was surplus.
+   *
+   * Workers treat an unrecognized value as `unknown` and stop the allocation
+   * anyway, so the manager may add causes without a coordinated upgrade.
+   *
+   * @generated from field: string cause = 2;
+   */
+  cause = "";
+
+  /**
+   * Name of the job that displaced this allocation. Set only when `cause` is
+   * `preempted`; empty otherwise. The worker copies it into the on-disk stop
+   * notice (`LEGION_STOP_NOTICE_PATH`) so a task can tell "the platform
+   * wanted my capacity for job X" from "my operator stopped me".
+   *
+   * Best-effort, like the cause itself: a stop that reconciles before its
+   * notice arrives is still carried out, just without attribution.
+   *
+   * @generated from field: string preemptor_job = 3;
+   */
+  preemptorJob = "";
+
+  /**
+   * Priority band of the job named in `preemptor_job` (`critical`, `high`,
+   * `elevated`, `normal`, `low`, `background`). Empty when `preemptor_job`
+   * is.
+   *
+   * @generated from field: string preemptor_band = 4;
+   */
+  preemptorBand = "";
+
+  constructor(data?: PartialMessage<StopNotice>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.StopNotice";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "allocation_id", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 2, name: "cause", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "preemptor_job", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "preemptor_band", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): StopNotice {
+    return new StopNotice().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): StopNotice {
+    return new StopNotice().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): StopNotice {
+    return new StopNotice().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: StopNotice | PlainMessage<StopNotice> | undefined, b: StopNotice | PlainMessage<StopNotice> | undefined): boolean {
+    return proto3.util.equals(StopNotice, a, b);
+  }
+}
+
+/**
+ * The endpoints one allocation may currently reach for one upstream service.
+ *
+ * Sent in `HeartbeatReply.upstream_endpoints`, this is the manager's answer to
+ * "where should this allocation's forwarder for service X send traffic right
+ * now". It is a snapshot, not a delta: each heartbeat carries the full list.
+ *
+ * @generated from message legion.UpstreamEndpoints
+ */
+export class UpstreamEndpoints extends Message<UpstreamEndpoints> {
+  /**
+   * Allocation consuming the service — the allocation whose task declared this
+   * upstream in its `connect` block. Identifies which node-local forwarder the
+   * endpoint list applies to.
+   *
+   * @generated from field: int64 allocation_id = 1;
+   */
+  allocationId = protoInt64.zero;
+
+  /**
+   * Upstream service name, exactly as written in the task's
+   * `connect.upstreams[].service`. Echoed so the worker can match the list to
+   * one of its listeners without relying on ordering.
+   *
+   * @generated from field: string service = 2;
+   */
+  service = "";
+
+  /**
+   * Endpoints the consumer may dial, already filtered by the manager:
+   *
+   * - **healthy only** — an endpoint appears when its latest health snapshot is
+   *   healthy *and* its node is alive, the same liveness rule `ResolveService`
+   *   applies. Unhealthy or lost backends are simply absent.
+   * - **intention filtered** — when the target service declares
+   *   `service.allow`, an endpoint is visible only if that list is empty,
+   *   contains `"*"`, or contains the consuming allocation's job id. A denied
+   *   consumer receives an empty list rather than an error.
+   *
+   * Endpoint fields carry the same meaning as in `ResolveServiceReply`; a
+   * consumer dials `address:port`, and skips entries whose `address` is empty
+   * or whose `port` is 0 (the backing node advertises no address yet).
+   *
+   * An empty list is authoritative and means "send no traffic": it is how a
+   * scaled-to-zero, unhealthy, or intention-denied service is reported.
+   * Workers only replace their endpoint list on a *successful* heartbeat, so a
+   * manager outage leaves the last known good set in place (fail-static)
+   * rather than blackholing traffic.
+   *
+   * @generated from field: repeated legion.ServiceEndpoint endpoints = 3;
+   */
+  endpoints: ServiceEndpoint[] = [];
+
+  constructor(data?: PartialMessage<UpstreamEndpoints>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.UpstreamEndpoints";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "allocation_id", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 2, name: "service", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "endpoints", kind: "message", T: ServiceEndpoint, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): UpstreamEndpoints {
+    return new UpstreamEndpoints().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): UpstreamEndpoints {
+    return new UpstreamEndpoints().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): UpstreamEndpoints {
+    return new UpstreamEndpoints().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: UpstreamEndpoints | PlainMessage<UpstreamEndpoints> | undefined, b: UpstreamEndpoints | PlainMessage<UpstreamEndpoints> | undefined): boolean {
+    return proto3.util.equals(UpstreamEndpoints, a, b);
   }
 }
 
@@ -6299,6 +7075,88 @@ export class FailedAllocation extends Message<FailedAllocation> {
 
   static equals(a: FailedAllocation | PlainMessage<FailedAllocation> | undefined, b: FailedAllocation | PlainMessage<FailedAllocation> | undefined): boolean {
     return proto3.util.equals(FailedAllocation, a, b);
+  }
+}
+
+/**
+ * A terminal, non-failure allocation outcome reported by a worker: the task's
+ * process exited and the task's `restart` policy says that is the end of it
+ * (see docs/task-supervision.md).
+ *
+ * @generated from message legion.TerminatedAllocation
+ */
+export class TerminatedAllocation extends Message<TerminatedAllocation> {
+  /**
+   * Allocation that reached the terminal state.
+   *
+   * @generated from field: int64 allocation_id = 1;
+   */
+  allocationId = protoInt64.zero;
+
+  /**
+   * True when the exit status was one the task counts as success
+   * (`restart.successExitCodes`, default `[0]`). A task whose policy is
+   * `never` can also terminate unsuccessfully; the manager marks the
+   * allocation complete either way and records the status.
+   *
+   * @generated from field: bool success = 2;
+   */
+  success = false;
+
+  /**
+   * Process exit code. Unset when the process was killed by a signal, or when
+   * the worker only re-adopted the pid after a restart and never had a handle
+   * to reap.
+   *
+   * @generated from field: optional int32 exit_code = 3;
+   */
+  exitCode?: number;
+
+  /**
+   * Signal that killed the process, when it was killed by one (Unix only).
+   *
+   * @generated from field: optional int32 signal = 4;
+   */
+  signal?: number;
+
+  /**
+   * Human-readable rendering of the same facts, e.g. `exited with status 0`
+   * or `killed by signal 9`. Carried so events and the UI do not have to
+   * re-derive wording from the numbers.
+   *
+   * @generated from field: string message = 5;
+   */
+  message = "";
+
+  constructor(data?: PartialMessage<TerminatedAllocation>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.TerminatedAllocation";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "allocation_id", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 2, name: "success", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 3, name: "exit_code", kind: "scalar", T: 5 /* ScalarType.INT32 */, opt: true },
+    { no: 4, name: "signal", kind: "scalar", T: 5 /* ScalarType.INT32 */, opt: true },
+    { no: 5, name: "message", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): TerminatedAllocation {
+    return new TerminatedAllocation().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): TerminatedAllocation {
+    return new TerminatedAllocation().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): TerminatedAllocation {
+    return new TerminatedAllocation().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: TerminatedAllocation | PlainMessage<TerminatedAllocation> | undefined, b: TerminatedAllocation | PlainMessage<TerminatedAllocation> | undefined): boolean {
+    return proto3.util.equals(TerminatedAllocation, a, b);
   }
 }
 
@@ -9550,6 +10408,25 @@ export class ServiceSummary extends Message<ServiceSummary> {
    */
   meta: { [key: string]: string } = {};
 
+  /**
+   * Connect intentions declared in the task's `service.allow`: the job IDs
+   * permitted to reach this service through a `connect.upstreams` entry.
+   *
+   * Empty — the default — means *every* job may connect, and so does a single
+   * `"*"` entry; the two are reported verbatim rather than normalized so
+   * tooling can tell "no policy declared" from "explicitly open". Intentions
+   * gate the connect datapath only: they filter the endpoint list a consuming
+   * allocation receives in `HeartbeatReply.upstream_endpoints`, and never
+   * affect who may *read* the catalog through ListServices/ResolveService.
+   *
+   * Reported here so a read-only caller (`job:read`) can explain why its
+   * consumer resolves to nothing — `legion service doctor` prints this list —
+   * without needing state-store access to the underlying task config.
+   *
+   * @generated from field: repeated string allow = 8;
+   */
+  allow: string[] = [];
+
   constructor(data?: PartialMessage<ServiceSummary>) {
     super();
     proto3.util.initPartial(data, this);
@@ -9565,6 +10442,7 @@ export class ServiceSummary extends Message<ServiceSummary> {
     { no: 5, name: "total_count", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
     { no: 6, name: "tags", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
     { no: 7, name: "meta", kind: "map", K: 9 /* ScalarType.STRING */, V: {kind: "scalar", T: 9 /* ScalarType.STRING */} },
+    { no: 8, name: "allow", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ServiceSummary {
@@ -12653,14 +13531,39 @@ export class TaskAllocation extends Message<TaskAllocation> {
   taskOnUnhealthy = "";
 
   /**
-   * JSON-encoded assigned network payload (address + ports) for this
-   * allocation, matching the `AllocNetwork` shape. Workers use it to inject
-   * `LEGION_PORT_*` / `LEGION_ADDR_*` environment variables into the task.
-   * Empty string when the task declares no network block.
+   * JSON-encoded assigned network payload (address + ports + upstreams) for
+   * this allocation, matching the `AllocNetwork` shape. Workers use it to
+   * inject `LEGION_PORT_*` / `LEGION_ADDR_*` environment variables into the
+   * task, and — when the task declares upstreams — the `upstreams` array
+   * (`[{"service":"db","localPort":20003,"balance":"round_robin"}]`) carries
+   * the loopback ports the node-local forwarders listen on, surfaced to the
+   * task as `LEGION_UPSTREAM_*`.
+   *
+   * Empty string when the task declares no network block and no upstreams.
    *
    * @generated from field: string network = 14;
    */
   network = "";
+
+  /**
+   * JSON-encoded `connect` block declared by the task, matching the
+   * `ConnectConfig` shape: `{"upstreams":[{"service":"db"},
+   * {"service":"cache","localPort":6379,"balance":"least_conn"}]}`.
+   *
+   * This is the *declared* form (which services the task dials and with which
+   * balancing strategy); the *assigned* loopback ports live in `network`
+   * alongside the task's host ports, because both come out of the same
+   * per-node port space. The worker starts one loopback TCP forwarder per
+   * upstream and load-balances new connections across that service's healthy
+   * endpoints, which the manager refreshes every heartbeat in
+   * `HeartbeatReply.upstream_endpoints`.
+   *
+   * Empty string (not `{}`) when the task declares no upstreams, so jobs that
+   * do not use connect stay byte-identical on the wire.
+   *
+   * @generated from field: string task_connect = 17;
+   */
+  taskConnect = "";
 
   /**
    * JSON-encoded list of normalized artifact specs for this task.
@@ -12774,6 +13677,7 @@ export class TaskAllocation extends Message<TaskAllocation> {
     { no: 9, name: "task_checks", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 10, name: "task_on_unhealthy", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 14, name: "network", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 17, name: "task_connect", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 11, name: "task_artifacts", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 12, name: "task_identities", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 13, name: "self_terminate_after_seconds", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },

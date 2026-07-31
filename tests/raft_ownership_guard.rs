@@ -73,6 +73,7 @@ fn test_job(name: &str) -> JobConfig {
     // A desired count so the reconcile/reschedule passes place replacements.
     task.count = legion::structs::job::TaskCount::new(1);
     JobConfig {
+        priority: Default::default(),
         rollout: None,
         rollout_by_group: Default::default(),
         name: name.to_string(),

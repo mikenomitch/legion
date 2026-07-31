@@ -598,6 +598,7 @@ fn task_config(
 
 fn job_alpha() -> JobConfig {
     JobConfig {
+        priority: Default::default(),
         rollout: None,
         rollout_by_group: Default::default(),
         name: "job-alpha".into(),
@@ -614,6 +615,7 @@ fn job_alpha() -> JobConfig {
 
 fn job_bravo() -> JobConfig {
     JobConfig {
+        priority: Default::default(),
         rollout: None,
         rollout_by_group: Default::default(),
         name: "job-bravo".into(),
@@ -630,6 +632,7 @@ fn job_bravo() -> JobConfig {
 
 fn job_charlie() -> JobConfig {
     JobConfig {
+        priority: Default::default(),
         rollout: None,
         rollout_by_group: Default::default(),
         name: "job-charlie".into(),
@@ -646,6 +649,7 @@ fn job_charlie() -> JobConfig {
 
 fn job_delta() -> JobConfig {
     JobConfig {
+        priority: Default::default(),
         rollout: None,
         rollout_by_group: Default::default(),
         name: "job-delta".into(),
@@ -662,6 +666,7 @@ fn job_delta() -> JobConfig {
 
 fn job_echo() -> JobConfig {
     JobConfig {
+        priority: Default::default(),
         rollout: None,
         rollout_by_group: Default::default(),
         name: "job-echo".into(),
@@ -678,6 +683,7 @@ fn job_echo() -> JobConfig {
 
 fn job_foxtrot() -> JobConfig {
     JobConfig {
+        priority: Default::default(),
         rollout: None,
         rollout_by_group: Default::default(),
         name: "job-foxtrot".into(),
@@ -694,6 +700,7 @@ fn job_foxtrot() -> JobConfig {
 
 fn job_golf() -> JobConfig {
     JobConfig {
+        priority: Default::default(),
         rollout: None,
         rollout_by_group: Default::default(),
         name: "job-golf".into(),
@@ -713,6 +720,7 @@ fn job_golf() -> JobConfig {
 
 fn job_hotel() -> JobConfig {
     JobConfig {
+        priority: Default::default(),
         rollout: None,
         rollout_by_group: Default::default(),
         name: "job-hotel".into(),
@@ -729,6 +737,7 @@ fn job_hotel() -> JobConfig {
 
 fn job_india() -> JobConfig {
     JobConfig {
+        priority: Default::default(),
         rollout: None,
         rollout_by_group: Default::default(),
         name: "job-india".into(),
@@ -745,6 +754,7 @@ fn job_india() -> JobConfig {
 
 fn job_resubmit_config(message: &str, count: u32, node_id: &str) -> JobConfig {
     JobConfig {
+        priority: Default::default(),
         rollout: None,
         rollout_by_group: Default::default(),
         name: "job-resubmit".into(),
@@ -761,6 +771,7 @@ fn job_resubmit_config(message: &str, count: u32, node_id: &str) -> JobConfig {
 
 fn job_score_load() -> JobConfig {
     JobConfig {
+        priority: Default::default(),
         rollout: None,
         rollout_by_group: Default::default(),
         name: "job-score-load".into(),
@@ -777,6 +788,7 @@ fn job_score_load() -> JobConfig {
 
 fn job_score_target() -> JobConfig {
     JobConfig {
+        priority: Default::default(),
         rollout: None,
         rollout_by_group: Default::default(),
         name: "job-score-target".into(),
@@ -981,6 +993,7 @@ fn scheduler_count_per_attribute_reschedules_by_group() -> R<()> {
     }
 
     let job = JobConfig {
+        priority: Default::default(),
         rollout: None,
         rollout_by_group: Default::default(),
         name: "job-per-region".into(),
@@ -1046,6 +1059,7 @@ fn scheduler_count_per_id_scales_with_node_changes() -> R<()> {
     cluster.add_nodes(&nodes)?;
 
     let job = JobConfig {
+        priority: Default::default(),
         rollout: None,
         rollout_by_group: Default::default(),
         name: "job-per-id".into(),
@@ -1122,6 +1136,7 @@ fn scheduler_multi_job_churn_constraints_and_count_per_reschedule() -> R<()> {
     }
 
     let regional_job = JobConfig {
+        priority: Default::default(),
         rollout: None,
         rollout_by_group: Default::default(),
         name: "job-regional".into(),
@@ -1135,6 +1150,7 @@ fn scheduler_multi_job_churn_constraints_and_count_per_reschedule() -> R<()> {
     };
 
     let constrained_job = JobConfig {
+        priority: Default::default(),
         rollout: None,
         rollout_by_group: Default::default(),
         name: "job-constrained".into(),

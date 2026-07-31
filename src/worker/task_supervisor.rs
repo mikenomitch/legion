@@ -56,13 +56,25 @@ pub fn decide(task: &TaskConfig, exit: &TaskExit, budget_available: bool) -> Exi
     }
 }
 
-/// Poll for task exits forever, acting on each one.
+/// Poll for task exits forever, acting on each one, and reap allocations that
+/// are inside their stop grace window.
+///
+/// The reap lives here rather than on the heartbeat path on purpose: it runs
+/// `destroy`, unmounts volumes and removes directories, any of which can block
+/// on a hung driver. The heartbeat must not be behind that work — that is the
+/// whole reason graceful stop needed a terminating set instead of a blocking
+/// `stop()` (see `docs/graceful-stop.md`).
 #[instrument(skip_all)]
 pub async fn start_task_supervisor(task_manager: Arc<Mutex<WorkerTaskManager>>) -> R<()> {
     loop {
         tokio::time::sleep(SUPERVISOR_TICK).await;
         let exits = {
             let mut manager = task_manager.lock().expect("task manager");
+            // Reap first: an allocation that just exited inside its grace
+            // window is not a supervised exit to restart, and clearing it
+            // here is what releases the node for allocations the reconcile
+            // is holding back.
+            manager.reap_terminating();
             manager.poll_task_exits()
         };
         for exit in exits {
