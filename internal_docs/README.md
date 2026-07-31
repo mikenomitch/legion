@@ -61,6 +61,7 @@ When one is required and what goes in it:
 | [container-runtime-exec-and-signals-plan.md](plans/container-runtime-exec-and-signals-plan.md) | planned |
 | [exec-and-actions-plan.md](plans/exec-and-actions-plan.md) | shipped (all five phases) |
 | [durability-and-ops-execution-plan.md](plans/durability-and-ops-execution-plan.md) | executed (workstreams A/B/C/D + adversarial verification, 2026-07-28); lanes topology opt-in |
+| [edge-boot-plan.md](plans/edge-boot-plan.md) | planned |
 | [gang-scheduling-plan.md](plans/gang-scheduling-plan.md) | planned |
 | [host-convergence-plan.md](plans/host-convergence-plan.md) | planned |
 | [host-process-supervision-plan.md](plans/host-process-supervision-plan.md) | in execution (phases 1–3 landed; phase 4 uncommitted) |
@@ -114,6 +115,7 @@ by project impact. The full template and a worked example:
 - [bounded-candidate-scoring-plan_calls.md](calls/bounded-candidate-scoring-plan_calls.md)
 - [container-runtime-exec-and-signals-plan_calls.md](calls/container-runtime-exec-and-signals-plan_calls.md)
 - [container-task-kind-macos_calls.md](calls/container-task-kind-macos_calls.md)
+- [edge-boot-plan_calls.md](calls/edge-boot-plan_calls.md)
 - [exec-and-actions-plan_calls.md](calls/exec-and-actions-plan_calls.md)
 - [gang-scheduling-plan_calls.md](calls/gang-scheduling-plan_calls.md)
 - [heartbeat-scale-plan_calls.md](calls/heartbeat-scale-plan_calls.md)

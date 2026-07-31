@@ -40,6 +40,19 @@ How to use it:
       `plan_conflict_max_retries` (default 3) races is failed terminally and
       never retried. Phase 0 also delivers the raft-mode concurrent-planning
       test tracked below.
+- [ ] **Edge boot / provisional allocations** — a node starts work *before* the
+      placement is durable, at a declared gate level (`stage` = pull only,
+      `boot` = run with the network shut, `serve` = run fully and kill the
+      loser), and an edge node can authorize a start itself with a short-lived
+      manager-signed boot ticket —
+      [plan](plans/edge-boot-plan.md) (PLANNED: measure the start path →
+      provisional allocations with pre-commit dispatch → `serve` → the network
+      gate → boot tickets + `StartClaim`). Today dispatch is strictly
+      post-commit (`src/structs/eval.rs:309`), so every sandbox start pays the
+      full control-plane round trip and fails outright when the manager is
+      unreachable. Ratification reuses the existing plan apply, so the
+      at-most-one-live-allocation invariant is unchanged. Phase 0 is a
+      measurement phase and is allowed to kill the later phases.
 - [ ] Worker groups + taint/toleration equivalent. Node pools exist as an ACL
       and config concept but nothing scheduling-side consumes them.
 - [ ] Priorities and eviction/preemption, with eviction toggled at the pool level
