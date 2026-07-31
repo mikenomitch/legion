@@ -514,6 +514,80 @@ pub mod drafts {
         EventDraft::info("job.destroyed", format!("Job {job_id} destroyed")).job(job_id)
     }
 
+    /// `scale.applied` — a count override was applied
+    /// (`legion job scale`, docs/autoscaling.md). `previous` is the
+    /// effective count before the change when the caller knows it.
+    pub fn scale_applied(
+        job_id: &str,
+        task_group: &str,
+        task_name: &str,
+        previous: Option<u32>,
+        count: u32,
+        source: &str,
+        reason: &str,
+    ) -> EventDraft {
+        let from = previous
+            .map(|previous| format!("{previous} -> "))
+            .unwrap_or_default();
+        EventDraft::info(
+            "scale.applied",
+            format!("Job {job_id} task {task_group}/{task_name} scaled {from}{count}"),
+        )
+        .job(job_id)
+        .meta(json!({
+            "group": task_group,
+            "task": task_name,
+            "previous": previous,
+            "count": count,
+            "source": source,
+            "reason": reason,
+        }))
+    }
+
+    /// `scale.deferred` — a scale-in was recorded during an active rollout
+    /// and waits for it to finish (docs/autoscaling.md).
+    pub fn scale_deferred(
+        job_id: &str,
+        task_group: &str,
+        task_name: &str,
+        pending: u32,
+        rollout_id: i64,
+        source: &str,
+        reason: &str,
+    ) -> EventDraft {
+        EventDraft::info(
+            "scale.deferred",
+            format!(
+                "Job {job_id} task {task_group}/{task_name} scale-in to {pending} deferred until rollout {rollout_id} completes"
+            ),
+        )
+        .job(job_id)
+        .rollout(rollout_id)
+        .meta(json!({
+            "group": task_group,
+            "task": task_name,
+            "pending": pending,
+            "source": source,
+            "reason": reason,
+        }))
+    }
+
+    /// `scale.reset` — an override was dropped: explicit
+    /// `legion job scale --reset`, or a resubmit that changed the spec
+    /// count reclaimed ownership (docs/autoscaling.md).
+    pub fn scale_reset(job_id: &str, task_group: &str, task_name: &str, why: &str) -> EventDraft {
+        EventDraft::info(
+            "scale.reset",
+            format!("Job {job_id} task {task_group}/{task_name} count override dropped: {why}"),
+        )
+        .job(job_id)
+        .meta(json!({
+            "group": task_group,
+            "task": task_name,
+            "why": why,
+        }))
+    }
+
     /// `rollout.event` — mirror of one rollout event into the unified stream,
     /// so consumers see rollout activity without polling per-rollout history.
     pub fn rollout_event(
@@ -947,6 +1021,42 @@ impl EventRecorder<'_> {
 
     pub fn job_destroyed(self, job_id: &str) {
         self.emit(drafts::job_destroyed(job_id));
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn scale_applied(
+        self,
+        job_id: &str,
+        task_group: &str,
+        task_name: &str,
+        previous: Option<u32>,
+        count: u32,
+        source: &str,
+        reason: &str,
+    ) {
+        self.emit(drafts::scale_applied(
+            job_id, task_group, task_name, previous, count, source, reason,
+        ));
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn scale_deferred(
+        self,
+        job_id: &str,
+        task_group: &str,
+        task_name: &str,
+        pending: u32,
+        rollout_id: i64,
+        source: &str,
+        reason: &str,
+    ) {
+        self.emit(drafts::scale_deferred(
+            job_id, task_group, task_name, pending, rollout_id, source, reason,
+        ));
+    }
+
+    pub fn scale_reset(self, job_id: &str, task_group: &str, task_name: &str, why: &str) {
+        self.emit(drafts::scale_reset(job_id, task_group, task_name, why));
     }
 
     pub fn rollout_event(

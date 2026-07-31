@@ -33,6 +33,7 @@ that removes the allocation, and serves it to the owning node.
 | `reschedule` | Moved by the scheduler: failure recovery, `onLost` handling, or a scheduler-driven move. |
 | `destroy` | The job was destroyed outright. |
 | `node_lost` | The node was removed or declared lost, clearing its allocations. |
+| `scale_in` | Surplus after `legion job scale` lowered the task's count ([autoscaling.md](autoscaling.md)). Distinct from `update`: no new job config version is involved. |
 | `preempted` | Displaced to make room for higher-priority work. **Reserved** — nothing emits this today; it lands with preemption. |
 | `unknown` | No cause was recorded. See [Delivery guarantees](#delivery-guarantees). |
 

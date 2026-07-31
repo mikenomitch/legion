@@ -145,6 +145,29 @@ histogram ([metrics.md](metrics.md)), and aggregated by the benchmark
 runners ([testing-and-benchmarks.md](testing-and-benchmarks.md)). When
 scheduling latency moves, find the phase that moved first.
 
+### Apply-time re-validation
+
+The epoch fence only covers what bumps an allocation epoch. Node-row
+changes — a cordon/drain, a node loss, or a worker re-registration that
+shrinks the node's capacity (`memory`, `reservedResources`,
+`maxAllocations`, …) — bump none, so the apply transaction re-validates
+every placement against the **fresh** node row before inserting it:
+
+- **Availability**: the node must still be `available`.
+- **Constraints and permits**: the task's constraint and permit sets must
+  still be satisfied.
+- **Resource totals**: the node's free pool is rebuilt inside the
+  transaction (current capacity minus the allocation rows the transaction
+  can see, with a Fresh plan's own replaced job excluded — the same
+  arithmetic as the planner's ledger) and every placement must still fit,
+  with earlier placements in the same plan debited.
+
+A failed re-validation rejects the whole plan the same way a stale epoch
+does; the eval handler's conflict retry then re-plans against the node's
+real state. Port assignments were always re-read in the apply
+transaction; these checks give availability, constraints, and resources
+the same apply-time guarantee.
+
 ### Conflict handling
 
 A stale epoch causes plan rejection with a conflict error. The eval handler retries conflicts with bounded attempts via `Eval::plan_with_conflict_retries`.

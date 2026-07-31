@@ -1,6 +1,12 @@
 # Built-In Autoscaler Plan
 
-**Status: PLANNED.** Nothing here is implemented. Deliberately deferred from v1:
+**Status: IN EXECUTION.** Phase 1 (`legion job scale` + count overrides —
+§6.1/§6.2/§8.1) shipped 2026-07-30 with docs in
+[docs/autoscaling.md](../../docs/autoscaling.md); deviations from this plan
+are recorded in the [calls doc](../calls/autoscaler-plan_calls.md) (notably:
+`task_scale` is control-lane, not scheduler-lane, and deferred scale-ins use
+a `pending_count` column promoted on rollout completion). Phases 2-7 are
+unstarted. Deliberately deferred from v1:
 request-rate/connection-count signals (blocked on the networking data path),
 wake-on-request scale-to-zero (blocked on the ingress proxy), autoscaling keyed
 stateful instances, dylib/WASM policy plugins, and the generic UI-extension

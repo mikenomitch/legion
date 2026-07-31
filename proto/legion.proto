@@ -69,6 +69,23 @@ service Manager {
   // Marks a job as stopped and enqueues stop reconciliation.
   rpc StopJob (StopJobRequest) returns (StopJobReply);
 
+  // Sets (or clears) a task's count override — the `legion job scale`
+  // surface (docs/autoscaling.md). Changes the effective desired count
+  // WITHOUT creating a new job config version or starting a rollout: the
+  // override is layered over the spec's `count` and reconciled by a
+  // `job_scale` eval (scale-out places only the shortfall; scale-in
+  // retires surplus allocations, highest slot indices first for slot-mode
+  // stateful tasks and newest-first for stateless ones). A scale-IN
+  // requested while a rollout is in flight is recorded as pending and
+  // applied when the rollout finishes (scale-out applies immediately).
+  // Guarded by `scale:write`, deliberately separate from `job:write`.
+  rpc ScaleTask (ScaleTaskRequest) returns (ScaleTaskReply);
+
+  // Reports every task's spec count, live override (or pending scale-in),
+  // and effective desired count for one job. The read half of the scale
+  // surface; `scale:read`.
+  rpc GetJobScaleStatus (GetJobScaleStatusRequest) returns (GetJobScaleStatusReply);
+
   // Permanently removes a stopped job and related records.
   rpc DestroyJob (DestroyJobRequest) returns (DestroyJobReply);
 
@@ -1720,6 +1737,98 @@ message StopJobReply {
   // True when replayed from a recorded result for the request's
   // `idempotency_key` rather than applied fresh.
   bool deduplicated = 2;
+}
+
+// Request payload for ScaleTask (docs/autoscaling.md).
+message ScaleTaskRequest {
+  // Job name.
+  string name = 1;
+
+  // Task group, when the job has more than one scalable task. Optional:
+  // a job with exactly one scalable task needs neither selector; an
+  // ambiguous request is rejected with the candidate list.
+  optional string task_group = 2;
+
+  // Task name, same rules as `task_group`.
+  optional string task_name = 3;
+
+  // The desired count. Required unless `reset` is set. Keyed stateful
+  // tasks (no count) and `count: { per: ... }` tasks are rejected.
+  optional uint32 count = 4;
+
+  // Drop the override (and any pending scale-in) and return ownership of
+  // the count to the job spec. Mutually exclusive with `count`.
+  bool reset = 5;
+
+  // Free-text audit note recorded on the override and in the
+  // `scale.applied` event.
+  optional string reason = 6;
+
+  // Optional idempotency key. See `RunJobRequest.idempotency_key`.
+  optional string idempotency_key = 7;
+}
+
+// Reply payload for ScaleTask.
+message ScaleTaskReply {
+  // Human-readable outcome, e.g.
+  // `"web/default/web: 4 -> 6 (spec count 2; override active)"` or the
+  // deferral notice
+  // `"deferred: rollout web-7 is in progress; scale-in to 2 applies when it completes"`.
+  string message = 1;
+
+  // True when replayed from a recorded result for the request's
+  // `idempotency_key` rather than applied fresh.
+  bool deduplicated = 2;
+
+  // True when the request was a scale-in during an active rollout and was
+  // recorded as pending rather than applied (see ScaleTask's RPC comment).
+  bool deferred = 3;
+}
+
+// Request payload for GetJobScaleStatus.
+message GetJobScaleStatusRequest {
+  // Job name.
+  string name = 1;
+}
+
+// One task's scale state (GetJobScaleStatus).
+message TaskScaleStatus {
+  // Task group name.
+  string task_group = 1;
+
+  // Task name.
+  string task_name = 2;
+
+  // The spec's `count.num` in the latest job config version.
+  uint32 spec_count = 3;
+
+  // The applied override count, when one exists.
+  optional uint32 override_count = 4;
+
+  // A recorded scale-in waiting for the active rollout to finish, when
+  // one exists.
+  optional uint32 pending_count = 5;
+
+  // The count the scheduler currently converges to
+  // (`override_count` if set, else `spec_count`).
+  uint32 effective_count = 6;
+
+  // Who set the override: `operator` today; `autoscaler` when the policy
+  // evaluator ships.
+  string source = 7;
+
+  // The audit note recorded with the override, if any.
+  string reason = 8;
+
+  // RFC 3339 timestamp of the last override write; empty when no
+  // override exists.
+  string updated_at = 9;
+}
+
+// Reply payload for GetJobScaleStatus.
+message GetJobScaleStatusReply {
+  // One entry per task in the job's latest config, spec-order.
+  repeated TaskScaleStatus tasks = 1;
 }
 
 // Request payload for DestroyJob.

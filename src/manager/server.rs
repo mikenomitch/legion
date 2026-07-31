@@ -35,25 +35,25 @@ use crate::structs::{
     DestroyJobRequest, ExecClientFrame, FailedAllocation, GetAllocationLogsReply,
     GetAllocationLogsRequest, GetArtifactCredentialReply, GetArtifactCredentialRequest,
     GetInstanceReply, GetInstanceRequest, GetJobInfoReply, GetJobInfoRequest,
-    GetJobSpecByConfigRequest, GetJobSpecReply, GetJobSpecRequest, GetJobTemplateReply,
-    GetJobTemplateRequest, GetKvLockReply, GetKvLockRequest, GetKvReply, GetKvRequest,
-    GetLedgerReply, GetLedgerRequest, GetManagerConfigsReply, GetManagerConfigsRequest,
-    GetNodeReply, GetNodeRequest, GetNodesReply, GetNodesRequest, GetObservabilityReply,
-    GetObservabilityRequest, GetRaftJoinTokenReply, GetRaftJoinTokenRequest, GetRaftStatusReply,
-    GetRaftStatusRequest, GetRolloutReply, GetRolloutRequest, GetRolloutStatusReply,
-    GetRolloutStatusRequest, GetStateBackupReply, GetStateBackupRequest, GetStateStoreSchemaReply,
-    GetStateStoreSchemaRequest, GetTaskLogsRequest, GetVolumeReply, GetVolumeRequest,
-    HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, Instance, InstanceInfo,
-    InstanceMode, InstanceState, IssueNodeIdentityTokenReply, IssueNodeIdentityTokenRequest,
-    IssueRaftCommandReply, IssueRaftCommandRequest, IssueWorkloadIdentityTokenReply,
-    IssueWorkloadIdentityTokenRequest, JobConfig, JobSpecHistoryItem, JobTemplate,
-    JobTemplateProvenance, JobTemplateSummary, JobTemplateVariable, JobTemplateVersionInfo,
-    KvEntry, KvInjectionAction, KvValueType, LedgerNode, ListEventsReply, ListEventsRequest,
-    ListInstancesReply, ListInstancesRequest, ListJobActionsReply, ListJobActionsRequest,
-    ListJobSpecHistoryReply, ListJobSpecHistoryRequest, ListJobTemplatesReply,
-    ListJobTemplatesRequest, ListJobsReply, ListJobsRequest, ListKvReply, ListKvRequest,
-    ListRaftHistoryReply, ListRaftHistoryRequest, ListRolloutEventsReply, ListRolloutEventsRequest,
-    ListRolloutsReply, ListRolloutsRequest, ListSavedStateQueriesReply,
+    GetJobScaleStatusReply, GetJobScaleStatusRequest, GetJobSpecByConfigRequest, GetJobSpecReply,
+    GetJobSpecRequest, GetJobTemplateReply, GetJobTemplateRequest, GetKvLockReply,
+    GetKvLockRequest, GetKvReply, GetKvRequest, GetLedgerReply, GetLedgerRequest,
+    GetManagerConfigsReply, GetManagerConfigsRequest, GetNodeReply, GetNodeRequest, GetNodesReply,
+    GetNodesRequest, GetObservabilityReply, GetObservabilityRequest, GetRaftJoinTokenReply,
+    GetRaftJoinTokenRequest, GetRaftStatusReply, GetRaftStatusRequest, GetRolloutReply,
+    GetRolloutRequest, GetRolloutStatusReply, GetRolloutStatusRequest, GetStateBackupReply,
+    GetStateBackupRequest, GetStateStoreSchemaReply, GetStateStoreSchemaRequest,
+    GetTaskLogsRequest, GetVolumeReply, GetVolumeRequest, HealthCheckReply, HealthCheckRequest,
+    HeartbeatReply, HeartbeatRequest, Instance, InstanceInfo, InstanceMode, InstanceState,
+    IssueNodeIdentityTokenReply, IssueNodeIdentityTokenRequest, IssueRaftCommandReply,
+    IssueRaftCommandRequest, IssueWorkloadIdentityTokenReply, IssueWorkloadIdentityTokenRequest,
+    JobConfig, JobSpecHistoryItem, JobTemplate, JobTemplateProvenance, JobTemplateSummary,
+    JobTemplateVariable, JobTemplateVersionInfo, KvEntry, KvInjectionAction, KvValueType,
+    LedgerNode, ListEventsReply, ListEventsRequest, ListInstancesReply, ListInstancesRequest,
+    ListJobActionsReply, ListJobActionsRequest, ListJobSpecHistoryReply, ListJobSpecHistoryRequest,
+    ListJobTemplatesReply, ListJobTemplatesRequest, ListJobsReply, ListJobsRequest, ListKvReply,
+    ListKvRequest, ListRaftHistoryReply, ListRaftHistoryRequest, ListRolloutEventsReply,
+    ListRolloutEventsRequest, ListRolloutsReply, ListRolloutsRequest, ListSavedStateQueriesReply,
     ListSavedStateQueriesRequest, ListServicesReply, ListServicesRequest, ListVolumeDriversReply,
     ListVolumeDriversRequest, ListVolumesReply, ListVolumesRequest, Node, NodeMsg, PatchKvReply,
     PatchKvRequest, PlanJobReply, PlanJobRequest, PlannedAllocation, PutKvReply, PutKvRequest,
@@ -62,14 +62,15 @@ use crate::structs::{
     RenewKvLockRequest, ReplaceInstanceReply, ReplaceInstanceRequest, ResolveServiceReply,
     ResolveServiceRequest, RestartWorkerReply, RestartWorkerRequest, RolloutAllocationStatus,
     RolloutEvent, RolloutGroupStatus, RolloutProgression, RolloutReplacement, RunJobReply,
-    RunJobRequest, RunJobTemplateReply, RunJobTemplateRequest, SavedStateQuery, SchedulerEvent,
-    ServiceEndpoint, ServiceSummary, SetNodeAvailabilityReply, SetNodeAvailabilityRequest,
-    StartInstanceReply, StartInstanceRequest, StopInstanceReply, StopInstanceRequest, StopJobReply,
-    StopJobRequest, StopNotice, StopRolloutReply, StopRolloutRequest, StreamEventsRequest,
-    Submission, TaskConfig, TaskOnUnhealthyConfig, UpdateNodeDynamicReply,
-    UpdateNodeDynamicRequest, UpsertJobTemplateReply, UpsertJobTemplateRequest,
-    UpsertSavedStateQueryReply, UpsertSavedStateQueryRequest, WorkerConfig, WorkerPreRegisterReply,
-    WorkerPreRegisterRequest, WorkerRegisterReply, WorkerRegisterRequest,
+    RunJobRequest, RunJobTemplateReply, RunJobTemplateRequest, SavedStateQuery, ScaleTaskReply,
+    ScaleTaskRequest, SchedulerEvent, ServiceEndpoint, ServiceSummary, SetNodeAvailabilityReply,
+    SetNodeAvailabilityRequest, StartInstanceReply, StartInstanceRequest, StopInstanceReply,
+    StopInstanceRequest, StopJobReply, StopJobRequest, StopNotice, StopRolloutReply,
+    StopRolloutRequest, StreamEventsRequest, Submission, TaskConfig, TaskOnUnhealthyConfig,
+    TaskScaleStatus, UpdateNodeDynamicReply, UpdateNodeDynamicRequest, UpsertJobTemplateReply,
+    UpsertJobTemplateRequest, UpsertSavedStateQueryReply, UpsertSavedStateQueryRequest,
+    WorkerConfig, WorkerPreRegisterReply, WorkerPreRegisterRequest, WorkerRegisterReply,
+    WorkerRegisterRequest,
 };
 use crate::structs::{
     AuthMethodInfo, BootstrapAclReply, BootstrapAclRequest, CreateAclTokenReply,
@@ -268,6 +269,56 @@ fn resolve_keyed_task<'a>(
                 .collect();
             Err(Status::invalid_argument(format!(
                 "multiple keyed tasks match in job {} ({}); disambiguate with group and task",
+                job_id,
+                matches.join(", "),
+            )))
+        }
+    }
+}
+
+/// Resolve the single SCALABLE task a `legion job scale` request targets
+/// (docs/autoscaling.md): not keyed-mode stateful (no count to scale) and
+/// not `count: { per: ... }` (group-converging; rejected in v1).
+/// `group`/`task` filters may be omitted when the job has exactly one
+/// scalable task; ambiguity is rejected with the candidate list, never
+/// guessed — the same rules as `resolve_keyed_task`, inverted.
+fn resolve_scalable_task<'a>(
+    config: &'a JobConfig,
+    job_id: &str,
+    group: Option<&str>,
+    task: Option<&str>,
+) -> Result<&'a TaskConfig, Status> {
+    let group_filter = group.filter(|group| !group.trim().is_empty());
+    let task_filter = task.filter(|task| !task.trim().is_empty());
+    let mut candidates: Vec<&TaskConfig> = config
+        .tasks
+        .iter()
+        .filter(|task| {
+            let keyed = task
+                .stateful
+                .as_ref()
+                .is_some_and(|stateful| stateful.mode == InstanceMode::Keyed);
+            !keyed && task.count.per.is_none()
+        })
+        .filter(|task| group_filter.is_none_or(|group| task.group == group))
+        .filter(|task| task_filter.is_none_or(|name| task.name == name))
+        .collect();
+    match candidates.len() {
+        0 => Err(Status::invalid_argument(format!(
+            "job {} has no scalable task matching group={} task={}; keyed stateful tasks \
+             have no count (use the instance API) and count.per tasks cannot be scaled",
+            job_id,
+            group_filter.unwrap_or("<any>"),
+            task_filter.unwrap_or("<any>"),
+        ))),
+        1 => Ok(candidates.remove(0)),
+        _ => {
+            let matches: Vec<String> = candidates
+                .iter()
+                .map(|task| format!("{}/{}", task.group, task.name))
+                .collect();
+            Err(Status::invalid_argument(format!(
+                "multiple scalable tasks match in job {} ({}); disambiguate with task_group and task_name",
                 job_id,
                 matches.join(", "),
             )))
@@ -3465,6 +3516,229 @@ impl Manager for ManagerDaemonService {
         };
 
         Ok(Response::new(reply))
+    }
+
+    #[instrument(skip_all)]
+    async fn scale_task(
+        &self,
+        request: Request<ScaleTaskRequest>,
+    ) -> Result<Response<ScaleTaskReply>, Status> {
+        // The whole point of the `scale` resource: resize rights without
+        // redeploy rights (docs/autoscaling.md, docs/auth-and-acls.md).
+        let ident = self.check_acl(
+            &request,
+            AclResource::Scale,
+            AclAction::Write,
+            self.job_read_scope(&request.get_ref().name),
+        )?;
+        let inner = request.into_inner();
+        let name = inner.name;
+        let idempotency_key = inner.idempotency_key.unwrap_or_default();
+
+        if let Some(message) = self
+            .store
+            .idempotency_lookup(&idempotency_key)
+            .map_err(|e| map_store_error("Error checking idempotency", e))?
+        {
+            return Ok(Response::new(ScaleTaskReply {
+                message,
+                deduplicated: true,
+                deferred: false,
+            }));
+        }
+
+        if inner.count.is_none() && !inner.reset {
+            return Err(Status::invalid_argument(
+                "provide count (the desired replicas) or reset (return the count to the spec)",
+            ));
+        }
+        if inner.count.is_some() && inner.reset {
+            return Err(Status::invalid_argument(
+                "count and reset are mutually exclusive",
+            ));
+        }
+
+        let config = keyed_job_config(&self.store, &name)?;
+        let task = resolve_scalable_task(
+            &config,
+            &name,
+            inner.task_group.as_deref(),
+            inner.task_name.as_deref(),
+        )?;
+        let (task_group, task_name, spec_count) =
+            (task.group.clone(), task.name.clone(), task.count.num);
+        let job_config_id = config.id();
+        let reason = inner.reason.unwrap_or_default();
+        let previous = self
+            .store
+            .effective_task_count(&name, &task_group, &task_name, spec_count)
+            .map_err(|e| map_store_error("Error reading scale state", e))?;
+
+        let (message, deferred) = if inner.reset {
+            let existed = self
+                .store
+                .clear_task_scale(&name, &task_group, &task_name)
+                .map_err(|e| map_store_error("Error resetting scale", e))?;
+            if existed {
+                self.store
+                    .events()
+                    .scale_reset(&name, &task_group, &task_name, "explicit reset");
+                self.store
+                    .enqueue_eval(
+                        "job_scale",
+                        Some(&name),
+                        Some(&job_config_id),
+                        None,
+                        Some(self.store.default_eval_priority),
+                    )
+                    .map_err(|e| map_store_error("Error enqueueing scale eval", e))?;
+            }
+            (
+                format!(
+                    "{}/{}/{}: {} -> {} (override dropped; spec owns the count)",
+                    name, task_group, task_name, previous, spec_count
+                ),
+                false,
+            )
+        } else {
+            let count = inner.count.unwrap_or_default();
+            // The ECS rule (docs/autoscaling.md): scale-out applies during
+            // a rollout, scale-in defers until it finishes.
+            let active_rollout = self
+                .store
+                .list_rollouts(Some(&name), true)
+                .map_err(|e| map_store_error("Error checking rollouts", e))?
+                .into_iter()
+                .next();
+            match active_rollout {
+                Some(rollout) if count < previous => {
+                    self.store
+                        .set_task_scale_pending(
+                            &name,
+                            &task_group,
+                            &task_name,
+                            count,
+                            spec_count,
+                            "operator",
+                            &reason,
+                            &ident.principal,
+                        )
+                        .map_err(|e| map_store_error("Error recording pending scale", e))?;
+                    self.store.events().scale_deferred(
+                        &name,
+                        &task_group,
+                        &task_name,
+                        count,
+                        rollout.id,
+                        "operator",
+                        &reason,
+                    );
+                    (
+                        format!(
+                            "deferred: rollout {} is in progress; scale-in to {} applies when it completes",
+                            rollout.id, count
+                        ),
+                        true,
+                    )
+                }
+                _ => {
+                    self.store
+                        .set_task_scale_override(
+                            &name,
+                            &task_group,
+                            &task_name,
+                            count,
+                            spec_count,
+                            "operator",
+                            &reason,
+                            &ident.principal,
+                        )
+                        .map_err(|e| map_store_error("Error applying scale", e))?;
+                    self.store.events().scale_applied(
+                        &name,
+                        &task_group,
+                        &task_name,
+                        Some(previous),
+                        count,
+                        "operator",
+                        &reason,
+                    );
+                    self.store
+                        .enqueue_eval(
+                            "job_scale",
+                            Some(&name),
+                            Some(&job_config_id),
+                            None,
+                            Some(self.store.default_eval_priority),
+                        )
+                        .map_err(|e| map_store_error("Error enqueueing scale eval", e))?;
+                    (
+                        format!(
+                            "{}/{}/{}: {} -> {} (spec count {}; override active)",
+                            name, task_group, task_name, previous, count, spec_count
+                        ),
+                        false,
+                    )
+                }
+            }
+        };
+
+        self.store
+            .idempotency_record(&idempotency_key, "scale_task", &message)
+            .map_err(|e| map_store_error("Error recording idempotency", e))?;
+        Ok(Response::new(ScaleTaskReply {
+            message,
+            deduplicated: false,
+            deferred,
+        }))
+    }
+
+    #[instrument(skip_all)]
+    async fn get_job_scale_status(
+        &self,
+        request: Request<GetJobScaleStatusRequest>,
+    ) -> Result<Response<GetJobScaleStatusReply>, Status> {
+        self.check_acl(
+            &request,
+            AclResource::Scale,
+            AclAction::Read,
+            self.job_read_scope(&request.get_ref().name),
+        )?;
+        let name = request.into_inner().name;
+        let config = self
+            .store
+            .get_job_config(&name)
+            .map_err(|e| map_store_error("Error loading job config", e))?;
+        let scales = self
+            .store
+            .task_scales_for_job(&name)
+            .map_err(|e| map_store_error("Error loading scale state", e))?;
+
+        let tasks = config
+            .tasks
+            .iter()
+            .map(|task| {
+                let scale = scales
+                    .iter()
+                    .find(|scale| scale.task_group == task.group && scale.task_name == task.name);
+                let override_count = scale.and_then(|scale| scale.count);
+                TaskScaleStatus {
+                    task_group: task.group.clone(),
+                    task_name: task.name.clone(),
+                    spec_count: task.count.num,
+                    override_count,
+                    pending_count: scale.and_then(|scale| scale.pending_count),
+                    effective_count: override_count.unwrap_or(task.count.num),
+                    source: scale.map(|scale| scale.source.clone()).unwrap_or_default(),
+                    reason: scale.map(|scale| scale.reason.clone()).unwrap_or_default(),
+                    updated_at: scale
+                        .map(|scale| scale.updated_at.clone())
+                        .unwrap_or_default(),
+                }
+            })
+            .collect();
+
+        Ok(Response::new(GetJobScaleStatusReply { tasks }))
     }
 
     #[instrument(skip_all)]

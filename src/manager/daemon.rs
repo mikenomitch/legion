@@ -15,6 +15,7 @@ use crate::worker::daemon::run_worker_local;
 use futures::join;
 use http::Method;
 use jsonnet::JsonnetVm;
+use rand::Rng;
 use std::fs;
 use std::sync::Arc;
 use std::time::Duration;
@@ -36,11 +37,16 @@ const ERROR_BACKOFF_MAX: Duration = Duration::from_secs(30);
 // (eval workers, node status checker). Bounds the takeover delay after a
 // leadership change to "a few seconds" (plan JC-15).
 const LEADER_POLL_INTERVAL: Duration = Duration::from_secs(1);
-// Delay before re-running an eval whose handler hit a foreign-lane
+// Base delay before re-running an eval whose handler hit a foreign-lane
 // NotRaftLeader rejection (divergent lane leadership) — long enough for the
 // engine's JC-40 lane-convergence loop (or an election) to move leadership,
-// short enough that acknowledged work is not parked for long.
+// short enough that acknowledged work is not parked for long. Repeated
+// rejections of the SAME eval back off exponentially from this base up to
+// the cap, with jitter, so a standing split parks evals quietly instead of
+// re-proposing and warning every 5s forever.
 const EVAL_NOT_LEADER_RETRY_DELAY: Duration = Duration::from_secs(5);
+const EVAL_NOT_LEADER_RETRY_MAX_DELAY: Duration = Duration::from_secs(60);
+const EVAL_NOT_LEADER_RETRY_JITTER_MS: u64 = 1_000;
 // Boot-path startup writes (config load, UI seed, manager-config upsert) are
 // composites that can touch two lanes. Under `lanes` topology a node that
 // leads the control lane may not (yet) lead the status/scheduler lane, so the
@@ -349,6 +355,9 @@ pub async fn run_manager(config: ManagerConfig, run_worker: bool) -> R<()> {
             "Telemetry is disabled (telemetry.enabled=false); /metrics and health probes are off"
         );
     }
+    // OTLP metrics push (opt-in via the OTEL_* env vars, like trace export;
+    // no-op when unconfigured). Independent of the scrape listener above.
+    crate::otel::start_metrics_push();
 
     let tls_identity = load_server_tls_identity(&full_config.server.tls)?;
     let server_builder = match tls_identity {
@@ -895,23 +904,44 @@ fn refresh_cluster_gauges(store: &Store) {
         Ok(count) => telemetry.allocations.set(count),
         Err(err) => debug!(error = ?err, "Failed refreshing allocation gauge"),
     }
-    // Raft quorum shape (plan §7-C3): `legion_raft_voters{lane}` /
-    // `legion_raft_quorum{lane}` from the local metrics view — cheap watch
-    // borrows, present on leaders and followers alike. Non-raft backends
+    // Raft engine series from the local metrics view — cheap watch borrows,
+    // present on leaders and followers alike. Quorum shape (plan §7-C3:
+    // voters/quorum) plus the per-lane progress series (term, commit and
+    // applied indexes, apply lag, local leadership) that make failover
+    // drills and bottleneck attribution observable. Non-raft backends
     // report no status and leave the families empty.
     if let Some(status) = store.raft_status() {
-        let voters: Vec<(Vec<String>, i64)> = status
-            .lanes
-            .iter()
-            .map(|lane| (vec![lane.lane.clone()], lane.voters as i64))
-            .collect();
-        let quorum: Vec<(Vec<String>, i64)> = status
-            .lanes
-            .iter()
-            .map(|lane| (vec![lane.lane.clone()], lane.quorum as i64))
-            .collect();
-        telemetry.raft_voters.set_all(&voters);
-        telemetry.raft_quorum.set_all(&quorum);
+        let lane_series = |value: fn(&crate::storage::persistence::RaftLaneStatus) -> i64| {
+            status
+                .lanes
+                .iter()
+                .map(|lane| (vec![lane.lane.clone()], value(lane)))
+                .collect::<Vec<(Vec<String>, i64)>>()
+        };
+        telemetry
+            .raft_voters
+            .set_all(&lane_series(|lane| lane.voters as i64));
+        telemetry
+            .raft_quorum
+            .set_all(&lane_series(|lane| lane.quorum as i64));
+        telemetry
+            .raft_term
+            .set_all(&lane_series(|lane| lane.term as i64));
+        telemetry
+            .raft_commit_index
+            .set_all(&lane_series(|lane| lane.commit_index as i64));
+        telemetry
+            .raft_applied_index
+            .set_all(&lane_series(|lane| lane.applied_index as i64));
+        telemetry.raft_apply_lag.set_all(&lane_series(|lane| {
+            lane.commit_index.saturating_sub(lane.applied_index) as i64
+        }));
+        telemetry.raft_is_leader.set_all(&lane_series(|lane| {
+            i64::from(matches!(
+                lane.role,
+                crate::storage::persistence::PersistenceRole::Primary
+            ))
+        }));
     }
 }
 
@@ -1180,7 +1210,21 @@ async fn eval_worker_loop(store: Store, notifier: Arc<Notify>, worker_id: usize)
                     claim_eval_ms = claim_started.elapsed().as_millis() as u64,
                     "Claimed eval for dispatch"
                 );
-                handle_claimed_eval(&store, worker_id, &eval);
+                // Eval handling is synchronous end to end — SQLite writes,
+                // raft-proposal waits, and the plan-conflict retry loop's
+                // backoff sleeps (`plan_with_conflict_retries`), which can
+                // hold the thread for hundreds of milliseconds per retry.
+                // Run it on the blocking pool so those stalls never park a
+                // tokio runtime worker; awaiting the handle keeps this
+                // worker's one-eval-at-a-time ordering.
+                let store_for_handler = store.clone();
+                if let Err(join_error) = tokio::task::spawn_blocking(move || {
+                    handle_claimed_eval(&store_for_handler, worker_id, &eval)
+                })
+                .await
+                {
+                    error!(worker_id, "Eval handler task failed: {join_error:?}");
+                }
             }
             Ok(None) => {
                 debug!(
@@ -1254,6 +1298,38 @@ mod tests {
         assert!(!leadership_acquired(true, true));
         assert!(!leadership_acquired(true, false));
         assert!(!leadership_acquired(false, false));
+    }
+
+    /// The NotRaftLeader release delay doubles per rejection of the same
+    /// eval, caps at the max, carries bounded jitter, and resets once the
+    /// eval completes (or fails terminally) — a flat 5s forever parked
+    /// split-stranded evals loudly and thundered them back together.
+    #[test]
+    fn not_leader_retry_delay_backs_off_caps_and_resets() {
+        let eval_id = "backoff-test-eval";
+        clear_not_leader_attempts(eval_id);
+
+        let base = EVAL_NOT_LEADER_RETRY_DELAY.as_millis() as u64;
+        let jitter = EVAL_NOT_LEADER_RETRY_JITTER_MS;
+        for attempt in 0..8u32 {
+            let expected_ms = base
+                .saturating_mul(1 << attempt)
+                .min(EVAL_NOT_LEADER_RETRY_MAX_DELAY.as_millis() as u64);
+            let delay = not_leader_retry_delay(eval_id).as_millis() as u64;
+            assert!(
+                (expected_ms..=expected_ms + jitter).contains(&delay),
+                "attempt {attempt}: delay {delay}ms outside [{expected_ms}, {}]",
+                expected_ms + jitter
+            );
+        }
+
+        clear_not_leader_attempts(eval_id);
+        let after_reset = not_leader_retry_delay(eval_id).as_millis() as u64;
+        assert!(
+            (base..=base + jitter).contains(&after_reset),
+            "reset delay {after_reset}ms should return to the base"
+        );
+        clear_not_leader_attempts(eval_id);
     }
 
     /// Adversarial regression (dropped acknowledged work): a NotRaftLeader
@@ -1576,6 +1652,58 @@ mod tests {
     }
 }
 
+/// Per-eval NotRaftLeader release counts, kept in-process only: the eval
+/// table has no attempt column, and durability is not needed — the count
+/// only shapes the retry delay, and resetting to the base after a restart
+/// or failover is the right behavior (new leadership is exactly the
+/// condition the backoff waits for). Entries are dropped when the eval
+/// completes or fails terminally; entries stranded by a leadership move
+/// (the eval finishes on another node) are bounded by the size guard in
+/// [`not_leader_retry_delay`].
+static EVAL_NOT_LEADER_ATTEMPTS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, u32>>,
+> = std::sync::OnceLock::new();
+
+fn eval_not_leader_attempts() -> &'static std::sync::Mutex<std::collections::HashMap<String, u32>> {
+    EVAL_NOT_LEADER_ATTEMPTS.get_or_init(Default::default)
+}
+
+fn clear_not_leader_attempts(eval_id: &str) {
+    let mut attempts = eval_not_leader_attempts()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    attempts.remove(eval_id);
+}
+
+/// Exponential backoff + jitter for foreign-lane NotRaftLeader releases:
+/// 5s, 10s, 20s, 40s, then capped at 60s, plus up to 1s of jitter so a
+/// batch of split-parked evals doesn't thunder back on one tick. Records
+/// the attempt as a side effect.
+fn not_leader_retry_delay(eval_id: &str) -> Duration {
+    let attempt = {
+        let mut attempts = eval_not_leader_attempts()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Stale entries (evals finished by another leader after a
+        // failover) never see the completion-path removal; clearing the
+        // whole map at an absurd size costs at most one backoff reset per
+        // stranded eval.
+        if attempts.len() > 10_000 {
+            attempts.clear();
+        }
+        let entry = attempts.entry(eval_id.to_owned()).or_insert(0);
+        let current = *entry;
+        *entry = entry.saturating_add(1);
+        current
+    };
+    let base_ms = EVAL_NOT_LEADER_RETRY_DELAY.as_millis() as u64;
+    let capped_ms = base_ms
+        .saturating_mul(1u64 << attempt.min(10))
+        .min(EVAL_NOT_LEADER_RETRY_MAX_DELAY.as_millis() as u64);
+    let jitter_ms = rand::thread_rng().gen_range(0..=EVAL_NOT_LEADER_RETRY_JITTER_MS);
+    Duration::from_millis(capped_ms + jitter_ms)
+}
+
 fn handle_claimed_eval(store: &Store, worker_id: usize, eval: &Eval) {
     let started = std::time::Instant::now();
     info!(
@@ -1597,6 +1725,7 @@ fn handle_claimed_eval(store: &Store, worker_id: usize, eval: &Eval) {
                 elapsed_ms = started.elapsed().as_millis() as u64,
                 "Eval {} handled successfully: {}", eval.id, message
             );
+            clear_not_leader_attempts(&eval.id);
             let completed = drafts::eval_completed(eval, &message, started.elapsed());
             if let Err(e) = store.complete_eval_with_event(&eval.id, true, completed) {
                 error!(worker_id, "Error completing eval {}: {:?}", eval.id, e);
@@ -1609,15 +1738,15 @@ fn handle_claimed_eval(store: &Store, worker_id: usize, eval: &Eval) {
         // evals are never retried). Release it back to pending with a delay
         // instead of terminally failing it.
         Err(e) if error_is_not_raft_leader(&e) => {
+            let retry_delay = not_leader_retry_delay(&eval.id);
             warn!(
                 worker_id,
                 eval_id = %eval.id,
                 kind = %eval.kind,
+                retry_delay_ms = retry_delay.as_millis() as u64,
                 "Eval hit a foreign-lane leader rejection; releasing for retry: {e:#}"
             );
-            if let Err(release_err) =
-                store.release_eval_for_retry(&eval.id, EVAL_NOT_LEADER_RETRY_DELAY)
-            {
+            if let Err(release_err) = store.release_eval_for_retry(&eval.id, retry_delay) {
                 error!(
                     worker_id,
                     "Error releasing eval {} for retry: {:?}", eval.id, release_err
@@ -1626,6 +1755,7 @@ fn handle_claimed_eval(store: &Store, worker_id: usize, eval: &Eval) {
         }
         Err(e) => {
             error!(worker_id, eval_id = %eval.id, elapsed_ms = started.elapsed().as_millis() as u64, "Error handling eval {}: {:?}", eval.id, e);
+            clear_not_leader_attempts(&eval.id);
             let failed = drafts::eval_failed(eval, &e, started.elapsed());
             if let Err(complete_err) = store.complete_eval_with_event(&eval.id, false, failed) {
                 error!(

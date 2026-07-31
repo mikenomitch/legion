@@ -41,6 +41,8 @@ Plans, roadmaps, to-do lists, and development notes live in
 - [Rollouts](rollouts.md) — update strategies, health gating, manual/auto
   progression.
 - [Rollout Strategy Plugins](rollout-strategy-plugins.md)
+- [Scaling Jobs](autoscaling.md) — `legion job scale`: count overrides
+  without a new version or rollout; the manual half of the autoscaler.
 - [Stop Causes](graceful-stop.md) — why an allocation was removed, recorded
   and delivered to the worker that ran it.
 

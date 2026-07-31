@@ -333,7 +333,7 @@ fn node_lifecycle_flows_into_the_index() {
     let bindings = HashMap::from([("region".to_string(), json!("east"))]);
     let query = |store: &Store| -> Vec<String> {
         match store
-            .scheduling_index_query(&bindings, &HashMap::new(), None)
+            .scheduling_index_query(&bindings, &HashMap::new(), None, true)
             .expect("query")
         {
             IndexQueryOutcome::Candidates(candidates) => candidates.node_ids,

@@ -1010,6 +1010,37 @@ pub fn get_migrations() -> Migrations<'static> {
              ON allocation_stop_notice(node_id);",
         )
         .down("DROP INDEX IF EXISTS idx_allocation_stop_notice_node;"),
+        // Count overrides (`legion job scale`, autoscaler plan §6.1): a
+        // task's effective desired count, layered over the spec without a
+        // new job config version. Keyed by the version-stable task tuple
+        // (the same handle slot retirement and keyed instances use), NOT
+        // the version-scoped task_config id, so overrides survive
+        // resubmits. `base_count` records the spec count the override was
+        // laid over — the resubmit-ownership arbiter (docs/autoscaling.md).
+        // `pending_count` holds a scale-in recorded during an active
+        // rollout, promoted to `count` when the rollout finishes; `count`
+        // is NULL while only a pending scale-in exists.
+        //
+        // Kept LAST for the same reason the stop-notice pair above gives:
+        // `rusqlite_migration` tracks the applied count, so a migration that
+        // has already shipped to `main` must keep its position. Anything
+        // added on a branch goes after everything already on `main`.
+        M::up(
+            "CREATE TABLE IF NOT EXISTS task_scale (
+            job_id STRING NOT NULL,
+            task_group STRING NOT NULL,
+            task_name STRING NOT NULL,
+            count INTEGER,
+            pending_count INTEGER,
+            base_count INTEGER NOT NULL,
+            source STRING NOT NULL,
+            reason STRING NOT NULL DEFAULT '',
+            principal STRING NOT NULL DEFAULT '',
+            updated_at TIMESTAMP NOT NULL,
+            PRIMARY KEY (job_id, task_group, task_name)
+        )",
+        )
+        .down("DROP TABLE IF EXISTS task_scale;"),
     ])
 }
 

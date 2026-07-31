@@ -36,6 +36,9 @@ from the CLI, the MCP server, the UI, and raw gRPC.
 | `job.submitted` / `job.updated` | info | A job config was created / updated. |
 | `job.stopped` / `job.destroyed` | info | A job was stopped / destroyed. |
 | `job.failed` | error | A job was marked failed (e.g. move limit exceeded). |
+| `scale.applied` | info | A count override was applied ([Scaling Jobs](autoscaling.md)); previous/new counts, source, and reason in metadata. |
+| `scale.deferred` | info | A scale-in was recorded but deferred until the active rollout completes. |
+| `scale.reset` | info | An override was dropped (explicit `--reset`, or a resubmit that changed the spec count reclaimed ownership). |
 | `rollout.event` | passthrough | Mirror of every rollout event (created, advanced, completed, failed, …). |
 
 Each event carries: an increasing (but sparse — see

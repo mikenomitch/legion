@@ -207,13 +207,24 @@ struct ResourceLedger {
 }
 
 struct TaskPlan<'a> {
-    constraint_set: ConstraintSet,
-    permit_set: PermitSet,
+    /// The task's hard filters (constraints, permit), parsed once per plan
+    /// in `build_plan` and shared with the group-filter pass.
+    filters: Arc<(ConstraintSet, PermitSet)>,
     affinity_set: AffinitySet,
     task_request: ResourceRequest,
     base_eligible: Vec<&'a Node>,
     distinct_tracker: Option<DistinctTracker>,
     index_usage: TaskIndexUsage,
+}
+
+impl TaskPlan<'_> {
+    fn constraint_set(&self) -> &ConstraintSet {
+        &self.filters.0
+    }
+
+    fn permit_set(&self) -> &PermitSet {
+        &self.filters.1
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -533,6 +544,13 @@ pub struct Scheduler<'a> {
     policy: Box<dyn SchedulingPolicy>,
     #[allow(dead_code)]
     policy_lib: Option<Library>,
+    /// Settings parsed ONCE at construction (`scheduler_settings` is fixed
+    /// for the store's lifetime): `build_plan` used to re-walk the settings
+    /// JSON on every plan. Malformed settings therefore fail at
+    /// `Scheduler::new` rather than at the first plan.
+    weights: SchedulerWeights,
+    nodes_considered: Option<NodesConsidered>,
+    score_sample: Option<ScoreSample>,
 }
 
 #[derive(Debug, Clone)]
@@ -547,11 +565,20 @@ impl<'a> Scheduler<'a> {
     pub fn new(store: &'a Store) -> R<Self> {
         let (policy_lib, policy) = load_policy(&store.scheduling_policy)?;
 
-        Ok(Scheduler {
+        // Two-phase: the parsers below read `self.policy`/`self.store`, so
+        // construct with the policy's default weights first and overwrite.
+        let mut scheduler = Scheduler {
+            weights: SchedulerWeights::for_policy(policy.name()),
             store,
             policy,
             policy_lib,
-        })
+            nodes_considered: None,
+            score_sample: None,
+        };
+        scheduler.weights = scheduler.scheduler_weights()?;
+        scheduler.nodes_considered = scheduler.nodes_considered_setting()?;
+        scheduler.score_sample = scheduler.score_sample_setting()?;
+        Ok(scheduler)
     }
 
     #[instrument(skip_all)]
@@ -667,6 +694,9 @@ impl<'a> Scheduler<'a> {
 
         let status_map = HashMap::new();
         let mut tasks = Self::tasks_for_plan(job_config, &status_map)?;
+        // Count overrides apply to dry-run plans too, so `job plan` previews
+        // what a submit would actually converge to (job id == job name).
+        Self::apply_count_overrides(self.store, &job_config.name, &mut tasks)?;
         // Keyed tasks plan against live instances, not count.num, even for
         // not-yet-submitted configs (a fresh job simply has zero instances).
         Self::apply_keyed_instance_counts(self.store, &job_config.name, &mut tasks)?;
@@ -1168,9 +1198,9 @@ impl<'a> Scheduler<'a> {
         // scan is cheaper than any bookkeeping (docs/scheduling-indexes.md).
         let index_armed = self.store.index_settings.armed_for(nodes.len());
         let mut planned: HashMap<String, usize> = HashMap::new();
-        let weights = self.scheduler_weights()?;
-        let nodes_considered_setting = self.nodes_considered_setting()?;
-        let score_sample_setting = self.score_sample_setting()?;
+        let weights = self.weights;
+        let nodes_considered_setting = self.nodes_considered;
+        let score_sample_setting = self.score_sample;
         let mut reschedule_rng = if matches!(mode, PlanMode::Reschedule) {
             Some(reschedule_rng())
         } else {
@@ -1196,8 +1226,12 @@ impl<'a> Scheduler<'a> {
         let mut group_sizes: HashMap<String, usize> = HashMap::new();
         // Hard filters (constraints + permit) of every member of a group. A
         // multi-task group is placed on a single node, so that node must
-        // satisfy all of them.
-        let mut group_filters: HashMap<String, Vec<(ConstraintSet, PermitSet)>> = HashMap::new();
+        // satisfy all of them. Arc'd and shared with `build_task_plan` via
+        // `parsed_filters`, so each task's constraints/permit parse exactly
+        // once per plan.
+        let mut group_filters: HashMap<String, Vec<Arc<(ConstraintSet, PermitSet)>>> =
+            HashMap::new();
+        let mut parsed_filters: HashMap<i64, Arc<(ConstraintSet, PermitSet)>> = HashMap::new();
         let mut task_group_map: HashMap<i64, (String, Option<String>)> = HashMap::new();
         let mut task_id_to_group: HashMap<i64, String> = HashMap::new();
         let task_name_to_id: HashMap<String, i64> = all_tasks
@@ -1232,10 +1266,12 @@ impl<'a> Scheduler<'a> {
                 })?;
             let permit_set = PermitSet::new(&task_config.permit)
                 .with_context(|| format!("Failed to parse permit for task {}", task_config.name))?;
+            let filters = Arc::new((constraint_set, permit_set));
             group_filters
                 .entry(task_config.group.clone())
                 .or_default()
-                .push((constraint_set, permit_set));
+                .push(Arc::clone(&filters));
+            parsed_filters.insert(*task_id, filters);
             task_group_map.insert(*task_id, (task_config.group.clone(), per_key));
             task_id_to_group.insert(*task_id, task_config.group.clone());
         }
@@ -1300,8 +1336,8 @@ impl<'a> Scheduler<'a> {
                 .and_then(|value| value.clone());
             let mut grouped: HashMap<String, Vec<&Node>> = HashMap::new();
             for node in nodes.iter().map(|node| &**node) {
-                if !filters.iter().all(|(constraint, permit)| {
-                    constraint.is_satisfied(node, None) && permit.is_permitted(node)
+                if !filters.iter().all(|filters| {
+                    filters.0.is_satisfied(node, None) && filters.1.is_permitted(node)
                 }) {
                     continue;
                 }
@@ -1345,6 +1381,7 @@ impl<'a> Scheduler<'a> {
                 needed,
                 index_armed,
                 in_multi_task_group,
+                &parsed_filters,
             )?;
 
             let base_eligible = plan.base_eligible.clone();
@@ -1553,33 +1590,37 @@ impl<'a> Scheduler<'a> {
             })
             .collect();
 
-        let candidates =
-            match self
-                .store
-                .scheduling_index_query(&bindings, &request_amounts, None)?
-            {
-                IndexQueryOutcome::Disabled => {
-                    return Ok(Self::scan_base_eligible(
-                        node_refs(nodes),
-                        constraint_set,
-                        permit_set,
-                        required_drivers,
-                    ));
-                }
-                IndexQueryOutcome::Unusable { reason } => {
-                    metrics
-                        .scheduler_index_queries_total
-                        .inc(&["none", "unusable"]);
-                    usage.reason = Some(reason);
-                    return Ok(Self::scan_base_eligible(
-                        node_refs(nodes),
-                        constraint_set,
-                        permit_set,
-                        required_drivers,
-                    ));
-                }
-                IndexQueryOutcome::Candidates(candidates) => candidates,
-            };
+        // Ordering matters only when the verified list may be truncated to
+        // the best-first budget below; the untruncated path re-sorts by
+        // node id, so the shard's nearest-fit cell sort would be wasted.
+        let candidates = match self.store.scheduling_index_query(
+            &bindings,
+            &request_amounts,
+            None,
+            allow_truncation,
+        )? {
+            IndexQueryOutcome::Disabled => {
+                return Ok(Self::scan_base_eligible(
+                    node_refs(nodes),
+                    constraint_set,
+                    permit_set,
+                    required_drivers,
+                ));
+            }
+            IndexQueryOutcome::Unusable { reason } => {
+                metrics
+                    .scheduler_index_queries_total
+                    .inc(&["none", "unusable"]);
+                usage.reason = Some(reason);
+                return Ok(Self::scan_base_eligible(
+                    node_refs(nodes),
+                    constraint_set,
+                    permit_set,
+                    required_drivers,
+                ));
+            }
+            IndexQueryOutcome::Candidates(candidates) => candidates,
+        };
 
         let mut verified: Vec<&'b Node> = candidates
             .node_ids
@@ -1676,6 +1717,7 @@ impl<'a> Scheduler<'a> {
         Ok(verified)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build_task_plan<'b>(
         &self,
         task_id: i64,
@@ -1687,24 +1729,30 @@ impl<'a> Scheduler<'a> {
         needed: u32,
         index_armed: bool,
         in_multi_task_group: bool,
+        parsed_filters: &HashMap<i64, Arc<(ConstraintSet, PermitSet)>>,
     ) -> R<TaskPlan<'b>> {
         let task_resources =
             resource_policy.normalize_task_resources(&task_config.resources, true)?;
         let task_request = ResourceRequest::from_value(&task_resources)?;
 
-        let constraint_set = ConstraintSet::new(&task_config.constraints).with_context(|| {
-            format!("Failed to parse constraints for task {}", task_config.name)
-        })?;
-        let permit_set = PermitSet::new(&task_config.permit)
-            .with_context(|| format!("Failed to parse permit for task {}", task_config.name))?;
+        // Parsed once per plan by `build_plan`'s group-filter pass;
+        // re-parsing here (the old shape) doubled the per-task JSON walk.
+        let filters = match parsed_filters.get(&task_id) {
+            Some(filters) => Arc::clone(filters),
+            None => Arc::new((
+                ConstraintSet::new(&task_config.constraints).with_context(|| {
+                    format!("Failed to parse constraints for task {}", task_config.name)
+                })?,
+                PermitSet::new(&task_config.permit).with_context(|| {
+                    format!("Failed to parse permit for task {}", task_config.name)
+                })?,
+            )),
+        };
+        let (constraint_set, permit_set) = (&filters.0, &filters.1);
         let affinity_set = AffinitySet::new(&task_config.affinities)
             .with_context(|| format!("Failed to parse affinities for task {}", task_config.name))?;
-        let distinct_tracker = Self::build_distinct_tracker(
-            &constraint_set,
-            task_id,
-            allocations_by_node,
-            node_lookup,
-        );
+        let distinct_tracker =
+            Self::build_distinct_tracker(constraint_set, task_id, allocations_by_node, node_lookup);
         // Storage is a hard placement requirement: a node without the task's
         // volume driver (or with it installed-but-unusable) can never run the
         // task, so filter it out here rather than letting the task start and
@@ -1726,8 +1774,8 @@ impl<'a> Scheduler<'a> {
             self.indexed_base_eligible(
                 nodes,
                 node_lookup,
-                &constraint_set,
-                &permit_set,
+                constraint_set,
+                permit_set,
                 &task_request,
                 &required_drivers,
                 needed,
@@ -1737,8 +1785,8 @@ impl<'a> Scheduler<'a> {
         } else {
             Self::scan_base_eligible(
                 node_refs(nodes),
-                &constraint_set,
-                &permit_set,
+                constraint_set,
+                permit_set,
                 &required_drivers,
             )
         };
@@ -1765,8 +1813,7 @@ impl<'a> Scheduler<'a> {
         }
 
         Ok(TaskPlan {
-            constraint_set,
-            permit_set,
+            filters,
             affinity_set,
             task_request,
             base_eligible,
@@ -1843,8 +1890,8 @@ impl<'a> Scheduler<'a> {
         for _ in 0..count {
             let mut eligible = Self::eligible_nodes(
                 &candidates,
-                &plan.constraint_set,
-                &plan.permit_set,
+                plan.constraint_set(),
+                plan.permit_set(),
                 plan.distinct_tracker.as_ref(),
                 &scoring_cache,
             );
@@ -1857,8 +1904,8 @@ impl<'a> Scheduler<'a> {
                 let required_drivers = task_config.required_volume_drivers();
                 let mut widened = Self::scan_base_eligible(
                     node_lookup.values().copied(),
-                    &plan.constraint_set,
-                    &plan.permit_set,
+                    plan.constraint_set(),
+                    plan.permit_set(),
                     &required_drivers,
                 );
                 widened.sort_by(|a, b| a.id.cmp(&b.id));
@@ -1894,8 +1941,8 @@ impl<'a> Scheduler<'a> {
                 );
                 eligible = Self::eligible_nodes(
                     &candidates,
-                    &plan.constraint_set,
-                    &plan.permit_set,
+                    plan.constraint_set(),
+                    plan.permit_set(),
                     plan.distinct_tracker.as_ref(),
                     &scoring_cache,
                 );
@@ -2181,9 +2228,36 @@ impl<'a> Scheduler<'a> {
 
         let mut tasks = Self::ready_tasks(tasks, &status_map)?;
         if let Some(job_id) = self.store.job_id_for_job_config(job_config_id)? {
+            // Overrides first, keyed counts second: keyed tasks' desired
+            // comes from live instances and must win (scaling keyed tasks
+            // is rejected at the ScaleTask RPC anyway).
+            Self::apply_count_overrides(self.store, &job_id, &mut tasks)?;
             Self::apply_keyed_instance_counts(self.store, &job_id, &mut tasks)?;
         }
         Ok(tasks)
+    }
+
+    /// Overlay `legion job scale` count overrides (docs/autoscaling.md):
+    /// the effective desired count is the override when one exists, else
+    /// the spec count already in the tuple. Keyed tasks (instance-driven)
+    /// and `count.per` tasks (group-converging) are skipped — both are
+    /// rejected at the ScaleTask RPC.
+    fn apply_count_overrides(
+        store: &Store,
+        job_id: &str,
+        tasks: &mut [(i64, TaskConfig, u32)],
+    ) -> R<()> {
+        for (_task_id, task, desired) in tasks.iter_mut() {
+            let keyed = task
+                .stateful
+                .as_ref()
+                .is_some_and(|stateful| stateful.mode == crate::structs::InstanceMode::Keyed);
+            if keyed || task.count.per.is_some() {
+                continue;
+            }
+            *desired = store.effective_task_count(job_id, &task.group, &task.name, *desired)?;
+        }
+        Ok(())
     }
 
     /// Replace `count.num`-derived desired counts with live keyed-instance
@@ -5484,6 +5558,120 @@ mod tests {
         Ok(())
     }
 
+    /// Apply-time re-validation of node resource TOTALS (TODO from the
+    /// 2026-07-28 adversarial pass): a worker re-registration that shrinks
+    /// capacity between the plan snapshot and the apply bumps no allocation
+    /// epoch — the version CAS structurally cannot see it — so the apply
+    /// transaction itself must rebuild the node's free pool and reject the
+    /// stale placement.
+    #[test]
+    fn apply_rejects_when_node_capacity_shrank_since_the_plan_snapshot() -> R<()> {
+        let store = setup_store()?;
+        // 8192 MiB of fingerprinted memory: the 6000 MiB task fits.
+        store.insert_node(make_node_msg("node-a", json!({})))?;
+
+        let job_config_id = submit_job(
+            &store,
+            "shrink-race",
+            vec![TaskConfig {
+                resources: json!({ "memory": 6000 }),
+                ..TaskConfig::new("api", "noop")
+            }],
+        )?;
+        let task_id = task_id_for(&store, &job_config_id, "api")?;
+
+        // The submission a planner snapshotting the 8192 MiB node would
+        // produce, with expected versions matching the CURRENT epochs so
+        // the compare-and-set passes — proving the rejection below comes
+        // from the capacity recheck, not the epoch fence.
+        let expected = BTreeMap::from([
+            (format!("job_config:{job_config_id}"), 0),
+            ("node:node-a".to_string(), 0),
+        ]);
+        let submission = store.insert_plan_submission(
+            &job_config_id,
+            "fresh",
+            &[("node-a".to_string(), task_id)],
+            &expected,
+        )?;
+
+        // Node re-registers with 2 GiB before the apply. Registration is a
+        // control-lane upsert that bumps no allocation epoch.
+        store.insert_node(make_node_msg_with_sources(
+            "node-a",
+            json!({}),
+            json!({ "memory_total": "2147483648" }),
+            json!({}),
+        ))?;
+
+        match store.apply_plan_submission(&submission)? {
+            crate::storage::store::PlanApplyOutcome::Rejected { reason, .. } => {
+                assert!(
+                    reason.contains("no longer has capacity"),
+                    "rejection must name the capacity recheck: {reason}"
+                );
+            }
+            crate::storage::store::PlanApplyOutcome::Applied(allocations) => {
+                panic!(
+                    "plan applied {} placements onto a node that shrank below the task's ask",
+                    allocations.len()
+                )
+            }
+        }
+        assert!(store.allocs_for_node("node-a")?.is_empty());
+
+        Ok(())
+    }
+
+    /// The recheck must mirror the planner's ledger exactly for a Fresh
+    /// plan: the planned JOB's surviving allocation rows (a job_submit
+    /// deletes the previous config's rows only after the apply) are
+    /// excluded from the reconstruction, so a same-capacity re-apply is
+    /// not spuriously rejected as over capacity.
+    /// `fresh_replan_ignores_the_jobs_own_outgoing_allocations` covers the
+    /// cross-config (v1 → v2) half of the same property.
+    #[test]
+    fn apply_capacity_recheck_does_not_double_count_a_fresh_plans_own_config() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", json!({})))?;
+
+        // First plan fills most of the node: 6000 of 8192 MiB.
+        let job_config_id = submit_job(
+            &store,
+            "self-replace",
+            vec![TaskConfig {
+                resources: json!({ "memory": 6000 }),
+                ..TaskConfig::new("api", "noop")
+            }],
+        )?;
+        let scheduler = Scheduler::new(&store)?;
+        let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
+        assert_eq!(outcome.allocations.len(), 1);
+
+        // A second Fresh plan for the SAME config (the planner drops the
+        // config's own allocations from its ledger). If the apply-time
+        // reconstruction counted the surviving row, 6000 + 6000 > 8192
+        // would reject a plan the planner legitimately built.
+        let task_id = task_id_for(&store, &job_config_id, "api")?;
+        let epochs = store.allocation_version_vector_for_candidates(&job_config_id, &["node-a"])?;
+        let submission = store.insert_plan_submission(
+            &job_config_id,
+            "fresh",
+            &[("node-a".to_string(), task_id)],
+            &epochs,
+        )?;
+        match store.apply_plan_submission(&submission)? {
+            crate::storage::store::PlanApplyOutcome::Applied(allocations) => {
+                assert_eq!(allocations.len(), 1);
+            }
+            crate::storage::store::PlanApplyOutcome::Rejected { reason, .. } => {
+                panic!("fresh-mode self-replacement must not be double counted: {reason}")
+            }
+        }
+
+        Ok(())
+    }
+
     #[test]
     fn lazy_version_sample_is_the_default_and_fences_a_second_job() -> R<()> {
         let store = setup_store()?;
@@ -5592,13 +5780,12 @@ mod tests {
         ] {
             let store = setup_store_with_scheduler("bin_pack", Some(bad.clone()))?;
             store.insert_node(make_node_msg("node-a", json!({})))?;
-            let job_config_id =
-                submit_job(&store, "sample-bad", vec![TaskConfig::new("api", "noop")])?;
-            let scheduler = Scheduler::new(&store)?;
+            submit_job(&store, "sample-bad", vec![TaskConfig::new("api", "noop")])?;
+            // Settings parse once at construction now, so a malformed
+            // setting fails Scheduler::new (fail-fast) instead of the
+            // first plan.
             assert!(
-                scheduler
-                    .plan_only(&job_config_id, PlanMode::Fresh)
-                    .is_err(),
+                Scheduler::new(&store).is_err(),
                 "malformed setting must be rejected: {bad}"
             );
         }

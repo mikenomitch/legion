@@ -40,6 +40,13 @@ pub enum StopCause {
     Destroy,
     /// The node was removed or declared lost; its allocations were cleared.
     NodeLost,
+    /// The task's count was lowered by `legion job scale`, and this
+    /// allocation was surplus (docs/autoscaling.md). Distinct from
+    /// [`StopCause::Update`] on purpose: a scale-in changes no job config
+    /// version and starts no rollout, which is the whole premise of the
+    /// count-override surface — reporting it as an update would tell a task
+    /// it is being replaced by a new version when it is not.
+    ScaleIn,
     /// The allocation was preempted to make room for higher-priority work.
     ///
     /// Reserved for Phase 3 of the preemption plan; nothing emits it yet.
@@ -65,6 +72,7 @@ impl StopCause {
             StopCause::Reschedule => "reschedule",
             StopCause::Destroy => "destroy",
             StopCause::NodeLost => "node_lost",
+            StopCause::ScaleIn => "scale_in",
             StopCause::Preempted => "preempted",
             StopCause::Unknown => "unknown",
         }
@@ -82,6 +90,7 @@ impl StopCause {
             "reschedule" => StopCause::Reschedule,
             "destroy" => StopCause::Destroy,
             "node_lost" => StopCause::NodeLost,
+            "scale_in" => StopCause::ScaleIn,
             "preempted" => StopCause::Preempted,
             _ => StopCause::Unknown,
         }
@@ -113,6 +122,7 @@ mod stop_cause_test {
             StopCause::Reschedule,
             StopCause::Destroy,
             StopCause::NodeLost,
+            StopCause::ScaleIn,
             StopCause::Preempted,
             StopCause::Unknown,
         ] {

@@ -19,6 +19,7 @@ How to use it:
 
 | PR | What it lands | Notes |
 | --- | --- | --- |
+| (branch `claude/pre-benchmark-features-mlgzyx`) | Pre-benchmark hardening: apply-time resource re-validation, raft engine metrics, worker /metrics + OTLP push, eval-path fixes, scheduler plan-path cleanups, `legion job scale` (autoscaler phase 1) | [calls](calls/pre-benchmark-hardening_calls.md) · [autoscaler calls #5/#7](calls/autoscaler-plan_calls.md) |
 | [#162](https://github.com/mikenomitch/legion/pull/162) | Lanes hardening: worker-write forwarding, split-tolerant submits, adversarial fixes | Plan §8 + calls doc in [durability-and-ops-execution-plan.md](plans/durability-and-ops-execution-plan.md) |
 | [#143](https://github.com/mikenomitch/legion/pull/143) | Note the node-level builtin resource override gap | Docs only; the fix itself is a todo below |
 | [#84](https://github.com/mikenomitch/legion/pull/84) | Instrument DB hot paths, batch task-status updates | Old; rebase or close |
@@ -115,13 +116,15 @@ How to use it:
       cached sorted node list + Arc'd pool values, 2026-07-30); the
       plan-submission insert is fused into the apply (one quorum commit,
       2026-07-29); the O(fleet) `version_sample` is lazy (D4) and plan
-      applies group-commit (D5), 2026-07-30. Remaining measured candidates:
-      per-task duplicated `ConstraintSet`/`PermitSet` parsing
-      (`build_plan` group filters vs `build_task_plan`), per-plan
-      `scheduler_settings` JSON walks (`weights`/`nodes_considered`), the
-      index shard-sort under `budget: None`, and the blocking
-      `thread::sleep` in `plan_with_conflict_retries` on the async eval
-      path.
+      applies group-commit (D5), 2026-07-30; eval handling (including
+      `plan_with_conflict_retries`' backoff sleeps) runs on the blocking
+      pool instead of parking tokio runtime workers (2026-07-30); the
+      remaining measured candidates all landed 2026-07-30 — shared
+      per-task `ConstraintSet`/`PermitSet` parsing, settings parsed once
+      at `Scheduler::new`, and the index shard-sort skipped when the
+      caller discards the order (before/after in
+      [benchmarks/scheduler/README.md](../benchmarks/scheduler/README.md)).
+      Further wins want profiling, not this list.
 - [x] Scheduler performance measurement stack
       ([plan](plans/scheduler-performance-plan.md),
       [calls](calls/scheduler-performance-plan_calls.md),
@@ -219,27 +222,29 @@ How to use it:
       *availability* on the fresh row, closing the cordon/lost race the
       epoch CAS structurally cannot see.
       [Calls #4](calls/durability-and-ops-execution-plan_calls.md)
-- [ ] Apply-time re-validation of node resource TOTALS: a worker
-      re-registration that shrinks capacity (or `reservedResources` /
-      `maxAllocations` changes) between plan snapshot and apply bumps no
-      allocation epoch and is not re-checked at apply — a plan can commit
-      placements exceeding the node's new capacity. Ports are apply-safe
-      (re-read in the apply tx); resources are the odd one out. Needs
-      ledger reconstruction inside the apply tx (cheaper now that
-      `node_pools` caches free capacity), or an epoch bump on
-      resource-affecting node updates (cross-lane under `lanes` — wants a
-      plan). Found by the 2026-07-28 adversarial pass.
+- [x] Apply-time re-validation of node resource TOTALS (2026-07-30): the
+      plan-apply transaction reconstructs each placement node's free pool
+      from the fresh node row and the allocation rows the transaction can
+      see (`ResourcePool::free_from_rows`), mirroring the planner's ledger
+      (Fresh plans exclude the replaced job's own rows), and rejects
+      placements a capacity shrink no longer fits — closing the window
+      where a worker re-registration shrinking capacity (or
+      `reservedResources`/`maxAllocations` changes) between snapshot and
+      apply bumped no epoch and was never re-checked. Ports were already
+      apply-safe; resources now match. Found by the 2026-07-28 adversarial
+      pass.
 - [ ] Volume-pin staleness in planning: pins are read mid-plan-build with
       no epoch coupling, so a pin invalidated mid-plan (e.g.
       `volume delete --force`) can still direct a placement; later
       reconciliation covers it. Low severity, same pass.
-- [ ] A raft-mode CONCURRENT-planning oversubscription test through the
-      real `Scheduler::plan_and_apply` path. The local_disk concurrency
-      test exists (`concurrent_plans_cannot_oversubscribe_a_node`) and the
-      raft batteries exercise plan CAS mechanics, but no test drives two
-      planners against raft's commit-then-project ordering — the exact
-      window the epoch mirror closes. The mirror's coherence is structural,
-      so this is regression insurance, not a known gap.
+- [x] A raft-mode CONCURRENT-planning oversubscription test through the
+      real `Scheduler::plan_and_apply` path (2026-07-30):
+      `concurrent_planners_cannot_oversubscribe_under_raft[_lanes]` in
+      [tests/raft_apply_roundtrip.rs](../tests/raft_apply_roundtrip.rs)
+      drives two barrier-released planners against raft's
+      commit-then-project ordering under both topologies — the exact
+      window the epoch mirror closes. Regression insurance; the local_disk
+      twin is `concurrent_plans_cannot_oversubscribe_a_node`.
 - [ ] Let a node override its builtin resource capacity (`cpu`, `memory`, `cores`)
     - `ResourcePool::from_node` skips builtin names when reading a node's
       `resources` block, so `resources: { cpu: 40000 }` in a worker config is
@@ -525,7 +530,16 @@ Plans: [persistence-plan.md](plans/persistence-plan.md), [multi-raft-persistence
         in [tests/raft_perf_smoke.rs](../tests/raft_perf_smoke.rs);
         numbers in [docs/multi-raft.md](../docs/multi-raft.md) § "Lane
         isolation A/B".
-  - [ ] Per-lane tuning knobs, bottleneck tracing, Raft health UI
+  - [x] Raft engine metrics + per-lane bottleneck tracing (2026-07-30):
+        the full `legion_raft_*` series — per-lane term / commit_index /
+        applied_index / apply_lag / is_leader gauges on the checker tick,
+        plus `capture_seconds` vs `propose_apply_seconds` histograms and
+        `ops_total{lane,outcome}` at the replication call site, with a
+        per-op debug trace of the capture/propose phase split
+        ([docs/metrics.md](../docs/metrics.md)). Snapshot timings and
+        per-peer replication lag stay reserved.
+  - [ ] Per-lane tuning knobs and a Raft health UI page (the remaining
+        two-thirds of the old "knobs, tracing, UI" item)
   - [ ] Speculative: Raft autopilot
   - [ ] Idempotency records are not atomic with their mutation: an RPC that
         errors after its mutation but before `idempotency_record` (control
@@ -533,9 +547,9 @@ Plans: [persistence-plan.md](plans/persistence-plan.md), [multi-raft-persistence
         (`create_instance`) that duplicates the instance. Fold the record
         into the mutating op's own capture (it is JC-28 commutative, so any
         lane may carry it). Found by the 2026-07-28 split inventory.
-  - [ ] Eval NotRaftLeader retries are a flat 5s forever; with the churn
-        loops fixed this only delays split-parked evals, but backoff +
-        jitter would quiet the logs.
+  - [x] Eval NotRaftLeader retries back off exponentially (5s base → 60s
+        cap, 1s jitter, in-process attempt tracking that resets on
+        completion or failover) instead of a flat 5s forever (2026-07-30).
   - [ ] `destroy_job` under a standing split half-applies from the status/
         scheduler side (cleanups land, control delete rejected) until a
         retry against the control leader completes it. Consider reordering
@@ -605,7 +619,27 @@ docs: [observability.md](../docs/observability.md), [logging.md](../docs/logging
 - [ ] A trace viewer in the UI (make it dev-only at first)
 - [x] Metrics endpoint and health probes — Prometheus `/metrics`, `/healthz`,
       `/readyz` ([docs/metrics.md](../docs/metrics.md), [#137](https://github.com/mikenomitch/legion/pull/137)).
-      Broader instrumentation (worker-side metrics, OTLP metric push) still open.
+- [x] Worker-side `/metrics` + OTLP metrics push (2026-07-30): opt-in
+      worker Prometheus listener (`LEGION_WORKER_TELEMETRY_PORT`;
+      `legion_worker_*` heartbeat/allocation families) and an OTLP/HTTP
+      metrics push for both registries (`OTEL_*` env conventions,
+      cumulative temporality, full histogram buckets) —
+      [docs/metrics.md](../docs/metrics.md),
+      [docs/observability.md](../docs/observability.md). Per-task runtime
+      metrics on workers still open (below).
+- [ ] Worker per-task runtime metrics (CPU/memory usage per allocation) —
+      also wanted by autoscaler phase 2, which collects usage via
+      heartbeats; build together.
+- [ ] Feed simulated fleets into the `legion_worker_*` families. Found
+      merging the worker-telemetry and `--simulate N` branches (2026-07-30):
+      [simulate.rs](../src/worker/simulate.rs) runs its own heartbeat loop
+      with private `heartbeats_ok`/`heartbeats_failed` atomics and never
+      starts the worker telemetry listener, so a simulated host exposes no
+      metrics — exactly the fleets the AWS campaign scrapes. Either have the
+      fleet loop update the shared registry (one process, N nodes: prefer
+      counters and a fleet-size gauge over per-node series) or give the
+      harness its own `/metrics`. Noted in
+      [docs/metrics.md](../docs/metrics.md) § Worker.
 - [x] Refresh [docs/observability.md](../docs/observability.md) — corrected; it
       had claimed OTLP export did not exist while [src/otel.rs](../src/otel.rs)
       ships it ([#137](https://github.com/mikenomitch/legion/pull/137))
@@ -631,10 +665,25 @@ The Pack/Helm equivalent. Job templates are in flight on
 Each of these should run inside the core binary *and* be splittable into its own
 job, so day 1 is simple and day N is performant. Each needs its own plan.
 
-- [ ] **Autoscaler** — [plan](plans/autoscaler-plan.md) (PLANNED) ·
+- [ ] **Autoscaler** — [plan](plans/autoscaler-plan.md) (IN EXECUTION) ·
       [calls](calls/autoscaler-plan_calls.md)
-  - [ ] Phase 1 — `legion job scale`: count overrides outside the job version,
-        `job_scale` eval, `scale` ACL resource, resubmit-ownership rules
+  - [x] Phase 1 — `legion job scale` (2026-07-30,
+        [docs/autoscaling.md](../docs/autoscaling.md)): `task_scale` count
+        overrides outside the job version (control-lane; see calls #5),
+        effective counts in every desired-count reader (scheduler plans,
+        slot retirement, rollout group plans), the `job_scale` eval
+        (retire surplus + reschedule shortfall), the ECS rollout rule with
+        `pending_count` promotion on terminal rollouts (calls #7),
+        `base_count` resubmit arbitration, the `scale` ACL resource,
+        ScaleTask/GetJobScaleStatus RPCs, CLI (`legion job scale`), MCP
+        tools, events, and the `scale_in` stop cause reported to the
+        worker whose allocation was retired (added merging with Phase 1a
+        of the preemption plan — calls #16). Deferred within phase 1: counts in
+        `legion job info` (scale status is the view), an ACL-scenario
+        test proving `scale:write` cannot RunJob (the endpoint matrix
+        covers the deny side), and regenerating `ui/src/gen/legion_pb.ts`
+        (no UI surface consumes the new RPCs yet; run the ui/README
+        protoc command when the scaling panel is built).
   - [ ] Phase 2 — per-allocation CPU/memory usage collection (heartbeat →
         `allocation_health`), request-vs-usage in CLI/UI
   - [ ] Phase 3 — task autoscaler MVP: `scaling { min, max, target }` block,

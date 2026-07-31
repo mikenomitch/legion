@@ -26,6 +26,7 @@ export type AclResource =
   | 'exec'
   | 'action'
   | 'template'
+  | 'scale'
 
 export type AclActionKind = 'read' | 'write'
 

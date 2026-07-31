@@ -78,6 +78,10 @@ fn endpoint_table() -> Vec<(&'static str, Plane)> {
         ("StopRollout", Plane::Protected("job:write")),
         ("PlanJob", Plane::Protected("job:read")),
         ("StopJob", Plane::Protected("job:write")),
+        // The `scale` resource is deliberately separate from `job`
+        // (docs/autoscaling.md): resize rights without redeploy rights.
+        ("ScaleTask", Plane::Protected("scale:write")),
+        ("GetJobScaleStatus", Plane::Protected("scale:read")),
         ("DestroyJob", Plane::Protected("job:write")),
         ("ListJobs", Plane::Protected("job:read")),
         ("UpsertJobTemplate", Plane::Protected("template:write")),
@@ -430,6 +434,26 @@ async fn call_endpoint(
                 StopJobRequest {
                     name: JOB_NAME.into(),
                     ..Default::default()
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "ScaleTask" => svc
+            .scale_task(req(
+                ScaleTaskRequest {
+                    name: JOB_NAME.into(),
+                    count: Some(2),
+                    ..Default::default()
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "GetJobScaleStatus" => svc
+            .get_job_scale_status(req(
+                GetJobScaleStatusRequest {
+                    name: JOB_NAME.into(),
                 },
                 token,
             ))

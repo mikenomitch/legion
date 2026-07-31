@@ -250,3 +250,39 @@ Readings:
   short at driver-limited batch sizes — with real arrival concurrency
   (batch 128) the same commit rate (~100 commits/s observed) covers
   ~12,800 hb/s. `heartbeatSeconds` remains the fleet-wide knob on top.
+
+## Plan-path cleanups: shared filter parsing, cached settings, optional shard sort — 2026-07-30
+
+Three measured leftovers from the TODO's "slowest bits" list, in one pass
+(dev container, Criterion, back-to-back before/after runs on the same
+host state):
+
+- **Per-task `ConstraintSet`/`PermitSet` parsing deduplicated** —
+  `build_plan`'s group-filter pass and `build_task_plan` each parsed
+  every task's constraints and permit; they now share one `Arc`'d parse
+  per task per plan.
+- **`scheduler_settings` walks hoisted to `Scheduler::new`** — weights,
+  `nodes_considered`, and `score_sample` were re-parsed from the settings
+  JSON on every `build_plan`; they are parsed once per scheduler now
+  (and malformed settings fail at construction instead of the first
+  plan).
+- **Index shard-sort skipped when the order is discarded** — the
+  index query's nearest-fit cell sort only matters when candidates may
+  be truncated to a best-first budget; the untruncated path re-sorts
+  verified candidates by node id, so it now passes `ordered: false` and
+  skips the sort (and the ordered path ranks each cell once instead of
+  recomputing ranks inside the comparator).
+
+| Cell | before | after | delta |
+| --- | --- | --- | --- |
+| `scheduler_speed/bin_pack/nodes_1000_allocs_100` (plan-and-apply) | 25.81 ms | 25.19 ms | −2.4% (p = 0.02) |
+| `candidate_construction/indexes_off/nodes_5000` (plan-only) | 32.11 ms | 32.88 ms | noise (CIs overlap) |
+| `candidate_construction/indexes_on/nodes_5000` (plan-only) | 26.27 ms | 26.02 ms | noise |
+
+Honest reading: the wins are real but small at these shapes — constraint
+JSON in the bench cells is tiny (two keys), the topo index's shards hold
+few cells, and the settings walk was microseconds each. The changes are
+kept because they scale with what the benchmark shapes don't stress
+(constraint complexity, task count, cells per shard) and they remove
+per-plan work with no behavioral cost; the `-2.4%` on the whole
+plan-and-apply path is the aggregate. No cell regressed outside noise.

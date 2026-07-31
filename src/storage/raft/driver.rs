@@ -1341,9 +1341,19 @@ fn execute_replicated(
     // A leadership loss between this check and `client_write` still
     // surfaces as the same typed error through `map_write_error`.
     let lane_label = (!single_topology).then(|| lane.wire_name());
+    // Engine metrics label: the raft GROUP the op commits through — under
+    // `single` topology every lane rides the one `control` group, so its
+    // capture/propose latency is that group's (docs/metrics.md, Raft).
+    let metric_lane = if single_topology {
+        Lane::Control.wire_name()
+    } else {
+        lane.wire_name()
+    };
+    let telemetry = crate::manager::telemetry::metrics();
     {
         let metrics = raft.metrics().borrow().clone();
         if metrics.state != ServerState::Leader {
+            telemetry.raft_ops_total.inc(&[metric_lane, "not_leader"]);
             let context = match lane_label {
                 Some(lane) => format!("raft op {op} must run on the {lane} lane's leader"),
                 None => format!("raft op {op} must run on the leader"),
@@ -1355,11 +1365,24 @@ fn execute_replicated(
             .context(context));
         }
     }
-    let (value, changeset) = capture::capture_mutation(store, lane, f)?;
+    let capture_started = std::time::Instant::now();
+    let captured = capture::capture_mutation(store, lane, f);
+    let capture_elapsed = capture_started.elapsed();
+    telemetry
+        .raft_capture_seconds
+        .observe(&[metric_lane], capture_elapsed.as_secs_f64());
+    let (value, changeset) = match captured {
+        Ok(captured) => captured,
+        Err(error) => {
+            telemetry.raft_ops_total.inc(&[metric_lane, "error"]);
+            return Err(error);
+        }
+    };
     if changeset.is_empty() {
         // The mutation touched no rows (e.g. an idempotent no-op): there is
         // no effect to replicate and nothing another replica could apply, so
         // skip the raft entry entirely.
+        telemetry.raft_ops_total.inc(&[metric_lane, "empty"]);
         return Ok(value);
     }
     // Capture-time single-writer ownership guard (plan §7-C2, JC-26): every
@@ -1378,9 +1401,30 @@ fn execute_replicated(
         op: op.to_string(),
         changeset,
     };
-    handle
-        .block_on(raft.client_write(command))
-        .map_err(|err| map_write_error(op, lane_label, err))?;
+    let propose_started = std::time::Instant::now();
+    let write_result = handle.block_on(raft.client_write(command));
+    let propose_elapsed = propose_started.elapsed();
+    telemetry
+        .raft_propose_apply_seconds
+        .observe(&[metric_lane], propose_elapsed.as_secs_f64());
+    match write_result {
+        Ok(_) => telemetry.raft_ops_total.inc(&[metric_lane, "applied"]),
+        Err(err) => {
+            telemetry.raft_ops_total.inc(&[metric_lane, "error"]);
+            return Err(map_write_error(op, lane_label, err));
+        }
+    }
+    // Per-lane bottleneck trace: one debug line per replicated op with the
+    // phase split (local capture vs propose→quorum→apply), so a slow lane
+    // can be attributed without a profiler. Kept at debug — the histograms
+    // above are the steady-state signal.
+    debug!(
+        lane = metric_lane,
+        op,
+        capture_ms = capture_elapsed.as_millis() as u64,
+        propose_apply_ms = propose_elapsed.as_millis() as u64,
+        "replicated op committed"
+    );
     Ok(value)
 }
 
