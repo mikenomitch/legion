@@ -608,6 +608,7 @@ fn seed_ui_test_data(store: &Store) -> R<()> {
             TaskConfig::new("api", "noop"),
             TaskConfig::new("worker", "noop"),
         ],
+        priority: Default::default(),
         rollout: None,
         rollout_by_group: Default::default(),
         version: None,
@@ -1493,6 +1494,7 @@ mod tests {
         // allocation once node-1's loss is confirmed.
         store.insert_node(node_msg("node-2", rfc3339_seconds_ago(0)?))?;
         let job = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "restart-survivor".into(),

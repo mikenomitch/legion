@@ -488,6 +488,7 @@ fn ab_job(name: &str) -> JobConfig {
     let mut task = TaskConfig::new("svc", "noop");
     task.count = legion::structs::job::TaskCount::new(1);
     JobConfig {
+        priority: Default::default(),
         rollout: None,
         rollout_by_group: Default::default(),
         name: name.to_string(),

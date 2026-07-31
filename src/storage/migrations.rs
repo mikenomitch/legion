@@ -1041,6 +1041,44 @@ pub fn get_migrations() -> Migrations<'static> {
         )",
         )
         .down("DROP TABLE IF EXISTS task_scale;"),
+        // ---------------------------------------------------------------
+        // Preemption and eviction, phases 1b-3. Everything below is
+        // additive and appended in the order it must apply. Per the note on
+        // `task_scale` above: `rusqlite_migration` tracks the applied COUNT,
+        // so new migrations always go at the end.
+        // ---------------------------------------------------------------
+        //
+        // Graceful stop (phase 1b): the ladder a task is stopped with, and
+        // the floor voluntary disruption may not cross. JSON columns rather
+        // than scalar ones because both blocks are small structs that will
+        // grow fields (a future `signal` per cause, a `maxUnavailable`)
+        // without wanting a migration each time — the same shape `restart`
+        // and `on_unhealthy` already use.
+        M::up("ALTER TABLE task_config ADD COLUMN stop JSONB;").down(""),
+        M::up("ALTER TABLE task_config ADD COLUMN disruption JSONB;").down(""),
+        // Who displaced a preempted allocation, carried on the stop notice so
+        // the heartbeat can hand the task a preemptor link in its on-disk
+        // notice. NULL for every other cause.
+        M::up("ALTER TABLE allocation_stop_notice ADD COLUMN preemptor_job STRING;").down(""),
+        M::up("ALTER TABLE allocation_stop_notice ADD COLUMN preemptor_band STRING;").down(""),
+        // Priority bands (phase 2). A column rather than a `meta` key: the
+        // preemption pass reads bands for every allocation on a candidate
+        // node, which is a join, not a JSON walk. Existing configs migrate to
+        // `normal`, which is exactly what absent means.
+        M::up("ALTER TABLE job_config ADD COLUMN priority STRING NOT NULL DEFAULT 'normal';")
+            .down(""),
+        // Allocation age (phase 3), for `preemption.victimExemptAge` — the
+        // cheapest thrash guard there is: an allocation that just started is
+        // not a victim, so a preemption cannot immediately undo the placement
+        // a previous one made. NULL on pre-migration rows and read as
+        // "older than any exempt window", which is true by construction.
+        M::up("ALTER TABLE allocation ADD COLUMN created_at_unix INTEGER;").down(""),
+        // Evictions ride the plan (phase 3). The plan format could only ever
+        // ADD allocations; this column is what lets one express a removal, so
+        // victims and the placements they pay for commit in a single
+        // transaction under a single epoch compare-and-set.
+        M::up("ALTER TABLE plan_submission ADD COLUMN evictions JSONB NOT NULL DEFAULT '[]';")
+            .down(""),
     ])
 }
 

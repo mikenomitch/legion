@@ -172,6 +172,27 @@ struct SubmittedJob {
     message: &'static str,
     job_name: String,
     job_config_id: String,
+    /// Advisory notes appended to the reply message. Today: the one warning
+    /// that a job's priority band cannot do what its author expects because
+    /// preemption is disabled — the Nomad discoverability failure inverted,
+    /// caught at submit rather than discovered from a troubleshooting guide.
+    warnings: Vec<String>,
+}
+
+impl SubmittedJob {
+    /// The reply message plus any warnings, one per line.
+    fn message_with_warnings(&self) -> String {
+        if self.warnings.is_empty() {
+            return self.message.to_string();
+        }
+        let mut message = self.message.to_string();
+        for warning in &self.warnings {
+            message.push('\n');
+            message.push_str("warning: ");
+            message.push_str(warning);
+        }
+        message
+    }
 }
 
 /// Store record -> proto message for one template version.
@@ -1128,7 +1149,10 @@ impl ManagerDaemonService {
         identity: &AclIdentity,
         js: &str,
         mut subs: Vec<Submission>,
-        priority: i64,
+        // Explicit eval-queue override (`--priority`/`--asap`). `None` lets
+        // the job's priority band set the queue position, which is the
+        // default and the point of having one field mean both things.
+        priority: Option<i64>,
         force_reschedule: bool,
         template: Option<&JobTemplateProvenance>,
     ) -> Result<SubmittedJob, Status> {
@@ -1149,11 +1173,31 @@ impl ManagerDaemonService {
         // the template the submission is going through — never the job's
         // stored provenance (that would let a template-scoped identity push
         // arbitrary specs to a job its template once created).
+        // The band is normalized (absent = `normal`) BEFORE enforcement, on
+        // both the plain and the through-a-template submit path. Two
+        // consequences, both required: a `bands`-scoped policy matches
+        // un-banded submissions instead of silently granting nothing, and a
+        // template that renders `priority: 'critical'` is gated by the same
+        // rule as a hand-written spec — a RunJob-only check would be
+        // bypassable by rendering.
         let scope = match template {
             Some(template) => AclScope::job_via_template(&config.name, &template.name),
             None => AclScope::job(&config.name),
-        };
-        acl::enforce(identity, AclResource::Job, AclAction::Write, &scope)?;
+        }
+        .with_band(config.priority);
+        acl::enforce(identity, AclResource::Job, AclAction::Write, &scope).map_err(|status| {
+            if status.code() == tonic::Code::PermissionDenied
+                && config.priority != crate::structs::Band::default()
+            {
+                Status::permission_denied(format!(
+                    "{}: this token's policy does not allow submitting jobs in the `{}`                      priority band (see the `bands` selector in docs/auth-and-acls.md)",
+                    status.message(),
+                    config.priority
+                ))
+            } else {
+                status
+            }
+        })?;
 
         if let Some(template) = template {
             self.enforce_template_collision_guard(identity, &config.name, template)?;
@@ -1315,7 +1359,7 @@ impl ManagerDaemonService {
                     Some(&config.name),
                     Some(&job_config_id),
                     None,
-                    Some(priority),
+                    priority,
                 )
                 .map_err(|e| map_store_error("Error running job", e))
             {
@@ -1340,7 +1384,7 @@ impl ManagerDaemonService {
                     Some(&config.name),
                     Some(&job_config_id),
                     None,
-                    Some(priority),
+                    priority,
                 )
                 .map_err(|e| map_store_error("Error scheduling seeded instance placement", e))
             {
@@ -1360,7 +1404,58 @@ impl ManagerDaemonService {
             message,
             job_name: config.name.clone(),
             job_config_id,
+            warnings: self.band_submit_warnings(&config),
         })
+    }
+
+    /// Warn at submit when a job's priority band cannot do what its author
+    /// almost certainly expects.
+    ///
+    /// This is Nomad's biggest preemption ergonomics failure inverted. There,
+    /// `priority` sits in the jobspec doing nothing until an operator flips a
+    /// cluster API most users never find, and "preemption not working" grew
+    /// its own troubleshooting genre. Here the field always orders the eval
+    /// queue — but if it *cannot* displace running work, the submit says so
+    /// once, at the moment the expectation is formed.
+    fn band_submit_warnings(&self, config: &JobConfig) -> Vec<String> {
+        // Only a band that could displace something has an expectation to
+        // disappoint. `normal` and below are the default posture.
+        if !config.priority.outranks(crate::structs::Band::default()) {
+            return Vec::new();
+        }
+        let settings = match Scheduler::new(&self.store) {
+            Ok(scheduler) => scheduler.preemption_settings().clone(),
+            // A scheduler that will not build is a much louder problem than a
+            // missing advisory line; the submit itself already succeeded.
+            Err(_) => return Vec::new(),
+        };
+        match settings.mode {
+            crate::manager::scheduler::PreemptionMode::Off => vec![format!(
+                "job {} is priority `{}`, but preemption is off for this cluster \
+                 (schedulerSettings.preemption.mode). The band will order the eval queue and \
+                 cannot displace running work. See docs/preemption-and-eviction.md",
+                config.name, config.priority
+            )],
+            crate::manager::scheduler::PreemptionMode::Observe => vec![format!(
+                "job {} is priority `{}`, and preemption is in observe mode: victims will be \
+                 identified and journalled (`allocation.preempt_planned`) but nothing is \
+                 evicted, so the band cannot displace running work yet. See \
+                 docs/preemption-and-eviction.md",
+                config.name, config.priority
+            )],
+            crate::manager::scheduler::PreemptionMode::Enforce
+                if !settings.disabled_pools.is_empty() =>
+            {
+                vec![format!(
+                    "job {} is priority `{}`; preemption is enforced but disabled in pool(s) {}. \
+                     Tasks constrained to those pools cannot displace lower-band work",
+                    config.name,
+                    config.priority,
+                    settings.disabled_pools.join(", ")
+                )]
+            }
+            crate::manager::scheduler::PreemptionMode::Enforce => Vec::new(),
+        }
     }
 
     /// A template run may only create new jobs or update jobs whose latest
@@ -2356,7 +2451,7 @@ impl Manager for ManagerDaemonService {
         let inner = request.into_inner();
         let js = inner.parsed_jobspec;
         let subs = inner.submissions;
-        let priority = inner.priority.unwrap_or(self.store.default_eval_priority);
+        let priority = inner.priority;
         let idempotency_key = inner.idempotency_key.unwrap_or_default();
 
         if let Some(message) = self
@@ -2373,12 +2468,13 @@ impl Manager for ManagerDaemonService {
         let submitted =
             self.submit_rendered_job(&identity, &js, subs, priority, inner.force_reschedule, None)?;
 
+        let message = submitted.message_with_warnings();
         self.store
-            .idempotency_record(&idempotency_key, "run_job", submitted.message)
+            .idempotency_record(&idempotency_key, "run_job", &message)
             .map_err(|e| map_store_error("Error recording idempotency", e))?;
 
         Ok(Response::new(RunJobReply {
-            message: submitted.message.into(),
+            message,
             deduplicated: false,
         }))
     }
@@ -2598,7 +2694,10 @@ impl Manager for ManagerDaemonService {
             &identity,
             AclResource::Job,
             AclAction::Write,
-            &AclScope::job_via_template(&config.name, &template.name),
+            // Same band normalization as the submit path: a render whose
+            // output the caller could not submit should fail here, not at the
+            // submit that follows it.
+            &AclScope::job_via_template(&config.name, &template.name).with_band(config.priority),
         )?;
         validate_job_config(&config).map_err(|e| {
             Status::invalid_argument(format!("rendered jobspec failed validation: {e}"))
@@ -2625,7 +2724,7 @@ impl Manager for ManagerDaemonService {
             AclScope::any(),
         )?;
         let inner = request.into_inner();
-        let priority = inner.priority.unwrap_or(self.store.default_eval_priority);
+        let priority = inner.priority;
         let idempotency_key = inner.idempotency_key.unwrap_or_default();
 
         if let Some(recorded) = self
@@ -2696,7 +2795,7 @@ impl Manager for ManagerDaemonService {
         );
 
         let record = TemplateRunRecord {
-            message: submitted.message.to_string(),
+            message: submitted.message_with_warnings(),
             job_name: submitted.job_name.clone(),
             job_config_id: submitted.job_config_id.clone(),
         };
@@ -3174,10 +3273,17 @@ impl Manager for ManagerDaemonService {
             .map(|existing| artifact_pin_diffs(existing, &config))
             .unwrap_or_default();
 
-        let (plan, task_lookup, index_report, message, matches_existing, same_content) =
-            match existing_config {
+        let (
+            plan,
+            task_lookup,
+            index_report,
+            preemptions,
+            message,
+            matches_existing,
+            same_content,
+        ) = match existing_config {
                 Some(existing) if existing.is_same_as(&config) => {
-                    let (plan, index_report) = scheduler
+                    let (plan, index_report, preemptions) = scheduler
                         .plan_only_with_report(&existing.id(), PlanMode::Fresh)
                         .map_err(|e| {
                             error!("Error planning job {}: {:?}", existing.name, e);
@@ -3196,6 +3302,7 @@ impl Manager for ManagerDaemonService {
                         plan,
                         task_lookup,
                         index_report,
+                        preemptions,
                         "Job config unchanged; showing force-reschedule placements".to_string(),
                         true,
                         true,
@@ -3206,6 +3313,7 @@ impl Manager for ManagerDaemonService {
                         allocations,
                         task_lookup,
                         index_report,
+                        preemptions,
                     } = scheduler
                         .plan_for_config(&config, PlanMode::Fresh, Some(&config.name))
                         .map_err(|e| {
@@ -3216,6 +3324,7 @@ impl Manager for ManagerDaemonService {
                         allocations,
                         task_lookup,
                         index_report,
+                        preemptions,
                         "Job config changed; showing updated placements".to_string(),
                         true,
                         false,
@@ -3226,6 +3335,7 @@ impl Manager for ManagerDaemonService {
                         allocations,
                         task_lookup,
                         index_report,
+                        preemptions,
                     } = scheduler
                         .plan_for_config(&config, PlanMode::Fresh, None)
                         .map_err(|e| {
@@ -3236,6 +3346,7 @@ impl Manager for ManagerDaemonService {
                         allocations,
                         task_lookup,
                         index_report,
+                        preemptions,
                         "Job config new; showing placements".to_string(),
                         false,
                         false,
@@ -3281,12 +3392,26 @@ impl Manager for ManagerDaemonService {
             })
             .collect();
 
+        let preemptions = preemptions
+            .into_iter()
+            .map(|victim| crate::structs::PlannedPreemption {
+                node_id: victim.node_id,
+                job_id: victim.job_id,
+                task_name: victim.task_name,
+                band: victim.band.as_str().to_string(),
+                allocation_id: victim.allocation_id,
+                kill_after_seconds: victim.kill_after_secs,
+            })
+            .collect();
+
         let reply = PlanJobReply {
             allocations,
             message,
             matches_existing,
             same_content,
             index_usage,
+            preemptions,
+            preemption_mode: scheduler.preemption_settings().mode.as_str().to_string(),
         };
 
         Ok(Response::new(reply))
@@ -4885,9 +5010,11 @@ impl Manager for ManagerDaemonService {
         let stop_notices = match self.store.stop_notices_for_node(&id) {
             Ok(notices) => notices
                 .into_iter()
-                .map(|(allocation_id, cause)| StopNotice {
-                    allocation_id,
-                    cause: cause.as_str().to_string(),
+                .map(|notice| StopNotice {
+                    allocation_id: notice.allocation_id,
+                    cause: notice.cause.as_str().to_string(),
+                    preemptor_job: notice.preemptor_job,
+                    preemptor_band: notice.preemptor_band,
                 })
                 .collect(),
             Err(err) => {
@@ -7850,6 +7977,7 @@ mod tests {
     ) -> R<crate::structs::Allocation> {
         insert_node(store, "node-1")?;
         let job = JobConfig {
+            priority: Default::default(),
             name: job_name.into(),
             tasks: vec![task],
             rollout: None,
@@ -8188,6 +8316,7 @@ mod tests {
             ..TaskConfig::new("db", "noop")
         };
         let job = JobConfig {
+            priority: Default::default(),
             name: job_name.into(),
             tasks: vec![task],
             rollout: None,
@@ -8342,6 +8471,7 @@ mod tests {
     #[test]
     fn rollout_launch_config_defaults_to_default_strategy() -> R<()> {
         let config = JobConfig {
+            priority: Default::default(),
             name: "rollout-defaults".into(),
             tasks: vec![TaskConfig::new("api", "noop")],
             rollout: None,
@@ -8361,6 +8491,7 @@ mod tests {
     #[test]
     fn rollout_launch_config_serializes_manual_create_first() -> R<()> {
         let config = JobConfig {
+            priority: Default::default(),
             name: "rollout-manual".into(),
             tasks: vec![TaskConfig::new("api", "noop")],
             rollout: Some(crate::structs::RolloutConfig {
@@ -9491,6 +9622,7 @@ mod tests {
         insert_node(&store, "node-a")?;
 
         let v1 = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "replace-rollout".into(),
@@ -9507,6 +9639,7 @@ mod tests {
         let _v1_alloc = store.place_alloc("node-a", v1_task_id)?;
 
         let v2 = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "replace-rollout".into(),
@@ -9581,6 +9714,7 @@ mod tests {
         insert_node(&store, "node-a")?;
 
         let v1 = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "stop-rollout".into(),
@@ -9597,6 +9731,7 @@ mod tests {
         let _v1_alloc = store.place_alloc("node-a", v1_task_id)?;
 
         let v2 = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "stop-rollout".into(),
@@ -9678,6 +9813,7 @@ mod tests {
             ..TaskConfig::new("task", "noop")
         };
         let job = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: job_name.clone(),
@@ -9745,6 +9881,7 @@ mod tests {
         insert_node(&store, "node-a")?;
 
         let job = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "job".into(),
@@ -9791,6 +9928,7 @@ mod tests {
         insert_node(&store, "node-a")?;
 
         let job = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "artifact-fail-job".into(),
@@ -9859,6 +9997,7 @@ mod tests {
         insert_node(&store, "node-b")?;
 
         let job = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "job-non-owner".into(),
@@ -9896,6 +10035,7 @@ mod tests {
         insert_node(&store, "node-a")?;
         insert_node(&store, "node-b")?;
         let job = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "health-upsert".into(),
@@ -9962,6 +10102,7 @@ mod tests {
         insert_node(&store, "node-a")?;
 
         let v1 = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "rollout-health".into(),
@@ -9978,6 +10119,7 @@ mod tests {
         let old_alloc = store.place_alloc("node-a", v1_task_id)?;
 
         let v2 = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "rollout-health".into(),
@@ -10047,6 +10189,7 @@ mod tests {
         insert_node(&store, "node-a")?;
 
         let v1 = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "rollout-groups".into(),
@@ -10081,6 +10224,7 @@ mod tests {
         let old_api = store.place_alloc("node-a", v1_api)?;
 
         let v2 = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "rollout-groups".into(),
@@ -10219,6 +10363,7 @@ mod tests {
         insert_node(&store, "node-a")?;
 
         let v1 = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "rollout-events-api".into(),
@@ -10232,6 +10377,7 @@ mod tests {
         let v1_id = store.get_job_config(&v1.name)?.id();
 
         let v2 = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "rollout-events-api".into(),
@@ -10397,6 +10543,7 @@ mod tests {
         insert_node(&store, "node-a")?;
 
         let job = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "job".into(),
@@ -10432,6 +10579,7 @@ mod tests {
         insert_node(&store, "node-a")?;
 
         let job = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "batch-job".into(),
@@ -10505,6 +10653,7 @@ mod tests {
             "allow": allow,
         }))?);
         let job = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: format!("svc-{name}"),
@@ -10751,6 +10900,7 @@ mod tests {
 
     fn submit_keyed_job(store: &Store, name: &str, tasks: Vec<TaskConfig>) -> R<String> {
         let job = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: name.into(),

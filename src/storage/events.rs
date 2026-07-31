@@ -14,7 +14,8 @@ use std::time::Duration;
 
 use crate::artifacts::status::{ArtifactState, ArtifactStatus};
 use crate::storage::store::{JobSubmitOutcome, Store};
-use crate::structs::{Allocation, Eval, Node, StopCause};
+use crate::manager::scheduler::PlannedPreemption;
+use crate::structs::{Allocation, Band, Eval, Node, StopCause};
 
 /// Severity levels used by scheduler events.
 pub const EVENT_LEVEL_INFO: &str = "info";
@@ -353,6 +354,158 @@ pub mod drafts {
                 "count": removed.len(),
                 "jobConfigId": job_config_id,
                 "cause": StopCause::Update.as_str(),
+            })),
+        )
+    }
+
+    /// `allocation.stopping` (info) — allocations have entered their grace
+    /// window. `None` when nothing was removed or the cause is unknown.
+    ///
+    /// Distinct from `allocation.removed`, which says the rows are gone. This
+    /// says the *processes* are being asked to exit and names how long they
+    /// have — the interval that did not exist before graceful stop, and the
+    /// one an operator watching a drain actually wants to see.
+    ///
+    /// `grace_by_task` maps task config id to `stop.killAfter` seconds. The
+    /// window is the manager's expectation: the worker's real clock starts
+    /// when it delivers the signal, up to one heartbeat later.
+    pub fn allocations_stopping(
+        removed: &[Allocation],
+        cause: StopCause,
+        grace_by_task: &std::collections::HashMap<i64, u64>,
+    ) -> Option<EventDraft> {
+        if removed.is_empty() || !cause.is_known() {
+            return None;
+        }
+        let first = removed.first()?;
+        let max_grace = removed
+            .iter()
+            .filter_map(|alloc| grace_by_task.get(&alloc.task_config_id).copied())
+            .max()
+            .unwrap_or(0);
+        let allocations: Vec<Value> = removed
+            .iter()
+            .take(20)
+            .map(|alloc| {
+                json!({
+                    "allocationId": alloc.id,
+                    "nodeId": alloc.node_id,
+                    "taskConfigId": alloc.task_config_id,
+                    "graceSeconds": grace_by_task.get(&alloc.task_config_id).copied(),
+                })
+            })
+            .collect();
+        Some(
+            EventDraft::info(
+                "allocation.stopping",
+                format!(
+                    "Stopping {} allocation(s) for job {} ({cause}), up to {max_grace}s grace",
+                    removed.len(),
+                    first.job_id
+                ),
+            )
+            .job(&first.job_id)
+            .meta(json!({
+                "count": removed.len(),
+                "cause": cause.as_str(),
+                "maxGraceSeconds": max_grace,
+                "allocations": allocations,
+            })),
+        )
+    }
+
+    /// `allocation.preempted` (warn) — allocations were displaced to make
+    /// room for higher-priority work, naming the preemptor.
+    ///
+    /// The victim -> preemptor link is the point: "Preempted" on its own is
+    /// the complaint Kueue had to retrofit an answer to (its users could not
+    /// tell *which* policy displaced them). One event per victim job, so a
+    /// `legion events list --kind allocation.preempted` reads as a list of
+    /// who lost what to whom.
+    pub fn allocations_preempted(
+        victims: &[Allocation],
+        victim_band: Band,
+        preemptor_job: &str,
+        preemptor_band: Band,
+    ) -> Option<EventDraft> {
+        let first = victims.first()?;
+        let allocations: Vec<Value> = victims
+            .iter()
+            .take(20)
+            .map(|alloc| {
+                json!({
+                    "allocationId": alloc.id,
+                    "nodeId": alloc.node_id,
+                    "taskConfigId": alloc.task_config_id,
+                })
+            })
+            .collect();
+        Some(
+            EventDraft::warn(
+                "allocation.preempted",
+                format!(
+                    "Preempted {} allocation(s) of job {} ({}) to place job {} ({})",
+                    victims.len(),
+                    first.job_id,
+                    victim_band,
+                    preemptor_job,
+                    preemptor_band
+                ),
+            )
+            .job(&first.job_id)
+            .meta(json!({
+                "count": victims.len(),
+                "band": victim_band.as_str(),
+                "preemptorJob": preemptor_job,
+                "preemptorBand": preemptor_band.as_str(),
+                "allocations": allocations,
+            })),
+        )
+    }
+
+    /// `allocation.preempt_planned` (info) — observe mode. The victim
+    /// selection ran and named these allocations, and nothing was evicted.
+    ///
+    /// This is the evidence an operator asked for before enabling
+    /// `enforce`: it says exactly what enforce mode *would* have done, in the
+    /// same vocabulary, without doing it.
+    pub fn preemption_planned(
+        job_config_id: &str,
+        preemptor_job: &str,
+        preemptor_band: Band,
+        victims: &[PlannedPreemption],
+    ) -> Option<EventDraft> {
+        if victims.is_empty() {
+            return None;
+        }
+        let detail: Vec<Value> = victims
+            .iter()
+            .take(20)
+            .map(|victim| {
+                json!({
+                    "allocationId": victim.allocation_id,
+                    "nodeId": victim.node_id,
+                    "jobId": victim.job_id,
+                    "taskName": victim.task_name,
+                    "band": victim.band.as_str(),
+                })
+            })
+            .collect();
+        Some(
+            EventDraft::info(
+                "allocation.preempt_planned",
+                format!(
+                    "Would preempt {} allocation(s) to place job {preemptor_job} \
+                     ({preemptor_band}); preemption mode is observe, nothing was evicted",
+                    victims.len()
+                ),
+            )
+            .job(preemptor_job)
+            .meta(json!({
+                "jobConfigId": job_config_id,
+                "count": victims.len(),
+                "preemptorBand": preemptor_band.as_str(),
+                "victims": detail,
             })),
         )
     }

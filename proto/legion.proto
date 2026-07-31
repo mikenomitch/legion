@@ -1000,11 +1000,16 @@ message RunJobRequest {
   // Source submissions used to produce `parsed_jobspec`.
   repeated Submission submissions = 2;
 
-  // Optional eval priority override.
+  // Optional eval-queue priority override for THIS submission.
   //
-  // Higher values are processed sooner in the eval queue.
-  // Default when omitted: manager `default_priority`
-  // (`50` in built-in config defaults).
+  // Higher values are processed sooner in the eval queue. This overrides the
+  // queue position only; it does not change the job's priority band, and so
+  // it has no effect on preemption.
+  //
+  // Default when omitted: the eval priority implied by the jobspec's
+  // `priority` band — `critical` 90, `high` 70, `elevated` 60, `normal` 50,
+  // `low` 30, `background` 15 — falling back to the manager's
+  // `defaultPriority` (50) for a job whose band cannot be resolved.
   optional int64 priority = 3;
 
   // When true, enqueues a reschedule even when the job spec content is unchanged.
@@ -1647,6 +1652,49 @@ message PlanJobReply {
   // did. One entry per task the plan considered. See
   // docs/scheduling-indexes.md for the model.
   repeated TaskIndexUsage index_usage = 5;
+
+  // Allocations this plan would displace to make room for `allocations`.
+  //
+  // Empty when the plan places without preemption, which is the common case:
+  // the preemption pass only runs for a task that could not otherwise be
+  // placed. Populated in `enforce` mode (what a submit would evict) and in
+  // `observe` mode (what enforce mode *would* evict, given that observe
+  // commits nothing) — so the preview answers the same question either way.
+  //
+  // This is a plan against a snapshot, not a reservation. The real submit
+  // re-plans, so the victims it takes may differ if the cluster moved in
+  // between. See docs/preemption-and-eviction.md.
+  repeated PlannedPreemption preemptions = 6;
+
+  // The cluster's preemption mode at plan time: `enforce`, `observe` or
+  // `off`. Present so a client can explain an empty `preemptions` list —
+  // "nothing needed displacing" and "preemption is off" look identical
+  // otherwise, which is exactly the discoverability failure this field
+  // exists to prevent.
+  string preemption_mode = 7;
+}
+
+// One allocation a plan would displace.
+message PlannedPreemption {
+  // Node the victim runs on, which is also the node the preemptor would be
+  // placed on: preemption only ever frees the node it places onto.
+  string node_id = 1;
+
+  // Victim's job name.
+  string job_id = 2;
+
+  // Victim's task name.
+  string task_name = 3;
+
+  // Victim's priority band. Always strictly below the preempting job's.
+  string band = 4;
+
+  // Victim's allocation ID.
+  int64 allocation_id = 5;
+
+  // The victim's `stop.killAfter` in seconds — how long it gets between the
+  // stop signal and SIGKILL (docs/graceful-stop.md).
+  uint64 kill_after_seconds = 6;
 }
 
 // How candidate construction went for one planned task — the scheduling
@@ -2398,6 +2446,15 @@ message Job {
   // for rows written by a manager older than the column (backfilled once at
   // migration time).
   int64 updated_at = 5;
+
+  // Priority band of the job's latest config: `critical`, `high`,
+  // `elevated`, `normal` (the default), `low`, or `background`.
+  //
+  // The band orders the eval queue and governs preemption: an allocation may
+  // only ever be displaced by a job in a STRICTLY higher band, never by a
+  // peer. See docs/preemption-and-eviction.md. Empty only when read from a
+  // manager that predates bands.
+  string priority = 6;
 }
 
 // Reply payload for ListJobs.
@@ -2599,12 +2656,28 @@ message StopNotice {
   // - `destroy` — the job was destroyed outright.
   // - `node_lost` — the node was removed or declared lost, clearing its
   //   allocations.
-  // - `preempted` — displaced to make room for higher-priority work.
-  //   Reserved; nothing emits this until preemption ships.
+  // - `preempted` — displaced to make room for higher-priority work
+  //   (docs/preemption-and-eviction.md).
+  // - `scale_in` — the task's count was lowered by `legion job scale` and
+  //   this allocation was surplus.
   //
   // Workers treat an unrecognized value as `unknown` and stop the allocation
   // anyway, so the manager may add causes without a coordinated upgrade.
   string cause = 2;
+
+  // Name of the job that displaced this allocation. Set only when `cause` is
+  // `preempted`; empty otherwise. The worker copies it into the on-disk stop
+  // notice (`LEGION_STOP_NOTICE_PATH`) so a task can tell "the platform
+  // wanted my capacity for job X" from "my operator stopped me".
+  //
+  // Best-effort, like the cause itself: a stop that reconciles before its
+  // notice arrives is still carried out, just without attribution.
+  string preemptor_job = 3;
+
+  // Priority band of the job named in `preemptor_job` (`critical`, `high`,
+  // `elevated`, `normal`, `low`, `background`). Empty when `preemptor_job`
+  // is.
+  string preemptor_band = 4;
 }
 
 // The endpoints one allocation may currently reach for one upstream service.

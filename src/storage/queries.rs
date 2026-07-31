@@ -80,11 +80,11 @@ id, status, resources, node_id, job_config_id, task_config_id,
 "#;
 
 pub const ALLOCATION_INSERT_ATTRS: &str = r#"
-status, resources, node_id, job_config_id, task_config_id, instance_id, network
+status, resources, node_id, job_config_id, task_config_id, instance_id, network, created_at_unix
 "#;
 
 pub const ALLOCATION_ATTRS_VALS: &str = r#"
-:status, :resources, :node_id, :job_config_id, :task_config_id, :instance_id, :network
+:status, :resources, :node_id, :job_config_id, :task_config_id, :instance_id, :network, :created_at_unix
 "#;
 
 lazy_static! {
@@ -226,6 +226,17 @@ pub const JOB_ATTRS: &str = r#"
 id, name, status, created_at, updated_at
 "#;
 
+// Read path. The priority band lives on `job_config`, not on `job` — it is a
+// property of a spec version, and a resubmit can change it — so the job's
+// current band is its latest config's, resolved by correlated subquery rather
+// than duplicated onto the job row where it would immediately drift.
+pub const JOB_SELECT_ATTRS: &str = r#"
+id, name, status, created_at, updated_at,
+    (SELECT priority FROM job_config
+     WHERE job_config.job_id = job.id
+     ORDER BY version DESC LIMIT 1) AS priority
+"#;
+
 // Upsert path only. `created_at` is deliberately absent: it is the job's
 // birth time and an upsert against an existing row must not move it (the
 // insert below is only reached when the row is missing, but a concurrent
@@ -241,14 +252,14 @@ pub const JOB_ATTRS_VALS: &str = r#"
 lazy_static! {
     pub static ref GET_JOB: String = format!(
         r#"
-    SELECT {JOB_ATTRS}
+    SELECT {JOB_SELECT_ATTRS}
     FROM job
     WHERE name = ?
     "#
     );
     pub static ref GET_JOBS: String = format!(
         r#"
-    SELECT {JOB_ATTRS}
+    SELECT {JOB_SELECT_ATTRS}
     FROM job;
     "#
     );
@@ -257,7 +268,7 @@ lazy_static! {
     INSERT INTO job ({JOB_ATTRS})
     VALUES ({JOB_ATTRS_VALS})
     ON CONFLICT(id) DO UPDATE SET {JOB_PARAM_SET}
-    RETURNING {JOB_ATTRS};
+    RETURNING {JOB_ATTRS}, NULL AS priority;
     "#
     );
 }
@@ -267,7 +278,7 @@ lazy_static! {
 //
 
 pub const JOB_CONFIG_ATTRS: &str = r#"
-id, name, type, meta, version, created_at, job_id
+id, name, type, meta, version, created_at, job_id, priority
 "#;
 
 // pub const JOB_CONFIG_PARAM_SET: &str = r#"
@@ -275,7 +286,7 @@ id, name, type, meta, version, created_at, job_id
 // "#;
 
 pub const JOB_CONFIG_ATTRS_VALS: &str = r#"
-:id, :name, :type, :meta, :version, :created_at, :job_id
+:id, :name, :type, :meta, :version, :created_at, :job_id, :priority
 "#;
 
 lazy_static! {
@@ -316,11 +327,11 @@ lazy_static! {
 //
 
 pub const TASK_CONFIG_ATTRS: &str = r#"
-id, name, runtime, count, count_per, group_name, lifecycle, schedule, depends_on, config, resources, constraints, permit, affinities, checks, on_unhealthy, kv_injections, job_id, job_config_id, identities, stateful, artifacts, network, service, actions, volumes, connect, restart
+id, name, runtime, count, count_per, group_name, lifecycle, schedule, depends_on, config, resources, constraints, permit, affinities, checks, on_unhealthy, kv_injections, job_id, job_config_id, identities, stateful, artifacts, network, service, actions, volumes, connect, restart, stop, disruption
 "#;
 
 pub const TASK_CONFIG_INSERT_ATTRS: &str = r#"
-name, runtime, count, count_per, group_name, lifecycle, schedule, depends_on, config, resources, constraints, permit, affinities, checks, on_unhealthy, kv_injections, job_id, job_config_id, identities, stateful, artifacts, network, service, actions, volumes, connect, restart
+name, runtime, count, count_per, group_name, lifecycle, schedule, depends_on, config, resources, constraints, permit, affinities, checks, on_unhealthy, kv_injections, job_id, job_config_id, identities, stateful, artifacts, network, service, actions, volumes, connect, restart, stop, disruption
 "#;
 
 // pub const TASK_CONFIG_PARAM_SET: &str = r#"
@@ -328,7 +339,7 @@ name, runtime, count, count_per, group_name, lifecycle, schedule, depends_on, co
 // "#;
 
 pub const TASK_CONFIG_ATTRS_VALS: &str = r#"
-:name, :runtime, :count, :count_per, :group_name, :lifecycle, :schedule, :depends_on, :config, :resources, :constraints, :permit, :affinities, :checks, :on_unhealthy, :kv_injections, :job_id, :job_config_id, :identities, :stateful, :artifacts, :network, :service, :actions, :volumes, :connect, :restart
+:name, :runtime, :count, :count_per, :group_name, :lifecycle, :schedule, :depends_on, :config, :resources, :constraints, :permit, :affinities, :checks, :on_unhealthy, :kv_injections, :job_id, :job_config_id, :identities, :stateful, :artifacts, :network, :service, :actions, :volumes, :connect, :restart, :stop, :disruption
 "#;
 
 lazy_static! {

@@ -17,13 +17,18 @@ use crate::scheduling_index::{IndexMode, IndexQueryOutcome};
 use crate::storage::errors::StorageError;
 use crate::storage::store::{PlanApplyOutcome, SharedNodeAllocations, Store};
 use crate::structs::{
-    Allocation, JobConfig, Node, TaskConfig, TaskDependencyCondition, TaskLifecycle,
+    Allocation, Band, JobConfig, Node, TaskConfig, TaskDependencyCondition, TaskLifecycle,
     TaskStatusState,
 };
 use policy::score_node_for_context;
 pub use policy::{load_policy, SchedulerWeights, SchedulingContext, SchedulingPolicy};
+pub use preemption::{
+    PlannedPreemption, PreemptionMode, PreemptionSettings, DEFAULT_VICTIM_EXEMPT_AGE,
+};
+use preemption::{eligible_victims, preemption_cost, select_victims, VictimCandidate};
 
 mod policy;
+mod preemption;
 
 const RESCHEDULE_SCORE_JITTER_THRESHOLD: f64 = 0.01;
 
@@ -59,6 +64,9 @@ impl PlanMode {
 pub struct PlanOutcome {
     pub allocations: Vec<Allocation>,
     pub deltas: Vec<LedgerDelta>,
+    /// Allocations this plan evicted, committed in the same transaction as
+    /// `allocations`. Empty on every plan that did not preempt.
+    pub evictions: Vec<crate::storage::store::PlanEviction>,
     /// Where the plan's wall-clock went, phase by phase (µs). Logged on
     /// completion, observed into `legion_scheduler_plan_phase_seconds`,
     /// and aggregated by the benchmark runners
@@ -161,6 +169,13 @@ impl TaskIndexUsage {
 struct BuiltPlan {
     placements: Vec<PlannedAllocation>,
     index_report: Vec<TaskIndexUsage>,
+    /// Allocations this plan will evict to make room for `placements`.
+    /// Committed in the same transaction as the placements, never
+    /// separately — that atomicity is the design's central claim.
+    evictions: Vec<PlannedPreemption>,
+    /// Victims `observe` mode identified and did not take. Never committed;
+    /// reported through `allocation.preempt_planned` and `job plan`.
+    observed_preemptions: Vec<PlannedPreemption>,
 }
 
 /// One plan's capacity state, taken from the read model in a single lock
@@ -196,6 +211,222 @@ enum NodesConsidered {
 struct ScoreSample {
     min_nodes: usize,
     sample: usize,
+}
+
+/// One node's preemption answer: where to place, and what it costs.
+#[derive(Debug, Clone)]
+struct PreemptionChoice {
+    node_id: String,
+    victims: Vec<VictimCandidate>,
+}
+
+/// The preemption state of one `build_plan` run.
+///
+/// Threaded through every placement in the plan rather than rebuilt per
+/// placement, for two reasons that are both correctness, not speed:
+///
+/// - the `disruption.minAvailable` floor has to hold across the whole plan
+///   (`taken_by_task`), or eight placements each take "one below the floor"
+///   and together take eight;
+/// - the victim metadata is loaded once and only on demand, so a plan that
+///   never needs preemption never touches the store for it.
+struct PreemptionPass {
+    /// The band of the job being placed.
+    preemptor_band: Band,
+    /// Job name of the preemptor, for events and stop notices.
+    preemptor_job: String,
+    /// Victim metadata by node, loaded lazily for the nodes actually asked
+    /// about. `None` until the first preemption attempt in this plan.
+    by_node: Option<HashMap<String, Vec<VictimCandidate>>>,
+    /// Victims this plan has committed to evicting.
+    victims: Vec<PlannedPreemption>,
+    /// Victims `observe` mode would have taken, for the event and preview.
+    observed: Vec<PlannedPreemption>,
+    /// How many victims this plan has already taken from each task, so
+    /// disruption floors bind across placements.
+    taken_by_task: HashMap<i64, u32>,
+    /// Why candidates were rejected, accumulated for the placement error.
+    rejected: preemption::IneligibleTally,
+    /// How many placements ran a preemption pass at all.
+    considered: usize,
+    /// False when the pass never ran because the mode or the pool disabled
+    /// it — which the "could not place" error should say, since it is the
+    /// most likely reason an operator is surprised.
+    enabled: bool,
+    /// Whether the whole cluster (not just a pool) has preemption off.
+    mode: PreemptionMode,
+}
+
+impl PreemptionPass {
+    fn new(preemptor_band: Band, preemptor_job: &str, settings: &PreemptionSettings) -> Self {
+        Self {
+            preemptor_band,
+            preemptor_job: preemptor_job.to_string(),
+            by_node: None,
+            victims: Vec::new(),
+            observed: Vec::new(),
+            taken_by_task: HashMap::new(),
+            rejected: preemption::IneligibleTally::default(),
+            considered: 0,
+            enabled: !matches!(settings.mode, PreemptionMode::Off),
+            mode: settings.mode,
+        }
+    }
+
+    /// Load victim metadata for any of `candidates` not already indexed.
+    fn load_candidates(
+        &mut self,
+        store: &Store,
+        resource_policy: &ResourcePolicy,
+        candidates: &[&Node],
+    ) -> R<()> {
+        let index = self.by_node.get_or_insert_with(HashMap::new);
+        let missing: Vec<&str> = candidates
+            .iter()
+            .map(|node| node.id.as_str())
+            .filter(|node_id| !index.contains_key(*node_id))
+            .collect();
+        if missing.is_empty() {
+            return Ok(());
+        }
+        // Seed every requested node, so an empty node is "loaded, nothing
+        // here" rather than "not loaded" and is never re-queried.
+        for node_id in &missing {
+            index.entry((*node_id).to_string()).or_default();
+        }
+        let rows = store.preemption_victim_metadata(&missing)?;
+        // The floor is measured against the task's live allocation count
+        // across the fleet, not just this node's share.
+        let mut running_by_task: HashMap<i64, u32> = HashMap::new();
+        for row in &rows {
+            *running_by_task.entry(row.task_config_id).or_default() += 1;
+        }
+        let now_unix = time::OffsetDateTime::now_utc().unix_timestamp();
+        for row in rows {
+            // An allocation whose resources will not parse is skipped rather
+            // than treated as free: the same fits-nothing posture the free
+            // pool takes for a bad row. Evicting something whose usage we
+            // cannot compute would not provably free what the placement
+            // needs.
+            let Ok(request) = resource_policy
+                .normalize_task_resources(&row.resources, false)
+                .and_then(|normalized| ResourceRequest::from_value(&normalized))
+            else {
+                warn!(
+                    allocation_id = row.allocation_id,
+                    "Allocation resources failed to parse; it is not a preemption candidate"
+                );
+                continue;
+            };
+            let disruption = row
+                .disruption_json
+                .as_deref()
+                .and_then(|raw| serde_json::from_str::<crate::structs::DisruptionConfig>(raw).ok());
+            let stop = row
+                .stop_json
+                .as_deref()
+                .and_then(|raw| serde_json::from_str::<crate::structs::StopConfig>(raw).ok())
+                .unwrap_or_default();
+            index
+                .entry(row.node_id.clone())
+                .or_default()
+                .push(VictimCandidate {
+                    allocation_id: row.allocation_id,
+                    node_id: row.node_id.clone(),
+                    job_id: row.job_id,
+                    job_config_id: row.job_config_id,
+                    task_config_id: row.task_config_id,
+                    task_name: row.task_name,
+                    band: row.band,
+                    request,
+                    age_secs: row.created_at_unix.map(|created| now_unix - created),
+                    min_available: disruption
+                        .map(|disruption| disruption.min_available_for(row.task_count))
+                        .unwrap_or(0),
+                    task_running: running_by_task
+                        .get(&row.task_config_id)
+                        .copied()
+                        .unwrap_or(1),
+                    node_pinned: row.node_pinned,
+                    kill_after_secs: stop.kill_after.as_secs(),
+                });
+        }
+        Ok(())
+    }
+
+    fn candidates_on_node(&self, node_id: &str) -> Vec<VictimCandidate> {
+        self.by_node
+            .as_ref()
+            .and_then(|index| index.get(node_id))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn record_tally(&mut self, tally: preemption::IneligibleTally) {
+        self.rejected.same_or_higher_band += tally.same_or_higher_band;
+        self.rejected.too_young += tally.too_young;
+        self.rejected.node_pinned += tally.node_pinned;
+        self.rejected.floor_bound += tally.floor_bound;
+    }
+
+    /// The "could not place" message, in band terms.
+    ///
+    /// Nomad's discoverability failure inverted: a user whose `high` job did
+    /// not place should not have to discover from a troubleshooting guide
+    /// that preemption was off, or that a floor held. The message names
+    /// whichever of those actually happened.
+    fn no_placement_error(&self, task_config: &TaskConfig) -> String {
+        let base = format!(
+            "Failed to place task {}: no available nodes matching constraints, permit, or resources",
+            task_config.name
+        );
+        if !self.preemptor_band.can_preempt() {
+            return format!(
+                "{base}. This job is in the lowest priority band ({}), so preemption cannot \
+                 make room for it (see docs/preemption-and-eviction.md)",
+                self.preemptor_band
+            );
+        }
+        if !self.enabled {
+            return format!(
+                "{base}. Preemption is off for this cluster \
+                 (schedulerSettings.preemption.mode), so a {} job cannot displace lower-band \
+                 work (see docs/preemption-and-eviction.md)",
+                self.preemptor_band
+            );
+        }
+        if matches!(self.mode, PreemptionMode::Observe) && !self.observed.is_empty() {
+            return format!(
+                "{base}. Preemption is in observe mode: it identified {} evictable \
+                 allocation(s) but committed none. Set \
+                 schedulerSettings.preemption.mode to 'enforce' to act on it",
+                self.observed.len()
+            );
+        }
+        if self.considered == 0 {
+            return format!(
+                "{base}. Preemption did not run: every candidate node is in a pool where \
+                 preemption is disabled (schedulerSettings.preemption.disabledPools)"
+            );
+        }
+        if self.rejected.is_empty() {
+            return format!(
+                "{base}. Preemption ran but found nothing to displace: every feasible node is                  full of work at this band or above"
+            );
+        }
+        let detail = self.rejected.describe();
+        if detail.is_empty() {
+            format!(
+                "{base}. Preemption found no eligible victims on any feasible node. \
+                 Job stays under its desired count"
+            )
+        } else {
+            format!(
+                "{base}; preemption found no eligible victims ({detail}). \
+                 Job stays under its desired count"
+            )
+        }
+    }
 }
 
 /// Plan-time free-capacity ledger. Pools are `Arc`'d straight off the
@@ -422,6 +653,37 @@ impl PlanScoringCache {
         }
     }
 
+    /// Recompute one node's capacity view from the ledger.
+    ///
+    /// [`Self::update_after_placement`] only ever *debits*; preemption
+    /// credits a node when its victims are booked, so the cached
+    /// feasibility bitmap has to be rebuilt from the pool rather than
+    /// adjusted by a delta.
+    fn refresh_node(
+        &mut self,
+        node_id: &str,
+        resource_ledger: &ResourceLedger,
+        task_request: &ResourceRequest,
+    ) {
+        let Some(state) = self.node_states.get_mut(node_id) else {
+            return;
+        };
+        match resource_ledger.pools.get(node_id) {
+            Some(pool) => {
+                state.common_resources = CommonResourceAvailability::from_pool(pool);
+                state.common_feasibility_bitmap = state
+                    .common_resources
+                    .feasibility_bitmap(&self.common_demand);
+                state.can_fit_task_request = pool.can_fit(task_request);
+            }
+            None => {
+                state.common_resources = CommonResourceAvailability::default();
+                state.common_feasibility_bitmap = 0;
+                state.can_fit_task_request = false;
+            }
+        }
+    }
+
     fn required_common_bitmap(&self) -> u8 {
         let mut bitmap = 0u8;
         if self.common_demand.memory > 0.0 {
@@ -551,6 +813,10 @@ pub struct Scheduler<'a> {
     weights: SchedulerWeights,
     nodes_considered: Option<NodesConsidered>,
     score_sample: Option<ScoreSample>,
+    /// `schedulerSettings.preemption`. Parsed here for the same reason as the
+    /// settings above — and so a typo'd `mode` fails the manager at startup
+    /// rather than quietly evicting production work on the first busy plan.
+    preemption: PreemptionSettings,
 }
 
 #[derive(Debug, Clone)]
@@ -559,6 +825,10 @@ pub struct PlanConfigOutcome {
     pub task_lookup: HashMap<i64, String>,
     /// Per-task scheduling-index usage (docs/scheduling-indexes.md).
     pub index_report: Vec<TaskIndexUsage>,
+    /// Allocations this plan would displace. The whole point of the dry run
+    /// for anyone submitting work that outranks something: the submit becomes
+    /// a decision rather than a surprise.
+    pub preemptions: Vec<PlannedPreemption>,
 }
 
 impl<'a> Scheduler<'a> {
@@ -574,11 +844,20 @@ impl<'a> Scheduler<'a> {
             policy_lib,
             nodes_considered: None,
             score_sample: None,
+            preemption: PreemptionSettings::default(),
         };
         scheduler.weights = scheduler.scheduler_weights()?;
         scheduler.nodes_considered = scheduler.nodes_considered_setting()?;
         scheduler.score_sample = scheduler.score_sample_setting()?;
+        scheduler.preemption =
+            PreemptionSettings::from_scheduler_settings(store.scheduler_settings.as_ref())?;
         Ok(scheduler)
+    }
+
+    /// The cluster's preemption settings, for callers that need to report
+    /// them (the submit-time warning, `job plan`).
+    pub fn preemption_settings(&self) -> &PreemptionSettings {
+        &self.preemption
     }
 
     #[instrument(skip_all)]
@@ -587,13 +866,18 @@ impl<'a> Scheduler<'a> {
     }
 
     /// `plan_only`, additionally returning the per-task scheduling-index
-    /// usage report for the `job plan` explain surface.
+    /// usage report for the `job plan` explain surface, and the preemptions
+    /// the plan would make.
     #[instrument(skip_all)]
     pub fn plan_only_with_report(
         &self,
         job_config_id: &str,
         mode: PlanMode,
-    ) -> R<(Vec<PlannedAllocation>, Vec<TaskIndexUsage>)> {
+    ) -> R<(
+        Vec<PlannedAllocation>,
+        Vec<TaskIndexUsage>,
+        Vec<PlannedPreemption>,
+    )> {
         let started = std::time::Instant::now();
         let mode_label = mode.as_str();
         info!(%job_config_id, mode = mode_label, "Starting scheduler plan_only");
@@ -626,9 +910,12 @@ impl<'a> Scheduler<'a> {
             &snapshot.allocations_by_node,
         );
 
+        let preemptor = self.store.job_band_for_job_config(job_config_id)?;
         let BuiltPlan {
             placements,
             index_report,
+            evictions,
+            observed_preemptions,
         } = self.build_plan(
             job_config_id,
             nodes,
@@ -638,15 +925,25 @@ impl<'a> Scheduler<'a> {
             snapshot,
             mode,
             None,
+            (&preemptor.0, preemptor.1),
         )?;
         info!(
             %job_config_id,
             mode = mode_label,
             planned_allocations = placements.len(),
+            preempts = evictions.len(),
             elapsed_ms = started.elapsed().as_millis() as u64,
             "Completed scheduler plan_only"
         );
-        Ok((placements, index_report))
+        // A dry run reports the enforce-mode decision when there is one, and
+        // otherwise what observe mode declined to act on — so the preview
+        // answers "who would this displace" the same way in both modes.
+        let preemptions = if evictions.is_empty() {
+            observed_preemptions
+        } else {
+            evictions
+        };
+        Ok((placements, index_report, preemptions))
     }
 
     /// Takes the plan's capacity snapshot from the read model, optionally
@@ -725,6 +1022,8 @@ impl<'a> Scheduler<'a> {
         let BuiltPlan {
             placements,
             index_report,
+            evictions,
+            observed_preemptions,
         } = self.build_plan(
             &job_config.id(),
             nodes,
@@ -734,6 +1033,7 @@ impl<'a> Scheduler<'a> {
             snapshot,
             mode,
             None,
+            (&job_config.name, job_config.priority),
         )?;
         info!(
             job_id = %job_config.name,
@@ -748,6 +1048,14 @@ impl<'a> Scheduler<'a> {
             allocations: placements,
             task_lookup,
             index_report,
+            // A dry run reports what enforce mode WOULD evict, and what
+            // observe mode already declined to — so `job plan` previews the
+            // same decision either way (S3 in the plan).
+            preemptions: if evictions.is_empty() {
+                observed_preemptions
+            } else {
+                evictions
+            },
         })
     }
 
@@ -795,6 +1103,9 @@ impl<'a> Scheduler<'a> {
         let started = std::time::Instant::now();
         let mut timings = PlanTimings::default();
         info!(%job_config_id, mode = mode.as_str(), target_override = task_targets.is_some(), "Starting scheduler plan_and_apply");
+        // The band governs whether this plan may preempt at all, and names
+        // the preemptor in every victim's stop notice and event.
+        let (preemptor_job, preemptor_band) = self.store.job_band_for_job_config(job_config_id)?;
 
         // Optimistic-concurrency fence. Every transaction that mutates a
         // scope's allocations bumps that scope's epoch
@@ -823,7 +1134,7 @@ impl<'a> Scheduler<'a> {
         //   subset at submit time — never re-read. Safe regardless of what
         //   commits mid-plan, at O(fleet) cost.
         let mut eager_sample = !self.lazy_version_sample_enabled();
-        let (placement_pairs, affected_nodes, expected_versions) = loop {
+        let (placement_pairs, plan_evictions, affected_nodes, expected_versions) = loop {
             let available_started = std::time::Instant::now();
             let mut nodes = self.available_nodes()?;
             if let Some(excluded) = excluded_nodes {
@@ -903,6 +1214,8 @@ impl<'a> Scheduler<'a> {
             let BuiltPlan {
                 placements,
                 index_report,
+                evictions,
+                observed_preemptions,
             } = self.build_plan(
                 job_config_id,
                 nodes,
@@ -912,6 +1225,7 @@ impl<'a> Scheduler<'a> {
                 snapshot,
                 mode.clone(),
                 task_targets,
+                (&preemptor_job, preemptor_band),
             )?;
             timings.build_plan_us = build_started.elapsed().as_micros() as u64;
             let indexed_tasks = index_report
@@ -927,6 +1241,17 @@ impl<'a> Scheduler<'a> {
                 build_plan_ms = build_started.elapsed().as_millis() as u64,
                 "Scheduler build_plan completed"
             );
+            // Observe mode's selection never commits, but it is the evidence
+            // the mode exists to produce, so it is journalled here rather
+            // than dropped.
+            if !observed_preemptions.is_empty() {
+                self.store.record_observed_preemptions(
+                    job_config_id,
+                    &preemptor_job,
+                    preemptor_band,
+                    &observed_preemptions,
+                );
+            }
             if placements.is_empty() {
                 info!(%job_config_id, "No placements generated during plan_and_apply");
                 timings.total_us = started.elapsed().as_micros() as u64;
@@ -934,6 +1259,7 @@ impl<'a> Scheduler<'a> {
                 return Ok(PlanOutcome {
                     allocations: Vec::new(),
                     deltas: Vec::new(),
+                    evictions: Vec::new(),
                     timings,
                 });
             }
@@ -942,9 +1268,25 @@ impl<'a> Scheduler<'a> {
                 .iter()
                 .map(|placement| (placement.node_id.clone(), placement.task_config_id))
                 .collect::<Vec<_>>();
+            let plan_evictions = evictions
+                .iter()
+                .map(|victim| crate::storage::store::PlanEviction {
+                    allocation_id: victim.allocation_id,
+                    node_id: victim.node_id.clone(),
+                    job_id: victim.job_id.clone(),
+                    job_config_id: victim.job_config_id.clone(),
+                    task_config_id: victim.task_config_id,
+                    band: victim.band.as_str().to_string(),
+                })
+                .collect::<Vec<_>>();
+            // Victim nodes are always placement nodes (a victim only ever
+            // frees the node its preemptor lands on), so the epoch fence
+            // already covers them. Union them in anyway so the invariant is
+            // enforced by the code rather than by a comment.
             let affected_nodes = placements
                 .iter()
                 .map(|placement| placement.node_id.clone())
+                .chain(plan_evictions.iter().map(|victim| victim.node_id.clone()))
                 .collect::<HashSet<_>>();
             let expected_versions = match candidate_versions.as_ref() {
                 // Eager: select from the pre-planning sample; re-reading here
@@ -986,7 +1328,12 @@ impl<'a> Scheduler<'a> {
                     }
                 }
             };
-            break (placement_pairs, affected_nodes, expected_versions);
+            break (
+                placement_pairs,
+                plan_evictions,
+                affected_nodes,
+                expected_versions,
+            );
         };
         // One replicated op for insert + apply: on raft backends the split
         // form paid a second quorum round-trip per plan (see
@@ -997,6 +1344,7 @@ impl<'a> Scheduler<'a> {
             mode.as_str(),
             &placement_pairs,
             &expected_versions,
+            &plan_evictions,
         )?;
         let allocations = match apply_outcome {
             PlanApplyOutcome::Applied(allocations) => allocations,
@@ -1034,12 +1382,14 @@ impl<'a> Scheduler<'a> {
         let outcome = PlanOutcome {
             allocations,
             deltas,
+            evictions: plan_evictions,
             timings,
         };
         info!(
             %job_config_id,
             mode = mode.as_str(),
             applied_allocations = outcome.allocations.len(),
+            preempted_allocations = outcome.evictions.len(),
             affected_nodes = outcome.deltas.len(),
             apply_plan_submission_ms = apply_started.elapsed().as_millis() as u64,
             elapsed_ms = started.elapsed().as_millis() as u64,
@@ -1180,8 +1530,13 @@ impl<'a> Scheduler<'a> {
         capacity: CapacitySnapshot,
         mode: PlanMode,
         task_targets: Option<&HashMap<i64, u32>>,
+        preemptor: (&str, Band),
     ) -> R<BuiltPlan> {
         tasks.sort_by_key(|a| a.0);
+        // Preemption state for the whole plan: floors bind across placements,
+        // and the victim index loads at most once (and only if a placement
+        // actually fails for capacity).
+        let mut preemption_pass = PreemptionPass::new(preemptor.1, preemptor.0, &self.preemption);
 
         let CapacitySnapshot {
             allocations_by_node,
@@ -1468,6 +1823,7 @@ impl<'a> Scheduler<'a> {
                         weights,
                         group_key.as_ref(),
                         &mut group_assignments,
+                        &mut preemption_pass,
                     )?;
                 }
             } else {
@@ -1515,6 +1871,7 @@ impl<'a> Scheduler<'a> {
                     weights,
                     group_key.as_ref(),
                     &mut group_assignments,
+                    &mut preemption_pass,
                 )?;
             }
             index_report.push(plan.index_usage.clone());
@@ -1523,6 +1880,8 @@ impl<'a> Scheduler<'a> {
         Ok(BuiltPlan {
             placements,
             index_report,
+            evictions: preemption_pass.victims,
+            observed_preemptions: preemption_pass.observed,
         })
     }
 
@@ -1845,6 +2204,7 @@ impl<'a> Scheduler<'a> {
         weights: SchedulerWeights,
         group_key: Option<&GroupKey>,
         group_assignments: &mut HashMap<GroupKey, String>,
+        preemption: &mut PreemptionPass,
     ) -> R<()> {
         // Owned so the truncated-index refill below can widen it mid-task.
         let mut candidates: Vec<&'b Node> = candidates.to_vec();
@@ -1948,11 +2308,74 @@ impl<'a> Scheduler<'a> {
                 );
             }
 
+            // Preemption: the fleet has nodes this task is *allowed* on, they
+            // are simply full. Ask whether displacing lower-band work would
+            // open one. Runs only here — after normal feasibility has already
+            // failed — which is what makes the feature free for clusters that
+            // never use it.
+            let mut preempted_node: Option<String> = None;
             if eligible.is_empty() {
-                bail!(
-                    "Failed to place task {}: no available nodes matching constraints, permit, or resources",
-                    task_config.name
+                let full_but_allowed = Self::preemption_candidate_nodes(
+                    &candidates,
+                    plan.constraint_set(),
+                    plan.permit_set(),
+                    plan.distinct_tracker.as_ref(),
                 );
+                if let Some(chosen) = self.plan_preemption_for_placement(
+                    &full_but_allowed,
+                    task_config,
+                    &plan.task_request,
+                    resource_ledger,
+                    group_key.and_then(|key| group_assignments.get(key)).cloned(),
+                    pins.front().map(|(_, node_id)| node_id.clone()),
+                    preemption,
+                )? {
+                    // Book the victims against the ledger so the placement
+                    // below sees the capacity they free, and so later
+                    // placements in this same plan cannot spend it twice.
+                    for victim in &chosen.victims {
+                        resource_ledger.release(&chosen.node_id, &victim.request);
+                        *preemption
+                            .taken_by_task
+                            .entry(victim.task_config_id)
+                            .or_default() += 1;
+                    }
+                    scoring_cache.refresh_node(
+                        &chosen.node_id,
+                        resource_ledger,
+                        &plan.task_request,
+                    );
+                    preemption.victims.extend(chosen.victims.iter().map(|victim| {
+                        PlannedPreemption {
+                            allocation_id: victim.allocation_id,
+                            node_id: victim.node_id.clone(),
+                            job_id: victim.job_id.clone(),
+                            job_config_id: victim.job_config_id.clone(),
+                            task_config_id: victim.task_config_id,
+                            task_name: victim.task_name.clone(),
+                            band: victim.band,
+                            kill_after_secs: victim.kill_after_secs,
+                        }
+                    }));
+                    eligible = full_but_allowed
+                        .iter()
+                        .copied()
+                        .filter(|node| node.id == chosen.node_id)
+                        .collect();
+                    preempted_node = Some(chosen.node_id);
+                }
+            }
+            if let Some(node_id) = preempted_node.as_deref() {
+                debug!(
+                    task = %task_config.name,
+                    node_id,
+                    victims = preemption.victims.len(),
+                    "Placement will preempt to fit"
+                );
+            }
+
+            if eligible.is_empty() {
+                bail!("{}", preemption.no_placement_error(task_config));
             }
 
             // Disk fit: drop nodes whose remaining free disk (minus what this
@@ -2183,6 +2606,184 @@ impl<'a> Scheduler<'a> {
                 task_config.name
             )
         })
+    }
+
+    /// Candidate nodes this task is *allowed* on but does not currently fit
+    /// — the input to the preemption pass.
+    ///
+    /// Identical to [`Self::eligible_nodes`] minus the resource check: the
+    /// whole question preemption answers is "would this node fit if lower-band
+    /// work were displaced", so the constraint, permit and `distinct` filters
+    /// still bind (they are not about capacity and preemption cannot change
+    /// them) while capacity does not.
+    fn preemption_candidate_nodes<'b>(
+        candidates: &[&'b Node],
+        constraint_set: &ConstraintSet,
+        permit_set: &PermitSet,
+        distinct_tracker: Option<&DistinctTracker>,
+    ) -> Vec<&'b Node> {
+        candidates
+            .iter()
+            .copied()
+            .filter(|node| {
+                permit_set.is_permitted(node)
+                    && distinct_tracker
+                        .map(|tracker| constraint_set.distinct_satisfied(node, tracker))
+                        .unwrap_or(true)
+            })
+            .collect()
+    }
+
+    /// Pick the node whose victim set this placement should pay for, or
+    /// `None` when nothing can be freed.
+    ///
+    /// Node choice is the plan's: fewest victims, then the least important
+    /// work, then the normal scoring policy as a tiebreak within the winning
+    /// group — so packing quality still decides among equally costly options.
+    /// `observe` mode runs this entire pass and then returns `None`, which is
+    /// what makes the preview honest: the selection an operator sees is the
+    /// selection enforce mode would make.
+    fn plan_preemption_for_placement(
+        &self,
+        candidates: &[&Node],
+        task_config: &TaskConfig,
+        ask: &ResourceRequest,
+        resource_ledger: &ResourceLedger,
+        pinned_group_node: Option<String>,
+        pinned_volume_node: Option<String>,
+        pass: &mut PreemptionPass,
+    ) -> R<Option<PreemptionChoice>> {
+        if !pass.preemptor_band.can_preempt() {
+            return Ok(None);
+        }
+        if candidates.is_empty() {
+            return Ok(None);
+        }
+
+        // A group already assigned to a node, or a placement pinned to the
+        // node its data lives on, has exactly one legal answer. Filtering
+        // here rather than after selection keeps the pass from proposing
+        // evictions on a node the placement could never use.
+        let candidates: Vec<&Node> = candidates
+            .iter()
+            .copied()
+            .filter(|node| {
+                pinned_group_node
+                    .as_deref()
+                    .map(|pinned| pinned == node.id)
+                    .unwrap_or(true)
+                    && pinned_volume_node
+                        .as_deref()
+                        .map(|pinned| pinned == node.id)
+                        .unwrap_or(true)
+            })
+            .filter(|node| self.preemption.enabled_for_pool(&node.pool))
+            .collect();
+        if candidates.is_empty() {
+            return Ok(None);
+        }
+
+        pass.load_candidates(self.store, &self.store.resource_policy, &candidates)?;
+
+        let mut best: Option<(PreemptionChoice, (usize, u32))> = None;
+        let mut node_scores: HashMap<String, (usize, u32)> = HashMap::new();
+        for node in &candidates {
+            let Some(free) = resource_ledger.pools.get(node.id.as_str()) else {
+                continue;
+            };
+            let on_node = pass.candidates_on_node(&node.id);
+            let (eligible, tally) = eligible_victims(
+                &on_node,
+                pass.preemptor_band,
+                self.preemption.victim_exempt_age,
+                &pass.taken_by_task,
+            );
+            pass.record_tally(tally);
+            let Some(victims) = select_victims(ask, free, &eligible) else {
+                continue;
+            };
+            // A node that needs no victims would have passed the resource
+            // check and never reached this pass; treat it as free anyway.
+            let cost = preemption_cost(&victims);
+            node_scores.insert(node.id.clone(), cost);
+            let better = best
+                .as_ref()
+                .map(|(_, best_cost)| cost < *best_cost)
+                .unwrap_or(true);
+            if better {
+                best = Some((
+                    PreemptionChoice {
+                        node_id: node.id.clone(),
+                        victims,
+                    },
+                    cost,
+                ));
+            }
+        }
+
+        let Some((mut choice, best_cost)) = best else {
+            return Ok(None);
+        };
+
+        // Tiebreak within the cheapest group using the normal policy score,
+        // so preemption does not undo the cluster's packing strategy.
+        let tied: Vec<&Node> = candidates
+            .iter()
+            .copied()
+            .filter(|node| node_scores.get(&node.id).copied() == Some(best_cost))
+            .collect();
+        if tied.len() > 1 {
+            let mut ids: Vec<&str> = tied.iter().map(|node| node.id.as_str()).collect();
+            ids.sort_unstable();
+            if let Some(first) = ids.first() {
+                if *first != choice.node_id {
+                    // Recompute the winner's victims on the deterministic
+                    // pick so the returned set matches the returned node.
+                    if let Some(node) = tied.iter().find(|node| node.id == *first) {
+                        if let Some(free) = resource_ledger.pools.get(node.id.as_str()) {
+                            let on_node = pass.candidates_on_node(&node.id);
+                            let (eligible, _) = eligible_victims(
+                                &on_node,
+                                pass.preemptor_band,
+                                self.preemption.victim_exempt_age,
+                                &pass.taken_by_task,
+                            );
+                            if let Some(victims) = select_victims(ask, free, &eligible) {
+                                choice = PreemptionChoice {
+                                    node_id: node.id.clone(),
+                                    victims,
+                                };
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        pass.considered += 1;
+        if matches!(self.preemption.mode, PreemptionMode::Observe) {
+            // Same selection, no commitment. The placement fails exactly as
+            // it does with preemption off; the operator gets the evidence.
+            pass.observed.extend(choice.victims.iter().map(|victim| PlannedPreemption {
+                allocation_id: victim.allocation_id,
+                node_id: victim.node_id.clone(),
+                job_id: victim.job_id.clone(),
+                job_config_id: victim.job_config_id.clone(),
+                task_config_id: victim.task_config_id,
+                task_name: victim.task_name.clone(),
+                band: victim.band,
+                kill_after_secs: victim.kill_after_secs,
+            }));
+            info!(
+                task = %task_config.name,
+                preemptor_job = %pass.preemptor_job,
+                node_id = %choice.node_id,
+                victims = choice.victims.len(),
+                "Preemption would place this task (observe mode); evicting nothing"
+            );
+            return Ok(None);
+        }
+        Ok(Some(choice))
     }
 
     fn eligible_nodes<'b>(
@@ -3194,6 +3795,19 @@ impl ResourceLedger {
         Arc::make_mut(pool).consume(request);
         Ok(())
     }
+
+    /// Credit a victim's resources back to its node, so the placements that
+    /// paid for the eviction can see the capacity.
+    ///
+    /// This is bookkeeping *within one plan*. It never lies about the
+    /// cluster: the eviction it models commits in the same transaction as the
+    /// placement, fenced by the same epoch compare-and-set, so no other plan
+    /// can observe the freed capacity without also conflicting.
+    fn release(&mut self, node_id: &str, request: &ResourceRequest) {
+        if let Some(pool) = self.pools.get_mut(node_id) {
+            Arc::make_mut(pool).release(request);
+        }
+    }
 }
 
 fn reschedule_rng() -> StdRng {
@@ -3441,6 +4055,7 @@ mod tests {
         insert_test_nodes(&store)?;
 
         let job = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "sched-job".into(),
@@ -3502,6 +4117,7 @@ mod tests {
         insert_test_nodes(&store)?;
 
         let job = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "resched-job".into(),
@@ -3560,6 +4176,7 @@ mod tests {
 
     fn submit_job(store: &Store, name: &str, tasks: Vec<TaskConfig>) -> R<String> {
         let job = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: name.into(),
@@ -3885,6 +4502,7 @@ mod tests {
         store.insert_node(make_node_msg("node-c", json!({ "region": "west" })))?;
 
         let job = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "per-attr-job".into(),
@@ -3928,6 +4546,7 @@ mod tests {
         store.insert_node(make_node_msg("node-c", json!({ "region": "west" })))?;
 
         let job = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "per-attr-resched".into(),
@@ -3986,6 +4605,7 @@ mod tests {
         ))?;
 
         let job = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "per-attr-constraints".into(),
@@ -4022,6 +4642,7 @@ mod tests {
         insert_test_nodes(&store)?;
 
         let job = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "resched-exclude".into(),
@@ -4051,6 +4672,7 @@ mod tests {
         store.insert_node(make_node_msg("node-a", json!({ "tier": "edge" })))?;
 
         let job = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "unschedulable".into(),
@@ -4122,6 +4744,7 @@ mod tests {
         ))?;
 
         let job = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "constraint-sources".into(),
@@ -4155,6 +4778,7 @@ mod tests {
         store.insert_node(make_node_msg("node-b", json!({ "zone": "us-west" })))?;
 
         let job = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "distinct-job".into(),
@@ -4294,6 +4918,7 @@ mod tests {
         store.insert_node(make_node_msg("node-a", json!({ "role": "web" })))?;
 
         let job = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "apply-constraints".into(),
@@ -4325,6 +4950,7 @@ mod tests {
         ))?;
 
         let job = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "permit-single".into(),
@@ -4354,6 +4980,7 @@ mod tests {
         ))?;
 
         let passing_job = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "permit-multi-pass".into(),
@@ -4373,6 +5000,7 @@ mod tests {
         assert_eq!(pass_outcome.allocations.len(), 1);
 
         let failing_job = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "permit-multi-fail".into(),
@@ -4408,6 +5036,7 @@ mod tests {
         store.insert_node(node_other)?;
 
         let job = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "permit-default".into(),
@@ -4440,6 +5069,7 @@ mod tests {
         ))?;
 
         let job = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "mem-limited".into(),
@@ -4593,6 +5223,7 @@ mod tests {
         ))?;
 
         let job = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "alloc-limit".into(),
@@ -4630,6 +5261,7 @@ mod tests {
             store.insert_node(make_node_msg("node-c", json!({})))?;
 
             let job = JobConfig {
+                priority: Default::default(),
                 rollout: None,
                 rollout_by_group: Default::default(),
                 name: "spread-considered".into(),
@@ -4672,6 +5304,7 @@ mod tests {
             store.insert_node(make_node_msg("node-c", json!({})))?;
 
             let job = JobConfig {
+                priority: Default::default(),
                 rollout: None,
                 rollout_by_group: Default::default(),
                 name: "binpack-considered".into(),
@@ -4747,6 +5380,7 @@ mod tests {
         store.insert_node(make_node_msg("node-b", json!({})))?;
 
         let job = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "grouped".into(),
@@ -4785,6 +5419,7 @@ mod tests {
         store.insert_node(make_node_msg("node-b", json!({ "role": "db" })))?;
 
         let job = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "group-constraints".into(),
@@ -4831,6 +5466,7 @@ mod tests {
         store.insert_node(make_node_msg("node-a", json!({})))?;
 
         let job = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "dag-group".into(),
@@ -4876,6 +5512,7 @@ mod tests {
         store.insert_node(make_node_msg("node-b", json!({ "role": "app" })))?;
 
         let job = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "dag-cross".into(),
@@ -5116,6 +5753,7 @@ mod tests {
         ))?;
 
         let job_one = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "job-one".into(),
@@ -5127,6 +5765,7 @@ mod tests {
             version: None,
         };
         let job_two = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "job-two".into(),
@@ -5204,6 +5843,7 @@ mod tests {
         store.insert_node(make_node_msg("node-b", json!({})))?;
 
         let job = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "anti-affinity-job".into(),
@@ -5245,6 +5885,7 @@ mod tests {
         store.insert_node(make_node_msg("node-b", json!({ "zone": "us-west" })))?;
 
         let load_job = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "load-job".into(),
@@ -5260,6 +5901,7 @@ mod tests {
         }
 
         let job = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "affinity-job".into(),
@@ -5290,6 +5932,7 @@ mod tests {
         // The constrained task is listed FIRST in the group: the group's node
         // must still satisfy it.
         let job = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "group-first-constraint".into(),
@@ -5328,6 +5971,7 @@ mod tests {
         store.insert_node(make_node_msg("node-c", json!({ "zone": "west" })))?;
 
         let job = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "distinct-zone".into(),
@@ -5370,6 +6014,7 @@ mod tests {
         store.insert_node(draining)?;
 
         let job = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "avail".into(),
@@ -5400,6 +6045,7 @@ mod tests {
         ))?;
 
         let job = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "gpu-job".into(),
@@ -5432,6 +6078,7 @@ mod tests {
         ))?;
 
         let job = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "reserved".into(),
@@ -5458,6 +6105,7 @@ mod tests {
         store.insert_node(make_node_msg("node-b", json!({})))?;
 
         let job = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "scale-up".into(),
@@ -5485,6 +6133,7 @@ mod tests {
         store.insert_node(make_node_msg("node-a", json!({ "region": "east" })))?;
 
         let job = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "mixed-per".into(),
@@ -5521,6 +6170,7 @@ mod tests {
         let mut config_ids = Vec::new();
         for name in ["job-one", "job-two"] {
             let job = JobConfig {
+                priority: Default::default(),
                 rollout: None,
                 rollout_by_group: Default::default(),
                 name: name.into(),
@@ -5727,7 +6377,7 @@ mod tests {
             }],
         )?;
         let scheduler = Scheduler::new(&store)?;
-        let (placements, report) =
+        let (placements, report, _preemptions) =
             scheduler.plan_only_with_report(&job_config_id, PlanMode::Fresh)?;
         assert_eq!(placements.len(), 4);
         assert!(
@@ -5755,7 +6405,7 @@ mod tests {
             }],
         )?;
         let scheduler = Scheduler::new(&store)?;
-        let (placements, report) =
+        let (placements, report, _preemptions) =
             scheduler.plan_only_with_report(&job_config_id, PlanMode::Fresh)?;
         assert_eq!(placements.len(), 5);
         assert_eq!(
@@ -5862,6 +6512,7 @@ mod tests {
         store.insert_node(make_node_msg("node-a", json!({})))?;
 
         let job = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "dag-failure".into(),
@@ -5907,6 +6558,7 @@ mod tests {
         store.insert_node(make_node_msg("node-a", json!({ "zone": "east" })))?;
 
         let v1 = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "heavy".into(),
@@ -5955,6 +6607,7 @@ mod tests {
         store.insert_node(make_node_msg("node-b", json!({})))?;
 
         let job = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "capacity".into(),
@@ -5994,6 +6647,7 @@ mod tests {
         store.insert_node(make_node_msg("node-d", json!({ "region": "west" })))?;
 
         let job = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "per-targets".into(),
@@ -6029,6 +6683,7 @@ mod tests {
         store.insert_node(make_node_msg("node-d", json!({ "region": "west" })))?;
 
         let job = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "per-refill".into(),

@@ -526,6 +526,85 @@ impl TaskPlugin for ContainerTaskPlugin {
         Ok(())
     }
 
+    /// Deliver the stop notice **into the container**, not to the launching
+    /// CLI: both runtimes keep the container alive when the foreground
+    /// process is signalled, so signalling the tracked host process would
+    /// notify nobody. The container's init (PID 1 in its namespace) is the
+    /// process the workload actually runs as.
+    fn stop_with(
+        &self,
+        allocation: &Allocation,
+        task: &TaskConfig,
+        _instance: &mut TaskInstance,
+        ctx: &crate::task_plugins::StopContext,
+    ) -> R<bool> {
+        let Ok(oci_runtime) = ContainerRuntime::detect() else {
+            return Ok(false);
+        };
+        let name = container_name(allocation);
+        let grace_secs = ctx.grace.as_secs().max(1).to_string();
+        let (program, args): (&str, Vec<String>) = match &oci_runtime {
+            // `runc`/`youki`-style `kill` signals the container init and
+            // returns immediately, which is exactly the contract here — the
+            // worker's reaper owns the deadline.
+            ContainerRuntime::Oci { binary } => (
+                binary.as_str(),
+                vec![
+                    "kill".to_string(),
+                    name.clone(),
+                    // The OCI CLI takes the bare name (`TERM`), not `SIGTERM`.
+                    ctx.signal.trim_start_matches("SIG").to_string(),
+                ],
+            ),
+            // Apple's `container stop` signals and then waits out its own
+            // timeout, so it is run detached below rather than inline. It
+            // owns the ladder end-to-end; Legion's `stop.signal` reaches it,
+            // but the runtime may SIGKILL before Legion's deadline if
+            // `killAfter` is longer than what `--time` accepts.
+            ContainerRuntime::AppleContainer => (
+                APPLE_CONTAINER_BIN,
+                vec![
+                    "stop".to_string(),
+                    "--signal".to_string(),
+                    ctx.signal.clone(),
+                    "--time".to_string(),
+                    grace_secs,
+                    name.clone(),
+                ],
+            ),
+        };
+        info!(
+            allocation_id = allocation.id,
+            task_name = %task.name,
+            oci_runtime = program,
+            signal = %ctx.signal,
+            grace_secs = ctx.grace.as_secs(),
+            cause = %ctx.cause,
+            "Signalling container to stop"
+        );
+        // Spawned, never waited on: `stop_with` runs under the worker's
+        // task-manager mutex and must not hold it for the grace window.
+        // Failures are ignored on purpose — an already-exited container is a
+        // successful stop, and the reaper cleans up either way.
+        match Command::new(program)
+            .args(&args)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(_child) => Ok(true),
+            Err(err) => {
+                warn!(
+                    allocation_id = allocation.id,
+                    task_name = %task.name,
+                    error = %err,
+                    "Failed to signal container; falling back to a hard stop"
+                );
+                Ok(false)
+            }
+        }
+    }
+
     fn stop(
         &self,
         allocation: &Allocation,

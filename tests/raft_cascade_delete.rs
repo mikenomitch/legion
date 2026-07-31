@@ -64,6 +64,7 @@ fn cascade_reliant_deletes_survive_raft_apply() -> R<()> {
 
     store.insert_node(NodeMsg::from(test_node("node-1")))?;
     let job = JobConfig {
+        priority: Default::default(),
         rollout: None,
         rollout_by_group: Default::default(),
         name: "cascade-job".to_string(),

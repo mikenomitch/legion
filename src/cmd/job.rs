@@ -1648,6 +1648,47 @@ async fn plan_job(arg_matches: &ArgMatches) -> R<()> {
                 println!("  {line}");
             }
         }
+        // Who this submit would displace. Printed last and unmissably,
+        // because it is the one thing in a plan that costs somebody else
+        // something (S3 in the preemption plan: the submit becomes a
+        // decision, not a surprise).
+        if reply.preemptions.is_empty() {
+            if reply.preemption_mode == "off" {
+                println!(
+                    "Preemption: off for this cluster; a higher-band job cannot displace \
+                     lower-band work"
+                );
+            }
+        } else {
+            let verb = if reply.preemption_mode == "observe" {
+                "would preempt (mode: observe — nothing is evicted)"
+            } else {
+                "would preempt"
+            };
+            println!("Preemption: {verb}");
+            // Group by node so the output reads the way an operator thinks
+            // about it: "on node-d, these go".
+            let mut by_node: std::collections::BTreeMap<&str, Vec<&_>> =
+                std::collections::BTreeMap::new();
+            for victim in &reply.preemptions {
+                by_node
+                    .entry(victim.node_id.as_str())
+                    .or_default()
+                    .push(victim);
+            }
+            for (node_id, victims) in by_node {
+                for victim in victims {
+                    println!(
+                        "  {node_id}: {}/{} (alloc {}, priority {}) — {}s grace, requeued",
+                        victim.job_id,
+                        victim.task_name,
+                        victim.allocation_id,
+                        victim.band,
+                        victim.kill_after_seconds
+                    );
+                }
+            }
+        }
     }
 
     Ok(())

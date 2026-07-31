@@ -13,6 +13,7 @@ use crate::volumes::VolumeMode;
 use tracing::warn;
 
 use super::artifact::{validate_task_artifacts, ArtifactSpec};
+use super::band::Band;
 use super::instance::InstanceMode;
 use super::workload_identity::{validate_identities, WorkloadIdentity};
 use super::{Job, PlannedAllocation, Submission};
@@ -22,6 +23,9 @@ use super::{Job, PlannedAllocation, Submission};
 pub struct JobPrint {
     pub name: String,
     pub status: String,
+    /// Priority band, so contention outcomes are legible from the job list
+    /// rather than only from the spec.
+    pub priority: String,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -42,6 +46,14 @@ impl From<Job> for JobPrint {
         JobPrint {
             name: job.name,
             status: job.status,
+            // A manager that predates bands sends nothing; render the
+            // default rather than a blank cell, because that is what such a
+            // cluster's scheduler is actually doing.
+            priority: if job.priority.is_empty() {
+                Band::default().as_str().to_string()
+            } else {
+                job.priority
+            },
             created_at: format_job_timestamp(job.created_at),
             updated_at: format_job_timestamp(job.updated_at),
         }
@@ -1242,6 +1254,150 @@ impl StatefulStorageConfig {
     }
 }
 
+/// Hard ceiling on `stop.killAfter`. Grace may slow a drain; it must never
+/// wedge one. This is the K8s PDB lesson inverted — a budget an operator
+/// cannot cross is the thing that turns "graceful" into "stuck" — so the
+/// window is an operator-owned maximum, not an application-owned one.
+pub const MAX_KILL_AFTER: Duration = Duration::from_secs(5 * 60);
+
+fn default_stop_signal() -> String {
+    "SIGTERM".to_string()
+}
+
+fn default_kill_after() -> Duration {
+    Duration::from_secs(30)
+}
+
+/// Signals a task may ask for as its stop notice. Restricted to the portable
+/// termination signals: `stop.signal` exists so a task can be told to shut
+/// down, not as a general signal-delivery API.
+pub const STOP_SIGNALS: &[&str] = &["SIGTERM", "SIGINT", "SIGQUIT", "SIGHUP", "SIGUSR1", "SIGUSR2"];
+
+/// How this task is stopped, whoever initiates it — `job stop`, a rollout
+/// replacement, a drain, a reschedule, a scale-in, or preemption. One ladder
+/// for every cause (see `docs/graceful-stop.md`).
+///
+/// Absent means the defaults below, which are a deliberate behavior change
+/// from the pre-1b hard kill: every stop now signals first and waits.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StopConfig {
+    /// The notice signal, delivered before the grace window opens. One of
+    /// [`STOP_SIGNALS`]; default `SIGTERM`.
+    #[serde(default = "default_stop_signal")]
+    pub signal: String,
+    /// How long the task has after the signal before it is SIGKILLed.
+    /// Default `30s`, capped at [`MAX_KILL_AFTER`].
+    #[serde(
+        default = "default_kill_after",
+        deserialize_with = "deserialize_duration",
+        serialize_with = "serialize_duration"
+    )]
+    pub kill_after: Duration,
+}
+
+impl Default for StopConfig {
+    fn default() -> Self {
+        Self {
+            signal: default_stop_signal(),
+            kill_after: default_kill_after(),
+        }
+    }
+}
+
+impl StopConfig {
+    pub fn validate(&self, task: &str) -> R<()> {
+        if !STOP_SIGNALS.iter().any(|known| *known == self.signal) {
+            bail!(
+                "task {task} stop.signal {:?} is not one of {}",
+                self.signal,
+                STOP_SIGNALS.join(", ")
+            );
+        }
+        if self.kill_after > MAX_KILL_AFTER {
+            bail!(
+                "task {task} stop.killAfter {} exceeds the {} maximum: grace may slow a \
+                 drain, never wedge it (see docs/graceful-stop.md)",
+                humantime::format_duration(self.kill_after),
+                humantime::format_duration(MAX_KILL_AFTER)
+            );
+        }
+        Ok(())
+    }
+}
+
+/// A floor on how many of a task's allocations *voluntary* disruption may
+/// leave running. Preemption is the only consumer today; a future rebalancer
+/// or scale-in policy is meant to read the same field (see
+/// `docs/preemption-and-eviction.md`).
+///
+/// Deliberately does **not** bind mandatory disruption: drain, node loss and
+/// `job stop` ignore it. A floor that can block maintenance is the documented
+/// cluster-wedge; a floor that only shrinks preemption's options can never
+/// wedge anything — the preemptor simply does not place.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DisruptionConfig {
+    /// Absolute count (`2`) or percent of the task's count (`"50%"`).
+    /// Default 0 — choosing a preemptible band donates the whole task.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_available: Option<Value>,
+}
+
+impl DisruptionConfig {
+    /// The floor in allocations, resolved against a concrete desired count.
+    /// A percent rounds **up**: `minAvailable: '50%'` of 5 protects 3.
+    pub fn min_available_for(&self, count: u32) -> u32 {
+        match self.min_available.as_ref() {
+            None => 0,
+            Some(Value::Number(number)) => number
+                .as_f64()
+                .map(|value| value.max(0.0).round() as u32)
+                .unwrap_or(0)
+                .min(count),
+            Some(Value::String(raw)) => match parse_percent(raw) {
+                Some(percent) => {
+                    let floor = (f64::from(count) * percent / 100.0).ceil();
+                    (floor.max(0.0) as u32).min(count)
+                }
+                None => 0,
+            },
+            Some(_) => 0,
+        }
+    }
+
+    pub fn validate(&self, task: &str) -> R<()> {
+        match self.min_available.as_ref() {
+            None => Ok(()),
+            Some(Value::Number(number)) => {
+                let value = number
+                    .as_f64()
+                    .ok_or_else(|| anyhow!("disruption.minAvailable must be a number or percent string"))?;
+                if value < 0.0 || value.fract() != 0.0 {
+                    bail!("task {task} disruption.minAvailable must be a non-negative whole number");
+                }
+                Ok(())
+            }
+            Some(Value::String(raw)) => match parse_percent(raw) {
+                Some(percent) if (0.0..=100.0).contains(&percent) => Ok(()),
+                _ => bail!(
+                    "task {task} disruption.minAvailable {raw:?} must be a percent between \
+                     \"0%\" and \"100%\", or a whole number"
+                ),
+            },
+            Some(_) => bail!(
+                "task {task} disruption.minAvailable must be a whole number or a percent \
+                 string like \"50%\""
+            ),
+        }
+    }
+}
+
+/// `"50%"` -> `Some(50.0)`. Anything else is `None`.
+fn parse_percent(raw: &str) -> Option<f64> {
+    raw.trim().strip_suffix('%')?.trim().parse::<f64>().ok()
+}
+
 /// Volume names flow into env var names and CLI arguments, so they carry the
 /// same charset restriction instance ids do.
 pub fn validate_volume_name(task: &str, name: &str) -> R<()> {
@@ -1413,6 +1569,18 @@ pub struct TaskConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[tabled(skip)]
     pub restart: Option<TaskRestartConfig>,
+    /// How the platform terminates this task — signal, then grace, then
+    /// SIGKILL. None = the defaults (`SIGTERM`, `30s`); see
+    /// `docs/graceful-stop.md`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[tabled(skip)]
+    pub stop: Option<StopConfig>,
+    /// Floor on how many allocations *voluntary* disruption (preemption
+    /// today) may leave running. None = floor 0, today's behavior; see
+    /// `docs/preemption-and-eviction.md`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[tabled(skip)]
+    pub disruption: Option<DisruptionConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[tabled(skip)]
     pub kv_injections: Option<TaskKvInjections>,
@@ -1796,6 +1964,11 @@ pub struct TaskKvInjections {
 pub struct JobConfig {
     pub name: String,
     pub tasks: Vec<TaskConfig>,
+    /// How important this job is, relative to everything else on the
+    /// cluster. Orders the eval queue and governs preemption; absent means
+    /// [`Band::Normal`]. See `docs/preemption-and-eviction.md`.
+    #[serde(default)]
+    pub priority: Band,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rollout: Option<RolloutConfig>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -1811,6 +1984,12 @@ struct JobConfigInput {
     tasks: Option<TaskConfigList>,
     #[serde(default)]
     task: Option<TaskConfigInput>,
+    /// `critical | high | elevated | normal | low | background`. Absent =
+    /// `normal`. Deserialized as a raw string so an unknown band produces
+    /// the vocabulary-listing message from [`Band::parse`] rather than
+    /// serde's bare "unknown variant".
+    #[serde(default)]
+    priority: Option<String>,
     #[serde(default)]
     rollout: Option<RolloutConfig>,
     #[serde(default)]
@@ -1867,6 +2046,10 @@ struct TaskConfigInput {
     on_unhealthy: Option<TaskOnUnhealthyConfig>,
     #[serde(default)]
     restart: Option<TaskRestartConfig>,
+    #[serde(default)]
+    stop: Option<StopConfig>,
+    #[serde(default)]
+    disruption: Option<DisruptionConfig>,
     #[serde(default)]
     kv: Option<KvInjectionPolicy>,
     #[serde(default)]
@@ -2000,6 +2183,8 @@ impl TaskConfigInput {
             checks: self.checks,
             on_unhealthy: self.on_unhealthy.unwrap_or_default(),
             restart: self.restart,
+            stop: self.stop,
+            disruption: self.disruption,
             kv_injections: Some(if let Some(existing) = self.kv_injections {
                 TaskKvInjections {
                     kv: self.kv.or(existing.kv),
@@ -2066,9 +2251,15 @@ impl<'de> Deserialize<'de> for JobConfig {
             (None, None) => return Err(D::Error::custom("jobspec must define at least one task")),
         };
 
+        let priority = match input.priority.as_deref() {
+            None => Band::default(),
+            Some(raw) => Band::parse(raw).map_err(D::Error::custom)?,
+        };
+
         Ok(JobConfig {
             name: input.name,
             tasks,
+            priority,
             rollout: input.rollout,
             rollout_by_group: input.rollout_by_group,
             version: input.version,
@@ -2090,6 +2281,10 @@ impl JobConfig {
     pub fn is_same_as(&self, other: &JobConfig) -> bool {
         self.name == other.name
             && self.tasks == other.tasks
+            // A band change is a real change: it moves the job's queue
+            // position and its preemption relationships, so it must mint a
+            // new config version rather than being swallowed as "unchanged".
+            && self.priority == other.priority
             && self.rollout == other.rollout
             && self.rollout_by_group == other.rollout_by_group
     }
@@ -2195,6 +2390,8 @@ impl TaskConfig {
             checks: Vec::new(),
             on_unhealthy: TaskOnUnhealthyConfig::default(),
             restart: None,
+            stop: None,
+            disruption: None,
             kv_injections: None,
             network: None,
             service: None,
@@ -2598,6 +2795,35 @@ impl TaskConfig {
             return Ok(());
         }
         validate_task_artifacts(&self.name, &self.artifacts, &self.config, &self.identities)
+    }
+
+    /// The task's effective stop ladder — the declared block, else the
+    /// defaults. There is no "no ladder" case: every stop signals first.
+    pub fn stop_config(&self) -> StopConfig {
+        self.stop.clone().unwrap_or_default()
+    }
+
+    /// How many of this task's allocations voluntary disruption must leave
+    /// running, resolved against its declared count. 0 when undeclared.
+    pub fn min_available(&self) -> u32 {
+        self.disruption
+            .as_ref()
+            .map(|disruption| disruption.min_available_for(self.count.num))
+            .unwrap_or(0)
+    }
+
+    pub fn validate_stop(&self) -> R<()> {
+        match self.stop.as_ref() {
+            Some(stop) => stop.validate(&self.name),
+            None => Ok(()),
+        }
+    }
+
+    pub fn validate_disruption(&self) -> R<()> {
+        match self.disruption.as_ref() {
+            Some(disruption) => disruption.validate(&self.name),
+            None => Ok(()),
+        }
     }
 
     /// Validate declared actions: unique names, well-formed params, and that
