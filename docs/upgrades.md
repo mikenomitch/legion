@@ -55,6 +55,13 @@ managers first, then re-join the worker. Heartbeats are deliberately left
 out of the handshake to keep that hot path lean; the check runs once per
 registration.
 
+## What each protocol version added
+
+| Version | Added | Behavior with an older worker |
+| --- | --- | --- |
+| 2 | Workers report task-process exits (`terminated_allocations` on the heartbeat), which is what makes a batch task's `Success` come from an exit code — see [Task Supervision](task-supervision.md) | The manager sees the node's advertised `protocolVersion` and keeps the pre-2 behavior for batch tasks placed there: the task is marked `Success` at placement, as it always was. Nothing stalls mid-rollout; new placements get the honest behavior once the worker is upgraded. |
+| 1 | The versioned handshake itself | Workers reporting `0` are pre-versioning builds and are accepted with a warning |
+
 ## Build-version skew expectations
 
 `build_version` is informational and never causes rejection — only

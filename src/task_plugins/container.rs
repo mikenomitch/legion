@@ -287,6 +287,12 @@ impl TaskPlugin for ContainerTaskPlugin {
         "container"
     }
 
+    /// The tracked process is the container runtime child; when it exits the
+    /// container is gone, so its exit is the task's exit.
+    fn supervises_process(&self) -> bool {
+        true
+    }
+
     fn schema(&self) -> Value {
         derived_schema::<ContainerTaskConfig>()
     }

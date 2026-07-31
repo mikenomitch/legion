@@ -82,6 +82,13 @@ const CLASSIFIED_MUTATIONS: &[&str] = &[
     "replace_job_kv_references",
     "request_job_restart",
     "set_node_availability",
+    // Count overrides (`legion job scale`): operator/autoscaler intent,
+    // control-owned so the submit-time ownership arbitration rides the
+    // job-submit capture (see storage::raft::ownership on `task_scale`).
+    "set_task_scale_override",
+    "set_task_scale_pending",
+    "clear_task_scale",
+    "promote_pending_task_scales",
     "stop_job",
     "sync_node_availability",
     "update_node_dyamic",
@@ -109,11 +116,13 @@ const CLASSIFIED_MUTATIONS: &[&str] = &[
     "apply_plan_submission",
     "submit_and_apply_plan",
     "submit_and_apply_plan_with_candidates",
+    "submit_and_apply_plans",
     "create_keyed_instance",
     "create_rollout",
     "destroy_job_scheduler_cleanup",
     "create_keyed_instances",
     "destroy_keyed_instance",
+    "complete_allocation",
     "get_or_create_slot_instance",
     "insert_plan_submission",
     "insert_plan_submission_with_candidates",
@@ -128,6 +137,8 @@ const CLASSIFIED_MUTATIONS: &[&str] = &[
     "remove_allocs_for_job",
     "remove_allocs_for_job_config",
     "remove_allocs_for_node",
+    // The scale-in half of the `job_scale` eval (docs/autoscaling.md).
+    "retire_surplus_allocations",
     "seed_keyed_instances",
     "set_instance_current_alloc",
     "set_instance_state",
@@ -165,6 +176,7 @@ const CLASSIFIED_MUTATIONS: &[&str] = &[
     "set_task_status",
     "update_node_health_checks",
     "update_node_heartbeat",
+    "update_node_heartbeats",
     "update_task_statuses_for_allocations",
     "upsert_allocation_health_snapshots",
 ];
@@ -190,6 +202,11 @@ const DELEGATED_BODIES: &[&str] = &[
     // Plan §8 D1 reconciler: inlines its INSERT..SELECT closure and shares
     // seed_task_statuses_apply's semantics (ON CONFLICT DO NOTHING seed).
     "seed_missing_task_statuses",
+    // D5 group commit: the batch op's closure runs submit_and_apply_plan_apply
+    // per plan inside per-plan savepoints; the single-heartbeat op shares
+    // update_node_heartbeats_apply with the batched form.
+    "submit_and_apply_plans",
+    "update_node_heartbeat",
 ];
 
 /// Public mutating methods that are deliberately NOT replicated — they route
@@ -249,6 +266,10 @@ fn lane_for(method: &str) -> Lane {
         | "replace_job_kv_references"
         | "request_job_restart"
         | "set_node_availability"
+        | "set_task_scale_override"
+        | "set_task_scale_pending"
+        | "clear_task_scale"
+        | "promote_pending_task_scales"
         | "stop_job"
         | "sync_node_availability"
         | "update_node_dyamic"
@@ -272,6 +293,7 @@ fn lane_for(method: &str) -> Lane {
         | "apply_plan_submission"
         | "submit_and_apply_plan"
         | "submit_and_apply_plan_with_candidates"
+        | "submit_and_apply_plans"
         | "create_keyed_instance"
         | "create_rollout"
         | "destroy_job_scheduler_cleanup"
@@ -280,6 +302,7 @@ fn lane_for(method: &str) -> Lane {
         | "get_or_create_slot_instance"
         | "insert_plan_submission"
         | "insert_plan_submission_with_candidates"
+        | "complete_allocation"
         | "migrate_allocations_to_job_config"
         | "place_alloc"
         | "prune_rollouts"
@@ -291,6 +314,7 @@ fn lane_for(method: &str) -> Lane {
         | "remove_allocs_for_job"
         | "remove_allocs_for_job_config"
         | "remove_allocs_for_node"
+        | "retire_surplus_allocations"
         | "seed_keyed_instances"
         | "set_instance_current_alloc"
         | "set_instance_state"
@@ -318,6 +342,7 @@ fn lane_for(method: &str) -> Lane {
         | "set_task_status"
         | "update_node_health_checks"
         | "update_node_heartbeat"
+        | "update_node_heartbeats"
         | "update_task_statuses_for_allocations"
         | "upsert_allocation_health_snapshots" => Lane::Status,
         other => panic!(

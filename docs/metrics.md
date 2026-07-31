@@ -91,6 +91,12 @@ into a single series with every label set to `"other"`.
   scheduling latency moves: compare the phase that grew against the
   others before profiling. The benchmark runners aggregate the same
   phases (docs/testing-and-benchmarks.md).
+- **`legion_scheduler_lazy_sample_fallback_total`** (counter) — plans that
+  re-ran with the eager (whole-fleet) optimistic-concurrency sample
+  because the read model changed while the plan was being built (see the
+  lazy epoch sample in docs/scheduler-and-eval-loop.md). A steadily high
+  rate relative to plan volume means heavy concurrent churn; correctness
+  is unaffected either way.
 
 ### Scheduling indexes
 
@@ -144,11 +150,100 @@ instrument.
 - **`legion_raft_quorum{lane}`** (gauge) — majority size required to commit
   on each lane (`voters / 2 + 1`). `voters - quorum` is the number of
   manager failures the lane survives while still committing.
+- **`legion_raft_term{lane}`** (gauge) — the lane's current raft term as
+  this manager sees it. A climbing term means elections; a term that climbs
+  without settling is leadership churn (see docs/multi-raft.md on the
+  election governor).
+- **`legion_raft_commit_index{lane}`** (gauge) — highest quorum-committed
+  log index of the lane, as this manager sees it.
+- **`legion_raft_applied_index{lane}`** (gauge) — highest log index this
+  manager's state machine has applied on the lane. Compare across managers
+  to spot a lagging follower.
+- **`legion_raft_apply_lag{lane}`** (gauge) — `commit_index -
+  applied_index` on this manager. Sustained growth means the local state
+  machine (SQLite apply + read-model projection) cannot keep up with the
+  commit rate.
+- **`legion_raft_is_leader{lane}`** (gauge) — `1` when this manager leads
+  the lane, else `0`. Summed across managers each lane should be exactly 1;
+  a flapping series is leadership churn made visible.
+- **`legion_raft_capture_seconds{lane}`** (histogram) — the local capture
+  phase of a replicated op: run the mutation, collect its changeset, roll
+  back. This is pure local store work.
+- **`legion_raft_propose_apply_seconds{lane}`** (histogram) — the
+  propose → quorum-commit → local-apply round-trip of a replicated op.
+  **Bottleneck attribution**: compare against `legion_raft_capture_seconds`
+  — when write latency moves, whichever histogram moved names the culprit
+  (local SQLite/capture vs the replication pipeline: network, fsync,
+  follower lag).
+- **`legion_raft_ops_total{lane,outcome}`** (counter) — replicated store
+  ops by outcome: `applied`, `empty` (the mutation touched no rows and
+  skipped the raft entry), `not_leader` (proposal rejected before capture —
+  normal on followers under divergent lane leadership), `error`.
 
-The rest of the `legion_raft_*` prefix (term, commit/applied index,
-leadership changes, replication lag, ...) remains **reserved** for the raft
-persistence engine work — nothing else emits it yet, and no other subsystem
-may claim the prefix.
+The gauge series refresh on the node-status-checker tick, on leaders and
+followers alike; the histograms and the op counter are recorded at the
+replication call site (leaders only — followers reject before capture).
+Under `single` topology every lane rides the one `control` raft group, so
+the latency histograms and op counters carry `lane="control"`.
+
+Anything else under the `legion_raft_*` prefix (snapshot timings,
+per-peer replication lag, ...) remains **reserved** for the raft engine —
+no other subsystem may claim the prefix.
+
+### Worker
+
+Workers can expose their own Prometheus listener, opt-in via the
+`LEGION_WORKER_TELEMETRY_PORT` environment variable (a port number; `0`
+binds an ephemeral port, logged at startup). It is an env var rather than a
+config field deliberately: workers joined with a bare token have no config
+file, and hosts packing many worker processes need a distinct port per
+process anyway. The listener binds `0.0.0.0:<port>` and serves `/metrics`
+and `/healthz` only — a worker has no store or quorum to probe, so there is
+no `/readyz`; the manager's node health/heartbeat state is the cluster's
+view of worker readiness. Default: disabled.
+
+- **`legion_worker_heartbeats_total{outcome}`** (counter) — heartbeat
+  round-trips attempted, by outcome (`ok` | `error` | `unauthenticated`).
+  A rising `error` rate is the worker-side view of manager unreachability;
+  `unauthenticated` means the node credential was revoked/rotated and the
+  worker is re-registering.
+- **`legion_worker_heartbeat_duration_seconds`** (histogram) — wall-clock
+  of one heartbeat round-trip (status report + reconcile against the
+  manager's reply). In a scale test this is how you prove the workers are
+  not the bottleneck.
+- **`legion_worker_allocations_running`** (gauge) — allocations this worker
+  currently runs, as reported on its last heartbeat.
+- **`legion_worker_allocation_failures_reported_total`** (counter) —
+  allocation failures this worker has reported to the manager.
+
+**Simulated fleets are not covered.** `legion start worker --simulate N`
+([worker-simulation](../internal_docs/plans/worker-simulation-plan.md))
+runs its own heartbeat loop for the whole fleet and does not start this
+listener or feed these families — its per-fleet counters are reported by
+the simulation harness instead. Scraping a simulated worker host yields
+nothing; use the manager's `legion_heartbeats_total` for the fleet-wide
+view until the two are wired together.
+
+## OTLP metrics push
+
+Both the manager's and the worker's registries can additionally be
+**pushed** over OTLP/HTTP (protobuf) to any OTLP-capable backend — the
+same opt-in convention as trace export (docs/observability.md):
+
+- `OTEL_EXPORTER_OTLP_ENDPOINT` — base collector URL; `/v1/metrics` is
+  appended for the metrics signal.
+- `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` — exact metrics endpoint, used
+  verbatim.
+- `OTEL_METRIC_EXPORT_INTERVAL` — export interval in milliseconds
+  (default 60000).
+- `LEGION_OTLP=1` — force-enable at the default endpoint.
+
+Each tick exports every registry the process actually initialized (a
+worker-only process pushes no manager families and vice versa) with
+cumulative temporality and full histogram buckets. Failed exports are
+logged at debug and retried on the next tick — the push is never allowed
+to back-pressure the daemon. The pull `/metrics` listeners are unaffected
+and can run alongside.
 
 ## Scrape configuration example
 
@@ -158,6 +253,10 @@ scrape_configs:
     metrics_path: /metrics
     static_configs:
       - targets: ["10.0.0.5:4749"] # server.port + 2 (or telemetry.port)
+  - job_name: legion-workers
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["10.0.1.7:9091"] # LEGION_WORKER_TELEMETRY_PORT, if enabled
 ```
 
 Probe wiring (e.g. under systemd or Kubernetes):

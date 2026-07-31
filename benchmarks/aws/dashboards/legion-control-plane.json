@@ -1,0 +1,124 @@
+{
+  "title": "Legion Control Plane (benchmark)",
+  "uid": "legion-control-plane",
+  "tags": ["legion", "benchmark"],
+  "timezone": "utc",
+  "schemaVersion": 39,
+  "refresh": "10s",
+  "time": { "from": "now-1h", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Scheduler phase p99 (legion_scheduler_plan_phase_seconds)",
+      "description": "The campaign's core measurement: per-phase plan cost. Projection quality depends on these curves staying explainable.",
+      "gridPos": { "x": 0, "y": 0, "w": 12, "h": 9 },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum by (phase, le) (rate(legion_scheduler_plan_phase_seconds_bucket[1m])))",
+          "legendFormat": "{{phase}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Placements applied / plans rejected",
+      "gridPos": { "x": 12, "y": 0, "w": 12, "h": 9 },
+      "fieldConfig": { "defaults": { "unit": "ops" }, "overrides": [] },
+      "targets": [
+        {
+          "expr": "sum by (outcome) (rate(legion_plan_apply_total[1m]))",
+          "legendFormat": "plan {{outcome}}",
+          "refId": "A"
+        },
+        {
+          "expr": "sum by (status) (rate(legion_evals_processed_total[1m]))",
+          "legendFormat": "evals {{status}}",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Eval queue depth",
+      "description": "Sustained growth = the scheduler is falling behind offered load; the soak's drift criterion.",
+      "gridPos": { "x": 0, "y": 9, "w": 8, "h": 8 },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "targets": [
+        { "expr": "legion_eval_queue_depth", "legendFormat": "{{instance}}", "refId": "A" }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Heartbeats/s + nodes by status",
+      "gridPos": { "x": 8, "y": 9, "w": 8, "h": 8 },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "targets": [
+        { "expr": "sum(rate(legion_heartbeats_total[1m]))", "legendFormat": "heartbeats/s", "refId": "A" },
+        { "expr": "sum by (status) (legion_nodes)", "legendFormat": "nodes {{status}}", "refId": "B" }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "gRPC p99 by method (top offenders)",
+      "gridPos": { "x": 16, "y": 9, "w": 8, "h": 8 },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "targets": [
+        {
+          "expr": "topk(8, histogram_quantile(0.99, sum by (method, le) (rate(legion_grpc_request_duration_seconds_bucket[1m]))))",
+          "legendFormat": "{{method}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Manager CPU (control-plane cost)",
+      "gridPos": { "x": 0, "y": 17, "w": 8, "h": 8 },
+      "fieldConfig": { "defaults": { "unit": "percentunit", "max": 4 }, "overrides": [] },
+      "targets": [
+        {
+          "expr": "sum by (instance_name) (rate(node_cpu_seconds_total{mode!=\"idle\", role=\"control-plane\"}[1m]))",
+          "legendFormat": "{{instance_name}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Manager memory used",
+      "gridPos": { "x": 8, "y": 17, "w": 8, "h": 8 },
+      "fieldConfig": { "defaults": { "unit": "bytes" }, "overrides": [] },
+      "targets": [
+        {
+          "expr": "(node_memory_MemTotal_bytes - node_memory_MemAvailable_bytes) and on(instance) label_replace(up{role=\"control-plane\"}, \"x\", \"\", \"\", \"\")",
+          "legendFormat": "{{instance}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Store write-lock wait + raft quorum",
+      "gridPos": { "x": 16, "y": 17, "w": 8, "h": 8 },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(legion_store_write_lock_wait_seconds_bucket[1m])))",
+          "legendFormat": "write-lock wait p99 (s)",
+          "refId": "A"
+        },
+        { "expr": "legion_raft_quorum", "legendFormat": "quorum {{lane}}", "refId": "B" }
+      ]
+    }
+  ]
+}

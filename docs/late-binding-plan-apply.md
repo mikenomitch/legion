@@ -25,13 +25,19 @@ manager-level `schedulerSettings`.
   candidate node's allocation epoch before planning. At apply, a
   candidate whose epoch still matches provably has the same allocation
   set the planner verified fit against — the epoch *is* the fit proof,
-  carried forward. The applier never recomputes capacity.
+  carried forward. The applier never re-derives free capacity from
+  competing allocations.
+- **What the epoch cannot prove is rechecked.** A worker
+  re-registration that *shrinks* a node's totals (or changes
+  `reservedResources` / `maxAllocations`) bumps no allocation epoch, so
+  the walk re-reads the fresh node row and re-checks that the task still
+  fits inside the node's current totals before binding to it.
 - **The walk is conservative.** A candidate whose epoch moved is skipped
   even if it would still fit; the placement falls back to the next
   candidate, a near-equivalent by score (see below). Skips also absorb
-  cordons/drains, node loss, constraint changes, and static-port
-  collisions that landed between snapshot and apply — each costs a rank
-  where it used to reject the plan.
+  cordons/drains, node loss, constraint changes, shrunken node totals,
+  and static-port collisions that landed between snapshot and apply —
+  each costs a rank where it used to reject the plan.
 - **The job-config epoch stays a hard check.** Two plans for the same job
   config still serialize all-or-nothing; candidate lists never weaken
   that.
@@ -43,6 +49,11 @@ manager-level `schedulerSettings`.
   sampling) runs at plan time on the planning manager. Apply is a pure
   function of the submission and committed state, so raft replicas hold
   identical results.
+- **Candidate submissions group-commit like any other plan.** Plans
+  queued while a commit is in flight batch into one replicated op, each
+  keeping its own verdict inside a per-plan savepoint (see
+  [scheduler-and-eval-loop.md](scheduler-and-eval-loop.md)); the walk is
+  unchanged inside a batch.
 
 ## Candidate list construction
 

@@ -8,7 +8,34 @@
 // version (workers reporting 0 are pre-versioning builds and are accepted
 // with a warning); they reject newer workers so operators upgrade managers
 // before workers. See docs/upgrades.md for the full skew policy.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
+
+// === Worker → task-runtime environment ===
+// Task runtimes are in-process dylibs with no config channel of their own, so
+// cross-cutting worker settings reach them as environment variables set by the
+// worker daemon at startup.
+/// Set to `1` when the worker enforces `resources` as cgroup limits.
+pub const ENV_RESOURCE_ENFORCEMENT: &str = "LEGION_RESOURCE_ENFORCEMENT";
+/// cgroup v2 parent path (relative to /sys/fs/cgroup) for worker-owned cgroups.
+pub const ENV_CGROUP_PARENT: &str = "LEGION_CGROUP_PARENT";
+
+// === Allocations ===
+// Allocation row status values. An allocation is `placed` from the moment the
+// scheduler writes its row until a worker reports it terminal; `complete` and
+// `failed` are the terminal states a worker's exit report produces (see
+// docs/task-supervision.md). Terminal allocations keep their row — the slot is
+// still spent — but are never dispatched back to a worker.
+pub const ALLOCATION_STATUS_PLACED: &str = "placed";
+pub const ALLOCATION_STATUS_COMPLETE: &str = "complete";
+pub const ALLOCATION_STATUS_FAILED: &str = "failed";
+
+/// Whether an allocation row is in a terminal state.
+pub fn allocation_status_is_terminal(status: &str) -> bool {
+    matches!(
+        status,
+        ALLOCATION_STATUS_COMPLETE | ALLOCATION_STATUS_FAILED
+    )
+}
 
 // === Manager ===
 pub const DEF_CONFIG_PATH: &str = "./configs/manager.jsonnet";
@@ -44,6 +71,13 @@ pub const WORKER_NODE_CHECK_DURATION_SEC: u64 = 30;
 pub const DEF_WORKER_SERVER_PORT: u64 = 4848;
 pub const DEF_WORKER_STATE_DIR: &str = ".legion/workers";
 pub const DEF_WORKER_STATE_PATH: &str = ".legion/workers/default/worker_state.json";
+
+// How long the manager keeps a stop notice (why an allocation was removed)
+// before pruning it. Notices are advisory metadata delivered on the next
+// heartbeat — at a 2s cadence a worker sees one within one tick, so this is
+// slack for a partitioned or restarting worker, not a delivery window. See
+// `docs/graceful-stop.md`.
+pub const STOP_NOTICE_RETENTION_SECS: i64 = 600;
 
 // Default per-stream cap (bytes) when reading captured task logs and no explicit
 // limit is requested. 256 KiB keeps replies small enough for an agent context.

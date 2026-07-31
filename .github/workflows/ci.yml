@@ -95,3 +95,42 @@ jobs:
       - name: Run scheduler benchmark SLO gate
         if: steps.changes.outputs.scheduler == 'true'
         run: cargo test --test scheduler_benchmark_slo -- --ignored --nocapture
+
+  aws-benchmark-rig:
+    name: AWS Benchmark Rig (validate only)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Detect rig changes
+        id: changes
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            rig:
+              - 'benchmarks/aws/**'
+
+      # The plan's dry-run gate: a broken driver must never burn
+      # cluster-hours. Pure-math fixture tests, no cluster, no AWS.
+      - name: Driver + translator fixture tests
+        if: steps.changes.outputs.rig == 'true'
+        run: python3 -m unittest discover benchmarks/aws/driver/tests -v
+
+      - name: Terraform validate (no apply, no credentials)
+        if: steps.changes.outputs.rig == 'true'
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: Run terraform fmt + validate
+        if: steps.changes.outputs.rig == 'true'
+        run: |
+          terraform -chdir=benchmarks/aws/terraform fmt -check -recursive
+          terraform -chdir=benchmarks/aws/terraform init -backend=false -input=false
+          terraform -chdir=benchmarks/aws/terraform validate
+
+      - name: Shell syntax check
+        if: steps.changes.outputs.rig == 'true'
+        run: bash -n benchmarks/aws/scripts/*.sh benchmarks/aws/experiments/*.sh

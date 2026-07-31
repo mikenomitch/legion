@@ -305,3 +305,197 @@ fn write_connection_bypass_guard_rejects_direct_writes() -> R<()> {
     );
     Ok(())
 }
+
+/// Group commit (plan-path scale levers, D5): concurrent plan submitters on
+/// a raft store coalesce into batched replicated ops — one capture → one
+/// propose per batch — with per-plan savepoint isolation. The correctness
+/// assertions hold whether or not batches form on any given run (that is
+/// timing), but this concurrency reliably forms them; the poisoned plan
+/// exercises the isolation savepoint (its failure must not take down
+/// batch-mates or the capture).
+#[test]
+fn concurrent_plan_applies_group_commit_with_isolation() -> R<()> {
+    use std::collections::HashSet;
+
+    let dir = tempfile::tempdir()?;
+    let store = Store::start_storage(&raft_config(dir.path(), "single")?)?;
+
+    let mut requests = Vec::new();
+    for index in 0..8 {
+        let node_id = format!("gc-node-{index}");
+        store.insert_node(NodeMsg::from(test_node(&node_id)))?;
+        let job_name = format!("gc-job-{index}");
+        let outcome = store.handle_job_submit(&test_job(&job_name), &[submission(&job_name)])?;
+        let job_config_id = outcome.job_config_id().to_string();
+        let tasks = store.get_task_configs_for_job_config(&job_config_id)?;
+        let (task_id, _) = *tasks.first().context("job must have a task config")?;
+        let versions =
+            store.allocation_version_vector(&job_config_id, &HashSet::from([node_id.clone()]))?;
+        // Request 3 is poisoned: a placement naming a task that does not
+        // exist, which fails during apply (not a CAS rejection).
+        let task_id = if index == 3 { 999_999 } else { task_id };
+        requests.push((index, job_config_id, node_id, task_id, versions));
+    }
+
+    let handles: Vec<_> = requests
+        .into_iter()
+        .map(|(index, job_config_id, node_id, task_id, versions)| {
+            let store = store.clone();
+            std::thread::spawn(move || {
+                (
+                    index,
+                    node_id.clone(),
+                    store.submit_and_apply_plan(
+                        &job_config_id,
+                        "fresh",
+                        &[(node_id, task_id)],
+                        &versions,
+                    ),
+                )
+            })
+        })
+        .collect();
+
+    for handle in handles {
+        let (index, node_id, result) = handle.join().expect("submitter panicked");
+        if index == 3 {
+            assert!(result.is_err(), "poisoned plan must fail alone");
+            assert!(
+                store.allocs_for_node(&node_id)?.is_empty(),
+                "poisoned plan must not place anything"
+            );
+        } else {
+            let (_, outcome) = result?;
+            assert!(
+                matches!(
+                    outcome,
+                    legion::storage::store::PlanApplyOutcome::Applied(_)
+                ),
+                "plan {index} must apply: {outcome:?}"
+            );
+            assert_eq!(
+                store.allocs_for_node(&node_id)?.len(),
+                1,
+                "exactly one allocation on {node_id}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The raft engine's Prometheus series are recorded at the replication
+/// call site: any committed replicated op must land in the per-lane
+/// capture/propose histograms and the op-outcome counter
+/// (docs/metrics.md, Raft). Under `single` topology every lane rides the
+/// one `control` group, so that is the label the series carry.
+#[test]
+fn replicated_ops_record_raft_engine_metrics() -> R<()> {
+    let dir = tempfile::tempdir()?;
+    let store = Store::start_storage(&raft_config(dir.path(), "single")?)?;
+
+    store.put_kv("metrics/probe", "1", KvValueType::String, None, None)?;
+
+    let rendered = legion::manager::telemetry::render();
+    for needle in [
+        "legion_raft_capture_seconds_bucket{lane=\"control\",le=\"+Inf\"}",
+        "legion_raft_propose_apply_seconds_bucket{lane=\"control\",le=\"+Inf\"}",
+        "legion_raft_ops_total{lane=\"control\",outcome=\"applied\"}",
+    ] {
+        assert!(
+            rendered.contains(needle),
+            "missing {needle} in rendered metrics"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn concurrent_planners_cannot_oversubscribe_under_raft() -> R<()> {
+    concurrent_planners_cannot_oversubscribe("single")
+}
+
+#[test]
+fn concurrent_planners_cannot_oversubscribe_under_raft_lanes() -> R<()> {
+    concurrent_planners_cannot_oversubscribe("lanes")
+}
+
+/// Raft-mode CONCURRENT planning through the real `Scheduler::plan_and_apply`
+/// path (regression insurance for the epoch-mirror fence, 2026-07-28): under
+/// raft, a commit makes the DB epoch visible immediately but the allocation
+/// cache is patched later — after the whole changeset projection — so a
+/// DB-sampled fence could pair a NEW epoch with the OLD cache and pass the
+/// plan-apply CAS against phantom capacity. The scheduler samples epochs
+/// from the in-memory mirror kept coherent with the allocation cache, which
+/// closes exactly that window; this test drives two planners into it and
+/// asserts the node is never oversubscribed. The local_disk twin is
+/// `concurrent_plans_cannot_oversubscribe_a_node` (scheduler unit tests);
+/// this is the commit-then-project ordering only a raft backend has.
+fn concurrent_planners_cannot_oversubscribe(topology: &str) -> R<()> {
+    use legion::manager::scheduler::{PlanMode, Scheduler};
+    use legion::storage::errors::StorageError;
+
+    let dir = tempfile::tempdir()?;
+    let store = Store::start_storage(&raft_config(dir.path(), topology)?)?;
+
+    // One node with 4096 MiB of fingerprinted memory: room for exactly one
+    // 3000 MiB task.
+    store.insert_node(NodeMsg::from(test_node("race-node")))?;
+
+    let mut config_ids = Vec::new();
+    for name in ["race-a", "race-b"] {
+        let mut task = TaskConfig::new("svc", "noop");
+        task.resources = json!({ "memory": 3000 });
+        let job = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: name.to_string(),
+            tasks: vec![task],
+            version: None,
+        };
+        let outcome = store.handle_job_submit(&job, &[submission(name)])?;
+        config_ids.push(outcome.job_config_id().to_string());
+    }
+
+    // Both planners release together so their capacity snapshots overlap:
+    // each sees the empty node, both argmax onto it, and only the CAS (fed
+    // by the epoch mirror) may decide the loser.
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(config_ids.len()));
+    let handles: Vec<_> = config_ids
+        .into_iter()
+        .map(|job_config_id| {
+            let store = store.clone();
+            let barrier = std::sync::Arc::clone(&barrier);
+            std::thread::spawn(move || -> R<usize> {
+                let scheduler = Scheduler::new(&store)?;
+                barrier.wait();
+                match scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh) {
+                    Ok(outcome) => Ok(outcome.allocations.len()),
+                    // Losing the race is the expected outcome for one
+                    // planner; anything else is a real failure.
+                    Err(error)
+                        if matches!(
+                            StorageError::from_anyhow(&error),
+                            Some(StorageError::Conflict { .. })
+                        ) =>
+                    {
+                        Ok(0)
+                    }
+                    Err(error) => Err(error),
+                }
+            })
+        })
+        .collect();
+
+    let mut applied = 0usize;
+    for handle in handles {
+        applied += handle.join().expect("planner panicked")?;
+    }
+
+    assert_eq!(applied, 1, "exactly one plan may claim the node");
+    assert_eq!(
+        store.allocs_for_node("race-node")?.len(),
+        1,
+        "the node must never be oversubscribed"
+    );
+    Ok(())
+}

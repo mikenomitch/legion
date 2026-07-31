@@ -35,25 +35,25 @@ use crate::structs::{
     DestroyJobRequest, ExecClientFrame, FailedAllocation, GetAllocationLogsReply,
     GetAllocationLogsRequest, GetArtifactCredentialReply, GetArtifactCredentialRequest,
     GetInstanceReply, GetInstanceRequest, GetJobInfoReply, GetJobInfoRequest,
-    GetJobSpecByConfigRequest, GetJobSpecReply, GetJobSpecRequest, GetJobTemplateReply,
-    GetJobTemplateRequest, GetKvLockReply, GetKvLockRequest, GetKvReply, GetKvRequest,
-    GetLedgerReply, GetLedgerRequest, GetManagerConfigsReply, GetManagerConfigsRequest,
-    GetNodeReply, GetNodeRequest, GetNodesReply, GetNodesRequest, GetObservabilityReply,
-    GetObservabilityRequest, GetRaftJoinTokenReply, GetRaftJoinTokenRequest, GetRaftStatusReply,
-    GetRaftStatusRequest, GetRolloutReply, GetRolloutRequest, GetRolloutStatusReply,
-    GetRolloutStatusRequest, GetStateBackupReply, GetStateBackupRequest, GetStateStoreSchemaReply,
-    GetStateStoreSchemaRequest, GetTaskLogsRequest, GetVolumeReply, GetVolumeRequest,
-    HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, Instance, InstanceInfo,
-    InstanceMode, InstanceState, IssueNodeIdentityTokenReply, IssueNodeIdentityTokenRequest,
-    IssueRaftCommandReply, IssueRaftCommandRequest, IssueWorkloadIdentityTokenReply,
-    IssueWorkloadIdentityTokenRequest, JobConfig, JobSpecHistoryItem, JobTemplate,
-    JobTemplateProvenance, JobTemplateSummary, JobTemplateVariable, JobTemplateVersionInfo,
-    KvEntry, KvInjectionAction, KvValueType, LedgerNode, ListEventsReply, ListEventsRequest,
-    ListInstancesReply, ListInstancesRequest, ListJobActionsReply, ListJobActionsRequest,
-    ListJobSpecHistoryReply, ListJobSpecHistoryRequest, ListJobTemplatesReply,
-    ListJobTemplatesRequest, ListJobsReply, ListJobsRequest, ListKvReply, ListKvRequest,
-    ListRaftHistoryReply, ListRaftHistoryRequest, ListRolloutEventsReply, ListRolloutEventsRequest,
-    ListRolloutsReply, ListRolloutsRequest, ListSavedStateQueriesReply,
+    GetJobScaleStatusReply, GetJobScaleStatusRequest, GetJobSpecByConfigRequest, GetJobSpecReply,
+    GetJobSpecRequest, GetJobTemplateReply, GetJobTemplateRequest, GetKvLockReply,
+    GetKvLockRequest, GetKvReply, GetKvRequest, GetLedgerReply, GetLedgerRequest,
+    GetManagerConfigsReply, GetManagerConfigsRequest, GetNodeReply, GetNodeRequest, GetNodesReply,
+    GetNodesRequest, GetObservabilityReply, GetObservabilityRequest, GetRaftJoinTokenReply,
+    GetRaftJoinTokenRequest, GetRaftStatusReply, GetRaftStatusRequest, GetRolloutReply,
+    GetRolloutRequest, GetRolloutStatusReply, GetRolloutStatusRequest, GetStateBackupReply,
+    GetStateBackupRequest, GetStateStoreSchemaReply, GetStateStoreSchemaRequest,
+    GetTaskLogsRequest, GetVolumeReply, GetVolumeRequest, HealthCheckReply, HealthCheckRequest,
+    HeartbeatReply, HeartbeatRequest, Instance, InstanceInfo, InstanceMode, InstanceState,
+    IssueNodeIdentityTokenReply, IssueNodeIdentityTokenRequest, IssueRaftCommandReply,
+    IssueRaftCommandRequest, IssueWorkloadIdentityTokenReply, IssueWorkloadIdentityTokenRequest,
+    JobConfig, JobSpecHistoryItem, JobTemplate, JobTemplateProvenance, JobTemplateSummary,
+    JobTemplateVariable, JobTemplateVersionInfo, KvEntry, KvInjectionAction, KvValueType,
+    LedgerNode, ListEventsReply, ListEventsRequest, ListInstancesReply, ListInstancesRequest,
+    ListJobActionsReply, ListJobActionsRequest, ListJobSpecHistoryReply, ListJobSpecHistoryRequest,
+    ListJobTemplatesReply, ListJobTemplatesRequest, ListJobsReply, ListJobsRequest, ListKvReply,
+    ListKvRequest, ListRaftHistoryReply, ListRaftHistoryRequest, ListRolloutEventsReply,
+    ListRolloutEventsRequest, ListRolloutsReply, ListRolloutsRequest, ListSavedStateQueriesReply,
     ListSavedStateQueriesRequest, ListServicesReply, ListServicesRequest, ListVolumeDriversReply,
     ListVolumeDriversRequest, ListVolumesReply, ListVolumesRequest, Node, NodeMsg, PatchKvReply,
     PatchKvRequest, PlanJobReply, PlanJobRequest, PlannedAllocation, PutKvReply, PutKvRequest,
@@ -62,14 +62,15 @@ use crate::structs::{
     RenewKvLockRequest, ReplaceInstanceReply, ReplaceInstanceRequest, ResolveServiceReply,
     ResolveServiceRequest, RestartWorkerReply, RestartWorkerRequest, RolloutAllocationStatus,
     RolloutEvent, RolloutGroupStatus, RolloutProgression, RolloutReplacement, RunJobReply,
-    RunJobRequest, RunJobTemplateReply, RunJobTemplateRequest, SavedStateQuery, SchedulerEvent,
-    ServiceEndpoint, ServiceSummary, SetNodeAvailabilityReply, SetNodeAvailabilityRequest,
-    StartInstanceReply, StartInstanceRequest, StopInstanceReply, StopInstanceRequest, StopJobReply,
-    StopJobRequest, StopRolloutReply, StopRolloutRequest, StreamEventsRequest, Submission,
-    TaskConfig, TaskOnUnhealthyConfig, UpdateNodeDynamicReply, UpdateNodeDynamicRequest,
-    UpsertJobTemplateReply, UpsertJobTemplateRequest, UpsertSavedStateQueryReply,
-    UpsertSavedStateQueryRequest, WorkerConfig, WorkerPreRegisterReply, WorkerPreRegisterRequest,
-    WorkerRegisterReply, WorkerRegisterRequest,
+    RunJobRequest, RunJobTemplateReply, RunJobTemplateRequest, SavedStateQuery, ScaleTaskReply,
+    ScaleTaskRequest, SchedulerEvent, ServiceEndpoint, ServiceSummary, SetNodeAvailabilityReply,
+    SetNodeAvailabilityRequest, StartInstanceReply, StartInstanceRequest, StopInstanceReply,
+    StopInstanceRequest, StopJobReply, StopJobRequest, StopNotice, StopRolloutReply,
+    StopRolloutRequest, StreamEventsRequest, Submission, TaskConfig, TaskOnUnhealthyConfig,
+    TaskScaleStatus, UpdateNodeDynamicReply, UpdateNodeDynamicRequest, UpsertJobTemplateReply,
+    UpsertJobTemplateRequest, UpsertSavedStateQueryReply, UpsertSavedStateQueryRequest,
+    WorkerConfig, WorkerPreRegisterReply, WorkerPreRegisterRequest, WorkerRegisterReply,
+    WorkerRegisterRequest,
 };
 use crate::structs::{
     AuthMethodInfo, BootstrapAclReply, BootstrapAclRequest, CreateAclTokenReply,
@@ -79,8 +80,8 @@ use crate::structs::{
     GetAclPolicyRequest, GetAuthMethodsReply, GetAuthMethodsRequest, ListAclPoliciesReply,
     ListAclPoliciesRequest, ListAclTokensReply, ListAclTokensRequest, ListAclUsersReply,
     ListAclUsersRequest, ListJoinTokensReply, ListJoinTokensRequest, LoginReply, LoginRequest,
-    UpsertAclPolicyReply, UpsertAclPolicyRequest, UpsertAclUserReply, UpsertAclUserRequest,
-    WhoAmIReply, WhoAmIRequest,
+    StopCause, UpsertAclPolicyReply, UpsertAclPolicyRequest, UpsertAclUserReply,
+    UpsertAclUserRequest, WhoAmIReply, WhoAmIRequest,
 };
 use crate::task_plugins::validate_job_config;
 use crate::tracing_util::{o11y_enabled, read_recent_observability};
@@ -268,6 +269,56 @@ fn resolve_keyed_task<'a>(
                 .collect();
             Err(Status::invalid_argument(format!(
                 "multiple keyed tasks match in job {} ({}); disambiguate with group and task",
+                job_id,
+                matches.join(", "),
+            )))
+        }
+    }
+}
+
+/// Resolve the single SCALABLE task a `legion job scale` request targets
+/// (docs/autoscaling.md): not keyed-mode stateful (no count to scale) and
+/// not `count: { per: ... }` (group-converging; rejected in v1).
+/// `group`/`task` filters may be omitted when the job has exactly one
+/// scalable task; ambiguity is rejected with the candidate list, never
+/// guessed — the same rules as `resolve_keyed_task`, inverted.
+fn resolve_scalable_task<'a>(
+    config: &'a JobConfig,
+    job_id: &str,
+    group: Option<&str>,
+    task: Option<&str>,
+) -> Result<&'a TaskConfig, Status> {
+    let group_filter = group.filter(|group| !group.trim().is_empty());
+    let task_filter = task.filter(|task| !task.trim().is_empty());
+    let mut candidates: Vec<&TaskConfig> = config
+        .tasks
+        .iter()
+        .filter(|task| {
+            let keyed = task
+                .stateful
+                .as_ref()
+                .is_some_and(|stateful| stateful.mode == InstanceMode::Keyed);
+            !keyed && task.count.per.is_none()
+        })
+        .filter(|task| group_filter.is_none_or(|group| task.group == group))
+        .filter(|task| task_filter.is_none_or(|name| task.name == name))
+        .collect();
+    match candidates.len() {
+        0 => Err(Status::invalid_argument(format!(
+            "job {} has no scalable task matching group={} task={}; keyed stateful tasks \
+             have no count (use the instance API) and count.per tasks cannot be scaled",
+            job_id,
+            group_filter.unwrap_or("<any>"),
+            task_filter.unwrap_or("<any>"),
+        ))),
+        1 => Ok(candidates.remove(0)),
+        _ => {
+            let matches: Vec<String> = candidates
+                .iter()
+                .map(|task| format!("{}/{}", task.group, task.name))
+                .collect();
+            Err(Status::invalid_argument(format!(
+                "multiple scalable tasks match in job {} ({}); disambiguate with task_group and task_name",
                 job_id,
                 matches.join(", "),
             )))
@@ -1829,7 +1880,7 @@ fn remove_stale_allocations_for_new_rollout(
             continue;
         }
         store
-            .remove_allocation_by_id(allocation.id)
+            .remove_allocation_by_id_because(allocation.id, StopCause::Update)
             .map_err(|e| map_store_error("Error removing stale allocation", e))?;
     }
 
@@ -3227,6 +3278,7 @@ impl Manager for ManagerDaemonService {
                 fell_back: usage.fell_back,
                 shadow_agreement: usage.shadow_agreement,
                 reason: usage.reason.unwrap_or_default(),
+                score_sampled: usage.score_sampled.unwrap_or_default() as u32,
             })
             .collect();
 
@@ -3336,7 +3388,7 @@ impl Manager for ManagerDaemonService {
             self.check_acl(&request, AclResource::Job, AclAction::Read, AclScope::any())?;
         let request = request.into_inner();
         let query = normalize_query(request.query);
-        let sort_by = request.sort_by.unwrap_or_else(|| "created_at".to_string());
+        let sort_by = request.sort_by.unwrap_or_else(|| "updated_at".to_string());
         let sort_desc = request
             .sort_order
             .as_deref()
@@ -3379,13 +3431,19 @@ impl Manager for ManagerDaemonService {
             let ordering = match sort_by.as_str() {
                 "name" => a.name.cmp(&b.name),
                 "status" => a.status.cmp(&b.status),
-                _ => a.created_at.cmp(&b.created_at),
+                "created_at" => a.created_at.cmp(&b.created_at),
+                _ => a.updated_at.cmp(&b.updated_at),
             };
-            if sort_desc {
+            let ordering = if sort_desc {
                 ordering.reverse()
             } else {
                 ordering
-            }
+            };
+            // Break ties on the name, always ascending and never reversed:
+            // the mtime is whole seconds, so a batch submitted together ties
+            // on it, and an arbitrary order there makes paging drop and
+            // duplicate rows between pages.
+            ordering.then_with(|| a.name.cmp(&b.name))
         });
 
         let (jobs, total_count) = paginate(jobs, page, page_size);
@@ -3459,6 +3517,229 @@ impl Manager for ManagerDaemonService {
         };
 
         Ok(Response::new(reply))
+    }
+
+    #[instrument(skip_all)]
+    async fn scale_task(
+        &self,
+        request: Request<ScaleTaskRequest>,
+    ) -> Result<Response<ScaleTaskReply>, Status> {
+        // The whole point of the `scale` resource: resize rights without
+        // redeploy rights (docs/autoscaling.md, docs/auth-and-acls.md).
+        let ident = self.check_acl(
+            &request,
+            AclResource::Scale,
+            AclAction::Write,
+            self.job_read_scope(&request.get_ref().name),
+        )?;
+        let inner = request.into_inner();
+        let name = inner.name;
+        let idempotency_key = inner.idempotency_key.unwrap_or_default();
+
+        if let Some(message) = self
+            .store
+            .idempotency_lookup(&idempotency_key)
+            .map_err(|e| map_store_error("Error checking idempotency", e))?
+        {
+            return Ok(Response::new(ScaleTaskReply {
+                message,
+                deduplicated: true,
+                deferred: false,
+            }));
+        }
+
+        if inner.count.is_none() && !inner.reset {
+            return Err(Status::invalid_argument(
+                "provide count (the desired replicas) or reset (return the count to the spec)",
+            ));
+        }
+        if inner.count.is_some() && inner.reset {
+            return Err(Status::invalid_argument(
+                "count and reset are mutually exclusive",
+            ));
+        }
+
+        let config = keyed_job_config(&self.store, &name)?;
+        let task = resolve_scalable_task(
+            &config,
+            &name,
+            inner.task_group.as_deref(),
+            inner.task_name.as_deref(),
+        )?;
+        let (task_group, task_name, spec_count) =
+            (task.group.clone(), task.name.clone(), task.count.num);
+        let job_config_id = config.id();
+        let reason = inner.reason.unwrap_or_default();
+        let previous = self
+            .store
+            .effective_task_count(&name, &task_group, &task_name, spec_count)
+            .map_err(|e| map_store_error("Error reading scale state", e))?;
+
+        let (message, deferred) = if inner.reset {
+            let existed = self
+                .store
+                .clear_task_scale(&name, &task_group, &task_name)
+                .map_err(|e| map_store_error("Error resetting scale", e))?;
+            if existed {
+                self.store
+                    .events()
+                    .scale_reset(&name, &task_group, &task_name, "explicit reset");
+                self.store
+                    .enqueue_eval(
+                        "job_scale",
+                        Some(&name),
+                        Some(&job_config_id),
+                        None,
+                        Some(self.store.default_eval_priority),
+                    )
+                    .map_err(|e| map_store_error("Error enqueueing scale eval", e))?;
+            }
+            (
+                format!(
+                    "{}/{}/{}: {} -> {} (override dropped; spec owns the count)",
+                    name, task_group, task_name, previous, spec_count
+                ),
+                false,
+            )
+        } else {
+            let count = inner.count.unwrap_or_default();
+            // The ECS rule (docs/autoscaling.md): scale-out applies during
+            // a rollout, scale-in defers until it finishes.
+            let active_rollout = self
+                .store
+                .list_rollouts(Some(&name), true)
+                .map_err(|e| map_store_error("Error checking rollouts", e))?
+                .into_iter()
+                .next();
+            match active_rollout {
+                Some(rollout) if count < previous => {
+                    self.store
+                        .set_task_scale_pending(
+                            &name,
+                            &task_group,
+                            &task_name,
+                            count,
+                            spec_count,
+                            "operator",
+                            &reason,
+                            &ident.principal,
+                        )
+                        .map_err(|e| map_store_error("Error recording pending scale", e))?;
+                    self.store.events().scale_deferred(
+                        &name,
+                        &task_group,
+                        &task_name,
+                        count,
+                        rollout.id,
+                        "operator",
+                        &reason,
+                    );
+                    (
+                        format!(
+                            "deferred: rollout {} is in progress; scale-in to {} applies when it completes",
+                            rollout.id, count
+                        ),
+                        true,
+                    )
+                }
+                _ => {
+                    self.store
+                        .set_task_scale_override(
+                            &name,
+                            &task_group,
+                            &task_name,
+                            count,
+                            spec_count,
+                            "operator",
+                            &reason,
+                            &ident.principal,
+                        )
+                        .map_err(|e| map_store_error("Error applying scale", e))?;
+                    self.store.events().scale_applied(
+                        &name,
+                        &task_group,
+                        &task_name,
+                        Some(previous),
+                        count,
+                        "operator",
+                        &reason,
+                    );
+                    self.store
+                        .enqueue_eval(
+                            "job_scale",
+                            Some(&name),
+                            Some(&job_config_id),
+                            None,
+                            Some(self.store.default_eval_priority),
+                        )
+                        .map_err(|e| map_store_error("Error enqueueing scale eval", e))?;
+                    (
+                        format!(
+                            "{}/{}/{}: {} -> {} (spec count {}; override active)",
+                            name, task_group, task_name, previous, count, spec_count
+                        ),
+                        false,
+                    )
+                }
+            }
+        };
+
+        self.store
+            .idempotency_record(&idempotency_key, "scale_task", &message)
+            .map_err(|e| map_store_error("Error recording idempotency", e))?;
+        Ok(Response::new(ScaleTaskReply {
+            message,
+            deduplicated: false,
+            deferred,
+        }))
+    }
+
+    #[instrument(skip_all)]
+    async fn get_job_scale_status(
+        &self,
+        request: Request<GetJobScaleStatusRequest>,
+    ) -> Result<Response<GetJobScaleStatusReply>, Status> {
+        self.check_acl(
+            &request,
+            AclResource::Scale,
+            AclAction::Read,
+            self.job_read_scope(&request.get_ref().name),
+        )?;
+        let name = request.into_inner().name;
+        let config = self
+            .store
+            .get_job_config(&name)
+            .map_err(|e| map_store_error("Error loading job config", e))?;
+        let scales = self
+            .store
+            .task_scales_for_job(&name)
+            .map_err(|e| map_store_error("Error loading scale state", e))?;
+
+        let tasks = config
+            .tasks
+            .iter()
+            .map(|task| {
+                let scale = scales
+                    .iter()
+                    .find(|scale| scale.task_group == task.group && scale.task_name == task.name);
+                let override_count = scale.and_then(|scale| scale.count);
+                TaskScaleStatus {
+                    task_group: task.group.clone(),
+                    task_name: task.name.clone(),
+                    spec_count: task.count.num,
+                    override_count,
+                    pending_count: scale.and_then(|scale| scale.pending_count),
+                    effective_count: override_count.unwrap_or(task.count.num),
+                    source: scale.map(|scale| scale.source.clone()).unwrap_or_default(),
+                    reason: scale.map(|scale| scale.reason.clone()).unwrap_or_default(),
+                    updated_at: scale
+                        .map(|scale| scale.updated_at.clone())
+                        .unwrap_or_default(),
+                }
+            })
+            .collect();
+
+        Ok(Response::new(GetJobScaleStatusReply { tasks }))
     }
 
     #[instrument(skip_all)]
@@ -4053,7 +4334,7 @@ impl Manager for ManagerDaemonService {
         // Free the gated allocation (instance -> rescheduling, id and
         // storage handle retained) and re-place excluding the lost node.
         self.store
-            .remove_allocation_by_id(allocation.id)
+            .remove_allocation_by_id_because(allocation.id, StopCause::Reschedule)
             .map_err(|e| map_store_error("Error removing gated allocation", e))?;
         let config = self
             .store
@@ -4571,6 +4852,11 @@ impl Manager for ManagerDaemonService {
             error!(node_id = %id, error = ?err, "Error handling failed allocations");
         }
         if let Err(err) =
+            handle_terminated_allocations(&self.store, &id, &req.terminated_allocations)
+        {
+            error!(node_id = %id, error = ?err, "Error handling terminated allocations");
+        }
+        if let Err(err) =
             update_allocation_health_snapshots(&self.store, &id, &req.allocation_health)
         {
             error!(
@@ -4594,12 +4880,29 @@ impl Manager for ManagerDaemonService {
         // Reclaim work for this node. Re-sent every heartbeat until the worker
         // confirms, so a worker that dies mid-destroy simply retries.
         let volume_destroy = build_volume_destroy_requests(&self.store, &id);
+        // Why this node's recently-removed allocations went away. Advisory:
+        // a lookup failure costs the worker a cause, never a reconcile, so
+        // it is logged and dropped rather than failing the heartbeat.
+        let stop_notices = match self.store.stop_notices_for_node(&id) {
+            Ok(notices) => notices
+                .into_iter()
+                .map(|(allocation_id, cause)| StopNotice {
+                    allocation_id,
+                    cause: cause.as_str().to_string(),
+                })
+                .collect(),
+            Err(err) => {
+                debug!(node_id = %id, error = ?err, "Error loading stop notices");
+                Vec::new()
+            }
+        };
 
         let reply = HeartbeatReply {
             message: "ack".into(),
             desired_allocations,
             upstream_endpoints,
             volume_destroy,
+            stop_notices,
         };
 
         Ok(Response::new(reply))
@@ -4658,6 +4961,8 @@ impl Manager for ManagerDaemonService {
             max_allocations: worker_config.max_allocations,
             artifacts: worker_config.artifacts,
             host_volumes: worker_config.host_volumes,
+            heartbeat_seconds: worker_config.heartbeat_seconds,
+            resource_enforcement: worker_config.resource_enforcement,
         };
 
         let reply = WorkerPreRegisterReply {
@@ -6477,6 +6782,63 @@ async fn fetch_allocation_logs(
     Ok(reply.into_inner().streams)
 }
 
+/// Record terminal, non-failure allocation outcomes reported by a worker: the
+/// task's process exited and the task's `restart` policy says that is the end
+/// of it (see docs/task-supervision.md).
+///
+/// Failures do NOT come through here — they arrive as `failed_allocations` and
+/// go through the reschedule/move machinery. This path is the one that makes a
+/// batch task's success real: the allocation row becomes terminal and the
+/// task's status follows the exit code.
+fn handle_terminated_allocations(
+    store: &Store,
+    node_id: &str,
+    terminated: &[crate::structs::TerminatedAllocation],
+) -> R<()> {
+    for report in terminated {
+        let allocation_id = report.allocation_id;
+        let Some(existing) = store.get_allocation_by_id(allocation_id)? else {
+            warn!(
+                allocation_id,
+                node_id, "Terminated allocation not found; ignoring report"
+            );
+            continue;
+        };
+        if existing.node_id != node_id {
+            warn!(
+                allocation_id,
+                reported_node_id = %node_id,
+                owner_node_id = %existing.node_id,
+                "Ignoring terminal allocation report from non-owner node"
+            );
+            continue;
+        }
+
+        let Some(allocation) = store.complete_allocation(allocation_id, report.success)? else {
+            continue;
+        };
+
+        store.events().allocation_terminated(
+            allocation_id,
+            node_id,
+            &allocation.job_id,
+            &allocation.job_config_id,
+            allocation.task_config_id,
+            report.success,
+            &report.message,
+        );
+        info!(
+            allocation_id,
+            node_id,
+            job_id = %allocation.job_id,
+            success = report.success,
+            status = %report.message,
+            "Allocation reached a terminal state"
+        );
+    }
+    Ok(())
+}
+
 fn handle_failed_allocations(
     store: &Store,
     failure_tracker: &Arc<Mutex<AllocationFailureTracker>>,
@@ -6985,6 +7347,12 @@ fn build_desired_allocations(
     let mut allocations = Vec::new();
 
     for allocation in desired {
+        // A finished allocation keeps its row (the slot is still spent) but
+        // must never be dispatched again — re-sending it would relaunch a
+        // completed batch task on the next worker restart.
+        if crate::constants::allocation_status_is_terminal(&allocation.status) {
+            continue;
+        }
         let tasks = task_cache
             .entry(allocation.job_config_id.clone())
             .or_default();
@@ -10052,6 +10420,68 @@ mod tests {
 
         let desired = build_desired_allocations(&store, "node-a", &[allocation.id])?;
         assert_eq!(desired.len(), 1);
+
+        Ok(())
+    }
+
+    /// A finished allocation keeps its row (its slot is still spent) but must
+    /// never be handed back to a worker — re-dispatching one would relaunch a
+    /// completed batch task on every heartbeat.
+    #[test]
+    fn terminal_allocations_are_never_dispatched_again() -> R<()> {
+        let store = setup_store()?;
+        insert_node(&store, "node-a")?;
+
+        let job = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "batch-job".into(),
+            tasks: vec![TaskConfig {
+                lifecycle: crate::structs::TaskLifecycle::Batch,
+                ..TaskConfig::new("prep", "noop")
+            }],
+            version: None,
+        };
+        store.handle_job_submit(&job, &[submission()])?;
+        let job_config_id = store.get_job_config(&job.name)?.id();
+        let task_id = store.get_task_configs_for_job_config(&job_config_id)?[0].0;
+        let allocation = store.place_alloc("node-a", task_id)?;
+        assert_eq!(build_desired_allocations(&store, "node-a", &[])?.len(), 1);
+
+        handle_terminated_allocations(
+            &store,
+            "node-a",
+            &[crate::structs::TerminatedAllocation {
+                allocation_id: allocation.id,
+                success: true,
+                exit_code: Some(0),
+                signal: None,
+                message: "exited with status 0".into(),
+            }],
+        )?;
+
+        assert!(build_desired_allocations(&store, "node-a", &[])?.is_empty());
+        assert!(store.get_allocation_by_id(allocation.id)?.is_some());
+
+        // A report from a node that does not own the allocation is ignored.
+        handle_terminated_allocations(
+            &store,
+            "node-b",
+            &[crate::structs::TerminatedAllocation {
+                allocation_id: allocation.id,
+                success: false,
+                exit_code: Some(1),
+                signal: None,
+                message: "exited with status 1".into(),
+            }],
+        )?;
+        assert_eq!(
+            store
+                .get_allocation_by_id(allocation.id)?
+                .expect("allocation exists")
+                .status,
+            "complete"
+        );
 
         Ok(())
     }

@@ -43,7 +43,7 @@ use crate::prelude::*;
 use crate::storage::raft::driver::NotRaftLeader;
 use crate::storage::raft::Lane;
 use crate::storage::store::Store;
-use crate::structs::AllocationHealth;
+use crate::structs::{AllocationHealth, StopCause};
 
 /// A store write that may be forwarded to its lane's leader. Closed enum:
 /// adding a variant is adding a wire message (serde_json on the manager
@@ -74,7 +74,17 @@ pub(crate) enum ForwardableLaneWrite {
     MarkJobFailed { job_id: String },
     /// `Store::remove_allocation_by_id` — scheduler lane. Returns the
     /// removed allocation, when one existed.
-    RemoveAllocationById { allocation_id: i64 },
+    ///
+    /// `cause` is why the allocation is going away, recorded as a stop notice
+    /// for the owning worker. It defaults on deserialize so a forward sent by
+    /// a manager that predates stop notices still applies here, landing as
+    /// [`StopCause::Unknown`] — the same value the worker would have used
+    /// with no notice at all.
+    RemoveAllocationById {
+        allocation_id: i64,
+        #[serde(default)]
+        cause: StopCause,
+    },
     /// `Store::enqueue_eval_after_delay` — scheduler lane. Returns the
     /// enqueued eval.
     EnqueueEval {
@@ -106,6 +116,9 @@ pub(crate) enum ForwardableLaneWrite {
     RecordVolumeError { volume_id: String, error: String },
     /// `Store::mark_volume_destroyed` — scheduler lane.
     MarkVolumeDestroyed { volume_id: String },
+    /// `Store::complete_allocation` — scheduler lane. Returns the completed
+    /// allocation, when one existed.
+    CompleteAllocation { allocation_id: i64, success: bool },
 }
 
 impl ForwardableLaneWrite {
@@ -125,7 +138,8 @@ impl ForwardableLaneWrite {
             | ForwardableLaneWrite::SeedKeyedInstances { .. }
             | ForwardableLaneWrite::RecordVolumeMounted { .. }
             | ForwardableLaneWrite::RecordVolumeError { .. }
-            | ForwardableLaneWrite::MarkVolumeDestroyed { .. } => Lane::Scheduler,
+            | ForwardableLaneWrite::MarkVolumeDestroyed { .. }
+            | ForwardableLaneWrite::CompleteAllocation { .. } => Lane::Scheduler,
         }
     }
 
@@ -147,6 +161,7 @@ impl ForwardableLaneWrite {
             ForwardableLaneWrite::RecordVolumeMounted { .. } => "record_volume_mounted",
             ForwardableLaneWrite::RecordVolumeError { .. } => "record_volume_error",
             ForwardableLaneWrite::MarkVolumeDestroyed { .. } => "mark_volume_destroyed",
+            ForwardableLaneWrite::CompleteAllocation { .. } => "complete_allocation",
         }
     }
 }
@@ -208,9 +223,10 @@ pub(crate) fn execute(store: &Store, op: ForwardableLaneWrite) -> ForwardOutcome
         ForwardableLaneWrite::MarkJobFailed { job_id } => {
             done(store.mark_job_failed_local(&job_id))
         }
-        ForwardableLaneWrite::RemoveAllocationById { allocation_id } => {
-            done(store.remove_allocation_by_id_local(allocation_id))
-        }
+        ForwardableLaneWrite::RemoveAllocationById {
+            allocation_id,
+            cause,
+        } => done(store.remove_allocation_by_id_local(allocation_id, cause)),
         ForwardableLaneWrite::EnqueueEval {
             kind,
             job_id,
@@ -253,6 +269,10 @@ pub(crate) fn execute(store: &Store, op: ForwardableLaneWrite) -> ForwardOutcome
         ForwardableLaneWrite::MarkVolumeDestroyed { volume_id } => {
             done(store.mark_volume_destroyed_local(&volume_id))
         }
+        ForwardableLaneWrite::CompleteAllocation {
+            allocation_id,
+            success,
+        } => done(store.complete_allocation_local(allocation_id, success)),
     }
 }
 
@@ -286,7 +306,10 @@ mod tests {
             ForwardableLaneWrite::MarkJobFailed {
                 job_id: "job".into(),
             },
-            ForwardableLaneWrite::RemoveAllocationById { allocation_id: 7 },
+            ForwardableLaneWrite::RemoveAllocationById {
+                allocation_id: 7,
+                cause: StopCause::Unknown,
+            },
             ForwardableLaneWrite::EnqueueEval {
                 kind: "job_reschedule".into(),
                 job_id: Some("job".into()),
@@ -309,6 +332,10 @@ mod tests {
             },
             ForwardableLaneWrite::MarkVolumeDestroyed {
                 volume_id: "v1".into(),
+            },
+            ForwardableLaneWrite::CompleteAllocation {
+                allocation_id: 9,
+                success: true,
             },
         ];
         for op in ops {

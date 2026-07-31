@@ -5463,9 +5463,9 @@ export class ListJobsRequest extends Message<ListJobsRequest> {
   query?: string;
 
   /**
-   * Sort key. Supported values: `name`, `status`, `created_at`.
+   * Sort key. Supported values: `name`, `status`, `created_at`, `updated_at`.
    *
-   * Default: `created_at`.
+   * Default: `updated_at`.
    *
    * @generated from field: optional string sort_by = 2;
    */
@@ -5560,11 +5560,27 @@ export class Job extends Message<Job> {
   status = "";
 
   /**
-   * Unix timestamp (seconds) when job was created.
+   * Unix timestamp (seconds) when job was created. Immutable for the life of
+   * the job — resubmitting a new spec version does not move it.
    *
    * @generated from field: int64 created_at = 4;
    */
   createdAt = protoInt64.zero;
+
+  /**
+   * Unix timestamp (seconds) of the last change to the job, and the value the
+   * UI's "Updated" column shows. Stamped when a new spec version is submitted
+   * and on every status transition the manager records (`stopped`, `failed`,
+   * recovery back to `done`, and an acknowledged restart request). Never
+   * moved by allocation churn, heartbeats, or reads.
+   *
+   * Equals `created_at` for a job that has not changed since submission, and
+   * for rows written by a manager older than the column (backfilled once at
+   * migration time).
+   *
+   * @generated from field: int64 updated_at = 5;
+   */
+  updatedAt = protoInt64.zero;
 
   constructor(data?: PartialMessage<Job>) {
     super();
@@ -5578,6 +5594,7 @@ export class Job extends Message<Job> {
     { no: 2, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 3, name: "status", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 4, name: "created_at", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 5, name: "updated_at", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): Job {

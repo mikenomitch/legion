@@ -1990,6 +1990,7 @@ dependencies = [
  "openraft",
  "opentelemetry",
  "opentelemetry-otlp",
+ "opentelemetry-proto",
  "opentelemetry-semantic-conventions",
  "opentelemetry_sdk",
  "portable-pty",

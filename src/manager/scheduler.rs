@@ -9,7 +9,7 @@ use serde_json::Value;
 
 use libloading::Library;
 use rand::seq::SliceRandom;
-use rand::{rngs::StdRng, SeedableRng};
+use rand::{rngs::StdRng, Rng, SeedableRng};
 
 use crate::constraints::{AffinitySet, ConstraintSet, DistinctTracker, PermitSet};
 use crate::prelude::*;
@@ -169,6 +169,12 @@ pub struct TaskIndexUsage {
     pub shadow_agreement: Option<bool>,
     /// Why no index served, when one was expected to (`None` otherwise).
     pub reason: Option<String>,
+    /// `Some(sample)` when bounded candidate scoring
+    /// (`schedulerSettings.score_sample`) engaged for any of this task's
+    /// placements: the placement was chosen as the best of `sample`
+    /// uniformly drawn eligible nodes instead of exact scoring over all of
+    /// them. `None` = every placement scored exactly.
+    pub score_sampled: Option<usize>,
 }
 
 impl TaskIndexUsage {
@@ -183,6 +189,7 @@ impl TaskIndexUsage {
             fell_back: false,
             shadow_agreement: None,
             reason: None,
+            score_sampled: None,
         }
     }
 }
@@ -200,8 +207,12 @@ struct BuiltPlan {
 /// ledger recomputes exactly those nodes from scratch.
 struct CapacitySnapshot {
     allocations_by_node: SharedNodeAllocations,
-    pools: HashMap<String, ResourcePool>,
+    pools: HashMap<String, Arc<ResourcePool>>,
     freed_nodes: HashSet<String>,
+    /// Read-model generation this snapshot was published at — what the
+    /// lazy version sample compares against at submit time (see
+    /// `Store::expected_versions_if_unchanged`).
+    generation: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -210,19 +221,47 @@ enum NodesConsidered {
     Percent(f64),
 }
 
+/// Bounded candidate scoring (`schedulerSettings.score_sample`,
+/// bounded-candidate-scoring plan): below `min_nodes` eligible candidates a
+/// placement scores every one of them (exactly today's behavior); at or
+/// above it, scoring runs on `sample` uniformly drawn candidates —
+/// best-of-k selection, which keeps per-placement cost flat as the fleet
+/// grows. Feasibility (constraints, permits, resources, distinct) is never
+/// sampled: a drawn candidate is always a valid placement, only the score
+/// *ranking* is approximate.
+#[derive(Debug, Clone, Copy)]
+struct ScoreSample {
+    min_nodes: usize,
+    sample: usize,
+}
+
+/// Plan-time free-capacity ledger. Pools are `Arc`'d straight off the
+/// read-model snapshot; `consume` copies-on-write only the pools this plan
+/// actually debits, so building the ledger never deep-clones the fleet.
 #[derive(Debug, Clone)]
 struct ResourceLedger {
-    pools: HashMap<String, ResourcePool>,
+    pools: HashMap<String, Arc<ResourcePool>>,
 }
 
 struct TaskPlan<'a> {
-    constraint_set: ConstraintSet,
-    permit_set: PermitSet,
+    /// The task's hard filters (constraints, permit), parsed once per plan
+    /// in `build_plan` and shared with the group-filter pass.
+    filters: Arc<(ConstraintSet, PermitSet)>,
     affinity_set: AffinitySet,
     task_request: ResourceRequest,
     base_eligible: Vec<&'a Node>,
     distinct_tracker: Option<DistinctTracker>,
     index_usage: TaskIndexUsage,
+}
+
+impl TaskPlan<'_> {
+    fn constraint_set(&self) -> &ConstraintSet {
+        &self.filters.0
+    }
+
+    fn permit_set(&self) -> &PermitSet {
+        &self.filters.1
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -542,6 +581,14 @@ pub struct Scheduler<'a> {
     policy: Box<dyn SchedulingPolicy>,
     #[allow(dead_code)]
     policy_lib: Option<Library>,
+    /// Settings parsed ONCE at construction (`scheduler_settings` is fixed
+    /// for the store's lifetime): `build_plan` used to re-walk the settings
+    /// JSON on every plan. Malformed settings therefore fail at
+    /// `Scheduler::new` rather than at the first plan.
+    weights: SchedulerWeights,
+    nodes_considered: Option<NodesConsidered>,
+    score_sample: Option<ScoreSample>,
+    plan_candidates: PlanCandidatesSetting,
 }
 
 #[derive(Debug, Clone)]
@@ -556,11 +603,22 @@ impl<'a> Scheduler<'a> {
     pub fn new(store: &'a Store) -> R<Self> {
         let (policy_lib, policy) = load_policy(&store.scheduling_policy)?;
 
-        Ok(Scheduler {
+        // Two-phase: the parsers below read `self.policy`/`self.store`, so
+        // construct with the policy's default weights first and overwrite.
+        let mut scheduler = Scheduler {
+            weights: SchedulerWeights::for_policy(policy.name()),
             store,
             policy,
             policy_lib,
-        })
+            nodes_considered: None,
+            score_sample: None,
+            plan_candidates: PlanCandidatesSetting::default(),
+        };
+        scheduler.weights = scheduler.scheduler_weights()?;
+        scheduler.nodes_considered = scheduler.nodes_considered_setting()?;
+        scheduler.score_sample = scheduler.score_sample_setting()?;
+        scheduler.plan_candidates = scheduler.plan_candidates_setting()?;
+        Ok(scheduler)
     }
 
     #[instrument(skip_all)]
@@ -638,7 +696,7 @@ impl<'a> Scheduler<'a> {
         &self,
         should_drop: Option<&dyn Fn(&Allocation) -> bool>,
     ) -> R<CapacitySnapshot> {
-        let (mut allocations_by_node, pools) = self.store.plan_capacity_snapshot()?;
+        let (mut allocations_by_node, pools, generation) = self.store.plan_capacity_snapshot()?;
         let mut freed_nodes = HashSet::new();
         if let Some(should_drop) = should_drop {
             for (node_id, allocations) in allocations_by_node.iter_mut() {
@@ -656,6 +714,7 @@ impl<'a> Scheduler<'a> {
             allocations_by_node,
             pools,
             freed_nodes,
+            generation,
         })
     }
 
@@ -675,6 +734,9 @@ impl<'a> Scheduler<'a> {
 
         let status_map = HashMap::new();
         let mut tasks = Self::tasks_for_plan(job_config, &status_map)?;
+        // Count overrides apply to dry-run plans too, so `job plan` previews
+        // what a submit would actually converge to (job id == job name).
+        Self::apply_count_overrides(self.store, &job_config.name, &mut tasks)?;
         // Keyed tasks plan against live instances, not count.num, even for
         // not-yet-submitted configs (a fresh job simply has zero instances).
         Self::apply_keyed_instance_counts(self.store, &job_config.name, &mut tasks)?;
@@ -773,148 +835,202 @@ impl<'a> Scheduler<'a> {
         let started = std::time::Instant::now();
         let mut timings = PlanTimings::default();
         info!(%job_config_id, mode = mode.as_str(), target_override = task_targets.is_some(), "Starting scheduler plan_and_apply");
-        let mut nodes = self.available_nodes()?;
-        if let Some(excluded) = excluded_nodes {
-            nodes.retain(|node| !excluded.contains(&node.id));
-        }
-        timings.available_nodes_us = started.elapsed().as_micros() as u64;
-        if nodes.is_empty() {
-            bail!("No nodes available to place allocations");
-        }
 
-        // Optimistic-concurrency fence, sampled HERE — before the capacity
-        // snapshot below (`capacity_snapshot`) that `build_plan` places
-        // against.
+        // Optimistic-concurrency fence. Every transaction that mutates a
+        // scope's allocations bumps that scope's epoch
+        // (`bump_epochs_for_allocations_tx`), and `apply_plan_submission`
+        // re-reads these epochs inside its write transaction and refuses the
+        // plan if any of them moved. So what the epochs fence is: "nothing
+        // changed the allocations I planned against between the moment I
+        // read them and the moment I write". That only holds if the epoch
+        // sample is taken no later than the capacity read the plan is built
+        // against — a sample taken after planning could see a *post-bump*
+        // value from a competing plan, pass the compare-and-set, and commit
+        // placements against capacity that no longer exists.
         //
-        // Every transaction that mutates a scope's allocations bumps that
-        // scope's epoch (`bump_epochs_for_allocations_tx`), and
-        // `apply_plan_submission` re-reads these epochs inside its write
-        // transaction and refuses the plan if any of them moved. So what the
-        // epochs fence is: "nothing changed the allocations I planned against
-        // between the moment I read them and the moment I write". That only
-        // holds if the sample is taken no later than the capacity read. If it
-        // were taken after planning (as it once was), a competing plan that
-        // applied in the window between the capacity read and the sample would
-        // already have bumped the epoch, so this plan would sample the
-        // *post-bump* value, pass the compare-and-set, and commit placements
-        // computed against capacity that no longer exists — oversubscribing the
-        // node. Sampling first makes that case fail the compare-and-set
-        // instead, and the caller retries against a fresh snapshot.
+        // Two ways to satisfy that, chosen per attempt:
         //
-        // The affected node set is only known after planning, so sample every
-        // candidate node now and select the affected subset at submit time —
-        // never re-read. That is one batched query rather than one per node;
-        // see `Store::allocation_version_vector_for_candidates`.
-        let candidate_node_ids: Vec<&str> = nodes.iter().map(|node| node.id.as_str()).collect();
-        let version_sample_started = std::time::Instant::now();
-        let candidate_versions = self
-            .store
-            .allocation_version_vector_for_candidates(job_config_id, &candidate_node_ids)?;
-        timings.version_sample_us = version_sample_started.elapsed().as_micros() as u64;
-
-        let task_fetch_started = std::time::Instant::now();
-        let all_tasks = self
-            .store
-            .cached_task_configs_for_job_config(job_config_id)?;
-        let mut tasks = self.tasks_for_plan_from_store(job_config_id)?;
-        if task_targets.is_none() && matches!(mode, PlanMode::Reschedule) {
-            if let Some(job_id) = self.store.job_id_for_job_config(job_config_id)? {
-                Self::apply_slot_staged_counts(self.store, &job_id, job_config_id, &mut tasks)?;
+        // - LAZY (the default): plan first, then sample epochs for exactly
+        //   the affected scopes, accepting the sample only if the
+        //   read-model generation is unchanged since the capacity read —
+        //   which proves the late sample equals one taken at the capacity
+        //   read (`Store::expected_versions_if_unchanged`). O(affected)
+        //   instead of O(fleet). If the generation moved, fall through to
+        //   one EAGER attempt.
+        // - EAGER (the fallback, and unconditionally when
+        //   `schedulerSettings.lazy_version_sample: false`): sample every
+        //   candidate node BEFORE the capacity read and select the affected
+        //   subset at submit time — never re-read. Safe regardless of what
+        //   commits mid-plan, at O(fleet) cost.
+        let mut eager_sample = !self.lazy_version_sample_enabled();
+        let (placements, affected_nodes, expected_versions) = loop {
+            let available_started = std::time::Instant::now();
+            let mut nodes = self.available_nodes()?;
+            if let Some(excluded) = excluded_nodes {
+                nodes.retain(|node| !excluded.contains(&node.id));
             }
-        }
-        timings.task_fetch_us = task_fetch_started.elapsed().as_micros() as u64;
+            timings.available_nodes_us = available_started.elapsed().as_micros() as u64;
+            if nodes.is_empty() {
+                bail!("No nodes available to place allocations");
+            }
 
-        // A `Fresh` plan replaces the job's allocations wholesale: whichever
-        // handler asked for it either already dropped the previous ones
-        // (`job_update`) or drops them the moment this plan applies
-        // (`job_submit`). Counting them against node capacity here would
-        // demand headroom for two copies of the job and fail a plain
-        // resubmit of anything using more than half a node — and it would
-        // contradict `plan_only` / `plan_for_config`, which drop them and so
-        // report a plan the apply path then refuses.
-        let replaced_job_id = if matches!(mode, PlanMode::Fresh) {
-            self.store.job_id_for_job_config(job_config_id)?
-        } else {
-            None
-        };
-        let drop_replaced = |allocation: &Allocation| {
-            Some(allocation.job_id.as_str()) == replaced_job_id.as_deref()
-        };
-        let capacity_snapshot_started = std::time::Instant::now();
-        let snapshot =
-            self.capacity_snapshot(replaced_job_id.is_some().then_some(&drop_replaced))?;
-        timings.capacity_snapshot_us = capacity_snapshot_started.elapsed().as_micros() as u64;
-        let existing_counts =
-            Self::existing_alloc_counts_by_task(job_config_id, &snapshot.allocations_by_node);
-        if let Some(task_targets) = task_targets {
-            for (task_id, _config, desired) in &mut tasks {
-                if let Some(target) = task_targets.get(task_id) {
-                    *desired = (*target).min(*desired);
-                } else if matches!(mode, PlanMode::Reschedule) {
-                    *desired = existing_counts.get(task_id).copied().unwrap_or_default();
+            let candidate_versions = if eager_sample {
+                let candidate_node_ids: Vec<&str> =
+                    nodes.iter().map(|node| node.id.as_str()).collect();
+                let version_sample_started = std::time::Instant::now();
+                let versions = self
+                    .store
+                    .allocation_version_vector_for_candidates(job_config_id, &candidate_node_ids)?;
+                timings.version_sample_us = version_sample_started.elapsed().as_micros() as u64;
+                Some(versions)
+            } else {
+                None
+            };
+
+            let task_fetch_started = std::time::Instant::now();
+            let all_tasks = self
+                .store
+                .cached_task_configs_for_job_config(job_config_id)?;
+            let mut tasks = self.tasks_for_plan_from_store(job_config_id)?;
+            if task_targets.is_none() && matches!(mode, PlanMode::Reschedule) {
+                if let Some(job_id) = self.store.job_id_for_job_config(job_config_id)? {
+                    Self::apply_slot_staged_counts(self.store, &job_id, job_config_id, &mut tasks)?;
                 }
             }
-        }
+            timings.task_fetch_us = task_fetch_started.elapsed().as_micros() as u64;
 
-        let required_counts = Self::required_counts_for_mode(
-            &tasks,
-            mode.clone(),
-            job_config_id,
-            &snapshot.allocations_by_node,
-        );
+            // A `Fresh` plan replaces the job's allocations wholesale: whichever
+            // handler asked for it either already dropped the previous ones
+            // (`job_update`) or drops them the moment this plan applies
+            // (`job_submit`). Counting them against node capacity here would
+            // demand headroom for two copies of the job and fail a plain
+            // resubmit of anything using more than half a node — and it would
+            // contradict `plan_only` / `plan_for_config`, which drop them and so
+            // report a plan the apply path then refuses.
+            let replaced_job_id = if matches!(mode, PlanMode::Fresh) {
+                self.store.job_id_for_job_config(job_config_id)?
+            } else {
+                None
+            };
+            let drop_replaced = |allocation: &Allocation| {
+                Some(allocation.job_id.as_str()) == replaced_job_id.as_deref()
+            };
+            let capacity_snapshot_started = std::time::Instant::now();
+            let snapshot =
+                self.capacity_snapshot(replaced_job_id.is_some().then_some(&drop_replaced))?;
+            timings.capacity_snapshot_us = capacity_snapshot_started.elapsed().as_micros() as u64;
+            let snapshot_generation = snapshot.generation;
+            let existing_counts =
+                Self::existing_alloc_counts_by_task(job_config_id, &snapshot.allocations_by_node);
+            if let Some(task_targets) = task_targets {
+                for (task_id, _config, desired) in &mut tasks {
+                    if let Some(target) = task_targets.get(task_id) {
+                        *desired = (*target).min(*desired);
+                    } else if matches!(mode, PlanMode::Reschedule) {
+                        *desired = existing_counts.get(task_id).copied().unwrap_or_default();
+                    }
+                }
+            }
 
-        let build_started = std::time::Instant::now();
-        let BuiltPlan {
-            placements,
-            index_report,
-        } = self.build_plan(
-            job_config_id,
-            nodes,
-            tasks,
-            all_tasks,
-            required_counts,
-            snapshot,
-            mode.clone(),
-            task_targets,
-        )?;
-        timings.build_plan_us = build_started.elapsed().as_micros() as u64;
-        let indexed_tasks = index_report
-            .iter()
-            .filter(|usage| usage.index.is_some())
-            .count();
-        debug!(
-            %job_config_id,
-            mode = mode.as_str(),
-            placement_count = placements.len(),
-            indexed_tasks,
-            planned_tasks = index_report.len(),
-            build_plan_ms = build_started.elapsed().as_millis() as u64,
-            "Scheduler build_plan completed"
-        );
-        if placements.is_empty() {
-            info!(%job_config_id, "No placements generated during plan_and_apply");
-            timings.total_us = started.elapsed().as_micros() as u64;
-            timings.observe();
-            return Ok(PlanOutcome {
-                allocations: Vec::new(),
-                deltas: Vec::new(),
-                timings,
-            });
-        }
+            let required_counts = Self::required_counts_for_mode(
+                &tasks,
+                mode.clone(),
+                job_config_id,
+                &snapshot.allocations_by_node,
+            );
 
-        // The expected vector covers the UNION of every placement's candidate
-        // list — the apply walk needs each candidate's sampled epoch to judge
-        // whether that candidate is still free. With candidates disabled the
-        // lists are singletons and this is exactly the placed-on node set.
-        let affected_nodes = placements
-            .iter()
-            .flat_map(|placement| placement.candidates.iter().cloned())
-            .collect::<HashSet<_>>();
-        // Select from the pre-planning sample; re-reading here would reopen the
-        // race the sample above exists to close.
-        let expected_versions =
-            Self::expected_versions_for(job_config_id, &candidate_versions, &affected_nodes);
-        let candidates_setting = self.plan_candidates_setting()?;
+            let build_started = std::time::Instant::now();
+            let BuiltPlan {
+                placements,
+                index_report,
+            } = self.build_plan(
+                job_config_id,
+                nodes,
+                tasks,
+                all_tasks,
+                required_counts,
+                snapshot,
+                mode.clone(),
+                task_targets,
+            )?;
+            timings.build_plan_us = build_started.elapsed().as_micros() as u64;
+            let indexed_tasks = index_report
+                .iter()
+                .filter(|usage| usage.index.is_some())
+                .count();
+            debug!(
+                %job_config_id,
+                mode = mode.as_str(),
+                placement_count = placements.len(),
+                indexed_tasks,
+                planned_tasks = index_report.len(),
+                build_plan_ms = build_started.elapsed().as_millis() as u64,
+                "Scheduler build_plan completed"
+            );
+            if placements.is_empty() {
+                info!(%job_config_id, "No placements generated during plan_and_apply");
+                timings.total_us = started.elapsed().as_micros() as u64;
+                timings.observe();
+                return Ok(PlanOutcome {
+                    allocations: Vec::new(),
+                    deltas: Vec::new(),
+                    timings,
+                });
+            }
+
+            // The expected vector covers the UNION of every placement's
+            // candidate list — the apply walk needs each candidate's sampled
+            // epoch to judge whether that candidate is still free. With
+            // candidates disabled the lists are singletons and this is exactly
+            // the placed-on node set.
+            let affected_nodes = placements
+                .iter()
+                .flat_map(|placement| placement.candidates.iter().cloned())
+                .collect::<HashSet<_>>();
+            let expected_versions = match candidate_versions.as_ref() {
+                // Eager: select from the pre-planning sample; re-reading here
+                // would reopen the race the sample exists to close.
+                Some(candidate_versions) => {
+                    Self::expected_versions_for(job_config_id, candidate_versions, &affected_nodes)
+                }
+                // Lazy: sample now, for exactly the affected scopes (the
+                // candidate union, not the whole fleet) — sound only if the
+                // generation check proves nothing was published since the
+                // capacity read.
+                None => {
+                    let version_sample_started = std::time::Instant::now();
+                    match self.store.expected_versions_if_unchanged(
+                        job_config_id,
+                        &affected_nodes,
+                        snapshot_generation,
+                    )? {
+                        Some(versions) => {
+                            timings.version_sample_us =
+                                version_sample_started.elapsed().as_micros() as u64;
+                            versions
+                        }
+                        None => {
+                            // The read model changed while this plan was being
+                            // built, so the late sample proves nothing. Re-plan
+                            // once with the eager sample (the unconditionally
+                            // safe path); that attempt cannot land back here.
+                            crate::manager::telemetry::metrics()
+                                .scheduler_lazy_sample_fallback_total
+                                .inc();
+                            debug!(
+                                %job_config_id,
+                                mode = mode.as_str(),
+                                "Read model changed mid-plan; retrying with the eager version sample"
+                            );
+                            eager_sample = true;
+                            continue;
+                        }
+                    }
+                }
+            };
+            break (placements, affected_nodes, expected_versions);
+        };
+        let candidates_setting = self.plan_candidates;
         // One replicated op for insert + apply: on raft backends the split
         // form paid a second quorum round-trip per plan (see
         // `Store::submit_and_apply_plan`).
@@ -1145,6 +1261,7 @@ impl<'a> Scheduler<'a> {
             allocations_by_node,
             pools,
             freed_nodes,
+            generation: _,
         } = capacity;
         // The body reads allocations by reference throughout (the owned map
         // outlives the plan); the pools move into the ledger below.
@@ -1155,9 +1272,10 @@ impl<'a> Scheduler<'a> {
         // scan is cheaper than any bookkeeping (docs/scheduling-indexes.md).
         let index_armed = self.store.index_settings.armed_for(nodes.len());
         let mut planned: HashMap<String, usize> = HashMap::new();
-        let weights = self.scheduler_weights()?;
-        let nodes_considered_setting = self.nodes_considered_setting()?;
-        let candidates_setting = self.plan_candidates_setting()?;
+        let weights = self.weights;
+        let nodes_considered_setting = self.nodes_considered;
+        let score_sample_setting = self.score_sample;
+        let candidates_setting = self.plan_candidates;
         let mut reschedule_rng = if matches!(mode, PlanMode::Reschedule) {
             Some(reschedule_rng())
         } else {
@@ -1187,8 +1305,12 @@ impl<'a> Scheduler<'a> {
         let mut distinct_keys_by_task: HashMap<i64, Vec<String>> = HashMap::new();
         // Hard filters (constraints + permit) of every member of a group. A
         // multi-task group is placed on a single node, so that node must
-        // satisfy all of them.
-        let mut group_filters: HashMap<String, Vec<(ConstraintSet, PermitSet)>> = HashMap::new();
+        // satisfy all of them. Arc'd and shared with `build_task_plan` via
+        // `parsed_filters`, so each task's constraints/permit parse exactly
+        // once per plan.
+        let mut group_filters: HashMap<String, Vec<Arc<(ConstraintSet, PermitSet)>>> =
+            HashMap::new();
+        let mut parsed_filters: HashMap<i64, Arc<(ConstraintSet, PermitSet)>> = HashMap::new();
         let mut task_group_map: HashMap<i64, (String, Option<String>)> = HashMap::new();
         let mut task_id_to_group: HashMap<i64, String> = HashMap::new();
         let task_name_to_id: HashMap<String, i64> = all_tasks
@@ -1224,10 +1346,12 @@ impl<'a> Scheduler<'a> {
             distinct_keys_by_task.insert(*task_id, constraint_set.distinct_keys());
             let permit_set = PermitSet::new(&task_config.permit)
                 .with_context(|| format!("Failed to parse permit for task {}", task_config.name))?;
+            let filters = Arc::new((constraint_set, permit_set));
             group_filters
                 .entry(task_config.group.clone())
                 .or_default()
-                .push((constraint_set, permit_set));
+                .push(Arc::clone(&filters));
+            parsed_filters.insert(*task_id, filters);
             task_group_map.insert(*task_id, (task_config.group.clone(), per_key));
             task_id_to_group.insert(*task_id, task_config.group.clone());
         }
@@ -1292,8 +1416,8 @@ impl<'a> Scheduler<'a> {
                 .and_then(|value| value.clone());
             let mut grouped: HashMap<String, Vec<&Node>> = HashMap::new();
             for node in nodes.iter().map(|node| &**node) {
-                if !filters.iter().all(|(constraint, permit)| {
-                    constraint.is_satisfied(node, None) && permit.is_permitted(node)
+                if !filters.iter().all(|filters| {
+                    filters.0.is_satisfied(node, None) && filters.1.is_permitted(node)
                 }) {
                     continue;
                 }
@@ -1337,6 +1461,7 @@ impl<'a> Scheduler<'a> {
                 needed,
                 index_armed,
                 in_multi_task_group,
+                &parsed_filters,
             )?;
 
             let base_eligible = plan.base_eligible.clone();
@@ -1414,6 +1539,7 @@ impl<'a> Scheduler<'a> {
                         &mut planned,
                         &mut reschedule_rng,
                         nodes_considered_setting.as_ref(),
+                        score_sample_setting.as_ref(),
                         &mut nodes_considered_rng,
                         &node_lookup,
                         &mut resource_ledger,
@@ -1461,6 +1587,7 @@ impl<'a> Scheduler<'a> {
                     &mut planned,
                     &mut reschedule_rng,
                     nodes_considered_setting.as_ref(),
+                    score_sample_setting.as_ref(),
                     &mut nodes_considered_rng,
                     &node_lookup,
                     &mut resource_ledger,
@@ -1647,33 +1774,37 @@ impl<'a> Scheduler<'a> {
             })
             .collect();
 
-        let candidates =
-            match self
-                .store
-                .scheduling_index_query(&bindings, &request_amounts, None)?
-            {
-                IndexQueryOutcome::Disabled => {
-                    return Ok(Self::scan_base_eligible(
-                        node_refs(nodes),
-                        constraint_set,
-                        permit_set,
-                        required_drivers,
-                    ));
-                }
-                IndexQueryOutcome::Unusable { reason } => {
-                    metrics
-                        .scheduler_index_queries_total
-                        .inc(&["none", "unusable"]);
-                    usage.reason = Some(reason);
-                    return Ok(Self::scan_base_eligible(
-                        node_refs(nodes),
-                        constraint_set,
-                        permit_set,
-                        required_drivers,
-                    ));
-                }
-                IndexQueryOutcome::Candidates(candidates) => candidates,
-            };
+        // Ordering matters only when the verified list may be truncated to
+        // the best-first budget below; the untruncated path re-sorts by
+        // node id, so the shard's nearest-fit cell sort would be wasted.
+        let candidates = match self.store.scheduling_index_query(
+            &bindings,
+            &request_amounts,
+            None,
+            allow_truncation,
+        )? {
+            IndexQueryOutcome::Disabled => {
+                return Ok(Self::scan_base_eligible(
+                    node_refs(nodes),
+                    constraint_set,
+                    permit_set,
+                    required_drivers,
+                ));
+            }
+            IndexQueryOutcome::Unusable { reason } => {
+                metrics
+                    .scheduler_index_queries_total
+                    .inc(&["none", "unusable"]);
+                usage.reason = Some(reason);
+                return Ok(Self::scan_base_eligible(
+                    node_refs(nodes),
+                    constraint_set,
+                    permit_set,
+                    required_drivers,
+                ));
+            }
+            IndexQueryOutcome::Candidates(candidates) => candidates,
+        };
 
         let mut verified: Vec<&'b Node> = candidates
             .node_ids
@@ -1770,6 +1901,7 @@ impl<'a> Scheduler<'a> {
         Ok(verified)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build_task_plan<'b>(
         &self,
         task_id: i64,
@@ -1781,24 +1913,30 @@ impl<'a> Scheduler<'a> {
         needed: u32,
         index_armed: bool,
         in_multi_task_group: bool,
+        parsed_filters: &HashMap<i64, Arc<(ConstraintSet, PermitSet)>>,
     ) -> R<TaskPlan<'b>> {
         let task_resources =
             resource_policy.normalize_task_resources(&task_config.resources, true)?;
         let task_request = ResourceRequest::from_value(&task_resources)?;
 
-        let constraint_set = ConstraintSet::new(&task_config.constraints).with_context(|| {
-            format!("Failed to parse constraints for task {}", task_config.name)
-        })?;
-        let permit_set = PermitSet::new(&task_config.permit)
-            .with_context(|| format!("Failed to parse permit for task {}", task_config.name))?;
+        // Parsed once per plan by `build_plan`'s group-filter pass;
+        // re-parsing here (the old shape) doubled the per-task JSON walk.
+        let filters = match parsed_filters.get(&task_id) {
+            Some(filters) => Arc::clone(filters),
+            None => Arc::new((
+                ConstraintSet::new(&task_config.constraints).with_context(|| {
+                    format!("Failed to parse constraints for task {}", task_config.name)
+                })?,
+                PermitSet::new(&task_config.permit).with_context(|| {
+                    format!("Failed to parse permit for task {}", task_config.name)
+                })?,
+            )),
+        };
+        let (constraint_set, permit_set) = (&filters.0, &filters.1);
         let affinity_set = AffinitySet::new(&task_config.affinities)
             .with_context(|| format!("Failed to parse affinities for task {}", task_config.name))?;
-        let distinct_tracker = Self::build_distinct_tracker(
-            &constraint_set,
-            task_id,
-            allocations_by_node,
-            node_lookup,
-        );
+        let distinct_tracker =
+            Self::build_distinct_tracker(constraint_set, task_id, allocations_by_node, node_lookup);
         // Storage is a hard placement requirement: a node without the task's
         // volume driver (or with it installed-but-unusable) can never run the
         // task, so filter it out here rather than letting the task start and
@@ -1820,8 +1958,8 @@ impl<'a> Scheduler<'a> {
             self.indexed_base_eligible(
                 nodes,
                 node_lookup,
-                &constraint_set,
-                &permit_set,
+                constraint_set,
+                permit_set,
                 &task_request,
                 &required_drivers,
                 needed,
@@ -1831,8 +1969,8 @@ impl<'a> Scheduler<'a> {
         } else {
             Self::scan_base_eligible(
                 node_refs(nodes),
-                &constraint_set,
-                &permit_set,
+                constraint_set,
+                permit_set,
                 &required_drivers,
             )
         };
@@ -1859,8 +1997,7 @@ impl<'a> Scheduler<'a> {
         }
 
         Ok(TaskPlan {
-            constraint_set,
-            permit_set,
+            filters,
             affinity_set,
             task_request,
             base_eligible,
@@ -1883,6 +2020,7 @@ impl<'a> Scheduler<'a> {
         planned: &mut HashMap<String, usize>,
         reschedule_rng: &mut Option<StdRng>,
         nodes_considered_setting: Option<&NodesConsidered>,
+        score_sample_setting: Option<&ScoreSample>,
         nodes_considered_rng: &mut StdRng,
         node_lookup: &HashMap<&'b str, &'b Node>,
         resource_ledger: &mut ResourceLedger,
@@ -1937,8 +2075,8 @@ impl<'a> Scheduler<'a> {
         for _ in 0..count {
             let mut eligible = Self::eligible_nodes(
                 &candidates,
-                &plan.constraint_set,
-                &plan.permit_set,
+                plan.constraint_set(),
+                plan.permit_set(),
                 plan.distinct_tracker.as_ref(),
                 &scoring_cache,
             );
@@ -1951,8 +2089,8 @@ impl<'a> Scheduler<'a> {
                 let required_drivers = task_config.required_volume_drivers();
                 let mut widened = Self::scan_base_eligible(
                     node_lookup.values().copied(),
-                    &plan.constraint_set,
-                    &plan.permit_set,
+                    plan.constraint_set(),
+                    plan.permit_set(),
                     &required_drivers,
                 );
                 widened.sort_by(|a, b| a.id.cmp(&b.id));
@@ -1988,8 +2126,8 @@ impl<'a> Scheduler<'a> {
                 );
                 eligible = Self::eligible_nodes(
                     &candidates,
-                    &plan.constraint_set,
-                    &plan.permit_set,
+                    plan.constraint_set(),
+                    plan.permit_set(),
                     plan.distinct_tracker.as_ref(),
                     &scoring_cache,
                 );
@@ -2081,6 +2219,8 @@ impl<'a> Scheduler<'a> {
                         eligible,
                         reschedule_rng,
                         nodes_considered_setting,
+                        score_sample_setting,
+                        &mut plan.index_usage.score_sampled,
                         nodes_considered_rng,
                         task_id,
                         task_config,
@@ -2107,6 +2247,8 @@ impl<'a> Scheduler<'a> {
                     eligible,
                     reschedule_rng,
                     nodes_considered_setting,
+                    score_sample_setting,
+                    &mut plan.index_usage.score_sampled,
                     nodes_considered_rng,
                     task_id,
                     task_config,
@@ -2162,11 +2304,14 @@ impl<'a> Scheduler<'a> {
     /// list is never empty; rank 0 is the chosen node, and any further
     /// entries are the fallback candidates the apply walk may bind instead
     /// (docs/late-binding-plan-apply.md).
+    #[allow(clippy::too_many_arguments)]
     fn select_node_candidates(
         &self,
         eligible: Vec<&Node>,
         reschedule_rng: &mut Option<StdRng>,
         nodes_considered_setting: Option<&NodesConsidered>,
+        score_sample_setting: Option<&ScoreSample>,
+        score_sampled: &mut Option<usize>,
         nodes_considered_rng: &mut StdRng,
         task_id: i64,
         task_config: &TaskConfig,
@@ -2186,8 +2331,38 @@ impl<'a> Scheduler<'a> {
             nodes_considered_setting,
             nodes_considered_rng,
         )?;
+        let eligible = Self::apply_score_sample(
+            eligible,
+            score_sample_setting,
+            nodes_considered_rng,
+            score_sampled,
+        );
 
         if matches!(self.policy.name(), "bin_pack" | "spread") {
+            // A one-entry list (the `plan_candidates: 0` kill switch) needs
+            // only the argmax, so take the fused scoring loop — same pick,
+            // without materializing a scored vector per placement.
+            if candidates_setting.count.max(1) == 1 {
+                let selected = match reschedule_rng.as_mut() {
+                    Some(rng) => self.select_cached_node_with_jitter(
+                        &eligible,
+                        affinity_set,
+                        scoring_cache,
+                        weights,
+                        rng,
+                    ),
+                    None => {
+                        self.select_cached_node(&eligible, affinity_set, scoring_cache, weights)
+                    }
+                };
+                return selected.map(|node| vec![node.id.clone()]).with_context(|| {
+                    format!(
+                        "Scheduling policy {} failed to place task {}",
+                        self.policy.name(),
+                        task_config.name
+                    )
+                });
+            }
             let scored = score_nodes_with_cache(&eligible, affinity_set, scoring_cache, weights);
             let ranked = if let Some(rng) = reschedule_rng.as_mut() {
                 Self::ranked_candidate_list(scored, true, candidates_setting, rng)
@@ -2392,9 +2567,36 @@ impl<'a> Scheduler<'a> {
 
         let mut tasks = Self::ready_tasks(tasks, &status_map)?;
         if let Some(job_id) = self.store.job_id_for_job_config(job_config_id)? {
+            // Overrides first, keyed counts second: keyed tasks' desired
+            // comes from live instances and must win (scaling keyed tasks
+            // is rejected at the ScaleTask RPC anyway).
+            Self::apply_count_overrides(self.store, &job_id, &mut tasks)?;
             Self::apply_keyed_instance_counts(self.store, &job_id, &mut tasks)?;
         }
         Ok(tasks)
+    }
+
+    /// Overlay `legion job scale` count overrides (docs/autoscaling.md):
+    /// the effective desired count is the override when one exists, else
+    /// the spec count already in the tuple. Keyed tasks (instance-driven)
+    /// and `count.per` tasks (group-converging) are skipped — both are
+    /// rejected at the ScaleTask RPC.
+    fn apply_count_overrides(
+        store: &Store,
+        job_id: &str,
+        tasks: &mut [(i64, TaskConfig, u32)],
+    ) -> R<()> {
+        for (_task_id, task, desired) in tasks.iter_mut() {
+            let keyed = task
+                .stateful
+                .as_ref()
+                .is_some_and(|stateful| stateful.mode == crate::structs::InstanceMode::Keyed);
+            if keyed || task.count.per.is_some() {
+                continue;
+            }
+            *desired = store.effective_task_count(job_id, &task.group, &task.name, *desired)?;
+        }
+        Ok(())
     }
 
     /// Replace `count.num`-derived desired counts with live keyed-instance
@@ -2661,6 +2863,75 @@ impl<'a> Scheduler<'a> {
         top.first().copied()
     }
 
+    /// The per-placement hot loop: pick the best-scoring node, breaking
+    /// exact-score ties uniformly at random. Fused into one scoring pass
+    /// (after the cheap load-bounds pass) with reservoir tie-breaking —
+    /// the same selection distribution as score-all/sort/shuffle, without
+    /// allocating a scored vector per placement.
+    fn select_cached_node<'b>(
+        &self,
+        eligible: &[&'b Node],
+        affinity_set: &AffinitySet,
+        scoring_cache: &PlanScoringCache,
+        weights: SchedulerWeights,
+    ) -> Option<&'b Node> {
+        if eligible.is_empty() {
+            return None;
+        }
+        let bounds = cached_load_bounds(eligible, scoring_cache);
+        let mut rng = rand::thread_rng();
+        let mut best: Option<(&'b Node, f64)> = None;
+        let mut tie_count = 0usize;
+        for node in eligible.iter().copied() {
+            let score = score_node_with_cache(node, affinity_set, scoring_cache, weights, bounds);
+            match best {
+                None => {
+                    best = Some((node, score));
+                    tie_count = 1;
+                }
+                Some((_, best_score)) if score > best_score + 1e-9 => {
+                    best = Some((node, score));
+                    tie_count = 1;
+                }
+                Some((_, best_score)) if (score - best_score).abs() <= 1e-9 => {
+                    // Uniform over the tie group: replace the incumbent
+                    // with probability 1/n at the n-th tied candidate.
+                    tie_count += 1;
+                    if rng.gen_range(0..tie_count) == 0 {
+                        best = Some((node, best_score));
+                    }
+                }
+                Some(_) => {}
+            }
+        }
+        best.map(|(node, _)| node)
+    }
+
+    fn select_cached_node_with_jitter<'b>(
+        &self,
+        eligible: &[&'b Node],
+        affinity_set: &AffinitySet,
+        scoring_cache: &PlanScoringCache,
+        weights: SchedulerWeights,
+        rng: &mut StdRng,
+    ) -> Option<&'b Node> {
+        let scored = score_nodes_with_cache(eligible, affinity_set, scoring_cache, weights);
+        if scored.is_empty() {
+            return None;
+        }
+
+        let max_score = scored
+            .iter()
+            .fold(f64::NEG_INFINITY, |best, (_, score)| best.max(*score));
+        let mut top = scored
+            .into_iter()
+            .filter(|(_, score)| *score >= max_score - RESCHEDULE_SCORE_JITTER_THRESHOLD)
+            .map(|(node, _)| node)
+            .collect::<Vec<_>>();
+        top.shuffle(rng);
+        top.first().copied()
+    }
+
     fn scheduler_weights(&self) -> R<SchedulerWeights> {
         let mut weights = SchedulerWeights::for_policy(self.policy.name());
         let Some(settings) = self.store.scheduler_settings.as_ref() else {
@@ -2798,6 +3069,84 @@ impl<'a> Scheduler<'a> {
             }
             _ => bail!("plan_candidates must be an integer or an object with count/band"),
         }
+    }
+
+    /// Bounded candidate scoring: when armed and the eligible list is at
+    /// least `min_nodes`, score `sample` uniformly drawn candidates instead
+    /// of all of them (best-of-k). Below the threshold the list is returned
+    /// untouched — bit-for-bit today's exact scoring. Records the sample
+    /// size in `score_sampled` for the `job plan` explain surface.
+    fn apply_score_sample<'b>(
+        eligible: Vec<&'b Node>,
+        setting: Option<&ScoreSample>,
+        rng: &mut StdRng,
+        score_sampled: &mut Option<usize>,
+    ) -> Vec<&'b Node> {
+        let Some(setting) = setting else {
+            return eligible;
+        };
+        if eligible.len() < setting.min_nodes || eligible.len() <= setting.sample {
+            return eligible;
+        }
+        let mut eligible = eligible;
+        // Partial Fisher-Yates: the first `sample` slots become a uniform
+        // draw without replacement; the tail is never shuffled.
+        for index in 0..setting.sample {
+            let other = rng.gen_range(index..eligible.len());
+            eligible.swap(index, other);
+        }
+        eligible.truncate(setting.sample);
+        *score_sampled = Some(setting.sample);
+        eligible
+    }
+
+    /// `schedulerSettings.score_sample` — bounded candidate scoring
+    /// (`{ min_nodes, sample }`), off unless configured. Only meaningful
+    /// for the built-in scoring policies, like `nodes_considered`.
+    fn score_sample_setting(&self) -> R<Option<ScoreSample>> {
+        if !matches!(self.policy.name(), "bin_pack" | "spread") {
+            return Ok(None);
+        }
+        let Some(settings) = self.store.scheduler_settings.as_ref() else {
+            return Ok(None);
+        };
+        let Some(raw) = settings.get("score_sample") else {
+            return Ok(None);
+        };
+        let map = raw
+            .as_object()
+            .context("schedulerSettings.score_sample must be an object { min_nodes, sample }")?;
+        let sample =
+            map.get("sample")
+                .and_then(Value::as_u64)
+                .context("score_sample.sample must be a positive integer")? as usize;
+        let min_nodes =
+            map.get("min_nodes")
+                .and_then(Value::as_u64)
+                .context("score_sample.min_nodes must be a positive integer")? as usize;
+        if sample < 2 {
+            bail!("score_sample.sample must be at least 2");
+        }
+        if min_nodes < sample {
+            bail!(
+                "score_sample.min_nodes ({min_nodes}) must be at least score_sample.sample \
+                 ({sample}): below the threshold scoring is exact"
+            );
+        }
+        Ok(Some(ScoreSample { min_nodes, sample }))
+    }
+
+    /// `schedulerSettings.lazy_version_sample` — default true. The escape
+    /// hatch back to the eager (pre-planning, O-fleet) epoch sample; the
+    /// lazy path falls back to eager on its own whenever it cannot prove
+    /// equivalence, so this exists for operators, not correctness.
+    fn lazy_version_sample_enabled(&self) -> bool {
+        self.store
+            .scheduler_settings
+            .as_ref()
+            .and_then(|settings| settings.get("lazy_version_sample"))
+            .and_then(Value::as_bool)
+            .unwrap_or(true)
     }
 
     fn nodes_considered_setting(&self) -> R<Option<NodesConsidered>> {
@@ -3062,16 +3411,16 @@ fn score_nodes_for_context<'a>(ctx: &SchedulingContext<'a>) -> Vec<(&'a Node, f6
         .collect()
 }
 
-fn score_nodes_with_cache<'a>(
-    eligible: &[&'a Node],
-    affinity_set: &AffinitySet,
-    scoring_cache: &PlanScoringCache,
-    weights: SchedulerWeights,
-) -> Vec<(&'a Node, f64)> {
-    if eligible.is_empty() {
-        return Vec::new();
-    }
+/// Min/max assigned load over `eligible` plus the normalization range —
+/// the cheap first pass both the fused selector and the batch scorer share.
+#[derive(Debug, Clone, Copy)]
+struct CachedLoadBounds {
+    min_load: f64,
+    max_load: f64,
+    range: f64,
+}
 
+fn cached_load_bounds(eligible: &[&Node], scoring_cache: &PlanScoringCache) -> CachedLoadBounds {
     let mut min_load: Option<usize> = None;
     let mut max_load: Option<usize> = None;
     for node in eligible {
@@ -3083,41 +3432,69 @@ fn score_nodes_with_cache<'a>(
         min_load = Some(min_load.map_or(load, |min| min.min(load)));
         max_load = Some(max_load.map_or(load, |max| max.max(load)));
     }
-
     let min_load = min_load.unwrap_or_default() as f64;
     let max_load = max_load.unwrap_or_default() as f64;
-    let range = (max_load - min_load).max(0.0);
+    CachedLoadBounds {
+        min_load,
+        max_load,
+        range: (max_load - min_load).max(0.0),
+    }
+}
 
+/// One node's score under the cached plan state — the body both the fused
+/// single-pass selector and the batch scorer run per candidate.
+fn score_node_with_cache(
+    node: &Node,
+    affinity_set: &AffinitySet,
+    scoring_cache: &PlanScoringCache,
+    weights: SchedulerWeights,
+    bounds: CachedLoadBounds,
+) -> f64 {
+    let state = scoring_cache.node_states.get(node.id.as_str());
+    let load = state.map(|s| s.assigned_count).unwrap_or_default() as f64;
+    let (spread_score, bin_pack_score) = if bounds.range > 0.0 {
+        (
+            (bounds.max_load - load) / bounds.range,
+            (load - bounds.min_load) / bounds.range,
+        )
+    } else {
+        (0.0, 0.0)
+    };
+    let affinity_score = state
+        .map(|s| s.base_affinity + scoring_cache.affinity.colocation_score(s))
+        .unwrap_or_else(|| affinity_set.score(node));
+    let anti_affinity_penalty = state
+        .map(|s| s.same_task_allocations.max(s.same_group_allocations) as f64)
+        .unwrap_or_else(|| {
+            if scoring_cache.group_name.is_some() {
+                1.0
+            } else {
+                0.0
+            }
+        });
+    weights.affinity * affinity_score
+        + weights.spread * spread_score
+        + weights.bin_pack * bin_pack_score
+        - weights.automatic_anti_affinity * anti_affinity_penalty
+}
+
+fn score_nodes_with_cache<'a>(
+    eligible: &[&'a Node],
+    affinity_set: &AffinitySet,
+    scoring_cache: &PlanScoringCache,
+    weights: SchedulerWeights,
+) -> Vec<(&'a Node, f64)> {
+    if eligible.is_empty() {
+        return Vec::new();
+    }
+    let bounds = cached_load_bounds(eligible, scoring_cache);
     eligible
         .iter()
         .copied()
         .map(|node| {
-            let state = scoring_cache.node_states.get(node.id.as_str());
-            let load = state.map(|s| s.assigned_count).unwrap_or_default() as f64;
-            let (spread_score, bin_pack_score) = if range > 0.0 {
-                ((max_load - load) / range, (load - min_load) / range)
-            } else {
-                (0.0, 0.0)
-            };
-            let affinity_score = state
-                .map(|s| s.base_affinity + scoring_cache.affinity.colocation_score(s))
-                .unwrap_or_else(|| affinity_set.score(node));
-            let anti_affinity_penalty = state
-                .map(|s| s.same_task_allocations.max(s.same_group_allocations) as f64)
-                .unwrap_or_else(|| {
-                    if scoring_cache.group_name.is_some() {
-                        1.0
-                    } else {
-                        0.0
-                    }
-                });
-
             (
                 node,
-                weights.affinity * affinity_score
-                    + weights.spread * spread_score
-                    + weights.bin_pack * bin_pack_score
-                    - weights.automatic_anti_affinity * anti_affinity_penalty,
+                score_node_with_cache(node, affinity_set, scoring_cache, weights, bounds),
             )
         })
         .collect()
@@ -3181,7 +3558,7 @@ impl ResourceLedger {
     /// candidate node with no cached pool (removed or drained between the
     /// node and capacity snapshots) simply fits nothing.
     fn from_snapshot(
-        mut pools: HashMap<String, ResourcePool>,
+        mut pools: HashMap<String, Arc<ResourcePool>>,
         freed_nodes: &HashSet<String>,
         node_lookup: &HashMap<&str, &Node>,
         allocations_by_node: &SharedNodeAllocations,
@@ -3197,7 +3574,7 @@ impl ResourceLedger {
                 .unwrap_or(&[]);
             pools.insert(
                 node_id.clone(),
-                ResourcePool::free_for_node(node, allocations, policy),
+                Arc::new(ResourcePool::free_for_node(node, allocations, policy)),
             );
         }
         ResourceLedger { pools }
@@ -3218,7 +3595,8 @@ impl ResourceLedger {
         if !pool.can_fit(request) {
             bail!("node {node_id} does not have required resources");
         }
-        pool.consume(request);
+        // Copy-on-write: only pools a plan debits are ever deep-cloned.
+        Arc::make_mut(pool).consume(request);
         Ok(())
     }
 }
@@ -4253,7 +4631,7 @@ mod tests {
         let mut distinct_tracker = DistinctTracker::new(&constraint_set.distinct_keys());
         let mut pools = HashMap::new();
         for node in &nodes {
-            pools.insert(node.id.clone(), ResourcePool::from_node(node)?);
+            pools.insert(node.id.clone(), Arc::new(ResourcePool::from_node(node)?));
         }
         let mut resource_ledger = ResourceLedger { pools };
         let request =
@@ -4520,7 +4898,10 @@ mod tests {
         let request =
             ResourceRequest::from_value(&json!({"memory": 256, "cpu": 100, "allocations": 1}))?;
         let mut pools = HashMap::new();
-        pools.insert("node-a".to_string(), ResourcePool::from_node(&nodes[0])?);
+        pools.insert(
+            "node-a".to_string(),
+            Arc::new(ResourcePool::from_node(&nodes[0])?),
+        );
         let mut ledger = ResourceLedger { pools };
         let allocations_by_node = SharedNodeAllocations::new();
         let mut planned: HashMap<String, usize> = HashMap::new();
@@ -5582,6 +5963,304 @@ mod tests {
         Ok(())
     }
 
+    /// Apply-time re-validation of node resource TOTALS (TODO from the
+    /// 2026-07-28 adversarial pass): a worker re-registration that shrinks
+    /// capacity between the plan snapshot and the apply bumps no allocation
+    /// epoch — the version CAS structurally cannot see it — so the apply
+    /// transaction itself must rebuild the node's free pool and reject the
+    /// stale placement.
+    #[test]
+    fn apply_rejects_when_node_capacity_shrank_since_the_plan_snapshot() -> R<()> {
+        let store = setup_store()?;
+        // 8192 MiB of fingerprinted memory: the 6000 MiB task fits.
+        store.insert_node(make_node_msg("node-a", json!({})))?;
+
+        let job_config_id = submit_job(
+            &store,
+            "shrink-race",
+            vec![TaskConfig {
+                resources: json!({ "memory": 6000 }),
+                ..TaskConfig::new("api", "noop")
+            }],
+        )?;
+        let task_id = task_id_for(&store, &job_config_id, "api")?;
+
+        // The submission a planner snapshotting the 8192 MiB node would
+        // produce, with expected versions matching the CURRENT epochs so
+        // the compare-and-set passes — proving the rejection below comes
+        // from the capacity recheck, not the epoch fence.
+        let expected = BTreeMap::from([
+            (format!("job_config:{job_config_id}"), 0),
+            ("node:node-a".to_string(), 0),
+        ]);
+        let submission = store.insert_plan_submission(
+            &job_config_id,
+            "fresh",
+            &[("node-a".to_string(), task_id)],
+            &expected,
+        )?;
+
+        // Node re-registers with 2 GiB before the apply. Registration is a
+        // control-lane upsert that bumps no allocation epoch.
+        store.insert_node(make_node_msg_with_sources(
+            "node-a",
+            json!({}),
+            json!({ "memory_total": "2147483648" }),
+            json!({}),
+        ))?;
+
+        match store.apply_plan_submission(&submission)? {
+            crate::storage::store::PlanApplyOutcome::Rejected { reason, .. } => {
+                assert!(
+                    reason.contains("no longer has capacity"),
+                    "rejection must name the capacity recheck: {reason}"
+                );
+            }
+            crate::storage::store::PlanApplyOutcome::Applied(allocations) => {
+                panic!(
+                    "plan applied {} placements onto a node that shrank below the task's ask",
+                    allocations.allocations.len()
+                )
+            }
+        }
+        assert!(store.allocs_for_node("node-a")?.is_empty());
+
+        Ok(())
+    }
+
+    /// The recheck must mirror the planner's ledger exactly for a Fresh
+    /// plan: the planned JOB's surviving allocation rows (a job_submit
+    /// deletes the previous config's rows only after the apply) are
+    /// excluded from the reconstruction, so a same-capacity re-apply is
+    /// not spuriously rejected as over capacity.
+    /// `fresh_replan_ignores_the_jobs_own_outgoing_allocations` covers the
+    /// cross-config (v1 → v2) half of the same property.
+    #[test]
+    fn apply_capacity_recheck_does_not_double_count_a_fresh_plans_own_config() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", json!({})))?;
+
+        // First plan fills most of the node: 6000 of 8192 MiB.
+        let job_config_id = submit_job(
+            &store,
+            "self-replace",
+            vec![TaskConfig {
+                resources: json!({ "memory": 6000 }),
+                ..TaskConfig::new("api", "noop")
+            }],
+        )?;
+        let scheduler = Scheduler::new(&store)?;
+        let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
+        assert_eq!(outcome.allocations.len(), 1);
+
+        // A second Fresh plan for the SAME config (the planner drops the
+        // config's own allocations from its ledger). If the apply-time
+        // reconstruction counted the surviving row, 6000 + 6000 > 8192
+        // would reject a plan the planner legitimately built.
+        let task_id = task_id_for(&store, &job_config_id, "api")?;
+        let epochs = store.allocation_version_vector_for_candidates(&job_config_id, &["node-a"])?;
+        let submission = store.insert_plan_submission(
+            &job_config_id,
+            "fresh",
+            &[("node-a".to_string(), task_id)],
+            &epochs,
+        )?;
+        match store.apply_plan_submission(&submission)? {
+            crate::storage::store::PlanApplyOutcome::Applied(applied) => {
+                assert_eq!(applied.allocations.len(), 1);
+            }
+            crate::storage::store::PlanApplyOutcome::Rejected { reason, .. } => {
+                panic!("fresh-mode self-replacement must not be double counted: {reason}")
+            }
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn lazy_version_sample_is_the_default_and_fences_a_second_job() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", json!({})))?;
+
+        let scheduler = Scheduler::new(&store)?;
+        assert!(scheduler.lazy_version_sample_enabled());
+
+        let first = submit_job(&store, "job-lazy-a", vec![TaskConfig::new("api", "noop")])?;
+        let outcome = scheduler.plan_and_apply(&first, PlanMode::Fresh)?;
+        assert_eq!(outcome.allocations.len(), 1);
+
+        // The applied plan carried expected versions from the LATE sample;
+        // it must have fenced normally — a stale re-apply of the same
+        // submission shape for a second job sees the bumped node epoch.
+        let second = submit_job(&store, "job-lazy-b", vec![TaskConfig::new("api", "noop")])?;
+        let stale = BTreeMap::from([
+            (format!("job_config:{second}"), 0),
+            ("node:node-a".to_string(), 0),
+        ]);
+        let submission = store.insert_plan_submission(
+            &second,
+            "fresh",
+            &[("node-a".to_string(), task_id_for(&store, &second, "api")?)],
+            &stale,
+        )?;
+        assert!(
+            matches!(
+                store.apply_plan_submission(&submission)?,
+                crate::storage::store::PlanApplyOutcome::Rejected { .. }
+            ),
+            "the lazy-sampled apply must have bumped the node epoch"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn score_sample_stays_exact_below_the_threshold() -> R<()> {
+        let store = setup_store_with_scheduler(
+            "bin_pack",
+            Some(json!({ "score_sample": { "min_nodes": 64, "sample": 8 } })),
+        )?;
+        for index in 0..6 {
+            store.insert_node(make_node_msg(&format!("node-{index}"), json!({})))?;
+        }
+        let job_config_id = submit_job(
+            &store,
+            "sample-below",
+            vec![TaskConfig {
+                count: TaskCount::new(4),
+                ..TaskConfig::new("api", "noop")
+            }],
+        )?;
+        let scheduler = Scheduler::new(&store)?;
+        let (placements, report) =
+            scheduler.plan_only_with_report(&job_config_id, PlanMode::Fresh)?;
+        assert_eq!(placements.len(), 4);
+        assert!(
+            report.iter().all(|usage| usage.score_sampled.is_none()),
+            "below min_nodes scoring must be exact: {report:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn score_sample_engages_above_the_threshold_and_reports_it() -> R<()> {
+        let store = setup_store_with_scheduler(
+            "bin_pack",
+            Some(json!({ "score_sample": { "min_nodes": 8, "sample": 3 } })),
+        )?;
+        for index in 0..12 {
+            store.insert_node(make_node_msg(&format!("node-{index:02}"), json!({})))?;
+        }
+        let job_config_id = submit_job(
+            &store,
+            "sample-above",
+            vec![TaskConfig {
+                count: TaskCount::new(5),
+                ..TaskConfig::new("api", "noop")
+            }],
+        )?;
+        let scheduler = Scheduler::new(&store)?;
+        let (placements, report) =
+            scheduler.plan_only_with_report(&job_config_id, PlanMode::Fresh)?;
+        assert_eq!(placements.len(), 5);
+        assert_eq!(
+            report.first().and_then(|usage| usage.score_sampled),
+            Some(3),
+            "sampling must engage and be reported: {report:?}"
+        );
+        // Every sampled placement is still a real node from the fleet.
+        for placement in &placements {
+            assert!(placement.node_id.starts_with("node-"));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn score_sample_settings_are_validated() -> R<()> {
+        for bad in [
+            json!({ "score_sample": { "min_nodes": 8, "sample": 1 } }),
+            json!({ "score_sample": { "min_nodes": 4, "sample": 8 } }),
+            json!({ "score_sample": { "sample": 8 } }),
+            json!({ "score_sample": "128" }),
+        ] {
+            let store = setup_store_with_scheduler("bin_pack", Some(bad.clone()))?;
+            store.insert_node(make_node_msg("node-a", json!({})))?;
+            submit_job(&store, "sample-bad", vec![TaskConfig::new("api", "noop")])?;
+            // Settings parse once at construction now, so a malformed
+            // setting fails Scheduler::new (fail-fast) instead of the
+            // first plan.
+            assert!(
+                Scheduler::new(&store).is_err(),
+                "malformed setting must be rejected: {bad}"
+            );
+        }
+        Ok(())
+    }
+
+    /// The bounded-candidate-scoring quality gate: best-of-k bin packing
+    /// must stay within a bound of exact packing (power-of-k-choices), and
+    /// far from uniform-random placement. 100 independent one-GiB tasks
+    /// (distinct tasks and groups, so automatic anti-affinity does not
+    /// engage) over 40 eight-GiB nodes: exact bin_pack packs onto
+    /// ceil(100/8) = 13 nodes; uniform random would touch essentially the
+    /// whole fleet (~37 of 40). The sampled run must place everything and
+    /// stay ≤ 32 nodes — loose enough to hold with high probability under
+    /// an unseeded RNG, tight enough that a regression to unsampled
+    /// uniform behavior fails.
+    #[test]
+    fn score_sample_bin_pack_quality_stays_bounded() -> R<()> {
+        let placements_for = |settings: Option<Value>| -> R<usize> {
+            let store = setup_store_with_scheduler("bin_pack", settings)?;
+            for index in 0..40 {
+                store.insert_node(make_node_msg(&format!("node-{index:02}"), json!({})))?;
+            }
+            let tasks = (0..100)
+                .map(|index| TaskConfig {
+                    group: format!("group-{index}"),
+                    resources: json!({ "memory": 1024 }),
+                    ..TaskConfig::new(&format!("task-{index}"), "noop")
+                })
+                .collect();
+            let job_config_id = submit_job(&store, "quality", tasks)?;
+            let scheduler = Scheduler::new(&store)?;
+            let placements = scheduler.plan_only(&job_config_id, PlanMode::Fresh)?;
+            assert_eq!(placements.len(), 100, "every allocation must place");
+            let nodes_used: HashSet<&str> = placements
+                .iter()
+                .map(|placement| placement.node_id.as_str())
+                .collect();
+            Ok(nodes_used.len())
+        };
+
+        let exact = placements_for(None)?;
+        assert_eq!(exact, 13, "exact bin_pack packs onto ceil(100/8) nodes");
+
+        let sampled = placements_for(Some(
+            json!({ "score_sample": { "min_nodes": 8, "sample": 8 } }),
+        ))?;
+        assert!(
+            sampled <= 32,
+            "best-of-8 packing must stay within the quality bound: used {sampled} nodes"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn eager_version_sample_setting_restores_the_pre_planning_sample() -> R<()> {
+        let store =
+            setup_store_with_scheduler("bin_pack", Some(json!({ "lazy_version_sample": false })))?;
+        store.insert_node(make_node_msg("node-a", json!({})))?;
+
+        let scheduler = Scheduler::new(&store)?;
+        assert!(!scheduler.lazy_version_sample_enabled());
+
+        let job_config_id = submit_job(&store, "job-eager", vec![TaskConfig::new("api", "noop")])?;
+        let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
+        assert_eq!(outcome.allocations.len(), 1);
+
+        Ok(())
+    }
+
     #[test]
     fn failed_batch_dependency_blocks_dependent_task() -> R<()> {
         let store = setup_store()?;
@@ -6028,12 +6707,13 @@ mod tests {
             );
         }
 
+        // Malformed settings fail at construction, like every other
+        // scheduler setting parsed once in `Scheduler::new`.
         let store = setup_store_with_scheduler(
             "bin_pack",
             Some(json!({ "plan_candidates": { "band": 2.0 } })),
         )?;
-        let scheduler = Scheduler::new(&store)?;
-        assert!(scheduler.plan_candidates_setting().is_err());
+        assert!(Scheduler::new(&store).is_err());
         Ok(())
     }
 

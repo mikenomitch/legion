@@ -16,8 +16,9 @@ from the CLI, the MCP server, the UI, and raw gRPC.
 | `eval.failed` | error | An eval handler returned an error. |
 | `eval.requeued` | warn | An eval exhausted its plan-conflict retries and was released back to pending with a delay instead of failing (docs/late-binding-plan-apply.md). |
 | `allocation.placed` | info | A plan was applied; one event per apply, with placement details in metadata — including `candidateRank` per placement (0 = first choice) and a `fallbacks` count. |
-| `allocation.removed` | info/warn | Allocations were removed (job stop/update: info; node loss: warn). |
+| `allocation.removed` | info/warn | Allocations were removed (job stop/update: info; node loss: warn). Metadata carries `cause` — `stop`, `update`, `drain`, `reschedule`, `destroy`, or `node_lost` — omitted when no cause was recorded. See [Stop Causes](graceful-stop.md). |
 | `allocation.failed` | warn | A worker reported an allocation failure (includes the reason). |
+| `allocation.terminated` | info/warn | A task's process exited and the allocation reached a terminal state without being rescheduled (info when the exit was a success, warn otherwise). Metadata carries `success` and the exit message — see [Task Supervision](task-supervision.md). |
 | `allocation.plan_rejected` | warn | A placement plan was rejected by optimistic concurrency (will be retried). |
 | `artifact.staging` | info | An allocation began staging its [artifacts](artifacts.md) (artifact list in metadata). |
 | `artifact.staged` | info | Every artifact for an allocation staged successfully (digests, bytes, durations in metadata). |
@@ -36,6 +37,9 @@ from the CLI, the MCP server, the UI, and raw gRPC.
 | `job.submitted` / `job.updated` | info | A job config was created / updated. |
 | `job.stopped` / `job.destroyed` | info | A job was stopped / destroyed. |
 | `job.failed` | error | A job was marked failed (e.g. move limit exceeded). |
+| `scale.applied` | info | A count override was applied ([Scaling Jobs](autoscaling.md)); previous/new counts, source, and reason in metadata. |
+| `scale.deferred` | info | A scale-in was recorded but deferred until the active rollout completes. |
+| `scale.reset` | info | An override was dropped (explicit `--reset`, or a resubmit that changed the spec count reclaimed ownership). |
 | `rollout.event` | passthrough | Mirror of every rollout event (created, advanced, completed, failed, …). |
 
 Each event carries: an increasing (but sparse — see

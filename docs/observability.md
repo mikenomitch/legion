@@ -90,10 +90,21 @@ writes — `docs/multi-raft.md`), the engine's live metrics stream backs:
   co-located, best effort; see docs/metrics.md and
   docs/multi-raft.md § "Lane leadership").
 
-Of the `legion_raft_*` Prometheus prefix, `legion_raft_voters{lane}` and
-`legion_raft_quorum{lane}` are emitted (voter-count checks); the rest
-(term, indexes, apply lag, …) is **reserved but not yet emitted** — see the
-Gaps list and `docs/metrics.md`.
+The `legion_raft_*` Prometheus prefix carries the engine series: quorum
+shape (`voters`/`quorum`), per-lane progress (`term`, `commit_index`,
+`applied_index`, `apply_lag`, `is_leader`), and the bottleneck-attribution
+histograms (`capture_seconds` vs `propose_apply_seconds`, plus
+`ops_total{lane,outcome}`) — see `docs/metrics.md`. Snapshot timings and
+per-peer replication lag remain reserved.
+
+## OTLP metrics push
+
+Beyond the pull-model `/metrics` listeners, both the manager's and the
+worker's metric registries can be pushed over OTLP/HTTP to any OTLP
+backend, gated by the same `OTEL_*` env-var conventions as trace export
+(`OTEL_EXPORTER_OTLP_METRICS_ENDPOINT`, `OTEL_METRIC_EXPORT_INTERVAL`,
+`LEGION_OTLP=1`). Cumulative temporality, full histogram buckets; details
+in `docs/metrics.md` § "OTLP metrics push".
 
 ## Gaps
 
@@ -101,10 +112,8 @@ Honest list of what does **not** exist yet:
 
 - No first-class trace viewer in the UI (`--o11y` span files and OTLP export
   to an external backend are the current options).
-- No worker-side metrics endpoint — `/metrics` and the health probes are
-  manager-only.
-- OTLP **metrics** push is not implemented — metrics are pull-model Prometheus
-  only; only traces go out over OTLP.
-- Most reserved `legion_raft_*` metric series are not emitted yet (only
-  the voters/quorum gauges are) — deeper raft observability is
-  status/history RPCs + `/readyz`, not `/metrics`.
+- The worker `/metrics` listener is opt-in (`LEGION_WORKER_TELEMETRY_PORT`)
+  and its family set is small (heartbeats, running allocations, reported
+  failures) — no per-task runtime metrics yet.
+- Raft snapshot timings and per-peer replication lag are reserved, not yet
+  emitted.

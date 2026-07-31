@@ -137,8 +137,11 @@ every surface where you would notice:
   and returned on the command's own output. Join promotion is **never**
   withheld to preserve parity — a visible warning beats an invisible
   availability surprise.
-- **Metrics / probes** — `legion_raft_voters{lane}` and
-  `legion_raft_quorum{lane}` gauges (docs/metrics.md); `readyz` stays `200`
+- **Metrics / probes** — the `legion_raft_*` series (docs/metrics.md):
+  quorum shape (`voters`/`quorum`), per-lane progress (`term`,
+  `commit_index`, `applied_index`, `apply_lag`, `is_leader`), and the
+  bottleneck-attribution histograms (`capture_seconds` vs
+  `propose_apply_seconds`, plus `ops_total`); `readyz` stays `200`
   but includes the advisory as a `note:` line while parity is even.
 
 The **only hard block** is a `remove-member` that would leave zero voters
@@ -578,12 +581,12 @@ In priority order (plan §6, updated 2026-07-28):
    only.** Client-plane RPCs still reject with the leader hint (above) —
    deliberate: clients can redial, and every client-facing op is anchored
    on the control leader.
-5. OTLP metrics push + worker-side `/metrics`; of the `legion_raft_*`
-   Prometheus prefix only `legion_raft_voters{lane}` /
-   `legion_raft_quorum{lane}` are emitted (voter-count checks, plan §7-C3)
-   — **the rest (term, indexes, apply lag, …) is still reserved, not yet
-   emitted**; deeper raft observability today is `raft
-   status`/history/`/readyz`.
+5. The `legion_raft_*` engine series are emitted (quorum shape, per-lane
+   term/indexes/apply-lag/leadership, and the capture-vs-propose latency
+   histograms), OTLP metrics push and the opt-in worker `/metrics`
+   listener exist (docs/metrics.md); snapshot timings and per-peer
+   replication lag remain reserved, and a Raft health UI page is still
+   open.
 6. Raft autopilot — speculative, default-off.
 
 Also: `step-down`/`transfer-leader` await an openraft with a

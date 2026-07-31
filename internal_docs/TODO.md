@@ -19,6 +19,7 @@ How to use it:
 
 | PR | What it lands | Notes |
 | --- | --- | --- |
+| (branch `claude/pre-benchmark-features-mlgzyx`) | Pre-benchmark hardening: apply-time resource re-validation, raft engine metrics, worker /metrics + OTLP push, eval-path fixes, scheduler plan-path cleanups, `legion job scale` (autoscaler phase 1) | [calls](calls/pre-benchmark-hardening_calls.md) · [autoscaler calls #5/#7](calls/autoscaler-plan_calls.md) |
 | [#162](https://github.com/mikenomitch/legion/pull/162) | Lanes hardening: worker-write forwarding, split-tolerant submits, adversarial fixes | Plan §8 + calls doc in [durability-and-ops-execution-plan.md](plans/durability-and-ops-execution-plan.md) |
 | [#143](https://github.com/mikenomitch/legion/pull/143) | Note the node-level builtin resource override gap | Docs only; the fix itself is a todo below |
 | [#84](https://github.com/mikenomitch/legion/pull/84) | Instrument DB hot paths, batch task-status updates | Old; rebase or close |
@@ -35,6 +36,12 @@ How to use it:
       replicas, and a serialized/batched apply lane for physically-full
       pools — [plan §8](plans/late-binding-plan-apply-plan.md). The shipped
       phases are in Done below.
+- [ ] **Fused top-k candidate scoring.** Ranked candidate lists materialize a
+      scored vector per placement; the one-candidate path (`plan_candidates:
+      0`) uses the fused argmax loop that does not. A fused top-k loop would
+      give the default path the same win — worth doing when the
+      candidate-construction benchmark (+2–10% plan-only) says it pays
+      ([calls #20](calls/late-binding-plan-apply-plan_calls.md)).
 - [ ] **Capacity exhaustion still fails evals terminally.** The late-binding
       requeue backstop only covers *conflict* errors; a replan that finds no
       eligible capacity at all ("no available nodes …") still ends the eval
@@ -45,9 +52,43 @@ How to use it:
 - [ ] Worker groups + taint/toleration equivalent. Node pools exist as an ACL
       and config concept but nothing scheduling-side consumes them.
 - [ ] Priorities and eviction/preemption, with eviction toggled at the pool level
-      — [plan](plans/preemption-and-eviction-plan.md) (PLANNED: graceful stop →
-      priority bands → plan-atomic preemption → governance; pool toggle is
-      `schedulerSettings.preemption.disabledPools`)
+      — [plan](plans/preemption-and-eviction-plan.md) (IN EXECUTION: stop causes
+      → graceful termination → priority bands → plan-atomic preemption →
+      governance; pool toggle is `schedulerSettings.preemption.disabledPools`)
+  - [x] **Phase 1a — stop causes.** Every allocation removal records *why*
+        (`stop`/`update`/`drain`/`reschedule`/`destroy`/`node_lost`), delivered
+        to the owning worker on its next heartbeat and carried in
+        `allocation.removed` event metadata.
+        [plan §Phase 1a](plans/preemption-and-eviction-plan.md) ·
+        [docs](../docs/graceful-stop.md)
+  - [ ] **Phase 1b — graceful termination.** `stop { signal, killAfter }`,
+        per-runtime SIGTERM→SIGKILL ladders, the `LEGION_STOP_NOTICE_PATH`
+        file, `allocation.stopping`, stops-before-starts reconcile ordering.
+        **Blocked on a worker-side terminating set**: `reconcile_allocations`
+        runs under the task-manager mutex inside the heartbeat loop, so a
+        blocking grace wait would stall heartbeats and the self-fence watchdog
+        and get the node declared lost. `stop_with` must signal and return,
+        with a reaper doing the SIGKILL — and teardown (notably
+        `volumes.unmount_for_allocation`) must move behind actual process
+        exit. [plan §Phase 1b](plans/preemption-and-eviction-plan.md)
+  - [ ] Decide Phase 1b's grace-vs-latency question: stops-before-starts puts a
+        victim's shutdown on the preemptor's critical path, so a task ignoring
+        SIGTERM delays an incident-response scale-up by up to `killAfter`.
+        Either a shorter preemption-specific grace, or start the preemptor once
+        capacity is *accounted* rather than *physically free*.
+  - [ ] Add a plugin ABI version symbol. `plugins/tasks/` loads a bare
+        `extern "C" fn() -> Box<dyn TaskPlugin>` with no version guard, so a
+        stale third-party dylib mismatches silently instead of failing loudly.
+        Phase 1a dodged this by not breaking the ABI (`stop_with` defaults to
+        `stop`); the next trait change will not have that option.
+  - [ ] Band governance ships as a `bands` selector on `job` ACL rules, not
+        `operator:write` — which also delivers per-namespace band caps, so
+        that is no longer a separate Phase 4 item. Needs band normalization
+        before `enforce` (a selector never matches a request lacking the
+        attribute), coverage on the update and template-render paths, and
+        explicit cases in `tests/acl_endpoints.rs` — the
+        `every_manager_rpc_is_classified` test cannot catch a dropped
+        conditional check inside an existing endpoint.
   - [x] At least think through fair-share policies — find the 80/20 rather than
         building a full hierarchical scheduler. Thought through in the plan's
         prior art + non-goals: the 80/20 is priority bands now, per-namespace
@@ -78,18 +119,21 @@ How to use it:
 - [ ] Fix the slowest bits of the scheduler using the benchmarks in
       [docs/testing-and-benchmarks.md](../docs/testing-and-benchmarks.md).
       Candidate construction is index-served
-      ([docs/scheduling-indexes.md](../docs/scheduling-indexes.md)) and the
-      per-plan snapshot is fixed (Arc'd nodes + cached free pools —
-      [plan](plans/scheduler-plan-snapshot-plan.md), numbers in
-      [benchmarks/scheduler/README.md](../benchmarks/scheduler/README.md)).
-      The allocations map is shared per node the same way
-      (`SharedNodeAllocations`, copy-on-write). Phase timings now say where
-      the rest goes ([plan](plans/scheduler-performance-plan.md)): the
+      ([docs/scheduling-indexes.md](../docs/scheduling-indexes.md)); the
+      per-plan snapshot is fixed twice over (Arc'd nodes + cached free
+      pools — [plan](plans/scheduler-plan-snapshot-plan.md) — then the
+      cached sorted node list + Arc'd pool values, 2026-07-30); the
       plan-submission insert is fused into the apply (one quorum commit,
-      2026-07-29); the remaining measured items are the O(fleet)
-      `version_sample` and per-plan snapshot rebuild — both proposed as
-      D4/D6 in the
-      [architecture review](plans/scheduler-architecture-review-plan.md).
+      2026-07-29); the O(fleet) `version_sample` is lazy (D4) and plan
+      applies group-commit (D5), 2026-07-30; eval handling (including
+      `plan_with_conflict_retries`' backoff sleeps) runs on the blocking
+      pool instead of parking tokio runtime workers (2026-07-30); the
+      remaining measured candidates all landed 2026-07-30 — shared
+      per-task `ConstraintSet`/`PermitSet` parsing, settings parsed once
+      at `Scheduler::new`, and the index shard-sort skipped when the
+      caller discards the order (before/after in
+      [benchmarks/scheduler/README.md](../benchmarks/scheduler/README.md)).
+      Further wins want profiling, not this list.
 - [x] Scheduler performance measurement stack
       ([plan](plans/scheduler-performance-plan.md),
       [calls](calls/scheduler-performance-plan_calls.md),
@@ -103,13 +147,65 @@ How to use it:
       ([docs/metrics.md](../docs/metrics.md)), and the fused
       `submit_and_apply_plan` (before/after in
       [benchmarks/scheduler/README.md](../benchmarks/scheduler/README.md)).
-- [ ] Architecture review proposals for scale
-      ([plan](plans/scheduler-architecture-review-plan.md)): D4 lazy
-      version sample, D5 apply group commit, D1 bounded candidate scoring,
-      D6 eval-batch snapshot reuse — ranked, none started.
+- [x] Architecture review proposals for scale
+      ([plan](plans/scheduler-architecture-review-plan.md)) — all four
+      accepted proposals shipped 2026-07-30 via
+      [plan-path-scale-levers](plans/plan-path-scale-levers-plan.md)
+      ([calls](calls/plan-path-scale-levers-plan_calls.md)) and
+      [bounded-candidate-scoring](plans/bounded-candidate-scoring-plan.md)
+      ([calls](calls/bounded-candidate-scoring-plan_calls.md)): D4 lazy
+      version sample + read-model generation fence, D5 plan-apply group
+      commit (leader-elect coalescer), D6 as cheap snapshots (cached
+      sorted node list, Arc'd pools), D1 opt-in `score_sample` with the
+      packing-quality gate. Docs in
+      [scheduler-and-eval-loop.md](../docs/scheduler-and-eval-loop.md);
+      before/after in
+      [benchmarks/scheduler/README.md](../benchmarks/scheduler/README.md).
+      D2 (cross-manager scheduling) and D3 (in-memory state) remain
+      recorded keep/defer decisions; D8's architecture choice still waits
+      on AWS-test data.
+- [x] Heartbeat path at scale
+      ([plan](plans/heartbeat-scale-plan.md),
+      [calls](calls/heartbeat-scale-plan_calls.md),
+      [docs](../docs/architecture-managers-workers.md)) — heartbeat scale
+      benchmark (`tests/heartbeat_scale_benchmark.rs`), status-lane
+      heartbeat group commit with per-id verdicts, skip-reprojection for
+      bare refreshes (leader + follower projection), integer liveness
+      clock (`last_heartbeat_unix`), batched lost-node recheck, partial
+      index for the volume-destroy feed, worker heartbeat jitter and
+      `heartbeatSeconds` worker-type config. Numbers in
+      [benchmarks/scheduler/README.md](../benchmarks/scheduler/README.md).
+      Deferred (noted in plan): per-node lost windows negotiated at
+      registration; batching `mark_nodes_as_lost`'s per-node
+      availability-sync + eval enqueues after a mass failure; an ACL
+      token-identity cache for worker-plane RPC rates.
 - [ ] AWS comparative benchmark vs Nomad/K8s
-      ([plan](plans/aws-comparative-benchmark-plan.md)): phase 0 is the
-      `legion start worker --simulate N` gap; nothing built yet.
+      ([plan](plans/aws-comparative-benchmark-plan.md),
+      [calls](calls/aws-comparative-benchmark-plan_calls.md)) — phases
+      0-1 built and locally validated 2026-07-30; campaigns (phases 2-5)
+      await an AWS account:
+  - [x] Phase 0: `legion start worker --simulate N`
+        ([mini-plan](plans/worker-simulation-plan.md),
+        [docs](../docs/worker-simulation.md)) — one process, N wire-real
+        nodes from a `node_profiles` file, real cadences, stub dispatch
+        server; end-to-end test `tests/worker_simulation.rs`.
+  - [x] Phase 1 rig, everything short of the cloud:
+        [`benchmarks/aws/`](../benchmarks/aws/README.md) — Terraform
+        (validate-clean; system-agnostic boxes + spot sim fleet + S3),
+        per-system configs (Legion A lanes / Legion B streaming+S3 lease
+        / Nomad / kubeadm+KWOK), scenario→jobs translator, measuring
+        driver with fixture-tested counting math and a `watch`
+        fault-drill mode, campaign runner + collect/fairness-record
+        scripts, piggyback experiment scripts (storm, failover,
+        streaming-RPO, 24h soak, upgrade-under-load), Grafana boards,
+        projection fitting (`analysis/fit_curves.py`), CI gate
+        (fixture tests + terraform validate), and the local no-AWS smoke
+        (`scripts/local-smoke.sh`).
+  - [ ] Phase 1 exit on real AWS: `bringup.sh` + 1k-node
+        `run-campaign.sh --system legion-a --smoke` (needs an account).
+  - [ ] Phases 2-5: Legion A/B campaigns, Nomad (verify nodesim `mock`
+        driver + install script), K8s (verify kubeadm/KWOK install +
+        watch parsing), 20k validation burst, analysis + REPORT.md.
 - [ ] Scheduling-index follow-ups deferred from
       [plan](plans/scheduling-index-plan.md) (see its calls doc):
       index-served candidates for multi-task **group** co-placement (v1
@@ -135,33 +231,129 @@ How to use it:
       *availability* on the fresh row, closing the cordon/lost race the
       epoch CAS structurally cannot see.
       [Calls #4](calls/durability-and-ops-execution-plan_calls.md)
-- [ ] Apply-time re-validation of node resource TOTALS: a worker
-      re-registration that shrinks capacity (or `reservedResources` /
-      `maxAllocations` changes) between plan snapshot and apply bumps no
-      allocation epoch and is not re-checked at apply — a plan can commit
-      placements exceeding the node's new capacity. Ports are apply-safe
-      (re-read in the apply tx); resources are the odd one out. Needs
-      ledger reconstruction inside the apply tx (cheaper now that
-      `node_pools` caches free capacity), or an epoch bump on
-      resource-affecting node updates (cross-lane under `lanes` — wants a
-      plan). Found by the 2026-07-28 adversarial pass.
+- [x] Apply-time re-validation of node resource TOTALS (2026-07-30): the
+      plan-apply transaction reconstructs each placement node's free pool
+      from the fresh node row and the allocation rows the transaction can
+      see (`ResourcePool::free_from_rows`), mirroring the planner's ledger
+      (Fresh plans exclude the replaced job's own rows), and rejects
+      placements a capacity shrink no longer fits — closing the window
+      where a worker re-registration shrinking capacity (or
+      `reservedResources`/`maxAllocations` changes) between snapshot and
+      apply bumped no epoch and was never re-checked. Ports were already
+      apply-safe; resources now match. Found by the 2026-07-28 adversarial
+      pass.
 - [ ] Volume-pin staleness in planning: pins are read mid-plan-build with
       no epoch coupling, so a pin invalidated mid-plan (e.g.
       `volume delete --force`) can still direct a placement; later
       reconciliation covers it. Low severity, same pass.
-- [ ] A raft-mode CONCURRENT-planning oversubscription test through the
-      real `Scheduler::plan_and_apply` path. The local_disk concurrency
-      test exists (`concurrent_plans_cannot_oversubscribe_a_node`) and the
-      raft batteries exercise plan CAS mechanics, but no test drives two
-      planners against raft's commit-then-project ordering — the exact
-      window the epoch mirror closes. The mirror's coherence is structural,
-      so this is regression insurance, not a known gap.
+- [x] A raft-mode CONCURRENT-planning oversubscription test through the
+      real `Scheduler::plan_and_apply` path (2026-07-30):
+      `concurrent_planners_cannot_oversubscribe_under_raft[_lanes]` in
+      [tests/raft_apply_roundtrip.rs](../tests/raft_apply_roundtrip.rs)
+      drives two barrier-released planners against raft's
+      commit-then-project ordering under both topologies — the exact
+      window the epoch mirror closes. Regression insurance; the local_disk
+      twin is `concurrent_plans_cannot_oversubscribe_a_node`.
+- [ ] Let a node override its builtin resource capacity (`cpu`, `memory`, `cores`)
+    - `ResourcePool::from_node` skips builtin names when reading a node's
+      `resources` block, so `resources: { cpu: 40000 }` in a worker config is
+      silently ignored rather than applied or rejected. Capacity can only come
+      from the fingerprint today, which leaves no escape hatch when a platform
+      fingerprints badly (see the Apple Silicon CPU frequency case) and no way
+      to deliberately under- or over-subscribe a node.
+    - Decide whether an override replaces the fingerprint or is a separate
+      ceiling, and how it composes with `reservedResources`. Whichever way it
+      lands, an ignored key should warn or fail validation instead of passing
+      silently.
 
 ## Task runtimes
 
 Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
 
+- [x] **Task process supervision** — the worker reaps task children, applies a
+      new `restart` policy (`always | onFailure | never`, `delay`,
+      `successExitCodes`) sharing one budget with health-check restarts, and
+      reports terminal outcomes so a batch task's `Success` comes from its exit
+      code instead of its placement (`PROTOCOL_VERSION` 2, with a per-node
+      legacy fallback for older workers) —
+      [plan](plans/host-process-supervision-plan.md) ·
+      [calls](calls/host-process-supervision-plan_calls.md) ·
+      [docs](../docs/task-supervision.md)
+- [x] **Worker-owned cgroups for `exec`** — opt-in `resourceEnforcement` on the
+      worker config turns a task's `resources` into `memory.max`/`cpu.max` in a
+      cgroup Legion creates and removes per allocation; an explicit
+      `config.cgroup` still means "join this one"
+      ([docs](../docs/task-supervision.md#resource-enforcement-cgroups))
+- [x] **`exec` hardening block** — `noNewPrivileges`, capability bounding-set
+      drops, `privateTmp`, `umask`, `nice`, applied in privilege order around
+      the user switch ([docs](../docs/task-supervision.md#process-hardening))
+- [ ] Deferred from the supervision plan: privileged runtime tests for the cgroup
+      and hardening paths (CI covers derivation, validation, and the unconfined
+      fallback; the root-only paths are manual against a Linux worker container);
+      PID/IPC/UTS namespaces and seccomp for
+      `exec` (a PID namespace needs a double-fork, which changes the pid the
+      worker tracks — see
+      [calls entry 10](calls/host-process-supervision-plan_calls.md)); enforce
+      `resources.disk`; scheduler preference for enforcing nodes.
+- [ ] Possible, not planned: activation and readiness for `exec` — an
+      `sd_notify`-compatible readiness socket, `WatchdogSec`-style pings, and
+      socket activation via pre-bound fds
+      ([plan §8 phase 4](plans/host-process-supervision-plan.md))
 - [ ] A **WASM** runtime
+- [ ] A **`converge`** runtime — idempotent host resources (package, file,
+      template, directory, user, service, mount) with per-resource
+      `unchanged | changed | failed` reporting, i.e. the Chef-replacement shape —
+      [plan](plans/host-convergence-plan.md) ·
+      [calls](calls/host-convergence-plan_calls.md) (PLANNED: file-shaped
+      resources → system resources → node-config jobs → why-run/drift →
+      `host` ACL resource). Phase 1 depends on the exit-status work above.
+- [ ] **`container` core gaps: exec on Linux, signals + stop knobs, Nomad-style
+      CPU/memory enforcement, file delivery** —
+      [plan](plans/container-runtime-exec-and-signals-plan.md) (PLANNED).
+      Today `legion exec`/actions/UI/MCP fail against container tasks on Linux
+      (exec was deferred for the OCI runtimes), no platform can signal a
+      container task (`changeMode: signal` rejected at admission), teardown
+      has no grace window or knobs (Linux is `delete --force`, SIGKILL),
+      declared `resources` set no cgroup limits on Linux (`cpu` MHz enforced
+      nowhere), and the unmounted task dir blocks KV/identity *file* delivery
+      and file/tree artifacts.
+  - [ ] Phase 1 — exec via `<runtime> exec` for youki/runc/crun
+  - [ ] Phase 2 — `TaskPlugin::signal()` seam + `container kill`/`<runtime> kill`
+  - [ ] Phase 3 — graceful stop + task-level `stopSignal`/`stopGracePeriod`
+        fields (defaults SIGTERM/10 s, admission-capped; container both
+        platforms + exec runtime)
+  - [ ] Phase 4 — the `resource_enforcement()` interface (`Unsupported`/
+        `WorkerCgroup`/`RuntimeApplied` + worker-computed `ResourceAssignment`)
+        with Linux memory hard limits and `cpu` MHz → `cpu.weight`
+        (share-slice cgroup, OOM-kill annotation, `cores`-xor-`cpu` and
+        whole-`cores` validation)
+  - [ ] Phase 5 — exclusive `cores` via cpuset pinning (worker core
+        allocator, `legion/share`/`legion/reserve` slices, restart recovery)
+  - [ ] Phase 6 — `exec` runtime adopts the interface (`WorkerCgroup`): one
+        node-wide fence for container + exec tasks, real memory limits for
+        exec, `cgroup.kill` teardown; explicit `config.cgroup` still wins
+  - [ ] Phase 7 — task dir mounted at `/legion/task` + translated env; flips
+        KV file injection, identity file delivery, and file/tree artifacts to
+        supported (container file paths must live under the mount)
+  - [ ] Follow-on (not in the plan): `sandbox` adopts `resource_enforcement()`
+        as a `RuntimeApplied` consumer — pin vCPU threads to the assignment's
+        cores, size the guest from its memory limit. The honest test of
+        whether the three modes are the right cut (plan Q4).
+  - Deliberately out of scope there (still open, see the plan's non-goals):
+    Linux port mapping/network namespaces, NUMA/SMT-aware core placement,
+    fencing non-Legion host processes off reserved cores, a delegated
+    (non-root) cgroup hierarchy root, alloc-dir sharing
+  - **Overlaps shipped work — reconcile before building phase 6.** `exec`
+    already creates and sizes a per-allocation cgroup from `resources`, opt-in
+    per worker via `resourceEnforcement` in the worker config
+    ([host process supervision plan](plans/host-process-supervision-plan.md)
+    §6.5, [docs](../docs/task-supervision.md#resource-enforcement-cgroups),
+    `src/task_plugins/exec_isolation.rs`). Phase 6 should adopt that code as
+    the `WorkerCgroup` implementation rather than write a second one, and
+    decide one opt-in story for both runtimes: the exec work is off by default
+    per worker (a `resources` block was only ever a scheduling estimate), which
+    the container plan's default-on stance has to either match or explicitly
+    overrule.
 - [ ] `exec`: unveil support
 - [ ] `exec`: network namespaces (netavark? CNI?) — see *Networking* below
 - [ ] **Sandbox snapshots, fast start, and forking** —
@@ -178,7 +370,10 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
         `instance create --from-snapshot --count N`)
   - [ ] Phase 6 — lazy memory (UFFD handler, remote page sources)
 - [ ] Split a task runtime's implementation into parts — isolation vs. runner vs.
-      artifact consumption? (idea, needs a plan)
+      artifact consumption? (idea, needs a plan). The container-runtime plan's
+      `resource_enforcement()` interface carves off the first slice of this —
+      resource placement moves to worker core, runtimes consume a computed
+      assignment — so revisit this idea once that has two real consumers.
 - [ ] Shared files between tasks in the same allocation —
       [proposal](plans/shared-alloc-dir-proposal.md), unimplemented, and blocked
       on allocations holding more than one task
@@ -269,6 +464,14 @@ No plan yet — this needs one before any code.
 
 Plans: [persistence-plan.md](plans/persistence-plan.md), [multi-raft-persistence-plan.md](plans/multi-raft-persistence-plan.md) · docs: [state-store.md](../docs/state-store.md), [raft-operations.md](../docs/raft-operations.md), [persistence-streaming.md](../docs/persistence-streaming.md)
 
+- [ ] `raft_lanes::killing_the_all_lane_leader_reconverges_onto_one_survivor`
+      is timing-sensitive under parallel test load: green in isolation
+      (9/9 on a 4-vCPU container, 2026-07-30) but failed once during a full
+      `cargo test --all` where ~20 test binaries starve its election
+      timers. The test already accepts split outcomes by design; consider a
+      longer election budget when `cargo test` runs the whole workspace, or
+      serializing the cluster-gated suites.
+
 - [x] **Real Raft persistence** — quorum-committed writes, per-lane log stores,
       snapshots/compaction, real membership
       ([#137](https://github.com/mikenomitch/legion/pull/137)). Ships
@@ -336,7 +539,16 @@ Plans: [persistence-plan.md](plans/persistence-plan.md), [multi-raft-persistence
         in [tests/raft_perf_smoke.rs](../tests/raft_perf_smoke.rs);
         numbers in [docs/multi-raft.md](../docs/multi-raft.md) § "Lane
         isolation A/B".
-  - [ ] Per-lane tuning knobs, bottleneck tracing, Raft health UI
+  - [x] Raft engine metrics + per-lane bottleneck tracing (2026-07-30):
+        the full `legion_raft_*` series — per-lane term / commit_index /
+        applied_index / apply_lag / is_leader gauges on the checker tick,
+        plus `capture_seconds` vs `propose_apply_seconds` histograms and
+        `ops_total{lane,outcome}` at the replication call site, with a
+        per-op debug trace of the capture/propose phase split
+        ([docs/metrics.md](../docs/metrics.md)). Snapshot timings and
+        per-peer replication lag stay reserved.
+  - [ ] Per-lane tuning knobs and a Raft health UI page (the remaining
+        two-thirds of the old "knobs, tracing, UI" item)
   - [ ] Speculative: Raft autopilot
   - [ ] Idempotency records are not atomic with their mutation: an RPC that
         errors after its mutation but before `idempotency_record` (control
@@ -344,9 +556,9 @@ Plans: [persistence-plan.md](plans/persistence-plan.md), [multi-raft-persistence
         (`create_instance`) that duplicates the instance. Fold the record
         into the mutating op's own capture (it is JC-28 commutative, so any
         lane may carry it). Found by the 2026-07-28 split inventory.
-  - [ ] Eval NotRaftLeader retries are a flat 5s forever; with the churn
-        loops fixed this only delays split-parked evals, but backoff +
-        jitter would quiet the logs.
+  - [x] Eval NotRaftLeader retries back off exponentially (5s base → 60s
+        cap, 1s jitter, in-process attempt tracking that resets on
+        completion or failover) instead of a flat 5s forever (2026-07-30).
   - [ ] `destroy_job` under a standing split half-applies from the status/
         scheduler side (cleanups land, control delete rejected) until a
         retry against the control leader completes it. Consider reordering
@@ -366,7 +578,10 @@ Plans: [persistence-plan.md](plans/persistence-plan.md), [multi-raft-persistence
       ([#137](https://github.com/mikenomitch/legion/pull/137))
 - [ ] **Node configuration jobs** — like sysbatch, but also runs on join and can
       add dynamic node metadata (CNI setup, volumes, artifacts, Ansible-shaped
-      work). Needs a plan.
+      work). Specified as phase 3 of the
+      [host convergence plan](plans/host-convergence-plan.md) (`nodeConfig`
+      with `onJoin`, `gateReadiness`, `publishAttrs`), which subsumes the
+      sysbatch/system-job items below.
 - [ ] Reconfigure a worker from the manager with CRUD commands
   - [ ] Existing nodes of a changed type need the update pushed to them, which
         implies nodes store a reference to their type
@@ -377,7 +592,8 @@ Plans: [persistence-plan.md](plans/persistence-plan.md), [multi-raft-persistence
 
 - [ ] **Sysbatch** — run once on every node
 - [ ] **System job** — N per X (1 per metal, 2 per region, …). Is this really a
-      job type, or just a richer `count`?
+      job type, or just a richer `count`? (`count: {num: 1, per: "id"}`
+      approximates it today but does not converge newly joined nodes.)
 
 ## Auth, TLS & security
 
@@ -412,7 +628,27 @@ docs: [observability.md](../docs/observability.md), [logging.md](../docs/logging
 - [ ] A trace viewer in the UI (make it dev-only at first)
 - [x] Metrics endpoint and health probes — Prometheus `/metrics`, `/healthz`,
       `/readyz` ([docs/metrics.md](../docs/metrics.md), [#137](https://github.com/mikenomitch/legion/pull/137)).
-      Broader instrumentation (worker-side metrics, OTLP metric push) still open.
+- [x] Worker-side `/metrics` + OTLP metrics push (2026-07-30): opt-in
+      worker Prometheus listener (`LEGION_WORKER_TELEMETRY_PORT`;
+      `legion_worker_*` heartbeat/allocation families) and an OTLP/HTTP
+      metrics push for both registries (`OTEL_*` env conventions,
+      cumulative temporality, full histogram buckets) —
+      [docs/metrics.md](../docs/metrics.md),
+      [docs/observability.md](../docs/observability.md). Per-task runtime
+      metrics on workers still open (below).
+- [ ] Worker per-task runtime metrics (CPU/memory usage per allocation) —
+      also wanted by autoscaler phase 2, which collects usage via
+      heartbeats; build together.
+- [ ] Feed simulated fleets into the `legion_worker_*` families. Found
+      merging the worker-telemetry and `--simulate N` branches (2026-07-30):
+      [simulate.rs](../src/worker/simulate.rs) runs its own heartbeat loop
+      with private `heartbeats_ok`/`heartbeats_failed` atomics and never
+      starts the worker telemetry listener, so a simulated host exposes no
+      metrics — exactly the fleets the AWS campaign scrapes. Either have the
+      fleet loop update the shared registry (one process, N nodes: prefer
+      counters and a fleet-size gauge over per-node series) or give the
+      harness its own `/metrics`. Noted in
+      [docs/metrics.md](../docs/metrics.md) § Worker.
 - [x] Refresh [docs/observability.md](../docs/observability.md) — corrected; it
       had claimed OTLP export did not exist while [src/otel.rs](../src/otel.rs)
       ships it ([#137](https://github.com/mikenomitch/legion/pull/137))
@@ -438,10 +674,25 @@ The Pack/Helm equivalent. Job templates are in flight on
 Each of these should run inside the core binary *and* be splittable into its own
 job, so day 1 is simple and day N is performant. Each needs its own plan.
 
-- [ ] **Autoscaler** — [plan](plans/autoscaler-plan.md) (PLANNED) ·
+- [ ] **Autoscaler** — [plan](plans/autoscaler-plan.md) (IN EXECUTION) ·
       [calls](calls/autoscaler-plan_calls.md)
-  - [ ] Phase 1 — `legion job scale`: count overrides outside the job version,
-        `job_scale` eval, `scale` ACL resource, resubmit-ownership rules
+  - [x] Phase 1 — `legion job scale` (2026-07-30,
+        [docs/autoscaling.md](../docs/autoscaling.md)): `task_scale` count
+        overrides outside the job version (control-lane; see calls #5),
+        effective counts in every desired-count reader (scheduler plans,
+        slot retirement, rollout group plans), the `job_scale` eval
+        (retire surplus + reschedule shortfall), the ECS rollout rule with
+        `pending_count` promotion on terminal rollouts (calls #7),
+        `base_count` resubmit arbitration, the `scale` ACL resource,
+        ScaleTask/GetJobScaleStatus RPCs, CLI (`legion job scale`), MCP
+        tools, events, and the `scale_in` stop cause reported to the
+        worker whose allocation was retired (added merging with Phase 1a
+        of the preemption plan — calls #16). Deferred within phase 1: counts in
+        `legion job info` (scale status is the view), an ACL-scenario
+        test proving `scale:write` cannot RunJob (the endpoint matrix
+        covers the deny side), and regenerating `ui/src/gen/legion_pb.ts`
+        (no UI surface consumes the new RPCs yet; run the ui/README
+        protoc command when the scaling panel is built).
   - [ ] Phase 2 — per-allocation CPU/memory usage collection (heartbeat →
         `allocation_health`), request-vs-usage in CLI/UI
   - [ ] Phase 3 — task autoscaler MVP: `scaling { min, max, target }` block,
@@ -508,6 +759,24 @@ Deferred from [ui-jump-hints-plan.md](plans/ui-jump-hints-plan.md):
       Chromium's reserved set, but "the page wins `⌘`+digit" is asserted from
       the reserved-key list, not measured
       ([calls entry 1](calls/ui-jump-hints-plan_calls.md))
+
+- [ ] `ui/src/gen/legion_pb.ts` has drifted from `proto/legion.proto` — it is
+      missing `WorkerConfig.heartbeat_seconds`, `TaskAllocation.task_connect`,
+      `HeartbeatReply.upstream_endpoints` + the whole `UpstreamEndpoints`
+      message, `ServiceSummary.allow`, and `PlannedAllocation.score_sampled`.
+      Nothing in the UI reads them yet, so it typechecks; regenerate with
+      `protoc -I proto --es_out=ui/src/gen --es_opt=target=ts proto/legion.proto`
+      (needs `ui/node_modules/.bin` on PATH) and add it to CI, or the next
+      person to need one of those fields will hand-write it too
+
+Deferred from [job-updated-at-plan.md](plans/job-updated-at-plan.md):
+
+- [ ] Per-page label for `SharedIndex`'s last column. It is hard-coded to
+      "Updated", but Nodes puts `last_heartbeat` under it — a different signal
+      wearing the same name ([calls entry 2](calls/job-updated-at-plan_calls.md))
+- [ ] Show created/updated on the job detail page header. The index was where
+      the wrong value was being read, so the header was left alone; it is a
+      layout change with its own design surface
 
 ## Cross-cutting
 
@@ -789,3 +1058,10 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
       ([plan](plans/ui-jump-hints-plan.md),
       [calls](calls/ui-jump-hints-plan_calls.md)). Rows past the tenth, the
       Overview dashboard, and detail-page tables are open items above.
+- [x] Job mtime — the Jobs index "Updated" column showed `created_at`, because
+      jobs had no `updated_at` anywhere in the system. Real column, stamped on
+      spec submissions and status transitions but not on allocation churn;
+      `ListJobs` sorts by it by default and `job list` renders both timestamps
+      readably ([plan](plans/job-updated-at-plan.md),
+      [calls](calls/job-updated-at-plan_calls.md),
+      [docs](../docs/jobs-tasks-and-scheduling.md#job-timestamps-created_at-and-updated_at)).

@@ -69,6 +69,23 @@ service Manager {
   // Marks a job as stopped and enqueues stop reconciliation.
   rpc StopJob (StopJobRequest) returns (StopJobReply);
 
+  // Sets (or clears) a task's count override — the `legion job scale`
+  // surface (docs/autoscaling.md). Changes the effective desired count
+  // WITHOUT creating a new job config version or starting a rollout: the
+  // override is layered over the spec's `count` and reconciled by a
+  // `job_scale` eval (scale-out places only the shortfall; scale-in
+  // retires surplus allocations, highest slot indices first for slot-mode
+  // stateful tasks and newest-first for stateless ones). A scale-IN
+  // requested while a rollout is in flight is recorded as pending and
+  // applied when the rollout finishes (scale-out applies immediately).
+  // Guarded by `scale:write`, deliberately separate from `job:write`.
+  rpc ScaleTask (ScaleTaskRequest) returns (ScaleTaskReply);
+
+  // Reports every task's spec count, live override (or pending scale-in),
+  // and effective desired count for one job. The read half of the scale
+  // surface; `scale:read`.
+  rpc GetJobScaleStatus (GetJobScaleStatusRequest) returns (GetJobScaleStatusReply);
+
   // Permanently removes a stopped job and related records.
   rpc DestroyJob (DestroyJobRequest) returns (DestroyJobReply);
 
@@ -841,6 +858,32 @@ message WorkerConfig {
   // Default: empty string (the `host` driver reports itself unavailable on
   // this node, and jobs claiming it are rejected at admission).
   string host_volumes = 10;
+
+  // How often this worker heartbeats the manager, in seconds (worker-type
+  // config `heartbeatSeconds`). Workers clamp the value to 1..=30 and add
+  // ±10% jitter per beat. The manager marks a node lost after 10s without
+  // a heartbeat, so values above ~3 trade detection margin for load; the
+  // manager logs a warning when serving such a config. At large fleets the
+  // cadence is the manager-load knob: 10k workers at the default 2s is
+  // 5,000 heartbeats/second.
+  //
+  // Default: unset (workers use the built-in 2s default).
+  optional uint32 heartbeat_seconds = 11;
+
+  // JSON-encoded resource-enforcement settings for this worker (see
+  // docs/task-supervision.md). Shape:
+  // `{"enabled":true,"cgroupParent":"legion"}`.
+  //
+  // When enabled, a Linux worker puts each `exec` task in a cgroup v2 subtree
+  // it creates under `cgroupParent` and writes the task's `resources` there as
+  // real limits (`memory.max`, `cpu.max`), instead of treating them as
+  // scheduling arithmetic only. Off by default: turning declared resources
+  // into kernel limits can OOM-kill a workload whose declaration was only ever
+  // an estimate, so it is a deliberate per-worker choice.
+  //
+  // Default: empty string (enforcement off; `resources` stays advisory for
+  // `exec` tasks).
+  string resource_enforcement = 12;
 }
 
 // Reply payload for WorkerPreRegister.
@@ -1645,6 +1688,16 @@ message TaskIndexUsage {
   // Why no index served when one might have been expected to — e.g.
   // "no usable index: gpu needs [region]". Empty otherwise.
   string reason = 9;
+
+  // When bounded candidate scoring engaged for any of this task's
+  // placements (the fleet-size threshold in the manager's
+  // `schedulerSettings.score_sample` was met), the number of eligible
+  // nodes actually scored per placement: the placement is the best of
+  // this many uniformly drawn feasible candidates rather than of every
+  // feasible node. 0 means every placement was scored exactly.
+  // Feasibility (constraints, permits, resources) is never sampled — a
+  // sampled placement is always a valid one.
+  uint32 score_sampled = 10;
 }
 
 // Planned allocation display item.
@@ -1695,6 +1748,98 @@ message StopJobReply {
   // True when replayed from a recorded result for the request's
   // `idempotency_key` rather than applied fresh.
   bool deduplicated = 2;
+}
+
+// Request payload for ScaleTask (docs/autoscaling.md).
+message ScaleTaskRequest {
+  // Job name.
+  string name = 1;
+
+  // Task group, when the job has more than one scalable task. Optional:
+  // a job with exactly one scalable task needs neither selector; an
+  // ambiguous request is rejected with the candidate list.
+  optional string task_group = 2;
+
+  // Task name, same rules as `task_group`.
+  optional string task_name = 3;
+
+  // The desired count. Required unless `reset` is set. Keyed stateful
+  // tasks (no count) and `count: { per: ... }` tasks are rejected.
+  optional uint32 count = 4;
+
+  // Drop the override (and any pending scale-in) and return ownership of
+  // the count to the job spec. Mutually exclusive with `count`.
+  bool reset = 5;
+
+  // Free-text audit note recorded on the override and in the
+  // `scale.applied` event.
+  optional string reason = 6;
+
+  // Optional idempotency key. See `RunJobRequest.idempotency_key`.
+  optional string idempotency_key = 7;
+}
+
+// Reply payload for ScaleTask.
+message ScaleTaskReply {
+  // Human-readable outcome, e.g.
+  // `"web/default/web: 4 -> 6 (spec count 2; override active)"` or the
+  // deferral notice
+  // `"deferred: rollout web-7 is in progress; scale-in to 2 applies when it completes"`.
+  string message = 1;
+
+  // True when replayed from a recorded result for the request's
+  // `idempotency_key` rather than applied fresh.
+  bool deduplicated = 2;
+
+  // True when the request was a scale-in during an active rollout and was
+  // recorded as pending rather than applied (see ScaleTask's RPC comment).
+  bool deferred = 3;
+}
+
+// Request payload for GetJobScaleStatus.
+message GetJobScaleStatusRequest {
+  // Job name.
+  string name = 1;
+}
+
+// One task's scale state (GetJobScaleStatus).
+message TaskScaleStatus {
+  // Task group name.
+  string task_group = 1;
+
+  // Task name.
+  string task_name = 2;
+
+  // The spec's `count.num` in the latest job config version.
+  uint32 spec_count = 3;
+
+  // The applied override count, when one exists.
+  optional uint32 override_count = 4;
+
+  // A recorded scale-in waiting for the active rollout to finish, when
+  // one exists.
+  optional uint32 pending_count = 5;
+
+  // The count the scheduler currently converges to
+  // (`override_count` if set, else `spec_count`).
+  uint32 effective_count = 6;
+
+  // Who set the override: `operator` today; `autoscaler` when the policy
+  // evaluator ships.
+  string source = 7;
+
+  // The audit note recorded with the override, if any.
+  string reason = 8;
+
+  // RFC 3339 timestamp of the last override write; empty when no
+  // override exists.
+  string updated_at = 9;
+}
+
+// Reply payload for GetJobScaleStatus.
+message GetJobScaleStatusReply {
+  // One entry per task in the job's latest config, spec-order.
+  repeated TaskScaleStatus tasks = 1;
 }
 
 // Request payload for DestroyJob.
@@ -2216,9 +2361,9 @@ message ListJobsRequest {
   // Free-text search against job name, ID, and status.
   optional string query = 1;
 
-  // Sort key. Supported values: `name`, `status`, `created_at`.
+  // Sort key. Supported values: `name`, `status`, `created_at`, `updated_at`.
   //
-  // Default: `created_at`.
+  // Default: `updated_at`.
   optional string sort_by = 2;
 
   // Sort direction. Supported values: `asc`, `desc`.
@@ -2250,8 +2395,20 @@ message Job {
   // Current values written by manager include: done, stopped, failed.
   string status = 3;
 
-  // Unix timestamp (seconds) when job was created.
+  // Unix timestamp (seconds) when job was created. Immutable for the life of
+  // the job — resubmitting a new spec version does not move it.
   int64 created_at = 4;
+
+  // Unix timestamp (seconds) of the last change to the job, and the value the
+  // UI's "Updated" column shows. Stamped when a new spec version is submitted
+  // and on every status transition the manager records (`stopped`, `failed`,
+  // recovery back to `done`, and an acknowledged restart request). Never
+  // moved by allocation churn, heartbeats, or reads.
+  //
+  // Equals `created_at` for a job that has not changed since submission, and
+  // for rows written by a manager older than the column (backfilled once at
+  // migration time).
+  int64 updated_at = 5;
 }
 
 // Reply payload for ListJobs.
@@ -2354,6 +2511,20 @@ message HeartbeatRequest {
   //
   // Default: empty list.
   repeated VolumeReport volume_reports = 5;
+
+  // Allocations whose task process reached a terminal state since the last
+  // heartbeat *without* failing — the task exited with a status its `restart`
+  // policy treats as done (see docs/task-supervision.md). Failures travel in
+  // `failed_allocations` instead, because the manager reschedules those.
+  //
+  // This is what makes a batch task's success real: the manager marks the
+  // allocation complete and the task successful only when a worker says the
+  // process exited successfully, instead of assuming it at placement.
+  //
+  // Sent only by workers at protocol version 2 and above.
+  //
+  // Default: empty list.
+  repeated TerminatedAllocation terminated_allocations = 6;
 }
 
 // Reply payload for Heartbeat.
@@ -2393,6 +2564,58 @@ message HeartbeatReply {
   // manager performs no catalog work at all in that case, so nodes running
   // only plain jobs pay nothing for this field.
   repeated UpstreamEndpoints upstream_endpoints = 4;
+
+  // Why the manager is stopping allocations on this node.
+  //
+  // Workers learn that an allocation should stop by noticing it is *absent*
+  // from `desired_allocations` — an absence carries no reason, so a drain, a
+  // rollout replacement, a `job stop` and a reschedule were historically
+  // indistinguishable to the worker and to anything reading its logs. This
+  // field supplies the missing reason, letting the worker hand a
+  // `StopCause` to the task runtime and log why each task went away.
+  //
+  // Delivery is **best effort and advisory**. The manager records a notice in
+  // the same transaction that removes the allocation, re-sends every live
+  // notice on each heartbeat, and prunes notices by age
+  // (`STOP_NOTICE_RETENTION_SECS`, 10 minutes). A worker that reconciles
+  // before the notice reaches it — or one talking to a manager older than
+  // this field — stops the allocation with cause `unknown` rather than
+  // waiting. A stop is never delayed or skipped for want of a notice.
+  //
+  // The list is a snapshot, not a delta: each heartbeat carries every notice
+  // the manager currently holds for this node, and the worker replaces its
+  // copy wholesale.
+  //
+  // Default: empty list when no allocation on this node was recently removed.
+  repeated StopNotice stop_notices = 5;
+}
+
+// Why one allocation is being stopped.
+//
+// Sent in `HeartbeatReply.stop_notices`. See that field for delivery
+// semantics and `docs/graceful-stop.md` for the full contract.
+message StopNotice {
+  // Allocation the manager removed. Matches an ID the worker previously
+  // received in `HeartbeatReply.desired_allocations`.
+  int64 allocation_id = 1;
+
+  // Why it was removed. One of:
+  //
+  // - `stop` — the job, or a keyed instance of it, was stopped by a user.
+  // - `update` — replaced by a newer job config (a rollout or in-place
+  //   update).
+  // - `drain` — the node is draining and its work is moving elsewhere.
+  // - `reschedule` — moved by the scheduler (failure recovery, `onLost`
+  //   handling, or a scheduler-driven move).
+  // - `destroy` — the job was destroyed outright.
+  // - `node_lost` — the node was removed or declared lost, clearing its
+  //   allocations.
+  // - `preempted` — displaced to make room for higher-priority work.
+  //   Reserved; nothing emits this until preemption ships.
+  //
+  // Workers treat an unrecognized value as `unknown` and stop the allocation
+  // anyway, so the manager may add causes without a coordinated upgrade.
+  string cause = 2;
 }
 
 // The endpoints one allocation may currently reach for one upstream service.
@@ -2510,6 +2733,33 @@ message FailedAllocation {
   //
   // Unset for non-artifact failures.
   optional string artifact_states = 3;
+}
+
+// A terminal, non-failure allocation outcome reported by a worker: the task's
+// process exited and the task's `restart` policy says that is the end of it
+// (see docs/task-supervision.md).
+message TerminatedAllocation {
+  // Allocation that reached the terminal state.
+  int64 allocation_id = 1;
+
+  // True when the exit status was one the task counts as success
+  // (`restart.successExitCodes`, default `[0]`). A task whose policy is
+  // `never` can also terminate unsuccessfully; the manager marks the
+  // allocation complete either way and records the status.
+  bool success = 2;
+
+  // Process exit code. Unset when the process was killed by a signal, or when
+  // the worker only re-adopted the pid after a restart and never had a handle
+  // to reap.
+  optional int32 exit_code = 3;
+
+  // Signal that killed the process, when it was killed by one (Unix only).
+  optional int32 signal = 4;
+
+  // Human-readable rendering of the same facts, e.g. `exited with status 0`
+  // or `killed by signal 9`. Carried so events and the UI do not have to
+  // re-derive wording from the numbers.
+  string message = 5;
 }
 
 // Allocation health snapshot item from worker to manager.

@@ -208,3 +208,147 @@ Also of note in the after-run: `apply` remains the dominant phase on
 every backend (group commit is architecture-review item D5), and
 laptop-hosted absolute numbers should be compared only within a run —
 record the host, build profile, and machine state with every table.
+
+## Plan-path scale levers (D4 lazy sample, D6 cheap snapshots, scoring fusion) — 2026-07-30
+
+**Host: 4-vCPU Linux container (Claude Code remote env), release build,
+in-process backends.** Container quorum-commit (fsync) latency swings
+run to run — compare phases within a run and before/after pairs, not
+absolutes; the same caveat the 2026-07-29 tables carry.
+
+Before (`target/benchmark-results/scale-1785396333.json`) vs after
+(`scale-1785406846.json`), sequential driver, correctness 1.000 and
+conflicts 0 in every cell of both runs. Selected cells (phase means, µs
+per plan):
+
+| Scenario (nodes) | Backend | nodes µs | versions µs | capacity µs | build µs |
+| --- | --- | --- | --- | --- | --- |
+| churn-large (1k) | local | 186 → 39 | **229 → 5** | **504 → 115** | 1427 → 1397 |
+| churn-large (1k) | raft1 | 235 → 54 | **254 → 4** | 793 → 177 | 1792 → 1741 |
+| churn-large (1k) | raft3 | 352 → 55 | **309 → 5** | **1262 → 223** | 2704 → 1986 |
+| mixed-heterogeneous (500) | local | 91 → 15 | 112 → 2 | 355 → 100 | 895 → 787 |
+| web-fleet (240) | raft3 | 99 → 20 | 107 → 5 | 315 → 133 | 817 → 789 |
+| steady-small (12) | local | 1 → 0 | 2 → 1 | 40 → 35 | 303 → 286 |
+
+Readings:
+
+- **The O(fleet) `version_sample` term is gone** (D4 lazy sample):
+  ~50x at 1k nodes, and — the point — no longer grows with fleet size.
+  The eager fallback never fired in these runs
+  (`legion_scheduler_lazy_sample_fallback_total` = 0; the sequential
+  driver never mutates mid-plan).
+- **Snapshot phases dropped 4.5–5.8x** at 1k nodes (D6: cached sorted
+  node list + Arc'd pools). churn-large is the *worst* case for the
+  node-list cache (25 nodes churn every iteration, invalidating it);
+  quiet fleets see `nodes` at 0–1 µs.
+- `build_plan` improved modestly (scoring-loop fusion; biggest on the
+  1k-node cells). `apply` means moved with container fsync noise in
+  both directions — the D5 group-commit win is measured separately
+  below, under concurrency, where it actually engages.
+
+## Plan-apply group commit (D5) under concurrency — 2026-07-30
+
+Same host/build. `LEGION_BENCH_CONCURRENCY=4` drives each cell with 4
+concurrent submitters (bounded conflict retries, like the production
+eval path); `LEGION_BENCH_SCHEDULER_SETTINGS` toggles the lever for the
+A/B. Back-to-back runs:
+
+4 concurrent submitters, raft backends, `steady-small` (12 nodes / 4
+jobs, the contended cell) and `web-fleet` (240 nodes / 30 jobs):
+
+| Scenario | Backend | evals/s off → on | p50 ms off → on | p99 ms off → on | conflicts/attempt (both) |
+| --- | --- | --- | --- | --- | --- |
+| steady-small | raft1 | 33.2 → **51.4** | 45.9 → **15.1** | 80.4 → 32.1 | 1.29 |
+| steady-small | raft3 | 15.6 → 19.5 | 99.1 → **41.2** | 158.5 → 93.0 | 1.25 |
+| web-fleet | raft1 | 63.9 → 63.3 | 45.9 → 30.1 | 72.3 → 79.4 | 0.32 / 0.47 |
+| web-fleet | raft3 | 30.0 → 34.9 | 92.1 → **64.9** | 155.5 → 124.5 | 0.36 |
+
+Readings — with measurement honesty first:
+
+- **p50 plan latency fell 2.4–3x** on the contended cells: concurrent
+  applies share one quorum commit instead of queueing solo fsyncs. That
+  is the group commit doing exactly what it was built for.
+- **Throughput gained 16–55%, not the plan's ≥2x target.** The ceiling
+  is not commit rate — it is optimistic-concurrency contention:
+  conflict rates are high (1.25+ retries per plan on steady-small,
+  where 4 bin_pack planners all pick the same argmax node) and
+  *identical with the lever on and off*, so batching neither causes nor
+  can fix them. Re-planning burns the latency the batch saved. This is
+  the parallel-planner pathology the late-binding plan
+  (`internal_docs/plans/late-binding-plan-apply-plan.md`) exists for;
+  group commit and late binding compose.
+- The purest measure of the coalescer mechanism is the heartbeat table
+  above (same primitive, no CAS in the loop): 5.3–6.7x at 8 threads.
+- Correctness 1.000 in every cell, both arms (bounded conflict retries,
+  as production's eval path does).
+
+
+## Heartbeat path (heartbeat-scale plan) — 2026-07-30
+
+Same host/build. `tests/heartbeat_scale_benchmark.rs`, 8 driver
+threads, 3s measurement window per cell. Before
+(`target/benchmark-results/heartbeat-1785401390.json`, commit before
+the heartbeat pass) vs after (`heartbeat-1785406179.json`):
+
+| Backend | Nodes | hb/s | p50 ms | p99 ms | liveness tick ms |
+| --- | --- | --- | --- | --- | --- |
+| local_disk | 1000 | 9,428 → **22,182** | 0.53 → 0.19 | 4.17 → 1.52 | 0.80 → 0.76 |
+| local_disk | 5000 | 9,586 → **21,409** | 0.52 → 0.20 | 4.78 → 1.47 | **7.71 → 3.60** |
+| raft1 | 1000 | 158 → **839** | 50.3 → 10.0 | 90.4 → 34.4 | 0.76 → 0.66 |
+| raft1 | 5000 | 143 → **953** | 51.5 → 9.3 | 123.1 → 15.0 | 4.11 → 3.92 |
+
+Readings:
+
+- **Raft heartbeat throughput is up 5.3–6.7x** — the group commit turns
+  one consensus round per heartbeat into one per batch. With 8 driver
+  threads the natural batch is ≤8; real fleets present hundreds of
+  concurrent RPCs and batch up to 128, so this measurement is the
+  *floor* of the win, not the ceiling. p50 fell from ~50 ms (a queued
+  solo fsync each) to ~10 ms (a shared commit).
+- Local-disk throughput roughly doubled (skip-reprojection: no
+  read-model write lock or node re-read on a bare refresh) and p99
+  dropped ~3x (no more lock convoys against scheduler reads).
+- The 5k-node liveness tick halved (integer heartbeat clock instead of
+  10k RFC3339 parses every 2s). The old parse path remains only as the
+  NULL-column fallback for pre-migration rows.
+- Baseline context: 10k workers at the default 2s cadence need 5,000
+  heartbeats/s. On this host, raft went from 33x short (158/s) to ~5x
+  short at driver-limited batch sizes — with real arrival concurrency
+  (batch 128) the same commit rate (~100 commits/s observed) covers
+  ~12,800 hb/s. `heartbeatSeconds` remains the fleet-wide knob on top.
+
+## Plan-path cleanups: shared filter parsing, cached settings, optional shard sort — 2026-07-30
+
+Three measured leftovers from the TODO's "slowest bits" list, in one pass
+(dev container, Criterion, back-to-back before/after runs on the same
+host state):
+
+- **Per-task `ConstraintSet`/`PermitSet` parsing deduplicated** —
+  `build_plan`'s group-filter pass and `build_task_plan` each parsed
+  every task's constraints and permit; they now share one `Arc`'d parse
+  per task per plan.
+- **`scheduler_settings` walks hoisted to `Scheduler::new`** — weights,
+  `nodes_considered`, and `score_sample` were re-parsed from the settings
+  JSON on every `build_plan`; they are parsed once per scheduler now
+  (and malformed settings fail at construction instead of the first
+  plan).
+- **Index shard-sort skipped when the order is discarded** — the
+  index query's nearest-fit cell sort only matters when candidates may
+  be truncated to a best-first budget; the untruncated path re-sorts
+  verified candidates by node id, so it now passes `ordered: false` and
+  skips the sort (and the ordered path ranks each cell once instead of
+  recomputing ranks inside the comparator).
+
+| Cell | before | after | delta |
+| --- | --- | --- | --- |
+| `scheduler_speed/bin_pack/nodes_1000_allocs_100` (plan-and-apply) | 25.81 ms | 25.19 ms | −2.4% (p = 0.02) |
+| `candidate_construction/indexes_off/nodes_5000` (plan-only) | 32.11 ms | 32.88 ms | noise (CIs overlap) |
+| `candidate_construction/indexes_on/nodes_5000` (plan-only) | 26.27 ms | 26.02 ms | noise |
+
+Honest reading: the wins are real but small at these shapes — constraint
+JSON in the bench cells is tiny (two keys), the topo index's shards hold
+few cells, and the settings walk was microseconds each. The changes are
+kept because they scale with what the benchmark shapes don't stress
+(constraint complexity, task count, cells per shard) and they remove
+per-plan work with no behavioral cost; the `-2.4%` on the whole
+plan-and-apply path is the aggregate. No cell regressed outside noise.

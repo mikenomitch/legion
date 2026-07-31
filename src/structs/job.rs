@@ -23,6 +23,18 @@ pub struct JobPrint {
     pub name: String,
     pub status: String,
     pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Render a job timestamp (unix seconds on the wire) for the human table.
+///
+/// The table used to print the raw epoch integer, which is not a timestamp
+/// anyone can read at 3am. `--json` is unaffected: it serializes the proto
+/// message, which still carries the integer.
+fn format_job_timestamp(unix_seconds: i64) -> String {
+    chrono::DateTime::from_timestamp(unix_seconds, 0)
+        .map(|at| at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+        .unwrap_or_else(|| unix_seconds.to_string())
 }
 
 impl From<Job> for JobPrint {
@@ -30,7 +42,8 @@ impl From<Job> for JobPrint {
         JobPrint {
             name: job.name,
             status: job.status,
-            created_at: job.created_at.to_string(),
+            created_at: format_job_timestamp(job.created_at),
+            updated_at: format_job_timestamp(job.updated_at),
         }
     }
 }
@@ -546,6 +559,59 @@ pub struct TaskOnUnhealthyConfig {
         serialize_with = "serialize_duration"
     )]
     pub move_delay: Duration,
+}
+
+/// What to do when a task's process exits (see
+/// `internal_docs/plans/host-process-supervision-plan.md`). This is the
+/// exit-status half of restart handling; health-check failures continue to be
+/// governed by [`TaskOnUnhealthyConfig`], and both share one restart budget.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum RestartPolicy {
+    /// Restart on any exit, successful or not. Default for `service` and
+    /// `sidecar` tasks: a service that exits is not doing its job.
+    #[default]
+    Always,
+    /// Restart only when the exit status is not in `successExitCodes`.
+    /// Default for `batch` tasks.
+    OnFailure,
+    /// Never restart. The allocation reaches a terminal state on first exit.
+    Never,
+}
+
+fn default_success_exit_codes() -> Vec<i32> {
+    vec![0]
+}
+
+/// Task `restart` block: how the worker reacts to the task process exiting.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskRestartConfig {
+    /// `always` | `onFailure` | `never`. Defaults per lifecycle — see
+    /// [`RestartPolicy`] and [`TaskConfig::restart_policy`].
+    #[serde(default)]
+    pub policy: RestartPolicy,
+    /// Wait before relaunching. Defaults to `on_unhealthy.restart_delay` when
+    /// unset, so a task that already tuned its restart pacing keeps it.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_duration",
+        serialize_with = "serialize_optional_duration"
+    )]
+    pub delay: Option<Duration>,
+    /// Exit codes counted as success. Default `[0]`.
+    #[serde(default = "default_success_exit_codes")]
+    pub success_exit_codes: Vec<i32>,
+}
+
+impl Default for TaskRestartConfig {
+    fn default() -> Self {
+        Self {
+            policy: RestartPolicy::default(),
+            delay: None,
+            success_exit_codes: default_success_exit_codes(),
+        }
+    }
 }
 
 impl Default for TaskOnUnhealthyConfig {
@@ -1341,6 +1407,12 @@ pub struct TaskConfig {
     #[serde(default = "default_on_unhealthy")]
     #[tabled(skip)]
     pub on_unhealthy: TaskOnUnhealthyConfig,
+    /// How the worker reacts to the task process exiting. None = the
+    /// lifecycle default (`always` for service/sidecar, `onFailure` for
+    /// batch) — see `docs/task-supervision.md`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[tabled(skip)]
+    pub restart: Option<TaskRestartConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[tabled(skip)]
     pub kv_injections: Option<TaskKvInjections>,
@@ -1794,6 +1866,8 @@ struct TaskConfigInput {
     #[serde(default)]
     on_unhealthy: Option<TaskOnUnhealthyConfig>,
     #[serde(default)]
+    restart: Option<TaskRestartConfig>,
+    #[serde(default)]
     kv: Option<KvInjectionPolicy>,
     #[serde(default)]
     env: Vec<TaskKvEnvInjection>,
@@ -1925,6 +1999,7 @@ impl TaskConfigInput {
             affinities: self.affinities,
             checks: self.checks,
             on_unhealthy: self.on_unhealthy.unwrap_or_default(),
+            restart: self.restart,
             kv_injections: Some(if let Some(existing) = self.kv_injections {
                 TaskKvInjections {
                     kv: self.kv.or(existing.kv),
@@ -2119,6 +2194,7 @@ impl TaskConfig {
             affinities: empty_object(),
             checks: Vec::new(),
             on_unhealthy: TaskOnUnhealthyConfig::default(),
+            restart: None,
             kv_injections: None,
             network: None,
             service: None,
@@ -2128,6 +2204,43 @@ impl TaskConfig {
             volumes: Vec::new(),
             artifacts: Vec::new(),
             actions: Vec::new(),
+        }
+    }
+
+    /// Effective restart policy for this task: the explicit `restart.policy`
+    /// when set, else the lifecycle default (`always` for service/sidecar,
+    /// `onFailure` for batch).
+    pub fn restart_policy(&self) -> RestartPolicy {
+        match self.restart.as_ref() {
+            Some(restart) => restart.policy,
+            None => match self.lifecycle {
+                TaskLifecycle::Batch => RestartPolicy::OnFailure,
+                TaskLifecycle::Service | TaskLifecycle::Sidecar => RestartPolicy::Always,
+            },
+        }
+    }
+
+    /// Delay before relaunching an exited task. Falls back to the shared
+    /// `on_unhealthy.restart_delay` so a task that already tuned its restart
+    /// pacing does not have to say it twice.
+    pub fn restart_delay(&self) -> Duration {
+        self.restart
+            .as_ref()
+            .and_then(|restart| restart.delay)
+            .unwrap_or(self.on_unhealthy.restart_delay)
+    }
+
+    /// Whether an exit code counts as success for this task (`[0]` unless the
+    /// task lists others). An exit with no code — killed by a signal, or a
+    /// process re-adopted after a worker restart whose status we never saw —
+    /// is never a success.
+    pub fn exit_code_is_success(&self, exit_code: Option<i32>) -> bool {
+        let Some(code) = exit_code else {
+            return false;
+        };
+        match self.restart.as_ref() {
+            Some(restart) => restart.success_exit_codes.contains(&code),
+            None => code == 0,
         }
     }
 

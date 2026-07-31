@@ -8,9 +8,10 @@ use crate::cmd::output::{self, CliError, OutputFormat};
 use crate::prelude::*;
 use crate::structs::{
     AdvanceRolloutRequest, DestroyJobRequest, GetAllocationLogsRequest, GetJobInfoRequest,
-    GetJobSpecRequest, GetKvRequest, GetRolloutStatusRequest, JobConfig, JobPlanPrint, JobPrint,
-    KvEntry, KvValueType, ListJobsRequest, ListRolloutEventsRequest, ListRolloutsRequest,
-    PlanJobRequest, RunJobRequest, StopJobRequest, Submission,
+    GetJobScaleStatusRequest, GetJobSpecRequest, GetKvRequest, GetRolloutStatusRequest, JobConfig,
+    JobPlanPrint, JobPrint, KvEntry, KvValueType, ListJobsRequest, ListRolloutEventsRequest,
+    ListRolloutsRequest, PlanJobRequest, RunJobRequest, ScaleTaskRequest, StopJobRequest,
+    Submission,
 };
 use crate::task_plugins::{builtin_task_plugin_schemas, validate_job_config};
 use jsonnet::JsonnetVm;
@@ -51,6 +52,49 @@ pub fn config() -> Command {
         )
         .arg(priority_arg())
         .arg(asap_flag())
+        .arg(idempotency_arg())
+        .arg(json_flag());
+
+    let scale_cmd = Command::new("scale")
+        .about("Change a task's count without a new job version or rollout (docs/autoscaling.md)")
+        .arg(
+            Arg::new("name")
+                .value_name("NAME")
+                .required(true)
+                .help("Name of the job to scale"),
+        )
+        .arg(
+            Arg::new("count")
+                .long("count")
+                .value_name("COUNT")
+                .value_parser(value_parser!(u32))
+                .help("Desired replica count; omit to print the job's scale status"),
+        )
+        .arg(
+            Arg::new("reset")
+                .long("reset")
+                .action(ArgAction::SetTrue)
+                .conflicts_with("count")
+                .help("Drop the override and return count ownership to the job spec"),
+        )
+        .arg(
+            Arg::new("group")
+                .long("group")
+                .value_name("GROUP")
+                .help("Task group, when the job has more than one scalable task"),
+        )
+        .arg(
+            Arg::new("task")
+                .long("task")
+                .value_name("TASK")
+                .help("Task name, when the job has more than one scalable task"),
+        )
+        .arg(
+            Arg::new("reason")
+                .long("reason")
+                .value_name("REASON")
+                .help("Audit note recorded on the override and in the event stream"),
+        )
         .arg(idempotency_arg())
         .arg(json_flag());
 
@@ -259,6 +303,7 @@ pub fn config() -> Command {
         .subcommand(wait_cmd)
         .subcommand(list_cmd)
         .subcommand(stop_cmd)
+        .subcommand(scale_cmd)
         .subcommand(spec_cmd)
         .subcommand(destroy_cmd)
         .subcommand(logs_cmd)
@@ -942,6 +987,7 @@ pub async fn handle(sub_matches: &ArgMatches) -> R<()> {
     match sub_matches.subcommand() {
         Some(("run", matches)) => run_job(matches).await,
         Some(("stop", matches)) => stop_job(matches).await,
+        Some(("scale", matches)) => scale_job(matches).await,
         Some(("spec", matches)) => get_job_spec(matches).await,
         Some(("destroy", matches)) => destroy_job(matches).await,
         Some(("list", matches)) => list_jobs(matches).await,
@@ -1340,6 +1386,101 @@ async fn stop_job(arg_matches: &ArgMatches) -> R<()> {
     Ok(())
 }
 
+/// `legion job scale <NAME> [--count N | --reset]` (docs/autoscaling.md):
+/// with `--count`/`--reset` it calls ScaleTask; with neither it prints the
+/// job's scale status (spec vs override vs effective, per task).
+#[instrument(err, skip_all)]
+async fn scale_job(arg_matches: &ArgMatches) -> R<()> {
+    let format = OutputFormat::from_matches(arg_matches);
+    let mut client = connect_manager_client().await?;
+    let job_name = arg_matches
+        .get_one::<String>("name")
+        .context("job name is required")?
+        .clone();
+    let count = arg_matches.get_one::<u32>("count").copied();
+    let reset = arg_matches.get_flag("reset");
+
+    if count.is_none() && !reset {
+        // Status mode.
+        let request = tonic::Request::new(GetJobScaleStatusRequest {
+            name: job_name.clone(),
+        });
+        let reply = output::resolve(
+            format,
+            "failed to fetch scale status",
+            client.get_job_scale_status(request).await,
+        )?
+        .into_inner();
+        if format.is_json() {
+            output::print_success(&json!({ "tasks": reply
+                .tasks
+                .iter()
+                .map(|task| {
+                    json!({
+                        "group": task.task_group,
+                        "task": task.task_name,
+                        "specCount": task.spec_count,
+                        "overrideCount": task.override_count,
+                        "pendingCount": task.pending_count,
+                        "effectiveCount": task.effective_count,
+                        "source": task.source,
+                        "reason": task.reason,
+                        "updatedAt": task.updated_at,
+                    })
+                })
+                .collect::<Vec<_>>() }));
+        } else {
+            for task in reply.tasks {
+                let mut line = format!(
+                    "{}/{}/{}: count {} (spec {}",
+                    job_name,
+                    task.task_group,
+                    task.task_name,
+                    task.effective_count,
+                    task.spec_count
+                );
+                if task.override_count.is_some() {
+                    line.push_str(&format!(", scaled by {}", task.source));
+                }
+                if let Some(pending) = task.pending_count {
+                    line.push_str(&format!(", scale-in to {pending} pending"));
+                }
+                line.push(')');
+                println!("{line}");
+            }
+        }
+        return Ok(());
+    }
+
+    let request = tonic::Request::new(ScaleTaskRequest {
+        name: job_name,
+        task_group: arg_matches.get_one::<String>("group").cloned(),
+        task_name: arg_matches.get_one::<String>("task").cloned(),
+        count,
+        reset,
+        reason: arg_matches.get_one::<String>("reason").cloned(),
+        idempotency_key: arg_matches.get_one::<String>("idempotency-key").cloned(),
+    });
+    let reply = output::resolve(
+        format,
+        "failed to scale job",
+        client.scale_task(request).await,
+    )?
+    .into_inner();
+
+    if format.is_json() {
+        output::print_success(&json!({
+            "message": reply.message,
+            "deduplicated": reply.deduplicated,
+            "deferred": reply.deferred,
+        }));
+    } else {
+        println!("{}", reply.message);
+    }
+
+    Ok(())
+}
+
 #[instrument(err, skip_all)]
 async fn get_job_spec(arg_matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(arg_matches);
@@ -1469,12 +1610,28 @@ async fn plan_job(arg_matches: &ArgMatches) -> R<()> {
             .iter()
             .filter_map(|usage| {
                 if usage.index.is_empty() {
-                    if usage.reason.is_empty() {
+                    if usage.reason.is_empty() && usage.score_sampled == 0 {
                         return None;
                     }
-                    return Some(format!("{}: scan — {}", usage.task_name, usage.reason));
+                    let mut line = format!("{}: scan", usage.task_name);
+                    if !usage.reason.is_empty() {
+                        line.push_str(&format!(" — {}", usage.reason));
+                    }
+                    if usage.score_sampled > 0 {
+                        line.push_str(&format!(
+                            "; scored best of {} sampled nodes",
+                            usage.score_sampled
+                        ));
+                    }
+                    return Some(line);
                 }
                 let mut notes = Vec::new();
+                if usage.score_sampled > 0 {
+                    notes.push(format!(
+                        "scored best of {} sampled nodes",
+                        usage.score_sampled
+                    ));
+                }
                 if usage.truncated {
                     notes.push("truncated".to_string());
                 }

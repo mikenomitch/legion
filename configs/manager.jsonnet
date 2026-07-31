@@ -31,6 +31,18 @@
     // Delay (ms, jittered) before a conflict-exhausted eval is retried;
     // exhaustion requeues the eval instead of failing it terminally.
     // plan_conflict_requeue_delay_ms: 1000,
+    //
+    // Plan-path scale levers (docs/scheduler-and-eval-loop.md). Both are on
+    // by default; the flags exist as escape hatches.
+    // lazy_version_sample: true,   // false = eager O(fleet) epoch sample per plan
+    // plan_apply_coalescing: true, // false = one commit/raft propose per plan
+    // plan_apply_batch_max: 16,    // max plans per group commit (1-128)
+    // Bounded candidate scoring (docs/scheduler-and-eval-loop.md): off
+    // unless configured. At or above `min_nodes` eligible candidates a
+    // placement scores the best of `sample` uniformly drawn feasible nodes
+    // instead of every one — flat per-placement cost on big fleets, at a
+    // measured packing/spread quality cost. Feasibility is never sampled.
+    // score_sample: { min_nodes: 1024, sample: 128 },
     // Declarable scheduling indexes (docs/scheduling-indexes.md): ad-hoc
     // candidate generation for the scheduler. A built-in `fit` index
     // (nearest-fit over free cpu/memory/disk within the task's pool) is

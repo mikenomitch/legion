@@ -3,8 +3,8 @@ use crate::prelude::*;
 use crate::structs::token::JoinToken;
 use crate::structs::{
     manager_client::ManagerClient, worker_server::WorkerServer, AllocNetwork, HealthCheckRequest,
-    HeartbeatReply, HeartbeatRequest, TaskAllocation, UpstreamEndpoints, WorkerPreRegisterReply,
-    WorkerPreRegisterRequest, WorkerRegisterRequest,
+    HeartbeatReply, HeartbeatRequest, TaskAllocation, UpstreamEndpoints, WorkerConfig,
+    WorkerPreRegisterReply, WorkerPreRegisterRequest, WorkerRegisterRequest,
 };
 use crate::util::random_string;
 use crate::worker::{
@@ -17,6 +17,7 @@ use crate::worker::{
     state::WorkerStateStore,
     task_health::spawn_health_monitor,
     task_manager::{launch_task_allocation, WorkerTaskManager},
+    task_supervisor::start_task_supervisor,
 };
 
 use futures::join;
@@ -55,10 +56,14 @@ impl WorkerCredentials {
         request
     }
 
-    fn store_node_token(&self, token: Option<String>) {
+    pub(crate) fn store_node_token(&self, token: Option<String>) {
         if let Ok(mut current) = self.node_token.write() {
             *current = token;
         }
+    }
+
+    pub(crate) fn join_secret(&self) -> Option<&String> {
+        self.join_secret.as_ref()
     }
 }
 
@@ -156,6 +161,10 @@ async fn run_worker_with_manager(
     // need the node id (it goes into every plugin request) plus the operator's
     // hostVolumes declarations from the worker config.
     let host_volumes = parse_host_volumes(&config.host_volumes);
+    // Task runtimes run in-process as dylibs and take no config of their own,
+    // so cross-cutting worker settings reach them through the environment —
+    // the same channel `sandbox` uses for LEGION_SANDBOX_KERNEL.
+    apply_resource_enforcement_env(&config.resource_enforcement);
     let restored_allocations = {
         let mut manager = task_manager.lock().expect("task manager");
         manager.load_builtin_plugins();
@@ -222,6 +231,10 @@ async fn run_worker_with_manager(
         .readiness_checks();
     let health_checks = run_health_checks(config.additional_node_checks.clone(), Some(readiness));
 
+    // Resolved before `config` is picked apart below (the helper borrows
+    // the whole struct).
+    let heartbeat_interval = heartbeat_interval_for(&config);
+
     let mut config_attrs = Map::new();
     for (key, value) in config.attributes {
         config_attrs.insert(key, Value::String(value));
@@ -249,6 +262,33 @@ async fn run_worker_with_manager(
     register_self(client.clone(), &registration, &credentials).await?;
     info!(worker_name = %name, "Worker registered with manager");
 
+    // Worker telemetry: opt-in Prometheus listener (/metrics + /healthz,
+    // `legion_worker_*` families) so a fleet can prove its workers are not
+    // the bottleneck. Env-var rather than config: workers joined with a bare
+    // token have no config file, and packed multi-worker hosts need
+    // per-process ports anyway (port 0 = ephemeral, logged on bind). See
+    // docs/metrics.md.
+    if let Ok(port) = std::env::var("LEGION_WORKER_TELEMETRY_PORT") {
+        match port.trim().parse::<u16>() {
+            Ok(port) => {
+                let telemetry_addr: std::net::SocketAddr = ([0, 0, 0, 0], port).into();
+                tokio::spawn(async move {
+                    if let Err(err) =
+                        crate::manager::telemetry::serve_worker_telemetry(telemetry_addr).await
+                    {
+                        error!(error = ?err, "worker telemetry listener exited");
+                    }
+                });
+            }
+            Err(_) => warn!(
+                value = %port,
+                "Ignoring LEGION_WORKER_TELEMETRY_PORT: not a valid port number"
+            ),
+        }
+    }
+    // OTLP metrics push (opt-in via the OTEL_* env vars; no-op otherwise).
+    crate::otel::start_metrics_push();
+
     // Registration just succeeded, so "now" is an honest last-contact time;
     // every successful heartbeat refreshes it. The self-fence watchdog kills
     // stateful allocations whose `selfTerminateAfter` window outlives this
@@ -267,6 +307,7 @@ async fn run_worker_with_manager(
         credentials.clone(),
         registration,
         forwarder,
+        heartbeat_interval,
     );
     let self_fence_fut = start_self_fence_watchdog(task_manager.clone(), last_successful_heartbeat);
     let checks_fut = start_node_checks(
@@ -277,11 +318,15 @@ async fn run_worker_with_manager(
         credentials,
     );
     let log_maintenance_fut = start_log_maintenance(task_manager.clone());
+    // Notices task processes exiting, reaps them, and applies each task's
+    // `restart` policy (see docs/task-supervision.md).
+    let supervisor_fut = start_task_supervisor(task_manager.clone());
     let _res = join!(
         heartbeat_fut,
         self_fence_fut,
         checks_fut,
         log_maintenance_fut,
+        supervisor_fut,
         worker_server_fut
     );
 
@@ -289,7 +334,7 @@ async fn run_worker_with_manager(
 }
 
 #[instrument(err, skip_all)]
-async fn connect_manager_with_retry(manager_addr: &str) -> R<ManagerClient<Channel>> {
+pub(crate) async fn connect_manager_with_retry(manager_addr: &str) -> R<ManagerClient<Channel>> {
     let mut backoff = Duration::from_millis(200);
     let max_backoff = Duration::from_secs(5);
 
@@ -306,6 +351,36 @@ async fn connect_manager_with_retry(manager_addr: &str) -> R<ManagerClient<Chann
                 backoff = std::cmp::min(backoff * 2, max_backoff);
             }
         }
+    }
+}
+
+/// Publishes the worker's `resourceEnforcement` settings into the environment
+/// the task runtimes read (see `docs/task-supervision.md`). An empty or
+/// unparseable payload leaves enforcement off, which is the default and the
+/// behavior every worker had before this existed.
+fn apply_resource_enforcement_env(raw: &str) {
+    let config = if raw.trim().is_empty() {
+        crate::structs::WorkerResourceEnforcementConfig::default()
+    } else {
+        match serde_json::from_str::<crate::structs::WorkerResourceEnforcementConfig>(raw) {
+            Ok(config) => config,
+            Err(err) => {
+                warn!(error = ?err, "Invalid worker resourceEnforcement config; enforcement off");
+                crate::structs::WorkerResourceEnforcementConfig::default()
+            }
+        }
+    };
+
+    if config.enabled {
+        info!(
+            cgroup_parent = %config.cgroup_parent,
+            "Resource enforcement enabled: exec tasks run in worker-owned cgroups"
+        );
+        std::env::set_var(crate::constants::ENV_RESOURCE_ENFORCEMENT, "1");
+        std::env::set_var(crate::constants::ENV_CGROUP_PARENT, &config.cgroup_parent);
+    } else {
+        std::env::remove_var(crate::constants::ENV_RESOURCE_ENFORCEMENT);
+        std::env::remove_var(crate::constants::ENV_CGROUP_PARENT);
     }
 }
 
@@ -391,6 +466,33 @@ async fn create_manager_client(
 // promptly — the self-fence clock keeps running regardless.
 const HEARTBEAT_RETRY_MIN: Duration = Duration::from_millis(500);
 const HEARTBEAT_RETRY_MAX: Duration = Duration::from_secs(10);
+
+/// Heartbeat cadence: worker-type config (`heartbeatSeconds`, clamped to
+/// 1..=30) or the built-in default. The manager's lost window stays 10s,
+/// so intervals above ~3s trade detection margin for load — the manager
+/// warns when serving such a config (docs/architecture-managers-workers.md).
+/// Shared with the simulated-fleet mode (`worker::simulate`), whose
+/// fairness contract is "same cadence resolution as a real worker".
+pub(crate) fn heartbeat_interval_for(config: &WorkerConfig) -> Duration {
+    Duration::from_secs(
+        config
+            .heartbeat_seconds
+            .map(|seconds| u64::from(seconds).clamp(1, 30))
+            .unwrap_or(WORKER_HEARTBEAT_DURATION_SEC),
+    )
+}
+
+/// The heartbeat sleep, jittered ±10% so a fleet that (re)started together
+/// does not stay phase-locked forever — 10k workers heartbeating in the
+/// same instant is a self-inflicted thundering herd (heartbeat-scale plan
+/// §5). Also what lets the manager-side heartbeat group commit form
+/// batches from *steady-state* arrivals rather than only from bursts.
+/// Shared with the simulated-fleet mode for the same fairness reason.
+pub(crate) fn jittered_heartbeat_interval(interval: Duration) -> Duration {
+    use rand::Rng;
+    let jitter = rand::thread_rng().gen_range(0.9..=1.1);
+    interval.mul_f64(jitter)
+}
 // How often the self-fence watchdog re-checks `last_successful_heartbeat`
 // against each running allocation's window.
 const SELF_FENCE_CHECK_INTERVAL: Duration = Duration::from_secs(1);
@@ -414,11 +516,13 @@ async fn start_heartbeats(
     credentials: Arc<WorkerCredentials>,
     registration: RegistrationPayload,
     forwarder: Arc<UpstreamForwarder>,
+    heartbeat_interval: Duration,
 ) -> R<()> {
     let mut backoff = HEARTBEAT_RETRY_MIN;
 
     loop {
-        match heartbeat_tick(
+        let tick_started = std::time::Instant::now();
+        let tick_result = heartbeat_tick(
             &name,
             &client,
             &task_manager,
@@ -426,17 +530,29 @@ async fn start_heartbeats(
             &credentials,
             &forwarder,
         )
-        .await
-        {
+        .await;
+        let worker_metrics = crate::manager::telemetry::worker_metrics();
+        worker_metrics
+            .heartbeat_duration_seconds
+            .observe(tick_started.elapsed().as_secs_f64());
+        worker_metrics.heartbeats_total.inc(&[match &tick_result {
+            Ok(()) => "ok",
+            Err(err)
+                if err
+                    .downcast_ref::<tonic::Status>()
+                    .is_some_and(|status| status.code() == tonic::Code::Unauthenticated) =>
+            {
+                "unauthenticated"
+            }
+            Err(_) => "error",
+        }]);
+        match tick_result {
             Ok(()) => {
                 *last_successful_heartbeat
                     .lock()
                     .expect("heartbeat clock lock") = std::time::Instant::now();
                 backoff = HEARTBEAT_RETRY_MIN;
-                tokio::time::sleep(tokio::time::Duration::from_secs(
-                    WORKER_HEARTBEAT_DURATION_SEC,
-                ))
-                .await;
+                tokio::time::sleep(jittered_heartbeat_interval(heartbeat_interval)).await;
             }
             // The node token can be revoked/rotated (for example ACLs were
             // just enabled, or the manager state was reset). Re-register with
@@ -481,7 +597,7 @@ async fn heartbeat_tick(
 
     {
         let start = std::time::Instant::now();
-        let (allocations, failures, allocation_health, volume_reports) = {
+        let (allocations, failures, terminations, allocation_health, volume_reports) = {
             let mut manager = task_manager.lock().expect("task manager");
             let failures = manager
                 .drain_failures()
@@ -492,18 +608,31 @@ async fn heartbeat_tick(
                     artifact_states: failure.artifact_states,
                 })
                 .collect::<Vec<_>>();
+            let terminations = manager.drain_terminations();
             let allocation_health = manager.allocation_health_snapshot();
             let volume_reports = manager.drain_volume_reports();
             (
                 manager.allocations_snapshot(),
                 failures,
+                terminations,
                 allocation_health,
                 volume_reports,
             )
         };
         let running = allocations.clone();
         let failures_for_redrive = failures.clone();
+        let terminations_for_redrive = terminations.clone();
         let volume_reports_for_redrive = volume_reports.clone();
+
+        let worker_metrics = crate::manager::telemetry::worker_metrics();
+        worker_metrics
+            .allocations_running
+            .set(allocations.len() as i64);
+        if !failures.is_empty() {
+            worker_metrics
+                .allocation_failures_reported_total
+                .add(failures.len() as u64);
+        }
 
         let req = credentials.attach(tonic::Request::new(HeartbeatRequest {
             id: name.to_string(),
@@ -511,6 +640,16 @@ async fn heartbeat_tick(
             failed_allocations: failures,
             allocation_health,
             volume_reports,
+            terminated_allocations: terminations
+                .into_iter()
+                .map(|report| crate::structs::TerminatedAllocation {
+                    allocation_id: report.allocation_id,
+                    success: report.success,
+                    exit_code: report.exit_code,
+                    signal: report.signal,
+                    message: report.message,
+                })
+                .collect(),
         }));
 
         let response = match client_clone.heartbeat(req).await {
@@ -523,6 +662,9 @@ async fn heartbeat_tick(
                 for failure in failures_for_redrive {
                     manager.record_failure(failure.allocation_id, failure.reason);
                 }
+                // Same for terminal outcomes: a batch task's completion lost
+                // to a dead connection would leave the job "running" forever.
+                manager.requeue_terminations(terminations_for_redrive);
                 // Same for volume outcomes: a destroy confirmation lost to a
                 // dead connection would leave the manager re-dispatching a
                 // reclaim forever.
@@ -586,10 +728,27 @@ async fn heartbeat_tick(
             }
             desired.retain(|allocation| !failed_prepare.contains(&allocation.allocation_id));
 
-            let new_allocations = task_manager
-                .lock()
-                .expect("task manager")
-                .reconcile_allocations(&desired);
+            // Why the manager is stopping things, delivered before the
+            // reconcile that acts on it: `reconcile_allocations` consumes
+            // these as it stops each undesired allocation, so a notice that
+            // landed after the reconcile would describe a stop that already
+            // happened.
+            let stop_causes = reply
+                .stop_notices
+                .iter()
+                .map(|notice| {
+                    (
+                        notice.allocation_id,
+                        crate::structs::StopCause::from_wire(&notice.cause),
+                    )
+                })
+                .collect();
+
+            let new_allocations = {
+                let mut manager = task_manager.lock().expect("task manager");
+                manager.set_stop_causes(stop_causes);
+                manager.reconcile_allocations(&desired)
+            };
             if !new_allocations.is_empty() {
                 // Refresh loops are keyed by allocation id and start slightly
                 // before the task process registers (the launch below is
@@ -913,6 +1072,7 @@ mod tests {
                 health_checks: "[]".into(),
             },
             Arc::new(UpstreamForwarder::new()),
+            Duration::from_secs(WORKER_HEARTBEAT_DURATION_SEC),
         ));
 
         // Long enough for several failed attempts (first retry after 500ms).
@@ -1108,6 +1268,7 @@ mod tests {
             message: "ack".into(),
             desired_allocations: vec![connect_allocation(11, "db", local_port)],
             volume_destroy: Vec::new(),
+            stop_notices: Vec::new(),
             upstream_endpoints: vec![UpstreamEndpoints {
                 allocation_id: 11,
                 service: "db".into(),

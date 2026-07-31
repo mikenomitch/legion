@@ -144,7 +144,12 @@ an `afterId` cursor so no events are missed across disconnects.
 
 - `Homepage.tsx`: ledger cards and active rollout summary.
 - `Nodes.tsx`: node inventory, attributes, resource usage visualization, allocation summaries.
-- `Jobs.tsx`: job list + on-demand spec retrieval. The job detail view
+- `Jobs.tsx`: job list + on-demand spec retrieval. The shared "Updated" column
+  shows `Job.updated_at` — the job record's mtime, which moves on spec
+  submissions and status transitions but *not* on allocation churn (see
+  [Job Timestamps](jobs-tasks-and-scheduling.md#job-timestamps-created_at-and-updated_at)).
+  Sorted newest-change-first by default, matching Rollouts, Templates, and
+  Manager. The job detail view
   (`pages/details/JobDetail.tsx`) marks stateful tasks with a
   "stateful · slot/keyed" badge (plus storage path) and, for jobs with
   stateful tasks or live `ListInstances` rows, renders a polled read-only
@@ -288,10 +293,16 @@ The UI includes a dedicated **Raft** page under Cluster navigation for manager r
 ## Exec & Actions (interactive terminal)
 
 The task detail page (`pages/details/JobDetail.tsx` → `TaskDetail.tsx`) has an
-**Exec & Actions** section listing the job's running allocations (from
-`GetLedger`). Each allocation gets an `AllocationExecPanel` with a command
-launcher (interactive-tty toggle) and, for tasks that declare them, action
-forms generated from the parameter schema (`ListJobActions`).
+**Exec & Actions** section listing **this task's** running allocations: the
+job's allocations from `GetLedger`, narrowed to the ones whose task is the page's
+task. The ledger carries only `task_config_id`, so the task name comes from the
+state-store lookup that also carries allocation health; a token without
+`state:read` cannot make that mapping, and the section then falls back to listing
+every running allocation of the job (the manager still rejects an exec whose
+allocation runs a different task). Each listed allocation gets an
+`AllocationExecPanel` with a command launcher (interactive-tty toggle) and, for
+tasks that declare them, action forms generated from the parameter schema
+(`ListJobActions`, filtered to this task).
 
 Unlike the rest of the UI, exec does **not** use gRPC-Web — browsers cannot do
 bidirectional streaming over it. `src/lib/execSocket.ts` opens a **WebSocket**

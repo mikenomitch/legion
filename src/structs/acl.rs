@@ -39,6 +39,12 @@ pub enum AclResource {
     /// versions and deletes them. Submitting a job *through* a template is
     /// gated separately, by a `job` rule carrying the `templates` selector.
     Template,
+    /// Task count overrides (`legion job scale`, docs/autoscaling.md):
+    /// `read` inspects scale status, `write` sets/resets overrides.
+    /// Deliberately separate from `job` so a principal (an autoscaler, a
+    /// teammate) can resize a job without the right to redeploy it. Scope
+    /// with the job-name selector, like `job` rules.
+    Scale,
 }
 
 impl AclResource {
@@ -53,12 +59,13 @@ impl AclResource {
             AclResource::Exec => "exec",
             AclResource::Action => "action",
             AclResource::Template => "template",
+            AclResource::Scale => "scale",
         }
     }
 
     pub fn all() -> &'static [&'static str] {
         &[
-            "job", "node", "kv", "state", "operator", "acl", "exec", "action", "template",
+            "job", "node", "kv", "state", "operator", "acl", "exec", "action", "template", "scale",
         ]
     }
 }
@@ -87,7 +94,7 @@ impl AclAction {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AclRule {
     /// Resource types: `job`, `node`, `kv`, `state`, `operator`, `acl`,
-    /// `exec`, `action`, `template`, `*`.
+    /// `exec`, `action`, `template`, `scale`, `*`.
     pub resources: Vec<String>,
     /// Actions: `read`, `write`, `*`.
     pub actions: Vec<String>,

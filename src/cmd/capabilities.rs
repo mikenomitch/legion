@@ -122,6 +122,22 @@ pub fn catalog() -> Vec<Capability> {
             read_only_safe: false,
         },
         Capability {
+            name: "job.scale",
+            cli: "legion job scale <NAME> [--count N | --reset]",
+            grpc: Some("Manager/ScaleTask"),
+            summary: "Change a task's count without a new job version or rollout (docs/autoscaling.md). Supports --idempotency-key.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "job.scale-status",
+            cli: "legion job scale <NAME>",
+            grpc: Some("Manager/GetJobScaleStatus"),
+            summary: "Per-task spec vs override vs effective counts for a job.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
             name: "job.destroy",
             cli: "legion job destroy <NAME>",
             grpc: Some("Manager/DestroyJob"),

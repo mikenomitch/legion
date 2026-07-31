@@ -423,6 +423,25 @@ impl ResourcePool {
         allocations: &[Allocation],
         policy: &ResourcePolicy,
     ) -> ResourcePool {
+        Self::free_from_rows(
+            node,
+            allocations
+                .iter()
+                .map(|allocation| (allocation.id, &allocation.resources)),
+            policy,
+        )
+    }
+
+    /// Same subtraction as [`ResourcePool::free_for_node`], from bare
+    /// `(allocation id, resources)` rows. The plan-apply transaction uses
+    /// this to rebuild a placement node's free pool from the rows the
+    /// transaction itself can see, without materializing full
+    /// [`Allocation`] values.
+    pub(crate) fn free_from_rows<'a>(
+        node: &Node,
+        allocation_resources: impl IntoIterator<Item = (i64, &'a Value)>,
+        policy: &ResourcePolicy,
+    ) -> ResourcePool {
         let empty = || ResourcePool {
             values: HashMap::new(),
         };
@@ -437,16 +456,16 @@ impl ResourcePool {
                 return empty();
             }
         };
-        for allocation in allocations {
+        for (allocation_id, resources) in allocation_resources {
             let usage = policy
-                .normalize_task_resources(&allocation.resources, false)
+                .normalize_task_resources(resources, false)
                 .and_then(|normalized| ResourceRequest::from_value(&normalized));
             match usage {
                 Ok(request) => pool.apply_usage(&request),
                 Err(error) => {
                     warn!(
                         node_id = %node.id,
-                        allocation_id = allocation.id,
+                        allocation_id,
                         %error,
                         "Allocation resources failed to parse; node will fit no tasks until corrected"
                     );

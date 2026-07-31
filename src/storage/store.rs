@@ -1,9 +1,12 @@
 // A few low-level persistence helpers take many columns by parameter.
 #![allow(clippy::too_many_arguments)]
 
+use crate::constants::{
+    ALLOCATION_STATUS_COMPLETE, ALLOCATION_STATUS_FAILED, STOP_NOTICE_RETENTION_SECS,
+};
 use crate::constraints::{ConstraintSet, DistinctTracker, PermitSet};
 use crate::prelude::*;
-use crate::resources::{ResourcePolicy, ResourcePool};
+use crate::resources::{ResourcePolicy, ResourcePool, ResourceRequest};
 use crate::scheduling_index::{IndexSet, IndexSettings};
 use crate::storage::errors::StorageError;
 use crate::storage::events::{drafts, EventDraft, SchedulerEventFilter, SchedulerEventRecord};
@@ -30,9 +33,9 @@ use crate::structs::{
     slot_instance_id, Allocation, AllocationHealth, Eval, Instance, InstanceMode, InstanceState,
     Job, JobConfig, JobTemplateProvenance, KvEntry, KvLock, KvValueType, LedgerEntry,
     ManagerConfigFull, ManagerNodeConfig, Node, NodeMsg, ReplaceAfter, ResolvedOnLostPolicy,
-    Rollout, RolloutConfig, SigningKeyRecord, StatefulConfig, StatefulOnLostConfig, Submission,
-    TaskCheck, TaskConfig, TaskCount, TaskDependency, TaskLifecycle, TaskOnUnhealthyConfig,
-    TaskSchedule, TaskStatusState, Volume, WorkerConfig,
+    Rollout, RolloutConfig, SigningKeyRecord, StatefulConfig, StatefulOnLostConfig, StopCause,
+    Submission, TaskCheck, TaskConfig, TaskCount, TaskDependency, TaskLifecycle,
+    TaskOnUnhealthyConfig, TaskSchedule, TaskStatusState, Volume, WorkerConfig,
 };
 use crate::util::random_string;
 
@@ -129,9 +132,11 @@ pub struct SchedulingReadModel {
     /// Free resource capacity per **available** node — fingerprinted
     /// capacity minus every current allocation's usage — recomputed for the
     /// affected node by the same reprojection pass that maintains
-    /// `indexes`. The plan-time `ResourceLedger` clones these instead of
-    /// re-parsing every node's JSON per plan.
-    pub(crate) node_pools: HashMap<String, ResourcePool>,
+    /// `indexes`. Values are `Arc`'d so the per-plan snapshot clone is a
+    /// refcount bump per node instead of a deep `ResourcePool` copy; the
+    /// plan-time `ResourceLedger` copies-on-write only the pools it
+    /// actually debits.
+    pub(crate) node_pools: HashMap<String, Arc<ResourcePool>>,
     /// Mirror of `allocation_epoch_partition`, keyed by
     /// `Store::scope_vector_key`, kept COHERENT with `allocations_by_node`
     /// (adversarial finding, 2026-07-28 — the plan-fence gap): an epoch
@@ -146,6 +151,28 @@ pub struct SchedulingReadModel {
     /// PUBLISHED after them), so a torn view can only make the CAS
     /// conservative (a spurious reject + retry), never permissive.
     pub scope_epochs: HashMap<String, i64>,
+    /// Publish counter for allocation-visible state: bumped (under the same
+    /// write lock) every time `allocations_by_node`/`scope_epochs` are
+    /// published — the per-scope refresh funnel, node removal, and full
+    /// model rebuilds (which carry the previous value forward, +1).
+    ///
+    /// This is what makes the LAZY optimistic-concurrency sample sound
+    /// (plan-path scale levers, D4): the scheduler reads `(capacity,
+    /// generation)` under one guard, plans, then reads `(epochs,
+    /// generation)` under one guard. An unchanged generation proves no
+    /// allocation publish happened in between, so the late epoch sample is
+    /// exactly what a pre-capacity sample would have returned — the "sample
+    /// no later than the capacity read" fence invariant holds. A moved
+    /// generation proves nothing either way, so the scheduler falls back to
+    /// the eager whole-fleet sample.
+    pub generation: u64,
+    /// The availability-filtered, id-sorted node list every plan starts
+    /// from, cached so a plan is a `Vec<Arc<Node>>` clone (refcount bumps)
+    /// instead of an O(fleet log fleet) filter + sort. Invalidated (set to
+    /// `None`) by every `nodes` mutation and rebuilt lazily on the next
+    /// plan, so churny fleets pay at most what they paid before this cache
+    /// existed.
+    pub(crate) available_nodes_cache: Option<Arc<Vec<Arc<Node>>>>,
 }
 
 #[derive(Debug)]
@@ -183,8 +210,14 @@ pub struct DeclaredService {
 }
 
 /// What [`Store::plan_capacity_snapshot`] hands the scheduler: current
-/// allocations by node plus the cached free pools, cloned under one guard.
-pub(crate) type PlanCapacityParts = (SharedNodeAllocations, HashMap<String, ResourcePool>);
+/// allocations by node plus the cached free pools, cloned under one guard,
+/// and the read-model generation those were published at (the lazy
+/// version-sample fence — see [`SchedulingReadModel::generation`]).
+pub(crate) type PlanCapacityParts = (
+    SharedNodeAllocations,
+    HashMap<String, Arc<ResourcePool>>,
+    u64,
+);
 
 #[derive(Debug, Clone)]
 pub struct PlanSubmission {
@@ -214,6 +247,28 @@ pub struct AppliedPlan {
     pub candidate_ranks: Vec<usize>,
 }
 
+/// One task's count override (`legion job scale`, docs/autoscaling.md),
+/// keyed by the version-stable task tuple so it survives resubmits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskScale {
+    pub job_id: String,
+    pub task_group: String,
+    pub task_name: String,
+    /// The applied override; `None` while only a pending scale-in exists.
+    pub count: Option<u32>,
+    /// A scale-in recorded during an active rollout, promoted into `count`
+    /// when the rollout reaches a terminal status.
+    pub pending_count: Option<u32>,
+    /// The spec count the override was laid over — the resubmit-ownership
+    /// arbiter (see `handle_job_submit_apply`).
+    pub base_count: u32,
+    /// `operator` today; `autoscaler` when the policy evaluator ships.
+    pub source: String,
+    pub reason: String,
+    pub principal: String,
+    pub updated_at: String,
+}
+
 #[derive(Debug, Clone)]
 pub enum PlanApplyOutcome {
     Applied(AppliedPlan),
@@ -222,6 +277,40 @@ pub enum PlanApplyOutcome {
         latest_versions: BTreeMap<String, i64>,
     },
 }
+
+/// One scheduler plan queued for the plan-apply group commit (D5): the
+/// arguments of [`Store::submit_and_apply_plan`], owned so a batch leader
+/// can carry them across threads.
+#[derive(Debug, Clone)]
+struct PlanApplyRequest {
+    job_config_id: String,
+    mode: String,
+    placements: PlanPlacements,
+    expected_versions: BTreeMap<String, i64>,
+}
+
+/// The two plan-submission shapes, so both take the same group-commit path
+/// (docs/late-binding-plan-apply.md): format 1 is one node per placement,
+/// format 2 a ranked candidate list the apply walk binds late.
+#[derive(Debug, Clone)]
+enum PlanPlacements {
+    Nodes(Vec<(String, i64)>),
+    Candidates(Vec<PlanSubmissionPlacement>),
+}
+
+impl PlanPlacements {
+    /// The `plan_submission.placements` JSON for this shape.
+    fn to_json(&self) -> R<String> {
+        match self {
+            PlanPlacements::Nodes(placements) => Ok(serde_json::to_string(placements)?),
+            PlanPlacements::Candidates(placements) => Ok(serde_json::to_string(
+                &serde_json::json!({ "format": 2, "placements": placements }),
+            )?),
+        }
+    }
+}
+
+type PlanApplyReply = (PlanSubmission, PlanApplyOutcome);
 
 #[derive(Debug, Clone)]
 pub struct Store {
@@ -268,6 +357,16 @@ pub struct Store {
     // (empty) observation window, which is exactly the protection.
     node_health_orphan_candidates: Arc<std::sync::Mutex<HashSet<String>>>,
     allocation_health_orphan_candidates: Arc<std::sync::Mutex<HashSet<i64>>>,
+    // Plan-apply group commit (plan-path scale levers, D5): concurrent
+    // submit_and_apply_plan callers coalesce into one replicated op — one
+    // capture → one raft propose/quorum round for the whole batch — with
+    // per-plan savepoint isolation inside. Shared across clones so every
+    // eval worker feeds the same queue.
+    plan_coalescer: Arc<crate::storage::coalesce::Coalescer<PlanApplyRequest, PlanApplyReply>>,
+    // Heartbeat group commit (heartbeat-scale plan §2): concurrent
+    // update_node_heartbeat callers coalesce into one status-lane op
+    // stamping every batched node id.
+    heartbeat_coalescer: Arc<crate::storage::coalesce::Coalescer<String, ()>>,
 }
 
 /// Result of [`Store::state_backup`]: where the backup landed, its size,
@@ -498,6 +597,10 @@ const EVENT_BROADCAST_CAPACITY: usize = 1_024;
 const EVENT_RETAINED_ROWS: i64 = 10_000;
 // Prune once every N inserts to keep the hot emit path cheap.
 const EVENT_PRUNE_INTERVAL: i64 = 256;
+// Heartbeats coalescing into one status-lane commit are capped per batch
+// (heartbeat-scale plan §2): 128 single-row upserts is a small changeset,
+// and the cap bounds both the IN-list and the raft entry size.
+const HEARTBEAT_BATCH_MAX: usize = 128;
 // Middle bits of a scheduler_event id carrying the per-process sequence:
 // the high bits carry unix milliseconds and the low `Lane::ID_STRIDE_BITS`
 // carry the minting lane's residue (see `next_scheduler_event_id`).
@@ -559,6 +662,12 @@ impl Store {
             durable_sync: raft_enabled,
             node_health_orphan_candidates: Arc::new(std::sync::Mutex::new(HashSet::new())),
             allocation_health_orphan_candidates: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            plan_coalescer: Arc::new(crate::storage::coalesce::Coalescer::new(
+                Self::plan_apply_batch_max(config.scheduler_settings.as_ref()),
+            )),
+            heartbeat_coalescer: Arc::new(crate::storage::coalesce::Coalescer::new(
+                HEARTBEAT_BATCH_MAX,
+            )),
         };
 
         store.refresh_read_model()?;
@@ -1526,7 +1635,7 @@ impl Store {
 
         let mut task_stmt = conn.prepare(
             r#"
-            SELECT id, name, runtime, count, count_per, group_name, lifecycle, schedule, depends_on, config, resources, constraints, permit, affinities, checks, on_unhealthy, kv_injections, job_config_id, identities, stateful, artifacts, network, service, actions, volumes, connect
+            SELECT id, name, runtime, count, count_per, group_name, lifecycle, schedule, depends_on, config, resources, constraints, permit, affinities, checks, on_unhealthy, kv_injections, job_config_id, identities, stateful, artifacts, network, service, actions, volumes, connect, restart
             FROM task_config;
             "#,
         )?;
@@ -1565,6 +1674,7 @@ impl Store {
                 actions: self.parse_actions_column(23, row.get(23)?)?,
                 volumes: self.parse_volumes_column(24, row.get(24)?)?,
                 connect: parse_json_column(25, row.get(25)?)?,
+                restart: parse_json_column(26, row.get(26)?)?,
             };
             let job_config_id: String = row.get(17)?;
             Ok((job_config_id, id, task))
@@ -1605,6 +1715,10 @@ impl Store {
             indexes: IndexSet::new(Arc::clone(&self.index_settings)),
             node_pools: HashMap::new(),
             scope_epochs,
+            // Placeholder: `refresh_read_model` overwrites this with the
+            // previous model's counter + 1 when it publishes the rebuild.
+            generation: 0,
+            available_nodes_cache: None,
         };
         let id_refs: Vec<&str> = node_ids.iter().map(String::as_str).collect();
         Self::reproject_model_nodes(&mut model, &self.resource_policy, &id_refs);
@@ -1638,7 +1752,9 @@ impl Store {
                         .unwrap_or(&[]);
                     let pool = ResourcePool::free_for_node(node, allocations, policy);
                     model.indexes.reindex_node(node, &pool);
-                    model.node_pools.insert((*node_id).to_string(), pool);
+                    model
+                        .node_pools
+                        .insert((*node_id).to_string(), Arc::new(pool));
                 }
                 _ => {
                     model.node_pools.remove(*node_id);
@@ -1660,7 +1776,12 @@ impl Store {
         }
         let model = self.load_read_model()?;
         let mut guard = self.read_model_writer()?;
+        // A full rebuild is an allocation publish like any other: carry the
+        // counter forward (+1) so a plan spanning the rebuild falls back to
+        // the eager sample instead of trusting a pre-rebuild capacity read.
+        let next_generation = guard.generation.wrapping_add(1);
         *guard = model;
+        guard.generation = next_generation;
         Ok(())
     }
 
@@ -1680,6 +1801,7 @@ impl Store {
         let mut guard = self.read_model_writer()?;
         let node_id = node.id.clone();
         guard.nodes.insert(node_id.clone(), Arc::new(node));
+        guard.available_nodes_cache = None;
         Self::reproject_model_nodes(&mut guard, &self.resource_policy, &[node_id.as_str()]);
         Ok(())
     }
@@ -1694,6 +1816,7 @@ impl Store {
             .get_mut(node_id)
             .with_context(|| format!("Missing cached node {node_id}"))?;
         Arc::make_mut(cached).dynamic_attrs = dynamic_attrs;
+        guard.available_nodes_cache = None;
         Self::reproject_model_nodes(&mut guard, &self.resource_policy, &[node_id]);
         Ok(())
     }
@@ -1710,6 +1833,7 @@ impl Store {
                 node.availability = "unavailable".to_string();
             }
         }
+        guard.available_nodes_cache = None;
         let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
         Self::reproject_model_nodes(&mut guard, &self.resource_policy, &id_refs);
         Ok(())
@@ -1724,6 +1848,9 @@ impl Store {
         guard.allocations_by_node.remove(id);
         guard.indexes.remove_node(id);
         guard.node_pools.remove(id);
+        guard.available_nodes_cache = None;
+        // Removing a node removes its allocations from the capacity view.
+        guard.generation = guard.generation.wrapping_add(1);
         Ok(())
     }
 
@@ -1777,6 +1904,10 @@ impl Store {
         for (key, epoch) in epochs {
             guard.scope_epochs.insert(key, epoch);
         }
+        // Every allocation/epoch publish funnels through here; the bump is
+        // what lets in-flight lazy-sample plans detect this publish (see
+        // `SchedulingReadModel::generation`).
+        guard.generation = guard.generation.wrapping_add(1);
         let affected: Vec<&str> = node_ids.iter().map(String::as_str).collect();
         Self::reproject_model_nodes(&mut guard, &self.resource_policy, &affected);
         Ok(())
@@ -1870,43 +2001,72 @@ impl Store {
     }
 
     /// The scheduler's per-plan node snapshot: every available node, sorted
-    /// by id, as `Arc`s — one read-lock pass, refcount bumps only.
+    /// by id, as `Arc`s. Served from the read model's cached list when the
+    /// node set is unchanged since the last plan (the overwhelmingly common
+    /// case — one `Vec` of refcount bumps); rebuilt lazily after any node
+    /// mutation invalidates it.
     pub fn available_node_arcs(&self) -> R<Vec<Arc<Node>>> {
-        let guard = self.read_model_reader()?;
-        let mut nodes: Vec<Arc<Node>> = guard
-            .nodes
-            .values()
-            .filter(|node| node.availability == "available")
-            .cloned()
-            .collect();
-        nodes.sort_by(|a, b| a.id.cmp(&b.id));
-        Ok(nodes)
+        {
+            let guard = self.read_model_reader()?;
+            if let Some(cache) = guard.available_nodes_cache.as_ref() {
+                return Ok(Vec::clone(cache));
+            }
+        }
+        let mut guard = self.read_model_writer()?;
+        // Re-check: another plan may have rebuilt it while we waited.
+        if guard.available_nodes_cache.is_none() {
+            let mut nodes: Vec<Arc<Node>> = guard
+                .nodes
+                .values()
+                .filter(|node| node.availability == "available")
+                .cloned()
+                .collect();
+            nodes.sort_by(|a, b| a.id.cmp(&b.id));
+            guard.available_nodes_cache = Some(Arc::new(nodes));
+        }
+        Ok(Vec::clone(
+            guard
+                .available_nodes_cache
+                .as_ref()
+                .expect("cache rebuilt above"),
+        ))
     }
 
     /// The scheduler's per-plan capacity snapshot: current allocations and
     /// the cached free pools, cloned under ONE read guard so they can never
-    /// disagree with each other. Taken after the plan's epoch sample (the
-    /// fence rule: sample no later than the capacity read), so any mutation
-    /// that lands after this snapshot bumps an epoch the apply-time
-    /// compare-and-set checks.
+    /// disagree with each other, plus the generation they were published at.
+    ///
+    /// The fence rule is "epoch sample no later than the capacity read".
+    /// The eager path satisfies it by sampling before calling this; the
+    /// lazy path satisfies it retroactively — it samples *after* planning
+    /// via [`Store::expected_versions_if_unchanged`], which only returns a
+    /// sample if the generation still equals the one returned here (proving
+    /// the late sample equals a pre-capacity one).
     pub(crate) fn plan_capacity_snapshot(&self) -> R<PlanCapacityParts> {
         let guard = self.read_model_reader()?;
-        Ok((guard.allocations_by_node.clone(), guard.node_pools.clone()))
+        Ok((
+            guard.allocations_by_node.clone(),
+            guard.node_pools.clone(),
+            guard.generation,
+        ))
     }
 
     /// Runs one scheduling-index candidate query under the read-model lock
     /// (docs/scheduling-indexes.md). Cheap: index selection plus one shard
-    /// walk; the caller re-verifies every returned candidate.
+    /// walk; the caller re-verifies every returned candidate. `ordered:
+    /// false` skips the shard's nearest-fit cell sort for callers that
+    /// re-order the candidates themselves (the untruncated scheduler path).
     pub fn scheduling_index_query(
         &self,
         bindings: &HashMap<String, Value>,
         request: &HashMap<String, f64>,
         budget: Option<usize>,
+        ordered: bool,
     ) -> R<crate::scheduling_index::IndexQueryOutcome> {
         Ok(self
             .read_model_reader()?
             .indexes
-            .query(bindings, request, budget))
+            .query_with_order(bindings, request, budget, ordered))
     }
 
     pub fn allocation_epoch_for_job_config(&self, job_config_id: &str) -> R<i64> {
@@ -1989,6 +2149,51 @@ impl Store {
             versions.insert(key, epoch);
         }
         Ok(versions)
+    }
+
+    /// The LAZY optimistic-concurrency sample (plan-path scale levers, D4):
+    /// epochs for exactly the scopes a finished plan touches — job config
+    /// plus affected nodes — instead of the whole candidate fleet.
+    ///
+    /// Sampling *after* planning is only sound if nothing was published
+    /// between the capacity read the plan was built against and this
+    /// sample; the generation check proves exactly that (both reads happen
+    /// under the read-model guard, and every publish bumps the counter
+    /// under the write guard — see [`SchedulingReadModel::generation`]).
+    /// Returns `None` when the generation moved: the caller must fall back
+    /// to the eager pre-planning sample
+    /// ([`Self::allocation_version_vector_for_candidates`]) and re-plan.
+    ///
+    /// Missing mirror entries sample `0` with the same conservative
+    /// semantics as the eager path.
+    pub fn expected_versions_if_unchanged(
+        &self,
+        job_config_id: &str,
+        affected_nodes: &HashSet<String>,
+        generation: u64,
+    ) -> R<Option<BTreeMap<String, i64>>> {
+        let guard = self.read_model_reader()?;
+        if guard.generation != generation {
+            return Ok(None);
+        }
+        let mut versions = BTreeMap::new();
+        let job_key = Self::scope_vector_key("job_config", job_config_id);
+        versions.insert(
+            job_key.clone(),
+            guard.scope_epochs.get(&job_key).copied().unwrap_or(0),
+        );
+        for node_id in affected_nodes {
+            let key = Self::scope_vector_key("node", node_id);
+            let epoch = guard.scope_epochs.get(&key).copied().unwrap_or(0);
+            versions.insert(key, epoch);
+        }
+        Ok(Some(versions))
+    }
+
+    /// Current read-model generation (see
+    /// [`SchedulingReadModel::generation`]).
+    pub fn read_model_generation(&self) -> R<u64> {
+        Ok(self.read_model_reader()?.generation)
     }
 
     fn allocation_epoch_for_scope(&self, scope_type: &str, scope_id: &str) -> R<i64> {
@@ -2200,6 +2405,14 @@ impl Store {
     /// ms per plan in the 2026-07-29 backend matrix
     /// (`benchmarks/scheduler/README.md`). The two-step API below stays
     /// for callers that genuinely stage submissions.
+    ///
+    /// Concurrent callers additionally GROUP-COMMIT (plan-path scale
+    /// levers, D5): plans queued while a commit is in flight batch into
+    /// one replicated op — one capture, one raft propose/quorum round for
+    /// the whole batch — with each plan keeping its own epoch-CAS verdict
+    /// inside a per-plan savepoint. A lone caller takes the single-plan
+    /// path unchanged. `schedulerSettings.plan_apply_coalescing: false`
+    /// disables the batching.
     pub fn submit_and_apply_plan(
         &self,
         job_config_id: &str,
@@ -2207,31 +2420,181 @@ impl Store {
         placements: &[(String, i64)],
         expected_versions: &BTreeMap<String, i64>,
     ) -> R<(PlanSubmission, PlanApplyOutcome)> {
-        let job_config_id = job_config_id.to_owned();
-        let mode = mode.to_owned();
-        let placements = placements.to_vec();
-        let expected_versions = expected_versions.clone();
-        let (submission, outcome) =
-            self.replicated(Lane::Scheduler, "submit_and_apply_plan", move |s| {
-                s.submit_and_apply_plan_apply(
-                    &job_config_id,
-                    &mode,
-                    &placements,
-                    &expected_versions,
-                )
-            })?;
+        let request = PlanApplyRequest {
+            job_config_id: job_config_id.to_owned(),
+            mode: mode.to_owned(),
+            placements: PlanPlacements::Nodes(placements.to_vec()),
+            expected_versions: expected_versions.clone(),
+        };
+        let (submission, outcome) = if self.plan_apply_coalescing_enabled() {
+            let coalescer = Arc::clone(&self.plan_coalescer);
+            coalescer.submit(request, |batch| self.run_plan_apply_batch(batch))?
+        } else {
+            self.submit_and_apply_plan_replicated(request)?
+        };
         self.plan_apply_bookkeeping(&outcome)?;
         Ok((submission, outcome))
+    }
+
+    /// `schedulerSettings.plan_apply_coalescing` — default true.
+    fn plan_apply_coalescing_enabled(&self) -> bool {
+        self.scheduler_settings
+            .as_ref()
+            .and_then(|settings| settings.get("plan_apply_coalescing"))
+            .and_then(Value::as_bool)
+            .unwrap_or(true)
+    }
+
+    /// `schedulerSettings.plan_apply_batch_max` — default 16, clamped to
+    /// 1..=128. Caps how many plans one group commit may carry, bounding
+    /// the size of the replicated changeset (raft append-entries budget).
+    fn plan_apply_batch_max(settings: Option<&Value>) -> usize {
+        settings
+            .and_then(|settings| settings.get("plan_apply_batch_max"))
+            .and_then(Value::as_u64)
+            .map(|max| (max as usize).clamp(1, 128))
+            .unwrap_or(16)
+    }
+
+    /// The single-plan replicated op — the group commit's batch-of-one
+    /// fast path, its re-run-singly fallback, and the
+    /// `plan_apply_coalescing: false` path. Exactly the pre-D5 operation.
+    /// The two formats propose under their own op names — the raft log (and
+    /// the lane classification in `tests/raft_seam.rs`) says which walk ran.
+    fn submit_and_apply_plan_replicated(&self, request: PlanApplyRequest) -> R<PlanApplyReply> {
+        match request.placements {
+            PlanPlacements::Nodes(_) => {
+                self.replicated(Lane::Scheduler, "submit_and_apply_plan", move |s| {
+                    s.submit_and_apply_plan_apply(
+                        &request.job_config_id,
+                        &request.mode,
+                        &request.placements,
+                        &request.expected_versions,
+                    )
+                })
+            }
+            PlanPlacements::Candidates(_) => self.replicated(
+                Lane::Scheduler,
+                "submit_and_apply_plan_with_candidates",
+                move |s| {
+                    s.submit_and_apply_plan_with_candidates_apply(
+                        &request.job_config_id,
+                        &request.mode,
+                        &request.placements,
+                        &request.expected_versions,
+                    )
+                },
+            ),
+        }
+    }
+
+    /// One plan of either format, applied on the current connection: the
+    /// group commit's per-plan body.
+    fn apply_plan_request(&self, request: &PlanApplyRequest) -> R<PlanApplyReply> {
+        match request.placements {
+            PlanPlacements::Nodes(_) => self.submit_and_apply_plan_apply(
+                &request.job_config_id,
+                &request.mode,
+                &request.placements,
+                &request.expected_versions,
+            ),
+            PlanPlacements::Candidates(_) => self.submit_and_apply_plan_with_candidates_apply(
+                &request.job_config_id,
+                &request.mode,
+                &request.placements,
+                &request.expected_versions,
+            ),
+        }
+    }
+
+    /// Batch leader body for the plan-apply group commit: run every
+    /// drained plan inside ONE replicated op. Under raft this is one
+    /// capture → one propose → one quorum round → one apply transaction
+    /// for the whole batch; on local backends the plans run back-to-back
+    /// exactly as they would have serially (WAL-mode commits are not the
+    /// local cost, so no outer transaction is added — see the plan's
+    /// judgement calls).
+    ///
+    /// Failure isolation: under capture, each plan runs inside its own
+    /// savepoint, so a failing plan rolls back alone and cannot poison
+    /// batch-mates (epoch-CAS rejections are not failures — they commit a
+    /// `rejected` submission row exactly as the single-plan op does). If
+    /// the batch op itself fails (capture/propose machinery), nothing was
+    /// applied — the capture rolled back — so every plan re-runs singly
+    /// through the pre-D5 path; any plan the failed propose DID commit
+    /// (a lost-leadership race) is then rejected by its own epoch CAS,
+    /// never applied twice.
+    fn run_plan_apply_batch(&self, batch: Vec<PlanApplyRequest>) -> Vec<R<PlanApplyReply>> {
+        if batch.len() == 1 {
+            let request = batch.into_iter().next().expect("length checked");
+            return vec![self.submit_and_apply_plan_replicated(request)];
+        }
+
+        let rerun = batch.clone();
+        let batch_size = batch.len();
+        let batched = self.replicated(Lane::Scheduler, "submit_and_apply_plans", move |s| {
+            let isolate = capture::in_capture();
+            let mut results: Vec<R<PlanApplyReply>> = Vec::with_capacity(batch.len());
+            for request in &batch {
+                if isolate {
+                    // Savepoint-machinery errors abort the whole capture
+                    // (`?`): a leftover savepoint would corrupt the stack
+                    // for batch-mates, and a full rollback + re-run-singly
+                    // is the safe recovery.
+                    s.exec_on_write_conn("SAVEPOINT legion_plan_batch_item;")?;
+                    match s.apply_plan_request(request) {
+                        Ok(reply) => {
+                            s.exec_on_write_conn("RELEASE legion_plan_batch_item;")?;
+                            results.push(Ok(reply));
+                        }
+                        Err(err) => {
+                            s.exec_on_write_conn(
+                                "ROLLBACK TO legion_plan_batch_item; \
+                                 RELEASE legion_plan_batch_item;",
+                            )?;
+                            results.push(Err(err));
+                        }
+                    }
+                } else {
+                    results.push(s.apply_plan_request(request));
+                }
+            }
+            Ok(results)
+        });
+        match batched {
+            Ok(results) => results,
+            Err(batch_err) => {
+                warn!(
+                    batch = batch_size,
+                    error = %batch_err,
+                    "Batched plan apply failed before commit; re-running each plan singly"
+                );
+                rerun
+                    .into_iter()
+                    .map(|request| self.submit_and_apply_plan_replicated(request))
+                    .collect()
+            }
+        }
+    }
+
+    /// Run raw SQL on the write connection, acquiring and releasing the
+    /// connection lock for just this statement (savepoint control inside
+    /// batched ops, where holding a transaction handle across the
+    /// per-plan calls would deadlock their own `write_connection` locks).
+    fn exec_on_write_conn(&self, sql: &str) -> R<()> {
+        let conn = self.write_connection()?;
+        conn.execute_batch(sql)?;
+        Ok(())
     }
 
     fn submit_and_apply_plan_apply(
         &self,
         job_config_id: &str,
         mode: &str,
-        placements: &[(String, i64)],
+        placements: &PlanPlacements,
         expected_versions: &BTreeMap<String, i64>,
     ) -> R<(PlanSubmission, PlanApplyOutcome)> {
-        let placements_json = serde_json::to_string(placements)?;
+        let placements_json = placements.to_json()?;
         let submission = self.insert_plan_submission_apply(
             job_config_id,
             mode,
@@ -2261,45 +2624,33 @@ impl Store {
                 );
             }
         }
-        let job_config_id = job_config_id.to_owned();
-        let mode = mode.to_owned();
-        let placements = placements.to_vec();
-        let expected_versions = expected_versions.clone();
-        let (submission, outcome) = self.replicated(
-            Lane::Scheduler,
-            "submit_and_apply_plan_with_candidates",
-            move |s| {
-                s.submit_and_apply_plan_with_candidates_apply(
-                    &job_config_id,
-                    &mode,
-                    &placements,
-                    &expected_versions,
-                )
-            },
-        )?;
+        let request = PlanApplyRequest {
+            job_config_id: job_config_id.to_owned(),
+            mode: mode.to_owned(),
+            placements: PlanPlacements::Candidates(placements.to_vec()),
+            expected_versions: expected_versions.clone(),
+        };
+        let (submission, outcome) = if self.plan_apply_coalescing_enabled() {
+            let coalescer = Arc::clone(&self.plan_coalescer);
+            coalescer.submit(request, |batch| self.run_plan_apply_batch(batch))?
+        } else {
+            self.submit_and_apply_plan_replicated(request)?
+        };
         self.plan_apply_bookkeeping(&outcome)?;
         Ok((submission, outcome))
     }
 
+    /// [`Self::submit_and_apply_plan_apply`] under the format-2 op name: the
+    /// insert and the candidate walk are the same body — the submission's
+    /// serialized shape is what differs (docs/late-binding-plan-apply.md).
     fn submit_and_apply_plan_with_candidates_apply(
         &self,
         job_config_id: &str,
         mode: &str,
-        placements: &[PlanSubmissionPlacement],
+        placements: &PlanPlacements,
         expected_versions: &BTreeMap<String, i64>,
     ) -> R<(PlanSubmission, PlanApplyOutcome)> {
-        let placements_json = serde_json::to_string(&serde_json::json!({
-            "format": 2,
-            "placements": placements,
-        }))?;
-        let submission = self.insert_plan_submission_apply(
-            job_config_id,
-            mode,
-            &placements_json,
-            expected_versions,
-        )?;
-        let outcome = self.apply_plan_submission_apply(&submission)?;
-        Ok((submission, outcome))
+        self.submit_and_apply_plan_apply(job_config_id, mode, placements, expected_versions)
     }
 
     pub fn apply_plan_submission(&self, submission: &PlanSubmission) -> R<PlanApplyOutcome> {
@@ -2483,10 +2834,10 @@ impl Store {
             return reject(tx, reason);
         }
 
-        let placements_json: String = tx.query_row(
-            "SELECT placements FROM plan_submission WHERE id = ?1;",
+        let (placements_json, plan_mode): (String, String) = tx.query_row(
+            "SELECT placements, mode FROM plan_submission WHERE id = ?1;",
             [submission.id],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
         let placements = Self::parse_plan_submission_placements(&placements_json)?;
 
@@ -2499,9 +2850,33 @@ impl Store {
         let node_row_sql =
             format!("SELECT {NODE_JOINED_ATTRS} {NODE_JOINED_FROM} WHERE node.id = ?1;");
 
+        // Free pools are reconstructed INSIDE the apply transaction, from
+        // the fresh node row and the allocation rows this transaction can
+        // see (the same rows the read model projects — no status filter).
+        // This closes the last unfenced plan input (2026-07-28 adversarial
+        // pass): a worker re-registration that SHRINKS capacity — or
+        // changes `reservedResources` / `maxAllocations` — between the
+        // planner's snapshot and this apply bumps no allocation epoch, so
+        // the epoch checks structurally cannot see it, and without this
+        // recheck the plan commits placements exceeding the node's new
+        // totals. Ports were already apply-safe (re-read in
+        // `assign_allocation_network`); resources now match. Like the node
+        // rows, pools build lazily — a candidate the walk never attempts
+        // never pays for one.
+        //
+        // Mirror the planner's ledger view: a Fresh plan replaces the JOB's
+        // allocations wholesale, so `plan_and_apply` drops every allocation
+        // of the planned config's job before planning (`drop_replaced`) —
+        // `handle_job_submit` only deletes the previous config's rows after
+        // this apply, so those rows are still in the table here and must not
+        // be double counted. Reschedule plans drop nothing.
+        let drop_own = plan_mode == "fresh";
+        let mut free_pools: HashMap<String, ResourcePool> = HashMap::new();
+
         let mut allocations = Vec::new();
         let mut candidate_ranks: Vec<usize> = Vec::new();
         let mut task_states: HashMap<i64, AllocationTaskState> = HashMap::new();
+        let mut task_requests: HashMap<i64, Option<ResourceRequest>> = HashMap::new();
         for placement in &placements {
             let task_id = placement.task_id;
             let state = match task_states.entry(task_id) {
@@ -2509,6 +2884,15 @@ impl Store {
                 Entry::Vacant(entry) => {
                     entry.insert(self.load_allocation_task_state(&tx, task_id)?)
                 }
+            };
+            let request = match task_requests.entry(task_id) {
+                Entry::Occupied(entry) => entry.into_mut(),
+                Entry::Vacant(entry) => entry.insert(
+                    self.resource_policy
+                        .normalize_task_resources(&state.resources, false)
+                        .and_then(|normalized| ResourceRequest::from_value(&normalized))
+                        .ok(),
+                ),
             };
 
             // Walk the ranked candidates; bind the first that is still free
@@ -2580,6 +2964,34 @@ impl Store {
                     continue;
                 }
 
+                // Capacity on the fresh node row is one more "the world
+                // moved" class, so it skips rather than rejects: a node
+                // whose totals shrank mid-plan hands the placement to the
+                // next candidate.
+                let pool = match free_pools.entry(node_id.clone()) {
+                    Entry::Occupied(entry) => entry.into_mut(),
+                    Entry::Vacant(entry) => entry.insert(self.free_pool_for_node_tx(
+                        &tx,
+                        node,
+                        &submission.job_config_id,
+                        drop_own,
+                    )?),
+                };
+                // Unparseable task resources fit nowhere — the same
+                // fits-nothing posture as `ResourcePool::free_from_rows`
+                // takes for an unparseable node or allocation row.
+                let fits = request
+                    .as_ref()
+                    .is_some_and(|request| pool.can_fit(request));
+                if !fits {
+                    if first_skip_reason.is_none() {
+                        first_skip_reason = Some(format!(
+                            "node {node_id} no longer has capacity for task {task_id} (its resource totals changed since the plan snapshot)"
+                        ));
+                    }
+                    continue;
+                }
+
                 // A static port collision on this candidate is one more
                 // "somebody got there first" class: skip to the next
                 // candidate. Any other error (config parse, SQL) is a real
@@ -2615,6 +3027,14 @@ impl Store {
                 )?;
                 allocations.push(allocation);
                 candidate_ranks.push(rank);
+                // Debit the bound node so later placements in the SAME plan
+                // see the reduced pool — the in-tx mirror of the planner's
+                // ledger consume.
+                if let (Some(request), Some(pool)) =
+                    (request.as_ref(), free_pools.get_mut(node_id.as_str()))
+                {
+                    pool.consume(request);
+                }
                 if let Some(tracker) = state.distinct.as_mut() {
                     tracker.insert_from_node(node);
                 }
@@ -2677,6 +3097,35 @@ impl Store {
         }))
     }
 
+    /// Free capacity for one node, rebuilt from the rows the apply
+    /// transaction can see. `drop_own` mirrors a Fresh plan's wholesale
+    /// replacement of the job's allocations; see the call site in
+    /// `apply_plan_submission_apply` for why the pool is recomputed at
+    /// apply time rather than trusted from the planner's snapshot.
+    fn free_pool_for_node_tx(
+        &self,
+        tx: &Connection,
+        node: &Node,
+        job_config_id: &str,
+        drop_own: bool,
+    ) -> R<ResourcePool> {
+        let mut stmt = tx.prepare_cached(
+            "SELECT a.id, a.resources FROM allocation a \
+             WHERE a.node_id = ?1 AND (?2 = 0 OR a.job_config_id NOT IN (\
+                 SELECT id FROM job_config WHERE job_id = \
+                     (SELECT job_id FROM job_config WHERE id = ?3)));",
+        )?;
+        let rows = Self::collect_rows(stmt.query_map(
+            params![node.id, i64::from(drop_own), job_config_id],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Value>(1)?)),
+        )?)?;
+        Ok(ResourcePool::free_from_rows(
+            node,
+            rows.iter().map(|(id, resources)| (*id, resources)),
+            &self.resource_policy,
+        ))
+    }
+
     pub(crate) fn collect_rows<T, I>(iter: I) -> R<Vec<T>>
     where
         I: Iterator<Item = Result<T, rusqlite::Error>>,
@@ -2728,6 +3177,15 @@ impl Store {
 
     fn now_rfc3339() -> R<String> {
         Ok(OffsetDateTime::now_utc().format(&Rfc3339)?)
+    }
+
+    /// Unix seconds, the storage form of `job.created_at` / `job.updated_at`.
+    ///
+    /// Safe inside a replicated apply: raft replicates the resulting row
+    /// values, not a re-execution of the closure, so followers never compute
+    /// their own `now` (see `storage/raft/capture.rs`).
+    fn now_unix() -> i64 {
+        OffsetDateTime::now_utc().unix_timestamp()
     }
 
     /// RFC3339 with a fixed-width, nine-digit subsecond field.
@@ -2802,11 +3260,16 @@ impl Store {
     //
 
     fn job_from_row(&self, row: &Row<'_>) -> Result<Job, rusqlite::Error> {
+        let created_at: i64 = row.get(3)?;
         let job = Job {
             id: row.get(0)?,
             name: row.get(1)?,
             status: row.get(2)?,
-            created_at: row.get(3)?,
+            created_at,
+            // NULL only for a row the backfill deliberately skipped (a
+            // text `created_at`); creation time is the honest floor for
+            // "last changed" when no mtime was ever recorded.
+            updated_at: row.get::<_, Option<i64>>(4)?.unwrap_or(created_at),
         };
 
         Ok(job)
@@ -2951,6 +3414,8 @@ impl Store {
             max_allocations,
             artifacts,
             host_volumes: row.get(9)?,
+            heartbeat_seconds: row.get(10)?,
+            resource_enforcement: row.get(11)?,
         })
     }
 
@@ -3163,6 +3628,7 @@ impl Store {
             actions: self.parse_actions_column(24, row.get(24)?)?,
             volumes: self.parse_volumes_column(25, row.get(25)?)?,
             connect: parse_json_column(26, row.get(26)?)?,
+            restart: parse_json_column(27, row.get(27)?)?,
         };
 
         Ok(task_config)
@@ -3630,7 +4096,7 @@ impl Store {
         }
 
         let evicted = removable.len();
-        let affected_job_configs = self.remove_allocations(&removable)?;
+        let affected_job_configs = self.remove_allocations(&removable, StopCause::Drain)?;
         for job_config_id in affected_job_configs {
             self.reconcile_job_config_allocations(&job_config_id)?;
         }
@@ -3660,6 +4126,11 @@ impl Store {
         tx.execute("DELETE FROM allocation WHERE node_id = ?;", [node_id])?;
         self.release_instance_bindings_tx(&tx, &allocs)?;
         self.bump_epochs_for_allocations_tx(&tx, &allocs)?;
+        // The node itself is going away, so these notices will almost never
+        // be delivered — recorded anyway because "almost never" is not
+        // "never": a node removed while still heartbeating (a decommission
+        // racing its own worker) does read them.
+        self.record_stop_notices_tx(&tx, &allocs, StopCause::NodeLost)?;
         tx.commit()?;
         drop(conn);
 
@@ -3669,7 +4140,7 @@ impl Store {
         self.cache_remove_allocations(&allocs)?;
 
         self.events()
-            .allocations_removed_from_node(node_id, &allocs);
+            .allocations_removed_from_node(node_id, &allocs, StopCause::NodeLost);
 
         Ok(allocs)
     }
@@ -3703,18 +4174,25 @@ impl Store {
     }
 
     #[instrument(err, skip_all)]
-    pub fn get_node_ids_and_heartbeats(&self) -> R<Vec<(String, String)>> {
+    /// Every active node's id and last heartbeat, for the liveness tick:
+    /// the RFC3339 text plus the integer unix clock heartbeats also write
+    /// (heartbeat-scale plan §4). The unix value is `None` only for rows
+    /// last written before the column existed — the tick falls back to
+    /// parsing the text for those, and they age out on their next
+    /// heartbeat.
+    pub fn get_node_ids_and_heartbeats(&self) -> R<Vec<(String, String, Option<i64>)>> {
         let conn = self.read_connection()?;
         // Anchored on `node` (a node_health row orphaned by node removal
         // must not resurrect a ghost); a registered node without a health
         // row hydrates the registration defaults, exactly as before the
         // split (status 'active', empty heartbeat).
-        let sql = "SELECT node.id, COALESCE(node_health.last_heartbeat, '')
+        let sql = "SELECT node.id, COALESCE(node_health.last_heartbeat, ''), node_health.last_heartbeat_unix
                    FROM node LEFT JOIN node_health ON node_health.node_id = node.id
                    WHERE COALESCE(node_health.status, 'active') = 'active'";
         let mut stmt = conn.prepare(sql)?;
-        let nodes_id_and_hb =
-            Self::collect_rows(stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?)?;
+        let nodes_id_and_hb = Self::collect_rows(
+            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?,
+        )?;
 
         Ok(nodes_id_and_hb)
     }
@@ -3874,7 +4352,37 @@ impl Store {
                 return;
             }
         };
+        if node_ids.is_empty() {
+            return;
+        }
+        // One query for every lost node's pending/in-flight reschedule eval
+        // instead of one EXISTS probe per node per tick (heartbeat-scale
+        // plan §4): the semantics are identical — re-enqueue whenever no
+        // eval is queued — but a 2,000-node partition costs one query per
+        // tick, not 2,000.
+        let already_queued: HashSet<String> = {
+            let queued = (|| -> R<Vec<String>> {
+                let conn = self.read_connection()?;
+                let mut stmt = conn.prepare(
+                    "SELECT DISTINCT node_id FROM eval
+                     WHERE status IN ('pending', 'in_flight')
+                       AND type = 'node_lost_reschedule' AND node_id IS NOT NULL;",
+                )?;
+                let queued = Self::collect_rows(stmt.query_map([], |row| row.get(0))?)?;
+                Ok(queued)
+            })();
+            match queued {
+                Ok(queued) => queued.into_iter().collect(),
+                Err(err) => {
+                    warn!(error = ?err, "Failed listing queued lost-node reschedules");
+                    return;
+                }
+            }
+        };
         for node_id in node_ids {
+            if already_queued.contains(&node_id) {
+                continue;
+            }
             if let Err(err) = self.enqueue_lost_node_reschedule(&node_id) {
                 warn!(
                     %node_id,
@@ -4120,15 +4628,95 @@ impl Store {
         Ok(node)
     }
 
+    /// Record one worker heartbeat. Concurrent callers GROUP-COMMIT
+    /// (heartbeat-scale plan §2): heartbeats queued while a commit is in
+    /// flight batch into one status-lane replicated op — one raft
+    /// propose/quorum round stamping every batched node — via the same
+    /// leader-elect coalescer the plan-apply path uses. A lone heartbeat
+    /// commits exactly as before.
+    ///
+    /// Forwarding (plan §8, D2) is preserved: a heartbeat is new
+    /// information no reconciler can re-derive, and workers dial ONE
+    /// manager forever — a standing rejection here marks healthy nodes
+    /// lost within seconds and self-fences their stateful allocations.
+    /// When this node does not lead the status lane the write is forwarded
+    /// to the lane leader; the worker's RPC surface is unchanged.
     #[instrument(err, skip_all)]
-    /// Record a worker heartbeat. Forwarding wrapper (plan §8, D2): a
-    /// heartbeat is new information no reconciler can re-derive, and
-    /// workers dial ONE manager forever — a standing rejection here marks
-    /// healthy nodes lost within seconds and self-fences their stateful
-    /// allocations. When this node does not lead the status lane the write
-    /// is forwarded to the lane leader; the worker's RPC surface is
-    /// unchanged.
     pub fn update_node_heartbeat(&self, id: String) -> R<()> {
+        let coalescer = Arc::clone(&self.heartbeat_coalescer);
+        coalescer.submit(id, |batch| self.run_heartbeat_batch(batch))
+    }
+
+    /// Batch leader body for heartbeat group commit: dedupe the drained
+    /// node ids and stamp them all in one replicated op. Per-id verdicts
+    /// are preserved: an unregistered node's heartbeat still errors
+    /// `NotFound` for exactly that caller (a ghost worker must not think
+    /// it is healthy — its self-fence clock feeds off heartbeat success),
+    /// while registered batch-mates succeed. On a typed `NotRaftLeader`
+    /// rejection every id forwards individually through the existing
+    /// single-heartbeat forward (wire-compatible with managers that
+    /// predate the batched op).
+    fn run_heartbeat_batch(&self, batch: Vec<String>) -> Vec<R<()>> {
+        if batch.len() == 1 {
+            let id = batch.into_iter().next().expect("length checked");
+            return vec![self.update_node_heartbeat_forwarding(id)];
+        }
+        let unique: Vec<String> = batch
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<String>>()
+            .into_iter()
+            .collect();
+        let ids = unique.clone();
+        let shared: Result<BTreeSet<String>, String> =
+            match self.replicated(Lane::Status, "update_node_heartbeats", move |s| {
+                s.update_node_heartbeats_apply(&ids)
+            }) {
+                Ok(ghosts) => Ok(ghosts),
+                Err(err) if crate::storage::raft::driver::NotRaftLeader::in_chain(&err) => {
+                    // Leadership moved: forward per id so the on-wire op stays
+                    // the one every manager version understands.
+                    let mut ghosts = BTreeSet::new();
+                    let mut failures: Vec<String> = Vec::new();
+                    for id in &unique {
+                        match self.update_node_heartbeat_forwarding(id.clone()) {
+                            Ok(()) => {}
+                            Err(err)
+                                if matches!(
+                                    err.downcast_ref::<StorageError>(),
+                                    Some(StorageError::NotFound { .. })
+                                ) =>
+                            {
+                                ghosts.insert(id.clone());
+                            }
+                            Err(err) => failures.push(format!("{id}: {err:#}")),
+                        }
+                    }
+                    if failures.is_empty() {
+                        Ok(ghosts)
+                    } else {
+                        Err(format!(
+                            "forwarded heartbeat batch had failures: {}",
+                            failures.join("; ")
+                        ))
+                    }
+                }
+                Err(err) => Err(format!("{err:#}")),
+            };
+        batch
+            .iter()
+            .map(|id| match &shared {
+                Ok(ghosts) if ghosts.contains(id) => Err(anyhow::Error::new(
+                    StorageError::not_found("node", id.clone()),
+                )),
+                Ok(_) => Ok(()),
+                Err(message) => Err(anyhow!(message.clone())),
+            })
+            .collect()
+    }
+
+    /// The pre-batching single-heartbeat op, with leader forwarding.
+    fn update_node_heartbeat_forwarding(&self, id: String) -> R<()> {
         match self.update_node_heartbeat_local(id.clone()) {
             Err(err) if crate::storage::raft::driver::NotRaftLeader::in_chain(&err) => self
                 .forward_after_rejection(
@@ -4143,43 +4731,140 @@ impl Store {
     /// `ForwardLaneWrite` executor (never re-forwards — rule 2 of
     /// `raft::forward`).
     pub(crate) fn update_node_heartbeat_local(&self, id: String) -> R<()> {
-        self.replicated(Lane::Status, "update_node_heartbeat", move |s| {
-            s.update_node_heartbeat_apply(id)
-        })
+        let ghost = {
+            let id = id.clone();
+            self.replicated(Lane::Status, "update_node_heartbeat", move |s| {
+                s.update_node_heartbeats_apply(std::slice::from_ref(&id))
+            })?
+        };
+        if !ghost.is_empty() {
+            return Err(anyhow::Error::new(StorageError::not_found("node", id)));
+        }
+        Ok(())
     }
 
-    fn update_node_heartbeat_apply(&self, id: String) -> R<()> {
-        let timestamp_now = OffsetDateTime::now_utc().format(&Rfc3339)?;
+    /// Stamp one heartbeat timestamp for a batch of nodes, and reproject
+    /// only the nodes whose liveness status actually TRANSITIONED. Returns
+    /// the ids that are not registered nodes (whose heartbeat is a no-op
+    /// the caller reports as `NotFound`, exactly as the single op did).
+    ///
+    /// Heartbeats upsert node_health (plan §7-C2, C-1): the first
+    /// heartbeat after a registration whose seed was lost creates the row;
+    /// selecting FROM node keeps heartbeats from unregistered nodes a
+    /// no-op, like the pre-split UPDATE. Both timestamp columns are
+    /// written: RFC3339 text (the human/API representation) and the unix
+    /// integer the liveness tick compares (heartbeat-scale plan §4).
+    ///
+    /// INVARIANT for future readers (heartbeat-scale plan §3): a heartbeat
+    /// that only refreshes the timestamp of an already-active node does
+    /// NOT re-read or reproject the cached `Node` — the scheduler read
+    /// model does not consume `last_heartbeat`, and every API/liveness
+    /// reader gets it from the database. Anything that starts consuming
+    /// `last_heartbeat` from the cached read model must remove this skip
+    /// (and pay the read-model write lock per heartbeat that it implies).
+    /// Status transitions (lost/missing -> active) always reproject.
+    fn update_node_heartbeats_apply(&self, ids: &[String]) -> R<BTreeSet<String>> {
+        let now = OffsetDateTime::now_utc();
+        let timestamp_now = now.format(&Rfc3339)?;
+        let unix_now = now.unix_timestamp();
 
-        let conn = self.write_connection()?;
-        // Heartbeats upsert node_health (plan §7-C2, C-1): the first
-        // heartbeat after a registration whose seed was lost creates the
-        // row; the EXISTS guard keeps heartbeats from unregistered nodes a
-        // no-op, like the pre-split UPDATE.
-        let sql = r#"
-        INSERT INTO node_health (node_id, status, last_heartbeat, lost_at, health_checks)
-        SELECT :id, 'active', :ts, NULL, '{}'
-        WHERE EXISTS (SELECT 1 FROM node WHERE id = :id)
-        ON CONFLICT(node_id) DO UPDATE SET
-            last_heartbeat = excluded.last_heartbeat, status = 'active', lost_at = NULL;
-"#;
-        info!(
-            "Updating heartbeat for node {} with TS: {}",
-            id, timestamp_now
+        let placeholders = std::iter::repeat_n("?", ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        // Pre-read (on the write connection, so an enclosing capture's own
+        // earlier writes are visible): which of these ids exist, and which
+        // are not currently active (those transition below and must
+        // reproject).
+        let mut present: BTreeSet<String> = BTreeSet::new();
+        let mut transitioning: BTreeSet<String> = BTreeSet::new();
+        {
+            let conn = self.write_connection()?;
+            let sql = format!(
+                "SELECT node.id, COALESCE(node_health.status, '') FROM node
+                 LEFT JOIN node_health ON node_health.node_id = node.id
+                 WHERE node.id IN ({placeholders})"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let rows: Vec<(String, String)> =
+                Self::collect_rows(stmt.query_map(params_from_iter(ids.iter()), |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                })?)?;
+            for (id, status) in rows {
+                if status != "active" {
+                    transitioning.insert(id.clone());
+                }
+                present.insert(id);
+            }
+        }
+        let ghosts: BTreeSet<String> = ids
+            .iter()
+            .filter(|id| !present.contains(*id))
+            .cloned()
+            .collect();
+        // Also reproject any present node whose CACHED view is not
+        // available: a concurrent mark-lost can land its cache update after
+        // this write (that interleaving pre-dates batching), and the
+        // DB-status check alone would then skip forever while the cache
+        // still says lost. Consulting the cache makes the next heartbeat
+        // converge, exactly as the unconditional reprojection used to.
+        if !capture::in_capture() {
+            let guard = self.read_model_reader()?;
+            for id in &present {
+                match guard.nodes.get(id) {
+                    Some(node) if node.availability == "available" => {}
+                    _ => {
+                        transitioning.insert(id.clone());
+                    }
+                }
+            }
+        }
+
+        {
+            let conn = self.write_connection()?;
+            let sql = format!(
+                "INSERT INTO node_health (node_id, status, last_heartbeat, last_heartbeat_unix, lost_at, health_checks)
+                 SELECT id, 'active', ?1, ?2, NULL, '{{}}' FROM node WHERE id IN ({placeholders})
+                 ON CONFLICT(node_id) DO UPDATE SET
+                     last_heartbeat = excluded.last_heartbeat,
+                     last_heartbeat_unix = excluded.last_heartbeat_unix,
+                     status = 'active', lost_at = NULL;"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let params = rusqlite::params_from_iter(
+                [
+                    &timestamp_now as &dyn rusqlite::types::ToSql,
+                    &unix_now as &dyn rusqlite::types::ToSql,
+                ]
+                .into_iter()
+                .chain(ids.iter().map(|id| id as &dyn rusqlite::types::ToSql)),
+            );
+            stmt.execute(params)?;
+        }
+        debug!(
+            heartbeats = ids.len(),
+            transitions = transitioning.len(),
+            ghosts = ghosts.len(),
+            "Stamped node heartbeats"
         );
 
-        let params = named_params! {
-            ":id": id,
-            ":ts": timestamp_now,
-        };
+        for id in &transitioning {
+            // A node removed between the pre-read and here is treated the
+            // way the projection path treats it: dropped from the cache.
+            match self.get_node(id) {
+                Ok(node) => self.cache_node(node)?,
+                Err(err)
+                    if matches!(
+                        err.downcast_ref::<StorageError>(),
+                        Some(StorageError::NotFound { .. })
+                    ) =>
+                {
+                    self.cache_remove_node(id)?;
+                }
+                Err(err) => return Err(err),
+            }
+        }
 
-        conn.execute(sql, params)?;
-
-        drop(conn);
-        let node = self.get_node(&id)?;
-        self.cache_node(node)?;
-
-        Ok(())
+        Ok(ghosts)
     }
 
     #[instrument(err, skip_all)]
@@ -4286,6 +4971,8 @@ impl Store {
             ":max_allocations": config.max_allocations,
             ":artifacts": config.artifacts,
             ":host_volumes": config.host_volumes,
+            ":heartbeat_seconds": config.heartbeat_seconds,
+            ":resource_enforcement": config.resource_enforcement,
         };
 
         let config = conn.query_row(&INSERT_WORKER_TYPE, params, |row| {
@@ -4329,12 +5016,14 @@ impl Store {
 
     fn stop_job_apply(&self, name: &str) -> R<()> {
         let conn = self.write_connection()?;
+        // The mtime moves with the status in one statement so the two can
+        // never disagree, and so it only moves on rows this write touched.
         let sql = r#"
         UPDATE job
-        SET status = 'stopped'
-        WHERE name = ?;
+        SET status = 'stopped', updated_at = ?2
+        WHERE name = ?1;
 "#;
-        conn.execute(sql, [name])?;
+        conn.execute(sql, params![name, Self::now_unix()])?;
         drop(conn);
 
         // TODO: Create a job_update record
@@ -4371,10 +5060,10 @@ impl Store {
         let conn = self.write_connection()?;
         let sql = r#"
         UPDATE job
-        SET status = 'failed'
-        WHERE id = ?;
+        SET status = 'failed', updated_at = ?2
+        WHERE id = ?1;
 "#;
-        conn.execute(sql, [job_id])?;
+        conn.execute(sql, params![job_id, Self::now_unix()])?;
         drop(conn);
 
         self.events().job_failed(job_id);
@@ -4427,7 +5116,10 @@ impl Store {
 
     fn mark_job_failed_for_kv_apply(&self, job_id: &str) -> R<()> {
         let conn = self.write_connection()?;
-        conn.execute("UPDATE job SET status = 'failed' WHERE id = ?;", [job_id])?;
+        conn.execute(
+            "UPDATE job SET status = 'failed', updated_at = ?2 WHERE id = ?1;",
+            params![job_id, Self::now_unix()],
+        )?;
         Ok(())
     }
 
@@ -4499,8 +5191,9 @@ impl Store {
     fn clear_job_failed_status_apply(&self, job_id: &str) -> R<bool> {
         let conn = self.write_connection()?;
         let updated = conn.execute(
-            "UPDATE job SET status = 'done' WHERE id = ?1 AND status = 'failed';",
-            [job_id],
+            "UPDATE job SET status = 'done', updated_at = ?2 \
+             WHERE id = ?1 AND status = 'failed';",
+            params![job_id, Self::now_unix()],
         )?;
         Ok(updated > 0)
     }
@@ -4523,8 +5216,9 @@ impl Store {
     fn clear_job_stopped_status_apply(&self, job_id: &str) -> R<bool> {
         let conn = self.write_connection()?;
         let updated = conn.execute(
-            "UPDATE job SET status = 'done' WHERE id = ?1 AND status = 'stopped';",
-            [job_id],
+            "UPDATE job SET status = 'done', updated_at = ?2 \
+             WHERE id = ?1 AND status = 'stopped';",
+            params![job_id, Self::now_unix()],
         )?;
         Ok(updated > 0)
     }
@@ -4542,9 +5236,12 @@ impl Store {
         let job_id = job_id.to_owned();
         self.replicated(Lane::Control, "request_job_restart", move |s| {
             let conn = s.write_connection()?;
+            // An acknowledged restart is a change to the job, so it moves
+            // the mtime; the marker's own clear (below) does not — that is
+            // the eval consuming its own bookkeeping, not a user action.
             conn.execute(
-                "UPDATE job SET restart_requested_at = ?2 WHERE id = ?1;",
-                params![job_id, Self::now_rfc3339()?],
+                "UPDATE job SET restart_requested_at = ?2, updated_at = ?3 WHERE id = ?1;",
+                params![job_id, Self::now_rfc3339()?, Self::now_unix()],
             )?;
             Ok(())
         })
@@ -4641,6 +5338,7 @@ impl Store {
         tx.execute("DELETE FROM rollout WHERE job_id = ?1;", [job_id])?;
         if !allocs.is_empty() {
             self.bump_epochs_for_allocations_tx(&tx, &allocs)?;
+            self.record_stop_notices_tx(&tx, &allocs, StopCause::Destroy)?;
         }
         tx.commit()?;
         drop(conn);
@@ -4679,6 +5377,8 @@ impl Store {
         "#;
 
         tx.execute(delete_sql, [name])?;
+        // Count overrides die with the job (control-owned, same capture).
+        tx.execute("DELETE FROM task_scale WHERE job_id = ?;", [&job.id])?;
 
         for submission_hash in submission_hashes {
             let reference_count: i64 = tx.query_row(
@@ -5173,12 +5873,22 @@ impl Store {
                     ":name": config.name,
                     ":status": "done",
                     ":created_at": now,
+                    ":updated_at": now,
                 };
 
                 tx.query_row(&INSERT_JOB, job_params, |row| self.job_from_row(row))
             }
             Err(error) => Err(error),
         }?;
+
+        // A new spec version is a change to the job, so the existing row's
+        // mtime moves with it. Skipped on the insert branch, which already
+        // stamped `updated_at` — and skipped entirely when the config is
+        // unchanged, because that path returned `Unchanged` above.
+        tx.execute(
+            "UPDATE job SET updated_at = ?2 WHERE id = ?1;",
+            params![job.id, now],
+        )?;
 
         let now = time::OffsetDateTime::now_utc();
         let mut meta = if config.rollout.is_none() && config.rollout_by_group.is_empty() {
@@ -5250,6 +5960,7 @@ impl Store {
             } else {
                 Some(serde_json::to_string(&t.volumes)?)
             };
+            let restart = t.restart.as_ref().map(serde_json::to_string).transpose()?;
             let schedule = t.schedule.as_ref().map(ToString::to_string);
             let task_params = named_params! {
                 ":name": t.name,
@@ -5278,6 +5989,7 @@ impl Store {
                 ":actions": actions,
                 ":volumes": volumes,
                 ":connect": connect,
+                ":restart": restart,
             };
 
             let task_id: i64 = tx.query_row(&INSERT_TASK, task_params, |row| row.get(0))?;
@@ -5318,6 +6030,51 @@ impl Store {
 
         tx.execute(&INSERT_JOB_UPDATE, job_update_params)?;
 
+        // Count-override ownership arbitration (docs/autoscaling.md): an
+        // override records the spec count it was laid over (`base_count`).
+        // A resubmit whose spec count CHANGED expresses new intent — the
+        // override (and any pending scale-in) is cleared and the spec
+        // wins; an unchanged spec count leaves the override in place, so
+        // "my scale sticks across deploys" and "editing the spec does
+        // what it says" are both true. Overrides for tasks the new
+        // version no longer declares are orphans and cleared too.
+        // `task_scale` is control-owned precisely so this rides the same
+        // capture as the config write.
+        let mut scale_reset_events = Vec::new();
+        for t in &config.tasks {
+            let existing: Option<i64> = tx
+                .query_row(
+                    "SELECT base_count FROM task_scale \
+                     WHERE job_id = ?1 AND task_group = ?2 AND task_name = ?3;",
+                    params![job.id, t.group, t.name],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(base_count) = existing {
+                if i64::from(t.count.num) != base_count {
+                    tx.execute(
+                        "DELETE FROM task_scale \
+                         WHERE job_id = ?1 AND task_group = ?2 AND task_name = ?3;",
+                        params![job.id, t.group, t.name],
+                    )?;
+                    scale_reset_events.push(drafts::scale_reset(
+                        &job.id,
+                        &t.group,
+                        &t.name,
+                        "resubmit changed the spec count; the spec owns the count again",
+                    ));
+                }
+            }
+        }
+        tx.execute(
+            "DELETE FROM task_scale WHERE job_id = ?1 AND NOT EXISTS (\
+                 SELECT 1 FROM task_config \
+                 WHERE task_config.job_config_id = ?2 \
+                 AND task_config.group_name = task_scale.task_group \
+                 AND task_config.name = task_scale.task_name);",
+            params![job.id, job_config_id],
+        )?;
+
         // Initial task_status rows are seeded by the status-lane half of
         // the submit composite (`seed_task_statuses`, plan §7-C2, C-2) —
         // task_status is status-owned and must not ride this control-lane
@@ -5331,9 +6088,16 @@ impl Store {
         let submit_event =
             drafts::job_submit_outcome(&job.id, &outcome, next_version, config.tasks.len())
                 .and_then(|draft| self.stage_event_locked(&tx, draft));
+        let scale_reset_events: Vec<_> = scale_reset_events
+            .into_iter()
+            .filter_map(|draft| self.stage_event_locked(&tx, draft))
+            .collect();
         tx.commit()
             .map_err(|_| anyhow!("Error committing transaction"))?;
         self.publish_staged(submit_event);
+        for staged in scale_reset_events {
+            self.publish_staged(Some(staged));
+        }
         drop(conn);
 
         let cached_tasks = self.get_task_configs_for_job_config(outcome.job_config_id())?;
@@ -5870,6 +6634,34 @@ impl Store {
                     // liveness hydrates from the node ⟕ node_health join
                     // (plan §7-C2, C-1) — so both tables funnel into one
                     // re-read of the joined row by node id.
+                    //
+                    // EXCEPT a bare heartbeat refresh (heartbeat-scale plan
+                    // §3): a node_health UPDATE whose only changed columns
+                    // are the heartbeat timestamps is invisible to the
+                    // scheduler read model (see the invariant on
+                    // `update_node_heartbeats_apply`), and at heartbeat
+                    // rates the per-apply reprojection is the cost that
+                    // starves read-model readers. Session changesets carry
+                    // only columns whose value actually changed, so this is
+                    // exact: any status/lost_at/health_checks movement still
+                    // reprojects.
+                    if table == "node_health" && action == Action::SQLITE_UPDATE {
+                        let status_idx =
+                            self.changeset_column_index(&mut column_cache, &table, "status")?;
+                        let lost_at_idx =
+                            self.changeset_column_index(&mut column_cache, &table, "lost_at")?;
+                        let checks_idx = self.changeset_column_index(
+                            &mut column_cache,
+                            &table,
+                            "health_checks",
+                        )?;
+                        let liveness_changed = item.new_value(status_idx).is_ok()
+                            || item.new_value(lost_at_idx).is_ok()
+                            || item.new_value(checks_idx).is_ok();
+                        if !liveness_changed {
+                            continue;
+                        }
+                    }
                     let pk_column = if table == "node" { "id" } else { "node_id" };
                     let idx = self.changeset_column_index(&mut column_cache, &table, pk_column)?;
                     // The PK is present in the insert's new record and in the
@@ -6684,11 +7476,49 @@ impl Store {
         Ok(())
     }
 
-    fn task_status_for_lifecycle(lifecycle: &TaskLifecycle) -> TaskStatusState {
+    /// Task status to stamp when an allocation is placed.
+    ///
+    /// A batch task is `Running` until a worker reports that its process
+    /// exited — that report is what makes `dependsOn: { condition: "success" }`
+    /// mean "exited 0" rather than "was placed" (see docs/task-supervision.md).
+    ///
+    /// `supervised_node` is false for workers too old to send exit reports
+    /// (protocol version < 2). Those nodes will never report a termination, so
+    /// their batch tasks keep the legacy optimistic `Success` — otherwise a
+    /// mid-upgrade cluster (managers upgrade first) would stall every DAG
+    /// waiting on a batch task.
+    fn task_status_for_lifecycle(
+        lifecycle: &TaskLifecycle,
+        supervised_node: bool,
+    ) -> TaskStatusState {
         match lifecycle {
+            TaskLifecycle::Batch if supervised_node => TaskStatusState::Running,
             TaskLifecycle::Batch => TaskStatusState::Success,
             TaskLifecycle::Service | TaskLifecycle::Sidecar => TaskStatusState::Running,
         }
+    }
+
+    /// Whether a node's worker reports task exits (protocol version 2+). Reads
+    /// the version recorded in the node's dynamic attrs at registration;
+    /// anything unreadable is treated as an old worker, which is the
+    /// conservative direction (keeps today's behavior).
+    fn node_reports_exits_tx(tx: &Connection, node_id: &str) -> bool {
+        let raw: Option<String> = tx
+            .query_row(
+                "SELECT dynamic_attrs FROM node WHERE id = ?;",
+                params![node_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .ok()
+            .flatten();
+        let Some(raw) = raw else {
+            return false;
+        };
+        serde_json::from_str::<Value>(&raw)
+            .ok()
+            .and_then(|attrs| attrs.get("protocolVersion").and_then(Value::as_u64))
+            .is_some_and(|version| version >= 2)
     }
 
     fn apply_task_status_updates_tx(
@@ -6728,6 +7558,8 @@ impl Store {
         let tx = Self::write_tx(&mut conn)?;
         let mut task_cache: HashMap<String, HashMap<i64, TaskConfig>> = HashMap::new();
         let mut updates: HashMap<i64, TaskStatusState> = HashMap::new();
+        // One node lookup per distinct node, not per allocation.
+        let mut node_supervision: HashMap<String, bool> = HashMap::new();
 
         for allocation in allocations {
             let tasks = task_cache
@@ -6743,9 +7575,12 @@ impl Store {
                 .get(&allocation.task_config_id)
                 .with_context(|| format!("Missing task config {}", allocation.task_config_id))?;
 
+            let supervised_node = *node_supervision
+                .entry(allocation.node_id.clone())
+                .or_insert_with(|| Self::node_reports_exits_tx(&tx, &allocation.node_id));
             updates.insert(
                 allocation.task_config_id,
-                Self::task_status_for_lifecycle(&task.lifecycle),
+                Self::task_status_for_lifecycle(&task.lifecycle, supervised_node),
             );
         }
 
@@ -7210,6 +8045,82 @@ impl Store {
         Ok(instance.instance_id)
     }
 
+    /// Record why a set of allocations is being removed, in the same
+    /// transaction that removes them.
+    ///
+    /// Same-transaction is the whole point: a notice can then never describe
+    /// a stop that was rolled back, and never arrive claiming a stop that has
+    /// not been decided yet. The heartbeat feed
+    /// ([`Self::stop_notices_for_node`]) reads them straight back out.
+    ///
+    /// [`StopCause::Unknown`] writes nothing — an unknown cause and no
+    /// recorded cause are the same fact, and the worker defaults to
+    /// `Unknown` anyway.
+    fn record_stop_notices_tx(
+        &self,
+        tx: &Connection,
+        removed: &[Allocation],
+        cause: StopCause,
+    ) -> R<()> {
+        if removed.is_empty() || !cause.is_known() {
+            return Ok(());
+        }
+        let now = Self::now_rfc3339()?;
+        let now_unix = OffsetDateTime::now_utc().unix_timestamp();
+
+        // Expire old notices here rather than on the heartbeat read path.
+        // This transaction is already a scheduler-lane write, so the delete
+        // costs no extra raft proposal and stays inside the lane that owns
+        // the table; pruning on read would have put a write (and, in raft
+        // mode, a proposal) on the hottest path in the system. A table with
+        // no removals is not growing, so tying the prune to removals cannot
+        // let it run away.
+        tx.execute(
+            "DELETE FROM allocation_stop_notice WHERE created_at_unix < ?1;",
+            params![now_unix - STOP_NOTICE_RETENTION_SECS],
+        )?;
+
+        for alloc in removed {
+            // REPLACE, not INSERT: an allocation id is unique and a second
+            // removal of the same id (a retried apply, say) should carry the
+            // latest cause rather than fail the transaction it rides in.
+            tx.execute(
+                "INSERT OR REPLACE INTO allocation_stop_notice
+                 (allocation_id, node_id, cause, created_at, created_at_unix)
+                 VALUES (?1, ?2, ?3, ?4, ?5);",
+                params![alloc.id, alloc.node_id, cause.as_str(), now, now_unix],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// The live stop notices for one node, for its heartbeat reply.
+    ///
+    /// Read-only by construction: this runs on every heartbeat from every
+    /// node, so it must not write (expiry happens in
+    /// [`Self::record_stop_notices_tx`], which is already a scheduler-lane
+    /// write). Notices past the retention window are filtered out here so a
+    /// prune that has not run yet cannot resurrect a stale cause.
+    pub fn stop_notices_for_node(&self, node_id: &str) -> R<Vec<(i64, StopCause)>> {
+        let cutoff = OffsetDateTime::now_utc().unix_timestamp() - STOP_NOTICE_RETENTION_SECS;
+
+        let conn = self.read_connection()?;
+        let mut stmt = conn.prepare(
+            "SELECT allocation_id, cause FROM allocation_stop_notice
+             WHERE node_id = ?1 AND created_at_unix >= ?2;",
+        )?;
+        let notices = Self::collect_rows(stmt.query_map(params![node_id, cutoff], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?)?;
+        drop(stmt);
+        drop(conn);
+
+        Ok(notices
+            .into_iter()
+            .map(|(id, cause)| (id, StopCause::from_wire(&cause)))
+            .collect())
+    }
+
     /// After allocation rows are deleted, transition the instances they
     /// fulfilled. Instances still referenced by another live allocation (for
     /// example the already-placed replacement during a config update) keep
@@ -7309,10 +8220,19 @@ impl Store {
             return Ok((true, true));
         };
 
+        // COALESCE overlays a `legion job scale` override onto the spec
+        // count (docs/autoscaling.md) — this is how slot scale-in flows:
+        // the override shrinks the desired range, `retire_surplus_allocations`
+        // deletes the highest slots' allocations, and this check terminates
+        // their instances (honoring `retainOnScaleIn` below).
         let latest_task: Option<(i64, Option<String>)> = tx
             .query_row(
-                "SELECT task_config.count, task_config.stateful FROM task_config \
+                "SELECT COALESCE(task_scale.count, task_config.count), task_config.stateful \
+                 FROM task_config \
                  INNER JOIN job_config ON job_config.id = task_config.job_config_id \
+                 LEFT JOIN task_scale ON task_scale.job_id = task_config.job_id \
+                 AND task_scale.task_group = task_config.group_name \
+                 AND task_scale.task_name = task_config.name \
                  WHERE task_config.job_id = ?1 AND task_config.group_name = ?2 \
                  AND task_config.name = ?3 \
                  ORDER BY job_config.version DESC LIMIT 1;",
@@ -7967,13 +8887,30 @@ impl Store {
             .collect())
     }
 
+    /// Remove one allocation without recording why.
+    ///
+    /// The worker-failure-report path: the task is already gone, so there is
+    /// no stop to explain. Callers that *are* stopping live work should use
+    /// [`Self::remove_allocation_by_id_because`] so the owning worker learns
+    /// the reason.
     #[instrument(err, skip_all)]
     pub fn remove_allocation_by_id(&self, allocation_id: i64) -> R<Option<Allocation>> {
-        match self.remove_allocation_by_id_local(allocation_id) {
+        self.remove_allocation_by_id_because(allocation_id, StopCause::Unknown)
+    }
+
+    /// Remove one allocation, recording why for the owning worker.
+    #[instrument(err, skip_all)]
+    pub fn remove_allocation_by_id_because(
+        &self,
+        allocation_id: i64,
+        cause: StopCause,
+    ) -> R<Option<Allocation>> {
+        match self.remove_allocation_by_id_local(allocation_id, cause) {
             Err(err) if crate::storage::raft::driver::NotRaftLeader::in_chain(&err) => self
                 .forward_after_rejection(
                     crate::storage::raft::forward::ForwardableLaneWrite::RemoveAllocationById {
                         allocation_id,
+                        cause,
                     },
                     err,
                 ),
@@ -7984,13 +8921,18 @@ impl Store {
     pub(crate) fn remove_allocation_by_id_local(
         &self,
         allocation_id: i64,
+        cause: StopCause,
     ) -> R<Option<Allocation>> {
         self.replicated(Lane::Scheduler, "remove_allocation_by_id", move |s| {
-            s.remove_allocation_by_id_apply(allocation_id)
+            s.remove_allocation_by_id_apply(allocation_id, cause)
         })
     }
 
-    fn remove_allocation_by_id_apply(&self, allocation_id: i64) -> R<Option<Allocation>> {
+    fn remove_allocation_by_id_apply(
+        &self,
+        allocation_id: i64,
+        cause: StopCause,
+    ) -> R<Option<Allocation>> {
         let allocation = self.get_allocation_by_id(allocation_id)?;
         let Some(allocation) = allocation else {
             return Ok(None);
@@ -8001,11 +8943,86 @@ impl Store {
         tx.execute("DELETE FROM allocation WHERE id = ?;", [allocation_id])?;
         self.release_instance_bindings_tx(&tx, std::slice::from_ref(&allocation))?;
         self.bump_job_config_epoch_tx(&tx, &allocation.job_config_id)?;
+        self.record_stop_notices_tx(&tx, std::slice::from_ref(&allocation), cause)?;
         tx.commit()?;
 
         self.cache_remove_allocations(std::slice::from_ref(&allocation))?;
 
         Ok(Some(allocation))
+    }
+
+    /// Record a terminal, non-failure outcome for an allocation: its task's
+    /// process exited and the task's `restart` policy says that is the end of
+    /// it (see docs/task-supervision.md).
+    ///
+    /// The row is marked `complete` rather than deleted. Deleting it would
+    /// leave the task's desired count unmet, and the very next reconcile would
+    /// place the batch task again — an infinite re-run loop. A completed
+    /// allocation still occupies its slot; it is the worker that knows not to
+    /// relaunch the process.
+    ///
+    /// The task's status follows the outcome: `Success` for a successful exit,
+    /// `Failed` otherwise (a `restart: { policy: "never" }` task that exits
+    /// non-zero terminates without going through the reschedule path).
+    pub fn complete_allocation(&self, allocation_id: i64, success: bool) -> R<Option<Allocation>> {
+        match self.complete_allocation_local(allocation_id, success) {
+            Err(err) if crate::storage::raft::driver::NotRaftLeader::in_chain(&err) => self
+                .forward_after_rejection(
+                    crate::storage::raft::forward::ForwardableLaneWrite::CompleteAllocation {
+                        allocation_id,
+                        success,
+                    },
+                    err,
+                ),
+            other => other,
+        }
+    }
+
+    pub(crate) fn complete_allocation_local(
+        &self,
+        allocation_id: i64,
+        success: bool,
+    ) -> R<Option<Allocation>> {
+        self.replicated(Lane::Scheduler, "complete_allocation", move |s| {
+            s.complete_allocation_apply(allocation_id, success)
+        })
+    }
+
+    fn complete_allocation_apply(
+        &self,
+        allocation_id: i64,
+        success: bool,
+    ) -> R<Option<Allocation>> {
+        let Some(allocation) = self.get_allocation_by_id(allocation_id)? else {
+            return Ok(None);
+        };
+
+        let status = if success {
+            ALLOCATION_STATUS_COMPLETE
+        } else {
+            ALLOCATION_STATUS_FAILED
+        };
+        let task_status = if success {
+            TaskStatusState::Success
+        } else {
+            TaskStatusState::Failed
+        };
+
+        let mut conn = self.write_connection()?;
+        let tx = Self::write_tx(&mut conn)?;
+        tx.execute(
+            "UPDATE allocation SET status = ? WHERE id = ?;",
+            params![status, allocation_id],
+        )?;
+        let mut updates = HashMap::new();
+        updates.insert(allocation.task_config_id, task_status);
+        self.apply_task_status_updates_tx(&tx, &updates)?;
+        tx.commit()?;
+
+        Ok(Some(Allocation {
+            status: status.to_string(),
+            ..allocation
+        }))
     }
 
     #[instrument(err, skip_all)]
@@ -8061,13 +9078,14 @@ impl Store {
         tx.execute(sql, params)?;
         self.release_instance_bindings_tx(&tx, &allocations)?;
         self.bump_epochs_for_allocations_tx(&tx, &allocations)?;
+        self.record_stop_notices_tx(&tx, &allocations, StopCause::Stop)?;
         tx.commit()?;
         drop(conn);
 
         self.cache_remove_allocations(&allocations)?;
 
         self.events()
-            .allocations_removed_for_job(job_id, allocations.len());
+            .allocations_removed_for_job(job_id, allocations.len(), StopCause::Stop);
 
         Ok(())
     }
@@ -8094,6 +9112,9 @@ impl Store {
         )?;
         self.release_instance_bindings_tx(&tx, &allocations)?;
         self.bump_job_config_epoch_tx(&tx, job_config_id)?;
+        // A superseded job config's allocations are cleaned up because a
+        // newer config replaced them.
+        self.record_stop_notices_tx(&tx, &allocations, StopCause::Update)?;
         tx.commit()?;
         drop(conn);
 
@@ -8103,6 +9124,380 @@ impl Store {
             .allocations_removed_for_job_config(job_config_id, &allocations);
 
         Ok(allocations)
+    }
+
+    // ── Count overrides (`legion job scale`, docs/autoscaling.md) ────────
+
+    /// Set (or update) a task's count override: the applied count wins over
+    /// the spec's `count.num` for every reader of desired count. Clears any
+    /// pending scale-in (a fresh override is newer intent). `base_count`
+    /// must be the CURRENT spec count — it is the resubmit-ownership
+    /// arbiter (`handle_job_submit_apply` clears the override when a
+    /// resubmit changes the spec count away from it).
+    #[instrument(err, skip(self, reason, principal))]
+    pub fn set_task_scale_override(
+        &self,
+        job_id: &str,
+        task_group: &str,
+        task_name: &str,
+        count: u32,
+        base_count: u32,
+        source: &str,
+        reason: &str,
+        principal: &str,
+    ) -> R<()> {
+        let (job_id, task_group, task_name) = (
+            job_id.to_owned(),
+            task_group.to_owned(),
+            task_name.to_owned(),
+        );
+        let (source, reason, principal) =
+            (source.to_owned(), reason.to_owned(), principal.to_owned());
+        self.replicated(Lane::Control, "set_task_scale_override", move |s| {
+            s.set_task_scale_override_apply(
+                &job_id,
+                &task_group,
+                &task_name,
+                count,
+                base_count,
+                &source,
+                &reason,
+                &principal,
+            )
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn set_task_scale_override_apply(
+        &self,
+        job_id: &str,
+        task_group: &str,
+        task_name: &str,
+        count: u32,
+        base_count: u32,
+        source: &str,
+        reason: &str,
+        principal: &str,
+    ) -> R<()> {
+        let now = Self::now_rfc3339()?;
+        let conn = self.write_connection()?;
+        conn.execute(
+            "INSERT OR REPLACE INTO task_scale \
+             (job_id, task_group, task_name, count, pending_count, base_count, source, reason, principal, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7, ?8, ?9);",
+            params![job_id, task_group, task_name, count, base_count, source, reason, principal, now],
+        )?;
+        Ok(())
+    }
+
+    /// Record a scale-in that must WAIT for the active rollout to finish
+    /// (docs/autoscaling.md, the ECS rule: scale-out applies mid-rollout,
+    /// scale-in defers). Keeps any applied override untouched; the pending
+    /// count is promoted by [`Store::promote_pending_task_scales`] when the
+    /// rollout reaches a terminal status.
+    #[instrument(err, skip(self, reason, principal))]
+    pub fn set_task_scale_pending(
+        &self,
+        job_id: &str,
+        task_group: &str,
+        task_name: &str,
+        pending: u32,
+        base_count: u32,
+        source: &str,
+        reason: &str,
+        principal: &str,
+    ) -> R<()> {
+        let (job_id, task_group, task_name) = (
+            job_id.to_owned(),
+            task_group.to_owned(),
+            task_name.to_owned(),
+        );
+        let (source, reason, principal) =
+            (source.to_owned(), reason.to_owned(), principal.to_owned());
+        self.replicated(Lane::Control, "set_task_scale_pending", move |s| {
+            s.set_task_scale_pending_apply(
+                &job_id,
+                &task_group,
+                &task_name,
+                pending,
+                base_count,
+                &source,
+                &reason,
+                &principal,
+            )
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn set_task_scale_pending_apply(
+        &self,
+        job_id: &str,
+        task_group: &str,
+        task_name: &str,
+        pending: u32,
+        base_count: u32,
+        source: &str,
+        reason: &str,
+        principal: &str,
+    ) -> R<()> {
+        let now = Self::now_rfc3339()?;
+        let conn = self.write_connection()?;
+        // Upsert preserving the applied `count` when a row already exists.
+        conn.execute(
+            "INSERT INTO task_scale \
+             (job_id, task_group, task_name, count, pending_count, base_count, source, reason, principal, updated_at) \
+             VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, ?7, ?8, ?9) \
+             ON CONFLICT(job_id, task_group, task_name) DO UPDATE SET \
+             pending_count = ?4, base_count = ?5, source = ?6, reason = ?7, principal = ?8, updated_at = ?9;",
+            params![job_id, task_group, task_name, pending, base_count, source, reason, principal, now],
+        )?;
+        Ok(())
+    }
+
+    /// Drop a task's override (and any pending scale-in), returning count
+    /// ownership to the job spec. Returns whether a row existed.
+    #[instrument(err, skip(self))]
+    pub fn clear_task_scale(&self, job_id: &str, task_group: &str, task_name: &str) -> R<bool> {
+        let (job_id, task_group, task_name) = (
+            job_id.to_owned(),
+            task_group.to_owned(),
+            task_name.to_owned(),
+        );
+        self.replicated(Lane::Control, "clear_task_scale", move |s| {
+            s.clear_task_scale_apply(&job_id, &task_group, &task_name)
+        })
+    }
+
+    fn clear_task_scale_apply(&self, job_id: &str, task_group: &str, task_name: &str) -> R<bool> {
+        let conn = self.write_connection()?;
+        let removed = conn.execute(
+            "DELETE FROM task_scale WHERE job_id = ?1 AND task_group = ?2 AND task_name = ?3;",
+            params![job_id, task_group, task_name],
+        )?;
+        Ok(removed > 0)
+    }
+
+    /// Promote every pending scale-in for a job into its applied count —
+    /// called when a rollout reaches a terminal status. Returns the
+    /// promoted rows (post-promotion), so the caller can emit events and
+    /// enqueue the reconciling `job_scale` eval.
+    #[instrument(err, skip(self))]
+    pub fn promote_pending_task_scales(&self, job_id: &str) -> R<Vec<TaskScale>> {
+        let job_id = job_id.to_owned();
+        self.replicated(Lane::Control, "promote_pending_task_scales", move |s| {
+            s.promote_pending_task_scales_apply(&job_id)
+        })
+    }
+
+    fn promote_pending_task_scales_apply(&self, job_id: &str) -> R<Vec<TaskScale>> {
+        let now = Self::now_rfc3339()?;
+        let conn = self.write_connection()?;
+        let mut stmt = conn.prepare(
+            "UPDATE task_scale SET count = pending_count, pending_count = NULL, updated_at = ?2 \
+             WHERE job_id = ?1 AND pending_count IS NOT NULL \
+             RETURNING job_id, task_group, task_name, count, pending_count, base_count, source, reason, principal, updated_at;",
+        )?;
+        let promoted =
+            Self::collect_rows(stmt.query_map(params![job_id, now], Self::task_scale_from_row)?)?;
+        Ok(promoted)
+    }
+
+    fn task_scale_from_row(row: &Row<'_>) -> Result<TaskScale, rusqlite::Error> {
+        Ok(TaskScale {
+            job_id: row.get(0)?,
+            task_group: row.get(1)?,
+            task_name: row.get(2)?,
+            count: row.get::<_, Option<i64>>(3)?.map(|count| count as u32),
+            pending_count: row.get::<_, Option<i64>>(4)?.map(|count| count as u32),
+            base_count: row.get::<_, i64>(5)? as u32,
+            source: row.get(6)?,
+            reason: row.get(7)?,
+            principal: row.get(8)?,
+            updated_at: row.get(9)?,
+        })
+    }
+
+    /// The override row for one task, if any.
+    pub fn task_scale_for(
+        &self,
+        job_id: &str,
+        task_group: &str,
+        task_name: &str,
+    ) -> R<Option<TaskScale>> {
+        let conn = self.read_connection()?;
+        Ok(conn
+            .query_row(
+                "SELECT job_id, task_group, task_name, count, pending_count, base_count, source, reason, principal, updated_at \
+                 FROM task_scale WHERE job_id = ?1 AND task_group = ?2 AND task_name = ?3;",
+                params![job_id, task_group, task_name],
+                Self::task_scale_from_row,
+            )
+            .optional()?)
+    }
+
+    /// Every override row for a job.
+    pub fn task_scales_for_job(&self, job_id: &str) -> R<Vec<TaskScale>> {
+        let conn = self.read_connection()?;
+        let mut stmt = conn.prepare(
+            "SELECT job_id, task_group, task_name, count, pending_count, base_count, source, reason, principal, updated_at \
+             FROM task_scale WHERE job_id = ?1 ORDER BY task_group, task_name;",
+        )?;
+        let scales = Self::collect_rows(stmt.query_map([job_id], Self::task_scale_from_row)?)?;
+        Ok(scales)
+    }
+
+    /// EFFECTIVE desired count for a task: the applied override when one
+    /// exists, else the given spec count. The one accessor every consumer
+    /// of desired count goes through (scheduler plans, slot retirement via
+    /// the SQL COALESCE in `slot_still_desired_tx`, rollout group plans,
+    /// surplus retirement).
+    pub fn effective_task_count(
+        &self,
+        job_id: &str,
+        task_group: &str,
+        task_name: &str,
+        spec_count: u32,
+    ) -> R<u32> {
+        Ok(self
+            .task_scale_for(job_id, task_group, task_name)?
+            // Overrides only bind to the spec count they were laid over
+            // (`base_count`); submitted configs always satisfy this (the
+            // submit arbitration clears mismatches), and it keeps dry-run
+            // plans over an EDITED spec honest about what a submit would
+            // converge to.
+            .filter(|scale| scale.base_count == spec_count)
+            .and_then(|scale| scale.count)
+            .unwrap_or(spec_count))
+    }
+
+    /// Retire surplus allocations for one job config down to each task's
+    /// effective desired count — the scale-in half of the `job_scale` eval.
+    /// Slot-mode stateful tasks lose their highest slot indices (the
+    /// released instances are terminated or set rescheduling by
+    /// `release_instance_bindings_tx` via `slot_still_desired_tx`, which
+    /// honors `stateful.storage.retainOnScaleIn`); stateless tasks lose
+    /// their newest allocations first. Returns the removed allocations.
+    #[instrument(err, skip_all)]
+    pub fn retire_surplus_allocations(&self, job_config_id: &str) -> R<Vec<Allocation>> {
+        let job_config_id = job_config_id.to_owned();
+        self.replicated(Lane::Scheduler, "retire_surplus_allocations", move |s| {
+            s.retire_surplus_allocations_apply(&job_config_id)
+        })
+    }
+
+    fn retire_surplus_allocations_apply(&self, job_config_id: &str) -> R<Vec<Allocation>> {
+        let Some(job_id) = self.job_id_for_job_config(job_config_id)? else {
+            return Ok(Vec::new());
+        };
+        let tasks = self.get_task_configs_for_job_config(job_config_id)?;
+        let allocations = self.allocs_for_job_config(job_config_id)?;
+
+        // Slot indexes for slot-mode ordering, one query for the config.
+        let mut slot_by_allocation: HashMap<i64, i64> = HashMap::new();
+        {
+            let conn = self.read_connection()?;
+            let mut stmt = conn.prepare(
+                "SELECT a.id, i.slot_index FROM allocation a \
+                 INNER JOIN instance i ON i.instance_id = a.instance_id \
+                 WHERE a.job_config_id = ?1 AND i.slot_index IS NOT NULL;",
+            )?;
+            let rows = Self::collect_rows(stmt.query_map([job_config_id], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+            })?)?;
+            slot_by_allocation.extend(rows);
+        }
+
+        let mut surplus: Vec<Allocation> = Vec::new();
+        for (task_id, task) in &tasks {
+            let keyed = task
+                .stateful
+                .as_ref()
+                .is_some_and(|stateful| stateful.mode == InstanceMode::Keyed);
+            // Keyed tasks have no count; count.per converges per group —
+            // both are rejected at the ScaleTask RPC and skipped here.
+            if keyed || task.count.per.is_some() {
+                continue;
+            }
+            let effective =
+                self.effective_task_count(&job_id, &task.group, &task.name, task.count.num)?;
+            let mut task_allocs: Vec<&Allocation> = allocations
+                .iter()
+                .filter(|allocation| allocation.task_config_id == *task_id)
+                .collect();
+            if task_allocs.len() <= effective as usize {
+                continue;
+            }
+            let slot_mode = task
+                .stateful
+                .as_ref()
+                .is_some_and(|stateful| stateful.mode == InstanceMode::Slot);
+            if slot_mode {
+                task_allocs.sort_by_key(|allocation| {
+                    std::cmp::Reverse(
+                        slot_by_allocation
+                            .get(&allocation.id)
+                            .copied()
+                            .unwrap_or(i64::MIN),
+                    )
+                });
+            } else {
+                task_allocs.sort_by_key(|allocation| std::cmp::Reverse(allocation.id));
+            }
+            let excess = task_allocs.len() - effective as usize;
+            surplus.extend(task_allocs.into_iter().take(excess).cloned());
+        }
+
+        if surplus.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut conn = self.write_connection()?;
+        let tx = Self::write_tx(&mut conn)?;
+        for allocation in &surplus {
+            tx.execute("DELETE FROM allocation WHERE id = ?;", [allocation.id])?;
+        }
+        // Every removal records WHY, in the same transaction that removes it
+        // (preemption plan § Phase 1a). Scale-in gets its own cause rather
+        // than borrowing `Update`: no new job config version exists here.
+        self.record_stop_notices_tx(&tx, &surplus, StopCause::ScaleIn)?;
+        self.release_instance_bindings_tx(&tx, &surplus)?;
+        self.bump_epochs_for_allocations_tx(&tx, &surplus)?;
+        tx.commit()?;
+        drop(conn);
+
+        self.cache_remove_allocations(&surplus)?;
+        self.events()
+            .allocations_removed_for_job_config(job_config_id, &surplus);
+
+        Ok(surplus)
+    }
+
+    /// Promote pending scale-ins after a rollout reached a terminal status,
+    /// emit their events, and enqueue the reconciling `job_scale` eval.
+    /// Composite of two sequential single-lane ops (Control promote →
+    /// Scheduler enqueue), the JC-33 wrapper-sequential shape.
+    pub fn apply_pending_scales_after_rollout(
+        &self,
+        job_id: &str,
+        job_config_id: &str,
+    ) -> R<usize> {
+        let promoted = self.promote_pending_task_scales(job_id)?;
+        if promoted.is_empty() {
+            return Ok(0);
+        }
+        for scale in &promoted {
+            self.events().scale_applied(
+                job_id,
+                &scale.task_group,
+                &scale.task_name,
+                None,
+                scale.count.unwrap_or_default(),
+                &scale.source,
+                "deferred scale-in applied after rollout",
+            );
+        }
+        self.enqueue_eval("job_scale", Some(job_id), Some(job_config_id), None, None)?;
+        Ok(promoted.len())
     }
 
     /// Bring a job config back to its desired allocation counts.
@@ -8202,7 +9597,7 @@ impl Store {
             return Ok(());
         }
 
-        let affected_job_configs = self.remove_allocations(&removable)?;
+        let affected_job_configs = self.remove_allocations(&removable, StopCause::NodeLost)?;
         for job_config_id in affected_job_configs {
             self.reconcile_job_config_allocations(&job_config_id)?;
         }
@@ -8289,17 +9684,25 @@ impl Store {
     /// Remove specific allocation rows (releasing instance bindings and
     /// bumping epochs, like every other allocation-removal path) and return
     /// the affected job config ids.
-    pub(crate) fn remove_allocations(&self, allocs: &[Allocation]) -> R<HashSet<String>> {
+    pub(crate) fn remove_allocations(
+        &self,
+        allocs: &[Allocation],
+        cause: StopCause,
+    ) -> R<HashSet<String>> {
         if allocs.is_empty() {
             return Ok(HashSet::new());
         }
         let allocs = allocs.to_vec();
         self.replicated(Lane::Scheduler, "remove_allocations", move |s| {
-            s.remove_allocations_apply(&allocs)
+            s.remove_allocations_apply(&allocs, cause)
         })
     }
 
-    fn remove_allocations_apply(&self, allocs: &[Allocation]) -> R<HashSet<String>> {
+    fn remove_allocations_apply(
+        &self,
+        allocs: &[Allocation],
+        cause: StopCause,
+    ) -> R<HashSet<String>> {
         let mut conn = self.write_connection()?;
         let tx = Self::write_tx(&mut conn)?;
         for alloc in allocs {
@@ -8307,6 +9710,7 @@ impl Store {
         }
         self.release_instance_bindings_tx(&tx, allocs)?;
         self.bump_epochs_for_allocations_tx(&tx, allocs)?;
+        self.record_stop_notices_tx(&tx, allocs, cause)?;
         tx.commit()?;
 
         self.cache_remove_allocations(allocs)?;
@@ -9066,6 +10470,7 @@ impl Store {
             params![now, instance_id],
         )?;
         self.bump_epochs_for_allocations_tx(&tx, &allocations)?;
+        self.record_stop_notices_tx(&tx, &allocations, StopCause::Destroy)?;
         tx.commit()?;
 
         self.cache_remove_allocations(&allocations)?;
@@ -9161,6 +10566,7 @@ impl Store {
             params![now, instance_id],
         )?;
         self.bump_epochs_for_allocations_tx(&tx, &allocations)?;
+        self.record_stop_notices_tx(&tx, &allocations, StopCause::Stop)?;
         tx.commit()?;
 
         self.cache_remove_allocations(&allocations)?;
@@ -12452,6 +13858,168 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn available_node_cache_tracks_node_mutations() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("cache-a", "active"))?;
+        store.insert_node(make_node_msg("cache-b", "active"))?;
+
+        let first = store.available_node_arcs()?;
+        assert_eq!(
+            first.iter().map(|n| n.id.as_str()).collect::<Vec<_>>(),
+            vec!["cache-a", "cache-b"],
+            "sorted by id"
+        );
+        // Second read is served from the cache and must be identical.
+        let second = store.available_node_arcs()?;
+        assert_eq!(second.len(), 2);
+        assert!(
+            Arc::ptr_eq(&first[0], &second[0]),
+            "cache serves the same Arcs"
+        );
+
+        // A lost node must drop out on the next read.
+        store.mark_nodes_as_lost(&["cache-a".to_string()])?;
+        let after_lost = store.available_node_arcs()?;
+        assert_eq!(
+            after_lost.iter().map(|n| n.id.as_str()).collect::<Vec<_>>(),
+            vec!["cache-b"]
+        );
+
+        // A removed node must drop out too.
+        store.remove_node("cache-b")?;
+        assert!(store.available_node_arcs()?.is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn batched_heartbeats_stamp_every_node_once() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("hb-a", "active"))?;
+        store.insert_node(make_node_msg("hb-b", "active"))?;
+        store.insert_node(make_node_msg("hb-c", "active"))?;
+
+        // Duplicates dedupe; an unregistered id stays a no-op that errors
+        // NotFound for exactly that caller, as the single op always did (a
+        // ghost worker must not believe it is healthy).
+        let results = store.run_heartbeat_batch(vec![
+            "hb-a".to_string(),
+            "hb-b".to_string(),
+            "hb-b".to_string(),
+            "hb-c".to_string(),
+            "hb-ghost".to_string(),
+        ]);
+        assert_eq!(results.len(), 5);
+        for result in &results[..4] {
+            assert!(result.is_ok(), "batched heartbeat failed: {result:?}");
+        }
+        assert!(
+            matches!(
+                results[4]
+                    .as_ref()
+                    .err()
+                    .and_then(|err| err.downcast_ref::<StorageError>()),
+                Some(StorageError::NotFound { .. })
+            ),
+            "ghost heartbeat must keep its typed NotFound: {:?}",
+            results[4]
+        );
+
+        let conn = store.read_connection()?;
+        let stamped: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM node_health
+             WHERE node_id IN ('hb-a','hb-b','hb-c')
+               AND last_heartbeat != '' AND last_heartbeat_unix IS NOT NULL;",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(stamped, 3, "every real node gets both timestamp columns");
+        let ghosts: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM node_health WHERE node_id = 'hb-ghost';",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(ghosts, 0, "unregistered ids must stay a no-op");
+        Ok(())
+    }
+
+    #[test]
+    fn heartbeat_transition_reprojects_and_bare_refresh_skips() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("hb-t", "active"))?;
+        store.update_node_heartbeat("hb-t".to_string())?;
+
+        // Bare refresh of an active node: the cached Node must not be
+        // rebuilt (the skip this heartbeat path exists for).
+        let before = store.scheduling_read_model()?;
+        let cached_before = before.nodes.get("hb-t").cloned().context("cached")?;
+        store.update_node_heartbeat("hb-t".to_string())?;
+        let after = store.scheduling_read_model()?;
+        let cached_after = after.nodes.get("hb-t").cloned().context("cached")?;
+        assert!(
+            Arc::ptr_eq(&cached_before, &cached_after),
+            "an active node's bare heartbeat refresh must not reproject the cached node"
+        );
+
+        // Lost -> active transition: the heartbeat must reproject the
+        // cached node (its status flips), unlike the bare refresh above.
+        // (Availability stays with `mark_node_ready` — heartbeats only own
+        // liveness status.)
+        store.mark_nodes_as_lost(&["hb-t".to_string()])?;
+        let lost_cached = store
+            .scheduling_read_model()?
+            .nodes
+            .get("hb-t")
+            .cloned()
+            .context("cached")?;
+        assert_eq!(lost_cached.status, "lost");
+        store.update_node_heartbeat("hb-t".to_string())?;
+        let recovered_cached = store
+            .scheduling_read_model()?
+            .nodes
+            .get("hb-t")
+            .cloned()
+            .context("cached")?;
+        assert_eq!(
+            recovered_cached.status, "active",
+            "a lost node's heartbeat must reproject the cached node"
+        );
+        assert_eq!(store.node_lost_at("hb-t")?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_heartbeats_coalesce_and_all_stamp() -> R<()> {
+        let store = setup_store()?;
+        let mut ids = Vec::new();
+        for index in 0..16 {
+            let id = format!("hb-conc-{index}");
+            store.insert_node(make_node_msg(&id, "active"))?;
+            ids.push(id);
+        }
+        let handles: Vec<_> = ids
+            .iter()
+            .cloned()
+            .map(|id| {
+                let store = store.clone();
+                std::thread::spawn(move || store.update_node_heartbeat(id))
+            })
+            .collect();
+        for handle in handles {
+            handle.join().expect("heartbeat thread panicked")?;
+        }
+        let conn = store.read_connection()?;
+        let stamped: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM node_health
+             WHERE node_id LIKE 'hb-conc-%' AND last_heartbeat_unix IS NOT NULL;",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(stamped, 16);
+        Ok(())
+    }
+
     /// The cached-pool invariant behind `ResourceLedger::from_snapshot`
     /// (scheduler-plan-snapshot plan): after ANY sequence of read-model
     /// mutations, every available node's cached pool equals a from-scratch
@@ -12600,7 +14168,7 @@ mod tests {
         // The defaults keep the node visible to the lost-checker feed...
         assert_eq!(
             store.get_node_ids_and_heartbeats()?,
-            vec![("node-one".to_string(), String::new())]
+            vec![("node-one".to_string(), String::new(), None)]
         );
 
         // ...and the first heartbeat (an upsert) creates the row again.
@@ -12897,6 +14465,7 @@ mod tests {
 
         let worker_config = WorkerConfig {
             host_volumes: String::new(),
+            resource_enforcement: String::new(),
             name: "test".to_string(),
             pool: "default".to_string(),
             additional_node_checks: vec![],
@@ -12906,6 +14475,7 @@ mod tests {
             reserved_resources: "{}".into(),
             max_allocations: None,
             artifacts: String::new(),
+            heartbeat_seconds: Some(5),
         };
 
         let returned_config = store.insert_worker_type(&worker_config)?;
@@ -12914,6 +14484,7 @@ mod tests {
         let returned_config = store.get_worker_type("test".to_string())?;
         assert_eq!(returned_config.name, worker_config.name);
         assert_eq!(returned_config.pool, worker_config.pool);
+        assert_eq!(returned_config.heartbeat_seconds, Some(5));
         let val = returned_config
             .attributes
             .get("test")
@@ -12930,6 +14501,7 @@ mod tests {
 
         let worker_config = WorkerConfig {
             host_volumes: String::new(),
+            resource_enforcement: String::new(),
             name: "empty".to_string(),
             pool: "default".to_string(),
             additional_node_checks: vec![],
@@ -12939,12 +14511,14 @@ mod tests {
             reserved_resources: "{}".into(),
             max_allocations: None,
             artifacts: String::new(),
+            heartbeat_seconds: None,
         };
 
         store.insert_worker_type(&worker_config)?;
 
         let returned_config = store.get_worker_type(worker_config.name.clone())?;
         assert!(returned_config.additional_node_checks.is_empty());
+        assert_eq!(returned_config.heartbeat_seconds, None);
 
         Ok(())
     }
@@ -14319,6 +15893,243 @@ mod tests {
     }
 
     #[test]
+    fn read_model_generation_bumps_on_allocation_publish() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "ready"))?;
+
+        let job = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "job-generation".into(),
+            tasks: vec![TaskConfig::new("task", "noop")],
+            version: None,
+        };
+        store.handle_job_submit(
+            &job,
+            &[Submission {
+                path: "job.jsonnet".into(),
+                content: "job".into(),
+                is_primary: true,
+            }],
+        )?;
+        let task_id = task_id_for(&store, "task", "job-generation")?;
+
+        let quiet_a = store.read_model_generation()?;
+        let quiet_b = store.read_model_generation()?;
+        assert_eq!(quiet_a, quiet_b, "reads alone must not move the counter");
+
+        store.place_alloc("node-a", task_id)?;
+        let after_place = store.read_model_generation()?;
+        assert!(
+            after_place > quiet_b,
+            "an allocation publish must bump the generation"
+        );
+
+        // A full rebuild is a publish too (it may change anything).
+        store.refresh_read_model()?;
+        let after_refresh = store.read_model_generation()?;
+        assert!(after_refresh > after_place);
+
+        Ok(())
+    }
+
+    #[test]
+    fn lazy_expected_versions_match_eager_when_quiet_and_bail_on_publish() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "ready"))?;
+        store.insert_node(make_node_msg("node-b", "ready"))?;
+
+        let job = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "job-lazy".into(),
+            tasks: vec![TaskConfig::new("task", "noop")],
+            version: None,
+        };
+        store.handle_job_submit(
+            &job,
+            &[Submission {
+                path: "job.jsonnet".into(),
+                content: "job".into(),
+                is_primary: true,
+            }],
+        )?;
+        let job_config_id = store.get_job_config("job-lazy")?.id();
+        let task_id = task_id_for(&store, "task", "job-lazy")?;
+        store.place_alloc("node-a", task_id)?;
+
+        // Quiet read model: the late sample is available and equals the
+        // eager path's selection for the same affected scopes.
+        let generation = store.read_model_generation()?;
+        let affected = HashSet::from(["node-a".to_string()]);
+        let lazy = store
+            .expected_versions_if_unchanged(&job_config_id, &affected, generation)?
+            .expect("generation unchanged: the lazy sample must be available");
+        let eager = store.allocation_version_vector(&job_config_id, &affected)?;
+        assert_eq!(lazy, eager, "lazy sample must equal the eager sample");
+
+        // A publish between the capacity read and the late sample voids it.
+        store.place_alloc("node-b", task_id)?;
+        assert!(
+            store
+                .expected_versions_if_unchanged(&job_config_id, &affected, generation)?
+                .is_none(),
+            "a moved generation must force the eager fallback"
+        );
+
+        Ok(())
+    }
+
+    fn submit_named_job(store: &Store, name: &str) -> R<(String, i64)> {
+        let job = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: name.into(),
+            tasks: vec![TaskConfig::new("task", "noop")],
+            version: None,
+        };
+        store.handle_job_submit(
+            &job,
+            &[Submission {
+                path: format!("{name}.jsonnet"),
+                content: name.into(),
+                is_primary: true,
+            }],
+        )?;
+        let job_config_id = store.get_job_config(name)?.id();
+        let task_id = task_id_for(store, "task", name)?;
+        Ok((job_config_id, task_id))
+    }
+
+    #[test]
+    fn plan_batch_isolates_batch_mate_outcomes() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "ready"))?;
+        store.insert_node(make_node_msg("node-b", "ready"))?;
+        store.insert_node(make_node_msg("node-c", "ready"))?;
+        let (job_a, task_a) = submit_named_job(&store, "batch-job-a")?;
+        let (job_b, _task_b) = submit_named_job(&store, "batch-job-b")?;
+        let (job_c, task_c) = submit_named_job(&store, "batch-job-c")?;
+
+        let versions_a =
+            store.allocation_version_vector(&job_a, &HashSet::from(["node-a".to_string()]))?;
+        // Poisoned: a placement referencing a task id that does not exist,
+        // on its own node so the epoch CAS passes and the failure happens
+        // mid-apply (the isolation case, not a rejection).
+        let versions_b =
+            store.allocation_version_vector(&job_b, &HashSet::from(["node-c".to_string()]))?;
+        let versions_c =
+            store.allocation_version_vector(&job_c, &HashSet::from(["node-b".to_string()]))?;
+
+        let results = store.run_plan_apply_batch(vec![
+            PlanApplyRequest {
+                job_config_id: job_a.clone(),
+                mode: "fresh".into(),
+                placements: PlanPlacements::Nodes(vec![("node-a".to_string(), task_a)]),
+                expected_versions: versions_a,
+            },
+            PlanApplyRequest {
+                job_config_id: job_b.clone(),
+                mode: "fresh".into(),
+                placements: PlanPlacements::Nodes(vec![("node-c".to_string(), 999_999)]),
+                expected_versions: versions_b,
+            },
+            PlanApplyRequest {
+                job_config_id: job_c.clone(),
+                mode: "fresh".into(),
+                placements: PlanPlacements::Nodes(vec![("node-b".to_string(), task_c)]),
+                expected_versions: versions_c,
+            },
+        ]);
+
+        assert_eq!(results.len(), 3);
+        assert!(
+            matches!(results[0], Ok((_, PlanApplyOutcome::Applied(_)))),
+            "first plan must apply: {:?}",
+            results[0]
+        );
+        assert!(results[1].is_err(), "poisoned plan must fail alone");
+        assert!(
+            matches!(results[2], Ok((_, PlanApplyOutcome::Applied(_)))),
+            "batch-mate after the failure must still apply: {:?}",
+            results[2]
+        );
+        assert_eq!(store.allocs_for_node("node-a")?.len(), 1);
+        assert_eq!(store.allocs_for_node("node-b")?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn plan_batch_keeps_per_plan_cas_verdicts() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "ready"))?;
+        let (job_a, task_a) = submit_named_job(&store, "cas-job-a")?;
+        let (job_b, task_b) = submit_named_job(&store, "cas-job-b")?;
+
+        let fresh =
+            store.allocation_version_vector(&job_a, &HashSet::from(["node-a".to_string()]))?;
+        // Stale by construction: bump node-a's epoch after sampling.
+        let stale =
+            store.allocation_version_vector(&job_b, &HashSet::from(["node-a".to_string()]))?;
+        store.place_alloc("node-a", task_a)?;
+
+        let results = store.run_plan_apply_batch(vec![PlanApplyRequest {
+            job_config_id: job_b.clone(),
+            mode: "fresh".into(),
+            placements: PlanPlacements::Nodes(vec![("node-a".to_string(), task_b)]),
+            expected_versions: stale,
+        }]);
+        assert!(
+            matches!(results[0], Ok((_, PlanApplyOutcome::Rejected { .. }))),
+            "stale epochs must reject inside a batch exactly as they do alone: {:?}",
+            results[0]
+        );
+
+        // And a fresh sample for the untouched job still applies.
+        let _ = fresh;
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_plan_submitters_coalesce_and_every_plan_lands() -> R<()> {
+        let store = setup_store()?;
+        let mut requests = Vec::new();
+        for index in 0..8 {
+            let node = format!("node-{index}");
+            store.insert_node(make_node_msg(&node, "ready"))?;
+            let (job_config_id, task_id) =
+                submit_named_job(&store, &format!("coalesce-job-{index}"))?;
+            let versions =
+                store.allocation_version_vector(&job_config_id, &HashSet::from([node.clone()]))?;
+            requests.push((job_config_id, node, task_id, versions));
+        }
+
+        let handles: Vec<_> = requests
+            .into_iter()
+            .map(|(job_config_id, node, task_id, versions)| {
+                let store = store.clone();
+                std::thread::spawn(move || {
+                    store.submit_and_apply_plan(
+                        &job_config_id,
+                        "fresh",
+                        &[(node, task_id)],
+                        &versions,
+                    )
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            let (_, outcome) = handle.join().expect("submitter panicked")?;
+            assert!(
+                matches!(outcome, PlanApplyOutcome::Applied(_)),
+                "distinct-scope plans must all apply: {outcome:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn plan_submission_rejects_stale_epoch_for_same_job_config() -> R<()> {
         let store = setup_store()?;
         store.insert_node(make_node_msg("node-a", "ready"))?;
@@ -14835,8 +16646,87 @@ mod tests {
         let statuses = store.task_statuses_for_job_config(&job_config_id)?;
         let prep_id = task_id_for(&store, "prep", &job.name)?;
         let api_id = task_id_for(&store, "api", &job.name)?;
+        // node-a advertises no protocol version, so it is a pre-exit-report
+        // worker and its batch task keeps the legacy optimistic Success.
         assert_eq!(statuses.get(&prep_id), Some(&TaskStatusState::Success));
         assert_eq!(statuses.get(&api_id), Some(&TaskStatusState::Running));
+
+        Ok(())
+    }
+
+    /// On a worker that reports exits, a batch task is `Running` until the
+    /// process actually exits — that is what makes `condition: "success"`
+    /// mean "exited 0" instead of "was placed".
+    #[test]
+    fn batch_task_status_waits_for_a_real_exit_on_supervising_workers() -> R<()> {
+        let store = setup_store()?;
+        let mut node = make_node_msg("node-a", "ready");
+        node.dynamic_attrs = json!({ "protocolVersion": 2 }).to_string();
+        store.insert_node(node)?;
+
+        let job = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "batch-exit-demo".into(),
+            tasks: vec![TaskConfig {
+                lifecycle: TaskLifecycle::Batch,
+                ..TaskConfig::new("prep", "exec")
+            }],
+            version: None,
+        };
+        store.handle_job_submit(
+            &job,
+            &[Submission {
+                path: "job.jsonnet".into(),
+                content: "job".into(),
+                is_primary: true,
+            }],
+        )?;
+        let job_config_id = store.get_job_config(&job.name)?.id();
+        let prep_id = task_id_for(&store, "prep", &job.name)?;
+
+        let scheduler = Scheduler::new(&store)?;
+        let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
+        store.update_task_statuses_for_allocations(&outcome.allocations)?;
+
+        let statuses = store.task_statuses_for_job_config(&job_config_id)?;
+        assert_eq!(
+            statuses.get(&prep_id),
+            Some(&TaskStatusState::Running),
+            "a placed batch task has not succeeded yet"
+        );
+
+        // The worker reports the process exited 0.
+        let allocation_id = outcome.allocations[0].id;
+        let completed = store
+            .complete_allocation(allocation_id, true)?
+            .expect("allocation exists");
+        assert_eq!(completed.status, "complete");
+        assert_eq!(
+            store
+                .task_statuses_for_job_config(&job_config_id)?
+                .get(&prep_id),
+            Some(&TaskStatusState::Success)
+        );
+        // The row survives: deleting it would leave the desired count unmet
+        // and re-run the batch task immediately.
+        assert!(store.get_allocation_by_id(allocation_id)?.is_some());
+
+        // A non-zero exit fails the task instead.
+        store.complete_allocation(allocation_id, false)?;
+        assert_eq!(
+            store
+                .task_statuses_for_job_config(&job_config_id)?
+                .get(&prep_id),
+            Some(&TaskStatusState::Failed)
+        );
+        assert_eq!(
+            store
+                .get_allocation_by_id(allocation_id)?
+                .expect("allocation exists")
+                .status,
+            "failed"
+        );
 
         Ok(())
     }
@@ -14919,6 +16809,204 @@ mod tests {
             }],
         )?;
         assert_eq!(artifact_events(&store)?.len(), 2);
+        Ok(())
+    }
+
+    /// Seed a one-task job and place an allocation for it on `node_id`.
+    fn seed_placed_allocation(store: &Store, job_name: &str, node_id: &str) -> R<Allocation> {
+        let job = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: job_name.into(),
+            tasks: vec![TaskConfig::new("web", "noop")],
+            version: None,
+        };
+        store.handle_job_submit(
+            &job,
+            &[Submission {
+                path: "job.jsonnet".into(),
+                content: "{}".into(),
+                is_primary: true,
+            }],
+        )?;
+        let task_id = task_id_for(store, "web", &job.name)?;
+        store.place_alloc(node_id, task_id)
+    }
+
+    /// Scale-in is a platform-initiated removal like any other, so it must
+    /// record WHY (preemption plan § Phase 1a) — and with its own cause, not
+    /// `update`: no new job config version exists, which is the entire point
+    /// of the count-override surface (docs/autoscaling.md).
+    #[test]
+    fn scale_in_records_its_own_stop_cause() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "ready"))?;
+
+        let job = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "scale-cause".into(),
+            tasks: vec![TaskConfig {
+                count: TaskCount::new(2),
+                ..TaskConfig::new("web", "noop")
+            }],
+            version: None,
+        };
+        store.handle_job_submit(
+            &job,
+            &[Submission {
+                path: "job.jsonnet".into(),
+                content: "{}".into(),
+                is_primary: true,
+            }],
+        )?;
+        let job_config_id = store.get_job_config("scale-cause")?.id();
+        let task_id = task_id_for(&store, "web", "scale-cause")?;
+        let first = store.place_alloc("node-a", task_id)?;
+        let second = store.place_alloc("node-a", task_id)?;
+        assert!(store.stop_notices_for_node("node-a")?.is_empty());
+
+        // Scale 2 -> 1: the newest allocation is retired.
+        store.set_task_scale_override(
+            "scale-cause",
+            "default",
+            "web",
+            1,
+            2,
+            "operator",
+            "test",
+            "t",
+        )?;
+        let retired = store.retire_surplus_allocations(&job_config_id)?;
+        assert_eq!(retired.len(), 1);
+        assert_eq!(retired[0].id, second.id.max(first.id));
+
+        assert_eq!(
+            store.stop_notices_for_node("node-a")?,
+            vec![(retired[0].id, StopCause::ScaleIn)],
+            "a scaled-in allocation reports scale_in, not update"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn stop_notice_records_the_cause_and_serves_it_to_the_owning_node() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "ready"))?;
+        store.insert_node(make_node_msg("node-b", "ready"))?;
+        let allocation = seed_placed_allocation(&store, "notice-demo", "node-a")?;
+
+        // Nothing removed yet: no notices.
+        assert!(store.stop_notices_for_node("node-a")?.is_empty());
+
+        store.remove_allocation_by_id_because(allocation.id, StopCause::Drain)?;
+
+        let notices = store.stop_notices_for_node("node-a")?;
+        assert_eq!(
+            notices,
+            vec![(allocation.id, StopCause::Drain)],
+            "the owning node learns why its allocation went away"
+        );
+        // Notices are addressed to one node; a different node must not see
+        // another node's stops.
+        assert!(
+            store.stop_notices_for_node("node-b")?.is_empty(),
+            "notices are scoped to the node that owned the allocation"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn stop_notice_is_absent_when_the_cause_is_unknown() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "ready"))?;
+        let allocation = seed_placed_allocation(&store, "unknown-demo", "node-a")?;
+
+        // The worker-failure-report path: the task died on its own, so there
+        // is no platform stop to explain. Recording `unknown` would be noise
+        // — the worker defaults to it anyway.
+        store.remove_allocation_by_id(allocation.id)?;
+
+        assert!(
+            store.stop_notices_for_node("node-a")?.is_empty(),
+            "an unknown cause records nothing"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn stop_notices_expire_and_are_pruned_by_later_removals() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "ready"))?;
+        // Both allocations are placed before either is removed: allocation
+        // ids are plain rowids and get REUSED after a delete, so seeding them
+        // one at a time would hand both the same id and quietly turn this
+        // into a test of `INSERT OR REPLACE`.
+        let first = seed_placed_allocation(&store, "expiry-demo-1", "node-a")?;
+        let second = seed_placed_allocation(&store, "expiry-demo-2", "node-a")?;
+        assert_ne!(first.id, second.id);
+
+        store.remove_allocation_by_id_because(first.id, StopCause::Stop)?;
+        assert_eq!(store.stop_notices_for_node("node-a")?.len(), 1);
+
+        // Backdate the notice past the retention window. The read path must
+        // filter it even before anything prunes it, so a stale cause can
+        // never be served.
+        {
+            let conn = store.write_connection()?;
+            conn.execute(
+                "UPDATE allocation_stop_notice SET created_at_unix = ?1 WHERE allocation_id = ?2;",
+                params![
+                    OffsetDateTime::now_utc().unix_timestamp() - STOP_NOTICE_RETENTION_SECS - 1,
+                    first.id
+                ],
+            )?;
+        }
+        assert!(
+            store.stop_notices_for_node("node-a")?.is_empty(),
+            "an expired notice is filtered on read"
+        );
+
+        // The next removal's transaction is what actually deletes it: expiry
+        // rides scheduler-lane writes, never the heartbeat read path.
+        store.remove_allocation_by_id_because(second.id, StopCause::Stop)?;
+
+        let remaining: i64 = store.read_connection()?.query_row(
+            "SELECT COUNT(*) FROM allocation_stop_notice WHERE allocation_id = ?1;",
+            params![first.id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(remaining, 0, "the expired row was pruned by the next write");
+        assert_eq!(
+            store.stop_notices_for_node("node-a")?,
+            vec![(second.id, StopCause::Stop)],
+            "the live notice survives the prune"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn job_stop_and_drain_record_distinguishable_causes() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "ready"))?;
+        let allocation = seed_placed_allocation(&store, "cause-demo", "node-a")?;
+
+        // `job stop` — the whole point of Phase 1a is that this is no longer
+        // indistinguishable from a drain or an update on the wire.
+        store.remove_allocs_for_job("cause-demo")?;
+        assert_eq!(
+            store.stop_notices_for_node("node-a")?,
+            vec![(allocation.id, StopCause::Stop)]
+        );
+
+        // And the event journal carries it too.
+        let events = store.list_scheduler_events(&SchedulerEventFilter::default())?;
+        let removed = events
+            .iter()
+            .find(|event| event.kind == "allocation.removed")
+            .context("a removal event should have been recorded")?;
+        let meta: Value = serde_json::from_str(&removed.metadata_json)?;
+        assert_eq!(meta["cause"], json!("stop"));
         Ok(())
     }
 
@@ -15073,8 +17161,12 @@ mod tests {
         let store = setup_store()?;
 
         // Empty inputs are no-ops, so callers don't need their own guards.
-        store.events().allocations_removed_from_node("node-a", &[]);
-        store.events().allocations_removed_for_job("demo", 0);
+        store
+            .events()
+            .allocations_removed_from_node("node-a", &[], StopCause::NodeLost);
+        store
+            .events()
+            .allocations_removed_for_job("demo", 0, StopCause::Stop);
         assert!(drafts::allocations_placed("cfg-1", &[], &[]).is_none());
         assert!(drafts::job_submit_outcome(
             "demo",
@@ -16818,6 +18910,180 @@ mod tests {
     //     let _store = setup_store()?;
     //     Ok(())
     // }
+
+    //
+    // job mtime (`job.updated_at`) — see the job-updated-at plan.
+    //
+
+    /// Submit `name` with one noop task whose runtime marker is `marker`, so
+    /// two calls with different markers are two distinct spec versions.
+    fn submit_versioned_job(store: &Store, name: &str, marker: &str) -> R<()> {
+        let task = TaskConfig::new(marker, "noop");
+        let job = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: name.into(),
+            tasks: vec![task],
+            version: None,
+        };
+        store.handle_job_submit(
+            &job,
+            &[Submission {
+                path: "job.jsonnet".into(),
+                content: format!("{{ marker: '{marker}' }}"),
+                is_primary: true,
+            }],
+        )?;
+        Ok(())
+    }
+
+    /// Drag a job's timestamps into the past so a mtime bump is observable
+    /// without sleeping — the column is whole seconds, so a same-second
+    /// write is indistinguishable from no write at all.
+    fn backdate_job(store: &Store, name: &str, seconds_ago: i64) -> R<i64> {
+        let then = OffsetDateTime::now_utc().unix_timestamp() - seconds_ago;
+        let conn = store.write_connection()?;
+        conn.execute(
+            "UPDATE job SET created_at = ?2, updated_at = ?2 WHERE id = ?1;",
+            params![name, then],
+        )?;
+        Ok(then)
+    }
+
+    #[test]
+    fn a_new_job_reports_the_same_created_and_updated_time() -> R<()> {
+        let store = setup_store()?;
+        submit_versioned_job(&store, "mtime-new", "v1")?;
+
+        let job = store.get_job("mtime-new")?;
+        assert_eq!(
+            job.created_at, job.updated_at,
+            "a job that has never changed has not been updated since it was created"
+        );
+        assert!(
+            job.created_at > 0,
+            "timestamp is real, got {}",
+            job.created_at
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn submitting_a_new_spec_version_moves_updated_at_but_not_created_at() -> R<()> {
+        let store = setup_store()?;
+        submit_versioned_job(&store, "mtime-resubmit", "v1")?;
+        let then = backdate_job(&store, "mtime-resubmit", 3_600)?;
+
+        submit_versioned_job(&store, "mtime-resubmit", "v2")?;
+
+        let job = store.get_job("mtime-resubmit")?;
+        assert_eq!(
+            job.created_at, then,
+            "created_at is the job's birth time and a resubmit must not move it"
+        );
+        assert!(
+            job.updated_at > then,
+            "a new spec version is a change to the job: {} !> {then}",
+            job.updated_at
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resubmitting_an_unchanged_spec_leaves_updated_at_alone() -> R<()> {
+        let store = setup_store()?;
+        submit_versioned_job(&store, "mtime-unchanged", "v1")?;
+        let then = backdate_job(&store, "mtime-unchanged", 3_600)?;
+
+        // Byte-identical resubmit: the store short-circuits to `Unchanged`,
+        // and nothing about the job actually changed.
+        submit_versioned_job(&store, "mtime-unchanged", "v1")?;
+
+        let job = store.get_job("mtime-unchanged")?;
+        assert_eq!(
+            job.updated_at, then,
+            "an unchanged resubmit is not a change"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn job_status_transitions_move_updated_at() -> R<()> {
+        let store = setup_store()?;
+        submit_versioned_job(&store, "mtime-status", "v1")?;
+
+        let then = backdate_job(&store, "mtime-status", 3_600)?;
+        store.stop_job("mtime-status")?;
+        let stopped = store.get_job("mtime-status")?;
+        assert_eq!(stopped.status, "stopped");
+        assert!(stopped.updated_at > then, "stop moves the mtime");
+        assert_eq!(stopped.created_at, then, "stop leaves created_at alone");
+
+        let then = backdate_job(&store, "mtime-status", 3_600)?;
+        assert!(store.clear_job_stopped_status("mtime-status")?);
+        assert!(
+            store.get_job("mtime-status")?.updated_at > then,
+            "revival moves the mtime"
+        );
+
+        let then = backdate_job(&store, "mtime-status", 3_600)?;
+        store.mark_job_failed("mtime-status")?;
+        assert!(
+            store.get_job("mtime-status")?.updated_at > then,
+            "failure moves the mtime"
+        );
+
+        let then = backdate_job(&store, "mtime-status", 3_600)?;
+        assert!(store.clear_job_failed_status("mtime-status")?);
+        assert!(
+            store.get_job("mtime-status")?.updated_at > then,
+            "recovery moves the mtime"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_no_op_status_clear_leaves_updated_at_alone() -> R<()> {
+        // `clear_job_*_status` is called speculatively on every recovery
+        // path. When it matches no row it must not tick the mtime, or every
+        // healthy job in the cluster would read as freshly touched.
+        let store = setup_store()?;
+        submit_versioned_job(&store, "mtime-noop", "v1")?;
+        let then = backdate_job(&store, "mtime-noop", 3_600)?;
+
+        assert!(!store.clear_job_failed_status("mtime-noop")?);
+        assert!(!store.clear_job_stopped_status("mtime-noop")?);
+
+        assert_eq!(
+            store.get_job("mtime-noop")?.updated_at,
+            then,
+            "a status clear that changed nothing is not an update"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn allocation_churn_does_not_move_a_jobs_updated_at() -> R<()> {
+        // The mtime describes the job record, not the workload underneath
+        // it: placements come and go on their own clock and would otherwise
+        // keep every job permanently "just updated".
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "ready"))?;
+        submit_versioned_job(&store, "mtime-churn", "v1")?;
+        let then = backdate_job(&store, "mtime-churn", 3_600)?;
+
+        let task_id = task_id_for(&store, "v1", "mtime-churn")?;
+        let alloc = store.place_alloc("node-a", task_id)?;
+        store.remove_allocation_by_id(alloc.id)?;
+        store.place_alloc("node-a", task_id)?;
+
+        assert_eq!(
+            store.get_job("mtime-churn")?.updated_at,
+            then,
+            "placing and replacing an allocation is not a change to the job"
+        );
+        Ok(())
+    }
 
     fn service_task(name: &str) -> TaskConfig {
         let mut task = TaskConfig::new(name, "noop");

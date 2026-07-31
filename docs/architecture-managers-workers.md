@@ -67,8 +67,37 @@ Worker startup (`run_worker`) flow:
    worker-plane calls (re-registering rotates it; on an Unauthenticated
    heartbeat the worker re-registers with its join secret automatically).
 9. Enter steady-state loops:
-   - Heartbeats every `WORKER_HEARTBEAT_DURATION_SEC` (default 2s).
+   - Heartbeats every `heartbeatSeconds` (worker-type config; default 2s,
+     clamped to 1–30s), with ±10% jitter per beat so a fleet that
+     (re)started together does not stay phase-locked.
    - Node checks every `WORKER_NODE_CHECK_DURATION_SEC` (default 30s).
+
+### Heartbeat cadence and scale
+
+The heartbeat interval is the manager-load knob for large fleets: 10k
+workers at the default 2s cadence is 5,000 heartbeat RPCs/second.
+
+- **`heartbeatSeconds`** in a worker-type config raises the cadence
+  fleet-wide (served to workers at pre-registration; a worker talking to
+  an older manager keeps the 2s default). The manager marks a node lost
+  after 10 seconds without a heartbeat, so intervals above ~3s leave
+  fewer than three missed beats of detection margin — the manager logs a
+  warning when loading such a config.
+- **Manager-side group commit**: concurrent heartbeats coalesce into one
+  status-lane store commit (one raft consensus round for the whole
+  batch, up to 128 heartbeats), so heartbeat cost scales with commit
+  rate, not worker count. Semantics per worker are unchanged — each RPC
+  still succeeds only when its heartbeat is durably recorded, and a
+  heartbeat from an unregistered node still errors.
+- **Cheap liveness ticks**: the manager's mark-lost scan compares an
+  integer heartbeat clock (`node_health.last_heartbeat_unix`) against
+  one cutoff — no per-node timestamp parsing — and a bare timestamp
+  refresh of an already-active node skips the scheduler read-model
+  update entirely (status transitions never skip it).
+
+Measured throughput per backend and fleet size lives in
+`benchmarks/scheduler/README.md`
+([testing-and-benchmarks.md](testing-and-benchmarks.md) has the runner).
 
 ## Manager <-> Worker Communication
 

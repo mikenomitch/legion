@@ -553,6 +553,10 @@ pub fn get_migrations() -> Migrations<'static> {
         // from `stateful.storage` is NOT here — it lives in the stateful
         // column and materializes through the instance's storage handle.
         M::up("ALTER TABLE task_config ADD COLUMN volumes JSONB;").down(""),
+        // Exit-driven restart policy for a task (host process supervision
+        // plan). JSON-encoded TaskRestartConfig; NULL/absent == the lifecycle
+        // default (`always` for service/sidecar, `onFailure` for batch).
+        M::up("ALTER TABLE task_config ADD COLUMN restart JSONB;").down(""),
         // Volumes: the manager's record of storage a plugin has (or will)
         // materialize. See docs/volumes.md.
         //
@@ -597,6 +601,13 @@ pub fn get_migrations() -> Migrations<'static> {
         // (JSON map of name -> {path, readOnly, create}); empty == none.
         M::up("ALTER TABLE worker_type ADD COLUMN host_volumes TEXT NOT NULL DEFAULT '';")
             .down(""),
+        // Per-worker resource enforcement (host process supervision plan).
+        // JSON-encoded WorkerResourceEnforcementConfig; empty == off, which is
+        // what every existing worker type gets.
+        M::up(
+            "ALTER TABLE worker_type ADD COLUMN resource_enforcement TEXT NOT NULL DEFAULT '';",
+        )
+        .down(""),
         // How a volume is handed to its consumer: `filesystem` (a directory) or
         // `block` (a device/disk image). Recorded rather than re-derived so a
         // future restore/clone knows the shape without re-probing the plugin.
@@ -926,6 +937,110 @@ pub fn get_migrations() -> Migrations<'static> {
              WHERE service IS NOT NULL AND json_valid(service);",
         )
         .down("DROP INDEX IF EXISTS idx_task_config_service_name;"),
+        // Integer heartbeat clock for the liveness scan (heartbeat-scale
+        // plan §4): the manager's 2s liveness tick compares every node's
+        // last heartbeat against a cutoff, and parsing the RFC3339 text
+        // column per node per tick is 10k parses every 2s at 10k workers.
+        // Heartbeats now write both columns; the scan compares integers and
+        // falls back to parsing the text only for rows written before this
+        // migration (NULL unix), which age out on their next heartbeat. The
+        // text column stays — it is the human/API-facing representation.
+        M::up("ALTER TABLE node_health ADD COLUMN last_heartbeat_unix INTEGER;").down(""),
+        // The per-heartbeat volume-destroy feed (`volumes_to_destroy_for_node`)
+        // filters on state = 'destroying' but its node disjunction defeats
+        // any full-column index; a partial index keeps the per-heartbeat
+        // query O(destroying rows) — almost always zero — instead of a
+        // volume-table scan per heartbeat (heartbeat-scale plan §3).
+        M::up(
+            "CREATE INDEX IF NOT EXISTS idx_volume_destroying
+             ON volume(state) WHERE state = 'destroying';",
+        )
+        .down("DROP INDEX IF EXISTS idx_volume_destroying;"),
+        // Worker-type heartbeat cadence (heartbeat-scale plan §5): NULL =
+        // the built-in default (2s). Served to workers at pre-registration.
+        M::up("ALTER TABLE worker_type ADD COLUMN heartbeat_seconds INTEGER;").down(""),
+        // Job mtime (job-updated-at plan §2). The job row only ever carried
+        // `created_at`, so every surface that wanted "when did this job last
+        // change" — the UI's Updated column most visibly — showed the
+        // submission time instead, and a job stopped or resubmitted months
+        // later still read as untouched. Unix seconds, matching
+        // `job.created_at`; NULL only until the backfill below runs.
+        M::up("ALTER TABLE job ADD COLUMN updated_at INTEGER;").down(""),
+        // Backfill: pre-migration rows have no mtime to recover, and their
+        // creation time is the only honest lower bound. Guarded on
+        // `typeof(created_at)` so a row whose created_at was written as text
+        // (only the pre-rename migration fixtures do this) leaves updated_at
+        // NULL rather than poisoning an INTEGER column with a string —
+        // `job_from_row` falls back to created_at for those.
+        M::up(
+            "UPDATE job SET updated_at = created_at
+             WHERE updated_at IS NULL AND typeof(created_at) = 'integer';",
+        )
+        .down(""),
+        // Stop causes (preemption-and-eviction plan § Phase 1a). Written in
+        // the same transaction that removes an allocation, so a notice can
+        // never claim a stop that did not happen, and read by the heartbeat
+        // that tells the owning node its allocation is gone.
+        //
+        // Ordered after the job-mtime pair above deliberately: those shipped
+        // to `main` first, so any store that has run that code already counts
+        // them as applied. `rusqlite_migration` tracks the applied *count*,
+        // so inserting these ahead of them would make such a store skip these
+        // two and re-run the job-mtime pair.
+        //
+        // No foreign key to `allocation`: the row this describes is deleted
+        // by the very transaction that inserts the notice. Rows are pruned by
+        // age (`STOP_NOTICE_RETENTION_SECS`) rather than by acknowledgement —
+        // the data is advisory, so bounded staleness beats a delivery
+        // protocol.
+        M::up(
+            "CREATE TABLE IF NOT EXISTS allocation_stop_notice (
+            allocation_id INTEGER PRIMARY KEY,
+            node_id STRING NOT NULL,
+            cause STRING NOT NULL,
+            created_at TIMESTAMP NOT NULL,
+            created_at_unix INTEGER NOT NULL
+        )",
+        )
+        .down("DROP TABLE IF EXISTS allocation_stop_notice;"),
+        // The per-heartbeat notice feed selects by node; without this every
+        // heartbeat scans the table.
+        M::up(
+            "CREATE INDEX IF NOT EXISTS idx_allocation_stop_notice_node
+             ON allocation_stop_notice(node_id);",
+        )
+        .down("DROP INDEX IF EXISTS idx_allocation_stop_notice_node;"),
+        // Count overrides (`legion job scale`, autoscaler plan §6.1): a
+        // task's effective desired count, layered over the spec without a
+        // new job config version. Keyed by the version-stable task tuple
+        // (the same handle slot retirement and keyed instances use), NOT
+        // the version-scoped task_config id, so overrides survive
+        // resubmits. `base_count` records the spec count the override was
+        // laid over — the resubmit-ownership arbiter (docs/autoscaling.md).
+        // `pending_count` holds a scale-in recorded during an active
+        // rollout, promoted to `count` when the rollout finishes; `count`
+        // is NULL while only a pending scale-in exists.
+        //
+        // Kept LAST for the same reason the stop-notice pair above gives:
+        // `rusqlite_migration` tracks the applied count, so a migration that
+        // has already shipped to `main` must keep its position. Anything
+        // added on a branch goes after everything already on `main`.
+        M::up(
+            "CREATE TABLE IF NOT EXISTS task_scale (
+            job_id STRING NOT NULL,
+            task_group STRING NOT NULL,
+            task_name STRING NOT NULL,
+            count INTEGER,
+            pending_count INTEGER,
+            base_count INTEGER NOT NULL,
+            source STRING NOT NULL,
+            reason STRING NOT NULL DEFAULT '',
+            principal STRING NOT NULL DEFAULT '',
+            updated_at TIMESTAMP NOT NULL,
+            PRIMARY KEY (job_id, task_group, task_name)
+        )",
+        )
+        .down("DROP TABLE IF EXISTS task_scale;"),
     ])
 }
 
@@ -1003,6 +1118,67 @@ mod migrations_test {
             .err()
             .is_some();
         assert!(has_kind, "`kind` column should no longer exist");
+
+        Ok(())
+    }
+
+    /// A cluster created before `job.updated_at` existed must come out of the
+    /// migration with a usable mtime rather than a NULL or an epoch-zero
+    /// timestamp — the UI's Updated column reads it directly, and "Jan 1
+    /// 1970" is a worse lie than "never changed since submission".
+    #[test]
+    fn job_updated_at_backfills_from_created_at() -> anyhow::Result<()> {
+        let migrations = get_migrations();
+
+        // Walk to the newest version that predates the column, rather than
+        // hard-coding an index, so appending migrations cannot silently turn
+        // this into a test of nothing.
+        let mut probe = Connection::open_in_memory()?;
+        migrations.to_latest(&mut probe)?;
+        let latest: usize = probe.query_row("PRAGMA user_version;", [], |row| row.get(0))?;
+        let has_updated_at = |conn: &Connection| -> anyhow::Result<bool> {
+            let mut stmt = conn.prepare("PRAGMA table_info(job);")?;
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                if row.get::<_, String>(1)? == "updated_at" {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        };
+        let mut pre_column_version = None;
+        for version in 1..=latest {
+            let mut probe = Connection::open_in_memory()?;
+            migrations.to_version(&mut probe, version)?;
+            if !has_updated_at(&probe)? {
+                pre_column_version = Some(version);
+            }
+        }
+        let pre_column_version =
+            pre_column_version.expect("no migration version predates `job.updated_at`");
+
+        let mut conn = Connection::open_in_memory()?;
+        migrations.to_version(&mut conn, pre_column_version)?;
+        // Unix seconds, the form `submit_job_config` has always written.
+        conn.execute(
+            "INSERT INTO job (id, name, status, created_at)
+             VALUES ('legacy', 'legacy', 'done', 1735689600);",
+            [],
+        )?;
+
+        migrations.to_latest(&mut conn)?;
+
+        let (created_at, updated_at): (i64, Option<i64>) = conn.query_row(
+            "SELECT created_at, updated_at FROM job WHERE id = 'legacy';",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(created_at, 1_735_689_600, "created_at is left untouched");
+        assert_eq!(
+            updated_at,
+            Some(1_735_689_600),
+            "a pre-column job's mtime backfills to its creation time"
+        );
 
         Ok(())
     }

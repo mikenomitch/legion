@@ -1,10 +1,12 @@
 # Judgement Calls: Preemption and Eviction
 
-Decisions made while writing
+Decisions made while writing and building
 [`plans/preemption-and-eviction-plan.md`](../plans/preemption-and-eviction-plan.md)
-(status PLANNED — these are design-time calls; implementation-time calls get
-appended here at their rank). **Entries are ordered most-impactful first; the
-number is the rank.**
+(status IN EXECUTION — Phase 1a shipped). **Entries are ordered
+most-impactful first; the number is the rank.** Implementation-time calls are
+inserted at their rank, not appended: entries 3, 5, 6 and 10 below came out of
+building Phase 1a, and the design-time entries they displaced kept their
+relative order.
 
 ## 1. Priority is four named bands, and preemption is strictly cross-band
 
@@ -64,7 +66,42 @@ are CAS'd — makes "reservation" free: the instant capacity is freed it is
 occupied by the preemptor's rows in the same commit. The strongest
 correctness property in the plan costs one column.
 
-## 3. Preemption ships enabled; choosing a band below `normal` is the opt-in
+## 3. Phase 1 split: the stop *cause* ships without the stop *ladder*
+
+**Call.** What the plan called Phase 1 became 1a (cause recorded, delivered,
+logged, in event metadata) and 1b (signal, `killAfter`, notice file, reaper).
+1a shipped; termination is still immediate.
+
+```console
+$ legion events list --kind allocation.removed -j | jq '.data.events[0].metadata'
+{ "count": 3, "cause": "drain" }
+```
+
+**Alternatives.** (a) Ship Phase 1 whole, as planned. (b) Ship the ladder
+first and the cause later — the plan's own framing, since `stop { signal,
+killAfter }` is the user-visible surface.
+
+**Trade-off.** Two releases instead of one, and 1a ships a `StopContext` whose
+only field is a cause no in-tree runtime acts on — vocabulary slightly ahead
+of behavior. A reviewer reading `stop_with` today will reasonably ask what it
+is for. The public doc has to lead with a scope note saying tasks still get no
+grace period, which is a weaker headline than "every stop is now clean".
+
+**Why (correctness first, then simplicity).** Building it revealed that (a) is
+not merely bigger, it is *wrong as specified*: `reconcile_allocations` runs
+under the task-manager mutex inside the async heartbeat loop, so a `stop()`
+that waits for a deadline holds the lock heartbeats, the self-fence watchdog
+and health reporting all need. At a 2s cadence, a 30s grace would let the
+manager declare the node lost and reschedule everything on it — graceful stop
+turning into node flapping, strictly worse than the hard kill it replaces.
+Grace needs a terminating set and a reaper, which is a small state machine,
+not an argument change. Option (b) inverts the dependency: a notice file
+written immediately before SIGKILL is a file no task can read, so the ladder
+has to come with, or before, the file. Splitting on the seam that actually
+exists let the debuggability win — "why did my task go away?" — ship in days
+while the state machine gets designed properly.
+
+## 4. Preemption ships enabled; choosing a band below `normal` is the opt-in
 
 **Call.** `schedulerSettings.preemption.mode` defaults to `enforce`. Nothing
 is ever a victim unless its author set `priority: 'low'` (or a `high`+
@@ -87,7 +124,76 @@ nothing, and "preemption not working" has its own troubleshooting genre. A
 field that always means what it says beats a safer field that usually means
 nothing. K8s proves always-on is livable even with a far sharper model.
 
-## 4. One eviction pipeline: graceful stop lands first and serves every cause
+## 5. Band governance is an ACL selector, not `operator:write`
+
+**Call.** Which priority bands a caller may submit is a `bands` selector on
+`job` ACL rules, alongside the existing `namespaces` / `names` / `pools` /
+`templates` selectors — not a coarse `operator:write` check on `critical`.
+
+```json
+{"resources": ["job"], "actions": ["write"], "namespaces": ["prod"], "bands": ["critical", "high"]}
+```
+
+**Alternatives.** (a) The plan's original proposal: `critical` requires
+`operator:write`, one line in the RunJob handler. (b) A boolean
+`privileged_bands: true` on job rules, mirroring the `host` flag on exec
+rules. (c) A `priority.maxBandByNamespace` config map (the plan's Open
+Question 5 lean).
+
+**Trade-off.** Materially more work than (a): a new selector, its
+`has_scope_selectors` wiring, band normalization before `enforce`, coverage on
+the update and template-render paths, and docs. (a) is one line and would
+have unblocked Phase 2 immediately.
+
+**Why (extensibility).** `operator` is documented as "raft, manager configs,
+observability" — using it here makes everyone who may submit a critical job a
+raft administrator, and every raft administrator a critical-job submitter.
+That is not a scope, it is a coincidence of vocabulary. It is also
+all-or-nothing, so "team A may use `critical` in their namespace" is
+inexpressible, which is the first thing any multi-tenant cluster asks for.
+(b) cannot express "high yes, critical no" — exactly the split the plan wants.
+(c) would have shipped a *second* policy vocabulary beside ACLs, then needed
+migrating onto them the moment anyone wanted per-team rather than
+per-namespace scoping. The selector costs more up front and is the same work
+as Phase 4's per-namespace band caps, done once in the right place — so
+Phase 4 loses an item rather than gaining one.
+
+## 6. `stop_with` is added alongside `stop`, so the plugin ABI does not break
+
+**Call.** `TaskPlugin` gains `stop_with(allocation, task, instance, ctx)` with
+a default implementation that delegates to `stop()`. The plan called for
+threading `StopContext` through `stop` itself — an ABI break with in-tree
+plugins "updated in the same commit".
+
+```rust
+fn stop_with(&self, allocation: &Allocation, task: &TaskConfig,
+             instance: &mut TaskInstance, _ctx: &StopContext) -> R<()> {
+    self.stop(allocation, task, instance)   // runtimes that ignore the cause
+}
+```
+
+**Alternatives.** (a) The planned break: change `stop`'s signature, update the
+in-tree runtimes, done. (b) Break it *and* add a plugin ABI version symbol, so
+a stale dylib fails loudly instead of mismatching.
+
+**Trade-off.** Two methods where one would do, and a trait that now needs a
+sentence explaining which one the worker calls. A future reader could
+implement `stop` and wonder why their cause never arrives — mitigated by doc
+comments on both, but it is real surface area. (b) remains unbuilt, so a
+genuinely stale third-party dylib still has no version guard.
+
+**Why (extensibility).** `plugins/tasks/` is a public extension point loaded
+through a bare `extern "C" fn() -> Box<dyn TaskPlugin>` with no version
+symbol, so changing the vtable layout means a third-party plugin either fails
+to load or mismatches *silently*. Phase 1a delivers no behavior a runtime must
+participate in — the cause is informational until the ladder lands — so
+breaking every out-of-tree plugin to deliver a field none of them would read
+is pure cost. When 1b gives runtimes something to *do* with the context, they
+override one method rather than being forced to. The version symbol from (b)
+is worth adding on its own merits and is now noted in the plan's 1b list
+rather than smuggled in here.
+
+## 7. One eviction pipeline: graceful stop lands first and serves every cause
 
 **Call.** Phase 1 gives *every* platform stop — job stop, rollout
 replacement, drain, reschedule, preemption — the same ladder: notice file →
@@ -102,11 +208,15 @@ stop: { signal: 'SIGTERM', killAfter: '30s' }
 stops hard kills (smallest diff for this plan). (b) K8s's status quo:
 per-path semantics (~9 eviction paths, inconsistent grace/budget behavior).
 
-**Trade-off.** A `TaskPlugin` ABI break (`StopContext` threaded through
-`stop`), a worker behavior change for *all* jobs (stops that used to be
+**Trade-off.** A worker behavior change for *all* jobs (stops that used to be
 instant now take up to `killAfter`), and Phase 3 taking a dependency on
 Phase 1. Also stops-before-starts reconcile ordering couples a new
 allocation's start latency to co-located victims' grace.
+
+*Amended during implementation:* this entry originally also listed a
+`TaskPlugin` ABI break as a cost. It is not one — see entry 6, which added
+`stop_with` alongside `stop` instead. And the pipeline lands in two releases
+rather than one, per entry 3.
 
 **Why (simplicity).** The K8s taxonomy — ~9 kill paths, each with different
 budget/grace semantics — is the most-cited operational failure in this
@@ -115,7 +225,7 @@ diverge early. Legion currently has *zero* graceful paths, which is the one
 moment unifying them costs nothing. The rollout/mesh roadmap
 (drain-before-SIGTERM) needs this exact contract anyway.
 
-## 5. `disruption.minAvailable` binds only voluntary disruption, and is a hard rule
+## 8. `disruption.minAvailable` binds only voluntary disruption, and is a hard rule
 
 **Call.** The floor is enforced in victim selection (the scheduler cannot
 cross it), and it governs *only* voluntary disruption — preemption now, a
@@ -144,7 +254,7 @@ preemptor stays pending, which is today's behavior. And a *hard* rule beats
 Nomad's penalty because a budget that can be outbid is not a budget
 (Nomad's is violated even by its own drainer).
 
-## 6. Victims requeue via the existing `job_reschedule` machinery, in the apply transaction
+## 9. Victims requeue via the existing `job_reschedule` machinery, in the apply transaction
 
 **Call.** No new eval kind, no persisted "preempted" intent, no blocked-eval
 queue. The apply transaction enqueues `job_reschedule` for each victim job;
@@ -166,7 +276,33 @@ exist here — nothing has to *remember* the eviction for the victim to come
 back. One less eval kind, one less persisted state, and the recovery story
 is the one that already exists.
 
-## 7. The band also sets eval-queue priority — one field, both meanings
+## 10. Stop causes are advisory: a missing cause never delays a stop
+
+**Call.** Cause delivery is best-effort. A worker that reconciles before the
+notice arrives, talks to an older manager, was partitioned past the 10-minute
+retention, or receives a cause it does not recognize stops the allocation
+anyway, recording `unknown`. `unknown` is a normal value, not an error.
+
+**Alternatives.** (a) Guaranteed delivery: hold the stop until the cause
+arrives, or have the worker acknowledge each notice like the volume-destroy
+feed does. (b) Treat an unrecognized cause as a protocol error.
+
+**Trade-off.** Observability has a hole that will occasionally be visible: a
+stop genuinely caused by a drain can be journalled as `unknown`, and someone
+debugging cannot tell "no cause recorded" from "cause lost". The `preempted`
+cause inherits this, so Phase 3's victim→preemptor link is best-effort in the
+same way and the public doc has to say so.
+
+**Why (correctness).** The alternative is a metadata lookup on the path that
+stops workloads. A notice that cannot be read — busy database, lagging read
+model, manager mid-failover — would then wedge every stop on the node, turning
+an observability feature into an availability dependency. Nothing downstream
+of a stop needs the cause to be correct; it is for humans and for the event
+journal. (b) fails the same way one level up: it would make adding a cause a
+coordinated fleet upgrade, when the whole point of a string on the wire is
+that Phase 3 can start emitting `preempted` to workers deployed today.
+
+## 11. The band also sets eval-queue priority — one field, both meanings
 
 **Call.** `critical/high/normal/low` map to eval priorities 90/70/50/30;
 `legion job run --priority N` and `--asap` stay as explicit per-submission
@@ -185,7 +321,7 @@ revisit with aging if a real queue shows it).
 scheduled first *and* wins fights" and file issues when it isn't true.
 Two fields tracking one intuition is a knob tax with no payer.
 
-## 8. Node-pinned stateful allocations are never victims
+## 12. Node-pinned stateful allocations are never victims
 
 **Call.** An allocation whose instance storage is node-local (`local-dir`)
 is ineligible for preemption, categorically. Stateful allocations on
@@ -208,7 +344,7 @@ not free capacity or destroys data — both indefensible. The rule follows
 the same principle as drain's held-stateful behavior: the platform never
 force-moves protected state; an operator who wants it moved acts explicitly.
 
-## 9. The worker orders stops before starts, and delays co-located starts until victims exit
+## 13. The worker orders stops before starts, and delays co-located starts until victims exit
 
 **Call.** `reconcile_allocations` applies removals first; a new allocation
 on a node with in-grace victims starts only after they exit (bounded by the
@@ -229,7 +365,7 @@ victim + preemptor beyond grace" is an invariant an operator can rely on.
 (call 2); this is the cheapest way to make the physical handover match it
 without new protocol between manager and worker.
 
-## 10. No preemption plugin seam in v1
+## 14. No preemption plugin seam in v1
 
 **Call.** Preemption is built into the planner. `SchedulingPolicy` keeps
 its ABI; there is no `PreemptionPolicy` plugin category yet.

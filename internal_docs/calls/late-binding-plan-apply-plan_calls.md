@@ -21,6 +21,11 @@ node is not skipped) and the shape a scheduler purist would build.
 (b) No walk at all — keep single-node plans and rely on plan-time
 decorrelation (jitter) alone.
 
+**Merged since.** The pre-benchmark hardening work added an
+apply-transaction recheck of the node's *own* totals; entry 17 records how
+the two compose. The claim above is unchanged for competing allocations —
+the applier still never re-derives free capacity from other jobs' rows.
+
 **Trade-off.** Conservative skips: an unrelated small allocation on
 candidate A bumps its epoch and pushes the plan to B even though A still
 fits, so bursts spread across the near-tie band where bin_pack would
@@ -381,3 +386,100 @@ candidates`) in the seam classification.
 **Why (performance, simplicity).** Both changes exist to make the same
 hot path cheaper; composing them is the only shape where neither undoes
 the other's win.
+
+## 17. Node-total capacity re-validation joins the walk as a skip class, not a rejection
+
+**Call.** `main` grew an apply-transaction recheck that a placement still
+fits the node's *current* totals — the fence against a worker
+re-registration that shrinks capacity (or changes `reservedResources` /
+`maxAllocations`), which bumps no allocation epoch and so is invisible to
+the epoch compare-and-set. On `main` a failed recheck rejected the whole
+plan. Merged into the walk, it is one more per-candidate skip: the
+placement slides to the next candidate, and only an exhausted list
+rejects. The free pool is rebuilt lazily, per candidate actually
+attempted, like the node rows.
+
+**Alternatives.** (a) Keep it a hard rejection even with candidates —
+one shrunken node kills a plan whose other candidates were fine.
+(b) Drop the recheck on the candidate path and keep it only under
+`plan_candidates: 0` — cheaper, but reopens the oversubscription hole
+the hardening work closed, exactly on the default path.
+(c) Rebuild every candidate's pool up front — simple, but pays k× the
+allocation scan per placement for rows the walk never looks at (the same
+regression lazy node rows were introduced to avoid).
+
+**Trade-off.** A capacity skip reads as a conflict to the eval loop, so
+a fleet-wide shrink shows up as requeues rather than an immediate
+terminal error. That is the correct posture — a replan against the new
+totals is what the operator wants — but it costs one requeue delay
+before the failure is legible.
+
+**Why (simplicity, performance).** Every other "the world moved since
+the snapshot" condition in the walk is a skip; making the newest one a
+rejection would leave the walk with two rules for one idea. Laziness
+keeps the recheck's cost proportional to the skips actually taken.
+
+## 18. Candidate submissions ride the plan-apply group commit
+
+**Call.** `submit_and_apply_plan_with_candidates` goes through the same
+coalescer as `submit_and_apply_plan`: `PlanApplyRequest` carries a
+`PlanPlacements` enum (format-1 nodes or format-2 candidate lists), and
+the batch body dispatches per format. Each format keeps its own
+replicated-op name, so the raft log and `tests/raft_seam.rs` still say
+which walk ran.
+
+**Alternatives.** Leave the candidate path on the single-plan replicated
+op (what the two branches would have produced left alone). Since
+candidate lists are on by default, that quietly retires the group commit
+for every production plan — the batching would only ever engage under the
+`plan_candidates: 0` kill switch.
+
+**Trade-off.** One enum in the coalescer's request type, and a
+delegating `submit_and_apply_plan_with_candidates_apply` body kept for
+the seam classification.
+
+**Why (performance).** The two changes optimize the same hot path for
+the same workload — concurrent submits. A merge that keeps only one of
+them under the default config wastes the other outright.
+
+## 19. The lazy epoch sample covers the candidate union
+
+**Call.** `main`'s lazy sample (plan first, then sample epochs for the
+scopes the plan touched, accepted only when the read-model generation
+proves nothing changed) samples the union of every placement's candidate
+list, not just the placed-on nodes. Anything less and the walk would
+compare a candidate against a default-0 epoch and skip it.
+
+**Alternatives.** Force the eager whole-fleet sample whenever candidate
+lists are on — correct, but throws away the O(affected) win on exactly
+the default path.
+
+**Trade-off.** The lazy sample is now O(placements x k) instead of
+O(placements); still far below O(fleet) for any real fleet, and the
+generation check that makes the late sample sound is unchanged.
+
+**Why (performance).** Keeps both wins composable: the sample stays
+proportional to what the plan touched, and "what the plan touched" is
+exactly the set the walk may bind.
+
+## 20. The fused scoring loop stays on the one-candidate path
+
+**Call.** `main` replaced score-all/sort/shuffle with a fused
+argmax-with-reservoir-tie-break loop that never materializes a scored
+vector. Candidate lists need the scores to rank a band, so the ranked
+path keeps the scored vector; the fused loop is kept and used whenever
+the effective list length is 1 (`plan_candidates: 0`).
+
+**Alternatives.** (a) Delete the fused loop — one code path, but the
+kill switch would then be *slower* than the feature it exists to
+disable. (b) Build a top-k fused loop so the ranked path never
+materializes scores either — the right end state, but a rewrite of the
+tail sampling, not a merge resolution.
+
+**Trade-off.** Two selection paths in `select_node_candidates`,
+distinguished by one branch on the setting.
+
+**Why (performance, simplicity).** The kill switch must stay the cheap
+path — it is what an operator falls back to under mixed versions. (b)
+stays a backlog item, tracked with the candidate-construction benchmark
+numbers that would justify it.
