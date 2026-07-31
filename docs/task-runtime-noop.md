@@ -26,6 +26,15 @@ declares `artifacts` is rejected with an actionable error at
 `legion job validate` and at admission (see
 [docs/artifacts.md](artifacts.md)).
 
+## Stop and resource fields
+
+`noop` tracks no process and confines nothing, so the task-level `stopSignal`
+and `stopGracePeriod` fields are **accepted and inert** on a `noop` task —
+there is nothing to signal and nothing to wait for. Likewise its
+`resource_enforcement()` is `Unsupported`, so `resources` stay scheduling-only
+and the worker touches no cgroup for it (see
+[docs/resource-enforcement.md](resource-enforcement.md)).
+
 ## Usage Notes
 
 - Useful in tests and lightweight demo jobs.

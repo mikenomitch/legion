@@ -31,6 +31,9 @@ Plans, roadmaps, to-do lists, and development notes live in
 - [Task Runtime: sandbox](task-runtime-sandbox.md) — OCI images in microVMs for
   untrusted code and agent workspaces.
 - [Task Runtime: noop](task-runtime-noop.md)
+- [Resource Enforcement](resource-enforcement.md) — making declared `memory`,
+  `cores`, and `cpu` real on Linux: hard memory limits, exclusive pinned
+  cores, proportional CPU weight, and the interface runtimes adopt.
 - [Job Templates](job-templates.md) — reusable, versioned job specs with typed
   variables, guided submission, and template-scoped delegation.
 - [Artifacts](artifacts.md) — declaring, fetching, verifying, and staging inputs.

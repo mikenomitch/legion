@@ -218,10 +218,31 @@ impl WorkerIdentityManager {
                     if let Some(backing) =
                         backing_file_path(&identity, alloc_id, delivery_base.as_ref())
                     {
-                        env_injections.push((
-                            format!("{env_key}_FILE"),
-                            backing.to_string_lossy().to_string(),
-                        ));
+                        // For a runtime that mounts its task dir elsewhere,
+                        // the var must name the path the *task* sees. A
+                        // backing file outside that mount is unreadable from
+                        // inside, so the companion is omitted rather than
+                        // pointing at a path that does not exist there
+                        // (env-delivered identities on such a runtime back
+                        // onto the worker's own directory — use file delivery
+                        // if the workload needs to re-read the token).
+                        let in_task = match delivery_base.as_ref() {
+                            None => Some(backing.to_string_lossy().to_string()),
+                            Some(base) => {
+                                backing
+                                    .strip_prefix(&base.host_task_dir)
+                                    .ok()
+                                    .map(|relative| {
+                                        PathBuf::from(base.in_task_root)
+                                            .join(relative)
+                                            .to_string_lossy()
+                                            .to_string()
+                                    })
+                            }
+                        };
+                        if let Some(path) = in_task {
+                            env_injections.push((format!("{env_key}_FILE"), path));
+                        }
                     }
                 }
             }

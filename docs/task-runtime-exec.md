@@ -44,9 +44,16 @@ Optional:
   - configure process options,
   - spawn child,
   - store child and PID in runtime.
-- `stop`:
-  - kill tracked child handle when available,
-  - otherwise try kill by PID lookup.
+- `stop` runs the task's stop ladder: deliver its `stopSignal` (default
+  `SIGTERM`), wait up to its `stopGracePeriod` (default `10s`, capped at 5m at
+  admission) for the process to exit on its own, then kill the tracked child
+  handle — or, failing that, by PID lookup. A process that exits inside the
+  window is never force-killed; one that ignores the signal is killed at the
+  deadline. Both fields are task-level, next to `resources`; see
+  [Task Supervision](task-supervision.md).
+- Under worker-owned enforcement, the hard-kill step additionally writes
+  `cgroup.kill`, which reaps double-forked descendants that reparented away
+  from the tracked pid.
 - `destroy` delegates to `stop`.
 
 Spawn helper sets a new session (`setsid`) on Unix so task processes survive worker restarts and are signal-isolated from worker process handling.
@@ -76,6 +83,8 @@ Spawn helper sets a new session (`setsid`) on Unix so task processes survive wor
 | KV file injection | ✅ |
 | Identity env / file delivery | ✅ / ✅ |
 | Signal delivery | ✅ |
+| Graceful stop (`stopSignal` / `stopGracePeriod`) | ✅ |
+| Memory / CPU limits, exclusive cores | ✅ Linux with `resourceEnforcement.enabled` — see [docs/resource-enforcement.md](resource-enforcement.md) |
 | Exit reporting / restart policy | ✅ (see [Task Supervision](task-supervision.md)) |
 | Artifacts | ✅ (File/Tree + interpolation + env) |
 | Exec / interactive PTY | ✅ / ✅ — **host-level** (see [docs/exec-and-actions.md](exec-and-actions.md)) |
@@ -92,9 +101,20 @@ Because it is a process on the host (even under landlock), it carries the
 - **Process exit** is observed by the worker's task supervisor, which reaps the
   child and applies the task's `restart` policy — see
   [Task Supervision](task-supervision.md).
-- **Resource limits.** `config.cgroup` *joins* an existing cgroup. For Legion to
-  create one and write `resources` into it as real limits, enable
-  `resourceEnforcement` on the worker
-  ([Task Supervision](task-supervision.md#resource-enforcement-cgroups)); an
-  explicit `cgroup` opts the task out.
+- **Resource limits.** With `resourceEnforcement.enabled` on the worker, the
+  `exec` runtime is a **governed** runtime: worker core creates this
+  allocation's cgroup inside the node-wide `legion/` hierarchy, writes the
+  task's `resources` into it as real limits (`memory.max`, `cpu.weight`,
+  `cpuset.cpus`), and the plugin spawns the process into it. That puts exec
+  tasks in the same hierarchy as container tasks, so a core reserved by either
+  is exclusive against both. See
+  [docs/resource-enforcement.md](resource-enforcement.md).
+
+  `config.cgroup` still *joins* an existing cgroup and **wins**, opting the
+  task out of the Legion hierarchy — it keeps meaning what it always meant.
+  Because Legion cannot promise exclusivity inside a cgroup it does not
+  manage, declaring `cores` together with an explicit `cgroup` is rejected at
+  submit. `user`, `landlock`, and `oom_score_adj` compose with the
+  worker-owned cgroup unchanged (the join is one more privileged `pre_exec`
+  step, ordered before the switch to the task user).
 

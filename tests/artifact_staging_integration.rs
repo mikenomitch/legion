@@ -239,8 +239,14 @@ fn exec_task_stages_http_artifact_and_runs_from_task_dir() -> R<()> {
         assert!(states.contains("\"name\":\"tool\""), "{states}");
     }
 
-    // Manager drops the allocation -> worker destroys it and removes dirs.
-    let _ = manager.lock().unwrap().reconcile_allocations(&[]);
+    // Manager drops the allocation -> the worker signals it, then reaps it
+    // on the next supervisor tick (the grace wait never runs under the
+    // task-manager lock, which the heartbeat loop also needs).
+    {
+        let mut guard = manager.lock().unwrap();
+        let _ = guard.reconcile_allocations(&[]);
+        guard.finish_ready_terminations();
+    }
     assert!(
         !temp_dir.path().join("allocs").join("21").exists(),
         "alloc dir removed on destroy"

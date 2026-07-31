@@ -63,6 +63,12 @@ pub async fn start_task_supervisor(task_manager: Arc<Mutex<WorkerTaskManager>>) 
         tokio::time::sleep(SUPERVISOR_TICK).await;
         let exits = {
             let mut manager = task_manager.lock().expect("task manager");
+            // Reap allocations whose grace period has run out (or whose
+            // process already exited) before polling for crashes. Stopping is
+            // two-phase precisely so this wait lives here, on the
+            // supervisor's tick, and not on the heartbeat path — see
+            // `WorkerTaskManager::begin_stop_allocation`.
+            manager.finish_ready_terminations();
             manager.poll_task_exits()
         };
         for exit in exits {

@@ -21,7 +21,9 @@ use crate::prelude::*;
 pub const DEFAULT_STOP_SIGNAL: &str = "SIGTERM";
 
 /// Every accepted signal name, canonical spelling, for error messages and
-/// documentation.
+/// documentation. `changeSignal` exposes the same set as bare short names
+/// (see [`crate::structs::workload_identity::SUPPORTED_CHANGE_SIGNALS`]),
+/// which is that field's own long-standing convention.
 pub const SUPPORTED_SIGNALS: [&str; 8] = [
     "SIGHUP", "SIGINT", "SIGQUIT", "SIGTERM", "SIGUSR1", "SIGUSR2", "SIGCONT", "SIGWINCH",
 ];

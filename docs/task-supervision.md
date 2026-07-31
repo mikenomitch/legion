@@ -9,6 +9,7 @@ a host process can be locked down.
 - [The `restart` block](#the-restart-block)
 - [Batch tasks and real completion](#batch-tasks-and-real-completion)
 - [Resource enforcement (cgroups)](#resource-enforcement-cgroups)
+- [Graceful stop](#graceful-stop)
 - [Process hardening](#process-hardening)
 - [Diagnostics](#diagnostics)
 - [Limitations](#limitations)
@@ -128,9 +129,8 @@ placements get the honest behavior.
 
 ## Resource enforcement (cgroups)
 
-By default a task's `resources` are *scheduling* arithmetic for `exec` tasks:
-they decide where the task fits, not what it may consume. Turn them into real
-limits per worker:
+By default a task's `resources` are *scheduling* arithmetic: they decide where
+the task fits, not what it may consume. Turn them into real limits per worker:
 
 ```jsonnet
 // configs/workers/<type>.jsonnet
@@ -138,37 +138,105 @@ limits per worker:
   workerType: "default",
   resourceEnforcement: {
     enabled: true,
-    cgroupParent: "legion",   // path under /sys/fs/cgroup
+    cgroupParent: "legion",   // hierarchy root under /sys/fs/cgroup
   },
 }
 ```
 
-With this on, a Linux worker creates `/sys/fs/cgroup/<cgroupParent>/alloc-<id>-<task>/`
-for each `exec` allocation, writes the task's resources into it, moves the
-process in before it execs, and removes the directory when the allocation stops:
+With this on, a Linux worker partitions the node into `legion/share` and
+`legion/reserve` cgroups and places **every governed task** — `exec` *and*
+`container` — into that hierarchy:
 
-| Job spec | cgroup v2 file |
+| Job spec | Kernel meaning |
 | --- | --- |
-| `resources.memory` (MiB) | `memory.max` (bytes) |
-| `resources.cpus` or `resources.cores` (cores) | `cpu.max` (`<quota> 100000`) |
-
-Requirements and behavior:
-
-- Linux with cgroup v2. `cgroupParent` must already exist, with `+memory` and
-  `+cpu` in its `cgroup.subtree_control`, and be writable by the worker.
-- **Enforcement never blocks a workload.** A node without cgroup v2, without
-  permission, or with an unwritable limit file logs a warning and runs the task
-  unconfined.
-- An explicit `config.cgroup` on the task opts out: that means "join the cgroup
-  I already made and limited", and Legion will not manage one alongside it.
-- Only limits the task actually declares are written. Declaring memory does not
-  imply a CPU limit.
-- `container` and `sandbox` already size their sandboxes from `resources`; this
-  setting is about host processes.
+| `resources.memory` (MiB) | a hard `memory.max`, with swap pinned equal to it |
+| `resources.cores` (whole CPUs) | exclusive pinned CPUs (`cpuset.cpus`), removed from every other governed task's set |
+| `resources.cpu` (MHz, alias `cpus`) | proportional `cpu.weight` under contention |
 
 It is **off by default** on purpose: many jobs' `resources` were written as
 scheduling estimates, and turning an estimate into `memory.max` on upgrade day
-would OOM-kill workloads that were running fine.
+would OOM-kill workloads that were running fine. A node that opts in but
+cannot enforce (no cgroup v2, no usable CPU fingerprint) warns at startup and
+runs tasks unconfined — enforcement must not be the reason a workload will not
+run.
+
+An explicit `config.cgroup` on an `exec` task still opts out: it means "join
+the cgroup I already made and limited", and Legion will not manage one
+alongside it.
+
+**The full model — the share/reserve partition, the core allocator, the
+validation rules (`cores` must be whole; `cores` xor `cpu`), OOM attribution,
+`cgroup.kill` teardown, the failure modes, and the interface a task runtime
+adopts — is documented in
+[Resource Enforcement](resource-enforcement.md).**
+
+## Graceful stop
+
+Stopping a task delivers a signal and waits before it kills. Both halves are
+declarable per task, next to `resources` (not inside the runtime `config` —
+the intent is runtime-independent):
+
+```jsonnet
+task: {
+  name: 'db',
+  runtime: 'exec',
+  config: { command: ['/usr/bin/postgres'] },
+  stopSignal: 'SIGINT',       // default: SIGTERM
+  stopGracePeriod: '90s',     // default: 10s; capped at 5m at admission
+}
+```
+
+- **`stopSignal`** comes from Legion's vocabulary — `SIGTERM`, `SIGINT`,
+  `SIGQUIT`, `SIGHUP`, `SIGUSR1`, `SIGUSR2`, `SIGCONT`, `SIGWINCH` (spelling
+  case-insensitive, `SIG` prefix optional). `SIGKILL` is deliberately not
+  declarable: it cannot be caught, so declaring it would only disable the
+  drain the field exists to provide.
+- **`stopGracePeriod`** is a duration string, validated positive and capped at
+  **5 minutes** at admission, so a wedged task cannot hold a drain or a
+  reschedule open indefinitely.
+
+Per runtime:
+
+- **`exec`:** deliver the signal to the tracked pid, poll for exit up to the
+  grace period, then kill. Under worker-owned enforcement the hard-kill step
+  also writes `cgroup.kill`, reaping double-forked descendants.
+- **`container`:** the runtime signals the container's *init* and waits — see
+  [Task Runtime: container](task-runtime-container.md#graceful-stop), which
+  also documents the Linux `stopSignal` default chain (jobspec → the image's
+  `STOPSIGNAL` → `SIGTERM`).
+- **Runtimes with nothing to signal** (`noop`, unported plugins): both fields
+  are accepted and inert.
+
+A task that exits inside the window is never force-killed. One that ignores
+the signal is killed at the deadline — so rescheduling a hung task is up to
+the grace period slower than an instant SIGKILL, which is the correct trade
+and the docker default everyone already operates under.
+
+### Stopping is two-phase
+
+The worker never waits out a grace period on its heartbeat path. Reconciling
+the manager's desired set runs under the worker's task-manager lock inside the
+heartbeat loop, and a blocking wait there would stall heartbeats and the
+self-fence watchdog — long enough to get the node declared lost, and its
+stateful allocations fenced, purely because one task was draining.
+
+So a stop is split:
+
+1. **Signal and record** — reconcile shuts the allocation's health monitor
+   down, delivers its `stopSignal`, notes the deadline, and returns
+   immediately.
+2. **Reap** — the task supervisor's tick (which runs off the heartbeat path)
+   finds allocations whose process has exited or whose deadline has passed,
+   and runs the runtime's teardown, storage release, and directory cleanup.
+
+While an allocation is draining it stays in the worker's maps, so the
+heartbeat keeps reporting it as this node's and the manager will not
+re-dispatch it mid-teardown. Its exit does **not** feed the `restart` policy —
+a task Legion deliberately stopped did not crash.
+
+An in-place re-dispatch (a config change reusing the same allocation id)
+drains the previous instance the same way, on the launch thread, with the
+task-manager lock released between polls.
 
 ## Process hardening
 

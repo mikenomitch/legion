@@ -2,7 +2,22 @@
 
 > **Judgement calls:** [../calls/container-runtime-exec-and-signals-plan_calls.md](../calls/container-runtime-exec-and-signals-plan_calls.md)
 
-**Status: PLANNED.**
+**Status: SHIPPED** (2026-07-31). All seven phases landed together.
+
+Deviations from the plan as written, each recorded in the
+[judgement calls](../calls/container-runtime-exec-and-signals-plan_calls.md)
+(entries 8–11): the wire *does* gain two `TaskAllocation` fields (§7 claimed
+none were needed — the worker never receives the jobspec, only the dispatched
+allocation); the enforcement subsystem reuses the existing opt-in
+`resourceEnforcement` worker config as its gate rather than shipping
+ungated; the `cores`-xor-`cpu` rule turned out to already exist in the
+scheduler's resource normalization; and `resources.cpus` is the scheduler's
+alias for `cpu` (MHz), **not** for `cores`, so it does not request a cpuset.
+
+Public documentation: [docs/task-runtime-container.md](../../docs/task-runtime-container.md),
+[docs/resource-enforcement.md](../../docs/resource-enforcement.md) (new),
+[docs/task-supervision.md](../../docs/task-supervision.md),
+[docs/task-runtime-plugins.md](../../docs/task-runtime-plugins.md).
 
 The `container` task runtime's four remaining core gaps, one plan, one goal:
 Linux production parity with the macOS dev experience, and a capability table

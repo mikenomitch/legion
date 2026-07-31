@@ -277,6 +277,7 @@ isolated filesystem cannot see the host task dir at all.
 | KV file injection | ❌ (baked at disk-build time; a change needs a restart) |
 | Identity env / file delivery | ✅ / ❌ |
 | Signal delivery | ❌ (needs a guest agent) |
+| Memory / CPU limits, exclusive cores | ❌ — the runtime has not adopted the enforcement interface; `resources` size the guest and are otherwise scheduling-only. It is the designed-for next adopter (`RuntimeApplied`, pinning the VMM's vCPU threads) — see [docs/resource-enforcement.md](resource-enforcement.md) |
 | Artifacts | ✅ image, file, tree, layers |
 | Exec / interactive PTY | ❌ on the microVM path (needs a vsock guest agent); ✅ / ✅ in macOS dev mode |
 | Volumes | ✅ `block` on microVM backends, `filesystem` on dev backends |

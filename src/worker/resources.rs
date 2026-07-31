@@ -537,9 +537,11 @@ fn create_task_cgroup(assignment: &ResourceAssignment) -> R<()> {
     }
     if let Some(bytes) = assignment.memory_limit_bytes {
         write_cgroup_file(&dir.join("memory.max"), &bytes.to_string())?;
-        // Swap equal to the limit, so swap cannot be used to escape it (the
-        // K8s semantic; docker's 2×limit default makes limits soft in
-        // practice, which defeats scheduling against them).
+        // No swap on top of the limit, so a leaking task cannot escape it by
+        // swapping (the K8s semantic; docker's default of 2x-limit-in-swap
+        // makes limits soft in practice, which defeats scheduling against
+        // them). cgroup v2's `memory.swap.max` counts *swap only*, so the
+        // equivalent of the OCI spec's `swap == limit` is 0 here.
         write_cgroup_file(&dir.join("memory.swap.max"), "0")?;
     }
     Ok(())
