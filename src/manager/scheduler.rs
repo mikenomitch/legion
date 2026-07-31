@@ -2803,6 +2803,13 @@ impl<'a> Scheduler<'a> {
         }
 
         let Some((mut choice, best_cost)) = best else {
+            // The pass ran and could not help. Worth a metric of its own:
+            // "preemption is enabled and still not placing this" is a
+            // different operational story from "preemption never ran", and
+            // only the counter distinguishes them at a glance.
+            crate::manager::telemetry::metrics()
+                .preemption_plans_total
+                .inc(&["no_victims"]);
             return Ok(None);
         };
 

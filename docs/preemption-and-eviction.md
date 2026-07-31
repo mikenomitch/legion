@@ -310,7 +310,10 @@ user who cannot tell *which* policy displaced them cannot act on it.
 - `legion_preemptions_total{pool,band}` — victims actually evicted, sliced by
   the two axes an operator reasons about.
 - `legion_preemption_plans_total{outcome}` — preemption passes that reached a
-  decision: `placed` or `observe`.
+  decision: `placed` (victims evicted, preemptor placed), `observe` (the pass
+  ran under `observe` mode and committed nothing), or `no_victims` (preemption
+  is enabled and still could not help). The last one is the interesting alert:
+  it separates "preemption is not placing this" from "preemption never ran".
 
 **In the job list**, the band is a column, so contention outcomes are legible
 without reading specs:

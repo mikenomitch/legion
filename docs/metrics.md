@@ -79,9 +79,12 @@ into a single series with every label set to `"other"`.
 - **`legion_preemption_plans_total{outcome}`** (counter) — preemption passes
   that reached a decision. `placed` means victims were evicted and the
   preemptor placed; `observe` means the pass ran under
-  `preemption.mode: observe` and committed nothing. Comparing `observe` here
-  against zero is how an operator sizes the blast radius before switching to
-  `enforce`.
+  `preemption.mode: observe` and committed nothing; `no_victims` means
+  preemption was enabled, ran, and still found nothing it was allowed to take.
+  Comparing `observe` against zero is how an operator sizes the blast radius
+  before switching to `enforce`; a rising `no_victims` is a capacity signal —
+  work is failing to place and the scheduler has already exhausted its
+  displacement options.
 - **`legion_scheduler_plan_phase_seconds{phase}`** (histogram) — per-phase
   wall-clock of every `plan_and_apply`, phases in execution order:
   `available_nodes` (node snapshot fetch), `version_sample` (the
