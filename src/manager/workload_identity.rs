@@ -522,6 +522,58 @@ impl Issuer {
         })
     }
 
+    /// Mint a **boot ticket**: the narrow, short-lived capability an edge node
+    /// verifies offline before starting work on its own (docs/edge-boot.md).
+    ///
+    /// Deliberately a separate entry point from [`Issuer::issue`] rather than
+    /// an identity with unusual claims. A boot ticket authorizes a *start*,
+    /// not a workload — it carries the reserved `legion:node` audience, its
+    /// own `legion.io/scope: boot` marker, and a caller-supplied `jti` the
+    /// manager records for single-use enforcement. Routing it through the
+    /// workload-identity path would make one code path responsible for two
+    /// different trust decisions, and would let a task audience and a node
+    /// audience be confused for one another.
+    ///
+    /// The `exp` is clamped to the signing key's overlap window for the same
+    /// reason every other token is: a ticket must never outlive the key that
+    /// can verify it.
+    pub fn issue_boot_ticket(
+        &self,
+        jti: &str,
+        subject: &str,
+        claims: Map<String, Value>,
+        iat: u64,
+        exp: u64,
+    ) -> R<IssuedToken> {
+        let key = self.active_key()?;
+        let mut exp = exp.min(iat + self.max_token_ttl.as_secs());
+        if let Some(not_after) = key.not_after {
+            exp = exp.min(not_after);
+        }
+        if exp <= iat {
+            bail!("boot ticket TTL collapsed to zero against the signing key's overlap window");
+        }
+
+        let mut body = claims;
+        body.insert("iss".into(), json!(self.issuer_url));
+        body.insert("sub".into(), json!(subject));
+        body.insert(
+            "aud".into(),
+            json!([crate::structs::edge_boot::BOOT_TICKET_AUDIENCE]),
+        );
+        body.insert("iat".into(), json!(iat));
+        body.insert("nbf".into(), json!(iat));
+        body.insert("exp".into(), json!(exp));
+        body.insert("jti".into(), json!(jti));
+
+        let token = key.sign(&body)?;
+        Ok(IssuedToken {
+            token,
+            expires_at: exp,
+            kid: key.kid.clone(),
+        })
+    }
+
     /// Verify a token against this issuer's keys (control-plane verification
     /// path; external relying parties use the published JWKS instead). Returns
     /// the decoded claims on success.
@@ -858,6 +910,21 @@ impl WorkloadIdentityState {
     /// verification path; external relying parties use the published JWKS).
     pub fn verify(&self, token: &str, expected_audience: &str) -> R<Map<String, Value>> {
         self.read_issuer()?.verify(token, expected_audience)
+    }
+
+    /// Mint a boot ticket (docs/edge-boot.md). See
+    /// [`Issuer::issue_boot_ticket`] for why this is a separate entry point
+    /// from the workload-identity mint.
+    pub fn issue_boot_ticket(
+        &self,
+        jti: &str,
+        subject: &str,
+        claims: Map<String, Value>,
+        iat: u64,
+        exp: u64,
+    ) -> R<IssuedToken> {
+        self.read_issuer()?
+            .issue_boot_ticket(jti, subject, claims, iat, exp)
     }
 
     /// One pass of the rotation state machine, persisting every transition:

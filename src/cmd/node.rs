@@ -18,6 +18,16 @@ fn idempotency_arg() -> Arg {
 pub fn config() -> Command {
     let get_nodes_cmd = Command::new("list").about("List nodes").arg(json_flag());
 
+    let node_claims_cmd = Command::new("claims")
+        .about("List a node's live provisional (unratified) allocations")
+        .arg(
+            Arg::new("id")
+                .value_name("ID")
+                .help("Identifier of the node to inspect")
+                .required(true),
+        )
+        .arg(json_flag());
+
     let node_info_cmd = Command::new("info")
         .about("Get node info")
         .arg(
@@ -111,6 +121,7 @@ pub fn config() -> Command {
         .subcommand(get_nodes_cmd)
         .subcommand(update_node_cmd)
         .subcommand(node_info_cmd)
+        .subcommand(node_claims_cmd)
         .subcommand(restart_node_cmd)
         .subcommand(cordon_node_cmd)
         .subcommand(drain_node_cmd)
@@ -160,6 +171,13 @@ pub async fn handle(sub_matches: &ArgMatches) -> R<()> {
 
             let format = OutputFormat::from_matches(arg_matches);
             update_node(id.into(), dynamic_diff, format).await
+        }
+        Some(("claims", arg_matches)) => {
+            let id = arg_matches
+                .get_one::<String>("id")
+                .context("Must provide id")?;
+            let format = OutputFormat::from_matches(arg_matches);
+            get_node_claims(id.to_string(), format).await
         }
         Some(("info", arg_matches)) => {
             let id = arg_matches
@@ -277,6 +295,60 @@ async fn get_node_info(node_id: String, format: OutputFormat) -> R<()> {
         }
     }
 
+    Ok(())
+}
+
+/// `legion node claims <NODE>` — what this node has started that the store
+/// has not recorded yet (docs/edge-boot.md).
+///
+/// Deliberately a separate view from `node info`: unratified work is live,
+/// short-lived state reported on the last heartbeat, not part of the node
+/// record, and mixing the two would suggest a durability it does not have.
+#[instrument(err, skip_all)]
+async fn get_node_claims(node_id: String, format: OutputFormat) -> R<()> {
+    let mut client = connect_manager_client().await?;
+    let request = tonic::Request::new(GetNodeRequest { id: node_id });
+    let reply = output::resolve(
+        format,
+        "failed to fetch node claims",
+        client.get_node(request).await,
+    )?
+    .into_inner();
+
+    let claims = reply
+        .provisional_claims
+        .into_iter()
+        .map(|claim| {
+            json!({
+                "claimId": claim.claim_id,
+                "jobConfigId": claim.job_config_id,
+                "taskName": claim.task_name,
+                "instanceId": claim.instance_id,
+                "gate": crate::structs::edge_boot::Gate::from_wire(claim.gate).as_str(),
+                "stage": claim.stage,
+                "leaseDeadlineUnix": claim.lease_deadline_unix,
+                "resources": claim.resources,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    if format.is_json() {
+        output::print_success(&claims);
+    } else if claims.is_empty() {
+        println!("No provisional allocations on this node");
+    } else {
+        for claim in &claims {
+            println!(
+                "{}  {}  instance={}  gate={}  stage={}  lease_expires_unix={}",
+                claim["claimId"].as_str().unwrap_or_default(),
+                claim["taskName"].as_str().unwrap_or_default(),
+                claim["instanceId"].as_str().unwrap_or_default(),
+                claim["gate"].as_str().unwrap_or_default(),
+                claim["stage"].as_str().unwrap_or_default(),
+                claim["leaseDeadlineUnix"],
+            );
+        }
+    }
     Ok(())
 }
 

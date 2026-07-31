@@ -1628,6 +1628,13 @@ pub struct TaskConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[tabled(skip)]
     pub actions: Vec<ActionSpec>,
+    /// How far a node may get on a start for this task before the placement
+    /// is durable (see `docs/edge-boot.md`). None = `mode: 'off'`, today's
+    /// behavior: dispatch happens after the commit and the wire payload
+    /// carries no provisional block at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[tabled(skip)]
+    pub speculative_start: Option<crate::structs::edge_boot::SpeculativeStartConfig>,
 }
 
 /// A declared action: a named command template with typed parameters.
@@ -2172,6 +2179,7 @@ impl TaskConfigInput {
             })
             .collect();
         Ok(TaskConfig {
+            speculative_start: None,
             name,
             count: self.count.unwrap_or_default(),
             runtime,
@@ -2379,6 +2387,7 @@ impl TaskCheck {
 impl TaskConfig {
     pub fn new(name: impl Into<String>, runtime: impl Into<String>) -> Self {
         TaskConfig {
+            speculative_start: None,
             name: name.into(),
             count: default_task_count(),
             runtime: runtime.into(),

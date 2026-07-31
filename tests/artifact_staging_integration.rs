@@ -156,6 +156,7 @@ fn task_allocation(
     artifacts: serde_json::Value,
 ) -> TaskAllocation {
     TaskAllocation {
+        provisional: None,
         task_volumes: String::new(),
         allocation_id: id,
         job_id: "job".into(),

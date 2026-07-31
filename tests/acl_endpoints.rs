@@ -148,6 +148,14 @@ fn endpoint_table() -> Vec<(&'static str, Plane)> {
         ("CreateJoinToken", Plane::Protected("node:write")),
         ("ListJoinTokens", Plane::Protected("node:read")),
         ("DeleteJoinToken", Plane::Protected("node:write")),
+        // The `boot` resource is deliberately separate from `job`
+        // (docs/edge-boot.md): a platform's ticket minter authorizes
+        // individual starts without holding the right to redeploy the fleet.
+        ("IssueBootTicket", Plane::Protected("boot:write")),
+        ("ListBootTickets", Plane::Protected("boot:read")),
+        // Worker plane: the node that started the work asks the manager to
+        // commit it, authenticated with its node token.
+        ("RatifyClaim", Plane::Worker),
         ("UpsertAclPolicy", Plane::Protected("acl:write")),
         ("GetAclPolicy", Plane::Protected("acl:read")),
         ("ListAclPolicies", Plane::Protected("acl:read")),
@@ -885,6 +893,43 @@ async fn call_endpoint(
             .map(|_| ()),
         "ListJoinTokens" => svc
             .list_join_tokens(req(ListJoinTokensRequest {}, token))
+            .await
+            .map(|_| ()),
+        "IssueBootTicket" => svc
+            .issue_boot_ticket(req(
+                IssueBootTicketRequest {
+                    job: JOB_NAME.into(),
+                    task: "web".into(),
+                    job_config_id: String::new(),
+                    instance_id: "acl-instance".into(),
+                    instance_prefix: String::new(),
+                    pool: "default".into(),
+                    gate: GateLevel::GateStage as i32,
+                    ttl: "5m".into(),
+                    uses: 1,
+                    idempotency_key: None,
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "ListBootTickets" => svc
+            .list_boot_tickets(req(ListBootTicketsRequest { job: String::new() }, token))
+            .await
+            .map(|_| ()),
+        "RatifyClaim" => svc
+            .ratify_claim(req(
+                RatifyClaimRequest {
+                    node_id: NODE_ID.into(),
+                    claim_id: "clm_acl".into(),
+                    job_config_id: fx.job_config_id.clone(),
+                    task_name: "web".into(),
+                    instance_id: String::new(),
+                    gate: GateLevel::GateStage as i32,
+                    ticket: String::new(),
+                },
+                token,
+            ))
             .await
             .map(|_| ()),
         "DeleteJoinToken" => svc

@@ -105,6 +105,149 @@ pub struct ManagerConfig {
     /// docs/metrics.md).
     #[serde(default)]
     pub telemetry: Option<TelemetryConfig>,
+    /// Edge boot: provisional allocations and boot tickets (see
+    /// docs/edge-boot.md). Off by default — enabling it opens a new
+    /// authorization surface and must be an explicit operator decision.
+    #[serde(default)]
+    pub edge_boot: Option<EdgeBootConfig>,
+}
+
+/// Manager-side edge boot settings (docs/edge-boot.md).
+///
+/// `enabled: false` is the default and it is a real switch, not a formality:
+/// with it off, `IssueBootTicket` and `RatifyClaim` are refused and no node
+/// can start work on a capability. Turning it on grows a compromised node's
+/// blast radius from "runs what it was given" to "runs anything a live ticket
+/// names", which is why it is never on by accident.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct EdgeBootConfig {
+    /// Master switch for boot tickets and edge-initiated starts. Default
+    /// false. Manager-side speculative dispatch (a job's own
+    /// `speculativeStart` block) does NOT need this — it opens no new
+    /// authorization surface.
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    /// Ticket lifetime when a mint does not ask for one. Default `5m`.
+    #[serde(default)]
+    pub default_ticket_ttl: Option<String>,
+    /// Hard cap on a ticket's lifetime. Default `1h`. Revocation is by TTL
+    /// only, so this is the real bound on how long a leaked ticket is
+    /// dangerous.
+    #[serde(default)]
+    pub max_ticket_ttl: Option<String>,
+    /// Cap on concurrent unratified claims per node. Default 32.
+    #[serde(default)]
+    pub max_provisional_per_node: Option<u32>,
+}
+
+/// Resolved [`EdgeBootConfig`].
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct EdgeBootConfigFull {
+    pub enabled: bool,
+    pub default_ticket_ttl: String,
+    pub max_ticket_ttl: String,
+    pub max_provisional_per_node: u32,
+}
+
+impl Default for EdgeBootConfigFull {
+    fn default() -> Self {
+        EdgeBootConfigFull {
+            enabled: false,
+            default_ticket_ttl: DEF_BOOT_TICKET_TTL.into(),
+            max_ticket_ttl: DEF_BOOT_TICKET_MAX_TTL.into(),
+            max_provisional_per_node: DEF_MAX_PROVISIONAL_PER_NODE,
+        }
+    }
+}
+
+impl EdgeBootConfig {
+    pub fn with_defaults(&self) -> EdgeBootConfigFull {
+        let defaults = EdgeBootConfigFull::default();
+        EdgeBootConfigFull {
+            enabled: self.enabled.unwrap_or(defaults.enabled),
+            default_ticket_ttl: self
+                .default_ticket_ttl
+                .clone()
+                .unwrap_or(defaults.default_ticket_ttl),
+            max_ticket_ttl: self
+                .max_ticket_ttl
+                .clone()
+                .unwrap_or(defaults.max_ticket_ttl),
+            max_provisional_per_node: self
+                .max_provisional_per_node
+                .unwrap_or(defaults.max_provisional_per_node),
+        }
+    }
+}
+
+impl From<EdgeBootConfigFull> for EdgeBootConfig {
+    fn from(val: EdgeBootConfigFull) -> Self {
+        EdgeBootConfig {
+            enabled: Some(val.enabled),
+            default_ticket_ttl: Some(val.default_ticket_ttl),
+            max_ticket_ttl: Some(val.max_ticket_ttl),
+            max_provisional_per_node: Some(val.max_provisional_per_node),
+        }
+    }
+}
+
+/// Default boot-ticket lifetime.
+pub const DEF_BOOT_TICKET_TTL: &str = "5m";
+/// Hard cap on boot-ticket lifetime.
+pub const DEF_BOOT_TICKET_MAX_TTL: &str = "1h";
+/// Default cap on concurrent unratified claims per node.
+pub const DEF_MAX_PROVISIONAL_PER_NODE: u32 = 32;
+
+/// Worker-side edge boot settings (docs/edge-boot.md).
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkerEdgeBootConfig {
+    /// Whether this node serves `Worker.StartClaim` — that is, whether it
+    /// will start work on a boot ticket at all. Default false, independently
+    /// of the manager's switch: a node opts in to being an edge, and an
+    /// operator who enables the feature cluster-wide still chooses which
+    /// nodes accept claims.
+    #[serde(default)]
+    pub accept_claims: Option<bool>,
+    /// How often the cached JWKS is proactively refreshed. Default `5m`.
+    #[serde(default)]
+    pub jwks_refresh: Option<String>,
+    /// Tolerance for clock disagreement with the minting manager. Default
+    /// `30s`.
+    #[serde(default)]
+    pub clock_skew: Option<String>,
+}
+
+/// Resolved [`WorkerEdgeBootConfig`].
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkerEdgeBootConfigFull {
+    pub accept_claims: bool,
+    pub jwks_refresh: String,
+    pub clock_skew: String,
+}
+
+impl Default for WorkerEdgeBootConfigFull {
+    fn default() -> Self {
+        WorkerEdgeBootConfigFull {
+            accept_claims: false,
+            jwks_refresh: "5m".into(),
+            clock_skew: "30s".into(),
+        }
+    }
+}
+
+impl WorkerEdgeBootConfig {
+    pub fn with_defaults(&self) -> WorkerEdgeBootConfigFull {
+        let defaults = WorkerEdgeBootConfigFull::default();
+        WorkerEdgeBootConfigFull {
+            accept_claims: self.accept_claims.unwrap_or(defaults.accept_claims),
+            jwks_refresh: self.jwks_refresh.clone().unwrap_or(defaults.jwks_refresh),
+            clock_skew: self.clock_skew.clone().unwrap_or(defaults.clock_skew),
+        }
+    }
 }
 
 /// Telemetry configuration: the manager's Prometheus metrics + health-probe
@@ -891,6 +1034,8 @@ pub struct ManagerConfigFull {
     pub exec: ExecConfigFull,
     #[serde(default)]
     pub telemetry: TelemetryConfigFull,
+    #[serde(default)]
+    pub edge_boot: EdgeBootConfigFull,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -1039,6 +1184,7 @@ impl From<ManagerConfigFull> for ManagerConfig {
                 enabled: Some(val.exec.enabled),
             }),
             telemetry: Some(val.telemetry.into()),
+            edge_boot: Some(val.edge_boot.into()),
         }
     }
 }
@@ -1105,6 +1251,11 @@ impl ManagerConfig {
                 .as_ref()
                 .map(TelemetryConfig::with_defaults)
                 .unwrap_or_default(),
+            edge_boot: self
+                .edge_boot
+                .as_ref()
+                .map(EdgeBootConfig::with_defaults)
+                .unwrap_or_default(),
         }
     }
 }
@@ -1130,6 +1281,7 @@ impl Default for ManagerConfigFull {
             artifacts: ArtifactsManagerConfigFull::default(),
             exec: ExecConfigFull::default(),
             telemetry: TelemetryConfigFull::default(),
+            edge_boot: EdgeBootConfigFull::default(),
         }
     }
 }
@@ -1386,6 +1538,10 @@ pub struct WorkerConfigAlt {
     /// unless declared.
     #[serde(default)]
     pub resource_enforcement: Option<WorkerResourceEnforcementConfig>,
+    /// Whether this node accepts edge-initiated starts, and how it verifies
+    /// the tickets that authorize them (see docs/edge-boot.md). Absent = off.
+    #[serde(default)]
+    pub edge_boot: Option<WorkerEdgeBootConfig>,
 }
 
 /// Worker `resourceEnforcement` block: cgroup v2 limits for `exec` tasks.

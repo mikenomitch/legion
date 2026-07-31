@@ -166,6 +166,12 @@ const TABLE_OWNERS: &[(&str, Owner)] = &[
     ("acl_token", Owner::Lane(Lane::Control)),
     ("acl_user", Owner::Lane(Lane::Control)),
     ("join_token", Owner::Lane(Lane::Control)),
+    // Boot tickets are capabilities an operator (or a platform's minter)
+    // hands out, like join tokens — minted and spent on the control lane,
+    // never touched by the scheduler. `spend_boot_ticket` is a conditional
+    // UPDATE on this lane, which is what makes single-use enforcement
+    // globally serialized rather than per-manager.
+    ("boot_ticket", Owner::Lane(Lane::Control)),
     // Count overrides (`legion job scale`) are operator/autoscaler INTENT,
     // like the job specs they layer over — and their lifecycle is coupled
     // to the submit path: `handle_job_submit` arbitrates override

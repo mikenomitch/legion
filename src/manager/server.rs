@@ -28,7 +28,7 @@ use crate::structs::manager_server::Manager;
 use crate::structs::{
     validate_keyed_instance_id, worker_client::WorkerClient, AcquireKvLockReply,
     AcquireKvLockRequest, AdvanceRolloutReply, AdvanceRolloutRequest, AllocationHealth,
-    AllocationLog, CreateInstanceReply, CreateInstanceRequest, CreateInstancesReply,
+    AllocationLog, BootTicket, CreateInstanceReply, CreateInstanceRequest, CreateInstancesReply,
     CreateInstancesRequest, DeleteJobTemplateReply, DeleteJobTemplateRequest, DeleteKvReply,
     DeleteKvRequest, DeleteSavedStateQueryReply, DeleteSavedStateQueryRequest, DeleteVolumeReply,
     DeleteVolumeRequest, DestroyInstanceReply, DestroyInstanceRequest, DestroyJobReply,
@@ -45,32 +45,34 @@ use crate::structs::{
     GetStateBackupRequest, GetStateStoreSchemaReply, GetStateStoreSchemaRequest,
     GetTaskLogsRequest, GetVolumeReply, GetVolumeRequest, HealthCheckReply, HealthCheckRequest,
     HeartbeatReply, HeartbeatRequest, Instance, InstanceInfo, InstanceMode, InstanceState,
-    IssueNodeIdentityTokenReply, IssueNodeIdentityTokenRequest, IssueRaftCommandReply,
-    IssueRaftCommandRequest, IssueWorkloadIdentityTokenReply, IssueWorkloadIdentityTokenRequest,
-    JobConfig, JobSpecHistoryItem, JobTemplate, JobTemplateProvenance, JobTemplateSummary,
+    IssueBootTicketReply, IssueBootTicketRequest, IssueNodeIdentityTokenReply,
+    IssueNodeIdentityTokenRequest, IssueRaftCommandReply, IssueRaftCommandRequest,
+    IssueWorkloadIdentityTokenReply, IssueWorkloadIdentityTokenRequest, JobConfig,
+    JobSpecHistoryItem, JobTemplate, JobTemplateProvenance, JobTemplateSummary,
     JobTemplateVariable, JobTemplateVersionInfo, KvEntry, KvInjectionAction, KvValueType,
-    LedgerNode, ListEventsReply, ListEventsRequest, ListInstancesReply, ListInstancesRequest,
-    ListJobActionsReply, ListJobActionsRequest, ListJobSpecHistoryReply, ListJobSpecHistoryRequest,
-    ListJobTemplatesReply, ListJobTemplatesRequest, ListJobsReply, ListJobsRequest, ListKvReply,
-    ListKvRequest, ListRaftHistoryReply, ListRaftHistoryRequest, ListRolloutEventsReply,
-    ListRolloutEventsRequest, ListRolloutsReply, ListRolloutsRequest, ListSavedStateQueriesReply,
+    LedgerNode, ListBootTicketsReply, ListBootTicketsRequest, ListEventsReply, ListEventsRequest,
+    ListInstancesReply, ListInstancesRequest, ListJobActionsReply, ListJobActionsRequest,
+    ListJobSpecHistoryReply, ListJobSpecHistoryRequest, ListJobTemplatesReply,
+    ListJobTemplatesRequest, ListJobsReply, ListJobsRequest, ListKvReply, ListKvRequest,
+    ListRaftHistoryReply, ListRaftHistoryRequest, ListRolloutEventsReply, ListRolloutEventsRequest,
+    ListRolloutsReply, ListRolloutsRequest, ListSavedStateQueriesReply,
     ListSavedStateQueriesRequest, ListServicesReply, ListServicesRequest, ListVolumeDriversReply,
     ListVolumeDriversRequest, ListVolumesReply, ListVolumesRequest, Node, NodeMsg, PatchKvReply,
     PatchKvRequest, PlanJobReply, PlanJobRequest, PlannedAllocation, PutKvReply, PutKvRequest,
-    QueryStateStoreReply, QueryStateStoreRequest, RaftHistoryEvent, RaftStatus, ReleaseKvLockReply,
-    ReleaseKvLockRequest, RenderJobTemplateReply, RenderJobTemplateRequest, RenewKvLockReply,
-    RenewKvLockRequest, ReplaceInstanceReply, ReplaceInstanceRequest, ResolveServiceReply,
-    ResolveServiceRequest, RestartWorkerReply, RestartWorkerRequest, RolloutAllocationStatus,
-    RolloutEvent, RolloutGroupStatus, RolloutProgression, RolloutReplacement, RunJobReply,
-    RunJobRequest, RunJobTemplateReply, RunJobTemplateRequest, SavedStateQuery, ScaleTaskReply,
-    ScaleTaskRequest, SchedulerEvent, ServiceEndpoint, ServiceSummary, SetNodeAvailabilityReply,
-    SetNodeAvailabilityRequest, StartInstanceReply, StartInstanceRequest, StopInstanceReply,
-    StopInstanceRequest, StopJobReply, StopJobRequest, StopNotice, StopRolloutReply,
-    StopRolloutRequest, StreamEventsRequest, Submission, TaskConfig, TaskOnUnhealthyConfig,
-    TaskScaleStatus, UpdateNodeDynamicReply, UpdateNodeDynamicRequest, UpsertJobTemplateReply,
-    UpsertJobTemplateRequest, UpsertSavedStateQueryReply, UpsertSavedStateQueryRequest,
-    WorkerConfig, WorkerPreRegisterReply, WorkerPreRegisterRequest, WorkerRegisterReply,
-    WorkerRegisterRequest,
+    QueryStateStoreReply, QueryStateStoreRequest, RaftHistoryEvent, RaftStatus, RatifyClaimReply,
+    RatifyClaimRequest, ReleaseKvLockReply, ReleaseKvLockRequest, RenderJobTemplateReply,
+    RenderJobTemplateRequest, RenewKvLockReply, RenewKvLockRequest, ReplaceInstanceReply,
+    ReplaceInstanceRequest, ResolveServiceReply, ResolveServiceRequest, RestartWorkerReply,
+    RestartWorkerRequest, RolloutAllocationStatus, RolloutEvent, RolloutGroupStatus,
+    RolloutProgression, RolloutReplacement, RunJobReply, RunJobRequest, RunJobTemplateReply,
+    RunJobTemplateRequest, SavedStateQuery, ScaleTaskReply, ScaleTaskRequest, SchedulerEvent,
+    ServiceEndpoint, ServiceSummary, SetNodeAvailabilityReply, SetNodeAvailabilityRequest,
+    StartInstanceReply, StartInstanceRequest, StopInstanceReply, StopInstanceRequest, StopJobReply,
+    StopJobRequest, StopNotice, StopRolloutReply, StopRolloutRequest, StreamEventsRequest,
+    Submission, TaskConfig, TaskOnUnhealthyConfig, TaskScaleStatus, UpdateNodeDynamicReply,
+    UpdateNodeDynamicRequest, UpsertJobTemplateReply, UpsertJobTemplateRequest,
+    UpsertSavedStateQueryReply, UpsertSavedStateQueryRequest, WorkerConfig, WorkerPreRegisterReply,
+    WorkerPreRegisterRequest, WorkerRegisterReply, WorkerRegisterRequest,
 };
 use crate::structs::{
     AuthMethodInfo, BootstrapAclReply, BootstrapAclRequest, CreateAclTokenReply,
@@ -1070,6 +1072,19 @@ pub struct ManagerDaemonService {
     /// Whether `ExecAllocation` is enabled (config `exec.enabled`, default
     /// true). When false the endpoint rejects with FailedPrecondition.
     exec_enabled: bool,
+    /// Edge boot settings (`edgeBoot`, docs/edge-boot.md). Disabled by
+    /// default: with `enabled: false` no ticket can be minted and no claim
+    /// ratified, so a cluster that upgrades and changes nothing grows no new
+    /// authorization surface.
+    edge_boot: crate::structs::EdgeBootConfigFull,
+    /// Last-reported provisional claims per node (docs/edge-boot.md).
+    ///
+    /// In memory on purpose: unratified work lives for seconds, and writing
+    /// it to the store on every heartbeat would put a per-node write on the
+    /// hottest path in the system to describe state that is stale before the
+    /// row lands. A failover shows nothing until the next heartbeat, which is
+    /// at most one interval of incompleteness and never a wrong answer.
+    provisional_claims: Arc<Mutex<HashMap<String, Vec<crate::structs::ProvisionalClaimReport>>>>,
 }
 
 impl ManagerDaemonService {
@@ -1096,6 +1111,8 @@ impl ManagerDaemonService {
                 crate::artifacts::FetcherRegistry::with_builtins(),
             )),
             exec_enabled: true,
+            edge_boot: crate::structs::EdgeBootConfigFull::default(),
+            provisional_claims: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -1588,6 +1605,109 @@ impl ManagerDaemonService {
     pub fn with_advertise_addr(mut self, advertise_addr: impl Into<String>) -> Self {
         self.advertise_addr = advertise_addr.into();
         self
+    }
+
+    /// Attach the cluster's edge-boot settings (docs/edge-boot.md).
+    pub fn with_edge_boot(mut self, edge_boot: crate::structs::EdgeBootConfigFull) -> Self {
+        self.edge_boot = edge_boot;
+        self
+    }
+
+    /// Render a committed allocation as the dispatch payload a node needs to
+    /// finish a ratified claim. `None` when anything it depends on is already
+    /// gone, which the caller reports rather than papering over.
+    fn committed_payload(
+        &self,
+        allocation_id: i64,
+        claim_id: &str,
+        gate: i32,
+    ) -> Option<crate::structs::TaskAllocation> {
+        let allocation = self
+            .store
+            .get_allocation_by_id(allocation_id)
+            .ok()
+            .flatten()?;
+        let task = self
+            .store
+            .get_task_config_by_id(allocation.task_config_id)
+            .ok()
+            .flatten()?;
+        let instance = match allocation.instance_id.as_deref() {
+            Some(instance_id) => self.store.get_instance(instance_id).ok().flatten(),
+            None => None,
+        };
+        let volumes = self
+            .store
+            .volume_mounts_for_allocation(&allocation.job_id, &task, instance.as_ref())
+            .ok()?;
+        let mut payload = crate::manager::dispatcher::build_task_allocation(
+            &task,
+            &allocation,
+            instance.as_ref(),
+            &volumes,
+        )
+        .ok()?;
+        payload.provisional = Some(crate::structs::ProvisionalAllocation {
+            claim_id: claim_id.to_string(),
+            gate,
+            lease_deadline_unix: 0,
+            instance_id: allocation.instance_id.clone().unwrap_or_default(),
+            origin: "edge".into(),
+            on_refused: String::new(),
+            ticket_jti: String::new(),
+        });
+        Some(payload)
+    }
+
+    /// Verdicts for claims a node is still holding that this manager has
+    /// already decided (`HeartbeatReply.claim_verdicts`).
+    ///
+    /// The `RatifyClaim` reply is the primary channel; this covers the case
+    /// where that reply was lost after the manager committed. Without it the
+    /// node would kill work the cluster believes is running, and the instance
+    /// would stay bound to a dead allocation until the next reschedule.
+    ///
+    /// The lookup is the instance binding itself, so it needs no new state:
+    /// an instance bound to an allocation on *this* node means confirmed, and
+    /// one bound elsewhere means this node lost the race.
+    fn claim_verdicts_for(
+        &self,
+        node_id: &str,
+        claims: &[crate::structs::ProvisionalClaimReport],
+    ) -> Vec<crate::structs::ClaimVerdict> {
+        let mut verdicts = Vec::new();
+        for claim in claims {
+            if claim.instance_id.trim().is_empty() {
+                continue;
+            }
+            let Ok(Some(instance)) = self.store.get_instance(&claim.instance_id) else {
+                continue;
+            };
+            let Some(allocation_id) = instance.current_alloc_id else {
+                continue;
+            };
+            let Ok(Some(allocation)) = self.store.get_allocation_by_id(allocation_id) else {
+                continue;
+            };
+            if allocation.node_id == node_id {
+                verdicts.push(crate::structs::ClaimVerdict {
+                    claim_id: claim.claim_id.clone(),
+                    confirmed: true,
+                    allocation_id,
+                    reason: 0,
+                    detail: String::new(),
+                });
+            } else {
+                verdicts.push(crate::structs::ClaimVerdict {
+                    claim_id: claim.claim_id.clone(),
+                    confirmed: false,
+                    allocation_id: 0,
+                    reason: crate::structs::edge_boot::RefusalReason::InstanceClaimed.to_wire(),
+                    detail: format!("bound to {}", allocation.node_id),
+                });
+            }
+        }
+        verdicts
     }
 
     /// Admission normalization for artifacts (artifact system plan §§1,6,7,8):
@@ -4955,6 +5075,7 @@ impl Manager for ManagerDaemonService {
         crate::manager::telemetry::metrics().heartbeats_total.inc();
         let req = request.into_inner();
         let id = req.id;
+        let provisional_claims = req.provisional_claims;
 
         self.store
             .update_node_heartbeat(id.clone())
@@ -5016,12 +5137,28 @@ impl Manager for ManagerDaemonService {
             }
         };
 
+        // Catch-up verdicts for claims this node is still holding that the
+        // manager has already decided (docs/edge-boot.md). Empty for every
+        // node running only committed work.
+        let claim_verdicts = self.claim_verdicts_for(&id, &provisional_claims);
+        // Keep the operator-visible view current, and drop the entry entirely
+        // when a node reports no claims so the map stays the live set rather
+        // than a history of every node that ever held one.
+        if let Ok(mut guard) = self.provisional_claims.lock() {
+            if provisional_claims.is_empty() {
+                guard.remove(&id);
+            } else {
+                guard.insert(id.clone(), provisional_claims.clone());
+            }
+        }
+
         let reply = HeartbeatReply {
             message: "ack".into(),
             desired_allocations,
             upstream_endpoints,
             volume_destroy,
             stop_notices,
+            claim_verdicts,
         };
 
         Ok(Response::new(reply))
@@ -5082,6 +5219,7 @@ impl Manager for ManagerDaemonService {
             host_volumes: worker_config.host_volumes,
             heartbeat_seconds: worker_config.heartbeat_seconds,
             resource_enforcement: worker_config.resource_enforcement,
+            edge_boot: worker_config.edge_boot,
         };
 
         let reply = WorkerPreRegisterReply {
@@ -5268,8 +5406,14 @@ impl Manager for ManagerDaemonService {
             &AclScope::pool(&node.pool),
         )?;
 
+        let provisional_claims = self
+            .provisional_claims
+            .lock()
+            .map(|guard| guard.get(&id).cloned().unwrap_or_default())
+            .unwrap_or_default();
         let reply = GetNodeReply {
             node: Some(node.into()),
+            provisional_claims,
         };
         Ok(Response::new(reply))
     }
@@ -6803,6 +6947,351 @@ impl Manager for ManagerDaemonService {
             message: format!("join token `{}` deleted", req.id),
         }))
     }
+
+    // -----------------------------------------------------------------
+    // Edge boot (docs/edge-boot.md)
+    // -----------------------------------------------------------------
+
+    #[instrument(skip_all, fields(job, task, jti))]
+    async fn issue_boot_ticket(
+        &self,
+        request: Request<IssueBootTicketRequest>,
+    ) -> Result<Response<IssueBootTicketReply>, Status> {
+        // Scope is the job named in the body, so authenticate first and
+        // enforce precisely once it is parsed.
+        let identity = self.authenticate_acl(&request)?;
+        let req = request.into_inner();
+        acl::enforce(
+            &identity,
+            AclResource::Boot,
+            AclAction::Write,
+            &AclScope::job(&req.job),
+        )?;
+        tracing::Span::current().record("job", req.job.as_str());
+        tracing::Span::current().record("task", req.task.as_str());
+
+        if !self.edge_boot.enabled {
+            return Err(Status::failed_precondition(
+                "edge boot is not enabled on this manager \
+                 (set edgeBoot.enabled: true in the manager config)",
+            ));
+        }
+        let Some(state) = self.workload_identity.as_ref() else {
+            return Err(Status::failed_precondition(
+                "boot tickets are signed by the workload-identity issuer, which is not enabled \
+                 on this manager (set workloadIdentity.enabled: true)",
+            ));
+        };
+
+        let idempotency_key = req.idempotency_key.clone().unwrap_or_default();
+        if let Some(recorded) = self
+            .store
+            .idempotency_lookup(&idempotency_key)
+            .map_err(|e| map_store_error("Error checking idempotency", e))?
+        {
+            let reply: MintedTicketRecord = serde_json::from_str(&recorded)
+                .map_err(|e| Status::internal(format!("corrupt idempotency record: {e}")))?;
+            return Ok(Response::new(IssueBootTicketReply {
+                ticket: reply.ticket,
+                jti: reply.jti,
+                job_config_id: reply.job_config_id,
+                expires_at_unix: reply.expires_at_unix,
+                deduplicated: true,
+            }));
+        }
+
+        // A ticket names an EXACT job config, never "latest": pinning at mint
+        // is what keeps a redeploy from silently widening what a live ticket
+        // can start.
+        let job_config_id = if req.job_config_id.trim().is_empty() {
+            self.store
+                .get_job_config_optional(&req.job)
+                .map_err(|e| map_store_error("Error resolving job config", e))?
+                .ok_or_else(|| {
+                    Status::not_found(format!("job `{}` has no current config", req.job))
+                })?
+                .id()
+        } else {
+            req.job_config_id.clone()
+        };
+
+        let task = self
+            .store
+            .get_task_configs_for_job_config(&job_config_id)
+            .map_err(|e| map_store_error("Error loading task configs", e))?
+            .into_iter()
+            .map(|(_, task)| task)
+            .find(|task| task.name == req.task)
+            .ok_or_else(|| {
+                Status::not_found(format!(
+                    "job config {job_config_id} has no task `{}`",
+                    req.task
+                ))
+            })?;
+
+        let ttl = match req.ttl.trim() {
+            "" => self.edge_boot.default_ticket_ttl.clone(),
+            raw => raw.to_string(),
+        };
+        let ttl = humantime::parse_duration(&ttl)
+            .map_err(|e| Status::invalid_argument(format!("invalid ttl `{ttl}`: {e}")))?;
+
+        let ticket_request = crate::manager::edge_boot::TicketRequest {
+            job: req.job.clone(),
+            task: req.task.clone(),
+            job_config_id: job_config_id.clone(),
+            instance_id: req.instance_id.clone(),
+            instance_prefix: req.instance_prefix.clone(),
+            pool: req.pool.clone(),
+            gate: crate::structs::edge_boot::Gate::from_wire(req.gate),
+            ttl,
+            uses: if req.uses == 0 { 1 } else { req.uses },
+            accessor_id: identity.accessor_id.clone().unwrap_or_default(),
+        };
+        crate::manager::edge_boot::validate_ticket_request(&ticket_request, &task, &self.edge_boot)
+            .map_err(|e| Status::invalid_argument(format!("{e:#}")))?;
+
+        let jti = crate::structs::edge_boot::new_ticket_id();
+        let minted = crate::manager::edge_boot::mint(
+            state,
+            &ticket_request,
+            &jti,
+            std::time::SystemTime::now(),
+        )
+        .map_err(|e| Status::internal(format!("failed to mint boot ticket: {e:#}")))?;
+        tracing::Span::current().record("jti", jti.as_str());
+
+        self.store
+            .insert_boot_ticket(&minted.record)
+            .map_err(|e| map_store_error("Error recording boot ticket", e))?;
+        self.store.events().boot_ticket_issued(
+            &minted.record.jti,
+            &minted.record.job,
+            &minted.record.task,
+            &minted.record.job_config_id,
+            &minted.record.instance_id,
+            &minted.record.instance_prefix,
+            &minted.record.pool,
+            &minted.record.gate,
+            &minted.record.accessor_id,
+            minted.record.expires_at_unix,
+        );
+
+        let reply = IssueBootTicketReply {
+            ticket: minted.token,
+            jti: minted.record.jti.clone(),
+            job_config_id,
+            expires_at_unix: minted.record.expires_at_unix,
+            deduplicated: false,
+        };
+        // The idempotency record carries the token so a retry returns the
+        // capability that was already minted instead of a second one.
+        let record = serde_json::to_string(&MintedTicketRecord {
+            ticket: reply.ticket.clone(),
+            jti: reply.jti.clone(),
+            job_config_id: reply.job_config_id.clone(),
+            expires_at_unix: reply.expires_at_unix,
+        })
+        .map_err(|e| Status::internal(format!("failed to record idempotency: {e}")))?;
+        self.store
+            .idempotency_record(&idempotency_key, "issue_boot_ticket", &record)
+            .map_err(|e| map_store_error("Error recording idempotency", e))?;
+
+        info!(jti = %reply.jti, job = %req.job, task = %req.task, "Boot ticket issued");
+        Ok(Response::new(reply))
+    }
+
+    #[instrument(skip_all)]
+    async fn list_boot_tickets(
+        &self,
+        request: Request<ListBootTicketsRequest>,
+    ) -> Result<Response<ListBootTicketsReply>, Status> {
+        // Coarse gate before the lookup, precise filtering after — a
+        // credential-less caller must not be able to probe which jobs have
+        // live tickets.
+        let identity = self.check_acl(
+            &request,
+            AclResource::Boot,
+            AclAction::Read,
+            AclScope::any(),
+        )?;
+        let req = request.into_inner();
+        let now_unix = time::OffsetDateTime::now_utc().unix_timestamp();
+        let tickets = self
+            .store
+            .list_boot_tickets(&req.job, now_unix)
+            .map_err(|e| map_store_error("Error listing boot tickets", e))?
+            .into_iter()
+            .filter(|record| {
+                identity.allows(
+                    AclResource::Boot,
+                    AclAction::Read,
+                    &AclScope::job(&record.job),
+                )
+            })
+            .map(|record| BootTicket {
+                gate: crate::structs::edge_boot::Gate::parse(&record.gate)
+                    .unwrap_or_default()
+                    .to_wire(),
+                uses_remaining: record.uses_remaining(),
+                jti: record.jti,
+                job: record.job,
+                task: record.task,
+                job_config_id: record.job_config_id,
+                instance_id: record.instance_id,
+                instance_prefix: record.instance_prefix,
+                pool: record.pool,
+                expires_at_unix: record.expires_at_unix,
+                accessor_id: record.accessor_id,
+                created_at: record.created_at,
+            })
+            .collect();
+        Ok(Response::new(ListBootTicketsReply { tickets }))
+    }
+
+    #[instrument(skip_all, fields(node_id, claim_id, verdict))]
+    async fn ratify_claim(
+        &self,
+        request: Request<RatifyClaimRequest>,
+    ) -> Result<Response<RatifyClaimReply>, Status> {
+        // ACL: worker-plane endpoint — the node that started the work asks
+        // the manager to commit it, authenticated with its node token. The
+        // ticket (when present) is re-verified below; nodes are honest but
+        // are not trusted to be the only holder of a capability.
+        let identity = self.authenticate_acl(&request)?;
+        acl::enforce_worker_plane(&identity)?;
+        let req = request.into_inner();
+        tracing::Span::current().record("node_id", req.node_id.as_str());
+        tracing::Span::current().record("claim_id", req.claim_id.as_str());
+
+        let refuse = |reason: crate::structs::edge_boot::RefusalReason, detail: String| {
+            crate::manager::telemetry::worker_metrics()
+                .provisional_refused_total
+                .inc(&[reason.as_str()]);
+            Ok(Response::new(RatifyClaimReply {
+                confirmed: false,
+                allocation_id: 0,
+                reason: reason.to_wire(),
+                detail,
+                allocation: None,
+            }))
+        };
+
+        // An edge-originated claim carries the ticket that authorized it.
+        if !req.ticket.trim().is_empty() {
+            if !self.edge_boot.enabled {
+                return refuse(
+                    crate::structs::edge_boot::RefusalReason::Disabled,
+                    "edge boot is not enabled on this manager".into(),
+                );
+            }
+            let Some(state) = self.workload_identity.as_ref() else {
+                return refuse(
+                    crate::structs::edge_boot::RefusalReason::Disabled,
+                    "the workload-identity issuer that signs boot tickets is not enabled".into(),
+                );
+            };
+            let node = self
+                .store
+                .get_node(&req.node_id)
+                .map_err(|e| map_store_error("Error loading node", e))?;
+            let now_unix = time::OffsetDateTime::now_utc().unix_timestamp();
+            if let Err(err) = crate::manager::edge_boot::verify_and_spend(
+                &self.store,
+                state,
+                &req.ticket,
+                &req.instance_id,
+                &node.pool,
+                now_unix,
+            ) {
+                return refuse(
+                    crate::structs::edge_boot::RefusalReason::TicketInvalid,
+                    format!("{err:#}"),
+                );
+            }
+        }
+
+        let started = std::time::Instant::now();
+        let claim = crate::manager::edge_boot::ClaimRatification {
+            node_id: &req.node_id,
+            claim_id: &req.claim_id,
+            job_config_id: &req.job_config_id,
+            task_name: &req.task_name,
+            instance_id: &req.instance_id,
+            gate: crate::structs::edge_boot::Gate::from_wire(req.gate),
+        };
+        let verdict = crate::manager::edge_boot::ratify(&self.store, &claim)
+            .map_err(|e| Status::internal(format!("ratification failed: {e:#}")))?;
+
+        let job_id = self
+            .store
+            .job_id_for_job_config(&req.job_config_id)
+            .unwrap_or_default()
+            .unwrap_or_default();
+        match verdict {
+            crate::manager::edge_boot::Verdict::Confirmed { allocation_id } => {
+                let latency_ms = started.elapsed().as_millis() as u64;
+                tracing::Span::current().record("verdict", "confirmed");
+                crate::manager::telemetry::worker_metrics()
+                    .provisional_ratify_seconds
+                    .observe(started.elapsed().as_secs_f64());
+                self.store.events().provisional_ratified(
+                    &req.claim_id,
+                    allocation_id,
+                    &req.node_id,
+                    &job_id,
+                    &req.instance_id,
+                    crate::structs::edge_boot::Gate::from_wire(req.gate).as_str(),
+                    latency_ms,
+                );
+                // The committed payload rides back with the verdict: the
+                // node booted from one that could not name assigned ports,
+                // the bound instance, or resolved mounts, and must replace it
+                // before it starts the workload or opens the gate.
+                let payload = self.committed_payload(allocation_id, &req.claim_id, req.gate);
+                if payload.is_none() {
+                    warn!(
+                        allocation_id,
+                        claim_id = %req.claim_id,
+                        "Ratified allocation could not be rendered; the node will kill the claim"
+                    );
+                }
+                Ok(Response::new(RatifyClaimReply {
+                    confirmed: true,
+                    allocation_id,
+                    reason: 0,
+                    detail: String::new(),
+                    allocation: payload,
+                }))
+            }
+            crate::manager::edge_boot::Verdict::Refused { reason, detail } => {
+                tracing::Span::current().record("verdict", "refused");
+                self.store.events().provisional_refused(
+                    &req.claim_id,
+                    &req.node_id,
+                    &job_id,
+                    &req.instance_id,
+                    reason.as_str(),
+                    &detail,
+                );
+                refuse(reason, detail)
+            }
+        }
+    }
+}
+
+/// The idempotency payload for `IssueBootTicket`.
+///
+/// It carries the signed ticket so a retried mint returns the capability that
+/// already exists rather than minting a second one — two live tickets where
+/// the caller believes there is one is precisely the surface this feature
+/// must not grow.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct MintedTicketRecord {
+    ticket: String,
+    jti: String,
+    job_config_id: String,
+    expires_at_unix: i64,
 }
 
 fn worker_address_for_node(node: &Node) -> Option<String> {
@@ -8511,6 +9000,21 @@ mod tests {
 
     #[tonic::async_trait]
     impl Worker for TestWorker {
+        type StartClaimStream = std::pin::Pin<
+            Box<
+                dyn tokio_stream::Stream<Item = Result<crate::structs::StartClaimReply, Status>>
+                    + Send
+                    + 'static,
+            >,
+        >;
+
+        async fn start_claim(
+            &self,
+            _request: Request<crate::structs::StartClaimRequest>,
+        ) -> Result<Response<Self::StartClaimStream>, Status> {
+            Err(Status::unimplemented("test worker does not accept claims"))
+        }
+
         async fn post_work(
             &self,
             _request: Request<PostWorkRequest>,
@@ -10679,6 +11183,7 @@ mod tests {
         service: &str,
     ) -> crate::structs::TaskAllocation {
         crate::structs::TaskAllocation {
+            provisional: None,
             allocation_id,
             job_id: job_id.into(),
             task_connect: json!({ "upstreams": [{ "service": service }] }).to_string(),
@@ -10696,6 +11201,7 @@ mod tests {
         seed_upstream_service(&store, "web", 18080, &[], true)?;
 
         let plain = crate::structs::TaskAllocation {
+            provisional: None,
             allocation_id: 1,
             job_id: "plain".into(),
             ..Default::default()
@@ -10811,6 +11317,7 @@ mod tests {
         seed_upstream_service(&store, "web", 18095, &[], true)?;
 
         let corrupt = crate::structs::TaskAllocation {
+            provisional: None,
             allocation_id: 1,
             job_id: "broken".into(),
             task_connect: "{not json".into(),

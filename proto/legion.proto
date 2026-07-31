@@ -778,6 +778,49 @@ service Manager {
   // Workers already registered keep their node tokens; revocation only
   // prevents future joins with this token.
   rpc DeleteJoinToken (DeleteJoinTokenRequest) returns (DeleteJoinTokenReply);
+
+  // Mints a boot ticket: a short-lived, narrow capability that lets an edge
+  // node start one workload on its own, without any call to a manager
+  // (docs/edge-boot.md). Requires `boot:write`, scoped by job name.
+  //
+  // The ticket is a JWT signed by the cluster's workload-identity signer and
+  // verified offline by the worker against the published JWKS. It names an
+  // exact job config, one task, the instance id (or a non-empty instance
+  // prefix) it may start, the node pool it may run in, and the furthest gate
+  // level the start may reach. Tickets are single-use by default; a second
+  // ratification carrying the same `jti` is refused.
+  //
+  // `boot:write` is deliberately separate from `job:write`: a platform's
+  // ticket minter should be able to authorize individual starts without
+  // holding the right to redeploy the fleet.
+  //
+  // Refused with FailedPrecondition when `edgeBoot.enabled` is false on the
+  // manager — minting is an explicit operator decision, because it grows a
+  // compromised node's blast radius from "runs what it was given" to "runs
+  // anything a live ticket names".
+  rpc IssueBootTicket (IssueBootTicketRequest) returns (IssueBootTicketReply);
+
+  // Lists outstanding boot tickets (metadata only — never the token bytes).
+  // Requires `boot:read`. Rows expire with the ticket, so this is the live
+  // set of capabilities the cluster has handed out.
+  rpc ListBootTickets (ListBootTicketsRequest) returns (ListBootTicketsReply);
+
+  // Ratifies a provisional allocation: the durable commit that decides who
+  // really owns an instance (docs/edge-boot.md).
+  //
+  // Worker plane — called by the node that started the work, authenticated
+  // with its node token. The manager turns the claim into an ordinary plan
+  // submission with a single placement on the calling node and applies it
+  // through the same transaction every other placement goes through, with
+  // the same epoch compare-and-set, the same constraint re-validation, and
+  // the same at-most-one-live-allocation instance binding. A refusal here is
+  // that apply failing; there is no second code path for correctness.
+  //
+  // The reply is the verdict: `confirmed` carries the manager-minted
+  // allocation id (the worker opens the network and the work becomes a normal
+  // allocation), `refused` carries a machine-readable reason the worker kills
+  // the work with.
+  rpc RatifyClaim (RatifyClaimRequest) returns (RatifyClaimReply);
 }
 
 // Request payload for WorkerPreRegister.
@@ -884,6 +927,17 @@ message WorkerConfig {
   // Default: empty string (enforcement off; `resources` stays advisory for
   // `exec` tasks).
   string resource_enforcement = 12;
+
+  // JSON-encoded edge-boot settings for this worker (see docs/edge-boot.md).
+  // Shape: `{"acceptClaims":true,"jwksRefresh":"5m","clockSkew":"30s"}`.
+  //
+  // `acceptClaims` decides whether this node serves `Worker.StartClaim` — that
+  // is, whether it will start work on a boot ticket at all. Off by default,
+  // independently of the manager's `edgeBoot.enabled`: an operator who turns
+  // the feature on cluster-wide still chooses which nodes are edges.
+  //
+  // Default: empty string (this node accepts no edge starts).
+  string edge_boot = 13;
 }
 
 // Reply payload for WorkerPreRegister.
@@ -2571,6 +2625,18 @@ message HeartbeatRequest {
   //
   // Default: empty list.
   repeated TerminatedAllocation terminated_allocations = 6;
+
+  // Unratified provisional allocations this node is currently holding (see
+  // docs/edge-boot.md). Reported on every heartbeat so started-but-
+  // unconfirmed work is visible to an operator looking at capacity, and so a
+  // manager that already decided a claim can re-deliver its verdict in
+  // `HeartbeatReply.claim_verdicts` when the `RatifyClaim` reply was lost.
+  //
+  // Claims disappear from this list the moment they are confirmed (they
+  // become ordinary allocations and appear in `allocation_ids`) or killed.
+  //
+  // Default: empty list — nodes running only committed work pay nothing.
+  repeated ProvisionalClaimReport provisional_claims = 7;
 }
 
 // Reply payload for Heartbeat.
@@ -2634,6 +2700,15 @@ message HeartbeatReply {
   //
   // Default: empty list when no allocation on this node was recently removed.
   repeated StopNotice stop_notices = 5;
+
+  // Catch-up verdicts for claims the worker reported in
+  // `HeartbeatRequest.provisional_claims` that the manager has already
+  // decided (see `ClaimVerdict`). The `RatifyClaim` reply is the primary
+  // channel; this covers the case where that reply was lost after the
+  // manager committed.
+  //
+  // Default: empty list.
+  repeated ClaimVerdict claim_verdicts = 6;
 }
 
 // Why one allocation is being stopped.
@@ -2958,6 +3033,18 @@ message GetNodeReply {
   //
   // Unset when the node ID does not exist.
   optional NodeMsg node = 1;
+
+  // Provisional (unratified) allocations this node reported on its most
+  // recent heartbeat — work it has started that the store has not recorded
+  // (docs/edge-boot.md). This is what makes started-but-unconfirmed capacity
+  // visible instead of invisible.
+  //
+  // Live state, not durable: the manager holds the last report in memory, so
+  // a failover shows an empty list until the node's next heartbeat (at most
+  // one heartbeat interval). It is never wrong, only briefly incomplete.
+  //
+  // Default: empty list.
+  repeated ProvisionalClaimReport provisional_claims = 2;
 }
 
 // Request payload for RestartWorker.
@@ -4218,6 +4305,25 @@ service Worker {
   // manager (worker plane); the manager has already authorized the caller and
   // rendered any action command into a raw argv on the `ExecStart` frame.
   rpc ExecTask (stream ExecClientFrame) returns (stream ExecServerFrame);
+
+  // Starts work on this node from a boot ticket, without any call to a
+  // manager on the critical path (docs/edge-boot.md).
+  //
+  // This is the edge entry point: a platform's router hands the node a
+  // ticket it minted ahead of time, the node verifies it offline against the
+  // cached JWKS, admits it against its own free resources, and boots to the
+  // gate level. Ratification runs in parallel and its verdict arrives on
+  // this same stream.
+  //
+  // Server-streaming so the caller learns each transition without polling —
+  // a router may begin routing at `booted` and must be prepared for
+  // `refused` at any point until `ratified`.
+  //
+  // Rejected with FailedPrecondition unless the worker was configured with
+  // `edgeBoot.acceptClaims: true`. Callers are authorized by the ticket
+  // alone; the worker holds no user credentials and verifies no other
+  // identity.
+  rpc StartClaim (StartClaimRequest) returns (stream StartClaimReply);
 }
 
 // === EXEC / ACTIONS ===
@@ -4589,6 +4695,22 @@ message TaskAllocation {
   //
   // Empty string when the task declares no resources.
   string task_resources = 16;
+
+  // Present only when this dispatch is a *provisional* start: work the node
+  // may begin before the placement is durable (docs/edge-boot.md).
+  //
+  // When set, `allocation_id` is 0 — the manager mints allocation ids inside
+  // the apply transaction, so a not-yet-committed placement has none. The
+  // node keys the work by `provisional.claim_id` instead, and learns its
+  // allocation id from the ratification verdict.
+  //
+  // Absent on every allocation of a job that did not opt into
+  // `speculativeStart`, so a cluster that upgrades and changes nothing sends
+  // byte-identical payloads. An old worker that ignores this field would run
+  // the allocation immediately with no gate and no lease, which is why
+  // pre-commit dispatch requires a minimum worker protocol version and falls
+  // back to post-commit dispatch per node below it.
+  ProvisionalAllocation provisional = 18;
 }
 
 // Request payload for PostWork.
@@ -5028,6 +5150,411 @@ message DeleteJoinTokenRequest {
 message DeleteJoinTokenReply {
   // Human-readable status message.
   string message = 1;
+}
+
+// === EDGE BOOT (provisional allocations, gates, boot tickets) ===
+
+// How far a node may get on a start before the placement is durable
+// (docs/edge-boot.md). Both the task's `speculativeStart.mode` and a boot
+// ticket's `legion.io/gate` claim carry one of these; the LOWER of the two
+// always wins, so neither a jobspec nor a ticket can raise the other's
+// ceiling.
+enum GateLevel {
+  // No speculation: today's behavior. The node is told about the allocation
+  // only after the commit. This is the default for every task.
+  GATE_OFF = 0;
+
+  // The node may fetch artifacts, pull images, build root disks, and
+  // provision (but not attach) node-local volumes before the commit. It may
+  // NOT start the workload. Nothing outside the node can observe a staged
+  // claim; the only cost of losing the race is wasted local work.
+  GATE_STAGE = 1;
+
+  // Everything `GATE_STAGE` allows, plus booting the guest and running the
+  // workload with its network held shut. It may NOT open the network,
+  // register in service discovery, attach shared storage, or obtain any
+  // Legion-issued identity until ratified.
+  //
+  // The network gate is a real boundary for the `sandbox` runtime (the TAP
+  // device is held down with a default-drop filter) and a weaker one for
+  // host runtimes — see docs/edge-boot.md "What the gate does and does not
+  // stop".
+  GATE_BOOT = 2;
+
+  // Everything `GATE_BOOT` allows, plus opening the network immediately.
+  // The fastest mode, and the only one where a workload that loses its race
+  // may already have produced externally visible side effects before it is
+  // killed. It still cannot obtain a Legion-issued identity or attach shared
+  // storage, so a loser can never act as the winner inside the cluster.
+  GATE_SERVE = 3;
+}
+
+// Why a ratification was refused. Workers treat an unrecognized value as
+// `REFUSAL_UNSPECIFIED` and kill the work anyway — fail-closed under skew.
+enum ClaimRefusalReason {
+  // Reason not stated (or from a newer manager than this worker knows).
+  REFUSAL_UNSPECIFIED = 0;
+
+  // Another allocation already owns this instance id. The expected outcome
+  // of two edges racing for one sandbox: the first ratification binds, this
+  // one loses.
+  REFUSAL_INSTANCE_CLAIMED = 1;
+
+  // The node no longer has room for the placement, as re-validated on the
+  // fresh node row inside the apply transaction.
+  REFUSAL_NO_CAPACITY = 2;
+
+  // The node does not satisfy the task's constraints/permit, or is cordoned,
+  // draining, or lost.
+  REFUSAL_INELIGIBLE = 3;
+
+  // The claim's lease expired before the ratification reached the manager.
+  REFUSAL_EXPIRED = 4;
+
+  // The boot ticket was invalid: bad signature, wrong audience, wrong pool,
+  // expired, or a `jti` already spent (single-use replay).
+  REFUSAL_TICKET_INVALID = 5;
+
+  // The job config, task, or instance named by the claim does not exist.
+  REFUSAL_UNKNOWN_TARGET = 6;
+
+  // Edge boot is disabled on this manager (`edgeBoot.enabled: false`).
+  REFUSAL_DISABLED = 7;
+
+  // The manager failed to apply the ratification for an internal reason
+  // (a store error, a raft election in progress). Retriable within the
+  // lease; fatal at the deadline.
+  REFUSAL_INTERNAL = 8;
+}
+
+// The provisional half of a dispatch: everything a worker needs to run work
+// that is not yet durable, and to kill it if it never becomes durable.
+//
+// Absent on every allocation of a job that did not opt into
+// `speculativeStart`, so today's dispatch payloads are unchanged on the wire.
+message ProvisionalAllocation {
+  // Claim id (`clm_<uuid>`), minted by whoever asked for the start. This is
+  // the correlation key for the whole lifecycle: the worker keys its claim
+  // table by it, ratification names it, and it appears in every event.
+  string claim_id = 1;
+
+  // How far this start may get before ratification.
+  GateLevel gate = 2;
+
+  // Unix seconds after which the worker MUST kill this work unconditionally
+  // if it has not been ratified. This is the lease, and it is the backstop
+  // for every failure mode the reply path cannot cover — a partition, a dead
+  // manager, a lost reply.
+  int64 lease_deadline_unix = 3;
+
+  // Instance id this claim is racing for, when the task is stateful. Empty
+  // for stateless tasks. Stable from the first millisecond, which is why an
+  // edge addresses a sandbox by this rather than by an allocation id that
+  // does not exist yet.
+  string instance_id = 4;
+
+  // How the start was authorized: `manager` (pre-commit dispatch from a
+  // manager that is applying the plan right now) or `edge` (a node acting on
+  // a boot ticket).
+  string origin = 5;
+
+  // What to do when ratification is refused: `kill` (default — a hard
+  // destroy) or `stop` (the task's normal graceful-stop ladder, then
+  // removal). Mirrors `speculativeStart.onRefused`.
+  string on_refused = 6;
+
+  // The boot ticket's `jti`, for edge-originated starts. Carried into
+  // ratification so the manager can enforce single use, and into the audit
+  // events so a start is traceable to the capability that authorized it.
+  // Never the ticket itself — no ticket material ever appears in a log,
+  // event, or store row.
+  string ticket_jti = 7;
+}
+
+// One unratified claim a worker is holding, reported on every heartbeat.
+//
+// This is what makes started-but-unconfirmed work visible to an operator
+// looking at capacity, and it is the catch-up channel's key: a manager that
+// sees a claim it has already decided replies with a verdict in
+// `HeartbeatReply.claim_verdicts`.
+message ProvisionalClaimReport {
+  // Claim id.
+  string claim_id = 1;
+
+  // Job config this claim runs an exact version of.
+  string job_config_id = 2;
+
+  // Task name within that config.
+  string task_name = 3;
+
+  // Instance id being raced for, empty for stateless tasks.
+  string instance_id = 4;
+
+  // Gate level actually in force (the lower of the task's mode and any
+  // ticket ceiling).
+  GateLevel gate = 5;
+
+  // How far the claim has actually progressed: `claimed`, `staged`,
+  // `booted`, or `serving`.
+  string stage = 6;
+
+  // Unix seconds at which the worker kills this claim if still unratified.
+  int64 lease_deadline_unix = 7;
+
+  // JSON-encoded resource request this claim is holding in the node's local
+  // ledger, so the manager can show unratified usage alongside committed
+  // usage.
+  string resources = 8;
+}
+
+// A ratification verdict delivered out-of-band on a heartbeat.
+//
+// The primary delivery is the `RatifyClaim` reply. This field exists because
+// that reply can be lost (the connection dies after the manager committed):
+// without it the worker would kill work the cluster believes is running, and
+// the instance would be bound to a dead allocation until the next reschedule.
+message ClaimVerdict {
+  // Claim the verdict is about.
+  string claim_id = 1;
+
+  // True when the claim was confirmed and `allocation_id` is set.
+  bool confirmed = 2;
+
+  // Manager-minted allocation id, set only when `confirmed`.
+  int64 allocation_id = 3;
+
+  // Why it was refused, when not confirmed.
+  ClaimRefusalReason reason = 4;
+
+  // Human-readable detail (`bound to node-a`), for logs and `legion instance
+  // get`. Never contains ticket material.
+  string detail = 5;
+}
+
+// Request payload for IssueBootTicket.
+message IssueBootTicketRequest {
+  // Job the ticket may start work for. Required; also the ACL scope.
+  string job = 1;
+
+  // Task within that job. Required — a ticket names one task, never a whole
+  // group.
+  string task = 2;
+
+  // Exact job config id the ticket authorizes. Optional: when empty the
+  // manager pins the job's current config at mint time and returns it in the
+  // reply. A ticket NEVER means "latest" — pinning at mint is what keeps a
+  // redeploy from silently widening what a live ticket can start.
+  string job_config_id = 3;
+
+  // Exactly one of these bounds which instance may be started:
+  //
+  // - `instance_id` — one specific sandbox. The narrowest capability.
+  // - `instance_prefix` — any instance whose id starts with this string.
+  //   Must be non-empty; an empty prefix would authorize every instance of
+  //   the task. Lets a platform mint one ticket per user cohort rather than
+  //   one per request, at the cost of a wider capability if the node holding
+  //   it is compromised.
+  //
+  // Both empty is rejected for stateful tasks.
+  string instance_id = 4;
+  string instance_prefix = 5;
+
+  // Node pool the ticket may be redeemed in. Required: a ticket says what
+  // may run AND where. The worker checks this against its own pool offline.
+  string pool = 6;
+
+  // Ceiling on how far a redeeming node may get before ratification. The
+  // task's own `speculativeStart.mode` also caps it, and the lower of the
+  // two always wins. `GATE_OFF` mints a ticket that can stage nothing —
+  // rejected as a mistake.
+  GateLevel gate = 7;
+
+  // Requested lifetime, e.g. `"5m"`. Defaults to `edgeBoot.defaultTicketTtl`
+  // and is clamped to `edgeBoot.maxTicketTtl`. Revocation is by TTL only
+  // (see docs/edge-boot.md) — the fast path cannot consult a revocation list
+  // without becoming the round trip the ticket exists to avoid.
+  string ttl = 8;
+
+  // How many times the ticket may be ratified. Defaults to 1 (single use).
+  // Enforced at the manager through the idempotency table, so two nodes
+  // presented the same ticket both boot but only the first is confirmed.
+  uint32 uses = 9;
+
+  // Optional idempotency key. A repeat with the same key returns the
+  // originally minted ticket rather than minting a second capability.
+  optional string idempotency_key = 10;
+}
+
+// Reply payload for IssueBootTicket.
+message IssueBootTicketReply {
+  // The signed ticket. This is the only time the manager returns it — the
+  // store keeps metadata (`jti`, scope, expiry, accessor) for audit and
+  // single-use enforcement, never the token bytes.
+  string ticket = 1;
+
+  // The ticket's `jti`, safe to log and to correlate against events.
+  string jti = 2;
+
+  // Exact job config the ticket is pinned to.
+  string job_config_id = 3;
+
+  // Expiry, unix seconds.
+  int64 expires_at_unix = 4;
+
+  // True when this reply replayed an earlier mint for the same idempotency
+  // key rather than minting a new ticket.
+  bool deduplicated = 5;
+}
+
+// Request payload for ListBootTickets.
+message ListBootTicketsRequest {
+  // Restrict to tickets for one job. Empty lists every ticket the caller is
+  // allowed to see.
+  string job = 1;
+}
+
+// One outstanding boot ticket, metadata only.
+message BootTicket {
+  // Ticket id (`jti`).
+  string jti = 1;
+  // Job the ticket authorizes starts for.
+  string job = 2;
+  // Task within that job.
+  string task = 3;
+  // Exact job config the ticket is pinned to.
+  string job_config_id = 4;
+  // Instance id it may start, when narrowed to one.
+  string instance_id = 5;
+  // Instance prefix it may start, when narrowed to a cohort.
+  string instance_prefix = 6;
+  // Node pool it may be redeemed in.
+  string pool = 7;
+  // Gate ceiling.
+  GateLevel gate = 8;
+  // Remaining redemptions.
+  uint32 uses_remaining = 9;
+  // Expiry, unix seconds.
+  int64 expires_at_unix = 10;
+  // ACL accessor id that minted it — who to ask about a start you did not
+  // expect. Never a token secret.
+  string accessor_id = 11;
+  // Mint time, RFC3339.
+  string created_at = 12;
+}
+
+// Reply payload for ListBootTickets.
+message ListBootTicketsReply {
+  // Live tickets, newest first.
+  repeated BootTicket tickets = 1;
+}
+
+// Request payload for RatifyClaim (worker plane).
+message RatifyClaimRequest {
+  // Node making the claim. Must match the node token on the request.
+  string node_id = 1;
+
+  // Claim being ratified.
+  string claim_id = 2;
+
+  // Exact job config the work runs.
+  string job_config_id = 3;
+
+  // Task within that config.
+  string task_name = 4;
+
+  // Instance id being bound, empty for stateless tasks.
+  string instance_id = 5;
+
+  // Gate level the work is currently held at, for the audit trail.
+  GateLevel gate = 6;
+
+  // Boot ticket that authorized the start, for edge-originated claims. The
+  // manager re-verifies it (nodes are honest but not trusted to be the only
+  // holder) and spends its `jti` when the ticket is single-use. Empty for
+  // manager-originated claims, which were authorized by the submit that
+  // produced them.
+  string ticket = 7;
+}
+
+// Reply payload for RatifyClaim.
+message RatifyClaimReply {
+  // True when the placement committed. The worker opens the network and the
+  // claim becomes an ordinary allocation.
+  bool confirmed = 1;
+
+  // Manager-minted allocation id, set only when `confirmed`.
+  int64 allocation_id = 2;
+
+  // Why it was refused, when not confirmed.
+  ClaimRefusalReason reason = 3;
+
+  // Human-readable detail for logs and `legion instance get`.
+  string detail = 4;
+
+  // The committed allocation, in the exact form an ordinary dispatch would
+  // have carried it: the manager-minted id, the assigned network, and the
+  // resolved volume mounts.
+  //
+  // Present only when `confirmed`. This is what lets a provisional start
+  // finish as a *normal* allocation rather than as a second-class one: the
+  // node replaces the payload it booted with (which could not name ports or
+  // volumes, because those are assigned inside the apply transaction) before
+  // it starts the workload or opens the network.
+  //
+  // It carries the same `provisional.claim_id`, so a node can match it to the
+  // claim without trusting field ordering.
+  TaskAllocation allocation = 5;
+}
+
+// Request payload for Worker.StartClaim (the edge entry point).
+message StartClaimRequest {
+  // Signed boot ticket authorizing this start. Verified entirely offline
+  // against the cached JWKS; a node that cannot reach any manager can still
+  // admit a start.
+  string ticket = 1;
+
+  // Instance id to start. Must equal the ticket's `legion.io/instance`, or
+  // begin with its `legion.io/instance_prefix`.
+  string instance_id = 2;
+
+  // Caller-minted claim id (`clm_<uuid>`). Supplying it makes the call
+  // retry-safe: a repeat with the same id joins the existing claim's stream
+  // instead of starting a second sandbox.
+  string claim_id = 3;
+
+  // Requested gate ceiling. Capped by both the ticket's gate and the task's
+  // `speculativeStart.mode`; the lowest of the three wins.
+  GateLevel gate = 4;
+
+  // Verify the ticket and local admission, then report what WOULD happen and
+  // stop — no artifacts fetched, nothing booted, no claim held. For agents
+  // and routers that want to self-correct before mutating anything.
+  bool dry_run = 5;
+}
+
+// One transition on a StartClaim stream. The caller learns each stage
+// without polling; a router may begin routing at `booted` and must expect
+// `refused` at any point up to `ratified`.
+message StartClaimReply {
+  // Claim id (echoed, or the one the worker minted).
+  string claim_id = 1;
+
+  // Lifecycle stage reached: `admitted`, `staged`, `booted`, `serving`,
+  // `ratified`, or `refused`.
+  string stage = 2;
+
+  // Manager-minted allocation id, set on the `ratified` frame only.
+  int64 allocation_id = 3;
+
+  // Refusal reason, set on the `refused` frame only.
+  ClaimRefusalReason reason = 4;
+
+  // Human-readable detail for the frame.
+  string detail = 5;
+
+  // Gate level in force for this claim, after intersecting the request, the
+  // ticket, and the task's own mode.
+  GateLevel gate = 6;
 }
 
 // === RAFT TRANSPORT (manager-plane internal) ===

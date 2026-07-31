@@ -19,6 +19,8 @@ fn cli() -> Command {
         .subcommand(cmd::node::config())
         .subcommand(cmd::start::config())
         .subcommand(cmd::join_token::config())
+        .subcommand(cmd::boot_ticket::config())
+        .subcommand(cmd::sandbox::config())
         .subcommand(cmd::join::config())
         .subcommand(cmd::ledger::config())
         .subcommand(cmd::events::config())
@@ -69,6 +71,8 @@ async fn main() -> R<()> {
         Some(("instance", sub_matches)) => cmd::instance::handle(sub_matches).await?,
         Some(("node", sub_matches)) => cmd::node::handle(sub_matches).await?,
         Some(("join-token", sub_matches)) => cmd::join_token::handle(sub_matches).await?,
+        Some(("boot-ticket", sub_matches)) => cmd::boot_ticket::handle(sub_matches).await?,
+        Some(("sandbox", sub_matches)) => cmd::sandbox::handle(sub_matches).await?,
         Some(("join", sub_matches)) => cmd::join::handle(sub_matches).await?,
         Some(("ledger", sub_matches)) => cmd::ledger::handle(sub_matches).await?,
         Some(("events", sub_matches)) => cmd::events::handle(sub_matches).await?,

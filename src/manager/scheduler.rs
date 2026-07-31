@@ -1391,6 +1391,15 @@ impl<'a> Scheduler<'a> {
                 expected_versions,
             );
         };
+        // Speculative dispatch (docs/edge-boot.md): tasks that opted into
+        // `speculativeStart` get their payload NOW, while the apply is in
+        // flight, so the node's image pull and root-disk build overlap the
+        // commit instead of queueing behind it. Nothing here can fail the
+        // plan — a claim that does not land simply misses the head start, and
+        // one whose plan is rejected dies at its own lease.
+        let speculative_claims =
+            crate::manager::dispatcher::dispatch_speculative(self.store, &placement_pairs);
+
         // One replicated op for insert + apply: on raft backends the split
         // form paid a second quorum round-trip per plan (see
         // `Store::submit_and_apply_plan`).
@@ -1431,6 +1440,14 @@ impl<'a> Scheduler<'a> {
             }
         };
         timings.apply_us = apply_started.elapsed().as_micros() as u64;
+        // The apply outcome IS the ratification for the claims dispatched
+        // above: deliver it before anything else, because a `stage`-gated
+        // node is holding a prepared workload waiting for exactly this.
+        crate::manager::dispatcher::dispatch_ratifications(
+            self.store,
+            &allocations,
+            &speculative_claims,
+        );
         let deltas = Self::allocations_delta(&affected_nodes, &allocations);
         timings.total_us = started.elapsed().as_micros() as u64;
         timings.observe();

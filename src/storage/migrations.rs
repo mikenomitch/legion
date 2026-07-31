@@ -1079,6 +1079,53 @@ pub fn get_migrations() -> Migrations<'static> {
         // transaction under a single epoch compare-and-set.
         M::up("ALTER TABLE plan_submission ADD COLUMN evictions JSONB NOT NULL DEFAULT '[]';")
             .down(""),
+        // ---------------------------------------------------------------
+        // Edge boot (docs/edge-boot.md). Appended last, per the note on
+        // `task_scale` above.
+        // ---------------------------------------------------------------
+        //
+        // How far a node may get on a start for this task before the
+        // placement is durable. A JSON column for the same reason `stop` and
+        // `disruption` are: it is a small block that will grow fields
+        // (a per-gate timeout, a per-runtime override) without wanting a
+        // migration each time. NULL — which every existing row gets — reads
+        // as `mode: 'off'`, so an upgraded cluster behaves byte for byte as
+        // it did.
+        M::up("ALTER TABLE task_config ADD COLUMN speculative_start JSONB;").down(""),
+        // Per-worker-type edge boot settings, as JSON like `artifacts` and
+        // `resource_enforcement`. Empty on every existing row, which reads as
+        // "this node accepts no edge starts".
+        M::up("ALTER TABLE worker_type ADD COLUMN edge_boot TEXT NOT NULL DEFAULT '';").down(""),
+        // Boot tickets: the capabilities the cluster has handed out. The
+        // token bytes are NEVER stored — only the metadata an operator needs
+        // to audit a start and the manager needs to enforce single use.
+        // Rows are pruned once they expire, because an expired ticket can
+        // never be redeemed and its row has no further job.
+        M::up(
+            "CREATE TABLE IF NOT EXISTS boot_ticket (
+            jti STRING PRIMARY KEY,
+            job STRING NOT NULL,
+            task STRING NOT NULL,
+            job_config_id STRING NOT NULL,
+            instance_id STRING NOT NULL DEFAULT '',
+            instance_prefix STRING NOT NULL DEFAULT '',
+            pool STRING NOT NULL,
+            gate STRING NOT NULL,
+            uses INTEGER NOT NULL DEFAULT 1,
+            uses_spent INTEGER NOT NULL DEFAULT 0,
+            expires_at_unix INTEGER NOT NULL,
+            accessor_id STRING NOT NULL DEFAULT '',
+            created_at TIMESTAMP NOT NULL
+        )",
+        )
+        .down("DROP TABLE IF EXISTS boot_ticket;"),
+        M::up("CREATE INDEX IF NOT EXISTS boot_ticket_job_idx ON boot_ticket (job);")
+            .down("DROP INDEX IF EXISTS boot_ticket_job_idx;"),
+        // A ratification names the ONE keyed instance it is racing for, so
+        // the apply binds that sandbox or refuses. Empty on every ordinary
+        // plan, which keeps the "any unbound instance" binding unchanged.
+        M::up("ALTER TABLE plan_submission ADD COLUMN target_instance STRING NOT NULL DEFAULT '';")
+            .down(""),
     ])
 }
 

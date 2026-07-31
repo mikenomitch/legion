@@ -254,6 +254,53 @@ fn tool_defs() -> Vec<ToolDef> {
             mutates: false,
         },
         ToolDef {
+            name: "legion_boot_ticket_create",
+            description: "Mint a boot ticket: a short-lived capability that lets one edge node start one workload without calling a manager (docs/edge-boot.md). Names an exact job config, one task, one instance (or a non-empty instance prefix), one node pool, and a gate ceiling. Single-use by default and revocable only by expiry, so prefer short TTLs. The token is returned ONCE. Mutating.",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "job": { "type": "string", "description": "Job the ticket may start work for." },
+                    "task": { "type": "string", "description": "Task within that job." },
+                    "pool": { "type": "string", "description": "Node pool the ticket may be redeemed in." },
+                    "instance_id": { "type": "string", "description": "Exact instance the ticket may start. Use this or instance_prefix." },
+                    "instance_prefix": { "type": "string", "description": "Any instance with this prefix. Wider capability than instance_id." },
+                    "gate": { "type": "string", "enum": ["stage", "boot", "serve"], "description": "Ceiling on how far the node may get before ratification. Capped by the task's own speculativeStart.mode." },
+                    "job_config_id": { "type": "string", "description": "Pin to an exact job config. Default: the job's current config." },
+                    "ttl": { "type": "string", "description": "Lifetime, e.g. 5m. Default: edgeBoot.defaultTicketTtl." },
+                    "uses": { "type": "integer", "description": "Redemptions allowed. Default 1." },
+                    "idempotency_key": { "type": "string", "description": "Retry-safe key; a repeat returns the ticket already minted." }
+                },
+                "required": ["job", "task", "pool"],
+                "additionalProperties": false
+            }),
+            mutates: true,
+        },
+        ToolDef {
+            name: "legion_boot_ticket_list",
+            description: "List outstanding boot tickets (metadata only — token bytes are never stored or returned). Read-only.",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "job": { "type": "string", "description": "Restrict to one job." }
+                },
+                "additionalProperties": false
+            }),
+            mutates: false,
+        },
+        ToolDef {
+            name: "legion_node_claims",
+            description: "List a node's live provisional (unratified) allocations — work it has started that the store has not recorded yet (docs/edge-boot.md). Use this to see started-but-unconfirmed capacity, and to tell 'still booting' from 'already confirmed'. Read-only.",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "node_id": { "type": "string", "description": "Node ID." }
+                },
+                "required": ["node_id"],
+                "additionalProperties": false
+            }),
+            mutates: false,
+        },
+        ToolDef {
             name: "legion_node_drain",
             description: "Cordon, drain, or uncordon a worker node. cordon = stop new placements (existing allocations keep running); drain = cordon + evict allocations (stateless move immediately, stateful stay protected by their stateful.onLost policy); uncordon = make the node schedulable again. Mutating.",
             input_schema: || json!({
@@ -800,6 +847,47 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
                 idempotency_key,
             }))
             .await
+        }
+        "legion_boot_ticket_create" => {
+            let gate = match opt_str_arg(&args, "gate") {
+                Some(raw) => crate::structs::edge_boot::Gate::parse(&raw)
+                    .map_err(|err| format!("{err:#}"))?,
+                None => crate::structs::edge_boot::Gate::Boot,
+            };
+            let uses = args
+                .get("uses")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(1) as u32;
+            let mut client = connect().await?;
+            grpc(
+                client.issue_boot_ticket(crate::structs::IssueBootTicketRequest {
+                    job: str_arg(&args, "job")?,
+                    task: str_arg(&args, "task")?,
+                    pool: str_arg(&args, "pool")?,
+                    instance_id: opt_str_arg(&args, "instance_id").unwrap_or_default(),
+                    instance_prefix: opt_str_arg(&args, "instance_prefix").unwrap_or_default(),
+                    job_config_id: opt_str_arg(&args, "job_config_id").unwrap_or_default(),
+                    gate: gate.to_wire(),
+                    ttl: opt_str_arg(&args, "ttl").unwrap_or_default(),
+                    uses,
+                    idempotency_key: opt_str_arg(&args, "idempotency_key"),
+                }),
+            )
+            .await
+        }
+        "legion_boot_ticket_list" => {
+            let mut client = connect().await?;
+            grpc(
+                client.list_boot_tickets(crate::structs::ListBootTicketsRequest {
+                    job: opt_str_arg(&args, "job").unwrap_or_default(),
+                }),
+            )
+            .await
+        }
+        "legion_node_claims" => {
+            let id = str_arg(&args, "node_id")?;
+            let mut client = connect().await?;
+            grpc(client.get_node(crate::structs::GetNodeRequest { id })).await
         }
         "legion_acl_whoami" => {
             let mut client = connect().await?;

@@ -206,9 +206,39 @@ async fn run_worker_with_manager(
         }
         spawn_health_monitor(task_manager.clone(), allocation, task);
     }
+    // Edge boot: this node serves `Worker.StartClaim` only when its worker
+    // config opts in. Off by default, independently of the manager's switch —
+    // an operator who enables the feature cluster-wide still chooses which
+    // nodes are edges (docs/edge-boot.md).
+    let edge_boot_config: crate::structs::WorkerEdgeBootConfigFull =
+        if config.edge_boot.trim().is_empty() {
+            crate::structs::WorkerEdgeBootConfigFull::default()
+        } else {
+            serde_json::from_str(&config.edge_boot).unwrap_or_else(|err| {
+                warn!(error = ?err, "Invalid edgeBoot worker config; edge starts stay disabled");
+                crate::structs::WorkerEdgeBootConfigFull::default()
+            })
+        };
+    let edge_boot = if edge_boot_config.accept_claims {
+        Some(Arc::new(build_edge_boot_runtime(
+            &edge_boot_config,
+            &manager_addr,
+            &name,
+            &config.pool,
+            client.clone(),
+            credentials.clone(),
+        )))
+    } else {
+        None
+    };
+    if edge_boot.is_some() {
+        info!(worker = %name, pool = %config.pool, "Edge boot enabled: this node accepts boot tickets");
+    }
+
     let worker_node = WorkerDaemonService {
         task_manager: task_manager.clone(),
         identity: Some(identity_manager.clone()),
+        edge_boot: edge_boot.clone(),
     };
     let worker_server_fut = Server::builder()
         .add_service(WorkerServer::new(worker_node))
@@ -331,6 +361,61 @@ async fn run_worker_with_manager(
     );
 
     Ok(())
+}
+
+/// Assemble this node's edge-boot runtime: the JWKS-backed ticket verifier,
+/// the spec cache, and the ratifier that calls the manager.
+fn build_edge_boot_runtime(
+    config: &crate::structs::WorkerEdgeBootConfigFull,
+    manager_addr: &str,
+    node_id: &str,
+    pool: &str,
+    client: ManagerClient<Channel>,
+    credentials: Arc<WorkerCredentials>,
+) -> crate::worker::server::EdgeBootRuntime {
+    let refresh = humantime::parse_duration(&config.jwks_refresh)
+        .unwrap_or(crate::worker::boot_ticket::DEFAULT_JWKS_REFRESH);
+    let skew = humantime::parse_duration(&config.clock_skew)
+        .unwrap_or(crate::worker::boot_ticket::DEFAULT_CLOCK_SKEW);
+    // The issuer URL is the manager address the worker already trusts (it is
+    // what its join token pointed at), and the JWKS lives at the well-known
+    // path the manager serves alongside gRPC.
+    let issuer = manager_addr.trim_end_matches('/').to_string();
+    let jwks_url = format!("{issuer}/.well-known/jwks.json");
+    let source = Box::new(crate::worker::boot_ticket::HttpJwksSource::new(
+        jwks_url,
+        Duration::from_secs(5),
+    ));
+    crate::worker::server::EdgeBootRuntime {
+        verifier: Arc::new(crate::worker::boot_ticket::BootTicketVerifier::new(
+            source, issuer, pool, refresh, skew,
+        )),
+        spec_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        node_id: node_id.to_string(),
+        ratifier: Arc::new(ManagerClaimRatifier {
+            client,
+            credentials,
+        }),
+    }
+}
+
+/// Ratifies claims by calling the manager's `RatifyClaim`, authenticated with
+/// this node's own credentials.
+struct ManagerClaimRatifier {
+    client: ManagerClient<Channel>,
+    credentials: Arc<WorkerCredentials>,
+}
+
+#[tonic::async_trait]
+impl crate::worker::server::ClaimRatifier for ManagerClaimRatifier {
+    async fn ratify(
+        &self,
+        request: crate::structs::RatifyClaimRequest,
+    ) -> R<crate::structs::RatifyClaimReply> {
+        let mut client = self.client.clone();
+        let request = self.credentials.attach(tonic::Request::new(request));
+        Ok(client.ratify_claim(request).await?.into_inner())
+    }
 }
 
 #[instrument(err, skip_all)]
@@ -634,8 +719,14 @@ async fn heartbeat_tick(
                 .add(failures.len() as u64);
         }
 
+        // Unratified work is reported separately from committed allocations:
+        // the manager cannot reconcile what it has not recorded, but an
+        // operator looking at capacity must still see it.
+        let provisional_claims = crate::worker::edge::claim_reports(task_manager);
+
         let req = credentials.attach(tonic::Request::new(HeartbeatRequest {
             id: name.to_string(),
+            provisional_claims,
             allocation_ids: allocations,
             failed_allocations: failures,
             allocation_health,
@@ -674,6 +765,48 @@ async fn heartbeat_tick(
         };
         debug!(worker = %name, elapsed_ms = start.elapsed().as_millis() as u64, "Heartbeat acknowledged by manager");
         let reply = response.into_inner();
+        // Catch-up verdicts, for claims whose `RatifyClaim` reply was lost
+        // after the manager committed (docs/edge-boot.md). Applied before the
+        // reconcile below so a confirmed claim is already an ordinary
+        // allocation by the time the desired set is compared.
+        for verdict in &reply.claim_verdicts {
+            // The committed payload is already on this reply, in
+            // `desired_allocations` — the manager lists it the moment the
+            // placement commits — so the verdict carries only the decision
+            // and this path costs no extra bytes on the wire.
+            let committed = verdict
+                .confirmed
+                .then(|| {
+                    reply
+                        .desired_allocations
+                        .iter()
+                        .find(|allocation| allocation.allocation_id == verdict.allocation_id)
+                })
+                .flatten();
+            if verdict.confirmed && committed.is_none() {
+                // Confirmed but not yet listed (the read model refreshes just
+                // after the commit): leave the claim alone and pick it up on
+                // the next tick, still inside its lease.
+                debug!(
+                    claim_id = %verdict.claim_id,
+                    allocation_id = verdict.allocation_id,
+                    "Verdict arrived before the allocation appeared in the desired set"
+                );
+                continue;
+            }
+            crate::worker::edge::apply_verdict(
+                task_manager,
+                &verdict.claim_id,
+                committed,
+                crate::structs::edge_boot::RefusalReason::from_wire(verdict.reason),
+                &verdict.detail,
+            );
+        }
+        // The lease is the backstop for every failure the reply path cannot
+        // cover: a partition, a dead manager, a lost verdict. It runs on the
+        // heartbeat tick because that is the one loop guaranteed to keep
+        // running while everything else is stuck.
+        crate::worker::edge::sweep_leases(task_manager);
         // The manager acknowledged us, so this reply is authoritative for the
         // connect datapath (see `apply_upstreams` on fail-static semantics).
         apply_upstreams(forwarder, &reply).await;
@@ -1180,6 +1313,7 @@ mod tests {
     /// was assigned at placement time.
     fn connect_allocation(allocation_id: i64, service: &str, local_port: u16) -> TaskAllocation {
         TaskAllocation {
+            provisional: None,
             allocation_id,
             task_connect: json!({ "upstreams": [{ "service": service }] }).to_string(),
             network: json!({
@@ -1212,6 +1346,7 @@ mod tests {
     #[test]
     fn upstream_specs_skip_allocations_without_connect() {
         let plain = TaskAllocation {
+            provisional: None,
             allocation_id: 1,
             network: json!({ "ports": [{ "name": "http", "hostPort": 20000 }] }).to_string(),
             ..TaskAllocation::default()
@@ -1219,11 +1354,13 @@ mod tests {
         // Declared upstreams but no network yet (or a corrupt payload) cannot
         // produce a listener — there is no port to bind.
         let unplaced = TaskAllocation {
+            provisional: None,
             allocation_id: 2,
             task_connect: json!({ "upstreams": [{ "service": "db" }] }).to_string(),
             ..TaskAllocation::default()
         };
         let corrupt = TaskAllocation {
+            provisional: None,
             allocation_id: 3,
             task_connect: json!({ "upstreams": [{ "service": "db" }] }).to_string(),
             network: "{not json".into(),
@@ -1282,6 +1419,7 @@ mod tests {
         };
         let forwarder = UpstreamForwarder::new();
         let reply = HeartbeatReply {
+            claim_verdicts: Vec::new(),
             message: "ack".into(),
             desired_allocations: vec![connect_allocation(11, "db", local_port)],
             volume_destroy: Vec::new(),
@@ -1321,6 +1459,7 @@ mod tests {
         apply_upstreams(
             &forwarder,
             &HeartbeatReply {
+                claim_verdicts: Vec::new(),
                 message: "ack".into(),
                 ..HeartbeatReply::default()
             },
