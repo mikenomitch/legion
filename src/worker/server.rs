@@ -21,10 +21,10 @@ use tonic::{Request, Response, Status, Streaming};
 pub struct EdgeBootRuntime {
     /// Offline ticket verification.
     pub verifier: Arc<BootTicketVerifier>,
-    /// Cached job configs this node may start work for, keyed by job config
-    /// id. Populated by any allocation the node has run for that config and
-    /// by an explicit `legion job prewarm` push.
-    pub spec_cache: Arc<Mutex<std::collections::HashMap<String, Vec<crate::structs::TaskConfig>>>>,
+    /// Task configs this node may start work for, keyed by job config id.
+    /// Populated from every allocation the node is dispatched (see
+    /// [`edge::remember_specs`]); nothing is fetched on the fast path.
+    pub spec_cache: edge::SpecCache,
     /// This node's id, for the ratification request.
     pub node_id: String,
     /// Ratifies a claim against the manager. Behind a trait object so the
@@ -61,6 +61,12 @@ impl Worker for WorkerDaemonService {
             .into_inner()
             .allocation
             .ok_or_else(|| Status::invalid_argument("Missing allocation"))?;
+
+        // Every payload this node is handed teaches it a job config it may
+        // later be asked to start from a boot ticket (docs/edge-boot.md).
+        if let Some(edge_boot) = self.edge_boot.as_ref() {
+            edge::remember_specs(&edge_boot.spec_cache, std::slice::from_ref(&allocation));
+        }
 
         // Provisional dispatches and their ratifications ride the same RPC as
         // an ordinary dispatch, distinguished by the `provisional` block and
@@ -224,8 +230,9 @@ impl Worker for WorkerDaemonService {
         let Some(task) = task else {
             edge_boot.verifier.unspend(&claims.jti);
             return Err(Status::failed_precondition(format!(
-                "this node has no cached spec for job config {} (prewarm it with \
-                 `legion job prewarm`, or let the node run one allocation of it first)",
+                "this node has no cached spec for job config {}; it caches a config \
+                 once it has been dispatched an allocation of it, and does not fetch \
+                 specs on the start path",
                 claims.job_config_id
             )));
         };

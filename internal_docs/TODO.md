@@ -70,6 +70,12 @@ How to use it:
   - [ ] Ticket pre-distribution and bulk minting for warm fleets, and
         ratification batching for a node starting many claims per second
         (plan phase 5).
+  - [ ] A pre-warm push for the worker spec cache. A node today caches a task
+        config once it has been dispatched an allocation of it, so an edge pool
+        must run at least one allocation of a job before a ticket for it can be
+        redeemed there. An explicit push (`legion job prewarm --pool edge-eu`)
+        would remove that ordering constraint and compose with the
+        [artifact cache and pre-warm plan](plans/artifact-cache-and-prewarm-plan.md).
   - [ ] Replace the string matching in `manager::edge_boot::classify` with a
         typed error out of the plan apply, if a second consumer of the
         rejection reason ever appears ([calls #17](calls/edge-boot-plan_calls.md)).

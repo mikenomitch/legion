@@ -2430,6 +2430,13 @@ fn parse_volume_mounts(allocation: &TaskAllocation) -> R<Vec<VolumeMount>> {
     serde_json::from_str(&allocation.task_volumes).context("Invalid task volumes JSON")
 }
 
+/// Parse a dispatch payload into its allocation and task config. Public so
+/// the edge-boot spec cache can record what a node has been asked to run
+/// without duplicating the parsing rules.
+pub fn task_and_allocation(allocation: &TaskAllocation) -> R<(Allocation, TaskConfig)> {
+    task_from_allocation(allocation)
+}
+
 fn task_from_allocation(allocation: &TaskAllocation) -> R<(Allocation, TaskConfig)> {
     let task_config: serde_json::Value =
         serde_json::from_str(&allocation.task_config).context("Invalid task configuration JSON")?;

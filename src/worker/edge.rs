@@ -18,6 +18,7 @@ use crate::structs::edge_boot::{ClaimStage, Gate, OnRefused, RefusalReason};
 use crate::structs::{ProvisionalAllocation, ProvisionalClaimReport, TaskAllocation};
 use crate::worker::claims::ClaimRecord;
 use crate::worker::task_manager::{launch_provisional_allocation, WorkerTaskManager};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -164,6 +165,46 @@ pub fn sweep_leases(task_manager: &Arc<Mutex<WorkerTaskManager>>) {
         .set(guard.unratified_claims().len() as i64);
 }
 
+/// A node's cache of task configs it may start work for, keyed by job config
+/// id (docs/edge-boot.md).
+///
+/// An edge start names an exact job config; without the matching task config
+/// the node has nothing to run. This is populated from every payload the node
+/// receives — an ordinary dispatch, a heartbeat's desired set, a provisional
+/// start — which is exactly "configs this node has run an allocation for".
+/// Nothing is fetched on the fast path: doing so would reintroduce the round
+/// trip the whole feature exists to avoid.
+pub type SpecCache = Arc<Mutex<HashMap<String, Vec<crate::structs::TaskConfig>>>>;
+
+/// Record the task configs carried by dispatched allocations, so a later
+/// `StartClaim` for the same job config can run without a manager.
+///
+/// Bounded by replacing a config's entry wholesale rather than accumulating:
+/// a node that runs a hundred versions of one job holds one entry per version
+/// it actually ran, not one per dispatch.
+pub fn remember_specs(cache: &SpecCache, allocations: &[TaskAllocation]) {
+    if allocations.is_empty() {
+        return;
+    }
+    let mut guard = match cache.lock() {
+        Ok(guard) => guard,
+        Err(_) => return,
+    };
+    for allocation in allocations {
+        if allocation.job_config_id.trim().is_empty() {
+            continue;
+        }
+        let Ok((_, task)) = crate::worker::task_manager::task_and_allocation(allocation) else {
+            continue;
+        };
+        let tasks = guard.entry(allocation.job_config_id.clone()).or_default();
+        match tasks.iter_mut().find(|cached| cached.name == task.name) {
+            Some(cached) => *cached = task,
+            None => tasks.push(task),
+        }
+    }
+}
+
 /// The heartbeat's view of this node's unratified work.
 pub fn claim_reports(task_manager: &Arc<Mutex<WorkerTaskManager>>) -> Vec<ProvisionalClaimReport> {
     task_manager
@@ -221,6 +262,58 @@ mod worker_edge_test {
             on_refused: "kill".into(),
             ticket_jti: "tkt_1".into(),
         }
+    }
+
+    #[test]
+    fn dispatched_specs_are_remembered_for_later_edge_starts() {
+        // Without this the spec cache is empty forever and every StartClaim
+        // fails: a ticket names a job config, and the node needs the matching
+        // task config to run anything.
+        let cache: SpecCache = Arc::new(Mutex::new(HashMap::new()));
+        remember_specs(&cache, &[payload()]);
+
+        let guard = cache.lock().expect("cache");
+        let tasks = guard.get("jc-1").expect("job config cached");
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].name, "workspace");
+        assert_eq!(tasks[0].runtime, "noop");
+    }
+
+    #[test]
+    fn a_redispatch_replaces_a_cached_task_rather_than_appending() {
+        // A node that runs a hundred dispatches of one task must hold one
+        // entry for it, not a hundred.
+        let cache: SpecCache = Arc::new(Mutex::new(HashMap::new()));
+        let mut updated = payload();
+        updated.task_config = serde_json::json!({ "command": ["new"] }).to_string();
+
+        remember_specs(&cache, &[payload()]);
+        remember_specs(&cache, &[updated]);
+
+        let guard = cache.lock().expect("cache");
+        let tasks = guard.get("jc-1").expect("job config cached");
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].config["command"], serde_json::json!(["new"]));
+    }
+
+    #[test]
+    fn two_tasks_of_one_job_config_are_both_cached() {
+        let cache: SpecCache = Arc::new(Mutex::new(HashMap::new()));
+        let mut sidecar = payload();
+        sidecar.task_name = "sidecar".into();
+        remember_specs(&cache, &[payload(), sidecar]);
+
+        let guard = cache.lock().expect("cache");
+        assert_eq!(guard.get("jc-1").expect("cached").len(), 2);
+    }
+
+    #[test]
+    fn a_payload_without_a_job_config_is_not_cached() {
+        let cache: SpecCache = Arc::new(Mutex::new(HashMap::new()));
+        let mut orphan = payload();
+        orphan.job_config_id = String::new();
+        remember_specs(&cache, &[orphan]);
+        assert!(cache.lock().expect("cache").is_empty());
     }
 
     #[test]

@@ -338,6 +338,7 @@ async fn run_worker_with_manager(
         registration,
         forwarder,
         heartbeat_interval,
+        edge_boot.as_ref().map(|runtime| runtime.spec_cache.clone()),
     );
     let self_fence_fut = start_self_fence_watchdog(task_manager.clone(), last_successful_heartbeat);
     let checks_fut = start_node_checks(
@@ -602,6 +603,9 @@ async fn start_heartbeats(
     registration: RegistrationPayload,
     forwarder: Arc<UpstreamForwarder>,
     heartbeat_interval: Duration,
+    // Edge-boot spec cache to keep warm from the desired set; `None` on a
+    // node that does not accept edge starts.
+    spec_cache: Option<crate::worker::edge::SpecCache>,
 ) -> R<()> {
     let mut backoff = HEARTBEAT_RETRY_MIN;
 
@@ -614,6 +618,7 @@ async fn start_heartbeats(
             &identity_manager,
             &credentials,
             &forwarder,
+            spec_cache.as_ref(),
         )
         .await;
         let worker_metrics = crate::manager::telemetry::worker_metrics();
@@ -677,6 +682,7 @@ async fn heartbeat_tick(
     identity_manager: &Arc<WorkerIdentityManager>,
     credentials: &Arc<WorkerCredentials>,
     forwarder: &Arc<UpstreamForwarder>,
+    spec_cache: Option<&crate::worker::edge::SpecCache>,
 ) -> R<()> {
     let mut client_clone = client.clone();
 
@@ -765,6 +771,11 @@ async fn heartbeat_tick(
         };
         debug!(worker = %name, elapsed_ms = start.elapsed().as_millis() as u64, "Heartbeat acknowledged by manager");
         let reply = response.into_inner();
+        // The desired set is the other place a node learns job configs it may
+        // later be asked to start from a ticket.
+        if let Some(cache) = spec_cache {
+            crate::worker::edge::remember_specs(cache, &reply.desired_allocations);
+        }
         // Catch-up verdicts, for claims whose `RatifyClaim` reply was lost
         // after the manager committed (docs/edge-boot.md). Applied before the
         // reconcile below so a confirmed claim is already an ordinary
@@ -1223,6 +1234,7 @@ mod tests {
             },
             Arc::new(UpstreamForwarder::new()),
             Duration::from_secs(WORKER_HEARTBEAT_DURATION_SEC),
+            None,
         ));
 
         // Long enough for several failed attempts (first retry after 500ms).

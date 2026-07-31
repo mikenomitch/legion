@@ -181,7 +181,10 @@ defensible at all:
 - **Service discovery.** A provisional allocation is not registered, so no
   other workload can route to something that may vanish.
 - **Instance binding.** Nothing about `user-42` changes in the store until
-  ratification.
+  ratification. `legion instance get user-42` reports the live claim alongside
+  the instance — the node holding it, the gate, the stage it has reached, and
+  when its lease expires — so "started but not yet confirmed" is a state you
+  can see rather than an instance that inexplicably has no allocation.
 
 A provisionally started task also sees **no `LEGION_ALLOC_ID`** — it does not
 have one yet, and a placeholder would be a lie. It gets `LEGION_CLAIM_ID`
@@ -307,10 +310,25 @@ ratification, which caps any damage at the gate level.
 ### The spec cache
 
 A ticket names a `job_config_id`; the node needs the matching task config to
-run anything. A node caches the specs of configs it has run allocations for.
+run anything. A node caches every task config it is *dispatched* — from an
+ordinary `PostWork`, from a heartbeat's desired set, or from a provisional
+start — so a config the node has already run an allocation of is redeemable
+without touching a manager.
+
 A `StartClaim` for a config the node has never seen is refused with
-`FailedPrecondition` naming the missing config — a node does not fetch specs on
-the fast path, because doing so would reintroduce the round trip.
+`FailedPrecondition` naming it:
+
+```
+this node has no cached spec for job config agent-sandboxes-7; it caches a
+config once it has been dispatched an allocation of it, and does not fetch
+specs on the start path
+```
+
+**A node never fetches a spec on the start path** — doing so would reintroduce
+the round trip the ticket exists to avoid. The practical shape is therefore to
+keep at least one allocation of the job running in each edge pool, which is
+what a warm sandbox fleet looks like anyway. A dedicated pre-warm push is
+tracked as future work.
 
 ## The kill path
 
