@@ -24,6 +24,7 @@ Full index: [docs/README.md](docs/README.md).
 - [Scaling Jobs](docs/autoscaling.md)
 - [Graceful Stop](docs/graceful-stop.md)
 - [Preemption and Eviction](docs/preemption-and-eviction.md)
+- [Edge Boot (starting work before the placement is durable, boot tickets)](docs/edge-boot.md)
 - [Service Discovery](docs/service-discovery.md)
 - [State Store](docs/state-store.md)
 - [Streaming Persistence](docs/persistence-streaming.md) and [Running Raft](docs/raft-operations.md)

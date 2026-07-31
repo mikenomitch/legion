@@ -2,14 +2,36 @@
 
 > **Judgement calls:** [`calls/edge-boot-plan_calls.md`](../calls/edge-boot-plan_calls.md)
 
-**Status: PLANNED.** Nothing here is built. Today every allocation reaches a
-node *after* it is durable in the store (§5), and there is no option — one-shot,
-single-topology, or otherwise — that starts work before the commit.
+**Status: SHIPPED (phases 1–4).** The public doc is
+[`docs/edge-boot.md`](../../docs/edge-boot.md), which stands on its own; this
+plan stays as the design record.
 
-Deliberately out of v1 and named as such: island mode (unratified work
-outliving a manager outage), per-destination network policy for the gated
-state, speculative attach of *shared* writable volumes, and edge-side capacity
-arbitration between tenants (§4 Non-Goals).
+What shipped: provisional allocations with the claim table, the advisory local
+ledger, the lease and the reconcile protection window; all three gate levels
+(`stage`, `boot`, `serve`) including the `sandbox` runtime's TAP link gate;
+ratification as a one-placement plan submission that names its keyed instance;
+boot tickets with offline JWKS verification, manager-side single-use
+enforcement, the `boot` ACL resource, `Worker.StartClaim`, and the
+`legion boot-ticket` / `legion sandbox start` / `legion node claims` surfaces.
+
+**Phase 0 was not run.** The start-path measurement matrix — and therefore the
+before/after benchmark numbers this plan's testing section asks for — is open
+work in `internal_docs/TODO.md`. The consequence is that the open question
+below about the recommended default gate is still open, and the public doc
+recommends neither: it states what each gate costs and lets the operator
+choose. See judgement call 18.
+
+**Phase 5 remains backlog**, unchanged. Deliberately out of v1 and named as
+such: island mode (unratified work outliving a manager outage),
+per-destination network policy for the gated state, speculative attach of
+*shared* writable volumes, and edge-side capacity arbitration between tenants
+(§4 Non-Goals).
+
+Two limitations were discovered while building and are documented publicly
+rather than left in a reader's bug report: the `sandbox` network gate is link
+state only (no per-interface default-drop filter), and gates above `stage` are
+unavailable to tasks declaring `network.ports` or `connect.upstreams`, because
+both are assigned inside the apply transaction.
 
 ## Problem Statement
 

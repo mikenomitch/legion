@@ -3,9 +3,16 @@
 Plan: [`../plans/edge-boot-plan.md`](../plans/edge-boot-plan.md)
 
 Entries are ranked by project impact, highest first; an entry's number is its
-rank. This is a design-time record — nothing here is built yet, so every entry
-is a call about the *shape* of the feature, and the ones that survive contact
-with Phase 0's measurements will be re-stated as implementation calls.
+rank.
+
+Entries 1–10 are the **design-time** record, written before anything was built.
+Entries 11–18 are **implementation-time** calls from building phases 1–4. They
+are appended rather than interleaved so the numbers already cited elsewhere stay
+stable; each one is ranked among its own group, and where an implementation call
+refines a design-time entry it is noted inline under that entry.
+
+Phase 0's measurement matrix was **not** run — see entry 18, which supersedes
+entry 9.
 
 ## 1. Ratification is the existing plan apply, not a new consistency mechanism
 
@@ -31,6 +38,11 @@ with Phase 0's measurements will be re-stated as implementation calls.
   to prevent. Reusing the applier also means the existing invariant tests cover
   the new path unmodified, which is the strongest evidence available that the
   guarantee still holds. (Simplicity: one owner of the invariant.)
+
+**Implementation note (entry 11).** Holding to "no new code path for
+correctness" needed one change to the shared path after all: the keyed binder
+had to learn to bind a *named* instance rather than any unbound one, or a
+ratification could have bound a different sandbox than the one it raced for.
 
 ## 2. Three gate levels (`stage`/`boot`/`serve`), not one speculative on/off switch
 
@@ -127,6 +139,10 @@ with Phase 0's measurements will be re-stated as implementation calls.
   id-allocation subsystem; the handle users type is the one that was already
   stable.)
 
+**Implementation note (entry 12).** Because there is no allocation id, the
+worker also needed a *stable* local key — and, once ratified, a way to keep
+using it. Entry 12 records why nothing is rekeyed and no directory moves.
+
 ## 6. Fail-closed everywhere: unratified work dies, and it dies via the reconcile loop that already exists
 
 - **The call:** every failure mode — refusal, timeout, partition, worker
@@ -176,6 +192,10 @@ with Phase 0's measurements will be re-stated as implementation calls.
   clusters. Downgrading keeps the job running everywhere and degrades exactly
   the thing that cannot be delivered safely. (Extensibility: the ceiling is a
   driver capability, not a hard-coded rule.)
+
+**Implementation note (entry 13).** Building this turned up a second class of
+task that cannot use gates above `stage` for the same reason: one that declares
+ports or connect upstreams, which are assigned inside the apply.
 
 ## 8. The `boot` gate is a strong network boundary for `sandbox` and a weaker one for host runtimes — and the docs say so
 
@@ -241,3 +261,203 @@ with Phase 0's measurements will be re-stated as implementation calls.
   blast radii, and collapsing them means one of them makes a decision that is
   not theirs to make. (Security boundary: consent is required from whoever owns
   the risk.)
+
+---
+
+# Implementation-time calls (phases 1–4)
+
+## 11. The keyed binder learned to bind a *named* instance, or fail
+
+**Call.** `assign_keyed_instance_tx` binds "any unbound keyed instance", which
+is right for a scheduler placing work and wrong for a claim racing on one
+sandbox. It now takes an optional target — threaded from a new
+`plan_submission.target_instance` column through
+`apply_plan_submission_apply` — and either binds that instance or raises the
+existing `Conflict`:
+
+```
+keyed instance user-42 is not available to bind (already bound to another
+allocation of this task config, stopped, or terminated)
+```
+
+Empty on every ordinary plan, which keeps the "any unbound instance" binding
+byte-identical.
+
+**Alternatives.** (a) A separate ratification transaction with its own binding
+logic. (b) Keep "any unbound" and verify *after* the apply that the right
+instance was bound, undoing it when not.
+
+**Trade-off.** The scheduler's hottest transaction grew a parameter and a
+column, and every caller of `insert_allocation_with_data` was touched. (b) was
+rejected outright: "bind something, check, undo" is a second correctness path
+with a window in it, and the undo would have to delete an allocation the store
+had already committed and epoch-bumped.
+
+**Why (simplicity).** This is what makes entry 1 true rather than
+aspirational. Two code paths that both bind instances is how the
+at-most-one guarantee dies — one gets a fix the other does not. The existing
+stateful suites run unmodified, which is the evidence the invariant did not
+move.
+
+## 12. A ratified claim keeps its worker-local key; nothing is rekeyed, no directory moves
+
+**Call.** The worker keys a provisional allocation by a negative local key
+(entry 5 said allocation ids stay manager-minted, so there is none to use). On
+ratification it records `local_key -> allocation_id` and translates at exactly
+six boundaries — the heartbeat's running set, health, failures, terminal
+reports, log reads, exec. The allocation directory, log directory, open file
+descriptors and running process never move.
+`PersistedAllocation.external_id` carries the pair across a worker restart.
+
+**Alternatives.** (a) Rekey the task manager's fifteen maps and rename
+`allocs/<local>/` to `allocs/<real>/` at ratification — the tidier end state,
+where nothing downstream needs to know provisional work ever existed. (b)
+Pre-mint allocation ids before the apply.
+
+**Trade-off.** A ratified sandbox's directory is named after a negative key, so
+`ls /var/lib/legion/allocs` no longer maps one-to-one to allocation ids. A real
+cost for anyone debugging by hand, and the reason the translation lives in two
+named helpers rather than being spread inline.
+
+**Why (not breaking things).** (b) needs id reservation to be a replicated op —
+precisely the commit this feature exists to skip. (a) means renaming a
+directory out from under a running microVM whose root disk and control socket
+live inside it: `rename(2)` is safe for open fds and cwd, but bind mounts and
+any runtime that re-derives a path from a string are a silent corruption
+waiting to happen. Six enumerable, testable translation points beat a migration
+that has to be right on every runtime forever.
+
+## 13. Declared ports and connect upstreams also cap the gate at `stage`
+
+**Call.** Entry 7 downgrades tasks with unfenceable storage. The same rule now
+covers `network.ports` and `connect.upstreams`, because both are assigned
+*inside* the apply and a workload booted before it cannot know them:
+
+```
+task `api` declares network ports, which are assigned when the placement
+commits; gates above `stage` would boot it without them
+```
+
+**Alternatives.** (a) Boot without ports and let the workload discover them
+later. (b) Assign ports speculatively at dispatch and reconcile at apply.
+
+**Trade-off.** A platform that wants `boot` must use `network.mode: 'tap'` or
+`'none'` rather than Legion-assigned host ports. A genuine narrowing of who can
+use the fastest gates, stated in the public doc under "Automatic downgrades"
+rather than discovered as a missing speedup.
+
+**Why (simplicity).** (b) is a second port allocator with its own conflict
+resolution — the "two sources of truth" shape entry 7 already rejected. (a)
+produces a workload that is up but unreachable and cannot say why, which is
+worse than a start that was 20 ms slower. `stage` is unaffected: it adopts the
+committed payload before it starts anything.
+
+## 14. A provisional workload gets `LEGION_CLAIM_ID` and **no** `LEGION_ALLOC_ID`
+
+**Call.** The provisional payload injects `LEGION_CLAIM_ID` and *removes*
+`LEGION_ALLOC_ID`, including one a jobspec tried to set. A task started at
+`boot` or `serve` addresses itself by `LEGION_INSTANCE_ID`, which entry 5
+already established is correct from the first millisecond.
+
+**Alternatives.** (a) Set `LEGION_ALLOC_ID` to the negative local key. (b) Set
+it to `0` or the empty string.
+
+**Trade-off.** An image that reads `LEGION_ALLOC_ID` unconditionally breaks
+under `boot`/`serve` — it gets an unset variable rather than a wrong one, and
+needs a one-line change.
+
+**Why (honesty).** An allocation id that does not exist cannot be reported
+truthfully, and both dishonest options are worse than absence: (a) leaks an
+internal key into user space and is silently wrong after ratification; (b) is a
+sentinel every consumer must know about. The env-precedence rule this repo
+already documents — Legion's runtime variables win so a jobspec cannot make a
+workload misreport its own identity — is what forces the *removal* rather than
+leaving a stale value behind.
+
+## 15. Two delivery paths for the verdict, one claim state machine
+
+**Call.** A manager-originated claim gets its verdict pushed as a second
+`PostWork` carrying the **committed** payload; an edge-originated claim fetches
+its own with `RatifyClaim`, whose reply carries the same payload. Both funnel
+into one `ratify_claim`, which adopts the payload and then opens whichever gate
+the claim is behind.
+
+**Alternatives.** (a) Have the worker call `RatifyClaim` for manager-originated
+claims too — one delivery path. (b) A new manager→worker RPC that pushes
+verdicts for edge claims too.
+
+**Trade-off.** Two transports to keep working, and `PostWork` now means three
+things (dispatch, provisional dispatch, ratification), distinguished by whether
+`provisional` is set and whether `allocation_id` is zero. That overloading is
+documented in the proto and is the thing most likely to confuse a reader.
+
+**Why (correctness).** (a) would double-apply: the manager is already applying
+the plan that produced the claim, so a worker-initiated ratification would
+commit a *second* allocation. (b) needs a manager that can reach a node whose
+whole point is being reachable only from its own edge. The committed payload
+has to ride the verdict either way — the node booted from one that could not
+name ports, the bound instance, or resolved mounts — so the reply is the
+natural carrier.
+
+## 16. The heartbeat's catch-up verdict is derived from the instance binding, not stored
+
+**Call.** `HeartbeatReply.claim_verdicts` is computed on the fly: for each
+unratified claim a node reports, look up the instance's `current_alloc_id`. An
+allocation on *this* node means confirmed; one elsewhere means
+`instance_claimed`; neither means undecided. The manager stores no claim table.
+
+**Alternatives.** (a) A `claim` table recording every verdict, pruned by TTL.
+
+**Trade-off.** A stateless claim carries no instance id, so it gets no catch-up
+verdict and falls back to its lease. Accepted: stateless provisional starts are
+the manager-originated case, where the verdict is pushed directly.
+
+**Why (simplicity, performance).** The binding already *is* the record of who
+won; a claim table would be a second copy with its own staleness and its own
+pruning bug — and it would put a write on the heartbeat path, the hottest path
+in the system. The same reasoning governs `legion node claims`, which reads a
+per-node list the manager holds in memory: after a failover it is empty until
+the next heartbeat, which is briefly incomplete and never wrong.
+
+## 17. Refusal reasons are classified by matching the apply's rejection strings
+
+**Call.** `classify()` maps the plan-apply rejection text onto a
+`RefusalReason` — "not available to bind" → `instance_claimed`, "no longer has
+capacity" → `no_capacity`, and so on.
+
+**Alternatives.** (a) Thread a typed error out of `apply_plan_submission_apply`
+so the reason is structural rather than textual.
+
+**Trade-off.** String matching on messages that could be reworded, where a
+reword would silently degrade a refusal to `internal`. Mitigated by unit tests
+that pin each string, so a reword fails the build rather than the runtime — but
+it is a real fragility, and (a) is the right answer if a second consumer ever
+appears.
+
+**Why (proportion).** (a) changes the return type of the scheduler's central
+transaction, and every caller of it, for one caller that wants a five-way enum.
+The failure mode of getting it wrong is a claim killed with reason `internal`
+instead of `instance_claimed` — worse diagnostics, never worse behavior.
+
+## 18. Phase 0's measurement matrix was not run — this supersedes entry 9
+
+**Call.** Phases 1–4 shipped without the start-path breakdown Phase 0 called
+for, and without the before/after benchmark numbers the plan's testing section
+asks for. Entry 9 said Phase 0 measures first and is allowed to kill the plan;
+that is not what happened.
+
+**Alternatives.** (a) Build the measurement harness first, as the plan ordered
+it, and let it reshape the phases.
+
+**Trade-off.** The plan's open question — is `boot` or `stage` the right
+recommended default for sandbox platforms — is still open, so the public doc
+recommends neither: it describes what each gate costs and lets the operator
+choose. The default `ratifyTimeout` of 5s is the plan's lean, not a measured
+value. `internal_docs/TODO.md` carries the measurement as open work.
+
+**Why, and what would change it.** The measurement needs a real multi-node raft
+cluster and a real image registry to say anything true, neither of which this
+change had. Shipping the mechanism with an honest "we have not measured this"
+beats shipping a number produced on a single-node loopback cluster and calling
+it a benchmark. A production deployment's `legion_provisional_ratify_seconds`
+histogram answers the question directly, which is why that metric exists.

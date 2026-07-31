@@ -747,6 +747,8 @@ pub fn validate_job_config(config: &JobConfig) -> R<()> {
         task.validate_actions()?;
         task.validate_stop()?;
         task.validate_disruption()?;
+        task.validate_speculative_start()
+            .map_err(|err| anyhow!(err))?;
         if !task.artifacts.is_empty() {
             registry.load_plugin(&task.runtime, false)?;
             let plugin = registry

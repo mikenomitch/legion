@@ -2515,6 +2515,274 @@ mod tests {
         manager
     }
 
+    // -----------------------------------------------------------------
+    // Provisional allocations (docs/edge-boot.md)
+    // -----------------------------------------------------------------
+
+    fn provisional_payload(local_key: i64) -> TaskAllocation {
+        TaskAllocation {
+            allocation_id: local_key,
+            job_id: "agent-sandboxes".into(),
+            job_config_id: "jc-1".into(),
+            node_id: "node-1".into(),
+            task_config_id: 7,
+            task_name: "workspace".into(),
+            // `exec` rather than `noop`: the noop runtime is a dylib that
+            // is not built for unit tests, and a real host process is the
+            // stronger check anyway — a `stage`-gated claim must leave no
+            // process behind.
+            task_runtime: "exec".into(),
+            task_config: json!({ "command": ["sleep", "30"] }).to_string(),
+            task_checks: String::new(),
+            task_on_unhealthy: String::new(),
+            network: String::new(),
+            task_connect: String::new(),
+            task_artifacts: String::new(),
+            task_identities: String::new(),
+            self_terminate_after_seconds: 0,
+            task_volumes: String::new(),
+            task_resources: json!({ "memory": 256 }).to_string(),
+            provisional: None,
+        }
+    }
+
+    fn claim_record(claim_id: &str, instance_id: &str, gate: Gate) -> ClaimRecord {
+        ClaimRecord {
+            claim_id: claim_id.into(),
+            local_key: 0,
+            gate,
+            stage: ClaimStage::Claimed,
+            lease_deadline: std::time::Instant::now() + std::time::Duration::from_secs(5),
+            lease_deadline_unix: 0,
+            job_id: "agent-sandboxes".into(),
+            job_config_id: "jc-1".into(),
+            task_name: "workspace".into(),
+            instance_id: instance_id.into(),
+            resources: json!({ "memory": 256 }),
+            origin: "edge".into(),
+            on_refused: OnRefused::Kill,
+            ticket_jti: String::new(),
+            allocation_id: None,
+        }
+    }
+
+    #[test]
+    fn a_stage_gated_claim_prepares_without_starting_anything() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let mut manager = manager_in(&temp_dir);
+        let admitted = manager.admit_claim(claim_record("clm_a", "user-42", Gate::Stage))?;
+
+        let outcome = manager
+            .begin_task_allocation_gated(&provisional_payload(admitted.local_key), Gate::Stage)?;
+        assert!(
+            matches!(outcome, BeginOutcome::Staged(..)),
+            "a stage-gated launch must stop short of start"
+        );
+        // Registered (so it can be stopped) but reported as staged, not
+        // running: nothing outside the node can observe it.
+        assert!(manager.is_allocation_active(admitted.local_key));
+        let health = manager.allocation_health;
+        let entry = health.get(&admitted.local_key).expect("health entry");
+        assert_eq!(entry.status, "staged (awaiting ratification)");
+        Ok(())
+    }
+
+    #[test]
+    fn an_unratified_claim_is_absent_from_everything_the_manager_reads() -> R<()> {
+        // The manager must not be told about work it has not recorded: a
+        // negative local key reported as a running allocation would be a lie
+        // the reconcile loop acts on.
+        let temp_dir = TempDir::new()?;
+        let mut manager = manager_in(&temp_dir);
+        let admitted = manager.admit_claim(claim_record("clm_a", "user-42", Gate::Boot))?;
+        manager
+            .begin_task_allocation_gated(&provisional_payload(admitted.local_key), Gate::Boot)?;
+
+        assert!(manager.allocations_snapshot().is_empty());
+        assert!(manager.allocation_health_snapshot().is_empty());
+        assert_eq!(manager.unratified_claims().len(), 1);
+
+        // Once ratified it appears under the manager's id, and disappears
+        // from the provisional report.
+        let mut committed = provisional_payload(admitted.local_key);
+        committed.allocation_id = 8123;
+        manager.ratify_claim("clm_a", &committed)?;
+        assert_eq!(manager.allocations_snapshot(), vec![8123]);
+        assert!(manager.unratified_claims().is_empty());
+        assert_eq!(manager.local_key(8123), admitted.local_key);
+        Ok(())
+    }
+
+    #[test]
+    fn an_unratified_claim_survives_a_heartbeat_that_omits_it() -> R<()> {
+        // The protection window. The manager cannot list work it does not
+        // know about, so an absence here is ignorance, not a decision —
+        // reading it as "stop this" would kill every provisional start on its
+        // first heartbeat.
+        let temp_dir = TempDir::new()?;
+        let mut manager = manager_in(&temp_dir);
+        let admitted = manager.admit_claim(claim_record("clm_a", "user-42", Gate::Boot))?;
+        manager
+            .begin_task_allocation_gated(&provisional_payload(admitted.local_key), Gate::Boot)?;
+
+        manager.reconcile_allocations(&[]);
+        assert!(
+            manager.is_allocation_active(admitted.local_key),
+            "an unratified claim must not be reconciled away"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_ratified_claim_is_reconciled_like_any_other_allocation() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let mut manager = manager_in(&temp_dir);
+        let admitted = manager.admit_claim(claim_record("clm_a", "user-42", Gate::Boot))?;
+        manager
+            .begin_task_allocation_gated(&provisional_payload(admitted.local_key), Gate::Boot)?;
+        let mut committed = provisional_payload(admitted.local_key);
+        committed.allocation_id = 8123;
+        manager.ratify_claim("clm_a", &committed)?;
+
+        // Still desired: nothing happens, and no relaunch is proposed.
+        let mut desired = provisional_payload(admitted.local_key);
+        desired.allocation_id = 8123;
+        assert!(manager.reconcile_allocations(&[desired]).is_empty());
+        assert!(manager.is_allocation_active(admitted.local_key));
+
+        // No longer desired: the protection window is over, so it stops.
+        manager.reconcile_allocations(&[]);
+        assert!(!manager.is_allocation_active(admitted.local_key));
+        Ok(())
+    }
+
+    #[test]
+    fn an_expired_lease_kills_the_claim_and_releases_its_capacity() -> R<()> {
+        // The backstop for every failure the reply path cannot cover.
+        let temp_dir = TempDir::new()?;
+        let mut manager = manager_in(&temp_dir);
+        manager.configure_ledger(LocalLedger::new(
+            &json!({ "memory": 512 }),
+            &json!({}),
+            None,
+        ));
+        let mut record = claim_record("clm_a", "user-42", Gate::Boot);
+        record.lease_deadline = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        let admitted = manager.admit_claim(record)?;
+        manager
+            .begin_task_allocation_gated(&provisional_payload(admitted.local_key), Gate::Boot)?;
+
+        let killed = manager.sweep_expired_claims(std::time::Instant::now());
+        assert_eq!(killed.len(), 1);
+        assert!(!manager.is_allocation_active(admitted.local_key));
+        // The ledger hold is gone, so the node can admit the next start.
+        manager.admit_claim(claim_record("clm_b", "user-43", Gate::Boot))?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_ratified_claim_is_not_swept_by_its_lease() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let mut manager = manager_in(&temp_dir);
+        let mut record = claim_record("clm_a", "user-42", Gate::Boot);
+        record.lease_deadline = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        let admitted = manager.admit_claim(record)?;
+        manager
+            .begin_task_allocation_gated(&provisional_payload(admitted.local_key), Gate::Boot)?;
+        let mut committed = provisional_payload(admitted.local_key);
+        committed.allocation_id = 8123;
+        manager.ratify_claim("clm_a", &committed)?;
+
+        assert!(manager
+            .sweep_expired_claims(std::time::Instant::now())
+            .is_empty());
+        assert!(manager.is_allocation_active(admitted.local_key));
+        Ok(())
+    }
+
+    #[test]
+    fn a_refused_claim_reports_nothing_to_the_manager() -> R<()> {
+        // A provisional allocation the manager never knew about must not
+        // arrive as a failed allocation: there is nothing to reschedule, and
+        // a phantom failure would look like a real workload dying.
+        let temp_dir = TempDir::new()?;
+        let mut manager = manager_in(&temp_dir);
+        let admitted = manager.admit_claim(claim_record("clm_a", "user-42", Gate::Boot))?;
+        manager
+            .begin_task_allocation_gated(&provisional_payload(admitted.local_key), Gate::Boot)?;
+
+        manager.kill_claim("clm_a", "instance claimed elsewhere");
+        assert!(manager.drain_failures().is_empty());
+        assert!(manager.drain_terminations().is_empty());
+        assert!(manager.allocation_health_snapshot().is_empty());
+        assert!(manager.unratified_claims().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn a_second_claim_for_the_same_instance_is_refused_locally() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let mut manager = manager_in(&temp_dir);
+        manager.admit_claim(claim_record("clm_a", "user-42", Gate::Boot))?;
+        assert!(manager
+            .admit_claim(claim_record("clm_b", "user-42", Gate::Boot))
+            .is_err());
+        assert!(manager.instance_is_claimed("user-42"));
+        Ok(())
+    }
+
+    #[test]
+    fn ratifying_an_unknown_claim_is_an_error_not_a_silent_no_op() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let mut manager = manager_in(&temp_dir);
+        let mut committed = provisional_payload(-1);
+        committed.allocation_id = 8123;
+        assert!(manager.ratify_claim("clm_missing", &committed).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn a_duplicate_verdict_is_a_no_op() -> R<()> {
+        // The RatifyClaim reply and the heartbeat catch-up can both land.
+        let temp_dir = TempDir::new()?;
+        let mut manager = manager_in(&temp_dir);
+        let admitted = manager.admit_claim(claim_record("clm_a", "user-42", Gate::Boot))?;
+        manager
+            .begin_task_allocation_gated(&provisional_payload(admitted.local_key), Gate::Boot)?;
+        let mut committed = provisional_payload(admitted.local_key);
+        committed.allocation_id = 8123;
+        manager.ratify_claim("clm_a", &committed)?;
+        let again = manager.ratify_claim("clm_a", &committed)?;
+        assert_eq!(again.allocation_id, Some(8123));
+        assert_eq!(manager.allocations_snapshot(), vec![8123]);
+        Ok(())
+    }
+
+    #[test]
+    fn ratification_adopts_the_committed_payload() -> R<()> {
+        // The payload a node booted with could not name assigned ports or a
+        // bound instance; the verdict's payload replaces it before anything
+        // starts.
+        let temp_dir = TempDir::new()?;
+        let mut manager = manager_in(&temp_dir);
+        let admitted = manager.admit_claim(claim_record("clm_a", "user-42", Gate::Stage))?;
+        manager
+            .begin_task_allocation_gated(&provisional_payload(admitted.local_key), Gate::Stage)?;
+
+        let mut committed = provisional_payload(admitted.local_key);
+        committed.allocation_id = 8123;
+        committed.task_config =
+            json!({ "command": ["sleep", "30"], "env": { "LEGION_ALLOC_ID": "8123" } }).to_string();
+        manager.ratify_claim("clm_a", &committed)?;
+
+        let stored = manager
+            .task_configs
+            .get(&admitted.local_key)
+            .expect("task config");
+        assert_eq!(stored.config["env"]["LEGION_ALLOC_ID"], json!("8123"));
+        Ok(())
+    }
+
     /// The supervisor's eyes: a process that has exited must be seen exactly
     /// once, with its status, and reaped in the process (no zombie left).
     #[test]

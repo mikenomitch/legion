@@ -40,19 +40,39 @@ How to use it:
       `plan_conflict_max_retries` (default 3) races is failed terminally and
       never retried. Phase 0 also delivers the raft-mode concurrent-planning
       test tracked below.
-- [ ] **Edge boot / provisional allocations** — a node starts work *before* the
-      placement is durable, at a declared gate level (`stage` = pull only,
-      `boot` = run with the network shut, `serve` = run fully and kill the
-      loser), and an edge node can authorize a start itself with a short-lived
-      manager-signed boot ticket —
-      [plan](plans/edge-boot-plan.md) (PLANNED: measure the start path →
-      provisional allocations with pre-commit dispatch → `serve` → the network
-      gate → boot tickets + `StartClaim`). Today dispatch is strictly
-      post-commit (`src/structs/eval.rs:309`), so every sandbox start pays the
-      full control-plane round trip and fails outright when the manager is
-      unreachable. Ratification reuses the existing plan apply, so the
-      at-most-one-live-allocation invariant is unchanged. Phase 0 is a
-      measurement phase and is allowed to kill the later phases.
+- [ ] Edge boot follow-ups — the feature shipped (phases 1–4;
+      [plan](plans/edge-boot-plan.md) · [docs](../docs/edge-boot.md) ·
+      [calls](calls/edge-boot-plan_calls.md)); these are what it left open.
+  - [ ] **Phase 0's measurement matrix was never run.** The start-path
+        breakdown (submit → eval claim → plan → apply → dispatch → prepare →
+        boot → first byte) in both persistence modes, cold and warm image,
+        single- and cross-region, belongs in
+        `benchmarks/scheduler/README.md` per the AGENTS.md before/after rule.
+        Until it exists the plan's open question — is `boot` or `stage` the
+        right recommended default — stays open, and the public doc recommends
+        neither. Needs a real multi-node raft cluster and a real registry; see
+        [calls #18](calls/edge-boot-plan_calls.md).
+  - [ ] A per-interface default-drop filter for the `sandbox` `boot` gate.
+        Today Legion only holds the TAP link down, which is the 95% mechanism;
+        a filter is stronger on hosts where link state alone is not enough, but
+        owning firewall rules means owning backend choice, conflicts with the
+        operator's own rules, and cleanup after a crash
+        ([calls #10](calls/edge-boot-plan_calls.md)).
+  - [ ] Lift the "no gates above `stage` for tasks with declared ports or
+        connect upstreams" restriction. Both are assigned inside the apply, so
+        this needs speculative port assignment reconciled at commit
+        ([calls #13](calls/edge-boot-plan_calls.md)).
+  - [ ] Speculative attach for volume drivers that can genuinely fence a
+        concurrent attach, via a capability advertised in the volume contract.
+        Today every non-node-local driver downgrades the gate to `stage`.
+  - [ ] Island mode: bounded survival of unratified work across a
+        control-plane outage, with its own consistency argument (plan phase 5).
+  - [ ] Ticket pre-distribution and bulk minting for warm fleets, and
+        ratification batching for a node starting many claims per second
+        (plan phase 5).
+  - [ ] Replace the string matching in `manager::edge_boot::classify` with a
+        typed error out of the plan apply, if a second consumer of the
+        rejection reason ever appears ([calls #17](calls/edge-boot-plan_calls.md)).
 - [ ] Worker groups + taint/toleration equivalent. Node pools exist as an ACL
       and config concept but nothing scheduling-side consumes them.
 - [ ] Preemption follow-ups — the feature shipped
@@ -992,6 +1012,15 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
       node-local pinning, `legion volume` CLI + MCP tools, UI, and the
       [Postgres](../docs/guides/postgres.md) / [Redis](../docs/guides/redis.md) guides
 - [x] Block-mode volumes, consumed directly by the sandbox runtime
+- [x] **Edge boot: provisional allocations, gate levels, and boot tickets** —
+      a node reaches a declared execution stage (`stage`/`boot`/`serve`) before
+      the placement is durable, and an edge node authorizes a start itself from
+      a short-lived manager-signed ticket. Ratification is the existing plan
+      apply with the instance named, so the at-most-one-live-allocation
+      invariant is unchanged and its suites run unmodified
+      ([plan](plans/edge-boot-plan.md) · [docs](../docs/edge-boot.md) ·
+      [calls](calls/edge-boot-plan_calls.md)). Phase 0's measurement and
+      phase 5's backlog are open above.
 
 ## Persistence
 

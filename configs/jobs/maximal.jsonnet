@@ -332,6 +332,29 @@
                 // preemptible band donates the whole task.
                 minAvailable: "50%",
             },
+            // How far a node may get on a start for this task BEFORE the
+            // placement is durable (docs/edge-boot.md). Absent = `off`,
+            // today's behavior: dispatch happens after the commit and the
+            // wire payload carries no provisional block at all.
+            speculativeStart: {
+                // 'off' (default) | 'stage' | 'boot' | 'serve'.
+                //   stage — fetch artifacts, pull the image, build the root
+                //           disk; do not start the workload.
+                //   boot  — also boot the guest, with its network held shut.
+                //   serve — also open the network immediately. The only mode
+                //           where a workload that LOSES its race may already
+                //           have had externally visible side effects.
+                // A task with declared ports, connect upstreams, or storage
+                // whose driver cannot fence a concurrent attach is downgraded
+                // to `stage` — reported by `legion job validate`.
+                mode: "stage",
+                // Lease: unratified work is killed at expiry, unconditionally.
+                // Default 5s, capped at 2m.
+                ratifyTimeout: "5s",
+                // What to do when ratification is refused. 'kill' (default,
+                // a hard destroy) or 'stop' (the normal graceful-stop ladder).
+                onRefused: "kill",
+            },
             affinities: [
                 {
                     key: "zone",

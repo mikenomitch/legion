@@ -251,6 +251,16 @@ plugin) pre-creates the device and Legion attaches it. `LEGION_PORT_*` /
 `LEGION_ADDR_*` are still exported into the guest, but nothing maps host ports
 into the VM yet.
 
+That single, operator-owned interface is also what makes `sandbox` the one
+runtime whose [edge boot](edge-boot.md) `boot` gate is a **real** network
+boundary. A guest started before its placement is durable boots with the TAP
+device attached but administratively **down** — Firecracker cannot hotplug a
+NIC, so the gate has to be on the link rather than on the attachment — and
+ratification is the only thing that raises it. With the default
+`mode: 'none'` there is nothing to gate, which is strictly stronger. Legion
+changes link state only; it installs no per-interface filter, so an operator
+who wants belt-and-braces isolation should add one.
+
 ## Artifacts Support
 
 `sandbox` reports `supports_artifacts()`, and — unlike `container` — file and

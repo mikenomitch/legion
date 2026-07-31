@@ -87,6 +87,27 @@ documented window.
 Priority bands need nothing from the worker at all — they live entirely in the
 manager's planner and eval queue — so they are unaffected by worker skew.
 
+## Edge boot under skew
+
+[Edge boot](edge-boot.md) is the one feature that **is** gated on a minimum
+worker protocol version, and for a specific reason:
+`TaskAllocation.provisional` is a new optional field, so an old worker would
+ignore it and run the payload the moment it arrives — which, with pre-commit
+dispatch, means running it *before* the commit, with no gate and no lease.
+
+That is not a graceful degradation, so it is fenced at the dispatcher: a node
+advertising `protocolVersion` below 2 silently falls back to post-commit
+dispatch and simply does not get the speedup. Nothing stalls, and no
+allocation runs ungated.
+
+The other direction fails closed on its own. `RatifyClaim` is a new RPC, so an
+old manager rejects it and the worker kills the claim at its lease — a wasted
+boot, never a duplicate.
+
+Neither the `boot` ACL resource nor the `edgeBoot` config blocks need a
+coordinated upgrade: both are off by default, and a manager that does not know
+them ignores them.
+
 ## Task-plugin ABI
 
 Task runtimes loaded from `plugins/tasks/<name>/` are **not** covered by

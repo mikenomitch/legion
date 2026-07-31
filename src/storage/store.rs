@@ -7697,27 +7697,17 @@ impl Store {
     }
 
     #[instrument(err, skip_all)]
-    /// One task config by its row id, with the job and job config it belongs
-    /// to. `None` when the row is gone (a job destroyed between a plan and
-    /// its dispatch).
-    pub fn task_config_with_job(
-        &self,
-        task_config_id: i64,
-    ) -> R<Option<(TaskConfig, String, String)>> {
+    /// The job and job config a task config belongs to. `None` when the row
+    /// is gone (a job destroyed between a plan and its dispatch).
+    pub fn task_config_job_ids(&self, task_config_id: i64) -> R<Option<(String, String)>> {
         let conn = self.read_connection()?;
-        let ids: Option<(String, String)> = conn
-            .query_row(
-                "SELECT job_id, job_config_id FROM task_config WHERE id = ?;",
-                [task_config_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()?;
-        let Some((job_id, job_config_id)) = ids else {
-            return Ok(None);
-        };
-        Ok(self
-            .get_task_config_by_id(task_config_id)?
-            .map(|task| (task, job_id, job_config_id)))
+        conn.query_row(
+            "SELECT job_id, job_config_id FROM task_config WHERE id = ?;",
+            [task_config_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(Into::into)
     }
 
     /// One task config by its row id. `None` when the row is gone (a job

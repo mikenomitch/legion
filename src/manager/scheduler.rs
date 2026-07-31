@@ -1397,8 +1397,11 @@ impl<'a> Scheduler<'a> {
         // commit instead of queueing behind it. Nothing here can fail the
         // plan — a claim that does not land simply misses the head start, and
         // one whose plan is rejected dies at its own lease.
-        let speculative_claims =
-            crate::manager::dispatcher::dispatch_speculative(self.store, &placement_pairs);
+        let speculative_claims = crate::manager::dispatcher::dispatch_speculative(
+            self.store,
+            job_config_id,
+            &placement_pairs,
+        );
 
         // One replicated op for insert + apply: on raft backends the split
         // form paid a second quorum round-trip per plan (see

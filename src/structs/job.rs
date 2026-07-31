@@ -2091,6 +2091,8 @@ struct TaskConfigInput {
     artifacts: Vec<ArtifactSpec>,
     #[serde(default)]
     actions: Vec<ActionSpec>,
+    #[serde(default)]
+    speculative_start: Option<crate::structs::edge_boot::SpeculativeStartConfig>,
 }
 
 #[derive(Deserialize)]
@@ -2179,7 +2181,6 @@ impl TaskConfigInput {
             })
             .collect();
         Ok(TaskConfig {
-            speculative_start: None,
             name,
             count: self.count.unwrap_or_default(),
             runtime,
@@ -2226,6 +2227,7 @@ impl TaskConfigInput {
             volumes: self.volumes,
             artifacts: self.artifacts,
             actions: self.actions,
+            speculative_start: self.speculative_start,
         })
     }
 }
@@ -2830,6 +2832,22 @@ impl TaskConfig {
             Some(stop) => stop.validate(&self.name),
             None => Ok(()),
         }
+    }
+
+    /// Validate the task's `speculativeStart` block (docs/edge-boot.md).
+    ///
+    /// Run at admission rather than at dispatch on purpose: a typo in `mode`
+    /// that was silently read as `off` would be discovered as a latency
+    /// regression in production, weeks later, by someone who was not there
+    /// when it was written.
+    pub fn validate_speculative_start(&self) -> Result<(), String> {
+        let Some(block) = self.speculative_start.as_ref() else {
+            return Ok(());
+        };
+        block
+            .resolve()
+            .map(|_| ())
+            .map_err(|err| format!("task {}: {err:#}", self.name))
     }
 
     pub fn validate_disruption(&self) -> R<()> {

@@ -136,10 +136,52 @@ pub struct SpeculativeClaim {
 /// optimization. If it does not land, the ordinary post-commit dispatch still
 /// runs and the only thing lost is the head start.
 #[instrument(skip_all)]
-pub fn dispatch_speculative(store: &Store, placements: &[(String, i64)]) -> Vec<SpeculativeClaim> {
+pub fn dispatch_speculative(
+    store: &Store,
+    job_config_id: &str,
+    placements: &[(String, i64)],
+) -> Vec<SpeculativeClaim> {
+    if placements.is_empty() {
+        return Vec::new();
+    }
+    // Read from the task-config cache the planner already warmed, and bail
+    // before touching anything else when no task opted in. That early return
+    // is what keeps `mode: 'off'` — every job today — free on the plan path:
+    // a non-speculative plan does one cache lookup and nothing more.
+    let tasks = match store.cached_task_configs_for_job_config(job_config_id) {
+        Ok(tasks) => tasks,
+        Err(err) => {
+            debug!(%job_config_id, error = ?err, "Speculative dispatch skipped; task configs unavailable");
+            return Vec::new();
+        }
+    };
+    let speculative: HashMap<i64, ResolvedSpeculativeStart> = tasks
+        .iter()
+        .filter_map(|(id, task)| match resolved_speculative_start(task) {
+            Ok(resolved) if resolved.mode != Gate::Off => Some((*id, resolved)),
+            Ok(_) => None,
+            Err(err) => {
+                // Admission already validated the block, so this is a
+                // corrupted row rather than user error; it must not fail the
+                // plan.
+                warn!(task = %task.name, error = ?err, "Invalid speculativeStart; not speculating");
+                None
+            }
+        })
+        .collect();
+    if speculative.is_empty() {
+        return Vec::new();
+    }
+
     let mut claims = Vec::new();
     for (node_id, task_config_id) in placements {
-        match speculative_claim_for(store, node_id, *task_config_id) {
+        let Some(resolved) = speculative.get(task_config_id) else {
+            continue;
+        };
+        let Some((_, task)) = tasks.iter().find(|(id, _)| id == task_config_id) else {
+            continue;
+        };
+        match speculative_claim_for(store, node_id, *task_config_id, task, *resolved) {
             Ok(Some(claim)) => claims.push(claim),
             Ok(None) => {}
             Err(err) => warn!(
@@ -157,14 +199,13 @@ fn speculative_claim_for(
     store: &Store,
     node_id: &str,
     task_config_id: i64,
+    task: &TaskConfig,
+    speculative: ResolvedSpeculativeStart,
 ) -> R<Option<SpeculativeClaim>> {
-    let Some((task, job_id, job_config_id)) = store.task_config_with_job(task_config_id)? else {
-        return Ok(None);
+    let (job_id, job_config_id) = match store.task_config_job_ids(task_config_id)? {
+        Some(ids) => ids,
+        None => return Ok(None),
     };
-    let speculative = resolved_speculative_start(&task)?;
-    if speculative.mode == Gate::Off {
-        return Ok(None);
-    }
 
     let node = store.get_node(node_id)?;
     if worker_protocol_version(&node) < MIN_PROVISIONAL_PROTOCOL_VERSION {
@@ -203,7 +244,7 @@ fn speculative_claim_for(
         instance_id: None,
         network: None,
     };
-    let payload = build_task_allocation_with(&task, &allocation, None, &[], Some(provisional))?;
+    let payload = build_task_allocation_with(task, &allocation, None, &[], Some(provisional))?;
 
     let sent = run_dispatch_future(async {
         let endpoint = Endpoint::from_shared(worker_address.clone())?;
@@ -527,7 +568,8 @@ pub fn effective_gate(task: &TaskConfig, declared: Gate) -> (Gate, Option<String
         return (
             Gate::Stage,
             Some(format!(
-                "task `{}` declares network ports, which are assigned when the placement                  commits; gates above `stage` would boot it without them",
+                "task `{}` declares network ports, which are assigned when the placement \
+                 commits; gates above `stage` would boot it without them",
                 task.name
             )),
         );
@@ -540,7 +582,9 @@ pub fn effective_gate(task: &TaskConfig, declared: Gate) -> (Gate, Option<String
         return (
             Gate::Stage,
             Some(format!(
-                "task `{}` declares connect upstreams, whose loopback ports are assigned when                  the placement commits; gates above `stage` would boot it without them",
+                "task `{}` declares connect upstreams, whose loopback ports are assigned \
+                 when the placement commits; gates above `stage` would boot it \
+                 without them",
                 task.name
             )),
         );
@@ -549,7 +593,9 @@ pub fn effective_gate(task: &TaskConfig, declared: Gate) -> (Gate, Option<String
         return (
             Gate::Stage,
             Some(format!(
-                "task `{}` claims volume `{unfenceable}`, whose driver cannot fence a                  concurrent attach from another node; it is mounted only after ratification",
+                "task `{}` claims volume `{unfenceable}`, whose driver cannot fence a \
+                 concurrent attach from another node; it is mounted only after \
+                 ratification",
                 task.name
             )),
         );
@@ -895,6 +941,192 @@ mod tests {
         build_task_allocation(&task, &allocation(None), None, &[])?;
         assert!(task.config.get("env").is_none());
         Ok(())
+    }
+
+    // ---------------------------------------------------------------
+    // Edge boot (docs/edge-boot.md)
+    // ---------------------------------------------------------------
+
+    fn speculative(mode: &str) -> Option<crate::structs::edge_boot::SpeculativeStartConfig> {
+        Some(crate::structs::edge_boot::SpeculativeStartConfig {
+            mode: Some(mode.into()),
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn a_task_without_the_block_speculates_nothing_and_changes_no_payload() -> R<()> {
+        // The byte-for-byte promise: a job that did not opt in must produce
+        // exactly the payload it produced before this feature existed.
+        let task = TaskConfig {
+            config: json!({ "command": ["true"] }),
+            ..TaskConfig::new("web", "exec")
+        };
+        assert_eq!(resolved_speculative_start(&task)?.mode, Gate::Off);
+        let built = build_task_allocation(&task, &allocation(None), None, &[])?;
+        assert!(built.provisional.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn a_provisional_payload_carries_a_claim_id_and_no_alloc_id() -> R<()> {
+        // An allocation id does not exist before the commit, and a workload
+        // that reported a fake one would be lying about its own identity.
+        let task = TaskConfig {
+            config: json!({ "command": ["true"] }),
+            speculative_start: speculative("boot"),
+            ..TaskConfig::new("workspace", "exec")
+        };
+        let mut alloc = allocation(None);
+        alloc.id = 0;
+        let built = build_task_allocation_with(
+            &task,
+            &alloc,
+            None,
+            &[],
+            Some(ProvisionalAllocation {
+                claim_id: "clm_9f2c".into(),
+                gate: Gate::Boot.to_wire(),
+                lease_deadline_unix: 1_770_000_005,
+                instance_id: "user-42".into(),
+                origin: "edge".into(),
+                on_refused: "kill".into(),
+                ticket_jti: "tkt_1".into(),
+            }),
+        )?;
+        assert_eq!(built.allocation_id, 0);
+        let config: Value = serde_json::from_str(&built.task_config)?;
+        assert_eq!(config["env"]["LEGION_CLAIM_ID"], json!("clm_9f2c"));
+        assert!(config["env"].get("LEGION_ALLOC_ID").is_none());
+        assert_eq!(built.provisional.expect("block").gate, Gate::Boot.to_wire());
+        Ok(())
+    }
+
+    #[test]
+    fn a_forged_alloc_id_cannot_survive_into_a_provisional_payload() {
+        // A jobspec must not be able to make an unratified workload claim an
+        // allocation id it does not have.
+        let mut config = json!({
+            "command": ["true"],
+            "env": { "LEGION_ALLOC_ID": "8123" }
+        });
+        inject_provisional_env(&mut config, "clm_a", None);
+        assert!(config["env"].get("LEGION_ALLOC_ID").is_none());
+        assert_eq!(config["env"]["LEGION_CLAIM_ID"], json!("clm_a"));
+    }
+
+    #[test]
+    fn declared_ports_cap_the_gate_at_stage() -> R<()> {
+        // Ports are assigned inside the apply, so a workload booted before it
+        // cannot know them. `stage` is unaffected: it picks them up from the
+        // ratification payload before it starts.
+        let network: crate::structs::network::NetworkConfig =
+            serde_json::from_value(json!({ "ports": [{ "name": "http", "to": 8080 }] }))?;
+        let task = TaskConfig {
+            speculative_start: speculative("serve"),
+            network: Some(network),
+            ..TaskConfig::new("api", "exec")
+        };
+        let (gate, reason) = effective_gate(&task, Gate::Serve);
+        assert_eq!(gate, Gate::Stage);
+        assert!(reason.expect("reason").contains("network ports"));
+        assert_eq!(resolved_speculative_start(&task)?.mode, Gate::Stage);
+        Ok(())
+    }
+
+    #[test]
+    fn connect_upstreams_cap_the_gate_at_stage() -> R<()> {
+        let connect: crate::structs::ConnectConfig =
+            serde_json::from_value(json!({ "upstreams": [{ "service": "db" }] }))?;
+        let task = TaskConfig {
+            speculative_start: speculative("boot"),
+            connect: Some(connect),
+            ..TaskConfig::new("api", "exec")
+        };
+        let (gate, reason) = effective_gate(&task, Gate::Boot);
+        assert_eq!(gate, Gate::Stage);
+        assert!(reason.expect("reason").contains("connect upstreams"));
+        Ok(())
+    }
+
+    #[test]
+    fn unfenceable_storage_caps_the_gate_at_stage() -> R<()> {
+        // Storage a second node could attach concurrently is mounted only
+        // after ratification, so nothing above `stage` may run against it.
+        let task = TaskConfig {
+            speculative_start: speculative("boot"),
+            stateful: Some(crate::structs::StatefulConfig {
+                mode: InstanceMode::Keyed,
+                id_source: None,
+                initial_instances: None,
+                on_lost: None,
+                storage: Some(crate::structs::StatefulStorageConfig {
+                    driver: Some("nfs".into()),
+                    mode: None,
+                    params: None,
+                    path: "/workspace".into(),
+                    retain_on_scale_in: None,
+                    retain_on_stop: None,
+                }),
+            }),
+            ..TaskConfig::new("workspace", "exec")
+        };
+        let (gate, reason) = effective_gate(&task, Gate::Boot);
+        assert_eq!(gate, Gate::Stage);
+        assert!(reason.expect("reason").contains("fence"));
+        Ok(())
+    }
+
+    #[test]
+    fn node_local_storage_is_exempt_from_the_downgrade() -> R<()> {
+        // The only possible racer for a node-local volume is on the same
+        // node, where the worker's claim table already fences it.
+        let task = TaskConfig {
+            speculative_start: speculative("boot"),
+            stateful: Some(crate::structs::StatefulConfig {
+                mode: InstanceMode::Keyed,
+                id_source: None,
+                initial_instances: None,
+                on_lost: None,
+                storage: Some(crate::structs::StatefulStorageConfig {
+                    driver: None, // local-dir, the default
+                    mode: None,
+                    params: None,
+                    path: "/workspace".into(),
+                    retain_on_scale_in: None,
+                    retain_on_stop: None,
+                }),
+            }),
+            ..TaskConfig::new("workspace", "exec")
+        };
+        assert_eq!(effective_gate(&task, Gate::Boot).0, Gate::Boot);
+        assert_eq!(resolved_speculative_start(&task)?.mode, Gate::Boot);
+        Ok(())
+    }
+
+    #[test]
+    fn a_node_below_the_protocol_floor_is_fenced_out_of_provisional_dispatch() {
+        // The one genuinely dangerous skew: an old worker ignores the
+        // `provisional` field and would run the payload with no gate and no
+        // lease. It falls back to post-commit dispatch instead.
+        let old = crate::structs::Node {
+            id: "node-old".into(),
+            status: "ready".into(),
+            pool: "default".into(),
+            availability: "available".into(),
+            last_heartbeat: "now".into(),
+            config_attrs: json!({ "workerAddress": "http://127.0.0.1:4848" }),
+            fingerprint_attrs: json!({}),
+            dynamic_attrs: json!({}),
+            health_checks: json!({}),
+        };
+        assert!(worker_protocol_version(&old) < MIN_PROVISIONAL_PROTOCOL_VERSION);
+
+        let current = crate::structs::Node {
+            config_attrs: json!({ "protocolVersion": 2 }),
+            ..old
+        };
+        assert!(worker_protocol_version(&current) >= MIN_PROVISIONAL_PROTOCOL_VERSION);
     }
 
     #[test]

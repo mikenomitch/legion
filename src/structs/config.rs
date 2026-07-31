@@ -1711,6 +1711,56 @@ mod tests {
     }
 
     #[test]
+    fn edge_boot_is_off_by_default_on_both_planes() {
+        // The promise the public doc makes three times over: a cluster that
+        // upgrades and changes nothing grows no new authorization surface.
+        let manager = ManagerConfigFull::default().edge_boot;
+        assert!(!manager.enabled);
+        assert_eq!(manager.default_ticket_ttl, DEF_BOOT_TICKET_TTL);
+        assert_eq!(manager.max_ticket_ttl, DEF_BOOT_TICKET_MAX_TTL);
+        assert_eq!(
+            manager.max_provisional_per_node,
+            DEF_MAX_PROVISIONAL_PER_NODE
+        );
+
+        let worker = WorkerEdgeBootConfigFull::default();
+        assert!(!worker.accept_claims);
+
+        // An absent block resolves to the same thing as an empty one.
+        assert_eq!(EdgeBootConfig::default().with_defaults(), manager);
+        assert_eq!(WorkerEdgeBootConfig::default().with_defaults(), worker);
+    }
+
+    #[test]
+    fn edge_boot_overrides_survive_the_round_trip_to_the_wire_form() {
+        let full = EdgeBootConfig {
+            enabled: Some(true),
+            default_ticket_ttl: Some("30s".into()),
+            max_ticket_ttl: Some("10m".into()),
+            max_provisional_per_node: Some(4),
+        }
+        .with_defaults();
+        assert!(full.enabled);
+        assert_eq!(full.max_provisional_per_node, 4);
+        // `ManagerConfigFull -> ManagerConfig` is what `GetManagerConfigs`
+        // serves, so a setting that vanished there would be invisible to an
+        // operator checking what the cluster actually thinks it is running.
+        let round_tripped: EdgeBootConfig = full.clone().into();
+        assert_eq!(round_tripped.with_defaults(), full);
+    }
+
+    #[test]
+    fn a_worker_edge_boot_block_parses_from_its_json_wire_form() -> R<()> {
+        // The block rides to the worker as a JSON string on `WorkerConfig`.
+        let parsed: WorkerEdgeBootConfigFull =
+            serde_json::from_str(r#"{"acceptClaims":true,"jwksRefresh":"1m","clockSkew":"5s"}"#)?;
+        assert!(parsed.accept_claims);
+        assert_eq!(parsed.jwks_refresh, "1m");
+        assert_eq!(parsed.clock_skew, "5s");
+        Ok(())
+    }
+
+    #[test]
     fn worker_artifact_fetch_defaults_and_overrides() -> R<()> {
         let defaults = WorkerArtifactsConfig::default().fetch_with_defaults()?;
         assert_eq!(defaults.parallelism, DEF_ARTIFACT_FETCH_PARALLELISM);

@@ -185,6 +185,7 @@ time, so they are present at process start for `exec` and `container` tasks:
 | `LEGION_INSTANCE_SLOT` | slot mode only | Ordinal slot index `0..count-1`. |
 | `LEGION_STORAGE_DIR` | tasks with `stateful.storage` | The instance volume's path. See [volumes.md](volumes.md#how-path-works-per-task-runtime) for why exec and container tasks get different values. |
 | `LEGION_VOLUME_<NAME>` | per declared volume | Same, for every volume including `volumes[]` claims. |
+| `LEGION_CLAIM_ID` | provisional starts only | The claim a workload was started under, before its placement was durable ([edge-boot.md](edge-boot.md)). Such a task sees **no** `LEGION_ALLOC_ID` — it does not have one yet, and a placeholder would be a lie. `LEGION_INSTANCE_ID` is correct from the first millisecond. |
 
 Apps key their durable state and "who am I" decisions on
 `LEGION_INSTANCE_ID`; `LEGION_ALLOC_ID` is the ephemeral placement id.
@@ -347,6 +348,21 @@ rejected at job admission with an actionable error pointing at this invariant.
 Stateful groups must use the default stop-then-start (`destroyFirst`)
 replacement, which guarantees the single-live-allocation invariant by
 construction. (This is a temporary restriction until instance fencing exists.)
+
+### Edge boot does not weaken the invariant
+
+[Edge boot](edge-boot.md) lets a node start a keyed sandbox *before* its
+placement is durable, which sounds like it should threaten the same invariant.
+It does not, because an unratified start binds nothing: no instance id, no
+storage handle, no workload identity. Binding still happens in exactly one
+place — `assign_stateful_instance_tx`, inside the plan apply — and a
+ratification is an ordinary plan submission that names the instance it is
+racing for.
+
+Two nodes that both boot `user-42` therefore resolve the same way two
+concurrent plans resolve today: the store serializes them, the first binds, and
+the second is refused with `instance_claimed` and kills its work. The existing
+suites in this section run unchanged with `speculativeStart` on and off.
 
 ## Ordered rollouts for slot pools
 
