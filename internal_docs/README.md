@@ -55,6 +55,7 @@ When one is required and what goes in it:
 | [artifact-cache-and-prewarm-plan.md](plans/artifact-cache-and-prewarm-plan.md) | planned |
 | [autoscaler-plan.md](plans/autoscaler-plan.md) | planned |
 | [auth-acl-plan.md](plans/auth-acl-plan.md) | phases 1–4 executed |
+| [container-runtime-exec-and-signals-plan.md](plans/container-runtime-exec-and-signals-plan.md) | planned |
 | [exec-and-actions-plan.md](plans/exec-and-actions-plan.md) | shipped (all five phases) |
 | [durability-and-ops-execution-plan.md](plans/durability-and-ops-execution-plan.md) | executed (workstreams A/B/C/D + adversarial verification, 2026-07-28); lanes topology opt-in |
 | [gang-scheduling-plan.md](plans/gang-scheduling-plan.md) | planned |
@@ -106,6 +107,7 @@ by project impact. The full template and a worked example:
 - [auth-acl-plan_calls.md](calls/auth-acl-plan_calls.md)
 - [aws-comparative-benchmark-plan_calls.md](calls/aws-comparative-benchmark-plan_calls.md)
 - [bounded-candidate-scoring-plan_calls.md](calls/bounded-candidate-scoring-plan_calls.md)
+- [container-runtime-exec-and-signals-plan_calls.md](calls/container-runtime-exec-and-signals-plan_calls.md)
 - [container-task-kind-macos_calls.md](calls/container-task-kind-macos_calls.md)
 - [exec-and-actions-plan_calls.md](calls/exec-and-actions-plan_calls.md)
 - [gang-scheduling-plan_calls.md](calls/gang-scheduling-plan_calls.md)

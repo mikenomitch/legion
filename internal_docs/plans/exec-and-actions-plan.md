@@ -333,7 +333,8 @@ Per-kind semantics:
   `container exec`. `{exec: true, pty: true, host_level: false}`. The
   `youki` runtime path defers exec support (it needs `youki exec`, which
   has different flags) — `exec_support()` is computed per detected runtime,
-  not hardcoded per kind.
+  not hardcoded per kind. *That deferral now has its own plan:
+  [container-runtime-exec-and-signals-plan.md](container-runtime-exec-and-signals-plan.md).*
 - **`noop` and dynamic plugins**: default `ExecSupport::default()` = no
   support; S4's fast failure comes free. The dylib ABI gains the two
   methods with default impls, so existing third-party plugins stay
