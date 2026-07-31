@@ -384,6 +384,23 @@ impl PreemptionPass {
         Ok(())
     }
 
+    /// Drop victims this plan has committed to from the candidate index, so
+    /// a later placement in the same plan cannot pick them again.
+    fn retire_victims(&mut self, node_id: &str, victims: &[VictimCandidate]) {
+        let Some(on_node) = self
+            .by_node
+            .as_mut()
+            .and_then(|index| index.get_mut(node_id))
+        else {
+            return;
+        };
+        on_node.retain(|candidate| {
+            !victims
+                .iter()
+                .any(|victim| victim.allocation_id == candidate.allocation_id)
+        });
+    }
+
     fn candidates_on_node(&self, node_id: &str) -> Vec<VictimCandidate> {
         self.by_node
             .as_ref()
@@ -2387,6 +2404,12 @@ impl<'a> Scheduler<'a> {
                             .entry(victim.task_config_id)
                             .or_default() += 1;
                     }
+                    // Retire the chosen victims from the index. A task placing
+                    // several allocations runs this pass once per placement,
+                    // and without this the SAME allocation could be chosen
+                    // again for the next one — freeing its capacity twice on
+                    // paper and evicting one allocation to pay for two.
+                    preemption.retire_victims(&chosen.node_id, &chosen.victims);
                     scoring_cache.refresh_node(
                         &chosen.node_id,
                         resource_ledger,
@@ -7115,6 +7138,116 @@ mod tests {
         assert!(
             outcome.evictions.is_empty(),
             "an unconstrained plan preempts nothing, whatever its band"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_multi_placement_plan_never_evicts_the_same_allocation_twice() -> R<()> {
+        // Two nodes, each full of two `low` allocations; a `high` job wants
+        // three. Each placement runs its own preemption pass against the same
+        // plan-wide index, so a victim taken by placement 1 must be invisible
+        // to placement 2 — otherwise one eviction is counted as paying for
+        // two placements, and the node ends up oversubscribed.
+        let store = setup_store()?;
+        small_node(&store, "node-a")?;
+        small_node(&store, "node-b")?;
+        let scheduler = Scheduler::new(&store)?;
+        let batch = submit_banded(&store, "transcode", Band::Low, 4, None)?;
+        let filled = scheduler.plan_and_apply(&batch, PlanMode::Fresh)?;
+        assert_eq!(filled.allocations.len(), 4, "both nodes start full");
+        age_allocations(&store)?;
+
+        let api = submit_banded(&store, "api", Band::High, 3, None)?;
+        let outcome = scheduler.plan_and_apply(&api, PlanMode::Fresh)?;
+        assert_eq!(outcome.allocations.len(), 3);
+
+        let mut victim_ids = outcome
+            .evictions
+            .iter()
+            .map(|victim| victim.allocation_id)
+            .collect::<Vec<_>>();
+        victim_ids.sort_unstable();
+        let unique = victim_ids.iter().collect::<HashSet<_>>().len();
+        assert_eq!(
+            unique,
+            victim_ids.len(),
+            "each victim is evicted once: {victim_ids:?}"
+        );
+        assert_eq!(victim_ids.len(), 3, "three placements need three victims");
+
+        // The real invariant behind the count: neither node is over its
+        // two-allocation capacity afterwards.
+        for node in ["node-a", "node-b"] {
+            assert!(
+                store.allocs_for_node(node)?.len() <= 2,
+                "{node} must not be oversubscribed"
+            );
+        }
+        assert_eq!(
+            store.allocs_for_node("node-a")?.len() + store.allocs_for_node("node-b")?.len(),
+            4,
+            "the cluster is still exactly full"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_rejected_plan_evicts_nobody() -> R<()> {
+        // The Volcano #5022 regression, at the transaction boundary: apply
+        // re-validates every placement against FRESH node rows, and a
+        // rejection there COMMITS (it persists the rejected submission row
+        // and its event). Without a savepoint around the eviction half, that
+        // commit would keep the victims gone and the placements unmade.
+        let store = setup_store()?;
+        small_node(&store, "node-a")?;
+        let scheduler = Scheduler::new(&store)?;
+        let batch = submit_banded(&store, "transcode", Band::Low, 2, None)?;
+        scheduler.plan_and_apply(&batch, PlanMode::Fresh)?;
+        age_allocations(&store)?;
+
+        let api = submit_banded(&store, "api", Band::High, 1, None)?;
+        let job_config_id = api.clone();
+        let victim = store
+            .allocs_for_node("node-a")?
+            .into_iter()
+            .next()
+            .expect("a victim to name");
+
+        // Hand-build the plan the scheduler would have produced, then cordon
+        // the node before applying it: apply's availability recheck rejects,
+        // on a plan that carries an eviction.
+        let task_id = store
+            .cached_task_configs_for_job_config(&job_config_id)?
+            .first()
+            .map(|(id, _)| *id)
+            .expect("task config");
+        let versions = store
+            .allocation_version_vector(&job_config_id, &HashSet::from(["node-a".to_string()]))?;
+        store.set_node_availability("node-a", "drained")?;
+
+        let (_submission, outcome) = store.submit_and_apply_plan(
+            &job_config_id,
+            "fresh",
+            &[("node-a".to_string(), task_id)],
+            &versions,
+            &[crate::storage::store::PlanEviction {
+                allocation_id: victim.id,
+                node_id: "node-a".into(),
+                job_id: victim.job_id.clone(),
+                job_config_id: victim.job_config_id.clone(),
+                task_config_id: victim.task_config_id,
+                band: Band::Low.as_str().to_string(),
+            }],
+        )?;
+        assert!(
+            matches!(outcome, PlanApplyOutcome::Rejected { .. }),
+            "a cordoned node must reject the placement: {outcome:?}"
+        );
+        assert_eq!(
+            store.allocs_for_node("node-a")?.len(),
+            2,
+            "the victim is still running: evictions cannot outlive the placement they paid for"
         );
         Ok(())
     }

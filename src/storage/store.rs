@@ -2808,6 +2808,17 @@ impl Store {
         // conflicts rather than double-spending. That is the whole
         // correctness claim of the design (Volcano #5022 is the bug this
         // shape cannot have).
+        // Fenced by a savepoint, because the per-placement validation below
+        // can still REJECT this plan — and a rejection commits (it persists
+        // the rejected submission row and its event). Without the savepoint
+        // that commit would keep the evictions and drop the placements they
+        // paid for, which is precisely the failure this design claims it
+        // cannot have. On rejection the savepoint is rolled back, so the
+        // victims are still running when the plan is retried.
+        let eviction_savepoint = !evictions.is_empty();
+        if eviction_savepoint {
+            tx.execute_batch("SAVEPOINT legion_plan_evictions;")?;
+        }
         let preempted = self.apply_plan_evictions_tx(&tx, submission, &evictions)?;
 
         let mut nodes_by_id: HashMap<String, Node> = HashMap::new();
@@ -2941,6 +2952,13 @@ impl Store {
                         node_id, task_id
                     )
                 };
+                // Un-evict before recording the rejection: this plan is not
+                // happening, so nothing it would have displaced may go.
+                if eviction_savepoint {
+                    tx.execute_batch(
+                        "ROLLBACK TO legion_plan_evictions; RELEASE legion_plan_evictions;",
+                    )?;
+                }
                 tx.execute(
                     "UPDATE plan_submission SET status = 'rejected', rejection_reason = ?1 WHERE id = ?2;",
                     params![reason, submission.id],
@@ -2956,8 +2974,9 @@ impl Store {
                 warn!(
                     submission_id = submission.id,
                     job_config_id = %submission.job_config_id,
+                    reverted_evictions = preempted.victims.len(),
                     duration_ms = tx_started.elapsed().as_millis() as u64,
-                    "Rejected plan submission after validation during apply"
+                    "Rejected plan submission after validation during apply; evictions reverted"
                 );
                 crate::manager::telemetry::metrics()
                     .plan_apply_total
@@ -3001,6 +3020,9 @@ impl Store {
 
         if !allocations.is_empty() {
             self.bump_epochs_for_allocations_tx(&tx, &allocations)?;
+        }
+        if eviction_savepoint {
+            tx.execute_batch("RELEASE legion_plan_evictions;")?;
         }
 
         tx.execute(
