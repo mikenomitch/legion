@@ -72,6 +72,7 @@ When one is required and what goes in it:
 | [preemption-and-eviction-plan.md](plans/preemption-and-eviction-plan.md) | in execution (phase 1a shipped: stop causes) |
 | [multi-cluster-federation-plan.md](plans/multi-cluster-federation-plan.md) | planned |
 | [multi-raft-persistence-plan.md](plans/multi-raft-persistence-plan.md) | planned |
+| [network-handlers-plan.md](plans/network-handlers-plan.md) | planned (ingress/egress chains; owns the outstanding mTLS + ingress-proxy items) |
 | [scheduler-performance-plan.md](plans/scheduler-performance-plan.md) | in execution |
 | [scheduler-architecture-review-plan.md](plans/scheduler-architecture-review-plan.md) | proposals accepted; D1/D4/D5/D6 graduated into the two plans below, D8's local slice into the heartbeat plan |
 | [plan-path-scale-levers-plan.md](plans/plan-path-scale-levers-plan.md) | shipped (D4/D5/D6, 2026-07-30) |
@@ -124,6 +125,7 @@ by project impact. The full template and a worked example:
 - [kv-reactive-task-updates-plan_calls.md](calls/kv-reactive-task-updates-plan_calls.md)
 - [multi-cluster-federation-plan_calls.md](calls/multi-cluster-federation-plan_calls.md)
 - [multi-raft-persistence-plan_calls.md](calls/multi-raft-persistence-plan_calls.md)
+- [network-handlers-plan_calls.md](calls/network-handlers-plan_calls.md)
 - [persistence-plan_calls.md](calls/persistence-plan_calls.md)
 - [plan-path-scale-levers-plan_calls.md](calls/plan-path-scale-levers-plan_calls.md)
 - [pre-benchmark-hardening_calls.md](calls/pre-benchmark-hardening_calls.md)
