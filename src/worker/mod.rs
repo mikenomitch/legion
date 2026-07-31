@@ -12,4 +12,5 @@ pub mod simulate;
 pub mod state;
 pub mod task_health;
 pub mod task_manager;
+pub mod task_supervisor;
 pub mod volumes;

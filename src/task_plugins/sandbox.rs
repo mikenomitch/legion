@@ -741,6 +741,12 @@ impl TaskPlugin for SandboxTaskPlugin {
         "sandbox"
     }
 
+    /// The tracked process is the VMM; killing it takes the guest with it, and
+    /// its exit is the guest's exit.
+    fn supervises_process(&self) -> bool {
+        true
+    }
+
     fn schema(&self) -> Value {
         derived_schema::<SandboxTaskConfig>()
     }

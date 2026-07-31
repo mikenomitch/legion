@@ -157,7 +157,6 @@ async fn run_health_monitor(
             )
         })
         .collect();
-    let mut restart_history = Vec::new();
 
     loop {
         tokio::select! {
@@ -216,7 +215,6 @@ async fn run_health_monitor(
                             &manager,
                             &allocation,
                             &task,
-                            &mut restart_history,
                             &mut state,
                             &mut boot_status,
                             &boot_ready,
@@ -263,21 +261,28 @@ async fn handle_unhealthy(
     manager: &Arc<Mutex<WorkerTaskManager>>,
     allocation: &Allocation,
     task: &TaskConfig,
-    restart_history: &mut Vec<Instant>,
     state: &mut HashMap<String, CheckState>,
     boot_status: &mut HashMap<String, bool>,
     boot_ready: &Arc<AtomicBool>,
     start_time: &mut Instant,
     reason: String,
 ) -> R<()> {
-    if task.on_unhealthy.restart_count > 0
-        && can_restart(
-            restart_history,
-            task.on_unhealthy.restart_period,
+    // The restart budget lives in the task manager, shared with the exit
+    // supervisor: a flapping task gets `restart_count` local restarts in
+    // total, not that many per path (see task_supervisor.rs).
+    let budget_available = {
+        let mut guard = manager.lock().expect("task manager");
+        guard.can_restart_allocation(
+            allocation.id,
             task.on_unhealthy.restart_count,
+            task.on_unhealthy.restart_period,
         )
-    {
-        restart_history.push(Instant::now());
+    };
+    if budget_available {
+        {
+            let mut guard = manager.lock().expect("task manager");
+            guard.record_restart_attempt(allocation.id);
+        }
         tokio::time::sleep(task.on_unhealthy.restart_delay).await;
         let restart_result = {
             let mut guard = manager.lock().expect("task manager");
@@ -312,12 +317,6 @@ async fn handle_unhealthy(
         .expect("task manager")
         .record_failure(allocation.id, format!("health check failed: {reason}"));
     Ok(())
-}
-
-fn can_restart(history: &mut Vec<Instant>, window: Duration, max: u32) -> bool {
-    let now = Instant::now();
-    history.retain(|time| now.duration_since(*time) <= window);
-    history.len() < max as usize
 }
 
 async fn run_check(runtime: &CheckRuntime) -> CheckResult {

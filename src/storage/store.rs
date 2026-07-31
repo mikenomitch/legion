@@ -1,7 +1,9 @@
 // A few low-level persistence helpers take many columns by parameter.
 #![allow(clippy::too_many_arguments)]
 
-use crate::constants::STOP_NOTICE_RETENTION_SECS;
+use crate::constants::{
+    ALLOCATION_STATUS_COMPLETE, ALLOCATION_STATUS_FAILED, STOP_NOTICE_RETENTION_SECS,
+};
 use crate::constraints::{ConstraintSet, DistinctTracker, PermitSet};
 use crate::prelude::*;
 use crate::resources::{ResourcePolicy, ResourcePool};
@@ -1569,7 +1571,7 @@ impl Store {
 
         let mut task_stmt = conn.prepare(
             r#"
-            SELECT id, name, runtime, count, count_per, group_name, lifecycle, schedule, depends_on, config, resources, constraints, permit, affinities, checks, on_unhealthy, kv_injections, job_config_id, identities, stateful, artifacts, network, service, actions, volumes, connect
+            SELECT id, name, runtime, count, count_per, group_name, lifecycle, schedule, depends_on, config, resources, constraints, permit, affinities, checks, on_unhealthy, kv_injections, job_config_id, identities, stateful, artifacts, network, service, actions, volumes, connect, restart
             FROM task_config;
             "#,
         )?;
@@ -1608,6 +1610,7 @@ impl Store {
                 actions: self.parse_actions_column(23, row.get(23)?)?,
                 volumes: self.parse_volumes_column(24, row.get(24)?)?,
                 connect: parse_json_column(25, row.get(25)?)?,
+                restart: parse_json_column(26, row.get(26)?)?,
             };
             let job_config_id: String = row.get(17)?;
             Ok((job_config_id, id, task))
@@ -3019,6 +3022,7 @@ impl Store {
             artifacts,
             host_volumes: row.get(9)?,
             heartbeat_seconds: row.get(10)?,
+            resource_enforcement: row.get(11)?,
         })
     }
 
@@ -3231,6 +3235,7 @@ impl Store {
             actions: self.parse_actions_column(24, row.get(24)?)?,
             volumes: self.parse_volumes_column(25, row.get(25)?)?,
             connect: parse_json_column(26, row.get(26)?)?,
+            restart: parse_json_column(27, row.get(27)?)?,
         };
 
         Ok(task_config)
@@ -4574,6 +4579,7 @@ impl Store {
             ":artifacts": config.artifacts,
             ":host_volumes": config.host_volumes,
             ":heartbeat_seconds": config.heartbeat_seconds,
+            ":resource_enforcement": config.resource_enforcement,
         };
 
         let config = conn.query_row(&INSERT_WORKER_TYPE, params, |row| {
@@ -5559,6 +5565,7 @@ impl Store {
             } else {
                 Some(serde_json::to_string(&t.volumes)?)
             };
+            let restart = t.restart.as_ref().map(serde_json::to_string).transpose()?;
             let schedule = t.schedule.as_ref().map(ToString::to_string);
             let task_params = named_params! {
                 ":name": t.name,
@@ -5587,6 +5594,7 @@ impl Store {
                 ":actions": actions,
                 ":volumes": volumes,
                 ":connect": connect,
+                ":restart": restart,
             };
 
             let task_id: i64 = tx.query_row(&INSERT_TASK, task_params, |row| row.get(0))?;
@@ -7021,11 +7029,49 @@ impl Store {
         Ok(())
     }
 
-    fn task_status_for_lifecycle(lifecycle: &TaskLifecycle) -> TaskStatusState {
+    /// Task status to stamp when an allocation is placed.
+    ///
+    /// A batch task is `Running` until a worker reports that its process
+    /// exited — that report is what makes `dependsOn: { condition: "success" }`
+    /// mean "exited 0" rather than "was placed" (see docs/task-supervision.md).
+    ///
+    /// `supervised_node` is false for workers too old to send exit reports
+    /// (protocol version < 2). Those nodes will never report a termination, so
+    /// their batch tasks keep the legacy optimistic `Success` — otherwise a
+    /// mid-upgrade cluster (managers upgrade first) would stall every DAG
+    /// waiting on a batch task.
+    fn task_status_for_lifecycle(
+        lifecycle: &TaskLifecycle,
+        supervised_node: bool,
+    ) -> TaskStatusState {
         match lifecycle {
+            TaskLifecycle::Batch if supervised_node => TaskStatusState::Running,
             TaskLifecycle::Batch => TaskStatusState::Success,
             TaskLifecycle::Service | TaskLifecycle::Sidecar => TaskStatusState::Running,
         }
+    }
+
+    /// Whether a node's worker reports task exits (protocol version 2+). Reads
+    /// the version recorded in the node's dynamic attrs at registration;
+    /// anything unreadable is treated as an old worker, which is the
+    /// conservative direction (keeps today's behavior).
+    fn node_reports_exits_tx(tx: &Connection, node_id: &str) -> bool {
+        let raw: Option<String> = tx
+            .query_row(
+                "SELECT dynamic_attrs FROM node WHERE id = ?;",
+                params![node_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .ok()
+            .flatten();
+        let Some(raw) = raw else {
+            return false;
+        };
+        serde_json::from_str::<Value>(&raw)
+            .ok()
+            .and_then(|attrs| attrs.get("protocolVersion").and_then(Value::as_u64))
+            .is_some_and(|version| version >= 2)
     }
 
     fn apply_task_status_updates_tx(
@@ -7065,6 +7111,8 @@ impl Store {
         let tx = Self::write_tx(&mut conn)?;
         let mut task_cache: HashMap<String, HashMap<i64, TaskConfig>> = HashMap::new();
         let mut updates: HashMap<i64, TaskStatusState> = HashMap::new();
+        // One node lookup per distinct node, not per allocation.
+        let mut node_supervision: HashMap<String, bool> = HashMap::new();
 
         for allocation in allocations {
             let tasks = task_cache
@@ -7080,9 +7128,12 @@ impl Store {
                 .get(&allocation.task_config_id)
                 .with_context(|| format!("Missing task config {}", allocation.task_config_id))?;
 
+            let supervised_node = *node_supervision
+                .entry(allocation.node_id.clone())
+                .or_insert_with(|| Self::node_reports_exits_tx(&tx, &allocation.node_id));
             updates.insert(
                 allocation.task_config_id,
-                Self::task_status_for_lifecycle(&task.lifecycle),
+                Self::task_status_for_lifecycle(&task.lifecycle, supervised_node),
             );
         }
 
@@ -8442,6 +8493,80 @@ impl Store {
         self.cache_remove_allocations(std::slice::from_ref(&allocation))?;
 
         Ok(Some(allocation))
+    }
+
+    /// Record a terminal, non-failure outcome for an allocation: its task's
+    /// process exited and the task's `restart` policy says that is the end of
+    /// it (see docs/task-supervision.md).
+    ///
+    /// The row is marked `complete` rather than deleted. Deleting it would
+    /// leave the task's desired count unmet, and the very next reconcile would
+    /// place the batch task again — an infinite re-run loop. A completed
+    /// allocation still occupies its slot; it is the worker that knows not to
+    /// relaunch the process.
+    ///
+    /// The task's status follows the outcome: `Success` for a successful exit,
+    /// `Failed` otherwise (a `restart: { policy: "never" }` task that exits
+    /// non-zero terminates without going through the reschedule path).
+    pub fn complete_allocation(&self, allocation_id: i64, success: bool) -> R<Option<Allocation>> {
+        match self.complete_allocation_local(allocation_id, success) {
+            Err(err) if crate::storage::raft::driver::NotRaftLeader::in_chain(&err) => self
+                .forward_after_rejection(
+                    crate::storage::raft::forward::ForwardableLaneWrite::CompleteAllocation {
+                        allocation_id,
+                        success,
+                    },
+                    err,
+                ),
+            other => other,
+        }
+    }
+
+    pub(crate) fn complete_allocation_local(
+        &self,
+        allocation_id: i64,
+        success: bool,
+    ) -> R<Option<Allocation>> {
+        self.replicated(Lane::Scheduler, "complete_allocation", move |s| {
+            s.complete_allocation_apply(allocation_id, success)
+        })
+    }
+
+    fn complete_allocation_apply(
+        &self,
+        allocation_id: i64,
+        success: bool,
+    ) -> R<Option<Allocation>> {
+        let Some(allocation) = self.get_allocation_by_id(allocation_id)? else {
+            return Ok(None);
+        };
+
+        let status = if success {
+            ALLOCATION_STATUS_COMPLETE
+        } else {
+            ALLOCATION_STATUS_FAILED
+        };
+        let task_status = if success {
+            TaskStatusState::Success
+        } else {
+            TaskStatusState::Failed
+        };
+
+        let mut conn = self.write_connection()?;
+        let tx = Self::write_tx(&mut conn)?;
+        tx.execute(
+            "UPDATE allocation SET status = ? WHERE id = ?;",
+            params![status, allocation_id],
+        )?;
+        let mut updates = HashMap::new();
+        updates.insert(allocation.task_config_id, task_status);
+        self.apply_task_status_updates_tx(&tx, &updates)?;
+        tx.commit()?;
+
+        Ok(Some(Allocation {
+            status: status.to_string(),
+            ..allocation
+        }))
     }
 
     #[instrument(err, skip_all)]
@@ -13464,6 +13589,7 @@ mod tests {
 
         let worker_config = WorkerConfig {
             host_volumes: String::new(),
+            resource_enforcement: String::new(),
             name: "test".to_string(),
             pool: "default".to_string(),
             additional_node_checks: vec![],
@@ -13499,6 +13625,7 @@ mod tests {
 
         let worker_config = WorkerConfig {
             host_volumes: String::new(),
+            resource_enforcement: String::new(),
             name: "empty".to_string(),
             pool: "default".to_string(),
             additional_node_checks: vec![],
@@ -15345,8 +15472,87 @@ mod tests {
         let statuses = store.task_statuses_for_job_config(&job_config_id)?;
         let prep_id = task_id_for(&store, "prep", &job.name)?;
         let api_id = task_id_for(&store, "api", &job.name)?;
+        // node-a advertises no protocol version, so it is a pre-exit-report
+        // worker and its batch task keeps the legacy optimistic Success.
         assert_eq!(statuses.get(&prep_id), Some(&TaskStatusState::Success));
         assert_eq!(statuses.get(&api_id), Some(&TaskStatusState::Running));
+
+        Ok(())
+    }
+
+    /// On a worker that reports exits, a batch task is `Running` until the
+    /// process actually exits — that is what makes `condition: "success"`
+    /// mean "exited 0" instead of "was placed".
+    #[test]
+    fn batch_task_status_waits_for_a_real_exit_on_supervising_workers() -> R<()> {
+        let store = setup_store()?;
+        let mut node = make_node_msg("node-a", "ready");
+        node.dynamic_attrs = json!({ "protocolVersion": 2 }).to_string();
+        store.insert_node(node)?;
+
+        let job = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "batch-exit-demo".into(),
+            tasks: vec![TaskConfig {
+                lifecycle: TaskLifecycle::Batch,
+                ..TaskConfig::new("prep", "exec")
+            }],
+            version: None,
+        };
+        store.handle_job_submit(
+            &job,
+            &[Submission {
+                path: "job.jsonnet".into(),
+                content: "job".into(),
+                is_primary: true,
+            }],
+        )?;
+        let job_config_id = store.get_job_config(&job.name)?.id();
+        let prep_id = task_id_for(&store, "prep", &job.name)?;
+
+        let scheduler = Scheduler::new(&store)?;
+        let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
+        store.update_task_statuses_for_allocations(&outcome.allocations)?;
+
+        let statuses = store.task_statuses_for_job_config(&job_config_id)?;
+        assert_eq!(
+            statuses.get(&prep_id),
+            Some(&TaskStatusState::Running),
+            "a placed batch task has not succeeded yet"
+        );
+
+        // The worker reports the process exited 0.
+        let allocation_id = outcome.allocations[0].id;
+        let completed = store
+            .complete_allocation(allocation_id, true)?
+            .expect("allocation exists");
+        assert_eq!(completed.status, "complete");
+        assert_eq!(
+            store
+                .task_statuses_for_job_config(&job_config_id)?
+                .get(&prep_id),
+            Some(&TaskStatusState::Success)
+        );
+        // The row survives: deleting it would leave the desired count unmet
+        // and re-run the batch task immediately.
+        assert!(store.get_allocation_by_id(allocation_id)?.is_some());
+
+        // A non-zero exit fails the task instead.
+        store.complete_allocation(allocation_id, false)?;
+        assert_eq!(
+            store
+                .task_statuses_for_job_config(&job_config_id)?
+                .get(&prep_id),
+            Some(&TaskStatusState::Failed)
+        );
+        assert_eq!(
+            store
+                .get_allocation_by_id(allocation_id)?
+                .expect("allocation exists")
+                .status,
+            "failed"
+        );
 
         Ok(())
     }

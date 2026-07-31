@@ -553,6 +553,10 @@ pub fn get_migrations() -> Migrations<'static> {
         // from `stateful.storage` is NOT here — it lives in the stateful
         // column and materializes through the instance's storage handle.
         M::up("ALTER TABLE task_config ADD COLUMN volumes JSONB;").down(""),
+        // Exit-driven restart policy for a task (host process supervision
+        // plan). JSON-encoded TaskRestartConfig; NULL/absent == the lifecycle
+        // default (`always` for service/sidecar, `onFailure` for batch).
+        M::up("ALTER TABLE task_config ADD COLUMN restart JSONB;").down(""),
         // Volumes: the manager's record of storage a plugin has (or will)
         // materialize. See docs/volumes.md.
         //
@@ -597,6 +601,13 @@ pub fn get_migrations() -> Migrations<'static> {
         // (JSON map of name -> {path, readOnly, create}); empty == none.
         M::up("ALTER TABLE worker_type ADD COLUMN host_volumes TEXT NOT NULL DEFAULT '';")
             .down(""),
+        // Per-worker resource enforcement (host process supervision plan).
+        // JSON-encoded WorkerResourceEnforcementConfig; empty == off, which is
+        // what every existing worker type gets.
+        M::up(
+            "ALTER TABLE worker_type ADD COLUMN resource_enforcement TEXT NOT NULL DEFAULT '';",
+        )
+        .down(""),
         // How a volume is handed to its consumer: `filesystem` (a directory) or
         // `block` (a device/disk image). Recorded rather than re-derived so a
         // future restore/clone knows the shape without re-probing the plugin.

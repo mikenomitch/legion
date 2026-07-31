@@ -22,6 +22,9 @@ Plans, roadmaps, to-do lists, and development notes live in
 
 ## Workloads
 
+- [Task Supervision](task-supervision.md) — process exits and the `restart`
+  policy, real batch completion, worker-owned cgroup limits, and `exec`
+  hardening.
 - [Task Runtime Plugins](task-runtime-plugins.md) — the task-runtime plugin contract.
 - [Task Runtime: exec](task-runtime-exec.md)
 - [Task Runtime: container](task-runtime-container.md)

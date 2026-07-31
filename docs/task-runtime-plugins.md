@@ -59,6 +59,20 @@ logged, but termination is still immediate for every runtime. `StopContext` is
 `#[non_exhaustive]` because it gains a signal and a deadline when graceful
 termination ships.
 
+Capability declarations (each has a default, so an existing plugin keeps
+compiling):
+
+- `supports_kv_env_injection()`, `supports_kv_file_injection()`,
+  `supports_identity_env()`, `supports_identity_file()`, `supports_signal()`,
+  `supports_artifacts()`, `supported_volume_modes()`, `exec_support()`
+- `supervises_process()` — **default `false`.** Return `true` when the task's
+  execution is a host process tracked in `TaskInstance.child`/`pid`. The
+  worker's task supervisor then polls it for exit, reaps it, and applies the
+  task's `restart` policy (see [Task Supervision](task-supervision.md)). Leave
+  it `false` when your runtime tracks no process: a `batch` task of such a
+  runtime is reported complete at start instead of waiting forever for an exit
+  that cannot be observed.
+
 Per-task state container, passed `&mut` to every hook:
 
 - `TaskInstance` with:
@@ -105,7 +119,10 @@ Worker task manager flow:
    - worker records failure and calls plugin `destroy` for cleanup
 5. Persist allocation/task/PID state to local worker file.
 
-Health checks and restart policies are managed by worker health monitor logic outside the plugin, but plugins control the actual runtime start/stop behavior.
+Health checks and restart policies are managed outside the plugin — the worker's
+health monitor for check failures and its task supervisor for process exits (see
+[Task Supervision](task-supervision.md)) — but plugins control the actual runtime
+start/stop behavior.
 
 ## Built-in and Bundled Runtimes
 

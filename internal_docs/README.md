@@ -28,6 +28,9 @@ architecture and behavior docs are public.
   Legion different from K8s and Nomad (part idea list, part roadmap).
 - [stateful-vs-nomad-k8s.md](stateful-vs-nomad-k8s.md) — honest gap analysis of
   the stateful primitives against StatefulSets and Nomad.
+- [systemd-and-chef-analysis.md](systemd-and-chef-analysis.md) — could Legion
+  replace systemd and/or Chef? What works today, the four gaps that block the
+  service-supervisor claim, and the `converge`-runtime shape for host config.
 
 ## Notes
 
@@ -59,6 +62,8 @@ When one is required and what goes in it:
 | [exec-and-actions-plan.md](plans/exec-and-actions-plan.md) | shipped (all five phases) |
 | [durability-and-ops-execution-plan.md](plans/durability-and-ops-execution-plan.md) | executed (workstreams A/B/C/D + adversarial verification, 2026-07-28); lanes topology opt-in |
 | [gang-scheduling-plan.md](plans/gang-scheduling-plan.md) | planned |
+| [host-convergence-plan.md](plans/host-convergence-plan.md) | planned |
+| [host-process-supervision-plan.md](plans/host-process-supervision-plan.md) | in execution (phases 1–3 landed; phase 4 uncommitted) |
 | [job-templates-plan.md](plans/job-templates-plan.md) | in execution |
 | [job-updated-at-plan.md](plans/job-updated-at-plan.md) | shipped (detail-page header + node column label deferred) |
 | [kv-reactive-task-updates-plan.md](plans/kv-reactive-task-updates-plan.md) | shipped |
@@ -112,6 +117,8 @@ by project impact. The full template and a worked example:
 - [exec-and-actions-plan_calls.md](calls/exec-and-actions-plan_calls.md)
 - [gang-scheduling-plan_calls.md](calls/gang-scheduling-plan_calls.md)
 - [heartbeat-scale-plan_calls.md](calls/heartbeat-scale-plan_calls.md)
+- [host-convergence-plan_calls.md](calls/host-convergence-plan_calls.md)
+- [host-process-supervision-plan_calls.md](calls/host-process-supervision-plan_calls.md)
 - [job-templates-plan_calls.md](calls/job-templates-plan_calls.md)
 - [job-updated-at-plan_calls.md](calls/job-updated-at-plan_calls.md)
 - [kv-reactive-task-updates-plan_calls.md](calls/kv-reactive-task-updates-plan_calls.md)

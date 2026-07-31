@@ -113,6 +113,7 @@ const CLASSIFIED_MUTATIONS: &[&str] = &[
     "destroy_job_scheduler_cleanup",
     "create_keyed_instances",
     "destroy_keyed_instance",
+    "complete_allocation",
     "get_or_create_slot_instance",
     "insert_plan_submission",
     "migrate_allocations_to_job_config",
@@ -279,6 +280,7 @@ fn lane_for(method: &str) -> Lane {
         | "destroy_keyed_instance"
         | "get_or_create_slot_instance"
         | "insert_plan_submission"
+        | "complete_allocation"
         | "migrate_allocations_to_job_config"
         | "place_alloc"
         | "prune_rollouts"

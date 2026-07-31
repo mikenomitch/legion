@@ -4577,6 +4577,11 @@ impl Manager for ManagerDaemonService {
             error!(node_id = %id, error = ?err, "Error handling failed allocations");
         }
         if let Err(err) =
+            handle_terminated_allocations(&self.store, &id, &req.terminated_allocations)
+        {
+            error!(node_id = %id, error = ?err, "Error handling terminated allocations");
+        }
+        if let Err(err) =
             update_allocation_health_snapshots(&self.store, &id, &req.allocation_health)
         {
             error!(
@@ -4682,6 +4687,7 @@ impl Manager for ManagerDaemonService {
             artifacts: worker_config.artifacts,
             host_volumes: worker_config.host_volumes,
             heartbeat_seconds: worker_config.heartbeat_seconds,
+            resource_enforcement: worker_config.resource_enforcement,
         };
 
         let reply = WorkerPreRegisterReply {
@@ -6501,6 +6507,63 @@ async fn fetch_allocation_logs(
     Ok(reply.into_inner().streams)
 }
 
+/// Record terminal, non-failure allocation outcomes reported by a worker: the
+/// task's process exited and the task's `restart` policy says that is the end
+/// of it (see docs/task-supervision.md).
+///
+/// Failures do NOT come through here — they arrive as `failed_allocations` and
+/// go through the reschedule/move machinery. This path is the one that makes a
+/// batch task's success real: the allocation row becomes terminal and the
+/// task's status follows the exit code.
+fn handle_terminated_allocations(
+    store: &Store,
+    node_id: &str,
+    terminated: &[crate::structs::TerminatedAllocation],
+) -> R<()> {
+    for report in terminated {
+        let allocation_id = report.allocation_id;
+        let Some(existing) = store.get_allocation_by_id(allocation_id)? else {
+            warn!(
+                allocation_id,
+                node_id, "Terminated allocation not found; ignoring report"
+            );
+            continue;
+        };
+        if existing.node_id != node_id {
+            warn!(
+                allocation_id,
+                reported_node_id = %node_id,
+                owner_node_id = %existing.node_id,
+                "Ignoring terminal allocation report from non-owner node"
+            );
+            continue;
+        }
+
+        let Some(allocation) = store.complete_allocation(allocation_id, report.success)? else {
+            continue;
+        };
+
+        store.events().allocation_terminated(
+            allocation_id,
+            node_id,
+            &allocation.job_id,
+            &allocation.job_config_id,
+            allocation.task_config_id,
+            report.success,
+            &report.message,
+        );
+        info!(
+            allocation_id,
+            node_id,
+            job_id = %allocation.job_id,
+            success = report.success,
+            status = %report.message,
+            "Allocation reached a terminal state"
+        );
+    }
+    Ok(())
+}
+
 fn handle_failed_allocations(
     store: &Store,
     failure_tracker: &Arc<Mutex<AllocationFailureTracker>>,
@@ -7009,6 +7072,12 @@ fn build_desired_allocations(
     let mut allocations = Vec::new();
 
     for allocation in desired {
+        // A finished allocation keeps its row (the slot is still spent) but
+        // must never be dispatched again — re-sending it would relaunch a
+        // completed batch task on the next worker restart.
+        if crate::constants::allocation_status_is_terminal(&allocation.status) {
+            continue;
+        }
         let tasks = task_cache
             .entry(allocation.job_config_id.clone())
             .or_default();
@@ -10076,6 +10145,68 @@ mod tests {
 
         let desired = build_desired_allocations(&store, "node-a", &[allocation.id])?;
         assert_eq!(desired.len(), 1);
+
+        Ok(())
+    }
+
+    /// A finished allocation keeps its row (its slot is still spent) but must
+    /// never be handed back to a worker — re-dispatching one would relaunch a
+    /// completed batch task on every heartbeat.
+    #[test]
+    fn terminal_allocations_are_never_dispatched_again() -> R<()> {
+        let store = setup_store()?;
+        insert_node(&store, "node-a")?;
+
+        let job = JobConfig {
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "batch-job".into(),
+            tasks: vec![TaskConfig {
+                lifecycle: crate::structs::TaskLifecycle::Batch,
+                ..TaskConfig::new("prep", "noop")
+            }],
+            version: None,
+        };
+        store.handle_job_submit(&job, &[submission()])?;
+        let job_config_id = store.get_job_config(&job.name)?.id();
+        let task_id = store.get_task_configs_for_job_config(&job_config_id)?[0].0;
+        let allocation = store.place_alloc("node-a", task_id)?;
+        assert_eq!(build_desired_allocations(&store, "node-a", &[])?.len(), 1);
+
+        handle_terminated_allocations(
+            &store,
+            "node-a",
+            &[crate::structs::TerminatedAllocation {
+                allocation_id: allocation.id,
+                success: true,
+                exit_code: Some(0),
+                signal: None,
+                message: "exited with status 0".into(),
+            }],
+        )?;
+
+        assert!(build_desired_allocations(&store, "node-a", &[])?.is_empty());
+        assert!(store.get_allocation_by_id(allocation.id)?.is_some());
+
+        // A report from a node that does not own the allocation is ignored.
+        handle_terminated_allocations(
+            &store,
+            "node-b",
+            &[crate::structs::TerminatedAllocation {
+                allocation_id: allocation.id,
+                success: false,
+                exit_code: Some(1),
+                signal: None,
+                message: "exited with status 1".into(),
+            }],
+        )?;
+        assert_eq!(
+            store
+                .get_allocation_by_id(allocation.id)?
+                .expect("allocation exists")
+                .status,
+            "complete"
+        );
 
         Ok(())
     }

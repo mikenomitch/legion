@@ -256,7 +256,43 @@ How to use it:
 
 Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
 
+- [x] **Task process supervision** — the worker reaps task children, applies a
+      new `restart` policy (`always | onFailure | never`, `delay`,
+      `successExitCodes`) sharing one budget with health-check restarts, and
+      reports terminal outcomes so a batch task's `Success` comes from its exit
+      code instead of its placement (`PROTOCOL_VERSION` 2, with a per-node
+      legacy fallback for older workers) —
+      [plan](plans/host-process-supervision-plan.md) ·
+      [calls](calls/host-process-supervision-plan_calls.md) ·
+      [docs](../docs/task-supervision.md)
+- [x] **Worker-owned cgroups for `exec`** — opt-in `resourceEnforcement` on the
+      worker config turns a task's `resources` into `memory.max`/`cpu.max` in a
+      cgroup Legion creates and removes per allocation; an explicit
+      `config.cgroup` still means "join this one"
+      ([docs](../docs/task-supervision.md#resource-enforcement-cgroups))
+- [x] **`exec` hardening block** — `noNewPrivileges`, capability bounding-set
+      drops, `privateTmp`, `umask`, `nice`, applied in privilege order around
+      the user switch ([docs](../docs/task-supervision.md#process-hardening))
+- [ ] Deferred from the supervision plan: privileged runtime tests for the cgroup
+      and hardening paths (CI covers derivation, validation, and the unconfined
+      fallback; the root-only paths are manual against a Linux worker container);
+      PID/IPC/UTS namespaces and seccomp for
+      `exec` (a PID namespace needs a double-fork, which changes the pid the
+      worker tracks — see
+      [calls entry 10](calls/host-process-supervision-plan_calls.md)); enforce
+      `resources.disk`; scheduler preference for enforcing nodes.
+- [ ] Possible, not planned: activation and readiness for `exec` — an
+      `sd_notify`-compatible readiness socket, `WatchdogSec`-style pings, and
+      socket activation via pre-bound fds
+      ([plan §8 phase 4](plans/host-process-supervision-plan.md))
 - [ ] A **WASM** runtime
+- [ ] A **`converge`** runtime — idempotent host resources (package, file,
+      template, directory, user, service, mount) with per-resource
+      `unchanged | changed | failed` reporting, i.e. the Chef-replacement shape —
+      [plan](plans/host-convergence-plan.md) ·
+      [calls](calls/host-convergence-plan_calls.md) (PLANNED: file-shaped
+      resources → system resources → node-config jobs → why-run/drift →
+      `host` ACL resource). Phase 1 depends on the exit-status work above.
 - [ ] **`container` core gaps: exec on Linux, signals + stop knobs, Nomad-style
       CPU/memory enforcement, file delivery** —
       [plan](plans/container-runtime-exec-and-signals-plan.md) (PLANNED).
@@ -293,6 +329,17 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
     Linux port mapping/network namespaces, NUMA/SMT-aware core placement,
     fencing non-Legion host processes off reserved cores, a delegated
     (non-root) cgroup hierarchy root, alloc-dir sharing
+  - **Overlaps shipped work — reconcile before building phase 6.** `exec`
+    already creates and sizes a per-allocation cgroup from `resources`, opt-in
+    per worker via `resourceEnforcement` in the worker config
+    ([host process supervision plan](plans/host-process-supervision-plan.md)
+    §6.5, [docs](../docs/task-supervision.md#resource-enforcement-cgroups),
+    `src/task_plugins/exec_isolation.rs`). Phase 6 should adopt that code as
+    the `WorkerCgroup` implementation rather than write a second one, and
+    decide one opt-in story for both runtimes: the exec work is off by default
+    per worker (a `resources` block was only ever a scheduling estimate), which
+    the container plan's default-on stance has to either match or explicitly
+    overrule.
 - [ ] `exec`: unveil support
 - [ ] `exec`: network namespaces (netavark? CNI?) — see *Networking* below
 - [ ] **Sandbox snapshots, fast start, and forking** —
@@ -508,7 +555,10 @@ Plans: [persistence-plan.md](plans/persistence-plan.md), [multi-raft-persistence
       ([#137](https://github.com/mikenomitch/legion/pull/137))
 - [ ] **Node configuration jobs** — like sysbatch, but also runs on join and can
       add dynamic node metadata (CNI setup, volumes, artifacts, Ansible-shaped
-      work). Needs a plan.
+      work). Specified as phase 3 of the
+      [host convergence plan](plans/host-convergence-plan.md) (`nodeConfig`
+      with `onJoin`, `gateReadiness`, `publishAttrs`), which subsumes the
+      sysbatch/system-job items below.
 - [ ] Reconfigure a worker from the manager with CRUD commands
   - [ ] Existing nodes of a changed type need the update pushed to them, which
         implies nodes store a reference to their type
@@ -519,7 +569,8 @@ Plans: [persistence-plan.md](plans/persistence-plan.md), [multi-raft-persistence
 
 - [ ] **Sysbatch** — run once on every node
 - [ ] **System job** — N per X (1 per metal, 2 per region, …). Is this really a
-      job type, or just a richer `count`?
+      job type, or just a richer `count`? (`count: {num: 1, per: "id"}`
+      approximates it today but does not converge newly joined nodes.)
 
 ## Auth, TLS & security
 
