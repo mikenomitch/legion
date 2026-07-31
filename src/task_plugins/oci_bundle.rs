@@ -23,6 +23,10 @@ pub(crate) struct ImageConfig {
     pub(crate) env: Vec<String>,
     pub(crate) working_dir: Option<String>,
     pub(crate) user: Option<String>,
+    /// The image's declared `StopSignal`, when it has one. Docker honors it
+    /// on `stop` unless the caller overrides; Legion uses it as the middle
+    /// layer of the same default chain (jobspec → image → `SIGTERM`).
+    pub(crate) stop_signal: Option<String>,
     layers: Vec<PathBuf>,
 }
 
@@ -51,18 +55,21 @@ pub(crate) fn materialize_rootfs(oci_layout: &Path, rootfs: &Path) -> R<ImageCon
 /// Builds an OCI runtime bundle at `bundle_dir` from the image `oci_layout`.
 ///
 /// `command` is the container's argv (Legion requires it on the task), `env`
-/// the task's env (merged over the image's, task wins), `hostname` the
-/// container's hostname, and `volumes` the mounted volumes to bind into the
-/// container (shared with the sandbox kind's dev mode, which runs an OCI
-/// bundle too). The bundle is rebuilt from scratch each call.
+/// the task's env (merged over the image's, task wins), and `ctx` everything
+/// about the allocation itself — hostname, mounted volumes, the task
+/// directory to expose, and the node's resource decision (see
+/// [`BundleContext`]). Shared with the sandbox kind's dev mode, which runs an
+/// OCI bundle too. The bundle is rebuilt from scratch each call.
+///
+/// Returns the image's declared `StopSignal`, when it has one, for the
+/// container runtime's stop-signal default chain.
 pub(crate) fn build_bundle(
     oci_layout: &Path,
     bundle_dir: &Path,
     command: &[String],
     env: &std::collections::HashMap<String, String>,
-    hostname: &str,
-    volumes: &[crate::task_plugins::MountedVolume],
-) -> R<()> {
+    ctx: &BundleContext<'_>,
+) -> R<Option<String>> {
     if command.is_empty() {
         bail!("container command must include at least one entry");
     }
@@ -78,11 +85,11 @@ pub(crate) fn build_bundle(
     // (`postgres`, `nobody:nogroup`) map to their real uid/gid instead of
     // silently running as root.
     let user = resolve_user(&rootfs, image.user.as_deref());
-    let spec = build_spec(command, env, &image, &user, hostname, volumes);
+    let spec = build_spec(command, env, &image, &user, ctx);
     let config_path = bundle_dir.join("config.json");
     std::fs::write(&config_path, serde_json::to_vec_pretty(&spec)?)
         .with_context(|| format!("write {}", config_path.display()))?;
-    Ok(())
+    Ok(image.stop_signal)
 }
 
 fn read_json(path: &Path) -> R<Value> {
@@ -132,6 +139,10 @@ pub(crate) fn read_image_config(layout: &Path) -> R<ImageConfig> {
         .as_str()
         .filter(|s| !s.is_empty())
         .map(String::from);
+    let stop_signal = cfg["StopSignal"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(String::from);
 
     let layers = manifest["layers"]
         .as_array()
@@ -147,6 +158,7 @@ pub(crate) fn read_image_config(layout: &Path) -> R<ImageConfig> {
         env,
         working_dir,
         user,
+        stop_signal,
         layers,
     })
 }
@@ -425,13 +437,66 @@ fn volume_mounts(volumes: &[crate::task_plugins::MountedVolume]) -> Vec<Value> {
         .collect()
 }
 
+/// The `linux.resources` block for a task, and the `cgroupsPath` the runtime
+/// should create its cgroup at.
+///
+/// This is the `RuntimeApplied` half of the enforcement contract: worker core
+/// decided the numbers (see `src/worker/resources.rs`), and the OCI runtime
+/// binary creates the cgroup at the given path — which places it inside the
+/// worker's `legion/share` or `legion/reserve` parent, so the share mask
+/// governs it exactly like a worker-created one.
+///
+/// Declared-only, mirroring the macOS guest-sizing rule: a job that declares
+/// nothing gets no `memory`/`cpu` entries and stays unconstrained.
+fn resource_limits(assignment: &crate::task_plugins::ResourceAssignment) -> Value {
+    let mut resources = serde_json::Map::new();
+    if let Some(bytes) = assignment.memory_limit_bytes {
+        // Swap set equal to the limit means the cgroup may use `limit` bytes
+        // of memory+swap combined — i.e. swap cannot be used to escape it
+        // (the K8s semantic). Docker's default of 2x-limit-in-swap makes
+        // limits soft in practice, which defeats scheduling against them.
+        resources.insert("memory".into(), json!({ "limit": bytes, "swap": bytes }));
+    }
+    let mut cpu = serde_json::Map::new();
+    if let Some(cores) = assignment.cores.as_ref().filter(|cores| !cores.is_empty()) {
+        cpu.insert(
+            "cpus".into(),
+            Value::String(crate::worker::resources::format_cpu_list(cores)),
+        );
+    }
+    if let Some(shares) = assignment.cpu_weight {
+        // OCI `cpu.shares`; cgroup-v2 runtimes convert it to `cpu.weight`
+        // with the standard mapping. Nomad's convention is shares == MHz.
+        cpu.insert("shares".into(), json!(shares));
+    }
+    if !cpu.is_empty() {
+        resources.insert("cpu".into(), Value::Object(cpu));
+    }
+    Value::Object(resources)
+}
+
+/// Everything about *this allocation* that shapes its bundle, as opposed to
+/// the image and the command: what the container is called, what is mounted
+/// into it, and how the node decided to confine it.
+pub(crate) struct BundleContext<'a> {
+    /// Container hostname (and OCI container id): `legion-<alloc>`.
+    pub(crate) hostname: &'a str,
+    /// Volumes the worker mounted for this allocation.
+    pub(crate) volumes: &'a [crate::task_plugins::MountedVolume],
+    /// Host task directory to mount at [`crate::constants::CONTAINER_TASK_DIR`],
+    /// when the runtime exposes one (the `container` runtime does; the
+    /// sandbox runtime's dev mode does not).
+    pub(crate) task_dir: Option<&'a Path>,
+    /// Worker-computed CPU/memory placement, for a `RuntimeApplied` runtime.
+    pub(crate) assignment: Option<&'a crate::task_plugins::ResourceAssignment>,
+}
+
 fn build_spec(
     command: &[String],
     task_env: &std::collections::HashMap<String, String>,
     image: &ImageConfig,
     user: &ResolvedUser,
-    hostname: &str,
-    volumes: &[crate::task_plugins::MountedVolume],
+    ctx: &BundleContext<'_>,
 ) -> Value {
     let mut env = merge_env(&image.env, task_env);
     if let Some(home) = &user.home {
@@ -455,10 +520,39 @@ fn build_spec(
               "options": ["nosuid", "noexec", "nodev", "ro"] }),
     ];
     mounts.extend(dns_mounts());
-    // Volumes last so a job can deliberately shadow a default mount point.
-    mounts.extend(volume_mounts(volumes));
+    // The allocation's task directory, read-write, at the canonical mount
+    // point. The *directory* is mounted, never individual files: the worker
+    // replaces rendered files atomically by rename, which stays visible
+    // through a directory bind mount and silently breaks through a per-file
+    // one (the well-known docker pitfall).
+    if let Some(task_dir) = ctx.task_dir {
+        mounts.push(json!({
+            "destination": crate::constants::CONTAINER_TASK_DIR,
+            "type": "bind",
+            "source": task_dir.display().to_string(),
+            "options": ["rbind", "rprivate", "rw"],
+        }));
+    }
+    // Volumes last so a job can deliberately shadow a default mount point —
+    // the task-dir mount included.
+    mounts.extend(volume_mounts(ctx.volumes));
 
-    json!({
+    // The device-cgroup deny rule is unconditional; declared limits are
+    // layered over it, so a task that declares nothing keeps exactly the
+    // spec it had before enforcement existed.
+    let mut linux_resources = json!({ "devices": [{ "allow": false, "access": "rwm" }] });
+    if let Some(assignment) = ctx.assignment {
+        if let (Some(target), Some(limits)) = (
+            linux_resources.as_object_mut(),
+            resource_limits(assignment).as_object(),
+        ) {
+            for (key, value) in limits {
+                target.insert(key.clone(), value.clone());
+            }
+        }
+    }
+
+    let mut spec = json!({
         "ociVersion": "1.0.2",
         "process": {
             "terminal": false,
@@ -475,10 +569,10 @@ fn build_spec(
             "noNewPrivileges": true
         },
         "root": { "path": "rootfs", "readonly": false },
-        "hostname": hostname,
+        "hostname": ctx.hostname,
         "mounts": mounts,
         "linux": {
-            "resources": { "devices": [{ "allow": false, "access": "rwm" }] },
+            "resources": linux_resources,
             "namespaces": [
                 { "type": "pid" },
                 { "type": "ipc" },
@@ -494,7 +588,16 @@ fn build_spec(
                 "/proc/bus", "/proc/fs", "/proc/irq", "/proc/sys", "/proc/sysrq-trigger"
             ]
         }
-    })
+    });
+
+    // Explicit cgroupfs form (`legion/share/legion-<alloc>`), so an operator
+    // can find a task's cgroup by allocation id and the share/reserve split
+    // is visible in the hierarchy. Omitted entirely when nothing governs this
+    // task, leaving the runtime's own default placement.
+    if let Some(assignment) = ctx.assignment {
+        spec["linux"]["cgroupsPath"] = Value::String(assignment.cgroup_path.display().to_string());
+    }
+    spec
 }
 
 #[cfg(test)]
@@ -629,6 +732,7 @@ mod tests {
             env: vec!["FROM_IMAGE=1".to_string()],
             working_dir: Some("/app".to_string()),
             user: Some("1000:1000".to_string()),
+            stop_signal: None,
             layers: vec![],
         };
         let user = ResolvedUser {
@@ -638,21 +742,26 @@ mod tests {
         };
         let mut task_env = HashMap::new();
         task_env.insert("MODE".to_string(), "test".to_string());
+        let volumes = [crate::task_plugins::MountedVolume {
+            name: "state".to_string(),
+            mode: crate::volumes::VolumeMode::Filesystem,
+            host_path: PathBuf::from("/var/legion/state"),
+            path: Some("/workspace".to_string()),
+            fs: None,
+            fresh: false,
+            read_only: false,
+        }];
         let spec = build_spec(
             &["/bin/echo".to_string(), "hi".to_string()],
             &task_env,
             &image,
             &user,
-            "legion-7",
-            &[crate::task_plugins::MountedVolume {
-                name: "state".to_string(),
-                mode: crate::volumes::VolumeMode::Filesystem,
-                host_path: PathBuf::from("/var/legion/state"),
-                path: Some("/workspace".to_string()),
-                fs: None,
-                fresh: false,
-                read_only: false,
-            }],
+            &BundleContext {
+                hostname: "legion-7",
+                volumes: &volumes,
+                task_dir: None,
+                assignment: None,
+            },
         );
 
         assert_eq!(spec["process"]["args"], json!(["/bin/echo", "hi"]));
@@ -689,12 +798,181 @@ mod tests {
         }
     }
 
+    fn bare_image() -> ImageConfig {
+        ImageConfig {
+            env: vec![],
+            working_dir: None,
+            user: None,
+            stop_signal: None,
+            layers: vec![],
+        }
+    }
+
+    fn spec_with(assignment: Option<&crate::task_plugins::ResourceAssignment>) -> Value {
+        build_spec(
+            &["true".to_string()],
+            &HashMap::new(),
+            &bare_image(),
+            &ResolvedUser {
+                uid: 0,
+                gid: 0,
+                home: None,
+            },
+            &BundleContext {
+                hostname: "legion-42",
+                volumes: &[],
+                task_dir: None,
+                assignment,
+            },
+        )
+    }
+
+    /// A pinned task: exclusive cpuset, hard memory limit with swap equal to
+    /// it, and a `cgroupsPath` under the reserve slice.
+    #[test]
+    fn a_reserve_slice_assignment_lands_in_the_spec() {
+        let spec = spec_with(Some(&crate::task_plugins::ResourceAssignment {
+            slice: crate::task_plugins::Slice::Reserve,
+            cgroup_path: PathBuf::from("legion/reserve/legion-42"),
+            cores: Some(vec![3, 7]),
+            cpu_weight: None,
+            memory_limit_bytes: Some(268_435_456),
+        }));
+
+        assert_eq!(spec["linux"]["cgroupsPath"], "legion/reserve/legion-42");
+        assert_eq!(spec["linux"]["resources"]["cpu"]["cpus"], "3,7");
+        assert_eq!(
+            spec["linux"]["resources"]["memory"]["limit"],
+            268_435_456u64
+        );
+        assert_eq!(
+            spec["linux"]["resources"]["memory"]["swap"], 268_435_456u64,
+            "swap equals the limit so it cannot be used to escape it"
+        );
+        // The device deny rule survives untouched.
+        assert_eq!(
+            spec["linux"]["resources"]["devices"],
+            json!([{ "allow": false, "access": "rwm" }])
+        );
+    }
+
+    /// A share-slice task: proportional weight, no cpuset.
+    #[test]
+    fn a_share_slice_assignment_carries_shares_not_cpus() {
+        let spec = spec_with(Some(&crate::task_plugins::ResourceAssignment {
+            slice: crate::task_plugins::Slice::Share,
+            cgroup_path: PathBuf::from("legion/share/legion-42"),
+            cores: None,
+            cpu_weight: Some(500),
+            memory_limit_bytes: Some(134_217_728),
+        }));
+
+        assert_eq!(spec["linux"]["cgroupsPath"], "legion/share/legion-42");
+        assert_eq!(spec["linux"]["resources"]["cpu"]["shares"], 500);
+        assert!(spec["linux"]["resources"]["cpu"]["cpus"].is_null());
+        assert_eq!(
+            spec["linux"]["resources"]["memory"]["limit"],
+            134_217_728u64
+        );
+    }
+
+    /// Declared-only, mirroring the macOS guest-sizing rule: a job that
+    /// declares nothing is left unconstrained, and an ungoverned node's spec
+    /// is byte-identical to what it was before enforcement existed.
+    #[test]
+    fn an_undeclared_task_gets_no_limits() {
+        let governed_but_empty = spec_with(Some(&crate::task_plugins::ResourceAssignment {
+            slice: crate::task_plugins::Slice::Share,
+            cgroup_path: PathBuf::from("legion/share/legion-42"),
+            cores: None,
+            cpu_weight: None,
+            memory_limit_bytes: None,
+        }));
+        assert!(governed_but_empty["linux"]["resources"]["memory"].is_null());
+        assert!(governed_but_empty["linux"]["resources"]["cpu"].is_null());
+        // It still gets a cgroup path: that is what makes reserved cores
+        // off-limits to it.
+        assert_eq!(
+            governed_but_empty["linux"]["cgroupsPath"],
+            "legion/share/legion-42"
+        );
+
+        let ungoverned = spec_with(None);
+        assert!(ungoverned["linux"]["cgroupsPath"].is_null());
+        assert_eq!(
+            ungoverned["linux"]["resources"],
+            json!({ "devices": [{ "allow": false, "access": "rwm" }] })
+        );
+    }
+
+    /// The task dir is mounted read-write at the canonical path, as a
+    /// *directory* (so host-side atomic renames stay visible), and before
+    /// declared volumes so a job can still shadow it.
+    #[test]
+    fn the_task_dir_mounts_at_the_canonical_path() {
+        let spec = build_spec(
+            &["true".to_string()],
+            &HashMap::new(),
+            &bare_image(),
+            &ResolvedUser {
+                uid: 0,
+                gid: 0,
+                home: None,
+            },
+            &BundleContext {
+                hostname: "legion-42",
+                volumes: &[crate::task_plugins::MountedVolume {
+                    name: "data".to_string(),
+                    mode: crate::volumes::VolumeMode::Filesystem,
+                    host_path: PathBuf::from("/var/legion/data"),
+                    path: Some("/data".to_string()),
+                    fs: None,
+                    fresh: false,
+                    read_only: false,
+                }],
+                task_dir: Some(Path::new("/var/legion/allocs/42/web")),
+                assignment: None,
+            },
+        );
+
+        let mounts = spec["mounts"].as_array().expect("mounts");
+        let task_mount = mounts
+            .iter()
+            .position(|mount| mount["destination"] == "/legion/task")
+            .expect("task dir mounted");
+        assert_eq!(mounts[task_mount]["source"], "/var/legion/allocs/42/web");
+        assert_eq!(mounts[task_mount]["type"], "bind");
+        assert_eq!(
+            mounts[task_mount]["options"],
+            json!(["rbind", "rprivate", "rw"])
+        );
+
+        let volume = mounts
+            .iter()
+            .position(|mount| mount["destination"] == "/data")
+            .expect("declared volume mounted");
+        assert!(
+            task_mount < volume,
+            "the task dir mounts before declared volumes so one can shadow it"
+        );
+
+        // Without a task dir there is no mount at all — the pre-existing
+        // spec, unchanged.
+        let bare = spec_with(None);
+        assert!(!bare["mounts"]
+            .as_array()
+            .expect("mounts")
+            .iter()
+            .any(|mount| mount["destination"] == "/legion/task"));
+    }
+
     #[test]
     fn env_home_not_overridden_when_set() {
         let image = ImageConfig {
             env: vec!["HOME=/from-image".to_string()],
             working_dir: None,
             user: None,
+            stop_signal: None,
             layers: vec![],
         };
         let user = ResolvedUser {
@@ -707,8 +985,12 @@ mod tests {
             &HashMap::new(),
             &image,
             &user,
-            "h",
-            &[],
+            &BundleContext {
+                hostname: "h",
+                volumes: &[],
+                task_dir: None,
+                assignment: None,
+            },
         );
         let env = spec["process"]["env"].as_array().unwrap();
         assert!(env.iter().any(|e| e == "HOME=/from-image"));

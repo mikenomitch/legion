@@ -120,6 +120,23 @@ impl TokenIssuer for ManagerTokenIssuer {
 pub struct PreparedIdentity {
     pub identity: WorkloadIdentity,
     pub expires_at: u64,
+    /// Where this allocation's file destinations resolve on the host, for a
+    /// runtime that mounts its task directory elsewhere (see
+    /// [`FileDeliveryBase`]). Carried so the refresh loop rewrites the same
+    /// file the launch wrote.
+    pub delivery_base: Option<FileDeliveryBase>,
+}
+
+/// A runtime's file-delivery mapping: the root a jobspec's paths are declared
+/// against (`/legion/task`) and the host directory it is mounted from.
+///
+/// `None` everywhere it appears means the runtime's filesystem *is* the
+/// host's — the `exec` runtime — where a declared absolute path is already
+/// the real path and nothing is translated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileDeliveryBase {
+    pub in_task_root: &'static str,
+    pub host_task_dir: PathBuf,
 }
 
 /// Owns token delivery and the per-allocation refresh loops on a worker.
@@ -157,6 +174,7 @@ impl WorkerIdentityManager {
     pub async fn prepare_task_allocation(
         &self,
         allocation: &mut TaskAllocation,
+        delivery_base: Option<FileDeliveryBase>,
     ) -> R<Vec<PreparedIdentity>> {
         let identities = parse_identities(&allocation.task_identities)?;
         if identities.is_empty() {
@@ -178,8 +196,8 @@ impl WorkerIdentityManager {
                 return Ok(Vec::new());
             };
 
-            write_identity_files(&identity, alloc_id, &issued.token)?;
-            if let Some(backing) = backing_file_path(&identity, alloc_id) {
+            write_identity_files(&identity, alloc_id, &issued.token, delivery_base.as_ref())?;
+            if let Some(backing) = backing_file_path(&identity, alloc_id, delivery_base.as_ref()) {
                 self.delivered_files
                     .lock()
                     .expect("identity delivered-files lock")
@@ -197,11 +215,34 @@ impl WorkerIdentityManager {
                 // the host path doesn't reach — so only emit it when a signal
                 // handler would actually use it.
                 if identity.change_mode == ChangeMode::Signal {
-                    if let Some(backing) = backing_file_path(&identity, alloc_id) {
-                        env_injections.push((
-                            format!("{env_key}_FILE"),
-                            backing.to_string_lossy().to_string(),
-                        ));
+                    if let Some(backing) =
+                        backing_file_path(&identity, alloc_id, delivery_base.as_ref())
+                    {
+                        // For a runtime that mounts its task dir elsewhere,
+                        // the var must name the path the *task* sees. A
+                        // backing file outside that mount is unreadable from
+                        // inside, so the companion is omitted rather than
+                        // pointing at a path that does not exist there
+                        // (env-delivered identities on such a runtime back
+                        // onto the worker's own directory — use file delivery
+                        // if the workload needs to re-read the token).
+                        let in_task = match delivery_base.as_ref() {
+                            None => Some(backing.to_string_lossy().to_string()),
+                            Some(base) => {
+                                backing
+                                    .strip_prefix(&base.host_task_dir)
+                                    .ok()
+                                    .map(|relative| {
+                                        PathBuf::from(base.in_task_root)
+                                            .join(relative)
+                                            .to_string_lossy()
+                                            .to_string()
+                                    })
+                            }
+                        };
+                        if let Some(path) = in_task {
+                            env_injections.push((format!("{env_key}_FILE"), path));
+                        }
                     }
                 }
             }
@@ -214,6 +255,7 @@ impl WorkerIdentityManager {
             prepared.push(PreparedIdentity {
                 identity,
                 expires_at: issued.expires_at,
+                delivery_base: delivery_base.clone(),
             });
         }
 
@@ -249,6 +291,7 @@ impl WorkerIdentityManager {
                     alloc_id,
                     entry.identity,
                     entry.expires_at,
+                    entry.delivery_base,
                     task_manager,
                 )
                 .await;
@@ -341,9 +384,34 @@ pub fn parse_identities(raw: &str) -> R<Vec<WorkloadIdentity>> {
 /// Where the refreshable copy of this identity's token lives: the declared
 /// `file.path` when file delivery is configured, else the well-known fallback
 /// for env-delivered identities.
-fn backing_file_path(identity: &WorkloadIdentity, alloc_id: i64) -> Option<PathBuf> {
+fn backing_file_path(
+    identity: &WorkloadIdentity,
+    alloc_id: i64,
+    delivery_base: Option<&FileDeliveryBase>,
+) -> Option<PathBuf> {
     if let Some(file) = identity.file.as_ref().filter(|f| !f.path.trim().is_empty()) {
-        return Some(PathBuf::from(&file.path));
+        let Some(base) = delivery_base else {
+            return Some(PathBuf::from(&file.path));
+        };
+        // A runtime that mounts its task dir declares destinations against
+        // the mount point, so the host path is the task dir plus whatever
+        // the jobspec put under it. Re-resolved here rather than trusted
+        // from admission — the same two-layer stance identity *naming*
+        // already takes — so a malformed spec cannot write outside the tree.
+        return match crate::task_plugins::resolve_task_dir_destination(
+            base.in_task_root,
+            &file.path,
+        ) {
+            Ok(relative) => Some(base.host_task_dir.join(relative)),
+            Err(err) => {
+                warn!(
+                    identity = %identity.name,
+                    error = %err,
+                    "Identity file path is outside the task directory; not delivering it"
+                );
+                None
+            }
+        };
     }
     if identity.delivers_env() {
         return Some(fallback_token_path(alloc_id, &identity.name));
@@ -406,8 +474,13 @@ fn sanitize_identity_name_component(identity_name: &str) -> String {
 }
 
 /// Write/rewrite every file this identity is materialized at.
-fn write_identity_files(identity: &WorkloadIdentity, alloc_id: i64, token: &str) -> R<()> {
-    let Some(path) = backing_file_path(identity, alloc_id) else {
+fn write_identity_files(
+    identity: &WorkloadIdentity,
+    alloc_id: i64,
+    token: &str,
+    delivery_base: Option<&FileDeliveryBase>,
+) -> R<()> {
+    let Some(path) = backing_file_path(identity, alloc_id, delivery_base) else {
         return Ok(());
     };
     let mode = identity
@@ -534,6 +607,7 @@ async fn refresh_loop(
     alloc_id: i64,
     identity: WorkloadIdentity,
     mut expires_at: u64,
+    delivery_base: Option<FileDeliveryBase>,
     task_manager: Arc<Mutex<WorkerTaskManager>>,
 ) {
     loop {
@@ -555,7 +629,13 @@ async fn refresh_loop(
             None => return,
         };
 
-        match apply_refreshed_token(&identity, alloc_id, &issued.token, &task_manager) {
+        match apply_refreshed_token(
+            &identity,
+            alloc_id,
+            &issued.token,
+            delivery_base.as_ref(),
+            &task_manager,
+        ) {
             Ok(()) => {
                 info!(
                     allocation_id = alloc_id,
@@ -627,9 +707,10 @@ pub(crate) fn apply_refreshed_token(
     identity: &WorkloadIdentity,
     alloc_id: i64,
     token: &str,
+    delivery_base: Option<&FileDeliveryBase>,
     task_manager: &Arc<Mutex<WorkerTaskManager>>,
 ) -> R<()> {
-    write_identity_files(identity, alloc_id, token)?;
+    write_identity_files(identity, alloc_id, token, delivery_base)?;
 
     let mut manager = task_manager
         .lock()
@@ -864,7 +945,7 @@ mod tests {
             }),
             ..file_identity(&path, ChangeMode::Noop)
         };
-        write_identity_files(&identity, 1, "tok")?;
+        write_identity_files(&identity, 1, "tok", None)?;
         #[cfg(unix)]
         assert_eq!(mode_of(&path), 0o440);
         assert_eq!(fs::read_to_string(&path)?, "tok");
@@ -907,9 +988,12 @@ mod tests {
 
             network: String::new(),
             task_connect: String::new(),
+            ..Default::default()
         };
 
-        let prepared = manager.prepare_task_allocation(&mut allocation).await?;
+        let prepared = manager
+            .prepare_task_allocation(&mut allocation, None)
+            .await?;
         assert_eq!(prepared.len(), 2);
 
         // File identity: token written at the declared path.
@@ -969,9 +1053,12 @@ mod tests {
 
             network: String::new(),
             task_connect: String::new(),
+            ..Default::default()
         };
 
-        let prepared = manager.prepare_task_allocation(&mut allocation).await?;
+        let prepared = manager
+            .prepare_task_allocation(&mut allocation, None)
+            .await?;
         assert!(prepared.is_empty());
         // No env injection happened.
         let config: Value = serde_json::from_str(&allocation.task_config)?;
@@ -999,12 +1086,13 @@ mod tests {
         let issuer = FakeIssuer::new(2); // 2s TTL → refresh roughly every 1s
         let manager = Arc::new(WorkerIdentityManager::new(issuer.clone()));
         let identity = file_identity(&token_path, ChangeMode::Noop);
-        write_identity_files(&identity, 11, "tok-0")?;
+        write_identity_files(&identity, 11, "tok-0", None)?;
         manager.spawn_refreshers(
             11,
             vec![PreparedIdentity {
                 identity,
                 expires_at: unix_now() + 2,
+                delivery_base: None,
             }],
             task_manager.clone(),
         );
@@ -1059,7 +1147,7 @@ mod tests {
         let pid_before = task_manager.lock().unwrap().allocation_pid(12);
 
         let identity = file_identity(&token_path, ChangeMode::Noop);
-        apply_refreshed_token(&identity, 12, "tok-new", &task_manager)?;
+        apply_refreshed_token(&identity, 12, "tok-new", None, &task_manager)?;
 
         assert_eq!(fs::read_to_string(&token_path)?, "tok-new");
         assert_eq!(task_manager.lock().unwrap().allocation_pid(12), pid_before);
@@ -1096,7 +1184,7 @@ mod tests {
             change_signal: Some("SIGHUP".into()),
             ..file_identity(&token_path, ChangeMode::Signal)
         };
-        apply_refreshed_token(&identity, 13, "tok-new", &task_manager)?;
+        apply_refreshed_token(&identity, 13, "tok-new", None, &task_manager)?;
 
         let deadline = std::time::Instant::now() + Duration::from_secs(3);
         while !marker.exists() {
@@ -1133,7 +1221,7 @@ mod tests {
             change_mode: ChangeMode::Restart,
             ..Default::default()
         };
-        apply_refreshed_token(&identity, 14, "tok-new", &task_manager)?;
+        apply_refreshed_token(&identity, 14, "tok-new", None, &task_manager)?;
 
         let guard = task_manager.lock().unwrap();
         let pid_after = guard.allocation_pid(14);

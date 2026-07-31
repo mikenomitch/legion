@@ -31,8 +31,26 @@ impl Worker for WorkerDaemonService {
         // Fetch + deliver identity tokens before the task starts (env tokens
         // must be in the env map at exec time). A task must not start without
         // an identity it declared.
+        let delivery_base = self
+            .task_manager
+            .lock()
+            .map_err(|_| Status::internal("Task manager lock poisoned"))?
+            .file_delivery_base(
+                allocation.allocation_id,
+                &allocation.task_name,
+                &allocation.task_runtime,
+            )
+            .map(
+                |(in_task_root, host_task_dir)| crate::worker::identity::FileDeliveryBase {
+                    in_task_root,
+                    host_task_dir,
+                },
+            );
         let prepared = match self.identity.as_ref() {
-            Some(identity) => match identity.prepare_task_allocation(&mut allocation).await {
+            Some(identity) => match identity
+                .prepare_task_allocation(&mut allocation, delivery_base)
+                .await
+            {
                 Ok(prepared) => prepared,
                 Err(err) => {
                     let reason = format!("Failed to deliver workload identities: {err}");

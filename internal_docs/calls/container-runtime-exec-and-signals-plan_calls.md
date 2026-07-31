@@ -245,3 +245,364 @@ failure remains clearly attributed when it happens, and a startup probe adds a
 subprocess launch on every worker for a case no supported configuration hits.
 Kept as open question Q1 in the plan so implementation can flip if the e2e
 matrix says otherwise.
+
+---
+
+## Execution-stage calls (2026-07-31)
+
+The planning entries above are ranked 1–7. The entries below were made while
+executing all seven phases; they are ranked among themselves, highest project
+impact first, and each records a deviation from the plan as written.
+
+## 8. Enforcement reuses the existing opt-in `resourceEnforcement` worker config as its gate
+
+**The call.** The share/reserve hierarchy, the core allocator, memory limits,
+and CPU weight are all active only on a worker started with
+`resourceEnforcement: { enabled: true }` — the config knob the exec runtime's
+cgroup support already shipped with. The plan's §10 said "no feature gate" and
+release-noted declared limits becoming real for every Linux worker on upgrade.
+
+**The alternatives.** (a) The plan as written: ungated, so every Linux worker
+starts OOM-killing over-consuming tasks the day it upgrades; (b) a *new*
+gate specific to container enforcement, leaving exec on its old one; (c) gate
+only the pieces that can kill a workload (memory) and leave pinning and weight
+ungated.
+
+**The trade-off.** The plan's headline — "no `resources` field is
+scheduling-only on Linux anymore" — is true only for operators who opt in, and
+the capability table has to say "with `resourceEnforcement.enabled`" rather
+than an unqualified ✅. Clusters that never flip the flag keep the exact gap
+the plan set out to close, and nothing surfaces that to them beyond the docs.
+
+**Why.** Simplicity of the *rule*, and honesty about an installed base. The
+repository had already made this exact call once, in the config comment the
+knob ships with: "a declaration that was only ever a scheduling estimate
+should not start OOM-killing workloads because the cluster upgraded." Shipping
+container enforcement ungated while exec's stayed gated would have left one
+node behaving two ways depending on which runtime a task used — the incoherence
+entry 3 exists to prevent. Alternative (c) splits the mental model along a line
+users cannot see (which limits are "dangerous"). One gate, one hierarchy, one
+sentence in the docs.
+
+## 9. `TaskAllocation` gains two fields; the plan's "no wire changes" was wrong
+
+**The call.** `stopSignal` and `stopGracePeriod` ride the dispatch payload as
+`task_stop_signal` (string) and `task_stop_grace_period_seconds` (uint64), both
+additive and both empty/0 when the task declares nothing.
+
+**The alternative.** The plan's §7 claim — that the fields "ride as JSON inside
+the existing job-config payload" and need no proto change.
+
+**The trade-off.** Two more fields on a message that is already large, and a
+third representation of a duration (the jobspec's string, the struct's
+`Duration`, the wire's seconds).
+
+**Why.** The claim was simply false, and finding out at the worker would have
+been worse than finding out now: the worker never receives a jobspec. It
+receives a `TaskAllocation` whose `task_config` is the *runtime* config block
+(`image`, `command`, …), and rebuilds a `TaskConfig` from individual scalar
+and JSON fields. Task-level fields that are not on the message do not exist on
+the worker. Encoding the grace period as seconds rather than the raw duration
+string keeps the wire self-describing and the worker parse-free; "undeclared"
+stays distinguishable from "declared the default", which the Linux container
+path needs in order to consult the image's `STOPSIGNAL` only when the jobspec
+was silent.
+
+## 10. `resources.cpus` stays an alias for `cpu` (MHz), not for `cores`
+
+**The call.** The core allocator reads `cores` only. `cpus` continues to mean
+what the scheduler has always made it mean — an alias for `cpu` — and so
+contributes to `cpu.weight`, never to a cpuset.
+
+**The alternative.** Treat `cpus` as the historical spelling of `cores`, which
+is what the exec runtime's pre-existing `limit_files` did (mapping either onto
+a CFS quota).
+
+**The trade-off.** Two spellings that look like they mean cores (`cores`,
+`cpus`) mean different things, which is a real papercut for someone reading a
+jobspec cold. The container runtime's own `--cpus` flag on macOS adds to the
+confusion.
+
+**Why.** Correctness, discovered by the shipped example configs failing
+validation: `ResourcePolicy::normalize_task_resources` rewrites `cpus` to
+`cpu`, and `configs/jobs/*.jsonnet` are full of `cpus: 0.1` / `cpus: 1.5`.
+Reading `cpus` as `cores` would have turned every one of those into a
+"fractional cores" rejection at submit — breaking specs that predate this work
+and mean nothing of the kind. The scheduler is the authority on what a
+resource field means; the enforcement layer follows it rather than inventing a
+second interpretation.
+
+## 11. The `cores`-xor-`cpu` rule is stated twice, deliberately
+
+**The call.** `validate_governed_resources` rejects `cores` + `cpu` on a
+governed runtime with a message about the two CPU contracts, even though
+`ResourcePolicy::normalize_task_resources` already rejects the same
+combination cluster-wide.
+
+**The alternative.** Rely on the scheduler's existing rule and skip the
+runtime-level one.
+
+**The trade-off.** Two error paths for one bad spec, and whichever runs first
+wins — so the message a user sees depends on validation order rather than on
+which rule is more specific.
+
+**Why.** The two rules justify themselves differently and could diverge. The
+scheduler's exists because it cannot price a task that declares CPU twice; the
+runtime's exists because a cpuset and a weight are different kernel
+mechanisms, and its message says so with the fix ("declare `cores` for
+latency-sensitive work, or `cpu` for everything else"). Keeping the
+runtime-level rule also means a future runtime that opts into enforcement
+inherits the check from the interface rather than depending on a scheduler
+invariant it never reads. Cheap redundancy on a rule that must not silently
+lapse.
+
+## 12. `stopGracePeriod: '0s'` is rejected rather than meaning "kill immediately"
+
+> **Superseded at merge** by [entry 19](#19-phase-3s-stopsignal--stopgraceperiod-surface-is-dropped-in-favour-of-mains-stop--signal-killafter-): this describes the dropped `stopSignal` / `stopGracePeriod` design, kept as the record of why it was built.
+
+
+**The call.** A zero grace period fails at submit ("must be greater than 0"),
+pointing at omitting the field for the 10s default.
+
+**The alternative.** Accept `0s` as the escape hatch for "I want today's
+instant SIGKILL back", which the implementation supports internally — the
+graceful reaper treats a zero window as the degenerate case.
+
+**The trade-off.** An operator who genuinely wants instant teardown for a
+specific task has no way to declare it, and must live with the smallest
+positive duration instead.
+
+**Why.** Simplicity, and the failure mode of the alternative. `0s` reads as a
+typo far more often than as intent — it is what a template renders when a
+variable is unset — and silently disabling a data-loss protection on a typo is
+exactly the outcome `stopGracePeriod` exists to prevent. The internal
+degenerate case stays, because it is what makes the ladder's code path
+uniform; it is simply not reachable from a jobspec.
+
+## 13. `SIGKILL` is not in the declarable signal vocabulary
+
+> **Superseded at merge** by [entry 19](#19-phase-3s-stopsignal--stopgraceperiod-surface-is-dropped-in-favour-of-mains-stop--signal-killafter-): this describes the dropped `stopSignal` / `stopGracePeriod` design, kept as the record of why it was built.
+
+
+**The call.** `crate::signals` accepts eight signals (`SIGTERM`, `SIGINT`,
+`SIGQUIT`, `SIGHUP`, `SIGUSR1`, `SIGUSR2`, `SIGCONT`, `SIGWINCH`) — the set
+that already existed for `changeSignal` — and `stopSignal: 'SIGKILL'` is
+rejected at submit with the vocabulary in the message.
+
+**The alternative.** Allow it, since `stopSignal` reaches a `kill(2)` that
+would accept it.
+
+**The trade-off.** An operator who wants a hard kill as the *first* step
+cannot say so.
+
+**Why.** `SIGKILL` cannot be caught, so declaring it as the stop signal
+disables the drain and makes `stopGracePeriod` meaningless — a spec that reads
+like it configures graceful shutdown and does the opposite. The hard kill is
+already the ladder's second step and needs no declaration. Reusing one
+vocabulary across `stopSignal` and `changeSignal` also means one place to
+extend and one error message shape.
+
+## 14. Signal *and* graceful-stop policy both flow through `StopContext`
+
+> **Superseded at merge** by [entry 19](#19-phase-3s-stopsignal--stopgraceperiod-surface-is-dropped-in-favour-of-mains-stop--signal-killafter-): this describes the dropped `stopSignal` / `stopGracePeriod` design, kept as the record of why it was built.
+
+
+**The call.** `StopContext` grew `signal` and `grace_period` alongside its
+existing `cause`, resolved once by the worker from the task config, and
+`stop_with` is the form both in-tree runtimes override.
+
+**The alternative.** Let each runtime read `task.stop_signal` /
+`task.stop_grace_period` itself (the `TaskConfig` is already a parameter to
+every stop hook), leaving `StopContext` carrying only the cause.
+
+**The trade-off.** The struct now carries three things a plugin author has to
+understand instead of one, and a runtime that only cares about the cause reads
+past two fields it ignores.
+
+**Why.** Extensibility, and the resolution rules being non-obvious. "Which
+signal, and how long" involves a default chain (jobspec → runtime-specific
+middle layer → `SIGTERM`) and a cap; having each runtime re-derive it would
+guarantee they drift, and a third-party plugin would almost certainly get it
+wrong or skip it. Resolving once in worker core and handing runtimes the
+answer is the same shape as `ResourceAssignment` (entry 3): core decides,
+runtimes apply. The plan's own `StopContext` comment anticipated exactly this
+("Phase 1b extends the context with a signal and a deadline"), so this is the
+predicted extension rather than a new idea.
+
+## 15. `join_assignment_cgroup` ships as the documented adoption path, but the exec runtime does not call it
+
+**The call.** The shared helper exists, is exported, is documented as the
+two-line `WorkerCgroup` recipe, and is unit-tested for its no-op case — while
+the `exec` runtime instead reads `instance.resource_assignment` and places the
+cgroup write inside its own existing `pre_exec` sequence.
+
+**The alternative.** Have `exec` call the helper too, so the plan's "adopting
+is two lines" claim is demonstrated by its first adopter.
+
+**The trade-off.** The recipe the docs teach is not the one the flagship
+adopter uses, which is a smell a careful reader will notice — and the helper's
+own correctness rests on a unit test plus the container-side e2e rather than
+on being exercised by an in-tree runtime.
+
+**Why.** Ordering, which the helper cannot express. The exec runtime's
+`pre_exec` is a privilege ladder: `oom_score_adj`, then the cgroup join, then
+private `/tmp` and capability drops, then `setuid`, then `no_new_privs` and
+landlock. The cgroup the worker creates is not writable by the task user, so
+the join *must* precede the user switch; a second, independent `pre_exec`
+closure from the helper would run in registration order with no way to
+interleave. Forcing the helper to fit would have meant giving it an ordering
+parameter — more interface surface than the two-line case deserves. The docs
+state the escape hatch explicitly rather than hiding it.
+
+## 16. Worker-core enforcement replaces the exec runtime's own cgroup path
+
+**The call.** `prepare_managed_cgroup` / `limit_files` (the exec runtime's
+per-allocation `legion/alloc-<id>-<task>` cgroup with a CFS `cpu.max` quota)
+are no longer called; exec tasks get their cgroup from the shared hierarchy.
+`remove_managed_cgroup` stays, and only runs for tasks that have no assignment
+— cleaning up cgroups a previous worker version created.
+
+**The alternatives.** (a) Keep both, with the old path as a fallback when the
+new one declines to assign; (b) delete the legacy functions outright,
+including the teardown.
+
+**The trade-off.** The exec runtime's cgroup path *moves*: an operator who
+scripted against `/sys/fs/cgroup/legion/alloc-<id>-<task>/` now finds
+`/sys/fs/cgroup/legion/share/legion-<id>/`. `cpu.max` quota semantics are
+replaced by `cpu.weight` proportional semantics, so a task that was throttled
+to 1.5 CPUs is now weighted instead — different behavior under contention,
+same declaration.
+
+**Why.** Two subsystems writing cgroups for the same task with contradictory
+CPU models is exactly the incoherence this plan exists to remove — and the old
+model conflated `cpus` with `cores` (entry 10), so it was also wrong. Keeping
+a fallback (a) would preserve the contradiction and double the states to
+reason about. Keeping the *removal* function (rejecting (b)) is what stops a
+worker upgrade from orphaning cgroup directories a previous version created.
+The path change is release-noted.
+
+## 8b. Stopping became two-phase so the grace wait never blocks a heartbeat
+
+> **Superseded at merge** by [entry 19](#19-phase-3s-stopsignal--stopgraceperiod-surface-is-dropped-in-favour-of-mains-stop--signal-killafter-): this describes the dropped `stopSignal` / `stopGracePeriod` design, kept as the record of why it was built.
+
+
+*(Ranked with entry 8 — the two together are the execution-stage calls with
+real operational consequences. Numbered 8b rather than renumbering the entries
+below, which are cited by number in the plan's status header.)*
+
+**The call.** `reconcile_allocations` no longer tears an allocation down. It
+signals it, records a deadline, and returns; the task supervisor's tick reaps
+whatever has exited or expired. A draining allocation stays in the worker's
+maps, is excluded from the restart policy, and an in-place re-dispatch drains
+its predecessor on the launch thread with the lock released between polls.
+
+**The alternatives.** (a) Wait synchronously inside `stop_with`, as the first
+implementation did — the smallest diff, and the shape the plan implies;
+(b) cap the synchronous wait at something small (say 2s) and hard-kill the
+rest, keeping one phase; (c) spawn a thread per stop that owns the instance,
+so the wait happens off-lock without a state machine.
+
+**The trade-off.** Teardown is no longer atomic with the reconcile that
+requested it, so there is a window in which an allocation is signaled but
+still present — which the heartbeat reports, and which every test that
+asserted "gone after reconcile" had to learn about. The worker also grows a
+`terminating` map and a second entry point (`finish_ready_terminations`) that a
+reader has to find before the stop path makes sense.
+
+**Why.** Alternative (a) is a genuine regression, and the repository had
+already written down why: `internal_docs/TODO.md`'s preemption Phase 1b entry
+says a blocking grace wait "would stall heartbeats and the self-fence watchdog
+and get the node declared lost", and names exactly the fix taken here
+("`stop_with` must signal and return, with a reaper doing the SIGKILL"). With
+a 5-minute admission cap, one stubborn task could have frozen a worker's
+heartbeats for five minutes and self-fenced its own stateful neighbors —
+strictly worse than the unconditional SIGKILL the plan set out to replace.
+Alternative (b) makes `stopGracePeriod` quietly mean something other than what
+it says, which is the failure the field exists to eliminate. Alternative (c)
+does work, but hands a live `TaskInstance` to a detached thread while worker
+core still believes it owns the allocation, and gives release-ordering
+(volumes, cores, dirs) no single owner. Draining through the supervisor keeps
+one owner and reuses a loop that already exists — and it is the same shape the
+preemption plan's eviction path will need, so that work inherits it rather
+than building a third mechanism.
+
+---
+
+## Merge-stage calls (2026-07-31)
+
+Made while merging `main` after the preemption plan (#176) landed. That plan's
+Phase 1b shipped this plan's Phase 3 under a different surface, so the entries
+below record what was dropped and why.
+
+## 19. Phase 3's `stopSignal` / `stopGracePeriod` surface is dropped in favour of `main`'s `stop { signal, killAfter }`
+
+**The call.** The graceful-stop surface this plan designed — task-level
+`stopSignal` and `stopGracePeriod` scalars, a 10-second default, an
+eight-signal vocabulary, `task_config.stop_signal` / `stop_grace_period`
+columns, and a per-runtime signal→wait→kill ladder run inside `stop_with` —
+was **deleted at the merge**. The branch now consumes `main`'s
+`stop { signal, killAfter }` block (30-second default, six-signal vocabulary,
+one `stop JSONB` column, one ladder for every stop cause). Entries 12, 13, 14
+and 8b above describe the dropped design; they are kept as the record of why
+it was built, not as a description of what shipped.
+
+**The alternatives.** (a) Keep both surfaces, mapping one onto the other —
+`stopSignal` as a documented alias for `stop.signal`; (b) keep this plan's
+surface and delete `main`'s, since this branch's ladder was per-runtime and
+covered the container path `main`'s did not; (c) take `main`'s field names but
+keep this plan's 10-second default and wider vocabulary.
+
+**The trade-off.** A phase of designed, built, tested and documented work is
+gone, and this plan's status line has to say so rather than claiming seven
+phases. Two behaviors the plan argued for are lost with it: the 10-second
+default (docker's, and what an operator's fingers expect) becomes 30 seconds,
+and `SIGCONT` / `SIGWINCH` stop signals become undeclarable.
+
+**Why.** Simplicity, and it is not close. Two jobspec fields that mean the
+same thing is the single most expensive kind of surface duplication a config
+language can carry: every doc has to explain both, every example has to pick
+one, and the precedence rule between them becomes a thing users get wrong
+forever. `main` is the merge target and shipped first, so its spelling wins by
+default; and its design is better on the merits independent of that — one
+ladder for every stop cause (`job stop`, rollout, drain, reschedule,
+scale-in, preemption) rather than a ladder each runtime re-derives, a
+`deadline` on `StopContext` so a runtime can hand an absolute instant to a
+stop-with-timeout API, and an explicit `Ok(false)` "I cannot signal" return
+so a runtime that declines is torn down immediately instead of waiting out a
+window nothing can use. Alternative (a) is the duplication with extra steps.
+Alternative (c) trades a genuinely better default for a worse one purely to
+preserve this plan's authorship, and re-opens a vocabulary `main` deliberately
+narrowed (`SIGCONT` and `SIGWINCH` are not *termination* signals; declaring
+one as a stop notice asks for a drain that never comes).
+
+## 20. The branch keeps its wire plumbing, because `main`'s `stop` block was reaching no worker
+
+**The call.** `TaskAllocation` still gains a field — now one `string
+task_stop` carrying `main`'s `StopConfig` as JSON, replacing this plan's two
+scalars — and the dispatcher and worker still serialize and rebuild it.
+
+**The alternatives.** (a) Drop the wire work with the rest of Phase 3, on the
+principle that `main` owns graceful stop now; (b) widen `Allocation` instead;
+(c) have the worker fetch the task config from the manager on stop.
+
+**The trade-off.** This branch now carries a change to a subsystem it does not
+own, and a reviewer of a "container runtime" PR has to evaluate a proto field
+belonging to the preemption plan.
+
+**Why.** Alternative (a) is the tempting one and it is wrong: `main`'s
+`TaskAllocation` has no stop field, and the worker rebuilds its `TaskConfig`
+purely from that message — so on `main` as merged, a task declaring
+`stop { signal: 'SIGINT', killAfter: '90s' }` has it stored, validated,
+and then **silently ignored**, with every stop using the default ladder. The
+field is live in the jobspec and inert in practice. This plan had already
+built exactly the plumbing that closes it (calls entry 9, for its own two
+scalars), so carrying it over costs one field and fixes a shipped feature that
+does not currently work. Alternative (b) touches the read model, the caches,
+the raft changesets and the wire for one consumer; (c) puts a manager round
+trip on the stop path, which is the one path that must not depend on the
+manager being reachable.
+
+A consequence worth stating: "undeclared" has to survive the trip as a state
+distinct from "declared `SIGTERM`", because the Linux container chain consults
+the image's own `STOPSIGNAL` only when the jobspec was silent. That is why the
+field is an empty string rather than a serialized default.
