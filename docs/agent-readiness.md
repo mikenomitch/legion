@@ -382,13 +382,27 @@ All client commands and the MCP server honour:
    `legion template render` to see the spec a template would submit. The
    `job plan --json` envelope also carries `index_usage` — per task, which
    scheduling index generated the candidates and why none did
-   ([scheduling-indexes.md](scheduling-indexes.md)).
+   ([scheduling-indexes.md](scheduling-indexes.md)) — and `preemptions`,
+   naming every allocation the submit would **displace**, with its job, task,
+   band and grace window ([preemption-and-eviction.md](preemption-and-eviction.md)).
+   `preemptionMode` tells you whether that list is empty because nothing
+   would be displaced or because preemption is off. Treat a non-empty
+   `preemptions` list as requiring confirmation: it is the one thing in a plan
+   that costs somebody else something.
 5. **Apply with a retry-safe key**: `legion job run … --idempotency-key … --wait`
    (or `legion template run … --idempotency-key … --wait`).
 6. **Verify**: inspect the `wait` result, `rollout events`, and `state query`.
 
 Prefer read-only operations; treat anything with `mutates: true` /
 `readOnlySafe: false` as requiring confirmation.
+
+**Reacting to being stopped.** An agent-run task is told when the platform is
+shutting it down: `LEGION_STOP_NOTICE_PATH` names a JSON file written just
+before the stop signal, carrying the cause (`preempted`, `drain`, `stop`, …),
+the SIGKILL deadline, the grace window in seconds, and — for preemption — the
+job that took the capacity. That is enough to checkpoint, hand off, or exit
+clean programmatically rather than inferring intent from a bare SIGTERM. See
+[graceful-stop.md](graceful-stop.md).
 
 ## Status / roadmap
 

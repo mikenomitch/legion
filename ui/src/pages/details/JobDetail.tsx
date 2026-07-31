@@ -28,7 +28,7 @@ function JobDetailContent() {
   // Keyed on the route param so navigating job→job (e.g. via the command
   // palette) refetches instead of showing the previous job's data.
   const [jobData] = createResource(jobName, async () => {
-    const [jobInfo, ledger, rollouts, spec, specHistory, services] = await Promise.all([
+    const [jobInfo, ledger, rollouts, spec, specHistory, services, preemptions] = await Promise.all([
       managerClient.getJobInfo({ name: jobName() }),
       // node:read garnish (allocation placement); job-scoped tokens
       // still get the rest of the page.
@@ -37,6 +37,14 @@ function JobDetailContent() {
       managerClient.getJobSpec({ name: jobName() }),
       managerClient.listJobSpecHistory({ name: jobName() }),
       managerClient.listServices({}),
+      // Preemption history: what displaced this job's allocations, and when.
+      // Best-effort — the event journal is bounded (~10k rows), so this is an
+      // observability surface rather than an audit log, and a job whose
+      // preemptions have aged out simply shows none.
+      managerClient
+        .listEvents({ kind: 'allocation.preempted', jobId: jobName(), limit: 20 })
+        .then((reply) => reply.events)
+        .catch(() => []),
     ])
 
     const jobId = jobInfo.job?.id ?? jobName()
@@ -74,6 +82,7 @@ function JobDetailContent() {
       taskInstances: buildTaskInstancesByName(rolloutStatus?.groups ?? []),
       services: jobServices,
       endpoints,
+      preemptions,
     }
   })
 
@@ -207,6 +216,19 @@ function JobDetailContent() {
             badges={
               <>
                 <StatusBadge status={jobData()!.job?.status || 'unknown'} />
+                {/* The priority band decides what this job can displace and
+                    what can displace it, so it belongs beside the status
+                    rather than buried in the spec. */}
+                <Show when={jobData()!.job?.priority}>
+                  {(priority) => (
+                    <MonoBadge
+                      tone={['critical', 'high'].includes(priority()) ? 'accent' : 'neutral'}
+                      title="Priority band: orders the eval queue and governs preemption"
+                    >
+                      <>priority: {priority()}</>
+                    </MonoBadge>
+                  )}
+                </Show>
                 <Badge tone="neutral">{jobData()!.allocations.length} allocation{jobData()!.allocations.length === 1 ? '' : 's'}</Badge>
                 <Show when={jobData()!.template}>
                   {(template) => (
@@ -535,6 +557,71 @@ function JobDetailContent() {
                   </TableShell>
                 </Show>
               </SectionCard>
+
+              {/* Preemption history. Only rendered when there is any: a job
+                  that has never been displaced should not carry an empty
+                  section implying it might be. */}
+              <Show when={jobData()!.preemptions.length}>
+                <SectionCard
+                  title="Preemption history"
+                  description="When this job's allocations were displaced to make room for higher-priority work. Best-effort: the event journal is bounded, so older preemptions age out."
+                  flush
+                >
+                  <TableShell>
+                    <table class={tableClass}>
+                      <thead class={theadClass}>
+                        <tr>
+                          <th class={thClass}>When</th>
+                          <th class={thClass}>Displaced by</th>
+                          <th class={thClass}>Band</th>
+                          <th class={thClass + ' text-right'}>Allocations</th>
+                        </tr>
+                      </thead>
+                      <tbody class="divide-y divide-line">
+                        <For each={jobData()!.preemptions}>
+                          {(event) => {
+                            const meta = (() => {
+                              try {
+                                return JSON.parse(event.metadataJson || '{}') as {
+                                  count?: number
+                                  band?: string
+                                  preemptorJob?: string
+                                  preemptorBand?: string
+                                }
+                              } catch {
+                                return {}
+                              }
+                            })()
+                            return (
+                              <tr class={trHoverClass}>
+                                <td class={tdClass + ' whitespace-nowrap text-xs text-faint'} title={formatDate(event.createdAt)}>
+                                  {formatRelativeTime(event.createdAt)}
+                                </td>
+                                <td class={tdClass}>
+                                  <Show when={meta.preemptorJob} fallback={<span class="text-faint">—</span>}>
+                                    {(job) => (
+                                      <A href={`/jobs/${encodeURIComponent(job())}`} class="font-medium hover:text-brass-strong">
+                                        {job()}
+                                      </A>
+                                    )}
+                                  </Show>
+                                  <Show when={meta.preemptorBand}>
+                                    <span class="ml-2 font-mono text-2xs text-muted">({meta.preemptorBand})</span>
+                                  </Show>
+                                </td>
+                                <td class={tdClass}>
+                                  <span class="font-mono text-xs text-muted">{meta.band ?? '—'}</span>
+                                </td>
+                                <td class={tdClass + ' text-right text-xs text-muted'}>{meta.count ?? 1}</td>
+                              </tr>
+                            )
+                          }}
+                        </For>
+                      </tbody>
+                    </table>
+                  </TableShell>
+                </SectionCard>
+              </Show>
             </div>
           </Show>
 

@@ -117,13 +117,17 @@ impl PreemptionSettings {
                 .iter()
                 .map(|item| {
                     item.as_str().map(str::to_string).ok_or_else(|| {
-                        anyhow!("schedulerSettings.preemption.disabledPools entries must be strings")
+                        anyhow!(
+                            "schedulerSettings.preemption.disabledPools entries must be strings"
+                        )
                     })
                 })
                 .collect::<R<Vec<_>>>()?,
             Some(_) => bail!("schedulerSettings.preemption.disabledPools must be a list"),
         };
-        let victim_exempt_age = match block.get("victimExemptAge").or(block.get("victim_exempt_age"))
+        let victim_exempt_age = match block
+            .get("victimExemptAge")
+            .or(block.get("victim_exempt_age"))
         {
             None => DEFAULT_VICTIM_EXEMPT_AGE,
             Some(Value::String(raw)) => humantime::parse_duration(raw).with_context(|| {
@@ -356,9 +360,11 @@ pub fn select_victims(
     for index in (0..chosen.len()).rev() {
         let mut without = free.clone();
         for (position, candidate) in chosen.iter().enumerate() {
-            if position == index || reprieved.iter().any(|spared| {
-                spared.allocation_id == candidate.allocation_id
-            }) {
+            if position == index
+                || reprieved
+                    .iter()
+                    .any(|spared| spared.allocation_id == candidate.allocation_id)
+            {
                 continue;
             }
             without.release(&candidate.request);
@@ -632,7 +638,10 @@ mod preemption_test {
         assert_eq!(parsed.mode, PreemptionMode::Observe);
         assert!(!parsed.enabled_for_pool("gpu"));
         assert!(parsed.enabled_for_pool("default"));
-        assert_eq!(parsed.victim_exempt_age, std::time::Duration::from_secs(300));
+        assert_eq!(
+            parsed.victim_exempt_age,
+            std::time::Duration::from_secs(300)
+        );
 
         let typo = json!({ "preemption": { "mode": "observ" } });
         assert!(

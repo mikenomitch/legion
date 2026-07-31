@@ -22,10 +22,10 @@ use crate::structs::{
 };
 use policy::score_node_for_context;
 pub use policy::{load_policy, SchedulerWeights, SchedulingContext, SchedulingPolicy};
+use preemption::{eligible_victims, preemption_cost, select_victims, VictimCandidate};
 pub use preemption::{
     PlannedPreemption, PreemptionMode, PreemptionSettings, DEFAULT_VICTIM_EXEMPT_AGE,
 };
-use preemption::{eligible_victims, preemption_cost, select_victims, VictimCandidate};
 
 mod policy;
 mod preemption;
@@ -213,6 +213,17 @@ struct ScoreSample {
     sample: usize,
 }
 
+/// Who is doing the preempting, as `build_plan` needs to know it.
+struct PreemptorContext<'a> {
+    /// Preempting job's name.
+    job: &'a str,
+    /// Its priority band, which decides what it may displace at all.
+    band: Band,
+    /// Whether observe-mode findings are written to the event journal.
+    /// Only the applying path journals; dry runs preview silently.
+    journal_observed: bool,
+}
+
 /// One node's preemption answer: where to place, and what it costs.
 #[derive(Debug, Clone)]
 struct PreemptionChoice {
@@ -235,6 +246,13 @@ struct PreemptionPass {
     preemptor_band: Band,
     /// Job name of the preemptor, for events and stop notices.
     preemptor_job: String,
+    /// Config id of the job being placed, for the observe-mode event.
+    preemptor_config_id: String,
+    /// Whether observe-mode findings are journalled. False for dry runs
+    /// (`job plan`), which must observe without writing anything — a preview
+    /// that emitted events would make repeatedly previewing a job look like
+    /// repeatedly nearly-preempting one.
+    journal_observed: bool,
     /// Victim metadata by node, loaded lazily for the nodes actually asked
     /// about. `None` until the first preemption attempt in this plan.
     by_node: Option<HashMap<String, Vec<VictimCandidate>>>,
@@ -249,6 +267,9 @@ struct PreemptionPass {
     rejected: preemption::IneligibleTally,
     /// How many placements ran a preemption pass at all.
     considered: usize,
+    /// True when a pass had feasible nodes to consider and every one of them
+    /// was in a pool with preemption disabled.
+    pool_blocked: bool,
     /// False when the pass never ran because the mode or the pool disabled
     /// it — which the "could not place" error should say, since it is the
     /// most likely reason an operator is surprised.
@@ -258,16 +279,25 @@ struct PreemptionPass {
 }
 
 impl PreemptionPass {
-    fn new(preemptor_band: Band, preemptor_job: &str, settings: &PreemptionSettings) -> Self {
+    fn new(
+        preemptor_band: Band,
+        preemptor_job: &str,
+        preemptor_config_id: &str,
+        journal_observed: bool,
+        settings: &PreemptionSettings,
+    ) -> Self {
         Self {
             preemptor_band,
             preemptor_job: preemptor_job.to_string(),
+            preemptor_config_id: preemptor_config_id.to_string(),
+            journal_observed,
             by_node: None,
             victims: Vec::new(),
             observed: Vec::new(),
             taken_by_task: HashMap::new(),
             rejected: preemption::IneligibleTally::default(),
             considered: 0,
+            pool_blocked: false,
             enabled: !matches!(settings.mode, PreemptionMode::Off),
             mode: settings.mode,
         }
@@ -403,10 +433,16 @@ impl PreemptionPass {
                 self.observed.len()
             );
         }
-        if self.considered == 0 {
+        if self.pool_blocked {
             return format!(
                 "{base}. Preemption did not run: every candidate node is in a pool where \
                  preemption is disabled (schedulerSettings.preemption.disabledPools)"
+            );
+        }
+        if self.considered == 0 {
+            return format!(
+                "{base}. Preemption did not run: no node this task is allowed on had any \
+                 allocation to consider"
             );
         }
         if self.rejected.is_empty() {
@@ -925,7 +961,12 @@ impl<'a> Scheduler<'a> {
             snapshot,
             mode,
             None,
-            (&preemptor.0, preemptor.1),
+            PreemptorContext {
+                job: &preemptor.0,
+                band: preemptor.1,
+                // A read-only plan preview writes nothing, events included.
+                journal_observed: false,
+            },
         )?;
         info!(
             %job_config_id,
@@ -1033,7 +1074,11 @@ impl<'a> Scheduler<'a> {
             snapshot,
             mode,
             None,
-            (&job_config.name, job_config.priority),
+            PreemptorContext {
+                job: &job_config.name,
+                band: job_config.priority,
+                journal_observed: false,
+            },
         )?;
         info!(
             job_id = %job_config.name,
@@ -1225,7 +1270,11 @@ impl<'a> Scheduler<'a> {
                 snapshot,
                 mode.clone(),
                 task_targets,
-                (&preemptor_job, preemptor_band),
+                PreemptorContext {
+                    job: &preemptor_job,
+                    band: preemptor_band,
+                    journal_observed: true,
+                },
             )?;
             timings.build_plan_us = build_started.elapsed().as_micros() as u64;
             let indexed_tasks = index_report
@@ -1241,17 +1290,7 @@ impl<'a> Scheduler<'a> {
                 build_plan_ms = build_started.elapsed().as_millis() as u64,
                 "Scheduler build_plan completed"
             );
-            // Observe mode's selection never commits, but it is the evidence
-            // the mode exists to produce, so it is journalled here rather
-            // than dropped.
-            if !observed_preemptions.is_empty() {
-                self.store.record_observed_preemptions(
-                    job_config_id,
-                    &preemptor_job,
-                    preemptor_band,
-                    &observed_preemptions,
-                );
-            }
+            let _ = &observed_preemptions;
             if placements.is_empty() {
                 info!(%job_config_id, "No placements generated during plan_and_apply");
                 timings.total_us = started.elapsed().as_micros() as u64;
@@ -1530,13 +1569,19 @@ impl<'a> Scheduler<'a> {
         capacity: CapacitySnapshot,
         mode: PlanMode,
         task_targets: Option<&HashMap<i64, u32>>,
-        preemptor: (&str, Band),
+        preemptor: PreemptorContext<'_>,
     ) -> R<BuiltPlan> {
         tasks.sort_by_key(|a| a.0);
         // Preemption state for the whole plan: floors bind across placements,
         // and the victim index loads at most once (and only if a placement
         // actually fails for capacity).
-        let mut preemption_pass = PreemptionPass::new(preemptor.1, preemptor.0, &self.preemption);
+        let mut preemption_pass = PreemptionPass::new(
+            preemptor.band,
+            preemptor.job,
+            job_config_id,
+            preemptor.journal_observed,
+            &self.preemption,
+        );
 
         let CapacitySnapshot {
             allocations_by_node,
@@ -2326,7 +2371,9 @@ impl<'a> Scheduler<'a> {
                     task_config,
                     &plan.task_request,
                     resource_ledger,
-                    group_key.and_then(|key| group_assignments.get(key)).cloned(),
+                    group_key
+                        .and_then(|key| group_assignments.get(key))
+                        .cloned(),
                     pins.front().map(|(_, node_id)| node_id.clone()),
                     preemption,
                 )? {
@@ -2345,8 +2392,9 @@ impl<'a> Scheduler<'a> {
                         resource_ledger,
                         &plan.task_request,
                     );
-                    preemption.victims.extend(chosen.victims.iter().map(|victim| {
-                        PlannedPreemption {
+                    preemption
+                        .victims
+                        .extend(chosen.victims.iter().map(|victim| PlannedPreemption {
                             allocation_id: victim.allocation_id,
                             node_id: victim.node_id.clone(),
                             job_id: victim.job_id.clone(),
@@ -2355,8 +2403,7 @@ impl<'a> Scheduler<'a> {
                             task_name: victim.task_name.clone(),
                             band: victim.band,
                             kill_after_secs: victim.kill_after_secs,
-                        }
-                    }));
+                        }));
                     eligible = full_but_allowed
                         .iter()
                         .copied()
@@ -2677,12 +2724,23 @@ impl<'a> Scheduler<'a> {
                         .map(|pinned| pinned == node.id)
                         .unwrap_or(true)
             })
+            .collect();
+        let before_pool_filter = candidates.len();
+        let candidates: Vec<&Node> = candidates
+            .into_iter()
             .filter(|node| self.preemption.enabled_for_pool(&node.pool))
             .collect();
         if candidates.is_empty() {
+            // Distinguish "there was nowhere to look" from "every place to
+            // look is exempt": only the second is a config an operator can
+            // change, and only the second should be blamed in the error.
+            pass.pool_blocked = before_pool_filter > 0;
             return Ok(None);
         }
 
+        // The pass ran. Whether it found anything is a separate question,
+        // answered by the tally.
+        pass.considered += 1;
         pass.load_candidates(self.store, &self.store.resource_policy, &candidates)?;
 
         let mut best: Option<(PreemptionChoice, (usize, u32))> = None;
@@ -2760,20 +2818,20 @@ impl<'a> Scheduler<'a> {
             }
         }
 
-        pass.considered += 1;
         if matches!(self.preemption.mode, PreemptionMode::Observe) {
             // Same selection, no commitment. The placement fails exactly as
             // it does with preemption off; the operator gets the evidence.
-            pass.observed.extend(choice.victims.iter().map(|victim| PlannedPreemption {
-                allocation_id: victim.allocation_id,
-                node_id: victim.node_id.clone(),
-                job_id: victim.job_id.clone(),
-                job_config_id: victim.job_config_id.clone(),
-                task_config_id: victim.task_config_id,
-                task_name: victim.task_name.clone(),
-                band: victim.band,
-                kill_after_secs: victim.kill_after_secs,
-            }));
+            pass.observed
+                .extend(choice.victims.iter().map(|victim| PlannedPreemption {
+                    allocation_id: victim.allocation_id,
+                    node_id: victim.node_id.clone(),
+                    job_id: victim.job_id.clone(),
+                    job_config_id: victim.job_config_id.clone(),
+                    task_config_id: victim.task_config_id,
+                    task_name: victim.task_name.clone(),
+                    band: victim.band,
+                    kill_after_secs: victim.kill_after_secs,
+                }));
             info!(
                 task = %task_config.name,
                 preemptor_job = %pass.preemptor_job,
@@ -2781,6 +2839,19 @@ impl<'a> Scheduler<'a> {
                 victims = choice.victims.len(),
                 "Preemption would place this task (observe mode); evicting nothing"
             );
+            // Journalled HERE rather than after the plan returns, because
+            // observe mode's whole point is that the placement then fails:
+            // the plan never reaches its caller, so an event emitted on the
+            // way out would never be written.
+            if pass.journal_observed {
+                let observed = pass.observed.clone();
+                self.store.record_observed_preemptions(
+                    &pass.preemptor_config_id,
+                    &pass.preemptor_job,
+                    pass.preemptor_band,
+                    &observed,
+                );
+            }
             return Ok(None);
         }
         Ok(Some(choice))
@@ -6705,6 +6776,382 @@ mod tests {
         assert_eq!(outcome.allocations.len(), 1);
         assert_eq!(outcome.allocations[0].node_id, "node-d");
 
+        Ok(())
+    }
+
+    //
+    // PREEMPTION (docs/preemption-and-eviction.md)
+    //
+
+    /// A node with exactly 512 MiB and one CPU: small enough that two
+    /// 256 MiB tasks fill it, which is what makes contention easy to stage.
+    fn small_node(store: &Store, id: &str) -> R<()> {
+        store.insert_node(make_node_msg_with_sources(
+            id,
+            json!({}),
+            json!({
+                "memory_total": "536870912",
+                "cpus": { "cpu-1": { "frequency": "1000" } }
+            }),
+            json!({}),
+        ))?;
+        Ok(())
+    }
+
+    /// Submit a banded job with `count` 256 MiB tasks and place it.
+    fn submit_banded(
+        store: &Store,
+        name: &str,
+        band: Band,
+        count: u32,
+        disruption: Option<crate::structs::DisruptionConfig>,
+    ) -> R<String> {
+        let job = JobConfig {
+            priority: band,
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: name.into(),
+            tasks: vec![TaskConfig {
+                count: TaskCount::new(count),
+                resources: json!({ "memory": 256 }),
+                disruption,
+                ..TaskConfig::new("worker", "noop")
+            }],
+            version: None,
+        };
+        store.handle_job_submit(&job, &[dummy_submission()])?;
+        Ok(store.get_job_config(name)?.id())
+    }
+
+    /// Backdate every allocation past `victimExemptAge`, so tests exercise
+    /// victim SELECTION rather than the thrash guard. The guard has its own
+    /// test below.
+    fn age_allocations(store: &Store) -> R<()> {
+        let conn = store.write_connection()?;
+        conn.execute(
+            "UPDATE allocation SET created_at_unix = created_at_unix - 3600;",
+            [],
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_higher_band_job_displaces_a_lower_band_one_when_the_cluster_is_full() -> R<()> {
+        let store = setup_store()?;
+        small_node(&store, "node-a")?;
+        let scheduler = Scheduler::new(&store)?;
+
+        // Fill the node with batch work.
+        let batch = submit_banded(&store, "transcode", Band::Low, 2, None)?;
+        let placed = scheduler.plan_and_apply(&batch, PlanMode::Fresh)?;
+        assert_eq!(placed.allocations.len(), 2, "the node starts full");
+        age_allocations(&store)?;
+
+        // The incident: a `high` job needs one slot and there is none.
+        let api = submit_banded(&store, "api", Band::High, 1, None)?;
+        let outcome = scheduler.plan_and_apply(&api, PlanMode::Fresh)?;
+
+        assert_eq!(outcome.allocations.len(), 1, "the preemptor places");
+        assert_eq!(
+            outcome.evictions.len(),
+            1,
+            "and takes exactly the one victim it needs, not both"
+        );
+        assert_eq!(outcome.evictions[0].band, "low");
+        assert_eq!(outcome.evictions[0].job_id, "transcode");
+
+        // The victim is really gone, and the placement really landed.
+        let live = store.allocs_for_node("node-a")?;
+        assert_eq!(live.len(), 2, "the node is still exactly full");
+        assert_eq!(
+            live.iter().filter(|a| a.job_id == "api").count(),
+            1,
+            "the preemptor is running"
+        );
+        assert_eq!(
+            live.iter().filter(|a| a.job_id == "transcode").count(),
+            1,
+            "one transcode allocation survived"
+        );
+
+        // The victim's stop notice names its cause and its preemptor, so the
+        // worker can hand the task a notice file it can act on.
+        let notices = store.stop_notices_for_node("node-a")?;
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0].cause, crate::structs::StopCause::Preempted);
+        assert_eq!(notices[0].preemptor_job, "api");
+        assert_eq!(notices[0].preemptor_band, "high");
+        Ok(())
+    }
+
+    #[test]
+    fn a_preempted_job_is_requeued_in_the_same_transaction() -> R<()> {
+        let store = setup_store()?;
+        small_node(&store, "node-a")?;
+        let scheduler = Scheduler::new(&store)?;
+        let batch = submit_banded(&store, "transcode", Band::Background, 2, None)?;
+        scheduler.plan_and_apply(&batch, PlanMode::Fresh)?;
+        age_allocations(&store)?;
+        let api = submit_banded(&store, "api", Band::Normal, 1, None)?;
+
+        let before = store.get_evals()?.len();
+        scheduler.plan_and_apply(&api, PlanMode::Fresh)?;
+
+        // Nothing has to REMEMBER the eviction for the victim to come back:
+        // the requeue eval rides the apply transaction and reschedule is
+        // driven by desired count. That is why the Nomad #9890 class of bug
+        // (preempted batch allocations never replaced) cannot exist here.
+        let evals = store.get_evals()?;
+        assert!(evals.len() > before, "the victim's job was requeued");
+        let requeue = evals
+            .iter()
+            .find(|eval| eval.kind == "job_reschedule" && eval.job_config_id == batch)
+            .expect("a job_reschedule eval for the victim job config");
+        assert_eq!(
+            requeue.priority,
+            Band::Background.eval_priority(),
+            "the victim requeues at its OWN band, so it cannot jump ahead of \
+             the work that displaced it"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn preemption_never_takes_a_peer_or_a_more_important_job() -> R<()> {
+        let store = setup_store()?;
+        small_node(&store, "node-a")?;
+        let scheduler = Scheduler::new(&store)?;
+        // The node is full of `high` work, and the newcomer is also `high`.
+        let incumbent = submit_banded(&store, "incumbent", Band::High, 2, None)?;
+        scheduler.plan_and_apply(&incumbent, PlanMode::Fresh)?;
+        age_allocations(&store)?;
+
+        let peer = submit_banded(&store, "peer", Band::High, 1, None)?;
+        let err = scheduler
+            .plan_and_apply(&peer, PlanMode::Fresh)
+            .expect_err("a peer must not be displaced");
+        assert!(
+            err.to_string().contains("same band or higher"),
+            "the error explains itself in band terms: {err}"
+        );
+        assert_eq!(
+            store.allocs_for_node("node-a")?.len(),
+            2,
+            "nothing was evicted"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_freshly_placed_allocation_is_exempt_from_preemption() -> R<()> {
+        let store = setup_store()?;
+        small_node(&store, "node-a")?;
+        let scheduler = Scheduler::new(&store)?;
+        let batch = submit_banded(&store, "transcode", Band::Low, 2, None)?;
+        scheduler.plan_and_apply(&batch, PlanMode::Fresh)?;
+        // Deliberately NOT aged: these allocations are seconds old.
+
+        let api = submit_banded(&store, "api", Band::Critical, 1, None)?;
+        let err = scheduler
+            .plan_and_apply(&api, PlanMode::Fresh)
+            .expect_err("victimExemptAge must hold even against `critical`");
+        assert!(
+            err.to_string().contains("victimExemptAge"),
+            "the error names the guard that bound: {err}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn the_disruption_floor_stops_a_task_being_wiped_out() -> R<()> {
+        let store = setup_store()?;
+        small_node(&store, "node-a")?;
+        let scheduler = Scheduler::new(&store)?;
+        // Two allocations, floor of 50% -> at most one may ever be taken.
+        let tool = submit_banded(
+            &store,
+            "internal-tool",
+            Band::Low,
+            2,
+            Some(crate::structs::DisruptionConfig {
+                min_available: Some(json!("50%")),
+            }),
+        )?;
+        scheduler.plan_and_apply(&tool, PlanMode::Fresh)?;
+        age_allocations(&store)?;
+
+        // One slot is available by eviction; two are not.
+        let api = submit_banded(&store, "api", Band::High, 2, None)?;
+        let err = scheduler
+            .plan_and_apply(&api, PlanMode::Fresh)
+            .expect_err("the floor must bind the second placement");
+        assert!(
+            err.to_string().contains("disruption.minAvailable"),
+            "the error names the floor: {err}"
+        );
+
+        // And the floor is a HARD rule, not a score: nothing was evicted at
+        // all, because the plan that would have crossed it failed whole.
+        assert_eq!(store.allocs_for_node("node-a")?.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn observe_mode_selects_victims_and_evicts_nothing() -> R<()> {
+        let store = setup_store_with_scheduler(
+            "bin_pack",
+            Some(json!({ "preemption": { "mode": "observe" } })),
+        )?;
+        small_node(&store, "node-a")?;
+        let scheduler = Scheduler::new(&store)?;
+        let batch = submit_banded(&store, "transcode", Band::Low, 2, None)?;
+        scheduler.plan_and_apply(&batch, PlanMode::Fresh)?;
+        age_allocations(&store)?;
+
+        let api = submit_banded(&store, "api", Band::High, 1, None)?;
+        let err = scheduler
+            .plan_and_apply(&api, PlanMode::Fresh)
+            .expect_err("observe mode commits nothing, so the placement fails");
+        assert!(
+            err.to_string().contains("observe mode"),
+            "the error says why it did not act: {err}"
+        );
+        assert_eq!(
+            store.allocs_for_node("node-a")?.len(),
+            2,
+            "observe mode evicted nothing"
+        );
+        // The evidence an operator turns enforce on for.
+        let events =
+            store.list_scheduler_events(&crate::storage::events::SchedulerEventFilter {
+                kind: Some("allocation.preempt_planned".into()),
+                ..Default::default()
+            })?;
+        assert!(
+            !events.is_empty(),
+            "observe mode journals what it would have done"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn preemption_off_leaves_placement_exactly_as_it_was() -> R<()> {
+        let store = setup_store_with_scheduler(
+            "bin_pack",
+            Some(json!({ "preemption": { "mode": "off" } })),
+        )?;
+        small_node(&store, "node-a")?;
+        let scheduler = Scheduler::new(&store)?;
+        let batch = submit_banded(&store, "transcode", Band::Low, 2, None)?;
+        scheduler.plan_and_apply(&batch, PlanMode::Fresh)?;
+        age_allocations(&store)?;
+
+        let api = submit_banded(&store, "api", Band::High, 1, None)?;
+        let err = scheduler
+            .plan_and_apply(&api, PlanMode::Fresh)
+            .expect_err("with preemption off, a full cluster is first-come-first-kept");
+        assert!(
+            err.to_string().contains("Preemption is off"),
+            "the error tells the operator which switch is responsible: {err}"
+        );
+        assert_eq!(store.allocs_for_node("node-a")?.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn a_disabled_pool_is_never_preempted() -> R<()> {
+        let store = setup_store_with_scheduler(
+            "bin_pack",
+            Some(json!({ "preemption": { "disabledPools": ["default"] } })),
+        )?;
+        small_node(&store, "node-a")?;
+        let scheduler = Scheduler::new(&store)?;
+        let batch = submit_banded(&store, "transcode", Band::Background, 2, None)?;
+        scheduler.plan_and_apply(&batch, PlanMode::Fresh)?;
+        age_allocations(&store)?;
+
+        let api = submit_banded(&store, "api", Band::Critical, 1, None)?;
+        let err = scheduler
+            .plan_and_apply(&api, PlanMode::Fresh)
+            .expect_err("a pool-level exemption outranks any band");
+        assert!(
+            err.to_string().contains("disabledPools"),
+            "the error names the exemption: {err}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn the_lowest_band_can_never_preempt_anything() -> R<()> {
+        let store = setup_store()?;
+        small_node(&store, "node-a")?;
+        let scheduler = Scheduler::new(&store)?;
+        let incumbent = submit_banded(&store, "incumbent", Band::Background, 2, None)?;
+        scheduler.plan_and_apply(&incumbent, PlanMode::Fresh)?;
+        age_allocations(&store)?;
+
+        let filler = submit_banded(&store, "filler", Band::Background, 1, None)?;
+        let err = scheduler
+            .plan_and_apply(&filler, PlanMode::Fresh)
+            .expect_err("background is the floor");
+        assert!(
+            err.to_string().contains("lowest priority band"),
+            "the error says the band itself is the reason: {err}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_plan_that_never_preempts_carries_no_evictions() -> R<()> {
+        // The regression guard for "preemption costs nothing when unused":
+        // the pass runs only after normal feasibility fails, so an ordinary
+        // plan against an empty cluster must not even reach it.
+        let store = setup_store()?;
+        insert_test_nodes(&store)?;
+        let scheduler = Scheduler::new(&store)?;
+        let job = submit_banded(&store, "api", Band::Critical, 2, None)?;
+        let outcome = scheduler.plan_and_apply(&job, PlanMode::Fresh)?;
+        assert_eq!(outcome.allocations.len(), 2);
+        assert!(
+            outcome.evictions.is_empty(),
+            "an unconstrained plan preempts nothing, whatever its band"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn job_plan_previews_the_victims_a_submit_would_take() -> R<()> {
+        let store = setup_store()?;
+        small_node(&store, "node-a")?;
+        let scheduler = Scheduler::new(&store)?;
+        let batch = submit_banded(&store, "transcode", Band::Low, 2, None)?;
+        scheduler.plan_and_apply(&batch, PlanMode::Fresh)?;
+        age_allocations(&store)?;
+
+        // A dry run of a job that has not been submitted at all.
+        let candidate = JobConfig {
+            priority: Band::High,
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "api".into(),
+            tasks: vec![TaskConfig {
+                count: TaskCount::new(1),
+                resources: json!({ "memory": 256 }),
+                ..TaskConfig::new("worker", "noop")
+            }],
+            version: None,
+        };
+        let preview = scheduler.plan_for_config(&candidate, PlanMode::Fresh, None)?;
+        assert_eq!(preview.allocations.len(), 1);
+        assert_eq!(preview.preemptions.len(), 1, "the preview names the victim");
+        assert_eq!(preview.preemptions[0].job_id, "transcode");
+        assert_eq!(preview.preemptions[0].band, Band::Low);
+        assert_eq!(
+            preview.preemptions[0].kill_after_secs, 30,
+            "and how long it would have to shut down"
+        );
+        // A dry run must not touch anything.
+        assert_eq!(store.allocs_for_node("node-a")?.len(), 2);
         Ok(())
     }
 }

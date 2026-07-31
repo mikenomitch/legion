@@ -20,6 +20,29 @@
   // telemetry: { enabled: true, port: 4749 },
   schedulerSettings: {
     plan_conflict_max_retries: 3,
+    // Preemption (docs/preemption-and-eviction.md). When a job cannot place
+    // and its priority band outranks work that can be displaced, the planner
+    // evicts the minimum set of lower-band allocations and places in the same
+    // transaction. Everything here matches the built-in defaults.
+    //
+    // preemption: {
+    //   // enforce (default) | observe | off.
+    //   //   enforce — evict and place, atomically.
+    //   //   observe — run the identical victim selection, emit
+    //   //             `allocation.preempt_planned`, evict nothing. The
+    //   //             cautious-adoption posture: evidence before action.
+    //   //   off     — never run the pass; bands only order the eval queue.
+    //   // Default is `enforce` because the band choice IS the consent:
+    //   // nothing is a victim unless its author put it below the preemptor.
+    //   mode: "enforce",
+    //   // Pools where preemption never runs, whatever the bands say — for
+    //   // pools whose jobs each hold hours of un-checkpointed state.
+    //   disabledPools: ["gpu"],
+    //   // Minimum age before an allocation may be preempted. The cheapest
+    //   // thrash guard there is: without it a plan can undo the placement a
+    //   // previous plan made seconds earlier.
+    //   victimExemptAge: "60s",
+    // },
     // Plan-path scale levers (docs/scheduler-and-eval-loop.md). Both are on
     // by default; the flags exist as escape hatches.
     // lazy_version_sample: true,   // false = eager O(fleet) epoch sample per plan

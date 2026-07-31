@@ -1271,7 +1271,9 @@ fn default_kill_after() -> Duration {
 /// Signals a task may ask for as its stop notice. Restricted to the portable
 /// termination signals: `stop.signal` exists so a task can be told to shut
 /// down, not as a general signal-delivery API.
-pub const STOP_SIGNALS: &[&str] = &["SIGTERM", "SIGINT", "SIGQUIT", "SIGHUP", "SIGUSR1", "SIGUSR2"];
+pub const STOP_SIGNALS: &[&str] = &[
+    "SIGTERM", "SIGINT", "SIGQUIT", "SIGHUP", "SIGUSR1", "SIGUSR2",
+];
 
 /// How this task is stopped, whoever initiates it — `job stop`, a rollout
 /// replacement, a drain, a reschedule, a scale-in, or preemption. One ladder
@@ -1370,11 +1372,13 @@ impl DisruptionConfig {
         match self.min_available.as_ref() {
             None => Ok(()),
             Some(Value::Number(number)) => {
-                let value = number
-                    .as_f64()
-                    .ok_or_else(|| anyhow!("disruption.minAvailable must be a number or percent string"))?;
+                let value = number.as_f64().ok_or_else(|| {
+                    anyhow!("disruption.minAvailable must be a number or percent string")
+                })?;
                 if value < 0.0 || value.fract() != 0.0 {
-                    bail!("task {task} disruption.minAvailable must be a non-negative whole number");
+                    bail!(
+                        "task {task} disruption.minAvailable must be a non-negative whole number"
+                    );
                 }
                 Ok(())
             }

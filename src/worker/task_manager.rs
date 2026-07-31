@@ -996,7 +996,13 @@ impl WorkerTaskManager {
 
         // No notice was delivered (a runtime with no graceful path, no
         // tracked process, or a failed signal): tear down immediately.
-        self.destroy_and_finish(allocation_id, &allocation, &task, &mut instance, remove_dirs);
+        self.destroy_and_finish(
+            allocation_id,
+            &allocation,
+            &task,
+            &mut instance,
+            remove_dirs,
+        );
         Ok(())
     }
 

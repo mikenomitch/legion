@@ -13,8 +13,8 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use crate::artifacts::status::{ArtifactState, ArtifactStatus};
-use crate::storage::store::{JobSubmitOutcome, Store};
 use crate::manager::scheduler::PlannedPreemption;
+use crate::storage::store::{JobSubmitOutcome, Store};
 use crate::structs::{Allocation, Band, Eval, Node, StopCause};
 
 /// Severity levels used by scheduler events.

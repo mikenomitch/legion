@@ -3273,15 +3273,8 @@ impl Manager for ManagerDaemonService {
             .map(|existing| artifact_pin_diffs(existing, &config))
             .unwrap_or_default();
 
-        let (
-            plan,
-            task_lookup,
-            index_report,
-            preemptions,
-            message,
-            matches_existing,
-            same_content,
-        ) = match existing_config {
+        let (plan, task_lookup, index_report, preemptions, message, matches_existing, same_content) =
+            match existing_config {
                 Some(existing) if existing.is_same_as(&config) => {
                     let (plan, index_report, preemptions) = scheduler
                         .plan_only_with_report(&existing.id(), PlanMode::Fresh)

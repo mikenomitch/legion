@@ -34,7 +34,9 @@ use std::fmt;
 /// value. Never compare bands with `<`/`>` directly — use [`Band::rank`],
 /// where a larger number means more important, or the intent-named
 /// [`Band::outranks`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, Default,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum Band {
     /// Cluster-critical work: the control plane's own jobs, incident-response
@@ -195,7 +197,10 @@ mod band_test {
     fn an_unknown_band_is_an_error_not_a_silent_normal() {
         let err = Band::parse("urgent").expect_err("unknown band should not parse");
         assert!(err.contains("urgent"), "{err}");
-        assert!(err.contains("critical"), "message lists the vocabulary: {err}");
+        assert!(
+            err.contains("critical"),
+            "message lists the vocabulary: {err}"
+        );
         // The read path is the one place it degrades instead.
         assert_eq!(Band::from_stored("urgent"), Band::Normal);
     }

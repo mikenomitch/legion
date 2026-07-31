@@ -50,14 +50,53 @@ Lifecycle hooks:
 - `destroy()`
 
 The worker calls `stop_with(allocation, task, instance, ctx)`, where `ctx` is
-a `StopContext` carrying the [stop cause](graceful-stop.md) — why the platform
-is stopping this allocation. Its default implementation delegates to `stop()`,
-so a runtime that does not care about the cause implements only `stop()`, and
-**plugins compiled against the trait before `stop_with` existed keep working
-unchanged**. No in-tree runtime overrides it today: the cause is delivered and
-logged, but termination is still immediate for every runtime. `StopContext` is
-`#[non_exhaustive]` because it gains a signal and a deadline when graceful
-termination ships.
+a `StopContext` carrying the [stop cause](graceful-stop.md), the signal to
+deliver, and the deadline after which the allocation is killed.
+
+`stop_with` is the **notice**, not the kill. Deliver `ctx.signal` and return
+promptly, reporting whether a notice actually went out:
+
+- `Ok(true)` — a notice was delivered and the process is still running. The
+  worker holds the allocation in its terminating set and calls `destroy()`
+  when the process exits or the deadline passes, whichever comes first.
+- `Ok(false)` — this runtime could not signal (no tracked process, no
+  graceful path). The worker tears the allocation down immediately, exactly
+  as it did before graceful stop existed.
+
+**Never block for the grace window.** `stop_with` runs under the worker's
+task-manager mutex, which the heartbeat, the self-fence watchdog, health
+reporting and log maintenance all need; holding it for 30 seconds would let
+the manager declare the node lost and reschedule everything on it.
+
+The default implementation signals the tracked host process group, which is
+right for any runtime whose model is "one process we spawned". Override it
+when your runtime has its own shutdown protocol (the `container` runtime
+signals the container's init; the `sandbox` runtime declines the notice
+outright, because there is no in-guest agent to relay it to).
+
+`StopContext` is `#[non_exhaustive]`, so it can gain fields without breaking
+call sites.
+
+### Plugin ABI version (required)
+
+`plugins/tasks/` is loaded through a bare `extern "C" fn() -> Box<dyn
+TaskPlugin>`, which carries no type information: a dylib built against an
+older trait layout would load happily and then call the wrong vtable slots.
+Every task plugin must therefore declare which ABI generation it was built
+against, beside its `get` constructor:
+
+```rust
+legion::declare_task_plugin_abi!();
+
+#[no_mangle]
+pub extern "C" fn get() -> Box<dyn TaskPlugin> { Box::new(MyPlugin) }
+```
+
+A plugin that declares nothing, or a mismatched generation, is **refused at
+load** with a message naming the rebuild — rather than silently corrupting.
+The current generation is `2` (graceful stop: `stop_with` returns `R<bool>`
+and `StopContext` carries a signal and a deadline). Generation `1` was the
+trait as of stop causes.
 
 Capability declarations (each has a default, so an existing plugin keeps
 compiling):

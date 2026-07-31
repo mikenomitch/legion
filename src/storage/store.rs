@@ -31,12 +31,11 @@ use crate::storage::queries::{
 };
 use crate::structs::{
     slot_instance_id, Allocation, AllocationHealth, Band, Eval, Instance, InstanceMode,
-    InstanceState,
-    Job, JobConfig, JobTemplateProvenance, KvEntry, KvLock, KvValueType, LedgerEntry,
-    ManagerConfigFull, ManagerNodeConfig, Node, NodeMsg, ReplaceAfter, ResolvedOnLostPolicy,
-    Rollout, RolloutConfig, SigningKeyRecord, StatefulConfig, StatefulOnLostConfig, StopCause,
-    Submission, TaskCheck, TaskConfig, TaskCount, TaskDependency, TaskLifecycle,
-    TaskOnUnhealthyConfig, TaskSchedule, TaskStatusState, Volume, WorkerConfig,
+    InstanceState, Job, JobConfig, JobTemplateProvenance, KvEntry, KvLock, KvValueType,
+    LedgerEntry, ManagerConfigFull, ManagerNodeConfig, Node, NodeMsg, ReplaceAfter,
+    ResolvedOnLostPolicy, Rollout, RolloutConfig, SigningKeyRecord, StatefulConfig,
+    StatefulOnLostConfig, StopCause, Submission, TaskCheck, TaskConfig, TaskCount, TaskDependency,
+    TaskLifecycle, TaskOnUnhealthyConfig, TaskSchedule, TaskStatusState, Volume, WorkerConfig,
 };
 use crate::util::random_string;
 
@@ -2125,10 +2124,7 @@ impl Store {
     /// The band, the `disruption` floor and `stop.killAfter` come from
     /// config rows rather than from the plan's in-memory snapshot, which
     /// carries only [`Allocation`]s.
-    pub fn preemption_victim_metadata(
-        &self,
-        node_ids: &[&str],
-    ) -> R<Vec<PreemptionVictimRow>> {
+    pub fn preemption_victim_metadata(&self, node_ids: &[&str]) -> R<Vec<PreemptionVictimRow>> {
         if node_ids.is_empty() {
             return Ok(Vec::new());
         }
@@ -2150,23 +2146,24 @@ impl Store {
         );
         let conn = self.read_connection()?;
         let mut stmt = conn.prepare(&sql)?;
-        let rows = Self::collect_rows(stmt.query_map(params_from_iter(node_ids.iter()), |row| {
-            Ok(PreemptionVictimRow {
-                allocation_id: row.get(0)?,
-                node_id: row.get(1)?,
-                job_config_id: row.get(2)?,
-                task_config_id: row.get(3)?,
-                created_at_unix: row.get(4)?,
-                resources: row.get(5)?,
-                task_name: row.get(6)?,
-                job_id: row.get(7)?,
-                task_count: row.get::<_, i64>(8)? as u32,
-                disruption_json: row.get(9)?,
-                stop_json: row.get(10)?,
-                band: Band::from_stored(&row.get::<_, String>(11)?),
-                node_pinned: row.get::<_, i64>(12)? != 0,
-            })
-        })?)?;
+        let rows =
+            Self::collect_rows(stmt.query_map(params_from_iter(node_ids.iter()), |row| {
+                Ok(PreemptionVictimRow {
+                    allocation_id: row.get(0)?,
+                    node_id: row.get(1)?,
+                    job_config_id: row.get(2)?,
+                    task_config_id: row.get(3)?,
+                    created_at_unix: row.get(4)?,
+                    resources: row.get(5)?,
+                    task_name: row.get(6)?,
+                    job_id: row.get(7)?,
+                    task_count: row.get::<_, i64>(8)? as u32,
+                    disruption_json: row.get(9)?,
+                    stop_json: row.get(10)?,
+                    band: Band::from_stored(&row.get::<_, String>(11)?),
+                    node_pinned: row.get::<_, i64>(12)? != 0,
+                })
+            })?)?;
         Ok(rows)
     }
 
@@ -3048,7 +3045,6 @@ impl Store {
         Ok(PlanApplyOutcome::Applied(allocations))
     }
 
-
     /// Commit a plan's evictions: delete the victims, release their
     /// instances, bump their epochs, record their stop notices, requeue their
     /// jobs, and stage the events — all inside the caller's transaction.
@@ -3083,7 +3079,10 @@ impl Store {
         // destroyed by another path. Evicting what is already gone is a
         // no-op, and the placement that "paid" for it still has the capacity,
         // because the row it needed freed is gone either way.
-        let ids: Vec<i64> = evictions.iter().map(|victim| victim.allocation_id).collect();
+        let ids: Vec<i64> = evictions
+            .iter()
+            .map(|victim| victim.allocation_id)
+            .collect();
         let placeholders = std::iter::repeat_n("?", ids.len())
             .collect::<Vec<_>>()
             .join(",");
@@ -3094,11 +3093,9 @@ impl Store {
              WHERE allocation.id IN ({placeholders});"
         );
         let mut stmt = tx.prepare(&sql)?;
-        let victims = Self::collect_rows(
-            stmt.query_map(params_from_iter(ids.iter()), |row| {
-                self.allocation_from_row(row)
-            })?,
-        )?;
+        let victims = Self::collect_rows(stmt.query_map(params_from_iter(ids.iter()), |row| {
+            self.allocation_from_row(row)
+        })?)?;
         drop(stmt);
         if victims.is_empty() {
             return Ok(AppliedEvictions::default());
@@ -3175,13 +3172,9 @@ impl Store {
                 .find(|eviction| eviction.job_config_id == job_config_id)
                 .map(|eviction| Band::from_stored(&eviction.band))
                 .unwrap_or_default();
-            if let Some(event) = drafts::allocations_preempted(
-                &group,
-                band,
-                &preemptor_job,
-                preemptor_band,
-            )
-            .and_then(|draft| self.stage_event_locked(tx, draft))
+            if let Some(event) =
+                drafts::allocations_preempted(&group, band, &preemptor_job, preemptor_band)
+                    .and_then(|draft| self.stage_event_locked(tx, draft))
             {
                 events.push(event);
             }
@@ -3300,12 +3293,9 @@ impl Store {
         crate::manager::telemetry::metrics()
             .preemption_plans_total
             .inc(&["observe"]);
-        if let Some(draft) = drafts::preemption_planned(
-            job_config_id,
-            preemptor_job,
-            preemptor_band,
-            victims,
-        ) {
+        if let Some(draft) =
+            drafts::preemption_planned(job_config_id, preemptor_job, preemptor_band, victims)
+        {
             self.emit_event(draft);
         }
     }
@@ -8382,11 +8372,10 @@ impl Store {
             .join(",");
         let sql = format!("SELECT id, stop FROM task_config WHERE id IN ({placeholders});");
         let mut stmt = tx.prepare(&sql)?;
-        let rows = Self::collect_rows(
-            stmt.query_map(params_from_iter(task_ids.iter()), |row| {
+        let rows =
+            Self::collect_rows(stmt.query_map(params_from_iter(task_ids.iter()), |row| {
                 Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?))
-            })?,
-        )?;
+            })?)?;
         Ok(rows
             .into_iter()
             .map(|(id, raw)| {

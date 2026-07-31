@@ -193,11 +193,7 @@ impl StopContext {
 
     /// A context carrying an explicit ladder, as the worker builds it from
     /// the task's `stop` block.
-    pub fn with_ladder(
-        cause: StopCause,
-        signal: &str,
-        grace: std::time::Duration,
-    ) -> Self {
+    pub fn with_ladder(cause: StopCause, signal: &str, grace: std::time::Duration) -> Self {
         Self {
             cause,
             signal: signal.to_string(),
