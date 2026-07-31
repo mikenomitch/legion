@@ -1593,7 +1593,7 @@ impl Store {
 
         let mut task_stmt = conn.prepare(
             r#"
-            SELECT id, name, runtime, count, count_per, group_name, lifecycle, schedule, depends_on, config, resources, constraints, permit, affinities, checks, on_unhealthy, kv_injections, job_config_id, identities, stateful, artifacts, network, service, actions, volumes, connect, restart
+            SELECT id, name, runtime, count, count_per, group_name, lifecycle, schedule, depends_on, config, resources, constraints, permit, affinities, checks, on_unhealthy, kv_injections, job_config_id, identities, stateful, artifacts, network, service, actions, volumes, connect, restart, stop_signal, stop_grace_period
             FROM task_config;
             "#,
         )?;
@@ -1633,6 +1633,8 @@ impl Store {
                 volumes: self.parse_volumes_column(24, row.get(24)?)?,
                 connect: parse_json_column(25, row.get(25)?)?,
                 restart: parse_json_column(26, row.get(26)?)?,
+                stop_signal: row.get(27)?,
+                stop_grace_period: row.get(28)?,
             };
             let job_config_id: String = row.get(17)?;
             Ok((job_config_id, id, task))
@@ -3336,6 +3338,8 @@ impl Store {
             volumes: self.parse_volumes_column(25, row.get(25)?)?,
             connect: parse_json_column(26, row.get(26)?)?,
             restart: parse_json_column(27, row.get(27)?)?,
+            stop_signal: row.get(28)?,
+            stop_grace_period: row.get(29)?,
         };
 
         Ok(task_config)
@@ -5697,6 +5701,8 @@ impl Store {
                 ":volumes": volumes,
                 ":connect": connect,
                 ":restart": restart,
+                ":stop_signal": t.stop_signal,
+                ":stop_grace_period": t.stop_grace_period,
             };
 
             let task_id: i64 = tx.query_row(&INSERT_TASK, task_params, |row| row.get(0))?;

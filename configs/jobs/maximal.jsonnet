@@ -559,10 +559,28 @@
                     LEGION_TASK: "container",
                 },
             },
+            // Graceful teardown, declared per task (see
+            // docs/task-supervision.md "Graceful stop"). Both fields are
+            // runtime-independent and live at task level next to `resources`.
+            //
+            // stopSignal: what Legion delivers when it stops the task.
+            // Defaults to SIGTERM. On the Linux container path the chain is
+            // jobspec -> the image's own STOPSIGNAL -> SIGTERM. Vocabulary:
+            // SIGTERM, SIGINT, SIGQUIT, SIGHUP, SIGUSR1, SIGUSR2, SIGCONT,
+            // SIGWINCH.
+            stopSignal: "SIGINT",
+            // stopGracePeriod: how long the workload gets between that signal
+            // and the hard kill. Defaults to "10s"; capped at "5m" at
+            // admission so a wedged task cannot hold a drain open forever.
+            stopGracePeriod: "30s",
             resources: {
-                // The container runtime applies these to the sandbox, not just to
-                // scheduling: memory (MiB) and cores size the guest. `cpu`/`cpus`
-                // (MHz) has no runtime analogue, so declare cores here.
+                // Real limits on Linux when the worker runs with
+                // `resourceEnforcement.enabled` (see docs/resource-enforcement.md):
+                // memory (MiB) becomes a hard cgroup limit, `cores` becomes
+                // *exclusive pinned CPUs* (whole numbers only), and `cpu`
+                // (MHz) becomes a proportional cpu.weight. A task declares
+                // `cores` OR `cpu`, never both. On macOS the same two fields
+                // size the Apple `container` guest VM instead.
                 cores: 1,
                 memory: 256,
             },

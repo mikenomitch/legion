@@ -4516,6 +4516,28 @@ message TaskAllocation {
   //
   // Empty string when the task declares no resources.
   string task_resources = 16;
+
+  // Signal Legion delivers when it stops this allocation, canonical spelling
+  // (`SIGTERM`, `SIGINT`, `SIGHUP`, `SIGQUIT`, `SIGUSR1`, `SIGUSR2`,
+  // `SIGCONT`, `SIGWINCH`) — the task's `stopSignal`, validated at admission.
+  //
+  // Empty string when the task declares none, which means "the runtime's own
+  // default chain": the `container` runtime on Linux then honors the image's
+  // `StopSignal` before falling back to `SIGTERM`, and every other runtime
+  // uses `SIGTERM` directly. Runtimes with nothing to signal (`noop`) ignore
+  // the field entirely.
+  string task_stop_signal = 18;
+
+  // How long the workload gets between `task_stop_signal` and the hard kill,
+  // in seconds — the task's `stopGracePeriod`, validated positive and capped
+  // at 300s (5m) at admission.
+  //
+  // 0 = the task declared none; the worker applies the 10-second default.
+  // Runtimes honor it with their own mechanism: `<runtime> kill` then a
+  // bounded wait then `delete --force` for a Linux container, `container stop
+  // --signal --time` on macOS, and signal-then-wait-then-SIGKILL for the
+  // `exec` runtime.
+  uint64 task_stop_grace_period_seconds = 19;
 }
 
 // Request payload for PostWork.

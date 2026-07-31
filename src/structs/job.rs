@@ -1456,7 +1456,33 @@ pub struct TaskConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[tabled(skip)]
     pub actions: Vec<ActionSpec>,
+    /// Signal delivered when Legion stops this task (`"SIGTERM"` by default).
+    /// Task-level, not runtime-config-level, because the intent — "tell my
+    /// process this, and give it this long" — is runtime-independent; each
+    /// runtime honors it with its own mechanism (see
+    /// `docs/task-supervision.md`). Runtimes with nothing to signal accept it
+    /// and ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[tabled(skip)]
+    pub stop_signal: Option<String>,
+    /// How long the task gets between [`Self::stop_signal`] and the hard
+    /// kill, as a duration string (`"90s"`). Default `10s`, capped at
+    /// [`MAX_STOP_GRACE_PERIOD`] so a wedged task cannot hold a drain or a
+    /// reschedule hostage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[tabled(skip)]
+    pub stop_grace_period: Option<String>,
 }
+
+/// Default window between the stop signal and the hard kill — docker's, and
+/// the one operators already have in their fingers.
+pub const DEFAULT_STOP_GRACE_PERIOD: Duration = Duration::from_secs(10);
+
+/// Admission cap on `stopGracePeriod`. Long enough for a database checkpoint,
+/// short enough that a node drain still converges. Plays the role of Nomad's
+/// per-client `max_kill_timeout`, but as one cluster-wide rule instead of a
+/// knob per node.
+pub const MAX_STOP_GRACE_PERIOD: Duration = Duration::from_secs(300);
 
 /// A declared action: a named command template with typed parameters.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -1897,6 +1923,10 @@ struct TaskConfigInput {
     artifacts: Vec<ArtifactSpec>,
     #[serde(default)]
     actions: Vec<ActionSpec>,
+    #[serde(default)]
+    stop_signal: Option<String>,
+    #[serde(default)]
+    stop_grace_period: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -2029,6 +2059,8 @@ impl TaskConfigInput {
             volumes: self.volumes,
             artifacts: self.artifacts,
             actions: self.actions,
+            stop_signal: self.stop_signal,
+            stop_grace_period: self.stop_grace_period,
         })
     }
 }
@@ -2204,6 +2236,8 @@ impl TaskConfig {
             volumes: Vec::new(),
             artifacts: Vec::new(),
             actions: Vec::new(),
+            stop_signal: None,
+            stop_grace_period: None,
         }
     }
 
@@ -2589,6 +2623,71 @@ impl TaskConfig {
     }
 
     /// Validate artifacts declared on this task (artifact system plan):
+    /// The signal Legion delivers when it stops this task, canonicalized.
+    /// Falls back to `SIGTERM` when the task declares none.
+    ///
+    /// Runtimes may layer their own middle default in (the Linux container
+    /// path consults the image's `StopSignal` when the jobspec is silent);
+    /// this is the jobspec-or-`SIGTERM` answer every runtime starts from.
+    pub fn resolved_stop_signal(&self) -> String {
+        self.stop_signal
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .and_then(|value| crate::signals::canonical_signal_name(value).ok())
+            .unwrap_or_else(|| crate::signals::DEFAULT_STOP_SIGNAL.to_string())
+    }
+
+    /// How long this task gets between the stop signal and the hard kill.
+    /// Falls back to [`DEFAULT_STOP_GRACE_PERIOD`]; a malformed value cannot
+    /// reach here (admission rejects it) but degrades to the default rather
+    /// than panicking on the worker.
+    pub fn resolved_stop_grace_period(&self) -> Duration {
+        self.stop_grace_period
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .and_then(|value| humantime::parse_duration(value).ok())
+            .unwrap_or(DEFAULT_STOP_GRACE_PERIOD)
+    }
+
+    /// Validate the graceful-teardown fields at submit, so a typo'd signal or
+    /// an unbounded grace period fails at `legion job validate` rather than
+    /// at the reschedule that needed it.
+    pub fn validate_stop_policy(&self) -> R<()> {
+        if let Some(signal) = self.stop_signal.as_deref() {
+            crate::signals::canonical_signal_name(signal)
+                .map_err(|err| anyhow!("task {} stopSignal is invalid: {err}", self.name))?;
+        }
+        if let Some(raw) = self.stop_grace_period.as_deref() {
+            let parsed = humantime::parse_duration(raw.trim()).map_err(|err| {
+                anyhow!(
+                    "task {} stopGracePeriod {raw:?} is not a valid duration \
+                     (use e.g. \"30s\" or \"2m\"): {err}",
+                    self.name
+                )
+            })?;
+            if parsed.is_zero() {
+                bail!(
+                    "task {} stopGracePeriod must be greater than 0; omit it for the {} default, \
+                     or declare a window your process can actually shut down in",
+                    self.name,
+                    humantime::format_duration(DEFAULT_STOP_GRACE_PERIOD)
+                );
+            }
+            if parsed > MAX_STOP_GRACE_PERIOD {
+                bail!(
+                    "task {} stopGracePeriod ({raw}) exceeds the {} cluster maximum: a task that \
+                     cannot shut down inside that window would hold drains and reschedules open \
+                     indefinitely. Lower it, or make shutdown asynchronous",
+                    self.name,
+                    humantime::format_duration(MAX_STOP_GRACE_PERIOD)
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// spec shape, name uniqueness, `${artifact.<name>}` references in the
     /// kind config, and `auth.identity` references. No artifacts = today's
     /// behavior. Cluster-scoped rules (scheme allowlist, nodeIdentity names)
@@ -2793,6 +2892,95 @@ impl Submission {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- graceful teardown (stopSignal / stopGracePeriod) ---
+
+    fn task_with_stop(signal: Option<&str>, grace: Option<&str>) -> TaskConfig {
+        TaskConfig {
+            stop_signal: signal.map(str::to_string),
+            stop_grace_period: grace.map(str::to_string),
+            ..TaskConfig::new("db", "exec")
+        }
+    }
+
+    /// A task that declares nothing gets docker's defaults — which is exactly
+    /// the behavior a fixed-constant design would have given it.
+    #[test]
+    fn stop_policy_defaults_to_sigterm_and_ten_seconds() {
+        let task = task_with_stop(None, None);
+        assert_eq!(task.resolved_stop_signal(), "SIGTERM");
+        assert_eq!(task.resolved_stop_grace_period(), Duration::from_secs(10));
+        assert!(task.validate_stop_policy().is_ok());
+    }
+
+    #[test]
+    fn stop_policy_resolves_declared_values_in_any_spelling() -> R<()> {
+        let task = task_with_stop(Some("sigint"), Some("90s"));
+        task.validate_stop_policy()?;
+        assert_eq!(task.resolved_stop_signal(), "SIGINT");
+        assert_eq!(task.resolved_stop_grace_period(), Duration::from_secs(90));
+        Ok(())
+    }
+
+    /// The signal must come from the vocabulary the worker can actually
+    /// deliver, and the error must say what the vocabulary is.
+    #[test]
+    fn stop_signal_outside_the_vocabulary_is_rejected() {
+        let err = task_with_stop(Some("SIGKILL"), None)
+            .validate_stop_policy()
+            .expect_err("SIGKILL is not declarable — it cannot be caught");
+        let message = err.to_string();
+        assert!(message.contains("stopSignal"), "{message}");
+        assert!(message.contains("SIGKILL"), "{message}");
+        assert!(message.contains("SIGTERM"), "{message}");
+    }
+
+    /// The cap is the operator promise the fixed constant used to make: no
+    /// task can hold a drain hostage.
+    #[test]
+    fn stop_grace_period_must_be_positive_and_within_the_cap() {
+        let err = task_with_stop(None, Some("0s"))
+            .validate_stop_policy()
+            .expect_err("a zero window is a typo, not an instant kill");
+        assert!(err.to_string().contains("greater than 0"), "{err}");
+
+        let err = task_with_stop(None, Some("10m"))
+            .validate_stop_policy()
+            .expect_err("above the cap");
+        let message = err.to_string();
+        assert!(message.contains("maximum"), "{message}");
+        assert!(message.contains("5m"), "{message}");
+
+        // Exactly the cap is fine — the boundary belongs to the user.
+        assert!(task_with_stop(None, Some("5m"))
+            .validate_stop_policy()
+            .is_ok());
+
+        let err = task_with_stop(None, Some("soon"))
+            .validate_stop_policy()
+            .expect_err("not a duration");
+        assert!(err.to_string().contains("not a valid duration"), "{err}");
+    }
+
+    /// Both fields ride the normal jobspec parse, so they can be declared in
+    /// camelCase like every other task field.
+    #[test]
+    fn stop_fields_parse_from_a_jobspec() -> R<()> {
+        let config: JobConfig = serde_json::from_value(serde_json::json!({
+            "name": "drain",
+            "task": {
+                "name": "db",
+                "runtime": "exec",
+                "config": { "command": ["true"] },
+                "stopSignal": "SIGQUIT",
+                "stopGracePeriod": "45s",
+            },
+        }))?;
+        let task = &config.tasks[0];
+        assert_eq!(task.stop_signal.as_deref(), Some("SIGQUIT"));
+        assert_eq!(task.resolved_stop_grace_period(), Duration::from_secs(45));
+        Ok(())
+    }
 
     fn sample_action() -> ActionSpec {
         ActionSpec {

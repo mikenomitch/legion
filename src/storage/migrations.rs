@@ -1041,6 +1041,17 @@ pub fn get_migrations() -> Migrations<'static> {
         )",
         )
         .down("DROP TABLE IF EXISTS task_scale;"),
+        // Graceful teardown, declared per task (container runtime exec &
+        // signals plan §6.3): the signal Legion delivers when it stops a
+        // task, and how long the task gets before the hard kill. NULL in both
+        // columns is the pre-existing behavior expressed as data — the
+        // runtime's own default chain, and the 10-second default window.
+        //
+        // Appended last for the reason the entries above give: the applied
+        // count is the migration version, so anything added on a branch goes
+        // after everything already on `main`.
+        M::up("ALTER TABLE task_config ADD COLUMN stop_signal STRING;").down(""),
+        M::up("ALTER TABLE task_config ADD COLUMN stop_grace_period STRING;").down(""),
     ])
 }
 

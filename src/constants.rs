@@ -19,6 +19,18 @@ pub const ENV_RESOURCE_ENFORCEMENT: &str = "LEGION_RESOURCE_ENFORCEMENT";
 /// cgroup v2 parent path (relative to /sys/fs/cgroup) for worker-owned cgroups.
 pub const ENV_CGROUP_PARENT: &str = "LEGION_CGROUP_PARENT";
 
+// === Task filesystem ===
+/// Where a runtime with an isolated filesystem mounts the allocation's host
+/// task directory, and therefore the root every file-delivery destination on
+/// such a task must resolve under (`kvInjections.files[].path`, identity
+/// `file.path`, staged artifacts).
+///
+/// A constant rather than a per-job setting on purpose: jobs grep for it and
+/// hardcode it, so it can never comfortably change. `/legion/task` is
+/// unmistakably Legion's and leaves room for siblings (`/legion/secrets`) if
+/// the deferred directory splits ever land. See docs/task-runtime-container.md.
+pub const CONTAINER_TASK_DIR: &str = "/legion/task";
+
 // === Allocations ===
 // Allocation row status values. An allocation is `placed` from the moment the
 // scheduler writes its row until a worker reports it terminal; `complete` and
