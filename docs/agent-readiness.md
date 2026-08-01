@@ -21,6 +21,7 @@ below map directly onto those pillars.
 | Discoverability | `legion capabilities`, MCP `tools/list`, `legion job schema`, `GetStateStoreSchema` |
 | Structured I/O | Universal `--json` envelope, typed errors with `code`/`hint`/`retryable` |
 | Safety under retries | Idempotency keys, read-only-by-default SQL, `job plan`, `job validate` |
+| Durable intent | A submit either places or stays visibly pending — plan conflicts requeue the eval instead of silently failing it ([late-binding-plan-apply.md](late-binding-plan-apply.md)), so one `job run` needs no agent-side poll-and-resubmit loop |
 | Closing the loop | `job run --wait` / `job wait`, rollout events, `legion state query`, `job logs` |
 
 ## 1. MCP server (`legion mcp serve`)

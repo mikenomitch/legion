@@ -38,6 +38,7 @@ Benchmark targets:
 - `tests/scheduler_benchmark_slo.rs` (scenario runner + SLO gate, CI)
 - `tests/scheduler_scale_benchmark.rs` (scenario × persistence-backend
   matrix, manual)
+- `tests/plan_contention.rs` (concurrent-submit contention harness)
 - Scenario definitions in `benchmarks/scheduler/scenarios/*.json`
 - SLO thresholds in `benchmarks/scheduler/slo.json` (global), overridable
   per scenario via the scenario's `slo` block
@@ -74,6 +75,14 @@ What they measure:
     it is.
 - `eval_critical_path_bench`: end-to-end enqueue -> claim -> apply -> complete
   latency under 1/4/8 concurrent eval workers (write-lock contention).
+- `plan_contention`: N-way concurrent single-allocation submits against one
+  pool, pumped by real eval workers — measures conflict rejections,
+  requeues, fallback binds, dropped evals, and time-to-all-placed, with
+  candidate lists on vs off
+  ([late-binding-plan-apply.md](late-binding-plan-apply.md)). The
+  non-ignored tests are the CI regression; the `#[ignore]`d
+  `contention_matrix` prints the full grid recorded in
+  `benchmarks/scheduler/README.md`.
 - `scheduler_benchmark_slo` / `scheduler_scale_benchmark`: scenario-driven
   whole-plan runs. Scenarios describe realistic fleets and workloads:
   `node_profiles` (heterogeneous node classes: count, memory, cpus,
@@ -96,6 +105,7 @@ Run commands:
 - `cargo bench --bench scheduler_bench`
 - `cargo bench --bench eval_critical_path_bench`
 - `cargo test --test scheduler_benchmark_slo -- --ignored --nocapture`
+- `cargo test --test plan_contention -- --ignored --nocapture`
 - Full backend matrix (use a release build for recorded numbers):
 
 ```bash

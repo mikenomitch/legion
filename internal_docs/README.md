@@ -68,7 +68,7 @@ When one is required and what goes in it:
 | [job-templates-plan.md](plans/job-templates-plan.md) | in execution |
 | [job-updated-at-plan.md](plans/job-updated-at-plan.md) | shipped (detail-page header + node column label deferred) |
 | [kv-reactive-task-updates-plan.md](plans/kv-reactive-task-updates-plan.md) | shipped |
-| [late-binding-plan-apply-plan.md](plans/late-binding-plan-apply-plan.md) | planned |
+| [late-binding-plan-apply-plan.md](plans/late-binding-plan-apply-plan.md) | shipped (phases 0–3; Phase 4 backlog deferred) |
 | [persistence-plan.md](plans/persistence-plan.md) | phases 0–1, 3 done |
 | [preemption-and-eviction-plan.md](plans/preemption-and-eviction-plan.md) | shipped (graceful stop, six priority bands, plan-atomic preemption) |
 | [multi-cluster-federation-plan.md](plans/multi-cluster-federation-plan.md) | planned |

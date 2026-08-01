@@ -20,6 +20,18 @@
   // telemetry: { enabled: true, port: 4749 },
   schedulerSettings: {
     plan_conflict_max_retries: 3,
+    // Late-binding plan apply (docs/late-binding-plan-apply.md): ranked
+    // candidates per placement; the apply binds the first candidate whose
+    // node epoch is unchanged, so concurrent submits cost a fallback rank
+    // instead of a conflict retry. Defaults on at 8. 0 disables candidate
+    // lists (single-node submissions — the mixed-version kill switch).
+    // plan_candidates: 8,
+    // Full form: plan_candidates: { count: 8, band: 0.01 },
+    //
+    // Delay (ms, jittered) before a conflict-exhausted eval is retried;
+    // exhaustion requeues the eval instead of failing it terminally.
+    // plan_conflict_requeue_delay_ms: 1000,
+    //
     // Preemption (docs/preemption-and-eviction.md). When a job cannot place
     // and its priority band outranks work that can be displaced, the planner
     // evicts the minimum set of lower-band allocations and places in the same
@@ -43,6 +55,7 @@
     //   // previous plan made seconds earlier.
     //   victimExemptAge: "60s",
     // },
+    //
     // Plan-path scale levers (docs/scheduler-and-eval-loop.md). Both are on
     // by default; the flags exist as escape hatches.
     // lazy_version_sample: true,   // false = eager O(fleet) epoch sample per plan

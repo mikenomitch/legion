@@ -3356,6 +3356,7 @@ impl Manager for ManagerDaemonService {
                     .get(&placement.task_config_id)
                     .cloned()
                     .unwrap_or_default(),
+                candidate_nodes: placement.candidates,
             })
             .collect();
 

@@ -104,8 +104,24 @@ Legion maintains an epoch per `job_config_id` in `allocation_epoch_partition`.
 This keeps conflicts localized so unrelated jobs can schedule in parallel without invalidating each other's plans.
 
 The plan submission and its apply run as **one replicated store op**
-(`Store::submit_and_apply_plan`): one write-transaction boundary, and on
-raft one propose→quorum-commit→apply instead of two.
+(`Store::submit_and_apply_plan` / `submit_and_apply_plan_with_candidates`):
+one write-transaction boundary, and on raft one
+propose→quorum-commit→apply instead of two.
+
+### Candidate lists (late-binding apply)
+
+Since the late-binding change
+([late-binding-plan-apply.md](late-binding-plan-apply.md)), a plan carries
+an ordered **candidate list** per placement instead of a single node, and
+the apply transaction binds each placement to the first candidate whose
+node epoch is unchanged since planning. A concurrent plan that touched the
+first choice costs a fallback rank instead of a whole-plan rejection.
+Coupled placements (overlapping lists, shared `distinct` keys, multi-task
+groups) keep exact all-or-nothing semantics. Defaults on
+(`schedulerSettings.plan_candidates: 8`); `0` disables it and restores
+single-node submissions. The epoch sample (lazy or eager, below) covers
+the union of every placement's candidate list, and candidate submissions
+take the same group commit as single-node ones.
 
 ### The epoch sample is lazy by default
 
@@ -113,8 +129,8 @@ The fence rule is that epochs must be sampled *no later than* the
 capacity snapshot the plan is built against. Sampling every candidate
 node up front satisfies that unconditionally but costs O(fleet) per
 plan. By default the scheduler instead plans first and samples epochs
-for exactly the scopes the plan touches (the job config plus the placed
-nodes), accepting the late sample only when the read model's
+for exactly the scopes the plan touches (the job config plus the union of
+every placement's candidate list), accepting the late sample only when the read model's
 **generation counter** — bumped on every allocation publish — proves
 nothing changed since the capacity read. When something did change
 mid-plan, the scheduler re-plans once with the eager whole-fleet sample
@@ -180,6 +196,12 @@ the same apply-time guarantee.
 
 A stale epoch causes plan rejection with a conflict error. The eval handler retries conflicts with bounded attempts via `Eval::plan_with_conflict_retries`.
 
+Since the late-binding change, exhausting that in-handler budget no longer
+fails the eval: the eval is released back to the pending queue with a
+jittered delay (`eval.requeued` event) and runs again. Conflict is
+transient by definition; terminal failure remains for non-conflict errors
+(for example, a pool with genuinely no capacity).
+
 ### Tuning conflict retries
 
 Use manager `schedulerSettings.plan_conflict_max_retries` to tune retry behavior for high contention.
@@ -188,17 +210,25 @@ Use manager `schedulerSettings.plan_conflict_max_retries` to tune retry behavior
 - minimum: `1`
 - maximum: `20`
 
+The requeue backstop is paced by
+`schedulerSettings.plan_conflict_requeue_delay_ms` (default `1000`,
+clamped to 100–60000, plus uniform jitter of up to the base).
+
 Example manager config:
 
 ```jsonnet
 {
   schedulerSettings: {
     plan_conflict_max_retries: 8,
+    plan_conflict_requeue_delay_ms: 500,
   },
 }
 ```
 
-If you observe frequent conflict retries, increase this setting modestly and also scale by partitioning workload across more jobs/configs and spreading eval traffic.
+With candidate lists on, retries are rarely spent — check
+`legion_plan_apply_total{outcome}` and the candidate-rank histogram before
+tuning here; see
+[late-binding-plan-apply.md](late-binding-plan-apply.md).
 
 ## Node Candidate Construction
 

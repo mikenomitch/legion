@@ -9,6 +9,7 @@ Full index: [docs/README.md](docs/README.md).
 - [Managers and Workers](docs/architecture-managers-workers.md)
 - [Plugin System](docs/plugin-system.md)
 - [Scheduler and Eval Loop](docs/scheduler-and-eval-loop.md)
+- [Late-Binding Plan Apply](docs/late-binding-plan-apply.md)
 - [Event Stream](docs/event-stream.md)
 - [Jobs, Tasks, and Scheduling](docs/jobs-tasks-and-scheduling.md)
 - [Job Templates (reusable specs, typed variables, delegated submission)](docs/job-templates.md)

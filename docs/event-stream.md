@@ -14,7 +14,8 @@ from the CLI, the MCP server, the UI, and raw gRPC.
 | `eval.enqueued` | info | An eval was added to the queue. |
 | `eval.completed` | info | An eval handler finished successfully. |
 | `eval.failed` | error | An eval handler returned an error. |
-| `allocation.placed` | info | A plan was applied; one event per apply, with placement details in metadata. |
+| `eval.requeued` | warn | An eval exhausted its plan-conflict retries and was released back to pending with a delay instead of failing (docs/late-binding-plan-apply.md). |
+| `allocation.placed` | info | A plan was applied; one event per apply, with placement details in metadata — including `candidateRank` per placement (0 = first choice) and a `fallbacks` count. |
 | `allocation.removed` | info/warn | Allocations were removed (job stop/update: info; node loss: warn). Metadata carries `cause` — `stop`, `update`, `drain`, `reschedule`, `destroy`, `node_lost`, `scale_in`, or `preempted` — omitted when no cause was recorded. See [Graceful Stop](graceful-stop.md). |
 | `allocation.stopping` | info | Allocations entered their grace window. Metadata carries `cause`, `maxGraceSeconds`, and per-allocation `graceSeconds`. The window is the manager's expectation; the worker's real clock starts when it delivers the signal. See [Graceful Stop](graceful-stop.md). |
 | `allocation.preempted` | warn | Allocations were displaced to make room for higher-band work. Metadata carries the victim's `band` plus `preemptorJob` and `preemptorBand` — the bidirectional link. One event per victim job. See [Preemption and Eviction](preemption-and-eviction.md). |
@@ -65,7 +66,7 @@ legion events follow --kind rollout --json   # NDJSON: one envelope per line
 ```
 
 `--kind` matches exactly or by category prefix: `--kind eval` matches
-`eval.enqueued`, `eval.completed`, and `eval.failed`.
+`eval.enqueued`, `eval.completed`, `eval.failed`, and `eval.requeued`.
 
 ### Cursor-based polling (CLI and MCP)
 
