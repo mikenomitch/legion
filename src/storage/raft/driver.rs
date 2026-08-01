@@ -1050,17 +1050,28 @@ impl MultiRaftDriver {
         };
         let payload = serde_json::to_vec(op)
             .with_context(|| format!("failed encoding forwarded op {}", op.op_name()))?;
-        let channel = engine
-            .pool
-            .get(&leader_addr)
-            .map_err(|e| anyhow!("malformed leader address {leader_addr}: {e}"))?;
         let secret: tonic::metadata::MetadataValue<tonic::metadata::Ascii> = engine
             .cluster_secret
             .parse()
             .map_err(|_| anyhow!("cluster secret is not valid ascii metadata"))?;
         let group_id = group.wire_name().to_string();
         let op_name = op.op_name();
+        let pool = Arc::clone(&engine.pool);
+        let dial_addr = leader_addr.clone();
         let outcome = Self::block_on_engine(engine, async move {
+            // Dial INSIDE the runtime. `ChannelPool::get` calls
+            // `Endpoint::connect_lazy`, and building a tonic channel spawns
+            // its connection task — which panics outright ("there is no
+            // reactor running") on a thread with no runtime context. Most
+            // callers of this function are synchronous (a write that lands
+            // on a follower reaches it via `Store::forward_after_rejection`),
+            // and the pool hides the hazard: it only bites on the FIRST
+            // forward to a given leader address, so it surfaces right after
+            // leadership moves to a manager this node has not forwarded to
+            // before.
+            let channel = pool
+                .get(&dial_addr)
+                .map_err(|e| anyhow!("malformed leader address {dial_addr}: {e}"))?;
             let mut client =
                 crate::structs::raft_transport_client::RaftTransportClient::new(channel)
                     .max_decoding_message_size(
@@ -1075,8 +1086,8 @@ impl MultiRaftDriver {
             request
                 .metadata_mut()
                 .insert(RAFT_CLUSTER_SECRET_METADATA_KEY, secret);
-            client.forward_lane_write(request).await
-        })?;
+            Ok::<_, anyhow::Error>(client.forward_lane_write(request).await)
+        })??;
         let reply = match outcome {
             Ok(reply) => reply.into_inner(),
             Err(status) => {

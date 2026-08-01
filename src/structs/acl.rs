@@ -45,6 +45,12 @@ pub enum AclResource {
     /// teammate) can resize a job without the right to redeploy it. Scope
     /// with the job-name selector, like `job` rules.
     Scale,
+    /// Boot tickets (`legion boot-ticket`, docs/edge-boot.md): `read` lists
+    /// outstanding tickets, `write` mints one. Separate from `job` for the
+    /// same reason `scale` is — a platform's ticket minter should be able to
+    /// authorize individual starts without holding `job:write`, which means
+    /// "redeploy the fleet". Scope with the job-name selector.
+    Boot,
 }
 
 impl AclResource {
@@ -60,12 +66,14 @@ impl AclResource {
             AclResource::Action => "action",
             AclResource::Template => "template",
             AclResource::Scale => "scale",
+            AclResource::Boot => "boot",
         }
     }
 
     pub fn all() -> &'static [&'static str] {
         &[
             "job", "node", "kv", "state", "operator", "acl", "exec", "action", "template", "scale",
+            "boot",
         ]
     }
 }
@@ -94,7 +102,7 @@ impl AclAction {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AclRule {
     /// Resource types: `job`, `node`, `kv`, `state`, `operator`, `acl`,
-    /// `exec`, `action`, `template`, `scale`, `*`.
+    /// `exec`, `action`, `template`, `scale`, `boot`, `*`.
     pub resources: Vec<String>,
     /// Actions: `read`, `write`, `*`.
     pub actions: Vec<String>,

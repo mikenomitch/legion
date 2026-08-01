@@ -1,12 +1,15 @@
 use crate::artifacts::{ArtifactStager, ArtifactStatusBoard, CredentialSource, StagedArtifact};
 use crate::prelude::*;
+use crate::structs::edge_boot::{ClaimStage, Gate, OnRefused};
 use crate::structs::{
     substitute_artifact_tokens, Allocation, AllocationHealth, StopCause, TaskAllocation,
     TaskConfig, TaskOnUnhealthyConfig, VolumeMount, VolumeReport, WorkerArtifactFetchConfigFull,
 };
 use crate::task_plugins::{
-    ResourceAssignment, ResourceEnforcement, StopContext, TaskInstance, TaskPluginRegistry,
+    NetworkGate, ResourceAssignment, ResourceEnforcement, StopContext, TaskInstance,
+    TaskPluginRegistry,
 };
+use crate::worker::claims::{ClaimRecord, ClaimTable, LocalLedger};
 use crate::worker::log_sink::{default_sinks, LogResource, LogSink};
 use crate::worker::logs::{read_allocation_logs, CapturedStream};
 use crate::worker::resources::NodeResourceGovernor;
@@ -112,14 +115,32 @@ pub struct StagingJob {
     pub allocation: Allocation,
     pub task: TaskConfig,
     pub task_dir: PathBuf,
+    /// Gate this launch is held at. [`Gate::Off`] for every ordinary
+    /// allocation; [`Gate::Stage`] stops after `prepare`, which is exactly
+    /// what makes staging overlap the commit without executing anything.
+    pub gate: Gate,
     stager: Arc<ArtifactStager>,
     board: ArtifactStatusBoard,
+}
+
+/// The outcome of ratifying a claim.
+pub struct Ratified {
+    pub claim: ClaimRecord,
+    /// Set when this ratification *started* the workload (a `stage`-gated
+    /// claim), so the caller must spawn its health monitor. `None` for a claim
+    /// that was already running, and for a duplicate verdict — both already
+    /// have one, and a second would double-count restarts.
+    pub start_health_monitor: Option<(Allocation, TaskConfig)>,
 }
 
 /// What `begin_task_allocation` did with a new allocation.
 pub enum BeginOutcome {
     /// No artifacts: the task was prepared and started synchronously.
     Started(Box<(Allocation, TaskConfig)>),
+    /// A provisional allocation at gate `stage`: prepared, not started.
+    /// Nothing outside the node can observe it, and no health monitor runs
+    /// until ratification starts the workload.
+    Staged(Box<(Allocation, TaskConfig)>),
     /// Artifacts declared: the allocation is registered as
     /// `staging artifacts` and the caller must run the staging job on a
     /// blocking thread (see [`launch_task_allocation`]).
@@ -201,6 +222,14 @@ pub struct WorkerTaskManager {
     /// Resolved mount lists per allocation, kept so a worker restart can
     /// re-mount exactly what the manager last dispatched.
     volume_specs: HashMap<i64, Vec<VolumeMount>>,
+    /// Provisional allocations this node has started but the store has not
+    /// yet recorded (docs/edge-boot.md). Keyed by claim id; each record
+    /// carries the negative worker-local allocation key the maps above use,
+    /// so provisional work flows through every existing path unchanged.
+    claims: ClaimTable,
+    /// This node's advisory view of its own free capacity, so it cannot
+    /// double-admit itself into oversubscription across concurrent claims.
+    ledger: LocalLedger,
     /// The node's CPU/memory accounting and cgroup hierarchy (see
     /// `src/worker/resources.rs`). Disabled unless the worker was started
     /// with `resourceEnforcement.enabled`, in which case it governs every
@@ -261,6 +290,8 @@ impl WorkerTaskManager {
                 },
             )),
             volume_specs: HashMap::new(),
+            claims: ClaimTable::new(),
+            ledger: LocalLedger::default(),
             resources: NodeResourceGovernor::from_env(),
         }
     }
@@ -418,8 +449,19 @@ impl WorkerTaskManager {
         self.registry.readiness_checks()
     }
 
+    /// The allocation ids this node is running, as the **manager** knows
+    /// them.
+    ///
+    /// Unratified provisional work is deliberately absent: the manager does
+    /// not know about it yet, and reporting a negative local key as a running
+    /// allocation would be a lie the reconcile loop would act on. It is
+    /// reported separately, in `HeartbeatRequest.provisional_claims`.
     pub fn allocations_snapshot(&self) -> Vec<i64> {
-        let mut allocations = self.instances.keys().copied().collect::<Vec<_>>();
+        let mut allocations = self
+            .instances
+            .keys()
+            .filter_map(|local_key| self.external_id(*local_key))
+            .collect::<Vec<_>>();
         allocations.sort_unstable();
         allocations
     }
@@ -427,7 +469,7 @@ impl WorkerTaskManager {
     /// Whether this worker currently runs the allocation (used by identity
     /// refresh loops to stop once the allocation is gone).
     pub fn has_allocation(&self, allocation_id: i64) -> bool {
-        self.instances.contains_key(&allocation_id)
+        self.instances.contains_key(&self.local_key(allocation_id))
     }
 
     /// The tracked process id for an allocation, if any.
@@ -513,11 +555,20 @@ impl WorkerTaskManager {
         Ok(())
     }
 
+    /// Per-allocation health, addressed by the ids the manager knows.
+    /// Unratified provisional work is omitted for the same reason it is
+    /// omitted from [`Self::allocations_snapshot`].
     pub fn allocation_health_snapshot(&self) -> Vec<AllocationHealth> {
-        let mut entries = self.allocation_health.values().cloned().collect::<Vec<_>>();
-        for entry in &mut entries {
-            entry.artifact_states = self.artifact_status.snapshot_json(entry.allocation_id);
-        }
+        let mut entries = self
+            .allocation_health
+            .values()
+            .filter_map(|entry| {
+                let mut entry = entry.clone();
+                entry.artifact_states = self.artifact_status.snapshot_json(entry.allocation_id);
+                entry.allocation_id = self.external_id(entry.allocation_id)?;
+                Some(entry)
+            })
+            .collect::<Vec<_>>();
         entries.sort_by_key(|entry| entry.allocation_id);
         entries
     }
@@ -697,8 +748,18 @@ impl WorkerTaskManager {
         });
     }
 
+    /// Terminal outcomes owed to the manager, addressed by the ids it knows.
+    /// Reports for unratified provisional work are dropped: there is no
+    /// allocation for the manager to complete.
     pub fn drain_terminations(&mut self) -> Vec<TerminatedAllocationReport> {
-        std::mem::take(&mut self.terminated_reports)
+        let reports = std::mem::take(&mut self.terminated_reports);
+        reports
+            .into_iter()
+            .filter_map(|mut report| {
+                report.allocation_id = self.external_id(report.allocation_id)?;
+                Some(report)
+            })
+            .collect()
     }
 
     /// Put drained terminal reports back after a failed heartbeat, so a dead
@@ -707,8 +768,19 @@ impl WorkerTaskManager {
         self.terminated_reports.extend(reports);
     }
 
+    /// Failures owed to the manager, addressed by the ids it knows. A
+    /// failure on unratified provisional work is dropped for the same reason
+    /// a terminal report is: there is nothing for the manager to reschedule,
+    /// and the claim's own kill path already emitted the event.
     pub fn drain_failures(&mut self) -> Vec<FailedAllocationReport> {
-        std::mem::take(&mut self.failed)
+        let failures = std::mem::take(&mut self.failed);
+        failures
+            .into_iter()
+            .filter_map(|mut failure| {
+                failure.allocation_id = self.external_id(failure.allocation_id)?;
+                Some(failure)
+            })
+            .collect()
     }
 
     fn alloc_dir(&self, allocation_id: i64) -> PathBuf {
@@ -929,13 +1001,28 @@ impl WorkerTaskManager {
     /// Held-back allocations are not lost: they stay in the manager's desired
     /// set, so the next heartbeat's reconcile returns them again.
     pub fn reconcile_allocations(&mut self, allocations: &[TaskAllocation]) -> Vec<TaskAllocation> {
+        // Desired ids are the manager's; the maps below are keyed by this
+        // node's. They differ only for a ratified provisional allocation,
+        // which keeps the local key it booted under.
         let desired_ids = allocations
             .iter()
-            .map(|allocation| allocation.allocation_id)
+            .map(|allocation| self.local_key(allocation.allocation_id))
+            .collect::<std::collections::HashSet<_>>();
+        // Unratified claims are exempt from the stop sweep for the length of
+        // their lease. The manager cannot list work it does not know about,
+        // so an absence here is not a decision — it is ignorance, and reading
+        // it as "stop this" would make every provisional start die on its
+        // first heartbeat. When the lease expires the claim is killed by
+        // `sweep_expired_claims`, which is the same outcome one tick later
+        // with no new reaper.
+        let protected = self
+            .claims
+            .unratified_local_keys()
+            .into_iter()
             .collect::<std::collections::HashSet<_>>();
         let existing_ids = self.instances.keys().copied().collect::<Vec<_>>();
         for allocation_id in existing_ids {
-            if desired_ids.contains(&allocation_id) {
+            if desired_ids.contains(&allocation_id) || protected.contains(&allocation_id) {
                 continue;
             }
             if let Err(err) = self.stop_allocation(allocation_id) {
@@ -949,8 +1036,10 @@ impl WorkerTaskManager {
 
         let pending: Vec<TaskAllocation> = allocations
             .iter()
-            .filter(|allocation| !self.instances.contains_key(&allocation.allocation_id))
-            .filter(|allocation| !self.terminating.contains_key(&allocation.allocation_id))
+            .filter(|allocation| {
+                let local = self.local_key(allocation.allocation_id);
+                !self.instances.contains_key(&local) && !self.terminating.contains_key(&local)
+            })
             .cloned()
             .collect();
 
@@ -1305,6 +1394,9 @@ impl WorkerTaskManager {
         task_name: Option<&str>,
         opts: crate::task_plugins::ExecOptions,
     ) -> R<Box<dyn crate::task_plugins::ExecSession>> {
+        // Exec addresses an allocation by the manager's id; translate to the
+        // worker-local key a ratified provisional allocation still runs under.
+        let allocation_id = self.local_key(allocation_id);
         let allocation = self
             .allocations
             .get(&allocation_id)
@@ -1351,10 +1443,22 @@ impl WorkerTaskManager {
     /// allocation.
     #[instrument(err, skip_all)]
     pub fn run_allocation(&mut self, allocation: &Allocation, task: &TaskConfig) -> R<()> {
+        self.run_allocation_gated(allocation, task, Gate::Off)
+    }
+
+    /// [`Self::run_allocation`] with an explicit gate; `Gate::Stage` stops
+    /// after `prepare`.
+    pub fn run_allocation_gated(
+        &mut self,
+        allocation: &Allocation,
+        task: &TaskConfig,
+        gate: Gate,
+    ) -> R<()> {
         info!(
             allocation_id = allocation.id,
             task_name = %task.name,
             task_runtime = %task.runtime,
+            gate = %gate,
             "Received task allocation"
         );
 
@@ -1363,13 +1467,26 @@ impl WorkerTaskManager {
             .with_context(|| format!("Failed to load task plugin {}", task.runtime))?;
         let instance = self.prepare_instance(allocation, task)?;
         self.instances.insert(allocation.id, instance);
-        self.start_prepared_allocation(allocation, task)
+        self.prepare_registered_allocation(allocation, task)?;
+        if gate == Gate::Stage {
+            self.set_allocation_health(allocation.id, false, "staged (awaiting ratification)");
+            return Ok(());
+        }
+        self.start_registered_allocation(allocation, task, gate)
     }
 
-    /// Runs `consume_artifact` hooks + volume mounts + `prepare` + `start`
-    /// against the already-registered instance, then records the allocation as
-    /// started.
-    fn start_prepared_allocation(&mut self, allocation: &Allocation, task: &TaskConfig) -> R<()> {
+    /// Everything up to (but not including) `start`: volume mounts, artifact
+    /// consumption, and the runtime's own `prepare`.
+    ///
+    /// Split out from [`Self::start_prepared_allocation`] because it is
+    /// exactly the work a provisional allocation at gate `stage` is allowed
+    /// to do — the `stage` gate is a pause between two calls the worker
+    /// already made in sequence, not a new execution path.
+    fn prepare_registered_allocation(
+        &mut self,
+        allocation: &Allocation,
+        task: &TaskConfig,
+    ) -> R<()> {
         // Storage first: a task must never observe a missing or empty data
         // directory because its volume was still being mounted. A failure here
         // fails the allocation, which is the honest outcome — the manager
@@ -1426,6 +1543,51 @@ impl WorkerTaskManager {
         );
         plugin.prepare(allocation, task, instance)?;
 
+        self.allocations.insert(allocation.id, allocation.clone());
+        self.task_configs.insert(allocation.id, task.clone());
+        Ok(())
+    }
+
+    /// The second half: `start` the prepared instance and register it as
+    /// running.
+    ///
+    /// `gate` is [`Gate::Off`] for every ordinary allocation. When it is
+    /// [`Gate::Boot`], the runtime's network gate is shut *before* the
+    /// workload starts, so the guest never has a live interface it could have
+    /// used — the ordering is the guarantee, not the mechanism.
+    fn start_registered_allocation(
+        &mut self,
+        allocation: &Allocation,
+        task: &TaskConfig,
+        gate: Gate,
+    ) -> R<()> {
+        let plugin = self
+            .registry
+            .plugin(&task.runtime)
+            .context("Task plugin not loaded")?;
+        let instance = self
+            .instances
+            .get_mut(&allocation.id)
+            .context("Task instance missing")?;
+
+        if gate == Gate::Boot {
+            if plugin.network_gate() == NetworkGate::Advisory {
+                // Stated loudly rather than assumed: for host-process
+                // runtimes Legion withholds service registration and the
+                // node-local forwarders, but the workload shares the host's
+                // network stack and can still reach the outside world.
+                // docs/edge-boot.md says so; this is the operator's copy.
+                warn!(
+                    allocation_id = allocation.id,
+                    task_runtime = %task.runtime,
+                    "The `boot` gate is advisory for this runtime: Legion withholds service \
+                     registration and upstream forwarders, but the task can still reach the \
+                     network through the host"
+                );
+            }
+            plugin.set_network_gate(allocation, task, instance, false)?;
+        }
+
         info!(
             allocation_id = allocation.id,
             task_name = %task.name,
@@ -1453,12 +1615,244 @@ impl WorkerTaskManager {
         Ok(())
     }
 
+    // ---------------------------------------------------------------------
+    // Provisional allocations (docs/edge-boot.md)
+    // ---------------------------------------------------------------------
+
+    /// Configure the node's advisory capacity ledger from its own declared
+    /// resources. Called once at worker startup, from the registration
+    /// config the manager served.
+    pub fn configure_ledger(&mut self, ledger: LocalLedger) {
+        self.ledger = ledger;
+    }
+
+    /// Snapshot of the node's live claims, for `legion node claims` and the
+    /// heartbeat report.
+    pub fn claims_snapshot(&self) -> Vec<ClaimRecord> {
+        self.claims.all()
+    }
+
+    /// The unratified claims, for `HeartbeatRequest.provisional_claims`.
+    pub fn unratified_claims(&self) -> Vec<ClaimRecord> {
+        self.claims.unratified()
+    }
+
+    /// Manager-facing allocation id for a worker-local key.
+    ///
+    /// The identity function for everything except a ratified provisional
+    /// allocation, which keeps its negative local key (and therefore its
+    /// directories, its open files, and its running process) and carries the
+    /// manager's id alongside. Nothing is ever rekeyed and no directory ever
+    /// moves — a ratification is a bookkeeping event, not a migration.
+    fn external_id(&self, local_key: i64) -> Option<i64> {
+        if local_key >= 0 {
+            return Some(local_key);
+        }
+        self.claims
+            .by_local_key(local_key)
+            .and_then(|claim| claim.allocation_id)
+    }
+
+    /// Worker-local key for a manager-facing allocation id. The identity
+    /// function unless the id names a ratified claim.
+    pub fn local_key(&self, allocation_id: i64) -> i64 {
+        self.claims
+            .by_allocation_id(allocation_id)
+            .map(|claim| claim.local_key)
+            .unwrap_or(allocation_id)
+    }
+
+    /// Admit and begin a provisional allocation.
+    ///
+    /// Admission is local and total: the ticket (if any) was already
+    /// verified by the caller, this checks the claim table and the resource
+    /// ledger, and *then* commits to running anything. A failure at this
+    /// point has held nothing and started nothing.
+    ///
+    /// Returns the registered claim. The caller runs the work through
+    /// [`launch_provisional_allocation`], which respects the gate.
+    pub fn admit_claim(&mut self, record: ClaimRecord) -> R<ClaimRecord> {
+        let claim_id = record.claim_id.clone();
+        self.ledger.admit(&claim_id, &record.resources)?;
+        match self.claims.insert(record) {
+            Ok(stored) => Ok(stored),
+            Err(err) => {
+                // Nothing is left partially held: a claim the table refuses
+                // releases its ledger reservation on the way out, or the node
+                // would slowly leak capacity to starts that never happened.
+                self.ledger.release_hold(&claim_id);
+                Err(err)
+            }
+        }
+    }
+
+    /// Ratify a claim: the placement committed and the work is now an
+    /// ordinary allocation under the manager's id.
+    ///
+    /// Opens the network for a claim held at gate `boot`, and starts a claim
+    /// that was held at gate `stage` (which prepared everything and stopped
+    /// short of `start`). Returns the claim as it now stands.
+    pub fn ratify_claim(&mut self, claim_id: &str, final_payload: &TaskAllocation) -> R<Ratified> {
+        let claim = self
+            .claims
+            .get(claim_id)
+            .cloned()
+            .with_context(|| format!("no claim {claim_id} on this node"))?;
+        if claim.is_ratified() {
+            // A duplicate verdict (the reply and the heartbeat catch-up both
+            // landed) is a no-op, not an error — and must not start a second
+            // health monitor for work that already has one.
+            return Ok(Ratified {
+                claim,
+                start_health_monitor: None,
+            });
+        }
+        let allocation_id = final_payload.allocation_id;
+
+        let local_key = claim.local_key;
+        // Adopt the committed payload before doing anything with it. The
+        // payload the node booted (or staged) with could not name assigned
+        // ports, the bound instance, or resolved volume mounts — those are
+        // produced by the apply transaction — so this is where a provisional
+        // start stops being provisional in every sense but its local key.
+        let (mut allocation, task) = task_from_allocation(final_payload)?;
+        allocation.id = local_key;
+        self.volume_specs
+            .insert(local_key, parse_volume_mounts(final_payload)?);
+        self.allocations.insert(local_key, allocation.clone());
+        self.task_configs.insert(local_key, task.clone());
+
+        // A `stage`-gated claim starts its workload here, so its health
+        // monitor starts here too — the launch path deliberately did not
+        // spawn one for work that was not running.
+        let mut start_health_monitor = None;
+        match claim.gate {
+            Gate::Stage => {
+                // Everything expensive already happened; this is the start
+                // the gate was holding back.
+                self.start_registered_allocation(&allocation, &task, Gate::Off)?;
+                start_health_monitor = Some((allocation.clone(), task.clone()));
+            }
+            Gate::Boot => {
+                let plugin = self
+                    .registry
+                    .plugin(&task.runtime)
+                    .context("Task plugin not loaded")?;
+                let instance = self
+                    .instances
+                    .get_mut(&local_key)
+                    .context("Task instance missing")?;
+                plugin.set_network_gate(&allocation, &task, instance, true)?;
+            }
+            // `serve` never gated anything, and `off` never got here.
+            Gate::Serve | Gate::Off => {}
+        }
+
+        self.ledger.release_hold(claim_id);
+        self.ledger.commit(local_key, &claim.resources);
+        let ratified = self
+            .claims
+            .ratify(claim_id, allocation_id)
+            .context("claim vanished during ratification")?;
+        // Persist now that the work has an id the cluster agrees on: a
+        // restart from here must restore it, not orphan it.
+        self.persist_state();
+        info!(
+            claim_id,
+            allocation_id,
+            gate = %claim.gate,
+            "Ratified provisional allocation"
+        );
+        Ok(Ratified {
+            claim: ratified,
+            start_health_monitor,
+        })
+    }
+
+    /// Kill a provisional allocation: refused, expired, or withdrawn.
+    ///
+    /// Every failure mode ends here — this is the single kill path the
+    /// design's fail-closed claim rests on. `on_refused: 'stop'` runs the
+    /// task's normal graceful-stop ladder; the default is a hard destroy,
+    /// because the common refusal is "someone else owns this id" and a loser
+    /// lingering is what the at-most-one invariant forbids.
+    pub fn kill_claim(&mut self, claim_id: &str, reason: &str) -> Option<ClaimRecord> {
+        let claim = self.claims.remove(claim_id)?;
+        self.ledger.release_hold(claim_id);
+        warn!(
+            claim_id,
+            local_key = claim.local_key,
+            instance_id = %claim.instance_id,
+            gate = %claim.gate,
+            reason,
+            "Killing provisional allocation"
+        );
+        let graceful = claim.on_refused == OnRefused::Stop;
+        let stopped = if graceful {
+            self.stop_allocation(claim.local_key)
+        } else {
+            self.stop_allocation_inner(claim.local_key, true)
+        };
+        if let Err(err) = stopped {
+            warn!(claim_id, error = ?err, "Failed to stop provisional allocation");
+        }
+        // A provisional allocation the manager never knew about must not be
+        // reported as a failed allocation — there is nothing to reschedule.
+        self.failed
+            .retain(|failure| failure.allocation_id != claim.local_key);
+        self.terminated_reports
+            .retain(|report| report.allocation_id != claim.local_key);
+        self.allocation_health.remove(&claim.local_key);
+        Some(claim)
+    }
+
+    /// Claims whose lease expired without a verdict. The backstop for every
+    /// failure the reply path cannot cover: a partition, a dead manager, a
+    /// lost reply. Returns what was killed, for events and metrics.
+    pub fn sweep_expired_claims(&mut self, now: std::time::Instant) -> Vec<ClaimRecord> {
+        let expired = self.claims.expired(now);
+        let mut killed = Vec::with_capacity(expired.len());
+        for claim in expired {
+            if let Some(claim) = self.kill_claim(&claim.claim_id, "ratification lease expired") {
+                killed.push(claim);
+            }
+        }
+        killed
+    }
+
+    /// Record how far a claim has progressed, for the heartbeat report and
+    /// the `StartClaim` stream.
+    pub fn set_claim_stage(&mut self, claim_id: &str, stage: ClaimStage) {
+        if let Some(claim) = self.claims.get_mut(claim_id) {
+            claim.stage = stage;
+        }
+    }
+
+    /// Whether this node already holds a live claim for an instance.
+    pub fn instance_is_claimed(&self, instance_id: &str) -> bool {
+        self.claims.instance_is_claimed(instance_id)
+    }
+
     /// Entry point for a new allocation from the manager. Tasks without
     /// artifacts start synchronously; artifact-bearing tasks are registered
     /// as `staging artifacts` and return a [`StagingJob`] the caller runs on
     /// a blocking thread (never under this lock — fetches can take minutes
     /// and heartbeats must keep flowing).
     pub fn begin_task_allocation(&mut self, allocation: &TaskAllocation) -> R<BeginOutcome> {
+        self.begin_task_allocation_gated(allocation, Gate::Off)
+    }
+
+    /// [`Self::begin_task_allocation`] with an explicit gate.
+    ///
+    /// `Gate::Off` is the ordinary path. `Gate::Stage` prepares everything
+    /// and stops short of `start`; `Gate::Boot` starts with the runtime's
+    /// network gate shut; `Gate::Serve` starts normally. The allocation id in
+    /// `allocation` is the worker-local claim key for a provisional start.
+    pub fn begin_task_allocation_gated(
+        &mut self,
+        allocation: &TaskAllocation,
+        gate: Gate,
+    ) -> R<BeginOutcome> {
         let (alloc, task) = task_from_allocation(allocation)?;
         // The manager resolved these against the volume table, so they carry
         // concrete ids and the driver attrs from previous mounts. Recorded
@@ -1488,7 +1882,7 @@ impl WorkerTaskManager {
             }
         }
         if task.artifacts.is_empty() {
-            self.run_allocation(&alloc, &task)?;
+            self.run_allocation_gated(&alloc, &task, gate)?;
             // Arm the self-fence watchdog for stateful allocations (0 = no
             // fencing; see the TaskAllocation proto comments). Registered
             // after a successful start and persisted so it survives worker
@@ -1498,6 +1892,11 @@ impl WorkerTaskManager {
                     alloc.id,
                     std::time::Duration::from_secs(allocation.self_terminate_after_seconds),
                 );
+            }
+            if gate == Gate::Stage {
+                // Nothing is running yet, so there is nothing to health
+                // check. The monitor starts with the workload, at ratify.
+                return Ok(BeginOutcome::Staged(Box::new((alloc, task))));
             }
             return Ok(BeginOutcome::Started(Box::new((alloc, task))));
         }
@@ -1554,6 +1953,7 @@ impl WorkerTaskManager {
             allocation: alloc,
             task,
             task_dir,
+            gate,
             stager: self.stager.clone(),
             board: self.artifact_status.clone(),
         })))
@@ -1567,6 +1967,7 @@ impl WorkerTaskManager {
         allocation: &Allocation,
         task: &TaskConfig,
         staged: Vec<StagedArtifact>,
+        gate: Gate,
     ) -> R<()> {
         // A runtime that mounts the task dir sees staged artifacts at the
         // in-task path, not the host one — the same rule volume env already
@@ -1612,7 +2013,15 @@ impl WorkerTaskManager {
         let mut started_task = task.clone();
         substitute_artifact_tokens(&mut started_task.config, &artifact_paths);
 
-        self.start_prepared_allocation(allocation, &started_task)
+        if gate == Gate::Stage {
+            // The whole point of the `stage` gate: everything expensive is
+            // done and nothing is executing. `ratify_claim` runs the start.
+            self.prepare_registered_allocation(allocation, &started_task)?;
+            self.set_allocation_health(allocation.id, false, "staged (awaiting ratification)");
+            return Ok(());
+        }
+        self.prepare_registered_allocation(allocation, &started_task)?;
+        self.start_registered_allocation(allocation, &started_task, gate)
     }
 
     /// Mount the allocation's volumes and expose them to the task.
@@ -1714,7 +2123,11 @@ impl WorkerTaskManager {
         max_bytes: i64,
         tail: bool,
     ) -> R<Vec<CapturedStream>> {
-        let log_dir = self.state_store.allocation_log_dir(allocation_id);
+        // Addressed by the manager's id; a ratified provisional allocation
+        // still writes under the local key it booted with.
+        let log_dir = self
+            .state_store
+            .allocation_log_dir(self.local_key(allocation_id));
         read_allocation_logs(&log_dir, stream, offset, max_bytes, tail)
     }
 
@@ -1726,6 +2139,7 @@ impl WorkerTaskManager {
         let persisted = self.state_store.load()?;
         let mut active = Vec::new();
         let mut restored = Vec::new();
+        let mut restored_claims: Vec<(i64, i64, TaskConfig)> = Vec::new();
 
         for record in persisted {
             let Some(pid) = record.pid else {
@@ -1794,8 +2208,45 @@ impl WorkerTaskManager {
                 );
             }
             self.set_allocation_health(record.allocation.id, false, "restored");
+            // A ratified provisional allocation is restored under the
+            // negative local key it booted with, so its directories, its open
+            // files and its running process all still line up. The alias to
+            // the manager's id is rebuilt here; without it the next heartbeat
+            // would report nothing for an allocation the cluster believes is
+            // running, and the manager would replace a live task.
+            if let Some(external_id) = record.external_id {
+                restored_claims.push((record.allocation.id, external_id, record.task.clone()));
+            }
             active.push(record.clone());
             restored.push((record.allocation, record.task));
+        }
+
+        // Seed the key counter below every restored key before rebuilding the
+        // aliases, so a claim admitted after the restart cannot be handed a
+        // key a running allocation is still using.
+        self.claims
+            .reserve_below(restored_claims.iter().map(|(local, _, _)| *local));
+        for (local_key, external_id, task) in restored_claims {
+            let record = ClaimRecord {
+                claim_id: format!("clm_restored_{}", external_id),
+                local_key,
+                gate: Gate::Off,
+                stage: ClaimStage::Serving,
+                lease_deadline: std::time::Instant::now(),
+                lease_deadline_unix: 0,
+                job_id: String::new(),
+                job_config_id: String::new(),
+                task_name: task.name.clone(),
+                instance_id: String::new(),
+                resources: task.resources.clone(),
+                origin: "restored".into(),
+                on_refused: OnRefused::Kill,
+                ticket_jti: String::new(),
+                allocation_id: Some(external_id),
+            };
+            if let Err(err) = self.claims.insert(record) {
+                warn!(external_id, error = ?err, "Failed to restore provisional allocation alias");
+            }
         }
 
         // One mask write for the whole restored set, after every
@@ -1809,6 +2260,18 @@ impl WorkerTaskManager {
     fn persist_state(&self) {
         let mut records = Vec::new();
         for (allocation_id, allocation) in &self.allocations {
+            // Unratified provisional work is deliberately never persisted: a
+            // worker restart kills it (edge boot plan §6.6), so writing it
+            // down would only create something to clean up. Ratified claims
+            // carry their manager-minted id in `external_id` so a restart
+            // restores the alias along with the allocation.
+            if self
+                .claims
+                .by_local_key(*allocation_id)
+                .is_some_and(|claim| !claim.is_ratified())
+            {
+                continue;
+            }
             let Some(task) = self.task_configs.get(allocation_id) else {
                 continue;
             };
@@ -1845,6 +2308,10 @@ impl WorkerTaskManager {
                     .get(allocation_id)
                     .cloned()
                     .unwrap_or_default(),
+                external_id: self
+                    .claims
+                    .by_local_key(*allocation_id)
+                    .and_then(|claim| claim.allocation_id),
             });
         }
 
@@ -1899,10 +2366,126 @@ pub fn launch_task_allocation(
             spawn_health_monitor(manager.clone(), alloc, task);
             Ok(())
         }
+        BeginOutcome::Staged(_) => Ok(()),
         BeginOutcome::Staging(job) => {
             spawn_staging_thread(manager.clone(), *job);
             Ok(())
         }
+    }
+}
+
+/// Launch a provisional allocation, respecting its gate.
+///
+/// The mirror of [`launch_task_allocation`] for work the store has not
+/// recorded yet: the payload's allocation id is the claim's worker-local key,
+/// and a failure is reported through the claim's kill path rather than as a
+/// failed allocation the manager would try to reschedule.
+pub fn launch_provisional_allocation(
+    manager: &Arc<Mutex<WorkerTaskManager>>,
+    allocation: &TaskAllocation,
+    claim_id: &str,
+    gate: Gate,
+) -> R<()> {
+    let outcome = {
+        let mut guard = manager.lock().expect("task manager");
+        match guard.begin_task_allocation_gated(allocation, gate) {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                guard.kill_claim(claim_id, &format!("provisional start failed: {err:#}"));
+                return Err(err);
+            }
+        }
+    };
+
+    match outcome {
+        BeginOutcome::Started(started) => {
+            let (alloc, task) = *started;
+            manager
+                .lock()
+                .expect("task manager")
+                .set_claim_stage(claim_id, stage_for(gate));
+            spawn_health_monitor(manager.clone(), alloc, task);
+            Ok(())
+        }
+        BeginOutcome::Staged(_) => {
+            manager
+                .lock()
+                .expect("task manager")
+                .set_claim_stage(claim_id, ClaimStage::Staged);
+            Ok(())
+        }
+        BeginOutcome::Staging(job) => {
+            spawn_provisional_staging_thread(manager.clone(), *job, claim_id.to_string());
+            Ok(())
+        }
+    }
+}
+
+/// The stage a claim has reached once its launch returns, given its gate.
+fn stage_for(gate: Gate) -> ClaimStage {
+    match gate {
+        Gate::Off | Gate::Stage => ClaimStage::Staged,
+        Gate::Boot => ClaimStage::Booted,
+        Gate::Serve => ClaimStage::Serving,
+    }
+}
+
+/// Stage a provisional allocation's artifacts, then take it to its gate.
+///
+/// Separate from [`spawn_staging_thread`] only in its failure handling: a
+/// provisional start that fails is killed as a claim (releasing its ledger
+/// hold and its instance slot), never reported as a failed allocation — the
+/// manager has no allocation to reschedule.
+fn spawn_provisional_staging_thread(
+    manager: Arc<Mutex<WorkerTaskManager>>,
+    job: StagingJob,
+    claim_id: String,
+) {
+    let allocation_id = job.allocation.id;
+    let gate = job.gate;
+    let manager_for_thread = manager.clone();
+    let claim_for_thread = claim_id.clone();
+    let spawned = std::thread::Builder::new()
+        .name(format!("provisional-staging-{allocation_id}"))
+        .spawn(move || {
+            let manager = manager_for_thread;
+            let result = job.stager.stage_task_artifacts(
+                allocation_id,
+                &job.task_dir,
+                &job.task.artifacts,
+                &job.board,
+            );
+
+            let started = {
+                let mut guard = manager.lock().expect("task manager");
+                if !guard.is_allocation_active(allocation_id) {
+                    debug!(allocation_id, "Claim removed while staging artifacts");
+                    return;
+                }
+                let claim_id = claim_for_thread.as_str();
+                match result.and_then(|staged| {
+                    guard.start_staged_allocation(&job.allocation, &job.task, staged, gate)
+                }) {
+                    Ok(()) => {
+                        guard.set_claim_stage(claim_id, stage_for(gate));
+                        true
+                    }
+                    Err(err) => {
+                        guard.kill_claim(claim_id, &format!("provisional staging failed: {err:#}"));
+                        false
+                    }
+                }
+            };
+            if started && gate != Gate::Stage {
+                spawn_health_monitor(manager, job.allocation, job.task);
+            }
+        });
+    if let Err(err) = spawned {
+        error!(allocation_id, error = ?err, "Failed to spawn provisional staging thread");
+        manager
+            .lock()
+            .expect("task manager")
+            .kill_claim(&claim_id, &format!("spawn staging thread: {err}"));
     }
 }
 
@@ -1930,7 +2513,12 @@ fn spawn_staging_thread(manager: Arc<Mutex<WorkerTaskManager>>, job: StagingJob)
                 }
                 match result {
                     Ok(staged) => {
-                        match guard.start_staged_allocation(&job.allocation, &job.task, staged) {
+                        match guard.start_staged_allocation(
+                            &job.allocation,
+                            &job.task,
+                            staged,
+                            job.gate,
+                        ) {
                             Ok(()) => true,
                             Err(err) => {
                                 guard.record_failure(
@@ -1950,7 +2538,9 @@ fn spawn_staging_thread(manager: Arc<Mutex<WorkerTaskManager>>, job: StagingJob)
                     }
                 }
             };
-            if started {
+            // A staged-but-not-started allocation has nothing to health
+            // check yet; the monitor starts when ratification does.
+            if started && job.gate != Gate::Stage {
                 spawn_health_monitor(manager, job.allocation, job.task);
             }
         });
@@ -1970,6 +2560,13 @@ fn parse_volume_mounts(allocation: &TaskAllocation) -> R<Vec<VolumeMount>> {
         return Ok(Vec::new());
     }
     serde_json::from_str(&allocation.task_volumes).context("Invalid task volumes JSON")
+}
+
+/// Parse a dispatch payload into its allocation and task config. Public so
+/// the edge-boot spec cache can record what a node has been asked to run
+/// without duplicating the parsing rules.
+pub fn task_and_allocation(allocation: &TaskAllocation) -> R<(Allocation, TaskConfig)> {
+    task_from_allocation(allocation)
 }
 
 fn task_from_allocation(allocation: &TaskAllocation) -> R<(Allocation, TaskConfig)> {
@@ -2083,6 +2680,317 @@ mod tests {
         let mut manager = WorkerTaskManager::with_state_store(state_store);
         manager.load_builtin_plugins();
         manager
+    }
+
+    // -----------------------------------------------------------------
+    // Provisional allocations (docs/edge-boot.md)
+    // -----------------------------------------------------------------
+
+    fn provisional_payload(local_key: i64) -> TaskAllocation {
+        TaskAllocation {
+            allocation_id: local_key,
+            job_id: "agent-sandboxes".into(),
+            job_config_id: "jc-1".into(),
+            node_id: "node-1".into(),
+            task_config_id: 7,
+            task_name: "workspace".into(),
+            // `exec` rather than `noop`: the noop runtime is a dylib that
+            // is not built for unit tests, and a real host process is the
+            // stronger check anyway — a `stage`-gated claim must leave no
+            // process behind.
+            task_runtime: "exec".into(),
+            task_config: json!({ "command": ["sleep", "30"] }).to_string(),
+            task_checks: String::new(),
+            task_on_unhealthy: String::new(),
+            network: String::new(),
+            task_connect: String::new(),
+            task_artifacts: String::new(),
+            task_identities: String::new(),
+            self_terminate_after_seconds: 0,
+            task_volumes: String::new(),
+            task_resources: json!({ "memory": 256 }).to_string(),
+            task_stop: String::new(),
+            provisional: None,
+        }
+    }
+
+    fn claim_record(claim_id: &str, instance_id: &str, gate: Gate) -> ClaimRecord {
+        ClaimRecord {
+            claim_id: claim_id.into(),
+            local_key: 0,
+            gate,
+            stage: ClaimStage::Claimed,
+            lease_deadline: std::time::Instant::now() + std::time::Duration::from_secs(5),
+            lease_deadline_unix: 0,
+            job_id: "agent-sandboxes".into(),
+            job_config_id: "jc-1".into(),
+            task_name: "workspace".into(),
+            instance_id: instance_id.into(),
+            resources: json!({ "memory": 256 }),
+            origin: "edge".into(),
+            on_refused: OnRefused::Kill,
+            ticket_jti: String::new(),
+            allocation_id: None,
+        }
+    }
+
+    #[test]
+    fn a_stage_gated_claim_prepares_without_starting_anything() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let mut manager = manager_in(&temp_dir);
+        let admitted = manager.admit_claim(claim_record("clm_a", "user-42", Gate::Stage))?;
+
+        let outcome = manager
+            .begin_task_allocation_gated(&provisional_payload(admitted.local_key), Gate::Stage)?;
+        assert!(
+            matches!(outcome, BeginOutcome::Staged(..)),
+            "a stage-gated launch must stop short of start"
+        );
+        // Registered (so it can be stopped) but reported as staged, not
+        // running: nothing outside the node can observe it.
+        assert!(manager.is_allocation_active(admitted.local_key));
+        let health = manager.allocation_health;
+        let entry = health.get(&admitted.local_key).expect("health entry");
+        assert_eq!(entry.status, "staged (awaiting ratification)");
+        Ok(())
+    }
+
+    #[test]
+    fn an_unratified_claim_is_absent_from_everything_the_manager_reads() -> R<()> {
+        // The manager must not be told about work it has not recorded: a
+        // negative local key reported as a running allocation would be a lie
+        // the reconcile loop acts on.
+        let temp_dir = TempDir::new()?;
+        let mut manager = manager_in(&temp_dir);
+        let admitted = manager.admit_claim(claim_record("clm_a", "user-42", Gate::Boot))?;
+        manager
+            .begin_task_allocation_gated(&provisional_payload(admitted.local_key), Gate::Boot)?;
+
+        assert!(manager.allocations_snapshot().is_empty());
+        assert!(manager.allocation_health_snapshot().is_empty());
+        assert_eq!(manager.unratified_claims().len(), 1);
+
+        // Once ratified it appears under the manager's id, and disappears
+        // from the provisional report.
+        let mut committed = provisional_payload(admitted.local_key);
+        committed.allocation_id = 8123;
+        manager.ratify_claim("clm_a", &committed)?;
+        assert_eq!(manager.allocations_snapshot(), vec![8123]);
+        assert!(manager.unratified_claims().is_empty());
+        assert_eq!(manager.local_key(8123), admitted.local_key);
+        Ok(())
+    }
+
+    #[test]
+    fn an_unratified_claim_survives_a_heartbeat_that_omits_it() -> R<()> {
+        // The protection window. The manager cannot list work it does not
+        // know about, so an absence here is ignorance, not a decision —
+        // reading it as "stop this" would kill every provisional start on its
+        // first heartbeat.
+        let temp_dir = TempDir::new()?;
+        let mut manager = manager_in(&temp_dir);
+        let admitted = manager.admit_claim(claim_record("clm_a", "user-42", Gate::Boot))?;
+        manager
+            .begin_task_allocation_gated(&provisional_payload(admitted.local_key), Gate::Boot)?;
+
+        manager.reconcile_allocations(&[]);
+        assert!(
+            manager.is_allocation_active(admitted.local_key),
+            "an unratified claim must not be reconciled away"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_ratified_claim_is_reconciled_like_any_other_allocation() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let mut manager = manager_in(&temp_dir);
+        let admitted = manager.admit_claim(claim_record("clm_a", "user-42", Gate::Boot))?;
+        manager
+            .begin_task_allocation_gated(&provisional_payload(admitted.local_key), Gate::Boot)?;
+        let mut committed = provisional_payload(admitted.local_key);
+        committed.allocation_id = 8123;
+        manager.ratify_claim("clm_a", &committed)?;
+
+        // Still desired: nothing happens, and no relaunch is proposed.
+        let mut desired = provisional_payload(admitted.local_key);
+        desired.allocation_id = 8123;
+        assert!(manager.reconcile_allocations(&[desired]).is_empty());
+        assert!(manager.is_allocation_active(admitted.local_key));
+
+        // No longer desired: the protection window is over, so it stops.
+        manager.reconcile_allocations(&[]);
+        assert!(!manager.is_allocation_active(admitted.local_key));
+        Ok(())
+    }
+
+    #[test]
+    fn an_expired_lease_kills_the_claim_and_releases_its_capacity() -> R<()> {
+        // The backstop for every failure the reply path cannot cover.
+        let temp_dir = TempDir::new()?;
+        let mut manager = manager_in(&temp_dir);
+        manager.configure_ledger(LocalLedger::new(
+            &json!({ "memory": 512 }),
+            &json!({}),
+            None,
+        ));
+        let mut record = claim_record("clm_a", "user-42", Gate::Boot);
+        record.lease_deadline = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        let admitted = manager.admit_claim(record)?;
+        manager
+            .begin_task_allocation_gated(&provisional_payload(admitted.local_key), Gate::Boot)?;
+
+        let killed = manager.sweep_expired_claims(std::time::Instant::now());
+        assert_eq!(killed.len(), 1);
+        assert!(!manager.is_allocation_active(admitted.local_key));
+        // The ledger hold is gone, so the node can admit the next start.
+        manager.admit_claim(claim_record("clm_b", "user-43", Gate::Boot))?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_ratified_claim_is_not_swept_by_its_lease() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let mut manager = manager_in(&temp_dir);
+        let mut record = claim_record("clm_a", "user-42", Gate::Boot);
+        record.lease_deadline = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        let admitted = manager.admit_claim(record)?;
+        manager
+            .begin_task_allocation_gated(&provisional_payload(admitted.local_key), Gate::Boot)?;
+        let mut committed = provisional_payload(admitted.local_key);
+        committed.allocation_id = 8123;
+        manager.ratify_claim("clm_a", &committed)?;
+
+        assert!(manager
+            .sweep_expired_claims(std::time::Instant::now())
+            .is_empty());
+        assert!(manager.is_allocation_active(admitted.local_key));
+        Ok(())
+    }
+
+    #[test]
+    fn a_refused_claim_reports_nothing_to_the_manager() -> R<()> {
+        // A provisional allocation the manager never knew about must not
+        // arrive as a failed allocation: there is nothing to reschedule, and
+        // a phantom failure would look like a real workload dying.
+        let temp_dir = TempDir::new()?;
+        let mut manager = manager_in(&temp_dir);
+        let admitted = manager.admit_claim(claim_record("clm_a", "user-42", Gate::Boot))?;
+        manager
+            .begin_task_allocation_gated(&provisional_payload(admitted.local_key), Gate::Boot)?;
+
+        manager.kill_claim("clm_a", "instance claimed elsewhere");
+        assert!(manager.drain_failures().is_empty());
+        assert!(manager.drain_terminations().is_empty());
+        assert!(manager.allocation_health_snapshot().is_empty());
+        assert!(manager.unratified_claims().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn a_second_claim_for_the_same_instance_is_refused_locally() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let mut manager = manager_in(&temp_dir);
+        manager.admit_claim(claim_record("clm_a", "user-42", Gate::Boot))?;
+        assert!(manager
+            .admit_claim(claim_record("clm_b", "user-42", Gate::Boot))
+            .is_err());
+        assert!(manager.instance_is_claimed("user-42"));
+        Ok(())
+    }
+
+    #[test]
+    fn ratifying_an_unknown_claim_is_an_error_not_a_silent_no_op() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let mut manager = manager_in(&temp_dir);
+        let mut committed = provisional_payload(-1);
+        committed.allocation_id = 8123;
+        assert!(manager.ratify_claim("clm_missing", &committed).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn a_duplicate_verdict_is_a_no_op() -> R<()> {
+        // The RatifyClaim reply and the heartbeat catch-up can both land.
+        let temp_dir = TempDir::new()?;
+        let mut manager = manager_in(&temp_dir);
+        let admitted = manager.admit_claim(claim_record("clm_a", "user-42", Gate::Boot))?;
+        manager
+            .begin_task_allocation_gated(&provisional_payload(admitted.local_key), Gate::Boot)?;
+        let mut committed = provisional_payload(admitted.local_key);
+        committed.allocation_id = 8123;
+        manager.ratify_claim("clm_a", &committed)?;
+        let again = manager.ratify_claim("clm_a", &committed)?;
+        assert_eq!(again.claim.allocation_id, Some(8123));
+        assert!(
+            again.start_health_monitor.is_none(),
+            "a duplicate verdict must not start a second health monitor"
+        );
+        assert_eq!(manager.allocations_snapshot(), vec![8123]);
+        Ok(())
+    }
+
+    #[test]
+    fn ratifying_a_stage_gated_claim_starts_it_and_asks_for_a_health_monitor() -> R<()> {
+        // The `stage` gate is a pause between prepare and start, so this is
+        // the point at which the workload becomes real — and the point at
+        // which it needs supervising.
+        let temp_dir = TempDir::new()?;
+        let mut manager = manager_in(&temp_dir);
+        let admitted = manager.admit_claim(claim_record("clm_a", "user-42", Gate::Stage))?;
+        manager
+            .begin_task_allocation_gated(&provisional_payload(admitted.local_key), Gate::Stage)?;
+
+        let mut committed = provisional_payload(admitted.local_key);
+        committed.allocation_id = 8123;
+        let ratified = manager.ratify_claim("clm_a", &committed)?;
+        assert!(
+            ratified.start_health_monitor.is_some(),
+            "a stage-gated claim starts at ratification and must be monitored"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn ratifying_a_boot_gated_claim_does_not_restart_its_monitor() -> R<()> {
+        // A `boot`-gated claim was already running (and already monitored);
+        // ratification only opens its network.
+        let temp_dir = TempDir::new()?;
+        let mut manager = manager_in(&temp_dir);
+        let admitted = manager.admit_claim(claim_record("clm_a", "user-42", Gate::Boot))?;
+        manager
+            .begin_task_allocation_gated(&provisional_payload(admitted.local_key), Gate::Boot)?;
+
+        let mut committed = provisional_payload(admitted.local_key);
+        committed.allocation_id = 8123;
+        let ratified = manager.ratify_claim("clm_a", &committed)?;
+        assert!(ratified.start_health_monitor.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn ratification_adopts_the_committed_payload() -> R<()> {
+        // The payload a node booted with could not name assigned ports or a
+        // bound instance; the verdict's payload replaces it before anything
+        // starts.
+        let temp_dir = TempDir::new()?;
+        let mut manager = manager_in(&temp_dir);
+        let admitted = manager.admit_claim(claim_record("clm_a", "user-42", Gate::Stage))?;
+        manager
+            .begin_task_allocation_gated(&provisional_payload(admitted.local_key), Gate::Stage)?;
+
+        let mut committed = provisional_payload(admitted.local_key);
+        committed.allocation_id = 8123;
+        committed.task_config =
+            json!({ "command": ["sleep", "30"], "env": { "LEGION_ALLOC_ID": "8123" } }).to_string();
+        manager.ratify_claim("clm_a", &committed)?;
+
+        let stored = manager
+            .task_configs
+            .get(&admitted.local_key)
+            .expect("task config");
+        assert_eq!(stored.config["env"]["LEGION_ALLOC_ID"], json!("8123"));
+        Ok(())
     }
 
     /// The supervisor's eyes: a process that has exited must be seen exactly
@@ -2361,6 +3269,8 @@ mod tests {
         // shape a preemption plan produces, since victim and preemptor commit
         // together and arrive in one heartbeat diff.
         let preemptor = TaskAllocation {
+            task_stop: String::new(),
+            provisional: None,
             allocation_id: 6,
             ..Default::default()
         };
@@ -2693,6 +3603,8 @@ mod tests {
         let mut manager = manager_in(&temp_dir);
 
         let ta = TaskAllocation {
+            task_stop: String::new(),
+            provisional: None,
             task_volumes: String::new(),
             allocation_id: 9,
             job_id: "job".into(),
@@ -2812,6 +3724,8 @@ mod tests {
         artifact.name = Some("tool".into());
         artifact.unpack = crate::structs::ArtifactUnpack::File;
         let ta = TaskAllocation {
+            task_stop: String::new(),
+            provisional: None,
             task_volumes: String::new(),
             allocation_id: 11,
             job_id: "job".into(),
@@ -2834,7 +3748,14 @@ mod tests {
         let outcome = manager.begin_task_allocation(&ta)?;
         let job = match outcome {
             BeginOutcome::Staging(job) => job,
-            BeginOutcome::Started(..) => panic!("artifact task must stage"),
+            other => panic!(
+                "artifact task must stage, got {}",
+                match other {
+                    BeginOutcome::Started(..) => "started",
+                    BeginOutcome::Staged(..) => "staged",
+                    BeginOutcome::Staging(..) => unreachable!(),
+                }
+            ),
         };
 
         // Without a manifest, fresh staging clears the leftovers and fetches.
@@ -2857,6 +3778,8 @@ mod tests {
 
         let artifacts = vec![ArtifactSpec::from_source("https://example.com/tool.tar.gz")];
         let ta = TaskAllocation {
+            task_stop: String::new(),
+            provisional: None,
             task_volumes: String::new(),
             allocation_id: 11,
             job_id: "job".into(),
@@ -2881,7 +3804,7 @@ mod tests {
         let outcome = manager.begin_task_allocation(&ta)?;
         let job = match outcome {
             BeginOutcome::Staging(job) => job,
-            BeginOutcome::Started(..) => panic!("artifact task must stage"),
+            _ => panic!("artifact task must stage"),
         };
         assert_eq!(job.task.artifacts.len(), 1);
         assert!(manager.is_allocation_active(11));
@@ -2933,7 +3856,7 @@ mod tests {
                 dir: staged_dir.clone(),
             },
         }];
-        manager.start_staged_allocation(&allocation, &task, staged)?;
+        manager.start_staged_allocation(&allocation, &task, staged, Gate::Off)?;
 
         let instance = manager.instances.get(&allocation.id).expect("instance");
         assert_eq!(

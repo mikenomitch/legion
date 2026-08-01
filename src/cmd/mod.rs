@@ -2,6 +2,7 @@
 
 pub mod acl;
 pub mod action;
+pub mod boot_ticket;
 pub mod capabilities;
 pub mod docs;
 pub mod events;
@@ -19,6 +20,7 @@ pub mod node;
 pub mod oidc;
 pub mod output;
 pub mod raft;
+pub mod sandbox;
 pub mod service;
 pub mod start;
 pub mod state;

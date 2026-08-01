@@ -346,6 +346,9 @@ struct PlanApplyRequest {
     /// same request, applied in the same transaction, fenced by the same
     /// `expected_versions` compare-and-set.
     evictions: Vec<PlanEviction>,
+    /// Bind exactly this keyed instance (docs/edge-boot.md). Empty for every
+    /// ordinary plan, which keeps the "any unbound instance" binding.
+    target_instance: String,
 }
 
 /// One allocation a plan will evict, as it rides the `plan_submission` row.
@@ -1726,6 +1729,7 @@ impl Store {
             let schedule = self.parse_schedule_column(7, row.get(7)?)?;
             let depends_on = self.parse_depends_on_column(8, row.get(8)?)?;
             let task = TaskConfig {
+                speculative_start: None,
                 name: row.get(1)?,
                 runtime: row.get(2)?,
                 count: TaskCount {
@@ -2476,6 +2480,7 @@ impl Store {
                 &placements_json,
                 &expected_versions,
                 &[],
+                "",
             )
         })
     }
@@ -2512,12 +2517,16 @@ impl Store {
                     "format": 2,
                     "placements": placements,
                 }))?;
+                // No target instance: a keyed instance is named only by
+                // ratification, which submits the single-node format
+                // (`submit_and_apply_plan_for_instance`).
                 s.insert_plan_submission_apply(
                     &job_config_id,
                     &mode,
                     &placements_json,
                     &expected_versions,
                     &[],
+                    "",
                 )
             },
         )
@@ -2530,6 +2539,7 @@ impl Store {
         placements_json: &str,
         expected_versions: &BTreeMap<String, i64>,
         evictions: &[PlanEviction],
+        target_instance: &str,
     ) -> R<PlanSubmission> {
         let created_at = OffsetDateTime::now_utc().format(&Rfc3339)?;
         let evictions_json = serde_json::to_string(evictions)?;
@@ -2539,7 +2549,7 @@ impl Store {
             .unwrap_or(&0);
         let conn = self.write_connection()?;
         let id = conn.query_row(
-            "INSERT INTO plan_submission(job_config_id, mode, placements, expected_epoch, expected_version_vector, status, created_at, evictions) VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6, ?7) RETURNING id;",
+            "INSERT INTO plan_submission(job_config_id, mode, placements, expected_epoch, expected_version_vector, status, created_at, evictions, target_instance) VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6, ?7, ?8) RETURNING id;",
             params![
                 job_config_id,
                 mode,
@@ -2547,7 +2557,8 @@ impl Store {
                 expected_job_epoch,
                 expected_vector_json,
                 created_at,
-                evictions_json
+                evictions_json,
+                target_instance
             ],
             |row| row.get(0),
         )?;
@@ -2584,12 +2595,42 @@ impl Store {
         expected_versions: &BTreeMap<String, i64>,
         evictions: &[PlanEviction],
     ) -> R<(PlanSubmission, PlanApplyOutcome)> {
+        self.submit_and_apply_plan_for_instance(
+            job_config_id,
+            mode,
+            placements,
+            expected_versions,
+            evictions,
+            "",
+        )
+    }
+
+    /// [`Self::submit_and_apply_plan`] that binds one specific keyed
+    /// instance, or fails.
+    ///
+    /// This is the whole of ratification (docs/edge-boot.md): a plan
+    /// submission whose placement list has length one and whose instance is
+    /// named. It goes through `apply_plan_submission_apply` like every other
+    /// plan — the same epoch compare-and-set, the same constraint
+    /// re-validation on the fresh node row, the same
+    /// `assign_stateful_instance_tx` — so "someone else already owns this
+    /// sandbox" is the existing conflict, not a new consistency mechanism.
+    pub fn submit_and_apply_plan_for_instance(
+        &self,
+        job_config_id: &str,
+        mode: &str,
+        placements: &[(String, i64)],
+        expected_versions: &BTreeMap<String, i64>,
+        evictions: &[PlanEviction],
+        target_instance: &str,
+    ) -> R<(PlanSubmission, PlanApplyOutcome)> {
         let request = PlanApplyRequest {
             job_config_id: job_config_id.to_owned(),
             mode: mode.to_owned(),
             placements: PlanPlacements::Nodes(placements.to_vec()),
             expected_versions: expected_versions.clone(),
             evictions: evictions.to_vec(),
+            target_instance: target_instance.to_owned(),
         };
         let (submission, outcome) = if self.plan_apply_coalescing_enabled() {
             let coalescer = Arc::clone(&self.plan_coalescer);
@@ -2636,6 +2677,7 @@ impl Store {
                         &request.placements,
                         &request.expected_versions,
                         &request.evictions,
+                        &request.target_instance,
                     )
                 })
             }
@@ -2649,6 +2691,7 @@ impl Store {
                         &request.placements,
                         &request.expected_versions,
                         &request.evictions,
+                        &request.target_instance,
                     )
                 },
             ),
@@ -2665,6 +2708,7 @@ impl Store {
                 &request.placements,
                 &request.expected_versions,
                 &request.evictions,
+                &request.target_instance,
             ),
             PlanPlacements::Candidates(_) => self.submit_and_apply_plan_with_candidates_apply(
                 &request.job_config_id,
@@ -2672,6 +2716,7 @@ impl Store {
                 &request.placements,
                 &request.expected_versions,
                 &request.evictions,
+                &request.target_instance,
             ),
         }
     }
@@ -2763,6 +2808,7 @@ impl Store {
         placements: &PlanPlacements,
         expected_versions: &BTreeMap<String, i64>,
         evictions: &[PlanEviction],
+        target_instance: &str,
     ) -> R<(PlanSubmission, PlanApplyOutcome)> {
         let placements_json = placements.to_json()?;
         let submission = self.insert_plan_submission_apply(
@@ -2771,6 +2817,7 @@ impl Store {
             &placements_json,
             expected_versions,
             evictions,
+            target_instance,
         )?;
         let outcome = self.apply_plan_submission_apply(&submission)?;
         Ok((submission, outcome))
@@ -2802,6 +2849,9 @@ impl Store {
             placements: PlanPlacements::Candidates(placements.to_vec()),
             expected_versions: expected_versions.clone(),
             evictions: evictions.to_vec(),
+            // Candidate lists are the scheduler's shape; ratification names
+            // its keyed instance through the single-node entry point.
+            target_instance: String::new(),
         };
         let (submission, outcome) = if self.plan_apply_coalescing_enabled() {
             let coalescer = Arc::clone(&self.plan_coalescer);
@@ -2823,6 +2873,7 @@ impl Store {
         placements: &PlanPlacements,
         expected_versions: &BTreeMap<String, i64>,
         evictions: &[PlanEviction],
+        target_instance: &str,
     ) -> R<(PlanSubmission, PlanApplyOutcome)> {
         self.submit_and_apply_plan_apply(
             job_config_id,
@@ -2830,6 +2881,7 @@ impl Store {
             placements,
             expected_versions,
             evictions,
+            target_instance,
         )
     }
 
@@ -3028,13 +3080,23 @@ impl Store {
             return reject(tx, reason, None);
         }
 
-        let (placements_json, plan_mode, evictions_json): (String, String, String) = tx.query_row(
-            "SELECT placements, mode, evictions FROM plan_submission WHERE id = ?1;",
+        let (placements_json, plan_mode, evictions_json, target_instance): (
+            String,
+            String,
+            String,
+            Option<String>,
+        ) = tx.query_row(
+            "SELECT placements, mode, evictions, target_instance FROM plan_submission \
+             WHERE id = ?1;",
             [submission.id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )?;
         let placements = Self::parse_plan_submission_placements(&placements_json)?;
         let evictions: Vec<PlanEviction> = serde_json::from_str(&evictions_json)?;
+        // Only a ratification sets this, and it always carries exactly one
+        // placement (docs/edge-boot.md): "bind this sandbox on this node, or
+        // tell me who beat me to it".
+        let target_instance = target_instance.filter(|id| !id.is_empty());
 
         // ---- Preemption: victims leave before the placements they paid for
         // arrive, inside this same transaction.
@@ -3264,6 +3326,7 @@ impl Store {
                     &state.job_config_id,
                     &state.resources,
                     network.as_ref(),
+                    target_instance.as_deref(),
                 )?;
                 allocations.push(allocation);
                 candidate_ranks.push(rank);
@@ -3940,6 +4003,7 @@ impl Store {
             host_volumes: row.get(9)?,
             heartbeat_seconds: row.get(10)?,
             resource_enforcement: row.get(11)?,
+            edge_boot: row.get(12)?,
         })
     }
 
@@ -4155,6 +4219,7 @@ impl Store {
             restart: parse_json_column(27, row.get(27)?)?,
             stop: parse_json_column(28, row.get(28)?)?,
             disruption: parse_json_column(29, row.get(29)?)?,
+            speculative_start: parse_json_column(30, row.get(30)?)?,
         };
 
         Ok(task_config)
@@ -5500,6 +5565,7 @@ impl Store {
             ":host_volumes": config.host_volumes,
             ":heartbeat_seconds": config.heartbeat_seconds,
             ":resource_enforcement": config.resource_enforcement,
+            ":edge_boot": config.edge_boot,
         };
 
         let config = conn.query_row(&INSERT_WORKER_TYPE, params, |row| {
@@ -6500,6 +6566,11 @@ impl Store {
                 .as_ref()
                 .map(serde_json::to_string)
                 .transpose()?;
+            let speculative_start = t
+                .speculative_start
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?;
             let schedule = t.schedule.as_ref().map(ToString::to_string);
             let task_params = named_params! {
                 ":name": t.name,
@@ -6531,6 +6602,7 @@ impl Store {
                 ":restart": restart,
                 ":stop": stop,
                 ":disruption": disruption,
+                ":speculative_start": speculative_start,
             };
 
             let task_id: i64 = tx.query_row(&INSERT_TASK, task_params, |row| row.get(0))?;
@@ -7958,6 +8030,32 @@ impl Store {
     }
 
     #[instrument(err, skip_all)]
+    /// The job and job config a task config belongs to. `None` when the row
+    /// is gone (a job destroyed between a plan and its dispatch).
+    pub fn task_config_job_ids(&self, task_config_id: i64) -> R<Option<(String, String)>> {
+        let conn = self.read_connection()?;
+        conn.query_row(
+            "SELECT job_id, job_config_id FROM task_config WHERE id = ?;",
+            [task_config_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    /// One task config by its row id. `None` when the row is gone (a job
+    /// destroyed between a plan and its dispatch).
+    pub fn get_task_config_by_id(&self, task_config_id: i64) -> R<Option<TaskConfig>> {
+        let conn = self.read_connection()?;
+        conn.query_row(
+            &crate::storage::queries::GET_TASK_BY_ID,
+            [task_config_id],
+            |row| self.task_config_from_row(row),
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
     pub fn get_task_configs_for_job_config(
         &self,
         job_config_id: &str,
@@ -8187,6 +8285,7 @@ impl Store {
             &job_config_id,
             &resources,
             network.as_ref(),
+            None,
         )
     }
 
@@ -8272,12 +8371,18 @@ impl Store {
         job_config_id: &str,
         resources: &Value,
         network: Option<&crate::structs::AllocNetwork>,
+        // Bind exactly this keyed instance, or fail. Set only by a
+        // ratification (docs/edge-boot.md), which is racing for one specific
+        // sandbox; `None` keeps the ordinary "any unbound instance" binding
+        // every other placement path uses.
+        target_instance: Option<&str>,
     ) -> R<Allocation> {
         let network_json = network.map(to_string).transpose()?;
         // Stateful tasks: pick (or re-materialize) the instance this
         // allocation will fulfill before writing the row, so the binding is
         // atomic with the placement.
-        let instance_id = self.assign_stateful_instance_tx(tx, task_id, node_id)?;
+        let instance_id =
+            self.assign_stateful_instance_tx(tx, task_id, node_id, target_instance)?;
 
         let params = named_params! {
             ":status": "placed",
@@ -8329,6 +8434,7 @@ impl Store {
         tx: &Connection,
         task_id: i64,
         node_id: &str,
+        target_instance: Option<&str>,
     ) -> R<Option<String>> {
         let (job_id, group, task_name, count, stateful): (
             String,
@@ -8358,9 +8464,22 @@ impl Store {
         if stateful.mode == InstanceMode::Keyed {
             return self
                 .assign_keyed_instance_tx(
-                    tx, task_id, &job_id, &group, &task_name, &stateful, node_id,
+                    tx,
+                    task_id,
+                    &job_id,
+                    &group,
+                    &task_name,
+                    &stateful,
+                    node_id,
+                    target_instance,
                 )
                 .map(Some);
+        }
+        if target_instance.is_some_and(|id| !id.is_empty()) {
+            // Slot ids are derived from the slot ordinal, so "bind exactly
+            // this id" is not a thing a slot-mode task can be asked for. Edge
+            // boot only ever targets keyed instances.
+            bail!("targeting a specific instance is only supported for keyed tasks");
         }
 
         // Slots already fulfilled by live allocations of this task config.
@@ -8535,6 +8654,7 @@ impl Store {
         task_name: &str,
         stateful: &StatefulConfig,
         node_id: &str,
+        target_instance: Option<&str>,
     ) -> R<String> {
         // Unbound live instances of this (job, group, task), oldest first.
         // Ordering by `node_local_pin DESC` first makes an allocation bind the
@@ -8557,19 +8677,42 @@ impl Store {
                      SELECT instance_id FROM allocation \
                      WHERE task_config_id = ?4 AND instance_id IS NOT NULL\
                  ) \
+                 AND (?6 = '' OR instance.instance_id = ?6) \
                  ORDER BY (volume.node_id = ?5) DESC, instance.created_at ASC, \
                  instance.instance_id ASC LIMIT 1;",
-                params![job_id, group, task_name, task_id, node_id],
+                params![
+                    job_id,
+                    group,
+                    task_name,
+                    task_id,
+                    node_id,
+                    target_instance.unwrap_or_default()
+                ],
                 |row| self.instance_from_row(row),
             )
             .optional()?;
 
-        let instance = instance.with_context(|| {
-            format!(
+        let instance = match instance {
+            Some(instance) => instance,
+            // A ratification names the instance it raced for, and losing that
+            // race is the ordinary outcome, not an error to paper over: if
+            // `user-42` is already bound, this apply must fail rather than
+            // silently bind some *other* unbound sandbox and hand the caller
+            // a workload under an identity nobody asked for.
+            None if target_instance.is_some_and(|id| !id.is_empty()) => {
+                let target = target_instance.unwrap_or_default();
+                bail!(StorageError::Conflict {
+                    message: format!(
+                        "keyed instance {target} is not available to bind (already bound to \
+                         another allocation of this task config, stopped, or terminated)"
+                    ),
+                });
+            }
+            None => bail!(
                 "no unbound keyed instance for task {task_name} (group {group}, job {job_id}); \
                  keyed allocations are driven by CreateInstance, not count"
-            )
-        })?;
+            ),
+        };
 
         if instance.storage_handle.is_none() {
             if let Some(handle) = self.mint_instance_volume_tx(
@@ -15144,6 +15287,7 @@ mod tests {
         let worker_config = WorkerConfig {
             host_volumes: String::new(),
             resource_enforcement: String::new(),
+            edge_boot: String::new(),
             name: "test".to_string(),
             pool: "default".to_string(),
             additional_node_checks: vec![],
@@ -15180,6 +15324,7 @@ mod tests {
         let worker_config = WorkerConfig {
             host_volumes: String::new(),
             resource_enforcement: String::new(),
+            edge_boot: String::new(),
             name: "empty".to_string(),
             pool: "default".to_string(),
             additional_node_checks: vec![],
@@ -16725,6 +16870,7 @@ mod tests {
                 placements: PlanPlacements::Nodes(vec![("node-a".to_string(), task_a)]),
                 expected_versions: versions_a,
                 evictions: Vec::new(),
+                target_instance: String::new(),
             },
             PlanApplyRequest {
                 job_config_id: job_b.clone(),
@@ -16732,6 +16878,7 @@ mod tests {
                 placements: PlanPlacements::Nodes(vec![("node-c".to_string(), 999_999)]),
                 expected_versions: versions_b,
                 evictions: Vec::new(),
+                target_instance: String::new(),
             },
             PlanApplyRequest {
                 job_config_id: job_c.clone(),
@@ -16739,6 +16886,7 @@ mod tests {
                 placements: PlanPlacements::Nodes(vec![("node-b".to_string(), task_c)]),
                 expected_versions: versions_c,
                 evictions: Vec::new(),
+                target_instance: String::new(),
             },
         ]);
 
@@ -16779,6 +16927,7 @@ mod tests {
             placements: PlanPlacements::Nodes(vec![("node-a".to_string(), task_b)]),
             expected_versions: stale,
             evictions: Vec::new(),
+            target_instance: String::new(),
         }]);
         assert!(
             matches!(results[0], Ok((_, PlanApplyOutcome::Rejected { .. }))),

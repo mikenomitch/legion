@@ -1045,6 +1045,19 @@ pub struct WorkerMetrics {
     pub allocations_running: Arc<Gauge>,
     /// `legion_worker_allocation_failures_reported_total`
     pub allocation_failures_reported_total: Arc<Counter>,
+    /// `legion_provisional_starts_total{origin,gate}` — provisional
+    /// allocations admitted on this node (docs/edge-boot.md).
+    pub provisional_starts_total: Arc<CounterVec>,
+    /// `legion_provisional_refused_total{reason}` — ratifications refused.
+    pub provisional_refused_total: Arc<CounterVec>,
+    /// `legion_provisional_killed_total{cause}` — provisional work killed
+    /// (`refused`, `expired`, `failed`).
+    pub provisional_killed_total: Arc<CounterVec>,
+    /// `legion_provisional_ratify_seconds` — admission to verdict.
+    pub provisional_ratify_seconds: Arc<Histogram>,
+    /// `legion_provisional_active` — unratified claims held right now, so
+    /// started-but-unconfirmed capacity is visible rather than invisible.
+    pub provisional_active: Arc<Gauge>,
     families: Vec<Arc<dyn RenderMetric>>,
 }
 
@@ -1083,11 +1096,58 @@ impl WorkerMetrics {
             cell: CounterCell::default(),
         });
 
+        let provisional_starts_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_provisional_starts_total",
+                help: "Provisional allocations admitted on this node, by origin (manager|edge) and gate.",
+                labels: &["origin", "gate"],
+            },
+            series: Series::new(),
+        });
+        let provisional_refused_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_provisional_refused_total",
+                help: "Ratifications refused, by reason (instance_claimed|no_capacity|ineligible|expired|ticket_invalid|unknown_target|disabled|internal).",
+                labels: &["reason"],
+            },
+            series: Series::new(),
+        });
+        let provisional_killed_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_provisional_killed_total",
+                help: "Provisional allocations killed, by cause (refused|expired|failed).",
+                labels: &["cause"],
+            },
+            series: Series::new(),
+        });
+        let provisional_ratify_seconds = Arc::new(Histogram {
+            meta: FamilyMeta {
+                name: "legion_provisional_ratify_seconds",
+                help:
+                    "Wall-clock from admitting a provisional allocation to receiving its verdict.",
+                labels: &[],
+            },
+            cell: HistogramCell::new(DURATION_BUCKETS),
+        });
+        let provisional_active = Arc::new(Gauge {
+            meta: FamilyMeta {
+                name: "legion_provisional_active",
+                help: "Unratified provisional allocations this node is holding right now.",
+                labels: &[],
+            },
+            cell: GaugeCell::default(),
+        });
+
         let families: Vec<Arc<dyn RenderMetric>> = vec![
             Arc::clone(&allocation_failures_reported_total) as Arc<dyn RenderMetric>,
             Arc::clone(&allocations_running) as Arc<dyn RenderMetric>,
             Arc::clone(&heartbeat_duration_seconds) as Arc<dyn RenderMetric>,
             Arc::clone(&heartbeats_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&provisional_active) as Arc<dyn RenderMetric>,
+            Arc::clone(&provisional_killed_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&provisional_ratify_seconds) as Arc<dyn RenderMetric>,
+            Arc::clone(&provisional_refused_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&provisional_starts_total) as Arc<dyn RenderMetric>,
         ];
 
         WorkerMetrics {
@@ -1095,6 +1155,11 @@ impl WorkerMetrics {
             heartbeat_duration_seconds,
             allocations_running,
             allocation_failures_reported_total,
+            provisional_starts_total,
+            provisional_refused_total,
+            provisional_killed_total,
+            provisional_ratify_seconds,
+            provisional_active,
             families,
         }
     }

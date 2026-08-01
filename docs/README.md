@@ -54,6 +54,8 @@ Plans, roadmaps, to-do lists, and development notes live in
   allocation was removed.
 - [Preemption and Eviction](preemption-and-eviction.md) — priority bands, when
   the scheduler displaces lower-band work, and how to preview or prevent it.
+- [Edge Boot](edge-boot.md) — starting work before the placement is durable:
+  gate levels, boot tickets, ratification, and the kill path.
 
 ## Platform Services
 

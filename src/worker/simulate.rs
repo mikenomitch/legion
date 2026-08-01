@@ -337,6 +337,27 @@ impl Worker for SimWorkerService {
         ))
     }
 
+    type StartClaimStream = std::pin::Pin<
+        Box<
+            dyn tokio_stream::Stream<Item = Result<crate::structs::StartClaimReply, Status>>
+                + Send
+                + 'static,
+        >,
+    >;
+
+    /// Simulated nodes never accept edge starts. The simulator exists to load
+    /// the scheduler; edge boot is a node-local execution path with no
+    /// scheduler cost to model, and pretending to accept a claim would report
+    /// capacity the fleet does not have.
+    async fn start_claim(
+        &self,
+        _request: Request<crate::structs::StartClaimRequest>,
+    ) -> Result<Response<Self::StartClaimStream>, Status> {
+        Err(Status::unimplemented(
+            "simulated workers do not accept edge starts",
+        ))
+    }
+
     type ExecTaskStream = crate::worker::exec::ExecTaskStream;
 
     async fn exec_task(
@@ -654,6 +675,10 @@ async fn heartbeat_sim_node(
     ready_after: Duration,
 ) -> Result<(), Status> {
     let req = node.credentials.attach(Request::new(HeartbeatRequest {
+        // Simulated nodes never take provisional starts: the simulator
+        // models scheduler load, and edge boot is a node-local execution
+        // path with nothing to model.
+        provisional_claims: Vec::new(),
         id: node.name.clone(),
         allocation_ids: node.acked_ids(ready_after),
         failed_allocations: Vec::new(),

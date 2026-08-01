@@ -18,6 +18,26 @@
   // (docs/metrics.md). Enabled by default; binds server.port + 2 (4749 here)
   // unless `port` is set. Set enabled:false to turn the listener off.
   // telemetry: { enabled: true, port: 4749 },
+  // Edge boot (docs/edge-boot.md): boot tickets and edge-initiated starts.
+  // OFF BY DEFAULT, and turning it on is an explicit security decision — it
+  // grants nodes the ability to start work on a capability, growing a
+  // compromised node's blast radius from "runs what it was given" to "runs
+  // anything a live ticket names". Tickets are signed by the
+  // workload-identity issuer, so `workloadIdentity.enabled` must also be true.
+  //
+  // A job's own `speculativeStart` block does NOT need this switch: pre-commit
+  // dispatch from the manager opens no new authorization surface.
+  //
+  // edgeBoot: {
+  //   enabled: false,
+  //   // Ticket lifetime when a mint does not ask for one.
+  //   defaultTicketTtl: "5m",
+  //   // Hard cap. Revocation is by TTL only, so this is the real bound on
+  //   // how long a leaked ticket is dangerous.
+  //   maxTicketTtl: "1h",
+  //   // Cap on concurrent unratified claims per node.
+  //   maxProvisionalPerNode: 32,
+  // },
   schedulerSettings: {
     plan_conflict_max_retries: 3,
     // Late-binding plan apply (docs/late-binding-plan-apply.md): ranked

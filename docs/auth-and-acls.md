@@ -49,6 +49,7 @@ legion acl whoami
 | `action` | run declared actions on an allocation | — | run an action (scope with `action_names`) |
 | `template` | job templates | list/inspect | publish versions, delete (scope with `templates`) |
 | `scale` | task count overrides ([Scaling Jobs](autoscaling.md)) | scale status | `job scale` / reset (scope by job name) — deliberately separate from `job:write`, so a principal can resize without redeploy rights |
+| `boot` | boot tickets ([Edge Boot](edge-boot.md)) | list outstanding tickets | mint a ticket (scope by job name) — separate from `job:write` for the same reason `scale` is: a platform's ticket minter authorizes individual starts without the right to redeploy the fleet |
 
 Actions are `read` and `write` (`write` does not imply `read`; grant both).
 `state:read` is powerful — it can read every table in the state store —

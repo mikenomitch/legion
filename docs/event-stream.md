@@ -44,6 +44,10 @@ from the CLI, the MCP server, the UI, and raw gRPC.
 | `scale.deferred` | info | A scale-in was recorded but deferred until the active rollout completes. |
 | `scale.reset` | info | An override was dropped (explicit `--reset`, or a resubmit that changed the spec count reclaimed ownership). |
 | `rollout.event` | passthrough | Mirror of every rollout event (created, advanced, completed, failed, …). |
+| `alloc.provisional_started` | info | A node started work before the placement was durable ([Edge Boot](edge-boot.md)); claim id, gate, origin, and — for an edge start — the ticket `jti` in metadata. Never the ticket itself. |
+| `alloc.ratified` | info | A provisional allocation became durable; allocation id and ratification latency in metadata. |
+| `alloc.refused` | warn | A ratification was refused and the node is killing the work; the reason code (`instance_claimed`, `no_capacity`, …) is in metadata. |
+| `boot_ticket.issued` | info | A boot ticket was minted; `jti`, scope, and the minting accessor id in metadata. The audit record for "who authorized this start". |
 
 Each event carries: an increasing (but sparse — see
 [cursors](#cursor-based-polling-cli-and-mcp)) `id`, `kind`, `level`

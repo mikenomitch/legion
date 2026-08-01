@@ -1929,6 +1929,13 @@ async fn load_initial_data(store: &Store, config: &ManagerConfig) -> R<()> {
             }
         };
 
+        // Edge-boot settings ride as JSON too. Absent means "no edge starts",
+        // which is the default and the thing an operator has to opt out of.
+        let edge_boot = match wcp.edge_boot.as_ref() {
+            None => String::new(),
+            Some(block) => serde_json::to_string(&block.with_defaults())?,
+        };
+
         if let Some(seconds) = wcp.heartbeat_seconds {
             if !(1..=30).contains(&seconds) {
                 bail!(
@@ -1959,6 +1966,7 @@ async fn load_initial_data(store: &Store, config: &ManagerConfig) -> R<()> {
             host_volumes,
             heartbeat_seconds: wcp.heartbeat_seconds,
             resource_enforcement,
+            edge_boot,
         };
 
         store.insert_worker_type(&wc)?;

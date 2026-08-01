@@ -58,11 +58,13 @@ Even with `--allow-write`, `legion_state_query` is forced to read-only.
 | `legion_rollout_list` | no | List rollouts. |
 | `legion_rollout_status` | no | Rollout progress + allocation health. |
 | `legion_instance_list` | no | List a job's stateful instances (slot + keyed). |
-| `legion_instance_get` | no | Inspect one stateful instance. |
+| `legion_instance_get` | no | Inspect one stateful instance, including a live unratified claim when one exists ([edge-boot.md](edge-boot.md)). |
 | `legion_volume_list` | no | List volumes — the storage behind stateful instances. Filters by job/node/plugin/instance/state. |
 | `legion_volume_get` | no | Inspect one volume: plugin, params, node pin, mount path, last driver error. |
 | `legion_volume_drivers` | no | Volume plugins installed across the cluster and which nodes can use them. Answers "why was my job rejected for plugin X". |
 | `legion_node_list` | no | List worker nodes. |
+| `legion_node_claims` | no | A node's live provisional (unratified) allocations — started-but-unconfirmed work ([edge-boot.md](edge-boot.md)). Tells "still booting" from "already confirmed". |
+| `legion_boot_ticket_list` | no | Outstanding boot tickets (metadata only; token bytes are never stored or returned). |
 | `legion_service_list` | no | List declared services with healthy/total endpoint counts — what a job can connect to. |
 | `legion_service_resolve` | no | Resolve a service to its endpoints (address, port, allocation, node, health). |
 | `legion_acl_whoami` | no | ACL status + caller identity (diagnose PermissionDenied). |
@@ -85,6 +87,7 @@ Even with `--allow-write`, `legion_state_query` is forced to read-only.
 | `legion_instance_destroy` | **yes** | Destroy a keyed instance, stop its allocation, drop its storage (supports `idempotency_key`). |
 | `legion_instance_replace` | **yes** | Force-replace an instance's allocation stuck on a LOST node (skips the `onLost.replaceAfter` loss-confirmation gate; split-brain risk if the node is only partitioned; supports `idempotency_key`). |
 | `legion_volume_delete` | **yes** | Delete a volume and reclaim its storage. DESTROYS DATA; `force: true` tombstones without driver confirmation for a node that is gone for good (supports `idempotency_key`). |
+| `legion_boot_ticket_create` | **yes** | Mint a boot ticket: a short-lived capability letting one edge node start one workload without a manager call ([edge-boot.md](edge-boot.md)). Revocable only by expiry, so prefer short TTLs (supports `idempotency_key`). |
 
 Tool errors are returned in-band (`result.isError = true` with a text payload),
 following MCP convention; transport/protocol errors use JSON-RPC `error`.
@@ -342,6 +345,36 @@ How it is wired (read-only, agent-safe):
 3. `Manager.GetAllocationLogs` resolves a job (or allocation id) to its
    allocations, locates each host node, and proxies the read to that worker.
 4. `legion job logs <name>` and the `legion_job_logs` MCP tool surface it.
+
+## 6b. Starting work at the edge (`legion sandbox start`)
+
+An agent that owns its own routing can start a workload directly on a node,
+without a manager on the request path, using a boot ticket
+([edge-boot.md](edge-boot.md)):
+
+```bash
+# Ahead of time (needs boot:write), from wherever the agent's control plane runs:
+legion boot-ticket create agent-sandboxes \
+    --task workspace --id user-42 --pool edge-eu --gate boot --ttl 5m -j
+
+# On the request path, against the node itself:
+legion sandbox start agent-sandboxes \
+    --id user-42 --node http://10.0.1.7:4848 --ticket "$TICKET" -j
+```
+
+The command streams one frame per transition (`admitted`, `staged`/`booted`,
+then `ratified` or `refused`). Two properties matter to an agent:
+
+- **A `booted` frame is not a promise.** The workload exists, but the placement
+  is not durable yet: a `refused` frame may still arrive, and the node will
+  then kill it. Build on `ratified`, which carries the allocation id.
+- **`--dry-run` verifies the ticket and the node's admission without holding or
+  booting anything** — the self-correct path before mutating a cluster, in the
+  same spirit as `job validate` and `job plan`.
+
+`legion instance get` reports a sandbox as `provisional` until it is ratified,
+and `legion node claims <NODE>` lists everything a node has started but not yet
+had confirmed.
 
 ## 7. State store introspection + saved query library
 

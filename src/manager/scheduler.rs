@@ -1435,6 +1435,26 @@ impl<'a> Scheduler<'a> {
             );
         };
         let candidates_setting = self.plan_candidates;
+        // Speculative dispatch (docs/edge-boot.md): tasks that opted into
+        // `speculativeStart` get their payload NOW, while the apply is in
+        // flight, so the node's image pull and root-disk build overlap the
+        // commit instead of queueing behind it. Nothing here can fail the
+        // plan — a claim that does not land simply misses the head start, and
+        // one whose plan is rejected dies at its own lease.
+        //
+        // The node speculated on is `candidates[0]`, the planner's first
+        // choice, which is what a pre-candidate submission would have bound
+        // outright. When the apply walk falls back to a later candidate
+        // (`candidate_ranks[i] > 0`) the winning node is not the one holding
+        // the claim, so the claim is never ratified and dies at its lease —
+        // the same outcome as a rejected plan, and the reason a fallback
+        // costs the head start rather than correctness.
+        let speculative_claims = crate::manager::dispatcher::dispatch_speculative(
+            self.store,
+            job_config_id,
+            &placements,
+        );
+
         // One replicated op for insert + apply: on raft backends the split
         // form paid a second quorum round-trip per plan (see
         // `Store::submit_and_apply_plan`).
@@ -1506,6 +1526,16 @@ impl<'a> Scheduler<'a> {
             .filter(|rank| **rank > 0)
             .count();
         let allocations = applied.allocations;
+        // The apply outcome IS the ratification for the claims dispatched
+        // above: deliver it before anything else, because a `stage`-gated
+        // node is holding a prepared workload waiting for exactly this.
+        // Matching is by (node, task), so a placement that fell back to
+        // another candidate ratifies nothing here by construction.
+        crate::manager::dispatcher::dispatch_ratifications(
+            self.store,
+            &allocations,
+            &speculative_claims,
+        );
         let deltas = Self::allocations_delta(&affected_nodes, &allocations);
         timings.total_us = started.elapsed().as_micros() as u64;
         timings.observe();

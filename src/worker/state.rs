@@ -23,6 +23,20 @@ pub struct PersistedAllocation {
     /// task is still running and still needs its data directory.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub volumes: Vec<crate::structs::VolumeMount>,
+    /// Manager-minted allocation id for work that started life as a
+    /// provisional allocation (docs/edge-boot.md).
+    ///
+    /// A provisional start has no allocation id — the manager mints those
+    /// inside the apply transaction — so the worker keys it by a negative
+    /// local key and records the real id here once the claim is ratified.
+    /// Persisting the pair is what lets a restarted worker keep serving the
+    /// running task under the id the cluster knows it by, instead of
+    /// relaunching it under a key nothing matches.
+    ///
+    /// Absent for every ordinary allocation, where `allocation.id` already is
+    /// the manager's id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_id: Option<i64>,
     /// The CPU/memory placement worker core handed this allocation (see
     /// `src/worker/resources.rs`). Persisted because it is the *unit of
     /// recovery*: a restarted worker rebuilds its core allocator and both

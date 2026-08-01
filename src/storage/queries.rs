@@ -183,15 +183,15 @@ lazy_static! {
 //
 
 pub const WORKER_TYPE_ATTRS: &str = r#"
-name, pool, additional_node_checks, attributes, name_prefix, resources, reserved_resources, max_allocations, artifacts, host_volumes, heartbeat_seconds, resource_enforcement
+name, pool, additional_node_checks, attributes, name_prefix, resources, reserved_resources, max_allocations, artifacts, host_volumes, heartbeat_seconds, resource_enforcement, edge_boot
 "#;
 
 pub const WORKER_TYPE_PARAM_SET: &str = r#"
-pool = :pool, additional_node_checks = :additional_node_checks, attributes = :attributes, name_prefix = :name_prefix, resources = :resources, reserved_resources = :reserved_resources, max_allocations = :max_allocations, artifacts = :artifacts, host_volumes = :host_volumes, heartbeat_seconds = :heartbeat_seconds, resource_enforcement = :resource_enforcement
+pool = :pool, additional_node_checks = :additional_node_checks, attributes = :attributes, name_prefix = :name_prefix, resources = :resources, reserved_resources = :reserved_resources, max_allocations = :max_allocations, artifacts = :artifacts, host_volumes = :host_volumes, heartbeat_seconds = :heartbeat_seconds, resource_enforcement = :resource_enforcement, edge_boot = :edge_boot
 "#;
 
 pub const WORKER_TYPE_ATTRS_VALS: &str = r#"
-:name, :pool, :additional_node_checks, :attributes, :name_prefix, :resources, :reserved_resources, :max_allocations, :artifacts, :host_volumes, :heartbeat_seconds, :resource_enforcement
+:name, :pool, :additional_node_checks, :attributes, :name_prefix, :resources, :reserved_resources, :max_allocations, :artifacts, :host_volumes, :heartbeat_seconds, :resource_enforcement, :edge_boot
 "#;
 
 lazy_static! {
@@ -327,11 +327,11 @@ lazy_static! {
 //
 
 pub const TASK_CONFIG_ATTRS: &str = r#"
-id, name, runtime, count, count_per, group_name, lifecycle, schedule, depends_on, config, resources, constraints, permit, affinities, checks, on_unhealthy, kv_injections, job_id, job_config_id, identities, stateful, artifacts, network, service, actions, volumes, connect, restart, stop, disruption
+id, name, runtime, count, count_per, group_name, lifecycle, schedule, depends_on, config, resources, constraints, permit, affinities, checks, on_unhealthy, kv_injections, job_id, job_config_id, identities, stateful, artifacts, network, service, actions, volumes, connect, restart, stop, disruption, speculative_start
 "#;
 
 pub const TASK_CONFIG_INSERT_ATTRS: &str = r#"
-name, runtime, count, count_per, group_name, lifecycle, schedule, depends_on, config, resources, constraints, permit, affinities, checks, on_unhealthy, kv_injections, job_id, job_config_id, identities, stateful, artifacts, network, service, actions, volumes, connect, restart, stop, disruption
+name, runtime, count, count_per, group_name, lifecycle, schedule, depends_on, config, resources, constraints, permit, affinities, checks, on_unhealthy, kv_injections, job_id, job_config_id, identities, stateful, artifacts, network, service, actions, volumes, connect, restart, stop, disruption, speculative_start
 "#;
 
 // pub const TASK_CONFIG_PARAM_SET: &str = r#"
@@ -339,7 +339,7 @@ name, runtime, count, count_per, group_name, lifecycle, schedule, depends_on, co
 // "#;
 
 pub const TASK_CONFIG_ATTRS_VALS: &str = r#"
-:name, :runtime, :count, :count_per, :group_name, :lifecycle, :schedule, :depends_on, :config, :resources, :constraints, :permit, :affinities, :checks, :on_unhealthy, :kv_injections, :job_id, :job_config_id, :identities, :stateful, :artifacts, :network, :service, :actions, :volumes, :connect, :restart, :stop, :disruption
+:name, :runtime, :count, :count_per, :group_name, :lifecycle, :schedule, :depends_on, :config, :resources, :constraints, :permit, :affinities, :checks, :on_unhealthy, :kv_injections, :job_id, :job_config_id, :identities, :stateful, :artifacts, :network, :service, :actions, :volumes, :connect, :restart, :stop, :disruption, :speculative_start
 "#;
 
 lazy_static! {
@@ -348,6 +348,13 @@ lazy_static! {
     SELECT {TASK_CONFIG_ATTRS}
     FROM task_config
     WHERE name = ?
+    "#
+    );
+    pub static ref GET_TASK_BY_ID: String = format!(
+        r#"
+    SELECT {TASK_CONFIG_ATTRS}
+    FROM task_config
+    WHERE id = ?;
     "#
     );
     pub static ref GET_TASK_FOR_JOB_CONIFG: String = format!(

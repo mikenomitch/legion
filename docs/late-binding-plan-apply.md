@@ -202,3 +202,10 @@ requeue backstop is independent of the setting and always on.
   spread allocations across the near-tie band even where `bin_pack`
   would happily have stacked them; capacity-aware skipping is a named
   backlog item, gated on fallback-rank metrics.
+- **A fallback discards speculative staging.** A task that opted into
+  [edge boot](edge-boot.md)'s `speculativeStart` has its payload
+  dispatched to the planner's first choice while the apply is in flight.
+  Falling back to a later candidate means the workload starts on a node
+  that staged nothing, and the claim on the first choice expires
+  unratified. Correct, but the head start is lost — a reason to watch
+  `fallbacks` on jobs that use both features.

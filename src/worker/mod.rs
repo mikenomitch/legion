@@ -1,6 +1,9 @@
 pub mod artifact_credentials;
 pub mod balance;
+pub mod boot_ticket;
+pub mod claims;
 pub mod daemon;
+pub mod edge;
 pub mod exec;
 pub mod forwarder;
 pub mod identity;

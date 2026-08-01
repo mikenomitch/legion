@@ -540,12 +540,19 @@ async fn validate_job(arg_matches: &ArgMatches) -> R<()> {
         .map(|task| task.group.as_str())
         .collect();
 
+    // Edge boot gate downgrades (docs/edge-boot.md). A task whose declared
+    // `speculativeStart.mode` cannot be honored is capped at `stage` — never
+    // silently, because the symptom otherwise is a speedup that quietly did
+    // not happen.
+    let warnings = speculative_start_warnings(&config);
+
     if format.is_json() {
         output::print_success(&json!({
             "valid": true,
             "job": config.name,
             "tasks": task_count,
             "groups": groups.iter().collect::<Vec<_>>(),
+            "warnings": warnings,
         }));
     } else {
         println!(
@@ -554,9 +561,32 @@ async fn validate_job(arg_matches: &ArgMatches) -> R<()> {
             task_count,
             groups.len()
         );
+        for warning in &warnings {
+            println!("warning: {warning}");
+        }
     }
 
     Ok(())
+}
+
+/// Gate downgrades this jobspec would take at admission, as human-readable
+/// lines. Empty for every job that did not declare `speculativeStart`, and for
+/// every one whose declared gate is honored as written.
+fn speculative_start_warnings(config: &JobConfig) -> Vec<String> {
+    config
+        .tasks
+        .iter()
+        .filter_map(|task| {
+            let declared = task.speculative_start.as_ref()?.resolve().ok()?.mode;
+            let (effective, reason) = crate::manager::dispatcher::effective_gate(task, declared);
+            (effective != declared).then(|| {
+                format!(
+                    "speculativeStart.mode `{declared}` is downgraded to `{effective}`: {}",
+                    reason.unwrap_or_else(|| "an invariant does not permit it".into())
+                )
+            })
+        })
+        .collect()
 }
 
 #[instrument(err, skip_all)]
@@ -662,6 +692,26 @@ pub(crate) fn build_jobspec_schema() -> Value {
                                     { "type": "integer", "minimum": 0 },
                                     { "type": "string" }
                                 ]
+                            }
+                        }
+                    },
+                    "speculativeStart": {
+                        "type": "object",
+                        "description": "How far a node may get on a start for this task BEFORE the placement is durable. Absent = off, today's behavior. A task declaring network ports, connect upstreams, or storage whose driver cannot fence a concurrent attach is downgraded to `stage` (reported by `job validate`). See docs/edge-boot.md.",
+                        "properties": {
+                            "mode": {
+                                "type": "string",
+                                "enum": ["off", "stage", "boot", "serve"],
+                                "description": "off (default) = no speculation. stage = fetch artifacts and build the root disk, do not start. boot = also boot, with the network held shut. serve = also open the network; the only mode where a workload that loses its race may already have had externally visible side effects."
+                            },
+                            "ratifyTimeout": {
+                                "type": "string",
+                                "description": "Lease: unratified work is killed at expiry, unconditionally. Default 5s, capped at 2m."
+                            },
+                            "onRefused": {
+                                "type": "string",
+                                "enum": ["kill", "stop"],
+                                "description": "What to do when ratification is refused. kill (default) is a hard destroy; stop runs the normal graceful-stop ladder."
                             }
                         }
                     }

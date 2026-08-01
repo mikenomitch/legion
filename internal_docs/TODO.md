@@ -48,19 +48,55 @@ How to use it:
       plan's blocked-eval machinery
       ([plan](plans/gang-scheduling-plan.md)) — when that lands, consider
       routing plain single-task capacity failures through it too.
-- [ ] **Edge boot / provisional allocations** — a node starts work *before* the
-      placement is durable, at a declared gate level (`stage` = pull only,
-      `boot` = run with the network shut, `serve` = run fully and kill the
-      loser), and an edge node can authorize a start itself with a short-lived
-      manager-signed boot ticket —
-      [plan](plans/edge-boot-plan.md) (PLANNED: measure the start path →
-      provisional allocations with pre-commit dispatch → `serve` → the network
-      gate → boot tickets + `StartClaim`). Today dispatch is strictly
-      post-commit (`src/structs/eval.rs:309`), so every sandbox start pays the
-      full control-plane round trip and fails outright when the manager is
-      unreachable. Ratification reuses the existing plan apply, so the
-      at-most-one-live-allocation invariant is unchanged. Phase 0 is a
-      measurement phase and is allowed to kill the later phases.
+- [ ] Edge boot follow-ups — the feature shipped (phases 1–4;
+      [plan](plans/edge-boot-plan.md) · [docs](../docs/edge-boot.md) ·
+      [calls](calls/edge-boot-plan_calls.md)); these are what it left open.
+  - [ ] **Phase 0's measurement matrix was never run.** The start-path
+        breakdown (submit → eval claim → plan → apply → dispatch → prepare →
+        boot → first byte) in both persistence modes, cold and warm image,
+        single- and cross-region, belongs in
+        `benchmarks/scheduler/README.md` per the AGENTS.md before/after rule.
+        Until it exists the plan's open question — is `boot` or `stage` the
+        right recommended default — stays open, and the public doc recommends
+        neither. Needs a real multi-node raft cluster and a real registry; see
+        [calls #18](calls/edge-boot-plan_calls.md).
+  - [ ] A per-interface default-drop filter for the `sandbox` `boot` gate.
+        Today Legion only holds the TAP link down, which is the 95% mechanism;
+        a filter is stronger on hosts where link state alone is not enough, but
+        owning firewall rules means owning backend choice, conflicts with the
+        operator's own rules, and cleanup after a crash
+        ([calls #10](calls/edge-boot-plan_calls.md)).
+  - [ ] Lift the "no gates above `stage` for tasks with declared ports or
+        connect upstreams" restriction. Both are assigned inside the apply, so
+        this needs speculative port assignment reconciled at commit
+        ([calls #13](calls/edge-boot-plan_calls.md)).
+  - [ ] Speculative attach for volume drivers that can genuinely fence a
+        concurrent attach, via a capability advertised in the volume contract.
+        Today every non-node-local driver downgrades the gate to `stage`.
+  - [ ] Island mode: bounded survival of unratified work across a
+        control-plane outage, with its own consistency argument (plan phase 5).
+  - [ ] Ticket pre-distribution and bulk minting for warm fleets, and
+        ratification batching for a node starting many claims per second
+        (plan phase 5).
+  - [ ] A pre-warm push for the worker spec cache. A node today caches a task
+        config once it has been dispatched an allocation of it, so an edge pool
+        must run at least one allocation of a job before a ticket for it can be
+        redeemed there. An explicit push (`legion job prewarm --pool edge-eu`)
+        would remove that ordering constraint and compose with the
+        [artifact cache and pre-warm plan](plans/artifact-cache-and-prewarm-plan.md).
+  - [ ] Replace the string matching in `manager::edge_boot::classify` with a
+        typed error out of the plan apply, if a second consumer of the
+        rejection reason ever appears ([calls #17](calls/edge-boot-plan_calls.md)).
+  - [ ] Speculative dispatch and late-binding plan apply do not compose yet.
+        A claim is dispatched to `candidates[0]`, the planner's first choice;
+        when the apply walk falls back to a later candidate the winning node
+        is not the one holding the claim, so the claim goes unratified and
+        holds its staged work until the lease expires. Correct but wasteful,
+        and invisible except as a gap between
+        `legion_provisional_claims_total` and the ratified count. Options:
+        dispatch to the top *n* candidates and refuse the losers, or hand the
+        apply walk the claim set so it prefers a node already holding one.
+        Needs the fallback-rank metric to say how often it actually bites.
 - [ ] Worker groups + taint/toleration equivalent. Node pools exist as an ACL
       and config concept but nothing scheduling-side consumes them.
 - [ ] Preemption follow-ups — the feature shipped
@@ -453,13 +489,22 @@ No plan yet — this needs one before any code.
 
 Plans: [persistence-plan.md](plans/persistence-plan.md), [multi-raft-persistence-plan.md](plans/multi-raft-persistence-plan.md) · docs: [state-store.md](../docs/state-store.md), [raft-operations.md](../docs/raft-operations.md), [persistence-streaming.md](../docs/persistence-streaming.md)
 
-- [ ] `raft_lanes::killing_the_all_lane_leader_reconverges_onto_one_survivor`
-      is timing-sensitive under parallel test load: green in isolation
-      (9/9 on a 4-vCPU container, 2026-07-30) but failed once during a full
-      `cargo test --all` where ~20 test binaries starve its election
-      timers. The test already accepts split outcomes by design; consider a
-      longer election budget when `cargo test` runs the whole workspace, or
-      serializing the cluster-gated suites.
+- [x] **A sync forward to a new lane leader panicked the manager.**
+      `MultiRaftDriver::forward_lane_write` dialed the leader through
+      `ChannelPool::get` *before* entering the raft runtime, and
+      `Endpoint::connect_lazy` builds a tonic channel by spawning its
+      connection task — which panics ("there is no reactor running") on a
+      thread with no runtime context. Every synchronous caller reaches this
+      path when its write lands on a follower
+      (`Store::forward_after_rejection` → `enqueue_eval`), and the channel
+      pool hid it: only the *first* forward to a given leader address dials,
+      so it fired only just after leadership moved to a manager this node had
+      not forwarded to before. The dial now happens inside
+      `block_on_engine`. This was previously logged here as
+      `raft_lanes::killing_the_all_lane_leader_reconverges_onto_one_survivor`
+      being "timing-sensitive under parallel test load" — that diagnosis was
+      wrong; the test was reporting a real crash. Reproduced at ~1-in-7 runs
+      of that suite before the fix, 20/20 clean after.
 
 - [x] **Real Raft persistence** — quorum-committed writes, per-lane log stores,
       snapshots/compaction, real membership
@@ -1060,6 +1105,15 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
       node-local pinning, `legion volume` CLI + MCP tools, UI, and the
       [Postgres](../docs/guides/postgres.md) / [Redis](../docs/guides/redis.md) guides
 - [x] Block-mode volumes, consumed directly by the sandbox runtime
+- [x] **Edge boot: provisional allocations, gate levels, and boot tickets** —
+      a node reaches a declared execution stage (`stage`/`boot`/`serve`) before
+      the placement is durable, and an edge node authorizes a start itself from
+      a short-lived manager-signed ticket. Ratification is the existing plan
+      apply with the instance named, so the at-most-one-live-allocation
+      invariant is unchanged and its suites run unmodified
+      ([plan](plans/edge-boot-plan.md) · [docs](../docs/edge-boot.md) ·
+      [calls](calls/edge-boot-plan_calls.md)). Phase 0's measurement and
+      phase 5's backlog are open above.
 
 ## Persistence
 

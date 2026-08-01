@@ -36,4 +36,17 @@
         // allocation beneath it.
         cgroupParent: "legion",
     },
+    // Whether this node serves `Worker.StartClaim` — that is, whether it will
+    // start work on a boot ticket at all (docs/edge-boot.md). Off by default
+    // and independent of the manager's `edgeBoot.enabled`: an operator who
+    // turns the feature on cluster-wide still chooses which nodes are edges.
+    // edgeBoot: {
+    //     acceptClaims: false,
+    //     // How often the cached JWKS is proactively refreshed. A fetch
+    //     // failure never invalidates cached keys — a node cut off from its
+    //     // managers must still be able to redeem tickets it can verify.
+    //     jwksRefresh: "5m",
+    //     // Tolerance for clock disagreement with the minting manager.
+    //     clockSkew: "30s",
+    // },
 }

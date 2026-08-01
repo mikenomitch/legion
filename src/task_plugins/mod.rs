@@ -697,6 +697,52 @@ pub trait TaskPlugin: Send + Sync {
     ) -> R<()> {
         Ok(())
     }
+
+    /// How strong this runtime's network gate is for a provisional start held
+    /// at gate `boot` (docs/edge-boot.md).
+    ///
+    /// The default is [`NetworkGate::Advisory`]: the worker still withholds
+    /// service registration and the node-local upstream forwarders (both fall
+    /// out of the allocation not being in the store yet), but nothing stops
+    /// the workload dialing out through the host's own stack. That is the
+    /// honest answer for host-process runtimes, and it is stated as a
+    /// limitation in the public doc rather than papered over.
+    fn network_gate(&self) -> NetworkGate {
+        NetworkGate::Advisory
+    }
+
+    /// Open or shut this allocation's network.
+    ///
+    /// Called with `open: false` immediately before `start` when a
+    /// provisional allocation is held at gate `boot`, and with `open: true`
+    /// when it is ratified. Runtimes reporting [`NetworkGate::Advisory`] may
+    /// leave this as the no-op default.
+    fn set_network_gate(
+        &self,
+        _allocation: &Allocation,
+        _task: &TaskConfig,
+        _instance: &mut TaskInstance,
+        _open: bool,
+    ) -> R<()> {
+        Ok(())
+    }
+}
+
+/// How much a runtime's `boot`-gate network hold is actually worth.
+///
+/// This asymmetry is deliberate and load-bearing for the security story:
+/// untrusted code belongs in a microVM, which is the same advice
+/// `docs/task-runtime-sandbox.md` already gives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetworkGate {
+    /// A real boundary: the workload physically cannot reach the network
+    /// before ratification (a microVM whose only interface is held down, or
+    /// one with no interface at all).
+    Enforced,
+    /// Legion withholds what it controls — service registration and the
+    /// node-local forwarders — but the workload shares the host's network
+    /// stack and can still reach the outside world.
+    Advisory,
 }
 
 pub struct LoadedTaskPlugin {
@@ -773,6 +819,8 @@ pub fn validate_job_config(config: &JobConfig) -> R<()> {
         task.validate_actions()?;
         task.validate_stop()?;
         task.validate_disruption()?;
+        task.validate_speculative_start()
+            .map_err(|err| anyhow!(err))?;
         if !task.artifacts.is_empty() {
             registry.load_plugin(&task.runtime, false)?;
             let plugin = registry

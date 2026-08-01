@@ -207,6 +207,7 @@ async fn stub_worker_accepts_dispatch_and_rejects_everything_else() -> R<()> {
     worker
         .post_work(PostWorkRequest {
             allocation: Some(TaskAllocation {
+                provisional: None,
                 allocation_id: 999,
                 node_id: "sim-it-web-0".into(),
                 ..TaskAllocation::default()
@@ -220,6 +221,7 @@ async fn stub_worker_accepts_dispatch_and_rejects_everything_else() -> R<()> {
     let status = worker
         .post_work(PostWorkRequest {
             allocation: Some(TaskAllocation {
+                provisional: None,
                 allocation_id: 1000,
                 node_id: "not-a-sim-node".into(),
                 ..TaskAllocation::default()

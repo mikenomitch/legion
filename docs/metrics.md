@@ -231,6 +231,26 @@ view of worker readiness. Default: disabled.
 - **`legion_worker_allocation_failures_reported_total`** (counter) —
   allocation failures this worker has reported to the manager.
 
+Edge boot ([edge-boot.md](edge-boot.md)) adds five more, all zero on a node
+that has never taken a provisional start:
+
+- **`legion_provisional_starts_total{origin,gate}`** (counter) — provisional
+  allocations admitted, by `origin` (`manager` | `edge`) and gate.
+- **`legion_provisional_refused_total{reason}`** (counter) — ratifications
+  refused. A rising `instance_claimed` rate is a routing problem (two edges
+  racing for one sandbox), not a cluster problem; `no_capacity` and
+  `ineligible` are the reverse.
+- **`legion_provisional_killed_total{cause}`** (counter) — provisional work
+  killed, by `refused`, `expired`, or `failed`. A rising `expired` count means
+  verdicts are not arriving inside the lease — look at manager reachability
+  before raising `ratifyTimeout`.
+- **`legion_provisional_ratify_seconds`** (histogram) — admission to verdict.
+  This is the latency the whole feature exists to remove from the start path;
+  its p99 is what sets a sensible `ratifyTimeout`.
+- **`legion_provisional_active`** (gauge) — unratified claims held right now.
+  This is how started-but-unconfirmed capacity becomes visible instead of
+  invisible; a value that does not return to zero means claims are leaking.
+
 **Simulated fleets are not covered.** `legion start worker --simulate N`
 ([worker-simulation](../internal_docs/plans/worker-simulation-plan.md))
 runs its own heartbeat loop for the whole fleet and does not start this
