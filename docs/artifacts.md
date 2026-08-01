@@ -501,7 +501,7 @@ Sources are redacted; errors name auth sources, never values.
 | Kind | artifacts | consumption |
 | --- | --- | --- |
 | `exec` | ✅ | File/Tree payloads staged into the task dir; `${artifact.*}` interpolation; `LEGION_ARTIFACT_*` / `LEGION_TASK_DIR` env; `cwd` defaults to the task dir; landlock auto-grants it. |
-| `container` | ✅ (image, behind a flag) | The implicit `image` artifact is consumed as an OCI layout (below). File/tree artifacts stage to the **host** task dir, which an isolated container filesystem cannot see, and worker-injected env is not applied — both deferred until the runtime grows volume plumbing (same limitation as its KV file injection). |
+| `container` | ✅ (image behind a flag; file/tree always) | The implicit `image` artifact is consumed as an OCI layout (below). File and tree artifacts stage into the host task dir, which is bind-mounted at `/legion/task`, so the container reads them there — `LEGION_ARTIFACT_<NAME>` and `${artifact.<name>}` both carry the in-container path. |
 | `sandbox` | ✅ | The implicit `image` artifact becomes the microVM's root filesystem. File/tree/layer artifacts are copied **into the guest** at `/legion/artifacts/<name>` while the root disk is built, with `LEGION_ARTIFACT_*` and already-interpolated `${artifact.*}` paths rewritten from host staging paths to their in-guest locations (see [task-runtime-sandbox.md](task-runtime-sandbox.md)). |
 | `noop` | ❌ | Artifact-bearing specs rejected at validation/admission. |
 
@@ -613,8 +613,13 @@ Remember the allowlists: a custom scheme must be added to the cluster's
   disk — it builds its own filesystem, so it has somewhere to put them.
 - **Container runtimes consume only the `Image` payload** (macOS imports it into
   Apple `container`; Linux converts it to an OCI runtime bundle), and image
-  desugaring is off by default; file/tree artifacts and env referencing inside
-  containers wait on volume plumbing.
+  desugaring is off by default. File and tree artifacts need no consumption:
+  they stage into the task directory, which the runtime mounts at
+  `/legion/task` (see
+  [task-runtime-container.md](task-runtime-container.md#the-task-directory-legiontask)).
+  An artifact staged *outside* the task directory would not be visible inside,
+  so its `LEGION_ARTIFACT_*` var is omitted rather than pointing at a dead
+  host path.
 - **Archive formats** are `.tar.gz`/`.tgz`/`.tar`/`.gz`; `zip`/`zstd` are
   not yet recognized (use `unpack: 'file'` to stage such files as-is).
 - **Fetch failures consume `on_unhealthy` budgets** (see

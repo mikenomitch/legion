@@ -759,8 +759,21 @@ impl SandboxTaskPlugin {
             &bundle,
             &config.command,
             &env,
-            &name,
-            &instance.volumes,
+            &oci_bundle::BundleContext {
+                hostname: &name,
+                volumes: &instance.volumes,
+                // The task dir is not mounted for the sandbox runtime: a
+                // microVM has no host bind mounts, and its dev-mode container
+                // must behave the same way so a jobspec does not change
+                // meaning per backend.
+                task_dir: None,
+                // The sandbox runtime has not adopted the enforcement
+                // interface (`ResourceEnforcement::Unsupported`), so worker
+                // core computes no assignment for it and its dev-mode bundle
+                // carries no limits. It is the designed-for next adopter —
+                // see docs/resource-enforcement.md.
+                assignment: None,
+            },
         )?;
         let mut cmd = Command::new(binary);
         cmd.arg("run").arg("--bundle").arg(&bundle).arg(&name);

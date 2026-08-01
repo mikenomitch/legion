@@ -623,9 +623,13 @@
                 },
             },
             resources: {
-                // The container runtime applies these to the sandbox, not just to
-                // scheduling: memory (MiB) and cores size the guest. `cpu`/`cpus`
-                // (MHz) has no runtime analogue, so declare cores here.
+                // Real limits on Linux when the worker runs with
+                // `resourceEnforcement.enabled` (see docs/resource-enforcement.md):
+                // memory (MiB) becomes a hard cgroup limit, `cores` becomes
+                // *exclusive pinned CPUs* (whole numbers only), and `cpu`
+                // (MHz) becomes a proportional cpu.weight. A task declares
+                // `cores` OR `cpu`, never both. On macOS the same two fields
+                // size the Apple `container` guest VM instead.
                 cores: 1,
                 memory: 256,
             },

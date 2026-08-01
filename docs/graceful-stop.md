@@ -111,7 +111,7 @@ guaranteed.
 | Runtime | Stop notice delivery |
 | --- | --- |
 | `exec` | Signals the task's process group directly. Full support. |
-| `container` | Signals the container's init, not the launching CLI. On Linux (OCI runtimes) `stop.signal` is delivered exactly. On macOS the Apple `container` runtime owns its own ladder and may SIGKILL on its own schedule if `killAfter` exceeds what it accepts. |
+| `container` | Signals the container's init, not the launching CLI. On Linux (OCI runtimes) `stop.signal` is delivered exactly, and when the jobspec declares no `stop` block at all the image's own `STOPSIGNAL` is consulted before `SIGTERM` — docker's chain (see [task-runtime-container.md](task-runtime-container.md#graceful-stop)). On macOS the Apple `container` runtime owns its own ladder and may SIGKILL on its own schedule if `killAfter` exceeds what it accepts. |
 | `sandbox` | **No graceful stop.** A sandbox is a guest OS behind a VMM; signalling the VMM terminates the hypervisor, it does not ask the workload inside to shut down, and Legion has no in-guest agent to relay a notice to. `stop { signal, killAfter }` has no effect, and these allocations are torn down immediately. |
 | Out-of-tree plugins | A runtime that tracks a host process inherits the default (signal the process group). One that does not declines the notice, and the worker tears the allocation down immediately — the pre-grace behavior. |
 

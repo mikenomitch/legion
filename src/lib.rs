@@ -9,6 +9,7 @@ pub mod plugin_runtime;
 pub mod prelude;
 pub mod resources;
 pub mod scheduling_index;
+pub mod signals;
 pub mod storage;
 pub mod structs;
 pub mod task_plugins;

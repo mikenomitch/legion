@@ -185,6 +185,7 @@ mod task_supervisor_test {
             task_name: "api".into(),
             exit_code: code,
             signal: None,
+            oom_killed_at_bytes: None,
         }
     }
 

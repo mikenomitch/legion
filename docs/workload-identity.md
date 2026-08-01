@@ -135,14 +135,44 @@ When a token is re-issued before expiry, `changeMode` governs what happens:
 | Kind | env delivery | file delivery | signal |
 | --- | --- | --- | --- |
 | `exec` | ✅ | ✅ | ✅ |
-| `container` | ✅ | ❌ | ❌ |
+| `container` | ✅ | ✅ (paths under `/legion/task`) | ✅ |
+| `sandbox` | ✅ | ❌ | ❌ |
 | `noop` | ❌ | ❌ | ❌ |
 
-`container` mirrors its existing injection surface (env yes, file no — file
-delivery into a container needs volume plumbing it doesn't yet implement, the
-same limitation as KV file injection). An env-delivered identity on a container
-must therefore refresh via `changeMode: restart`. Specs that ask for an
-unsupported delivery are rejected at admission with an actionable error.
+Specs that ask for an unsupported delivery are rejected at admission with an
+actionable error.
+
+**`container` file paths must resolve under `/legion/task`.** The allocation's
+task directory is bind-mounted there, and nothing else of the host is
+reachable from inside the container, so a destination outside the mount is
+rejected at submit rather than written where the workload could never read it.
+Relative paths resolve against the mount:
+
+```jsonnet
+identities: [{
+  name: 'api',
+  audience: ['sts.amazonaws.com'],
+  file: { path: '/legion/task/identity/token', mode: '0400' },
+  changeMode: 'signal',
+  changeSignal: 'SIGHUP',
+}],
+```
+
+```
+task api identity "api": file.path "/var/run/legion/token" is outside the
+container task directory; use a path under /legion/task (or a relative path),
+or switch to env delivery
+```
+
+This is the one place a jobspec is not verbatim-portable between the `exec`
+and `container` runtimes — the exec runtime's filesystem *is* the host's, so
+its host-absolute paths stay valid.
+
+Because the *directory* is mounted (never individual files), the worker's
+atomic rewrite-and-rename on rotation is visible inside the running container.
+Paired with `changeMode: 'signal'` — which the container runtime delivers to
+the container's init process — a rotation reaches the workload with no restart
+at all. See [docs/task-runtime-container.md](task-runtime-container.md).
 
 ## Manager configuration
 

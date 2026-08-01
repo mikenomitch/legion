@@ -58,7 +58,7 @@ When one is required and what goes in it:
 | [artifact-cache-and-prewarm-plan.md](plans/artifact-cache-and-prewarm-plan.md) | planned |
 | [autoscaler-plan.md](plans/autoscaler-plan.md) | planned |
 | [auth-acl-plan.md](plans/auth-acl-plan.md) | phases 1–4 executed |
-| [container-runtime-exec-and-signals-plan.md](plans/container-runtime-exec-and-signals-plan.md) | planned |
+| [container-runtime-exec-and-signals-plan.md](plans/container-runtime-exec-and-signals-plan.md) | shipped (all seven phases, 2026-07-31) |
 | [exec-and-actions-plan.md](plans/exec-and-actions-plan.md) | shipped (all five phases) |
 | [durability-and-ops-execution-plan.md](plans/durability-and-ops-execution-plan.md) | executed (workstreams A/B/C/D + adversarial verification, 2026-07-28); lanes topology opt-in |
 | [edge-boot-plan.md](plans/edge-boot-plan.md) | shipped (phases 1–4); phase 0 measurement not run, phase 5 backlog |

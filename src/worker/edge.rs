@@ -248,6 +248,7 @@ mod worker_edge_test {
             self_terminate_after_seconds: 0,
             task_volumes: String::new(),
             task_resources: r#"{"memory":512}"#.into(),
+            task_stop: String::new(),
             provisional: None,
         }
     }

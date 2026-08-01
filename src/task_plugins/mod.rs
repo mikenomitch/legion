@@ -19,12 +19,16 @@ mod exec_session;
 mod microvm;
 mod oci_bundle;
 mod oci_image;
+pub mod resource_enforcement;
 mod sandbox;
 mod schema_docs;
 
 pub use container::ContainerTaskPlugin;
 pub use exec::ExecTaskPlugin;
 pub use exec_session::{spawn_pipe, spawn_pty, ExecOptions, ExecOutputStreams, ExecSession};
+pub use resource_enforcement::{
+    join_assignment_cgroup, ResourceAssignment, ResourceEnforcement, Slice, CGROUP_ROOT,
+};
 pub use sandbox::SandboxTaskPlugin;
 pub use schema_docs::{
     builtin_task_plugin_schemas, render_builtin_task_plugin_schemas_markdown,
@@ -354,6 +358,15 @@ pub struct TaskInstance {
     /// real mounts; host-process runtimes just read `LEGION_VOLUME_*` from
     /// [`Self::extra_env`], which the worker already filled in.
     pub volumes: Vec<MountedVolume>,
+    /// What worker core decided for this allocation's CPU and memory (see
+    /// [`ResourceAssignment`]), filled in before `prepare()` for every
+    /// runtime whose [`TaskPlugin::resource_enforcement`] is not
+    /// `Unsupported`.
+    ///
+    /// `None` means nothing is governed — enforcement off, a non-Linux
+    /// worker, or an unported runtime — and a plugin that ignores the field
+    /// entirely behaves exactly as it does today.
+    pub resource_assignment: Option<ResourceAssignment>,
 }
 
 impl TaskInstance {
@@ -467,10 +480,53 @@ pub trait TaskPlugin: Send + Sync {
         false
     }
 
+    /// Where this runtime's tasks see their task directory, when that is not
+    /// the host path.
+    ///
+    /// `None` (the default) means the task shares the host filesystem, so a
+    /// file-delivery destination is a host-absolute path and anything goes —
+    /// the `exec` runtime's position. `Some(root)` means the worker mounts
+    /// the task directory at `root` inside an isolated filesystem, and every
+    /// declared destination (`kvInjections.files[].path`, identity
+    /// `file.path`) must resolve under it, because nothing else is reachable
+    /// from in there. Relative destinations resolve against `root`.
+    ///
+    /// Admission enforces the rule; the worker re-checks before joining a
+    /// declared path onto the host task directory (the same two-layer stance
+    /// identity naming already takes for traversal).
+    fn file_delivery_root(&self) -> Option<&'static str> {
+        None
+    }
+
     /// Whether this runtime can deliver a Unix signal to the running task (needed
     /// for an identity with `changeMode: signal`).
     fn supports_signal(&self) -> bool {
         false
+    }
+
+    /// Deliver a Unix signal (by name, e.g. `"SIGHUP"`) to the running task.
+    ///
+    /// The default signals the tracked pid, which is correct wherever the
+    /// tracked process *is* the workload — the `exec` runtime, and any plugin
+    /// that spawns its task directly. Isolating runtimes override it to reach
+    /// inside: for a container the tracked pid is the runtime CLI supervisor,
+    /// and signaling that kills the supervisor while the container runs on.
+    ///
+    /// Called by the worker for `changeMode: signal` identity refreshes and by
+    /// graceful stop. A runtime that returns `false` from
+    /// [`TaskPlugin::supports_signal`] is never asked (admission rejects the
+    /// specs that would ask), so the default is a safety net, not a contract.
+    fn signal(
+        &self,
+        allocation: &Allocation,
+        _task: &TaskConfig,
+        instance: &mut TaskInstance,
+        signal: &str,
+    ) -> R<()> {
+        let pid = instance.pid.with_context(|| {
+            format!("allocation {} has no tracked pid to signal", allocation.id)
+        })?;
+        crate::signals::send_signal(pid, signal)
     }
 
     /// Whether the task's execution is a host process this worker tracks —
@@ -507,6 +563,22 @@ pub trait TaskPlugin: Send + Sync {
 
     fn supports_artifacts(&self) -> bool {
         false
+    }
+
+    /// How this runtime participates in worker-enforced resource placement
+    /// (see [`ResourceEnforcement`] and `docs/resource-enforcement.md`).
+    ///
+    /// The default is `Unsupported`: worker core computes no assignment and
+    /// touches no cgroup, so `resources` stay scheduling-only — exactly the
+    /// behavior every runtime had before this method existed, which is what
+    /// keeps third-party dylib plugins working untouched.
+    ///
+    /// Opting in is one line for a runtime whose task is a host process
+    /// (`WorkerCgroup` + [`join_assignment_cgroup`] at spawn) and one field
+    /// read for a runtime that confines its own workload (`RuntimeApplied`,
+    /// which the `container` runtime writes into the generated OCI spec).
+    fn resource_enforcement(&self) -> ResourceEnforcement {
+        ResourceEnforcement::Unsupported
     }
 
     /// Desugars runtime-config fields into artifacts (artifact system plan §8).
@@ -806,6 +878,22 @@ pub fn validate_job_config(config: &JobConfig) -> R<()> {
                 }
             }
         }
+        // Resource rules that only bite on a runtime the worker can actually
+        // confine. Checked at admission so a spec that would be silently
+        // meaningless (or unimplementable) fails at `job validate` instead of
+        // at the node.
+        {
+            registry.load_plugin(&task.runtime, false)?;
+            let plugin = registry
+                .plugin(&task.runtime)
+                .context("task plugin loaded but missing")?;
+            if plugin.resource_enforcement() != ResourceEnforcement::Unsupported {
+                validate_governed_resources(task)?;
+            }
+            if let Some(root) = plugin.file_delivery_root() {
+                validate_file_delivery_paths(task, root)?;
+            }
+        }
         if task.schedule.is_some() && task.lifecycle != TaskLifecycle::Batch {
             bail!(
                 "Task {} can only set schedule when lifecycle is batch",
@@ -944,6 +1032,133 @@ pub fn validate_job_config(config: &JobConfig) -> R<()> {
         }
     }
     validate_task_dependencies(config)?;
+    Ok(())
+}
+
+/// Resolve a declared file-delivery destination against an isolating
+/// runtime's task-dir mount, returning the path *relative to the task
+/// directory* — which is exactly what the worker joins onto the host task dir.
+///
+/// Accepts a relative path (resolved against `root`) or an absolute path
+/// inside `root`. Rejects anything else, including `..` traversal that would
+/// climb out, so the check is the same at admission and on the worker.
+pub fn resolve_task_dir_destination(root: &str, declared: &str) -> Result<PathBuf, String> {
+    let declared = declared.trim();
+    if declared.is_empty() {
+        return Err("path cannot be empty".to_string());
+    }
+    let path = std::path::Path::new(declared);
+    let relative = if path.is_absolute() {
+        path.strip_prefix(root).map_err(|_| {
+            format!(
+                "{declared:?} is outside the container task directory; use a path under {root} \
+                 (or a relative path), or switch to env delivery"
+            )
+        })?
+    } else {
+        path
+    };
+
+    // Normalize, refusing any component that could climb out. `.` is dropped;
+    // `..` is a hard error rather than something to resolve, so the message
+    // stays about the destination the author wrote.
+    let mut normalized = PathBuf::new();
+    for component in relative.components() {
+        match component {
+            std::path::Component::Normal(part) => normalized.push(part),
+            std::path::Component::CurDir => {}
+            std::path::Component::RootDir if normalized.as_os_str().is_empty() => {}
+            _ => {
+                return Err(format!(
+                    "{declared:?} escapes the container task directory; use a path under {root}"
+                ))
+            }
+        }
+    }
+    if normalized.as_os_str().is_empty() {
+        return Err(format!(
+            "{declared:?} names the task directory itself, not a file inside it"
+        ));
+    }
+    Ok(normalized)
+}
+
+/// Every file-delivery destination on a task whose runtime mounts its task
+/// directory must land inside that mount — the one place a jobspec is not
+/// verbatim-portable between the `exec` and `container` runtimes.
+fn validate_file_delivery_paths(task: &TaskConfig, root: &str) -> R<()> {
+    if let Some(injections) = task.kv_injections.as_ref() {
+        for file in &injections.files {
+            resolve_task_dir_destination(root, &file.path)
+                .map_err(|err| anyhow!("task {} kvInjections.files path {err}", task.name))?;
+        }
+    }
+    for identity in &task.identities {
+        let Some(file) = identity.file.as_ref() else {
+            continue;
+        };
+        resolve_task_dir_destination(root, &file.path).map_err(|err| {
+            anyhow!(
+                "task {} identity {:?}: file.path {err}",
+                task.name,
+                identity.name
+            )
+        })?;
+    }
+    Ok(())
+}
+
+/// The `resources` rules that apply to a runtime the worker can confine
+/// (`container`, `exec`) — Nomad's, because the semantics are Nomad's.
+///
+/// Both rules reject specs that were previously accepted-and-ignored, which
+/// is deliberate: `cores: 1.5` was silently rounded on macOS and dropped on
+/// Linux, and `cores` + `cpu` together asked for two different CPU contracts
+/// on one task. Every message names the fix.
+fn validate_governed_resources(task: &TaskConfig) -> R<()> {
+    let cores = crate::worker::resources::declared_cores(&task.resources);
+    let cpu_mhz = crate::worker::resources::cpu_weight_shares(&task.resources);
+
+    if let Some(cores) = cores {
+        if cores.fract() != 0.0 {
+            bail!(
+                "task {} declares resources.cores {cores}, which must be a whole number on the \
+                 {} runtime: `cores` reserves exclusive CPUs and a cpuset cannot hold a fraction \
+                 of one. Round it, or use `cpu` (MHz) for a proportional share instead",
+                task.name,
+                task.runtime,
+            );
+        }
+        if cpu_mhz.is_some() {
+            bail!(
+                "task {} declares both resources.cores and resources.cpu: they are two different \
+                 CPU contracts (exclusive whole CPUs vs. a proportional share of the shared \
+                 pool) and cannot both hold. Declare `cores` for latency-sensitive work, or \
+                 `cpu` (MHz) for everything else",
+                task.name,
+            );
+        }
+    }
+
+    // An explicit `config.cgroup` on an exec task opts it out of Legion's
+    // hierarchy, so Legion cannot promise exclusivity inside it.
+    if cores.is_some() {
+        let named_cgroup = task
+            .config
+            .get("cgroup")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        if let Some(cgroup) = named_cgroup {
+            bail!(
+                "task {} declares resources.cores together with config.cgroup ({cgroup:?}): an \
+                 explicit cgroup is one Legion does not manage, so it cannot fence other tasks \
+                 off the cores you reserved. Drop `cores` (use `cpu` MHz instead), or drop \
+                 `cgroup` and let the worker place the task",
+                task.name,
+            );
+        }
+    }
     Ok(())
 }
 
@@ -1720,6 +1935,210 @@ mod tests {
         validate_job_config(&scoped).expect("group-scoped slots block is valid");
     }
 
+    /// The path rule, at the level admission and the worker both call.
+    #[test]
+    fn file_destinations_resolve_against_the_task_dir_mount() {
+        let root = "/legion/task";
+        // Relative resolves against the mount.
+        assert_eq!(
+            resolve_task_dir_destination(root, "config/app.toml").expect("relative is in range"),
+            Path::new("config/app.toml")
+        );
+        // Absolute-in-range keeps its remainder.
+        assert_eq!(
+            resolve_task_dir_destination(root, "/legion/task/identity/token")
+                .expect("absolute in range"),
+            Path::new("identity/token")
+        );
+        // `./` noise is normalized away.
+        assert_eq!(
+            resolve_task_dir_destination(root, "./a/./b").expect("normalizes"),
+            Path::new("a/b")
+        );
+
+        // Out of range names the fix and the alternative.
+        let err = resolve_task_dir_destination(root, "/var/run/legion/token")
+            .expect_err("outside the mount");
+        assert!(err.contains("/legion/task"), "{err}");
+        assert!(err.contains("env delivery"), "{err}");
+
+        // Traversal cannot climb out, however it is spelled.
+        for escape in ["../escape", "a/../../escape", "/legion/task/../escape"] {
+            assert!(
+                resolve_task_dir_destination(root, escape).is_err(),
+                "{escape} must be refused"
+            );
+        }
+        // The mount point itself is a directory, not a destination.
+        assert!(resolve_task_dir_destination(root, "/legion/task").is_err());
+        assert!(resolve_task_dir_destination(root, "").is_err());
+    }
+
+    /// The declared roots per built-in runtime — the contract validation and
+    /// the worker's translation both key off.
+    #[test]
+    fn the_builtin_runtimes_declare_their_file_delivery_roots() {
+        assert_eq!(
+            ContainerTaskPlugin.file_delivery_root(),
+            Some("/legion/task")
+        );
+        // The exec runtime's filesystem is the host's: nothing to translate.
+        assert_eq!(ExecTaskPlugin.file_delivery_root(), None);
+        assert_eq!(LegacyStopPlugin::default().file_delivery_root(), None);
+    }
+
+    // --- resource enforcement: the interface contract, and the validation
+    // rules that come with it ---
+
+    /// The three modes, asserted generically over the trait, so the next
+    /// adopter — in-tree or dylib — inherits this suite instead of writing
+    /// one. Each mode is a promise about what worker core does on the
+    /// plugin's behalf.
+    #[test]
+    fn the_enforcement_contract_holds_for_all_three_modes() {
+        struct ModePlugin(ResourceEnforcement);
+        impl TaskPlugin for ModePlugin {
+            fn name(&self) -> &'static str {
+                "mode-plugin"
+            }
+            fn resource_enforcement(&self) -> ResourceEnforcement {
+                self.0
+            }
+        }
+
+        let mut governor = crate::worker::resources::NodeResourceGovernor::disabled();
+        let task = TaskConfig {
+            resources: json!({ "memory": 64 }),
+            ..TaskConfig::new("api", "mode-plugin")
+        };
+
+        for mode in [
+            ResourceEnforcement::Unsupported,
+            ResourceEnforcement::WorkerCgroup,
+            ResourceEnforcement::RuntimeApplied,
+        ] {
+            let plugin = ModePlugin(mode);
+            assert_eq!(plugin.resource_enforcement(), mode);
+            // A disabled governor (the default worker) never assigns,
+            // whatever the mode — the opt-in promise.
+            assert!(governor
+                .assign(1, &task, plugin.resource_enforcement())
+                .expect("disabled governor never fails")
+                .is_none());
+        }
+
+        // And a plugin that never mentions enforcement is `Unsupported`,
+        // which is what keeps unported dylib plugins behaving as today.
+        assert_eq!(
+            LegacyStopPlugin::default().resource_enforcement(),
+            ResourceEnforcement::Unsupported
+        );
+
+        // `join_assignment_cgroup` is a no-op without an assignment, so a
+        // `WorkerCgroup` plugin can call it unconditionally.
+        let mut cmd = Command::new("true");
+        crate::task_plugins::join_assignment_cgroup(&mut cmd, &TaskInstance::default())
+            .expect("no assignment is not an error");
+    }
+
+    /// The built-ins' declared modes are part of the contract: exclusivity is
+    /// only node-wide because `container` and `exec` share one hierarchy.
+    #[test]
+    fn the_builtin_runtimes_declare_their_modes() {
+        assert_eq!(
+            ContainerTaskPlugin.resource_enforcement(),
+            ResourceEnforcement::RuntimeApplied
+        );
+        assert_eq!(
+            ExecTaskPlugin.resource_enforcement(),
+            ResourceEnforcement::WorkerCgroup
+        );
+        // The sandbox runtime is the designed-for next adopter, not one yet.
+        assert_eq!(
+            SandboxTaskPlugin.resource_enforcement(),
+            ResourceEnforcement::Unsupported
+        );
+    }
+
+    /// A cpuset cannot hold half a CPU. This was silently rounded on macOS
+    /// and dropped on Linux before, so the rejection is a tightening — the
+    /// message names both fixes.
+    #[test]
+    fn governed_runtimes_reject_fractional_cores() {
+        let task = TaskConfig {
+            resources: json!({ "cores": 1.5 }),
+            config: json!({"image": "alpine", "command": ["echo", "hi"]}),
+            ..TaskConfig::new("api", "container")
+        };
+        let err = validate_job_config(&job_with(task)).expect_err("half a core is not a cpuset");
+        let message = err.to_string();
+        assert!(message.contains("whole number"), "{message}");
+        assert!(message.contains("cpu"), "{message}");
+
+        // Whole numbers are fine, on both governed runtimes.
+        for (runtime, config) in [
+            ("container", json!({"image": "alpine", "command": ["x"]})),
+            ("exec", json!({"command": ["true"]})),
+        ] {
+            validate_job_config(&job_with(TaskConfig {
+                resources: json!({ "cores": 2 }),
+                config,
+                ..TaskConfig::new("api", runtime)
+            }))
+            .expect("whole cores are valid");
+        }
+    }
+
+    /// `cores` and `cpu` are two different CPU contracts; asking for both has
+    /// no coherent meaning (Nomad's rule).
+    #[test]
+    fn governed_runtimes_reject_cores_and_cpu_together() {
+        let task = TaskConfig {
+            resources: json!({ "cores": 2, "cpu": 500 }),
+            config: json!({"image": "alpine", "command": ["echo", "hi"]}),
+            ..TaskConfig::new("api", "container")
+        };
+        let err = validate_job_config(&job_with(task)).expect_err("two CPU contracts");
+        let message = err.to_string();
+        assert!(message.contains("both"), "{message}");
+        assert!(message.contains("cores"), "{message}");
+    }
+
+    /// Legion cannot promise exclusivity inside a cgroup it does not manage.
+    #[test]
+    fn exec_rejects_cores_with_an_explicit_cgroup() {
+        let task = TaskConfig {
+            resources: json!({ "cores": 1 }),
+            config: json!({"command": ["true"], "cgroup": "workloads/demo"}),
+            ..TaskConfig::new("api", "exec")
+        };
+        let err = validate_job_config(&job_with(task)).expect_err("cannot fence a foreign cgroup");
+        let message = err.to_string();
+        assert!(message.contains("config.cgroup"), "{message}");
+        assert!(message.contains("cores"), "{message}");
+
+        // An explicit cgroup on its own is still fine — it means what it has
+        // always meant, and back-compat is the whole point.
+        validate_job_config(&job_with(TaskConfig {
+            resources: json!({ "memory": 64 }),
+            config: json!({"command": ["true"], "cgroup": "workloads/demo"}),
+            ..TaskConfig::new("api", "exec")
+        }))
+        .expect("an explicit cgroup alone stays valid");
+    }
+
+    /// An ungoverned runtime keeps accepting whatever it accepted before:
+    /// its `resources` are scheduling-only, so there is nothing to enforce
+    /// and nothing to reject.
+    #[test]
+    fn ungoverned_runtimes_keep_accepting_scheduling_only_resources() -> R<()> {
+        validate_job_config(&job_with(TaskConfig {
+            resources: json!({ "cores": 1.5, "cpu": 500 }),
+            config: json!({"image": "alpine", "command": ["/bin/sh", "-c", "sleep 1"]}),
+            ..TaskConfig::new("box", "sandbox")
+        }))
+    }
+
     #[test]
     fn builtin_plugin_schemas_have_descriptions_and_defaults() -> R<()> {
         validate_builtin_task_plugin_schemas()?;
@@ -1763,15 +2182,55 @@ mod tests {
         validate_job_config(&job_with(task))
     }
 
+    /// Identity file delivery works in containers now that the task dir is
+    /// mounted — at a destination under the mount. The FHS-conventional path
+    /// the exec runtime uses is not reachable from inside, and the error says
+    /// so with the fix.
     #[test]
-    fn container_task_rejects_file_identity() {
-        let task = TaskConfig {
+    fn container_task_scopes_identity_files_to_the_task_dir() -> R<()> {
+        let err = validate_job_config(&job_with(TaskConfig {
             identities: vec![file_identity("aws")],
             config: json!({"image": "alpine", "command": ["echo", "hi"]}),
             ..TaskConfig::new("api", "container")
-        };
-        let err = validate_job_config(&job_with(task)).expect_err("container has no file delivery");
-        assert!(err.to_string().contains("identity file delivery"), "{err}");
+        }))
+        .expect_err("/var/run/legion/... is outside the mount");
+        let message = err.to_string();
+        assert!(message.contains("/legion/task"), "names the fix: {message}");
+        assert!(
+            message.contains("outside the container task directory"),
+            "{message}"
+        );
+
+        // The absolute in-range form, and the relative form, both work.
+        for path in ["/legion/task/identity/token", "identity/token"] {
+            validate_job_config(&job_with(TaskConfig {
+                identities: vec![WorkloadIdentity {
+                    name: "aws".into(),
+                    audience: vec!["sts.amazonaws.com".into()],
+                    file: Some(WorkloadIdentityFile {
+                        path: path.into(),
+                        mode: Some("0400".into()),
+                    }),
+                    ..Default::default()
+                }],
+                config: json!({"image": "alpine", "command": ["echo", "hi"]}),
+                ..TaskConfig::new("api", "container")
+            }))
+            .unwrap_or_else(|err| panic!("{path} should be accepted: {err}"));
+        }
+        Ok(())
+    }
+
+    /// The exec runtime is untouched: its filesystem *is* the host's, so a
+    /// host-absolute destination stays valid. This is the one place a jobspec
+    /// is not verbatim-portable between the two runtimes.
+    #[test]
+    fn exec_task_keeps_host_absolute_file_destinations() -> R<()> {
+        validate_job_config(&job_with(TaskConfig {
+            identities: vec![file_identity("aws")],
+            config: json!({"command": ["true"]}),
+            ..TaskConfig::new("api", "exec")
+        }))
     }
 
     #[test]
@@ -1791,8 +2250,12 @@ mod tests {
         validate_job_config(&job_with(task))
     }
 
+    /// The container runtime signals the container's init through its runtime
+    /// CLI, so a token can be refreshed with a signal instead of a full
+    /// container restart. (This test asserted the opposite before the signal
+    /// seam landed.)
     #[test]
-    fn container_task_rejects_signal_change_mode() {
+    fn container_task_accepts_signal_change_mode() -> R<()> {
         let identity = WorkloadIdentity {
             name: "vault".into(),
             audience: vec!["vault.internal".into()],
@@ -1806,8 +2269,53 @@ mod tests {
             config: json!({"image": "alpine", "command": ["echo", "hi"]}),
             ..TaskConfig::new("api", "container")
         };
-        let err = validate_job_config(&job_with(task)).expect_err("container cannot signal");
+        validate_job_config(&job_with(task))
+    }
+
+    /// A runtime with nothing to signal still rejects the mode at submit,
+    /// rather than accepting a refresh contract it cannot honor.
+    #[test]
+    fn sandbox_task_still_rejects_signal_change_mode() {
+        let identity = WorkloadIdentity {
+            name: "vault".into(),
+            audience: vec!["vault.internal".into()],
+            env: Some("VAULT_TOKEN".into()),
+            change_mode: ChangeMode::Signal,
+            change_signal: Some("SIGHUP".into()),
+            ..Default::default()
+        };
+        let task = TaskConfig {
+            identities: vec![identity],
+            config: json!({"image": "alpine", "command": ["/bin/sh", "-c", "sleep 1"]}),
+            ..TaskConfig::new("box", "sandbox")
+        };
+        let err = validate_job_config(&job_with(task)).expect_err("sandbox cannot signal");
         assert!(err.to_string().contains("signaling"), "{err}");
+    }
+
+    /// The trait default is the pre-existing worker behavior: signal the
+    /// tracked pid. A plugin that never overrides `signal` keeps it, and a
+    /// plugin with no tracked process gets an error naming the allocation
+    /// rather than a silent no-op.
+    #[test]
+    fn default_signal_targets_the_tracked_pid() -> R<()> {
+        let plugin = LegacyStopPlugin::default();
+        let task = TaskConfig::new("legacy-task", "legacy-stop");
+
+        let mut empty = TaskInstance::default();
+        let err = plugin
+            .signal(&alloc(), &task, &mut empty, "SIGHUP")
+            .expect_err("no pid to signal");
+        assert!(err.to_string().contains("no tracked pid"), "{err}");
+
+        // Our own pid, with a signal that is a no-op for a process that does
+        // not handle it: proves the default reaches kill(2) successfully.
+        let mut instance = TaskInstance {
+            pid: Some(std::process::id()),
+            ..TaskInstance::default()
+        };
+        plugin.signal(&alloc(), &task, &mut instance, "SIGWINCH")?;
+        Ok(())
     }
 
     #[test]

@@ -37,6 +37,16 @@ pub struct PersistedAllocation {
     /// the manager's id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub external_id: Option<i64>,
+    /// The CPU/memory placement worker core handed this allocation (see
+    /// `src/worker/resources.rs`). Persisted because it is the *unit of
+    /// recovery*: a restarted worker rebuilds its core allocator and both
+    /// slice masks from these records, so a running task's exclusive cores
+    /// are never handed out twice.
+    ///
+    /// Absent in records written before enforcement existed, and in every
+    /// record on a worker that does not enforce — both load unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_assignment: Option<crate::task_plugins::ResourceAssignment>,
 }
 
 #[derive(Debug, Clone)]

@@ -10108,12 +10108,17 @@ mod tests {
         Ok(())
     }
 
+    /// KV file injection into containers works now that the task directory
+    /// is mounted — but only at a destination the container can actually see.
+    /// A host-absolute path outside the mount is rejected at submit with the
+    /// fix in the message, rather than staging to a directory the workload
+    /// could never read.
     #[tokio::test]
-    async fn run_job_rejects_file_injection_for_container_tasks() -> R<()> {
+    async fn run_job_scopes_container_file_injection_to_the_task_dir() -> R<()> {
         let store = setup_store()?;
         let manager = ManagerDaemonService::new(store);
 
-        let jobspec = json!({
+        let out_of_range = json!({
             "name": "kv-container-files",
             "task": {
                 "runtime": "container",
@@ -10126,16 +10131,35 @@ mod tests {
                 "config": { "image": "alpine", "command": ["echo", "hi"] }
             }
         });
-        let err = run_jobspec(&manager, jobspec)
+        let err = run_jobspec(&manager, out_of_range)
             .await
-            .expect_err("submit should fail for unsupported file injection");
+            .expect_err("a path outside the mount is unreachable from inside");
 
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        let message = err.message();
+        assert!(message.contains("/legion/task"), "names the fix: {message}");
         assert!(
-            err.message().contains("does not support kv file injection"),
-            "unexpected error message: {}",
-            err.message()
+            message.contains("outside the container task directory"),
+            "unexpected error message: {message}"
         );
+
+        // A relative path resolves against the mount and is accepted.
+        let in_range = json!({
+            "name": "kv-container-files-ok",
+            "task": {
+                "runtime": "container",
+                "files": [
+                    {
+                        "path": "config/app.toml",
+                        "file": { "template": "static-content" }
+                    }
+                ],
+                "config": { "image": "alpine", "command": ["echo", "hi"] }
+            }
+        });
+        run_jobspec(&manager, in_range)
+            .await
+            .expect("a path under the mount is accepted");
         Ok(())
     }
 
