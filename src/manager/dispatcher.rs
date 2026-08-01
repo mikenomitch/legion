@@ -135,11 +135,16 @@ pub struct SpeculativeClaim {
 /// Failures are swallowed on purpose: a provisional dispatch is an
 /// optimization. If it does not land, the ordinary post-commit dispatch still
 /// runs and the only thing lost is the head start.
+/// Takes the planner's placements directly rather than a prepared node list:
+/// the node speculated on is `candidates[0]` (== `node_id`), and building a
+/// separate list up front would clone a node id per placement on every plan,
+/// including the overwhelming majority where no task opted in and this
+/// returns on the first cache lookup.
 #[instrument(skip_all)]
 pub fn dispatch_speculative(
     store: &Store,
     job_config_id: &str,
-    placements: &[(String, i64)],
+    placements: &[crate::manager::scheduler::PlannedAllocation],
 ) -> Vec<SpeculativeClaim> {
     if placements.is_empty() {
         return Vec::new();
@@ -174,7 +179,9 @@ pub fn dispatch_speculative(
     }
 
     let mut claims = Vec::new();
-    for (node_id, task_config_id) in placements {
+    for placement in placements {
+        let node_id = &placement.node_id;
+        let task_config_id = &placement.task_config_id;
         let Some(resolved) = speculative.get(task_config_id) else {
             continue;
         };

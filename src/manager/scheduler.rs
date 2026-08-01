@@ -1449,14 +1449,10 @@ impl<'a> Scheduler<'a> {
         // the claim, so the claim is never ratified and dies at its lease —
         // the same outcome as a rejected plan, and the reason a fallback
         // costs the head start rather than correctness.
-        let speculative_pairs = placements
-            .iter()
-            .map(|placement| (placement.node_id.clone(), placement.task_config_id))
-            .collect::<Vec<_>>();
         let speculative_claims = crate::manager::dispatcher::dispatch_speculative(
             self.store,
             job_config_id,
-            &speculative_pairs,
+            &placements,
         );
 
         // One replicated op for insert + apply: on raft backends the split
