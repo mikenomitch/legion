@@ -135,6 +135,7 @@ pub struct SpeculativeClaim {
 /// Failures are swallowed on purpose: a provisional dispatch is an
 /// optimization. If it does not land, the ordinary post-commit dispatch still
 /// runs and the only thing lost is the head start.
+///
 /// Takes the planner's placements directly rather than a prepared node list:
 /// the node speculated on is `candidates[0]` (== `node_id`), and building a
 /// separate list up front would clone a node id per placement on every plan,

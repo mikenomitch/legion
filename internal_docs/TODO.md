@@ -489,13 +489,22 @@ No plan yet — this needs one before any code.
 
 Plans: [persistence-plan.md](plans/persistence-plan.md), [multi-raft-persistence-plan.md](plans/multi-raft-persistence-plan.md) · docs: [state-store.md](../docs/state-store.md), [raft-operations.md](../docs/raft-operations.md), [persistence-streaming.md](../docs/persistence-streaming.md)
 
-- [ ] `raft_lanes::killing_the_all_lane_leader_reconverges_onto_one_survivor`
-      is timing-sensitive under parallel test load: green in isolation
-      (9/9 on a 4-vCPU container, 2026-07-30) but failed once during a full
-      `cargo test --all` where ~20 test binaries starve its election
-      timers. The test already accepts split outcomes by design; consider a
-      longer election budget when `cargo test` runs the whole workspace, or
-      serializing the cluster-gated suites.
+- [x] **A sync forward to a new lane leader panicked the manager.**
+      `MultiRaftDriver::forward_lane_write` dialed the leader through
+      `ChannelPool::get` *before* entering the raft runtime, and
+      `Endpoint::connect_lazy` builds a tonic channel by spawning its
+      connection task — which panics ("there is no reactor running") on a
+      thread with no runtime context. Every synchronous caller reaches this
+      path when its write lands on a follower
+      (`Store::forward_after_rejection` → `enqueue_eval`), and the channel
+      pool hid it: only the *first* forward to a given leader address dials,
+      so it fired only just after leadership moved to a manager this node had
+      not forwarded to before. The dial now happens inside
+      `block_on_engine`. This was previously logged here as
+      `raft_lanes::killing_the_all_lane_leader_reconverges_onto_one_survivor`
+      being "timing-sensitive under parallel test load" — that diagnosis was
+      wrong; the test was reporting a real crash. Reproduced at ~1-in-7 runs
+      of that suite before the fix, 20/20 clean after.
 
 - [x] **Real Raft persistence** — quorum-committed writes, per-lane log stores,
       snapshots/compaction, real membership
