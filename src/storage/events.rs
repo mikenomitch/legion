@@ -231,21 +231,59 @@ pub mod drafts {
         }))
     }
 
+    /// `eval.requeued` — an eval exhausted its in-handler plan-conflict
+    /// retry budget and was released back to the pending queue with a delay
+    /// instead of being terminally failed. Conflict is transient by
+    /// definition, so the work stays visibly pending and runs again once the
+    /// delay elapses (docs/late-binding-plan-apply.md).
+    pub fn eval_requeued(eval: &Eval, error: &anyhow::Error, delay: Duration) -> EventDraft {
+        EventDraft::warn(
+            "eval.requeued",
+            format!(
+                "Eval {} ({}) requeued after plan conflicts; retrying in {}ms",
+                eval.id,
+                eval.kind,
+                delay.as_millis()
+            ),
+        )
+        .job(&eval.job_id)
+        .node(&eval.node_name)
+        .eval(&eval.id)
+        .meta(json!({
+            "evalKind": eval.kind,
+            "delayMs": delay.as_millis() as u64,
+            "error": format!("{error:#}"),
+        }))
+    }
+
     /// `allocation.placed` — a plan was applied. One event per apply with up
     /// to 20 placements detailed in metadata. `None` when nothing was placed.
-    pub fn allocations_placed(job_config_id: &str, placed: &[Allocation]) -> Option<EventDraft> {
+    ///
+    /// `candidate_ranks` is parallel to `placed`: the candidate rank each
+    /// placement bound at (0 = the planner's first choice; >0 = the apply
+    /// walk absorbed a race by falling back —
+    /// docs/late-binding-plan-apply.md). The metadata carries the rank per
+    /// placement and a top-level `fallbacks` count.
+    pub fn allocations_placed(
+        job_config_id: &str,
+        placed: &[Allocation],
+        candidate_ranks: &[usize],
+    ) -> Option<EventDraft> {
         let first = placed.first()?;
         let placements: Vec<Value> = placed
             .iter()
+            .enumerate()
             .take(20)
-            .map(|alloc| {
+            .map(|(index, alloc)| {
                 json!({
                     "allocationId": alloc.id,
                     "nodeId": alloc.node_id,
                     "taskConfigId": alloc.task_config_id,
+                    "candidateRank": candidate_ranks.get(index).copied().unwrap_or(0),
                 })
             })
             .collect();
+        let fallbacks = candidate_ranks.iter().filter(|rank| **rank > 0).count();
         Some(
             EventDraft::info(
                 "allocation.placed",
@@ -259,6 +297,7 @@ pub mod drafts {
             .meta(json!({
                 "jobConfigId": job_config_id,
                 "count": placed.len(),
+                "fallbacks": fallbacks,
                 "placements": placements,
             })),
         )

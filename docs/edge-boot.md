@@ -482,6 +482,17 @@ Stated here rather than left for a bug report:
   instance a placement binds is decided inside the apply, so a payload sent
   before it cannot know. Keyed starts that need to name their sandbox up front
   use the edge path.
+- **A late-binding fallback costs the head start.** Under [late-binding plan
+  apply](late-binding-plan-apply.md) a placement carries ranked candidate
+  nodes and the apply walk binds the first one still valid. Speculative
+  dispatch goes to the planner's first choice, so when the walk falls back to
+  another candidate the workload starts on a node that staged nothing — it
+  starts by ordinary post-commit dispatch, and the claim on the first choice
+  expires at its `ratifyTimeout` without ever running. Nothing is placed
+  twice and nothing is lost but the head start. The `fallbacks` field on the
+  scheduler's `Completed scheduler plan_and_apply` log line counts how often
+  the walk fell back; if that is high for a job that opted into
+  `speculativeStart`, the speculation is mostly wasted work.
 - **No speculative attach for shared storage,** even for drivers that could
   fence it. A driver-advertised fencing capability is future work.
 - **Not a snapshot/fast-start substitute.** This removes control-plane latency;

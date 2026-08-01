@@ -97,7 +97,7 @@ pub fn ratify(store: &Store, claim: &ClaimRatification<'_>) -> R<Verdict> {
     );
 
     match outcome {
-        Ok((_, PlanApplyOutcome::Applied(allocations))) => match allocations.first() {
+        Ok((_, PlanApplyOutcome::Applied(applied))) => match applied.allocations.first() {
             Some(allocation) => Ok(Verdict::Confirmed {
                 allocation_id: allocation.id,
             }),

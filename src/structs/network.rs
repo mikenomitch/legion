@@ -359,6 +359,43 @@ pub fn sanitize_env_label(label: &str) -> String {
         .collect()
 }
 
+/// Typed marker for a statically-requested port that is already taken on a
+/// node. Kept as a distinct error type so the plan-apply candidate walk can
+/// recognize the collision and skip to the next candidate instead of
+/// failing the whole plan; every other port-assignment error propagates
+/// (docs/late-binding-plan-apply.md).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaticPortInUse {
+    pub port: u16,
+    message: String,
+}
+
+impl StaticPortInUse {
+    fn for_port(port: u16, name: &str) -> Self {
+        StaticPortInUse {
+            port,
+            message: format!("static port {port} for port '{name}' is already in use on this node"),
+        }
+    }
+
+    fn for_upstream(port: u16, service: &str) -> Self {
+        StaticPortInUse {
+            port,
+            message: format!(
+                "static local port {port} for upstream '{service}' is already in use on this node"
+            ),
+        }
+    }
+}
+
+impl std::fmt::Display for StaticPortInUse {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for StaticPortInUse {}
+
 /// Take the next free port from the dynamic range, advancing the shared
 /// cursor. `what` names the offending entry in the exhaustion error.
 fn next_dynamic_port(cursor: &mut u16, taken: &mut HashSet<u16>, what: &str) -> R<u16> {
@@ -397,10 +434,10 @@ pub fn assign_allocation_ports(
     for port in ports {
         if let Some(static_port) = port.static_port {
             if !taken.insert(static_port) {
-                bail!(
-                    "static port {static_port} for port '{}' is already in use on this node",
-                    port.name
-                );
+                return Err(anyhow::Error::new(StaticPortInUse::for_port(
+                    static_port,
+                    &port.name,
+                )));
             }
             assigned.push(AllocPort {
                 name: port.name.clone(),
@@ -412,10 +449,10 @@ pub fn assign_allocation_ports(
     for upstream in upstreams {
         if let Some(local_port) = upstream.local_port {
             if !taken.insert(local_port) {
-                bail!(
-                    "static local port {local_port} for upstream '{}' is already in use on this node",
-                    upstream.service
-                );
+                return Err(anyhow::Error::new(StaticPortInUse::for_upstream(
+                    local_port,
+                    &upstream.service,
+                )));
             }
             assigned_upstreams.push(AllocUpstream {
                 service: upstream.service.clone(),

@@ -380,6 +380,35 @@ impl Eval {
             .is_some_and(|storage| matches!(storage, StorageError::Conflict { .. }))
     }
 
+    /// Whether an eval-handler error is (or wraps) an optimistic-concurrency
+    /// plan conflict (`StorageError::Conflict`). This is the transient class
+    /// `handle_claimed_eval` requeues with a delay instead of terminally
+    /// failing: the plan lost races, not validity, and failed evals are
+    /// never retried (docs/late-binding-plan-apply.md).
+    pub fn error_is_plan_conflict(error: &anyhow::Error) -> bool {
+        Self::is_conflict_error(error)
+    }
+
+    /// The requeue-backstop delay for a conflict-exhausted eval:
+    /// `plan_conflict_requeue_delay_ms` (default 1000, clamped to
+    /// [100, 60_000]) plus uniform jitter of up to the base, so a burst of
+    /// requeued racers does not re-fire in lockstep and re-collide.
+    pub fn plan_conflict_requeue_delay(store: &Store) -> Duration {
+        const DEFAULT_MS: u64 = 1_000;
+        const MIN_MS: u64 = 100;
+        const MAX_MS: u64 = 60_000;
+
+        let base = store
+            .scheduler_settings
+            .as_ref()
+            .and_then(|settings| settings.get("plan_conflict_requeue_delay_ms"))
+            .and_then(|value| value.as_u64())
+            .unwrap_or(DEFAULT_MS)
+            .clamp(MIN_MS, MAX_MS);
+        let jitter = rand::thread_rng().gen_range(0..=base);
+        Duration::from_millis(base + jitter)
+    }
+
     fn max_plan_conflict_retries(store: &Store) -> usize {
         const DEFAULT_RETRIES: usize = 3;
         const MAX_RETRIES: usize = 20;
@@ -585,6 +614,63 @@ mod tests {
         };
         let delay = Eval::adaptive_retry_delay(settings, 6, 6);
         assert_eq!(delay, Duration::from_millis(80));
+    }
+
+    #[test]
+    fn error_is_plan_conflict_sees_through_context_wrapping() {
+        // The exhaustion path wraps the conflict in context — exactly what
+        // `plan_with_conflict_retries` returns after its last attempt.
+        let wrapped = anyhow::Error::new(StorageError::Conflict {
+            message: "plan submission rejected".into(),
+        })
+        .context("plan submission failed after 3 attempts");
+        assert!(Eval::error_is_plan_conflict(&wrapped));
+
+        let unrelated = anyhow::anyhow!("no available nodes matching constraints");
+        assert!(!Eval::error_is_plan_conflict(&unrelated));
+
+        let not_found = anyhow::Error::new(StorageError::NotFound {
+            entity: "job",
+            id: "x".into(),
+        });
+        assert!(!Eval::error_is_plan_conflict(&not_found));
+    }
+
+    #[test]
+    fn plan_conflict_requeue_delay_is_jittered_within_bounds() -> R<()> {
+        let store = setup_store()?;
+        for _ in 0..10 {
+            let delay = Eval::plan_conflict_requeue_delay(&store);
+            assert!(delay >= Duration::from_millis(1_000), "delay {delay:?}");
+            assert!(delay <= Duration::from_millis(2_000), "delay {delay:?}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn plan_conflict_requeue_delay_respects_scheduler_settings() -> R<()> {
+        let store_dir = Builder::new()
+            .prefix("legion-eval-")
+            .tempdir()
+            .context("error creating temp store directory")?
+            .keep();
+        let store_config = ManagerConfigFull {
+            store_path: store_dir
+                .to_str()
+                .context("error parsing store path")?
+                .to_string(),
+            scheduler_settings: Some(json!({ "plan_conflict_requeue_delay_ms": 100 })),
+            ..Default::default()
+        };
+        let store = Store::start_storage(&store_config)?;
+        store.reset_all_tables()?;
+
+        for _ in 0..10 {
+            let delay = Eval::plan_conflict_requeue_delay(&store);
+            assert!(delay >= Duration::from_millis(100), "delay {delay:?}");
+            assert!(delay <= Duration::from_millis(200), "delay {delay:?}");
+        }
+        Ok(())
     }
 
     fn make_node(id: &str, zone: &str) -> Node {

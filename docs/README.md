@@ -15,6 +15,9 @@ Plans, roadmaps, to-do lists, and development notes live in
   drives placement.
 - [Scheduling Indexes](scheduling-indexes.md) — declarable nearest-fit indexes
   over node attributes and free resources; how candidate selection scales.
+- [Late-Binding Plan Apply](late-binding-plan-apply.md) — ranked candidate
+  lists with commit-time node choice, and the conflict-requeue backstop; how
+  concurrent submits stop fighting over one node.
 - [Jobs, Tasks, and Scheduling](jobs-tasks-and-scheduling.md) — job spec shapes,
   placement semantics, and edge cases.
 - [State Store](state-store.md) — manager and worker persistence.

@@ -19,7 +19,6 @@ How to use it:
 
 | PR | What it lands | Notes |
 | --- | --- | --- |
-| (branch `claude/pre-benchmark-features-mlgzyx`) | Pre-benchmark hardening: apply-time resource re-validation, raft engine metrics, worker /metrics + OTLP push, eval-path fixes, scheduler plan-path cleanups, `legion job scale` (autoscaler phase 1) | [calls](calls/pre-benchmark-hardening_calls.md) · [autoscaler calls #5/#7](calls/autoscaler-plan_calls.md) |
 | [#162](https://github.com/mikenomitch/legion/pull/162) | Lanes hardening: worker-write forwarding, split-tolerant submits, adversarial fixes | Plan §8 + calls doc in [durability-and-ops-execution-plan.md](plans/durability-and-ops-execution-plan.md) |
 | [#143](https://github.com/mikenomitch/legion/pull/143) | Note the node-level builtin resource override gap | Docs only; the fix itself is a todo below |
 | [#84](https://github.com/mikenomitch/legion/pull/84) | Instrument DB hot paths, batch task-status updates | Old; rebase or close |
@@ -29,17 +28,26 @@ How to use it:
 
 ## Scheduling & placement
 
-- [ ] **Late-binding plan apply** — plans carry a ranked candidate list per
-      placement and the applier binds to the first candidate whose node epoch
-      is unchanged, so parallel submits racing for the same node cost a rank
-      instead of a conflict retry — [plan](plans/late-binding-plan-apply-plan.md)
-      (PLANNED: contention benchmark → requeue-not-fail backstop → candidate
-      walk for single-placement plans → coupling components). Fixes the
-      parallel-sandbox pathology: today concurrent Fresh-mode planners all
-      pick the same argmax node, and an eval that loses
-      `plan_conflict_max_retries` (default 3) races is failed terminally and
-      never retried. Phase 0 also delivers the raft-mode concurrent-planning
-      test tracked below.
+- [ ] **Late-binding plan apply, Phase 4 backlog** (each optional, gated on
+      the fallback-rank / `plan_apply_total{rejected}` metrics the shipped
+      phases added): capacity-aware candidate skipping, per-component partial
+      commit + eval refill, striped disjoint candidate lists for identical
+      replicas, and a serialized/batched apply lane for physically-full
+      pools — [plan §8](plans/late-binding-plan-apply-plan.md). The shipped
+      phases are in Done below.
+- [ ] **Fused top-k candidate scoring.** Ranked candidate lists materialize a
+      scored vector per placement; the one-candidate path (`plan_candidates:
+      0`) uses the fused argmax loop that does not. A fused top-k loop would
+      give the default path the same win — worth doing when the
+      candidate-construction benchmark (+2–10% plan-only) says it pays
+      ([calls #20](calls/late-binding-plan-apply-plan_calls.md)).
+- [ ] **Capacity exhaustion still fails evals terminally.** The late-binding
+      requeue backstop only covers *conflict* errors; a replan that finds no
+      eligible capacity at all ("no available nodes …") still ends the eval
+      in `failed`. Blocked-and-retried capacity waits are the gang-scheduling
+      plan's blocked-eval machinery
+      ([plan](plans/gang-scheduling-plan.md)) — when that lands, consider
+      routing plain single-task capacity failures through it too.
 - [ ] Edge boot follow-ups — the feature shipped (phases 1–4;
       [plan](plans/edge-boot-plan.md) · [docs](../docs/edge-boot.md) ·
       [calls](calls/edge-boot-plan_calls.md)); these are what it left open.
@@ -79,6 +87,16 @@ How to use it:
   - [ ] Replace the string matching in `manager::edge_boot::classify` with a
         typed error out of the plan apply, if a second consumer of the
         rejection reason ever appears ([calls #17](calls/edge-boot-plan_calls.md)).
+  - [ ] Speculative dispatch and late-binding plan apply do not compose yet.
+        A claim is dispatched to `candidates[0]`, the planner's first choice;
+        when the apply walk falls back to a later candidate the winning node
+        is not the one holding the claim, so the claim goes unratified and
+        holds its staged work until the lease expires. Correct but wasteful,
+        and invisible except as a gap between
+        `legion_provisional_claims_total` and the ratified count. Options:
+        dispatch to the top *n* candidates and refuse the losers, or hand the
+        apply walk the claim set so it prefers a node already holding one.
+        Needs the fallback-rank metric to say how often it actually bites.
 - [ ] Worker groups + taint/toleration equivalent. Node pools exist as an ACL
       and config concept but nothing scheduling-side consumes them.
 - [ ] Preemption follow-ups — the feature shipped
@@ -917,6 +935,22 @@ docs: [scheduler-and-eval-loop.md](../docs/scheduler-and-eval-loop.md), [jobs-ta
       changes, and `benches/scheduler_bench.rs` grew a
       `candidate_construction` group that isolates candidate-set cost
       (indexes on vs off) across fleet sizes.
+- [x] **Late-binding plan apply** (phases 0–3) — plans carry a ranked
+      candidate list per placement (format-2 submissions) and the applier
+      binds each placement to the first candidate whose node epoch is
+      unchanged, so parallel submits racing for one node cost a fallback
+      rank instead of a conflict retry; coupled placements (overlapping
+      lists, `distinct` tasks, multi-task groups) keep exact all-or-nothing
+      semantics. Conflict-exhausted evals now requeue with jittered backoff
+      (`eval.requeued`) instead of failing terminally. Includes the
+      `plan_candidates` setting (default 8; 0 = kill switch + format-1
+      emission), `job plan` candidate preview, `candidateRank`/`fallbacks`
+      event metadata, the rank histogram + `fallback` outcome metrics, and
+      the `tests/plan_contention.rs` burst harness (also the raft-mode
+      concurrent-planning regression) —
+      [plan](plans/late-binding-plan-apply-plan.md),
+      [docs/late-binding-plan-apply.md](../docs/late-binding-plan-apply.md).
+      Phase 4 backlog and the capacity-exhaustion gap are open items above.
 
 ## Task runtimes
 

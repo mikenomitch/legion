@@ -461,3 +461,39 @@ change had. Shipping the mechanism with an honest "we have not measured this"
 beats shipping a number produced on a single-node loopback cluster and calling
 it a benchmark. A production deployment's `legion_provisional_ratify_seconds`
 histogram answers the question directly, which is why that metric exists.
+
+## 19. Speculative dispatch targets the planner's first choice, and a late-binding fallback simply loses the head start
+
+**Call.** Merging late-binding plan apply (`main`, PR #165) put a ranked
+candidate list where a single chosen node used to be: the winning node is now
+picked inside the apply walk, after speculative dispatch has already happened.
+Dispatch speculates on `candidates[0]` — the planner's first choice, which is
+exactly the node a pre-candidate submission would have bound outright — and
+`dispatch_ratifications` continues to match a claim to an allocation by
+`(node, task)`. When the walk falls back to a later candidate, the claim on the
+first choice matches nothing, is never ratified, and dies at its lease.
+
+**Alternatives.** (a) Dispatch a claim to the top *n* candidates and refuse the
+losers once the walk picks a winner — *n* times the staging work, and *n* nodes
+holding capacity for one workload. (b) Hand the apply walk the set of nodes
+already holding claims and have it prefer them, which would make the head start
+survive a fallback. (c) Pin speculative plans to a one-element candidate list,
+giving up late binding's contention win for any task that opted in.
+
+**Trade-off.** A fallback costs a claim's worth of wasted staging — an image
+pulled and a root disk built on a node that will not run the workload — held
+until `ratifyTimeout` expires rather than released promptly. Nothing is
+incorrect: the allocation is on the winning node, the at-most-one-live
+invariant is untouched, and the workload starts by the ordinary post-commit
+dispatch. It is a lost optimization, not a lost guarantee.
+
+**Why.** (b) is the right end state, but it means the applier taking a
+dependency on the claim table — a scheduler-side structure the store has no
+reason to know about — and this merge is not where that coupling should be
+designed. (a) multiplies exactly the resource consumption edge boot exists to
+make cheap, and (c) would make opting into `speculativeStart` silently opt out
+of the contention fix, which is a worse trade for the parallel-sandbox workload
+both features target. Doing nothing is correct and cheap; the fallback-rank
+metric main shipped (`candidate_ranks`, surfaced as `fallbacks` on the plan log
+line) is what says whether the waste is ever worth engineering against.
+`internal_docs/TODO.md` carries it as an edge-boot follow-up.

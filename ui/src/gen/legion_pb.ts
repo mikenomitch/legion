@@ -3594,6 +3594,21 @@ export class PlannedAllocation extends Message<PlannedAllocation> {
    */
   taskName = "";
 
+  /**
+   * Ranked candidate node IDs for this placement, best first; the first
+   * entry is always node_id. At apply time the store binds the placement to
+   * the first candidate whose node epoch is unchanged since planning, so
+   * under contention the allocation may land on a lower-ranked
+   * (near-equivalent by score) candidate instead of node_id. A single entry
+   * means no fallback: the placement applies to node_id or the plan is
+   * rejected and retried. Empty only when the manager predates candidate
+   * lists. Controlled by schedulerSettings.plan_candidates; see
+   * docs/late-binding-plan-apply.md.
+   *
+   * @generated from field: repeated string candidate_nodes = 4;
+   */
+  candidateNodes: string[] = [];
+
   constructor(data?: PartialMessage<PlannedAllocation>) {
     super();
     proto3.util.initPartial(data, this);
@@ -3605,6 +3620,7 @@ export class PlannedAllocation extends Message<PlannedAllocation> {
     { no: 1, name: "node_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 2, name: "task_config_id", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
     { no: 3, name: "task_name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "candidate_nodes", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): PlannedAllocation {

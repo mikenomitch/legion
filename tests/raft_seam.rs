@@ -109,11 +109,13 @@ const CLASSIFIED_MUTATIONS: &[&str] = &[
     "insert_eval",
     "prune_stale_evals",
     "release_eval_for_retry",
+    "release_eval_for_retry_with_event",
     "requeue_in_flight_evals",
     "set_eval_status",
     "apply_allocation_plan",
     "apply_plan_submission",
     "submit_and_apply_plan",
+    "submit_and_apply_plan_with_candidates",
     "submit_and_apply_plans",
     "create_keyed_instance",
     "create_rollout",
@@ -123,6 +125,7 @@ const CLASSIFIED_MUTATIONS: &[&str] = &[
     "complete_allocation",
     "get_or_create_slot_instance",
     "insert_plan_submission",
+    "insert_plan_submission_with_candidates",
     "migrate_allocations_to_job_config",
     "place_alloc",
     "prune_rollouts",
@@ -192,6 +195,9 @@ const DELEGATED_BODIES: &[&str] = &[
     "clear_job_restart_request",
     "complete_eval",
     "complete_eval_with_event",
+    // Serializes its candidate placements in the closure and shares
+    // `insert_plan_submission_apply` with the format-1 wrapper.
+    "insert_plan_submission_with_candidates",
     "request_job_restart",
     // Plan §8 D1 reconciler: inlines its INSERT..SELECT closure and shares
     // seed_task_statuses_apply's semantics (ON CONFLICT DO NOTHING seed).
@@ -281,10 +287,12 @@ fn lane_for(method: &str) -> Lane {
         | "insert_eval"
         | "prune_stale_evals"
         | "release_eval_for_retry"
+        | "release_eval_for_retry_with_event"
         | "requeue_in_flight_evals"
         | "set_eval_status"
         | "apply_plan_submission"
         | "submit_and_apply_plan"
+        | "submit_and_apply_plan_with_candidates"
         | "submit_and_apply_plans"
         | "create_keyed_instance"
         | "create_rollout"
@@ -293,6 +301,7 @@ fn lane_for(method: &str) -> Lane {
         | "destroy_keyed_instance"
         | "get_or_create_slot_instance"
         | "insert_plan_submission"
+        | "insert_plan_submission_with_candidates"
         | "complete_allocation"
         | "migrate_allocations_to_job_config"
         | "place_alloc"

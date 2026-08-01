@@ -1669,12 +1669,28 @@ async fn plan_job(arg_matches: &ArgMatches) -> R<()> {
         if !reply.message.is_empty() {
             println!("{}", reply.message);
         }
+        // One line per placement that carries fallback candidates: the
+        // ranked list the apply walk may bind instead of the first choice
+        // under contention (docs/late-binding-plan-apply.md). Quiet when
+        // every placement is a singleton (plan_candidates: 0, coupled
+        // placements, or a pre-candidate manager).
+        let candidate_lines: Vec<String> = allocations
+            .iter()
+            .filter(|alloc| alloc.candidate_nodes.len() > 1)
+            .map(|alloc| format!("{}: {}", alloc.task_name, alloc.candidate_nodes.join(" > ")))
+            .collect();
         let printable_allocations: Vec<JobPlanPrint> =
             allocations.into_iter().map(Into::into).collect();
         if printable_allocations.is_empty() {
             println!("No allocations planned");
         } else {
             print_table(printable_allocations);
+        }
+        if !candidate_lines.is_empty() {
+            println!("Placement candidates (best first; a race falls back down the list):");
+            for line in candidate_lines {
+                println!("  {line}");
+            }
         }
         // One line per task on how candidates were generated: which
         // scheduling index served (or why none did). Quiet when there is
