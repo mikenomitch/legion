@@ -396,7 +396,7 @@ cmd_create() {
     # non-interactive ssh, which skips ~/.bashrc and so misses anything
     # rustup put there. Check the way the caller will call.
     local missing
-    missing=$(ssh_ 'for t in cargo rustc terraform aws tmux python3 protoc git rsync; do
+    missing=$(ssh_ 'for t in cargo rustc clang terraform aws tmux python3 protoc git rsync; do
                         command -v $t >/dev/null 2>&1 || echo -n " $t"
                     done')
     [ -z "$missing" ] ||
@@ -517,8 +517,15 @@ set -euxo pipefail
 export DEBIAN_FRONTEND=noninteractive
 
 apt-get update
+# clang/libclang-dev are not optional: rusqlite is built with the
+# `session` feature, which forces libsqlite3-sys to run bindgen, and
+# bindgen needs libclang plus clang's own builtin headers (without them
+# it fails on `'stdarg.h' file not found`). CI does not surface this —
+# GitHub's ubuntu-latest runners ship clang preinstalled, a bare Ubuntu
+# AMI does not.
 apt-get install -y --no-install-recommends \
     build-essential pkg-config libssl-dev protobuf-compiler \
+    clang libclang-dev \
     git jq curl unzip tmux rsync ca-certificates gnupg \
     python3 python3-pip python3-venv
 
