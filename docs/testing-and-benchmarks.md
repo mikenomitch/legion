@@ -31,10 +31,19 @@ Repo convention also expects running tests for Rust changes (docs/frontend-only 
 
 ## Benchmark Coverage
 
+Everything benchmark-related lives under `benchmarks/`: the Criterion
+micro-benchmarks in `benchmarks/micro/`, the scenario-driven scheduler
+harness in `benchmarks/scheduler/`, and the AWS comparison rig in
+`benchmarks/aws/`. The Criterion targets are declared in `Cargo.toml` with
+an explicit `path`, so `cargo bench --bench <name>` works as usual even
+though they are not in Cargo's default `benches/` directory. Only the
+runners themselves live elsewhere, next to the tests they are written as
+(`tests/`).
+
 Benchmark targets:
 
-- `benches/scheduler_bench.rs` (Criterion)
-- `benches/eval_critical_path_bench.rs` (Criterion)
+- `benchmarks/micro/scheduler_bench.rs` (Criterion)
+- `benchmarks/micro/eval_critical_path_bench.rs` (Criterion)
 - `tests/scheduler_benchmark_slo.rs` (scenario runner + SLO gate, CI)
 - `tests/scheduler_scale_benchmark.rs` (scenario × persistence-backend
   matrix, manual)

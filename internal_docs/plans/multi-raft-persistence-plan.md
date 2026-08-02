@@ -90,7 +90,7 @@ We want Legion to be **faster and more scalable than Nomad/K8s** (per [`README.m
 | Idempotency | AGENTS.md / `Store::idempotency_*` | Mutating RPCs carry `idempotency_key`; commands must dedupe on apply (replay-safety). |
 | Read model cache | [`src/storage/store.rs:105`](../../src/storage/store.rs) | In-memory `SchedulingReadModel` already decouples scheduler reads from the write DB — the natural projection point for a multi-lane read view. |
 | Raft tests | [`src/storage/persistence.rs:714`](../../src/storage/persistence.rs) | 3 unit tests; **no** integration/multi-node/fault/perf tests anywhere. |
-| Perf harness | [`tests/scheduler_benchmark_slo.rs`](../../tests/scheduler_benchmark_slo.rs), [`benches/`](../../benches) | SLO test reads `min_evals_per_sec`, `max_p99_latency_ms`, `max_conflict_rejection_rate`, `min_correctness_ratio`; `scheduler_bench` + `eval_critical_path_bench` exist. Reuse these as the multi-raft perf gate. |
+| Perf harness | [`tests/scheduler_benchmark_slo.rs`](../../tests/scheduler_benchmark_slo.rs), [`benchmarks/micro/`](../../benchmarks/micro) | SLO test reads `min_evals_per_sec`, `max_p99_latency_ms`, `max_conflict_rejection_rate`, `min_correctness_ratio`; `scheduler_bench` + `eval_critical_path_bench` exist. Reuse these as the multi-raft perf gate. |
 
 **Bottom line:** the operator-facing Raft surface (RPC/CLI/UI/history/config/join-token) already exists and is good. What's missing is the *engine* underneath it and the *partitioning* on top of it.
 
@@ -611,7 +611,7 @@ Make `raft` actually replicate, with a single group, before partitioning. This d
 - [ ] Batching/pipelining tuning per lane (openraft `Config` per lane); keep `tests/scheduler_benchmark_slo.rs` green.
 
 **Exit criteria:** `scheduler_benchmark_slo` passes; lane-isolation bench shows scheduler-lane latency under cross-lane load within target (and materially better than single-group); results recorded in `docs/multi-raft.md` and `benchmarks/`.
-**Targeted verify:** `cargo test --test scheduler_benchmark_slo --locked`; `cargo bench --bench scheduler_bench`; new `benches/multi_raft_lane_isolation.rs`.
+**Targeted verify:** `cargo test --test scheduler_benchmark_slo --locked`; `cargo bench --bench scheduler_bench`; new `benchmarks/micro/multi_raft_lane_isolation.rs`.
 
 ### Phase 8 — *(Optional, flagged)* scheduler-lane key-range sharding
 
@@ -689,7 +689,7 @@ Make `raft` actually replicate, with a single group, before partitioning. This d
 
 ### Performance / regression
 - `tests/scheduler_benchmark_slo.rs` must stay green throughout (existing SLOs: `min_evals_per_sec`, `max_p99_latency_ms`, `max_conflict_rejection_rate`, `min_correctness_ratio`).
-- `benches/multi_raft_lane_isolation.rs` — scheduler-lane latency under control+status saturation, `single` vs `lanes` (P7).
+- `benchmarks/micro/multi_raft_lane_isolation.rs` — scheduler-lane latency under control+status saturation, `single` vs `lanes` (P7).
 - Regression: `local_disk`/`streaming` paths unchanged (entire existing suite green every phase).
 
 ### Adversarial verification (workflow-level)

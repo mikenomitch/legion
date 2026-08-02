@@ -185,8 +185,8 @@ placement quality.
   epoch/cache-refresh fencing gap tracked in
   [`TODO.md`](../TODO.md) (Scheduling & placement) is exactly why the
   index must never be load-bearing for correctness (§6.6).
-- **Benchmarks.** `benches/scheduler_bench.rs`,
-  `benches/eval_critical_path_bench.rs`, and the scale matrix under
+- **Benchmarks.** `benchmarks/micro/scheduler_bench.rs`,
+  `benchmarks/micro/eval_critical_path_bench.rs`, and the scale matrix under
   `benchmarks/scheduler`
   ([docs/testing-and-benchmarks.md](../../docs/testing-and-benchmarks.md)).
 
@@ -456,7 +456,7 @@ raft work used.
 
 Each phase ships and stands alone.
 
-- **Phase 0 — Measure.** Extend `benches/scheduler_bench.rs` and the
+- **Phase 0 — Measure.** Extend `benchmarks/micro/scheduler_bench.rs` and the
   `benchmarks/scheduler` matrix to isolate candidate-construction time at
   1k / 5k / 10k nodes × {0, 3, 10} constraints, and record the baseline.
   Directly serves the standing TODO item ("fix the slowest bits…"), and

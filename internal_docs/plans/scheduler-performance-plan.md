@@ -100,9 +100,9 @@ Today we cannot prove it, and we only partially know it:
 
 ## What exists today
 
-- `benches/scheduler_bench.rs`: `scheduler_speed` (uniform scale matrix)
+- `benchmarks/micro/scheduler_bench.rs`: `scheduler_speed` (uniform scale matrix)
   and `candidate_construction` (indexes on/off) Criterion groups.
-- `benches/eval_critical_path_bench.rs`: enqueue→claim→apply→complete
+- `benchmarks/micro/eval_critical_path_bench.rs`: enqueue→claim→apply→complete
   under 1/4/8 threads, local_disk only.
 - `tests/scheduler_benchmark_slo.rs` + `benchmarks/scheduler/scenarios/*.json`
   + `slo.json`: 3 small uniform scenarios, generous global thresholds, CI
