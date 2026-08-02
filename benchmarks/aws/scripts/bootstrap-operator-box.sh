@@ -467,12 +467,17 @@ create_iam_role() {
             {
               "Sid":"ManageRigRoles",
               "Effect":"Allow",
-              "Action":["iam:CreateRole","iam:DeleteRole","iam:GetRole","iam:TagRole",
+              "Action":["iam:CreateRole","iam:DeleteRole","iam:GetRole",
+                        "iam:UpdateAssumeRolePolicy",
+                        "iam:TagRole","iam:UntagRole","iam:ListRoleTags",
                         "iam:PutRolePolicy","iam:DeleteRolePolicy","iam:GetRolePolicy",
                         "iam:ListRolePolicies","iam:ListAttachedRolePolicies",
                         "iam:AttachRolePolicy","iam:DetachRolePolicy",
                         "iam:CreateInstanceProfile","iam:DeleteInstanceProfile",
-                        "iam:GetInstanceProfile","iam:AddRoleToInstanceProfile",
+                        "iam:GetInstanceProfile","iam:ListInstanceProfilesForRole",
+                        "iam:TagInstanceProfile","iam:UntagInstanceProfile",
+                        "iam:ListInstanceProfileTags",
+                        "iam:AddRoleToInstanceProfile",
                         "iam:RemoveRoleFromInstanceProfile","iam:PassRole"],
               "Resource":["arn:aws:iam::*:role/legion-bench*",
                           "arn:aws:iam::*:instance-profile/legion-bench*"]
@@ -488,17 +493,30 @@ create_iam_role() {
           ]
         }'
     iam_ok create-instance-profile --instance-profile-name "$NAME"
-    iam_ok add-role-to-instance-profile --instance-profile-name "$NAME" \
+
+    # Attach only if it is not already attached. Re-adding a role that is
+    # already on the profile fails with `LimitExceeded: Cannot exceed
+    # quota for InstanceSessionsPerInstanceProfile: 1` — which reads like
+    # an account limit but just means "already done", and is the wrong
+    # thing to blanket-tolerate in iam_ok since a real limit shares the
+    # code. Checking state is unambiguous.
+    local attached
+    attached=$(aws iam get-instance-profile --instance-profile-name "$NAME" \
+        --query 'InstanceProfile.Roles[].RoleName' --output text 2>/dev/null || true)
+    case "$attached" in
+    *"$NAME"*) ;;
+    *) iam_ok add-role-to-instance-profile --instance-profile-name "$NAME" \
         --role-name "$NAME"
+        attached=$(aws iam get-instance-profile --instance-profile-name "$NAME" \
+            --query 'InstanceProfile.Roles[].RoleName' --output text 2>/dev/null || true)
+        ;;
+    esac
 
     # Verify rather than assume. If the role is not actually on the
     # profile, RunInstances fails with "Invalid IAM Instance Profile
     # name" forever — indistinguishable from the propagation race it
     # retries, so it would burn the whole retry budget and then blame
     # propagation for a permanent condition.
-    local attached
-    attached=$(aws iam get-instance-profile --instance-profile-name "$NAME" \
-        --query 'InstanceProfile.Roles[].RoleName' --output text 2>/dev/null || true)
     case "$attached" in
     *"$NAME"*) ;;
     *) die "instance profile $NAME has no role attached (got '${attached:-none}').
@@ -763,6 +781,19 @@ cmd_start() {
     log "tmux does not survive a stop — resume with: $0 run --from <step>"
 }
 
+# Re-apply the box's IAM role and policies to the running instance.
+# Every call in create_iam_role is idempotent, and put-role-policy
+# overwrites, so this is how a policy gap gets closed mid-campaign
+# without destroying a box that holds the terraform state. Instance-role
+# credentials refresh on their own, so the widened policy takes effect
+# within a minute or two.
+cmd_repair_iam() {
+    state_get .instance_id >/dev/null
+    log "re-applying IAM role and policies for $NAME"
+    create_iam_role
+    log "done — instance-role credentials pick this up within ~1-2 minutes"
+}
+
 cmd_status() {
     local id ip
     id=$(state_get .instance_id)
@@ -941,6 +972,7 @@ run) cmd_run ;;
 logs) cmd_logs "$@" ;;
 stop) cmd_stop ;;
 start) cmd_start ;;
+repair-iam) cmd_repair_iam ;;
 tfvars) cmd_tfvars ;;
 ssh) ssh_ "$@" ;;
 status) cmd_status ;;
