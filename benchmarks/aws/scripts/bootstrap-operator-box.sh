@@ -587,10 +587,20 @@ cmd_push() {
     ip=$(state_get .public_ip)
     log "syncing $REPO_ROOT -> $ip:~/legion"
     ssh_ "mkdir -p ~/legion"
+    # --delete keeps the box a mirror of the working tree, which means it
+    # deletes anything on the box that is not here. Three things are born
+    # on the box and exist nowhere else, so they MUST be excluded:
+    #   terraform.tfvars   written by `configure` from the box's own
+    #                      Elastic IP and rig key
+    #   terraform.tfstate* the only record of every rig resource. Losing
+    #                      it orphans the whole rig — teardown.sh would
+    #                      have nothing to destroy.
+    #   .terraform*        provider plugins and the lock from `init`
     rsync -az --delete \
-        --exclude 'target/' --exclude 'node_modules/' --exclude '.terraform/' \
+        --exclude 'target/' --exclude 'node_modules/' --exclude '__pycache__/' \
+        --exclude '.terraform/' --exclude '.terraform.lock.hcl' \
+        --exclude 'terraform.tfvars' --exclude 'terraform.tfstate*' \
         --exclude 'benchmarks/aws/results/' --exclude 'benchmarks/aws/.operator-box.json' \
-        --exclude '__pycache__/' \
         -e "ssh -i $(state_get .key_path) -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes" \
         "$REPO_ROOT/" "ubuntu@$ip:legion/"
     log "synced"
