@@ -384,16 +384,32 @@ EOF
 # IAM roles for the rig's own boxes. PowerUserAccess covers all of that
 # except IAM, which is deliberately added back narrowed to the rig's
 # name prefix — a benchmark box has no business minting arbitrary roles.
+#
+# Idempotent on every call: `destroy`'s IAM deletes are best-effort, so a
+# retry after a failed create routinely finds some of these already
+# there. EntityAlreadyExists is the expected case, not an error — but it
+# is the ONLY tolerated one, so a genuine permissions failure here still
+# stops the run instead of surfacing later as an unexplained
+# RunInstances error.
+iam_ok() { # iam_ok <aws iam args...>
+    local err
+    err=$(aws iam "$@" 2>&1 >/dev/null) && return 0
+    case "$err" in
+    *EntityAlreadyExists* | *LimitExceeded.DuplicateName*) return 0 ;;
+    *) die "iam $1 failed: $err" ;;
+    esac
+}
+
 create_iam_role() {
     state_put iam_role_created true
-    aws iam create-role --role-name "$NAME" \
+    iam_ok create-role --role-name "$NAME" \
         --assume-role-policy-document '{
           "Version":"2012-10-17",
           "Statement":[{"Effect":"Allow","Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole"}]
-        }' >/dev/null
-    aws iam attach-role-policy --role-name "$NAME" \
-        --policy-arn arn:aws:iam::aws:policy/PowerUserAccess >/dev/null
-    aws iam put-role-policy --role-name "$NAME" --policy-name rig-iam \
+        }'
+    iam_ok attach-role-policy --role-name "$NAME" \
+        --policy-arn arn:aws:iam::aws:policy/PowerUserAccess
+    iam_ok put-role-policy --role-name "$NAME" --policy-name rig-iam \
         --policy-document '{
           "Version":"2012-10-17",
           "Statement":[
@@ -419,10 +435,24 @@ create_iam_role() {
                 "autoscaling.amazonaws.com","spot.amazonaws.com","spotfleet.amazonaws.com"]}}
             }
           ]
-        }' >/dev/null
-    aws iam create-instance-profile --instance-profile-name "$NAME" >/dev/null
-    aws iam add-role-to-instance-profile --instance-profile-name "$NAME" \
-        --role-name "$NAME" >/dev/null
+        }'
+    iam_ok create-instance-profile --instance-profile-name "$NAME"
+    iam_ok add-role-to-instance-profile --instance-profile-name "$NAME" \
+        --role-name "$NAME"
+
+    # Verify rather than assume. If the role is not actually on the
+    # profile, RunInstances fails with "Invalid IAM Instance Profile
+    # name" forever — indistinguishable from the propagation race it
+    # retries, so it would burn the whole retry budget and then blame
+    # propagation for a permanent condition.
+    local attached
+    attached=$(aws iam get-instance-profile --instance-profile-name "$NAME" \
+        --query 'InstanceProfile.Roles[].RoleName' --output text 2>/dev/null || true)
+    case "$attached" in
+    *"$NAME"*) ;;
+    *) die "instance profile $NAME has no role attached (got '${attached:-none}').
+  Delete it and retry:  $0 destroy" ;;
+    esac
 }
 
 # Everything the runbook shells out to, installed once at first boot.
