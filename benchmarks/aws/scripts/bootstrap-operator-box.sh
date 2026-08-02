@@ -295,9 +295,12 @@ cmd_create() {
     user_data=$(render_user_data)
     # The instance profile was created seconds ago and IAM is eventually
     # consistent, so RunInstances can fail with "Invalid IAM Instance
-    # Profile name" on a race that resolves itself. Retry rather than
-    # making the operator re-run the whole command.
-    local attempt
+    # Profile name" on a race that resolves itself. Retry THAT and only
+    # that. Retrying every failure — the obvious loop — spends 80 seconds
+    # hiding the real error behind a message naming the one cause it is
+    # not, which is worse than failing immediately.
+    local attempt err errfile
+    errfile=$(mktemp)
     for attempt in $(seq 1 12); do
         instance_id=$(aws_ ec2 run-instances \
             --image-id "$ami" \
@@ -311,11 +314,28 @@ cmd_create() {
             --user-data "$user_data" \
             --tag-specifications \
             "ResourceType=instance,Tags=[{Key=Name,Value=$NAME},{Key=Project,Value=legion-bench},{Key=Purpose,Value=benchmark-operator}]" \
-            --query 'Instances[0].InstanceId' --output text 2>/dev/null) && break
-        log "  RunInstances not ready yet (IAM propagation), retry $attempt/12"
-        sleep 5
+            --query 'Instances[0].InstanceId' --output text 2>"$errfile") && break
+        err=$(cat "$errfile")
+        case "$err" in
+        *"Invalid IAM Instance Profile"* | *iamInstanceProfile*)
+            log "  waiting for the IAM instance profile to propagate, retry $attempt/12"
+            sleep 5
+            ;;
+        *VcpuLimitExceeded* | *InstanceLimitExceeded*)
+            rm -f "$errfile"
+            die "$INSTANCE_TYPE exceeds this account's on-demand vCPU quota in $REGION:
+  $err
+  Raise 'Running On-Demand Standard instances' (quota L-1216C47A), or use a
+  smaller box: $0 $CMD --type c7i.large   (cheaper, much slower dist build)"
+            ;;
+        *)
+            rm -f "$errfile"
+            die "RunInstances failed: $err"
+            ;;
+        esac
     done
-    [ -n "${instance_id:-}" ] || die "RunInstances failed — re-run with the AWS CLI's --debug to see why"
+    rm -f "$errfile"
+    [ -n "${instance_id:-}" ] || die "RunInstances kept failing after IAM-propagation retries: ${err:-unknown}"
     state_put instance_id "$instance_id"
 
     aws_ ec2 wait instance-running --instance-ids "$instance_id"
