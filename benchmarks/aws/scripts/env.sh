@@ -105,7 +105,7 @@ load_rig() {
     fi
     export CP_PUBLIC_IPS CP_PRIVATE_IPS CP_ADDRS LOADGEN_PUBLIC_IP \
         LOADGEN_PRIVATE_IP LOADGEN_ADDR BUCKET REGION WORKER_ASG \
-        CONTROL_PLANE_TYPE LOADGEN_TYPE
+        CONTROL_PLANE_TYPE LOADGEN_TYPE WORKER_ON_DEMAND_PCT ARCHIVE_BUCKET
 }
 
 _load_rig_terraform() {
@@ -118,6 +118,8 @@ _load_rig_terraform() {
     WORKER_ASG=$(tf_output worker_asg_name | jq -r .)
     CONTROL_PLANE_TYPE=$(tf_output control_plane_type | jq -r .)
     LOADGEN_TYPE=$(tf_output loadgen_type | jq -r .)
+    WORKER_ON_DEMAND_PCT=$(tf_output worker_on_demand_percentage | jq -r .)
+    ARCHIVE_BUCKET=$(tf_output archive_bucket | jq -r .)
 }
 
 _load_rig_manifest() {
@@ -135,6 +137,8 @@ _load_rig_manifest() {
     WORKER_ASG=$(jq -r '.worker_asg_name' "$m")
     CONTROL_PLANE_TYPE=$(jq -r '.control_plane_type' "$m")
     LOADGEN_TYPE=$(jq -r '.loadgen_type' "$m")
+    WORKER_ON_DEMAND_PCT=$(jq -r '.worker_on_demand_percentage // 0' "$m")
+    ARCHIVE_BUCKET=$(jq -r '.archive_bucket // ""' "$m")
 }
 
 # Serialize the topology for the loadgen box. Everything the scripts read
@@ -147,11 +151,15 @@ write_rig_manifest() { # write_rig_manifest > rig.json
         --arg lg_pub "$LOADGEN_PUBLIC_IP" --arg lg_priv "$LOADGEN_PRIVATE_IP" \
         --arg bucket "$BUCKET" --arg region "$REGION" --arg asg "$WORKER_ASG" \
         --arg cp_type "$CONTROL_PLANE_TYPE" --arg lg_type "$LOADGEN_TYPE" \
+        --argjson on_demand_pct "${WORKER_ON_DEMAND_PCT:-0}" \
+        --arg archive_bucket "${ARCHIVE_BUCKET:-}" \
         --arg written_at "$(date -u +%FT%TZ)" \
         '{control_plane_public_ips: $cp_pub, control_plane_private_ips: $cp_priv,
           loadgen_public_ip: $lg_pub, loadgen_private_ip: $lg_priv,
           bucket: $bucket, region: $region, worker_asg_name: $asg,
           control_plane_type: $cp_type, loadgen_type: $lg_type,
+          worker_on_demand_percentage: $on_demand_pct,
+          archive_bucket: $archive_bucket,
           written_at: $written_at}'
 }
 

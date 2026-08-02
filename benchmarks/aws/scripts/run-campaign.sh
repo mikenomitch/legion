@@ -59,6 +59,18 @@ while [ $# -gt 0 ]; do
         KEEP_FLEET=true
         shift
         ;;
+    --campaign)
+        CAMPAIGN_OVERRIDE="$2"
+        shift 2
+        ;;
+    --nodes-per-instance)
+        # The measured ceiling from experiments/packing-density.sh. The
+        # 1250 default is the plan's estimate; measuring it once turns
+        # every step's instance count (and its spot vCPU bill) into a
+        # number backed by this fleet rather than by an assumption.
+        NODES_PER_INSTANCE="$2"
+        shift 2
+        ;;
     *)
         echo "unknown arg $1" >&2
         exit 1
@@ -90,7 +102,9 @@ trap release_fleet EXIT
 # those into a normal exit so the release above still happens.
 trap 'exit 143' HUP INT TERM
 
-CAMPAIGN="$(date -u +%Y%m%d-%H%M)-$SYSTEM"
+# An explicit id lets the caller correlate archives with a status stream
+# it already published under (remote-campaign.sh does exactly this).
+CAMPAIGN="${CAMPAIGN_OVERRIDE:-$(date -u +%Y%m%d-%H%M)-$SYSTEM}"
 SIM_SYSTEM=${SYSTEM%-a}
 SIM_SYSTEM=${SIM_SYSTEM%-b} # legion-a/legion-b share the legion sim fleet
 log "=== campaign $CAMPAIGN: steps [$STEPS], scenarios [$SCENARIOS] ==="

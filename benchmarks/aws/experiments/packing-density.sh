@@ -1,0 +1,223 @@
+#!/usr/bin/env bash
+# Packing density: how many simulated nodes one worker instance actually
+# carries before it becomes the bottleneck.
+#
+# The topology table in the plan assumes ~1,250 nodes per c7i.2xlarge.
+# That is an estimate, and every scale step is sized from it — so if the
+# real ceiling is 2,500, every step needs half the instances, half the
+# cost, and half the spot vCPU quota. If it is 800, the campaign has been
+# measuring its own sim fleet rather than Legion's managers. Either way
+# the number is worth twenty minutes on a rig that is already standing.
+#
+# Runs an ascending ladder of densities on ONE instance, holds each long
+# enough for the rate windows to fill, and reads the fleet's own
+# `legion_worker_*` series (docs/metrics.md § Worker) plus node_exporter
+# off Prometheus. A density is healthy when the fleet fully registers,
+# reports no failures, and sustains its heartbeat cadence with CPU and
+# memory headroom to spare.
+#
+# Usage:
+#   packing-density.sh [--steps "1000 2000 4000"] [--hold 180]
+#                      [--system legion-a] [--heartbeat-secs 2]
+#                      [--campaign <id>] [--scenario <file>]
+#
+# Precondition: a Legion control plane installed and running. The probe
+# scales the spot fleet to a single instance itself and leaves it there
+# — run-campaign.sh sizes the fleet per step anyway, so the next campaign
+# reclaims whatever it needs.
+#
+# Safe to run unattended via `remote-campaign.sh exec` (the ladder is
+# bounded and every step archives to S3).
+set -euo pipefail
+SCRIPTS="$(cd "$(dirname "${BASH_SOURCE[0]}")/../scripts" && pwd)"
+source "$SCRIPTS/env.sh"
+load_rig
+
+STEPS="1000 2000 4000" HOLD=180 SYSTEM="legion-a" HEARTBEAT_SECS=2
+CAMPAIGN="" SCENARIO="" MANAGER=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+    --steps) STEPS="$2" ;;
+    --hold) HOLD="$2" ;;
+    --system) SYSTEM="$2" ;;
+    --heartbeat-secs) HEARTBEAT_SECS="$2" ;;
+    --campaign) CAMPAIGN="$2" ;;
+    --scenario) SCENARIO="$2" ;;
+    --manager) MANAGER="$2" ;;
+    *)
+        echo "unknown arg $1" >&2
+        exit 1
+        ;;
+    esac
+    shift 2
+done
+CAMPAIGN="${CAMPAIGN:-adhoc-$(date -u +%Y%m%d-%H%M%S)}"
+SCENARIO="${SCENARIO:-$SCENARIOS_DIR/web_fleet.json}"
+MANAGER="${MANAGER:-http://${CP_PRIVATE_IPS[0]}:4747}"
+
+# Exactly one instance, or the ladder measures the wrong thing: with two
+# boxes start-sim-fleet.sh halves every density and the ceiling never
+# appears. Scaling down is also what makes the probe cheap.
+scale_workers 1
+wait_for_workers 1
+mapfile -t WORKERS < <(worker_instances)
+[ "${#WORKERS[@]}" -eq 1 ] || {
+    echo "expected 1 InService worker instance, found ${#WORKERS[@]}" >&2
+    exit 1
+}
+read -r WORKER_ID _WORKER_PUBLIC _WORKER_PRIVATE <<<"${WORKERS[0]}"
+
+# Ascending, always. start-sim-fleet.sh waits on the manager's total node
+# count, and nodes from an earlier step linger in the store as lost until
+# their names are re-registered — so a descending ladder would satisfy
+# that wait instantly against stale rows.
+STEPS=$(tr ' ' '\n' <<<"$STEPS" | grep -v '^$' | sort -n | tr '\n' ' ')
+
+PROM="http://$LOADGEN_ADDR:9090"
+promq() { # promq <promql> -> first sample value, or empty
+    curl -fsS "$PROM/api/v1/query" --data-urlencode "query=$1" 2>/dev/null |
+        jq -r '.data.result[0].value[1] // empty'
+}
+num() { # num <value> -> JSON number, or null for empty/NaN/Inf
+    case "${1:-}" in
+    '' | NaN | +Inf | -Inf) echo null ;;
+    *) echo "$1" ;;
+    esac
+}
+
+log "packing density on $WORKER_ID: steps [$STEPS], ${HOLD}s hold each"
+log "  a step is healthy at <85% CPU and memory, no failures, and >=95% of cadence"
+
+ROWS="[]"
+for N in $STEPS; do
+    log "--- $N nodes on one instance ---"
+    "$SCRIPTS/stop-sim-fleet.sh" >/dev/null 2>&1 || true
+
+    REGISTERED_OK=true
+    "$SCRIPTS/start-sim-fleet.sh" legion "$N" "$SCENARIO" "$MANAGER" || REGISTERED_OK=false
+    if [ "$REGISTERED_OK" = false ]; then
+        # Denser will not fare better; record the wall and stop climbing.
+        log "  fleet did not reach $N registered nodes — treating as the ceiling"
+        ROWS=$(jq --argjson nodes "$N" \
+            '. + [{nodes: $nodes, healthy: false, reason: "fleet never fully registered"}]' \
+            <<<"$ROWS")
+        break
+    fi
+
+    log "  holding ${HOLD}s for the rate windows to fill"
+    sleep "$HOLD"
+
+    REGISTERED=$(promq 'sum(legion_worker_simulated_nodes)')
+    TARGET=$(promq 'sum(legion_worker_simulated_nodes_target)')
+    HB_OK=$(promq 'sum(rate(legion_worker_heartbeats_total{outcome="ok"}[1m]))')
+    HB_BAD=$(promq 'sum(rate(legion_worker_heartbeats_total{outcome!="ok"}[1m]))')
+    REG_ERR=$(promq 'sum(rate(legion_worker_simulated_registrations_total{outcome="error"}[1m]))')
+    P99=$(promq 'histogram_quantile(0.99, sum by (le) (rate(legion_worker_heartbeat_duration_seconds_bucket[1m])))')
+    P50=$(promq 'histogram_quantile(0.50, sum by (le) (rate(legion_worker_heartbeat_duration_seconds_bucket[1m])))')
+    CPU=$(promq 'sum(rate(node_cpu_seconds_total{mode!="idle", role="sim-worker"}[1m])) / count(count by (cpu) (node_cpu_seconds_total{role="sim-worker", mode="idle"}))')
+    MEM=$(promq '1 - (sum(node_memory_MemAvailable_bytes{role="sim-worker"}) / sum(node_memory_MemTotal_bytes{role="sim-worker"}))')
+
+    ROW=$(jq -n \
+        --argjson nodes "$N" \
+        --argjson registered "$(num "$REGISTERED")" \
+        --argjson target "$(num "$TARGET")" \
+        --argjson hb_ok "$(num "$HB_OK")" \
+        --argjson hb_failed "$(num "$HB_BAD")" \
+        --argjson reg_err "$(num "$REG_ERR")" \
+        --argjson p99 "$(num "$P99")" \
+        --argjson p50 "$(num "$P50")" \
+        --argjson cpu "$(num "$CPU")" \
+        --argjson mem "$(num "$MEM")" \
+        --argjson hb_secs "$HEARTBEAT_SECS" \
+        '{
+            nodes: $nodes,
+            registered: $registered,
+            target: $target,
+            heartbeats_ok_per_sec: $hb_ok,
+            heartbeats_failed_per_sec: $hb_failed,
+            registration_errors_per_sec: $reg_err,
+            heartbeat_p50_secs: $p50,
+            heartbeat_p99_secs: $p99,
+            cpu_utilization: $cpu,
+            memory_utilization: $mem,
+            # Each node should heartbeat once per interval; the fraction of
+            # that cadence the fleet actually sustains is the clearest
+            # single signal that the box is keeping up.
+            cadence_ratio: (if ($hb_ok != null and $registered != null and $registered > 0)
+                            then ($hb_ok / $registered) * $hb_secs else null end)
+        }
+        | .healthy = (
+            .registered != null and .target != null and .registered >= .target
+            and (.registration_errors_per_sec // 1) == 0
+            and (.heartbeats_failed_per_sec // 1) == 0
+            and (.cpu_utilization // 1) < 0.85
+            and (.memory_utilization // 1) < 0.85
+            and (.cadence_ratio // 0) >= 0.95
+        )')
+
+    printf '  registered %s/%s  cadence %s  cpu %s  mem %s  p99 %ss  -> %s\n' \
+        "$(jq -r '.registered // "?"' <<<"$ROW")" \
+        "$(jq -r '.target // "?"' <<<"$ROW")" \
+        "$(jq -r 'if .cadence_ratio then (.cadence_ratio * 100 | floor | tostring) + "%" else "?" end' <<<"$ROW")" \
+        "$(jq -r 'if .cpu_utilization then (.cpu_utilization * 100 | floor | tostring) + "%" else "?" end' <<<"$ROW")" \
+        "$(jq -r 'if .memory_utilization then (.memory_utilization * 100 | floor | tostring) + "%" else "?" end' <<<"$ROW")" \
+        "$(jq -r '.heartbeat_p99_secs // "?"' <<<"$ROW")" \
+        "$(jq -r 'if .healthy then "HEALTHY" else "SATURATED" end' <<<"$ROW")"
+
+    ROWS=$(jq --argjson row "$ROW" '. + [$row]' <<<"$ROWS")
+    jq -e '.healthy' >/dev/null <<<"$ROW" || {
+        log "  saturated at $N — denser steps would only confirm it"
+        break
+    }
+done
+
+"$SCRIPTS/stop-sim-fleet.sh" >/dev/null 2>&1 || true
+
+# The recommendation: the densest healthy step, and what it implies for
+# each of the plan's scale steps. `null` means even the first rung was
+# saturated — lower the ladder and re-run.
+REPORT=$(jq -n \
+    --argjson steps "$ROWS" \
+    --arg instance "$WORKER_ID" \
+    --argjson hb_secs "$HEARTBEAT_SECS" \
+    --arg assumed 1250 \
+    '($steps | map(select(.healthy)) | max_by(.nodes) | .nodes) as $density
+     | {
+        measured_at_instance: $instance,
+        heartbeat_secs: $hb_secs,
+        assumed_nodes_per_instance: ($assumed | tonumber),
+        measured_nodes_per_instance: $density,
+        steps: $steps,
+        implied_fleet: (if $density == null then null else
+            [1000, 2000, 5000, 10000, 20000]
+            | map({
+                nodes: .,
+                worker_instances: ((. + $density - 1) / $density | floor),
+                spot_vcpu: (((. + $density - 1) / $density | floor) * 8)
+              })
+        end)
+       }')
+
+RUN_ID="experiments/packing-density-$(date -u +%Y%m%d-%H%M%S)"
+REMOTE_OUT="/opt/bench/runs/$CAMPAIGN/$RUN_ID"
+TMP=$(mktemp)
+trap 'rm -f "$TMP"' EXIT
+jq . <<<"$REPORT" >"$TMP"
+rsh "$LOADGEN_ADDR" "mkdir -p '$REMOTE_OUT'"
+rcp "$TMP" "$LOADGEN_ADDR:$REMOTE_OUT/metrics.json"
+
+DENSITY=$(jq -r '.measured_nodes_per_instance // "none"' <<<"$REPORT")
+"$SCRIPTS/collect.sh" --campaign "$CAMPAIGN" --run "$RUN_ID" --system "$SYSTEM" \
+    --nodes "$(jq -r '.measured_nodes_per_instance // 0' <<<"$REPORT")" \
+    --scenario packing-density
+
+echo
+log "measured density: $DENSITY nodes/instance (plan assumed 1,250)"
+if [ "$DENSITY" != "none" ]; then
+    jq -r '.implied_fleet[] | "  \(.nodes) nodes -> worker_instances=\(.worker_instances) (\(.spot_vcpu) vCPU)"' \
+        <<<"$REPORT"
+    log "set worker_instances from this table; re-run after any change to the sim path"
+else
+    log "even the lowest step saturated — re-run with a lower --steps ladder"
+fi
+log "report: $RESULTS_ROOT/$CAMPAIGN/$RUN_ID/metrics.json"

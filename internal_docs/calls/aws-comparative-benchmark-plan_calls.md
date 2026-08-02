@@ -181,11 +181,43 @@ something longer-lived.
 the failure modes of every install script for a rig whose entire threat
 model is "we delete it after the campaign".
 
-**Amended (entry 12).** Still one bucket, but now two roles: the loadgen
+**Amended (entry 13).** Still one bucket, but now two roles: the loadgen
 box takes an `orchestrator` role that adds `SetDesiredCapacity` on the
 sim-fleet ASG. Bucket access is unchanged and shared.
 
-## 11. Campaigns are driven from the loadgen box, not the operator's machine
+## 11. Results are mirrored to a bucket terraform does not manage
+
+**Call.** `var.archive_bucket` names an existing, externally-created S3
+bucket. `collect.sh` mirrors every cell into it as the cell lands, and
+`teardown.sh` re-syncs anything that missed before destroying anything.
+The rig's IAM role gets `GetObject`/`PutObject` on it and deliberately
+not `DeleteObject`. Unset is allowed, and teardown says loudly what that
+costs.
+
+**Alternatives.** (a) Keep the single bucket of entry 10 and rely on
+teardown's pre-destroy sync to the operator's machine — the shipped
+behavior until now. (b) Have terraform create a second bucket with
+`prevent_destroy`. (c) Drop `force_destroy` from the rig bucket.
+
+**Trade-off.** A prerequisite that terraform cannot create for you: one
+`aws s3 mb` before the first campaign, or the warning fires on every
+teardown. It also splits "where are the results" into two answers.
+
+**Why (the campaign is the product).** (a) fails precisely when it
+matters: entry 12 moved the driver's seat onto the loadgen box so a run
+survives the operator's laptop, which means the machine running teardown
+can itself be disposable — syncing results *to* it is syncing them to
+the thing you are about to lose. (b) and (c) both break `teardown.sh`:
+terraform refuses to destroy a `prevent_destroy` resource and refuses to
+delete a non-empty bucket without `force_destroy`, so the one command
+standing between an idle rig and a real bill starts failing — a rig you
+cannot cheaply destroy is a rig that keeps billing. A bucket outside the
+state file sidesteps the conflict entirely: terraform cannot destroy
+what it does not own. Withholding delete follows from the same premise
+as the rig being disposable — nothing inside a short-lived,
+internet-facing environment should be able to erase the durable copy.
+
+## 12. Campaigns are driven from the loadgen box, not the operator's machine
 
 **Call.** `scripts/remote-campaign.sh` stages the rig tree, a topology
 manifest, and the ssh key onto the loadgen box, then starts the campaign
@@ -219,7 +251,7 @@ addressed to another instance's *public* IP hairpins out through the
 internet gateway and arrives with the sender's public IP as its source,
 so the security group's intra-rig `self` rule does not match it.
 
-## 12. Scale steps move through the ASG API, not `terraform apply`
+## 13. Scale steps move through the ASG API, not `terraform apply`
 
 **Call.** `scale_workers` calls `autoscaling:SetDesiredCapacity`
 (`scripts/env.sh`), the ASG carries
@@ -244,7 +276,7 @@ one narrowly-scoped permission and no state at all. It also keeps
 `teardown.sh` the only thing that can destroy the rig, and keeps it on
 the operator's machine where the confirmation prompt is.
 
-## 13. The spot fleet is released on any campaign exit
+## 14. The spot fleet is released on any campaign exit
 
 **Call.** `run-campaign.sh` traps `EXIT` and scales the ASG to zero on
 success, failure, or a killed session. `--keep-fleet` opts out. The
@@ -265,3 +297,98 @@ control plane stays up because it holds the state a post-mortem needs and
 is comparatively cheap, and because destroying the rig is a decision that
 belongs to a human running `teardown.sh`.
 
+
+## 15. Campaign state is published to S3, not only answerable over SSH
+
+**Call.** The unattended runner publishes `status.json` (phase, step,
+detail, timestamp) and a tail of its console log to
+`s3://<bucket>/status/`, on every transition and on a 60s heartbeat.
+`scripts/campaign-status.sh show|watch` reads it with nothing but a
+bucket name, a region, and credentials, and returns the state as its
+exit code: 0 running, 2 finished, 3 failed, 4 stale, 5 missing.
+
+```bash
+scripts/campaign-status.sh show --bucket <bucket> --region us-east-1
+```
+
+**Alternatives.** (a) `remote-campaign.sh status`, which entry 12
+already provides, over SSH. (b) Push notifications (SNS/webhook) on
+transitions. (c) Expose the campaign log over HTTP from the loadgen box.
+
+**Trade-off.** State is polled, not pushed, and lags by up to the
+heartbeat interval. Two places now report status, and they can disagree
+if publishing fails (it is best-effort by design — status must never
+fail a campaign).
+
+**Why (ease, for the thing actually watching).** (a) assumes the watcher
+can SSH from inside `admin_cidr` to a box that still exists. The most
+likely watcher of an overnight run is an agent or cloud shell elsewhere,
+and such environments routinely have HTTPS and no outbound port 22 at
+all — this session was written from one. (c) has the same problem plus a
+new listener and a security-group hole. (b) is genuinely better for
+"tell me when it breaks" but needs an endpoint to deliver to, which a
+transient watcher does not have; polling a bucket needs no inbound
+anything. The heartbeat exists because the interesting failure is not a
+crash — a crash sets `failed` — but a box that vanishes mid-step, which
+without a liveness stamp is indistinguishable from a scale step being
+quiet for ten minutes. Exit codes rather than parsed output so a watcher
+can branch without a JSON parser.
+
+## 16. Spot and on-demand are split by a knob, not a quota ticket
+
+**Call.** `var.worker_on_demand_percentage` (default 0, all spot) sets
+the share of the sim fleet launched on-demand, through the ASG's
+existing `mixed_instances_policy`. `collect.sh` records it per cell.
+
+**Alternatives.** (a) All spot, and wait on an AWS quota increase.
+(b) All on-demand for simplicity. (c) Spread the fleet across regions,
+which have independent quotas.
+
+**Trade-off.** The on-demand share costs roughly 3x, and a fleet split
+across purchase types is not perfectly homogeneous — part of it cannot
+be spot-reclaimed. That is a fidelity difference and not only a price
+one, which is why it lands in the fairness record rather than staying a
+deployment detail.
+
+**Why (ease).** AWS meters spot and on-demand vCPU as separate quotas,
+so a 50/50 split needs neither limit to cover the whole fleet: the 20k
+burst is 128 vCPU, which is 64 from each bucket instead of 128 from one.
+A quota increase is still the right long-run answer and the runbook says
+to file one — but it has unpredictable lead time, and this knob turns
+"blocked until AWS answers" into "one line, a few dollars." (b) throws
+away the cost model the whole campaign budget rests on. (c) was rejected
+outright for measured cells: cross-region heartbeat RTT inflates
+sim-side latency and delays ack visibility, corrupting the submit->placed
+number the campaign exists to produce.
+
+## 17. Nodes-per-instance is measured before it is trusted
+
+**Call.** `experiments/packing-density.sh` climbs an ascending ladder of
+densities on a single instance and reports the highest that stays
+healthy — fully registered, no failures, >=95% of heartbeat cadence,
+CPU and memory under 85%. The result feeds
+`run-campaign.sh --nodes-per-instance <n>`; the 1,250 default is
+explicitly labelled as the plan's estimate.
+
+**Alternatives.** (a) Keep trusting 1,250. (b) Derive the ceiling
+analytically from per-node cost (two async tasks, a few KB). (c) Let
+each campaign auto-tune density as it goes.
+
+**Trade-off.** Twenty minutes of rig time, and a number that is only
+valid for this instance type and this build of the sim path — it has to
+be re-run when either changes.
+
+**Why (performance, honestly measured).** 1,250 sizes every scale step,
+so being wrong is expensive in both directions and invisible in both.
+Too low and every step over-provisions instances, cost, and quota. Too
+high and the sim host saturates: `start-sim-fleet.sh` divides the
+requested total by however many instances actually came up, so an
+under-provisioned fleet does not fail — it silently packs more nodes per
+box, and the campaign measures its own simulator. The cadence ratio is
+the load-bearing check precisely because it catches that case, and the
+`legion_worker_*` families the fleet now exports are what make it
+observable at all. (b) cannot see the real constraints — the gRPC
+channel pool caps at 16 channels of 256 nodes, so past ~4k nodes per
+process the multiplexing itself becomes the variable. (c) would make
+density a per-cell variable, which is exactly the kind of thing a
+fairness record cannot explain away.

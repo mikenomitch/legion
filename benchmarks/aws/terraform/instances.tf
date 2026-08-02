@@ -160,7 +160,10 @@ resource "aws_autoscaling_group" "workers" {
 
   mixed_instances_policy {
     instances_distribution {
-      on_demand_percentage_above_base_capacity = 0 # all spot
+      # 0 = all spot. Raise it to split the fleet across the spot and
+      # on-demand vCPU quotas, which AWS meters separately — see
+      # var.worker_on_demand_percentage.
+      on_demand_percentage_above_base_capacity = var.worker_on_demand_percentage
       spot_allocation_strategy                 = "price-capacity-optimized"
     }
 

@@ -2,8 +2,15 @@
 admin_cidr     = "203.0.113.7/32" # your IP
 ssh_public_key = "ssh-ed25519 AAAA... you@laptop"
 
-# Scale the sim-worker fleet per step (1k=1, 2k=2, 5k=4, 10k=8, 20k=16):
+# Scale the sim-worker fleet per step (1k=1, 2k=2, 5k=4, 10k=8, 20k=16).
+# Those counts assume ~1,250 nodes per instance; experiments/packing-density.sh
+# measures the real ceiling, and a higher one means fewer instances per step.
 # worker_instances = 1
+
+# Split the fleet across the spot and on-demand vCPU quotas (separate AWS
+# limits) when spot alone cannot cover a step. 0 = all spot, 50 = half from
+# each, 100 = no spot. Costs ~3x for the on-demand share.
+# worker_on_demand_percentage = 0
 
 # region = "us-east-1"
 # project = "legion-bench"

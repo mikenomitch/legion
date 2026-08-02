@@ -34,6 +34,16 @@ output "control_plane_type" {
   value = var.control_plane_type
 }
 
+output "worker_on_demand_percentage" {
+  description = "Sim-fleet purchase mix; rides the rig manifest into every fairness record."
+  value       = var.worker_on_demand_percentage
+}
+
+output "archive_bucket" {
+  description = "Durable results mirror outside this terraform ('' = none)."
+  value       = var.archive_bucket
+}
+
 output "loadgen_type" {
   value = var.loadgen_type
 }

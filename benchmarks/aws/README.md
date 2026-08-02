@@ -119,6 +119,55 @@ What makes this safe to leave alone:
 - **Every cell archives to S3 as it completes**, so results survive even
   if the run dies partway.
 
+### Watching from somewhere else
+
+`remote-campaign.sh status` needs SSH, from an address inside
+`admin_cidr`, to a box that still exists. An agent or cloud shell
+checking on an overnight run has none of that — many such environments
+have no outbound port 22 at all. So the campaign also publishes its own
+state to S3, and anything with AWS credentials can read it:
+
+```bash
+scripts/campaign-status.sh show --bucket <bucket> --region us-east-1
+scripts/campaign-status.sh watch --bucket <bucket>   # until terminal
+```
+
+No repo checkout, terraform state, rig manifest, or SSH required — the
+bucket name is the only input. The exit code *is* the state, so a
+watcher can branch on it without parsing: `0` running, `2` finished, `3`
+failed, `4` stale, `5` no status found.
+
+`4` is the one that matters for an unattended run. The runner heartbeats
+every 60s, so "no update in 30 minutes" means the driver or its box is
+gone — which a scale step's long silence would otherwise look exactly
+like. The console log is mirrored alongside the status, so a watcher can
+read the actual failure:
+
+```bash
+aws s3 cp s3://<bucket>/status/<campaign>/console.log -
+```
+
+### Keeping results after the rig is gone
+
+Cells archive to the rig's own bucket as they complete, so results
+already survive losing an instance. They do **not** survive
+`teardown.sh`: that bucket is `force_destroy`, and teardown's local sync
+writes to whatever machine ran it — for an unattended campaign, exactly
+the disposable thing you might lose.
+
+Set `archive_bucket` to a bucket terraform does not manage:
+
+```bash
+aws s3 mb s3://my-legion-benchmarks --region us-east-1
+# terraform.tfvars: archive_bucket = "my-legion-benchmarks"
+```
+
+`collect.sh` then mirrors every cell there as it lands, and teardown
+re-syncs anything that missed. Terraform cannot destroy a bucket it does
+not own, and the rig's IAM role gets write but deliberately not delete —
+so the durable copy is not erasable by anything running inside the rig.
+Without it, teardown warns, and it is warning about real data loss.
+
 Two details worth knowing:
 
 - **Addresses switch automatically.** On the loadgen box the scripts
