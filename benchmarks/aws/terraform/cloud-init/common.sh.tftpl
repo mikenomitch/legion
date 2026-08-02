@@ -8,7 +8,19 @@ set -euo pipefail
 NODE_EXPORTER_VERSION="${node_exporter_version}"
 
 DEBIAN_FRONTEND=noninteractive apt-get update -y
-DEBIAN_FRONTEND=noninteractive apt-get install -y chrony jq unzip awscli gettext-base
+DEBIAN_FRONTEND=noninteractive apt-get install -y chrony jq unzip gettext-base curl
+
+# AWS CLI v2 from the bundled installer, NOT `apt-get install awscli`:
+# Ubuntu 24.04 (noble) dropped the awscli package from the archive
+# entirely, so the apt route fails the whole cloud-init run with
+# "Package 'awscli' has no installation candidate". The archive's v1 was
+# also behind the commands the campaign scripts use.
+if ! command -v aws >/dev/null 2>&1; then
+  curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
+  unzip -q /tmp/awscliv2.zip -d /tmp
+  /tmp/aws/install
+  rm -rf /tmp/aws /tmp/awscliv2.zip
+fi
 
 # node_exporter: pinned release, dedicated user, systemd-managed.
 useradd --no-create-home --shell /usr/sbin/nologin node_exporter || true
