@@ -260,8 +260,36 @@ How to use it:
         state — can check on an unattended campaign and tell "stalled"
         from "quiet". README "Watching from somewhere else" and "Keeping
         results after the rig is gone"; calls entries 11 and 15-17.
+  - [x] Bootstrap the operator box the campaign is driven from
+        (`scripts/bootstrap-operator-box.sh`, `scripts/phase1.sh`; calls
+        entries 18-19). One command takes an AWS key to a running
+        phase 1: builds an Ubuntu x86_64 box outside the rig's terraform
+        (it *runs* that terraform, and must outlive `teardown.sh`, which
+        destroys the state), gives it an Elastic IP so `admin_cidr` stays
+        true, carries an IAM instance role instead of a copied key,
+        writes `terraform.tfvars` from the box's own facts, and runs the
+        six phase-1 steps under tmux with per-step checkpoints.
+        `stop`/`start` for between sessions (~$268/mo running vs ~$12/mo
+        stopped); `repair-iam` re-applies the role in place, which is the
+        only remedy available when the box holds the sole copy of the
+        terraform state.
   - [ ] Phase 1 exit on real AWS: `bringup.sh` + 1k-node
-        `run-campaign.sh --system legion-a --smoke` (needs an account).
+        `run-campaign.sh --system legion-a --smoke`. **In progress on a
+        real account (2026-08-02).** Step 1 (local-smoke) passes on a
+        real box. Bugs found and fixed while getting there, all in
+        `bootstrap-operator-box.sh` unless noted: no default VPC in the
+        account; `Subnets[0]` landing in an AZ that does not offer the
+        instance type (us-east-1e has no c7i); `RunInstances` retrying
+        every failure and blaming IAM propagation; `cargo` absent from a
+        non-interactive SSH PATH (rustup writes to `~/.bashrc`, which
+        Ubuntu skips for non-interactive shells) — fixed in `phase1.sh`
+        and in cloud-init, and documented in `development.md`; `clang` +
+        `libclang-dev` missing for `rusqlite`'s `session` feature forcing
+        libsqlite3-sys through bindgen; `push`'s `rsync --delete`
+        deleting `terraform.tfvars` and — far worse — `terraform.tfstate`,
+        which would have orphaned the whole rig; the operator role
+        missing `iam:TagInstanceProfile` while terraform tags every
+        resource via `default_tags`.
         Unverified against real AWS, and first in line to shake out:
         the `orchestrator` role's `SetDesiredCapacity` path, the
         loadgen box's private-IP reachability to CP + spot workers, the
