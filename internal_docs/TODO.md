@@ -945,7 +945,7 @@ docs: [scheduler-and-eval-loop.md](../docs/scheduler-and-eval-loop.md), [jobs-ta
       Deferred pieces are open items above (group-path candidates, disk
       fingerprinting, backlog).
 - [x] AGENTS.md now requires before/after benchmark numbers on scheduler
-      changes, and `benches/scheduler_bench.rs` grew a
+      changes, and `benchmarks/micro/scheduler_bench.rs` grew a
       `candidate_construction` group that isolates candidate-set cost
       (indexes on vs off) across fleet sizes.
 - [x] **Late-binding plan apply** (phases 0–3) — plans carry a ranked

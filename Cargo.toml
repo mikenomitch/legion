@@ -110,12 +110,19 @@ criterion = "0.5.1"
 [build-dependencies]
 tonic-build = "0.12.3"
 
+# Benchmarks all live under `benchmarks/` — the Criterion targets below in
+# `benchmarks/micro/`, alongside the scenario-driven scheduler harness
+# (`benchmarks/scheduler/`) and the AWS comparison rig (`benchmarks/aws/`).
+# That is why each target names its `path` instead of relying on Cargo's
+# default `benches/` discovery. See `benchmarks/README.md`.
 [[bench]]
 name = "scheduler_bench"
+path = "benchmarks/micro/scheduler_bench.rs"
 harness = false
 
 [[bench]]
 name = "eval_critical_path_bench"
+path = "benchmarks/micro/eval_critical_path_bench.rs"
 harness = false
 
 # Profile for shipped binaries: `cargo build --profile dist`.

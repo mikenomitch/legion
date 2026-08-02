@@ -355,9 +355,9 @@ Code recon (verified against `main` at the time of writing):
   seams (plan outcome, eval retry, placement failure taxonomy); §8 keeps
   the two composable.
 - **Benchmarks that gate this work**: `scheduler_speed` and
-  `candidate_construction` groups in `benches/scheduler_bench.rs`
+  `candidate_construction` groups in `benchmarks/micro/scheduler_bench.rs`
   (`:113`, `:206`), plus `eval_claim_apply_complete_latency`
-  (`benches/eval_critical_path_bench.rs:50`). Scheduler changes ship with
+  (`benchmarks/micro/eval_critical_path_bench.rs:50`). Scheduler changes ship with
   before/after numbers (AGENTS.md).
 
 ## Proposed Design
