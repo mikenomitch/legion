@@ -81,6 +81,14 @@ cell as validation, not as fit input).
   fake nodes speak that system's real node protocol, shaped from the
   same `node_profiles` file (`workloads/profile_split.py` is the shared
   split).
+- **The sim fleets are measured too.** Legion sim hosts export the
+  ordinary `legion_worker_*` registry on `:9101`
+  (`LEGION_WORKER_TELEMETRY_PORT`, set by `start-sim-fleet.sh`), scraped
+  as the `legion-sim-workers` job and shown on the campaign board. That
+  is how a run proves the workers were not the bottleneck instead of
+  asserting it. The metrics are per sim *process* (~1,250 nodes), not per
+  node — see docs/metrics.md § Worker. Nomad and K8s fleets are not
+  scraped this way, so worker-side cost is only compared via instance CPU.
 - **Driver-side clocks.** Submit and placed timestamps are taken by the
   same driver process for every system; no cross-host clock skew enters
   a latency, and all systems pay the same stream-delivery latency.

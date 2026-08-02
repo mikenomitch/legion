@@ -17,4 +17,10 @@ done < <(worker_instances)
 
 rsh "$LOADGEN_PUBLIC_IP" \
     "command -v kubectl >/dev/null 2>&1 && kubectl delete nodes -l type=kwok --ignore-not-found" || true
+
+# Retract the sim-worker scrape targets published by start-sim-fleet.sh, so
+# a stopped fleet reads as "no targets" rather than a wall of `up == 0`.
+rsh "$LOADGEN_PUBLIC_IP" \
+    "echo '[]' >/opt/bench/observability/targets/sim-workers.json" || true
+
 log "sim fleets stopped"

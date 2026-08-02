@@ -1036,6 +1036,14 @@ pub fn snapshot_initialized_families() -> Vec<FamilySnapshot> {
 /// machinery as the manager registry, separate global: a combined
 /// manager+worker process serves both registries from their own listeners,
 /// and the OTLP push exports whichever registries the process initialized.
+///
+/// A simulated fleet (`legion start worker --simulate N`) reports through
+/// this same registry rather than a parallel one — the process *is* a
+/// worker, just carrying N nodes. Everything here is therefore per-process:
+/// in a fleet the shared families aggregate over every simulated node, and
+/// the `simulated_*` families below describe the fleet itself. Per-node
+/// series are deliberately not exported; at 1,250 nodes per host that is a
+/// cardinality bomb, and the manager already holds the per-node view.
 pub struct WorkerMetrics {
     /// `legion_worker_heartbeats_total{outcome}`
     pub heartbeats_total: Arc<CounterVec>,
@@ -1058,6 +1066,14 @@ pub struct WorkerMetrics {
     /// `legion_provisional_active` — unratified claims held right now, so
     /// started-but-unconfirmed capacity is visible rather than invisible.
     pub provisional_active: Arc<Gauge>,
+    /// `legion_worker_simulated_nodes` — simulated nodes registered by this
+    /// process (`--simulate N`); 0 in a real worker.
+    pub simulated_nodes: Arc<Gauge>,
+    /// `legion_worker_simulated_nodes_target` — the fleet size this process
+    /// was asked for, so a stalled ramp is visible as a gap.
+    pub simulated_nodes_target: Arc<Gauge>,
+    /// `legion_worker_simulated_registrations_total{outcome}`
+    pub simulated_registrations_total: Arc<CounterVec>,
     families: Vec<Arc<dyn RenderMetric>>,
 }
 
@@ -1066,7 +1082,7 @@ impl WorkerMetrics {
         let heartbeats_total = Arc::new(CounterVec {
             meta: FamilyMeta {
                 name: "legion_worker_heartbeats_total",
-                help: "Heartbeat round-trips attempted by this worker, by outcome (ok|error|unauthenticated).",
+                help: "Heartbeat round-trips attempted by this worker process, by outcome (ok|error|unauthenticated). Summed over every node in a simulated fleet.",
                 labels: &["outcome"],
             },
             series: Series::new(),
@@ -1082,7 +1098,7 @@ impl WorkerMetrics {
         let allocations_running = Arc::new(Gauge {
             meta: FamilyMeta {
                 name: "legion_worker_allocations_running",
-                help: "Allocations this worker currently runs, as reported on its last heartbeat.",
+                help: "Allocations this worker currently runs, as reported on its last heartbeat. Summed over every node in a simulated fleet (where they are acked, not run).",
                 labels: &[],
             },
             cell: GaugeCell::default(),
@@ -1138,6 +1154,36 @@ impl WorkerMetrics {
             cell: GaugeCell::default(),
         });
 
+        // Simulated-fleet families. A `--simulate N` process is a worker
+        // process that happens to carry N nodes, so it reports through this
+        // same registry: the families above become fleet-wide aggregates and
+        // these three say how big the fleet is and whether it got there. All
+        // three stay at zero in a real worker.
+        let simulated_nodes = Arc::new(Gauge {
+            meta: FamilyMeta {
+                name: "legion_worker_simulated_nodes",
+                help: "Simulated nodes in this process that have completed registration (0 in a real worker).",
+                labels: &[],
+            },
+            cell: GaugeCell::default(),
+        });
+        let simulated_nodes_target = Arc::new(Gauge {
+            meta: FamilyMeta {
+                name: "legion_worker_simulated_nodes_target",
+                help: "Simulated nodes this process was asked to run (`--simulate N`); 0 in a real worker.",
+                labels: &[],
+            },
+            cell: GaugeCell::default(),
+        });
+        let simulated_registrations_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_worker_simulated_registrations_total",
+                help: "Simulated-node registration attempts, by outcome (ok|error). Counts re-registrations, so it outruns the node count over a long run.",
+                labels: &["outcome"],
+            },
+            series: Series::new(),
+        });
+
         let families: Vec<Arc<dyn RenderMetric>> = vec![
             Arc::clone(&allocation_failures_reported_total) as Arc<dyn RenderMetric>,
             Arc::clone(&allocations_running) as Arc<dyn RenderMetric>,
@@ -1148,6 +1194,9 @@ impl WorkerMetrics {
             Arc::clone(&provisional_ratify_seconds) as Arc<dyn RenderMetric>,
             Arc::clone(&provisional_refused_total) as Arc<dyn RenderMetric>,
             Arc::clone(&provisional_starts_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&simulated_nodes) as Arc<dyn RenderMetric>,
+            Arc::clone(&simulated_nodes_target) as Arc<dyn RenderMetric>,
+            Arc::clone(&simulated_registrations_total) as Arc<dyn RenderMetric>,
         ];
 
         WorkerMetrics {
@@ -1160,6 +1209,9 @@ impl WorkerMetrics {
             provisional_killed_total,
             provisional_ratify_seconds,
             provisional_active,
+            simulated_nodes,
+            simulated_nodes_target,
+            simulated_registrations_total,
             families,
         }
     }
