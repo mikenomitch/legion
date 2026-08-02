@@ -212,6 +212,40 @@ import_key_pair() {
     esac
 }
 
+# Older AZs do not carry newer instance families: us-east-1e has no
+# c7i at all, and every region has some equivalent. Taking the first
+# default subnet and finding out at RunInstances costs a full
+# create-and-destroy cycle for a fact that is one API call away, so
+# intersect the AZs that offer this type with the subnets available.
+instance_type_azs() {
+    aws_ ec2 describe-instance-type-offerings \
+        --location-type availability-zone \
+        --filters "Name=instance-type,Values=$INSTANCE_TYPE" \
+        --query 'InstanceTypeOfferings[].Location' --output text | tr '\t' ' '
+}
+
+az_offers() { # az_offers <az> <space-separated az list>
+    case " $2 " in *" $1 "*) return 0 ;; esac
+    return 1
+}
+
+pick_subnet() { # pick_subnet <vpc-id> <az-list> -> "<subnet-id> <az>"
+    local vpc="$1" azs="$2" subnets sn az
+    subnets=$(aws_ ec2 describe-subnets \
+        --filters "Name=vpc-id,Values=$vpc" "Name=default-for-az,Values=true" \
+        --query 'Subnets[].[SubnetId,AvailabilityZone]' --output text)
+    while read -r sn az; do
+        [ -n "$sn" ] || continue
+        if az_offers "$az" "$azs"; then
+            echo "$sn $az"
+            return 0
+        fi
+    done <<<"$subnets"
+    die "no default subnet in $REGION sits in an AZ that offers $INSTANCE_TYPE.
+  Offered in: $azs
+  Use --type <other-type>, or OPERATOR_SUBNET_ID for a public subnet in one of those AZs."
+}
+
 cmd_create() {
     for tool in aws jq ssh rsync; do
         command -v "$tool" >/dev/null || die "$tool is required locally"
@@ -241,24 +275,29 @@ cmd_create() {
     # VPC derived from the subnet. The subnet must be public: the box is
     # reached over SSH from admin_cidr, and an Elastic IP does not help
     # without a route to an internet gateway.
-    local vpc_id subnet_id
+    local vpc_id subnet_id azs subnet_az
+    azs=$(instance_type_azs)
+    [ -n "$azs" ] || die "$INSTANCE_TYPE is not offered in any AZ in $REGION"
+
     if [ -n "${OPERATOR_SUBNET_ID:-}" ]; then
         subnet_id="$OPERATOR_SUBNET_ID"
-        vpc_id=$(aws_ ec2 describe-subnets --subnet-ids "$subnet_id" \
-            --query 'Subnets[0].VpcId' --output text 2>/dev/null || true)
-        [ -n "$vpc_id" ] && [ "$vpc_id" != None ] ||
+        read -r vpc_id subnet_az < <(aws_ ec2 describe-subnets --subnet-ids "$subnet_id" \
+            --query 'Subnets[0].[VpcId,AvailabilityZone]' --output text 2>/dev/null || true)
+        [ -n "${vpc_id:-}" ] && [ "$vpc_id" != None ] ||
             die "subnet $subnet_id not found in $REGION"
-        log "using subnet $subnet_id (VPC $vpc_id) from OPERATOR_SUBNET_ID"
+        az_offers "$subnet_az" "$azs" ||
+            die "subnet $subnet_id is in $subnet_az, which does not offer $INSTANCE_TYPE.
+  Offered in: $azs
+  Pick a subnet in one of those AZs, or use --type."
+        log "using subnet $subnet_id ($subnet_az, VPC $vpc_id) from OPERATOR_SUBNET_ID"
     else
         vpc_id=$(aws_ ec2 describe-vpcs --filters Name=isDefault,Values=true \
             --query 'Vpcs[0].VpcId' --output text)
         [ "$vpc_id" != "None" ] || die "no default VPC in $REGION.
   Create one (free, instant):     aws ec2 create-default-vpc --region $REGION
   Or use an existing public subnet: OPERATOR_SUBNET_ID=subnet-... $0 $CMD"
-        subnet_id=$(aws_ ec2 describe-subnets \
-            --filters "Name=vpc-id,Values=$vpc_id" "Name=default-for-az,Values=true" \
-            --query 'Subnets[0].SubnetId' --output text)
-        log "using default VPC $vpc_id / subnet $subnet_id"
+        read -r subnet_id subnet_az < <(pick_subnet "$vpc_id" "$azs")
+        log "using default VPC $vpc_id / subnet $subnet_id ($subnet_az)"
     fi
 
     log "creating key pair, security group, and IAM role"
