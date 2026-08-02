@@ -5,8 +5,9 @@ Plan: [`../plans/aws-comparative-benchmark-plan.md`](../plans/aws-comparative-be
 Entries 1-4 are planning-stage calls; 5-10 were made while building the
 rig (phases 0-1, 2026-07-30); 11-13 came from making campaigns runnable
 unattended (2026-08-02); 18-19 came from making the rig startable at all
-from an arm64 macOS machine (2026-08-02). Ranked by project impact; the
-number is the rank.
+from an arm64 macOS machine (2026-08-02); 20 came from adding memory to
+the measured results during the first real campaign (2026-08-02). Ranked
+by project impact; the number is the rank.
 
 ## 1. Simulated workers everywhere, real control planes only
 
