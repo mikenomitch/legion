@@ -46,6 +46,14 @@ resource "aws_instance" "control_plane" {
     install_docker = false
   })
 
+  # cloud-init only ever runs on first boot, so an in-place user_data
+  # update (the provider's default) changes nothing about the running
+  # box — `apply` reports success while leaving the old, broken boot
+  # intact. If the first-boot script changed, the box has to be rebuilt
+  # or the change is a lie. Deliberate: `ignore_changes = [ami]` above
+  # already prevents the accidental churn this would otherwise cause.
+  user_data_replace_on_change = true
+
   lifecycle {
     ignore_changes = [ami]
   }
@@ -84,6 +92,10 @@ resource "aws_instance" "loadgen" {
     bootstrap_b64  = local.bootstrap_b64
     install_docker = true
   })
+
+  # See the control plane above: an in-place user_data update leaves the
+  # already-booted box untouched, so a first-boot change must rebuild it.
+  user_data_replace_on_change = true
 
   lifecycle {
     ignore_changes = [ami]
