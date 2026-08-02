@@ -88,6 +88,12 @@ launch_detached() {
         exit 1
     fi
 
+    # One id for the status stream. `launch` hands the same one to
+    # run-campaign.sh (--campaign) so the S3 status and the S3 archives
+    # agree on what to call this run; `exec` has no campaign of its own,
+    # so the id names the drill instead.
+    STATUS_ID="${STATUS_ID:-$(date -u +%Y%m%d-%H%M%S)-remote}"
+
     local quoted=""
     local arg
     for arg in "$@"; do quoted+="$(printf '%q ' "$arg")"; done
@@ -97,10 +103,36 @@ launch_detached() {
 # Written by scripts/remote-campaign.sh. Regenerated on every launch.
 cd $RIG_DIR || exit 1
 echo "=== $(date -u +%FT%TZ) launching: $quoted" >>$LOG
+
+# Publish state to S3 as well as tmux. tmux answers "is it running?" only
+# to something that can SSH in from inside admin_cidr, to a box that
+# still exists — none of which is true of whatever is checking on an
+# overnight run from elsewhere. S3 needs only HTTPS and credentials.
+# Always best-effort: status publishing must never fail a campaign.
+status() { # status <phase> [detail]
+    scripts/campaign-status.sh publish --campaign '$STATUS_ID' \\
+        --phase "\$1" --detail "\${2:-}" --log $LOG >/dev/null 2>&1 || true
+}
+status running 'started'
+
+# The heartbeat is what separates "quiet but working" from "the box is
+# gone" — a scale step can run for many minutes with no output at all.
+while :; do
+    sleep 60
+    status running 'in progress'
+done &
+HEARTBEAT=\$!
+
 set -o pipefail
 $quoted 2>&1 | tee -a $LOG
 code=\${PIPESTATUS[0]}
+kill \$HEARTBEAT 2>/dev/null || true
 echo "=== finished with exit \$code" >>$LOG
+if [ "\$code" = 0 ]; then
+    status succeeded 'campaign complete'
+else
+    status failed "exit \$code"
+fi
 exit \$code
 RUNNER_EOF
 
@@ -132,7 +164,16 @@ launch)
     done
     [ -n "$KEY" ] || KEY=$(resolve_key)
     stage "$KEY"
-    launch_detached "scripts/run-campaign.sh" "${ARGS[@]}"
+    # Shared id: the status stream and the result archives name the run
+    # the same thing, so a watcher reading status.json knows exactly
+    # which s3://.../campaigns/<id>/ prefix to pull.
+    SYSTEM_FOR_ID=""
+    for i in "${!ARGS[@]}"; do
+        [ "${ARGS[$i]}" = "--system" ] && SYSTEM_FOR_ID="${ARGS[$((i + 1))]:-}"
+    done
+    STATUS_ID="$(date -u +%Y%m%d-%H%M)-${SYSTEM_FOR_ID:-campaign}"
+    export STATUS_ID
+    launch_detached "scripts/run-campaign.sh" "${ARGS[@]}" --campaign "$STATUS_ID"
     ;;
 
 exec)

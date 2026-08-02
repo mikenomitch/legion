@@ -76,6 +76,10 @@ log "writing fairness record"
     echo "    \"control_plane\": \"$CONTROL_PLANE_TYPE\","
     echo "    \"loadgen\": \"$LOADGEN_TYPE\", \"workers\": \"see terraform/variables.tf\""
     echo "  },"
+    # Purchase mix for the sim fleet: an on-demand share means that part
+    # of the fleet saw no spot reclaims, which is a fidelity difference
+    # between cells and not only a cost one.
+    echo "  \"worker_on_demand_percentage\": ${WORKER_ON_DEMAND_PCT:-0},"
     echo "  \"legion_binary\": $(aws s3 cp --region "$REGION" "s3://$BUCKET/bin/legion.meta.json" - 2>/dev/null || echo null),"
     echo "  \"versions\": {"
     echo "    \"nomad\": \"$NOMAD_VERSION\", \"k8s\": \"$K8S_VERSION\","
@@ -90,4 +94,20 @@ rsh "${CP_ADDRS[0]}" "cat /opt/legion/configs/manager.jsonnet 2>/dev/null || cat
 log "archiving to s3://$BUCKET/campaigns/$CAMPAIGN/$RUN.tar.gz"
 tar -C "$RESULTS_ROOT/$CAMPAIGN" -czf - "$RUN" |
     aws s3 cp --region "$REGION" - "s3://$BUCKET/campaigns/$CAMPAIGN/$RUN.tar.gz"
+
+# Durable mirror. The rig's own bucket dies with `teardown.sh`
+# (force_destroy), and $DEST is on whichever box drove the campaign — for
+# an unattended run, a disposable one. A cell that reaches the archive
+# bucket survives losing both. Best-effort by design: a mirror failure
+# must never fail a cell whose primary copy already landed.
+if [ -n "${ARCHIVE_BUCKET:-}" ]; then
+    if tar -C "$RESULTS_ROOT/$CAMPAIGN" -czf - "$RUN" |
+        aws s3 cp --region "$REGION" - "s3://$ARCHIVE_BUCKET/campaigns/$CAMPAIGN/$RUN.tar.gz"; then
+        log "mirrored to s3://$ARCHIVE_BUCKET/campaigns/$CAMPAIGN/$RUN.tar.gz"
+    else
+        log "WARNING: mirror to s3://$ARCHIVE_BUCKET failed — this cell only exists in the rig bucket and on this box"
+    fi
+else
+    log "NOTE: no archive_bucket set; this cell dies with teardown.sh unless you sync it out"
+fi
 log "collected: $DEST"

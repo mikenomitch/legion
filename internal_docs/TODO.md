@@ -245,13 +245,32 @@ How to use it:
         the ASG API under a narrow `orchestrator` IAM role; the spot
         fleet is released on any campaign exit (`--keep-fleet` opts
         out). See the README's "Unattended runs" and calls entries
-        11-13.
+        12-14.
+  - [x] Quota headroom + durable results (2026-08-02):
+        `var.worker_on_demand_percentage` splits the sim fleet across the
+        spot and on-demand vCPU quotas (separate AWS limits) so neither
+        has to cover a whole step; `experiments/packing-density.sh`
+        measures the real nodes-per-instance ceiling the 1,250 estimate
+        stands in for, feeding `run-campaign.sh --nodes-per-instance`;
+        `var.archive_bucket` mirrors every cell to a bucket terraform
+        does not manage (write, not delete), so results outlive both the
+        VM and `teardown.sh`; `scripts/campaign-status.sh` publishes
+        run state + console log to S3 with a 60s heartbeat, so a watcher
+        with only HTTPS and credentials — no SSH, no repo, no terraform
+        state — can check on an unattended campaign and tell "stalled"
+        from "quiet". README "Watching from somewhere else" and "Keeping
+        results after the rig is gone"; calls entries 11 and 15-17.
   - [ ] Phase 1 exit on real AWS: `bringup.sh` + 1k-node
         `run-campaign.sh --system legion-a --smoke` (needs an account).
         Unverified against real AWS, and first in line to shake out:
         the `orchestrator` role's `SetDesiredCapacity` path, the
-        loadgen box's private-IP reachability to CP + spot workers, and
-        the tmux launch path in `remote-campaign.sh`.
+        loadgen box's private-IP reachability to CP + spot workers, the
+        tmux launch path in `remote-campaign.sh`, and the S3 status
+        stream + archive-bucket mirror (both written and unit-checked,
+        neither exercised against a real bucket). Run
+        `packing-density.sh` during this step: it needs the same
+        standing rig and retires the 1,250 assumption before any cell
+        is sized from it.
   - [ ] Phases 2-5: Legion A/B campaigns, Nomad (verify nodesim `mock`
         driver + install script), K8s (verify kubeadm/KWOK install +
         watch parsing), 20k validation burst, analysis + REPORT.md.

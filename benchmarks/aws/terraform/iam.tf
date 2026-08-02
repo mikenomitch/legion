@@ -33,6 +33,30 @@ data "aws_iam_policy_document" "bucket_rw" {
     ]
     resources = ["${aws_s3_bucket.bench.arn}/*"]
   }
+
+  # The durable mirror (var.archive_bucket), when one is configured. It
+  # outlives the rig, so the rig gets write but deliberately NOT delete:
+  # results that survive teardown should not be erasable by anything
+  # running inside a disposable, internet-facing instance.
+  dynamic "statement" {
+    for_each = var.archive_bucket == "" ? [] : [var.archive_bucket]
+
+    content {
+      sid       = "ArchiveBucketList"
+      actions   = ["s3:ListBucket", "s3:GetBucketLocation"]
+      resources = ["arn:aws:s3:::${statement.value}"]
+    }
+  }
+
+  dynamic "statement" {
+    for_each = var.archive_bucket == "" ? [] : [var.archive_bucket]
+
+    content {
+      sid       = "ArchiveBucketWrite"
+      actions   = ["s3:GetObject", "s3:PutObject"]
+      resources = ["arn:aws:s3:::${statement.value}/*"]
+    }
+  }
 }
 
 resource "aws_iam_role" "bench" {

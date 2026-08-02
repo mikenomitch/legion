@@ -92,9 +92,41 @@ variable "worker_instances" {
     on desired_capacity and changing this variable after bringup does
     nothing to a running fleet. The ASG replaces nothing on the way
     up/down either way, so the control plane is untouched.
+
+    1,250 is the plan's estimate, not a measurement. Run
+    `experiments/packing-density.sh` once against the standing rig to
+    find this fleet's real ceiling: a higher density needs fewer
+    instances per step, which cuts both cost and the spot vCPU quota a
+    campaign has to clear.
   EOT
   type        = number
   default     = 1
+}
+
+variable "worker_on_demand_percentage" {
+  description = <<-EOT
+    Share of the sim-worker fleet launched on-demand instead of spot
+    (0-100). Default 0 = all spot, the cheapest way to run a campaign.
+
+    Raise it when a region's spot vCPU quota cannot cover a step. Spot
+    and on-demand are separate AWS quotas, so a 50/50 split draws half
+    the fleet from each and neither limit has to cover the whole fleet:
+    at 8 vCPU per instance the 20k validation burst is 128 vCPU — 64
+    from each bucket at 50, versus 128 from one at 0.
+
+    It costs money: on-demand runs roughly 3x spot for these types. A
+    2-hour validation burst at 100 is a few dollars more; a 24h soak is
+    not. It also removes spot reclaims for that share of the fleet,
+    which is a fidelity difference, not just a price one — so
+    collect.sh records the setting in every cell's fairness record.
+  EOT
+  type        = number
+  default     = 0
+
+  validation {
+    condition     = var.worker_on_demand_percentage >= 0 && var.worker_on_demand_percentage <= 100
+    error_message = "worker_on_demand_percentage must be between 0 and 100."
+  }
 }
 
 variable "worker_instance_types" {
@@ -113,6 +145,33 @@ variable "worker_disk_gb" {
 }
 
 # --- Results / streaming storage ---------------------------------------
+
+variable "archive_bucket" {
+  description = <<-EOT
+    Name of an EXISTING S3 bucket, managed outside this terraform, to
+    mirror campaign results into. Optional, and strongly recommended for
+    any run whose numbers you intend to keep.
+
+    The rig's own bucket is `force_destroy` — `teardown.sh` deletes it
+    with everything inside — and teardown's pre-destroy sync writes to
+    whatever machine ran it, which for an unattended campaign is exactly
+    the disposable thing you might lose. A bucket terraform does not
+    manage cannot be destroyed by terraform, so results mirrored here
+    outlive both the VM and the teardown.
+
+    Create one once, outside any campaign:
+
+      aws s3 mb s3://my-legion-benchmarks --region us-east-1
+
+    then set archive_bucket = "my-legion-benchmarks". The rig is granted
+    read and write on it, deliberately NOT delete: the durable copy
+    should not be erasable by anything running inside a disposable rig.
+
+    Empty (the default) means no mirror, and teardown says so loudly.
+  EOT
+  type        = string
+  default     = ""
+}
 
 variable "results_bucket_prefix" {
   description = "S3 bucket name prefix (a random suffix is appended). Holds campaign archives, the Legion B streaming replica + lease, and the uploaded legion binary."

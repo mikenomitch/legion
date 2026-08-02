@@ -18,6 +18,7 @@ boundary.
 | `streaming-rpo.sh` | Lease-failover gap + RPO (writes not yet shipped) | legion-b |
 | `soak-24h.sh` | Drift, leaks, eval-queue growth, store growth over 24h of mixed+churn | legion-a or -b |
 | `upgrade-under-load.sh` | Placement disruption during a rolling manager upgrade | legion-a |
+| `packing-density.sh` | How many sim nodes one worker instance really carries | legion-a, legion-b |
 
 ## Methodology notes (read before running)
 
@@ -59,6 +60,32 @@ never returns to zero, RSS growth without plateau.
 a time, verify quorum between steps) with the steady workload running;
 `driver.py watch` spans the whole rolling window, and the disruption
 number is the max placement gap observed during it.
+
+**packing-density.sh** — the one drill worth running *before* a campaign
+rather than during one. Every scale step's instance count comes from
+`NODES_PER_INSTANCE=1250` in `run-campaign.sh`, which is the plan's
+estimate and has never been measured. The probe scales the fleet to a
+single instance and climbs an ascending ladder of densities on it,
+holding each long enough for the rate windows to fill, then reads the
+fleet's own `legion_worker_*` series off Prometheus.
+
+A density passes when the fleet fully registers, reports no heartbeat or
+registration failures, and sustains at least 95% of its heartbeat
+cadence with CPU and memory under 85%. The cadence ratio is the
+load-bearing signal: a box that cannot keep N nodes heartbeating on
+schedule is a box whose numbers describe the simulator, not the
+scheduler.
+
+The ladder must be ascending, and the script enforces it.
+`start-sim-fleet.sh` waits on the manager's *total* node count, and nodes
+from an earlier step linger as lost rows until their deterministic names
+are re-registered — so a descending ladder would satisfy that wait
+instantly against stale rows and measure nothing.
+
+Feed the result back with `run-campaign.sh --nodes-per-instance <n>`. A
+measured ceiling above 1,250 cuts instances, cost, and the spot vCPU
+quota a campaign has to clear, all proportionally; one below it means
+earlier cells were measuring the sim fleet.
 
 ## Results
 
