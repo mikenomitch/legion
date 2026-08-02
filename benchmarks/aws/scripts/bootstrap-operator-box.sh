@@ -391,6 +391,18 @@ cmd_create() {
     ssh_ "test -f /home/ubuntu/.setup-complete" ||
         die "setup did not complete; check: $0 ssh 'sudo tail -50 /var/log/cloud-init-output.log'"
 
+    # `.setup-complete` proves cloud-init ran. It does NOT prove the tools
+    # are reachable the way the campaign scripts reach them — over a
+    # non-interactive ssh, which skips ~/.bashrc and so misses anything
+    # rustup put there. Check the way the caller will call.
+    local missing
+    missing=$(ssh_ 'for t in cargo rustc terraform aws tmux python3 protoc git rsync; do
+                        command -v $t >/dev/null 2>&1 || echo -n " $t"
+                    done')
+    [ -z "$missing" ] ||
+        die "the box came up but these are not on a non-interactive PATH:$missing
+  Check: $0 ssh 'sudo tail -50 /var/log/cloud-init-output.log'"
+
     log "box is ready"
     cmd_push
 
@@ -543,6 +555,15 @@ echo 'source "$HOME/.cargo/env"' >>"$HOME/.bashrc"
 printf 'Host *\n    ServerAliveInterval 30\n    ServerAliveCountMax 10\n' >>"$HOME/.ssh/config"
 chmod 600 "$HOME/.ssh/config"
 ASUSER
+
+# /usr/local/bin is on the default PATH for a non-interactive `ssh host
+# "cmd"`; ~/.cargo/bin is not, because rustup adds it via ~/.bashrc and
+# Ubuntu's .bashrc returns early for non-interactive shells. Every remote
+# command the campaign scripts issue arrives that way, so expose the
+# toolchain somewhere those shells can actually see it.
+for b in cargo rustc rustup; do
+    ln -sf /home/ubuntu/.cargo/bin/$b /usr/local/bin/$b
+done
 
 touch /home/ubuntu/.setup-complete
 CLOUDINIT
