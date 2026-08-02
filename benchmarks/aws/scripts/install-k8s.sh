@@ -37,7 +37,7 @@ install_kube_packages() { # install_kube_packages <public-ip>
 }
 
 log "installing kube packages on all control-plane boxes"
-for ip in "${CP_PUBLIC_IPS[@]}"; do
+for ip in "${CP_ADDRS[@]}"; do
     install_kube_packages "$ip"
 done
 
@@ -45,26 +45,26 @@ log "kubeadm init on cp-0"
 CP0_IP="${CP_PRIVATE_IPS[0]}" PRIVATE_IP="${CP_PRIVATE_IPS[0]}" K8S_VERSION="$K8S_VERSION" \
     render_tpl CP0_IP PRIVATE_IP K8S_VERSION \
     <"$AWS_BENCH_ROOT/configs/k8s/kubeadm-config.yaml.tpl" >/tmp/kubeadm-config.yaml
-rcp /tmp/kubeadm-config.yaml "${CP_PUBLIC_IPS[0]}:/tmp/kubeadm-config.yaml"
+rcp /tmp/kubeadm-config.yaml "${CP_ADDRS[0]}:/tmp/kubeadm-config.yaml"
 rm -f /tmp/kubeadm-config.yaml
-rsh "${CP_PUBLIC_IPS[0]}" "
+rsh "${CP_ADDRS[0]}" "
     sudo cp /tmp/kubeadm-config.yaml /etc/kubernetes/kubeadm-config.yaml
     sudo kubeadm init --config /tmp/kubeadm-config.yaml --upload-certs | tee /tmp/kubeadm-init.log
 "
 
-JOIN_CMD=$(rsh "${CP_PUBLIC_IPS[0]}" "sudo kubeadm token create --print-join-command")
-CERT_KEY=$(rsh "${CP_PUBLIC_IPS[0]}" "sudo kubeadm init phase upload-certs --upload-certs 2>/dev/null | tail -1")
+JOIN_CMD=$(rsh "${CP_ADDRS[0]}" "sudo kubeadm token create --print-join-command")
+CERT_KEY=$(rsh "${CP_ADDRS[0]}" "sudo kubeadm init phase upload-certs --upload-certs 2>/dev/null | tail -1")
 
 for idx in 1 2; do
     log "joining cp-$idx as a control plane"
-    rsh "${CP_PUBLIC_IPS[$idx]}" "sudo $JOIN_CMD --control-plane --certificate-key $CERT_KEY"
+    rsh "${CP_ADDRS[$idx]}" "sudo $JOIN_CMD --control-plane --certificate-key $CERT_KEY"
 done
 
 log "installing kubeconfig + KWOK $KWOK_VERSION via loadgen"
-rsh "${CP_PUBLIC_IPS[0]}" "sudo cat /etc/kubernetes/admin.conf" >/tmp/bench-kubeconfig
-rcp /tmp/bench-kubeconfig "$LOADGEN_PUBLIC_IP:/tmp/kubeconfig"
+rsh "${CP_ADDRS[0]}" "sudo cat /etc/kubernetes/admin.conf" >/tmp/bench-kubeconfig
+rcp /tmp/bench-kubeconfig "$LOADGEN_ADDR:/tmp/kubeconfig"
 rm -f /tmp/bench-kubeconfig
-rsh "$LOADGEN_PUBLIC_IP" "
+rsh "$LOADGEN_ADDR" "
     set -euo pipefail
     mkdir -p ~/.kube && mv /tmp/kubeconfig ~/.kube/config
     # kubectl for the driver + fleet scripts.
@@ -75,16 +75,16 @@ rsh "$LOADGEN_PUBLIC_IP" "
     kubectl apply -f https://github.com/kubernetes-sigs/kwok/releases/download/v${KWOK_VERSION}/kwok.yaml
     kubectl apply -f https://github.com/kubernetes-sigs/kwok/releases/download/v${KWOK_VERSION}/stage-fast.yaml || true
 "
-rcp "$AWS_BENCH_ROOT/configs/k8s/kwok-stages.yaml" "$LOADGEN_PUBLIC_IP:/tmp/kwok-stages.yaml"
-rsh "$LOADGEN_PUBLIC_IP" "kubectl apply -f /tmp/kwok-stages.yaml"
+rcp "$AWS_BENCH_ROOT/configs/k8s/kwok-stages.yaml" "$LOADGEN_ADDR:/tmp/kwok-stages.yaml"
+rsh "$LOADGEN_ADDR" "kubectl apply -f /tmp/kwok-stages.yaml"
 
 log "wiring scheduler metrics scrape into Prometheus"
-TOKEN=$(rsh "$LOADGEN_PUBLIC_IP" "
+TOKEN=$(rsh "$LOADGEN_ADDR" "
     kubectl create serviceaccount bench-metrics -n kube-system --dry-run=client -o yaml | kubectl apply -f - >/dev/null
     kubectl create clusterrolebinding bench-metrics --clusterrole=system:monitoring --serviceaccount=kube-system:bench-metrics --dry-run=client -o yaml | kubectl apply -f - >/dev/null
     kubectl create token bench-metrics -n kube-system --duration 48h
 ")
-rsh "$LOADGEN_PUBLIC_IP" "
+rsh "$LOADGEN_ADDR" "
     cat >>/opt/bench/observability/prometheus.yml <<SCRAPE
 
   - job_name: kube-scheduler

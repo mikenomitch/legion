@@ -27,6 +27,17 @@ output "region" {
   value = var.region
 }
 
+# Instance types are part of every cell's fairness record, and the
+# loadgen box has no terraform state to read them from — they ride in the
+# rig manifest instead (scripts/env.sh: write_rig_manifest).
+output "control_plane_type" {
+  value = var.control_plane_type
+}
+
+output "loadgen_type" {
+  value = var.loadgen_type
+}
+
 output "ssh_config" {
   description = "Paste into ~/.ssh/config (or use scripts/env.sh helpers)."
   value       = <<-EOT

@@ -60,6 +60,10 @@ resource "aws_instance" "control_plane" {
 # Prometheus + Grafana + the workload driver. Never colocated with the
 # control plane so measurement and load generation don't steal the CPU
 # being measured.
+#
+# Takes the orchestrator instance profile rather than the shared one: it
+# is also the box that drives unattended campaigns
+# (scripts/remote-campaign.sh), so it alone may resize the sim fleet.
 resource "aws_instance" "loadgen" {
   ami                    = data.aws_ssm_parameter.ubuntu.value
   instance_type          = var.loadgen_type
@@ -67,7 +71,7 @@ resource "aws_instance" "loadgen" {
   private_ip             = local.loadgen_private_ip
   vpc_security_group_ids = [aws_security_group.bench.id]
   key_name               = aws_key_pair.bench.key_name
-  iam_instance_profile   = aws_iam_instance_profile.bench.name
+  iam_instance_profile   = aws_iam_instance_profile.orchestrator.name
 
   root_block_device {
     volume_type = "gp3"
@@ -94,8 +98,8 @@ resource "aws_instance" "loadgen" {
 # --- Simulated-worker fleet: spot ASG -----------------------------------
 # Fake nodes are the one place spot is safe: an interruption is just a
 # fleet blip the campaign already models as churn (the sim fleet
-# re-registers from the replacement instance). Scale steps are
-# `terraform apply -var worker_instances=N`.
+# re-registers from the replacement instance). Scale steps move desired
+# capacity through the ASG API — see the lifecycle block below.
 resource "aws_launch_template" "worker" {
   name_prefix   = "${var.project}-worker-"
   image_id      = data.aws_ssm_parameter.ubuntu.value
@@ -144,6 +148,15 @@ resource "aws_autoscaling_group" "workers" {
   min_size            = 0
   max_size            = 20 # 20k-node validation burst ceiling
   vpc_zone_identifier = [aws_subnet.bench.id]
+
+  # Scale steps move desired_capacity through the ASG API
+  # (scripts/env.sh: scale_workers), not through terraform: the loadgen
+  # box drives campaigns and has no state to apply from. var.worker_instances
+  # is therefore the *initial* size only, and terraform must not drag the
+  # fleet back to it on an unrelated apply mid-campaign.
+  lifecycle {
+    ignore_changes = [desired_capacity]
+  }
 
   mixed_instances_policy {
     instances_distribution {

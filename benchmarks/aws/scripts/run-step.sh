@@ -37,7 +37,7 @@ legion-b)
     # Streaming: the primary is whichever box holds the lease.
     MANAGER=""
     for ip in "${CP_PRIVATE_IPS[@]}"; do
-        if rsh "$LOADGEN_PUBLIC_IP" "curl -fsS -m 3 http://$ip:4749/readyz >/dev/null 2>&1"; then
+        if rsh "$LOADGEN_ADDR" "curl -fsS -m 3 http://$ip:4749/readyz >/dev/null 2>&1"; then
             MANAGER="http://$ip:4747"
             break
         fi
@@ -63,7 +63,7 @@ log "cell $RUN_ID (campaign $CAMPAIGN, manager ${MANAGER:-kubeconfig})"
 # a half-registered fleet is a wasted cluster-hour, the thing the
 # dry-run gate exists to prevent.
 if [ "$DRIVER_SYSTEM" = legion ]; then
-    registered=$(rsh "$LOADGEN_PUBLIC_IP" \
+    registered=$(rsh "$LOADGEN_ADDR" \
         "LEGION_ADDR=$MANAGER legion state query 'SELECT COUNT(*) AS n FROM node' -j" |
         jq -r '.data.rows[0].n // 0')
     [ "$registered" -ge "$NODES" ] || {
@@ -72,7 +72,7 @@ if [ "$DRIVER_SYSTEM" = legion ]; then
     }
 fi
 
-rsh "$LOADGEN_PUBLIC_IP" "
+rsh "$LOADGEN_ADDR" "
     set -euo pipefail
     mkdir -p '$REMOTE_OUT'
     python3 /opt/bench/workloads/translate.py \

@@ -19,7 +19,7 @@ BUCKET="$BUCKET" REGION="$REGION" render_tpl BUCKET REGION \
     <"$AWS_BENCH_ROOT/configs/legion/manager-b.jsonnet.tpl" >"$STAGE/manager.jsonnet"
 
 for idx in 0 1 2; do
-    ip="${CP_PUBLIC_IPS[$idx]}"
+    ip="${CP_ADDRS[$idx]}"
     log "installing legion (streaming) on cp-$idx ($ip)"
     rsh "$ip" "
         sudo aws s3 cp --region $REGION s3://$BUCKET/bin/legion /opt/legion/bin/legion &&
@@ -62,8 +62,8 @@ deadline=$(($(date +%s) + 300))
 PRIMARY=""
 while [ -z "$PRIMARY" ]; do
     for idx in 0 1 2; do
-        if curl -fsS -m 3 "http://${CP_PUBLIC_IPS[$idx]}:4749/readyz" >/dev/null 2>&1; then
-            PRIMARY="cp-$idx (${CP_PUBLIC_IPS[$idx]})"
+        if curl -fsS -m 3 "http://${CP_ADDRS[$idx]}:4749/readyz" >/dev/null 2>&1; then
+            PRIMARY="cp-$idx (${CP_ADDRS[$idx]})"
             break
         fi
     done

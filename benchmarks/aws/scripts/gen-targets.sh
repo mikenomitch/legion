@@ -39,6 +39,6 @@ trap 'rm -rf "$TARGETS"' EXIT
     echo ']'
 } >"$TARGETS/node-workers.json"
 
-rcp "$TARGETS/node-static.json" "$LOADGEN_PUBLIC_IP:/opt/bench/observability/targets/node-static.json"
-rcp "$TARGETS/node-workers.json" "$LOADGEN_PUBLIC_IP:/opt/bench/observability/targets/node-workers.json"
+rcp "$TARGETS/node-static.json" "$LOADGEN_ADDR:/opt/bench/observability/targets/node-static.json"
+rcp "$TARGETS/node-workers.json" "$LOADGEN_ADDR:/opt/bench/observability/targets/node-workers.json"
 log "prometheus node targets updated ($(wc -l <"$TARGETS/node-workers.json") lines of workers)"

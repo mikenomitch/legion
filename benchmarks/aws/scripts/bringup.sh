@@ -14,12 +14,12 @@ terraform -chdir="$TF_DIR" apply -auto-approve -input=false "$@"
 load_rig
 
 log "waiting for SSH on the control plane + loadgen"
-for ip in "${CP_PUBLIC_IPS[@]}" "$LOADGEN_PUBLIC_IP"; do
+for ip in "${CP_ADDRS[@]}" "$LOADGEN_ADDR"; do
     wait_for_ssh "$ip"
 done
 
 log "waiting for cloud-init (node_exporter) on every box"
-for ip in "${CP_PUBLIC_IPS[@]}" "$LOADGEN_PUBLIC_IP"; do
+for ip in "${CP_ADDRS[@]}" "$LOADGEN_ADDR"; do
     rsh "$ip" "cloud-init status --wait >/dev/null"
     wait_for_http "http://$ip:9100/metrics" 120 2>/dev/null ||
         rsh "$ip" "curl -fsS -m 3 http://localhost:9100/metrics >/dev/null"

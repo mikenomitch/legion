@@ -25,7 +25,7 @@ render_config() { # render_config <node-idx> <bootstrap> <join-token-line>
 }
 
 install_manager() { # install_manager <node-idx> <config-file>
-    local idx="$1" config="$2" ip="${CP_PUBLIC_IPS[$1]}"
+    local idx="$1" config="$2" ip="${CP_ADDRS[$1]}"
     log "installing legion manager on cp-$idx ($ip)"
     rsh "$ip" "
         sudo aws s3 cp --region $REGION s3://$BUCKET/bin/legion /opt/legion/bin/legion &&
@@ -68,11 +68,11 @@ trap 'rm -rf "$STAGE"' EXIT
 render_config 0 true "" >"$STAGE/cp-0.jsonnet"
 install_manager 0 "$STAGE/cp-0.jsonnet"
 log "waiting for cp-0 readyz"
-wait_for_http "http://${CP_PUBLIC_IPS[0]}:4749/readyz" 180
+wait_for_http "http://${CP_ADDRS[0]}:4749/readyz" 180
 
 # Join token minted on the bootstrap node enrolls the other two.
 log "minting raft join token on cp-0"
-RAFT_TOKEN=$(rsh "${CP_PUBLIC_IPS[0]}" "legion raft join-token" | grep -o 'lgnraft_[A-Za-z0-9_-]*' | head -1)
+RAFT_TOKEN=$(rsh "${CP_ADDRS[0]}" "legion raft join-token" | grep -o 'lgnraft_[A-Za-z0-9_-]*' | head -1)
 [ -n "$RAFT_TOKEN" ] || {
     echo "failed to mint a raft join token" >&2
     exit 1
@@ -85,8 +85,8 @@ done
 
 log "waiting for all managers ready (voters settled on every lane)"
 for idx in 0 1 2; do
-    wait_for_http "http://${CP_PUBLIC_IPS[$idx]}:4749/readyz" 300
+    wait_for_http "http://${CP_ADDRS[$idx]}:4749/readyz" 300
 done
-rsh "${CP_PUBLIC_IPS[0]}" "legion raft status" || true
+rsh "${CP_ADDRS[0]}" "legion raft status" || true
 
 log "Legion A is up. Next: start-sim-fleet.sh legion <nodes>, then run-step.sh"

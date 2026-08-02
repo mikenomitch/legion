@@ -41,7 +41,7 @@ snapshot() {
         printf '{"at":"%s"' "$stamp"
         printf ',"store_bytes":['
         local first=true
-        for ip in "${CP_PUBLIC_IPS[@]}"; do
+        for ip in "${CP_ADDRS[@]}"; do
             $first || printf ','
             first=false
             rsh "$ip" "sudo du -sb /var/lib/legion 2>/dev/null | cut -f1" | tr -d '\n' || printf 'null'
@@ -49,19 +49,19 @@ snapshot() {
         printf ']'
         printf ',"manager_rss_kb":['
         first=true
-        for ip in "${CP_PUBLIC_IPS[@]}"; do
+        for ip in "${CP_ADDRS[@]}"; do
             $first || printf ','
             first=false
             rsh "$ip" "ps -o rss= -C legion | head -1" | tr -d ' \n' || printf 'null'
         done
         printf ']'
         local counts
-        counts=$(rsh "$LOADGEN_PUBLIC_IP" "LEGION_ADDR=$MANAGER legion state query \
+        counts=$(rsh "$LOADGEN_ADDR" "LEGION_ADDR=$MANAGER legion state query \
             'SELECT (SELECT COUNT(*) FROM node) AS nodes, (SELECT COUNT(*) FROM allocation) AS allocations, (SELECT COUNT(*) FROM eval) AS evals' -j" |
             jq -c '.data.rows[0]' 2>/dev/null || echo '{}')
         printf ',"counts":%s' "$counts"
         local queue
-        queue=$(curl -fsS -m 5 "http://$LOADGEN_PUBLIC_IP:9090/api/v1/query" \
+        queue=$(curl -fsS -m 5 "http://$LOADGEN_ADDR:9090/api/v1/query" \
             --data-urlencode 'query=legion_eval_queue_depth' |
             jq -c '[.data.result[].value[1]]' 2>/dev/null || echo '[]')
         printf ',"eval_queue_depth":%s}\n' "$queue"
@@ -74,7 +74,7 @@ while [ "$(date +%s)" -lt "$END" ]; do
     log "soak cycle $CYCLE"
 
     # Re-submit the mixed workload (updates are the steady-state load).
-    rsh "$LOADGEN_PUBLIC_IP" "
+    rsh "$LOADGEN_ADDR" "
         set -euo pipefail
         mkdir -p /opt/bench/runs/$CAMPAIGN/$RUN_ID/cycle-$CYCLE
         python3 /opt/bench/workloads/translate.py \
@@ -90,8 +90,9 @@ while [ "$(date +%s)" -lt "$END" ]; do
     " || log "WARNING: cycle $CYCLE workload did not fully converge"
 
     # Churn: bounce one sim slice (nodes lost + re-registered).
-    read -r _ CHURN_PUBLIC _ < <(worker_instances | head -1)
-    [ -n "${CHURN_PUBLIC:-}" ] && rsh "$CHURN_PUBLIC" "sudo systemctl restart legion-sim" || true
+    read -r _ CHURN_PUBLIC CHURN_PRIVATE < <(worker_instances | head -1)
+    CHURN_ADDR=$(worker_addr "${CHURN_PUBLIC:-}" "${CHURN_PRIVATE:-}")
+    [ -n "$CHURN_ADDR" ] && rsh "$CHURN_ADDR" "sudo systemctl restart legion-sim" || true
 
     snapshot
     sleep "$CHURN_EVERY_SECS"
@@ -101,7 +102,7 @@ snapshot
 log "soak finished after $CYCLE cycles"
 
 # Full-window Prometheus export for the drift analysis.
-PROM="http://$LOADGEN_PUBLIC_IP:9090"
+PROM="http://$LOADGEN_ADDR:9090"
 for query in legion_eval_queue_depth legion_nodes legion_allocations; do
     curl -fsS "$PROM/api/v1/query_range" \
         --data-urlencode "query=$query" \

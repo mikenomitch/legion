@@ -11,7 +11,7 @@ load_rig
 "$(dirname "$0")/wipe-control-plane.sh"
 
 for idx in 0 1 2; do
-    ip="${CP_PUBLIC_IPS[$idx]}"
+    ip="${CP_ADDRS[$idx]}"
     log "installing nomad $NOMAD_VERSION on cp-$idx ($ip)"
     rsh "$ip" "
         set -euo pipefail
@@ -47,7 +47,7 @@ done
 
 log "waiting for a nomad leader"
 deadline=$(($(date +%s) + 300))
-until rsh "${CP_PUBLIC_IPS[0]}" "nomad operator api /v1/status/leader 2>/dev/null" | grep -q ':4647'; do
+until rsh "${CP_ADDRS[0]}" "nomad operator api /v1/status/leader 2>/dev/null" | grep -q ':4647'; do
     (($(date +%s) < deadline)) || {
         echo "no nomad leader in 300s" >&2
         exit 1
@@ -56,7 +56,7 @@ until rsh "${CP_PUBLIC_IPS[0]}" "nomad operator api /v1/status/leader 2>/dev/nul
 done
 
 log "building nomad-nodesim ($NOMAD_NODESIM_REF) on loadgen -> s3://$BUCKET/bin/"
-rsh "$LOADGEN_PUBLIC_IP" "
+rsh "$LOADGEN_ADDR" "
     set -euo pipefail
     command -v go >/dev/null 2>&1 || sudo DEBIAN_FRONTEND=noninteractive apt-get install -y golang-go
     rm -rf /tmp/nomad-nodesim

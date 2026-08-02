@@ -11,6 +11,12 @@ criterion (1k-node cloud smoke) awaits one. Phases 2-5 not started;
 the Nomad/K8s install scripts and driver adapters are written but
 marked TO-VERIFY until their phases run.
 
+Campaigns can be run unattended since 2026-08-02:
+`scripts/remote-campaign.sh` drives them from the loadgen box so a run
+does not depend on the operator's machine staying awake or holding one
+IP, and the spot fleet is released whenever a campaign exits. Also
+TO-VERIFY until phase 1 runs on a real account. See calls entries 11-13.
+
 > **Judgement calls:** [`../calls/aws-comparative-benchmark-plan_calls.md`](../calls/aws-comparative-benchmark-plan_calls.md)
 
 ## Problem

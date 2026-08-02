@@ -17,6 +17,11 @@
 #
 # Prerequisites (once per rig): bringup.sh, build-and-upload.sh, and the
 # system's install script (install-legion-a.sh / -b / nomad / k8s).
+#
+# On exit — however it exits — the spot fleet is released, so a campaign
+# that dies unattended stops costing money. Pass --keep-fleet to hold the
+# fleet up for a post-mortem. For overnight runs, launch this on the
+# loadgen box via scripts/remote-campaign.sh rather than from a laptop.
 set -euo pipefail
 source "$(dirname "$0")/env.sh"
 load_rig
@@ -26,7 +31,7 @@ SYSTEM="" STEPS="1000 2000 5000 10000" SCENARIOS="web_fleet batch_burst mixed_he
 # drill runs at the 10k step where a slice is 12.5% of the fleet — the
 # closest process-granular approximation of the plan's "kill 10%"; the
 # exact fraction lands in the fairness record.
-WARMUP=30 SMOKE=false STORM_STEP=10000 NODES_PER_INSTANCE=1250
+WARMUP=30 SMOKE=false STORM_STEP=10000 NODES_PER_INSTANCE=1250 KEEP_FLEET=false
 while [ $# -gt 0 ]; do
     case "$1" in
     --system)
@@ -50,6 +55,10 @@ while [ $# -gt 0 ]; do
         STEPS="1000" SCENARIOS="web_fleet" SMOKE=true
         shift
         ;;
+    --keep-fleet)
+        KEEP_FLEET=true
+        shift
+        ;;
     *)
         echo "unknown arg $1" >&2
         exit 1
@@ -57,6 +66,29 @@ while [ $# -gt 0 ]; do
     esac
 done
 : "${SYSTEM:?--system required (legion-a|legion-b|nomad|k8s)}"
+
+# Release the spot fleet no matter how we leave — success, failure, or a
+# killed session. An unattended campaign that dies at 03:00 otherwise
+# leaves up to 20 spot instances running until someone notices, and the
+# fleet is the expensive half of the rig. The control plane deliberately
+# stays up: it holds the state a post-mortem needs, and teardown.sh is
+# the one thing that should ever destroy it.
+release_fleet() {
+    local code=$?
+    if $KEEP_FLEET; then
+        log "leaving the spot fleet up (--keep-fleet)"
+        return $code
+    fi
+    log "releasing the spot fleet (exit $code)"
+    "$(dirname "$0")/stop-sim-fleet.sh" >/dev/null 2>&1 || true
+    scale_workers 0 >/dev/null 2>&1 || log "WARNING: could not scale the fleet to 0 — check the ASG"
+    return $code
+}
+trap release_fleet EXIT
+# Bash does not run an EXIT trap when it dies on an untrapped signal, and
+# `remote-campaign.sh stop` kills the tmux session with a SIGHUP. Turn
+# those into a normal exit so the release above still happens.
+trap 'exit 143' HUP INT TERM
 
 CAMPAIGN="$(date -u +%Y%m%d-%H%M)-$SYSTEM"
 SIM_SYSTEM=${SYSTEM%-a}
@@ -68,17 +100,9 @@ for NODES in $STEPS; do
     MULTIPLIER=$(python3 -c "print(max(0.25, $NODES/1000))")
 
     log "--- step ${NODES}n: scaling spot fleet to $INSTANCES instance(s) ---"
-    terraform -chdir="$TF_DIR" apply -auto-approve -input=false \
-        -var "worker_instances=$INSTANCES" >/dev/null
+    scale_workers "$INSTANCES"
     # Spot capacity can take a couple of minutes to arrive.
-    deadline=$(($(date +%s) + 600))
-    while [ "$(worker_instances | wc -l)" -lt "$INSTANCES" ]; do
-        (($(date +%s) < deadline)) || {
-            echo "spot fleet did not reach $INSTANCES instances" >&2
-            exit 1
-        }
-        sleep 15
-    done
+    wait_for_workers "$INSTANCES" 600
     "$(dirname "$0")/gen-targets.sh"
 
     "$(dirname "$0")/stop-sim-fleet.sh"

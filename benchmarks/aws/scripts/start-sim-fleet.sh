@@ -19,7 +19,7 @@ load_rig
 
 SYSTEM="${1:?usage: start-sim-fleet.sh <legion|nomad|k8s> <total-nodes> [scenario] [manager]}"
 TOTAL="${2:?total node count required}"
-SCENARIO="${3:-$REPO_ROOT/benchmarks/scheduler/scenarios/web_fleet.json}"
+SCENARIO="${3:-$SCENARIOS_DIR/web_fleet.json}"
 MANAGER="${4:-http://${CP_PRIVATE_IPS[0]}:4747}"
 
 # Worker telemetry port for Legion sim fleets. node_exporter owns 9100 on
@@ -31,7 +31,7 @@ SIM_TELEMETRY_PORT=9101
 
 mapfile -t WORKERS < <(worker_instances)
 [ "${#WORKERS[@]}" -gt 0 ] || {
-    echo "no InService worker instances — terraform apply -var worker_instances=N first" >&2
+    echo "no InService worker instances — scale the fleet first (run-campaign.sh does this per step)" >&2
     exit 1
 }
 COUNT=${#WORKERS[@]}
@@ -42,10 +42,10 @@ log "starting $SYSTEM sim fleet: $TOTAL nodes over $COUNT instances (~$BASE each
 case "$SYSTEM" in
 legion)
     log "minting a sim join token via loadgen"
-    TOKEN=$(rsh "$LOADGEN_PUBLIC_IP" \
+    TOKEN=$(rsh "$LOADGEN_ADDR" \
         "LEGION_ADDR=$MANAGER legion join-token create --type sim --ttl 24h -j" |
         jq -r '.data.token? // empty' | head -1)
-    [ -n "$TOKEN" ] || TOKEN=$(rsh "$LOADGEN_PUBLIC_IP" \
+    [ -n "$TOKEN" ] || TOKEN=$(rsh "$LOADGEN_ADDR" \
         "LEGION_ADDR=$MANAGER legion join-token create --type sim --ttl 24h" |
         grep -o 'lgnjoin_[A-Za-z0-9_-]*' | head -1)
     [ -n "$TOKEN" ] || {
@@ -56,13 +56,14 @@ legion)
     idx=0
     for line in "${WORKERS[@]}"; do
         read -r instance_id public private <<<"$line"
+        addr=$(worker_addr "$public" "$private")
         slice=$BASE
         [ "$idx" -lt "$EXTRA" ] && slice=$((slice + 1))
         [ "$slice" -gt 0 ] || continue
         log "  $instance_id ($private): $slice nodes"
-        wait_for_ssh "$public" 120
-        rcp "$SCENARIO" "$public:/tmp/profiles.json"
-        rsh "$public" "
+        wait_for_ssh "$addr" 120
+        rcp "$SCENARIO" "$addr:/tmp/profiles.json"
+        rsh "$addr" "
             sudo aws s3 cp --region $REGION s3://$BUCKET/bin/legion /opt/legion/bin/legion &&
             sudo chmod +x /opt/legion/bin/legion &&
             sudo mv /tmp/profiles.json /opt/legion/configs/profiles.json &&
@@ -112,14 +113,14 @@ UNIT
         echo
         echo ']'
     } >"$SIM_TARGETS"
-    rcp "$SIM_TARGETS" "$LOADGEN_PUBLIC_IP:/opt/bench/observability/targets/sim-workers.json"
+    rcp "$SIM_TARGETS" "$LOADGEN_ADDR:/opt/bench/observability/targets/sim-workers.json"
     rm -f "$SIM_TARGETS"
     log "published ${#WORKERS[@]} sim-worker scrape targets on :$SIM_TELEMETRY_PORT"
 
     log "waiting for $TOTAL registered nodes"
     deadline=$(($(date +%s) + 600))
     while :; do
-        registered=$(rsh "$LOADGEN_PUBLIC_IP" \
+        registered=$(rsh "$LOADGEN_ADDR" \
             "LEGION_ADDR=$MANAGER legion state query 'SELECT COUNT(*) AS n FROM node' -j" |
             jq -r '.data.rows[0].n // 0' 2>/dev/null || echo 0)
         log "  registered: $registered/$TOTAL"
@@ -136,12 +137,13 @@ nomad)
     idx=0
     for line in "${WORKERS[@]}"; do
         read -r instance_id public private <<<"$line"
+        addr=$(worker_addr "$public" "$private")
         slice=$BASE
         [ "$idx" -lt "$EXTRA" ] && slice=$((slice + 1))
         [ "$slice" -gt 0 ] || continue
         log "  $instance_id ($private): $slice nodesim nodes"
-        wait_for_ssh "$public" 120
-        rsh "$public" "
+        wait_for_ssh "$addr" 120
+        rsh "$addr" "
             sudo aws s3 cp --region $REGION s3://$BUCKET/bin/nomad-nodesim /opt/legion/bin/nomad-nodesim &&
             sudo chmod +x /opt/legion/bin/nomad-nodesim &&
             sudo mkdir -p /var/lib/nodesim &&
@@ -170,10 +172,10 @@ k8s)
     # KWOK nodes are API objects — created once, from the loadgen box,
     # shaped by the shared profile split. max pods per fake node is
     # generous: bin-packing pressure comes from cpu/memory requests.
-    rcp "$SCENARIO" "$LOADGEN_PUBLIC_IP:/tmp/profiles.json"
-    rcp "$AWS_BENCH_ROOT/workloads/profile_split.py" "$LOADGEN_PUBLIC_IP:/tmp/profile_split.py"
-    rcp "$AWS_BENCH_ROOT/configs/k8s/kwok-node.yaml.tpl" "$LOADGEN_PUBLIC_IP:/tmp/kwok-node.yaml.tpl"
-    rsh "$LOADGEN_PUBLIC_IP" "
+    rcp "$SCENARIO" "$LOADGEN_ADDR:/tmp/profiles.json"
+    rcp "$AWS_BENCH_ROOT/workloads/profile_split.py" "$LOADGEN_ADDR:/tmp/profile_split.py"
+    rcp "$AWS_BENCH_ROOT/configs/k8s/kwok-node.yaml.tpl" "$LOADGEN_ADDR:/tmp/kwok-node.yaml.tpl"
+    rsh "$LOADGEN_ADDR" "
         set -euo pipefail
         python3 /tmp/profile_split.py --profiles /tmp/profiles.json --total $TOTAL |
         while read -r name cpus memory count attrs; do
