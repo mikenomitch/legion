@@ -673,16 +673,6 @@ docs: [observability.md](../docs/observability.md), [logging.md](../docs/logging
 - [ ] Worker per-task runtime metrics (CPU/memory usage per allocation) —
       also wanted by autoscaler phase 2, which collects usage via
       heartbeats; build together.
-- [ ] Feed simulated fleets into the `legion_worker_*` families. Found
-      merging the worker-telemetry and `--simulate N` branches (2026-07-30):
-      [simulate.rs](../src/worker/simulate.rs) runs its own heartbeat loop
-      with private `heartbeats_ok`/`heartbeats_failed` atomics and never
-      starts the worker telemetry listener, so a simulated host exposes no
-      metrics — exactly the fleets the AWS campaign scrapes. Either have the
-      fleet loop update the shared registry (one process, N nodes: prefer
-      counters and a fleet-size gauge over per-node series) or give the
-      harness its own `/metrics`. Noted in
-      [docs/metrics.md](../docs/metrics.md) § Worker.
 - [x] Refresh [docs/observability.md](../docs/observability.md) — corrected; it
       had claimed OTLP export did not exist while [src/otel.rs](../src/otel.rs)
       ships it ([#137](https://github.com/mikenomitch/legion/pull/137))
@@ -1165,6 +1155,25 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
 - [x] OTLP trace export for Legion's own spans ([src/otel.rs](../src/otel.rs))
 - [x] Event stream: scheduler events as history and live tail (`ListEvents`,
       `StreamEvents`, CLI, UI)
+- [x] Simulated fleets feed the `legion_worker_*` families (2026-08-02) —
+      the sim fleet starts the shared worker telemetry listener (via
+      `daemon::start_worker_telemetry`, so the real and simulated paths
+      cannot drift on how telemetry is turned on) and reports into the
+      process-global worker registry: the existing heartbeat/allocation
+      families aggregated over the fleet, plus
+      `legion_worker_simulated_nodes`, `..._nodes_target`, and
+      `legion_worker_simulated_registrations_total{outcome}`. Per-node
+      series deliberately omitted — cardinality at the ~1,250 nodes/host
+      the AWS campaign packs, and the manager already holds the per-node
+      view. The AWS rig consumes them: `start-sim-fleet.sh` sets
+      `LEGION_WORKER_TELEMETRY_PORT=9101` and publishes file_sd targets
+      (retracted by `stop-sim-fleet.sh`), Prometheus grows a
+      `legion-sim-workers` job, and the campaign board grows a sim-fleet
+      row. Like the rest of the rig that plumbing is unexercised until a
+      real campaign runs. [docs/metrics.md](../docs/metrics.md) § Worker,
+      [docs/worker-simulation.md](../docs/worker-simulation.md) § Metrics,
+      [plan](plans/worker-simulation-plan.md),
+      [calls](calls/worker-simulation-plan_calls.md).
 
 ## Job types & dependencies
 

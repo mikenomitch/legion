@@ -251,13 +251,46 @@ that has never taken a provisional start:
   This is how started-but-unconfirmed capacity becomes visible instead of
   invisible; a value that does not return to zero means claims are leaking.
 
-**Simulated fleets are not covered.** `legion start worker --simulate N`
-([worker-simulation](../internal_docs/plans/worker-simulation-plan.md))
-runs its own heartbeat loop for the whole fleet and does not start this
-listener or feed these families — its per-fleet counters are reported by
-the simulation harness instead. Scraping a simulated worker host yields
-nothing; use the manager's `legion_heartbeats_total` for the fleet-wide
-view until the two are wired together.
+#### Simulated fleets
+
+`legion start worker --simulate N`
+([worker-simulation.md](worker-simulation.md)) is a worker process that
+happens to carry N nodes, so it exports this same registry from this same
+opt-in listener — set `LEGION_WORKER_TELEMETRY_PORT` on the sim host and
+scrape it like any other worker.
+
+Everything above is **per-process**: on a sim host the families aggregate
+over every node in the fleet. `legion_worker_heartbeats_total` counts the
+fleet's heartbeats, not one node's, and `legion_worker_allocations_running`
+sums what every node reported on its last heartbeat (a simulated node acks
+allocations rather than running them). Three families describe the fleet
+itself, and stay at zero in a real worker:
+
+- **`legion_worker_simulated_nodes`** (gauge) — simulated nodes in this
+  process that have completed registration.
+- **`legion_worker_simulated_nodes_target`** (gauge) — the fleet size the
+  process was asked for. A persistent gap below it is a stalled ramp:
+  compare against the registration counter to tell "still ramping" from
+  "erroring".
+- **`legion_worker_simulated_registrations_total{outcome}`** (counter) —
+  registration attempts, `ok` or `error`. Re-registrations (after an
+  `unauthenticated` heartbeat) count too, so over a long run it outruns
+  the node count.
+
+**Per-node series are deliberately not exported.** At the ~1,250 nodes per
+host a scale campaign packs, per-node labels are a cardinality bomb, and
+the manager already holds the authoritative per-node view. If you need to
+know about one simulated node, ask the manager, not the sim host.
+
+Two limitations worth knowing when reading a campaign:
+
+- The fleet-wide allocation gauge is maintained by per-node deltas and
+  repaired from the authoritative per-node state every 30s, so a scrape can
+  briefly disagree with the manager by a few allocations under heavy churn.
+  Counters and the histogram are exact.
+- Aborting a fleet (or killing sim nodes for a storm scenario) stops the
+  process; it does not walk the gauges back down first. Read a torn-down
+  fleet's last sample as "state at teardown", not as a live value.
 
 ## OTLP metrics push
 

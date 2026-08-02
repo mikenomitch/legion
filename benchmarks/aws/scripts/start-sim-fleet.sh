@@ -22,6 +22,13 @@ TOTAL="${2:?total node count required}"
 SCENARIO="${3:-$REPO_ROOT/benchmarks/scheduler/scenarios/web_fleet.json}"
 MANAGER="${4:-http://${CP_PRIVATE_IPS[0]}:4747}"
 
+# Worker telemetry port for Legion sim fleets. node_exporter owns 9100 on
+# these boxes; the sim process exports the `legion_worker_*` registry here
+# (docs/metrics.md § Worker), and the legion branch below publishes the
+# matching Prometheus file_sd targets. Intra-rig traffic is unrestricted
+# (terraform/security.tf), so no security-group change is needed.
+SIM_TELEMETRY_PORT=9101
+
 mapfile -t WORKERS < <(worker_instances)
 [ "${#WORKERS[@]}" -gt 0 ] || {
     echo "no InService worker instances — terraform apply -var worker_instances=N first" >&2
@@ -74,6 +81,7 @@ ExecStart=/opt/legion/bin/legion start worker $TOKEN \\
 Restart=on-failure
 LimitNOFILE=1048576
 Environment=RUST_LOG=info
+Environment=LEGION_WORKER_TELEMETRY_PORT=$SIM_TELEMETRY_PORT
 
 [Install]
 WantedBy=multi-user.target
@@ -83,6 +91,30 @@ UNIT
         "
         idx=$((idx + 1))
     done
+
+    # Publish the sim hosts as Prometheus targets. Written here rather
+    # than in gen-targets.sh so the targets exist exactly while a Legion
+    # sim fleet does: the Nomad and K8s campaigns reuse these same
+    # instances and would otherwise leave a file of dead scrape targets
+    # behind in their fairness records.
+    SIM_TARGETS=$(mktemp)
+    {
+        echo '['
+        first=true
+        for line in "${WORKERS[@]}"; do
+            read -r instance_id _public private <<<"$line"
+            [ -n "$instance_id" ] || continue
+            $first || echo ','
+            first=false
+            printf '  {"targets":["%s:%s"],"labels":{"role":"sim-worker","instance_name":"%s"}}' \
+                "$private" "$SIM_TELEMETRY_PORT" "$instance_id"
+        done
+        echo
+        echo ']'
+    } >"$SIM_TARGETS"
+    rcp "$SIM_TARGETS" "$LOADGEN_PUBLIC_IP:/opt/bench/observability/targets/sim-workers.json"
+    rm -f "$SIM_TARGETS"
+    log "published ${#WORKERS[@]} sim-worker scrape targets on :$SIM_TELEMETRY_PORT"
 
     log "waiting for $TOTAL registered nodes"
     deadline=$(($(date +%s) + 600))

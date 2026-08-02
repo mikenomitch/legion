@@ -81,7 +81,47 @@ per-placement cost that every production cluster pays. Reversed from
 the plan's first draft precisely because the code reads that way, not
 how the draft assumed.
 
-## 4. N is distributed over profiles proportionally, not taken from profile counts
+## 4. A sim fleet reports as one worker in the shared registry, with no per-node series
+
+**Call.** A `--simulate N` process starts the same opt-in worker
+telemetry listener a real worker does (extracted as
+`daemon::start_worker_telemetry`, called from both paths) and reports
+into the same process-global `legion_worker_*` registry. The existing
+heartbeat and allocation families become fleet-wide aggregates; three new
+ones — `legion_worker_simulated_nodes`, `..._nodes_target`,
+`..._registrations_total{outcome}` — describe the fleet. No metric is
+labelled by node.
+
+```bash
+LEGION_WORKER_TELEMETRY_PORT=9101 legion start worker "$TOKEN" --simulate 1250
+curl -s localhost:9101/metrics | grep legion_worker_
+```
+
+**Alternatives.** (a) Give the simulator its own `/metrics` endpoint and
+its own `legion_sim_*` families — the TODO offered this explicitly.
+(b) Export per-node series (`legion_worker_heartbeats_total{node="..."}`)
+so a fleet is inspectable node by node.
+
+**Trade-off.** Against (a): the shared families now mean "per process,
+which may be N nodes", so their help text and docs must carry that
+caveat, and a dashboard mixing real and simulated hosts must not sum
+them naively. Against (b): you cannot ask a sim host about one specific
+node — you have to ask the manager.
+
+**Why (simplicity/ease).** A campaign should scrape one set of families
+and get one answer whichever kind of host produced it; `benchmarks/aws/`
+already provisions Prometheus jobs and Grafana boards against
+`legion_worker_*`, and a parallel `legion_sim_*` namespace would fork
+every panel and every recording rule. Sharing the listener also means the
+real and simulated paths cannot drift on *how* telemetry is switched on
+— the thing that broke here in the first place, when `--simulate` and the
+worker-telemetry work merged past each other and left the campaign's own
+hosts exporting nothing. Per-node series were never on: at the ~1,250
+nodes per host the rig packs, four families × 1,250 is a cardinality bomb
+aimed at the box measuring the experiment, and the manager already holds
+the authoritative per-node view.
+
+## 5. N is distributed over profiles proportionally, not taken from profile counts
 
 **Call.** `--profiles` supplies *weights* (the schema's `count` fields);
 `--simulate N` supplies the total, split largest-remainder. The same
@@ -99,7 +139,7 @@ means recording N alongside the file (the campaign archive does).
 per-step files are four copies that drift. Literal counts remain
 available trivially (set N to the file's total).
 
-## 5. Restart-safety comes from deterministic names, not persisted state
+## 6. Restart-safety comes from deterministic names, not persisted state
 
 **Call.** Sim nodes have no state directory; `<prefix>-<profile>-<idx>`
 naming makes a restarted process re-register the same node ids
@@ -117,3 +157,32 @@ does on purpose.
 **Why (simplicity).** Simulation state that survives its process is
 state nobody asked for; the failure mode ("restart = fleet blip") is the
 same event the benchmark already models as churn.
+
+## 7. The fleet's allocation gauge is delta-maintained and repaired on a cadence, not recomputed per heartbeat
+
+**Call.** `legion_worker_allocations_running` on a sim host is kept
+current by folding in only the *change* against what each node last
+reported (O(1) per heartbeat), with a re-derivation from the
+authoritative per-node state every 30s on the existing summary cadence.
+The repair sums what nodes last reported rather than what they currently
+hold — the same quantity the deltas maintain — so it cannot itself
+desync the total it exists to fix.
+
+**Alternatives.** (a) Recompute the fleet total on every heartbeat
+(`SimFleet::acked_total`, already there for the status line).
+(b) Delta-only, with no periodic repair.
+
+**Trade-off.** A scrape can disagree with the manager by a few
+allocations under heavy churn, and the drift window is one summary
+interval. Documented as a limitation in both public pages rather than
+left for a reader to discover from a graph that does not quite add up.
+
+**Why (performance).** (a) walks every node and takes every node's
+allocation lock: at 1,250 nodes heartbeating on a 10s cadence that is
+~156k lock acquisitions per second, spent by the process whose spare
+capacity is the thing making the measurement trustworthy — the
+instrumentation would become the load. (b) is cheap but lets the racy
+read-modify-write on a gauge accumulate error over a 24h soak, which is
+exactly the run where a slowly-wrong number is most expensive to
+discover. Counters and the histogram take neither compromise: they are
+exact.

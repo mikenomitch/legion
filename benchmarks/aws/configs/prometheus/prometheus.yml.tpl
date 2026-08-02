@@ -23,6 +23,17 @@ scrape_configs:
       - files: ["/etc/prometheus/targets/node-*.json"]
         refresh_interval: 15s
 
+  # Legion sim fleets: the `legion_worker_*` registry on :9101, so the
+  # campaign can prove the simulated workers were not the bottleneck
+  # (docs/metrics.md § Worker). Per-process, not per-node — one series
+  # per sim host covering the ~1,250 nodes it carries. Targets are
+  # published by start-sim-fleet.sh and retracted by stop-sim-fleet.sh,
+  # so this job is empty during the Nomad and K8s campaigns.
+  - job_name: legion-sim-workers
+    file_sd_configs:
+      - files: ["/etc/prometheus/targets/sim-*.json"]
+        refresh_interval: 15s
+
   # Nomad campaign: servers publish Prometheus-format telemetry on the
   # HTTP API port (configs/nomad/server.hcl.tpl enables it).
   - job_name: nomad-servers

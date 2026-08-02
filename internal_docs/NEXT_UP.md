@@ -31,10 +31,11 @@ the remaining gate is an AWS account, not code. Jobs also gained a real
 
 ## The follow-up queue (in priority order)
 
-1. **Feed simulated fleets into the `legion_worker_*` families** — surfaced
-   by the merge: the fleet loop keeps private heartbeat counters and starts
-   no telemetry listener, so the very hosts the campaign scrapes expose no
-   worker metrics (TODO.md § Observability).
+1. ~~Feed simulated fleets into the `legion_worker_*` families~~ — **done**
+   (2026-08-02): sim fleets start the shared worker telemetry listener and
+   report into the process-global registry, and the AWS rig scrapes them
+   (`LEGION_WORKER_TELEMETRY_PORT=9101`, a `legion-sim-workers` Prometheus
+   job, a sim-fleet dashboard row). See TODO.md § Done → Observability.
 2. Late-binding plan apply
    ([plan](plans/late-binding-plan-apply-plan.md)) — skipped in this batch
    by explicit decision; the contention benchmark (its phase 0) is the

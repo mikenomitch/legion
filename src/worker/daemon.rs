@@ -305,32 +305,7 @@ async fn run_worker_with_manager(
     register_self(client.clone(), &registration, &credentials).await?;
     info!(worker_name = %name, "Worker registered with manager");
 
-    // Worker telemetry: opt-in Prometheus listener (/metrics + /healthz,
-    // `legion_worker_*` families) so a fleet can prove its workers are not
-    // the bottleneck. Env-var rather than config: workers joined with a bare
-    // token have no config file, and packed multi-worker hosts need
-    // per-process ports anyway (port 0 = ephemeral, logged on bind). See
-    // docs/metrics.md.
-    if let Ok(port) = std::env::var("LEGION_WORKER_TELEMETRY_PORT") {
-        match port.trim().parse::<u16>() {
-            Ok(port) => {
-                let telemetry_addr: std::net::SocketAddr = ([0, 0, 0, 0], port).into();
-                tokio::spawn(async move {
-                    if let Err(err) =
-                        crate::manager::telemetry::serve_worker_telemetry(telemetry_addr).await
-                    {
-                        error!(error = ?err, "worker telemetry listener exited");
-                    }
-                });
-            }
-            Err(_) => warn!(
-                value = %port,
-                "Ignoring LEGION_WORKER_TELEMETRY_PORT: not a valid port number"
-            ),
-        }
-    }
-    // OTLP metrics push (opt-in via the OTEL_* env vars; no-op otherwise).
-    crate::otel::start_metrics_push();
+    start_worker_telemetry();
 
     // Registration just succeeded, so "now" is an honest last-contact time;
     // every successful heartbeat refreshes it. The self-fence watchdog kills
@@ -565,6 +540,41 @@ async fn create_manager_client(
 // promptly — the self-fence clock keeps running regardless.
 const HEARTBEAT_RETRY_MIN: Duration = Duration::from_millis(500);
 const HEARTBEAT_RETRY_MAX: Duration = Duration::from_secs(10);
+
+/// Start the worker process's telemetry exporters: the opt-in Prometheus
+/// listener (`/metrics` + `/healthz`, the `legion_worker_*` families) so a
+/// fleet can prove its workers are not the bottleneck, plus the OTLP
+/// metrics push (opt-in via the `OTEL_*` env vars; a no-op otherwise).
+///
+/// The listener is an env var rather than a config field deliberately:
+/// workers joined with a bare token have no config file, and packed
+/// multi-worker hosts need per-process ports anyway (port 0 = ephemeral,
+/// logged on bind). See docs/metrics.md.
+///
+/// Shared with the simulated-fleet mode (`worker::simulate`) — a sim host
+/// is exactly the host a scale campaign scrapes, so the two paths must not
+/// drift on how telemetry gets turned on.
+pub(crate) fn start_worker_telemetry() {
+    if let Ok(port) = std::env::var("LEGION_WORKER_TELEMETRY_PORT") {
+        match port.trim().parse::<u16>() {
+            Ok(port) => {
+                let telemetry_addr: std::net::SocketAddr = ([0, 0, 0, 0], port).into();
+                tokio::spawn(async move {
+                    if let Err(err) =
+                        crate::manager::telemetry::serve_worker_telemetry(telemetry_addr).await
+                    {
+                        error!(error = ?err, "worker telemetry listener exited");
+                    }
+                });
+            }
+            Err(_) => warn!(
+                value = %port,
+                "Ignoring LEGION_WORKER_TELEMETRY_PORT: not a valid port number"
+            ),
+        }
+    }
+    crate::otel::start_metrics_push();
+}
 
 /// Heartbeat cadence: worker-type config (`heartbeatSeconds`, clamped to
 /// 1..=30) or the built-in default. The manager's lost window stays 10s,

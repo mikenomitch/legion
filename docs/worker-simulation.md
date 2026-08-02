@@ -102,6 +102,33 @@ constraint (for example `constraints: { simulated: { operator: "is_not_set" } }`
   cumulative failures, and acked allocations — scripts can watch this
   to confirm a fleet is healthy.
 
+## Metrics
+
+A sim host exports the ordinary worker registry, from the ordinary
+opt-in listener — set `LEGION_WORKER_TELEMETRY_PORT` and scrape
+`/metrics` as you would on any worker
+([metrics.md § Worker](metrics.md#worker)). The listener starts before
+the registration ramp, so a scrape during ramp-up shows the climb.
+
+```bash
+LEGION_WORKER_TELEMETRY_PORT=9101 legion start worker "$TOKEN" --simulate 1250
+curl -s localhost:9101/metrics | grep legion_worker_
+```
+
+The familiar families (`legion_worker_heartbeats_total`,
+`legion_worker_heartbeat_duration_seconds`,
+`legion_worker_allocations_running`) aggregate over the whole fleet —
+this is a worker process carrying N nodes, so its metrics are
+per-process, not per-node. Three more describe the fleet:
+`legion_worker_simulated_nodes`, `..._nodes_target`, and
+`legion_worker_simulated_registrations_total{outcome}`. Registered
+nodes short of target with a flat `error` counter means the ramp is
+still climbing; short of target with a rising one means it is stuck.
+
+Per-node series are deliberately not exported (cardinality, and the
+manager already has that view), and OTLP push works here exactly as it
+does for a real worker.
+
 ## Limitations
 
 - `legion exec`, log streaming (`legion job logs`), and worker restart
@@ -113,6 +140,11 @@ constraint (for example `constraints: { simulated: { operator: "is_not_set" } }`
   not converge there. Use plain (checkless) noop tasks for load.
 - Failure reports, workload identity, service-discovery upstreams, and
   artifact staging are not simulated.
+- The fleet-wide allocation gauge is maintained incrementally and
+  repaired from authoritative state every 30s, so under heavy churn a
+  scrape can disagree with the manager by a few allocations; aborting a
+  fleet leaves the gauges at their teardown values rather than zero.
+  Counters and the heartbeat histogram are exact.
 - All nodes in one process share one advertised dispatch address; the
   manager's per-node connection cost is therefore understated at very
   large N (real fleets dial N addresses). Recorded in the benchmark
