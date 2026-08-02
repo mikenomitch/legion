@@ -12,7 +12,11 @@ built and locally validated (`scripts/local-smoke.sh`, driver fixture
 tests, `terraform validate`); the Nomad/K8s install paths are complete
 but marked TO-VERIFY until their campaign phases run on real instances.
 The unattended path ("Unattended runs" below) is in the same state:
-written and syntax/unit-checked, unexercised against real AWS.
+written and syntax/unit-checked, unexercised against real AWS. So is
+`bootstrap-operator-box.sh` — its AWS calls and phase chain have been
+run end-to-end against stubbed `aws`/`ssh` binaries and nothing more.
+Treat the first `launch` as a test of the bootstrap as much as of the
+rig.
 
 ## Layout
 
@@ -22,13 +26,64 @@ written and syntax/unit-checked, unexercised against real AWS.
 | `configs/` | Rendered-per-campaign config templates: Legion A (raft lanes), Legion B (streaming + S3 lease), Nomad servers, kubeadm + KWOK, Prometheus + Grafana stack. |
 | `workloads/` | `translate.py`: scenario JSON → Legion jobspecs / Nomad jobs / K8s Deployments, plus the driver's expectation manifest. `profile_split.py`: the shared fleet-shape split. |
 | `driver/` | `driver.py`: submits, watches placements, computes throughput/latency/recovery. `tests/`: the fixture suite that keeps the counting math honest. |
-| `scripts/` | The runbook, as executables (below). |
+| `scripts/` | The runbook, as executables (below). `bootstrap-operator-box.sh` builds the box you drive from; `phase1.sh` is the whole of phase 1, checkpointed. |
 | `experiments/` | Piggyback drills: storm, failover, streaming RPO, 24h soak, upgrade-under-load. See `experiments/README.md`. |
 | `dashboards/` | Grafana boards provisioned onto the loadgen box. |
 | `analysis/` | `fit_curves.py`: scaling fits + 20k/50k projections with prediction intervals and validation deltas. |
 | `results/` | Campaign archives land here (gitignored) and in `s3://<bucket>/campaigns/`. |
 
+## Start here: one command
+
+You need an AWS key and nothing else. This builds the box that drives the
+campaign, configures the rig against it, and runs phase 1 remotely:
+
+```bash
+benchmarks/aws/scripts/bootstrap-operator-box.sh launch \
+    --access-key-id AKIA... --secret-access-key ...     # or --profile <name>
+
+benchmarks/aws/scripts/bootstrap-operator-box.sh logs -f
+```
+
+The credentials build the box and are never copied onto it — it carries
+an IAM instance role instead. What it runs, checkpointed so a failure
+resumes rather than restarts, is `scripts/phase1.sh`: the six steps of
+the manual runbook below, ending at phase 1's exit criterion.
+
+**Why a separate box rather than your laptop.** `build-and-upload.sh`
+compiles the dist binary and plugin dylibs *for the rig's Linux x86_64
+instances*, so an arm64 macOS machine cannot produce the artifact at all.
+And `admin_cidr` pins every rig ingress rule to one CIDR: the operator
+box gets an Elastic IP, so that CIDR stays true for the whole campaign
+where a laptop's egress IP would not. Terraform state lives on the box
+too, which is why it must outlive `teardown.sh` — it is deliberately not
+managed by the rig's terraform.
+
+**Stop the box between sessions.** Idle it is ~$0.37/hr running and
+~$0.016/hr stopped (~$268/mo vs ~$12/mo), and unlike the spot fleet —
+which `run-campaign.sh` releases on any exit — nothing releases this one
+for you. It holds an Elastic IP rather than an auto-assigned address, so
+the IP, and therefore `admin_cidr`, survives the stop:
+
+```bash
+scripts/bootstrap-operator-box.sh stop
+scripts/bootstrap-operator-box.sh start
+```
+
+Two teardowns, in this order:
+
+```bash
+scripts/bootstrap-operator-box.sh ssh 'cd ~/legion/benchmarks/aws && scripts/teardown.sh'
+scripts/bootstrap-operator-box.sh destroy
+```
+
+`destroy` warns if rig instances are still up, because the box holds the
+only copy of their terraform state.
+
 ## The runbook
+
+What `phase1.sh` automates, if you would rather drive it yourself. Run
+these **on the operator box** (`bootstrap-operator-box.sh ssh`), in
+`~/legion/benchmarks/aws`:
 
 ```bash
 cd benchmarks/aws
