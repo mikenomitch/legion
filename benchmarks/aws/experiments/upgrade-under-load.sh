@@ -38,7 +38,7 @@ REMOTE_OUT="/opt/bench/runs/$CAMPAIGN/$RUN_ID"
 # leader last).
 UPGRADE_CMD=""
 for idx in 2 1 0; do
-    UPGRADE_CMD+="ssh -o StrictHostKeyChecking=accept-new ubuntu@${CP_PRIVATE_IPS[$idx]} '
+    UPGRADE_CMD+="$RSH_FROM_LOADGEN ubuntu@${CP_PRIVATE_IPS[$idx]} '
         sudo aws s3 cp --region $REGION $NEW_BINARY /opt/legion/bin/legion.new &&
         sudo chmod +x /opt/legion/bin/legion.new &&
         sudo mv /opt/legion/bin/legion.new /opt/legion/bin/legion &&
@@ -46,7 +46,7 @@ for idx in 2 1 0; do
     UPGRADE_CMD+="until curl -fsS -m 3 http://${CP_PRIVATE_IPS[$idx]}:4749/healthz >/dev/null 2>&1; do sleep 2; done; "
 done
 
-rsh "$LOADGEN_PUBLIC_IP" "
+rsh "$LOADGEN_ADDR" "
     set -euo pipefail
     mkdir -p '$REMOTE_OUT'
     # Trickle load so gaps are observable (same shape as the failover drill).

@@ -83,11 +83,15 @@ variable "loadgen_disk_gb" {
 
 variable "worker_instances" {
   description = <<-EOT
-    Spot instances hosting simulated nodes. At ~1,250 sim nodes per
-    instance: 1k step -> 1, 2k -> 2, 5k -> 4, 10k -> 8, and the one-off
-    20k validation burst -> 16. Scale between steps with
-    `terraform apply -var worker_instances=N` — the ASG replaces nothing
-    on the way down/up, so the control plane is untouched.
+    INITIAL count of spot instances hosting simulated nodes. At ~1,250
+    sim nodes per instance: 1k step -> 1, 2k -> 2, 5k -> 4, 10k -> 8, and
+    the one-off 20k validation burst -> 16.
+
+    Campaigns scale between steps through the ASG API rather than
+    terraform (scripts/env.sh: scale_workers), so the ASG ignores drift
+    on desired_capacity and changing this variable after bringup does
+    nothing to a running fleet. The ASG replaces nothing on the way
+    up/down either way, so the control plane is untouched.
   EOT
   type        = number
   default     = 1

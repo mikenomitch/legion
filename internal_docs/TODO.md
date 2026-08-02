@@ -236,8 +236,22 @@ How to use it:
         projection fitting (`analysis/fit_curves.py`), CI gate
         (fixture tests + terraform validate), and the local no-AWS smoke
         (`scripts/local-smoke.sh`).
+  - [x] Unattended campaigns (2026-08-02): `scripts/remote-campaign.sh`
+        drives a campaign from the loadgen box under tmux, so a run
+        survives a sleeping laptop, a dropped session, and a changing
+        egress IP (`admin_cidr` pins ingress to one CIDR). Scripts pick
+        public vs private addresses from `BENCH_ON_RIG`; topology comes
+        from a rig manifest instead of terraform state; scale steps use
+        the ASG API under a narrow `orchestrator` IAM role; the spot
+        fleet is released on any campaign exit (`--keep-fleet` opts
+        out). See the README's "Unattended runs" and calls entries
+        11-13.
   - [ ] Phase 1 exit on real AWS: `bringup.sh` + 1k-node
         `run-campaign.sh --system legion-a --smoke` (needs an account).
+        Unverified against real AWS, and first in line to shake out:
+        the `orchestrator` role's `SetDesiredCapacity` path, the
+        loadgen box's private-IP reachability to CP + spot workers, and
+        the tmux launch path in `remote-campaign.sh`.
   - [ ] Phases 2-5: Legion A/B campaigns, Nomad (verify nodesim `mock`
         driver + install script), K8s (verify kubeadm/KWOK install +
         watch parsing), 20k validation burst, analysis + REPORT.md.

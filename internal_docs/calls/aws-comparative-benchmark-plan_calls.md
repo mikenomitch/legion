@@ -3,8 +3,9 @@
 Plan: [`../plans/aws-comparative-benchmark-plan.md`](../plans/aws-comparative-benchmark-plan.md)
 
 Entries 1-4 are planning-stage calls; 5-10 were made while building the
-rig (phases 0-1, 2026-07-30). Ranked by project impact; the number is
-the rank.
+rig (phases 0-1, 2026-07-30); 11-13 came from making campaigns runnable
+unattended (2026-08-02). Ranked by project impact; the number is the
+rank.
 
 ## 1. Simulated workers everywhere, real control planes only
 
@@ -179,4 +180,88 @@ something longer-lived.
 **Why (ease).** Three buckets and three roles triple the Terraform and
 the failure modes of every install script for a rig whose entire threat
 model is "we delete it after the campaign".
+
+**Amended (entry 12).** Still one bucket, but now two roles: the loadgen
+box takes an `orchestrator` role that adds `SetDesiredCapacity` on the
+sim-fleet ASG. Bucket access is unchanged and shared.
+
+## 11. Campaigns are driven from the loadgen box, not the operator's machine
+
+**Call.** `scripts/remote-campaign.sh` stages the rig tree, a topology
+manifest, and the ssh key onto the loadgen box, then starts the campaign
+there under `tmux`. Every script picks its address family from
+`BENCH_ON_RIG`: public IPs when driven from outside, private IPs when
+driven from the rig.
+
+**Alternatives.** (a) Keep driving from the operator's machine and widen
+`admin_cidr` to `0.0.0.0/0` for SSH. (b) Replace SSH ingress with SSM
+Session Manager so there is no admin CIDR at all. (c) Run the driver from
+a CI runner with a static egress IP.
+
+**Trade-off.** Two execution modes to keep working, and the address-family
+switch is a real trap for anyone adding a script (use `CP_ADDRS` /
+`LOADGEN_ADDR`, never `*_PUBLIC_IP`, for anything you connect to). (b) is
+cleaner and removes the admin CIDR entirely, but it rewrites every `rsh`
+call site and adds VPC endpoints or an SSM agent dependency to a rig that
+is otherwise plain SSH. (a) leaves port 22 open to the internet and does
+nothing about the real problem below.
+
+**Why (ease).** A campaign is hours of unbroken SSH from one address, and
+`admin_cidr` pins ingress to one CIDR. Driving from a laptop or an
+ephemeral cloud runner means the run dies when the machine sleeps, the
+session drops, or the egress IP rotates — and the rig keeps billing until
+someone notices. Moving the driver's seat inside the VPC removes all
+three failure modes at once, and it costs nothing extra because the
+loadgen box is already running and already inside the security group.
+
+The private-IP rule on-rig is not a preference: same-VPC traffic
+addressed to another instance's *public* IP hairpins out through the
+internet gateway and arrives with the sender's public IP as its source,
+so the security group's intra-rig `self` rule does not match it.
+
+## 12. Scale steps move through the ASG API, not `terraform apply`
+
+**Call.** `scale_workers` calls `autoscaling:SetDesiredCapacity`
+(`scripts/env.sh`), the ASG carries
+`lifecycle { ignore_changes = [desired_capacity] }`, and the loadgen box
+gets an `orchestrator` role holding exactly that permission plus two
+describes. `var.worker_instances` becomes the *initial* size only.
+
+**Alternatives.** Put terraform state in an S3 backend and run
+`terraform apply -var worker_instances=N` from the loadgen box, as the
+operator's machine did.
+
+**Trade-off.** Desired capacity now drifts from what terraform's state
+records, which is why the lifecycle rule exists — without it an unrelated
+apply mid-campaign would drag the fleet back and corrupt a scale step.
+Anyone reading `var.worker_instances` expecting it to describe a running
+fleet will be wrong.
+
+**Why (simplicity).** The alternative hands an internet-facing instance
+the IAM to rebuild or destroy every resource in the rig, plus a state
+bucket to bootstrap and lock, all to turn one dial. Two ASG calls need
+one narrowly-scoped permission and no state at all. It also keeps
+`teardown.sh` the only thing that can destroy the rig, and keeps it on
+the operator's machine where the confirmation prompt is.
+
+## 13. The spot fleet is released on any campaign exit
+
+**Call.** `run-campaign.sh` traps `EXIT` and scales the ASG to zero on
+success, failure, or a killed session. `--keep-fleet` opts out. The
+control plane is deliberately left running.
+
+**Alternatives.** Leave the fleet up (the previous behavior); tear the
+whole rig down on exit; a separate watchdog with a deadline.
+
+**Trade-off.** A failed run loses the sim fleet's state, so a post-mortem
+that needs live workers has to opt out with `--keep-fleet` before the
+fact. Accepted: the driver's own output and the Prometheus snapshots are
+what post-mortems actually read.
+
+**Why (ease).** The point of unattended runs is not having to watch them,
+and the spot fleet is the expensive half of the rig — up to 20 instances.
+A campaign that dies at 03:00 should not still be billing at 09:00. The
+control plane stays up because it holds the state a post-mortem needs and
+is comparatively cheap, and because destroying the rig is a decision that
+belongs to a human running `teardown.sh`.
 

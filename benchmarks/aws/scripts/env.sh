@@ -3,8 +3,9 @@
 #
 #   source "$(dirname "$0")/env.sh"
 #
-# Requires: terraform, jq, aws CLI (with credentials for the rig's
-# account), ssh/scp with the key from terraform.tfvars loaded.
+# Requires: jq, aws CLI (with credentials for the rig's account), ssh/scp
+# with the rig key loaded. Off-rig it also requires terraform; on-rig it
+# does not (see "Where am I running?" below).
 set -euo pipefail
 
 AWS_BENCH_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -15,14 +16,99 @@ RESULTS_ROOT="$AWS_BENCH_ROOT/results"
 # shellcheck source=versions.env
 source "$AWS_BENCH_ROOT/scripts/versions.env"
 
+# --- Where am I running? ------------------------------------------------
+# A campaign can be driven from two places, and every "reach that box"
+# address below depends on which:
+#
+#   off-rig   your machine. Topology comes from terraform state, and the
+#             boxes are reached on their PUBLIC IPs — which is why
+#             terraform/security.tf pins admin_cidr to your address.
+#   on-rig    the loadgen box itself, via scripts/remote-campaign.sh.
+#             There is no terraform state there, so topology comes from
+#             the rig manifest, and boxes are reached on PRIVATE IPs.
+#
+# The private-IP rule on-rig is not a style preference. Same-VPC traffic
+# addressed to another instance's *public* IP hairpins out through the
+# internet gateway and arrives with the sender's public IP as its source,
+# so the security group's intra-rig `self` rule does not match it and the
+# connection is refused. Private IPs stay inside the VPC and match.
+#
+# Detection is the manifest's presence; BENCH_ON_RIG=0|1 forces it.
+RIG_MANIFEST="${RIG_MANIFEST:-/opt/bench/rig.json}"
+if [ -z "${BENCH_ON_RIG:-}" ]; then
+    if [ -f "$RIG_MANIFEST" ]; then BENCH_ON_RIG=1; else BENCH_ON_RIG=0; fi
+fi
+
+# Scenario JSONs live in the repo off-rig; install-loadgen.sh stages them
+# next to the driver on-rig, where the repo isn't checked out.
+if [ "$BENCH_ON_RIG" = 1 ]; then
+    SCENARIOS_DIR="${SCENARIOS_DIR:-/opt/bench/scenarios}"
+else
+    SCENARIOS_DIR="${SCENARIOS_DIR:-$REPO_ROOT/benchmarks/scheduler/scenarios}"
+fi
+
+# The rig key on the loadgen box. This is not new with unattended
+# campaigns: the drills in experiments/ build fault-injection commands
+# that the driver runs ON the loadgen box ("stop the manager on the
+# victim"), so that box has always needed to reach the rest of the rig
+# over ssh. install-loadgen.sh puts the key here; RSH_FROM_LOADGEN is the
+# prefix to use in any command string destined for that box, which has no
+# ssh agent to fall back on.
+RIG_KEY_ON_LOADGEN=/home/ubuntu/.ssh/bench_key
+RSH_FROM_LOADGEN="ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o IdentitiesOnly=yes -i $RIG_KEY_ON_LOADGEN"
+
+# On-rig the operator's ssh agent isn't there either, so use that key.
+if [ "$BENCH_ON_RIG" = 1 ]; then
+    BENCH_SSH_KEY="${BENCH_SSH_KEY:-$RIG_KEY_ON_LOADGEN}"
+fi
 SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o User=ubuntu)
+[ -n "${BENCH_SSH_KEY:-}" ] && SSH_OPTS+=(-o IdentitiesOnly=yes -i "$BENCH_SSH_KEY")
+
+# The local private key matching var.ssh_public_key, for staging onto the
+# loadgen box. Deliberately not folded into SSH_OPTS off-rig: your own ssh
+# should keep using whatever agent and config it already has.
+resolve_local_ssh_key() {
+    local k="${BENCH_SSH_KEY:-}" candidate
+    if [ -z "$k" ]; then
+        for candidate in "$HOME/.ssh/id_ed25519" "$HOME/.ssh/id_rsa"; do
+            [ -f "$candidate" ] && k="$candidate" && break
+        done
+    fi
+    [ -n "$k" ] && [ -f "$k" ] || return 1
+    echo "$k"
+}
 
 tf_output() {
     terraform -chdir="$TF_DIR" output -json "$1"
 }
 
-# Populates the rig topology variables from terraform state.
+# Populates the rig topology variables, from terraform state (off-rig) or
+# the manifest (on-rig). Both paths set the same variables:
+#
+#   CP_PRIVATE_IPS[] LOADGEN_PRIVATE_IP   baked into configs, always private
+#   CP_PUBLIC_IPS[]  LOADGEN_PUBLIC_IP    for URLs a human opens
+#   CP_ADDRS[]       LOADGEN_ADDR         "reach that box" — use these for
+#                                         ssh/scp/curl, they follow the mode
 load_rig() {
+    if [ "$BENCH_ON_RIG" = 1 ]; then
+        _load_rig_manifest
+    else
+        _load_rig_terraform
+    fi
+
+    if [ "$BENCH_ON_RIG" = 1 ]; then
+        CP_ADDRS=("${CP_PRIVATE_IPS[@]}")
+        LOADGEN_ADDR="$LOADGEN_PRIVATE_IP"
+    else
+        CP_ADDRS=("${CP_PUBLIC_IPS[@]}")
+        LOADGEN_ADDR="$LOADGEN_PUBLIC_IP"
+    fi
+    export CP_PUBLIC_IPS CP_PRIVATE_IPS CP_ADDRS LOADGEN_PUBLIC_IP \
+        LOADGEN_PRIVATE_IP LOADGEN_ADDR BUCKET REGION WORKER_ASG \
+        CONTROL_PLANE_TYPE LOADGEN_TYPE
+}
+
+_load_rig_terraform() {
     CP_PUBLIC_IPS=($(tf_output control_plane_public_ips | jq -r '.[]'))
     CP_PRIVATE_IPS=($(tf_output control_plane_private_ips | jq -r '.[]'))
     LOADGEN_PUBLIC_IP=$(tf_output loadgen_public_ip | jq -r .)
@@ -30,11 +116,47 @@ load_rig() {
     BUCKET=$(tf_output bucket | jq -r .)
     REGION=$(tf_output region | jq -r .)
     WORKER_ASG=$(tf_output worker_asg_name | jq -r .)
-    export CP_PUBLIC_IPS CP_PRIVATE_IPS LOADGEN_PUBLIC_IP LOADGEN_PRIVATE_IP \
-        BUCKET REGION WORKER_ASG
+    CONTROL_PLANE_TYPE=$(tf_output control_plane_type | jq -r .)
+    LOADGEN_TYPE=$(tf_output loadgen_type | jq -r .)
+}
+
+_load_rig_manifest() {
+    local m="$RIG_MANIFEST"
+    [ -f "$m" ] || {
+        echo "no rig manifest at $m — this box was not staged by remote-campaign.sh" >&2
+        return 1
+    }
+    CP_PUBLIC_IPS=($(jq -r '.control_plane_public_ips[]' "$m"))
+    CP_PRIVATE_IPS=($(jq -r '.control_plane_private_ips[]' "$m"))
+    LOADGEN_PUBLIC_IP=$(jq -r '.loadgen_public_ip' "$m")
+    LOADGEN_PRIVATE_IP=$(jq -r '.loadgen_private_ip' "$m")
+    BUCKET=$(jq -r '.bucket' "$m")
+    REGION=$(jq -r '.region' "$m")
+    WORKER_ASG=$(jq -r '.worker_asg_name' "$m")
+    CONTROL_PLANE_TYPE=$(jq -r '.control_plane_type' "$m")
+    LOADGEN_TYPE=$(jq -r '.loadgen_type' "$m")
+}
+
+# Serialize the topology for the loadgen box. Everything the scripts read
+# from terraform lives here, so the on-rig path needs no state and no
+# terraform binary.
+write_rig_manifest() { # write_rig_manifest > rig.json
+    jq -n \
+        --argjson cp_pub "$(printf '%s\n' "${CP_PUBLIC_IPS[@]}" | jq -R . | jq -s .)" \
+        --argjson cp_priv "$(printf '%s\n' "${CP_PRIVATE_IPS[@]}" | jq -R . | jq -s .)" \
+        --arg lg_pub "$LOADGEN_PUBLIC_IP" --arg lg_priv "$LOADGEN_PRIVATE_IP" \
+        --arg bucket "$BUCKET" --arg region "$REGION" --arg asg "$WORKER_ASG" \
+        --arg cp_type "$CONTROL_PLANE_TYPE" --arg lg_type "$LOADGEN_TYPE" \
+        --arg written_at "$(date -u +%FT%TZ)" \
+        '{control_plane_public_ips: $cp_pub, control_plane_private_ips: $cp_priv,
+          loadgen_public_ip: $lg_pub, loadgen_private_ip: $lg_priv,
+          bucket: $bucket, region: $region, worker_asg_name: $asg,
+          control_plane_type: $cp_type, loadgen_type: $lg_type,
+          written_at: $written_at}'
 }
 
 # Current spot-fleet members: "instance-id public-ip private-ip" per line.
+# Use worker_addr to pick the reachable one for the current mode.
 worker_instances() {
     local ids
     ids=$(aws autoscaling describe-auto-scaling-groups \
@@ -47,6 +169,39 @@ worker_instances() {
     aws ec2 describe-instances --region "$REGION" --instance-ids $ids \
         --query 'Reservations[].Instances[].[InstanceId,PublicIpAddress,PrivateIpAddress]' \
         --output text
+}
+
+# worker_addr <public-ip> <private-ip> -> the one this mode can reach.
+worker_addr() {
+    if [ "$BENCH_ON_RIG" = 1 ]; then echo "$2"; else echo "$1"; fi
+}
+
+# Resize the spot fleet. Deliberately the ASG API and not `terraform
+# apply -var worker_instances=N`: desired capacity is a per-step runtime
+# knob, the loadgen box has no terraform state, and giving it the IAM to
+# mutate the whole rig to turn one dial is a bad trade. The ASG ignores
+# desired_capacity drift (terraform/instances.tf) so the two never fight.
+scale_workers() { # scale_workers <instance-count>
+    local want="$1"
+    log "scaling spot fleet to $want instance(s)"
+    aws autoscaling set-desired-capacity --region "$REGION" \
+        --auto-scaling-group-name "$WORKER_ASG" \
+        --desired-capacity "$want" --no-honor-cooldown
+}
+
+# Block until the fleet has at least <count> InService instances.
+wait_for_workers() { # wait_for_workers <count> [timeout-secs]
+    local want="$1" timeout="${2:-600}" start have
+    start=$(date +%s)
+    while :; do
+        have=$(worker_instances | grep -c . || true)
+        [ "$have" -ge "$want" ] && return 0
+        if (($(date +%s) - start > timeout)); then
+            echo "spot fleet reached $have/$want instances in ${timeout}s" >&2
+            return 1
+        fi
+        sleep 15
+    done
 }
 
 rsh() { # rsh <ip> <command...>

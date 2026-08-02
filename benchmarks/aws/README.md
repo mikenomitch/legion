@@ -11,6 +11,8 @@ this directory.
 built and locally validated (`scripts/local-smoke.sh`, driver fixture
 tests, `terraform validate`); the Nomad/K8s install paths are complete
 but marked TO-VERIFY until their campaign phases run on real instances.
+The unattended path ("Unattended runs" below) is in the same state:
+written and syntax/unit-checked, unexercised against real AWS.
 
 ## Layout
 
@@ -43,6 +45,8 @@ scripts/build-and-upload.sh          # dist binary + plugins -> S3
 # 2. Legion campaign, both HA modes. One command each: scales the spot
 #    fleet per step, starts sim fleets, drives every workload, collects,
 #    archives. Start with --smoke (1k nodes, one workload).
+#    For anything long, launch it on the loadgen box instead — see
+#    "Unattended runs" below.
 scripts/install-legion-a.sh
 scripts/run-campaign.sh --system legion-a --smoke
 scripts/run-campaign.sh --system legion-a
@@ -70,6 +74,72 @@ The 20k validation burst is one extra flag pass:
 `scripts/run-campaign.sh --system legion-a --steps "20000"` (the ASG
 tops out at 20 instances; `fit_curves.py` automatically treats a 20k
 cell as validation, not as fit input).
+
+## Unattended runs (overnight, or from a cloud shell)
+
+A full campaign is hours of continuous SSH from one address. Driving it
+from your own machine means the run dies if the laptop sleeps, the
+session drops, or your egress IP changes — and the rig keeps billing
+until you notice. `admin_cidr` pins ingress to a single CIDR
+(`terraform/security.tf`), so a rotating IP breaks the very next hop.
+
+`scripts/remote-campaign.sh` moves the driver's seat onto the loadgen
+box, inside the VPC. After `launch` returns, nothing on your side needs
+to stay up:
+
+```bash
+scripts/remote-campaign.sh launch --system legion-a --smoke
+```
+
+```bash
+scripts/remote-campaign.sh status
+```
+
+```bash
+scripts/remote-campaign.sh logs -f
+```
+
+`launch` stages the rig tree to `/opt/bench/rig`, writes the topology
+manifest, installs the SSH key, and starts the campaign under `tmux`.
+`exec` runs any other script the same way
+(`remote-campaign.sh exec experiments/soak-24h.sh --hours 24`), `attach`
+joins the live tmux session, `fetch` pulls the S3 archives back, and
+`stop` kills the run.
+
+What makes this safe to leave alone:
+
+- **The fleet is released on exit, however the campaign exits** — success,
+  failure, or a killed session. The spot fleet is the expensive half of
+  the rig, and an unattended run that dies at 03:00 would otherwise hold
+  up to 20 instances until morning. Pass `--keep-fleet` to hold it for a
+  post-mortem.
+- **The control plane deliberately stays up**, because it holds the state
+  a post-mortem needs. It is ~$0.75/hr, and `scripts/teardown.sh` is the
+  only thing that should ever destroy it. Tear down in the morning.
+- **Every cell archives to S3 as it completes**, so results survive even
+  if the run dies partway.
+
+Two details worth knowing:
+
+- **Addresses switch automatically.** On the loadgen box the scripts
+  reach other instances on *private* IPs. This is required, not
+  cosmetic: same-VPC traffic sent to another instance's public IP
+  hairpins out through the internet gateway and comes back with the
+  sender's public IP as its source, so the security group's intra-rig
+  rule does not match it. `scripts/env.sh` picks the right family from
+  `BENCH_ON_RIG`.
+- **Scale steps use the ASG API, not `terraform apply`.** The loadgen box
+  has no terraform state, and desired capacity is a runtime knob rather
+  than desired state. The ASG ignores `desired_capacity` drift so the two
+  never fight, which also means `var.worker_instances` is the *initial*
+  size only.
+
+The loadgen box holds the rig's SSH private key at
+`~/.ssh/bench_key`. That is not new with unattended runs — the drills in
+`experiments/` build fault-injection commands ("stop the manager on the
+victim") that the driver executes from that box, so it has always needed
+to reach the rest of the rig. Treat the whole rig as one trust domain,
+and tear it down when the campaign is over.
 
 ## Methodology (what makes the numbers defensible)
 

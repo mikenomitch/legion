@@ -31,13 +31,13 @@ DEST="$RESULTS_ROOT/$CAMPAIGN/$RUN"
 mkdir -p "$DEST"
 
 log "pulling driver output"
-rsh "$LOADGEN_PUBLIC_IP" "tar -C /opt/bench/runs/$CAMPAIGN -czf - $RUN" |
+rsh "$LOADGEN_ADDR" "tar -C /opt/bench/runs/$CAMPAIGN -czf - $RUN" |
     tar -C "$RESULTS_ROOT/$CAMPAIGN" -xzf -
 
 # Prometheus snapshot: the run's window (from the driver's submit/event
 # stamps are monotonic, so use wall-clock now-2h as a safe superset;
 # range-export the series the analysis notebook reads).
-PROM="http://$LOADGEN_PUBLIC_IP:9090"
+PROM="http://$LOADGEN_ADDR:9090"
 START=$(date -u -d '2 hours ago' +%s 2>/dev/null || date -u -v-2H +%s)
 END=$(date -u +%s)
 mkdir -p "$DEST/prometheus"
@@ -70,9 +70,11 @@ log "writing fairness record"
     echo "  \"campaign\": \"$CAMPAIGN\", \"run\": \"$RUN\","
     echo "  \"system\": \"$SYSTEM\", \"nodes\": $NODES, \"scenario\": \"$SCENARIO\","
     echo "  \"collected_at\": \"$(date -u +%FT%TZ)\","
+    # From the rig manifest / terraform outputs, never hardcoded: the
+    # fairness record has to state the hardware the cell actually ran on.
     echo "  \"instance_types\": {"
-    echo "    \"control_plane\": \"$(terraform -chdir="$TF_DIR" output -raw control_plane_type 2>/dev/null || echo m7i.xlarge)\","
-    echo "    \"loadgen\": \"m7i.large\", \"workers\": \"see terraform/variables.tf\""
+    echo "    \"control_plane\": \"$CONTROL_PLANE_TYPE\","
+    echo "    \"loadgen\": \"$LOADGEN_TYPE\", \"workers\": \"see terraform/variables.tf\""
     echo "  },"
     echo "  \"legion_binary\": $(aws s3 cp --region "$REGION" "s3://$BUCKET/bin/legion.meta.json" - 2>/dev/null || echo null),"
     echo "  \"versions\": {"
@@ -82,7 +84,7 @@ log "writing fairness record"
     echo "}"
 } >"$DEST/fairness-record.json"
 # The exact rendered config the control plane ran with.
-rsh "${CP_PUBLIC_IPS[0]}" "cat /opt/legion/configs/manager.jsonnet 2>/dev/null || cat /etc/nomad.d/server.hcl 2>/dev/null || sudo cat /etc/kubernetes/kubeadm-config.yaml 2>/dev/null" \
+rsh "${CP_ADDRS[0]}" "cat /opt/legion/configs/manager.jsonnet 2>/dev/null || cat /etc/nomad.d/server.hcl 2>/dev/null || sudo cat /etc/kubernetes/kubeadm-config.yaml 2>/dev/null" \
     >"$DEST/control-plane-config" 2>/dev/null || true
 
 log "archiving to s3://$BUCKET/campaigns/$CAMPAIGN/$RUN.tar.gz"

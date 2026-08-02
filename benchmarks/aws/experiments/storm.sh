@@ -44,7 +44,7 @@ read -r KILL_INSTANCE KILL_PUBLIC KILL_PRIVATE < <(worker_instances | head -1)
 # How many allocations live on the doomed slice right now — that is the
 # replacement expectation the watch waits for.
 if [ "$DRIVER_SYSTEM" = legion ]; then
-    EXPECTED=$(rsh "$LOADGEN_PUBLIC_IP" "LEGION_ADDR=$MANAGER legion state query \
+    EXPECTED=$(rsh "$LOADGEN_ADDR" "LEGION_ADDR=$MANAGER legion state query \
         \"SELECT COUNT(*) AS n FROM allocation WHERE node_id IN (SELECT id FROM node WHERE id LIKE 'sim-0-%')\" -j" |
         jq -r '.data.rows[0].n // 0')
 else
@@ -54,9 +54,9 @@ log "storm: killing $KILL_INSTANCE (slice sim-0), expecting $EXPECTED replacemen
 
 RUN_ID="experiments/storm-$(date -u +%Y%m%d-%H%M%S)"
 REMOTE_OUT="/opt/bench/runs/$CAMPAIGN/$RUN_ID"
-FAULT_CMD="ssh -o StrictHostKeyChecking=accept-new ubuntu@$KILL_PRIVATE sudo systemctl stop legion-sim nomad-nodesim 2>/dev/null || true"
+FAULT_CMD="$RSH_FROM_LOADGEN ubuntu@$KILL_PRIVATE sudo systemctl stop legion-sim nomad-nodesim 2>/dev/null || true"
 
-rsh "$LOADGEN_PUBLIC_IP" "
+rsh "$LOADGEN_ADDR" "
     set -euo pipefail
     mkdir -p '$REMOTE_OUT'
     python3 /opt/bench/driver/driver.py watch \
