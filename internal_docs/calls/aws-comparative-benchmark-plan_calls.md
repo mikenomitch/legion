@@ -4,8 +4,9 @@ Plan: [`../plans/aws-comparative-benchmark-plan.md`](../plans/aws-comparative-be
 
 Entries 1-4 are planning-stage calls; 5-10 were made while building the
 rig (phases 0-1, 2026-07-30); 11-13 came from making campaigns runnable
-unattended (2026-08-02). Ranked by project impact; the number is the
-rank.
+unattended (2026-08-02); 18-19 came from making the rig startable at all
+from an arm64 macOS machine (2026-08-02). Ranked by project impact; the
+number is the rank.
 
 ## 1. Simulated workers everywhere, real control planes only
 
@@ -392,3 +393,83 @@ channel pool caps at 16 channels of 256 nodes, so past ~4k nodes per
 process the multiplexing itself becomes the variable. (c) would make
 density a per-cell variable, which is exactly the kind of thing a
 fairness record cannot explain away.
+
+## 18. A disposable operator box, outside the rig's terraform
+
+**The call.** `scripts/bootstrap-operator-box.sh` builds a dedicated
+Ubuntu x86_64 EC2 instance to drive campaigns from, using plain AWS CLI
+calls and its own state file — not a terraform module, and not part of
+the rig.
+
+```bash
+benchmarks/aws/scripts/bootstrap-operator-box.sh launch \
+    --access-key-id AKIA... --secret-access-key ...
+```
+
+**Alternatives.** (a) Drive campaigns from the operator's laptop, as the
+runbook originally assumed. (b) Add the box to `terraform/` as a fourth
+instance. (c) Document a manual setup checklist instead of scripting it.
+
+**Trade-off.** A second, separately-managed lifecycle: `teardown.sh`
+destroys the rig, `bootstrap-operator-box.sh destroy` destroys the box,
+and forgetting the second leaves an instance billing. Mitigated by
+`destroy` refusing quietly — it warns when rig instances are still up,
+because the box holds the only copy of their terraform state.
+
+Not having terraform also means not having its state file, so `create`
+writes its own *before* the first API call and appends after each one.
+Recording only on success — the shorter version — orphans a security
+group, an IAM role, and a billing Elastic IP whenever `create` dies in
+the middle, with nothing left that knows they exist. `destroy` therefore
+treats every recorded field as optional and cleans up exactly what was
+made. It also only deletes the EC2 key pair when this script is the
+thing that imported it; a pre-existing key pair of the same name belongs
+to something else.
+
+**Why (ease).** (a) does not actually work from this project's primary
+development machine: `build-and-upload.sh` produces the dist binary and
+plugin dylibs for the rig's Linux x86_64 instances, which an arm64 macOS
+laptop cannot cross-compile with the plugin build as it stands. It also
+fights `admin_cidr` — every rig ingress rule pins to one CIDR, and a
+laptop's egress IP rotates, so the box gets an Elastic IP and that CIDR
+stays true for the campaign. (b) is circular: this box runs the
+terraform, so it cannot be created by it, and it must outlive
+`teardown.sh`, which destroys everything terraform manages including the
+state. (c) is what the previous session left behind, and the setup is
+eight tools deep — protoc, a Rust toolchain, terraform, AWS CLI v2 — with
+a Rust build in the middle. Scripting it is the difference between
+starting a campaign and spending an evening on prerequisites.
+
+## 19. The operator box carries an IAM role, never a copied key
+
+**The call.** Credentials passed to `bootstrap-operator-box.sh` are used
+only for the local AWS calls that build the box. The instance gets an
+IAM instance profile — `PowerUserAccess` plus an inline IAM policy
+narrowed to `legion-bench*` role and instance-profile names — and no
+long-lived key is ever written to it.
+
+**Alternatives.** (a) Copy the operator's access key onto the box, which
+is the obvious way to make a remote box "just work". (b) Hand-write a
+least-privilege policy for exactly the rig's resource set. (c) Grant
+`AdministratorAccess`.
+
+**Trade-off.** `PowerUserAccess` is broader than this rig strictly needs,
+so the box could touch unrelated resources in the account. The IAM half
+— the part that mints roles — is the piece narrowed by name prefix,
+because that is where the privilege-escalation path is.
+
+**Why (simplicity, and the blast radius that matters).** The box is
+internet-facing, sits inside a trust domain that already holds the rig's
+SSH private key, and is deliberately left running unattended overnight.
+A static access key on it is a credential that outlives the box and the
+campaign; an instance role's credentials are rotated by AWS and die with
+the instance, which is exactly the lifetime wanted here. (b) is the
+right answer for a permanent account and the wrong trade for a
+disposable benchmark rig: the rig creates VPCs, subnets, route tables,
+security groups, instances, launch templates, an ASG, an S3 bucket, and
+two IAM roles, and a hand-narrowed policy for that set is a maintenance
+burden that breaks every time `terraform/` grows a resource. (c) gives
+away the one thing worth withholding — unrestricted `iam:CreateRole` on
+an internet-facing box is a full account takeover from a single SSH
+compromise, which the name-prefix condition prevents at no usability
+cost.
