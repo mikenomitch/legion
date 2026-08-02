@@ -235,14 +235,31 @@ cmd_create() {
 
     ensure_local_key
 
+    # Plenty of accounts have no default VPC — newer ones, and any where
+    # it was deleted. OPERATOR_SUBNET_ID is the escape hatch, so it has to
+    # be read BEFORE the default-VPC check rather than after it, and the
+    # VPC derived from the subnet. The subnet must be public: the box is
+    # reached over SSH from admin_cidr, and an Elastic IP does not help
+    # without a route to an internet gateway.
     local vpc_id subnet_id
-    vpc_id=$(aws_ ec2 describe-vpcs --filters Name=isDefault,Values=true \
-        --query 'Vpcs[0].VpcId' --output text)
-    [ "$vpc_id" != "None" ] || die "no default VPC in $REGION — pass a subnet with OPERATOR_SUBNET_ID"
-    subnet_id="${OPERATOR_SUBNET_ID:-$(aws_ ec2 describe-subnets \
-        --filters "Name=vpc-id,Values=$vpc_id" "Name=default-for-az,Values=true" \
-        --query 'Subnets[0].SubnetId' --output text)}"
-    log "using default VPC $vpc_id / subnet $subnet_id"
+    if [ -n "${OPERATOR_SUBNET_ID:-}" ]; then
+        subnet_id="$OPERATOR_SUBNET_ID"
+        vpc_id=$(aws_ ec2 describe-subnets --subnet-ids "$subnet_id" \
+            --query 'Subnets[0].VpcId' --output text 2>/dev/null || true)
+        [ -n "$vpc_id" ] && [ "$vpc_id" != None ] ||
+            die "subnet $subnet_id not found in $REGION"
+        log "using subnet $subnet_id (VPC $vpc_id) from OPERATOR_SUBNET_ID"
+    else
+        vpc_id=$(aws_ ec2 describe-vpcs --filters Name=isDefault,Values=true \
+            --query 'Vpcs[0].VpcId' --output text)
+        [ "$vpc_id" != "None" ] || die "no default VPC in $REGION.
+  Create one (free, instant):     aws ec2 create-default-vpc --region $REGION
+  Or use an existing public subnet: OPERATOR_SUBNET_ID=subnet-... $0 $CMD"
+        subnet_id=$(aws_ ec2 describe-subnets \
+            --filters "Name=vpc-id,Values=$vpc_id" "Name=default-for-az,Values=true" \
+            --query 'Subnets[0].SubnetId' --output text)
+        log "using default VPC $vpc_id / subnet $subnet_id"
+    fi
 
     log "creating key pair, security group, and IAM role"
     state_init
