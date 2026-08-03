@@ -15,11 +15,15 @@ aws s3 rm --region "$REGION" "s3://$BUCKET/legion-b/" --recursive --quiet || tru
 
 STAGE=$(mktemp -d)
 trap 'rm -rf "$STAGE"' EXIT
-BUCKET="$BUCKET" REGION="$REGION" render_tpl BUCKET REGION \
-    <"$AWS_BENCH_ROOT/configs/legion/manager-b.jsonnet.tpl" >"$STAGE/manager.jsonnet"
-
 for idx in 0 1 2; do
     ip="${CP_ADDRS[$idx]}"
+    # Rendered per node, not once for all three: server.advertiseAddr is
+    # the address baked into every join token this manager mints, so it
+    # has to be THIS box's private ip. Sharing one rendered config would
+    # hand every worker the same (wrong) manager address.
+    BUCKET="$BUCKET" REGION="$REGION" PRIVATE_IP="${CP_PRIVATE_IPS[$idx]}" \
+        render_tpl BUCKET REGION PRIVATE_IP \
+        <"$AWS_BENCH_ROOT/configs/legion/manager-b.jsonnet.tpl" >"$STAGE/manager.jsonnet"
     log "installing legion (streaming) on cp-$idx ($ip)"
     rsh "$ip" "
         sudo aws s3 cp --region $REGION s3://$BUCKET/bin/legion /opt/legion/bin/legion &&
