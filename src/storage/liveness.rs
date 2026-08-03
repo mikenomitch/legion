@@ -308,7 +308,11 @@ impl LivenessTable {
     /// the table the live set rather than a history of everything that ever
     /// beat.
     pub fn retain(&self, keep: &HashSet<String>) {
-        self.lock().seen.retain(|id, _| keep.contains(id));
+        let mut state = self.lock();
+        state.seen.retain(|id, _| keep.contains(id));
+        // The pending digest is pruned with it, so a manager that later loses
+        // status-lane leadership does not report nodes that no longer exist.
+        state.pending_digest.retain(|id| keep.contains(id));
     }
 
     pub fn forget(&self, node_id: &str) {

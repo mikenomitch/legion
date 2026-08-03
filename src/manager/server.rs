@@ -5118,21 +5118,21 @@ impl Manager for ManagerDaemonService {
         let id = req.id;
         let provisional_claims = req.provisional_claims;
 
-        // Offloaded, not called inline: `update_node_heartbeat` is a
-        // BLOCKING call (coalescer std::sync::Mutex + mpsc, then a raft
-        // commit that fsyncs). Running it on a tokio worker thread parks
-        // that thread for the whole commit, so at most `worker_threads`
-        // heartbeats can be in flight — and, worse, every other heartbeat
-        // stays stuck in the gRPC layer where the coalescer cannot see it.
-        // The coalescer batches whatever is queued when a commit finishes,
-        // so starving its queue keeps batches at size 1 and defeats the
-        // group commit entirely (HEARTBEAT_BATCH_MAX is 128).
+        // Offloaded, not called inline. In steady state this is now cheap —
+        // one read-model lookup and one map write, no commit and no fsync
+        // (docs/node-liveness.md) — but the call is still BLOCKING on the
+        // paths that do commit: a `lost -> active` transition, and the
+        // mixed-version fallback where a status-lane leader that predates
+        // liveness digests makes every beat a replicated write again.
         //
-        // Measured on gp3 EBS (3 voters, one box, 1000 sim nodes): 86
-        // heartbeats/sec, 17% of the 2s cadence, with the host idle. The
-        // same code on NVMe does ~2000/sec, because a 0.5ms commit meets
-        // demand even at batch size 1 — which is why this only shows up on
-        // network-attached storage.
+        // Running those on a tokio worker thread parks it for the whole
+        // commit, so at most `worker_threads` heartbeats can be in flight —
+        // and, worse, every other heartbeat stays stuck in the gRPC layer
+        // where the coalescer cannot see it. The coalescer batches whatever
+        // is queued when a commit finishes, so starving its queue keeps
+        // batches at size 1 and defeats the group commit entirely
+        // (HEARTBEAT_BATCH_MAX is 128). Measured on gp3 EBS before the
+        // offload: 86 heartbeats/sec, 17% of the 2s cadence, host idle.
         {
             let store = self.store.clone();
             let heartbeat_id = id.clone();

@@ -2,8 +2,9 @@
 
 Decisions made while writing
 [`../plans/liveness-off-the-raft-path-plan.md`](../plans/liveness-off-the-raft-path-plan.md)
-(status PLANNED — these are the plan's calls, not an implementation's;
-entries get appended and re-ranked as phases execute).
+(status SHIPPED). Entries marked *(Implementation)* were added while the
+plan was executed; the rest are the plan's own calls. Where an implementation
+entry contradicts an earlier one, it says so and gives the reason.
 
 **Ordered most-impactful first. The entry number is its rank.**
 
@@ -34,14 +35,14 @@ replicated one. (c) **Gossip/SWIM**, Consul's model.
 **Trade-off.** Three things get worse, and none of them is free:
 
 - The last-heartbeat *timestamp* becomes approximate on any manager that
-  does not lead the status lane (entry 6). The *status* stays exact
+  does not lead the status lane (entry 8). The *status* stays exact
   everywhere, which is the half that matters, but "approximate" is a new
   word in an operator's vocabulary that was not there before.
 - Soft state is harder to reason about than replicated state. A bug in the
   liveness table is invisible to the content-hash convergence checks that
   `tests/raft_lanes.rs` uses to prove everything else correct.
 - Under a standing lane split, detection now depends on a digest RPC path
-  (entry 8) that does not exist today, with its own partial-failure story.
+  (entry 12) that does not exist today, with its own partial-failure story.
 
 **Why (performance, then extensibility).** A heartbeat timestamp is
 *derived* (the worker never sends one; the manager stamps `now`), *worthless
@@ -78,9 +79,41 @@ call makes (c) *cheaper*: gossip's output is exactly what the liveness table
 holds, so gossip would replace the table's input and leave the transition,
 grace, checkpoint, and read-path machinery intact.
 
+
 ---
 
-## 2. Phase 1 is a measurement, not a fix — and the batching knob became contingent on it
+## 2. `lost -> active` recovery keeps the old status-lane write; it does NOT take `mark_node_ready`
+
+**Call.** *(Implementation; a deliberate deviation from entry 1's design,
+which named `Store::mark_node_ready` as the recovery composite.)* When a
+heartbeat arrives from a node the store believes is not active, it replicates
+through `update_node_heartbeat_forwarding` — the path it has always taken —
+rather than through `mark_node_ready`.
+
+**Alternative.** `mark_node_ready(id, now)`, exactly as the plan specified:
+the status lane, then a control-lane `availability = "available"` flip, so a
+recovered node becomes schedulable in one step.
+
+**Trade-off.** A recovered node's `node.availability` stays `unavailable`
+until it re-registers, exactly as before this change. That is a real
+limitation, and it is preserved rather than newly introduced — but the plan
+promised to fix it here and this does not.
+
+**Why (correctness).** `mark_node_ready_apply` writes `status = "ready"`, not
+`"active"` — a pre-existing quirk of the node-join eval path. Every liveness
+query in the system filters on `status = 'active'`
+(`active_node_liveness_rows`, `node_status_counts`), so a node recovered
+through it would silently drop out of the liveness scan **and** out of
+`legion_nodes{status="active"}`. Following the plan literally would have
+introduced a worse bug than the limitation it fixed. Flipping `availability`
+on a heartbeat is also a larger semantic change than this plan should make:
+schedulability has never been a heartbeat's to grant. The right fix —
+normalizing `"ready"` to `"active"` across the node-join path — is its own
+change, and is filed as an open TODO item rather than smuggled in here.
+
+---
+
+## 3. Phase 1 is a measurement, not a fix — and the batching knob became contingent on it
 
 **Call.** Phase 1 ships **no behavior change**. It re-runs
 `heartbeat-commit-probe.sh` post-`f24c6e0` on both storage classes and
@@ -136,9 +169,37 @@ hb/sec against a measured 422, and the control plane is still pinned to local
 NVMe (`a774fb0`) to buy headroom. What changed is the urgency — the fleet is
 no longer 10% of margin from mass false loss — not the destination.
 
+
 ---
 
-## 3. The scheduler keeps reading `node.availability`; liveness is never read across a lane boundary
+## 4. `liveness.batchWindow` ships inert, because the measurement it is contingent on has not been run
+
+**Call.** *(Implementation.)* `liveness.batchWindow` exists in the config, is
+parsed and validated, and defaults to `"0ms"` — reproducing today's
+commit-while-you-can batching exactly — but **nothing consumes it**, and the
+phase-1 attribution the previous entry makes it contingent on
+(`heartbeat-commit-probe.sh` on gp3 and NVMe at 1000 and 4000 nodes) has not
+been run.
+
+**Alternative.** Omit the field entirely until a measurement justifies it,
+which is what the plan says to do: *"shipping it blind would be adding a knob
+to solve a problem that may no longer exist."*
+
+**Trade-off.** A config field an operator can set that currently changes
+nothing. Its doc comment and `configs/manager.jsonnet` both say so, and the
+knob is commented out in the example config.
+
+**Why.** The measurement needs the AWS rig, which this change cannot run.
+Keeping the field means the validation rules, the config plumbing, and the
+public docs are already in place for whoever runs it; leaving it out would
+mean reopening `config.rs`, `manager.jsonnet`, and two doc pages to add one
+`Duration`. The honest cost is one inert knob — recorded here, on the public
+page, and as an open TODO item, rather than quietly shipped as though it did
+something.
+
+---
+
+## 5. The scheduler keeps reading `node.availability`; liveness is never read across a lane boundary
 
 **Call.** Nothing in the scheduler, the eval loop, the dispatcher, or the
 rollout engine ever reads the liveness table. Placement continues to gate on
@@ -174,9 +235,10 @@ create the first place in Legion where a scheduling decision depends on
 another lane's leader being reachable — a new failure mode, bought to close
 a window that has never been reported as a problem.
 
+
 ---
 
-## 4. On election, the new leader seeds every active node at `now` — never at its persisted heartbeat
+## 6. On election, the new leader seeds every active node at `now` — never at its persisted heartbeat
 
 **Call.** When a manager acquires status-lane leadership, it reads the set of
 registered active nodes from replicated state and stamps every one of them
@@ -202,11 +264,12 @@ tick — precisely the mass false loss this plan exists to prevent, arriving
 through the back door. Nomad reaches the same conclusion from the same
 constraint: `initializeHeartbeatTimers()` arms every node at
 `failover_heartbeat_ttl` rather than at any remembered value. Discarding the
-data is what makes the checkpoint safe to write at all (entry 7).
+data is what makes the checkpoint safe to write at all (entry 10).
+
 
 ---
 
-## 5. `failoverGrace` defaults to 60 seconds, not Nomad's 5 minutes
+## 7. `failoverGrace` defaults to 60 seconds, not Nomad's 5 minutes
 
 **Call.** `liveness.failoverGrace: "60s"`.
 
@@ -233,9 +296,10 @@ room for the worker-side backoff that an election itself causes.
 Validation rejects `failoverGrace` below the lost window at config load,
 because a grace shorter than the window is not a grace.
 
+
 ---
 
-## 6. A manager that does not own liveness shows an approximate heartbeat time and says so, rather than forwarding the read
+## 8. A manager that does not own liveness shows an approximate heartbeat time and says so, rather than forwarding the read
 
 **Call.** The status-lane leader replicates a batched liveness checkpoint
 every `checkpointInterval` (default 30s) recording each node's **observed**
@@ -279,16 +343,43 @@ protects the on-call responder: `node_health.status` stays replicated, so
 `legion node list`, `legion_nodes{status}`, and the UI status pill are
 exact on every manager. Only the *time* is approximate.
 
+
 ---
 
-## 7. A checkpoint is written for display and is never read back as liveness
+## 9. `heartbeat_source` is its own `NodeMsg` field, not a suffix baked into `last_heartbeat`
+
+**Call.** *(Implementation of the previous entry's surface.)* A new
+`string heartbeat_source` (`"live"` | `"checkpoint"` | `""`) on `NodeMsg`. The
+CLI table composes the two at print time; `--json` emits both separately; the
+UI renders it as a tooltip on the relative time rather than as a column.
+
+**Alternative.** Append `(checkpoint)` to `last_heartbeat` on the wire. No new
+field, and every existing client — including ones built before this change —
+would show the caveat for free.
+
+**Trade-off.** A client built before this field ignores it and shows an
+approximate timestamp as though it were exact, for up to
+`checkpointInterval`. Accepted: the node's *status* is exact on every client
+either way, and status is what anything automated should branch on. The
+caveat is stated in the proto comment, in `docs/agent-readiness.md`, and on
+the public page.
+
+**Why (extensibility).** `last_heartbeat` is a timestamp that agents, the UI,
+and `legion node list --sort-by` all parse. Making it sometimes-not-a-timestamp
+breaks every consumer to serve a display concern, and it cannot be undone
+without another breaking change. This also settles the plan's open question 5
+(UI or `--json`?) as *both, quietly*.
+
+---
+
+## 10. A checkpoint is written for display and is never read back as liveness
 
 **Call.** The liveness checkpoint is write-only from the system's point of
 view. Nothing in the lost-node decision, the election seed, or any
 reconciler ever reads it. The rule is stated in the code comment at the
 write site, in the proto comment, and on the public page.
 
-**Alternative.** Read it on election (entry 4's rejected alternative), or as
+**Alternative.** Read it on election (entry 6's rejected alternative), or as
 a warm-start for a restarting manager. It is the obvious use for a value the
 system went to the trouble of writing.
 
@@ -307,9 +398,35 @@ quality alone, with no correctness consequence — which is why 30s is an
 acceptable default rather than something that would have to be tuned against
 the lost window.
 
+
 ---
 
-## 8. Managers push liveness digests to the status leader; the leader never pulls
+## 11. The checkpoint is an upsert guarded on `status = 'active'`, not a bare UPDATE
+
+**Call.** *(Implementation.)* `checkpoint_node_heartbeats_apply` inserts the
+health row when a registered node has none, and refreshes the timestamp only
+when the existing row already says `active`.
+
+**Alternative.** A plain `UPDATE ... WHERE node_id = ? AND status = 'active'`,
+which is the minimal expression of "display state only" and cannot create
+anything.
+
+**Trade-off.** The checkpoint can now create a row, which is one more thing it
+can do than its name suggests. Bounded by its `SELECT ... FROM node` guard: it
+can only ever create a row for a registered node, carrying exactly the values
+hydration already assumes for a missing row.
+
+**Why (correctness).** Before this work, a `node_health` row lost to a crash
+between registration's two halves was recreated by that node's next heartbeat.
+With heartbeats in memory, a bare UPDATE would leave the row missing forever —
+and with it that node's `lost_after_seconds`, silently reverting it to the
+default window. The upsert restores the old self-healing property at
+checkpoint cadence instead of at beat cadence, which is the least surprising
+place for it to live.
+
+---
+
+## 12. Managers push liveness digests to the status leader; the leader never pulls
 
 **Call.** Each manager that does not lead the status lane batches the node
 ids it personally received heartbeats from and sends **one**
@@ -346,9 +463,35 @@ breaker, applied one level down — and it composes with that breaker rather
 than duplicating it, since peer-gap suppression catches the partial case and
 the breaker catches the total one.
 
+
 ---
 
-## 9. `ReportNodeLiveness` goes on `RaftTransport`, not on the `Manager` service
+## 13. Peer-gap suppression is bounded on BOTH sides
+
+**Call.** *(Implementation; resolves an ambiguity in the previous entry.)* A
+peer manager's claimed nodes are suppressed from the lost decision while that
+peer's last digest is between one `digestInterval` and one `peerDigestGrace`
+old. **Past the grace, its nodes become eligible again.**
+
+**Alternative.** Suppress indefinitely while the peer is silent — the reading
+the previous entry's prose most naturally supports ("not eligible to be marked
+lost until it reports again").
+
+**Trade-off.** A manager that is genuinely gone takes its share of the fleet
+with it after 30 seconds, so a dead manager *does* eventually produce node
+losses.
+
+**Why (correctness).** Unbounded suppression turns a manager failure into a
+permanent hole in the fleet's failure detection: a dead manager's nodes could
+never be marked lost, however long they had been gone. And the workers dialing
+that manager genuinely are unreachable — their allocations should move. The
+plan's own testing section resolves the ambiguity the same way (*"at
+`t + peerDigestGrace + 1s` C's become eligible"*), so this follows the tests
+rather than the prose.
+
+---
+
+## 14. `ReportNodeLiveness` goes on `RaftTransport`, not on the `Manager` service
 
 **Call.** The digest RPC is added to the existing authenticated manager-plane
 `RaftTransport` service (`src/storage/raft/server.rs:70`), alongside
@@ -375,11 +518,12 @@ when the payload is "here is who I heard from"? Putting it on `Manager` would
 mint a user-visible RPC for an internal message and force an ACL
 classification that is a lie. `RaftTransport` already has the right trust
 model (shared-secret peer auth, `PROTOCOL_VERSION`-versioned payloads) and
-the right degradation story against an older peer, which entry 10 depends on.
+the right degradation story against an older peer, which entry 15 depends on.
+
 
 ---
 
-## 10. Version skew is absorbed entirely on the manager plane; the worker protocol does not change
+## 15. Version skew is absorbed entirely on the manager plane; the worker protocol does not change
 
 **Call.** No `HeartbeatRequest`/`HeartbeatReply` field, no
 `protocol_version` bump, no worker behavior change. A manager that gets
@@ -407,12 +551,13 @@ Workers are the numerous, slow-moving, operator-scheduled half of a Legion
 fleet — 1000 of them, upgraded "at whatever pace suits the workloads". A
 change that requires none of them to move is worth a real amount of design
 constraint. It also means the whole plan can be rolled back by downgrading
-managers alone, which is what makes entry 12's no-migration property
+managers alone, which is what makes entry 17's no-migration property
 actually usable.
+
 
 ---
 
-## 11. The failover-grace fix moves from the cadence plan into this one
+## 16. The failover-grace fix moves from the cadence plan into this one
 
 **Call.** The status-lane leadership grace
 (`internal_docs/TODO.md:369-378`, currently assigned to phase 3 of
@@ -443,9 +588,10 @@ this plan's phase 3 being safe at all. Shipping it as phase 2 also means it
 lands as a standalone fix for a hazard that is live *today*, which is worth
 doing whether or not the rest of this plan ever ships.
 
+
 ---
 
-## 12. No schema migration
+## 17. No schema migration
 
 **Call.** `node_health.last_heartbeat` and `.last_heartbeat_unix` keep their
 columns, their types, and their names. The only change is who writes them:
@@ -471,3 +617,51 @@ procedure, and it is the largest compatibility asset in the plan — worth
 more than a tidier column name. It also means phases 1 through 4 can each be
 reverted independently without a database step, which is what allows the
 phasing in the first place.
+
+
+---
+
+## 18. The liveness table lives on `Store`, not on the manager service
+
+**Call.** *(Implementation.)* `LivenessTable` (`src/storage/liveness.rs`) is
+an `Arc` field on `Store`, and `Store::update_node_heartbeat` remains the one
+entry point a heartbeat takes.
+
+**Alternatives.** (a) Put it on `ManagerDaemonService` — it is arguably
+manager state, not storage state, and `src/storage/` is where *persistence*
+lives. (b) A standalone service owned by `run_manager` and threaded into both
+the gRPC handler and the checker loop.
+
+**Trade-off.** `Store` gains a field that is explicitly not persisted, in a
+module named `storage`. Accepted, and stated in the module's first paragraph.
+
+**Why (simplicity).** Three call sites need the table and all three already
+hold a `Store` and nothing else: the heartbeat handler, the status-checker
+tick, and `RaftTransport::ReportNodeLiveness` (which only has a `Store`
+because `forward_store` was already there for `ForwardLaneWrite`). `Store`
+also already carries process-local soft state that is neither persisted nor
+replicated — the two coalescers, `node_health_orphan_candidates` — so this is
+the established shape rather than a new one. Options (a) and (b) both mean
+threading a second handle through code that has no manager service at all,
+including `tests/raft_lanes.rs` and every embedded use of `Store`.
+
+---
+
+## 19. The registry gained a float gauge rather than scaling the ratio into an integer
+
+**Call.** *(Implementation.)* `src/manager/telemetry.rs` gained a `FloatGauge`
+family type and a `SampleValue::GaugeF64` variant, so
+`legion_heartbeat_freshness_ratio` reads `0.22`.
+
+**Alternative.** Export `legion_heartbeat_freshness_permille` as an integer
+(`220`) — no new metric type, no new arm in the OTLP export.
+
+**Trade-off.** One more type in the registry and one more branch in
+`src/otel.rs`.
+
+**Why (simplicity at 3am).** The whole point of the ratio is that it is in the
+same units as its danger threshold: false loss begins at
+`served_interval / lost_window`, which is `0.20` at the defaults. An operator
+comparing `220` against `0.20` has to do a conversion mid-incident, and every
+doc, alert rule, and log line would have to carry the factor. Prometheus
+gauges are floats; the registry was the thing that was wrong.

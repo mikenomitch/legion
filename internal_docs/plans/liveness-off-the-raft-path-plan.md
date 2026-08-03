@@ -1,6 +1,23 @@
 # Liveness Off the Raft Path
 
-**Status: PLANNED** — nothing here is built.
+**Status: SHIPPED** (2026-08-03) — phases 2, 3 and 4 are built; phase 1's AWS
+measurement is **not run** (see below). What shipped is on the public pages
+[`docs/node-liveness.md`](../../docs/node-liveness.md) and
+[`docs/heartbeat-cadence-and-scale.md`](../../docs/heartbeat-cadence-and-scale.md);
+this plan stays as history.
+
+**Deliberately not done, and open:**
+
+- **Phase 1's attribution of the residual 16%** (`heartbeat-commit-probe.sh`
+  on gp3 and NVMe at 1000 and 4000 nodes) and every re-measurement in §10.1.
+  They need the AWS rig. `liveness.batchWindow` therefore ships parsed,
+  validated, and **inert** — see the judgement-calls doc.
+- **The `lost -> active` recovery does not flip `node.availability`.** The
+  plan named `mark_node_ready` as the composite; that method writes
+  `status = "ready"`, which every liveness query filters out, so the recovery
+  keeps the status-lane write it always used. A recovered node becomes
+  schedulable at re-registration, exactly as before. Normalizing `"ready"` to
+  `"active"` is a separate change and an open TODO item.
 
 This is architecture item **D8** from
 [`scheduler-architecture-review-plan.md`](scheduler-architecture-review-plan.md),
