@@ -299,6 +299,25 @@ How to use it:
         `packing-density.sh` during this step: it needs the same
         standing rig and retires the 1,250 assumption before any cell
         is sized from it.
+  - [ ] **Warn when a manager binds a wildcard host with no
+        `server.advertiseAddr`.** Found the hard way on the first real
+        campaign. With `host: '0.0.0.0'` and `advertiseAddr` unset,
+        `ServerConfig::advertised_address()` derives
+        `http://127.0.0.1:4747`, and that address is embedded in *every
+        join token the manager mints*. A remote worker decodes the token
+        and dials its own loopback, retrying connection-refused forever.
+        Nothing on the manager side looks wrong — the failure appears
+        only in the worker's journal, and an operator watching the
+        cluster sees "0 nodes registered" with no error at all. Options,
+        roughly in order of preference: refuse to mint a join token whose
+        address is loopback while bound to a wildcard host; or log a
+        startup warning naming the derived address; or return the
+        condition in `CreateJoinToken`'s response. The config comment in
+        `configs/manager.jsonnet` already says what the field is for, and
+        that was not enough. See `benchmarks/aws/configs/legion/
+        manager-a.jsonnet.tpl` for the fix the rig now carries, and note
+        `persistence.raft.advertiseAddr` is a *different* setting — having
+        set that one is exactly why the gap was easy to miss.
   - [ ] Export process-level memory from the manager so the campaign can
         report the manager's own RSS instead of whole-box memory.
         `docs/metrics.md` has no process family and nothing registers a
