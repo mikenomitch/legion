@@ -299,8 +299,48 @@ How to use it:
         `packing-density.sh` during this step: it needs the same
         standing rig and retires the 1,250 assumption before any cell
         is sized from it.
-  - [ ] **Investigate: a 1k simulated fleet sustains ~59 heartbeat
-        RPCs/sec where ~500/sec is expected, with nothing saturated.**
+  - [ ] **The simulator's shared gRPC channel pool caps a fleet at ~40-60
+        heartbeats/sec per process, not the manager.** DIAGNOSED on the
+        first real AWS rig (2026-08-03). 1000 sim nodes at a 2s cadence
+        should produce ~500 heartbeat RPCs/sec; the rig sustained ~41/sec
+        worker-side and ~47/sec manager-side. The two sides of the *same
+        call* disagree by 200x:
+        - `legion.Manager/Heartbeat` handler p99: **50ms**
+        - `legion_worker_heartbeat_duration_seconds` p99: **10s** (the top
+          bucket, so possibly worse)
+        - `legion_worker_heartbeats_total` is **100% `outcome="ok"`** — no
+          errors, no retries; heartbeats succeed, just slowly
+        - sim host CPU **0.2%**, manager CPU **19-23%** — neither is
+          resource-bound
+        So ~10s per round trip is spent client-side, before the request
+        reaches a handler that answers in 50ms. The suspect is
+        `SIM_NODES_PER_CHANNEL = 256` / `SIM_MAX_CHANNELS = 16`
+        (`src/worker/simulate.rs`): 1000 nodes multiplex over just 4
+        HTTP/2 connections, so heartbeats queue on stream concurrency.
+        This is the check `docs/metrics.md` describes as "how you prove
+        the workers are not the bottleneck" — and it proves they are.
+        Consequences and options:
+        - The plan's 1,250 nodes/instance is **not achievable at a 2s
+          cadence with the current pool**, and `packing-density.sh` will
+          keep reporting saturation at 1000 with an idle host until this
+          changes. Every scale step's sizing depends on it.
+        - Fix candidates: lower `SIM_NODES_PER_CHANNEL` (64 would give 16
+          channels at 1000 nodes), raise `SIM_MAX_CHANNELS`, or shard
+          into several sim processes per instance in
+          `start-sim-fleet.sh`. Whichever is chosen, re-run the density
+          drill and record the new ceiling.
+        - `docs/worker-simulation.md` should state the per-process
+          heartbeat ceiling as a known limit, next to the existing
+          "shared channels" note, since it bounds what a simulated
+          campaign can claim.
+  - [ ] ~~Investigate: a 1k simulated fleet sustains ~59 heartbeat
+        RPCs/sec where ~500/sec is expected, with nothing saturated.~~
+        Resolved by the entry above. **Correction to that entry's last
+        bullet:** the follower disagreement (leader 942 active vs both
+        followers 0 active / 1000 lost) was transient — measured just
+        after a fleet teardown. With a fleet running, all three managers
+        report ~997 active / ~3 lost. Node status replicates correctly;
+        there is no replication bug.
         Measured on the first real AWS rig (2026-08-03, 1000 sim nodes on
         one c7i.2xlarge against a 3-voter lanes control plane). The
         numbers rule out the easy explanations:
