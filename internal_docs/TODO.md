@@ -299,7 +299,36 @@ How to use it:
         `packing-density.sh` during this step: it needs the same
         standing rig and retires the 1,250 assumption before any cell
         is sized from it.
-  - [ ] **The manager sustains only ~80 heartbeat RPCs/sec regardless of
+  - [x] **Manager heartbeat throughput: ~7x, by taking the store call off
+        the tokio runtime.** `Manager::heartbeat` called the blocking
+        `Store::update_node_heartbeat` inline on a worker thread. That
+        parked the thread for a whole fsync-bound raft commit, and — the
+        part that actually mattered — left every other heartbeat stuck in
+        the gRPC layer where the coalescer could not see it, so batches
+        stayed at size 1 and `HEARTBEAT_BATCH_MAX = 128` was never
+        approached. Now offloaded via `spawn_blocking`, so the queue
+        builds, batches form, and one fsync amortizes across many beats.
+
+        Measured on gp3 EBS (`experiments/heartbeat-commit-probe.sh`,
+        3 voters + 1000 sim nodes on one box, 2s cadence = 500/sec needed):
+
+        | worker threads | before | after |
+        | --- | --- | --- |
+        | 1 | 48.3/sec (9%) | **349.8/sec (69%)** |
+        | 4 | 60.5/sec (12%) | **422.6/sec (84%)** |
+
+        `cargo test --all --locked`: 1405 passed, 0 failed.
+
+        Note the before-numbers barely move with thread count (48 -> 60):
+        adding threads does not help when every thread is blocked, which
+        is why "raise worker_threads" was never the fix.
+
+        Still open, tracked separately: the remaining 16% gap at 4 threads,
+        which is the single `pipeline_loop` OS thread per lane plus the
+        fsync itself — see the liveness plan below for the architectural
+        answer, and note the control plane now runs on local NVMe
+        (`m6id.xlarge`), which removes most of the fsync cost.
+  - [ ] ~~The manager sustains only ~80 heartbeat RPCs/sec regardless of
         fleet size or shape.** Measured on the first real AWS rig
         (2026-08-03; 3x m7i.xlarge, 3-voter lanes, sim fleets on
         c7i.2xlarge). This is a Legion-side ceiling, not a simulator one:
@@ -331,6 +360,20 @@ How to use it:
         engages at these arrival rates, or whether each heartbeat pays a
         full quorum round trip.
 
+        **The instrumentation gap is closed** (2026-08-02, Done section):
+        the next run of this rig can answer the open questions from
+        `/metrics` alone — whether batching engages
+        (`legion_store_coalesce_batch_size` le="1" vs `_count`), whether
+        submitters wait or commit (`_wait_seconds{role}` vs
+        `_commit_seconds`), whether the per-lane raft pipeline is the queue
+        (`legion_raft_pipeline_wait_seconds` / `_depth`), and whether the
+        tokio runtime is saturated by the blocking call
+        (`legion_grpc_in_flight` vs `legion_runtime_worker_threads`, and
+        `legion_runtime_spawn_delay_seconds`, which explains the 30ms
+        `HealthCheck` p99 if it is). Read order:
+        [docs/metrics.md](../docs/metrics.md) § "Diagnosing a manager
+        throughput ceiling".
+
         **Consequences.** At ~80 hb/s a single manager supports roughly
         160 nodes at the 2s default cadence before liveness degrades, so
         the campaign cannot reach its 1k-10k scale steps without either
@@ -343,6 +386,33 @@ How to use it:
         gRPC channel pool. `SIM_NODES_PER_CHANNEL` was changed 256 -> 64
         (4x the connections at 250 nodes) and rebuilt; cadence went 66%
         -> 64%, i.e. no change. That commit is reverted.
+
+        **Design answer:**
+        [heartbeat-cadence-at-scale-plan.md](plans/heartbeat-cadence-at-scale-plan.md)
+        (planned) — sizing formula + freshness metric, a runtime warning,
+        per-node lost windows derived from each node's cadence, and
+        opt-in manager-dictated adaptive cadence. It does not raise the
+        ~80/s ceiling; it stops the ceiling from marking healthy nodes
+        lost, and makes the cadence a run was measured at part of the
+        fairness record. Raising the ceiling itself is still D8.
+  - [ ] **Status-lane leadership change has no lost-node grace.**
+        `nodes_to_mark_lost` (`src/manager/daemon.rs:978`) suppresses
+        marking only for the first `DEF_LOST_NODE_AT_SEC` of *process*
+        uptime, measured from `started_at` in
+        `start_node_status_checker`. Under `lanes`, a long-running
+        manager that acquires status-lane leadership mid-life starts
+        marking immediately, right after an election during which the
+        fleet's heartbeats were failing. Nomad's `failover_heartbeat_ttl`
+        is the prior art; fix is phase 3 of
+        [heartbeat-cadence-at-scale-plan.md](plans/heartbeat-cadence-at-scale-plan.md).
+  - [ ] **`heartbeatSeconds` and `stateful.onLost.selfTerminateAfter`
+        are unvalidated against each other.** `selfTerminateAfter`
+        defaults to 90s (`src/structs/job.rs:1050`) and makes a worker
+        kill its own stateful tasks after that long without manager
+        contact. Nothing stops a cadence at or near that value, in which
+        case a healthy worker self-fences between beats. Currently masked
+        by the `1..=30` clamp; becomes live the moment that clamp widens.
+        Cross-check specified in the plan's §7.
 
   - [ ] ~~Investigate: a 1k simulated fleet sustains ~59 heartbeat
         RPCs/sec where ~500/sec is expected, with nothing saturated.~~
@@ -744,6 +814,20 @@ Plans: [persistence-plan.md](plans/persistence-plan.md), [multi-raft-persistence
         in [tests/raft_perf_smoke.rs](../tests/raft_perf_smoke.rs);
         numbers in [docs/multi-raft.md](../docs/multi-raft.md) § "Lane
         isolation A/B".
+  - [x] Contention instrumentation for the manager write path (2026-08-02):
+        the families that were missing when the ~80 hb/s ceiling was
+        investigated — group-commit effectiveness
+        (`legion_store_coalesce_batch_size` / `_wait_seconds{role}` /
+        `_commit_seconds` / `_wait_rounds_total`, labeled `heartbeat` and
+        `plan_apply`), the per-lane pipeline queue in front of raft
+        (`legion_raft_pipeline_wait_seconds`, `legion_raft_pipeline_depth`),
+        and runtime saturation (`legion_grpc_in_flight`,
+        `legion_runtime_spawn_delay_seconds`,
+        `legion_runtime_worker_threads`). Read order in
+        [docs/metrics.md](../docs/metrics.md) § "Diagnosing a manager
+        throughput ceiling"; calls in
+        [calls/manager-contention-instrumentation_calls.md](calls/manager-contention-instrumentation_calls.md).
+        Instrumentation only — the blocking heartbeat path is unchanged.
   - [x] Raft engine metrics + per-lane bottleneck tracing (2026-07-30):
         the full `legion_raft_*` series — per-lane term / commit_index /
         applied_index / apply_lag / is_leader gauges on the checker tick,

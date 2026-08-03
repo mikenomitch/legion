@@ -5105,9 +5105,29 @@ impl Manager for ManagerDaemonService {
         let id = req.id;
         let provisional_claims = req.provisional_claims;
 
-        self.store
-            .update_node_heartbeat(id.clone())
-            .map_err(|e| map_store_error("Error updating node heartbeat", e))?;
+        // Offloaded, not called inline: `update_node_heartbeat` is a
+        // BLOCKING call (coalescer std::sync::Mutex + mpsc, then a raft
+        // commit that fsyncs). Running it on a tokio worker thread parks
+        // that thread for the whole commit, so at most `worker_threads`
+        // heartbeats can be in flight — and, worse, every other heartbeat
+        // stays stuck in the gRPC layer where the coalescer cannot see it.
+        // The coalescer batches whatever is queued when a commit finishes,
+        // so starving its queue keeps batches at size 1 and defeats the
+        // group commit entirely (HEARTBEAT_BATCH_MAX is 128).
+        //
+        // Measured on gp3 EBS (3 voters, one box, 1000 sim nodes): 86
+        // heartbeats/sec, 17% of the 2s cadence, with the host idle. The
+        // same code on NVMe does ~2000/sec, because a 0.5ms commit meets
+        // demand even at batch size 1 — which is why this only shows up on
+        // network-attached storage.
+        {
+            let store = self.store.clone();
+            let heartbeat_id = id.clone();
+            tokio::task::spawn_blocking(move || store.update_node_heartbeat(heartbeat_id))
+                .await
+                .map_err(|e| Status::internal(format!("heartbeat task failed: {e}")))?
+                .map_err(|e| map_store_error("Error updating node heartbeat", e))?;
+        }
 
         if let Err(err) = handle_failed_allocations(
             &self.store,
