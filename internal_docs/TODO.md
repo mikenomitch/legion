@@ -299,53 +299,51 @@ How to use it:
         `packing-density.sh` during this step: it needs the same
         standing rig and retires the 1,250 assumption before any cell
         is sized from it.
-  - [ ] **The simulator's shared gRPC channel pool caps a fleet at ~40-60
-        heartbeats/sec per process, not the manager.** DIAGNOSED on the
-        first real AWS rig (2026-08-03). 1000 sim nodes at a 2s cadence
-        should produce ~500 heartbeat RPCs/sec; the rig sustained ~41/sec
-        worker-side and ~47/sec manager-side. The two sides of the *same
-        call* disagree by 200x:
-        - `legion.Manager/Heartbeat` handler p99: **50ms**
-        - `legion_worker_heartbeat_duration_seconds` p99: **10s** (the top
-          bucket, so possibly worse)
-        - `legion_worker_heartbeats_total` is **100% `outcome="ok"`** — no
-          errors, no retries; heartbeats succeed, just slowly
-        - sim host CPU **0.2%**, manager CPU **19-23%** — neither is
-          resource-bound
-        So ~10s per round trip is spent client-side, before the request
-        reaches a handler that answers in 50ms. This is the check
-        `docs/metrics.md` describes as "how you prove the workers are not
-        the bottleneck" — and it proves they are.
+  - [ ] **The manager sustains only ~80 heartbeat RPCs/sec regardless of
+        fleet size or shape.** Measured on the first real AWS rig
+        (2026-08-03; 3x m7i.xlarge, 3-voter lanes, sim fleets on
+        c7i.2xlarge). This is a Legion-side ceiling, not a simulator one:
 
-        **The knee is per-channel, and it was measured.** A ladder run
-        with everything on ONE channel isolates it (`div_ceil(n, 256)` is
-        1 for both rows), with the host at 0% CPU throughout:
+        | fleet layout | total heartbeats/sec |
+        | --- | --- |
+        | 250 nodes on 1 sim host | 80 |
+        | 250 nodes across 2 sim hosts (125 each) | 80.3 |
 
-        | nodes/channel | cadence | heartbeat p99 |
-        | --- | --- | --- |
-        | 125 | 97% | 0.23s |
-        | 250 | 66% | 2.47s |
+        Doubling the simulator hardware bought nothing — per-host
+        throughput *fell* from ~60/s to ~40/s so the total stayed pinned.
+        A shared downstream resource is the constraint, and it is the
+        manager. Supporting evidence:
+        - `legion.Manager/Heartbeat` handler p99 **50ms**, which is slow
+          for a counter bump plus a node-timestamp update, and at ~80/s
+          implies only ~4 requests in flight
+        - manager CPU **19-23%** of 4 vCPU, sim hosts **0.2%** — nothing
+          is CPU-bound, so this is latency/serialization, not work
+        - `legion_worker_heartbeats_total` is 100% `outcome="ok"` — no
+          errors, no retries
+        - the fleet degrades smoothly with density: 125 nodes/host holds
+          97% cadence at 0.23s p99; 250 holds 64% at 2.49s
 
-        Doubling density costs 10x the latency while nothing is busy, so
-        this is queueing on the shared HTTP/2 connection. The old
-        `SIM_NODES_PER_CHANNEL = 256` put **every** fleet past that knee
-        by construction — a simulated instance carried ~125 usable nodes,
-        one tenth of the plan's 1,250, and the drill's implied sizing for
-        the 20k validation burst went from 16 instances to **160
-        instances / 1,280 spot vCPU**, which is not affordable.
+        Prime suspect: `Manager::heartbeat` calls
+        `store.update_node_heartbeat`, which on a raft store commits
+        through the status lane. A per-heartbeat raft commit would be
+        latency-bound exactly like this. `docs/multi-raft.md` describes
+        heartbeat group commit — worth checking whether batching actually
+        engages at these arrival rates, or whether each heartbeat pays a
+        full quorum round trip.
 
-        **Fix applied:** `SIM_NODES_PER_CHANNEL` 256 → 64 and
-        `SIM_MAX_CHANNELS` 16 → 64 (`src/worker/simulate.rs`), keeping
-        density well under the measured knee while admitting 4,096 nodes
-        per process. `cargo test --all --locked`: 34 suites, 1402 passed.
-        **Still to confirm:** re-run the ladder against the rebuilt
-        binary and record the new ceiling here — 64 has margin but the
-        knee was not bisected, so the true per-channel limit is somewhere
-        in 125-250 and the optimum may be higher than 64.
-        - `docs/worker-simulation.md` should state the per-process
-          heartbeat ceiling as a known limit, next to the existing
-          "shared channels" note, since it bounds what a simulated
-          campaign can claim.
+        **Consequences.** At ~80 hb/s a single manager supports roughly
+        160 nodes at the 2s default cadence before liveness degrades, so
+        the campaign cannot reach its 1k-10k scale steps without either
+        fixing this or raising `heartbeatSeconds` (which changes what is
+        being measured and must be recorded in the fairness record).
+        Every phase 2-5 campaign is blocked on understanding it — a run
+        at 1k+ nodes today measures this ceiling, not the scheduler.
+
+        **Not the cause, ruled out by experiment:** the simulator's
+        gRPC channel pool. `SIM_NODES_PER_CHANNEL` was changed 256 -> 64
+        (4x the connections at 250 nodes) and rebuilt; cadence went 66%
+        -> 64%, i.e. no change. That commit is reverted.
+
   - [ ] ~~Investigate: a 1k simulated fleet sustains ~59 heartbeat
         RPCs/sec where ~500/sec is expected, with nothing saturated.~~
         Resolved by the entry above. **Correction to that entry's last
