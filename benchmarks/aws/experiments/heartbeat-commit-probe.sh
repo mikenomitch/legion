@@ -151,7 +151,7 @@ hist_p99() { # hist_p99 <telemetry-port> <bucket-metric> <label-match>
 }
 
 run_cell() { # run_cell <threads> <nodes>
-    local threads="$1" nodes="$2" i
+    local threads="$1" nodes="$2" i voters_seen="?"
     WORK=$(mktemp -d -t hbprobe-XXXXXX)
     export TOKIO_WORKER_THREADS="$threads"
 
@@ -173,6 +173,9 @@ run_cell() { # run_cell <threads> <nodes>
             [ "${voters:-0}" -ge "$VOTERS" ] && break
             sleep 2
         done
+        voters_seen="${voters:-0}"
+    else
+        voters_seen=1
     fi
 
     local token
@@ -196,21 +199,56 @@ run_cell() { # run_cell <threads> <nodes>
     sleep "$HOLD"
     after=$(metric 4749 legion_heartbeats_total); t1=$(date +%s)
 
+    # The manager's own /metrics is served by the same starved runtime we
+    # are measuring: with the worker threads parked in blocking commits it
+    # stops answering, and a scrape timeout is indistinguishable from
+    # "zero heartbeats". The simulated fleet reports its achieved rate from
+    # a process that is NOT saturated, so prefer it whenever the
+    # manager-side read came back empty.
+    local sim_rate
+    # Strip ANSI first: tracing colourises field names, and those escape
+    # sequences contain digits, so any digit-based pattern matches inside
+    # them instead of the value. `heartbeats_expected_per_sec` is a
+    # different key so the anchored match below cannot pick it up.
+    sim_rate=$(sed 's/\x1b\[[0-9;]*m//g' "$WORK/sim.log" 2>/dev/null |
+        grep -o 'heartbeats_per_sec: "[0-9.]*"' | grep -o '[0-9.]\+' | tail -1)
+
     local achieved expected pct p99
-    achieved=$(echo "scale=1; (${after:-0} - ${before:-0}) / ($t1 - $t0)" | bc)
+    local achieved_src=manager
+    if [ -n "${before:-}" ] && [ -n "${after:-}" ]; then
+        achieved=$(echo "scale=1; ($after - $before) / ($t1 - $t0)" | bc)
+    else
+        achieved="${sim_rate:-0}"
+        log "manager /metrics unreadable (runtime starved?) — using fleet-reported rate"
+    fi
     expected=$(echo "scale=1; $nodes / 2" | bc)
     pct=$(echo "scale=0; $achieved * 100 / $expected" | bc 2>/dev/null || echo "?")
     p99=$(hist_p99 4749 legion_grpc_request_duration_seconds_bucket Heartbeat)
 
-    printf '  %-8s %-7s %-11s %-11s %-7s %s\n' \
-        "$threads" "$nodes" "$achieved" "$expected" "${pct}%" "${p99}s"
+    # `registered` and `voters` are reported, not just used internally: a
+    # zero throughput row is otherwise uninterpretable. "0/s with 1000
+    # nodes registered" is a real ceiling; "0/s with 0 registered" means
+    # the fleet never attached and the cell measured nothing at all.
+    printf '  %-8s %-7s %-11s %-11s %-7s %-9s %-7s %s\n' \
+        "$threads" "$nodes" "$achieved" "$expected" "${pct}%" \
+        "${p99}s" "${voters_seen:-?}" "${registered:-0}"
+
+    # Keep the evidence when a cell produced nothing — the temp dir is
+    # about to be deleted, and re-running to capture it costs another
+    # instance-hour.
+    if [ "${achieved%%.*}" = "0" ]; then
+        echo "  -- cell produced no heartbeats; manager 0 log tail --" >&2
+        tail -20 "$WORK/m0.log" >&2 2>/dev/null || true
+        echo "  -- sim log tail --" >&2
+        tail -20 "$WORK/sim.log" >&2 2>/dev/null || true
+    fi
     cleanup_run
 }
 
 echo
 echo "  heartbeat throughput vs commit cost — ${VOTERS} voter(s), all on this box"
-printf '  %-8s %-7s %-11s %-11s %-7s %s\n' threads nodes achieved expected cadence hb_p99
-printf '  %-8s %-7s %-11s %-11s %-7s %s\n' ------- ----- -------- -------- ------- ------
+printf '  %-8s %-7s %-11s %-11s %-7s %-9s %-7s %s\n' threads nodes achieved expected cadence hb_p99 voters registered
+printf '  %-8s %-7s %-11s %-11s %-7s %-9s %-7s %s\n' ------- ----- -------- -------- ------- ------ ------ ----------
 for threads in $THREADS_LIST; do
     for nodes in $NODES_LIST; do
         run_cell "$threads" "$nodes" || echo "  (cell threads=$threads nodes=$nodes failed)"

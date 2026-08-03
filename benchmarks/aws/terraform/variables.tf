@@ -54,9 +54,40 @@ variable "control_plane_count" {
 }
 
 variable "control_plane_type" {
-  description = "On-demand instance type for the control plane (4 vCPU / 16 GiB in the plan)."
+  description = <<-EOT
+    On-demand instance type for the control plane (4 vCPU / 16 GiB in the
+    plan). Default `m6id.xlarge` — same 4 vCPU / 16 GiB as the `m7i.xlarge`
+    it replaces, but with 237 GB of LOCAL NVMe, which cloud-init mounts at
+    /var/lib/legion so every raft data dir lands on it.
+
+    This is a measurement decision, not a tuning one. Measured 2026-08-03
+    with `experiments/heartbeat-commit-probe.sh`, identical code and a
+    3-voter lanes topology, varying only the disk:
+
+      gp3 (EBS root)   ~86 heartbeats/sec   (17% of a 2s cadence)
+      local NVMe     ~2000 heartbeats/sec   (100%)
+
+    A raft commit fsyncs, and on network-attached storage that fsync — not
+    the scheduler — sets control-plane throughput. Leaving the campaign on
+    gp3 would publish a comparison of EBS latency wearing three different
+    schedulers' clothes.
+
+    It is NOT a thumb on the scale for Legion. The systems are affected
+    unequally *by architecture*: Nomad resets an in-memory timer on the
+    leader per heartbeat (`resetHeartbeatTimer`, no raft write), K8s writes
+    a small Lease to etcd (KEP-589 shrank it from the 15 KB Node object),
+    and Legion replicates every heartbeat through the status lane. Fast
+    local disk is what stops that architectural difference from being
+    swamped by storage latency — and identical hardware for all three is
+    still the rule (judgement call 3).
+
+    The trade, which belongs in every fairness record: instance-store NVMe
+    is EPHEMERAL. It does not survive a stop/start or a replacement, which
+    is a genuine deployment difference from the EBS-backed control planes
+    many operators run on purpose.
+  EOT
   type        = string
-  default     = "m7i.xlarge"
+  default     = "m6id.xlarge"
 }
 
 variable "control_plane_disk_gb" {
