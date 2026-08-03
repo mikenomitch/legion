@@ -313,22 +313,35 @@ How to use it:
         - sim host CPU **0.2%**, manager CPU **19-23%** — neither is
           resource-bound
         So ~10s per round trip is spent client-side, before the request
-        reaches a handler that answers in 50ms. The suspect is
-        `SIM_NODES_PER_CHANNEL = 256` / `SIM_MAX_CHANNELS = 16`
-        (`src/worker/simulate.rs`): 1000 nodes multiplex over just 4
-        HTTP/2 connections, so heartbeats queue on stream concurrency.
-        This is the check `docs/metrics.md` describes as "how you prove
-        the workers are not the bottleneck" — and it proves they are.
-        Consequences and options:
-        - The plan's 1,250 nodes/instance is **not achievable at a 2s
-          cadence with the current pool**, and `packing-density.sh` will
-          keep reporting saturation at 1000 with an idle host until this
-          changes. Every scale step's sizing depends on it.
-        - Fix candidates: lower `SIM_NODES_PER_CHANNEL` (64 would give 16
-          channels at 1000 nodes), raise `SIM_MAX_CHANNELS`, or shard
-          into several sim processes per instance in
-          `start-sim-fleet.sh`. Whichever is chosen, re-run the density
-          drill and record the new ceiling.
+        reaches a handler that answers in 50ms. This is the check
+        `docs/metrics.md` describes as "how you prove the workers are not
+        the bottleneck" — and it proves they are.
+
+        **The knee is per-channel, and it was measured.** A ladder run
+        with everything on ONE channel isolates it (`div_ceil(n, 256)` is
+        1 for both rows), with the host at 0% CPU throughout:
+
+        | nodes/channel | cadence | heartbeat p99 |
+        | --- | --- | --- |
+        | 125 | 97% | 0.23s |
+        | 250 | 66% | 2.47s |
+
+        Doubling density costs 10x the latency while nothing is busy, so
+        this is queueing on the shared HTTP/2 connection. The old
+        `SIM_NODES_PER_CHANNEL = 256` put **every** fleet past that knee
+        by construction — a simulated instance carried ~125 usable nodes,
+        one tenth of the plan's 1,250, and the drill's implied sizing for
+        the 20k validation burst went from 16 instances to **160
+        instances / 1,280 spot vCPU**, which is not affordable.
+
+        **Fix applied:** `SIM_NODES_PER_CHANNEL` 256 → 64 and
+        `SIM_MAX_CHANNELS` 16 → 64 (`src/worker/simulate.rs`), keeping
+        density well under the measured knee while admitting 4,096 nodes
+        per process. `cargo test --all --locked`: 34 suites, 1402 passed.
+        **Still to confirm:** re-run the ladder against the rebuilt
+        binary and record the new ceiling here — 64 has margin but the
+        knee was not bisected, so the true per-channel limit is somewhere
+        in 125-250 and the optimum may be higher than 64.
         - `docs/worker-simulation.md` should state the per-process
           heartbeat ceiling as a known limit, next to the existing
           "shared channels" note, since it bounds what a simulated
