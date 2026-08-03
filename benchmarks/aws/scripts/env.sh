@@ -10,6 +10,18 @@ set -euo pipefail
 
 AWS_BENCH_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REPO_ROOT="$(cd "$AWS_BENCH_ROOT/../.." && pwd)"
+
+# Make the Rust toolchain reachable however this script was invoked.
+# rustup puts cargo in ~/.cargo/bin and appends its env to ~/.bashrc,
+# which Ubuntu's .bashrc skips for non-interactive shells — and every
+# remote invocation (`ssh host "scripts/build-and-upload.sh"`, a tmux
+# command string) is non-interactive. Without this, build-and-upload.sh
+# dies on `cargo: command not found` after the campaign has already
+# built the rig.
+if ! command -v cargo >/dev/null 2>&1 && [ -f "$HOME/.cargo/env" ]; then
+    # shellcheck disable=SC1091
+    . "$HOME/.cargo/env"
+fi
 TF_DIR="$AWS_BENCH_ROOT/terraform"
 RESULTS_ROOT="$AWS_BENCH_ROOT/results"
 
