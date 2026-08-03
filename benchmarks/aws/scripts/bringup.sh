@@ -20,9 +20,25 @@ done
 
 log "waiting for cloud-init (node_exporter) on every box"
 for ip in "${CP_ADDRS[@]}" "$LOADGEN_ADDR"; do
-    rsh "$ip" "cloud-init status --wait >/dev/null"
-    wait_for_http "http://$ip:9100/metrics" 120 2>/dev/null ||
-        rsh "$ip" "curl -fsS -m 3 http://localhost:9100/metrics >/dev/null"
+    # `cloud-init status --wait` exits non-zero when the run ended in
+    # error, and under `set -e` that killed bringup with no output at
+    # all — the box, the failing module, and the reason were all on the
+    # instance and never surfaced. Report them here instead: a cloud-init
+    # failure is a first-boot bug that has to be read to be fixed.
+    if ! rsh "$ip" "cloud-init status --wait >/dev/null"; then
+        echo "cloud-init failed on $ip:" >&2
+        rsh "$ip" "cloud-init status --long 2>&1 | sed 's/^/  /'" >&2 || true
+        rsh "$ip" "sudo tail -30 /var/log/cloud-init-output.log 2>&1 | sed 's/^/  /'" >&2 || true
+        exit 1
+    fi
+    # node_exporter listens on 9100, which security.tf opens ONLY
+    # intra-rig — so probing it from an operator box could never succeed
+    # and used to burn a full 120s timeout per box. rig_http_ready picks
+    # the addressing that can actually work here.
+    rig_http_ready "$ip" 9100/metrics 120 || {
+        echo "node_exporter never came up on $ip" >&2
+        exit 1
+    }
 done
 
 "$(dirname "$0")/install-loadgen.sh"

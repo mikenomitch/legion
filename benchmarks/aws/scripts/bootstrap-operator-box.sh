@@ -212,6 +212,40 @@ import_key_pair() {
     esac
 }
 
+# Older AZs do not carry newer instance families: us-east-1e has no
+# c7i at all, and every region has some equivalent. Taking the first
+# default subnet and finding out at RunInstances costs a full
+# create-and-destroy cycle for a fact that is one API call away, so
+# intersect the AZs that offer this type with the subnets available.
+instance_type_azs() {
+    aws_ ec2 describe-instance-type-offerings \
+        --location-type availability-zone \
+        --filters "Name=instance-type,Values=$INSTANCE_TYPE" \
+        --query 'InstanceTypeOfferings[].Location' --output text | tr '\t' ' '
+}
+
+az_offers() { # az_offers <az> <space-separated az list>
+    case " $2 " in *" $1 "*) return 0 ;; esac
+    return 1
+}
+
+pick_subnet() { # pick_subnet <vpc-id> <az-list> -> "<subnet-id> <az>"
+    local vpc="$1" azs="$2" subnets sn az
+    subnets=$(aws_ ec2 describe-subnets \
+        --filters "Name=vpc-id,Values=$vpc" "Name=default-for-az,Values=true" \
+        --query 'Subnets[].[SubnetId,AvailabilityZone]' --output text)
+    while read -r sn az; do
+        [ -n "$sn" ] || continue
+        if az_offers "$az" "$azs"; then
+            echo "$sn $az"
+            return 0
+        fi
+    done <<<"$subnets"
+    die "no default subnet in $REGION sits in an AZ that offers $INSTANCE_TYPE.
+  Offered in: $azs
+  Use --type <other-type>, or OPERATOR_SUBNET_ID for a public subnet in one of those AZs."
+}
+
 cmd_create() {
     for tool in aws jq ssh rsync; do
         command -v "$tool" >/dev/null || die "$tool is required locally"
@@ -235,14 +269,36 @@ cmd_create() {
 
     ensure_local_key
 
-    local vpc_id subnet_id
-    vpc_id=$(aws_ ec2 describe-vpcs --filters Name=isDefault,Values=true \
-        --query 'Vpcs[0].VpcId' --output text)
-    [ "$vpc_id" != "None" ] || die "no default VPC in $REGION — pass a subnet with OPERATOR_SUBNET_ID"
-    subnet_id="${OPERATOR_SUBNET_ID:-$(aws_ ec2 describe-subnets \
-        --filters "Name=vpc-id,Values=$vpc_id" "Name=default-for-az,Values=true" \
-        --query 'Subnets[0].SubnetId' --output text)}"
-    log "using default VPC $vpc_id / subnet $subnet_id"
+    # Plenty of accounts have no default VPC — newer ones, and any where
+    # it was deleted. OPERATOR_SUBNET_ID is the escape hatch, so it has to
+    # be read BEFORE the default-VPC check rather than after it, and the
+    # VPC derived from the subnet. The subnet must be public: the box is
+    # reached over SSH from admin_cidr, and an Elastic IP does not help
+    # without a route to an internet gateway.
+    local vpc_id subnet_id azs subnet_az
+    azs=$(instance_type_azs)
+    [ -n "$azs" ] || die "$INSTANCE_TYPE is not offered in any AZ in $REGION"
+
+    if [ -n "${OPERATOR_SUBNET_ID:-}" ]; then
+        subnet_id="$OPERATOR_SUBNET_ID"
+        read -r vpc_id subnet_az < <(aws_ ec2 describe-subnets --subnet-ids "$subnet_id" \
+            --query 'Subnets[0].[VpcId,AvailabilityZone]' --output text 2>/dev/null || true)
+        [ -n "${vpc_id:-}" ] && [ "$vpc_id" != None ] ||
+            die "subnet $subnet_id not found in $REGION"
+        az_offers "$subnet_az" "$azs" ||
+            die "subnet $subnet_id is in $subnet_az, which does not offer $INSTANCE_TYPE.
+  Offered in: $azs
+  Pick a subnet in one of those AZs, or use --type."
+        log "using subnet $subnet_id ($subnet_az, VPC $vpc_id) from OPERATOR_SUBNET_ID"
+    else
+        vpc_id=$(aws_ ec2 describe-vpcs --filters Name=isDefault,Values=true \
+            --query 'Vpcs[0].VpcId' --output text)
+        [ "$vpc_id" != "None" ] || die "no default VPC in $REGION.
+  Create one (free, instant):     aws ec2 create-default-vpc --region $REGION
+  Or use an existing public subnet: OPERATOR_SUBNET_ID=subnet-... $0 $CMD"
+        read -r subnet_id subnet_az < <(pick_subnet "$vpc_id" "$azs")
+        log "using default VPC $vpc_id / subnet $subnet_id ($subnet_az)"
+    fi
 
     log "creating key pair, security group, and IAM role"
     state_init
@@ -278,9 +334,12 @@ cmd_create() {
     user_data=$(render_user_data)
     # The instance profile was created seconds ago and IAM is eventually
     # consistent, so RunInstances can fail with "Invalid IAM Instance
-    # Profile name" on a race that resolves itself. Retry rather than
-    # making the operator re-run the whole command.
-    local attempt
+    # Profile name" on a race that resolves itself. Retry THAT and only
+    # that. Retrying every failure — the obvious loop — spends 80 seconds
+    # hiding the real error behind a message naming the one cause it is
+    # not, which is worse than failing immediately.
+    local attempt err errfile
+    errfile=$(mktemp)
     for attempt in $(seq 1 12); do
         instance_id=$(aws_ ec2 run-instances \
             --image-id "$ami" \
@@ -294,11 +353,28 @@ cmd_create() {
             --user-data "$user_data" \
             --tag-specifications \
             "ResourceType=instance,Tags=[{Key=Name,Value=$NAME},{Key=Project,Value=legion-bench},{Key=Purpose,Value=benchmark-operator}]" \
-            --query 'Instances[0].InstanceId' --output text 2>/dev/null) && break
-        log "  RunInstances not ready yet (IAM propagation), retry $attempt/12"
-        sleep 5
+            --query 'Instances[0].InstanceId' --output text 2>"$errfile") && break
+        err=$(cat "$errfile")
+        case "$err" in
+        *"Invalid IAM Instance Profile"* | *iamInstanceProfile*)
+            log "  waiting for the IAM instance profile to propagate, retry $attempt/12"
+            sleep 5
+            ;;
+        *VcpuLimitExceeded* | *InstanceLimitExceeded*)
+            rm -f "$errfile"
+            die "$INSTANCE_TYPE exceeds this account's on-demand vCPU quota in $REGION:
+  $err
+  Raise 'Running On-Demand Standard instances' (quota L-1216C47A), or use a
+  smaller box: $0 $CMD --type c7i.large   (cheaper, much slower dist build)"
+            ;;
+        *)
+            rm -f "$errfile"
+            die "RunInstances failed: $err"
+            ;;
+        esac
     done
-    [ -n "${instance_id:-}" ] || die "RunInstances failed — re-run with the AWS CLI's --debug to see why"
+    rm -f "$errfile"
+    [ -n "${instance_id:-}" ] || die "RunInstances kept failing after IAM-propagation retries: ${err:-unknown}"
     state_put instance_id "$instance_id"
 
     aws_ ec2 wait instance-running --instance-ids "$instance_id"
@@ -314,6 +390,18 @@ cmd_create() {
     ssh_ "cloud-init status --wait >/dev/null 2>&1 || true"
     ssh_ "test -f /home/ubuntu/.setup-complete" ||
         die "setup did not complete; check: $0 ssh 'sudo tail -50 /var/log/cloud-init-output.log'"
+
+    # `.setup-complete` proves cloud-init ran. It does NOT prove the tools
+    # are reachable the way the campaign scripts reach them — over a
+    # non-interactive ssh, which skips ~/.bashrc and so misses anything
+    # rustup put there. Check the way the caller will call.
+    local missing
+    missing=$(ssh_ 'for t in cargo rustc clang terraform aws tmux python3 protoc git rsync; do
+                        command -v $t >/dev/null 2>&1 || echo -n " $t"
+                    done')
+    [ -z "$missing" ] ||
+        die "the box came up but these are not on a non-interactive PATH:$missing
+  Check: $0 ssh 'sudo tail -50 /var/log/cloud-init-output.log'"
 
     log "box is ready"
     cmd_push
@@ -347,28 +435,49 @@ EOF
 # IAM roles for the rig's own boxes. PowerUserAccess covers all of that
 # except IAM, which is deliberately added back narrowed to the rig's
 # name prefix — a benchmark box has no business minting arbitrary roles.
+#
+# Idempotent on every call: `destroy`'s IAM deletes are best-effort, so a
+# retry after a failed create routinely finds some of these already
+# there. EntityAlreadyExists is the expected case, not an error — but it
+# is the ONLY tolerated one, so a genuine permissions failure here still
+# stops the run instead of surfacing later as an unexplained
+# RunInstances error.
+iam_ok() { # iam_ok <aws iam args...>
+    local err
+    err=$(aws iam "$@" 2>&1 >/dev/null) && return 0
+    case "$err" in
+    *EntityAlreadyExists* | *LimitExceeded.DuplicateName*) return 0 ;;
+    *) die "iam $1 failed: $err" ;;
+    esac
+}
+
 create_iam_role() {
     state_put iam_role_created true
-    aws iam create-role --role-name "$NAME" \
+    iam_ok create-role --role-name "$NAME" \
         --assume-role-policy-document '{
           "Version":"2012-10-17",
           "Statement":[{"Effect":"Allow","Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole"}]
-        }' >/dev/null
-    aws iam attach-role-policy --role-name "$NAME" \
-        --policy-arn arn:aws:iam::aws:policy/PowerUserAccess >/dev/null
-    aws iam put-role-policy --role-name "$NAME" --policy-name rig-iam \
+        }'
+    iam_ok attach-role-policy --role-name "$NAME" \
+        --policy-arn arn:aws:iam::aws:policy/PowerUserAccess
+    iam_ok put-role-policy --role-name "$NAME" --policy-name rig-iam \
         --policy-document '{
           "Version":"2012-10-17",
           "Statement":[
             {
               "Sid":"ManageRigRoles",
               "Effect":"Allow",
-              "Action":["iam:CreateRole","iam:DeleteRole","iam:GetRole","iam:TagRole",
+              "Action":["iam:CreateRole","iam:DeleteRole","iam:GetRole",
+                        "iam:UpdateAssumeRolePolicy",
+                        "iam:TagRole","iam:UntagRole","iam:ListRoleTags",
                         "iam:PutRolePolicy","iam:DeleteRolePolicy","iam:GetRolePolicy",
                         "iam:ListRolePolicies","iam:ListAttachedRolePolicies",
                         "iam:AttachRolePolicy","iam:DetachRolePolicy",
                         "iam:CreateInstanceProfile","iam:DeleteInstanceProfile",
-                        "iam:GetInstanceProfile","iam:AddRoleToInstanceProfile",
+                        "iam:GetInstanceProfile","iam:ListInstanceProfilesForRole",
+                        "iam:TagInstanceProfile","iam:UntagInstanceProfile",
+                        "iam:ListInstanceProfileTags",
+                        "iam:AddRoleToInstanceProfile",
                         "iam:RemoveRoleFromInstanceProfile","iam:PassRole"],
               "Resource":["arn:aws:iam::*:role/legion-bench*",
                           "arn:aws:iam::*:instance-profile/legion-bench*"]
@@ -382,10 +491,37 @@ create_iam_role() {
                 "autoscaling.amazonaws.com","spot.amazonaws.com","spotfleet.amazonaws.com"]}}
             }
           ]
-        }' >/dev/null
-    aws iam create-instance-profile --instance-profile-name "$NAME" >/dev/null
-    aws iam add-role-to-instance-profile --instance-profile-name "$NAME" \
-        --role-name "$NAME" >/dev/null
+        }'
+    iam_ok create-instance-profile --instance-profile-name "$NAME"
+
+    # Attach only if it is not already attached. Re-adding a role that is
+    # already on the profile fails with `LimitExceeded: Cannot exceed
+    # quota for InstanceSessionsPerInstanceProfile: 1` — which reads like
+    # an account limit but just means "already done", and is the wrong
+    # thing to blanket-tolerate in iam_ok since a real limit shares the
+    # code. Checking state is unambiguous.
+    local attached
+    attached=$(aws iam get-instance-profile --instance-profile-name "$NAME" \
+        --query 'InstanceProfile.Roles[].RoleName' --output text 2>/dev/null || true)
+    case "$attached" in
+    *"$NAME"*) ;;
+    *) iam_ok add-role-to-instance-profile --instance-profile-name "$NAME" \
+        --role-name "$NAME"
+        attached=$(aws iam get-instance-profile --instance-profile-name "$NAME" \
+            --query 'InstanceProfile.Roles[].RoleName' --output text 2>/dev/null || true)
+        ;;
+    esac
+
+    # Verify rather than assume. If the role is not actually on the
+    # profile, RunInstances fails with "Invalid IAM Instance Profile
+    # name" forever — indistinguishable from the propagation race it
+    # retries, so it would burn the whole retry budget and then blame
+    # propagation for a permanent condition.
+    case "$attached" in
+    *"$NAME"*) ;;
+    *) die "instance profile $NAME has no role attached (got '${attached:-none}').
+  Delete it and retry:  $0 destroy" ;;
+    esac
 }
 
 # Everything the runbook shells out to, installed once at first boot.
@@ -399,8 +535,15 @@ set -euxo pipefail
 export DEBIAN_FRONTEND=noninteractive
 
 apt-get update
+# clang/libclang-dev are not optional: rusqlite is built with the
+# `session` feature, which forces libsqlite3-sys to run bindgen, and
+# bindgen needs libclang plus clang's own builtin headers (without them
+# it fails on `'stdarg.h' file not found`). CI does not surface this —
+# GitHub's ubuntu-latest runners ship clang preinstalled, a bare Ubuntu
+# AMI does not.
 apt-get install -y --no-install-recommends \
     build-essential pkg-config libssl-dev protobuf-compiler \
+    clang libclang-dev \
     git jq curl unzip tmux rsync ca-certificates gnupg \
     python3 python3-pip python3-venv
 
@@ -438,6 +581,15 @@ printf 'Host *\n    ServerAliveInterval 30\n    ServerAliveCountMax 10\n' >>"$HO
 chmod 600 "$HOME/.ssh/config"
 ASUSER
 
+# /usr/local/bin is on the default PATH for a non-interactive `ssh host
+# "cmd"`; ~/.cargo/bin is not, because rustup adds it via ~/.bashrc and
+# Ubuntu's .bashrc returns early for non-interactive shells. Every remote
+# command the campaign scripts issue arrives that way, so expose the
+# toolchain somewhere those shells can actually see it.
+for b in cargo rustc rustup; do
+    ln -sf /home/ubuntu/.cargo/bin/$b /usr/local/bin/$b
+done
+
 touch /home/ubuntu/.setup-complete
 CLOUDINIT
 }
@@ -453,10 +605,20 @@ cmd_push() {
     ip=$(state_get .public_ip)
     log "syncing $REPO_ROOT -> $ip:~/legion"
     ssh_ "mkdir -p ~/legion"
+    # --delete keeps the box a mirror of the working tree, which means it
+    # deletes anything on the box that is not here. Three things are born
+    # on the box and exist nowhere else, so they MUST be excluded:
+    #   terraform.tfvars   written by `configure` from the box's own
+    #                      Elastic IP and rig key
+    #   terraform.tfstate* the only record of every rig resource. Losing
+    #                      it orphans the whole rig — teardown.sh would
+    #                      have nothing to destroy.
+    #   .terraform*        provider plugins and the lock from `init`
     rsync -az --delete \
-        --exclude 'target/' --exclude 'node_modules/' --exclude '.terraform/' \
+        --exclude 'target/' --exclude 'node_modules/' --exclude '__pycache__/' \
+        --exclude '.terraform/' --exclude '.terraform.lock.hcl' \
+        --exclude 'terraform.tfvars' --exclude 'terraform.tfstate*' \
         --exclude 'benchmarks/aws/results/' --exclude 'benchmarks/aws/.operator-box.json' \
-        --exclude '__pycache__/' \
         -e "ssh -i $(state_get .key_path) -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes" \
         "$REPO_ROOT/" "ubuntu@$ip:legion/"
     log "synced"
@@ -617,6 +779,19 @@ cmd_start() {
     wait_for_ssh "$ip"
     log "running at $ip"
     log "tmux does not survive a stop — resume with: $0 run --from <step>"
+}
+
+# Re-apply the box's IAM role and policies to the running instance.
+# Every call in create_iam_role is idempotent, and put-role-policy
+# overwrites, so this is how a policy gap gets closed mid-campaign
+# without destroying a box that holds the terraform state. Instance-role
+# credentials refresh on their own, so the widened policy takes effect
+# within a minute or two.
+cmd_repair_iam() {
+    state_get .instance_id >/dev/null
+    log "re-applying IAM role and policies for $NAME"
+    create_iam_role
+    log "done — instance-role credentials pick this up within ~1-2 minutes"
 }
 
 cmd_status() {
@@ -797,6 +972,7 @@ run) cmd_run ;;
 logs) cmd_logs "$@" ;;
 stop) cmd_stop ;;
 start) cmd_start ;;
+repair-iam) cmd_repair_iam ;;
 tfvars) cmd_tfvars ;;
 ssh) ssh_ "$@" ;;
 status) cmd_status ;;

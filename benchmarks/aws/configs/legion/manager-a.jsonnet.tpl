@@ -7,6 +7,14 @@
   server: {
     port: 4747,
     host: '0.0.0.0',
+    // The address embedded in every join token this manager mints. Not
+    // optional here: with host '0.0.0.0' and this unset, Legion derives
+    // it as http://127.0.0.1:4747, so a remote worker decodes the token
+    // and dials its OWN loopback. The fleet then retries connection-
+    // refused forever while the campaign only sees "registered: 0/N".
+    // Distinct from persistence.raft.advertiseAddr below, which is the
+    // raft peer address.
+    advertiseAddr: 'http://${PRIVATE_IP}:4747',
   },
   storePath: '/var/lib/legion/store',
   workerConfigPath: '/opt/legion/configs/workers/',

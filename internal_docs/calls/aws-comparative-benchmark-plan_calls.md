@@ -5,8 +5,9 @@ Plan: [`../plans/aws-comparative-benchmark-plan.md`](../plans/aws-comparative-be
 Entries 1-4 are planning-stage calls; 5-10 were made while building the
 rig (phases 0-1, 2026-07-30); 11-13 came from making campaigns runnable
 unattended (2026-08-02); 18-19 came from making the rig startable at all
-from an arm64 macOS machine (2026-08-02). Ranked by project impact; the
-number is the rank.
+from an arm64 macOS machine (2026-08-02); 20 came from adding memory to
+the measured results during the first real campaign (2026-08-02). Ranked
+by project impact; the number is the rank.
 
 ## 1. Simulated workers everywhere, real control planes only
 
@@ -473,3 +474,38 @@ away the one thing worth withholding — unrestricted `iam:CreateRole` on
 an internet-facing box is a full account takeover from a single SSH
 compromise, which the name-prefix condition prevents at no usability
 cost.
+
+## 20. Memory is measured whole-box, not as manager process RSS
+
+**The call.** Memory vs load is reported from node_exporter's whole-box
+counters, split into `used` (`MemTotal - MemAvailable`) and `anon` (used
+minus page cache and buffers), peak and mean per role, reduced into a
+`memory.json` beside every cell's `metrics.json`. The scale steps are the
+load axis, so no separate low/medium/high experiment exists.
+
+**Alternatives.** (a) Add a process collector to Legion so
+`process_resident_memory_bytes` is exposed on `:4749` and measure the
+manager directly. (b) Run `node_exporter`'s `processes` collector or a
+`namedprocess` exporter on the control plane. (c) Report only `used`, the
+single number most systems quote.
+
+**Trade-off.** Whole-box memory is an upper bound: it includes the OS,
+and `used` includes reclaimable page cache. On the idle rig the control
+plane measures 1.63 GB used against 0.92 GB anon, so page cache is ~40%
+of `used` before Legion is even installed — a gap that widens as a
+SQLite-backed store warms. Every published memory figure therefore has to
+carry the caveat rather than read as "the manager uses this much".
+
+**Why (honesty over precision, and not moving the thing being measured).**
+(a) is the right answer and should happen — but not mid-campaign. It
+changes the binary under test, which invalidates the fairness record for
+every cell already collected, and the fairness record is the argument
+that makes the comparison credible at all. A slightly loose number that
+every system is measured with identically beats a precise number that
+only some cells have. (b) needs a second exporter deployed and version-
+pinned on the control plane, which is more moving parts in the fairness
+record for the same upper-bound answer, since the boxes are single-tenant
+anyway. (c) is what would have been reported by default and is the actual
+trap: `used` alone would have overstated resident cost by ~40% while
+looking like a clean measurement, and nothing in the output would have
+said so.

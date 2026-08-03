@@ -27,6 +27,17 @@ AWS_BENCH_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 STATE_DIR="${PHASE1_STATE_DIR:-$HOME/.legion-phase1}"
 mkdir -p "$STATE_DIR"
 
+# rustup puts cargo in ~/.cargo/bin and appends its env to ~/.bashrc —
+# which Ubuntu's default .bashrc never reaches, because it returns early
+# for non-interactive shells. `ssh host "cmd"` is non-interactive, and
+# that is precisely how a campaign gets launched, so steps 1 and 3 would
+# otherwise die on `cargo: command not found`. Source it here rather than
+# relying on the environment, so this script works however it is invoked.
+if [ -f "$HOME/.cargo/env" ]; then
+    # shellcheck disable=SC1091
+    . "$HOME/.cargo/env"
+fi
+
 SKIP_SMOKE=false FROM=1
 while [ $# -gt 0 ]; do
     case "$1" in

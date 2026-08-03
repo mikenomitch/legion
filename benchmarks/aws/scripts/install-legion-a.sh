@@ -68,7 +68,7 @@ trap 'rm -rf "$STAGE"' EXIT
 render_config 0 true "" >"$STAGE/cp-0.jsonnet"
 install_manager 0 "$STAGE/cp-0.jsonnet"
 log "waiting for cp-0 readyz"
-wait_for_http "http://${CP_ADDRS[0]}:4749/readyz" 180
+rig_http_ready "${CP_ADDRS[0]}" 4749/readyz 180
 
 # Join token minted on the bootstrap node enrolls the other two.
 log "minting raft join token on cp-0"
@@ -85,7 +85,7 @@ done
 
 log "waiting for all managers ready (voters settled on every lane)"
 for idx in 0 1 2; do
-    wait_for_http "http://${CP_ADDRS[$idx]}:4749/readyz" 300
+    rig_http_ready "${CP_ADDRS[$idx]}" 4749/readyz 300
 done
 rsh "${CP_ADDRS[0]}" "legion raft status" || true
 

@@ -8,6 +8,10 @@
   server: {
     port: 4747,
     host: '0.0.0.0',
+    // See manager-a.jsonnet.tpl: without this, join tokens embed
+    // http://127.0.0.1:4747 and every remote worker dials its own
+    // loopback instead of the manager.
+    advertiseAddr: 'http://${PRIVATE_IP}:4747',
   },
   storePath: '/var/lib/legion/store',
   workerConfigPath: '/opt/legion/configs/workers/',

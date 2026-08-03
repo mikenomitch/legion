@@ -260,8 +260,36 @@ How to use it:
         state — can check on an unattended campaign and tell "stalled"
         from "quiet". README "Watching from somewhere else" and "Keeping
         results after the rig is gone"; calls entries 11 and 15-17.
+  - [x] Bootstrap the operator box the campaign is driven from
+        (`scripts/bootstrap-operator-box.sh`, `scripts/phase1.sh`; calls
+        entries 18-19). One command takes an AWS key to a running
+        phase 1: builds an Ubuntu x86_64 box outside the rig's terraform
+        (it *runs* that terraform, and must outlive `teardown.sh`, which
+        destroys the state), gives it an Elastic IP so `admin_cidr` stays
+        true, carries an IAM instance role instead of a copied key,
+        writes `terraform.tfvars` from the box's own facts, and runs the
+        six phase-1 steps under tmux with per-step checkpoints.
+        `stop`/`start` for between sessions (~$268/mo running vs ~$12/mo
+        stopped); `repair-iam` re-applies the role in place, which is the
+        only remedy available when the box holds the sole copy of the
+        terraform state.
   - [ ] Phase 1 exit on real AWS: `bringup.sh` + 1k-node
-        `run-campaign.sh --system legion-a --smoke` (needs an account).
+        `run-campaign.sh --system legion-a --smoke`. **In progress on a
+        real account (2026-08-02).** Step 1 (local-smoke) passes on a
+        real box. Bugs found and fixed while getting there, all in
+        `bootstrap-operator-box.sh` unless noted: no default VPC in the
+        account; `Subnets[0]` landing in an AZ that does not offer the
+        instance type (us-east-1e has no c7i); `RunInstances` retrying
+        every failure and blaming IAM propagation; `cargo` absent from a
+        non-interactive SSH PATH (rustup writes to `~/.bashrc`, which
+        Ubuntu skips for non-interactive shells) — fixed in `phase1.sh`
+        and in cloud-init, and documented in `development.md`; `clang` +
+        `libclang-dev` missing for `rusqlite`'s `session` feature forcing
+        libsqlite3-sys through bindgen; `push`'s `rsync --delete`
+        deleting `terraform.tfvars` and — far worse — `terraform.tfstate`,
+        which would have orphaned the whole rig; the operator role
+        missing `iam:TagInstanceProfile` while terraform tags every
+        resource via `default_tags`.
         Unverified against real AWS, and first in line to shake out:
         the `orchestrator` role's `SetDesiredCapacity` path, the
         loadgen box's private-IP reachability to CP + spot workers, the
@@ -271,6 +299,206 @@ How to use it:
         `packing-density.sh` during this step: it needs the same
         standing rig and retires the 1,250 assumption before any cell
         is sized from it.
+  - [x] **Manager heartbeat throughput: ~7x, by taking the store call off
+        the tokio runtime.** `Manager::heartbeat` called the blocking
+        `Store::update_node_heartbeat` inline on a worker thread. That
+        parked the thread for a whole fsync-bound raft commit, and — the
+        part that actually mattered — left every other heartbeat stuck in
+        the gRPC layer where the coalescer could not see it, so batches
+        stayed at size 1 and `HEARTBEAT_BATCH_MAX = 128` was never
+        approached. Now offloaded via `spawn_blocking`, so the queue
+        builds, batches form, and one fsync amortizes across many beats.
+
+        Measured on gp3 EBS (`experiments/heartbeat-commit-probe.sh`,
+        3 voters + 1000 sim nodes on one box, 2s cadence = 500/sec needed):
+
+        | worker threads | before | after |
+        | --- | --- | --- |
+        | 1 | 48.3/sec (9%) | **349.8/sec (69%)** |
+        | 4 | 60.5/sec (12%) | **422.6/sec (84%)** |
+
+        `cargo test --all --locked`: 1405 passed, 0 failed.
+
+        Note the before-numbers barely move with thread count (48 -> 60):
+        adding threads does not help when every thread is blocked, which
+        is why "raise worker_threads" was never the fix.
+
+        Still open, tracked separately: the remaining 16% gap at 4 threads,
+        which is the single `pipeline_loop` OS thread per lane plus the
+        fsync itself — see the liveness plan below for the architectural
+        answer, and note the control plane now runs on local NVMe
+        (`m6id.xlarge`), which removes most of the fsync cost.
+  - [ ] ~~The manager sustains only ~80 heartbeat RPCs/sec regardless of
+        fleet size or shape.** Measured on the first real AWS rig
+        (2026-08-03; 3x m7i.xlarge, 3-voter lanes, sim fleets on
+        c7i.2xlarge). This is a Legion-side ceiling, not a simulator one:
+
+        | fleet layout | total heartbeats/sec |
+        | --- | --- |
+        | 250 nodes on 1 sim host | 80 |
+        | 250 nodes across 2 sim hosts (125 each) | 80.3 |
+
+        Doubling the simulator hardware bought nothing — per-host
+        throughput *fell* from ~60/s to ~40/s so the total stayed pinned.
+        A shared downstream resource is the constraint, and it is the
+        manager. Supporting evidence:
+        - `legion.Manager/Heartbeat` handler p99 **50ms**, which is slow
+          for a counter bump plus a node-timestamp update, and at ~80/s
+          implies only ~4 requests in flight
+        - manager CPU **19-23%** of 4 vCPU, sim hosts **0.2%** — nothing
+          is CPU-bound, so this is latency/serialization, not work
+        - `legion_worker_heartbeats_total` is 100% `outcome="ok"` — no
+          errors, no retries
+        - the fleet degrades smoothly with density: 125 nodes/host holds
+          97% cadence at 0.23s p99; 250 holds 64% at 2.49s
+
+        Prime suspect: `Manager::heartbeat` calls
+        `store.update_node_heartbeat`, which on a raft store commits
+        through the status lane. A per-heartbeat raft commit would be
+        latency-bound exactly like this. `docs/multi-raft.md` describes
+        heartbeat group commit — worth checking whether batching actually
+        engages at these arrival rates, or whether each heartbeat pays a
+        full quorum round trip.
+
+        **The instrumentation gap is closed** (2026-08-02, Done section):
+        the next run of this rig can answer the open questions from
+        `/metrics` alone — whether batching engages
+        (`legion_store_coalesce_batch_size` le="1" vs `_count`), whether
+        submitters wait or commit (`_wait_seconds{role}` vs
+        `_commit_seconds`), whether the per-lane raft pipeline is the queue
+        (`legion_raft_pipeline_wait_seconds` / `_depth`), and whether the
+        tokio runtime is saturated by the blocking call
+        (`legion_grpc_in_flight` vs `legion_runtime_worker_threads`, and
+        `legion_runtime_spawn_delay_seconds`, which explains the 30ms
+        `HealthCheck` p99 if it is). Read order:
+        [docs/metrics.md](../docs/metrics.md) § "Diagnosing a manager
+        throughput ceiling".
+
+        **Consequences.** At ~80 hb/s a single manager supports roughly
+        160 nodes at the 2s default cadence before liveness degrades, so
+        the campaign cannot reach its 1k-10k scale steps without either
+        fixing this or raising `heartbeatSeconds` (which changes what is
+        being measured and must be recorded in the fairness record).
+        Every phase 2-5 campaign is blocked on understanding it — a run
+        at 1k+ nodes today measures this ceiling, not the scheduler.
+
+        **Not the cause, ruled out by experiment:** the simulator's
+        gRPC channel pool. `SIM_NODES_PER_CHANNEL` was changed 256 -> 64
+        (4x the connections at 250 nodes) and rebuilt; cadence went 66%
+        -> 64%, i.e. no change. That commit is reverted.
+
+        **Design answer:**
+        [heartbeat-cadence-at-scale-plan.md](plans/heartbeat-cadence-at-scale-plan.md)
+        (planned) — sizing formula + freshness metric, a runtime warning,
+        per-node lost windows derived from each node's cadence, and
+        opt-in manager-dictated adaptive cadence. It does not raise the
+        ~80/s ceiling; it stops the ceiling from marking healthy nodes
+        lost, and makes the cadence a run was measured at part of the
+        fairness record. Raising the ceiling itself is D8, now planned in
+        [liveness-off-the-raft-path-plan.md](plans/liveness-off-the-raft-path-plan.md)
+        ([calls](calls/liveness-off-the-raft-path-plan_calls.md)) — the
+        AWS probe settled the D8 question the architecture review was
+        waiting on: gp3 48-86 hb/s vs local NVMe ~2000 hb/s on identical
+        code, so the cost is the per-commit fsync. The `spawn_blocking`
+        offload above collected most of the cheap amortization (gp3 to
+        422/s, 84% of cadence at 1000 nodes), so the plan's phase 1 is now
+        a measurement — attribute the residual 16% between the fsync and
+        the single `pipeline_loop` thread per lane — and phases 2-4 take
+        steady-state liveness off raft entirely, replicating only status
+        transitions. Still needed because 84% of cadence at 1000 nodes is
+        6x short of the campaign's 5k step and 12x short of its 10k step,
+        and because `R` remains a property of the disk.
+  - [ ] **Status-lane leadership change has no lost-node grace.**
+        `nodes_to_mark_lost` (`src/manager/daemon.rs:978`) suppresses
+        marking only for the first `DEF_LOST_NODE_AT_SEC` of *process*
+        uptime, measured from `started_at` in
+        `start_node_status_checker`. Under `lanes`, a long-running
+        manager that acquires status-lane leadership mid-life starts
+        marking immediately, right after an election during which the
+        fleet's heartbeats were failing. Nomad's `failover_heartbeat_ttl`
+        is the prior art. **Fix moved:** now phase 2 of
+        [liveness-off-the-raft-path-plan.md](plans/liveness-off-the-raft-path-plan.md)
+        (§6.4, [call 11](calls/liveness-off-the-raft-path-plan_calls.md)),
+        which needs it as its rebuild mechanism rather than as a safety
+        valve — a leader-memory liveness table inherits nothing, so without
+        the grace the first election marks the whole fleet lost. The
+        mass-disruption circuit breaker stays with
+        [heartbeat-cadence-at-scale-plan.md](plans/heartbeat-cadence-at-scale-plan.md)
+        phase 3.
+  - [ ] **`heartbeatSeconds` and `stateful.onLost.selfTerminateAfter`
+        are unvalidated against each other.** `selfTerminateAfter`
+        defaults to 90s (`src/structs/job.rs:1050`) and makes a worker
+        kill its own stateful tasks after that long without manager
+        contact. Nothing stops a cadence at or near that value, in which
+        case a healthy worker self-fences between beats. Currently masked
+        by the `1..=30` clamp; becomes live the moment that clamp widens.
+        Cross-check specified in the plan's §7.
+
+  - [ ] ~~Investigate: a 1k simulated fleet sustains ~59 heartbeat
+        RPCs/sec where ~500/sec is expected, with nothing saturated.~~
+        Resolved by the entry above. **Correction to that entry's last
+        bullet:** the follower disagreement (leader 942 active vs both
+        followers 0 active / 1000 lost) was transient — measured just
+        after a fleet teardown. With a fleet running, all three managers
+        report ~997 active / ~3 lost. Node status replicates correctly;
+        there is no replication bug.
+        Measured on the first real AWS rig (2026-08-03, 1000 sim nodes on
+        one c7i.2xlarge against a 3-voter lanes control plane). The
+        numbers rule out the easy explanations:
+        - sim host CPU **0.2%** of 8 vCPU, memory 3% — the fleet is idle,
+          so this is not the simulator running out of room
+        - manager CPU **19-23%** of 4 vCPU across all three — not
+          saturated either
+        - `legion.Manager/Heartbeat` gRPC **p99 50ms** — the RPC is fast
+        - `legion_heartbeats_total` is per-RPC (`server.rs` increments it
+          once per handler call), so this is not group-commit batching
+          making the counter read low
+        - effective interval works out to ~17s against a 2s
+          `WORKER_HEARTBEAT_DURATION_SEC`, and the drill's heartbeat p99
+          pins at exactly 10s — which is `HEARTBEAT_RETRY_MAX`, hinting
+          the loop is in retry/backoff rather than steady state
+        - node liveness disagrees across the cluster: the leader reports
+          942 active / 58 lost while **both followers report 0 active /
+          1000 lost**. Either follower `legion_nodes{status}` is
+          leader-only by design and mismeasured here, or status is not
+          replicating — worth settling on its own.
+        Next step is the fleet's own worker-side counters
+        (`legion_worker_heartbeats_total{outcome}` on :9101, see
+        docs/metrics.md § Worker) to separate "heartbeats attempted and
+        failing" from "heartbeats never attempted". Until this is
+        understood, `experiments/packing-density.sh` cannot produce a
+        density and every scale step stays sized from the plan's 1,250
+        estimate.
+  - [ ] **Warn when a manager binds a wildcard host with no
+        `server.advertiseAddr`.** Found the hard way on the first real
+        campaign. With `host: '0.0.0.0'` and `advertiseAddr` unset,
+        `ServerConfig::advertised_address()` derives
+        `http://127.0.0.1:4747`, and that address is embedded in *every
+        join token the manager mints*. A remote worker decodes the token
+        and dials its own loopback, retrying connection-refused forever.
+        Nothing on the manager side looks wrong — the failure appears
+        only in the worker's journal, and an operator watching the
+        cluster sees "0 nodes registered" with no error at all. Options,
+        roughly in order of preference: refuse to mint a join token whose
+        address is loopback while bound to a wildcard host; or log a
+        startup warning naming the derived address; or return the
+        condition in `CreateJoinToken`'s response. The config comment in
+        `configs/manager.jsonnet` already says what the field is for, and
+        that was not enough. See `benchmarks/aws/configs/legion/
+        manager-a.jsonnet.tpl` for the fix the rig now carries, and note
+        `persistence.raft.advertiseAddr` is a *different* setting — having
+        set that one is exactly why the gap was easy to miss.
+  - [ ] Export process-level memory from the manager so the campaign can
+        report the manager's own RSS instead of whole-box memory.
+        `docs/metrics.md` has no process family and nothing registers a
+        process collector, so `process_resident_memory_bytes` does not
+        exist on `:4749`; `collect.sh` therefore reports node_exporter
+        whole-box memory, an upper bound that includes the OS and (in
+        `used`) reclaimable page cache — ~40% of `used` on an idle
+        control-plane box. Deliberately not done mid-campaign: it changes
+        the binary under test and invalidates the fairness record for
+        every cell already collected. Do it before the phase-2 campaign.
+        See calls entry 20 and the Metrics section of the plan.
   - [ ] Phases 2-5: Legion A/B campaigns, Nomad (verify nodesim `mock`
         driver + install script), K8s (verify kubeadm/KWOK install +
         watch parsing), 20k validation burst, analysis + REPORT.md.
@@ -606,6 +834,20 @@ Plans: [persistence-plan.md](plans/persistence-plan.md), [multi-raft-persistence
         in [tests/raft_perf_smoke.rs](../tests/raft_perf_smoke.rs);
         numbers in [docs/multi-raft.md](../docs/multi-raft.md) § "Lane
         isolation A/B".
+  - [x] Contention instrumentation for the manager write path (2026-08-02):
+        the families that were missing when the ~80 hb/s ceiling was
+        investigated — group-commit effectiveness
+        (`legion_store_coalesce_batch_size` / `_wait_seconds{role}` /
+        `_commit_seconds` / `_wait_rounds_total`, labeled `heartbeat` and
+        `plan_apply`), the per-lane pipeline queue in front of raft
+        (`legion_raft_pipeline_wait_seconds`, `legion_raft_pipeline_depth`),
+        and runtime saturation (`legion_grpc_in_flight`,
+        `legion_runtime_spawn_delay_seconds`,
+        `legion_runtime_worker_threads`). Read order in
+        [docs/metrics.md](../docs/metrics.md) § "Diagnosing a manager
+        throughput ceiling"; calls in
+        [calls/manager-contention-instrumentation_calls.md](calls/manager-contention-instrumentation_calls.md).
+        Instrumentation only — the blocking heartbeat path is unchanged.
   - [x] Raft engine metrics + per-lane bottleneck tracing (2026-07-30):
         the full `legion_raft_*` series — per-lane term / commit_index /
         applied_index / apply_lag / is_leader gauges on the checker tick,

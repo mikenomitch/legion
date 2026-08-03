@@ -744,9 +744,11 @@ impl Store {
             node_health_orphan_candidates: Arc::new(std::sync::Mutex::new(HashSet::new())),
             allocation_health_orphan_candidates: Arc::new(std::sync::Mutex::new(HashSet::new())),
             plan_coalescer: Arc::new(crate::storage::coalesce::Coalescer::new(
+                "plan_apply",
                 Self::plan_apply_batch_max(config.scheduler_settings.as_ref()),
             )),
             heartbeat_coalescer: Arc::new(crate::storage::coalesce::Coalescer::new(
+                "heartbeat",
                 HEARTBEAT_BATCH_MAX,
             )),
         };

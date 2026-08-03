@@ -60,6 +60,18 @@ MANAGER="${MANAGER:-http://${CP_PRIVATE_IPS[0]}:4747}"
 # appears. Scaling down is also what makes the probe cheap.
 scale_workers 1
 wait_for_workers 1
+
+# Refresh the Prometheus node targets for the instance that just came up.
+# Without this the file_sd targets still name whatever instance the ASG
+# had before, so every `role="sim-worker"` query resolves against a
+# terminated box and returns nothing. The drill then prints `cpu ? mem ?`
+# and judges saturation on cadence alone — which defeats its entire
+# purpose, since the question it exists to answer is whether the SIM HOST
+# or the manager is the bottleneck, and CPU/memory headroom is how you
+# tell those apart. run-campaign.sh already does this after each scale
+# step; this drill scales the fleet itself and has to do the same.
+"$SCRIPTS/gen-targets.sh"
+
 mapfile -t WORKERS < <(worker_instances)
 [ "${#WORKERS[@]}" -eq 1 ] || {
     echo "expected 1 InService worker instance, found ${#WORKERS[@]}" >&2
@@ -148,12 +160,31 @@ for N in $STEPS; do
         }
         | .healthy = (
             .registered != null and .target != null and .registered >= .target
-            and (.registration_errors_per_sec // 1) == 0
-            and (.heartbeats_failed_per_sec // 1) == 0
+            # Absent means ZERO here, not "assume the worst". Both series
+            # are counters selected by a failure label
+            # (`outcome!="ok"`, `outcome="error"`), and Prometheus does
+            # not create a series until it is first incremented — so a
+            # fleet that never failed reports nothing at all. Defaulting
+            # those to 1 made a clean run indistinguishable from a broken
+            # one, and no step could ever be HEALTHY: the drill reported
+            # "no healthy step, even the lowest saturated" on a fleet
+            # sitting at 96% cadence and 0.26s p99. Safe because
+            # `.measured` below already fails the step outright if the
+            # worker telemetry is missing, which is the case `// 1` was
+            # reaching for.
+            and (.registration_errors_per_sec // 0) == 0
+            and (.heartbeats_failed_per_sec // 0) == 0
             and (.cpu_utilization // 1) < 0.85
             and (.memory_utilization // 1) < 0.85
             and (.cadence_ratio // 0) >= 0.95
-        )')
+        )
+        # Missing telemetry fails the health test above (via `// 1`),
+        # which is the safe default but reports "SATURATED" for what is
+        # really "could not measure". They call for opposite responses:
+        # saturation means the ceiling was found, unmeasurable means the
+        # drill is blind and its answer must not be trusted.
+        | .measured = (.cpu_utilization != null and .memory_utilization != null
+                       and .cadence_ratio != null)')
 
     printf '  registered %s/%s  cadence %s  cpu %s  mem %s  p99 %ss  -> %s\n' \
         "$(jq -r '.registered // "?"' <<<"$ROW")" \
@@ -162,7 +193,16 @@ for N in $STEPS; do
         "$(jq -r 'if .cpu_utilization then (.cpu_utilization * 100 | floor | tostring) + "%" else "?" end' <<<"$ROW")" \
         "$(jq -r 'if .memory_utilization then (.memory_utilization * 100 | floor | tostring) + "%" else "?" end' <<<"$ROW")" \
         "$(jq -r '.heartbeat_p99_secs // "?"' <<<"$ROW")" \
-        "$(jq -r 'if .healthy then "HEALTHY" else "SATURATED" end' <<<"$ROW")"
+        "$(jq -r 'if .measured | not then "UNMEASURED"
+                  elif .healthy then "HEALTHY" else "SATURATED" end' <<<"$ROW")"
+
+    jq -e '.measured' >/dev/null <<<"$ROW" || {
+        echo "  telemetry missing for this step — the drill cannot tell a saturated" >&2
+        echo "  sim host from a saturated manager, which is the only thing it measures." >&2
+        echo "  Check the loadgen Prometheus has live targets for role=\"sim-worker\"" >&2
+        echo "  (scripts/gen-targets.sh) and for the legion-sim-workers job." >&2
+        exit 1
+    }
 
     ROWS=$(jq --argjson row "$ROW" '. + [$row]' <<<"$ROWS")
     jq -e '.healthy' >/dev/null <<<"$ROW" || {
@@ -213,11 +253,30 @@ DENSITY=$(jq -r '.measured_nodes_per_instance // "none"' <<<"$REPORT")
 
 echo
 log "measured density: $DENSITY nodes/instance (plan assumed 1,250)"
+log "report: $RESULTS_ROOT/$CAMPAIGN/$RUN_ID/metrics.json"
+
 if [ "$DENSITY" != "none" ]; then
     jq -r '.implied_fleet[] | "  \(.nodes) nodes -> worker_instances=\(.worker_instances) (\(.spot_vcpu) vCPU)"' \
         <<<"$REPORT"
     log "set worker_instances from this table; re-run after any change to the sim path"
-else
-    log "even the lowest step saturated — re-run with a lower --steps ladder"
+    exit 0
 fi
-log "report: $RESULTS_ROOT/$CAMPAIGN/$RUN_ID/metrics.json"
+
+# No density means no result, and the whole point of this drill is to
+# replace the plan's 1,250 estimate with a measurement. Exiting 0 here
+# let an unattended phase-1 run checkpoint the step as "done" while every
+# scale step downstream stayed sized from the guess.
+#
+# Two very different things produce "none", so say which: a ladder where
+# every step ran and saturated is a real (if unhelpful) answer, while a
+# ladder that produced no samples at all means the drill never executed —
+# a missing `legion` on the loadgen box does exactly that.
+if [ "$(jq -r '[.steps[]? | select(.registered > 0)] | length' <<<"$REPORT")" = 0 ]; then
+    echo "packing density measured nothing: no step registered a single node." >&2
+    echo "The ladder did not run — check the log above for the real error" >&2
+    echo "(a missing legion CLI on the loadgen box looks exactly like this)." >&2
+else
+    echo "packing density found no healthy step: even the lowest saturated." >&2
+    echo "Re-run with a lower ladder, e.g. --steps \"250 500 1000\"." >&2
+fi
+exit 1

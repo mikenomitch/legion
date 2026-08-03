@@ -155,7 +155,29 @@ warm-up period discarded.
   counts transitions to placed/running-equivalent state).
 - **Placement latency**: submit→placed p50/p95/p99 (driver timestamps).
 - **Recovery**: storm scenario time-to-100%-replaced.
-- **Control-plane cost**: CPU/mem per manager (node_exporter), and for
+- **Control-plane memory vs load**: peak and mean bytes per role at every
+  scale step, so memory is comparable across low/medium/high load the
+  same way throughput is. The scale steps (1k/2k/5k/10k) are the load
+  axis — no separate experiment is needed, because every cell is already
+  archived at a known node count. `collect.sh` records two series per
+  cell and reduces them into `memory.json` next to `metrics.json`:
+  - `used` = `MemTotal - MemAvailable`. What the box needs provisioned.
+  - `anon` = used minus page cache and buffers. The closer proxy for the
+    manager's own footprint. The split matters: on the idle rig the
+    control plane measures 1.63 GB used against 0.92 GB anon, so page
+    cache is ~40% of `used`, and a SQLite-backed store only grows that
+    share. Reporting `used` alone would overstate resident cost.
+
+  **Known limitation:** this is whole-box memory from node_exporter, not
+  the manager process's RSS. Legion registers no process collector, so
+  `process_resident_memory_bytes` is not exposed on `:4749`. The
+  control-plane boxes run nothing else of consequence, so box memory
+  tracks the manager closely, but these numbers are an upper bound and
+  must be reported as such. Adding a process collector is the real fix
+  and is deliberately *not* done mid-campaign: it changes the binary
+  under test and so invalidates the fairness record for every cell
+  already collected.
+- **Control-plane cost**: CPU per manager (node_exporter), and for
   Legion the per-phase histogram (`legion_scheduler_plan_phase_seconds`)
   — the phase curves are what make projection defensible rather than
   hand-wavy. K8s: `scheduler_framework_extension_point_duration_seconds`

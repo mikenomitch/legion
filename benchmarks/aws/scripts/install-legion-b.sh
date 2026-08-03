@@ -15,11 +15,15 @@ aws s3 rm --region "$REGION" "s3://$BUCKET/legion-b/" --recursive --quiet || tru
 
 STAGE=$(mktemp -d)
 trap 'rm -rf "$STAGE"' EXIT
-BUCKET="$BUCKET" REGION="$REGION" render_tpl BUCKET REGION \
-    <"$AWS_BENCH_ROOT/configs/legion/manager-b.jsonnet.tpl" >"$STAGE/manager.jsonnet"
-
 for idx in 0 1 2; do
     ip="${CP_ADDRS[$idx]}"
+    # Rendered per node, not once for all three: server.advertiseAddr is
+    # the address baked into every join token this manager mints, so it
+    # has to be THIS box's private ip. Sharing one rendered config would
+    # hand every worker the same (wrong) manager address.
+    BUCKET="$BUCKET" REGION="$REGION" PRIVATE_IP="${CP_PRIVATE_IPS[$idx]}" \
+        render_tpl BUCKET REGION PRIVATE_IP \
+        <"$AWS_BENCH_ROOT/configs/legion/manager-b.jsonnet.tpl" >"$STAGE/manager.jsonnet"
     log "installing legion (streaming) on cp-$idx ($ip)"
     rsh "$ip" "
         sudo aws s3 cp --region $REGION s3://$BUCKET/bin/legion /opt/legion/bin/legion &&
@@ -62,7 +66,11 @@ deadline=$(($(date +%s) + 300))
 PRIMARY=""
 while [ -z "$PRIMARY" ]; do
     for idx in 0 1 2; do
-        if curl -fsS -m 3 "http://${CP_ADDRS[$idx]}:4749/readyz" >/dev/null 2>&1; then
+        # Probed the same way as install-legion-a: 4749 is intra-rig
+        # only, so a direct curl from an operator box never succeeds and
+        # every node would look like a standby forever. See
+        # rig_http_ready in env.sh.
+        if rig_probe_once "${CP_ADDRS[$idx]}" 4749/readyz; then
             PRIMARY="cp-$idx (${CP_ADDRS[$idx]})"
             break
         fi
