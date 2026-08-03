@@ -57,6 +57,14 @@ into a single series with every label set to `"other"`.
 - **`legion_grpc_request_duration_seconds{method}`** (histogram) — request
   duration, measured until response headers are produced (not the end of a
   streaming body).
+- **`legion_grpc_in_flight{method}`** (gauge) — requests currently executing,
+  by method. Counted from the moment the service accepts the request, so it
+  includes time spent waiting for a runtime worker to poll it, and it is
+  decremented even when a client hangs up mid-call. Read it against
+  `legion_runtime_worker_threads`: a sum that sits at or above the
+  worker-thread count means handlers are *occupying* the runtime rather than
+  the cluster being busy — the shape a blocking call inside an async handler
+  produces. Duration alone cannot tell those apart; concurrency can.
 
 ### Scheduler / eval loop
 
@@ -147,11 +155,65 @@ instrument.
 - **`legion_heartbeats_total`** (counter) — worker heartbeat RPCs accepted
   (past authentication) by the manager.
 
+### Async runtime
+
+The manager's handlers run on a multi-threaded tokio runtime, and several of
+them make **blocking** store calls. When every worker thread is occupied by
+one, latency appears on *every* handler — including ones that do no work —
+while CPU sits idle and no individual operation is slow. These two families
+name that condition directly; without them it looks like "everything is
+mysteriously slow".
+
+- **`legion_runtime_worker_threads`** (gauge) — worker threads in the
+  runtime. Set once at startup. This is the ceiling on concurrent blocking
+  handlers and the denominator for `legion_grpc_in_flight`.
+- **`legion_runtime_spawn_delay_seconds`** (histogram) — a probe task is
+  spawned once a second and records how long it waited before its first
+  poll. **Tens of microseconds** is a healthy runtime. **Milliseconds** means
+  no worker thread was free to pick up trivial work, which is the signature
+  of blocking handlers rather than of load: the delay lands on unrelated
+  RPCs, so a do-nothing endpoint's p99 rises alongside a genuinely expensive
+  one's. Buckets are finer than the other duration histograms (50µs up)
+  precisely so the healthy case is distinguishable from the saturated one.
+
 ### Store
 
 - **`legion_store_write_lock_wait_seconds`** (histogram) — time spent
   waiting to acquire the store's SQLite write-connection lock. Sustained high
   buckets indicate write contention on the state store.
+
+#### Group commit (the coalescer)
+
+Two write paths batch concurrent submitters into one commit: heartbeats
+(`path="heartbeat"`) and scheduler plan applies (`path="plan_apply"`). See
+[scheduler-and-eval-loop.md](scheduler-and-eval-loop.md). Batching is
+*opportunistic* — a batch forms only from requests that arrive while a commit
+is already in flight — so "batching is configured" and "batching is
+happening" are different claims, and only these families can tell them apart.
+
+- **`legion_store_coalesce_batch_size{path}`** (histogram) — requests drained
+  into one group commit. **The `le="1"` bucket is the number that matters**:
+  compared against `_count`, it is how often batching did not engage at all.
+  A distribution pinned at 1 while the path is under load means submitters
+  are not overlapping the way the design assumes, and raising the batch cap
+  will do nothing.
+- **`legion_store_coalesce_commit_seconds{path}`** (histogram) — wall-clock
+  of the batch runner itself, i.e. the actual commit (on raft, including
+  propose → quorum → apply).
+- **`legion_store_coalesce_wait_seconds{path, role}`** (histogram) — how long
+  a submitter waited before being served. `role="leader"` is the time from
+  enqueue to winning the commit lock, measured *before* its own commit
+  starts: pure contention. `role="follower"` is the time until another
+  submitter's batch handed back a result, which includes that batch's commit.
+  **Attribution**: against `..._commit_seconds`, this splits "the commit is
+  slow" from "submitters are queued behind a commit". A large leader wait
+  with a small commit time means the path is lock-bound, not storage-bound.
+- **`legion_store_coalesce_wait_rounds_total{path}`** (counter) — times a
+  waiting submitter's 1ms reply poll timed out and it re-contended for the
+  commit lock. Divided by `..._wait_seconds_count` it is the mean number of
+  poll rounds per request: latency that belongs to the coalescer's own
+  polling rather than to any commit. A ratio far above 1 means requests are
+  routinely sitting through several poll intervals.
 
 ### Raft
 
@@ -194,16 +256,40 @@ instrument.
   ops by outcome: `applied`, `empty` (the mutation touched no rows and
   skipped the raft entry), `not_leader` (proposal rejected before capture —
   normal on followers under divergent lane leadership), `error`.
+- **`legion_raft_pipeline_wait_seconds{lane}`** (histogram) — time a
+  replicated op sat in the lane's pipeline queue before the lane's pipeline
+  thread began executing it. Each lane is served by exactly **one** OS thread
+  (capture → propose → apply are serialized per lane, see
+  [multi-raft.md](multi-raft.md)), so queueing is a first-class latency
+  component — and it is invisible in the capture/propose histograms, which
+  only start once a job is picked up. **This is the third bottleneck
+  candidate**: when this grows while `legion_raft_propose_apply_seconds` does
+  not, replication is fine and the lane's serialized pipeline is the
+  constraint.
+- **`legion_raft_pipeline_depth{lane}`** (gauge) — ops queued to a lane's
+  pipeline thread and not yet started. Sustained depth above 1 means writes
+  on that lane are standing in line behind each other.
 
 The gauge series refresh on the node-status-checker tick, on leaders and
 followers alike; the histograms and the op counter are recorded at the
-replication call site (leaders only — followers reject before capture).
+replication call site (leaders only — followers reject before capture). The
+pipeline queue families are the exception: they are recorded on *every*
+node, since a job queues before anyone knows whether this node leads.
+
+Together the four latency families decompose one replicated write end to
+end: `pipeline_wait` (queued behind this lane's other writes) → `capture`
+(local SQLite) → `propose_apply` (quorum + local apply). Whichever grew is
+the answer; if none did, the time is outside the store and
+`legion_runtime_spawn_delay_seconds` is the next place to look.
 Under `single` topology every lane rides the one `control` raft group, so
 the latency histograms and op counters carry `lane="control"`.
 
 Anything else under the `legion_raft_*` prefix (snapshot timings,
 per-peer replication lag, ...) remains **reserved** for the raft engine —
-no other subsystem may claim the prefix.
+no other subsystem may claim the prefix. The `pipeline` families are part
+of that engine (the queue is a consequence of its one-thread-per-lane
+design), which is why they carry the prefix despite being recorded off the
+leader path.
 
 ### Worker
 
@@ -291,6 +377,35 @@ Two limitations worth knowing when reading a campaign:
 - Aborting a fleet (or killing sim nodes for a storm scenario) stops the
   process; it does not walk the gauges back down first. Read a torn-down
   fleet's last sample as "state at teardown", not as a live value.
+
+## Diagnosing a manager throughput ceiling
+
+When RPC throughput plateaus below what the workload should produce, the
+handler-duration histogram tells you *that* it is slow, never *why*. Read
+these in order — each step rules out a layer:
+
+1. **Is anything actually busy?** `legion_grpc_in_flight` versus
+   `legion_runtime_worker_threads`, and `legion_runtime_spawn_delay_seconds`.
+   In-flight pinned at the worker count with spawn delay in the
+   milliseconds means the runtime is saturated by blocking handlers. The
+   tell that it is saturation and not load: a trivial endpoint
+   (`HealthCheck`) shows the same latency as an expensive one.
+2. **Is the group commit batching?** `legion_store_coalesce_batch_size`'s
+   `le="1"` bucket against its `_count`. Nearly all size-1 means batching
+   never engages, and the path is paying a full commit per request.
+3. **Waiting or committing?** `legion_store_coalesce_wait_seconds` (by
+   `role`) against `legion_store_coalesce_commit_seconds`, plus
+   `legion_store_coalesce_wait_rounds_total` for the polling share.
+4. **Is it replication or the queue in front of it?**
+   `legion_raft_pipeline_wait_seconds` and `legion_raft_pipeline_depth`
+   against `legion_raft_capture_seconds` and
+   `legion_raft_propose_apply_seconds`.
+
+A worked example of the shape this catches: hundreds of heartbeats a second
+against a raft control plane, `Heartbeat` p99 in the tens of milliseconds,
+`AppendEntries` p99 at 3ms, manager CPU under 25%. Replication was fast, so
+the time was queueing and waiting — which none of the pre-existing families
+could show.
 
 ## OTLP metrics push
 

@@ -55,6 +55,13 @@ const DURATION_BUCKETS: &[f64] = &[
     0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
 ];
 
+/// Bucket bounds (seconds) for runtime-scheduling delay, which is
+/// microseconds on a healthy runtime — [`DURATION_BUCKETS`] would put every
+/// healthy sample in one bucket and lose the signal.
+const SCHEDULER_DELAY_BUCKETS: &[f64] = &[
+    0.00005, 0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 1.0,
+];
+
 /// Bucket bounds for candidate-count histograms (scheduling indexes).
 const COUNT_BUCKETS: &[f64] = &[
     1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1024.0, 4096.0, 16384.0,
@@ -89,6 +96,13 @@ pub struct GaugeCell(AtomicI64);
 impl GaugeCell {
     pub fn set(&self, v: i64) {
         self.0.store(v, Ordering::Relaxed);
+    }
+
+    /// Relative update (`+1` / `-1`), for gauges maintained by paired
+    /// increment/decrement rather than by a periodic refresh — in-flight
+    /// requests, queue depths. One atomic, safe from any thread.
+    pub fn add(&self, delta: i64) {
+        self.0.fetch_add(delta, Ordering::Relaxed);
     }
 
     pub fn get(&self) -> i64 {
@@ -396,6 +410,22 @@ impl GaugeVec {
         self.series.cell(labels, GaugeCell::default).set(v);
     }
 
+    /// Relative update of one series. Callers must pair their `+1` with a
+    /// `-1` on every exit path (including cancellation — see
+    /// [`InFlightGuard`]), or the series drifts upward forever.
+    pub fn add(&self, labels: &[&str], delta: i64) {
+        debug_assert_eq!(labels.len(), self.meta.labels.len());
+        self.series.cell(labels, GaugeCell::default).add(delta);
+    }
+
+    /// Current value of a series (0 when it does not exist). Test/inspection
+    /// helper — not needed on hot paths.
+    pub fn get(&self, labels: &[&str]) -> i64 {
+        Series::find(&self.series.snapshot(), labels)
+            .map(|c| c.get())
+            .unwrap_or(0)
+    }
+
     /// Replace the whole family: series present in `entries` get their new
     /// value, previously-seen series absent from `entries` drop to zero (so a
     /// status that empties out reads 0 instead of a stale count).
@@ -628,6 +658,8 @@ pub struct Metrics {
     pub grpc_requests_total: Arc<CounterVec>,
     /// `legion_grpc_request_duration_seconds{method}`
     pub grpc_request_duration_seconds: Arc<HistogramVec>,
+    /// `legion_grpc_in_flight{method}`
+    pub grpc_in_flight: Arc<GaugeVec>,
     /// `legion_evals_processed_total{kind,status}`
     pub evals_processed_total: Arc<CounterVec>,
     /// `legion_eval_queue_depth`
@@ -651,6 +683,18 @@ pub struct Metrics {
     pub allocations: Arc<Gauge>,
     /// `legion_store_write_lock_wait_seconds`
     pub store_write_lock_wait_seconds: Arc<Histogram>,
+    /// `legion_store_coalesce_batch_size{path}`
+    pub store_coalesce_batch_size: Arc<HistogramVec>,
+    /// `legion_store_coalesce_wait_seconds{path,role}`
+    pub store_coalesce_wait_seconds: Arc<HistogramVec>,
+    /// `legion_store_coalesce_commit_seconds{path}`
+    pub store_coalesce_commit_seconds: Arc<HistogramVec>,
+    /// `legion_store_coalesce_wait_rounds_total{path}`
+    pub store_coalesce_wait_rounds_total: Arc<CounterVec>,
+    /// `legion_runtime_spawn_delay_seconds`
+    pub runtime_spawn_delay_seconds: Arc<Histogram>,
+    /// `legion_runtime_worker_threads`
+    pub runtime_worker_threads: Arc<Gauge>,
     /// `legion_raft_voters{lane}`
     pub raft_voters: Arc<GaugeVec>,
     /// `legion_raft_quorum{lane}`
@@ -671,6 +715,10 @@ pub struct Metrics {
     pub raft_propose_apply_seconds: Arc<HistogramVec>,
     /// `legion_raft_ops_total{lane,outcome}`
     pub raft_ops_total: Arc<CounterVec>,
+    /// `legion_raft_pipeline_wait_seconds{lane}`
+    pub raft_pipeline_wait_seconds: Arc<HistogramVec>,
+    /// `legion_raft_pipeline_depth{lane}`
+    pub raft_pipeline_depth: Arc<GaugeVec>,
     /// `legion_scheduler_index_queries_total{index,outcome}`
     pub scheduler_index_queries_total: Arc<CounterVec>,
     /// `legion_scheduler_index_candidates{index}`
@@ -704,6 +752,14 @@ impl Metrics {
                 labels: &["method"],
             },
             bounds: DURATION_BUCKETS,
+            series: Series::new(),
+        });
+        let grpc_in_flight = Arc::new(GaugeVec {
+            meta: FamilyMeta {
+                name: "legion_grpc_in_flight",
+                help: "gRPC requests currently executing in the manager, by method. Read against legion_runtime_worker_threads: a value that sits at or above the worker-thread count means handlers are blocking the runtime, not that the cluster is busy.",
+                labels: &["method"],
+            },
             series: Series::new(),
         });
         let evals_processed_total = Arc::new(CounterVec {
@@ -794,6 +850,61 @@ impl Metrics {
             },
             cell: HistogramCell::new(DURATION_BUCKETS),
         });
+        // Coalescer (group commit) instrumentation. Three questions, three
+        // families: does batching engage at all (batch_size), is a submitter
+        // waiting or committing (wait_seconds by role vs commit_seconds), and
+        // how much of the wait is the 1ms re-contend poll (wait_rounds).
+        let store_coalesce_batch_size = Arc::new(HistogramVec {
+            meta: FamilyMeta {
+                name: "legion_store_coalesce_batch_size",
+                help: "Requests drained into one group commit, by coalesced path (heartbeat|plan_apply). The le=\"1\" bucket is how often batching did not engage at all; a distribution pinned at 1 under load means requests are not arriving while a commit is in flight.",
+                labels: &["path"],
+            },
+            bounds: COUNT_BUCKETS,
+            series: Series::new(),
+        });
+        let store_coalesce_wait_seconds = Arc::new(HistogramVec {
+            meta: FamilyMeta {
+                name: "legion_store_coalesce_wait_seconds",
+                help: "Time a submitter waited before being served, by path and role. role=\"leader\": queued until it won the commit lock (pure contention, commit not yet started). role=\"follower\": queued until another submitter's batch returned its result (contention plus that batch's commit).",
+                labels: &["path", "role"],
+            },
+            bounds: DURATION_BUCKETS,
+            series: Series::new(),
+        });
+        let store_coalesce_commit_seconds = Arc::new(HistogramVec {
+            meta: FamilyMeta {
+                name: "legion_store_coalesce_commit_seconds",
+                help: "Wall-clock of one group commit (the batch runner itself), by path. Compare against legion_store_coalesce_wait_seconds to split 'the commit is slow' from 'submitters are queued behind it'.",
+                labels: &["path"],
+            },
+            bounds: DURATION_BUCKETS,
+            series: Series::new(),
+        });
+        let store_coalesce_wait_rounds_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_store_coalesce_wait_rounds_total",
+                help: "Times a submitter's 1ms wait for a reply timed out and it re-contended for the commit lock. Divided by the wait_seconds count this is the mean number of poll rounds per request — the part of heartbeat latency that is the coalescer's own polling rather than any commit.",
+                labels: &["path"],
+            },
+            series: Series::new(),
+        });
+        let runtime_spawn_delay_seconds = Arc::new(Histogram {
+            meta: FamilyMeta {
+                name: "legion_runtime_spawn_delay_seconds",
+                help: "Probe: wall-clock from tokio::spawn to that task's first poll, sampled once a second. Microseconds on a healthy runtime; milliseconds mean every worker thread is busy or blocked, which shows up as latency on EVERY handler including trivial ones.",
+                labels: &[],
+            },
+            cell: HistogramCell::new(SCHEDULER_DELAY_BUCKETS),
+        });
+        let runtime_worker_threads = Arc::new(Gauge {
+            meta: FamilyMeta {
+                name: "legion_runtime_worker_threads",
+                help: "Tokio worker threads in this manager's runtime — the ceiling on concurrent blocking handlers, and the denominator for legion_grpc_in_flight.",
+                labels: &[],
+            },
+            cell: GaugeCell::default(),
+        });
         let raft_voters = Arc::new(GaugeVec {
             meta: FamilyMeta {
                 name: "legion_raft_voters",
@@ -876,6 +987,23 @@ impl Metrics {
             },
             series: Series::new(),
         });
+        let raft_pipeline_wait_seconds = Arc::new(HistogramVec {
+            meta: FamilyMeta {
+                name: "legion_raft_pipeline_wait_seconds",
+                help: "Time a replicated op sat in a lane's pipeline queue before its (single, per-lane) pipeline thread began executing it. This is queueing, not replication: when it grows while legion_raft_propose_apply_seconds does not, the lane's serialized pipeline is the bottleneck.",
+                labels: &["lane"],
+            },
+            bounds: DURATION_BUCKETS,
+            series: Series::new(),
+        });
+        let raft_pipeline_depth = Arc::new(GaugeVec {
+            meta: FamilyMeta {
+                name: "legion_raft_pipeline_depth",
+                help: "Replicated ops queued to a lane's pipeline thread and not yet started. Sustained depth > 1 means writes on that lane are serialized behind each other.",
+                labels: &["lane"],
+            },
+            series: Series::new(),
+        });
 
         let scheduler_index_queries_total = Arc::new(CounterVec {
             meta: FamilyMeta {
@@ -933,6 +1061,7 @@ impl Metrics {
             Arc::clone(&allocations) as Arc<dyn RenderMetric>,
             Arc::clone(&eval_queue_depth) as Arc<dyn RenderMetric>,
             Arc::clone(&evals_processed_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&grpc_in_flight) as Arc<dyn RenderMetric>,
             Arc::clone(&grpc_request_duration_seconds) as Arc<dyn RenderMetric>,
             Arc::clone(&grpc_requests_total) as Arc<dyn RenderMetric>,
             Arc::clone(&heartbeats_total) as Arc<dyn RenderMetric>,
@@ -947,10 +1076,14 @@ impl Metrics {
             Arc::clone(&raft_commit_index) as Arc<dyn RenderMetric>,
             Arc::clone(&raft_is_leader) as Arc<dyn RenderMetric>,
             Arc::clone(&raft_ops_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&raft_pipeline_depth) as Arc<dyn RenderMetric>,
+            Arc::clone(&raft_pipeline_wait_seconds) as Arc<dyn RenderMetric>,
             Arc::clone(&raft_propose_apply_seconds) as Arc<dyn RenderMetric>,
             Arc::clone(&raft_quorum) as Arc<dyn RenderMetric>,
             Arc::clone(&raft_term) as Arc<dyn RenderMetric>,
             Arc::clone(&raft_voters) as Arc<dyn RenderMetric>,
+            Arc::clone(&runtime_spawn_delay_seconds) as Arc<dyn RenderMetric>,
+            Arc::clone(&runtime_worker_threads) as Arc<dyn RenderMetric>,
             Arc::clone(&scheduler_index_candidates) as Arc<dyn RenderMetric>,
             Arc::clone(&scheduler_index_maintenance_seconds) as Arc<dyn RenderMetric>,
             Arc::clone(&scheduler_index_queries_total) as Arc<dyn RenderMetric>,
@@ -958,12 +1091,17 @@ impl Metrics {
             Arc::clone(&scheduler_plan_candidate_rank) as Arc<dyn RenderMetric>,
             Arc::clone(&scheduler_lazy_sample_fallback_total) as Arc<dyn RenderMetric>,
             Arc::clone(&scheduler_plan_phase_seconds) as Arc<dyn RenderMetric>,
+            Arc::clone(&store_coalesce_batch_size) as Arc<dyn RenderMetric>,
+            Arc::clone(&store_coalesce_commit_seconds) as Arc<dyn RenderMetric>,
+            Arc::clone(&store_coalesce_wait_rounds_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&store_coalesce_wait_seconds) as Arc<dyn RenderMetric>,
             Arc::clone(&store_write_lock_wait_seconds) as Arc<dyn RenderMetric>,
         ];
 
         Metrics {
             grpc_requests_total,
             grpc_request_duration_seconds,
+            grpc_in_flight,
             evals_processed_total,
             eval_queue_depth,
             plan_apply_total,
@@ -975,6 +1113,12 @@ impl Metrics {
             nodes,
             allocations,
             store_write_lock_wait_seconds,
+            store_coalesce_batch_size,
+            store_coalesce_wait_seconds,
+            store_coalesce_commit_seconds,
+            store_coalesce_wait_rounds_total,
+            runtime_spawn_delay_seconds,
+            runtime_worker_threads,
             raft_voters,
             raft_quorum,
             raft_term,
@@ -985,6 +1129,8 @@ impl Metrics {
             raft_capture_seconds,
             raft_propose_apply_seconds,
             raft_ops_total,
+            raft_pipeline_wait_seconds,
+            raft_pipeline_depth,
             scheduler_index_queries_total,
             scheduler_index_candidates,
             scheduler_index_shadow_total,
@@ -1234,11 +1380,83 @@ pub fn render_worker() -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Runtime saturation probe
+// ---------------------------------------------------------------------------
+
+/// How often [`start_runtime_probe`] samples spawn delay. One spawn a second
+/// is free; the signal it carries (are there any idle worker threads?) is
+/// not obtainable any other way once handlers block.
+const RUNTIME_PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Start the runtime saturation probe on the current tokio runtime.
+///
+/// Every second it spawns a task that does nothing but record how long it
+/// waited to be polled (`legion_runtime_spawn_delay_seconds`), and it
+/// publishes the runtime's worker-thread count once
+/// (`legion_runtime_worker_threads`).
+///
+/// Why this exists: a handler that makes a *blocking* call from an async
+/// context occupies a worker thread without yielding. With every worker
+/// occupied, latency appears on unrelated handlers — even ones that do no
+/// work at all — which reads like "everything is slow" while CPU sits idle
+/// and no single operation is slow. Spawn delay names that condition
+/// directly. Cheap enough to leave on permanently; see docs/metrics.md.
+pub fn start_runtime_probe() {
+    metrics()
+        .runtime_worker_threads
+        .set(tokio::runtime::Handle::current().metrics().num_workers() as i64);
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(RUNTIME_PROBE_INTERVAL);
+        // Delay (not burst) after a missed tick: a saturated runtime must
+        // not be handed a backlog of probe spawns to catch up on.
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            let spawned_at = Instant::now();
+            let probe = tokio::spawn(async move {
+                metrics()
+                    .runtime_spawn_delay_seconds
+                    .observe(spawned_at.elapsed().as_secs_f64());
+            });
+            if probe.await.is_err() {
+                debug!("runtime saturation probe task failed; stopping probe");
+                return;
+            }
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
 // gRPC instrumentation layer
 // ---------------------------------------------------------------------------
 
-/// Tower layer recording `legion_grpc_requests_total` and
-/// `legion_grpc_request_duration_seconds` around the tonic service.
+/// Holds one `legion_grpc_in_flight` increment for the life of a request.
+/// A `Drop` guard rather than a decrement at the end of the future because
+/// a client that hangs up mid-call leaves the future *dropped*, not
+/// completed — decrementing only on the happy path would let the gauge
+/// drift upward forever and turn the saturation signal into noise.
+struct InFlightGuard {
+    method: String,
+}
+
+impl InFlightGuard {
+    fn enter(method: &str) -> Self {
+        metrics().grpc_in_flight.add(&[method], 1);
+        InFlightGuard {
+            method: method.to_string(),
+        }
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        metrics().grpc_in_flight.add(&[&self.method], -1);
+    }
+}
+
+/// Tower layer recording `legion_grpc_requests_total`,
+/// `legion_grpc_request_duration_seconds` and `legion_grpc_in_flight`
+/// around the tonic service.
 ///
 /// The `code` label is the `grpc-status` value when tonic surfaces it in the
 /// response *headers* (trailers-only responses, i.e. every error path);
@@ -1279,9 +1497,15 @@ where
     fn call(&mut self, req: Request<ReqBody>) -> Self::Future {
         let method = grpc_method_label(req.uri().path());
         let started = Instant::now();
+        // Taken here, not inside the future: the request is in flight from
+        // the moment the service accepts it, including any time it spends
+        // waiting for a runtime worker to poll it — which is exactly the
+        // saturation this gauge exists to show.
+        let in_flight = InFlightGuard::enter(&method);
         let fut = self.inner.call(req);
         Box::pin(async move {
             let result = fut.await;
+            drop(in_flight);
             let code = match &result {
                 Ok(resp) => grpc_code_label(resp.headers(), resp.status()),
                 Err(_) => "transport_error".to_string(),
@@ -2090,11 +2314,20 @@ mod tests {
             "legion_allocations",
             "legion_eval_queue_depth",
             "legion_evals_processed_total",
+            "legion_grpc_in_flight",
             "legion_grpc_request_duration_seconds",
             "legion_grpc_requests_total",
             "legion_heartbeats_total",
             "legion_nodes",
             "legion_plan_apply_total",
+            "legion_raft_pipeline_depth",
+            "legion_raft_pipeline_wait_seconds",
+            "legion_runtime_spawn_delay_seconds",
+            "legion_runtime_worker_threads",
+            "legion_store_coalesce_batch_size",
+            "legion_store_coalesce_commit_seconds",
+            "legion_store_coalesce_wait_rounds_total",
+            "legion_store_coalesce_wait_seconds",
             "legion_store_write_lock_wait_seconds",
         ] {
             assert!(
@@ -2103,5 +2336,37 @@ mod tests {
             );
         }
         assert!(out.contains("legion_plan_apply_total{outcome=\"applied\"}"));
+    }
+
+    #[test]
+    fn gauge_vec_add_is_relative_per_series() {
+        let gauge = GaugeVec {
+            meta: FamilyMeta {
+                name: "test_depth",
+                help: "g",
+                labels: &["lane"],
+            },
+            series: Series::new(),
+        };
+        gauge.add(&["status"], 1);
+        gauge.add(&["status"], 1);
+        gauge.add(&["control"], 1);
+        gauge.add(&["status"], -1);
+        assert_eq!(gauge.get(&["status"]), 1);
+        assert_eq!(gauge.get(&["control"]), 1);
+        assert_eq!(gauge.get(&["scheduler"]), 0);
+    }
+
+    #[test]
+    fn in_flight_guard_decrements_when_a_request_is_dropped_unfinished() {
+        let method = "legion.Manager/InFlightGuardTest";
+        let started = metrics().grpc_in_flight.get(&[method]);
+        {
+            let _guard = InFlightGuard::enter(method);
+            assert_eq!(metrics().grpc_in_flight.get(&[method]), started + 1);
+            // No completion path runs here — this is the cancelled-request
+            // case (client hung up, tonic dropped the future).
+        }
+        assert_eq!(metrics().grpc_in_flight.get(&[method]), started);
     }
 }

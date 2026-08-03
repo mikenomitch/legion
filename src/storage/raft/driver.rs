@@ -652,6 +652,13 @@ struct PipelineJob {
     op: &'static str,
     f: ReplicatedOp,
     reply: std_mpsc::Sender<R<Box<dyn Any + Send>>>,
+    /// When the submitter enqueued this job, so the pipeline thread can
+    /// record how long it queued (`legion_raft_pipeline_wait_seconds`).
+    /// One pipeline thread per lane serializes every write on that lane, so
+    /// queue time is a first-class latency component and is invisible in
+    /// the capture/propose histograms that only start once a job is picked
+    /// up.
+    queued_at: std::time::Instant,
 }
 
 /// In-memory operator-facing raft history ring (real transitions, recorded
@@ -1447,8 +1454,20 @@ fn pipeline_loop(
     single_topology: bool,
     jobs: std_mpsc::Receiver<PipelineJob>,
 ) {
+    let group_label = group.wire_name();
+    let telemetry = crate::manager::telemetry::metrics();
     while let Ok(job) = jobs.recv() {
-        let PipelineJob { lane, op, f, reply } = job;
+        let PipelineJob {
+            lane,
+            op,
+            f,
+            reply,
+            queued_at,
+        } = job;
+        telemetry.raft_pipeline_depth.add(&[group_label], -1);
+        telemetry
+            .raft_pipeline_wait_seconds
+            .observe(&[group_label], queued_at.elapsed().as_secs_f64());
         // A panic inside a captured store-method body must not kill the
         // pipeline thread: `capture_mutation` already rolled the capture
         // savepoint back before resuming the unwind, so the store is
@@ -3026,14 +3045,20 @@ impl PersistenceDriver for MultiRaftDriver {
                 .get(&group)
                 .ok_or_else(|| anyhow!("no raft pipeline for lane {}", group.wire_name()))?;
             let (reply_tx, reply_rx) = std_mpsc::channel();
+            let telemetry = crate::manager::telemetry::metrics();
+            telemetry.raft_pipeline_depth.add(&[group.wire_name()], 1);
             sender
                 .send(PipelineJob {
                     lane,
                     op,
                     f,
                     reply: reply_tx,
+                    queued_at: std::time::Instant::now(),
                 })
                 .map_err(|_| {
+                    // The job never reached the (dead) pipeline thread, so
+                    // nothing will decrement the depth for it.
+                    telemetry.raft_pipeline_depth.add(&[group.wire_name()], -1);
                     anyhow!(
                         "raft replication pipeline for lane {} has shut down (op {op})",
                         group.wire_name()

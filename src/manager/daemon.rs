@@ -358,6 +358,11 @@ pub async fn run_manager(config: ManagerConfig, run_worker: bool) -> R<()> {
     // OTLP metrics push (opt-in via the OTEL_* env vars, like trace export;
     // no-op when unconfigured). Independent of the scrape listener above.
     crate::otel::start_metrics_push();
+    // Runtime saturation probe. Started regardless of the scrape listener —
+    // the OTLP push exports the same registry — and independent of it: when
+    // handlers block the runtime, every metric that answers "why is a
+    // do-nothing RPC slow?" comes from here.
+    crate::manager::telemetry::start_runtime_probe();
 
     let tls_identity = load_server_tls_identity(&full_config.server.tls)?;
     let server_builder = match tls_identity {
