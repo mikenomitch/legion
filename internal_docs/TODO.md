@@ -908,6 +908,38 @@ Plans: [persistence-plan.md](plans/persistence-plan.md), [multi-raft-persistence
 
 Plan: [auth-acl-plan.md](plans/auth-acl-plan.md) · docs: [auth-and-acls.md](../docs/auth-and-acls.md)
 
+- [ ] **Namespaces** — [plan](plans/namespaces-plan.md) (PLANNED) ·
+      [calls](calls/namespaces-plan_calls.md). Today namespaces are vocabulary
+      without values: the `namespaces` ACL selector globs correctly but every
+      scope is stamped `"default"` (`src/structs/acl.rs:213`), so a policy
+      naming any other namespace silently grants nothing.
+  - [ ] Phase 0 — `Namespace` object + CRUD (gRPC/CLI/MCP), the `namespace`
+        ACL resource, and validation that a `namespaces` selector names a
+        namespace that exists (kills the silent-no-op policy footgun).
+  - [ ] Phase 1 — jobs carry a namespace; `-n`/`LEGION_NAMESPACE`/`-A`,
+        `namespace/name` references, namespace on every job-derived ACL scope,
+        list filtering, `$LEGION_NAMESPACE` in task env. Names stay globally
+        unique; resolution becomes namespace-scoped (the plan's one behavioral
+        change, landed while everything is still in `default`).
+  - [ ] Phase 2 — per-namespace name uniqueness, **and** `{namespace}` in the
+        default workload-identity subject template in the same phase (without
+        it, `prod/web` and `dev/web` mint identical JWT subjects — see
+        [call 4](calls/namespaces-plan_calls.md)).
+  - [ ] Phase 3 — namespaced service catalog + same-namespace `connect`
+        resolution, and per-namespace event filtering (`list_events` /
+        `stream_events` are `operator:read` all-or-nothing today,
+        `src/manager/server.rs:3133`).
+  - [ ] Phase 4 — namespaced volumes and templates; UI (namespace in the URL,
+        header switcher, All-namespaces mode, Namespaces page, switcher
+        suppressed for single-namespace identities).
+  - [ ] Phase 5 — governance on the namespace object: quota,
+        `allowedPools`, `allowedRuntimes`, default band. Enforcement point for
+        quota is open (plan § 14).
+- [ ] **Cross-tenant leak: idempotency keys are globally scoped.**
+      `Store::idempotency_lookup` keys on the caller-supplied key alone
+      (`src/storage/store.rs:13087`), so two callers using `deploy-1` share a
+      record and the second gets the first's reply. Harmless while there is one
+      tenant; closed by namespaces Phase 1.
 - [ ] **KV ACLs on `GetArtifactCredential`.** Artifact auth (`auth.kv`) lets any
       job read any KV credential path today. The enforcement point exists and is
       marked — see the SECURITY BOUNDARY comment on `get_artifact_credential` in
@@ -1163,14 +1195,19 @@ docs: [scheduler-and-eval-loop.md](../docs/scheduler-and-eval-loop.md), [jobs-ta
   - [x] Phase 2 — priority bands, governed by a `bands` selector on `job` ACL
         rules (not `operator:write`), normalized before enforcement and
         covering the template-render path, with explicit cases in
-        `tests/acl_endpoints.rs`. Delivers per-namespace band caps, so that is
-        no longer a separate item. [docs](../docs/auth-and-acls.md)
+        `tests/acl_endpoints.rs`. The selector composes with `namespaces`, so
+        per-namespace band caps need no second surface — but they are not
+        *live* until namespaces carry real values
+        ([namespaces-plan.md](plans/namespaces-plan.md)); today the selector
+        delivers band caps scoped by job name and principal only.
+        [docs](../docs/auth-and-acls.md)
   - [x] Phase 3 — plan-atomic preemption. [docs](../docs/preemption-and-eviction.md)
   - [x] Phase 4's UI item — preemption history on the job page, the band badge
         on the job header, and the `priority` column in `job list`.
   - [x] At least think through fair-share policies — find the 80/20 rather than
         building a full hierarchical scheduler. The 80/20 is priority bands
-        plus per-namespace band caps via the `bands` ACL selector;
+        plus per-namespace band caps via the `bands` ACL selector (the caps go
+        live when [namespaces](plans/namespaces-plan.md) ship);
         fair-share/hierarchical queues stay an explicit non-goal (Kueue's
         policy-matrix issue history is the argument against).
 - [x] Ledger command — see every node and what's on it from the CLI
