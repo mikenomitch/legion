@@ -96,6 +96,13 @@ ExecStart=/opt/legion/bin/legion start worker $TOKEN \\
 Restart=on-failure
 LimitNOFILE=1048576
 Environment=RUST_LOG=info
+# Without this the fleet dials the worker's OWN 127.0.0.1:4747 (the
+# default when LEGION_ADDR is unset) and every node retries a connection
+# refused forever, while the campaign just sees "registered: 0/N". The
+# address is the control plane's PRIVATE ip: same-VPC traffic to a public
+# ip hairpins out through the internet gateway and no longer matches the
+# security group's intra-rig rule.
+Environment=LEGION_ADDR=$MANAGER
 Environment=LEGION_WORKER_TELEMETRY_PORT=$SIM_TELEMETRY_PORT
 
 [Install]
