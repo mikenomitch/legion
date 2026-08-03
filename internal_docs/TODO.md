@@ -299,6 +299,17 @@ How to use it:
         `packing-density.sh` during this step: it needs the same
         standing rig and retires the 1,250 assumption before any cell
         is sized from it.
+  - [ ] Export process-level memory from the manager so the campaign can
+        report the manager's own RSS instead of whole-box memory.
+        `docs/metrics.md` has no process family and nothing registers a
+        process collector, so `process_resident_memory_bytes` does not
+        exist on `:4749`; `collect.sh` therefore reports node_exporter
+        whole-box memory, an upper bound that includes the OS and (in
+        `used`) reclaimable page cache — ~40% of `used` on an idle
+        control-plane box. Deliberately not done mid-campaign: it changes
+        the binary under test and invalidates the fairness record for
+        every cell already collected. Do it before the phase-2 campaign.
+        See calls entry 20 and the Metrics section of the plan.
   - [ ] Phases 2-5: Legion A/B campaigns, Nomad (verify nodesim `mock`
         driver + install script), K8s (verify kubeadm/KWOK install +
         watch parsing), 20k validation burst, analysis + REPORT.md.
