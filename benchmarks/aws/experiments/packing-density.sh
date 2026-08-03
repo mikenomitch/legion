@@ -213,11 +213,30 @@ DENSITY=$(jq -r '.measured_nodes_per_instance // "none"' <<<"$REPORT")
 
 echo
 log "measured density: $DENSITY nodes/instance (plan assumed 1,250)"
+log "report: $RESULTS_ROOT/$CAMPAIGN/$RUN_ID/metrics.json"
+
 if [ "$DENSITY" != "none" ]; then
     jq -r '.implied_fleet[] | "  \(.nodes) nodes -> worker_instances=\(.worker_instances) (\(.spot_vcpu) vCPU)"' \
         <<<"$REPORT"
     log "set worker_instances from this table; re-run after any change to the sim path"
-else
-    log "even the lowest step saturated — re-run with a lower --steps ladder"
+    exit 0
 fi
-log "report: $RESULTS_ROOT/$CAMPAIGN/$RUN_ID/metrics.json"
+
+# No density means no result, and the whole point of this drill is to
+# replace the plan's 1,250 estimate with a measurement. Exiting 0 here
+# let an unattended phase-1 run checkpoint the step as "done" while every
+# scale step downstream stayed sized from the guess.
+#
+# Two very different things produce "none", so say which: a ladder where
+# every step ran and saturated is a real (if unhelpful) answer, while a
+# ladder that produced no samples at all means the drill never executed —
+# a missing `legion` on the loadgen box does exactly that.
+if [ "$(jq -r '[.steps[]? | select(.registered > 0)] | length' <<<"$REPORT")" = 0 ]; then
+    echo "packing density measured nothing: no step registered a single node." >&2
+    echo "The ladder did not run — check the log above for the real error" >&2
+    echo "(a missing legion CLI on the loadgen box looks exactly like this)." >&2
+else
+    echo "packing density found no healthy step: even the lowest saturated." >&2
+    echo "Re-run with a lower ladder, e.g. --steps \"250 500 1000\"." >&2
+fi
+exit 1

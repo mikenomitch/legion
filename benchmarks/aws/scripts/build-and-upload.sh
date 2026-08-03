@@ -64,3 +64,27 @@ printf '{"git_rev":"%s","sha256":"%s","built_at":"%s"}\n' \
     "$REV" "$SHA" "$(date -u +%FT%TZ)" |
     aws s3 cp --region "$REGION" - "s3://$BUCKET/bin/legion.meta.json"
 log "uploaded (sha256 $SHA)"
+
+# Install the CLI on the loadgen box now that it exists in S3.
+#
+# install-loadgen.sh also does this, but it runs inside bringup.sh —
+# before this script has ever run, when the bucket holds no binary. It
+# warns and continues, which is right (the bucket is created by the same
+# bringup), but it leaves the loadgen box without a `legion` on PATH.
+# Every later step needs it: start-sim-fleet.sh mints join tokens with
+# it, run-step.sh queries node counts with it, and both fail with a bare
+# `legion: command not found` a long way from this cause.
+log "installing the legion CLI on the loadgen box"
+rsh "$LOADGEN_ADDR" "
+    sudo aws s3 cp --region $REGION s3://$BUCKET/bin/legion /opt/legion/bin/legion &&
+    sudo chmod +x /opt/legion/bin/legion &&
+    sudo ln -sf /opt/legion/bin/legion /usr/local/bin/legion
+" >/dev/null || {
+    echo "failed to install the legion CLI on the loadgen box ($LOADGEN_ADDR)" >&2
+    exit 1
+}
+rsh "$LOADGEN_ADDR" "command -v legion >/dev/null" || {
+    echo "legion still not on PATH on the loadgen box" >&2
+    exit 1
+}
+log "legion CLI ready on the loadgen box"
