@@ -352,3 +352,62 @@ kept because they scale with what the benchmark shapes don't stress
 (constraint complexity, task count, cells per shard) and they remove
 per-plan work with no behavioral cost; the `-2.4%` on the whole
 plan-and-apply path is the aggregate. No cell regressed outside noise.
+
+## Plan batch as one transaction — 2026-08-03
+
+Phase 4 of `internal_docs/plans/plan-path-scale-levers-plan.md`: a group
+commit is now ONE write transaction on every backend (previously the
+amortization landed only under raft — judgement call #6), and the
+batch's post-apply `task_status` projection is one status-lane write for
+the batch instead of one per plan.
+
+**Commit count, measured directly** (`cargo test --lib
+local_plan_batch_commits_once_and_projects_statuses_once`, a SQLite
+commit hook counting transactions that reach the disk):
+
+| Three plans | commits before | commits after |
+| --- | --- | --- |
+| applied singly (`plan_apply_coalescing: false`) | 6 | 6 |
+| applied as one batch | 6 | **2** |
+
+Six is three plan commits plus three status projections; two is one of
+each. This is exact, not a timing.
+
+**Wall clock, conflict-free** (`cargo test --release --lib
+bench_local_plan_batch -- --ignored --nocapture`; batch of 16
+independent single-placement plans on `local_disk`, medians of 20
+repetitions, dev container). The "before" arm applies the same 16 plans
+one at a time, which is precisely what the pre-phase-4 batch did on a
+local backend:
+
+| Batch of 16, local_disk | before | after |
+| --- | --- | --- |
+| plan applies + status projections | 31.99 ms | **4.33 ms** (7.4x) |
+
+The plans are built with disjoint scopes on purpose: this measures the
+write path, not optimistic-concurrency contention.
+
+**Macro matrix** (`LEGION_BENCH_CONCURRENCY=4`, release, same host,
+`steady-small` + `web-fleet`, one run per arm):
+
+| Scenario | Backend | evals/s before → after | p99 ms before → after |
+| --- | --- | --- | --- |
+| steady-small | local_disk | 277.8 → 294.2 | 7.84 → 7.41 |
+| steady-small | raft1 | 30.5 → 29.0 | 68.4 → 71.7 |
+| web-fleet | local_disk | 325.9 → 360.7 | 29.2 → 28.3 |
+| web-fleet | raft1 | 69.9 → 69.2 | 51.1 → 46.6 |
+
+Honest reading: **the macro matrix does not resolve this change on this
+host.** Three back-to-back runs of the *same* (after) binary measured
+raft1 `steady-small` at 29.0, 40.2 and 52.3 evals/s — a spread far wider
+than any delta in the table above. These cells are also conflict-bound
+(112-129% conflict rate on `steady-small`), which is the ceiling the
+phase-3 entry above already documented and which batching cannot move.
+The commit-count table is the result; the wall-clock A/B is what that
+costs in time; the macro numbers are recorded only to show nothing
+regressed beyond noise, with correctness 1.000 in every cell.
+
+Under raft the plan write was already one propose per batch, so the new
+win there is the status projection: a batch of N plans drops from N
+status-lane rounds to one (N more raft rounds under
+`topology: "lanes"`).

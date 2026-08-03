@@ -393,6 +393,68 @@ impl PlanPlacements {
 
 type PlanApplyReply = (PlanSubmission, PlanApplyOutcome);
 
+/// One plan's slot in a group commit: what the submitter gets back, plus
+/// whether the batch leader already ran this plan's post-apply
+/// bookkeeping (batched across the whole group — see
+/// `Store::batch_apply_bookkeeping`). A submitter whose bookkeeping was
+/// not done runs it itself, which is also the uncoalesced path.
+#[derive(Debug)]
+struct PlanApplySlot {
+    reply: PlanApplyReply,
+    bookkeeping_done: bool,
+}
+
+impl PlanApplySlot {
+    /// A reply whose bookkeeping still belongs to its submitter.
+    fn unbooked(reply: PlanApplyReply) -> Self {
+        PlanApplySlot {
+            reply,
+            bookkeeping_done: false,
+        }
+    }
+}
+
+/// Side effects a plan apply produced but must not perform until its
+/// transaction has COMMITTED: the event broadcast, and the read-model
+/// refresh for the allocation scopes it touched.
+///
+/// Returning them instead of firing them in place is what lets a group
+/// commit run many plans in one transaction: mid-transaction, a refresh
+/// would read PRE-batch state through the read connections and publish a
+/// read model missing the batch's own placements, and a broadcast would
+/// announce a placement that is not durable yet. Under raft both are
+/// suppressed anyway and re-projected from the committed changeset
+/// (JC-11); this is the same rule made explicit for every backend.
+#[derive(Debug, Default)]
+struct PlanApplyEffects {
+    /// Staged event rows, in the order they were staged — which is id
+    /// order, the order subscribers must observe them in.
+    events: Vec<SchedulerEventRecord>,
+    /// Node scopes whose allocations and epochs need republishing.
+    node_ids: BTreeSet<String>,
+    /// Job-config scopes whose epochs need republishing.
+    job_config_ids: BTreeSet<String>,
+}
+
+impl PlanApplyEffects {
+    /// Mark the scopes of allocations this plan placed or removed. Both
+    /// directions land in one refresh: it reads committed state, so the
+    /// mirror never passes through the intermediate state a
+    /// remove-then-add pair of refreshes exposed.
+    fn touch_allocations(&mut self, allocations: &[Allocation]) {
+        for allocation in allocations {
+            self.node_ids.insert(allocation.node_id.clone());
+            self.job_config_ids.insert(allocation.job_config_id.clone());
+        }
+    }
+
+    fn merge(&mut self, other: PlanApplyEffects) {
+        self.events.extend(other.events);
+        self.node_ids.extend(other.node_ids);
+        self.job_config_ids.extend(other.job_config_ids);
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Store {
     pub write_conn: MemSafeConn,
@@ -443,7 +505,7 @@ pub struct Store {
     // capture → one raft propose/quorum round for the whole batch — with
     // per-plan savepoint isolation inside. Shared across clones so every
     // eval worker feeds the same queue.
-    plan_coalescer: Arc<crate::storage::coalesce::Coalescer<PlanApplyRequest, PlanApplyReply>>,
+    plan_coalescer: Arc<crate::storage::coalesce::Coalescer<PlanApplyRequest, PlanApplySlot>>,
     // Heartbeat group commit (heartbeat-scale plan §2): concurrent
     // update_node_heartbeat callers coalesce into one status-lane op
     // stamping every batched node id.
@@ -2543,13 +2605,37 @@ impl Store {
         evictions: &[PlanEviction],
         target_instance: &str,
     ) -> R<PlanSubmission> {
+        let conn = self.write_connection()?;
+        self.insert_plan_submission_on(
+            &conn,
+            job_config_id,
+            mode,
+            placements_json,
+            expected_versions,
+            evictions,
+            target_instance,
+        )
+    }
+
+    /// [`Self::insert_plan_submission_apply`] on a caller-supplied
+    /// connection, so the row can join the transaction the plan itself
+    /// applies in (the fused op, and every plan inside a group commit).
+    fn insert_plan_submission_on(
+        &self,
+        conn: &Connection,
+        job_config_id: &str,
+        mode: &str,
+        placements_json: &str,
+        expected_versions: &BTreeMap<String, i64>,
+        evictions: &[PlanEviction],
+        target_instance: &str,
+    ) -> R<PlanSubmission> {
         let created_at = OffsetDateTime::now_utc().format(&Rfc3339)?;
         let evictions_json = serde_json::to_string(evictions)?;
         let expected_vector_json = serde_json::to_string(expected_versions)?;
         let expected_job_epoch = *expected_versions
             .get(&Self::scope_vector_key("job_config", job_config_id))
             .unwrap_or(&0);
-        let conn = self.write_connection()?;
         let id = conn.query_row(
             "INSERT INTO plan_submission(job_config_id, mode, placements, expected_epoch, expected_version_vector, status, created_at, evictions, target_instance) VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6, ?7, ?8) RETURNING id;",
             params![
@@ -2634,14 +2720,7 @@ impl Store {
             evictions: evictions.to_vec(),
             target_instance: target_instance.to_owned(),
         };
-        let (submission, outcome) = if self.plan_apply_coalescing_enabled() {
-            let coalescer = Arc::clone(&self.plan_coalescer);
-            coalescer.submit(request, |batch| self.run_plan_apply_batch(batch))?
-        } else {
-            self.submit_and_apply_plan_replicated(request)?
-        };
-        self.plan_apply_bookkeeping(&outcome)?;
-        Ok((submission, outcome))
+        self.submit_and_apply_plan_coalesced(request)
     }
 
     /// `schedulerSettings.plan_apply_coalescing` — default true.
@@ -2673,111 +2752,110 @@ impl Store {
         match request.placements {
             PlanPlacements::Nodes(_) => {
                 self.replicated(Lane::Scheduler, "submit_and_apply_plan", move |s| {
-                    s.submit_and_apply_plan_apply(
-                        &request.job_config_id,
-                        &request.mode,
-                        &request.placements,
-                        &request.expected_versions,
-                        &request.evictions,
-                        &request.target_instance,
-                    )
+                    s.submit_and_apply_plan_apply(&request)
                 })
             }
             PlanPlacements::Candidates(_) => self.replicated(
                 Lane::Scheduler,
                 "submit_and_apply_plan_with_candidates",
-                move |s| {
-                    s.submit_and_apply_plan_with_candidates_apply(
-                        &request.job_config_id,
-                        &request.mode,
-                        &request.placements,
-                        &request.expected_versions,
-                        &request.evictions,
-                        &request.target_instance,
-                    )
-                },
+                move |s| s.submit_and_apply_plan_with_candidates_apply(&request),
             ),
         }
     }
 
-    /// One plan of either format, applied on the current connection: the
-    /// group commit's per-plan body.
-    fn apply_plan_request(&self, request: &PlanApplyRequest) -> R<PlanApplyReply> {
-        match request.placements {
-            PlanPlacements::Nodes(_) => self.submit_and_apply_plan_apply(
-                &request.job_config_id,
-                &request.mode,
-                &request.placements,
-                &request.expected_versions,
-                &request.evictions,
-                &request.target_instance,
-            ),
-            PlanPlacements::Candidates(_) => self.submit_and_apply_plan_with_candidates_apply(
-                &request.job_config_id,
-                &request.mode,
-                &request.placements,
-                &request.expected_versions,
-                &request.evictions,
-                &request.target_instance,
-            ),
-        }
+    /// The format-1 op body.
+    fn submit_and_apply_plan_apply(&self, request: &PlanApplyRequest) -> R<PlanApplyReply> {
+        self.submit_and_apply_plan_txn(request)
+    }
+
+    /// The format-2 (candidate list) op body: the same walk under its own
+    /// op name, so the raft log says which submission shape ran
+    /// (docs/late-binding-plan-apply.md).
+    fn submit_and_apply_plan_with_candidates_apply(
+        &self,
+        request: &PlanApplyRequest,
+    ) -> R<PlanApplyReply> {
+        self.submit_and_apply_plan_txn(request)
+    }
+
+    /// One plan in its own write transaction: insert the submission, run
+    /// the walk, commit, then emit the side effects the commit made real.
+    /// The group commit runs the same body ([`Self::submit_and_apply_plan_on`])
+    /// against a transaction it opened for the whole batch instead.
+    fn submit_and_apply_plan_txn(&self, request: &PlanApplyRequest) -> R<PlanApplyReply> {
+        let mut conn = self.write_connection()?;
+        let tx = Self::write_tx(&mut conn)?;
+        let (reply, effects) = self.submit_and_apply_plan_on(&tx, request)?;
+        tx.commit()?;
+        // Emitted while the write guard is still held, so subscribers
+        // observe events in strict id order.
+        self.emit_plan_effects(effects)?;
+        Ok(reply)
+    }
+
+    /// One plan of either format, applied on `tx`: insert the submission
+    /// row and run the candidate walk, returning the side effects the
+    /// caller must emit once `tx` commits. Format 1 and format 2 share
+    /// this body — the submission's serialized shape is what differs, not
+    /// the walk (docs/late-binding-plan-apply.md).
+    fn submit_and_apply_plan_on(
+        &self,
+        tx: &Connection,
+        request: &PlanApplyRequest,
+    ) -> R<(PlanApplyReply, PlanApplyEffects)> {
+        let placements_json = request.placements.to_json()?;
+        let submission = self.insert_plan_submission_on(
+            tx,
+            &request.job_config_id,
+            &request.mode,
+            &placements_json,
+            &request.expected_versions,
+            &request.evictions,
+            &request.target_instance,
+        )?;
+        let (outcome, effects) = self.apply_plan_submission_on(tx, &submission)?;
+        Ok(((submission, outcome), effects))
     }
 
     /// Batch leader body for the plan-apply group commit: run every
-    /// drained plan inside ONE replicated op. Under raft this is one
-    /// capture → one propose → one quorum round → one apply transaction
-    /// for the whole batch; on local backends the plans run back-to-back
-    /// exactly as they would have serially (WAL-mode commits are not the
-    /// local cost, so no outer transaction is added — see the plan's
-    /// judgement calls).
+    /// drained plan inside ONE replicated op, then do the whole batch's
+    /// post-apply bookkeeping once.
     ///
-    /// Failure isolation: under capture, each plan runs inside its own
-    /// savepoint, so a failing plan rolls back alone and cannot poison
-    /// batch-mates (epoch-CAS rejections are not failures — they commit a
-    /// `rejected` submission row exactly as the single-plan op does). If
-    /// the batch op itself fails (capture/propose machinery), nothing was
-    /// applied — the capture rolled back — so every plan re-runs singly
-    /// through the pre-D5 path; any plan the failed propose DID commit
-    /// (a lost-leadership race) is then rejected by its own epoch CAS,
-    /// never applied twice.
-    fn run_plan_apply_batch(&self, batch: Vec<PlanApplyRequest>) -> Vec<R<PlanApplyReply>> {
+    /// **One transaction, one commit, on every backend.** The batch opens
+    /// a single write transaction and holds the write connection for its
+    /// whole duration, exactly as every other multi-statement write in
+    /// this store does. Locally that is one fsync for N plans instead of
+    /// N; under raft the transaction nests inside the capture savepoint,
+    /// so it stays one capture → one propose → one quorum round → one
+    /// apply transaction for the batch. Holding the connection is also
+    /// what makes the amortization *safe*: no unrelated writer can land
+    /// its own transaction inside the batch's, where its commit would not
+    /// be durable until the batch's and its own read-model refresh would
+    /// read pre-batch state (the hazard that deferred this locally —
+    /// judgement call #6).
+    ///
+    /// Failure isolation: each plan runs inside its own savepoint, so a
+    /// failing plan rolls back alone and cannot poison batch-mates
+    /// (epoch-CAS rejections are not failures — they commit a `rejected`
+    /// submission row exactly as the single-plan op does). If the batch
+    /// op itself fails before its commit, nothing was applied, so every
+    /// plan re-runs singly through the pre-D5 path; any plan a failed
+    /// propose DID commit (a lost-leadership race) is then rejected by
+    /// its own epoch CAS, never applied twice.
+    fn run_plan_apply_batch(&self, batch: Vec<PlanApplyRequest>) -> Vec<R<PlanApplySlot>> {
         if batch.len() == 1 {
             let request = batch.into_iter().next().expect("length checked");
-            return vec![self.submit_and_apply_plan_replicated(request)];
+            return vec![self
+                .submit_and_apply_plan_replicated(request)
+                .map(PlanApplySlot::unbooked)];
         }
 
         let rerun = batch.clone();
         let batch_size = batch.len();
         let batched = self.replicated(Lane::Scheduler, "submit_and_apply_plans", move |s| {
-            let isolate = capture::in_capture();
-            let mut results: Vec<R<PlanApplyReply>> = Vec::with_capacity(batch.len());
-            for request in &batch {
-                if isolate {
-                    // Savepoint-machinery errors abort the whole capture
-                    // (`?`): a leftover savepoint would corrupt the stack
-                    // for batch-mates, and a full rollback + re-run-singly
-                    // is the safe recovery.
-                    s.exec_on_write_conn("SAVEPOINT legion_plan_batch_item;")?;
-                    match s.apply_plan_request(request) {
-                        Ok(reply) => {
-                            s.exec_on_write_conn("RELEASE legion_plan_batch_item;")?;
-                            results.push(Ok(reply));
-                        }
-                        Err(err) => {
-                            s.exec_on_write_conn(
-                                "ROLLBACK TO legion_plan_batch_item; \
-                                 RELEASE legion_plan_batch_item;",
-                            )?;
-                            results.push(Err(err));
-                        }
-                    }
-                } else {
-                    results.push(s.apply_plan_request(request));
-                }
-            }
-            Ok(results)
+            s.run_plan_batch_txn(&batch)
         });
-        match batched {
+        let results = match batched {
             Ok(results) => results,
             Err(batch_err) => {
                 warn!(
@@ -2785,44 +2863,79 @@ impl Store {
                     error = %batch_err,
                     "Batched plan apply failed before commit; re-running each plan singly"
                 );
-                rerun
+                return rerun
                     .into_iter()
-                    .map(|request| self.submit_and_apply_plan_replicated(request))
-                    .collect()
+                    .map(|request| {
+                        self.submit_and_apply_plan_replicated(request)
+                            .map(PlanApplySlot::unbooked)
+                    })
+                    .collect();
+            }
+        };
+        // One epoch self-heal and one status-lane task_status projection
+        // for the whole batch (see `batch_apply_bookkeeping`). When that
+        // does not complete, each submitter runs its own instead, so a
+        // hard failure is attributed to the plan that caused it.
+        let bookkeeping_done = self.batch_apply_bookkeeping(&results);
+        results
+            .into_iter()
+            .map(|result| {
+                result.map(|reply| PlanApplySlot {
+                    reply,
+                    bookkeeping_done,
+                })
+            })
+            .collect()
+    }
+
+    /// The group commit's transaction: every drained plan applied inside
+    /// one write transaction, each fenced by its own savepoint, with the
+    /// batch's side effects emitted once after the single commit.
+    fn run_plan_batch_txn(&self, batch: &[PlanApplyRequest]) -> R<Vec<R<PlanApplyReply>>> {
+        let mut conn = self.write_connection()?;
+        let tx = Self::write_tx(&mut conn)?;
+        let mut results: Vec<R<PlanApplyReply>> = Vec::with_capacity(batch.len());
+        let mut effects = PlanApplyEffects::default();
+        for request in batch {
+            // Savepoint-machinery errors abort the whole batch (`?`): a
+            // leftover savepoint would corrupt the stack for batch-mates,
+            // and a full rollback + re-run-singly is the safe recovery.
+            tx.execute_batch("SAVEPOINT legion_plan_batch_item;")?;
+            match self.submit_and_apply_plan_on(&tx, request) {
+                Ok((reply, plan_effects)) => {
+                    tx.execute_batch("RELEASE legion_plan_batch_item;")?;
+                    effects.merge(plan_effects);
+                    results.push(Ok(reply));
+                }
+                Err(err) => {
+                    tx.execute_batch(
+                        "ROLLBACK TO legion_plan_batch_item; \
+                         RELEASE legion_plan_batch_item;",
+                    )?;
+                    results.push(Err(err));
+                }
             }
         }
-    }
-
-    /// Run raw SQL on the write connection, acquiring and releasing the
-    /// connection lock for just this statement (savepoint control inside
-    /// batched ops, where holding a transaction handle across the
-    /// per-plan calls would deadlock their own `write_connection` locks).
-    fn exec_on_write_conn(&self, sql: &str) -> R<()> {
-        let conn = self.write_connection()?;
-        conn.execute_batch(sql)?;
-        Ok(())
-    }
-
-    fn submit_and_apply_plan_apply(
-        &self,
-        job_config_id: &str,
-        mode: &str,
-        placements: &PlanPlacements,
-        expected_versions: &BTreeMap<String, i64>,
-        evictions: &[PlanEviction],
-        target_instance: &str,
-    ) -> R<(PlanSubmission, PlanApplyOutcome)> {
-        let placements_json = placements.to_json()?;
-        let submission = self.insert_plan_submission_apply(
-            job_config_id,
-            mode,
-            &placements_json,
-            expected_versions,
-            evictions,
-            target_instance,
-        )?;
-        let outcome = self.apply_plan_submission_apply(&submission)?;
-        Ok((submission, outcome))
+        // The batch's single commit. Only now may its effects be seen:
+        // every staged event in id order, then one coherent read-model
+        // refresh over the union of every plan's scopes.
+        tx.commit()?;
+        // Past the commit this function may NOT fail: its caller's
+        // recovery is to re-run every plan singly, which after a commit
+        // would apply the batch twice. A refresh that cannot publish
+        // (a poisoned read-model lock) leaves the mirror stale for these
+        // scopes until the next publish or a rejection's self-heal, which
+        // costs conflicts, not correctness — the apply-time fence never
+        // trusts the mirror. See the plan's judgement call #10.
+        if let Err(err) = self.emit_plan_effects(effects) {
+            error!(
+                plans = batch.len(),
+                error = %err,
+                "Batched plan apply committed but could not publish its read model; \
+                 the next allocation publish or rejection self-heal reconciles it"
+            );
+        }
+        Ok(results)
     }
 
     /// [`Self::submit_and_apply_plan`] for format-2 (candidate list)
@@ -2855,36 +2968,23 @@ impl Store {
             // its keyed instance through the single-node entry point.
             target_instance: String::new(),
         };
-        let (submission, outcome) = if self.plan_apply_coalescing_enabled() {
+        self.submit_and_apply_plan_coalesced(request)
+    }
+
+    /// Submit one plan through the group commit (or straight to the
+    /// single-plan op when coalescing is off), then run whatever
+    /// post-apply bookkeeping the batch leader did not already do for it.
+    fn submit_and_apply_plan_coalesced(&self, request: PlanApplyRequest) -> R<PlanApplyReply> {
+        let slot = if self.plan_apply_coalescing_enabled() {
             let coalescer = Arc::clone(&self.plan_coalescer);
             coalescer.submit(request, |batch| self.run_plan_apply_batch(batch))?
         } else {
-            self.submit_and_apply_plan_replicated(request)?
+            PlanApplySlot::unbooked(self.submit_and_apply_plan_replicated(request)?)
         };
-        self.plan_apply_bookkeeping(&outcome)?;
-        Ok((submission, outcome))
-    }
-
-    /// [`Self::submit_and_apply_plan_apply`] under the format-2 op name: the
-    /// insert and the candidate walk are the same body — the submission's
-    /// serialized shape is what differs (docs/late-binding-plan-apply.md).
-    fn submit_and_apply_plan_with_candidates_apply(
-        &self,
-        job_config_id: &str,
-        mode: &str,
-        placements: &PlanPlacements,
-        expected_versions: &BTreeMap<String, i64>,
-        evictions: &[PlanEviction],
-        target_instance: &str,
-    ) -> R<(PlanSubmission, PlanApplyOutcome)> {
-        self.submit_and_apply_plan_apply(
-            job_config_id,
-            mode,
-            placements,
-            expected_versions,
-            evictions,
-            target_instance,
-        )
+        if !slot.bookkeeping_done {
+            self.plan_apply_bookkeeping(&slot.reply.1)?;
+        }
+        Ok(slot.reply)
     }
 
     pub fn apply_plan_submission(&self, submission: &PlanSubmission) -> R<PlanApplyOutcome> {
@@ -2900,6 +3000,92 @@ impl Store {
     /// `submit_and_apply_plan`: epoch-mirror self-heal on rejection,
     /// status-lane task_status projection on success.
     fn plan_apply_bookkeeping(&self, outcome: &PlanApplyOutcome) -> R<()> {
+        let mut rejected_nodes = BTreeSet::new();
+        let mut rejected_job_configs = BTreeSet::new();
+        let mut placed: &[Allocation] = &[];
+        match outcome {
+            PlanApplyOutcome::Rejected {
+                latest_versions, ..
+            } => Self::collect_rejected_scopes(
+                latest_versions,
+                &mut rejected_nodes,
+                &mut rejected_job_configs,
+            ),
+            PlanApplyOutcome::Applied(applied) => placed = &applied.allocations,
+        }
+        self.run_apply_bookkeeping(&rejected_nodes, &rejected_job_configs, placed)
+    }
+
+    /// Post-apply bookkeeping for a whole group commit, run once by the
+    /// batch leader: ONE epoch self-heal covering every rejected plan's
+    /// scopes, and ONE status-lane `task_status` projection covering
+    /// every allocation the batch placed. The projection dedupes by task
+    /// config, and the job-config epoch CAS makes two *applied* plans for
+    /// the same config inside one batch impossible, so the union is
+    /// exactly what N per-plan projections would have written.
+    ///
+    /// Returns whether the batched path completed. On any failure the
+    /// submitters run their own `plan_apply_bookkeeping` instead, so a
+    /// hard error is attributed to the plan that caused it — the same
+    /// re-run-singly idiom the batch itself uses. Both halves are
+    /// idempotent, so the repeat costs nothing but the work.
+    fn batch_apply_bookkeeping(&self, results: &[R<PlanApplyReply>]) -> bool {
+        let mut rejected_nodes = BTreeSet::new();
+        let mut rejected_job_configs = BTreeSet::new();
+        let mut placed: Vec<Allocation> = Vec::new();
+        for (_, outcome) in results.iter().filter_map(|result| result.as_ref().ok()) {
+            match outcome {
+                PlanApplyOutcome::Rejected {
+                    latest_versions, ..
+                } => Self::collect_rejected_scopes(
+                    latest_versions,
+                    &mut rejected_nodes,
+                    &mut rejected_job_configs,
+                ),
+                PlanApplyOutcome::Applied(applied) => {
+                    placed.extend_from_slice(&applied.allocations)
+                }
+            }
+        }
+        match self.run_apply_bookkeeping(&rejected_nodes, &rejected_job_configs, &placed) {
+            Ok(()) => true,
+            Err(err) => {
+                warn!(
+                    plans = results.len(),
+                    error = %err,
+                    "Batched plan bookkeeping failed; each plan will run its own"
+                );
+                false
+            }
+        }
+    }
+
+    /// The scopes a rejection proved stale, split by kind.
+    fn collect_rejected_scopes(
+        latest_versions: &BTreeMap<String, i64>,
+        node_ids: &mut BTreeSet<String>,
+        job_config_ids: &mut BTreeSet<String>,
+    ) {
+        for key in latest_versions.keys() {
+            match Self::parse_scope_vector_key(key) {
+                Ok(("node", id)) => {
+                    node_ids.insert(id.to_string());
+                }
+                Ok(("job_config", id)) => {
+                    job_config_ids.insert(id.to_string());
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// The bookkeeping body, over one plan's scopes or a whole batch's.
+    fn run_apply_bookkeeping(
+        &self,
+        rejected_nodes: &BTreeSet<String>,
+        rejected_job_configs: &BTreeSet<String>,
+        placed: &[Allocation],
+    ) -> R<()> {
         // Self-heal the epoch mirror on rejection: the CAS just proved the
         // sampler's mirror was behind the database for these scopes (a
         // competing plan applied, or a write path bumped an epoch without a
@@ -2907,24 +3093,8 @@ impl Store {
         // allocations second, like every mirror update — makes the retry
         // sample fresh state instead of failing on the same stale entries
         // forever.
-        if let PlanApplyOutcome::Rejected {
-            latest_versions, ..
-        } = outcome
-        {
-            let mut node_ids = BTreeSet::new();
-            let mut job_config_ids = BTreeSet::new();
-            for key in latest_versions.keys() {
-                match Self::parse_scope_vector_key(key) {
-                    Ok(("node", id)) => {
-                        node_ids.insert(id.to_string());
-                    }
-                    Ok(("job_config", id)) => {
-                        job_config_ids.insert(id.to_string());
-                    }
-                    _ => {}
-                }
-            }
-            self.cache_refresh_allocation_scopes(&node_ids, &job_config_ids)?;
+        if !rejected_nodes.is_empty() || !rejected_job_configs.is_empty() {
+            self.cache_refresh_allocation_scopes(rejected_nodes, rejected_job_configs)?;
         }
         // Lifecycle-derived task_status transitions are status-lane writes
         // (plan §7-C2, C-2), so they follow the scheduler-lane apply as a
@@ -2940,13 +3110,13 @@ impl Store {
         // derivable — the status leader's seed reconciler and the workers'
         // own status reports converge them — so a typed `NotRaftLeader`
         // here is warn-and-continue; any other error still fails.
-        if let PlanApplyOutcome::Applied(applied) = outcome {
-            if let Err(err) = self.update_task_statuses_for_allocations(&applied.allocations) {
+        if !placed.is_empty() {
+            if let Err(err) = self.update_task_statuses_for_allocations(placed) {
                 if !crate::storage::raft::driver::NotRaftLeader::in_chain(&err) {
                     return Err(err);
                 }
                 warn!(
-                    allocations = applied.allocations.len(),
+                    allocations = placed.len(),
                     error = %err,
                     "status-lane task_status projection deferred: this node does not lead \
                      the status lane; worker reports and the status leader's reconciler \
@@ -3012,6 +3182,40 @@ impl Store {
     /// plan's backlog). The walk is a pure function of the submission and
     /// committed state: all randomness ran at plan time.
     fn apply_plan_submission_apply(&self, submission: &PlanSubmission) -> R<PlanApplyOutcome> {
+        let mut conn = self.write_connection()?;
+        let tx = Self::write_tx(&mut conn)?;
+        let (outcome, effects) = self.apply_plan_submission_on(&tx, submission)?;
+        tx.commit()?;
+        // Emitted while the write guard is still held, so subscribers
+        // observe events in strict id order.
+        self.emit_plan_effects(effects)?;
+        Ok(outcome)
+    }
+
+    /// Emit the side effects a committed plan (or batch of plans) made
+    /// real: the staged events, then one coherent read-model refresh over
+    /// every allocation scope the commit touched. Both funnels no-op
+    /// under an active capture, where the raft apply path re-projects
+    /// them from the committed changeset instead (JC-11).
+    fn emit_plan_effects(&self, effects: PlanApplyEffects) -> R<()> {
+        for event in effects.events {
+            self.publish_staged(Some(event));
+        }
+        if !effects.node_ids.is_empty() || !effects.job_config_ids.is_empty() {
+            self.cache_refresh_allocation_scopes(&effects.node_ids, &effects.job_config_ids)?;
+        }
+        Ok(())
+    }
+
+    /// [`Self::apply_plan_submission_apply`] on a caller-supplied
+    /// transaction, returning the side effects to emit once that
+    /// transaction commits. The group commit runs this once per plan
+    /// inside the batch's single transaction.
+    fn apply_plan_submission_on(
+        &self,
+        tx: &Connection,
+        submission: &PlanSubmission,
+    ) -> R<(PlanApplyOutcome, PlanApplyEffects)> {
         let tx_started = Instant::now();
         debug!(
             submission_id = submission.id,
@@ -3019,18 +3223,16 @@ impl Store {
             expected_scope_count = submission.expected_versions.len(),
             "Applying plan submission"
         );
-        let mut conn = self.write_connection()?;
-        let tx = Self::write_tx(&mut conn)?;
 
         // `reverted_evictions` is `Some(n)` once this plan has staged
         // evictions inside the `legion_plan_evictions` savepoint: a rejection
         // still COMMITS (it persists the rejected row and its event), so the
         // victims must be rolled back first — a plan that is not happening
         // may not displace anything.
-        let reject = |tx: rusqlite::Savepoint<'_>,
+        let reject = |tx: &Connection,
                       reason: String,
                       reverted_evictions: Option<usize>|
-         -> R<PlanApplyOutcome> {
+         -> R<(PlanApplyOutcome, PlanApplyEffects)> {
             if reverted_evictions.is_some() {
                 tx.execute_batch(
                     "ROLLBACK TO legion_plan_evictions; RELEASE legion_plan_evictions;",
@@ -3040,14 +3242,11 @@ impl Store {
                 "UPDATE plan_submission SET status = 'rejected', rejection_reason = ?1 WHERE id = ?2;",
                 params![reason, submission.id],
             )?;
-            let latest_versions =
-                self.scope_vector_epochs_tx(&tx, &submission.expected_versions)?;
+            let latest_versions = self.scope_vector_epochs_tx(tx, &submission.expected_versions)?;
             let rejected_event = self.stage_event_locked(
-                &tx,
+                tx,
                 drafts::plan_rejected(&submission.job_config_id, &reason),
             );
-            tx.commit()?;
-            self.publish_staged(rejected_event);
             warn!(
                 submission_id = submission.id,
                 job_config_id = %submission.job_config_id,
@@ -3058,10 +3257,16 @@ impl Store {
             crate::manager::telemetry::metrics()
                 .plan_apply_total
                 .inc(&["rejected"]);
-            Ok(PlanApplyOutcome::Rejected {
-                reason,
-                latest_versions,
-            })
+            Ok((
+                PlanApplyOutcome::Rejected {
+                    reason,
+                    latest_versions,
+                },
+                PlanApplyEffects {
+                    events: rejected_event.into_iter().collect(),
+                    ..PlanApplyEffects::default()
+                },
+            ))
         };
 
         // The job-config epoch is a hard, all-or-nothing check: it is what
@@ -3073,7 +3278,7 @@ impl Store {
             .get(&job_scope_key)
             .copied()
             .unwrap_or_default();
-        let latest_job_epoch = self.scope_epoch_tx(&tx, "job_config", &submission.job_config_id)?;
+        let latest_job_epoch = self.scope_epoch_tx(tx, "job_config", &submission.job_config_id)?;
         if latest_job_epoch != expected_job_epoch {
             let reason = format!(
                 "plan epoch for job config {} is stale; expected {}, latest {}",
@@ -3132,7 +3337,7 @@ impl Store {
         let mut pre_eviction_node_epochs: HashMap<String, i64> = HashMap::new();
         for eviction in &evictions {
             if let Entry::Vacant(entry) = pre_eviction_node_epochs.entry(eviction.node_id.clone()) {
-                let epoch = self.scope_epoch_tx(&tx, "node", &eviction.node_id)?;
+                let epoch = self.scope_epoch_tx(tx, "node", &eviction.node_id)?;
                 entry.insert(epoch);
             }
         }
@@ -3140,7 +3345,7 @@ impl Store {
         if eviction_savepoint {
             tx.execute_batch("SAVEPOINT legion_plan_evictions;")?;
         }
-        let preempted = self.apply_plan_evictions_tx(&tx, submission, &evictions)?;
+        let preempted = self.apply_plan_evictions_tx(tx, submission, &evictions)?;
 
         // Node rows load LAZILY, per candidate actually attempted, memoized
         // for the plan. The walk usually binds rank 0, so eagerly loading
@@ -3182,9 +3387,7 @@ impl Store {
             let task_id = placement.task_id;
             let state = match task_states.entry(task_id) {
                 Entry::Occupied(entry) => entry.into_mut(),
-                Entry::Vacant(entry) => {
-                    entry.insert(self.load_allocation_task_state(&tx, task_id)?)
-                }
+                Entry::Vacant(entry) => entry.insert(self.load_allocation_task_state(tx, task_id)?),
             };
             let request = match task_requests.entry(task_id) {
                 Entry::Occupied(entry) => entry.into_mut(),
@@ -3211,7 +3414,7 @@ impl Store {
                     .unwrap_or_default();
                 let latest_epoch = match pre_eviction_node_epochs.get(node_id) {
                     Some(epoch) => *epoch,
-                    None => self.scope_epoch_tx(&tx, "node", node_id)?,
+                    None => self.scope_epoch_tx(tx, "node", node_id)?,
                 };
                 if latest_epoch != expected_epoch {
                     if first_skip_reason.is_none() {
@@ -3275,7 +3478,7 @@ impl Store {
                 let pool = match free_pools.entry(node_id.clone()) {
                     Entry::Occupied(entry) => entry.into_mut(),
                     Entry::Vacant(entry) => entry.insert(self.free_pool_for_node_tx(
-                        &tx,
+                        tx,
                         node,
                         &submission.job_config_id,
                         drop_own,
@@ -3301,7 +3504,7 @@ impl Store {
                 // candidate. Any other error (config parse, SQL) is a real
                 // failure and propagates.
                 let network = match self.assign_allocation_network(
-                    &tx,
+                    tx,
                     node_id,
                     task_id,
                     state.network_raw.clone(),
@@ -3322,7 +3525,7 @@ impl Store {
                 };
 
                 let allocation = self.insert_allocation_with_data(
-                    &tx,
+                    tx,
                     node_id,
                     task_id,
                     &state.job_config_id,
@@ -3364,7 +3567,7 @@ impl Store {
         }
 
         if !allocations.is_empty() {
-            self.bump_epochs_for_allocations_tx(&tx, &allocations)?;
+            self.bump_epochs_for_allocations_tx(tx, &allocations)?;
         }
         if eviction_savepoint {
             tx.execute_batch("RELEASE legion_plan_evictions;")?;
@@ -3376,12 +3579,16 @@ impl Store {
         )?;
         let placed_event =
             drafts::allocations_placed(&submission.job_config_id, &allocations, &candidate_ranks)
-                .and_then(|draft| self.stage_event_locked(&tx, draft));
-        tx.commit()?;
-        self.publish_staged(placed_event);
-        for event in preempted.events {
-            self.publish_staged(Some(event));
-        }
+                .and_then(|draft| self.stage_event_locked(tx, draft));
+        let mut effects = PlanApplyEffects {
+            events: placed_event.into_iter().chain(preempted.events).collect(),
+            ..PlanApplyEffects::default()
+        };
+        // Evicted and placed rows refresh together, in one read of
+        // committed state — the mirror never passes through the
+        // intermediate state a remove-then-add pair of refreshes exposed.
+        effects.touch_allocations(&preempted.victims);
+        effects.touch_allocations(&allocations);
         let fallbacks = candidate_ranks.iter().filter(|rank| **rank > 0).count();
         info!(
             submission_id = submission.id,
@@ -3394,13 +3601,6 @@ impl Store {
             "Applied plan submission transaction"
         );
 
-        // Mirror maintenance in the same order as every other path: drop the
-        // evicted rows before adding the placements that replaced them, so
-        // the mirror never briefly shows both.
-        if !preempted.victims.is_empty() {
-            self.cache_remove_allocations(&preempted.victims)?;
-        }
-        self.cache_add_allocations(&allocations)?;
         let metrics = crate::manager::telemetry::metrics();
         for rank in &candidate_ranks {
             metrics.scheduler_plan_candidate_rank.observe(*rank as f64);
@@ -3420,10 +3620,13 @@ impl Store {
             metrics.preemption_plans_total.inc(&["placed"]);
         }
 
-        Ok(PlanApplyOutcome::Applied(AppliedPlan {
-            allocations,
-            candidate_ranks,
-        }))
+        Ok((
+            PlanApplyOutcome::Applied(AppliedPlan {
+                allocations,
+                candidate_ranks,
+            }),
+            effects,
+        ))
     }
 
     /// Free capacity for one node, rebuilt from the rows the apply
@@ -16894,13 +17097,25 @@ mod tests {
 
         assert_eq!(results.len(), 3);
         assert!(
-            matches!(results[0], Ok((_, PlanApplyOutcome::Applied(_)))),
+            matches!(
+                results[0],
+                Ok(PlanApplySlot {
+                    reply: (_, PlanApplyOutcome::Applied(_)),
+                    ..
+                })
+            ),
             "first plan must apply: {:?}",
             results[0]
         );
         assert!(results[1].is_err(), "poisoned plan must fail alone");
         assert!(
-            matches!(results[2], Ok((_, PlanApplyOutcome::Applied(_)))),
+            matches!(
+                results[2],
+                Ok(PlanApplySlot {
+                    reply: (_, PlanApplyOutcome::Applied(_)),
+                    ..
+                })
+            ),
             "batch-mate after the failure must still apply: {:?}",
             results[2]
         );
@@ -16932,7 +17147,13 @@ mod tests {
             target_instance: String::new(),
         }]);
         assert!(
-            matches!(results[0], Ok((_, PlanApplyOutcome::Rejected { .. }))),
+            matches!(
+                results[0],
+                Ok(PlanApplySlot {
+                    reply: (_, PlanApplyOutcome::Rejected { .. }),
+                    ..
+                })
+            ),
             "stale epochs must reject inside a batch exactly as they do alone: {:?}",
             results[0]
         );
@@ -16979,6 +17200,246 @@ mod tests {
                 "distinct-scope plans must all apply: {outcome:?}"
             );
         }
+        Ok(())
+    }
+
+    /// Count every commit on the store's write connection from now on.
+    /// SQLite fires the commit hook once per transaction that reaches the
+    /// disk, so this counts exactly the fsyncs a local backend pays.
+    fn count_write_commits(store: &Store) -> R<Arc<AtomicUsize>> {
+        let commits = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&commits);
+        let conn = store
+            .write_conn
+            .lock()
+            .map_err(|_| anyhow!("write connection lock poisoned"))?;
+        conn.commit_hook(Some(move || {
+            counter.fetch_add(1, Ordering::Relaxed);
+            // `true` would ABORT the commit — the hook only observes.
+            false
+        }));
+        Ok(commits)
+    }
+
+    /// Build `count` independent single-placement plan requests, each on
+    /// its own node and job config, so nothing in the set conflicts.
+    fn independent_plan_requests(
+        store: &Store,
+        prefix: &str,
+        count: usize,
+    ) -> R<Vec<PlanApplyRequest>> {
+        let mut requests = Vec::with_capacity(count);
+        for index in 0..count {
+            let node = format!("{prefix}-node-{index}");
+            store.insert_node(make_node_msg(&node, "ready"))?;
+            let (job_config_id, task_id) =
+                submit_named_job(store, &format!("{prefix}-job-{index}"))?;
+            let expected_versions =
+                store.allocation_version_vector(&job_config_id, &HashSet::from([node.clone()]))?;
+            requests.push(PlanApplyRequest {
+                job_config_id,
+                mode: "fresh".into(),
+                placements: PlanPlacements::Nodes(vec![(node, task_id)]),
+                expected_versions,
+                evictions: Vec::new(),
+                target_instance: String::new(),
+            });
+        }
+        Ok(requests)
+    }
+
+    #[test]
+    fn local_plan_batch_commits_once_and_projects_statuses_once() -> R<()> {
+        let store = setup_store()?;
+        let singly = independent_plan_requests(&store, "singly", 3)?;
+        let batched = independent_plan_requests(&store, "batched", 3)?;
+        let commits = count_write_commits(&store)?;
+
+        // Baseline: the pre-batch shape — each plan commits alone and
+        // projects its own task statuses on the status lane.
+        for request in singly {
+            let (_, outcome) = store.submit_and_apply_plan_replicated(request)?;
+            store.plan_apply_bookkeeping(&outcome)?;
+        }
+        let alone = commits.swap(0, Ordering::Relaxed);
+        assert_eq!(
+            alone, 6,
+            "three plans applied singly: one commit per plan plus one status projection per plan"
+        );
+
+        // Batched: one transaction for the three plans, one status-lane
+        // projection for every allocation they placed.
+        let results = store.run_plan_apply_batch(batched);
+        let together = commits.load(Ordering::Relaxed);
+        assert_eq!(
+            results.len(),
+            3,
+            "every batched plan gets its own result: {results:?}"
+        );
+        for result in &results {
+            assert!(
+                matches!(
+                    result,
+                    Ok(PlanApplySlot {
+                        reply: (_, PlanApplyOutcome::Applied(_)),
+                        bookkeeping_done: true,
+                    })
+                ),
+                "batched plans apply and have their bookkeeping done for them: {result:?}"
+            );
+        }
+        assert_eq!(
+            together, 2,
+            "three batched plans: one commit for the batch, one for its status projection"
+        );
+
+        // Same end state as applying them one at a time.
+        for index in 0..3 {
+            assert_eq!(
+                store
+                    .allocs_for_node(&format!("batched-node-{index}"))?
+                    .len(),
+                1
+            );
+        }
+        Ok(())
+    }
+
+    /// Wall-clock A/B for the group commit's local amortization, on
+    /// conflict-free plans so the measurement is the write path and not
+    /// optimistic-concurrency contention (which dominates the macro
+    /// scheduler benchmark). Numbers land in
+    /// `benchmarks/scheduler/README.md`.
+    ///
+    /// ```bash
+    /// cargo test --release --lib bench_local_plan_batch -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "benchmark; run with --release --ignored --nocapture"]
+    fn bench_local_plan_batch_commit_amortization() -> R<()> {
+        const BATCH: usize = 16;
+        const REPS: usize = 20;
+
+        let mut singly_ms = Vec::with_capacity(REPS);
+        let mut batched_ms = Vec::with_capacity(REPS);
+        for rep in 0..REPS {
+            let store = setup_store()?;
+            let alone = independent_plan_requests(&store, &format!("a{rep}"), BATCH)?;
+            let together = independent_plan_requests(&store, &format!("b{rep}"), BATCH)?;
+
+            let started = Instant::now();
+            for request in alone {
+                let (_, outcome) = store.submit_and_apply_plan_replicated(request)?;
+                store.plan_apply_bookkeeping(&outcome)?;
+            }
+            singly_ms.push(started.elapsed().as_secs_f64() * 1_000.0);
+
+            let started = Instant::now();
+            let results = store.run_plan_apply_batch(together);
+            batched_ms.push(started.elapsed().as_secs_f64() * 1_000.0);
+            assert!(results.iter().all(|result| result.is_ok()));
+        }
+
+        let median = |mut samples: Vec<f64>| -> f64 {
+            samples.sort_by(|a, b| a.partial_cmp(b).expect("no NaN"));
+            samples[samples.len() / 2]
+        };
+        let singly = median(singly_ms);
+        let batched = median(batched_ms);
+        println!(
+            "plan batch of {BATCH} ({REPS} reps, medians): singly {singly:.2} ms, \
+             batched {batched:.2} ms ({:.2}x)",
+            singly / batched
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn local_plan_batch_publishes_one_read_model_refresh_after_its_commit() -> R<()> {
+        let store = setup_store()?;
+        let requests = independent_plan_requests(&store, "refresh", 3)?;
+        let before = store.read_model_generation()?;
+
+        let results = store.run_plan_apply_batch(requests);
+        assert!(results.iter().all(|result| result.is_ok()));
+
+        let after = store.read_model_generation()?;
+        assert_eq!(
+            after.wrapping_sub(before),
+            1,
+            "the batch publishes ONE coherent refresh over the union of its scopes, \
+             not one per plan"
+        );
+        // And that one refresh is coherent with the committed rows: a
+        // mid-transaction refresh would have read pre-batch state and left
+        // the mirror empty (the hazard that deferred this — the plan's
+        // judgement call #6).
+        for index in 0..3 {
+            let node = format!("refresh-node-{index}");
+            let mirrored = store
+                .scheduling_read_model()?
+                .allocations_by_node
+                .get(&node)
+                .map(|allocs| allocs.len())
+                .unwrap_or_default();
+            assert_eq!(
+                mirrored,
+                store.allocs_for_node(&node)?.len(),
+                "read model and database must agree for {node} after the batch"
+            );
+            assert_eq!(mirrored, 1);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn local_plan_batch_broadcasts_no_event_before_it_commits() -> R<()> {
+        let store = setup_store()?;
+        let requests = independent_plan_requests(&store, "events", 3)?;
+        let mut subscriber = store.subscribe_events();
+
+        // Sample how many events had been broadcast at each commit. The
+        // batch's own commit is the first one, and nothing it staged may
+        // have been announced yet.
+        let probe = store.subscribe_events();
+        let seen_at_commit = Arc::new(Mutex::new(Vec::new()));
+        {
+            let recorder = Arc::clone(&seen_at_commit);
+            let conn = store
+                .write_conn
+                .lock()
+                .map_err(|_| anyhow!("write connection lock poisoned"))?;
+            conn.commit_hook(Some(move || {
+                if let Ok(mut samples) = recorder.lock() {
+                    samples.push(probe.len());
+                }
+                false
+            }));
+        }
+
+        let results = store.run_plan_apply_batch(requests);
+        assert!(results.iter().all(|result| result.is_ok()));
+
+        let samples = seen_at_commit
+            .lock()
+            .map_err(|_| anyhow!("sample lock poisoned"))?
+            .clone();
+        assert_eq!(
+            samples.first().copied(),
+            Some(0),
+            "no event may be broadcast before the batch's transaction commits: {samples:?}"
+        );
+
+        let mut placed = 0;
+        while let Ok(event) = subscriber.try_recv() {
+            if event.kind == "allocation.placed" {
+                placed += 1;
+            }
+        }
+        assert_eq!(
+            placed, 3,
+            "every plan's placement event is still published, once the batch is durable"
+        );
         Ok(())
     }
 
