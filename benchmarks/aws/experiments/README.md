@@ -20,6 +20,21 @@ boundary.
 | `upgrade-under-load.sh` | Placement disruption during a rolling manager upgrade | legion-a |
 | `packing-density.sh` | How many sim nodes one worker instance really carries | legion-a, legion-b |
 
+One script here is **not** a piggyback experiment and does not need the rig:
+
+| Script | Measures | Where it runs |
+| --- | --- | --- |
+| `heartbeat-commit-probe.sh` | Heartbeat throughput vs. store commit cost — every raft voter and the sim fleet on ONE box | any Linux box with the storage you want to test |
+
+It exists to isolate a single variable behind the ~80 heartbeats/sec
+ceiling the first campaign hit: a developer laptop runs the identical
+code at ~2000/sec on one worker thread, and the difference that a laptop
+cannot reproduce is fsync latency on network-attached storage. Because it
+answers an engineering question rather than a comparison one, it needs no
+identical hardware and no fairness record, so run it on the cheapest box
+with the right disk (the standing operator box at ~$0.37/hr, not the rig
+at ~$2.50/hr).
+
 ## Methodology notes (read before running)
 
 **storm.sh** — kills whole sim *processes* (one instance slice ≈ the
