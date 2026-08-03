@@ -5566,12 +5566,13 @@ impl Store {
                 // thirty times a minute.
                 //
                 // Deliberately NOT `mark_node_ready`: that writes status
-                // `"ready"` and flips `node.availability` back to available.
-                // Schedulability has never been a heartbeat's to grant — a
-                // recovered worker re-registers, and THAT is what makes it
-                // schedulable again — and `"ready"` would drop the node out of
-                // the liveness scan, which filters on `"active"`.
+                // `"ready"`, which every liveness query filters out (they all
+                // match `"active"`), so recovering through it would drop the
+                // node out of the liveness scan and out of
+                // `legion_nodes{status="active"}`. This is the same composite
+                // shape with the correct status value.
                 self.update_node_heartbeat_forwarding(id.clone())?;
+                self.restore_availability_after_loss(&id);
                 self.liveness.observe(&id);
                 Ok(())
             }
@@ -5588,6 +5589,53 @@ impl Store {
                 self.liveness.observe(&id);
                 Ok(())
             }
+        }
+    }
+
+    /// Put a recovered node back in the scheduling pool.
+    ///
+    /// Node loss is a CROSS-LANE composite: the status lane records `lost`,
+    /// and the control lane flips `node.availability` to `unavailable` — and
+    /// `availability` is the column the scheduler actually gates placement on
+    /// ([`Self::available_node_arcs`]). Clearing only the status half would
+    /// leave a returned node reading `active` in `legion node list` while
+    /// never receiving work again, which presents as a scheduler bug and is
+    /// almost impossible to diagnose from the outside. Recovery has to undo
+    /// both halves, because loss did both.
+    ///
+    /// **Only `unavailable` -> `available`.** `drained` is OPERATOR intent
+    /// (`legion node cordon` / `drain`), so a node an operator cordoned must
+    /// still be cordoned when it comes back: a heartbeat may never un-cordon a
+    /// node. This guard is what `mark_node_ready` lacks.
+    ///
+    /// Best effort on purpose. The beat has already succeeded and the node is
+    /// already `active`, so a control-lane rejection here must not fail the
+    /// worker's RPC — its stateful self-fence clock feeds off heartbeat
+    /// success. The next beat retries, because the disposition stays
+    /// `Transition` until the flip lands.
+    fn restore_availability_after_loss(&self, id: &str) {
+        match self.get_node(id) {
+            Ok(node) if node.availability == "unavailable" => {
+                match self.sync_node_availability(&[id.to_string()], "available") {
+                    Ok(()) => info!(
+                        node_id = %id,
+                        "Node heartbeated after being marked lost; it is schedulable again"
+                    ),
+                    Err(err) => warn!(
+                        node_id = %id,
+                        error = ?err,
+                        "Node recovered but its availability flip was rejected; \
+                         retrying on its next heartbeat"
+                    ),
+                }
+            }
+            // Already available, or deliberately drained by an operator.
+            Ok(_) => {}
+            Err(err) => debug!(
+                node_id = %id,
+                error = ?err,
+                "Could not read node to restore its availability after recovery"
+            ),
         }
     }
 

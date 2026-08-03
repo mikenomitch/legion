@@ -12,12 +12,14 @@ this plan stays as history.
   on gp3 and NVMe at 1000 and 4000 nodes) and every re-measurement in §10.1.
   They need the AWS rig. `liveness.batchWindow` therefore ships parsed,
   validated, and **inert** — see the judgement-calls doc.
-- **The `lost -> active` recovery does not flip `node.availability`.** The
-  plan named `mark_node_ready` as the composite; that method writes
-  `status = "ready"`, which every liveness query filters out, so the recovery
-  keeps the status-lane write it always used. A recovered node becomes
-  schedulable at re-registration, exactly as before. Normalizing `"ready"` to
-  `"active"` is a separate change and an open TODO item.
+- **The `lost -> active` recovery does the composite itself rather than
+  calling `mark_node_ready`.** That method writes `status = "ready"`, which
+  every liveness query filters out, and flips `availability` unconditionally
+  (so it would un-cordon a drained node). The recovery therefore uses the
+  status-lane write it always used plus a guarded `unavailable -> available`
+  flip — same shape §6.1 asked for, correct status value, and a heartbeat can
+  never overrule an operator's cordon. Normalizing `mark_node_ready` itself is
+  a separate change and an open TODO item.
 
 This is architecture item **D8** from
 [`scheduler-architecture-review-plan.md`](scheduler-architecture-review-plan.md),

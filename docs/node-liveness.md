@@ -50,6 +50,26 @@ What stays replicated: node registration and identity, pool, attributes,
 payloads — everything else. And the `lost -> active` transition, which is new
 information no reconciler can re-derive.
 
+### What a recovery does
+
+Node loss is a **cross-lane composite**: the status lane records `lost`, and
+the control lane flips `node.availability` to `unavailable` — and
+`availability` is the column the scheduler gates placement on. So recovery
+undoes both halves, because loss did both.
+
+A worker that comes back simply resumes heartbeating; it does **not** need to
+restart or re-register. Its first beat clears the loss (`status` back to
+`active`, `lost_at` cleared) and puts the node back in the scheduling pool.
+Recovering only the status half would leave a returned node reading `active`
+in `legion node list` while never receiving work again — a silent hole in the
+fleet that looks like a scheduler bug.
+
+One thing a heartbeat will **not** do: un-cordon a node. Only
+`availability: "unavailable"` — the value node loss sets — is cleared. A node
+an operator drained with `legion node cordon` or `legion node drain` is still
+drained when it comes back, because that is a human's intent and a heartbeat
+does not get to overrule it.
+
 ---
 
 ## What an election does

@@ -82,35 +82,65 @@ grace, checkpoint, and read-path machinery intact.
 
 ---
 
-## 2. `lost -> active` recovery keeps the old status-lane write; it does NOT take `mark_node_ready`
+## 2. `lost -> active` recovery keeps the old status-lane write, plus a GUARDED availability flip
 
-**Call.** *(Implementation; a deliberate deviation from entry 1's design,
-which named `Store::mark_node_ready` as the recovery composite.)* When a
-heartbeat arrives from a node the store believes is not active, it replicates
-through `update_node_heartbeat_forwarding` — the path it has always taken —
-rather than through `mark_node_ready`.
+**Call.** *(Implementation; entry 1 named `Store::mark_node_ready` as the
+recovery composite.)* A heartbeat from a node the store believes is not active
+replicates through `update_node_heartbeat_forwarding` — the status-lane write
+this path has always used — and then flips `node.availability` from
+`unavailable` back to `available` on the control lane. Same composite shape
+the plan asked for; not the same method.
 
-**Alternative.** `mark_node_ready(id, now)`, exactly as the plan specified:
-the status lane, then a control-lane `availability = "available"` flip, so a
-recovered node becomes schedulable in one step.
+**Alternatives.** (a) `mark_node_ready(id, now)` verbatim, as the plan
+specified. (b) Status half only, leaving schedulability to re-registration.
 
-**Trade-off.** A recovered node's `node.availability` stays `unavailable`
-until it re-registers, exactly as before this change. That is a real
-limitation, and it is preserved rather than newly introduced — but the plan
-promised to fix it here and this does not.
+**Trade-off.** Recovery is now two lane writes instead of one, and the control
+half is best-effort: if it is rejected the beat still succeeds (a worker's
+stateful self-fence clock feeds off heartbeat success) and the next beat
+retries. So a node can briefly be `active` but unschedulable while the control
+lane is unreachable — bounded by one heartbeat interval, and self-healing
+because the disposition stays `Transition` until the flip lands.
 
-**Why (correctness).** `mark_node_ready_apply` writes `status = "ready"`, not
-`"active"` — a pre-existing quirk of the node-join eval path. Every liveness
-query in the system filters on `status = 'active'`
-(`active_node_liveness_rows`, `node_status_counts`), so a node recovered
-through it would silently drop out of the liveness scan **and** out of
-`legion_nodes{status="active"}`. Following the plan literally would have
-introduced a worse bug than the limitation it fixed. Flipping `availability`
-on a heartbeat is also a larger semantic change than this plan should make:
-schedulability has never been a heartbeat's to grant. The right fix —
-normalizing `"ready"` to `"active"` across the node-join path — is its own
-change, and is filed as an open TODO item rather than smuggled in here.
+**Why (correctness).** (a) is wrong in a way that is easy to miss:
+`mark_node_ready_apply` writes `status = "ready"`, not `"active"`, and every
+liveness query in the system filters on `'active'`
+(`active_node_liveness_rows`, `node_status_counts`). Recovering through it
+would silently drop the node out of the liveness scan **and** out of
+`legion_nodes{status="active"}`.
 
+(b) was this branch's first implementation and it was **wrong** — recorded
+here because a reversal is the most useful entry in the file. The reasoning
+was "schedulability has never been a heartbeat's to grant; a recovered worker
+re-registers, and that is what makes it schedulable again". Both halves of
+that were false. Nothing in production enqueues the `node_join` eval, so
+`mark_node_ready` never runs at all; and a worker only re-registers on
+`Unauthenticated`, so a worker that rides out a partition and resumes
+heartbeating never re-registers. Measured on the branch before the fix:
+
+```
+after register:  availability="available"    schedulable={"node-1"}
+after lost:      availability="unavailable"  schedulable={}
+after heartbeat: status="active"             availability="unavailable"  schedulable={}
+```
+
+A node that came back read as healthy and never received work again, until
+someone restarted its worker. That is a silent hole in the fleet presenting as
+a scheduler bug. The gap pre-dates this plan — `update_node_heartbeats_apply`
+never touched `node.availability` — but the plan explicitly set out to close
+it, and "preserve existing behavior" was the wrong instinct against a product
+goal as plain as *a node that comes back comes back*.
+
+**The guard is the part `mark_node_ready` gets wrong.** Only
+`unavailable -> available` is cleared. `drained` is operator intent
+(`legion node cordon` / `drain`), and a heartbeat must never un-cordon a node;
+`mark_node_ready` flips availability unconditionally. Pinned by
+`recovery_does_not_uncordon_a_drained_node`.
+
+Still open, and now the only part of this that is deferred: `mark_node_ready`
+itself keeps writing `"ready"`, and `mark_nodes_as_lost` still clobbers a
+`drained` node's availability with `unavailable` at loss time, so a
+cordon-then-lose-then-return node comes back `available` rather than
+`drained`. Both are recorded as TODO items.
 ---
 
 ## 3. Phase 1 is a measurement, not a fix — and the batching knob became contingent on it

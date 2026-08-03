@@ -445,15 +445,24 @@ How to use it:
   - [ ] **`mark_node_ready` writes `status = "ready"`, which every liveness
         query filters out.** `mark_node_ready_apply`
         (`src/storage/store.rs`) sets `"ready"` rather than `"active"`, so a
-        node recovered through the node-join eval path drops out of
-        `active_node_liveness_rows`, out of `legion_nodes{status="active"}`,
-        and out of the liveness scan entirely. Pre-dates this work and is
-        why the `lost -> active` heartbeat recovery deliberately does NOT
-        use that composite
-        ([call 2](calls/liveness-off-the-raft-path-plan_calls.md)). Fixing
-        it means normalizing the status string and flipping
-        `node.availability` back on recovery, which is also what would let a
-        recovered node become schedulable without re-registering.
+        node recovered through it drops out of `active_node_liveness_rows`,
+        out of `legion_nodes{status="active"}`, and out of the liveness scan
+        entirely. It also flips `node.availability` unconditionally, so it
+        would un-cordon a drained node. Nothing in production enqueues the
+        `node_join` eval that calls it, so it is currently dead code on the
+        real path — which is why the heartbeat recovery does the composite
+        itself instead
+        ([call 2](calls/liveness-off-the-raft-path-plan_calls.md)). Fix:
+        normalize the status string to `"active"` and adopt the same
+        `unavailable`-only availability guard, then delete the duplication.
+  - [ ] **Node loss clobbers an operator's drain.** `mark_nodes_as_lost`
+        calls `sync_node_availability(ids, "unavailable")` unconditionally,
+        so a node an operator had `drained` loses that intent the moment it
+        goes lost — and comes back `available` rather than `drained`. The
+        recovery path deliberately does not paper over this (it only clears
+        `unavailable`), because the drain intent is already gone from the row
+        by then. Fixing it properly means recording the pre-loss
+        availability, or keeping loss and drain on separate axes.
   - [ ] **Per-pool heartbeat freshness.** `legion_heartbeat_freshness_ratio`
         is fleet-wide, so a cluster with a slow batch pool and a fast
         latency pool has two populations and one blended ratio, which can
@@ -1199,6 +1208,12 @@ Deferred from [job-updated-at-plan.md](plans/job-updated-at-plan.md):
         .next_interval_seconds`, with widen-immediately / narrow-on-confirmation
         windows and a one-shot full-width re-phase in the worker sleep. The
         simulated fleet honors it through the same shared helpers.
+  - [x] **A returning node is schedulable again.** Node loss is a cross-lane
+        composite (status lane `lost`, control lane `unavailable`), and the
+        scheduler gates on `availability` — so recovery undoes both halves. A
+        worker that rides out a partition and resumes heartbeating recovers
+        without restarting or re-registering. Guarded so a heartbeat can
+        never un-cordon an operator-drained node.
   - [x] **Display checkpoint + `NodeMsg.heartbeat_source`**: one batched
         status-lane commit per 30s records each node's OBSERVED beat time, so
         every manager can show an approximate "last heartbeat" and say that it

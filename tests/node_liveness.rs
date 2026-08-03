@@ -147,6 +147,61 @@ fn a_recovered_node_transitions_through_replicated_state() -> R<()> {
     Ok(())
 }
 
+/// A node that comes back must ACTUALLY come back — schedulable, not merely
+/// `active`.
+///
+/// Node loss is a cross-lane composite (status lane says `lost`, control lane
+/// says `unavailable`), and the scheduler gates placement on `availability`.
+/// Recovering only the status half left a returned node reading `active` in
+/// `legion node list` while never receiving work again.
+#[test]
+fn a_returning_node_becomes_schedulable_again() -> R<()> {
+    let store = setup_store(5)?;
+    register(&store, "node-1", None)?;
+    assert!(store.available_node_ids()?.contains("node-1"));
+
+    store.mark_nodes_as_lost(&["node-1".to_string()])?;
+    assert_eq!(store.get_node("node-1")?.availability, "unavailable");
+    assert!(
+        !store.available_node_ids()?.contains("node-1"),
+        "a lost node must not keep receiving placements"
+    );
+
+    // The worker simply resumes heartbeating — it does NOT restart, so it does
+    // not re-register. That is the ordinary case after a network partition
+    // heals, and it has to be enough.
+    store.update_node_heartbeat("node-1".to_string())?;
+    let node = store.get_node("node-1")?;
+    assert_eq!(node.status, "active");
+    assert_eq!(
+        node.availability, "available",
+        "a recovered node that is active but unschedulable is a silent hole in the fleet"
+    );
+    assert!(store.available_node_ids()?.contains("node-1"));
+    Ok(())
+}
+
+/// ...but recovery must not undo an OPERATOR's cordon. A heartbeat may clear
+/// the loss the manager set; it may never clear intent a human expressed.
+#[test]
+fn recovery_does_not_uncordon_a_drained_node() -> R<()> {
+    let store = setup_store(5)?;
+    register(&store, "node-1", None)?;
+    store.set_node_availability("node-1", "drained")?;
+    assert_eq!(store.get_node("node-1")?.availability, "drained");
+
+    // A drained node still heartbeats, and those beats must leave the drain
+    // alone — including the beat that would otherwise look like a recovery.
+    store.update_node_heartbeat("node-1".to_string())?;
+    assert_eq!(
+        store.get_node("node-1")?.availability,
+        "drained",
+        "a heartbeat must never un-cordon a node"
+    );
+    assert!(!store.available_node_ids()?.contains("node-1"));
+    Ok(())
+}
+
 /// A heartbeat from a node that was never registered is still rejected: a
 /// ghost worker must not think it is healthy, because its stateful self-fence
 /// clock feeds off heartbeat success.
