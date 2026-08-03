@@ -60,6 +60,18 @@ MANAGER="${MANAGER:-http://${CP_PRIVATE_IPS[0]}:4747}"
 # appears. Scaling down is also what makes the probe cheap.
 scale_workers 1
 wait_for_workers 1
+
+# Refresh the Prometheus node targets for the instance that just came up.
+# Without this the file_sd targets still name whatever instance the ASG
+# had before, so every `role="sim-worker"` query resolves against a
+# terminated box and returns nothing. The drill then prints `cpu ? mem ?`
+# and judges saturation on cadence alone — which defeats its entire
+# purpose, since the question it exists to answer is whether the SIM HOST
+# or the manager is the bottleneck, and CPU/memory headroom is how you
+# tell those apart. run-campaign.sh already does this after each scale
+# step; this drill scales the fleet itself and has to do the same.
+"$SCRIPTS/gen-targets.sh"
+
 mapfile -t WORKERS < <(worker_instances)
 [ "${#WORKERS[@]}" -eq 1 ] || {
     echo "expected 1 InService worker instance, found ${#WORKERS[@]}" >&2
@@ -153,7 +165,14 @@ for N in $STEPS; do
             and (.cpu_utilization // 1) < 0.85
             and (.memory_utilization // 1) < 0.85
             and (.cadence_ratio // 0) >= 0.95
-        )')
+        )
+        # Missing telemetry fails the health test above (via `// 1`),
+        # which is the safe default but reports "SATURATED" for what is
+        # really "could not measure". They call for opposite responses:
+        # saturation means the ceiling was found, unmeasurable means the
+        # drill is blind and its answer must not be trusted.
+        | .measured = (.cpu_utilization != null and .memory_utilization != null
+                       and .cadence_ratio != null)')
 
     printf '  registered %s/%s  cadence %s  cpu %s  mem %s  p99 %ss  -> %s\n' \
         "$(jq -r '.registered // "?"' <<<"$ROW")" \
@@ -162,7 +181,16 @@ for N in $STEPS; do
         "$(jq -r 'if .cpu_utilization then (.cpu_utilization * 100 | floor | tostring) + "%" else "?" end' <<<"$ROW")" \
         "$(jq -r 'if .memory_utilization then (.memory_utilization * 100 | floor | tostring) + "%" else "?" end' <<<"$ROW")" \
         "$(jq -r '.heartbeat_p99_secs // "?"' <<<"$ROW")" \
-        "$(jq -r 'if .healthy then "HEALTHY" else "SATURATED" end' <<<"$ROW")"
+        "$(jq -r 'if .measured | not then "UNMEASURED"
+                  elif .healthy then "HEALTHY" else "SATURATED" end' <<<"$ROW")"
+
+    jq -e '.measured' >/dev/null <<<"$ROW" || {
+        echo "  telemetry missing for this step — the drill cannot tell a saturated" >&2
+        echo "  sim host from a saturated manager, which is the only thing it measures." >&2
+        echo "  Check the loadgen Prometheus has live targets for role=\"sim-worker\"" >&2
+        echo "  (scripts/gen-targets.sh) and for the legion-sim-workers job." >&2
+        exit 1
+    }
 
     ROWS=$(jq --argjson row "$ROW" '. + [$row]' <<<"$ROWS")
     jq -e '.healthy' >/dev/null <<<"$ROW" || {
