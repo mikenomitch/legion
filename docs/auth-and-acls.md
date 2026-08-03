@@ -137,8 +137,10 @@ and observability, so gating bands on it would make everyone who may submit a
 critical job a raft administrator, and it could not express "team A may use
 `critical` in their namespace".
 
-Manage with `legion acl policy apply|list|get|delete`. Files can be JSON or
-Nickel (either a bare rules array or `{description, rules}`).
+Manage with `legion acl policy apply|list|get|delete`. A policy file is Nickel
+(`.ncl`) or JSON (`.json`), read by the same rules as every other Legion
+config — see [Configuration Language](configuration-language.md). Either shape
+works: a bare rules array, or `{description, rules}`.
 
 ### Tokens
 

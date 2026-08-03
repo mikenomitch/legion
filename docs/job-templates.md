@@ -26,7 +26,12 @@ boundary to "this template, with these knobs".
 
 A template is **one self-contained Nickel file** that evaluates to a record
 with optional `description` and `variables` fields and a
-`job | not_exported = fun vars => …` function returning the jobspec:
+`job | not_exported = fun vars => …` function returning the jobspec.
+
+Templates are the one config surface with no JSON form — `job` is a *function*
+of the variables, and JSON has no functions. `legion template create` rejects a
+`.json` file saying so. (Every other surface accepts either; see
+[Configuration Language](configuration-language.md#json-for-machine-emitted-config).)
 
 ```nickel
 {

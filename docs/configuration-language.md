@@ -10,12 +10,14 @@ Every configuration file Legion accepts is a [Nickel][nickel] program:
 | ACL policies | `legion acl policy create -f` | see [Auth & ACLs](auth-and-acls.md) |
 | Job templates | `legion template create -f` | [`configs/templates/render.ncl`](../configs/templates/render.ncl) |
 
-The convention is `.ncl`. ACL policy files are the one place a plain `.json`
-file is also accepted — the extension decides which reader runs.
-
 Legion evaluates a file the way `nickel export --format json` does, then
 deserializes the resulting JSON. Anything Nickel can produce, Legion accepts;
 nothing about the schemas below is Nickel-specific.
+
+Nickel is the default and the language everything here is written in. A
+`.json` file is accepted for the first four, for config a program emits — see
+[JSON](#json-for-machine-emitted-config). Job templates are Nickel-only,
+because a template declares `job` as a *function* of its variables.
 
 ## Why Nickel
 
@@ -154,6 +156,13 @@ shows the exact source a running job was submitted from.
 [`configs/jobs/demo-imports-2.ncl`](../configs/jobs/demo-imports-2.ncl) is a
 runnable example.
 
+Imports resolve against the spec's own directory, including when the spec is
+given by a relative path from somewhere else — `legion job run` reads a local
+spec where it sits rather than copying it aside. A spec fetched from a remote
+source (`https://`, `git::`, `s3://`) is staged as a whole tree, so its
+imports resolve too; use the `#<relative path>` fragment to name the entry
+point inside a fetched directory.
+
 ### Where imports are not allowed
 
 [Job templates](job-templates.md) are rendered by the manager on a caller's
@@ -167,6 +176,74 @@ imports are not allowed here; the source must be self-contained
 
 The check is lexical (the source is tokenized), so the word "import" inside a
 string or a comment is not a false positive.
+
+## JSON, for machine-emitted config
+
+A file named `.json` is parsed as JSON instead of evaluated, for job specs,
+the manager config, worker configs, and ACL policies:
+
+```console
+$ legion job run configs/jobs/machine-generated.json
+```
+
+This exists for config that a *program* writes: Terraform, a CI job, a control
+plane, an agent. Those emitters already have a JSON serializer, and requiring
+them to grow a Nickel one buys nothing — the abstractions Nickel offers are
+for humans, and a generator has its own.
+
+Write anything a person maintains in Nickel. JSON has no variables, no
+imports, no comments, and no way to state a shared value once.
+
+**The dispatch is by file extension and nothing else.** No content sniffing:
+the name always tells you how the file will be read, and an error is always
+reported in the language you named. Note that a `.json` file is *not* valid
+Nickel — see [Known limitations](#known-limitations) — so the extension is
+what keeps you out of a confusing parse error.
+
+`--var` and friends are rejected against a `.json` file rather than ignored:
+
+```
+configs/jobs/machine-generated.json is JSON, which has no variables — drop the
+variable flags, or use a .ncl file that reads `vars` and imports the JSON
+```
+
+### Mixing the two
+
+Nickel imports JSON natively, dispatching on the same extension. That is the
+supported way to combine generated data with hand-written structure — the
+generator owns a data file, the spec stays readable:
+
+```nickel
+let fleet = import "generated/fleet.json" in
+{
+  name = "web",
+  tasks = [{
+    name = "server",
+    runtime = "container",
+    count = fleet.count,
+    config = { image = fleet.image },
+  }],
+}
+```
+
+The imported JSON is data only; it cannot contain Nickel expressions.
+
+### Job templates are Nickel-only
+
+A [job template](job-templates.md) declares `job` as a function of its
+variables (`job | not_exported = fun vars => …`), and JSON has no functions, so
+there is no JSON form of a template. `legion template create` says so rather
+than letting the parser report a syntax error:
+
+```
+$ legion template create render -f render.json
+error: render.json is JSON, but a job template must be Nickel (a template
+       declares `job` as a function of its variables …)
+```
+
+A generator that wants a template-shaped surface should publish the rendered
+`.json` jobspec instead, or emit the small Nickel wrapper by hand once and
+keep the varying data in an imported `.json`.
 
 ## No environment access
 
@@ -198,6 +275,9 @@ unrelated to evaluation.
 | `contract broken by a value` | A `\| String` / `\| Number` annotation rejecting the value — usually the actual bug, one step earlier than it would otherwise surface. |
 | `imports are not allowed here` | An `import` inside a job template. Inline it. |
 | `jobspec must define at least one task` | The file evaluated fine but is a fragment, not a whole jobspec. |
+| `invalid contract expression … can't be used as a contract` | A JSON object being read as Nickel. Rename the file to `.json`, or convert `:` to `=`. |
+| `is not valid JSON` | A `.json` file that does not parse — the message carries the line and column. |
+| `is JSON, which has no variables` | `--var` against a `.json` spec. |
 
 Evaluation errors are reported with the source line and a caret, in the CLI
 and in the manager's gRPC status alike.
@@ -214,5 +294,14 @@ and in the manager's gRPC status alike.
 - **`legion job schema`** emits JSON Schema for the *rendered* JSON, not a
   Nickel contract. Generating an importable Legion contract library from the
   same source is not implemented.
+- **JSON is not a subset of Nickel**, unlike Jsonnet, where renaming `.json`
+  to `.jsonnet` just worked. Records are `key = value`, and `:` is Nickel's
+  type-annotation operator — so a JSON object handed to the Nickel parser does
+  not fail cleanly, it fails as `invalid contract expression` (`{"a": 1}`
+  reads as a field annotated with the contract `1`). Give the file a `.json`
+  extension and it is read as JSON instead. Everything else in JSON — scalars,
+  arrays, `true`/`false`/`null` — *is* valid Nickel.
+- **A `.json` config is data only.** No variables, no imports, no comments.
+  Import it from a `.ncl` file to get those back.
 
 [nickel]: https://nickel-lang.org

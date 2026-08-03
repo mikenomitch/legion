@@ -9,8 +9,8 @@
 //!
 //! Three entry points cover the surfaces:
 //!
-//! - [`eval_file`] — evaluate a `.ncl` file to JSON. Imports resolve relative
-//!   to the file, as they do under `nickel export`.
+//! - [`eval_file`] — evaluate a configuration file to JSON. Imports resolve
+//!   relative to the file, as they do under `nickel export`.
 //! - [`eval_file_tracked`] — the same, but also reports every source file the
 //!   evaluation loaded, which the CLI stores alongside a submitted jobspec.
 //! - [`eval_sandboxed`] — evaluate an in-memory snippet with imports rejected
@@ -22,6 +22,35 @@
 //! That is Legion's parameterization hook: `legion job run web.ncl --var
 //! image=nginx` makes `vars.image` available to the jobspec. A program that
 //! never mentions `vars` is unaffected.
+//!
+//! # JSON is accepted too
+//!
+//! Nickel is the language Legion is written for and documented in, but a
+//! `.json` file is accepted for job specs, the manager config, worker
+//! configs, and ACL policies, and is parsed as plain JSON rather than
+//! evaluated. That exists for **machine-emitted config**: Terraform, CI, a
+//! control plane, or any program that already has a JSON serializer and no
+//! reason to grow a Nickel one. Job templates are the exception — a template
+//! declares `job` as a *function* of its variables, which JSON cannot express,
+//! so `legion template create` refuses a `.json` file outright.
+//!
+//! The dispatch is by file extension ([`format_for`]) and nothing else — no
+//! content sniffing, so a file's name always tells you how it will be read.
+//! JSON is *not* a subset of Nickel the way it was of Jsonnet: records are
+//! `key = value`, and a JSON object fed to the Nickel parser fails obscurely
+//! (`:` is Nickel's type-annotation operator, so `{"a": 1}` reads as a field
+//! annotated with the contract `1`). Dispatching on the extension is what
+//! keeps that confusion off users.
+//!
+//! JSON has no variables and no imports, so a `.json` file with `--var` is an
+//! error rather than a silent no-op. To *combine* the two — machine-generated
+//! data with hand-written structure — import the JSON from Nickel, which
+//! reads it natively by extension:
+//!
+//! ```text
+//! let fleet = import "generated/fleet.json" in
+//! { name = "web", tasks = [{ name = "server", runtime = "noop", count = fleet.count }] }
+//! ```
 //!
 //! [Nickel]: https://nickel-lang.org
 
@@ -41,6 +70,51 @@ use std::path::{Path, PathBuf};
 pub const CONFIG_EXTENSION: &str = "ncl";
 /// The dotted form, for `ends_with` checks and error messages.
 pub const CONFIG_SUFFIX: &str = ".ncl";
+
+/// The file extension for pre-serialized JSON configuration.
+pub const JSON_EXTENSION: &str = "json";
+
+/// How a configuration file's bytes should be turned into JSON.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigFormat {
+    /// Evaluate as a Nickel program. The default for every extension that is
+    /// not explicitly JSON, so an unrecognized name gets Legion's real
+    /// configuration language and its error reporting.
+    Nickel,
+    /// Parse as plain JSON. No evaluation, no variables, no imports.
+    Json,
+}
+
+/// Picks the format for a path from its extension alone.
+///
+/// Extension-only, deliberately: the alternative is sniffing the content,
+/// which makes a file's meaning depend on its first non-space byte and turns
+/// a typo in a Nickel record into "well, it didn't look like JSON". Answering
+/// from the name means the failure is always reported in the language the
+/// user named.
+pub fn format_for(path: impl AsRef<Path>) -> ConfigFormat {
+    match path.as_ref().extension().and_then(|ext| ext.to_str()) {
+        // Case-insensitive so `FLEET.JSON` off a Windows-y toolchain works.
+        Some(ext) if ext.eq_ignore_ascii_case(JSON_EXTENSION) => ConfigFormat::Json,
+        _ => ConfigFormat::Nickel,
+    }
+}
+
+/// Whether a path found by scanning a directory is a configuration file.
+///
+/// This is the *discovery* question, not the *parsing* one, and the two have
+/// different answers on purpose: [`format_for`] reads anything it is handed
+/// and defaults to Nickel, while a directory scan (the manager's worker-config
+/// directory) must not try to parse `README.md` or an editor's `.swp` file
+/// just because they share the directory.
+pub fn is_config_file(path: impl AsRef<Path>) -> bool {
+    matches!(
+        path.as_ref().extension().and_then(|ext| ext.to_str()),
+        Some(ext)
+            if ext.eq_ignore_ascii_case(CONFIG_EXTENSION)
+                || ext.eq_ignore_ascii_case(JSON_EXTENSION)
+    )
+}
 
 /// The identifier the caller-supplied variables are bound to.
 ///
@@ -108,17 +182,50 @@ fn run(mut program: Program<CacheImpl>) -> R<String> {
     export_json(&program, &value)
 }
 
-/// Evaluates a Nickel file to JSON.
+/// Reads a `.json` configuration file.
 ///
-/// Imports inside the file resolve relative to the file itself.
+/// The text is parsed and re-serialized rather than passed through, so every
+/// caller downstream gets canonical JSON regardless of how the file was
+/// formatted, and a malformed file fails here — with a line and column —
+/// instead of somewhere in a `serde` deserializer that has lost the path.
+fn read_json(path: &Path, vars: Option<&Map<String, Value>>) -> R<String> {
+    // A JSON file cannot read `vars`, so accepting them silently would make
+    // `--var` look like it worked. Only a non-empty set is an error: callers
+    // pass an empty map unconditionally.
+    if vars.is_some_and(|vars| !vars.is_empty()) {
+        bail!(
+            "{} is JSON, which has no variables — drop the variable flags, or use a \
+             {CONFIG_SUFFIX} file that reads `vars` and imports the JSON",
+            path.display()
+        );
+    }
+
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    let value: Value = serde_json::from_str(&text)
+        .with_context(|| format!("{} is not valid JSON", path.display()))?;
+    serde_json::to_string(&value)
+        .with_context(|| format!("failed to re-serialize {}", path.display()))
+}
+
+/// Evaluates a configuration file to JSON.
+///
+/// A `.json` file is parsed as JSON; anything else is evaluated as Nickel,
+/// with imports resolving relative to the file itself.
 pub fn eval_file(path: impl AsRef<Path>) -> R<String> {
     let path = path.as_ref();
     eval_file_with_vars(path, None)
 }
 
-/// Evaluates a Nickel file to JSON with `vars` bound in scope.
+/// Evaluates a configuration file to JSON with `vars` bound in scope.
+///
+/// `vars` reaches a Nickel program as the free identifier `vars`; supplying a
+/// non-empty set for a `.json` file is an error, since JSON cannot read it.
 pub fn eval_file_with_vars(path: impl AsRef<Path>, vars: Option<&Map<String, Value>>) -> R<String> {
     let path = path.as_ref();
+    if format_for(path) == ConfigFormat::Json {
+        return read_json(path, vars);
+    }
     let program = ProgramBuilder::new()
         .add_path(path)
         .extend_initial_env(vars_env(vars)?)
@@ -127,17 +234,31 @@ pub fn eval_file_with_vars(path: impl AsRef<Path>, vars: Option<&Map<String, Val
     run(program)
 }
 
-/// Evaluates a Nickel file to JSON and reports every source it read.
+/// Evaluates a configuration file to JSON and reports every source it read.
 ///
 /// The returned list always starts with `path` itself (`is_primary`), then
 /// every file the program imported, transitively. `legion job run` stores
 /// that set with the job so the exact source of a running job can be shown
-/// back later.
+/// back later. A `.json` spec has no imports, so it reports only itself.
 pub fn eval_file_tracked(
     path: impl AsRef<Path>,
     vars: Option<&Map<String, Value>>,
 ) -> R<(String, Vec<LoadedSource>)> {
     let path = path.as_ref();
+    if format_for(path) == ConfigFormat::Json {
+        let json = read_json(path, vars)?;
+        let content = std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        return Ok((
+            json,
+            vec![LoadedSource {
+                path: path.to_string_lossy().to_string(),
+                content,
+                is_primary: true,
+            }],
+        ));
+    }
+
     let mut program = ProgramBuilder::new()
         .add_path(path)
         .extend_initial_env(vars_env(vars)?)
@@ -309,6 +430,113 @@ mod config_lang_test {
         assert_eq!(eval_expression("[1, 2, 3]").unwrap(), json!([1, 2, 3]));
         assert_eq!(eval_expression("{ a = true }").unwrap(), json!({"a": true}));
         assert!(eval_expression("1 +").is_err());
+    }
+
+    #[test]
+    fn picks_the_format_from_the_extension_test() {
+        assert_eq!(format_for("job.json"), ConfigFormat::Json);
+        assert_eq!(format_for("/a/b/FLEET.JSON"), ConfigFormat::Json);
+        assert_eq!(format_for("job.ncl"), ConfigFormat::Nickel);
+        // Unknown and missing extensions fall back to Legion's real
+        // configuration language rather than being refused.
+        assert_eq!(format_for("job.txt"), ConfigFormat::Nickel);
+        assert_eq!(format_for("job"), ConfigFormat::Nickel);
+    }
+
+    #[test]
+    fn recognizes_config_files_for_directory_scans_test() {
+        assert!(is_config_file("worker.ncl"));
+        assert!(is_config_file("worker.json"));
+        // Discovery is stricter than parsing: a scan must not pick these up.
+        assert!(!is_config_file("README.md"));
+        assert!(!is_config_file(".worker.ncl.swp"));
+        assert!(!is_config_file("worker"));
+    }
+
+    #[test]
+    fn reads_json_config_files_test() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("job.json");
+        std::fs::write(&path, "{\n  \"name\": \"web\",\n  \"count\": 2\n}\n").unwrap();
+
+        let json = eval_file(&path).unwrap();
+        let value: Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["name"], "web");
+        assert_eq!(value["count"], 2);
+    }
+
+    #[test]
+    fn json_config_files_are_not_evaluated_as_nickel_test() {
+        // The point of the extension dispatch: this exact text is a *Nickel*
+        // error ("invalid contract expression", because `:` annotates a
+        // contract there) and a perfectly good JSON document.
+        let dir = tempfile::tempdir().unwrap();
+        let json_path = dir.path().join("job.json");
+        let ncl_path = dir.path().join("job.ncl");
+        let source = "{\"name\": \"web\"}";
+        std::fs::write(&json_path, source).unwrap();
+        std::fs::write(&ncl_path, source).unwrap();
+
+        let value: Value = serde_json::from_str(&eval_file(&json_path).unwrap()).unwrap();
+        assert_eq!(value["name"], "web");
+        assert!(eval_file(&ncl_path).is_err());
+    }
+
+    #[test]
+    fn reports_malformed_json_with_a_position_test() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("job.json");
+        std::fs::write(&path, "{\n  \"name\": \"web\",\n}\n").unwrap();
+
+        let err = format!("{:#}", eval_file(&path).unwrap_err());
+        assert!(err.contains("is not valid JSON"), "{err}");
+        assert!(err.contains("line 3"), "{err}");
+    }
+
+    #[test]
+    fn rejects_vars_for_json_config_files_test() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("job.json");
+        std::fs::write(&path, "{\"name\": \"web\"}").unwrap();
+
+        let mut vars = Map::new();
+        vars.insert("image".into(), Value::String("nginx".into()));
+        let err = eval_file_with_vars(&path, Some(&vars)).unwrap_err();
+        assert!(err.to_string().contains("has no variables"), "{err}");
+
+        // An empty set is what every caller passes unconditionally, so it
+        // must not trip the check.
+        assert!(eval_file_with_vars(&path, Some(&Map::new())).is_ok());
+    }
+
+    #[test]
+    fn tracks_a_json_config_file_as_its_own_only_source_test() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("job.json");
+        std::fs::write(&path, "{\"name\": \"web\"}").unwrap();
+
+        let (json, sources) = eval_file_tracked(&path, None).unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&json).unwrap()["name"], "web");
+        assert_eq!(sources.len(), 1);
+        assert!(sources[0].is_primary);
+        assert_eq!(sources[0].content, "{\"name\": \"web\"}");
+    }
+
+    #[test]
+    fn nickel_can_import_a_json_file_test() {
+        // The combining path: machine-generated data, hand-written structure.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("fleet.json"), "{\"memory\": 128}").unwrap();
+        let main = dir.path().join("job.ncl");
+        std::fs::write(
+            &main,
+            "let fleet = import \"fleet.json\" in { name = \"web\", memory = fleet.memory }",
+        )
+        .unwrap();
+
+        let json = eval_file(&main).unwrap();
+        let value: Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["memory"], 128);
     }
 
     #[test]

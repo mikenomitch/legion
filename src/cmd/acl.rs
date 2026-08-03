@@ -304,15 +304,10 @@ fn read_policy_source(
     description_flag: Option<&String>,
 ) -> R<(String, String)> {
     let raw = match (file, inline) {
-        (Some(path), None) => {
-            if path.ends_with(crate::config_lang::CONFIG_SUFFIX) {
-                crate::config_lang::eval_file(path)
-                    .with_context(|| format!("Error rendering policy {path}"))?
-            } else {
-                std::fs::read_to_string(path)
-                    .with_context(|| format!("failed to read policy file {path}"))?
-            }
-        }
+        // Both languages go through the one loader: `.json` is parsed, and
+        // anything else is evaluated as Nickel.
+        (Some(path), None) => crate::config_lang::eval_file(path)
+            .with_context(|| format!("Error rendering policy {path}"))?,
         (None, Some(inline)) => inline.clone(),
         (Some(_), Some(_)) => bail!("provide either FILE or --rules, not both"),
         (None, None) => bail!("provide a policy FILE or --rules <json>"),

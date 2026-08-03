@@ -1837,6 +1837,13 @@ async fn load_initial_data(store: &Store, config: &ManagerConfig) -> R<()> {
 
     for path in sub_paths {
         let path = path.unwrap().path();
+        // Only the two configuration extensions. The directory is a normal
+        // one an operator edits, so it collects `README.md` files and editor
+        // swap files, and neither should be fed to a config parser.
+        if !crate::config_lang::is_config_file(&path) {
+            debug!(path = %path.display(), "skipping non-config file in worker config directory");
+            continue;
+        }
         let path_str = path.to_str().unwrap();
         let wcp = parse_worker_config(path_str)?;
 

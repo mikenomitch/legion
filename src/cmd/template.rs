@@ -239,6 +239,25 @@ async fn create_template(matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(matches);
     let name = required_name(matches);
     let path = matches.get_one::<String>("file").expect("file is required");
+
+    // Templates are the one config surface JSON cannot serve: a template
+    // declares `job` as a *function* of its variables, and JSON has no
+    // functions. Say so here rather than letting the manager's Nickel parser
+    // report a syntax error on a file the user believes is valid.
+    if crate::config_lang::format_for(path) == crate::config_lang::ConfigFormat::Json {
+        return Err(output::fail_local(
+            format,
+            CliError::local(
+                "InvalidArgument",
+                format!("{path} is JSON, but a job template must be Nickel"),
+                Some(
+                    "a template declares `job` as a function of its variables \
+                     (`job | not_exported = fun vars => …`), which JSON cannot express",
+                ),
+            ),
+        ));
+    }
+
     let source_nickel = std::fs::read_to_string(path).map_err(|error| {
         output::fail_local(
             format,

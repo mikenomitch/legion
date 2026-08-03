@@ -7,8 +7,15 @@ use legion::util::plugin_root_dir;
 use serde_json::Value;
 
 /// Evaluates a shipped example the way `legion job run` does.
+///
+/// A `.json` example is handed no variables: JSON cannot read them, and
+/// supplying them is an error rather than a silent no-op.
 fn render_job_spec(path: &str, vars: &serde_json::Map<String, Value>) -> String {
-    config_lang::eval_file_with_vars(path, Some(vars))
+    let vars = match config_lang::format_for(path) {
+        config_lang::ConfigFormat::Json => None,
+        config_lang::ConfigFormat::Nickel => Some(vars),
+    };
+    config_lang::eval_file_with_vars(path, vars)
         .unwrap_or_else(|e| panic!("{path} should evaluate:\n{e:#}"))
 }
 
@@ -45,7 +52,7 @@ fn config_jobs_parse() {
     for entry in std::fs::read_dir(&jobs_dir).expect("jobs dir should read") {
         let entry = entry.expect("entry should read");
         let path = entry.path();
-        if path.extension().and_then(|ext| ext.to_str()) != Some(config_lang::CONFIG_EXTENSION) {
+        if !config_lang::is_config_file(&path) {
             continue;
         }
 
@@ -117,7 +124,7 @@ fn config_jobs_pass_full_validation() {
     for entry in std::fs::read_dir(&jobs_dir).expect("jobs dir should read") {
         let entry = entry.expect("entry should read");
         let path = entry.path();
-        if path.extension().and_then(|ext| ext.to_str()) != Some(config_lang::CONFIG_EXTENSION) {
+        if !config_lang::is_config_file(&path) {
             continue;
         }
 
@@ -310,7 +317,7 @@ fn config_manager_files_parse() {
     let mut seen = 0;
     for entry in std::fs::read_dir(&configs_dir).expect("configs dir should read") {
         let path = entry.expect("entry should read").path();
-        if path.extension().and_then(|ext| ext.to_str()) != Some(config_lang::CONFIG_EXTENSION) {
+        if !config_lang::is_config_file(&path) {
             continue;
         }
 
@@ -341,7 +348,7 @@ fn config_worker_files_parse() {
     let mut seen = 0;
     for entry in std::fs::read_dir(&workers_dir).expect("workers dir should read") {
         let path = entry.expect("entry should read").path();
-        if path.extension().and_then(|ext| ext.to_str()) != Some(config_lang::CONFIG_EXTENSION) {
+        if !config_lang::is_config_file(&path) {
             continue;
         }
 
@@ -372,6 +379,8 @@ fn config_template_files_parse() {
     let mut seen = 0;
     for entry in std::fs::read_dir(&templates_dir).expect("templates dir should read") {
         let path = entry.expect("entry should read").path();
+        // Nickel only: a template declares `job` as a function of its
+        // variables, so unlike every other config surface it has no JSON form.
         if path.extension().and_then(|ext| ext.to_str()) != Some(config_lang::CONFIG_EXTENSION) {
             continue;
         }
@@ -399,4 +408,104 @@ fn config_template_files_parse() {
     }
 
     assert!(seen >= 1, "expected the shipped job template, found {seen}");
+}
+
+/// A JSON jobspec is accepted anywhere a Nickel one is.
+///
+/// The shipped `machine-generated.json` is covered by the directory scans
+/// above; this pins the property those scans rely on — that the two languages
+/// are two spellings of one job, not two dialects with different reach.
+#[test]
+fn json_and_nickel_jobspecs_produce_the_same_job() {
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    let json_path = dir.path().join("job.json");
+    std::fs::write(
+        &json_path,
+        r#"{
+          "name": "equivalent",
+          "priority": "high",
+          "tasks": [{
+            "name": "server",
+            "runtime": "exec",
+            "lifecycle": "service",
+            "group": "api",
+            "count": 2,
+            "resources": {"cpu": 200, "memory": 256},
+            "config": {"command": ["echo", "hi"]}
+          }]
+        }"#,
+    )
+    .expect("write json spec");
+
+    let ncl_path = dir.path().join("job.ncl");
+    std::fs::write(
+        &ncl_path,
+        r#"{
+          name = "equivalent",
+          priority = "high",
+          tasks = [{
+            name = "server",
+            runtime = "exec",
+            lifecycle = "service",
+            group = "api",
+            count = 2,
+            resources = { cpu = 200, memory = 256 },
+            config = { command = ["echo", "hi"] },
+          }],
+        }"#,
+    )
+    .expect("write nickel spec");
+
+    let from_json: JobConfig = serde_json::from_str(&render_job_spec(
+        &json_path.to_string_lossy(),
+        &default_vars(),
+    ))
+    .expect("json spec should deserialize");
+    let from_ncl: JobConfig = serde_json::from_str(&render_job_spec(
+        &ncl_path.to_string_lossy(),
+        &default_vars(),
+    ))
+    .expect("nickel spec should deserialize");
+
+    assert_eq!(from_json, from_ncl);
+    validate_job_config(&from_json).expect("json spec should pass full validation");
+}
+
+/// Nickel reads an imported `.json` file natively.
+///
+/// This is the path for mixing the two: generated data, hand-written
+/// structure. It is also what the local-jobspec resolution fix protects —
+/// the import has to resolve against the spec's own directory.
+#[test]
+fn a_nickel_jobspec_can_import_generated_json() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(dir.path().join("fleet.json"), r#"{"count": 3, "cpu": 150}"#)
+        .expect("write generated json");
+
+    let spec = dir.path().join("job.ncl");
+    std::fs::write(
+        &spec,
+        r#"
+        let fleet = import "fleet.json" in
+        {
+          name = "hybrid",
+          tasks = [{
+            name = "server",
+            runtime = "exec",
+            group = "api",
+            count = fleet.count,
+            resources = { cpu = fleet.cpu },
+            config = { command = ["echo", "hybrid"] },
+          }],
+        }
+        "#,
+    )
+    .expect("write spec");
+
+    let rendered = render_job_spec(&spec.to_string_lossy(), &default_vars());
+    let config: JobConfig = serde_json::from_str(&rendered).expect("should deserialize");
+    assert_eq!(config.name, "hybrid");
+    assert_eq!(config.tasks[0].count.num, 3);
+    validate_job_config(&config).expect("hybrid spec should pass full validation");
 }

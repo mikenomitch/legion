@@ -54,7 +54,67 @@ and defaults expressed in the language itself (`{ replicas | Number | default =
 
 ---
 
-## 2. Template imports are rejected by lexing the source, not by an import hook
+## 2. JSON is accepted alongside Nickel, dispatched on the file extension alone
+
+**The call.** A `.json` file is read as plain JSON on four of the five config
+surfaces — job specs, manager config, worker configs, ACL policies — and the
+choice is made from the file extension, with no content sniffing and no flag.
+`--var` against a `.json` file is a hard error rather than a silent no-op. Job
+templates stay Nickel-only: a template declares `job` as a *function* of its
+variables, so there is nothing for JSON to express, and `legion template create`
+says that rather than letting the parser report a syntax error.
+
+**The alternatives.**
+- **Nickel only.** Generators emit Nickel, or pipe their JSON through `nickel
+  export`.
+- **Sniff the content** (leading `{` plus a successful `serde_json` parse) and
+  pick a reader, so any extension works.
+- **An explicit `--format json` flag** rather than inferring from the name.
+- **Accept `vars` for JSON too** and ignore them, so the flags are uniform
+  across both languages.
+
+**The trade-off.** Two accepted languages is a second surface to document,
+test, and keep in sync forever, and it weakens "every Legion config is a Nickel
+program" — the sentence the migration was written to be able to say. A user who
+names a Nickel file `.json` gets a parse error that does not mention Nickel.
+
+**Why.** JSON is *not* a subset of Nickel, which is the fact that forces this.
+Under Jsonnet it was — renaming `.json` to `.jsonnet` just worked, so machine
+emitters were served for free and nobody had to decide anything. Under Nickel,
+records are `key = value` and `:` is the type-annotation operator, so a
+generated JSON object does not fail cleanly: `{"name": "web"}` parses as a
+field annotated with the contract `"web"` and dies as `invalid contract
+expression`. Removing the C++ VM would otherwise have quietly cost every
+Terraform module, CI script, and agent a hand-written Nickel emitter, to
+express data they already had a serializer for. Nickel's abstractions —
+functions, imports, defaults, contracts — are for people; a generator has its
+own and needs none of them.
+
+Extension dispatch over sniffing because sniffing makes a file's meaning depend
+on its first non-space byte: a typo'd Nickel record that happens to start with
+`{` would be reported as bad JSON, in a language the author never chose. The
+name is a declaration, and it makes the failure legible. Extension over a
+`--format` flag because the flag would have to be threaded through every
+surface, including the manager's worker-config directory scan, which has no
+command line to put it on.
+
+Erroring on `--var` rather than ignoring it: a dropped `--var image=nginx`
+would submit a *working* job with the wrong image, which is the worst available
+outcome. The error names the fix.
+
+```
+$ legion job run fleet.json --var image=nginx
+error: fleet.json is JSON, which has no variables — drop the variable flags,
+       or use a .ncl file that reads `vars` and imports the JSON
+```
+
+The documented way to have both is Nickel's native JSON import (`let fleet =
+import "generated/fleet.json"`), which keeps generated data generated and
+hand-written structure hand-written.
+
+---
+
+## 3. Template imports are rejected by lexing the source, not by an import hook
 
 **The call.** `config_lang::eval_sandboxed` tokenizes the source with Nickel's
 own lexer and rejects any `import` keyword *before* evaluation begins:
@@ -91,7 +151,7 @@ operator), so the conservative version wins over the precise one.
 
 ---
 
-## 3. No `.jsonnet` compatibility path at all
+## 4. No `.jsonnet` compatibility path at all
 
 **The call.** The Jsonnet evaluator is deleted, `.jsonnet` files are not
 recognized, and the `job_template_version.source_jsonnet` column is renamed in
@@ -116,7 +176,41 @@ was declared irrelevant.
 
 ---
 
-## 4. Library fragments moved to `configs/jobs/lib/` rather than given a distinguishing name
+## 5. A local jobspec is evaluated where it sits, rather than staged into a temp directory
+
+**The call.** `legion job run/plan/validate` reads a local spec from its own
+path. Only remote sources (`https://`, `git::`, `s3://`) are fetched into a
+temp directory. `file://` counts as local.
+
+**The alternatives.**
+- **Copy the spec's parent directory** into the temp dir, preserving the
+  staging model while making sibling imports resolvable.
+- **Walk the import graph** and copy only the files it names.
+- **Point Nickel's import resolver at the original directory** while still
+  evaluating the copy.
+
+**The trade-off.** The code path is no longer uniform — a local spec and a
+remote one are resolved differently, and a future feature that assumes "the
+spec always lives in a scratch directory we own" has to learn otherwise.
+
+**Why.** Staging a *single file* was the bug: `import "lib/task-a.ncl"`
+resolves against the importing file's directory, so copying the entry point
+alone into an otherwise empty temp dir guarantees `could not find import`. The
+shipped `configs/jobs/demo-imports-2.ncl` did not run. This predates the
+migration — Jsonnet's import callback `unwrap()`ed the same failed read and
+panicked — so the copy never served local specs at all; it existed for remote
+ones and local paths fell through it by accident.
+
+Copying the parent directory would fix the symptom and import a new problem:
+jobspecs live in repositories, and the parent directory is as often a
+1 GB checkout as a tidy `configs/jobs/`. Walking the import graph means
+reimplementing Nickel's resolver, including its JSON/YAML/TOML extension
+handling, and being wrong about it later. Local files are already readable by
+the process — staging them bought nothing to begin with.
+
+---
+
+## 6. Library fragments moved to `configs/jobs/lib/` rather than given a distinguishing name
 
 **The call.** `task-a.libsonnet` / `task-b.libsonnet` — importable task records,
 not jobspecs — became `configs/jobs/lib/task-a.ncl` and `lib/task-b.ncl`.
@@ -140,7 +234,7 @@ test exists to catch.
 
 ---
 
-## 5. Errors are rendered with Nickel's own diagnostic reporter, colorless
+## 7. Errors are rendered with Nickel's own diagnostic reporter, colorless
 
 **The call.** Every evaluation failure goes through
 `error::report::report_as_str(..., ColorOpt::Never)` and becomes an
@@ -172,7 +266,7 @@ of those wants ANSI escapes — TTY detection at the point where the error is
 
 ---
 
-## 6. KV-backed variables are threaded through `std.deserialize`, not pasted as source
+## 8. KV-backed variables are threaded through `std.deserialize`, not pasted as source
 
 **The call.** `--kv-var-code key=path` renders the KV entry as
 `std.deserialize 'Json "<escaped json>"` rather than inlining the value as

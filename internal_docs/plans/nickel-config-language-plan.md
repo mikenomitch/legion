@@ -8,6 +8,15 @@ Jsonnet evaluator is gone from the tree. Deliberately deferred: no compatibility
 shim for `.jsonnet` files, no shipped Nickel contract library for the jobspec
 schema, no `legion fmt`. See "Deliberately deferred" at the end.
 
+**Follow-up, shipped in the same branch.** A `.json` file is accepted anywhere
+a `.ncl` one is, parsed rather than evaluated, for machine-emitted config. This
+was not in the original plan: it became necessary once the migration made JSON
+stop being a subset of the configuration language (it was one under Jsonnet, so
+generators were served for free). Dispatch is by extension only; `--var`
+against a `.json` file is an error. See calls #2. The same branch fixed local
+jobspec resolution, which had been staging a lone file into a temp directory
+and stranding every relative import — see calls #5.
+
 ## Problem statement
 
 Legion's configuration language was Jsonnet, embedded through `jsonnet-rs`,
@@ -96,6 +105,9 @@ evaluates configuration.
   a test that actually evaluates them.
 
 **Non-goals**
+- Accepting any *other* format. JSON earns its place by being what machines
+  already emit and what `legion job schema` already describes; YAML and TOML
+  have neither claim, and each additional reader is a permanent surface.
 - Backwards compatibility with `.jsonnet` files. The user explicitly waived it;
   a dual-evaluator period would double the surface and the docs for a
   transitional benefit.

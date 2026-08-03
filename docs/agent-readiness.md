@@ -144,6 +144,17 @@ legion job validate ./configs/jobs/demo.ncl --json
 The schema embeds the built-in task-runtime config schemas (`exec`, `container`, …)
 under `taskRuntimes`, derived from the typed Rust structs.
 
+**Write the spec as `.json`, not `.ncl`.** An agent generating a jobspec is the
+machine-emitted case the JSON path exists for: `legion job schema` describes
+the JSON, an agent already emits JSON, and a `.json` file is accepted anywhere
+a `.ncl` one is. Going through Nickel means generating a second syntax whose
+records use `=` — and a JSON object handed to the Nickel parser fails as
+`invalid contract expression`, which is a bad error to have to self-correct
+from. Nickel is for the humans reading the spec afterward; if the job needs to
+be *both* generated and readable, emit a `.json` data file and import it from a
+short hand-written `.ncl`. See
+[Configuration Language](configuration-language.md#json-for-machine-emitted-config).
+
 Runtime configs are checked *typed*, not just against their JSON schema, so
 mistakes an agent could not otherwise see — an unknown capability name in
 `exec`'s `hardening` block, a non-octal `umask`, `oom_adj` and `oom_score_adj`

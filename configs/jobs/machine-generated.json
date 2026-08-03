@@ -1,0 +1,15 @@
+{
+  "name": "machine-generated",
+  "priority": "normal",
+  "tasks": [
+    {
+      "name": "server",
+      "runtime": "exec",
+      "lifecycle": "service",
+      "group": "api",
+      "count": 2,
+      "resources": { "cpu": 200, "memory": 256 },
+      "config": { "command": ["echo", "machine-generated"] }
+    }
+  ]
+}

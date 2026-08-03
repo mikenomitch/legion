@@ -68,7 +68,8 @@ It aims to be differentiated from the above based on the following:
 - Other Benefits:
   - OTEL compliant tracing, logs, and metrics
   - Well-documented GRPC interface
-  - Nickel configuration language for simple and DRY job specifications
+  - Nickel configuration language for simple and DRY job specifications —
+    with plain `.json` accepted anywhere for machine-emitted config
     ([docs/configuration-language.md](docs/configuration-language.md))
   - Raft is optional. Making life simpler — plain local SQLite by default, real quorum-replicated manager state (`persistence.type = "raft"`) when you need HA ([docs/multi-raft.md](docs/multi-raft.md))
   - Can easily be used as a library

@@ -1148,7 +1148,25 @@ Deferred from [job-updated-at-plan.md](plans/job-updated-at-plan.md):
       manager configs, the worker configs, and the shipped job template, none
       of which were evaluated by any test before. **No compatibility path**:
       `.jsonnet` files are not recognized and stored template sources do not
-      migrate (deliberate — see calls #3).
+      migrate (deliberate — see calls #4).
+- [x] **`.json` accepted on four of the five config surfaces** (2026-08-03,
+      [calls](calls/nickel-config-language-plan_calls.md) ·
+      [docs](../docs/configuration-language.md#json-for-machine-emitted-config)).
+      For machine-emitted config — generators already have a JSON serializer,
+      and JSON is *not* a Nickel subset, so without this a generated object
+      fails as `invalid contract expression`. Dispatch is by extension only
+      (`config_lang::format_for`), no content sniffing. `--var` against a
+      `.json` file is an error, not a silent no-op; Nickel's native
+      `import "x.json"` is the documented way to mix the two. Job templates
+      stay Nickel-only — a template's `job` is a function, which JSON cannot
+      express — and `legion template create` rejects a `.json` file with that
+      reason. Shipped example: `configs/jobs/machine-generated.json`.
+- [x] **Local jobspecs are evaluated in place** (2026-08-03). `legion job
+      run/plan/validate` used to copy a local spec into a temp directory,
+      which stranded every relative import — `configs/jobs/demo-imports-2.ncl`
+      did not run from the CLI. Pre-existing under Jsonnet, where the import
+      callback `unwrap()`ed the failed read and panicked. Remote sources still
+      stage, correctly: the fetcher brings the whole tree.
 
 ## Worker nodes
 

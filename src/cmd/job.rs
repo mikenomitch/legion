@@ -25,7 +25,7 @@ pub fn config() -> Command {
         .arg(
             Arg::new("path")
                 .value_name("PATH")
-                .help("Path or URL to the job specification to run")
+                .help("Path or URL to the job specification to run (.ncl Nickel, or .json)")
                 .value_hint(ValueHint::AnyPath),
         )
         .arg(priority_arg())
@@ -114,7 +114,7 @@ pub fn config() -> Command {
         .arg(
             Arg::new("path")
                 .value_name("PATH")
-                .help("Path or URL to the job specification to validate")
+                .help("Path or URL to the job specification to validate (.ncl Nickel, or .json)")
                 .required(true)
                 .value_hint(ValueHint::AnyPath),
         )
@@ -151,7 +151,7 @@ pub fn config() -> Command {
         .arg(
             Arg::new("path")
                 .value_name("PATH")
-                .help("Path or URL to the job specification to plan")
+                .help("Path or URL to the job specification to plan (.ncl Nickel, or .json)")
                 .required(true)
                 .value_hint(ValueHint::AnyPath),
         )
@@ -959,18 +959,53 @@ fn print_json<T: Serialize>(value: &T) {
 }
 
 struct ResolvedJobspec {
-    _temp_dir: TempDir,
+    /// Holds the staging directory open for as long as `path` points into it.
+    /// `None` for a local jobspec, which is read where it already lives.
+    _temp_dir: Option<TempDir>,
     path: PathBuf,
 }
 
+/// The local file a jobspec source names, if it names one.
+///
+/// A bare path is local; so is a `file://` URL, which reaches the same copy in
+/// the artifact fetcher. `Url::to_file_path` does the percent-decoding and
+/// rejects a URL with a foreign host. Everything else (`http(s)://`, `git::`,
+/// `s3://`) has to be fetched.
+fn local_jobspec_path(source: &str) -> Option<PathBuf> {
+    if source.starts_with("file://") {
+        return Url::parse(source).ok()?.to_file_path().ok();
+    }
+    if source.contains("://") || source.starts_with("git::") {
+        return None;
+    }
+    Some(PathBuf::from(source))
+}
+
 fn resolve_jobspec_source(source: &str) -> R<ResolvedJobspec> {
+    // A local jobspec is evaluated in place. Copying it to a temp directory
+    // would strand its relative imports: `import "lib/task.ncl"` resolves
+    // against the file's own directory, and only the one file gets copied, so
+    // staging turns a working spec into "could not find import".
+    //
+    // Only a plain existing file short-circuits. A directory, a `#fragment`
+    // selector, or a missing path falls through to the fetch path below,
+    // which already handles and reports each of those.
+    if let Some(path) = local_jobspec_path(source) {
+        if path.is_file() {
+            return Ok(ResolvedJobspec {
+                _temp_dir: None,
+                path,
+            });
+        }
+    }
+
     let temp_dir = tempfile::tempdir().context("create temporary directory for jobspec")?;
     let fetched_path = crate::artifacts::fetch_source_to_dir(source, temp_dir.path())
         .with_context(|| format!("fetch jobspec from {source}"))?;
     let resolved_path = ensure_jobspec_file(source, &fetched_path)?;
 
     Ok(ResolvedJobspec {
-        _temp_dir: temp_dir,
+        _temp_dir: Some(temp_dir),
         path: resolved_path,
     })
 }
@@ -1408,6 +1443,108 @@ mod tests {
         let (rendered, _subs) = render_jobspec(&job_path, &resolved)?;
         let config: JobConfig = serde_json::from_str(&rendered)?;
         assert_eq!(config.name, "kv-job");
+        Ok(())
+    }
+
+    #[test]
+    fn local_jobspec_resolves_in_place_so_imports_still_work() -> R<()> {
+        // Regression: the resolver used to copy a local spec into a temp
+        // directory on its own, which left `import "lib/task.ncl"` looking in
+        // a directory that held nothing but the copy.
+        let dir = tempdir()?;
+        std::fs::create_dir(dir.path().join("lib"))?;
+        std::fs::write(
+            dir.path().join("lib").join("task.ncl"),
+            r#"{ name = "t", runtime = "noop" }"#,
+        )?;
+        let job_path = dir.path().join("job.ncl");
+        std::fs::write(
+            &job_path,
+            r#"
+            let task = import "lib/task.ncl" in
+            { name = "imports", tasks = [task] }
+            "#,
+        )?;
+
+        let resolved = resolve_jobspec_source(job_path.to_str().unwrap())?;
+        assert_eq!(resolved.path, job_path, "spec should be read where it sits");
+
+        let (rendered, subs) = render_jobspec(&resolved.path, &ConfigVars::default())?;
+        let config: JobConfig = serde_json::from_str(&rendered)?;
+        assert_eq!(config.name, "imports");
+        // The imported file is stored with the job, not just the entrypoint.
+        assert_eq!(subs.len(), 2);
+        assert!(subs
+            .iter()
+            .any(|s| s.is_primary && s.path.ends_with("job.ncl")));
+        assert!(subs
+            .iter()
+            .any(|s| !s.is_primary && s.path.ends_with("task.ncl")));
+        Ok(())
+    }
+
+    #[test]
+    fn local_jobspec_paths_are_recognized_without_fetching() {
+        assert_eq!(
+            local_jobspec_path("configs/jobs/demo.ncl"),
+            Some(PathBuf::from("configs/jobs/demo.ncl"))
+        );
+        assert_eq!(
+            local_jobspec_path("/abs/demo.ncl"),
+            Some(PathBuf::from("/abs/demo.ncl"))
+        );
+        assert_eq!(
+            local_jobspec_path("file:///abs/demo.ncl"),
+            Some(PathBuf::from("/abs/demo.ncl"))
+        );
+        // Percent-decoded, which is why this goes through `Url`.
+        assert_eq!(
+            local_jobspec_path("file:///abs/with%20space.ncl"),
+            Some(PathBuf::from("/abs/with space.ncl"))
+        );
+        // Remote sources still stage into a temp directory, which is correct
+        // for them: the fetcher brings the whole tree, imports included.
+        assert_eq!(local_jobspec_path("https://example.com/demo.ncl"), None);
+        assert_eq!(local_jobspec_path("git::https://example.com/r.git"), None);
+        assert_eq!(local_jobspec_path("s3://bucket/demo.ncl"), None);
+    }
+
+    #[test]
+    fn a_missing_local_jobspec_is_reported_by_path() {
+        let Err(err) = resolve_jobspec_source("does/not/exist.ncl") else {
+            panic!("a missing jobspec should not resolve");
+        };
+        assert!(err.to_string().contains("does/not/exist.ncl"), "{err}");
+    }
+
+    #[test]
+    fn json_jobspecs_render_without_nickel() -> R<()> {
+        // Machine-emitted config: the same spec a generator would write out.
+        let dir = tempdir()?;
+        let job_path = dir.path().join("job.json");
+        std::fs::write(
+            &job_path,
+            r#"{"name": "generated", "tasks": [{"name": "t", "runtime": "noop"}]}"#,
+        )?;
+
+        let (rendered, subs) = render_jobspec(&job_path, &ConfigVars::default())?;
+        let config: JobConfig = serde_json::from_str(&rendered)?;
+        assert_eq!(config.name, "generated");
+        assert_eq!(subs.len(), 1);
+        assert!(subs[0].is_primary);
+        Ok(())
+    }
+
+    #[test]
+    fn json_jobspecs_reject_vars() -> R<()> {
+        let dir = tempdir()?;
+        let job_path = dir.path().join("job.json");
+        std::fs::write(&job_path, r#"{"name": "generated"}"#)?;
+
+        let mut vars = ConfigVars::default();
+        vars.strings.push(("image".into(), "nginx".into()));
+        let err = render_jobspec(&job_path, &vars).unwrap_err();
+        assert!(format!("{err:#}").contains("has no variables"), "{err:#}");
         Ok(())
     }
 
