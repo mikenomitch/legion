@@ -168,7 +168,12 @@ How to use it:
       at `Scheduler::new`, and the index shard-sort skipped when the
       caller discards the order (before/after in
       [benchmarks/scheduler/README.md](../benchmarks/scheduler/README.md)).
-      Further wins want profiling, not this list.
+      The two costs D5 left on the table closed 2026-08-03 (phase 4 of
+      [plan-path-scale-levers](plans/plan-path-scale-levers-plan.md)):
+      a plan batch is now ONE transaction on every backend — one fsync
+      locally instead of one per plan — and its post-apply `task_status`
+      projection is one status-lane write for the batch instead of one
+      per plan. Further wins want profiling, not this list.
 - [x] Scheduler performance measurement stack
       ([plan](plans/scheduler-performance-plan.md),
       [calls](calls/scheduler-performance-plan_calls.md),
@@ -196,9 +201,12 @@ How to use it:
       [scheduler-and-eval-loop.md](../docs/scheduler-and-eval-loop.md);
       before/after in
       [benchmarks/scheduler/README.md](../benchmarks/scheduler/README.md).
-      D2 (cross-manager scheduling) and D3 (in-memory state) remain
-      recorded keep/defer decisions; D8's architecture choice still waits
-      on AWS-test data.
+      Phase 4 (2026-08-03) closed what D5 deferred: the batch is one
+      transaction on every backend (local commit amortization, reversing
+      judgement call #6) and its `task_status` projection is batched onto
+      the status lane once per group commit. D2 (cross-manager
+      scheduling) and D3 (in-memory state) remain recorded keep/defer
+      decisions; D8's architecture choice still waits on AWS-test data.
 - [x] Heartbeat path at scale
       ([plan](plans/heartbeat-scale-plan.md),
       [calls](calls/heartbeat-scale-plan_calls.md),

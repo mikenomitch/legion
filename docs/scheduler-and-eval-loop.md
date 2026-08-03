@@ -151,10 +151,45 @@ own epoch-CAS verdict inside a per-plan savepoint. A plan that fails
 mid-apply rolls back alone; its batch-mates commit. A lone plan takes
 the single-plan path unchanged, so idle-cluster latency is unaffected.
 
+The batch is one transaction on **every** backend, so a local
+(`local_disk` / `streaming`) manager pays one fsync for the batch
+instead of one per plan, exactly as a raft manager pays one quorum
+round. The batch holds the store's write connection for the whole
+transaction — the same rule every other multi-statement write follows —
+so no unrelated write can land inside it.
+
+What the batch produces is published **once, after that commit**:
+
+- **One read-model refresh** over the union of every plan's allocation
+  scopes, read from committed state. Evicted and placed rows refresh
+  together, so the mirror never shows an intermediate state.
+- **One status-lane `task_status` projection** covering every allocation
+  the batch placed, instead of one per plan. Lifecycle-derived task
+  statuses are a status-lane write that follows the scheduler-lane apply
+  (see [multi-raft.md](multi-raft.md) on lanes); batching it turns N
+  follow-up writes — N more raft rounds under `lanes` — into one.
+- **Every staged event**, in id order. Nothing is broadcast before the
+  batch is durable.
+
+During the batch the read model still shows pre-batch state for the
+scopes it is about to change. That is the same window the epoch fence
+already covers: a plan built against it fails its compare-and-set at
+apply, so a stale read model costs a conflict, never an
+oversubscription.
+
 - `schedulerSettings.plan_apply_coalescing: false` restores one commit
-  per plan.
+  per plan, one status projection per plan, and one read-model refresh
+  per plan. This is the only escape hatch — there is no separate switch
+  for the local commit amortization or the batched status projection.
 - `schedulerSettings.plan_apply_batch_max` (default 16, max 128) caps
   plans per batch.
+
+Known limitation: a batch is bounded by `plan_apply_batch_max`, and a
+larger batch holds the write connection (and, on raft, one log entry)
+for proportionally longer. Raising it past the default trades tail
+latency for other writers against fewer commits; the raft append-entries
+deadline (`heartbeatIntervalMs`) is the real ceiling, which is why the
+cap exists.
 
 Worker heartbeats batch the same way on the status lane (see
 [architecture-managers-workers.md](architecture-managers-workers.md)).

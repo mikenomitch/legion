@@ -92,30 +92,86 @@ Plan: [`../plans/plan-path-scale-levers-plan.md`](../plans/plan-path-scale-lever
   (fsync amortization), which the raft-pipeline seam would not.
   (Performance where measured; smallest correct surface.)
 
-## 6. Local backends run batch members back-to-back — no outer transaction
+## 6. The batch is one transaction and HOLDS the write connection for it
 
-- **The call:** on `local_disk`/`streaming`, a plan batch executes its
-  members sequentially exactly as the pre-D5 code did (each plan's own
-  savepoint commit), rather than wrapping the batch in one outer
-  transaction; the raft win (one capture → one propose per batch) is
-  where the amortization lands.
-- **Alternatives:** an outer savepoint on local backends too, committing
-  the whole batch once.
-- **Trade-off:** local backends get no commit amortization from D5 —
-  measured acceptable because WAL mode with `synchronous = NORMAL` makes
-  local commits cheap (the baseline shows local apply dominated by
-  statement work, not fsync).
-- **Why:** the read-model refresh after each local apply reads committed
-  state through separate read connections; under an uncommitted outer
-  transaction those reads would see PRE-batch state and publish a stale
-  read model (a correctness bug, not a slowdown). Deferring cache
-  updates to batch end would fix that at the cost of restructuring the
-  apply path this plan explicitly kept intact. Raft mode has no such
-  hazard (cache updates are suppressed during capture and re-derived
-  from the committed changeset). (Correctness first; optimize where the
-  measurements point — raft.)
+> **Reverses the original entry 6** ("Local backends run batch members
+> back-to-back — no outer transaction", phases 1-3, 2026-07-30), which
+> deferred local commit amortization because the read-model refresh
+> after each local apply reads committed state through the read
+> connections: mid-batch those reads see PRE-batch state and publish a
+> mirror missing the batch's own placements. Phase 4 (2026-08-03) fixed
+> the cause rather than living with the symptom. The original call is
+> kept here as history; the current call is below.
 
-## 7. Heartbeat batching reuses the same coalescer pattern (see heartbeat plan)
+- **The call:** the group commit opens ONE write transaction for the
+  whole batch and **holds the store's write connection** for its whole
+  duration, exactly as every other multi-statement write in this store
+  does. To make that possible the plan body gained a
+  caller-supplied-connection form (`apply_plan_submission_on(tx, …)` /
+  `submit_and_apply_plan_on(tx, …)`), and it now *returns* its side
+  effects (`PlanApplyEffects`) instead of performing them, so the
+  transaction's owner emits them after the commit. Locally that is one
+  fsync for N plans; under raft it is unchanged (the transaction nests
+  inside the capture savepoint).
+- **Alternatives:** (a) leave it deferred, as phases 1-3 did; (b) an
+  outer `SAVEPOINT legion_plan_batch` with the connection released
+  between plans (the small change — no `_on` seams, no returned
+  effects), plus a thread-local scope that buffers side effects until
+  batch end, mirroring what `capture::in_capture()` does for raft;
+  (c) an explicit process-wide write barrier (`RwLock`) taken by every
+  `write_connection()` caller and held exclusively by the batch.
+- **Trade-off:** the `_on` seams and returned effects touch the most
+  critical function in the store — `apply_plan_submission_apply` is the
+  oversubscription fence — for a change whose whole purpose is to move
+  a commit boundary. Holding the connection also means an unrelated
+  writer waits for the batch instead of interleaving with it, so a
+  batch of `plan_apply_batch_max` plans is now a single write-lock hold.
+- **Why:** alternative (b) is a correctness hole, not a smaller version
+  of the same thing. With the connection released between plans, any
+  other thread's write lands *inside* the batch's open transaction:
+  its commit is not durable until the batch's, a batch rollback erases
+  it, and — the same JC-6 bug one level out — its own post-commit cache
+  refresh reads pre-batch state and publishes a mirror missing its own
+  write. Alternative (c) closes that hole but adds a lock to every
+  write in the process and a thread-local exemption for the batch
+  thread, to avoid a refactor that the codebase's own idiom (a writer
+  holds the guard for its transaction) says should exist anyway.
+  Returning effects also beats buffering them in a thread-local: the
+  effects become a value with a type, the batch merges them explicitly,
+  and there is no ambient state to get wrong. The bounded write-lock
+  hold is the batch's real cost and is why `plan_apply_batch_max`
+  exists. (Correctness first, then performance; simplicity of the
+  resulting structure over the smaller diff.)
+
+## 7. The batch leader does the batch's bookkeeping, including ONE status projection
+
+- **The call:** post-apply bookkeeping moved from "every submitter, for
+  its own plan" to "the batch leader, once for the batch": one epoch
+  self-heal over every rejected plan's scopes, and one status-lane
+  `task_status` projection over every allocation the batch placed. Each
+  submitter is told whether it was done for it
+  (`PlanApplySlot::bookkeeping_done`) and runs its own otherwise.
+- **Alternatives:** (a) leave the projection per plan (the shipped
+  phase-3 behavior) — a batch of N plans costs 1 plan commit and N
+  status writes, which under `lanes` is N more raft rounds; (b) fold
+  the status projection INTO the plan's transaction, removing the
+  follow-up write entirely.
+- **Trade-off:** the leader's critical section grows — it now holds the
+  coalescer's commit lock across the status projection, so the next
+  batch starts marginally later. And a batched bookkeeping failure is
+  attributed to the batch, not to one plan, until the per-plan fallback
+  re-runs it.
+- **Why:** the N status writes were the larger half of what a batch
+  still paid per plan, and they serialize on the same write connection
+  anyway — batching them does not lengthen the aggregate critical
+  section, it shortens it. (b) is not available: lifecycle-derived
+  `task_status` rows are status-lane state and must not ride a
+  scheduler-lane changeset (plan §7-C2) — that split is what lets the
+  lanes topology exist. The fallback keeps per-plan error attribution,
+  and both halves are idempotent so the repeat is free of consequence.
+  (Performance, without giving up the lane boundary.)
+
+## 8. Heartbeat batching reuses the same coalescer pattern (see heartbeat plan)
 
 - **The call:** one leader-elect drain-batch primitive, used by both
   plan applies and heartbeats, rather than two bespoke queues.
@@ -125,3 +181,45 @@ Plan: [`../plans/plan-path-scale-levers-plan.md`](../plans/plan-path-scale-lever
   in the batch functions, not the primitive.
 - **Why:** identical concurrency shape, identical failure semantics,
   one set of race-condition tests. (Simplicity/extensibility.)
+
+## 9. A batch member that fails mid-apply now rolls back its submission row too
+
+- **The call:** every plan in a batch runs inside a
+  `legion_plan_batch_item` savepoint on **every** backend, so a plan
+  that fails mid-apply rolls back its `plan_submission` insert along
+  with its placements. Locally that row used to survive, because the
+  insert ran on the connection in autocommit before the apply opened
+  its own transaction.
+- **Alternatives:** keep the local insert outside the batch's
+  transaction so the queued row survives a failure, preserving
+  byte-identical local behavior.
+- **Trade-off:** a failed plan leaves no forensic `queued` row on local
+  backends. Nothing consumes those rows — no recovery path scans for
+  `status = 'queued'` — so the loss is diagnostic only, and the failure
+  itself is still logged and returned to the submitter.
+- **Why:** raft mode already rolled both back together (a failed
+  capture proposes nothing), so this makes the two backends agree
+  instead of adding a difference. Keeping the old behavior would mean
+  deliberately leaving one write outside the transaction that exists to
+  contain it. (Simplicity: one apply story, not two.)
+
+## 10. A failed post-commit refresh is logged, never returned
+
+- **The call:** past the batch's commit, `run_plan_batch_txn` cannot
+  fail: a read-model refresh that will not publish is logged at `error`
+  and the batch's per-plan results stand.
+- **Alternatives:** propagate the error like any other batch failure —
+  which routes into the re-run-singly fallback.
+- **Trade-off:** a failed refresh leaves the mirror stale for the
+  affected scopes until the next publish or the rejection self-heal
+  refreshes them; plans built against it conflict rather than
+  oversubscribe.
+- **Why:** re-running a batch that has already COMMITTED is the one
+  thing this path must never do. (Each re-run plan would fail its own
+  epoch CAS against the state its first run created, so the cluster
+  stays consistent — but every submitter would be told `Rejected` for a
+  plan that in fact applied, and would replan from scratch.) The
+  re-run-singly fallback is only sound before the commit, so the commit
+  is the last statement that may use `?`. In practice a refresh failure
+  means a poisoned read-model lock, which is not a condition a retry
+  improves. (Correctness first.)
