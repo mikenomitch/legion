@@ -9,7 +9,7 @@
 #   RPO_secs  = (last_written_seq - last_survived_seq) / WRITE_HZ
 #   gap_secs  = first successful write after the kill - kill time
 #
-# Publish alongside syncInterval (1s in manager-b.jsonnet.tpl) and the
+# Publish alongside syncInterval (1s in manager-b.ncl.tpl) and the
 # lease TTL (15s) — the numbers are functions of both.
 #
 # Usage: streaming-rpo.sh [--write-hz 10] [--campaign <id>]

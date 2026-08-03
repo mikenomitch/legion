@@ -49,40 +49,40 @@ Two invariants make this safe to leave on:
 Everything lives under `schedulerSettings` in the manager config; changes
 take effect at manager restart. The minimal declaration is one line:
 
-```jsonnet
+```nickel
 {
-  schedulerSettings: {
-    indexes: {
-      // Shorthand: `resources.*` entries become dims, everything else is a
-      // partition key.
-      topo: ["pool", "region", "zone"],
-      gpu: ["pool", "region", "resources.gpu_vram", "resources.memory"],
+  schedulerSettings = {
+    indexes = {
+      # Shorthand = `resources.*` entries become dims, everything else is a
+      # partition key.
+      topo = ["pool", "region", "zone"],
+      gpu = ["pool", "region", "resources.gpu_vram", "resources.memory"],
 
-      // Kill switch for the built-in fit index (see below).
-      fit: false,
+      # Kill switch for the built-in fit index (see below).
+      fit = false,
 
-      // Full form when the defaults need overriding.
-      big_jobs: {
-        partition_by: ["pool"],
-        dims: [
-          { attr: "resources.memory", weight: 2 },            // scale: "log"
-          { attr: "gpu_count", scale: "linear", step: 1 },
+      # Full form when the defaults need overriding.
+      big_jobs = {
+        partition_by = ["pool"],
+        dims = [
+          { attr = "resources.memory", weight = 2 },            # scale = "log"
+          { attr = "gpu_count", scale = "linear", step = 1 },
         ],
-        order: "tight",   // "tight" (default under bin_pack) | "loose" (default under spread)
-        mode: "on",       // "on" | "shadow" | "off"
+        order = "tight",   # "tight" (default under bin_pack) | "loose" (default under spread)
+        mode = "on",       # "on" | "shadow" | "off"
       },
     },
-    index_min_nodes: 128, // arming threshold; 0 disables indexing entirely
+    index_min_nodes = 128, # arming threshold; 0 disables indexing entirely
   },
 }
 ```
 
 Defaults do the work:
 
-- Dim entries given as plain strings get `weight: 1` and `scale: "log"`.
-- `scale: "log"` buckets by `floor(log2(value + 1))` — unit-independent and
+- Dim entries given as plain strings get `weight = 1` and `scale = "log"`.
+- `scale = "log"` buckets by `floor(log2(value + 1))` — unit-independent and
   monotone, the right choice for capacities spanning orders of magnitude.
-  `scale: "linear"` with `step` suits small discrete ranges (GPU counts).
+  `scale = "linear"` with `step` suits small discrete ranges (GPU counts).
 - `order` defaults from the scheduling policy: `bin_pack` → `tight`
   (smallest sufficient fit first), `spread` → `loose` (most headroom
   first). This orders *candidate generation*; the policy still scores and
@@ -103,10 +103,10 @@ surface below exists to prevent.
 
 Unless you disable or redefine it, every cluster gets:
 
-```jsonnet
-fit: {
-  partition_by: ["pool"],
-  dims: ["resources.cpu", "resources.memory", "resources.disk"],
+```nickel
+fit = {
+  partition_by = ["pool"],
+  dims = ["resources.cpu", "resources.memory", "resources.disk"],
 }
 ```
 
@@ -119,7 +119,7 @@ sort last for requests that do, which is exactly the conclusion the
 resource ledger would reach anyway. `allocations` is deliberately not a
 dim — its default capacity is unlimited, which buckets uselessly.
 
-Disable it with `indexes: { fit: false }`, or redefine it by declaring your
+Disable it with `indexes = { fit = false }`, or redefine it by declaring your
 own index named `fit`.
 
 ## Arming: small clusters pay nothing
@@ -128,7 +128,7 @@ Indexes participate in planning only when the plan's candidate fleet has at
 least `index_min_nodes` available nodes (default **128**). Below the
 threshold the scheduler uses the plain scan and the only cost is index
 bookkeeping on node/allocation changes — O(1) hash-map work per event, and
-none at all if you set `index_min_nodes: 0`, which disables indexing
+none at all if you set `index_min_nodes = 0`, which disables indexing
 entirely. Edge clusters never see this feature unless they ask for it.
 
 ## Automatic index selection
@@ -202,7 +202,7 @@ unindexed attributes costs one comparison.
 - **"My index isn't being used."** `legion job plan` → the task's `reason`
   line. Usual causes: the fleet is below `index_min_nodes`; the task lacks
   an `=` constraint for one of the index's `partition_by` keys; the index
-  is `mode: "off"`.
+  is `mode = "off"`.
 - **Manager refuses to start after editing `indexes`.** The parse error
   names the index and field; fix the declaration — validation is strict on
   purpose.
@@ -213,7 +213,7 @@ unindexed attributes costs one comparison.
 - **A placement that used to succeed now fails.** Indexes cannot cause
   this: an index-served empty candidate set is always cross-checked against
   the scan before failing, and the scan's verdict wins. If you want to rule
-  the feature out anyway, `index_min_nodes: 0` restores pre-index behavior
+  the feature out anyway, `index_min_nodes = 0` restores pre-index behavior
   byte for byte.
 
 ## Known limitations

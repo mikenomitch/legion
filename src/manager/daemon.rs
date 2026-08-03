@@ -14,7 +14,6 @@ use crate::worker::daemon::run_worker_local;
 
 use futures::join;
 use http::Method;
-use jsonnet::JsonnetVm;
 use rand::Rng;
 use std::fs;
 use std::sync::Arc;
@@ -1509,7 +1508,7 @@ mod tests {
         store.handle_job_submit(
             &job,
             &[Submission {
-                path: "job.jsonnet".into(),
+                path: "job.ncl".into(),
                 content: "{}".into(),
                 is_primary: true,
             }],
@@ -1819,16 +1818,11 @@ fn error_is_not_raft_leader(error: &anyhow::Error) -> bool {
 
 #[instrument(err, skip_all)]
 fn parse_worker_config(config_path: &str) -> R<WorkerConfigAlt> {
-    // Pluginify jsonnet
-    let mut vm = JsonnetVm::new();
-    let rendered = vm
-        .evaluate_file(config_path)
-        .map_err(|e| {
-            let err = anyhow!("Error parsing worker config at path {config_path}: {e}");
-            error!("{err}");
-            err
-        })?
-        .to_string();
+    let rendered = crate::config_lang::eval_file(config_path).map_err(|e| {
+        let err = e.context(format!("Error parsing worker config at path {config_path}"));
+        error!("{err}");
+        err
+    })?;
 
     let config: WorkerConfigAlt = serde_json::from_str(&rendered)
         .with_context(|| format!("Error parsing worker config at path {config_path}"))?;

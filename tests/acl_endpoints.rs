@@ -194,17 +194,17 @@ fn req<T>(inner: T, token: Option<&str>) -> Request<T> {
 fn template_source(job_name: &str) -> String {
     format!(
         r#"{{
-  description: 'acl fixture template',
-  variables: [],
-  job(vars):: {{
-    name: '{job_name}',
-    tasks: [{{
-      name: 'main',
-      runtime: 'exec',
-      count: 1,
-      config: {{ command: ['echo', 'ok'] }},
-      resources: {{}},
-      constraints: {{}},
+  description = "acl fixture template",
+  variables = [],
+  job | not_exported = fun vars => {{
+    name = "{job_name}",
+    tasks = [{{
+      name = "main",
+      runtime = "exec",
+      count = 1,
+      config = {{ command = ["echo", "ok"] }},
+      resources = {{}},
+      constraints = {{}},
     }}],
   }},
 }}"#
@@ -296,7 +296,7 @@ async fn call_endpoint(
             .upsert_job_template(req(
                 UpsertJobTemplateRequest {
                     name: TEMPLATE_NAME.into(),
-                    source_jsonnet: template_source(TEMPLATE_JOB_NAME),
+                    source_nickel: template_source(TEMPLATE_JOB_NAME),
                 },
                 token,
             ))
@@ -1781,18 +1781,18 @@ async fn band_scoped_policy_gates_the_priority_a_job_may_claim() -> R<()> {
         "band-escalation",
         None,
         r#"{
-  description: 'renders a critical job',
-  variables: [],
-  job(vars):: {
-    name: 'band-template-job',
-    priority: 'critical',
-    tasks: [{
-      name: 'main',
-      runtime: 'noop',
-      count: 1,
-      config: {},
-      resources: {},
-      constraints: {},
+  description = "renders a critical job",
+  variables = [],
+  job | not_exported = fun vars => {
+    name = "band-template-job",
+    "priority" = "critical",
+    tasks = [{
+      name = "main",
+      runtime = "noop",
+      count = 1,
+      config = {},
+      resources = {},
+      constraints = {},
     }],
   },
 }"#,

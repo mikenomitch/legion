@@ -746,7 +746,7 @@ export class JobTemplateVariable extends Message<JobTemplateVariable> {
   /**
    * Variable key. Must match `[a-zA-Z_][a-zA-Z0-9_]*`. The rendered
    * template receives all declared keys as fields of the single `vars`
-   * object passed to its `job(vars)` function.
+   * record its `job` function is applied to.
    *
    * @generated from field: string key = 1;
    */
@@ -927,11 +927,11 @@ export class JobTemplate extends Message<JobTemplate> {
   description?: string;
 
   /**
-   * Raw Jsonnet source of this version.
+   * Raw Nickel source of this version.
    *
-   * @generated from field: string source_jsonnet = 5;
+   * @generated from field: string source_nickel = 5;
    */
-  sourceJsonnet = "";
+  sourceNickel = "";
 
   /**
    * Declared variables from the manifest, in declaration order.
@@ -966,7 +966,7 @@ export class JobTemplate extends Message<JobTemplate> {
     { no: 2, name: "version", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
     { no: 3, name: "latest_version", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
     { no: 4, name: "description", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
-    { no: 5, name: "source_jsonnet", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 5, name: "source_nickel", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 6, name: "variables", kind: "message", T: JobTemplateVariable, repeated: true },
     { no: 7, name: "created_at", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 8, name: "created_by", kind: "scalar", T: 9 /* ScalarType.STRING */ },
@@ -1126,12 +1126,12 @@ export class UpsertJobTemplateRequest extends Message<UpsertJobTemplateRequest> 
   name = "";
 
   /**
-   * Full Jsonnet source. Must be self-contained (imports are rejected) and
+   * Full Nickel source. Must be self-contained (imports are rejected) and
    * at most 512 KiB. See JobTemplate for the required document shape.
    *
-   * @generated from field: string source_jsonnet = 2;
+   * @generated from field: string source_nickel = 2;
    */
-  sourceJsonnet = "";
+  sourceNickel = "";
 
   constructor(data?: PartialMessage<UpsertJobTemplateRequest>) {
     super();
@@ -1142,7 +1142,7 @@ export class UpsertJobTemplateRequest extends Message<UpsertJobTemplateRequest> 
   static readonly typeName = "legion.UpsertJobTemplateRequest";
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
     { no: 1, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
-    { no: 2, name: "source_jsonnet", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "source_nickel", kind: "scalar", T: 9 /* ScalarType.STRING */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): UpsertJobTemplateRequest {

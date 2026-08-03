@@ -12,7 +12,7 @@ Legion uses a mixed strategy:
 Integration tests currently include:
 
 - `tests/config_jobs.rs`
-  - validates all Jsonnet job configs deserialize to `JobConfig`.
+  - validates all Nickel job configs deserialize to `JobConfig`.
   - validates maximal config shape.
 - `tests/scheduler_integration.rs`
   - end-to-end scheduling scenarios (constraints, permit, count.per, reschedule behavior).

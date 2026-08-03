@@ -15,14 +15,14 @@ to diverge early.
 
 ## The ladder
 
-```jsonnet
+```nickel
 {
-  name: 'web',
-  runtime: 'container',
-  // How this task is stopped, whoever initiates it. Both fields optional.
-  stop: {
-    signal: 'SIGTERM',   // default
-    killAfter: '30s',    // default; SIGKILL after this grace window
+  name = "web",
+  runtime = "container",
+  # How this task is stopped, whoever initiates it. Both fields optional.
+  stop = {
+    signal = "SIGTERM",   # default
+    killAfter = "30s",    # default; SIGKILL after this grace window
   },
 }
 ```
@@ -280,7 +280,7 @@ it just reports `unknown` and carries no preemptor link.
 - **The grace window costs stop latency for everyone.** Stops that used to be
   instantaneous now take up to `killAfter`. This is the intended behavior
   change and it applies to jobs that declare no `stop` block: the default
-  ladder is `SIGTERM` + `30s`, not a hard kill. Set `stop: { killAfter: '0s' }`
+  ladder is `SIGTERM` + `30s`, not a hard kill. Set `stop = { killAfter = "0s" }`
   on a task that genuinely wants the old behavior.
 - **Starts wait behind co-located stops.** A new allocation landing on a node
   with in-grace allocations waits for them, even when it is unrelated to
@@ -294,7 +294,7 @@ it just reports `unknown` and carries no preemptor link.
   returns all removals; filter on the `cause` metadata key client-side.
 - **Causes are per-removal-batch in the journal, per-allocation on the wire.**
   A `job stop` that removes 12 allocations produces one `allocation.removed`
-  event with `count: 12`, and 12 individual notices.
+  event with `count = 12`, and 12 individual notices.
 - **Allocation IDs are reused.** An allocation ID freed by a deletion can be
   assigned to a new allocation. A stale notice is overwritten when the new
   allocation is itself removed, so a mislabel would require a worker to stop

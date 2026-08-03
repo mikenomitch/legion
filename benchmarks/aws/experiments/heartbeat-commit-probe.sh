@@ -88,7 +88,7 @@ trap cleanup_run EXIT
 peer_list() {
     local i out=""
     for ((i = 0; i < VOTERS; i++)); do
-        out="$out'cp-$i=127.0.0.1:$((4747 + i * 10))',"
+        out="$out\"cp-$i=127.0.0.1:$((4747 + i * 10))\","
     done
     echo "$out"
 }
@@ -97,24 +97,24 @@ start_voter() { # start_voter <idx> <bootstrap true|false> <join-token-line>
     local i="$1" bootstrap="$2" join_line="$3"
     local port=$((4747 + i * 10)) tel=$((4749 + i * 10))
     mkdir -p "$WORK/m$i"
-    cat >"$WORK/m$i/config.jsonnet" <<EOF
+    cat >"$WORK/m$i/config.ncl" <<EOF
 {
-  server: { port: $port, host: '127.0.0.1', advertiseAddr: 'http://127.0.0.1:$port' },
-  storePath: '$WORK/m$i/store',
-  workerConfigPath: '$REPO_ROOT/configs/workers/',
-  telemetry: { enabled: true, port: $tel },
-  taskResourceDefaults: { cpu: 0, memory: 0, allocations: 1000 },
-  persistence: { type: 'raft', raft: {
-    nodeId: 'cp-$i', bootstrap: $bootstrap, $join_line
-    advertiseAddr: '127.0.0.1:$port',
-    peers: [$(peer_list)],
-    expectedVoters: $VOTERS,
-    dataDir: '$WORK/m$i/raft',
-    topology: 'lanes',
+  server = { port = $port, host = "127.0.0.1", advertiseAddr = "http://127.0.0.1:$port" },
+  storePath = "$WORK/m$i/store",
+  workerConfigPath = "$REPO_ROOT/configs/workers/",
+  telemetry = { enabled = true, port = $tel },
+  taskResourceDefaults = { cpu = 0, memory = 0, allocations = 1000 },
+  persistence = { type = "raft", raft = {
+    nodeId = "cp-$i", bootstrap = $bootstrap, $join_line
+    advertiseAddr = "127.0.0.1:$port",
+    peers = [$(peer_list)],
+    expectedVoters = $VOTERS,
+    dataDir = "$WORK/m$i/raft",
+    topology = "lanes",
   } },
 }
 EOF
-    (cd "$WORK/m$i" && exec "$BINARY" start manager -c config.jsonnet) \
+    (cd "$WORK/m$i" && exec "$BINARY" start manager -c config.ncl) \
         >"$WORK/m$i.log" 2>&1 &
     PIDS+=($!)
 }
@@ -164,7 +164,7 @@ run_cell() { # run_cell <threads> <nodes>
         raft_token=$("$BINARY" raft join-token 2>&1 | grep -o 'lgnraft_[A-Za-z0-9_-]*' | head -1)
         [ -n "$raft_token" ] || { echo "  no raft join token"; return 1; }
         for ((i = 1; i < VOTERS; i++)); do
-            start_voter "$i" false "joinToken: '$raft_token',"
+            start_voter "$i" false "joinToken = \"$raft_token\","
         done
         for ((i = 0; i < 120; i++)); do
             local voters

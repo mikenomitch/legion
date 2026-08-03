@@ -119,24 +119,24 @@ this feature's.
 
 Manager-level `schedulerSettings` (no job-spec surface):
 
-```jsonnet
+```nickel
 {
-  schedulerSettings: {
-    // Candidates per placement. 0 disables candidate lists entirely and
-    // restores single-node plan submissions (today's pre-candidate
-    // behavior, and the mixed-version kill switch). Shorthand:
-    plan_candidates: 8,
+  schedulerSettings = {
+    # Candidates per placement. 0 disables candidate lists entirely and
+    # restores single-node plan submissions (today's pre-candidate
+    # behavior, and the mixed-version kill switch). Shorthand:
+    plan_candidates = 8,
 
-    // Full form when the defaults need overriding:
-    // plan_candidates: {
-    //   count: 8,    // list length per placement (clamped to 0..=32)
-    //   band: 0.01,  // score band the fallback tail is sampled from
-    // },
+    # Full form when the defaults need overriding:
+    # plan_candidates = {
+    #   count = 8,    # list length per placement (clamped to 0..=32)
+    #   band = 0.01,  # score band the fallback tail is sampled from
+    # },
 
-    // Delay before a conflict-exhausted eval is retried (ms; default
-    // 1000, clamped to 100..=60000; uniform jitter of up to the base is
-    // added so requeued racers do not re-collide in lockstep).
-    plan_conflict_requeue_delay_ms: 1000,
+    # Delay before a conflict-exhausted eval is retried (ms; default
+    # 1000, clamped to 100..=60000; uniform jitter of up to the base is
+    # added so requeued racers do not re-collide in lockstep).
+    plan_conflict_requeue_delay_ms = 1000,
   },
 }
 ```
@@ -176,10 +176,10 @@ Candidate-carrying plans are stored as a new submission format
 forever, so upgrading is seamless — but an *older* manager cannot parse
 format-2 rows. Under raft, follow the standard same-version upgrade order
 ([upgrades.md](upgrades.md)). If you must run a mixed-version manager
-fleet beyond an upgrade window, set `plan_candidates: 0` until the fleet
+fleet beyond an upgrade window, set `plan_candidates = 0` until the fleet
 is level: it holds format-2 emission off entirely.
 
-`plan_candidates: 0` also restores the previous placement behavior
+`plan_candidates = 0` also restores the previous placement behavior
 byte-for-byte (single-node submissions, all-or-nothing apply). The
 requeue backstop is independent of the setting and always on.
 

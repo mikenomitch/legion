@@ -31,7 +31,7 @@ $ legion job scale multi --task api --count 3   # disambiguate multi-task jobs
   task (the common case). With several, the error names the candidates.
 - `--reason` is recorded on the override and in the event stream.
 - `--json` / `-j` emits the standard envelope; `--idempotency-key` makes the
-  RPC retry-safe (`deduplicated: true` on replay).
+  RPC retry-safe (`deduplicated = true` on replay).
 - Everything is also available over gRPC (`ScaleTask`) and MCP
   (`legion_job_scale`, write-gated).
 
@@ -53,7 +53,7 @@ value.
   slot-mode stateful tasks (honoring `stateful.storage.retainOnScaleIn`),
   newest first for stateless tasks.
 - **Keyed stateful tasks** are rejected — keyed tasks have no count; use the
-  instance API. Tasks with `count: { per: ... }` are rejected in v1.
+  instance API. Tasks with `count = { per = ... }` are rejected in v1.
 
 ### Ownership: overrides vs resubmits
 
@@ -98,7 +98,7 @@ timestamp in `legion job scale <name>`.
 ## Access control
 
 Scaling is its own ACL resource: **`scale`** (actions `read`/`write`, scoped
-by job name). `job:write` does not imply `scale:write` and vice versa — the
+by job name). `job:write` does not imply `scale = "write"` and vice versa — the
 point is granting an autoscaler or a teammate the right to *resize* without
 the right to *redeploy*. See [auth-and-acls.md](auth-and-acls.md).
 

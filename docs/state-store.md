@@ -124,7 +124,7 @@ Server-side backups exist in every mode: `legion state backup` (a
 
 ## What Is Not Implemented Yet
 
-- Raft `topology: 'lanes'` (independent per-domain raft groups) is
+- Raft `topology = "lanes"` (independent per-domain raft groups) is
   runnable and measured but stays **opt-in** — `single` remains the
   recommended default. See `docs/multi-raft.md` § "Topology: `single` vs
   `lanes`".

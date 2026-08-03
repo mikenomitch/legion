@@ -3,7 +3,7 @@
 This document describes how jobs are represented and how scheduling behavior works, including edge cases.
 
 Jobs reach the manager either as a rendered spec (`legion job run`, which
-evaluates Jsonnet client-side) or through a
+evaluates [Nickel](configuration-language.md) client-side) or through a
 [job template](job-templates.md), where the cluster stores the spec and the
 submitter supplies typed variables. Both paths converge on the same
 validation, admission, and scheduling described below; templates only
@@ -106,7 +106,7 @@ Lifecycle rules, enforced at submit and by `legion job validate`:
   another service, because services never exit. Those conditions are only
   satisfiable by `batch` targets.
 
-See `configs/jobs/maximal.jsonnet` and `configs/jobs/dag-exec-mac-sidecars.jsonnet`
+See `configs/jobs/maximal.ncl` and `configs/jobs/dag-exec-mac-sidecars.ncl`
 for validating examples of both the cross-group and sidecar shapes.
 
 ## Constraints, Permits, and Affinities
@@ -208,10 +208,10 @@ health, heartbeats, or running allocations.
 The `SetNodeAvailability` RPC (CLI: `legion node cordon|drain|uncordon <ID>`,
 MCP: `legion_node_drain`) drives three operator flows:
 
-- **Cordon** (`availability: "drained"`, `evict: false`): the node stops
+- **Cordon** (`availability = "drained"`, `evict = false`): the node stops
   receiving new placements; existing allocations keep running. Emits
   `node.cordoned`.
-- **Drain** (`availability: "drained"`, `evict: true`): cordon plus a
+- **Drain** (`availability = "drained"`, `evict = true`): cordon plus a
   `node_drain` eval that evicts the node's existing allocations
   (`Store::reschedule_allocations_for_drained_node`):
   - Stateless allocations are removed immediately and the affected job
@@ -227,7 +227,7 @@ MCP: `legion_node_drain`) drives three operator flows:
     recheck sweep then applies `onLost.replaceAfter` as usual) or an
     operator moves them explicitly with `legion instance replace`.
   - Emits `node.drained` with evicted/held counts.
-- **Uncordon** (`availability: "available"`): the node re-enters the
+- **Uncordon** (`availability = "available"`): the node re-enters the
   scheduling pool. Existing allocations elsewhere are not moved back
   automatically; the next reschedule/reconcile may use the node. Emits
   `node.uncordoned`.
@@ -251,7 +251,7 @@ A worker's task supervisor polls each running allocation's process, reaps it on
 exit, and applies the task's `restart` policy — restart in place, terminal
 success, or failure into the reschedule path below. This is also what makes a
 batch task's `Success` real (the exit code decides it, not the placement), so
-`dependsOn: { condition: "success" }` means "exited 0". The full semantics,
+`dependsOn = { condition = "success" }` means "exited 0". The full semantics,
 including the version-skew rule for workers that predate exit reporting, are in
 [Task Supervision](task-supervision.md).
 

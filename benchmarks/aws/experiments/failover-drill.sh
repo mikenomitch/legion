@@ -98,11 +98,11 @@ rsh "$LOADGEN_ADDR" "
         --out '$REMOTE_OUT/trickle' >/dev/null 2>&1 || true
     (
       i=0
-      for f in '$REMOTE_OUT'/trickle/*.jsonnet '$REMOTE_OUT'/trickle/*.hcl '$REMOTE_OUT'/trickle/*.json; do
+      for f in '$REMOTE_OUT'/trickle/*.ncl '$REMOTE_OUT'/trickle/*.hcl '$REMOTE_OUT'/trickle/*.json; do
         [ -e \"\$f\" ] || continue
         case \"\$f\" in
           *manifest.json) continue ;;
-          *.jsonnet) LEGION_ADDR='$MANAGER' legion job run \"\$f\" -j >/dev/null 2>&1 || true ;;
+          *.ncl) LEGION_ADDR='$MANAGER' legion job run \"\$f\" -j >/dev/null 2>&1 || true ;;
           *.hcl) NOMAD_ADDR='$MANAGER' nomad job run -detach \"\$f\" >/dev/null 2>&1 || true ;;
           *.json) kubectl apply -f \"\$f\" >/dev/null 2>&1 || true ;;
         esac

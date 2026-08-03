@@ -74,7 +74,7 @@ legion node list -j | jq '[.data[] | select(.config_attrs.simulated)] | length'
 
 Simulated nodes are **not capacity**. Keep simulated fleets out of
 production clusters, or at minimum keep real workloads off them with a
-constraint (for example `constraints: { simulated: { operator: "is_not_set" } }`).
+constraint (for example `constraints = { simulated = { operator = "is_not_set" } }`).
 
 ## Behavior and fidelity
 

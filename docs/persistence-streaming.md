@@ -21,24 +21,33 @@ Legion supports a streaming persistence mode for manager state using:
 
 ## Configuration
 
-```jsonnet
+Nickel deliberately has no access to the process environment, so secrets are
+kept in a separate, uncommitted file and imported:
+
+```nickel
+# secrets.ncl (gitignored)
+{ accessKeyId = "…", secretAccessKey = "…" }
+```
+
+```nickel
+let secrets = import "secrets.ncl" in
 {
-  persistence: {
-    type: "streaming",
-    streaming: {
-      replicaUrl: "s3://my-bucket/legion/prod",
-      syncInterval: "1s",
-      lease: {
-        provider: "object_storage", // none | object_storage
-        key: "leases/prod/primary.json",
-        ttlSeconds: 15,
-        renewIntervalSeconds: 5,
-        objectStorage: {
-          bucket: "my-bucket",
-          region: "auto", // R2 commonly uses auto
-          endpoint: "https://<account-id>.r2.cloudflarestorage.com",
-          accessKeyId: std.extVar("R2_ACCESS_KEY_ID"),
-          secretAccessKey: std.extVar("R2_SECRET_ACCESS_KEY"),
+  persistence = {
+    type = "streaming",
+    streaming = {
+      replicaUrl = "s3://my-bucket/legion/prod",
+      syncInterval = "1s",
+      lease = {
+        provider = "object_storage", # none | object_storage
+        key = "leases/prod/primary.json",
+        ttlSeconds = 15,
+        renewIntervalSeconds = 5,
+        objectStorage = {
+          bucket = "my-bucket",
+          region = "auto", # R2 commonly uses auto
+          endpoint = "https://<account-id>.r2.cloudflarestorage.com",
+          accessKeyId = secrets.accessKeyId,
+          secretAccessKey = secrets.secretAccessKey,
         },
       },
     },

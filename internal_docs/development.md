@@ -35,7 +35,7 @@ login finds cargo fine.
 ### Running locally
 
 <!-- Run the manager -->
-cargo run -- start manager -c configs/manager.jsonnet
+cargo run -- start manager -c configs/manager.ncl
 <!-- Join the cluster as a worker node (note the port and lack of tls) -->
 LEGION_ADDR=http://127.0.0.1:4748 cargo run -- join -a
 <!-- Now you can make calls to legion (note that the port is different, should be TLS in the future) -->

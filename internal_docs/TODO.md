@@ -491,9 +491,9 @@ How to use it:
         address is loopback while bound to a wildcard host; or log a
         startup warning naming the derived address; or return the
         condition in `CreateJoinToken`'s response. The config comment in
-        `configs/manager.jsonnet` already says what the field is for, and
+        `configs/manager.ncl` already says what the field is for, and
         that was not enough. See `benchmarks/aws/configs/legion/
-        manager-a.jsonnet.tpl` for the fix the rig now carries, and note
+        manager-a.ncl.tpl` for the fix the rig now carries, and note
         `persistence.raft.advertiseAddr` is a *different* setting — having
         set that one is exactly why the gap was easy to miss.
   - [ ] Export process-level memory from the manager so the campaign can
@@ -1087,6 +1087,16 @@ Deferred from [job-updated-at-plan.md](plans/job-updated-at-plan.md):
 
 ## Cross-cutting
 
+- [ ] **Ship a Nickel contract library for the jobspec.** `legion job schema`
+      emits JSON Schema for the *rendered* JSON; an importable
+      `legion/jobspec.ncl` a spec could apply as a contract would move whole
+      classes of error to evaluation time. Needs a generator from the same
+      source as the JSON Schema or it drifts — deferred out of the
+      [Nickel migration](plans/nickel-config-language-plan.md).
+- [ ] **Decide whether `legion fmt` is worth the dependency.**
+      `nickel-lang-core`'s `format` feature pulls in topiary + tree-sitter;
+      today users format with the standalone `nickel` CLI. Deferred out of the
+      [Nickel migration](plans/nickel-config-language-plan.md).
 - [ ] **Audit every name decision in depth.** Important, and gets harder the
       longer it waits.
 - [ ] Performance and scale: prove Legion scales better than K8s, and than Nomad
@@ -1119,6 +1129,26 @@ Deferred from [job-updated-at-plan.md](plans/job-updated-at-plan.md):
 ---
 
 # Done
+
+## Configuration language
+
+- [x] **Nickel replaces Jsonnet as the configuration language** (2026-08-03,
+      [plan](plans/nickel-config-language-plan.md) ·
+      [calls](calls/nickel-config-language-plan_calls.md) ·
+      [docs/configuration-language.md](../docs/configuration-language.md)).
+      Every surface — job specs, manager config, worker configs, ACL policy
+      files, job templates — is `.ncl`, evaluated through one module
+      (`src/config_lang.rs`) with Nickel's positioned diagnostics. The forked
+      `jsonnet-rs` git dependency and its C++ VM are gone. Jsonnet's ext-vars
+      and top-level args collapse into a single `vars` record and four flags
+      (`--var`, `--var-code`, `--kv-var`, `--kv-var-code`); job templates hide
+      their `job` function with `| not_exported` and reject imports lexically
+      before evaluation; `source_jsonnet` became `source_nickel` in the proto,
+      the store, and the UI. `tests/config_jobs.rs` grew coverage for the
+      manager configs, the worker configs, and the shipped job template, none
+      of which were evaluated by any test before. **No compatibility path**:
+      `.jsonnet` files are not recognized and stored template sources do not
+      migrate (deliberate — see calls #3).
 
 ## Worker nodes
 

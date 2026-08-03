@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Install Legion A on the control plane: 3-voter raft, lanes topology
-# (configs/legion/manager-a.jsonnet.tpl). Wipes any previous system's
+# (configs/legion/manager-a.ncl.tpl). Wipes any previous system's
 # state on the boxes first — campaigns run serially on the same
 # hardware, that's the methodology.
 #
@@ -21,7 +21,7 @@ render_config() { # render_config <node-idx> <bootstrap> <join-token-line>
         CP1_IP="${CP_PRIVATE_IPS[1]}" \
         CP2_IP="${CP_PRIVATE_IPS[2]}" \
         render_tpl NODE_ID BOOTSTRAP JOIN_TOKEN_LINE PRIVATE_IP CP0_IP CP1_IP CP2_IP \
-        <"$AWS_BENCH_ROOT/configs/legion/manager-a.jsonnet.tpl"
+        <"$AWS_BENCH_ROOT/configs/legion/manager-a.ncl.tpl"
 }
 
 install_manager() { # install_manager <node-idx> <config-file>
@@ -35,11 +35,11 @@ install_manager() { # install_manager <node-idx> <config-file>
         sudo aws s3 cp --region $REGION s3://$BUCKET/bin/legion-plugins.tar.gz /tmp/plugins.tar.gz &&
         sudo tar -xzf /tmp/plugins.tar.gz --strip-components=1 -C /opt/legion/plugins
     "
-    rcp "$config" "$ip:/tmp/manager.jsonnet"
-    rcp "$AWS_BENCH_ROOT/configs/legion/workers/sim.jsonnet" "$ip:/tmp/sim.jsonnet"
+    rcp "$config" "$ip:/tmp/manager.ncl"
+    rcp "$AWS_BENCH_ROOT/configs/legion/workers/sim.ncl" "$ip:/tmp/sim.ncl"
     rsh "$ip" "
-        sudo mv /tmp/manager.jsonnet /opt/legion/configs/manager.jsonnet &&
-        sudo mv /tmp/sim.jsonnet /opt/legion/configs/workers/sim.jsonnet &&
+        sudo mv /tmp/manager.ncl /opt/legion/configs/manager.ncl &&
+        sudo mv /tmp/sim.ncl /opt/legion/configs/workers/sim.ncl &&
         sudo tee /etc/systemd/system/legion-manager.service >/dev/null <<'UNIT'
 [Unit]
 Description=Legion manager (benchmark)
@@ -47,7 +47,7 @@ After=network-online.target
 
 [Service]
 WorkingDirectory=/var/lib/legion
-ExecStart=/opt/legion/bin/legion start manager -c /opt/legion/configs/manager.jsonnet
+ExecStart=/opt/legion/bin/legion start manager -c /opt/legion/configs/manager.ncl
 Restart=on-failure
 LimitNOFILE=1048576
 Environment=RUST_LOG=info
@@ -65,8 +65,8 @@ STAGE=$(mktemp -d)
 trap 'rm -rf "$STAGE"' EXIT
 
 # cp-0: bootstrap.
-render_config 0 true "" >"$STAGE/cp-0.jsonnet"
-install_manager 0 "$STAGE/cp-0.jsonnet"
+render_config 0 true "" >"$STAGE/cp-0.ncl"
+install_manager 0 "$STAGE/cp-0.ncl"
 log "waiting for cp-0 readyz"
 rig_http_ready "${CP_ADDRS[0]}" 4749/readyz 180
 
@@ -79,8 +79,8 @@ RAFT_TOKEN=$(rsh "${CP_ADDRS[0]}" "legion raft join-token" | grep -o 'lgnraft_[A
 }
 
 for idx in 1 2; do
-    render_config "$idx" false "joinToken: '$RAFT_TOKEN'," >"$STAGE/cp-$idx.jsonnet"
-    install_manager "$idx" "$STAGE/cp-$idx.jsonnet"
+    render_config "$idx" false "joinToken = \"$RAFT_TOKEN\"," >"$STAGE/cp-$idx.ncl"
+    install_manager "$idx" "$STAGE/cp-$idx.ncl"
 done
 
 log "waiting for all managers ready (voters settled on every lane)"

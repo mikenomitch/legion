@@ -45,27 +45,27 @@ that many per path.
 
 ## The `restart` block
 
-```jsonnet
+```nickel
 {
-  name: "api",
-  runtime: "exec",
-  lifecycle: "service",
-  config: { command: ["/usr/local/bin/api"] },
+  name = "api",
+  runtime = "exec",
+  lifecycle = "service",
+  config = { command = ["/usr/local/bin/api"] },
 
-  restart: {
-    // always | onFailure | never
-    policy: "always",
-    // Wait before relaunching. Defaults to on_unhealthy.restart_delay.
-    delay: "5s",
-    // Exit codes counted as success. Default [0].
-    successExitCodes: [0],
+  restart = {
+    # always | onFailure | never
+    policy = "always",
+    # Wait before relaunching. Defaults to on_unhealthy.restart_delay.
+    delay = "5s",
+    # Exit codes counted as success. Default [0].
+    successExitCodes = [0],
   },
 
-  // The shared budget: how many local restarts, over what window, before the
-  // allocation is failed and the manager moves it elsewhere.
-  on_unhealthy: {
-    restart_count: 3, restart_period: "30m", restart_delay: "30s",
-    move_count: 3, move_period: "30m", move_delay: "30s",
+  # The shared budget: how many local restarts, over what window, before the
+  # allocation is failed and the manager moves it elsewhere.
+  on_unhealthy = {
+    restart_count = 3, restart_period = "30m", restart_delay = "30s",
+    move_count = 3, move_period = "30m", move_delay = "30s",
   },
 }
 ```
@@ -87,7 +87,7 @@ What happens on an exit:
 | policy does not want a restart, exit was not a success | allocation **fails**, as above |
 
 A process killed by a signal has no exit code and is never a success — so
-`policy: "never"` plus a `SIGKILL` is a failure, not a completion.
+`policy = "never"` plus a `SIGKILL` is a failure, not a completion.
 
 Restarting is in place, on the same node, keeping the allocation id, its
 directory, its staged artifacts, and its volumes. Only when the local budget is
@@ -101,16 +101,16 @@ worker reports an exit the task is `Running`; a successful exit makes it
 
 This is what makes dependencies mean what they say:
 
-```jsonnet
-{ task: "migrate", condition: "success" }   // migrate exited 0
-{ task: "migrate", condition: "complete" }  // migrate finished, either way
+```nickel
+{ task = "migrate", condition = "success" }   # migrate exited 0
+{ task = "migrate", condition = "complete" }  # migrate finished, either way
 ```
 
 Two consequences worth knowing before you upgrade:
 
 - **A batch task that never exits now blocks its dependents** in later
   scheduling passes, where it previously did not. If a "batch" task is really a
-  daemon, it should be `lifecycle: "service"`.
+  daemon, it should be `lifecycle = "service"`.
 - **Runtimes that cannot report exits** (`noop`, third-party plugins that do not
   opt in) report their batch tasks as complete *at start*, which is exactly the
   optimistic answer Legion used to assume everywhere. The difference is that
@@ -132,13 +132,13 @@ placements get the honest behavior.
 By default a task's `resources` are *scheduling* arithmetic: they decide where
 the task fits, not what it may consume. Turn them into real limits per worker:
 
-```jsonnet
-// configs/workers/<type>.jsonnet
+```nickel
+# configs/workers/<type>.ncl
 {
-  workerType: "default",
-  resourceEnforcement: {
-    enabled: true,
-    cgroupParent: "legion",   // hierarchy root under /sys/fs/cgroup
+  workerType = "default",
+  resourceEnforcement = {
+    enabled = true,
+    cgroupParent = "legion",   # hierarchy root under /sys/fs/cgroup
   },
 }
 ```
@@ -175,12 +175,12 @@ adopts — is documented in
 Stopping a task delivers a signal and waits before it kills, declared per task
 in the `stop` block:
 
-```jsonnet
-task: {
-  name: 'db',
-  runtime: 'exec',
-  config: { command: ['/usr/bin/postgres'] },
-  stop: { signal: 'SIGINT', killAfter: '90s' },   // defaults: SIGTERM, 30s
+```nickel
+task = {
+  name = "db",
+  runtime = "exec",
+  config = { command = ["/usr/bin/postgres"] },
+  stop = { signal = "SIGINT", killAfter = "90s" },   # defaults: SIGTERM, 30s
 }
 ```
 
@@ -201,16 +201,16 @@ stop causes are documented in [Graceful stop](graceful-stop.md).** The Linux
 An `exec` task can restrict itself further (Linux; parsed and validated
 everywhere, ignored with a warning off Linux):
 
-```jsonnet
-config: {
-  command: ["/usr/local/bin/api"],
-  user: "app",
-  hardening: {
-    noNewPrivileges: true,            // prctl(PR_SET_NO_NEW_PRIVS)
-    privateTmp: true,                 // own mount namespace + tmpfs /tmp
-    capabilities: { drop: ["all"] },  // bounding-set drops; names or "all"
-    umask: "0027",
-    nice: 5,
+```nickel
+config = {
+  command = ["/usr/local/bin/api"],
+  user = "app",
+  hardening = {
+    noNewPrivileges = true,            # prctl(PR_SET_NO_NEW_PRIVS)
+    privateTmp = true,                 # own mount namespace + tmpfs /tmp
+    capabilities = { drop = ["all"] },  # bounding-set drops; names or "all"
+    umask = "0027",
+    nice = 5,
   },
 }
 ```

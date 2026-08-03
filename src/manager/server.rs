@@ -204,7 +204,7 @@ fn job_template_to_proto(record: JobTemplateVersionRecord) -> JobTemplate {
         version: record.version,
         latest_version: record.latest_version,
         description: record.description,
-        source_jsonnet: record.source_jsonnet,
+        source_nickel: record.source_nickel,
         variables: record
             .variables
             .into_iter()
@@ -2644,7 +2644,7 @@ impl Manager for ManagerDaemonService {
         )?;
 
         let manifest =
-            run_blocking_admission(|| job_templates::parse_manifest(&inner.source_jsonnet))
+            run_blocking_admission(|| job_templates::parse_manifest(&inner.source_nickel))
                 .map_err(|e| Status::invalid_argument(e.to_string()))?;
 
         // When every variable has a default the template is fully renderable
@@ -2658,7 +2658,7 @@ impl Manager for ManagerDaemonService {
             let values = job_templates::resolve_variable_values(&manifest.variables, "{}")
                 .map_err(|e| Status::invalid_argument(e.to_string()))?;
             let rendered = run_blocking_admission(|| {
-                job_templates::render_with_timeout(&inner.source_jsonnet, &values)
+                job_templates::render_with_timeout(&inner.source_nickel, &values)
             })
             .map_err(|e| {
                 Status::invalid_argument(format!("trial render with defaults failed: {e}"))
@@ -2680,7 +2680,7 @@ impl Manager for ManagerDaemonService {
             .upsert_job_template_version(
                 &name,
                 manifest.description.as_deref(),
-                &inner.source_jsonnet,
+                &inner.source_nickel,
                 &manifest.variables,
                 &identity.principal,
             )
@@ -2824,7 +2824,7 @@ impl Manager for ManagerDaemonService {
             job_templates::resolve_variable_values(&template.variables, &inner.variables_json)
                 .map_err(|e| Status::invalid_argument(e.to_string()))?;
         let rendered = run_blocking_admission(|| {
-            job_templates::render_with_timeout(&template.source_jsonnet, &values)
+            job_templates::render_with_timeout(&template.source_nickel, &values)
         })
         .map_err(|e| Status::invalid_argument(e.to_string()))?;
 
@@ -2894,7 +2894,7 @@ impl Manager for ManagerDaemonService {
             job_templates::resolve_variable_values(&template.variables, &inner.variables_json)
                 .map_err(|e| Status::invalid_argument(e.to_string()))?;
         let rendered = run_blocking_admission(|| {
-            job_templates::render_with_timeout(&template.source_jsonnet, &values)
+            job_templates::render_with_timeout(&template.source_nickel, &values)
         })
         .map_err(|e| Status::invalid_argument(e.to_string()))?;
 
@@ -2905,7 +2905,7 @@ impl Manager for ManagerDaemonService {
         let subs = vec![
             Submission {
                 path: format!("template://{}/{}", template.name, template.version),
-                content: template.source_jsonnet.clone(),
+                content: template.source_nickel.clone(),
                 is_primary: true,
             },
             Submission {
@@ -8461,7 +8461,7 @@ mod tests {
 
     fn submission() -> Submission {
         Submission {
-            path: "job.jsonnet".into(),
+            path: "job.ncl".into(),
             content: "{}".into(),
             is_primary: true,
         }

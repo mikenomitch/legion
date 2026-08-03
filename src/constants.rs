@@ -50,7 +50,7 @@ pub fn allocation_status_is_terminal(status: &str) -> bool {
 }
 
 // === Manager ===
-pub const DEF_CONFIG_PATH: &str = "./configs/manager.jsonnet";
+pub const DEF_CONFIG_PATH: &str = "./configs/manager.ncl";
 
 // Manager config file
 pub const DEF_WORKER_CONFIG_PATH: &str = "./configs/workers/";

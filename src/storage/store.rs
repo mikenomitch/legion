@@ -661,7 +661,7 @@ pub struct JobTemplateVersionRecord {
     pub version: u32,
     pub latest_version: u32,
     pub description: Option<String>,
-    pub source_jsonnet: String,
+    pub source_nickel: String,
     pub variables: Vec<JobTemplateVariableRecord>,
     pub created_at: String,
     pub created_by: String,
@@ -13354,7 +13354,7 @@ impl Store {
             version: row.get::<_, i64>(1)? as u32,
             latest_version: row.get::<_, i64>(7)? as u32,
             description: row.get(3)?,
-            source_jsonnet: row.get(2)?,
+            source_nickel: row.get(2)?,
             variables,
             created_at: row.get(5)?,
             created_by: row.get(6)?,
@@ -13368,7 +13368,7 @@ impl Store {
         &self,
         name: &str,
         description: Option<&str>,
-        source_jsonnet: &str,
+        source_nickel: &str,
         variables: &[JobTemplateVariableRecord],
         created_by: &str,
     ) -> R<JobTemplateVersionRecord> {
@@ -13402,19 +13402,19 @@ impl Store {
             },
         )?;
         tx.execute(
-            "INSERT INTO job_template_version (template_name, version, description, source_jsonnet, variables, created_by, created_at) VALUES (:name, :version, :description, :source, :variables, :created_by, :now);",
+            "INSERT INTO job_template_version (template_name, version, description, source_nickel, variables, created_by, created_at) VALUES (:name, :version, :description, :source, :variables, :created_by, :now);",
             named_params! {
                 ":name": name,
                 ":version": next_version,
                 ":description": description,
-                ":source": source_jsonnet,
+                ":source": source_nickel,
                 ":variables": variables_json,
                 ":created_by": created_by,
                 ":now": now,
             },
         )?;
         let stored = tx.query_row(
-            "SELECT tv.template_name, tv.version, tv.source_jsonnet, tv.description, tv.variables, tv.created_at, tv.created_by, t.latest_version
+            "SELECT tv.template_name, tv.version, tv.source_nickel, tv.description, tv.variables, tv.created_at, tv.created_by, t.latest_version
              FROM job_template_version tv
              INNER JOIN job_template t ON t.name = tv.template_name
              WHERE tv.template_name = ? AND tv.version = ?;",
@@ -13433,7 +13433,7 @@ impl Store {
         version: Option<u32>,
     ) -> R<JobTemplateVersionRecord> {
         let conn = self.read_connection()?;
-        let base = "SELECT tv.template_name, tv.version, tv.source_jsonnet, tv.description, tv.variables, tv.created_at, tv.created_by, t.latest_version
+        let base = "SELECT tv.template_name, tv.version, tv.source_nickel, tv.description, tv.variables, tv.created_at, tv.created_by, t.latest_version
              FROM job_template_version tv
              INNER JOIN job_template t ON t.name = tv.template_name
              WHERE tv.template_name = ?";
@@ -15120,7 +15120,7 @@ mod tests {
             version: None,
         };
         let submission = Submission {
-            path: "pool-prop.jsonnet".into(),
+            path: "pool-prop.ncl".into(),
             content: "{}".into(),
             is_primary: true,
         };
@@ -15284,7 +15284,7 @@ mod tests {
         store.handle_job_submit(
             &job,
             &[Submission {
-                path: "job.jsonnet".into(),
+                path: "job.ncl".into(),
                 content: "{}".into(),
                 is_primary: true,
             }],
@@ -15331,7 +15331,7 @@ mod tests {
         store.handle_job_submit(
             &job,
             &[Submission {
-                path: "job.jsonnet".into(),
+                path: "job.ncl".into(),
                 content: "{}".into(),
                 is_primary: true,
             }],
@@ -15356,7 +15356,7 @@ mod tests {
         store.handle_job_submit(
             &job,
             &[Submission {
-                path: "job.jsonnet".into(),
+                path: "job.ncl".into(),
                 content: "{}".into(),
                 is_primary: true,
             }],
@@ -15384,7 +15384,7 @@ mod tests {
         store.handle_job_submit(
             &job,
             &[Submission {
-                path: "job.jsonnet".into(),
+                path: "job.ncl".into(),
                 content: "{}".into(),
                 is_primary: true,
             }],
@@ -15431,7 +15431,7 @@ mod tests {
         store.handle_job_submit(
             &job,
             &[Submission {
-                path: "job.jsonnet".into(),
+                path: "job.ncl".into(),
                 content: "{}".into(),
                 is_primary: true,
             }],
@@ -15462,7 +15462,7 @@ mod tests {
         store.handle_job_submit(
             &updated_job,
             &[Submission {
-                path: "job.jsonnet".into(),
+                path: "job.ncl".into(),
                 content: "{}".into(),
                 is_primary: true,
             }],
@@ -15606,7 +15606,7 @@ mod tests {
         store.handle_job_submit(
             &job,
             &[Submission {
-                path: "job.jsonnet".into(),
+                path: "job.ncl".into(),
                 content: "{}".into(),
                 is_primary: true,
             }],
@@ -15904,7 +15904,7 @@ mod tests {
     #[test]
     fn handle_job_submit_adds_new_job() -> R<()> {
         let sub_one = Submission {
-            path: "sub-1.jsonnet".into(),
+            path: "sub-1.ncl".into(),
             content: "sub-1".into(),
             is_primary: true,
         };
@@ -16017,7 +16017,7 @@ mod tests {
         let result = store.handle_job_submit(
             &job_config,
             &[Submission {
-                path: "sub-1.jsonnet".into(),
+                path: "sub-1.ncl".into(),
                 content: "sub-1".into(),
                 is_primary: true,
             }],
@@ -16033,7 +16033,7 @@ mod tests {
     #[test]
     fn handle_job_submit_updates_job_properly() -> R<()> {
         let orib_sub = Submission {
-            path: "sub-1.jsonnet".into(),
+            path: "sub-1.ncl".into(),
             content: "sub-1".into(),
             is_primary: true,
         };
@@ -16215,7 +16215,7 @@ mod tests {
             version: None,
         };
         let job_one_subs = vec![Submission {
-            path: "job-one-sub.jsonnet".into(),
+            path: "job-one-sub.ncl".into(),
             content: "job-one".into(),
             is_primary: true,
         }];
@@ -16240,7 +16240,7 @@ mod tests {
             version: None,
         };
         let job_two_subs = vec![Submission {
-            path: "job-two-sub.jsonnet".into(),
+            path: "job-two-sub.ncl".into(),
             content: "job-two".into(),
             is_primary: true,
         }];
@@ -16316,12 +16316,12 @@ mod tests {
 
         let submissions = vec![
             Submission {
-                path: "sub-1.jsonnet".into(),
+                path: "sub-1.ncl".into(),
                 content: "sub-1".into(),
                 is_primary: true,
             },
             Submission {
-                path: "sub-2.jsonnet".into(),
+                path: "sub-2.ncl".into(),
                 content: "sub-2".into(),
                 is_primary: false,
             },
@@ -16382,7 +16382,7 @@ mod tests {
         let store = setup_store()?;
 
         let shared_submission = Submission {
-            path: "shared.jsonnet".into(),
+            path: "shared.ncl".into(),
             content: "shared-content".into(),
             is_primary: true,
         };
@@ -16716,7 +16716,7 @@ mod tests {
         };
 
         let submission = [Submission {
-            path: "job.jsonnet".into(),
+            path: "job.ncl".into(),
             content: "job".into(),
             is_primary: true,
         }];
@@ -16787,7 +16787,7 @@ mod tests {
         store.handle_job_submit(
             &job,
             &[Submission {
-                path: "job.jsonnet".into(),
+                path: "job.ncl".into(),
                 content: "job".into(),
                 is_primary: true,
             }],
@@ -16819,7 +16819,7 @@ mod tests {
         store.handle_job_submit(
             &job_v1,
             &[Submission {
-                path: "v1.jsonnet".into(),
+                path: "v1.ncl".into(),
                 content: "v1".into(),
                 is_primary: true,
             }],
@@ -16842,7 +16842,7 @@ mod tests {
         store.handle_job_submit(
             &job_v2,
             &[Submission {
-                path: "v2.jsonnet".into(),
+                path: "v2.ncl".into(),
                 content: "v2".into(),
                 is_primary: true,
             }],
@@ -16882,7 +16882,7 @@ mod tests {
         store.handle_job_submit(
             &job,
             &[Submission {
-                path: "job.jsonnet".into(),
+                path: "job.ncl".into(),
                 content: "job".into(),
                 is_primary: true,
             }],
@@ -16952,7 +16952,7 @@ mod tests {
         store.handle_job_submit(
             &job,
             &[Submission {
-                path: "job.jsonnet".into(),
+                path: "job.ncl".into(),
                 content: "job".into(),
                 is_primary: true,
             }],
@@ -16995,7 +16995,7 @@ mod tests {
         store.handle_job_submit(
             &job,
             &[Submission {
-                path: "job.jsonnet".into(),
+                path: "job.ncl".into(),
                 content: "job".into(),
                 is_primary: true,
             }],
@@ -17038,7 +17038,7 @@ mod tests {
         store.handle_job_submit(
             &job,
             &[Submission {
-                path: format!("{name}.jsonnet"),
+                path: format!("{name}.ncl"),
                 content: name.into(),
                 is_primary: true,
             }],
@@ -17459,7 +17459,7 @@ mod tests {
         store.handle_job_submit(
             &job,
             &[Submission {
-                path: "job.jsonnet".into(),
+                path: "job.ncl".into(),
                 content: "job".into(),
                 is_primary: true,
             }],
@@ -17513,7 +17513,7 @@ mod tests {
         };
 
         let submission = [Submission {
-            path: "job.jsonnet".into(),
+            path: "job.ncl".into(),
             content: "job".into(),
             is_primary: true,
         }];
@@ -17577,7 +17577,7 @@ mod tests {
         store.handle_job_submit(
             &job,
             &[Submission {
-                path: "job.jsonnet".into(),
+                path: "job.ncl".into(),
                 content: "job".into(),
                 is_primary: true,
             }],
@@ -17634,7 +17634,7 @@ mod tests {
         store.handle_job_submit(
             &job,
             &[Submission {
-                path: "job.jsonnet".into(),
+                path: "job.ncl".into(),
                 content: "job".into(),
                 is_primary: true,
             }],
@@ -17946,7 +17946,7 @@ mod tests {
         store.handle_job_submit(
             &job,
             &[Submission {
-                path: "job.jsonnet".into(),
+                path: "job.ncl".into(),
                 content: "job".into(),
                 is_primary: true,
             }],
@@ -17997,7 +17997,7 @@ mod tests {
         store.handle_job_submit(
             &job,
             &[Submission {
-                path: "job.jsonnet".into(),
+                path: "job.ncl".into(),
                 content: "job".into(),
                 is_primary: true,
             }],
@@ -18067,7 +18067,7 @@ mod tests {
         store.handle_job_submit(
             &job,
             &[Submission {
-                path: "job.jsonnet".into(),
+                path: "job.ncl".into(),
                 content: "{}".into(),
                 is_primary: true,
             }],
@@ -18146,7 +18146,7 @@ mod tests {
         store.handle_job_submit(
             &job,
             &[Submission {
-                path: "job.jsonnet".into(),
+                path: "job.ncl".into(),
                 content: "{}".into(),
                 is_primary: true,
             }],
@@ -18178,7 +18178,7 @@ mod tests {
         store.handle_job_submit(
             &job,
             &[Submission {
-                path: "job.jsonnet".into(),
+                path: "job.ncl".into(),
                 content: "{}".into(),
                 is_primary: true,
             }],
@@ -18366,7 +18366,7 @@ mod tests {
         store.handle_job_submit(
             &job,
             &[Submission {
-                path: "job.jsonnet".into(),
+                path: "job.ncl".into(),
                 content: "{}".into(),
                 is_primary: true,
             }],
@@ -18766,7 +18766,7 @@ mod tests {
         store.handle_job_submit(
             &v1,
             &[Submission {
-                path: "job.jsonnet".into(),
+                path: "job.ncl".into(),
                 content: "{}".into(),
                 is_primary: true,
             }],
@@ -18787,7 +18787,7 @@ mod tests {
         store.handle_job_submit(
             &v2,
             &[Submission {
-                path: "job.jsonnet".into(),
+                path: "job.ncl".into(),
                 content: "{}".into(),
                 is_primary: true,
             }],
@@ -18839,7 +18839,7 @@ mod tests {
         store.handle_job_submit(
             &v1,
             &[Submission {
-                path: "job.jsonnet".into(),
+                path: "job.ncl".into(),
                 content: "{}".into(),
                 is_primary: true,
             }],
@@ -18860,7 +18860,7 @@ mod tests {
         store.handle_job_submit(
             &v2,
             &[Submission {
-                path: "job.jsonnet".into(),
+                path: "job.ncl".into(),
                 content: "{}".into(),
                 is_primary: true,
             }],
@@ -18925,7 +18925,7 @@ mod tests {
         store.handle_job_submit(
             &config,
             &[Submission {
-                path: "job.jsonnet".into(),
+                path: "job.ncl".into(),
                 content: "{}".into(),
                 is_primary: true,
             }],
@@ -20278,7 +20278,7 @@ mod tests {
         store.handle_job_submit(
             &job,
             &[Submission {
-                path: "job.jsonnet".into(),
+                path: "job.ncl".into(),
                 content: format!("{{ marker: '{marker}' }}"),
                 is_primary: true,
             }],
@@ -20463,7 +20463,7 @@ mod tests {
         store.handle_job_submit(
             &job,
             &[Submission {
-                path: "job.jsonnet".into(),
+                path: "job.ncl".into(),
                 content: "{}".into(),
                 is_primary: true,
             }],
@@ -20712,9 +20712,9 @@ mod tests {
         // Latest fetch returns v2; explicit fetch still returns v1 verbatim.
         let latest = store.get_job_template_version("tpl", None)?;
         assert_eq!(latest.version, 2);
-        assert_eq!(latest.source_jsonnet, "src-v2");
+        assert_eq!(latest.source_nickel, "src-v2");
         let pinned = store.get_job_template_version("tpl", Some(1))?;
-        assert_eq!(pinned.source_jsonnet, "src-v1");
+        assert_eq!(pinned.source_nickel, "src-v1");
         assert_eq!(pinned.latest_version, 2);
         assert_eq!(pinned.variables.len(), 1);
 
@@ -21281,7 +21281,7 @@ mod tests {
             store.handle_job_submit(
                 &job,
                 &[Submission {
-                    path: "job.jsonnet".into(),
+                    path: "job.ncl".into(),
                     content: "job".into(),
                     is_primary: true,
                 }],
@@ -21329,7 +21329,7 @@ mod tests {
             version: None,
         };
         let subs = [Submission {
-            path: "job.jsonnet".into(),
+            path: "job.ncl".into(),
             content: "job".into(),
             is_primary: true,
         }];

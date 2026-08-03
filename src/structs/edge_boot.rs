@@ -170,7 +170,7 @@ impl OnRefused {
 
 /// Task-level `speculativeStart` block, as declared in a jobspec.
 ///
-/// ```jsonnet
+/// ```nickel
 /// speculativeStart: {
 ///   mode: 'boot',        // 'off' (default) | 'stage' | 'boot' | 'serve'
 ///   ratifyTimeout: '5s', // lease; unratified work is killed at expiry

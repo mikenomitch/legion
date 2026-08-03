@@ -336,15 +336,15 @@ Legion job, one per node**, so the cluster schedules and supervises it for you.
 Two ready jobspecs ship in [`configs/jobs/`](../configs/jobs/):
 
 ```bash
-legion job run configs/jobs/otel-log-shipper.jsonnet     # OpenTelemetry Collector
+legion job run configs/jobs/otel-log-shipper.ncl     # OpenTelemetry Collector
 # or
-legion job run configs/jobs/vector-log-shipper.jsonnet   # Vector
+legion job run configs/jobs/vector-log-shipper.ncl   # Vector
 ```
 
 How they work:
 
-- **One per node** via `count: { num: 1, per: "id" }`. Legion's scheduler groups
-  eligible nodes by their unique node **id**, so `per: "id"` places exactly one
+- **One per node** via `count = { num = 1, per = "id" }`. Legion's scheduler groups
+  eligible nodes by their unique node **id**, so `per = "id"` places exactly one
   allocation on every node — the daemonset/system-job pattern. New nodes get a
   shipper automatically.
 - **Reads every allocation's logs** because the shipper runs as an `exec` task: it
@@ -352,7 +352,7 @@ How they work:
   containing `.legion/`), so the relative `filelog`/`file` glob
   `.legion/workers/*/logs/*/*.log` matches all of that node's task logs.
 - The collector config/Vector config is materialized on the node via the exec
-  task's `files:` field — no external config distribution needed.
+  task's `files` field — no external config distribution needed.
 
 Edit the endpoint at the top of the jobspec (`otlpEndpoint` / `lokiEndpoint`)
 before running.

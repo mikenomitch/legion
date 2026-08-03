@@ -43,7 +43,7 @@
 
 ### Also Nice
 
-* Nicer Config language (jsonnet)
+* Nicer Config language (nickel)
 * Sqlite interface for state
   * Makes for nicer nicer o11y and devex
 

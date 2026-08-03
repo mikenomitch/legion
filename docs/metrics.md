@@ -21,13 +21,13 @@ read-only operational data — no secrets, tokens, or job payloads.
 
 Optional `telemetry` block in the manager config:
 
-```jsonnet
+```nickel
 {
-  server: { port: 4747, host: "127.0.0.1" },
-  // ...
-  telemetry: {
-    enabled: true,   // default: true
-    port: 4749,      // default: server.port + 2
+  server = { port = 4747, host = "127.0.0.1" },
+  # ...
+  telemetry = {
+    enabled = true,   # default: true
+    port = 4749,      # default: server.port + 2
   },
 }
 ```
@@ -96,7 +96,7 @@ into a single series with every label set to `"other"`.
 - **`legion_preemption_plans_total{outcome}`** (counter) — preemption passes
   that reached a decision. `placed` means victims were evicted and the
   preemptor placed; `observe` means the pass ran under
-  `preemption.mode: observe` and committed nothing; `no_victims` means
+  `preemption.mode = "observe"` and committed nothing; `no_victims` means
   preemption was enabled, ran, and still found nothing it was allowed to take.
   Comparing `observe` against zero is how an operator sizes the blast radius
   before switching to `enforce`; a rising `no_victims` is a capacity signal —

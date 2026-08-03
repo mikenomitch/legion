@@ -35,7 +35,7 @@ This file captures current conventions used across Legion.
 
 - Protobuf schema in `proto/legion.proto` is the source of gRPC API contracts.
 - Most Rust structs use `camelCase` serde naming for API/config consistency.
-- Jsonnet is first-class for manager/job/worker config inputs.
+- Nickel is first-class for manager/job/worker config inputs.
 
 ## Scheduler and Eval Conventions
 

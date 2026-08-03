@@ -1,6 +1,6 @@
 # Job Templates
 
-Job templates are cluster-resident, versioned Jsonnet documents with
+Job templates are cluster-resident, versioned Nickel documents with
 declared, typed variables. A platform team publishes a template once;
 anyone with access can then submit jobs from it — from the CLI, the UI's
 guided form, or over gRPC/MCP — by supplying just the variable values. The
@@ -15,8 +15,8 @@ templates, without granting general job submission. See
 ## Why templates exist
 
 Without templates, every submitter needs the full jobspec and a local
-Jsonnet toolchain (`legion job run` renders client-side). That makes reuse
-an out-of-band problem (copying `.jsonnet` files around), makes guided
+Nickel evaluator (`legion job run` evaluates client-side). That makes reuse
+an out-of-band problem (copying `.ncl` files around), makes guided
 submission impossible for thin clients like the UI, and makes delegation
 all-or-nothing: `job:write` lets a token submit *any* spec. Templates move
 the spec to the cluster, the rendering to the manager, and the authorization
@@ -24,39 +24,43 @@ boundary to "this template, with these knobs".
 
 ## Writing a template
 
-A template is **one self-contained Jsonnet file** that evaluates to an
-object with optional `description` and `variables` fields and a hidden
-`job(vars)::` function returning the jobspec:
+A template is **one self-contained Nickel file** that evaluates to a record
+with optional `description` and `variables` fields and a
+`job | not_exported = fun vars => …` function returning the jobspec:
 
-```jsonnet
+```nickel
 {
-  description: 'Render a demo scene on the cluster.',
-  variables: [
-    { key: 'scene', type: 'string', label: 'Scene name', description: 'Short slug.' },
-    { key: 'frames', type: 'number', default: 4 },
-    { key: 'quality', type: 'select', options: ['draft', 'final'], default: 'draft' },
-    { key: 'debug', type: 'boolean', default: false },
+  description = "Render a demo scene on the cluster.",
+  variables = [
+    { key = "scene", type = "string", label = "Scene name", description = "Short slug." },
+    { key = "frames", type = "number", "default" = 4 },
+    { key = "quality", type = "select", options = ["draft", "final"], "default" = "draft" },
+    { key = "debug", type = "boolean", "default" = false },
   ],
-  job(vars):: {
-    name: 'render-' + vars.scene,
-    tasks: [{
-      name: 'render',
-      runtime: 'exec',
-      count: vars.frames,
-      config: { command: ['echo', 'render ' + vars.scene] },
+  job | not_exported = fun vars => {
+    name = "render-%{vars.scene}",
+    tasks = [{
+      name = "render",
+      runtime = "exec",
+      count = vars.frames,
+      config = { command = ["echo", "render %{vars.scene}"] },
     }],
   },
 }
 ```
 
-Evaluating the file yields the manifest — hidden fields (`::`) are not
-emitted — which is how the manager reads the metadata without needing
-variable values. Rendering calls `template.job(vars)` with **one native JSON
-object**: `vars.frames` is a number, `vars.debug` a boolean, `vars.regions`
-an array. There is no `std.extVar` string parsing.
+`default` is a Nickel keyword, which is why it appears as a quoted field
+name in the variable definitions. It is an ordinary data field here — not
+Nickel's `| default` merge annotation.
+
+Exporting the file yields the manifest: `| not_exported` drops `job` from
+the export, which is how the manager reads the metadata without needing
+variable values. Rendering applies `template.job` to **one native Nickel
+record**: `vars.frames` is a number, `vars.debug` a boolean, `vars.regions`
+an array. Nothing is passed as a string to be re-parsed.
 
 A worked example lives at
-[`configs/templates/render.jsonnet`](../configs/templates/render.jsonnet).
+[`configs/templates/render.ncl`](../configs/templates/render.ncl).
 
 ### Variable definitions
 
@@ -69,7 +73,7 @@ Each entry in `variables`:
 | `label`, `description` | Optional; used by the UI form. Label defaults to the key. |
 | `default` | Optional typed JSON value (`4`, `false`, `["us"]`). |
 | `options` | Required for `select`/`multi_select`, forbidden otherwise. |
-| `required` | Defaults to **true when there is no `default`**, false otherwise. `required: false` with no default renders as `null`. |
+| `required` | Defaults to **true when there is no `default`**, false otherwise. `required = false` with no default renders as `null`. |
 
 At submit time the manager merges provided values with defaults, rejects
 unknown keys, and type-checks everything. Strings are leniently coerced
@@ -88,10 +92,13 @@ instead of at someone else's submit.
 
 Rendering runs on the manager, with limits:
 
-- **No imports.** `import` and `importstr` fail with
-  `imports are not allowed in job templates`. A template is one file.
+- **No imports.** Any use of the `import` keyword is rejected before
+  evaluation starts, at publish time as well as at render time, with
+  `imports are not allowed here; the source must be self-contained`. A
+  template is one file. Rejection is lexical (the source is tokenized), so
+  the word "import" inside a string or a comment is not a false positive.
 - Source is capped at 512 KiB, the variables payload at 64 KiB.
-- One render gets a 5-second wall-clock budget. Jsonnet cannot be
+- One render gets a 5-second wall-clock budget. Nickel cannot be
   interrupted mid-evaluation, so a runaway render is abandoned (the thread
   keeps a core busy until it finishes) and the request fails with
   `template rendering exceeded the 5s limit`.
@@ -100,11 +107,11 @@ Rendering runs on the manager, with limits:
 
 ```bash
 # Publish (creates version 1; publishing again appends version 2, 3, …)
-legion template create render -f configs/templates/render.jsonnet
+legion template create render -f configs/templates/render.ncl
 
 # Browse
 legion template list
-legion template get render            # variables, history; --source for the Jsonnet
+legion template get render            # variables, history; --source for the Nickel
 legion template get render --version 1
 
 # Dry run: validate variables and print the rendered jobspec
@@ -173,15 +180,15 @@ Two additions to the [ACL model](auth-and-acls.md):
 The delegation recipe — an account that can only submit via the `render`
 template, and can see and stop only the jobs it produces:
 
-```jsonnet
+```nickel
 [
-  { resources: ['template'], actions: ['read'], templates: ['render'] },
-  { resources: ['job'], actions: ['read', 'write'], templates: ['render'] },
+  { resources = ["template"], actions = ["read"], templates = ["render"] },
+  { resources = ["job"], actions = ["read", "write"], templates = ["render"] },
 ]
 ```
 
 With that policy, `legion template run render …` succeeds while
-`legion job run anything.jsonnet` returns `PermissionDenied`; `job list`
+`legion job run anything.ncl` returns `PermissionDenied`; `job list`
 shows only jobs created from `render`; the UI shows only the pages and
 templates the token can use.
 
@@ -216,11 +223,11 @@ Details worth knowing:
 
 | Symptom | Cause |
 | --- | --- |
-| `template must declare a hidden job(vars):: function` at create | The source's `job` field is missing or not hidden/function-typed. |
+| `template must declare a job function field` at create | The source has no `job` field, or `job` is not a function. |
 | `trial render with defaults failed: …` at create | Every variable has a default, so the manager rendered the template and the result was invalid. Fix the template, not the submit. |
 | `variable 'x' is required` / `variable 'x': expected a number …` at run | Missing or mistyped value; `unknown variable 'x'` means a typo'd key. |
-| `imports are not allowed in job templates` | The template (or a value rendered into it) used `import`/`importstr`. Inline everything. |
-| `template rendering exceeded the 5s limit` | Runaway or extremely heavy Jsonnet. Simplify the template. |
+| `imports are not allowed here` | The template used the `import` keyword. Inline everything. |
+| `template rendering exceeded the 5s limit` | Runaway or extremely heavy Nickel. Simplify the template. |
 | `FAILED_PRECONDITION: job 'x' already exists and was not created from template …` | The collision guard (see above). |
 | `PermissionDenied: job:write requires a policy granting it` on `template run` | The identity has neither plain `job:write` for the rendered name nor a `templates`-scoped job rule matching this template. |
 

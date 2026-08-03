@@ -63,18 +63,18 @@ trap cleanup EXIT
 
 log "2/3 local manager + $NODES-node simulated fleet"
 mkdir -p "$WORK/manager"
-cat >"$WORK/manager/config.jsonnet" <<EOF
+cat >"$WORK/manager/config.ncl" <<EOF
 {
-  storePath: '$WORK/manager/store',
-  workerConfigPath: '$REPO_ROOT/configs/workers/',
-  // Same benchmark defaults as the scenario runner: noop tasks with no
-  // declared resources must fit anywhere.
-  taskResourceDefaults: { cpu: 0, memory: 0, allocations: 1000 },
+  storePath = "$WORK/manager/store",
+  workerConfigPath = "$REPO_ROOT/configs/workers/",
+  # Same benchmark defaults as the scenario runner: noop tasks with no
+  # declared resources must fit anywhere.
+  taskResourceDefaults = { cpu = 0, memory = 0, allocations = 1000 },
 }
 EOF
 # exec so $! is the manager itself, not a wrapper subshell — cleanup
 # must kill the real process or failed runs leak a manager on :4747.
-(cd "$WORK/manager" && exec "$LEGION" start manager -c config.jsonnet) >"$WORK/manager.log" 2>&1 &
+(cd "$WORK/manager" && exec "$LEGION" start manager -c config.ncl) >"$WORK/manager.log" 2>&1 &
 MANAGER_PID=$!
 export LEGION_ADDR="http://127.0.0.1:4747"
 

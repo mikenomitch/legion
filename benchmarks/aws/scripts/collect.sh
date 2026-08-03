@@ -140,7 +140,7 @@ log "writing fairness record"
     echo "}"
 } >"$DEST/fairness-record.json"
 # The exact rendered config the control plane ran with.
-rsh "${CP_ADDRS[0]}" "cat /opt/legion/configs/manager.jsonnet 2>/dev/null || cat /etc/nomad.d/server.hcl 2>/dev/null || sudo cat /etc/kubernetes/kubeadm-config.yaml 2>/dev/null" \
+rsh "${CP_ADDRS[0]}" "cat /opt/legion/configs/manager.ncl 2>/dev/null || cat /etc/nomad.d/server.hcl 2>/dev/null || sudo cat /etc/kubernetes/kubeadm-config.yaml 2>/dev/null" \
     >"$DEST/control-plane-config" 2>/dev/null || true
 
 log "archiving to s3://$BUCKET/campaigns/$CAMPAIGN/$RUN.tar.gz"

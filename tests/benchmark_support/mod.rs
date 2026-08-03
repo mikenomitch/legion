@@ -281,7 +281,7 @@ pub fn insert_fleet(store: &Store, scenario: &SchedulerScenario) -> anyhow::Resu
 
 pub fn submit_jobs(store: &Store, scenario: &SchedulerScenario) -> anyhow::Result<Vec<String>> {
     let submission = Submission {
-        path: "benchmark.jsonnet".into(),
+        path: "benchmark.ncl".into(),
         content: "{}".into(),
         is_primary: true,
     };

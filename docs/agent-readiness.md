@@ -81,12 +81,12 @@ Even with `--allow-write`, `legion_state_query` is forced to read-only.
 | `legion_job_scale_status` | no | Per-task spec vs override vs effective counts. |
 | `legion_job_destroy` | **yes** | Destroy a job. |
 | `legion_template_run` | **yes** | Render a template with variables and submit the job (supports `idempotency_key`). |
-| `legion_template_upsert` | **yes** | Store Jsonnet as the next immutable version of a template. |
+| `legion_template_upsert` | **yes** | Store Nickel as the next immutable version of a template. |
 | `legion_template_delete` | **yes** | Delete a template and all of its versions (running jobs are unaffected). |
 | `legion_instance_create` | **yes** | Create a keyed-mode stateful instance (never-recycled id; supports `idempotency_key`). |
 | `legion_instance_destroy` | **yes** | Destroy a keyed instance, stop its allocation, drop its storage (supports `idempotency_key`). |
 | `legion_instance_replace` | **yes** | Force-replace an instance's allocation stuck on a LOST node (skips the `onLost.replaceAfter` loss-confirmation gate; split-brain risk if the node is only partitioned; supports `idempotency_key`). |
-| `legion_volume_delete` | **yes** | Delete a volume and reclaim its storage. DESTROYS DATA; `force: true` tombstones without driver confirmation for a node that is gone for good (supports `idempotency_key`). |
+| `legion_volume_delete` | **yes** | Delete a volume and reclaim its storage. DESTROYS DATA; `force = true` tombstones without driver confirmation for a node that is gone for good (supports `idempotency_key`). |
 | `legion_boot_ticket_create` | **yes** | Mint a boot ticket: a short-lived capability letting one edge node start one workload without a manager call ([edge-boot.md](edge-boot.md)). Revocable only by expiry, so prefer short TTLs (supports `idempotency_key`). |
 
 Tool errors are returned in-band (`result.isError = true` with a text payload),
@@ -129,14 +129,14 @@ and the MCP `tools/list`; keep it in sync when adding operations
 
 ## 4. Authoring jobs: schema + validate
 
-Agents author far more reliably against a schema than against free-form Jsonnet.
+Agents author far more reliably against a schema than against free-form Nickel.
 
 ```bash
 # Get the jobspec JSON Schema, including the live per-runtime task config schemas:
 legion job schema --json
 
 # Render and deeply validate a jobspec WITHOUT submitting it:
-legion job validate ./configs/jobs/demo.jsonnet --json
+legion job validate ./configs/jobs/demo.ncl --json
 ```
 
 `job validate` runs the exact validation the manager applies on submit
@@ -175,11 +175,11 @@ An agent authoring a multi-task system should never have to invent, inject, or
 reconcile addresses. Declare the producer's port once and let the consumer name
 the service ([Service Discovery](service-discovery.md)):
 
-```jsonnet
-// producer
-service: { port: 8080, allow: ["api"] },      // allow is optional; omit = any job
-// consumer
-connect: { upstreams: [{ service: "db", balance: "least_conn" }] },
+```nickel
+# producer
+service = { port = 8080, allow = ["api"] },      # allow is optional; omit = any job
+# consumer
+connect = { upstreams = [{ service = "db", balance = "least_conn" }] },
 ```
 
 The consumer's task then dials `$LEGION_UPSTREAM_DB` (`127.0.0.1:<port>`) and
@@ -234,7 +234,7 @@ Mutating job operations accept an optional idempotency key so an agent can retry
 after a timeout without risking a double-apply:
 
 ```bash
-legion job run demo.jsonnet --idempotency-key deploy-2026-05-29-001
+legion job run demo.ncl --idempotency-key deploy-2026-05-29-001
 legion job stop demo        --idempotency-key stop-demo-001
 legion job destroy demo     --idempotency-key destroy-demo-001
 legion instance create sandbox-demo --id user-42 --idempotency-key sbx-user-42
@@ -252,7 +252,7 @@ deduplication.
 
 ```bash
 # Submit and block until the resulting rollout converges:
-legion job run demo.jsonnet --wait --timeout 180 --json
+legion job run demo.ncl --wait --timeout 180 --json
 
 # Or wait on an existing job's latest rollout:
 legion job wait demo --json
@@ -265,7 +265,7 @@ tracked `rolloutId`. A non-converged wait exits non-zero.
 
 > **Scope note:** `wait` tracks **rollouts**, which are the convergence signal for
 > updates to existing jobs. A brand-new job with no prior version has no rollout
-> to track and reports `status: "no_rollout"`. For deeper post-deploy inspection,
+> to track and reports `status = "no_rollout"`. For deeper post-deploy inspection,
 > use rollout events and the state store (below).
 
 Other loop-closing signals available to agents today:
@@ -427,8 +427,8 @@ All client commands and the MCP server honour:
    (or `legion template run … --idempotency-key … --wait`).
 6. **Verify**: inspect the `wait` result, `rollout events`, and `state query`.
 
-Prefer read-only operations; treat anything with `mutates: true` /
-`readOnlySafe: false` as requiring confirmation.
+Prefer read-only operations; treat anything with `mutates = true` /
+`readOnlySafe = false` as requiring confirmation.
 
 **Reacting to being stopped.** An agent-run task is told when the platform is
 shutting it down: `LEGION_STOP_NOTICE_PATH` names a JSON file written just

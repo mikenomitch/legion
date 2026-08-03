@@ -519,14 +519,14 @@ fn tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "legion_template_upsert",
-            description: "Store Jsonnet source as the next immutable version of a job template. Mutating.",
+            description: "Store Nickel source as the next immutable version of a job template. Mutating.",
             input_schema: || json!({
                 "type": "object",
                 "properties": {
                     "name": { "type": "string", "description": "Template name (lowercase, digits, dashes)." },
-                    "source_jsonnet": { "type": "string", "description": "Self-contained template source with a hidden job(vars):: function." }
+                    "source_nickel": { "type": "string", "description": "Self-contained template source with a `job | not_exported = fun vars => ...` function." }
                 },
-                "required": ["name", "source_jsonnet"],
+                "required": ["name", "source_nickel"],
                 "additionalProperties": false
             }),
             mutates: true,
@@ -1201,11 +1201,11 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
         }
         "legion_template_upsert" => {
             let name = str_arg(&args, "name")?;
-            let source_jsonnet = str_arg(&args, "source_jsonnet")?;
+            let source_nickel = str_arg(&args, "source_nickel")?;
             let mut client = connect().await?;
             grpc(client.upsert_job_template(UpsertJobTemplateRequest {
                 name,
-                source_jsonnet,
+                source_nickel,
             }))
             .await
         }

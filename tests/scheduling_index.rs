@@ -68,7 +68,7 @@ fn insert_fleet(store: &Store) {
 
 fn submit_job(store: &Store, job: &JobConfig) -> String {
     let submission = Submission {
-        path: "test.jsonnet".into(),
+        path: "test.ncl".into(),
         content: "{}".into(),
         is_primary: true,
     };

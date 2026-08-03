@@ -1,6 +1,6 @@
 //! `legion template` — manage and run cluster-resident job templates.
 //!
-//! Templates are versioned Jsonnet documents with declared, typed variables,
+//! Templates are versioned Nickel documents with declared, typed variables,
 //! rendered server-side (see docs/job-templates.md). `create` uploads a new
 //! version, `run` renders one with `--var` values and submits the result as
 //! a job, and `render` is the dry-run twin of `run`.
@@ -62,7 +62,7 @@ pub fn config() -> Command {
                         .value_name("PATH")
                         .required(true)
                         .value_hint(ValueHint::FilePath)
-                        .help("Path to the template Jsonnet source"),
+                        .help("Path to the template Nickel source"),
                 )
                 .arg(json_flag()),
         )
@@ -88,7 +88,7 @@ pub fn config() -> Command {
                     Arg::new("source")
                         .long("source")
                         .action(ArgAction::SetTrue)
-                        .help("Print the raw Jsonnet source instead of the summary"),
+                        .help("Print the raw Nickel source instead of the summary"),
                 )
                 .arg(json_flag()),
         )
@@ -239,7 +239,7 @@ async fn create_template(matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(matches);
     let name = required_name(matches);
     let path = matches.get_one::<String>("file").expect("file is required");
-    let source_jsonnet = std::fs::read_to_string(path).map_err(|error| {
+    let source_nickel = std::fs::read_to_string(path).map_err(|error| {
         output::fail_local(
             format,
             CliError::local(
@@ -257,7 +257,7 @@ async fn create_template(matches: &ArgMatches) -> R<()> {
         client
             .upsert_job_template(tonic::Request::new(UpsertJobTemplateRequest {
                 name: name.clone(),
-                source_jsonnet,
+                source_nickel,
             }))
             .await,
     )?;
@@ -341,7 +341,7 @@ async fn get_template(matches: &ArgMatches) -> R<()> {
         return Ok(());
     }
     if matches.get_flag("source") {
-        println!("{}", template.source_jsonnet);
+        println!("{}", template.source_nickel);
         return Ok(());
     }
 

@@ -192,7 +192,7 @@ impl VolumeDriver for LocalDirDriver {
 
 /// Claims a path the operator declared in the worker config:
 ///
-/// ```jsonnet
+/// ```nickel
 /// hostVolumes: {
 ///   models: { path: '/mnt/models', readOnly: true },
 ///   pgdata: { path: '/mnt/nvme0/pg', create: true },
