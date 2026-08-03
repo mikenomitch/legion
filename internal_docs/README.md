@@ -95,6 +95,7 @@ When one is required and what goes in it:
 | [service-discovery-critique.md](plans/service-discovery-critique.md) | superseded (self-critique) |
 | [stateful-workloads-and-instance-identity-plan.md](plans/stateful-workloads-and-instance-identity-plan.md) | shipped |
 | [task-runtime-rename-plan.md](plans/task-runtime-rename-plan.md) | shipped |
+| [typed-jsonnet-plan.md](plans/typed-jsonnet-plan.md) | planned (derived schema → generated `legion.libsonnet` → `legion job check` → `legion lsp`) |
 | [ui-jump-hints-plan.md](plans/ui-jump-hints-plan.md) | shipped |
 | [workload-identity-oidc-plan.md](plans/workload-identity-oidc-plan.md) | shipped (task identities) |
 | [volume-plugin-system-plan.md](plans/volume-plugin-system-plan.md) | shipped (v1; CSI bridge + snapshot/clone deferred) |
@@ -143,6 +144,7 @@ by project impact. The full template and a worked example:
 - [service-discovery-final-plan_calls.md](calls/service-discovery-final-plan_calls.md)
 - [shared-alloc-dir-proposal_calls.md](calls/shared-alloc-dir-proposal_calls.md)
 - [stateful-workloads-and-instance-identity-plan_calls.md](calls/stateful-workloads-and-instance-identity-plan_calls.md)
+- [typed-jsonnet-plan_calls.md](calls/typed-jsonnet-plan_calls.md)
 - [volume-plugin-system-plan_calls.md](calls/volume-plugin-system-plan_calls.md)
 - [worker-simulation-plan_calls.md](calls/worker-simulation-plan_calls.md)
 - [workload-identity-oidc-plan_calls.md](calls/workload-identity-oidc-plan_calls.md)

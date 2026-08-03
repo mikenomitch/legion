@@ -976,6 +976,60 @@ The Pack/Helm equivalent. Job templates are in flight on
       `legion prep`, plus a context file
 - [ ] Buildpack runner
 
+## Jobspec authoring & editor tooling
+
+plan: [typed-jsonnet-plan.md](plans/typed-jsonnet-plan.md) (PLANNED) ·
+[calls](calls/typed-jsonnet-plan_calls.md)
+
+"Typed jsonnet": every mistake a type system would have caught becomes an error
+with a file, a line, and a suggested fix, raised while the author is typing.
+Nothing here is built. Phase 0 is the prerequisite for the rest and is worth
+landing on its own.
+
+- [ ] **Phase 0 — one derived jobspec schema.** Derive `JsonSchema` on
+      `JobConfigInput` / `TaskConfigInput` (`src/structs/job.rs:1992`, `:2020`)
+      and delete the hand-written `build_jobspec_schema` literal
+      (`src/cmd/job.rs:607`), which feeds `legion job schema`, the
+      `legion_job_schema` MCP tool, and the UI today with nothing enforcing
+      that it matches the structs. Adds `x-legion-*` extension keys (formats,
+      cluster-object refs, cross-field rules, version skew) and the
+      round-trip/coverage tests over `configs/jobs/`.
+- [ ] **Unknown jobspec fields are silently dropped.** Neither
+      `JobConfigInput` nor `TaskConfigInput` sets `deny_unknown_fields`, so
+      `prioritee: "high"` parses and the job runs at `normal`. Closing them is
+      part of Phase 0, shipped as a warning for one release and promoted to an
+      error in the next minor — [plan §10](plans/typed-jsonnet-plan.md),
+      [calls #3](calls/typed-jsonnet-plan_calls.md). **The promotion is the
+      work that must not be forgotten.**
+- [ ] **Phase 1 — `legion.libsonnet`, generated from the schema**, plus
+      `legion jsonnet vendor`, a CI regenerate-and-diff drift test, and
+      `configs/jobs/maximal-typed.jsonnet` proving it renders identically to
+      `maximal.jsonnet`. Gives completion and hover in any editor that already
+      has a jsonnet LSP, before we ship one.
+- [ ] **Phase 2 — `legion job check`** with rustc-style positioned
+      diagnostics, `--json` in LSP shape, and a `legion_jobspec_check` MCP
+      tool. `legion job validate` stays as-is ([calls #9](calls/typed-jsonnet-plan_calls.md)).
+- [ ] **Phase 3 — `legion lsp`** (`tower-lsp`): diagnostics on change,
+      completion discriminated by a task's `runtime`, hover from the schema
+      descriptions, go-to-definition; plus a VS Code extension and editor
+      snippets.
+- [ ] **Phase 4 — cluster-aware completion and the UI editor.** `x-legion-ref`
+      fields complete from a live manager (opt-in, off by default), code
+      actions, a `GetJobSchema` RPC, Monaco in the UI.
+- [ ] **Phase 5 backlog** — cluster-config (manager/worker) schemas and their
+      library, exact position provenance via an instrumented evaluator,
+      `legion fmt`, deprecation lints from `x-legion-since`.
+- [ ] **Decide the jsonnet implementation.** The LSP wants an AST for position
+      mapping, which the C++ `jsonnet-rs` fork (`Cargo.toml:12`) does not give
+      us. The plan introduces jrsonnet in the LSP only and gates converging on
+      it for the submit path behind a differential-evaluation test over
+      `configs/jobs/` — two evaluators is the plan's biggest risk
+      ([plan §11](plans/typed-jsonnet-plan.md), [calls #6](calls/typed-jsonnet-plan_calls.md)).
+- [ ] **Write `docs/typed-jobspecs.md`** when Phase 1 lands: the library, the
+      check command, per-editor setup, the diagnostic code index, and the known
+      limitations (lazy fields behind false conditionals, approximate positions
+      in computed specs, the offline/online completion split).
+
 ## Ecosystem apps (the omakase experience)
 
 Each of these should run inside the core binary *and* be splittable into its own
