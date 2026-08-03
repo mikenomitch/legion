@@ -160,8 +160,20 @@ for N in $STEPS; do
         }
         | .healthy = (
             .registered != null and .target != null and .registered >= .target
-            and (.registration_errors_per_sec // 1) == 0
-            and (.heartbeats_failed_per_sec // 1) == 0
+            # Absent means ZERO here, not "assume the worst". Both series
+            # are counters selected by a failure label
+            # (`outcome!="ok"`, `outcome="error"`), and Prometheus does
+            # not create a series until it is first incremented — so a
+            # fleet that never failed reports nothing at all. Defaulting
+            # those to 1 made a clean run indistinguishable from a broken
+            # one, and no step could ever be HEALTHY: the drill reported
+            # "no healthy step, even the lowest saturated" on a fleet
+            # sitting at 96% cadence and 0.26s p99. Safe because
+            # `.measured` below already fails the step outright if the
+            # worker telemetry is missing, which is the case `// 1` was
+            # reaching for.
+            and (.registration_errors_per_sec // 0) == 0
+            and (.heartbeats_failed_per_sec // 0) == 0
             and (.cpu_utilization // 1) < 0.85
             and (.memory_utilization // 1) < 0.85
             and (.cadence_ratio // 0) >= 0.95
