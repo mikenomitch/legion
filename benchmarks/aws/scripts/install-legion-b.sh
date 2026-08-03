@@ -62,7 +62,11 @@ deadline=$(($(date +%s) + 300))
 PRIMARY=""
 while [ -z "$PRIMARY" ]; do
     for idx in 0 1 2; do
-        if curl -fsS -m 3 "http://${CP_ADDRS[$idx]}:4749/readyz" >/dev/null 2>&1; then
+        # Probed the same way as install-legion-a: 4749 is intra-rig
+        # only, so a direct curl from an operator box never succeeds and
+        # every node would look like a standby forever. See
+        # rig_http_ready in env.sh.
+        if rig_probe_once "${CP_ADDRS[$idx]}" 4749/readyz; then
             PRIMARY="cp-$idx (${CP_ADDRS[$idx]})"
             break
         fi

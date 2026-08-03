@@ -242,6 +242,46 @@ wait_for_ssh() { # wait_for_ssh <ip> [timeout-secs]
     done
 }
 
+# Wait for an HTTP endpoint that lives ON a rig box, from wherever this
+# script happens to be running.
+#
+# This exists because `wait_for_http` below probes from the local machine,
+# and off-rig that can only reach what security.tf opens to admin_cidr:
+# SSH, Grafana (3000), and Prometheus (9090). Everything else the rig
+# serves — the manager's health/metrics port 4749, node_exporter's 9100,
+# Nomad's 4646 — is intra-rig only, so polling it from an operator box
+# does not fail because the service is unhealthy. It fails because the
+# packet never arrives, and the timeout then reports a perfectly healthy
+# manager as dead. Run the probe on the box itself instead.
+#
+# On-rig, poll directly: the private IP matches the security group's
+# `self` rule, and there is no ssh hop worth paying for.
+# Single non-blocking probe, same addressing rule as rig_http_ready.
+# For callers polling several boxes to find one that answers.
+rig_probe_once() { # rig_probe_once <ip> <port/path>
+    if [ "$BENCH_ON_RIG" = 1 ]; then
+        curl -fsS -m 3 "http://$1:$2" >/dev/null 2>&1
+    else
+        rsh "$1" "curl -fsS -m 3 'http://localhost:$2' >/dev/null 2>&1"
+    fi
+}
+
+rig_http_ready() { # rig_http_ready <ip> <port/path> [timeout-secs]
+    local ip="$1" suffix="$2" timeout="${3:-180}"
+    if [ "$BENCH_ON_RIG" = 1 ]; then
+        wait_for_http "http://$ip:$suffix" "$timeout"
+        return
+    fi
+    rsh "$ip" "for _ in \$(seq 1 $((timeout / 5))); do
+                   curl -fsS -m 3 'http://localhost:$suffix' >/dev/null 2>&1 && exit 0
+                   sleep 5
+               done
+               exit 1" || {
+        echo "timed out waiting for http://localhost:$suffix on $ip" >&2
+        return 1
+    }
+}
+
 wait_for_http() { # wait_for_http <url> [timeout-secs]  (runs locally)
     local url="$1" timeout="${2:-180}" start
     start=$(date +%s)

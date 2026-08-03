@@ -32,23 +32,13 @@ for ip in "${CP_ADDRS[@]}" "$LOADGEN_ADDR"; do
         exit 1
     fi
     # node_exporter listens on 9100, which security.tf opens ONLY
-    # intra-rig (the `self` rule) — deliberately not to admin_cidr. So a
-    # direct poll can succeed on-rig and can never succeed off-rig, where
-    # it burns its full timeout on every box before the ssh fallback does
-    # the real check. That was ~8 minutes of guaranteed-useless waiting
-    # per bringup. Branch on where we are instead.
-    if [ "$BENCH_ON_RIG" = 1 ]; then
-        wait_for_http "http://$ip:9100/metrics" 120
-    else
-        rsh "$ip" 'for _ in $(seq 1 24); do
-                       curl -fsS -m 3 http://localhost:9100/metrics >/dev/null 2>&1 && exit 0
-                       sleep 5
-                   done
-                   exit 1' || {
-            echo "node_exporter never came up on $ip" >&2
-            exit 1
-        }
-    fi
+    # intra-rig — so probing it from an operator box could never succeed
+    # and used to burn a full 120s timeout per box. rig_http_ready picks
+    # the addressing that can actually work here.
+    rig_http_ready "$ip" 9100/metrics 120 || {
+        echo "node_exporter never came up on $ip" >&2
+        exit 1
+    }
 done
 
 "$(dirname "$0")/install-loadgen.sh"

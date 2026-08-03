@@ -53,7 +53,7 @@ rsh "$LOADGEN_ADDR" "
 
 log "starting Prometheus + Grafana"
 rsh "$LOADGEN_ADDR" "cd /opt/bench/observability && sudo docker compose up -d"
-wait_for_http "http://$LOADGEN_ADDR:9090/-/ready" 120
+rig_http_ready "$LOADGEN_ADDR" "9090/-/ready" 120
 # Public IPs here on purpose: these two are for a human's browser, and
 # the dashboards are only reachable from admin_cidr.
 log "Grafana: http://$LOADGEN_PUBLIC_IP:3000  Prometheus: http://$LOADGEN_PUBLIC_IP:9090"
