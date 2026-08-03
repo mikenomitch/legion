@@ -36,9 +36,26 @@ use tonic::{transport::Channel, Request, Response, Status, Streaming};
 /// How many simulated nodes share one gRPC channel. HTTP/2 multiplexes
 /// requests over one connection, so a handful of connections carries
 /// thousands of nodes — the same shape nomad-nodesim uses.
-const SIM_NODES_PER_CHANNEL: usize = 256;
+///
+/// 64, not 256, because 256 was above the knee. Measured on a real rig
+/// (c7i.2xlarge, 3-voter lanes control plane, 2026-08-03) with
+/// `benchmarks/aws/experiments/packing-density.sh`, all on ONE channel:
+///
+///   nodes/channel   heartbeat cadence   heartbeat p99
+///   125             97%                 0.23s
+///   250             66%                 2.47s
+///
+/// The host was at 0% CPU in both cases and the manager answered in
+/// 50ms, so this is queueing on the shared connection, not work. At the
+/// old 256 every fleet ran past that knee by construction, which capped
+/// a simulated instance at ~125 usable nodes and made the fleet — not
+/// the system under test — the bottleneck in any scale measurement.
+const SIM_NODES_PER_CHANNEL: usize = 64;
 /// Never open more than this many channels, however large the fleet.
-const SIM_MAX_CHANNELS: usize = 16;
+/// Raised with the density above so a large fleet still gets enough
+/// connections to stay under the knee: at 64/channel this admits 4,096
+/// nodes per process before density climbs past the measured limit.
+const SIM_MAX_CHANNELS: usize = 64;
 /// Fleet-status summary log cadence.
 const SIM_SUMMARY_INTERVAL: Duration = Duration::from_secs(30);
 /// Heartbeat retry bounds — same values as the real worker loop.
