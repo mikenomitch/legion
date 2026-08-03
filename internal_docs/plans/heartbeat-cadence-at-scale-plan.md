@@ -245,6 +245,13 @@ TTL contract, and the idea that a quantized/stepped scaling function
 now:** gossip. It is the right answer to this problem and it is D8; it
 changes where liveness lives, and this plan deliberately does not.
 
+> **Now owned elsewhere.** Moving liveness off the raft path is specified
+> in [`liveness-off-the-raft-path-plan.md`](liveness-off-the-raft-path-plan.md),
+> written after this one. That plan owns the failover-grace behavior this
+> plan's phase 3 describes; where the two disagree, it wins. This plan
+> still owns cadence itself — the interval workers are served, the sizing
+> guidance, and the warnings.
+
 **Sources.** [KEP-589](https://github.com/kubernetes/enhancements/blob/master/keps/sig-node/589-efficient-node-heartbeats/README.md) ·
 [K8s nodes concept](https://kubernetes.io/docs/concepts/architecture/nodes/) ·
 [kubelet config v1beta1](https://kubernetes.io/docs/reference/config-api/kubelet-config.v1beta1/) ·

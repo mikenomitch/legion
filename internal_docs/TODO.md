@@ -394,7 +394,20 @@ How to use it:
         opt-in manager-dictated adaptive cadence. It does not raise the
         ~80/s ceiling; it stops the ceiling from marking healthy nodes
         lost, and makes the cadence a run was measured at part of the
-        fairness record. Raising the ceiling itself is still D8.
+        fairness record. Raising the ceiling itself is D8, now planned in
+        [liveness-off-the-raft-path-plan.md](plans/liveness-off-the-raft-path-plan.md)
+        ([calls](calls/liveness-off-the-raft-path-plan_calls.md)) — the
+        AWS probe settled the D8 question the architecture review was
+        waiting on: gp3 48-86 hb/s vs local NVMe ~2000 hb/s on identical
+        code, so the cost is the per-commit fsync. The `spawn_blocking`
+        offload above collected most of the cheap amortization (gp3 to
+        422/s, 84% of cadence at 1000 nodes), so the plan's phase 1 is now
+        a measurement — attribute the residual 16% between the fsync and
+        the single `pipeline_loop` thread per lane — and phases 2-4 take
+        steady-state liveness off raft entirely, replicating only status
+        transitions. Still needed because 84% of cadence at 1000 nodes is
+        6x short of the campaign's 5k step and 12x short of its 10k step,
+        and because `R` remains a property of the disk.
   - [ ] **Status-lane leadership change has no lost-node grace.**
         `nodes_to_mark_lost` (`src/manager/daemon.rs:978`) suppresses
         marking only for the first `DEF_LOST_NODE_AT_SEC` of *process*
@@ -403,8 +416,15 @@ How to use it:
         manager that acquires status-lane leadership mid-life starts
         marking immediately, right after an election during which the
         fleet's heartbeats were failing. Nomad's `failover_heartbeat_ttl`
-        is the prior art; fix is phase 3 of
-        [heartbeat-cadence-at-scale-plan.md](plans/heartbeat-cadence-at-scale-plan.md).
+        is the prior art. **Fix moved:** now phase 2 of
+        [liveness-off-the-raft-path-plan.md](plans/liveness-off-the-raft-path-plan.md)
+        (§6.4, [call 11](calls/liveness-off-the-raft-path-plan_calls.md)),
+        which needs it as its rebuild mechanism rather than as a safety
+        valve — a leader-memory liveness table inherits nothing, so without
+        the grace the first election marks the whole fleet lost. The
+        mass-disruption circuit breaker stays with
+        [heartbeat-cadence-at-scale-plan.md](plans/heartbeat-cadence-at-scale-plan.md)
+        phase 3.
   - [ ] **`heartbeatSeconds` and `stateful.onLost.selfTerminateAfter`
         are unvalidated against each other.** `selfTerminateAfter`
         defaults to 90s (`src/structs/job.rs:1050`) and makes a worker
