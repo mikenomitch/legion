@@ -299,6 +299,35 @@ How to use it:
         `packing-density.sh` during this step: it needs the same
         standing rig and retires the 1,250 assumption before any cell
         is sized from it.
+  - [ ] **Investigate: a 1k simulated fleet sustains ~59 heartbeat
+        RPCs/sec where ~500/sec is expected, with nothing saturated.**
+        Measured on the first real AWS rig (2026-08-03, 1000 sim nodes on
+        one c7i.2xlarge against a 3-voter lanes control plane). The
+        numbers rule out the easy explanations:
+        - sim host CPU **0.2%** of 8 vCPU, memory 3% — the fleet is idle,
+          so this is not the simulator running out of room
+        - manager CPU **19-23%** of 4 vCPU across all three — not
+          saturated either
+        - `legion.Manager/Heartbeat` gRPC **p99 50ms** — the RPC is fast
+        - `legion_heartbeats_total` is per-RPC (`server.rs` increments it
+          once per handler call), so this is not group-commit batching
+          making the counter read low
+        - effective interval works out to ~17s against a 2s
+          `WORKER_HEARTBEAT_DURATION_SEC`, and the drill's heartbeat p99
+          pins at exactly 10s — which is `HEARTBEAT_RETRY_MAX`, hinting
+          the loop is in retry/backoff rather than steady state
+        - node liveness disagrees across the cluster: the leader reports
+          942 active / 58 lost while **both followers report 0 active /
+          1000 lost**. Either follower `legion_nodes{status}` is
+          leader-only by design and mismeasured here, or status is not
+          replicating — worth settling on its own.
+        Next step is the fleet's own worker-side counters
+        (`legion_worker_heartbeats_total{outcome}` on :9101, see
+        docs/metrics.md § Worker) to separate "heartbeats attempted and
+        failing" from "heartbeats never attempted". Until this is
+        understood, `experiments/packing-density.sh` cannot produce a
+        density and every scale step stays sized from the plan's 1,250
+        estimate.
   - [ ] **Warn when a manager binds a wildcard host with no
         `server.advertiseAddr`.** Found the hard way on the first real
         campaign. With `host: '0.0.0.0'` and `advertiseAddr` unset,
