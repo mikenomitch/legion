@@ -1,0 +1,469 @@
+# Judgement Calls: Heartbeat Cadence at Scale
+
+Decisions made while writing
+[`../plans/heartbeat-cadence-at-scale-plan.md`](../plans/heartbeat-cadence-at-scale-plan.md)
+(status PLANNED — these are the plan's calls, not an implementation's;
+entries get appended and re-ranked as phases execute).
+
+**Ordered most-impactful first. The entry number is its rank.**
+
+---
+
+## 1. Adaptive cadence is a pure function of fleet size, never of measured saturation
+
+**Call.** When adaptive cadence is on, the served interval is
+`clamp(ceil(H × active_nodes / targetRatePerSecond), min, max)`, snapped to
+a fixed ladder. Fleet size is the *only* input. The manager never reads its
+own latency, freshness ratio, queue depth, or fsync time to decide how fast
+workers should check in.
+
+```jsonnet
+heartbeat: {
+  targetRatePerSecond: 80,   // what this control plane sustains — YOU measure it
+  minInterval: "2s",
+  maxInterval: "120s",
+}
+```
+
+The operator can compute the manager's answer on paper, before running it.
+
+**Alternatives.** (a) The obvious one, and what "adaptive" usually means:
+close the loop on the thing you actually care about — watch
+`legion_heartbeat_freshness_ratio`, back off when it sags, speed up when it
+recovers. It needs no operator-supplied `R` at all, which is a real
+usability win, and it tracks load sources other than node count (a
+scheduling storm, a noisy neighbor on the EBS volume). (b) Feed both:
+size as the baseline, saturation as a correction term.
+
+**Trade-off.** The operator has to supply `targetRatePerSecond`, measured
+on their own hardware, and it will be stale after they change instance
+types or storage. The controller is also blind to non-heartbeat load: a
+cluster whose managers are saturated by a scheduling storm at 100 nodes
+will not back off, because 100 nodes is under the target. The freshness
+warning (entry 3) is what covers that gap, and it covers it by telling a
+human rather than by acting.
+
+What would make us revisit: evidence from the AWS campaign that `R` swings
+by more than ~2× under realistic mixed load, which would mean a
+size-derived interval is not a good enough proxy in practice.
+
+**Why (performance, and honesty about it).** Closing the loop on
+saturation makes this a genuine control system with a plant delay: back off
+→ load drops → freshness recovers → speed up → load returns → back off.
+Its oscillation period would be set by the liveness tick rate, and — the
+part that makes it unacceptable — **the lost-node window breathes with the
+interval**, so an oscillating controller means an oscillating definition of
+"dead". That is a correctness surface driven by a feedback loop, which is
+not a thing to ship.
+
+It is also the fairness argument. A system that speeds up when it is idle
+and slows down when it is measured is exactly the "silently slows its own
+heartbeats to look better on throughput" failure the brief warns about. A
+pure function of node count cannot do that: at a given fleet size it always
+serves the same interval, benchmark or production. Nomad reached the same
+conclusion — `RateScaledInterval(rate, min, n)` takes `n`, not a latency —
+and Consul's anti-entropy `scaleFactor(nodes)` is the same shape. Two
+HashiCorp products at scale, neither of which closed the loop.
+
+---
+
+## 2. The lost-node window is `missedBeatsBeforeLost × that node's served interval`, and nothing else
+
+**Call.** `DEF_LOST_NODE_AT_SEC = 10` stops being the answer and becomes a
+fallback. The window is derived, per node, from the cadence that node is
+actually running at, stored in a new nullable
+`node_health.lost_after_seconds`. One new knob, defaulting to a value that
+reproduces today exactly:
+
+```jsonnet
+heartbeat: {
+  // 5 x the 2s default = the historical 10s. Unchanged for anyone
+  // who never touches cadence.
+  missedBeatsBeforeLost: 5,
+}
+```
+
+The whole user-facing model is two sentences: *the manager tells workers
+how often to check in; a node is lost after five missed check-ins.*
+
+**Alternatives.** (a) Keep a separate absolute `lostNodeAfter` duration
+alongside `heartbeatSeconds`, validated against each other at config load —
+what an operator coming from Kubernetes would expect, since
+`--node-monitor-grace-period` and `--node-status-update-frequency` are
+independently settable there. (b) Nomad's shape: serve a TTL and add a
+separate server-side `heartbeat_grace` the client is never told about, so
+detection margin is tunable without changing what workers do.
+
+**Trade-off.** Detection margin is no longer independently tunable. An
+operator who wants a 60s cadence with a 90s window cannot have it — they
+get 300s. That is a real loss of expressiveness, and (b) in particular is
+the more sophisticated design: Nomad's hidden grace absorbs network and
+processing delay without inflating the interval the client sleeps for.
+
+**Why (simplicity).** Two independent duration knobs whose relationship
+matters, with nothing enforcing it, is precisely the Kubernetes failure
+mode: the `--node-monitor-grace-period` flag help says it "must be N times
+more than kubelet's nodeStatusUpdateFrequency", and no code checks it. The
+result was v1.32 raising the default from 40s to 50s after an apiserver
+HTTP/2 timeout summing to 45s marked *every node* NotReady. That bug is a
+two-independent-numbers bug.
+
+Making the window a multiple removes the class. It is also what makes
+adaptive cadence safe to build at all — if the window did not follow the
+interval by construction, every back-off would need its own correctness
+argument. And it is what makes the sizing table in the plan legal advice
+rather than a trap: today, every row above `heartbeatSeconds: 3` would
+cause false loss.
+
+The per-node part is not optional even without adaptive cadence, because
+`heartbeatSeconds` is already per **worker type**. A cluster with a 2s
+latency pool and a 60s batch pool cannot have one global cutoff. This
+closes the predecessor plan's first named deferral.
+
+---
+
+## 3. All three options ship, as layers, in the order measure → warn → adapt — and adapt is opt-in
+
+**Call.** Documentation, warning, and adaptive cadence are not competing
+answers to be picked between; they are phases 1, 2, and 4 of one plan, in
+that order. Adaptive cadence ships **off** (`targetRatePerSecond` unset),
+and every benchmark result carries the served interval and freshness ratio
+next to the throughput number.
+
+**Alternatives.** (a) Adaptive only. It is the option that actually fixes
+the correctness bug, and the other two are advice — why ship advice when
+you can ship a fix? (b) Docs + warning only, and treat cadence at scale as
+an operator's sizing problem, which is defensible: Kubernetes ships 5,000
+nodes of static config and no adaptation whatsoever. (c) Adaptive on by
+default, since an operator who has not heard of the problem is exactly the
+one who needs it.
+
+**Trade-off.** The ordering delays the actual fix by three phases, and
+opt-in means the operators most likely to hit the wall — the ones who never
+read the page — get no protection. Both are real costs, accepted.
+
+**Why (simplicity, then performance).** Two reasons the order is not
+negotiable.
+
+The first: an adaptive controller you cannot observe is worse than a fixed
+interval you can. Phase 4's controller is validated by
+`legion_heartbeat_freshness_ratio`, which is phase 1. Its remaining failure
+mode — target rate set too high, or non-heartbeat load — surfaces as the
+phase 2 warning. Shipping (c) first means shipping a mechanism that
+silently changes cluster timing with no way to ask what it did, and the
+first support question is unanswerable.
+
+The second is fairness, and it is why opt-in wins over on-by-default for
+now. The AWS campaign exists to publish Legion-vs-Nomad-vs-K8s numbers. A
+Legion that adapts by default while being benchmarked is open to exactly
+the accusation the brief raises. Off-by-default plus mandatory cadence
+reporting makes the number defensible. Worth stating the other half
+honestly, though: **Nomad adapts too**, by the same `n/rate` formula, so an
+unpinned comparison already favours Nomad against a non-adaptive Legion.
+The fix for that is pinning both and reporting both, not refusing to build
+the feature.
+
+The default flips once the campaign has data — the criterion is written
+into the plan's open question 1 rather than left to taste. This matches how
+`score_sample` and `preemption.mode` shipped: measurable, opt-in, promoted
+on evidence.
+
+---
+
+## 4. Windows widen immediately; they narrow only after the manager sees a beat at the faster cadence
+
+**Call.** When the served interval goes **up**, a node's
+`lost_after_seconds` is widened at the moment the manager decides, *before*
+the worker is told. When it goes **down**, the window stays wide until the
+manager observes that node beating at the new, faster rate.
+
+**Alternatives.** Symmetric update — recompute every node's window from the
+current served interval on every tick. It is one line instead of a state
+rule, and the asymmetry looks like superstition until you write out the
+race.
+
+**Trade-off.** After a speed-up, the cluster carries stale-wide windows for
+up to one old interval, so genuine failures in that gap are detected on the
+old, slower schedule. Bounded, transient, and strictly on the safe side.
+
+**Why (correctness).** The manager decides; the worker finds out one beat
+later; the network may lose the message entirely; an older worker build
+ignores the field forever. Every one of those is a window where the
+manager's belief about a node's cadence is ahead of the node's. Symmetric
+update punishes a worker for obeying the last instruction it actually
+received — which is the exact bug this whole plan exists to prevent,
+re-introduced by the fix. The asymmetry makes the safe direction the
+default in every race.
+
+This is Consul's session-TTL contract, per node: "Consul will not expire
+the session before the TTL is reached, but it is allowed to delay the
+expiration past the TTL." Lower bound guaranteed, upper bound advisory.
+
+---
+
+## 5. The served interval is a quantized ladder with hysteresis, not a continuous `n/rate`
+
+**Call.** `target` is computed continuously, then snapped **up** to the next
+rung of `[2, 3, 5, 8, 13, 21, 34, 55, 89, 120]s` (~1.6× per rung). Step up
+immediately; step down only after `target` has stayed below the next-lower
+rung for 5 minutes.
+
+**Alternatives.** Nomad's continuous form — serve `max(min, n/rate)`
+directly, recomputed per heartbeat from the live timer count. It is simpler
+code, it has no rungs to explain, and it is proven at scale.
+
+**Trade-off.** Granularity: a fleet must grow ~60% to move a rung, so
+between rungs the cluster runs at up to 1.6× the interval it strictly
+needs, which is 1.6× the detection latency it strictly needs. Accepted.
+
+**Why (simplicity, and a schema consequence).** Continuous means the served
+interval changes on nearly every tick, which — given entry 2 — means every
+node's `lost_after_seconds` changes on nearly every tick. Nomad can afford
+that because its heartbeat timers are leader-local soft state in a map;
+Legion's per-node window is a **replicated store column**, so continuous
+recomputation is a fleet-wide write storm on the status lane, caused by the
+feature meant to reduce status-lane load. The ladder turns that into a rare
+event.
+
+The operator-facing half matters as much: ten values an operator can
+memorize, and "what will the manager do at 700 nodes?" answered by reading
+a row. Consul reached for the same device in `agent/ae/ae.go` — doubling
+per octave above 128 nodes — for the same reason, on the same kind of
+central write path. Legion uses finer rungs because a 2× jump in the lost
+window is a bigger deal than a 2× jump in a state-sync interval.
+
+---
+
+## 6. One-shot full-width re-phase on interval change, instead of Nomad's permanent 2× stagger
+
+**Call.** On the beat where a worker's served interval changes, it sleeps
+`U[0, new_interval)` once, then returns to the existing `new_interval ±
+10%` steady state. Nomad's `ttl += RandomStagger(ttl)` — uniform in
+`[base, 2×base)` on *every* beat — is not adopted.
+
+**Alternatives.** Adopt Nomad's stagger wholesale. It is battle-tested, it
+is one line, and it decorrelates continuously rather than only at
+transitions.
+
+**Trade-off.** A one-shot re-phase leaves the fleet on a tighter
+distribution (±10%) in steady state, so a correlated external event — a
+network partition healing, a rack powering on — can still produce a
+partially phase-locked fleet that the ±10% walk decorrelates only slowly.
+Nomad's version would grind that away continuously.
+
+**Why (performance, and predictability).** Nomad's permanent stagger costs
+a third of the target rate forever: uniform on `[base, 2×base)` has mean
+`1.5×base`, so the achieved aggregate is `rate/1.5` — at the documented
+`max_heartbeats_per_second: 50`, about 33/s. Worse for us, it makes the
+operator's `sustainable_nodes ≈ R × I` arithmetic wrong by a variable
+factor, and it doubles worst-case detection time on top of whatever the
+window already allows. The sizing table in the plan is the main
+operator-facing artifact here; a formula that is off by an unstated 1.5×
+undermines it.
+
+The actual herd risk is a *transition* risk — every worker learning about a
+new interval within one old interval and re-phasing onto the same boundary.
+A one-shot `U[0, new)` spreads the fleet uniformly across the new period in
+exactly one beat, which is strictly better at the moment it matters, and
+costs nothing the rest of the time. The ±10% steady-state jitter is also
+already shipped and already the basis for the group-commit batching numbers
+in the predecessor plan; changing it would invalidate those.
+
+---
+
+## 7. Slower failure detection is the accepted price, bounded by `maxInterval` and a warning — not an unbounded back-off
+
+**Call.** Backing off cadence makes real failures take proportionally
+longer to notice: at 1000 nodes with `R ≈ 80`, up to ~125s instead of 10s.
+That is accepted and stated on the public page. The back-off stops at
+`maxInterval` (default 120s), and at the bound the manager serves the
+ceiling and **warns** rather than continuing to slow down.
+
+**Alternatives.** (a) Unbounded back-off — always prefer "no false loss"
+over "timely true loss", and let the interval go wherever the fleet
+requires. (b) Cap the *window* instead of the interval, accepting some
+false loss above a threshold as the lesser evil.
+
+**Trade-off.** Between the bound and the cluster's real ceiling there is a
+band where the manager is knowingly serving an interval it cannot sustain,
+and false loss becomes possible again. We chose to make that band loud
+rather than to make it impossible.
+
+**Why (simplicity, honestly stated).** Unbounded back-off turns a capacity
+problem into a silently-degrading-service problem: a cluster could drift to
+a ten-minute detection window and still report itself healthy, and the
+operator would discover it as "why did a dead node run for ten minutes".
+The bound is where Legion says out loud that the answer is more control
+plane, not more patience. It is also where option (b) — the warning — earns
+its place in the final design rather than being made redundant by option
+(c): the warning at the ceiling is the same warning, saying the same thing,
+for a cluster that has exhausted adaptation.
+
+Nomad accepts the same cost without the bound (100–200s TTL at 5k clients).
+We keep the cost and add the stopping point.
+
+---
+
+## 8. A cluster-wide 50% disruption circuit breaker, applied at detection rather than at eviction
+
+**Call.** If more than 50% of active nodes would be marked lost in a single
+liveness tick, mark **none** of them and log at `error`. Minimum fleet size
+20, below which the rule does not apply.
+
+**Alternatives.** (a) Kubernetes' actual design: mark the nodes NotReady
+regardless, and rate-limit the *consequence* — `--node-eviction-rate` 0.1/s,
+dropping to 0.01/s or to zero when a zone crosses
+`--unhealthy-zone-threshold` (0.55), and stopping entirely when every zone
+is fully disrupted. Truth in the API, safety in the actuator. (b) Nothing —
+rely on `failoverGrace` and adaptive cadence to prevent the situation
+arising.
+
+**Trade-off.** A real correlated outage — one rack, one AZ, one power
+event taking 60% of the fleet — is now *not reflected in node status* until
+the tick where fewer than half are newly silent. The cluster's state will be
+visibly wrong during a real disaster, which is a genuine cost and the
+opposite of what (a) gives you.
+
+**Why (simplicity, and the shape of Legion's plumbing).** Legion has no
+zone concept, so the per-zone graduation that makes (a) work has no analog
+here; a cluster-wide eviction rate limiter without zones would just delay a
+cascade rather than stop it. And Legion's mark-lost path is *directly*
+coupled to rescheduling — `mark_nodes_as_lost` is followed by
+`recheck_lost_nodes`, and every lost allocation becomes an eval. Marking
+truthfully and rate-limiting downstream would require a second throttle in
+the eval path, i.e. two mechanisms where one will do.
+
+The reasoning that decides it: a control plane does not genuinely lose half
+its fleet in two seconds. When it looks like it did, the overwhelmingly
+likelier explanation is that the control plane is what broke — which is
+literally the v1.32 Kubernetes incident, where an apiserver HTTP/2 timeout
+marked every node NotReady. Believing the fleet over the control plane in
+that moment is the wrong prior. Stateful workloads keep their independent
+protection either way: `selfTerminateAfter` fences from the worker side and
+does not depend on the manager's verdict.
+
+The `error` log is load-bearing — the whole point is that a human finds out
+immediately, not that the situation is hidden.
+
+---
+
+## 9. Gossip liveness and a Kubernetes-style lease/state split stay non-goals
+
+**Call.** The plan does not move liveness out of raft. No SWIM/Serf, no
+separate lightweight lease record. Both remain architecture item D8,
+awaiting the AWS campaign.
+
+**Alternatives.** (a) Gossip. It is the architecturally correct answer:
+Consul's per-node message rate is flat regardless of fleet size and touches
+no consensus write path at all, with detection time growing only as
+`log(N)`. Every number in this plan's problem statement disappears. (b) The
+K8s split: keep the beat at 2s but make the write cheap, which is exactly
+what KEP-589 did to take etcd write throughput from 150MB/min to 30MB/min
+at 5k nodes.
+
+**Trade-off.** We are shipping a mitigation for a problem whose root cause
+we have decided not to fix yet, and phase 4's controller may be dead code
+in a world where liveness is gossiped. The plan spends real effort — a
+schema column, a proto field, a controller — on a shape that could be
+superseded.
+
+**Why (extensibility, and sequencing).** Both alternatives change *where
+liveness lives*, which is the largest architectural decision open in the
+scheduler review, and D8 was deferred specifically pending AWS data.
+Choosing it now on the strength of one benchmark run would be the deferral
+overturned by the first inconvenient number.
+
+The K8s split is also the weaker analogy than it first appears: KEP-589's
+problem was **bytes per write** (20KB Node objects), and Legion's
+per-heartbeat cost is already one *batched* raft commit — group commit
+shipped in the predecessor plan and coalesces up to 128 heartbeats into a
+single consensus round. What remains is per-commit fsync, which a smaller
+record does not fix. The K8s lever mostly does not apply.
+
+And the effort is not wasted under either outcome. Phases 1–3 —
+the freshness metric, per-node windows, failover grace, the circuit breaker
+— are the instrumentation and the safety rails that *any* liveness
+architecture needs, and they are how the D8 decision gets measured in the
+first place. Only phase 4's controller is contingent, and it remains the
+fallback for clusters that do not run gossip.
+
+---
+
+## 10. The `heartbeatSeconds` clamp widens from 30 to 300, gated on a `selfTerminateAfter` cross-check
+
+**Call.** `heartbeat_interval_for`'s `1..=30` clamp becomes `1..=300`. Config
+load rejects any value where `missedBeatsBeforeLost × heartbeatSeconds`
+would exceed the smallest `stateful.onLost.selfTerminateAfter` in play
+(default 90s):
+
+```
+ERROR worker config configs/workers/batch.jsonnet: heartbeatSeconds 30 gives a
+  150s lost-node window, but job `db` sets stateful.onLost.selfTerminateAfter
+  to 90s — those workers would kill their own stateful tasks between
+  heartbeats. Raise selfTerminateAfter above 150s or lower heartbeatSeconds.
+```
+
+**Alternatives.** (a) Keep 30. It is a round number, it has never been
+complained about, and widening a clamp is a compatibility-shaped change.
+(b) Widen it and leave the interaction to documentation, as a note on the
+stateful page.
+
+**Trade-off.** A hard error at config load can block a cluster from
+starting on a combination that was previously accepted — though only in
+combinations that were already silently broken.
+
+**Why (simplicity, by removing a landmine).** 30 was chosen when the lost
+window was fixed at 10s, where it was already unusable; it is not a
+considered ceiling and it is below what the sizing table needs at 2000
+nodes. Widening it is required for the plan to have an answer at all in its
+own last row.
+
+The cross-check is the more important half.
+`DEFAULT_SELF_TERMINATE_AFTER = 90s` means a worker kills its own stateful
+tasks after 90 seconds without manager contact. At a 120s cadence, a
+perfectly healthy worker crosses that threshold **between beats** — a
+correctness bug produced by the interaction of two independently reasonable
+settings, presenting as stateful tasks dying for no visible reason. That is
+the worst possible bug to leave for a user to find, and it is exactly the
+"two numbers whose relationship matters, unenforced" pattern entry 2 exists
+to kill. Rejecting at config load rather than warning is deliberate: the
+symptom is data-plane task death, not a slow dashboard.
+
+---
+
+## 11. Cadence gets its own read-only RPC and `legion node cadence`, rather than fields on `legion node list`
+
+**Call.** A new `GetHeartbeatCadence` RPC and a `legion node cadence` verb,
+with `--json`, a `catalog()` entry (`read_only_safe: true`), an MCP tool,
+and a `tests/acl_endpoints.rs` row (`node`/`read`/`any`).
+
+```console
+$ legion node cadence
+Fleet             1000 nodes (987 active)
+Served interval   2s
+Lost window       10s  (5 missed beats)
+Freshness         0.22  ── FALLING BEHIND (false loss below 0.20)
+Sustainable       ~160 nodes at 2s on this control plane
+Suggested         heartbeatSeconds: 25   (lost window 125s)
+```
+
+**Alternatives.** (a) Add the numbers to `legion node list`'s output or a
+summary footer — no new RPC, no new ACL row, no new MCP tool, and the
+operator is already there. (b) Metrics only: it is all in Prometheus, and a
+CLI verb duplicates a scrape.
+
+**Trade-off.** A new endpoint carries the full tax — proto comments, ACL
+classification, capabilities entry, MCP tool, test row — for a report an
+operator reads occasionally.
+
+**Why (ease, at the moment it is needed).** These are fleet-level facts, not
+per-node ones; hanging them off a list of nodes puts a cluster-wide answer
+in a per-row command and makes `-j` output awkward for both consumers. And
+(b) fails the scenario that matters: an on-call responder watching nodes
+disappear needs to know *within seconds* whether the machines are gone or
+the control plane is behind, and requiring a working Prometheus to answer
+that is requiring a working monitoring stack during the incident where it
+is least trustworthy. The suggested `heartbeatSeconds` also has to be
+*computed* from live fleet size and observed rate — that is a server-side
+calculation, so it needs a server-side endpoint regardless of where it is
+printed.
