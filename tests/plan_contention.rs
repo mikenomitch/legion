@@ -66,6 +66,7 @@ fn insert_node(store: &Store, id: &str) -> R<()> {
         dynamic_attrs: "{}".into(),
         health_checks: "{}".into(),
         last_heartbeat: "2023-01-01 00:00:00 +00:00:00".into(),
+        heartbeat_source: String::new(),
     })?;
     Ok(())
 }

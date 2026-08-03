@@ -482,6 +482,7 @@ mod tests {
             pool: "default".into(),
             availability: "available".into(),
             last_heartbeat: "2023-01-01 00:00:00 +00:00:00".into(),
+            heartbeat_source: String::new(),
             config_attrs: attrs,
             fingerprint_attrs: json!({}),
             dynamic_attrs: json!({}),

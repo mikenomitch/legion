@@ -197,6 +197,7 @@ mod tests {
             pool: "default".into(),
             availability: "available".into(),
             last_heartbeat: String::new(),
+            heartbeat_source: String::new(),
             config_attrs: json!({}),
             fingerprint_attrs,
             dynamic_attrs: json!({}),

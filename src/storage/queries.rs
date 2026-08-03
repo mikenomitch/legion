@@ -51,9 +51,15 @@ ON CONFLICT(id) DO UPDATE SET pool = :pool, availability = :availability, config
 /// liveness row): a (re-)registering node is by definition not lost, so
 /// `lost_at` resets to NULL and the stateful node-loss confirmation clock
 /// stops (see mark_node_lost).
+///
+/// `lost_after_seconds` is seeded here because registration is where the
+/// manager learns the cadence this node will actually beat at (the worker
+/// reports its resolved `heartbeatSeconds` in `config_attrs`), and because an
+/// INSERT OR REPLACE would otherwise blank the column on every re-register.
+/// See docs/heartbeat-cadence-and-scale.md.
 pub const SEED_NODE_HEALTH: &str = r#"
-INSERT OR REPLACE INTO node_health (node_id, status, last_heartbeat, lost_at, health_checks)
-VALUES (:id, :status, :last_heartbeat, NULL, :health_checks);
+INSERT OR REPLACE INTO node_health (node_id, status, last_heartbeat, lost_at, health_checks, lost_after_seconds)
+VALUES (:id, :status, :last_heartbeat, NULL, :health_checks, :lost_after_seconds);
 "#;
 
 //

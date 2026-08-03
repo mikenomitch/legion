@@ -63,6 +63,7 @@ impl Eval {
                 pool: "default".into(),
                 availability: "available".into(),
                 last_heartbeat,
+                heartbeat_source: String::new(),
                 config_attrs: json!({}),
                 fingerprint_attrs: Self::default_fingerprint_attrs(),
                 dynamic_attrs: json!({}),
@@ -680,6 +681,7 @@ mod tests {
             pool: "default".into(),
             availability: "available".into(),
             last_heartbeat: "2023-01-01T00:00:00Z".into(),
+            heartbeat_source: String::new(),
             config_attrs: json!({ "node_id": id, "zone": zone }),
             fingerprint_attrs: json!({
                 "memory_total": "8589934592",

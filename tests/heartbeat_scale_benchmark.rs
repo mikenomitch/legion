@@ -7,7 +7,7 @@
 //!   the fleet as fast as the store allows for a fixed window —
 //!   heartbeats/sec plus p50/p99 latency of `Store::update_node_heartbeat`.
 //! - **Liveness tick**: wall-clock of one manager liveness pass
-//!   (`get_node_ids_and_heartbeats` + the mark-lost decision) at that
+//!   (`liveness_snapshot` + the mark-lost decision) at that
 //!   fleet size.
 //!
 //! ```bash
@@ -129,12 +129,23 @@ fn heartbeat_scale_benchmark_matrix() -> R<()> {
             let elapsed = window_started.elapsed().as_secs_f64();
 
             // Liveness phase: one manager tick's scan + decision, averaged.
+            // The fake value is a fake RESPONSIBILITY age, not a fake process
+            // uptime — the grace clock now runs from status-lane leadership
+            // acquisition (liveness plan §6.4), and the ages the decision
+            // compares come from the in-memory table the heartbeats above
+            // populated rather than from the database.
             let tick_rounds = 10;
             let tick_started = Instant::now();
             for _ in 0..tick_rounds {
-                let rows = store.get_node_ids_and_heartbeats()?;
-                let lost =
-                    legion::manager::daemon::nodes_to_mark_lost(rows, Duration::from_secs(3600));
+                let snapshot = legion::manager::daemon::liveness_snapshot(&store, Instant::now())?;
+                let lost = legion::manager::cadence::decide_lost_nodes(
+                    &snapshot,
+                    &legion::manager::cadence::LossContext {
+                        responsible_for: Duration::from_secs(3600),
+                        ..Default::default()
+                    },
+                )
+                .lost;
                 // Every node just heartbeated: nothing should be lost.
                 assert!(
                     lost.len() < nodes,

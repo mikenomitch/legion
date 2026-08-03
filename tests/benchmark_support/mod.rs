@@ -265,6 +265,7 @@ pub fn insert_profile_node(store: &Store, profile: &NodeProfile, id: &str) -> an
         dynamic_attrs: json!({}).to_string(),
         health_checks: "{}".into(),
         last_heartbeat: "2023-01-01 00:00:00 +00:00:00".into(),
+        heartbeat_source: String::new(),
     };
     store.insert_node(node)?;
     Ok(())

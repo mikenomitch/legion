@@ -7,7 +7,7 @@ use crate::storage::events::drafts;
 use crate::storage::persistence::PersistenceRole;
 use crate::storage::store::Store;
 use crate::structs::{
-    manager_server::ManagerServer, Eval, JobConfig, KvValueType, ManagerConfig, Node, NodeMsg,
+    manager_server::ManagerServer, Eval, JobConfig, KvValueType, ManagerConfig, NodeMsg,
     Submission, TaskConfig, TlsConfigFull, WorkerConfig as WorkerConfigMsg, WorkerConfigAlt,
 };
 use crate::worker::daemon::run_worker_local;
@@ -76,6 +76,17 @@ pub async fn run_manager(config: ManagerConfig, run_worker: bool) -> R<()> {
     crate::artifacts::auth::validate_cluster_artifacts_config(
         &full_config.artifacts,
         &node_identity_names,
+    )?;
+    // Heartbeat cadence and liveness: reject combinations that cannot hold
+    // together, naming the offending values. A grace shorter than the window
+    // it protects, or a checkpoint fast enough to re-create the commit load
+    // this design removes, is a configuration error and belongs at startup
+    // rather than in an incident (docs/heartbeat-cadence-and-scale.md,
+    // docs/node-liveness.md).
+    full_config.heartbeat.validate()?;
+    full_config.liveness.validate(
+        full_config.heartbeat.parsed_min_interval()
+            * full_config.heartbeat.missed_beats_before_lost.max(1),
     )?;
     let manager_node_id = format!("{}:{}", full_config.server.host, full_config.server.port);
     let store = Store::start_storage(&full_config)?;
@@ -404,8 +415,15 @@ pub async fn run_manager(config: ManagerConfig, run_worker: bool) -> R<()> {
 
     println!("Manager node starting on {addr}");
 
-    let node_checker_fut =
-        start_node_status_checker(store_copy_a, full_config.worker_check_seconds);
+    let node_checker_fut = start_node_status_checker(
+        store_copy_a,
+        LivenessCheckerConfig {
+            check_interval: Duration::from_secs(full_config.worker_check_seconds),
+            heartbeat: full_config.heartbeat.clone(),
+            liveness: full_config.liveness.clone(),
+            manager_node_id: manager_node_id.clone(),
+        },
+    );
     let eval_loop_fut = start_eval_loop(store_copy_b, full_config.eval_threads);
     let manager_host = resolve_manager_host(&full_config.server.host);
     let manager_addr = format!("http://{}:{}", manager_host, full_config.server.port);
@@ -587,6 +605,7 @@ fn seed_ui_test_data(store: &Store) -> R<()> {
         ])
         .to_string(),
         last_heartbeat: now.clone(),
+        heartbeat_source: String::new(),
     })?;
     store.insert_node(NodeMsg {
         id: "demo-worker-b".into(),
@@ -605,6 +624,7 @@ fn seed_ui_test_data(store: &Store) -> R<()> {
         ])
         .to_string(),
         last_heartbeat: now,
+        heartbeat_source: String::new(),
     })?;
 
     let job = JobConfig {
@@ -679,12 +699,57 @@ fn load_server_tls_identity(tls: &TlsConfigFull) -> R<Option<Identity>> {
     Ok(Some(Identity::from_pem(cert, key)))
 }
 
+/// Everything the status checker needs from the manager config, resolved once
+/// at startup so the loop itself reads no config.
+#[derive(Debug, Clone)]
+pub struct LivenessCheckerConfig {
+    pub check_interval: Duration,
+    pub heartbeat: crate::structs::HeartbeatConfigFull,
+    pub liveness: crate::structs::LivenessConfigFull,
+    /// This manager's own id, as the digest identifies its sender.
+    pub manager_node_id: String,
+}
+
+/// The interval this manager currently serves, and the ladder state behind it.
+///
+/// With adaptive cadence off (the default) the served interval is just the
+/// floor — the manager tells workers nothing and they keep their worker-type
+/// `heartbeatSeconds`. The value is still tracked because the freshness ratio
+/// and the sizing arithmetic need an interval to be "on time" relative to.
+struct ServedCadence {
+    ladder: crate::manager::cadence::LadderState,
+    at_max: bool,
+}
+
 #[instrument(err, skip_all)]
-async fn start_node_status_checker(store: Store, check_seconds: u64) -> R<()> {
+async fn start_node_status_checker(store: Store, config: LivenessCheckerConfig) -> R<()> {
+    use crate::manager::cadence::{self, LadderState};
+
     info!("Beginning node status checker loop");
-    let started_at = std::time::Instant::now();
-    let check_interval = Duration::from_secs(check_seconds);
-    let mut was_status_leader = true;
+    let check_interval = config.check_interval;
+    let min_interval = config.heartbeat.parsed_min_interval();
+    let max_interval = config.heartbeat.parsed_max_interval();
+    let missed_beats = config.heartbeat.missed_beats_before_lost.max(1);
+    let adaptive = config.heartbeat.adaptive_enabled();
+    let liveness_settings = config.liveness.settings();
+    store.liveness().configure(liveness_settings.clone());
+
+    let mut cadence_state = ServedCadence {
+        ladder: LadderState::new(min_interval),
+        at_max: false,
+    };
+    // Freshness warning debounce: 3 consecutive sub-threshold ticks, then at
+    // most one line a minute. A single slow tick is not a page.
+    let mut low_freshness_ticks: u32 = 0;
+    let mut last_freshness_warn: Option<std::time::Instant> = None;
+    let mut last_checkpoint: Option<std::time::Instant> = None;
+    let mut last_digest: Option<std::time::Instant> = None;
+    // Starts false so PROCESS START takes the same path as an election: seed
+    // the liveness table, start the grace clock, log the acquisition. Before
+    // this, the grace was keyed on process uptime and a manager that had been
+    // up for hours could acquire status-lane leadership mid-life and start
+    // marking lost on its very next tick (liveness plan §5.4).
+    let mut was_status_leader = false;
     // Rollout reconciliation piggybacks on this loop but gates on the
     // SCHEDULER lane (C-2 rollout consolidation) — under `lanes` topology
     // the status and scheduler leaders can be different nodes, so it runs
@@ -705,11 +770,80 @@ async fn start_node_status_checker(store: Store, check_seconds: u64) -> R<()> {
         let status_leader = store.is_raft_leader(crate::storage::Lane::Status);
         if status_leader {
             if !was_status_leader {
-                info!("Raft status-lane leadership acquired; node status checker resuming");
+                // Responsibility for liveness starts HERE, not at process
+                // start. A new leader inherits no liveness state, so it seeds
+                // every active node at `now` and marks nothing lost for
+                // `failoverGrace` while the fleet checks back in. Seeding from
+                // the persisted timestamps instead would mark the whole fleet
+                // lost on the first tick, because those timestamps are stale
+                // by construction on a manager that has just taken over.
+                let active = match store.active_node_liveness_rows() {
+                    Ok(rows) => rows.into_iter().map(|row| row.id).collect::<Vec<_>>(),
+                    Err(err) => {
+                        warn!(error = ?err, "Failed reading active nodes to seed liveness");
+                        Vec::new()
+                    }
+                };
+                store.liveness().become_responsible(&active);
+                info!(
+                    seeded_nodes = active.len(),
+                    failover_grace_secs = liveness_settings.failover_grace.as_secs(),
+                    "Status-lane liveness responsibility acquired; marking nothing lost until \
+                     the fleet has had its failover grace to check in"
+                );
                 was_status_leader = true;
             }
-            let node_ids_to_update =
-                nodes_to_mark_lost(store.get_node_ids_and_heartbeats()?, started_at.elapsed());
+            let now = std::time::Instant::now();
+            let snapshot = match liveness_snapshot(&store, now) {
+                Ok(snapshot) => snapshot,
+                Err(err) => {
+                    warn!(error = ?err, "Failed reading node liveness; skipping this tick");
+                    tokio::time::sleep(check_interval).await;
+                    continue;
+                }
+            };
+            let peer_gap = store.liveness().peer_gap_at(now);
+            let decision = cadence::decide_lost_nodes(
+                &snapshot,
+                &cadence::LossContext {
+                    responsible_for: store.liveness().responsible_for_at(now),
+                    failover_grace: liveness_settings.failover_grace,
+                    peer_gap_nodes: peer_gap.suppressed.clone(),
+                    ..cadence::LossContext::default()
+                },
+            );
+            report_liveness_metrics(
+                &store,
+                &snapshot,
+                &decision,
+                &peer_gap,
+                cadence_state.ladder.served,
+                missed_beats,
+                now,
+            );
+            for (reason, count) in &decision.suppressed {
+                match reason {
+                    cadence::SuppressionReason::MassDisruption => error!(
+                        would_be_lost = count,
+                        active_nodes = snapshot.len(),
+                        "More than half this fleet would be marked lost in one tick; marking \
+                         NONE. A control plane does not lose half its fleet in one tick — \
+                         believe the control plane broke, not the fleet \
+                         (docs/heartbeat-cadence-and-scale.md)"
+                    ),
+                    cadence::SuppressionReason::PeerDigestGap => info!(
+                        suppressed = count,
+                        peers = ?peer_gap.stale_peers,
+                        "Holding node losses for a peer manager that has stopped reporting \
+                         liveness; a manager-to-manager problem is not fleet-wide node loss"
+                    ),
+                    cadence::SuppressionReason::FailoverGrace => debug!(
+                        suppressed = count,
+                        "Inside the liveness failover grace; marking nothing lost"
+                    ),
+                }
+            }
+            let node_ids_to_update = decision.lost;
 
             // Warn-and-continue rather than `?`: under `lanes` topology the
             // status-lane leader may not lead the control lane, and the
@@ -718,6 +852,81 @@ async fn start_node_status_checker(store: Store, check_seconds: u64) -> R<()> {
             // ticking — the mark is retried every tick until it lands.
             if let Err(err) = store.mark_nodes_as_lost(&node_ids_to_update) {
                 warn!(error = ?err, "Failed marking nodes lost; will retry next tick");
+            } else if !node_ids_to_update.is_empty() {
+                crate::manager::telemetry::metrics()
+                    .nodes_marked_lost_total
+                    .add(node_ids_to_update.len() as u64);
+                for id in &node_ids_to_update {
+                    store.liveness().forget(id);
+                }
+            }
+
+            // Cadence: recompute what to serve, warn when the fleet is not
+            // sustaining it, and keep the per-node windows honest.
+            let report = cadence::cadence_report(
+                &snapshot,
+                cadence_state.ladder.served,
+                missed_beats,
+                config.heartbeat.headroom,
+                HEARTBEAT_FRESHNESS_MIN_FLEET,
+                adaptive,
+                cadence_state.at_max,
+            );
+            if adaptive {
+                let target = cadence::target_interval(
+                    snapshot.len(),
+                    config.heartbeat.target_rate_per_second.unwrap_or(0.0),
+                    config.heartbeat.headroom,
+                    min_interval,
+                    max_interval,
+                );
+                cadence_state.at_max = target >= max_interval;
+                let next = cadence::advance_ladder(
+                    &cadence_state.ladder,
+                    target,
+                    check_interval,
+                    min_interval,
+                    max_interval,
+                );
+                if next.served != cadence_state.ladder.served {
+                    info!(
+                        active_nodes = snapshot.len(),
+                        from_seconds = cadence_state.ladder.served.as_secs(),
+                        to_seconds = next.served.as_secs(),
+                        "Serving a new heartbeat interval for this fleet size"
+                    );
+                    apply_served_cadence(
+                        &store,
+                        &snapshot,
+                        cadence_state.ladder.served,
+                        next.served,
+                        missed_beats,
+                    );
+                }
+                cadence_state.ladder = next;
+                // Only a manager running adaptive cadence puts an interval on
+                // the reply. With it off, workers keep their worker-type value
+                // and the wire field stays absent, which is what makes the
+                // default path bit-for-bit identical to before.
+                store
+                    .liveness()
+                    .set_served_interval(Some(cadence_state.ladder.served));
+            }
+            warn_on_stale_cadence(
+                &report,
+                &mut low_freshness_ticks,
+                &mut last_freshness_warn,
+                snapshot.len(),
+            );
+
+            // Display checkpoint: the ONE heartbeat-derived write that still
+            // reaches raft, and it is two commits a minute rather than one per
+            // beat per node. Never read back as liveness.
+            if let Some(interval) = liveness_settings.checkpoint_interval {
+                if last_checkpoint.is_none_or(|at| at.elapsed() >= interval) {
+                    last_checkpoint = Some(std::time::Instant::now());
+                    write_liveness_checkpoint(&store, now);
+                }
             }
             // Stateful allocations on lost nodes are gated behind their
             // onLost.replaceAfter loss-confirmation window (see
@@ -760,9 +969,29 @@ async fn start_node_status_checker(store: Store, check_seconds: u64) -> R<()> {
                 ),
                 Err(err) => warn!(error = ?err, "Failed seeding missing task statuses"),
             }
-        } else if was_status_leader {
-            info!("Not the status-lane raft leader; node status checker idling until elected");
-            was_status_leader = false;
+        } else {
+            if was_status_leader {
+                info!("Not the status-lane raft leader; node status checker idling until elected");
+                // Stop being responsible: a re-acquisition must start a FRESH
+                // grace clock, not resume the one from the last term.
+                store.liveness().relinquish();
+                was_status_leader = false;
+            }
+            // Liveness digest (liveness plan §6.3): a manager that does not
+            // lead the status lane still receives heartbeats — workers dial
+            // one fixed manager forever — so it batches the ids it heard from
+            // and sends ONE RPC per interval to the leader. The cost is
+            // `managers x 1 RPC/second`, not `nodes x 1 write per interval`.
+            if last_digest.is_none_or(|at| at.elapsed() >= liveness_settings.digest_interval) {
+                last_digest = Some(std::time::Instant::now());
+                send_liveness_digest(&store, &config.manager_node_id).await;
+            }
+            crate::manager::telemetry::metrics()
+                .liveness_responsible_seconds
+                .set(0);
+            crate::manager::telemetry::metrics()
+                .liveness_tracked_nodes
+                .set(0);
         }
 
         // Scheduler-lane piggyback: rollout reconciliation runs wherever the
@@ -951,62 +1180,278 @@ fn refresh_cluster_gauges(store: &Store) {
     }
 }
 
-/// Which active nodes to mark lost, given their last heartbeats and how long
-/// this manager process has been up.
+/// Every active node's age and window, as the lost decision sees them.
 ///
-/// Heartbeats only refresh while the manager is up, so time the manager spent
-/// down must not count as missed heartbeats: right after a manager restart
-/// every persisted heartbeat looks stale, and marking those nodes lost would
-/// deschedule — and therefore kill — every healthy task in the cluster before
-/// its worker had a chance to reconnect. No node is marked lost until the
-/// manager has been up for a full lost-node window; live workers heartbeat
-/// every `WORKER_HEARTBEAT_DURATION_SEC` and retry with a capped backoff, so
-/// they re-establish contact well within it.
+/// The AGE comes from the in-memory liveness table, not from the database: a
+/// steady-state heartbeat no longer writes a timestamp anywhere, so the
+/// persisted clock is display state (liveness plan §6.5). The WINDOW comes
+/// from the replicated row, because it is a configured value rather than an
+/// observation and every manager must agree on it.
+///
+/// A node the table has never seen — registered since this manager became
+/// responsible — is seeded at `now` on first sighting and is therefore never
+/// lost on the tick that discovers it.
+///
 /// Public for the heartbeat scale benchmark
-/// (`tests/heartbeat_scale_benchmark.rs`), which times one liveness pass;
-/// not part of any stable API.
-///
-/// Nodes whose row carries the integer heartbeat clock compare against one
-/// precomputed cutoff — no per-node timestamp parsing (heartbeat-scale
-/// plan §4; at 10k nodes the old per-tick RFC3339 parse storm was 5,000
-/// parses/second). Rows without it (written before the column existed)
-/// fall back to parsing the text, with unparseable-means-lost preserved.
-pub fn nodes_to_mark_lost(
-    nodes_with_heartbeats: Vec<(String, String, Option<i64>)>,
-    manager_uptime: Duration,
-) -> Vec<String> {
-    if manager_uptime < Duration::from_secs(DEF_LOST_NODE_AT_SEC as u64) {
-        return Vec::new();
-    }
-    let unix_cutoff = OffsetDateTime::now_utc().unix_timestamp() - DEF_LOST_NODE_AT_SEC;
-    nodes_with_heartbeats
+/// (`tests/heartbeat_scale_benchmark.rs`), which times one liveness pass; not
+/// part of any stable API.
+pub fn liveness_snapshot(
+    store: &Store,
+    now: std::time::Instant,
+) -> R<Vec<crate::manager::cadence::NodeLiveness>> {
+    let rows = store.active_node_liveness_rows()?;
+    let unix_now = OffsetDateTime::now_utc().unix_timestamp();
+    let table = store.liveness();
+    let active: std::collections::HashSet<String> = rows.iter().map(|row| row.id.clone()).collect();
+    // Keep the table the LIVE set: nodes removed or already lost drop out, so
+    // `legion_liveness_tracked_nodes` stays comparable with
+    // `legion_nodes{status="active"}` instead of accumulating history.
+    table.retain(&active);
+    let snapshot = rows
         .into_iter()
-        .filter(|(id, heartbeat, heartbeat_unix)| {
-            if let Some(heartbeat_unix) = heartbeat_unix {
-                let too_slow = *heartbeat_unix < unix_cutoff;
-                if too_slow {
-                    warn!("Node {} heartbeat too slow - marking as lost", id);
-                }
-                return too_slow;
-            }
-            match Node::last_heartbeat_too_slow(heartbeat) {
-                Ok(too_slow) => {
-                    if too_slow {
-                        warn!("Node {} heartbeat too slow - marking as lost", id);
-                    }
-                    too_slow
-                }
-                Err(e) => {
-                    warn!(
-                        "Error checking heartbeat - marking node {} lost: {:?}",
-                        id, e
-                    );
-                    true
-                }
+        .map(|row| {
+            let beat = table.seed_if_missing_at(&row.id, now, unix_now);
+            let window = row.window();
+            crate::manager::cadence::NodeLiveness {
+                id: row.id,
+                age: now.saturating_duration_since(beat.at),
+                window,
             }
         })
-        .map(|(id, _heartbeat, _unix)| id)
-        .collect()
+        .collect();
+    Ok(snapshot)
+}
+
+/// Report the nodes this manager has heard from to the status-lane leader.
+///
+/// Costs ONE RPC per manager per `digestInterval`, whatever the fleet size —
+/// against the ~`N/interval` forwarded raft writes per second the pre-digest
+/// path cost. A failure is not an error to a worker: the leader still holds
+/// this peer's last digest and will not mark its nodes lost inside
+/// `peerDigestGrace`, which is exactly the fail-safe the push (rather than a
+/// pull) buys.
+async fn send_liveness_digest(store: &Store, manager_node_id: &str) {
+    use crate::storage::liveness::DigestOutcome;
+
+    let seen = store.liveness().drain_pending_digest();
+    if seen.is_empty() {
+        return;
+    }
+    let count = seen.len();
+    let outcome = store.report_node_liveness(manager_node_id, seen).await;
+    let telemetry = crate::manager::telemetry::metrics();
+    telemetry
+        .liveness_digest_rpcs_total
+        .inc(&[outcome.metric_label()]);
+    telemetry.liveness_digest_nodes.observe(count as f64);
+    match &outcome {
+        DigestOutcome::Accepted => {
+            store.liveness().set_digest_fallback(false);
+            debug!(
+                nodes = count,
+                "Reported node liveness to the status-lane leader"
+            );
+        }
+        // A peer that predates digests leads the lane. Fall back to forwarding
+        // each heartbeat as a replicated write — today's behavior, and correct;
+        // it resolves when leadership lands on an upgraded manager.
+        DigestOutcome::Unimplemented => {
+            if !store.liveness().digest_fallback() {
+                warn!(
+                    "The status-lane leader does not accept liveness digests (a manager that \
+                     predates them). Falling back to a replicated write per heartbeat until the \
+                     manager upgrade finishes (docs/upgrades.md)"
+                );
+            }
+            store.liveness().set_digest_fallback(true);
+        }
+        DigestOutcome::NotLeader { leader_hint } => {
+            debug!(%leader_hint, "Liveness digest reached a manager that no longer leads the status lane");
+        }
+        DigestOutcome::NoLeader | DigestOutcome::NoEngine => {}
+        DigestOutcome::Error(message) => {
+            debug!(%message, nodes = count, "Liveness digest failed; the leader's peer grace covers this window");
+        }
+    }
+}
+
+/// Publish the liveness and cadence gauges for one tick.
+fn report_liveness_metrics(
+    store: &Store,
+    snapshot: &[crate::manager::cadence::NodeLiveness],
+    decision: &crate::manager::cadence::LossDecision,
+    peer_gap: &crate::storage::liveness::PeerGap,
+    served_interval: Duration,
+    missed_beats: u32,
+    now: std::time::Instant,
+) {
+    let telemetry = crate::manager::telemetry::metrics();
+    telemetry
+        .liveness_tracked_nodes
+        .set(store.liveness().tracked() as i64);
+    telemetry
+        .liveness_responsible_seconds
+        .set(store.liveness().responsible_for_at(now).as_secs() as i64);
+    telemetry
+        .heartbeat_served_interval_seconds
+        .set(served_interval.as_secs() as i64);
+    telemetry
+        .heartbeat_lost_window_seconds
+        .set((served_interval * missed_beats).as_secs() as i64);
+    let ratio = crate::manager::cadence::freshness_ratio(
+        snapshot,
+        served_interval,
+        HEARTBEAT_FRESHNESS_MIN_FLEET,
+    );
+    telemetry
+        .heartbeat_freshness_ratio
+        .set(ratio.unwrap_or(0.0));
+    telemetry.heartbeat_sustainable_nodes.set(
+        ratio
+            .map(|ratio| (snapshot.len() as f64 * ratio).round() as i64)
+            .unwrap_or(0),
+    );
+    for (reason, count) in &decision.suppressed {
+        telemetry
+            .liveness_loss_suppressed_total
+            .inc_by(&[reason.as_str()], *count as u64);
+    }
+    let mut peer_series: Vec<(Vec<String>, i64)> = peer_gap
+        .stale_peers
+        .iter()
+        .map(|peer| (vec![peer.clone()], 1))
+        .collect();
+    peer_series.extend(
+        peer_gap
+            .fresh_peers
+            .iter()
+            .map(|peer| (vec![peer.clone()], 0)),
+    );
+    telemetry.liveness_peer_stale.set_all(&peer_series);
+}
+
+/// Fire the runtime cadence warning, debounced.
+///
+/// Fires only after `HEARTBEAT_FRESHNESS_WARN_TICKS` consecutive sub-threshold
+/// ticks and at most once a minute, because the point is to reach an operator
+/// BEFORE the collapse, not to fill the log during one.
+fn warn_on_stale_cadence(
+    report: &crate::manager::cadence::CadenceReport,
+    low_ticks: &mut u32,
+    last_warn: &mut Option<std::time::Instant>,
+    active_nodes: usize,
+) {
+    let Some(ratio) = report.freshness_ratio else {
+        *low_ticks = 0;
+        return;
+    };
+    if ratio >= HEARTBEAT_FRESHNESS_WARN_RATIO {
+        *low_ticks = 0;
+        return;
+    }
+    *low_ticks += 1;
+    if *low_ticks < HEARTBEAT_FRESHNESS_WARN_TICKS {
+        return;
+    }
+    let due = last_warn.is_none_or(|at| {
+        at.elapsed() >= Duration::from_secs(HEARTBEAT_FRESHNESS_WARN_INTERVAL_SEC)
+    });
+    if !due {
+        return;
+    }
+    *last_warn = Some(std::time::Instant::now());
+    warn!(
+        nodes = active_nodes,
+        served_interval_secs = report.served_interval.as_secs(),
+        freshness = ratio,
+        lost_window_secs = report.lost_window.as_secs(),
+        at_max_interval = report.at_max_interval,
+        "{}",
+        crate::manager::cadence::freshness_warning(report)
+    );
+}
+
+/// Write the display checkpoint: every tracked node's ACTUAL last observed
+/// beat time, in one batched status-lane commit.
+fn write_liveness_checkpoint(store: &Store, now: std::time::Instant) {
+    let beats: Vec<(String, i64)> = store
+        .liveness()
+        .snapshot()
+        .into_iter()
+        .map(|(id, beat)| (id, beat.unix))
+        .collect();
+    if beats.is_empty() {
+        return;
+    }
+    let count = beats.len();
+    let started = std::time::Instant::now();
+    match store.checkpoint_node_heartbeats(&beats) {
+        Ok(()) => {
+            crate::manager::telemetry::metrics()
+                .liveness_checkpoint_seconds
+                .observe(started.elapsed().as_secs_f64());
+            debug!(
+                nodes = count,
+                age_secs = now.elapsed().as_secs(),
+                "Replicated the liveness display checkpoint"
+            );
+        }
+        // Never fatal and never retried tightly: a checkpoint is display
+        // state, so a missed one costs a stale column for one interval.
+        Err(err) => debug!(error = ?err, "Failed writing the liveness checkpoint"),
+    }
+}
+
+/// Move every node's lost window when the served interval changes.
+///
+/// The asymmetry is the safety argument (heartbeat-cadence plan §6.4):
+///
+/// - **Widening happens immediately**, the moment the manager DECIDES to slow
+///   down and before any worker has been told. A worker that never gets the
+///   message is protected.
+/// - **Narrowing waits for confirmation** — a node keeps its wide window until
+///   it is observed actually beating at the faster cadence. A worker that
+///   missed the speed-up is never punished for obeying the last instruction it
+///   received. This is Consul's session-TTL contract, per node.
+fn apply_served_cadence(
+    store: &Store,
+    snapshot: &[crate::manager::cadence::NodeLiveness],
+    previous: Duration,
+    next: Duration,
+    missed_beats: u32,
+) {
+    let widening = next > previous;
+    let window = crate::manager::cadence::lost_window_for(next, missed_beats);
+    let table = store.liveness();
+    let updates: Vec<(String, i64)> = snapshot
+        .iter()
+        .filter(|node| {
+            if widening {
+                return true;
+            }
+            // Narrowing: only nodes we have SEEN beat at the new, faster
+            // cadence. `gap` is the interval between this node's last two
+            // observed beats; 1.5x leaves room for jitter and one slow tick.
+            table
+                .last_beat(&node.id)
+                .and_then(|beat| beat.gap)
+                .is_some_and(|gap| gap <= next.mul_f64(1.5))
+        })
+        .map(|node| (node.id.clone(), window.as_secs() as i64))
+        .collect();
+    if updates.is_empty() {
+        return;
+    }
+    let count = updates.len();
+    match store.set_node_lost_windows(&updates) {
+        Ok(()) => info!(
+            nodes = count,
+            window_secs = window.as_secs(),
+            widening,
+            "Moved per-node lost windows with the served cadence"
+        ),
+        Err(err) => warn!(error = ?err, "Failed updating per-node lost windows; will retry"),
+    }
 }
 
 #[instrument(err, skip_all)]
@@ -1452,28 +1897,69 @@ mod tests {
             dynamic_attrs: "{}".into(),
             health_checks: "{}".into(),
             last_heartbeat,
+            heartbeat_source: String::new(),
         }
     }
 
+    /// A manager that has just become responsible for liveness must not
+    /// deschedule a fleet whose persisted heartbeats are stale by
+    /// construction.
+    ///
+    /// This is the test the old process-uptime grace only half passed: it
+    /// covered a process RESTART, but not a manager up for hours that acquires
+    /// status-lane leadership mid-life (liveness plan §5.4). Both take the
+    /// same path now, because responsibility — not uptime — starts the clock.
     #[test]
-    fn nodes_to_mark_lost_waits_for_startup_heartbeat_grace() -> R<()> {
-        let lost_window = DEF_LOST_NODE_AT_SEC as u64;
-        // No unix clock on these rows: exercises the text-parse fallback.
-        let nodes = vec![
-            ("stale-node".to_string(), rfc3339_seconds_ago(120)?, None),
-            ("fresh-node".to_string(), rfc3339_seconds_ago(0)?, None),
-        ];
+    fn acquiring_liveness_responsibility_marks_nothing_lost() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(node_msg("stale-node", rfc3339_seconds_ago(3600)?))?;
+        store.insert_node(node_msg("fresh-node", rfc3339_seconds_ago(0)?))?;
 
-        // Right after a manager restart every persisted heartbeat looks
-        // stale; nothing may be marked lost until workers have had a full
-        // window to reconnect.
-        assert!(nodes_to_mark_lost(nodes.clone(), Duration::ZERO).is_empty());
-        assert!(nodes_to_mark_lost(nodes.clone(), Duration::from_secs(lost_window - 1)).is_empty());
+        // Acquisition seeds every active node at `now`, so a persisted
+        // heartbeat an hour old produces no candidates at all...
+        store
+            .liveness()
+            .become_responsible(&["stale-node".into(), "fresh-node".into()]);
+        let snapshot = liveness_snapshot(&store, std::time::Instant::now())?;
+        assert_eq!(snapshot.len(), 2);
+        assert!(snapshot
+            .iter()
+            .all(|node| node.age < Duration::from_secs(1)));
+        let settled = crate::manager::cadence::LossContext {
+            responsible_for: Duration::from_secs(3600),
+            ..Default::default()
+        };
+        assert!(
+            crate::manager::cadence::decide_lost_nodes(&snapshot, &settled)
+                .lost
+                .is_empty(),
+            "a stale persisted timestamp must never be a loss decision"
+        );
 
-        // Once the manager has been up a full window, silence means real loss
-        // — and only for the silent node.
+        // ...and even a genuinely silent node is held while the failover
+        // grace runs.
+        let long_ago = std::time::Instant::now() - Duration::from_secs(600);
+        store.liveness().observe_at(
+            "stale-node",
+            long_ago,
+            OffsetDateTime::now_utc().unix_timestamp() - 600,
+        );
+        let snapshot = liveness_snapshot(&store, std::time::Instant::now())?;
+        let in_grace = crate::manager::cadence::LossContext {
+            responsible_for: Duration::from_secs(1),
+            ..Default::default()
+        };
+        let decision = crate::manager::cadence::decide_lost_nodes(&snapshot, &in_grace);
+        assert!(decision.lost.is_empty());
         assert_eq!(
-            nodes_to_mark_lost(nodes, Duration::from_secs(lost_window)),
+            decision.suppressed_count(crate::manager::cadence::SuppressionReason::FailoverGrace),
+            1
+        );
+
+        // Past the grace, silence means real loss — and only for the silent
+        // node.
+        assert_eq!(
+            crate::manager::cadence::decide_lost_nodes(&snapshot, &settled).lost,
             vec!["stale-node".to_string()]
         );
         Ok(())
@@ -1521,9 +2007,18 @@ mod tests {
         )?;
         store.place_alloc("node-1", task_id)?;
 
+        let settled = crate::manager::cadence::LossContext {
+            responsible_for: Duration::from_secs(3600),
+            ..Default::default()
+        };
+
         // First status-checker tick of the freshly restarted manager: the
         // node must stay active and keep its allocation.
-        let to_mark = nodes_to_mark_lost(store.get_node_ids_and_heartbeats()?, Duration::ZERO);
+        store
+            .liveness()
+            .become_responsible(&["node-1".into(), "node-2".into()]);
+        let snapshot = liveness_snapshot(&store, std::time::Instant::now())?;
+        let to_mark = crate::manager::cadence::decide_lost_nodes(&snapshot, &settled).lost;
         store.mark_nodes_as_lost(&to_mark)?;
         assert_eq!(store.get_node("node-1")?.status, "active");
         assert_eq!(
@@ -1532,12 +2027,16 @@ mod tests {
             "allocation must survive a manager restart"
         );
 
-        // The grace elapsed and the node still never heartbeated: now it is
-        // genuinely lost and its allocations reschedule off it.
-        let to_mark = nodes_to_mark_lost(
-            store.get_node_ids_and_heartbeats()?,
-            Duration::from_secs(DEF_LOST_NODE_AT_SEC as u64),
+        // The node still never heartbeated after the manager came back: now
+        // it is genuinely lost and its allocations reschedule off it.
+        let long_ago = std::time::Instant::now() - Duration::from_secs(600);
+        store.liveness().observe_at(
+            "node-1",
+            long_ago,
+            OffsetDateTime::now_utc().unix_timestamp() - 600,
         );
+        let snapshot = liveness_snapshot(&store, std::time::Instant::now())?;
+        let to_mark = crate::manager::cadence::decide_lost_nodes(&snapshot, &settled).lost;
         assert_eq!(to_mark, vec!["node-1".to_string()]);
         store.mark_nodes_as_lost(&to_mark)?;
         // The reschedule tail is eval-mediated since C-2: pump the queue
@@ -1555,6 +2054,47 @@ mod tests {
             store.allocs_for_node("node-2")?.len(),
             1,
             "the surviving node receives the rescheduled allocation"
+        );
+        Ok(())
+    }
+
+    /// Two worker types with different cadences coexist, each with its own
+    /// window. Impossible under the old global cutoff, and the reason the
+    /// per-node column exists (heartbeat-cadence plan §6.4(4)).
+    #[test]
+    fn per_worker_type_cadences_get_their_own_windows() -> R<()> {
+        let store = setup_store()?;
+        let mut fast = node_msg("fast-node", rfc3339_seconds_ago(0)?);
+        fast.config_attrs = json!({ "heartbeatSeconds": 2 }).to_string();
+        let mut slow = node_msg("slow-node", rfc3339_seconds_ago(0)?);
+        slow.config_attrs = json!({ "heartbeatSeconds": 60 }).to_string();
+        store.insert_node(fast)?;
+        store.insert_node(slow)?;
+
+        store
+            .liveness()
+            .become_responsible(&["fast-node".into(), "slow-node".into()]);
+        // Both silent for 55 seconds: the 2s node is long gone, the 60s node
+        // has not even missed a beat.
+        let unix = OffsetDateTime::now_utc().unix_timestamp() - 55;
+        let silent_since = std::time::Instant::now() - Duration::from_secs(55);
+        store.liveness().observe_at("fast-node", silent_since, unix);
+        store.liveness().observe_at("slow-node", silent_since, unix);
+
+        let snapshot = liveness_snapshot(&store, std::time::Instant::now())?;
+        let windows: HashMap<String, Duration> = snapshot
+            .iter()
+            .map(|node| (node.id.clone(), node.window))
+            .collect();
+        assert_eq!(windows["fast-node"], Duration::from_secs(10));
+        assert_eq!(windows["slow-node"], Duration::from_secs(300));
+        let settled = crate::manager::cadence::LossContext {
+            responsible_for: Duration::from_secs(3600),
+            ..Default::default()
+        };
+        assert_eq!(
+            crate::manager::cadence::decide_lost_nodes(&snapshot, &settled).lost,
+            vec!["fast-node".to_string()]
         );
         Ok(())
     }
@@ -1942,20 +2482,49 @@ async fn load_initial_data(store: &Store, config: &ManagerConfig) -> R<()> {
         };
 
         if let Some(seconds) = wcp.heartbeat_seconds {
-            if !(1..=30).contains(&seconds) {
+            // The clamp widened from 1..=30 the moment the lost window began
+            // moving with the cadence (heartbeat-cadence plan §7). Under the
+            // old fixed 10s window every value above 3 traded detection margin
+            // for load; now `missedBeatsBeforeLost x heartbeatSeconds` IS the
+            // window, so a slow worker type is a supported configuration
+            // rather than a trap.
+            if !(1..=MAX_WORKER_HEARTBEAT_SECONDS).contains(&seconds) {
                 bail!(
-                    "worker config {path_str}: heartbeatSeconds must be between 1 and 30, \
-                     got {seconds}"
+                    "worker config {path_str}: heartbeatSeconds must be between 1 and \
+                     {MAX_WORKER_HEARTBEAT_SECONDS}, got {seconds}"
                 );
             }
-            if seconds > 3 {
-                warn!(
-                    worker_type = %wcp.worker_type,
-                    heartbeat_seconds = seconds,
-                    "heartbeatSeconds above 3: the 10s lost-node window leaves fewer than \
-                     three missed beats before workers are marked lost"
+            let missed = config
+                .with_defaults()
+                .heartbeat
+                .missed_beats_before_lost
+                .max(1);
+            let window = u64::from(seconds) * u64::from(missed);
+            // The §1 hazard, caught at config load rather than discovered as
+            // spontaneous stateful task death: a worker kills its own stateful
+            // tasks after `selfTerminateAfter` without manager contact, so a
+            // lost window at or past that fence means a HEALTHY worker
+            // self-fences between beats.
+            let self_terminate = crate::structs::job::DEFAULT_SELF_TERMINATE_AFTER.as_secs();
+            if window >= self_terminate {
+                bail!(
+                    "worker config {path_str}: heartbeatSeconds {seconds} x \
+                     missedBeatsBeforeLost {missed} is a {window}s lost window, at or past the \
+                     {self_terminate}s stateful self-fence (stateful.onLost.selfTerminateAfter). \
+                     A healthy worker would kill its own stateful tasks between beats. Lower \
+                     heartbeatSeconds, lower missedBeatsBeforeLost, or raise \
+                     selfTerminateAfter on the jobs that run here \
+                     (docs/heartbeat-cadence-and-scale.md)"
                 );
             }
+            info!(
+                worker_type = %wcp.worker_type,
+                heartbeat_seconds = seconds,
+                lost_window_seconds = window,
+                missed_beats = missed,
+                "Worker type heartbeat cadence: real node failures on this worker type take \
+                 up to the lost window to detect"
+            );
         }
 
         let wc = WorkerConfigMsg {

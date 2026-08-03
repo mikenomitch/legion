@@ -2,7 +2,7 @@ import { A } from '@solidjs/router'
 import { For, Show, createMemo, createResource, createSignal, onCleanup, onMount } from 'solid-js'
 import { EmptyState, LoadingRows, MonoBadge, Note, SectionCard, StatCard, StatusBadge, TableShell, linkClass, tableClass, tdClass, thClass, theadClass, trHoverClass } from '../components/ui'
 import { managerClient } from '../grpcClient'
-import { asDisplay, formatRelativeTime } from '../utils/format'
+import { asDisplay, formatRelativeTime, heartbeatFreshnessHint } from '../utils/format'
 import { summarizeHealthChecks } from '../utils/health'
 import { statusTone } from '../utils/status'
 import { POLL_INTERVAL_MS } from '../utils/polling'
@@ -201,7 +201,7 @@ export default function Homepage() {
                             <td class={tdClass}><StatusBadge status={health.label} /></td>
                             <td class={tdClass + ' text-muted'}>{entry.node?.pool || 'default'}</td>
                             <td class={tdClass + ' text-right tabular-nums text-muted'}>{entry.allocations.length}</td>
-                            <td class={tdClass + ' whitespace-nowrap text-right text-xs text-faint'}>{formatRelativeTime(entry.node?.lastHeartbeat)}</td>
+                            <td class={tdClass + ' whitespace-nowrap text-right text-xs text-faint'}><span title={heartbeatFreshnessHint(entry.node?.heartbeatSource)}>{formatRelativeTime(entry.node?.lastHeartbeat)}</span></td>
                           </tr>
                         )
                       }}

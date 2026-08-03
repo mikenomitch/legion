@@ -140,6 +140,22 @@ LEGION_BENCH_BACKENDS=local_disk,raft1 LEGION_HEARTBEAT_NODES=1000,5000 \
 Recorded results live in `benchmarks/scheduler/README.md`, with the host
 and build profile noted alongside every table.
 
+**A heartbeat number states which storage it was taken on**, and whether
+liveness was on the raft path. Since a steady-state heartbeat costs no
+commit ([node-liveness.md](node-liveness.md)), a modern number measures the
+gRPC handler; a number from a cluster in the mixed-version fallback measures
+the commit path, and the two are not comparable. The gp3-to-NVMe ratio is the
+single figure that tells them apart: near 1.0 means liveness is off the raft
+path, ~25x means it is not.
+
+**A throughput number carries the cadence it was achieved at.** A system that
+quietly slows its own heartbeats to score better is cheating, so every
+benchmark run records the served interval and
+`legion_heartbeat_freshness_ratio` alongside throughput, and comparative runs
+either pin all systems to the same interval or report all three systems'
+*achieved* cadence. Adaptive cadence is off by default for exactly this
+reason ([heartbeat-cadence-and-scale.md](heartbeat-cadence-and-scale.md)).
+
 ### Measuring scheduler event-stream overhead
 
 `LEGION_EVENTS_OFF=1` disables scheduler event emission, which allows an

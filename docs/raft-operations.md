@@ -261,10 +261,24 @@ backed by the same real engine state as the CLI.
   cannot propose a worker's write (it is a follower after a failover, or
   does not lead the owning lane under `topology: lanes`) FORWARDS the
   write to the leader over the authenticated raft transport and answers
-  the worker after the forwarded write commits — worker liveness,
-  failure reports, and volume reports keep working without the worker
-  redialing. See `docs/multi-raft.md`, "Non-leader write redirects and
-  forwarding".
+  the worker after the forwarded write commits — failure reports, health
+  reports, and volume reports keep working without the worker redialing.
+  See `docs/multi-raft.md`, "Non-leader write redirects and forwarding".
+- **Heartbeats do not go through raft at all.** A steady-state heartbeat is
+  one write into the memory of the manager that owns node status; a manager
+  that does not own it sends one digest RPC per second, whatever the fleet
+  size. That takes the highest-frequency write in the system off the log
+  entirely — which is why the raft store's storage class is a **performance
+  preference rather than a requirement**: network-attached disks (EBS gp3
+  and equivalents) are a supported choice for the control plane, and local
+  NVMe buys headroom on the paths that still commit rather than being the
+  difference between a fleet that keeps up and one that does not. See
+  `docs/node-liveness.md`.
+- **An election is quiet.** A newly elected status-lane leader inherits no
+  liveness state, so it seeds every active node at `now` and marks nothing
+  lost for `liveness.failoverGrace` (60s). A failover drill on a live fleet
+  should mark **zero** nodes lost; if it does not, check
+  `legion_liveness_loss_suppressed_total`.
 
 ### Recovering a replica that stopped a lane on an apply conflict
 

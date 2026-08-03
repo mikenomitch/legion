@@ -472,6 +472,7 @@ fn test_node_msg(id: &str) -> NodeMsg {
         pool: "default".into(),
         availability: "available".into(),
         last_heartbeat: "2023-01-01T00:00:00Z".into(),
+        heartbeat_source: String::new(),
         config_attrs: json!({ "maxAllocations": 100, "resources": {} }),
         fingerprint_attrs: json!({
             "memory_total": "4294967296",

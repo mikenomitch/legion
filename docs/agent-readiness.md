@@ -62,7 +62,8 @@ Even with `--allow-write`, `legion_state_query` is forced to read-only.
 | `legion_volume_list` | no | List volumes — the storage behind stateful instances. Filters by job/node/plugin/instance/state. |
 | `legion_volume_get` | no | Inspect one volume: plugin, params, node pin, mount path, last driver error. |
 | `legion_volume_drivers` | no | Volume plugins installed across the cluster and which nodes can use them. Answers "why was my job rejected for plugin X". |
-| `legion_node_list` | no | List worker nodes. |
+| `legion_node_list` | no | List worker nodes. Each carries `heartbeat_source` — see the freshness note below. |
+| `legion_node_cadence` | no | Is the fleet sustaining its heartbeat cadence? Freshness ratio, lost window, sustainable fleet size, and the `heartbeatSeconds` to set if it is falling behind ([heartbeat-cadence-and-scale.md](heartbeat-cadence-and-scale.md)). |
 | `legion_node_claims` | no | A node's live provisional (unratified) allocations — started-but-unconfirmed work ([edge-boot.md](edge-boot.md)). Tells "still booting" from "already confirmed". |
 | `legion_boot_ticket_list` | no | Outstanding boot tickets (metadata only; token bytes are never stored or returned). |
 | `legion_service_list` | no | List declared services with healthy/total endpoint counts — what a job can connect to. |
@@ -94,6 +95,25 @@ following MCP convention; transport/protocol errors use JSON-RPC `error`.
 
 The transport contract is one JSON message per line. In MCP mode Legion routes
 all console logs to **stderr** so stdout stays a clean protocol stream.
+
+### Reading a node's last heartbeat honestly
+
+`NodeMsg.last_heartbeat` is **not** always a live clock, and an agent that
+treats it as one will draw wrong conclusions. Heartbeats are tracked in the
+memory of the manager that owns node status; only status *transitions* are
+replicated. Every node therefore carries `heartbeat_source`:
+
+- `live` — the answering manager observed the beat itself. Current.
+- `checkpoint` — from a periodic replicated checkpoint, up to
+  `liveness.checkpointInterval` (30s by default) behind.
+- `""` — no beat observed, or checkpoints are disabled.
+
+**The node's `status` is exact on every manager**, so `status` is what to
+branch on. Use `last_heartbeat` for display and for ordering, not as evidence
+that a node has just died — and when a lot of nodes look stale at once, call
+`legion_node_cadence` before concluding anything: a low freshness ratio means
+the control plane is behind, not that the machines are gone. See
+[node-liveness.md](node-liveness.md).
 
 ## 2. Structured output envelope
 

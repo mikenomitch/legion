@@ -4431,6 +4431,7 @@ mod tests {
             dynamic_attrs: dynamic_attrs.to_string(),
             health_checks: "{}".into(),
             last_heartbeat: "2023-01-01 00:00:00 +00:00:00".into(),
+            heartbeat_source: String::new(),
         }
     }
 
@@ -5242,6 +5243,7 @@ mod tests {
             pool: "default".into(),
             availability: "available".into(),
             last_heartbeat: "2023-01-01 00:00:00 +00:00:00".into(),
+            heartbeat_source: String::new(),
             config_attrs: json!({ "role": "db" }),
             fingerprint_attrs: json!({ "arch": "arm64" }),
             dynamic_attrs: json!({ "zone": "us-east" }),
@@ -5353,6 +5355,7 @@ mod tests {
                 pool: "default".into(),
                 availability: "available".into(),
                 last_heartbeat: String::new(),
+                heartbeat_source: String::new(),
                 config_attrs: json!({"zone": "us-east"}),
                 fingerprint_attrs: default_fingerprint(),
                 dynamic_attrs: json!({}),
@@ -5364,6 +5367,7 @@ mod tests {
                 pool: "default".into(),
                 availability: "available".into(),
                 last_heartbeat: String::new(),
+                heartbeat_source: String::new(),
                 config_attrs: json!({"zone": "us-west"}),
                 fingerprint_attrs: default_fingerprint(),
                 dynamic_attrs: json!({}),
@@ -5642,6 +5646,7 @@ mod tests {
             pool: "default".into(),
             availability: "available".into(),
             last_heartbeat: String::new(),
+            heartbeat_source: String::new(),
             config_attrs: json!({}),
             fingerprint_attrs: json!({
                 "memory_total": "536870912",
@@ -5720,6 +5725,7 @@ mod tests {
             pool: "default".into(),
             availability: "available".into(),
             last_heartbeat: String::new(),
+            heartbeat_source: String::new(),
             config_attrs: json!({}),
             fingerprint_attrs,
             dynamic_attrs: json!({}),
@@ -7259,6 +7265,7 @@ mod tests {
             pool: "default".into(),
             availability: "available".into(),
             last_heartbeat: "2023-01-01T00:00:00Z".into(),
+            heartbeat_source: String::new(),
             config_attrs: json!({}),
             fingerprint_attrs: json!({}),
             dynamic_attrs: json!({}),

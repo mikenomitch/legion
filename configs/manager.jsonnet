@@ -189,6 +189,64 @@
       joinTokenTtlSeconds: 900,
     },
   },
+  // Heartbeat cadence and the lost-node window derived from it
+  // (docs/heartbeat-cadence-and-scale.md). Omitting the whole block
+  // reproduces Legion's historical behavior exactly: workers keep their
+  // worker-type `heartbeatSeconds`, nothing adapts, and 5 x 2s is the
+  // historical fixed 10s lost window.
+  heartbeat: {
+    // Missed beats before a node is lost. The lost window is ALWAYS this
+    // times THAT node's own interval, so a 2s pool and a 60s pool get
+    // 10s and 300s windows from one setting.
+    missedBeatsBeforeLost: 5,
+
+    // Aggregate heartbeat rate this control plane will accept. When set, the
+    // manager computes each worker's interval from FLEET SIZE and serves it
+    // on the heartbeat reply, so cadence backs off as the fleet grows
+    // instead of healthy nodes being marked lost. Unset (the default) means
+    // nothing adapts — measure yours with `legion node cadence` first.
+    // targetRatePerSecond: 80,
+
+    // Floor and ceiling on a served interval. Past the ceiling the manager
+    // stops backing off and warns instead: the answer is more control plane.
+    minInterval: "2s",
+    maxInterval: "120s",
+
+    // Headroom in the sizing formula `heartbeatSeconds >= H x N / R`.
+    // 2 runs the control plane at half its measured ceiling.
+    headroom: 2,
+  },
+  // Node liveness: where heartbeat state lives and how it survives an
+  // election (docs/node-liveness.md). Heartbeats are tracked in the
+  // status-lane leader's MEMORY; only status transitions are replicated.
+  liveness: {
+    // After acquiring status-lane leadership (or starting the process), mark
+    // nothing lost for this long. A new leader inherits no liveness state and
+    // rebuilds it from incoming heartbeats, so an election is not an outage.
+    failoverGrace: "60s",
+
+    // How often a manager that does NOT lead the status lane reports the
+    // nodes it heard from to the leader. ONE RPC per manager per interval,
+    // whatever the fleet size.
+    digestInterval: "1s",
+
+    // How long the leader keeps trusting a silent peer manager's last
+    // digest. A manager-to-manager problem must not present as fleet-wide
+    // node loss.
+    peerDigestGrace: "30s",
+
+    // How often the leader replicates a batched heartbeat checkpoint so
+    // every manager can show an approximate "last heartbeat" time. DISPLAY
+    // ONLY — never read back as liveness. "0s" disables it entirely, and
+    // non-leaders then show no time rather than an approximate one.
+    checkpointInterval: "30s",
+
+    // Accumulation window for the heartbeat group commit. "0ms" (the
+    // default) is commit-while-you-can batching. A steady-state heartbeat
+    // does not commit at all, so this applies only to the checkpoint and to
+    // the mixed-version forwarding fallback.
+    // batchWindow: "0ms",
+  },
   // Auth & ACLs (off by default; see docs/auth-and-acls.md).
   // When enabled, run `legion acl bootstrap` once to mint the initial
   // management token, then create policies/tokens with `legion acl ...` and

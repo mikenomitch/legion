@@ -312,6 +312,11 @@ pub struct SampleSnapshot {
 pub enum SampleValue {
     Counter(u64),
     Gauge(i64),
+    /// A gauge whose value is genuinely fractional — a ratio, not a count.
+    /// Kept separate rather than scaling into the integer gauge so the metric
+    /// an operator alerts on reads in the units the docs state
+    /// (`legion_heartbeat_freshness_ratio` is 0.22, never 220).
+    GaugeF64(f64),
     Histogram {
         bounds: &'static [f64],
         /// Per-bucket (NON-cumulative) counts, one per bound plus a final
@@ -609,6 +614,42 @@ impl RenderMetric for Gauge {
     }
 }
 
+/// Unlabeled gauge with a fractional value (a ratio, a rate).
+pub struct FloatGauge {
+    meta: FamilyMeta,
+    bits: AtomicU64,
+}
+
+impl FloatGauge {
+    pub fn set(&self, v: f64) {
+        self.bits.store(v.to_bits(), Ordering::Relaxed);
+    }
+
+    pub fn get(&self) -> f64 {
+        f64::from_bits(self.bits.load(Ordering::Relaxed))
+    }
+}
+
+impl RenderMetric for FloatGauge {
+    fn render_into(&self, out: &mut String) {
+        render_header(out, &self.meta, "gauge");
+        out.push_str(&format!("{} {}\n", self.meta.name, self.get()));
+    }
+
+    fn snapshot_family(&self) -> FamilySnapshot {
+        FamilySnapshot {
+            name: self.meta.name,
+            help: self.meta.help,
+            kind: SnapshotKind::Gauge,
+            label_names: self.meta.labels,
+            samples: vec![SampleSnapshot {
+                label_values: Vec::new(),
+                value: SampleValue::GaugeF64(self.get()),
+            }],
+        }
+    }
+}
+
 /// Unlabeled histogram.
 pub struct Histogram {
     meta: FamilyMeta,
@@ -731,6 +772,30 @@ pub struct Metrics {
     pub scheduler_plan_phase_seconds: Arc<HistogramVec>,
     /// `legion_scheduler_lazy_sample_fallback_total`
     pub scheduler_lazy_sample_fallback_total: Arc<Counter>,
+    /// `legion_heartbeat_freshness_ratio` — **the number to alert on.**
+    pub heartbeat_freshness_ratio: Arc<FloatGauge>,
+    /// `legion_heartbeat_served_interval_seconds`
+    pub heartbeat_served_interval_seconds: Arc<Gauge>,
+    /// `legion_heartbeat_lost_window_seconds`
+    pub heartbeat_lost_window_seconds: Arc<Gauge>,
+    /// `legion_heartbeat_sustainable_nodes`
+    pub heartbeat_sustainable_nodes: Arc<Gauge>,
+    /// `legion_nodes_marked_lost_total`
+    pub nodes_marked_lost_total: Arc<Counter>,
+    /// `legion_liveness_tracked_nodes`
+    pub liveness_tracked_nodes: Arc<Gauge>,
+    /// `legion_liveness_responsible_seconds`
+    pub liveness_responsible_seconds: Arc<Gauge>,
+    /// `legion_liveness_digest_rpcs_total{outcome}`
+    pub liveness_digest_rpcs_total: Arc<CounterVec>,
+    /// `legion_liveness_digest_nodes`
+    pub liveness_digest_nodes: Arc<Histogram>,
+    /// `legion_liveness_peer_stale{peer}`
+    pub liveness_peer_stale: Arc<GaugeVec>,
+    /// `legion_liveness_loss_suppressed_total{reason}`
+    pub liveness_loss_suppressed_total: Arc<CounterVec>,
+    /// `legion_liveness_checkpoint_seconds`
+    pub liveness_checkpoint_seconds: Arc<Histogram>,
     /// Render order for the exposition endpoint.
     families: Vec<Arc<dyn RenderMetric>>,
 }
@@ -1057,7 +1122,123 @@ impl Metrics {
             cell: CounterCell::default(),
         });
 
+        // Heartbeat cadence (docs/heartbeat-cadence-and-scale.md). All on the
+        // status-lane leader; a manager that does not own liveness reports 0,
+        // which is why the freshness ratio is derived from the store's view
+        // rather than from a per-process RPC counter — under `lanes` topology
+        // an RPC rate is only ever one manager's share.
+        let heartbeat_freshness_ratio = Arc::new(FloatGauge {
+            meta: FamilyMeta {
+                name: "legion_heartbeat_freshness_ratio",
+                help: "Fraction of active nodes that checked in within one heartbeat interval. 1.0 = the fleet is keeping up; false node loss begins at served_interval/lost_window (0.20 at the defaults). 0 on a manager that does not own liveness or a fleet too small to measure.",
+                labels: &[],
+            },
+            bits: AtomicU64::new(0),
+        });
+        let heartbeat_served_interval_seconds = Arc::new(Gauge {
+            meta: FamilyMeta {
+                name: "legion_heartbeat_served_interval_seconds",
+                help: "Heartbeat interval this manager is currently telling workers to use.",
+                labels: &[],
+            },
+            cell: GaugeCell::default(),
+        });
+        let heartbeat_lost_window_seconds = Arc::new(Gauge {
+            meta: FamilyMeta {
+                name: "legion_heartbeat_lost_window_seconds",
+                help: "Lost-node window derived from the served interval (missedBeatsBeforeLost x interval).",
+                labels: &[],
+            },
+            cell: GaugeCell::default(),
+        });
+        let heartbeat_sustainable_nodes = Arc::new(Gauge {
+            meta: FamilyMeta {
+                name: "legion_heartbeat_sustainable_nodes",
+                help: "Nodes this control plane is observed to sustain at the current interval. A LOWER BOUND while the fleet is keeping up: an unsaturated control plane never reveals its ceiling.",
+                labels: &[],
+            },
+            cell: GaugeCell::default(),
+        });
+        let nodes_marked_lost_total = Arc::new(Counter {
+            meta: FamilyMeta {
+                name: "legion_nodes_marked_lost_total",
+                help: "Nodes marked lost after missed heartbeats. Distinguishes 'nodes went away' from legion_nodes{status=\"lost\"}'s 'nodes are away'.",
+                labels: &[],
+            },
+            cell: CounterCell::default(),
+        });
+
+        // Node liveness (docs/node-liveness.md).
+        let liveness_tracked_nodes = Arc::new(Gauge {
+            meta: FamilyMeta {
+                name: "legion_liveness_tracked_nodes",
+                help: "Nodes in this manager's in-memory liveness table. Should equal legion_nodes{status=\"active\"} on the status-lane leader; 0 elsewhere.",
+                labels: &[],
+            },
+            cell: GaugeCell::default(),
+        });
+        let liveness_responsible_seconds = Arc::new(Gauge {
+            meta: FamilyMeta {
+                name: "legion_liveness_responsible_seconds",
+                help: "Seconds since this manager became responsible for liveness (process start OR status-lane leadership acquisition, whichever is later). Resets at every acquisition, which is what makes 'we just took over' visible.",
+                labels: &[],
+            },
+            cell: GaugeCell::default(),
+        });
+        let liveness_digest_rpcs_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_liveness_digest_rpcs_total",
+                help: "Liveness digests sent to the status-lane leader, by outcome (ok|not_leader|error|unimplemented). 'unimplemented' means a peer that predates digests leads the lane and heartbeats have fallen back to replicated writes.",
+                labels: &["outcome"],
+            },
+            series: Series::new(),
+        });
+        let liveness_digest_nodes = Arc::new(Histogram {
+            meta: FamilyMeta {
+                name: "legion_liveness_digest_nodes",
+                help: "Node ids carried by one liveness digest.",
+                labels: &[],
+            },
+            cell: HistogramCell::new(COUNT_BUCKETS),
+        });
+        let liveness_peer_stale = Arc::new(GaugeVec {
+            meta: FamilyMeta {
+                name: "legion_liveness_peer_stale",
+                help: "1 while a peer manager has missed several liveness digests. THE metric to alert on for a manager-to-manager problem: without it, one quiet manager looks like its share of the fleet dying.",
+                labels: &["peer"],
+            },
+            series: Series::new(),
+        });
+        let liveness_loss_suppressed_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_liveness_loss_suppressed_total",
+                help: "Would-be node losses the manager declined to act on, by reason (failover_grace|peer_digest_gap|mass_disruption). 'Nothing was marked lost' must never be indistinguishable from 'nothing was wrong'.",
+                labels: &["reason"],
+            },
+            series: Series::new(),
+        });
+        let liveness_checkpoint_seconds = Arc::new(Histogram {
+            meta: FamilyMeta {
+                name: "legion_liveness_checkpoint_seconds",
+                help: "Wall-clock of one replicated liveness checkpoint (the display-only batched write of observed heartbeat times).",
+                labels: &[],
+            },
+            cell: HistogramCell::new(DURATION_BUCKETS),
+        });
+
         let families: Vec<Arc<dyn RenderMetric>> = vec![
+            Arc::clone(&heartbeat_freshness_ratio) as Arc<dyn RenderMetric>,
+            Arc::clone(&heartbeat_served_interval_seconds) as Arc<dyn RenderMetric>,
+            Arc::clone(&heartbeat_lost_window_seconds) as Arc<dyn RenderMetric>,
+            Arc::clone(&heartbeat_sustainable_nodes) as Arc<dyn RenderMetric>,
+            Arc::clone(&nodes_marked_lost_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&liveness_tracked_nodes) as Arc<dyn RenderMetric>,
+            Arc::clone(&liveness_responsible_seconds) as Arc<dyn RenderMetric>,
+            Arc::clone(&liveness_digest_rpcs_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&liveness_digest_nodes) as Arc<dyn RenderMetric>,
+            Arc::clone(&liveness_peer_stale) as Arc<dyn RenderMetric>,
+            Arc::clone(&liveness_loss_suppressed_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&liveness_checkpoint_seconds) as Arc<dyn RenderMetric>,
             Arc::clone(&allocations) as Arc<dyn RenderMetric>,
             Arc::clone(&eval_queue_depth) as Arc<dyn RenderMetric>,
             Arc::clone(&evals_processed_total) as Arc<dyn RenderMetric>,
@@ -1137,6 +1318,18 @@ impl Metrics {
             scheduler_index_maintenance_seconds,
             scheduler_plan_phase_seconds,
             scheduler_lazy_sample_fallback_total,
+            heartbeat_freshness_ratio,
+            heartbeat_served_interval_seconds,
+            heartbeat_lost_window_seconds,
+            heartbeat_sustainable_nodes,
+            nodes_marked_lost_total,
+            liveness_tracked_nodes,
+            liveness_responsible_seconds,
+            liveness_digest_rpcs_total,
+            liveness_digest_nodes,
+            liveness_peer_stale,
+            liveness_loss_suppressed_total,
+            liveness_checkpoint_seconds,
             families,
         }
     }

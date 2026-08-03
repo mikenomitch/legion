@@ -564,6 +564,7 @@ fn build_node(spec: &NodeSpec) -> Node {
         pool: "default".into(),
         availability: "available".into(),
         last_heartbeat: "2023-01-01T00:00:00Z".into(),
+        heartbeat_source: String::new(),
         config_attrs,
         fingerprint_attrs,
         dynamic_attrs: json!({}),

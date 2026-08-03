@@ -464,6 +464,22 @@ service Manager {
   // Returns one node by ID.
   rpc GetNode (GetNodeRequest) returns (GetNodeReply);
 
+  // Reports whether this fleet is sustaining its heartbeat cadence, and what
+  // to do about it if it is not.
+  //
+  // Read-only and cheap: every field is derived from the liveness snapshot the
+  // status checker already takes each tick, so calling this costs no extra
+  // scan. Backs `legion node cadence`.
+  //
+  // Answer with care on a manager that does not lead the status lane: it does
+  // not own liveness, so it reports zeros rather than a guess. Ask any manager
+  // and check `is_liveness_owner` in the reply.
+  //
+  // ACL: node:read, unscoped (the report is fleet-wide).
+  // See docs/heartbeat-cadence-and-scale.md.
+  rpc GetHeartbeatCadence (GetHeartbeatCadenceRequest)
+    returns (GetHeartbeatCadenceReply);
+
   // Proxies a restart request to a worker node.
   rpc RestartWorker (RestartWorkerRequest) returns (RestartWorkerReply);
 
@@ -2737,6 +2753,29 @@ message HeartbeatReply {
   //
   // Default: empty list.
   repeated ClaimVerdict claim_verdicts = 6;
+
+  // The interval, in seconds, the manager wants this worker to heartbeat at.
+  //
+  // Present only when the manager runs adaptive cadence
+  // (`heartbeat.targetRatePerSecond` in the manager config); absent means
+  // "keep using your worker-type `heartbeatSeconds`", which is the default and
+  // reproduces Legion's historical behavior exactly.
+  //
+  // The manager derives this node's lost-node window from the SAME value
+  // (`missedBeatsBeforeLost x interval`), so a worker that honors a slower
+  // cadence is never penalized for it. A worker that ignores the field — an
+  // older build — is also never penalized: the manager widens a node's window
+  // the moment it decides to slow down, before any worker has been told, and
+  // only narrows a window after observing that node actually beating at the
+  // faster rate.
+  //
+  // A worker that adopts a new interval sleeps one uniform `[0, interval)`
+  // before resuming its normal jittered cadence, so a fleet that all learns
+  // the new value within one old interval spreads across the new period
+  // instead of re-phasing onto the same boundary.
+  //
+  // See docs/heartbeat-cadence-and-scale.md.
+  optional uint32 next_interval_seconds = 7;
 }
 
 // Why one allocation is being stopped.
@@ -3005,7 +3044,99 @@ message NodeMsg {
   // Last heartbeat timestamp string.
   //
   // On worker registration this starts empty and is set on first heartbeat.
+  //
+  // FRESHNESS CAVEAT: read `heartbeat_source` before trusting this as a live
+  // clock. Heartbeats are tracked in the status-lane leader's memory and only
+  // status transitions are replicated, so on any other manager this value
+  // comes from a periodic checkpoint and can be up to
+  // `liveness.checkpointInterval` (30s by default) behind. The node's
+  // `status` is exact everywhere.
   string last_heartbeat = 9;
+
+  // Where `last_heartbeat` came from on the manager that answered:
+  //
+  // - `"live"` — this manager owns liveness and observed the beat itself. The
+  //   timestamp is current.
+  // - `"checkpoint"` — a replicated checkpoint, accurate to within
+  //   `liveness.checkpointInterval`. It records the time the beat was
+  //   OBSERVED, not the time the checkpoint was written, so it is coarse
+  //   rather than wrong.
+  // - `""` — no heartbeat has been observed, or checkpoints are disabled
+  //   (`liveness.checkpointInterval: "0s"`), in which case a non-owning
+  //   manager reports no time rather than an approximate one.
+  //
+  // Additive: a client built before this field ignores it and sees exactly
+  // today's `last_heartbeat`. See docs/node-liveness.md.
+  string heartbeat_source = 10;
+}
+
+// Request payload for GetHeartbeatCadence. No parameters: the report is
+// always fleet-wide, because the question it answers ("is the control plane
+// keeping up?") has no per-node answer.
+message GetHeartbeatCadenceRequest {}
+
+// Reply payload for GetHeartbeatCadence — one fleet's cadence report.
+//
+// The arithmetic behind every field is published in
+// docs/heartbeat-cadence-and-scale.md; the short version is
+// `sustainable_nodes ~= R x I`, where `R` is heartbeat commits per second this
+// control plane sustains and `I` is the interval.
+message GetHeartbeatCadenceReply {
+  // Active nodes this manager currently tracks.
+  uint32 active_nodes = 1;
+
+  // The interval, in seconds, this manager is currently telling workers to
+  // use. With adaptive cadence off this is the configured floor
+  // (`heartbeat.minInterval`, 2s by default) and workers keep their
+  // worker-type `heartbeatSeconds` instead.
+  uint32 served_interval_seconds = 2;
+
+  // The lost-node window derived from it:
+  // `missed_beats_before_lost x served_interval_seconds`.
+  uint32 lost_window_seconds = 3;
+
+  // Fraction of active nodes that checked in within one interval, 0.0 to 1.0.
+  // 1.0 means the fleet is keeping up. False node loss begins when this falls
+  // below `served_interval_seconds / lost_window_seconds` — 0.20 at the
+  // defaults. Zero, with `freshness_measurable` false, on a fleet too small to
+  // measure (under 20 nodes) or on a manager that does not own liveness.
+  double freshness_ratio = 4;
+
+  // Whether `freshness_ratio` means anything. False on a tiny fleet, where the
+  // ratio is pure noise, and on a non-owning manager.
+  bool freshness_measurable = 5;
+
+  // Nodes this control plane is OBSERVED to sustain at the current interval.
+  //
+  // A lower bound, not a ceiling: a control plane that is comfortably keeping
+  // up never reveals how much more it could take, so this reads as roughly the
+  // current fleet size until the fleet is actually pressed.
+  uint32 sustainable_nodes_estimate = 6;
+
+  // The value to put in `heartbeatSeconds` for a fleet this size on this
+  // control plane, at the configured headroom. The remedy is computed, not
+  // left as a formula for the operator to evaluate mid-incident.
+  uint32 suggested_heartbeat_seconds = 7;
+
+  // Whether `heartbeat.targetRatePerSecond` is set, i.e. whether the manager
+  // dictates cadence at all. Off by default.
+  bool adaptive_enabled = 8;
+
+  // True when the controller wanted to back off further but hit
+  // `heartbeat.maxInterval`. Backing off is not infinite; past this point the
+  // answer is more control plane, and the manager warns rather than slowing
+  // the fleet down further.
+  bool at_max_interval = 9;
+
+  // Missed beats before a node is marked lost
+  // (`heartbeat.missedBeatsBeforeLost`, 5 by default).
+  uint32 missed_beats_before_lost = 10;
+
+  // Whether the manager that answered owns liveness — that is, leads the
+  // status lane (always true outside raft mode and in `single` topology). When
+  // false, every number above is zero: a manager that does not own liveness
+  // reports nothing rather than guessing.
+  bool is_liveness_owner = 11;
 }
 
 // Request payload for GetNodes.
@@ -5696,6 +5827,74 @@ service RaftTransport {
   // allocations).
   // ACL: manager-plane internal, authenticated by cluster secret metadata.
   rpc ForwardLaneWrite (RaftLaneRequest) returns (RaftLaneReply);
+
+  // Reports which nodes a manager has personally received heartbeats from,
+  // to the manager that leads the status lane.
+  //
+  // This is what keeps liveness off the raft path under `lanes` topology with
+  // a standing leadership split. Workers dial ONE manager forever, so a
+  // manager that leads nothing still receives their beats; rather than
+  // forwarding each beat as a replicated write (the pre-digest behavior, kept
+  // as the mixed-version fallback), it batches the ids it heard from and sends
+  // one of these per `liveness.digestInterval`. The cost is
+  // `managers x 1 RPC/interval`, independent of fleet size — at 1000 nodes
+  // across 3 managers, 2 RPCs a second carrying ~333 ids each, against ~500
+  // forwarded raft writes a second before.
+  //
+  // Pushed rather than pulled deliberately: a pull would make the lost
+  // decision itself depend on a fan-out completing, so a manager that was slow
+  // at tick time would make its nodes look dead. A push lets the leader hold
+  // the last digest, know how old it is, and DECLINE to decide — see
+  // `liveness.peerDigestGrace`.
+  //
+  // Carries ids only, not per-node times. Ids plus the digest's own timestamp
+  // decide liveness at `digestInterval` resolution, and it keeps the message
+  // small and the merge trivial.
+  //
+  // ACL: manager-plane internal, authenticated by cluster secret metadata —
+  // it is not a `Manager` RPC, so it takes no ACL row and
+  // `tests/acl_endpoints.rs::every_manager_rpc_is_classified` does not cover
+  // it. See docs/node-liveness.md.
+  rpc ReportNodeLiveness (NodeLivenessDigestRequest)
+    returns (NodeLivenessDigestReply);
+}
+
+// One manager's report of the nodes it is hearing from.
+message NodeLivenessDigestRequest {
+  // Sender's wire-protocol version, so a receiver can refuse a digest it
+  // cannot interpret rather than silently dropping nodes from liveness.
+  uint32 protocol_version = 1;
+
+  // The reporting manager's string id ("host:port"). The leader keys its
+  // per-peer staleness tracking on this, and raises
+  // `legion_liveness_peer_stale{peer}` for it when the digests stop.
+  string observer_manager_id = 2;
+
+  // When the sender took this observation, unix milliseconds. Advisory: the
+  // receiver times peer staleness on its OWN clock, because two managers'
+  // wall clocks disagreeing must not turn into node loss.
+  int64 observed_at_unix_ms = 3;
+
+  // Every node this manager has received a heartbeat from since its last
+  // digest. Authoritative for this peer: the leader REPLACES the peer's
+  // previous claimed set, so a node that moved managers is not left attributed
+  // to the old one.
+  repeated string seen_node_ids = 4;
+}
+
+// Reply payload for RaftTransport.ReportNodeLiveness.
+message NodeLivenessDigestReply {
+  // True when the receiver leads the status lane and merged the digest.
+  bool accepted = 1;
+
+  // True when the receiver does NOT lead the status lane. The sender re-targets
+  // using `leader_hint`, exactly as ForwardLaneWrite callers do; until it
+  // does, its nodes are covered by the previous leader's `peerDigestGrace`.
+  bool not_status_leader = 2;
+
+  // The receiver's own view of who leads the status lane, as "host:port".
+  // Empty when it does not know (mid-election).
+  string leader_hint = 3;
 }
 
 // Request envelope for the three openraft protocol RPCs (AppendEntries,
