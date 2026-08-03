@@ -34,21 +34,21 @@ use crate::structs::{
     DeleteVolumeRequest, DestroyInstanceReply, DestroyInstanceRequest, DestroyJobReply,
     DestroyJobRequest, ExecClientFrame, FailedAllocation, GetAllocationLogsReply,
     GetAllocationLogsRequest, GetArtifactCredentialReply, GetArtifactCredentialRequest,
-    GetInstanceReply, GetInstanceRequest, GetJobInfoReply, GetJobInfoRequest,
-    GetJobScaleStatusReply, GetJobScaleStatusRequest, GetJobSpecByConfigRequest, GetJobSpecReply,
-    GetJobSpecRequest, GetJobTemplateReply, GetJobTemplateRequest, GetKvLockReply,
-    GetKvLockRequest, GetKvReply, GetKvRequest, GetLedgerReply, GetLedgerRequest,
-    GetManagerConfigsReply, GetManagerConfigsRequest, GetNodeReply, GetNodeRequest, GetNodesReply,
-    GetNodesRequest, GetObservabilityReply, GetObservabilityRequest, GetRaftJoinTokenReply,
-    GetRaftJoinTokenRequest, GetRaftStatusReply, GetRaftStatusRequest, GetRolloutReply,
-    GetRolloutRequest, GetRolloutStatusReply, GetRolloutStatusRequest, GetStateBackupReply,
-    GetStateBackupRequest, GetStateStoreSchemaReply, GetStateStoreSchemaRequest,
-    GetTaskLogsRequest, GetVolumeReply, GetVolumeRequest, HealthCheckReply, HealthCheckRequest,
-    HeartbeatReply, HeartbeatRequest, Instance, InstanceInfo, InstanceMode, InstanceState,
-    IssueBootTicketReply, IssueBootTicketRequest, IssueNodeIdentityTokenReply,
-    IssueNodeIdentityTokenRequest, IssueRaftCommandReply, IssueRaftCommandRequest,
-    IssueWorkloadIdentityTokenReply, IssueWorkloadIdentityTokenRequest, JobConfig,
-    JobSpecHistoryItem, JobTemplate, JobTemplateProvenance, JobTemplateSummary,
+    GetHeartbeatCadenceReply, GetHeartbeatCadenceRequest, GetInstanceReply, GetInstanceRequest,
+    GetJobInfoReply, GetJobInfoRequest, GetJobScaleStatusReply, GetJobScaleStatusRequest,
+    GetJobSpecByConfigRequest, GetJobSpecReply, GetJobSpecRequest, GetJobTemplateReply,
+    GetJobTemplateRequest, GetKvLockReply, GetKvLockRequest, GetKvReply, GetKvRequest,
+    GetLedgerReply, GetLedgerRequest, GetManagerConfigsReply, GetManagerConfigsRequest,
+    GetNodeReply, GetNodeRequest, GetNodesReply, GetNodesRequest, GetObservabilityReply,
+    GetObservabilityRequest, GetRaftJoinTokenReply, GetRaftJoinTokenRequest, GetRaftStatusReply,
+    GetRaftStatusRequest, GetRolloutReply, GetRolloutRequest, GetRolloutStatusReply,
+    GetRolloutStatusRequest, GetStateBackupReply, GetStateBackupRequest, GetStateStoreSchemaReply,
+    GetStateStoreSchemaRequest, GetTaskLogsRequest, GetVolumeReply, GetVolumeRequest,
+    HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, Instance, InstanceInfo,
+    InstanceMode, InstanceState, IssueBootTicketReply, IssueBootTicketRequest,
+    IssueNodeIdentityTokenReply, IssueNodeIdentityTokenRequest, IssueRaftCommandReply,
+    IssueRaftCommandRequest, IssueWorkloadIdentityTokenReply, IssueWorkloadIdentityTokenRequest,
+    JobConfig, JobSpecHistoryItem, JobTemplate, JobTemplateProvenance, JobTemplateSummary,
     JobTemplateVariable, JobTemplateVersionInfo, KvEntry, KvInjectionAction, KvValueType,
     LedgerNode, ListBootTicketsReply, ListBootTicketsRequest, ListEventsReply, ListEventsRequest,
     ListInstancesReply, ListInstancesRequest, ListJobActionsReply, ListJobActionsRequest,
@@ -1085,6 +1085,10 @@ pub struct ManagerDaemonService {
     /// row lands. A failover shows nothing until the next heartbeat, which is
     /// at most one interval of incompleteness and never a wrong answer.
     provisional_claims: Arc<Mutex<HashMap<String, Vec<crate::structs::ProvisionalClaimReport>>>>,
+    /// Heartbeat cadence settings (`heartbeat`, docs/heartbeat-cadence-and-scale.md).
+    /// Adaptive cadence is off unless `targetRatePerSecond` is set, so by
+    /// default this only supplies `missedBeatsBeforeLost` to the cadence report.
+    heartbeat: crate::structs::HeartbeatConfigFull,
 }
 
 impl ManagerDaemonService {
@@ -1113,7 +1117,15 @@ impl ManagerDaemonService {
             exec_enabled: true,
             edge_boot: crate::structs::EdgeBootConfigFull::default(),
             provisional_claims: Arc::new(Mutex::new(HashMap::new())),
+            heartbeat: crate::structs::HeartbeatConfigFull::default(),
         }
+    }
+
+    /// Attach the manager's heartbeat-cadence settings (`run_manager` always
+    /// does; direct service users get the defaults, which serve no interval).
+    pub fn with_heartbeat_config(mut self, heartbeat: crate::structs::HeartbeatConfigFull) -> Self {
+        self.heartbeat = heartbeat;
+        self
     }
 
     /// Drop-in ACL gate for RPC handlers: authenticates the caller and
@@ -1584,6 +1596,7 @@ impl ManagerDaemonService {
             .map(|identity| identity.name.clone())
             .collect();
         service.exec_enabled = config.exec.enabled;
+        service.heartbeat = config.heartbeat.clone();
         service
     }
 
@@ -5105,21 +5118,21 @@ impl Manager for ManagerDaemonService {
         let id = req.id;
         let provisional_claims = req.provisional_claims;
 
-        // Offloaded, not called inline: `update_node_heartbeat` is a
-        // BLOCKING call (coalescer std::sync::Mutex + mpsc, then a raft
-        // commit that fsyncs). Running it on a tokio worker thread parks
-        // that thread for the whole commit, so at most `worker_threads`
-        // heartbeats can be in flight — and, worse, every other heartbeat
-        // stays stuck in the gRPC layer where the coalescer cannot see it.
-        // The coalescer batches whatever is queued when a commit finishes,
-        // so starving its queue keeps batches at size 1 and defeats the
-        // group commit entirely (HEARTBEAT_BATCH_MAX is 128).
+        // Offloaded, not called inline. In steady state this is now cheap —
+        // one read-model lookup and one map write, no commit and no fsync
+        // (docs/node-liveness.md) — but the call is still BLOCKING on the
+        // paths that do commit: a `lost -> active` transition, and the
+        // mixed-version fallback where a status-lane leader that predates
+        // liveness digests makes every beat a replicated write again.
         //
-        // Measured on gp3 EBS (3 voters, one box, 1000 sim nodes): 86
-        // heartbeats/sec, 17% of the 2s cadence, with the host idle. The
-        // same code on NVMe does ~2000/sec, because a 0.5ms commit meets
-        // demand even at batch size 1 — which is why this only shows up on
-        // network-attached storage.
+        // Running those on a tokio worker thread parks it for the whole
+        // commit, so at most `worker_threads` heartbeats can be in flight —
+        // and, worse, every other heartbeat stays stuck in the gRPC layer
+        // where the coalescer cannot see it. The coalescer batches whatever
+        // is queued when a commit finishes, so starving its queue keeps
+        // batches at size 1 and defeats the group commit entirely
+        // (HEARTBEAT_BATCH_MAX is 128). Measured on gp3 EBS before the
+        // offload: 86 heartbeats/sec, 17% of the 2s cadence, host idle.
         {
             let store = self.store.clone();
             let heartbeat_id = id.clone();
@@ -5200,6 +5213,16 @@ impl Manager for ManagerDaemonService {
             }
         }
 
+        // The cadence this manager wants, when it dictates one at all. Absent
+        // by default: adaptive cadence is opt-in, and a worker that receives
+        // nothing keeps its worker-type `heartbeatSeconds`, which is exactly
+        // the historical behavior.
+        let next_interval_seconds = self
+            .store
+            .liveness()
+            .served_interval()
+            .map(|interval| interval.as_secs() as u32);
+
         let reply = HeartbeatReply {
             message: "ack".into(),
             desired_allocations,
@@ -5207,9 +5230,65 @@ impl Manager for ManagerDaemonService {
             volume_destroy,
             stop_notices,
             claim_verdicts,
+            next_interval_seconds,
         };
 
         Ok(Response::new(reply))
+    }
+
+    #[instrument(skip_all)]
+    async fn get_heartbeat_cadence(
+        &self,
+        request: Request<GetHeartbeatCadenceRequest>,
+    ) -> Result<Response<GetHeartbeatCadenceReply>, Status> {
+        self.check_acl(
+            &request,
+            AclResource::Node,
+            AclAction::Read,
+            AclScope::any(),
+        )?;
+        // A manager that does not lead the status lane does not own liveness,
+        // so it has no snapshot to report. It answers zeros with
+        // `is_liveness_owner: false` rather than a guess: an approximate
+        // freshness ratio is worse than an honest "ask the owner".
+        if !self.store.is_raft_leader(crate::storage::Lane::Status) {
+            return Ok(Response::new(GetHeartbeatCadenceReply {
+                missed_beats_before_lost: self.heartbeat.missed_beats_before_lost,
+                adaptive_enabled: self.heartbeat.adaptive_enabled(),
+                is_liveness_owner: false,
+                ..Default::default()
+            }));
+        }
+        let now = std::time::Instant::now();
+        let snapshot = crate::manager::daemon::liveness_snapshot(&self.store, now)
+            .map_err(|e| map_store_error("Error reading node liveness", e))?;
+        let served = self
+            .store
+            .liveness()
+            .served_interval()
+            .unwrap_or_else(|| self.heartbeat.parsed_min_interval());
+        let report = crate::manager::cadence::cadence_report(
+            &snapshot,
+            served,
+            self.heartbeat.missed_beats_before_lost.max(1),
+            self.heartbeat.headroom,
+            HEARTBEAT_FRESHNESS_MIN_FLEET,
+            self.heartbeat.adaptive_enabled(),
+            served >= self.heartbeat.parsed_max_interval(),
+        );
+        Ok(Response::new(GetHeartbeatCadenceReply {
+            active_nodes: report.active_nodes as u32,
+            served_interval_seconds: report.served_interval.as_secs() as u32,
+            lost_window_seconds: report.lost_window.as_secs() as u32,
+            freshness_ratio: report.freshness_ratio.unwrap_or(0.0),
+            freshness_measurable: report.freshness_ratio.is_some(),
+            sustainable_nodes_estimate: report.sustainable_nodes.unwrap_or(0) as u32,
+            suggested_heartbeat_seconds: report.suggested_heartbeat_seconds.unwrap_or(0) as u32,
+            adaptive_enabled: report.adaptive_enabled,
+            at_max_interval: report.at_max_interval,
+            missed_beats_before_lost: report.missed_beats_before_lost,
+            is_liveness_owner: true,
+        }))
     }
 
     #[instrument(skip_all)]
@@ -5336,6 +5415,7 @@ impl Manager for ManagerDaemonService {
             availability: "available".to_string(),
             pool: request.pool,
             last_heartbeat: String::new(),
+            heartbeat_source: String::new(),
             health_checks: request.health_checks,
         };
 
@@ -8454,6 +8534,7 @@ mod tests {
             dynamic_attrs: "{}".into(),
             health_checks: "{}".into(),
             last_heartbeat: "2023-01-01 00:00:00 +00:00:00".into(),
+            heartbeat_source: String::new(),
         };
         store.insert_node(node)?;
         Ok(())
@@ -9141,6 +9222,7 @@ mod tests {
             pool: "default".into(),
             availability: "available".into(),
             last_heartbeat: "2023-01-01T00:00:00Z".into(),
+            heartbeat_source: String::new(),
             config_attrs: json!({ "workerAddress": worker_address }),
             fingerprint_attrs: json!({}),
             dynamic_attrs: json!({}),
@@ -10357,6 +10439,7 @@ mod tests {
             pool: "default".into(),
             availability: "available".into(),
             last_heartbeat: "2023-01-01T00:00:00Z".into(),
+            heartbeat_source: String::new(),
             config_attrs: json!({ "node_id": "node-a" }),
             fingerprint_attrs: json!({}),
             dynamic_attrs: json!({ "tier": "edge" }),
@@ -10368,6 +10451,7 @@ mod tests {
             pool: "default".into(),
             availability: "available".into(),
             last_heartbeat: "2023-01-01T00:00:00Z".into(),
+            heartbeat_source: String::new(),
             config_attrs: json!({ "node_id": "node-b" }),
             fingerprint_attrs: json!({}),
             dynamic_attrs: json!({ "tier": "edge" }),

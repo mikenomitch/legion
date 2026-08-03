@@ -7,7 +7,7 @@
 //!   the fleet as fast as the store allows for a fixed window —
 //!   heartbeats/sec plus p50/p99 latency of `Store::update_node_heartbeat`.
 //! - **Liveness tick**: wall-clock of one manager liveness pass
-//!   (`get_node_ids_and_heartbeats` + the mark-lost decision) at that
+//!   (`liveness_snapshot` + the mark-lost decision) at that
 //!   fleet size.
 //!
 //! ```bash
@@ -54,6 +54,19 @@ struct Cell {
     p50_ms: f64,
     p99_ms: f64,
     liveness_tick_ms: f64,
+    /// The interval this cell's fleet was told to heartbeat at, and the
+    /// fraction of it that checked in on time.
+    ///
+    /// Non-negotiable in the result JSON (heartbeat-cadence plan §6.4): a
+    /// throughput number without its cadence is not publishable, because a
+    /// system that quietly slows its own heartbeats scores better for free.
+    served_interval_secs: u64,
+    freshness_ratio: f64,
+    /// Whether liveness was on the raft path for this cell. A heartbeat number
+    /// from a cluster in the mixed-version forwarding fallback measures the
+    /// commit path; one from a modern cluster measures the gRPC handler. The
+    /// two are not comparable (docs/testing-and-benchmarks.md).
+    liveness_on_raft_path: bool,
 }
 
 #[test]
@@ -129,12 +142,23 @@ fn heartbeat_scale_benchmark_matrix() -> R<()> {
             let elapsed = window_started.elapsed().as_secs_f64();
 
             // Liveness phase: one manager tick's scan + decision, averaged.
+            // The fake value is a fake RESPONSIBILITY age, not a fake process
+            // uptime — the grace clock now runs from status-lane leadership
+            // acquisition (liveness plan §6.4), and the ages the decision
+            // compares come from the in-memory table the heartbeats above
+            // populated rather than from the database.
             let tick_rounds = 10;
             let tick_started = Instant::now();
             for _ in 0..tick_rounds {
-                let rows = store.get_node_ids_and_heartbeats()?;
-                let lost =
-                    legion::manager::daemon::nodes_to_mark_lost(rows, Duration::from_secs(3600));
+                let snapshot = legion::manager::daemon::liveness_snapshot(&store, Instant::now())?;
+                let lost = legion::manager::cadence::decide_lost_nodes(
+                    &snapshot,
+                    &legion::manager::cadence::LossContext {
+                        responsible_for: Duration::from_secs(3600),
+                        ..Default::default()
+                    },
+                )
+                .lost;
                 // Every node just heartbeated: nothing should be lost.
                 assert!(
                     lost.len() < nodes,
@@ -144,6 +168,14 @@ fn heartbeat_scale_benchmark_matrix() -> R<()> {
             let liveness_tick_ms =
                 tick_started.elapsed().as_secs_f64() * 1000.0 / tick_rounds as f64;
 
+            // Cadence, recorded alongside throughput rather than assumed.
+            let served_interval =
+                Duration::from_secs(legion::constants::WORKER_HEARTBEAT_DURATION_SEC);
+            let snapshot = legion::manager::daemon::liveness_snapshot(&store, Instant::now())?;
+            let freshness_ratio =
+                legion::manager::cadence::freshness_ratio(&snapshot, served_interval, 0)
+                    .unwrap_or(0.0);
+
             cells.push(Cell {
                 backend: backend.label(),
                 nodes,
@@ -152,15 +184,21 @@ fn heartbeat_scale_benchmark_matrix() -> R<()> {
                 p50_ms: pctl(&latencies_ms, 0.50),
                 p99_ms: pctl(&latencies_ms, 0.99),
                 liveness_tick_ms,
+                served_interval_secs: served_interval.as_secs(),
+                freshness_ratio,
+                liveness_on_raft_path: store.liveness().digest_fallback(),
             });
             let cell = cells.last().expect("just pushed");
             eprintln!(
-                "[{} nodes={nodes}] {:.0} hb/s p50 {:.2}ms p99 {:.2}ms liveness_tick {:.2}ms",
+                "[{} nodes={nodes}] {:.0} hb/s p50 {:.2}ms p99 {:.2}ms liveness_tick {:.2}ms \
+                 cadence {}s freshness {:.2}",
                 cell.backend,
                 cell.heartbeats_per_sec,
                 cell.p50_ms,
                 cell.p99_ms,
-                cell.liveness_tick_ms
+                cell.liveness_tick_ms,
+                cell.served_interval_secs,
+                cell.freshness_ratio
             );
         }
     }
@@ -193,6 +231,9 @@ fn heartbeat_scale_benchmark_matrix() -> R<()> {
                 "p50_ms": cell.p50_ms,
                 "p99_ms": cell.p99_ms,
                 "liveness_tick_ms": cell.liveness_tick_ms,
+                "served_interval_secs": cell.served_interval_secs,
+                "freshness_ratio": cell.freshness_ratio,
+                "liveness_on_raft_path": cell.liveness_on_raft_path,
             })
         })
         .collect();

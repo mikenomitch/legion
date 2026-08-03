@@ -290,6 +290,44 @@ struct AppliedEvictions {
     metric_rows: Vec<(String, String, u64)>,
 }
 
+/// What a heartbeat from a given node costs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BeatDisposition {
+    /// The node is registered and already active: memory only, no commit.
+    Active,
+    /// The node is registered but not active (lost, or drained by a loss):
+    /// the beat carries a status transition and must be replicated.
+    Transition,
+    /// Not a registered node. The heartbeat is rejected — a ghost worker must
+    /// not think it is healthy, because its self-fence clock feeds off
+    /// heartbeat success.
+    Ghost,
+}
+
+/// One active node's replicated liveness row, for the status checker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveNodeLiveness {
+    pub id: String,
+    /// Persisted heartbeat clock. DISPLAY state once liveness is off the raft
+    /// path; `None` on a row written before the integer column existed.
+    pub last_heartbeat_unix: Option<i64>,
+    /// This node's own lost window in seconds. `None` falls back to
+    /// [`DEF_LOST_NODE_AT_SEC`], so a pre-migration row behaves exactly as it
+    /// always did.
+    pub lost_after_seconds: Option<i64>,
+}
+
+impl ActiveNodeLiveness {
+    /// The window to compare this node against.
+    pub fn window(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(
+            self.lost_after_seconds
+                .filter(|seconds| *seconds > 0)
+                .unwrap_or(DEF_LOST_NODE_AT_SEC) as u64,
+        )
+    }
+}
+
 /// One live stop notice, as the heartbeat feed serves it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredStopNotice {
@@ -508,8 +546,18 @@ pub struct Store {
     plan_coalescer: Arc<crate::storage::coalesce::Coalescer<PlanApplyRequest, PlanApplySlot>>,
     // Heartbeat group commit (heartbeat-scale plan §2): concurrent
     // update_node_heartbeat callers coalesce into one status-lane op
-    // stamping every batched node id.
+    // stamping every batched node id. Still the path for the display
+    // checkpoint and for the mixed-version forwarding fallback; a
+    // steady-state heartbeat no longer reaches it at all (liveness plan §6).
     heartbeat_coalescer: Arc<crate::storage::coalesce::Coalescer<String, ()>>,
+    // Node liveness as leader-local soft state (liveness plan §6.2). A
+    // steady-state heartbeat is one write into this table: no raft commit,
+    // no fsync, no pipeline-thread hop. Shared across clones so the gRPC
+    // handler and the status-checker tick see the same table.
+    liveness: Arc<crate::storage::liveness::LivenessTable>,
+    // Missed beats before a node is lost, from `heartbeat.missedBeatsBeforeLost`.
+    // A node's window is ALWAYS this times its own interval.
+    missed_beats_before_lost: u32,
 }
 
 /// Result of [`Store::state_backup`]: where the backup landed, its size,
@@ -813,7 +861,10 @@ impl Store {
                 "heartbeat",
                 HEARTBEAT_BATCH_MAX,
             )),
+            liveness: Arc::new(crate::storage::liveness::LivenessTable::new()),
+            missed_beats_before_lost: config.heartbeat.missed_beats_before_lost.max(1),
         };
+        store.liveness.configure(config.liveness.settings());
 
         store.refresh_read_model()?;
 
@@ -903,6 +954,37 @@ impl Store {
         {
             Some(driver) => driver.is_leader(lane),
             None => true,
+        }
+    }
+
+    /// `host:port` of the manager that leads `lane`, when this node knows one.
+    /// `None` outside raft mode and mid-election.
+    pub(crate) fn lane_leader_hint(&self, lane: crate::storage::Lane) -> Option<String> {
+        self.persistence_driver
+            .as_any()
+            .downcast_ref::<crate::storage::raft::driver::MultiRaftDriver>()
+            .and_then(|driver| driver.lane_leader_addr(lane))
+    }
+
+    /// Report the nodes this manager has heard from to the status-lane leader
+    /// (liveness plan §6.3). A no-op outside raft mode, where this manager IS
+    /// the leader and its own table is the truth.
+    pub async fn report_node_liveness(
+        &self,
+        observer_manager_id: &str,
+        node_ids: Vec<String>,
+    ) -> crate::storage::liveness::DigestOutcome {
+        match self
+            .persistence_driver
+            .as_any()
+            .downcast_ref::<crate::storage::raft::driver::MultiRaftDriver>()
+        {
+            Some(driver) => {
+                driver
+                    .send_liveness_digest(observer_manager_id.to_string(), node_ids)
+                    .await
+            }
+            None => crate::storage::liveness::DigestOutcome::NoEngine,
         }
     }
 
@@ -4068,8 +4150,27 @@ impl Store {
     }
 
     fn node_from_row(&self, row: &Row<'_>) -> Result<Node, rusqlite::Error> {
+        let id: String = row.get(0)?;
+        // Heartbeat freshness, stated rather than implied (liveness plan
+        // §6.5). On the manager that OWNS liveness the in-memory observation
+        // is the live truth and beats the column outright; anywhere else the
+        // column is a checkpoint that is at most `checkpointInterval` behind,
+        // and the reader is told so. The node's STATUS is exact either way —
+        // that is the replicated half, and it does not regress.
+        let (last_heartbeat, heartbeat_source) = match self.live_heartbeat(&id) {
+            Some(observed) => (observed, "live".to_string()),
+            None => {
+                let persisted: String = row.get(8)?;
+                let source = if persisted.is_empty() {
+                    String::new()
+                } else {
+                    "checkpoint".to_string()
+                };
+                (persisted, source)
+            }
+        };
         let node = Node {
-            id: row.get(0)?,
+            id,
             pool: row.get(1)?,
             status: row.get(2)?,
             availability: row.get(3)?,
@@ -4077,10 +4178,24 @@ impl Store {
             fingerprint_attrs: row.get(5)?,
             dynamic_attrs: row.get(6)?,
             health_checks: row.get(7)?,
-            last_heartbeat: row.get(8)?,
+            last_heartbeat,
+            heartbeat_source,
         };
 
         Ok(node)
+    }
+
+    /// The heartbeat time this manager observed itself, when it owns liveness.
+    /// `None` on a manager that does not, which is what makes the reader fall
+    /// back to the replicated checkpoint and say so.
+    fn live_heartbeat(&self, id: &str) -> Option<String> {
+        let table = self.liveness();
+        table.responsible_since()?;
+        let beat = table.last_beat(id)?;
+        OffsetDateTime::from_unix_timestamp(beat.unix)
+            .ok()?
+            .format(&Rfc3339)
+            .ok()
     }
 
     fn eval_from_row(&self, row: &Row<'_>) -> Result<Eval, rusqlite::Error> {
@@ -5246,6 +5361,7 @@ impl Store {
                 ":status": node.status,
                 ":last_heartbeat": node.last_heartbeat,
                 ":health_checks": node.health_checks,
+                ":lost_after_seconds": self.registered_lost_window_seconds(node),
             },
         )?;
         drop(conn);
@@ -5440,8 +5556,246 @@ impl Store {
     /// to the lane leader; the worker's RPC surface is unchanged.
     #[instrument(err, skip_all)]
     pub fn update_node_heartbeat(&self, id: String) -> R<()> {
-        let coalescer = Arc::clone(&self.heartbeat_coalescer);
-        coalescer.submit(id, |batch| self.run_heartbeat_batch(batch))
+        match self.beat_disposition(&id) {
+            BeatDisposition::Ghost => Err(anyhow::Error::new(StorageError::not_found("node", id))),
+            BeatDisposition::Transition => {
+                // `lost -> active` is NEW information no reconciler can
+                // re-derive, so it stays replicated — the status-lane write
+                // this path has always used, forwarding included. Rare by
+                // construction: a node transitions twice per outage, not
+                // thirty times a minute.
+                //
+                // Deliberately NOT `mark_node_ready`: that writes status
+                // `"ready"`, which every liveness query filters out (they all
+                // match `"active"`), so recovering through it would drop the
+                // node out of the liveness scan and out of
+                // `legion_nodes{status="active"}`. This is the same composite
+                // shape with the correct status value.
+                self.update_node_heartbeat_forwarding(id.clone())?;
+                self.restore_availability_after_loss(&id);
+                self.liveness.observe(&id);
+                Ok(())
+            }
+            BeatDisposition::Active => {
+                if self.liveness.digest_fallback() {
+                    // Mixed-version window (liveness plan §10): a manager that
+                    // predates `ReportNodeLiveness` is leading the status
+                    // lane, so this beat has to travel as the replicated write
+                    // every manager version understands. Correct, just slower;
+                    // it resolves when the roll finishes.
+                    let coalescer = Arc::clone(&self.heartbeat_coalescer);
+                    coalescer.submit(id.clone(), |batch| self.run_heartbeat_batch(batch))?;
+                }
+                self.liveness.observe(&id);
+                Ok(())
+            }
+        }
+    }
+
+    /// Put a recovered node back in the scheduling pool.
+    ///
+    /// Node loss is a CROSS-LANE composite: the status lane records `lost`,
+    /// and the control lane flips `node.availability` to `unavailable` — and
+    /// `availability` is the column the scheduler actually gates placement on
+    /// ([`Self::available_node_arcs`]). Clearing only the status half would
+    /// leave a returned node reading `active` in `legion node list` while
+    /// never receiving work again, which presents as a scheduler bug and is
+    /// almost impossible to diagnose from the outside. Recovery has to undo
+    /// both halves, because loss did both.
+    ///
+    /// **Only `unavailable` -> `available`.** `drained` is OPERATOR intent
+    /// (`legion node cordon` / `drain`), so a node an operator cordoned must
+    /// still be cordoned when it comes back: a heartbeat may never un-cordon a
+    /// node. This guard is what `mark_node_ready` lacks.
+    ///
+    /// Best effort on purpose. The beat has already succeeded and the node is
+    /// already `active`, so a control-lane rejection here must not fail the
+    /// worker's RPC — its stateful self-fence clock feeds off heartbeat
+    /// success. The next beat retries, because the disposition stays
+    /// `Transition` until the flip lands.
+    fn restore_availability_after_loss(&self, id: &str) {
+        match self.get_node(id) {
+            Ok(node) if node.availability == "unavailable" => {
+                match self.sync_node_availability(&[id.to_string()], "available") {
+                    Ok(()) => info!(
+                        node_id = %id,
+                        "Node heartbeated after being marked lost; it is schedulable again"
+                    ),
+                    Err(err) => warn!(
+                        node_id = %id,
+                        error = ?err,
+                        "Node recovered but its availability flip was rejected; \
+                         retrying on its next heartbeat"
+                    ),
+                }
+            }
+            // Already available, or deliberately drained by an operator.
+            Ok(_) => {}
+            Err(err) => debug!(
+                node_id = %id,
+                error = ?err,
+                "Could not read node to restore its availability after recovery"
+            ),
+        }
+    }
+
+    /// The liveness soft-state table (liveness plan §6.2).
+    pub fn liveness(&self) -> &Arc<crate::storage::liveness::LivenessTable> {
+        &self.liveness
+    }
+
+    /// Missed beats before a node is lost (`heartbeat.missedBeatsBeforeLost`).
+    pub fn missed_beats_before_lost(&self) -> u32 {
+        self.missed_beats_before_lost
+    }
+
+    /// What a heartbeat from `id` costs: nothing, a transition, or a rejection.
+    ///
+    /// Answered from the in-memory read model rather than the database, so
+    /// the hottest path in the system does not open a connection. The read
+    /// model is the same view the scheduler places from, so a node it does not
+    /// have is a node no manager will schedule onto either.
+    fn beat_disposition(&self, id: &str) -> BeatDisposition {
+        let Ok(guard) = self.read_model_reader() else {
+            // A poisoned read model is not a reason to reject a live worker;
+            // fall back to the replicated path, which reads the database.
+            return BeatDisposition::Transition;
+        };
+        match guard.nodes.get(id) {
+            None => BeatDisposition::Ghost,
+            Some(node) if node.status == "active" && node.availability != "unavailable" => {
+                BeatDisposition::Active
+            }
+            Some(_) => BeatDisposition::Transition,
+        }
+    }
+
+    /// Every active node's liveness row for the tick: its id, the persisted
+    /// heartbeat clock, and its own lost window.
+    ///
+    /// The timestamp columns are DISPLAY state once liveness is off the raft
+    /// path — the tick reads the in-memory table for freshness and uses this
+    /// only for the per-node window and the active set. They are still read
+    /// here so a manager running the mixed-version forwarding fallback (whose
+    /// beats do land in the database) is not blind.
+    #[instrument(err, skip_all)]
+    pub fn active_node_liveness_rows(&self) -> R<Vec<ActiveNodeLiveness>> {
+        let conn = self.read_connection()?;
+        // Anchored on `node` (a node_health row orphaned by node removal must
+        // not resurrect a ghost), same as `get_node_ids_and_heartbeats`.
+        let sql = "SELECT node.id, node_health.last_heartbeat_unix, node_health.lost_after_seconds
+                   FROM node LEFT JOIN node_health ON node_health.node_id = node.id
+                   WHERE COALESCE(node_health.status, 'active') = 'active'";
+        let mut stmt = conn.prepare(sql)?;
+        let rows = Self::collect_rows(stmt.query_map([], |row| {
+            Ok(ActiveNodeLiveness {
+                id: row.get(0)?,
+                last_heartbeat_unix: row.get(1)?,
+                lost_after_seconds: row.get(2)?,
+            })
+        })?)?;
+        Ok(rows)
+    }
+
+    /// Replicate the display checkpoint: one batched status-lane commit
+    /// stamping each node's ACTUAL last observed beat time (liveness plan
+    /// §6.5).
+    ///
+    /// Two rules make this safe, and neither is negotiable:
+    ///
+    /// - **A checkpoint is never read back as liveness.** Not by the tick, not
+    ///   on election, not ever. `become_responsible` seeds at `now` precisely
+    ///   so a 30s-stale checkpoint can never become a loss decision.
+    /// - **It records the OBSERVED time, not the write time.** A downgraded or
+    ///   older manager reading the column sees a truthful (if coarse) value
+    ///   rather than one claiming the whole fleet beat in lockstep.
+    #[instrument(err, skip_all)]
+    pub fn checkpoint_node_heartbeats(&self, beats: &[(String, i64)]) -> R<()> {
+        if beats.is_empty() {
+            return Ok(());
+        }
+        let beats = beats.to_vec();
+        self.replicated(Lane::Status, "checkpoint_node_heartbeats", move |s| {
+            s.checkpoint_node_heartbeats_apply(&beats)
+        })
+    }
+
+    fn checkpoint_node_heartbeats_apply(&self, beats: &[(String, i64)]) -> R<()> {
+        let conn = self.write_connection()?;
+        // Only ever refreshes the timestamp of a node the store already
+        // believes active: a checkpoint must not create a health row, revive a
+        // lost node, or clear `lost_at`. Those are transitions and they travel
+        // their own replicated paths.
+        let mut stmt = conn.prepare(
+            "INSERT INTO node_health (node_id, status, last_heartbeat, last_heartbeat_unix, lost_at, health_checks)
+             SELECT id, 'active', ?2, ?3, NULL, '{}' FROM node WHERE id = ?1
+             ON CONFLICT(node_id) DO UPDATE SET
+                 last_heartbeat = excluded.last_heartbeat,
+                 last_heartbeat_unix = excluded.last_heartbeat_unix
+             WHERE node_health.status = 'active';",
+        )?;
+        for (id, unix) in beats {
+            let text = OffsetDateTime::from_unix_timestamp(*unix)
+                .unwrap_or_else(|_| OffsetDateTime::now_utc())
+                .format(&Rfc3339)?;
+            stmt.execute(rusqlite::params![id, text, unix])?;
+        }
+        Ok(())
+    }
+
+    /// Record each node's lost window (`missedBeatsBeforeLost x its
+    /// interval`). Replicated, but rare: registration, and a served-cadence
+    /// change (heartbeat-cadence plan §6.4).
+    #[instrument(err, skip_all)]
+    pub fn set_node_lost_windows(&self, windows: &[(String, i64)]) -> R<()> {
+        if windows.is_empty() {
+            return Ok(());
+        }
+        let windows = windows.to_vec();
+        self.replicated(Lane::Status, "set_node_lost_windows", move |s| {
+            s.set_node_lost_windows_apply(&windows)
+        })
+    }
+
+    fn set_node_lost_windows_apply(&self, windows: &[(String, i64)]) -> R<()> {
+        let conn = self.write_connection()?;
+        let mut stmt =
+            conn.prepare("UPDATE node_health SET lost_after_seconds = ?2 WHERE node_id = ?1;")?;
+        for (id, seconds) in windows {
+            stmt.execute(rusqlite::params![id, seconds])?;
+        }
+        Ok(())
+    }
+
+    /// The lost window to seed a registering node with:
+    /// `missedBeatsBeforeLost x the cadence that node reports it will use`.
+    ///
+    /// The worker puts its RESOLVED interval in `config_attrs.heartbeatSeconds`
+    /// at registration, which is how a cluster running a 2s latency-sensitive
+    /// pool and a 60s batch pool gets a correct window for each without one
+    /// global constant (heartbeat-cadence plan §6.4(4)). A worker built before
+    /// that reported nothing, so it falls back to the default cadence — the
+    /// same value such a worker actually uses.
+    fn registered_lost_window_seconds(&self, node: &NodeMsg) -> i64 {
+        let reported = serde_json::from_str::<Value>(&node.config_attrs)
+            .ok()
+            .and_then(|attrs| attrs.get("heartbeatSeconds")?.as_u64());
+        let interval = reported
+            .map(|seconds| seconds.clamp(1, u64::from(MAX_WORKER_HEARTBEAT_SECONDS)))
+            .unwrap_or(WORKER_HEARTBEAT_DURATION_SEC);
+        (interval * u64::from(self.missed_beats_before_lost.max(1))) as i64
+    }
+
+    /// Every registered node's id and its currently recorded lost window.
+    #[instrument(err, skip_all)]
+    pub fn node_lost_windows(&self) -> R<Vec<(String, Option<i64>)>> {
+        let conn = self.read_connection()?;
+        let mut stmt = conn.prepare(
+            "SELECT node.id, node_health.lost_after_seconds
+             FROM node LEFT JOIN node_health ON node_health.node_id = node.id;",
+        )?;
+        let rows = Self::collect_rows(stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?)?;
+        Ok(rows)
     }
 
     /// Batch leader body for heartbeat group commit: dedupe the drained
@@ -14749,6 +15103,7 @@ mod tests {
             pool: "default".into(),
             availability: "available".into(),
             last_heartbeat: "2023-01-01T00:00:00Z".into(),
+            heartbeat_source: String::new(),
             config_attrs: json!({}),
             fingerprint_attrs: json!({}),
             dynamic_attrs: json!({}),
@@ -14767,6 +15122,7 @@ mod tests {
             dynamic_attrs: "{}".into(),
             health_checks: "{}".into(),
             last_heartbeat: "2023-01-01 00:00:00 +00:00:00".into(),
+            heartbeat_source: String::new(),
         }
     }
 
@@ -15028,6 +15384,31 @@ mod tests {
         for handle in handles {
             handle.join().expect("heartbeat thread panicked")?;
         }
+        // A steady-state heartbeat costs NO replicated commit (liveness plan
+        // §6.1): every beat lands in the in-memory table, and the database
+        // timestamp columns are refreshed only by the display checkpoint.
+        assert_eq!(store.liveness().tracked(), 16);
+        let conn = store.read_connection()?;
+        let stamped: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM node_health
+             WHERE node_id LIKE 'hb-conc-%' AND last_heartbeat_unix IS NOT NULL;",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            stamped, 0,
+            "heartbeats must not reach the raft path in steady state"
+        );
+
+        // The checkpoint is what makes the column readable on any manager,
+        // and it records the OBSERVED time rather than the write time.
+        let beats: Vec<(String, i64)> = store
+            .liveness()
+            .snapshot()
+            .into_iter()
+            .map(|(id, beat)| (id, beat.unix))
+            .collect();
+        store.checkpoint_node_heartbeats(&beats)?;
         let conn = store.read_connection()?;
         let stamped: i64 = conn.query_row(
             "SELECT COUNT(*) FROM node_health
@@ -15191,8 +15572,13 @@ mod tests {
             vec![("node-one".to_string(), String::new(), None)]
         );
 
-        // ...and the first heartbeat (an upsert) creates the row again.
+        // ...and the first CHECKPOINT (an upsert) creates the row again.
+        // The heartbeat itself no longer writes: it lands in the in-memory
+        // liveness table, and the checkpoint replicates what was observed
+        // (liveness plan §6.5).
         store.update_node_heartbeat("node-one".to_string())?;
+        let beat = store.liveness().last_beat("node-one").context("observed")?;
+        store.checkpoint_node_heartbeats(&[("node-one".to_string(), beat.unix)])?;
         let recreated: i64 = {
             let conn = store.read_connection()?;
             conn.query_row(

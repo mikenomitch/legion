@@ -32,7 +32,8 @@ use crate::storage::raft::types::TypeConfig;
 use crate::storage::raft::{RaftTransportRegistry, RAFT_CLUSTER_SECRET_METADATA_KEY};
 use crate::structs::raft_transport_server::RaftTransport;
 use crate::structs::{
-    JoinRaftClusterReply, JoinRaftClusterRequest, RaftLaneReply, RaftLaneRequest,
+    JoinRaftClusterReply, JoinRaftClusterRequest, NodeLivenessDigestReply,
+    NodeLivenessDigestRequest, RaftLaneReply, RaftLaneRequest,
 };
 
 /// Constant-time byte comparison for the cluster secret, so the check does
@@ -218,5 +219,47 @@ impl RaftTransport for RaftTransportService {
         let payload = serde_json::to_vec(&outcome)
             .map_err(|e| Status::internal(format!("failed encoding ForwardOutcome: {e}")))?;
         Ok(Response::new(RaftLaneReply { payload }))
+    }
+
+    /// Merge a peer manager's liveness digest into this manager's table
+    /// (liveness plan §6.3).
+    ///
+    /// Answered even when this manager does NOT lead the status lane: the
+    /// sender needs a typed "not the leader" plus a hint so it can re-target,
+    /// exactly as `ForwardLaneWrite` callers do. Refusing with a gRPC error
+    /// instead would be indistinguishable, at the sender, from the peer being
+    /// unreachable — and that difference is what decides whether the sender
+    /// falls back to per-heartbeat replicated writes.
+    async fn report_node_liveness(
+        &self,
+        request: Request<NodeLivenessDigestRequest>,
+    ) -> Result<Response<NodeLivenessDigestReply>, Status> {
+        let registry = self.authenticate(&request)?;
+        let store = registry.forward_store.clone().ok_or_else(|| {
+            Status::unimplemented("liveness digests are not available on this manager")
+        })?;
+        let digest = request.into_inner();
+        if digest.observer_manager_id.is_empty() {
+            return Err(Status::invalid_argument(
+                "liveness digest is missing observer_manager_id",
+            ));
+        }
+        if !store.is_raft_leader(crate::storage::Lane::Status) {
+            return Ok(Response::new(NodeLivenessDigestReply {
+                accepted: false,
+                not_status_leader: true,
+                leader_hint: store
+                    .lane_leader_hint(crate::storage::Lane::Status)
+                    .unwrap_or_default(),
+            }));
+        }
+        store
+            .liveness()
+            .observe_peer(&digest.observer_manager_id, digest.seen_node_ids);
+        Ok(Response::new(NodeLivenessDigestReply {
+            accepted: true,
+            not_status_leader: false,
+            leader_hint: String::new(),
+        }))
     }
 }

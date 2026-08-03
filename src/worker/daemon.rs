@@ -294,6 +294,16 @@ async fn run_worker_with_manager(
         "workerAddress".into(),
         Value::String(format!("http://{}:{}", DEF_MANAGER_HOSTNAME, server_port)),
     );
+    // The cadence this node will actually beat at, so the manager can derive
+    // its lost window from it (`missedBeatsBeforeLost x this`) instead of
+    // applying one global constant to a fleet with several cadences. Reported
+    // rather than looked up because the node record carries no worker type —
+    // and it is the RESOLVED value, so what the manager records is what the
+    // worker does. See docs/heartbeat-cadence-and-scale.md.
+    config_attrs.insert(
+        "heartbeatSeconds".into(),
+        json!(heartbeat_interval.as_secs()),
+    );
 
     let registration = RegistrationPayload {
         name: name.clone(),
@@ -577,18 +587,49 @@ pub(crate) fn start_worker_telemetry() {
 }
 
 /// Heartbeat cadence: worker-type config (`heartbeatSeconds`, clamped to
-/// 1..=30) or the built-in default. The manager's lost window stays 10s,
-/// so intervals above ~3s trade detection margin for load — the manager
-/// warns when serving such a config (docs/architecture-managers-workers.md).
-/// Shared with the simulated-fleet mode (`worker::simulate`), whose
-/// fairness contract is "same cadence resolution as a real worker".
+/// `1..=MAX_WORKER_HEARTBEAT_SECONDS`) or the built-in default.
+///
+/// The clamp used to stop at 30 because the lost window was a fixed 10s, so
+/// anything above ~3s traded detection margin for load. The window now moves
+/// with the cadence (`missedBeatsBeforeLost x this value`), so a slow worker
+/// type is a supported configuration — see
+/// docs/heartbeat-cadence-and-scale.md.
+///
+/// Shared with the simulated-fleet mode (`worker::simulate`), whose fairness
+/// contract is "same cadence resolution as a real worker".
 pub(crate) fn heartbeat_interval_for(config: &WorkerConfig) -> Duration {
-    Duration::from_secs(
-        config
-            .heartbeat_seconds
-            .map(|seconds| u64::from(seconds).clamp(1, 30))
-            .unwrap_or(WORKER_HEARTBEAT_DURATION_SEC),
-    )
+    Duration::from_secs(crate::manager::cadence::clamp_heartbeat_seconds(
+        config.heartbeat_seconds,
+    ))
+}
+
+/// The one-shot re-phase a worker performs when its served interval changes.
+///
+/// When the manager moves the fleet to a new interval, every worker learns it
+/// within one OLD interval and would otherwise re-phase onto the same
+/// boundary — a thundering herd the +-10% steady-state jitter (a slow random
+/// walk) would take a long time to break up. Sleeping `U[0, new)` ONCE spreads
+/// the fleet uniformly across the new period in exactly one beat, at the cost
+/// of one interval of unevenness.
+///
+/// Deliberately not Nomad's permanent `[base, 2*base)` stagger: that costs a
+/// third of the target rate forever, makes the operator's `N/R` arithmetic
+/// wrong by a variable factor, and doubles worst-case detection time.
+pub(crate) fn rephase_sleep(new_interval: Duration) -> Duration {
+    use rand::Rng;
+    new_interval.mul_f64(rand::thread_rng().gen_range(0.0..1.0))
+}
+
+/// Adopt a manager-served interval, if there is one and it differs.
+///
+/// A worker that receives nothing (adaptive cadence off, or an older manager)
+/// keeps its worker-type value — exactly today's behavior. A worker that
+/// receives one is never penalized for honoring it: the manager derives that
+/// node's lost window from the same number, and widens before it tells anyone.
+pub(crate) fn adopt_served_interval(current: Duration, served: Option<u32>) -> Option<Duration> {
+    let served =
+        Duration::from_secs(u64::from(served?).clamp(1, u64::from(MAX_WORKER_HEARTBEAT_SECONDS)));
+    (served != current).then_some(served)
 }
 
 /// The heartbeat sleep, jittered ±10% so a fleet that (re)started together
@@ -625,7 +666,10 @@ async fn start_heartbeats(
     credentials: Arc<WorkerCredentials>,
     registration: RegistrationPayload,
     forwarder: Arc<UpstreamForwarder>,
-    heartbeat_interval: Duration,
+    // The worker-type cadence this worker starts at. Mutable because the
+    // manager may serve a different one on the reply (adaptive cadence,
+    // docs/heartbeat-cadence-and-scale.md).
+    mut heartbeat_interval: Duration,
     // Edge-boot spec cache to keep warm from the desired set; `None` on a
     // node that does not accept edge starts.
     spec_cache: Option<crate::worker::edge::SpecCache>,
@@ -649,7 +693,7 @@ async fn start_heartbeats(
             .heartbeat_duration_seconds
             .observe(tick_started.elapsed().as_secs_f64());
         worker_metrics.heartbeats_total.inc(&[match &tick_result {
-            Ok(()) => "ok",
+            Ok(_) => "ok",
             Err(err)
                 if err
                     .downcast_ref::<tonic::Status>()
@@ -660,12 +704,30 @@ async fn start_heartbeats(
             Err(_) => "error",
         }]);
         match tick_result {
-            Ok(()) => {
+            Ok(served) => {
                 *last_successful_heartbeat
                     .lock()
                     .expect("heartbeat clock lock") = std::time::Instant::now();
                 backoff = HEARTBEAT_RETRY_MIN;
-                tokio::time::sleep(jittered_heartbeat_interval(heartbeat_interval)).await;
+                // Adopt a manager-served interval, once, with a full-width
+                // re-phase so a fleet that all learns the new value within one
+                // old interval spreads across the new period instead of
+                // re-phasing onto the same boundary.
+                match adopt_served_interval(heartbeat_interval, served) {
+                    Some(next) => {
+                        info!(
+                            worker = %name,
+                            from_seconds = heartbeat_interval.as_secs(),
+                            to_seconds = next.as_secs(),
+                            "Manager served a new heartbeat interval; re-phasing once"
+                        );
+                        heartbeat_interval = next;
+                        tokio::time::sleep(rephase_sleep(next)).await;
+                    }
+                    None => {
+                        tokio::time::sleep(jittered_heartbeat_interval(heartbeat_interval)).await;
+                    }
+                }
             }
             // The node token can be revoked/rotated (for example ACLs were
             // just enabled, or the manager state was reset). Re-register with
@@ -706,8 +768,12 @@ async fn heartbeat_tick(
     credentials: &Arc<WorkerCredentials>,
     forwarder: &Arc<UpstreamForwarder>,
     spec_cache: Option<&crate::worker::edge::SpecCache>,
-) -> R<()> {
+) -> R<Option<u32>> {
     let mut client_clone = client.clone();
+    // The cadence the manager wants, when it dictates one. `None` (the
+    // default, and every pre-adaptive manager) means "keep your worker-type
+    // interval".
+    let served_interval;
 
     {
         let start = std::time::Instant::now();
@@ -794,6 +860,7 @@ async fn heartbeat_tick(
         };
         debug!(worker = %name, elapsed_ms = start.elapsed().as_millis() as u64, "Heartbeat acknowledged by manager");
         let reply = response.into_inner();
+        served_interval = reply.next_interval_seconds;
         // The desired set is the other place a node learns job configs it may
         // later be asked to start from a ticket.
         if let Some(cache) = spec_cache {
@@ -991,7 +1058,7 @@ async fn heartbeat_tick(
         identity_manager.retain(&live);
     }
 
-    Ok(())
+    Ok(served_interval)
 }
 
 /// Drive the node-local connect datapath from one *successful* heartbeat
@@ -1472,6 +1539,7 @@ mod tests {
         let forwarder = UpstreamForwarder::new();
         let reply = HeartbeatReply {
             claim_verdicts: Vec::new(),
+            next_interval_seconds: None,
             message: "ack".into(),
             desired_allocations: vec![connect_allocation(11, "db", local_port)],
             volume_destroy: Vec::new(),

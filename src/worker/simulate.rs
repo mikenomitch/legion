@@ -217,6 +217,14 @@ fn config_attrs_for(
     }
     attrs.insert("simulated".into(), json!(true));
     attrs.insert("workerAddress".into(), Value::String(worker_address.into()));
+    // The cadence contract is SHARED with the real worker, not forked: a sim
+    // node reports the interval it will beat at exactly as a real one does, so
+    // the manager derives the same lost window for it and the benchmark rig
+    // exercises the real arithmetic rather than a parallel implementation.
+    attrs.insert(
+        "heartbeatSeconds".into(),
+        json!(crate::worker::daemon::heartbeat_interval_for(config).as_secs()),
+    );
     Value::Object(attrs)
 }
 
@@ -669,7 +677,11 @@ async fn run_sim_node(
         }
     }
 
-    let heartbeat_interval = fleet.heartbeat_interval;
+    // Mutable for the same reason the real worker's is: a manager running
+    // adaptive cadence serves an interval on the reply, and the sim fleet
+    // honors it so a scale run measures the real controller rather than a
+    // fleet that ignores it.
+    let mut heartbeat_interval = fleet.heartbeat_interval;
     let ticks_per_health_check = ((WORKER_NODE_CHECK_DURATION_SEC as f64
         / heartbeat_interval.as_secs_f64().max(0.001))
     .round() as u64)
@@ -687,12 +699,12 @@ async fn run_sim_node(
             .heartbeat_duration_seconds
             .observe(tick_started.elapsed().as_secs_f64());
         metrics.heartbeats_total.inc(&[match &tick_result {
-            Ok(()) => "ok",
+            Ok(_) => "ok",
             Err(status) if status.code() == tonic::Code::Unauthenticated => "unauthenticated",
             Err(_) => "error",
         }]);
         match tick_result {
-            Ok(()) => {
+            Ok(served) => {
                 fleet.heartbeats_ok.fetch_add(1, Ordering::Relaxed);
                 backoff = SIM_RETRY_MIN;
                 if tick.is_multiple_of(ticks_per_health_check) {
@@ -707,7 +719,15 @@ async fn run_sim_node(
                     }
                 }
                 tick += 1;
-                tokio::time::sleep(jittered_heartbeat_interval(heartbeat_interval)).await;
+                match crate::worker::daemon::adopt_served_interval(heartbeat_interval, served) {
+                    Some(next) => {
+                        heartbeat_interval = next;
+                        tokio::time::sleep(crate::worker::daemon::rephase_sleep(next)).await;
+                    }
+                    None => {
+                        tokio::time::sleep(jittered_heartbeat_interval(heartbeat_interval)).await;
+                    }
+                }
             }
             Err(status) if status.code() == tonic::Code::Unauthenticated => {
                 warn!(node = %node.name, "Sim heartbeat unauthenticated; re-registering");
@@ -763,7 +783,7 @@ async fn heartbeat_sim_node(
     node: &SimNode,
     fleet: &SimFleet,
     ready_after: Duration,
-) -> Result<(), Status> {
+) -> Result<Option<u32>, Status> {
     let acked = node.acked_ids(ready_after);
     fleet.record_reported_allocations(node, acked.len());
     let req = node.credentials.attach(Request::new(HeartbeatRequest {
@@ -786,7 +806,7 @@ async fn heartbeat_sim_node(
         .map(|allocation| allocation.allocation_id)
         .collect();
     node.reconcile_allocations(&desired);
-    Ok(())
+    Ok(reply.next_interval_seconds)
 }
 
 /// Periodic fleet-status line — cheap enough for campaign scripts to
@@ -1021,14 +1041,25 @@ mod tests {
         );
         assert!(default_interval.as_secs() as i64 * 2 <= DEF_LOST_NODE_AT_SEC);
 
+        // The clamp widened from 30 to 300 once the lost window began moving
+        // with the cadence (docs/heartbeat-cadence-and-scale.md); the sim
+        // fleet follows it because the helper is shared, not forked.
         let configured = WorkerConfig {
             heartbeat_seconds: Some(120),
             ..WorkerConfig::default()
         };
         assert_eq!(
             heartbeat_interval_for(&configured),
-            Duration::from_secs(30),
+            Duration::from_secs(120),
             "sim fleets follow the same clamp as real workers"
+        );
+        let over_clamp = WorkerConfig {
+            heartbeat_seconds: Some(4000),
+            ..WorkerConfig::default()
+        };
+        assert_eq!(
+            heartbeat_interval_for(&over_clamp),
+            Duration::from_secs(u64::from(MAX_WORKER_HEARTBEAT_SECONDS))
         );
     }
 }

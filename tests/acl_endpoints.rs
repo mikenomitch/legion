@@ -93,6 +93,7 @@ fn endpoint_table() -> Vec<(&'static str, Plane)> {
         ("ListServices", Plane::Protected("job:read")),
         ("ResolveService", Plane::Protected("job:read")),
         ("GetNodes", Plane::Protected("node:read")),
+        ("GetHeartbeatCadence", Plane::Protected("node:read")),
         ("GetNode", Plane::Protected("node:read")),
         ("RestartWorker", Plane::Protected("node:write")),
         ("SetNodeAvailability", Plane::Protected("node:write")),
@@ -491,6 +492,10 @@ async fn call_endpoint(
             .map(|_| ()),
         "GetNodes" => svc
             .get_nodes(req(GetNodesRequest::default(), token))
+            .await
+            .map(|_| ()),
+        "GetHeartbeatCadence" => svc
+            .get_heartbeat_cadence(req(GetHeartbeatCadenceRequest {}, token))
             .await
             .map(|_| ()),
         "GetNode" => svc
@@ -1058,6 +1063,7 @@ fn seed_fixtures(store: &Store) -> R<Fixtures> {
         dynamic_attrs: "{}".into(),
         health_checks: "[]".into(),
         last_heartbeat: "2026-01-01T00:00:00Z".into(),
+        heartbeat_source: String::new(),
     })?;
 
     let config: JobConfig = serde_json::from_str(&jobspec(JOB_NAME))?;
@@ -1934,6 +1940,7 @@ async fn node_pool_scoped_policy_limits_node_access() -> R<()> {
         dynamic_attrs: "{}".into(),
         health_checks: "[]".into(),
         last_heartbeat: "2026-01-01T00:00:00Z".into(),
+        heartbeat_source: String::new(),
     })?;
 
     svc.store.upsert_acl_policy(

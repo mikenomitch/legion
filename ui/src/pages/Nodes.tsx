@@ -6,7 +6,7 @@ import { CreateJoinTokenForm } from '../components/acl/AdminPanels'
 import { Button, SectionCard, linkClass } from '../components/ui'
 import { managerClient } from '../grpcClient'
 import { debounced } from '../utils/debounce'
-import { formatRelativeTime } from '../utils/format'
+import { formatRelativeTime, heartbeatFreshnessHint } from '../utils/format'
 import { summarizeHealthChecks } from '../utils/health'
 
 function NodesContent() {
@@ -99,6 +99,7 @@ function NodesContent() {
             status: health.label,
             statusTone: health.tone,
             updatedAt: formatRelativeTime(node.lastHeartbeat),
+            updatedAtTitle: heartbeatFreshnessHint(node.heartbeatSource),
             href: `/nodes/${encodeURIComponent(node.id)}`,
             cells: {
               pool: node.pool || 'default',

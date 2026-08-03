@@ -21,6 +21,11 @@ Plans, roadmaps, to-do lists, and development notes live in
 - [Jobs, Tasks, and Scheduling](jobs-tasks-and-scheduling.md) — job spec shapes,
   placement semantics, and edge cases.
 - [State Store](state-store.md) — manager and worker persistence.
+- [Node Liveness](node-liveness.md) — where a node's "is it there?" answer
+  lives, what an election does to it, and why a heartbeat costs no commit.
+- [Heartbeat Cadence and Scale](heartbeat-cadence-and-scale.md) — sizing a
+  control plane for a fleet, the per-node lost window, and the freshness
+  ratio that says whether the fleet is keeping up.
 - [UI Architecture](ui-architecture.md) — the SolidJS app and its design system.
 
 ## Workloads

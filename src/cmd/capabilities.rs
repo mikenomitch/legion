@@ -356,6 +356,16 @@ pub fn catalog() -> Vec<Capability> {
             read_only_safe: true,
         },
         Capability {
+            name: "node.cadence",
+            cli: "legion node cadence",
+            grpc: Some("Manager/GetHeartbeatCadence"),
+            summary: "Report whether the fleet is sustaining its heartbeat cadence: freshness \
+                 ratio, lost window, sustainable fleet size, and the heartbeatSeconds value to \
+                 set if it is falling behind.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
             name: "node.cordon",
             cli: "legion node cordon <ID>",
             grpc: Some("Manager/SetNodeAvailability"),

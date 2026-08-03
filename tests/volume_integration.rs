@@ -87,6 +87,7 @@ impl Cluster {
             status: "ready".into(),
             availability: "available".into(),
             last_heartbeat: "2023-01-01T00:00:00Z".into(),
+            heartbeat_source: String::new(),
             config_attrs: json!({
                 "node_id": id,
                 "maxAllocations": 20,
