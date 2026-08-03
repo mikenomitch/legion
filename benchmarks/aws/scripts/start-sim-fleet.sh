@@ -62,6 +62,20 @@ legion)
         [ "$slice" -gt 0 ] || continue
         log "  $instance_id ($private): $slice nodes"
         wait_for_ssh "$addr" 120
+        # sshd answers well before cloud-init has finished: the AWS CLI
+        # v2 install alone is a ~60 MB download. The very next command
+        # fetches the legion binary with `aws`, so racing first boot dies
+        # with a bare "sudo: aws: command not found" on a node that
+        # becomes perfectly good half a minute later. This is not a
+        # one-time bringup concern — the fleet is spot, so instances are
+        # replaced mid-campaign and every replacement re-runs the race.
+        rsh "$addr" "cloud-init status --wait >/dev/null 2>&1 || true"
+        rsh "$addr" "command -v aws >/dev/null 2>&1" || {
+            echo "worker $instance_id ($addr) has no aws CLI after cloud-init:" >&2
+            rsh "$addr" "cloud-init status --long 2>&1 | sed 's/^/  /'" >&2 || true
+            rsh "$addr" "sudo tail -20 /var/log/cloud-init-output.log 2>&1 | sed 's/^/  /'" >&2 || true
+            exit 1
+        }
         rcp "$SCENARIO" "$addr:/tmp/profiles.json"
         rsh "$addr" "
             sudo aws s3 cp --region $REGION s3://$BUCKET/bin/legion /opt/legion/bin/legion &&
