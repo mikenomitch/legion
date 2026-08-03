@@ -12,8 +12,13 @@ Legion uses a mixed strategy:
 Integration tests currently include:
 
 - `tests/config_jobs.rs`
-  - validates all Nickel job configs deserialize to `JobConfig`.
+  - evaluates every shipped `configs/jobs/*.ncl` and validates it the way the
+    manager does on submit, not just that it deserializes to `JobConfig`.
   - validates maximal config shape.
+  - evaluates the shipped manager configs (`configs/*.ncl`) and worker configs
+    (`configs/workers/*.ncl`) into their config structs.
+  - parses the shipped job template, resolves its defaults, renders it through
+    the manager's sandboxed path, and validates the result.
 - `tests/scheduler_integration.rs`
   - end-to-end scheduling scenarios (constraints, permit, count.per, reschedule behavior).
 - `tests/eval_loop.rs`

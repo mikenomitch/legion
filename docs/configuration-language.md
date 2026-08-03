@@ -26,7 +26,7 @@ wrong. Nickel gives Legion three things plain JSON does not:
   once. There is no templating layer stapled on top of the format.
 - **Contracts** (`| String`, `| Number`, custom predicates) that fail at
   evaluation with the offending line, before the manager ever sees the spec.
-- **Merging with defaults** (`|  default`, `&`), which is exactly the shape
+- **Merging with defaults** (`| default`, `&`), which is exactly the shape
   "here are the defaults, here is what the caller overrode" wants.
 
 Error messages carry source snippets, so a mistake points at the line that
