@@ -80,6 +80,10 @@ Plans, roadmaps, to-do lists, and development notes live in
 
 - [Logging](logging.md) — task log capture, tailing, rotation, shipping, OTLP.
 - [Observability](observability.md) — current tracing and metrics state.
+- [Diagnosing Scheduler Performance](diagnosing-scheduler-performance.md) —
+  symptom-first: throughput fell when you scaled up, the box is idle but
+  capped, new work waits behind a backlog. What to read, what its
+  neighbouring metric rules out, and what to change.
 - [Event Stream](event-stream.md) — scheduler events as history and live tail.
 - [Streaming Persistence](persistence-streaming.md) — WAL shipping and
   lease-fenced failover.

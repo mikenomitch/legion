@@ -34,6 +34,7 @@ Full index: [docs/README.md](docs/README.md).
 - [Streaming Persistence](docs/persistence-streaming.md) and [Running Raft](docs/raft-operations.md)
 - [Logging (task logs, tailing, rotation, shipping, OTLP traces)](docs/logging.md)
 - [Observability](docs/observability.md)
+- [Diagnosing Scheduler Performance](docs/diagnosing-scheduler-performance.md)
 - [UI Architecture](docs/ui-architecture.md)
 - [KV Store](docs/kv-store.md)
 - [Auth & ACLs](docs/auth-and-acls.md)

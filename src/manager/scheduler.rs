@@ -904,6 +904,11 @@ pub struct Scheduler<'a> {
     nodes_considered: Option<NodesConsidered>,
     score_sample: Option<ScoreSample>,
     plan_candidates: PlanCandidatesSetting,
+    /// `schedulerSettings.plan_apply_batch_max` — how many plans one group
+    /// commit may carry, and so how many plans can race for the same node
+    /// scores at once. Sizes the fallback sampling pool
+    /// ([`Self::fallback_pool_width`]).
+    plan_apply_batch_max: usize,
     /// `schedulerSettings.preemption`. Parsed here for the same reason as the
     /// settings above — and so a typo'd `mode` fails the manager at startup
     /// rather than quietly evicting production work on the first busy plan.
@@ -936,6 +941,7 @@ impl<'a> Scheduler<'a> {
             nodes_considered: None,
             score_sample: None,
             plan_candidates: PlanCandidatesSetting::default(),
+            plan_apply_batch_max: Store::plan_apply_batch_max(store.scheduler_settings.as_ref()),
             preemption: PreemptionSettings::default(),
         };
         scheduler.weights = scheduler.scheduler_weights()?;
@@ -2074,18 +2080,28 @@ impl<'a> Scheduler<'a> {
     /// fit math (docs/late-binding-plan-apply.md).
     ///
     /// Coupling edges:
-    /// - **overlapping candidate lists** — the planner's ledger assumed at
-    ///   most one of the two lands on the shared node; two independent
-    ///   fallbacks onto it could oversubscribe capacity (or collide static
-    ///   ports);
     /// - **a task with a `distinct` constraint** — the tracker couples that
     ///   task's placements even across disjoint node lists (two nodes can
     ///   share a zone);
     /// - **membership in the same multi-task co-placement group** — the
     ///   group is one selection unit.
     ///
+    /// **Overlapping candidate lists are NOT an edge.** They were, on the
+    /// theory that two independent fallbacks onto a shared node could
+    /// oversubscribe it — but the apply walk debits each bind from the
+    /// node's in-transaction free pool before the next placement is
+    /// considered (`apply_plan_submission_on`), so the second placement
+    /// sees the capacity the first spent and skips the node if it no
+    /// longer fits; static ports are re-read there too. Keeping the edge
+    /// cost far more than it bought: any multi-placement job into one pool
+    /// overlaps by construction, so *every* placement of it collapsed to a
+    /// one-element list and the plan degenerated to the pre-candidate
+    /// all-or-nothing CAS. That is what drove plan rejection to 73.6% on
+    /// the 5000-node benchmark
+    /// (internal_docs/plans/plan-apply-conflict-reduction-plan.md).
+    ///
     /// Singleton components keep their fallback lists and walk
-    /// independently at apply; components of size >1 keep today's
+    /// independently at apply; components of size >1 keep the
     /// all-or-nothing epoch CAS on their exact chosen nodes.
     fn decouple_plan_components(
         placements: &mut [PlannedAllocation],
@@ -2114,18 +2130,9 @@ impl<'a> Scheduler<'a> {
 
         let mut parent: Vec<usize> = (0..placements.len()).collect();
         {
-            let mut by_node: HashMap<&str, usize> = HashMap::new();
             let mut by_distinct_task: HashMap<i64, usize> = HashMap::new();
             let mut by_group: HashMap<&str, usize> = HashMap::new();
             for (index, placement) in placements.iter().enumerate() {
-                for node_id in &placement.candidates {
-                    match by_node.entry(node_id.as_str()) {
-                        Entry::Occupied(entry) => union(&mut parent, *entry.get(), index),
-                        Entry::Vacant(entry) => {
-                            entry.insert(index);
-                        }
-                    }
-                }
                 let has_distinct = distinct_keys_by_task
                     .get(&placement.task_config_id)
                     .is_some_and(|keys| !keys.is_empty());
@@ -2165,9 +2172,15 @@ impl<'a> Scheduler<'a> {
 
     /// Budget for a truncated (index-served) candidate list: a generous
     /// multiple of what the task still needs, floored so small counts still
-    /// see real choice before scoring.
-    fn candidate_budget(needed: u32) -> usize {
-        (needed as usize).saturating_mul(8).max(64)
+    /// see real choice before scoring, and never narrower than the pool the
+    /// fallback tail samples from — truncating below that would hand every
+    /// concurrent planner the same few nodes again
+    /// ([`Self::fallback_pool_width`]).
+    fn candidate_budget(&self, needed: u32) -> usize {
+        (needed as usize)
+            .saturating_mul(8)
+            .max(64)
+            .max(self.fallback_pool_width())
     }
 
     /// Today's authoritative candidate filter: constraints, permit, and
@@ -2341,7 +2354,7 @@ impl<'a> Scheduler<'a> {
         metrics
             .scheduler_index_queries_total
             .inc(&[candidates.index.as_str(), "used"]);
-        let budget = Self::candidate_budget(needed);
+        let budget = self.candidate_budget(needed);
         if allow_truncation && verified.len() > budget {
             verified.truncate(budget);
             usage.truncated = true;
@@ -2889,13 +2902,15 @@ impl<'a> Scheduler<'a> {
                 });
             }
             let scored = score_nodes_with_cache(&eligible, affinity_set, scoring_cache, weights);
+            let fallback_width = self.fallback_pool_width();
             let ranked = if let Some(rng) = reschedule_rng.as_mut() {
-                Self::ranked_candidate_list(scored, true, candidates_setting, rng)
+                Self::ranked_candidate_list(scored, true, candidates_setting, fallback_width, rng)
             } else {
                 Self::ranked_candidate_list(
                     scored,
                     false,
                     candidates_setting,
+                    fallback_width,
                     &mut rand::thread_rng(),
                 )
             };
@@ -2953,13 +2968,16 @@ impl<'a> Scheduler<'a> {
     /// within the 1% jitter band. Ranks 1.. are sampled without
     /// replacement, score-weighted, from the near-tie band (nodes within
     /// `setting.band` of the best score); when the band holds fewer nodes
-    /// than the list needs, the remaining slots fill straight down the
-    /// ranking in score order. All randomness runs here, at plan time, on
-    /// the planning manager — the apply walk is deterministic.
+    /// than the list needs, the remaining slots are sampled — again
+    /// without replacement — from the best `fallback_width` nodes below
+    /// the band, and kept in score order. All randomness runs here, at
+    /// plan time, on the planning manager — the apply walk is
+    /// deterministic.
     fn ranked_candidate_list<'b, RNG: rand::Rng + ?Sized>(
         scored: Vec<(&'b Node, f64)>,
         jitter_head: bool,
         setting: PlanCandidatesSetting,
+        fallback_width: usize,
         rng: &mut RNG,
     ) -> Option<Vec<&'b Node>> {
         if scored.is_empty() {
@@ -3026,10 +3044,20 @@ impl<'a> Scheduler<'a> {
             list.push(band.swap_remove(chosen).0);
         }
 
-        // Partial selection, not a full sort: this fallback runs whenever the
-        // band is thinner than the list (the common bin_pack case), and the
-        // below-band set is nearly the whole fleet — O(n log n) per placement
-        // was measurable at 10k nodes where O(n + m log m) is free.
+        // Below-band fill, for when the band is thinner than the list (the
+        // common bin_pack case). Take the top `width` by score, then sample
+        // the slots we still need from that pool without replacement.
+        //
+        // The sampling is the point. Taking the top `need` deterministically
+        // — what this did — hands every concurrent planner the *same*
+        // fallback nodes in the same order, so a burst's fallbacks collide
+        // exactly as their first choices did and the tail buys nothing.
+        // Sampling from a pool sized to the number of placements that can
+        // be in flight at once decorrelates them.
+        //
+        // Still a partial selection, not a full sort: the below-band set is
+        // nearly the whole fleet, and O(n + w log w) was measurably cheaper
+        // than O(n log n) per placement at 10k nodes.
         let need = k.saturating_sub(list.len()).min(below.len());
         if need > 0 {
             let descending = |left: &(&Node, f64), right: &(&Node, f64)| {
@@ -3038,7 +3066,15 @@ impl<'a> Scheduler<'a> {
                     .partial_cmp(&left.1)
                     .unwrap_or(std::cmp::Ordering::Equal)
             };
-            below.select_nth_unstable_by(need - 1, descending);
+            let width = fallback_width.max(need).min(below.len());
+            below.select_nth_unstable_by(width - 1, descending);
+            below.truncate(width);
+            // Partial Fisher-Yates: `need` draws without replacement, then
+            // back into score order so a lower rank is never a better node.
+            for index in 0..need {
+                let pick = rng.gen_range(index..below.len());
+                below.swap(index, pick);
+            }
             below.truncate(need);
             below.sort_by(descending);
             for (node, _) in below {
@@ -3047,6 +3083,21 @@ impl<'a> Scheduler<'a> {
         }
 
         Some(list)
+    }
+
+    /// How wide a score-ordered pool the below-band fallback tail is
+    /// sampled from, before it is clamped to the eligible set.
+    ///
+    /// Sized to the placements that can race for the same scores at once:
+    /// one group commit's worth of plans (`plan_apply_batch_max`, default
+    /// 16) times a plan's placement count, for which the candidate-list
+    /// length (default 8) is the stand-in available here. 128 at the
+    /// defaults. Wider costs placement quality (the tail reaches further
+    /// down the ranking); narrower re-correlates concurrent planners,
+    /// which is the collision this exists to break.
+    fn fallback_pool_width(&self) -> usize {
+        self.plan_apply_batch_max
+            .saturating_mul(self.plan_candidates.count.max(1))
     }
 
     /// Candidate nodes this task is *allowed* on but does not currently fit
@@ -6866,8 +6917,18 @@ mod tests {
         Ok(())
     }
 
+    /// The lazy (post-planning) version sample still produces a real
+    /// fence: the applied plan bumps its nodes' epochs, so a later
+    /// submission carrying pre-apply epochs is visibly stale.
+    ///
+    /// Asserted on the epoch itself rather than through a rejection: a
+    /// stale node epoch is no longer a rejection on its own — the apply
+    /// walk revalidates such a candidate and binds it when it still fits
+    /// (see `plan_walk_rebinds_an_epoch_dirty_candidate_that_still_fits`).
+    /// What the epoch still buys is ordering information, and that is what
+    /// this test pins.
     #[test]
-    fn lazy_version_sample_is_the_default_and_fences_a_second_job() -> R<()> {
+    fn lazy_version_sample_is_the_default_and_bumps_node_epochs() -> R<()> {
         let store = setup_store()?;
         store.insert_node(make_node_msg("node-a", json!({})))?;
 
@@ -6878,25 +6939,13 @@ mod tests {
         let outcome = scheduler.plan_and_apply(&first, PlanMode::Fresh)?;
         assert_eq!(outcome.allocations.len(), 1);
 
-        // The applied plan carried expected versions from the LATE sample;
-        // it must have fenced normally — a stale re-apply of the same
-        // submission shape for a second job sees the bumped node epoch.
-        let second = submit_job(&store, "job-lazy-b", vec![TaskConfig::new("api", "noop")])?;
-        let stale = BTreeMap::from([
-            (format!("job_config:{second}"), 0),
-            ("node:node-a".to_string(), 0),
-        ]);
-        let submission = store.insert_plan_submission(
-            &second,
-            "fresh",
-            &[("node-a".to_string(), task_id_for(&store, &second, "api")?)],
-            &stale,
-        )?;
+        let after = store.allocation_version_vector_for_candidates(&first, &["node-a"])?;
+        let node_epoch = after
+            .get("node:node-a")
+            .copied()
+            .expect("the sample covers the placed node");
         assert!(
-            matches!(
-                store.apply_plan_submission(&submission)?,
-                crate::storage::store::PlanApplyOutcome::Rejected { .. }
-            ),
+            node_epoch > 0,
             "the lazy-sampled apply must have bumped the node epoch"
         );
 
@@ -7292,7 +7341,7 @@ mod tests {
         };
         let mut rng = StdRng::seed_from_u64(7);
 
-        let list = Scheduler::ranked_candidate_list(scored, false, setting, &mut rng)
+        let list = Scheduler::ranked_candidate_list(scored, false, setting, 128, &mut rng)
             .expect("non-empty scored list");
         assert_eq!(list.len(), 4);
         assert_eq!(list[0].id, "node-0", "the head must be the true argmax");
@@ -7322,7 +7371,7 @@ mod tests {
         };
         let mut rng = StdRng::seed_from_u64(3);
 
-        let list = Scheduler::ranked_candidate_list(scored, false, setting, &mut rng)
+        let list = Scheduler::ranked_candidate_list(scored, false, setting, 128, &mut rng)
             .expect("non-empty scored list");
         let ids: Vec<&str> = list.iter().map(|node| node.id.as_str()).collect();
         assert_eq!(
@@ -7343,14 +7392,17 @@ mod tests {
         };
         let mut rng = StdRng::seed_from_u64(1);
 
-        let list = Scheduler::ranked_candidate_list(scored, false, setting, &mut rng)
+        let list = Scheduler::ranked_candidate_list(scored, false, setting, 128, &mut rng)
             .expect("non-empty scored list");
         assert_eq!(list.len(), 1, "count 0 restores single-node selection");
         assert_ne!(list[0].id, "node-0", "the singleton is still the argmax");
     }
 
+    /// Overlap is no longer a coupling edge: the apply walk debits each
+    /// bind from the shared node's in-transaction free pool, so two
+    /// placements landing on it cannot oversubscribe it.
     #[test]
-    fn decouple_components_shrinks_overlapping_lists_only() {
+    fn decouple_components_keeps_overlapping_lists() {
         let mut placements = vec![
             planned("node-a", 1, &["node-a", "node-b"]),
             planned("node-c", 2, &["node-c", "node-b"]),
@@ -7362,17 +7414,20 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
         );
-        assert_eq!(placements[0].candidates, vec!["node-a".to_string()]);
-        assert_eq!(placements[1].candidates, vec!["node-c".to_string()]);
-        assert_eq!(
-            placements[2].candidates,
-            vec!["node-e".to_string(), "node-f".to_string()],
-            "the disjoint placement keeps its fallback list"
-        );
+        for placement in &placements {
+            assert_eq!(
+                placement.candidates.len(),
+                2,
+                "an overlapping list is not a coupled component"
+            );
+        }
     }
 
+    /// The same reversal for a transitive chain — the shape that used to
+    /// collapse an entire plan because two of its placements shared one
+    /// fallback node.
     #[test]
-    fn decouple_components_transitive_overlap_is_one_component() {
+    fn decouple_components_transitive_overlap_is_not_coupled() {
         let mut placements = vec![
             planned("node-a", 1, &["node-a", "node-b"]),
             planned("node-b", 2, &["node-b", "node-c"]),
@@ -7385,11 +7440,7 @@ mod tests {
             &HashMap::new(),
         );
         for placement in &placements {
-            assert_eq!(
-                placement.candidates.len(),
-                1,
-                "transitive overlap couples the whole chain"
-            );
+            assert_eq!(placement.candidates.len(), 2);
         }
     }
 
@@ -7790,8 +7841,15 @@ mod tests {
         Ok(())
     }
 
+    /// The reversal that motivated the conflict-reduction work: replicas
+    /// of one task into one pool overlap by construction, and coupling
+    /// them on that overlap collapsed every placement to a one-element
+    /// list — the pre-candidate all-or-nothing CAS, for the single most
+    /// common job shape there is. They now keep their lists; the apply
+    /// walk's in-transaction pool debit is what keeps two of them off one
+    /// node's last slot.
     #[test]
-    fn count_two_placements_on_a_shared_pool_are_coupled_singletons() -> R<()> {
+    fn count_two_placements_on_a_shared_pool_keep_their_candidate_lists() -> R<()> {
         let store = setup_store()?;
         for index in 0..5 {
             store.insert_node(make_node_msg(&format!("node-{index}"), json!({})))?;
@@ -7809,10 +7867,14 @@ mod tests {
         let placements = scheduler.plan_only(&job_config_id, PlanMode::Fresh)?;
         assert_eq!(placements.len(), 2);
         for placement in &placements {
+            assert!(
+                placement.candidates.len() > 1,
+                "same-pool replicas keep a fallback list: {:?}",
+                placement.candidates
+            );
             assert_eq!(
-                placement.candidates,
-                vec![placement.node_id.clone()],
-                "same-pool replicas overlap and must keep all-or-nothing semantics"
+                placement.candidates[0], placement.node_id,
+                "rank 0 is still the planner's own choice"
             );
         }
         Ok(())

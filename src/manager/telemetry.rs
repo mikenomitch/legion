@@ -709,6 +709,8 @@ pub struct Metrics {
     pub plan_apply_total: Arc<CounterVec>,
     /// `legion_scheduler_plan_candidate_rank`
     pub scheduler_plan_candidate_rank: Arc<Histogram>,
+    /// `legion_scheduler_plan_bind_pass{pass}`
+    pub scheduler_plan_bind_pass: Arc<CounterVec>,
     /// `legion_eval_conflict_requeues_total`
     pub eval_conflict_requeues_total: Arc<Counter>,
     /// `legion_preemptions_total{pool,band}` — victims actually evicted.
@@ -858,6 +860,14 @@ impl Metrics {
                 labels: &[],
             },
             cell: HistogramCell::new(COUNT_BUCKETS),
+        });
+        let scheduler_plan_bind_pass = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_scheduler_plan_bind_pass",
+                help: "Placements bound by the apply walk, by pass: `clean` (the candidate's node epoch was unchanged since the plan snapshot) or `revalidated` (its epoch had moved, and the in-transaction recheck admitted it anyway).",
+                labels: &["pass"],
+            },
+            series: Series::new(),
         });
         let eval_conflict_requeues_total = Arc::new(Counter {
             meta: FamilyMeta {
@@ -1269,6 +1279,7 @@ impl Metrics {
             Arc::clone(&scheduler_index_maintenance_seconds) as Arc<dyn RenderMetric>,
             Arc::clone(&scheduler_index_queries_total) as Arc<dyn RenderMetric>,
             Arc::clone(&scheduler_index_shadow_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&scheduler_plan_bind_pass) as Arc<dyn RenderMetric>,
             Arc::clone(&scheduler_plan_candidate_rank) as Arc<dyn RenderMetric>,
             Arc::clone(&scheduler_lazy_sample_fallback_total) as Arc<dyn RenderMetric>,
             Arc::clone(&scheduler_plan_phase_seconds) as Arc<dyn RenderMetric>,
@@ -1286,6 +1297,7 @@ impl Metrics {
             evals_processed_total,
             eval_queue_depth,
             plan_apply_total,
+            scheduler_plan_bind_pass,
             scheduler_plan_candidate_rank,
             eval_conflict_requeues_total,
             preemptions_total,

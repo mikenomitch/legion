@@ -15,11 +15,21 @@ Honesty rules, encoded:
     spot burst), the report includes the delta — the projection is
     published alongside it or not at all.
 
+Also reports the SATURATION curve when a campaign swept allocation
+density at a fixed node count
+(`run-campaign.sh --allocs-per-node-sweep "5 10 20 40"`): throughput and
+latency per allocation count, including the points where the cluster
+stopped converging. Incomplete cells are excluded from the scaling fits
+but kept here on purpose — "the cell never placed its workload" is the
+answer a saturation sweep is looking for, and dropping it would end the
+curve exactly where it gets interesting.
+
 Stdlib only. Usage:
   fit_curves.py --campaign benchmarks/aws/results/<campaign-id> [--json out.json]
 
-Cell discovery expects run-step.sh's layout:
-  <campaign>/<system>-<scenario>-<nodes>n-x<mult>/metrics.json
+Cell discovery expects run-step.sh's layout, in either sizing form:
+  <campaign>/<system>-<scenario>-<nodes>n-a<allocations>/metrics.json
+  <campaign>/<system>-<scenario>-<nodes>n-x<multiplier>/metrics.json
 """
 
 import argparse
@@ -35,7 +45,39 @@ PROJECT_TO = [20000, 50000]
 # Two-sided 95% t quantiles for the tiny dfs a 4-6 step campaign has.
 T_975 = {1: 12.706, 2: 4.303, 3: 3.182, 4: 2.776, 5: 2.571, 6: 2.447, 7: 2.365, 8: 2.306}
 
-CELL_RE = re.compile(r"^(?P<system>.+)-(?P<scenario>[a-z0-9_]+)-(?P<nodes>\d+)n-x[\d.]+$")
+# Two sizing forms, because run-step.sh names a cell after the sizing it
+# was actually given: `-a<allocations>` for --target-allocations (what a
+# campaign uses, and the only form that distinguishes the points of an
+# allocation sweep at one node count) and the older `-x<multiplier>`.
+CELL_RE = re.compile(
+    r"^(?P<system>.+)-(?P<scenario>[a-z0-9_]+)-(?P<nodes>\d+)n-"
+    r"(?:a(?P<allocations>\d+)|x(?P<multiplier>[\d.]+))$"
+)
+
+
+def parse_cell_name(name):
+    """`legion-a-web_fleet-5000n-a25000` -> the cell's coordinates, or None.
+
+    `allocs_per_node` is what separates two campaigns of the same shape:
+    a scaling campaign holds it constant while nodes grow, a saturation
+    sweep holds nodes constant while it grows. Keying series by it keeps
+    the two from being fitted as if they were one.
+    """
+    match = CELL_RE.match(name)
+    if not match:
+        return None
+    nodes = int(match.group("nodes"))
+    allocations = match.group("allocations")
+    allocations = int(allocations) if allocations is not None else None
+    return {
+        "name": name,
+        "system": match.group("system"),
+        "scenario": match.group("scenario"),
+        "nodes": nodes,
+        "allocations": allocations,
+        "multiplier": float(match.group("multiplier")) if match.group("multiplier") else None,
+        "allocs_per_node": round(allocations / nodes, 3) if allocations and nodes else None,
+    }
 
 
 def ols(xs, ys):
@@ -106,37 +148,116 @@ def fit_series(nodes, values):
 
 
 def load_campaign(campaign_dir):
-    """-> {(system, scenario): {nodes: metrics}}"""
-    cells = {}
-    for path in glob.glob(os.path.join(campaign_dir, "*", "metrics.json")):
-        cell_name = os.path.basename(os.path.dirname(path))
-        match = CELL_RE.match(cell_name)
-        if not match:
+    """-> [cell dicts], every parseable cell, complete or not."""
+    cells = []
+    for path in sorted(glob.glob(os.path.join(campaign_dir, "*", "metrics.json"))):
+        cell = parse_cell_name(os.path.basename(os.path.dirname(path)))
+        if not cell:
             continue
         with open(path) as f:
-            metrics = json.load(f)
-        if not metrics.get("complete", False):
-            print(f"note: skipping incomplete cell {cell_name}", file=sys.stderr)
-            continue
-        key = (match.group("system"), match.group("scenario"))
-        cells.setdefault(key, {})[int(match.group("nodes"))] = metrics
+            cell["metrics"] = json.load(f)
+        cell["complete"] = bool(cell["metrics"].get("complete", False))
+        cells.append(cell)
     return cells
+
+
+def fit_inputs(cells):
+    """-> {(system, scenario, allocs_per_node): {nodes: metrics}}
+
+    Only complete cells: a cell that never converged has no defensible
+    throughput to fit. Keyed by allocation density too, so a saturation
+    sweep's points cannot silently overwrite each other (they share a
+    node count) or be fitted as a scaling series (they have one).
+    """
+    series = {}
+    for cell in cells:
+        if not cell["complete"]:
+            print(f"note: skipping incomplete cell {cell['name']}", file=sys.stderr)
+            continue
+        key = (cell["system"], cell["scenario"], cell["allocs_per_node"])
+        series.setdefault(key, {})[cell["nodes"]] = cell["metrics"]
+    return series
+
+
+def saturation(cells):
+    """The allocation-density sweeps: per (system, scenario, nodes), every
+    allocation count that was run, in order.
+
+    Reported only where there is a curve to report (two or more points at
+    one node count), and deliberately including the cells that did not
+    converge — `complete: false` at the top of the sweep IS the saturation
+    point, and its placed/expected shortfall is the measurement.
+    """
+    grouped = {}
+    for cell in cells:
+        if cell["allocations"] is None:
+            continue
+        grouped.setdefault((cell["system"], cell["scenario"], cell["nodes"]), []).append(cell)
+
+    report = []
+    for (system, scenario, nodes), group in sorted(grouped.items()):
+        if len(group) < 2:
+            continue
+        points = []
+        for cell in sorted(group, key=lambda c: c["allocations"]):
+            metrics = cell["metrics"]
+            points.append(
+                {
+                    "allocations": cell["allocations"],
+                    "allocs_per_node": cell["allocs_per_node"],
+                    "converged": cell["complete"],
+                    "placed_total": metrics.get("placed_total"),
+                    "expected_total": metrics.get("expected_total"),
+                    "throughput_per_sec": metrics.get("throughput_per_sec"),
+                    "p99_ms": metrics.get("p99_ms"),
+                }
+            )
+        # The knee: the last point that both converged and did not lose
+        # throughput against the point before it. Reported as an
+        # observation, not a fit — three or four points do not support one.
+        knee = None
+        best = 0.0
+        for point in points:
+            rate = point["throughput_per_sec"] or 0.0
+            if point["converged"] and rate >= best:
+                best, knee = rate, point["allocations"]
+        report.append(
+            {
+                "system": system,
+                "scenario": scenario,
+                "nodes": nodes,
+                "points": points,
+                "peak_throughput_at_allocations": knee,
+            }
+        )
+    return report
 
 
 def analyze(cells):
     report = []
-    for (system, scenario), by_nodes in sorted(cells.items()):
+    for (system, scenario, allocs_per_node), by_nodes in sorted(
+        cells.items(), key=lambda item: (item[0][0], item[0][1], item[0][2] or 0)
+    ):
         steps = sorted(by_nodes)
         # Validation cells (20k burst) are held out of the fit.
         fit_steps = [n for n in steps if n <= 10000]
+        label = f"{system}/{scenario}"
+        if allocs_per_node is not None:
+            label += f" @ {allocs_per_node} allocs/node"
         if len(fit_steps) < 3:
             print(
-                f"note: {system}/{scenario}: {len(fit_steps)} fitted steps — "
+                f"note: {label}: {len(fit_steps)} fitted steps — "
                 "need >= 3 for a defensible curve; skipping",
                 file=sys.stderr,
             )
             continue
-        entry = {"system": system, "scenario": scenario, "steps": fit_steps, "metrics": {}}
+        entry = {
+            "system": system,
+            "scenario": scenario,
+            "allocs_per_node": allocs_per_node,
+            "steps": fit_steps,
+            "metrics": {},
+        }
         for metric in METRICS:
             values = [by_nodes[n].get(metric) for n in fit_steps]
             if any(v is None for v in values):
@@ -182,6 +303,28 @@ def analyze(cells):
     return report
 
 
+def render_saturation(report):
+    for entry in report:
+        print(
+            f"\n== saturation: {entry['system']} / {entry['scenario']} "
+            f"@ {entry['nodes']} nodes"
+        )
+        print(f"  {'allocations':>12}  {'per node':>8}  {'throughput':>10}  {'p99 ms':>8}  placed")
+        for point in entry["points"]:
+            placed = f"{point['placed_total']}/{point['expected_total']}"
+            if not point["converged"]:
+                placed += "  DID NOT CONVERGE"
+            print(
+                f"  {point['allocations']:>12}  {point['allocs_per_node']:>8}  "
+                f"{point['throughput_per_sec']:>10}  {point['p99_ms']:>8}  {placed}"
+            )
+        if entry["peak_throughput_at_allocations"] is not None:
+            print(
+                f"  peak sustained throughput at "
+                f"{entry['peak_throughput_at_allocations']} allocations"
+            )
+
+
 def render(report):
     for entry in report:
         print(f"\n== {entry['system']} / {entry['scenario']} (steps: {entry['steps']})")
@@ -209,13 +352,23 @@ def main():
 
     cells = load_campaign(args.campaign)
     if not cells:
-        print(f"no complete cells under {args.campaign}", file=sys.stderr)
+        print(f"no cells under {args.campaign}", file=sys.stderr)
         return 1
-    report = analyze(cells)
-    render(report)
+    scaling = analyze(fit_inputs(cells))
+    saturation_report = saturation(cells)
+    render(scaling)
+    render_saturation(saturation_report)
+    if not scaling and not saturation_report:
+        print(
+            f"nothing to report from {len(cells)} cell(s) under {args.campaign}: "
+            "no series had 3+ complete scale steps and no node count had 2+ "
+            "allocation points",
+            file=sys.stderr,
+        )
+        return 1
     if args.json:
         with open(args.json, "w") as f:
-            json.dump(report, f, indent=2)
+            json.dump({"scaling": scaling, "saturation": saturation_report}, f, indent=2)
             f.write("\n")
         print(f"\nreport written to {args.json}")
     return 0

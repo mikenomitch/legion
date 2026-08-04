@@ -83,6 +83,33 @@ def expected_allocations(job_type):
     return job_type["tasks_per_job"] * job_type["task_count_per_task"]
 
 
+def total_expected(scenario, multiplier):
+    """Allocations this scenario yields at `multiplier`, without writing files."""
+    return sum(expected_allocations(jt) for _, jt, _ in iter_jobs(scenario, multiplier))
+
+
+def multiplier_for_target(scenario, target):
+    """The multiplier that lands this scenario near `target` allocations.
+
+    The scenarios were sized for the local micro-benchmarks, where a few
+    dozen nodes make 180-380 allocations a real workload. On the AWS rig
+    they are not: the plan asks for 5-50k allocations across the scale
+    steps, and 180 of them place in under a second — inside the driver's
+    warmup, so the cell reports a throughput of zero and no latency
+    samples at all. Expressing the size as a target rather than a
+    multiplier keeps the three scenarios comparable, since their bases
+    differ (180 / 304 / 380) and one flat multiplier would scatter them.
+
+    Linear because `multiplier` scales job COUNT and each job contributes
+    a fixed allocation count, so total is proportional up to the per-type
+    ceil() in scaled_count().
+    """
+    base = total_expected(scenario, 1.0)
+    if base <= 0:
+        return 1.0
+    return max(0.25, target / base)
+
+
 # --- Legion -----------------------------------------------------------
 
 
@@ -305,10 +332,21 @@ def main():
         default=1.0,
         help="Scale every job type's job count (allocation scaling per step)",
     )
+    parser.add_argument(
+        "--target-allocations",
+        type=int,
+        default=None,
+        help="Size the workload to about this many allocations, overriding "
+        "--count-multiplier. Preferred for campaign steps: the scenarios' "
+        "own bases differ, so a shared target keeps cells comparable.",
+    )
     args = parser.parse_args()
 
     scenario = load_scenario(args.scenario)
-    manifest = translate(scenario, args.system, args.out, args.count_multiplier)
+    multiplier = args.count_multiplier
+    if args.target_allocations is not None:
+        multiplier = multiplier_for_target(scenario, args.target_allocations)
+    manifest = translate(scenario, args.system, args.out, multiplier)
     print(
         f"{manifest['scenario']} -> {args.system}: {len(manifest['jobs'])} jobs, "
         f"{manifest['total_expected_allocations']} expected allocations in {args.out}",

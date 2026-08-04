@@ -28,11 +28,11 @@ install_manager() { # install_manager <node-idx> <config-file>
     local idx="$1" config="$2" ip="${CP_ADDRS[$1]}"
     log "installing legion manager on cp-$idx ($ip)"
     rsh "$ip" "
-        sudo aws s3 cp --region $REGION s3://$BUCKET/bin/legion /opt/legion/bin/legion &&
+        sudo aws s3 cp --only-show-errors --region $REGION s3://$BUCKET/bin/legion /opt/legion/bin/legion &&
         sudo chmod +x /opt/legion/bin/legion &&
         sudo ln -sf /opt/legion/bin/legion /usr/local/bin/legion &&
         sudo mkdir -p /opt/legion/configs/workers /opt/legion/plugins /var/lib/legion &&
-        sudo aws s3 cp --region $REGION s3://$BUCKET/bin/legion-plugins.tar.gz /tmp/plugins.tar.gz &&
+        sudo aws s3 cp --only-show-errors --region $REGION s3://$BUCKET/bin/legion-plugins.tar.gz /tmp/plugins.tar.gz &&
         sudo tar -xzf /tmp/plugins.tar.gz --strip-components=1 -C /opt/legion/plugins
     "
     rcp "$config" "$ip:/tmp/manager.ncl"

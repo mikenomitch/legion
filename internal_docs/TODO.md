@@ -28,6 +28,28 @@ How to use it:
 
 ## Scheduling & placement
 
+- [ ] **Re-measure the plan-apply fix on AWS.** Phase 4 of
+      [plan-apply-conflict-reduction-plan.md](plans/plan-apply-conflict-reduction-plan.md).
+      The two-pass bind is shipped and unit-proven but **unmeasured at
+      scale** — every number in
+      [aws-phase2-findings.md](aws-phase2-findings.md) is still the
+      pre-change baseline. Re-run its five-row table; that table is the
+      regression test. Success is `plan_apply_total{rejected}` under 5%
+      (from 73.6%) and throughput that RISES with eval threads instead of
+      falling. Watch `legion_scheduler_plan_bind_pass{pass="revalidated"}`
+      — it counts the conflicts that used to be rejections, and should be
+      high under bin_pack.
+    - [ ] Run `spread` as well as `bin_pack`. Every phase-2 number is
+          bin_pack (the manager template sets it and `translate.py` drops
+          the scenario's `spread`), which is the maximally correlated
+          policy and therefore the worst case for this conflict. It is
+          also where the fix's regression risk lives: pass 2 improves
+          packing under bin_pack but slightly loosens spread. Make the
+          rig config and the scenario agree first.
+    - [ ] Answer the two open questions the campaign could not:
+          whether `build_plan` stays flat above 5k nodes (the whole scale
+          claim rests on it, and it has never been tested there), and what
+          made `task_fetch` grow 33x.
 - [ ] **Late-binding plan apply, Phase 4 backlog** (each optional, gated on
       the fallback-rank / `plan_apply_total{rejected}` metrics the shipped
       phases added): capacity-aware candidate skipping, per-component partial
@@ -35,6 +57,33 @@ How to use it:
       replicas, and a serialized/batched apply lane for physically-full
       pools — [plan §8](plans/late-binding-plan-apply-plan.md). The shipped
       phases are in Done below.
+      **The gating metric now has a number.** AWS rig 2026-08-04, 5,000
+      allocations over 1,000 nodes with concurrent submission:
+      `plan_apply_total{outcome="rejected"}` 472 against
+      `{outcome="applied"}` 2503 — a **15.9% rejection rate**, each one a
+      full eval retry. The rejections read "no candidate for task N could
+      bind: all 1 candidate(s) were stale or invalid", while
+      `legion_scheduler_index_candidates{index="fit"}` shows the index
+      handing placement 33-64 candidates per task. So the index is not
+      candidate-starved; the plan carries one candidate per task and loses
+      it to a concurrent apply. That points straight at striped disjoint
+      candidate lists as the highest-value item of the four.
+- [ ] **Cut the raft round trips per eval, or widen the lane pipeline.**
+      Same run: the scheduler lane took 67,165 raft ops for ~10,700 evals
+      (~6 per eval — `claim_eval`, the plan apply, `complete_eval_with_event`,
+      plus enqueues, each its own replicated proposal), and accumulated
+      **206 seconds of `legion_raft_pipeline_wait_seconds`** at 3.07ms/op
+      against the status lane's 0.09ms/op on comparable volume.
+      `propose_apply` is a flat ~1.5ms on every lane, so this is queueing
+      behind the lane's single `pipeline_loop` thread, not replication
+      cost. Net effect: `legion_scheduler_plan_phase_seconds{phase="total"}`
+      averages 9.32ms per eval (of which `apply` is 6.74ms, 72%) while
+      achieved throughput implies ~75ms of wall time per eval per thread.
+      The scheduling work itself is not the problem — `build_plan` is
+      1.72ms and `available_nodes` 0.03ms over 1,000 nodes. Options:
+      batch the eval lifecycle ops into fewer proposals, or give the
+      pipeline more than one thread per lane. Wants measurement of which
+      of the ~6 ops are actually separable before any design.
 - [ ] **Fused top-k candidate scoring.** Ranked candidate lists materialize a
       scored vector per placement; the one-candidate path (`plan_candidates:
       0`) uses the fused argmax loop that does not. A fused top-k loop would
@@ -442,6 +491,86 @@ How to use it:
         otherwise delete the field.
         [liveness plan §8 phase 1](plans/liveness-off-the-raft-path-plan.md),
         [call 4](calls/liveness-off-the-raft-path-plan_calls.md).
+  - [ ] **No way to remove a node record, so simulated fleets orphan
+        rows.** `Store::remove_node` (`src/storage/store.rs:5070`) is
+        implemented, cross-lane correct, and unit-tested, but has no
+        production caller: there is no `DeregisterNode` RPC and no
+        `legion node` verb for it, so a row created by registration lives
+        until the raft store is wiped. That is a product gap as much as a
+        rig one — an operator decommissioning hardware has no way to
+        remove the row either. On the rig it means `stop-sim-fleet.sh`
+        leaves every node behind (the K8s path, by contrast, does
+        `kubectl delete nodes -l type=kwok`), and a later smaller cell
+        runs against the leftovers. Contamination is bimodal and both
+        halves invalidate the cell: below 50% orphans you get the eval
+        storm above; above 50% the mass-disruption breaker
+        (`src/constants.rs:109`) marks *nobody* lost, so the cell runs
+        with node-loss detection silently off, leaving one `error!` line
+        (`src/manager/daemon.rs:824`) as the only evidence. Rig-side
+        mitigations that need no product change: make the fleet gate in
+        `run-step.sh:71` assert an exact live-node census instead of
+        `registered >= NODES` (`4000 >= 1000` is why nothing caught it),
+        and wipe + reinstall the control plane between an experiment and
+        a campaign — `phase1.sh` runs `packing-density.sh` then
+        `run-campaign.sh` with no wipe between. Do NOT scope node-name
+        prefixes per run before deregistration exists: name *reuse* is
+        currently the only thing bounding the node table, so unique
+        prefixes would make every run leak its whole fleet.
+  - [ ] **A mass node-loss event starves every other kind of eval.**
+        Measured on the AWS rig 2026-08-04: ~3000 sim nodes vanished at
+        once and job submission slowed to ~6s per job, with
+        `evals_processed_total{kind="node_lost_reschedule"}` at 2752
+        against `{kind="job_submit"}` at 66 and a 764-deep queue. Four
+        separate causes, each fixable on its own:
+    - [ ] **Equal priority means submissions queue behind recovery.**
+          `claim_eval` orders by `priority DESC, id ASC`
+          (`src/storage/store.rs:12200`) and `node_lost_reschedule`
+          enqueues with no priority, falling back to `DEF_EVAL_PRIORITY`
+          = 50 (`src/constants.rs:65`) — the same value a normal job
+          gets. At equal priority the autoincrement id decides, so a new
+          submit can never overtake an older backlog. Either drop
+          reschedules below the default or give `claim_eval` cross-kind
+          fairness. [preemption plan §on eval
+          starvation](plans/preemption-and-eviction-plan.md) covers the
+          *priority* case and calls it theoretical; this is the equal-
+          priority FIFO case and it is not.
+    - [ ] **Lost nodes with no allocations still cost a full eval.** The
+          `allocs.is_empty()` check is inside the handler
+          (`src/storage/store.rs:10936`), after the enqueue and claim
+          have each been through raft. Push the predicate up to the three
+          enqueue sites (`:5132`, `:5294`, `:12580`).
+    - [ ] **The fan-out is one raft proposal per node, per 2s tick,
+          inline in the status checker.** `mark_nodes_as_lost` loops
+          per node (`src/storage/store.rs:5123-5136`), and
+          `recheck_lost_nodes` re-enqueues every tick for as long as a
+          node stays lost. Batch into one replicated op, and get it off
+          the liveness loop so the checkpoint and gauge refresh still run
+          during the event.
+    - [ ] **Failed evals may not reach `evals_processed_total`.**
+          Suspected on the AWS run and then RETRACTED — the counter is
+          incremented on both paths at `src/manager/daemon.rs:2267`, and
+          the evidence turned out to be two scrapes compared across
+          different times. Left here as one deliberate check for the next
+          campaign rather than as a known bug: submit a job whose
+          constraints match no node, and confirm
+          `evals_processed_total{kind="job_submit",status="error"}`
+          moves by exactly one.
+    - [ ] **Recovery is invisible.** Re-registration clears a `lost` row
+          via `SEED_NODE_HEALTH` with no log and no counter, unlike the
+          heartbeat recovery path which logs at
+          `src/storage/store.rs:5620`. Add
+          `legion_nodes_recovered_total{path}` so `lost - recovered` is
+          computable and flapping is visible; today a fleet that dies and
+          comes back reads as if nothing happened.
+        Not a rig-only concern: a single-AZ loss in a three-AZ cluster is
+        ~33% of the fleet, which is *under*
+        `LIVENESS_MASS_DISRUPTION_FRACTION` (`src/constants.rs:109`), so
+        the full storm fires unsuppressed. The cadence plan anticipates
+        the loss→reschedule→load loop
+        ([plan §6.4](plans/heartbeat-cadence-at-scale-plan.md)) but sizes
+        it as one eval per *allocation*; it is per node, including nodes
+        with none. Needs a plan before any fix, and a public note in
+        [docs/node-liveness.md](../docs/node-liveness.md).
   - [ ] **`mark_node_ready` writes `status = "ready"`, which every liveness
         query filters out.** `mark_node_ready_apply`
         (`src/storage/store.rs`) sets `"ready"` rather than `"active"`, so a
@@ -1136,6 +1265,76 @@ Deferred from [job-updated-at-plan.md](plans/job-updated-at-plan.md):
 - [ ] **Audit every name decision in depth.** Important, and gets harder the
       longer it waits.
 - [ ] Performance and scale: prove Legion scales better than K8s, and than Nomad
+- [ ] **`DestroyJob` reports a precondition failure as an opaque
+      `Internal`.** Destroying a running job fails, correctly, with
+      `"Job must be stopped before it can be destroyed"` — but that
+      reason stays in the manager's log. The client gets
+      `{"code": "Internal", "message": "Error deleting job"}`, which
+      names neither the cause nor the fix. Wrong on three counts: the
+      code should be a precondition/failed-precondition rather than
+      `Internal`, the envelope should carry a `hint` ("stop the job
+      first, or pass --asap"), and an agent reading `Internal` has no
+      way to tell a bug from a thing it should do differently — exactly
+      what the agent-readiness rules in AGENTS.md exist to prevent.
+      Found when a benchmark teardown silently left 835 jobs behind.
+      Worth auditing the other mutating verbs for the same pattern.
+- [ ] **`schedulingPolicy` in the rig contradicts the scenarios.**
+      `benchmarks/aws/configs/legion/manager-a.ncl.tpl` sets
+      `schedulingPolicy = "bin_pack"` while
+      `benchmarks/scheduler/scenarios/web_fleet.json` declares
+      `"scheduling_policy": "spread"`. The manager setting wins, so every
+      number from 2026-08-04 is a bin_pack number. That matters for the
+      conflict work specifically: bin_pack is the maximally correlated
+      policy — every planner's argmax is the same fullest-node-that-still
+      -fits — so it is the worst case for optimistic concurrency and the
+      best case for the two-pass bind. Decide which policy the campaign
+      is supposed to measure, make the two agree, and measure the
+      conflict rate under BOTH before quoting either.
+- [ ] **Consider a batch job-submission RPC.** `RunJob` is one job per call,
+      so a client submitting N jobs pays N round trips and N control-lane
+      raft commits. Measured on the AWS rig 2026-08-04: a client submitting
+      serially manages ~40 jobs/sec, of which ~25ms per job is CLI startup
+      (~2ms), Nickel evaluation (~13ms) and the commit (~10ms) — and Legion
+      placed each job before the next one arrived, so the client, not the
+      scheduler, set the rate. The benchmark driver worked around it with a
+      thread pool, but bulk submission is a real user path (CI fan-out,
+      a `legion job run` over a directory, an agent registering a fleet of
+      jobs). A `RunJobs` that commits once for the batch would cut both the
+      round trips and the commits. Wants a plan first: batching changes
+      idempotency (one key per batch or per job?), partial-failure
+      semantics, and ACL scope evaluation, none of which are obvious.
+- [ ] **`a_task_that_ignores_its_stop_signal_is_killed_at_the_deadline` is
+      flaky under parallel load.** Passes alone and in most full runs, fails
+      intermittently in `cargo test --all` (seen 2026-08-04). Its own comment
+      claims "a zero grace window is already expired, so the very first reap
+      takes it — no sleeping, no flakiness", but it spawns a real process and
+      asserts a reap deadline, so a loaded machine can reap before the child
+      is scheduled. Not caused by the plan-apply work — `src/worker/task_manager.rs`
+      is untouched by it. Make the assertion independent of the child actually
+      having started, or gate on an observed start.
+- [ ] **`teardown.sh` silently aborts when run non-interactively, leaving the
+      whole rig billing.** It prompts `read -r -p "Destroy the entire benchmark
+      rig?"` unless `--yes` is passed. Under `nohup ... < /dev/null` (how any
+      unattended teardown runs) `read` gets EOF and returns non-zero, and
+      `set -e` kills the script *before* it prints "aborted" — so the log ends
+      on a successful-looking S3 sync line and every instance stays up. Hit
+      tonight: teardown appeared to succeed twice while the full rig kept
+      running. Fix: detect a non-tty and either default to proceeding or fail
+      loudly, never exit silently on a confirmation prompt. Audit the other
+      rig scripts for the same `set -e` + `read` shape.
+- [ ] **Share one target dir across plugin builds.** `build.rs` gives every
+      plugin its own `CARGO_TARGET_DIR` (`target/plugin-build/<kind>/<name>`)
+      and builds them sequentially, and every plugin depends on the whole
+      `legion` crate — so a `LEGION_BUILD_PLUGINS=1` build compiles the same
+      ~470 dependency crates six times in release, ~2,950 crate-compilations
+      and ~10.9 GB where ~600 and ~2 GB would do. It dominates the 16m48s
+      clean build, and the AWS rig pays it on every `build-and-upload.sh`.
+      The blocker is a name collision, not the target dir: `node_checks/example`
+      and `volumes/example` are both crate `example`, so one shared dir would
+      have them clobber each other's `libexample.dylib`, which is what the
+      harvest step globs for. Rename the plugin crates unique, then share the
+      dir — sequential builds mean no lock contention, and identical profile +
+      dependency versions mean cargo reuses everything after the first plugin.
 - [x] **Binary size: ship a `dist` profile.** `cargo build --profile dist` (LTO +
       `codegen-units = 1` + strip) takes the binary from 43.7 MB to 26.0 MB. See
       "Building a shipping binary" in [development.md](development.md).
@@ -1282,6 +1481,38 @@ Deferred from [job-updated-at-plan.md](plans/job-updated-at-plan.md):
 
 docs: [scheduler-and-eval-loop.md](../docs/scheduler-and-eval-loop.md), [jobs-tasks-and-scheduling.md](../docs/jobs-tasks-and-scheduling.md)
 
+- [x] **Plan-apply conflict reduction: the epoch is a ranking hint, not a
+      gate.** 2026-08-04, from the AWS phase-2 finding that **74% of plan
+      applies were rejected and re-planned**
+      ([findings](aws-phase2-findings.md),
+      [plan](plans/plan-apply-conflict-reduction-plan.md),
+      [calls](calls/plan-apply-conflict-reduction-plan_calls.md)).
+      Three things shipped together:
+    - **Two-pass bind** in `apply_plan_submission_on`. Pass 1 is the old
+      walk byte-for-byte; pass 2 revisits only epoch-moved candidates and
+      admits them on the in-transaction revalidation that already runs
+      (node row, availability, constraints, free pool with this plan's
+      binds debited, static ports, `distinct`). Rejections now name
+      capacity or constraint instead of staleness. `target_instance`
+      ratification keeps the hard gate. New
+      `legion_scheduler_plan_bind_pass{pass}`.
+    - **Candidate lists restored.** `decouple_plan_components` was
+      collapsing every multi-placement plan to ONE candidate whenever two
+      placements shared a candidate node — which for a multi-replica job
+      into one pool is always, so late binding was structurally off for
+      the workloads it was built for. Overlap edge deleted (the in-tx
+      pool debit already covers it); `distinct` and co-placement edges
+      kept. Fallback tail now samples from the top-W by score instead of
+      a deterministic top-N that handed every concurrent planner the same
+      list.
+    - **A pre-existing partial-apply bug**, found on the way: a *rejected*
+      plan committed the placements it had already bound — allocation
+      rows no `allocation.placed` event announced, inside a submission
+      marked `rejected`. Only evictions were savepointed; the savepoint
+      now covers the whole plan body. Removing the overlap edge would
+      have widened that window sharply.
+      1482 tests pass, clippy and fmt clean, and the oversubscription and
+      job-config-epoch fences pass **unmodified**.
 - [x] **Priorities and eviction/preemption, with eviction toggled at the pool
       level.** Six named priority bands (`critical` / `high` / `elevated` /
       `normal` / `low` / `background`) driving both eval-queue order and
@@ -1645,3 +1876,35 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
       readably ([plan](plans/job-updated-at-plan.md),
       [calls](calls/job-updated-at-plan_calls.md),
       [docs](../docs/jobs-tasks-and-scheduling.md#job-timestamps-created_at-and-updated_at)).
+
+## AWS rig: mitigations in place for the node-deregistration and plugin-build gaps
+
+Both gaps are still open (see "No way to remove a node record" and "Share one
+target dir across plugin builds" above); this records what `benchmarks/aws/`
+now does about them so nobody re-derives it at 02:00.
+
+- **Node records.** The rig no longer pretends the node table is a fleet
+  count. `scripts/env.sh` gained `node_census` / `assert_fleet`: an exact
+  assertion — right row count, every row `active` in `node_health` and
+  `available` in `node`, every id from this fleet's `sim-<slice>-` prefixes —
+  replacing the `registered >= NODES` gate in both `run-step.sh` and
+  `start-sim-fleet.sh`, and printing the observed census
+  (`total=4000 active=1000 lost=3000 …`) when it refuses.
+  `scripts/reset-control-plane.sh` (stop the fleet, then reinstall, which
+  wipes) is the only reliable cleanup, and `run-campaign.sh` runs it before
+  every campaign, which also closes the `packing-density.sh` ->
+  `run-campaign.sh` boundary in `phase1.sh`. Node-name prefixes remain
+  reused, deliberately, for the reason stated above.
+- **Fleet churn.** A cell now avoids a fleet restart when the running fleet
+  already matches (system, scenario, node count) — a saturation sweep's
+  points share one fleet for exactly this reason — waits for the eval
+  backlog to drain before measuring, and archives the depth it started from
+  in the cell's `pre-cell.json` and `pre_cell_eval_backlog` in the fairness
+  record, so a contaminated cell is identifiable from the archive alone.
+- **Plugin builds.** `build-and-upload.sh` now fingerprints `plugins/` plus
+  the rustc version, and when the fingerprint matches the bundle already in
+  S3 it builds with `LEGION_SKIP_PLUGIN_BUILD=1` and reuses that bundle
+  (`--force-plugins` overrides). That removes the repeated ~10.9 GB /
+  6x-470-crate rebuild from every campaign, but it is a cache, not a fix:
+  the first build on a fresh box and any change under `plugins/` still pays
+  in full, so the shared-target-dir item above stands.

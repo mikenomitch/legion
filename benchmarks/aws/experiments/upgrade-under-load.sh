@@ -39,7 +39,7 @@ REMOTE_OUT="/opt/bench/runs/$CAMPAIGN/$RUN_ID"
 UPGRADE_CMD=""
 for idx in 2 1 0; do
     UPGRADE_CMD+="$RSH_FROM_LOADGEN ubuntu@${CP_PRIVATE_IPS[$idx]} '
-        sudo aws s3 cp --region $REGION $NEW_BINARY /opt/legion/bin/legion.new &&
+        sudo aws s3 cp --only-show-errors --region $REGION $NEW_BINARY /opt/legion/bin/legion.new &&
         sudo chmod +x /opt/legion/bin/legion.new &&
         sudo mv /opt/legion/bin/legion.new /opt/legion/bin/legion &&
         sudo systemctl restart legion-manager'; "

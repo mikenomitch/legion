@@ -15,6 +15,16 @@
 #   5. packing-density.sh      retire the 1,250-nodes-per-instance guess
 #   6. run-campaign.sh --smoke phase 1's exit criterion
 #
+# Steps 5 and 6 must not share a control plane. The density ladder climbs
+# to 4,000 simulated nodes, and Legion cannot deregister a node, so those
+# rows are still in the store when the 1,000-node smoke campaign starts —
+# which is exactly how a "1,000-node" cell came to be measured against a
+# 4,000-row node table, and reported as though it were not.
+# `run-campaign.sh` now wipes and reinstalls the control plane before its
+# first step, so this boundary is handled inside step 6 rather than left
+# to whoever reads this list. Step 4 stays: the density ladder in step 5
+# needs a control plane of its own to register against.
+#
 # It deliberately stops before teardown. The control plane holds the
 # state a post-mortem needs and costs ~$0.75/hr; deciding to destroy it
 # is a human's call, and `scripts/teardown.sh` is the only thing that

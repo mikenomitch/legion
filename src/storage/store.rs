@@ -2817,7 +2817,7 @@ impl Store {
     /// `schedulerSettings.plan_apply_batch_max` — default 16, clamped to
     /// 1..=128. Caps how many plans one group commit may carry, bounding
     /// the size of the replicated changeset (raft append-entries budget).
-    fn plan_apply_batch_max(settings: Option<&Value>) -> usize {
+    pub(crate) fn plan_apply_batch_max(settings: Option<&Value>) -> usize {
         settings
             .and_then(|settings| settings.get("plan_apply_batch_max"))
             .and_then(Value::as_u64)
@@ -3306,19 +3306,20 @@ impl Store {
             "Applying plan submission"
         );
 
-        // `reverted_evictions` is `Some(n)` once this plan has staged
-        // evictions inside the `legion_plan_evictions` savepoint: a rejection
-        // still COMMITS (it persists the rejected row and its event), so the
-        // victims must be rolled back first — a plan that is not happening
-        // may not displace anything.
+        // `reverted` is `Some(n)` once this plan has written anything
+        // inside the `legion_plan_body` savepoint — evictions, or the
+        // placements of a multi-placement plan. A rejection still COMMITS
+        // (it persists the rejected row and its event), so that work must
+        // be rolled back first: a plan that is not happening may neither
+        // displace anything nor leave a partially-bound placement behind.
+        // The rollback runs before the UPDATE and the event below, so the
+        // rejection itself survives the commit.
         let reject = |tx: &Connection,
                       reason: String,
-                      reverted_evictions: Option<usize>|
+                      reverted: Option<usize>|
          -> R<(PlanApplyOutcome, PlanApplyEffects)> {
-            if reverted_evictions.is_some() {
-                tx.execute_batch(
-                    "ROLLBACK TO legion_plan_evictions; RELEASE legion_plan_evictions;",
-                )?;
+            if reverted.is_some() {
+                tx.execute_batch("ROLLBACK TO legion_plan_body; RELEASE legion_plan_body;")?;
             }
             tx.execute(
                 "UPDATE plan_submission SET status = 'rejected', rejection_reason = ?1 WHERE id = ?2;",
@@ -3332,7 +3333,7 @@ impl Store {
             warn!(
                 submission_id = submission.id,
                 job_config_id = %submission.job_config_id,
-                reverted_evictions = reverted_evictions.unwrap_or_default(),
+                reverted_writes = reverted.unwrap_or_default(),
                 duration_ms = tx_started.elapsed().as_millis() as u64,
                 "Rejected plan submission: {reason}"
             );
@@ -3423,9 +3424,16 @@ impl Store {
                 entry.insert(epoch);
             }
         }
-        let eviction_savepoint = !evictions.is_empty();
-        if eviction_savepoint {
-            tx.execute_batch("SAVEPOINT legion_plan_evictions;")?;
+        // The savepoint covers the evictions AND the placement walk. A
+        // plan that binds its first placement and then finds no candidate
+        // for its second must leave nothing behind: the rejection commits,
+        // and without this the bound allocation would commit with it —
+        // rows nothing announced, belonging to a plan the store says did
+        // not happen. Skipped for the common single-placement,
+        // no-eviction plan, which has nothing to undo.
+        let body_savepoint = !evictions.is_empty() || placements.len() > 1;
+        if body_savepoint {
+            tx.execute_batch("SAVEPOINT legion_plan_body;")?;
         }
         let preempted = self.apply_plan_evictions_tx(tx, submission, &evictions)?;
 
@@ -3461,10 +3469,28 @@ impl Store {
         let drop_own = plan_mode == "fresh";
         let mut free_pools: HashMap<String, ResourcePool> = HashMap::new();
 
+        // Building one free pool costs a per-node allocation scan, and the
+        // two-pass walk below can attempt every candidate of every
+        // placement. Cap the distinct nodes one plan may rebuild a pool
+        // for, so a pathological plan (hundreds of placements × a long
+        // candidate list, all of them contended) cannot stretch the group
+        // commit's single transaction. Generous by construction: a plan
+        // that binds rank 0 everywhere needs exactly one rebuild per
+        // distinct node.
+        let pool_rebuild_budget = placements.len().saturating_mul(4).max(256);
+
         let mut allocations = Vec::new();
         let mut candidate_ranks: Vec<usize> = Vec::new();
+        // Which pass bound each allocation: `false` = clean, `true` =
+        // revalidated. Emitted as `legion_scheduler_plan_bind_pass` after
+        // the plan commits.
+        let mut bind_passes: Vec<bool> = Vec::new();
         let mut task_states: HashMap<i64, AllocationTaskState> = HashMap::new();
         let mut task_requests: HashMap<i64, Option<ResourceRequest>> = HashMap::new();
+        // Nodes this plan has already bound a replica of a given task onto.
+        // Pass 1 avoids stacking a task's replicas; pass 2 relaxes it (see
+        // the walk below).
+        let mut plan_binds: HashSet<(i64, String)> = HashSet::new();
         for placement in &placements {
             let task_id = placement.task_id;
             let state = match task_states.entry(task_id) {
@@ -3481,30 +3507,89 @@ impl Store {
                 ),
             };
 
-            // Walk the ranked candidates; bind the first that is still free
-            // ("free" = epoch unchanged) and still valid on its fresh row.
-            // Every skip is conservative: a touched-but-still-fitting node
-            // costs a near-equivalent fallback, never correctness.
+            // Walk the ranked candidates in two passes.
+            //
+            // **Pass 1 (`clean`)** is the pre-two-pass walk, byte for
+            // byte: in rank order, bind the first candidate whose node
+            // epoch is unchanged since the plan snapshot and whose fresh
+            // row still checks out. Uncontended placements therefore keep
+            // the planner's argmax and placement quality is untouched.
+            //
+            // **Pass 2 (`revalidated`)** revisits — still in rank order —
+            // only the candidates pass 1 deferred: those whose node epoch
+            // moved, and those the replica rule held back. The node epoch
+            // is a *ranking hint* that the node's allocation set is
+            // unchanged, not the fit proof it once was, because everything
+            // it stands in for is re-derived below inside this serialized
+            // apply transaction against committed rows: the node row and
+            // its availability, constraints and permit, capacity from a
+            // free pool rebuilt in-transaction (`reservedResources` /
+            // `maxAllocations` included, with this plan's own binds
+            // debited), static ports, and the `distinct` tracker. A
+            // candidate that passes all of those fits, whoever else
+            // touched the node meanwhile. Job-level count double-spend is
+            // fenced separately, by the job-config epoch above, which
+            // stays hard and all-or-nothing.
+            //
+            // The one exception is a ratification (`target_instance`,
+            // docs/edge-boot.md): there a moved epoch may mean somebody
+            // already owns this sandbox, which no capacity recheck can
+            // disprove, so the epoch stays a hard gate and pass 2 never
+            // runs.
+            let revalidation_allowed = target_instance.is_none();
             let mut bound = false;
             let mut first_skip_reason: Option<String> = None;
-            for (rank, node_id) in placement.candidates.iter().enumerate() {
-                let node_scope_key = Self::scope_vector_key("node", node_id);
-                let expected_epoch = submission
-                    .expected_versions
-                    .get(&node_scope_key)
-                    .copied()
-                    .unwrap_or_default();
-                let latest_epoch = match pre_eviction_node_epochs.get(node_id) {
-                    Some(epoch) => *epoch,
-                    None => self.scope_epoch_tx(tx, "node", node_id)?,
-                };
-                if latest_epoch != expected_epoch {
-                    if first_skip_reason.is_none() {
-                        first_skip_reason = Some(format!(
-                            "node {node_id} epoch moved (expected {expected_epoch}, latest {latest_epoch})"
-                        ));
+            let mut first_stale_reason: Option<String> = None;
+            // `(rank, revalidated)`. Pass-2 entries are appended as pass 1
+            // defers them, so they are only reached once every pass-1
+            // entry has been tried, and they keep rank order among
+            // themselves. Deterministic, like the rest of the walk.
+            let mut attempts: Vec<(usize, bool)> = (0..placement.candidates.len())
+                .map(|rank| (rank, false))
+                .collect();
+            let mut attempt_index = 0;
+            while attempt_index < attempts.len() {
+                let (rank, revalidated) = attempts[attempt_index];
+                attempt_index += 1;
+                let node_id = &placement.candidates[rank];
+                if !revalidated {
+                    let node_scope_key = Self::scope_vector_key("node", node_id);
+                    let expected_epoch = submission
+                        .expected_versions
+                        .get(&node_scope_key)
+                        .copied()
+                        .unwrap_or_default();
+                    let latest_epoch = match pre_eviction_node_epochs.get(node_id) {
+                        Some(epoch) => *epoch,
+                        None => self.scope_epoch_tx(tx, "node", node_id)?,
+                    };
+                    if latest_epoch != expected_epoch {
+                        if first_stale_reason.is_none() {
+                            first_stale_reason = Some(format!(
+                                "node {node_id} epoch moved (expected {expected_epoch}, latest {latest_epoch})"
+                            ));
+                        }
+                        if revalidation_allowed {
+                            attempts.push((rank, true));
+                        }
+                        continue;
                     }
-                    continue;
+                    // Replicas of one task prefer distinct nodes *when they
+                    // fall back*: without this, every replica's tail
+                    // converges on the same near-tie nodes and a contended
+                    // plan stacks a service onto one machine. Rank 0 is
+                    // exempt — the planner's ledger already decided
+                    // whether replicas share a node, and under `bin_pack`
+                    // stacking them is the point. A preference, not a
+                    // constraint: pass 2 stacks them when nothing else
+                    // fits, and `distinct` remains the constraint for
+                    // callers who need the guarantee.
+                    if rank > 0 && plan_binds.contains(&(task_id, node_id.clone())) {
+                        if revalidation_allowed {
+                            attempts.push((rank, true));
+                        }
+                        continue;
+                    }
                 }
 
                 // Availability is re-validated on the FRESH node row, not
@@ -3557,6 +3642,17 @@ impl Store {
                 // moved" class, so it skips rather than rejects: a node
                 // whose totals shrank mid-plan hands the placement to the
                 // next candidate.
+                if !free_pools.contains_key(node_id.as_str())
+                    && free_pools.len() >= pool_rebuild_budget
+                {
+                    if first_skip_reason.is_none() {
+                        first_skip_reason = Some(format!(
+                            "node {node_id} was not checked: this plan exhausted its \
+                             {pool_rebuild_budget}-node capacity-recheck budget"
+                        ));
+                    }
+                    continue;
+                }
                 let pool = match free_pools.entry(node_id.clone()) {
                     Entry::Occupied(entry) => entry.into_mut(),
                     Entry::Vacant(entry) => entry.insert(self.free_pool_for_node_tx(
@@ -3628,22 +3724,34 @@ impl Store {
                 if let Some(tracker) = state.distinct.as_mut() {
                     tracker.insert_from_node(node);
                 }
+                plan_binds.insert((task_id, node_id.clone()));
+                // Counted once the plan is known to have applied — a
+                // rejection rolls these binds back, and a metric that
+                // counted them would overstate the pass-2 win.
+                bind_passes.push(revalidated);
                 bound = true;
                 break;
             }
 
             if !bound {
+                // Name the real cause. With pass 2 in play, every
+                // candidate has been re-derived against committed state,
+                // so a rejection means no candidate *fits* — capacity, a
+                // constraint, a cordon, a port. Only a ratification (which
+                // skips pass 2) can still be rejected for staleness alone.
+                let cause = first_skip_reason
+                    .or(first_stale_reason)
+                    .unwrap_or_else(|| "no candidates listed".to_string());
                 let reason = format!(
-                    "no candidate for task {} could bind: all {} candidate(s) were stale or invalid since the plan snapshot ({})",
+                    "no candidate for task {} could bind: none of its {} candidate(s) still fits ({})",
                     task_id,
                     placement.candidates.len(),
-                    first_skip_reason
-                        .unwrap_or_else(|| "no candidates listed".to_string()),
+                    cause,
                 );
                 return reject(
                     tx,
                     reason,
-                    eviction_savepoint.then_some(preempted.victims.len()),
+                    body_savepoint.then(|| preempted.victims.len() + allocations.len()),
                 );
             }
         }
@@ -3651,8 +3759,8 @@ impl Store {
         if !allocations.is_empty() {
             self.bump_epochs_for_allocations_tx(tx, &allocations)?;
         }
-        if eviction_savepoint {
-            tx.execute_batch("RELEASE legion_plan_evictions;")?;
+        if body_savepoint {
+            tx.execute_batch("RELEASE legion_plan_body;")?;
         }
 
         tx.execute(
@@ -3686,6 +3794,13 @@ impl Store {
         let metrics = crate::manager::telemetry::metrics();
         for rank in &candidate_ranks {
             metrics.scheduler_plan_candidate_rank.observe(*rank as f64);
+        }
+        for revalidated in &bind_passes {
+            metrics.scheduler_plan_bind_pass.inc(&[if *revalidated {
+                "revalidated"
+            } else {
+                "clean"
+            }]);
         }
         // Outcomes are mutually exclusive so an operator can split "no race
         // happened" from "a race was absorbed" at a glance: `applied` means
@@ -17514,24 +17629,38 @@ mod tests {
     fn plan_batch_keeps_per_plan_cas_verdicts() -> R<()> {
         let store = setup_store()?;
         store.insert_node(make_node_msg("node-a", "ready"))?;
+        store.insert_node(make_node_msg("node-b", "ready"))?;
         let (job_a, task_a) = submit_named_job(&store, "cas-job-a")?;
         let (job_b, task_b) = submit_named_job(&store, "cas-job-b")?;
 
-        let fresh =
-            store.allocation_version_vector(&job_a, &HashSet::from(["node-a".to_string()]))?;
-        // Stale by construction: bump node-a's epoch after sampling.
+        // Stale by construction, on the check that is still hard and
+        // all-or-nothing: the JOB-CONFIG epoch. (A stale *node* epoch is
+        // now revalidated and rebound — see
+        // `plan_walk_rebinds_an_epoch_dirty_candidate_that_still_fits`.)
         let stale =
-            store.allocation_version_vector(&job_b, &HashSet::from(["node-a".to_string()]))?;
+            store.allocation_version_vector(&job_a, &HashSet::from(["node-a".to_string()]))?;
         store.place_alloc("node-a", task_a)?;
+        let fresh =
+            store.allocation_version_vector(&job_b, &HashSet::from(["node-b".to_string()]))?;
 
-        let results = store.run_plan_apply_batch(vec![PlanApplyRequest {
-            job_config_id: job_b.clone(),
-            mode: "fresh".into(),
-            placements: PlanPlacements::Nodes(vec![("node-a".to_string(), task_b)]),
-            expected_versions: stale,
-            evictions: Vec::new(),
-            target_instance: String::new(),
-        }]);
+        let results = store.run_plan_apply_batch(vec![
+            PlanApplyRequest {
+                job_config_id: job_a.clone(),
+                mode: "fresh".into(),
+                placements: PlanPlacements::Nodes(vec![("node-a".to_string(), task_a)]),
+                expected_versions: stale,
+                evictions: Vec::new(),
+                target_instance: String::new(),
+            },
+            PlanApplyRequest {
+                job_config_id: job_b.clone(),
+                mode: "fresh".into(),
+                placements: PlanPlacements::Nodes(vec![("node-b".to_string(), task_b)]),
+                expected_versions: fresh,
+                evictions: Vec::new(),
+                target_instance: String::new(),
+            },
+        ]);
         assert!(
             matches!(
                 results[0],
@@ -17540,12 +17669,73 @@ mod tests {
                     ..
                 })
             ),
-            "stale epochs must reject inside a batch exactly as they do alone: {:?}",
+            "a stale job-config epoch must reject inside a batch exactly as it does alone: {:?}",
             results[0]
         );
+        assert!(
+            matches!(
+                results[1],
+                Ok(PlanApplySlot {
+                    reply: (_, PlanApplyOutcome::Applied(_)),
+                    ..
+                })
+            ),
+            "a batch-mate's rejection must not poison the next plan: {:?}",
+            results[1]
+        );
+        Ok(())
+    }
 
-        // And a fresh sample for the untouched job still applies.
-        let _ = fresh;
+    /// Plans queued in one group commit routinely overlap: independent
+    /// jobs planned against the same snapshot pick the same best node, so
+    /// every plan after the first in the batch carries a node epoch its
+    /// batch-mate just bumped. With the two-pass bind they all apply while
+    /// the node has room, instead of all but one rejecting.
+    #[test]
+    fn plan_batch_of_overlapping_plans_all_apply_when_capacity_allows() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(NodeMsg {
+            config_attrs: json!({ "maxAllocations": 4 }).to_string(),
+            ..make_node_msg("node-a", "ready")
+        })?;
+
+        // Every plan samples the SAME pre-batch epochs and targets the
+        // same node — the shape the AWS benchmark produced at scale.
+        let mut batch = Vec::new();
+        for index in 0..4 {
+            let (job_config_id, task_id) =
+                submit_named_job(&store, &format!("overlap-job-{index}"))?;
+            let versions = store.allocation_version_vector(
+                &job_config_id,
+                &HashSet::from(["node-a".to_string()]),
+            )?;
+            batch.push(PlanApplyRequest {
+                job_config_id,
+                mode: "fresh".into(),
+                placements: PlanPlacements::Candidates(vec![PlanSubmissionPlacement {
+                    task_id,
+                    candidates: vec!["node-a".to_string()],
+                }]),
+                expected_versions: versions,
+                evictions: Vec::new(),
+                target_instance: String::new(),
+            });
+        }
+
+        let results = store.run_plan_apply_batch(batch);
+        for (index, result) in results.iter().enumerate() {
+            assert!(
+                matches!(
+                    result,
+                    Ok(PlanApplySlot {
+                        reply: (_, PlanApplyOutcome::Applied(_)),
+                        ..
+                    })
+                ),
+                "plan {index} of the batch must apply: {result:?}"
+            );
+        }
+        assert_eq!(store.allocs_for_node("node-a")?.len(), 4);
         Ok(())
     }
 
@@ -17884,59 +18074,89 @@ mod tests {
         Ok(())
     }
 
+    /// Two jobs onto one node, the second carrying pre-apply (stale) node
+    /// epochs. The node scope no longer fences on the epoch alone: when
+    /// the node still has room the second plan binds, and when it does not
+    /// — the case the fence existed to protect — it is rejected on the
+    /// in-transaction capacity recheck. `maxAllocations` makes the two
+    /// halves differ by exactly one number.
     #[test]
-    fn plan_submission_rejects_stale_epoch_for_shared_node_scope() -> R<()> {
-        let store = setup_store()?;
-        store.insert_node(make_node_msg("node-a", "ready"))?;
+    fn plan_submission_shared_node_scope_binds_when_it_fits_and_rejects_when_full() -> R<()> {
+        for (max_allocations, expect_applied) in [(2, true), (1, false)] {
+            let store = setup_store()?;
+            store.insert_node(NodeMsg {
+                config_attrs: json!({ "maxAllocations": max_allocations }).to_string(),
+                ..make_node_msg("node-a", "ready")
+            })?;
 
-        let make_job = |name: &str, task_name: &str| JobConfig {
-            priority: Default::default(),
-            rollout: None,
-            rollout_by_group: Default::default(),
-            name: name.into(),
-            tasks: vec![TaskConfig::new(task_name, "noop")],
-            version: None,
-        };
+            let make_job = |name: &str, task_name: &str| JobConfig {
+                priority: Default::default(),
+                rollout: None,
+                rollout_by_group: Default::default(),
+                name: name.into(),
+                tasks: vec![TaskConfig::new(task_name, "noop")],
+                version: None,
+            };
 
-        let submission = [Submission {
-            path: "job.ncl".into(),
-            content: "job".into(),
-            is_primary: true,
-        }];
-        store.handle_job_submit(&make_job("job-scope-a", "task-a"), &submission)?;
-        store.handle_job_submit(&make_job("job-scope-b", "task-b"), &submission)?;
+            let submissions = [Submission {
+                path: "job.ncl".into(),
+                content: "job".into(),
+                is_primary: true,
+            }];
+            store.handle_job_submit(&make_job("job-scope-a", "task-a"), &submissions)?;
+            store.handle_job_submit(&make_job("job-scope-b", "task-b"), &submissions)?;
 
-        let job_a_config = store.get_job_config("job-scope-a")?.id();
-        let job_b_config = store.get_job_config("job-scope-b")?.id();
-        let task_a = task_id_for(&store, "task-a", "job-scope-a")?;
-        let task_b = task_id_for(&store, "task-b", "job-scope-b")?;
+            let job_a_config = store.get_job_config("job-scope-a")?.id();
+            let job_b_config = store.get_job_config("job-scope-b")?.id();
+            let task_a = task_id_for(&store, "task-a", "job-scope-a")?;
+            let task_b = task_id_for(&store, "task-b", "job-scope-b")?;
 
-        let job_a_versions = store
-            .allocation_version_vector(&job_a_config, &HashSet::from(["node-a".to_string()]))?;
-        let job_b_versions = store
-            .allocation_version_vector(&job_b_config, &HashSet::from(["node-a".to_string()]))?;
+            let job_a_versions = store
+                .allocation_version_vector(&job_a_config, &HashSet::from(["node-a".to_string()]))?;
+            // Sampled BEFORE the first plan applies, so these epochs are
+            // stale by the time the second plan is applied.
+            let job_b_versions = store
+                .allocation_version_vector(&job_b_config, &HashSet::from(["node-a".to_string()]))?;
 
-        let first = store.insert_plan_submission(
-            &job_a_config,
-            "fresh",
-            &[("node-a".to_string(), task_a)],
-            &job_a_versions,
-        )?;
-        let second = store.insert_plan_submission(
-            &job_b_config,
-            "fresh",
-            &[("node-a".to_string(), task_b)],
-            &job_b_versions,
-        )?;
+            let first = store.insert_plan_submission(
+                &job_a_config,
+                "fresh",
+                &[("node-a".to_string(), task_a)],
+                &job_a_versions,
+            )?;
+            let second = store.insert_plan_submission(
+                &job_b_config,
+                "fresh",
+                &[("node-a".to_string(), task_b)],
+                &job_b_versions,
+            )?;
 
-        assert!(matches!(
-            store.apply_plan_submission(&first)?,
-            PlanApplyOutcome::Applied(_)
-        ));
-        assert!(matches!(
-            store.apply_plan_submission(&second)?,
-            PlanApplyOutcome::Rejected { .. }
-        ));
+            assert!(matches!(
+                store.apply_plan_submission(&first)?,
+                PlanApplyOutcome::Applied(_)
+            ));
+            match store.apply_plan_submission(&second)? {
+                PlanApplyOutcome::Applied(_) => assert!(
+                    expect_applied,
+                    "a full node must not be bound by a stale-epoch plan"
+                ),
+                PlanApplyOutcome::Rejected { reason, .. } => {
+                    assert!(
+                        !expect_applied,
+                        "a stale epoch alone must not reject the plan"
+                    );
+                    assert!(
+                        reason.contains("no longer has capacity"),
+                        "the rejection must name capacity: {reason}"
+                    );
+                }
+            }
+            assert_eq!(
+                store.allocs_for_node("node-a")?.len(),
+                if expect_applied { 2 } else { 1 },
+                "the node never exceeds maxAllocations"
+            );
+        }
 
         Ok(())
     }
@@ -18070,8 +18290,14 @@ mod tests {
         Ok(())
     }
 
+    /// Pass 2 of the bind walk: every candidate's epoch moved, so pass 1
+    /// binds nothing — but the in-transaction revalidation says they still
+    /// fit, so the placement binds rather than rejecting. This is the
+    /// behavior change at the heart of
+    /// `internal_docs/plans/plan-apply-conflict-reduction-plan.md`; the
+    /// same shape used to reject the plan outright.
     #[test]
-    fn plan_walk_rejects_when_all_candidates_are_stale() -> R<()> {
+    fn plan_walk_rebinds_an_epoch_dirty_candidate_that_still_fits() -> R<()> {
         let store = setup_store()?;
         store.insert_node(make_node_msg("node-a", "ready"))?;
         store.insert_node(make_node_msg("node-b", "ready"))?;
@@ -18097,13 +18323,63 @@ mod tests {
         store.place_alloc("node-b", rival_task)?;
 
         match store.apply_plan_submission(&submission)? {
+            PlanApplyOutcome::Applied(applied) => {
+                assert_eq!(applied.allocations.len(), 1);
+                assert_eq!(
+                    applied.allocations[0].node_id, "node-a",
+                    "pass 2 walks the same rank order, so rank 0 wins again"
+                );
+                assert_eq!(applied.candidate_ranks, vec![0]);
+            }
+            PlanApplyOutcome::Rejected { reason, .. } => {
+                bail!("an epoch-dirty candidate that still fits must bind: {reason}")
+            }
+        }
+        Ok(())
+    }
+
+    /// The negative half of the pass-2 contract: epoch-dirty *and* out of
+    /// room still rejects, and the reason names the capacity, not the
+    /// staleness — an operator reading it should be told to add nodes.
+    #[test]
+    fn plan_walk_rejects_when_every_epoch_dirty_candidate_is_full() -> R<()> {
+        let store = setup_store()?;
+        // One allocation slot per node, so the rival below fills it.
+        let full_node = |id: &str| NodeMsg {
+            config_attrs: json!({ "maxAllocations": 1 }).to_string(),
+            ..make_node_msg(id, "ready")
+        };
+        store.insert_node(full_node("node-a"))?;
+        store.insert_node(full_node("node-b"))?;
+
+        let (job_config_id, task_id) = submit_walk_job(&store, "walk-full", task("task"))?;
+        let (_, rival_task) = submit_walk_job(&store, "walk-full-rival", task("rival"))?;
+
+        let expected_versions = store.allocation_version_vector(
+            &job_config_id,
+            &HashSet::from(["node-a".to_string(), "node-b".to_string()]),
+        )?;
+        let submission = store.insert_plan_submission_with_candidates(
+            &job_config_id,
+            "fresh",
+            &[PlanSubmissionPlacement {
+                task_id,
+                candidates: vec!["node-a".to_string(), "node-b".to_string()],
+            }],
+            &expected_versions,
+        )?;
+
+        store.place_alloc("node-a", rival_task)?;
+        store.place_alloc("node-b", rival_task)?;
+
+        match store.apply_plan_submission(&submission)? {
             PlanApplyOutcome::Rejected { reason, .. } => {
                 assert!(
-                    reason.contains("no candidate"),
-                    "unexpected rejection reason: {reason}"
+                    reason.contains("no candidate") && reason.contains("no longer has capacity"),
+                    "the rejection must name capacity, not staleness: {reason}"
                 );
             }
-            PlanApplyOutcome::Applied(_) => bail!("expected an all-candidates-stale rejection"),
+            PlanApplyOutcome::Applied(_) => bail!("a full node must not be bound"),
         }
         Ok(())
     }
@@ -18194,6 +18470,105 @@ mod tests {
             }
             PlanApplyOutcome::Rejected { reason, .. } => {
                 bail!("expected the port-collision candidate to be skipped: {reason}");
+            }
+        }
+        Ok(())
+    }
+
+    /// What replaced the planner's overlap coupling edge: two placements
+    /// of ONE plan may now name the same node, and the walk's
+    /// in-transaction debit is what keeps them from oversubscribing it.
+    /// One allocation slot, two placements, both listing only `node-a` —
+    /// the second must be rejected on capacity, not admitted because its
+    /// epoch happened to be clean.
+    #[test]
+    fn plan_walk_debit_stops_two_placements_of_one_plan_oversubscribing() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(NodeMsg {
+            config_attrs: json!({ "maxAllocations": 1 }).to_string(),
+            ..make_node_msg("node-a", "ready")
+        })?;
+
+        let (job_config_id, task_id) = submit_walk_job(&store, "walk-debit", task("task"))?;
+        let expected_versions = store
+            .allocation_version_vector(&job_config_id, &HashSet::from(["node-a".to_string()]))?;
+        let placement = || PlanSubmissionPlacement {
+            task_id,
+            candidates: vec!["node-a".to_string()],
+        };
+        let submission = store.insert_plan_submission_with_candidates(
+            &job_config_id,
+            "fresh",
+            &[placement(), placement()],
+            &expected_versions,
+        )?;
+
+        match store.apply_plan_submission(&submission)? {
+            PlanApplyOutcome::Rejected { reason, .. } => {
+                assert!(
+                    reason.contains("no longer has capacity"),
+                    "the second placement must lose on capacity: {reason}"
+                );
+            }
+            PlanApplyOutcome::Applied(applied) => bail!(
+                "two placements were admitted onto a one-slot node: {:?}",
+                applied.allocations
+            ),
+        }
+        assert!(store.allocs_for_node("node-a")?.is_empty());
+        Ok(())
+    }
+
+    /// The same guard for static ports: two placements of one plan cannot
+    /// both claim port 18080 on one node, because the walk re-reads the
+    /// node's ports (including the row it just inserted) per bind.
+    #[test]
+    fn plan_walk_port_check_separates_two_placements_of_one_plan() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "ready"))?;
+        store.insert_node(make_node_msg("node-b", "ready"))?;
+
+        let mut port_task = task("task");
+        port_task.network = Some(crate::structs::network::NetworkConfig {
+            mode: "host".into(),
+            ports: vec![crate::structs::network::PortConfig {
+                name: "http".into(),
+                static_port: Some(18080),
+                to: None,
+            }],
+        });
+        let (job_config_id, task_id) = submit_walk_job(&store, "walk-port-pair", port_task)?;
+
+        let expected_versions = store.allocation_version_vector(
+            &job_config_id,
+            &HashSet::from(["node-a".to_string(), "node-b".to_string()]),
+        )?;
+        let placement = || PlanSubmissionPlacement {
+            task_id,
+            candidates: vec!["node-a".to_string(), "node-b".to_string()],
+        };
+        let submission = store.insert_plan_submission_with_candidates(
+            &job_config_id,
+            "fresh",
+            &[placement(), placement()],
+            &expected_versions,
+        )?;
+
+        match store.apply_plan_submission(&submission)? {
+            PlanApplyOutcome::Applied(applied) => {
+                let nodes: Vec<&str> = applied
+                    .allocations
+                    .iter()
+                    .map(|allocation| allocation.node_id.as_str())
+                    .collect();
+                assert_eq!(nodes.len(), 2);
+                assert_ne!(
+                    nodes[0], nodes[1],
+                    "both placements claimed port 18080 on one node"
+                );
+            }
+            PlanApplyOutcome::Rejected { reason, .. } => {
+                bail!("both placements had a free node available: {reason}")
             }
         }
         Ok(())

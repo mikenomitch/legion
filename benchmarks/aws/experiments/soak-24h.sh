@@ -112,5 +112,5 @@ for query in legion_eval_queue_depth legion_nodes legion_allocations; do
 done
 
 tar -C "$RESULTS_ROOT/$CAMPAIGN" -czf - "$RUN_ID" |
-    aws s3 cp --region "$REGION" - "s3://$BUCKET/campaigns/$CAMPAIGN/soak.tar.gz"
+    aws s3 cp --only-show-errors --region "$REGION" - "s3://$BUCKET/campaigns/$CAMPAIGN/soak.tar.gz"
 log "soak archived. Drift checks: store_bytes monotone growth, eval queue not returning to 0, RSS without plateau."

@@ -75,6 +75,15 @@ rsh "$LOADGEN_ADDR" "
     --nodes "$NODES" --scenario storm
 
 # The killed slice restarts (systemd) on the next fleet start; bring it
-# back now so later cells see a full fleet.
-rsh "$KILL_PUBLIC" "sudo systemctl start legion-sim 2>/dev/null || sudo systemctl start nomad-nodesim 2>/dev/null || true"
+# back now so later cells see a full fleet — and they now REQUIRE it,
+# because the fleet gate asserts an exact census rather than a lower
+# bound, so a slice left stopped fails the next cell outright.
+#
+# Addressed with worker_addr, not the public IP: on-rig (the unattended
+# path, which is how a campaign actually runs) traffic to another
+# instance's public IP hairpins out through the internet gateway and no
+# longer matches the security group's intra-rig rule, so this hop was
+# refused and the slice silently stayed down.
+rsh "$(worker_addr "$KILL_PUBLIC" "$KILL_PRIVATE")" \
+    "sudo systemctl start legion-sim 2>/dev/null || sudo systemctl start nomad-nodesim 2>/dev/null || true"
 log "storm complete: see $RESULTS_ROOT/$CAMPAIGN/$RUN_ID/metrics.json (recovery_secs)"
