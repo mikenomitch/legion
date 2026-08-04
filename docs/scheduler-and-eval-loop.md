@@ -19,19 +19,45 @@ At manager startup:
 
 Each worker loop:
 
-1. `claim_evals()` atomically marks a **batch** of `pending` evals as
-   `in_flight`.
-2. Executes `Eval::handle(store)` for each one, in claim order, one at a
-   time.
-3. `complete_evals_and_claim_next()` writes every outcome and claims the
+1. Ask the admission gate for a permit
+   ([adaptive-scheduler-concurrency.md](adaptive-scheduler-concurrency.md)).
+   With the controller `off`, and with today's default `observe`, this never
+   refuses.
+2. `claim_evals()` atomically marks a **batch** of `pending` evals as
+   `in_flight`. A worker the gate refused claims only eval kinds that cannot
+   conflict (today, `job_stop`).
+3. Executes `Eval::handle(store)` for each one, in claim order, one at a
+   time, holding the permit across the whole batch, conflict-retry backoffs
+   included.
+4. `complete_evals_and_claim_next()` writes every outcome and claims the
    next batch in one operation. Success deletes the eval row, failure sets
    status `failed`, and a transient rejection returns the row to `pending`
-   after a delay.
+   after a delay. The permit is released, and asked for again at the next
+   batch.
 
 When the queue is empty, workers block on either:
 
 - `Notify` wake-up (`enqueue_eval` of zero-delay work), or
-- timeout until next delayed eval `ready_at`.
+- timeout until next delayed eval `ready_at`, or
+- (when throttled) the admission gate releasing a permit.
+
+### `evalThreads` is a ceiling, not a target
+
+`evalThreads` fixes the size of the worker pool, and the pool is never resized
+at runtime. What *is* adaptive is how many of those workers may be inside a
+**planning** eval at once: the manager measures its own plan-apply conflict rate
+and moves that limit between a floor and `evalThreads`.
+
+The practical consequence is that setting `evalThreads` too high stops being
+expensive — the controller finds the level — while setting it too low still
+caps the cluster. Set it to your core count.
+
+This is `observe` by default: the controller publishes the limit it *would*
+enforce and actuates nothing until you set
+`schedulerSettings.adaptiveConcurrency.mode = "enforce"`. The full surface,
+including the states, metrics and the one queue-ordering deviation it
+introduces, is in
+[adaptive-scheduler-concurrency.md](adaptive-scheduler-concurrency.md).
 
 ### Batching
 

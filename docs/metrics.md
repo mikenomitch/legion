@@ -148,6 +148,42 @@ neighbor rules a cause in or out, and which knob to turn), see
 - **`legion_eval_conflict_requeues_total`** (counter): evals released back
   to the pending queue after exhausting their plan-conflict retry budget,
   instead of failing terminally (the requeue backstop).
+
+#### Adaptive scheduler concurrency
+
+All scheduler-lane-leader-only: a manager that does no planning reports zeros.
+See [adaptive-scheduler-concurrency.md](adaptive-scheduler-concurrency.md).
+
+- **`legion_scheduler_concurrency_limit`** (gauge): planners currently
+  admitted. In `observe` mode this is the *shadow* limit — what the
+  controller would enforce — which is what makes observe mode useful on its
+  own.
+- **`legion_scheduler_concurrency_in_flight`** (gauge): admission permits
+  held by workers inside a planning eval. 0 when the controller is `off`,
+  which never consults the gate.
+- **`legion_scheduler_concurrency_state{state}`** (gauge): 1 on the current
+  state, 0 on the others: `steady`, `throttled`, `probing`, `saturated`.
+  **`saturated` is the one to alert on**: it means backing off did not
+  improve goodput, so the conflicts are capacity-driven and the remedy is
+  nodes rather than patience.
+- **`legion_scheduler_concurrency_conflict_rate`** (gauge): the smoothed
+  rejection share the controller is deciding on. Fallbacks count as progress,
+  so this is not the same number as a raw ratio of `legion_plan_apply_total`
+  outcomes taken over a different window.
+- **`legion_scheduler_concurrency_fallback_rate`** (gauge): the smoothed
+  share of plans that bound at a lower-ranked candidate: races *absorbed*.
+  Reported for diagnosis; never fed into the decision.
+- **`legion_scheduler_concurrency_goodput`** (gauge): smoothed plans that
+  actually placed, per second. The objective every decrease is verified
+  against.
+- **`legion_scheduler_concurrency_adjustments_total{direction}`** (counter) —
+  `increase`, `decrease`, or `revert` (a decrease undone by the goodput
+  guard). A sustained two-value sawtooth is hunting — a bug, not a cosmetic
+  issue.
+- **`legion_scheduler_admission_skips_total`** (counter): times a throttled
+  worker claimed a non-planning eval (today `job_stop`) instead of the queue
+  head. This counts the one cross-class priority inversion the admission gate
+  introduces.
 - **`legion_preemptions_total{pool, band}`** (counter): allocations evicted
   by scheduler preemption, labeled by the victim's node pool and its
   priority band. Alert on the rate. Preemption of production-adjacent bands

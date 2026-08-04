@@ -14023,6 +14023,283 @@ export class GetManagerConfigsReply extends Message<GetManagerConfigsReply> {
 }
 
 /**
+ * Request payload for GetSchedulerConcurrency. No parameters: the controller
+ * is per-manager and global, so there is nothing to scope the question to.
+ *
+ * @generated from message legion.GetSchedulerConcurrencyRequest
+ */
+export class GetSchedulerConcurrencyRequest extends Message<GetSchedulerConcurrencyRequest> {
+  constructor(data?: PartialMessage<GetSchedulerConcurrencyRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetSchedulerConcurrencyRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetSchedulerConcurrencyRequest {
+    return new GetSchedulerConcurrencyRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetSchedulerConcurrencyRequest {
+    return new GetSchedulerConcurrencyRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetSchedulerConcurrencyRequest {
+    return new GetSchedulerConcurrencyRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetSchedulerConcurrencyRequest | PlainMessage<GetSchedulerConcurrencyRequest> | undefined, b: GetSchedulerConcurrencyRequest | PlainMessage<GetSchedulerConcurrencyRequest> | undefined): boolean {
+    return proto3.util.equals(GetSchedulerConcurrencyRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for GetSchedulerConcurrency — one manager's view of how much
+ * planning it is admitting, and why.
+ *
+ * The controller measures its own plan-apply conflict rate and tunes how many
+ * evals it will PLAN at once between `floor` and `ceiling` (AIMD: halve on
+ * congestion, add one back after calm). The arithmetic behind every field is
+ * published in docs/adaptive-scheduler-concurrency.md.
+ *
+ * @generated from message legion.GetSchedulerConcurrencyReply
+ */
+export class GetSchedulerConcurrencyReply extends Message<GetSchedulerConcurrencyReply> {
+  /**
+   * The controller's mode, as configured in
+   * `schedulerSettings.adaptiveConcurrency.mode`:
+   * - `enforce` — measure and actuate.
+   * - `observe` — measure and publish what it WOULD do, actuate nothing.
+   *   The default.
+   * - `off` — the controller does not run; `evalThreads` is the fixed planner
+   *   count, exactly as before this feature existed. Every numeric field below
+   *   is zero in this mode.
+   *
+   * @generated from field: string mode = 1;
+   */
+  mode = "";
+
+  /**
+   * Planners currently admitted. In `observe` mode this is the SHADOW limit —
+   * what the controller would be enforcing — which is what makes observe mode
+   * useful on its own.
+   *
+   * @generated from field: uint32 limit = 2;
+   */
+  limit = 0;
+
+  /**
+   * Lower bound on `limit` (`adaptiveConcurrency.min`, 1 by default). Never 0:
+   * a floor of 0 is a stuck scheduler, not a throttled one.
+   *
+   * @generated from field: uint32 floor = 3;
+   */
+  floor = 0;
+
+  /**
+   * Upper bound on `limit`. `adaptiveConcurrency.max` if set, otherwise
+   * `evalThreads`, and never above `evalThreads`.
+   *
+   * @generated from field: uint32 ceiling = 4;
+   */
+  ceiling = 0;
+
+  /**
+   * The manager's configured `evalThreads`: the size of the worker pool, and
+   * the ceiling the controller works under. The controller never admits more
+   * planners than this and, in `enforce`, backs off below it on evidence.
+   *
+   * @generated from field: uint32 eval_threads = 5;
+   */
+  evalThreads = 0;
+
+  /**
+   * Admission permits held right now — eval workers currently inside a
+   * planning eval. 0 when the controller is off, which never consults the gate.
+   *
+   * @generated from field: uint32 in_flight = 6;
+   */
+  inFlight = 0;
+
+  /**
+   * What the controller is doing:
+   * - `steady` — running at the ceiling; nothing is held back.
+   * - `throttled` — below the ceiling, and conflicts have not yet subsided.
+   * - `probing` — below the ceiling and accumulating calm ticks toward an
+   *   increase.
+   * - `saturated` — backing off did NOT improve goodput, so the conflicts are
+   *   capacity-driven rather than concurrency-driven. The remedy is nodes, not
+   *   patience, and the controller has stopped applying an actuator that
+   *   cannot help.
+   *
+   * @generated from field: string state = 7;
+   */
+  state = "";
+
+  /**
+   * How long the controller has been in `state`, in seconds.
+   *
+   * @generated from field: uint32 seconds_in_state = 8;
+   */
+  secondsInState = 0;
+
+  /**
+   * Smoothed plan rejection rate, 0.0 to 1.0:
+   * `rejected / (applied + fallback + rejected)`. Plans that bound but slid
+   * down a candidate list count as PROGRESS, not as conflict — that is the
+   * point of late binding, and throttling to avoid absorbed races would be
+   * throttling to avoid the feature working.
+   *
+   * @generated from field: double conflict_rate = 9;
+   */
+  conflictRate = 0;
+
+  /**
+   * Smoothed fraction of plans that bound at a lower-ranked candidate: races
+   * ABSORBED by late binding. Reported for diagnosis and never fed into the
+   * controller's decision.
+   *
+   * @generated from field: double fallback_rate = 10;
+   */
+  fallbackRate = 0;
+
+  /**
+   * Smoothed plans that actually placed, per second. This — not the conflict
+   * rate — is the objective; the conflict rate is only its fast leading
+   * indicator, and every decrease is verified against this before it is kept.
+   *
+   * @generated from field: double goodput = 11;
+   */
+  goodput = 0;
+
+  /**
+   * Raw plan outcomes in the most recent 500ms window, so the percentages
+   * above can be checked by hand.
+   *
+   * @generated from field: uint32 window_applied = 12;
+   */
+  windowApplied = 0;
+
+  /**
+   * @generated from field: uint32 window_fallback = 13;
+   */
+  windowFallback = 0;
+
+  /**
+   * @generated from field: uint32 window_rejected = 14;
+   */
+  windowRejected = 0;
+
+  /**
+   * The last limit change: `increase`, `decrease`, or `revert` (a decrease
+   * undone because it did not improve goodput). Empty if the controller has
+   * not moved the limit yet.
+   *
+   * @generated from field: string last_adjustment_direction = 15;
+   */
+  lastAdjustmentDirection = "";
+
+  /**
+   * The limit before and after that change.
+   *
+   * @generated from field: uint32 last_adjustment_from = 16;
+   */
+  lastAdjustmentFrom = 0;
+
+  /**
+   * @generated from field: uint32 last_adjustment_to = 17;
+   */
+  lastAdjustmentTo = 0;
+
+  /**
+   * How long ago it happened, in seconds.
+   *
+   * @generated from field: uint32 last_adjustment_seconds_ago = 18;
+   */
+  lastAdjustmentSecondsAgo = 0;
+
+  /**
+   * Relative change in goodput since that adjustment, as a fraction (0.18 =
+   * +18%). This is what says whether backing off actually bought anything.
+   *
+   * @generated from field: double last_adjustment_goodput_delta = 19;
+   */
+  lastAdjustmentGoodputDelta = 0;
+
+  /**
+   * Times a throttled worker claimed a non-planning eval (today: `job_stop`)
+   * instead of the queue head. This counts the one deviation from strict
+   * priority order the admission gate introduces: it is a cross-class
+   * inversion only, never within a class, and it exists so an operator's
+   * `job stop` during an incident does not queue behind the storm it is
+   * trying to end.
+   *
+   * @generated from field: uint64 admission_skips = 20;
+   */
+  admissionSkips = protoInt64.zero;
+
+  /**
+   * Whether the manager that answered leads the scheduler lane, and therefore
+   * does the planning (always true outside raft mode and in `single`
+   * topology). When false, every number above is zero: a manager that does no
+   * planning reports nothing rather than guessing.
+   *
+   * @generated from field: bool is_scheduler_lane_leader = 21;
+   */
+  isSchedulerLaneLeader = false;
+
+  constructor(data?: PartialMessage<GetSchedulerConcurrencyReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetSchedulerConcurrencyReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "mode", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "limit", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 3, name: "floor", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 4, name: "ceiling", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 5, name: "eval_threads", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 6, name: "in_flight", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 7, name: "state", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 8, name: "seconds_in_state", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 9, name: "conflict_rate", kind: "scalar", T: 1 /* ScalarType.DOUBLE */ },
+    { no: 10, name: "fallback_rate", kind: "scalar", T: 1 /* ScalarType.DOUBLE */ },
+    { no: 11, name: "goodput", kind: "scalar", T: 1 /* ScalarType.DOUBLE */ },
+    { no: 12, name: "window_applied", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 13, name: "window_fallback", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 14, name: "window_rejected", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 15, name: "last_adjustment_direction", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 16, name: "last_adjustment_from", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 17, name: "last_adjustment_to", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 18, name: "last_adjustment_seconds_ago", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 19, name: "last_adjustment_goodput_delta", kind: "scalar", T: 1 /* ScalarType.DOUBLE */ },
+    { no: 20, name: "admission_skips", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 21, name: "is_scheduler_lane_leader", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetSchedulerConcurrencyReply {
+    return new GetSchedulerConcurrencyReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetSchedulerConcurrencyReply {
+    return new GetSchedulerConcurrencyReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetSchedulerConcurrencyReply {
+    return new GetSchedulerConcurrencyReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetSchedulerConcurrencyReply | PlainMessage<GetSchedulerConcurrencyReply> | undefined, b: GetSchedulerConcurrencyReply | PlainMessage<GetSchedulerConcurrencyReply> | undefined): boolean {
+    return proto3.util.equals(GetSchedulerConcurrencyReply, a, b);
+  }
+}
+
+/**
  * Request payload for GetObservability.
  *
  * @generated from message legion.GetObservabilityRequest

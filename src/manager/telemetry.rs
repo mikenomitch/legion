@@ -748,6 +748,22 @@ pub struct Metrics {
     pub scheduler_plan_bind_pass: Arc<CounterVec>,
     /// `legion_eval_conflict_requeues_total`
     pub eval_conflict_requeues_total: Arc<Counter>,
+    /// `legion_scheduler_concurrency_limit`
+    pub scheduler_concurrency_limit: Arc<Gauge>,
+    /// `legion_scheduler_concurrency_in_flight`
+    pub scheduler_concurrency_in_flight: Arc<Gauge>,
+    /// `legion_scheduler_concurrency_state{state}`
+    pub scheduler_concurrency_state: Arc<GaugeVec>,
+    /// `legion_scheduler_concurrency_conflict_rate`
+    pub scheduler_concurrency_conflict_rate: Arc<FloatGauge>,
+    /// `legion_scheduler_concurrency_fallback_rate`
+    pub scheduler_concurrency_fallback_rate: Arc<FloatGauge>,
+    /// `legion_scheduler_concurrency_goodput`
+    pub scheduler_concurrency_goodput: Arc<FloatGauge>,
+    /// `legion_scheduler_concurrency_adjustments_total{direction}`
+    pub scheduler_concurrency_adjustments_total: Arc<CounterVec>,
+    /// `legion_scheduler_admission_skips_total`
+    pub scheduler_admission_skips_total: Arc<Counter>,
     /// `legion_preemptions_total{pool,band}` — victims actually evicted.
     pub preemptions_total: Arc<CounterVec>,
     /// `legion_preemption_plans_total{outcome}` — preemption passes that
@@ -1002,6 +1018,74 @@ impl Metrics {
             meta: FamilyMeta {
                 name: "legion_eval_conflict_requeues_total",
                 help: "Evals released back to the pending queue after exhausting plan-conflict retries, instead of failing terminally.",
+                labels: &[],
+            },
+            cell: CounterCell::default(),
+        });
+        // Adaptive scheduler concurrency
+        // (docs/adaptive-scheduler-concurrency.md). All of these are
+        // scheduler-lane-leader-only: a follower does no planning, so its
+        // window is empty and its state would be noise.
+        let scheduler_concurrency_limit = Arc::new(Gauge {
+            meta: FamilyMeta {
+                name: "legion_scheduler_concurrency_limit",
+                help: "Planners the adaptive concurrency controller currently admits. In `observe` mode this is the SHADOW limit — what the controller would enforce — which is what makes observe mode useful on its own.",
+                labels: &[],
+            },
+            cell: GaugeCell::default(),
+        });
+        let scheduler_concurrency_in_flight = Arc::new(Gauge {
+            meta: FamilyMeta {
+                name: "legion_scheduler_concurrency_in_flight",
+                help: "Admission permits currently held by eval workers running a planning eval. 0 when the controller is off, which does not consult the gate at all.",
+                labels: &[],
+            },
+            cell: GaugeCell::default(),
+        });
+        let scheduler_concurrency_state = Arc::new(GaugeVec {
+            meta: FamilyMeta {
+                name: "legion_scheduler_concurrency_state",
+                help: "1 on the controller's current state, 0 on the others: `steady` (running at the ceiling), `throttled` (backed off), `probing` (calm, climbing back), `saturated` (backing off did not improve goodput, so the conflicts are capacity-driven and the actuator has stopped being applied).",
+                labels: &["state"],
+            },
+            series: Series::new(),
+        });
+        let scheduler_concurrency_conflict_rate = Arc::new(FloatGauge {
+            meta: FamilyMeta {
+                name: "legion_scheduler_concurrency_conflict_rate",
+                help: "Smoothed plan rejection rate the controller is deciding on: rejected / (applied + fallback + rejected). Fallbacks count as progress, not as conflict.",
+                labels: &[],
+            },
+            bits: AtomicU64::new(0),
+        });
+        let scheduler_concurrency_fallback_rate = Arc::new(FloatGauge {
+            meta: FamilyMeta {
+                name: "legion_scheduler_concurrency_fallback_rate",
+                help: "Smoothed fraction of plans that bound but slid down a candidate list — races ABSORBED by late binding. Reported for diagnosis; never fed into the controller's decision.",
+                labels: &[],
+            },
+            bits: AtomicU64::new(0),
+        });
+        let scheduler_concurrency_goodput = Arc::new(FloatGauge {
+            meta: FamilyMeta {
+                name: "legion_scheduler_concurrency_goodput",
+                help: "Smoothed plans that actually placed, per second. The objective the controller is guarding; conflict rate is only its leading indicator.",
+                labels: &[],
+            },
+            bits: AtomicU64::new(0),
+        });
+        let scheduler_concurrency_adjustments_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_scheduler_concurrency_adjustments_total",
+                help: "Limit changes the controller made, by direction: `increase`, `decrease`, or `revert` (a decrease undone because it did not improve goodput). A sustained two-value sawtooth here is hunting, which is a failure and not a cosmetic issue.",
+                labels: &["direction"],
+            },
+            series: Series::new(),
+        });
+        let scheduler_admission_skips_total = Arc::new(Counter {
+            meta: FamilyMeta {
+                name: "legion_scheduler_admission_skips_total",
+                help: "Times a throttled eval worker claimed a non-planning eval (today: `job_stop`) instead of the queue head. This counts the one cross-class priority inversion the admission gate introduces.",
                 labels: &[],
             },
             cell: CounterCell::default(),
@@ -1660,6 +1744,14 @@ impl Metrics {
             Arc::clone(&eval_claim_total) as Arc<dyn RenderMetric>,
             Arc::clone(&eval_handle_seconds) as Arc<dyn RenderMetric>,
             Arc::clone(&dispatch_send_seconds) as Arc<dyn RenderMetric>,
+            Arc::clone(&scheduler_concurrency_limit) as Arc<dyn RenderMetric>,
+            Arc::clone(&scheduler_concurrency_in_flight) as Arc<dyn RenderMetric>,
+            Arc::clone(&scheduler_concurrency_state) as Arc<dyn RenderMetric>,
+            Arc::clone(&scheduler_concurrency_conflict_rate) as Arc<dyn RenderMetric>,
+            Arc::clone(&scheduler_concurrency_fallback_rate) as Arc<dyn RenderMetric>,
+            Arc::clone(&scheduler_concurrency_goodput) as Arc<dyn RenderMetric>,
+            Arc::clone(&scheduler_concurrency_adjustments_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&scheduler_admission_skips_total) as Arc<dyn RenderMetric>,
             Arc::clone(&preemption_plans_total) as Arc<dyn RenderMetric>,
             Arc::clone(&preemptions_total) as Arc<dyn RenderMetric>,
             Arc::clone(&raft_applied_index) as Arc<dyn RenderMetric>,
@@ -1716,6 +1808,14 @@ impl Metrics {
             scheduler_plan_bind_pass,
             scheduler_plan_candidate_rank,
             eval_conflict_requeues_total,
+            scheduler_concurrency_limit,
+            scheduler_concurrency_in_flight,
+            scheduler_concurrency_state,
+            scheduler_concurrency_conflict_rate,
+            scheduler_concurrency_fallback_rate,
+            scheduler_concurrency_goodput,
+            scheduler_concurrency_adjustments_total,
+            scheduler_admission_skips_total,
             preemptions_total,
             preemption_plans_total,
             heartbeats_total,

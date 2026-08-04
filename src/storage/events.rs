@@ -184,6 +184,65 @@ pub mod drafts {
         .meta(json!({ "requeued": requeued_evals }))
     }
 
+    /// `scheduler.concurrency_adjusted` — the adaptive concurrency controller
+    /// moved the number of planners it admits
+    /// (docs/adaptive-scheduler-concurrency.md).
+    ///
+    /// Emitted on the CHANGE, never per tick: a control loop that narrates
+    /// every 500ms tick is noise an operator learns to ignore.
+    pub fn scheduler_concurrency_adjusted(
+        direction: &str,
+        from: usize,
+        to: usize,
+        ceiling: usize,
+        conflict_rate: f64,
+        mode: &str,
+    ) -> EventDraft {
+        let shadow = if mode == "enforce" { "" } else { " (shadow)" };
+        EventDraft::info(
+            "scheduler.concurrency_adjusted",
+            format!(
+                "Admitted planners {from} -> {to} of {ceiling}{shadow}: conflict rate \
+                 {percent:.1}%",
+                percent = conflict_rate * 100.0,
+            ),
+        )
+        .meta(json!({
+            "direction": direction,
+            "from": from,
+            "to": to,
+            "ceiling": ceiling,
+            "conflictRate": conflict_rate,
+            "mode": mode,
+        }))
+    }
+
+    /// `scheduler.concurrency_saturated` — backing off did not improve
+    /// goodput, so the conflicts are capacity-driven rather than
+    /// concurrency-driven. The distinction matters because "add nodes" and
+    /// "wait" are very different responses, and no other signal separates
+    /// them.
+    pub fn scheduler_concurrency_saturated(
+        restored_to: usize,
+        goodput_before: f64,
+        goodput_after: f64,
+    ) -> EventDraft {
+        EventDraft::warn(
+            "scheduler.concurrency_saturated",
+            format!(
+                "Reducing scheduler concurrency did not improve goodput \
+                 ({goodput_before:.0} -> {goodput_after:.0} placements/sec); conflicts are \
+                 capacity-driven, not concurrency-driven. Restored the limit to \
+                 {restored_to} — add nodes rather than waiting"
+            ),
+        )
+        .meta(json!({
+            "restoredTo": restored_to,
+            "goodputBefore": goodput_before,
+            "goodputAfter": goodput_after,
+        }))
+    }
+
     /// `eval.enqueued` — an eval was added to the queue.
     pub fn eval_enqueued(eval: &Eval, delay: Duration) -> EventDraft {
         EventDraft::info(
@@ -1924,6 +1983,38 @@ impl EventRecorder<'_> {
 
     pub fn scheduler_recovered(self, requeued_evals: u64) {
         self.emit(drafts::scheduler_recovered(requeued_evals));
+    }
+
+    pub fn scheduler_concurrency_adjusted(
+        self,
+        direction: &str,
+        from: usize,
+        to: usize,
+        ceiling: usize,
+        conflict_rate: f64,
+        mode: &str,
+    ) {
+        self.emit(drafts::scheduler_concurrency_adjusted(
+            direction,
+            from,
+            to,
+            ceiling,
+            conflict_rate,
+            mode,
+        ));
+    }
+
+    pub fn scheduler_concurrency_saturated(
+        self,
+        restored_to: usize,
+        goodput_before: f64,
+        goodput_after: f64,
+    ) {
+        self.emit(drafts::scheduler_concurrency_saturated(
+            restored_to,
+            goodput_before,
+            goodput_after,
+        ));
     }
 
     pub fn allocations_removed_from_node(

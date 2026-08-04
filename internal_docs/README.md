@@ -87,7 +87,7 @@ When one is required and what goes in it:
 
 | Plan | Status |
 | --- | --- |
-| [adaptive-scheduler-concurrency-plan.md](plans/adaptive-scheduler-concurrency-plan.md) | planned (Phase 0 is a gate; sequenced behind late-binding Phase 4 striping) |
+| [adaptive-scheduler-concurrency-plan.md](plans/adaptive-scheduler-concurrency-plan.md) | in execution (phases 1–3 shipped 2026-08-04, default `observe`); its motivating "4 beats 16" measurement was retracted the next day ([aws-phase4-findings.md](aws-phase4-findings.md)), so phase 0 now has to find a conflict-bound cell before phase 4's default flip can be argued |
 | [artifact-system-plan.md](plans/artifact-system-plan.md) | shipped |
 | [artifact-cache-and-prewarm-plan.md](plans/artifact-cache-and-prewarm-plan.md) | in execution (Phase 1 partly shipped as the node content store, Phase 3 partly as suspend plan Phase 7a) |
 | [autoscaler-plan.md](plans/autoscaler-plan.md) | planned |

@@ -11,6 +11,8 @@ It is available from the CLI, the MCP server, the UI, and raw gRPC.
 | --- | --- | --- |
 | `scheduler.started` | info | Eval loop started (manager startup). |
 | `scheduler.recovered` | warn | Stale in-flight evals were requeued at startup. |
+| `scheduler.concurrency_adjusted` | info | The adaptive concurrency controller moved the number of planners it admits. Emitted on the change, never per tick (docs/adaptive-scheduler-concurrency.md). |
+| `scheduler.concurrency_saturated` | warn | Backing off did not improve goodput, so the cluster's plan conflicts are capacity-driven rather than concurrency-driven. Add nodes; waiting will not help. |
 | `eval.enqueued` | info | An eval was added to the queue. |
 | `eval.completed` | info | An eval handler finished successfully. |
 | `eval.failed` | error | An eval handler returned an error. |

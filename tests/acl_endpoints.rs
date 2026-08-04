@@ -119,6 +119,7 @@ fn endpoint_table() -> Vec<(&'static str, Plane)> {
         ("UpdateNodeDynamic", Plane::Protected("node:write")),
         ("GetManagerConfigs", Plane::Protected("operator:read")),
         ("GetObservability", Plane::Protected("operator:read")),
+        ("GetSchedulerConcurrency", Plane::Protected("operator:read")),
         ("GetRaftStatus", Plane::Protected("operator:read")),
         ("ListRaftHistory", Plane::Protected("operator:read")),
         ("IssueRaftCommand", Plane::Protected("operator:write")),
@@ -641,6 +642,10 @@ async fn call_endpoint(
                 },
                 token,
             ))
+            .await
+            .map(|_| ()),
+        "GetSchedulerConcurrency" => svc
+            .get_scheduler_concurrency(req(GetSchedulerConcurrencyRequest {}, token))
             .await
             .map(|_| ()),
         "GetNode" => svc

@@ -1,11 +1,12 @@
 use crate::prelude::*;
 
+use crate::manager::concurrency::{is_planning_kind, PlannerPermit};
 use crate::manager::oidc_http::OidcHttpLayer;
 use crate::manager::server::ManagerDaemonService;
 use crate::manager::workload_identity::WorkloadIdentityState;
 use crate::storage::events::drafts;
 use crate::storage::persistence::PersistenceRole;
-use crate::storage::store::{EvalBatchLimits, EvalCompletion, Store};
+use crate::storage::store::{ClaimScope, EvalBatchLimits, EvalCompletion, Store};
 use crate::structs::{
     manager_server::ManagerServer, Eval, JobConfig, KvValueType, ManagerConfig, NodeMsg,
     Submission, TaskConfig, TlsConfigFull, WorkerConfig as WorkerConfigMsg, WorkerConfigAlt,
@@ -29,6 +30,11 @@ use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 const IDLE_POLL_INTERVAL: Duration = Duration::from_secs(30);
 // Safety cap for empty queues so idle workers can still periodically re-check state.
 const IDLE_WAIT_CAP: Duration = Duration::from_secs(300);
+// How long a throttled eval worker with no non-planning work parks before
+// re-checking the admission gate. Short, because the thing it is waiting for
+// is a permit rather than a timer, and `Notify::notify_waiters` stores no
+// permit for a release that lands between the claim attempt and the wait.
+const THROTTLED_GATE_POLL: Duration = Duration::from_millis(100);
 // Exponential backoff is reserved for true error paths (claim failures).
 const ERROR_BACKOFF_MIN: Duration = Duration::from_secs(1);
 const ERROR_BACKOFF_MAX: Duration = Duration::from_secs(30);
@@ -129,6 +135,15 @@ pub async fn run_manager_with(
         full_config.heartbeat.parsed_min_interval()
             * full_config.heartbeat.missed_beats_before_lost.max(1),
     )?;
+    // Adaptive scheduler concurrency, validated HERE rather than inside its
+    // own loop: that loop's error is swallowed by the `join!` below, so a
+    // mistyped `mode = "enforc"` would silently leave the controller off
+    // while the operator believed they had turned it on
+    // (docs/adaptive-scheduler-concurrency.md).
+    let adaptive_concurrency =
+        crate::manager::concurrency::AdaptiveConcurrencySettings::from_scheduler_settings(
+            full_config.scheduler_settings.as_ref(),
+        )?;
     let manager_node_id = format!("{}:{}", full_config.server.host, full_config.server.port);
     let store = Store::start_storage(&full_config)?;
     // A restore is an explicit operator action with the operator present:
@@ -234,6 +249,7 @@ pub async fn run_manager_with(
     let store_for_keyring = store.clone();
 
     let store_for_shutdown = store.clone();
+    let store_copy_c = store.clone();
 
     // Workload identity (OIDC issuer): only constructed when enabled. The
     // signing keys are restored from (or first-boot persisted to) the store,
@@ -561,6 +577,8 @@ pub async fn run_manager_with(
             }),
         },
     );
+    let concurrency_fut =
+        start_concurrency_controller(store_copy_c, full_config.eval_threads, adaptive_concurrency);
     let eval_loop_fut = start_eval_loop(store_copy_b, full_config.eval_threads);
     let manager_host = resolve_manager_host(&full_config.server.host);
     let manager_addr = format!("http://{}:{}", manager_host, full_config.server.port);
@@ -587,9 +605,10 @@ pub async fn run_manager_with(
     // The background loops run as one task the daemon can abort: without an
     // API and raft transport they must not keep acting on the cluster.
     let background = tokio::spawn(async move {
-        let (checker, evals, worker, rotation, keyring) = join!(
+        let (checker, evals, concurrency, worker, rotation, keyring) = join!(
             node_checker_fut,
             eval_loop_fut,
+            concurrency_fut,
             worker_fut,
             rotation_fut,
             keyring_fut
@@ -597,6 +616,7 @@ pub async fn run_manager_with(
         for (name, result) in [
             ("node status checker", checker),
             ("eval loop", evals),
+            ("adaptive scheduler concurrency", concurrency),
             ("in-process worker", worker),
             ("workload identity rotation", rotation),
             ("keyring maintenance", keyring),
@@ -2003,6 +2023,202 @@ fn write_lost_windows(store: &Store, updates: Vec<(String, i64)>, widening: bool
     }
 }
 
+/// The adaptive scheduler-concurrency control loop
+/// (docs/adaptive-scheduler-concurrency.md).
+///
+/// Copies the heartbeat-cadence shape exactly: the decision is a pure function
+/// ([`crate::manager::concurrency::advance`]) and this loop only collects the
+/// snapshot and applies the verdict.
+///
+/// **Scheduler-lane-leader-only**, for the same reason the eval workers are: a
+/// follower does no planning, so its window is empty and its state would be
+/// noise. State resets on leadership acquisition — a new leader starts at the
+/// startup limit and re-derives within ~2s, which is cheaper than replicating
+/// controller state at one op per tick.
+#[instrument(err, skip_all)]
+async fn start_concurrency_controller(
+    store: Store,
+    eval_threads: usize,
+    settings: crate::manager::concurrency::AdaptiveConcurrencySettings,
+) -> R<()> {
+    use crate::manager::concurrency::{
+        self, AdjustmentDirection, ConcurrencyMode, ConcurrencyReport, ConcurrencyState, TickInput,
+    };
+
+    // Published before the first tick so eval workers take the right path from
+    // their very first claim.
+    concurrency::gate().set_mode(settings.mode);
+    if settings.mode == ConcurrencyMode::Off {
+        info!(
+            eval_threads,
+            "Adaptive scheduler concurrency is off; evalThreads is the fixed planner count"
+        );
+        return Ok(());
+    }
+
+    let (floor, ceiling) = settings.bounds(eval_threads);
+    let gate = concurrency::gate();
+    let mut state = ConcurrencyState::new(ceiling);
+    gate.set_limit(state.limit);
+    info!(
+        mode = settings.mode.as_str(),
+        floor,
+        ceiling,
+        eval_threads,
+        starting_limit = state.limit,
+        "Adaptive scheduler concurrency started"
+    );
+
+    let mut ticker = tokio::time::interval(concurrency::TICK_PERIOD);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut last_tick = std::time::Instant::now();
+    let mut was_leader = false;
+    loop {
+        ticker.tick().await;
+        let now = std::time::Instant::now();
+        let elapsed = now.saturating_duration_since(last_tick);
+        last_tick = now;
+
+        if !store.is_raft_leader(crate::storage::Lane::Scheduler) {
+            if was_leader {
+                info!("Scheduler-lane leadership lost; concurrency controller idling");
+                concurrency::clear_report();
+                was_leader = false;
+            }
+            // Discard whatever landed in the window: it describes a stint that
+            // is over, and carrying it into the next one would decide on it.
+            concurrency::conflict_window().drain();
+            continue;
+        }
+        if !was_leader {
+            info!("Scheduler-lane leadership acquired; concurrency controller resuming");
+            state = ConcurrencyState::new(ceiling);
+            gate.set_limit(state.limit);
+            concurrency::conflict_window().drain();
+            was_leader = true;
+            continue;
+        }
+
+        let counts = concurrency::conflict_window().drain();
+        let input = TickInput {
+            applied: counts.applied,
+            fallback: counts.fallback,
+            rejected: counts.rejected,
+            elapsed,
+            floor,
+            ceiling,
+            tuning: settings.tuning(),
+        };
+        let next = concurrency::advance(&state, &input);
+
+        // `enforce` publishes the limit into the gate; `observe` computes the
+        // identical value and publishes it as a shadow, which is what makes
+        // observe mode useful on its own.
+        if settings.mode == ConcurrencyMode::Enforce && next.limit != state.limit {
+            gate.set_limit(next.limit);
+        }
+
+        let just_adjusted = next
+            .last_adjustment
+            .filter(|adjustment| adjustment.ticks_ago == 0);
+        if let Some(adjustment) = just_adjusted {
+            // At `info` only on change; the per-tick line below is `debug`.
+            info!(
+                direction = adjustment.direction.as_str(),
+                from = adjustment.from,
+                to = adjustment.to,
+                ceiling,
+                mode = settings.mode.as_str(),
+                conflict_rate = adjustment.conflict_rate,
+                goodput = next.ewma_goodput.unwrap_or(0.0),
+                "Adjusted admitted planners"
+            );
+            crate::manager::telemetry::metrics()
+                .scheduler_concurrency_adjustments_total
+                .inc(&[adjustment.direction.as_str()]);
+            store.events().scheduler_concurrency_adjusted(
+                adjustment.direction.as_str(),
+                adjustment.from,
+                adjustment.to,
+                ceiling,
+                adjustment.conflict_rate,
+                settings.mode.as_str(),
+            );
+            if adjustment.direction == AdjustmentDirection::Revert {
+                warn!(
+                    restored_to = adjustment.to,
+                    goodput_before = adjustment.goodput_before,
+                    goodput_after = next.ewma_goodput.unwrap_or(0.0),
+                    "Reducing scheduler concurrency did not improve goodput; conflicts are \
+                     capacity-driven, not concurrency-driven — add nodes"
+                );
+                store.events().scheduler_concurrency_saturated(
+                    adjustment.to,
+                    adjustment.goodput_before,
+                    next.ewma_goodput.unwrap_or(0.0),
+                );
+            }
+        } else {
+            debug!(
+                limit = next.limit,
+                state = next.state.as_str(),
+                conflict_rate = next.ewma_conflict.unwrap_or(0.0),
+                applied = counts.applied,
+                fallback = counts.fallback,
+                rejected = counts.rejected,
+                "Scheduler concurrency tick"
+            );
+        }
+
+        publish_concurrency_metrics(&next);
+        concurrency::publish_report(ConcurrencyReport {
+            mode: settings.mode,
+            limit: next.limit,
+            floor,
+            ceiling,
+            eval_threads,
+            in_flight: gate.in_flight(),
+            state: next.state,
+            seconds_in_state: next.seconds_in_state(),
+            conflict_rate: next.ewma_conflict,
+            fallback_rate: next.ewma_fallback,
+            goodput: next.ewma_goodput,
+            window: counts,
+            last_adjustment: next.last_adjustment,
+            admission_skips: concurrency::admission_skips(),
+        });
+        state = next;
+    }
+}
+
+fn publish_concurrency_metrics(state: &crate::manager::concurrency::ConcurrencyState) {
+    use crate::manager::concurrency::{self, ControllerState};
+    let metrics = crate::manager::telemetry::metrics();
+    metrics.scheduler_concurrency_limit.set(state.limit as i64);
+    metrics
+        .scheduler_concurrency_in_flight
+        .set(concurrency::gate().in_flight() as i64);
+    for candidate in [
+        ControllerState::Steady,
+        ControllerState::Throttled,
+        ControllerState::Probing,
+        ControllerState::Saturated,
+    ] {
+        metrics
+            .scheduler_concurrency_state
+            .set(&[candidate.as_str()], i64::from(candidate == state.state));
+    }
+    metrics
+        .scheduler_concurrency_conflict_rate
+        .set(state.ewma_conflict.unwrap_or(0.0));
+    metrics
+        .scheduler_concurrency_fallback_rate
+        .set(state.ewma_fallback.unwrap_or(0.0));
+    metrics
+        .scheduler_concurrency_goodput
+        .set(state.ewma_goodput.unwrap_or(0.0));
+}
+
 #[instrument(err, skip_all)]
 async fn start_eval_loop(store: Store, max_threads: usize) -> R<()> {
     let max_threads = max_threads.max(1);
@@ -2314,14 +2530,37 @@ async fn eval_worker_loop(
             info!(worker_id, "Raft leadership acquired; eval worker resuming");
             was_leader = true;
         }
+        // Admission control for PLANNING (docs/adaptive-scheduler-concurrency.md).
+        //
+        // A permit is held PER WORKER, PER BATCH. A worker takes its batch
+        // through the handlers one eval at a time, so one permit per worker
+        // is exactly one concurrent planner: the limit counts workers inside
+        // planning work, not evals. The permit spans the whole batch,
+        // including every `plan_with_conflict_retries` backoff sleep — a
+        // retrying planner still counts against the budget, because its next
+        // attempt is precisely the arrival the controller is spacing out.
+        //
+        // The gate is asked at every batch boundary, so a lowered limit lands
+        // on the next batch with no thread churn: the worker pool is never
+        // resized, only how many of its members may plan at once.
         let claim_started = std::time::Instant::now();
-        // A batch carried over by the previous `complete_evals_and_claim_next`
-        // was already paid for by that round, so only a claim that actually
-        // hit the store is metered below.
         let carried_ahead = !claimed_ahead.is_empty();
-        let batch = if carried_ahead {
-            std::mem::take(&mut claimed_ahead)
+        let (batch, mut permit, throttled) = if carried_ahead {
+            // Already ours, claimed by the previous round's fused
+            // settle-and-claim (and already metered by that round). If any of
+            // it plans, WAIT for a permit rather than run over the limit: the
+            // rows are `in_flight` to us either way, and parking here holds
+            // them exactly as the queue would have.
+            let batch = std::mem::take(&mut claimed_ahead);
+            let permit = if batch.iter().any(|eval| is_planning_kind(&eval.kind)) {
+                wait_for_permit(worker_id).await
+            } else {
+                None
+            };
+            (batch, permit, false)
         } else {
+            let admission = crate::manager::concurrency::gate().admit();
+            let throttled = admission.is_throttled();
             // On the blocking pool, like the handler below: a claim is a
             // scheduler-lane quorum round, and running it inline here
             // parked a tokio runtime worker for the whole round trip.
@@ -2329,16 +2568,17 @@ async fn eval_worker_loop(
             // matter how high `evalThreads` goes, so at high thread counts
             // the claims themselves were what serialized the loop.
             let store_for_claim = store.clone();
-            let claimed =
-                tokio::task::spawn_blocking(move || store_for_claim.claim_evals(batch_limits))
-                    .await
-                    .unwrap_or_else(|join_error| {
-                        Err(anyhow::anyhow!("eval claim task failed: {join_error:?}"))
-                    });
+            let claimed = tokio::task::spawn_blocking(move || {
+                claim_eval_batch(&store_for_claim, throttled, batch_limits)
+            })
+            .await
+            .unwrap_or_else(|join_error| {
+                Err(anyhow::anyhow!("eval claim task failed: {join_error:?}"))
+            });
             crate::manager::telemetry::metrics()
                 .eval_queue_round_seconds
                 .observe(&["claim"], claim_started.elapsed().as_secs_f64());
-            match claimed {
+            let batch = match claimed {
                 Ok(batch) => batch,
                 Err(e) => {
                     error!(
@@ -2351,33 +2591,43 @@ async fn eval_worker_loop(
                     error_backoff = std::cmp::min(error_backoff * 2, ERROR_BACKOFF_MAX);
                     continue;
                 }
-            }
-        };
-        // An empty claim yields an empty changeset, which skips the raft
-        // entry — but it still pays the capture (a savepoint on the write
-        // connection) and the wake that produced it, so the empty share is
-        // the cost of waking a worker for nothing — the thundering-herd
-        // signal this counter exists for.
-        // Batching does not change what a tick means here: it is still one
-        // round, so `claimed` counts rounds that found work rather than
-        // evals. That is deliberate — dividing `evals_processed_total` by
-        // this counter is exactly the evals-per-round ratio batching is
-        // meant to raise, and there is no other way to see it.
-        if !carried_ahead {
+            };
+            // An empty claim yields an empty changeset, which skips the raft
+            // entry — but it still pays the capture (a savepoint on the write
+            // connection) and the wake that produced it, so the empty share is
+            // the cost of waking a worker for nothing — the thundering-herd
+            // signal this counter exists for.
+            // Batching does not change what a tick means here: it is still one
+            // round, so `claimed` counts rounds that found work rather than
+            // evals. That is deliberate — dividing `evals_processed_total` by
+            // this counter is exactly the evals-per-round ratio batching is
+            // meant to raise, and there is no other way to see it.
             crate::manager::telemetry::metrics()
                 .eval_claim_total
                 .inc(&[if batch.is_empty() { "empty" } else { "claimed" }]);
-        }
+            (batch, admission.into_permit(), throttled)
+        };
 
         if batch.is_empty() {
+            // Nothing to hold the budget for.
+            drop(permit);
             debug!(
                 worker_id,
+                throttled,
                 claim_eval_ms = claim_started.elapsed().as_millis() as u64,
                 "No eval claimed; worker entering wait path"
             );
-            // Queue is empty (or only delayed work exists), so park until notified or due.
-            wait_for_next_eval(&store, &notifier, worker_id).await;
+            // Queue is empty (or only delayed work exists), so park until
+            // notified or due — plus, when throttled, until a permit frees up,
+            // so a worker holding no work reacts to the gate opening as fast as
+            // it reacts to new work arriving.
+            wait_for_next_eval(&store, &notifier, worker_id, throttled).await;
             continue;
+        }
+        // A batch of nothing but stops needs no slot: hand it back before the
+        // handlers run so a planner can have it.
+        if !batch.iter().any(|eval| is_planning_kind(&eval.kind)) {
+            permit = None;
         }
 
         error_backoff = ERROR_BACKOFF_MIN;
@@ -2465,7 +2715,9 @@ async fn eval_worker_loop(
 
         // One scheduler-lane round settles the whole batch and claims the
         // next one, instead of two rounds per eval. On the blocking pool
-        // for the same reason as the claim above.
+        // for the same reason as the claim above. A worker the gate refused
+        // claims narrowly again here — the same kinds it was allowed this
+        // round — and re-asks the gate at the top of the next.
         //
         // The terminal write is RETRIED (bounded) before the completions
         // are dropped: a transient write error on a leader that never
@@ -2476,6 +2728,7 @@ async fn eval_worker_loop(
         // worker's time; giving up still leaves the batch recoverable by
         // the existing paths, and a leadership loss fails fast on its
         // first attempt (the retries hit the same typed rejection).
+        let scope = claim_scope(throttled);
         let settled = completions.len();
         let mut settle_attempts = 0;
         loop {
@@ -2483,8 +2736,11 @@ async fn eval_worker_loop(
             let completions_for_attempt = completions.clone();
             let settle_started = std::time::Instant::now();
             let outcome = tokio::task::spawn_blocking(move || {
-                store_for_settle
-                    .complete_evals_and_claim_next(completions_for_attempt, batch_limits)
+                store_for_settle.complete_evals_and_claim_next(
+                    completions_for_attempt,
+                    batch_limits,
+                    scope,
+                )
             })
             .await
             .unwrap_or_else(|join_error| {
@@ -2495,6 +2751,7 @@ async fn eval_worker_loop(
                 .observe(&["settle"], settle_started.elapsed().as_secs_f64());
             match outcome {
                 Ok(next) => {
+                    note_narrow_claim(scope, &next);
                     claimed_ahead = next;
                     error_backoff = ERROR_BACKOFF_MIN;
                     break;
@@ -2522,10 +2779,74 @@ async fn eval_worker_loop(
                 }
             }
         }
+        // The permit ends with the batch; a carried-ahead batch asks again.
+        drop(permit);
     }
 }
 
-async fn wait_for_next_eval(store: &Store, notifier: &Notify, worker_id: usize) {
+/// The scope a worker may claim in, given what the gate told it.
+fn claim_scope(throttled: bool) -> ClaimScope {
+    if throttled {
+        ClaimScope::NonPlanning
+    } else {
+        ClaimScope::Any
+    }
+}
+
+/// Count the evals a throttled worker took instead of the queue head
+/// (`legion_scheduler_admission_skips_total`, plan §8.2). The one deviation
+/// from strict queue order the admission gate introduces — a cross-class
+/// inversion, never one within a class — and it must never be silent.
+fn note_narrow_claim(scope: ClaimScope, batch: &[Eval]) {
+    if scope == ClaimScope::NonPlanning && !batch.is_empty() {
+        crate::manager::concurrency::record_admission_skips(batch.len() as u64);
+    }
+}
+
+/// The claim a worker makes given what the gate told it: the queue head when
+/// admitted, only kinds that cannot conflict when throttled.
+///
+/// Public because admission is only meaningful end to end:
+/// `tests/adaptive_scheduler_concurrency.rs` drives this function rather than
+/// testing a copy of it.
+pub fn claim_eval_batch(store: &Store, throttled: bool, limits: EvalBatchLimits) -> R<Vec<Eval>> {
+    let scope = claim_scope(throttled);
+    let batch = store.claim_evals(limits, scope)?;
+    note_narrow_claim(scope, &batch);
+    Ok(batch)
+}
+
+/// Wait until the gate admits this worker, for a batch it already holds.
+///
+/// `None` when the controller is not enforcing — there is nothing to hold.
+/// The poll cap exists because `Notify::notify_waiters` stores no permit: a
+/// release that lands between the refusal and the wait would otherwise be
+/// missed until the next one.
+async fn wait_for_permit(worker_id: usize) -> Option<PlannerPermit> {
+    use crate::manager::concurrency::{self, Admission};
+    let mut logged = false;
+    loop {
+        match concurrency::gate().admit() {
+            Admission::Granted(permit) => return Some(permit),
+            Admission::Unrestricted => return None,
+            Admission::Throttled => {
+                if !logged {
+                    debug!(
+                        worker_id,
+                        "Holding a claimed batch that plans; waiting for a planning permit"
+                    );
+                    logged = true;
+                }
+                tokio::select! {
+                    _ = concurrency::gate().released() => {}
+                    _ = tokio::time::sleep(THROTTLED_GATE_POLL) => {}
+                }
+            }
+        }
+    }
+}
+
+async fn wait_for_next_eval(store: &Store, notifier: &Notify, worker_id: usize, throttled: bool) {
     // Compute the shortest meaningful sleep: until next delayed eval is ready,
     // or a long idle cap when the queue has no pending rows.
     let wait_for = match store.next_pending_eval_delay() {
@@ -2540,7 +2861,37 @@ async fn wait_for_next_eval(store: &Store, notifier: &Notify, worker_id: usize) 
         }
     };
 
-    if wait_for.is_zero() {
+    // A throttled worker that found no non-planning work is usually waiting on
+    // the GATE, not on the clock — the queue head is claimable right now, it
+    // just is not admissible. Returning here would spin, so the wait is capped
+    // rather than skipped, and the gate's release is added to the wakeup set.
+    // The cap matters because `notify_waiters` stores no permit: a release
+    // between the claim attempt and the wait would otherwise be missed.
+    let wait_for = if throttled {
+        if wait_for.is_zero() {
+            THROTTLED_GATE_POLL
+        } else {
+            wait_for.min(THROTTLED_GATE_POLL)
+        }
+    } else if wait_for.is_zero() {
+        return;
+    } else {
+        wait_for
+    };
+
+    if throttled {
+        debug!(
+            worker_id,
+            ?wait_for,
+            "Planning is throttled and no non-planning eval is ready; waiting on the gate"
+        );
+        // Race wake events against timeout so workers react quickly to new
+        // work — or to the gate opening — without busy polling.
+        tokio::select! {
+            _ = notifier.notified() => {}
+            _ = crate::manager::concurrency::gate().released() => {}
+            _ = tokio::time::sleep(wait_for) => {}
+        }
         return;
     }
 
@@ -3496,7 +3847,7 @@ mod tests {
         let wait_task = tokio::spawn({
             let store = store.clone();
             let notifier = notifier.clone();
-            async move { wait_for_next_eval(&store, &notifier, 0).await }
+            async move { wait_for_next_eval(&store, &notifier, 0, false).await }
         });
 
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -3523,7 +3874,7 @@ mod tests {
         )?;
 
         let start = tokio::time::Instant::now();
-        wait_for_next_eval(&store, &notifier, 0).await;
+        wait_for_next_eval(&store, &notifier, 0, false).await;
         let elapsed = start.elapsed();
 
         assert!(

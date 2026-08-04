@@ -422,6 +422,12 @@ fn tool_defs() -> Vec<ToolDef> {
             mutates: false,
         },
         ToolDef {
+            name: "legion_scheduler_concurrency",
+            description: "Report how many evals the manager will PLAN at once, and why. Returns the current limit against its floor/ceiling (`evalThreads`), the smoothed plan-conflict rate, the fallback rate (races absorbed by candidate lists — these are successes, not failures), goodput in placements/sec, and a `state` of steady|throttled|probing|saturated. Read this before concluding that a cluster is slow or full: `throttled` means the scheduler is deliberately admitting fewer planners and work will drain, while `saturated` means backing off did NOT help and the conflicts are capacity-driven — the answer there is more nodes, not waiting or resubmitting (docs/adaptive-scheduler-concurrency.md).",
+            input_schema: empty_schema,
+            mutates: false,
+        },
+        ToolDef {
             name: "legion_boot_ticket_create",
             description: "Mint a boot ticket: a short-lived capability that lets one edge node start one workload without calling a manager (docs/edge-boot.md). Names an exact job config, one task, one instance (or a non-empty instance prefix), one node pool, and a gate ceiling. Single-use by default and revocable only by expiry, so prefer short TTLs. The token is returned ONCE. Mutating.",
             input_schema: || json!({
@@ -1214,6 +1220,13 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
             let mut client = connect().await?;
             grpc(client.rotate_data_key(crate::structs::RotateDataKeyRequest { idempotency_key }))
                 .await
+        }
+        "legion_scheduler_concurrency" => {
+            let mut client = connect().await?;
+            grpc(
+                client.get_scheduler_concurrency(crate::structs::GetSchedulerConcurrencyRequest {}),
+            )
+            .await
         }
         "legion_node_drain" => {
             let node_id = str_arg(&args, "node_id")?;

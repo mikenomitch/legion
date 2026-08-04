@@ -355,7 +355,8 @@ start:
 - **Concepts:** [Managers and Workers](docs/architecture-managers-workers.md) ·
   [Jobs, Tasks, and Scheduling](docs/jobs-tasks-and-scheduling.md) ·
   [Configuration Language](docs/configuration-language.md) ·
-  [Scheduler and Eval Loop](docs/scheduler-and-eval-loop.md)
+  [Scheduler and Eval Loop](docs/scheduler-and-eval-loop.md) ·
+  [Adaptive Scheduler Concurrency](docs/adaptive-scheduler-concurrency.md)
 - **Running workloads:** [Task Runtimes](docs/task-runtime-plugins.md) ·
   [Artifacts](docs/artifacts.md) · [Rollouts](docs/rollouts.md) ·
   [Scaling Jobs](docs/autoscaling.md) ·
