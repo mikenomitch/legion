@@ -1,9 +1,15 @@
 use crate::prelude::*;
 use crate::structs::{Allocation, TaskConfig};
 use crate::task_plugins::exec_isolation::{
-    cap_last_cap, capabilities_to_drop, enforcement_enabled, parse_umask, remove_managed_cgroup,
-    ExecHardeningConfig,
+    enforcement_enabled, remove_managed_cgroup, ExecHardeningConfig,
 };
+// Linux-only: these are called from the pre-exec hardening block, which is
+// itself `cfg(target_os = "linux")` because it goes through `libc::prctl`
+// and `PR_CAPBSET_DROP`. Importing them unconditionally made every macOS
+// build warn, and `cargo clippy -- -D warnings` fails on it — green on CI,
+// which is Linux, and broken for anyone developing on a Mac.
+#[cfg(target_os = "linux")]
+use crate::task_plugins::exec_isolation::{cap_last_cap, capabilities_to_drop, parse_umask};
 use crate::task_plugins::{
     configure_task_log_capture, derived_schema, spawn_pipe, spawn_pty, spawn_task_process,
     ExecOptions, ExecSession, ExecSupport, TaskInstance, TaskPlugin,
