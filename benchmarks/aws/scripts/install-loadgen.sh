@@ -44,7 +44,7 @@ fi
 
 log "installing legion CLI from s3://$BUCKET/bin/legion"
 rsh "$LOADGEN_ADDR" "
-    sudo aws s3 cp --region $REGION s3://$BUCKET/bin/legion /opt/legion/bin/legion &&
+    sudo aws s3 cp --only-show-errors --region $REGION s3://$BUCKET/bin/legion /opt/legion/bin/legion &&
     sudo chmod +x /opt/legion/bin/legion &&
     sudo ln -sf /opt/legion/bin/legion /usr/local/bin/legion
 " || log "WARNING: legion binary not in S3 yet — run build-and-upload.sh, then re-run"

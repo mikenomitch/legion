@@ -34,6 +34,7 @@ A run directory contains:
 """
 
 import argparse
+import concurrent.futures
 import json
 import os
 import subprocess
@@ -179,7 +180,11 @@ class RunRecorder:
         self._raw_file = open(os.path.join(out_dir, "raw-events.ndjson"), "w")
 
     def record_submit(self, job):
-        self.submits[job] = now_ms()
+        # Locked because submission is concurrent (--submit-concurrency).
+        # CPython would make the bare assignment atomic anyway, but the
+        # timestamp is a measurement input and this is cheap.
+        with self._lock:
+            self.submits[job] = now_ms()
 
     def record_placement(self, job, count):
         event = {"t_ms": now_ms(), "job": job, "count": count}
@@ -230,10 +235,17 @@ class LegionAdapter:
         self._follower = None
 
     def start_watch(self, recorder):
+        # Keep the follower's stderr. Discarding it cost a 10-minute cell
+        # that reported 0 placements: the follower had exited, the pump
+        # loop ended with it, and the driver sat in its settle loop
+        # waiting for a stream that was no longer there -- with the one
+        # explanation written to /dev/null.
+        self._stderr_path = os.path.join(recorder.out_dir, "follower-stderr.log")
+        self._stderr_file = open(self._stderr_path, "w")
         self._follower = subprocess.Popen(
             [self.legion_bin, "events", "follow", "-j", "--kind", "allocation"],
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            stderr=self._stderr_file,
             env=self.env,
             text=True,
         )
@@ -264,9 +276,14 @@ class LegionAdapter:
         if not reply.get("ok"):
             raise RuntimeError(f"legion job run {job_name} rejected: {reply}")
 
+    def watch_alive(self):
+        return self._follower is not None and self._follower.poll() is None
+
     def stop_watch(self):
         if self._follower:
             self._follower.terminate()
+        if getattr(self, "_stderr_file", None):
+            self._stderr_file.close()
 
 
 class NomadAdapter:
@@ -321,6 +338,9 @@ class NomadAdapter:
         )
         if result.returncode != 0:
             raise RuntimeError(f"nomad job run {job_name} failed: {result.stderr}")
+
+    def watch_alive(self):
+        return not self._stop.is_set()
 
     def stop_watch(self):
         self._stop.set()
@@ -397,6 +417,9 @@ class K8sAdapter:
         if result.returncode != 0:
             raise RuntimeError(f"kubectl apply {job_name} failed: {result.stderr}")
 
+    def watch_alive(self):
+        return self._watcher is not None and self._watcher.poll() is None
+
     def stop_watch(self):
         if self._watcher:
             self._watcher.terminate()
@@ -431,15 +454,50 @@ def cmd_run(args):
         f"({expected_total} expected allocations) to {args.system}",
         file=sys.stderr,
     )
-    for job in manifest["jobs"]:
+    def submit_one(job):
+        # Stamp inside the worker, immediately before the call, or the
+        # submit->placed latency picks up queueing in this pool.
         recorder.record_submit(job["name"])
         adapter.submit(os.path.join(args.workload_dir, job["file"]), job["name"])
         if args.submit_gap_ms:
             time.sleep(args.submit_gap_ms / 1000.0)
 
+    # Submission has to outpace placement or the driver, not the system
+    # under test, sets the measured rate. Serially it does not come
+    # close: each submit is a fresh CLI process plus an RPC, which
+    # measured 25ms -- about 40 jobs/sec -- and on a clean 1000-node
+    # cluster Legion placed every job before the next one arrived (last
+    # placement landed 0.0s after the last submit). That run measured
+    # subprocess spawn, not the scheduler. The same loop feeds the Nomad
+    # and K8s adapters, so lifting it lifts the ceiling for all three
+    # equally and the comparison stays fair.
+    if args.submit_concurrency > 1:
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=args.submit_concurrency
+        ) as pool:
+            # list() so a failed submit raises here rather than being
+            # silently dropped -- a cell short of its expected count must
+            # fail loudly, not average over the gap.
+            list(pool.map(submit_one, manifest["jobs"]))
+    else:
+        for job in manifest["jobs"]:
+            submit_one(job)
+
     deadline = time.monotonic() + args.settle_timeout_secs
     while time.monotonic() < deadline:
         if recorder.placed_total() >= expected_total:
+            break
+        # A dead watcher is not a slow cluster, and waiting out the full
+        # settle timeout to report zero placements hides which one it
+        # was. Fail as soon as the stream is gone, and say where its
+        # stderr went.
+        if not adapter.watch_alive():
+            print(
+                f"ERROR: the event watcher exited mid-run after "
+                f"{recorder.placed_total()}/{expected_total} placements. "
+                f"The cell measured nothing; see {args.out}/follower-stderr.log",
+                file=sys.stderr,
+            )
             break
         time.sleep(0.25)
     else:
@@ -523,6 +581,17 @@ def main():
     run.add_argument("--warmup-secs", type=float, default=5.0)
     run.add_argument("--settle-timeout-secs", type=float, default=600.0)
     run.add_argument("--submit-gap-ms", type=int, default=0)
+    run.add_argument(
+        "--submit-concurrency",
+        type=int,
+        default=4,
+        help="Jobs submitted in parallel. 1 restores the old serial loop, "
+        "which measured the driver (~40 jobs/sec) rather than the system. "
+        "The default is deliberately modest: each slot is a whole CLI "
+        "process, and the loadgen box is an m7i.large with 2 vCPU, so "
+        "oversubscribing it starves the event-watcher thread and the cell "
+        "measures the driver's contention instead of the scheduler.",
+    )
     run.add_argument("--legion-bin", default="legion")
     run.add_argument("--nomad-bin", default="nomad")
     run.add_argument("--kubectl-bin", default="kubectl")

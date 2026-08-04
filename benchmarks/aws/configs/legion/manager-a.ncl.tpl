@@ -18,6 +18,14 @@
   },
   storePath = "/var/lib/legion/store",
   workerConfigPath = "/opt/legion/configs/workers/",
+  # 4, not more. Measured 2026-08-04: raising this to 16 made throughput
+  # WORSE at both scales (1000 nodes 354.6 -> 310.4 alloc/sec, 5000 nodes
+  # 86.6 -> 77.3) while box CPU went 29% -> 85%, because the extra
+  # planners collided and their plans were discarded — the plan-apply
+  # rejection rate went 31.9% -> 73.6%. The CPU was doing work that was
+  # thrown away. Do not raise this to "use the cores" until
+  # plan-apply-conflict-reduction-plan.md lands; after it does, this
+  # number is exactly what the fix should let you raise.
   evalThreads = 4,
   schedulingPolicy = "bin_pack",
   defaultPriority = 50,

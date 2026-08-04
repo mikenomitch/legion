@@ -63,7 +63,7 @@ rsh "$LOADGEN_ADDR" "
     git clone --depth 1 https://github.com/hashicorp-forge/nomad-nodesim /tmp/nomad-nodesim
     cd /tmp/nomad-nodesim && git checkout '$NOMAD_NODESIM_REF' 2>/dev/null || true
     go build -o /tmp/nomad-nodesim-bin ./...  || go build -o /tmp/nomad-nodesim-bin .
-    aws s3 cp --region $REGION /tmp/nomad-nodesim-bin s3://$BUCKET/bin/nomad-nodesim
+    aws s3 cp --only-show-errors --region $REGION /tmp/nomad-nodesim-bin s3://$BUCKET/bin/nomad-nodesim
     git -C /tmp/nomad-nodesim rev-parse HEAD
 "
 

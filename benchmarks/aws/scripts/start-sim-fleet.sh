@@ -78,7 +78,7 @@ legion)
         }
         rcp "$SCENARIO" "$addr:/tmp/profiles.json"
         rsh "$addr" "
-            sudo aws s3 cp --region $REGION s3://$BUCKET/bin/legion /opt/legion/bin/legion &&
+            sudo aws s3 cp --only-show-errors --region $REGION s3://$BUCKET/bin/legion /opt/legion/bin/legion &&
             sudo chmod +x /opt/legion/bin/legion &&
             sudo mv /tmp/profiles.json /opt/legion/configs/profiles.json &&
             sudo tee /etc/systemd/system/legion-sim.service >/dev/null <<UNIT
@@ -138,20 +138,27 @@ UNIT
     rm -f "$SIM_TARGETS"
     log "published ${#WORKERS[@]} sim-worker scrape targets on :$SIM_TELEMETRY_PORT"
 
-    log "waiting for $TOTAL registered nodes"
-    deadline=$(($(date +%s) + 600))
-    while :; do
-        registered=$(rsh "$LOADGEN_ADDR" \
-            "LEGION_ADDR=$MANAGER legion state query 'SELECT COUNT(*) AS n FROM node' -j" |
-            jq -r '.data.rows[0].n // 0' 2>/dev/null || echo 0)
-        log "  registered: $registered/$TOTAL"
-        [ "$registered" -ge "$TOTAL" ] && break
-        (($(date +%s) < deadline)) || {
-            echo "fleet did not reach $TOTAL nodes in 600s" >&2
-            exit 1
-        }
-        sleep 10
-    done
+    # An EXACT census, not `registered >= TOTAL`.
+    #
+    # The old lower bound passed against the wrong population twice over.
+    # `SELECT COUNT(*) FROM node` counts every row the control plane has
+    # ever seen — nothing in Legion removes a node record — so a 4000-node
+    # experiment's orphans satisfied a 1000-node fleet's wait instantly,
+    # and the "fleet" the next cell measured was 1000 live nodes plus 3000
+    # corpses. It also ignores health, so a fleet where every node had
+    # gone `lost` passed the same gate. assert_fleet (scripts/env.sh)
+    # requires the exact count, all of them active, and every name from
+    # one of THIS fleet's slices, and prints the census when it does not
+    # get it. $idx is the number of slices actually started.
+    log "waiting for exactly $TOTAL active nodes across $idx slice(s)"
+    assert_fleet "$MANAGER" "$TOTAL" "$idx" 600 || exit 1
+
+    # Record what is now running, so the next script does not have to
+    # guess: run-campaign.sh uses it to skip a redundant fleet restart
+    # (every restart marks the whole fleet lost and buries the next cell
+    # in reschedule evals), and run-step.sh uses the slice count to gate
+    # on the same census this wait just passed.
+    write_fleet_state legion "$(basename "$SCENARIO" .json)" "$TOTAL" "$idx" "$MANAGER"
     ;;
 
 nomad)
@@ -165,7 +172,7 @@ nomad)
         log "  $instance_id ($private): $slice nodesim nodes"
         wait_for_ssh "$addr" 120
         rsh "$addr" "
-            sudo aws s3 cp --region $REGION s3://$BUCKET/bin/nomad-nodesim /opt/legion/bin/nomad-nodesim &&
+            sudo aws s3 cp --only-show-errors --region $REGION s3://$BUCKET/bin/nomad-nodesim /opt/legion/bin/nomad-nodesim &&
             sudo chmod +x /opt/legion/bin/nomad-nodesim &&
             sudo mkdir -p /var/lib/nodesim &&
             sudo tee /etc/systemd/system/nomad-nodesim.service >/dev/null <<UNIT

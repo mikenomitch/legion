@@ -38,7 +38,19 @@ rsh "$LOADGEN_ADDR" "tar -C /opt/bench/runs/$CAMPAIGN -czf - $RUN" |
 # stamps are monotonic, so use wall-clock now-2h as a safe superset;
 # range-export the series the analysis notebook reads).
 PROM="http://$LOADGEN_ADDR:9090"
-START=$(date -u -d '2 hours ago' +%s 2>/dev/null || date -u -v-2H +%s)
+# The cell's own window when run-step.sh supplies it, and only then a
+# trailing 2h superset. The difference decides whether the archived
+# series describe THIS cell or the last two hours of rig activity: a 1000
+# node cell collected right after a 4000-node packing-density run
+# otherwise archives `liveness_tracked_nodes` peaking at 4000 and a
+# freshness ratio dipping to 0.009, neither of which happened during the
+# cell. Cadence evidence that cannot be attributed to a cell cannot
+# certify it, which was the whole reason for capturing it.
+#
+# A minute of padding each side keeps the fleet ramp and the settle tail
+# in frame without reaching back to the previous cell.
+START=${CELL_START_EPOCH:-$(date -u -d '2 hours ago' +%s 2>/dev/null || date -u -v-2H +%s)}
+[ -n "${CELL_START_EPOCH:-}" ] && START=$((START - 60))
 END=$(date -u +%s)
 mkdir -p "$DEST/prometheus"
 snapshot() { # snapshot <name> <promql>
@@ -56,6 +68,17 @@ snapshot eval_queue_depth 'legion_eval_queue_depth'
 snapshot plan_apply 'sum by (outcome) (rate(legion_plan_apply_total[1m]))'
 snapshot heartbeats 'rate(legion_heartbeats_total[1m])'
 snapshot nodes 'legion_nodes'
+# Whether the fleet actually kept its cadence, archived per cell. Phase 1's
+# numbers were unusable for exactly this reason and the archive could not
+# show it: the cell measured the heartbeat ceiling rather than the
+# scheduler, and nothing in the results said so. The freshness ratio is
+# the one number that distinguishes the two (1.0 = every node on time;
+# false node loss begins at served_interval/lost_window, 0.20 at the
+# defaults), and the suppression counters say whether the manager was
+# declining to act on losses it saw. Read these before quoting a cell.
+snapshot heartbeat_freshness 'legion_heartbeat_freshness_ratio'
+snapshot liveness_tracked_nodes 'legion_liveness_tracked_nodes'
+snapshot liveness_loss_suppressed 'sum by (reason) (rate(legion_liveness_loss_suppressed_total[1m]))'
 snapshot grpc_p99 'histogram_quantile(0.99, sum by (method, le) (rate(legion_grpc_request_duration_seconds_bucket[1m])))'
 snapshot cpu 'sum by (instance_name, role) (rate(node_cpu_seconds_total{mode!="idle"}[1m]))'
 # Memory is a first-class result alongside CPU — "what does the control
@@ -83,11 +106,15 @@ snapshot memory_anon 'sum by (instance_name, role) (node_memory_MemTotal_bytes -
 # control-plane boxes run nothing else of consequence, so box memory
 # tracks the manager closely — but it includes the OS and, in `used`,
 # the page cache. Treat these as an upper bound on the manager's cost.
+# Same window as the range snapshots above, for the same reason: a peak
+# taken over a trailing 2h is the rig's peak, not the cell's.
+WINDOW_SECS=$((END - START))
+[ "$WINDOW_SECS" -lt 60 ] && WINDOW_SECS=60
 mem_reduce() { # mem_reduce <name> <promql>
     local fn out
     for fn in max avg; do
         out=$(curl -fsS "$PROM/api/v1/query" \
-            --data-urlencode "query=${fn}_over_time(($2)[2h:15s])" 2>/dev/null) || out=""
+            --data-urlencode "query=${fn}_over_time(($2)[${WINDOW_SECS}s:15s])" 2>/dev/null) || out=""
         printf '%s' "${out:-null}" >"$DEST/prometheus/$1-${fn}.json"
     done
 }
@@ -122,6 +149,23 @@ log "writing fairness record"
     echo "  \"campaign\": \"$CAMPAIGN\", \"run\": \"$RUN\","
     echo "  \"system\": \"$SYSTEM\", \"nodes\": $NODES, \"scenario\": \"$SCENARIO\","
     echo "  \"collected_at\": \"$(date -u +%FT%TZ)\","
+    # What the archived Prometheus series actually cover. A reader
+    # checking a cell's cadence evidence needs to know whether the window
+    # is the cell's own or a trailing superset that may include a
+    # neighbouring experiment.
+    echo "  \"metrics_window\": {"
+    echo "    \"start_epoch\": $START, \"end_epoch\": $END,"
+    echo "    \"scope\": \"$([ -n "${CELL_START_EPOCH:-}" ] && echo cell || echo "trailing-2h-superset")\""
+    echo "  },"
+    # The scheduler backlog this cell inherited, from run-step.sh's
+    # pre-cell probe. Anything above a handful means the cell shared the
+    # eval workers with churn it did not create — a fleet restart marks
+    # every node lost and raises a reschedule eval per node, which at 10k
+    # nodes outnumbered the cell's own submissions more than two to one.
+    # A cell whose throughput looks low is either a real result or this;
+    # the number is here so the archive can tell them apart. -1 means the
+    # probe could not read the eval table.
+    echo "  \"pre_cell_eval_backlog\": ${PRE_CELL_EVAL_DEPTH:--1},"
     # From the rig manifest / terraform outputs, never hardcoded: the
     # fairness record has to state the hardware the cell actually ran on.
     echo "  \"instance_types\": {"
@@ -132,7 +176,7 @@ log "writing fairness record"
     # of the fleet saw no spot reclaims, which is a fidelity difference
     # between cells and not only a cost one.
     echo "  \"worker_on_demand_percentage\": ${WORKER_ON_DEMAND_PCT:-0},"
-    echo "  \"legion_binary\": $(aws s3 cp --region "$REGION" "s3://$BUCKET/bin/legion.meta.json" - 2>/dev/null || echo null),"
+    echo "  \"legion_binary\": $(aws s3 cp --only-show-errors --region "$REGION" "s3://$BUCKET/bin/legion.meta.json" - 2>/dev/null || echo null),"
     echo "  \"versions\": {"
     echo "    \"nomad\": \"$NOMAD_VERSION\", \"k8s\": \"$K8S_VERSION\","
     echo "    \"kwok\": \"$KWOK_VERSION\", \"nodesim_ref\": \"$NOMAD_NODESIM_REF\""
@@ -145,7 +189,7 @@ rsh "${CP_ADDRS[0]}" "cat /opt/legion/configs/manager.ncl 2>/dev/null || cat /et
 
 log "archiving to s3://$BUCKET/campaigns/$CAMPAIGN/$RUN.tar.gz"
 tar -C "$RESULTS_ROOT/$CAMPAIGN" -czf - "$RUN" |
-    aws s3 cp --region "$REGION" - "s3://$BUCKET/campaigns/$CAMPAIGN/$RUN.tar.gz"
+    aws s3 cp --only-show-errors --region "$REGION" - "s3://$BUCKET/campaigns/$CAMPAIGN/$RUN.tar.gz"
 
 # Durable mirror. The rig's own bucket dies with `teardown.sh`
 # (force_destroy), and $DEST is on whichever box drove the campaign — for
@@ -154,7 +198,7 @@ tar -C "$RESULTS_ROOT/$CAMPAIGN" -czf - "$RUN" |
 # must never fail a cell whose primary copy already landed.
 if [ -n "${ARCHIVE_BUCKET:-}" ]; then
     if tar -C "$RESULTS_ROOT/$CAMPAIGN" -czf - "$RUN" |
-        aws s3 cp --region "$REGION" - "s3://$ARCHIVE_BUCKET/campaigns/$CAMPAIGN/$RUN.tar.gz"; then
+        aws s3 cp --only-show-errors --region "$REGION" - "s3://$ARCHIVE_BUCKET/campaigns/$CAMPAIGN/$RUN.tar.gz"; then
         log "mirrored to s3://$ARCHIVE_BUCKET/campaigns/$CAMPAIGN/$RUN.tar.gz"
     else
         log "WARNING: mirror to s3://$ARCHIVE_BUCKET failed — this cell only exists in the rig bucket and on this box"

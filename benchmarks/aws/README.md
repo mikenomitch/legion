@@ -96,6 +96,9 @@ scripts/local-smoke.sh
 cp terraform/terraform.tfvars.example terraform/terraform.tfvars   # edit
 scripts/bringup.sh
 scripts/build-and-upload.sh          # dist binary + plugins -> S3
+                                     # (plugins are fingerprinted and only
+                                     #  rebuilt when they change; force with
+                                     #  --force-plugins)
 
 # 2. Legion campaign, both HA modes. One command each: scales the spot
 #    fleet per step, starts sim fleets, drives every workload, collects,
@@ -129,6 +132,41 @@ The 20k validation burst is one extra flag pass:
 `scripts/run-campaign.sh --system legion-a --steps "20000"` (the ASG
 tops out at 20 instances; `fit_curves.py` automatically treats a 20k
 cell as validation, not as fit input).
+
+### Saturating the scheduler (the other axis)
+
+Node count is one axis; allocations per node is the other, and it is the
+one that decides whether the scheduler is being asked for real work. A
+saturation sweep runs several densities at one node count, on one fleet,
+one cell per point:
+
+```bash
+scripts/run-campaign.sh --system legion-a --steps "5000" \
+    --allocs-per-node-sweep "5 10 20 40 80"
+```
+
+Each point lands in its own archive (`…-5000n-a25000`, `…-a50000`, …),
+and `fit_curves.py` prints the curve — including the points where the
+cluster stopped converging, which is the answer the sweep is looking for.
+The points deliberately share one fleet: restarting it between them puts
+a node-loss storm in the middle of the curve.
+
+`--allocs-per-node N` (default 5) sets the density for an ordinary
+scaling campaign, which is what puts the four steps at 5k/10k/25k/50k
+allocations.
+
+### Every campaign resets the control plane first
+
+`run-campaign.sh` wipes and reinstalls the control plane before its first
+step (`scripts/reset-control-plane.sh`, `--no-reset-control-plane` to opt
+out). This is load-bearing, not hygiene: **Legion cannot deregister a
+node**, so `stop-sim-fleet.sh` leaves every node record behind and the
+node table becomes a high-water mark of every fleet the boxes have ever
+carried. A 1,000-node cell run after a 4,000-node experiment otherwise
+measures a scheduler holding 3,000 corpses while reporting itself as a
+1,000-node result. Every cell now also gates on an exact node census —
+right count, all active and available, all named from this fleet's
+slices — and refuses to run otherwise, printing what it actually saw.
 
 ## Unattended runs (overnight, or from a cloud shell)
 
@@ -290,6 +328,22 @@ and tear it down when the campaign is over.
 - Batch workloads translate to K8s Deployments (not Jobs) so all three
   systems schedule "keep N running" semantics; noted in the fairness
   record.
-- `collect.sh` snapshots Prometheus over a trailing window, not the
-  exact cell window; the driver's own timestamps are authoritative for
-  the reported numbers.
+- `collect.sh` snapshots Prometheus over the cell's own window when
+  `run-step.sh` supplies one (`CELL_START_EPOCH`), and falls back to a
+  trailing 2h superset otherwise; the fairness record says which. The
+  driver's own timestamps remain authoritative for the reported numbers.
+- **Nothing removes node records.** There is no deregistration RPC
+  (`Store::remove_node` has no production caller), so a fleet's nodes
+  outlive it and only a control-plane reset clears them. Node names are
+  therefore reused run to run on purpose — a unique per-run prefix would
+  make every run leak its whole fleet instead of overwriting the last
+  one's. The consequences are handled by the reset at campaign start and
+  the per-cell census gate, but the underlying gap is real.
+- **Fleet churn contaminates the cell that follows it.** Every fleet
+  stop/start marks thousands of nodes lost and raises a reschedule eval
+  per node (measured: 5,760 reschedules against 2,503 job submissions at
+  the 10k step), which competes with the cell's own submissions for the
+  eval workers. Cells now avoid the restart where they can, wait for the
+  backlog to drain where they cannot, and archive the depth they started
+  from in `pre-cell.json` and the fairness record — but a cell that
+  started from a non-zero backlog is still a cell to read carefully.

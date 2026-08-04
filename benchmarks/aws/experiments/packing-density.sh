@@ -19,12 +19,14 @@
 # Usage:
 #   packing-density.sh [--steps "1000 2000 4000"] [--hold 180]
 #                      [--system legion-a] [--heartbeat-secs 2]
-#                      [--campaign <id>] [--scenario <file>]
+#                      [--campaign <id>] [--scenario <file>] [--no-reset]
 #
 # Precondition: a Legion control plane installed and running. The probe
 # scales the spot fleet to a single instance itself and leaves it there
 # — run-campaign.sh sizes the fleet per step anyway, so the next campaign
-# reclaims whatever it needs.
+# reclaims whatever it needs. It also resets that control plane before
+# the ladder (--no-reset opts out), because a node table carried over
+# from an earlier run would be counted as this drill's fleet.
 #
 # Safe to run unattended via `remote-campaign.sh exec` (the ladder is
 # bounded and every step archives to S3).
@@ -34,7 +36,7 @@ source "$SCRIPTS/env.sh"
 load_rig
 
 STEPS="1000 2000 4000" HOLD=180 SYSTEM="legion-a" HEARTBEAT_SECS=2
-CAMPAIGN="" SCENARIO="" MANAGER=""
+CAMPAIGN="" SCENARIO="" MANAGER="" RESET=true
 while [ $# -gt 0 ]; do
     case "$1" in
     --steps) STEPS="$2" ;;
@@ -43,7 +45,17 @@ while [ $# -gt 0 ]; do
     --heartbeat-secs) HEARTBEAT_SECS="$2" ;;
     --campaign) CAMPAIGN="$2" ;;
     --scenario) SCENARIO="$2" ;;
-    --manager) MANAGER="$2" ;;
+    --manager)
+        # An explicit manager means the caller owns that control plane;
+        # do not reinstall something we were only pointed at.
+        MANAGER="$2"
+        RESET=false
+        ;;
+    --no-reset)
+        RESET=false
+        shift
+        continue
+        ;;
     *)
         echo "unknown arg $1" >&2
         exit 1
@@ -79,11 +91,31 @@ mapfile -t WORKERS < <(worker_instances)
 }
 read -r WORKER_ID _WORKER_PUBLIC _WORKER_PRIVATE <<<"${WORKERS[0]}"
 
-# Ascending, always. start-sim-fleet.sh waits on the manager's total node
-# count, and nodes from an earlier step linger in the store as lost until
-# their names are re-registered — so a descending ladder would satisfy
-# that wait instantly against stale rows.
-STEPS=$(tr ' ' '\n' <<<"$STEPS" | grep -v '^$' | sort -n | tr '\n' ' ')
+# Start from an empty node table. Nothing deregisters a node, so a
+# control plane that has already carried a campaign still holds its rows,
+# and the first rung's census would count them as this drill's fleet.
+# Skipped with --no-reset or an explicit --manager.
+if $RESET; then
+    "$SCRIPTS/reset-control-plane.sh" --system "$SYSTEM"
+fi
+
+# Ascending, always — but no longer as a workaround.
+#
+# It used to be one: start-sim-fleet.sh waited on `COUNT(*) >= N`, and
+# rows from an earlier, wider rung linger in the store forever, so a
+# descending ladder satisfied that wait instantly against stale rows and
+# "measured" a fleet that was never started. That hole is closed — the
+# wait now asserts an exact census (scripts/env.sh assert_fleet), so a
+# descending rung fails loudly and says what it saw instead of quietly
+# reporting a density it never reached.
+#
+# The order is still ascending for two reasons that are about the drill
+# rather than about the store: the ladder stops at the first saturated
+# rung ("denser steps would only confirm it"), which only means anything
+# climbing; and each rung's node names strictly contain the previous
+# rung's, so an ascending ladder needs no reset between rungs. If you
+# want a descending ladder, reset the control plane between rungs.
+STEPS=$(tr ' ' '\n' <<<"$STEPS" | grep -v '^$' | sort -n -u | tr '\n' ' ')
 
 PROM="http://$LOADGEN_ADDR:9090"
 promq() { # promq <promql> -> first sample value, or empty
