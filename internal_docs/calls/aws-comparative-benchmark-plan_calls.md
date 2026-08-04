@@ -509,3 +509,143 @@ anyway. (c) is what would have been reported by default and is the actual
 trap: `used` alone would have overstated resident cost by ~40% while
 looking like a clean measurement, and nothing in the output would have
 said so.
+
+## 21. Cells are sized by allocation target, not by a per-scenario multiplier
+
+**The call.** `run-campaign.sh` computes `TARGET = nodes x ALLOCS_PER_NODE`
+(default 5, so the steps are 5k/10k/25k/50k — the plan's stated band) and
+`translate.py --target-allocations` solves for each scenario's multiplier.
+The old `--count-multiplier nodes/1000` is still there and still works.
+
+**Alternatives.** (a) Keep the multiplier and raise it. (b) Raise the
+scenarios' own base counts. (c) Leave it and shorten the warmup instead.
+
+**Trade-off.** A target is one more indirection between "what the plan
+asks for" and "what the scenario emits", and it silently reshapes a
+scenario whose job types are weighted differently from the others.
+
+**Why (honest measurement).** The multiplier scaled each scenario from its
+*own* base, and those bases — 180, 304 and 380 allocations — were chosen
+for the local micro-benchmarks on a few dozen nodes. At the 1k step the
+campaign was asking a 3-manager raft cluster to place 180 allocations. It
+did so in 0.8 seconds, entirely inside the 30-second warmup, so the cell
+reported `throughput_per_sec: 0.0`, `latency_samples: 0` and
+`complete: true` — a cell that looks successful and measures nothing. (a)
+leaves the three scenarios landing at different sizes for the same step,
+which the fairness record cannot explain. (b) edits fixtures the local
+benchmarks depend on. (c) treats the symptom: a workload that drains in
+under a second has no steady state to find, whatever the warmup.
+
+## 22. The driver submits concurrently, because serially it measured itself
+
+**The call.** `driver.py --submit-concurrency` (default 4) submits through
+a thread pool. `1` restores the old serial loop.
+
+**Alternatives.** (a) Stay serial and accept the ceiling. (b) Ask Legion
+for a batch-submission RPC. (c) Run several driver processes.
+
+**Trade-off.** Concurrency puts the driver's own scheduling between the
+submit timestamp and the wire, so a saturated pool would inflate measured
+latency. Mitigated by stamping `record_submit` inside the worker thread
+immediately before the call, and by keeping the default low.
+
+**Why (the measurement was of the wrong thing).** Serially, each submit is
+a fresh CLI process plus a Nickel evaluation plus an RPC — 25ms, so ~40
+jobs/sec. Measured on a clean 1000-node cluster, the last placement landed
+**0.0 seconds after the last submit**, and the run's total span equalled
+the submit span exactly: Legion placed every job before the next one
+arrived. The cell measured Python's subprocess loop. With concurrency 4 a
+backlog finally forms (4.9s from last submit to last placement) and the
+number describes the scheduler. The same loop feeds the Nomad and K8s
+adapters, so lifting it lifts all three equally and the comparison stays
+fair. (b) is the better long-term answer for real users and is now a TODO,
+but it changes the product to fix the harness. (c) multiplies clock skew
+across processes, which entry 5 exists to avoid.
+
+**Sized to the box, not to a round number.** The default is 4, not 16,
+because the loadgen box is an `m7i.large` — 2 vCPU. Each slot is a whole
+CLI process; oversubscribing starves the event-watcher thread and the cell
+measures the driver's own contention.
+
+## 23. Each cell tears down its jobs, from an EXIT trap
+
+**The call.** `run-step.sh` stops then destroys every job after
+`collect.sh`, via `trap cleanup_jobs EXIT`.
+
+**Alternatives.** (a) Leave jobs standing. (b) Wipe and reinstall the
+control plane between cells. (c) Clean up inline after collect.
+
+**Trade-off.** Teardown costs rig time proportional to job count, and on a
+failed cell the trap fires before `collect.sh` has run, so a failure
+archives nothing.
+
+**Why (the fitted variable must be the only variable).** Cells run back to
+back — three scenarios per step, four steps — and nothing else removed
+what a cell submitted, so the 10k step would have been measured against a
+cluster still carrying everything the 1k, 2k and 5k steps left running.
+Throughput would decay across the campaign for reasons unrelated to node
+count, which is precisely the axis being fitted. (b) is a guarantee rather
+than a best effort, but it also clears the node table and forces a full
+fleet re-registration, changing what the next cell measures. (c) is what
+was tried first and is subtly wrong: the driver exits non-zero whenever a
+cell is incomplete and `pipefail` aborts the script, so an inline teardown
+ran only after *successful* cells — leaving the wreckage of exactly the
+cells most likely to have left some.
+
+**The failure it produced is worth recording, because it was unreadable.**
+With teardown skipped, the next cell resubmitted identical specs for jobs
+that already existed. Legion correctly treated that as a no-op, created no
+allocations, and emitted no placement events — so the cell reported zero
+placements and looked for all the world like a broken event stream. Two
+runs were spent blaming the watcher.
+
+## 24. Cadence evidence is archived per cell, over the cell's own window
+
+**The call.** `collect.sh` snapshots `legion_heartbeat_freshness_ratio`,
+`legion_liveness_tracked_nodes` and
+`legion_liveness_loss_suppressed_total{reason}` with every cell, scoped to
+`CELL_START_EPOCH` rather than a trailing 2h, and records the window and
+its scope in `fairness-record.json`.
+
+**Alternatives.** (a) Trust the cell and check cadence only when a number
+looks wrong. (b) Keep the trailing 2h window already used for every other
+series.
+
+**Trade-off.** Three more series per cell, and a window that no longer
+overlaps its neighbours cannot show a slow drift across a campaign.
+
+**Why (phase 1 failed exactly here, invisibly).** The first campaign's
+cell reported 0.9 placements/sec at a p50 of 109s, which measured the
+heartbeat ceiling and not the scheduler — and *nothing in the archive said
+so*. The freshness ratio is the one number that separates the two, and a
+cell that cannot be certified cannot be quoted. (b) defeats the purpose:
+collected right after a 4000-node packing-density run, a 1000-node cell
+archived `liveness_tracked_nodes` peaking at 4000 and a freshness ratio
+dipping to 0.009, neither of which happened during the cell. Evidence that
+cannot be attributed to a cell cannot certify it.
+
+## 25. Heartbeat cadence stays at the default; adaptive cadence is not measured
+
+**The call.** The rig's `manager-a.ncl.tpl` sets no `heartbeat` block, so
+`targetRatePerSecond` stays unset, nothing adapts, and every worker holds
+a fixed 2s interval at every scale step.
+
+**Alternatives.** (a) Set `targetRatePerSecond` so cadence backs off as the
+fleet grows. (b) Measure both, doubling the Legion cell count.
+
+**Trade-off.** At the 10k step a fixed 2s cadence is 5,000 heartbeats/sec
+into three managers. If that exceeds what the control plane sustains, the
+step degrades — and the campaign will have declined to use the feature
+built to prevent it.
+
+**Why (fairness, and a measurable denominator).** The campaign's rule is
+default configs plus documented, defensible tuning, and Nomad and K8s will
+run their defaults too; `targetRatePerSecond` is a Legion-only knob with
+no counterpart in either. It would also serve a *varying* interval, which
+silently invalidates `packing-density.sh`'s achieved-cadence arithmetic
+(it divides by a fixed 2s) and makes "heartbeat cost at 10k nodes"
+incomparable across cells. With entry 24's evidence in every cell, a
+cadence shortfall at 5k or 10k becomes a recorded finding rather than a
+contaminated number — which is the outcome the plan wants from a first
+campaign. (a) remains the right thing to measure in a follow-up whose
+stated subject is the cadence ladder itself.

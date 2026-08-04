@@ -65,7 +65,7 @@ leader predates liveness digests, still pays the old cost. Measure yours.
 ### The measurement recipe
 
 1. Point a simulated fleet at the real control plane:
-   `legion start worker --simulate --count N`. The simulated fleet shares the
+   `legion start worker <TOKEN> --simulate N`. The simulated fleet shares the
    real cadence-resolution and jitter helpers, so it beats exactly as a real
    worker does — the number it produces is not a parallel implementation's.
 2. Ramp `N` and watch `legion_heartbeat_freshness_ratio` (or run

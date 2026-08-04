@@ -68,6 +68,10 @@ into a single series with every label set to `"other"`.
 
 ### Scheduler / eval loop
 
+Symptom-first guidance for these families — which one to read, which neighbour
+rules a cause in or out, and which knob to turn — is in
+[diagnosing-scheduler-performance.md](diagnosing-scheduler-performance.md).
+
 - **`legion_evals_processed_total{kind, status}`** (counter) — evals
   completed by the eval workers. `kind` is the eval kind (`job_submit`,
   `node-left`, ...); `status` is `ok` or `error`.
@@ -78,12 +82,22 @@ into a single series with every label set to `"other"`.
   submissions applied to the store; `outcome` is `applied` (every placement
   bound its first-choice candidate), `fallback` (applied, but at least one
   placement bound a lower-ranked candidate because of a race), or
-  `rejected` (optimistic-concurrency epoch conflicts or late constraint
-  failures). The outcomes are mutually exclusive — see
+  `rejected` (no candidate still fits: capacity, a late constraint or
+  cordon, or — for an edge-boot ratification only — an epoch conflict).
+  The outcomes are mutually exclusive — see
   [late-binding-plan-apply.md](late-binding-plan-apply.md).
 - **`legion_scheduler_plan_candidate_rank`** (histogram) — candidate rank
   each applied placement bound at (0 = the planner's first choice; higher
   ranks mean the apply walk absorbed a race by falling back).
+- **`legion_scheduler_plan_bind_pass{pass}`** (counter) — placements bound
+  by the apply walk, by pass. `clean` means the candidate's node was
+  untouched since the plan snapshot; `revalidated` means its allocation
+  epoch had moved and the in-transaction recheck (capacity, constraints,
+  ports, availability) admitted it anyway. A `revalidated` share that
+  rises with load is contention being absorbed rather than rejected —
+  before the two-pass bind these were plan rejections. Read it next to
+  `legion_plan_apply_total{outcome="rejected"}`: `revalidated` climbing
+  while `rejected` stays flat is the healthy shape.
 - **`legion_eval_conflict_requeues_total`** (counter) — evals released back
   to the pending queue after exhausting their plan-conflict retry budget,
   instead of failing terminally (the requeue backstop).
@@ -433,6 +447,15 @@ Two limitations worth knowing when reading a campaign:
   fleet's last sample as "state at teardown", not as a live value.
 
 ## Diagnosing a manager throughput ceiling
+
+This section is the **manager-wide** read order: RPC throughput has plateaued
+and you do not yet know which layer owns the time. If the symptom is
+specifically about scheduling — placements are slow, throughput fell when you
+added eval threads or nodes, or work is not running and nothing reports an
+error — start at
+[Diagnosing scheduler performance](diagnosing-scheduler-performance.md), which
+is organized by symptom rather than by metric and attaches the config knob to
+each one.
 
 When RPC throughput plateaus below what the workload should produce, the
 handler-duration histogram tells you *that* it is slow, never *why*. Read

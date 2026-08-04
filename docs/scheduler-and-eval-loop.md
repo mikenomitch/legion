@@ -113,11 +113,14 @@ propose→quorum-commit→apply instead of two.
 Since the late-binding change
 ([late-binding-plan-apply.md](late-binding-plan-apply.md)), a plan carries
 an ordered **candidate list** per placement instead of a single node, and
-the apply transaction binds each placement to the first candidate whose
-node epoch is unchanged since planning. A concurrent plan that touched the
-first choice costs a fallback rank instead of a whole-plan rejection.
-Coupled placements (overlapping lists, shared `distinct` keys, multi-task
-groups) keep exact all-or-nothing semantics. Defaults on
+the apply transaction binds each placement in two passes: first the
+best candidate whose node epoch is unchanged since planning, then — for
+placements that found none — the best candidate that still passes the
+transaction's own re-validation, epoch or no epoch. A concurrent plan that
+touched the first choice costs a fallback rank, or nothing at all, instead
+of a whole-plan rejection. Coupled placements (shared `distinct` keys,
+multi-task groups) keep exact all-or-nothing semantics; overlapping
+candidate lists are not coupling. Defaults on
 (`schedulerSettings.plan_candidates = 8`); `0` disables it and restores
 single-node submissions. The epoch sample (lazy or eager, below) covers
 the union of every placement's candidate list, and candidate submissions
@@ -221,15 +224,20 @@ every placement against the **fresh** node row before inserting it:
   arithmetic as the planner's ledger) and every placement must still fit,
   with earlier placements in the same plan debited.
 
-A failed re-validation rejects the whole plan the same way a stale epoch
-does; the eval handler's conflict retry then re-plans against the node's
-real state. Port assignments were always re-read in the apply
+A failed re-validation on *every* candidate is what rejects a plan; the
+eval handler's conflict retry then re-plans against the node's real
+state. Since the two-pass bind, this re-validation — not the node epoch —
+is what decides whether a contended placement lands. Port assignments were always re-read in the apply
 transaction; these checks give availability, constraints, and resources
 the same apply-time guarantee.
 
 ### Conflict handling
 
-A stale epoch causes plan rejection with a conflict error. The eval handler retries conflicts with bounded attempts via `Eval::plan_with_conflict_retries`.
+A rejected plan raises a conflict error, which the eval handler retries
+with bounded attempts via `Eval::plan_with_conflict_retries`. A stale
+*job-config* epoch always rejects; a stale *node* epoch only rejects when
+the re-validation above also fails (or for an edge-boot ratification, which
+keeps the hard node-epoch check).
 
 Since the late-binding change, exhausting that in-handler budget no longer
 fails the eval: the eval is released back to the pending queue with a
