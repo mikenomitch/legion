@@ -719,7 +719,7 @@ mod tests {
         }
 
         let submission = Submission {
-            path: "web.jsonnet".into(),
+            path: "web.ncl".into(),
             content: "v1".into(),
             is_primary: true,
         };
@@ -1069,7 +1069,7 @@ mod tests {
         store.handle_job_submit(
             &job_config,
             &[Submission {
-                path: "job.jsonnet".into(),
+                path: "job.ncl".into(),
                 content: "job".into(),
                 is_primary: true,
             }],
@@ -1151,7 +1151,7 @@ mod tests {
             version: None,
         };
         let subs = vec![Submission {
-            path: "job.jsonnet".into(),
+            path: "job.ncl".into(),
             content: "job".into(),
             is_primary: true,
         }];
@@ -1253,7 +1253,7 @@ mod tests {
             version: None,
         };
         let job_subs = vec![Submission {
-            path: "job.jsonnet".into(),
+            path: "job.ncl".into(),
             content: "job".into(),
             is_primary: true,
         }];
@@ -1315,7 +1315,7 @@ mod tests {
             version: None,
         };
         let job_subs = vec![Submission {
-            path: "job.jsonnet".into(),
+            path: "job.ncl".into(),
             content: "job".into(),
             is_primary: true,
         }];

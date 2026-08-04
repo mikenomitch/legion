@@ -75,7 +75,7 @@ fn job(name: &str, msg: &str, count: u32) -> JobConfig {
 
 fn submission(name: &str) -> Submission {
     Submission {
-        path: format!("{name}.jsonnet"),
+        path: format!("{name}.ncl"),
         content: format!("job {name}"),
         is_primary: true,
     }

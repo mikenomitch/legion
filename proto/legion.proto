@@ -94,7 +94,7 @@ service Manager {
 
   // === JOB TEMPLATES ===
   //
-  // Job templates are cluster-resident, immutably versioned Jsonnet
+  // Job templates are cluster-resident, immutably versioned Nickel
   // documents with declared, typed variables. Anyone with `template:read`
   // can browse them; `template:write` creates new versions or deletes them;
   // submitting a job *through* a template is gated by `job:write` rules
@@ -106,9 +106,11 @@ service Manager {
 
   // Creates the next immutable version of a named job template.
   //
-  // The source must evaluate to an object with an optional `description`,
-  // an optional `variables` list, and a hidden `job(vars)::` function that
-  // returns the jobspec. Invalid manifests are rejected here, not at run
+  // The source must evaluate to a record with an optional `description`,
+  // an optional `variables` list, and a
+  // `job | not_exported = fun vars => ...` function that returns the
+  // jobspec. `not_exported` is what keeps `job` out of the published
+  // manifest. Invalid manifests are rejected here, not at run
   // time. When every declared variable has a default, the manager also
   // trial-renders the template and validates the resulting jobspec.
   // Requires `template:write` scoped to the template name.
@@ -1122,7 +1124,7 @@ message RunJobReply {
 message JobTemplateVariable {
   // Variable key. Must match `[a-zA-Z_][a-zA-Z0-9_]*`. The rendered
   // template receives all declared keys as fields of the single `vars`
-  // object passed to its `job(vars)` function.
+  // record its `job` function is applied to.
   string key = 1;
 
   // Variable type. One of: `string`, `text` (multiline string), `number`,
@@ -1177,8 +1179,8 @@ message JobTemplate {
   // Optional user-facing description from the template manifest.
   optional string description = 4;
 
-  // Raw Jsonnet source of this version.
-  string source_jsonnet = 5;
+  // Raw Nickel source of this version.
+  string source_nickel = 5;
 
   // Declared variables from the manifest, in declaration order.
   repeated JobTemplateVariable variables = 6;
@@ -1223,9 +1225,9 @@ message UpsertJobTemplateRequest {
   // version; versions are never overwritten.
   string name = 1;
 
-  // Full Jsonnet source. Must be self-contained (imports are rejected) and
+  // Full Nickel source. Must be self-contained (imports are rejected) and
   // at most 512 KiB. See JobTemplate for the required document shape.
-  string source_jsonnet = 2;
+  string source_nickel = 2;
 }
 
 // Reply payload for UpsertJobTemplate.

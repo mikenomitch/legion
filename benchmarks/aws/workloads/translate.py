@@ -4,8 +4,8 @@
 One scenario file (benchmarks/scheduler/scenarios/*.json — the schema in
 tests/benchmark_support/mod.rs) becomes:
 
-  legion : one JSON jobspec per job (JSON is valid jsonnet; submitted
-           with `legion job run <file>`)
+  legion : one Nickel jobspec per job (.ncl, submitted with
+           `legion job run <file>`)
   nomad  : one .nomad.hcl job per job (mock driver — nodesim fleets
            advertise it, so placements stay pure-scheduler)
   k8s    : one Deployment manifest per (job, task) as JSON (YAML is a
@@ -104,6 +104,48 @@ def legion_jobspec(job_name, job_type):
             task["constraints"] = job_type["constraints"]
         tasks.append(task)
     return {"name": job_name, "tasks": tasks}
+
+
+# Nickel keywords that cannot appear as bare record field names.
+NICKEL_KEYWORDS = {
+    "if", "then", "else", "forall", "in", "let", "rec", "match", "null",
+    "true", "false", "fun", "import", "merge", "default", "doc", "optional",
+    "priority", "force", "not_exported",
+}
+
+
+def nickel(value, indent=0):
+    """Render a JSON-shaped Python value as Nickel source.
+
+    JSON is not a subset of Nickel — records use `=` rather than `:` — so
+    the jobspecs are emitted rather than dumped.
+    """
+    pad = "  " * indent
+    inner = "  " * (indent + 1)
+    if isinstance(value, dict):
+        if not value:
+            return "{}"
+        fields = []
+        for key, item in value.items():
+            name = (
+                key
+                if key.isidentifier() and key not in NICKEL_KEYWORDS
+                else json.dumps(key)
+            )
+            fields.append(f"{inner}{name} = {nickel(item, indent + 1)},")
+        return "{\n" + "\n".join(fields) + f"\n{pad}}}"
+    if isinstance(value, list):
+        if not value:
+            return "[]"
+        items = [f"{inner}{nickel(item, indent + 1)}," for item in value]
+        return "[\n" + "\n".join(items) + f"\n{pad}]"
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return repr(value)
+    return json.dumps(value)
 
 
 # --- Nomad ------------------------------------------------------------
@@ -219,9 +261,9 @@ def translate(scenario, system, out_dir, multiplier):
     for job_name, job_type, _idx in iter_jobs(scenario, multiplier):
         expected = expected_allocations(job_type)
         if system == "legion":
-            filename = f"{job_name}.jsonnet"
+            filename = f"{job_name}.ncl"
             with open(os.path.join(out_dir, filename), "w") as f:
-                json.dump(legion_jobspec(job_name, job_type), f, indent=2)
+                f.write(nickel(legion_jobspec(job_name, job_type)))
                 f.write("\n")
         elif system == "nomad":
             filename = f"{job_name}.nomad.hcl"

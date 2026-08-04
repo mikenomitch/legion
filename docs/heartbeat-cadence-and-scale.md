@@ -181,26 +181,26 @@ computes each worker's interval from **fleet size** and serves it on the
 heartbeat reply, so cadence backs off as the fleet grows instead of healthy
 nodes being marked lost.
 
-```jsonnet
-// configs/manager.jsonnet
-heartbeat: {
-  // Aggregate heartbeat rate this control plane will accept. Unset (the
-  // default) = workers keep their worker-type `heartbeatSeconds` and nothing
-  // adapts. Measure yours with `legion node cadence`.
-  targetRatePerSecond: 80,
+```nickel
+# configs/manager.ncl
+heartbeat = {
+  # Aggregate heartbeat rate this control plane will accept. Unset (the
+  # default) = workers keep their worker-type `heartbeatSeconds` and nothing
+  # adapts. Measure yours with `legion node cadence`.
+  targetRatePerSecond = 80,
 
-  // Floor and ceiling on the served interval. The floor is never crossed
-  // however small the fleet; the ceiling is where the manager gives up
-  // backing off and warns instead.
-  minInterval: "2s",
-  maxInterval: "120s",
+  # Floor and ceiling on the served interval. The floor is never crossed
+  # however small the fleet; the ceiling is where the manager gives up
+  # backing off and warns instead.
+  minInterval = "2s",
+  maxInterval = "120s",
 
-  // Missed beats before a node is lost. The lost window is ALWAYS this times
-  // that node's served interval — 5 x 2s = the historical 10s.
-  missedBeatsBeforeLost: 5,
+  # Missed beats before a node is lost. The lost window is ALWAYS this times
+  # that node's served interval — 5 x 2s = the historical 10s.
+  missedBeatsBeforeLost = 5,
 
-  // Headroom in the sizing formula: 2 runs at half the measured ceiling.
-  headroom: 2,
+  # Headroom in the sizing formula: 2 runs at half the measured ceiling.
+  headroom = 2,
 }
 ```
 

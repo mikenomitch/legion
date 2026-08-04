@@ -1991,7 +1991,7 @@ mod tests {
 
     fn submission() -> Submission {
         Submission {
-            path: "job.jsonnet".into(),
+            path: "job.ncl".into(),
             content: "{}".into(),
             is_primary: true,
         }

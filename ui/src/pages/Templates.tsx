@@ -11,18 +11,18 @@ const errorText = (error: unknown): string =>
   error instanceof Error ? error.message : String(error)
 
 const STARTER_SOURCE = `{
-  description: 'What this template runs.',
-  variables: [
-    { key: 'name', type: 'string', label: 'Job name suffix' },
-    { key: 'replicas', type: 'number', default: 1 },
+  description = "What this template runs.",
+  variables = [
+    { key = "name", type = "string", label = "Job name suffix" },
+    { key = "replicas", type = "number", "default" = 1 },
   ],
-  job(vars):: {
-    name: 'example-' + vars.name,
-    tasks: [{
-      name: 'main',
-      runtime: 'exec',
-      count: vars.replicas,
-      config: { command: ['echo', 'hello from ' + vars.name] },
+  job | not_exported = fun vars => {
+    name = "example-%{vars.name}",
+    tasks = [{
+      name = "main",
+      runtime = "exec",
+      count = vars.replicas,
+      config = { command = ["echo", "hello from %{vars.name}"] },
     }],
   },
 }
@@ -74,7 +74,7 @@ function TemplatesContent() {
     try {
       const reply = await managerClient.upsertJobTemplate({
         name: newName().trim(),
-        sourceJsonnet: newSource(),
+        sourceNickel: newSource(),
       })
       const stored = reply.template
       setCreateNotice(
@@ -95,7 +95,7 @@ function TemplatesContent() {
       <Show when={editorOpen()}>
         <SectionCard
           title="New template"
-          description="One self-contained Jsonnet file: metadata, typed variables, and a hidden job(vars):: function."
+          description="One self-contained Nickel file: metadata, typed variables, and a `job | not_exported = fun vars => …` function."
         >
           <form class="flex flex-col gap-3" onSubmit={createTemplate}>
             <Field label="Name" hint="Lowercase letters, digits, and dashes.">
@@ -107,7 +107,7 @@ function TemplatesContent() {
                 required
               />
             </Field>
-            <Field label="Jsonnet source">
+            <Field label="Nickel source">
               <textarea
                 class={`${textareaClass} h-72 font-mono text-xs`}
                 value={newSource()}
@@ -178,7 +178,7 @@ function TemplatesContent() {
           setPage(1)
         }}
         emptyLabel="No templates yet"
-        emptyHint="Publish one with `legion template create <name> -f template.jsonnet` or the editor below."
+        emptyHint="Publish one with `legion template create <name> -f template.ncl` or the editor below."
       />
 
     </div>

@@ -895,7 +895,7 @@ pub fn get_migrations() -> Migrations<'static> {
         // Job templates (job-templates plan): name + latest-version pointer,
         // with immutable versions in job_template_version. variables is the
         // JSON-encoded Vec<JobTemplateVariableRecord> parsed from the
-        // manifest at upsert time so list/get never re-evaluate Jsonnet.
+        // manifest at upsert time so list/get never re-evaluate Nickel.
         M::up(
             "CREATE TABLE IF NOT EXISTS job_template (
             name STRING PRIMARY KEY,
@@ -910,7 +910,7 @@ pub fn get_migrations() -> Migrations<'static> {
             template_name STRING NOT NULL,
             version INTEGER NOT NULL,
             description STRING,
-            source_jsonnet TEXT NOT NULL,
+            source_nickel TEXT NOT NULL,
             variables JSONB NOT NULL DEFAULT '[]',
             created_by STRING NOT NULL DEFAULT '',
             created_at TIMESTAMP NOT NULL,

@@ -11,14 +11,14 @@ because the cluster upgraded.
 
 ## Turning it on
 
-```jsonnet
-// configs/workers/default.jsonnet
+```nickel
+# configs/workers/default.ncl
 {
-    resourceEnforcement: {
-        enabled: true,
-        // Hierarchy root under /sys/fs/cgroup. Legion creates `share/` and
-        // `reserve/` beneath it, and one cgroup per allocation beneath those.
-        cgroupParent: "legion",
+    resourceEnforcement = {
+        enabled = true,
+        # Hierarchy root under /sys/fs/cgroup. Legion creates `share/` and
+        # `reserve/` beneath it, and one cgroup per allocation beneath those.
+        cgroupParent = "legion",
     },
 }
 ```
@@ -49,7 +49,7 @@ Two rules follow, enforced at submit on every governed runtime:
 
 - **`cores` must be a whole number.** A cpuset cannot hold half a CPU. (This
   was silently rounded on macOS and ignored on Linux before enforcement
-  existed, so a `cores: 1.5` spec that used to be accepted now fails with a
+  existed, so a `cores = 1.5` spec that used to be accepted now fails with a
   message naming both fixes.)
 - **`cores` *or* `cpu`, never both.** They are two different CPU contracts —
   exclusive whole CPUs versus a share of the shared pool — and no coherent
@@ -61,7 +61,7 @@ lands in the hierarchy, which is what makes another task's reserved cores
 off-limits to it.
 
 `resources.cpus` is the scheduler's historical alias for `cpu` (MHz), not for
-`cores` — a `cpus: 0.5` declaration is a CPU share and is not treated as a
+`cores` — a `cpus = 0.5` declaration is a CPU share and is not treated as a
 cpuset request.
 
 ## How the node is partitioned

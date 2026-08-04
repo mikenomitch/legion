@@ -12,11 +12,11 @@ without hand-managing capacity.
 
 ## Priority bands
 
-```jsonnet
+```nickel
 {
-  name: 'api',
-  priority: 'high',   // critical | high | elevated | normal | low | background
-  tasks: [ /* ... */ ],
+  name = "api",
+  "priority" = "high",   # critical | high | elevated | normal | low | background
+  tasks = [{ name = "server", runtime = "exec", config = { command = ["./api"] } }],
 }
 ```
 
@@ -51,7 +51,7 @@ marked `critical` quietly losing every contention fight is exactly the class
 of bug a closed vocabulary exists to prevent:
 
 ```console
-$ legion job run api.jsonnet
+$ legion job run api.ncl
 error: Error parsing jobspec: unknown priority band "urgent"; expected one of
 critical, high, elevated, normal, low, background
 ```
@@ -148,14 +148,14 @@ stops victims with grace before starting the preemptor.
 
 ## Protecting a task: `disruption.minAvailable`
 
-```jsonnet
+```nickel
 {
-  name: 'web',
-  count: 6,
-  disruption: {
-    // Voluntary disruption never takes this task below the floor.
-    // Absolute count or percent of count. Default 0.
-    minAvailable: '50%',
+  name = "web",
+  count = 6,
+  disruption = {
+    # Voluntary disruption never takes this task below the floor.
+    # Absolute count or percent of count. Default 0.
+    minAvailable = "50%",
   },
 }
 ```
@@ -165,7 +165,7 @@ Two deliberate properties:
 - **It binds only voluntary disruption** — preemption today, a future
   rebalancer or scale-in policy tomorrow. Drain, node loss and `job stop`
   ignore it. A floor that can block mandatory maintenance is the documented
-  cluster-wedge (`maxUnavailable: 0` blocking a Kubernetes upgrade is so
+  cluster-wedge (`maxUnavailable = 0` blocking a Kubernetes upgrade is so
   common it grew an escape hatch); a floor that only shrinks preemption's
   options can never wedge anything — worst case the preemptor stays pending,
   which is the status quo.
@@ -173,7 +173,7 @@ Two deliberate properties:
   penalty-not-limit budget is documented as violated in practice, including by
   its own drainer, and a budget that can be outbid is not a budget.
 
-Percentages round **up**: `minAvailable: '50%'` of 5 protects 3. The floor is
+Percentages round **up**: `minAvailable = "50%"` of 5 protects 3. The floor is
 measured against the task's live allocation count, and it holds across a whole
 plan — eight placements cannot each take "one below the floor" and together
 take eight.
@@ -184,13 +184,13 @@ versus a Kubernetes PodDisruptionBudget, and it is the deliberate trade.
 
 ## Operator controls
 
-```jsonnet
+```nickel
 {
-  schedulerSettings: {
-    preemption: {
-      mode: 'enforce',          // enforce | observe | off   (default enforce)
-      disabledPools: ['gpu'],   // pools where preemption never runs
-      victimExemptAge: '60s',
+  schedulerSettings = {
+    preemption = {
+      mode = "enforce",          # enforce | observe | off   (default enforce)
+      disabledPools = ["gpu"],   # pools where preemption never runs
+      victimExemptAge = "60s",
     },
   },
 }
@@ -223,7 +223,7 @@ failure mode for a typo.
 `legion job plan` names the exact victims a submit would take:
 
 ```console
-$ legion job plan api.jsonnet
+$ legion job plan api.ncl
 Job config new; showing placements
 +---------+----------------+-----------+
 | node id | task config id | task name |
@@ -266,7 +266,7 @@ Submitting a job whose band cannot act also warns at submit time, so the
 expectation is corrected where it is formed:
 
 ```console
-$ legion job run api.jsonnet
+$ legion job run api.ncl
 Job submit success
 warning: job api is priority `high`, but preemption is off for this cluster
 (schedulerSettings.preemption.mode). The band will order the eval queue and

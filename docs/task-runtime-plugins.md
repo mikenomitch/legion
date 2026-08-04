@@ -8,16 +8,16 @@ Every task names the runtime that runs it. The runtime is the pluggable
 component responsible for starting, supervising, signalling, and reaping the
 workload:
 
-```jsonnet
-tasks: {
-  web: {
-    runtime: 'container',
-    config: { image: 'nginx:1.27' },
+```nickel
+tasks = {
+  web = {
+    runtime = "container",
+    config = { image = "nginx:1.27" },
   },
-  migrate: {
-    runtime: 'exec',
-    lifecycle: 'prestart',
-    config: { command: ['./migrate.sh'] },
+  migrate = {
+    runtime = "exec",
+    lifecycle = "prestart",
+    config = { command = ["./migrate.sh"] },
   },
 }
 ```
@@ -31,7 +31,7 @@ object is runtime-specific and is validated against that runtime's schema —
 > **Renamed from `kind`.** This field used to be called `kind`. There is no
 > alias: a jobspec that still says `kind` is rejected at submit with an error
 > naming the replacement. Editing existing jobspecs is a mechanical
-> `kind:` → `runtime:` substitution on task blocks. Health checks keep their own
+> `kind =` → `runtime =` substitution on task blocks. Health checks keep their own
 > `kind` field (`http`, `tcp`, `script`) — that is a different axis and was not
 > renamed.
 
@@ -80,14 +80,14 @@ call sites.
 Signals:
 
 - `signal(allocation, task, instance, signal)` — deliver a Unix signal by
-  name, outside the stop ladder (a workload-identity `changeMode: signal`
+  name, outside the stop ladder (a workload-identity `changeMode = "signal"`
   refresh, for instance). The **default signals the tracked pid**, which is
   correct wherever the tracked process *is* the workload. Isolating runtimes
   override it to reach inside: the `container` runtime shells out to
   `<runtime> kill` / `container kill --signal`, because its tracked pid is the
   runtime CLI supervisor and signaling that would leave the workload running
   unsignaled. Pair the override with `supports_signal() -> true`, which is
-  what admission gates `changeMode: signal` identities on.
+  what admission gates `changeMode = "signal"` identities on.
 
 
 ### Plugin ABI version (required)

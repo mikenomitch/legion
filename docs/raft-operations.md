@@ -36,21 +36,21 @@ managers loses no committed write.
 
 ## Configure a cluster
 
-See `configs/manager-raft.jsonnet` for a complete commented 3-node example.
+See `configs/manager-raft.ncl` for a complete commented 3-node example.
 Minimal shape:
 
-```jsonnet
+```nickel
 {
-  persistence: {
-    type: 'raft',
-    raft: {
-      nodeId: 'mgr-a',                  // stable unique identity
-      bootstrap: true,                  // FIRST manager only
-      advertiseAddr: '10.0.0.1:4747',   // required behind wildcard binds
-      peers: ['mgr-a=10.0.0.1:4747', 'mgr-b=10.0.0.2:4747', 'mgr-c=10.0.0.3:4747'],
-      dataDir: '.legion/raft',          // raft log + cluster secret
-      topology: 'single',               // default; 'lanes' is experimental
-      joinTokenTtlSeconds: 900,
+  persistence = {
+    type = "raft",
+    raft = {
+      nodeId = "mgr-a",                  # stable unique identity
+      bootstrap = true,                  # FIRST manager only
+      advertiseAddr = "10.0.0.1:4747",   # required behind wildcard binds
+      peers = ["mgr-a=10.0.0.1:4747", "mgr-b=10.0.0.2:4747", "mgr-c=10.0.0.3:4747"],
+      dataDir = ".legion/raft",          # raft log + cluster secret
+      topology = "single",               # default; 'lanes' is experimental
+      joinTokenTtlSeconds = 900,
     },
   },
 }
@@ -78,7 +78,7 @@ Full field-by-field reference (including `clusterSecret`, `dataDir`,
 
 ```bash
 # 1. First manager (bootstrap: true in its config)
-legion start manager -c configs/manager-raft.jsonnet
+legion start manager -c configs/manager-raft.ncl
 
 # 2. Mint a join token on it
 legion raft join-token
@@ -101,7 +101,7 @@ and rejoin automatically.
 
 ### Upgrading an existing single-manager cluster
 
-Flip `persistence.type` to `raft` (with `bootstrap: true`) on the existing
+Flip `persistence.type` to `raft` (with `bootstrap = true`) on the existing
 manager: the first raft start **adopts the existing `store.sqlite` as the
 initial replicated state** and builds a seed snapshot of it, so even late
 joiners receive the full baseline via snapshot install. See
@@ -116,7 +116,7 @@ legion raft status
 ```
 
 Reports real engine state: role, current leader, term, last log/applied
-indexes, voters/learners, and — under `topology: 'lanes'` — one line per
+indexes, voters/learners, and — under `topology = "lanes"` — one line per
 raft group. Every lane also gets a quorum line:
 
 ```
@@ -143,7 +143,7 @@ changes are idempotent.
 
 The top-level `voters` list means **settled voter on every lane**: a
 manager appears there only once every lane carries it in a uniform
-membership. Under `topology: 'lanes'` that is deliberately stricter than
+membership. Under `topology = "lanes"` that is deliberately stricter than
 any single lane's list, so the headline can never report a fault-tolerant
 cluster while one lane is still mid-join.
 
@@ -259,7 +259,7 @@ backed by the same real engine state as the CLI.
   happens when they part ways).
 - **Workers and failover:** workers dial one fixed manager. A manager that
   cannot propose a worker's write (it is a follower after a failover, or
-  does not lead the owning lane under `topology: lanes`) FORWARDS the
+  does not lead the owning lane under `topology = "lanes"`) FORWARDS the
   write to the leader over the authenticated raft transport and answers
   the worker after the forwarded write commits — failure reports, health
   reports, and volume reports keep working without the worker redialing.
@@ -308,7 +308,7 @@ lines.
 - Auto-forwarding of **client** writes from followers (today: reject +
   leader hint; the worker plane and internal lane halves forward — see
   above).
-- `topology: 'lanes'` is runnable and measured but stays opt-in;
+- `topology = "lanes"` is runnable and measured but stays opt-in;
   see `docs/multi-raft.md` ("Topology: `single` vs `lanes`").
 - `step-down` / `transfer-leader` (no leader-transfer API in openraft 0.9).
 - Raft `/metrics` series; transport mTLS (today: shared cluster secret).

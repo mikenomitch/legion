@@ -65,7 +65,7 @@ Defaults from `src/structs/config.rs` (`RaftPersistenceConfig::with_defaults`):
 | `heartbeatIntervalMs` | `250` | How often a leader sends heartbeats (append-entries) to every follower. This is the floor on how fast a dead leader can be noticed, and — because openraft reuses it as the append-entries RPC **deadline** — it also bounds how long one replication batch may take, so it is a matched pair with the entries-per-batch cap. Lower = faster failure detection, more constant traffic, less tolerance for a slow round trip. See "When to raise the election timings" below. |
 | `electionTimeoutMinMs` | `600` | Lower bound of the randomized election timeout: a follower that has heard nothing for a duration drawn from `[min, max)` campaigns to replace the leader. This is the **stability** knob — it must sit comfortably above `heartbeatIntervalMs` so a couple of merely slow or dropped heartbeats never look like a dead leader. Set it too close to the heartbeat interval and the cluster flaps: followers time out under transient load, campaign, split the vote, and the term climbs while no leader holds power long enough to commit. Config load **rejects** `electionTimeoutMinMs < 2 × heartbeatIntervalMs`. |
 | `electionTimeoutMaxMs` | `1200` | Upper bound of the randomized election timeout; must be strictly greater than `electionTimeoutMinMs` (config load rejects otherwise). The randomized *width* between min and max is what breaks up split votes, so keep a real gap. This value is **also the follower leader-lease**: a follower will not grant its vote while it still believes the current leader's lease is live. That cuts both ways — a larger maximum buys stability under load but slows every *deliberate* leadership move (lane convergence, `trigger_lane_election`) by the same proportion. Prefer widening the window over inflating it; the default keeps `max = 2 × min`. |
-| `forceNewCluster` | `false` | Explicit override to re-stamp a state DB onto a NEW cluster identity. Without it, a manager whose derived cluster id does not match the id stamped into its state DB **refuses to start** (protects against a wiped `dataDir` + `bootstrap: true` silently minting a second cluster over the old cluster's data — split-brain). |
+| `forceNewCluster` | `false` | Explicit override to re-stamp a state DB onto a NEW cluster identity. Without it, a manager whose derived cluster id does not match the id stamped into its state DB **refuses to start** (protects against a wiped `dataDir` + `bootstrap = true` silently minting a second cluster over the old cluster's data — split-brain). |
 
 The raft transport is a gRPC service (`RaftTransport`) multiplexed onto the
 manager's existing listener — there is no separate raft port.
@@ -125,7 +125,7 @@ stops all writes. Legion therefore warns (never blocks, per plan JC-29) at
 every surface where you would notice:
 
 - **Config load** — an even `expectedVoters`, or a `peers` list describing
-  an even cluster, logs the advisory once at startup; `expectedVoters: 0`
+  an even cluster, logs the advisory once at startup; `expectedVoters = 0`
   refuses to load.
 - **`legion raft status`** — every lane prints
   `voters N (quorum Q) — survives F failure(s)`, with a `⚠` + the advisory
@@ -155,24 +155,24 @@ learner, or never joined.
 
 ## Bootstrap and join: a 3-node walkthrough
 
-See `configs/manager-raft.jsonnet` for a complete commented example.
+See `configs/manager-raft.ncl` for a complete commented example.
 
 1. **Bootstrap the first manager** (`mgr-a`):
 
-   ```jsonnet
-   persistence: {
-     type: 'raft',
-     raft: {
-       nodeId: 'mgr-a',
-       bootstrap: true,
-       advertiseAddr: '10.0.0.1:4747',
-       peers: ['mgr-a=10.0.0.1:4747', 'mgr-b=10.0.0.2:4747', 'mgr-c=10.0.0.3:4747'],
+   ```nickel
+   persistence = {
+     type = "raft",
+     raft = {
+       nodeId = "mgr-a",
+       bootstrap = true,
+       advertiseAddr = "10.0.0.1:4747",
+       peers = ["mgr-a=10.0.0.1:4747", "mgr-b=10.0.0.2:4747", "mgr-c=10.0.0.3:4747"],
      },
    },
    ```
 
    ```bash
-   legion start manager -c mgr-a.jsonnet
+   legion start manager -c mgr-a.ncl
    ```
 
    It elects itself leader of a single-voter cluster. If a pre-existing
@@ -192,8 +192,8 @@ See `configs/manager-raft.jsonnet` for a complete commented example.
    secret, the current **leader's** advertise address, and an expiry.
    Treat it as a secret — the embedded secret is the credential.
 
-3. **Start `mgr-b` and `mgr-c`** with `bootstrap: false` and
-   `joinToken: 'lgnraft_...'` in their raft config. Each joiner enrolls in
+3. **Start `mgr-b` and `mgr-c`** with `bootstrap = false` and
+   `joinToken = "lgnraft_..."` in their raft config. Each joiner enrolls in
    the background: it dials the leader's `Join` RPC (retrying until the
    leader is reachable), is added as a **learner**, has its log caught up
    (by replay or snapshot install), and is promoted to **voter**. Progress
@@ -460,7 +460,7 @@ Each of these is exercised by an in-process 3-node test in
 | **Follower loss** | No client impact; the cluster commits on the remaining quorum. On return the follower catches up by log replay, or by snapshot install if the leader has compacted past its position. |
 | **Full-cluster restart** | Every node recovers from its raft log + state DB; a leader is re-elected and the cluster resumes with all committed state. A restarted member that cannot yet hear the leader (its inbound transport shares the manager listener) proceeds leaderless with a warning and catches up once serving — startup never deadlocks on the election. |
 | **Operator double-start** | The second process fails fast on the `dataDir` advisory lock. |
-| **Wiped `dataDir`, kept state DB** | Startup is refused by the cluster stamp unless `forceNewCluster: true` (deliberate re-stamp). |
+| **Wiped `dataDir`, kept state DB** | Startup is refused by the cluster stamp unless `forceNewCluster = true` (deliberate re-stamp). |
 | **Standing lane split** (`lanes` topology; different managers lead different lanes past convergence) | Nothing is lost: worker liveness and reports forward to the owning lane's leader, submits are accepted by the control leader and completed by lane reconcilers within the checker cadence, single-lane ops and reads are unaffected. Costs: scheduling latency, briefly-lagging task statuses/claims/rollouts, no `state backup`, `/readyz` 503 after ~10s as the operator signal. Exercised by `tests/raft_lanes.rs` (standing-split and forwarding tests). |
 
 ## Non-leader write redirects and forwarding

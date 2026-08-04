@@ -55,7 +55,7 @@ rsh "$LOADGEN_ADDR" "
         --system legion --count-multiplier 10 \
         --out '$REMOTE_OUT/trickle' >/dev/null
     (
-      for f in '$REMOTE_OUT'/trickle/*.jsonnet; do
+      for f in '$REMOTE_OUT'/trickle/*.ncl; do
         LEGION_ADDR='$MANAGER' legion job run \"\$f\" -j >/dev/null 2>&1 || true
         sleep 3
       done

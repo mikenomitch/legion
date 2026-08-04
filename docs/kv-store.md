@@ -78,34 +78,34 @@ Legacy `$` references are implicitly watched and required:
 ## Reactive updates (KV-driven task updates)
 
 Tasks can opt into KV-backed env and file injections with explicit
-per-reference update policies. See `configs/jobs/kv-reactive-demo.jsonnet`
-for a minimal runnable example and `configs/jobs/maximal.jsonnet` for the
+per-reference update policies. See `configs/jobs/kv-reactive-demo.ncl`
+for a minimal runnable example and `configs/jobs/maximal.ncl` for the
 full surface.
 
 ### Task spec API
 
-```jsonnet
-task: {
-  runtime: "exec",
-  // Task-level policy defaults for all injections below.
-  kv: { watch: true, onChange: "restart", onDelete: "fail" },
-  env: [
+```nickel
+task = {
+  runtime = "exec",
+  # Task-level policy defaults for all injections below.
+  kv = { watch = true, onChange = "restart", onDelete = "fail" },
+  env = [
     {
-      name: "FEATURE_FLAGS",
-      value: {
-        // Exactly one of:
-        template: '{{ kv "flags/global" }}',  // inline template
-        templateKv: "templates/feature-flags",  // KV key holding the template
+      name = "FEATURE_FLAGS",
+      value = {
+        # Exactly one of:
+        template = "{{ kv \"flags/global\" }}",  # inline template
+        templateKv = "templates/feature-flags",  # KV key holding the template
       },
-      // Optional per-entry policy override (field-by-field).
-      kv: { onChange: "rollout" },
+      # Optional per-entry policy override (field-by-field).
+      kv = { onChange = "rollout" },
     },
   ],
-  files: [
+  files = [
     {
-      path: "/etc/app/runtime.conf",
-      mode: "0640",
-      file: { template: 'tenant={{ kv "tenant/id" }}\n' },
+      path = "/etc/app/runtime.conf",
+      mode = "0640",
+      file = { template = "tenant={{ kv \"tenant/id\" }}\n" },
     },
   ],
 }
@@ -135,11 +135,11 @@ Per-reference policy fields (all optional):
 Precedence is field-by-field: an entry-level `kv` block overrides only the
 fields it sets; unset fields inherit the task-level `kv` defaults block, and
 fields unset in both places use the hard defaults above. (So an entry can,
-for example, override `onChange` while inheriting `watch: true` from the
-defaults — or set `watch: false` to opt out entirely.)
+for example, override `onChange` while inheriting `watch = true` from the
+defaults — or set `watch = false` to opt out entirely.)
 
 Event handling: a put resolves through `onChange`, a delete through
-`onDelete`. Edges with `watch: false` (the default) never act — though a put
+`onDelete`. Edges with `watch = false` (the default) never act — though a put
 still refreshes the rendered value in the stored desired config, which is
 picked up on the next natural restart/update. When one KV change matches
 several edges of a job, the strongest action wins:
@@ -159,7 +159,7 @@ Actions:
 - `fail`: mark the job failed (see below). Typically used as `onDelete`.
 
 On delete, the deleted key obviously cannot be re-rendered: entries that
-depend on it keep their last rendered value, and `onDelete: restart/rollout`
+depend on it keep their last rendered value, and `onDelete = "restart"` / `onDelete = "rollout"`
 still fires even though the rendered config is unchanged.
 
 ### Debounce / coalescing
@@ -179,11 +179,11 @@ disables debouncing and reconciles synchronously inside the KV RPC):
   action fires per job per window (the strongest across all matched edges).
 - Events are only ever coalesced, never dropped. With debouncing enabled,
   reconciliation errors are logged on the manager (there is no RPC caller to
-  surface them to); with `kvDebounceMs: 0` they surface on the KV RPC.
+  surface them to); with `kvDebounceMs = 0` they surface on the KV RPC.
 
 ### Fail semantics and recovery
 
-When the resolved action is `fail` (usually `onDelete: fail` and the key was
+When the resolved action is `fail` (usually `onDelete = "fail"` and the key was
 deleted):
 
 - The job status becomes `failed` (visible in `job list` / `job info`).
@@ -204,11 +204,11 @@ Recovery paths:
   a `restart` or `rollout` action re-renders the config, clears the
   `failed:missing_kv_dependency` stamps, flips the job status back to `done`,
   and replaces the failed allocations.
-- `onChange: none` does **not** auto-recover: a put re-renders and stores the
+- `onChange = "none"` does **not** auto-recover: a put re-renders and stores the
   desired config but schedules nothing, so the job stays `failed` with its
   stamped allocations until an explicit action.
 - A manual `job run` (resubmitting the jobspec) is the recovery path for the
-  `onChange: none` case — and works generally: it clears the failed status and
+  `onChange = "none"` case — and works generally: it clears the failed status and
   re-runs the job through the normal submit/eval flow with the latest KV state.
 
 ### Capability matrix
@@ -229,10 +229,10 @@ directory bind-mounted at `/legion/task` and nothing else of the host, so a
 rendered file's `path` must resolve under it (relative paths resolve against
 it). An out-of-range path is rejected at submit:
 
-```jsonnet
-kvInjections: { files: [
-  { path: 'config/app.toml', file: { template: 'tenant={{ kv "tenant/id" }}\n' } },
-  //  -> readable inside the container at /legion/task/config/app.toml
+```nickel
+kvInjections = { files = [
+  { path = "config/app.toml", file = { template = "tenant={{ kv \"tenant/id\" }}\n" } },
+  #  -> readable inside the container at /legion/task/config/app.toml
 ] },
 ```
 
@@ -253,15 +253,15 @@ distinct names if you need both.
 Start a manager with an in-process worker:
 
 ```sh
-cargo run -- start manager -c configs/manager.jsonnet
+cargo run -- start manager -c configs/manager.ncl
 ```
 
 Seed the watched key, then run the demo job (one exec task; watched env +
-file injection with `onChange: restart`, `onDelete: fail`):
+file injection with `onChange = "restart"`, `onDelete = "fail"`):
 
 ```sh
 cargo run -- kv put demo/banner hello
-cargo run -- job run configs/jobs/kv-reactive-demo.jsonnet
+cargo run -- job run configs/jobs/kv-reactive-demo.ncl
 cargo run -- job list -j        # job kv-reactive-demo running
 ```
 
@@ -274,7 +274,7 @@ cargo run -- ledger             # allocation id changed; task re-ran with BANNER
 cat /tmp/legion/kv-demo.conf    # banner=world
 ```
 
-Delete the key to see `onDelete: fail`:
+Delete the key to see `onDelete = "fail"`:
 
 ```sh
 cargo run -- kv delete demo/banner

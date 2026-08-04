@@ -214,30 +214,30 @@ value that manager holds.
 
 ## Configuration
 
-```jsonnet
-// configs/manager.jsonnet — every field optional; omitting the block
-// reproduces the defaults below.
-liveness: {
-  // Accumulation window for the heartbeat group commit. "0ms" (the default)
-  // is commit-while-you-can batching. A steady-state heartbeat does not
-  // commit at all, so this applies only to the checkpoint and to the
-  // mixed-version forwarding fallback.
-  batchWindow: "0ms",
+```nickel
+# configs/manager.ncl — every field optional; omitting the block
+# reproduces the defaults below.
+liveness = {
+  # Accumulation window for the heartbeat group commit. "0ms" (the default)
+  # is commit-while-you-can batching. A steady-state heartbeat does not
+  # commit at all, so this applies only to the checkpoint and to the
+  # mixed-version forwarding fallback.
+  batchWindow = "0ms",
 
-  // After acquiring status-lane leadership (or starting the process), mark
-  // nothing lost for this long.
-  failoverGrace: "60s",
+  # After acquiring status-lane leadership (or starting the process), mark
+  # nothing lost for this long.
+  failoverGrace = "60s",
 
-  // How often a manager that does NOT lead the status lane reports the nodes
-  // it heard from. ONE RPC per manager per interval, whatever the fleet size.
-  digestInterval: "1s",
+  # How often a manager that does NOT lead the status lane reports the nodes
+  # it heard from. ONE RPC per manager per interval, whatever the fleet size.
+  digestInterval = "1s",
 
-  // How long the leader keeps trusting a silent peer manager's last digest.
-  peerDigestGrace: "30s",
+  # How long the leader keeps trusting a silent peer manager's last digest.
+  peerDigestGrace = "30s",
 
-  // How often the leader replicates a display checkpoint. DISPLAY ONLY.
-  // "0s" disables checkpoints entirely.
-  checkpointInterval: "30s",
+  # How often the leader replicates a display checkpoint. DISPLAY ONLY.
+  # "0s" disables checkpoints entirely.
+  checkpointInterval = "30s",
 }
 ```
 

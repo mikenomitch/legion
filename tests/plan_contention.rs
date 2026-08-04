@@ -88,7 +88,7 @@ fn submit_job(store: &Store, name: &str) -> R<()> {
     store.handle_job_submit(
         &job,
         &[Submission {
-            path: "job.jsonnet".into(),
+            path: "job.ncl".into(),
             content: "job".into(),
             is_primary: true,
         }],

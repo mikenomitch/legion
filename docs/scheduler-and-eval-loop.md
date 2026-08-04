@@ -118,7 +118,7 @@ node epoch is unchanged since planning. A concurrent plan that touched the
 first choice costs a fallback rank instead of a whole-plan rejection.
 Coupled placements (overlapping lists, shared `distinct` keys, multi-task
 groups) keep exact all-or-nothing semantics. Defaults on
-(`schedulerSettings.plan_candidates: 8`); `0` disables it and restores
+(`schedulerSettings.plan_candidates = 8`); `0` disables it and restores
 single-node submissions. The epoch sample (lazy or eager, below) covers
 the union of every placement's candidate list, and candidate submissions
 take the same group commit as single-node ones.
@@ -137,7 +137,7 @@ mid-plan, the scheduler re-plans once with the eager whole-fleet sample
 (unconditionally safe), counted by the
 `legion_scheduler_lazy_sample_fallback_total` metric.
 
-`schedulerSettings.lazy_version_sample: false` restores the eager sample
+`schedulerSettings.lazy_version_sample = false` restores the eager sample
 on every plan. Correctness never depends on this setting — the lazy path
 falls back on its own whenever it cannot prove equivalence.
 
@@ -177,7 +177,7 @@ already covers: a plan built against it fails its compare-and-set at
 apply, so a stale read model costs a conflict, never an
 oversubscription.
 
-- `schedulerSettings.plan_apply_coalescing: false` restores one commit
+- `schedulerSettings.plan_apply_coalescing = false` restores one commit
   per plan, one status projection per plan, and one read-model refresh
   per plan. This is the only escape hatch — there is no separate switch
   for the local commit amortization or the batched status projection.
@@ -251,11 +251,11 @@ clamped to 100–60000, plus uniform jitter of up to the base).
 
 Example manager config:
 
-```jsonnet
+```nickel
 {
-  schedulerSettings: {
-    plan_conflict_max_retries: 8,
-    plan_conflict_requeue_delay_ms: 500,
+  schedulerSettings = {
+    plan_conflict_max_retries = 8,
+    plan_conflict_requeue_delay_ms = 500,
   },
 }
 ```
@@ -322,10 +322,10 @@ By default every placement scores **every** feasible node — exact
 placement, at a per-placement cost that grows with fleet size. On large
 fleets, `schedulerSettings.score_sample` bounds it:
 
-```jsonnet
+```nickel
 {
-  schedulerSettings: {
-    score_sample: { min_nodes: 1024, sample: 128 },
+  schedulerSettings = {
+    score_sample = { min_nodes = 1024, sample = 128 },
   },
 }
 ```

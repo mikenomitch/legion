@@ -32,7 +32,7 @@ surface, ranked by project impact.
 
 Public page in [`docs/`](docs/README.md) covering the surface, defaults, failure
 modes, and known limitations; proto comments for every RPC and field; every new
-job-config field in `configs/jobs/maximal.jsonnet`.
+job-config field in `configs/jobs/maximal.ncl`.
 
 **→ The full rule: the Documentation section of [AGENTS.md](AGENTS.md)**
 

@@ -601,7 +601,7 @@ fn test_job_with_volume(name: &str, count: u32) -> JobConfig {
 
 fn submission(name: &str, content: &str) -> Submission {
     Submission {
-        path: format!("{name}.jsonnet"),
+        path: format!("{name}.ncl"),
         content: content.to_string(),
         is_primary: true,
     }

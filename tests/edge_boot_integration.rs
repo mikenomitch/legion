@@ -98,7 +98,7 @@ fn submit(store: &Store) -> R<String> {
     store.handle_job_submit(
         &config,
         &[legion::structs::Submission {
-            path: "job.jsonnet".into(),
+            path: "job.ncl".into(),
             content: "{}".into(),
             is_primary: true,
         }],

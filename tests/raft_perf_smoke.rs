@@ -500,7 +500,7 @@ fn ab_job(name: &str) -> JobConfig {
 
 fn ab_submission(name: &str, content: &str) -> Submission {
     Submission {
-        path: format!("{name}.jsonnet"),
+        path: format!("{name}.ncl"),
         content: content.to_string(),
         is_primary: true,
     }

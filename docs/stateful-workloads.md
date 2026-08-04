@@ -87,38 +87,38 @@ pending -> active -> rescheduling -> active -> ... -> stopped/terminated
 
 ## Job Spec Reference
 
-```jsonnet
+```nickel
 {
-  name: 'db',
-  tasks: [{
-    name: 'replica',
-    runtime: 'exec',
-    count: 3,                    // slot cardinality: slots 0, 1, 2
-    stateful: {
-      mode: 'slot',              // 'slot' (default) | 'keyed'
-      // idSource: 'caller',     // keyed only: 'caller' | 'uuid'
-      // initialInstances: ['user-1', 'user-2'],  // keyed only: seed list
-      onLost: {                  // optional; node-loss fencing policy — see
-                                 // "Node loss and fencing (at-most-one)"
-        selfTerminateAfter: '90s', // worker kills this task after losing
-                                   // manager contact this long (default 90s)
-        replaceAfter: '3m',        // manager replaces a lost-node allocation
-                                   // only after this long; default 2x
-                                   // selfTerminateAfter; must be greater than
-                                   // selfTerminateAfter; 'never' = wait for
-                                   // node recovery or operator override
+  name = "db",
+  tasks = [{
+    name = "replica",
+    runtime = "exec",
+    count = 3,                    # slot cardinality: slots 0, 1, 2
+    stateful = {
+      mode = "slot",              # 'slot' (default) | 'keyed'
+      # idSource = "caller",     # keyed only: "caller" | "uuid"
+      # initialInstances = ["user-1", "user-2"],  # keyed only: seed list
+      onLost = {                  # optional; node-loss fencing policy — see
+                                 # "Node loss and fencing (at-most-one)"
+        selfTerminateAfter = "90s", # worker kills this task after losing
+                                   # manager contact this long (default 90s)
+        replaceAfter = "3m",        # manager replaces a lost-node allocation
+                                   # only after this long; default 2x
+                                   # selfTerminateAfter; must be greater than
+                                   # selfTerminateAfter; "never" = wait for
+                                   # node recovery or operator override
       },
-      storage: {                 // optional persistent storage (docs/volumes.md)
-        path: '/var/lib/db',     // container: bind destination; exec:
-                                 // informational (read $LEGION_STORAGE_DIR)
-        driver: 'local-dir',     // volume driver; default 'local-dir'
-        params: { size: '10G' }, // passed to the plugin verbatim
-        retainOnScaleIn: true,   // default true (K8s whenScaled: Retain)
-        retainOnStop: true,      // default true (K8s whenDeleted: Retain);
-                                 // slot mode only — see retention section
+      storage = {                 # optional persistent storage (docs/volumes.md)
+        path = "/var/lib/db",     # container: bind destination; exec:
+                                 # informational (read $LEGION_STORAGE_DIR)
+        driver = "local-dir",     # volume driver; default 'local-dir'
+        params = { size = "10G" }, # passed to the plugin verbatim
+        retainOnScaleIn = true,   # default true (K8s whenScaled: Retain)
+        retainOnStop = true,      # default true (K8s whenDeleted: Retain);
+                                 # slot mode only — see retention section
       },
     },
-    config: { command: ['run-db'] },
+    config = { command = ["run-db"] },
   }],
 }
 ```
@@ -295,17 +295,17 @@ exists). Prefer not deploying stateful jobs while nodes are lost, or size
 ### Defaults, tuning, and `'never'`
 
 Every stateful task gets the policy — an absent `onLost` block means
-`selfTerminateAfter: '90s'`, `replaceAfter: '180s'`. **Safe by default
+`selfTerminateAfter = "90s"`, `replaceAfter = "180s"`. **Safe by default
 means stateful failover is deliberately slower than stateless failover**: a
 replica on a lost node waits out the confirmation window (~3 minutes by
 default) where a stateless task moves in seconds. For workloads where fast
 failover matters more than a long partition grace (and whose checks/restarts
-tolerate it), tune the *worker* side down — e.g. `selfTerminateAfter: '15s'`
+tolerate it), tune the *worker* side down — e.g. `selfTerminateAfter = "15s"`
 lets `replaceAfter` default to 30s. The worker pays for that with less
 tolerance of manager downtime: any manager outage longer than the window
 kills the task locally (it is rescheduled when the manager returns).
 
-`replaceAfter: 'never'` is the K8s StatefulSet behavior: the manager never
+`replaceAfter = "never"` is the K8s StatefulSet behavior: the manager never
 auto-replaces the allocation. Recovery requires the node coming back (the
 allocation simply keeps running; `lost_at` clears) or an operator override.
 
@@ -381,16 +381,16 @@ which replicas restart. Two rollout options make config updates
 ordinal-aware (`rollout.slots`, also scopeable per group via
 `rolloutByGroup.<group>.slots` like every other rollout option):
 
-```jsonnet
-rollout: {
-  slots: {
-    order: 'sequential',   // 'parallel' (default, today's behavior) | 'sequential'
-    updateFrom: 2,         // optional staged floor; requires order: 'sequential'
+```nickel
+rollout = {
+  slots = {
+    order = "sequential",   # 'parallel' (default, today's behavior) | 'sequential'
+    updateFrom = 2,         # optional staged floor; requires order = "sequential"
   },
 }
 ```
 
-### `order: 'sequential'` — one slot at a time, highest first
+### `order = "sequential"` — one slot at a time, highest first
 
 A sequential rollout replaces allocations **one slot per step, highest
 ordinal first** (`count-1 → 0`), and each step is gated on the previous
@@ -419,18 +419,18 @@ conventional leader at slot 0.
   combined with the step modes (`percentEachStep`, `countEachStep`,
   `percentSteps`, `countSteps`) in the same scope. A per-group `slots`
   override replaces a global step mode (and vice versa), mirroring how step
-  mode overrides already work. `progression: manual` composes fine: each
+  mode overrides already work. `progression = "manual"` composes fine: each
   manual advance releases one slot.
 
 **Initial bring-up is not yet gated.** A fresh job's slots place in
 ascending order (0 → N-1) by construction, but in a single eval without
 per-slot health gating — the K8s `OrderedReady` *bring-up* analog is a
-follow-up. `order: 'sequential'` governs config updates (and staged
+follow-up. `order = "sequential"` governs config updates (and staged
 promotions) today.
 
 ### `updateFrom` — staged ("partitioned") rollouts
 
-`updateFrom: N` stages the rollout: **only slots `>= N` are updated to the
+`updateFrom = N` stages the rollout: **only slots `>= N` are updated to the
 new config; slots `0..N` keep running their current allocations untouched**
 — including across later reschedules (the scheduler knows staged slots are
 deliberately occupied by the older config and will not double-place them).
@@ -456,14 +456,14 @@ errors):
 - `rollout.slots` (both `order` and `updateFrom`) is only valid for groups
   whose stateful task is **slot mode** — stateless and keyed groups are
   rejected, with a pointer at `rolloutByGroup` scoping for mixed jobs.
-- `updateFrom` requires `order: 'sequential'`. (K8s `partition` exists only
+- `updateFrom` requires `order = "sequential"`. (K8s `partition` exists only
   inside ordered rolling updates; "update slots >= N" has no coherent
   meaning unless slots are replaced by ordinal.)
 - `updateFrom` must be `< count.num`. K8s permits `partition >= replicas`
   to mean "update nothing", but a rollout that completes instantly while
   silently pinning every slot to the old config is almost always a typo in
   Legion — omit the field to update everything, or lower it to stage.
-- `updateFrom: 0` is valid and identical to omitting the field.
+- `updateFrom = 0` is valid and identical to omitting the field.
 - Negative or non-numeric values and unknown `order` values are rejected at
   parse time.
 
@@ -471,9 +471,9 @@ errors):
 
 | K8s StatefulSet | Legion |
 | --- | --- |
-| `podManagementPolicy: OrderedReady` (update order) | `rollout.slots.order: 'sequential'` |
+| `podManagementPolicy: OrderedReady` (update order) | `rollout.slots.order = "sequential"` |
 | `updateStrategy.rollingUpdate.partition` | `rollout.slots.updateFrom` |
-| `podManagementPolicy: Parallel` | `order: 'parallel'` (the default) |
+| `podManagementPolicy: Parallel` | `order = "parallel"` (the default) |
 | OrderedReady bring-up gating | not yet (slots place 0→N-1 but ungated) |
 
 ## Keyed Mode: the Management API
@@ -597,7 +597,7 @@ legion instance get user-42 -j                      # state: "active" again
 
 # A job stop is a bulk pause for keyed instances:
 legion job stop sandbox-demo                         # keyed -> stopped (handles kept)
-legion job run configs/jobs/sandbox-demo.jsonnet     # job revived...
+legion job run configs/jobs/sandbox-demo.ncl     # job revived...
 legion instance list sandbox-demo -j                 # ...but instances still "stopped"
 legion instance start user-42                        # each one revived explicitly
 ```
@@ -640,7 +640,7 @@ Stopping the whole job (`job stop`) is **not** a destroy: keyed instances are
 moved to `stopped` (not `terminated`) with their storage handles **retained**,
 so `job run` + `instance start` revives them with their data. Slot instances
 become `terminated` with handles retained too (unless the task sets
-`retainOnStop: false`, see [Scale-In / Scale-Out
+`retainOnStop = false`, see [Scale-In / Scale-Out
 Retention](#scale-in--scale-out-retention)), so a later `job run`
 re-materializes the same ordinal identities. Only `instance destroy` / `job
 destroy` drops keyed handles.
@@ -658,15 +658,15 @@ config.
 
 - **Scale-in** (`count` 3 → 2): slot 2's instance is marked `terminated` but
   the **row is retained**, and its storage handle is kept by default
-  (`retainOnScaleIn: true`). With `retainOnScaleIn: false` the handle is
+  (`retainOnScaleIn = true`). With `retainOnScaleIn = false` the handle is
   dropped on scale-in (reclamation itself is a driver concern, see below).
 - **Scale-out** (2 → 3): slot 2 is re-materialized with the **same instance
   id**, and a retained storage handle is reattached. If no handle was retained
   a fresh one is minted.
 - **Job stop**: rows are retained for all instances. Slot instances become
   `terminated`, so a later `job run` re-materializes the same identities;
-  their handles are retained by default (`retainOnStop: true`) so the re-run
-  reattaches the same data, while `retainOnStop: false` drops the handles on
+  their handles are retained by default (`retainOnStop = true`) so the re-run
+  reattaches the same data, while `retainOnStop = false` drops the handles on
   stop and the revived slots mint fresh ones — identity comes back, the data
   binding doesn't. Keyed instances become `stopped` (handles retained,
   always), so `job run` + `legion instance start <id>` revives each one with
@@ -685,8 +685,8 @@ The two knobs are the slot-mode analog of a StatefulSet's
 
 | K8s | Legion |
 | --- | --- |
-| `whenScaled: Retain/Delete` | `retainOnScaleIn: true/false` |
-| `whenDeleted: Retain/Delete` | `retainOnStop: true/false` (`job stop`; `job destroy` always deletes) |
+| `whenScaled: Retain/Delete` | `retainOnScaleIn = true/false` |
+| `whenDeleted: Retain/Delete` | `retainOnStop = true/false` (`job stop`; `job destroy` always deletes) |
 
 `whenDeleted` maps to `job stop` — not `job destroy` — because stopping is
 Legion's analog of deleting a StatefulSet (the spec lingers, identities can
@@ -715,7 +715,7 @@ Every task runtime consumes the same machinery — there is no runtime-private
 storage. What differs is the *shape* a runtime takes
 ([`volume_mode`](volumes.md#filesystem-mode-vs-block-mode)): `exec` and
 `container` consume a host directory, while the
-[`sandbox` runtime](task-runtime-sandbox.md) declares `mode: 'block'` and is handed
+[`sandbox` runtime](task-runtime-sandbox.md) declares `mode = "block"` and is handed
 a formatted disk image its microVM attaches as a virtio-blk device. Either
 way, single-writer safety is the invariant above: a filesystem (or a
 filesystem image) tolerates exactly one writer, and "at most one live
@@ -736,13 +736,13 @@ Start a manager, join a worker, and run the demo job:
 
 ```bash
 # Terminal 1: manager
-cargo run -- start manager -c configs/manager.jsonnet
+cargo run -- start manager -c configs/manager.ncl
 
 # Terminal 2: worker (use the join token printed by the manager)
 cargo run -- join <TOKEN>
 
 # Terminal 3: run the slot-mode demo (count 3, stateful storage)
-cargo run -- job run configs/jobs/stateful-demo.jsonnet
+cargo run -- job run configs/jobs/stateful-demo.ncl
 cargo run -- job list -j
 ```
 
@@ -775,7 +775,7 @@ With the same manager + worker running:
 
 ```bash
 # Submitting the keyed demo places ZERO allocations (count is not in charge)
-cargo run -- job run configs/jobs/sandbox-demo.jsonnet
+cargo run -- job run configs/jobs/sandbox-demo.ncl
 cargo run -- instance list sandbox-demo        # empty
 
 # Create two sandboxes: one explicit key, one server-minted

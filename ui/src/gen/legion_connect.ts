@@ -248,8 +248,9 @@ export const Manager = {
     /**
      * Creates the next immutable version of a named job template.
      *
-     * The source must evaluate to an object with an optional `description`,
-     * an optional `variables` list, and a hidden `job(vars)::` function that
+     * The source must evaluate to a record with an optional `description`,
+     * an optional `variables` list, and a
+     * `job | not_exported = fun vars => ...` function that
      * returns the jobspec. Invalid manifests are rejected here, not at run
      * time. When every declared variable has a default, the manager also
      * trial-renders the template and validates the resulting jobspec.

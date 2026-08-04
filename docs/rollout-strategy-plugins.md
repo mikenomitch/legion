@@ -16,17 +16,17 @@ The strategy receives `(group, desired_count, RolloutConfig)` and returns an eff
 `plugins/rollouts/slow_start/src/lib.rs` provides an example plugin:
 
 - name: `slow_start`
-- behavior: if no step mode is configured, injects `percentSteps: [5, 20, 50, 100]`
+- behavior: if no step mode is configured, injects `percentSteps = [5, 20, 50, 100]`
 - keeps all other rollout settings unchanged
 
 ## Example jobspec
 
-`configs/jobs/rollout-plugin-slow-start.jsonnet` demonstrates usage:
+`configs/jobs/rollout-plugin-slow-start.ncl` demonstrates usage:
 
-```jsonnet
-rollout: {
-  strategy: "slow_start",
-  replacement: "createFirst",
+```nickel
+rollout = {
+  strategy = "slow_start",
+  replacement = "createFirst",
 }
 ```
 

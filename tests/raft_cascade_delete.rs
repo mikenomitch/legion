@@ -75,7 +75,7 @@ fn cascade_reliant_deletes_survive_raft_apply() -> R<()> {
     let outcome = store.handle_job_submit(
         &job,
         &[Submission {
-            path: "cascade-job.jsonnet".into(),
+            path: "cascade-job.ncl".into(),
             content: "job cascade-job".into(),
             is_primary: true,
         }],

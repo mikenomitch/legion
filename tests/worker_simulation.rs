@@ -160,7 +160,7 @@ async fn simulated_fleet_registers_schedules_and_acks() -> R<()> {
         version: None,
     };
     let submission = Submission {
-        path: "sim-it.jsonnet".into(),
+        path: "sim-it.ncl".into(),
         content: "{}".into(),
         is_primary: true,
     };

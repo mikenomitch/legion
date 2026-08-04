@@ -68,7 +68,7 @@ fn run_request(jobspec: String, name: &str) -> RunJobRequest {
     RunJobRequest {
         parsed_jobspec: jobspec,
         submissions: vec![Submission {
-            path: format!("{name}.jsonnet"),
+            path: format!("{name}.ncl"),
             content: name.to_string(),
             is_primary: true,
         }],

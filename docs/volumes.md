@@ -11,17 +11,17 @@ when the replica goes away.
 
 ## The short version
 
-```jsonnet
+```nickel
 {
-  name: 'db',
-  tasks: [{
-    name: 'postgres',
-    runtime: 'exec',
-    count: 3,
-    stateful: {
-      storage: { path: '/var/lib/postgresql/data' },   // that's it
+  name = "db",
+  tasks = [{
+    name = "postgres",
+    runtime = "exec",
+    count = 3,
+    stateful = {
+      storage = { path = "/var/lib/postgresql/data" },   # that's it
     },
-    config: { command: ['postgres', '-D', '$LEGION_STORAGE_DIR'] },
+    config = { command = ["postgres", "-D", "$LEGION_STORAGE_DIR"] },
   }],
 }
 ```
@@ -55,7 +55,7 @@ confirms the storage is gone.
 
 Two declaration sites, because they are two different lifecycles:
 
-| | `stateful.storage` | `volumes: [...]` |
+| | `stateful.storage` | `volumes = [...]` |
 | --- | --- | --- |
 | One per | instance (replica) | task |
 | Provisioned | on first placement | never — it already exists |
@@ -68,17 +68,17 @@ replica, provisioned automatically. `volumes[]` is a claim on storage that
 already exists — a models directory, an NFS export, a scratch tmpfs — and works
 on any task, stateful or not.
 
-```jsonnet
-tasks: [{
-  name: 'inference',
-  runtime: 'container',
-  count: 8,
-  // Stateless. Still mounts a volume.
-  volumes: [
-    { name: 'models', driver: 'host', params: { name: 'models' },
-      path: '/models', readOnly: true },
+```nickel
+tasks = [{
+  name = "inference",
+  runtime = "container",
+  count = 8,
+  # Stateless. Still mounts a volume.
+  volumes = [
+    { name = "models", driver = "host", params = { name = "models" },
+      path = "/models", readOnly = true },
   ],
-  config: { image: 'ghcr.io/acme/inference:1.2', command: ['serve'] },
+  config = { image = "ghcr.io/acme/inference:1.2", command = ["serve"] },
 }]
 ```
 
@@ -118,14 +118,14 @@ Every volume is handed over one of two ways, declared with `mode`:
 
 This is the same split Kubernetes makes with `volumeMode`, for the same reason.
 
-```jsonnet
-stateful: {
-  mode: 'keyed',
-  storage: {
-    path: '/workspace',        // where the TASK sees it (the guest path)
-    driver: 'local-dir',
-    mode: 'block',
-    params: { size: '4G', fs: 'ext4' },
+```nickel
+stateful = {
+  mode = "keyed",
+  storage = {
+    path = "/workspace",        # where the TASK sees it (the guest path)
+    driver = "local-dir",
+    mode = "block",
+    params = { size = "4G", fs = "ext4" },
   },
 },
 ```
@@ -147,7 +147,7 @@ volumes are devices a guest attaches
 **The driver formats, never the guest.** A block volume is created and
 formatted with `params.fs` (default `ext4`) on its first mount, so `mkfs` never
 runs inside an untrusted guest and "is this volume fresh?" is a driver-side
-fact rather than a guess. `mount` returns `fresh: true` exactly once — on the
+fact rather than a guess. `mount` returns `fresh = true` exactly once — on the
 call that created the storage — which is the signal to run first-boot
 initialization. **A remount never reformats**; the conformance suite has a
 dedicated check for that, because getting it wrong silently destroys the volume
@@ -174,13 +174,13 @@ Every volume is exported as `LEGION_VOLUME_<NAME>` (name upper-cased,
 non-alphanumerics folded to `_`). The instance volume from `stateful.storage` is
 additionally exported as **`LEGION_STORAGE_DIR`**, which is what the guides use:
 
-```jsonnet
-// exec — read the env var
-config: { command: ['redis-server', '--dir', '$LEGION_STORAGE_DIR'] }
+```nickel
+# exec — read the env var
+config = { command = ["redis-server", "--dir", "$LEGION_STORAGE_DIR"] }
 
-// container — the path is real
-stateful: { mode: 'slot', storage: { path: '/var/lib/postgresql/data' } }
-config: { image: 'postgres:16', env: { PGDATA: '/var/lib/postgresql/data' } }
+# container — the path is real
+stateful = { mode = "slot", storage = { path = "/var/lib/postgresql/data" } }
+config = { image = "postgres:16", env = { PGDATA = "/var/lib/postgresql/data" } }
 ```
 
 ## Built-in drivers
@@ -192,10 +192,10 @@ cluster actually has, including anything installed out of tree.
 
 A directory under the worker's state dir, created on first mount, removed on
 destroy. Node-local. Zero configuration — this is what a bare
-`storage: { path: … }` uses.
+`storage = { path = … }` uses.
 
-```jsonnet
-storage: { path: '/var/lib/db', params: { size: '10G', mode: '0700' } }
+```nickel
+storage = { path = "/var/lib/db", params = { size = "10G", mode = "0700" } }
 ```
 
 `size` is **not a quota** in filesystem mode — a directory has no enforcement,
@@ -218,29 +218,29 @@ Claims a path the operator declared in the worker config. No provisioning, and
 `destroy` is deliberately a **no-op**: the data belongs to the operator, so a
 scaled-in job must never delete `/mnt/models`.
 
-```jsonnet
-// worker config (configs/workers/<type>.jsonnet)
+```nickel
+# worker config (configs/workers/<type>.ncl)
 {
-  workerType: 'default',
-  hostVolumes: {
-    models: { path: '/mnt/models', readOnly: true },
-    pgdata: { path: '/mnt/nvme0/pg', create: true },
+  workerType = "default",
+  hostVolumes = {
+    models = { path = "/mnt/models", readOnly = true },
+    pgdata = { path = "/mnt/nvme0/pg", create = true },
   },
 }
 ```
 
-```jsonnet
-// jobspec
-volumes: [{ name: 'models', driver: 'host', params: { name: 'models' },
-            path: '/models', readOnly: true }],
+```nickel
+# jobspec
+volumes = [{ name = "models", driver = "host", params = { name = "models" },
+            path = "/models", readOnly = true }],
 ```
 
 For block mode, declare a `device` instead of a `path` — the bare-metal escape
 hatch for handing a dedicated disk to a guest:
 
-```jsonnet
-hostVolumes: {
-  scratch: { device: '/dev/mapper/legion-scratch', fs: 'ext4' },
+```nickel
+hostVolumes = {
+  scratch = { device = "/dev/mapper/legion-scratch", fs = "ext4" },
 }
 ```
 
@@ -261,11 +261,11 @@ Mounts an NFS export and hands out a per-volume subdirectory inside it. The one
 built-in that is **not** node-local, so instances holding an `nfs` volume
 reschedule anywhere that can reach the server.
 
-```jsonnet
-storage: {
-  path: '/var/lib/db',
-  driver: 'nfs',
-  params: { server: '10.0.0.5', export: '/exports/legion', options: 'vers=4,hard' },
+```nickel
+storage = {
+  path = "/var/lib/db",
+  driver = "nfs",
+  params = { server = "10.0.0.5", export = "/exports/legion", options = "vers=4,hard" },
 }
 ```
 
@@ -285,9 +285,9 @@ RAM-backed scratch, sized by `size`, wiped on unmount. **Linux only** — macOS
 has no tmpfs, and quietly substituting a disk-backed directory would turn "this
 is in RAM and capped at 512M" into a lie.
 
-```jsonnet
-volumes: [{ name: 'scratch', driver: 'tmpfs', params: { size: '2G' },
-            path: '/scratch' }],
+```nickel
+volumes = [{ name = "scratch", driver = "tmpfs", params = { size = "2G" },
+            path = "/scratch" }],
 ```
 
 `tmpfs` advertises itself as **ephemeral**, and admission rejects it for
@@ -318,7 +318,7 @@ instance ──────────────────────> pen
 - **Reclaim is reconciled, not triggered.** A background loop marks any volume
   that no instance references as `destroying`. One rule covers every way a
   handle can be dropped (keyed destroy, scale-in without `retainOnScaleIn`,
-  `retainOnStop: false` on job stop, a job destroy that cascades instance rows
+  `retainOnStop = false` on job stop, a job destroy that cascades instance rows
   away), so no code path can forget to free storage.
 - **Destroy is two-phase.** The manager marks `destroying` and re-sends the
   request to the owning worker on every heartbeat until a driver confirms. A
@@ -415,23 +415,23 @@ next to the workflow rather than hidden in a limitations section.
 
 ### A database with zero storage decisions
 
-```jsonnet
-stateful: { storage: { path: '/var/lib/postgresql/data' } },
+```nickel
+stateful = { storage = { path = "/var/lib/postgresql/data" } },
 ```
 
-Every field has a default: `mode: 'slot'`, `driver: 'local-dir'`,
-`volume_mode: 'filesystem'`, retention on. One replica, one volume, data
+Every field has a default: `mode = "slot"`, `driver = "local-dir"`,
+`volume_mode = "filesystem"`, retention on. One replica, one volume, data
 survives restarts and reschedules to the same node. This is the dev-cluster
 and single-node-production shape; the [Postgres guide](guides/postgres.md)
 builds on it.
 
 ### Remote volume: lose the node, replace the instance, reattach
 
-```jsonnet
-stateful: {
-  storage: { path: '/data', driver: 'nfs',
-             params: { server: '10.0.0.5', export: '/exports/pg' } },
-  onLost: { selfTerminateAfter: '90s', replaceAfter: '3m' },
+```nickel
+stateful = {
+  storage = { path = "/data", driver = "nfs",
+             params = { server = "10.0.0.5", export = "/exports/pg" } },
+  onLost = { selfTerminateAfter = "90s", replaceAfter = "3m" },
 },
 ```
 
@@ -443,7 +443,7 @@ subdir defaults to the volume id. No operator action; total downtime ≈
 `replaceAfter` + application recovery. Step-by-step narration:
 [the Postgres guide](guides/postgres.md#what-node-loss-looks-like-on-nfs-step-by-step).
 
-Prefer a human in the loop? `replaceAfter: 'never'` parks the instance until
+Prefer a human in the loop? `replaceAfter = "never"` parks the instance until
 someone runs `legion instance replace <id>`. Same reattach, manual trigger.
 
 ### Node-local volume: lose the node, wait for it
@@ -473,13 +473,13 @@ live mount — so a mistyped id cannot reclaim a running database's disk.
 
 Worker config names the disks; the job claims one by name:
 
-```jsonc
-// worker config
-"hostVolumes": { "nvme0": { "path": "/mnt/nvme0" } }
+```nickel
+# worker config
+"hostVolumes" = { "nvme0" = { "path" = "/mnt/nvme0" } }
 ```
 
-```jsonnet
-stateful: { storage: { path: '/data', driver: 'host', params: { name: 'nvme0' } } },
+```nickel
+stateful = { storage = { path = "/data", driver = "host", params = { name = "nvme0" } } },
 ```
 
 `host` is node-local, so this pins like `local-dir` — the right behavior for
@@ -488,21 +488,21 @@ same disk as a raw block device.
 
 ### Shared read-only model / artifact cache
 
-```jsonnet
-volumes: [{ name: 'models', driver: 'nfs', path: '/models', read_only: true,
-            params: { server: '10.0.0.5', export: '/exports/models' } }],
+```nickel
+volumes = [{ name = "models", driver = "nfs", path = "/models", read_only = true,
+            params = { server = "10.0.0.5", export = "/exports/models" } }],
 ```
 
 A `volumes` claim (not `stateful.storage`) is shared per task: every replica on
 every node mounts the same export, read-only, with no instance identity and no
-pin. Scale the fleet freely; the cache is just there. With `driver: 'host'`
+pin. Scale the fleet freely; the cache is just there. With `driver = "host"`
 this becomes "every node has the dataset pre-synced at a named path."
 
 ### Scratch space
 
-```jsonnet
-volumes: [{ name: 'scratch', driver: 'tmpfs', path: '/scratch',
-            params: { size: '1G' } }],
+```nickel
+volumes = [{ name = "scratch", driver = "tmpfs", path = "/scratch",
+            params = { size = "1G" } }],
 ```
 
 `tmpfs` is RAM-backed, wiped on unmount, Linux-only, and refuses to back
@@ -512,8 +512,8 @@ all.
 
 ### A sandbox (or tenant) per key, with pause and resume
 
-```jsonnet
-stateful: { mode: 'keyed', storage: { path: '/home/user' } },
+```nickel
+stateful = { mode = "keyed", storage = { path = "/home/user" } },
 ```
 
 ```bash
@@ -530,15 +530,15 @@ worker's driver confirms.
 
 ### Ordered rollout of a quorum system
 
-```jsonnet
-rollout: { slots: { order: 'sequential' } },
+```nickel
+rollout = { slots = { order = "sequential" } },
 ```
 
 Updates replace **allocations**, never instances, so slot N's replacement
 re-mounts slot N's existing volume — a rollout cannot touch data. `sequential`
 updates one slot at a time, highest ordinal first, each step health-gated
 (the StatefulSet `OrderedReady` analog). For a staged canary, add
-`updateFrom: 2`: slots ≥ 2 get the new config, slots 0–1 keep running the old
+`updateFrom = 2`: slots ≥ 2 get the new config, slots 0–1 keep running the old
 one until you lower the floor.
 
 ### Scale in without losing data, scale back out and reattach
@@ -549,7 +549,7 @@ one until you lower the floor.
 legion volume list --job db   # the retained rows are visible the whole time
 ```
 
-Set `retainOnScaleIn: false` to trade reattach-on-scale-out for automatic
+Set `retainOnScaleIn = false` to trade reattach-on-scale-out for automatic
 reclaim. Either way the behavior is declared in the spec, not decided in an
 incident.
 
@@ -564,9 +564,9 @@ volume (workload stopped), let the instance mint under the new driver, restore.
 
 ### A block device for a VM or sandbox runtime
 
-```jsonnet
-stateful: { storage: { path: '/workspace', driver: 'local-dir', mode: 'block',
-                       params: { size: '10G', fs: 'ext4' } } },
+```nickel
+stateful = { storage = { path = "/workspace", driver = "local-dir", mode = "block",
+                       params = { size = "10G", fs = "ext4" } } },
 ```
 
 The driver creates and formats a disk image and hands the task a device path
@@ -574,7 +574,7 @@ instead of a mount path — the shape microVM runtimes want to attach as a
 virtio disk. This is exactly how the [`sandbox` runtime](task-runtime-sandbox.md)
 persists a workspace: the device becomes `/dev/vdb` in the guest and the
 generated init mounts it at `path`. Filesystem tasks and block volumes are
-cross-checked at admission (a plain container asking for `mode: 'block'` is
+cross-checked at admission (a plain container asking for `mode = "block"` is
 rejected with the reason).
 
 ## Writing a volume driver
@@ -615,31 +615,31 @@ Settling its name now is what keeps that work from forcing an ABI break.
 
 ### The request
 
-```jsonc
-// stdin for: zfs mount
+```nickel
+# stdin for: zfs mount
 {
-  "apiVersion": 1,
-  "op": "mount",
-  "volume": {
-    "id": "vol-9f2c…",
-    "name": "data",
-    "driver": "zfs",
-    "attrs": { "dataset": "tank/legion/vol-9f2c" },  // what you recorded last time
-    "readOnly": false
+  "apiVersion" = 1,
+  "op" = "mount",
+  "volume" = {
+    "id" = "vol-9f2c…",
+    "name" = "data",
+    "driver" = "zfs",
+    "attrs" = { "dataset" = "tank/legion/vol-9f2c" },  # what you recorded last time
+    "readOnly" = false
   },
-  "params": { "size": "10G" },                        // straight from the jobspec
-  "instance": { "id": "db-default-2", "job": "db", "group": "default",
-                "mode": "slot", "slot": 2 },
-  "allocId": 8841,
-  "node": { "id": "node-a1", "dataDir": "/var/lib/legion",
-            "volumeDir": "/var/lib/legion/volumes" }
+  "params" = { "size" = "10G" },                        # straight from the jobspec
+  "instance" = { "id" = "db-default-2", "job" = "db", "group" = "default",
+                "mode" = "slot", "slot" = 2 },
+  "allocId" = 8841,
+  "node" = { "id" = "node-a1", "dataDir" = "/var/lib/legion",
+            "volumeDir" = "/var/lib/legion/volumes" }
 }
 ```
 
-```jsonc
-// stdout
-{ "apiVersion": 1, "mountPath": "/tank/legion/vol-9f2c",
-  "attrs": { "dataset": "tank/legion/vol-9f2c" } }
+```nickel
+# stdout
+{ "apiVersion" = 1, "mountPath" = "/tank/legion/vol-9f2c",
+  "attrs" = { "dataset" = "tank/legion/vol-9f2c" } }
 ```
 
 `attrs` is yours: whatever you return is persisted on the volume row and handed
@@ -710,7 +710,7 @@ manager restart.
   other than single-writer is rejected for instance storage. Several tasks *can*
   share a `host` volume read-only, since it has no per-instance lifecycle.
 - **Multiple volumes per instance.** `stateful.storage` is one volume. The
-  schema is keyed by `(instance, name)`, so `stateful.volumes: [...]` is a purely
+  schema is keyed by `(instance, name)`, so `stateful.volumes = [...]` is a purely
   additive change when it is needed.
 - **Snapshots, clones, expansion.** Named in the contract and reserved in
   `capabilities.ops`, but no built-in implements them yet.

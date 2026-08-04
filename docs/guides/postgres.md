@@ -5,12 +5,12 @@ writer, it will corrupt itself if two processes open one data directory, and
 losing its disk means losing the product. This guide runs one on Legion and
 then walks through what happens when things go wrong.
 
-Runnable spec: [`configs/jobs/postgres.jsonnet`](../../configs/jobs/postgres.jsonnet).
+Runnable spec: [`configs/jobs/postgres.ncl`](../../configs/jobs/postgres.ncl).
 
 ## Run it
 
 ```bash
-legion job run configs/jobs/postgres.jsonnet
+legion job run configs/jobs/postgres.ncl
 legion job list
 legion volume list --job postgres
 ```
@@ -32,43 +32,43 @@ psql "postgres://postgres:legion-demo@10.0.0.4:29315/legion"
 
 ## The spec, and why each part is there
 
-```jsonnet
+```nickel
 {
-  name: 'postgres',
-  tasks: [{
-    name: 'postgres',
-    runtime: 'container',
-    count: 1,
-    group: 'db',
+  name = "postgres",
+  tasks = [{
+    name = "postgres",
+    runtime = "container",
+    count = 1,
+    group = "db",
 
-    stateful: {
-      mode: 'slot',
-      storage: {
-        path: '/var/lib/postgresql/data',
-        driver: 'local-dir',
-        params: { size: '20G' },
-        retainOnScaleIn: true,
-        retainOnStop: true,
+    stateful = {
+      mode = "slot",
+      storage = {
+        path = "/var/lib/postgresql/data",
+        driver = "local-dir",
+        params = { size = "20G" },
+        retainOnScaleIn = true,
+        retainOnStop = true,
       },
-      onLost: { selfTerminateAfter: '90s', replaceAfter: '3m' },
+      onLost = { selfTerminateAfter = "90s", replaceAfter = "3m" },
     },
 
-    config: {
-      image: 'postgres:16-alpine',
-      command: ['postgres'],
-      env: {
-        PGDATA: '/var/lib/postgresql/data/pgdata',
-        POSTGRES_PASSWORD: 'legion-demo',
-        POSTGRES_DB: 'legion',
+    config = {
+      image = "postgres:16-alpine",
+      command = ["postgres"],
+      env = {
+        PGDATA = "/var/lib/postgresql/data/pgdata",
+        POSTGRES_PASSWORD = "legion-demo",
+        POSTGRES_DB = "legion",
       },
     },
-    network: { mode: 'auto', ports: [{ name: 'pg', to: 5432 }] },
-    service: { name: 'postgres', port: 'pg' },
+    network = { mode = "auto", ports = [{ name = "pg", to = 5432 }] },
+    service = { name = "postgres", port = "pg" },
   }],
 }
 ```
 
-**`stateful.mode: 'slot'`** gives the task a stable instance whose id and
+**`stateful.mode = "slot"`** gives the task a stable instance whose id and
 storage survive reschedules. It also buys the guarantee Postgres actually needs:
 at most one live allocation per instance, *including across a network
 partition*. A missed heartbeat is not proof a node is dead, so Legion waits out
@@ -76,7 +76,7 @@ partition*. A missed heartbeat is not proof a node is dead, so Legion waits out
 partitioned worker has provably self-fenced. See
 [Node loss and fencing](../stateful-workloads.md#node-loss-and-fencing-at-most-one).
 
-**`count: 1`** is the whole cluster here. Postgres does not scale by running N
+**`count = 1`** is the whole cluster here. Postgres does not scale by running N
 copies of one data directory; scaling means streaming replication, which is a
 different topology (see [Scaling out](#scaling-out-replicas) below).
 
@@ -148,7 +148,7 @@ that leaves the node is a safety net.
 | `legion job run` with a new image | ✅ | ✅ |
 | Worker process restarts | ✅ | ✅ |
 | Node reboots | ✅ | ✅ |
-| `legion job stop` then `job run` | ✅ (`retainOnStop: true`) | ✅ |
+| `legion job stop` then `job run` | ✅ (`retainOnStop = true`) | ✅ |
 | `legion job destroy` | ❌ reclaimed | ❌ |
 | `legion volume delete --force` | ❌ abandoned | ✅ (fresh, empty volume) |
 
@@ -156,7 +156,7 @@ Try it:
 
 ```bash
 psql … -c 'CREATE TABLE t (x int); INSERT INTO t VALUES (1);'
-legion job run configs/jobs/postgres.jsonnet --force-reschedule
+legion job run configs/jobs/postgres.ncl --force-reschedule
 # wait for it to come back
 psql … -c 'SELECT * FROM t;'   # 1
 ```
@@ -187,11 +187,11 @@ data loss. Your options:
 
 Put the data somewhere every node can reach:
 
-```jsonnet
-storage: {
-  path: '/var/lib/postgresql/data',
-  driver: 'nfs',
-  params: { server: '10.0.0.5', export: '/exports/postgres', options: 'vers=4,hard' },
+```nickel
+storage = {
+  path = "/var/lib/postgresql/data",
+  driver = "nfs",
+  params = { server = "10.0.0.5", export = "/exports/postgres", options = "vers=4,hard" },
 }
 ```
 
@@ -224,8 +224,7 @@ fencing policy:
    volume, different node. Total downtime ≈ `replaceAfter` plus Postgres
    recovery.
 
-Nothing to run, nothing to reattach by hand. If you set `replaceAfter:
-'never'`, step 3 waits for you: `legion instance replace postgres-db-0` is the
+Nothing to run, nothing to reattach by hand. If you set `replaceAfter = "never"`, step 3 waits for you: `legion instance replace postgres-db-0` is the
 manual trigger. Compare the `local-dir` version of the same story in
 [When the node dies](#when-the-node-dies) — that one *waits for the node*,
 because the bytes are on it.
@@ -244,22 +243,22 @@ Two things to know before doing this in production:
 To pin Postgres to a specific NVMe rather than the worker's state directory,
 declare it on the worker and claim it:
 
-```jsonnet
-// configs/workers/db.jsonnet
+```nickel
+# configs/workers/db.ncl
 {
-  workerType: 'db',
-  pool: 'db',
-  hostVolumes: {
-    pgdata: { path: '/mnt/nvme0/postgres', create: true },
+  workerType = "db",
+  pool = "db",
+  hostVolumes = {
+    pgdata = { path = "/mnt/nvme0/postgres", create = true },
   },
 }
 ```
 
-```jsonnet
-// jobspec
-volumes: [{ name: 'pgdata', driver: 'host', params: { name: 'pgdata' },
-            path: '/var/lib/postgresql/data' }],
-// and drop stateful.storage — the host volume IS the storage now
+```nickel
+# jobspec
+volumes = [{ name = "pgdata", driver = "host", params = { name = "pgdata" },
+            path = "/var/lib/postgresql/data" }],
+# and drop stateful.storage — the host volume IS the storage now
 ```
 
 Trade-off: a `host` volume is shared and has no per-instance lifecycle, so it is
@@ -268,7 +267,7 @@ the right tool for exactly one Postgres. `legion volume delete` on it will
 
 ## Scaling out (replicas)
 
-`count: 3` on this spec gives you three independent Postgres instances with
+`count = 3` on this spec gives you three independent Postgres instances with
 three independent data directories, not a replicated cluster. That is a
 perfectly good primitive — it is what you want for per-tenant databases — but it
 is not high availability.
@@ -277,7 +276,7 @@ For streaming replication, run the primary and the replicas as separate tasks in
 one group: the replica task's command runs `pg_basebackup` against the
 primary's service address on first boot (an empty `$LEGION_STORAGE_DIR` is the
 signal), then starts in standby mode. Each replica gets its own slot instance
-and its own volume, and `rollout.slots.order: 'sequential'` restarts them
+and its own volume, and `rollout.slots.order = "sequential"` restarts them
 highest-ordinal-first on a config change so the primary is touched last.
 
 Automatic failover (promoting a replica when the primary dies) needs a
@@ -295,20 +294,21 @@ disk both lose data. Two built-in paths:
   uncomment it and point the output somewhere durable (object storage via
   `aws s3 cp -`, or a `host` volume on a dedicated backup disk):
 
-```jsonnet
-// already in configs/jobs/postgres.jsonnet, commented out
-tasks+: [{
-  name: 'backup',
-  runtime: 'container',
-  group: 'db',
-  lifecycle: 'batch',
-  schedule: '0 3 * * *',
-  config: {
-    image: 'postgres:16-alpine',
-    command: ['sh', '-c', 'pg_dump "$DATABASE_URL" | gzip > "$LEGION_TASK_DIR/pg-$(date +%F).sql.gz"'],
-    env: { DATABASE_URL: 'postgres://postgres:legion-demo@postgres.service.legion:5432/legion' },
+```nickel
+# already in configs/jobs/postgres.ncl, commented out —
+# add this entry to the spec's `tasks` array
+{
+  name = "backup",
+  runtime = "container",
+  group = "db",
+  lifecycle = "batch",
+  schedule = "0 3 * * *",
+  config = {
+    image = "postgres:16-alpine",
+    command = ["sh", "-c", "pg_dump \"$DATABASE_URL\" | gzip > \"$LEGION_TASK_DIR/pg-$(date +%F).sql.gz\""],
+    env = { DATABASE_URL = "postgres://postgres:legion-demo@postgres.service.legion:5432/legion" },
   },
-}],
+}
 ```
 
 ## Troubleshooting

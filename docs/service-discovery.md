@@ -13,14 +13,14 @@ Design background lives in [internal_docs/plans/service-discovery-final-plan.md]
 
 The one-liner — a bare port number declares and advertises the port:
 
-```jsonnet
+```nickel
 {
-    name: "redis-job",
-    tasks: [{
-        name: "redis",
-        runtime: "exec",
-        config: { command: ["redis-server", "--port", "6379"] },
-        service: { port: 6379 },   // -> service "redis", static port 6379
+    name = "redis-job",
+    tasks = [{
+        name = "redis",
+        runtime = "exec",
+        config = { command = ["redis-server", "--port", "6379"] },
+        service = { port = 6379 },   # -> service "redis", static port 6379
     }],
 }
 ```
@@ -35,20 +35,20 @@ legion service doctor redis     # layer-by-layer diagnosis when something's off
 
 And to *use* it from another task — one block, one env var:
 
-```jsonnet
-connect: { upstreams: [{ service: "redis" }] },   // -> $LEGION_UPSTREAM_REDIS
+```nickel
+connect = { upstreams = [{ service = "redis" }] },   # -> $LEGION_UPSTREAM_REDIS
 ```
 
 See [Connecting to services](#connecting-to-services-the-connect-block).
 
 ## Declaring ports: the `network` block
 
-```jsonnet
-network: {
-    mode: "auto",                        // auto | host
-    ports: [
-        { name: "http", to: 8080 },      // no `static` -> dynamic host port (20000-32000)
-        { name: "metrics", static: 9090 }, // fixed host port
+```nickel
+network = {
+    mode = "auto",                        # auto | host
+    ports = [
+        { name = "http", to = 8080 },      # no `static` -> dynamic host port (20000-32000)
+        { name = "metrics", static = 9090 }, # fixed host port
     ],
 },
 ```
@@ -62,15 +62,15 @@ network: {
 
 ## Advertising: the `service` block
 
-```jsonnet
-service: {
-    name: "web",          // defaults to the task name
-    port: "http",         // a network.ports label...
-    // port: 6379,        // ...or a number  -> declares a static port inline
-    // port: "dynamic",   // ...or 'dynamic' -> declares a dynamic port inline
-    tags: ["v1"],
-    meta: { protocol: "http" },
-    // allow: ["gateway"],   // optional connect intentions; see below
+```nickel
+service = {
+    name = "web",          # defaults to the task name
+    port = "http",         # a network.ports label...
+    # port = 6379,        # ...or a number  -> declares a static port inline
+    # port = "dynamic",   # ...or "dynamic" -> declares a dynamic port inline
+    tags = ["v1"],
+    meta = { protocol = "http" },
+    # allow = ["gateway"],   # optional connect intentions; see below
 },
 ```
 
@@ -88,9 +88,9 @@ running; add checks to gate registration on real readiness.
 A check's `port` may name a port label — it resolves to the assigned host port
 at runtime:
 
-```jsonnet
-checks: [
-    { type: "health", kind: "tcp", port: "http", every: "5s", timeout: "2s" },
+```nickel
+checks = [
+    { type = "health", kind = "tcp", port = "http", every = "5s", timeout = "2s" },
 ],
 ```
 
@@ -126,16 +126,16 @@ task gets one fixed local address per upstream, and the worker load-balances
 every connection made to it across that service's healthy endpoints. No client
 library, no sidecar, no DNS, no service-specific code.
 
-```jsonnet
+```nickel
 {
-    name: "api",
-    kind: "exec",
-    config: { command: ["sh", "-c", "exec ./api"] },
-    connect: {
-        upstreams: [
-            { service: "db" },                             // dynamic local port
-            { service: "cache", localPort: 6379 },         // pinned local port
-            { service: "search", balance: "least_conn" },  // strategy override
+    name = "api",
+    kind = "exec",
+    config = { command = ["sh", "-c", "exec ./api"] },
+    connect = {
+        upstreams = [
+            { service = "db" },                             # dynamic local port
+            { service = "cache", localPort = 6379 },         # pinned local port
+            { service = "search", balance = "least_conn" },  # strategy override
         ],
     },
 }
@@ -156,7 +156,7 @@ per-node dynamic range (20000–32000) and the same used-port set as task ports,
 so an upstream port can never collide with a host port on that node. `balance`
 overrides the strategy for that one upstream.
 
-Upstream ports are per *allocation*, exactly like host ports: a `count: 3`
+Upstream ports are per *allocation*, exactly like host ports: a `count = 3`
 client task gets three independent listeners on three distinct ports.
 
 ### Balancing strategies
@@ -232,10 +232,10 @@ Per-connection logging stays at `debug`.
 
 A service can name the jobs allowed to reach it through connect:
 
-```jsonnet
-service: {
-    port: "http",
-    allow: ["gateway", "api"],   // job ids; absent or ["*"] = every job
+```nickel
+service = {
+    port = "http",
+    allow = ["gateway", "api"],   # job ids; absent or ["*"] = every job
 },
 ```
 
@@ -346,10 +346,10 @@ tell "unhealthy" apart from "not allowed".
 ```bash
 # terminal 1                          # terminal 2
 cargo run -- start manager \          cargo run -- join <TOKEN>
-  -c configs/manager.jsonnet
+  -c configs/manager.ncl
 
 # terminal 3
-cargo run -- job run configs/jobs/service-demo.jsonnet
+cargo run -- job run configs/jobs/service-demo.ncl
 cargo run -- service resolve web -j
 curl "http://$(cargo run -q -- service resolve web --one)"
 
@@ -362,13 +362,13 @@ cargo run -- service doctor web       # names the failing layer
 
 ### ...and the connect path
 
-[`configs/jobs/connect-demo.jsonnet`](../configs/jobs/connect-demo.jsonnet) runs
+[`configs/jobs/connect-demo.ncl`](../configs/jobs/connect-demo.ncl) runs
 two `web` backends plus a `client` task that curls `$LEGION_UPSTREAM_WEB` in a
 loop. Each backend serves its own allocation id, so the balancing is visible in
 the client's logs:
 
 ```bash
-cargo run -- job run configs/jobs/connect-demo.jsonnet
+cargo run -- job run configs/jobs/connect-demo.ncl
 cargo run -- service resolve web              # two healthy endpoints
 cargo run -- job logs connect-demo --tail     # client alternates between them
 

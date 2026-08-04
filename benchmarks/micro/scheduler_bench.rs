@@ -101,7 +101,7 @@ fn make_jobs(total_allocations: usize) -> Vec<JobConfig> {
 fn submit_jobs(store: &Store, jobs: &[JobConfig]) -> anyhow::Result<Vec<String>> {
     let mut ids = Vec::with_capacity(jobs.len());
     let submission = Submission {
-        path: "bench.jsonnet".into(),
+        path: "bench.ncl".into(),
         content: "{}".into(),
         is_primary: true,
     };

@@ -9,6 +9,9 @@ Plans, roadmaps, to-do lists, and development notes live in
 
 ## Architecture
 
+- [Configuration Language](configuration-language.md) — Nickel: the syntax
+  essentials, the `vars` binding behind `--var`, imports, where imports are
+  refused, and the `.json` path for machine-emitted config.
 - [Managers and Workers](architecture-managers-workers.md) — cluster shape,
   responsibilities, and the manager/worker protocol.
 - [Scheduler and Eval Loop](scheduler-and-eval-loop.md) — the control loop that

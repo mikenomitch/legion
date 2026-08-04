@@ -1,36 +1,34 @@
 //! Job-template manifest parsing, variable validation, and sandboxed
-//! server-side Jsonnet rendering.
+//! server-side Nickel rendering.
 //!
-//! A template is one self-contained Jsonnet file that evaluates to an object
-//! with optional `description` and `variables` fields plus a hidden
-//! `job(vars)::` function returning the jobspec. Evaluating the file yields
-//! the manifest (hidden fields are not emitted); rendering calls
-//! `template.job(vars)` with the resolved variable values as a single native
-//! JSON object (passed via `ext_code`, so numbers are numbers and booleans
-//! are booleans — no `std.extVar` string parsing).
+//! A template is one self-contained Nickel file that evaluates to a record
+//! with optional `description` and `variables` fields plus a
+//! `job | not_exported = fun vars => ...` function returning the jobspec.
+//! Exporting the file yields the manifest (`not_exported` fields are dropped
+//! on export, which is what keeps `job` out of the published manifest);
+//! rendering applies `template.job` to the resolved variable values, handed
+//! in as a native Nickel record through the evaluator's `vars` binding — no
+//! string parsing, so numbers stay numbers and booleans stay booleans.
 //!
 //! Rendering runs on the manager, so it is sandboxed: imports are rejected
-//! through the VM import callback, source and variable payloads are
-//! size-capped, and evaluation runs on its own thread under a wall-clock
-//! timeout. See docs/job-templates.md.
+//! before evaluation starts, source and variable payloads are size-capped,
+//! and evaluation runs on its own thread under a wall-clock timeout. See
+//! docs/job-templates.md.
 
+use crate::config_lang;
 use crate::prelude::*;
 use crate::storage::store::JobTemplateVariableRecord;
 
-use jsonnet::JsonnetVm;
 use std::time::Duration;
 
 /// Maximum accepted template source size.
 pub const MAX_SOURCE_BYTES: usize = 512 * 1024;
 /// Maximum accepted `variables_json` payload size.
 pub const MAX_VARIABLES_BYTES: usize = 64 * 1024;
-/// Wall-clock budget for one Jsonnet evaluation.
+/// Wall-clock budget for one Nickel evaluation.
 pub const RENDER_TIMEOUT: Duration = Duration::from_secs(5);
 
 const MAX_NAME_LEN: usize = 128;
-/// Ext-code slot carrying the resolved variable object into the render
-/// wrapper snippet.
-const VARS_EXT_CODE: &str = "legion_template_vars";
 
 pub const VARIABLE_TYPES: &[&str] = &[
     "string",
@@ -81,41 +79,33 @@ fn check_source_size(source: &str) -> R<()> {
     Ok(())
 }
 
-/// A VM with the sandbox applied: imports rejected, bounded traces.
-fn sandboxed_vm() -> JsonnetVm {
-    let mut vm = JsonnetVm::new();
-    vm.max_trace(Some(20));
-    vm.import_callback(|_vm, _base, _path| {
-        Err("imports are not allowed in job templates; templates must be self-contained".into())
-    });
-    vm
-}
-
 /// Evaluates the manifest half of a template document.
 ///
-/// The wrapper treats the whole source as one expression (a Jsonnet file is
-/// an expression, possibly preceded by `local` bindings, so parenthesizing
-/// it is always valid) and projects out the metadata plus shape checks.
+/// The wrapper treats the whole source as one expression (a Nickel file is an
+/// expression, possibly preceded by `let` bindings, so parenthesizing it is
+/// always valid) and projects out the metadata plus shape checks. It reads
+/// `job` through record access rather than exporting the template directly,
+/// so the `not_exported` annotation that hides `job` from the manifest does
+/// not hide it from these checks.
 pub fn parse_manifest(source: &str) -> R<TemplateManifest> {
     check_source_size(source)?;
     let snippet = format!(
-        r#"local template = (
+        r#"let template = (
 {source}
-);
-if !std.isObject(template) then
-  error 'template must evaluate to an object'
+) in
+if !(std.is_record template) then
+  std.fail_with "template must evaluate to a record"
 else {{
-  description: if std.objectHas(template, 'description') then template.description else null,
-  variables: if std.objectHas(template, 'variables') then template.variables else [],
-  hasJob: std.objectHasAll(template, 'job'),
-  jobIsFunction: std.objectHasAll(template, 'job') && std.isFunction(template.job),
+  description =
+    if std.record.has_field "description" template then template.description else null,
+  variables = if std.record.has_field "variables" template then template.variables else [],
+  hasJob = std.record.has_field "job" template,
+  jobIsFunction =
+    std.record.has_field "job" template && std.is_function template.job,
 }}"#
     );
-    let mut vm = sandboxed_vm();
-    let manifest_json = vm
-        .evaluate_snippet("template-manifest", &snippet)
-        .map_err(|err| anyhow!("invalid template source: {err}"))?
-        .to_string();
+    let manifest_json = config_lang::eval_sandboxed("template-manifest", &snippet, None)
+        .map_err(|err| anyhow!("invalid template source: {err}"))?;
 
     #[derive(serde::Deserialize)]
     #[serde(rename_all = "camelCase")]
@@ -129,10 +119,10 @@ else {{
         .map_err(|err| anyhow!("invalid template manifest: {err}"))?;
 
     if !raw.has_job {
-        bail!("template must declare a hidden `job(vars)::` function field");
+        bail!("template must declare a `job | not_exported = fun vars => ...` function field");
     }
     if !raw.job_is_function {
-        bail!("template field `job` must be a function taking the variables object");
+        bail!("template field `job` must be a function taking the variables record");
     }
     let description = match raw.description {
         None | Some(Value::Null) => None,
@@ -281,7 +271,7 @@ fn coerce_value(def: &JobTemplateVariableRecord, value: Value) -> R<Value> {
 }
 
 /// Merges provided values with defaults, validates and coerces them, and
-/// returns the complete `vars` object handed to `template.job(vars)`.
+/// returns the complete `vars` record `template.job` is applied to.
 /// Every declared key is present; optional variables with no default render
 /// as `null`. Unknown provided keys are rejected (typo protection).
 pub fn resolve_variable_values(
@@ -327,29 +317,22 @@ pub fn resolve_variable_values(
     Ok(resolved)
 }
 
-/// Renders `template.job(vars)` and returns the jobspec JSON.
+/// Renders `template.job vars` and returns the jobspec JSON.
 fn render(source: &str, vars: &Map<String, Value>) -> R<String> {
     check_source_size(source)?;
-    let vars_json = serde_json::to_string(&Value::Object(vars.clone()))?;
     let snippet = format!(
-        r#"local template = (
+        r#"let template = (
 {source}
-);
-template.job(std.extVar('{VARS_EXT_CODE}'))"#
+) in
+template.job vars"#
     );
-    let mut vm = sandboxed_vm();
-    // JSON is valid Jsonnet, so ext_code delivers the object natively.
-    vm.ext_code(VARS_EXT_CODE, &vars_json);
-    let rendered = vm
-        .evaluate_snippet("template-render", &snippet)
-        .map_err(|err| anyhow!("template rendering failed: {err}"))?
-        .to_string();
-    Ok(rendered)
+    config_lang::eval_sandboxed("template-render", &snippet, Some(vars))
+        .map_err(|err| anyhow!("template rendering failed: {err}"))
 }
 
 /// Renders on a dedicated thread under `RENDER_TIMEOUT`.
 ///
-/// Jsonnet is Turing-complete and the C VM cannot be interrupted, so on
+/// Nickel is Turing-complete and its evaluator cannot be interrupted, so on
 /// timeout the render thread is abandoned (it keeps a core busy until the
 /// evaluation finishes or the process exits) and the caller gets an error.
 /// Call from sync/blocking context.
@@ -384,18 +367,18 @@ mod job_templates_test {
 
     const VALID_TEMPLATE: &str = r#"
 {
-  description: 'demo',
-  variables: [
-    { key: 'name', type: 'string' },
-    { key: 'replicas', type: 'number', default: 2 },
-    { key: 'debug', type: 'boolean', default: false },
-    { key: 'quality', type: 'select', options: ['draft', 'final'], default: 'draft' },
-    { key: 'regions', type: 'multi_select', options: ['us', 'eu'], default: [] },
-    { key: 'extra', type: 'json', required: false },
+  description = "demo",
+  variables = [
+    { key = "name", type = "string" },
+    { key = "replicas", type = "number", "default" = 2 },
+    { key = "debug", type = "boolean", "default" = false },
+    { key = "quality", type = "select", options = ["draft", "final"], "default" = "draft" },
+    { key = "regions", type = "multi_select", options = ["us", "eu"], "default" = [] },
+    { key = "extra", type = "json", required = false },
   ],
-  job(vars):: {
-    name: 'demo-' + vars.name,
-    tasks: [{ name: 'main', runtime: 'noop', count: vars.replicas }],
+  job | not_exported = fun vars => {
+    name = "demo-%{vars.name}",
+    tasks = [{ name = "main", runtime = "noop", count = vars.replicas }],
   },
 }
 "#;
@@ -417,28 +400,38 @@ mod job_templates_test {
 
     #[test]
     fn rejects_manifests_without_a_job_function() {
-        let err = parse_manifest("{ description: 'x' }").unwrap_err();
-        assert!(err.to_string().contains("job(vars)"), "{err}");
-        let err = parse_manifest("{ job: 'not a function' }").unwrap_err();
+        let err = parse_manifest(r#"{ description = "x" }"#).unwrap_err();
+        assert!(err.to_string().contains("job"), "{err}");
+        let err = parse_manifest(r#"{ job = "not a function" }"#).unwrap_err();
         assert!(err.to_string().contains("must be a function"), "{err}");
         let err = parse_manifest("[1, 2]").unwrap_err();
-        assert!(err.to_string().contains("object"), "{err}");
-        assert!(parse_manifest("this is not jsonnet {{{").is_err());
+        assert!(err.to_string().contains("record"), "{err}");
+        assert!(parse_manifest("this is not nickel {{{").is_err());
     }
 
     #[test]
     fn rejects_bad_variable_definitions() {
-        let bad_type = r#"{ variables: [{ key: 'a', type: 'enum' }], job(vars):: {} }"#;
+        let bad_type = r#"{ variables = [{ key = "a", type = "enum" }], job | not_exported = fun vars => {} }"#;
         assert!(parse_manifest(bad_type).is_err());
-        let dup = r#"{ variables: [
-            { key: 'a', type: 'string' }, { key: 'a', type: 'number' }
-        ], job(vars):: {} }"#;
+        let dup = r#"{ variables = [
+            { key = "a", type = "string" }, { key = "a", type = "number" }
+        ], job | not_exported = fun vars => {} }"#;
         assert!(parse_manifest(dup).is_err());
-        let no_options = r#"{ variables: [{ key: 'a', type: 'select' }], job(vars):: {} }"#;
+        let no_options = r#"{ variables = [{ key = "a", type = "select" }], job | not_exported = fun vars => {} }"#;
         assert!(parse_manifest(no_options).is_err());
-        let bad_default =
-            r#"{ variables: [{ key: 'a', type: 'number', default: 'nope' }], job(vars):: {} }"#;
+        let bad_default = r#"{ variables = [{ key = "a", type = "number", "default" = "nope" }], job | not_exported = fun vars => {} }"#;
         assert!(parse_manifest(bad_default).is_err());
+    }
+
+    #[test]
+    fn manifest_omits_the_job_function() {
+        let json = config_lang::eval_sandboxed("t", VALID_TEMPLATE, None).expect("export");
+        let value: Value = serde_json::from_str(&json).expect("json");
+        assert!(
+            value.get("job").is_none(),
+            "`job` must be hidden from the published manifest: {value}"
+        );
+        assert_eq!(value["description"], json!("demo"));
     }
 
     #[test]
@@ -493,15 +486,15 @@ mod job_templates_test {
     fn blocks_imports() {
         let importing = r#"
 {
-  variables: [],
-  job(vars):: { name: import '/etc/passwd' },
+  variables = [],
+  job | not_exported = fun vars => { name = import "/etc/passwd" },
 }
 "#;
         let vars = Map::new();
         let err = render(importing, &vars).unwrap_err();
         assert!(err.to_string().contains("imports are not allowed"), "{err}");
-        let importstr = r#"{ variables: [], job(vars):: { name: importstr 'x' } }"#;
-        let err = render(importstr, &Map::new()).unwrap_err();
+        // Rejected at definition time too, not only at render time.
+        let err = parse_manifest(importing).unwrap_err();
         assert!(err.to_string().contains("imports are not allowed"), "{err}");
     }
 

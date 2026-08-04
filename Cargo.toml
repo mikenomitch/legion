@@ -8,8 +8,11 @@ edition = "2021"
 [dependencies]
 clap = { version = "4.5.48", features = ["cargo", "derive"] }
 futures = "0.3"
-# jsonnet-rs = "0.17.0"
-jsonnet-rs = { git = "https://github.com/mikenomitch/rust-jsonnet" }
+# Nickel is Legion's configuration language: job specs, manager/worker
+# configs, and ACL policies are all `.ncl` files evaluated to JSON. Default
+# features (repl, markdown, doc, format) pull in rustyline/topiary/tree-sitter
+# and are not used by the embedded evaluator.
+nickel-lang-core = { version = "0.18.0", default-features = false }
 jsonwebtoken = "9.1.0"
 libloading = "0.8.1"
 prost = "0.13.3"

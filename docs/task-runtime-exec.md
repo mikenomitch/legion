@@ -30,7 +30,7 @@ Optional:
   - `read_only_paths`
   - `read_write_paths`
 - `hardening` (linux): `noNewPrivileges`, `privateTmp`,
-  `capabilities: { drop: [...] }`, `umask`, `nice` — see
+  `capabilities = { drop = [...] }`, `umask`, `nice` — see
   [Task Supervision](task-supervision.md#process-hardening).
 
 ## Runtime Behavior
@@ -94,7 +94,7 @@ Spawn helper sets a new session (`setsid`) on Unix so task processes survive wor
 Exec runs a sibling host process with the task's env and working directory.
 Because it is a process on the host (even under landlock), it carries the
 `host` ACL flag: exec into an `exec` task requires an `exec:write` rule with
-`host: true`.
+`host = true`.
 
 ## Notes
 

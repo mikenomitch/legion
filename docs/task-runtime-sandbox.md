@@ -17,23 +17,23 @@ not a runtime-specific field — it is a **block-mode volume**
 ([volumes](volumes.md)), because a guest kernel attaches a block device rather
 than reading a host directory.
 
-```jsonnet
+```nickel
 {
-    name: 'workspace',
-    runtime: 'sandbox',
-    group: 'sandboxes',
-    stateful: {
-        mode: 'keyed',
-        // The persistent half of the sandbox: a formatted disk image served
-        // by the local-dir driver, bound to the instance, attached to the VM
-        // as /dev/vdb, and mounted at `path` by the generated guest init.
-        storage: { path: '/workspace', mode: 'block', params: { size: '4G' } },
+    name = "workspace",
+    runtime = "sandbox",
+    group = "sandboxes",
+    stateful = {
+        mode = "keyed",
+        # The persistent half of the sandbox: a formatted disk image served
+        # by the local-dir driver, bound to the instance, attached to the VM
+        # as /dev/vdb, and mounted at `path` by the generated guest init.
+        storage = { path = "/workspace", mode = "block", params = { size = "4G" } },
     },
-    config: {
-        image: 'alpine:latest',
-        command: ['/bin/sh', '-c', 'cd /workspace && ./agent.sh'],
-        vcpus: 2,
-        memory_mib: 1024,
+    config = {
+        image = "alpine:latest",
+        command = ["/bin/sh", "-c", "cd /workspace && ./agent.sh"],
+        vcpus = 2,
+        memory_mib = 1024,
     },
 }
 ```
@@ -84,7 +84,7 @@ disk, which dev mode does not do.
 
 ### Linux dev mode
 
-Explicitly asking for `hypervisor: 'dev'` on a Linux node without KVM (CI
+Explicitly asking for `hypervisor = "dev"` on a Linux node without KVM (CI
 containers, VMs without nested virt) runs the image through an OCI runtime
 bundle — namespaces, not a VM. It is never selected automatically, exists so
 the runtime is exercisable on machines that cannot boot a VM, and is not a
@@ -138,10 +138,10 @@ Sandboxes are usually stateful — a dev workspace, a database, an agent's home
 directory. The runtime owns **none** of the storage machinery: persistence is the
 [volume system](volumes.md), consumed in its **block** mode.
 
-```jsonnet
-stateful: {
-    mode: 'keyed',
-    storage: { path: '/workspace', mode: 'block', params: { size: '4G' } },
+```nickel
+stateful = {
+    mode = "keyed",
+    storage = { path = "/workspace", mode = "block", params = { size = "4G" } },
 },
 ```
 
@@ -152,7 +152,7 @@ What each layer does:
    reclaimed by the manager when the handle is dropped (instance destroy,
    scale-in without `retainOnScaleIn`, `legion volume delete`).
 2. The **driver** serves the shape. `local-dir` in block mode produces a
-   sparse ext4 disk image, formats it on first mount (`fresh: true` exactly
+   sparse ext4 disk image, formats it on first mount (`fresh = true` exactly
    once), and never reformats a reattach — the conformance suite pins that.
 3. The **worker** mounts before start and hands this runtime the device path.
 4. **This runtime** attaches it as `/dev/vdb` and the generated guest init mounts
@@ -193,12 +193,12 @@ Design notes that matter:
   guest with the *guest* mount path, so a payload finds its persistent
   directory without hardcoding it. (`exec` tasks get host paths in these vars;
   kinds with their own filesystem view get in-task paths.)
-- **Mode pairing per backend:** microVM backends take `mode: 'block'` only
+- **Mode pairing per backend:** microVM backends take `mode = "block"` only
   (until virtio-fs lands); dev-mode backends bind-mount `filesystem` volumes
   only. A mismatch fails at start naming the volume and both ways out. In
   practice placement already steers this: a node that cannot serve block-mode
   `local-dir` (no `mkfs.ext4`) never advertises it.
-- Task-level `volumes: [...]` claims work too — e.g. a read-only `host` block
+- Task-level `volumes = [...]` claims work too — e.g. a read-only `host` block
   device shared across sandboxes on a bare-metal node. A claim with no `path`
   is attached as a raw, unmounted guest device.
 
@@ -224,7 +224,7 @@ Optional:
 | `network` | `{ mode: 'none' }` | `{ mode: 'tap', tap: 'tap0', mac: … }` attaches the guest to a **pre-created** host TAP device. |
 
 Persistent state is **not** part of the runtime config: declare
-`stateful.storage` (or `volumes[]`) on the task with `mode: 'block'` — see
+`stateful.storage` (or `volumes[]`) on the task with `mode = "block"` — see
 [Stateful Sandboxes](#stateful-sandboxes). A leftover `config.state` block
 from the pre-volume design is rejected at validation with the migration.
 
@@ -234,9 +234,9 @@ microVMs need an uncompressed kernel image (`vmlinux`, not `bzImage`). Point
 `LEGION_SANDBOX_KERNEL` at one on each worker, install it at
 `/var/lib/legion/kernels/vmlinux`, or ship it per-job as an artifact:
 
-```jsonnet
-artifacts: [{ name: 'kernel', source: 'https://…/vmlinux' }],
-config: { kernel: '${artifact.kernel}', /* … */ },
+```nickel
+artifacts = [{ name = "kernel", source = "https://example.com/vmlinux" }],
+config = { kernel = "${artifact.kernel}", image = "alpine:latest" },
 ```
 
 A missing kernel fails at start with an error naming all three options.
@@ -245,8 +245,8 @@ A missing kernel fails at start with an error naming all three options.
 
 Guest networking needs a host TAP device, which needs `CAP_NET_ADMIN` and a
 host addressing plan — so Legion does not create one. The default is
-`mode: 'none'`: the guest has loopback only, which is the right default for
-compute/agent sandboxes. With `mode: 'tap'` the operator (or a future network
+`mode = "none"`: the guest has loopback only, which is the right default for
+compute/agent sandboxes. With `mode = "tap"` the operator (or a future network
 plugin) pre-creates the device and Legion attaches it. `LEGION_PORT_*` /
 `LEGION_ADDR_*` are still exported into the guest, but nothing maps host ports
 into the VM yet.
@@ -257,7 +257,7 @@ boundary. A guest started before its placement is durable boots with the TAP
 device attached but administratively **down** — Firecracker cannot hotplug a
 NIC, so the gate has to be on the link rather than on the attachment — and
 ratification is the only thing that raises it. With the default
-`mode: 'none'` there is nothing to gate, which is strictly stronger. Legion
+`mode = "none"` there is nothing to gate, which is strictly stronger. Legion
 changes link state only; it installs no per-interface filter, so an operator
 who wants belt-and-braces isolation should add one.
 
@@ -303,11 +303,11 @@ an `exec:write` rule without `host` suffices — see
 # then point the worker at an uncompressed kernel:
 export LEGION_SANDBOX_KERNEL=/path/to/vmlinux
 
-cargo run -- start manager -c configs/manager.jsonnet   # terminal 1
+cargo run -- start manager -c configs/manager.ncl   # terminal 1
 cargo run -- join <TOKEN>                               # terminal 2
 
 # terminal 3 — keyed sandboxes: submitting places nothing
-cargo run -- job run configs/jobs/sandbox-microvm.jsonnet
+cargo run -- job run configs/jobs/sandbox-microvm.ncl
 cargo run -- instance create sandbox-vm --id user-42
 cargo run -- job logs sandbox-vm            # guest console (serial) output
 cargo run -- instance destroy user-42
@@ -315,7 +315,7 @@ cargo run -- instance destroy user-42
 
 On macOS the same job runs in dev mode with no kernel setup (Apple `container`
 must be installed). To exercise the runtime on a Linux machine without KVM, set
-`hypervisor: 'dev'` on the task.
+`hypervisor = "dev"` on the task.
 
 The end-to-end boot test is opt-in:
 
@@ -356,7 +356,7 @@ snapshot-capable as-is.
 - **No exec into a running microVM.** That needs a vsock guest agent; the runtime
   reports the capability honestly rather than failing at session open.
 - **No signal delivery** into the guest (same reason), so an env-delivered
-  identity must use `changeMode: restart`.
+  identity must use `changeMode = "restart"`.
 - **No virtio-fs.** A microVM sandbox consumes block volumes only; a
   `filesystem` volume on a microVM backend fails at start. Filesystem-mode
   support via virtio-fs (a `virtiofsd` per mount) is future work.
