@@ -66,6 +66,7 @@ fn make_node_msg(id: &str, attrs: serde_json::Value) -> NodeMsg {
         dynamic_attrs: json!({}).to_string(),
         health_checks: "{}".into(),
         last_heartbeat: "2023-01-01 00:00:00 +00:00:00".into(),
+        heartbeat_source: String::new(),
     }
 }
 

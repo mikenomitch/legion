@@ -395,9 +395,9 @@ How to use it:
         (4x the connections at 250 nodes) and rebuilt; cadence went 66%
         -> 64%, i.e. no change. That commit is reverted.
 
-        **Design answer:**
+        **Design answer, SHIPPED 2026-08-03** (see Done):
         [heartbeat-cadence-at-scale-plan.md](plans/heartbeat-cadence-at-scale-plan.md)
-        (planned) — sizing formula + freshness metric, a runtime warning,
+        — sizing formula + freshness metric, a runtime warning,
         per-node lost windows derived from each node's cadence, and
         opt-in manager-dictated adaptive cadence. It does not raise the
         ~80/s ceiling; it stops the ceiling from marking healthy nodes
@@ -406,7 +406,7 @@ How to use it:
         [liveness-off-the-raft-path-plan.md](plans/liveness-off-the-raft-path-plan.md)
         ([calls](calls/liveness-off-the-raft-path-plan_calls.md)) — the
         AWS probe settled the D8 question the architecture review was
-        waiting on: gp3 48-86 hb/s vs local NVMe ~2000 hb/s on identical
+        waiting on (that plan has now SHIPPED too): gp3 48-86 hb/s vs local NVMe ~2000 hb/s on identical
         code, so the cost is the per-commit fsync. The `spawn_blocking`
         offload above collected most of the cheap amortization (gp3 to
         422/s, 84% of cadence at 1000 nodes), so the plan's phase 1 is now
@@ -416,31 +416,67 @@ How to use it:
         transitions. Still needed because 84% of cadence at 1000 nodes is
         6x short of the campaign's 5k step and 12x short of its 10k step,
         and because `R` remains a property of the disk.
-  - [ ] **Status-lane leadership change has no lost-node grace.**
-        `nodes_to_mark_lost` (`src/manager/daemon.rs:978`) suppresses
-        marking only for the first `DEF_LOST_NODE_AT_SEC` of *process*
-        uptime, measured from `started_at` in
-        `start_node_status_checker`. Under `lanes`, a long-running
-        manager that acquires status-lane leadership mid-life starts
-        marking immediately, right after an election during which the
-        fleet's heartbeats were failing. Nomad's `failover_heartbeat_ttl`
-        is the prior art. **Fix moved:** now phase 2 of
-        [liveness-off-the-raft-path-plan.md](plans/liveness-off-the-raft-path-plan.md)
-        (§6.4, [call 11](calls/liveness-off-the-raft-path-plan_calls.md)),
-        which needs it as its rebuild mechanism rather than as a safety
-        valve — a leader-memory liveness table inherits nothing, so without
-        the grace the first election marks the whole fleet lost. The
-        mass-disruption circuit breaker stays with
-        [heartbeat-cadence-at-scale-plan.md](plans/heartbeat-cadence-at-scale-plan.md)
-        phase 3.
-  - [ ] **`heartbeatSeconds` and `stateful.onLost.selfTerminateAfter`
-        are unvalidated against each other.** `selfTerminateAfter`
-        defaults to 90s (`src/structs/job.rs:1050`) and makes a worker
-        kill its own stateful tasks after that long without manager
-        contact. Nothing stops a cadence at or near that value, in which
-        case a healthy worker self-fences between beats. Currently masked
-        by the `1..=30` clamp; becomes live the moment that clamp widens.
-        Cross-check specified in the plan's §7.
+  - [ ] **Re-measure the AWS campaign now that heartbeats are off the raft
+        path.** Neither shipped plan's scale runs have been executed — they
+        need the shared rig. Owed:
+        `benchmarks/aws/experiments/heartbeat-commit-probe.sh` on **gp3** at
+        250/1000/2500 nodes (the acceptance number is the gp3-to-NVMe ratio
+        approaching 1.0), `packing-density.sh`, all twelve `run-campaign.sh`
+        cells, `storm.sh`, `soak-24h.sh` (raft log growth and snapshot
+        cadence change materially when heartbeats stop producing log
+        entries — possibly a larger win than the throughput), and
+        `failover-drill.sh` extended with "zero nodes marked lost across the
+        drill". Also the cadence plan's phase-4 reproduction: 1000 simulated
+        nodes at `R ~= 80`, adaptive off reproducing the collapse and
+        adaptive on marking zero nodes lost.
+        [liveness plan §10.1](plans/liveness-off-the-raft-path-plan.md).
+  - [ ] **Attribute the residual heartbeat-commit gap, then decide on
+        `liveness.batchWindow`.** The knob ships parsed, validated, and
+        **inert** (`0ms`), because the measurement it is contingent on has
+        not been run: split the remaining gap between the fsync and the
+        status lane's single `pipeline_loop` thread, at 1000 and 4000 nodes
+        on both storage classes, reading
+        `legion_store_coalesce_batch_size{path="heartbeat"}` against
+        `legion_raft_pipeline_wait_seconds{lane="status"}`. Ship the window
+        only if batches stay well below `HEARTBEAT_BATCH_MAX` under load —
+        otherwise delete the field.
+        [liveness plan §8 phase 1](plans/liveness-off-the-raft-path-plan.md),
+        [call 4](calls/liveness-off-the-raft-path-plan_calls.md).
+  - [ ] **`mark_node_ready` writes `status = "ready"`, which every liveness
+        query filters out.** `mark_node_ready_apply`
+        (`src/storage/store.rs`) sets `"ready"` rather than `"active"`, so a
+        node recovered through it drops out of `active_node_liveness_rows`,
+        out of `legion_nodes{status="active"}`, and out of the liveness scan
+        entirely. It also flips `node.availability` unconditionally, so it
+        would un-cordon a drained node. Nothing in production enqueues the
+        `node_join` eval that calls it, so it is currently dead code on the
+        real path — which is why the heartbeat recovery does the composite
+        itself instead
+        ([call 2](calls/liveness-off-the-raft-path-plan_calls.md)). Fix:
+        normalize the status string to `"active"` and adopt the same
+        `unavailable`-only availability guard, then delete the duplication.
+  - [ ] **Node loss clobbers an operator's drain.** `mark_nodes_as_lost`
+        calls `sync_node_availability(ids, "unavailable")` unconditionally,
+        so a node an operator had `drained` loses that intent the moment it
+        goes lost — and comes back `available` rather than `drained`. The
+        recovery path deliberately does not paper over this (it only clears
+        `unavailable`), because the drain intent is already gone from the row
+        by then. Fixing it properly means recording the pre-loss
+        availability, or keeping loss and drain on separate axes.
+  - [ ] **Per-pool heartbeat freshness.** `legion_heartbeat_freshness_ratio`
+        is fleet-wide, so a cluster with a slow batch pool and a fast
+        latency pool has two populations and one blended ratio, which can
+        mask a problem in the fast pool. Named as a known limitation on
+        [docs/heartbeat-cadence-and-scale.md](../docs/heartbeat-cadence-and-scale.md).
+  - [ ] **Should adaptive cadence default on?** Off by default today because
+        the benchmark-fairness argument is strongest while the comparative
+        numbers are being produced. The criterion for flipping: a campaign
+        run showing a cluster past its ceiling surviving with adaptive on,
+        detection latency inside the documented bound, and the same run
+        reproducing the collapse with it off — with
+        `targetRatePerSecond` auto-derived from measured `R` rather than
+        configured.
+        [cadence plan §11](plans/heartbeat-cadence-at-scale-plan.md).
 
   - [ ] ~~Investigate: a 1k simulated fleet sustains ~59 heartbeat
         RPCs/sec where ~500/sec is expected, with nothing saturated.~~
@@ -1170,6 +1206,68 @@ Deferred from [job-updated-at-plan.md](plans/job-updated-at-plan.md):
 
 ## Worker nodes
 
+- [x] **Node liveness off the raft path, and a lost window that moves with the
+      cadence.** Two plans, shipped together 2026-08-03:
+      [liveness-off-the-raft-path-plan.md](plans/liveness-off-the-raft-path-plan.md)
+      ([calls](calls/liveness-off-the-raft-path-plan_calls.md)) and
+      [heartbeat-cadence-at-scale-plan.md](plans/heartbeat-cadence-at-scale-plan.md)
+      ([calls](calls/heartbeat-cadence-at-scale-plan_calls.md)) ·
+      [docs: node-liveness.md](../docs/node-liveness.md),
+      [heartbeat-cadence-and-scale.md](../docs/heartbeat-cadence-and-scale.md)
+  - [x] A steady-state heartbeat costs **no replicated commit and no fsync**:
+        it is one write into the status-lane leader's in-memory
+        `LivenessTable` (`src/storage/liveness.rs`). Only status transitions
+        replicate. `legion_raft_pipeline_depth{lane="status"}` should sit at
+        ~0 between display checkpoints.
+  - [x] **The failover grace runs from liveness RESPONSIBILITY**, not process
+        uptime — closes the "status-lane leadership change has no lost-node
+        grace" item that used to live in Open. Acquisition seeds every active
+        node at `now` and marks nothing lost for `liveness.failoverGrace`
+        (60s), so an election on a manager that has been up for hours marks
+        **zero** nodes lost where it previously marked the whole fleet.
+        `legion_liveness_responsible_seconds` resets at every acquisition.
+  - [x] **Per-node lost windows** (`node_health.lost_after_seconds`, additive
+        migration, NULL = the old constant): a node is lost after
+        `missedBeatsBeforeLost x its own interval`, so a 2s pool and a 60s
+        pool coexist with 10s and 300s windows. `5 x 2s` reproduces the
+        historical fixed 10s exactly. The worker reports its resolved cadence
+        in `config_attrs.heartbeatSeconds`.
+  - [x] **`heartbeatSeconds` clamp widened 30 -> 300**, gated on a hard
+        startup check against `stateful.onLost.selfTerminateAfter` — closes
+        the "unvalidated against each other" item that used to live in Open.
+        A config that would make a healthy worker self-fence between beats
+        fails manager startup, naming both numbers.
+  - [x] **Mass-disruption circuit breaker**: >50% of the active fleet lost in
+        one tick marks none and logs at `error`. Suppressed under 20 nodes.
+  - [x] **Peer-gap suppression and the liveness digest**
+        (`RaftTransport.ReportNodeLiveness`): a manager that does not lead the
+        status lane sends ONE RPC per second carrying the ids it heard from,
+        whatever the fleet size, and a quiet peer's nodes are not marked lost
+        inside `liveness.peerDigestGrace`. Falls back to per-heartbeat
+        forwarding against a manager that predates the RPC.
+  - [x] **Freshness**: `legion_heartbeat_freshness_ratio` (the number to alert
+        on) plus served-interval / lost-window / sustainable-nodes gauges and
+        `legion_nodes_marked_lost_total`, a debounced runtime warning that
+        computes the `heartbeatSeconds` to set, and `legion node cadence`
+        (`--json`, MCP tool, capability entry, `GetHeartbeatCadence` + ACL row).
+  - [x] **Adaptive cadence, opt-in** (`heartbeat.targetRatePerSecond`): fleet-
+        size-derived interval on a Fibonacci-ish ladder with step-up-now /
+        step-down-after-5m hysteresis, served on `HeartbeatReply
+        .next_interval_seconds`, with widen-immediately / narrow-on-confirmation
+        windows and a one-shot full-width re-phase in the worker sleep. The
+        simulated fleet honors it through the same shared helpers.
+  - [x] **A returning node is schedulable again.** Node loss is a cross-lane
+        composite (status lane `lost`, control lane `unavailable`), and the
+        scheduler gates on `availability` — so recovery undoes both halves. A
+        worker that rides out a partition and resumes heartbeating recovers
+        without restarting or re-registering. Guarded so a heartbeat can
+        never un-cordon an operator-drained node.
+  - [x] **Display checkpoint + `NodeMsg.heartbeat_source`**: one batched
+        status-lane commit per 30s records each node's OBSERVED beat time, so
+        every manager can show an approximate "last heartbeat" and say that it
+        is approximate. Never read back as liveness. `"0s"` disables it.
+  - [ ] The AWS scale runs for both plans are **not done** — see the open
+        items in "Benchmarks and scale" above.
 - [x] Add a worker node
 - [x] CLI arg to get the address
 - [x] Makes contact via RPC

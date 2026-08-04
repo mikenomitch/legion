@@ -1402,6 +1402,7 @@ mod tests {
             dynamic_attrs: "{}".into(),
             health_checks: "{}".into(),
             last_heartbeat: "2026-01-01 00:00:00 +00:00:00".into(),
+            heartbeat_source: String::new(),
         })?;
         let job = JobConfig {
             priority: Default::default(),

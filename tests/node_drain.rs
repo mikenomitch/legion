@@ -175,6 +175,7 @@ fn make_node(id: &str) -> Node {
         pool: "default".into(),
         availability: "available".into(),
         last_heartbeat: "2023-01-01T00:00:00Z".into(),
+        heartbeat_source: String::new(),
         config_attrs: json!({ "node_id": id, "maxAllocations": 20 }),
         fingerprint_attrs: json!({
             "memory_total": "8589934592",

@@ -30,6 +30,7 @@ Full index: [docs/README.md](docs/README.md).
 - [Edge Boot (starting work before the placement is durable, boot tickets)](docs/edge-boot.md)
 - [Service Discovery](docs/service-discovery.md)
 - [State Store](docs/state-store.md)
+- [Node Liveness](docs/node-liveness.md) and [Heartbeat Cadence and Scale](docs/heartbeat-cadence-and-scale.md)
 - [Streaming Persistence](docs/persistence-streaming.md) and [Running Raft](docs/raft-operations.md)
 - [Logging (task logs, tailing, rotation, shipping, OTLP traces)](docs/logging.md)
 - [Observability](docs/observability.md)

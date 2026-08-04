@@ -1126,6 +1126,19 @@ pub fn get_migrations() -> Migrations<'static> {
         // plan, which keeps the "any unbound instance" binding unchanged.
         M::up("ALTER TABLE plan_submission ADD COLUMN target_instance STRING NOT NULL DEFAULT '';")
             .down(""),
+        // Per-node lost window (heartbeat-cadence plan §6.4). The lost
+        // threshold used to be one global constant compared against every
+        // node, which made `heartbeatSeconds` a knob that relieved manager
+        // load and destroyed detection margin with the same turn: at 13s
+        // cadence against a fixed 10s window, one missed beat was a dead node.
+        //
+        // The window is now `missedBeatsBeforeLost x that node's own
+        // interval`, recorded here. NULL falls back to DEF_LOST_NODE_AT_SEC,
+        // so a row written before this column behaves exactly as it did and
+        // ages out on its next registration. Additive with no backfill: an
+        // older manager binary ignores the column entirely, so a manager
+        // rollback is safe.
+        M::up("ALTER TABLE node_health ADD COLUMN lost_after_seconds INTEGER;").down(""),
     ])
 }
 

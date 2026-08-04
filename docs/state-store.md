@@ -50,10 +50,14 @@ step with the nodes and allocations it came from.
 Main tables (see migrations):
 
 - `node` (identity/pool/attrs/availability), `node_health` (liveness:
-  status, last heartbeat, lost-at marker, health checks — split out so the
-  raft status lane is the table's single writer; readers hydrate `Node` via
-  a `node ⟕ node_health` join, and a node that has not heartbeated yet
-  hydrates registration defaults)
+  status, last heartbeat, lost-at marker, this node's own lost window
+  `lost_after_seconds`, health checks — split out so the raft status lane is
+  the table's single writer; readers hydrate `Node` via a
+  `node ⟕ node_health` join, and a node that has not heartbeated yet
+  hydrates registration defaults). Note that `last_heartbeat` /
+  `last_heartbeat_unix` are **display state**: a steady-state heartbeat
+  writes nothing here, and the columns are refreshed by a periodic
+  checkpoint (see [node-liveness.md](node-liveness.md))
 - `worker_type`
 - `job`, `job_config`, `task_config`, `task_status`, `job_update`
 - `allocation`

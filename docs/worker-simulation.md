@@ -83,8 +83,12 @@ constraint (for example `constraints = { simulated = { operator = "is_not_set" }
   ±10%-jittered by the same code as a real worker — see
   [architecture-managers-workers.md](architecture-managers-workers.md)),
   30s health-check reports, exponential retry with re-registration on
-  `Unauthenticated`. The manager's lost-node detection (no heartbeat
-  for 10s) applies to simulated nodes unchanged.
+  `Unauthenticated`. A sim node reports its resolved cadence at
+  registration and honors a manager-served interval (with the same one-shot
+  re-phase) exactly as a real worker does, so a scale run measures the real
+  controller. The manager's lost-node detection applies unchanged — the
+  window is `missedBeatsBeforeLost x that node's interval`, 10s at the
+  defaults ([heartbeat-cadence-and-scale.md](heartbeat-cadence-and-scale.md)).
 - **Shared channels.** Nodes multiplex over a small pool of gRPC
   channels (one per 256 nodes, max 16), so one process holds a
   handful of connections regardless of fleet size.

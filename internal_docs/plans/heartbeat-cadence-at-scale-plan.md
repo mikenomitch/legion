@@ -1,6 +1,19 @@
 # Heartbeat Cadence at Scale
 
-**Status: PLANNED** — nothing here is built. Follows
+**Status: SHIPPED** (2026-08-03) — all four phases are built. The public page
+is [`docs/heartbeat-cadence-and-scale.md`](../../docs/heartbeat-cadence-and-scale.md);
+this plan stays as history.
+
+**Deliberately not done, and open:** the phase-4 AWS reproduction (1000
+simulated nodes against a control plane measured at `R ~= 80`, adaptive on
+versus off) has **not** been run — it needs the shared rig. Correctness is
+covered by unit tests over the pure controller and decision functions and by
+integration tests on the `tests/raft_lanes.rs` harness; the scale claim is
+argued, not measured. Phase 3's failover grace is owned by
+[`liveness-off-the-raft-path-plan.md`](liveness-off-the-raft-path-plan.md),
+which shipped it.
+
+Follows
 [`heartbeat-scale-plan.md`](heartbeat-scale-plan.md) (SHIPPED 2026-07-30),
 which made one heartbeat cheap; this plan decides what happens when there
 are too many of them for the control plane in front of you. It picks up

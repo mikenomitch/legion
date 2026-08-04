@@ -17,6 +17,9 @@ export type IndexItem = {
   status?: string
   statusTone?: Tone
   updatedAt: string
+  /// Optional tooltip on the relative time — used for the node list's
+  /// heartbeat freshness caveat (docs/node-liveness.md).
+  updatedAtTitle?: string
   href: string
   cells?: Record<string, JSX.Element>
 }
@@ -243,7 +246,7 @@ export default function SharedIndex(props: SharedIndexProps) {
                           <For each={props.columns ?? []}>
                             {(column) => <td class={cx(tdClass, 'text-muted', column.class)}>{item.cells?.[column.key] ?? '—'}</td>}
                           </For>
-                          <td class={cx(tdClass, 'whitespace-nowrap text-right text-xs text-faint')}>{item.updatedAt}</td>
+                          <td class={cx(tdClass, 'whitespace-nowrap text-right text-xs text-faint')} title={item.updatedAtTitle}>{item.updatedAt}</td>
                         </tr>
                       )}
                     </For>

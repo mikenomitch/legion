@@ -154,6 +154,60 @@ instrument.
   manager. Refreshed on the same tick.
 - **`legion_heartbeats_total`** (counter) — worker heartbeat RPCs accepted
   (past authentication) by the manager.
+- **`legion_nodes_marked_lost_total`** (counter) — nodes marked lost after
+  missed heartbeats. Distinguishes "nodes went away" from
+  `legion_nodes{status="lost"}`'s "nodes are away".
+
+### Heartbeat cadence
+
+Reported on the status-lane leader (the manager that owns node liveness);
+`0` everywhere else. See
+[heartbeat-cadence-and-scale.md](heartbeat-cadence-and-scale.md).
+
+- **`legion_heartbeat_freshness_ratio`** (gauge) — **the number to alert
+  on.** Fraction of active nodes that checked in within one interval. `1.0`
+  means the fleet is keeping up; **false node loss begins at
+  `served_interval / lost_window`**, which is `0.20` at the defaults. Reads
+  `0` on a fleet under 20 nodes, where the ratio is noise — check
+  `legion_heartbeat_sustainable_nodes` for whether it is measurable at all.
+- **`legion_heartbeat_served_interval_seconds`** (gauge) — the interval this
+  manager is telling workers to use.
+- **`legion_heartbeat_lost_window_seconds`** (gauge) — the window derived
+  from it (`missedBeatsBeforeLost x interval`).
+- **`legion_heartbeat_sustainable_nodes`** (gauge) — nodes this control plane
+  is observed to sustain at the current interval. A LOWER BOUND while the
+  fleet is keeping up: an unsaturated control plane never reveals its
+  ceiling, so on a healthy cluster this reads as roughly the fleet size.
+
+### Node liveness
+
+Heartbeats live in the memory of the manager that owns node status; only
+status transitions are replicated. See
+[node-liveness.md](node-liveness.md).
+
+- **`legion_liveness_tracked_nodes`** (gauge) — nodes in this manager's
+  liveness table. Should equal `legion_nodes{status="active"}` on the owner;
+  `0` elsewhere.
+- **`legion_liveness_responsible_seconds`** (gauge) — seconds since this
+  manager became responsible for liveness (process start OR status-lane
+  leadership acquisition, whichever is later). Resets at every acquisition,
+  which is what makes "we just took over" visible on a dashboard.
+- **`legion_liveness_digest_rpcs_total{outcome}`** (counter) — liveness
+  digests sent to the status-lane leader: `ok`, `not_leader`, `error`,
+  `unimplemented`. A non-zero `unimplemented` means a manager that predates
+  digests leads the lane and heartbeats have fallen back to replicated
+  writes — finish the roll.
+- **`legion_liveness_digest_nodes`** (histogram) — node ids per digest.
+- **`legion_liveness_peer_stale{peer}`** (gauge) — `1` while a peer manager
+  has missed several digests. **The metric to alert on** for a
+  manager-to-manager problem: without it, one quiet manager looks like its
+  share of the fleet dying.
+- **`legion_liveness_loss_suppressed_total{reason}`** (counter) — would-be
+  node losses the manager declined to act on:
+  `failover_grace`, `peer_digest_gap`, `mass_disruption`. "Nothing was
+  marked lost" must never be indistinguishable from "nothing was wrong".
+- **`legion_liveness_checkpoint_seconds`** (histogram) — wall-clock of one
+  replicated liveness checkpoint (the display-only batched write).
 
 ### Async runtime
 
@@ -400,6 +454,17 @@ these in order — each step rules out a layer:
    `legion_raft_pipeline_wait_seconds` and `legion_raft_pipeline_depth`
    against `legion_raft_capture_seconds` and
    `legion_raft_propose_apply_seconds`.
+
+   `legion_raft_pipeline_depth{lane="status"}` means something different now
+   that heartbeats do not commit: on a steady-state fleet it should sit at
+   approximately zero between display checkpoints. If it does not, heartbeats
+   are still reaching raft — check
+   `legion_liveness_digest_rpcs_total{outcome="unimplemented"}` for a
+   mixed-version manager fleet.
+5. **Is it the fleet, or the control plane?** Before concluding that nodes
+   died, read `legion_heartbeat_freshness_ratio`. A low ratio means the
+   control plane is behind, not that the machines are gone —
+   `legion node cadence` prints the same answer with the remedy attached.
 
 A worked example of the shape this catches: hundreds of heartbeats a second
 against a raft control plane, `Heartbeat` p99 in the tens of milliseconds,

@@ -311,16 +311,27 @@ guarantees instead:
 **What divergent leadership costs you.** It is safe and it degrades rather
 than dies, but it is not free:
 
-- **Worker liveness keeps working, by forwarding.** Workers dial one fixed
-  manager; when that manager does not lead the status lane, heartbeat,
-  health-check, allocation-health and failure-report writes are FORWARDED
-  over the authenticated manager plane to the owning lane's leader
-  (`ForwardLaneWrite` on the raft transport), and the worker's RPC succeeds
-  only after the forwarded write commits. The same path keeps a mark-lost's
-  control-lane availability sync working from the status leader, so a lost
-  node cannot keep receiving placements. (This forwarding also covers plain
-  `single`-topology failover: workers pointed at a demoted ex-leader keep
-  heartbeating through it.)
+- **Worker liveness keeps working, by digest.** Workers dial one fixed
+  manager; when that manager does not lead the status lane it batches the
+  node ids it has heard from and sends the owning leader ONE
+  `ReportNodeLiveness` RPC per `liveness.digestInterval` (1s) over the
+  authenticated manager plane. The cost is `managers x 1 RPC/interval`,
+  independent of fleet size, and no heartbeat becomes a replicated write.
+  If those digests stop arriving, the leader will not mark that peer's nodes
+  lost inside `liveness.peerDigestGrace` — a manager-to-manager problem must
+  not present as fleet-wide node loss — and raises
+  `legion_liveness_peer_stale{peer}`. See
+  [node-liveness.md](node-liveness.md).
+
+  Health-check, allocation-health and failure-report writes are still
+  FORWARDED to the owning lane's leader (`ForwardLaneWrite` on the raft
+  transport), and the worker's RPC succeeds only after the forwarded write
+  commits. Heartbeats fall back to that same path during a manager upgrade,
+  while a peer that predates `ReportNodeLiveness` leads the status lane. The
+  forwarding path also keeps a mark-lost's control-lane availability sync
+  working from the status leader, so a lost node cannot keep receiving
+  placements. (It equally covers plain `single`-topology failover: workers
+  pointed at a demoted ex-leader keep reporting through it.)
 - **Job submits are accepted by the control leader** and complete
   asynchronously. The control half — the operator's intent — must commit on
   the node you submitted to (a non-control-leader still rejects with the

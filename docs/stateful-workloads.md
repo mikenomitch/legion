@@ -152,6 +152,16 @@ Validation rules (enforced at `job validate` / submit time):
   self-fenced. `onLost` belongs *inside* the `stateful` block; declaring it
   at the task level — including on a stateless task, which has nothing to
   fence — is rejected at parse time with a pointer to the right nesting.
+- **The lost window must stay clear of the self-fence.** A node's window is
+  `missedBeatsBeforeLost x its heartbeat interval`
+  ([heartbeat-cadence-and-scale.md](heartbeat-cadence-and-scale.md)). If that
+  reaches `selfTerminateAfter`, a perfectly HEALTHY worker kills its own
+  stateful tasks between beats. The manager refuses to start on a worker
+  config that would produce it, naming both numbers — so this is caught at
+  config load rather than discovered as spontaneous stateful task death. At
+  the defaults (`5 x 2s = 10s` against a 90s fence) there is nine times the
+  margin; a 60-second batch cadence would need `selfTerminateAfter` raised
+  well past its 300-second window.
 
 ### Seed list (`initialInstances`) semantics
 

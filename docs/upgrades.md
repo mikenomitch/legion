@@ -156,6 +156,16 @@ other. During a rolling manager upgrade the plane tolerates skew:
   typed leader-hint rejection it would have produced before forwarding
   existed. Upgrade managers first (the standard order below) and the
   window closes.
+- The liveness digest RPC (`ReportNodeLiveness`, added 2026-08-03) degrades
+  the same way and with the same remedy: an older manager answers
+  `Unimplemented`, the sender counts
+  `legion_liveness_digest_rpcs_total{outcome="unimplemented"}` and falls back
+  to forwarding each heartbeat as a replicated write — correct, just slower.
+  It clears the moment status-lane leadership lands on an upgraded manager.
+  **Downgrade all managers together**: a partial downgrade that leaves an old
+  manager leading the status lane while a new one holds the display
+  checkpoint is the one unsafe combination, and it resolves within one lost
+  window. See [node-liveness.md](node-liveness.md).
 - Payloads inside the transport are versioned by `PROTOCOL_VERSION`;
   undecodable payloads name mixed manager protocol versions in their
   error.

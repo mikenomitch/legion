@@ -249,7 +249,13 @@ fn tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "legion_node_list",
-            description: "List worker nodes and their health.",
+            description: "List worker nodes and their health. Each node carries `heartbeat_source`: `live` means the answering manager observed the beat itself, `checkpoint` means the timestamp comes from a periodic replicated checkpoint and is up to `liveness.checkpointInterval` (30s) behind, empty means none has been observed. The node's `status` is exact either way (docs/node-liveness.md).",
+            input_schema: empty_schema,
+            mutates: false,
+        },
+        ToolDef {
+            name: "legion_node_cadence",
+            description: "Report whether the fleet is sustaining its heartbeat cadence. Returns the freshness ratio (1.0 = every node checked in on time; false node loss begins at served_interval/lost_window, 0.20 at the defaults), the per-fleet lost window, the sustainable node count for this control plane, and the `heartbeatSeconds` value to set if the fleet is falling behind. Read this before concluding that nodes have died: a low ratio means the control plane is behind, not that the machines are gone (docs/heartbeat-cadence-and-scale.md).",
             input_schema: empty_schema,
             mutates: false,
         },
@@ -824,6 +830,10 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
         "legion_node_list" => {
             let mut client = connect().await?;
             grpc(client.get_nodes(GetNodesRequest::default())).await
+        }
+        "legion_node_cadence" => {
+            let mut client = connect().await?;
+            grpc(client.get_heartbeat_cadence(crate::structs::GetHeartbeatCadenceRequest {})).await
         }
         "legion_node_drain" => {
             let node_id = str_arg(&args, "node_id")?;

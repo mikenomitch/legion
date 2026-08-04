@@ -162,6 +162,7 @@ const CLASSIFIED_MUTATIONS: &[&str] = &[
     // are the C-2 composite splits' status-lane halves — `node_health`,
     // `task_status`, and `allocation_health` are single-written by this
     // lane, plan §7-C2.)
+    "checkpoint_node_heartbeats",
     "destroy_job_status_cleanup",
     "emit_event",
     "mark_node_lost",
@@ -173,6 +174,7 @@ const CLASSIFIED_MUTATIONS: &[&str] = &[
     "seed_node_health",
     "seed_task_statuses",
     "set_node_lost_at",
+    "set_node_lost_windows",
     "set_task_status",
     "update_node_health_checks",
     "update_node_heartbeat",
@@ -328,7 +330,8 @@ fn lane_for(method: &str) -> Lane {
         | "delete_volume"
         | "mark_volume_destroyed"
         | "sync_task_volume_claims" => Lane::Scheduler,
-        "destroy_job_status_cleanup"
+        "checkpoint_node_heartbeats"
+        | "destroy_job_status_cleanup"
         | "emit_event"
         | "mark_node_lost"
         | "mark_node_ready"
@@ -339,6 +342,7 @@ fn lane_for(method: &str) -> Lane {
         | "seed_node_health"
         | "seed_task_statuses"
         | "set_node_lost_at"
+        | "set_node_lost_windows"
         | "set_task_status"
         | "update_node_health_checks"
         | "update_node_heartbeat"
