@@ -2263,11 +2263,21 @@ pub fn handle_claimed_eval(store: &Store, worker_id: usize, eval: &Eval) {
         "Dispatching claimed eval"
     );
     let result = eval.handle(store);
-    crate::manager::telemetry::metrics()
-        .evals_processed_total
-        .inc(&[&eval.kind, if result.is_ok() { "ok" } else { "error" }]);
+    // Recorded per DISPOSITION, below, rather than on the handler's return
+    // value here. The two are not the same thing: two of the three error
+    // arms below release the eval back to the queue, so an `Err` return
+    // frequently means "will run again", and the old placement of this
+    // counter reported those as errors while never reporting the arm that
+    // actually fails the eval. `status` is therefore `ok | retried |
+    // failed`, and `failed` means the row reached status `failed`.
+    let record = |status: &str| {
+        crate::manager::telemetry::metrics()
+            .evals_processed_total
+            .inc(&[&eval.kind, status]);
+    };
     match result {
         Ok(message) => {
+            record("ok");
             info!(
                 worker_id,
                 eval_id = %eval.id,
@@ -2288,6 +2298,7 @@ pub fn handle_claimed_eval(store: &Store, worker_id: usize, eval: &Eval) {
         // evals are never retried). Release it back to pending with a delay
         // instead of terminally failing it.
         Err(e) if error_is_not_raft_leader(&e) => {
+            record("retried");
             let retry_delay = not_leader_retry_delay(&eval.id);
             warn!(
                 worker_id,
@@ -2312,6 +2323,7 @@ pub fn handle_claimed_eval(store: &Store, worker_id: usize, eval: &Eval) {
         // with its `eval.requeued` event, so saturation shows as visibly
         // waiting work (docs/late-binding-plan-apply.md).
         Err(e) if Eval::error_is_plan_conflict(&e) => {
+            record("retried");
             let delay = Eval::plan_conflict_requeue_delay(store);
             warn!(
                 worker_id,
@@ -2334,10 +2346,15 @@ pub fn handle_claimed_eval(store: &Store, worker_id: usize, eval: &Eval) {
             }
         }
         Err(e) => {
+            record("failed");
             error!(worker_id, eval_id = %eval.id, elapsed_ms = started.elapsed().as_millis() as u64, "Error handling eval {}: {:?}", eval.id, e);
             clear_not_leader_attempts(&eval.id);
+            // Classified here, where the error is still typed, and carried
+            // into the store write so `legion_evals_failed_total{reason}`
+            // can tell a full cluster from a bad jobspec.
+            let reason = crate::structs::EvalFailureReason::classify(&e);
             let failed = drafts::eval_failed(eval, &e, started.elapsed());
-            if let Err(complete_err) = store.complete_eval_with_event(&eval.id, false, failed) {
+            if let Err(complete_err) = store.fail_eval_with_event(&eval.id, reason, failed) {
                 error!(
                     worker_id,
                     "Error marking eval {} as failed after handling error: {:?}",

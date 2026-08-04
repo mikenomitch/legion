@@ -3797,65 +3797,76 @@ impl<'a> Scheduler<'a> {
     /// single-node (format-1) plan submissions — the mixed-version kill
     /// switch (docs/late-binding-plan-apply.md).
     pub fn plan_candidates_setting(&self) -> R<PlanCandidatesSetting> {
-        let default = PlanCandidatesSetting::default();
-        let Some(settings) = self.store.scheduler_settings.as_ref() else {
-            return Ok(default);
-        };
-
-        let settings = match settings {
-            Value::Null => return Ok(default),
-            Value::Object(map) => map,
-            _ => {
-                bail!(
-                    "scheduler_settings for policy {} must be an object",
-                    self.policy.name()
-                )
-            }
-        };
-
-        let Some(value) = settings.get("plan_candidates") else {
-            return Ok(default);
-        };
-
-        match value {
-            Value::Number(count) => {
-                let count = count
-                    .as_u64()
-                    .context("plan_candidates must be a non-negative integer")?;
-                Ok(PlanCandidatesSetting {
-                    count: (count as usize).min(PlanCandidatesSetting::MAX_COUNT),
-                    ..default
-                })
-            }
-            Value::Object(map) => {
-                let count = match map.get("count") {
-                    None => default.count,
-                    Some(count) => count
-                        .as_u64()
-                        .context("plan_candidates.count must be a non-negative integer")?
-                        as usize,
-                };
-                let band = match map.get("band") {
-                    None => default.band,
-                    Some(band) => {
-                        let band = band
-                            .as_f64()
-                            .context("plan_candidates.band must be a number")?;
-                        if !(0.0..=1.0).contains(&band) {
-                            bail!("plan_candidates.band must be between 0.0 and 1.0");
-                        }
-                        band
-                    }
-                };
-                Ok(PlanCandidatesSetting {
-                    count: count.min(PlanCandidatesSetting::MAX_COUNT),
-                    band,
-                })
-            }
-            _ => bail!("plan_candidates must be an integer or an object with count/band"),
-        }
+        parse_plan_candidates(self.store.scheduler_settings.as_ref(), self.policy.name())
     }
+}
 
+/// The body of [`Scheduler::plan_candidates_setting`], as a free function
+/// over the raw `schedulerSettings` value.
+///
+/// Split out so a reader that has the config but no `Scheduler` — the
+/// scheduler-diagnosis report, which names the setting in its `Ruled out:`
+/// line — parses it the same way the planner does rather than
+/// reimplementing the shorthand.
+pub fn parse_plan_candidates(
+    settings: Option<&Value>,
+    policy_name: &str,
+) -> R<PlanCandidatesSetting> {
+    let default = PlanCandidatesSetting::default();
+    let Some(settings) = settings else {
+        return Ok(default);
+    };
+
+    let settings = match settings {
+        Value::Null => return Ok(default),
+        Value::Object(map) => map,
+        _ => bail!("scheduler_settings for policy {policy_name} must be an object"),
+    };
+
+    let Some(value) = settings.get("plan_candidates") else {
+        return Ok(default);
+    };
+
+    match value {
+        Value::Number(count) => {
+            let count = count
+                .as_u64()
+                .context("plan_candidates must be a non-negative integer")?;
+            Ok(PlanCandidatesSetting {
+                count: (count as usize).min(PlanCandidatesSetting::MAX_COUNT),
+                ..default
+            })
+        }
+        Value::Object(map) => {
+            let count = match map.get("count") {
+                None => default.count,
+                Some(count) => count
+                    .as_u64()
+                    .context("plan_candidates.count must be a non-negative integer")?
+                    as usize,
+            };
+            let band = match map.get("band") {
+                None => default.band,
+                Some(band) => {
+                    let band = band
+                        .as_f64()
+                        .context("plan_candidates.band must be a number")?;
+                    if !(0.0..=1.0).contains(&band) {
+                        bail!("plan_candidates.band must be between 0.0 and 1.0");
+                    }
+                    band
+                }
+            };
+            Ok(PlanCandidatesSetting {
+                count: count.min(PlanCandidatesSetting::MAX_COUNT),
+                band,
+            })
+        }
+        _ => bail!("plan_candidates must be an integer or an object with count/band"),
+    }
+}
+
+impl<'a> Scheduler<'a> {
     /// Bounded candidate scoring: when armed and the eligible list is at
     /// least `min_nodes`, score `sample` uniformly drawn candidates instead
     /// of all of them (best-of-k). Below the threshold the list is returned

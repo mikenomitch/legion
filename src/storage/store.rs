@@ -30,9 +30,9 @@ use crate::storage::queries::{
     UPSERT_MANAGER_CONFIG,
 };
 use crate::structs::{
-    slot_instance_id, Allocation, AllocationHealth, Band, Eval, Instance, InstanceMode,
-    InstanceState, Job, JobConfig, JobTemplateProvenance, KvEntry, KvLock, KvValueType,
-    LedgerEntry, ManagerConfigFull, ManagerNodeConfig, Node, NodeMsg, ReplaceAfter,
+    slot_instance_id, Allocation, AllocationHealth, Band, Eval, EvalFailureReason, Instance,
+    InstanceMode, InstanceState, Job, JobConfig, JobTemplateProvenance, KvEntry, KvLock,
+    KvValueType, LedgerEntry, ManagerConfigFull, ManagerNodeConfig, Node, NodeMsg, ReplaceAfter,
     ResolvedOnLostPolicy, Rollout, RolloutConfig, SigningKeyRecord, StatefulConfig,
     StatefulOnLostConfig, StopCause, Submission, TaskCheck, TaskConfig, TaskCount, TaskDependency,
     TaskLifecycle, TaskOnUnhealthyConfig, TaskSchedule, TaskStatusState, Volume, WorkerConfig,
@@ -218,6 +218,59 @@ pub(crate) type PlanCapacityParts = (
     HashMap<String, Arc<ResourcePool>>,
     u64,
 );
+
+// ---------------------------------------------------------------------------
+// Plan-rejection reasons (`legion_plan_rejected_total{reason}`)
+//
+// Bounded classifications of why a plan submission was rejected at apply.
+// The stored `plan_submission.rejection_reason` stays free text — it
+// interpolates node ids and epoch numbers, which is what makes it useful to
+// a human and impossible as a metric label. These nine are the label.
+//
+// The split that matters: `node_epoch_moved` dominating means CONTENTION
+// (too many planners racing, reduce `evalThreads`), while
+// `node_unavailable` / `node_gone` / `capacity_shrank` dominating means the
+// FLEET moved under the plan, where reducing concurrency is the wrong
+// remedy. Both produce an identical rejection share, which is why the share
+// alone was never enough to act on.
+// ---------------------------------------------------------------------------
+
+/// Two plans raced on one job config. Serialization working as designed.
+pub const PLAN_REJECT_JOB_EPOCH_STALE: &str = "job_epoch_stale";
+/// A concurrent apply took the node. The signature of too much concurrency.
+pub const PLAN_REJECT_NODE_EPOCH_MOVED: &str = "node_epoch_moved";
+/// The node row vanished between the plan and its apply.
+pub const PLAN_REJECT_NODE_GONE: &str = "node_gone";
+/// Cordoned, draining, or lost since the snapshot. Fleet churn.
+pub const PLAN_REJECT_NODE_UNAVAILABLE: &str = "node_unavailable";
+/// Constraints or permits no longer satisfied on the fresh node row.
+pub const PLAN_REJECT_LATE_CONSTRAINT_FAILURE: &str = "late_constraint_failure";
+/// The plan exhausted its per-plan capacity-recheck budget.
+pub const PLAN_REJECT_CAPACITY_RECHECK_BUDGET: &str = "capacity_recheck_budget";
+/// The node's resource totals changed under the plan.
+pub const PLAN_REJECT_CAPACITY_SHRANK: &str = "capacity_shrank";
+/// A static port was taken at bind time.
+pub const PLAN_REJECT_STATIC_PORT_TAKEN: &str = "static_port_taken";
+/// The placement carried no candidates at all — `plan_candidates: 0`, the
+/// mixed-version kill switch, where a single moved epoch has nothing to fall
+/// back to. Not in the original eight: it only appears with candidate lists
+/// disabled, and a report that could not name it would blame contention for
+/// a configuration choice.
+pub const PLAN_REJECT_NO_CANDIDATES: &str = "no_candidates";
+
+/// Every value [`Store::apply_plan_submission_on`] can emit. The metrics doc
+/// and the diagnosis report both enumerate from here.
+pub const PLAN_REJECT_REASONS: &[&str] = &[
+    PLAN_REJECT_JOB_EPOCH_STALE,
+    PLAN_REJECT_NODE_EPOCH_MOVED,
+    PLAN_REJECT_NODE_GONE,
+    PLAN_REJECT_NODE_UNAVAILABLE,
+    PLAN_REJECT_LATE_CONSTRAINT_FAILURE,
+    PLAN_REJECT_CAPACITY_RECHECK_BUDGET,
+    PLAN_REJECT_CAPACITY_SHRANK,
+    PLAN_REJECT_STATIC_PORT_TAKEN,
+    PLAN_REJECT_NO_CANDIDATES,
+];
 
 #[derive(Debug, Clone)]
 pub struct PlanSubmission {
@@ -3314,7 +3367,15 @@ impl Store {
         // displace anything nor leave a partially-bound placement behind.
         // The rollback runs before the UPDATE and the event below, so the
         // rejection itself survives the commit.
+        // `reason` is the free-text explanation that reaches the operator
+        // (it interpolates node ids and epoch numbers, so it can never be a
+        // metric label); `reason_kind` is the bounded classification that
+        // becomes `legion_plan_rejected_total{reason}`. Kept as two
+        // arguments rather than derived from the string, because parsing
+        // prose to recover a class the caller already knew is exactly the
+        // kind of thing that silently rots.
         let reject = |tx: &Connection,
+                      reason_kind: &'static str,
                       reason: String,
                       reverted: Option<usize>|
          -> R<(PlanApplyOutcome, PlanApplyEffects)> {
@@ -3337,9 +3398,9 @@ impl Store {
                 duration_ms = tx_started.elapsed().as_millis() as u64,
                 "Rejected plan submission: {reason}"
             );
-            crate::manager::telemetry::metrics()
-                .plan_apply_total
-                .inc(&["rejected"]);
+            let metrics = crate::manager::telemetry::metrics();
+            metrics.plan_apply_total.inc(&["rejected"]);
+            metrics.plan_rejected_total.inc(&[reason_kind]);
             Ok((
                 PlanApplyOutcome::Rejected {
                     reason,
@@ -3367,7 +3428,7 @@ impl Store {
                 "plan epoch for job config {} is stale; expected {}, latest {}",
                 submission.job_config_id, expected_job_epoch, latest_job_epoch
             );
-            return reject(tx, reason, None);
+            return reject(tx, PLAN_REJECT_JOB_EPOCH_STALE, reason, None);
         }
 
         let (placements_json, plan_mode, evictions_json, target_instance): (
@@ -3540,6 +3601,12 @@ impl Store {
             let mut bound = false;
             let mut first_skip_reason: Option<String> = None;
             let mut first_stale_reason: Option<String> = None;
+            // The bounded twin of each, set at the same sites. Eight
+            // classes that collapse into one free-text `cause` today, and
+            // the distinction between them decides whether the remedy is
+            // "reduce concurrency" or "stop losing nodes".
+            let mut first_skip_kind: Option<&'static str> = None;
+            let mut first_stale_kind: Option<&'static str> = None;
             // `(rank, revalidated)`. Pass-2 entries are appended as pass 1
             // defers them, so they are only reached once every pass-1
             // entry has been tried, and they keep rank order among
@@ -3568,6 +3635,7 @@ impl Store {
                             first_stale_reason = Some(format!(
                                 "node {node_id} epoch moved (expected {expected_epoch}, latest {latest_epoch})"
                             ));
+                            first_stale_kind = Some(PLAN_REJECT_NODE_EPOCH_MOVED);
                         }
                         if revalidation_allowed {
                             attempts.push((rank, true));
@@ -3613,6 +3681,7 @@ impl Store {
                 let Some(node) = node else {
                     if first_skip_reason.is_none() {
                         first_skip_reason = Some(format!("node {node_id} no longer exists"));
+                        first_skip_kind = Some(PLAN_REJECT_NODE_GONE);
                     }
                     continue;
                 };
@@ -3622,6 +3691,7 @@ impl Store {
                             "node {} is {} (cordoned, draining, or lost since the plan snapshot)",
                             node_id, node.availability
                         ));
+                        first_skip_kind = Some(PLAN_REJECT_NODE_UNAVAILABLE);
                     }
                     continue;
                 }
@@ -3634,6 +3704,7 @@ impl Store {
                         first_skip_reason = Some(format!(
                             "node {node_id} does not satisfy constraints for task {task_id}"
                         ));
+                        first_skip_kind = Some(PLAN_REJECT_LATE_CONSTRAINT_FAILURE);
                     }
                     continue;
                 }
@@ -3650,6 +3721,7 @@ impl Store {
                             "node {node_id} was not checked: this plan exhausted its \
                              {pool_rebuild_budget}-node capacity-recheck budget"
                         ));
+                        first_skip_kind = Some(PLAN_REJECT_CAPACITY_RECHECK_BUDGET);
                     }
                     continue;
                 }
@@ -3673,6 +3745,7 @@ impl Store {
                         first_skip_reason = Some(format!(
                             "node {node_id} no longer has capacity for task {task_id} (its resource totals changed since the plan snapshot)"
                         ));
+                        first_skip_kind = Some(PLAN_REJECT_CAPACITY_SHRANK);
                     }
                     continue;
                 }
@@ -3696,6 +3769,7 @@ impl Store {
                     {
                         if first_skip_reason.is_none() {
                             first_skip_reason = Some(format!("node {node_id}: {error:#}"));
+                            first_skip_kind = Some(PLAN_REJECT_STATIC_PORT_TAKEN);
                         }
                         continue;
                     }
@@ -3739,6 +3813,13 @@ impl Store {
                 // so a rejection means no candidate *fits* — capacity, a
                 // constraint, a cordon, a port. Only a ratification (which
                 // skips pass 2) can still be rejected for staleness alone.
+                // Same precedence as the free-text cause: a candidate that
+                // was reached and did not fit explains the rejection better
+                // than one that was skipped for staleness and then
+                // revalidated.
+                let reason_kind = first_skip_kind
+                    .or(first_stale_kind)
+                    .unwrap_or(PLAN_REJECT_NO_CANDIDATES);
                 let cause = first_skip_reason
                     .or(first_stale_reason)
                     .unwrap_or_else(|| "no candidates listed".to_string());
@@ -3750,6 +3831,7 @@ impl Store {
                 );
                 return reject(
                     tx,
+                    reason_kind,
                     reason,
                     body_savepoint.then(|| preempted.victims.len() + allocations.len()),
                 );
@@ -5468,6 +5550,11 @@ impl Store {
     }
 
     fn seed_node_health_apply(&self, node: &NodeMsg) -> R<()> {
+        // `SEED_NODE_HEALTH` is an INSERT OR REPLACE that clears `lost_at`,
+        // so a node that re-registers while marked lost recovers here
+        // instead of through a heartbeat. Sampled before the write, for the
+        // reason in `update_node_heartbeat`.
+        let recovered_from_lost = self.node_is_lost_in_read_model(&node.id);
         let conn = self.write_connection()?;
         conn.execute(
             SEED_NODE_HEALTH,
@@ -5480,6 +5567,11 @@ impl Store {
             },
         )?;
         drop(conn);
+        if recovered_from_lost {
+            crate::manager::telemetry::metrics()
+                .nodes_recovered_total
+                .inc(&["registration"]);
+        }
 
         let node = self.get_node(&node.id)?;
         self.cache_node(node)?;
@@ -5686,7 +5778,19 @@ impl Store {
                 // node out of the liveness scan and out of
                 // `legion_nodes{status="active"}`. This is the same composite
                 // shape with the correct status value.
+                // Sampled BEFORE the write: this arm also fires for
+                // `ready -> active` (a node's first beat after
+                // registration) and on a poisoned read model, and neither
+                // is a recovery. `marked_lost - recovered` is the only way
+                // flapping becomes visible, and counting a first beat as a
+                // recovery would make that difference read negative.
+                let recovered_from_lost = self.node_is_lost_in_read_model(&id);
                 self.update_node_heartbeat_forwarding(id.clone())?;
+                if recovered_from_lost {
+                    crate::manager::telemetry::metrics()
+                        .nodes_recovered_total
+                        .inc(&["heartbeat"]);
+                }
                 self.restore_availability_after_loss(&id);
                 self.liveness.observe(&id);
                 Ok(())
@@ -5770,6 +5874,17 @@ impl Store {
     /// the hottest path in the system does not open a connection. The read
     /// model is the same view the scheduler places from, so a node it does not
     /// have is a node no manager will schedule onto either.
+    /// Whether the read model currently has this node as `lost` — the
+    /// guard on the recovery counter. A poisoned read model answers `false`:
+    /// under-counting a recovery is a missing data point, over-counting one
+    /// is a wrong one.
+    fn node_is_lost_in_read_model(&self, id: &str) -> bool {
+        self.read_model_reader()
+            .ok()
+            .and_then(|guard| guard.nodes.get(id).map(|node| node.status == "lost"))
+            .unwrap_or(false)
+    }
+
     fn beat_disposition(&self, id: &str) -> BeatDisposition {
         let Ok(guard) = self.read_model_reader() else {
             // A poisoned read model is not a reason to reject a live worker;
@@ -12365,11 +12480,9 @@ impl Store {
         // Cheapest accurate point for the queue-depth gauge: the claim (and
         // its superseded-eval sweep) just changed the pending count, and the
         // eval table is small enough that COUNT inside the open tx is cheap.
-        let pending = Self::pending_eval_count_tx(&tx)?;
+        let pending = Self::pending_eval_counts_tx(&tx)?;
         tx.commit()?;
-        crate::manager::telemetry::metrics()
-            .eval_queue_depth
-            .set(pending);
+        Self::publish_eval_queue_depth(pending);
         info!(
             eval_id = eval.id,
             eval_kind = %eval.kind,
@@ -12427,11 +12540,9 @@ impl Store {
             [],
         )?;
 
-        let pending = Self::pending_eval_count_tx(&conn)?;
+        let pending = Self::pending_eval_counts_tx(&conn)?;
         drop(conn);
-        crate::manager::telemetry::metrics()
-            .eval_queue_depth
-            .set(pending);
+        Self::publish_eval_queue_depth(pending);
 
         if updated > 0 && !capture::in_capture() {
             // Recovery moved work from in_flight->pending; wake all waiters.
@@ -12738,25 +12849,149 @@ impl Store {
                    );",
             [],
         )?;
+        // The prune DELETEs pending rows. Without this refresh the gauge
+        // over-reads until the next enqueue or claim happens to correct it,
+        // which on a quiet cluster is never — one of the two paths the
+        // gauge was missing.
+        let pending = Self::pending_eval_counts_tx(&conn)?;
+        drop(conn);
+        Self::publish_eval_queue_depth(pending);
         Ok(removed as u64)
     }
 
-    /// Pending (unclaimed) eval count, used to keep the
-    /// `legion_eval_queue_depth` gauge accurate at the points where the
-    /// pending set changes (enqueue, claim, startup requeue).
-    fn pending_eval_count_tx(conn: &Connection) -> R<i64> {
-        Ok(conn.query_row(
-            "SELECT COUNT(*) FROM eval WHERE status = 'pending';",
-            [],
-            |row| row.get(0),
-        )?)
+    /// Pending (unclaimed) evals BY KIND, used to keep the
+    /// `legion_eval_queue_depth{kind}` gauge accurate at every point where
+    /// the pending set changes (enqueue, claim, startup requeue, both
+    /// requeue paths, and the stale-eval prune).
+    ///
+    /// Grouped rather than counted because one unlabeled depth number cannot
+    /// say WHAT is queued, and that is the whole question: "764 pending"
+    /// reads completely differently once you know 700 of them are node-loss
+    /// reschedules. Ten known kinds is far inside
+    /// [`MAX_SERIES_PER_FAMILY`](crate::manager::telemetry::MAX_SERIES_PER_FAMILY),
+    /// and the same index (`status, ready_at, priority, id`) serves the
+    /// GROUP BY, so this costs what the bare COUNT did.
+    fn pending_eval_counts_tx(conn: &Connection) -> R<Vec<(Vec<String>, i64)>> {
+        let mut stmt = conn
+            .prepare("SELECT type, COUNT(*) FROM eval WHERE status = 'pending' GROUP BY type;")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((vec![row.get::<_, String>(0)?], row.get::<_, i64>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Publish a [`Self::pending_eval_counts_tx`] reading.
+    ///
+    /// Always called AFTER the commit that produced it, never inside the
+    /// transaction: a rolled-back write must not leave a published depth
+    /// behind. `set_all` zeroes kinds that were present before and are not
+    /// now, so a kind that drains reads `0` instead of going stale at its
+    /// last value — the failure mode a plain per-series `set` would have.
+    fn publish_eval_queue_depth(entries: Vec<(Vec<String>, i64)>) {
+        crate::manager::telemetry::metrics()
+            .eval_queue_depth
+            .set_all(&entries);
+    }
+
+    /// Pending (unclaimed) evals grouped by kind, including delayed ones.
+    ///
+    /// Read-only, for `legion scheduler diagnose`: one unlabelled depth
+    /// number cannot say *what* is queued, and "764 pending" reads
+    /// completely differently once you know 5,760 of the last 8,000
+    /// processed were node-loss reschedules.
+    pub fn pending_evals_by_kind(&self) -> R<BTreeMap<String, i64>> {
+        self.eval_counts_by_kind("pending")
+    }
+
+    /// Terminally failed eval rows grouped by kind.
+    ///
+    /// This is the population `legion_evals_processed_total{status="error"}`
+    /// historically did not describe — the counter fired for two retry
+    /// dispositions that leave the eval alive, and never fired for the write
+    /// that actually sets `status = 'failed'`.
+    pub fn failed_evals_by_kind(&self) -> R<BTreeMap<String, i64>> {
+        self.eval_counts_by_kind("failed")
+    }
+
+    fn eval_counts_by_kind(&self, status: &str) -> R<BTreeMap<String, i64>> {
+        let conn = self.read_connection()?;
+        let mut stmt =
+            conn.prepare("SELECT type, COUNT(*) FROM eval WHERE status = ?1 GROUP BY type;")?;
+        let rows = stmt.query_map([status], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        let mut out = BTreeMap::new();
+        for row in rows {
+            let (kind, count) = row?;
+            out.insert(kind, count);
+        }
+        Ok(out)
+    }
+
+    /// Free capacity per node pool, over AVAILABLE nodes only.
+    ///
+    /// Read straight off the scheduling read model's cached per-node free
+    /// pools — the same numbers the planner places against — so the report
+    /// cannot disagree with the scheduler about whether the cluster has
+    /// room. Cordoned, draining, and lost nodes are excluded: capacity a
+    /// placement may not use is not capacity.
+    ///
+    /// A node whose resources failed to fingerprint carries unbounded
+    /// capacity for the dimensions it did not report. Those are counted as
+    /// having room (which is what the planner believes) but contribute
+    /// nothing to the free totals, so an unfingerprinted fleet reads as
+    /// "has room, totals unknown" rather than as infinity.
+    pub fn free_capacity_by_pool(&self) -> R<Vec<crate::manager::diagnose::PoolFreeCapacity>> {
+        use crate::manager::diagnose::PoolFreeCapacity;
+        use crate::resources::ResourceValue;
+
+        let guard = self.read_model_reader()?;
+        let mut by_pool: BTreeMap<String, PoolFreeCapacity> = BTreeMap::new();
+        for node in guard.nodes.values() {
+            if node.availability != "available" {
+                continue;
+            }
+            let entry = by_pool
+                .entry(node.pool.clone())
+                .or_insert_with(|| PoolFreeCapacity {
+                    pool: node.pool.clone(),
+                    ..PoolFreeCapacity::default()
+                });
+            entry.nodes += 1;
+            let Some(pool) = guard.node_pools.get(&node.id) else {
+                // No cached pool means the node is not in the placement
+                // path yet; it counts toward the fleet but claims no room.
+                continue;
+            };
+            let amount = |name: &str| match pool.values.get(name) {
+                Some(ResourceValue::Amount(value)) => *value,
+                // An undeclared dimension is unbounded, per `ResourcePool`.
+                _ => f64::INFINITY,
+            };
+            let cpu = amount("cpu");
+            let memory = amount("memory");
+            if cpu > 0.0 && memory > 0.0 {
+                entry.nodes_with_free_capacity += 1;
+            }
+            if cpu.is_finite() {
+                entry.free_cpu += cpu;
+            }
+            if memory.is_finite() {
+                entry.free_memory_mib += memory;
+            }
+        }
+        Ok(by_pool.into_values().collect())
     }
 
     #[instrument(err, skip_all)]
     pub fn complete_eval(&self, eval_id: &str, succeeded: bool) -> R<()> {
         let eval_id = eval_id.to_owned();
         self.replicated(Lane::Scheduler, "complete_eval", move |s| {
-            s.complete_eval_impl(&eval_id, succeeded, None)
+            s.complete_eval_impl(&eval_id, succeeded, EvalFailureReason::Other, None)
         })
     }
 
@@ -12776,7 +13011,30 @@ impl Store {
     ) -> R<()> {
         let eval_id = eval_id.to_owned();
         self.replicated(Lane::Scheduler, "complete_eval_with_event", move |s| {
-            s.complete_eval_impl(&eval_id, succeeded, Some(event))
+            s.complete_eval_impl(&eval_id, succeeded, EvalFailureReason::Other, Some(event))
+        })
+    }
+
+    /// Fail an eval terminally with its cause classified, recording the
+    /// `eval.failed` event in the same scheduler-lane op.
+    ///
+    /// A sibling of [`Self::complete_eval_with_event`] rather than a wider
+    /// signature on it: the fifteen callers that only ever COMPLETE an eval
+    /// have no reason to name a failure class, and making them pass one they
+    /// must ignore adds noise without adding safety. The safety comes from
+    /// `complete_eval_impl`, which counts every terminal failure whether or
+    /// not the caller classified it — an unclassified one simply lands in
+    /// `reason="other"`.
+    #[instrument(err, skip(self, event))]
+    pub fn fail_eval_with_event(
+        &self,
+        eval_id: &str,
+        reason: EvalFailureReason,
+        event: EventDraft,
+    ) -> R<()> {
+        let eval_id = eval_id.to_owned();
+        self.replicated(Lane::Scheduler, "complete_eval_with_event", move |s| {
+            s.complete_eval_impl(&eval_id, false, reason, Some(event))
         })
     }
 
@@ -12810,6 +13068,13 @@ impl Store {
             "UPDATE eval SET status = 'pending', ready_at = ?2 WHERE id = ?1;",
             params![eval_id, ready_at],
         )?;
+        // The release moved a row back into the pending set — the other
+        // path the gauge was missing. Its event-carrying sibling always
+        // refreshed; this one did not, so a foreign-lane retry storm was
+        // invisible in the depth.
+        let pending = Self::pending_eval_counts_tx(&conn)?;
+        drop(conn);
+        Self::publish_eval_queue_depth(pending);
         Ok(())
     }
 
@@ -12849,13 +13114,11 @@ impl Store {
             "UPDATE eval SET status = 'pending', ready_at = ?2 WHERE id = ?1;",
             params![eval_id, ready_at],
         )?;
-        let pending = Self::pending_eval_count_tx(&tx)?;
+        let pending = Self::pending_eval_counts_tx(&tx)?;
         let staged = self.stage_event_locked(&tx, event);
         tx.commit()?;
         self.publish_staged(staged);
-        crate::manager::telemetry::metrics()
-            .eval_queue_depth
-            .set(pending);
+        Self::publish_eval_queue_depth(pending);
         Ok(())
     }
 
@@ -12863,20 +13126,44 @@ impl Store {
         &self,
         eval_id: &str,
         succeeded: bool,
+        reason: EvalFailureReason,
         event: Option<EventDraft>,
     ) -> R<()> {
         let tx_started = Instant::now();
         let mut conn: MutexGuard<'_, Connection> = self.write_connection()?;
         let tx = Self::write_tx(&mut conn)?;
 
+        // The counter lives HERE, in the write that sets `failed`, rather
+        // than at the call site that decided to fail the eval. That is the
+        // whole point: 264 evals once reached `status: failed` while the
+        // eval counter never moved, because the counter was recorded on one
+        // path and the write was reachable from several. Counting inside
+        // the write makes it structurally impossible for a future caller to
+        // fail an eval invisibly.
+        //
+        // The kind is read from the row rather than threaded in, for the
+        // same reason, and only on the failure path — the success path
+        // (a bare DELETE) keeps exactly the statements it had.
+        let mut failed_kind = None;
         if succeeded {
             tx.execute("DELETE FROM eval WHERE id = ?;", [eval_id])?;
         } else {
+            failed_kind = tx
+                .query_row("SELECT type FROM eval WHERE id = ?;", [eval_id], |row| {
+                    row.get::<_, String>(0)
+                })
+                .optional()?;
             tx.execute("UPDATE eval SET status = 'failed' WHERE id = ?;", [eval_id])?;
         }
         let staged = event.and_then(|draft| self.stage_event_locked(&tx, draft));
         tx.commit()?;
         self.publish_staged(staged);
+        // After the commit: a rolled-back failure is not a failure.
+        if let Some(kind) = failed_kind {
+            crate::manager::telemetry::metrics()
+                .evals_failed_total
+                .inc(&[&kind, reason.as_str()]);
+        }
         debug!(
             eval_id,
             succeeded,
@@ -13032,15 +13319,13 @@ impl Store {
         // row (JC-41): `scheduler_event` is commutative, so a scheduler-lane
         // INSERT is legal, and the row and its event replicate together.
         let enqueue_event = self.stage_event_locked(&tx, drafts::eval_enqueued(&eval, delay));
-        // See `pending_eval_count_tx`: the insert just grew the pending set,
-        // so refresh the queue-depth gauge while the tx is still open.
-        let pending = Self::pending_eval_count_tx(&tx)?;
+        // See `pending_eval_counts_tx`: the insert just grew the pending
+        // set, so read the depth while the tx is still open.
+        let pending = Self::pending_eval_counts_tx(&tx)?;
         tx.commit()?;
         self.publish_staged(enqueue_event);
         drop(conn);
-        crate::manager::telemetry::metrics()
-            .eval_queue_depth
-            .set(pending);
+        Self::publish_eval_queue_depth(pending);
 
         if delay.is_zero() && !capture::in_capture() {
             // Zero-delay evals are immediately claimable, so wake one
@@ -15182,6 +15467,151 @@ mod tests {
         let store = Store::start_storage(&store_config)?;
         store.reset_all_tables()?;
         Ok(store)
+    }
+
+    // -- Scheduler-diagnosis metric gaps (phase 2) ------------------------
+
+    /// The label may not change what the family MEANS: every dashboard
+    /// built on the unlabeled gauge kept working because `sum()` reproduces
+    /// its old value, and this is the assertion that keeps that true.
+    #[test]
+    fn eval_queue_depth_by_kind_sums_to_the_pending_count_test() -> R<()> {
+        let store = setup_store()?;
+        let metrics = crate::manager::telemetry::metrics();
+
+        for (id, status, kind) in [
+            (1, "pending", "job_submit"),
+            (2, "pending", "job_submit"),
+            (3, "pending", "node_lost_reschedule"),
+            (4, "in_flight", "job_submit"),
+            (5, "failed", "job_update"),
+        ] {
+            insert_eval(&store, id, status, kind, None, None, None, 50)?;
+        }
+
+        let conn = store.read_connection()?;
+        let entries = Store::pending_eval_counts_tx(&conn)?;
+        drop(conn);
+        let total: i64 = entries.iter().map(|(_, count)| *count).sum();
+        assert_eq!(total, 3, "in_flight and failed rows are not pending");
+
+        Store::publish_eval_queue_depth(entries);
+        assert_eq!(metrics.eval_queue_depth.get(&["job_submit"]), 2);
+        assert_eq!(metrics.eval_queue_depth.get(&["node_lost_reschedule"]), 1);
+        // A kind that never had a pending row has no series at all, which
+        // reads as 0 — the same answer, without a fabricated series.
+        assert_eq!(metrics.eval_queue_depth.get(&["job_update"]), 0);
+
+        // Drain the reschedule kind: it must read 0, not stay at its last
+        // value. A stale series is worse than no series, because it is
+        // indistinguishable from a real one.
+        let conn = store.write_connection()?;
+        conn.execute("DELETE FROM eval WHERE type = 'node_lost_reschedule';", [])?;
+        let entries = Store::pending_eval_counts_tx(&conn)?;
+        drop(conn);
+        Store::publish_eval_queue_depth(entries);
+        assert_eq!(metrics.eval_queue_depth.get(&["node_lost_reschedule"]), 0);
+        assert_eq!(metrics.eval_queue_depth.get(&["job_submit"]), 2);
+        Ok(())
+    }
+
+    /// The leak-proofing is the point: the counter lives in the store write,
+    /// so a caller that fails an eval without classifying it still counts.
+    #[test]
+    fn failing_an_eval_from_any_caller_increments_the_failure_counter_test() -> R<()> {
+        let store = setup_store()?;
+        let metrics = crate::manager::telemetry::metrics();
+        let before = metrics.evals_failed_total.get(&["node_drop", "other"]);
+        let classified = metrics
+            .evals_failed_total
+            .get(&["node_drop", "no_capacity"]);
+
+        insert_eval(&store, 1, "pending", "node_drop", None, None, None, 50)?;
+        insert_eval(&store, 2, "pending", "node_drop", None, None, None, 50)?;
+
+        // The bare `complete_eval(.., false)` any caller can reach.
+        store.complete_eval("1", false)?;
+        assert_eq!(
+            metrics.evals_failed_total.get(&["node_drop", "other"]),
+            before + 1,
+            "an unclassified failure must still be counted"
+        );
+
+        // And the classified sibling.
+        store.fail_eval_with_event(
+            "2",
+            EvalFailureReason::NoCapacity,
+            drafts::eval_failed(
+                &Eval {
+                    id: "2".into(),
+                    kind: "node_drop".into(),
+                    status: "in_flight".into(),
+                    job_id: String::new(),
+                    job_config_id: String::new(),
+                    node_name: String::new(),
+                    priority: 50,
+                },
+                &anyhow!("no available nodes matching constraints"),
+                Duration::from_millis(1),
+            ),
+        )?;
+        assert_eq!(
+            metrics
+                .evals_failed_total
+                .get(&["node_drop", "no_capacity"]),
+            classified + 1
+        );
+
+        // A successful completion counts nothing — it deletes the row.
+        let unchanged = metrics.evals_failed_total.get(&["node_drop", "other"]);
+        insert_eval(&store, 3, "pending", "node_drop", None, None, None, 50)?;
+        store.complete_eval("3", true)?;
+        assert_eq!(
+            metrics.evals_failed_total.get(&["node_drop", "other"]),
+            unchanged
+        );
+        Ok(())
+    }
+
+    /// `marked_lost - recovered` is the only way flapping becomes visible,
+    /// so a `ready -> active` first beat must NOT count as a recovery.
+    #[test]
+    fn node_recovery_counts_only_a_node_that_was_lost_test() -> R<()> {
+        let store = setup_store()?;
+        let metrics = crate::manager::telemetry::metrics();
+        let before = metrics.nodes_recovered_total.get(&["heartbeat"]);
+
+        let node = make_node("recovery-node");
+        store.cache_node(node.clone())?;
+        assert!(
+            !store.node_is_lost_in_read_model("recovery-node"),
+            "a `ready` node is not a recovered one"
+        );
+
+        let mut lost = node;
+        lost.status = "lost".into();
+        store.cache_node(lost)?;
+        assert!(store.node_is_lost_in_read_model("recovery-node"));
+
+        // Unknown nodes and a healthy model both answer "not lost".
+        assert!(!store.node_is_lost_in_read_model("no-such-node"));
+        assert_eq!(metrics.nodes_recovered_total.get(&["heartbeat"]), before);
+        Ok(())
+    }
+
+    /// The rejection labels are a stable, bounded vocabulary; a new site
+    /// must add its value here rather than inventing a free-text one.
+    #[test]
+    fn plan_rejection_reasons_are_bounded_and_unique_test() {
+        let mut seen = std::collections::HashSet::new();
+        for reason in PLAN_REJECT_REASONS {
+            assert!(seen.insert(*reason), "duplicate rejection reason {reason}");
+            assert!(
+                reason.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
+                "{reason} is not a snake_case label"
+            );
+        }
+        assert_eq!(seen.len(), 9);
     }
 
     #[test]

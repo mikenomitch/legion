@@ -703,10 +703,14 @@ pub struct Metrics {
     pub grpc_in_flight: Arc<GaugeVec>,
     /// `legion_evals_processed_total{kind,status}`
     pub evals_processed_total: Arc<CounterVec>,
-    /// `legion_eval_queue_depth`
-    pub eval_queue_depth: Arc<Gauge>,
+    /// `legion_evals_failed_total{kind,reason}`
+    pub evals_failed_total: Arc<CounterVec>,
+    /// `legion_eval_queue_depth{kind}`
+    pub eval_queue_depth: Arc<GaugeVec>,
     /// `legion_plan_apply_total{outcome}`
     pub plan_apply_total: Arc<CounterVec>,
+    /// `legion_plan_rejected_total{reason}`
+    pub plan_rejected_total: Arc<CounterVec>,
     /// `legion_scheduler_plan_candidate_rank`
     pub scheduler_plan_candidate_rank: Arc<Histogram>,
     /// `legion_scheduler_plan_bind_pass{pass}`
@@ -784,6 +788,8 @@ pub struct Metrics {
     pub heartbeat_sustainable_nodes: Arc<Gauge>,
     /// `legion_nodes_marked_lost_total`
     pub nodes_marked_lost_total: Arc<Counter>,
+    /// `legion_nodes_recovered_total{path}`
+    pub nodes_recovered_total: Arc<CounterVec>,
     /// `legion_liveness_tracked_nodes`
     pub liveness_tracked_nodes: Arc<Gauge>,
     /// `legion_liveness_responsible_seconds`
@@ -832,24 +838,40 @@ impl Metrics {
         let evals_processed_total = Arc::new(CounterVec {
             meta: FamilyMeta {
                 name: "legion_evals_processed_total",
-                help: "Scheduler evals completed, by eval kind and outcome status (ok|error).",
+                help: "Scheduler evals dispatched, by eval kind and DISPOSITION: `ok` (handled, row deleted), `retried` (released back to the pending queue — a foreign-lane leader rejection or plan-conflict exhaustion; the eval is still alive and will run again), or `failed` (terminally failed, never retried). Recorded after the disposition is decided, so `failed` here equals the eval rows that reach status `failed`. Count terminal failures with legion_evals_failed_total, which also carries the reason.",
                 labels: &["kind", "status"],
             },
             series: Series::new(),
         });
-        let eval_queue_depth = Arc::new(Gauge {
+        let evals_failed_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_evals_failed_total",
+                help: "Evals that TERMINALLY failed, by kind and bounded reason (no_capacity|unsupported_kind|conflict_exhausted|store_error|other). Recorded inside the store write that sets the eval row to `failed`, so no caller can fail an eval without counting it. A failed eval is never retried, and the job it belonged to still reports its own lifecycle status — this counter is the only place a terminal failure is visible.",
+                labels: &["kind", "reason"],
+            },
+            series: Series::new(),
+        });
+        let eval_queue_depth = Arc::new(GaugeVec {
             meta: FamilyMeta {
                 name: "legion_eval_queue_depth",
-                help: "Pending (unclaimed) evals in the scheduler queue, including delayed ones.",
-                labels: &[],
+                help: "Pending (unclaimed) evals in the scheduler queue, including delayed ones, by eval kind. `sum()` reproduces the unlabeled value this family had before the label existed; a query that selects the bare series without an aggregator now returns one series per kind. A kind that drains reads 0 rather than disappearing.",
+                labels: &["kind"],
             },
-            cell: GaugeCell::default(),
+            series: Series::new(),
         });
         let plan_apply_total = Arc::new(CounterVec {
             meta: FamilyMeta {
                 name: "legion_plan_apply_total",
                 help: "Scheduler plan submissions applied to the store, by outcome (applied|rejected).",
                 labels: &["outcome"],
+            },
+            series: Series::new(),
+        });
+        let plan_rejected_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_plan_rejected_total",
+                help: "Plan submissions rejected at apply, by bounded reason. `node_epoch_moved` dominating is the signature of TOO MUCH CONCURRENCY — reduce evalThreads. `node_unavailable`/`node_gone`/`capacity_shrank` dominating is fleet churn instead, and reducing concurrency is the WRONG remedy there. A separate family from legion_plan_apply_total{outcome=\"rejected\"} so that family's series shape, and every dashboard on it, is unchanged; the two totals agree.",
+                labels: &["reason"],
             },
             series: Series::new(),
         });
@@ -1177,6 +1199,14 @@ impl Metrics {
             },
             cell: CounterCell::default(),
         });
+        let nodes_recovered_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_nodes_recovered_total",
+                help: "Nodes that came back from `lost`, by the path that recovered them: `heartbeat` (the node beat again) or `registration` (it re-registered). The mirror image of legion_nodes_marked_lost_total — read the two together, because `marked_lost` alone cannot distinguish a fleet that shrank from a fleet that is flapping.",
+                labels: &["path"],
+            },
+            series: Series::new(),
+        });
 
         // Node liveness (docs/node-liveness.md).
         let liveness_tracked_nodes = Arc::new(Gauge {
@@ -1242,6 +1272,7 @@ impl Metrics {
             Arc::clone(&heartbeat_lost_window_seconds) as Arc<dyn RenderMetric>,
             Arc::clone(&heartbeat_sustainable_nodes) as Arc<dyn RenderMetric>,
             Arc::clone(&nodes_marked_lost_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&nodes_recovered_total) as Arc<dyn RenderMetric>,
             Arc::clone(&liveness_tracked_nodes) as Arc<dyn RenderMetric>,
             Arc::clone(&liveness_responsible_seconds) as Arc<dyn RenderMetric>,
             Arc::clone(&liveness_digest_rpcs_total) as Arc<dyn RenderMetric>,
@@ -1250,6 +1281,7 @@ impl Metrics {
             Arc::clone(&liveness_loss_suppressed_total) as Arc<dyn RenderMetric>,
             Arc::clone(&liveness_checkpoint_seconds) as Arc<dyn RenderMetric>,
             Arc::clone(&allocations) as Arc<dyn RenderMetric>,
+            Arc::clone(&evals_failed_total) as Arc<dyn RenderMetric>,
             Arc::clone(&eval_queue_depth) as Arc<dyn RenderMetric>,
             Arc::clone(&evals_processed_total) as Arc<dyn RenderMetric>,
             Arc::clone(&grpc_in_flight) as Arc<dyn RenderMetric>,
@@ -1259,6 +1291,7 @@ impl Metrics {
             Arc::clone(&nodes) as Arc<dyn RenderMetric>,
             Arc::clone(&eval_conflict_requeues_total) as Arc<dyn RenderMetric>,
             Arc::clone(&plan_apply_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&plan_rejected_total) as Arc<dyn RenderMetric>,
             Arc::clone(&preemption_plans_total) as Arc<dyn RenderMetric>,
             Arc::clone(&preemptions_total) as Arc<dyn RenderMetric>,
             Arc::clone(&raft_applied_index) as Arc<dyn RenderMetric>,
@@ -1295,8 +1328,10 @@ impl Metrics {
             grpc_request_duration_seconds,
             grpc_in_flight,
             evals_processed_total,
+            evals_failed_total,
             eval_queue_depth,
             plan_apply_total,
+            plan_rejected_total,
             scheduler_plan_bind_pass,
             scheduler_plan_candidate_rank,
             eval_conflict_requeues_total,
@@ -1335,6 +1370,7 @@ impl Metrics {
             heartbeat_lost_window_seconds,
             heartbeat_sustainable_nodes,
             nodes_marked_lost_total,
+            nodes_recovered_total,
             liveness_tracked_nodes,
             liveness_responsible_seconds,
             liveness_digest_rpcs_total,
@@ -1361,6 +1397,24 @@ pub fn render() -> String {
         family.render_into(&mut out);
     }
     out
+}
+
+/// Structured snapshot of the MANAGER registry only, including families that
+/// currently hold no series.
+///
+/// In-process readers of the manager's own numbers (`legion scheduler
+/// diagnose`) use this instead of scraping `/metrics` over HTTP. Unlike
+/// [`snapshot_initialized_families`] it *creates* the registry if it does
+/// not exist, so the caller can tell "this family exists and is empty" from
+/// "this build has no such family" — a distinction that matters, because
+/// treating an absent counter as a zero reading is how a health check once
+/// reported success for a step that had never run.
+pub fn snapshot_manager_families() -> Vec<FamilySnapshot> {
+    metrics()
+        .families
+        .iter()
+        .map(|family| family.snapshot_family())
+        .collect()
 }
 
 /// Structured snapshots of every family in every registry this process has

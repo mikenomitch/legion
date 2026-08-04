@@ -482,6 +482,33 @@ service Manager {
   rpc GetHeartbeatCadence (GetHeartbeatCadenceRequest)
     returns (GetHeartbeatCadenceReply);
 
+  // Reports whether the scheduler is healthy and, when it is not, which
+  // condition it is in and what to change.
+  //
+  // Read-only: nothing in this call mutates the cluster or tunes a knob. It
+  // samples the manager's in-process metric registry twice, `sample_seconds`
+  // apart, so every number it reports is a rate over a stated window rather
+  // than a since-boot average, and reads eval-queue composition and free
+  // capacity from the store. Backs `legion scheduler diagnose`.
+  //
+  // The reply's organising idea is that every finding carries the
+  // DISCRIMINATING NEIGHBOUR — the number that proves what the headline
+  // number means — including for the causes it ruled out. Checks that PASSED
+  // are returned too, in `passed`, each with the number that made it pass:
+  // silence on a passing check is what makes the next responder
+  // re-investigate a cause somebody already excluded.
+  //
+  // Answer with care on a manager that does not lead the scheduler lane: its
+  // scheduler counters are near zero because the work is happening
+  // elsewhere. Check `is_scheduler_lane_leader` in the reply, and ask the
+  // manager that does lead (`legion raft status` names it).
+  //
+  // ACL: operator:read, unscoped (the report is cluster-wide, and exposes
+  // queue composition and free capacity).
+  // See docs/diagnosing-scheduler-performance.md.
+  rpc DiagnoseScheduler (DiagnoseSchedulerRequest)
+    returns (DiagnoseSchedulerReply);
+
   // Proxies a restart request to a worker node.
   rpc RestartWorker (RestartWorkerRequest) returns (RestartWorkerReply);
 
@@ -5988,4 +6015,159 @@ message RaftMemberInfo {
 
   // True for voters, false for learners still catching up.
   bool voter = 4;
+}
+
+// ---------------------------------------------------------------------------
+// Scheduler diagnosis (docs/diagnosing-scheduler-performance.md)
+// ---------------------------------------------------------------------------
+
+// Request payload for DiagnoseScheduler.
+message DiagnoseSchedulerRequest {
+  // How long, in seconds, to sample the metric registry before answering.
+  //
+  // The handler takes one snapshot, waits this long, takes another, and
+  // reports the DELTA — so "31.9% of plans rejected" means during this
+  // window, not since the manager booted. The call therefore blocks for
+  // roughly this long; clients must set a deadline above it.
+  //
+  // `0` skips the wait and reports since-boot values instead, and the reply
+  // echoes `sample_seconds: 0` so a reader can tell the difference. Since-
+  // boot values on a long-lived manager are an average over every regime it
+  // has been in, which is the reading this whole feature exists to stop
+  // people from making — use it only when you want the lifetime picture.
+  //
+  // Unset (0 on the wire) is therefore "since boot", NOT "use the default":
+  // the CLI sends its own default of 30. Values above 300 are clamped to
+  // 300; a diagnosis is a 3am command, not a batch job.
+  uint32 sample_seconds = 1;
+}
+
+// One `key: value` pair of supporting evidence.
+//
+// Deliberately a repeated pair rather than a map: the order the detector
+// wrote its evidence in IS the order it reasoned in, and rendering the
+// headline number after the ones that qualify it would defeat the purpose.
+// Maps have no order on the wire.
+message SchedulerEvidence {
+  // Stable camelCase identifier, e.g. `rejectionShare`, `freshnessRatio`,
+  // `pipelineWaitSchedulerP99`. Additive over time; treat unknown keys as
+  // informational rather than an error.
+  string key = 1;
+
+  // The value, already formatted for display (`31.9%`, `3.07ms`, `0.98`).
+  // Formatted rather than numeric on purpose: the unit is part of the
+  // reading, and a bare `3.07` invites exactly the misreading this report
+  // exists to prevent. Parse `key`-specific numerics if you need them.
+  string value = 2;
+}
+
+// A cause this finding EXCLUDED, and the number that excluded it.
+//
+// Required on every failing finding — a finding that cannot name what it
+// ruled out does not ship. This is the field that distinguishes this report
+// from a metric dump: it carries the neighbouring number that rules a cause
+// out, not only the one that rules a cause in.
+message SchedulerRuledOut {
+  // Stable snake_case cause identifier, e.g. `cpu_bound`, `pool_full`,
+  // `candidate_lists_disabled`, `scheduler_tuning`.
+  string cause = 1;
+
+  // What proves it is not this. Never empty.
+  repeated SchedulerEvidence evidence = 2;
+}
+
+// What to do about a finding. Names the field and the direction so a human
+// can check the change before it lands and an agent can propose it without
+// inventing one.
+message SchedulerAction {
+  // `config` (change a manager-config field), `capacity` (add hardware — no
+  // knob applies), or `investigate` (read something specific first).
+  string kind = 1;
+
+  // The manager-config field to change, when `kind` is `config`. Empty
+  // otherwise. Dotted where the field is nested,
+  // e.g. `schedulerSettings.score_sample`.
+  string field = 2;
+
+  // The field's CURRENT value, read from this manager's resolved config, so
+  // "reduce evalThreads (currently 16)" needs no second lookup.
+  string current = 3;
+
+  // `decrease` or `increase`. Empty when `kind` is not `config`.
+  string direction = 4;
+
+  // The value to try. A starting point that is expected to be re-measured,
+  // not a computed optimum.
+  string suggested = 5;
+
+  // The remedy in a sentence, including why it points the way it does.
+  string text = 6;
+}
+
+// One detector's verdict.
+message SchedulerFinding {
+  // Stable finding code, e.g. `plan_rejection_storm`, `scheduler_lane_queued`,
+  // `heartbeat_ceiling`, `phase_growth`, `eval_starvation`,
+  // `invisible_eval_failures`, `capacity_exhausted`.
+  //
+  // **A stable API**: codes are additive only and are never renamed, because
+  // runbooks and agents branch on them. A client that does not recognise a
+  // code should report it verbatim rather than dropping it.
+  string code = 1;
+
+  // `critical`, `warning`, or `ok`. Findings in `passed` are always `ok`;
+  // findings in `findings` never are.
+  string severity = 2;
+
+  // One line carrying the headline number.
+  string title = 3;
+
+  // What it means and what it costs, in prose meant to be shown as-is.
+  string detail = 4;
+
+  // The numbers behind the verdict, in the order they were reasoned about.
+  repeated SchedulerEvidence evidence = 5;
+
+  // Causes excluded, with proof. Non-empty on every failing finding.
+  repeated SchedulerRuledOut ruled_out = 6;
+
+  // The remedy. Present on every failing finding; absent on passing ones.
+  SchedulerAction action = 7;
+
+  // Path and anchor of the doc section that explains this condition,
+  // e.g. `docs/diagnosing-scheduler-performance.md#symptom-throughput-fell-when-i-scaled-up`.
+  string doc = 8;
+
+  // True when `heartbeat_ceiling` also fired. A fleet that cannot sustain
+  // its heartbeat cadence generates scheduler load — reschedule evals, plan
+  // churn — that looks exactly like a scheduler problem, so every other
+  // finding in that report may be a downstream symptom. Fix cadence first,
+  // then re-run.
+  bool secondary = 9;
+}
+
+// Reply payload for DiagnoseScheduler — one cluster-wide scheduler report.
+message DiagnoseSchedulerReply {
+  // `healthy` (nothing fired), `degraded` (at least one `warning`), or
+  // `unhealthy` (at least one `critical`).
+  string verdict = 1;
+
+  // The window every rate in this reply covers, echoing the request. `0`
+  // means the numbers are since-boot rather than a rate.
+  uint32 sample_seconds = 2;
+
+  // Whether the manager that answered leads the scheduler lane (always true
+  // outside raft mode and in `single` topology). When false its scheduler
+  // counters describe a process that is not scheduling, so the report says
+  // what it can and names the limitation rather than diagnosing an idle
+  // process.
+  bool is_scheduler_lane_leader = 3;
+
+  // Checks that FAILED, worst first.
+  repeated SchedulerFinding findings = 4;
+
+  // Checks that PASSED, each carrying the number that made it pass. Returned
+  // deliberately: "eval_starvation ok, job_submit 61% of processed evals" is
+  // the reading that stops the next responder re-investigating starvation.
+  repeated SchedulerFinding passed = 5;
 }

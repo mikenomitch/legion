@@ -16,6 +16,90 @@ including the ones where the first reading was wrong.
 
 ---
 
+## Start here: run the command
+
+```console
+$ legion scheduler diagnose
+```
+
+One read-only command that samples the manager's metrics over a window,
+applies every check on this page, and prints a verdict with the remedy
+attached. It exists because working through this page by hand takes an hour
+and a Prometheus scrape, and because the rule above is easy to break at 3am.
+
+```console
+$ legion scheduler diagnose
+Scheduler                 DEGRADED   (sampled 30s)
+
+  ✗ plan_rejection_storm            critical
+    31.9% of plans rejected (1,247 rejected / 3,912 total)
+    Each rejection is a discarded plan plus a full eval retry: the work is
+    done twice and placed once.
+    rejectionShare=0.319; planApplyApplied=2503; planApplyRejected=1247
+    Ruled out: candidate_lists_disabled (planCandidates=8); pool_full
+               (candidateRankP50=0.0)
+    → Reduce evalThreads from 16 to 8 and re-measure. Fewer planners racing
+      means fewer discarded plans, and measured throughput goes up, not down.
+      docs/diagnosing-scheduler-performance.md#symptom-throughput-fell-when-i-scaled-up
+
+  ✓ heartbeat_ceiling               freshness 0.98 (false loss below 0.20)
+  ✓ scheduler_lane_queued           scheduler lane wait 0.09ms against 0.08ms on status
+  ✓ phase_growth                    apply 6.70ms of 9.30ms total
+  ✓ eval_starvation                 job_submit 61.0% of processed evals
+  ✓ invisible_eval_failures         0 failed evals in the window
+  ✓ capacity_exhausted              184 of 200 available nodes still have room
+
+Nothing here mutates the cluster. See docs/diagnosing-scheduler-performance.md.
+```
+
+Four things about that output are deliberate:
+
+- **Checks that PASSED are printed, with their numbers.** "eval_starvation ✓
+  job_submit 61%" is the reading that stops the next responder
+  re-investigating starvation. Silence on a passing check reproduces the
+  exact failure this page exists to fix.
+- **`Ruled out:` is required on every failing check.** A check that cannot
+  name what it excluded — and the number that excluded it — is a bug in the
+  command, not a terse report.
+- **The remedy names the field, the direction, and the current value.** It
+  reads `evalThreads` out of the manager's own config, so "reduce evalThreads
+  from 16 to 8" needs no second lookup.
+- **The window is in the header.** Every rate is a delta over that window,
+  never a since-boot average.
+
+| Flag | Meaning |
+| --- | --- |
+| `--sample <dur>` | Sampling window, default `30s`. The command blocks for it. `0s` reports since-boot values and says so in the header. Maximum `300s`. |
+| `--watch` | Re-sample and reprint until interrupted. |
+| `-j` / `--json` | The standard envelope, for agents and scripts. |
+
+### The finding codes
+
+Stable, additive-only identifiers you can branch on in a runbook or an agent.
+Each links to the section of this page that explains it.
+
+| Code | Fires when | The discriminator it carries |
+| --- | --- | --- |
+| [`heartbeat_ceiling`](#symptom-slow-placements-and-nodes-flapping-lost) | Freshness is below 0.5, or below the false-loss line | Served interval, lost window, fleet size, lost-vs-recovered counts |
+| [`plan_rejection_storm`](#symptom-throughput-fell-when-i-scaled-up) | Rejection share above 5% (warning) / 20% (critical) | `plan_candidates`, candidate-rank p50, index candidates per task, the rejection reason mix |
+| [`scheduler_lane_queued`](#symptom-the-box-is-idle-and-throughput-is-still-capped) | Scheduler-lane `pipeline_wait` p99 above 1ms **and** 5x the quietest lane, with `propose_apply` flat | Spawn delay, in-flight vs worker threads, per-lane `propose_apply` |
+| [`phase_growth`](#symptom-it-got-slower-as-the-cluster-grew) | One phase holds over half of `total`, or over 20% is outside any phase | The full phase mix as percentages |
+| [`eval_starvation`](#symptom-new-work-waits-behind-a-backlog-of-other-work) | One kind is over 60% of processed evals **and** depth is over 100 | The full kind mix and the queue depth |
+| [`invisible_eval_failures`](#symptom-nothing-is-running-and-nothing-reports-an-error) | Any eval failed terminally in the window | The failure count by kind, against `evals_processed_total{status}` |
+| [`capacity_exhausted`](#symptom-the-cluster-is-full-and-no-knob-helps) | No available node has room while work is pending | Free capacity per pool |
+
+`heartbeat_ceiling` is evaluated first and printed first whatever its
+severity. When it fires, every other finding is marked **secondary**: a fleet
+that cannot sustain its cadence generates scheduler load, and tuning the
+scheduler first is the most expensive wrong turn on this page.
+
+### If you would rather read the metrics yourself
+
+The rest of this page is the manual version, and stays the authority on what
+each signal means. Everything below is what the command automates.
+
+---
+
 ## Start here
 
 | What you are seeing | Go to |
@@ -26,6 +110,7 @@ including the ones where the first reading was wrong.
 | New submissions take seconds while the cluster is otherwise busy | [Eval starvation](#symptom-new-work-waits-behind-a-backlog-of-other-work) |
 | Placements look glacial and nodes keep going `lost` | [Heartbeat ceiling](#symptom-slow-placements-and-nodes-flapping-lost) |
 | Nothing is running, and nothing reports an error | [Invisible failures](#symptom-nothing-is-running-and-nothing-reports-an-error) |
+| Work will not place and the fleet looks full | [Capacity exhausted](#symptom-the-cluster-is-full-and-no-knob-helps) |
 
 Before any of them, take **thirty seconds** on the two questions that decide
 whether you are even in the right subsystem:
@@ -75,6 +160,7 @@ counter-intuitive and it is correct.
 legion_plan_apply_total{outcome="rejected"}
 legion_plan_apply_total{outcome="applied"}
 legion_plan_apply_total{outcome="fallback"}
+legion_plan_rejected_total{reason}          # and WHY they were rejected
 ```
 
 Compute the rejection share over a window (not since boot):
@@ -151,44 +237,44 @@ the contention is being absorbed and the remaining rejections are real capacity.
    plans built against a snapshot that is already losing. It changes where the
    work is wasted, not how much.
 
-**Known limitation.** Legion cannot yet tell you *why* a plan was rejected. A
-stale job-config epoch, a node whose epoch moved under a concurrent apply, a
-cordon, a shrunken node, and a static-port collision all land in the same
-`rejected` counter, and only the free-text rejection string on the
-`plan_submission` row distinguishes them. Until a `reason`-labelled counter
-exists, read the strings:
+### Why the plan was rejected
 
-The strings embed node and task ids, so grouping on the raw column gives one
-group per row. Classify them instead:
+The rejection *share* alone cannot tell contention from fleet churn, and they
+take opposite remedies — which is the single most expensive guess available on
+this page. `legion_plan_rejected_total{reason}` is the discriminator:
 
-```console
-$ legion state query "SELECT CASE \
-    WHEN rejection_reason LIKE '%plan epoch for job config%' THEN 'job_epoch_stale' \
-    WHEN rejection_reason LIKE '%epoch moved%'               THEN 'node_epoch_moved' \
-    WHEN rejection_reason LIKE '%cordoned, draining, or lost%' THEN 'node_unavailable' \
-    WHEN rejection_reason LIKE '%no longer has capacity%'    THEN 'capacity_shrank' \
-    WHEN rejection_reason LIKE '%does not satisfy constraints%' THEN 'late_constraint' \
-    WHEN rejection_reason LIKE '%no longer exists%'          THEN 'node_gone' \
-    WHEN rejection_reason LIKE '%capacity-recheck budget%'   THEN 'recheck_budget' \
-    ELSE 'other' END AS reason, COUNT(*) AS n \
-    FROM plan_submission WHERE status = 'rejected' GROUP BY 1 ORDER BY 2 DESC;"
+```
+legion_plan_rejected_total{reason="node_epoch_moved"}     # contention
+legion_plan_rejected_total{reason="node_unavailable"}     # fleet churn
 ```
 
-**The classification changes the remedy**, which is why guessing is expensive:
+The totals agree with `legion_plan_apply_total{outcome="rejected"}`; it is a
+separate family so the existing one's series shape is unchanged.
 
-| Reason | Cause | Remedy |
+| `reason` | Cause | Remedy |
 | --- | --- | --- |
-| `node_epoch_moved` | A concurrent apply took the node *and* the placement could not be revalidated onto it — only an edge-boot ratification (`target_instance`) rejects on epoch alone. | Rare. If you see volume here, look at `speculativeStart` jobs, not at `evalThreads`. |
+| `node_epoch_moved` | A concurrent apply took the node *and* the placement could not be revalidated onto it — only an edge-boot ratification (`target_instance`) rejects on epoch alone. | **The signature of too much concurrency.** Reduce `evalThreads`. If the volume is on `speculativeStart` jobs, look there instead. |
 | `job_epoch_stale` | Two plans raced on one job config | Reduce concurrency; job-config epochs are a hard all-or-nothing fence. |
 | `node_unavailable` | Cordoned, draining, or lost since the plan snapshot | **Fleet churn, not contention.** Reducing `evalThreads` will not help. Find what is cordoning or losing nodes. |
 | `capacity_shrank` | A worker re-registered with smaller totals | Check worker configs and re-registrations. |
-| `late_constraint` | Constraints or permits no longer satisfied | Check node attribute churn. |
+| `late_constraint_failure` | Constraints or permits no longer satisfied | Check node attribute churn. |
 | `node_gone` | The node row vanished mid-plan | Usually deregistration or a wiped fleet. |
-| `recheck_budget` | The plan ran out of its per-plan capacity-recheck budget | Contention plus long candidate lists; reduce concurrency. |
+| `capacity_recheck_budget` | The plan ran out of its per-plan capacity-recheck budget | Contention plus long candidate lists; reduce concurrency. |
+| `static_port_taken` | A static port collided at bind time | Two jobs want the same host port. A jobspec problem, not a tuning one. |
+| `no_candidates` | The placement carried no candidate list | `schedulerSettings.plan_candidates` is `0` — the mixed-version kill switch. Set it back to `8`. |
 
-Tracked in [internal_docs/TODO.md](../internal_docs/TODO.md) under *Scheduling &
-placement*, alongside the striped-candidate-list work that would reduce the
-collisions in the first place.
+`legion scheduler diagnose` branches on exactly this mix: a churn-dominated
+report drops the `evalThreads` advice and tells you to investigate the fleet
+instead.
+
+The free-text `plan_submission.rejection_reason` column is still there and still
+richer — it names the node and the epochs — when you need to look at individual
+rejections rather than the mix:
+
+```console
+$ legion state query "SELECT rejection_reason FROM plan_submission \
+    WHERE status = 'rejected' ORDER BY id DESC LIMIT 20;"
+```
 
 ---
 
@@ -338,7 +424,7 @@ Confirm the mix first.
 
 ```
 legion_evals_processed_total{kind}      # by kind, over a window
-legion_eval_queue_depth
+legion_eval_queue_depth{kind}           # what is queued, not just how much
 ```
 
 **Worked example**
@@ -357,21 +443,38 @@ ASC`, and a `node_lost_reschedule` enqueued with no priority inherits the same
 default (50) that a normal job gets. At equal priority the autoincrement id
 decides, so a new submit can **never** overtake an older backlog.
 
-**Known limitation, and the workaround**
+**Reading the composition**
 
-`legion_eval_queue_depth` is a **single unlabelled gauge**. It tells you the
-queue is 764 deep and nothing about what is in it, which is exactly the
-information this diagnosis needs. Until it carries a `kind` label, read the
-queue composition from the store directly:
+`legion_eval_queue_depth` carries a `{kind}` label, so the queue says what is
+in it rather than only how much:
+
+```
+legion_eval_queue_depth{kind="node_lost_reschedule"}  700
+legion_eval_queue_depth{kind="job_submit"}             64
+```
+
+`sum(legion_eval_queue_depth)` is the old unlabelled value, unchanged, so
+existing dashboards keep working. A kind that drains reads `0` rather than
+disappearing.
+
+The gauge is maintained by the writes each manager performs, and the eval queue
+is a replicated table — so on a manager that is not leading the scheduler lane
+the gauge is stale by construction. `legion scheduler diagnose` reads the table
+for this reason and reports the gauge beside it. By hand:
 
 ```console
-$ legion state query "SELECT kind, status, COUNT(*) FROM eval \
+$ legion state query "SELECT type AS kind, status, COUNT(*) FROM eval \
     WHERE status IN ('pending','in_flight') GROUP BY 1,2 ORDER BY 3 DESC;"
 ```
 
 `legion state seed-queries` installs `agent:pending-evals` and
 `agent:recent-failed-evals`, which cover the same ground as saved queries for
 agents and the UI State Explorer.
+
+**Known limitation.** There is no queue-*age* metric — the eval table has no
+creation timestamp — so a 764-deep queue draining in two seconds and one taking
+six seconds per item produce the same reading, and `eval_starvation` fires on
+depth plus kind mix rather than on how long anything has actually waited.
 
 **Actions**
 
@@ -444,7 +547,13 @@ numbers.
   have fallen back to replicated writes. Finish the upgrade roll.
 - `legion_nodes{status="lost"}` is "nodes are away";
   `legion_nodes_marked_lost_total` is "nodes went away". You need the second one
-  to see flapping.
+  to see flapping — and its mirror,
+  `legion_nodes_recovered_total{path}` (`heartbeat` or `registration`), to tell
+  flapping from a fleet that genuinely shrank. `marked_lost` climbing with
+  `recovered` climbing behind it is nodes bouncing, which is a control-plane
+  cadence problem; `marked_lost` climbing alone is hardware. Both are zero on a
+  cluster that has lost nothing, which is the correct reading and not a broken
+  exporter.
 
 **Actions**
 
@@ -483,9 +592,9 @@ change, and it is invisible in every scheduler metric.
 
 ## Symptom: nothing is running and nothing reports an error
 
-**Decision: do not trust `legion job info`'s status field, and do not trust
-`evals_processed_total{status="error"}`.** Neither one reports placement
-failure. Count allocations instead.
+**Decision: do not trust `legion job info`'s status field.** It is a lifecycle
+flag, not a placement verdict. Read
+`legion_evals_failed_total{kind,reason}`, or count allocations.
 
 **Worked example**
 
@@ -501,13 +610,27 @@ Two independent gaps produced that:
    placements all failed keeps the status it was created with. `GetJobInfo`
    returns the job row and nothing about its allocations, so `legion job info`
    structurally cannot answer "did this place".
-2. **Terminal eval failure does not reach the counter reliably.**
-   `legion_evals_processed_total{status="error"}` is recorded from the eval
-   worker's return value, and the two *retry* dispositions (not-leader and
-   plan-conflict, both of which put the eval back on the queue) increment it too
-   while the terminal failure path writes `status = 'failed'` to the eval row
-   through a different code path. The counter and the table disagree in both
+2. **Terminal eval failure did not reach the counter.**
+   `legion_evals_processed_total{status="error"}` was recorded from the eval
+   worker's return value, so the two *retry* dispositions (not-leader and
+   plan-conflict, both of which put the eval back on the queue) incremented it
+   while the terminal failure path — which writes `status = 'failed'` through a
+   different code path — never did. The counter and the table disagreed in both
    directions.
+
+   **Fixed.** `status` is now the eval's disposition — `ok`, `retried`, or
+   `failed` — recorded after the disposition is decided, and
+   `legion_evals_failed_total{kind,reason}` is incremented *inside* the store
+   write that sets the row to `failed`, so no caller can fail an eval without
+   counting it. `reason` is `no_capacity`, `unsupported_kind`,
+   `conflict_exhausted`, `store_error`, or `other`. If you have a dashboard
+   alerting on `status="error"`, move it to `legion_evals_failed_total`;
+   `retried` is a contention signal, not a failure one.
+
+   One caveat remains, and `legion scheduler diagnose` handles it for you: the
+   counter is per-process while the eval table is replicated, so a failure
+   written by another manager in the raft group does not move *this* manager's
+   counter. The command reads both and takes the larger.
 
 **What to read instead**
 
@@ -519,9 +642,10 @@ $ legion state query "SELECT j.id AS job, j.status, COUNT(a.id) AS allocations \
     GROUP BY 1,2 ORDER BY 3 ASC;"
 
 # What failed, and why?
-$ legion state query "SELECT kind, COUNT(*) FROM eval WHERE status = 'failed' \
+$ legion scheduler diagnose -j | jq '.data.findings[] | select(.code=="invisible_eval_failures")'
+$ legion state query "SELECT type AS kind, COUNT(*) FROM eval WHERE status = 'failed' \
     GROUP BY 1 ORDER BY 2 DESC;"
-$ legion state query "SELECT id, kind, job_id, node_name FROM eval \
+$ legion state query "SELECT id, type AS kind, job_id, node_id FROM eval \
     WHERE status = 'failed' ORDER BY id DESC LIMIT 20;"
 
 # The narrative version, with reasons attached.
@@ -547,11 +671,57 @@ the fastest way to get the allocation count next to the status.
 - **An unsupported eval kind** fails immediately, which in practice means a
   mixed-version manager fleet or a corrupt row.
 
-**Known limitation.** Until failed evals reach `evals_processed_total`, a
-dashboard built on that counter alone will show a clean cluster while work is
-failing. Alert on the eval table, or on the gap between desired and live
-allocations, not on the counter. Tracked in
-[internal_docs/TODO.md](../internal_docs/TODO.md).
+**Known limitation.** The job `status` field is still a lifecycle flag, and
+nothing in the product turns "this job's placements all failed" into a job-level
+verdict. `invisible_eval_failures` tells you evals failed and in what quantity;
+it is cluster-wide, so it cannot name the job. Count allocations, or read
+`legion_evals_failed_total{kind,reason}` and follow it into the eval table.
+Tracked in [internal_docs/TODO.md](../internal_docs/TODO.md).
+
+---
+
+## Symptom: the cluster is full and no knob helps
+
+**Decision: add capacity.** No scheduler setting applies, and every one of
+them makes a genuinely full cluster *slower*.
+
+This section exists because it is the most expensive wrong turn available.
+A full cluster and a contended one present almost identically — work is not
+placing, rejections may be elevated, latency is up — and the instinct is to
+reach for `evalThreads` or `plan_candidates`. On a fleet with no room, more
+concurrency means more plans racing for absent capacity, and more candidates
+per plan means longer walks that still find nothing. You spend the incident
+tuning and the cluster gets worse.
+
+**The reading.**
+
+```console
+$ legion scheduler diagnose -j | jq '.data.findings[] | select(.code=="capacity_exhausted")'
+```
+
+or by hand:
+
+```console
+$ legion node list                    # how many nodes are `available`?
+$ legion state query "SELECT type, COUNT(*) FROM eval WHERE status='pending' GROUP BY type;"
+```
+
+`capacity_exhausted` fires when **no available node has room and work is
+pending**. It also fires when the rejection reason mix
+(`legion_plan_rejected_total{reason}`) is dominated by `capacity_shrank`,
+`capacity_recheck_budget`, or `late_constraint_failure` — plans that reached
+a node and did not fit, rather than plans that lost a race.
+
+**The discriminator.** `node_epoch_moved` dominating the reason mix means
+contention, and the remedy is the [rejection
+storm](#symptom-throughput-fell-when-i-scaled-up) one. Capacity reasons
+dominating means the fleet is the constraint. Same rejection share, opposite
+actions — this is exactly why the reason label exists.
+
+**Watch for**: cordoned and draining nodes counting toward "the fleet" in your
+head but not toward schedulable capacity. `legion scheduler diagnose` counts
+only `available` nodes, because capacity a placement may not use is not
+capacity.
 
 ---
 
@@ -578,25 +748,25 @@ Honest gaps, so you do not spend an incident looking for an answer that is not
 there. All are tracked in
 [internal_docs/TODO.md](../internal_docs/TODO.md).
 
-- **Why a plan was rejected.** `legion_plan_apply_total{outcome="rejected"}` is
-  unattributed. A stale job-config epoch, a node epoch moved by a concurrent
-  apply, a cordon, a shrunken node, a late constraint failure, and a static-port
-  collision are six different problems with six different remedies, and they
-  share one counter. Workaround: group `plan_submission.rejection_reason`.
-- **What is in the eval queue.** `legion_eval_queue_depth` is one unlabelled
-  gauge. Workaround: `GROUP BY kind` on the eval table.
-- **How long work has been queued.** There is no queue-age metric, so a 764-deep
-  queue that drains in two seconds is indistinguishable from one that is six
-  seconds per item. Workaround: watch depth over two samples and divide by the
-  processed-eval delta.
+- **How long work has been queued.** There is no queue-age metric, so a
+  764-deep queue that drains in two seconds is indistinguishable from one that
+  is six seconds per item. `eval_starvation` therefore fires on depth and kind
+  mix rather than on how long anything has actually waited, which makes its
+  severity coarser than it should be. The eval table has no creation
+  timestamp, so this is a schema change rather than a query. Workaround: watch
+  depth over two samples and divide by the processed-eval delta.
 - **Whether a job placed.** `legion job info` reports the job row's lifecycle
-  status, not placement success. Workaround: count allocations.
-- **Whether evals are failing.** Terminal failures do not reliably reach
-  `evals_processed_total{status="error"}`. Workaround: query the eval table.
-- **Whether nodes came back.** `legion_nodes_marked_lost_total` has no
-  `legion_nodes_recovered_total` counterpart, so a fleet that dies and recovers
-  reads as if nothing happened and flapping is invisible. Workaround: watch
-  `legion_nodes{status="lost"}` transitions over time.
+  status, not placement success — a job whose evals all failed still reports
+  `done`. Workaround: count allocations. `invisible_eval_failures` catches the
+  failure, but it cannot tell you which job it belonged to;
+  cluster-wide-only is a deliberate limit of `legion scheduler diagnose`, and
+  the per-job question is `legion job plan`'s.
+- **Per-node and per-pool attribution.** Every finding is cluster-wide. A
+  report cannot tell you *which* nodes are churning or *which* pool is full
+  beyond the free-capacity summary.
+- **Anomaly detection.** Every threshold is a constant with a documented
+  derivation, not a learned baseline. A cluster whose normal rejection share
+  is genuinely 6% will see a standing `warning`.
 
 ---
 

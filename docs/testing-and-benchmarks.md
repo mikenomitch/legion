@@ -88,7 +88,10 @@ What they measure:
     A change is only real if it exceeds that floor. Report both, and say which
     it is.
 - `eval_critical_path_bench`: end-to-end enqueue -> claim -> apply -> complete
-  latency under 1/4/8 concurrent eval workers (write-lock contention).
+  latency under 1/4/8 concurrent eval workers (write-lock contention). This is
+  the group to run for anything that touches the eval queue's write paths —
+  the queue-depth refresh, eval completion, plan apply. Same noise caveat as
+  above: measure the floor before believing a delta.
 - `plan_contention`: N-way concurrent single-allocation submits against one
   pool, pumped by real eval workers — measures conflict rejections,
   requeues, fallback binds, dropped evals, and time-to-all-placed, with

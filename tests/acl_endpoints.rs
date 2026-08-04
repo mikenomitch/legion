@@ -100,6 +100,9 @@ fn endpoint_table() -> Vec<(&'static str, Plane)> {
         ("GetLedger", Plane::Protected("node:read")),
         ("UpdateNodeDynamic", Plane::Protected("node:write")),
         ("GetManagerConfigs", Plane::Protected("operator:read")),
+        // Cluster-wide operational state (queue composition, free
+        // capacity), so `operator` rather than `node`.
+        ("DiagnoseScheduler", Plane::Protected("operator:read")),
         ("GetObservability", Plane::Protected("operator:read")),
         ("GetRaftStatus", Plane::Protected("operator:read")),
         ("ListRaftHistory", Plane::Protected("operator:read")),
@@ -496,6 +499,12 @@ async fn call_endpoint(
             .map(|_| ()),
         "GetHeartbeatCadence" => svc
             .get_heartbeat_cadence(req(GetHeartbeatCadenceRequest {}, token))
+            .await
+            .map(|_| ()),
+        // `sample_seconds: 0` reports since-boot values without sleeping,
+        // which keeps the deny/allow matrix instant.
+        "DiagnoseScheduler" => svc
+            .diagnose_scheduler(req(DiagnoseSchedulerRequest { sample_seconds: 0 }, token))
             .await
             .map(|_| ()),
         "GetNode" => svc

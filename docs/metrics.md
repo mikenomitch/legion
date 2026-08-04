@@ -73,11 +73,57 @@ rules a cause in or out, and which knob to turn — is in
 [diagnosing-scheduler-performance.md](diagnosing-scheduler-performance.md).
 
 - **`legion_evals_processed_total{kind, status}`** (counter) — evals
-  completed by the eval workers. `kind` is the eval kind (`job_submit`,
-  `node-left`, ...); `status` is `ok` or `error`.
-- **`legion_eval_queue_depth`** (gauge) — pending (unclaimed) evals in the
-  queue, including delayed evals not yet ready. Updated transactionally on
-  enqueue, claim, and startup requeue.
+  dispatched by the eval workers. `kind` is the eval kind (`job_submit`,
+  `node_lost_reschedule`, ...); `status` is the eval's **disposition**:
+  - `ok` — handled; the row was deleted.
+  - `retried` — released back to the pending queue and will run again. Two
+    causes: a foreign-lane `NotRaftLeader` rejection under `lanes`
+    topology, and plan-conflict exhaustion (the requeue backstop).
+  - `failed` — terminally failed. Failed evals are never retried, so their
+    work never happens.
+
+  **This vocabulary changed.** `status` was previously `ok|error`, where
+  `error` meant "the handler returned `Err`" — which fired for both retry
+  dispositions above (evals that were fine and ran again) and never fired
+  for the write that actually sets an eval row to `failed`. A dashboard
+  alerting on `status="error"` was therefore wrong in both directions.
+  Alert on `legion_evals_failed_total` instead; treat `retried` as a
+  contention signal, not a failure one.
+- **`legion_evals_failed_total{kind, reason}`** (counter) — evals that
+  **terminally failed**, by kind and by a bounded reason: `no_capacity`
+  (placement found no node that fits — a fleet problem, not a scheduler
+  one), `unsupported_kind` (version skew or corruption), `conflict_exhausted`
+  (optimistic-concurrency retries ran out without the backstop requeueing —
+  non-zero here means the backstop was bypassed), `store_error`, or `other`.
+  Recorded **inside** the store write that sets the row to `failed`, so no
+  caller can fail an eval without counting it; a caller that does not
+  classify its failure lands in `other` rather than going uncounted.
+
+  Per-process, and the eval table is replicated: under raft another manager's
+  terminal failures do not move this counter. `legion scheduler diagnose`
+  reads both this and the rise in the table's own failed-row count, and takes
+  the larger.
+
+  Zero on a cluster where nothing has failed yet — which is the correct and
+  intended reading. Do not build a health check that treats the absence of a
+  failure counter as a failure.
+- **`legion_eval_queue_depth{kind}`** (gauge) — pending (unclaimed) evals in
+  the queue, including delayed evals not yet ready, **by eval kind**. Read
+  transactionally and published after commit at every point the pending set
+  changes: enqueue, claim, startup requeue, both retry-release paths, and the
+  stale-eval prune.
+
+  The label is what makes the number actionable. A depth of 764 says nothing;
+  `{kind="node_lost_reschedule"} 700` against `{kind="job_submit"} 64` says
+  the fleet is losing nodes and everything else is queued behind the
+  consequences. Modelled on `kube-scheduler`'s `scheduler_pending_pods{queue}`.
+
+  **Dashboard compatibility:** the family name is unchanged and
+  `sum(legion_eval_queue_depth)` reproduces exactly the value the unlabelled
+  gauge had. A query that selects the bare series without an aggregator now
+  returns one series per kind instead of one series. A kind that drains reads
+  `0` rather than disappearing, so a drained kind cannot go stale at its last
+  value.
 - **`legion_plan_apply_total{outcome}`** (counter) — scheduler plan
   submissions applied to the store; `outcome` is `applied` (every placement
   bound its first-choice candidate), `fallback` (applied, but at least one
@@ -86,6 +132,29 @@ rules a cause in or out, and which knob to turn — is in
   cordon, or — for an edge-boot ratification only — an epoch conflict).
   The outcomes are mutually exclusive — see
   [late-binding-plan-apply.md](late-binding-plan-apply.md).
+- **`legion_plan_rejected_total{reason}`** (counter) — the same rejections
+  `legion_plan_apply_total{outcome="rejected"}` counts, broken out by a
+  bounded cause. The two totals agree; this is a separate family so the
+  existing one's series shape, and every dashboard built on it, is unchanged.
+
+  | `reason` | Means |
+  | --- | --- |
+  | `job_epoch_stale` | Two plans raced on one job config. Serialization working as designed. |
+  | `node_epoch_moved` | A concurrent apply took the node. **The signature of too much concurrency.** |
+  | `node_gone` | The node row vanished between the plan and its apply. |
+  | `node_unavailable` | Cordoned, draining, or lost since the snapshot. Fleet churn. |
+  | `late_constraint_failure` | Constraints or permits no longer satisfied on the fresh node row. |
+  | `capacity_recheck_budget` | The plan exhausted its per-plan capacity-recheck budget. |
+  | `capacity_shrank` | The node's resource totals changed under the plan. |
+  | `static_port_taken` | A static port collided at bind time. |
+  | `no_candidates` | The placement carried no candidates — `plan_candidates: 0`, the kill switch. |
+
+  **This is the label that decides the remedy.** A rejection *share* alone
+  cannot distinguish contention from fleet churn, and they take opposite
+  actions: `node_epoch_moved` dominating means reduce `evalThreads`, while
+  `node_unavailable` / `node_gone` / `capacity_shrank` dominating means the
+  fleet is moving under the planner and reducing concurrency will not help.
+  `legion scheduler diagnose` branches on exactly this.
 - **`legion_scheduler_plan_candidate_rank`** (histogram) — candidate rank
   each applied placement bound at (0 = the planner's first choice; higher
   ranks mean the apply walk absorbed a race by falling back).
@@ -171,6 +240,21 @@ instrument.
 - **`legion_nodes_marked_lost_total`** (counter) — nodes marked lost after
   missed heartbeats. Distinguishes "nodes went away" from
   `legion_nodes{status="lost"}`'s "nodes are away".
+- **`legion_nodes_recovered_total{path}`** (counter) — nodes that came back
+  from `lost`, by the path that recovered them: `heartbeat` (the node beat
+  again) or `registration` (it re-registered). Counted only when the previous
+  status was actually `lost` — a node's first beat after registration
+  (`ready -> active`) is not a recovery.
+
+  Read it **next to** `legion_nodes_marked_lost_total`: that counter alone
+  cannot distinguish a fleet that shrank from a fleet that is flapping, and
+  `marked_lost - recovered` is the difference. A high `marked_lost` with a
+  matching `recovered` is nodes bouncing, which is usually a control-plane
+  cadence problem rather than dying hardware — check
+  `legion_heartbeat_freshness_ratio` and `legion node cadence`.
+
+  Zero on a cluster that has lost nothing yet. That is the correct reading,
+  not a broken exporter.
 
 ### Heartbeat cadence
 
@@ -455,7 +539,10 @@ added eval threads or nodes, or work is not running and nothing reports an
 error — start at
 [Diagnosing scheduler performance](diagnosing-scheduler-performance.md), which
 is organized by symptom rather than by metric and attaches the config knob to
-each one.
+each one — or just run `legion scheduler diagnose`, which applies every check
+on that page over a sampled window and prints a verdict with the remedy
+attached. It reads the manager's registry in process, so it needs no scrape
+and works whether or not the telemetry listener is enabled.
 
 When RPC throughput plateaus below what the workload should produce, the
 handler-duration histogram tells you *that* it is slow, never *why*. Read

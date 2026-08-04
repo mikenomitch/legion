@@ -32,23 +32,24 @@ use crate::structs::{
     CreateInstancesRequest, DeleteJobTemplateReply, DeleteJobTemplateRequest, DeleteKvReply,
     DeleteKvRequest, DeleteSavedStateQueryReply, DeleteSavedStateQueryRequest, DeleteVolumeReply,
     DeleteVolumeRequest, DestroyInstanceReply, DestroyInstanceRequest, DestroyJobReply,
-    DestroyJobRequest, ExecClientFrame, FailedAllocation, GetAllocationLogsReply,
-    GetAllocationLogsRequest, GetArtifactCredentialReply, GetArtifactCredentialRequest,
-    GetHeartbeatCadenceReply, GetHeartbeatCadenceRequest, GetInstanceReply, GetInstanceRequest,
-    GetJobInfoReply, GetJobInfoRequest, GetJobScaleStatusReply, GetJobScaleStatusRequest,
-    GetJobSpecByConfigRequest, GetJobSpecReply, GetJobSpecRequest, GetJobTemplateReply,
-    GetJobTemplateRequest, GetKvLockReply, GetKvLockRequest, GetKvReply, GetKvRequest,
-    GetLedgerReply, GetLedgerRequest, GetManagerConfigsReply, GetManagerConfigsRequest,
-    GetNodeReply, GetNodeRequest, GetNodesReply, GetNodesRequest, GetObservabilityReply,
-    GetObservabilityRequest, GetRaftJoinTokenReply, GetRaftJoinTokenRequest, GetRaftStatusReply,
-    GetRaftStatusRequest, GetRolloutReply, GetRolloutRequest, GetRolloutStatusReply,
-    GetRolloutStatusRequest, GetStateBackupReply, GetStateBackupRequest, GetStateStoreSchemaReply,
-    GetStateStoreSchemaRequest, GetTaskLogsRequest, GetVolumeReply, GetVolumeRequest,
-    HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, Instance, InstanceInfo,
-    InstanceMode, InstanceState, IssueBootTicketReply, IssueBootTicketRequest,
-    IssueNodeIdentityTokenReply, IssueNodeIdentityTokenRequest, IssueRaftCommandReply,
-    IssueRaftCommandRequest, IssueWorkloadIdentityTokenReply, IssueWorkloadIdentityTokenRequest,
-    JobConfig, JobSpecHistoryItem, JobTemplate, JobTemplateProvenance, JobTemplateSummary,
+    DestroyJobRequest, DiagnoseSchedulerReply, DiagnoseSchedulerRequest, ExecClientFrame,
+    FailedAllocation, GetAllocationLogsReply, GetAllocationLogsRequest, GetArtifactCredentialReply,
+    GetArtifactCredentialRequest, GetHeartbeatCadenceReply, GetHeartbeatCadenceRequest,
+    GetInstanceReply, GetInstanceRequest, GetJobInfoReply, GetJobInfoRequest,
+    GetJobScaleStatusReply, GetJobScaleStatusRequest, GetJobSpecByConfigRequest, GetJobSpecReply,
+    GetJobSpecRequest, GetJobTemplateReply, GetJobTemplateRequest, GetKvLockReply,
+    GetKvLockRequest, GetKvReply, GetKvRequest, GetLedgerReply, GetLedgerRequest,
+    GetManagerConfigsReply, GetManagerConfigsRequest, GetNodeReply, GetNodeRequest, GetNodesReply,
+    GetNodesRequest, GetObservabilityReply, GetObservabilityRequest, GetRaftJoinTokenReply,
+    GetRaftJoinTokenRequest, GetRaftStatusReply, GetRaftStatusRequest, GetRolloutReply,
+    GetRolloutRequest, GetRolloutStatusReply, GetRolloutStatusRequest, GetStateBackupReply,
+    GetStateBackupRequest, GetStateStoreSchemaReply, GetStateStoreSchemaRequest,
+    GetTaskLogsRequest, GetVolumeReply, GetVolumeRequest, HealthCheckReply, HealthCheckRequest,
+    HeartbeatReply, HeartbeatRequest, Instance, InstanceInfo, InstanceMode, InstanceState,
+    IssueBootTicketReply, IssueBootTicketRequest, IssueNodeIdentityTokenReply,
+    IssueNodeIdentityTokenRequest, IssueRaftCommandReply, IssueRaftCommandRequest,
+    IssueWorkloadIdentityTokenReply, IssueWorkloadIdentityTokenRequest, JobConfig,
+    JobSpecHistoryItem, JobTemplate, JobTemplateProvenance, JobTemplateSummary,
     JobTemplateVariable, JobTemplateVersionInfo, KvEntry, KvInjectionAction, KvValueType,
     LedgerNode, ListBootTicketsReply, ListBootTicketsRequest, ListEventsReply, ListEventsRequest,
     ListInstancesReply, ListInstancesRequest, ListJobActionsReply, ListJobActionsRequest,
@@ -1036,6 +1037,57 @@ fn build_rollout_launch_config(config: &JobConfig) -> Result<RolloutLaunchConfig
 /// deleted and the resolved policy is `fail`.
 const MISSING_KV_DEPENDENCY_REASON: &str = "missing_kv_dependency";
 
+/// Ceiling on `DiagnoseSchedulerRequest.sample_seconds`. The call blocks for
+/// the whole window, so an unbounded value would be a client-supplied hold
+/// on a manager thread. Five minutes is far past useful — every signature in
+/// docs/diagnosing-scheduler-performance.md resolves inside 30 seconds.
+const MAX_DIAGNOSE_SAMPLE_SECONDS: u32 = 300;
+
+/// Render one [`crate::manager::diagnose::Finding`] onto the wire.
+fn finding_to_proto(
+    finding: &crate::manager::diagnose::Finding,
+) -> crate::structs::SchedulerFinding {
+    use crate::structs::{SchedulerAction, SchedulerEvidence, SchedulerRuledOut};
+
+    let evidence = |pairs: &[(String, String)]| -> Vec<SchedulerEvidence> {
+        pairs
+            .iter()
+            .map(|(key, value)| SchedulerEvidence {
+                key: key.clone(),
+                value: value.clone(),
+            })
+            .collect()
+    };
+    crate::structs::SchedulerFinding {
+        code: finding.code.to_string(),
+        severity: finding.severity.as_str().to_string(),
+        title: finding.title.clone(),
+        detail: finding.detail.clone(),
+        evidence: evidence(&finding.evidence),
+        ruled_out: finding
+            .ruled_out
+            .iter()
+            .map(|ruled| SchedulerRuledOut {
+                cause: ruled.cause.to_string(),
+                evidence: evidence(&ruled.evidence),
+            })
+            .collect(),
+        action: finding.action.as_ref().map(|action| SchedulerAction {
+            kind: action.kind.as_str().to_string(),
+            field: action.field.clone().unwrap_or_default(),
+            current: action.current.clone().unwrap_or_default(),
+            direction: action
+                .direction
+                .map(|direction| direction.as_str().to_string())
+                .unwrap_or_default(),
+            suggested: action.suggested.clone().unwrap_or_default(),
+            text: action.text.clone(),
+        }),
+        doc: finding.doc_anchor.clone(),
+        secondary: finding.secondary,
+    }
+}
+
 /// Pending coalesced KV events while a debounce window is open. Keyed by KV
 /// key; the value is the latest event type (`true` = delete), so a delete
 /// arriving after a put within the window still resolves through `onDelete`.
@@ -1089,6 +1141,12 @@ pub struct ManagerDaemonService {
     /// Adaptive cadence is off unless `targetRatePerSecond` is set, so by
     /// default this only supplies `missedBeatsBeforeLost` to the cadence report.
     heartbeat: crate::structs::HeartbeatConfigFull,
+    /// Resolved scheduler knobs, so `DiagnoseScheduler` can name the
+    /// *current* value of every field a remedy points at ("reduce
+    /// `evalThreads` (currently 16)") instead of leaving the operator a
+    /// second lookup mid-incident. `is_scheduler_lane_leader` is filled per
+    /// request; the rest is fixed at construction.
+    scheduler_knobs: crate::manager::diagnose::SchedulerKnobs,
 }
 
 impl ManagerDaemonService {
@@ -1118,7 +1176,37 @@ impl ManagerDaemonService {
             edge_boot: crate::structs::EdgeBootConfigFull::default(),
             provisional_claims: Arc::new(Mutex::new(HashMap::new())),
             heartbeat: crate::structs::HeartbeatConfigFull::default(),
+            scheduler_knobs: crate::manager::diagnose::SchedulerKnobs::default(),
         }
+    }
+
+    /// One reading of everything `DiagnoseScheduler` looks at: the manager's
+    /// in-process metric registry plus the two store shapes the registry
+    /// cannot express (eval-queue composition, free capacity by pool).
+    ///
+    /// Deliberately no HTTP scrape and no Prometheus dependency — the
+    /// registry is in this process, and requiring `/metrics` to be enabled
+    /// would make the diagnosis unavailable on exactly the clusters least
+    /// likely to have it turned on.
+    fn scheduler_snapshot(&self) -> Result<crate::manager::diagnose::SchedulerSnapshot, Status> {
+        let store = crate::manager::diagnose::StoreSnapshot {
+            pending_evals_by_kind: self
+                .store
+                .pending_evals_by_kind()
+                .map_err(|e| map_store_error("Error reading pending evals", e))?,
+            failed_evals_by_kind: self
+                .store
+                .failed_evals_by_kind()
+                .map_err(|e| map_store_error("Error reading failed evals", e))?,
+            pools: self
+                .store
+                .free_capacity_by_pool()
+                .map_err(|e| map_store_error("Error reading free capacity", e))?,
+        };
+        Ok(crate::manager::diagnose::SchedulerSnapshot::from_families(
+            &crate::manager::telemetry::snapshot_manager_families(),
+            store,
+        ))
     }
 
     /// Attach the manager's heartbeat-cadence settings (`run_manager` always
@@ -1597,6 +1685,29 @@ impl ManagerDaemonService {
             .collect();
         service.exec_enabled = config.exec.enabled;
         service.heartbeat = config.heartbeat.clone();
+        service.scheduler_knobs = crate::manager::diagnose::SchedulerKnobs {
+            eval_threads: config.eval_threads as u32,
+            // Parsed with the planner's own parser, not a second reading of
+            // the same shorthand: a report that names `plan_candidates` in
+            // its "ruled out" line must agree with what the planner is
+            // actually doing. An unparseable setting reads as the kill
+            // switch (0), which is the direction that makes the report say
+            // "candidate lists are off" rather than silently claiming they
+            // are on.
+            plan_candidates: crate::manager::scheduler::parse_plan_candidates(
+                config.scheduler_settings.as_ref(),
+                &config.scheduling_policy,
+            )
+            .map(|setting| setting.count as u32)
+            .unwrap_or(0),
+            raft_topology: match config.persistence.r#type {
+                crate::structs::config::PersistenceType::Raft => {
+                    config.persistence.raft.topology.clone()
+                }
+                _ => String::new(),
+            },
+            is_scheduler_lane_leader: true,
+        };
         service
     }
 
@@ -5292,6 +5403,46 @@ impl Manager for ManagerDaemonService {
     }
 
     #[instrument(skip_all)]
+    async fn diagnose_scheduler(
+        &self,
+        request: Request<DiagnoseSchedulerRequest>,
+    ) -> Result<Response<DiagnoseSchedulerReply>, Status> {
+        self.check_acl(
+            &request,
+            AclResource::Operator,
+            AclAction::Read,
+            AclScope::any(),
+        )?;
+        let sample_seconds = request
+            .into_inner()
+            .sample_seconds
+            .min(MAX_DIAGNOSE_SAMPLE_SECONDS);
+
+        let mut knobs = self.scheduler_knobs.clone();
+        // Scheduler counters are per-process. Under `lanes`, a manager that
+        // does not lead the scheduler lane has near-zero counters because
+        // the scheduling is happening on another machine, not because the
+        // cluster is idle — so the report says so rather than diagnosing an
+        // idle process. Same posture as `GetHeartbeatCadence`.
+        knobs.is_scheduler_lane_leader = self.store.is_raft_leader(crate::storage::Lane::Scheduler);
+
+        let before = self.scheduler_snapshot()?;
+        if sample_seconds > 0 {
+            tokio::time::sleep(Duration::from_secs(u64::from(sample_seconds))).await;
+        }
+        let after = self.scheduler_snapshot()?;
+
+        let report = crate::manager::diagnose::diagnose(&before, &after, &knobs, sample_seconds);
+        Ok(Response::new(DiagnoseSchedulerReply {
+            verdict: report.verdict.as_str().to_string(),
+            sample_seconds: report.sample_seconds,
+            is_scheduler_lane_leader: report.is_scheduler_lane_leader,
+            findings: report.findings.iter().map(finding_to_proto).collect(),
+            passed: report.passed.iter().map(finding_to_proto).collect(),
+        }))
+    }
+
+    #[instrument(skip_all)]
     async fn health_check(
         &self,
         request: Request<HealthCheckRequest>,
@@ -8795,6 +8946,88 @@ mod tests {
         assert_eq!(claims["legion.io/pool"], json!("default"));
         assert_eq!(claims["legion.io/node"], json!("node-1"));
         assert!(claims.get("legion.io/alloc").is_none());
+        Ok(())
+    }
+
+    /// End-to-end shape of the report the RPC actually returns: `0`
+    /// sample seconds so it does not sleep, every detector present, and the
+    /// two invariants the whole feature rests on — a failing finding always
+    /// names what it ruled out, and a passing one always carries the number
+    /// that made it pass.
+    #[tokio::test]
+    async fn diagnose_scheduler_returns_every_check_with_evidence() -> R<()> {
+        use crate::manager::diagnose::FINDING_CODES;
+
+        let store = setup_store()?;
+        insert_node(&store, "node-1")?;
+        let manager = ManagerDaemonService::new(store);
+
+        let reply = manager
+            .diagnose_scheduler(Request::new(DiagnoseSchedulerRequest { sample_seconds: 0 }))
+            .await?
+            .into_inner();
+
+        assert_eq!(reply.sample_seconds, 0, "since-boot must echo back as 0");
+        assert!(
+            ["healthy", "degraded", "unhealthy"].contains(&reply.verdict.as_str()),
+            "unexpected verdict {}",
+            reply.verdict
+        );
+        // Not replicated, so this manager owns the scheduler.
+        assert!(reply.is_scheduler_lane_leader);
+
+        let seen: Vec<&str> = reply
+            .findings
+            .iter()
+            .chain(reply.passed.iter())
+            .map(|finding| finding.code.as_str())
+            .collect();
+        for code in FINDING_CODES {
+            assert!(seen.contains(code), "{code} missing from the report");
+        }
+
+        for finding in &reply.findings {
+            assert_ne!(finding.severity, "ok", "findings are the failing checks");
+            assert!(
+                !finding.ruled_out.is_empty(),
+                "{} fired without naming what it excluded",
+                finding.code
+            );
+            assert!(finding.action.is_some(), "{} has no action", finding.code);
+            assert!(
+                finding.doc.starts_with("docs/"),
+                "{} has no doc anchor",
+                finding.code
+            );
+        }
+        for finding in &reply.passed {
+            assert_eq!(finding.severity, "ok");
+            assert!(
+                !finding.evidence.is_empty(),
+                "{} passed without evidence, which is the failure mode this feature exists to fix",
+                finding.code
+            );
+        }
+        Ok(())
+    }
+
+    /// The window is client-supplied and the call BLOCKS for it, so an
+    /// unbounded value would be a caller-supplied hold on a manager task.
+    /// The reply echoes the clamped window, which is also what makes the
+    /// header honest about what was actually sampled.
+    #[tokio::test(start_paused = true)]
+    async fn diagnose_scheduler_clamps_an_absurd_sample_window() -> R<()> {
+        let store = setup_store()?;
+        let manager = ManagerDaemonService::new(store);
+        // u32::MAX seconds is 136 years. The clock is paused, so the clamped
+        // sleep costs nothing here; what is being asserted is the ceiling.
+        let reply = manager
+            .diagnose_scheduler(Request::new(DiagnoseSchedulerRequest {
+                sample_seconds: u32::MAX,
+            }))
+            .await?
+            .into_inner();
+        assert_eq!(reply.sample_seconds, MAX_DIAGNOSE_SAMPLE_SECONDS);
         Ok(())
     }
 

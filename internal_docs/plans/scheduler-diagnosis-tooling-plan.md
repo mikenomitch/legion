@@ -1,10 +1,40 @@
 # Scheduler Diagnosis Tooling
 
-**Status: PLANNED.** Nothing here is built. The public guidance that this plan
-would automate ships now and stands alone:
+**Status: SHIPPED** (phases 1, 2, and 3). `legion scheduler diagnose` exists,
+all seven detectors run, and four of the five metric gaps are closed. The
+public page this plan set out to automate remains the authority on what each
+signal means and now documents the command:
 [`docs/diagnosing-scheduler-performance.md`](../../docs/diagnosing-scheduler-performance.md).
 
-> **Judgement calls:** [`../calls/scheduler-diagnosis-tooling-plan_calls.md`](../calls/scheduler-diagnosis-tooling-plan_calls.md) (to be written when the first phase lands)
+> **Judgement calls:** [`../calls/scheduler-diagnosis-tooling-plan_calls.md`](../calls/scheduler-diagnosis-tooling-plan_calls.md)
+
+**What shipped, against §8.** Phase 1 in full (the RPC, the CLI verb, `--json`,
+`--sample`, the ACL classification and test entry, the MCP tool, the
+capabilities entry, all seven detectors, and the campaign fixtures as unit
+tests). Phase 2 for G1–G4. Phase 3 in full, including `--watch`.
+
+**Deliberately not built, and why.**
+
+- **G5, `legion_eval_queue_age_seconds`.** The plan costed it as "cheap
+  (`SELECT MIN(created_at)` on the same refresh)"; the `eval` table has no
+  creation timestamp, so it is a raft-replicated schema migration rather than a
+  query. `eval_starvation` therefore fires on depth and kind mix with no age
+  input, and its severity is coarser than §6.5 intended. Open item in
+  [`../TODO.md`](../TODO.md); reasoning in calls entry 5.
+- **§8 phase 3's "the SQL fallback is deleted".** It was not, and should not be:
+  the metric registry is per-process while the eval table is replicated, so
+  under `lanes` a manager can hold zero counters for failures that certainly
+  happened. Deleting the SQL would have made the command report health on a
+  cluster with failed evals on a peer. Calls entry 1.
+- Everything §8 already named as deferred: baseline capture/compare, the UI
+  page, an alerting rule pack, and per-pool attribution.
+
+**Resolved open questions (§11).** 1 — `operator:read`. 2 — `30s`, and
+`--watch` inherits it rather than defaulting lower. 3 — embed the verdict:
+`heartbeat_ceiling` is a first-class finding, evaluated *and printed* first,
+and it points at `legion node cadence` for the remedy. 4 — `legion scheduler`.
+5 — no `preemptive` label. 6 — no exit-code contract yet; the verdict
+vocabulary is stable but nothing branches on it in CI.
 
 **Deliberately out of scope, and named as non-goals in §4:** anomaly detection,
 any change to scheduler *behavior*, a Prometheus/alerting rule pack, a UI page,

@@ -109,6 +109,11 @@ landlock = "0.4.1"
 
 [dev-dependencies]
 criterion = "0.5.1"
+# `test-util` only, for `#[tokio::test(start_paused = true)]`: it lets a test
+# assert what an RPC does with a long sampling window without waiting out the
+# window. Dev-only so the paused-clock machinery never reaches a shipped
+# binary.
+tokio = { version = "1.0", features = ["test-util"] }
 
 [build-dependencies]
 tonic-build = "0.12.3"

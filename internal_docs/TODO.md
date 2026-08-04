@@ -517,6 +517,11 @@ How to use it:
         currently the only thing bounding the node table, so unique
         prefixes would make every run leak its whole fleet.
   - [ ] **A mass node-loss event starves every other kind of eval.**
+        *Now diagnosable but not fixed:* `legion scheduler diagnose`
+        reports this shape as the `eval_starvation` finding, and
+        `legion_eval_queue_depth{kind}` shows the composition on a
+        dashboard. The four causes below are all still open — the
+        tooling names the problem, it does not solve it.
         Measured on the AWS rig 2026-08-04: ~3000 sim nodes vanished at
         once and job submission slowed to ~6s per job, with
         `evals_processed_total{kind="node_lost_reschedule"}` at 2752
@@ -546,22 +551,27 @@ How to use it:
           node stays lost. Batch into one replicated op, and get it off
           the liveness loop so the checkpoint and gauge refresh still run
           during the event.
-    - [ ] **Failed evals may not reach `evals_processed_total`.**
-          Suspected on the AWS run and then RETRACTED — the counter is
-          incremented on both paths at `src/manager/daemon.rs:2267`, and
-          the evidence turned out to be two scrapes compared across
-          different times. Left here as one deliberate check for the next
-          campaign rather than as a known bug: submit a job whose
-          constraints match no node, and confirm
-          `evals_processed_total{kind="job_submit",status="error"}`
-          moves by exactly one.
-    - [ ] **Recovery is invisible.** Re-registration clears a `lost` row
-          via `SEED_NODE_HEALTH` with no log and no counter, unlike the
-          heartbeat recovery path which logs at
-          `src/storage/store.rs:5620`. Add
-          `legion_nodes_recovered_total{path}` so `lost - recovered` is
-          computable and flapping is visible; today a fleet that dies and
-          comes back reads as if nothing happened.
+    - [x] **Failed evals may not reach `evals_processed_total`.** Real
+          after all, and fixed 2026-08-04 — the retraction was right
+          about the *scrape* evidence and wrong about the code. The
+          counter fired before the disposition match, so it reported the
+          two RETRY arms (foreign-lane rejection, plan-conflict
+          exhaustion) as `error` while never firing for the write that
+          sets `status = 'failed'`. `status` is now `ok | retried |
+          failed`, recorded per disposition, and
+          `legion_evals_failed_total{kind,reason}` is incremented inside
+          `Store::complete_eval_impl` so no caller can fail an eval
+          without counting it.
+          [docs/metrics.md](../docs/metrics.md#scheduler--eval-loop),
+          [plan](plans/scheduler-diagnosis-tooling-plan.md) G2,
+          [calls #2](calls/scheduler-diagnosis-tooling-plan_calls.md).
+    - [x] **Recovery is invisible.** Fixed 2026-08-04:
+          `legion_nodes_recovered_total{path}`, `path` ∈ `heartbeat |
+          registration`, guarded on the previous status actually being
+          `lost` so a `ready -> active` first beat does not count.
+          `marked_lost - recovered` is now computable and flapping is
+          visible. [docs/metrics.md](../docs/metrics.md#cluster-shape),
+          [plan](plans/scheduler-diagnosis-tooling-plan.md) G3.
         Not a rig-only concern: a single-AZ loss in a three-AZ cluster is
         ~33% of the fleet, which is *under*
         `LIVENESS_MASS_DISRUPTION_FRACTION` (`src/constants.rs:109`), so
@@ -592,6 +602,24 @@ How to use it:
         `unavailable`), because the drain intent is already gone from the row
         by then. Fixing it properly means recording the pre-loss
         availability, or keeping loss and drain on separate axes.
+  - [ ] **No eval queue-age metric (G5 of the diagnosis plan).** The
+        `eval` table has columns `id, status, type, job_id, job_config_id,
+        node_id, priority, ready_at` and no creation timestamp, so
+        `legion_eval_queue_age_seconds` is a raft-replicated schema
+        migration rather than the cheap `SELECT MIN(created_at)` the plan
+        costed it as. Consequence today: `eval_starvation` in `legion
+        scheduler diagnose` fires on depth plus kind mix with no age
+        input, so a 764-deep queue draining in 2s and one taking 6s per
+        item produce the same finding. `ready_at` is not a substitute — a
+        delayed eval's is in the future. Named as a known limitation in
+        [docs/diagnosing-scheduler-performance.md](../docs/diagnosing-scheduler-performance.md#what-these-signals-still-cannot-tell-you)
+        and [calls #5](calls/scheduler-diagnosis-tooling-plan_calls.md).
+  - [ ] **`legion scheduler diagnose` has no exit-code contract.** Open
+        question 6 of the diagnosis plan, deliberately left for later: a
+        non-zero exit on `unhealthy` would let the command gate CI, and
+        it permanently constrains the verdict vocabulary
+        (`healthy|degraded|unhealthy`), so it wants one decision rather
+        than a default.
   - [ ] **Per-pool heartbeat freshness.** `legion_heartbeat_freshness_ratio`
         is fleet-wide, so a cluster with a slow batch pool and a fast
         latency pool has two populations and one blended ratio, which can
@@ -1815,6 +1843,25 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
 - [x] OTLP trace export for Legion's own spans ([src/otel.rs](../src/otel.rs))
 - [x] Event stream: scheduler events as history and live tail (`ListEvents`,
       `StreamEvents`, CLI, UI)
+- [x] Scheduler diagnosis tooling (2026-08-04) — `legion scheduler diagnose`
+      (+ `--json`, `--sample`, `--watch`), the `DiagnoseScheduler` RPC
+      (`operator:read`), the `legion_scheduler_diagnose` MCP tool, and the
+      `scheduler.diagnose` capability. Seven detectors —
+      `heartbeat_ceiling`, `plan_rejection_storm`, `scheduler_lane_queued`,
+      `phase_growth`, `eval_starvation`, `invisible_eval_failures`,
+      `capacity_exhausted` — each carrying the discriminating neighbour that
+      rules a cause OUT, and each with the campaign's own numbers as a unit
+      fixture. Four metric gaps closed alongside:
+      `legion_eval_queue_depth{kind}`, `legion_evals_failed_total{kind,reason}`
+      plus the `ok|retried|failed` disposition vocabulary,
+      `legion_nodes_recovered_total{path}`, and
+      `legion_plan_rejected_total{reason}` (nine bounded reasons — the label
+      that distinguishes contention from fleet churn, which take opposite
+      remedies). Queue age (G5) deferred; see the open item above.
+      [docs/diagnosing-scheduler-performance.md](../docs/diagnosing-scheduler-performance.md),
+      [docs/metrics.md](../docs/metrics.md),
+      [plan](plans/scheduler-diagnosis-tooling-plan.md),
+      [calls](calls/scheduler-diagnosis-tooling-plan_calls.md).
 - [x] Simulated fleets feed the `legion_worker_*` families (2026-08-02) —
       the sim fleet starts the shared worker telemetry listener (via
       `daemon::start_worker_telemetry`, so the real and simulated paths

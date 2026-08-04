@@ -260,6 +260,18 @@ fn tool_defs() -> Vec<ToolDef> {
             mutates: false,
         },
         ToolDef {
+            name: "legion_scheduler_diagnose",
+            description: "Diagnose the scheduler: is it healthy, and if not, which condition is it in and what should change. Read-only. Returns `verdict` (healthy|degraded|unhealthy), `findings` (checks that FAILED) and `passed` (checks that succeeded, each with the number that made them pass). Every finding carries a stable `code` (`heartbeat_ceiling`, `plan_rejection_storm`, `scheduler_lane_queued`, `phase_growth`, `eval_starvation`, `invisible_eval_failures`, `capacity_exhausted`), the `evidence` behind it, a `ruled_out` list naming the causes it EXCLUDED and the numbers that excluded them, and an `action` naming the exact config field and direction to change. Findings marked `secondary` are downstream of a heartbeat-cadence problem — fix that first (`legion_node_cadence`). The call BLOCKS for `sample_seconds` (default 30) because every number it reports is a delta over that window rather than a since-boot average; pass 0 for since-boot values without waiting. Do not read one number in isolation — the report pairs each with its discriminator on purpose (docs/diagnosing-scheduler-performance.md).",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "sample_seconds": { "type": "integer", "description": "Sampling window in seconds; the call blocks this long. Default 30, maximum 300. 0 reports since-boot values without waiting." }
+                },
+                "additionalProperties": false
+            }),
+            mutates: false,
+        },
+        ToolDef {
             name: "legion_boot_ticket_create",
             description: "Mint a boot ticket: a short-lived capability that lets one edge node start one workload without calling a manager (docs/edge-boot.md). Names an exact job config, one task, one instance (or a non-empty instance prefix), one node pool, and a gate ceiling. Single-use by default and revocable only by expiry, so prefer short TTLs. The token is returned ONCE. Mutating.",
             input_schema: || json!({
@@ -834,6 +846,19 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
         "legion_node_cadence" => {
             let mut client = connect().await?;
             grpc(client.get_heartbeat_cadence(crate::structs::GetHeartbeatCadenceRequest {})).await
+        }
+        "legion_scheduler_diagnose" => {
+            let sample_seconds = args
+                .get("sample_seconds")
+                .and_then(Value::as_u64)
+                .unwrap_or(30) as u32;
+            let mut client = connect().await?;
+            grpc(
+                client.diagnose_scheduler(crate::structs::DiagnoseSchedulerRequest {
+                    sample_seconds,
+                }),
+            )
+            .await
         }
         "legion_node_drain" => {
             let node_id = str_arg(&args, "node_id")?;
@@ -1482,6 +1507,27 @@ mod tests {
         assert!(!names.contains(&"legion_instance_stop"));
         assert!(!names.contains(&"legion_instance_start"));
         assert!(!names.contains(&"legion_instance_destroy"));
+    }
+
+    /// The diagnosis tool is the one an agent reaches for when asked "is
+    /// the cluster healthy", so it must be listed WITHOUT `--allow-write` —
+    /// gating it behind the write flag would make the read-only posture
+    /// (which is the recommended one) blind.
+    #[test]
+    fn scheduler_diagnose_tool_is_listed_read_only() {
+        let names: Vec<&str> = available_tools(false).iter().map(|t| t.name).collect();
+        assert!(names.contains(&"legion_scheduler_diagnose"));
+
+        let tool = tool_defs()
+            .into_iter()
+            .find(|tool| tool.name == "legion_scheduler_diagnose")
+            .expect("legion_scheduler_diagnose");
+        assert!(!tool.mutates);
+        let schema = (tool.input_schema)();
+        assert!(schema["properties"]["sample_seconds"].is_object());
+        // No required arguments: an agent asked "is this healthy?" should be
+        // able to call it with none.
+        assert!(schema.get("required").is_none());
     }
 
     #[test]

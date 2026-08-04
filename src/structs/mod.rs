@@ -25,6 +25,7 @@ pub use artifact::*;
 pub use band::*;
 pub use config::*;
 pub use edge_boot::*;
+pub use eval::EvalFailureReason;
 pub use instance::*;
 pub use job::*;
 pub use ledger::*;

@@ -21,6 +21,7 @@ pub mod oidc;
 pub mod output;
 pub mod raft;
 pub mod sandbox;
+pub mod scheduler;
 pub mod service;
 pub mod start;
 pub mod state;

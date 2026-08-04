@@ -366,6 +366,17 @@ pub fn catalog() -> Vec<Capability> {
             read_only_safe: true,
         },
         Capability {
+            name: "scheduler.diagnose",
+            cli: "legion scheduler diagnose",
+            grpc: Some("Manager/DiagnoseScheduler"),
+            summary: "Diagnose the scheduler: a verdict plus stable finding codes, the \
+                 evidence behind each, the causes it ruled out, and the config field and \
+                 direction to change. Samples metrics over --sample (default 30s), so the \
+                 call blocks for that long.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
             name: "node.cordon",
             cli: "legion node cordon <ID>",
             grpc: Some("Manager/SetNodeAvailability"),
@@ -736,6 +747,20 @@ mod tests {
                 assert!(!cap.read_only_safe, "{} must not be agent-safe", cap.name);
             }
         }
+    }
+
+    /// The catalog is how an agent discovers the surface, so a command that
+    /// is not in it effectively does not exist to one.
+    #[test]
+    fn scheduler_diagnose_is_catalogued_as_read_only_safe_test() {
+        let cap = catalog()
+            .into_iter()
+            .find(|cap| cap.name == "scheduler.diagnose")
+            .expect("scheduler.diagnose must be catalogued");
+        assert_eq!(cap.cli, "legion scheduler diagnose");
+        assert_eq!(cap.grpc, Some("Manager/DiagnoseScheduler"));
+        assert!(!cap.mutates);
+        assert!(cap.read_only_safe);
     }
 
     #[test]

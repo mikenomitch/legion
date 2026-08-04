@@ -28,6 +28,7 @@ fn cli() -> Command {
         .subcommand(cmd::service::config())
         .subcommand(cmd::volume::config())
         .subcommand(cmd::state::config())
+        .subcommand(cmd::scheduler::config())
         .subcommand(cmd::raft::config())
         .subcommand(cmd::acl::config())
         .subcommand(cmd::exec::config())
@@ -80,6 +81,7 @@ async fn main() -> R<()> {
         Some(("service", sub_matches)) => cmd::service::handle(sub_matches).await?,
         Some(("volume", sub_matches)) => cmd::volume::handle(sub_matches).await?,
         Some(("state", sub_matches)) => cmd::state::handle(sub_matches).await?,
+        Some(("scheduler", sub_matches)) => cmd::scheduler::handle(sub_matches).await?,
         Some(("raft", sub_matches)) => cmd::raft::handle(sub_matches).await?,
         Some(("acl", sub_matches)) => cmd::acl::handle(sub_matches).await?,
         Some(("exec", sub_matches)) => cmd::exec::handle(sub_matches).await?,

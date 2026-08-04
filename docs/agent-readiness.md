@@ -64,6 +64,7 @@ Even with `--allow-write`, `legion_state_query` is forced to read-only.
 | `legion_volume_drivers` | no | Volume plugins installed across the cluster and which nodes can use them. Answers "why was my job rejected for plugin X". |
 | `legion_node_list` | no | List worker nodes. Each carries `heartbeat_source` — see the freshness note below. |
 | `legion_node_cadence` | no | Is the fleet sustaining its heartbeat cadence? Freshness ratio, lost window, sustainable fleet size, and the `heartbeatSeconds` to set if it is falling behind ([heartbeat-cadence-and-scale.md](heartbeat-cadence-and-scale.md)). |
+| `legion_scheduler_diagnose` | no | Is the scheduler healthy, and if not what should change? Returns a verdict plus stable finding codes, the evidence behind each, the causes it RULED OUT with the numbers that excluded them, and an action naming the exact config field and direction ([diagnosing-scheduler-performance.md](diagnosing-scheduler-performance.md)). Blocks for `sample_seconds` (default 30) because every number is a delta over that window. |
 | `legion_node_claims` | no | A node's live provisional (unratified) allocations — started-but-unconfirmed work ([edge-boot.md](edge-boot.md)). Tells "still booting" from "already confirmed". |
 | `legion_boot_ticket_list` | no | Outstanding boot tickets (metadata only; token bytes are never stored or returned). |
 | `legion_service_list` | no | List declared services with healthy/total endpoint counts — what a job can connect to. |
@@ -107,6 +108,26 @@ replicated. Every node therefore carries `heartbeat_source`:
 - `checkpoint` — from a periodic replicated checkpoint, up to
   `liveness.checkpointInterval` (30s by default) behind.
 - `""` — no beat observed, or checkpoints are disabled.
+
+### Reading `legion_scheduler_diagnose`
+
+The tool is built for the failure mode agents are most prone to: quoting one
+number and inventing an explanation for it. Three rules follow from that.
+
+- **Do not report a finding without its `ruled_out` list.** Every failing
+  finding carries the causes it excluded and the numbers that excluded them.
+  Dropping them is how "the cluster is slow" becomes a plausible-sounding
+  wrong diagnosis.
+- **Report `passed` findings when asked whether something is wrong.** "Not
+  starvation — `job_submit` is 61% of processed evals" is an answer. Silence
+  is not.
+- **A finding marked `secondary` is downstream of a heartbeat-cadence
+  problem.** When `heartbeat_ceiling` fires, call `legion_node_cadence` and
+  report that first; the scheduler findings under it are probably symptoms.
+
+Propose the `action` verbatim — it names the field, the direction, and the
+field's current value, so a human can check it before it lands. Do not invent
+a remedy for a finding whose action is `investigate`.
 
 **The node's `status` is exact on every manager**, so `status` is what to
 branch on. Use `last_heartbeat` for display and for ordering, not as evidence

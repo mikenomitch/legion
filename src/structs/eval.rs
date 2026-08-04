@@ -26,6 +26,75 @@ use super::ledger::LedgerEntry;
 #[cfg(test)]
 use super::Submission;
 
+/// Why an eval failed TERMINALLY, as a bounded label for
+/// `legion_evals_failed_total{kind,reason}`.
+///
+/// Bounded on purpose: the error string an eval handler returns carries node
+/// ids, job config ids, and attempt counts, so it cannot become a metric
+/// label without turning one family into thousands of series. Five values
+/// answer the only question the counter is asked — "is this a full cluster,
+/// a bad jobspec, or the control plane losing races?" — and anything
+/// unrecognised lands in `other` rather than inventing a class.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EvalFailureReason {
+    /// Placement found no node that fits. The fleet, not the scheduler.
+    NoCapacity,
+    /// The eval names a kind this manager does not implement — a
+    /// version-skew or corruption signature, never normal operation.
+    UnsupportedKind,
+    /// Optimistic-concurrency retries ran out. Normally requeued rather than
+    /// failed, so a non-zero count here means the backstop was bypassed.
+    ConflictExhausted,
+    /// The store refused the write (NotFound, replication, SQL).
+    StoreError,
+    /// Anything else, including every path that fails an eval without
+    /// classifying it. Never empty on a cluster with failures — see
+    /// `Store::complete_eval_impl`, which counts whether or not the caller
+    /// bothered to classify.
+    Other,
+}
+
+impl EvalFailureReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EvalFailureReason::NoCapacity => "no_capacity",
+            EvalFailureReason::UnsupportedKind => "unsupported_kind",
+            EvalFailureReason::ConflictExhausted => "conflict_exhausted",
+            EvalFailureReason::StoreError => "store_error",
+            EvalFailureReason::Other => "other",
+        }
+    }
+
+    /// Classify a handler error into one of the five buckets.
+    ///
+    /// String matching for the placement case because "no node fits" is
+    /// produced by the planner as prose rather than as a typed error, and
+    /// the alternative — a new error type threaded through every placement
+    /// path — is a much larger change than the label is worth. The match is
+    /// against the exact literal the planner formats, and the planner has a
+    /// test asserting that literal.
+    pub fn classify(error: &anyhow::Error) -> Self {
+        if Eval::error_is_plan_conflict(error) {
+            return EvalFailureReason::ConflictExhausted;
+        }
+        let text = format!("{error:#}");
+        if text.contains("no available nodes matching constraints") {
+            return EvalFailureReason::NoCapacity;
+        }
+        if text.contains("Unsupported eval kind") {
+            return EvalFailureReason::UnsupportedKind;
+        }
+        if error.downcast_ref::<StorageError>().is_some()
+            || error
+                .chain()
+                .any(|cause| cause.downcast_ref::<StorageError>().is_some())
+        {
+            return EvalFailureReason::StoreError;
+        }
+        EvalFailureReason::Other
+    }
+}
+
 impl Eval {
     pub fn handle(&self, store: &Store) -> R<String> {
         match self.kind.as_str() {
