@@ -57,7 +57,7 @@ use std::time::{Duration, Instant};
 use time::format_description::well_known::Rfc3339;
 use time::macros::format_description;
 use time::{Duration as TimeDuration, OffsetDateTime};
-use tokio::sync::{broadcast, Notify};
+use tokio::sync::{broadcast, mpsc, Notify};
 
 // warning incorrectly
 #[allow(dead_code)]
@@ -563,6 +563,21 @@ pub struct Store {
     read_model: Arc<RwLock<SchedulingReadModel>>,
     // Cross-task wake signal for eval workers waiting on an empty queue.
     eval_notify: Arc<Notify>,
+    // Where a plan apply hands off its task_status projection, when a
+    // drain task is running to receive it.
+    //
+    // The projection is a full STATUS-lane quorum round, and it used to run
+    // synchronously inside the scheduler-lane apply — so `apply` paid two
+    // round trips on two different raft groups, each with its own
+    // single-threaded pipeline. It is also the one write on that path the
+    // code already treats as losable: a `NotRaftLeader` here is
+    // warn-and-continue, because the status leader's reconciler and the
+    // workers' own reports re-derive the same rows.
+    //
+    // `None` means no drain task is installed (tests, embedded uses), and
+    // the projection runs inline exactly as before — so behaviour is
+    // unchanged anywhere the daemon is not running.
+    status_projection_tx: Arc<OnceLock<mpsc::UnboundedSender<Vec<Allocation>>>>,
     // Live fan-out of scheduler events to StreamEvents subscribers. Persisted
     // history lives in the scheduler_event table; this only carries new events.
     event_tx: broadcast::Sender<SchedulerEventRecord>,
@@ -923,6 +938,7 @@ impl Store {
             persistence_driver,
             read_model: Arc::new(RwLock::new(SchedulingReadModel::default())),
             eval_notify: Arc::new(Notify::new()),
+            status_projection_tx: Arc::new(OnceLock::new()),
             event_tx: broadcast::channel(EVENT_BROADCAST_CAPACITY).0,
             raft_mode: Arc::new(AtomicBool::new(false)),
             replication: Arc::new(OnceLock::new()),
@@ -3315,7 +3331,27 @@ impl Store {
         // derivable — the status leader's seed reconciler and the workers'
         // own status reports converge them — so a typed `NotRaftLeader`
         // here is warn-and-continue; any other error still fails.
+        //
+        // When a drain task is installed the projection is HANDED OFF
+        // rather than run here: it is a second quorum round, on a second
+        // raft group, inside the scheduler lane's own apply, and the
+        // paragraph above is the argument for why it does not need to be
+        // synchronous — the rows are derivable and losing them is already
+        // tolerated. Deferring it takes that round off the eval's critical
+        // path. Without a drain task (tests, embedded use) it still runs
+        // inline, unchanged.
         if !placed.is_empty() {
+            if let Some(tx) = self.status_projection_tx.get() {
+                // Unbounded: the drain coalesces, and dropping a
+                // projection here would be a silent correctness hole
+                // rather than backpressure. A closed channel means the
+                // daemon is shutting down, in which case the reconciler
+                // covers it on the next leadership acquisition.
+                if tx.send(placed.to_vec()).is_ok() {
+                    return Ok(());
+                }
+                debug!("status projection drain is gone; projecting inline");
+            }
             if let Err(err) = self.update_task_statuses_for_allocations(placed) {
                 if !crate::storage::raft::driver::NotRaftLeader::in_chain(&err) {
                     return Err(err);
@@ -12575,6 +12611,47 @@ impl Store {
     // Expose a clone so runtime worker tasks can await wake notifications.
     pub fn eval_notifier(&self) -> Arc<Notify> {
         Arc::clone(&self.eval_notify)
+    }
+
+    /// Install the deferred task_status projection queue and take its
+    /// receiving half. Called once, by the daemon, when it spawns the
+    /// drain task; every later call gets `None`.
+    ///
+    /// Until this is called the projection runs inline inside the plan
+    /// apply, which is the behaviour every test and embedded caller
+    /// already depends on.
+    pub fn install_status_projection_queue(
+        &self,
+    ) -> Option<mpsc::UnboundedReceiver<Vec<Allocation>>> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        match self.status_projection_tx.set(tx) {
+            Ok(()) => Some(rx),
+            Err(_) => None,
+        }
+    }
+
+    /// Apply one drained batch of task_status projections.
+    ///
+    /// Separate from [`Self::update_task_statuses_for_allocations`] only so
+    /// the drain task has an entry point that owns the same
+    /// "derivable, so a foreign-lane rejection is not fatal" rule the
+    /// inline path has.
+    pub fn project_task_statuses(&self, placed: &[Allocation]) -> R<()> {
+        if placed.is_empty() {
+            return Ok(());
+        }
+        if let Err(err) = self.update_task_statuses_for_allocations(placed) {
+            if !crate::storage::raft::driver::NotRaftLeader::in_chain(&err) {
+                return Err(err);
+            }
+            warn!(
+                allocations = placed.len(),
+                error = %err,
+                "status-lane task_status projection skipped: this node does not lead the \
+                 status lane; worker reports and the status leader's reconciler converge them"
+            );
+        }
+        Ok(())
     }
 
     // Returns how long until the earliest pending eval becomes claimable.

@@ -1572,6 +1572,13 @@ async fn start_eval_loop(store: Store, max_threads: usize) -> R<()> {
     }
 
     let mut join_set = JoinSet::new();
+    // Before the workers: once this is installed, plan applies hand their
+    // task_status projection here instead of paying a status-lane quorum
+    // round inline. Installing it after would leave the first few applies
+    // on the synchronous path for no reason.
+    if let Some(rx) = store.install_status_projection_queue() {
+        spawn_status_projection_drain(&mut join_set, &store, rx);
+    }
     for worker_id in 0..max_threads {
         spawn_eval_worker(&mut join_set, &store, worker_id);
     }
@@ -1610,6 +1617,50 @@ async fn restart_eval_worker_after_exit(
     info!(worker_id, "Spawning replacement eval worker");
     spawn_eval_worker(join_set, store, worker_id);
     true
+}
+
+/// Drain deferred task_status projections off the plan-apply path.
+///
+/// Each projection is a status-lane quorum round. Running it inside the
+/// scheduler-lane apply meant every applied plan paid two round trips on
+/// two raft groups before the eval could finish. Here it is one round per
+/// DRAIN instead of one per plan: whatever has queued up while the last
+/// round was in flight is merged and projected together, which is the
+/// same amortization the plan-apply coalescer already gets.
+///
+/// Losing a batch is survivable by design — the rows are derived from
+/// allocations that are already committed, and the status leader's
+/// reconciler plus the workers' own reports re-derive them. That is why
+/// this can be off the critical path at all.
+fn spawn_status_projection_drain(
+    join_set: &mut JoinSet<()>,
+    store: &Store,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<Vec<crate::structs::Allocation>>,
+) {
+    let store = store.clone();
+    join_set.spawn(async move {
+        info!("Task-status projection drain started");
+        while let Some(first) = rx.recv().await {
+            let mut batch = first;
+            // Take everything else already queued. The projection dedupes
+            // by task config internally, so merging is free.
+            while let Ok(more) = rx.try_recv() {
+                batch.extend(more);
+            }
+            let store_for_write = store.clone();
+            let size = batch.len();
+            // spawn_blocking: this is a raft propose plus a SQLite write,
+            // and it must not park a runtime worker.
+            match tokio::task::spawn_blocking(move || store_for_write.project_task_statuses(&batch))
+                .await
+            {
+                Ok(Ok(())) => debug!(allocations = size, "Projected task statuses"),
+                Ok(Err(e)) => warn!(allocations = size, "Task-status projection failed: {e:#}"),
+                Err(e) => warn!("Task-status projection task failed: {e:?}"),
+            }
+        }
+        info!("Task-status projection drain stopped");
+    });
 }
 
 fn spawn_eval_worker(join_set: &mut JoinSet<()>, store: &Store, worker_id: usize) {
