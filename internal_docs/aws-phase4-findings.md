@@ -231,12 +231,26 @@ diagnosis of my own.
 | 50,000 | 736.1 alloc/s | 58.0 s |
 | 100,000 | 456.58 alloc/s | 177.8 s |
 
-Plan phases at 100,000 against 25,000: `apply` 20.96 ms -> **354 ms**,
-`build_plan` 9.10 -> 20 ms, `capacity_snapshot` 1.40 -> 4 ms, total 36.86 ->
-381 ms. `apply` is 93% of plan time.
+Plan phases at 100,000: `apply` **354 ms** of a 381 ms total — 93%.
+
+> **Do not compare that against the 36.86 ms total from cell A.** Cell A was
+> driver-bound, so it measured an IDLE control plane with no queueing. Putting
+> 21 ms of idle `apply` next to 354 ms of saturated `apply` reads as a 17x
+> scaling cliff and is nothing of the kind. Compare saturated points only:
+
+| allocations | apply | build_plan | capacity_snapshot | total |
+| --- | --- | --- | --- | --- |
+| 100,000 | 354 ms | 20 ms | 4 ms | 381 ms |
+| 200,000 | 415 ms | 32 ms | 8 ms | 465 ms |
+
+**+22% for 2x the data** — sublinear. `build_plan` and `capacity_snapshot` do
+grow with the live allocation count and `apply` is dominated by queueing, which
+is a load effect rather than a data-size one.
 
 The first guess was that SQLite was thrashing its 2 MiB default page cache.
-That was wrong, and the timer boundary is why: `apply_us` wraps the whole
+That was wrong twice over — the cliff it was explaining was an artifact of
+comparing an idle cell to a saturated one, and the timer boundary rules out
+reads anyway: `apply_us` wraps the whole
 `replicated()` call, so it contains the coalescer wait, the raft propose, the
 quorum round trip and the post-commit cache refresh — it is not a
 SQLite-read timer. Measured during the 200,000 cell:
