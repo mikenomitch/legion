@@ -86,6 +86,13 @@ rules a cause in or out, and which knob to turn — is in
   cordon, or — for an edge-boot ratification only — an epoch conflict).
   The outcomes are mutually exclusive — see
   [late-binding-plan-apply.md](late-binding-plan-apply.md).
+- **`legion_eval_claim_total{outcome}`** (counter) — eval claim attempts by
+  an eval worker: `claimed` found work, `empty` did not. Every attempt is a
+  scheduler-lane quorum round either way, so the `empty` share is the cost of
+  waking a worker for work that does not exist. A large share means the pool
+  is being over-woken; a saturated 5,000-node cluster runs at roughly 0.3
+  empty claims per second. Claims carried over by the fused
+  complete-and-claim round are not counted — they were already paid for.
 - **`legion_scheduler_plan_candidate_rank`** (histogram) — candidate rank
   each applied placement bound at (0 = the planner's first choice; higher
   ranks mean the apply walk absorbed a race by falling back).
@@ -332,10 +339,22 @@ happening" are different claims, and only these families can tell them apart.
   — when write latency moves, whichever histogram moved names the culprit
   (local SQLite/capture vs the replication pipeline: network, fsync,
   follower lag).
-- **`legion_raft_ops_total{lane,outcome}`** (counter) — replicated store
+- **`legion_raft_ops_total{lane,op,outcome}`** (counter) — replicated store
   ops by outcome: `applied`, `empty` (the mutation touched no rows and
   skipped the raft entry), `not_leader` (proposal rejected before capture —
   normal on followers under divergent lane leadership), `error`.
+  `op` is the operation name, which is what makes a busy lane attributable:
+  a lane's `applied` count is its quorum-round count, so
+  `topk(10, sum by (lane, op) (rate(legion_raft_ops_total{outcome="applied"}[1m])))`
+  is the list to shorten when a lane is the limit.
+
+  **Split by `outcome` before drawing conclusions.** A high op rate is not a
+  high replication cost: an op whose changeset came out empty never reaches
+  quorum. A 5,000-node cluster shows `update_node_health_checks` as the
+  single busiest op on the status lane at ~134/s, and every one of them is
+  `empty` — workers re-report the same health check and the row does not
+  change. Reading the op rate without the outcome makes it look like the
+  dominant cost in the system when it costs no rounds at all.
 - **`legion_raft_pipeline_wait_seconds{lane}`** (histogram) — time a
   replicated op sat in the lane's pipeline queue before the lane's pipeline
   thread began executing it. Each lane is served by exactly **one** OS thread
