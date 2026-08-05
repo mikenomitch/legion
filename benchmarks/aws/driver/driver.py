@@ -134,6 +134,54 @@ def compute_metrics(submits, events, expected_total, warmup_secs=0.0, kill_time_
         "warmup_applied": warmup_applied,
     }
 
+    # Is this cell measuring the system under test, or the driver?
+    #
+    # Submission is a CLI process per job from a thread pool, so it has its
+    # own ceiling, and when the scheduler is faster than that ceiling the
+    # cell reports the DRIVER's rate with no sign that it has done so. The
+    # 2026-08-05 phase-4 campaign is the worked example: 4,167 jobs went out
+    # over 114.97s (36.24 jobs/sec) and the cell reported 203.19 alloc/sec,
+    # which is 36.24 x 6 allocations per job. The control plane sat at 8%
+    # CPU with an empty eval queue. Three sessions of "throughput" numbers
+    # were submission rates.
+    #
+    # The signal is the lag between the two streams: if placement finishes
+    # essentially when submission does, placement was never behind, and the
+    # rate is submission's. Report it rather than leaving it to be noticed.
+    if submits and events:
+        last_submit = max(submits.values())
+        submit_span = (last_submit - first_submit) / 1000.0
+        submit_rate = len(submits) / submit_span if submit_span > 0 else None
+        # How long after the last job was submitted the last allocation
+        # landed. Near zero means the scheduler was never the constraint.
+        drain_secs = (last_event - last_submit) / 1000.0
+        window = metrics["steady_window_secs"] or 0.0
+        driver_bound = window > 0 and drain_secs < 0.1 * window
+        metrics["submission"] = {
+            "jobs": len(submits),
+            "span_secs": round(submit_span, 3),
+            "rate_per_sec": round(submit_rate, 2) if submit_rate else None,
+            # Placement time left after the last submit. A cell whose
+            # scheduler is the constraint keeps draining after submission
+            # stops; one that is driver-bound finishes with it.
+            "drain_secs": round(drain_secs, 3),
+            # True means throughput_per_sec is a floor for the system under
+            # test and an accurate measure of nothing but this driver.
+            "driver_bound": driver_bound,
+        }
+        if driver_bound:
+            print(
+                f"WARNING: DRIVER-BOUND CELL. Submission ran at "
+                f"{submit_rate:.1f} jobs/sec and the last allocation landed "
+                f"{drain_secs:.1f}s after the last submit, so the scheduler "
+                f"was never behind. throughput_per_sec="
+                f"{metrics['throughput_per_sec']} is this driver's ceiling, "
+                f"NOT the system's. Raise --submit-concurrency, use a bigger "
+                f"loadgen box, or use a scenario with more allocations per "
+                f"job before comparing this number to anything.",
+                file=sys.stderr,
+            )
+
     if kill_time_ms is not None:
         replacements = [event for event in events if event["t_ms"] >= kill_time_ms]
         replaced = sum(event["count"] for event in replacements)
@@ -669,13 +717,16 @@ def main():
     run.add_argument(
         "--submit-concurrency",
         type=int,
-        default=4,
+        default=32,
         help="Jobs submitted in parallel. 1 restores the old serial loop, "
         "which measured the driver (~40 jobs/sec) rather than the system. "
-        "The default is deliberately modest: each slot is a whole CLI "
-        "process, and the loadgen box is an m7i.large with 2 vCPU, so "
-        "oversubscribing it starves the event-watcher thread and the cell "
-        "measures the driver's contention instead of the scheduler.",
+        "Each slot is a whole CLI process, so this is the setting that "
+        "decides whether a cell measures the scheduler or the driver: at "
+        "the old default of 4 on a 2-vCPU loadgen box, submission ceilinged "
+        "at ~36 jobs/sec and phase 4 reported that as Legion throughput "
+        "while the control plane idled at 8% CPU. Size it to the loadgen "
+        "box (the rig now provisions 16 vCPU) and check "
+        "`submission.driver_bound` in the output before trusting a number.",
     )
     run.add_argument("--legion-bin", default="legion")
     run.add_argument("--nomad-bin", default="nomad")
