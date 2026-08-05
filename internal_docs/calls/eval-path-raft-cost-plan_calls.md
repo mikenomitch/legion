@@ -38,7 +38,71 @@ Ranked by project impact; the number is the rank.
   a large `empty` share means workers are being woken for work that does
   not exist.
 
-## 2. Fuse claim and complete, rather than making the lane parallel
+## 2. Refresh the read model from the changeset delta, giving up self-healing
+
+- **The call:** after a committed changeset, patch `allocations_by_node`
+  from the allocation rows the changeset *named* — one primary-key read
+  per created or changed row — instead of reloading every touched node's
+  entire allocation list. `cache_refresh_allocation_scopes` stays, as the
+  fallback and as the path for every non-changeset caller.
+- **Alternatives.** (a) Keep the full reload and make it cheaper still
+  (one connection and one cached statement, which
+  an earlier commit on this branch already did). (b) Rebuild the
+  allocation from the changeset's own column values and never touch
+  SQLite. (c) Cache the per-node lists behind an epoch so an unchanged
+  node's reload can be skipped. (d) Leave it: the refresh is off the
+  timed plan path, so it is invisible in the metrics.
+- **Trade-off — the property being sold.** The full reload is
+  **self-healing**: whatever the in-memory model held, it is overwritten
+  by the truth in SQLite, so drift cannot persist. A delta can only ever
+  be as right as the entry it patches, and a read model that drifts from
+  committed state makes the scheduler plan against a fleet that does not
+  exist — placements onto full nodes, or nodes wrongly believed full and
+  therefore never written to again. That last case is self-sustaining:
+  no later changeset names a node nobody schedules onto, so a delta alone
+  would never revisit it. Three things bound the loss, and they are the
+  reason this was worth doing: a **per-node fallback** to the full reload
+  whenever the delta contradicts the cache (a delete that finds no row,
+  an insert that finds one, an in-place update that does not), a
+  **whole-changeset fallback** whenever a record cannot be classified or
+  names a row committed state does not have, and a **round-robin scrub**
+  that reloads one node in full per projected changeset, so any drift is
+  repaired within one sweep of the fleet instead of never. The honest
+  summary: drift is no longer *impossible*, it is *bounded* — by one
+  fleet sweep in time, and by a fallback in every case the projection can
+  actually see.
+- **Why (performance).** The old cost scaled with how FULL the cluster
+  is while the change being projected did not. On the AWS `dense_fleet`
+  shape (5,000 nodes, 16 eval threads, no cell driver-bound) a plan
+  touching ~44 nodes reloaded ~440 rows at 50,000 allocations and ~1,760
+  at 200,000 — to learn about ~44 allocations the changeset had already
+  named exactly. Throughput across that ladder was 736.1 → 456.58 →
+  272.91 alloc/s, ~1.6x worse per doubling, while plan-phase timers grew
+  only 22% over the last step: the missing time is here, outside those
+  timers, on **every replica**. (a) divides the constant and keeps the
+  scaling, which is the actual defect. (b) saves the primary-key reads
+  but has to reconstruct an `Allocation` from a record that carries only
+  the columns that changed, and re-derive the `job_id` join — more code
+  in the one place where being subtly wrong corrupts capacity, for a
+  saving on top of an indexed lookup. (c) is a bigger structure (a
+  per-node epoch mirror maintained everywhere allocations are written)
+  that would still reload whole lists whenever a node did change. (d) is
+  what the last three campaigns did.
+- **Surface.** None for the user. Two `warn!` lines are new, and both
+  mean the same thing — the cached read model disagreed with committed
+  state — naming the allocation ids or the nodes involved. Neither is
+  expected in a healthy cluster; either one appearing repeatedly is the
+  signal that the delta's premises are wrong somewhere.
+- **What is left on the table.** Reprojection (`reproject_model_nodes`)
+  still recomputes each touched node's free pool from its whole
+  allocation list, so a fill-scaled term remains in memory even though
+  the SQL one is gone. Measured locally over 44 touched nodes: at 10
+  allocations/node the refresh went 832µs → 496µs, at 40 it went 2.16ms →
+  1.03ms — about 2x, with the remainder now dominated by that
+  reprojection and by the 44 separate per-scope epoch reads. Making
+  either incremental is its own change.
+
+## 3. Fuse claim and complete, rather than making the lane parallel
 
 - **The call:** halve the scheduler lane's per-eval quorum rounds by
   fusing the terminal write with the next claim
@@ -69,7 +133,7 @@ Ranked by project impact; the number is the rank.
   worker immediately asks for more work. Do the cheap, safe half first and
   let the measurement decide whether the expensive half is needed.
 
-## 3. The fused claim is handled before the leadership gate
+## 4. The fused claim is handled before the leadership gate
 
 - **The call:** a worker holding an eval handed back by the previous
   fused write processes it even if `is_raft_leader` now reports false;
@@ -89,7 +153,7 @@ Ranked by project impact; the number is the rank.
   tested, so the honest framing is that fusing does not widen the window
   it inherits.
 
-## 4. A panicked handler writes nothing
+## 5. A panicked handler writes nothing
 
 - **The call:** when `spawn_blocking` returns `Err` (handler panicked or
   was cancelled), the loop logs and writes no outcome, leaving the eval
@@ -105,7 +169,7 @@ Ranked by project impact; the number is the rank.
   both fixed). Writing nothing is the only option that cannot lose work,
   and it matches what a crashed worker already produces.
 
-## 5. Batched enqueue takes a request struct, not N arguments
+## 6. Batched enqueue takes a request struct, not N arguments
 
 - **The call:** `enqueue_evals(Vec<EvalRequest>)` with a struct carrying
   kind/job/config/node/priority/delay, plus an `EvalRequest::for_job`
@@ -121,7 +185,7 @@ Ranked by project impact; the number is the rank.
   half of the storm — an obvious thing to build. (b) would have fixed
   today's four loops and left the next one to rediscover the problem.
 
-## 6. Local benchmarks are reported as a no-regression check only
+## 7. Local benchmarks are reported as a no-regression check only
 
 - **The call:** the PR quotes the local SLO gate as "no regression" and
   explicitly declines to claim a throughput win from it.

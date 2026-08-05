@@ -330,9 +330,20 @@ does not reduce the rows read.
 
 ## Open, in priority order
 
-1. **Stop re-reading whole nodes on the read-model refresh.** The strongest
-   explanation for the ~1.6x-per-doubling degradation, and the only one that
-   accounts for time outside the plan timers. Apply a changeset delta.
+1. ~~**Stop re-reading whole nodes on the read-model refresh.**~~ **Shipped
+   2026-08-05, unmeasured at scale.** `cache_apply_allocation_delta` reads
+   exactly the rows the changeset names, by primary key, and splices them
+   into the cached per-node lists; the full reload stays as the fallback and
+   as the path for every non-changeset caller. Self-healing is bounded rather
+   than free now: a per-node fallback on contradiction, a whole-changeset
+   fallback on anything unclassifiable, and a round-robin scrub of one node
+   per projected changeset. Locally, over 44 touched nodes, the refresh is
+   ~2x faster at both 10 and 40 allocations per node. **The ladder above is
+   the regression test** — if this was the mechanism, the ~1.6x-per-doubling
+   degradation should flatten; if it does not, the remaining suspect is
+   `free_pool_for_node_tx` inside the apply transaction, which still reads
+   every allocation on a node, and `reproject_model_nodes`, which still
+   recomputes each touched node's pool from its whole list.
 2. **Break the serialized plan-apply commit.** 347 ms of follower wait against
    a 138 ms commit is the ceiling at scale. Either make the commit cheaper or
    let submitters join an in-flight batch rather than queue behind it — the

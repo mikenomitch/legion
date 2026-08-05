@@ -116,6 +116,18 @@ selects how durable the writes are:
   every manager — replicas cannot diverge. The read-model cache and event
   stream are projected from the committed changeset at apply time, so
   followers get both for free and nothing is visible before quorum commit.
+  That projection is a **delta**: the changeset names exactly which
+  allocation rows moved, so the cache patches those rows instead of
+  reloading every touched node's allocation list, and the cost of a commit
+  follows the size of the change rather than how full the cluster is. A
+  delta cannot repair a cache entry that is already wrong, so three things
+  bound that: any node whose delta contradicts the cache is reloaded in
+  full, any changeset whose allocation records cannot be classified falls
+  back to the full reload wholesale, and one node per projected changeset is
+  reloaded in full on a round-robin sweep of the fleet. The fallbacks log at
+  `warn` naming the allocation ids or nodes involved; they are not expected
+  in a healthy cluster, and repeated occurrences mean the cache and
+  committed state are disagreeing.
   In raft mode, `write_connection()` outside the capture/apply paths fails
   loudly (a runtime bypass guard), so no code path can mutate state
   without replicating it. Snapshots, log compaction, membership, and

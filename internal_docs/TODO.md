@@ -75,6 +75,16 @@ How to use it:
       `submission.driver_bound: false`: **177.27 alloc/sec** at 4 eval
       threads, **219.25** at 16, and **736.1** on `dense_fleet` (44
       allocations per eval), all at 5,000 nodes on three 4-vCPU managers.
+- [ ] **Reprojection still reads a node's whole allocation list.** The
+      read-model refresh now takes the changeset delta (Done below), but
+      `reproject_model_nodes` still recomputes each touched node's free pool
+      from every allocation on it — so a fill-scaled term survives, in memory
+      rather than in SQLite. Locally, over 44 touched nodes, the refresh went
+      832µs → 496µs at 10 allocations/node and 2.16ms → 1.03ms at 40; what
+      remains is that reprojection plus 44 separate per-scope epoch reads,
+      each taking its own read connection. Making either incremental is its
+      own change: the pool would have to be debited and credited by the
+      delta, and the index reprojection consumes the pool.
 - [ ] **Batch the eval loop (claim N, plan N, apply N, complete N).** Now the
       whole remaining cost. With the wake herd fixed and health checks shown
       to be `outcome=empty`, the only meaningful quorum traffic left is
@@ -1580,6 +1590,22 @@ Deferred from [job-updated-at-plan.md](plans/job-updated-at-plan.md):
 
 docs: [scheduler-and-eval-loop.md](../docs/scheduler-and-eval-loop.md), [jobs-tasks-and-scheduling.md](../docs/jobs-tasks-and-scheduling.md)
 
+- [x] **The read-model refresh takes the changeset delta, not a whole-node
+      reload.** 2026-08-05, from the phase-4 fill-scaling finding
+      ([findings](aws-phase4-findings.md),
+      [calls](calls/eval-path-raft-cost-plan_calls.md) #2).
+      `cache_refresh_allocation_scopes` reloaded every touched node's ENTIRE
+      allocation list after each committed changeset, on every replica — ~440
+      rows at 50,000 allocations and ~1,760 at 200,000 to learn about the ~44
+      the changeset already named. `cache_apply_allocation_delta` now reads
+      exactly the named rows by primary key and splices them in, so the cost
+      follows the change instead of the fill. What it gives up is
+      self-healing, bounded three ways: a per-node fallback to the full
+      reload when the delta contradicts the cache, a whole-changeset fallback
+      when a record cannot be classified, and a round-robin scrub that
+      reloads one node in full per projected changeset, so drift is repaired
+      within one sweep of the fleet. Two new `warn!` lines fire only when the
+      cache and committed state disagree.
 - [x] **Plan-apply conflict reduction: the epoch is a ranking hint, not a
       gate.** 2026-08-04, from the AWS phase-2 finding that **74% of plan
       applies were rejected and re-planned**
