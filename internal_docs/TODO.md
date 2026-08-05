@@ -66,17 +66,42 @@ How to use it:
       `Store::enqueue_evals` makes every fan-out one round instead of one
       per row (leadership regeneration, drained and lost nodes). **The
       AWS re-measurement is NOT run** — see the open item below.
-- [ ] **Measure the eval-path raft cuts at 5,000 nodes.** Exit criterion
-      from [eval-path-raft-cost-plan.md](plans/eval-path-raft-cost-plan.md):
-      `cell_summary.py --lanes` shows scheduler-lane rounds per eval at or
-      below 2.5 (from ~4), and throughput above the 80.35 alloc/sec
-      phase-3 baseline. `collect.sh` now archives the raft lane metrics
-      needed to check it. **A local run cannot measure this** —
-      `Store::replicated` short-circuits when raft is off, so the fused
-      op and the unfused pair execute identical code on one node.
-      If rounds fall and throughput does not, the lane is not the ceiling
-      either and the next suspect is `apply` itself (27.9 ms/eval, 67% of
-      plan time).
+- [x] **Measure the eval-path raft cuts at 5,000 nodes.** Done 2026-08-05,
+      but only after the rig itself was fixed — see
+      [aws-phase4-findings.md](aws-phase4-findings.md). The benchmark driver
+      spawned one CLI process per job from a pool of 4 on a 2-vCPU box, which
+      capped submission at ~36 jobs/sec and meant every earlier cell reported
+      the DRIVER's rate. Results on a rig that reports
+      `submission.driver_bound: false`: **177.27 alloc/sec** at 4 eval
+      threads, **219.25** at 16, and **736.1** on `dense_fleet` (44
+      allocations per eval), all at 5,000 nodes on three 4-vCPU managers.
+- [ ] **Batch the eval loop (claim N, plan N, apply N, complete N).** Now the
+      whole remaining cost. With the wake herd fixed and health checks shown
+      to be `outcome=empty`, the only meaningful quorum traffic left is
+      `complete_and_claim_next` (44/s) plus ~20/s of plan applies. The
+      amortization curve says the same thing from the other side: 6
+      allocations per eval gives 219 alloc/sec, 44 gives 736, so per-eval
+      overhead is what sets the rate.
+- [x] **Fix the eval-notifier thundering herd.** `notify_waiters()` woke
+      every parked eval worker on ANY `eval` row change, and each answered
+      with a `claim_eval` — a scheduler-lane quorum round whether or not it
+      found work. Every eval crosses that path three times. Measured at
+      16,678 scheduler-lane raft ops at 4 threads against 47,096 at 16, for
+      identical work, with throughput FALLING as threads rose. Now wakes one
+      worker per newly-claimable eval; empty claims are down to 0.3/sec and
+      16 threads beat 4 by 23.7%. Adds
+      `legion_eval_claim_total{outcome}`, whose absence is what hid it, and
+      an `op` label on `legion_raft_ops_total`.
+- [ ] **Decide the `evalThreads` default.** It is `available_parallelism()`,
+      which is the 4 that just lost to 16 by 23.7%. An eval worker parks on
+      quorum round trips rather than computing (8% CPU at saturation), so
+      core count is the wrong basis. A changed default needs a plan under
+      [plans/README.md](plans/README.md)'s rule.
+- [ ] **Skip the health-check write when nothing changed.**
+      `update_node_health_checks` runs ~134/s on a 5,000-node fleet and every
+      one is `outcome=empty`, so it costs no quorum rounds — but it still
+      takes a savepoint and the write connection each time. Cheap to remove,
+      and it is pure contention against real writes.
 - [ ] **Re-measure the plan-apply fix on AWS.** Phase 4 of
       [plan-apply-conflict-reduction-plan.md](plans/plan-apply-conflict-reduction-plan.md).
       The two-pass bind is shipped and unit-proven but **unmeasured at
