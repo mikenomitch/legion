@@ -872,6 +872,25 @@ fn read_only_conn_pool_size() -> usize {
         .max(4)
 }
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Page cache per connection, as a NEGATIVE `cache_size` — SQLite reads a
+/// negative value as kibibytes rather than pages, so this is 64 MiB whatever
+/// the page size is.
+///
+/// SQLite's default is 2 MiB, which a real cluster outgrows immediately: a
+/// 5,000-node fleet holding 100,000 allocations has an `allocation` table plus
+/// indexes far larger than that, and the scheduler's hot path re-reads it
+/// constantly (free pools per node, epochs per scope, the read model's
+/// refresh). Past the default the cache thrashes and every read becomes a
+/// page fetch. The 2026-08-05 AWS campaign measured the plan `apply` phase
+/// going from 21 ms per eval at 25,000 allocations to 354 ms at 100,000 —
+/// a 17x rise from a 4x data increase, which is a cliff rather than a slope.
+///
+/// Generous is safe here: `cache_size` is a CAP, not a preallocation. SQLite
+/// grows the cache lazily as pages are actually read, so a small deployment
+/// never pays for a limit it does not reach, while a large one stops
+/// thrashing.
+const SQLITE_CACHE_SIZE_KIB: i64 = -65536;
 // Live subscribers that fall this many events behind must catch up from the
 // scheduler_event table (StreamEvents handles the Lagged case).
 const EVENT_BROADCAST_CAPACITY: usize = 1_024;
@@ -1379,6 +1398,7 @@ impl Store {
         }
 
         conn.pragma_update(None, "foreign_keys", "ON")?;
+        conn.pragma_update(None, "cache_size", SQLITE_CACHE_SIZE_KIB)?;
 
         Ok(())
     }
@@ -15490,6 +15510,35 @@ mod tests {
     /// `last_purged_log_id` (possible under NORMAL until a WAL checkpoint)
     /// would brick the node at startup reapply. local_disk keeps NORMAL.
     #[test]
+    /// Both connection kinds get a page cache big enough to hold a real
+    /// cluster's hot tables. SQLite's 2 MiB default made the plan-apply phase
+    /// cliff from 21 ms to 354 ms per eval between 25,000 and 100,000
+    /// allocations on the 2026-08-05 AWS campaign.
+    #[test]
+    fn connections_raise_the_page_cache_off_the_sqlite_default() -> R<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("cache.sqlite");
+
+        // Read-only connections have to be configured against a database that
+        // already exists, so make it with the write path first.
+        let writer = Connection::open(&path)?;
+        Store::configure_connection(&writer, false, false)?;
+        let cached: i64 = writer.query_row("PRAGMA cache_size;", [], |r| r.get(0))?;
+        assert_eq!(
+            cached, SQLITE_CACHE_SIZE_KIB,
+            "the write connection must carry an explicit page cache, not SQLite's 2 MiB default"
+        );
+
+        let reader = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        Store::configure_connection(&reader, true, false)?;
+        let cached: i64 = reader.query_row("PRAGMA cache_size;", [], |r| r.get(0))?;
+        assert_eq!(
+            cached, SQLITE_CACHE_SIZE_KIB,
+            "read connections serve the scheduler's hot path and need the cache most"
+        );
+        Ok(())
+    }
+
     fn durable_sync_runs_write_connection_at_synchronous_full() -> R<()> {
         let dir = tempfile::tempdir()?;
 
