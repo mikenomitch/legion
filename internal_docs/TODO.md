@@ -1371,6 +1371,31 @@ Deferred from [job-updated-at-plan.md](plans/job-updated-at-plan.md):
       running. Fix: detect a non-tty and either default to proceeding or fail
       loudly, never exit silently on a confirmation prompt. Audit the other
       rig scripts for the same `set -e` + `read` shape.
+- [x] **Bake the operator box's toolchain into an AMI.** Standing the box up
+      installed build-essential, protoc, clang, terraform, AWS CLI v2 and
+      rustup in user-data on every launch: `cloud-init analyze blame` measured
+      `modules-final/config-scripts_user` at **3245 seconds (54 minutes)** on
+      one launch and ~14 minutes on another — same instance type, same region,
+      same script, so it is `apt-get` throughput and nothing the rig controls.
+      All of it paid before any Legion code compiles.
+      `benchmarks/aws/scripts/bake-operator-ami.sh` pays it once into a tagged
+      AMI (~20 min, ~$0.05/mo for the snapshot) and `bootstrap-operator-box.sh`
+      launches from it, leaving only per-instance setup — the rig's SSH key
+      pair — in user-data, so first boot is seconds. Both paths run the one
+      `scripts/operator-toolchain.sh`, whose content hash is tagged onto the
+      image: a toolchain change makes the bootstrap report the image stale and
+      fall back to the slow path rather than launch a box missing a tool. No
+      baked AMI means today's behavior exactly, with a log line saying so.
+      See the README's "Bake the operator AMI first" and
+      [calls #29](calls/aws-comparative-benchmark-plan_calls.md).
+  - [ ] **Bake one against real AWS.** Written and exercised against a stubbed
+        `aws` CLI only (every path: no AMI, current AMI, stale AMI, re-run,
+        `--show`), because a campaign was billing at the time and an extra
+        instance or image would have confused its teardown. Unverified: that
+        console output survives the bake instance's stop (the version tag
+        degrades to `unknown` if not — the power state, not the console, is
+        the completion signal), and that the real bake lands inside the
+        90-minute timeout.
 - [ ] **Share one target dir across plugin builds.** `build.rs` gives every
       plugin its own `CARGO_TARGET_DIR` (`target/plugin-build/<kind>/<name>`)
       and builds them sequentially, and every plugin depends on the whole

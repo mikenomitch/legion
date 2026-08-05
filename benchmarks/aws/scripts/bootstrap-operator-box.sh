@@ -39,6 +39,17 @@
 # stopped, and the Elastic IP means the address — hence admin_cidr in the
 # rig's terraform.tfvars — survives the stop.
 #
+# Bake the toolchain first, once per region. Installing it in user-data
+# was measured at 54 minutes on one launch of this box and 14 on
+# another; from a baked AMI first boot is seconds:
+#
+#   bake-operator-ami.sh --region us-east-1     # ~20 min, once
+#   bake-operator-ami.sh --show                 # what is baked, and is it current
+#
+# Without one, `create` says so and installs the toolchain in user-data
+# exactly as it always did. `--ami <id>` launches from a specific image;
+# `--slow-bootstrap` ignores any baked image.
+#
 #   # The pieces `launch` chains, if you want to drive them yourself:
 #   bootstrap-operator-box.sh create [--region us-east-1] [--type c7i.2xlarge]
 #   bootstrap-operator-box.sh push            # rsync this repo onto the box
@@ -61,6 +72,12 @@ REPO_ROOT="$(cd "$AWS_BENCH_ROOT/../.." && pwd)"
 # Deliberately not sourcing env.sh: that file's first act is to resolve
 # rig topology from terraform state or the on-rig manifest, and neither
 # exists yet at step 0.
+#
+# operator-ami-lib.sh is a different animal — three constants and two
+# read-only helpers shared with bake-operator-ami.sh, so the tag this
+# script searches for and the tag that script writes cannot drift apart.
+# shellcheck source=./operator-ami-lib.sh
+. "$AWS_BENCH_ROOT/scripts/operator-ami-lib.sh"
 STATE_FILE="${OPERATOR_STATE_FILE:-$AWS_BENCH_ROOT/.operator-box.json}"
 
 NAME="${OPERATOR_NAME:-legion-bench-operator}"
@@ -74,6 +91,13 @@ DISK_GB=100
 ADMIN_CIDR=""     # who may SSH to THIS box; default is your current IP /32
 KEY_PATH="$HOME/.ssh/${NAME}"
 ARCHIVE_BUCKET=""       # "" = create one; "none" = skip the durable mirror
+# Which image the box launches from. Empty = look for one this account
+# baked with scripts/bake-operator-ami.sh, and fall back to the stock
+# Ubuntu AMI plus a 15-55 minute install. See resolve_base_ami.
+BASE_AMI="${OPERATOR_AMI:-}"
+USE_BAKED_AMI=true      # --slow-bootstrap forces the stock-AMI path
+BASE_AMI_ID=""          # set by resolve_base_ami
+BASE_AMI_BAKED=false    # set by resolve_base_ami; decides the user-data
 # A plain string, not an array: macOS still ships bash 3.2, where
 # expanding an empty array under `set -u` is an error.
 PHASE1_ARGS=""
@@ -321,13 +345,8 @@ cmd_create() {
     state_put public_ip "$eip_ip"
     log "elastic IP $eip_ip allocated — this is the rig's admin_cidr"
 
-    # Canonical's Ubuntu 24.04 amd64 pointer, same source terraform uses
-    # (terraform/instances.tf) so the operator box and the rig run the
-    # same distro. Resolved at run time, never a hardcoded AMI id.
-    local ami
-    ami=$(aws_ ssm get-parameters \
-        --names /aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id \
-        --query 'Parameters[0].Value' --output text)
+    resolve_base_ami
+    local ami="$BASE_AMI_ID"
 
     log "launching $INSTANCE_TYPE from $ami"
     local instance_id user_data
@@ -386,7 +405,12 @@ cmd_create() {
     CREATE_IN_PROGRESS=false
 
     wait_for_ssh "$eip_ip"
-    log "waiting for setup to finish (rust, terraform, aws cli — a few minutes)"
+    if [ "$BASE_AMI_BAKED" = true ]; then
+        log "waiting for first boot (toolchain is in the AMI — seconds, not minutes)"
+    else
+        log "waiting for the toolchain to install in user-data — 14-54 minutes,"
+        log "  measured. This is the step scripts/bake-operator-ami.sh removes."
+    fi
     ssh_ "cloud-init status --wait >/dev/null 2>&1 || true"
     ssh_ "test -f /home/ubuntu/.setup-complete" ||
         die "setup did not complete; check: $0 ssh 'sudo tail -50 /var/log/cloud-init-output.log'"
@@ -524,49 +548,90 @@ create_iam_role() {
     esac
 }
 
-# Everything the runbook shells out to, installed once at first boot.
-# `protobuf-compiler` and the Rust toolchain are for build-and-upload.sh;
-# terraform for bringup; python3 for the driver, translator, and
-# analysis; tmux because remote-campaign.sh runs campaigns under it.
+# Which image to launch, and — the part that matters — whether the
+# toolchain is already inside it. Sets BASE_AMI_ID and BASE_AMI_BAKED
+# rather than echoing, because a `$(...)` call would set the flag in a
+# subshell and the caller would build the wrong user-data.
+#
+# Why this exists: installing the toolchain in user-data was measured at
+# 3245 seconds (54 minutes) on one launch of this box and ~14 minutes on
+# another — same type, same region, same script, nearly all of it
+# `apt-get`. scripts/bake-operator-ami.sh pays that once into an AMI.
+#
+# The fallback is deliberate and loud, never silent: an account that has
+# never baked, or has baked an image that predates the current
+# operator-toolchain.sh, still gets a correct box — just a slow one, with
+# a line saying so and how to fix it. Preferring a stale image would be
+# the worse trade: it launches a box missing whatever tool was added to
+# the toolchain script, and that surfaces hours later inside a build.
+resolve_base_ami() {
+    # Both paths depend on this file — one installs it, the other is
+    # fingerprinted against it — so its absence is not a thing to work
+    # around silently.
+    [ -f "$OPERATOR_TOOLCHAIN_SCRIPT" ] ||
+        die "missing $OPERATOR_TOOLCHAIN_SCRIPT — it is the shared install list for both the baked and the unbaked path"
+
+    if [ -n "$BASE_AMI" ]; then
+        BASE_AMI_ID="$BASE_AMI"
+        BASE_AMI_BAKED=true
+        log "using $BASE_AMI (--ami/OPERATOR_AMI) — assumed to carry the toolchain"
+        return 0
+    fi
+
+    if [ "$USE_BAKED_AMI" = true ]; then
+        local want current stale
+        want=$(operator_toolchain_hash)
+        current=$(operator_find_baked_ami "$REGION" "$want")
+        if [ -n "$current" ]; then
+            BASE_AMI_ID="$current"
+            BASE_AMI_BAKED=true
+            log "using baked AMI $current (toolchain $want) — skipping the install"
+            return 0
+        fi
+        stale=$(operator_find_baked_ami "$REGION")
+        if [ -n "$stale" ]; then
+            log "baked AMI $stale is stale: it was made from a different"
+            log "  scripts/operator-toolchain.sh than this tree has ($want)."
+            log "  Ignoring it — re-bake with: $AWS_BENCH_ROOT/scripts/bake-operator-ami.sh --region $REGION"
+            log "  Or launch from it anyway with: $0 $CMD --ami $stale"
+        fi
+    fi
+
+    # Canonical's Ubuntu 24.04 amd64 pointer, same source terraform uses
+    # (terraform/instances.tf) so the operator box and the rig run the
+    # same distro. Resolved at run time, never a hardcoded AMI id.
+    BASE_AMI_ID=$(aws_ ssm get-parameters \
+        --names /aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id \
+        --query 'Parameters[0].Value' --output text)
+    BASE_AMI_BAKED=false
+    log "no baked AMI in $REGION — taking the SLOW path: the whole toolchain"
+    log "  installs in user-data, measured at 14-54 minutes. Bake it once:"
+    log "  $AWS_BENCH_ROOT/scripts/bake-operator-ami.sh --region $REGION"
+}
+
+# The box's first boot, in two halves.
+#
+#   The toolchain — everything the runbook shells out to. It lives in
+#   scripts/operator-toolchain.sh, in ONE copy, because a baked AMI
+#   contains it and this path installs it, and the day those two lists
+#   disagree is the day a box comes up missing protoc. Skipped entirely
+#   when launching from an image that already has it.
+#
+#   Per-instance setup — everything below, which must differ on every
+#   box and therefore must never be baked. The rig's SSH key pair above
+#   all: baking it would put the private half of the rig's trust domain
+#   inside a disk image and give every future box the same key.
 render_user_data() {
+    echo '#!/bin/bash'
+    echo 'set -euxo pipefail'
+    if [ "$BASE_AMI_BAKED" != true ]; then
+        cat "$OPERATOR_TOOLCHAIN_SCRIPT"
+    fi
     cat <<'CLOUDINIT'
-#!/bin/bash
-set -euxo pipefail
-export DEBIAN_FRONTEND=noninteractive
-
-apt-get update
-# clang/libclang-dev are not optional: rusqlite is built with the
-# `session` feature, which forces libsqlite3-sys to run bindgen, and
-# bindgen needs libclang plus clang's own builtin headers (without them
-# it fails on `'stdarg.h' file not found`). CI does not surface this —
-# GitHub's ubuntu-latest runners ship clang preinstalled, a bare Ubuntu
-# AMI does not.
-apt-get install -y --no-install-recommends \
-    build-essential pkg-config libssl-dev protobuf-compiler \
-    clang libclang-dev \
-    git jq curl unzip tmux rsync ca-certificates gnupg \
-    python3 python3-pip python3-venv
-
-# HashiCorp apt repo — terraform, pinned to the same >= 1.6 the rig's
-# terraform block requires.
-install -m 0755 -d /etc/apt/keyrings
-curl -fsSL https://apt.releases.hashicorp.com/gpg |
-    gpg --dearmor -o /etc/apt/keyrings/hashicorp.gpg
-echo "deb [signed-by=/etc/apt/keyrings/hashicorp.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" \
-    >/etc/apt/sources.list.d/hashicorp.list
-apt-get update && apt-get install -y terraform
-
-# AWS CLI v2. Ubuntu's packaged awscli is v1 and misses commands the
-# campaign scripts use.
-curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
-unzip -q /tmp/awscliv2.zip -d /tmp && /tmp/aws/install && rm -rf /tmp/aws /tmp/awscliv2.zip
 
 sudo -u ubuntu bash <<'ASUSER'
 set -euxo pipefail
 cd "$HOME"
-
-curl -fsSL https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
-echo 'source "$HOME/.cargo/env"' >>"$HOME/.bashrc"
 
 # The rig's shared key pair. Generated here, so the private half exists
 # only inside the trust domain it unlocks — scripts/env.sh's
@@ -581,15 +646,9 @@ printf 'Host *\n    ServerAliveInterval 30\n    ServerAliveCountMax 10\n' >>"$HO
 chmod 600 "$HOME/.ssh/config"
 ASUSER
 
-# /usr/local/bin is on the default PATH for a non-interactive `ssh host
-# "cmd"`; ~/.cargo/bin is not, because rustup adds it via ~/.bashrc and
-# Ubuntu's .bashrc returns early for non-interactive shells. Every remote
-# command the campaign scripts issue arrives that way, so expose the
-# toolchain somewhere those shells can actually see it.
-for b in cargo rustc rustup; do
-    ln -sf /home/ubuntu/.cargo/bin/$b /usr/local/bin/$b
-done
-
+# The marker `create` waits on. Deliberately written here and not in the
+# toolchain script: baked into the AMI it would already exist at first
+# boot, and the wait below would return before this box had a key.
 touch /home/ubuntu/.setup-complete
 CLOUDINIT
 }
@@ -922,6 +981,19 @@ while [ $# -gt 0 ]; do
     --archive-bucket)
         ARCHIVE_BUCKET="$2"
         shift 2
+        ;;
+    # Launch from this image and skip the toolchain install. The escape
+    # hatch for a baked AMI this script would otherwise reject as stale.
+    --ami)
+        BASE_AMI="$2"
+        shift 2
+        ;;
+    # Ignore any baked AMI and install in user-data — the pre-AMI
+    # behavior, kept because it is the only path that proves
+    # operator-toolchain.sh still works from a stock image.
+    --slow-bootstrap)
+        USE_BAKED_AMI=false
+        shift
         ;;
     # Credentials for THIS script's AWS calls only; see the header for
     # why they never reach the box.
