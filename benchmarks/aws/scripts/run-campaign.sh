@@ -146,8 +146,11 @@ while [ $# -gt 0 ]; do
         shift
         ;;
     --submit-concurrency)
+        # Jobs submitted in parallel. Raise it when a cell reports
+        # submission.driver_bound: that means the driver, not the
+        # scheduler, set the measured rate.
         SUBMIT_CONCURRENCY="$2"
-        shift
+        shift 2
         ;;
     --eval-threads)
         # legion-a only. The phase-2 finding was that raising this COST
