@@ -1713,10 +1713,23 @@ async fn eval_worker_loop(store: Store, notifier: Arc<Notify>, worker_id: usize)
             was_leader = true;
         }
         let claim_started = std::time::Instant::now();
-        let claimed = match claimed_ahead.take() {
+        let carried_ahead = claimed_ahead.take();
+        let claimed = match carried_ahead.clone() {
             Some(eval) => Ok(Some(eval)),
             None => store.claim_eval(),
         };
+        // A claim costs a scheduler-lane quorum round whether or not it finds
+        // work, so the empty share is the cost of waking a worker for nothing.
+        // Only a claim that actually hit the store counts: an eval carried
+        // over by `complete_and_claim_next` was already paid for.
+        if carried_ahead.is_none() {
+            crate::manager::telemetry::metrics()
+                .eval_claim_total
+                .inc(&[match &claimed {
+                    Ok(Some(_)) => "claimed",
+                    _ => "empty",
+                }]);
+        }
         match claimed {
             Ok(Some(eval)) => {
                 error_backoff = ERROR_BACKOFF_MIN;

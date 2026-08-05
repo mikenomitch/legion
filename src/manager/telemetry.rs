@@ -707,6 +707,8 @@ pub struct Metrics {
     pub eval_queue_depth: Arc<Gauge>,
     /// `legion_plan_apply_total{outcome}`
     pub plan_apply_total: Arc<CounterVec>,
+    /// `legion_eval_claim_total{outcome}`
+    pub eval_claim_total: Arc<CounterVec>,
     /// `legion_scheduler_plan_candidate_rank`
     pub scheduler_plan_candidate_rank: Arc<Histogram>,
     /// `legion_scheduler_plan_bind_pass{pass}`
@@ -851,6 +853,14 @@ impl Metrics {
             meta: FamilyMeta {
                 name: "legion_plan_apply_total",
                 help: "Scheduler plan submissions applied to the store, by outcome (applied|rejected).",
+                labels: &["outcome"],
+            },
+            series: Series::new(),
+        });
+        let eval_claim_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_eval_claim_total",
+                help: "Eval claim attempts by an eval worker, by outcome (claimed|empty). Every attempt is a scheduler-lane quorum round whether or not it finds work, so a high `empty` share means workers are being woken for evals that do not exist and the raft lane is paying for it.",
                 labels: &["outcome"],
             },
             series: Series::new(),
@@ -1269,6 +1279,7 @@ impl Metrics {
             Arc::clone(&nodes) as Arc<dyn RenderMetric>,
             Arc::clone(&eval_conflict_requeues_total) as Arc<dyn RenderMetric>,
             Arc::clone(&plan_apply_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&eval_claim_total) as Arc<dyn RenderMetric>,
             Arc::clone(&preemption_plans_total) as Arc<dyn RenderMetric>,
             Arc::clone(&preemptions_total) as Arc<dyn RenderMetric>,
             Arc::clone(&raft_applied_index) as Arc<dyn RenderMetric>,
@@ -1308,6 +1319,7 @@ impl Metrics {
             evals_processed_total,
             eval_queue_depth,
             plan_apply_total,
+            eval_claim_total,
             scheduler_plan_bind_pass,
             scheduler_plan_candidate_rank,
             eval_conflict_requeues_total,

@@ -8057,7 +8057,7 @@ impl Store {
         let mut epoch_job_scopes: BTreeSet<String> = BTreeSet::new();
         let mut task_reread_ids: HashSet<i64> = HashSet::new();
         let mut event_ids: Vec<i64> = Vec::new();
-        let mut eval_touched = false;
+        let mut evals_made_claimable = 0usize;
 
         // Column positions come from the live schema (changeset records use
         // the table's declared column order), so this cannot drift from
@@ -8215,7 +8215,30 @@ impl Store {
                     }
                 }
                 "eval" => {
-                    eval_touched = true;
+                    // Count the evals this changeset made CLAIMABLE, rather
+                    // than noting that the table moved at all. Every eval
+                    // crosses this arm at least three times (enqueued,
+                    // claimed, completed), and only the first of those is
+                    // work for a parked worker — waking the pool for the
+                    // other two hands every worker a `claim_eval`, and each
+                    // one of those is a scheduler-lane quorum round that
+                    // comes back empty.
+                    let status_idx =
+                        self.changeset_column_index(&mut column_cache, "eval", "status")?;
+                    // An UPDATE's new record carries only the columns that
+                    // changed, so a row whose status held still reads as
+                    // absent here — which is exactly the answer we want.
+                    let became_claimable = matches!(
+                        action,
+                        Action::SQLITE_INSERT | Action::SQLITE_UPDATE
+                    ) && item
+                        .new_value(status_idx)
+                        .ok()
+                        .and_then(|value| value.as_str().ok().map(|s| s == "pending"))
+                        .unwrap_or(false);
+                    if became_claimable {
+                        evals_made_claimable += 1;
+                    }
                 }
                 "allocation_epoch_partition" => {
                     let type_idx = self.changeset_column_index(
@@ -8335,8 +8358,15 @@ impl Store {
             }
         }
 
-        if eval_touched {
-            self.eval_notify.notify_waiters();
+        // One wake per newly-claimable eval. `notify_one` hands the permit to
+        // a single parked worker (or stores it for the next one to park), so
+        // the pool issues one claim per unit of work instead of one claim per
+        // worker per eval transition. Under-waking is bounded rather than
+        // lost: `wait_for_next_eval` sizes its park by
+        // `next_pending_eval_delay`, which is zero while any eval is ready,
+        // so a worker that missed a permit re-checks instead of sleeping.
+        for _ in 0..evals_made_claimable {
+            self.eval_notify.notify_one();
         }
 
         Ok(())
@@ -12701,11 +12731,14 @@ impl Store {
             .set(pending);
 
         if updated > 0 && !capture::in_capture() {
-            // Recovery moved work from in_flight->pending; wake all waiters.
-            // Under capture the rows are not committed yet, so the wake is
-            // deferred to apply time — `project_changeset_side_effects`
-            // notifies on any eval change, on every replica (JC-11/JC-41).
-            self.eval_notify.notify_waiters();
+            // Recovery moved work from in_flight->pending; wake one worker
+            // per recovered eval. Under capture the rows are not committed
+            // yet, so the wake is deferred to apply time —
+            // `project_changeset_side_effects` counts the same transition on
+            // every replica (JC-11/JC-41).
+            for _ in 0..updated {
+                self.eval_notify.notify_one();
+            }
         }
 
         Ok(updated as u64)
