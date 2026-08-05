@@ -103,9 +103,11 @@ const CLASSIFIED_MUTATIONS: &[&str] = &[
     // rollout/rollout_event mutation.
     "append_rollout_event",
     "claim_eval",
+    "complete_and_claim_next",
     "complete_eval",
     "complete_eval_with_event",
     "enqueue_eval_after_delay",
+    "enqueue_evals",
     "insert_eval",
     "prune_stale_evals",
     "release_eval_for_retry",
@@ -195,6 +197,13 @@ const CLASSIFIED_MUTATIONS: &[&str] = &[
 /// closure, and no op name of its own.)
 const DELEGATED_BODIES: &[&str] = &[
     "clear_job_restart_request",
+    // Fuses the eval loop's terminal write with the following claim into
+    // one scheduler-lane round: its closure calls `apply_eval_completion`
+    // (itself a switch over `complete_eval_impl` /
+    // `release_eval_for_retry{,_with_event}_apply`) and then
+    // `claim_eval_apply`. Nested `replicated` calls short-circuit inside a
+    // capture, so the pair lands in one changeset.
+    "complete_and_claim_next",
     "complete_eval",
     "complete_eval_with_event",
     // Serializes its candidate placements in the closure and shares
@@ -204,6 +213,10 @@ const DELEGATED_BODIES: &[&str] = &[
     // Plan §8 D1 reconciler: inlines its INSERT..SELECT closure and shares
     // seed_task_statuses_apply's semantics (ON CONFLICT DO NOTHING seed).
     "seed_missing_task_statuses",
+    // Batched fan-out: runs `enqueue_eval_after_delay_apply` per request in
+    // one op, so a leadership regeneration or node-loss storm pays quorum
+    // once instead of once per row.
+    "enqueue_evals",
     // D5 group commit: the batch op's closure runs submit_and_apply_plan_apply
     // per plan inside per-plan savepoints; the single-heartbeat op shares
     // update_node_heartbeats_apply with the batched form.
@@ -283,9 +296,11 @@ fn lane_for(method: &str) -> Lane {
         "append_rollout_event"
         | "apply_allocation_plan"
         | "claim_eval"
+        | "complete_and_claim_next"
         | "complete_eval"
         | "complete_eval_with_event"
         | "enqueue_eval_after_delay"
+        | "enqueue_evals"
         | "insert_eval"
         | "prune_stale_evals"
         | "release_eval_for_retry"

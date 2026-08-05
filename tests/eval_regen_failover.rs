@@ -515,3 +515,124 @@ fn released_evals_return_to_pending_and_are_reclaimable() -> R<()> {
     assert_eq!(reclaimed.id, eval.id);
     Ok(())
 }
+
+/// `complete_and_claim_next` (the fused eval-loop write): one call must
+/// finish the eval it was given AND hand back the next claimable one, so
+/// the scheduler lane pays one quorum round per eval instead of two.
+///
+/// The AWS phase-3 campaign put the scheduler lane, not the planner, at
+/// the throughput ceiling — each eval spent ~86% of its wall time outside
+/// the measured plan phases — so this fusion is a throughput change, and
+/// these assertions are what keep it from silently regressing to two ops.
+#[test]
+fn complete_and_claim_next_finishes_one_eval_and_claims_the_next() -> R<()> {
+    use legion::storage::events::drafts;
+    use legion::storage::store::EvalCompletion;
+
+    let store = setup_store()?;
+    store.enqueue_eval("job_reschedule", Some("a"), Some("ac"), None, None)?;
+    store.enqueue_eval("job_reschedule", Some("b"), Some("bc"), None, None)?;
+
+    let first = store.claim_eval()?.context("first claimable")?;
+    let completion = EvalCompletion::Finished {
+        succeeded: true,
+        event: drafts::eval_completed(&first, "done", std::time::Duration::from_millis(1)),
+    };
+    let second = store
+        .complete_and_claim_next(&first.id, completion)?
+        .context("the fused call must hand back the next eval")?;
+
+    assert_ne!(second.id, first.id, "must claim a different eval");
+    assert_eq!(second.status, "in_flight");
+    // The first is gone (success deletes the row), and only the second
+    // remains — in flight, not pending, so no other worker takes it.
+    let remaining: Vec<(String, String)> = store
+        .get_evals()?
+        .into_iter()
+        .map(|eval| (eval.id, eval.status))
+        .collect();
+    assert_eq!(
+        remaining,
+        vec![(second.id.clone(), "in_flight".to_string())]
+    );
+
+    // Draining the queue returns None rather than spinning.
+    let completion = EvalCompletion::Finished {
+        succeeded: true,
+        event: drafts::eval_completed(&second, "done", std::time::Duration::from_millis(1)),
+    };
+    assert!(
+        store
+            .complete_and_claim_next(&second.id, completion)?
+            .is_none(),
+        "an empty queue must report None so the worker parks"
+    );
+    assert!(store.get_evals()?.is_empty());
+    Ok(())
+}
+
+/// The `Released` arm of the fused write must behave exactly like the
+/// standalone release it replaces: back to pending, delay honored, and
+/// still able to claim a *different* eval in the same op.
+#[test]
+fn complete_and_claim_next_release_honors_the_retry_delay() -> R<()> {
+    use legion::storage::store::EvalCompletion;
+
+    let store = setup_store()?;
+    store.enqueue_eval("job_reschedule", Some("a"), Some("ac"), None, None)?;
+    store.enqueue_eval("job_reschedule", Some("b"), Some("bc"), None, None)?;
+
+    let first = store.claim_eval()?.context("first claimable")?;
+    let next = store.complete_and_claim_next(
+        &first.id,
+        EvalCompletion::Released {
+            delay: std::time::Duration::from_secs(3600),
+            event: None,
+        },
+    )?;
+
+    // The released eval is pending-but-not-due, so the eval handed back
+    // must be the OTHER one, never the one just released.
+    let next = next.context("the other eval is still claimable")?;
+    assert_ne!(
+        next.id, first.id,
+        "a delayed release must not re-claim itself"
+    );
+
+    let released = store
+        .get_evals()?
+        .into_iter()
+        .find(|eval| eval.id == first.id)
+        .context("released eval still present")?;
+    assert_eq!(released.status, "pending");
+    Ok(())
+}
+
+/// `enqueue_evals` writes every row in one op. The fan-out loops it
+/// replaces (leadership regeneration, node-loss storms) were one quorum
+/// round per row.
+#[test]
+fn enqueue_evals_creates_every_row_in_one_op() -> R<()> {
+    use legion::storage::store::EvalRequest;
+
+    let store = setup_store()?;
+    let requests: Vec<EvalRequest> = (0..5)
+        .map(|i| EvalRequest::for_job("job_reschedule", &format!("job-{i}"), &format!("cfg-{i}")))
+        .collect();
+
+    let created = store.enqueue_evals(requests)?;
+    assert_eq!(created.len(), 5);
+    assert_eq!(store.get_evals()?.len(), 5);
+
+    // Every one is independently claimable, so batching changed only how
+    // many times quorum was paid, not what was queued.
+    let mut claimed = 0;
+    while store.claim_eval()?.is_some() {
+        claimed += 1;
+    }
+    assert_eq!(claimed, 5);
+
+    // An empty batch proposes nothing rather than an empty op.
+    assert!(store.enqueue_evals(Vec::new())?.is_empty());
+    Ok(())
+}
