@@ -20,10 +20,28 @@ Startup (`Store::start_storage`):
 `Store` maintains:
 
 - one write connection (`write_conn`)
-- a small read-only pool (`read_conns`, query-only)
-- round-robin read selection
+- a read-only pool (`read_conns`, query-only)
+- round-robin read selection, with steal-on-contention
 
 This reduces lock contention for read-heavy paths.
+
+The pool holds `evalThreads + 4` connections, capped at 16. Eval workers are
+the manager's concurrent readers, and the `+ 4` covers the readers that are
+not eval workers: worker heartbeats, the read-only gRPC and UI surface, the
+metrics scrape, and the background reconcilers. A reader takes any free
+connection before it queues on a busy one, so one slow query does not stall
+the readers behind it.
+
+The cap exists for memory, not contention. Every connection carries its own
+SQLite page cache capped at 64 MiB (`cache_size = -65536`), and the caches do
+not share — 16 connections is a 1 GiB ceiling for a cluster whose working set
+is large enough to reach it. `cache_size` is a cap that SQLite fills lazily,
+so a small deployment holds only what it reads.
+
+There is no separate configuration field for the pool size; raising
+`evalThreads` widens it. `legion_store_read_lock_wait_seconds`
+([metrics.md](metrics.md)) is how you tell whether it is short — its `le="0"`
+bucket against `_count` is how often a reader found a free connection at once.
 
 ## Read Model Cache
 

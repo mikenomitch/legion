@@ -154,6 +154,12 @@ the contention is being absorbed and the remaining rejections are real capacity.
    and by round-trip latency, not by cores. On an uncontended workload that
    means the default is more likely to be too LOW than too high.
 
+   `evalThreads` also sizes the store's read-connection pool (`evalThreads + 4`,
+   capped at 16 — see [state-store.md](state-store.md)), because the eval
+   workers are the manager's concurrent readers. Turning it down therefore
+   narrows the pool as well; watch `legion_store_read_lock_wait_seconds`
+   alongside whatever you were trying to fix.
+
 2. **Confirm candidate lists are on.** `schedulerSettings.plan_candidates`
    defaults to `8`; `0` disables them and restores single-node submissions,
    which turns every race into a rejection. If someone set it to `0` for a
@@ -578,7 +584,7 @@ allocations, not on the counter. Tracked in
 
 | Knob | Where | Turn it when | Do **not** turn it when |
 | --- | --- | --- | --- |
-| `evalThreads` | manager config | Rejection share is high, or the scheduler lane's `pipeline_wait` is high, and the lane's ops are `applied` rather than `empty`. **Turn it down.** On an uncontended cluster the opposite applies: 16 beat 4 by 23.7% at 5,000 nodes. | You have not looked at `plan_apply_total{outcome}` and `raft_ops_total{op,outcome}`. Moving it in either direction without those is guessing. |
+| `evalThreads` | manager config | Rejection share is high, or the scheduler lane's `pipeline_wait` is high, and the lane's ops are `applied` rather than `empty`. **Turn it down.** On an uncontended cluster the opposite applies: 16 beat 4 by 23.7% at 5,000 nodes. Note it also sizes the read pool (`evalThreads + 4`, capped at 16). | You have not looked at `plan_apply_total{outcome}` and `raft_ops_total{op,outcome}`. Moving it in either direction without those is guessing. |
 | `schedulerSettings.plan_candidates` | manager config | It is `0` and you are not mid-upgrade. Set it back to `8`. | Rejections are low. The default is right. |
 | `schedulerSettings.plan_conflict_max_retries` | manager config | Contention is bursty and short-lived (default `3`, max `20`). | Rejections are sustained. More retries wastes more plans. |
 | `schedulerSettings.plan_apply_batch_max` | manager config | Group commit is engaging and you want fewer commits (default `16`, max `128`). | `coalesce_batch_size`'s `le="1"` bucket is near `_count`. Batching is not engaging; the cap is not the constraint. |

@@ -69,7 +69,69 @@ Ranked by project impact; the number is the rank.
   worker immediately asks for more work. Do the cheap, safe half first and
   let the measurement decide whether the expensive half is needed.
 
-## 3. The fused claim is handled before the leadership gate
+## 3. Size the read pool from the readers, not from the cores
+
+- **The call:** `read_only_conn_pool_size` takes `evalThreads` and returns
+  `evalThreads + 4`, capped at 16, instead of
+  `available_parallelism().max(4)`. On the campaign's 4-vCPU managers that
+  is 4 connections today, 8 at the default and 16 at `evalThreads = 16`.
+- **Alternatives.** (a) Leave it at the core count — the pool is not the
+  throughput gate, so why touch it. (b) A flat constant (8 or 16),
+  independent of everything. (c) A new `readConnections` config knob.
+  (d) Raise it aggressively (32, 64) on the theory that the pool *was*
+  gating the plan path.
+- **Trade-off.** `evalThreads` now moves two things at once: planner
+  concurrency and read-pool width. An operator who raises it to 64 gets 16
+  connections rather than 64, so the coupling is bounded but it is real, and
+  it has to be stated wherever `evalThreads` is documented. The cap also
+  means a very wide `evalThreads` no longer gets one connection per worker —
+  deliberately, see below.
+- **Why (performance, honestly bounded).** (d) was the tempting one and the
+  evidence does not support it. The plan path was traced end to end first:
+  no read connection is held across a quorum round, across an `.await`, or
+  across `build_plan` — planning reads the in-memory `SchedulingReadModel`,
+  `plan_and_apply_internal` holds no guard when it calls
+  `submit_and_apply_plan_with_candidates`, and the apply runs on the WRITE
+  connection inside `replicated()`. Every acquisition is one leaf store
+  method wide. **The pool cannot serialize two planners against each other**,
+  so the 4-cores/4-connections/~4-effective-planners coincidence is a
+  coincidence, and the archives already have a better explanation for the
+  last term: 347 ms of coalescer follower wait against a 138 ms serialized
+  commit. That rules out (d) and most of the reason to care at all.
+  What survives is that the *basis* was wrong, which is (a)'s problem.
+  Core count justified itself on "these reads are CPU-bound page-cache
+  hits", and a saturated 5,000-node control plane measured **8% CPU across
+  four cores** — the readers are latency-bound, a cache miss is a `pread`
+  holding the mutex through an I/O wait, and
+  `cache_refresh_allocation_scopes` holds one connection across ~44 per-node
+  queries after every apply on every replica. Worse, the heartbeat body
+  (`build_desired_allocations` and everything after it) runs **inline on a
+  tokio worker thread**, so a heartbeat queueing for a connection parks a
+  runtime thread — and a pool sized at the core count is exactly a pool that
+  fills at the same moment the runtime does. (b) fixes the basis but throws
+  away the one signal we have about how many concurrent readers exist;
+  `evalThreads` is that signal, already in the config, which is also why
+  (c) is unnecessary — a knob nobody can size from first principles is worse
+  than a derivation from one they already set.
+- **Why capped at 16 (simplicity, and memory).** `SQLITE_CACHE_SIZE_KIB` is
+  -65536, a **64 MiB page cache per connection**. It is a cap that SQLite
+  fills lazily, so a small cluster never reaches it — but at 200,000
+  allocations every connection independently pulls in the same hot
+  `allocation` pages, the caches do not share, and the worst case becomes
+  the real case. 16 connections is a 1 GiB ceiling, asserted by the unit
+  test so that raising the page cache forces the cap to be reconsidered
+  rather than silently multiplying it. A manager that wants more read
+  concurrency than this wants a smaller per-connection cache first.
+- **Surface.** None directly. Indirectly, `evalThreads` is now also a
+  read-pool control, which the `evalThreads` plan
+  ([`../plans/eval-thread-default-plan.md`](../plans/eval-thread-default-plan.md))
+  carries as an open question, since its Phase 0 sweep now has a memory
+  dimension. `legion_store_read_lock_wait_seconds` remains the way to tell
+  whether the pool is actually short: with it sized from readers rather than
+  cores, a nonzero wait means a reader is holding a connection too long, and
+  the fix for that is fewer or shorter reads.
+
+## 4. The fused claim is handled before the leadership gate
 
 - **The call:** a worker holding an eval handed back by the previous
   fused write processes it even if `is_raft_leader` now reports false;
@@ -89,7 +151,7 @@ Ranked by project impact; the number is the rank.
   tested, so the honest framing is that fusing does not widen the window
   it inherits.
 
-## 4. A panicked handler writes nothing
+## 5. A panicked handler writes nothing
 
 - **The call:** when `spawn_blocking` returns `Err` (handler panicked or
   was cancelled), the loop logs and writes no outcome, leaving the eval
@@ -105,7 +167,7 @@ Ranked by project impact; the number is the rank.
   both fixed). Writing nothing is the only option that cannot lose work,
   and it matches what a crashed worker already produces.
 
-## 5. Batched enqueue takes a request struct, not N arguments
+## 6. Batched enqueue takes a request struct, not N arguments
 
 - **The call:** `enqueue_evals(Vec<EvalRequest>)` with a struct carrying
   kind/job/config/node/priority/delay, plus an `EvalRequest::for_job`
@@ -121,7 +183,7 @@ Ranked by project impact; the number is the rank.
   half of the storm — an obvious thing to build. (b) would have fixed
   today's four loops and left the next one to rediscover the problem.
 
-## 6. Local benchmarks are reported as a no-regression check only
+## 7. Local benchmarks are reported as a no-regression check only
 
 - **The call:** the PR quotes the local SLO gate as "no regression" and
   explicitly declines to claim a throughput win from it.

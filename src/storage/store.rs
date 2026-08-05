@@ -843,33 +843,105 @@ pub const CONN_LOCK_ERROR: &str = "Error locking database connection";
 /// §8, D1), which all scope themselves to each job's latest config.
 const LATEST_CONFIG_FOR_JOB: &str = "(SELECT jc.id FROM job_config jc \
      WHERE jc.job_id = j.id ORDER BY jc.created_at DESC LIMIT 1)";
+/// Read connections beyond the eval workers' own, for the readers that do
+/// not come from the eval pool: worker heartbeats (`allocs_for_node` once
+/// per node per `WORKER_HEARTBEAT_DURATION_SEC`), the read-only gRPC/UI
+/// surface, the metrics scrape, and the background reconcilers. None of
+/// those is deeply concurrent on its own — each is a short indexed read
+/// issued from a request handler — but together they are what a planner
+/// would otherwise queue behind.
+const READ_POOL_SERVING_HEADROOM: usize = 4;
+
+/// Hard cap on the read pool, set by MEMORY rather than by contention.
+/// Each connection carries its own page cache capped at
+/// [`SQLITE_CACHE_SIZE_KIB`] (64 MiB), so the pool's worst case is
+/// `size * 64 MiB` — 1 GiB here. `cache_size` is a cap that SQLite fills
+/// lazily, so a small cluster never reaches it, but a 200,000-allocation
+/// working set will: every connection independently pulls in the same hot
+/// `allocation` pages, so the caches do not share and the worst case is
+/// the real case at scale. A manager that wants more read concurrency
+/// than this wants a smaller per-connection cache first.
+const READ_POOL_MAX: usize = 16;
+
 /// Read-only SQLite connections shared by every reader in the manager.
 ///
-/// This was 2, and 2 is a serialization point rather than a pool. The
-/// eval path takes ~4 read connections per evaluation, but the heartbeat
-/// path is the volume: `build_desired_allocations` runs per node per
-/// `WORKER_HEARTBEAT_DURATION_SEC`, so demand scales with *fleet size* —
-/// roughly 3-7k acquisitions/sec at 1,000 nodes and 15-37k/sec at 5,000.
-/// Funnelling that through two mutexes is what made the `task_fetch`
-/// plan phase grow 100x between those two fleet sizes (0.14ms -> 14.96ms)
-/// while control-plane CPU sat at 29% and no thread exceeded 40% of a
-/// core: the manager was not short of CPU, it was queueing.
+/// This was 2, and 2 is a serialization point rather than a pool: at
+/// 5,000 nodes the `task_fetch` plan phase grew 100x against the 1,000-node
+/// cell (0.14 ms -> 14.96 ms) while control-plane CPU sat at 29% and no
+/// thread exceeded 40% of a core. The manager was not short of CPU, it was
+/// queueing. (The later phase-3 cell measured `task_fetch` at 0.65 ms on
+/// the unmodified two-connection binary, which says that particular
+/// queueing was coupled to the plan-conflict rate rather than to fleet
+/// size — the pool still had to grow, but it was never the throughput
+/// ceiling it looked like.)
 ///
-/// Sized from the host rather than fixed, because the contention is
-/// concurrency-shaped. Cores is the bound, and deliberately not some
-/// larger constant: these reads are CPU-bound page-cache hits, so past
-/// one connection per core extra connections cannot add read throughput
-/// — they would only decouple one slow query from the queue, at ~2 MB of
-/// SQLite page cache each. If demand still exceeds the pool (it is
-/// heartbeat-driven, so it scales with *fleet size* rather than with
-/// cores), the fix is to issue fewer reads, not to hold more connections.
+/// **Why not core count.** The pool used to be `available_parallelism()`,
+/// on the argument that these reads are CPU-bound page-cache hits and so
+/// one connection per core saturates them. Every part of that is wrong for
+/// this workload:
 ///
-/// The floor keeps a 1-2 core host off the old cliff.
-fn read_only_conn_pool_size() -> usize {
-    std::thread::available_parallelism()
-        .map(|value| value.get())
-        .unwrap_or(4)
-        .max(4)
+/// - The readers are latency-bound, not CPU-bound. A saturated 5,000-node
+///   control plane measured **8% CPU across four cores**; an eval worker
+///   spends its life parked on a quorum round trip, and a read that misses
+///   the 64 MiB page cache is a `pread` — the connection's mutex is held
+///   for the whole of an I/O wait that uses no CPU. Past one-per-core,
+///   extra connections therefore *do* add read throughput.
+/// - Holds are not uniform, so head-of-line blocking is real. Most
+///   acquisitions are one indexed statement, but
+///   `cache_refresh_allocation_scopes` holds ONE connection across a loop
+///   of up to ~44 per-node queries (~1,700 rows at 200,000 allocations),
+///   after every plan-apply, **on every replica**. With a pool of 4, a
+///   couple of those in flight leaves a heartbeat's point read waiting on
+///   a connection that is busy for milliseconds.
+/// - Sizing the pool AT the core count makes two unrelated resources
+///   saturate at the same instant, and lets one convert into the other.
+///   `build_desired_allocations` and the rest of the heartbeat body run
+///   *inline on a tokio worker thread* (only `update_node_heartbeat` is
+///   offloaded), so a heartbeat that queues for a connection parks a
+///   runtime thread — and there are `available_parallelism()` of those.
+///   Four connections on a four-core manager means the pool cannot fill
+///   without the runtime filling with it. The headroom below is what
+///   breaks that coupling on the small managers where it bites — a large
+///   host hits [`READ_POOL_MAX`] before it hits its own core count, and
+///   that is fine: a 32-core runtime does not starve on a few parked
+///   heartbeat threads the way a 4-core one does.
+///
+/// None of those has anything to do with how many cores the box has.
+///
+/// **What it is sized from instead:** the number of concurrent readers the
+/// manager actually runs. That is `evalThreads` (each eval worker is one
+/// reader at a time, by construction — its handler is synchronous end to
+/// end) plus [`READ_POOL_SERVING_HEADROOM`] for the heartbeat, RPC, and
+/// telemetry readers, capped at [`READ_POOL_MAX`] because per-connection
+/// page cache is not free.
+///
+/// **This is not a scheduler-concurrency knob.** The plan path does not
+/// hold a read connection across its apply — it was checked, because the
+/// old pool size and the campaign's core count and its ~4 effective
+/// planner concurrency were all 4 and that coincidence deserved ruling
+/// out. Planning reads the in-memory `SchedulingReadModel`;
+/// `plan_and_apply_internal` holds no read guard when it calls
+/// `submit_and_apply_plan_with_candidates`; and the apply itself runs on
+/// the WRITE connection inside `replicated()`. Every acquisition on the
+/// path is one leaf store method wide. What the eval path has is read
+/// *volume* — tens of acquisitions per eval, plus the apply-side
+/// `project_changeset_side_effects` reads that every replica pays while
+/// the leader's eval thread is blocked on the quorum round — so the pool
+/// shows up as queueing latency, never as mutual exclusion. Sizing it
+/// cannot move the plan-apply ceiling, and it is not meant to. If reads
+/// really are queueing,
+/// `legion_store_read_lock_wait_seconds` says so directly — reach for that
+/// before assuming, because with the pool sized from the readers rather
+/// than the cores, a nonzero wait means a reader is holding a connection
+/// too long, and the fix for that is to issue fewer or shorter reads.
+fn read_only_conn_pool_size(eval_threads: usize) -> usize {
+    // `eval_threads` comes straight from operator config and is a `usize`,
+    // so 0 is expressible; the daemon clamps it to at least one worker and
+    // so does this.
+    eval_threads
+        .max(1)
+        .saturating_add(READ_POOL_SERVING_HEADROOM)
+        .min(READ_POOL_MAX)
 }
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -936,7 +1008,7 @@ impl Store {
 
         let write_conn = Store::create_write_conn(&db_path, raft_enabled)?;
         let _migrations = Store::create_initial_tables(&Arc::clone(&write_conn))?;
-        let read_conns = Store::create_read_pool(&db_path)?;
+        let read_conns = Store::create_read_pool(&db_path, config.eval_threads)?;
         let resource_policy = ResourcePolicy::from_manager_config(config)?;
         let index_settings = Arc::new(IndexSettings::from_scheduler_settings(
             config.scheduler_settings.as_ref(),
@@ -1404,8 +1476,8 @@ impl Store {
     }
 
     #[instrument(err, skip_all)]
-    fn create_read_pool(db_path: &Path) -> R<Vec<MemSafeConn>> {
-        let size = read_only_conn_pool_size();
+    fn create_read_pool(db_path: &Path, eval_threads: usize) -> R<Vec<MemSafeConn>> {
+        let size = read_only_conn_pool_size(eval_threads);
         let mut read_conns = Vec::with_capacity(size);
         for _ in 0..size {
             read_conns.push(Self::create_readonly_conn(db_path)?);
@@ -8264,14 +8336,13 @@ impl Store {
                     // An UPDATE's new record carries only the columns that
                     // changed, so a row whose status held still reads as
                     // absent here — which is exactly the answer we want.
-                    let became_claimable = matches!(
-                        action,
-                        Action::SQLITE_INSERT | Action::SQLITE_UPDATE
-                    ) && item
-                        .new_value(status_idx)
-                        .ok()
-                        .and_then(|value| value.as_str().ok().map(|s| s == "pending"))
-                        .unwrap_or(false);
+                    let became_claimable =
+                        matches!(action, Action::SQLITE_INSERT | Action::SQLITE_UPDATE)
+                            && item
+                                .new_value(status_idx)
+                                .ok()
+                                .and_then(|value| value.as_str().ok().map(|s| s == "pending"))
+                                .unwrap_or(false);
                     if became_claimable {
                         evals_made_claimable += 1;
                     }
@@ -15520,12 +15591,6 @@ mod tests {
     use rusqlite::params;
     use tempfile::Builder;
 
-    /// Adversarial regression (durability past the purge horizon): in raft
-    /// mode the state DB must run `synchronous = FULL` — raft purges its log
-    /// behind snapshots, so a power loss regressing the applied marker below
-    /// `last_purged_log_id` (possible under NORMAL until a WAL checkpoint)
-    /// would brick the node at startup reapply. local_disk keeps NORMAL.
-    #[test]
     /// Both connection kinds get a page cache big enough to hold a real
     /// cluster's hot tables. SQLite's 2 MiB default made the plan-apply phase
     /// cliff from 21 ms to 354 ms per eval between 25,000 and 100,000
@@ -15555,6 +15620,82 @@ mod tests {
         Ok(())
     }
 
+    /// The read pool is sized from the readers the manager runs, not from
+    /// the host's core count. The three properties that matter:
+    ///
+    /// 1. it tracks `evalThreads` (the eval workers are the concurrent
+    ///    readers whose queueing would matter), with headroom for the
+    ///    heartbeat/RPC/telemetry readers that do not come from that pool;
+    /// 2. it is capped, because each connection carries its own 64 MiB
+    ///    page-cache cap and those caches do not share; and
+    /// 3. it never collapses to a serialization point, whatever an
+    ///    operator writes in the config.
+    #[test]
+    fn read_pool_is_sized_from_readers_and_capped_by_page_cache() {
+        // Tracks evalThreads with headroom. The AWS campaign's managers
+        // are 4-vCPU, so the old core-count rule gave exactly 4 whether
+        // the operator ran 4 eval workers or 16.
+        assert_eq!(read_only_conn_pool_size(4), 4 + READ_POOL_SERVING_HEADROOM);
+        assert_eq!(
+            read_only_conn_pool_size(8),
+            8 + READ_POOL_SERVING_HEADROOM,
+            "raising evalThreads must raise the pool with it — under the old \
+             rule both of these were the core count"
+        );
+
+        // Capped: 64 eval workers do not get 64 x 64 MiB of page cache.
+        assert_eq!(read_only_conn_pool_size(64), READ_POOL_MAX);
+        assert_eq!(read_only_conn_pool_size(usize::MAX), READ_POOL_MAX);
+
+        // Never a serialization point, even at evalThreads = 0.
+        assert_eq!(read_only_conn_pool_size(0), 1 + READ_POOL_SERVING_HEADROOM);
+        assert!(
+            read_only_conn_pool_size(1) >= 4,
+            "the floor that keeps a small host off the two-connection cliff"
+        );
+
+        // On the manager sizes this actually runs on, the pool is strictly
+        // wider than the tokio runtime. Heartbeat reads run inline on
+        // runtime threads, so a pool the same size as the core count lets
+        // read queueing turn straight into a parked runtime.
+        for cores in 1..=(READ_POOL_MAX - READ_POOL_SERVING_HEADROOM) {
+            assert!(
+                read_only_conn_pool_size(cores) > cores,
+                "with the default evalThreads = available_parallelism(), a \
+                 {cores}-core manager must get more connections than runtime \
+                 threads"
+            );
+        }
+
+        // Monotonic, so the rule cannot surprise an operator who turns
+        // evalThreads up.
+        for threads in 0..(READ_POOL_MAX * 2) {
+            assert!(
+                read_only_conn_pool_size(threads + 1) >= read_only_conn_pool_size(threads),
+                "pool size must not shrink as evalThreads grows (at {threads})"
+            );
+        }
+
+        // The cap is a memory budget, so state it as one: the pool's
+        // worst-case page cache stays at or under 1 GiB. If
+        // SQLITE_CACHE_SIZE_KIB grows, this is what forces READ_POOL_MAX
+        // to be reconsidered rather than silently multiplying.
+        const ONE_GIB_IN_KIB: i64 = 1024 * 1024;
+        let worst_case_kib = READ_POOL_MAX as i64 * -SQLITE_CACHE_SIZE_KIB;
+        assert!(
+            worst_case_kib <= ONE_GIB_IN_KIB,
+            "{READ_POOL_MAX} connections x {} KiB of page cache = {worst_case_kib} KiB, \
+             over the 1 GiB budget the cap exists to hold",
+            -SQLITE_CACHE_SIZE_KIB
+        );
+    }
+
+    /// Adversarial regression (durability past the purge horizon): in raft
+    /// mode the state DB must run `synchronous = FULL` — raft purges its log
+    /// behind snapshots, so a power loss regressing the applied marker below
+    /// `last_purged_log_id` (possible under NORMAL until a WAL checkpoint)
+    /// would brick the node at startup reapply. local_disk keeps NORMAL.
+    #[test]
     fn durable_sync_runs_write_connection_at_synchronous_full() -> R<()> {
         let dir = tempfile::tempdir()?;
 
