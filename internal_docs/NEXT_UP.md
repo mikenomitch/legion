@@ -82,11 +82,18 @@ Legion; all of them were first-boot cost or rot in the rig:
 **Fix the rig before the next campaign, or the next session goes the same
 way.** In order:
 
-1. **Bake the AMIs.** `scripts/bake-operator-ami.sh` exists and is
-   stub-tested; run it for real (`--region us-east-1`). Then do the same
-   for the **worker** AMI — the sim workers install almost nothing, yet
-   pay a full cloud-init on every ASG scale-up, which is what stalled
-   this session's last attempt.
+1. **Operator AMI: DONE.** `ami-01753f38f8c003da3` (us-east-1, toolchain
+   `c105e74e77e2`), baked 2026-08-05. The install it replaces measured
+   **2260 s (38 min)**. `bootstrap-operator-box.sh` finds it by tag and
+   skips the install; it refuses a stale image rather than launching one
+   missing a tool. Re-bake when `scripts/operator-toolchain.sh` changes.
+   **Still to do: the RIG AMI.** The control plane, loadgen, and spot
+   workers each pay their own cloud-init — ~10 min at bring-up and 6-8 min
+   on every ASG scale-up, and the scale-up is what stalled a whole
+   session. `scripts/rig-toolchain.sh` is written (the bakeable half,
+   with the instance-store mount deliberately left at boot because the
+   NVMe is ephemeral); it still needs a `bake-rig-ami.sh` and a terraform
+   lookup.
 2. **Cache the binary, not the compiler flags.** `distfast` (thin LTO, 16
    codegen units) took 28 minutes against 24.5 for full fat LTO — the
    cost is compiling ~900 crates, not linking. `build-and-upload.sh`
