@@ -373,4 +373,104 @@ Ranked by project impact; the number is the rank.
   outcomes we already hold for no gain. (c) gives back most of the win: the
   terminal write is the round phase 4 measured at 44/s.
 
-## 12. Local benchmarks are reported as a no-regression check only
+## 12. Size the read pool from its readers, and publish the negative result
+
+- **The call:** `read_only_conn_pool_size` takes `evalThreads` and returns
+  `evalThreads + 4`, capped at 16, instead of
+  `available_parallelism().max(4)`. On the campaign's 4-vCPU managers that
+  is 4 connections today, 8 at the default and 16 from `evalThreads = 12`
+  up. **No throughput improvement is claimed.**
+- **Alternatives.** (a) Change nothing — the pool is measurably not the
+  gate, so leave it. (b) A flat constant (8 or 16), independent of
+  everything. (c) A new `readConnections` config knob. (d) Raise it
+  aggressively (32, 64) on the theory that the pool *was* gating the plan
+  path.
+- **Trade-off.** `evalThreads` now moves two things at once: planner
+  concurrency and read-pool width, so it has to be documented wherever
+  `evalThreads` is. And the honest cost of not choosing (a) is that this
+  ships an unmeasured change to a hot-path resource on a structural
+  argument — a category the last three campaigns exist to warn about.
+- **Why (a) lost, narrowly.** (d) was the tempting one and the evidence
+  refutes it outright. The 2026-08-05 eval-thread sweep ran every cell with
+  the pool at 4 and throughput rose monotonically with eval workers:
+  177.27 alloc/s at 4 threads, 208.83 at 8, 219.25 at 16, **251.68 at 32**,
+  and >= 263.08 at 64 (where the load generator, not Legion, became the
+  constraint). Four connections carried 32 concurrent planners plus 5,000
+  nodes of heartbeats; a pool capping concurrency near 4 could not have let
+  32 threads beat 16 by 14.8%. The code says the same thing: no read
+  connection is held across a quorum round, an `.await`, or `build_plan` —
+  planning reads the in-memory `SchedulingReadModel`,
+  `plan_and_apply_internal` holds no guard when it calls
+  `submit_and_apply_plan_with_candidates`, and the apply runs on the WRITE
+  connection inside `replicated()`. Every acquisition is one leaf store
+  method wide, so **the pool cannot serialize two planners against each
+  other**. What survives is that the *basis* was wrong, which is (a)'s
+  problem: core count justified itself on "these reads are CPU-bound
+  page-cache hits", and a saturated 5,000-node control plane measured **8%
+  CPU across four cores**. A page-cache miss is a `pread` holding the mutex
+  through an I/O wait that uses no CPU; holds are uneven
+  (`cache_refresh_allocation_scopes` keeps one connection across ~44
+  per-node queries after every apply, on every replica); and the heartbeat
+  body runs inline on tokio worker threads, so a pool sized at the core
+  count saturates in lockstep with the runtime by construction. Leaving a
+  wrong argument in the tree is how the next person re-derives the wrong
+  conclusion from it. (b) fixes the basis but discards the one signal we
+  have for how many concurrent readers exist, which is also why (c) is
+  unnecessary: `evalThreads` is that signal and it is already in the
+  config, whereas a `readConnections` field is a number no operator can
+  size from first principles.
+- **Why capped at 16 (memory, and an admission).** `SQLITE_CACHE_SIZE_KIB`
+  is -65536, a **64 MiB page cache per connection**, filled lazily but not
+  shared: at 200,000 allocations every connection independently pulls in
+  the same hot `allocation` pages, so the worst case is the real case. 16
+  connections is a 1 GiB ceiling, asserted by the unit test so that raising
+  the page cache forces the cap to be reconsidered rather than silently
+  multiplying. The cap is emphatically **not** a knee — the sweep's
+  64-thread cell was driver-bound, so where read concurrency stops paying
+  has never been observed, and the comment says so rather than implying a
+  measurement that does not exist.
+- **The negative result is the valuable half.** The suspicion was
+  arithmetic: throughput divided by plan-path latency gave ~3.96 "effective
+  workers" against 16 configured, sitting next to 4 cores and 4
+  connections. The derivation used the wrong denominator.
+  `legion_scheduler_plan_phase_seconds{phase="total"}` times **planning
+  only**, so Little's law over it counts evals in the *planning stage*, not
+  busy workers — a worker in `claim_eval`, dispatch, post-apply
+  bookkeeping, or a conflict-retry backoff is busy and invisible to it.
+  3.96 of 16 means planning was about a quarter of an eval's wall time,
+  which is exactly what `legion_eval_handle_seconds` was added to expose
+  ("the difference is everything an eval does outside planning"). Two
+  smaller errors compounded it: allocations-per-eval was taken from the
+  scenario's nominal shape rather than measured per cell, and a since-boot
+  histogram mean was divided into a steady-window rate. All three are
+  written into the `read_only_conn_pool_size` doc comment, because the
+  purpose of this entry is that nobody spends a fourth campaign on it.
+- **Surface.** None directly. Indirectly, `evalThreads` is now also a
+  read-pool control — documented in `docs/state-store.md`,
+  `docs/metrics.md`, and the `evalThreads` row of
+  `docs/diagnosing-scheduler-performance.md`, and carried as an open
+  question by the `evalThreads` plan
+  ([`../plans/eval-thread-default-plan.md`](../plans/eval-thread-default-plan.md)),
+  whose Phase 0 now has a memory dimension.
+  `legion_store_read_lock_wait_seconds` remains the way to tell whether the
+  pool is short.
+
+## 13. Local benchmarks are reported as a no-regression check only
+
+- **The call:** the PR quotes the local SLO gate as "no regression" and
+  explicitly declines to claim a throughput win from it.
+- **Alternatives.** (a) Quote the batch-burst delta (72.6 → 94.6
+  evals/sec) as the improvement. (b) Skip local benchmarks entirely since
+  they cannot measure the change.
+- **Trade-off.** The PR ships a performance change with no performance
+  number, which is unsatisfying and against the letter of the
+  "scheduler changes ship with before/after numbers" rule.
+- **Why (measurement honesty).** `Store::replicated` short-circuits when
+  raft is off, so on a single-node local run the fused op and the unfused
+  pair execute *identical* code — the win is structurally unmeasurable
+  there, and any delta is laptop noise. (a) would be quoting noise as a
+  result, which is precisely the failure mode that invalidated the first
+  two AWS campaigns. (b) throws away the correctness signal, which is the
+  part local runs *can* give: correctness_ratio stayed 1.000 across all
+  eight scenarios. The real number needs the rig, and the plan's exit
+  criterion says so.

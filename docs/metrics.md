@@ -264,8 +264,7 @@ mysteriously slow".
   waiting to acquire the store's SQLite write-connection lock. Sustained high
   buckets indicate write contention on the state store.
 - **`legion_store_read_lock_wait_seconds`** (histogram) — time spent waiting
-  for one of the store's read-only SQLite connections. The pool is sized from
-  the host (`available_parallelism()`, floor 4), and a reader takes any free
+  for one of the store's read-only SQLite connections. A reader takes any free
   connection before queueing on a busy one, so a read that found one
   immediately is recorded as 0. That makes the ratio of the `le="0"` bucket to
   `_count` the useful reading: it is how often the pool was saturated, not how
@@ -275,6 +274,20 @@ mysteriously slow".
   `task_fetch`, so read it alongside `legion_scheduler_plan_phase_seconds`. If
   it stays high on a well-sized pool, the fix is to issue fewer reads rather
   than to hold more connections.
+
+  **How the pool is sized.** `evalThreads + 4`, capped at 16 connections. The
+  eval workers are the manager's concurrent readers; the `+ 4` covers the
+  readers that do not come from that pool — worker heartbeats, the read-only
+  gRPC and UI surface, the metrics scrape, and the background reconcilers.
+  There is no separate knob, and raising `evalThreads` therefore widens the
+  pool too. The cap is a **memory** budget rather than a contention one: each
+  connection carries its own SQLite page cache capped at 64 MiB, and those
+  caches do not share, so 16 connections is a 1 GiB ceiling. The cap is only
+  approached by a cluster whose working set is actually that large — SQLite
+  fills the cache lazily. The pool used to be sized from the host's core
+  count; it is not, because these reads are latency-bound rather than
+  CPU-bound and a page-cache miss holds a connection through an I/O wait that
+  uses no CPU at all.
 
 #### Group commit (the coalescer)
 
