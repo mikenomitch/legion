@@ -65,6 +65,41 @@ it, or leave the operator box stopped rather than destroyed** — it is
   It now separates a size-independent stall timeout from a derived cap
   and records which fired (`outcome` in `metrics.json`).
 
+
+## The rig is the bottleneck, not the scheduler (2026-08-05)
+
+A full session produced **zero cells**. Not one of the failures was in
+Legion; all of them were first-boot cost or rot in the rig:
+
+| Cost | Time |
+| --- | --- |
+| Operator box cloud-init (`cloud-init analyze blame`: `config-scripts_user`) | **54 min** |
+| `docker-compose-v2` no longer resolving on Noble, killing bringup twice | ~20 min |
+| Rig control-plane/loadgen cloud-init | 10 min |
+| `cargo build --profile distfast` | 28 min |
+| Spot workers' cloud-init on scale-up | 8+ min, never finished |
+
+**Fix the rig before the next campaign, or the next session goes the same
+way.** In order:
+
+1. **Bake the AMIs.** `scripts/bake-operator-ami.sh` exists and is
+   stub-tested; run it for real (`--region us-east-1`). Then do the same
+   for the **worker** AMI — the sim workers install almost nothing, yet
+   pay a full cloud-init on every ASG scale-up, which is what stalled
+   this session's last attempt.
+2. **Cache the binary, not the compiler flags.** `distfast` (thin LTO, 16
+   codegen units) took 28 minutes against 24.5 for full fat LTO — the
+   cost is compiling ~900 crates, not linking. `build-and-upload.sh`
+   already fingerprints plugins and skips them when unchanged; do the
+   same for the main binary, keyed on git rev, in S3.
+3. **Keep the operator box stopped rather than destroyed** between
+   sessions (~$0.016/hr plus its EBS). It holds the terraform state, the
+   toolchain, and `~/legion/target` — i.e. items 1 and 2 for free until
+   they are built properly.
+
+Measured end to end: **~80 minutes from `launch` to a first cell**, on a
+good run. That is the number to beat.
+
 ## Known open questions
 
 - **Why is `apply` 27.9 ms/eval?** It is 67% of plan time and it contains
