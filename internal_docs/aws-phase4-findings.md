@@ -328,6 +328,45 @@ one cached statement instead of one acquisition and one parse per node. That
 removes 44 acquisitions per eval from a pool sized to the core count, but it
 does not reduce the rows read.
 
+## The eval-thread sweep: no serial wall at this scale
+
+`web_fleet`, 5,000 nodes, 25,002 allocations, one campaign per thread count
+(evalThreads is a control-plane setting), read pool at its shipped size of 4:
+
+| eval threads | throughput | verdict |
+| --- | --- | --- |
+| 4 | 177.27 alloc/s | Legion-bound |
+| 8 | 208.83 alloc/s | Legion-bound |
+| 16 | 219.25 alloc/s | Legion-bound |
+| 32 | **251.68 alloc/s** | Legion-bound |
+| 64 | **>=263.08 alloc/s** | **driver-bound — floor only** |
+
+Two conclusions and one caveat.
+
+**There is no serial wall here.** Throughput rises monotonically to at least 32
+threads. An earlier reading of 4 -> 8 -> 16 (+17.8%, then +5.0%) looked like a
+plateau and was called one; 32 threads then added another 14.8%. The +5% was
+noise in the trend, not a ceiling. Cheaper commits should therefore raise a
+rising curve rather than lift a fixed one.
+
+**The read pool is probably not the concurrency gate.** All of these ran with
+4 read connections. If that capped effective concurrency near 4, 32 threads
+could not have beaten 16. The earlier derivation of "~4 effective workers"
+from throughput divided by plan-path latency is therefore suspect.
+
+**At 64 threads the rig could not feed Legion.** Submission fell to 46.73
+jobs/sec and the last allocation landed 0.62s after the last submit, so the
+cell is a floor. Without `submission.driver_bound` this would have read as
+"263 against 252, only +4%, we have plateaued" — the third false finding the
+detector has caught today. **The knee above 32 is unmeasured and needs a
+faster load generator, not a bigger cluster.**
+
+*Caveat:* submission rate declined across the sweep (89.62, 77.09, 58.10,
+46.73 jobs/sec). Some of that is likely `RunJob` acknowledgement slowing as
+the manager gets busier, which means the cells are not perfectly matched. The
+Legion-bound cells are still valid measurements of Legion — `driver_bound` is
+false for all of them — but the submit rates are not a controlled variable.
+
 ## Open, in priority order
 
 1. **Stop re-reading whole nodes on the read-model refresh.** The strongest
@@ -338,7 +377,9 @@ does not reduce the rows read.
    let submitters join an in-flight batch rather than queue behind it — the
    coalescer is charging for batching it is not doing (batch size 1.32 at 16
    threads).
-3. **Find the knee.** 16 threads beat 4; the ladder above 16 is unmeasured.
+3. **Find the eval-thread knee**, which needs a FASTER LOAD GENERATOR: the
+   rig became the constraint at 64 threads, so the knee above 32 cannot be
+   seen with one CLI process per submitted job.
 4. **Measure control-plane CPU at saturation.** Every CPU figure so far (8% of
    four cores) came from a driver-bound cell — an idle system. Whether the
    ceiling is CPU or serialization is still unmeasured, and it decides which of
