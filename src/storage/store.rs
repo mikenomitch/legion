@@ -15620,6 +15620,7 @@ mod tests {
         Ok(())
     }
 
+    #[test]
     fn durable_sync_runs_write_connection_at_synchronous_full() -> R<()> {
         let dir = tempfile::tempdir()?;
 
