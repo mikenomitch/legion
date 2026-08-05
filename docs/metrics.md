@@ -249,6 +249,18 @@ mysteriously slow".
 - **`legion_store_write_lock_wait_seconds`** (histogram) — time spent
   waiting to acquire the store's SQLite write-connection lock. Sustained high
   buckets indicate write contention on the state store.
+- **`legion_store_read_lock_wait_seconds`** (histogram) — time spent waiting
+  for one of the store's read-only SQLite connections. The pool is sized from
+  the host (`available_parallelism()`, floor 4), and a reader takes any free
+  connection before queueing on a busy one, so a read that found one
+  immediately is recorded as 0. That makes the ratio of the `le="0"` bucket to
+  `_count` the useful reading: it is how often the pool was saturated, not how
+  long a query took. Demand here is heartbeat-driven, so it scales with
+  **fleet size** rather than with eval throughput. A rising tail lands inside
+  whichever scheduler plan phase happened to be running, historically
+  `task_fetch`, so read it alongside `legion_scheduler_plan_phase_seconds`. If
+  it stays high on a well-sized pool, the fix is to issue fewer reads rather
+  than to hold more connections.
 
 #### Group commit (the coalescer)
 
