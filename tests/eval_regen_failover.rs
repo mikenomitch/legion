@@ -636,4 +636,3 @@ fn enqueue_evals_creates_every_row_in_one_op() -> R<()> {
     assert!(store.enqueue_evals(Vec::new())?.is_empty());
     Ok(())
 }
-
