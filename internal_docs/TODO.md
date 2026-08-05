@@ -165,6 +165,29 @@ How to use it:
       quorum round trips rather than computing (8% CPU at saturation), so
       core count is the wrong basis. A changed default needs a plan under
       [plans/README.md](plans/README.md)'s rule.
+- [x] **Stop the coalescer polling for its handoff.** A submitter that lost
+      the commit lock slept 1 ms on its reply channel and re-contended, so
+      the lock sat free until some waiter's next tick and every waiter
+      burned a wake-up per millisecond of every commit (phase 4: 347 ms
+      follower wait against a 138 ms commit). The wait is now one
+      `Mutex` + `Condvar`, woken exactly when the commit it queued behind
+      ends. It also fixes a wedge: the old `commit_lock` was held across
+      the batch runner, so a panic there **poisoned** it and every later
+      submitter spun forever. `legion_store_coalesce_wait_rounds_total` now
+      counts extra commits sat through, not poll ticks, and should read 0.
+      Judgement calls, including why the leader deliberately does *not* run
+      a second batch:
+      [eval-path-raft-cost-plan_calls.md](calls/eval-path-raft-cost-plan_calls.md) §3.
+- [ ] **The plan-apply commit is still serialized, and batch size is the
+      arrival rate.** The handoff fix above is worth milliseconds per
+      commit; the 138 ms commit itself is untouched, and `batch_size` 1.32
+      at 16 eval threads means only ~1.3 plan applies arrive per commit
+      period — there is nothing queued to batch. No timer-free coalescer
+      change can raise that (and a timer would tax the lone submitter), so
+      the levers are a cheaper commit or more concurrent demand reaching
+      the coalescer. Find out which by measuring how many threads are
+      actually inside `submit_and_apply_plan` at once —
+      [aws-phase4-findings.md](aws-phase4-findings.md) item 2.
 - [ ] **Skip the health-check write when nothing changed.**
       `update_node_health_checks` runs ~134/s on a 5,000-node fleet and every
       one is `outcome=empty`, so it costs no quorum rounds — but it still

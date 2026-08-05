@@ -296,18 +296,21 @@ happening" are different claims, and only these families can tell them apart.
   propose → quorum → apply).
 - **`legion_store_coalesce_wait_seconds{path, role}`** (histogram) — how long
   a submitter waited before being served. `role="leader"` is the time from
-  enqueue to winning the commit lock, measured *before* its own commit
+  enqueue to winning the commit slot, measured *before* its own commit
   starts: pure contention. `role="follower"` is the time until another
   submitter's batch handed back a result, which includes that batch's commit.
   **Attribution**: against `..._commit_seconds`, this splits "the commit is
   slow" from "submitters are queued behind a commit". A large leader wait
   with a small commit time means the path is lock-bound, not storage-bound.
 - **`legion_store_coalesce_wait_rounds_total{path}`** (counter) — times a
-  waiting submitter's 1ms reply poll timed out and it re-contended for the
-  commit lock. Divided by `..._wait_seconds_count` it is the mean number of
-  poll rounds per request: latency that belongs to the coalescer's own
-  polling rather than to any commit. A ratio far above 1 means requests are
-  routinely sitting through several poll intervals.
+  waiting submitter was woken by a finished commit that was neither its own
+  result nor its turn to lead, i.e. it sat through an extra commit. Divided
+  by `..._wait_seconds_count` it is the mean number of *extra* commits a
+  request waits out. **Zero is the healthy value**: every submitter was
+  served by the first commit it queued behind. A ratio near or above 1 means
+  requests are consistently missing the batch they arrived behind, which is
+  either `plan_apply_batch_max` capping the drain or a commit so slow that a
+  second one starts before the first cohort clears.
 
 ### Raft
 
@@ -510,7 +513,8 @@ these in order — each step rules out a layer:
    never engages, and the path is paying a full commit per request.
 3. **Waiting or committing?** `legion_store_coalesce_wait_seconds` (by
    `role`) against `legion_store_coalesce_commit_seconds`, plus
-   `legion_store_coalesce_wait_rounds_total` for the polling share.
+   `legion_store_coalesce_wait_rounds_total` for the share of the wait that
+   is extra commits rather than the one being waited on.
 4. **Is it replication or the queue in front of it?**
    `legion_raft_pipeline_wait_seconds` and `legion_raft_pipeline_depth`
    against `legion_raft_capture_seconds` and
