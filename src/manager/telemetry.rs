@@ -760,7 +760,7 @@ pub struct Metrics {
     pub raft_capture_seconds: Arc<HistogramVec>,
     /// `legion_raft_propose_apply_seconds{lane}`
     pub raft_propose_apply_seconds: Arc<HistogramVec>,
-    /// `legion_raft_ops_total{lane,outcome}`
+    /// `legion_raft_ops_total{lane,op,outcome}`
     pub raft_ops_total: Arc<CounterVec>,
     /// `legion_raft_pipeline_wait_seconds{lane}`
     pub raft_pipeline_wait_seconds: Arc<HistogramVec>,
@@ -1077,8 +1077,8 @@ impl Metrics {
         let raft_ops_total = Arc::new(CounterVec {
             meta: FamilyMeta {
                 name: "legion_raft_ops_total",
-                help: "Replicated store ops by lane and outcome (applied|empty|not_leader|error). empty = the mutation touched no rows and skipped the raft entry.",
-                labels: &["lane", "outcome"],
+                help: "Replicated store ops by lane, op name, and outcome (applied|empty|not_leader|error). empty = the mutation touched no rows and skipped the raft entry. The op name is what makes a busy lane attributable: a lane's op count is its quorum-round count, so the top ops by rate are the ones setting its cost.",
+                labels: &["lane", "op", "outcome"],
             },
             series: Series::new(),
         });

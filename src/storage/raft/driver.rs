@@ -1445,7 +1445,7 @@ fn execute_replicated(
     {
         let metrics = raft.metrics().borrow().clone();
         if metrics.state != ServerState::Leader {
-            telemetry.raft_ops_total.inc(&[metric_lane, "not_leader"]);
+            telemetry.raft_ops_total.inc(&[metric_lane, op, "not_leader"]);
             let context = match lane_label {
                 Some(lane) => format!("raft op {op} must run on the {lane} lane's leader"),
                 None => format!("raft op {op} must run on the leader"),
@@ -1466,7 +1466,7 @@ fn execute_replicated(
     let (value, changeset) = match captured {
         Ok(captured) => captured,
         Err(error) => {
-            telemetry.raft_ops_total.inc(&[metric_lane, "error"]);
+            telemetry.raft_ops_total.inc(&[metric_lane, op, "error"]);
             return Err(error);
         }
     };
@@ -1474,7 +1474,7 @@ fn execute_replicated(
         // The mutation touched no rows (e.g. an idempotent no-op): there is
         // no effect to replicate and nothing another replica could apply, so
         // skip the raft entry entirely.
-        telemetry.raft_ops_total.inc(&[metric_lane, "empty"]);
+        telemetry.raft_ops_total.inc(&[metric_lane, op, "empty"]);
         return Ok(value);
     }
     // Capture-time single-writer ownership guard (plan §7-C2, JC-26): every
@@ -1500,9 +1500,9 @@ fn execute_replicated(
         .raft_propose_apply_seconds
         .observe(&[metric_lane], propose_elapsed.as_secs_f64());
     match write_result {
-        Ok(_) => telemetry.raft_ops_total.inc(&[metric_lane, "applied"]),
+        Ok(_) => telemetry.raft_ops_total.inc(&[metric_lane, op, "applied"]),
         Err(err) => {
-            telemetry.raft_ops_total.inc(&[metric_lane, "error"]);
+            telemetry.raft_ops_total.inc(&[metric_lane, op, "error"]);
             return Err(map_write_error(op, lane_label, err));
         }
     }
