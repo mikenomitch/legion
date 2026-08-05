@@ -113,16 +113,70 @@ the plan-apply path.
   grouping `by (lane, op)` against a metric with no such label and silently
   getting lane totals back, which is why the status lane was unattributable.
 
+## The first unstarved measurement
+
+Cell G, 2026-08-05 14:05, `web_fleet` 5,000 nodes, `evalThreads=4`, on a
+16-vCPU loadgen with concurrency 32 and pre-rendered JSON:
+
+| metric | value |
+| --- | --- |
+| submission rate | **89.62 jobs/sec** (was 36.24) |
+| drain after last submit | **101.05 s** |
+| `driver_bound` | **false** |
+| throughput | **177.27 alloc/sec** (~29.5 evals/sec) |
+| p50 / p99 placement | 63.4 s / 100.8 s |
+| placed | 25,002 / 25,002 |
+
+Submission demands 538 alloc/sec and Legion delivers 177, so it is ~3x behind
+with a 101-second backlog. This is real saturation.
+
+Note the driver-bound figure (203.19) was *higher* than the true one. A slow
+driver paces work so the scheduler never falls behind, which flatters both
+throughput and latency.
+
+## What the raft lanes are actually doing
+
+Measured live during cell G with the new `op` label — the first time any of
+this was attributable:
+
+| lane | op | rate |
+| --- | --- | --- |
+| status | **`update_node_health_checks`** | **178.7/s** |
+| scheduler | `complete_and_claim_next` | 26.6/s |
+| status | `update_task_statuses_for_allocations` | 25.3/s |
+| scheduler | `submit_and_apply_plan_with_candidates` | 25.3/s |
+| status | `seed_task_statuses` | 21.1/s |
+| control | `handle_job_submit` | 21.1/s |
+| control | `idempotency_record` | 21.1/s |
+| control | `replace_job_kv_references` | 21.1/s |
+| control | `clear_job_failed_status` | 21.1/s |
+| control | `clear_job_stopped_status` | 21.1/s |
+| scheduler | `enqueue_eval_after_delay` | 21.1/s |
+| scheduler | `sync_task_volume_claims` | 21.1/s |
+
+Two findings, and the first corrects a guess made earlier in this document's
+own history:
+
+1. **The status lane is not allocation state transitions.**
+   `update_task_statuses_for_allocations` is already batched at one round per
+   eval (25.3/s), not one per allocation. The dominator is
+   `update_node_health_checks` at **178.7/s** — 7x the eval rate — and it
+   scales with FLEET SIZE, not workload. Heartbeats were moved off raft to the
+   local liveness tracker; health checks were not.
+
+2. **Job submit costs five separate control-lane quorum rounds.**
+   `handle_job_submit`, `idempotency_record`, `replace_job_kv_references`,
+   `clear_job_failed_status` and `clear_job_stopped_status` all run at exactly
+   the submission rate. They are one logical operation and are candidates to
+   fuse into one round, the same way `complete_and_claim_next` fused the eval
+   queue's pair.
+
 ## Open, in priority order
 
-1. **Re-measure on an unstarved rig.** Nothing about Legion's throughput is
-   known until a cell reports `driver_bound: false`.
-2. **The status lane is the biggest raft consumer in the system.** Cell A:
-   status 50,567 ops, control 25,838, scheduler 16,678. With 25,002 allocations
-   at ~2 state transitions each, that is ~1 quorum round per allocation state
-   change — more than scheduling itself. Heartbeats are already off raft (the
-   local liveness tracker), so this is allocation status. Confirm with the new
-   `op` label before touching it.
+1. **`update_node_health_checks` at 178.7/s.** The largest single raft
+   consumer in the cluster, and it grows with the fleet rather than the work.
+   Batch it, or move it off raft as heartbeats already were.
+2. **Fuse the five control-lane rounds per job submit into one.**
 3. **A real bulk-submit path.** One CLI process per job is a poor way to drive
    load even at 16 vCPU. A long-lived submitter speaking gRPC directly would
    remove the rig's ceiling rather than raise it. This is a benchmark-harness
