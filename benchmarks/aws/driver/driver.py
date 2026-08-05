@@ -73,6 +73,21 @@ def compute_metrics(submits, events, expected_total, warmup_secs=0.0, kill_time_
     first_submit = min(submits.values()) if submits else 0
     warmup_end = first_submit + int(warmup_secs * 1000)
 
+    # A cell shorter than its own warm-up measures nothing: every placement
+    # is excluded and the cell reports `throughput_per_sec: 0.0` alongside
+    # `complete: true`, which reads as a catastrophic result rather than a
+    # missing one. That is not hypothetical — the 2026-08-04 phase-3
+    # campaign lost its 1,000-node throughput number exactly this way, at
+    # the default 30s warm-up.
+    #
+    # Fall back to measuring the whole run rather than nothing, and say so
+    # in the metrics: a number with `warmup_applied: false` is comparable
+    # to nothing else, but it is honest and it is not zero.
+    last_event = max((event["t_ms"] for event in events), default=warmup_end)
+    warmup_applied = last_event > warmup_end
+    if not warmup_applied:
+        warmup_end = first_submit
+
     latencies = []
     window_placed = 0
     window_start = None
@@ -113,6 +128,10 @@ def compute_metrics(submits, events, expected_total, warmup_secs=0.0, kill_time_
         "p99_ms": percentile(latencies, 0.99),
         "latency_samples": len(latencies),
         "warmup_secs": warmup_secs,
+        # False means the cell finished inside its own warm-up and the
+        # numbers above cover the WHOLE run, warm-up included. Read such a
+        # cell as a floor, and shorten `--warmup` before comparing it.
+        "warmup_applied": warmup_applied,
     }
 
     if kill_time_ms is not None:
@@ -483,15 +502,60 @@ def cmd_run(args):
         for job in manifest["jobs"]:
             submit_one(job)
 
-    deadline = time.monotonic() + args.settle_timeout_secs
+    # Two clocks, because a fixed wall-clock deadline cannot tell "the
+    # cluster stopped converging" from "this cell is simply bigger".
+    # A 200k-allocation saturation point needs ~10 minutes at 350
+    # alloc/sec just to finish healthily, so a flat 600s would report it
+    # incomplete for arithmetic reasons and the sweep would read that as
+    # the scheduler's ceiling — the exact class of measurement error that
+    # invalidated phase 1.
+    #
+    #   stall  — no placement at all for this long. THIS is "stopped
+    #            converging", and it is independent of cell size.
+    #   settle — an absolute cap so a pathologically slow trickle still
+    #            ends the cell. Scaled from the expected allocation count
+    #            when the caller leaves it at 0 (= derive it).
+    settle_timeout = args.settle_timeout_secs
+    if settle_timeout <= 0:
+        # 20 alloc/sec is a deliberately pessimistic floor — an order of
+        # magnitude under the slowest cell ever measured (86.6/sec) — so
+        # the cap only ever fires on a system that is not really working.
+        settle_timeout = max(600.0, expected_total / 20.0)
+    print(
+        f"settling: stall timeout {args.stall_timeout_secs}s, "
+        f"absolute cap {settle_timeout:.0f}s ({expected_total} expected)",
+        file=sys.stderr,
+    )
+
+    outcome = "complete"
+    deadline = time.monotonic() + settle_timeout
+    last_progress = time.monotonic()
+    last_placed = recorder.placed_total()
     while time.monotonic() < deadline:
-        if recorder.placed_total() >= expected_total:
+        placed = recorder.placed_total()
+        if placed >= expected_total:
+            break
+        if placed > last_placed:
+            last_placed = placed
+            last_progress = time.monotonic()
+        elif (
+            args.stall_timeout_secs > 0
+            and time.monotonic() - last_progress > args.stall_timeout_secs
+        ):
+            outcome = "stalled"
+            print(
+                f"STALLED: no placement for {args.stall_timeout_secs}s at "
+                f"{placed}/{expected_total} — the cluster stopped converging; "
+                f"metrics record the shortfall",
+                file=sys.stderr,
+            )
             break
         # A dead watcher is not a slow cluster, and waiting out the full
         # settle timeout to report zero placements hides which one it
         # was. Fail as soon as the stream is gone, and say where its
         # stderr went.
         if not adapter.watch_alive():
+            outcome = "watcher_died"
             print(
                 f"ERROR: the event watcher exited mid-run after "
                 f"{recorder.placed_total()}/{expected_total} placements. "
@@ -501,8 +565,9 @@ def cmd_run(args):
             break
         time.sleep(0.25)
     else:
+        outcome = "timeout"
         print(
-            f"WARNING: settle timeout after {args.settle_timeout_secs}s "
+            f"WARNING: settle cap reached after {settle_timeout:.0f}s "
             f"({recorder.placed_total()}/{expected_total} placed) — "
             f"metrics record the shortfall",
             file=sys.stderr,
@@ -510,6 +575,11 @@ def cmd_run(args):
 
     adapter.stop_watch()
     metrics = recorder.finalize(expected_total, args.warmup_secs)
+    # Why the cell ended, in the archive. An incomplete cell that stalled
+    # is a scheduler result; one that hit the cap is a rig result; and
+    # they are indistinguishable from `complete: false` alone.
+    metrics["outcome"] = outcome
+    metrics["settle_timeout_secs"] = round(settle_timeout, 1)
     print(json.dumps(metrics, indent=2))
     return 0 if metrics["complete"] else 1
 
@@ -579,7 +649,22 @@ def main():
     run.add_argument("--out", required=True, help="run directory to write")
     run.add_argument("--manager", default="http://127.0.0.1:4747", help="manager/server address")
     run.add_argument("--warmup-secs", type=float, default=5.0)
-    run.add_argument("--settle-timeout-secs", type=float, default=600.0)
+    run.add_argument(
+        "--settle-timeout-secs",
+        type=float,
+        default=0.0,
+        help="Absolute cap on the settle wait. 0 (the default) derives it "
+        "from the expected allocation count at a pessimistic 20/sec floor, "
+        "so a large saturation cell is not cut off for arithmetic reasons.",
+    )
+    run.add_argument(
+        "--stall-timeout-secs",
+        type=float,
+        default=120.0,
+        help="End the cell when no placement has landed for this long. This "
+        "is the real 'stopped converging' signal, and unlike the cap it does "
+        "not move with cell size. 0 disables it, leaving only the cap.",
+    )
     run.add_argument("--submit-gap-ms", type=int, default=0)
     run.add_argument(
         "--submit-concurrency",

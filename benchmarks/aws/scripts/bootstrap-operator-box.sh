@@ -945,6 +945,10 @@ while [ $# -gt 0 ]; do
         PHASE1_ARGS="$PHASE1_ARGS --skip-smoke" # passed through to phase1.sh
         shift
         ;;
+    --skip-density)
+        PHASE1_ARGS="$PHASE1_ARGS --skip-density" # passed through to phase1.sh
+        shift
+        ;;
     --from)
         PHASE1_ARGS="$PHASE1_ARGS --from $2"
         shift 2

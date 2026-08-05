@@ -46,6 +46,15 @@ architecture and behavior docs are public.
   that is now the regression test for every scheduler change, what the
   rig got wrong (every cell of the first campaign was invalid, each for a
   different reason), and one claim retracted after checking the source.
+- [aws-phase3-findings.md](aws-phase3-findings.md) — the third AWS run
+  (2026-08-04), which measured #189 and **retired the phase-2
+  diagnosis**: plan-apply rejections went 31.9% -> **0%**, per-eval plan
+  time fell 36%, p99 fell 42% — and throughput did not move (86.6 ->
+  80.35 alloc/sec at 5,000 nodes). Conflicts were real and are fixed, but
+  they were never the ceiling; `apply` (the raft commit) is 67% of plan
+  time and the scheduler runs ~7x below what its own planning cost
+  permits. Also a read-connection-pool hypothesis raised and refuted
+  in the same session.
 - [development.md](development.md) — running locally, Linux worker containers,
   gRPC poking, CI lint baseline.
 - [rustyriver-migration.md](rustyriver-migration.md) — porting streaming
@@ -90,7 +99,8 @@ When one is required and what goes in it:
 | [scheduler-performance-plan.md](plans/scheduler-performance-plan.md) | in execution |
 | [scheduler-architecture-review-plan.md](plans/scheduler-architecture-review-plan.md) | proposals accepted; D1/D4/D5/D6 graduated into the two plans below, D8's local slice into the heartbeat plan |
 | [plan-path-scale-levers-plan.md](plans/plan-path-scale-levers-plan.md) | shipped (D4/D5/D6, 2026-07-30; batch-as-a-transaction, 2026-08-03) |
-| [plan-apply-conflict-reduction-plan.md](plans/plan-apply-conflict-reduction-plan.md) | in execution (two-pass bind + candidate-list restoration + decorrelated tails landed; the AWS re-measurement is not run) |
+| [plan-apply-conflict-reduction-plan.md](plans/plan-apply-conflict-reduction-plan.md) | in execution (two-pass bind + candidate-list restoration + decorrelated tails landed; **measured on AWS 2026-08-04: rejections 31.9% -> 0%**, but throughput unchanged — see [aws-phase3-findings.md](aws-phase3-findings.md)) |
+| [eval-path-raft-cost-plan.md](plans/eval-path-raft-cost-plan.md) | in execution (claim/complete fusion + batched enqueue landed; the AWS re-measurement is not run) |
 | [bounded-candidate-scoring-plan.md](plans/bounded-candidate-scoring-plan.md) | shipped (opt-in `score_sample`, 2026-07-30) |
 | [heartbeat-scale-plan.md](plans/heartbeat-scale-plan.md) | shipped (benchmark + batching + liveness + cadence, 2026-07-30) |
 | [heartbeat-cadence-at-scale-plan.md](plans/heartbeat-cadence-at-scale-plan.md) | **shipped** 2026-08-03 (sizing + freshness warning + per-node lost windows + opt-in adaptive cadence); the AWS reproduction is not run |

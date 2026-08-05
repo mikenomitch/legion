@@ -726,6 +726,8 @@ pub struct Metrics {
     pub allocations: Arc<Gauge>,
     /// `legion_store_write_lock_wait_seconds`
     pub store_write_lock_wait_seconds: Arc<Histogram>,
+    /// `legion_store_read_lock_wait_seconds`
+    pub store_read_lock_wait_seconds: Arc<Histogram>,
     /// `legion_store_coalesce_batch_size{path}`
     pub store_coalesce_batch_size: Arc<HistogramVec>,
     /// `legion_store_coalesce_wait_seconds{path,role}`
@@ -921,6 +923,14 @@ impl Metrics {
             meta: FamilyMeta {
                 name: "legion_store_write_lock_wait_seconds",
                 help: "Time spent waiting for the store's SQLite write-connection lock.",
+                labels: &[],
+            },
+            cell: HistogramCell::new(DURATION_BUCKETS),
+        });
+        let store_read_lock_wait_seconds = Arc::new(Histogram {
+            meta: FamilyMeta {
+                name: "legion_store_read_lock_wait_seconds",
+                help: "Time spent waiting for one of the store's SQLite read connections. Reads that found a free connection immediately are recorded as 0, so this is the queueing cost of the read pool and not the cost of the query. A rising tail here shows up inside whichever scheduler plan phase happened to be running — historically `task_fetch` — so read it alongside legion_scheduler_plan_phase_seconds.",
                 labels: &[],
             },
             cell: HistogramCell::new(DURATION_BUCKETS),
@@ -1288,6 +1298,7 @@ impl Metrics {
             Arc::clone(&store_coalesce_wait_rounds_total) as Arc<dyn RenderMetric>,
             Arc::clone(&store_coalesce_wait_seconds) as Arc<dyn RenderMetric>,
             Arc::clone(&store_write_lock_wait_seconds) as Arc<dyn RenderMetric>,
+            Arc::clone(&store_read_lock_wait_seconds) as Arc<dyn RenderMetric>,
         ];
 
         Metrics {
@@ -1306,6 +1317,7 @@ impl Metrics {
             nodes,
             allocations,
             store_write_lock_wait_seconds,
+            store_read_lock_wait_seconds,
             store_coalesce_batch_size,
             store_coalesce_wait_seconds,
             store_coalesce_commit_seconds,

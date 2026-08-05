@@ -1,0 +1,51 @@
+{
+  "name": "dense-fleet",
+  "_comment": [
+    "Built to saturate the SCHEDULER, where web_fleet saturates the rig.",
+    "",
+    "Two properties differ from web_fleet, both deliberate:",
+    "",
+    "1. ~44 allocations per job, against web_fleet's 6. The density axis",
+    "   (--allocs-per-node) scales job COUNT, so every density point on",
+    "   web_fleet is also a submission-rate point, and the driver -- a",
+    "   2-vCPU loadgen box spawning one CLI process per submit -- reaches",
+    "   its ceiling long before the control plane reaches its own. Fat",
+    "   jobs move the load from submission into placement, which is the",
+    "   thing under test.",
+    "",
+    "2. Small resource requests (50 mCPU / 64 MiB against 500 / 1024).",
+    "   web_fleet's api job fits ~16 allocations on an 8-core node, so a",
+    "   density sweep past that measures capacity exhaustion -- a correct",
+    "   refusal to place -- rather than scheduler throughput. At 50 mCPU a",
+    "   5,000-node fleet has room for ~800k allocations, so the sweep ends",
+    "   when the scheduler stops keeping up and not before.",
+    "",
+    "A 50-replica service into one pool is also precisely the shape that",
+    "plan-apply-conflict-reduction targets: decouple_plan_components used",
+    "to collapse exactly this to a single candidate per placement.",
+    "",
+    "node_profiles are web_fleet's, unchanged, so fleet shape stays",
+    "comparable across the two scenarios."
+  ],
+  "scheduling_policy": "spread",
+  "iterations": 6,
+  "node_profiles": [
+    { "name": "web-east", "count": 120, "memory_gb": 32, "cpus": 8,
+      "attrs": { "class": "web", "region": "us-east" } },
+    { "name": "web-west", "count": 80, "memory_gb": 32, "cpus": 8,
+      "attrs": { "class": "web", "region": "us-west" } },
+    { "name": "util", "count": 40, "memory_gb": 16, "cpus": 4,
+      "attrs": { "class": "util", "region": "us-east" } }
+  ],
+  "job_types": [
+    { "name": "svc", "count": 20, "tasks_per_job": 1, "task_count_per_task": 50,
+      "resources": { "cpu": 50, "memory": 64 },
+      "constraints": { "class": "web" } },
+    { "name": "worker", "count": 5, "tasks_per_job": 1, "task_count_per_task": 20,
+      "resources": { "cpu": 50, "memory": 64 },
+      "constraints": { "class": "util" } }
+  ],
+  "churn_every": 3,
+  "churn_nodes": 6,
+  "slo": { "min_evals_per_sec": 10.0, "max_p99_latency_ms": 500.0 }
+}

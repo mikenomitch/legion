@@ -155,6 +155,26 @@ a node-loss storm in the middle of the curve.
 scaling campaign, which is what puts the four steps at 5k/10k/25k/50k
 allocations.
 
+### Eval concurrency (`--eval-threads`)
+
+The third axis, and the one phase 2 found pointing the wrong way: more
+eval threads *cost* throughput (4 → 16 gave -12% at 1k nodes and -11% at
+5k) because the extra planners collided and their plans were discarded.
+Re-measuring that is how plan-apply conflict reduction gets judged, so
+the manager's `evalThreads` is rendered per campaign rather than
+hardcoded in `configs/legion/manager-a.ncl.tpl`:
+
+```bash
+scripts/run-campaign.sh --system legion-a --steps "1000 5000" --eval-threads 16
+```
+
+It is a control-plane setting, not a per-cell one, so it is one value per
+campaign — a sweep is one campaign per point, and each campaign's
+rendered config (archived in the fairness record) states the value it
+actually ran. `legion-a` only; passing it to another system is an error
+rather than a silent no-op, because a cell archived as a 16-thread result
+whose config says 4 is worse than a failed run.
+
 ### Every campaign resets the control plane first
 
 `run-campaign.sh` wipes and reinstalls the control plane before its first

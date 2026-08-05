@@ -68,6 +68,55 @@ pub enum Msg {
 pub type MemSafeConn = Arc<Mutex<Connection>>;
 const READ_MODEL_LOCK_ERROR: &str = "Error locking read model";
 
+/// One eval to enqueue, for the batched [`Store::enqueue_evals`].
+#[derive(Debug, Clone)]
+pub struct EvalRequest {
+    pub kind: String,
+    pub job_id: Option<String>,
+    pub job_config_id: Option<String>,
+    pub node_id: Option<String>,
+    pub priority: Option<i64>,
+    pub delay: Duration,
+}
+
+impl EvalRequest {
+    /// An immediate eval for a job and its config — the shape every
+    /// fan-out loop needs.
+    pub fn for_job(kind: &str, job_id: &str, job_config_id: &str) -> Self {
+        Self {
+            kind: kind.to_owned(),
+            job_id: Some(job_id.to_owned()),
+            job_config_id: Some(job_config_id.to_owned()),
+            node_id: None,
+            priority: None,
+            delay: Duration::ZERO,
+        }
+    }
+}
+
+/// How a handled eval should be written back, so the terminal write can be
+/// fused with the next claim into one scheduler-lane round
+/// ([`Store::complete_and_claim_next`]).
+///
+/// This exists so the eval worker can *decide* an outcome without also
+/// *writing* it: deciding happens on the blocking pool, writing happens on
+/// the lane, and keeping them separate is what lets the write be batched
+/// with the following claim.
+#[derive(Debug, Clone)]
+pub enum EvalCompletion {
+    /// Terminal. `succeeded` deletes the row; otherwise it is marked
+    /// `failed` (and failed evals are never retried).
+    Finished { succeeded: bool, event: EventDraft },
+    /// Back to `pending` after `delay` — the eval must run again. Used for
+    /// foreign-lane `NotRaftLeader` rejections and plan-conflict
+    /// exhaustion, both of which are transient and would otherwise drop
+    /// acknowledged work.
+    Released {
+        delay: Duration,
+        event: Option<EventDraft>,
+    },
+}
+
 /// RFC3339 with the subsecond field pinned to nine digits, so the rendered
 /// string sorts lexicographically in chronological order. Used for any
 /// timestamp SQL compares or orders by (see `Store::sortable_timestamp`).
@@ -779,7 +828,34 @@ pub const CONN_LOCK_ERROR: &str = "Error locking database connection";
 /// §8, D1), which all scope themselves to each job's latest config.
 const LATEST_CONFIG_FOR_JOB: &str = "(SELECT jc.id FROM job_config jc \
      WHERE jc.job_id = j.id ORDER BY jc.created_at DESC LIMIT 1)";
-const READ_ONLY_CONN_POOL_SIZE: usize = 2;
+/// Read-only SQLite connections shared by every reader in the manager.
+///
+/// This was 2, and 2 is a serialization point rather than a pool. The
+/// eval path takes ~4 read connections per evaluation, but the heartbeat
+/// path is the volume: `build_desired_allocations` runs per node per
+/// `WORKER_HEARTBEAT_DURATION_SEC`, so demand scales with *fleet size* —
+/// roughly 3-7k acquisitions/sec at 1,000 nodes and 15-37k/sec at 5,000.
+/// Funnelling that through two mutexes is what made the `task_fetch`
+/// plan phase grow 100x between those two fleet sizes (0.14ms -> 14.96ms)
+/// while control-plane CPU sat at 29% and no thread exceeded 40% of a
+/// core: the manager was not short of CPU, it was queueing.
+///
+/// Sized from the host rather than fixed, because the contention is
+/// concurrency-shaped. Cores is the bound, and deliberately not some
+/// larger constant: these reads are CPU-bound page-cache hits, so past
+/// one connection per core extra connections cannot add read throughput
+/// — they would only decouple one slow query from the queue, at ~2 MB of
+/// SQLite page cache each. If demand still exceeds the pool (it is
+/// heartbeat-driven, so it scales with *fleet size* rather than with
+/// cores), the fix is to issue fewer reads, not to hold more connections.
+///
+/// The floor keeps a 1-2 core host off the old cliff.
+fn read_only_conn_pool_size() -> usize {
+    std::thread::available_parallelism()
+        .map(|value| value.get())
+        .unwrap_or(4)
+        .max(4)
+}
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 // Live subscribers that fall this many events behind must catch up from the
 // scheduler_event table (StreamEvents handles the Lagged case).
@@ -1293,8 +1369,9 @@ impl Store {
 
     #[instrument(err, skip_all)]
     fn create_read_pool(db_path: &Path) -> R<Vec<MemSafeConn>> {
-        let mut read_conns = Vec::with_capacity(READ_ONLY_CONN_POOL_SIZE);
-        for _ in 0..READ_ONLY_CONN_POOL_SIZE {
+        let size = read_only_conn_pool_size();
+        let mut read_conns = Vec::with_capacity(size);
+        for _ in 0..size {
             read_conns.push(Self::create_readonly_conn(db_path)?);
         }
         Ok(read_conns)
@@ -1329,10 +1406,18 @@ impl Store {
         let lock_wait_started = Instant::now();
         let guard = conn.lock().map_err(|_| anyhow!(CONN_LOCK_ERROR))?;
         let waited = lock_wait_started.elapsed();
-        if connection_kind == "write" {
-            crate::manager::telemetry::metrics()
+        // Both kinds are observed. The read side was unmeasured, which is
+        // why its cost was invisible: every millisecond spent queueing for
+        // a read connection was attributed to whichever plan phase
+        // happened to be holding the stopwatch (`task_fetch`, usually),
+        // with no metric anywhere naming the real resource.
+        match connection_kind {
+            "write" => crate::manager::telemetry::metrics()
                 .store_write_lock_wait_seconds
-                .observe(waited.as_secs_f64());
+                .observe(waited.as_secs_f64()),
+            _ => crate::manager::telemetry::metrics()
+                .store_read_lock_wait_seconds
+                .observe(waited.as_secs_f64()),
         }
         debug!(
             connection_kind,
@@ -1816,9 +1901,30 @@ impl Store {
 
     pub(crate) fn read_connection(&self) -> R<MutexGuard<'_, Connection>> {
         let pool = self.read_conns.as_slice();
-        let index = self.read_index.fetch_add(1, Ordering::Relaxed);
-        let conn = pool.get(index % pool.len()).unwrap_or(&self.write_conn);
-        Self::lock_conn(conn, "read")
+        if pool.is_empty() {
+            return Self::lock_conn(&self.write_conn, "read");
+        }
+        let start = self.read_index.fetch_add(1, Ordering::Relaxed);
+
+        // Take any free connection before waiting on a busy one. Plain
+        // round-robin picked a slot and then *blocked* on it, so a reader
+        // could sit behind a long query while its neighbour sat idle —
+        // which makes a pool of N behave worse than N under load, and is
+        // half of why two connections hurt as much as they did.
+        for offset in 0..pool.len() {
+            let conn = &pool[(start.wrapping_add(offset)) % pool.len()];
+            if let Ok(guard) = conn.try_lock() {
+                crate::manager::telemetry::metrics()
+                    .store_read_lock_wait_seconds
+                    .observe(0.0);
+                return Ok(guard);
+            }
+        }
+
+        // Every connection is busy: queue on the one this caller drew, so
+        // waiters still spread across the pool rather than piling onto a
+        // single slot.
+        Self::lock_conn(&pool[start % pool.len()], "read")
     }
 
     fn read_model_reader(&self) -> R<std::sync::RwLockReadGuard<'_, SchedulingReadModel>> {
@@ -2559,13 +2665,30 @@ impl Store {
         Ok(latest)
     }
 
+    /// Bump a scope's epoch and return the new value.
+    ///
+    /// One statement on the hot path, not four. This used to be
+    /// `ensure` + `UPDATE` + `ensure` again + `SELECT`, and a plan bumps
+    /// one scope per bound node plus the job config — about 28 statements
+    /// per plan on the benchmark workload, all inside the capture that the
+    /// scheduler lane executes serially. `UPDATE … RETURNING` collapses
+    /// the common case (the row exists) to a single round through SQLite;
+    /// the insert only runs when the scope is genuinely new.
     fn bump_scope_epoch_tx(&self, tx: &Connection, scope_type: &str, scope_id: &str) -> R<i64> {
+        const BUMP: &str = "UPDATE allocation_epoch_partition SET epoch = epoch + 1 \
+             WHERE scope_type = ?1 AND scope_id = ?2 RETURNING epoch;";
+        if let Some(epoch) = tx
+            .query_row(BUMP, params![scope_type, scope_id], |row| row.get(0))
+            .optional()?
+        {
+            return Ok(epoch);
+        }
+        // First write for this scope: seed it, then bump. The seed is 0, so
+        // the bump lands on 1 exactly as the old four-statement form did.
         self.ensure_scope_epoch_tx(tx, scope_type, scope_id)?;
-        tx.execute(
-            "UPDATE allocation_epoch_partition SET epoch = epoch + 1 WHERE scope_type = ?1 AND scope_id = ?2;",
-            params![scope_type, scope_id],
-        )?;
-        self.scope_epoch_tx(tx, scope_type, scope_id)
+        tx.query_row(BUMP, params![scope_type, scope_id], |row| row.get(0))
+            .optional()?
+            .context("epoch row vanished between insert and bump")
     }
 
     fn bump_job_config_epoch_tx(&self, tx: &Connection, job_config_id: &str) -> R<i64> {
@@ -12299,6 +12422,73 @@ impl Store {
         self.replicated(Lane::Scheduler, "claim_eval", move |s| s.claim_eval_apply())
     }
 
+    /// Finish the eval a worker just handled AND claim its next one, in a
+    /// single scheduler-lane op.
+    ///
+    /// Every eval used to cost two quorum rounds on this lane that had
+    /// nothing to do with the work itself: one to claim it and one to
+    /// finish it. They bracket a loop in which the same worker immediately
+    /// claims again, so the pair is pure queue overhead — and the AWS
+    /// phase-3 campaign put the scheduler lane, not the planner, at the
+    /// throughput ceiling (each eval spent ~86% of its wall time outside
+    /// the measured plan phases). Fusing them halves the lane's
+    /// per-eval round count.
+    ///
+    /// This is sound for the same reason the pieces are: `replicated`
+    /// short-circuits when it is already inside a capture
+    /// ([`Self::replicated`]), so the two writes land in one changeset and
+    /// commit or roll back together. A worker that dies between them
+    /// leaves the current eval `in_flight`, which is exactly the state
+    /// `requeue_in_flight_evals` already recovers — the same window the
+    /// unfused pair had, not a new one.
+    ///
+    /// Returns the next claimable eval, or `None` when the queue is empty
+    /// (or holds only delayed work), in which case the caller parks.
+    #[instrument(err, skip(self, completion))]
+    pub fn complete_and_claim_next(
+        &self,
+        eval_id: &str,
+        completion: EvalCompletion,
+    ) -> R<Option<Eval>> {
+        let eval_id = eval_id.to_owned();
+        self.replicated(Lane::Scheduler, "complete_and_claim_next", move |s| {
+            s.apply_eval_completion(&eval_id, completion)?;
+            s.claim_eval_apply()
+        })
+    }
+
+    /// Write a handled eval's outcome as its own scheduler-lane op, for
+    /// callers with no following claim to fuse it with (see
+    /// [`Self::complete_and_claim_next`], which is what the eval worker
+    /// loop uses).
+    pub fn apply_eval_completion_standalone(
+        &self,
+        eval_id: &str,
+        completion: EvalCompletion,
+    ) -> R<()> {
+        let eval_id = eval_id.to_owned();
+        self.replicated(Lane::Scheduler, "complete_eval", move |s| {
+            s.apply_eval_completion(&eval_id, completion)
+        })
+    }
+
+    /// The terminal write for a handled eval, shared by the fused and
+    /// unfused paths so the two can never drift.
+    fn apply_eval_completion(&self, eval_id: &str, completion: EvalCompletion) -> R<()> {
+        match completion {
+            EvalCompletion::Finished { succeeded, event } => {
+                self.complete_eval_impl(eval_id, succeeded, Some(event))
+            }
+            EvalCompletion::Released {
+                delay,
+                event: Some(event),
+            } => self.release_eval_for_retry_with_event_apply(eval_id, delay, event),
+            EvalCompletion::Released { delay, event: None } => {
+                self.release_eval_for_retry_apply(eval_id, delay)
+            }
+        }
+    }
+
     fn claim_eval_apply(&self) -> R<Option<Eval>> {
         let tx_started = Instant::now();
         let mut conn = self.write_connection()?;
@@ -12528,10 +12718,14 @@ impl Store {
             let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
             Self::collect_rows(rows)?
         };
-        for (job_id, to_config) in rollout_targets {
-            self.enqueue_eval("rollout_tick", Some(&job_id), Some(&to_config), None, None)?;
-            enqueued += 1;
-        }
+        // One op for the whole fan-out. This runs on every leadership
+        // acquisition, so on a large cluster it was one quorum round per
+        // mid-flight rollout before the new leader could do anything else.
+        let rollout_requests: Vec<EvalRequest> = rollout_targets
+            .iter()
+            .map(|(job_id, to_config)| EvalRequest::for_job("rollout_tick", job_id, to_config))
+            .collect();
+        enqueued += self.enqueue_evals(rollout_requests)?.len() as u64;
 
         // Active jobs without a live rollout.
         let job_targets: Vec<(String, Option<String>, bool)> = {
@@ -12560,6 +12754,7 @@ impl Store {
             })?;
             Self::collect_rows(rows)?
         };
+        let mut job_requests: Vec<EvalRequest> = Vec::new();
         for (job_id, latest_config, restart_requested) in job_targets {
             let Some(latest_config) = latest_config else {
                 continue;
@@ -12611,9 +12806,12 @@ impl Store {
                     }
                 }
             };
-            self.enqueue_eval(kind, Some(&job_id), Some(&latest_config), None, None)?;
-            enqueued += 1;
+            job_requests.push(EvalRequest::for_job(kind, &job_id, &latest_config));
         }
+        // Flushed once rather than per job. The loop body above has its own
+        // side effects (stale-config migration and cleanup) that must stay
+        // interleaved, so only the enqueues are batched.
+        enqueued += self.enqueue_evals(job_requests)?.len() as u64;
 
         // Stopped jobs whose teardown tail was lost with the old leader.
         let stop_targets: Vec<(String, Option<String>)> = {
@@ -12646,16 +12844,18 @@ impl Store {
             let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
             Self::collect_rows(rows)?
         };
-        for (job_id, job_config_id) in stop_targets {
-            self.enqueue_eval(
-                "job_stop",
-                Some(&job_id),
-                job_config_id.as_deref(),
-                None,
-                None,
-            )?;
-            enqueued += 1;
-        }
+        let stop_requests: Vec<EvalRequest> = stop_targets
+            .iter()
+            .map(|(job_id, job_config_id)| EvalRequest {
+                kind: "job_stop".to_owned(),
+                job_id: Some(job_id.clone()),
+                job_config_id: job_config_id.clone(),
+                node_id: None,
+                priority: None,
+                delay: Duration::ZERO,
+            })
+            .collect();
+        enqueued += self.enqueue_evals(stop_requests)?.len() as u64;
 
         let drained_nodes: Vec<String> = {
             let conn = self.read_connection()?;
@@ -12688,14 +12888,28 @@ impl Store {
             drop(stmt);
             nodes
         };
-        for node_id in drained_nodes {
-            self.enqueue_eval("node_drain", None, None, Some(&node_id), None)?;
-            enqueued += 1;
-        }
-        for node_id in lost_nodes {
-            self.enqueue_eval("node_lost_reschedule", None, None, Some(&node_id), None)?;
-            enqueued += 1;
-        }
+        // Both node fan-outs in one op. This is the storm path: an AZ loss
+        // is ~33% of a fleet, so `lost_nodes` alone was thousands of
+        // quorum rounds on the scheduler lane before a new leader could
+        // schedule anything.
+        let node_requests: Vec<EvalRequest> = drained_nodes
+            .iter()
+            .map(|node_id| (node_id, "node_drain"))
+            .chain(
+                lost_nodes
+                    .iter()
+                    .map(|node_id| (node_id, "node_lost_reschedule")),
+            )
+            .map(|(node_id, kind)| EvalRequest {
+                kind: kind.to_owned(),
+                job_id: None,
+                job_config_id: None,
+                node_id: Some(node_id.clone()),
+                priority: None,
+                delay: Duration::ZERO,
+            })
+            .collect();
+        enqueued += self.enqueue_evals(node_requests)?.len() as u64;
         Ok(enqueued)
     }
 
@@ -12941,6 +13155,39 @@ impl Store {
                 ),
             other => other,
         }
+    }
+
+    /// Enqueue many evals in ONE scheduler-lane op.
+    ///
+    /// Every enqueue used to be its own quorum round, which is what made
+    /// fan-out loops expensive rather than merely numerous: a leadership
+    /// change runs `regenerate_scheduling_evals` over every active job,
+    /// and a node-loss storm raises one per affected job config (phase 2
+    /// measured 5,760 reschedule evals against 2,503 submissions). The
+    /// rows are independent, so batching them changes only how many times
+    /// quorum is paid.
+    ///
+    /// Returns the created evals in request order. An empty request list
+    /// proposes nothing.
+    pub fn enqueue_evals(&self, requests: Vec<EvalRequest>) -> R<Vec<Eval>> {
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.replicated(Lane::Scheduler, "enqueue_evals", move |s| {
+            requests
+                .iter()
+                .map(|request| {
+                    s.enqueue_eval_after_delay_apply(
+                        &request.kind,
+                        request.job_id.as_deref(),
+                        request.job_config_id.as_deref(),
+                        request.node_id.as_deref(),
+                        request.priority,
+                        request.delay,
+                    )
+                })
+                .collect()
+        })
     }
 
     pub(crate) fn enqueue_eval_after_delay_local(

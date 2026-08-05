@@ -5,7 +5,7 @@ use crate::manager::server::ManagerDaemonService;
 use crate::manager::workload_identity::WorkloadIdentityState;
 use crate::storage::events::drafts;
 use crate::storage::persistence::PersistenceRole;
-use crate::storage::store::Store;
+use crate::storage::store::{EvalCompletion, Store};
 use crate::structs::{
     manager_server::ManagerServer, Eval, JobConfig, KvValueType, ManagerConfig, NodeMsg,
     Submission, TaskConfig, TlsConfigFull, WorkerConfig as WorkerConfigMsg, WorkerConfigAlt,
@@ -1625,6 +1625,11 @@ async fn eval_worker_loop(store: Store, notifier: Arc<Notify>, worker_id: usize)
 
     let mut error_backoff = ERROR_BACKOFF_MIN;
     let mut was_leader = true;
+    // The eval handed back by the previous iteration's fused
+    // complete-and-claim. Carrying it here is what removes one
+    // scheduler-lane raft round per eval: the round that finished the last
+    // eval also claimed this one.
+    let mut claimed_ahead: Option<Eval> = None;
     loop {
         // Leader-only scheduling (raft mode, JC-41): the eval queue is
         // REPLICATED — followers hold every eval row but never ACT on the
@@ -1634,7 +1639,14 @@ async fn eval_worker_loop(store: Store, notifier: Arc<Notify>, worker_id: usize)
         // which point they inherit the real pending queue (the acquisition
         // hook below only reconciles). Non-raft backends always report
         // leadership here.
-        if !store.is_raft_leader(crate::storage::Lane::Scheduler) {
+        // An eval already claimed by the previous iteration's fused write
+        // is handled before anything else, including the leadership gate:
+        // we held leadership when it was claimed, and dropping it here
+        // would leave the row `in_flight` for `requeue_in_flight_evals` to
+        // rescue later. If leadership really has moved, the terminal write
+        // fails with `NotRaftLeader` and lands in the error path below,
+        // which is the same recovery the unfused loop had.
+        if claimed_ahead.is_none() && !store.is_raft_leader(crate::storage::Lane::Scheduler) {
             if was_leader {
                 info!(
                     worker_id,
@@ -1650,7 +1662,11 @@ async fn eval_worker_loop(store: Store, notifier: Arc<Notify>, worker_id: usize)
             was_leader = true;
         }
         let claim_started = std::time::Instant::now();
-        match store.claim_eval() {
+        let claimed = match claimed_ahead.take() {
+            Some(eval) => Ok(Some(eval)),
+            None => store.claim_eval(),
+        };
+        match claimed {
             Ok(Some(eval)) => {
                 error_backoff = ERROR_BACKOFF_MIN;
                 info!(
@@ -1668,12 +1684,37 @@ async fn eval_worker_loop(store: Store, notifier: Arc<Notify>, worker_id: usize)
                 // tokio runtime worker; awaiting the handle keeps this
                 // worker's one-eval-at-a-time ordering.
                 let store_for_handler = store.clone();
-                if let Err(join_error) = tokio::task::spawn_blocking(move || {
-                    handle_claimed_eval(&store_for_handler, worker_id, &eval)
+                let eval_for_handler = eval.clone();
+                match tokio::task::spawn_blocking(move || {
+                    resolve_claimed_eval(&store_for_handler, worker_id, &eval_for_handler)
                 })
                 .await
                 {
-                    error!(worker_id, "Eval handler task failed: {join_error:?}");
+                    // One scheduler-lane round finishes this eval and
+                    // claims the next, instead of one round each.
+                    Ok(completion) => match store.complete_and_claim_next(&eval.id, completion) {
+                        Ok(next) => {
+                            claimed_ahead = next;
+                            error_backoff = ERROR_BACKOFF_MIN;
+                        }
+                        Err(e) => {
+                            error!(
+                                worker_id,
+                                eval_id = %eval.id,
+                                "Error writing eval outcome and claiming next: {:?}", e
+                            );
+                            tokio::time::sleep(error_backoff).await;
+                            error_backoff = std::cmp::min(error_backoff * 2, ERROR_BACKOFF_MAX);
+                        }
+                    },
+                    // The handler panicked or was cancelled. Its outcome is
+                    // unknown, so write nothing: the row stays `in_flight`
+                    // and `requeue_in_flight_evals` recovers it, rather
+                    // than this loop inventing a completion for work it did
+                    // not observe finish.
+                    Err(join_error) => {
+                        error!(worker_id, "Eval handler task failed: {join_error:?}");
+                    }
                 }
             }
             Ok(None) => {
@@ -2254,7 +2295,29 @@ fn not_leader_retry_delay(eval_id: &str) -> Duration {
 /// for retry on foreign-lane rejections and plan-conflict exhaustion, fail
 /// terminally otherwise. Public so integration tests (the plan-contention
 /// harness) can drive the real worker logic, requeue backstop included.
+/// Handle a claimed eval and write its outcome immediately, as its own
+/// scheduler-lane op.
+///
+/// The eval worker loop uses [`resolve_claimed_eval`] instead, so it can
+/// fuse this write with the next claim. This wrapper stays for callers
+/// that handle a single eval outside the loop (tests, and any one-shot
+/// path), where there is no following claim to fuse with.
 pub fn handle_claimed_eval(store: &Store, worker_id: usize, eval: &Eval) {
+    let completion = resolve_claimed_eval(store, worker_id, eval);
+    if let Err(e) = store.apply_eval_completion_standalone(&eval.id, completion) {
+        error!(worker_id, "Error writing eval {} outcome: {:?}", eval.id, e);
+    }
+}
+
+/// Run a claimed eval and decide how it should be written back, WITHOUT
+/// writing it.
+///
+/// Splitting the decision from the write is what lets the caller fuse the
+/// terminal write with the next claim into one scheduler-lane round
+/// (`Store::complete_and_claim_next`). The AWS phase-3 campaign measured
+/// the scheduler lane, not the planner, as the throughput ceiling, and
+/// claim+complete were two of the ~4 rounds every eval spent there.
+pub fn resolve_claimed_eval(store: &Store, worker_id: usize, eval: &Eval) -> EvalCompletion {
     let started = std::time::Instant::now();
     info!(
         worker_id,
@@ -2276,9 +2339,9 @@ pub fn handle_claimed_eval(store: &Store, worker_id: usize, eval: &Eval) {
                 "Eval {} handled successfully: {}", eval.id, message
             );
             clear_not_leader_attempts(&eval.id);
-            let completed = drafts::eval_completed(eval, &message, started.elapsed());
-            if let Err(e) = store.complete_eval_with_event(&eval.id, true, completed) {
-                error!(worker_id, "Error completing eval {}: {:?}", eval.id, e);
+            EvalCompletion::Finished {
+                succeeded: true,
+                event: drafts::eval_completed(eval, &message, started.elapsed()),
             }
         }
         // A NotRaftLeader rejection means a cross-lane half of the eval's
@@ -2296,11 +2359,9 @@ pub fn handle_claimed_eval(store: &Store, worker_id: usize, eval: &Eval) {
                 retry_delay_ms = retry_delay.as_millis() as u64,
                 "Eval hit a foreign-lane leader rejection; releasing for retry: {e:#}"
             );
-            if let Err(release_err) = store.release_eval_for_retry(&eval.id, retry_delay) {
-                error!(
-                    worker_id,
-                    "Error releasing eval {} for retry: {:?}", eval.id, release_err
-                );
+            EvalCompletion::Released {
+                delay: retry_delay,
+                event: None,
             }
         }
         // Plan-conflict exhaustion is transient by definition: the plan lost
@@ -2323,27 +2384,17 @@ pub fn handle_claimed_eval(store: &Store, worker_id: usize, eval: &Eval) {
             crate::manager::telemetry::metrics()
                 .eval_conflict_requeues_total
                 .inc();
-            let requeued = drafts::eval_requeued(eval, &e, delay);
-            if let Err(release_err) =
-                store.release_eval_for_retry_with_event(&eval.id, delay, requeued)
-            {
-                error!(
-                    worker_id,
-                    "Error requeueing eval {} after plan conflict: {:?}", eval.id, release_err
-                );
+            EvalCompletion::Released {
+                delay,
+                event: Some(drafts::eval_requeued(eval, &e, delay)),
             }
         }
         Err(e) => {
             error!(worker_id, eval_id = %eval.id, elapsed_ms = started.elapsed().as_millis() as u64, "Error handling eval {}: {:?}", eval.id, e);
             clear_not_leader_attempts(&eval.id);
-            let failed = drafts::eval_failed(eval, &e, started.elapsed());
-            if let Err(complete_err) = store.complete_eval_with_event(&eval.id, false, failed) {
-                error!(
-                    worker_id,
-                    "Error marking eval {} as failed after handling error: {:?}",
-                    eval.id,
-                    complete_err
-                );
+            EvalCompletion::Finished {
+                succeeded: false,
+                event: drafts::eval_failed(eval, &e, started.elapsed()),
             }
         }
     }

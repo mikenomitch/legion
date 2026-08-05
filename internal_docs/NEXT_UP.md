@@ -1,89 +1,102 @@
 # Next Up: Current Focus
 
-**The scheduler's limit is plan-apply conflicts, and we now know it.**
-Second AWS night, 2026-08-04
-([findings](aws-phase2-findings.md)) — the campaign produced no
-publishable benchmark, which was not its purpose. It produced a
-diagnosis.
+**Plan-apply conflicts are fixed, and they were not the ceiling.** Third
+AWS session, 2026-08-04 ([findings](aws-phase3-findings.md)), campaign
+`20260804-1506-legion-a`.
 
-Three quarters of all planning work is computed and thrown away
-(`plan_apply_total` 4974 applied against 14382 rejected), and the
-rejection rate climbs with both concurrency and cluster size: 15.9% at 4
-eval threads / 1000 nodes, 31.9% through 5000, **73.6%** at 16 threads.
-Throughput inverts as a result — 4→16 eval threads *cost* 12% throughput
-while CPU went 29%→85% — and collapses 4x from 1k to 5k nodes while p99
-goes 3.8s → 177s.
+Two clean cells against `8e90745` (the #189 merge), each on a freshly
+reset control plane with an exact node census:
 
-The cause is specific. `decouple_plan_components`
-(`src/manager/scheduler.rs:2158`) collapses every multi-placement plan to
-a **single candidate per placement**, so late binding is structurally off
-for exactly the workloads it was built for. Then the apply walk rejects
-on a node-epoch mismatch before re-deriving fit — even though the same
-transaction already re-derives capacity, constraints, ports and distinct
-keys against committed state. "Stale" means only "the epoch moved", never
-"it no longer fits".
+| | phase 2 | phase 3 | change |
+| --- | --- | --- | --- |
+| plan-apply rejected | 31.9% | **0%** | eliminated |
+| throughput @5,000 nodes | 86.6/s | 80.35/s | -7% |
+| p99 @5,000 nodes | 177.1 s | 103.4 s | **-42%** |
+| plan time/eval @5,000 | 65.18 ms | 41.42 ms | **-36%** |
 
-Two design agents reached that independently, and a two-parameter model
-of it reproduces all three measured rejection rates.
+Across 30,006 placements the `rejected` counter was never incremented
+once, conflict requeues were zero, and every placement bound on the first
+pass. **Per-eval planning cost fell by a third and throughput did not
+move.** The win landed entirely in latency, which is what removing
+retries looks like.
 
-## In flight right now
+So the ceiling is elsewhere. At 41.42 ms/eval and 4 eval threads the
+planner could clear ~580 alloc/sec; we measured 80. `apply` — which
+contains the raft commit — is **67% of plan time**, and the residual gap
+points at the scheduler lane's serialized commit pipeline.
 
-1. **Plan-apply conflict reduction** —
-   [plan](plans/plan-apply-conflict-reduction-plan.md). Two-pass bind
-   (epoch becomes a ranking hint, not a gate), candidate lists restored,
-   decorrelated tail sampling. Target: rejection under 5%, and throughput
-   that *rises* with eval threads instead of falling.
-2. **Adaptive scheduler concurrency** —
-   [plan](plans/adaptive-scheduler-concurrency-plan.md), `PLANNED`.
-   Congestion control for scheduler parallelism, so an operator never has
-   to guess `evalThreads`. Deliberately gated behind (1): its Phase 0 is a
-   measurement that decides whether the rest gets built at all.
-3. **Eval-path raft cost.** ~6 replicated scheduler-lane ops per eval,
-   and the lane's single `pipeline_loop` thread was ~100% busy
-   (67,165 ops x ~3ms ≈ the 206s of measured `pipeline_wait`). Claim
-   fuses with complete; enqueues batch; allocation removal folds into the
-   apply. Target ≤ 2.5 ops/eval.
-4. **Node-loss storm.** 5760 reschedule evals against 2503 submits, and a
-   submit could not overtake the backlog because both sit at default
-   priority 50 with a FIFO tie-break. Also: lost nodes with *zero*
-   allocations still cost a full enqueue→claim→no-op→complete cycle, and
-   `reschedule_allocations_for_lost_node` reconciles once per lost node
-   per job config — O(lost x configs). Not rig-only: an AZ loss is ~33%
-   of a fleet, under the mass-disruption breaker, so the storm fires
-   unsuppressed.
-5. **Diagnosis tooling and the operator runbook** —
-   [plan](plans/scheduler-diagnosis-tooling-plan.md). Tonight's diagnosis
-   took hours because the signals were scattered and several lied. A
-   `legion scheduler diagnose` plus symptom-first guidance, so the next
-   person starts from "throughput dropped when I scaled up" rather than
-   from a metric name.
-6. **The rig itself** — every cell of the first campaign was invalid for
-   a different reason. All fixed; see the findings doc and calls entries
-   21-25.
+## Do this first, next session
+
+1. **Cut the raft round-trips per eval.** This is now the top item —
+   the measurement says the ceiling is the replicated write path. In
+   order: (a) fuse `claim_eval` + `complete_eval_with_event` into
+   `complete_and_claim_next`; (b) add a batched enqueue API. Details and
+   the per-eval op map are in
+   [aws-phase3-findings.md](aws-phase3-findings.md). Target <= 2.5
+   ops/eval.
+2. **Fix the warmup defect, then re-run the 1,000-node cell.**
+   `run-campaign.sh` defaults `WARMUP=30`, which is longer than a 1k cell
+   takes: tonight's placed 5,004/5,004 and reported `throughput 0.0`
+   because every placement fell inside the warmup. Phase 3 therefore has
+   **no 1,000-node throughput number**.
+3. **Run the 16-eval-thread rows** — one command now
+   (`--eval-threads 16`). Phase 2's headline was that more threads *cost*
+   throughput because planners collided; conflicts are now zero, so this
+   should invert. Untested.
+4. **Then the saturation sweep** — max throughput above 5,000 nodes /
+   5 allocations per node is still unmeasured. Use `dense_fleet`:
+   `run-campaign.sh --system legion-a --scenarios dense_fleet
+   --steps "5000" --allocs-per-node-sweep "5 10 20 40 80"`.
+
+The rig is ready and the bootstrap is the expensive part (~55 min from
+nothing to a running cell, most of it an LTO `dist` build). **Budget for
+it, or leave the operator box stopped rather than destroyed** — it is
+~$0.016/hr stopped and holds the terraform state.
+
+## Also shipped this session, unmeasured
+
+- **Rollout retirement is batched.** `rollout.rs` looped
+  `remove_allocation_by_id_because`, one raft quorum round per
+  allocation; a step retiring 25% of a 10,000-allocation job cost 2,500
+  sequential rounds. Now one `remove_allocations` call.
+- **The rig can now measure saturation honestly.** The driver had a flat
+  600s settle timeout regardless of cell size, which would have reported
+  every large sweep point as "stopped converging" for arithmetic reasons.
+  It now separates a size-independent stall timeout from a derived cap
+  and records which fired (`outcome` in `metrics.json`).
 
 ## Known open questions
 
-- **`task_fetch` grew 33x** (0.29ms → 9.64ms per eval, 1k → 5k nodes)
-  and nothing explains it yet. Its queries are all scoped by
-  `job_config_id`, the indexes exist, and SQLite is in WAL mode. The
-  standing hypothesis is contention on the read-model lock, taken more
-  than once per eval. **Unverified** — and in a later 16-thread run it
-  was only 0.92ms, so the effect is load-shaped rather than size-shaped.
-- **Does `build_plan` stay flat at 10k+?** It was 1.72ms at 1k, and
-  `available_nodes` costs 0.03ms with the index handing over a bounded
-  33-64 candidates regardless of fleet size. That *suggests* placement
-  cost is independent of fleet size, which is the whole scale claim — but
-  it has never been measured above 5k.
-- **Is there a node-deregistration story?** `Store::remove_node` is
-  implemented, correct and tested, with no RPC, no CLI verb and no
-  caller. Operators decommissioning hardware hit the same wall the rig
-  did.
+- **Why is `apply` 27.9 ms/eval?** It is 67% of plan time and it contains
+  the raft commit, but the arithmetic still does not close: 41.42 ms/eval
+  across 4 eval threads permits ~580 alloc/sec and we measured 80. Either
+  evals are far more serialized than 4-way (the scheduler lane's single
+  `pipeline_loop` thread is the suspect — phase 2 measured 3.07 ms of
+  `pipeline_wait` per op over 67,165 ops) or `apply` itself blocks. Get
+  `legion_store_write_lock_wait_seconds` and the lane pipeline metrics
+  into the next campaign's collection.
+- **A read-pool hypothesis was raised and refuted this session.** The
+  manager had two SQLite read connections with no steal-on-contention,
+  and `task_fetch` grew 107x between 1k and 5k in the phase-2 archives —
+  which looked like the ceiling. But tonight's 5k cell measured
+  `task_fetch` at **0.65 ms on the unmodified binary**. Read-pool
+  queueing was *coupled to the conflict rate* (every rejected plan
+  retries and re-runs the phases), not driven by fleet size. The pool fix
+  is still in the branch and still correct, but it is no longer a
+  priority. Its `legion_store_read_lock_wait_seconds` is worth keeping
+  regardless: read-connection wait had no metric at all, which is why
+  this took two campaigns to notice.
+- **Does `build_plan` scale with fleet size?** 7.90 ms/eval at 5k this
+  session against 9.82 ms in phase 2, so it did not improve much when
+  conflicts went to zero. Still unexplained against a bounded 33-64
+  candidate list.
+- **Is there a node-deregistration story?** Still no. `Store::remove_node`
+  is implemented, correct, tested, and has no caller. Every campaign
+  works around it with a control-plane reset.
 
 ## Before the next campaign
 
-The rig is ready (fleet shaped per scenario, exact-census gate, per-cell
-teardown, cadence evidence per cell, allocation sweeps in one command).
-The binary is not, until (1) lands. Re-run the five-row table in the
-findings doc first — it is the regression test for every change above.
+Nothing to prepare — the rig changes are in the tree and `dense_fleet` is
+SLO-gated. Bring up, then go straight to (1).
 
 Higher-level backlog: [TODO.md](TODO.md).

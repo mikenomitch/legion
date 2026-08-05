@@ -6,9 +6,38 @@
 #
 # Order: cp-0 bootstraps, then a raft join token minted on cp-0 enrolls
 # cp-1 and cp-2. Exit: all three /readyz and 3 voters on every lane.
+#
+#   install-legion-a.sh [--eval-threads N]
 set -euo pipefail
 source "$(dirname "$0")/env.sh"
 load_rig
+
+# Scheduler eval concurrency, the axis phase 2 measured the wrong way
+# round (see the comment in configs/legion/manager-a.ncl.tpl). Read from
+# the environment as well as the flag because run-campaign.sh reinstalls
+# the control plane through reset-control-plane.sh, which does not — and
+# should not have to — know every installer's options.
+EVAL_THREADS="${LEGION_EVAL_THREADS:-4}"
+while [ $# -gt 0 ]; do
+    case "$1" in
+    --eval-threads)
+        EVAL_THREADS="$2"
+        shift 2
+        ;;
+    *)
+        echo "unknown arg $1" >&2
+        exit 1
+        ;;
+    esac
+done
+case "$EVAL_THREADS" in
+'' | *[!0-9]*)
+    echo "--eval-threads must be a positive integer, got '$EVAL_THREADS'" >&2
+    exit 1
+    ;;
+esac
+
+log "installing legion-a (lanes topology, 3 voters, evalThreads=$EVAL_THREADS)"
 
 "$(dirname "$0")/wipe-control-plane.sh"
 
@@ -20,7 +49,8 @@ render_config() { # render_config <node-idx> <bootstrap> <join-token-line>
         CP0_IP="${CP_PRIVATE_IPS[0]}" \
         CP1_IP="${CP_PRIVATE_IPS[1]}" \
         CP2_IP="${CP_PRIVATE_IPS[2]}" \
-        render_tpl NODE_ID BOOTSTRAP JOIN_TOKEN_LINE PRIVATE_IP CP0_IP CP1_IP CP2_IP \
+        EVAL_THREADS="$EVAL_THREADS" \
+        render_tpl NODE_ID BOOTSTRAP JOIN_TOKEN_LINE PRIVATE_IP CP0_IP CP1_IP CP2_IP EVAL_THREADS \
         <"$AWS_BENCH_ROOT/configs/legion/manager-a.ncl.tpl"
 }
 

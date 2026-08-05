@@ -8093,7 +8093,15 @@ fn build_desired_allocations(
             .entry(allocation.job_config_id.clone())
             .or_default();
         if tasks.is_empty() {
-            let task_configs = store.get_task_configs_for_job_config(&allocation.job_config_id)?;
+            // The cached accessor, deliberately: this runs once per
+            // distinct job config per node per heartbeat, so on a 5,000-node
+            // fleet at a 2s cadence it was ~10k read-connection acquisitions
+            // per second for rows the read model already holds. Task configs
+            // are immutable per `job_config_id` — a change mints a new
+            // config id — which is why the scheduler already reads them this
+            // way and why the cache needs no invalidation.
+            let task_configs =
+                store.cached_task_configs_for_job_config(&allocation.job_config_id)?;
             for (id, config) in task_configs {
                 tasks.insert(id, config);
             }
