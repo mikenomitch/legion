@@ -33,12 +33,20 @@ that 41 ms:
 | round | inside plan timing? |
 | --- | --- |
 | `claim_eval` (scheduler) | no |
-| plan-apply (scheduler) | yes — the 27.9 ms `apply` phase |
-| `update_task_statuses_for_allocations` (status) | no |
+| plan-apply (scheduler) | yes — part of the 27.9 ms `apply` phase |
+| `update_task_statuses_for_allocations` (status) | **yes — also inside `apply`** |
 | `complete_eval_with_event` (scheduler) | no |
 
-Three to four rounds per eval are unmeasured, with ~257 ms to account
-for — roughly 64-85 ms each. A raft commit on instance NVMe inside one AZ
+**Correction (2026-08-04, from a code audit after this plan was first
+written):** the status-lane projection *is* inside the timed region.
+`submit_and_apply_plan_coalesced` calls `plan_apply_bookkeeping` before
+returning, and `run_apply_bookkeeping` (`store.rs:3301`) issues a
+status-lane `replicated()` whenever anything was placed — which is every
+applied plan. So `apply_us` contains **two full quorum rounds on two
+different raft groups**, each with its own single-threaded pipeline. That
+makes `apply` the densest thing on the eval path, and it means the
+unmeasured remainder outside the plan phases is two rounds
+(`claim`/`complete`), not three or four. A raft commit on instance NVMe inside one AZ
 should be 1-3 ms, so those rounds are not committing slowly, they are
 **queueing**: each lane drains through a single `pipeline_loop` thread
 (`src/storage/raft/driver.rs`), and phase 2 measured 3.07 ms of

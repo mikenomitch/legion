@@ -96,6 +96,22 @@ snapshot raft_propose_apply_mean 'sum by (lane) (rate(legion_raft_propose_apply_
 snapshot store_write_lock_wait_p99 'histogram_quantile(0.99, sum by (le) (rate(legion_store_write_lock_wait_seconds_bucket[1m])))'
 snapshot store_read_lock_wait_p99 'histogram_quantile(0.99, sum by (le) (rate(legion_store_read_lock_wait_seconds_bucket[1m])))'
 snapshot evals_processed 'sum by (kind, outcome) (legion_evals_processed_total)'
+# The group commit, which is the difference between paying plan-apply cost
+# per plan and per batch. It only engages when a second eval thread reaches
+# the coalescer while a commit is in flight, so the expected batch size is
+# ~1 + (arrival rate x commit time) -- about 1.25 at 4 eval threads, i.e.
+# effectively off. Read batch_size against evalThreads: if the mean is
+# pinned near 1, the batching knob (plan_apply_batch_max, default 16) is
+# irrelevant and concurrency is what has to rise.
+snapshot coalesce_batch_size_mean 'sum by (path) (rate(legion_store_coalesce_batch_size_sum[1m])) / sum by (path) (rate(legion_store_coalesce_batch_size_count[1m]))'
+snapshot coalesce_batch_size_p99 'histogram_quantile(0.99, sum by (path, le) (rate(legion_store_coalesce_batch_size_bucket[1m])))'
+snapshot coalesce_wait_mean 'sum by (path, role) (rate(legion_store_coalesce_wait_seconds_sum[1m])) / sum by (path, role) (rate(legion_store_coalesce_wait_seconds_count[1m]))'
+snapshot coalesce_commit_mean 'sum by (path) (rate(legion_store_coalesce_commit_seconds_sum[1m])) / sum by (path) (rate(legion_store_coalesce_commit_seconds_count[1m]))'
+# Local SQL inside the capture, separated from the quorum wait. capture is
+# pure CPU/page-cache (the capture opens and rolls back a savepoint, no
+# fsync), so apply_us minus capture minus pipeline_wait is what the raft
+# round actually costs.
+snapshot raft_capture_mean 'sum by (lane) (rate(legion_raft_capture_seconds_sum[1m])) / sum by (lane) (rate(legion_raft_capture_seconds_count[1m]))'
 snapshot heartbeats 'rate(legion_heartbeats_total[1m])'
 snapshot nodes 'legion_nodes'
 # Whether the fleet actually kept its cadence, archived per cell. Phase 1's
