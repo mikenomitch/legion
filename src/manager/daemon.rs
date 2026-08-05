@@ -5,7 +5,7 @@ use crate::manager::server::ManagerDaemonService;
 use crate::manager::workload_identity::WorkloadIdentityState;
 use crate::storage::events::drafts;
 use crate::storage::persistence::PersistenceRole;
-use crate::storage::store::{EvalCompletion, Store};
+use crate::storage::store::{EvalBatchLimits, EvalCompletion, Store};
 use crate::structs::{
     manager_server::ManagerServer, Eval, JobConfig, KvValueType, ManagerConfig, NodeMsg,
     Submission, TaskConfig, TlsConfigFull, WorkerConfig as WorkerConfigMsg, WorkerConfigAlt,
@@ -54,6 +54,19 @@ const EVAL_NOT_LEADER_RETRY_JITTER_MS: u64 = 1_000;
 // most. Retry across that window instead of failing manager startup.
 const STARTUP_WRITE_ATTEMPTS: usize = 20;
 const STARTUP_WRITE_RETRY_DELAY: Duration = Duration::from_millis(500);
+// Hard ceiling on how many evals one worker takes through claim → handle →
+// complete together (`Store::claim_evals`). The batch is really sized as a
+// fair share of the live queue depth, so this only binds on a deep queue;
+// it is deliberately NOT a config knob, because the useful value follows
+// queue depth and `evalThreads`, both of which the loop already knows.
+//
+// 16 is chosen against what a batch COSTS, not what it saves: a worker
+// holds its whole batch `in_flight` until the terminal write lands, so a
+// crash mid-batch re-runs up to this many already-handled evals (handlers
+// are idempotent convergence steps, so re-running is safe, just wasted).
+// Sixteen keeps that bounded while still dividing the lane's per-eval round
+// cost by an order of magnitude on a saturated queue.
+const MAX_EVAL_BATCH: usize = 16;
 
 #[instrument(err, skip_all)]
 pub async fn run_manager(config: ManagerConfig, run_worker: bool) -> R<()> {
@@ -1571,6 +1584,13 @@ async fn start_eval_loop(store: Store, max_threads: usize) -> R<()> {
         });
     }
 
+    // Every worker shares the queue, so each takes only its share of it —
+    // see `EvalBatchLimits`.
+    let batch_limits = EvalBatchLimits {
+        max: MAX_EVAL_BATCH,
+        workers: max_threads,
+    };
+
     let mut join_set = JoinSet::new();
     // Before the workers: once this is installed, plan applies hand their
     // task_status projection here instead of paying a status-lane quorum
@@ -1580,13 +1600,15 @@ async fn start_eval_loop(store: Store, max_threads: usize) -> R<()> {
         spawn_status_projection_drain(&mut join_set, &store, rx);
     }
     for worker_id in 0..max_threads {
-        spawn_eval_worker(&mut join_set, &store, worker_id);
+        spawn_eval_worker(&mut join_set, &store, worker_id, batch_limits);
     }
 
     let mut next_worker_id = max_threads;
     // Supervises workers forever: any worker exit/crash is immediately replaced.
     loop {
-        if !restart_eval_worker_after_exit(&mut join_set, &store, &mut next_worker_id).await {
+        if !restart_eval_worker_after_exit(&mut join_set, &store, &mut next_worker_id, batch_limits)
+            .await
+        {
             break;
         }
     }
@@ -1598,6 +1620,7 @@ async fn restart_eval_worker_after_exit(
     join_set: &mut JoinSet<()>,
     store: &Store,
     next_worker_id: &mut usize,
+    batch_limits: EvalBatchLimits,
 ) -> bool {
     match join_set.join_next().await {
         Some(Ok(())) => {
@@ -1615,7 +1638,7 @@ async fn restart_eval_worker_after_exit(
     let worker_id = *next_worker_id;
     *next_worker_id = next_worker_id.saturating_add(1);
     info!(worker_id, "Spawning replacement eval worker");
-    spawn_eval_worker(join_set, store, worker_id);
+    spawn_eval_worker(join_set, store, worker_id, batch_limits);
     true
 }
 
@@ -1663,24 +1686,55 @@ fn spawn_status_projection_drain(
     });
 }
 
-fn spawn_eval_worker(join_set: &mut JoinSet<()>, store: &Store, worker_id: usize) {
+fn spawn_eval_worker(
+    join_set: &mut JoinSet<()>,
+    store: &Store,
+    worker_id: usize,
+    batch_limits: EvalBatchLimits,
+) {
     // Each worker shares the same notifier. enqueue/requeue paths wake sleepers.
     let store_for_eval = store.clone();
     let notifier = store.eval_notifier();
 
-    join_set.spawn(async move { eval_worker_loop(store_for_eval, notifier, worker_id).await });
+    join_set.spawn(async move {
+        eval_worker_loop(store_for_eval, notifier, worker_id, batch_limits).await
+    });
 }
 
-async fn eval_worker_loop(store: Store, notifier: Arc<Notify>, worker_id: usize) {
+/// One eval worker: claim a batch, take every member of it through the
+/// handler, settle the batch and claim the next one — forever.
+///
+/// The loop works in BATCHES rather than single evals because every fixed
+/// cost in the cycle is paid per round, not per eval, and the 2026-08-05
+/// AWS campaign says that fixed cost is what is left: once the wake herd
+/// was fixed, the only real scheduler-lane quorum traffic was
+/// `complete_and_claim_next` at 44/s (against ~44 evals/s) plus ~20/s of
+/// plan applies. The amortization curve agrees from the other side — same
+/// 5,000-node cluster, same 16 eval threads, `web_fleet` (6 allocations per
+/// eval) sustained 219 alloc/s while `dense_fleet` (44 per eval) sustained
+/// 736. 7x the work per eval for 3.4x the throughput: throughput tracking
+/// work-per-eval rather than work is the signature of a per-eval cost
+/// dominating, so the lever is fewer cycles per eval.
+///
+/// What batching does NOT change: the evals in a batch are still handled
+/// strictly one at a time, in claim order, each applying its own plan in its
+/// own op. Only the queue's own bookkeeping — the claim round and the
+/// terminal-write round — is shared.
+async fn eval_worker_loop(
+    store: Store,
+    notifier: Arc<Notify>,
+    worker_id: usize,
+    batch_limits: EvalBatchLimits,
+) {
     info!(worker_id, "Eval worker started");
 
     let mut error_backoff = ERROR_BACKOFF_MIN;
     let mut was_leader = true;
-    // The eval handed back by the previous iteration's fused
-    // complete-and-claim. Carrying it here is what removes one
-    // scheduler-lane raft round per eval: the round that finished the last
-    // eval also claimed this one.
-    let mut claimed_ahead: Option<Eval> = None;
+    // The evals handed back by the previous iteration's fused
+    // complete-and-claim. Carrying them here is what removes the
+    // scheduler-lane rounds: the round that finished the last batch also
+    // claimed this one. Empty means "ask the queue".
+    let mut claimed_ahead: Vec<Eval> = Vec::new();
     loop {
         // Leader-only scheduling (raft mode, JC-41): the eval queue is
         // REPLICATED — followers hold every eval row but never ACT on the
@@ -1690,14 +1744,14 @@ async fn eval_worker_loop(store: Store, notifier: Arc<Notify>, worker_id: usize)
         // which point they inherit the real pending queue (the acquisition
         // hook below only reconciles). Non-raft backends always report
         // leadership here.
-        // An eval already claimed by the previous iteration's fused write
-        // is handled before anything else, including the leadership gate:
-        // we held leadership when it was claimed, and dropping it here
-        // would leave the row `in_flight` for `requeue_in_flight_evals` to
+        // Evals already claimed by the previous iteration's fused write
+        // are handled before anything else, including the leadership gate:
+        // we held leadership when they were claimed, and dropping them here
+        // would leave the rows `in_flight` for `requeue_in_flight_evals` to
         // rescue later. If leadership really has moved, the terminal write
         // fails with `NotRaftLeader` and lands in the error path below,
         // which is the same recovery the unfused loop had.
-        if claimed_ahead.is_none() && !store.is_raft_leader(crate::storage::Lane::Scheduler) {
+        if claimed_ahead.is_empty() && !store.is_raft_leader(crate::storage::Lane::Scheduler) {
             if was_leader {
                 info!(
                     worker_id,
@@ -1713,98 +1767,142 @@ async fn eval_worker_loop(store: Store, notifier: Arc<Notify>, worker_id: usize)
             was_leader = true;
         }
         let claim_started = std::time::Instant::now();
-        let carried_ahead = claimed_ahead.take();
-        let claimed = match carried_ahead.clone() {
-            Some(eval) => Ok(Some(eval)),
-            None => store.claim_eval(),
-        };
-        // A claim costs a scheduler-lane quorum round whether or not it finds
-        // work, so the empty share is the cost of waking a worker for nothing.
-        // Only a claim that actually hit the store counts: an eval carried
-        // over by `complete_and_claim_next` was already paid for.
-        if carried_ahead.is_none() {
-            crate::manager::telemetry::metrics()
-                .eval_claim_total
-                .inc(&[match &claimed {
-                    Ok(Some(_)) => "claimed",
-                    _ => "empty",
-                }]);
-        }
-        match claimed {
-            Ok(Some(eval)) => {
-                error_backoff = ERROR_BACKOFF_MIN;
-                info!(
-                    worker_id,
-                    eval_id = %eval.id,
-                    kind = %eval.kind,
-                    claim_eval_ms = claim_started.elapsed().as_millis() as u64,
-                    "Claimed eval for dispatch"
-                );
-                // Eval handling is synchronous end to end — SQLite writes,
-                // raft-proposal waits, and the plan-conflict retry loop's
-                // backoff sleeps (`plan_with_conflict_retries`), which can
-                // hold the thread for hundreds of milliseconds per retry.
-                // Run it on the blocking pool so those stalls never park a
-                // tokio runtime worker; awaiting the handle keeps this
-                // worker's one-eval-at-a-time ordering.
-                let store_for_handler = store.clone();
-                let eval_for_handler = eval.clone();
-                // Timed end to end because the plan-phase histograms only
-                // cover planning: an eval also dispatches its allocations and
-                // runs post-apply bookkeeping, and the difference between
-                // this and `plan_phase_seconds{phase="total"}` is the only
-                // way to see that half. Throughput is roughly `evalThreads`
-                // divided by this.
-                let handle_started = std::time::Instant::now();
-                let handled = tokio::task::spawn_blocking(move || {
-                    resolve_claimed_eval(&store_for_handler, worker_id, &eval_for_handler)
-                })
-                .await;
-                crate::manager::telemetry::metrics()
-                    .eval_handle_seconds
-                    .observe(&[&eval.kind], handle_started.elapsed().as_secs_f64());
-                match handled {
-                    // One scheduler-lane round finishes this eval and
-                    // claims the next, instead of one round each.
-                    Ok(completion) => match store.complete_and_claim_next(&eval.id, completion) {
-                        Ok(next) => {
-                            claimed_ahead = next;
-                            error_backoff = ERROR_BACKOFF_MIN;
-                        }
-                        Err(e) => {
-                            error!(
-                                worker_id,
-                                eval_id = %eval.id,
-                                "Error writing eval outcome and claiming next: {:?}", e
-                            );
-                            tokio::time::sleep(error_backoff).await;
-                            error_backoff = std::cmp::min(error_backoff * 2, ERROR_BACKOFF_MAX);
-                        }
-                    },
-                    // The handler panicked or was cancelled. Its outcome is
-                    // unknown, so write nothing: the row stays `in_flight`
-                    // and `requeue_in_flight_evals` recovers it, rather
-                    // than this loop inventing a completion for work it did
-                    // not observe finish.
-                    Err(join_error) => {
-                        error!(worker_id, "Eval handler task failed: {join_error:?}");
-                    }
+        // A batch carried over by the previous `complete_evals_and_claim_next`
+        // was already paid for by that round, so only a claim that actually
+        // hit the store is metered below.
+        let carried_ahead = !claimed_ahead.is_empty();
+        let batch = if carried_ahead {
+            std::mem::take(&mut claimed_ahead)
+        } else {
+            match store.claim_evals(batch_limits) {
+                Ok(batch) => batch,
+                Err(e) => {
+                    error!(
+                        worker_id,
+                        claim_eval_ms = claim_started.elapsed().as_millis() as u64,
+                        "Error claiming next eval batch: {:?}",
+                        e
+                    );
+                    tokio::time::sleep(error_backoff).await;
+                    error_backoff = std::cmp::min(error_backoff * 2, ERROR_BACKOFF_MAX);
+                    continue;
                 }
             }
-            Ok(None) => {
-                debug!(
+        };
+        // A claim costs a scheduler-lane quorum ROUND whether or not it
+        // finds work, so the empty share is the cost of waking a worker for
+        // nothing — the thundering-herd signal this counter exists for.
+        // Batching does not change what a tick means here: it is still one
+        // round, so `claimed` counts rounds that found work rather than
+        // evals. That is deliberate — dividing `evals_processed_total` by
+        // this counter is exactly the evals-per-round ratio batching is
+        // meant to raise, and there is no other way to see it.
+        if !carried_ahead {
+            crate::manager::telemetry::metrics()
+                .eval_claim_total
+                .inc(&[if batch.is_empty() { "empty" } else { "claimed" }]);
+        }
+
+        if batch.is_empty() {
+            debug!(
+                worker_id,
+                claim_eval_ms = claim_started.elapsed().as_millis() as u64,
+                "No eval claimed; worker entering wait path"
+            );
+            // Queue is empty (or only delayed work exists), so park until notified or due.
+            wait_for_next_eval(&store, &notifier, worker_id).await;
+            continue;
+        }
+
+        error_backoff = ERROR_BACKOFF_MIN;
+        info!(
+            worker_id,
+            batch_size = batch.len(),
+            claim_eval_ms = claim_started.elapsed().as_millis() as u64,
+            "Claimed eval batch for dispatch"
+        );
+
+        // Outcomes we ACTUALLY OBSERVED, one entry per eval. An eval whose
+        // handler panicked, or that leadership loss stopped us reaching, is
+        // deliberately absent: `complete_evals_and_claim_next` settles only
+        // what is listed, so an unobserved eval stays `in_flight` for
+        // `requeue_in_flight_evals` to recover instead of having an outcome
+        // invented for it. That is the per-eval isolation the single-eval
+        // loop had, preserved across the batch — one member failing neither
+        // completes its siblings nor completes itself.
+        let mut completions: Vec<(String, EvalCompletion)> = Vec::with_capacity(batch.len());
+        for (index, eval) in batch.iter().enumerate() {
+            // Stop the batch the moment this node stops leading the lane.
+            // Everything from here on would fail its own writes anyway, and
+            // the terminal write below cannot land either — abandoning the
+            // remainder to in-flight recovery is both cheaper and the only
+            // outcome that cannot half-apply a batch across a leadership
+            // change. Skipped for the first eval, which keeps the carried
+            // batch's "we held leadership when we claimed it" contract.
+            if index > 0 && !store.is_raft_leader(crate::storage::Lane::Scheduler) {
+                warn!(
                     worker_id,
-                    claim_eval_ms = claim_started.elapsed().as_millis() as u64,
-                    "No eval claimed; worker entering wait path"
+                    abandoned = batch.len() - index,
+                    "Lost scheduler-lane leadership mid-batch; leaving the rest in flight"
                 );
-                // Queue is empty (or only delayed work exists), so park until notified or due.
-                wait_for_next_eval(&store, &notifier, worker_id).await;
+                break;
+            }
+            // Eval handling is synchronous end to end — SQLite writes,
+            // raft-proposal waits, and the plan-conflict retry loop's
+            // backoff sleeps (`plan_with_conflict_retries`), which can
+            // hold the thread for hundreds of milliseconds per retry.
+            // Run it on the blocking pool so those stalls never park a
+            // tokio runtime worker; awaiting the handle keeps this
+            // worker's one-eval-at-a-time ordering, batch or not.
+            let store_for_handler = store.clone();
+            let eval_for_handler = eval.clone();
+            // Timed end to end because the plan-phase histograms only
+            // cover planning: an eval also dispatches its allocations and
+            // runs post-apply bookkeeping, and the difference between
+            // this and `plan_phase_seconds{phase="total"}` is the only
+            // way to see that half. Still PER EVAL under batching — the
+            // handlers run one at a time, so a per-batch timer would blur
+            // kinds together and make the histogram unreadable.
+            let handle_started = std::time::Instant::now();
+            let handled = tokio::task::spawn_blocking(move || {
+                resolve_claimed_eval(&store_for_handler, worker_id, &eval_for_handler)
+            })
+            .await;
+            crate::manager::telemetry::metrics()
+                .eval_handle_seconds
+                .observe(&[&eval.kind], handle_started.elapsed().as_secs_f64());
+            match handled {
+                Ok(completion) => completions.push((eval.id.clone(), completion)),
+                // The handler panicked or was cancelled. Its outcome is
+                // unknown, so record nothing for it and CARRY ON with the
+                // rest of the batch: its siblings' outcomes are known and
+                // must not be thrown away because this one is not.
+                Err(join_error) => {
+                    error!(
+                        worker_id,
+                        eval_id = %eval.id,
+                        "Eval handler task failed: {join_error:?}"
+                    );
+                }
+            }
+        }
+
+        // One scheduler-lane round settles the whole batch and claims the
+        // next one, instead of two rounds per eval.
+        let settled = completions.len();
+        match store.complete_evals_and_claim_next(completions, batch_limits) {
+            Ok(next) => {
+                claimed_ahead = next;
+                error_backoff = ERROR_BACKOFF_MIN;
             }
             Err(e) => {
+                // Nothing was written — the op is one changeset — so every
+                // member of the batch is still `in_flight` and recoverable.
                 error!(
                     worker_id,
-                    claim_eval_ms = claim_started.elapsed().as_millis() as u64,
-                    "Error claiming next eval: {:?}",
+                    batch_size = batch.len(),
+                    settled,
+                    "Error writing eval batch outcomes and claiming next: {:?}",
                     e
                 );
                 tokio::time::sleep(error_backoff).await;
@@ -2266,8 +2364,16 @@ mod tests {
         let mut next_worker_id = 1;
 
         join_set.spawn(async {});
-        let restarted =
-            restart_eval_worker_after_exit(&mut join_set, &store, &mut next_worker_id).await;
+        let restarted = restart_eval_worker_after_exit(
+            &mut join_set,
+            &store,
+            &mut next_worker_id,
+            EvalBatchLimits {
+                max: MAX_EVAL_BATCH,
+                workers: 1,
+            },
+        )
+        .await;
 
         assert!(restarted);
         assert_eq!(next_worker_id, 2);

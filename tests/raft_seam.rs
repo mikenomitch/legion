@@ -103,7 +103,9 @@ const CLASSIFIED_MUTATIONS: &[&str] = &[
     // rollout/rollout_event mutation.
     "append_rollout_event",
     "claim_eval",
+    "claim_evals",
     "complete_and_claim_next",
+    "complete_evals_and_claim_next",
     "complete_eval",
     "complete_eval_with_event",
     "enqueue_eval_after_delay",
@@ -204,6 +206,12 @@ const DELEGATED_BODIES: &[&str] = &[
     // `claim_eval_apply`. Nested `replicated` calls short-circuit inside a
     // capture, so the pair lands in one changeset.
     "complete_and_claim_next",
+    // The batched form of the above: its closure loops
+    // `apply_eval_completion` over the batch and then calls
+    // `claim_evals_apply`, so every terminal write and the following claim
+    // land in one changeset. Batching divides the lane's fixed per-eval
+    // round cost by the batch size.
+    "complete_evals_and_claim_next",
     "complete_eval",
     "complete_eval_with_event",
     // Serializes its candidate placements in the closure and shares
@@ -296,7 +304,9 @@ fn lane_for(method: &str) -> Lane {
         "append_rollout_event"
         | "apply_allocation_plan"
         | "claim_eval"
+        | "claim_evals"
         | "complete_and_claim_next"
+        | "complete_evals_and_claim_next"
         | "complete_eval"
         | "complete_eval_with_event"
         | "enqueue_eval_after_delay"

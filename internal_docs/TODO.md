@@ -92,6 +92,39 @@ How to use it:
       amortization curve says the same thing from the other side: 6
       allocations per eval gives 219 alloc/sec, 44 gives 736, so per-eval
       overhead is what sets the rate.
+    - [x] **claim N and complete N are done** — phase 4 of
+          [eval-path-raft-cost-plan.md](plans/eval-path-raft-cost-plan.md),
+          documented in
+          [scheduler-and-eval-loop.md](../docs/scheduler-and-eval-loop.md#batching).
+          `Store::claim_evals` takes a batch in one round and
+          `Store::complete_evals_and_claim_next` settles the batch while
+          claiming the next, so the 44/s `complete_and_claim_next` traffic
+          becomes 44/N. The batch is a fair share of the live queue
+          (`pending / evalThreads`, capped at 16), never lingers to fill,
+          and has no config knob. **Unverified at scale**, see below.
+    - [ ] **plan N and apply N are NOT done, and were declined on purpose.**
+          Handlers write as they go across lanes rather than returning a
+          plan, so committing N plans together means restructuring every
+          handler to be a pure function of a snapshot — a scheduler rewrite,
+          not a loop change ([call 2](calls/eval-path-raft-cost-plan_calls.md)).
+          It also overlaps the D5 group commit in `coalesce.rs`, which
+          already batches *concurrent* applies and gets *more* to batch as
+          the claim/complete rounds get cheaper. This is the same target as
+          "the plan-apply commit is serialized" in
+          [aws-phase4-findings.md](aws-phase4-findings.md) (`apply` at 354 ms
+          of a 381 ms total at 100,000 allocations) and should be costed out
+          against that, not against the eval loop.
+    - [ ] **Re-measure with batching on.** Rerun cells G/H from
+          [aws-phase4-findings.md](aws-phase4-findings.md). Expect
+          `legion_raft_ops_total{op="complete_evals_and_claim_next"}` well
+          below the eval rate (it was 44/s at 44 evals/s), and the 3.4x
+          `web_fleet` / `dense_fleet` gap to narrow. Divide that op's rate by
+          `legion_evals_processed_total` for evals-per-round; if it stays at
+          1, the queue never gets deeper than `evalThreads` and the
+          bottleneck is upstream of the eval loop. **A local run cannot
+          measure any of this** — `Store::replicated` short-circuits when
+          raft is off, so a batched claim of N and N single claims execute
+          the same SQL in the same process.
 - [x] **Fix the eval-notifier thundering herd.** `notify_waiters()` woke
       every parked eval worker on ANY `eval` row change, and each answered
       with a `claim_eval` — a scheduler-lane quorum round whether or not it

@@ -19,16 +19,70 @@ At manager startup:
 
 Each worker loop:
 
-1. `claim_eval()` atomically marks one `pending` eval as `in_flight`.
-2. Executes `Eval::handle(store)`.
-3. `complete_eval()`:
-   - success -> delete eval row
-   - failure -> set status `failed`
+1. `claim_evals()` atomically marks a **batch** of `pending` evals as
+   `in_flight`.
+2. Executes `Eval::handle(store)` for each one, in claim order, one at a
+   time.
+3. `complete_evals_and_claim_next()` writes every outcome — success deletes
+   the eval row, failure sets status `failed`, a transient rejection returns
+   the row to `pending` after a delay — **and** claims the next batch, in one
+   operation.
 
 When queue is empty, workers block on either:
 
 - `Notify` wake-up (`enqueue_eval` of zero-delay work), or
 - timeout until next delayed eval `ready_at`.
+
+### Batching
+
+Steps 1 and 3 are fixed costs paid per *round*, not per eval. On a
+replicated (raft) manager each is a quorum round on the scheduler lane, and
+that lane drains through a single pipeline thread — so a cluster doing a
+little work per eval hits a ceiling that has nothing to do with the work.
+Taking N evals through one cycle divides those two rounds by N.
+
+The batch is sized to the queue, not to a timer:
+
+- **It never waits to fill.** A worker takes whatever is claimable right now
+  and starts working. Idle latency is unchanged.
+- **It is a fair share, not a grab.** Each worker takes at most
+  `pending_evals / evalThreads` rows, so a burst of work spreads across
+  workers instead of serializing behind the first one to wake.
+- **It is capped at 16** rows per worker regardless of queue depth.
+- **A shallow queue yields a batch of one**, which behaves exactly like the
+  unbatched loop.
+
+There is no configuration for this; the two inputs — live queue depth and
+`evalThreads` — are already known to the loop.
+
+Batching does not change what evals do or the order they run in. Each eval
+still runs its own handler and applies its own plan in its own operation,
+and the claim still drains in `priority DESC, id ASC` order across the whole
+batch, so a low-priority eval can never overtake a high-priority one by
+riding in someone's batch.
+
+**Failure isolation.** Only outcomes the worker actually *observed* are
+written. If one eval's handler panics or is cancelled, its siblings still
+settle normally and that eval is simply omitted — its row stays `in_flight`
+and returns to the queue via `requeue_in_flight_evals()` (run on startup and
+on raft leadership acquisition). The same applies to the whole batch if the
+terminal write itself fails, or if the worker or manager dies mid-batch:
+nothing is written, every row stays `in_flight`, and recovery requeues them.
+An eval is never marked failed on the strength of an unknown outcome,
+because failed evals are not retried.
+
+The cost of that safety is bounded re-execution: an eval handled inside a
+batch whose terminal write never lands will run again after recovery. Eval
+handlers are idempotent convergence steps, so this is wasted work rather
+than duplicated effects, and the batch cap bounds how much of it a single
+crash can cause.
+
+**Leadership.** A worker that loses scheduler-lane leadership part-way
+through a batch stops there and leaves the remainder `in_flight` for the new
+leader, rather than running work whose writes cannot commit. A batch can
+never be half-applied across a leadership change: the terminal write for the
+whole batch is a single replicated operation that either commits or does
+not.
 
 ## Eval Queue Semantics
 
