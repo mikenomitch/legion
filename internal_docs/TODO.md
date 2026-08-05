@@ -28,6 +28,55 @@ How to use it:
 
 ## Scheduling & placement
 
+- [ ] **Find what makes `apply` 27.9 ms/eval.** Phase 3 measured
+      plan-apply conflicts at **0%** (from 31.9%) with throughput
+      unchanged at 80.35/s, so the ceiling is the replicated write path,
+      not planning. `apply` is 67% of plan time, and 41.42 ms/eval over 4
+      eval threads permits ~580 alloc/sec against 80 measured — so evals
+      are far more serialized than 4-way. Prime suspect: the scheduler
+      lane's single `pipeline_loop` thread. Collect
+      `legion_store_write_lock_wait_seconds` and the lane pipeline
+      metrics next campaign. See
+      [aws-phase3-findings.md](aws-phase3-findings.md).
+- [ ] **Warmup is longer than a small cell.** `run-campaign.sh` defaults
+      `WARMUP=30`; phase 3's 1,000-node cell placed 5,004/5,004 and
+      reported `throughput_per_sec: 0.0` with `steady_window_placed: 0`
+      because every placement fell inside the warmup. Scale warmup to
+      cell size, or floor the steady window. This is why phase 3 has no
+      1,000-node throughput number.
+- [ ] **Read-connection pool fix is shipped but deprioritised.** Pool
+      sized from `available_parallelism()`, steal-on-contention, cached
+      heartbeat task configs, and a new
+      `legion_store_read_lock_wait_seconds` (read-connection wait
+      previously had **no metric at all**). The hypothesis that this was
+      the ceiling was **refuted**: phase 3 measured `task_fetch` at
+      0.65 ms at 5,000 nodes on the *unmodified* binary, so the 107x
+      growth seen in the phase-2 archives was coupled to the conflict
+      rate, not to fleet size. Worth measuring eventually; not urgent.
+- [ ] **Make the read-connection pool size configurable.** It is derived
+      from `available_parallelism()` today, but demand is heartbeat-driven
+      and therefore scales with *fleet size*, not cores — an operator
+      running 10k nodes on 8 cores is better placed to judge than a
+      compile-time formula. Needs a config field, a `docs/` note and a
+      `configs/jobs/maximal.ncl`-equivalent entry for manager config.
+- [x] **Cut the raft round-trips per eval** —
+      [eval-path-raft-cost-plan.md](plans/eval-path-raft-cost-plan.md).
+      `Store::complete_and_claim_next` fuses the eval loop's terminal
+      write with the following claim (4-5 rounds/eval → 3-4), and
+      `Store::enqueue_evals` makes every fan-out one round instead of one
+      per row (leadership regeneration, drained and lost nodes). **The
+      AWS re-measurement is NOT run** — see the open item below.
+- [ ] **Measure the eval-path raft cuts at 5,000 nodes.** Exit criterion
+      from [eval-path-raft-cost-plan.md](plans/eval-path-raft-cost-plan.md):
+      `cell_summary.py --lanes` shows scheduler-lane rounds per eval at or
+      below 2.5 (from ~4), and throughput above the 80.35 alloc/sec
+      phase-3 baseline. `collect.sh` now archives the raft lane metrics
+      needed to check it. **A local run cannot measure this** —
+      `Store::replicated` short-circuits when raft is off, so the fused
+      op and the unfused pair execute identical code on one node.
+      If rounds fall and throughput does not, the lane is not the ceiling
+      either and the next suspect is `apply` itself (27.9 ms/eval, 67% of
+      plan time).
 - [ ] **Re-measure the plan-apply fix on AWS.** Phase 4 of
       [plan-apply-conflict-reduction-plan.md](plans/plan-apply-conflict-reduction-plan.md).
       The two-pass bind is shipped and unit-proven but **unmeasured at
