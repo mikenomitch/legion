@@ -269,10 +269,19 @@ Throughput follows directly: ~7 commits/sec x 44 allocations is the observed
 rate. The page cache was raised anyway as a cheap hedge on the 138 ms, but it
 is not the explanation and the commit message says so.
 
-Note the batch size: **1.32**, with 16 threads contending. The coalescer is
-being waited on without doing the batching that would justify the wait. A
-submitter that has already lost the lock could join the in-flight batch
-instead of forming the next one.
+Note the batch size: **1.32**, with 16 threads contending.
+
+> **Corrected.** This was first read as the coalescer failing to batch — being
+> waited on without doing the work that would justify the wait. That is wrong.
+> The queue is FIFO and a leader drains ALL of it, so the accumulation window
+> is already the whole previous commit; 1.32 is simply the ARRIVAL RATE at the
+> coalescer (1 leader + 0.32 followers per commit). No timer-free change can
+> raise it, and a timer is ruled out because it would tax the uncontended
+> single-submitter case. The 347 ms is therefore not lost amortization — it is
+> what a submitter waits while the commit ahead of it runs, plus a 1 ms
+> polling handoff. Only the handoff is recoverable; the commit itself is the
+> real cost, which points back at making commits cheaper rather than grouping
+> them.
 
 ### Reads the scheduler should not be doing
 
@@ -372,11 +381,10 @@ false for all of them — but the submit rates are not a controlled variable.
 1. **Stop re-reading whole nodes on the read-model refresh.** The strongest
    explanation for the ~1.6x-per-doubling degradation, and the only one that
    accounts for time outside the plan timers. Apply a changeset delta.
-2. **Break the serialized plan-apply commit.** 347 ms of follower wait against
-   a 138 ms commit is the ceiling at scale. Either make the commit cheaper or
-   let submitters join an in-flight batch rather than queue behind it — the
-   coalescer is charging for batching it is not doing (batch size 1.32 at 16
-   threads).
+2. **Make the plan-apply commit cheaper.** 347 ms of follower wait against a
+   138 ms commit is the ceiling at scale, and since batch size reflects
+   arrival rate rather than a batching defect, grouping cannot help — only a
+   shorter commit can.
 3. **Find the eval-thread knee**, which needs a FASTER LOAD GENERATOR: the
    rig became the constraint at 64 threads, so the knee above 32 cannot be
    seen with one CLI process per submitted job.
