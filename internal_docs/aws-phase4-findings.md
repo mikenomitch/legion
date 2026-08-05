@@ -221,12 +221,69 @@ This retires two targets this document previously named:
 The genuine quorum cost is the eval path: `complete_and_claim_next` at 44/s
 plus ~20/s of plan applies.
 
+## The real ceiling at scale: the plan-apply commit is serialized
+
+The `dense_fleet` ladder found a cliff, and chasing it corrected a wrong
+diagnosis of my own.
+
+| allocations | throughput | drain |
+| --- | --- | --- |
+| 50,000 | 736.1 alloc/s | 58.0 s |
+| 100,000 | 456.58 alloc/s | 177.8 s |
+
+Plan phases at 100,000 against 25,000: `apply` 20.96 ms -> **354 ms**,
+`build_plan` 9.10 -> 20 ms, `capacity_snapshot` 1.40 -> 4 ms, total 36.86 ->
+381 ms. `apply` is 93% of plan time.
+
+The first guess was that SQLite was thrashing its 2 MiB default page cache.
+That was wrong, and the timer boundary is why: `apply_us` wraps the whole
+`replicated()` call, so it contains the coalescer wait, the raft propose, the
+quorum round trip and the post-commit cache refresh — it is not a
+SQLite-read timer. Measured during the 200,000 cell:
+
+| metric | value |
+| --- | --- |
+| coalescer **follower wait** | **347 ms** |
+| coalescer commit | 138 ms |
+| coalescer leader wait | 66 ms |
+| batch size | 1.32 |
+| scheduler pipeline wait | 20 ms |
+
+**The 354 ms is 347 ms of queueing.** Plan-apply holds a single commit lock,
+one commit costs 138 ms at this scale, and 16 eval threads pile up behind it.
+Throughput follows directly: ~7 commits/sec x 44 allocations is the observed
+rate. The page cache was raised anyway as a cheap hedge on the 138 ms, but it
+is not the explanation and the commit message says so.
+
+Note the batch size: **1.32**, with 16 threads contending. The coalescer is
+being waited on without doing the batching that would justify the wait. A
+submitter that has already lost the lock could join the in-flight batch
+instead of forming the next one.
+
+### Reads the scheduler should not be doing
+
+The planner reads the in-memory `SchedulingReadModel` — that is why
+`build_plan` stays at 20 ms. The apply path deliberately re-reads committed
+state inside the transaction, and must: the fence cannot bind against a cache
+refreshed only after commit.
+
+The avoidable read is on the write-back side. After commit,
+`cache_refresh_allocation_scopes` calls `allocs_for_node` for every touched
+node and re-reads that node's ENTIRE allocation list, though the changeset
+already names exactly which allocations changed. At ~40 allocations per node
+across ~44 nodes that is ~1,700 rows re-read per eval to learn about 44
+changes, on every replica.
+
 ## Open, in priority order
 
-1. **Find the knee.** 16 threads beat 4; the ladder above 16 is unmeasured.
-2. **The eval path is now the whole cost.** `complete_and_claim_next` at 44/s
-   and plan applies at ~20/s are what is left to attack, which is what the
-   batch-the-eval-loop item was always about.
+1. **Break the serialized plan-apply commit.** 347 ms of follower wait against
+   a 138 ms commit is the ceiling at scale. Either make the commit cheaper or
+   let submitters join an in-flight batch rather than queue behind it — the
+   coalescer is charging for batching it is not doing (batch size 1.32 at 16
+   threads).
+2. **Apply a delta to the read model instead of re-reading each node.**
+   ~1,700 rows re-read per eval, on every replica, to learn about 44 changes.
+3. **Find the knee.** 16 threads beat 4; the ladder above 16 is unmeasured.
 3. **Capture cost, not raft cost.** 134 empty captures/sec still take the write
    connection. Skipping the write when the value is unchanged would remove
    them entirely.
