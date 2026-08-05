@@ -2259,10 +2259,26 @@ impl Store {
                 self.allocation_epoch_for_scope("job_config", job_config_id)?,
             ));
         }
-        // 2. Allocations second.
+        // 2. Allocations second, over ONE connection with ONE cached
+        //    statement.
+        //
+        //    `allocs_for_node` takes a fresh read connection and re-prepares
+        //    the statement on every call, and this loop runs once per node a
+        //    plan touched — up to 44 on the AWS `dense_fleet` shape. That was
+        //    44 acquisitions from a pool sized to the core count (4 on the
+        //    campaign's managers) and 44 statement parses, per eval, on every
+        //    replica: the refresh was contending with the planning it exists
+        //    to serve.
         let mut per_node: Vec<(String, Vec<Allocation>)> = Vec::new();
-        for node_id in node_ids {
-            per_node.push((node_id.clone(), self.allocs_for_node(node_id)?));
+        {
+            let conn = self.read_connection()?;
+            let mut stmt = conn.prepare_cached(GET_ALLOCS_FOR_NODE.as_str())?;
+            for node_id in node_ids {
+                let allocs = Self::collect_rows(
+                    stmt.query_map([node_id], |row| self.allocation_from_row(row))?,
+                )?;
+                per_node.push((node_id.clone(), allocs));
+            }
         }
         // 3. Publish atomically, then re-derive the affected nodes' free
         // pools and index projections from the refreshed allocations —
