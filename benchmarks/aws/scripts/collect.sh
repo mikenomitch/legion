@@ -66,6 +66,36 @@ snapshot plan_phase_rate 'sum by (phase) (rate(legion_scheduler_plan_phase_secon
 snapshot plan_phase_sum 'sum by (phase) (rate(legion_scheduler_plan_phase_seconds_sum[1m]))'
 snapshot eval_queue_depth 'legion_eval_queue_depth'
 snapshot plan_apply 'sum by (outcome) (rate(legion_plan_apply_total[1m]))'
+# The rate above shows the shape over time; the raw counter gives the
+# cell its exact applied/rejected totals as (last - first), which is the
+# headline number of the conflict work and the one phase 2 had to
+# reconstruct by hand from a whole campaign's cumulative values.
+snapshot plan_apply_counter 'sum by (outcome) (legion_plan_apply_total)'
+# Two-pass bind (plan-apply-conflict-reduction-plan.md): `clean` bound on
+# an unmoved node epoch, `revalidated` had a moved epoch and the
+# in-transaction recheck admitted it anyway. `revalidated` is precisely
+# the work that used to be thrown away, so it is the fix's own scoreboard.
+snapshot plan_bind_pass 'sum by (pass) (legion_scheduler_plan_bind_pass)'
+snapshot eval_conflict_requeues 'legion_eval_conflict_requeues_total'
+# The raft lanes, which is where phase 3 found the ceiling and could only
+# INFER it: plan phases accounted for 41ms/eval while each eval occupied a
+# worker for ~298ms, and the missing time is the 3-4 quorum rounds per eval
+# that the plan-phase histogram does not cover. These four make that
+# directly measurable instead of arithmetic:
+#   ops_total     — rounds per lane; divide by evals for rounds/eval
+#   pipeline_wait — queueing behind the lane's single pipeline thread
+#   pipeline_depth— how deep that queue got
+#   propose_apply — the commit itself, once it stops queueing
+# Read pipeline_wait against propose_apply: wait >> apply means the lane is
+# serialized, not slow, and the fix is fewer ops rather than faster ones.
+snapshot raft_ops 'sum by (lane, op) (legion_raft_ops_total)'
+snapshot raft_pipeline_wait_p99 'histogram_quantile(0.99, sum by (lane, le) (rate(legion_raft_pipeline_wait_seconds_bucket[1m])))'
+snapshot raft_pipeline_wait_mean 'sum by (lane) (rate(legion_raft_pipeline_wait_seconds_sum[1m])) / sum by (lane) (rate(legion_raft_pipeline_wait_seconds_count[1m]))'
+snapshot raft_pipeline_depth 'legion_raft_pipeline_depth'
+snapshot raft_propose_apply_mean 'sum by (lane) (rate(legion_raft_propose_apply_seconds_sum[1m])) / sum by (lane) (rate(legion_raft_propose_apply_seconds_count[1m]))'
+snapshot store_write_lock_wait_p99 'histogram_quantile(0.99, sum by (le) (rate(legion_store_write_lock_wait_seconds_bucket[1m])))'
+snapshot store_read_lock_wait_p99 'histogram_quantile(0.99, sum by (le) (rate(legion_store_read_lock_wait_seconds_bucket[1m])))'
+snapshot evals_processed 'sum by (kind, outcome) (legion_evals_processed_total)'
 snapshot heartbeats 'rate(legion_heartbeats_total[1m])'
 snapshot nodes 'legion_nodes'
 # Whether the fleet actually kept its cadence, archived per cell. Phase 1's

@@ -30,7 +30,7 @@
 # is a human's call, and `scripts/teardown.sh` is the only thing that
 # should make it.
 #
-# Usage: phase1.sh [--skip-smoke] [--from <step-number>]
+# Usage: phase1.sh [--skip-smoke] [--skip-density] [--from <step-number>]
 set -euo pipefail
 
 AWS_BENCH_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -48,11 +48,19 @@ if [ -f "$HOME/.cargo/env" ]; then
     . "$HOME/.cargo/env"
 fi
 
-SKIP_SMOKE=false FROM=1
+SKIP_SMOKE=false SKIP_DENSITY=false FROM=1
 while [ $# -gt 0 ]; do
     case "$1" in
     --skip-smoke)
         SKIP_SMOKE=true
+        shift
+        ;;
+    --skip-density)
+        # Step 5 retires the 1,250-nodes-per-instance guess, which only
+        # has to happen once per instance type — skip it when a previous
+        # campaign already measured it, or when the fleet sizes in play
+        # are ones the guess has already carried.
+        SKIP_DENSITY=true
         shift
         ;;
     --from)
@@ -105,7 +113,11 @@ fi
 step 2 bringup scripts/bringup.sh
 step 3 build-and-upload scripts/build-and-upload.sh
 step 4 install-legion-a scripts/install-legion-a.sh
-step 5 packing-density experiments/packing-density.sh
+if [ "$SKIP_DENSITY" = false ]; then
+    step 5 packing-density experiments/packing-density.sh
+else
+    log "step 5 (packing-density) — skipped, --skip-density"
+fi
 step 6 smoke-campaign scripts/run-campaign.sh --system legion-a --smoke
 
 log "PHASE 1 COMPLETE"

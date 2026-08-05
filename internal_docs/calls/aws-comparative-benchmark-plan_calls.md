@@ -649,3 +649,78 @@ cadence shortfall at 5k or 10k becomes a recorded finding rather than a
 contaminated number — which is the outcome the plan wants from a first
 campaign. (a) remains the right thing to measure in a follow-up whose
 stated subject is the cadence ladder itself.
+
+## 26. "Stopped converging" is a stall, not a wall-clock deadline
+
+- **The call:** the driver ends a cell on a **stall timeout** — no
+  placement at all for 120s — with the old fixed `--settle-timeout-secs`
+  demoted to an absolute cap that is *derived* from the expected
+  allocation count (20 alloc/sec floor) rather than fixed at 600s.
+  `metrics.json` gains an `outcome` field (`complete` / `stalled` /
+  `timeout` / `watcher_died`).
+- **Alternatives.** (a) Keep the flat 600s and raise it by hand per cell.
+  (b) Scale the deadline with cell size but keep a single clock.
+- **Trade-off.** Two knobs instead of one, and a cell that trickles
+  placements slower than one per 120s is now reported as stalled even
+  though it was still moving.
+- **Why (measurement honesty).** The saturation sweep is the whole point
+  of the density axis, and its larger points are legitimately long: 200k
+  allocations needs ~10 minutes at a *healthy* 350 alloc/sec. Under a flat
+  600s every one of those points would have been reported incomplete for
+  arithmetic reasons, and the sweep would have read that as the
+  scheduler's ceiling — inventing a finding out of a rig default. (b)
+  fixes the arithmetic but still cannot distinguish "big" from "stuck",
+  and that distinction is the answer the sweep exists to produce. The
+  stall clock is size-independent, which is exactly the property the
+  question needs; the cap only survives to bound a pathological trickle.
+  `outcome` matters for the same reason: an incomplete cell that stalled
+  is a scheduler result, one that hit the cap is a rig result, and
+  `complete: false` alone cannot tell a reader which they are holding.
+
+## 27. A second scenario for saturation, rather than pushing web_fleet harder
+
+- **The call:** added `benchmarks/scheduler/scenarios/dense_fleet.json` —
+  web_fleet's node profiles unchanged, but ~44 allocations per job
+  (against 6) and 50 mCPU / 64 MiB requests (against 500 / 1024).
+- **Alternatives.** (a) Sweep density on `web_fleet` as the rig already
+  allowed. (b) Add a replica multiplier to `translate.py` so density and
+  job count become independent axes on any scenario.
+- **Trade-off.** A second scenario to keep honest, and one more cell in
+  the local SLO gate (it passes: 31.3 evals/sec, p99 81ms, correctness
+  1.000). `dense_fleet` is also less like a real fleet than `web_fleet`,
+  so it measures the scheduler rather than describing a customer.
+- **Why (the measurement would otherwise be of the rig).** Two independent
+  ceilings sit below the scheduler's on `web_fleet`. The density axis
+  scales job *count*, and each submit is a fresh CLI process on a 2-vCPU
+  loadgen box, so every density point is also a submission-rate point —
+  the driver saturates first. And at 500 mCPU an 8-core node holds ~16
+  allocations, so a sweep past that measures capacity exhaustion, which is
+  a correct refusal to place rather than a throughput number. Fat jobs
+  with small requests move both ceilings out of the way. (b) is the more
+  general fix and is the right follow-up, but it changes a translator that
+  every existing cell depends on, which is not a change to make in the
+  same session as the measurement it feeds. A 50-replica service into one
+  pool is also precisely the shape `decouple_plan_components` used to
+  collapse, so the scenario earns its place twice.
+
+## 28. `evalThreads` is rendered per campaign, and refused elsewhere
+
+- **The call:** `run-campaign.sh --eval-threads N` exports
+  `LEGION_EVAL_THREADS`, which `install-legion-a.sh` renders into
+  `manager-a.ncl.tpl`. Passing it to any system other than `legion-a`, or
+  alongside `--no-reset-control-plane`, is a hard error.
+- **Alternatives.** (a) Edit the committed template between runs, as
+  phase 2 did. (b) Accept the flag everywhere and ignore it where it does
+  not apply.
+- **Trade-off.** The value has to survive the control-plane reinstall that
+  every campaign performs, so it travels as an environment variable
+  through `reset-control-plane.sh` — a slightly less obvious path than a
+  plain command-line argument.
+- **Why (reproducibility).** The phase-2 finding that more eval threads
+  *cost* throughput is the single most useful result of that campaign and
+  the one the plan-apply fix is judged against, and it could not be
+  reproduced in one command. (b) is the dangerous option: a silently
+  dropped flag produces a cell archived as a 16-thread result whose
+  rendered config — the fairness record — says 4. A run that fails loudly
+  is strictly better than a number that lies quietly, which is the same
+  principle as entry 24.

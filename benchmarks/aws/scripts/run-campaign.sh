@@ -15,6 +15,13 @@
 #   run-campaign.sh --system legion-a --steps "5000" \
 #       --allocs-per-node-sweep "5 10 20 40 80"
 #
+# EVAL CONCURRENCY. --eval-threads N renders the manager's evalThreads
+# for this campaign (legion-a only), so the phase-2 finding that more
+# planners cost throughput can be re-measured in one command rather than
+# by editing a committed template between runs:
+#
+#   run-campaign.sh --system legion-a --steps "1000 5000" --eval-threads 16
+#
 # CONTROL-PLANE RESET. Every campaign wipes and reinstalls the control
 # plane before its first step (--no-reset-control-plane opts out). This
 # is not tidiness: Legion cannot deregister a node, so the node table
@@ -68,6 +75,14 @@ ALLOCS_SWEEP=""
 # reset-control-plane.sh for why, and why unique node names are not the
 # answer.
 RESET_CP=true
+# Scheduler eval concurrency for the system under test. Empty means "the
+# installer's default" (4), so an ordinary campaign is unaffected. Set,
+# it is exported for the reinstall that the reset below performs — which
+# is the only reason this belongs here rather than being a one-off
+# install-legion-a.sh invocation: every campaign reinstalls the control
+# plane, so a value set only at install time would be reverted before
+# the first cell ran.
+EVAL_THREADS=""
 while [ $# -gt 0 ]; do
     case "$1" in
     --system)
@@ -127,6 +142,16 @@ while [ $# -gt 0 ]; do
         RESET_CP=false
         shift
         ;;
+    --eval-threads)
+        # legion-a only. The phase-2 finding was that raising this COST
+        # throughput (4 -> 16 threads: -12% at 1k, -11% at 5k) because
+        # the extra planners' work was discarded; re-measuring it is how
+        # plan-apply-conflict-reduction is judged. One value per
+        # campaign — it is a control-plane setting, so sweeping it means
+        # one campaign per point.
+        EVAL_THREADS="$2"
+        shift 2
+        ;;
     --nodes-per-instance)
         # The measured ceiling from experiments/packing-density.sh. The
         # 1250 default is the plan's estimate; measuring it once turns
@@ -142,6 +167,27 @@ while [ $# -gt 0 ]; do
     esac
 done
 : "${SYSTEM:?--system required (legion-a|legion-b|nomad|k8s)}"
+
+# Refused rather than ignored: only install-legion-a.sh renders this, and
+# a silently-dropped --eval-threads would produce a cell archived as a
+# 16-thread result whose rendered config says 4.
+if [ -n "$EVAL_THREADS" ]; then
+    case "$EVAL_THREADS" in
+    '' | *[!0-9]*)
+        echo "--eval-threads must be a positive integer, got '$EVAL_THREADS'" >&2
+        exit 1
+        ;;
+    esac
+    [ "$SYSTEM" = "legion-a" ] || {
+        echo "--eval-threads applies to --system legion-a only (got $SYSTEM)" >&2
+        exit 1
+    }
+    $RESET_CP || {
+        echo "--eval-threads needs the control-plane reset to apply it; drop --no-reset-control-plane" >&2
+        exit 1
+    }
+    export LEGION_EVAL_THREADS="$EVAL_THREADS"
+fi
 
 # Release the spot fleet no matter how we leave — success, failure, or a
 # killed session. An unattended campaign that dies at 03:00 otherwise
@@ -175,7 +221,7 @@ SIM_SYSTEM=${SIM_SYSTEM%-b} # legion-a/legion-b share the legion sim fleet
 # The allocation densities this campaign runs at each step. One value is
 # the ordinary campaign; several is a saturation sweep.
 ALLOC_POINTS="${ALLOCS_SWEEP:-$ALLOCS_PER_NODE}"
-log "=== campaign $CAMPAIGN: steps [$STEPS], scenarios [$SCENARIOS], allocs/node [$ALLOC_POINTS] ==="
+log "=== campaign $CAMPAIGN: steps [$STEPS], scenarios [$SCENARIOS], allocs/node [$ALLOC_POINTS]${EVAL_THREADS:+, evalThreads $EVAL_THREADS} ==="
 
 # Start from an empty node table.
 #
