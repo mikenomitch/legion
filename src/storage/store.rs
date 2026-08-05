@@ -6330,6 +6330,21 @@ impl Store {
 
     #[instrument(err, skip_all)]
     pub fn update_node_health_checks(&self, id: &str, health_checks: &str) -> R<()> {
+        // A worker re-reports the same health checks on every beat, so most
+        // of these calls have nothing to record. They were not free: the
+        // changeset comes out empty and never reaches quorum, but the apply
+        // still takes the WRITE connection, runs the upsert, re-reads the
+        // node and refreshes its cache entry — and the write connection is
+        // the same one the serialized plan-apply commit needs. The
+        // 2026-08-05 AWS campaign measured 134 of these a second against a
+        // 5,000-node fleet, every one of them `outcome=empty`, all of it
+        // contending with scheduling.
+        //
+        // Comparing first costs a read-connection lookup, which does not
+        // block the writer.
+        if self.node_health_checks_unchanged(id, health_checks)? {
+            return Ok(());
+        }
         match self.update_node_health_checks_local(id, health_checks) {
             Err(err) if crate::storage::raft::driver::NotRaftLeader::in_chain(&err) => self
                 .forward_after_rejection(
@@ -6341,6 +6356,23 @@ impl Store {
                 ),
             other => other,
         }
+    }
+
+    /// Whether `node_health` already holds exactly these health checks.
+    ///
+    /// False when the row is missing, so a node that has never reported still
+    /// takes the write path — the apply's own `EXISTS (SELECT 1 FROM node)`
+    /// guard then decides whether there is anything to write to.
+    fn node_health_checks_unchanged(&self, id: &str, health_checks: &str) -> R<bool> {
+        let conn = self.read_connection()?;
+        let current: Option<String> = conn
+            .query_row(
+                "SELECT health_checks FROM node_health WHERE node_id = ?;",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(current.as_deref() == Some(health_checks))
     }
 
     pub(crate) fn update_node_health_checks_local(&self, id: &str, health_checks: &str) -> R<()> {
@@ -8264,14 +8296,13 @@ impl Store {
                     // An UPDATE's new record carries only the columns that
                     // changed, so a row whose status held still reads as
                     // absent here — which is exactly the answer we want.
-                    let became_claimable = matches!(
-                        action,
-                        Action::SQLITE_INSERT | Action::SQLITE_UPDATE
-                    ) && item
-                        .new_value(status_idx)
-                        .ok()
-                        .and_then(|value| value.as_str().ok().map(|s| s == "pending"))
-                        .unwrap_or(false);
+                    let became_claimable =
+                        matches!(action, Action::SQLITE_INSERT | Action::SQLITE_UPDATE)
+                            && item
+                                .new_value(status_idx)
+                                .ok()
+                                .and_then(|value| value.as_str().ok().map(|s| s == "pending"))
+                                .unwrap_or(false);
                     if became_claimable {
                         evals_made_claimable += 1;
                     }
@@ -15530,6 +15561,40 @@ mod tests {
     /// cluster's hot tables. SQLite's 2 MiB default made the plan-apply phase
     /// cliff from 21 ms to 354 ms per eval between 25,000 and 100,000
     /// allocations on the 2026-08-05 AWS campaign.
+    /// A repeated health check must not reach the write path.
+    ///
+    /// It produced an EMPTY changeset and so never reached quorum, but the
+    /// apply still took the write connection — the one the serialized
+    /// plan-apply commit needs — ran the upsert, re-read the node and
+    /// refreshed its cache. The AWS campaign measured 134 of these a second
+    /// against a 5,000-node fleet, all of them contending with scheduling.
+    #[test]
+    fn a_repeated_health_check_does_not_take_the_write_path() -> R<()> {
+        let store = setup_store()?;
+        let mut msg = crate::structs::NodeMsg::default();
+        msg.id = "hc-node".into();
+        msg.status = "ready".into();
+        msg.config_attrs = "{}".into();
+        msg.fingerprint_attrs = "{}".into();
+        msg.dynamic_attrs = "{}".into();
+        msg.health_checks = "{}".into();
+        store.insert_node(msg)?;
+
+        // First report is a real change and must be written.
+        store.update_node_health_checks("hc-node", "{\"disk\":\"ok\"}")?;
+        assert!(store.node_health_checks_unchanged("hc-node", "{\"disk\":\"ok\"}")?);
+
+        // A different value is still a change.
+        assert!(!store.node_health_checks_unchanged("hc-node", "{\"disk\":\"full\"}")?);
+        store.update_node_health_checks("hc-node", "{\"disk\":\"full\"}")?;
+        assert!(store.node_health_checks_unchanged("hc-node", "{\"disk\":\"full\"}")?);
+
+        // A node with no health row yet must NOT be treated as unchanged, or
+        // its first report would be dropped.
+        assert!(!store.node_health_checks_unchanged("never-reported", "{}")?);
+        Ok(())
+    }
+
     #[test]
     fn connections_raise_the_page_cache_off_the_sqlite_default() -> R<()> {
         let dir = tempfile::tempdir()?;
