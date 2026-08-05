@@ -637,3 +637,265 @@ fn enqueue_evals_creates_every_row_in_one_op() -> R<()> {
     Ok(())
 }
 
+/// A batch of ONE must be indistinguishable from today's single claim.
+///
+/// This is the load-bearing property of the whole batching change: the
+/// cluster is idle far more often than it is saturated, so batching may not
+/// buy throughput at the cost of idle latency. The share calculation is
+/// what guarantees it — with `workers` workers and a shallow queue, every
+/// worker's share rounds down to one — and the claim never waits for a
+/// batch to fill.
+#[test]
+fn claim_evals_of_one_matches_the_single_claim() -> R<()> {
+    use legion::storage::store::EvalBatchLimits;
+
+    let store = setup_store()?;
+    let limits = EvalBatchLimits {
+        max: 16,
+        workers: 16,
+    };
+
+    // Empty queue: an empty batch, immediately — no waiting to fill.
+    assert!(store.claim_evals(limits)?.is_empty());
+
+    let enqueued = store.enqueue_eval("job_reschedule", Some("a"), Some("ac"), None, None)?;
+    let batch = store.claim_evals(limits)?;
+    assert_eq!(batch.len(), 1, "a one-deep queue must yield a batch of one");
+    assert_eq!(batch[0].id, enqueued.id);
+    assert_eq!(batch[0].status, "in_flight");
+
+    // And the queue is genuinely drained, not merely under-served.
+    assert!(store.claim_evals(limits)?.is_empty());
+    assert!(store.claim_eval()?.is_none());
+    Ok(())
+}
+
+/// Evals are not interchangeable: batching must not let a low-priority eval
+/// jump the queue. Each pass of the batched claim takes the head of
+/// `priority DESC, id ASC`, so ordering holds ACROSS the batch exactly as it
+/// holds across successive single claims.
+#[test]
+fn claim_evals_preserves_priority_order_across_the_batch() -> R<()> {
+    use legion::storage::store::EvalBatchLimits;
+
+    let store = setup_store()?;
+    // Distinct jobs, so the claim's superseded-eval sweep (same kind + same
+    // job) never removes one of these and confuses the ordering assertion.
+    for (job, priority) in [
+        ("low", 1_i64),
+        ("high", 99),
+        ("mid", 50),
+        ("highest", 100),
+        ("mid-two", 50),
+    ] {
+        store.enqueue_eval(
+            "job_reschedule",
+            Some(job),
+            Some(&format!("{job}-cfg")),
+            None,
+            Some(priority),
+        )?;
+    }
+
+    // One worker, so the share is the whole queue: the batch sees every row
+    // and any reordering would show up here.
+    let batch = store.claim_evals(EvalBatchLimits {
+        max: 16,
+        workers: 1,
+    })?;
+    assert_eq!(batch.len(), 5);
+
+    let priorities: Vec<i64> = batch.iter().map(|eval| eval.priority).collect();
+    assert_eq!(
+        priorities,
+        vec![100, 99, 50, 50, 1],
+        "batched claim must drain in priority order"
+    );
+    assert!(
+        batch
+            .windows(2)
+            .all(|pair| pair[0].priority > pair[1].priority || pair[0].id < pair[1].id),
+        "equal priorities must still break ties by id ASC: {:?}",
+        batch
+            .iter()
+            .map(|e| (&e.id, e.priority))
+            .collect::<Vec<_>>()
+    );
+    Ok(())
+}
+
+/// The fused batch write settles every eval it was GIVEN an outcome for and
+/// claims the next batch, all in one scheduler-lane round.
+#[test]
+fn complete_evals_and_claim_next_settles_the_batch_and_claims_more() -> R<()> {
+    use legion::storage::events::drafts;
+    use legion::storage::store::{EvalBatchLimits, EvalCompletion};
+
+    let store = setup_store()?;
+    let limits = EvalBatchLimits { max: 2, workers: 1 };
+    for i in 0..4 {
+        store.enqueue_eval(
+            "job_reschedule",
+            Some(&format!("job-{i}")),
+            Some(&format!("cfg-{i}")),
+            None,
+            None,
+        )?;
+    }
+
+    let first = store.claim_evals(limits)?;
+    assert_eq!(first.len(), 2, "max caps the batch at 2");
+
+    let completions: Vec<(String, EvalCompletion)> = first
+        .iter()
+        .map(|eval| {
+            (
+                eval.id.clone(),
+                EvalCompletion::Finished {
+                    succeeded: true,
+                    event: drafts::eval_completed(
+                        eval,
+                        "done",
+                        std::time::Duration::from_millis(1),
+                    ),
+                },
+            )
+        })
+        .collect();
+
+    let second = store.complete_evals_and_claim_next(completions, limits)?;
+    assert_eq!(
+        second.len(),
+        2,
+        "the fused call must hand back the next two"
+    );
+
+    // The first batch is gone (success deletes the row) and only the second
+    // remains — in flight, so no other worker takes it.
+    let remaining: Vec<(String, String)> = store
+        .get_evals()?
+        .into_iter()
+        .map(|eval| (eval.id, eval.status))
+        .collect();
+    assert_eq!(remaining.len(), 2);
+    assert!(remaining.iter().all(|(_, status)| status == "in_flight"));
+    assert!(second
+        .iter()
+        .all(|eval| remaining.iter().any(|(id, _)| id == &eval.id)));
+
+    // Draining the queue returns an empty batch rather than spinning, so
+    // the worker parks.
+    let completions: Vec<(String, EvalCompletion)> = second
+        .iter()
+        .map(|eval| {
+            (
+                eval.id.clone(),
+                EvalCompletion::Finished {
+                    succeeded: true,
+                    event: drafts::eval_completed(
+                        eval,
+                        "done",
+                        std::time::Duration::from_millis(1),
+                    ),
+                },
+            )
+        })
+        .collect();
+    assert!(store
+        .complete_evals_and_claim_next(completions, limits)?
+        .is_empty());
+    assert!(store.get_evals()?.is_empty());
+    Ok(())
+}
+
+/// Partial failure inside a batch: one member's handler dies (panic,
+/// cancellation, a leadership loss that stopped the worker reaching it), so
+/// the loop simply omits it from the completions.
+///
+/// Two things must hold, and they are the reason batching is safe at all:
+/// its siblings still settle normally, and the omitted eval is neither
+/// completed nor lost — it stays `in_flight` until
+/// `requeue_in_flight_evals` (the leadership-acquisition hook) returns it to
+/// the queue. Inventing an outcome for it would be the dangerous choice:
+/// failed evals are never retried, so a fabricated failure silently drops
+/// acknowledged work.
+#[test]
+fn an_unobserved_batch_member_stays_in_flight_and_is_recovered() -> R<()> {
+    use legion::storage::events::drafts;
+    use legion::storage::store::{EvalBatchLimits, EvalCompletion};
+
+    let store = setup_store()?;
+    let limits = EvalBatchLimits { max: 8, workers: 1 };
+    for i in 0..3 {
+        store.enqueue_eval(
+            "job_reschedule",
+            Some(&format!("job-{i}")),
+            Some(&format!("cfg-{i}")),
+            None,
+            None,
+        )?;
+    }
+
+    let batch = store.claim_evals(limits)?;
+    assert_eq!(batch.len(), 3);
+    let casualty = batch[1].clone();
+
+    // Everything except the casualty gets an outcome: one succeeded, one
+    // failed terminally — the two shapes a real handler produces.
+    let completions = vec![
+        (
+            batch[0].id.clone(),
+            EvalCompletion::Finished {
+                succeeded: true,
+                event: drafts::eval_completed(
+                    &batch[0],
+                    "done",
+                    std::time::Duration::from_millis(1),
+                ),
+            },
+        ),
+        (
+            batch[2].id.clone(),
+            EvalCompletion::Finished {
+                succeeded: false,
+                event: drafts::eval_failed(
+                    &batch[2],
+                    &legion::prelude::anyhow!("handler error"),
+                    std::time::Duration::from_millis(1),
+                ),
+            },
+        ),
+    ];
+    let next = store.complete_evals_and_claim_next(completions, limits)?;
+    assert!(
+        next.is_empty(),
+        "the casualty is in flight, so nothing is claimable"
+    );
+
+    let by_id: std::collections::HashMap<String, String> = store
+        .get_evals()?
+        .into_iter()
+        .map(|eval| (eval.id, eval.status))
+        .collect();
+    assert!(
+        !by_id.contains_key(&batch[0].id),
+        "a succeeded sibling must be deleted"
+    );
+    assert_eq!(
+        by_id.get(&batch[2].id).map(String::as_str),
+        Some("failed"),
+        "a failed sibling must be marked failed"
+    );
+    assert_eq!(
+        by_id.get(&casualty.id).map(String::as_str),
+        Some("in_flight"),
+        "the unobserved eval must be neither completed nor failed"
+    );
+
+    // Recovery: the row the batch died holding comes back to the queue.
+    assert_eq!(store.requeue_in_flight_evals()?, 1);
+    let recovered = store.claim_evals(limits)?;
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered[0].id, casualty.id);
+    Ok(())
+}

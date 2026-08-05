@@ -117,6 +117,57 @@ pub enum EvalCompletion {
     },
 }
 
+/// How many evals one worker may take through the loop together
+/// ([`Store::claim_evals`], [`Store::complete_evals_and_claim_next`]).
+///
+/// Batching amortizes the scheduler lane's fixed per-eval cost over N
+/// evals — but it must not do that by letting one worker vacuum the queue
+/// while its peers idle. With `evalThreads` workers sharing one queue, a
+/// greedy claim of a 16-eval burst would serialize behind one worker work
+/// that all 16 could have run at once, which is a throughput *loss* on
+/// exactly the bursty fan-out (a lost AZ, a leadership regeneration) that
+/// matters most.
+///
+/// So the batch is a fair share of what is actually queued, capped by
+/// `max`, and the claim never waits for the batch to fill: at low queue
+/// depth every worker gets a batch of one and behaves exactly as it did
+/// before batching existed.
+///
+/// The fair share is also what keeps the wake accounting honest. The
+/// notifier issues one permit per newly-claimable eval (`notify_one` in
+/// `project_changeset_side_effects`), so a worker that swallowed a whole
+/// burst would leave its woken peers claiming nothing — re-creating the
+/// empty claims that fix removed. Taking `pending / workers` leaves work
+/// for every permit that was issued, and below `workers` deep the share is
+/// one, which is exactly the pre-batching behavior the fix was measured
+/// against.
+#[derive(Debug, Clone, Copy)]
+pub struct EvalBatchLimits {
+    /// Hard ceiling on one worker's batch, however deep the queue is. Caps
+    /// how long a worker can hold rows `in_flight` before its terminal
+    /// write lands, which is what a crash mid-batch costs in re-run work.
+    pub max: usize,
+    /// How many eval workers share this queue (`evalThreads`) — the
+    /// divisor for the fair share.
+    pub workers: usize,
+}
+
+impl EvalBatchLimits {
+    /// This worker's share of a queue holding `pending` unclaimed rows.
+    ///
+    /// `pending` counts every pending row, including ones whose `ready_at`
+    /// is still in the future, so it is an UPPER bound on what is
+    /// claimable. That is the right side to err on: overestimating costs
+    /// one extra claim attempt that returns nothing and ends the batch,
+    /// while underestimating would leave ready work sitting for a whole
+    /// loop iteration.
+    fn share_of(&self, pending: i64) -> usize {
+        let workers = self.workers.max(1);
+        let pending = pending.max(0) as usize;
+        (pending / workers).clamp(1, self.max.max(1))
+    }
+}
+
 /// RFC3339 with the subsecond field pinned to nine digits, so the rendered
 /// string sorts lexicographically in chronological order. Used for any
 /// timestamp SQL compares or orders by (see `Store::sortable_timestamp`).
@@ -12555,8 +12606,114 @@ impl Store {
         self.replicated(Lane::Scheduler, "claim_eval", move |s| s.claim_eval_apply())
     }
 
+    /// Claim a whole batch of evals in ONE scheduler-lane op.
+    ///
+    /// The claim round is a FIXED cost per round, not per eval, so taking N
+    /// evals through it together divides it by N. The AWS phase-3/4 data is
+    /// what makes this worth doing: at 5,000 nodes `web_fleet` (6
+    /// allocations per eval) sustained 219 alloc/s while `dense_fleet` (44
+    /// per eval) sustained 736 — 7x the work per eval bought 3.4x the
+    /// throughput on the same cluster and the same thread count, which is
+    /// the signature of a per-eval cost dominating.
+    ///
+    /// Batch size is a fair share of what is *actually* queued
+    /// ([`EvalBatchLimits`]) and the loop never waits for the batch to
+    /// fill, so an idle cluster still claims exactly one eval and pays
+    /// exactly what it pays today.
+    ///
+    /// Ordering is preserved ACROSS the batch: each pass reuses
+    /// `claim_eval_apply`, which takes the head of `priority DESC, id ASC`,
+    /// so a lower-priority eval is only ever reached after every
+    /// higher-priority one — batching changes how many rounds the queue
+    /// costs, not which eval runs next.
+    #[instrument(err, skip_all)]
+    pub fn claim_evals(&self, limits: EvalBatchLimits) -> R<Vec<Eval>> {
+        self.replicated(Lane::Scheduler, "claim_evals", move |s| {
+            s.claim_evals_apply(limits)
+        })
+    }
+
+    fn claim_evals_apply(&self, limits: EvalBatchLimits) -> R<Vec<Eval>> {
+        let take = {
+            // The WRITE connection, not a read one: inside a capture the
+            // completions this op already applied live in an uncommitted
+            // savepoint that only this connection can see, so a read
+            // connection would size the batch off the previous round's
+            // queue depth.
+            let conn = self.write_connection()?;
+            limits.share_of(Self::pending_eval_count_tx(&conn)?)
+        };
+
+        let mut claimed = Vec::with_capacity(take);
+        for _ in 0..take {
+            // Reused verbatim so a batched claim can never drift from a
+            // single one: same ordering, same superseded-eval sweep, same
+            // queue-depth gauge.
+            match self.claim_eval_apply()? {
+                Some(eval) => claimed.push(eval),
+                // Dry queue. Return what we have instead of waiting for
+                // the batch to fill — this cluster is idle far more often
+                // than it is saturated, and lingering would trade idle
+                // latency for throughput that is not being asked for.
+                None => break,
+            }
+        }
+
+        if claimed.len() > 1 {
+            debug!(
+                claimed = claimed.len(),
+                requested = take,
+                "Claimed a batch of evals in one scheduler-lane op"
+            );
+        }
+        Ok(claimed)
+    }
+
+    /// Settle a whole batch of handled evals AND claim the next batch, in
+    /// ONE scheduler-lane op — the batched form of
+    /// [`Self::complete_and_claim_next`].
+    ///
+    /// `completions` holds an entry for exactly the evals whose outcome the
+    /// caller **observed**. An eval the caller claimed but whose handler
+    /// panicked, was cancelled, or was never reached (leadership moved
+    /// mid-batch) must simply be OMITTED: its row stays `in_flight` and
+    /// `requeue_in_flight_evals` recovers it, which is the same contract
+    /// the single-eval loop has always had. Omission is the only safe
+    /// answer for an unknown outcome — a failed eval is never retried, so
+    /// inventing a failure is how acknowledged work vanishes.
+    ///
+    /// The op is all-or-nothing by construction (`replicated`
+    /// short-circuits inside a capture, so every write lands in one
+    /// changeset). That is deliberate for the *terminal writes*: if the op
+    /// is rejected — a lost leadership, a write error — nothing is written
+    /// and every member of the batch stays `in_flight` for recovery. No
+    /// eval can be half-completed, and none can be completed twice. It is
+    /// NOT plan-apply: the per-plan savepoint isolation that lets one
+    /// rejected plan spare its neighbours lives in `submit_and_apply_plans`
+    /// and is untouched here, because each eval still applies its own plan
+    /// in its own op.
+    #[instrument(err, skip_all)]
+    pub fn complete_evals_and_claim_next(
+        &self,
+        completions: Vec<(String, EvalCompletion)>,
+        limits: EvalBatchLimits,
+    ) -> R<Vec<Eval>> {
+        self.replicated(Lane::Scheduler, "complete_evals_and_claim_next", move |s| {
+            for (eval_id, completion) in completions {
+                s.apply_eval_completion(&eval_id, completion)?;
+            }
+            s.claim_evals_apply(limits)
+        })
+    }
+
     /// Finish the eval a worker just handled AND claim its next one, in a
     /// single scheduler-lane op.
+    ///
+    /// The eval worker loop uses the batched
+    /// [`Self::complete_evals_and_claim_next`] instead; this single-eval
+    /// form is the one-at-a-time semantics the batch must preserve, and is
+    /// what the one-shot callers (and the tests that pin those semantics)
+    /// use.
     ///
     /// Every eval used to cost two quorum rounds on this lane that had
     /// nothing to do with the work itself: one to claim it and one to
@@ -17431,6 +17588,41 @@ mod tests {
         assert_eq!(job_two_submission_refs, 1);
 
         Ok(())
+    }
+
+    /// The batch a worker takes is a fair SHARE of the live queue, never a
+    /// greedy grab: with N workers sharing one queue, a worker that
+    /// vacuumed a burst would serialize work its idle peers could have run
+    /// in parallel. The important boundary is the low end — a shallow queue
+    /// must yield a batch of exactly one, so an idle cluster behaves
+    /// exactly as it did before batching existed.
+    #[test]
+    fn eval_batch_share_tracks_queue_depth_and_never_starves_peers() {
+        let limits = EvalBatchLimits {
+            max: 16,
+            workers: 16,
+        };
+
+        // Shallow queue: one each, so all 16 workers get work.
+        assert_eq!(limits.share_of(0), 1);
+        assert_eq!(limits.share_of(1), 1);
+        assert_eq!(limits.share_of(16), 1);
+        // Deep enough to divide: each worker takes its share, no more.
+        assert_eq!(limits.share_of(64), 4);
+        assert_eq!(limits.share_of(160), 10);
+        // Saturated: capped, so a crash mid-batch re-runs a bounded amount.
+        assert_eq!(limits.share_of(100_000), 16);
+
+        // Degenerate inputs cannot produce a zero-sized batch (which would
+        // spin the worker) or panic.
+        let degenerate = EvalBatchLimits { max: 0, workers: 0 };
+        assert_eq!(degenerate.share_of(-5), 1);
+        assert_eq!(degenerate.share_of(1_000), 1);
+
+        // A single-worker manager is the batch's best case, still capped.
+        let solo = EvalBatchLimits { max: 8, workers: 1 };
+        assert_eq!(solo.share_of(3), 3);
+        assert_eq!(solo.share_of(3_000), 8);
     }
 
     #[test]

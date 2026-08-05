@@ -93,6 +93,13 @@ rules a cause in or out, and which knob to turn — is in
   is being over-woken; a saturated 5,000-node cluster runs at roughly 0.3
   empty claims per second. Claims carried over by the fused
   complete-and-claim round are not counted — they were already paid for.
+  A claim takes a *batch* (see
+  [scheduler-and-eval-loop.md](scheduler-and-eval-loop.md#batching)), so
+  `claimed` counts rounds that found work rather than evals. Dividing
+  `legion_evals_processed_total` by it gives evals per claim round — the
+  direct measure of how much batching is engaging. A ratio pinned at 1 on a
+  busy cluster means the queue never gets deeper than `evalThreads`, so the
+  bottleneck is upstream of the eval loop.
 - **`legion_scheduler_plan_candidate_rank`** (histogram) — candidate rank
   each applied placement bound at (0 = the planner's first choice; higher
   ranks mean the apply walk absorbed a race by falling back).
