@@ -3,10 +3,14 @@
 > **Judgement calls:** [`../calls/eval-path-raft-cost-plan_calls.md`](../calls/eval-path-raft-cost-plan_calls.md)
 
 **Status: IN EXECUTION** — phases 1 and 2 landed together (claim/complete
-fusion, batched enqueue). Phase 3 (re-measurement on AWS) is not run, and
-until it is, every throughput claim here is a prediction. Deliberately
+fusion, batched enqueue). Phase 3 (re-measurement on AWS) ran on
+2026-08-05 ([../aws-phase4-findings.md](../aws-phase4-findings.md)) and
+its exit criterion pointed at `apply` itself, which is phase 4 below.
+Phase 4's code has landed and is **unmeasured at scale**. Deliberately
 deferred: fusing the status-lane `task_status` projection (different
-lane, so it cannot share a round), and any change to plan-apply itself.
+lane, so it cannot share a round), and the read-model half of phase 4's
+finding (`cache_refresh_allocation_scopes` re-reading whole nodes after
+commit).
 
 ## 1. Problem statement
 
@@ -159,6 +163,53 @@ Read `pipeline_wait` against `propose_apply`: wait >> apply means the
 lane is serialized rather than slow, which is the claim this plan rests
 on and the thing phase 3 could only infer.
 
+### Phase 4 — take the per-node allocation scan out of the apply commit
+
+Phase 3's exit criterion said that if rounds fell and throughput did not,
+the next suspect was `apply` itself. That is where the `dense_fleet` fill
+ladder landed: 736.1 → 456.58 → 272.91 alloc/s as live allocations went
+50k → 100k → 200k at 5,000 nodes, roughly 1.6x per doubling, while plan
+total grew only 22%.
+
+The mechanism is that the serialized plan-apply commit did work
+proportional to how full the cluster is while the plan's own work stayed
+constant. `Store::free_pool_for_node_tx` rebuilt each placement node's
+free pool by selecting **every** allocation row on that node and parsing
+every `resources` blob: ~440 rows per eval at 50k allocations, ~1,760 at
+200k, for the same ~44 placements.
+
+The pool is now served from a per-node aggregate cached in
+`node_alloc_usage`, and **validated on every read** against a fingerprint
+of the live rows — the node's allocation epoch, the row count, and the sum
+of the allocation ids, all read from `idx_allocation_node_id` without
+touching a row body or parsing any JSON. A mismatch rebuilds exactly as
+before; a successful apply refreshes the row, but only when the live
+fingerprint is precisely the one it predicted. A Fresh plan's own
+allocations are gathered once per plan rather than re-filtered per node.
+
+This is deliberately a cache and not a denormalized total: a free-capacity
+number that drifts high overcommits a node, and validation makes that
+impossible rather than merely unlikely. The reasoning, and the three
+alternatives rejected for it, are entry 1 of the calls doc.
+
+It flattens the slope rather than removing it — the fingerprint is still
+proportional to allocations-per-node, at roughly a hundredth of the
+constant — and the read-model half of the finding is untouched.
+
+Local A/B on the rebuild itself (`bench_local_free_pool`, both arms
+against the same store, `drop_own` on):
+
+| allocations/node | row walk | cached |
+| --- | --- | --- |
+| 10 | 15.573 µs | 8.635 µs |
+| 40 | 37.764 µs | 9.358 µs |
+
+The columns are the result: over a 4x change in fill the row walk grows
+2.4x and the cached path grows 1.08x. End-to-end throughput is *not*
+measurable locally — the cost is a serialized commit on a multi-node
+cluster under fill — so the AWS `dense_fleet` ladder remains the exit
+criterion.
+
 ## 7. Testing
 
 - `tests/eval_regen_failover.rs`: the fused call finishes one eval and
@@ -171,13 +222,29 @@ on and the thing phase 3 could only infer.
 - The local SLO gate is a **no-regression** check only: `replicated`
   short-circuits when raft is off, so a single-node run cannot show this
   win at all. Correctness stayed 1.000 across all eight scenarios.
+- Phase 4 is tested as an **equivalence** against the code it replaced,
+  which is kept verbatim as the oracle: the cached free pool must equal
+  the row walk's across an empty node, amount-typed, item-typed and
+  mixed-kind allocations, a zero-amount demand, both `drop_own` modes, and
+  an unreadable row — cold cache and warm. Plus a drift battery that
+  drives real inserts, a removal that bumps only the job-config epoch, an
+  in-plan eviction and a wholesale job removal through the public store
+  API, re-asserting the equivalence after each. `src/resources.rs` carries
+  the aggregate's own properties (add/remove are inverses; item counts are
+  a multiset, not a set union).
 
 ## 8. Rollout
 
-No config, no migration, no wire change — the eval queue schema and the
-op semantics are unchanged; only how many quorum rounds they cost
-changes. A mixed-version cluster is fine: the ops are per-leader, and a
-follower applies changesets either way.
+Phases 1-3: no config, no migration, no wire change — the eval queue
+schema and the op semantics are unchanged; only how many quorum rounds
+they cost changes. A mixed-version cluster is fine: the ops are
+per-leader, and a follower applies changesets either way.
+
+Phase 4 adds one table (`node_alloc_usage`) in an additive migration with
+no backfill, owned by the scheduler lane. Version skew is safe in both
+directions because the table is a validated cache: a manager binary
+without the feature neither reads nor writes it, so a leader on either
+side of an upgrade finds the fingerprints stale and rebuilds.
 
 **Exit criterion:** at 5,000 nodes, `cell_summary.py --lanes` shows
 scheduler-lane rounds per eval at or below 2.5 (from ~4), and throughput

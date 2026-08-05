@@ -92,6 +92,31 @@ How to use it:
       16 threads beat 4 by 23.7%. Adds
       `legion_eval_claim_total{outcome}`, whose absence is what hid it, and
       an `op` label on `legion_raft_ops_total`.
+- [x] **Stop re-reading every allocation on a node inside the plan-apply
+      commit.** `free_pool_for_node_tx` rebuilt a node's free pool by
+      selecting every allocation row on it and parsing every `resources`
+      blob, inside the serialized commit — so the cost of committing a plan
+      scaled with cluster fill while the work per plan did not (~440 rows per
+      eval at 50k allocations, ~1,760 at 200k, for the same ~44 placements;
+      throughput 736.1 → 456.6 → 272.9 alloc/s). Now cached per node in
+      `node_alloc_usage` and validated on every read against a fingerprint of
+      the live rows (node allocation epoch + row count + id sum), so the
+      cache can never inflate free capacity — the worst a stale row does is
+      cost one rebuild. A Fresh plan's own allocations are read once per
+      plan instead of re-filtered per node. Local A/B on the rebuild: 15.6
+      → 8.6 µs per pool at 10 allocations/node, 37.8 → 9.4 µs at 40 (the
+      old path grows 2.4x over that fill change, the new one 1.08x). See
+      [aws-phase4-findings.md](aws-phase4-findings.md),
+      [benchmarks/scheduler/README.md](../benchmarks/scheduler/README.md) and
+      [scheduler-and-eval-loop.md](../docs/scheduler-and-eval-loop.md#the-per-node-usage-cache).
+      **Unmeasured end to end** — see the open item below.
+- [ ] **Re-measure the `dense_fleet` fill ladder.** The per-node usage cache
+      above targets the apply half of the ~1.6x-per-doubling degradation;
+      the read-model refresh half (`cache_refresh_allocation_scopes`,
+      ~1,700 rows per eval on every replica) is untouched. Re-run the
+      50k/100k/200k ladder at 5,000 nodes and see how much of the slope is
+      left. The fingerprint is still an index-only scan proportional to
+      allocations-per-node, so the slope should flatten rather than vanish.
 - [ ] **Decide the `evalThreads` default.** It is `available_parallelism()`,
       which is the 4 that just lost to 16 by 23.7%. An eval worker parks on
       quorum round trips rather than computing (8% CPU at saturation), so

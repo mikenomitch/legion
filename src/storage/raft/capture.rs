@@ -676,7 +676,10 @@ mod tests {
             Ok(())
         })?;
         let woke = wakes_from!(apply_changeset(&store, &claimed)?);
-        assert_eq!(woke, 0, "a claim takes work off the queue; it must wake nobody");
+        assert_eq!(
+            woke, 0,
+            "a claim takes work off the queue; it must wake nobody"
+        );
 
         Ok(())
     }

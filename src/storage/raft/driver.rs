@@ -1445,7 +1445,9 @@ fn execute_replicated(
     {
         let metrics = raft.metrics().borrow().clone();
         if metrics.state != ServerState::Leader {
-            telemetry.raft_ops_total.inc(&[metric_lane, op, "not_leader"]);
+            telemetry
+                .raft_ops_total
+                .inc(&[metric_lane, op, "not_leader"]);
             let context = match lane_label {
                 Some(lane) => format!("raft op {op} must run on the {lane} lane's leader"),
                 None => format!("raft op {op} must run on the leader"),
