@@ -959,7 +959,7 @@ impl Metrics {
         // Coalescer (group commit) instrumentation. Three questions, three
         // families: does batching engage at all (batch_size), is a submitter
         // waiting or committing (wait_seconds by role vs commit_seconds), and
-        // how much of the wait is the 1ms re-contend poll (wait_rounds).
+        // how many extra commits it sat through before its own (wait_rounds).
         let store_coalesce_batch_size = Arc::new(HistogramVec {
             meta: FamilyMeta {
                 name: "legion_store_coalesce_batch_size",
@@ -990,7 +990,7 @@ impl Metrics {
         let store_coalesce_wait_rounds_total = Arc::new(CounterVec {
             meta: FamilyMeta {
                 name: "legion_store_coalesce_wait_rounds_total",
-                help: "Times a submitter's 1ms wait for a reply timed out and it re-contended for the commit lock. Divided by the wait_seconds count this is the mean number of poll rounds per request — the part of heartbeat latency that is the coalescer's own polling rather than any commit.",
+                help: "Times a waiting submitter was woken by a finished commit that was neither its own result nor its turn to lead, i.e. it sat through an extra commit. Divided by the wait_seconds count this is the mean number of EXTRA commits a request waits out; 0 means every submitter was served by the first commit it queued behind.",
                 labels: &["path"],
             },
             series: Series::new(),

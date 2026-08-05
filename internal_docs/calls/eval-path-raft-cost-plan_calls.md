@@ -69,7 +69,59 @@ Ranked by project impact; the number is the rank.
   worker immediately asks for more work. Do the cheap, safe half first and
   let the measurement decide whether the expensive half is needed.
 
-## 3. The fused claim is handled before the leadership gate
+## 3. The coalescer signals its handoff; the leader does NOT run a second batch
+
+- **The call:** replace the coalescer's poll-and-re-contend wait (a reply
+  channel plus a `try_lock` retried every millisecond) with one `Mutex` and
+  one `Condvar`, so a submitter that loses the election blocks once and is
+  woken exactly when the commit it queued behind ends. The leader still
+  runs **one** batch and then returns to its own caller.
+- **Alternatives.** (a) The leader loops — drain, run, drain again, all
+  inside one lock hold — so requests that arrived during a commit are
+  picked up with no handoff at all. (b) Leave the wait alone and let the
+  next leader take a bigger batch, on the theory that batch size is the
+  problem. (c) Shrink `LEADER_RECHECK_INTERVAL` below a millisecond.
+- **Trade-off.** It is a concurrency rewrite of a hot path — the class of
+  bug that is a wedged cluster rather than a slow one — for a saving that
+  is a few milliseconds per commit boundary, not the 347 ms the finding is
+  about. It also changes what `legion_store_coalesce_wait_rounds_total`
+  counts (poll ticks -> extra commits sat through), so anything reading it
+  needs updating; `docs/metrics.md` is updated in the same change.
+- **Why (performance, honestly bounded).** (a) is the shape
+  [aws-phase4-findings.md](../aws-phase4-findings.md) proposed and it is a
+  **regression**. The leader's own request is already answered by the time
+  it re-drains, so every extra batch it runs adds a full commit — 138 ms
+  measured — to its own caller's latency, in order to save the arrivals a
+  handoff they would have led themselves about a millisecond later. At the
+  measured 0.32 arrivals per commit that means roughly a third of
+  submitters pay 138 ms so that a third of submitters save ~5 ms, and
+  unbounded altruism starves whichever thread keeps winning. Prior art
+  agrees: RocksDB's write thread elects a *successor* rather than making
+  the leader serve a second group. (b) is what the code already does — the
+  queue is FIFO and a leader drains all of it, so the next batch is already
+  as big as the arrivals allow. **Batch size 1.32 is the arrival rate, not
+  a batching failure**, and no timer-free change can raise it; a timer is
+  ruled out because a lone submitter has to keep paying nothing. What was
+  genuinely broken is the *shape of the wait*: a loser could not block on
+  "my result arrived" and "the commit slot is free" at once, because they
+  lived behind two different primitives, so it polled — the lock sat free
+  until some waiter's next tick, and every waiter burned a wake-up per
+  millisecond of every commit. Measured in the new unit test: 600
+  re-contention rounds for six submitters behind one 150 ms commit, now 0.
+  (c) buys the same milliseconds by spending CPU, and scales the wrong way
+  with thread count.
+- **Surface.** None in the jobspec or CLI. Two operator-visible things:
+  `legion_store_coalesce_wait_rounds_total` should now read 0 on a healthy
+  path (it was never 0 before, because it counted polling), and a
+  coalescer whose batch runner panics no longer wedges. The old
+  `commit_lock` was a `Mutex` held across `run`, so a panicking runner
+  **poisoned** it and every later submitter spun at 1 ms forever —
+  `try_lock` cannot tell "busy" from "poisoned". The slot is now a flag
+  released by an RAII guard on every exit including unwind, covered by
+  `a_panicking_leader_does_not_wedge_its_batch_mates`, which hangs
+  indefinitely on the old implementation.
+
+## 4. The fused claim is handled before the leadership gate
 
 - **The call:** a worker holding an eval handed back by the previous
   fused write processes it even if `is_raft_leader` now reports false;
@@ -89,7 +141,7 @@ Ranked by project impact; the number is the rank.
   tested, so the honest framing is that fusing does not widen the window
   it inherits.
 
-## 4. A panicked handler writes nothing
+## 5. A panicked handler writes nothing
 
 - **The call:** when `spawn_blocking` returns `Err` (handler panicked or
   was cancelled), the loop logs and writes no outcome, leaving the eval
@@ -105,7 +157,7 @@ Ranked by project impact; the number is the rank.
   both fixed). Writing nothing is the only option that cannot lose work,
   and it matches what a crashed worker already produces.
 
-## 5. Batched enqueue takes a request struct, not N arguments
+## 6. Batched enqueue takes a request struct, not N arguments
 
 - **The call:** `enqueue_evals(Vec<EvalRequest>)` with a struct carrying
   kind/job/config/node/priority/delay, plus an `EvalRequest::for_job`
@@ -121,7 +173,7 @@ Ranked by project impact; the number is the rank.
   half of the storm — an obvious thing to build. (b) would have fixed
   today's four loops and left the next one to rediscover the problem.
 
-## 6. Local benchmarks are reported as a no-regression check only
+## 7. Local benchmarks are reported as a no-regression check only
 
 - **The call:** the PR quotes the local SLO gate as "no regression" and
   explicitly declines to claim a throughput win from it.
