@@ -224,6 +224,58 @@ pub struct SchedulingReadModel {
     pub(crate) available_nodes_cache: Option<Arc<Vec<Arc<Node>>>>,
 }
 
+/// The allocation-row changes one committed changeset names, collected by
+/// [`Store::project_changeset_side_effects`] and applied to the read model
+/// by [`Store::cache_apply_allocation_delta`] — the delta that replaces
+/// reloading every touched node's whole allocation list.
+#[derive(Debug, Default)]
+struct AllocationDelta {
+    /// Every allocation row this changeset created or changed, by id. Their
+    /// committed content is re-read by primary key (one indexed row each)
+    /// and spliced into the owning node's cached list.
+    upserts: BTreeSet<i64>,
+    /// The subset of `upserts` the changeset INSERTed, which must therefore
+    /// NOT already be cached.
+    inserts: BTreeSet<i64>,
+    /// The subset of `upserts` whose UPDATE changed `node_id`, so the row is
+    /// legitimately absent from its new node's cached list (its removal from
+    /// the old node is in `removals`).
+    moved: BTreeSet<i64>,
+    /// `(allocation id, node)` pairs this changeset removed from a node's
+    /// list: DELETE records, plus the old side of a move.
+    removals: Vec<(i64, String)>,
+    /// Cleared the moment an allocation record cannot be classified — the id
+    /// or the owning node is not in the record and cannot be derived. The
+    /// whole changeset then takes the self-healing full-reload path instead,
+    /// because a delta with a hole in it is worse than no delta at all.
+    usable: bool,
+}
+
+impl AllocationDelta {
+    fn new() -> Self {
+        AllocationDelta {
+            usable: true,
+            ..Default::default()
+        }
+    }
+
+    /// Whether this changeset moved any allocation row at all. An in-place
+    /// UPDATE names no node (unchanged columns are absent from the record),
+    /// so the scope sets can be empty while there is still work to splice.
+    fn is_empty(&self) -> bool {
+        self.upserts.is_empty() && self.removals.is_empty()
+    }
+}
+
+/// What the delta path expects to find in a node's cached allocation list
+/// for the row it is about to splice in. A mismatch is drift, and drift
+/// sends that node down the full-reload path.
+#[derive(Debug, Clone, Copy)]
+enum CachedEntry {
+    Absent,
+    Present,
+}
+
 #[derive(Debug)]
 struct AllocationConstraintState {
     constraints: ConstraintSet,
@@ -660,6 +712,16 @@ pub struct Store {
     // Missed beats before a node is lost, from `heartbeat.missedBeatsBeforeLost`.
     // A node's window is ALWAYS this times its own interval.
     missed_beats_before_lost: u32,
+    // Round-robin scrub queue for the delta read-model refresh
+    // ([`Store::cache_apply_allocation_delta`]). The changeset projection
+    // patches `allocations_by_node` from the rows a commit NAMED instead of
+    // reloading every touched node in full, and a delta — unlike a reload —
+    // cannot repair a cache entry that is already wrong. This queue is the
+    // bound: every delta refresh also reloads ONE node in full, drawn from a
+    // queue refilled with the whole fleet when it empties, so a drifted entry
+    // is repaired within one sweep of the fleet rather than never. Shared
+    // across clones so the sweep is per-process, not per-clone.
+    alloc_scrub_queue: Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 /// Result of [`Store::state_backup`]: where the backup landed, its size,
@@ -1012,6 +1074,7 @@ impl Store {
             )),
             liveness: Arc::new(crate::storage::liveness::LivenessTable::new()),
             missed_beats_before_lost: config.heartbeat.missed_beats_before_lost.max(1),
+            alloc_scrub_queue: Arc::new(std::sync::Mutex::new(Vec::new())),
         };
         store.liveness.configure(config.liveness.settings());
 
@@ -2284,19 +2347,7 @@ impl Store {
             return Ok(());
         }
         // 1. Epochs first.
-        let mut epochs: Vec<(String, i64)> = Vec::new();
-        for node_id in node_ids {
-            epochs.push((
-                Self::scope_vector_key("node", node_id),
-                self.allocation_epoch_for_scope("node", node_id)?,
-            ));
-        }
-        for job_config_id in job_config_ids {
-            epochs.push((
-                Self::scope_vector_key("job_config", job_config_id),
-                self.allocation_epoch_for_scope("job_config", job_config_id)?,
-            ));
-        }
+        let epochs = self.read_allocation_scope_epochs(node_ids, job_config_ids)?;
         // 2. Allocations second, over ONE connection with ONE cached
         //    statement.
         //
@@ -2330,13 +2381,276 @@ impl Store {
         for (key, epoch) in epochs {
             guard.scope_epochs.insert(key, epoch);
         }
-        // Every allocation/epoch publish funnels through here; the bump is
-        // what lets in-flight lazy-sample plans detect this publish (see
-        // `SchedulingReadModel::generation`).
+        // Every allocation/epoch publish bumps the counter (this path and
+        // the delta path below); the bump is what lets in-flight lazy-sample
+        // plans detect the publish (see `SchedulingReadModel::generation`).
         guard.generation = guard.generation.wrapping_add(1);
         let affected: Vec<&str> = node_ids.iter().map(String::as_str).collect();
         Self::reproject_model_nodes(&mut guard, &self.resource_policy, &affected);
         Ok(())
+    }
+
+    /// The epoch half of an allocation-scope refresh, read BEFORE any
+    /// allocation row (both refresh paths call this first — the ordering is
+    /// the mirror's coherence invariant, see
+    /// [`Self::cache_refresh_allocation_scopes`]).
+    fn read_allocation_scope_epochs(
+        &self,
+        node_ids: &BTreeSet<String>,
+        job_config_ids: &BTreeSet<String>,
+    ) -> R<Vec<(String, i64)>> {
+        let mut epochs: Vec<(String, i64)> =
+            Vec::with_capacity(node_ids.len() + job_config_ids.len());
+        for node_id in node_ids {
+            epochs.push((
+                Self::scope_vector_key("node", node_id),
+                self.allocation_epoch_for_scope("node", node_id)?,
+            ));
+        }
+        for job_config_id in job_config_ids {
+            epochs.push((
+                Self::scope_vector_key("job_config", job_config_id),
+                self.allocation_epoch_for_scope("job_config", job_config_id)?,
+            ));
+        }
+        Ok(epochs)
+    }
+
+    /// Refresh the allocation cache and the epoch mirror from the rows a
+    /// committed changeset NAMED, instead of reloading every touched node's
+    /// whole allocation list.
+    ///
+    /// **Why.** [`Self::cache_refresh_allocation_scopes`] reloads each
+    /// touched node in full, so its cost scales with how FULL the cluster is
+    /// while the change being projected does not: on the AWS `dense_fleet`
+    /// shape (5,000 nodes) a plan touching ~44 nodes reloaded ~440 rows at
+    /// 50,000 allocations and ~1,760 at 200,000 — to learn about the ~44
+    /// allocations the changeset already named precisely. Throughput fell
+    /// 736 → 457 → 273 alloc/s across those three fills, ~1.6x per doubling,
+    /// and this refresh runs outside the plan-phase timers, which is part of
+    /// why the time was invisible. Reading the named rows by primary key
+    /// makes the cost proportional to the CHANGE (~44 indexed single-row
+    /// reads), not to the fill.
+    ///
+    /// **What this gives up.** The full reload is self-healing: whatever the
+    /// in-memory model held is replaced by the truth from SQLite, so drift
+    /// cannot persist. A delta cannot self-heal — it can only be correct if
+    /// the entry it patches was already correct. Three things bound that:
+    ///
+    /// 1. **Fallback on contradiction.** Every splice is checked against the
+    ///    cached list (a DELETE must find its row, an INSERT must not, an
+    ///    in-place UPDATE must). Any node whose delta contradicts the cache
+    ///    is reloaded in full through the self-healing path — same for a row
+    ///    the changeset created or changed that is not in committed state,
+    ///    which falls the WHOLE changeset back to the old path.
+    /// 2. **Unclassifiable changesets never take this path.** The caller
+    ///    ([`Self::project_changeset_side_effects`]) only builds a delta when
+    ///    it could name the id and the owning node of every allocation
+    ///    record; anything else uses the full reload.
+    /// 3. **A round-robin scrub.** Each call also reloads ONE node in full
+    ///    (`alloc_scrub_queue`), so drift on a node the deltas never touch
+    ///    again — the dangerous case, a node wrongly believed full that the
+    ///    scheduler then never writes to — is repaired within one sweep of
+    ///    the fleet.
+    ///
+    /// Correctness also rests on serialized application: `allocation` is
+    /// owned by the scheduler raft lane (`raft::ownership`), whose state
+    /// machine applies (and therefore projects) one changeset at a time, so
+    /// the cached list this patches is exactly committed state minus this
+    /// changeset.
+    ///
+    /// Publishing is identical to the full path: epochs read first,
+    /// everything published under ONE write-lock acquisition, `generation`
+    /// bumped, and the touched nodes reprojected inside that lock.
+    fn cache_apply_allocation_delta(
+        &self,
+        delta: &AllocationDelta,
+        node_ids: &BTreeSet<String>,
+        job_config_ids: &BTreeSet<String>,
+    ) -> R<()> {
+        if capture::in_capture() {
+            return Ok(());
+        }
+        // 1. Epochs first, exactly as the full path reads them.
+        let epochs = self.read_allocation_scope_epochs(node_ids, job_config_ids)?;
+
+        // 2. The named rows second, over ONE connection with cached
+        //    statements — one indexed single-row read per created/changed
+        //    allocation, plus the one scrubbed node's list.
+        let scrub_node = self.next_alloc_scrub_node()?;
+        let mut upserted: Vec<Allocation> = Vec::with_capacity(delta.upserts.len());
+        let mut missing: Vec<i64> = Vec::new();
+        let mut scrubbed: Option<(String, Vec<Allocation>)> = None;
+        {
+            let conn = self.read_connection()?;
+            let mut by_id = conn.prepare_cached(GET_ALLOCATION_BY_ID.as_str())?;
+            for id in &delta.upserts {
+                match by_id
+                    .query_row([id], |row| self.allocation_from_row(row))
+                    .optional()?
+                {
+                    Some(allocation) => upserted.push(allocation),
+                    None => missing.push(*id),
+                }
+            }
+            if let Some(node_id) = &scrub_node {
+                let mut for_node = conn.prepare_cached(GET_ALLOCS_FOR_NODE.as_str())?;
+                let allocations = Self::collect_rows(
+                    for_node.query_map([node_id], |row| self.allocation_from_row(row))?,
+                )?;
+                scrubbed = Some((node_id.clone(), allocations));
+            }
+        }
+        // A row the changeset created or changed that committed state does
+        // not have contradicts the premise of the whole delta, and we cannot
+        // even name its node to reload it. Fall back to the self-healing
+        // path for this changeset's scopes — which is exactly what this
+        // projection did before deltas existed.
+        if !missing.is_empty() {
+            warn!(
+                allocation_ids = ?missing,
+                "Changeset named allocations that are not in committed state; \
+                 reloading the affected scopes in full"
+            );
+            return self.cache_refresh_allocation_scopes(node_ids, job_config_ids);
+        }
+
+        // 3. Publish atomically. Nodes whose delta contradicts the cache are
+        //    collected here and reloaded in full AFTER the lock is dropped —
+        //    a reload needs the database, and holding the write lock across
+        //    SQLite reads would stall every plan.
+        let mut drifted: BTreeSet<String> = BTreeSet::new();
+        let mut touched: BTreeSet<String> = BTreeSet::new();
+        {
+            let mut guard = self.read_model_writer()?;
+            // Removals first: an UPDATE that moved an allocation between
+            // nodes is a removal from the old node plus an upsert into the
+            // new one, and the removal has to land before the upsert.
+            for (id, node_id) in &delta.removals {
+                if !Self::cache_drop_allocation_entry(&mut guard, node_id, *id) {
+                    drifted.insert(node_id.clone());
+                }
+                touched.insert(node_id.clone());
+            }
+            for allocation in upserted {
+                // A new row must not already be cached, and a row moved to
+                // another node was just removed from its old list, so both
+                // are legitimately absent. An in-place update must be there.
+                let expected = if delta.inserts.contains(&allocation.id)
+                    || delta.moved.contains(&allocation.id)
+                {
+                    CachedEntry::Absent
+                } else {
+                    CachedEntry::Present
+                };
+                let node_id = allocation.node_id.clone();
+                if !Self::cache_splice_allocation_entry(&mut guard, allocation, expected) {
+                    drifted.insert(node_id.clone());
+                }
+                touched.insert(node_id);
+            }
+            // The scrub's wholesale reload lands last so it wins over any
+            // splice into the same node — it is the newer read of the two.
+            if let Some((node_id, allocations)) = scrubbed {
+                // A node that left the fleet between the read and here must
+                // not be resurrected in the allocation map.
+                if guard.nodes.contains_key(&node_id) {
+                    guard
+                        .allocations_by_node
+                        .insert(node_id.clone(), Arc::new(allocations));
+                    touched.insert(node_id);
+                }
+            }
+            for (key, epoch) in epochs {
+                guard.scope_epochs.insert(key, epoch);
+            }
+            guard.generation = guard.generation.wrapping_add(1);
+            // Only nodes whose allocation list actually moved need their
+            // free pool and index projections re-derived: a node that merely
+            // had its epoch bumped holds the same allocations, hence the
+            // same pool. Reprojection is O(allocations on the node), so this
+            // is the same fill-scaling saving as the reads above.
+            let affected: Vec<&str> = touched.iter().map(String::as_str).collect();
+            Self::reproject_model_nodes(&mut guard, &self.resource_policy, &affected);
+        }
+
+        if !drifted.is_empty() {
+            warn!(
+                nodes = ?drifted,
+                "Allocation delta contradicted the cached read model; reloading those nodes in full"
+            );
+            self.cache_refresh_allocation_scopes(&drifted, &BTreeSet::new())?;
+        }
+        Ok(())
+    }
+
+    /// Removes `allocation_id` from `node_id`'s cached list, reporting
+    /// whether it was there. A miss means the cache disagrees with committed
+    /// state — the delta path's drift signal.
+    fn cache_drop_allocation_entry(
+        model: &mut SchedulingReadModel,
+        node_id: &str,
+        allocation_id: i64,
+    ) -> bool {
+        let Some(entry) = model.allocations_by_node.get_mut(node_id) else {
+            return false;
+        };
+        // Copy-on-write: a plan may still hold the previous snapshot.
+        let allocations = Arc::make_mut(entry);
+        let before = allocations.len();
+        allocations.retain(|allocation| allocation.id != allocation_id);
+        allocations.len() != before
+    }
+
+    /// Splices one allocation into its node's cached list, replacing any
+    /// entry with the same id. Reports whether the list held what
+    /// `expected` said it would — `false` is the delta path's drift signal.
+    fn cache_splice_allocation_entry(
+        model: &mut SchedulingReadModel,
+        allocation: Allocation,
+        expected: CachedEntry,
+    ) -> bool {
+        let entry = model
+            .allocations_by_node
+            .entry(allocation.node_id.clone())
+            .or_default();
+        let allocations = Arc::make_mut(entry);
+        let existing = allocations
+            .iter()
+            .position(|candidate| candidate.id == allocation.id);
+        let as_expected = match expected {
+            CachedEntry::Absent => existing.is_none(),
+            CachedEntry::Present => existing.is_some(),
+        };
+        match existing {
+            Some(index) => allocations[index] = allocation,
+            None => {
+                allocations.push(allocation);
+                // Keep the list in id order, which is the order a full
+                // reload produces (the node_id index scans by rowid), so the
+                // two paths are comparable row for row.
+                allocations.sort_unstable_by_key(|allocation| allocation.id);
+            }
+        }
+        as_expected
+    }
+
+    /// Next node in the round-robin allocation scrub (see
+    /// `Store::alloc_scrub_queue`). `None` only when the fleet is empty.
+    ///
+    /// Refilling costs one pass over the node ids per sweep of the fleet, so
+    /// the scrub is amortized O(1) node ids per changeset on top of the one
+    /// node's allocation list it reloads.
+    fn next_alloc_scrub_node(&self) -> R<Option<String>> {
+        let mut queue = self
+            .alloc_scrub_queue
+            .lock()
+            .map_err(|_| anyhow!("allocation scrub queue lock poisoned"))?;
+        if queue.is_empty() {
+            let model = self.read_model_reader()?;
+            queue.extend(model.nodes.keys().cloned());
+        }
+        Ok(queue.pop())
     }
 
     /// Scope sets (nodes + job configs) touched by a batch of allocations.
@@ -8457,6 +8771,12 @@ impl Store {
         let mut node_ids: HashSet<String> = HashSet::new();
         let mut alloc_node_ids: HashSet<String> = HashSet::new();
         let mut alloc_reread_ids: HashSet<i64> = HashSet::new();
+        // The allocation rows this changeset actually moved, which is what
+        // the read model is refreshed FROM (see
+        // `Store::cache_apply_allocation_delta`). The scope sets above stay
+        // exactly as they were: they still drive the epoch mirror, and they
+        // are the fallback's reload set whenever the delta is unusable.
+        let mut alloc_delta = AllocationDelta::new();
         let mut task_job_config_ids: HashSet<String> = HashSet::new();
         // Epoch scopes bumped by this changeset (the plan-fence mirror —
         // see `SchedulingReadModel::scope_epochs`): the changeset's own
@@ -8533,27 +8853,69 @@ impl Store {
                 "allocation" => {
                     let node_idx =
                         self.changeset_column_index(&mut column_cache, "allocation", "node_id")?;
+                    let id_idx =
+                        self.changeset_column_index(&mut column_cache, "allocation", "id")?;
+                    // The row id is what makes a delta possible: the
+                    // changeset names every allocation this commit moved, so
+                    // the read model can be patched from those rows instead
+                    // of reloading each touched node's whole list. Anything
+                    // this arm cannot name unambiguously clears
+                    // `alloc_delta.usable`, and the whole changeset then
+                    // takes the old self-healing full-reload path.
                     match action {
                         Action::SQLITE_INSERT => {
-                            if let Ok(value) = item.new_value(node_idx) {
-                                if let Ok(node_id) = value.as_str() {
-                                    alloc_node_ids.insert(node_id.to_owned());
+                            let node_id = item
+                                .new_value(node_idx)
+                                .ok()
+                                .and_then(|value| value.as_str().ok().map(str::to_owned));
+                            let id = item
+                                .new_value(id_idx)
+                                .ok()
+                                .and_then(|value| value.as_i64().ok());
+                            if let Some(node_id) = &node_id {
+                                alloc_node_ids.insert(node_id.clone());
+                            }
+                            match (id, node_id) {
+                                (Some(id), Some(_)) => {
+                                    alloc_delta.inserts.insert(id);
+                                    alloc_delta.upserts.insert(id);
                                 }
+                                _ => alloc_delta.usable = false,
                             }
                         }
                         Action::SQLITE_DELETE => {
-                            if let Ok(value) = item.old_value(node_idx) {
-                                if let Ok(node_id) = value.as_str() {
-                                    alloc_node_ids.insert(node_id.to_owned());
+                            let node_id = item
+                                .old_value(node_idx)
+                                .ok()
+                                .and_then(|value| value.as_str().ok().map(str::to_owned));
+                            let id = item
+                                .old_value(id_idx)
+                                .ok()
+                                .and_then(|value| value.as_i64().ok());
+                            if let Some(node_id) = &node_id {
+                                alloc_node_ids.insert(node_id.clone());
+                            }
+                            match (id, node_id) {
+                                (Some(id), Some(node_id)) => {
+                                    alloc_delta.removals.push((id, node_id));
                                 }
+                                _ => alloc_delta.usable = false,
                             }
                         }
                         _ => {
                             // UPDATE: unchanged columns are absent from the
-                            // record. Collect whichever sides are present; if
-                            // node_id itself did not change, fall back to
-                            // re-reading the row by PK.
+                            // record, so a present OLD node_id means the
+                            // allocation MOVED — it leaves the old node's
+                            // cached list and joins the new one. Collect
+                            // whichever sides are present; if node_id itself
+                            // did not change, fall back to re-reading the row
+                            // by PK (only the fallback needs that — the delta
+                            // learns the node from the row it re-reads).
                             let mut found = false;
+                            let moved_from = item
+                                .old_value(node_idx)
+                                .ok()
+                                .and_then(|value| value.as_str().ok().map(str::to_owned));
                             for value in [item.old_value(node_idx), item.new_value(node_idx)]
                                 .into_iter()
                                 .flatten()
@@ -8563,17 +8925,24 @@ impl Store {
                                     found = true;
                                 }
                             }
-                            if !found {
-                                let id_idx = self.changeset_column_index(
-                                    &mut column_cache,
-                                    "allocation",
-                                    "id",
-                                )?;
-                                if let Some(id) =
-                                    item.old_value(id_idx).ok().and_then(|v| v.as_i64().ok())
-                                {
-                                    alloc_reread_ids.insert(id);
+                            // The primary key is always in an update's old
+                            // record, changed or not.
+                            let id = item
+                                .old_value(id_idx)
+                                .ok()
+                                .and_then(|value| value.as_i64().ok());
+                            match id {
+                                Some(id) => {
+                                    alloc_delta.upserts.insert(id);
+                                    if let Some(node_id) = moved_from {
+                                        alloc_delta.moved.insert(id);
+                                        alloc_delta.removals.push((id, node_id));
+                                    }
+                                    if !found {
+                                        alloc_reread_ids.insert(id);
+                                    }
                                 }
+                                None => alloc_delta.usable = false,
                             }
                         }
                     }
@@ -8688,10 +9057,14 @@ impl Store {
         drop(iter);
 
         // Resolve rows whose owning scope was not carried by the update
-        // record.
-        for id in alloc_reread_ids {
-            if let Some(allocation) = self.get_allocation_by_id(id)? {
-                alloc_node_ids.insert(allocation.node_id);
+        // record. Only the full-reload path needs this: it reloads BY NODE,
+        // so it cannot proceed without the node id, while the delta path
+        // reads the row itself and learns the node from it.
+        if !alloc_delta.usable {
+            for id in alloc_reread_ids {
+                if let Some(allocation) = self.get_allocation_by_id(id)? {
+                    alloc_node_ids.insert(allocation.node_id);
+                }
             }
         }
         for id in task_reread_ids {
@@ -8727,10 +9100,24 @@ impl Store {
         // nodes' free pools/indexes inside that lock — so a sampler can
         // never pair a new epoch with a stale cache, and the plan-snapshot
         // cache never observes pools out of step with allocations.
+        //
+        // Which path: the DELTA (`cache_apply_allocation_delta`) whenever
+        // this changeset's allocation records were all classifiable, because
+        // a full reload costs one whole allocation list per touched node —
+        // work that grows with cluster FILL while the change being projected
+        // does not. `cache_refresh_allocation_scopes` remains the path for
+        // everything else, and the delta falls back to it on contradiction.
         let mut refresh_nodes: BTreeSet<String> = alloc_node_ids.into_iter().collect();
         refresh_nodes.extend(epoch_node_scopes);
-        if !refresh_nodes.is_empty() || !epoch_job_scopes.is_empty() {
-            self.cache_refresh_allocation_scopes(&refresh_nodes, &epoch_job_scopes)?;
+        // An in-place allocation UPDATE names no scope at all (its record
+        // carries only the columns that changed), so the delta's own rows
+        // have to keep the refresh alive on their own.
+        if !refresh_nodes.is_empty() || !epoch_job_scopes.is_empty() || !alloc_delta.is_empty() {
+            if alloc_delta.usable {
+                self.cache_apply_allocation_delta(&alloc_delta, &refresh_nodes, &epoch_job_scopes)?;
+            } else {
+                self.cache_refresh_allocation_scopes(&refresh_nodes, &epoch_job_scopes)?;
+            }
         }
         for job_config_id in task_job_config_ids {
             let tasks = self.get_task_configs_for_job_config(&job_config_id)?;
@@ -23431,6 +23818,333 @@ mod tests {
         assert_eq!(
             allocs[0].id, allocation.id,
             "leader-assigned rowid replicated"
+        );
+        Ok(())
+    }
+
+    /// Capture a mutation the way a lane leader does — locally rolled back —
+    /// and then apply the committed changeset back into the same store. That
+    /// apply is the projection every replica runs, and the only caller of
+    /// the delta read-model refresh.
+    fn apply_captured<T>(store: &Store, f: impl FnOnce(&Store) -> R<T>) -> R<T> {
+        let (value, changeset) = raft_capture::capture_mutation(store, Lane::Scheduler, f)?;
+        raft_capture::apply_changeset(store, &changeset)?;
+        Ok(value)
+    }
+
+    /// The allocation cache, normalized for comparison against a full
+    /// reload. An absent entry and an empty list mean the same thing to
+    /// every reader (`allocations_by_node.get(..)` unwraps to `&[]`), and
+    /// SQLite promises no row order without an ORDER BY, so neither
+    /// distinction is allowed to fail the comparison.
+    fn allocation_cache_view(model: &SchedulingReadModel) -> R<BTreeMap<String, Vec<String>>> {
+        let mut view = BTreeMap::new();
+        for (node_id, allocations) in &model.allocations_by_node {
+            if allocations.is_empty() {
+                continue;
+            }
+            let mut rendered = Vec::new();
+            for allocation in allocations.iter() {
+                rendered.push(serde_json::to_string(allocation)?);
+            }
+            rendered.sort();
+            view.insert(node_id.clone(), rendered);
+        }
+        Ok(view)
+    }
+
+    /// The derived free-capacity pools, rendered order-stably (both the map
+    /// and the item sets inside it are hashed).
+    fn node_pool_view(model: &SchedulingReadModel) -> BTreeMap<String, BTreeMap<String, String>> {
+        model
+            .node_pools
+            .iter()
+            .map(|(node_id, pool)| {
+                let values = pool
+                    .values
+                    .iter()
+                    .map(|(resource, value)| {
+                        let rendered = match value {
+                            crate::resources::ResourceValue::Amount(amount) => {
+                                format!("amount:{amount}")
+                            }
+                            crate::resources::ResourceValue::Items(items) => {
+                                let mut items: Vec<&str> =
+                                    items.iter().map(String::as_str).collect();
+                                items.sort_unstable();
+                                format!("items:{}", items.join(","))
+                            }
+                        };
+                        (resource.clone(), rendered)
+                    })
+                    .collect();
+                (node_id.clone(), values)
+            })
+            .collect()
+    }
+
+    /// The delta refresh's whole contract: after a changeset is projected,
+    /// the read model must hold exactly what a full reload of committed
+    /// state would produce — allocations, the pools derived from them, and
+    /// the epoch mirror.
+    fn assert_model_matches_full_reload(store: &Store, label: &str) -> R<()> {
+        let cached = store.scheduling_read_model()?;
+        let truth = store.load_read_model()?;
+        assert_eq!(
+            allocation_cache_view(&cached)?,
+            allocation_cache_view(&truth)?,
+            "{label}: allocations_by_node must equal a full reload"
+        );
+        assert_eq!(
+            node_pool_view(&cached),
+            node_pool_view(&truth),
+            "{label}: node_pools must equal a full reload"
+        );
+        for (scope, epoch) in &truth.scope_epochs {
+            assert_eq!(
+                cached.scope_epochs.get(scope),
+                Some(epoch),
+                "{label}: epoch mirror for {scope} must equal committed state"
+            );
+        }
+        Ok(())
+    }
+
+    /// Point the round-robin scrub at one specific node, so a test can prove
+    /// which mechanism repaired a cache entry: the delta's own fallback, or
+    /// the scrub.
+    fn aim_scrub_at(store: &Store, node_id: &str) -> R<()> {
+        let mut queue = store
+            .alloc_scrub_queue
+            .lock()
+            .map_err(|_| anyhow!("scrub queue lock poisoned"))?;
+        *queue = vec![node_id.to_string()];
+        Ok(())
+    }
+
+    /// The node the scrub is parked on while a test proves something about
+    /// the delta itself. Nothing is ever placed here, so a scrub of it can
+    /// neither hide a bad splice nor repair one.
+    const SCRUB_PARK_NODE: &str = "node-park";
+
+    /// [`apply_captured`] with the scrub parked (see [`SCRUB_PARK_NODE`]):
+    /// whatever the read model looks like afterwards, the delta put it
+    /// there.
+    fn apply_captured_delta_only<T>(store: &Store, f: impl FnOnce(&Store) -> R<T>) -> R<T> {
+        aim_scrub_at(store, SCRUB_PARK_NODE)?;
+        apply_captured(store, f)
+    }
+
+    /// Add an allocation to a node's cached list that committed state does
+    /// not have — the drift a delta refresh cannot see, because no changeset
+    /// will ever name it.
+    fn plant_phantom_allocation(store: &Store, node_id: &str, template: &Allocation) -> R<i64> {
+        let mut guard = store.read_model_writer()?;
+        let entry = guard
+            .allocations_by_node
+            .entry(node_id.to_string())
+            .or_default();
+        let allocations = Arc::make_mut(entry);
+        let phantom_id = 900_000 + allocations.len() as i64;
+        allocations.push(Allocation {
+            id: phantom_id,
+            node_id: node_id.to_string(),
+            ..template.clone()
+        });
+        Ok(phantom_id)
+    }
+
+    /// The delta refresh replaces a full per-node reload, so the only thing
+    /// that makes it safe is producing the same model: after inserts,
+    /// in-place updates, deletes, an eviction, and a mixed changeset, the
+    /// delta-refreshed read model must equal what a full reload of committed
+    /// state would build.
+    #[test]
+    fn a_delta_refreshed_read_model_equals_a_full_reload() -> R<()> {
+        let store = setup_store()?;
+        for node_id in ["node-a", "node-b", SCRUB_PARK_NODE] {
+            store.insert_node(make_node_msg(node_id, "ready"))?;
+        }
+        let (job_config_id, task_id) = submit_named_job(&store, "delta-demo")?;
+
+        // INSERT, on two different nodes.
+        let first = apply_captured_delta_only(&store, |s| s.place_alloc("node-a", task_id))?;
+        assert_model_matches_full_reload(&store, "insert")?;
+        let second = apply_captured_delta_only(&store, |s| s.place_alloc("node-b", task_id))?;
+        assert_model_matches_full_reload(&store, "second insert")?;
+        assert_eq!(
+            store
+                .cached_allocations_by_node()?
+                .get("node-a")
+                .map(Vec::len),
+            Some(1),
+            "the delta spliced the placement into node-a's list"
+        );
+
+        // UPDATE in place: a status change names no node at all (only the
+        // changed column rides the record), so this is the case that has to
+        // find its node from the row it re-reads.
+        apply_captured_delta_only(&store, |s| s.complete_allocation(first.id, true))?;
+        assert_model_matches_full_reload(&store, "in-place update")?;
+        assert_eq!(
+            store
+                .cached_allocations_by_node()?
+                .get("node-a")
+                .and_then(|allocs| allocs.first())
+                .map(|alloc| alloc.status.clone())
+                .as_deref(),
+            Some(ALLOCATION_STATUS_COMPLETE),
+            "the delta patched the changed row rather than reloading the node"
+        );
+
+        // DELETE.
+        apply_captured_delta_only(&store, |s| s.remove_allocation_by_id(second.id))?;
+        assert_model_matches_full_reload(&store, "delete")?;
+        assert!(
+            store
+                .cached_allocations_by_node()?
+                .get("node-b")
+                .map_or(true, Vec::is_empty),
+            "node-b's only allocation was removed"
+        );
+
+        // EVICTION: a removal that carries a stop notice and a cause, the
+        // shape preemption and drain commit.
+        let victim = apply_captured_delta_only(&store, |s| s.place_alloc("node-b", task_id))?;
+        apply_captured_delta_only(&store, |s| {
+            s.remove_allocation_by_id_because(victim.id, StopCause::Preempted)
+        })?;
+        assert_model_matches_full_reload(&store, "eviction")?;
+
+        // MIXED: two placements, a removal, and a status change in ONE
+        // changeset, across both nodes.
+        let doomed = apply_captured_delta_only(&store, |s| s.place_alloc("node-a", task_id))?;
+        apply_captured_delta_only(&store, |s| {
+            s.place_alloc("node-a", task_id)?;
+            s.place_alloc("node-b", task_id)?;
+            s.remove_allocation_by_id(doomed.id)?;
+            s.complete_allocation(first.id, false)?;
+            Ok(())
+        })?;
+        assert_model_matches_full_reload(&store, "mixed changeset")?;
+
+        // A Fresh plan's wholesale replacement: every allocation of the job
+        // config retired in one changeset.
+        apply_captured_delta_only(&store, |s| s.remove_allocs_for_job_config(&job_config_id))?;
+        assert_model_matches_full_reload(&store, "wholesale removal")?;
+        Ok(())
+    }
+
+    /// The property the delta gives up is self-healing: it can only patch
+    /// entries that were already right. So a delta that contradicts the
+    /// cache — here a removal whose row is not in the cached list — must
+    /// hand that node to the full reload, which is self-healing and takes
+    /// the unrelated phantom with it.
+    #[test]
+    fn a_delta_that_contradicts_the_cache_reloads_that_node_in_full() -> R<()> {
+        let store = setup_store()?;
+        for node_id in ["node-a", "node-b"] {
+            store.insert_node(make_node_msg(node_id, "ready"))?;
+        }
+        let (_job_config_id, task_id) = submit_named_job(&store, "drift-demo")?;
+        let first = apply_captured(&store, |s| s.place_alloc("node-a", task_id))?;
+        apply_captured(&store, |s| s.place_alloc("node-a", task_id))?;
+
+        // Corrupt node-a's cached list: drop a row committed state has, and
+        // add one it does not.
+        let phantom_id = plant_phantom_allocation(&store, "node-a", &first)?;
+        {
+            let mut guard = store.read_model_writer()?;
+            let entry = guard
+                .allocations_by_node
+                .get_mut("node-a")
+                .context("node-a allocations")?;
+            Arc::make_mut(entry).retain(|allocation| allocation.id != first.id);
+        }
+
+        // Keep the scrub away from node-a, so any repair must come from the
+        // delta's own fallback.
+        aim_scrub_at(&store, "node-b")?;
+        apply_captured(&store, |s| s.remove_allocation_by_id(first.id))?;
+
+        let cached = store.cached_allocations_by_node()?;
+        let node_a = cached.get("node-a").context("node-a allocations")?;
+        assert!(
+            !node_a.iter().any(|allocation| allocation.id == phantom_id),
+            "the contradicted node must be reloaded in full, phantom and all: {node_a:?}"
+        );
+        assert_model_matches_full_reload(&store, "contradicted delta")?;
+        Ok(())
+    }
+
+    /// The same fallback, from the other direction: a changeset that names a
+    /// row committed state does not have cannot be spliced at all — the
+    /// delta cannot even say which node it belonged to — so the whole
+    /// changeset's scopes go back to the full reload.
+    #[test]
+    fn a_delta_naming_an_uncommitted_row_falls_back_to_a_full_reload() -> R<()> {
+        let store = setup_store()?;
+        for node_id in ["node-a", "node-b"] {
+            store.insert_node(make_node_msg(node_id, "ready"))?;
+        }
+        let (_job_config_id, task_id) = submit_named_job(&store, "missing-demo")?;
+        let placed = apply_captured(&store, |s| s.place_alloc("node-a", task_id))?;
+        let phantom_id = plant_phantom_allocation(&store, "node-a", &placed)?;
+
+        aim_scrub_at(&store, "node-b")?;
+        let mut delta = AllocationDelta::new();
+        delta.upserts.insert(4_242);
+        delta.inserts.insert(4_242);
+        store.cache_apply_allocation_delta(
+            &delta,
+            &BTreeSet::from(["node-a".to_string()]),
+            &BTreeSet::new(),
+        )?;
+
+        let cached = store.cached_allocations_by_node()?;
+        let node_a = cached.get("node-a").context("node-a allocations")?;
+        assert!(
+            !node_a.iter().any(|allocation| allocation.id == phantom_id),
+            "an unsplicable delta must reload its scopes in full: {node_a:?}"
+        );
+        assert_model_matches_full_reload(&store, "unsplicable delta")?;
+        Ok(())
+    }
+
+    /// Drift on a node no later changeset touches is the dangerous case — a
+    /// node wrongly believed full is a node the scheduler then never writes
+    /// to, so no delta ever visits it again. The round-robin scrub is what
+    /// bounds that: one node reloaded in full per projected changeset,
+    /// refilled with the whole fleet when the queue empties.
+    #[test]
+    fn the_allocation_scrub_repairs_a_node_no_delta_touches() -> R<()> {
+        let store = setup_store()?;
+        for node_id in ["node-a", "node-b"] {
+            store.insert_node(make_node_msg(node_id, "ready"))?;
+        }
+        let (_job_config_id, task_id) = submit_named_job(&store, "scrub-demo")?;
+        let placed = apply_captured(&store, |s| s.place_alloc("node-b", task_id))?;
+        let phantom_id = plant_phantom_allocation(&store, "node-b", &placed)?;
+
+        // A changeset that touches only node-a. Without the scrub node-b
+        // would keep its phantom forever.
+        aim_scrub_at(&store, "node-b")?;
+        apply_captured(&store, |s| s.place_alloc("node-a", task_id))?;
+
+        let cached = store.cached_allocations_by_node()?;
+        let node_b = cached.get("node-b").context("node-b allocations")?;
+        assert!(
+            !node_b.iter().any(|allocation| allocation.id == phantom_id),
+            "the scrub must repair a node the delta never named: {node_b:?}"
+        );
+        assert_model_matches_full_reload(&store, "scrubbed node")?;
+
+        // The queue refills with the whole fleet once it drains, so the
+        // sweep continues rather than stopping at the first pass.
+        let refilled = store.next_alloc_scrub_node()?;
+        assert!(
+            refilled.is_some(),
+            "an emptied scrub queue must refill from the fleet"
         );
         Ok(())
     }
