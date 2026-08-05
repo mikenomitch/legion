@@ -18,6 +18,18 @@ pub fn dispatch_allocations(store: &Store, allocations: &[Allocation]) -> R<()> 
     let mut task_cache: HashMap<String, HashMap<i64, TaskConfig>> = HashMap::new();
     let mut node_cache: HashMap<String, crate::structs::Node> = HashMap::new();
 
+    // Requests are built first, then sent together. The send used to be a
+    // sequential `await` per allocation, so an eval placing N allocations
+    // paid N worker round trips end to end, on the eval worker's own
+    // thread — and dispatch sits OUTSIDE the plan-phase stopwatch, so none
+    // of it appeared in the measured 41 ms/eval while all of it counted
+    // against the ~298 ms an eval actually occupied a worker.
+    //
+    // Building stays sequential: it is local store reads, and it fills the
+    // task/node caches that make those reads cheap.
+    let mut pending: Vec<(String, crate::structs::PostWorkRequest, i64, String)> =
+        Vec::with_capacity(allocations.len());
+
     run_dispatch_future(async {
         let mut clients: HashMap<String, WorkerClient<Channel>> = HashMap::new();
         for allocation in allocations {
@@ -65,32 +77,47 @@ pub fn dispatch_allocations(store: &Store, allocations: &[Allocation]) -> R<()> 
                 allocation: Some(task_allocation),
             };
 
-            let client = if let Some(client) = clients.get_mut(&worker_address) {
-                client
-            } else {
+            if !clients.contains_key(&worker_address) {
                 let endpoint = Endpoint::from_shared(worker_address.clone())?;
                 let channel = endpoint.connect_lazy();
                 clients.insert(worker_address.clone(), WorkerClient::new(channel));
-                clients
-                    .get_mut(&worker_address)
-                    .context("Failed to build worker client")?
-            };
-
-            if let Err(err) = client.post_work(request).await {
-                warn!(
-                    allocation_id = allocation.id,
-                    node_id = %allocation.node_id,
-                    error = ?err,
-                    "Failed to dispatch allocation to worker"
-                );
-                continue;
             }
-            info!(
-                allocation_id = allocation.id,
-                node_id = %allocation.node_id,
-                "Dispatched allocation to worker"
-            );
+            pending.push((
+                worker_address,
+                request,
+                allocation.id,
+                allocation.node_id.clone(),
+            ));
         }
+
+        // All sends at once. Each allocation still gets its own client
+        // clone (a `Channel` clone shares the connection pool), so this is
+        // N concurrent RPCs over the same set of connections rather than N
+        // round trips back to back. Failures stay per-allocation and
+        // non-fatal: the heartbeat reply carries the full desired set, so a
+        // dropped push costs at most one heartbeat interval.
+        let sends = pending.into_iter().map(|(address, request, id, node_id)| {
+            let mut client = clients
+                .get(&address)
+                .expect("client inserted above")
+                .clone();
+            async move {
+                match client.post_work(request).await {
+                    Ok(_) => info!(
+                        allocation_id = id,
+                        node_id = %node_id,
+                        "Dispatched allocation to worker"
+                    ),
+                    Err(err) => warn!(
+                        allocation_id = id,
+                        node_id = %node_id,
+                        error = ?err,
+                        "Failed to dispatch allocation to worker"
+                    ),
+                }
+            }
+        });
+        futures::future::join_all(sends).await;
         Ok::<(), anyhow::Error>(())
     })?;
 

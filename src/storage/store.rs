@@ -2665,13 +2665,30 @@ impl Store {
         Ok(latest)
     }
 
+    /// Bump a scope's epoch and return the new value.
+    ///
+    /// One statement on the hot path, not four. This used to be
+    /// `ensure` + `UPDATE` + `ensure` again + `SELECT`, and a plan bumps
+    /// one scope per bound node plus the job config — about 28 statements
+    /// per plan on the benchmark workload, all inside the capture that the
+    /// scheduler lane executes serially. `UPDATE … RETURNING` collapses
+    /// the common case (the row exists) to a single round through SQLite;
+    /// the insert only runs when the scope is genuinely new.
     fn bump_scope_epoch_tx(&self, tx: &Connection, scope_type: &str, scope_id: &str) -> R<i64> {
+        const BUMP: &str = "UPDATE allocation_epoch_partition SET epoch = epoch + 1 \
+             WHERE scope_type = ?1 AND scope_id = ?2 RETURNING epoch;";
+        if let Some(epoch) = tx
+            .query_row(BUMP, params![scope_type, scope_id], |row| row.get(0))
+            .optional()?
+        {
+            return Ok(epoch);
+        }
+        // First write for this scope: seed it, then bump. The seed is 0, so
+        // the bump lands on 1 exactly as the old four-statement form did.
         self.ensure_scope_epoch_tx(tx, scope_type, scope_id)?;
-        tx.execute(
-            "UPDATE allocation_epoch_partition SET epoch = epoch + 1 WHERE scope_type = ?1 AND scope_id = ?2;",
-            params![scope_type, scope_id],
-        )?;
-        self.scope_epoch_tx(tx, scope_type, scope_id)
+        tx.query_row(BUMP, params![scope_type, scope_id], |row| row.get(0))
+            .optional()?
+            .context("epoch row vanished between insert and bump")
     }
 
     fn bump_job_config_epoch_tx(&self, tx: &Connection, job_config_id: &str) -> R<i64> {
