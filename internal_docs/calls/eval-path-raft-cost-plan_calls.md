@@ -4,7 +4,41 @@ Plan: [`../plans/eval-path-raft-cost-plan.md`](../plans/eval-path-raft-cost-plan
 
 Ranked by project impact; the number is the rank.
 
-## 1. Fuse claim and complete, rather than making the lane parallel
+## 1. Meter eval wakes by work, not by the eval table moving
+
+- **The call:** count the evals a changeset makes *claimable* and wake
+  exactly that many workers with `notify_one`, instead of calling
+  `notify_waiters` whenever any `eval` row changed.
+- **Alternatives.** (a) Keep the broadcast and make an empty `claim_eval`
+  cheap — serve it from a local read instead of a quorum round.
+  (b) Have workers back off when they lose the claim race, so the herd
+  self-limits after the first round. (c) Leave it and cap `evalThreads`
+  low, which is what the phase-2 and phase-3 numbers effectively did.
+- **Trade-off.** A targeted wake can under-notify where a broadcast
+  cannot: if the wake count is ever wrong, an eval could sit pending with
+  every worker parked. That risk is what the broadcast was buying.
+- **Why (performance).** Every eval crosses the projection at least three
+  times — enqueued, claimed, completed — and only the first is work for a
+  parked worker. The broadcast handed all N workers a `claim_eval` for
+  each of the three, and a claim is a scheduler-lane quorum round whether
+  or not it finds anything, so N-1 of every N were pure waste that scaled
+  with the pool. Phase 3 measured it directly: 16,678 scheduler-lane raft
+  ops at 4 threads against 47,096 at 16, for the same 25,002 allocations,
+  with throughput *falling* from 203.19 to 164.72 alloc/sec. (a) makes the
+  waste cheaper without making it smaller and leaves the pool doing N
+  wakeups per unit of work. (b) is a heuristic layered over a bug whose
+  fix is exact. The under-notification risk in the trade-off is bounded
+  rather than accepted: `wait_for_next_eval` sizes its park by
+  `next_pending_eval_delay`, which is zero while any eval is ready, so a
+  worker that misses a permit re-checks instead of sleeping — the wake is
+  an optimization over a poll that was always correct.
+- **Surface.** None for the user, except that `evalThreads` now buys
+  throughput instead of costing it. The new
+  `legion_eval_claim_total{outcome}` is what makes the waste visible:
+  a large `empty` share means workers are being woken for work that does
+  not exist.
+
+## 2. Fuse claim and complete, rather than making the lane parallel
 
 - **The call:** halve the scheduler lane's per-eval quorum rounds by
   fusing the terminal write with the next claim
@@ -19,9 +53,12 @@ Ranked by project impact; the number is the rank.
   is the lane's *throughput* rather than its round count, this moves the
   number less than hoped — which the exit criterion in the plan is
   written to detect.
-- **Why (performance, at a risk the evidence supports).** (c) is refuted:
-  phase 2 measured throughput *falling* from 4 → 16 eval threads, because
-  threads and lanes are different resources. (b) is the real fix and is
+- **Why (performance, at a risk the evidence supports).** (c) looked
+  refuted: phase 2 measured throughput *falling* from 4 → 16 eval threads,
+  which was read at the time as threads and lanes being different
+  resources. Phase 4 found the real cause — the wake herd in entry 1, which
+  made every extra thread cost a wasted quorum round — so (c) was never
+  tested on its merits. It is worth retrying now that the herd is gone. (b) is the real fix and is
   also the largest possible change to Legion's durability story — the
   replicated queue is what makes acknowledged work survive a failover
   (JC-41), and phase-3's own data does not justify spending that. (a) is
@@ -32,7 +69,7 @@ Ranked by project impact; the number is the rank.
   worker immediately asks for more work. Do the cheap, safe half first and
   let the measurement decide whether the expensive half is needed.
 
-## 2. The fused claim is handled before the leadership gate
+## 3. The fused claim is handled before the leadership gate
 
 - **The call:** a worker holding an eval handed back by the previous
   fused write processes it even if `is_raft_leader` now reports false;
@@ -52,7 +89,7 @@ Ranked by project impact; the number is the rank.
   tested, so the honest framing is that fusing does not widen the window
   it inherits.
 
-## 3. A panicked handler writes nothing
+## 4. A panicked handler writes nothing
 
 - **The call:** when `spawn_blocking` returns `Err` (handler panicked or
   was cancelled), the loop logs and writes no outcome, leaving the eval
@@ -68,7 +105,7 @@ Ranked by project impact; the number is the rank.
   both fixed). Writing nothing is the only option that cannot lose work,
   and it matches what a crashed worker already produces.
 
-## 4. Batched enqueue takes a request struct, not N arguments
+## 5. Batched enqueue takes a request struct, not N arguments
 
 - **The call:** `enqueue_evals(Vec<EvalRequest>)` with a struct carrying
   kind/job/config/node/priority/delay, plus an `EvalRequest::for_job`
@@ -84,7 +121,7 @@ Ranked by project impact; the number is the rank.
   half of the storm — an obvious thing to build. (b) would have fixed
   today's four loops and left the next one to rediscover the problem.
 
-## 5. Local benchmarks are reported as a no-regression check only
+## 6. Local benchmarks are reported as a no-regression check only
 
 - **The call:** the PR quotes the local SLO gate as "no regression" and
   explicitly declines to claim a throughput win from it.
