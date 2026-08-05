@@ -4,7 +4,86 @@ Plan: [`../plans/eval-path-raft-cost-plan.md`](../plans/eval-path-raft-cost-plan
 
 Ranked by project impact; the number is the rank.
 
-## 1. Meter eval wakes by work, not by the eval table moving
+## 1. The apply-time free pool is a validated cache, not a maintained total
+
+- **The call:** `Store::free_pool_for_node_tx` now reads a node's total
+  allocation usage from a new `node_alloc_usage` row, and trusts that row
+  only when a **fingerprint of the live allocation rows** — the node's
+  allocation epoch, the row count, and the sum of the allocation ids —
+  still matches the one stored beside it. A mismatch rebuilds from the
+  rows, exactly as before. The plan-apply transaction refreshes the row at
+  the end of a successful apply, and only if the live fingerprint is
+  precisely the one it predicted (what it read, plus the allocations it
+  itself inserted).
+- **Alternatives.** (a) A genuinely denormalized per-node capacity row,
+  maintained by every path that inserts or removes an allocation. (b) A
+  SQL aggregate (`SUM(json_extract(...)) … GROUP BY node_id`) that avoids
+  materializing rows and JSON into Rust. (c) Maintain the row from SQLite
+  triggers on `allocation`, which fire for any DML whatever the caller.
+  (d) Memoize parsed `resources` per allocation id in process memory.
+- **Trade-off.** The fingerprint is still an O(rows-on-node) index scan,
+  so this does not make the apply cost *flat* in cluster fill the way (a)
+  would — it makes the per-row constant roughly two orders of magnitude
+  smaller (a b-tree walk over `idx_allocation_node_id` versus a row read
+  plus a `serde_json` parse plus a normalize plus a `ResourceRequest`
+  build). And the aggregate re-associates a float sum, so the number can
+  differ from the row walk's by a rounding step. It is also a new
+  replicated table, which is a new thing a future migration has to think
+  about (a rebuild of `allocation` that renumbers ids must clear it).
+- **Why (performance, without buying it with correctness).** The measured
+  problem is that the serialized plan-apply commit does work proportional
+  to how full the cluster is while the work per eval stays constant: at
+  5,000 nodes, ~44 placements read ~440 allocation rows at 50k allocations
+  live and ~1,760 at 200k, and throughput fell 736.1 → 456.6 → 272.9
+  alloc/s across those fills — about 1.6x per doubling, while plan time
+  grew only 22%.
+  **A free-capacity number that drifts high overcommits a node**, which is
+  a worse failure than slow scheduling by a wide margin, so the design
+  question was not "how fast" but "what happens when the fast path is
+  wrong". (a) answers that with discipline: every current and *future*
+  allocation writer must remember the update, and a missed one is silent
+  overcommit with no test that would catch it — and the audit needed for
+  that confidence is not available here. The evidence is concrete: two
+  removal paths (`remove_allocation_by_id`, `remove_allocs_for_job_config`)
+  already bump only the job-config epoch and not the node's, so even the
+  invariant that *is* maintained today is not total. (c) fixes exactly
+  that by moving maintenance below the callers — but a changeset-replicated
+  schema with no triggers anywhere in it is the wrong place to introduce
+  the first one on the scheduler's hot table, since whether
+  `sqlite3changeset_apply` re-fires them decides between "works" and
+  "every replica aborts", and that cannot be settled here. (d) has the
+  same hazard in a nastier form: SQLite reuses a rowid once the highest
+  row is deleted, so a memo keyed by allocation id can hand a new
+  allocation the resources of a deleted one.
+  The validated cache keeps the *asymptotics* of (b) — the residual scan
+  is O(rows on the node) either way — while beating (b)'s constant, and it
+  makes drift structurally impossible rather than merely unlikely: the
+  value is checked against the rows on every read, so the worst a stale,
+  wrong, or absent row can do is cost one rebuild. Maintenance is an
+  optimization; validation is the guarantee. That is also what makes it
+  safe under version skew: an older manager binary neither reads nor
+  writes the table, so a leader on either side of an upgrade simply finds
+  the fingerprints stale.
+  Measured locally on the rebuild itself: 15.573 → 8.635 µs per pool at 10
+  allocations/node, 37.764 → 9.358 µs at 40 — i.e. over a 4x change in
+  fill the old path grows 2.4x and the new one 1.08x, which is the slope
+  the AWS ladder was measuring.
+- **The invariant, and how it fails.** `node_alloc_usage.usage_json` is the
+  aggregated usage of every allocation on `node_id` as of the
+  `(alloc_epoch, alloc_count, alloc_id_sum)` beside it. It is *never*
+  read without re-deriving that fingerprint from `allocation`, so the
+  failure mode is bounded to "the fingerprint matched but the aggregate is
+  wrong", which requires the row content to change under a preserved id
+  set — i.e. an in-place `UPDATE` of `allocation.resources`, which nothing
+  does today. A future writer that starts mutating `resources` in place
+  must clear this table in the same transaction.
+- **Surface.** None. No jobspec, CLI, or API change; identical placement
+  decisions. The one thing an operator can observe is the table itself,
+  and one known wart: a node removed from the cluster leaves its row
+  behind (`remove_node` is a control-lane op and may not write a
+  scheduler-lane table), inert and ~100 bytes.
+
+## 2. Meter eval wakes by work, not by the eval table moving
 
 - **The call:** count the evals a changeset makes *claimable* and wake
   exactly that many workers with `notify_one`, instead of calling
@@ -38,7 +117,7 @@ Ranked by project impact; the number is the rank.
   a large `empty` share means workers are being woken for work that does
   not exist.
 
-## 2. Fuse claim and complete, rather than making the lane parallel
+## 3. Fuse claim and complete, rather than making the lane parallel
 
 - **The call:** halve the scheduler lane's per-eval quorum rounds by
   fusing the terminal write with the next claim
@@ -56,7 +135,7 @@ Ranked by project impact; the number is the rank.
 - **Why (performance, at a risk the evidence supports).** (c) looked
   refuted: phase 2 measured throughput *falling* from 4 → 16 eval threads,
   which was read at the time as threads and lanes being different
-  resources. Phase 4 found the real cause — the wake herd in entry 1, which
+  resources. Phase 4 found the real cause — the wake herd in entry 2, which
   made every extra thread cost a wasted quorum round — so (c) was never
   tested on its merits. It is worth retrying now that the herd is gone. (b) is the real fix and is
   also the largest possible change to Legion's durability story — the
@@ -69,7 +148,7 @@ Ranked by project impact; the number is the rank.
   worker immediately asks for more work. Do the cheap, safe half first and
   let the measurement decide whether the expensive half is needed.
 
-## 3. The fused claim is handled before the leadership gate
+## 4. The fused claim is handled before the leadership gate
 
 - **The call:** a worker holding an eval handed back by the previous
   fused write processes it even if `is_raft_leader` now reports false;
@@ -89,7 +168,7 @@ Ranked by project impact; the number is the rank.
   tested, so the honest framing is that fusing does not widen the window
   it inherits.
 
-## 4. A panicked handler writes nothing
+## 5. A panicked handler writes nothing
 
 - **The call:** when `spawn_blocking` returns `Err` (handler panicked or
   was cancelled), the loop logs and writes no outcome, leaving the eval
@@ -105,7 +184,7 @@ Ranked by project impact; the number is the rank.
   both fixed). Writing nothing is the only option that cannot lose work,
   and it matches what a crashed worker already produces.
 
-## 5. Batched enqueue takes a request struct, not N arguments
+## 6. Batched enqueue takes a request struct, not N arguments
 
 - **The call:** `enqueue_evals(Vec<EvalRequest>)` with a struct carrying
   kind/job/config/node/priority/delay, plus an `EvalRequest::for_job`
@@ -121,7 +200,7 @@ Ranked by project impact; the number is the rank.
   half of the storm — an obvious thing to build. (b) would have fixed
   today's four loops and left the next one to rediscover the problem.
 
-## 6. Local benchmarks are reported as a no-regression check only
+## 7. Local benchmarks are reported as a no-regression check only
 
 - **The call:** the PR quotes the local SLO gate as "no regression" and
   explicitly declines to claim a throughput win from it.

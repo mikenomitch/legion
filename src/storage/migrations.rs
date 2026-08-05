@@ -1139,6 +1139,53 @@ pub fn get_migrations() -> Migrations<'static> {
         // older manager binary ignores the column entirely, so a manager
         // rollback is safe.
         M::up("ALTER TABLE node_health ADD COLUMN lost_after_seconds INTEGER;").down(""),
+        // Per-node cached allocation usage for the plan-apply capacity
+        // recheck (`Store::free_pool_for_node_tx`).
+        //
+        // Rebuilding a node's free pool used to read EVERY allocation row on
+        // that node and parse every `resources` blob, inside the serialized
+        // plan-apply commit. That made the cost of committing a plan scale
+        // with how full the cluster is while the work per plan stayed
+        // constant: at 5,000 nodes an eval touching ~44 nodes read ~440 rows
+        // with 50k allocations live and ~1,760 with 200k, for the same 44
+        // placements. Measured throughput fell 736 -> 457 -> 273 alloc/s
+        // across those three fills — roughly 1.6x per doubling.
+        //
+        // This table caches the aggregate ("everything on the node adds up
+        // to this much") next to a FINGERPRINT of the rows it was derived
+        // from: the node's allocation epoch, the row count, and the sum of
+        // the allocation ids. The apply path recomputes that fingerprint
+        // (index-only — no row bodies, no JSON) and only trusts the cached
+        // aggregate when it still matches.
+        //
+        // It is therefore a CACHE, not a maintained invariant: nothing has
+        // to remember to update it. Any writer that adds or removes an
+        // allocation by any path invalidates it implicitly, and the worst a
+        // stale row can do is cost one rebuild. A wrong free-capacity number
+        // overcommits a node, so "validated against the rows" is the only
+        // form of this that is safe to ship.
+        //
+        // Purely additive, no backfill: an empty table means every node
+        // rebuilds once. An older manager binary neither reads nor writes
+        // it, so a mixed-version cluster (and a rollback) is safe in both
+        // directions — a new leader taking over after an old one placed
+        // allocations simply finds the fingerprints no longer match.
+        //
+        // NOTE for a future migration that REBUILDS `allocation` (the
+        // ownerlane pattern above): the fingerprint is computed from live
+        // rows, so a rebuild that preserves ids preserves validity. One that
+        // renumbers ids must `DELETE FROM node_alloc_usage` in the same
+        // migration.
+        M::up(
+            "CREATE TABLE IF NOT EXISTS node_alloc_usage (
+            node_id STRING PRIMARY KEY,
+            alloc_epoch INTEGER NOT NULL,
+            alloc_count INTEGER NOT NULL,
+            alloc_id_sum INTEGER NOT NULL,
+            usage_json JSONB NOT NULL
+        )",
+        )
+        .down("DROP TABLE IF EXISTS node_alloc_usage;"),
     ])
 }
 

@@ -65,6 +65,11 @@ Main tables (see migrations):
 - `manager_config`
 - `kv_entry`, `kv_lock`, `job_kv_reference`
 - `allocation_epoch`, `plan_submission`
+- `node_alloc_usage` — a **cache**, not a source of truth: one row per node
+  holding the aggregated resource usage of that node's allocations, beside a
+  fingerprint of the rows it was derived from. Read only by the plan-apply
+  capacity recheck, and only when the fingerprint still matches
+  (see [scheduler-and-eval-loop.md](scheduler-and-eval-loop.md#the-per-node-usage-cache))
 - `rollout`, `allocation_health`, `rollout_event`
 - `instance` (stateful identity), `volume` (the storage its handle points at —
   see [volumes.md](volumes.md))

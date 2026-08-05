@@ -224,6 +224,45 @@ every placement against the **fresh** node row before inserting it:
   arithmetic as the planner's ledger) and every placement must still fit,
   with earlier placements in the same plan debited.
 
+#### The per-node usage cache
+
+Rebuilding that free pool used to read **every** allocation row on the node
+and parse every stored `resources` blob, inside the serialized plan-apply
+commit. The cost of committing a plan therefore grew with how full the
+cluster was while the plan's own work stayed constant: on a 5,000-node
+fleet, the same ~44 placements read ~440 allocation rows with 50,000
+allocations live and ~1,760 with 200,000.
+
+A node's total allocation usage is now cached in `node_alloc_usage`, one
+row per node. The cache is **validated, never trusted**: each row stores a
+fingerprint of the allocation rows it was computed from — the node's
+allocation epoch, the row count, and the sum of the allocation ids — and
+the apply path recomputes that fingerprint (an index-only read that touches
+no row bodies and parses no JSON) before using the cached value. If it does
+not match, the pool is rebuilt from the rows exactly as before, and the
+plan refreshes the row on its way out.
+
+What this means in practice:
+
+- **The number is unchanged.** The same capacity arithmetic, the same
+  overcommit policy, the same exclusion of a Fresh plan's own job. Cached
+  and rebuilt pools can differ only by a floating-point rounding step,
+  because the cache subtracts one summed total where the rebuild subtracts
+  each allocation in turn.
+- **Nothing has to maintain it.** Any path that adds or removes an
+  allocation — a placement, a stop, a preemption, a node removal, a job
+  destroy — invalidates the affected rows implicitly, because it moves the
+  fingerprint. A stale, wrong, or missing row costs one rebuild; it can
+  never inflate a node's free capacity.
+- **Version skew is safe in both directions.** A manager binary without
+  this feature neither reads nor writes the table, so a leader on either
+  side of an upgrade simply finds the fingerprints stale and rebuilds. The
+  table is created empty with no backfill.
+
+Known limitation: removing a node leaves its cache row behind (the removal
+runs on a different raft lane than the table's writer). The row is inert
+and roughly 100 bytes.
+
 A failed re-validation on *every* candidate is what rejects a plan; the
 eval handler's conflict retry then re-plans against the node's real
 state. Since the two-pass bind, this re-validation — not the node epoch —

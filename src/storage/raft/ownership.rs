@@ -199,6 +199,16 @@ const TABLE_OWNERS: &[(&str, Owner)] = &[
     // commutative: the insert is an upsert (`INSERT OR REPLACE`), which the
     // commutative class forbids.
     ("allocation_stop_notice", Owner::Lane(Lane::Scheduler)),
+    // `node_alloc_usage` caches the aggregated allocation usage of a node
+    // for the plan-apply capacity recheck, next to a fingerprint of the rows
+    // it was derived from (see the migration that creates it). Written by
+    // exactly one op — `apply_plan_submission`, at the end of a plan it
+    // applied — which is a scheduler-lane op writing it in the same capture
+    // as the placements it describes. Derived state, so a replica needs no
+    // special handling: it receives the leader's rows like any other, and a
+    // new leader's first plan revalidates them against the live allocation
+    // rows before trusting them.
+    ("node_alloc_usage", Owner::Lane(Lane::Scheduler)),
     ("instance", Owner::Lane(Lane::Scheduler)),
     // `volume` rides the scheduler lane: a volume's lifecycle is bound to its
     // instance (`instance` is already scheduler-owned, and `place_alloc`

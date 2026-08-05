@@ -6,7 +6,7 @@ use crate::constants::{
 };
 use crate::constraints::{ConstraintSet, DistinctTracker, PermitSet};
 use crate::prelude::*;
-use crate::resources::{ResourcePolicy, ResourcePool, ResourceRequest};
+use crate::resources::{NodeUsage, ResourcePolicy, ResourcePool, ResourceRequest};
 use crate::scheduling_index::{IndexSet, IndexSettings};
 use crate::storage::errors::StorageError;
 use crate::storage::events::{drafts, EventDraft, SchedulerEventFilter, SchedulerEventRecord};
@@ -539,6 +539,44 @@ impl PlanApplyEffects {
         self.events.extend(other.events);
         self.node_ids.extend(other.node_ids);
         self.job_config_ids.extend(other.job_config_ids);
+    }
+}
+
+/// A node's total allocation usage together with the fingerprint of the
+/// rows it was derived from — the in-flight form of a `node_alloc_usage`
+/// row (see `Store::free_pool_for_node_tx`).
+///
+/// The plan carries one per node it built a pool for, keeps it in step with
+/// its own placements, and publishes it at the end of a successful apply
+/// only if the live rows still agree with it.
+#[derive(Debug, Clone)]
+struct NodeUsageSnapshot {
+    node_id: String,
+    /// Allocation rows on the node, and the sum of their ids. Together with
+    /// the node's allocation epoch these are the fingerprint; the epoch is
+    /// read fresh at publish time because the plan's own placements bump it.
+    count: i64,
+    id_sum: i64,
+    /// Usage of EVERY allocation on the node — never a job-filtered subset,
+    /// so the cached value is usable by the next plan whichever job it is
+    /// for.
+    total: NodeUsage,
+}
+
+/// The planned job's own allocations, per node: the rows a Fresh plan's
+/// free pool must not count, gathered once per plan.
+#[derive(Debug, Default)]
+struct OwnAllocationUsage {
+    by_node: HashMap<String, Vec<ResourceRequest>>,
+    /// Nodes where one of the job's own rows would not parse. Subtracting
+    /// what cannot be read is impossible, so these nodes take the exact
+    /// row-filtering path instead.
+    unreadable: HashSet<String>,
+}
+
+impl OwnAllocationUsage {
+    fn requests_on(&self, node_id: &str) -> impl Iterator<Item = &ResourceRequest> {
+        self.by_node.get(node_id).into_iter().flatten()
     }
 }
 
@@ -3663,15 +3701,29 @@ impl Store {
         // be double counted. Reschedule plans drop nothing.
         let drop_own = plan_mode == "fresh";
         let mut free_pools: HashMap<String, ResourcePool> = HashMap::new();
+        // What each rebuilt pool was derived from, kept so the plan can hand
+        // the next plan a usable cache (see `publish_node_usage_tx`). Absent
+        // for a node whose pool came from the uncached fallback.
+        let mut pool_usage: HashMap<String, NodeUsageSnapshot> = HashMap::new();
+        // The planned job's OWN allocations, aggregated per node, read once
+        // for the whole plan instead of re-filtered on every node the walk
+        // touches. Only a Fresh plan needs it; it is read lazily so a plan
+        // that never builds a pool never pays for it.
+        //
+        // One query over `idx_allocation_job_config_id` costs O(this job's
+        // allocations) — bounded by the job the eval is already planning,
+        // and unaffected by how full the rest of the cluster is, which is
+        // the entire point of the rewrite below.
+        let mut own_usage: Option<OwnAllocationUsage> = None;
 
-        // Building one free pool costs a per-node allocation scan, and the
-        // two-pass walk below can attempt every candidate of every
-        // placement. Cap the distinct nodes one plan may rebuild a pool
-        // for, so a pathological plan (hundreds of placements × a long
-        // candidate list, all of them contended) cannot stretch the group
-        // commit's single transaction. Generous by construction: a plan
-        // that binds rank 0 everywhere needs exactly one rebuild per
-        // distinct node.
+        // Building one free pool costs at least a per-node fingerprint scan
+        // (and a full rebuild when the cache misses), and the two-pass walk
+        // below can attempt every candidate of every placement. Cap the
+        // distinct nodes one plan may rebuild a pool for, so a pathological
+        // plan (hundreds of placements × a long candidate list, all of them
+        // contended) cannot stretch the group commit's single transaction.
+        // Generous by construction: a plan that binds rank 0 everywhere
+        // needs exactly one rebuild per distinct node.
         let pool_rebuild_budget = placements.len().saturating_mul(4).max(256);
 
         let mut allocations = Vec::new();
@@ -3850,12 +3902,24 @@ impl Store {
                 }
                 let pool = match free_pools.entry(node_id.clone()) {
                     Entry::Occupied(entry) => entry.into_mut(),
-                    Entry::Vacant(entry) => entry.insert(self.free_pool_for_node_tx(
-                        tx,
-                        node,
-                        &submission.job_config_id,
-                        drop_own,
-                    )?),
+                    Entry::Vacant(entry) => {
+                        if drop_own && own_usage.is_none() {
+                            own_usage =
+                                Some(self.own_allocation_usage_tx(tx, &submission.job_config_id)?);
+                        }
+                        let own = own_usage.as_ref();
+                        let (pool, snapshot) = self.free_pool_for_node_tx(
+                            tx,
+                            node,
+                            &submission.job_config_id,
+                            drop_own,
+                            own,
+                        )?;
+                        if let Some(snapshot) = snapshot {
+                            pool_usage.insert(node_id.clone(), snapshot);
+                        }
+                        entry.insert(pool)
+                    }
                 };
                 // Unparseable task resources fit nowhere — the same
                 // fits-nothing posture as `ResourcePool::free_from_rows`
@@ -3954,6 +4018,9 @@ impl Store {
         if !allocations.is_empty() {
             self.bump_epochs_for_allocations_tx(tx, &allocations)?;
         }
+        // Hand the next plan a warm cache. Runs AFTER the epoch bumps above,
+        // because the epoch is part of the fingerprint the next plan checks.
+        self.publish_node_usage_tx(tx, &mut pool_usage, &allocations, &task_requests)?;
         if body_savepoint {
             tx.execute_batch("RELEASE legion_plan_body;")?;
         }
@@ -4026,13 +4093,58 @@ impl Store {
     /// replacement of the job's allocations; see the call site in
     /// `apply_plan_submission_apply` for why the pool is recomputed at
     /// apply time rather than trusted from the planner's snapshot.
+    ///
+    /// The number this returns is unchanged. How it is obtained is not.
+    ///
+    /// The original form read every allocation row on the node and parsed
+    /// every `resources` blob, inside the serialized plan-apply commit — so
+    /// committing a plan cost O(allocations on the node) while the plan's
+    /// own work stayed constant. At 5,000 nodes the same ~44 placements read
+    /// ~440 rows with 50k allocations live and ~1,760 with 200k, and
+    /// measured throughput fell 736 -> 457 -> 273 alloc/s across those
+    /// fills.
+    ///
+    /// Now the total usage of the node comes from the `node_alloc_usage`
+    /// cache, trusted only when a fingerprint of the live rows — the node's
+    /// allocation epoch, the row count, and the sum of the allocation ids —
+    /// still matches the one stored beside it. The fingerprint reads only
+    /// `idx_allocation_node_id`: no row bodies, no JSON. On a miss this
+    /// falls back to exactly the old walk.
+    ///
+    /// `own` carries the planned job's own allocations (aggregated per node,
+    /// read once per plan), so a Fresh plan's "everything except mine" is
+    /// *total − own* rather than a per-node filtered re-read.
+    ///
+    /// Returns the pool and, when it was computed the cached way, the
+    /// snapshot the caller needs to publish an updated cache entry.
     fn free_pool_for_node_tx(
         &self,
         tx: &Connection,
         node: &Node,
         job_config_id: &str,
         drop_own: bool,
-    ) -> R<ResourcePool> {
+        own: Option<&OwnAllocationUsage>,
+    ) -> R<(ResourcePool, Option<NodeUsageSnapshot>)> {
+        // A node whose own allocations could not be parsed cannot have
+        // `own` subtracted from its total, so it takes the exact old path.
+        let own_unreadable = own.is_some_and(|own| own.unreadable.contains(node.id.as_str()));
+        if !own_unreadable {
+            if let Some(snapshot) = self.node_usage_tx(tx, &node.id)? {
+                let mut usage = snapshot.total.clone();
+                if let Some(own) = own {
+                    for request in own.requests_on(&node.id) {
+                        usage.remove(request);
+                    }
+                }
+                return Ok((ResourcePool::free_from_usage(node, &usage), Some(snapshot)));
+            }
+        }
+
+        // Fallback: the pre-cache walk, byte for byte. Reached when a row on
+        // the node has resources nothing can parse — `free_from_rows` owns
+        // the "then the node fits nothing" rule and the warning that names
+        // the offending row, and a value derived from a row nobody could
+        // read must never enter the cache.
         let mut stmt = tx.prepare_cached(
             "SELECT a.id, a.resources FROM allocation a \
              WHERE a.node_id = ?1 AND (?2 = 0 OR a.job_config_id NOT IN (\
@@ -4043,11 +4155,241 @@ impl Store {
             params![node.id, i64::from(drop_own), job_config_id],
             |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Value>(1)?)),
         )?)?;
-        Ok(ResourcePool::free_from_rows(
-            node,
+        Ok((
+            ResourcePool::free_from_rows(
+                node,
+                rows.iter().map(|(id, resources)| (*id, resources)),
+                &self.resource_policy,
+            ),
+            None,
+        ))
+    }
+
+    /// The fingerprint of a node's allocation rows: `(epoch, count, id
+    /// sum)`. What makes the `node_alloc_usage` cache a cache rather than a
+    /// denormalized invariant somebody has to remember to maintain.
+    ///
+    /// Each part covers a way the row set can move:
+    ///
+    /// - **count** catches inserts and deletes, whatever path made them —
+    ///   including the removal paths that bump only the job-config epoch
+    ///   (`remove_allocation_by_id`, `remove_allocs_for_job_config`), which
+    ///   is why the epoch alone would not do.
+    /// - **id sum** catches a delete paired with an insert that keeps the
+    ///   count.
+    /// - **epoch** catches the one case the first two miss: SQLite reuses a
+    ///   rowid once the highest row is deleted, so deleting the newest
+    ///   allocation and placing another on the same node can reproduce both
+    ///   the count and the sum. Every insert path bumps the node's
+    ///   allocation epoch, so an id reuse cannot also reproduce this.
+    ///
+    /// The count and sum come straight out of `idx_allocation_node_id`,
+    /// which covers both columns — the scan touches no row bodies and parses
+    /// no JSON, which is what makes it ~two orders of magnitude cheaper than
+    /// the walk it replaces.
+    fn node_alloc_fingerprint_tx(&self, tx: &Connection, node_id: &str) -> R<(i64, i64, i64)> {
+        let epoch = self.scope_epoch_tx(tx, "node", node_id)?;
+        let (count, id_sum): (i64, i64) = tx.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(a.id), 0) FROM allocation a WHERE a.node_id = ?1;",
+            [node_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        Ok((epoch, count, id_sum))
+    }
+
+    /// Total usage of every allocation on a node, as of this transaction:
+    /// served from `node_alloc_usage` when its fingerprint still matches the
+    /// live rows, rebuilt (from the same rows the old walk read) when it
+    /// does not.
+    ///
+    /// `None` means "no aggregate can be formed" — a row on the node has
+    /// resources that do not parse — and the caller must take the exact
+    /// row-by-row path. Nothing is cached in that case, so the node keeps
+    /// paying for the walk until the bad row is corrected or removed.
+    fn node_usage_tx(&self, tx: &Connection, node_id: &str) -> R<Option<NodeUsageSnapshot>> {
+        let (epoch, count, id_sum) = self.node_alloc_fingerprint_tx(tx, node_id)?;
+        let cached: Option<String> = tx
+            .query_row(
+                "SELECT usage_json FROM node_alloc_usage \
+                 WHERE node_id = ?1 AND alloc_epoch = ?2 AND alloc_count = ?3 \
+                   AND alloc_id_sum = ?4;",
+                params![node_id, epoch, count, id_sum],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(cached) = cached {
+            match serde_json::from_str::<NodeUsage>(&cached) {
+                Ok(total) => {
+                    return Ok(Some(NodeUsageSnapshot {
+                        node_id: node_id.to_string(),
+                        count,
+                        id_sum,
+                        total,
+                    }))
+                }
+                // Only reachable if the column was written by something that
+                // is not this code. Treated as a miss rather than an error:
+                // the rebuild below overwrites it with a readable value.
+                Err(error) => warn!(
+                    node_id,
+                    %error,
+                    "Cached node allocation usage did not deserialize; rebuilding it"
+                ),
+            }
+        }
+
+        let mut stmt =
+            tx.prepare_cached("SELECT a.id, a.resources FROM allocation a WHERE a.node_id = ?1;")?;
+        let rows = Self::collect_rows(stmt.query_map([node_id], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, Value>(1)?))
+        })?)?;
+        let total = match NodeUsage::from_rows(
             rows.iter().map(|(id, resources)| (*id, resources)),
             &self.resource_policy,
-        ))
+        ) {
+            Ok(total) => total,
+            Err(_) => return Ok(None),
+        };
+        Ok(Some(NodeUsageSnapshot {
+            node_id: node_id.to_string(),
+            count,
+            id_sum,
+            total,
+        }))
+    }
+
+    /// Every allocation the planned job already owns, aggregated per node —
+    /// the rows a Fresh plan's pool must NOT count, read once for the whole
+    /// plan.
+    ///
+    /// This is the same row set the old query excluded with its
+    /// `job_config_id NOT IN (configs of this job)` clause, only gathered
+    /// from the other side: one pass over `idx_allocation_job_config_id`
+    /// costs O(the job's own allocations), where re-filtering per node cost
+    /// O(allocations on that node) × (nodes the walk touched).
+    fn own_allocation_usage_tx(
+        &self,
+        tx: &Connection,
+        job_config_id: &str,
+    ) -> R<OwnAllocationUsage> {
+        let mut stmt = tx.prepare_cached(
+            "SELECT a.node_id, a.id, a.resources FROM allocation a \
+             WHERE a.job_config_id IN (\
+                 SELECT id FROM job_config WHERE job_id = \
+                     (SELECT job_id FROM job_config WHERE id = ?1));",
+        )?;
+        let rows = Self::collect_rows(stmt.query_map([job_config_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Value>(2)?,
+            ))
+        })?)?;
+
+        let mut own = OwnAllocationUsage::default();
+        for (node_id, allocation_id, resources) in rows {
+            let request = self
+                .resource_policy
+                .normalize_task_resources(&resources, false)
+                .and_then(|normalized| ResourceRequest::from_value(&normalized));
+            match request {
+                Ok(request) => own.by_node.entry(node_id).or_default().push(request),
+                // A row this plan's own job owns that cannot be read is not
+                // fatal — the old query simply excluded it without looking.
+                // But "total minus own" cannot subtract what it cannot
+                // parse, so the node falls back to the filtered walk, which
+                // excludes the row the same way the old code did.
+                Err(error) => {
+                    warn!(
+                        node_id,
+                        allocation_id,
+                        %error,
+                        "Planned job's own allocation resources failed to parse; \
+                         rebuilding that node's free pool the uncached way"
+                    );
+                    own.unreadable.insert(node_id);
+                }
+            }
+        }
+        Ok(own)
+    }
+
+    /// Publish an updated `node_alloc_usage` row for every node this plan
+    /// rebuilt a pool for, so the next plan on those nodes reads one row
+    /// instead of every allocation on them.
+    ///
+    /// The safety of the whole cache lives here, in one rule: a row is
+    /// written only when the live fingerprint is *exactly* the one this plan
+    /// predicted — the count and id sum it read, plus precisely the
+    /// allocations it inserted. Anything else that touched the node's rows
+    /// inside this transaction (now or after a future edit to the apply
+    /// path) breaks that equality, and the entry is dropped instead of
+    /// published, sending the next plan through a rebuild.
+    ///
+    /// That is what keeps a cached number from drifting away from reality.
+    /// A free-capacity number that reads lower than the truth costs a
+    /// placement; one that reads higher OVERCOMMITS THE NODE, so the cache
+    /// never publishes a value it cannot tie to the exact set of rows it was
+    /// computed from.
+    fn publish_node_usage_tx(
+        &self,
+        tx: &Connection,
+        pool_usage: &mut HashMap<String, NodeUsageSnapshot>,
+        placed: &[Allocation],
+        task_requests: &HashMap<i64, Option<ResourceRequest>>,
+    ) -> R<()> {
+        if pool_usage.is_empty() {
+            return Ok(());
+        }
+        for allocation in placed {
+            let Some(snapshot) = pool_usage.get_mut(allocation.node_id.as_str()) else {
+                continue;
+            };
+            // The request the walk fitted and debited, not a re-parse of the
+            // row: `insert_allocation_with_data` stores the very value that
+            // produced it, and a placement whose resources did not parse
+            // could not have bound (`can_fit` is false for `None`).
+            let Some(Some(request)) = task_requests.get(&allocation.task_config_id) else {
+                pool_usage.remove(allocation.node_id.as_str());
+                continue;
+            };
+            snapshot.total.add(request);
+            snapshot.count += 1;
+            snapshot.id_sum += allocation.id;
+        }
+
+        for snapshot in pool_usage.values() {
+            let (epoch, count, id_sum) = self.node_alloc_fingerprint_tx(tx, &snapshot.node_id)?;
+            if count != snapshot.count || id_sum != snapshot.id_sum {
+                // Something moved this node's rows that this plan did not
+                // account for. Publishing here would be the drift that
+                // overcommits, so publish nothing.
+                debug!(
+                    node_id = %snapshot.node_id,
+                    "Node allocation rows moved unexpectedly during plan apply; \
+                     leaving its usage cache to be rebuilt"
+                );
+                continue;
+            }
+            tx.execute(
+                "INSERT INTO node_alloc_usage \
+                     (node_id, alloc_epoch, alloc_count, alloc_id_sum, usage_json) \
+                 VALUES (?1, ?2, ?3, ?4, ?5) \
+                 ON CONFLICT(node_id) DO UPDATE SET \
+                     alloc_epoch = excluded.alloc_epoch, \
+                     alloc_count = excluded.alloc_count, \
+                     alloc_id_sum = excluded.alloc_id_sum, \
+                     usage_json = excluded.usage_json;",
+                params![
+                    snapshot.node_id,
+                    epoch,
+                    count,
+                    id_sum,
+                    serde_json::to_string(&snapshot.total)?
+                ],
+            )?;
+        }
+        Ok(())
     }
 
     /// Commit a plan's evictions: delete the victims, release their
@@ -18712,6 +19054,539 @@ mod tests {
             }
         }
 
+        Ok(())
+    }
+
+    // ---------------------------------------------------------------
+    // `node_alloc_usage`: the plan-apply free-pool cache
+    //
+    // The cache's only job is to produce the SAME number the row walk
+    // produced, more cheaply. A free-capacity number that reads lower than
+    // the truth costs a placement; one that reads higher overcommits the
+    // node. So the tests below are equivalence tests against the walk they
+    // replaced, kept verbatim as the oracle.
+    // ---------------------------------------------------------------
+
+    /// The pre-cache body of `free_pool_for_node_tx`, verbatim: read every
+    /// allocation row on the node (minus the planned job's own, on a Fresh
+    /// plan) and subtract them one at a time. Every test in this section
+    /// asserts the cached path agrees with this.
+    fn free_pool_the_old_way(
+        store: &Store,
+        tx: &Connection,
+        node: &Node,
+        job_config_id: &str,
+        drop_own: bool,
+    ) -> R<ResourcePool> {
+        let mut stmt = tx.prepare(
+            "SELECT a.id, a.resources FROM allocation a \
+             WHERE a.node_id = ?1 AND (?2 = 0 OR a.job_config_id NOT IN (\
+                 SELECT id FROM job_config WHERE job_id = \
+                     (SELECT job_id FROM job_config WHERE id = ?3)));",
+        )?;
+        let rows = Store::collect_rows(stmt.query_map(
+            params![node.id, i64::from(drop_own), job_config_id],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Value>(1)?)),
+        )?)?;
+        Ok(ResourcePool::free_from_rows(
+            node,
+            rows.iter().map(|(id, resources)| (*id, resources)),
+            &store.resource_policy,
+        ))
+    }
+
+    /// Two pools agree. Amounts compare with a tolerance because the
+    /// aggregate computes `capacity − (a₁ + a₂ + …)` where the walk computes
+    /// `((capacity − a₁) − a₂) − …`: the same sum, associated differently,
+    /// so they can differ by a float rounding step. Anything larger means a
+    /// whole allocation went missing, which is the bug these tests exist to
+    /// catch.
+    fn assert_pool_eq(actual: &ResourcePool, expected: &ResourcePool, what: &str) {
+        let actual_keys: BTreeSet<&String> = actual.values.keys().collect();
+        let expected_keys: BTreeSet<&String> = expected.values.keys().collect();
+        assert_eq!(actual_keys, expected_keys, "{what}: resource dims differ");
+        for (name, expected_value) in &expected.values {
+            match (&actual.values[name], expected_value) {
+                (
+                    crate::resources::ResourceValue::Amount(got),
+                    crate::resources::ResourceValue::Amount(want),
+                ) => {
+                    let agrees = got == want
+                        || (got.is_finite()
+                            && want.is_finite()
+                            && (got - want).abs() <= 1e-9 * want.abs().max(1.0));
+                    assert!(agrees, "{what}: {name} is {got}, expected {want}");
+                }
+                (
+                    crate::resources::ResourceValue::Items(got),
+                    crate::resources::ResourceValue::Items(want),
+                ) => assert_eq!(got, want, "{what}: {name} items differ"),
+                (got, want) => panic!("{what}: {name} changed kind: {got:?} vs {want:?}"),
+            }
+        }
+    }
+
+    /// Assert the cached path and the walk agree for every node, in both
+    /// `drop_own` modes, and return the snapshots so a caller can publish
+    /// them and re-assert against a WARM cache.
+    fn assert_free_pools_match(
+        store: &Store,
+        tx: &Connection,
+        node_ids: &[&str],
+        job_config_id: &str,
+        label: &str,
+    ) -> R<HashMap<String, NodeUsageSnapshot>> {
+        let mut snapshots = HashMap::new();
+        for drop_own in [false, true] {
+            let own = match drop_own {
+                true => Some(store.own_allocation_usage_tx(tx, job_config_id)?),
+                false => None,
+            };
+            for node_id in node_ids {
+                let node = store.get_node(node_id)?;
+                let expected = free_pool_the_old_way(store, tx, &node, job_config_id, drop_own)?;
+                let (actual, snapshot) = store.free_pool_for_node_tx(
+                    tx,
+                    &node,
+                    job_config_id,
+                    drop_own,
+                    own.as_ref(),
+                )?;
+                assert_pool_eq(
+                    &actual,
+                    &expected,
+                    &format!("{label}: {node_id} (drop_own={drop_own})"),
+                );
+                if let Some(snapshot) = snapshot {
+                    snapshots.insert((*node_id).to_string(), snapshot);
+                }
+            }
+        }
+        Ok(snapshots)
+    }
+
+    fn usage_node_msg(id: &str, config_attrs: &str) -> NodeMsg {
+        NodeMsg {
+            config_attrs: config_attrs.to_string(),
+            // Two cores at 2 GHz and 8 GiB, in the worker's own reporting
+            // shape (byte counts and frequencies arrive as strings), so the
+            // pools under test hold real numbers rather than infinities.
+            fingerprint_attrs: json!({
+                "memory_total": "8589934592",
+                "cpus": {
+                    "0": { "frequency": "2000" },
+                    "1": { "frequency": "2000" },
+                },
+            })
+            .to_string(),
+            ..make_node_msg(id, "ready")
+        }
+    }
+
+    fn insert_usage_job(store: &Store, job_id: &str, config_ids: &[&str]) -> R<()> {
+        let conn = store.write_connection()?;
+        conn.execute(
+            "INSERT INTO job (id, name, status, created_at) VALUES (?1, ?1, 'running', '2026-01-01T00:00:00Z');",
+            [job_id],
+        )?;
+        for (version, config_id) in config_ids.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO job_config (id, name, type, meta, version, created_at, job_id) \
+                 VALUES (?1, ?2, 'service', '{}', ?3, '2026-01-01T00:00:00Z', ?2);",
+                params![config_id, job_id, version as i64 + 1],
+            )?;
+        }
+        Ok(())
+    }
+
+    fn insert_usage_allocation(
+        store: &Store,
+        id: i64,
+        node_id: &str,
+        job_config_id: &str,
+        resources: Value,
+    ) -> R<()> {
+        let conn = store.write_connection()?;
+        conn.execute(
+            "INSERT INTO allocation (id, status, resources, node_id, job_config_id, task_config_id) \
+             VALUES (?1, 'running', ?2, ?3, ?4, 1);",
+            params![id, resources, node_id, job_config_id],
+        )?;
+        Ok(())
+    }
+
+    /// The core equivalence test: across an empty node, nodes carrying
+    /// amount-typed, item-typed and mixed-kind allocations, and both
+    /// `drop_own` modes, the cached free pool equals the one the row walk
+    /// built — on a cold cache (which rebuilds) and again on a warm one
+    /// (which reads the stored aggregate).
+    #[test]
+    fn cached_free_pool_matches_the_row_walk_across_resource_shapes() -> R<()> {
+        let store = setup_store()?;
+        // `node-plain` has only what the fingerprint reports; `node-rich`
+        // adds a device list, a custom counter, a reservation and an
+        // allocation cap, so every branch of the pool arithmetic is live.
+        store.insert_node(usage_node_msg("node-empty", "{}"))?;
+        store.insert_node(usage_node_msg("node-plain", "{}"))?;
+        store.insert_node(usage_node_msg(
+            "node-rich",
+            &json!({
+                "maxAllocations": 8,
+                "resources": { "gpu": ["g0", "g1", "g2"], "widgets": 6 },
+                "reservedResources": { "memory": 512 },
+            })
+            .to_string(),
+        ))?;
+
+        // Two configs of the planned job (a Fresh plan sees the previous
+        // config's rows too) and one unrelated job.
+        insert_usage_job(&store, "own-job", &["own-cfg-1", "own-cfg-2"])?;
+        insert_usage_job(&store, "other-job", &["other-cfg"])?;
+
+        insert_usage_allocation(&store, 1, "node-plain", "own-cfg-1", json!({"cpu": 500}))?;
+        insert_usage_allocation(
+            &store,
+            2,
+            "node-plain",
+            "other-cfg",
+            json!({"cpu": 250, "memory": 1024}),
+        )?;
+        // Same dim, two kinds: `gpu` as a device list from one job and as a
+        // plain counter from another. The pool resolves whichever matches
+        // its own kind and ignores the other, per row — the aggregate has to
+        // reproduce that.
+        insert_usage_allocation(
+            &store,
+            3,
+            "node-rich",
+            "own-cfg-1",
+            json!({"cpu": 100, "gpu": ["g0"], "widgets": 2}),
+        )?;
+        insert_usage_allocation(
+            &store,
+            4,
+            "node-rich",
+            "own-cfg-2",
+            json!({"memory": 256, "gpu": 1}),
+        )?;
+        insert_usage_allocation(
+            &store,
+            5,
+            "node-rich",
+            "other-cfg",
+            json!({"cpu": 100, "gpu": ["g1"], "widgets": 1, "fractional": 0.1}),
+        )?;
+        // A zero-amount demand: the walk still CREATES the pool entry, so
+        // the aggregate must too, or the dim would silently read as absent.
+        insert_usage_allocation(&store, 6, "node-rich", "other-cfg", json!({"scratch": 0}))?;
+
+        let nodes = ["node-empty", "node-plain", "node-rich"];
+        let mut conn = store.write_connection()?;
+        let tx = Store::write_tx(&mut conn)?;
+
+        // Cold: nothing cached, so every node rebuilds.
+        let mut snapshots = assert_free_pools_match(&store, &tx, &nodes, "own-cfg-2", "cold")?;
+        assert_eq!(
+            snapshots.len(),
+            nodes.len(),
+            "every node should have produced a cacheable aggregate"
+        );
+
+        // Warm: publish what the rebuild found, then assert the stored
+        // aggregate produces the identical pool.
+        store.publish_node_usage_tx(&tx, &mut snapshots, &[], &HashMap::new())?;
+        assert_free_pools_match(&store, &tx, &nodes, "own-cfg-2", "warm")?;
+
+        // And from the other job's point of view, where "own" is a
+        // different set of rows but the cached total is the same one.
+        assert_free_pools_match(&store, &tx, &nodes, "other-cfg", "warm/other-job")?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// An allocation whose stored resources cannot be parsed keeps its old
+    /// meaning — the node fits nothing — and is never allowed to enter the
+    /// cache, because a cached value derived from a row nobody could read
+    /// would outlive the row that produced it.
+    #[test]
+    fn an_unparseable_allocation_row_bypasses_the_cache_entirely() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(usage_node_msg("node-bad", "{}"))?;
+        insert_usage_job(&store, "own-job", &["own-cfg"])?;
+        insert_usage_job(&store, "other-job", &["other-cfg"])?;
+        insert_usage_allocation(&store, 1, "node-bad", "other-cfg", json!({"cpu": "lots"}))?;
+        insert_usage_allocation(&store, 2, "node-bad", "own-cfg", json!({"cpu": 100}))?;
+
+        let mut conn = store.write_connection()?;
+        let tx = Store::write_tx(&mut conn)?;
+        let snapshots = assert_free_pools_match(&store, &tx, &["node-bad"], "own-cfg", "poisoned")?;
+        assert!(
+            snapshots.is_empty(),
+            "a node with an unreadable allocation must not be cached"
+        );
+        let cached: i64 = tx.query_row("SELECT COUNT(*) FROM node_alloc_usage;", [], |row| {
+            row.get(0)
+        })?;
+        assert_eq!(cached, 0);
+
+        // The planned job's OWN row being unreadable is different: a Fresh
+        // plan never counted it, so the node still fits things — it just
+        // cannot take the subtracting path.
+        tx.execute(
+            "UPDATE allocation SET resources = ?1 WHERE id = 1;",
+            [json!({"cpu": 100})],
+        )?;
+        tx.execute(
+            "UPDATE allocation SET resources = ?1 WHERE id = 2;",
+            [json!({"cpu": "lots"})],
+        )?;
+        let own = store.own_allocation_usage_tx(&tx, "own-cfg")?;
+        assert!(own.unreadable.contains("node-bad"));
+        assert_free_pools_match(&store, &tx, &["node-bad"], "own-cfg", "poisoned-own")?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The drift case, which is the one that matters: after inserts,
+    /// removals and an eviction driven through the real store paths, the
+    /// cached pool still equals the walk's. A cached number that survived a
+    /// mutation it did not see would overcommit the node.
+    #[test]
+    fn the_usage_cache_stays_correct_across_inserts_removals_and_evictions() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "ready"))?;
+        store.insert_node(make_node_msg("node-b", "ready"))?;
+
+        let (job_config_id, task_id) = submit_walk_job(&store, "usage-drift", task("task"))?;
+        let (victim_config_id, victim_task) =
+            submit_walk_job(&store, "usage-victim", task("victim"))?;
+
+        let check = |label: &str| -> R<()> {
+            let mut conn = store.write_connection()?;
+            let tx = Store::write_tx(&mut conn)?;
+            assert_free_pools_match(&store, &tx, &["node-a", "node-b"], &job_config_id, label)?;
+            tx.commit()?;
+            Ok(())
+        };
+
+        // 1. A plan apply, which both reads the pools and publishes the
+        //    cache entries the next plan will trust.
+        let expected_versions = store.allocation_version_vector(
+            &job_config_id,
+            &HashSet::from(["node-a".to_string(), "node-b".to_string()]),
+        )?;
+        let submission = store.insert_plan_submission_with_candidates(
+            &job_config_id,
+            "fresh",
+            &[PlanSubmissionPlacement {
+                task_id,
+                candidates: vec!["node-a".to_string()],
+            }],
+            &expected_versions,
+        )?;
+        assert!(matches!(
+            store.apply_plan_submission(&submission)?,
+            PlanApplyOutcome::Applied(_)
+        ));
+        check("after a plan apply")?;
+        let warm: i64 = store.read_connection()?.query_row(
+            "SELECT COUNT(*) FROM node_alloc_usage WHERE node_id = 'node-a';",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(warm, 1, "the apply should have left a usable cache entry");
+
+        // 2. An insert through a path that is not plan apply.
+        let victim = store.place_alloc("node-a", victim_task)?;
+        check("after place_alloc")?;
+
+        // 3. A removal that bumps only the JOB-CONFIG epoch, never the
+        //    node's — the case a node-epoch-only validator would miss.
+        store.remove_allocation_by_id(victim.id)?;
+        check("after remove_allocation_by_id")?;
+
+        // 4. An eviction inside a plan: the victim's row disappears in the
+        //    same transaction that reads the pool.
+        let victim = store.place_alloc("node-b", victim_task)?;
+        let expected_versions = store.allocation_version_vector(
+            &job_config_id,
+            &HashSet::from(["node-a".to_string(), "node-b".to_string()]),
+        )?;
+        let (_, outcome) = store.submit_and_apply_plan_with_candidates(
+            &job_config_id,
+            "reschedule",
+            &[PlanSubmissionPlacement {
+                task_id,
+                candidates: vec!["node-b".to_string()],
+            }],
+            &expected_versions,
+            &[PlanEviction {
+                allocation_id: victim.id,
+                node_id: "node-b".into(),
+                job_id: "usage-victim".into(),
+                job_config_id: victim_config_id,
+                task_config_id: victim_task,
+                band: Band::default().as_str().to_string(),
+            }],
+        )?;
+        assert!(matches!(outcome, PlanApplyOutcome::Applied(_)));
+        check("after a preempting plan")?;
+
+        // 5. Wholesale removal of the job's allocations.
+        store.remove_allocs_for_job("usage-drift")?;
+        check("after remove_allocs_for_job")?;
+        Ok(())
+    }
+
+    /// A published cache entry must describe the rows that are actually
+    /// there. This is the invariant `publish_node_usage_tx` enforces by
+    /// re-reading the fingerprint before it writes; assert it end to end.
+    #[test]
+    fn a_published_usage_row_fingerprints_the_live_allocation_rows() -> R<()> {
+        let store = setup_store()?;
+        // A fingerprinted node, so the pool holds finite numbers a planted
+        // value can visibly move.
+        store.insert_node(usage_node_msg("node-a", "{}"))?;
+        let (job_config_id, task_id) = submit_walk_job(&store, "usage-fingerprint", task("task"))?;
+
+        let expected_versions = store
+            .allocation_version_vector(&job_config_id, &HashSet::from(["node-a".to_string()]))?;
+        let submission = store.insert_plan_submission_with_candidates(
+            &job_config_id,
+            "fresh",
+            &[PlanSubmissionPlacement {
+                task_id,
+                candidates: vec!["node-a".to_string()],
+            }],
+            &expected_versions,
+        )?;
+        assert!(matches!(
+            store.apply_plan_submission(&submission)?,
+            PlanApplyOutcome::Applied(_)
+        ));
+
+        let mut conn = store.write_connection()?;
+        let tx = Store::write_tx(&mut conn)?;
+        let (epoch, count, id_sum) = store.node_alloc_fingerprint_tx(&tx, "node-a")?;
+        let (stored_epoch, stored_count, stored_sum): (i64, i64, i64) = tx.query_row(
+            "SELECT alloc_epoch, alloc_count, alloc_id_sum FROM node_alloc_usage \
+             WHERE node_id = 'node-a';",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        assert_eq!(
+            (stored_epoch, stored_count, stored_sum),
+            (epoch, count, id_sum)
+        );
+        assert_eq!(stored_count, 1, "one placement, one row");
+
+        // The fast path is really the one being taken. Plant a distinctive
+        // (wrong) aggregate under the matching fingerprint: if the next read
+        // reflects it, the row was served from the cache rather than
+        // rebuilt. Without this, the whole change could silently regress to
+        // "rebuild every time" and every equivalence test would still pass.
+        let node = store.get_node("node-a")?;
+        let before = store
+            .free_pool_for_node_tx(&tx, &node, &job_config_id, false, None)?
+            .0;
+        tx.execute(
+            "UPDATE node_alloc_usage SET usage_json = ?1 WHERE node_id = 'node-a';",
+            [r#"{"dims":{"cpu":{"amount_contributors":1,"amount":777.0,"items":{}}}}"#],
+        )?;
+        let after = store
+            .free_pool_for_node_tx(&tx, &node, &job_config_id, false, None)?
+            .0;
+        assert_ne!(
+            before.amount("cpu"),
+            after.amount("cpu"),
+            "the cached aggregate is not being read"
+        );
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Wall-clock A/B for the free-pool rebuild, at two cluster fills, both
+    /// paths measured against the SAME store in the same process so the
+    /// comparison is the function and not the machine.
+    ///
+    /// This is the local stand-in for the AWS `dense_fleet` ladder, which
+    /// measured throughput falling 736.1 → 456.58 → 272.91 alloc/s as live
+    /// allocations went 50k → 100k → 200k at 5,000 nodes. What a single-node
+    /// run *can* show is the per-node cost that ladder is made of, and how
+    /// it moves with allocations-per-node.
+    ///
+    /// ```bash
+    /// cargo test --release --lib bench_local_free_pool -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "benchmark; run with --release --ignored --nocapture"]
+    fn bench_local_free_pool_rebuild_by_fill() -> R<()> {
+        const NODES: usize = 50;
+        const ROUNDS: usize = 20;
+
+        for per_node in [10usize, 40] {
+            let store = setup_store()?;
+            insert_usage_job(&store, "bench-job", &["bench-cfg"])?;
+            insert_usage_job(&store, "bench-other", &["other-cfg"])?;
+            let mut allocation_id = 0i64;
+            for node in 0..NODES {
+                let node_id = format!("bench-node-{node}");
+                store.insert_node(usage_node_msg(&node_id, "{}"))?;
+                for index in 0..per_node {
+                    allocation_id += 1;
+                    // One in ten belongs to the planned job, so the
+                    // `drop_own` path has something real to subtract.
+                    let config = match index % 10 {
+                        0 => "bench-cfg",
+                        _ => "other-cfg",
+                    };
+                    insert_usage_allocation(
+                        &store,
+                        allocation_id,
+                        &node_id,
+                        config,
+                        json!({ "cpu": 10, "memory": 8 }),
+                    )?;
+                }
+            }
+            let nodes: Vec<Node> = (0..NODES)
+                .map(|node| store.get_node(&format!("bench-node-{node}")))
+                .collect::<R<_>>()?;
+
+            let mut conn = store.write_connection()?;
+            let tx = Store::write_tx(&mut conn)?;
+
+            let started = Instant::now();
+            for _ in 0..ROUNDS {
+                for node in &nodes {
+                    free_pool_the_old_way(&store, &tx, node, "bench-cfg", true)?;
+                }
+            }
+            let old = started.elapsed() / (ROUNDS * NODES) as u32;
+
+            // Warm the cache the way a plan apply would, then measure the
+            // steady state: fingerprint check plus one aggregate.
+            let mut snapshots: HashMap<String, NodeUsageSnapshot> = HashMap::new();
+            for node in 0..NODES {
+                let node_id = format!("bench-node-{node}");
+                if let Some(snapshot) = store.node_usage_tx(&tx, &node_id)? {
+                    snapshots.insert(node_id, snapshot);
+                }
+            }
+            store.publish_node_usage_tx(&tx, &mut snapshots, &[], &HashMap::new())?;
+
+            let own = store.own_allocation_usage_tx(&tx, "bench-cfg")?;
+            let started = Instant::now();
+            for _ in 0..ROUNDS {
+                for node in &nodes {
+                    store.free_pool_for_node_tx(&tx, node, "bench-cfg", true, Some(&own))?;
+                }
+            }
+            let new = started.elapsed() / (ROUNDS * NODES) as u32;
+
+            println!("free pool @ {per_node} allocations/node: row walk {old:?}, cached {new:?}");
+            tx.commit()?;
+        }
         Ok(())
     }
 

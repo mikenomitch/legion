@@ -411,3 +411,42 @@ Under raft the plan write was already one propose per batch, so the new
 win there is the status projection: a batch of N plans drops from N
 status-lane rounds to one (N more raft rounds under
 `topology: "lanes"`).
+
+## Free-pool rebuild inside the apply commit — 2026-08-05
+
+Phase 4 of `internal_docs/plans/eval-path-raft-cost-plan.md`:
+`Store::free_pool_for_node_tx` no longer reads every allocation row on a
+node on the common path. The node's total usage is cached in
+`node_alloc_usage` and validated on each read against a fingerprint of the
+live rows (node allocation epoch + row count + allocation-id sum), which
+comes out of `idx_allocation_node_id` without touching a row body or
+parsing any JSON.
+
+The thing being fixed is a *slope*, not a constant: the AWS `dense_fleet`
+ladder measured throughput at 736.1 → 456.58 → 272.91 alloc/s as live
+allocations went 50k → 100k → 200k at 5,000 nodes (≈1.6x per doubling),
+while plan total grew only 22%.
+
+**Wall clock per free pool** (`cargo test --release --lib
+bench_local_free_pool -- --ignored --nocapture`; 50 nodes, 20 rounds,
+both arms against the same store in the same process, `drop_own` on —
+the Fresh-plan shape):
+
+| allocations/node | row walk | cached | speedup |
+| --- | --- | --- | --- |
+| 10 | 15.573 µs | **8.635 µs** | 1.8x |
+| 40 | 37.764 µs | **9.358 µs** | 4.0x |
+
+Read the *columns*, not the rows: over the same 4x change in cluster
+fill, the row walk grows 2.4x while the cached path grows 1.08x. That
+flattening is the point — the residual growth is the fingerprint scan,
+which is still proportional to allocations-per-node but at roughly a
+hundredth of the constant.
+
+For an eval touching ~44 nodes at 40 allocations/node, that is ~1.66 ms
+of in-commit time against ~0.41 ms.
+
+**Not measured here:** end-to-end throughput. This is a serialized-commit
+cost on a multi-node cluster under fill; a single-node local run cannot
+reproduce either the serialization or the fill. The AWS ladder is the
+real number and has not been re-run.

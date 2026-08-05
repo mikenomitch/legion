@@ -337,6 +337,23 @@ one cached statement instead of one acquisition and one parse per node. That
 removes 44 acquisitions per eval from a pool sized to the core count, but it
 does not reduce the rows read.
 
+**Shipped since (apply half only, unmeasured):** `free_pool_for_node_tx` no
+longer reads the node's allocation rows on the common path. The node's total
+usage is cached per node in `node_alloc_usage` and validated on every read
+against a fingerprint of the live rows — the node allocation epoch, the row
+count, and the sum of the allocation ids — so a stale entry costs a rebuild
+and can never inflate free capacity. What is left of the scan is that
+fingerprint, which reads `idx_allocation_node_id` only: no row bodies, no
+JSON. A Fresh plan's own allocations are gathered once per plan rather than
+re-filtered on every node the bind walk touches. The refresh half below is
+untouched, so the ladder above should flatten, not go flat.
+
+Local A/B on the rebuild (`bench_local_free_pool`, both arms on one
+store): 15.573 → 8.635 µs per pool at 10 allocations/node, 37.764 →
+9.358 µs at 40. Over that 4x fill change the old path grows 2.4x and the
+new one 1.08x. Whether that moves the ladder is unmeasured — see
+[benchmarks/scheduler/README.md](../benchmarks/scheduler/README.md).
+
 ## The eval-thread sweep: no serial wall at this scale
 
 `web_fleet`, 5,000 nodes, 25,002 allocations, one campaign per thread count
