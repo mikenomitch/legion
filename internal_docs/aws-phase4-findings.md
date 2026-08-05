@@ -171,12 +171,65 @@ own history:
    fuse into one round, the same way `complete_and_claim_next` fused the eval
    queue's pair.
 
+## The wake herd, measured
+
+Cells G and H are the same binary on the same rig, differing only in
+`evalThreads`, and both report `driver_bound: false`:
+
+| cell | evalThreads | throughput | p50 | p99 | submit rate | drain |
+| --- | --- | --- | --- | --- | --- | --- |
+| G | 4 | 177.27 alloc/s | 63.4 s | 100.8 s | 89.62/s | 101.05 s |
+| **H** | **16** | **219.25 alloc/s** | 54.1 s | 67.3 s | 69.21/s | 56.97 s |
+
+**+23.7% throughput from concurrency, and p99 down 33%.** Before the fix the
+same comparison ran the other way (203.19 at 4 threads against 164.72 at 16).
+The sign of the relationship flipped, which is the result the fix predicted and
+the one a starved rig could never have shown.
+
+`legion_eval_claim_total` during cell H: **0.3 empty claims/sec** on the
+scheduler lane, against a herd that used to put 30,000 extra ops on that lane
+per cell.
+
+## What the raft ops cost, by outcome
+
+The op label alone is misleading — `Store::replicated` skips the raft entry
+entirely when a mutation's changeset is empty, so a high op rate can be free.
+Split by outcome, during cell H:
+
+| lane | op | outcome | rate |
+| --- | --- | --- | --- |
+| status | `update_node_health_checks` | **empty** | 133.9/s |
+| scheduler | `complete_and_claim_next` | applied | 44/s |
+| status | `update_task_statuses_for_allocations` | applied | 16.2/s |
+| scheduler | `submit_and_apply_plans` | applied | 11.2/s |
+| scheduler | `submit_and_apply_plan_with_candidates` | applied | 9.3/s |
+| scheduler | `claim_eval` | **empty** | 0.3/s |
+| control | `clear_job_failed_status` | **empty** | 0/s |
+
+This retires two targets this document previously named:
+
+- **`update_node_health_checks` is not a bottleneck.** A local probe
+  (`capture_mutation` on an unchanged versus changed value) returns a
+  **0-byte** changeset when the health check is unchanged and 65 bytes when it
+  is not, so these never reach quorum. The residual cost is the capture itself
+  — a savepoint and a write-connection acquisition ~134 times a second — which
+  is real lock contention but not a raft round.
+- **The five control-lane rounds per job submit are mostly empty too**
+  (`clear_job_failed_status` at `empty`), so fusing them buys much less than
+  their op rate suggested.
+
+The genuine quorum cost is the eval path: `complete_and_claim_next` at 44/s
+plus ~20/s of plan applies.
+
 ## Open, in priority order
 
-1. **`update_node_health_checks` at 178.7/s.** The largest single raft
-   consumer in the cluster, and it grows with the fleet rather than the work.
-   Batch it, or move it off raft as heartbeats already were.
-2. **Fuse the five control-lane rounds per job submit into one.**
+1. **Find the knee.** 16 threads beat 4; the ladder above 16 is unmeasured.
+2. **The eval path is now the whole cost.** `complete_and_claim_next` at 44/s
+   and plan applies at ~20/s are what is left to attack, which is what the
+   batch-the-eval-loop item was always about.
+3. **Capture cost, not raft cost.** 134 empty captures/sec still take the write
+   connection. Skipping the write when the value is unchanged would remove
+   them entirely.
 3. **A real bulk-submit path.** One CLI process per job is a poor way to drive
    load even at 16 vCPU. A long-lived submitter speaking gRPC directly would
    remove the rig's ceiling rather than raise it. This is a benchmark-harness
