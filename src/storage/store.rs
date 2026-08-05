@@ -852,9 +852,13 @@ const LATEST_CONFIG_FOR_JOB: &str = "(SELECT jc.id FROM job_config jc \
 /// would otherwise queue behind.
 const READ_POOL_SERVING_HEADROOM: usize = 4;
 
-/// Hard cap on the read pool, set by MEMORY rather than by contention.
-/// Each connection carries its own page cache capped at
-/// [`SQLITE_CACHE_SIZE_KIB`] (64 MiB), so the pool's worst case is
+/// Hard cap on the read pool, set by MEMORY and by nothing else. It is
+/// **not** a measured knee — the eval-thread sweep never found one, because
+/// its 64-thread cell was limited by the load generator rather than by
+/// Legion, so where read concurrency would stop paying is unknown.
+///
+/// What is known is the cost: each connection carries its own page cache
+/// capped at [`SQLITE_CACHE_SIZE_KIB`] (64 MiB), so the pool's worst case is
 /// `size * 64 MiB` — 1 GiB here. `cache_size` is a cap that SQLite fills
 /// lazily, so a small cluster never reaches it, but a 200,000-allocation
 /// working set will: every connection independently pulls in the same hot
@@ -865,75 +869,94 @@ const READ_POOL_MAX: usize = 16;
 
 /// Read-only SQLite connections shared by every reader in the manager.
 ///
-/// This was 2, and 2 is a serialization point rather than a pool: at
-/// 5,000 nodes the `task_fetch` plan phase grew 100x against the 1,000-node
-/// cell (0.14 ms -> 14.96 ms) while control-plane CPU sat at 29% and no
-/// thread exceeded 40% of a core. The manager was not short of CPU, it was
-/// queueing. (The later phase-3 cell measured `task_fetch` at 0.65 ms on
-/// the unmodified two-connection binary, which says that particular
-/// queueing was coupled to the plan-conflict rate rather than to fleet
-/// size — the pool still had to grow, but it was never the throughput
-/// ceiling it looked like.)
+/// **The pool is NOT a scheduler concurrency gate. That is measured, not
+/// argued.** The 2026-08-05 eval-thread sweep at 5,000 nodes ran every cell
+/// with this pool at 4 connections (`available_parallelism()` on the
+/// campaign's 4-vCPU managers) and throughput rose monotonically with eval
+/// workers anyway:
 ///
-/// **Why not core count.** The pool used to be `available_parallelism()`,
-/// on the argument that these reads are CPU-bound page-cache hits and so
-/// one connection per core saturates them. Every part of that is wrong for
-/// this workload:
+/// | eval threads | throughput |
+/// | ---: | ---: |
+/// | 4 | 177.27 alloc/s |
+/// | 8 | 208.83 alloc/s |
+/// | 16 | 219.25 alloc/s |
+/// | 32 | 251.68 alloc/s |
+/// | 64 | >= 263.08 alloc/s (load generator became the constraint) |
 ///
-/// - The readers are latency-bound, not CPU-bound. A saturated 5,000-node
-///   control plane measured **8% CPU across four cores**; an eval worker
-///   spends its life parked on a quorum round trip, and a read that misses
-///   the 64 MiB page cache is a `pread` — the connection's mutex is held
-///   for the whole of an I/O wait that uses no CPU. Past one-per-core,
-///   extra connections therefore *do* add read throughput.
-/// - Holds are not uniform, so head-of-line blocking is real. Most
-///   acquisitions are one indexed statement, but
-///   `cache_refresh_allocation_scopes` holds ONE connection across a loop
-///   of up to ~44 per-node queries (~1,700 rows at 200,000 allocations),
-///   after every plan-apply, **on every replica**. With a pool of 4, a
-///   couple of those in flight leaves a heartbeat's point read waiting on
-///   a connection that is busy for milliseconds.
-/// - Sizing the pool AT the core count makes two unrelated resources
-///   saturate at the same instant, and lets one convert into the other.
-///   `build_desired_allocations` and the rest of the heartbeat body run
-///   *inline on a tokio worker thread* (only `update_node_heartbeat` is
-///   offloaded), so a heartbeat that queues for a connection parks a
-///   runtime thread — and there are `available_parallelism()` of those.
-///   Four connections on a four-core manager means the pool cannot fill
-///   without the runtime filling with it. The headroom below is what
-///   breaks that coupling on the small managers where it bites — a large
-///   host hits [`READ_POOL_MAX`] before it hits its own core count, and
-///   that is fine: a 32-core runtime does not starve on a few parked
-///   heartbeat threads the way a 4-core one does.
+/// Four connections carried 32 concurrent planners and 5,000 nodes of
+/// heartbeats. If the pool capped effective concurrency near 4, going from
+/// 16 to 32 threads could not have bought 14.8%.
 ///
-/// None of those has anything to do with how many cores the box has.
+/// The suspicion it retires was arithmetic: throughput divided by
+/// plan-path latency came out at ~3.96 "effective workers" against 16
+/// configured, next to 4 cores and 4 connections. That derivation used the
+/// wrong denominator. `legion_scheduler_plan_phase_seconds{phase="total"}`
+/// times **planning only**, so Little's law over it counts evals in the
+/// *planning stage*, not busy workers — a worker in `claim_eval`, dispatch,
+/// post-apply bookkeeping, or a conflict-retry backoff is busy and
+/// invisible to it. 3.96 out of 16 says planning was about a quarter of an
+/// eval's wall time, which is what `legion_eval_handle_seconds` was added
+/// to show ("the difference is everything an eval does outside planning").
+/// It never said anything about a cap at 4.
 ///
-/// **What it is sized from instead:** the number of concurrent readers the
-/// manager actually runs. That is `evalThreads` (each eval worker is one
-/// reader at a time, by construction — its handler is synchronous end to
-/// end) plus [`READ_POOL_SERVING_HEADROOM`] for the heartbeat, RPC, and
-/// telemetry readers, capped at [`READ_POOL_MAX`] because per-connection
-/// page cache is not free.
+/// The code agrees: no read connection is held across a quorum round,
+/// across an `.await`, or across `build_plan`. Planning reads the in-memory
+/// `SchedulingReadModel`, `plan_and_apply_internal` holds no read guard
+/// when it calls `submit_and_apply_plan_with_candidates`, and the apply
+/// runs on the WRITE connection inside `replicated()`. Every acquisition on
+/// the path is one leaf store method wide, so the pool cannot serialize two
+/// planners against each other. It shows up as queueing latency, never as
+/// mutual exclusion.
 ///
-/// **This is not a scheduler-concurrency knob.** The plan path does not
-/// hold a read connection across its apply — it was checked, because the
-/// old pool size and the campaign's core count and its ~4 effective
-/// planner concurrency were all 4 and that coincidence deserved ruling
-/// out. Planning reads the in-memory `SchedulingReadModel`;
-/// `plan_and_apply_internal` holds no read guard when it calls
-/// `submit_and_apply_plan_with_candidates`; and the apply itself runs on
-/// the WRITE connection inside `replicated()`. Every acquisition on the
-/// path is one leaf store method wide. What the eval path has is read
-/// *volume* — tens of acquisitions per eval, plus the apply-side
-/// `project_changeset_side_effects` reads that every replica pays while
-/// the leader's eval thread is blocked on the quorum round — so the pool
-/// shows up as queueing latency, never as mutual exclusion. Sizing it
-/// cannot move the plan-apply ceiling, and it is not meant to. If reads
-/// really are queueing,
-/// `legion_store_read_lock_wait_seconds` says so directly — reach for that
-/// before assuming, because with the pool sized from the readers rather
-/// than the cores, a nonzero wait means a reader is holding a connection
-/// too long, and the fix for that is to issue fewer or shorter reads.
+/// **So why change it at all? The basis was wrong, not the size.** The pool
+/// was `available_parallelism().max(4)` on the argument that these reads
+/// are CPU-bound page-cache hits and one connection per core saturates
+/// them. That argument does not survive contact with the workload:
+///
+/// - The readers are latency-bound. A saturated 5,000-node control plane
+///   measured **8% CPU across four cores**, and a read that misses the
+///   64 MiB page cache is a `pread` — the connection's mutex is held for
+///   the whole of an I/O wait that uses no CPU at all.
+/// - Holds are not uniform. Most acquisitions are one indexed statement,
+///   but `cache_refresh_allocation_scopes` holds ONE connection across a
+///   loop of up to ~44 per-node queries (~1,700 rows at 200,000
+///   allocations), after every plan-apply, **on every replica**.
+/// - Sizing the pool AT the core count couples it to the tokio runtime's
+///   width. `build_desired_allocations` and the rest of the heartbeat body
+///   run *inline on a runtime worker thread* (only `update_node_heartbeat`
+///   is offloaded), so a heartbeat that queues for a connection parks one
+///   of `available_parallelism()` runtime threads. This is a structural
+///   coupling, not an observed failure — the sweep above shows 4
+///   connections holding up fine — but two unrelated resources should not
+///   saturate at the same instant by construction.
+///
+/// **What it is sized from instead:** the concurrent readers the manager
+/// actually runs — `evalThreads` (an eval worker is one reader at a time,
+/// its handler being synchronous end to end) plus
+/// [`READ_POOL_SERVING_HEADROOM`], capped at [`READ_POOL_MAX`].
+///
+/// **What this deliberately does not claim.** No throughput win: the sweep
+/// says the old size was adequate through 32 eval threads at this fleet
+/// size and fill, and nothing here has been measured against it. The cap is
+/// [`READ_POOL_MAX`] because that is the memory budget, **not** because
+/// anyone has seen a knee there — the sweep's own knee is unmeasured, since
+/// the 64-thread cell was limited by the load generator rather than by
+/// Legion. Sizing for a knee nobody has seen would be guesswork. This is a
+/// correction to the reasoning and a bounded hedge for the higher
+/// `evalThreads` values the sweep shows operators will want, and it should
+/// be read as nothing more.
+///
+/// If reads really are queueing, `legion_store_read_lock_wait_seconds` says
+/// so directly — reach for that before assuming. With the pool sized from
+/// the readers rather than the cores, a nonzero wait means a reader is
+/// holding a connection too long, and the fix for that is to issue fewer or
+/// shorter reads, not to hold more connections.
+///
+/// (Historical: this was 2, and 2 really was a serialization point — the
+/// `task_fetch` plan phase grew 100x between the 1,000- and 5,000-node
+/// cells, 0.14 ms -> 14.96 ms. Phase 3 then measured `task_fetch` at
+/// 0.65 ms at 5,000 nodes on that same two-connection binary, so even that
+/// was coupled to the plan-conflict rate rather than to fleet size.)
 fn read_only_conn_pool_size(eval_threads: usize) -> usize {
     // `eval_threads` comes straight from operator config and is a `usize`,
     // so 0 is expressible; the daemon clamps it to at least one worker and
@@ -15621,20 +15644,27 @@ mod tests {
     }
 
     /// The read pool is sized from the readers the manager runs, not from
-    /// the host's core count. The three properties that matter:
+    /// the host's core count. The four properties that matter:
     ///
     /// 1. it tracks `evalThreads` (the eval workers are the concurrent
     ///    readers whose queueing would matter), with headroom for the
     ///    heartbeat/RPC/telemetry readers that do not come from that pool;
     /// 2. it is capped, because each connection carries its own 64 MiB
-    ///    page-cache cap and those caches do not share; and
+    ///    page-cache cap and those caches do not share;
     /// 3. it never collapses to a serialization point, whatever an
-    ///    operator writes in the config.
+    ///    operator writes in the config; and
+    /// 4. it is decoupled from the tokio runtime's width, which is the
+    ///    structural reason the core count was the wrong basis.
+    ///
+    /// Note what is deliberately NOT asserted: any relationship to
+    /// throughput. The 2026-08-05 sweep placed 251.68 alloc/s at 32 eval
+    /// threads with only four connections, so this rule is a correction to
+    /// the sizing *argument* and a bounded hedge, not a performance claim.
     #[test]
     fn read_pool_is_sized_from_readers_and_capped_by_page_cache() {
         // Tracks evalThreads with headroom. The AWS campaign's managers
         // are 4-vCPU, so the old core-count rule gave exactly 4 whether
-        // the operator ran 4 eval workers or 16.
+        // the operator ran 4 eval workers or 32.
         assert_eq!(read_only_conn_pool_size(4), 4 + READ_POOL_SERVING_HEADROOM);
         assert_eq!(
             read_only_conn_pool_size(8),
@@ -15643,7 +15673,10 @@ mod tests {
              rule both of these were the core count"
         );
 
-        // Capped: 64 eval workers do not get 64 x 64 MiB of page cache.
+        // Capped by memory, not by an observed knee: 64 eval workers do
+        // not get 64 x 64 MiB of page cache. The sweep ran 64 threads but
+        // its load generator, not Legion, was the constraint there, so
+        // nobody has seen where read concurrency stops paying.
         assert_eq!(read_only_conn_pool_size(64), READ_POOL_MAX);
         assert_eq!(read_only_conn_pool_size(usize::MAX), READ_POOL_MAX);
 
@@ -15657,7 +15690,9 @@ mod tests {
         // On the manager sizes this actually runs on, the pool is strictly
         // wider than the tokio runtime. Heartbeat reads run inline on
         // runtime threads, so a pool the same size as the core count lets
-        // read queueing turn straight into a parked runtime.
+        // read queueing turn straight into a parked runtime. No cell has
+        // been observed doing that — this asserts the coupling is gone by
+        // construction rather than fixing a measured failure.
         for cores in 1..=(READ_POOL_MAX - READ_POOL_SERVING_HEADROOM) {
             assert!(
                 read_only_conn_pool_size(cores) > cores,

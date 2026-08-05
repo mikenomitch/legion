@@ -76,9 +76,21 @@ more likely to help than lowering it.
 > submission below what the scheduler could absorb, and it ran against a build
 > whose eval notifier woke *every* worker on any eval state change, so each
 > added thread spent quorum rounds discovering an empty queue. With both fixed,
-> 16 threads beat 4 by 23.7% on the same hardware — 5,000 nodes, 25,002
-> allocations, three 4-vCPU managers: 219.25 against 177.27 allocations per
-> second, with p99 placement latency falling from 100.8s to 67.3s.
+> throughput rises with eval threads on the same hardware — 5,000 nodes, 25,002
+> allocations, three 4-vCPU managers:
+>
+> | eval threads | throughput |
+> | ---: | ---: |
+> | 4 | 177.27 alloc/s |
+> | 8 | 208.83 alloc/s |
+> | 16 | 219.25 alloc/s |
+> | 32 | 251.68 alloc/s |
+>
+> p99 placement latency fell from 100.8s to 67.3s between 4 and 16. A
+> 64-thread cell reached at least 263.08 alloc/s but was limited by the
+> benchmark's own load generator, so **where this stops paying is not known**
+> — read the table as "more helped up to 32 on a 4-core manager", not as a
+> recommendation to set 32.
 
 **Read**
 
@@ -152,7 +164,10 @@ the contention is being absorbed and the remaining rejections are real capacity.
    rather than computing (a saturated 5,000-node control plane measured 8% CPU),
    so the useful thread count is set by how much the plan-apply fence can absorb
    and by round-trip latency, not by cores. On an uncontended workload that
-   means the default is more likely to be too LOW than too high.
+   means the default is more likely to be too LOW than too high: at 5,000
+   nodes on 4-vCPU managers, throughput rose at every step from 4 to 32
+   threads. Nobody has measured where it stops, so treat larger values as
+   worth trying and worth measuring, not as a recommendation.
 
    `evalThreads` also sizes the store's read-connection pool (`evalThreads + 4`,
    capped at 16 — see [state-store.md](state-store.md)), because the eval
@@ -584,7 +599,7 @@ allocations, not on the counter. Tracked in
 
 | Knob | Where | Turn it when | Do **not** turn it when |
 | --- | --- | --- | --- |
-| `evalThreads` | manager config | Rejection share is high, or the scheduler lane's `pipeline_wait` is high, and the lane's ops are `applied` rather than `empty`. **Turn it down.** On an uncontended cluster the opposite applies: 16 beat 4 by 23.7% at 5,000 nodes. Note it also sizes the read pool (`evalThreads + 4`, capped at 16). | You have not looked at `plan_apply_total{outcome}` and `raft_ops_total{op,outcome}`. Moving it in either direction without those is guessing. |
+| `evalThreads` | manager config | Rejection share is high, or the scheduler lane's `pipeline_wait` is high, and the lane's ops are `applied` rather than `empty`. **Turn it down.** On an uncontended cluster the opposite applies: at 5,000 nodes throughput rose at every step from 4 to 32 threads (177.27 -> 251.68 alloc/s), and the point where it stops paying has not been measured. Note it also sizes the read pool (`evalThreads + 4`, capped at 16). | You have not looked at `plan_apply_total{outcome}` and `raft_ops_total{op,outcome}`. Moving it in either direction without those is guessing. |
 | `schedulerSettings.plan_candidates` | manager config | It is `0` and you are not mid-upgrade. Set it back to `8`. | Rejections are low. The default is right. |
 | `schedulerSettings.plan_conflict_max_retries` | manager config | Contention is bursty and short-lived (default `3`, max `20`). | Rejections are sustained. More retries wastes more plans. |
 | `schedulerSettings.plan_apply_batch_max` | manager config | Group commit is engaging and you want fewer commits (default `16`, max `128`). | `coalesce_batch_size`'s `le="1"` bucket is near `_count`. Batching is not engaging; the cap is not the constraint. |

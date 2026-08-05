@@ -4,11 +4,20 @@
 
 **Status: PLANNED**
 
-Nothing here is built, and **Phase 0 is a gate, not a formality**: the only
-measurement we have compares 4 threads against 16 and says 16 wins. It does
-not say whether 32 or 64 wins by more, or where the number turns back down.
-Shipping a new default without that sweep would replace one unmeasured
-constant with another.
+Nothing here is built, and **this plan deliberately does not pick a number.**
+The 2026-08-05 sweep at 5,000 nodes ran 4/8/16/32/64 eval threads and
+throughput rose at every step — 177.27, 208.83, 219.25, 251.68, and at least
+263.08 alloc/sec. It never turned over. The 64-thread cell was limited by the
+**load generator**, not by Legion, so the curve stops before it says anything
+about where the knee is. Choosing a default from a monotonic run whose top
+point is a floor would be picking the largest number the rig happened to
+reach.
+
+**Phase 0 is therefore split**: 0a is load-generator work on the benchmark
+rig, and 0b is the sweep. A driver that can feed 64+ eval workers is a
+prerequisite for choosing the value, not a nice-to-have. Until it exists the
+honest statement is "`available_parallelism()` is wrong, and at least 32 is
+better on a 4-core manager" — which is not a default.
 
 Deliberately out of scope from the outset: any change to what `evalThreads`
 *means*, any adaptive or self-tuning controller (that is
@@ -42,19 +51,36 @@ backed up. The resource that decides how many workers are useful is
 round-trip latency and how much the commit path can absorb, not how many
 cores are available to burn.
 
-**The measurement.** AWS campaign 2026-08-05
-([aws-phase4-findings.md](../aws-phase4-findings.md)), cells G and H: same
-binary, same rig, 5,000 nodes, 25,002 allocations, three 4-vCPU managers,
-both cells verified `driver_bound: false`.
+**The measurement.** AWS campaign 2026-08-05, 5,000 nodes, three 4-vCPU
+managers, one variable:
 
-| cell | `evalThreads` | throughput | p50 | p99 |
-| --- | ---: | ---: | ---: | ---: |
-| G | 4 (the default on that host) | 177.27 alloc/s | 63.4 s | 100.8 s |
-| **H** | **16** | **219.25 alloc/s** | **54.1 s** | **67.3 s** |
+| `evalThreads` | throughput | verdict |
+| ---: | ---: | --- |
+| 4 (the default on that host) | 177.27 alloc/s | Legion-bound |
+| 8 | 208.83 alloc/s | Legion-bound |
+| 16 | 219.25 alloc/s | Legion-bound |
+| **32** | **251.68 alloc/s** | Legion-bound |
+| 64 | >= 263.08 alloc/s | **driver-bound — a floor, not a result** |
 
-**+23.7% throughput and p99 down 33%, from a value the default cannot
-produce.** On the campaign's `m6id.xlarge` managers the default is 4, so
-every cell that used it ran at the losing setting.
+The 4-to-16 pair is cells G and H from
+[aws-phase4-findings.md](../aws-phase4-findings.md), which also recorded p99
+placement latency falling from 100.8 s to 67.3 s.
+
+**Monotonic to at least 32, and +42% over the default at that point.** On
+the campaign's `m6id.xlarge` managers the default is 4, so every cell that
+used it ran at the worst setting measured.
+
+**The curve has no top.** The 64-thread cell hit the load generator's
+submission ceiling, so 263.08 alloc/sec is a lower bound on what 64 threads
+can do and says nothing about whether 64 beats 32 by 5% or by 50% — or
+whether it is already past the turn. Every earlier campaign that reported a
+driver-bound number as a Legion number had to be retracted; this plan is not
+going to add another by treating the last row as a result.
+
+**Two things the sweep settles.** The read-connection pool is not a
+concurrency gate: every cell above ran with four read connections, and four
+connections carried 32 concurrent planners. And the "~4 effective planners"
+figure that suggested otherwise was a metrics error — see §5.
 
 **Why the earlier answer was the opposite.** Phases 2 and 3 measured 203.19
 alloc/s at 4 threads against 164.72 at 16 and concluded that concurrency
@@ -77,7 +103,7 @@ the notifier fix predicted and a starved rig could never have shown.
 **The shipped example config makes it worse.** `configs/manager.ncl` sets
 `evalThreads = 4` explicitly, so anyone who starts from it gets the losing
 value pinned regardless of their hardware, and never sees the default at
-all. Whatever Phase 0 decides, that line moves with it.
+all. Whatever Phase 0b decides, that line moves with it.
 
 **What an operator faces today.** Nothing tells them the default is wrong.
 `legion` logs the worker count at startup and no more. The public guidance
@@ -137,7 +163,7 @@ connection pools from configuration and workload rather than from
 `NumCPU()`, and Legion's own read-connection pool was moved off
 `available_parallelism()` for the same reason
 ([eval-path-raft-cost-plan_calls.md](../calls/eval-path-raft-cost-plan_calls.md)
-entry 3).
+entry 5).
 
 **The pattern across all three:** nobody derives *replicated-write*
 concurrency from core count. Nomad derives *compute* concurrency from it, and
@@ -189,7 +215,8 @@ already structured, so there is no agent-specific surface to design here.
 1. **The default install.** An operator deploys three managers on 4-vCPU
    instances, runs 5,000 nodes, and never opens the scheduler docs. Their
    cluster should place work at roughly the rate the measurements say it can
-   — not 23.7% below it.
+   — not 30% below it, which is where the default sat against 32 threads on
+   exactly that hardware.
 2. **The deliberate tuner.** An operator with a 64-vCPU manager reads the
    docs, wants more concurrency, and sets `evalThreads` explicitly. Their
    value must keep winning over the default, and the docs must tell them
@@ -205,7 +232,9 @@ already structured, so there is no agent-specific surface to design here.
 **Goals**
 
 - G1. Establish, by measurement, where eval-worker concurrency stops buying
-  throughput at a realistic fleet size — the *knee*, not just "16 > 4".
+  throughput at a realistic fleet size — the *knee*, not just "more is
+  better". That requires a load generator that can outrun the scheduler,
+  which is why Phase 0a exists.
 - G2. Set a default that is defensible from that measurement and does not
   derive from core count.
 - G3. Make the chosen value legible: logged at startup, documented, and
@@ -226,7 +255,7 @@ already structured, so there is no agent-specific surface to design here.
   against a 138 ms commit is the real constraint at scale, and it belongs to
   [plan-apply-conflict-reduction-plan.md](plan-apply-conflict-reduction-plan.md)
   and the coalescer work. This plan chooses how many workers queue against
-  that ceiling; it does not raise it. **If the ceiling moves, Phase 0 must be
+  that ceiling; it does not raise it. **If the ceiling moves, Phase 0b must be
   re-run** — the knee is a property of the commit path, not of the workers.
 - N4. **Per-lane, per-pool, or per-namespace worker counts.** One number per
   manager.
@@ -287,21 +316,37 @@ is 93% of an eval and it is overwhelmingly queueing. Workers are cheap to
 add in CPU terms and expensive to add in queue-depth terms — which is
 exactly why the knee is an empirical question rather than an arithmetic one.
 
-**What the numbers do not settle.** Effective planner concurrency — evals
-per second x plan latency, i.e. how many evals were actually inside the plan
-path at once — is **3.96** at 100,000 allocations (456.58 alloc/s ÷ 44
-allocations per eval = 10.4 evals/s, x 381 ms), with 16 workers configured.
-At 200,000 it is ~2.9. Sixteen workers were configured and about four were
-in the plan path. The coincidence with the
-campaign's 4 vCPUs prompted a check of whether the read-connection pool
-(then also 4) was gating the plan path; **it is not** — no read connection
-is held across a quorum round, an await, or `build_plan`, and the apply runs
-on the write connection (see
+**A retracted "finding", written down so nobody re-derives it.** Dividing
+throughput by plan-path latency produced ~**3.96** "effective workers" at
+100,000 allocations against 16 configured (456.58 alloc/s ÷ 44 allocations
+per eval = 10.4 evals/s, x 381 ms), and ~2.9 at 200,000. Sitting next to 4
+vCPUs and 4 read connections, that looked like a concurrency cap. **It was
+not.** Three errors, in order of size:
+
+- **Wrong denominator.** `legion_scheduler_plan_phase_seconds{phase="total"}`
+  times *planning only*. Little's law over it counts evals in the **planning
+  stage**, not busy workers — a worker inside `claim_eval`, dispatching
+  allocations, doing post-apply bookkeeping, or sleeping a conflict-retry
+  backoff is fully busy and completely invisible to that timer. 3.96 out of
+  16 says planning was roughly a quarter of an eval's wall time.
+  `legion_eval_handle_seconds` is the metric that covers the whole eval, and
+  it exists for exactly this reason: its help text says "the difference is
+  everything an eval does outside planning".
+- **Assumed divisor.** 44 allocations per eval came from the `dense_fleet`
+  scenario's nominal shape, not from that cell. The result scales inversely
+  with it, so an unverified divisor moves the answer proportionally.
+- **Mixed windows.** A since-boot histogram mean (which includes warmup and
+  drain, when the control plane is idle and plan latency is low) was divided
+  into a steady-window throughput. `docs/diagnosing-scheduler-performance.md`
+  opens by warning against precisely this.
+
+The sweep then refuted it directly: 32 threads beat 16 by 14.8% on the same
+4 read connections, which is impossible if concurrency were capped near 4.
+The read pool was checked in code along the way and is not a gate either —
+no read connection is held across a quorum round, an `.await`, or
+`build_plan`, and the apply runs on the write connection (see
 [eval-path-raft-cost-plan_calls.md](../calls/eval-path-raft-cost-plan_calls.md)
-entry 3). The missing concurrency is unexplained and Phase 0 has to look at
-it, because *if 16 workers only ever put 4 in the plan path, the knee may
-already be below 16 for reasons that have nothing to do with the commit
-lock.*
+entry 5).
 
 **One new coupling to state.** As of the same change, the read-connection
 pool is sized from `evalThreads` rather than from the core count
@@ -310,7 +355,7 @@ therefore also widens the read pool, up to a cap of 16 connections, each
 with a 64 MiB SQLite page-cache **cap** (`SQLITE_CACHE_SIZE_KIB`). This is
 deliberate — the eval workers *are* the concurrent readers — but it means a
 new default has a memory consequence as well as a concurrency one, and
-Phase 0 must record manager RSS per cell rather than assuming it is free.
+Phase 0b must record manager RSS per cell rather than assuming it is free.
 
 **Documentation as it stands.**
 [docs/diagnosing-scheduler-performance.md](../../docs/diagnosing-scheduler-performance.md)
@@ -326,8 +371,8 @@ and Phase 2 updates it rather than contradicting it.**
 `legion_plan_apply_total{outcome}`, `legion_scheduler_plan_phase_seconds{phase}`,
 `legion_store_coalesce_*{path="plan_apply"}`, `legion_raft_ops_total{lane,op,outcome}`,
 `legion_store_read_lock_wait_seconds`, `legion_store_write_lock_wait_seconds`,
-`legion_eval_handle_seconds{kind}`. Phase 0 needs no new instrumentation,
-which is most of why it is cheap.
+`legion_eval_handle_seconds{kind}`. Phase 0b needs no new instrumentation
+(Phase 0a is entirely rig work), which is most of why it is cheap.
 
 ---
 
@@ -355,18 +400,19 @@ The default becomes a **named constant, not a host property**:
 /// NOT the core count. An eval worker's wall time is two scheduler-lane
 /// quorum rounds plus a plan-apply commit; a saturated 5,000-node control
 /// plane measured 8% CPU across four cores. <measured justification and
-/// the campaign that produced it go here, once Phase 0 has run>
-const DEFAULT_EVAL_THREADS: usize = /* Phase 0 decides: 16, 32, or 64 */;
+/// the campaign that produced it go here, once Phase 0b has run>
+const DEFAULT_EVAL_THREADS: usize = /* Phase 0b decides: 32, 64, 128? */;
 
 fn default_eval_threads() -> usize {
     DEFAULT_EVAL_THREADS
 }
 ```
 
-**The value is deliberately left open.** It is Phase 0's output. What the
-existing evidence supports is that it is **at least 16** and **not the core
-count**; the phases below are ordered so the constant is written after the
-sweep, not before.
+**The value is deliberately left open.** It is Phase 0b's output. What the
+existing evidence supports is that it is **at least 32** on a 4-vCPU manager
+and **not the core count**; the phases below are ordered so the constant is
+written after the sweep, not before. Writing 32 in today would be choosing
+the largest number a broken load generator happened to reach.
 
 ### 6.3 What an operator sees
 
@@ -395,8 +441,8 @@ A flat default of 16 or 32 on a single-node dev cluster costs 16-32 parked
 threads and up to 16 read connections. Threads that are parked on an empty
 `Notify` are nearly free; the read pool is capped and its page cache is a
 lazily-filled cap rather than a preallocation, so a dev cluster with a
-2 MiB working set holds 2 MiB per connection. Phase 0 measures this rather
-than asserting it (acceptance criterion A0.4) — if idle RSS on a small
+2 MiB working set holds 2 MiB per connection. Phase 0b measures this rather
+than asserting it (acceptance criterion A0b.4) — if idle RSS on a small
 cluster moves materially, the default gains a small-host clamp and the plan
 records that as a judgement call.
 
@@ -420,18 +466,42 @@ exists despite the diff being three lines.
 
 ## 8. Implementation Phases
 
-### Phase 0 — Measure the knee *(prerequisite, ships alone, changes no code)*
+### Phase 0a — Make the rig able to feed the scheduler *(hard prerequisite, no Legion code)*
 
-**This phase is the reason the plan exists.** It produces a number; nothing
-downstream is defensible without it.
+**This is the gate, and it is rig work, not scheduler work.** The 2026-08-05
+sweep ran out of load generator at 64 eval threads. Until the driver can
+saturate a manager running 64+ workers, no cell above 32 threads produces a
+number, and the whole plan is stuck at "more is better, we do not know how
+much more".
 
-Run the sweep on the AWS rig, one variable, everything else fixed. There is
-no sweep flag for this knob — `--eval-threads` takes one value and needs the
-control-plane reset to apply it — so it is one campaign invocation per cell,
-which is also what keeps the cells honestly independent:
+The driver's known ceiling is structural: it spawns one `legion job run` CLI
+process per job from a fixed thread pool, so its rate is bounded by process
+spawn and gRPC dial cost rather than by anything Legion does. That is what
+capped it at ~36 jobs/sec on an `m7i.large` in phase 4 and it is why the
+64-thread cell is a floor. Candidate fixes, in increasing order of effort:
+
+- submit through one long-lived gRPC client in-process instead of one CLI
+  process per job, which removes the spawn and the TLS handshake per job;
+- give the load generator its own instance, sized, rather than sharing with
+  Prometheus and Grafana;
+- shard submission across several loadgen hosts.
+
+**Exit criterion:** a cell at 64 eval threads that reports
+`driver_bound: false`, at a submission rate with visible headroom over the
+throughput it produces. **Until this exits, Phase 1 does not start.** Note
+this also unblocks the saturation questions the other scheduler plans are
+waiting on — the driver's ceiling is not specific to `evalThreads`.
+
+### Phase 0b — Sweep for the knee *(ships alone, changes no code)*
+
+Once 0a exits, re-run the sweep on the AWS rig, one variable, everything
+else fixed. There is no sweep flag for this knob — `--eval-threads` takes one
+value and needs the control-plane reset to apply it — so it is one campaign
+invocation per cell, which is also what keeps the cells honestly
+independent:
 
 ```bash
-for threads in 4 8 16 32 64; do
+for threads in 4 8 16 32 64 128; do
   benchmarks/aws/scripts/run-campaign.sh \
     --system legion-a \
     --scenarios dense_fleet \
@@ -440,36 +510,37 @@ for threads in 4 8 16 32 64; do
 done
 ```
 
-4 is included even though cell G already measured it: comparing cells from
-different campaigns is how phases 2 and 3 went wrong, so the baseline is
-re-run inside this campaign.
+The whole ladder is re-run, including the points 2026-08-05 already covered:
+comparing cells from different campaigns is how phases 2 and 3 went wrong.
+128 is included because 64 has never been measured on its merits and the
+curve may well still be climbing there.
 
 - 5,000 nodes, three manager voters, `topology = "lanes"`, identical binary
   and identical allocations-per-node across cells.
 - **Every cell must report `driver_bound: false`.** A cell that does not is
-  discarded, not interpreted. This is the defect that invalidated three
-  campaigns; the rig now reports the flag, so there is no excuse for
-  repeating it.
+  discarded, not interpreted — not quoted as a floor, not plotted, not
+  averaged in. This is the defect that invalidated three campaigns.
 - Record per cell: throughput, p50/p99 placement latency, drain time,
-  `plan_phase_seconds{phase}`, `coalesce_*{path="plan_apply"}` (especially
-  `batch_size` and follower wait), `raft_ops_total{lane,op,outcome}`,
-  `eval_claim_total{outcome}`, `store_read_lock_wait_seconds`,
-  `store_write_lock_wait_seconds`, manager CPU, **and manager RSS**.
-- Compute **effective planner concurrency** (evals per second x plan
-  latency) for every cell and put it next to the configured thread count.
-  The 16-configured/3.96-effective gap at 100,000 allocations is the thing
-  this sweep most needs to explain.
+  `plan_phase_seconds{phase}`, **`eval_handle_seconds{kind}`**,
+  `coalesce_*{path="plan_apply"}` (especially `batch_size` and follower
+  wait), `raft_ops_total{lane,op,outcome}`, `eval_claim_total{outcome}`,
+  `store_read_lock_wait_seconds`, `store_write_lock_wait_seconds`, manager
+  CPU, **and manager RSS**.
+- Compute worker occupancy as evals per second x **`eval_handle_seconds`**,
+  not x `plan_phase_seconds{total}`, and measure allocations per eval per
+  cell rather than taking it from the scenario. §5 explains why: the earlier
+  "3.96 effective workers" was that substitution, and it invented a
+  concurrency cap that the sweep then disproved.
 - Repeat the winning and neighbouring cells at a second fill (100,000
   allocations) to see whether the knee moves with live allocation count. It
   probably does — throughput already degrades ~1.6x per doubling of live
   allocations — and a default that is right only at one fill is not a
   default.
 
-**Output:** a findings section in `internal_docs/` with the table, and a
-recommended constant with its reasoning. **Exit criterion:** the sweep shows
-a clear maximum or a clear plateau. If throughput is still climbing at 64,
-extend the sweep before proceeding rather than shipping the edge of the
-range.
+**Output:** a findings document in `internal_docs/` with the table, and a
+recommended constant with its reasoning. **Exit criterion:** a cell where
+throughput stops rising, with `driver_bound: false` on both it and the cell
+below it. A still-climbing curve is not an exit — extend the ladder.
 
 **Independently valuable:** yes, regardless of what happens next. It is the
 first honest measurement of Legion's scheduler concurrency response, and the
@@ -477,7 +548,7 @@ plan-apply and coalescer work both need it.
 
 ### Phase 1 — Set the default
 
-Replace `default_eval_threads()`'s body with the constant Phase 0 chose;
+Replace `default_eval_threads()`'s body with the constant Phase 0b chose;
 write the doc comment with the campaign, the date, the cell table, and the
 fill the number was measured at. Add the unit tests in §9. Write
 `internal_docs/calls/eval-thread-default-plan_calls.md` with, at minimum:
@@ -527,7 +598,7 @@ baseline.
   config with `evalThreads` set and confirm the explicit value survives;
   deserialize one without it and confirm the constant appears.
 - `eval_threads_default_is_within_the_swept_range` — asserts the constant is
-  one of the values Phase 0 actually measured, so a later edit cannot drift
+  one of the values Phase 0b actually measured, so a later edit cannot drift
   it to an untested number without changing the test and noticing.
 
 **Integration (Phase 1)** — there is no daemon-level test today that asserts
@@ -542,7 +613,7 @@ capturing logs, rather than on the log line.
 
 **Benchmark (required by [AGENTS.md](../../AGENTS.md))** — this is a
 scheduler change, so it ships with before/after numbers. The relevant
-numbers are the Phase 0 sweep itself, not
+numbers are the Phase 0b sweep itself, not
 `benchmarks/micro/scheduler_bench.rs`: the micro-benchmarks run one thread
 against a local store with raft off, where `Store::replicated`
 short-circuits and eval-worker concurrency is structurally unmeasurable. Run
@@ -586,23 +657,25 @@ the docs tell operators how to check it on theirs.
 
 ## 11. Open Questions
 
-1. **Where is the knee — 16, 32, or 64?** *Unmeasured. This is Phase 0 and
-   it gates everything.* Current lean: the response is not monotonic and
-   flattens well before 64, because the plan-apply commit is serialized and
-   the coalescer's batch size was 1.32 at 16 threads — more submitters
-   waiting on a lock they are not batching against buys latency, not
-   throughput. Lean toward the low end of what the sweep permits.
-2. **Why did 16 configured workers produce ~4 effective ones?** Throughput ×
-   plan latency gives 3.96 at 100,000 allocations and ~2.9 at 200,000. The
-   read pool is ruled out (§5). Remaining candidates: the scheduler lane's
-   single `pipeline_loop` thread serializing claims; `claim_eval` and
-   `complete_and_claim_next` being called synchronously from the async loop
-   (`daemon.rs:1719`, `:1768`) rather than from `spawn_blocking`, so each one
-   parks a tokio runtime worker and there are `available_parallelism()` of
-   those; or simply insufficient queue depth. **These have different
-   answers**, and the third would mean the knee is a property of the rig.
-   Lean: the runtime-thread one is real and worth fixing on its own merits
-   regardless of what the sweep says.
+1. **Where is the knee — 32, 64, 128, or higher?** *Unmeasured, and it
+   cannot be measured on the current rig.* The 2026-08-05 sweep was monotonic
+   through 32 and its 64-thread cell was driver-bound, so the only honest
+   statement is "at least 32, on a 4-vCPU manager at 5,000 nodes and 25,002
+   allocations". Previous lean — that the response would flatten well before
+   64, because the plan-apply commit is serialized and the coalescer's batch
+   size was 1.32 at 16 threads — **is not supported by the data**: 32 beat 16
+   by 14.8% with that same serialized commit in place. Current lean: no
+   prediction. Fix Phase 0a and measure.
+2. **How high can `evalThreads` go before something else breaks?** Distinct
+   from the throughput knee. Each worker is a thread, each holds an eval, and
+   `claim_eval` / `complete_and_claim_next` are called synchronously from the
+   async eval loop (`daemon.rs:1719`, `:1768`) rather than from
+   `spawn_blocking` — so each parks one of `available_parallelism()` tokio
+   runtime threads for a whole quorum round. At 128 workers on a 4-core
+   manager that is a lot of contention for four runtime threads, and it is a
+   bug worth fixing on its own merits whatever the sweep says. Lean: fix the
+   blocking calls before sweeping past 64, or the sweep measures the defect
+   rather than the scheduler.
 3. **Does the knee move with live allocation count?** Almost certainly —
    throughput degrades ~1.6x per doubling of live allocations and plan time
    grew only 22% across the same step, so the cost is elsewhere and may
@@ -611,39 +684,52 @@ the docs tell operators how to check it on theirs.
    real plan. Lean: measure at two fills and see.
 4. **What does the new default cost in memory?** Each eval worker is a
    parked thread, and the read pool now scales with `evalThreads` up to 16
-   connections at a 64 MiB page-cache cap each. Lean: negligible on a small
+   connections at a 64 MiB page-cache cap each. This matters more now that
+   the answer may be 64 or 128 rather than 16. Lean: negligible on a small
    cluster because the cache is a lazily-filled cap, but it is measured in
-   Phase 0, not asserted.
+   Phase 0b, not asserted.
 5. **Should the default be clamped on very small hosts?** A flat 32 on a
    1-vCPU dev VM is defensible but slightly silly. Lean: no clamp unless
-   Phase 0's small-cluster RSS number says otherwise — a clamp reintroduces
+   Phase 0b's small-cluster RSS number says otherwise — a clamp reintroduces
    a host-derived term, which is the thing this plan is removing.
 
 ---
 
 ## 12. Acceptance Criteria
 
-**Phase 0**
+**Phase 0a** — the gate
 
-- A0.1 A sweep of at least 4/8/16/32/64 eval threads at 5,000 nodes, every
-  cell reporting `driver_bound: false`, in one campaign on one binary.
-- A0.2 A published table with throughput, p50/p99, drain, plan phases,
-  coalescer batch size and follower wait, raft ops by outcome, read/write
-  lock wait, CPU, and RSS per cell.
-- A0.3 Effective planner concurrency computed per cell and stated next to
-  the configured count, with the gap either explained or explicitly named as
-  unexplained.
-- A0.4 Idle and loaded manager RSS at the recommended value against RSS at
+- A0a.1 A 64-eval-thread cell at 5,000 nodes reporting `driver_bound: false`.
+- A0a.2 The driver's submission rate recorded next to the throughput it
+  produced, with visible headroom between them, so "not driver-bound" is a
+  number rather than a flag.
+
+**Phase 0b**
+
+- A0b.1 A sweep of at least 4/8/16/32/64/128 eval threads at 5,000 nodes,
+  every cell reporting `driver_bound: false`, in one campaign on one binary.
+  A driver-bound cell is discarded, never quoted as a floor.
+- A0b.2 A published table with throughput, p50/p99, drain, plan phases,
+  `eval_handle_seconds`, coalescer batch size and follower wait, raft ops by
+  outcome, read/write lock wait, CPU, and RSS per cell.
+- A0b.3 Worker occupancy computed per cell as evals/sec x
+  `eval_handle_seconds` — not x `plan_phase_seconds{total}` — with
+  allocations per eval measured rather than assumed, and stated next to the
+  configured count.
+- A0b.4 Idle and loaded manager RSS at the recommended value against RSS at
   4 threads.
-- A0.5 A recommended constant with its reasoning, and the sweep repeated at
-  a second fill for the winner and its neighbours.
+- A0b.5 A recommended constant with its reasoning, and the sweep repeated at
+  a second fill for the winner and its neighbours. **A monotonic curve is
+  not a result**: if throughput is still rising at the top of the ladder,
+  extend the ladder rather than choosing its last point.
 
 **Phase 1**
 
 - A1.1 `default_eval_threads()` contains no reference to
   `available_parallelism()`.
 - A1.2 The three unit tests in §9 pass, including the one asserting the
-  constant is a swept value.
+  constant is a value Phase 0b actually measured (and measured
+  `driver_bound: false`).
 - A1.3 A manager config with an explicit `evalThreads` produces exactly that
   many workers; one without produces the constant.
 - A1.4 `internal_docs/calls/eval-thread-default-plan_calls.md` exists,

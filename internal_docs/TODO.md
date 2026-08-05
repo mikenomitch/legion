@@ -48,23 +48,34 @@ How to use it:
       ceiling.** Steal-on-contention, cached heartbeat task configs, and a new
       `legion_store_read_lock_wait_seconds` (read-connection wait
       previously had **no metric at all**). The hypothesis that this was
-      the ceiling was **refuted twice**: phase 3 measured `task_fetch` at
-      0.65 ms at 5,000 nodes on the *unmodified* binary, so the 107x
-      growth seen in the phase-2 archives was coupled to the conflict
-      rate, not to fleet size; and the plan path was then traced in code
-      and holds **no** read connection across a quorum round, an `.await`,
-      or `build_plan` (the apply runs on the write connection inside
-      `replicated()`). The pool cannot serialize two planners. See
+      the ceiling was **refuted three times**: phase 3 measured
+      `task_fetch` at 0.65 ms at 5,000 nodes on the *unmodified* binary, so
+      the 107x growth seen in the phase-2 archives was coupled to the
+      conflict rate, not to fleet size; the plan path was traced in code and
+      holds **no** read connection across a quorum round, an `.await`, or
+      `build_plan` (the apply runs on the write connection inside
+      `replicated()`), so the pool cannot serialize two planners; and the
+      2026-08-05 eval-thread sweep ran every cell with **four** connections
+      and still got 251.68 alloc/s at 32 eval threads, up 14.8% on 16. The
+      "~4 effective planners" figure that started the hunt was a metrics
+      error — `plan_phase_seconds{total}` times planning only, so Little's
+      law over it counts evals in the planning *stage*, not busy workers.
+      Use `eval_handle_seconds`. See
       [eval-path-raft-cost-plan_calls.md](calls/eval-path-raft-cost-plan_calls.md)
-      entry 3.
+      entry 5.
 - [x] **Take the read-connection pool off `available_parallelism()`.**
-      Now `evalThreads + 4`, capped at 16. Core count was the wrong basis:
-      the readers are latency-bound (8% CPU at saturation, and a page-cache
-      miss holds the mutex through a `pread`), holds are uneven
+      Now `evalThreads + 4`, capped at 16. **No throughput claim** — the
+      sweep above shows four connections were adequate through 32 eval
+      threads, so this is a correction to the sizing *argument* plus a
+      bounded hedge for the higher `evalThreads` values the sweep says
+      operators will want. Core count was the wrong basis: the readers are
+      latency-bound (8% CPU at saturation, and a page-cache miss holds the
+      mutex through a `pread`), holds are uneven
       (`cache_refresh_allocation_scopes` keeps one connection across ~44
-      per-node queries after every apply, on every replica), and — worst —
-      the heartbeat body runs inline on tokio worker threads, so a pool
-      sized at the core count fills at the same moment the runtime does.
+      per-node queries after every apply, on every replica), and a pool
+      sized at the core count saturates in lockstep with the tokio runtime
+      by construction, since the heartbeat body reads inline on runtime
+      threads.
       **A config knob was deliberately not added**: `evalThreads` is the
       concurrent-reader count we already have, and a `readConnections`
       field would be a number no operator can size from first principles.
@@ -105,23 +116,25 @@ How to use it:
       `legion_eval_claim_total{outcome}`, whose absence is what hid it, and
       an `op` label on `legion_raft_ops_total`.
 - [ ] **Decide the `evalThreads` default.** It is `available_parallelism()`,
-      which is the 4 that just lost to 16 by 23.7%. An eval worker parks on
-      quorum round trips rather than computing (8% CPU at saturation), so
-      core count is the wrong basis. **Planned, not built** —
-      [eval-thread-default-plan.md](plans/eval-thread-default-plan.md).
-      Phase 0 is a gate and nothing else may land first: the sweep
-      (4/8/16/32/64 eval threads at 5,000 nodes, every cell
-      `driver_bound: false`, repeated at a second fill) has not been run, so
-      whether the answer is 16, 32 or 64 is unmeasured. `configs/manager.ncl`
-      also pins `evalThreads = 4` explicitly, so it has to move with the
-      default.
-  - [ ] **Explain the 16-configured / ~4-effective planner gap.** Throughput
-        x plan latency gives **3.96** concurrent planners at 100,000
-        allocations and ~2.9 at 200,000, with 16 workers configured. The
-        read pool is ruled out. Remaining suspects: the scheduler lane's
-        single `pipeline_loop` thread serializing claims, the runtime-thread
-        item below, or insufficient queue depth on the rig. These have
-        different answers and Phase 0 has to separate them.
+      which is the 4 that placed slowest in the 2026-08-05 sweep at 5,000
+      nodes: 177.27 alloc/s at 4 threads, 208.83 at 8, 219.25 at 16,
+      **251.68 at 32**, and >= 263.08 at 64 where the LOAD GENERATOR became
+      the constraint. An eval worker parks on quorum round trips rather than
+      computing (8% CPU at saturation), so core count is the wrong basis —
+      but the curve never turned over, so the right value is unknown.
+      **Planned, not built** —
+      [eval-thread-default-plan.md](plans/eval-thread-default-plan.md), which
+      deliberately picks no number.
+  - [ ] **Fix the load generator before sweeping again (Phase 0a, the
+        gate).** The driver spawns one `legion job run` CLI process per job,
+        so its rate is bounded by process spawn and gRPC dial, not by
+        Legion. Until a 64-thread cell can report `driver_bound: false`, no
+        point above 32 produces a number. Submit through one long-lived
+        in-process gRPC client; give the loadgen its own instance; shard it
+        if that is not enough. Unblocks the saturation questions in the
+        other scheduler plans too.
+  - [ ] `configs/manager.ncl` pins `evalThreads = 4` explicitly, so it has
+        to move with the default.
 - [ ] **The eval loop blocks tokio worker threads on quorum rounds.**
       `store.claim_eval()` (`daemon.rs:1719`) and
       `store.complete_and_claim_next()` (`:1768`) are synchronous calls made
@@ -131,7 +144,9 @@ How to use it:
       `available_parallelism()` of those — 4 on the campaign's managers, no
       matter how high `evalThreads` goes. While they are parked nothing
       async runs, including polling the completed handlers. Move both onto
-      the blocking pool. Suspect in the effective-concurrency gap above.
+      the blocking pool. This is now a **prerequisite for sweeping past 64
+      eval threads** — at 128 workers against 4 runtime threads the sweep
+      would be measuring this defect rather than the scheduler.
 - [ ] **`run_dispatch_future` has no `Send` bound** (`dispatcher.rs:408`),
       so holding a `MutexGuard` across an `.await` inside
       `dispatch_allocations` would **compile**. It does not happen today —
