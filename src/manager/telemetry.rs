@@ -709,6 +709,8 @@ pub struct Metrics {
     pub plan_apply_total: Arc<CounterVec>,
     /// `legion_eval_claim_total{outcome}`
     pub eval_claim_total: Arc<CounterVec>,
+    /// `legion_eval_handle_seconds{kind}`
+    pub eval_handle_seconds: Arc<HistogramVec>,
     /// `legion_scheduler_plan_candidate_rank`
     pub scheduler_plan_candidate_rank: Arc<Histogram>,
     /// `legion_scheduler_plan_bind_pass{pass}`
@@ -864,6 +866,15 @@ impl Metrics {
                 labels: &["outcome"],
             },
             series: Series::new(),
+        });
+        let eval_handle_seconds = Arc::new(HistogramVec {
+            meta: FamilyMeta {
+                name: "legion_eval_handle_seconds",
+                help: "Wall time to handle one claimed eval end to end: planning, applying, dispatching the allocations, and the post-apply bookkeeping. Read it AGAINST legion_scheduler_plan_phase_seconds{phase=\"total\"} — the difference is everything an eval does outside planning, which is otherwise invisible. Throughput is roughly evalThreads divided by this.",
+                labels: &["kind"],
+            },
+            series: Series::new(),
+            bounds: DURATION_BUCKETS,
         });
         let scheduler_plan_candidate_rank = Arc::new(Histogram {
             meta: FamilyMeta {
@@ -1280,6 +1291,7 @@ impl Metrics {
             Arc::clone(&eval_conflict_requeues_total) as Arc<dyn RenderMetric>,
             Arc::clone(&plan_apply_total) as Arc<dyn RenderMetric>,
             Arc::clone(&eval_claim_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&eval_handle_seconds) as Arc<dyn RenderMetric>,
             Arc::clone(&preemption_plans_total) as Arc<dyn RenderMetric>,
             Arc::clone(&preemptions_total) as Arc<dyn RenderMetric>,
             Arc::clone(&raft_applied_index) as Arc<dyn RenderMetric>,
@@ -1320,6 +1332,7 @@ impl Metrics {
             eval_queue_depth,
             plan_apply_total,
             eval_claim_total,
+            eval_handle_seconds,
             scheduler_plan_bind_pass,
             scheduler_plan_candidate_rank,
             eval_conflict_requeues_total,

@@ -1749,11 +1749,21 @@ async fn eval_worker_loop(store: Store, notifier: Arc<Notify>, worker_id: usize)
                 // worker's one-eval-at-a-time ordering.
                 let store_for_handler = store.clone();
                 let eval_for_handler = eval.clone();
-                match tokio::task::spawn_blocking(move || {
+                // Timed end to end because the plan-phase histograms only
+                // cover planning: an eval also dispatches its allocations and
+                // runs post-apply bookkeeping, and the difference between
+                // this and `plan_phase_seconds{phase="total"}` is the only
+                // way to see that half. Throughput is roughly `evalThreads`
+                // divided by this.
+                let handle_started = std::time::Instant::now();
+                let handled = tokio::task::spawn_blocking(move || {
                     resolve_claimed_eval(&store_for_handler, worker_id, &eval_for_handler)
                 })
-                .await
-                {
+                .await;
+                crate::manager::telemetry::metrics()
+                    .eval_handle_seconds
+                    .observe(&[&eval.kind], handle_started.elapsed().as_secs_f64());
+                match handled {
                     // One scheduler-lane round finishes this eval and
                     // claims the next, instead of one round each.
                     Ok(completion) => match store.complete_and_claim_next(&eval.id, completion) {
