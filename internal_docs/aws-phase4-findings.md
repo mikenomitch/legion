@@ -288,16 +288,61 @@ already names exactly which allocations changed. At ~40 allocations per node
 across ~44 nodes that is ~1,700 rows re-read per eval to learn about 44
 changes, on every replica.
 
+## Throughput degrades ~1.6x per doubling of live allocations
+
+The full `dense_fleet` ladder, all `driver_bound: false`, 16 eval threads:
+
+| allocations | throughput | ratio |
+| --- | --- | --- |
+| 50,000 | 736.1 alloc/s | — |
+| 100,000 | 456.58 alloc/s | /1.61 |
+| 200,000 | 272.91 alloc/s | /1.67 |
+
+Consistent across both steps, and the plan path does not explain it: plan total
+grew only 381 -> 465 ms (+22%) across the last step while throughput fell 40%.
+The missing time is outside the plan-phase timers.
+
+**Mechanism (hypothesis, testable).** Both hot paths read *every allocation on
+a node*, and allocations-per-node grows with cluster fill while the work per
+eval does not:
+
+- `free_pool_for_node_tx`, inside the apply transaction —
+  `SELECT ... FROM allocation WHERE node_id = ?`, memoized per node per apply.
+- `cache_refresh_allocation_scopes`, after commit on EVERY replica —
+  `allocs_for_node` per touched node, re-reading the node's whole list.
+
+At 5,000 nodes that is 10 allocations/node at 50,000 and **40 at 200,000**. An
+eval touching ~44 nodes therefore reads ~440 rows at the bottom of the ladder
+and ~1,760 at the top — 4x the work for identical placement counts, purely
+from fill. The refresh half runs outside the plan timers, which is why plan
+time barely moved.
+
+**The fix this implies** is to stop re-reading: the changeset already names
+exactly which allocations changed, so the read model can take a delta instead
+of a full per-node reload. That trades the current self-healing property (a
+full reload cannot drift) for cost that scales with the fleet rather than with
+the change, so it needs care rather than enthusiasm.
+
+An interim change already landed: the refresh now uses one read connection and
+one cached statement instead of one acquisition and one parse per node. That
+removes 44 acquisitions per eval from a pool sized to the core count, but it
+does not reduce the rows read.
+
 ## Open, in priority order
 
-1. **Break the serialized plan-apply commit.** 347 ms of follower wait against
+1. **Stop re-reading whole nodes on the read-model refresh.** The strongest
+   explanation for the ~1.6x-per-doubling degradation, and the only one that
+   accounts for time outside the plan timers. Apply a changeset delta.
+2. **Break the serialized plan-apply commit.** 347 ms of follower wait against
    a 138 ms commit is the ceiling at scale. Either make the commit cheaper or
    let submitters join an in-flight batch rather than queue behind it — the
    coalescer is charging for batching it is not doing (batch size 1.32 at 16
    threads).
-2. **Apply a delta to the read model instead of re-reading each node.**
-   ~1,700 rows re-read per eval, on every replica, to learn about 44 changes.
 3. **Find the knee.** 16 threads beat 4; the ladder above 16 is unmeasured.
+4. **Measure control-plane CPU at saturation.** Every CPU figure so far (8% of
+   four cores) came from a driver-bound cell — an idle system. Whether the
+   ceiling is CPU or serialization is still unmeasured, and it decides which of
+   1 and 2 matters more.
 3. **Capture cost, not raft cost.** 134 empty captures/sec still take the write
    connection. Skipping the write when the value is unchanged would remove
    them entirely.
