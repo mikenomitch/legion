@@ -393,9 +393,61 @@ the manager gets busier, which means the cells are not perfectly matched. The
 Legion-bound cells are still valid measurements of Legion — `driver_bound` is
 false for all of them — but the submit rates are not a controlled variable.
 
+## The PR measured: a constant factor, not a flatter curve
+
+Binary built from the merge HEAD `101e74c` and verified against the fairness
+record's git rev. 5,000-node fleet, three m6id.xlarge managers, 16 eval
+threads, every cell `driver_bound: false` unless noted.
+
+| allocations | before | after | gain |
+| --- | --- | --- | --- |
+| 50,000 | 736.1 alloc/s | **1,721.54 alloc/s** | 2.34x |
+| 100,000 | 456.58 alloc/s | **1,170.9 alloc/s** | 2.56x |
+| 200,000 | 272.91 alloc/s | **636.62 alloc/s** | 2.33x |
+| web_fleet 25,002 | 219.25 alloc/s | **>=336.33 alloc/s** | driver-bound floor |
+
+**The fill-degradation slope did not move.** Per doubling of live allocations:
+1.61 then 1.67 before, 1.47 then 1.84 after — geometric mean **1.64 against
+1.65**. The curve shifted up by a uniform ~2.4x and kept its shape.
+
+That is a useful negative result, because two of the changes existed
+specifically to attack it and both provably flattened their own path: the
+free pool grows 1.08x over a 4x fill change where the row walk grew 2.4x, and
+the delta refresh is proportional to the changeset rather than to fill. **So
+neither was the dominant term.** The next suspect is `reproject_model_nodes`,
+which still recomputes each touched node's pool from its whole allocation
+list on every refresh.
+
+An interim reading of the 50k->100k step alone ("1.47, modestly flatter") was
+called early and was wrong — the second step went the other way. Two points
+are not a trend.
+
+### Mechanism metrics, which did move
+
+| metric | before | after |
+| --- | --- | --- |
+| evals settled per claim round | 1 | **86.8** |
+| group-commit batch size | 1.32 | **3.10** |
+| empty claims, scheduler lane | ~2,600/cell | **0.3/s** |
+| eval handle vs plan total | not measurable | **272 ms vs 94 ms** |
+
+The last row is the one to keep: **65% of an eval's life is outside the plan
+path**, in dispatch and bookkeeping. Every plan-phase-based inference made
+earlier in this document was blind to that, which is precisely how the "~4
+effective workers" derivation went wrong.
+
+The coalescer batch size roughly doubling is a second-order effect and worth
+noting: it was argued (correctly) that batch size reflects ARRIVAL RATE and
+cannot be raised directly. Cheaper claim rounds meant more submitters arrived
+during each commit, so it rose on its own.
+
 ## Open, in priority order
 
-1. ~~**Stop re-reading whole nodes on the read-model refresh.**~~ **Shipped
+1. **Find what actually drives the fill degradation.** Measured at ~1.65x per
+   doubling both before and after this work, so it is neither
+   `free_pool_for_node_tx` nor `cache_refresh_allocation_scopes`. Next
+   suspect: `reproject_model_nodes`.
+2. ~~**Stop re-reading whole nodes on the read-model refresh.**~~ **Shipped
    2026-08-05, unmeasured at scale.** `cache_apply_allocation_delta` reads
    exactly the rows the changeset names, by primary key, and splices them
    into the cached per-node lists; the full reload stays as the fallback and
