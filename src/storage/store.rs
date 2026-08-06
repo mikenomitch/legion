@@ -68,6 +68,14 @@ pub enum Msg {
 pub type MemSafeConn = Arc<Mutex<Connection>>;
 const READ_MODEL_LOCK_ERROR: &str = "Error locking read model";
 
+/// One `RunJob` submission headed for the control-lane group commit.
+#[derive(Debug, Clone)]
+pub struct JobSubmitRequest {
+    pub config: JobConfig,
+    pub subs: Vec<Submission>,
+    pub template: Option<JobTemplateProvenance>,
+}
+
 /// One eval to enqueue, for the batched [`Store::enqueue_evals`].
 #[derive(Debug, Clone)]
 pub struct EvalRequest {
@@ -780,6 +788,8 @@ pub struct Store {
     // every gRPC worker thread feeds the same two queues.
     eval_enqueue_coalescer: Arc<crate::storage::coalesce::Coalescer<EvalRequest, Eval>>,
     task_status_seed_coalescer: Arc<crate::storage::coalesce::Coalescer<String, ()>>,
+    job_submit_coalescer:
+        Arc<crate::storage::coalesce::Coalescer<JobSubmitRequest, JobSubmitOutcome>>,
     // Node liveness as leader-local soft state (liveness plan §6.2). A
     // steady-state heartbeat is one write into this table: no raft commit,
     // no fsync, no pipeline-thread hop. Shared across clones so the gRPC
@@ -1180,6 +1190,12 @@ const HEARTBEAT_BATCH_MAX: usize = 128;
 // tiny next to a plan's placement set, and the intake path's concurrency is
 // the client fan-out, which is what we want to absorb in one round.
 const EVAL_ENQUEUE_BATCH_MAX: usize = 64;
+
+/// Cap for the control-lane job-submit group commit. Same reasoning as the
+/// eval-enqueue cap: bounded by what a submit burst realistically piles up
+/// while one commit is in flight, and by how much work a single control-lane
+/// changeset should carry.
+const JOB_SUBMIT_BATCH_MAX: usize = 64;
 const TASK_STATUS_SEED_BATCH_MAX: usize = 64;
 // The submit composite's status-lane seed, shared by the single-seed op and
 // the group commit so the two forms can never drift apart.
@@ -1263,6 +1279,10 @@ impl Store {
             eval_enqueue_coalescer: Arc::new(crate::storage::coalesce::Coalescer::new(
                 "eval_enqueue",
                 EVAL_ENQUEUE_BATCH_MAX,
+            )),
+            job_submit_coalescer: Arc::new(crate::storage::coalesce::Coalescer::new(
+                "job_submit",
+                JOB_SUBMIT_BATCH_MAX,
             )),
             task_status_seed_coalescer: Arc::new(crate::storage::coalesce::Coalescer::new(
                 "task_status_seed",
@@ -8179,6 +8199,47 @@ impl Store {
         Ok((rollout, rollout_by_group))
     }
 
+    /// The latest stored config for `name`, read THROUGH the given
+    /// transaction. This is what makes job submits batchable: the version
+    /// derivation in `handle_job_submit_tx` must see writes earlier in the
+    /// same batch transaction (a second submit of one job in a batch derives
+    /// N+2, not a duplicate N+1), and the read-connection variant below
+    /// structurally cannot — it reads committed state, which is also the
+    /// standing "race condition here with the version" the old comment
+    /// admitted for concurrent submits.
+    fn latest_job_config_tx(&self, tx: &Connection, name: &str) -> R<Option<JobConfig>> {
+        let maybe: Option<(JobConfig, String)> = tx
+            .prepare_cached(&GET_JOB_CONFIG)?
+            .query_row([name], |row| {
+                let job_config_id: String = row.get(0)?;
+                let meta: Value = row.get(3)?;
+                let (rollout, rollout_by_group) = Self::rollout_meta_from_value(meta)?;
+                Ok((
+                    JobConfig {
+                        name: row.get(1)?,
+                        tasks: vec![],
+                        priority: Band::from_stored(&row.get::<_, String>(7)?),
+                        rollout,
+                        rollout_by_group,
+                        version: Some(row.get(4)?),
+                    },
+                    job_config_id,
+                ))
+            })
+            .optional()?;
+        let Some((job_config, jc_id)) = maybe else {
+            return Ok(None);
+        };
+        let tasks = Self::collect_rows(
+            tx.prepare_cached(&GET_TASK_FOR_JOB_CONIFG)?
+                .query_map([jc_id], |row| self.task_config_from_row(row))?,
+        )?;
+        Ok(Some(JobConfig {
+            tasks,
+            ..job_config
+        }))
+    }
+
     pub fn get_job_config_optional(&self, name: &str) -> R<Option<JobConfig>> {
         let conn = self.read_connection()?;
         let maybe_job_config: Option<(JobConfig, String)> = conn
@@ -8414,12 +8475,31 @@ impl Store {
         subs: &[Submission],
         template: Option<&JobTemplateProvenance>,
     ) -> R<JobSubmitOutcome> {
-        let config = config.clone();
-        let subs = subs.to_vec();
-        let template = template.cloned();
-        let outcome = self.replicated(Lane::Control, "handle_job_submit", move |s| {
-            s.handle_job_submit_apply(&config, &subs, template.as_ref())
-        })?;
+        let request = JobSubmitRequest {
+            config: config.clone(),
+            subs: subs.to_vec(),
+            template: template.cloned(),
+        };
+        // A submit raised from INSIDE another op's capture must stay part of
+        // that capture (`replicated` short-circuits there); routing it
+        // through the coalescer would wait on a leader that needs the very
+        // lane pipeline the caller holds.
+        let outcome = if capture::in_capture()
+            || capture::in_apply()
+            || !self.job_intake_coalescing_enabled()
+        {
+            let JobSubmitRequest {
+                config,
+                subs,
+                template,
+            } = request;
+            self.replicated(Lane::Control, "handle_job_submit", move |s| {
+                s.handle_job_submit_apply(&config, &subs, template.as_ref())
+            })?
+        } else {
+            let coalescer = Arc::clone(&self.job_submit_coalescer);
+            coalescer.submit(request, |batch| self.run_job_submit_batch(batch))?
+        };
         // The status half runs for EVERY outcome, `Unchanged` included
         // (JC-40 composite-retry idempotency): if a previous attempt's
         // control half committed and its status half was rejected — the
@@ -8679,21 +8759,179 @@ impl Store {
         subs: &[Submission],
         template: Option<&JobTemplateProvenance>,
     ) -> R<JobSubmitOutcome> {
+        let mut conn = self.write_connection()?;
+        let tx = Self::write_tx(&mut conn)?;
+        let (outcome, staged) = self.handle_job_submit_tx(&tx, config, subs, template)?;
+        tx.commit()
+            .map_err(|_| anyhow!("Error committing transaction"))?;
+        drop(conn);
+        self.finish_job_submit(&outcome, staged)?;
+        Ok(outcome)
+    }
+
+    /// Post-commit half of a submit: broadcast the staged events and warm
+    /// the task-config cache. Shared by the single op and the batch, and
+    /// run once per SUCCESSFUL request after its transaction committed.
+    fn finish_job_submit(
+        &self,
+        outcome: &JobSubmitOutcome,
+        staged: Vec<SchedulerEventRecord>,
+    ) -> R<()> {
+        for event in staged {
+            self.publish_staged(Some(event));
+        }
+        let cached_tasks = self.get_task_configs_for_job_config(outcome.job_config_id())?;
+        self.cache_set_task_configs_for_job_config(outcome.job_config_id(), cached_tasks)?;
+        Ok(())
+    }
+
+    /// Batch leader body for the job-submit group commit: every drained
+    /// submit in ONE control-lane op, each request inside its own savepoint
+    /// so a failing submit rolls back alone and its batch-mates still
+    /// commit. Same-job submits in one batch derive successive versions
+    /// correctly because the version read goes through this transaction
+    /// (`latest_job_config_tx`).
+    fn handle_job_submits_apply(&self, batch: &[JobSubmitRequest]) -> Vec<R<JobSubmitOutcome>> {
+        let mut conn = match self.write_connection() {
+            Ok(conn) => conn,
+            Err(err) => {
+                let msg = format!("job-submit batch could not open a write connection: {err:#}");
+                return batch.iter().map(|_| Err(anyhow!(msg.clone()))).collect();
+            }
+        };
+        let tx = match Self::write_tx(&mut conn) {
+            Ok(tx) => tx,
+            Err(err) => {
+                let msg = format!("job-submit batch could not open a transaction: {err:#}");
+                return batch.iter().map(|_| Err(anyhow!(msg.clone()))).collect();
+            }
+        };
+
+        let mut results: Vec<R<JobSubmitOutcome>> = Vec::with_capacity(batch.len());
+        let mut finished: Vec<(JobSubmitOutcome, Vec<SchedulerEventRecord>)> = Vec::new();
+        for request in batch {
+            if let Err(err) = tx.execute_batch("SAVEPOINT legion_submit_item;") {
+                results.push(Err(anyhow!("job-submit item savepoint failed: {err:#}")));
+                continue;
+            }
+            match self.handle_job_submit_tx(
+                &tx,
+                &request.config,
+                &request.subs,
+                request.template.as_ref(),
+            ) {
+                Ok((outcome, staged)) => {
+                    if let Err(err) = tx.execute_batch("RELEASE legion_submit_item;") {
+                        results.push(Err(anyhow!("job-submit item release failed: {err:#}")));
+                        continue;
+                    }
+                    results.push(Ok(outcome.clone()));
+                    finished.push((outcome, staged));
+                }
+                Err(err) => {
+                    let _ = tx.execute_batch(
+                        "ROLLBACK TO legion_submit_item; RELEASE legion_submit_item;",
+                    );
+                    results.push(Err(err));
+                }
+            }
+        }
+
+        if let Err(err) = tx.commit() {
+            let msg = format!("job-submit batch commit failed: {err:#}");
+            return batch.iter().map(|_| Err(anyhow!(msg.clone()))).collect();
+        }
+        drop(conn);
+        for (outcome, staged) in finished {
+            if let Err(err) = self.finish_job_submit(&outcome, staged) {
+                warn!(
+                    job_config_id = outcome.job_config_id(),
+                    error = ?err,
+                    "Post-commit submit bookkeeping failed; the read model heals via projection"
+                );
+            }
+        }
+        results
+    }
+
+    /// Group-commit entry for a submit: coalesce concurrent `RunJob`s into
+    /// one control-lane round. Mirrors `run_eval_enqueue_batch`'s contract —
+    /// a `NotRaftLeader` rejection re-runs each request singly (nothing was
+    /// proposed, and each caller keeps the typed rejection its
+    /// standing-split tolerance matches on); any other batch error is
+    /// reported to every member rather than re-run, because an error out of
+    /// `replicated` can straddle a commit and a re-run could double-submit.
+    fn run_job_submit_batch(&self, batch: Vec<JobSubmitRequest>) -> Vec<R<JobSubmitOutcome>> {
+        if batch.len() == 1 {
+            let request = batch.into_iter().next().expect("length checked");
+            return vec![
+                self.replicated(Lane::Control, "handle_job_submit", move |s| {
+                    s.handle_job_submit_apply(
+                        &request.config,
+                        &request.subs,
+                        request.template.as_ref(),
+                    )
+                }),
+            ];
+        }
+        let size = batch.len();
+        let rerun = batch.clone();
+        match self.replicated(Lane::Control, "handle_job_submits", move |s| {
+            Ok(s.handle_job_submits_apply(&batch))
+        }) {
+            Ok(results) => results,
+            Err(err) if crate::storage::raft::driver::NotRaftLeader::in_chain(&err) => {
+                debug!(
+                    batch = size,
+                    "Batched job submit rejected by the control lane; running each singly"
+                );
+                rerun
+                    .into_iter()
+                    .map(|request| {
+                        self.replicated(Lane::Control, "handle_job_submit", move |s| {
+                            s.handle_job_submit_apply(
+                                &request.config,
+                                &request.subs,
+                                request.template.as_ref(),
+                            )
+                        })
+                    })
+                    .collect()
+            }
+            Err(err) => {
+                let msg = format!("job-submit group commit failed: {err:#}");
+                (0..size).map(|_| Err(anyhow!(msg.clone()))).collect()
+            }
+        }
+    }
+
+    /// The whole submit write, against a caller-owned transaction, with the
+    /// version derivation reading THROUGH that transaction (see
+    /// `latest_job_config_tx`). Stages events but does not publish them and
+    /// does not commit — the caller does both, which is what lets the batch
+    /// runner wrap each request in its own savepoint inside one commit.
+    fn handle_job_submit_tx(
+        &self,
+        tx: &Connection,
+        config: &JobConfig,
+        subs: &[Submission],
+        template: Option<&JobTemplateProvenance>,
+    ) -> R<(JobSubmitOutcome, Vec<SchedulerEventRecord>)> {
         let config = self.normalize_job_config(config)?;
-        // Note: There is a race condition here with the version
-        // I think this should prob be all in a single lock, but
-        // I am not going to worry about this for now
 
         let mut next_version = 1;
         let mut last_versions_id: Option<String> = None;
         let mut was_update = false;
 
-        if let Some(latest_job_config) = self.get_job_config_optional(&config.name)? {
+        if let Some(latest_job_config) = self.latest_job_config_tx(tx, &config.name)? {
             // if latest_job_config is deep equal to config, return unchanged
             if latest_job_config.is_same_as(&config) {
-                return Ok(JobSubmitOutcome::Unchanged {
-                    job_config_id: latest_job_config.id(),
-                });
+                return Ok((
+                    JobSubmitOutcome::Unchanged {
+                        job_config_id: latest_job_config.id(),
+                    },
+                    Vec::new(),
+                ));
             } else {
                 next_version = latest_job_config.version.unwrap_or(0) + 1;
                 last_versions_id = Some(latest_job_config.id());
@@ -8701,9 +8939,7 @@ impl Store {
             }
         }
 
-        let mut conn = self.write_connection()?;
         let now = OffsetDateTime::now_utc().unix_timestamp();
-        let tx = Self::write_tx(&mut conn)?;
 
         let get_job_res = tx.query_row(&GET_JOB, [config.name.clone()], |row| {
             self.job_from_row(row)
@@ -8945,25 +9181,18 @@ impl Store {
         } else {
             JobSubmitOutcome::Created { job_config_id }
         };
-        let submit_event =
+        let mut staged: Vec<SchedulerEventRecord> =
             drafts::job_submit_outcome(&job.id, &outcome, next_version, config.tasks.len())
-                .and_then(|draft| self.stage_event_locked(&tx, draft));
-        let scale_reset_events: Vec<_> = scale_reset_events
-            .into_iter()
-            .filter_map(|draft| self.stage_event_locked(&tx, draft))
-            .collect();
-        tx.commit()
-            .map_err(|_| anyhow!("Error committing transaction"))?;
-        self.publish_staged(submit_event);
-        for staged in scale_reset_events {
-            self.publish_staged(Some(staged));
-        }
-        drop(conn);
+                .and_then(|draft| self.stage_event_locked(tx, draft))
+                .into_iter()
+                .collect();
+        staged.extend(
+            scale_reset_events
+                .into_iter()
+                .filter_map(|draft| self.stage_event_locked(tx, draft)),
+        );
 
-        let cached_tasks = self.get_task_configs_for_job_config(outcome.job_config_id())?;
-        self.cache_set_task_configs_for_job_config(outcome.job_config_id(), cached_tasks)?;
-
-        Ok(outcome)
+        Ok((outcome, staged))
     }
 
     pub fn normalize_job_config(&self, config: &JobConfig) -> R<JobConfig> {
@@ -17244,6 +17473,100 @@ mod tests {
         // A node with no health row yet must NOT be treated as unchanged, or
         // its first report would be dropped.
         assert!(!store.node_health_checks_unchanged("never-reported", "{}")?);
+        Ok(())
+    }
+
+    /// The property that makes job submits batchable at all: version
+    /// derivation reads THROUGH the batch transaction, so two submits of
+    /// the SAME job in one batch derive successive versions instead of
+    /// both computing N+1 — which is exactly the race the old
+    /// read-connection derivation carried (its own comment admitted it)
+    /// and the reason the intake work originally declined to batch this
+    /// op.
+    #[test]
+    fn same_job_submits_in_one_batch_derive_successive_versions() -> R<()> {
+        let store = setup_store()?;
+        let v1 = JobConfig {
+            priority: Default::default(),
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "batched-job".into(),
+            tasks: vec![TaskConfig {
+                count: TaskCount::new(1),
+                ..TaskConfig::new("api", "noop")
+            }],
+            version: None,
+        };
+        let mut v2 = v1.clone();
+        v2.tasks[0].count = TaskCount::new(2);
+        let sub = |n: &str| Submission {
+            path: format!("{n}.ncl"),
+            content: format!("job {n}"),
+            is_primary: true,
+        };
+        let batch = vec![
+            JobSubmitRequest {
+                config: v1,
+                subs: vec![sub("v1")],
+                template: None,
+            },
+            JobSubmitRequest {
+                config: v2,
+                subs: vec![sub("v2")],
+                template: None,
+            },
+        ];
+        let results = store.handle_job_submits_apply(&batch);
+        assert_eq!(results.len(), 2);
+        let first = results[0].as_ref().expect("first submit");
+        let second = results[1].as_ref().expect("second submit");
+        assert!(matches!(first, JobSubmitOutcome::Created { .. }));
+        assert!(
+            matches!(second, JobSubmitOutcome::Updated { .. }),
+            "the second same-job submit must see the first's in-transaction write"
+        );
+        let latest = store
+            .get_job_config_optional("batched-job")?
+            .expect("stored config");
+        assert_eq!(
+            latest.version,
+            Some(2),
+            "versions must be successive, not racing duplicates of 1"
+        );
+
+        // A failing member must roll back alone: an unparseable config (a
+        // task count of zero is normalized fine, so use a duplicate
+        // identical config which reports Unchanged — a benign case) plus a
+        // fresh job around it still commits.
+        let unchanged = JobSubmitRequest {
+            config: latest.clone(),
+            subs: vec![sub("v2")],
+            template: None,
+        };
+        let fresh = JobSubmitRequest {
+            config: JobConfig {
+                priority: Default::default(),
+                rollout: None,
+                rollout_by_group: Default::default(),
+                name: "batched-other".into(),
+                tasks: vec![TaskConfig {
+                    count: TaskCount::new(1),
+                    ..TaskConfig::new("api", "noop")
+                }],
+                version: None,
+            },
+            subs: vec![sub("other")],
+            template: None,
+        };
+        let results = store.handle_job_submits_apply(&[unchanged, fresh]);
+        assert!(matches!(
+            results[0].as_ref().expect("unchanged"),
+            JobSubmitOutcome::Unchanged { .. }
+        ));
+        assert!(matches!(
+            results[1].as_ref().expect("fresh"),
+            JobSubmitOutcome::Created { .. }
+        ));
         Ok(())
     }
 
