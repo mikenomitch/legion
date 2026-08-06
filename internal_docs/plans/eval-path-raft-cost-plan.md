@@ -8,11 +8,14 @@ fusion, batched enqueue). Phase 3 (re-measurement on AWS) ran on 2026-08-05
 criterion pointed at `apply` itself, which is phase 4 below. Phase 4's code
 has landed — batching the queue's own bookkeeping across N evals, plus the
 apply-time free-pool cache and the delta read-model refresh — and all of it
-is **unmeasured at scale**. Deliberately deferred: fusing the status-lane
-`task_status` projection (different lane, so it cannot share a round), and
-the batched *apply* across evals, which phase 4 explicitly declined because
-handlers write across lanes as they go rather than returning a plan (see the
-judgement calls).
+is **unmeasured at scale**. The intake phase below (2026-08-06) group-commits
+the two projection halves of job submit and is likewise unmeasured at scale.
+Deliberately deferred: fusing the status-lane `task_status` projection of the
+*apply* path (different lane, so it cannot share a round), the batched *apply*
+across evals, which phase 4 explicitly declined because handlers write across
+lanes as they go rather than returning a plan, and the control-lane
+`handle_job_submit`, which the intake phase declined for the version-derivation
+reason below (see the judgement calls).
 
 ## 1. Problem statement
 
@@ -305,6 +308,62 @@ the rig — the slope should now flatten. If it still does not, the next
 suspect is off this path entirely (control-plane CPU at saturation,
 phase-4 findings open item 4).
 
+### Intake phase — group-commit the two projection halves of job submit
+
+Everything above attacks what an eval costs once it exists. The AWS
+5,000-node profile says the *creation* of an eval is just as expensive,
+because a submitted job writes to all three lanes and each write is its
+own quorum round:
+
+| op | lane | applied/s |
+| --- | --- | --- |
+| `enqueue_eval_after_delay` | scheduler | 19.1 |
+| `handle_job_submit` | control | 16.6 |
+| `seed_task_statuses` | status | 16.6 |
+| `complete_evals_and_claim_next` (already batched) | scheduler | 4.2 |
+
+The top three move in lockstep with the submission rate against 21.9
+evals/s overall; the fourth is what the phase-4 batching did to a
+comparable per-eval round (0.19 rounds/eval). The intake path never got
+the same treatment, and the driver submits 32 jobs concurrently — so
+there is real concurrency to absorb.
+
+Two of the three halves now take the `coalesce.rs` group commit, one
+coalescer per lane (a lane is a separate raft group with its own
+pipeline, so a batch physically cannot span two):
+
+- **scheduler** — `enqueue_eval_after_delay` submits an `EvalRequest` to
+  the `eval_enqueue` coalescer, whose batch runner proposes one
+  `enqueue_evals_isolated` op applying each request in its own savepoint.
+- **status** — the submit composite's seed submits its `job_config_id` to
+  the `task_status_seed` coalescer, whose runner proposes one
+  `seed_task_statuses_batch` op, again savepoint-per-request.
+
+Both keep the pre-batching single op as the batch-of-one fast path, as
+the `NotRaftLeader` fallback (so the wire op and the typed rejection the
+standing-split tolerance matches on are unchanged), and as the
+`schedulerSettings.job_intake_coalescing = false` path. There is no
+linger: an uncontended submitter goes straight to the commit slot.
+
+**The control-lane half is deliberately left alone.**
+`handle_job_submit_apply` derives a config's next version from
+`get_job_config_optional`, which reads committed state through a read
+connection; today one submit commits before the next reads because each
+is its own replicated op. In one uncommitted batch transaction, two
+submits of the same job would both read the same latest version and both
+compute N+1 — the file's own long-standing race note, promoted from rare
+to routine. The composite is also not one store call:
+`submit_rendered_job` interleaves `clear_job_stopped_status`,
+`replace_job_kv_references`, `seed_keyed_instances`,
+`previous_job_config_id` and rollout creation between the control write
+and the eval enqueue. Batching it means making the submit a pure function
+of its request first, which is a rewrite of the RPC.
+
+**Exit criterion:** on the same cell, `enqueue_evals_isolated` and
+`seed_task_statuses_batch` applied/s well below the submission rate, and
+`legion_store_coalesce_batch_size{path="eval_enqueue"}`'s `le="1"` bucket
+well below its `_count`.
+
 ## 7. Testing
 
 - `tests/eval_regen_failover.rs`: a batch of one is indistinguishable
@@ -313,6 +372,18 @@ phase-4 findings open item 4).
   member and claims the next batch; an unobserved member stays
   `in_flight` while its siblings settle, and `requeue_in_flight_evals`
   recovers it.
+- The intake group commit is tested in `src/storage/store.rs`: a batch of
+  one is asserted to be the single enqueue it replaced (same row, same
+  priority, same claim order); a request that cannot be applied fails
+  alone while its batch-mates commit; a batch preserves
+  `priority DESC, id ASC` across mixed priorities and arrival order;
+  concurrent submitters each get their own eval exactly once; the batched
+  status seed writes what N single seeds would, duplicates included; and
+  concurrent `idempotency_record` calls for one key have exactly one
+  winner whose response the losers can read. `tests/raft_seam.rs`
+  classifies `enqueue_evals_isolated` (scheduler) and
+  `seed_task_statuses_batch` (status). Like everything else here, the
+  round-trip saving is **structurally unmeasurable locally**.
 - `EvalBatchLimits::share_of` is unit-tested in `store.rs` at the
   boundaries that matter: a shallow queue must yield exactly one, a deep
   one must be capped, and degenerate inputs must not produce a zero-sized

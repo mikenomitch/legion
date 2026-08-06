@@ -2622,13 +2622,33 @@ impl Manager for ManagerDaemonService {
             self.submit_rendered_job(&identity, &js, subs, priority, inner.force_reschedule, None)?;
 
         let message = submitted.message_with_warnings();
-        self.store
+        // The lookup above only catches a duplicate that arrived after the
+        // first one recorded. Two submits carrying the same key CONCURRENTLY
+        // both miss it, and the record is `INSERT OR IGNORE` — so the loser
+        // learns it lost here, and must say so. Reporting `deduplicated:
+        // false` to both would tell a retrying agent it created two
+        // submissions when the key exists precisely to promise it did not.
+        // (Submitting the same spec twice is itself harmless — the second
+        // resolves to `Unchanged` — so the loser is corrected, not failed.)
+        let first = self
+            .store
             .idempotency_record(&idempotency_key, "run_job", &message)
             .map_err(|e| map_store_error("Error recording idempotency", e))?;
+        let (message, deduplicated) = if first {
+            (message, false)
+        } else {
+            // The winner's recorded response is the authoritative one, and
+            // is what a later retry of this key would be handed.
+            let recorded = self
+                .store
+                .idempotency_lookup(&idempotency_key)
+                .map_err(|e| map_store_error("Error checking idempotency", e))?;
+            (recorded.unwrap_or(message), true)
+        };
 
         Ok(Response::new(RunJobReply {
             message,
-            deduplicated: false,
+            deduplicated,
         }))
     }
 

@@ -251,6 +251,49 @@ cap exists.
 Worker heartbeats batch the same way on the status lane (see
 [architecture-managers-workers.md](architecture-managers-workers.md)).
 
+### Job intake group-commits too
+
+Submitting a job is a composite across all three raft lanes: the
+**control** lane writes the job and its config, the **status** lane seeds
+one `pending` `task_status` row per task, and the **scheduler** lane
+enqueues the placement eval. Under `lanes` that is three quorum rounds per
+submitted job, and a client that submits many jobs at once pays all three
+per job.
+
+Two of the three now batch. Concurrent submitters coalesce their
+scheduler-lane enqueue into one op and their status-lane seed into another
+— the same group commit plans use, with per-request savepoints so one bad
+submission fails alone and its batch-mates still commit. A lane is its own
+raft group with its own pipeline, so a batch can never span lanes; that is
+why there are two coalescers and not one.
+
+What does **not** change:
+
+- **A lone submit is untouched.** There is no accumulation window. A
+  single `legion job run` on an idle cluster goes straight to the commit
+  slot and takes the single-op path, exactly as before.
+- **Queue order.** Evals are still claimed strictly by
+  `priority DESC, id ASC`. A batch inserts in arrival order and each eval
+  still derives its own priority (an explicit `--priority`/`--asap`
+  override, else the job's band).
+- **Idempotency.** `RunJob`'s `idempotency_key` still arbitrates before
+  anything is written, and the loser of a concurrent same-key submit is
+  told so (`deduplicated: true`, carrying the winner's message).
+- **The control-lane write.** `handle_job_submit` is deliberately *not*
+  batched: it derives a config's next version from committed state, so two
+  submits of the same job inside one uncommitted batch would compute the
+  same version. Intake therefore costs one quorum round per job, not zero.
+
+`schedulerSettings.job_intake_coalescing = false` restores one op per
+submitter on both lanes. Batch size is capped at 64 per lane and is not
+configurable.
+
+Whether batching is actually engaging is visible in
+`legion_store_coalesce_batch_size{path="eval_enqueue"}` and
+`{path="task_status_seed"}` — compare the `le="1"` bucket against `_count`
+([metrics.md](metrics.md)). Serial submitters never overlap, so a
+`for` loop over jobspecs will sit at 1 and there is nothing to tune.
+
 ### Observing where plan time goes
 
 Every `plan_and_apply` records a per-phase wall-clock breakdown

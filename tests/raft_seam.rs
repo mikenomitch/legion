@@ -110,6 +110,7 @@ const CLASSIFIED_MUTATIONS: &[&str] = &[
     "complete_eval_with_event",
     "enqueue_eval_after_delay",
     "enqueue_evals",
+    "enqueue_evals_isolated",
     "insert_eval",
     "prune_stale_evals",
     "release_eval_for_retry",
@@ -177,6 +178,7 @@ const CLASSIFIED_MUTATIONS: &[&str] = &[
     "seed_missing_task_statuses",
     "seed_node_health",
     "seed_task_statuses",
+    "seed_task_statuses_batch",
     "set_node_lost_at",
     "set_node_lost_windows",
     "set_task_status",
@@ -311,6 +313,7 @@ fn lane_for(method: &str) -> Lane {
         | "complete_eval_with_event"
         | "enqueue_eval_after_delay"
         | "enqueue_evals"
+        | "enqueue_evals_isolated"
         | "insert_eval"
         | "prune_stale_evals"
         | "release_eval_for_retry"
@@ -366,6 +369,7 @@ fn lane_for(method: &str) -> Lane {
         | "seed_missing_task_statuses"
         | "seed_node_health"
         | "seed_task_statuses"
+        | "seed_task_statuses_batch"
         | "set_node_lost_at"
         | "set_node_lost_windows"
         | "set_task_status"
