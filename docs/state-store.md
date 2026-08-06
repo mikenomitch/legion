@@ -95,6 +95,25 @@ Main tables (see migrations):
 - `instance` (stateful identity), `volume` (the storage its handle points at —
   see [volumes.md](volumes.md))
 
+### Column Affinity
+
+JSON payload columns (`allocation.resources`, `plan_submission.placements`,
+`task_config.*`, node attributes, and the rest) are declared `TEXT`. They
+were originally declared `JSONB`, which SQLite's affinity rules silently
+map to NUMERIC affinity — meaning every insert first attempted to parse
+the whole JSON blob as a number before storing it as text (measurable CPU
+waste on the plan-apply and job-intake write paths, for a conversion that
+can never succeed on a JSON object). A migration rebuilds all affected
+tables in place; data, column order, indexes, and rowids are preserved
+exactly, so the change is invisible outside a profiler and a rolling
+manager upgrade across it is safe.
+
+`STRING` and `TIMESTAMP` columns intentionally keep NUMERIC affinity: for
+those, SQLite's numeric conversion can succeed (numeric-looking ids,
+unix-seconds timestamps), so re-typing them would change what is stored
+and break comparisons against existing rows. See the known-limitations
+entry in `internal_docs/TODO.md`.
+
 ## Allocation Epoch and Plan Submission Safety
 
 Scheduler apply path uses compare-and-swap semantics:

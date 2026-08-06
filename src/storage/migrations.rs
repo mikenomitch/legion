@@ -1205,6 +1205,360 @@ pub fn get_migrations() -> Migrations<'static> {
         // NULL, which never equals a fingerprint, so they are rebuilt
         // rather than trusted.
         M::up("ALTER TABLE node_alloc_usage ADD COLUMN policy_fingerprint TEXT;").down(""),
+        // JSONB -> TEXT affinity (jsonb-text-affinity plan). SQLite derives
+        // column affinity from the declared type name by substring rules, and
+        // `JSONB` matches none of the keywords — so every JSON column in the
+        // schema had NUMERIC affinity, and every INSERT/UPDATE first ran
+        // `applyNumericAffinity`/`sqlite3AtoF` over the whole bound blob
+        // trying to store it as a number (~4-5% of a sampled manager's CPU;
+        // a local A/B measures the numeric-affinity twin ~5-10% slower on
+        // the raw JSON insert path). The parse always fails on JSON
+        // objects/arrays, so the work was pure waste — sitting inside the
+        // serialized plan-apply commit (allocation.resources,
+        // plan_submission.placements, node_alloc_usage.usage_json), the
+        // job-intake path (21 columns on task_config), and the event stream.
+        //
+        // Every JSONB-carrying table is rebuilt with the identical schema
+        // text except ` JSONB` -> ` TEXT`. Stored content is untouched (the
+        // numeric conversion never succeeded on JSON, so the values were
+        // already TEXT); only future writes skip the parse.
+        //
+        // The rebuild deliberately preserves COLUMN ORDER, COLUMN COUNT, and
+        // ROWIDS exactly — that is the load-bearing property, not a nicety.
+        // Raft session changesets identify columns BY POSITION, so a
+        // migration that reordered columns (e.g. the cheaper
+        // add/copy/drop/rename column surgery) would let a mixed-version
+        // manager pair silently write values into the wrong columns during a
+        // rolling upgrade. A twin-table rebuild is positionally identical to
+        // a pre-migration peer; the only cross-version difference is
+        // declared type names, which changesets never carry. Preserved
+        // rowids also keep `node_alloc_usage` fingerprints valid, per the
+        // NOTE on that table's migration.
+        //
+        // `job_config` is the one rebuilt table that is a CASCADE parent
+        // (task_config, job_config_submission, job_kv_reference, job_update
+        // all reference it ON DELETE CASCADE), and migrations run with
+        // `foreign_keys = ON` where `DROP TABLE` performs an implicit
+        // `DELETE FROM` that fires cascades (the C-2 rule above). So it gets
+        // a rename-first dance: rename the old table aside (children's FK
+        // clauses follow the rename), create + fill the new `job_config`,
+        // rebuild all four children (their fresh `REFERENCES job_config`
+        // clauses bind to the new parent — three of them carry no JSONB and
+        // are rebuilt with identical schemas purely to re-point their FKs),
+        // and only then drop the renamed original, which by that point has
+        // no FK-bearing children left.
+        //
+        // The three AUTOINCREMENT tables (plan_submission, rollout,
+        // rollout_event) lose their sqlite_sequence rows at DROP and re-seed
+        // to max(id) via the explicit-id copies — an id below the old
+        // high-water mark can be reused if the largest-id row had been
+        // deleted, the same acceptance the C-2 rebuild made.
+        //
+        // Empty down, like the other rebuilds: the original creations'
+        // `DROP TABLE IF EXISTS` downs remove the rebuilt tables on the way
+        // to version 0.
+        M::up(
+            "ALTER TABLE job_config RENAME TO job_config__jsonb;
+        CREATE TABLE job_config (
+            id STRING PRIMARY KEY,
+            name STRING NOT NULL,
+            type STRING NOT NULL,
+            meta TEXT NOT NULL,
+            version INTEGER NOT NULL,
+            created_at TIMESTAMP NOT NULL,
+            job_id STRING NOT NULL, priority STRING NOT NULL DEFAULT 'normal',
+            FOREIGN KEY(job_id) REFERENCES job(id) ON DELETE CASCADE
+        );
+        INSERT INTO job_config (id, name, type, meta, version, created_at, job_id, priority) SELECT id, name, type, meta, version, created_at, job_id, priority FROM job_config__jsonb;
+
+        CREATE TABLE task_config__textaff (
+            id INTEGER PRIMARY KEY,
+            count INTEGER NOT NULL,
+            name STRING NOT NULL,
+            runtime STRING NOT NULL,
+            config TEXT NOT NULL,
+            resources TEXT NOT NULL,
+            constraints TEXT NOT NULL,
+            job_id STRING NOT NULL,
+            job_config_id STRING NOT NULL, affinities TEXT NOT NULL DEFAULT '{}', permit TEXT NOT NULL DEFAULT '{}', checks TEXT NOT NULL DEFAULT '[]', on_unhealthy TEXT NOT NULL DEFAULT '{}', count_per STRING, group_name STRING NOT NULL DEFAULT 'default', lifecycle STRING NOT NULL DEFAULT 'service', schedule STRING, depends_on TEXT NOT NULL DEFAULT '[]', kv_injections TEXT, network TEXT, service TEXT, identities TEXT, stateful TEXT, artifacts TEXT, actions TEXT, volumes TEXT, restart TEXT, connect TEXT, stop TEXT, disruption TEXT, speculative_start TEXT,
+            FOREIGN KEY(job_id) REFERENCES job(id) ON DELETE CASCADE,
+            FOREIGN KEY(job_config_id) REFERENCES job_config(id) ON DELETE CASCADE
+        );
+        INSERT INTO task_config__textaff (id, count, name, runtime, config, resources, constraints, job_id, job_config_id, affinities, permit, checks, on_unhealthy, count_per, group_name, lifecycle, schedule, depends_on, kv_injections, network, service, identities, stateful, artifacts, actions, volumes, restart, connect, stop, disruption, speculative_start) SELECT id, count, name, runtime, config, resources, constraints, job_id, job_config_id, affinities, permit, checks, on_unhealthy, count_per, group_name, lifecycle, schedule, depends_on, kv_injections, network, service, identities, stateful, artifacts, actions, volumes, restart, connect, stop, disruption, speculative_start FROM task_config;
+        DROP TABLE task_config;
+        ALTER TABLE task_config__textaff RENAME TO task_config;
+        CREATE INDEX idx_task_config_job_config_id ON task_config(job_config_id);
+        CREATE INDEX idx_task_config_service_name
+             ON task_config(COALESCE(json_extract(service, '$.name'), name))
+             WHERE service IS NOT NULL AND json_valid(service);
+
+        CREATE TABLE job_config_submission__textaff (
+            id INTEGER PRIMARY KEY,
+            path STRING NOT NULL,
+            is_primary INTEGER NOT NULL,
+            job_config_id STRING NOT NULL,
+            submission_hash STRING NOT NULL,
+            FOREIGN KEY(job_config_id) REFERENCES job_config(id) ON DELETE CASCADE,
+            FOREIGN KEY(submission_hash) REFERENCES submission(hash) ON DELETE CASCADE
+        );
+        INSERT INTO job_config_submission__textaff (id, path, is_primary, job_config_id, submission_hash) SELECT id, path, is_primary, job_config_id, submission_hash FROM job_config_submission;
+        DROP TABLE job_config_submission;
+        ALTER TABLE job_config_submission__textaff RENAME TO job_config_submission;
+
+        CREATE TABLE job_kv_reference__textaff (
+            id INTEGER PRIMARY KEY,
+            job_id STRING NOT NULL,
+            job_config_id STRING NOT NULL,
+            kv_key STRING NOT NULL,
+            json_pointer STRING NOT NULL,
+            FOREIGN KEY(job_id) REFERENCES job(id) ON DELETE CASCADE,
+            FOREIGN KEY(job_config_id) REFERENCES job_config(id) ON DELETE CASCADE
+        );
+        INSERT INTO job_kv_reference__textaff (id, job_id, job_config_id, kv_key, json_pointer) SELECT id, job_id, job_config_id, kv_key, json_pointer FROM job_kv_reference;
+        DROP TABLE job_kv_reference;
+        ALTER TABLE job_kv_reference__textaff RENAME TO job_kv_reference;
+        CREATE INDEX idx_job_kv_reference_key ON job_kv_reference(kv_key);
+        CREATE INDEX idx_job_kv_reference_job ON job_kv_reference(job_id);
+
+        CREATE TABLE job_update__textaff (
+            id STRING PRIMARY KEY,
+            status STRING NOT NULL,
+            job_id STRING NOT NULL,
+            to_job_config_id STRING NOT NULL,
+            from_job_config_id STRING,
+            FOREIGN KEY(job_id) REFERENCES job(id) ON DELETE CASCADE,
+            FOREIGN KEY(to_job_config_id) REFERENCES job_config(id) ON DELETE CASCADE,
+            FOREIGN KEY(from_job_config_id) REFERENCES job_config(id) ON DELETE CASCADE
+        );
+        INSERT INTO job_update__textaff (id, status, job_id, to_job_config_id, from_job_config_id) SELECT id, status, job_id, to_job_config_id, from_job_config_id FROM job_update;
+        DROP TABLE job_update;
+        ALTER TABLE job_update__textaff RENAME TO job_update;
+
+        DROP TABLE job_config__jsonb;
+
+        CREATE TABLE acl_policy__textaff (
+            name STRING PRIMARY KEY,
+            description STRING NOT NULL DEFAULT '',
+            rules TEXT NOT NULL,
+            created_at TIMESTAMP NOT NULL,
+            updated_at TIMESTAMP NOT NULL
+        );
+        INSERT INTO acl_policy__textaff (name, description, rules, created_at, updated_at) SELECT name, description, rules, created_at, updated_at FROM acl_policy;
+        DROP TABLE acl_policy;
+        ALTER TABLE acl_policy__textaff RENAME TO acl_policy;
+
+        CREATE TABLE acl_token__textaff (
+            accessor_id STRING PRIMARY KEY,
+            secret_hash STRING NOT NULL UNIQUE,
+            name STRING NOT NULL,
+            token_type STRING NOT NULL,
+            policies TEXT NOT NULL,
+            expires_at TIMESTAMP,
+            created_at TIMESTAMP NOT NULL
+        );
+        INSERT INTO acl_token__textaff (accessor_id, secret_hash, name, token_type, policies, expires_at, created_at) SELECT accessor_id, secret_hash, name, token_type, policies, expires_at, created_at FROM acl_token;
+        DROP TABLE acl_token;
+        ALTER TABLE acl_token__textaff RENAME TO acl_token;
+        CREATE INDEX idx_acl_token_secret_hash ON acl_token(secret_hash);
+
+        CREATE TABLE acl_user__textaff (
+            username STRING PRIMARY KEY,
+            password_hash STRING NOT NULL,
+            policies TEXT NOT NULL,
+            created_at TIMESTAMP NOT NULL,
+            updated_at TIMESTAMP NOT NULL
+        );
+        INSERT INTO acl_user__textaff (username, password_hash, policies, created_at, updated_at) SELECT username, password_hash, policies, created_at, updated_at FROM acl_user;
+        DROP TABLE acl_user;
+        ALTER TABLE acl_user__textaff RENAME TO acl_user;
+
+        CREATE TABLE allocation__textaff (
+            id INTEGER PRIMARY KEY,
+            status STRING NOT NULL,
+            resources TEXT NOT NULL,
+            node_id STRING NOT NULL,
+            job_config_id STRING NOT NULL,
+            task_config_id INTEGER NOT NULL,
+            network TEXT,
+            instance_id STRING
+        , created_at_unix INTEGER);
+        INSERT INTO allocation__textaff (id, status, resources, node_id, job_config_id, task_config_id, network, instance_id, created_at_unix) SELECT id, status, resources, node_id, job_config_id, task_config_id, network, instance_id, created_at_unix FROM allocation;
+        DROP TABLE allocation;
+        ALTER TABLE allocation__textaff RENAME TO allocation;
+        CREATE INDEX idx_allocation_task_config_id ON allocation(task_config_id);
+        CREATE INDEX idx_allocation_job_config_id ON allocation(job_config_id);
+        CREATE INDEX idx_allocation_node_id ON allocation(node_id);
+        CREATE INDEX idx_allocation_instance_id ON allocation(instance_id);
+
+        CREATE TABLE job_template_version__textaff (
+            template_name STRING NOT NULL,
+            version INTEGER NOT NULL,
+            description STRING,
+            source_nickel TEXT NOT NULL,
+            variables TEXT NOT NULL DEFAULT '[]',
+            created_by STRING NOT NULL DEFAULT '',
+            created_at TIMESTAMP NOT NULL,
+            PRIMARY KEY(template_name, version),
+            FOREIGN KEY(template_name) REFERENCES job_template(name) ON DELETE CASCADE
+        );
+        INSERT INTO job_template_version__textaff (template_name, version, description, source_nickel, variables, created_by, created_at) SELECT template_name, version, description, source_nickel, variables, created_by, created_at FROM job_template_version;
+        DROP TABLE job_template_version;
+        ALTER TABLE job_template_version__textaff RENAME TO job_template_version;
+
+        CREATE TABLE manager_config__textaff (
+            node_id STRING PRIMARY KEY,
+            config TEXT NOT NULL,
+            updated_at TIMESTAMP NOT NULL
+        );
+        INSERT INTO manager_config__textaff (node_id, config, updated_at) SELECT node_id, config, updated_at FROM manager_config;
+        DROP TABLE manager_config;
+        ALTER TABLE manager_config__textaff RENAME TO manager_config;
+
+        CREATE TABLE node__textaff (
+            id STRING PRIMARY KEY,
+            pool STRING NOT NULL,
+            availability STRING NOT NULL,
+            config_attrs  TEXT NOT NULL,
+            fingerprint_attrs  TEXT NOT NULL,
+            dynamic_attrs TEXT NOT NULL, drain_evict INTEGER NOT NULL DEFAULT 0);
+        INSERT INTO node__textaff (id, pool, availability, config_attrs, fingerprint_attrs, dynamic_attrs, drain_evict) SELECT id, pool, availability, config_attrs, fingerprint_attrs, dynamic_attrs, drain_evict FROM node;
+        DROP TABLE node;
+        ALTER TABLE node__textaff RENAME TO node;
+
+        CREATE TABLE node_alloc_usage__textaff (
+            node_id STRING PRIMARY KEY,
+            alloc_epoch INTEGER NOT NULL,
+            alloc_count INTEGER NOT NULL,
+            alloc_id_sum INTEGER NOT NULL,
+            usage_json TEXT NOT NULL
+        , policy_fingerprint TEXT);
+        INSERT INTO node_alloc_usage__textaff (node_id, alloc_epoch, alloc_count, alloc_id_sum, usage_json, policy_fingerprint) SELECT node_id, alloc_epoch, alloc_count, alloc_id_sum, usage_json, policy_fingerprint FROM node_alloc_usage;
+        DROP TABLE node_alloc_usage;
+        ALTER TABLE node_alloc_usage__textaff RENAME TO node_alloc_usage;
+
+        CREATE TABLE node_health__textaff (
+            node_id STRING PRIMARY KEY,
+            status STRING NOT NULL,
+            last_heartbeat TIMESTAMP NOT NULL,
+            lost_at TIMESTAMP,
+            health_checks TEXT NOT NULL
+        , last_heartbeat_unix INTEGER, lost_after_seconds INTEGER);
+        INSERT INTO node_health__textaff (node_id, status, last_heartbeat, lost_at, health_checks, last_heartbeat_unix, lost_after_seconds) SELECT node_id, status, last_heartbeat, lost_at, health_checks, last_heartbeat_unix, lost_after_seconds FROM node_health;
+        DROP TABLE node_health;
+        ALTER TABLE node_health__textaff RENAME TO node_health;
+
+        CREATE TABLE plan_submission__textaff (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_config_id STRING NOT NULL,
+            mode STRING NOT NULL,
+            placements TEXT NOT NULL,
+            expected_epoch INTEGER NOT NULL,
+            expected_version_vector TEXT NOT NULL DEFAULT '{}',
+            status STRING NOT NULL,
+            rejection_reason STRING,
+            created_at TIMESTAMP NOT NULL
+        , evictions TEXT NOT NULL DEFAULT '[]', target_instance STRING NOT NULL DEFAULT '');
+        INSERT INTO plan_submission__textaff (id, job_config_id, mode, placements, expected_epoch, expected_version_vector, status, rejection_reason, created_at, evictions, target_instance) SELECT id, job_config_id, mode, placements, expected_epoch, expected_version_vector, status, rejection_reason, created_at, evictions, target_instance FROM plan_submission;
+        DROP TABLE plan_submission;
+        ALTER TABLE plan_submission__textaff RENAME TO plan_submission;
+        CREATE INDEX idx_plan_submission_job_config_status ON plan_submission(job_config_id, status);
+
+        CREATE TABLE rollout__textaff (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_id STRING NOT NULL,
+            from_job_config_id STRING,
+            to_job_config_id STRING NOT NULL,
+            status STRING NOT NULL,
+            incomplete INTEGER NOT NULL DEFAULT 0,
+            message STRING NOT NULL DEFAULT '',
+            strategy STRING,
+            progression STRING,
+            replacement STRING,
+            in_place INTEGER,
+            config_json TEXT NOT NULL DEFAULT '{}',
+            created_at TIMESTAMP NOT NULL,
+            updated_at TIMESTAMP NOT NULL,
+            completed_at TIMESTAMP
+        );
+        INSERT INTO rollout__textaff (id, job_id, from_job_config_id, to_job_config_id, status, incomplete, message, strategy, progression, replacement, in_place, config_json, created_at, updated_at, completed_at) SELECT id, job_id, from_job_config_id, to_job_config_id, status, incomplete, message, strategy, progression, replacement, in_place, config_json, created_at, updated_at, completed_at FROM rollout;
+        DROP TABLE rollout;
+        ALTER TABLE rollout__textaff RENAME TO rollout;
+        CREATE INDEX idx_rollout_job_id ON rollout(job_id);
+        CREATE INDEX idx_rollout_status ON rollout(status);
+        CREATE INDEX idx_rollout_job_status_created ON rollout(job_id, status, created_at DESC);
+
+        CREATE TABLE rollout_event__textaff (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            rollout_id INTEGER NOT NULL,
+            job_id STRING NOT NULL,
+            group_name STRING,
+            level STRING NOT NULL,
+            message STRING NOT NULL,
+            metadata_json TEXT NOT NULL DEFAULT '{}',
+            created_at TIMESTAMP NOT NULL
+        );
+        INSERT INTO rollout_event__textaff (id, rollout_id, job_id, group_name, level, message, metadata_json, created_at) SELECT id, rollout_id, job_id, group_name, level, message, metadata_json, created_at FROM rollout_event;
+        DROP TABLE rollout_event;
+        ALTER TABLE rollout_event__textaff RENAME TO rollout_event;
+        CREATE INDEX idx_rollout_event_rollout_created ON rollout_event(rollout_id, created_at ASC, id ASC);
+        CREATE INDEX idx_rollout_event_job_created ON rollout_event(job_id, created_at DESC, id DESC);
+
+        CREATE TABLE scheduler_event__textaff (
+            id INTEGER PRIMARY KEY,
+            kind TEXT NOT NULL,
+            level TEXT NOT NULL,
+            job_id TEXT,
+            node_id TEXT,
+            eval_id TEXT,
+            allocation_id INTEGER,
+            rollout_id INTEGER,
+            message TEXT NOT NULL,
+            metadata_json TEXT NOT NULL DEFAULT '{}',
+            created_at TIMESTAMP NOT NULL
+        );
+        INSERT INTO scheduler_event__textaff (id, kind, level, job_id, node_id, eval_id, allocation_id, rollout_id, message, metadata_json, created_at) SELECT id, kind, level, job_id, node_id, eval_id, allocation_id, rollout_id, message, metadata_json, created_at FROM scheduler_event;
+        DROP TABLE scheduler_event;
+        ALTER TABLE scheduler_event__textaff RENAME TO scheduler_event;
+
+        CREATE TABLE volume__textaff (
+            volume_id STRING PRIMARY KEY,
+            name STRING NOT NULL DEFAULT 'data',
+            driver STRING NOT NULL,
+            job_id STRING,
+            instance_id STRING,
+            task_name STRING,
+            state STRING NOT NULL,
+            node_id STRING,
+            node_local INTEGER NOT NULL DEFAULT 1,
+            read_only INTEGER NOT NULL DEFAULT 0,
+            params TEXT NOT NULL DEFAULT '{}',
+            attrs TEXT NOT NULL DEFAULT '{}',
+            mount_path STRING,
+            last_error STRING,
+            created_at TIMESTAMP NOT NULL,
+            updated_at TIMESTAMP NOT NULL
+        , volume_mode STRING NOT NULL DEFAULT 'filesystem', fs STRING);
+        INSERT INTO volume__textaff (volume_id, name, driver, job_id, instance_id, task_name, state, node_id, node_local, read_only, params, attrs, mount_path, last_error, created_at, updated_at, volume_mode, fs) SELECT volume_id, name, driver, job_id, instance_id, task_name, state, node_id, node_local, read_only, params, attrs, mount_path, last_error, created_at, updated_at, volume_mode, fs FROM volume;
+        DROP TABLE volume;
+        ALTER TABLE volume__textaff RENAME TO volume;
+        CREATE INDEX idx_volume_instance ON volume(instance_id);
+        CREATE INDEX idx_volume_node ON volume(node_id);
+        CREATE INDEX idx_volume_state ON volume(state);
+        CREATE INDEX idx_volume_destroying
+             ON volume(state) WHERE state = 'destroying';
+
+        CREATE TABLE worker_type__textaff (
+            name STRING PRIMARY KEY,
+            pool STRING NOT NULL,
+            additional_node_checks Text NOT NULL,
+            attributes TEXT NOT NULL,
+            name_prefix STRING
+        , resources TEXT NOT NULL DEFAULT '{}', reserved_resources TEXT NOT NULL DEFAULT '{}', max_allocations INTEGER, artifacts TEXT NOT NULL DEFAULT '', host_volumes TEXT NOT NULL DEFAULT '', resource_enforcement TEXT NOT NULL DEFAULT '', heartbeat_seconds INTEGER, edge_boot TEXT NOT NULL DEFAULT '');
+        INSERT INTO worker_type__textaff (name, pool, additional_node_checks, attributes, name_prefix, resources, reserved_resources, max_allocations, artifacts, host_volumes, resource_enforcement, heartbeat_seconds, edge_boot) SELECT name, pool, additional_node_checks, attributes, name_prefix, resources, reserved_resources, max_allocations, artifacts, host_volumes, resource_enforcement, heartbeat_seconds, edge_boot FROM worker_type;
+        DROP TABLE worker_type;
+        ALTER TABLE worker_type__textaff RENAME TO worker_type;",
+        )
+        .down(""),
     ])
 }
 
@@ -1282,6 +1636,231 @@ mod migrations_test {
             .err()
             .is_some();
         assert!(has_kind, "`kind` column should no longer exist");
+
+        Ok(())
+    }
+
+    /// The JSONB -> TEXT affinity rebuild must be invisible except to a
+    /// profiler: same rows, same column order (raft changesets bind by
+    /// position), same indexes, same FK behavior — under `foreign_keys = ON`,
+    /// which is how production runs migrations and what makes the job_config
+    /// rename dance necessary in the first place.
+    #[test]
+    fn jsonb_affinity_rebuild_preserves_rows_order_indexes_and_fks() -> anyhow::Result<()> {
+        let migrations = get_migrations();
+        let mut probe = Connection::open_in_memory()?;
+        migrations.to_latest(&mut probe)?;
+        let latest: usize = probe.query_row("PRAGMA user_version;", [], |row| row.get(0))?;
+
+        let jsonb_count = |conn: &Connection| -> anyhow::Result<i64> {
+            Ok(conn.query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND sql LIKE '%JSONB%';",
+                [],
+                |row| row.get(0),
+            )?)
+        };
+
+        // The newest version that still declares JSONB anywhere is the
+        // pre-rebuild schema. Searching (like the rename tests above) keeps
+        // this valid as migrations are appended after the rebuild.
+        let mut pre_version = None;
+        for version in 1..=latest {
+            let mut walk = Connection::open_in_memory()?;
+            migrations.to_version(&mut walk, version)?;
+            if jsonb_count(&walk)? > 0 {
+                pre_version = Some(version);
+            }
+        }
+        let pre_version = pre_version.expect("no migration version declares a JSONB column");
+
+        let mut conn = Connection::open_in_memory()?;
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+        migrations.to_version(&mut conn, pre_version)?;
+
+        // One row in every rebuilt table (and the parents they reference),
+        // JSON payloads included, explicit ids on the AUTOINCREMENT tables.
+        conn.execute_batch(r#"
+            INSERT INTO job (id, name, status, created_at) VALUES ('job-1','demo','active','2026-01-01T00:00:00Z');
+            INSERT INTO job_config (id, name, type, meta, version, created_at, job_id) VALUES ('jc-1','demo','service','{"team":"platform"}',1,'2026-01-01T00:00:00Z','job-1');
+            INSERT INTO submission (hash, content) VALUES ('h1','{}');
+            INSERT INTO job_config_submission (id, path, is_primary, job_config_id, submission_hash) VALUES (1,'main.ncl',1,'jc-1','h1');
+            INSERT INTO task_config (id, count, name, runtime, config, resources, constraints, job_id, job_config_id, service) VALUES (1,2,'web','noop','{}','{"cpu":500}','{"class":"web"}','job-1','jc-1','{"name":"web-svc"}');
+            INSERT INTO job_kv_reference (id, job_id, job_config_id, kv_key, json_pointer) VALUES (1,'job-1','jc-1','cfg/key','/a/b');
+            INSERT INTO job_update (id, status, job_id, to_job_config_id) VALUES ('ju-1','complete','job-1','jc-1');
+            INSERT INTO node (id, pool, availability, config_attrs, fingerprint_attrs, dynamic_attrs) VALUES ('n1','default','active','{}','{"memory":1}','{}');
+            INSERT INTO node_health (node_id, status, last_heartbeat, health_checks) VALUES ('n1','active','2026-01-01T00:00:00Z','{}');
+            INSERT INTO allocation (id, status, resources, node_id, job_config_id, task_config_id) VALUES (7,'running','{"cpu":500}','n1','jc-1',1);
+            INSERT INTO node_alloc_usage (node_id, alloc_epoch, alloc_count, alloc_id_sum, usage_json) VALUES ('n1',3,1,7,'{"cpu":500}');
+            INSERT INTO plan_submission (id, job_config_id, mode, placements, expected_epoch, status, created_at) VALUES (5,'jc-1','fresh','[{"node":"n1"}]',1,'applied','2026-01-01T00:00:00Z');
+            INSERT INTO rollout (id, job_id, to_job_config_id, status, created_at, updated_at) VALUES (9,'job-1','jc-1','complete','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');
+            INSERT INTO rollout_event (id, rollout_id, job_id, level, message, metadata_json, created_at) VALUES (11,9,'job-1','info','step','{"pct":25}','2026-01-01T00:00:00Z');
+            INSERT INTO scheduler_event (id, kind, level, message, metadata_json, created_at) VALUES (1,'placed','info','ok','{"n":1}','2026-01-01T00:00:00Z');
+            INSERT INTO volume (volume_id, driver, state, created_at, updated_at) VALUES ('v1','host','ready','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');
+            INSERT INTO worker_type (name, pool, additional_node_checks, attributes) VALUES ('wt1','default','','{"os":"linux"}');
+            INSERT INTO manager_config (node_id, config, updated_at) VALUES ('m1','{"evalThreads":4}','2026-01-01T00:00:00Z');
+            INSERT INTO acl_policy (name, rules, created_at, updated_at) VALUES ('p1','[{"resource":"job"}]','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');
+            INSERT INTO acl_token (accessor_id, secret_hash, name, token_type, policies, created_at) VALUES ('a1','s1','root','management','[]','2026-01-01T00:00:00Z');
+            INSERT INTO acl_user (username, password_hash, policies, created_at, updated_at) VALUES ('u1','h','[]','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');
+            INSERT INTO job_template (name, latest_version, created_at, updated_at) VALUES ('t1',1,'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');
+            INSERT INTO job_template_version (template_name, version, source_nickel, variables, created_at) VALUES ('t1',1,'{}','[{"name":"x"}]','2026-01-01T00:00:00Z');
+        "#)?;
+
+        let rebuilt = [
+            "job_config",
+            "task_config",
+            "job_config_submission",
+            "job_kv_reference",
+            "job_update",
+            "acl_policy",
+            "acl_token",
+            "acl_user",
+            "allocation",
+            "job_template_version",
+            "manager_config",
+            "node",
+            "node_alloc_usage",
+            "node_health",
+            "plan_submission",
+            "rollout",
+            "rollout_event",
+            "scheduler_event",
+            "volume",
+            "worker_type",
+        ];
+        let column_names = |conn: &Connection, table: &str| -> anyhow::Result<Vec<String>> {
+            let mut stmt = conn.prepare(&format!("PRAGMA table_info({table});"))?;
+            let names = stmt
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(names)
+        };
+        let index_names = |conn: &Connection, table: &str| -> anyhow::Result<Vec<String>> {
+            let mut stmt = conn.prepare(
+                "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name=?1 AND sql IS NOT NULL ORDER BY name;",
+            )?;
+            let names = stmt
+                .query_map([table], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(names)
+        };
+        let mut pre_columns = Vec::new();
+        let mut pre_indexes = Vec::new();
+        for table in rebuilt {
+            pre_columns.push(column_names(&conn, table)?);
+            pre_indexes.push(index_names(&conn, table)?);
+        }
+
+        migrations.to_latest(&mut conn)?;
+
+        // No live table declares JSONB anymore — this is also the guard that
+        // keeps future migrations from re-introducing a NUMERIC-affinity
+        // JSON column.
+        assert_eq!(jsonb_count(&conn)?, 0, "a live table still declares JSONB");
+
+        // Positional layout and index sets are exactly what they were.
+        for (i, table) in rebuilt.iter().enumerate() {
+            assert_eq!(
+                column_names(&conn, table)?,
+                pre_columns[i],
+                "column order changed on {table} — raft changesets bind by position"
+            );
+            assert_eq!(
+                index_names(&conn, table)?,
+                pre_indexes[i],
+                "index set changed on {table}"
+            );
+        }
+
+        // Rows and JSON payloads came through byte for byte.
+        for (table, expected) in [("job_config", 1i64), ("task_config", 1), ("allocation", 1)] {
+            let count: i64 =
+                conn.query_row(&format!("SELECT count(*) FROM {table};"), [], |r| r.get(0))?;
+            assert_eq!(count, expected, "{table} row count");
+        }
+        let meta: String =
+            conn.query_row("SELECT meta FROM job_config WHERE id='jc-1';", [], |r| {
+                r.get(0)
+            })?;
+        assert_eq!(meta, r#"{"team":"platform"}"#);
+        let service: String =
+            conn.query_row("SELECT service FROM task_config WHERE id=1;", [], |r| {
+                r.get(0)
+            })?;
+        assert_eq!(service, r#"{"name":"web-svc"}"#);
+        let resources: String =
+            conn.query_row("SELECT resources FROM allocation WHERE id=7;", [], |r| {
+                r.get(0)
+            })?;
+        assert_eq!(resources, r#"{"cpu":500}"#);
+        let usage: String = conn.query_row(
+            "SELECT usage_json FROM node_alloc_usage WHERE node_id='n1';",
+            [],
+            |r| r.get(0),
+        )?;
+        assert_eq!(usage, r#"{"cpu":500}"#);
+        let placements: String = conn.query_row(
+            "SELECT placements FROM plan_submission WHERE id=5;",
+            [],
+            |r| r.get(0),
+        )?;
+        assert_eq!(placements, r#"[{"node":"n1"}]"#);
+
+        // Nothing was orphaned by the rebuild.
+        let violations: i64 = conn.query_row(
+            "SELECT count(*) FROM pragma_foreign_key_check();",
+            [],
+            |r| r.get(0),
+        )?;
+        assert_eq!(violations, 0, "foreign_key_check found violations");
+
+        // TEXT affinity in practice: numeric-looking text now STAYS text
+        // (under NUMERIC affinity this stored as an INTEGER).
+        conn.execute(
+            "INSERT INTO node_alloc_usage (node_id, alloc_epoch, alloc_count, alloc_id_sum, usage_json) VALUES ('n2',1,0,0,'123');",
+            [],
+        )?;
+        let stored_type: String = conn.query_row(
+            "SELECT typeof(usage_json) FROM node_alloc_usage WHERE node_id='n2';",
+            [],
+            |r| r.get(0),
+        )?;
+        assert_eq!(stored_type, "text", "JSON columns must have TEXT affinity");
+
+        // AUTOINCREMENT resumed above the copied ids.
+        conn.execute(
+            "INSERT INTO plan_submission (job_config_id, mode, placements, expected_epoch, status, created_at) VALUES ('jc-1','fresh','[]',1,'applied','2026-01-01T00:00:00Z');",
+            [],
+        )?;
+        let next_id: i64 =
+            conn.query_row("SELECT max(id) FROM plan_submission;", [], |r| r.get(0))?;
+        assert!(
+            next_id > 5,
+            "plan_submission AUTOINCREMENT regressed: {next_id}"
+        );
+
+        // The FKs still enforce, and still cascade, against the new parent.
+        assert!(
+            conn.execute(
+                "INSERT INTO task_config (id, count, name, runtime, config, resources, constraints, job_id, job_config_id) VALUES (2,1,'x','noop','{}','{}','{}','job-1','nope');",
+                [],
+            )
+            .is_err(),
+            "FK on task_config.job_config_id no longer enforces"
+        );
+        conn.execute("DELETE FROM job_config WHERE id='jc-1';", [])?;
+        for table in [
+            "task_config",
+            "job_config_submission",
+            "job_kv_reference",
+            "job_update",
+        ] {
+            let count: i64 =
+                conn.query_row(&format!("SELECT count(*) FROM {table};"), [], |r| r.get(0))?;
+            assert_eq!(
+                count, 0,
+                "job_config delete no longer cascades into {table}"
+            );
+        }
 
         Ok(())
     }

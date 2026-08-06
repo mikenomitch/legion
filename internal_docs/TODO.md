@@ -39,14 +39,30 @@ How to use it:
       locally: per-job quorum rounds ~3.0 -> ~1.5, unit-eval throughput at
       the knee 419.6 -> 476/s. Remaining singles at ~0.5/job are
       arrival-gaps, not a defect.
-- [ ] **JSONB columns carry NUMERIC affinity, so every JSON write parses as
-      a number first.** SQLite's affinity rules give `JSONB` (no TEXT/BLOB
-      substring) NUMERIC affinity; a sampled manager showed ~4-5% of CPU in
-      `sqlite3AtoF`/`applyNumericAffinity` trying to parse whole JSON blobs
-      as numbers on every insert/compare of `resources`, `constraints`,
-      `meta`, etc. Harmless semantically, pure waste. Fix is a column-type
-      migration (TEXT affinity) across the JSON columns - churny, so it
-      wants its own change with before/after profiles.
+- [x] **JSONB columns carry NUMERIC affinity, so every JSON write parses as
+      a number first — fixed** (2026-08-06,
+      [jsonb-text-affinity-plan.md](plans/jsonb-text-affinity-plan.md),
+      doc in [state-store.md](../docs/state-store.md#column-affinity)).
+      All 46 JSON columns across 17 tables rebuilt to TEXT affinity in one
+      migration that preserves column order/count/rowids exactly — the
+      load-bearing property, since raft changesets bind columns by
+      position and a reordering rebuild would corrupt a mixed-version
+      cluster mid-rolling-upgrade. `job_config` (the one CASCADE parent)
+      gets a rename dance, with `job_config_submission`,
+      `job_kv_reference`, and `job_update` rebuilt byte-identically purely
+      to re-point their FKs. Local A/B on the raw JSON insert path: the
+      NUMERIC twin is ~5-10% slower; before/after Criterion cells in
+      [benchmarks/scheduler/README.md](../benchmarks/scheduler/README.md).
+- [ ] **`STRING` and `TIMESTAMP` columns still carry NUMERIC affinity** —
+      deliberately excluded from the fix above. Same wasted parse on
+      every id/timestamp bind, but for these the conversion can
+      *succeed*: numeric-looking ids and unix-seconds timestamps are
+      stored as INTEGERs today, so a re-type changes what future writes
+      store while existing rows stay INTEGER, and INTEGER never
+      compares equal to TEXT — a value-rewriting migration with its own
+      risk budget, not a type rename. See
+      [jsonb-text-affinity-plan_calls.md](calls/jsonb-text-affinity-plan_calls.md)
+      entry 2.
 
 ## In flight (open PRs)
 
