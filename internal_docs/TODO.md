@@ -1435,6 +1435,21 @@ Plans: [persistence-plan.md](plans/persistence-plan.md), [multi-raft-persistence
       (learners + zone auto-replacement), and an async DR standby cluster
       with manual promotion and generation fencing. Cross-cluster service
       discovery deferred to a follow-up plan (see plan §11).
+- [ ] **Scheduler sharding (more raft groups for more throughput)** —
+      [proposal](plans/scheduler-sharding-strategies-proposal.md) (with a
+      [calls doc](calls/scheduler-sharding-strategies-proposal_calls.md)):
+      the option map for scaling eval/alloc throughput by adding raft
+      groups. Headline recommendation: pool-keyed *node-owned* scheduler
+      shards (`raft.scheduler.shards = N`, leadership spread) — the only
+      in-cluster sharding that preserves single-writer ownership and
+      no-oversubscription-by-construction; job-keyed (Omega-style) shards
+      rejected; more write-class lanes refused as a scaling axis. Gated
+      behind the native-submitter ceiling re-measurement (Phase 0): nothing
+      graduates to an implementation plan until the post-batching ceiling
+      is measured and attributed (pipeline wait vs the process-global
+      capture/apply mutex vs planner CPU). Prerequisites it names: row-scoped
+      snapshots, row-scope capture enforcement, backup fan-in under spread
+      leadership, `ID_STRIDE` widening.
 - [x] Version handshake between manager and worker — protocol version plus
       build-skew reporting, upgrade order in [docs/upgrades.md](../docs/upgrades.md)
       ([#137](https://github.com/mikenomitch/legion/pull/137))
