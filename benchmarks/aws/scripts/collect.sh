@@ -231,6 +231,14 @@ log "writing fairness record"
     # of the fleet saw no spot reclaims, which is a fidelity difference
     # between cells and not only a cost one.
     echo "  \"worker_on_demand_percentage\": ${WORKER_ON_DEMAND_PCT:-0},"
+    # Which submission path produced this cell, lifted from the driver's own
+    # metrics. `native` is legion-loadgen (one process, pooled connections,
+    # concurrent RunJob calls) and is LEGION-ONLY; `cli` is the shared
+    # process-per-job loop that Nomad and K8s also use. A cross-system
+    # comparison is only valid between cells that agree on this field, so it
+    # belongs in the record that makes the numbers defensible and not only in
+    # metrics.json. See benchmarks/aws/README.md § Methodology.
+    echo "  \"submitter\": $(jq -c '.submitter // "cli"' "$DEST/metrics.json" 2>/dev/null || echo '"unknown"'),"
     echo "  \"legion_binary\": $(aws s3 cp --only-show-errors --region "$REGION" "s3://$BUCKET/bin/legion.meta.json" - 2>/dev/null || echo null),"
     echo "  \"versions\": {"
     echo "    \"nomad\": \"$NOMAD_VERSION\", \"k8s\": \"$K8S_VERSION\","

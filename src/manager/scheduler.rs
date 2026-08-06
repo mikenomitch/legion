@@ -5084,6 +5084,125 @@ mod tests {
         Ok(())
     }
 
+    /// The staleness half of the storm-drill repro: a fleet that GROWS
+    /// after the available-nodes cache is first warmed. On the rig, nodes
+    /// register over ~20 seconds while the manager is already serving
+    /// planner reads; if registration does not invalidate the cache, every
+    /// later plan sees only the early registrants — which is exactly the
+    /// observed shape (25,002 allocations on the first-registered slice).
+    #[test]
+    fn nodes_registered_after_a_plan_are_visible_to_the_next_plan() -> R<()> {
+        let store = setup_store_with_scheduler("spread", None)?;
+        for index in 0..25 {
+            store.insert_node(make_node_msg(&format!("n-{index:03}"), json!({})))?;
+        }
+
+        // Warm the cache: plan and apply one job against the small fleet.
+        let warm = JobConfig {
+            priority: Default::default(),
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "warm".into(),
+            tasks: vec![TaskConfig {
+                count: TaskCount::new(10),
+                ..TaskConfig::new("api", "noop")
+            }],
+            version: None,
+        };
+        store.handle_job_submit(&warm, &[dummy_submission()])?;
+        let warm_id = store.get_job_config(&warm.name)?.id();
+        Scheduler::new(&store)?.plan_and_apply(&warm_id, PlanMode::Fresh)?;
+
+        // The fleet quadruples AFTER that plan.
+        for index in 25..100 {
+            store.insert_node(make_node_msg(&format!("n-{index:03}"), json!({})))?;
+        }
+
+        let job = JobConfig {
+            priority: Default::default(),
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "after-growth".into(),
+            tasks: vec![TaskConfig {
+                count: TaskCount::new(50),
+                ..TaskConfig::new("api", "noop")
+            }],
+            version: None,
+        };
+        store.handle_job_submit(&job, &[dummy_submission()])?;
+        let job_id = store.get_job_config(&job.name)?.id();
+        let outcome = Scheduler::new(&store)?.plan_and_apply(&job_id, PlanMode::Fresh)?;
+        assert_eq!(outcome.allocations.len(), 50);
+
+        let on_new_nodes = outcome
+            .allocations
+            .iter()
+            .filter(|alloc| alloc.node_id.as_str() >= "n-025")
+            .count();
+        println!("on nodes registered after the first plan: {on_new_nodes}/50");
+        // 75 of 100 nodes are new and empty; spread should put the great
+        // majority there. Zero means the planner never saw them.
+        assert!(
+            on_new_nodes >= 25,
+            "planner is blind to late-registered nodes: {on_new_nodes}/50 landed on them"
+        );
+        Ok(())
+    }
+
+    /// Repro for the 2026-08-06 storm-drill finding: 25,002 spread-policy
+    /// allocations all landed on the first-registered quarter of a
+    /// 5,000-node fleet, and their replacements packed the NEXT quarter.
+    /// Spread on a uniformly empty fleet must not concentrate.
+    #[test]
+    fn spread_on_an_empty_fleet_does_not_concentrate_on_low_node_ids() -> R<()> {
+        let store = setup_store_with_scheduler("spread", None)?;
+        for index in 0..100 {
+            store.insert_node(make_node_msg(&format!("n-{index:03}"), json!({})))?;
+        }
+
+        let job = JobConfig {
+            priority: Default::default(),
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "spread-repro".into(),
+            tasks: vec![TaskConfig {
+                count: TaskCount::new(50),
+                ..TaskConfig::new("api", "noop")
+            }],
+            version: None,
+        };
+        store.handle_job_submit(&job, &[dummy_submission()])?;
+        let job_config_id = store.get_job_config(&job.name)?.id();
+        let scheduler = Scheduler::new(&store)?;
+        let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
+        assert_eq!(outcome.allocations.len(), 50);
+
+        // 50 replicas over 100 empty identical nodes: the bottom half of the
+        // id ordering should NOT hold materially more than the top half. On
+        // the fleet that motivated this test the bottom quarter held 100%.
+        let low = outcome
+            .allocations
+            .iter()
+            .filter(|alloc| alloc.node_id.as_str() < "n-050")
+            .count();
+        let distinct: std::collections::HashSet<&str> = outcome
+            .allocations
+            .iter()
+            .map(|alloc| alloc.node_id.as_str())
+            .collect();
+        println!("low-half {low}/50, distinct nodes {}", distinct.len());
+        assert!(
+            (15..=35).contains(&low),
+            "spread concentrated: {low}/50 on the low half of the id order"
+        );
+        assert!(
+            distinct.len() >= 40,
+            "spread stacked replicas: only {} distinct nodes for 50 allocations",
+            distinct.len()
+        );
+        Ok(())
+    }
+
     #[test]
     fn count_per_attribute_places_allocations_per_group() -> R<()> {
         let store = setup_store_with_scheduler("spread", None)?;

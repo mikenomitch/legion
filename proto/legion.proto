@@ -1112,8 +1112,19 @@ message RunJobReply {
   // - `"Job config unchanged; forced reschedule queued"`
   string message = 1;
 
-  // True when this reply was replayed from a previously recorded result for the
-  // request's `idempotency_key` rather than applied fresh.
+  // True when this reply carries a previously recorded result for the request's
+  // `idempotency_key` rather than this request's own.
+  //
+  // Set in two cases:
+  // - the recorded result was found *before* this request did any work (the
+  //   ordinary retry-after-timeout case); and
+  // - two requests carrying the same key raced, both missed that lookup, and
+  //   this one lost — the manager records the first outcome only, so the loser
+  //   is handed the winner's `message` with `deduplicated = true`. The loser's
+  //   own submit is harmless (an identical spec resolves to "unchanged"), so it
+  //   is corrected rather than failed.
+  //
+  // In both cases `message` describes the recorded outcome, not this request's.
   bool deduplicated = 2;
 }
 

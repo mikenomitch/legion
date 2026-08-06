@@ -46,6 +46,9 @@ architecture and behavior docs are public.
   that is now the regression test for every scheduler change, what the
   rig got wrong (every cell of the first campaign was invalid, each for a
   different reason), and one claim retracted after checking the source.
+- [aws-phase5-findings.md](aws-phase5-findings.md) — the fifth AWS run: the
+  scheduler now outruns the CLI load generator at every fill level; the
+  night's commit-path and intake fixes with their evidence
 - [aws-phase4-findings.md](aws-phase4-findings.md) — the fourth AWS run: the
   rig was measuring its own submission ceiling, so phases 2-3 throughput
   numbers are retracted

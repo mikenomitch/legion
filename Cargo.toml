@@ -128,6 +128,24 @@ name = "eval_critical_path_bench"
 path = "benchmarks/micro/eval_critical_path_bench.rs"
 harness = false
 
+# The AWS rig's native job submitter. Not part of the product: it exists
+# because the rig's per-job `legion job run` process spawn ceilinged at ~36-103
+# jobs/sec and was being reported as Legion's throughput. It links against this
+# crate's own generated client so the proto has exactly one source of truth.
+#
+# Behind a feature so an ordinary `cargo build` does not link a second copy of
+# the binary for a tool nobody but the rig runs. CI lints it via
+# `--all-features`; `benchmarks/aws/scripts/local-smoke.sh` and
+# `build-and-upload.sh` build it explicitly.
+[[bin]]
+name = "legion-loadgen"
+path = "benchmarks/loadgen/main.rs"
+required-features = ["loadgen"]
+
+[features]
+# Builds the `legion-loadgen` bin above. No effect on the `legion` binary.
+loadgen = []
+
 # Profile for shipped binaries: `cargo build --profile dist`.
 #
 # Legion is distributed as one binary that is manager, worker, CLI, and MCP

@@ -36,11 +36,15 @@ jobs:
       # the same tree to ~3.5 GiB and links faster; only backtrace detail is
       # lost, never test behavior. Use `line-tables-only` instead of `0` if
       # file/line in panic backtraces is worth the extra size.
+      # --all-features so the `loadgen` feature's bin (benchmarks/loadgen,
+      # the AWS rig's native job submitter) is built and its unit tests run.
+      # It is feature-gated to keep it out of ordinary local builds, which
+      # would otherwise leave it untested until a campaign failed on it.
       - name: Run cargo tests
         env:
           CARGO_PROFILE_DEV_DEBUG: 0
           CARGO_PROFILE_TEST_DEBUG: 0
-        run: cargo test --all --locked
+        run: cargo test --all --all-features --locked
 
   cargo-clippy:
     name: Cargo Clippy
@@ -59,7 +63,7 @@ jobs:
           sudo apt-get install -y protobuf-compiler
 
       - name: Run cargo clippy
-        run: cargo clippy --all --locked -- -D warnings -A dead_code -A unused_variables
+        run: cargo clippy --all --all-features --locked -- -D warnings -A dead_code -A unused_variables
 
   scheduler-benchmark-gate:
     name: Scheduler Benchmark Gate
@@ -111,6 +115,9 @@ jobs:
           filters: |
             rig:
               - 'benchmarks/aws/**'
+              # The native submitter the driver invokes. A change there can
+              # break the rig without touching benchmarks/aws/.
+              - 'benchmarks/loadgen/**'
 
       # The plan's dry-run gate: a broken driver must never burn
       # cluster-hours. Pure-math fixture tests, no cluster, no AWS.

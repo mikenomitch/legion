@@ -279,6 +279,14 @@ result was replayed. Backed by the `idempotency_record` table
 [`src/storage/store.rs`](../src/storage/store.rs)). An empty/absent key disables
 deduplication.
 
+**Concurrent** requests carrying the same key are a separate case from a retry:
+both miss the recorded result, so the *record* arbitrates. `job run` handles
+this — exactly one caller is told it was first, and the loser is handed the
+winner's message with `deduplicated: true`. Known limitation: the other mutating
+RPCs (`job stop`, `job destroy`, `job scale`, the `instance` verbs) still report
+`deduplicated: false` to both sides of such a race. Sequential retries — the
+case the key is really for — are correct on every one of them.
+
 ## 6. Closing the loop: waiting for convergence
 
 ```bash

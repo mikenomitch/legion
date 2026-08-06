@@ -17,12 +17,30 @@ source "$(dirname "$0")/env.sh"
 load_rig
 
 SYSTEM="" NODES="" SCENARIO="" MULTIPLIER="1.0" WARMUP="30" CAMPAIGN=""
-# Jobs submitted in parallel. Each slot is a whole CLI process, so this is
-# what decides whether the cell measures the scheduler or the driver: phase 4
-# found three sessions of "throughput" numbers that were really the driver's
-# 36 jobs/sec submission ceiling. Sized for the loadgen box, and the driver
-# now reports `submission.driver_bound` when it is still the constraint.
-SUBMIT_CONCURRENCY="${LEGION_SUBMIT_CONCURRENCY:-32}"
+# Leave the cell's jobs resident on exit. The storm drill measures
+# time-to-replace for allocations lost with their nodes, so it needs a
+# workload RESIDENT when the fault lands — the 2026-08-06 drill ran after
+# the cell's cleanup and measured a 1,250-node loss with nothing on it:
+# loss-path metrics only, replacement throughput unmeasured.
+KEEP_JOBS=false
+# Jobs submitted in parallel. Left empty so the driver picks the default that
+# suits the submission path it takes (a CLI slot is a whole process; a native
+# slot is one in-flight RPC, and the two want very different numbers). Set
+# LEGION_SUBMIT_CONCURRENCY or --submit-concurrency to pin it.
+SUBMIT_CONCURRENCY="${LEGION_SUBMIT_CONCURRENCY:-}"
+# How Legion jobs are submitted.
+#
+# `auto` takes the native submitter (legion-loadgen) when the loadgen box has
+# it. That path exists because the per-job CLI loop ceilinged at ~36-103
+# jobs/sec and phase 4 reported that ceiling as Legion's throughput while the
+# control plane idled at 8% CPU.
+#
+# FAIRNESS: it is Legion-only. Nomad and K8s still spawn a process per job, so
+# any cell meant for a cross-system comparison must run with
+# LEGION_SUBMITTER=cli (all three on the shared loop). The driver archives the
+# path it took as `submitter` in metrics.json, so this can be verified after
+# the fact rather than remembered.
+SUBMITTER="${LEGION_SUBMITTER:-auto}"
 # Preferred over --multiplier: sizes the cell to an allocation count
 # rather than to a scale factor over each scenario's own base, which
 # differ (180/304/380) and so scatter under one shared multiplier.
@@ -35,7 +53,11 @@ while [ $# -gt 0 ]; do
     --multiplier) MULTIPLIER="$2" ;;
     --target-allocations) TARGET_ALLOCS="$2" ;;
     --warmup) WARMUP="$2" ;;
+    # Value-taking (`--keep-jobs true`) because this loop shifts two for
+    # every argument.
+    --keep-jobs) KEEP_JOBS="$2" ;;
     --submit-concurrency) SUBMIT_CONCURRENCY="$2" ;;
+    --submitter) SUBMITTER="$2" ;;
     --campaign) CAMPAIGN="$2" ;;
     *)
         echo "unknown arg $1" >&2
@@ -175,7 +197,7 @@ cleanup_jobs() {
 # existed, Legion correctly treated it as a no-op, no allocations were
 # created, no placement events fired, and the cell reported zero
 # placements as though the event stream were broken.
-trap cleanup_jobs EXIT
+trap '[ "$KEEP_JOBS" = true ] || cleanup_jobs' EXIT
 
 # One or the other, never both: --target-allocations wins when given, and
 # the chosen sizing is echoed so the cell's log says which it was.
@@ -232,8 +254,10 @@ rsh "$LOADGEN_ADDR" "
         --out '$REMOTE_OUT/run' \
         ${MANAGER:+--manager '$MANAGER'} \
         --warmup-secs '$WARMUP' \
-        --submit-concurrency '$SUBMIT_CONCURRENCY' \
+        ${SUBMIT_CONCURRENCY:+--submit-concurrency '$SUBMIT_CONCURRENCY'} \
+        --submitter '$SUBMITTER' \
         --legion-bin /usr/local/bin/legion \
+        --legion-loadgen-bin /usr/local/bin/legion-loadgen \
         | tee '$REMOTE_OUT/metrics.json'
 "
 

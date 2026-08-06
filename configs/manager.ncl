@@ -81,6 +81,10 @@
     # lazy_version_sample = true,   # false = eager O(fleet) epoch sample per plan
     # plan_apply_coalescing = true, # false = one commit/raft propose per plan
     # plan_apply_batch_max = 16,    # max plans per group commit (1-128)
+    # Job-intake group commit (docs/scheduler-and-eval-loop.md): concurrent
+    # job submits batch their scheduler-lane placement eval and their
+    # status-lane task_status seed. One switch for both halves.
+    # job_intake_coalescing = true, # false = one op per submitter, per lane
     # Bounded candidate scoring (docs/scheduler-and-eval-loop.md): off
     # unless configured. At or above `min_nodes` eligible candidates a
     # placement scores the best of `sample` uniformly drawn feasible nodes

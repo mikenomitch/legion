@@ -771,6 +771,15 @@ pub struct Store {
     // checkpoint and for the mixed-version forwarding fallback; a
     // steady-state heartbeat no longer reaches it at all (liveness plan §6).
     heartbeat_coalescer: Arc<crate::storage::coalesce::Coalescer<String, ()>>,
+    // Job-intake group commits (eval-path raft cost plan §"intake"). One
+    // submitted job costs one scheduler-lane round (the placement eval) and
+    // one status-lane round (the `task_status` seed), and a client that
+    // submits N jobs at once pays both N times. A lane is a raft group with
+    // its own pipeline, so a batch cannot span lanes — hence one coalescer
+    // per lane rather than one for the composite. Shared across clones so
+    // every gRPC worker thread feeds the same two queues.
+    eval_enqueue_coalescer: Arc<crate::storage::coalesce::Coalescer<EvalRequest, Eval>>,
+    task_status_seed_coalescer: Arc<crate::storage::coalesce::Coalescer<String, ()>>,
     // Node liveness as leader-local soft state (liveness plan §6.2). A
     // steady-state heartbeat is one write into this table: no raft commit,
     // no fsync, no pipeline-thread hop. Shared across clones so the gRPC
@@ -1164,6 +1173,21 @@ const EVENT_PRUNE_INTERVAL: i64 = 256;
 // (heartbeat-scale plan §2): 128 single-row upserts is a small changeset,
 // and the cap bounds both the IN-list and the raft entry size.
 const HEARTBEAT_BATCH_MAX: usize = 128;
+// Job-intake group commits are capped per batch. Both batched ops are
+// single-row-per-request inserts against one table, so the changeset stays
+// small; the cap bounds the raft entry and the time the batch holds the
+// write connection. Higher than the plan cap (16) because these rows are
+// tiny next to a plan's placement set, and the intake path's concurrency is
+// the client fan-out, which is what we want to absorb in one round.
+const EVAL_ENQUEUE_BATCH_MAX: usize = 64;
+const TASK_STATUS_SEED_BATCH_MAX: usize = 64;
+// The submit composite's status-lane seed, shared by the single-seed op and
+// the group commit so the two forms can never drift apart.
+const SEED_TASK_STATUSES_SQL: &str =
+    "INSERT INTO task_status (task_config_id, job_id, job_config_id, status, updated_at)
+     SELECT id, job_id, job_config_id, ?2, ?3
+     FROM task_config WHERE job_config_id = ?1
+     ON CONFLICT(task_config_id) DO NOTHING;";
 // Middle bits of a scheduler_event id carrying the per-process sequence:
 // the high bits carry unix milliseconds and the low `Lane::ID_STRIDE_BITS`
 // carry the minting lane's residue (see `next_scheduler_event_id`).
@@ -1236,6 +1260,14 @@ impl Store {
                 "heartbeat",
                 HEARTBEAT_BATCH_MAX,
             )),
+            eval_enqueue_coalescer: Arc::new(crate::storage::coalesce::Coalescer::new(
+                "eval_enqueue",
+                EVAL_ENQUEUE_BATCH_MAX,
+            )),
+            task_status_seed_coalescer: Arc::new(crate::storage::coalesce::Coalescer::new(
+                "task_status_seed",
+                TASK_STATUS_SEED_BATCH_MAX,
+            )),
             liveness: Arc::new(crate::storage::liveness::LivenessTable::new()),
             missed_beats_before_lost: config.heartbeat.missed_beats_before_lost.max(1),
             alloc_scrub_queue: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -1254,7 +1286,57 @@ impl Store {
             store.persistence_driver.clone().start_engine(&store)?;
         }
 
+        Store::spawn_wal_checkpointer(&db_path);
+
         Ok(store)
+    }
+
+    /// Checkpoint the WAL from a dedicated connection, off the write path.
+    ///
+    /// With autocheckpointing alone, whichever writer crossed the page
+    /// threshold paid the whole checkpoint inline — inside the serialized
+    /// plan-apply commit, where a sample profile showed the batch body
+    /// dominated by pwrite. PASSIVE checkpoints never block writers or
+    /// readers; they simply move as many WAL frames into the main database
+    /// as they can without contention, and the raised `wal_autocheckpoint`
+    /// threshold in `configure_connection` still bounds the WAL if this
+    /// thread ever stalls.
+    ///
+    /// The thread holds only its own connection and a path, so it never
+    /// keeps a `Store` alive; it exits when the checkpoint connection
+    /// errors hard (e.g. the file is gone after a test teardown).
+    fn spawn_wal_checkpointer(db_path: &Path) {
+        let path = db_path.to_path_buf();
+        std::thread::Builder::new()
+            .name("wal-checkpoint".into())
+            .spawn(move || {
+                let conn = match Connection::open(&path) {
+                    Ok(conn) => conn,
+                    Err(_) => return,
+                };
+                let mut consecutive_failures = 0u32;
+                loop {
+                    std::thread::sleep(std::time::Duration::from_millis(1000));
+                    match conn.query_row(
+                        "PRAGMA wal_checkpoint(PASSIVE);",
+                        [],
+                        // (busy, log_frames, checkpointed_frames)
+                        |row| row.get::<_, i64>(0),
+                    ) {
+                        Ok(_) => consecutive_failures = 0,
+                        Err(_) => {
+                            consecutive_failures += 1;
+                            // A store that has been torn down (tests, or a
+                            // wiped data dir) errors forever; stop rather
+                            // than spin on a dead file.
+                            if consecutive_failures > 30 {
+                                return;
+                            }
+                        }
+                    }
+                }
+            })
+            .ok();
     }
 
     /// Clone handed to the raft engine (state machines, pipeline threads):
@@ -1664,6 +1746,23 @@ impl Store {
 
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.pragma_update(None, "cache_size", SQLITE_CACHE_SIZE_KIB)?;
+        // The default cache holds 16 statements; the plan-apply walk alone
+        // cycles through more than that, so hot statements were being
+        // evicted and re-parsed. Sized to hold every statement the manager
+        // uses steadily, with room to spare — a cached statement is a few KiB.
+        conn.set_prepared_statement_cache_capacity(128);
+
+        if !read_only {
+            // WAL checkpointing is moved OFF the commit path: with the
+            // default (1000 pages), whichever writer crossed the threshold
+            // paid the whole checkpoint inline, inside the serialized
+            // plan-apply commit — a sample profile showed the batch body
+            // dominated by pwrite. A background thread checkpoints
+            // passively every second (see `spawn_wal_checkpointer`); this
+            // raised threshold only backstops it if that thread stalls, so
+            // the WAL stays bounded either way.
+            conn.pragma_update(None, "wal_autocheckpoint", 4000)?;
+        }
 
         Ok(())
     }
@@ -3403,20 +3502,25 @@ impl Store {
     }
 
     fn ensure_scope_epoch_tx(&self, tx: &Connection, scope_type: &str, scope_id: &str) -> R<()> {
-        tx.execute(
+        // prepare_cached throughout this file's hot paths: the plan-apply
+        // walk runs these statements hundreds of times per batch, and a
+        // sample profile of the batch body showed ~15% of its time inside
+        // SQLite's PARSER (sqlite3RunParser/yy_reduce) — rusqlite's
+        // `Connection::execute`/`query_row` re-parse on every call, and only
+        // `prepare_cached` hits the statement cache.
+        let mut stmt = tx.prepare_cached(
             "INSERT OR IGNORE INTO allocation_epoch_partition(scope_type, scope_id, epoch) VALUES (?1, ?2, 0);",
-            params![scope_type, scope_id],
         )?;
+        stmt.execute(params![scope_type, scope_id])?;
         Ok(())
     }
 
     fn scope_epoch_tx(&self, tx: &Connection, scope_type: &str, scope_id: &str) -> R<i64> {
         self.ensure_scope_epoch_tx(tx, scope_type, scope_id)?;
-        let epoch = tx.query_row(
+        let mut stmt = tx.prepare_cached(
             "SELECT epoch FROM allocation_epoch_partition WHERE scope_type = ?1 AND scope_id = ?2;",
-            params![scope_type, scope_id],
-            |row| row.get(0),
         )?;
+        let epoch = stmt.query_row(params![scope_type, scope_id], |row| row.get(0))?;
         Ok(epoch)
     }
 
@@ -3702,6 +3806,21 @@ impl Store {
         self.scheduler_settings
             .as_ref()
             .and_then(|settings| settings.get("plan_apply_coalescing"))
+            .and_then(Value::as_bool)
+            .unwrap_or(true)
+    }
+
+    /// `schedulerSettings.job_intake_coalescing` — default true. The one
+    /// escape hatch for BOTH job-intake group commits (the scheduler-lane
+    /// eval enqueue and the status-lane `task_status` seed); off, each
+    /// submitter proposes its own op exactly as it did before batching.
+    /// Deliberately one switch rather than two: they are halves of the same
+    /// composite, and an operator diagnosing a submit-path incident wants to
+    /// take the whole change out, not half of it.
+    fn job_intake_coalescing_enabled(&self) -> bool {
+        self.scheduler_settings
+            .as_ref()
+            .and_then(|settings| settings.get("job_intake_coalescing"))
             .and_then(Value::as_bool)
             .unwrap_or(true)
     }
@@ -4531,7 +4650,8 @@ impl Store {
                     Entry::Occupied(entry) => entry.into_mut(),
                     Entry::Vacant(entry) => {
                         let row = tx
-                            .query_row(&node_row_sql, [node_id], |row| self.node_from_row(row))
+                            .prepare_cached(&node_row_sql)?
+                            .query_row([node_id], |row| self.node_from_row(row))
                             .optional()?;
                         entry.insert(row)
                     }
@@ -8312,10 +8432,7 @@ impl Store {
         // NOTHING`, so the repeat costs one no-op statement — and under raft
         // an empty changeset skips the raft entry entirely (JC-26), so a
         // steady-state resubmit does not even reach the log.
-        let job_config_id = outcome.job_config_id().to_string();
-        if let Err(err) = self.replicated(Lane::Status, "seed_task_statuses", move |s| {
-            s.seed_task_statuses_apply(&job_config_id)
-        }) {
+        if let Err(err) = self.seed_task_statuses_coalesced(outcome.job_config_id()) {
             if !crate::storage::raft::driver::NotRaftLeader::in_chain(&err) {
                 return Err(err);
             }
@@ -8373,6 +8490,117 @@ impl Store {
         Ok(outcome)
     }
 
+    /// The status-lane half of the submit composite, group-committing with
+    /// whatever other submits are in flight.
+    ///
+    /// The seed is one quorum round per submitted job on a THIRD raft group
+    /// (16.6 applied/s on the AWS 5,000-node run, in lockstep with the
+    /// submission rate). A lane is its own raft group with its own
+    /// single-threaded pipeline, so this cannot share the scheduler-lane
+    /// batch — it gets its own coalescer, and a concurrent burst of submits
+    /// pays one status-lane round instead of one each.
+    ///
+    /// A lone submitter takes the single-seed op unchanged.
+    fn seed_task_statuses_coalesced(&self, job_config_id: &str) -> R<()> {
+        // Same reasoning as the eval enqueue: an in-capture caller must stay
+        // in its own capture rather than wait on a leader that needs the
+        // pipeline it is holding.
+        if capture::in_capture() || capture::in_apply() || !self.job_intake_coalescing_enabled() {
+            return self.seed_task_statuses_replicated(job_config_id.to_owned());
+        }
+        let coalescer = Arc::clone(&self.task_status_seed_coalescer);
+        coalescer.submit(job_config_id.to_owned(), |batch| {
+            self.run_task_status_seed_batch(batch)
+        })
+    }
+
+    /// The single-seed replicated op — the group commit's batch-of-one fast
+    /// path, its not-the-leader fallback, and the
+    /// `job_intake_coalescing: false` path.
+    fn seed_task_statuses_replicated(&self, job_config_id: String) -> R<()> {
+        self.replicated(Lane::Status, "seed_task_statuses", move |s| {
+            s.seed_task_statuses_apply(&job_config_id)
+        })
+    }
+
+    /// Batch leader body for the status-lane seed group commit.
+    ///
+    /// Requests are NOT deduplicated: two concurrent submits of the same
+    /// config (an idempotent resubmit racing the original) are two
+    /// submitters owed two results, and the seed is `ON CONFLICT DO
+    /// NOTHING`, so the repeat costs one no-op statement and keeps the
+    /// result mapping a plain 1:1 by index.
+    ///
+    /// Failure isolation and the not-the-leader fallback mirror the eval
+    /// enqueue: each seed runs in its own savepoint, and a typed rejection
+    /// (this node does not lead the status lane) re-runs every request as
+    /// its own op so each caller still sees the `NotRaftLeader` its
+    /// standing-split tolerance matches on — that tolerance is what lets a
+    /// submit succeed while the status leader's reconciler finishes the
+    /// half later.
+    fn run_task_status_seed_batch(&self, batch: Vec<String>) -> Vec<R<()>> {
+        if batch.len() == 1 {
+            let job_config_id = batch.into_iter().next().expect("length checked");
+            return vec![self.seed_task_statuses_replicated(job_config_id)];
+        }
+        let size = batch.len();
+        let rerun = batch.clone();
+        match self.replicated(Lane::Status, "seed_task_statuses_batch", move |s| {
+            s.seed_task_statuses_batch_apply(&batch)
+        }) {
+            Ok(results) => results,
+            Err(err) if crate::storage::raft::driver::NotRaftLeader::in_chain(&err) => {
+                debug!(
+                    batch = size,
+                    "Batched task-status seed rejected by the status lane; seeding each singly"
+                );
+                rerun
+                    .into_iter()
+                    .map(|job_config_id| self.seed_task_statuses_replicated(job_config_id))
+                    .collect()
+            }
+            Err(err) => {
+                let message = format!("batched task-status seed failed: {err:#}");
+                warn!(batch = size, error = %err, "Batched task-status seed failed");
+                (0..size).map(|_| Err(anyhow!(message.clone()))).collect()
+            }
+        }
+    }
+
+    /// The group commit's op body: every batched seed in ONE write
+    /// transaction, each fenced by its own savepoint so a failing seed
+    /// rolls back alone. One result per request, in request order.
+    fn seed_task_statuses_batch_apply(&self, batch: &[String]) -> R<Vec<R<()>>> {
+        let mut conn = self.write_connection()?;
+        let tx = Self::write_tx(&mut conn)?;
+        let now = Self::now_rfc3339()?;
+        let mut results: Vec<R<()>> = Vec::with_capacity(batch.len());
+        for job_config_id in batch {
+            // Savepoint-machinery errors abort the whole batch (`?`): a
+            // leftover savepoint corrupts the stack for the batch-mates
+            // behind it, and the caller's recovery is a clean rollback.
+            tx.execute_batch("SAVEPOINT legion_status_seed_item;")?;
+            match tx.execute(
+                SEED_TASK_STATUSES_SQL,
+                params![job_config_id, TaskStatusState::Pending.as_str(), now],
+            ) {
+                Ok(_) => {
+                    tx.execute_batch("RELEASE legion_status_seed_item;")?;
+                    results.push(Ok(()));
+                }
+                Err(err) => {
+                    tx.execute_batch(
+                        "ROLLBACK TO legion_status_seed_item; \
+                         RELEASE legion_status_seed_item;",
+                    )?;
+                    results.push(Err(err.into()));
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(results)
+    }
+
     /// Status-lane seed of the submit composite: one `pending` row per task
     /// config of the just-written job config (task identity comes from the
     /// control-lane rows, read here).
@@ -8380,10 +8608,7 @@ impl Store {
         let conn = self.write_connection()?;
         let now = Self::now_rfc3339()?;
         conn.execute(
-            "INSERT INTO task_status (task_config_id, job_id, job_config_id, status, updated_at)
-             SELECT id, job_id, job_config_id, ?2, ?3
-             FROM task_config WHERE job_config_id = ?1
-             ON CONFLICT(task_config_id) DO NOTHING;",
+            SEED_TASK_STATUSES_SQL,
             params![job_config_id, TaskStatusState::Pending.as_str(), now],
         )?;
         Ok(())
@@ -10452,8 +10677,9 @@ impl Store {
         }
 
         let mut used: HashSet<u16> = HashSet::new();
-        let mut stmt = tx
-            .prepare("SELECT network FROM allocation WHERE node_id = ? AND network IS NOT NULL;")?;
+        let mut stmt = tx.prepare_cached(
+            "SELECT network FROM allocation WHERE node_id = ? AND network IS NOT NULL;",
+        )?;
         let rows = stmt.query_map([node_id], |row| row.get::<_, Option<String>>(0))?;
         for row in rows {
             let Some(raw) = row? else { continue };
@@ -10523,9 +10749,9 @@ impl Store {
             ":created_at_unix": OffsetDateTime::now_utc().unix_timestamp(),
         };
 
-        let allocation = tx.query_row(&INSERT_ALLOCATION, params, |row| {
-            self.allocation_from_row(row)
-        })?;
+        let allocation = tx
+            .prepare_cached(&INSERT_ALLOCATION)?
+            .query_row(params, |row| self.allocation_from_row(row))?;
 
         if let Some(instance_id) = allocation.instance_id.as_deref() {
             let now = Self::now_rfc3339()?;
@@ -10566,10 +10792,11 @@ impl Store {
             String,
             i64,
             Option<String>,
-        ) = tx.query_row(
-            "SELECT job_id, group_name, name, count, stateful FROM task_config WHERE id = ?;",
-            [task_id],
-            |row| {
+        ) = tx
+            .prepare_cached(
+                "SELECT job_id, group_name, name, count, stateful FROM task_config WHERE id = ?;",
+            )?
+            .query_row([task_id], |row| {
                 Ok((
                     row.get(0)?,
                     row.get(1)?,
@@ -10577,8 +10804,7 @@ impl Store {
                     row.get(3)?,
                     row.get(4)?,
                 ))
-            },
-        )?;
+            })?;
 
         let Some(stateful) = stateful else {
             return Ok(None);
@@ -14596,6 +14822,29 @@ impl Store {
         )
     }
 
+    /// Enqueue one eval, group-committing with whatever other enqueues are
+    /// in flight.
+    ///
+    /// This is the scheduler-lane half of the job-intake composite, and on
+    /// the AWS 5,000-node run it was the single busiest replicated op in the
+    /// system (19.1 applied/s against 21.9 evals/s) for one reason: it is
+    /// one quorum round per submitted job, and the client submits jobs
+    /// concurrently. The eval loop's own bookkeeping had already been
+    /// batched (`complete_evals_and_claim_next`, 0.19 rounds/eval); the
+    /// intake path had not.
+    ///
+    /// Concurrent callers therefore coalesce (`storage/coalesce.rs`):
+    /// enqueues that arrive while a commit is in flight ride the next
+    /// batch as ONE scheduler-lane op, each row fenced by its own savepoint.
+    /// There is no timer and no linger — a lone caller on an idle cluster
+    /// goes straight to the commit slot and takes the single-enqueue path
+    /// below, unchanged and no slower than before.
+    ///
+    /// Queue semantics are untouched. `claim_eval` orders by
+    /// `priority DESC, id ASC`; the coalescer's queue is FIFO and its leader
+    /// drains from the front, so a batch inserts in arrival order and each
+    /// row still derives its own priority (explicit override, else the job's
+    /// band) inside its own savepoint.
     pub fn enqueue_eval_after_delay(
         &self,
         kind: &str,
@@ -14605,26 +14854,59 @@ impl Store {
         priority: Option<i64>,
         delay: Duration,
     ) -> R<Eval> {
-        // Forwarding wrapper (plan §8, D2): the enqueue is the scheduler
-        // half of many composites (RPC submit tails, failure-report
-        // reschedules, drain evictions). Regeneration re-derives lost
-        // enqueues eventually; forwarding lands them immediately, from any
-        // node.
-        match self.enqueue_eval_after_delay_local(
+        let request = EvalRequest {
+            kind: kind.to_owned(),
+            job_id: job_id.map(str::to_owned),
+            job_config_id: job_config_id.map(str::to_owned),
+            node_id: node_id.map(str::to_owned),
+            priority,
+            delay,
+        };
+        // An enqueue raised from INSIDE another op's capture must stay part
+        // of that capture (`replicated` short-circuits there, which is how
+        // composites fuse into one changeset). Routing it through the
+        // coalescer would hand it to a leader that needs the very lane
+        // pipeline this caller is holding — a deadlock, not a slow path.
+        if capture::in_capture() || capture::in_apply() || !self.job_intake_coalescing_enabled() {
+            return self.enqueue_eval_forwarding(request);
+        }
+        let coalescer = Arc::clone(&self.eval_enqueue_coalescer);
+        coalescer.submit(request, |batch| self.run_eval_enqueue_batch(batch))
+    }
+
+    /// The single-enqueue op with leader forwarding — the group commit's
+    /// batch-of-one fast path, its not-the-leader fallback, and the
+    /// `job_intake_coalescing: false` path. Exactly the pre-batching
+    /// operation.
+    fn enqueue_eval_forwarding(&self, request: EvalRequest) -> R<Eval> {
+        let EvalRequest {
             kind,
             job_id,
             job_config_id,
             node_id,
             priority,
             delay,
+        } = request;
+        // Forwarding wrapper (plan §8, D2): the enqueue is the scheduler
+        // half of many composites (RPC submit tails, failure-report
+        // reschedules, drain evictions). Regeneration re-derives lost
+        // enqueues eventually; forwarding lands them immediately, from any
+        // node.
+        match self.enqueue_eval_after_delay_local(
+            &kind,
+            job_id.as_deref(),
+            job_config_id.as_deref(),
+            node_id.as_deref(),
+            priority,
+            delay,
         ) {
             Err(err) if crate::storage::raft::driver::NotRaftLeader::in_chain(&err) => self
                 .forward_after_rejection(
                     crate::storage::raft::forward::ForwardableLaneWrite::EnqueueEval {
-                        kind: kind.to_owned(),
-                        job_id: job_id.map(str::to_owned),
-                        job_config_id: job_config_id.map(str::to_owned),
-                        node_id: node_id.map(str::to_owned),
+                        kind,
+                        job_id,
+                        job_config_id,
+                        node_id,
                         priority,
                         delay_ms: delay.as_millis() as u64,
                     },
@@ -14632,6 +14914,82 @@ impl Store {
                 ),
             other => other,
         }
+    }
+
+    /// Batch leader body for the eval-enqueue group commit: every drained
+    /// enqueue in ONE scheduler-lane op.
+    ///
+    /// **Failure isolation.** Each request runs through
+    /// `enqueue_eval_after_delay_apply`, which opens and commits its own
+    /// savepoint, so a request that fails (an unrepresentable delay, a
+    /// constraint violation) rolls back alone and its batch-mates still
+    /// commit — one bad `job run` cannot take down the 31 submitted
+    /// alongside it. That is why the op returns `Vec<R<Eval>>` rather than
+    /// the all-or-nothing `R<Vec<Eval>>` [`Self::enqueue_evals`] gives its
+    /// fan-out callers.
+    ///
+    /// **Not-the-leader.** A typed rejection means this node does not lead
+    /// the scheduler lane, and nothing was proposed. Every request then
+    /// takes the single-enqueue forwarding path individually — slower, but
+    /// it is the wire op every manager version understands, and it keeps
+    /// the typed `NotRaftLeader` in each caller's own error chain, which is
+    /// what the submit path's standing-split tolerance matches on.
+    ///
+    /// **Any other batch failure** is reported to every member rather than
+    /// re-run: unlike a local rejection, an error out of `replicated` can
+    /// straddle a commit (a leadership race after the propose), and
+    /// re-running would risk enqueueing the batch twice. A duplicate eval is
+    /// only wasted work, but a spurious one is still a lie about what the
+    /// caller's write did.
+    fn run_eval_enqueue_batch(&self, batch: Vec<EvalRequest>) -> Vec<R<Eval>> {
+        if batch.len() == 1 {
+            let request = batch.into_iter().next().expect("length checked");
+            return vec![self.enqueue_eval_forwarding(request)];
+        }
+        let size = batch.len();
+        let forwarded = batch.clone();
+        match self.replicated(Lane::Scheduler, "enqueue_evals_isolated", move |s| {
+            Ok(s.enqueue_evals_isolated_apply(&batch))
+        }) {
+            Ok(results) => results,
+            Err(err) if crate::storage::raft::driver::NotRaftLeader::in_chain(&err) => {
+                debug!(
+                    batch = size,
+                    "Batched eval enqueue rejected by the scheduler lane; forwarding each enqueue"
+                );
+                forwarded
+                    .into_iter()
+                    .map(|request| self.enqueue_eval_forwarding(request))
+                    .collect()
+            }
+            Err(err) => {
+                // `anyhow::Error` is not `Clone`, and every member is owed
+                // its own result, so the shared cause travels as text.
+                let message = format!("batched eval enqueue failed: {err:#}");
+                warn!(batch = size, error = %err, "Batched eval enqueue failed");
+                (0..size).map(|_| Err(anyhow!(message.clone()))).collect()
+            }
+        }
+    }
+
+    /// The group commit's op body: every batched request applied in its own
+    /// savepoint, one result each, in request order. Insert order is arrival
+    /// order, so the `id ASC` half of the claim ordering matches what
+    /// unbatched submitters would have produced.
+    fn enqueue_evals_isolated_apply(&self, batch: &[EvalRequest]) -> Vec<R<Eval>> {
+        batch
+            .iter()
+            .map(|request| {
+                self.enqueue_eval_after_delay_apply(
+                    &request.kind,
+                    request.job_id.as_deref(),
+                    request.job_config_id.as_deref(),
+                    request.node_id.as_deref(),
+                    request.priority,
+                    request.delay,
+                )
+            })
+            .collect()
     }
 
     /// Enqueue many evals in ONE scheduler-lane op.
@@ -18991,6 +19349,254 @@ mod tests {
         Ok(())
     }
 
+    // ── job-intake group commit ──────────────────────────────────────────
+
+    /// The whole no-linger promise: an uncontended submitter must not be
+    /// able to tell that batching exists. It leads a batch of ONE, which
+    /// takes the pre-batching single-enqueue op, so the row it gets back is
+    /// the row it always got.
+    #[test]
+    fn a_batch_of_one_enqueue_is_the_single_enqueue_it_replaced() -> R<()> {
+        let store = setup_store()?;
+
+        // Through the coalescer (the public path).
+        let coalesced = store.enqueue_eval("job_submit", Some("a"), Some("a:1"), None, Some(70))?;
+        // The pre-batching op, called directly. A different job only because
+        // claiming one eval sweeps away same-kind pending evals for the same
+        // job, which would hide the second row below.
+        let single = store.enqueue_eval_forwarding(EvalRequest {
+            kind: "job_submit".into(),
+            job_id: Some("b".into()),
+            job_config_id: Some("b:1".into()),
+            node_id: None,
+            priority: Some(70),
+            delay: Duration::ZERO,
+        })?;
+
+        assert_eq!(coalesced.kind, single.kind);
+        assert_eq!(coalesced.status, single.status);
+        assert_eq!(coalesced.job_id, "a");
+        assert_eq!(single.job_id, "b");
+        assert_eq!(coalesced.priority, single.priority);
+        assert_eq!(
+            single.id.parse::<i64>()?,
+            coalesced.id.parse::<i64>()? + 1,
+            "the coalesced enqueue must have taken the same INSERT, one id earlier"
+        );
+        // And both are real, claimable rows in arrival order.
+        assert_eq!(store.claim_eval()?.context("first")?.id, coalesced.id);
+        assert_eq!(store.claim_eval()?.context("second")?.id, single.id);
+        Ok(())
+    }
+
+    /// The contended case, through the public API: whatever way the batches
+    /// fall, every submitter gets its OWN eval exactly once and every row
+    /// lands. This is the property the coalescer's ticketing is for — a
+    /// submitter handed a batch-mate's eval id would have the eval loop
+    /// working on someone else's job.
+    #[test]
+    fn concurrent_enqueues_each_get_their_own_eval() -> R<()> {
+        let store = setup_store()?;
+        const SUBMITTERS: usize = 24;
+
+        let handles: Vec<_> = (0..SUBMITTERS)
+            .map(|i| {
+                let store = store.clone();
+                std::thread::spawn(move || {
+                    let job = format!("job-{i}");
+                    store
+                        .enqueue_eval(
+                            "job_submit",
+                            Some(&job),
+                            Some(&format!("{job}:1")),
+                            None,
+                            None,
+                        )
+                        .map(|eval| (job, eval))
+                })
+            })
+            .collect();
+
+        let mut ids = BTreeSet::new();
+        for handle in handles {
+            let (job, eval) = handle.join().expect("submitter panicked")?;
+            assert_eq!(
+                eval.job_id, job,
+                "a submitter was handed someone else's eval"
+            );
+            assert!(ids.insert(eval.id.clone()), "duplicate eval id {}", eval.id);
+        }
+
+        let rows: i64 =
+            store
+                .read_connection()?
+                .query_row("SELECT COUNT(*) FROM eval;", [], |row| row.get(0))?;
+        assert_eq!(rows as usize, SUBMITTERS, "every enqueue must have landed");
+        Ok(())
+    }
+
+    /// Per-request failure isolation. One request that cannot be applied
+    /// must fail alone: batching a `job run` behind 31 others must never let
+    /// one bad submission reject the other 31.
+    #[test]
+    fn a_failing_enqueue_does_not_fail_its_batch_mates() -> R<()> {
+        let store = setup_store()?;
+        let good = |kind: &str| EvalRequest {
+            kind: kind.into(),
+            job_id: Some("j".into()),
+            job_config_id: Some("j:1".into()),
+            node_id: None,
+            priority: Some(50),
+            delay: Duration::ZERO,
+        };
+        // `Duration::MAX` exceeds what `time::Duration` can represent, so
+        // computing this row's `ready_at` fails — inside its own savepoint.
+        let poison = EvalRequest {
+            delay: Duration::MAX,
+            ..good("poison")
+        };
+
+        let results = store.run_eval_enqueue_batch(vec![good("first"), poison, good("third")]);
+        assert_eq!(results.len(), 3, "one result per request, always");
+        assert!(results[0].is_ok(), "batch-mate ahead of the failure");
+        assert!(results[1].is_err(), "the failing request must fail itself");
+        assert!(results[2].is_ok(), "batch-mate behind the failure");
+
+        // The rolled-back row left nothing behind, and the survivors are
+        // claimable in arrival order.
+        let kinds: Vec<String> = std::iter::from_fn(|| store.claim_eval().transpose())
+            .map(|eval| eval.map(|eval| eval.kind))
+            .collect::<R<Vec<String>>>()?;
+        assert_eq!(kinds, vec!["first".to_string(), "third".to_string()]);
+        Ok(())
+    }
+
+    /// A batch must not disturb the queue: `claim_eval` takes
+    /// `priority DESC, id ASC`, so a batch has to insert in arrival order
+    /// and let each row derive its own priority.
+    #[test]
+    fn a_batch_preserves_priority_then_arrival_ordering() -> R<()> {
+        let store = setup_store()?;
+        let request = |kind: &str, priority: i64| EvalRequest {
+            kind: kind.into(),
+            job_id: Some("j".into()),
+            job_config_id: Some("j:1".into()),
+            node_id: None,
+            priority: Some(priority),
+            delay: Duration::ZERO,
+        };
+        // Arrival order deliberately not priority order.
+        let results = store.run_eval_enqueue_batch(vec![
+            request("normal-first", 50),
+            request("urgent-first", 90),
+            request("normal-second", 50),
+            request("urgent-second", 90),
+        ]);
+        for result in &results {
+            assert!(result.is_ok(), "every request in this batch is valid");
+        }
+
+        let kinds: Vec<String> = std::iter::from_fn(|| store.claim_eval().transpose())
+            .map(|eval| eval.map(|eval| eval.kind))
+            .collect::<R<Vec<String>>>()?;
+        assert_eq!(
+            kinds,
+            vec![
+                "urgent-first".to_string(),
+                "urgent-second".to_string(),
+                "normal-first".to_string(),
+                "normal-second".to_string(),
+            ],
+            "priority DESC then id ASC — batching must not reorder either half"
+        );
+        Ok(())
+    }
+
+    /// The status-lane half of the same composite. A batched seed writes
+    /// exactly the rows N single seeds would, and a duplicated request (two
+    /// concurrent submits of the same config) is the no-op it is supposed to
+    /// be rather than a lost result.
+    #[test]
+    fn a_batched_task_status_seed_writes_what_single_seeds_would() -> R<()> {
+        let store = setup_store()?;
+        let first = submit_job(
+            &store,
+            "seed-batch-a",
+            vec![
+                TaskConfig::new("api", "noop"),
+                TaskConfig::new("web", "noop"),
+            ],
+        )?;
+        let second = submit_job(&store, "seed-batch-b", vec![TaskConfig::new("api", "noop")])?;
+
+        // Start from a clean slate so the batch is what writes the rows.
+        {
+            let conn = store.write_connection()?;
+            conn.execute("DELETE FROM task_status;", [])?;
+        }
+
+        // The duplicate is deliberate: it must get its own `Ok`, not be
+        // deduplicated out of the result list.
+        let ids = vec![first.clone(), second.clone(), second.clone()];
+        let results = store.run_task_status_seed_batch(ids);
+        assert_eq!(results.len(), 3, "one result per request, duplicates too");
+        for result in &results {
+            assert!(result.is_ok(), "no seed in this batch can fail");
+        }
+
+        let seeded: i64 =
+            store
+                .read_connection()?
+                .query_row("SELECT COUNT(*) FROM task_status;", [], |row| row.get(0))?;
+        assert_eq!(
+            seeded, 3,
+            "one pending row per task config, and the repeat is a no-op"
+        );
+        Ok(())
+    }
+
+    /// Idempotency under concurrency, which batching makes more likely
+    /// rather than less: two submits carrying the same key both miss the
+    /// pre-submit lookup, so the RECORD is what arbitrates. Exactly one
+    /// caller may be told it was first, and the loser must be able to read
+    /// the winner's response — that pair is what `RunJob` turns into
+    /// `deduplicated`.
+    #[test]
+    fn concurrent_submits_of_one_idempotency_key_have_exactly_one_winner() -> R<()> {
+        let store = setup_store()?;
+        let winners = Arc::new(AtomicUsize::new(0));
+
+        let handles: Vec<_> = (0..8)
+            .map(|i| {
+                let store = store.clone();
+                let winners = Arc::clone(&winners);
+                std::thread::spawn(move || -> R<()> {
+                    if store.idempotency_record("race-key", "run_job", &format!("reply {i}"))? {
+                        winners.fetch_add(1, Ordering::SeqCst);
+                    }
+                    Ok(())
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().expect("submitter panicked")?;
+        }
+
+        assert_eq!(
+            winners.load(Ordering::SeqCst),
+            1,
+            "exactly one concurrent submit may report itself as the first"
+        );
+        let recorded = store
+            .idempotency_lookup("race-key")?
+            .context("the winner's response must be replayable")?;
+        assert!(
+            recorded.starts_with("reply "),
+            "the loser reads the winner's recorded response, got {recorded:?}"
+        );
+        Ok(())
+    }
+
     #[test]
     fn sortable_timestamps_sort_chronologically() -> R<()> {
         let base = OffsetDateTime::from_unix_timestamp(1_700_000_000)?;
@@ -20746,6 +21352,278 @@ mod tests {
 
             println!("free pool @ {per_node} allocations/node: row walk {old:?}, cached {new:?}");
             tx.commit()?;
+        }
+        Ok(())
+    }
+
+    /// Hotspot loop for the batch body: one 40-allocs/node store, thirty
+    /// 10-plan batches over rotating node ranges, no capture. Exists to be
+    /// sample-profiled (`sample <pid>` on macOS, `perf` on Linux) — the
+    /// commit-split bench says WHERE the commit's time is (the body, not
+    /// the diff or the changeset apply); this says what the body spends it
+    /// on.
+    ///
+    /// ```bash
+    /// cargo test --release --lib bench_plan_body_hotspot_loop -- --ignored --nocapture &
+    /// sample legion 5 -file /tmp/body.sample.txt   # while it runs
+    /// ```
+    #[test]
+    #[ignore = "profiling harness; run with --release --ignored --nocapture"]
+    fn bench_plan_body_hotspot_loop() -> R<()> {
+        const NODES: usize = 1000;
+        const PLANS: usize = 10;
+        const PLACEMENTS_PER_PLAN: usize = 44;
+        const ROUNDS: usize = 200;
+
+        let store = setup_store()?;
+        let conn = store.write_connection()?;
+        conn.execute(
+            "INSERT INTO job (id, name, status, created_at) \
+             VALUES ('filler', 'filler', 'running', '2026-01-01T00:00:00Z');",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO job_config (id, name, type, meta, version, created_at, job_id) \
+             VALUES ('filler-cfg', 'filler', 'service', '{}', 1, '2026-01-01T00:00:00Z', 'filler');",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO task_config (id, count, name, runtime, config, resources, constraints, job_id, job_config_id) \
+             VALUES (1, 1, 'filler-task', 'noop', '{}', '{\"cpu\": 10, \"memory\": 8}', '{}', 'filler', 'filler-cfg');",
+            [],
+        )?;
+        drop(conn);
+        for node in 0..NODES {
+            store.insert_node(usage_node_msg(&format!("bench-node-{node}"), "{}"))?;
+        }
+        let conn = store.write_connection()?;
+        let mut alloc_id = 0i64;
+        for node in 0..NODES {
+            for _ in 0..40 {
+                alloc_id += 1;
+                conn.execute(
+                    "INSERT INTO allocation (id, status, resources, node_id, job_config_id, task_config_id) \
+                     VALUES (?1, 'running', '{\"cpu\": 10, \"memory\": 8}', ?2, 'filler-cfg', 1);",
+                    params![alloc_id, format!("bench-node-{node}")],
+                )?;
+            }
+        }
+        drop(conn);
+
+        // Streamed (not captured) so an external profiler can key off it:
+        // everything before this line is store construction, not the body.
+        eprintln!("LOOP START");
+        let mut total = std::time::Duration::ZERO;
+        for round in 0..ROUNDS {
+            let mut batch = Vec::with_capacity(PLANS);
+            for plan in 0..PLANS {
+                let job_id = format!("bench-job-{round}-{plan}");
+                let config_id = format!("bench-cfg-{round}-{plan}");
+                let task_id = 1000 + (round * PLANS + plan) as i64;
+                let conn = store.write_connection()?;
+                conn.execute(
+                    "INSERT INTO job (id, name, status, created_at) VALUES (?1, ?1, 'running', '2026-01-01T00:00:00Z');",
+                    [&job_id],
+                )?;
+                conn.execute(
+                    "INSERT INTO job_config (id, name, type, meta, version, created_at, job_id) \
+                     VALUES (?1, ?2, 'service', '{}', 1, '2026-01-01T00:00:00Z', ?2);",
+                    params![config_id, job_id],
+                )?;
+                conn.execute(
+                    "INSERT INTO task_config (id, count, name, runtime, config, resources, constraints, job_id, job_config_id) \
+                     VALUES (?1, ?2, 'bench-task', 'noop', '{}', '{\"cpu\": 10, \"memory\": 8}', '{}', ?3, ?4);",
+                    params![task_id, PLACEMENTS_PER_PLAN as i64, job_id, config_id],
+                )?;
+                drop(conn);
+                // Rotate the node range so successive rounds spread over the
+                // fleet the way a live scheduler would.
+                let base =
+                    (round * 61 + plan * PLACEMENTS_PER_PLAN) % (NODES - PLACEMENTS_PER_PLAN);
+                let nodes: HashSet<String> = (0..PLACEMENTS_PER_PLAN)
+                    .map(|slot| format!("bench-node-{}", base + slot))
+                    .collect();
+                let expected_versions = store.allocation_version_vector(&config_id, &nodes)?;
+                let placements: Vec<PlanSubmissionPlacement> = nodes
+                    .iter()
+                    .map(|node| PlanSubmissionPlacement {
+                        task_id,
+                        candidates: vec![node.clone()],
+                    })
+                    .collect();
+                batch.push(PlanApplyRequest {
+                    job_config_id: config_id,
+                    mode: "submit".into(),
+                    placements: PlanPlacements::Candidates(placements),
+                    expected_versions,
+                    evictions: Vec::new(),
+                    target_instance: String::new(),
+                });
+            }
+            let started = Instant::now();
+            let results = store.run_plan_batch_txn(&batch)?;
+            total += started.elapsed();
+            for result in &results {
+                assert!(result.is_ok(), "hotspot loop rejected a plan: {result:?}");
+            }
+        }
+        println!(
+            "hotspot loop: {ROUNDS} batches, body mean {:?}",
+            total / ROUNDS as u32
+        );
+        Ok(())
+    }
+
+    /// Split the serialized plan-apply commit into its three parts, at two
+    /// cluster fills: executing the batch body, capturing it (execute +
+    /// session diff + rollback), and applying the captured changeset — the
+    /// last being what the leader AND every follower pay per commit.
+    ///
+    /// Why this exists: the AWS ladder measured the group commit at 108.7 ms
+    /// with 50k live allocations and 285 ms at 200k (batch ~9.6), while the
+    /// quorum round itself stayed under 8 ms — so whatever grows with fill
+    /// is in the local SQLite work this bench isolates. Three store-path
+    /// fixes each flattened their own cost and the ladder's ~1.6x-per-
+    /// doubling slope never moved; this is the instrument for finding the
+    /// term that does move it.
+    ///
+    /// ```bash
+    /// cargo test --release --lib bench_plan_batch_commit_split -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "benchmark; run with --release --ignored --nocapture"]
+    fn bench_plan_batch_commit_split() -> R<()> {
+        use crate::storage::raft::capture::{apply_changeset, capture_mutation};
+
+        const NODES: usize = 1000;
+        const PLANS: usize = 10;
+        const PLACEMENTS_PER_PLAN: usize = 44;
+
+        // Arms mutate the store (a committed body, an applied changeset), so
+        // each arm gets its own identically-built store: same fill, no
+        // contamination between measurements.
+        let build = |per_node: usize| -> R<(Store, Vec<PlanApplyRequest>)> {
+            let store = setup_store()?;
+            let conn = store.write_connection()?;
+            // Filler load: what the cluster is already running.
+            conn.execute(
+                "INSERT INTO job (id, name, status, created_at) \
+                 VALUES ('filler', 'filler', 'running', '2026-01-01T00:00:00Z');",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO job_config (id, name, type, meta, version, created_at, job_id) \
+                 VALUES ('filler-cfg', 'filler', 'service', '{}', 1, '2026-01-01T00:00:00Z', 'filler');",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO task_config (id, count, name, runtime, config, resources, constraints, job_id, job_config_id) \
+                 VALUES (1, 1, 'filler-task', 'noop', '{}', '{\"cpu\": 10, \"memory\": 8}', '{}', 'filler', 'filler-cfg');",
+                [],
+            )?;
+            drop(conn);
+
+            for node in 0..NODES {
+                store.insert_node(usage_node_msg(&format!("bench-node-{node}"), "{}"))?;
+            }
+            let conn = store.write_connection()?;
+            let mut alloc_id = 0i64;
+            for node in 0..NODES {
+                for _ in 0..per_node {
+                    alloc_id += 1;
+                    conn.execute(
+                        "INSERT INTO allocation (id, status, resources, node_id, job_config_id, task_config_id) \
+                         VALUES (?1, 'running', '{\"cpu\": 10, \"memory\": 8}', ?2, 'filler-cfg', 1);",
+                        params![alloc_id, format!("bench-node-{node}")],
+                    )?;
+                }
+            }
+            drop(conn);
+
+            // The batch under test: PLANS fresh submits, dense_fleet-shaped
+            // (single-candidate placements on disjoint nodes, so every
+            // placement binds first choice and no fallback walking muddies
+            // the timing).
+            let mut batch = Vec::with_capacity(PLANS);
+            for plan in 0..PLANS {
+                let job_id = format!("bench-job-{plan}");
+                let config_id = format!("bench-cfg-{plan}");
+                let task_id = 1000 + plan as i64;
+                let conn = store.write_connection()?;
+                conn.execute(
+                    "INSERT INTO job (id, name, status, created_at) VALUES (?1, ?1, 'running', '2026-01-01T00:00:00Z');",
+                    [&job_id],
+                )?;
+                conn.execute(
+                    "INSERT INTO job_config (id, name, type, meta, version, created_at, job_id) \
+                     VALUES (?1, ?2, 'service', '{}', 1, '2026-01-01T00:00:00Z', ?2);",
+                    params![config_id, job_id],
+                )?;
+                conn.execute(
+                    "INSERT INTO task_config (id, count, name, runtime, config, resources, constraints, job_id, job_config_id) \
+                     VALUES (?1, ?2, 'bench-task', 'noop', '{}', '{\"cpu\": 10, \"memory\": 8}', '{}', ?3, ?4);",
+                    params![task_id, PLACEMENTS_PER_PLAN as i64, job_id, config_id],
+                )?;
+                drop(conn);
+
+                let nodes: HashSet<String> = (0..PLACEMENTS_PER_PLAN)
+                    .map(|slot| format!("bench-node-{}", plan * PLACEMENTS_PER_PLAN + slot))
+                    .collect();
+                let expected_versions = store.allocation_version_vector(&config_id, &nodes)?;
+                let placements: Vec<PlanSubmissionPlacement> = nodes
+                    .iter()
+                    .map(|node| PlanSubmissionPlacement {
+                        task_id,
+                        candidates: vec![node.clone()],
+                    })
+                    .collect();
+                batch.push(PlanApplyRequest {
+                    job_config_id: config_id,
+                    mode: "submit".into(),
+                    placements: PlanPlacements::Candidates(placements),
+                    expected_versions,
+                    evictions: Vec::new(),
+                    target_instance: String::new(),
+                });
+            }
+            Ok((store, batch))
+        };
+
+        for per_node in [10usize, 40] {
+            // Arm 1: the batch body alone, committed for real.
+            let (store, batch) = build(per_node)?;
+            let started = Instant::now();
+            let results = store.run_plan_batch_txn(&batch)?;
+            let body = started.elapsed();
+            for result in &results {
+                assert!(result.is_ok(), "body arm rejected a plan: {result:?}");
+            }
+
+            // Arm 2: the same body under capture (execute + diff + rollback),
+            // then the changeset applied — leader-side cost is capture +
+            // apply + the ~4-8 ms quorum round the rig measures separately.
+            let (store, batch) = build(per_node)?;
+            let started = Instant::now();
+            let ((), changeset) = capture_mutation(&store, Lane::Scheduler, |s| {
+                for result in s.run_plan_batch_txn(&batch)? {
+                    result?;
+                }
+                Ok(())
+            })?;
+            let capture = started.elapsed();
+
+            let started = Instant::now();
+            apply_changeset(&store, &changeset)?;
+            let apply = started.elapsed();
+
+            println!(
+                "commit split @ {per_node} allocs/node ({} live rows): \
+                 body {body:?}, capture {capture:?} (diff+rollback {:?}), \
+                 changeset apply {apply:?}, changeset {} KiB",
+                NODES * per_node,
+                capture.saturating_sub(body),
+                changeset.len() / 1024,
+            );
         }
         Ok(())
     }

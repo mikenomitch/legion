@@ -15,6 +15,21 @@ How to use it:
 
 ---
 
+- [ ] **The planner's node universe truncates to one slice at rig scale.**
+      The 2026-08-06 storm drill found ALL of a 25k-allocation `spread`
+      workload on one quarter of a 5,000-node fleet, replacements packing
+      the next quarter, nodes filled to exactly `maxAllocations`, and —
+      decisively — every candidate in sampled `plan_submission` rows from
+      one slice, across constraint classes. Eliminated: naming,
+      availability, class/pool distribution, tie-breaks, cache
+      invalidation, and the capture/projection path (pinned by
+      `tests/spread_under_raft.rs` plus two scheduler unit tests). Does
+      NOT reproduce locally up to 300 nodes with the raft engine on. Next:
+      a fleet-scale repro using the worker-registration RPC at the sim's
+      register rate, and a read-model node-count gauge next to
+      `legion_nodes` so this is visible in one query. Findings:
+      [aws-phase5-findings.md](aws-phase5-findings.md).
+
 ## In flight (open PRs)
 
 | PR | What it lands | Notes |
@@ -119,6 +134,51 @@ How to use it:
       [eval-path-raft-cost-plan_calls.md](calls/eval-path-raft-cost-plan_calls.md)
       §3. **The `dense_fleet` ladder re-run is the regression test** — see
       the open re-measure item below.
+- [x] **Job intake group-commits on the scheduler and status lanes**
+      (2026-08-06, phase "intake" of
+      [eval-path-raft-cost-plan.md](plans/eval-path-raft-cost-plan.md),
+      documented in
+      [scheduler-and-eval-loop.md](../docs/scheduler-and-eval-loop.md)).
+      A submitted job cost THREE quorum rounds, one per lane, and all
+      three sat on top of the AWS 5,000-node profile in lockstep with the
+      submission rate: `enqueue_eval_after_delay` 19.1 applied/s,
+      `handle_job_submit` 16.6/s, `seed_task_statuses` 16.6/s, against
+      21.9 evals/s overall — while the eval loop's own
+      `complete_evals_and_claim_next`, already batched, sat at 4.2/s.
+      Concurrent submitters now coalesce their scheduler-lane enqueue and
+      their status-lane `task_status` seed through the existing
+      `coalesce.rs` group commit, each request fenced by its own
+      savepoint so one bad submission fails alone. No timer, so a lone
+      `job run` on an idle cluster is byte-for-byte the path it was.
+      `schedulerSettings.job_intake_coalescing = false` takes both back
+      out. Calls:
+      [eval-path-raft-cost-plan_calls.md](calls/eval-path-raft-cost-plan_calls.md)
+      §2. **Unverified at scale** — see the re-measure item below.
+    - [ ] **The control-lane `handle_job_submit` is NOT batched, on
+          purpose.** It derives a config's next version from committed
+          state read through a read connection, so two submits of the
+          same job inside one uncommitted batch transaction would both
+          compute version N+1 — the "there is a race condition here with
+          the version" note in `handle_job_submit_apply`, promoted from
+          rare to routine. The composite is also not one store call:
+          `submit_rendered_job` interleaves `clear_job_stopped_status`,
+          `replace_job_kv_references`, `seed_keyed_instances`,
+          `previous_job_config_id` and rollout creation between the
+          control write and the eval enqueue. Batching it means making
+          the submit a pure function of its request first — a rewrite of
+          the RPC, not a storage change. Intake therefore still costs one
+          quorum round per submitted job.
+    - [ ] **Re-measure intake with batching on.** Same cell as the
+          measurement above (5,000 nodes, `dense_fleet` at 200,000
+          allocations, 16 eval threads, 32 concurrent submitters).
+          `legion_raft_ops_total{op="enqueue_evals_isolated"}` and
+          `{op="seed_task_statuses_batch"}` should be well below the
+          submission rate, and
+          `legion_store_coalesce_batch_size{path="eval_enqueue"}`'s
+          `le="1"` bucket well below its `_count`. **A local run cannot
+          measure this** — `Store::replicated` short-circuits when raft
+          is off, so the batched and unbatched forms execute identical
+          code.
 - [ ] **Batch the eval loop (claim N, plan N, apply N, complete N).** Now the
       whole remaining cost. With the wake herd fixed and health checks shown
       to be `outcome=empty`, the only meaningful quorum traffic left is
@@ -226,14 +286,43 @@ How to use it:
       **Planned, not built** —
       [eval-thread-default-plan.md](plans/eval-thread-default-plan.md), which
       deliberately picks no number.
-  - [ ] **Fix the load generator before sweeping again (Phase 0a, the
-        gate).** The driver spawns one `legion job run` CLI process per job,
-        so its rate is bounded by process spawn and gRPC dial, not by
-        Legion. Until a 64-thread cell can report `driver_bound: false`, no
-        point above 32 produces a number. Submit through one long-lived
-        in-process gRPC client; give the loadgen its own instance; shard it
-        if that is not enough. Unblocks the saturation questions in the
-        other scheduler plans too.
+  - [x] **Fix the load generator before sweeping again (Phase 0a, the
+        gate)** (2026-08-05). `legion-loadgen`
+        (`benchmarks/loadgen/main.rs`, `cargo build --features loadgen`)
+        submits a whole workload from one process over a pool of long-lived
+        gRPC channels, with no per-job process spawn or dial. Measured on
+        one macOS box, 5,001 web_fleet jobs, the two paths alternated back
+        to back: **255-260 jobs/sec** on the CLI loop against **1,107-1,492
+        jobs/sec** native on an idle box, and 105/108 against 741/564 on a
+        loaded one — **5-7x either way**. End to end at 600 nodes,
+        submission of 2,001 jobs went from 8.54s to 2.64s and the placement
+        tail after the last submit went from 2.1s to 8.1s, so the scheduler
+        is now the constraint by a fourfold wider margin.
+        `driver.py --submitter {auto,native,cli}` selects it and every cell
+        archives which path it took. The eval-thread sweep above can now be
+        re-run past 32. Calls:
+        [aws-comparative-benchmark-plan_calls.md](calls/aws-comparative-benchmark-plan_calls.md)
+        §23-24.
+  - [ ] **Native submitters for Nomad and K8s, before the next
+        cross-system table.** `legion-loadgen` is Legion-only, so a cell run
+        with `--submitter native` is comparable to another Legion cell and
+        to nothing else; Nomad and K8s still spawn a CLI process per job.
+        Until they have equivalents (Nomad's HTTP API and the apiserver
+        REST API, each over one keep-alive session), every cross-system
+        comparison must force `LEGION_SUBMITTER=cli` on all three. The rule
+        is in `benchmarks/aws/README.md` § Methodology and the path taken is
+        recorded per cell as `submitter` in `metrics.json` and
+        `fairness-record.json`.
+  - [ ] **Burst submission costs measured placement throughput — find out
+        why.** The same 600-node/12,006-allocation cell placed 1,329
+        alloc/sec when the CLI loop paced submission over 8.5s and 1,126
+        alloc/sec when the native submitter delivered the same jobs in
+        2.6s: about 15% lost to receiving the work faster. That is the
+        first look the rig has ever had at Legion under a submission burst,
+        and the obvious suspect is plan-apply conflict
+        ([plan-apply-conflict-reduction-plan.md](plans/plan-apply-conflict-reduction-plan.md)).
+        Measure `legion_plan_apply_total{outcome}` across a paced/burst
+        pair before drawing a conclusion.
   - [ ] `configs/manager.ncl` pins `evalThreads = 4` explicitly, so it has
         to move with the default.
 - [x] **The eval loop no longer blocks tokio worker threads on quorum
@@ -1482,6 +1571,19 @@ The MCP server, self-documenting CLI, structured output, and documented gRPC
 surface all shipped. What's left is the harder "can an agent actually operate
 this" work:
 
+- [ ] **`deduplicated` lies to the loser of a CONCURRENT idempotency-key
+      race, on every mutating RPC except `RunJob`.** Two requests carrying
+      the same key both miss `idempotency_lookup`, and `idempotency_record`
+      (`INSERT OR IGNORE`) already returns which one won — but `stop_job`,
+      `destroy_job`, `scale_task`, the `instance` verbs and the rest
+      discard that boolean and hardcode `deduplicated: false`, so both
+      callers are told they were first. `run_job` was fixed alongside the
+      job-intake group commit (which widens the overlap window); the rest
+      each need their own decision about what the loser should be handed
+      back. Sequential retries — what the key is really for — are correct
+      everywhere. Calls:
+      [eval-path-raft-cost-plan_calls.md](calls/eval-path-raft-cost-plan_calls.md)
+      §17.
 - [ ] An agent can easily write a plugin (scaffolding, schema, a worked example)
 - [ ] An agent can easily configure a worker to talk to a manager
 - [ ] An agent can search the registry and find jobs worth installing and running
@@ -1576,6 +1678,14 @@ Deferred from [job-updated-at-plan.md](plans/job-updated-at-plan.md):
       round trips and the commits. Wants a plan first: batching changes
       idempotency (one key per batch or per job?), partial-failure
       semantics, and ACL scope evaluation, none of which are obvious.
+      **Still open, and now measurable.** The benchmark rig no longer needs
+      it — `legion-loadgen` reaches ~1,100-1,500 jobs/sec against one local
+      manager with unary `RunJob` — but that is also the first honest
+      baseline a `RunJobs` would have to beat, and the per-job control-lane
+      commit is still there underneath it. The loadgen's concurrency curve
+      is the evidence: throughput peaks near 128 in flight and *falls* to
+      607 jobs/sec at 1,024, which is what a serialized commit looks like
+      from the client side.
 - [ ] **`a_task_that_ignores_its_stop_signal_is_killed_at_the_deadline` is
       flaky under parallel load.** Passes alone and in most full runs, fails
       intermittently in `cargo test --all` (seen 2026-08-04). Its own comment

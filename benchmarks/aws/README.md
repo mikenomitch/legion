@@ -27,6 +27,7 @@ against a stubbed `aws`, no image baked against real AWS yet.
 | `configs/` | Rendered-per-campaign config templates: Legion A (raft lanes), Legion B (streaming + S3 lease), Nomad servers, kubeadm + KWOK, Prometheus + Grafana stack. |
 | `workloads/` | `translate.py`: scenario JSON → Legion jobspecs / Nomad jobs / K8s Deployments, plus the driver's expectation manifest. `profile_split.py`: the shared fleet-shape split. |
 | `driver/` | `driver.py`: submits, watches placements, computes throughput/latency/recovery. `tests/`: the fixture suite that keeps the counting math honest. |
+| `../loadgen/` | `legion-loadgen`: the native Legion job submitter (`cargo build --features loadgen`). Legion-only on purpose — read the submission-path rule under Methodology before comparing a cell built with it to another system. |
 | `scripts/` | The runbook, as executables (below). `bootstrap-operator-box.sh` builds the box you drive from (`bake-operator-ami.sh` bakes its toolchain into an AMI first, from the one shared `operator-toolchain.sh`); `phase1.sh` is the whole of phase 1, checkpointed. |
 | `experiments/` | Piggyback drills: storm, failover, streaming RPO, 24h soak, upgrade-under-load. See `experiments/README.md`. |
 | `dashboards/` | Grafana boards provisioned onto the loadgen box. |
@@ -147,6 +148,10 @@ scripts/install-legion-b.sh
 scripts/run-campaign.sh --system legion-b
 
 # 3-4. Competitor campaigns (same boxes, serially — phase 3/4).
+#      LEGION_SUBMITTER=cli on the Legion campaigns these are compared
+#      against — see the submission-path rule under Methodology. Without
+#      it, Legion submits natively and Nomad/K8s spawn a process per job,
+#      and the table compares submitters instead of schedulers.
 scripts/install-nomad.sh  && scripts/run-campaign.sh --system nomad
 scripts/install-k8s.sh    && scripts/run-campaign.sh --system k8s
 
@@ -356,9 +361,37 @@ and tear it down when the campaign is over.
   asserting it. The metrics are per sim *process* (~1,250 nodes), not per
   node — see docs/metrics.md § Worker. Nomad and K8s fleets are not
   scraped this way, so worker-side cost is only compared via instance CPU.
+- **Submission paths are not interchangeable — the one rule that
+  invalidates a comparison if you break it.** Legion has a native
+  submitter, `legion-loadgen` (`benchmarks/loadgen/main.rs`): one
+  process, a few long-lived gRPC connections, hundreds of concurrent
+  `RunJob` calls. Nomad and K8s do not; they still spawn a CLI process
+  per job, which is the shared loop that made the comparison fair in the
+  first place. **A cross-system comparison must therefore either run all
+  three with `--submitter cli` (`LEGION_SUBMITTER=cli` for
+  `run-step.sh`), or add equivalent native submitters for Nomad and K8s
+  first.** Anything else compares submitters, not schedulers, and it does
+  so in Legion's favour. Every cell archives the path it took as
+  `submitter` in both `metrics.json` and `fairness-record.json`, so this
+  is checkable after the fact rather than a thing to remember.
+
+  The submitter exists because the CLI loop was not fast enough to
+  measure Legion's weakest case. `web_fleet` is ~6 allocations per job,
+  so its ~36-103 jobs/sec ceiling is only ~600 alloc/sec of demand, and
+  Legion already served ≥336 alloc/sec while the driver was the
+  constraint — every such cell reported `submission.driver_bound: true`,
+  which is a floor and not a measurement. A Legion-vs-Legion sweep
+  (scaling, saturation, eval-thread) is what `native` is for; a
+  Legion-vs-Nomad-vs-K8s table is not.
 - **Driver-side clocks.** Submit and placed timestamps are taken by the
   same driver process for every system; no cross-host clock skew enters
-  a latency, and all systems pay the same stream-delivery latency.
+  a latency, and all systems pay the same stream-delivery latency. The
+  native submitter is the one exception, and it is closed rather than
+  waived: it runs in its own process, so it stamps in UNIX epoch
+  milliseconds and the driver hands it the `monotonic - epoch` offset
+  (`--clock-offset-ms`) that rebases those stamps onto the same clock
+  its placement events use. Same host, same tick rate; only an NTP
+  *step* mid-cell could skew a latency.
 - **Expectation manifests.** The translator declares how many
   allocations every job must produce; the driver reports shortfalls
   (`complete: false`) instead of averaging over them.

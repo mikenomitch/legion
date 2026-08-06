@@ -6,8 +6,11 @@ Entries 1-4 are planning-stage calls; 5-10 were made while building the
 rig (phases 0-1, 2026-07-30); 11-13 came from making campaigns runnable
 unattended (2026-08-02); 18-19 came from making the rig startable at all
 from an arm64 macOS machine (2026-08-02); 20 came from adding memory to
-the measured results during the first real campaign (2026-08-02). Ranked
-by project impact; the number is the rank.
+the measured results during the first real campaign (2026-08-02); 23-24
+came from replacing the rig's process-per-job submission with a native
+submitter, after three sessions of "throughput" numbers turned out to be
+the driver's own ceiling (2026-08-05). Ranked by project impact; the
+number is the rank.
 
 ## 1. Simulated workers everywhere, real control planes only
 
@@ -567,7 +570,155 @@ because the loadgen box is an `m7i.large` — 2 vCPU. Each slot is a whole
 CLI process; oversubscribing starves the event-watcher thread and the cell
 measures the driver's own contention.
 
-## 23. Each cell tears down its jobs, from an EXIT trap
+**Superseded for Legion by entry 23 (2026-08-05).** Raising the pool moved
+the ceiling (4 → 32 on a 16-vCPU box took it from ~36 to ~103 jobs/sec) but
+never removed it, because the per-job cost is a whole process. This loop is
+now the *fairness baseline* rather than the fast path: it is what Nomad and
+K8s use, and what a cross-system comparison forces Legion back onto.
+
+## 23. Legion gets a native submitter, and that makes cross-system comparison conditional
+
+**The call.** A separate binary, `legion-loadgen`
+(`benchmarks/loadgen/main.rs`, `cargo build --features loadgen`), submits a
+whole workload from one process: a small pool of long-lived gRPC channels
+and hundreds of concurrent `RunJob` calls, no per-job process spawn or
+dial. `driver.py` uses it for the `legion` adapter only. Nomad and K8s keep
+the process-per-job loop, unchanged.
+
+The asymmetry is made explicit rather than hidden. `--submitter` is a
+first-class flag, `cli` forces every system onto the shared loop, and the
+path taken is archived per cell in `metrics.json` and
+`fairness-record.json`:
+
+```bash
+# Legion-vs-Legion sweep (scaling, saturation, eval threads): fast path.
+scripts/run-step.sh --system legion-a --nodes 5000 --scenario web_fleet
+
+# Any Legion-vs-Nomad-vs-K8s table: all three on the shared CLI loop.
+LEGION_SUBMITTER=cli scripts/run-step.sh --system legion-a ...
+```
+
+```json
+{ "throughput_per_sec": 1126.16, "submitter": "native",
+  "submission": { "span_secs": 2.639, "rate_per_sec": 758.24,
+                  "drain_secs": 8.079, "driver_bound": false } }
+```
+
+**Alternatives.** (a) Keep raising `--submit-concurrency` on the CLI loop.
+(b) Generate Python gRPC stubs from `proto/legion.proto` and submit from
+the driver process. (c) Add a batch-submission RPC to Legion itself.
+(d) Give all three systems native submitters at the same time. (e) Make
+the fast path the only path and delete the CLI loop.
+
+**Trade-off.** This is the entry's real cost, and it is a methodological
+one: **a `native` cell is comparable to another Legion cell and to nothing
+else.** The rig now has two submission paths with a 5-7x throughput gap
+between them, and using the fast one for Legion and the slow one for Nomad
+would produce a cross-system table that flatters Legion for reasons that
+have nothing to do with either scheduler. That hazard did not exist while
+one loop fed all three. It is mitigated by making the choice explicit,
+loud, and archived — never by defaulting quietly — and the rule is written
+into `benchmarks/aws/README.md` § Methodology, the driver's module
+docstring, and the submitter's own header, because a rule recorded only in
+a judgement-calls file is a rule nobody reads at 2am.
+
+The secondary cost is a second client of the manager API that is not the
+CLI. It is kept to a minimum: the binary calls the CLI's own
+`connect_manager_client()`, so TLS, `LEGION_ADDR`, and token resolution
+cannot drift from what a user gets, and it links the crate's generated
+client so the proto keeps one source of truth.
+
+**Why (performance — the rig was measuring itself).** `web_fleet` is ~6
+allocations per job, so the CLI loop's ~36-103 jobs/sec ceiling is at most
+~600 alloc/sec of demand — and Legion had already served ≥336 alloc/sec
+with the driver, not Legion, as the constraint. Every such cell reported
+`submission.driver_bound: true`, which is honest but is a floor, not a
+measurement, and small-job performance is precisely Legion's weakest and
+most important case.
+
+Measured on one macOS box (M-series, single manager, `local_disk` store,
+5,001 `web_fleet` jobs), alternating the two paths back to back so both saw
+the same machine:
+
+| | CLI loop (32) | native (128/4) |
+| --- | --- | --- |
+| idle box | 255-260 jobs/sec | 1,107-1,492 jobs/sec |
+| loaded box | 105.0 / 108.3 | 740.5 / 563.8 |
+
+**5-7x, consistently, and the best native point was 1,492 jobs/sec.** The
+end-to-end effect is the one that matters: driving 2,001 jobs at a 600-node
+fleet, submission went from 8.54s to 2.64s (234 → 758 jobs/sec) and the
+placement tail after the last submit went from 2.1s to 8.1s. Both cells
+completed and both reported `driver_bound: false`, but the fourfold drain
+is the scheduler being asked for real work instead of being fed at its own
+pace.
+
+That burst also cost measured placement throughput — 1,329 alloc/sec on the
+paced CLI cell against 1,126 on the native one, about 15% — which is a
+*result*, not a regression in the submitter: it is the plan-apply conflict
+behaviour showing up once submission stops rate-limiting the scheduler for
+us, and it is exactly the effect the rig could not see before.
+
+**Concurrency is measured, not assumed.** The default is 128 in flight over
+4 connections because throughput here is *not* monotonic in concurrency —
+32/643, 64/730, 128/1282, 256/1107, 512/686, 1024/607 jobs/sec on the local
+box. Past a few hundred the surplus requests only queue at the manager's
+control-lane commit. The peak moves with per-request latency, so it sits
+higher on the rig (a commit there is a raft round trip) than on one box;
+128 is near the local peak and still deep enough to hide that round trip.
+Connections matter separately and less: 368 jobs/sec on one connection at
+concurrency 32 against 643 on four, which is HTTP/2's 64 KiB per-connection
+flow-control window.
+
+(a) was already tried and is what the 36→103 jobs/sec drift is: process
+spawn does not get cheaper. (b) puts a second copy of the proto in the
+tree, which is exactly the drift the generated client exists to prevent,
+and leaves submission on Python threads. (c) changes the product to fix
+the harness — a batch RPC has to earn its place on its own merits, not as
+a benchmark accessory. (d) is the right answer for a cross-system phase
+and is now an open TODO item; it is not a reason to keep Legion's own
+scaling curves unmeasurable in the meantime. (e) would delete the only
+thing that makes the three-system table valid.
+
+## 24. Cross-process submit stamps are epoch milliseconds, rebased by an offset the driver supplies
+
+**The call.** `legion-loadgen` stamps each submission in UNIX epoch
+milliseconds and adds a `--clock-offset-ms` the driver passes it, computed
+as `now_ms() - int(time.time() * 1000)` immediately before the child
+starts. The driver reads the resulting rows straight into the recorder;
+`finalize()` still writes `submits.json` in the same shape as always, so
+`replay` and every existing analysis are untouched.
+
+**Alternatives.** (a) Have the submitter write `submits.json` itself and
+let the driver read it verbatim. (b) Read `CLOCK_MONOTONIC` directly in
+both processes via `libc`. (c) Have the driver stamp the submissions
+instead, by streaming progress back from the child. (d) Use epoch
+timestamps for placements too, and drop the monotonic clock entirely.
+
+**Trade-off.** A wall-clock *step* (an NTP correction, not a slew) between
+the offset sample and the end of a cell would skew that cell's latencies —
+a failure mode the pure-monotonic CLI path does not have. Accepted because
+the rig's hosts slew, a cell is minutes long, and the smoke test asserts
+the resulting percentiles are plausible, which catches a mis-signed or
+un-applied offset immediately (a raw epoch stamp shows up as a latency
+about 55 years wide).
+
+**Why (entry 5's rule, kept across a process boundary).** Entry 5 makes
+every timestamp a driver-side reading on one clock, and that is what makes
+a submit→placed latency mean anything. A second process cannot join that
+clock: `time.monotonic()` and Rust's `Instant` are both deliberately
+epoch-less, so there is no portable way to hand one process's monotonic
+reading to another. Epoch time is the only clock two processes can name the
+same instant on, so the offset is the bridge. (a) reads cleaner but leaves
+the two files on different clocks unless the same arithmetic happens
+anyway. (b) is not the same clock on every platform — CPython uses
+`mach_absolute_time` on macOS while `CLOCK_MONOTONIC` there counts sleep
+— so it would work on the rig and quietly lie on a developer's laptop.
+(c) puts a pipe and the driver's GIL back in the measured path, which is
+what the submitter exists to remove. (d) would expose *every* cell,
+including the CLI ones, to clock steps to fix a problem only one path has.
+
+## 25. Each cell tears down its jobs, from an EXIT trap
 
 **The call.** `run-step.sh` stops then destroys every job after
 `collect.sh`, via `trap cleanup_jobs EXIT`.
@@ -599,7 +750,7 @@ allocations, and emitted no placement events — so the cell reported zero
 placements and looked for all the world like a broken event stream. Two
 runs were spent blaming the watcher.
 
-## 24. Cadence evidence is archived per cell, over the cell's own window
+## 26. Cadence evidence is archived per cell, over the cell's own window
 
 **The call.** `collect.sh` snapshots `legion_heartbeat_freshness_ratio`,
 `legion_liveness_tracked_nodes` and
@@ -624,7 +775,7 @@ archived `liveness_tracked_nodes` peaking at 4000 and a freshness ratio
 dipping to 0.009, neither of which happened during the cell. Evidence that
 cannot be attributed to a cell cannot certify it.
 
-## 25. Heartbeat cadence stays at the default; adaptive cadence is not measured
+## 27. Heartbeat cadence stays at the default; adaptive cadence is not measured
 
 **The call.** The rig's `manager-a.ncl.tpl` sets no `heartbeat` block, so
 `targetRatePerSecond` stays unset, nothing adapts, and every worker holds
@@ -644,13 +795,13 @@ run their defaults too; `targetRatePerSecond` is a Legion-only knob with
 no counterpart in either. It would also serve a *varying* interval, which
 silently invalidates `packing-density.sh`'s achieved-cadence arithmetic
 (it divides by a fixed 2s) and makes "heartbeat cost at 10k nodes"
-incomparable across cells. With entry 24's evidence in every cell, a
+incomparable across cells. With entry 26's evidence in every cell, a
 cadence shortfall at 5k or 10k becomes a recorded finding rather than a
 contaminated number — which is the outcome the plan wants from a first
 campaign. (a) remains the right thing to measure in a follow-up whose
 stated subject is the cadence ladder itself.
 
-## 26. "Stopped converging" is a stall, not a wall-clock deadline
+## 28. "Stopped converging" is a stall, not a wall-clock deadline
 
 - **The call:** the driver ends a cell on a **stall timeout** — no
   placement at all for 120s — with the old fixed `--settle-timeout-secs`
@@ -677,7 +828,7 @@ stated subject is the cadence ladder itself.
   is a scheduler result, one that hit the cap is a rig result, and
   `complete: false` alone cannot tell a reader which they are holding.
 
-## 27. A second scenario for saturation, rather than pushing web_fleet harder
+## 29. A second scenario for saturation, rather than pushing web_fleet harder
 
 - **The call:** added `benchmarks/scheduler/scenarios/dense_fleet.json` —
   web_fleet's node profiles unchanged, but ~44 allocations per job
@@ -703,7 +854,7 @@ stated subject is the cadence ladder itself.
   pool is also precisely the shape `decouple_plan_components` used to
   collapse, so the scenario earns its place twice.
 
-## 28. `evalThreads` is rendered per campaign, and refused elsewhere
+## 30. `evalThreads` is rendered per campaign, and refused elsewhere
 
 - **The call:** `run-campaign.sh --eval-threads N` exports
   `LEGION_EVAL_THREADS`, which `install-legion-a.sh` renders into
@@ -723,9 +874,9 @@ stated subject is the cadence ladder itself.
   dropped flag produces a cell archived as a 16-thread result whose
   rendered config — the fairness record — says 4. A run that fails loudly
   is strictly better than a number that lies quietly, which is the same
-  principle as entry 24.
+  principle as entry 26.
 
-## 29. The operator box's toolchain is baked into an AMI, and a stale image is refused rather than reused
+## 31. The operator box's toolchain is baked into an AMI, and a stale image is refused rather than reused
 
 - **The call:** `scripts/bake-operator-ami.sh` runs the toolchain install
   once on a throwaway instance and snapshots it into an AMI tagged
