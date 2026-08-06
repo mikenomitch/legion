@@ -88,18 +88,32 @@ scheduling concurrent with the loss processing itself. (For scale:
 Kubernetes' default eviction rate limit is 0.1 nodes/sec, so a loss this
 size takes hours to evict at defaults before rescheduling begins.)
 
-*And a placement-quality bug, found by the drill:* `web_fleet` declares
-`spread`, yet ~96% of the workload sat on the killed one-of-four slice —
-the drill's expectation query counted 25,002 allocations on `sim-0-%`
-nodes, and 23,935 of them died with the instance. Under spread on a
-uniformly empty fleet, placement concentrated on the first-registered
-nodes; the likely mechanism is band-granular spread scoring (large,
-mostly-empty nodes share a score band, and the in-band tie-break follows
-scan order, so the fleet fills in name order until a band boundary moves).
-This defeats failure-domain spreading — it is exactly what turned one
-instance loss into a 96% workload loss. Silver lining: the drill therefore
-measured a WORST-CASE loss, and the 86 s / 6 ms numbers held. Filed as
-open work; placement scoring is not a night-refactor.
+*And a placement-availability bug, found by the drill and then localized:* `web_fleet` declares
+`spread`, yet ALL 25,002 allocations sat on the killed one-of-four slice,
+and their replacements packed the NEXT slice (24,012 on `sim-1-` after the
+drill, with slices 2 and 3 available and empty). The investigation
+eliminated, in order: slice naming (clean, 4x1,250), availability rows
+(correct), class distribution (uniform 1,042 web + 208 util per slice),
+node pools (all `default`), the head-jitter tie-break (uniform in code and
+in tests), available-nodes cache staleness on registration (invalidation
+verified on both the direct and the projection path), and the
+capture->apply->projection path itself (a single-voter raft repro at 100
+and at 300 nodes spreads perfectly; `tests/spread_under_raft.rs` pins it).
+
+What localized it: `plan_submission` rows from the replacement window carry
+their candidate lists, and every candidate in every sampled plan is
+`sim-1-*` — the PLANNER'S ELIGIBLE SET was one slice, before scoring or
+binding. Confirming detail: nodes filled to exactly their `maxAllocations`
+cap (32/node) before spilling — cap-fill is what placement into an
+artificially tiny universe looks like — and even `util`-class jobs landed
+only on slice 1, so the truncation is class-independent. The read model's
+node universe under rig-scale registration (worker-registration RPC at
+250/s x 4 instances, 5,000 nodes) holds one slice at a time; no local
+harness up to 300 nodes reproduces it. This is the top open item: it
+defeats failure-domain spreading (one instance loss took 96% of the
+workload) and it caps effective fleet utilization at one slice per epoch
+of whatever refresh is failing. Silver lining: the storm drill therefore
+measured a WORST-CASE loss, and the 86 s / 6 ms numbers held.
 
 ## Corrections from tonight's own analysis
 
@@ -130,11 +144,11 @@ open work; placement scoring is not a night-refactor.
 
 ## Open, in priority order
 
-1. **Spread placement concentrates on a uniformly empty fleet** — see the
-   storm section. Verify the banding hypothesis against
-   `ranked_candidate_list`'s scoring, then either widen the band
-   resolution or randomize the in-band tie-break the way the fallback
-   tail already is.
+1. **The planner's node universe truncates to one slice at rig scale** —
+   see the storm section for the full elimination record. Next probe: a
+   fleet-scale repro with worker-registration RPCs (not `insert_node`) at
+   the sim's register rate, and read-model introspection (expose the
+   read model's node count as a gauge next to `legion_nodes`).
 2. **The fast native submitter** — the gate on every further measurement.
 2. **Re-run the fill ladder behind it** — the slope (1.6×/doubling through
    #193) is untested on this branch because every deep point is a floor.
