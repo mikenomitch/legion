@@ -88,14 +88,18 @@ scheduling concurrent with the loss processing itself. (For scale:
 Kubernetes' default eviction rate limit is 0.1 nodes/sec, so a loss this
 size takes hours to evict at defaults before rescheduling begins.)
 
-*Open question, recorded rather than glossed:* `replaced_total` of 23,935
-is ~96% of the resident workload, far more than the ~25% a one-of-four
-instance slice should carry, and the drill's expectation query
-(`node_id LIKE 'sim-0-%'`) counted all 25,002 — the slice naming does not
-partition the fleet the way the drill assumes. Either placement
-concentrated on the killed instance's nodes or the fault hit more than one
-slice's processes. The throughput and gap numbers stand on their own; the
-attribution needs the drill's naming fixed before the next run.
+*And a placement-quality bug, found by the drill:* `web_fleet` declares
+`spread`, yet ~96% of the workload sat on the killed one-of-four slice —
+the drill's expectation query counted 25,002 allocations on `sim-0-%`
+nodes, and 23,935 of them died with the instance. Under spread on a
+uniformly empty fleet, placement concentrated on the first-registered
+nodes; the likely mechanism is band-granular spread scoring (large,
+mostly-empty nodes share a score band, and the in-band tie-break follows
+scan order, so the fleet fills in name order until a band boundary moves).
+This defeats failure-domain spreading — it is exactly what turned one
+instance loss into a 96% workload loss. Silver lining: the drill therefore
+measured a WORST-CASE loss, and the 86 s / 6 ms numbers held. Filed as
+open work; placement scoring is not a night-refactor.
 
 ## Corrections from tonight's own analysis
 
@@ -126,7 +130,12 @@ attribution needs the drill's naming fixed before the next run.
 
 ## Open, in priority order
 
-1. **The fast native submitter** — the gate on every further measurement.
+1. **Spread placement concentrates on a uniformly empty fleet** — see the
+   storm section. Verify the banding hypothesis against
+   `ranked_candidate_list`'s scoring, then either widen the band
+   resolution or randomize the in-band tie-break the way the fallback
+   tail already is.
+2. **The fast native submitter** — the gate on every further measurement.
 2. **Re-run the fill ladder behind it** — the slope (1.6×/doubling through
    #193) is untested on this branch because every deep point is a floor.
 4. **The eval-thread knee above 32** — same gate.

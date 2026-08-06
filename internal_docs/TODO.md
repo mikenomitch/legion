@@ -15,6 +15,15 @@ How to use it:
 
 ---
 
+- [ ] **Spread placement concentrates on a uniformly empty fleet.** The
+      2026-08-06 storm drill found ~96% of a 25k-allocation `spread`
+      workload on the first-registered quarter of a 5,000-node fleet — one
+      instance loss took 23,935 allocations with it. Likely band-granular
+      scoring with a scan-order tie-break inside the band. Verify against
+      `ranked_candidate_list`, then widen band resolution or randomize the
+      in-band tie-break (the fallback tail already is). Findings:
+      [aws-phase5-findings.md](aws-phase5-findings.md).
+
 ## In flight (open PRs)
 
 | PR | What it lands | Notes |
