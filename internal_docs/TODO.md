@@ -30,6 +30,24 @@ How to use it:
       `legion_nodes` so this is visible in one query. Findings:
       [aws-phase5-findings.md](aws-phase5-findings.md).
 
+- [x] **Batch the control-lane job submit** (the "fuse the five control-lane
+      rounds" item, right-sized). The two `clear_*` rounds were already
+      empty changesets; what remained was one `handle_job_submit` commit
+      (and `synchronous=FULL` fsync) per job. Now group-committed with
+      versions derived through the batch transaction, which also fixes the
+      code's own commented version race for concurrent submits. Measured
+      locally: per-job quorum rounds ~3.0 -> ~1.5, unit-eval throughput at
+      the knee 419.6 -> 476/s. Remaining singles at ~0.5/job are
+      arrival-gaps, not a defect.
+- [ ] **JSONB columns carry NUMERIC affinity, so every JSON write parses as
+      a number first.** SQLite's affinity rules give `JSONB` (no TEXT/BLOB
+      substring) NUMERIC affinity; a sampled manager showed ~4-5% of CPU in
+      `sqlite3AtoF`/`applyNumericAffinity` trying to parse whole JSON blobs
+      as numbers on every insert/compare of `resources`, `constraints`,
+      `meta`, etc. Harmless semantically, pure waste. Fix is a column-type
+      migration (TEXT affinity) across the JSON columns - churny, so it
+      wants its own change with before/after profiles.
+
 ## In flight (open PRs)
 
 | PR | What it lands | Notes |

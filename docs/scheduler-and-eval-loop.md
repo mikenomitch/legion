@@ -294,6 +294,18 @@ Whether batching is actually engaging is visible in
 ([metrics.md](metrics.md)). Serial submitters never overlap, so a
 `for` loop over jobspecs will sit at 1 and there is nothing to tune.
 
+The control-lane half batches too: concurrent `RunJob`s coalesce into one
+`handle_job_submits` commit, each request inside its own savepoint so a
+failing submit rolls back alone. What makes this safe is that version
+derivation reads *through the batch transaction*: two submits of the same
+job in one batch derive successive versions (N+1 then N+2) because the
+second sees the first's in-transaction write — the same property that fixes
+the long-standing version race for concurrent single submits. A
+`NotRaftLeader` rejection re-runs each request singly with the typed error
+each caller's standing-split handling expects. With all three halves
+batched, a 32-wide submit burst costs roughly 1.5 quorum rounds per job
+where it once cost 3.
+
 ### Observing where plan time goes
 
 Every `plan_and_apply` records a per-phase wall-clock breakdown
