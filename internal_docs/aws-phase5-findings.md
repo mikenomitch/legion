@@ -24,6 +24,19 @@ scenario included. Since the dense scenario was built specifically to outrun
 the submitter, the rig is now the floor everywhere, and the fast native
 submitter (in progress) is the only way to see the ceiling again.
 
+### What the truncation bug means for every number in this file
+
+Every binary measured in phases 2–5 carried the same read-model truncation,
+so the A/B comparisons in this document stand — both sides packed the same
+artificially small universe. But the absolute framing "at 5,000 nodes"
+overstates the placement universe: the planner effectively worked ~1,250
+nodes, so per-node fill ran ~4x the nominal figure (the 200k-allocation
+cells were ~160 allocations/node, not 40), and anything O(rows-per-node) —
+the free-pool fingerprint, reprojection before its memo — was amplified
+accordingly. Fixing the truncation may therefore flatten the measured fill
+slope on its own. Re-measure after the fix before attributing the slope to
+anything else.
+
 ## What this branch changed, with the evidence for each
 
 1. **Worker dispatch left the eval's critical path** (`3be4c68`). The eval
