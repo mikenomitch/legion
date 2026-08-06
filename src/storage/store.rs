@@ -1286,7 +1286,57 @@ impl Store {
             store.persistence_driver.clone().start_engine(&store)?;
         }
 
+        Store::spawn_wal_checkpointer(&db_path);
+
         Ok(store)
+    }
+
+    /// Checkpoint the WAL from a dedicated connection, off the write path.
+    ///
+    /// With autocheckpointing alone, whichever writer crossed the page
+    /// threshold paid the whole checkpoint inline — inside the serialized
+    /// plan-apply commit, where a sample profile showed the batch body
+    /// dominated by pwrite. PASSIVE checkpoints never block writers or
+    /// readers; they simply move as many WAL frames into the main database
+    /// as they can without contention, and the raised `wal_autocheckpoint`
+    /// threshold in `configure_connection` still bounds the WAL if this
+    /// thread ever stalls.
+    ///
+    /// The thread holds only its own connection and a path, so it never
+    /// keeps a `Store` alive; it exits when the checkpoint connection
+    /// errors hard (e.g. the file is gone after a test teardown).
+    fn spawn_wal_checkpointer(db_path: &Path) {
+        let path = db_path.to_path_buf();
+        std::thread::Builder::new()
+            .name("wal-checkpoint".into())
+            .spawn(move || {
+                let conn = match Connection::open(&path) {
+                    Ok(conn) => conn,
+                    Err(_) => return,
+                };
+                let mut consecutive_failures = 0u32;
+                loop {
+                    std::thread::sleep(std::time::Duration::from_millis(1000));
+                    match conn.query_row(
+                        "PRAGMA wal_checkpoint(PASSIVE);",
+                        [],
+                        // (busy, log_frames, checkpointed_frames)
+                        |row| row.get::<_, i64>(0),
+                    ) {
+                        Ok(_) => consecutive_failures = 0,
+                        Err(_) => {
+                            consecutive_failures += 1;
+                            // A store that has been torn down (tests, or a
+                            // wiped data dir) errors forever; stop rather
+                            // than spin on a dead file.
+                            if consecutive_failures > 30 {
+                                return;
+                            }
+                        }
+                    }
+                }
+            })
+            .ok();
     }
 
     /// Clone handed to the raft engine (state machines, pipeline threads):
@@ -1696,6 +1746,23 @@ impl Store {
 
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.pragma_update(None, "cache_size", SQLITE_CACHE_SIZE_KIB)?;
+        // The default cache holds 16 statements; the plan-apply walk alone
+        // cycles through more than that, so hot statements were being
+        // evicted and re-parsed. Sized to hold every statement the manager
+        // uses steadily, with room to spare — a cached statement is a few KiB.
+        conn.set_prepared_statement_cache_capacity(128);
+
+        if !read_only {
+            // WAL checkpointing is moved OFF the commit path: with the
+            // default (1000 pages), whichever writer crossed the threshold
+            // paid the whole checkpoint inline, inside the serialized
+            // plan-apply commit — a sample profile showed the batch body
+            // dominated by pwrite. A background thread checkpoints
+            // passively every second (see `spawn_wal_checkpointer`); this
+            // raised threshold only backstops it if that thread stalls, so
+            // the WAL stays bounded either way.
+            conn.pragma_update(None, "wal_autocheckpoint", 4000)?;
+        }
 
         Ok(())
     }
@@ -3435,20 +3502,25 @@ impl Store {
     }
 
     fn ensure_scope_epoch_tx(&self, tx: &Connection, scope_type: &str, scope_id: &str) -> R<()> {
-        tx.execute(
+        // prepare_cached throughout this file's hot paths: the plan-apply
+        // walk runs these statements hundreds of times per batch, and a
+        // sample profile of the batch body showed ~15% of its time inside
+        // SQLite's PARSER (sqlite3RunParser/yy_reduce) — rusqlite's
+        // `Connection::execute`/`query_row` re-parse on every call, and only
+        // `prepare_cached` hits the statement cache.
+        let mut stmt = tx.prepare_cached(
             "INSERT OR IGNORE INTO allocation_epoch_partition(scope_type, scope_id, epoch) VALUES (?1, ?2, 0);",
-            params![scope_type, scope_id],
         )?;
+        stmt.execute(params![scope_type, scope_id])?;
         Ok(())
     }
 
     fn scope_epoch_tx(&self, tx: &Connection, scope_type: &str, scope_id: &str) -> R<i64> {
         self.ensure_scope_epoch_tx(tx, scope_type, scope_id)?;
-        let epoch = tx.query_row(
+        let mut stmt = tx.prepare_cached(
             "SELECT epoch FROM allocation_epoch_partition WHERE scope_type = ?1 AND scope_id = ?2;",
-            params![scope_type, scope_id],
-            |row| row.get(0),
         )?;
+        let epoch = stmt.query_row(params![scope_type, scope_id], |row| row.get(0))?;
         Ok(epoch)
     }
 
@@ -4578,7 +4650,8 @@ impl Store {
                     Entry::Occupied(entry) => entry.into_mut(),
                     Entry::Vacant(entry) => {
                         let row = tx
-                            .query_row(&node_row_sql, [node_id], |row| self.node_from_row(row))
+                            .prepare_cached(&node_row_sql)?
+                            .query_row([node_id], |row| self.node_from_row(row))
                             .optional()?;
                         entry.insert(row)
                     }
@@ -10604,8 +10677,9 @@ impl Store {
         }
 
         let mut used: HashSet<u16> = HashSet::new();
-        let mut stmt = tx
-            .prepare("SELECT network FROM allocation WHERE node_id = ? AND network IS NOT NULL;")?;
+        let mut stmt = tx.prepare_cached(
+            "SELECT network FROM allocation WHERE node_id = ? AND network IS NOT NULL;",
+        )?;
         let rows = stmt.query_map([node_id], |row| row.get::<_, Option<String>>(0))?;
         for row in rows {
             let Some(raw) = row? else { continue };
@@ -10675,9 +10749,9 @@ impl Store {
             ":created_at_unix": OffsetDateTime::now_utc().unix_timestamp(),
         };
 
-        let allocation = tx.query_row(&INSERT_ALLOCATION, params, |row| {
-            self.allocation_from_row(row)
-        })?;
+        let allocation = tx
+            .prepare_cached(&INSERT_ALLOCATION)?
+            .query_row(params, |row| self.allocation_from_row(row))?;
 
         if let Some(instance_id) = allocation.instance_id.as_deref() {
             let now = Self::now_rfc3339()?;
@@ -10718,10 +10792,11 @@ impl Store {
             String,
             i64,
             Option<String>,
-        ) = tx.query_row(
-            "SELECT job_id, group_name, name, count, stateful FROM task_config WHERE id = ?;",
-            [task_id],
-            |row| {
+        ) = tx
+            .prepare_cached(
+                "SELECT job_id, group_name, name, count, stateful FROM task_config WHERE id = ?;",
+            )?
+            .query_row([task_id], |row| {
                 Ok((
                     row.get(0)?,
                     row.get(1)?,
@@ -10729,8 +10804,7 @@ impl Store {
                     row.get(3)?,
                     row.get(4)?,
                 ))
-            },
-        )?;
+            })?;
 
         let Some(stateful) = stateful else {
             return Ok(None);
@@ -21364,7 +21438,8 @@ mod tests {
                 drop(conn);
                 // Rotate the node range so successive rounds spread over the
                 // fleet the way a live scheduler would.
-                let base = (round * 61 + plan * PLACEMENTS_PER_PLAN) % (NODES - PLACEMENTS_PER_PLAN);
+                let base =
+                    (round * 61 + plan * PLACEMENTS_PER_PLAN) % (NODES - PLACEMENTS_PER_PLAN);
                 let nodes: HashSet<String> = (0..PLACEMENTS_PER_PLAN)
                     .map(|slot| format!("bench-node-{}", base + slot))
                     .collect();
