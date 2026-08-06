@@ -20750,6 +20750,277 @@ mod tests {
         Ok(())
     }
 
+    /// Hotspot loop for the batch body: one 40-allocs/node store, thirty
+    /// 10-plan batches over rotating node ranges, no capture. Exists to be
+    /// sample-profiled (`sample <pid>` on macOS, `perf` on Linux) — the
+    /// commit-split bench says WHERE the commit's time is (the body, not
+    /// the diff or the changeset apply); this says what the body spends it
+    /// on.
+    ///
+    /// ```bash
+    /// cargo test --release --lib bench_plan_body_hotspot_loop -- --ignored --nocapture &
+    /// sample legion 5 -file /tmp/body.sample.txt   # while it runs
+    /// ```
+    #[test]
+    #[ignore = "profiling harness; run with --release --ignored --nocapture"]
+    fn bench_plan_body_hotspot_loop() -> R<()> {
+        const NODES: usize = 1000;
+        const PLANS: usize = 10;
+        const PLACEMENTS_PER_PLAN: usize = 44;
+        const ROUNDS: usize = 200;
+
+        let store = setup_store()?;
+        let conn = store.write_connection()?;
+        conn.execute(
+            "INSERT INTO job (id, name, status, created_at) \
+             VALUES ('filler', 'filler', 'running', '2026-01-01T00:00:00Z');",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO job_config (id, name, type, meta, version, created_at, job_id) \
+             VALUES ('filler-cfg', 'filler', 'service', '{}', 1, '2026-01-01T00:00:00Z', 'filler');",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO task_config (id, count, name, runtime, config, resources, constraints, job_id, job_config_id) \
+             VALUES (1, 1, 'filler-task', 'noop', '{}', '{\"cpu\": 10, \"memory\": 8}', '{}', 'filler', 'filler-cfg');",
+            [],
+        )?;
+        drop(conn);
+        for node in 0..NODES {
+            store.insert_node(usage_node_msg(&format!("bench-node-{node}"), "{}"))?;
+        }
+        let conn = store.write_connection()?;
+        let mut alloc_id = 0i64;
+        for node in 0..NODES {
+            for _ in 0..40 {
+                alloc_id += 1;
+                conn.execute(
+                    "INSERT INTO allocation (id, status, resources, node_id, job_config_id, task_config_id) \
+                     VALUES (?1, 'running', '{\"cpu\": 10, \"memory\": 8}', ?2, 'filler-cfg', 1);",
+                    params![alloc_id, format!("bench-node-{node}")],
+                )?;
+            }
+        }
+        drop(conn);
+
+        // Streamed (not captured) so an external profiler can key off it:
+        // everything before this line is store construction, not the body.
+        eprintln!("LOOP START");
+        let mut total = std::time::Duration::ZERO;
+        for round in 0..ROUNDS {
+            let mut batch = Vec::with_capacity(PLANS);
+            for plan in 0..PLANS {
+                let job_id = format!("bench-job-{round}-{plan}");
+                let config_id = format!("bench-cfg-{round}-{plan}");
+                let task_id = 1000 + (round * PLANS + plan) as i64;
+                let conn = store.write_connection()?;
+                conn.execute(
+                    "INSERT INTO job (id, name, status, created_at) VALUES (?1, ?1, 'running', '2026-01-01T00:00:00Z');",
+                    [&job_id],
+                )?;
+                conn.execute(
+                    "INSERT INTO job_config (id, name, type, meta, version, created_at, job_id) \
+                     VALUES (?1, ?2, 'service', '{}', 1, '2026-01-01T00:00:00Z', ?2);",
+                    params![config_id, job_id],
+                )?;
+                conn.execute(
+                    "INSERT INTO task_config (id, count, name, runtime, config, resources, constraints, job_id, job_config_id) \
+                     VALUES (?1, ?2, 'bench-task', 'noop', '{}', '{\"cpu\": 10, \"memory\": 8}', '{}', ?3, ?4);",
+                    params![task_id, PLACEMENTS_PER_PLAN as i64, job_id, config_id],
+                )?;
+                drop(conn);
+                // Rotate the node range so successive rounds spread over the
+                // fleet the way a live scheduler would.
+                let base = (round * 61 + plan * PLACEMENTS_PER_PLAN) % (NODES - PLACEMENTS_PER_PLAN);
+                let nodes: HashSet<String> = (0..PLACEMENTS_PER_PLAN)
+                    .map(|slot| format!("bench-node-{}", base + slot))
+                    .collect();
+                let expected_versions = store.allocation_version_vector(&config_id, &nodes)?;
+                let placements: Vec<PlanSubmissionPlacement> = nodes
+                    .iter()
+                    .map(|node| PlanSubmissionPlacement {
+                        task_id,
+                        candidates: vec![node.clone()],
+                    })
+                    .collect();
+                batch.push(PlanApplyRequest {
+                    job_config_id: config_id,
+                    mode: "submit".into(),
+                    placements: PlanPlacements::Candidates(placements),
+                    expected_versions,
+                    evictions: Vec::new(),
+                    target_instance: String::new(),
+                });
+            }
+            let started = Instant::now();
+            let results = store.run_plan_batch_txn(&batch)?;
+            total += started.elapsed();
+            for result in &results {
+                assert!(result.is_ok(), "hotspot loop rejected a plan: {result:?}");
+            }
+        }
+        println!(
+            "hotspot loop: {ROUNDS} batches, body mean {:?}",
+            total / ROUNDS as u32
+        );
+        Ok(())
+    }
+
+    /// Split the serialized plan-apply commit into its three parts, at two
+    /// cluster fills: executing the batch body, capturing it (execute +
+    /// session diff + rollback), and applying the captured changeset — the
+    /// last being what the leader AND every follower pay per commit.
+    ///
+    /// Why this exists: the AWS ladder measured the group commit at 108.7 ms
+    /// with 50k live allocations and 285 ms at 200k (batch ~9.6), while the
+    /// quorum round itself stayed under 8 ms — so whatever grows with fill
+    /// is in the local SQLite work this bench isolates. Three store-path
+    /// fixes each flattened their own cost and the ladder's ~1.6x-per-
+    /// doubling slope never moved; this is the instrument for finding the
+    /// term that does move it.
+    ///
+    /// ```bash
+    /// cargo test --release --lib bench_plan_batch_commit_split -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "benchmark; run with --release --ignored --nocapture"]
+    fn bench_plan_batch_commit_split() -> R<()> {
+        use crate::storage::raft::capture::{apply_changeset, capture_mutation};
+
+        const NODES: usize = 1000;
+        const PLANS: usize = 10;
+        const PLACEMENTS_PER_PLAN: usize = 44;
+
+        // Arms mutate the store (a committed body, an applied changeset), so
+        // each arm gets its own identically-built store: same fill, no
+        // contamination between measurements.
+        let build = |per_node: usize| -> R<(Store, Vec<PlanApplyRequest>)> {
+            let store = setup_store()?;
+            let conn = store.write_connection()?;
+            // Filler load: what the cluster is already running.
+            conn.execute(
+                "INSERT INTO job (id, name, status, created_at) \
+                 VALUES ('filler', 'filler', 'running', '2026-01-01T00:00:00Z');",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO job_config (id, name, type, meta, version, created_at, job_id) \
+                 VALUES ('filler-cfg', 'filler', 'service', '{}', 1, '2026-01-01T00:00:00Z', 'filler');",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO task_config (id, count, name, runtime, config, resources, constraints, job_id, job_config_id) \
+                 VALUES (1, 1, 'filler-task', 'noop', '{}', '{\"cpu\": 10, \"memory\": 8}', '{}', 'filler', 'filler-cfg');",
+                [],
+            )?;
+            drop(conn);
+
+            for node in 0..NODES {
+                store.insert_node(usage_node_msg(&format!("bench-node-{node}"), "{}"))?;
+            }
+            let conn = store.write_connection()?;
+            let mut alloc_id = 0i64;
+            for node in 0..NODES {
+                for _ in 0..per_node {
+                    alloc_id += 1;
+                    conn.execute(
+                        "INSERT INTO allocation (id, status, resources, node_id, job_config_id, task_config_id) \
+                         VALUES (?1, 'running', '{\"cpu\": 10, \"memory\": 8}', ?2, 'filler-cfg', 1);",
+                        params![alloc_id, format!("bench-node-{node}")],
+                    )?;
+                }
+            }
+            drop(conn);
+
+            // The batch under test: PLANS fresh submits, dense_fleet-shaped
+            // (single-candidate placements on disjoint nodes, so every
+            // placement binds first choice and no fallback walking muddies
+            // the timing).
+            let mut batch = Vec::with_capacity(PLANS);
+            for plan in 0..PLANS {
+                let job_id = format!("bench-job-{plan}");
+                let config_id = format!("bench-cfg-{plan}");
+                let task_id = 1000 + plan as i64;
+                let conn = store.write_connection()?;
+                conn.execute(
+                    "INSERT INTO job (id, name, status, created_at) VALUES (?1, ?1, 'running', '2026-01-01T00:00:00Z');",
+                    [&job_id],
+                )?;
+                conn.execute(
+                    "INSERT INTO job_config (id, name, type, meta, version, created_at, job_id) \
+                     VALUES (?1, ?2, 'service', '{}', 1, '2026-01-01T00:00:00Z', ?2);",
+                    params![config_id, job_id],
+                )?;
+                conn.execute(
+                    "INSERT INTO task_config (id, count, name, runtime, config, resources, constraints, job_id, job_config_id) \
+                     VALUES (?1, ?2, 'bench-task', 'noop', '{}', '{\"cpu\": 10, \"memory\": 8}', '{}', ?3, ?4);",
+                    params![task_id, PLACEMENTS_PER_PLAN as i64, job_id, config_id],
+                )?;
+                drop(conn);
+
+                let nodes: HashSet<String> = (0..PLACEMENTS_PER_PLAN)
+                    .map(|slot| format!("bench-node-{}", plan * PLACEMENTS_PER_PLAN + slot))
+                    .collect();
+                let expected_versions = store.allocation_version_vector(&config_id, &nodes)?;
+                let placements: Vec<PlanSubmissionPlacement> = nodes
+                    .iter()
+                    .map(|node| PlanSubmissionPlacement {
+                        task_id,
+                        candidates: vec![node.clone()],
+                    })
+                    .collect();
+                batch.push(PlanApplyRequest {
+                    job_config_id: config_id,
+                    mode: "submit".into(),
+                    placements: PlanPlacements::Candidates(placements),
+                    expected_versions,
+                    evictions: Vec::new(),
+                    target_instance: String::new(),
+                });
+            }
+            Ok((store, batch))
+        };
+
+        for per_node in [10usize, 40] {
+            // Arm 1: the batch body alone, committed for real.
+            let (store, batch) = build(per_node)?;
+            let started = Instant::now();
+            let results = store.run_plan_batch_txn(&batch)?;
+            let body = started.elapsed();
+            for result in &results {
+                assert!(result.is_ok(), "body arm rejected a plan: {result:?}");
+            }
+
+            // Arm 2: the same body under capture (execute + diff + rollback),
+            // then the changeset applied — leader-side cost is capture +
+            // apply + the ~4-8 ms quorum round the rig measures separately.
+            let (store, batch) = build(per_node)?;
+            let started = Instant::now();
+            let ((), changeset) = capture_mutation(&store, Lane::Scheduler, |s| {
+                for result in s.run_plan_batch_txn(&batch)? {
+                    result?;
+                }
+                Ok(())
+            })?;
+            let capture = started.elapsed();
+
+            let started = Instant::now();
+            apply_changeset(&store, &changeset)?;
+            let apply = started.elapsed();
+
+            println!(
+                "commit split @ {per_node} allocs/node ({} live rows): \
+                 body {body:?}, capture {capture:?} (diff+rollback {:?}), \
+                 changeset apply {apply:?}, changeset {} KiB",
+                NODES * per_node,
+                capture.saturating_sub(body),
+                changeset.len() / 1024,
+            );
+        }
+        Ok(())
+    }
+
     /// Wall-clock A/B for the read-model reprojection, at two cluster
     /// fills — the in-memory sibling of `bench_local_free_pool_rebuild_by_fill`.
     ///
