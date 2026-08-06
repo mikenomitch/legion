@@ -86,6 +86,20 @@ rules a cause in or out, and which knob to turn — is in
   cordon, or — for an edge-boot ratification only — an epoch conflict).
   The outcomes are mutually exclusive — see
   [late-binding-plan-apply.md](late-binding-plan-apply.md).
+- **`legion_eval_claim_total{outcome}`** (counter) — eval claim attempts by
+  an eval worker: `claimed` found work, `empty` did not. Every attempt is a
+  scheduler-lane quorum round either way, so the `empty` share is the cost of
+  waking a worker for work that does not exist. A large share means the pool
+  is being over-woken; a saturated 5,000-node cluster runs at roughly 0.3
+  empty claims per second. Claims carried over by the fused
+  complete-and-claim round are not counted — they were already paid for.
+  A claim takes a *batch* (see
+  [scheduler-and-eval-loop.md](scheduler-and-eval-loop.md#batching)), so
+  `claimed` counts rounds that found work rather than evals. Dividing
+  `legion_evals_processed_total` by it gives evals per claim round — the
+  direct measure of how much batching is engaging. A ratio pinned at 1 on a
+  busy cluster means the queue never gets deeper than `evalThreads`, so the
+  bottleneck is upstream of the eval loop.
 - **`legion_scheduler_plan_candidate_rank`** (histogram) — candidate rank
   each applied placement bound at (0 = the planner's first choice; higher
   ranks mean the apply walk absorbed a race by falling back).
@@ -249,6 +263,31 @@ mysteriously slow".
 - **`legion_store_write_lock_wait_seconds`** (histogram) — time spent
   waiting to acquire the store's SQLite write-connection lock. Sustained high
   buckets indicate write contention on the state store.
+- **`legion_store_read_lock_wait_seconds`** (histogram) — time spent waiting
+  for one of the store's read-only SQLite connections. A reader takes any free
+  connection before queueing on a busy one, so a read that found one
+  immediately is recorded as 0. That makes the ratio of the `le="0"` bucket to
+  `_count` the useful reading: it is how often the pool was saturated, not how
+  long a query took. Demand here is heartbeat-driven, so it scales with
+  **fleet size** rather than with eval throughput. A rising tail lands inside
+  whichever scheduler plan phase happened to be running, historically
+  `task_fetch`, so read it alongside `legion_scheduler_plan_phase_seconds`. If
+  it stays high on a well-sized pool, the fix is to issue fewer reads rather
+  than to hold more connections.
+
+  **How the pool is sized.** `evalThreads + 4`, capped at 16 connections. The
+  eval workers are the manager's concurrent readers; the `+ 4` covers the
+  readers that do not come from that pool — worker heartbeats, the read-only
+  gRPC and UI surface, the metrics scrape, and the background reconcilers.
+  There is no separate knob, and raising `evalThreads` therefore widens the
+  pool too. The cap is a **memory** budget rather than a contention one: each
+  connection carries its own SQLite page cache capped at 64 MiB, and those
+  caches do not share, so 16 connections is a 1 GiB ceiling. The cap is only
+  approached by a cluster whose working set is actually that large — SQLite
+  fills the cache lazily. The pool used to be sized from the host's core
+  count; it is not, because these reads are latency-bound rather than
+  CPU-bound and a page-cache miss holds a connection through an I/O wait that
+  uses no CPU at all.
 
 #### Group commit (the coalescer)
 
@@ -270,18 +309,21 @@ happening" are different claims, and only these families can tell them apart.
   propose → quorum → apply).
 - **`legion_store_coalesce_wait_seconds{path, role}`** (histogram) — how long
   a submitter waited before being served. `role="leader"` is the time from
-  enqueue to winning the commit lock, measured *before* its own commit
+  enqueue to winning the commit slot, measured *before* its own commit
   starts: pure contention. `role="follower"` is the time until another
   submitter's batch handed back a result, which includes that batch's commit.
   **Attribution**: against `..._commit_seconds`, this splits "the commit is
   slow" from "submitters are queued behind a commit". A large leader wait
   with a small commit time means the path is lock-bound, not storage-bound.
 - **`legion_store_coalesce_wait_rounds_total{path}`** (counter) — times a
-  waiting submitter's 1ms reply poll timed out and it re-contended for the
-  commit lock. Divided by `..._wait_seconds_count` it is the mean number of
-  poll rounds per request: latency that belongs to the coalescer's own
-  polling rather than to any commit. A ratio far above 1 means requests are
-  routinely sitting through several poll intervals.
+  waiting submitter was woken by a finished commit that was neither its own
+  result nor its turn to lead, i.e. it sat through an extra commit. Divided
+  by `..._wait_seconds_count` it is the mean number of *extra* commits a
+  request waits out. **Zero is the healthy value**: every submitter was
+  served by the first commit it queued behind. A ratio near or above 1 means
+  requests are consistently missing the batch they arrived behind, which is
+  either `plan_apply_batch_max` capping the drain or a commit so slow that a
+  second one starts before the first cohort clears.
 
 ### Raft
 
@@ -320,10 +362,22 @@ happening" are different claims, and only these families can tell them apart.
   — when write latency moves, whichever histogram moved names the culprit
   (local SQLite/capture vs the replication pipeline: network, fsync,
   follower lag).
-- **`legion_raft_ops_total{lane,outcome}`** (counter) — replicated store
+- **`legion_raft_ops_total{lane,op,outcome}`** (counter) — replicated store
   ops by outcome: `applied`, `empty` (the mutation touched no rows and
   skipped the raft entry), `not_leader` (proposal rejected before capture —
   normal on followers under divergent lane leadership), `error`.
+  `op` is the operation name, which is what makes a busy lane attributable:
+  a lane's `applied` count is its quorum-round count, so
+  `topk(10, sum by (lane, op) (rate(legion_raft_ops_total{outcome="applied"}[1m])))`
+  is the list to shorten when a lane is the limit.
+
+  **Split by `outcome` before drawing conclusions.** A high op rate is not a
+  high replication cost: an op whose changeset came out empty never reaches
+  quorum. A 5,000-node cluster shows `update_node_health_checks` as the
+  single busiest op on the status lane at ~134/s, and every one of them is
+  `empty` — workers re-report the same health check and the row does not
+  change. Reading the op rate without the outcome makes it look like the
+  dominant cost in the system when it costs no rounds at all.
 - **`legion_raft_pipeline_wait_seconds{lane}`** (histogram) — time a
   replicated op sat in the lane's pipeline queue before the lane's pipeline
   thread began executing it. Each lane is served by exactly **one** OS thread
@@ -472,7 +526,8 @@ these in order — each step rules out a layer:
    never engages, and the path is paying a full commit per request.
 3. **Waiting or committing?** `legion_store_coalesce_wait_seconds` (by
    `role`) against `legion_store_coalesce_commit_seconds`, plus
-   `legion_store_coalesce_wait_rounds_total` for the polling share.
+   `legion_store_coalesce_wait_rounds_total` for the share of the wait that
+   is extra commits rather than the one being waited on.
 4. **Is it replication or the queue in front of it?**
    `legion_raft_pipeline_wait_seconds` and `legion_raft_pipeline_depth`
    against `legion_raft_capture_seconds` and

@@ -16,7 +16,8 @@ written and syntax/unit-checked, unexercised against real AWS. So is
 `bootstrap-operator-box.sh` — its AWS calls and phase chain have been
 run end-to-end against stubbed `aws`/`ssh` binaries and nothing more.
 Treat the first `launch` as a test of the bootstrap as much as of the
-rig.
+rig. `bake-operator-ami.sh` is in that same state: every path exercised
+against a stubbed `aws`, no image baked against real AWS yet.
 
 ## Layout
 
@@ -26,7 +27,7 @@ rig.
 | `configs/` | Rendered-per-campaign config templates: Legion A (raft lanes), Legion B (streaming + S3 lease), Nomad servers, kubeadm + KWOK, Prometheus + Grafana stack. |
 | `workloads/` | `translate.py`: scenario JSON → Legion jobspecs / Nomad jobs / K8s Deployments, plus the driver's expectation manifest. `profile_split.py`: the shared fleet-shape split. |
 | `driver/` | `driver.py`: submits, watches placements, computes throughput/latency/recovery. `tests/`: the fixture suite that keeps the counting math honest. |
-| `scripts/` | The runbook, as executables (below). `bootstrap-operator-box.sh` builds the box you drive from; `phase1.sh` is the whole of phase 1, checkpointed. |
+| `scripts/` | The runbook, as executables (below). `bootstrap-operator-box.sh` builds the box you drive from (`bake-operator-ami.sh` bakes its toolchain into an AMI first, from the one shared `operator-toolchain.sh`); `phase1.sh` is the whole of phase 1, checkpointed. |
 | `experiments/` | Piggyback drills: storm, failover, streaming RPO, 24h soak, upgrade-under-load. See `experiments/README.md`. |
 | `dashboards/` | Grafana boards provisioned onto the loadgen box. |
 | `analysis/` | `fit_curves.py`: scaling fits + 20k/50k projections with prediction intervals and validation deltas. |
@@ -48,6 +49,40 @@ The credentials build the box and are never copied onto it — it carries
 an IAM instance role instead. What it runs, checkpointed so a failure
 resumes rather than restarts, is `scripts/phase1.sh`: the six steps of
 the manual runbook below, ending at phase 1's exit criterion.
+
+### Bake the operator AMI first (one command, once per region)
+
+The box installs its whole toolchain — build-essential, protoc, clang,
+terraform, AWS CLI v2, rustup — at first boot. Measured on this rig,
+`cloud-init analyze blame` put `modules-final/config-scripts_user` at
+**3245 seconds (54 minutes)** on one launch and ~14 minutes on another:
+same instance type, same region, same script. It is nearly all
+`apt-get`, and it is paid before a single line of Legion compiles.
+
+Pay it once, into an AMI:
+
+```bash
+benchmarks/aws/scripts/bake-operator-ami.sh --region us-east-1   # ~20 min
+benchmarks/aws/scripts/bake-operator-ami.sh --show               # what is baked
+```
+
+`launch` then finds that image by tag and first boot is seconds instead
+of an hour. Cost is a c7i.large for the length of the bake plus ~$0.05/mo
+for the snapshot.
+
+**Nothing requires it.** With no baked AMI, `create` says so — naming the
+bake command — and installs the toolchain in user-data exactly as it
+always did. The slow path is a supported path, not a broken one;
+`--slow-bootstrap` takes it deliberately.
+
+**One list, two paths.** Both the bake and the fallback run
+`scripts/operator-toolchain.sh`, the single copy of what gets installed.
+The image is tagged with that file's hash, so when the toolchain changes,
+`create` reports the baked image as stale and falls back rather than
+launching a box missing the tool that was just added. Re-bake when it
+says so, and otherwise every few months so a new box is not `apt-get
+upgrade`-ing through a season of security updates. AMIs are regional —
+bake in the region the campaign runs in.
 
 **Why a separate box rather than your laptop.** `build-and-upload.sh`
 compiles the dist binary and plugin dylibs *for the rig's Linux x86_64

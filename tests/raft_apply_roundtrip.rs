@@ -402,7 +402,7 @@ fn replicated_ops_record_raft_engine_metrics() -> R<()> {
     for needle in [
         "legion_raft_capture_seconds_bucket{lane=\"control\",le=\"+Inf\"}",
         "legion_raft_propose_apply_seconds_bucket{lane=\"control\",le=\"+Inf\"}",
-        "legion_raft_ops_total{lane=\"control\",outcome=\"applied\"}",
+        "legion_raft_ops_total{lane=\"control\",op=\"put_kv\",outcome=\"applied\"}",
     ] {
         assert!(
             rendered.contains(needle),

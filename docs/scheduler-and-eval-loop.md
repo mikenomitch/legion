@@ -19,16 +19,70 @@ At manager startup:
 
 Each worker loop:
 
-1. `claim_eval()` atomically marks one `pending` eval as `in_flight`.
-2. Executes `Eval::handle(store)`.
-3. `complete_eval()`:
-   - success -> delete eval row
-   - failure -> set status `failed`
+1. `claim_evals()` atomically marks a **batch** of `pending` evals as
+   `in_flight`.
+2. Executes `Eval::handle(store)` for each one, in claim order, one at a
+   time.
+3. `complete_evals_and_claim_next()` writes every outcome — success deletes
+   the eval row, failure sets status `failed`, a transient rejection returns
+   the row to `pending` after a delay — **and** claims the next batch, in one
+   operation.
 
 When queue is empty, workers block on either:
 
 - `Notify` wake-up (`enqueue_eval` of zero-delay work), or
 - timeout until next delayed eval `ready_at`.
+
+### Batching
+
+Steps 1 and 3 are fixed costs paid per *round*, not per eval. On a
+replicated (raft) manager each is a quorum round on the scheduler lane, and
+that lane drains through a single pipeline thread — so a cluster doing a
+little work per eval hits a ceiling that has nothing to do with the work.
+Taking N evals through one cycle divides those two rounds by N.
+
+The batch is sized to the queue, not to a timer:
+
+- **It never waits to fill.** A worker takes whatever is claimable right now
+  and starts working. Idle latency is unchanged.
+- **It is a fair share, not a grab.** Each worker takes at most
+  `pending_evals / evalThreads` rows, so a burst of work spreads across
+  workers instead of serializing behind the first one to wake.
+- **It is capped at 16** rows per worker regardless of queue depth.
+- **A shallow queue yields a batch of one**, which behaves exactly like the
+  unbatched loop.
+
+There is no configuration for this; the two inputs — live queue depth and
+`evalThreads` — are already known to the loop.
+
+Batching does not change what evals do or the order they run in. Each eval
+still runs its own handler and applies its own plan in its own operation,
+and the claim still drains in `priority DESC, id ASC` order across the whole
+batch, so a low-priority eval can never overtake a high-priority one by
+riding in someone's batch.
+
+**Failure isolation.** Only outcomes the worker actually *observed* are
+written. If one eval's handler panics or is cancelled, its siblings still
+settle normally and that eval is simply omitted — its row stays `in_flight`
+and returns to the queue via `requeue_in_flight_evals()` (run on startup and
+on raft leadership acquisition). The same applies to the whole batch if the
+terminal write itself fails, or if the worker or manager dies mid-batch:
+nothing is written, every row stays `in_flight`, and recovery requeues them.
+An eval is never marked failed on the strength of an unknown outcome,
+because failed evals are not retried.
+
+The cost of that safety is bounded re-execution: an eval handled inside a
+batch whose terminal write never lands will run again after recovery. Eval
+handlers are idempotent convergence steps, so this is wasted work rather
+than duplicated effects, and the batch cap bounds how much of it a single
+crash can cause.
+
+**Leadership.** A worker that loses scheduler-lane leadership part-way
+through a batch stops there and leaves the remainder `in_flight` for the new
+leader, rather than running work whose writes cannot commit. A batch can
+never be half-applied across a leadership change: the terminal write for the
+whole batch is a single replicated operation that either commits or does
+not.
 
 ## Eval Queue Semantics
 
@@ -223,6 +277,45 @@ every placement against the **fresh** node row before inserting it:
   can see, with a Fresh plan's own replaced job excluded — the same
   arithmetic as the planner's ledger) and every placement must still fit,
   with earlier placements in the same plan debited.
+
+#### The per-node usage cache
+
+Rebuilding that free pool used to read **every** allocation row on the node
+and parse every stored `resources` blob, inside the serialized plan-apply
+commit. The cost of committing a plan therefore grew with how full the
+cluster was while the plan's own work stayed constant: on a 5,000-node
+fleet, the same ~44 placements read ~440 allocation rows with 50,000
+allocations live and ~1,760 with 200,000.
+
+A node's total allocation usage is now cached in `node_alloc_usage`, one
+row per node. The cache is **validated, never trusted**: each row stores a
+fingerprint of the allocation rows it was computed from — the node's
+allocation epoch, the row count, and the sum of the allocation ids — and
+the apply path recomputes that fingerprint (an index-only read that touches
+no row bodies and parses no JSON) before using the cached value. If it does
+not match, the pool is rebuilt from the rows exactly as before, and the
+plan refreshes the row on its way out.
+
+What this means in practice:
+
+- **The number is unchanged.** The same capacity arithmetic, the same
+  overcommit policy, the same exclusion of a Fresh plan's own job. Cached
+  and rebuilt pools can differ only by a floating-point rounding step,
+  because the cache subtracts one summed total where the rebuild subtracts
+  each allocation in turn.
+- **Nothing has to maintain it.** Any path that adds or removes an
+  allocation — a placement, a stop, a preemption, a node removal, a job
+  destroy — invalidates the affected rows implicitly, because it moves the
+  fingerprint. A stale, wrong, or missing row costs one rebuild; it can
+  never inflate a node's free capacity.
+- **Version skew is safe in both directions.** A manager binary without
+  this feature neither reads nor writes the table, so a leader on either
+  side of an upgrade simply finds the fingerprints stale and rebuilds. The
+  table is created empty with no backfill.
+
+Known limitation: removing a node leaves its cache row behind (the removal
+runs on a different raft lane than the table's writer). The row is inert
+and roughly 100 bytes.
 
 A failed re-validation on *every* candidate is what rejects a plan; the
 eval handler's conflict retry then re-plans against the node's real

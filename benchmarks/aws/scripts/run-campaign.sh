@@ -83,6 +83,9 @@ RESET_CP=true
 # plane, so a value set only at install time would be reverted before
 # the first cell ran.
 EVAL_THREADS=""
+# Empty leaves run-step.sh's default. Raise it when a cell reports
+# submission.driver_bound, which means the driver set the measured rate.
+SUBMIT_CONCURRENCY=""
 while [ $# -gt 0 ]; do
     case "$1" in
     --system)
@@ -141,6 +144,13 @@ while [ $# -gt 0 ]; do
         # the worst case is a loud failure rather than a bad number.
         RESET_CP=false
         shift
+        ;;
+    --submit-concurrency)
+        # Jobs submitted in parallel. Raise it when a cell reports
+        # submission.driver_bound: that means the driver, not the
+        # scheduler, set the measured rate.
+        SUBMIT_CONCURRENCY="$2"
+        shift 2
         ;;
     --eval-threads)
         # legion-a only. The phase-2 finding was that raising this COST
@@ -338,7 +348,8 @@ for NODES in $STEPS; do
             log "--- cell: $SCENARIO @ ${NODES}n x ${ALLOCS} allocs/node (~$TARGET allocations) ---"
             "$(dirname "$0")/run-step.sh" \
                 --system "$SYSTEM" --nodes "$NODES" --scenario "$SCENARIO" \
-                --target-allocations "$TARGET" --warmup "$WARMUP" --campaign "$CAMPAIGN"
+                --target-allocations "$TARGET" --warmup "$WARMUP" --campaign "$CAMPAIGN" \
+                ${SUBMIT_CONCURRENCY:+--submit-concurrency "$SUBMIT_CONCURRENCY"}
         done
     done
 

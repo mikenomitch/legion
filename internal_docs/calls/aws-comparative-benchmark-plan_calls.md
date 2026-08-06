@@ -724,3 +724,67 @@ stated subject is the cadence ladder itself.
   rendered config — the fairness record — says 4. A run that fails loudly
   is strictly better than a number that lies quietly, which is the same
   principle as entry 24.
+
+## 29. The operator box's toolchain is baked into an AMI, and a stale image is refused rather than reused
+
+- **The call:** `scripts/bake-operator-ami.sh` runs the toolchain install
+  once on a throwaway instance and snapshots it into an AMI tagged
+  `Name=legion-bench-operator-ami`. `bootstrap-operator-box.sh` looks that
+  image up by tag and launches from it, leaving only per-instance work
+  (the rig's SSH key pair) in user-data. Both paths run the *same*
+  `scripts/operator-toolchain.sh`, and the AMI carries a tag holding that
+  file's content hash. When the hashes disagree the baked image is
+  **ignored**, not used: the bootstrap says so, says how to re-bake, and
+  falls back to installing in user-data.
+
+  ```bash
+  scripts/bake-operator-ami.sh --region us-east-1   # once, ~20 min
+  scripts/bake-operator-ami.sh --show               # baked? current?
+  scripts/bootstrap-operator-box.sh launch --profile me   # finds it by tag
+  ```
+
+- **Alternatives.** (a) Leave it: keep installing in user-data every time.
+  (b) Bake, but use whatever image carries the tag — no fingerprint, no
+  staleness check. (c) Fingerprint it, and *fail* rather than fall back,
+  forcing a re-bake before any box can be created. (d) Reach for Packer,
+  or add the AMI to `terraform/`. (e) Keep two copies of the install list,
+  one in the bake script and one in the user-data heredoc.
+- **Trade-off.** A second artifact with its own lifecycle, in a repo whose
+  standing complaint is already that the operator box is a second
+  lifecycle (entry 18). AMIs are regional, so a campaign in a new region
+  bakes again. And the strict fingerprint means a comment-only edit to
+  `operator-toolchain.sh` invalidates a perfectly good image — `--ami
+  <id>` exists for exactly that, and `--slow-bootstrap` for the reverse.
+- **Why (ease, and the cost of being wrong).** The number is the argument:
+  `cloud-init analyze blame` measured `modules-final/config-scripts_user`
+  at **3245 seconds — 54 minutes** on one launch of this box, and ~14
+  minutes on another with the same type, region, and script. That variance
+  is the tell: it is `apt-get` throughput, which the rig does not control
+  and cannot tune, spent before any Legion code compiles. (a) pays it on
+  every box, and this box is created more often than its "build it once"
+  framing suggests — every failed `create`, every region, every fresh
+  account.
+
+  (e) is the real risk this change introduces, and one file is the whole
+  mitigation: a drifted install list produces a box that looks healthy and
+  dies hours later inside a `cargo build` on a missing `protoc`, which is
+  a far worse failure than a slow bootstrap. (b) has the same failure
+  shape one step removed — the tag says "toolchain", the image says
+  something older. (c) is the tempting strict answer and is wrong here for
+  the reason entry 18 exists: `bootstrap-operator-box.sh` is the *first*
+  thing a new operator runs, and a step 0 that refuses to work until you
+  have baked an image is exactly the prerequisite hunt that script was
+  written to delete. The fallback is a correct box, only slow, and it says
+  which path it took and why. (d) buys image-build features this needs
+  none of, against a tool nobody here has installed; terraform is
+  circular for the same reason it is in entry 18 — this box runs the
+  terraform, and must outlive `teardown.sh`.
+
+  Two details are security calls rather than speed ones. The bake instance
+  gets **no key pair**: an AMI baked from an instance that had one hands
+  that key to every box launched from the image afterwards. And the rig's
+  SSH key pair stays in per-instance user-data rather than moving into the
+  toolchain script, because baking it would put the private half of the
+  rig's trust domain inside a disk image and give every future operator
+  box the same key. The bake epilogue removes the host keys and runs
+  `cloud-init clean` for the same reason.

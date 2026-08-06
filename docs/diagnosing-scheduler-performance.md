@@ -66,8 +66,31 @@ over the whole run, not the current latency. Subtract two samples of both.
 
 ## Symptom: throughput fell when I scaled up
 
-**Decision: reduce concurrency.** Lower `evalThreads`. This is
-counter-intuitive and it is correct.
+**Decision: check the rejection share first.** If it is high, reduce
+`evalThreads`. If it is not, `evalThreads` is the wrong knob and raising it is
+more likely to help than lowering it.
+
+> **Corrected 2026-08-05.** This section used to say "reduce concurrency" flatly,
+> on the strength of a measurement where 4 eval threads beat 16. That
+> measurement was wrong twice over: it came from a load generator that capped
+> submission below what the scheduler could absorb, and it ran against a build
+> whose eval notifier woke *every* worker on any eval state change, so each
+> added thread spent quorum rounds discovering an empty queue. With both fixed,
+> throughput rises with eval threads on the same hardware — 5,000 nodes, 25,002
+> allocations, three 4-vCPU managers:
+>
+> | eval threads | throughput |
+> | ---: | ---: |
+> | 4 | 177.27 alloc/s |
+> | 8 | 208.83 alloc/s |
+> | 16 | 219.25 alloc/s |
+> | 32 | 251.68 alloc/s |
+>
+> p99 placement latency fell from 100.8s to 67.3s between 4 and 16. A
+> 64-thread cell reached at least 263.08 alloc/s but was limited by the
+> benchmark's own load generator, so **where this stops paying is not known**
+> — read the table as "more helped up to 32 on a 4-core manager", not as a
+> recommendation to set 32.
 
 **Read**
 
@@ -128,18 +151,29 @@ the contention is being absorbed and the remaining rejections are real capacity.
 
 **Actions, in order**
 
-1. **Lower `evalThreads`** in the manager config and re-measure. On the numbers
-   above, 4 beat 16 outright. Start at half and bisect.
+1. **Lower `evalThreads`** in the manager config and re-measure — but only if
+   the rejection share above is actually high. Start at half and bisect.
 
    ```nickel
    # configs/manager.ncl
    { evalThreads = 4 }
    ```
 
-   The default is `available_parallelism()`, which on a large control-plane box
-   is very likely too high for a contended workload. There is no relationship
-   between core count and the concurrency the optimistic-concurrency fence can
-   absorb.
+   The default is `available_parallelism()`. Core count is a poor basis either
+   way: an eval worker spends most of its life parked on a quorum round trip
+   rather than computing (a saturated 5,000-node control plane measured 8% CPU),
+   so the useful thread count is set by how much the plan-apply fence can absorb
+   and by round-trip latency, not by cores. On an uncontended workload that
+   means the default is more likely to be too LOW than too high: at 5,000
+   nodes on 4-vCPU managers, throughput rose at every step from 4 to 32
+   threads. Nobody has measured where it stops, so treat larger values as
+   worth trying and worth measuring, not as a recommendation.
+
+   `evalThreads` also sizes the store's read-connection pool (`evalThreads + 4`,
+   capped at 16 — see [state-store.md](state-store.md)), because the eval
+   workers are the manager's concurrent readers. Turning it down therefore
+   narrows the pool as well; watch `legion_store_read_lock_wait_seconds`
+   alongside whatever you were trying to fix.
 
 2. **Confirm candidate lists are on.** `schedulerSettings.plan_candidates`
    defaults to `8`; `0` disables them and restores single-node submissions,
@@ -244,10 +278,16 @@ lane was.
 
 **Actions**
 
-1. **Reduce `evalThreads`.** More eval threads produce more proposals into the
-   same single-threaded lane. This symptom and the
-   [rejection storm](#symptom-throughput-fell-when-i-scaled-up) have the same
-   remedy, for different reasons, which is why they so often appear together.
+1. **Cut proposals per eval before cutting threads.** More eval threads do put
+   more proposals into the same single-threaded lane, but the proposals *per
+   eval* are the cheaper thing to attack, and much of the six counted here has
+   since been removed: `claim_eval` and `complete_eval` are now a single fused
+   round (`complete_and_claim_next`), enqueues batch, and the wake herd that
+   made each extra thread issue its own empty `claim_eval` is fixed. Read
+   `legion_raft_ops_total{lane,op,outcome}` and check whether the ops are
+   `applied` or `empty` — an `empty` changeset never reaches quorum, so a high
+   op rate there costs nothing in replication. Reduce `evalThreads` only if the
+   lane's `applied` rate is genuinely the constraint.
 2. **Check topology.** Under `topology = "single"` every lane rides one raft
    group, so scheduler work queues behind status and control work. `lanes` gives
    the scheduler its own pipeline thread. See [Multi-raft](multi-raft.md).
@@ -559,7 +599,7 @@ allocations, not on the counter. Tracked in
 
 | Knob | Where | Turn it when | Do **not** turn it when |
 | --- | --- | --- | --- |
-| `evalThreads` | manager config | Rejection share is high, or the scheduler lane's `pipeline_wait` is high. **Turn it down.** | You have not looked at `plan_apply_total{outcome}`. Raising it on a contended cluster reliably makes throughput worse. |
+| `evalThreads` | manager config | Rejection share is high, or the scheduler lane's `pipeline_wait` is high, and the lane's ops are `applied` rather than `empty`. **Turn it down.** On an uncontended cluster the opposite applies: at 5,000 nodes throughput rose at every step from 4 to 32 threads (177.27 -> 251.68 alloc/s), and the point where it stops paying has not been measured. Note it also sizes the read pool (`evalThreads + 4`, capped at 16). | You have not looked at `plan_apply_total{outcome}` and `raft_ops_total{op,outcome}`. Moving it in either direction without those is guessing. |
 | `schedulerSettings.plan_candidates` | manager config | It is `0` and you are not mid-upgrade. Set it back to `8`. | Rejections are low. The default is right. |
 | `schedulerSettings.plan_conflict_max_retries` | manager config | Contention is bursty and short-lived (default `3`, max `20`). | Rejections are sustained. More retries wastes more plans. |
 | `schedulerSettings.plan_apply_batch_max` | manager config | Group commit is engaging and you want fewer commits (default `16`, max `128`). | `coalesce_batch_size`'s `le="1"` bucket is near `_count`. Batching is not engaging; the cap is not the constraint. |

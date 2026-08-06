@@ -99,9 +99,16 @@ variable "control_plane_disk_gb" {
 # --- Load / metrics ----------------------------------------------------
 
 variable "loadgen_type" {
+  # 2 vCPU was not enough, and it silently capped every cell rather than
+  # failing. This box runs Prometheus and Grafana AND the driver, and the
+  # driver spawns one CLI process per submitted job; on an m7i.large that
+  # ceilinged submission at ~36 jobs/sec, which the phase-4 campaign then
+  # reported as Legion throughput while the control plane idled at 8% CPU.
+  # Sized so the driver, not the box, is the limit -- and the driver now
+  # says so in `submission.driver_bound` when it is still the constraint.
   description = "On-demand instance type for the Prometheus + Grafana + driver box."
   type        = string
-  default     = "m7i.large"
+  default     = "m7i.4xlarge"
 }
 
 variable "loadgen_disk_gb" {

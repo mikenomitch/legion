@@ -88,7 +88,16 @@ snapshot eval_conflict_requeues 'legion_eval_conflict_requeues_total'
 #   propose_apply — the commit itself, once it stops queueing
 # Read pipeline_wait against propose_apply: wait >> apply means the lane is
 # serialized, not slow, and the fix is fewer ops rather than faster ones.
-snapshot raft_ops 'sum by (lane, op) (legion_raft_ops_total)'
+snapshot raft_ops 'sum by (lane, op, outcome) (legion_raft_ops_total)'
+# The top ops by rate on the busiest lane. A lane's op count IS its
+# quorum-round count, so this is the list to shorten when a lane is the
+# limit. (Phase 3 had no `op` label and the status lane's 411 ops/sec was
+# unattributable — it collected `by (lane, op)` against a metric that had
+# no such label and silently got the lane totals back.)
+snapshot raft_ops_by_op_rate 'topk(15, sum by (lane, op) (rate(legion_raft_ops_total[1m])))'
+# Claims that found nothing still cost a full quorum round. A large `empty`
+# share means workers are being woken for work that does not exist.
+snapshot eval_claims 'sum by (outcome) (legion_eval_claim_total)'
 snapshot raft_pipeline_wait_p99 'histogram_quantile(0.99, sum by (lane, le) (rate(legion_raft_pipeline_wait_seconds_bucket[1m])))'
 snapshot raft_pipeline_wait_mean 'sum by (lane) (rate(legion_raft_pipeline_wait_seconds_sum[1m])) / sum by (lane) (rate(legion_raft_pipeline_wait_seconds_count[1m]))'
 snapshot raft_pipeline_depth 'legion_raft_pipeline_depth'

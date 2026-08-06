@@ -276,7 +276,7 @@ def k8s_deployment(job_name, job_type, task_idx):
 # --- Driver manifest --------------------------------------------------
 
 
-def translate(scenario, system, out_dir, multiplier):
+def translate(scenario, system, out_dir, multiplier, jobspec_format="json"):
     os.makedirs(out_dir, exist_ok=True)
     manifest = {
         "scenario": scenario.get("name"),
@@ -288,9 +288,28 @@ def translate(scenario, system, out_dir, multiplier):
     for job_name, job_type, _idx in iter_jobs(scenario, multiplier):
         expected = expected_allocations(job_type)
         if system == "legion":
-            filename = f"{job_name}.ncl"
+            # Pre-rendered JSON, not Nickel, unless asked for.
+            #
+            # `legion job run` accepts either, but a .ncl path makes every
+            # submit evaluate Nickel inside the CLI process. Submission is
+            # one CLI process per job and it is the rig's throughput
+            # ceiling (phase 4: ~36 jobs/sec, which the cells then reported
+            # as Legion's rate), so that evaluation is paid 4,167 times per
+            # cell for a spec that never changes.
+            #
+            # It is also a fairness problem: the Nomad and K8s adapters
+            # both submit pre-rendered artifacts, so only Legion was being
+            # charged for rendering inside the measured path. `nickel`
+            # stays reachable through --jobspec-format ncl, which is the
+            # surface a real user types.
+            if jobspec_format == "ncl":
+                filename = f"{job_name}.ncl"
+                body = nickel(legion_jobspec(job_name, job_type))
+            else:
+                filename = f"{job_name}.json"
+                body = json.dumps(legion_jobspec(job_name, job_type), indent=2)
             with open(os.path.join(out_dir, filename), "w") as f:
-                f.write(nickel(legion_jobspec(job_name, job_type)))
+                f.write(body)
                 f.write("\n")
         elif system == "nomad":
             filename = f"{job_name}.nomad.hcl"
@@ -340,13 +359,25 @@ def main():
         "--count-multiplier. Preferred for campaign steps: the scenarios' "
         "own bases differ, so a shared target keeps cells comparable.",
     )
+    parser.add_argument(
+        "--jobspec-format",
+        choices=["json", "ncl"],
+        default="json",
+        help="Legion jobspec artifact. json (default) is pre-rendered, so a "
+        "submit does not evaluate Nickel inside the CLI process for a spec "
+        "that never changes -- submission is the rig's throughput ceiling, "
+        "and the Nomad and K8s adapters already submit pre-rendered files. "
+        "ncl emits Nickel, which is what a real user writes.",
+    )
     args = parser.parse_args()
 
     scenario = load_scenario(args.scenario)
     multiplier = args.count_multiplier
     if args.target_allocations is not None:
         multiplier = multiplier_for_target(scenario, args.target_allocations)
-    manifest = translate(scenario, args.system, args.out, multiplier)
+    manifest = translate(
+        scenario, args.system, args.out, multiplier, args.jobspec_format
+    )
     print(
         f"{manifest['scenario']} -> {args.system}: {len(manifest['jobs'])} jobs, "
         f"{manifest['total_expected_allocations']} expected allocations in {args.out}",

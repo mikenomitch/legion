@@ -3,10 +3,16 @@
 > **Judgement calls:** [`../calls/eval-path-raft-cost-plan_calls.md`](../calls/eval-path-raft-cost-plan_calls.md)
 
 **Status: IN EXECUTION** — phases 1 and 2 landed together (claim/complete
-fusion, batched enqueue). Phase 3 (re-measurement on AWS) is not run, and
-until it is, every throughput claim here is a prediction. Deliberately
-deferred: fusing the status-lane `task_status` projection (different
-lane, so it cannot share a round), and any change to plan-apply itself.
+fusion, batched enqueue). Phase 3 (re-measurement on AWS) ran on 2026-08-05
+([../aws-phase4-findings.md](../aws-phase4-findings.md)) and its exit
+criterion pointed at `apply` itself, which is phase 4 below. Phase 4's code
+has landed — batching the queue's own bookkeeping across N evals, plus the
+apply-time free-pool cache and the delta read-model refresh — and all of it
+is **unmeasured at scale**. Deliberately deferred: fusing the status-lane
+`task_status` projection (different lane, so it cannot share a round), and
+the batched *apply* across evals, which phase 4 explicitly declined because
+handlers write across lanes as they go rather than returning a plan (see the
+judgement calls).
 
 ## 1. Problem statement
 
@@ -159,28 +165,192 @@ Read `pipeline_wait` against `propose_apply`: wait >> apply means the
 lane is serialized rather than slow, which is the claim this plan rests
 on and the thing phase 3 could only infer.
 
+### Phase 4 — take the per-node allocation scan out of the apply commit
+
+Phase 3's exit criterion said that if rounds fell and throughput did not,
+the next suspect was `apply` itself. That is where the `dense_fleet` fill
+ladder landed: 736.1 → 456.58 → 272.91 alloc/s as live allocations went
+50k → 100k → 200k at 5,000 nodes, roughly 1.6x per doubling, while plan
+total grew only 22%.
+
+The mechanism is that the serialized plan-apply commit did work
+proportional to how full the cluster is while the plan's own work stayed
+constant. `Store::free_pool_for_node_tx` rebuilt each placement node's
+free pool by selecting **every** allocation row on that node and parsing
+every `resources` blob: ~440 rows per eval at 50k allocations, ~1,760 at
+200k, for the same ~44 placements.
+
+The pool is now served from a per-node aggregate cached in
+`node_alloc_usage`, and **validated on every read** against a fingerprint
+of the live rows — the node's allocation epoch, the row count, and the sum
+of the allocation ids, all read from `idx_allocation_node_id` without
+touching a row body or parsing any JSON. A mismatch rebuilds exactly as
+before; a successful apply refreshes the row, but only when the live
+fingerprint is precisely the one it predicted. A Fresh plan's own
+allocations are gathered once per plan rather than re-filtered per node.
+
+This is deliberately a cache and not a denormalized total: a free-capacity
+number that drifts high overcommits a node, and validation makes that
+impossible rather than merely unlikely. The reasoning, and the three
+alternatives rejected for it, are entry 1 of the calls doc.
+
+It flattens the slope rather than removing it — the fingerprint is still
+proportional to allocations-per-node, at roughly a hundredth of the
+constant — and the read-model half of the finding is untouched.
+
+Local A/B on the rebuild itself (`bench_local_free_pool`, both arms
+against the same store, `drop_own` on):
+
+| allocations/node | row walk | cached |
+| --- | --- | --- |
+| 10 | 15.573 µs | 8.635 µs |
+| 40 | 37.764 µs | 9.358 µs |
+
+The columns are the result: over a 4x change in fill the row walk grows
+2.4x and the cached path grows 1.08x. End-to-end throughput is *not*
+measurable locally — the cost is a serialized commit on a multi-node
+cluster under fill — so the AWS `dense_fleet` ladder remains the exit
+criterion.
+
+### Phase 4 — batch the cycle across N evals
+
+Phase 1 divided the queue's fixed cost by two. Phase 4 divides it by the
+batch size, because the measured campaign
+([../aws-phase4-findings.md](../aws-phase4-findings.md)) says the fixed
+cost is what is left. With the wake herd fixed and health checks shown to
+produce empty changesets, the only real scheduler-lane quorum traffic is
+`complete_and_claim_next` at **44/s** plus ~20/s of plan applies. The
+amortization curve says the same thing from the other side — same cluster
+(5,000 nodes), same code, same 16 eval threads:
+
+| scenario | allocations per eval | throughput |
+| --- | --- | --- |
+| `web_fleet` | 6 | 219.25 alloc/s |
+| `dense_fleet` | 44 | 736.1 alloc/s |
+
+**7x the work per eval bought 3.4x the throughput.** Throughput tracking
+work-*per-eval* rather than work is the signature of a per-eval cost
+dominating — if the planner were the ceiling, the two rows would be much
+closer together.
+
+So a worker takes N evals through one cycle:
+
+- `Store::claim_evals(limits) -> Vec<Eval>` claims a batch in one op, by
+  looping the existing `claim_eval_apply` — same `priority DESC, id ASC`
+  head, same superseded-eval sweep, so ordering holds across the batch.
+- Each eval is handled exactly as before, serially, applying its own
+  plan in its own op.
+- `Store::complete_evals_and_claim_next(completions, limits)` settles the
+  batch and claims the next one, in one op.
+
+```rust
+pub struct EvalBatchLimits { pub max: usize, pub workers: usize }
+// share = clamp(pending / workers, 1, max)
+```
+
+**Sizing.** The batch is a fair share of the live queue, capped at 16,
+and the claim never waits to fill: a shallow queue yields a batch of one,
+which is exactly today's cost. The fair share is load-bearing — a greedy
+claim would let one worker vacuum a burst that its idle peers could have
+run in parallel, which is a throughput *loss* on the fan-out storms this
+plan exists for. No config knob: both inputs are already known to the
+loop.
+
+**Failure isolation.** `completions` carries only outcomes the worker
+observed. A panicked handler, or an eval a mid-batch leadership loss
+stopped us reaching, is omitted and stays `in_flight` for
+`requeue_in_flight_evals` — phase 1's "write nothing for an unknown
+outcome" rule, applied per member. The write is one changeset, so a
+rejection settles nothing and leaves the whole batch recoverable; no eval
+can be half-completed or completed twice.
+
+**Not done: batched apply.** Handlers write as they go across several
+lanes rather than returning a plan, so applying N plans as one commit
+means restructuring every handler to be a pure function of a snapshot.
+It is also partly redundant: the D5 group commit already batches
+*concurrent* applies, and cheaper claim/complete rounds put more workers
+in apply at once, which feeds it.
+
+**Steady-state scheduler-lane rounds per eval: 2 → 2/N.**
+
 ## 7. Testing
 
+- `tests/eval_regen_failover.rs`: a batch of one is indistinguishable
+  from a single claim and an empty queue returns immediately; priority
+  order is preserved across a batch; the fused batch write settles every
+  member and claims the next batch; an unobserved member stays
+  `in_flight` while its siblings settle, and `requeue_in_flight_evals`
+  recovers it.
+- `EvalBatchLimits::share_of` is unit-tested in `store.rs` at the
+  boundaries that matter: a shallow queue must yield exactly one, a deep
+  one must be capped, and degenerate inputs must not produce a zero-sized
+  batch.
 - `tests/eval_regen_failover.rs`: the fused call finishes one eval and
   claims the next; the queue draining returns `None`; a delayed
   `Released` goes back to pending and does not re-claim itself; batched
   enqueue creates every row and each stays independently claimable.
 - `tests/raft_seam.rs` classifies both new ops onto the scheduler lane —
   the guard that fails the build if a replicated op is unclassified. It
-  caught both of these during development, which is the point of it.
+  caught both of these during development, which is the point of it —
+  and phase 4's `claim_evals` /
+  `complete_evals_and_claim_next` are classified the same way.
 - The local SLO gate is a **no-regression** check only: `replicated`
   short-circuits when raft is off, so a single-node run cannot show this
   win at all. Correctness stayed 1.000 across all eight scenarios.
+- Phase 4 is tested as an **equivalence** against the code it replaced,
+  which is kept verbatim as the oracle: the cached free pool must equal
+  the row walk's across an empty node, amount-typed, item-typed and
+  mixed-kind allocations, a zero-amount demand, both `drop_own` modes, and
+  an unreadable row — cold cache and warm. Plus a drift battery that
+  drives real inserts, a removal that bumps only the job-config epoch, an
+  in-plan eviction and a wholesale job removal through the public store
+  API, re-asserting the equivalence after each. `src/resources.rs` carries
+  the aggregate's own properties (add/remove are inverses; item counts are
+  a multiset, not a set union).
+
+  win at all. Correctness stayed 1.000 across all eight scenarios. This
+  holds doubly for phase 4 — with raft off, a batched claim of N and N
+  single claims execute the same SQL in the same process, so the batching
+  win is **structurally unmeasurable** locally.
 
 ## 8. Rollout
 
-No config, no migration, no wire change — the eval queue schema and the
-op semantics are unchanged; only how many quorum rounds they cost
-changes. A mixed-version cluster is fine: the ops are per-leader, and a
-follower applies changesets either way.
+Phases 1-3: no config, no migration, no wire change — the eval queue
+schema and the op semantics are unchanged; only how many quorum rounds
+they cost changes. A mixed-version cluster is fine: the ops are
+per-leader, and a follower applies changesets either way.
+
+Phase 4 adds one table (`node_alloc_usage`) in an additive migration with
+no backfill, owned by the scheduler lane. Version skew is safe in both
+directions because the table is a validated cache: a manager binary
+without the feature neither reads nor writes it, so a leader on either
+side of an upgrade finds the fingerprints stale and rebuilds.
 
 **Exit criterion:** at 5,000 nodes, `cell_summary.py --lanes` shows
 scheduler-lane rounds per eval at or below 2.5 (from ~4), and throughput
 above the 80.35 alloc/sec phase-3 baseline. If rounds fall and throughput
 does not, the lane is not the ceiling either and the next suspect is
 `apply` itself (27.9 ms/eval, 67% of plan time).
+
+**Phase 4 exit criterion:** rerun cells G and H from
+[../aws-phase4-findings.md](../aws-phase4-findings.md).
+`complete_evals_and_claim_next` should run **well below the eval rate**
+(`complete_and_claim_next` was 44/s at ~44 evals/s), and the 3.4x
+`web_fleet` / `dense_fleet` throughput gap should narrow. No new metric is
+needed: dividing `legion_evals_processed_total` by
+`legion_eval_claim_total{outcome="claimed"}` gives evals per claim round,
+and `legion_raft_ops_total{lane="scheduler",op=…}` gives the same for the
+terminal write. Two failure shapes to watch for and what each means:
+
+- **Batch size stays at 1.** The queue never gets deeper than
+  `evalThreads`, so the eval loop is not the constraint at all and the
+  submission path is.
+- **Rounds fall, throughput does not.** The scheduler lane was not the
+  ceiling either, and `apply` is what is left — 354 ms of a 381 ms plan
+  total at 100,000 allocations, which is the target the same findings
+  already name.
+
+Also check `legion_eval_claim_total{outcome="empty"}` has not risen from
+its 0.3/s: the notifier issues one permit per claimable eval, and a batch
+that took more than its share would leave woken peers with nothing, which
+is the regression the fair-share sizing exists to prevent.

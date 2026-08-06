@@ -44,21 +44,44 @@ How to use it:
       because every placement fell inside the warmup. Scale warmup to
       cell size, or floor the steady window. This is why phase 3 has no
       1,000-node throughput number.
-- [ ] **Read-connection pool fix is shipped but deprioritised.** Pool
-      sized from `available_parallelism()`, steal-on-contention, cached
-      heartbeat task configs, and a new
+- [x] **Read-connection pool: fixed, measured, and ruled out as the
+      ceiling.** Steal-on-contention, cached heartbeat task configs, and a new
       `legion_store_read_lock_wait_seconds` (read-connection wait
       previously had **no metric at all**). The hypothesis that this was
-      the ceiling was **refuted**: phase 3 measured `task_fetch` at
-      0.65 ms at 5,000 nodes on the *unmodified* binary, so the 107x
-      growth seen in the phase-2 archives was coupled to the conflict
-      rate, not to fleet size. Worth measuring eventually; not urgent.
-- [ ] **Make the read-connection pool size configurable.** It is derived
-      from `available_parallelism()` today, but demand is heartbeat-driven
-      and therefore scales with *fleet size*, not cores — an operator
-      running 10k nodes on 8 cores is better placed to judge than a
-      compile-time formula. Needs a config field, a `docs/` note and a
-      `configs/jobs/maximal.ncl`-equivalent entry for manager config.
+      the ceiling was **refuted three times**: phase 3 measured
+      `task_fetch` at 0.65 ms at 5,000 nodes on the *unmodified* binary, so
+      the 107x growth seen in the phase-2 archives was coupled to the
+      conflict rate, not to fleet size; the plan path was traced in code and
+      holds **no** read connection across a quorum round, an `.await`, or
+      `build_plan` (the apply runs on the write connection inside
+      `replicated()`), so the pool cannot serialize two planners; and the
+      2026-08-05 eval-thread sweep ran every cell with **four** connections
+      and still got 251.68 alloc/s at 32 eval threads, up 14.8% on 16. The
+      "~4 effective planners" figure that started the hunt was a metrics
+      error — `plan_phase_seconds{total}` times planning only, so Little's
+      law over it counts evals in the planning *stage*, not busy workers.
+      Use `eval_handle_seconds`. See
+      [eval-path-raft-cost-plan_calls.md](calls/eval-path-raft-cost-plan_calls.md)
+      entry 5.
+- [x] **Take the read-connection pool off `available_parallelism()`.**
+      Now `evalThreads + 4`, capped at 16. **No throughput claim** — the
+      sweep above shows four connections were adequate through 32 eval
+      threads, so this is a correction to the sizing *argument* plus a
+      bounded hedge for the higher `evalThreads` values the sweep says
+      operators will want. Core count was the wrong basis: the readers are
+      latency-bound (8% CPU at saturation, and a page-cache miss holds the
+      mutex through a `pread`), holds are uneven
+      (`cache_refresh_allocation_scopes` keeps one connection across ~44
+      per-node queries after every apply, on every replica), and a pool
+      sized at the core count saturates in lockstep with the tokio runtime
+      by construction, since the heartbeat body reads inline on runtime
+      threads.
+      **A config knob was deliberately not added**: `evalThreads` is the
+      concurrent-reader count we already have, and a `readConnections`
+      field would be a number no operator can size from first principles.
+      The 16 cap is a memory budget — `SQLITE_CACHE_SIZE_KIB` is 64 MiB per
+      connection and the caches do not share, so the cap holds the pool's
+      worst case at 1 GiB (unit-tested).
 - [x] **Cut the raft round-trips per eval** —
       [eval-path-raft-cost-plan.md](plans/eval-path-raft-cost-plan.md).
       `Store::complete_and_claim_next` fuses the eval loop's terminal
@@ -66,17 +89,171 @@ How to use it:
       `Store::enqueue_evals` makes every fan-out one round instead of one
       per row (leadership regeneration, drained and lost nodes). **The
       AWS re-measurement is NOT run** — see the open item below.
-- [ ] **Measure the eval-path raft cuts at 5,000 nodes.** Exit criterion
-      from [eval-path-raft-cost-plan.md](plans/eval-path-raft-cost-plan.md):
-      `cell_summary.py --lanes` shows scheduler-lane rounds per eval at or
-      below 2.5 (from ~4), and throughput above the 80.35 alloc/sec
-      phase-3 baseline. `collect.sh` now archives the raft lane metrics
-      needed to check it. **A local run cannot measure this** —
-      `Store::replicated` short-circuits when raft is off, so the fused
-      op and the unfused pair execute identical code on one node.
-      If rounds fall and throughput does not, the lane is not the ceiling
-      either and the next suspect is `apply` itself (27.9 ms/eval, 67% of
-      plan time).
+- [x] **Measure the eval-path raft cuts at 5,000 nodes.** Done 2026-08-05,
+      but only after the rig itself was fixed — see
+      [aws-phase4-findings.md](aws-phase4-findings.md). The benchmark driver
+      spawned one CLI process per job from a pool of 4 on a 2-vCPU box, which
+      capped submission at ~36 jobs/sec and meant every earlier cell reported
+      the DRIVER's rate. Results on a rig that reports
+      `submission.driver_bound: false`: **177.27 alloc/sec** at 4 eval
+      threads, **219.25** at 16, and **736.1** on `dense_fleet` (44
+      allocations per eval), all at 5,000 nodes on three 4-vCPU managers.
+- [ ] **Reprojection still reads a node's whole allocation list.** The
+      read-model refresh now takes the changeset delta (Done below), but
+      `reproject_model_nodes` still recomputes each touched node's free pool
+      from every allocation on it — so a fill-scaled term survives, in memory
+      rather than in SQLite. Locally, over 44 touched nodes, the refresh went
+      832µs → 496µs at 10 allocations/node and 2.16ms → 1.03ms at 40; what
+      remains is that reprojection plus 44 separate per-scope epoch reads,
+      each taking its own read connection. Making either incremental is its
+      own change: the pool would have to be debited and credited by the
+      delta, and the index reprojection consumes the pool.
+- [ ] **Batch the eval loop (claim N, plan N, apply N, complete N).** Now the
+      whole remaining cost. With the wake herd fixed and health checks shown
+      to be `outcome=empty`, the only meaningful quorum traffic left is
+      `complete_and_claim_next` (44/s) plus ~20/s of plan applies. The
+      amortization curve says the same thing from the other side: 6
+      allocations per eval gives 219 alloc/sec, 44 gives 736, so per-eval
+      overhead is what sets the rate.
+    - [x] **claim N and complete N are done** — phase 4 of
+          [eval-path-raft-cost-plan.md](plans/eval-path-raft-cost-plan.md),
+          documented in
+          [scheduler-and-eval-loop.md](../docs/scheduler-and-eval-loop.md#batching).
+          `Store::claim_evals` takes a batch in one round and
+          `Store::complete_evals_and_claim_next` settles the batch while
+          claiming the next, so the 44/s `complete_and_claim_next` traffic
+          becomes 44/N. The batch is a fair share of the live queue
+          (`pending / evalThreads`, capped at 16), never lingers to fill,
+          and has no config knob. **Unverified at scale**, see below.
+    - [ ] **plan N and apply N are NOT done, and were declined on purpose.**
+          Handlers write as they go across lanes rather than returning a
+          plan, so committing N plans together means restructuring every
+          handler to be a pure function of a snapshot — a scheduler rewrite,
+          not a loop change ([call 2](calls/eval-path-raft-cost-plan_calls.md)).
+          It also overlaps the D5 group commit in `coalesce.rs`, which
+          already batches *concurrent* applies and gets *more* to batch as
+          the claim/complete rounds get cheaper. This is the same target as
+          "the plan-apply commit is serialized" in
+          [aws-phase4-findings.md](aws-phase4-findings.md) (`apply` at 354 ms
+          of a 381 ms total at 100,000 allocations) and should be costed out
+          against that, not against the eval loop.
+    - [ ] **Re-measure with batching on.** Rerun cells G/H from
+          [aws-phase4-findings.md](aws-phase4-findings.md). Expect
+          `legion_raft_ops_total{op="complete_evals_and_claim_next"}` well
+          below the eval rate (it was 44/s at 44 evals/s), and the 3.4x
+          `web_fleet` / `dense_fleet` gap to narrow. Divide that op's rate by
+          `legion_evals_processed_total` for evals-per-round; if it stays at
+          1, the queue never gets deeper than `evalThreads` and the
+          bottleneck is upstream of the eval loop. **A local run cannot
+          measure any of this** — `Store::replicated` short-circuits when
+          raft is off, so a batched claim of N and N single claims execute
+          the same SQL in the same process.
+- [x] **Fix the eval-notifier thundering herd.** `notify_waiters()` woke
+      every parked eval worker on ANY `eval` row change, and each answered
+      with a `claim_eval` — a scheduler-lane quorum round whether or not it
+      found work. Every eval crosses that path three times. Measured at
+      16,678 scheduler-lane raft ops at 4 threads against 47,096 at 16, for
+      identical work, with throughput FALLING as threads rose. Now wakes one
+      worker per newly-claimable eval; empty claims are down to 0.3/sec and
+      16 threads beat 4 by 23.7%. Adds
+      `legion_eval_claim_total{outcome}`, whose absence is what hid it, and
+      an `op` label on `legion_raft_ops_total`.
+- [x] **Stop re-reading every allocation on a node inside the plan-apply
+      commit.** `free_pool_for_node_tx` rebuilt a node's free pool by
+      selecting every allocation row on it and parsing every `resources`
+      blob, inside the serialized commit — so the cost of committing a plan
+      scaled with cluster fill while the work per plan did not (~440 rows per
+      eval at 50k allocations, ~1,760 at 200k, for the same ~44 placements;
+      throughput 736.1 → 456.6 → 272.9 alloc/s). Now cached per node in
+      `node_alloc_usage` and validated on every read against a fingerprint of
+      the live rows (node allocation epoch + row count + id sum), so the
+      cache can never inflate free capacity — the worst a stale row does is
+      cost one rebuild. A Fresh plan's own allocations are read once per
+      plan instead of re-filtered per node. Local A/B on the rebuild: 15.6
+      → 8.6 µs per pool at 10 allocations/node, 37.8 → 9.4 µs at 40 (the
+      old path grows 2.4x over that fill change, the new one 1.08x). See
+      [aws-phase4-findings.md](aws-phase4-findings.md),
+      [benchmarks/scheduler/README.md](../benchmarks/scheduler/README.md) and
+      [scheduler-and-eval-loop.md](../docs/scheduler-and-eval-loop.md#the-per-node-usage-cache).
+      **Unmeasured end to end** — see the open item below.
+- [ ] **Re-measure the `dense_fleet` fill ladder.** The per-node usage cache
+      above targets the apply half of the ~1.6x-per-doubling degradation;
+      the read-model refresh half (`cache_refresh_allocation_scopes`,
+      ~1,700 rows per eval on every replica) is untouched. Re-run the
+      50k/100k/200k ladder at 5,000 nodes and see how much of the slope is
+      left. The fingerprint is still an index-only scan proportional to
+      allocations-per-node, so the slope should flatten rather than vanish.
+- [ ] **Decide the `evalThreads` default.** It is `available_parallelism()`,
+      which is the 4 that placed slowest in the 2026-08-05 sweep at 5,000
+      nodes: 177.27 alloc/s at 4 threads, 208.83 at 8, 219.25 at 16,
+      **251.68 at 32**, and >= 263.08 at 64 where the LOAD GENERATOR became
+      the constraint. An eval worker parks on quorum round trips rather than
+      computing (8% CPU at saturation), so core count is the wrong basis —
+      but the curve never turned over, so the right value is unknown.
+      **Planned, not built** —
+      [eval-thread-default-plan.md](plans/eval-thread-default-plan.md), which
+      deliberately picks no number.
+  - [ ] **Fix the load generator before sweeping again (Phase 0a, the
+        gate).** The driver spawns one `legion job run` CLI process per job,
+        so its rate is bounded by process spawn and gRPC dial, not by
+        Legion. Until a 64-thread cell can report `driver_bound: false`, no
+        point above 32 produces a number. Submit through one long-lived
+        in-process gRPC client; give the loadgen its own instance; shard it
+        if that is not enough. Unblocks the saturation questions in the
+        other scheduler plans too.
+  - [ ] `configs/manager.ncl` pins `evalThreads = 4` explicitly, so it has
+        to move with the default.
+- [ ] **The eval loop blocks tokio worker threads on quorum rounds.**
+      `store.claim_eval()` (`daemon.rs:1719`) and
+      `store.complete_and_claim_next()` (`:1768`) are synchronous calls made
+      directly in the async loop, not inside the `spawn_blocking` the eval
+      *handler* correctly uses. Each parks a runtime worker thread for a
+      whole scheduler-lane quorum round, and there are
+      `available_parallelism()` of those — 4 on the campaign's managers, no
+      matter how high `evalThreads` goes. While they are parked nothing
+      async runs, including polling the completed handlers. Move both onto
+      the blocking pool. This is now a **prerequisite for sweeping past 64
+      eval threads** — at 128 workers against 4 runtime threads the sweep
+      would be measuring this defect rather than the scheduler.
+- [ ] **`run_dispatch_future` has no `Send` bound** (`dispatcher.rs:408`),
+      so holding a `MutexGuard` across an `.await` inside
+      `dispatch_allocations` would **compile**. It does not happen today —
+      the per-allocation loop is entirely synchronous and the awaits come
+      after it — but this is the one spot on the plan path where the type
+      system is not enforcing the invariant. Latent, not a live bug.
+
+      which is the 4 that just lost to 16 by 23.7%. An eval worker parks on
+      quorum round trips rather than computing (8% CPU at saturation), so
+      core count is the wrong basis. A changed default needs a plan under
+      [plans/README.md](plans/README.md)'s rule.
+- [x] **Stop the coalescer polling for its handoff.** A submitter that lost
+      the commit lock slept 1 ms on its reply channel and re-contended, so
+      the lock sat free until some waiter's next tick and every waiter
+      burned a wake-up per millisecond of every commit (phase 4: 347 ms
+      follower wait against a 138 ms commit). The wait is now one
+      `Mutex` + `Condvar`, woken exactly when the commit it queued behind
+      ends. It also fixes a wedge: the old `commit_lock` was held across
+      the batch runner, so a panic there **poisoned** it and every later
+      submitter spun forever. `legion_store_coalesce_wait_rounds_total` now
+      counts extra commits sat through, not poll ticks, and should read 0.
+      Judgement calls, including why the leader deliberately does *not* run
+      a second batch:
+      [eval-path-raft-cost-plan_calls.md](calls/eval-path-raft-cost-plan_calls.md) §3.
+- [ ] **The plan-apply commit is still serialized, and batch size is the
+      arrival rate.** The handoff fix above is worth milliseconds per
+      commit; the 138 ms commit itself is untouched, and `batch_size` 1.32
+      at 16 eval threads means only ~1.3 plan applies arrive per commit
+      period — there is nothing queued to batch. No timer-free coalescer
+      change can raise that (and a timer would tax the lone submitter), so
+      the levers are a cheaper commit or more concurrent demand reaching
+      the coalescer. Find out which by measuring how many threads are
+      actually inside `submit_and_apply_plan` at once —
+      [aws-phase4-findings.md](aws-phase4-findings.md) item 2.
+- [ ] **Skip the health-check write when nothing changed.**
+      `update_node_health_checks` runs ~134/s on a 5,000-node fleet and every
+      one is `outcome=empty`, so it costs no quorum rounds — but it still
+      takes a savepoint and the write connection each time. Cheap to remove,
+      and it is pure contention against real writes.
 - [ ] **Re-measure the plan-apply fix on AWS.** Phase 4 of
       [plan-apply-conflict-reduction-plan.md](plans/plan-apply-conflict-reduction-plan.md).
       The two-pass bind is shipped and unit-proven but **unmeasured at
@@ -1371,6 +1548,31 @@ Deferred from [job-updated-at-plan.md](plans/job-updated-at-plan.md):
       running. Fix: detect a non-tty and either default to proceeding or fail
       loudly, never exit silently on a confirmation prompt. Audit the other
       rig scripts for the same `set -e` + `read` shape.
+- [x] **Bake the operator box's toolchain into an AMI.** Standing the box up
+      installed build-essential, protoc, clang, terraform, AWS CLI v2 and
+      rustup in user-data on every launch: `cloud-init analyze blame` measured
+      `modules-final/config-scripts_user` at **3245 seconds (54 minutes)** on
+      one launch and ~14 minutes on another — same instance type, same region,
+      same script, so it is `apt-get` throughput and nothing the rig controls.
+      All of it paid before any Legion code compiles.
+      `benchmarks/aws/scripts/bake-operator-ami.sh` pays it once into a tagged
+      AMI (~20 min, ~$0.05/mo for the snapshot) and `bootstrap-operator-box.sh`
+      launches from it, leaving only per-instance setup — the rig's SSH key
+      pair — in user-data, so first boot is seconds. Both paths run the one
+      `scripts/operator-toolchain.sh`, whose content hash is tagged onto the
+      image: a toolchain change makes the bootstrap report the image stale and
+      fall back to the slow path rather than launch a box missing a tool. No
+      baked AMI means today's behavior exactly, with a log line saying so.
+      See the README's "Bake the operator AMI first" and
+      [calls #29](calls/aws-comparative-benchmark-plan_calls.md).
+  - [ ] **Bake one against real AWS.** Written and exercised against a stubbed
+        `aws` CLI only (every path: no AMI, current AMI, stale AMI, re-run,
+        `--show`), because a campaign was billing at the time and an extra
+        instance or image would have confused its teardown. Unverified: that
+        console output survives the bake instance's stop (the version tag
+        degrades to `unknown` if not — the power state, not the console, is
+        the completion signal), and that the real bake lands inside the
+        90-minute timeout.
 - [ ] **Share one target dir across plugin builds.** `build.rs` gives every
       plugin its own `CARGO_TARGET_DIR` (`target/plugin-build/<kind>/<name>`)
       and builds them sequentially, and every plugin depends on the whole
@@ -1530,6 +1732,22 @@ Deferred from [job-updated-at-plan.md](plans/job-updated-at-plan.md):
 
 docs: [scheduler-and-eval-loop.md](../docs/scheduler-and-eval-loop.md), [jobs-tasks-and-scheduling.md](../docs/jobs-tasks-and-scheduling.md)
 
+- [x] **The read-model refresh takes the changeset delta, not a whole-node
+      reload.** 2026-08-05, from the phase-4 fill-scaling finding
+      ([findings](aws-phase4-findings.md),
+      [calls](calls/eval-path-raft-cost-plan_calls.md) #2).
+      `cache_refresh_allocation_scopes` reloaded every touched node's ENTIRE
+      allocation list after each committed changeset, on every replica — ~440
+      rows at 50,000 allocations and ~1,760 at 200,000 to learn about the ~44
+      the changeset already named. `cache_apply_allocation_delta` now reads
+      exactly the named rows by primary key and splices them in, so the cost
+      follows the change instead of the fill. What it gives up is
+      self-healing, bounded three ways: a per-node fallback to the full
+      reload when the delta contradicts the cache, a whole-changeset fallback
+      when a record cannot be classified, and a round-robin scrub that
+      reloads one node in full per projected changeset, so drift is repaired
+      within one sweep of the fleet. Two new `warn!` lines fire only when the
+      cache and committed state disagree.
 - [x] **Plan-apply conflict reduction: the epoch is a ranking hint, not a
       gate.** 2026-08-04, from the AWS phase-2 finding that **74% of plan
       applies were rejected and re-planned**

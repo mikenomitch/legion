@@ -8,7 +8,14 @@ set -euo pipefail
 source "$(dirname "$0")/env.sh"
 load_rig
 
-BIN="$REPO_ROOT/target/dist/legion"
+# `dist` is the shipping profile (fat LTO, one codegen unit) and takes
+# ~25 minutes to link on this box. LEGION_BUILD_PROFILE=distfast swaps in
+# thin LTO across 16 units for roughly a third of the time, for sessions
+# where the measurement window is shorter than the build. The fairness
+# record carries the profile, so a cell can never silently claim to be a
+# `dist` result when it is not.
+BUILD_PROFILE="${LEGION_BUILD_PROFILE:-dist}"
+BIN="$REPO_ROOT/target/$BUILD_PROFILE/legion"
 
 SKIP_BUILD=false FORCE_PLUGINS=false
 for arg in "$@"; do
@@ -69,10 +76,10 @@ if ! $SKIP_BUILD; then
     if $PLUGINS_CACHED; then
         log "plugins unchanged (fingerprint $PLUGIN_FP) — reusing the staged bundle"
         log "building legion (dist profile, no plugins; this link is slow by design)"
-        (cd "$REPO_ROOT" && LEGION_SKIP_PLUGIN_BUILD=1 cargo build --profile dist)
+        (cd "$REPO_ROOT" && LEGION_SKIP_PLUGIN_BUILD=1 cargo build --profile "$BUILD_PROFILE")
     else
         log "building legion (dist profile + plugins; this link is slow by design)"
-        (cd "$REPO_ROOT" && LEGION_BUILD_PLUGINS=1 cargo build --profile dist)
+        (cd "$REPO_ROOT" && LEGION_BUILD_PLUGINS=1 cargo build --profile "$BUILD_PROFILE")
     fi
 fi
 [[ -x "$BIN" ]] || {

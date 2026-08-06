@@ -17,6 +17,12 @@ source "$(dirname "$0")/env.sh"
 load_rig
 
 SYSTEM="" NODES="" SCENARIO="" MULTIPLIER="1.0" WARMUP="30" CAMPAIGN=""
+# Jobs submitted in parallel. Each slot is a whole CLI process, so this is
+# what decides whether the cell measures the scheduler or the driver: phase 4
+# found three sessions of "throughput" numbers that were really the driver's
+# 36 jobs/sec submission ceiling. Sized for the loadgen box, and the driver
+# now reports `submission.driver_bound` when it is still the constraint.
+SUBMIT_CONCURRENCY="${LEGION_SUBMIT_CONCURRENCY:-32}"
 # Preferred over --multiplier: sizes the cell to an allocation count
 # rather than to a scale factor over each scenario's own base, which
 # differ (180/304/380) and so scatter under one shared multiplier.
@@ -29,6 +35,7 @@ while [ $# -gt 0 ]; do
     --multiplier) MULTIPLIER="$2" ;;
     --target-allocations) TARGET_ALLOCS="$2" ;;
     --warmup) WARMUP="$2" ;;
+    --submit-concurrency) SUBMIT_CONCURRENCY="$2" ;;
     --campaign) CAMPAIGN="$2" ;;
     *)
         echo "unknown arg $1" >&2
@@ -225,6 +232,7 @@ rsh "$LOADGEN_ADDR" "
         --out '$REMOTE_OUT/run' \
         ${MANAGER:+--manager '$MANAGER'} \
         --warmup-secs '$WARMUP' \
+        --submit-concurrency '$SUBMIT_CONCURRENCY' \
         --legion-bin /usr/local/bin/legion \
         | tee '$REMOTE_OUT/metrics.json'
 "

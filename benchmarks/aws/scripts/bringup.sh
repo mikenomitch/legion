@@ -20,16 +20,16 @@ done
 
 log "waiting for cloud-init (node_exporter) on every box"
 for ip in "${CP_ADDRS[@]}" "$LOADGEN_ADDR"; do
-    # `cloud-init status --wait` exits non-zero when the run ended in
-    # error, and under `set -e` that killed bringup with no output at
-    # all — the box, the failing module, and the reason were all on the
-    # instance and never surfaced. Report them here instead: a cloud-init
-    # failure is a first-boot bug that has to be read to be fixed.
+    # A cloud-init failure is reported, not fatal. It was fatal, and that
+    # turned an observability-only package problem (docker-compose-v2, no
+    # longer resolvable on Noble) into a dead campaign -- twice -- even
+    # though node_exporter had installed fine. The probe immediately below
+    # is the actual requirement, so let it decide.
     if ! rsh "$ip" "cloud-init status --wait >/dev/null"; then
-        echo "cloud-init failed on $ip:" >&2
+        echo "WARNING: cloud-init reported a failure on $ip. The node_exporter" >&2
+        echo "         probe below decides whether it matters:" >&2
         rsh "$ip" "cloud-init status --long 2>&1 | sed 's/^/  /'" >&2 || true
-        rsh "$ip" "sudo tail -30 /var/log/cloud-init-output.log 2>&1 | sed 's/^/  /'" >&2 || true
-        exit 1
+        rsh "$ip" "sudo tail -10 /var/log/cloud-init-output.log 2>&1 | sed 's/^/  /'" >&2 || true
     fi
     # node_exporter listens on 9100, which security.tf opens ONLY
     # intra-rig — so probing it from an operator box could never succeed

@@ -707,6 +707,10 @@ pub struct Metrics {
     pub eval_queue_depth: Arc<Gauge>,
     /// `legion_plan_apply_total{outcome}`
     pub plan_apply_total: Arc<CounterVec>,
+    /// `legion_eval_claim_total{outcome}`
+    pub eval_claim_total: Arc<CounterVec>,
+    /// `legion_eval_handle_seconds{kind}`
+    pub eval_handle_seconds: Arc<HistogramVec>,
     /// `legion_scheduler_plan_candidate_rank`
     pub scheduler_plan_candidate_rank: Arc<Histogram>,
     /// `legion_scheduler_plan_bind_pass{pass}`
@@ -758,7 +762,7 @@ pub struct Metrics {
     pub raft_capture_seconds: Arc<HistogramVec>,
     /// `legion_raft_propose_apply_seconds{lane}`
     pub raft_propose_apply_seconds: Arc<HistogramVec>,
-    /// `legion_raft_ops_total{lane,outcome}`
+    /// `legion_raft_ops_total{lane,op,outcome}`
     pub raft_ops_total: Arc<CounterVec>,
     /// `legion_raft_pipeline_wait_seconds{lane}`
     pub raft_pipeline_wait_seconds: Arc<HistogramVec>,
@@ -855,6 +859,23 @@ impl Metrics {
             },
             series: Series::new(),
         });
+        let eval_claim_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_eval_claim_total",
+                help: "Eval claim attempts by an eval worker, by outcome (claimed|empty). Every attempt is a scheduler-lane quorum round whether or not it finds work, so a high `empty` share means workers are being woken for evals that do not exist and the raft lane is paying for it.",
+                labels: &["outcome"],
+            },
+            series: Series::new(),
+        });
+        let eval_handle_seconds = Arc::new(HistogramVec {
+            meta: FamilyMeta {
+                name: "legion_eval_handle_seconds",
+                help: "Wall time to handle one claimed eval end to end: planning, applying, dispatching the allocations, and the post-apply bookkeeping. Read it AGAINST legion_scheduler_plan_phase_seconds{phase=\"total\"} — the difference is everything an eval does outside planning, which is otherwise invisible. Throughput is roughly evalThreads divided by this.",
+                labels: &["kind"],
+            },
+            series: Series::new(),
+            bounds: DURATION_BUCKETS,
+        });
         let scheduler_plan_candidate_rank = Arc::new(Histogram {
             meta: FamilyMeta {
                 name: "legion_scheduler_plan_candidate_rank",
@@ -938,7 +959,7 @@ impl Metrics {
         // Coalescer (group commit) instrumentation. Three questions, three
         // families: does batching engage at all (batch_size), is a submitter
         // waiting or committing (wait_seconds by role vs commit_seconds), and
-        // how much of the wait is the 1ms re-contend poll (wait_rounds).
+        // how many extra commits it sat through before its own (wait_rounds).
         let store_coalesce_batch_size = Arc::new(HistogramVec {
             meta: FamilyMeta {
                 name: "legion_store_coalesce_batch_size",
@@ -969,7 +990,7 @@ impl Metrics {
         let store_coalesce_wait_rounds_total = Arc::new(CounterVec {
             meta: FamilyMeta {
                 name: "legion_store_coalesce_wait_rounds_total",
-                help: "Times a submitter's 1ms wait for a reply timed out and it re-contended for the commit lock. Divided by the wait_seconds count this is the mean number of poll rounds per request — the part of heartbeat latency that is the coalescer's own polling rather than any commit.",
+                help: "Times a waiting submitter was woken by a finished commit that was neither its own result nor its turn to lead, i.e. it sat through an extra commit. Divided by the wait_seconds count this is the mean number of EXTRA commits a request waits out; 0 means every submitter was served by the first commit it queued behind.",
                 labels: &["path"],
             },
             series: Series::new(),
@@ -1067,8 +1088,8 @@ impl Metrics {
         let raft_ops_total = Arc::new(CounterVec {
             meta: FamilyMeta {
                 name: "legion_raft_ops_total",
-                help: "Replicated store ops by lane and outcome (applied|empty|not_leader|error). empty = the mutation touched no rows and skipped the raft entry.",
-                labels: &["lane", "outcome"],
+                help: "Replicated store ops by lane, op name, and outcome (applied|empty|not_leader|error). empty = the mutation touched no rows and skipped the raft entry. The op name is what makes a busy lane attributable: a lane's op count is its quorum-round count, so the top ops by rate are the ones setting its cost.",
+                labels: &["lane", "op", "outcome"],
             },
             series: Series::new(),
         });
@@ -1269,6 +1290,8 @@ impl Metrics {
             Arc::clone(&nodes) as Arc<dyn RenderMetric>,
             Arc::clone(&eval_conflict_requeues_total) as Arc<dyn RenderMetric>,
             Arc::clone(&plan_apply_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&eval_claim_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&eval_handle_seconds) as Arc<dyn RenderMetric>,
             Arc::clone(&preemption_plans_total) as Arc<dyn RenderMetric>,
             Arc::clone(&preemptions_total) as Arc<dyn RenderMetric>,
             Arc::clone(&raft_applied_index) as Arc<dyn RenderMetric>,
@@ -1308,6 +1331,8 @@ impl Metrics {
             evals_processed_total,
             eval_queue_depth,
             plan_apply_total,
+            eval_claim_total,
+            eval_handle_seconds,
             scheduler_plan_bind_pass,
             scheduler_plan_candidate_rank,
             eval_conflict_requeues_total,
