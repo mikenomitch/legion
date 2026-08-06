@@ -119,6 +119,51 @@ How to use it:
       [eval-path-raft-cost-plan_calls.md](calls/eval-path-raft-cost-plan_calls.md)
       §3. **The `dense_fleet` ladder re-run is the regression test** — see
       the open re-measure item below.
+- [x] **Job intake group-commits on the scheduler and status lanes**
+      (2026-08-06, phase "intake" of
+      [eval-path-raft-cost-plan.md](plans/eval-path-raft-cost-plan.md),
+      documented in
+      [scheduler-and-eval-loop.md](../docs/scheduler-and-eval-loop.md)).
+      A submitted job cost THREE quorum rounds, one per lane, and all
+      three sat on top of the AWS 5,000-node profile in lockstep with the
+      submission rate: `enqueue_eval_after_delay` 19.1 applied/s,
+      `handle_job_submit` 16.6/s, `seed_task_statuses` 16.6/s, against
+      21.9 evals/s overall — while the eval loop's own
+      `complete_evals_and_claim_next`, already batched, sat at 4.2/s.
+      Concurrent submitters now coalesce their scheduler-lane enqueue and
+      their status-lane `task_status` seed through the existing
+      `coalesce.rs` group commit, each request fenced by its own
+      savepoint so one bad submission fails alone. No timer, so a lone
+      `job run` on an idle cluster is byte-for-byte the path it was.
+      `schedulerSettings.job_intake_coalescing = false` takes both back
+      out. Calls:
+      [eval-path-raft-cost-plan_calls.md](calls/eval-path-raft-cost-plan_calls.md)
+      §2. **Unverified at scale** — see the re-measure item below.
+    - [ ] **The control-lane `handle_job_submit` is NOT batched, on
+          purpose.** It derives a config's next version from committed
+          state read through a read connection, so two submits of the
+          same job inside one uncommitted batch transaction would both
+          compute version N+1 — the "there is a race condition here with
+          the version" note in `handle_job_submit_apply`, promoted from
+          rare to routine. The composite is also not one store call:
+          `submit_rendered_job` interleaves `clear_job_stopped_status`,
+          `replace_job_kv_references`, `seed_keyed_instances`,
+          `previous_job_config_id` and rollout creation between the
+          control write and the eval enqueue. Batching it means making
+          the submit a pure function of its request first — a rewrite of
+          the RPC, not a storage change. Intake therefore still costs one
+          quorum round per submitted job.
+    - [ ] **Re-measure intake with batching on.** Same cell as the
+          measurement above (5,000 nodes, `dense_fleet` at 200,000
+          allocations, 16 eval threads, 32 concurrent submitters).
+          `legion_raft_ops_total{op="enqueue_evals_isolated"}` and
+          `{op="seed_task_statuses_batch"}` should be well below the
+          submission rate, and
+          `legion_store_coalesce_batch_size{path="eval_enqueue"}`'s
+          `le="1"` bucket well below its `_count`. **A local run cannot
+          measure this** — `Store::replicated` short-circuits when raft
+          is off, so the batched and unbatched forms execute identical
+          code.
 - [ ] **Batch the eval loop (claim N, plan N, apply N, complete N).** Now the
       whole remaining cost. With the wake herd fixed and health checks shown
       to be `outcome=empty`, the only meaningful quorum traffic left is
@@ -1482,6 +1527,19 @@ The MCP server, self-documenting CLI, structured output, and documented gRPC
 surface all shipped. What's left is the harder "can an agent actually operate
 this" work:
 
+- [ ] **`deduplicated` lies to the loser of a CONCURRENT idempotency-key
+      race, on every mutating RPC except `RunJob`.** Two requests carrying
+      the same key both miss `idempotency_lookup`, and `idempotency_record`
+      (`INSERT OR IGNORE`) already returns which one won — but `stop_job`,
+      `destroy_job`, `scale_task`, the `instance` verbs and the rest
+      discard that boolean and hardcode `deduplicated: false`, so both
+      callers are told they were first. `run_job` was fixed alongside the
+      job-intake group commit (which widens the overlap window); the rest
+      each need their own decision about what the loser should be handed
+      back. Sequential retries — what the key is really for — are correct
+      everywhere. Calls:
+      [eval-path-raft-cost-plan_calls.md](calls/eval-path-raft-cost-plan_calls.md)
+      §17.
 - [ ] An agent can easily write a plugin (scaffolding, schema, a worked example)
 - [ ] An agent can easily configure a worker to talk to a manager
 - [ ] An agent can search the registry and find jobs worth installing and running

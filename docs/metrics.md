@@ -297,8 +297,11 @@ mysteriously slow".
 
 #### Group commit (the coalescer)
 
-Two write paths batch concurrent submitters into one commit: heartbeats
-(`path="heartbeat"`) and scheduler plan applies (`path="plan_apply"`). See
+Four write paths batch concurrent submitters into one commit: heartbeats
+(`path="heartbeat"`), scheduler plan applies (`path="plan_apply"`), and the
+two lane-halves of job intake — the placement eval
+(`path="eval_enqueue"`) and the `task_status` seed
+(`path="task_status_seed"`). See
 [scheduler-and-eval-loop.md](scheduler-and-eval-loop.md). Batching is
 *opportunistic* — a batch forms only from requests that arrive while a commit
 is already in flight — so "batching is configured" and "batching is

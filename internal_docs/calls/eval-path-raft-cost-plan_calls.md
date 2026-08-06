@@ -101,7 +101,99 @@ Ranked by project impact; the number is the rank.
   behind (`remove_node` is a control-lane op and may not write a
   scheduler-lane table), inert and ~100 bytes.
 
-## 2. Meter eval wakes by work, not by the eval table moving
+## 2. Job intake group-commits per lane; the control-lane submit does not
+
+- **The call:** the two *projection* halves of the job-submit composite —
+  the scheduler-lane placement eval (`Store::enqueue_eval*`) and the
+  status-lane `task_status` seed — each get their own `coalesce.rs`
+  coalescer, so concurrent submitters pay one quorum round per lane per
+  *batch* instead of one per lane per *job*. Each request keeps its own
+  result and its own error inside a savepoint. The control-lane
+  `handle_job_submit` is deliberately left unbatched.
+- **Alternatives.** (a) Batch all three halves, `handle_job_submit`
+  included. (b) One coalescer for the whole composite. (c) A short linger
+  window so batches fill before the leader commits. (d) An all-or-nothing
+  batch that re-runs every request singly when any one fails, instead of
+  per-request savepoints. (e) Leave intake alone and keep attacking the
+  apply path.
+- **Trade-off.** Two of the three rounds, not three: a submitted job still
+  costs one control-lane quorum round of its own, so the intake floor is
+  1 round/job rather than 0. And a batch is only as large as the client's
+  actual concurrency — a serial `for job in *.ncl; legion job run` loop
+  batches nothing and is exactly as fast (or slow) as before.
+- **Why (performance, without moving a correctness boundary).** The AWS
+  5,000-node run measured the intake path as the top of the profile, and
+  all three of its rounds move in lockstep with the submission rate:
+  `enqueue_eval_after_delay` 19.1 applied/s, `handle_job_submit` 16.6/s,
+  `seed_task_statuses` 16.6/s, against an overall 21.9 evals/s — while
+  `complete_evals_and_claim_next`, which entry 8 batched, sat at 4.2/s
+  (0.19 rounds/eval). The intake path simply never got the treatment the
+  eval loop's own bookkeeping got, and the driver submits 32 jobs
+  concurrently, so the concurrency to batch is really there.
+  (b) is not implementable: a lane is a separate raft group with its own
+  single-threaded pipeline, so one batch physically cannot span two of
+  them — three lanes means at most three coalescers, and that constraint
+  is what shapes this entry.
+  (a) is where the judgement is, and it is a no. `handle_job_submit_apply`
+  derives the next config version from `get_job_config_optional`, which
+  reads *committed* state through a read connection; today one submit
+  commits before the next reads, because each is its own replicated op.
+  Put two submits of the same job in one uncommitted batch transaction and
+  both read the same latest version and both compute version N+1 — the
+  file's own long-standing "there is a race condition here with the
+  version" note, promoted from rare to routine. The composite is also not
+  one store call: `submit_rendered_job` interleaves
+  `clear_job_stopped_status`, `replace_job_kv_references`,
+  `seed_keyed_instances`, `previous_job_config_id` and rollout creation
+  between the control write and the eval enqueue, several of them reading
+  what the control half just committed. A coalescer needs its batch runner
+  to be one function of the request; making that true here is a rewrite of
+  the submit RPC, not a storage change. Left as open work in
+  [`../TODO.md`](../TODO.md).
+  (c) is rejected for the same reason entry 9 rejects it, and the
+  coalescer's own header says so: this cluster is idle far more often than
+  it is saturated, and a linger buys throughput nobody asked for with
+  latency everybody notices. A lone `legion job run` on an idle cluster
+  goes straight to the commit slot, leads a batch of one, and takes the
+  single-op path unchanged — asserted by
+  `a_batch_of_one_enqueue_is_the_single_enqueue_it_replaced`.
+  (d) is cheaper to write and wrong at the wrong moment: one job whose
+  eval cannot be enqueued would cost its 31 batch-mates a full redo, and
+  the redo is N quorum rounds — the exact cost this change exists to
+  remove. Savepoints make a bad request fail alone, which is what
+  `submit_and_apply_plans` already does per plan.
+  (e) ignores what the profile says is on top.
+- **What a batch may NOT do, and why it still cannot.** `claim_eval`
+  orders strictly by `priority DESC, id ASC`. The coalescer's queue is
+  FIFO and its leader drains from the front, so a batch inserts in arrival
+  order (`id ASC` preserved) and each row still derives its own priority
+  inside its own savepoint — an explicit `--priority`/`--asap` override,
+  else the job's band. Nothing about the queue's semantics is batched.
+- **Failure and leadership.** A typed `NotRaftLeader` on the batch means
+  this node does not lead that lane and nothing was proposed, so every
+  request re-runs through the single-op forwarding path — slower, but it
+  keeps the wire op every manager version understands *and* keeps the
+  typed rejection in each caller's own error chain, which is what the
+  submit path's standing-split tolerance matches on. Any other batch error
+  is reported to every member rather than re-run: unlike a local
+  rejection, an error out of `replicated` can straddle a commit, and
+  re-running would risk enqueueing the batch twice.
+- **Surface.** `schedulerSettings.job_intake_coalescing = false` (default
+  `true`) restores one op per submitter on both lanes — one switch, not
+  two, because they are halves of one composite and an operator taking the
+  change out wants all of it out. Batch caps are constants (64 each), not
+  config, for the reason entry 9 gives. The coalescer's existing metric
+  families gain two `path` values, `eval_enqueue` and `task_status_seed`;
+  `legion_store_coalesce_batch_size{path="eval_enqueue"}`'s `le="1"`
+  bucket against `_count` is how an operator sees whether batching engaged
+  at all.
+- **Unverified.** `Store::replicated` short-circuits when raft is off, so
+  a single-node run executes the batched and unbatched forms as identical
+  code and cannot show the round-trip saving. Correctness is tested
+  locally; the throughput claim needs the AWS rig. Same reasoning as the
+  last entry in this file.
+
+## 3. Meter eval wakes by work, not by the eval table moving
 
 - **The call:** count the evals a changeset makes *claimable* and wake
   exactly that many workers with `notify_one`, instead of calling
@@ -135,7 +227,7 @@ Ranked by project impact; the number is the rank.
   a large `empty` share means workers are being woken for work that does
   not exist.
 
-## 3. Refresh the read model from the changeset delta, giving up self-healing
+## 4. Refresh the read model from the changeset delta, giving up self-healing
 
 - **The call:** after a committed changeset, patch `allocations_by_node`
   from the allocation rows the changeset *named* — one primary-key read
@@ -228,7 +320,7 @@ Ranked by project impact; the number is the rank.
   the node (a pure status UPDATE); placements and removals always bump,
   and the scrub still bounds the rest.
 
-## 4. Fuse claim and complete, rather than making the lane parallel
+## 5. Fuse claim and complete, rather than making the lane parallel
 
 - **The call:** halve the scheduler lane's per-eval quorum rounds by
   fusing the terminal write with the next claim
@@ -246,7 +338,7 @@ Ranked by project impact; the number is the rank.
 - **Why (performance, at a risk the evidence supports).** (c) looked
   refuted: phase 2 measured throughput *falling* from 4 → 16 eval threads,
   which was read at the time as threads and lanes being different
-  resources. Phase 4 found the real cause — the wake herd in entry 2, which
+  resources. Phase 4 found the real cause — the wake herd in entry 3, which
   made every extra thread cost a wasted quorum round — so (c) was never
   tested on its merits. It is worth retrying now that the herd is gone. (b) is the real fix and is
   also the largest possible change to Legion's durability story — the
@@ -259,7 +351,7 @@ Ranked by project impact; the number is the rank.
   worker immediately asks for more work. Do the cheap, safe half first and
   let the measurement decide whether the expensive half is needed.
 
-## 5. The coalescer signals its handoff; the leader does NOT run a second batch
+## 6. The coalescer signals its handoff; the leader does NOT run a second batch
 
 - **The call:** replace the coalescer's poll-and-re-contend wait (a reply
   channel plus a `try_lock` retried every millisecond) with one `Mutex` and
@@ -311,9 +403,9 @@ Ranked by project impact; the number is the rank.
   `a_panicking_leader_does_not_wedge_its_batch_mates`, which hangs
   indefinitely on the old implementation.
 
-## 6. The fused claim is handled before the leadership gate
+## 7. The fused claim is handled before the leadership gate
 
-## 7. Batch the queue's own bookkeeping; leave plan-apply alone
+## 8. Batch the queue's own bookkeeping; leave plan-apply alone
 
 - **The call:** phase 4 batches exactly two things — the claim
   (`Store::claim_evals`) and the terminal write
@@ -331,7 +423,7 @@ Ranked by project impact; the number is the rank.
   (93%) on the saturated `dense_fleet` cell, and this change does not touch
   it. If apply is the real ceiling, batching the queue moves the number less
   than the amortization curve suggests.
-- **Why (correctness, at the same risk budget as entry 2).** (a) is a much
+- **Why (correctness, at the same risk budget as entry 3).** (a) is a much
   larger change than it looks. Handlers do not *produce* a plan and hand it
   back; they write as they go — `handle_job_update` clears a restart marker,
   removes allocations, schedules, then enqueues a follow-up, each its own
@@ -349,7 +441,7 @@ Ranked by project impact; the number is the rank.
   `complete_and_claim_next` traffic phase 4 measured at 44/s down to 44/N,
   and leaves the apply question exactly where phase 4 left it.
 
-## 8. The batch is a fair share of the live queue, sized in code, not config
+## 9. The batch is a fair share of the live queue, sized in code, not config
 
 - **The call:** a worker claims `min(pending / evalThreads, 16)` evals, at
   least one, and never waits for the batch to fill. No config knob.
@@ -364,7 +456,7 @@ Ranked by project impact; the number is the rank.
   proves it matters: 16 eval threads beat 4 by 23.7% once the wake herd was
   fixed, so concurrency across workers is now a real lever. A greedy claim
   gives it back — one worker takes a 16-eval burst and serializes what 16
-  workers could have run at once. It would also undo entry 1: the notifier
+  workers could have run at once. It would also undo entry 3: the notifier
   issues one permit per newly-claimable eval, so a worker that swallowed a
   burst leaves its woken peers claiming nothing, which is precisely the
   empty-claim traffic that fix removed. The fair share is what makes
@@ -382,11 +474,11 @@ Ranked by project impact; the number is the rank.
   *cost* of a batch (how much already-handled work a crash re-runs), not
   its benefit.
 
-## 9. A panicked handler writes nothing
+## 10. A panicked handler writes nothing
 
-## 10. Batched enqueue takes a request struct, not N arguments
+## 11. Batched enqueue takes a request struct, not N arguments
 
-## 11. The batch's terminal write is all-or-nothing, and an unobserved eval is simply left out
+## 12. The batch's terminal write is all-or-nothing, and an unobserved eval is simply left out
 
 - **The call:** `complete_evals_and_claim_next` takes only the outcomes the
   worker actually observed. An eval whose handler panicked, or that a
@@ -406,7 +498,7 @@ Ranked by project impact; the number is the rank.
   member's outcome is not durable until the whole batch finishes, which
   widens the crash window from one eval to sixteen.
 - **Why (correctness, cheaply).** Omission is the only answer that cannot
-  lose work — it is entry 6's rule applied per member instead of per loop
+  lose work — it is entry 7's rule applied per member instead of per loop
   iteration, and it lands the batch in the state `requeue_in_flight_evals`
   already recovers rather than inventing an outcome (a *failed* eval is
   never retried, so a fabricated failure silently drops acknowledged work).
@@ -420,7 +512,7 @@ Ranked by project impact; the number is the rank.
   outcomes we already hold for no gain. (c) gives back most of the win: the
   terminal write is the round phase 4 measured at 44/s.
 
-## 12. Size the read pool from its readers, and publish the negative result
+## 13. Size the read pool from its readers, and publish the negative result
 
 - **The call:** `read_only_conn_pool_size` takes `evalThreads` and returns
   `evalThreads + 4`, capped at 16, instead of
@@ -502,7 +594,7 @@ Ranked by project impact; the number is the rank.
   `legion_store_read_lock_wait_seconds` remains the way to tell whether the
   pool is short.
 
-## 13. The eval worker's own rounds move to the blocking pool, and the terminal write retries before abandoning a batch
+## 14. The eval worker's own rounds move to the blocking pool, and the terminal write retries before abandoning a batch
 
 - **The call:** `claim_evals` and `complete_evals_and_claim_next` run
   under `spawn_blocking` in the eval worker loop (the handler already
@@ -535,7 +627,7 @@ Ranked by project impact; the number is the rank.
   was transient.
 - **Surface.** None. The failure logs gain a `settle_attempts` field.
 
-## 14. The status-projection drain is not supervised as an eval worker
+## 15. The status-projection drain is not supervised as an eval worker
 
 - **The call:** the drain task moved off the eval workers' `JoinSet` onto
   a plain `tokio::spawn`.
@@ -556,7 +648,7 @@ Ranked by project impact; the number is the rank.
   JoinSet is machinery for a case that degrades gracefully without it.
 - **Surface.** None.
 
-## 15. Local benchmarks are reported as a no-regression check only
+## 16. Local benchmarks are reported as a no-regression check only
 
 - **The call:** the PR quotes the local SLO gate as "no regression" and
   explicitly declines to claim a throughput win from it.
@@ -575,3 +667,30 @@ Ranked by project impact; the number is the rank.
   part local runs *can* give: correctness_ratio stayed 1.000 across all
   eight scenarios. The real number needs the rig, and the plan's exit
   criterion says so.
+
+## 17. `RunJob` reports `deduplicated` to the loser of an idempotency race
+
+- **The call:** `run_job` now uses the boolean `Store::idempotency_record`
+  already returns. Two submits carrying the same `idempotency_key`
+  concurrently both miss the pre-submit lookup; the `INSERT OR IGNORE`
+  picks a winner, and the loser now replies `deduplicated: true` carrying
+  the winner's recorded message instead of `deduplicated: false` carrying
+  its own. Only `RunJob` is changed.
+- **Alternatives.** (a) Leave it — the race predates this work.
+  (b) Fail the loser with `AlreadyExists`. (c) Fix the same drop in all
+  fifteen mutating RPCs that discard the boolean.
+- **Trade-off.** The loser pays one extra read (only on the losing path),
+  and the fix is now inconsistent with the other mutating RPCs until they
+  follow — recorded as open work in [`../TODO.md`](../TODO.md).
+- **Why (agent-readiness).** The key exists to promise a retrying agent
+  that it did not create two submissions; telling both callers they were
+  first is the one answer that breaks that promise, and batching the
+  intake path makes the overlap window *more* likely to be hit, not less
+  — which is why it belongs in this change rather than a later one.
+  (b) is wrong for this RPC: submitting the same spec twice is harmless
+  (the second resolves to `Unchanged`), so the loser should be corrected,
+  not failed. (c) is the right end state and the wrong blast radius for a
+  performance change — each of those RPCs needs its own think about what
+  the loser should be handed back.
+- **Surface.** `RunJobReply.deduplicated` is now `true` for the loser of a
+  concurrent same-key submit, and `message` is the winner's.
