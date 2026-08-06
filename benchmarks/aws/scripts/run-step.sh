@@ -17,6 +17,12 @@ source "$(dirname "$0")/env.sh"
 load_rig
 
 SYSTEM="" NODES="" SCENARIO="" MULTIPLIER="1.0" WARMUP="30" CAMPAIGN=""
+# Leave the cell's jobs resident on exit. The storm drill measures
+# time-to-replace for allocations lost with their nodes, so it needs a
+# workload RESIDENT when the fault lands — the 2026-08-06 drill ran after
+# the cell's cleanup and measured a 1,250-node loss with nothing on it:
+# loss-path metrics only, replacement throughput unmeasured.
+KEEP_JOBS=false
 # Jobs submitted in parallel. Each slot is a whole CLI process, so this is
 # what decides whether the cell measures the scheduler or the driver: phase 4
 # found three sessions of "throughput" numbers that were really the driver's
@@ -35,6 +41,9 @@ while [ $# -gt 0 ]; do
     --multiplier) MULTIPLIER="$2" ;;
     --target-allocations) TARGET_ALLOCS="$2" ;;
     --warmup) WARMUP="$2" ;;
+    # Value-taking (`--keep-jobs true`) because this loop shifts two for
+    # every argument.
+    --keep-jobs) KEEP_JOBS="$2" ;;
     --submit-concurrency) SUBMIT_CONCURRENCY="$2" ;;
     --campaign) CAMPAIGN="$2" ;;
     *)
@@ -175,7 +184,7 @@ cleanup_jobs() {
 # existed, Legion correctly treated it as a no-op, no allocations were
 # created, no placement events fired, and the cell reported zero
 # placements as though the event stream were broken.
-trap cleanup_jobs EXIT
+trap '[ "$KEEP_JOBS" = true ] || cleanup_jobs' EXIT
 
 # One or the other, never both: --target-allocations wins when given, and
 # the chosen sizing is echoed so the cell's log says which it was.

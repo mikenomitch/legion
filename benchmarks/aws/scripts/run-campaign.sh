@@ -86,6 +86,9 @@ EVAL_THREADS=""
 # Empty leaves run-step.sh's default. Raise it when a cell reports
 # submission.driver_bound, which means the driver set the measured rate.
 SUBMIT_CONCURRENCY=""
+# Threaded to run-step so a storm drill after the last cell finds a
+# workload still resident (see run-step.sh).
+KEEP_JOBS=false
 while [ $# -gt 0 ]; do
     case "$1" in
     --system)
@@ -143,6 +146,10 @@ while [ $# -gt 0 ]; do
         # The per-cell census gate still refuses a contaminated fleet, so
         # the worst case is a loud failure rather than a bad number.
         RESET_CP=false
+        shift
+        ;;
+    --keep-jobs)
+        KEEP_JOBS=true
         shift
         ;;
     --submit-concurrency)
@@ -349,7 +356,8 @@ for NODES in $STEPS; do
             "$(dirname "$0")/run-step.sh" \
                 --system "$SYSTEM" --nodes "$NODES" --scenario "$SCENARIO" \
                 --target-allocations "$TARGET" --warmup "$WARMUP" --campaign "$CAMPAIGN" \
-                ${SUBMIT_CONCURRENCY:+--submit-concurrency "$SUBMIT_CONCURRENCY"}
+                ${SUBMIT_CONCURRENCY:+--submit-concurrency "$SUBMIT_CONCURRENCY"} \
+                --keep-jobs "$KEEP_JOBS"
         done
     done
 
