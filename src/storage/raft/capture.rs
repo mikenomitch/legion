@@ -613,9 +613,10 @@ mod tests {
     ///
     /// Every eval crosses the projection at least three times (enqueued,
     /// claimed, completed) and the pool used to be woken for all three, with
-    /// `notify_waiters`. Each woken worker answers with a `claim_eval`, and
-    /// that is a scheduler-lane quorum round whether or not it finds work —
-    /// so a pool of N paid N rounds per transition and N-1 came back empty.
+    /// `notify_waiters`. Each woken worker answers with a `claim_eval` — a
+    /// capture on the write connection, and a scheduler-lane quorum round
+    /// whenever it finds work — so a pool of N paid N claims per transition
+    /// and N-1 came back empty.
     /// The AWS phase-3 campaign measured 2.8x the scheduler-lane raft ops at
     /// 16 workers versus 4, for identical work, and LOWER throughput.
     #[test]

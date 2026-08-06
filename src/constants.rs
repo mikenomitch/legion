@@ -63,6 +63,16 @@ pub const DEF_MANAGER_ADDRESS: &str = "http://127.0.0.1:4747";
 pub const DEF_WORKER_CHECK_SEC: u64 = 2;
 pub const DEF_SCHEDULING_POLICY: &str = "bin_pack";
 pub const DEF_EVAL_PRIORITY: i64 = 50;
+// How far below the cluster's default eval priority a `node_lost_reschedule`
+// eval is enqueued. The eval queue is strict `priority DESC, id ASC`, so at
+// EQUAL priority a mass node-loss event's recovery backlog runs strictly
+// ahead of every newer submission (measured on the 2026-08-04 AWS rig: ~3,000
+// lost nodes slowed job submission to ~6s per job behind 2,752 queued
+// reschedules). Recovery is bulk background work that the monitor re-drives
+// every tick; a submission is someone waiting. One band below the default
+// lets submissions overtake the backlog while reschedules still outrank
+// anything an operator explicitly deprioritized.
+pub const NODE_LOST_RESCHEDULE_PRIORITY_DROP: i64 = 10;
 pub const DEF_ROLLOUT_RETENTION_DAYS: u64 = 30;
 // Debounce window (ms) for KV-driven job reconciliation: rapid puts/deletes
 // to watched keys are coalesced and applied once per quiet window. 0 applies

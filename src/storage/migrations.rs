@@ -1186,6 +1186,25 @@ pub fn get_migrations() -> Migrations<'static> {
         )",
         )
         .down("DROP TABLE IF EXISTS node_alloc_usage;"),
+        // `node_alloc_usage.policy_fingerprint`: the resource policy the
+        // cached aggregate was normalized under (adversarial finding,
+        // 2026-08-06). The row-set fingerprint above (epoch, count, id sum)
+        // is pure row IDENTITY — it cannot see the manager's
+        // `taskResourceDefaults`/`customResources` changing across a
+        // restart, and an aggregate normalized under the OLD defaults would
+        // keep validating forever on any node whose rows don't move.
+        // Raising a default would then understate cached usage on every
+        // quiet node: silent overcommit. The read path only serves a row
+        // whose fingerprint equals the running policy's
+        // (`ResourcePolicy::fingerprint`), so a policy change costs one
+        // rebuild per node — the same as the cache's cold start.
+        //
+        // Nullable, no backfill, and rollback-safe in both directions: rows
+        // written before this column (or by an older binary after a
+        // rollback, whose INSERT names only the original columns) carry
+        // NULL, which never equals a fingerprint, so they are rebuilt
+        // rather than trusted.
+        M::up("ALTER TABLE node_alloc_usage ADD COLUMN policy_fingerprint TEXT;").down(""),
     ])
 }
 

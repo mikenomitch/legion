@@ -273,6 +273,17 @@ pub struct SchedulingReadModel {
     /// plan, so churny fleets pay at most what they paid before this cache
     /// existed.
     pub(crate) available_nodes_cache: Option<Arc<Vec<Arc<Node>>>>,
+    /// Per-node aggregated allocation usage ([`NodeUsage`]) — the memo that
+    /// makes reprojection O(resource dims) instead of O(allocations on the
+    /// node). Strictly derived from `allocations_by_node`: the delta path
+    /// adjusts an entry only when it knows the exact rows it spliced, and
+    /// EVERY wholesale list replacement (scope refresh, scrub, drift
+    /// reload, node removal) drops the entry so the next reprojection
+    /// rebuilds it from the list. An absent entry is always safe — it costs
+    /// one `NodeUsage::from_rows` walk, which is exactly what every
+    /// reprojection cost before the memo existed. Never published on its
+    /// own: all writes happen under the same lock as the list they mirror.
+    pub(crate) node_usage: HashMap<String, NodeUsage>,
 }
 
 /// The allocation-row changes one committed changeset names, collected by
@@ -700,6 +711,11 @@ pub struct Store {
     /// at startup on malformed declarations).
     pub index_settings: Arc<IndexSettings>,
     pub resource_policy: ResourcePolicy,
+    /// Canonical fingerprint of `resource_policy`
+    /// ([`ResourcePolicy::fingerprint`]), computed once — it gates every
+    /// `node_alloc_usage` cache read, and serializing the policy per read
+    /// would put JSON work back on the path the cache exists to clear.
+    resource_policy_fingerprint: Arc<str>,
     persistence_driver: Arc<dyn PersistenceDriver>,
     read_model: Arc<RwLock<SchedulingReadModel>>,
     // Cross-task wake signal for eval workers waiting on an empty queue.
@@ -1189,6 +1205,7 @@ impl Store {
             &config.scheduling_policy,
         )?);
 
+        let resource_policy_fingerprint: Arc<str> = resource_policy.fingerprint().into();
         let store = Store {
             write_conn,
             read_conns: Arc::new(read_conns),
@@ -1200,6 +1217,7 @@ impl Store {
             scheduler_settings: config.scheduler_settings.clone(),
             index_settings,
             resource_policy,
+            resource_policy_fingerprint,
             persistence_driver,
             read_model: Arc::new(RwLock::new(SchedulingReadModel::default())),
             eval_notify: Arc::new(Notify::new()),
@@ -2338,6 +2356,9 @@ impl Store {
             // previous model's counter + 1 when it publishes the rebuild.
             generation: 0,
             available_nodes_cache: None,
+            // Populated by the reprojection below, node by node, while the
+            // model is still private to this builder.
+            node_usage: HashMap::new(),
         };
         let id_refs: Vec<&str> = node_ids.iter().map(String::as_str).collect();
         Self::reproject_model_nodes(&mut model, &self.resource_policy, &id_refs);
@@ -2352,6 +2373,18 @@ impl Store {
     /// allocation changes — calls this inside the same write lock as the
     /// mutation, so derived state is never observable out of step with
     /// `nodes`. Unavailable or deleted nodes lose both.
+    ///
+    /// The pool comes from the per-node [`NodeUsage`] memo
+    /// (`SchedulingReadModel::node_usage`) when one is cached: subtracting
+    /// the aggregate is O(resource dims), where the row walk this replaces
+    /// re-normalized every allocation's resources JSON on the node — an
+    /// O(allocations-on-node) cost, per touched node, on every replica,
+    /// inside this write lock, that grew with cluster FILL while the change
+    /// being projected did not (the fill-degradation mechanism named in
+    /// aws-phase4-findings.md). A node with no memo entry pays one
+    /// [`NodeUsage::from_rows`] walk here — the exact cost every call paid
+    /// before the memo — and caches the result. A node whose rows fail to
+    /// parse keeps the row walk's fits-nothing posture and caches nothing.
     fn reproject_model_nodes(
         model: &mut SchedulingReadModel,
         policy: &ResourcePolicy,
@@ -2362,15 +2395,39 @@ impl Store {
         }
         let started = Instant::now();
         for node_id in node_ids {
-            match model.nodes.get(*node_id) {
+            // Arc clone, not a borrow: the memo insert below needs `model`
+            // mutably while the node is still in hand.
+            let node = model.nodes.get(*node_id).cloned();
+            match node {
                 Some(node) if node.availability == "available" => {
-                    let allocations = model
-                        .allocations_by_node
-                        .get(*node_id)
-                        .map(|allocations| allocations.as_slice())
-                        .unwrap_or(&[]);
-                    let pool = ResourcePool::free_for_node(node, allocations, policy);
-                    model.indexes.reindex_node(node, &pool);
+                    let pool = match model.node_usage.get(*node_id) {
+                        Some(usage) => ResourcePool::free_from_usage(&node, usage),
+                        None => {
+                            let allocations = model
+                                .allocations_by_node
+                                .get(*node_id)
+                                .map(|allocations| allocations.as_slice())
+                                .unwrap_or(&[]);
+                            match NodeUsage::from_rows(
+                                allocations
+                                    .iter()
+                                    .map(|allocation| (allocation.id, &allocation.resources)),
+                                policy,
+                            ) {
+                                Ok(usage) => {
+                                    let pool = ResourcePool::free_from_usage(&node, &usage);
+                                    model.node_usage.insert((*node_id).to_string(), usage);
+                                    pool
+                                }
+                                // A row nobody could read: the row walk owns
+                                // this case — it warns naming the node and
+                                // yields the fits-nothing empty pool — and no
+                                // aggregate is cached for it.
+                                Err(_) => ResourcePool::free_for_node(&node, allocations, policy),
+                            }
+                        }
+                    };
+                    model.indexes.reindex_node(&node, &pool);
                     model
                         .node_pools
                         .insert((*node_id).to_string(), Arc::new(pool));
@@ -2467,6 +2524,7 @@ impl Store {
         guard.allocations_by_node.remove(id);
         guard.indexes.remove_node(id);
         guard.node_pools.remove(id);
+        guard.node_usage.remove(id);
         guard.available_nodes_cache = None;
         // Removing a node removes its allocations from the capacity view.
         guard.generation = guard.generation.wrapping_add(1);
@@ -2515,23 +2573,83 @@ impl Store {
                 per_node.push((node_id.clone(), allocs));
             }
         }
+        // Re-aggregate each reloaded node's usage memo from the fresh rows
+        // HERE, outside the write lock, so the JSON normalization cost never
+        // extends the lock hold (`SchedulingReadModel::node_usage`). A node
+        // whose rows fail to parse gets no aggregate; reprojection then
+        // takes the row walk's fits-nothing path for it.
+        let usage_per_node: Vec<(String, Option<NodeUsage>)> = per_node
+            .iter()
+            .map(|(node_id, allocs)| {
+                let usage = NodeUsage::from_rows(
+                    allocs
+                        .iter()
+                        .map(|allocation| (allocation.id, &allocation.resources)),
+                    &self.resource_policy,
+                )
+                .ok();
+                (node_id.clone(), usage)
+            })
+            .collect();
         // 3. Publish atomically, then re-derive the affected nodes' free
         // pools and index projections from the refreshed allocations —
         // inside the same lock, so `node_pools`/`indexes` can never be
         // observed out of step with `allocations_by_node` (the
         // plan-snapshot cache's own invariant).
+        //
+        // A scope whose mirror epoch is already AHEAD of the one this
+        // refresh read is skipped wholesale (list, usage, epoch): a delta
+        // projection published newer state for it between our reads and
+        // this lock, and overwriting that with our older snapshot would be
+        // a lost update the deltas cannot see afterwards — a splice
+        // contradicts the cache only when it touches the erased rows, so
+        // the hole could otherwise persist until the round-robin scrub
+        // reached the node (adversarial finding, 2026-08-06). Skipping is
+        // safe precisely because what we would have written is OLDER than
+        // what is there. The residual window is a concurrent commit that
+        // bumps NO scope epoch of the node (a pure status UPDATE);
+        // placements and removals — the capacity-bearing changes — always
+        // bump, and the scrub still bounds the rest.
         let mut guard = self.read_model_writer()?;
+        let stale_scopes: HashSet<&str> = epochs
+            .iter()
+            .filter(|(key, epoch)| guard.scope_epochs.get(key).copied().unwrap_or(0) > *epoch)
+            .map(|(key, _)| key.as_str())
+            .collect();
+        let node_stale =
+            |node_id: &str| stale_scopes.contains(Self::scope_vector_key("node", node_id).as_str());
+        let mut published_nodes: Vec<String> = Vec::with_capacity(per_node.len());
         for (node_id, allocs) in per_node {
+            if node_stale(&node_id) {
+                continue;
+            }
+            published_nodes.push(node_id.clone());
             guard.allocations_by_node.insert(node_id, Arc::new(allocs));
         }
-        for (key, epoch) in epochs {
-            guard.scope_epochs.insert(key, epoch);
+        for (node_id, usage) in usage_per_node {
+            if node_stale(&node_id) {
+                continue;
+            }
+            match usage {
+                Some(usage) => {
+                    guard.node_usage.insert(node_id, usage);
+                }
+                None => {
+                    guard.node_usage.remove(&node_id);
+                }
+            }
+        }
+        for (key, epoch) in epochs.iter() {
+            if stale_scopes.contains(key.as_str()) {
+                continue;
+            }
+            guard.scope_epochs.insert(key.clone(), *epoch);
         }
         // Every allocation/epoch publish bumps the counter (this path and
         // the delta path below); the bump is what lets in-flight lazy-sample
         // plans detect the publish (see `SchedulingReadModel::generation`).
         guard.generation = guard.generation.wrapping_add(1);
-        let affected: Vec<&str> = node_ids.iter().map(String::as_str).collect();
+        let affected: Vec<&str> = published_nodes.iter().map(String::as_str).collect();
         Self::reproject_model_nodes(&mut guard, &self.resource_policy, &affected);
         Ok(())
     }
@@ -2547,16 +2665,32 @@ impl Store {
     ) -> R<Vec<(String, i64)>> {
         let mut epochs: Vec<(String, i64)> =
             Vec::with_capacity(node_ids.len() + job_config_ids.len());
+        // ONE read connection and ONE cached statement for the whole scope
+        // set. This runs after every plan apply on every replica, over the
+        // ~44 nodes a dense plan touches — as separate
+        // `allocation_epoch_for_scope` calls it was 44 read-pool
+        // acquisitions and 44 statement parses per eval, contending with the
+        // planners the pool exists to serve.
+        let conn = self.read_connection()?;
+        let mut stmt = conn.prepare_cached(
+            "SELECT epoch FROM allocation_epoch_partition WHERE scope_type = ?1 AND scope_id = ?2;",
+        )?;
+        let mut read = |scope_type: &str, scope_id: &str| -> R<i64> {
+            let epoch: Option<i64> = stmt
+                .query_row(params![scope_type, scope_id], |row| row.get(0))
+                .optional()?;
+            Ok(epoch.unwrap_or(0))
+        };
         for node_id in node_ids {
             epochs.push((
                 Self::scope_vector_key("node", node_id),
-                self.allocation_epoch_for_scope("node", node_id)?,
+                read("node", node_id)?,
             ));
         }
         for job_config_id in job_config_ids {
             epochs.push((
                 Self::scope_vector_key("job_config", job_config_id),
-                self.allocation_epoch_for_scope("job_config", job_config_id)?,
+                read("job_config", job_config_id)?,
             ));
         }
         Ok(epochs)
@@ -2661,6 +2795,19 @@ impl Store {
             return self.cache_refresh_allocation_scopes(node_ids, job_config_ids);
         }
 
+        // Re-aggregate the scrubbed node's usage memo off-lock, like the
+        // full-refresh path does — the JSON normalization must not extend
+        // the write-lock hold.
+        let scrubbed_usage: Option<NodeUsage> = scrubbed.as_ref().and_then(|(_, allocations)| {
+            NodeUsage::from_rows(
+                allocations
+                    .iter()
+                    .map(|allocation| (allocation.id, &allocation.resources)),
+                &self.resource_policy,
+            )
+            .ok()
+        });
+
         // 3. Publish atomically. Nodes whose delta contradicts the cache are
         //    collected here and reloaded in full AFTER the lock is dropped —
         //    a reload needs the database, and holding the write lock across
@@ -2673,8 +2820,17 @@ impl Store {
             // nodes is a removal from the old node plus an upsert into the
             // new one, and the removal has to land before the upsert.
             for (id, node_id) in &delta.removals {
-                if !Self::cache_drop_allocation_entry(&mut guard, node_id, *id) {
-                    drifted.insert(node_id.clone());
+                match Self::cache_drop_allocation_entry(&mut guard, node_id, *id) {
+                    Some(removed) => Self::cache_adjust_node_usage(
+                        &mut guard,
+                        &self.resource_policy,
+                        node_id,
+                        Some(&removed.resources),
+                        None,
+                    ),
+                    None => {
+                        drifted.insert(node_id.clone());
+                    }
                 }
                 touched.insert(node_id.clone());
             }
@@ -2690,13 +2846,24 @@ impl Store {
                     CachedEntry::Present
                 };
                 let node_id = allocation.node_id.clone();
-                if !Self::cache_splice_allocation_entry(&mut guard, allocation, expected) {
+                let added_resources = allocation.resources.clone();
+                let (as_expected, replaced) =
+                    Self::cache_splice_allocation_entry(&mut guard, allocation, expected);
+                if !as_expected {
                     drifted.insert(node_id.clone());
                 }
+                Self::cache_adjust_node_usage(
+                    &mut guard,
+                    &self.resource_policy,
+                    &node_id,
+                    replaced.as_ref().map(|replaced| &replaced.resources),
+                    Some(&added_resources),
+                );
                 touched.insert(node_id);
             }
             // The scrub's wholesale reload lands last so it wins over any
-            // splice into the same node — it is the newer read of the two.
+            // splice into the same node — it is the newer read of the two,
+            // and its memo entry replaces whatever the splices left.
             if let Some((node_id, allocations)) = scrubbed {
                 // A node that left the fleet between the read and here must
                 // not be resurrected in the allocation map.
@@ -2704,8 +2871,23 @@ impl Store {
                     guard
                         .allocations_by_node
                         .insert(node_id.clone(), Arc::new(allocations));
+                    match scrubbed_usage {
+                        Some(usage) => {
+                            guard.node_usage.insert(node_id.clone(), usage);
+                        }
+                        None => {
+                            guard.node_usage.remove(&node_id);
+                        }
+                    }
                     touched.insert(node_id);
                 }
+            }
+            // A drifted node's list no longer matches what the memo was
+            // adjusted toward; drop the entry so the reprojection below
+            // rebuilds it from the list actually published, and the full
+            // reload after the lock re-aggregates it from committed state.
+            for node_id in &drifted {
+                guard.node_usage.remove(node_id);
             }
             for (key, epoch) in epochs {
                 guard.scope_epochs.insert(key, epoch);
@@ -2730,32 +2912,34 @@ impl Store {
         Ok(())
     }
 
-    /// Removes `allocation_id` from `node_id`'s cached list, reporting
-    /// whether it was there. A miss means the cache disagrees with committed
-    /// state — the delta path's drift signal.
+    /// Removes `allocation_id` from `node_id`'s cached list, returning the
+    /// removed row so the caller can take its usage back out of the node's
+    /// [`NodeUsage`] memo. `None` means the row was not there — the cache
+    /// disagrees with committed state, the delta path's drift signal.
     fn cache_drop_allocation_entry(
         model: &mut SchedulingReadModel,
         node_id: &str,
         allocation_id: i64,
-    ) -> bool {
-        let Some(entry) = model.allocations_by_node.get_mut(node_id) else {
-            return false;
-        };
+    ) -> Option<Allocation> {
+        let entry = model.allocations_by_node.get_mut(node_id)?;
         // Copy-on-write: a plan may still hold the previous snapshot.
         let allocations = Arc::make_mut(entry);
-        let before = allocations.len();
-        allocations.retain(|allocation| allocation.id != allocation_id);
-        allocations.len() != before
+        let index = allocations
+            .iter()
+            .position(|allocation| allocation.id == allocation_id)?;
+        Some(allocations.remove(index))
     }
 
     /// Splices one allocation into its node's cached list, replacing any
-    /// entry with the same id. Reports whether the list held what
-    /// `expected` said it would — `false` is the delta path's drift signal.
+    /// entry with the same id. The `bool` reports whether the list held
+    /// what `expected` said it would — `false` is the delta path's drift
+    /// signal — and the `Option` carries the row this splice replaced, so
+    /// the caller can swap its usage out of the node's [`NodeUsage`] memo.
     fn cache_splice_allocation_entry(
         model: &mut SchedulingReadModel,
         allocation: Allocation,
         expected: CachedEntry,
-    ) -> bool {
+    ) -> (bool, Option<Allocation>) {
         let entry = model
             .allocations_by_node
             .entry(allocation.node_id.clone())
@@ -2768,17 +2952,52 @@ impl Store {
             CachedEntry::Absent => existing.is_none(),
             CachedEntry::Present => existing.is_some(),
         };
-        match existing {
-            Some(index) => allocations[index] = allocation,
+        let replaced = match existing {
+            Some(index) => Some(std::mem::replace(&mut allocations[index], allocation)),
             None => {
                 allocations.push(allocation);
                 // Keep the list in id order, which is the order a full
                 // reload produces (the node_id index scans by rowid), so the
                 // two paths are comparable row for row.
                 allocations.sort_unstable_by_key(|allocation| allocation.id);
+                None
             }
+        };
+        (as_expected, replaced)
+    }
+
+    /// Applies one splice's effect to a node's [`NodeUsage`] memo: the
+    /// replaced/removed row's usage comes out, the inserted row's goes in.
+    /// A node with no memo entry needs nothing — the next reprojection
+    /// rebuilds it from the list. A row whose resources fail to parse
+    /// poisons the aggregate, so the entry is dropped instead and the next
+    /// reprojection takes the row walk's fits-nothing path.
+    fn cache_adjust_node_usage(
+        model: &mut SchedulingReadModel,
+        policy: &ResourcePolicy,
+        node_id: &str,
+        removed_resources: Option<&Value>,
+        added_resources: Option<&Value>,
+    ) {
+        if !model.node_usage.contains_key(node_id) {
+            return;
         }
-        as_expected
+        let removed_request = removed_resources.map(|resources| policy.usage_request(resources));
+        let added_request = added_resources.map(|resources| policy.usage_request(resources));
+        let parses = |request: &Option<R<ResourceRequest>>| !matches!(request, Some(Err(_)));
+        if !parses(&removed_request) || !parses(&added_request) {
+            model.node_usage.remove(node_id);
+            return;
+        }
+        let Some(usage) = model.node_usage.get_mut(node_id) else {
+            return;
+        };
+        if let Some(Ok(request)) = removed_request {
+            usage.remove(&request);
+        }
+        if let Some(Ok(request)) = added_request {
+            usage.add(&request);
+        }
     }
 
     /// Next node in the round-robin allocation scrub (see
@@ -4668,12 +4887,24 @@ impl Store {
     /// paying for the walk until the bad row is corrected or removed.
     fn node_usage_tx(&self, tx: &Connection, node_id: &str) -> R<Option<NodeUsageSnapshot>> {
         let (epoch, count, id_sum) = self.node_alloc_fingerprint_tx(tx, node_id)?;
+        // `policy_fingerprint` is part of the validation, not a filter
+        // nicety: the row-set fingerprint cannot see the resource policy
+        // changing across a restart, and an aggregate normalized under an
+        // old policy must never be served under a new one (see the
+        // migration note). NULL — a row written before the column existed,
+        // or by an older binary — never matches, so it rebuilds.
         let cached: Option<String> = tx
             .query_row(
                 "SELECT usage_json FROM node_alloc_usage \
                  WHERE node_id = ?1 AND alloc_epoch = ?2 AND alloc_count = ?3 \
-                   AND alloc_id_sum = ?4;",
-                params![node_id, epoch, count, id_sum],
+                   AND alloc_id_sum = ?4 AND policy_fingerprint = ?5;",
+                params![
+                    node_id,
+                    epoch,
+                    count,
+                    id_sum,
+                    self.resource_policy_fingerprint.as_ref()
+                ],
                 |row| row.get(0),
             )
             .optional()?;
@@ -4833,19 +5064,22 @@ impl Store {
             }
             tx.execute(
                 "INSERT INTO node_alloc_usage \
-                     (node_id, alloc_epoch, alloc_count, alloc_id_sum, usage_json) \
-                 VALUES (?1, ?2, ?3, ?4, ?5) \
+                     (node_id, alloc_epoch, alloc_count, alloc_id_sum, usage_json, \
+                      policy_fingerprint) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
                  ON CONFLICT(node_id) DO UPDATE SET \
                      alloc_epoch = excluded.alloc_epoch, \
                      alloc_count = excluded.alloc_count, \
                      alloc_id_sum = excluded.alloc_id_sum, \
-                     usage_json = excluded.usage_json;",
+                     usage_json = excluded.usage_json, \
+                     policy_fingerprint = excluded.policy_fingerprint;",
                 params![
                     snapshot.node_id,
                     epoch,
                     count,
                     id_sum,
-                    serde_json::to_string(&snapshot.total)?
+                    serde_json::to_string(&snapshot.total)?,
+                    self.resource_policy_fingerprint.as_ref()
                 ],
             )?;
         }
@@ -6241,9 +6475,7 @@ impl Store {
             s.mark_nodes_as_lost_apply(&ids_owned)
         })?;
         self.sync_node_availability(ids, "unavailable")?;
-        for node_id in ids {
-            self.enqueue_lost_node_reschedule(node_id)?;
-        }
+        self.enqueue_lost_node_reschedules(ids)?;
         Ok(())
     }
 
@@ -6274,30 +6506,111 @@ impl Store {
 
         Ok(())
     }
-    /// Enqueue the scheduler-lane reschedule pass for a lost node as its own
-    /// scheduler-lane eval op (plan §7-C2, C-2), skipping the enqueue while one is
-    /// already pending/in-flight for the node (the monitor re-drives every
-    /// tick, so a completed pass is re-enqueued on the next tick until the
-    /// node recovers or nothing is left to free — the recheck-loop
-    /// behavior, now eval-shaped).
-    fn enqueue_lost_node_reschedule(&self, node_id: &str) -> R<()> {
-        let already_queued: bool = {
-            let conn = self.read_connection()?;
-            conn.query_row(
-                "SELECT EXISTS (
-                     SELECT 1 FROM eval
-                     WHERE status IN ('pending', 'in_flight')
-                       AND type = 'node_lost_reschedule' AND node_id = ?1
-                 );",
-                [node_id],
-                |row| row.get(0),
-            )?
-        };
-        if already_queued {
+    /// Enqueue the scheduler-lane reschedule pass for a batch of lost nodes
+    /// (plan §7-C2, C-2): drop nodes with a pass already pending/in-flight,
+    /// drop nodes with NOTHING to reschedule, and enqueue the remainder in
+    /// ONE scheduler-lane round. The monitor re-drives every tick, so a
+    /// completed pass — or an allocation that lands on a lost node after a
+    /// filter — is picked up on the next tick until the node recovers or
+    /// nothing is left to free.
+    ///
+    /// This used to be one EXISTS probe plus one scheduler-lane quorum
+    /// round PER NODE, inline in the status checker: the 2026-08-04 AWS rig
+    /// measured a ~3,000-node loss producing 2,752 reschedule evals against
+    /// 66 job submissions with a 764-deep queue, and most of those nodes
+    /// had nothing on them (the empty check lived inside the eval handler,
+    /// after the enqueue, claim, and terminal write had each been through
+    /// raft).
+    ///
+    /// The evals are enqueued BELOW the default priority
+    /// ([`NODE_LOST_RESCHEDULE_PRIORITY_DROP`]): the queue is strict
+    /// `priority DESC, id ASC`, so at equal priority a recovery backlog
+    /// starves every newer submission behind it.
+    fn enqueue_lost_node_reschedules(&self, node_ids: &[String]) -> R<()> {
+        if node_ids.is_empty() {
             return Ok(());
         }
-        self.enqueue_eval("node_lost_reschedule", None, None, Some(node_id), None)?;
-        Ok(())
+        let already_queued = self.queued_lost_node_reschedules()?;
+        let with_allocations = self.nodes_with_allocations(node_ids)?;
+        let priority = self
+            .default_eval_priority
+            .saturating_sub(crate::constants::NODE_LOST_RESCHEDULE_PRIORITY_DROP);
+        let requests: Vec<EvalRequest> = node_ids
+            .iter()
+            .filter(|node_id| {
+                !already_queued.contains(*node_id) && with_allocations.contains(*node_id)
+            })
+            .map(|node_id| EvalRequest {
+                kind: "node_lost_reschedule".to_owned(),
+                job_id: None,
+                job_config_id: None,
+                node_id: Some(node_id.clone()),
+                priority: Some(priority),
+                delay: Duration::ZERO,
+            })
+            .collect();
+        if requests.is_empty() {
+            return Ok(());
+        }
+        match self.enqueue_evals(requests) {
+            Ok(_) => Ok(()),
+            // The batched enqueue is not forwarding-aware (a new wire
+            // variant would be a cross-version message; judgement call).
+            // Under split lane leadership — this status-lane leader does
+            // not lead the scheduler lane — fall back to the per-node
+            // forwarding path, which is exactly what every enqueue was
+            // before batching.
+            Err(err) if crate::storage::raft::driver::NotRaftLeader::in_chain(&err) => {
+                for node_id in node_ids {
+                    if already_queued.contains(node_id) || !with_allocations.contains(node_id) {
+                        continue;
+                    }
+                    self.enqueue_eval(
+                        "node_lost_reschedule",
+                        None,
+                        None,
+                        Some(node_id),
+                        Some(priority),
+                    )?;
+                }
+                Ok(())
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Nodes (of `node_ids`) that currently hold at least one allocation
+    /// row. Chunked `IN` so a mass-loss batch stays inside SQLite's bound
+    /// parameter limit.
+    fn nodes_with_allocations(&self, node_ids: &[String]) -> R<HashSet<String>> {
+        let mut with_allocations = HashSet::new();
+        let conn = self.read_connection()?;
+        for chunk in node_ids.chunks(500) {
+            let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+            let sql = format!(
+                "SELECT DISTINCT node_id FROM allocation WHERE node_id IN ({placeholders});"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(params_from_iter(chunk), |row| row.get::<_, String>(0))?;
+            for row in rows {
+                with_allocations.insert(row?);
+            }
+        }
+        Ok(with_allocations)
+    }
+
+    /// Node ids with a `node_lost_reschedule` eval already pending or in
+    /// flight — one query for the whole fleet instead of one EXISTS probe
+    /// per node per tick (heartbeat-scale plan §4).
+    fn queued_lost_node_reschedules(&self) -> R<HashSet<String>> {
+        let conn = self.read_connection()?;
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT node_id FROM eval
+             WHERE status IN ('pending', 'in_flight')
+               AND type = 'node_lost_reschedule' AND node_id IS NOT NULL;",
+        )?;
+        let queued = Self::collect_rows(stmt.query_map([], |row| row.get(0))?)?;
+        Ok(queued.into_iter().collect())
     }
 
     /// When the node was marked lost (RFC3339), or `None` while it is not
@@ -6379,41 +6692,16 @@ impl Store {
         if node_ids.is_empty() {
             return;
         }
-        // One query for every lost node's pending/in-flight reschedule eval
-        // instead of one EXISTS probe per node per tick (heartbeat-scale
-        // plan §4): the semantics are identical — re-enqueue whenever no
-        // eval is queued — but a 2,000-node partition costs one query per
-        // tick, not 2,000.
-        let already_queued: HashSet<String> = {
-            let queued = (|| -> R<Vec<String>> {
-                let conn = self.read_connection()?;
-                let mut stmt = conn.prepare(
-                    "SELECT DISTINCT node_id FROM eval
-                     WHERE status IN ('pending', 'in_flight')
-                       AND type = 'node_lost_reschedule' AND node_id IS NOT NULL;",
-                )?;
-                let queued = Self::collect_rows(stmt.query_map([], |row| row.get(0))?)?;
-                Ok(queued)
-            })();
-            match queued {
-                Ok(queued) => queued.into_iter().collect(),
-                Err(err) => {
-                    warn!(error = ?err, "Failed listing queued lost-node reschedules");
-                    return;
-                }
-            }
-        };
-        for node_id in node_ids {
-            if already_queued.contains(&node_id) {
-                continue;
-            }
-            if let Err(err) = self.enqueue_lost_node_reschedule(&node_id) {
-                warn!(
-                    %node_id,
-                    error = ?err,
-                    "Failed enqueueing lost-node reschedule eval"
-                );
-            }
+        // Dedup, the nothing-to-reschedule filter, and the single-round
+        // batched enqueue all live in the helper, shared with
+        // `mark_nodes_as_lost` — a 2,000-node partition costs two queries
+        // and one scheduler-lane round per tick, not 2,000 probes and
+        // 2,000 rounds.
+        if let Err(err) = self.enqueue_lost_node_reschedules(&node_ids) {
+            warn!(
+                error = ?err,
+                "Failed enqueueing lost-node reschedule evals"
+            );
         }
     }
 
@@ -6428,6 +6716,20 @@ impl Store {
     /// seeds, until the worker's first heartbeat/health-check upserts it.
     #[instrument(err, skip_all)]
     pub fn insert_node(&self, node: NodeMsg) -> R<Node> {
+        // Read the pre-registration status first: the seed below resets a
+        // stale `lost` row (a re-registering node is by definition not
+        // lost), and that reset was the ONE recovery path with no log and
+        // no counter — a fleet that died and re-registered read as if
+        // nothing had happened.
+        let was_lost = self
+            .read_model_reader()
+            .map(|guard| {
+                guard
+                    .nodes
+                    .get(&node.id)
+                    .is_some_and(|cached| cached.status == "lost")
+            })
+            .unwrap_or(false);
         let seed = node.clone();
         let registered = self.replicated(Lane::Control, "insert_node", move |s| {
             s.insert_node_apply(node)
@@ -6435,6 +6737,15 @@ impl Store {
         self.replicated(Lane::Status, "seed_node_health", move |s| {
             s.seed_node_health_apply(&seed)
         })?;
+        if was_lost {
+            info!(
+                node_id = %registered.id,
+                "Node re-registered after being marked lost; it is schedulable again"
+            );
+            crate::manager::telemetry::metrics()
+                .nodes_recovered_total
+                .inc(&["reregistration"]);
+        }
         Ok(registered)
     }
 
@@ -6729,10 +7040,18 @@ impl Store {
         match self.get_node(id) {
             Ok(node) if node.availability == "unavailable" => {
                 match self.sync_node_availability(&[id.to_string()], "available") {
-                    Ok(()) => info!(
-                        node_id = %id,
-                        "Node heartbeated after being marked lost; it is schedulable again"
-                    ),
+                    Ok(()) => {
+                        info!(
+                            node_id = %id,
+                            "Node heartbeated after being marked lost; it is schedulable again"
+                        );
+                        // `marked_lost` minus this is the fleet's net loss;
+                        // without it a fleet that dies and comes back reads
+                        // as if nothing happened.
+                        crate::manager::telemetry::metrics()
+                            .nodes_recovered_total
+                            .inc(&["heartbeat"]);
+                    }
                     Err(err) => warn!(
                         node_id = %id,
                         error = ?err,
@@ -20260,6 +20579,92 @@ mod tests {
         Ok(())
     }
 
+    /// A cached aggregate is rows run through SOME policy's normalization,
+    /// and the row-set fingerprint cannot see the policy changing across a
+    /// restart — so the policy fingerprint must gate the read. A row whose
+    /// fingerprint is not the running policy's (here: one written before
+    /// the column existed, carrying NULL, and one planted with a foreign
+    /// fingerprint) must be rebuilt from the rows, not served.
+    #[test]
+    fn a_usage_row_from_another_policy_is_rebuilt_not_served() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(usage_node_msg("node-a", "{}"))?;
+        let (job_config_id, task_id) = submit_walk_job(&store, "usage-policy", task("task"))?;
+
+        let expected_versions = store
+            .allocation_version_vector(&job_config_id, &HashSet::from(["node-a".to_string()]))?;
+        let submission = store.insert_plan_submission_with_candidates(
+            &job_config_id,
+            "fresh",
+            &[PlanSubmissionPlacement {
+                task_id,
+                candidates: vec!["node-a".to_string()],
+            }],
+            &expected_versions,
+        )?;
+        assert!(matches!(
+            store.apply_plan_submission(&submission)?,
+            PlanApplyOutcome::Applied(_)
+        ));
+
+        let mut conn = store.write_connection()?;
+        let tx = Store::write_tx(&mut conn)?;
+        let stored: Option<String> = tx.query_row(
+            "SELECT policy_fingerprint FROM node_alloc_usage WHERE node_id = 'node-a';",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            stored.as_deref(),
+            Some(store.resource_policy_fingerprint.as_ref()),
+            "a published row must carry the policy that normalized it"
+        );
+
+        // Plant a distinctive wrong aggregate under a FOREIGN policy
+        // fingerprint but an otherwise valid row-set fingerprint. If the
+        // read still trusts row identity alone, the planted value leaks
+        // into the pool; the policy gate must send it through the rebuild,
+        // which reproduces the true pool.
+        let node = store.get_node("node-a")?;
+        let true_pool = store
+            .free_pool_for_node_tx(&tx, &node, &job_config_id, false, None)?
+            .0;
+        tx.execute(
+            "UPDATE node_alloc_usage SET \
+                 usage_json = ?1, policy_fingerprint = ?2 WHERE node_id = 'node-a';",
+            params![
+                r#"{"dims":{"cpu":{"amount_contributors":1,"amount":777.0,"items":{}}}}"#,
+                "some-other-policy"
+            ],
+        )?;
+        let repooled = store
+            .free_pool_for_node_tx(&tx, &node, &job_config_id, false, None)?
+            .0;
+        assert_eq!(
+            true_pool.amount("cpu"),
+            repooled.amount("cpu"),
+            "a row from another policy must be rebuilt, not served"
+        );
+
+        // NULL — a pre-column row, or one written by a rolled-back binary —
+        // must behave the same way.
+        tx.execute(
+            "UPDATE node_alloc_usage SET \
+                 usage_json = ?1, policy_fingerprint = NULL WHERE node_id = 'node-a';",
+            [r#"{"dims":{"cpu":{"amount_contributors":1,"amount":777.0,"items":{}}}}"#],
+        )?;
+        let renulled = store
+            .free_pool_for_node_tx(&tx, &node, &job_config_id, false, None)?
+            .0;
+        assert_eq!(
+            true_pool.amount("cpu"),
+            renulled.amount("cpu"),
+            "a NULL-fingerprint row must be rebuilt, not served"
+        );
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Wall-clock A/B for the free-pool rebuild, at two cluster fills, both
     /// paths measured against the SAME store in the same process so the
     /// comparison is the function and not the machine.
@@ -20341,6 +20746,79 @@ mod tests {
 
             println!("free pool @ {per_node} allocations/node: row walk {old:?}, cached {new:?}");
             tx.commit()?;
+        }
+        Ok(())
+    }
+
+    /// Wall-clock A/B for the read-model reprojection, at two cluster
+    /// fills — the in-memory sibling of `bench_local_free_pool_rebuild_by_fill`.
+    ///
+    /// Reprojection runs after every projected changeset, on every replica,
+    /// INSIDE the read-model write lock every planner reads through. The
+    /// walk arm re-aggregates each touched node's whole allocation list
+    /// (`NodeUsage::from_rows` — one JSON normalization per allocation),
+    /// which is what every reprojection did before the
+    /// `SchedulingReadModel::node_usage` memo; the memo arm subtracts the
+    /// cached aggregate (O(resource dims) per node). 44 touched nodes is
+    /// the AWS `dense_fleet` per-eval shape.
+    ///
+    /// ```bash
+    /// cargo test --release --lib bench_local_reprojection -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "benchmark; run with --release --ignored --nocapture"]
+    fn bench_local_reprojection_by_fill() -> R<()> {
+        const NODES: usize = 50;
+        const TOUCHED: usize = 44;
+        const ROUNDS: u32 = 200;
+
+        for per_node in [10usize, 40] {
+            let store = setup_store()?;
+            insert_usage_job(&store, "bench-job", &["bench-cfg"])?;
+            let mut allocation_id = 0i64;
+            for node in 0..NODES {
+                let node_id = format!("bench-node-{node}");
+                store.insert_node(usage_node_msg(&node_id, "{}"))?;
+                for _ in 0..per_node {
+                    allocation_id += 1;
+                    insert_usage_allocation(
+                        &store,
+                        allocation_id,
+                        &node_id,
+                        "bench-cfg",
+                        json!({ "cpu": 10, "memory": 8 }),
+                    )?;
+                }
+            }
+            store.refresh_read_model()?;
+
+            let touched: Vec<String> = (0..TOUCHED).map(|i| format!("bench-node-{i}")).collect();
+            let touched_refs: Vec<&str> = touched.iter().map(String::as_str).collect();
+            let mut guard = store.read_model_writer()?;
+
+            // Walk arm: the memo is dropped before every pass, so each pass
+            // pays the full per-allocation re-aggregation — the pre-memo
+            // reprojection, cost for cost.
+            let started = Instant::now();
+            for _ in 0..ROUNDS {
+                guard.node_usage.clear();
+                Store::reproject_model_nodes(&mut guard, &store.resource_policy, &touched_refs);
+            }
+            let walk = started.elapsed() / ROUNDS;
+
+            // Memo arm: steady state — every touched node's aggregate is
+            // cached, as it is after any reprojection has run once.
+            Store::reproject_model_nodes(&mut guard, &store.resource_policy, &touched_refs);
+            let started = Instant::now();
+            for _ in 0..ROUNDS {
+                Store::reproject_model_nodes(&mut guard, &store.resource_policy, &touched_refs);
+            }
+            let memo = started.elapsed() / ROUNDS;
+
+            println!(
+                "reprojection of {TOUCHED} nodes @ {per_node} allocations/node: \
+                 walk {walk:?}, memo {memo:?}"
+            );
         }
         Ok(())
     }
@@ -24273,6 +24751,28 @@ mod tests {
                 cached.scope_epochs.get(scope),
                 Some(epoch),
                 "{label}: epoch mirror for {scope} must equal committed state"
+            );
+        }
+        // The usage memo is only sound if every entry equals the aggregate
+        // of the list it mirrors — contributor counts included, which the
+        // pool comparison above cannot see (a wrong count with the right sum
+        // yields the right pool today and the wrong one on the next splice).
+        for (node_id, usage) in &cached.node_usage {
+            let allocations = cached
+                .allocations_by_node
+                .get(node_id)
+                .map(|allocations| allocations.as_slice())
+                .unwrap_or(&[]);
+            let rebuilt = NodeUsage::from_rows(
+                allocations
+                    .iter()
+                    .map(|allocation| (allocation.id, &allocation.resources)),
+                &store.resource_policy,
+            )
+            .with_context(|| format!("{label}: node {node_id} memo list failed to aggregate"))?;
+            assert_eq!(
+                usage, &rebuilt,
+                "{label}: node {node_id} usage memo must equal its list's aggregate"
             );
         }
         Ok(())

@@ -68,6 +68,15 @@ const STARTUP_WRITE_RETRY_DELAY: Duration = Duration::from_millis(500);
 // cost by an order of magnitude on a saturated queue.
 const MAX_EVAL_BATCH: usize = 16;
 
+/// How many times an eval worker retries the batch terminal write before
+/// abandoning the batch to in-flight recovery. Bounded because retrying
+/// forever would wedge the worker on a persistent write error; more than
+/// one because on a STABLE leader nothing else ever recovers the batch
+/// (`requeue_in_flight_evals` runs only at startup and on leadership
+/// acquisition), so giving up on the first transient error orphaned up to
+/// a whole batch of handled evals.
+const EVAL_SETTLE_MAX_ATTEMPTS: u32 = 3;
+
 #[instrument(err, skip_all)]
 pub async fn run_manager(config: ManagerConfig, run_worker: bool) -> R<()> {
     info!("Starting manager node");
@@ -862,7 +871,22 @@ async fn start_node_status_checker(store: Store, config: LivenessCheckerConfig) 
             // composite's control half (`sync_node_availability`) is then
             // rejected with that lane's leader hint. The checker must keep
             // ticking — the mark is retried every tick until it lands.
-            if let Err(err) = store.mark_nodes_as_lost(&node_ids_to_update) {
+            //
+            // On the blocking pool: the mark is up to three quorum rounds
+            // (status, control, the batched reschedule enqueue), and running
+            // it inline here parked a runtime worker and stalled the tick.
+            let mark_result = {
+                let store_for_mark = store.clone();
+                let ids_for_mark = node_ids_to_update.clone();
+                tokio::task::spawn_blocking(move || {
+                    store_for_mark.mark_nodes_as_lost(&ids_for_mark)
+                })
+                .await
+                .unwrap_or_else(|join_error| {
+                    Err(anyhow::anyhow!("mark-lost task failed: {join_error:?}"))
+                })
+            };
+            if let Err(err) = mark_result {
                 warn!(error = ?err, "Failed marking nodes lost; will retry next tick");
             } else if !node_ids_to_update.is_empty() {
                 crate::manager::telemetry::metrics()
@@ -945,8 +969,17 @@ async fn start_node_status_checker(store: Store, config: LivenessCheckerConfig) 
             // docs/stateful-workloads.md "Node loss and fencing"). Re-run the
             // reschedule path for still-lost nodes every tick so replacement
             // proceeds automatically once a window elapses — no operator
-            // action needed.
-            store.recheck_lost_nodes();
+            // action needed. Blocking pool: it reads the queue and may
+            // propose a scheduler-lane round.
+            {
+                let store_for_recheck = store.clone();
+                if let Err(join_error) =
+                    tokio::task::spawn_blocking(move || store_for_recheck.recheck_lost_nodes())
+                        .await
+                {
+                    warn!("Lost-node recheck task failed: {join_error:?}");
+                }
+            }
             // node_health rows orphaned by node removal (`remove_node` is a
             // control-lane op and must not delete status-lane rows — plan
             // §7-C2, C-1) are swept here on the status-lane leader. Harmless
@@ -1597,7 +1630,7 @@ async fn start_eval_loop(store: Store, max_threads: usize) -> R<()> {
     // round inline. Installing it after would leave the first few applies
     // on the synchronous path for no reason.
     if let Some(rx) = store.install_status_projection_queue() {
-        spawn_status_projection_drain(&mut join_set, &store, rx);
+        spawn_status_projection_drain(&store, rx);
     }
     for worker_id in 0..max_threads {
         spawn_eval_worker(&mut join_set, &store, worker_id, batch_limits);
@@ -1655,13 +1688,24 @@ async fn restart_eval_worker_after_exit(
 /// allocations that are already committed, and the status leader's
 /// reconciler plus the workers' own reports re-derive them. That is why
 /// this can be off the critical path at all.
+///
+/// Deliberately NOT in the eval workers' `JoinSet`: the supervisor there
+/// replaces any exited member with an eval worker, so a drain that died
+/// would silently become a 17th planner while every future projection
+/// send failed into a closed channel (the send path then falls back to
+/// the inline status-lane round, so correctness held — but the
+/// off-critical-path optimization was permanently and invisibly off, and
+/// the extra worker skewed the batch-fairness arithmetic). The drain body
+/// is panic-free by construction — the projection itself runs under
+/// `spawn_blocking` and both error arms are logged — so a plain spawn
+/// needs no supervisor of its own; if it ever does exit, the closed
+/// channel degrades every send to the inline path, unchanged behavior.
 fn spawn_status_projection_drain(
-    join_set: &mut JoinSet<()>,
     store: &Store,
     mut rx: tokio::sync::mpsc::UnboundedReceiver<Vec<crate::structs::Allocation>>,
 ) {
     let store = store.clone();
-    join_set.spawn(async move {
+    tokio::spawn(async move {
         info!("Task-status projection drain started");
         while let Some(first) = rx.recv().await {
             let mut batch = first;
@@ -1774,7 +1818,20 @@ async fn eval_worker_loop(
         let batch = if carried_ahead {
             std::mem::take(&mut claimed_ahead)
         } else {
-            match store.claim_evals(batch_limits) {
+            // On the blocking pool, like the handler below: a claim is a
+            // scheduler-lane quorum round, and running it inline here
+            // parked a tokio runtime worker for the whole round trip.
+            // There are only `available_parallelism()` runtime workers no
+            // matter how high `evalThreads` goes, so at high thread counts
+            // the claims themselves were what serialized the loop.
+            let store_for_claim = store.clone();
+            let claimed =
+                tokio::task::spawn_blocking(move || store_for_claim.claim_evals(batch_limits))
+                    .await
+                    .unwrap_or_else(|join_error| {
+                        Err(anyhow::anyhow!("eval claim task failed: {join_error:?}"))
+                    });
+            match claimed {
                 Ok(batch) => batch,
                 Err(e) => {
                     error!(
@@ -1789,9 +1846,11 @@ async fn eval_worker_loop(
                 }
             }
         };
-        // A claim costs a scheduler-lane quorum ROUND whether or not it
-        // finds work, so the empty share is the cost of waking a worker for
-        // nothing — the thundering-herd signal this counter exists for.
+        // An empty claim yields an empty changeset, which skips the raft
+        // entry — but it still pays the capture (a savepoint on the write
+        // connection) and the wake that produced it, so the empty share is
+        // the cost of waking a worker for nothing — the thundering-herd
+        // signal this counter exists for.
         // Batching does not change what a tick means here: it is still one
         // round, so `claimed` counts rounds that found work rather than
         // evals. That is deliberate — dividing `evals_processed_total` by
@@ -1888,25 +1947,58 @@ async fn eval_worker_loop(
         }
 
         // One scheduler-lane round settles the whole batch and claims the
-        // next one, instead of two rounds per eval.
+        // next one, instead of two rounds per eval. On the blocking pool
+        // for the same reason as the claim above.
+        //
+        // The terminal write is RETRIED (bounded) before the completions
+        // are dropped: a transient write error on a leader that never
+        // loses leadership used to abandon every handled member of the
+        // batch as `in_flight` forever, because `requeue_in_flight_evals`
+        // only runs at startup and on leadership ACQUISITION — a stable
+        // leader has no third chance. A retry burns nothing but this
+        // worker's time; giving up still leaves the batch recoverable by
+        // the existing paths, and a leadership loss fails fast on its
+        // first attempt (the retries hit the same typed rejection).
         let settled = completions.len();
-        match store.complete_evals_and_claim_next(completions, batch_limits) {
-            Ok(next) => {
-                claimed_ahead = next;
-                error_backoff = ERROR_BACKOFF_MIN;
-            }
-            Err(e) => {
-                // Nothing was written — the op is one changeset — so every
-                // member of the batch is still `in_flight` and recoverable.
-                error!(
-                    worker_id,
-                    batch_size = batch.len(),
-                    settled,
-                    "Error writing eval batch outcomes and claiming next: {:?}",
-                    e
-                );
-                tokio::time::sleep(error_backoff).await;
-                error_backoff = std::cmp::min(error_backoff * 2, ERROR_BACKOFF_MAX);
+        let mut settle_attempts = 0;
+        loop {
+            let store_for_settle = store.clone();
+            let completions_for_attempt = completions.clone();
+            let outcome = tokio::task::spawn_blocking(move || {
+                store_for_settle
+                    .complete_evals_and_claim_next(completions_for_attempt, batch_limits)
+            })
+            .await
+            .unwrap_or_else(|join_error| {
+                Err(anyhow::anyhow!("eval settle task failed: {join_error:?}"))
+            });
+            match outcome {
+                Ok(next) => {
+                    claimed_ahead = next;
+                    error_backoff = ERROR_BACKOFF_MIN;
+                    break;
+                }
+                Err(e) => {
+                    settle_attempts += 1;
+                    // Nothing was written — the op is one changeset — so
+                    // every member of the batch is still `in_flight` and
+                    // recoverable.
+                    error!(
+                        worker_id,
+                        batch_size = batch.len(),
+                        settled,
+                        settle_attempts,
+                        "Error writing eval batch outcomes and claiming next: {:?}",
+                        e
+                    );
+                    tokio::time::sleep(error_backoff).await;
+                    error_backoff = std::cmp::min(error_backoff * 2, ERROR_BACKOFF_MAX);
+                    if settle_attempts >= EVAL_SETTLE_MAX_ATTEMPTS
+                        || crate::storage::raft::driver::NotRaftLeader::in_chain(&e)
+                    {
+                        break;
+                    }
+                }
             }
         }
     }

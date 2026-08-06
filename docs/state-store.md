@@ -85,8 +85,11 @@ Main tables (see migrations):
 - `allocation_epoch`, `plan_submission`
 - `node_alloc_usage` — a **cache**, not a source of truth: one row per node
   holding the aggregated resource usage of that node's allocations, beside a
-  fingerprint of the rows it was derived from. Read only by the plan-apply
-  capacity recheck, and only when the fingerprint still matches
+  fingerprint of the rows it was derived from **and of the resource policy
+  that normalized them**. Read only by the plan-apply capacity recheck, and
+  only when both fingerprints still match — a row written under a different
+  `taskResourceDefaults`/`customResources` configuration is rebuilt, never
+  served
   (see [scheduler-and-eval-loop.md](scheduler-and-eval-loop.md#the-per-node-usage-cache))
 - `rollout`, `allocation_health`, `rollout_event`
 - `instance` (stateful identity), `volume` (the storage its handle points at —

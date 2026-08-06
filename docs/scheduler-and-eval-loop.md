@@ -312,6 +312,25 @@ What this means in practice:
   this feature neither reads nor writes the table, so a leader on either
   side of an upgrade simply finds the fingerprints stale and rebuilds. The
   table is created empty with no backfill.
+- **A resource-policy change invalidates it.** Each row also records a
+  fingerprint of the resource policy (`taskResourceDefaults`,
+  `customResources`) that normalized it, and a row from any other policy —
+  including one written before the fingerprint existed — is rebuilt rather
+  than served. Without this, raising a task default and restarting would
+  keep serving aggregates computed under the old default on every node
+  whose rows had not moved, understating usage indefinitely. A policy
+  change therefore costs one rebuild per node, the same as a cold start.
+
+The scheduler's **in-memory read model keeps the same aggregate per node**
+(beside each node's cached allocation list), so re-deriving a node's free
+pool and index projections after a committed change — which happens on
+every replica, inside the write lock every planner reads through — is a
+subtraction over resource dimensions instead of a re-parse of every
+allocation on the node. The memo is maintained only by splices that know
+the exact rows they moved; every wholesale list reload drops it, and the
+next reprojection rebuilds it from the list (the same walk every
+reprojection used to pay). It shares `NodeUsage` — and the equivalence
+tests — with the persistent cache above.
 
 Known limitation: removing a node leaves its cache row behind (the removal
 runs on a different raft lane than the table's writer). The row is inert

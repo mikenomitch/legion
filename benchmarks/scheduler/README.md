@@ -450,3 +450,64 @@ of in-commit time against ~0.41 ms.
 cost on a multi-node cluster under fill; a single-node local run cannot
 reproduce either the serialization or the fill. The AWS ladder is the
 real number and has not been re-run.
+
+## Read-model reprojection under fill — 2026-08-06
+
+Phase 5 of `internal_docs/plans/eval-path-raft-cost-plan.md`. After the
+delta refresh and the per-node usage cache both provably flattened their
+own paths, the AWS `dense_fleet` ladder's ~1.65x-per-doubling degradation
+did not move — pointing at `reproject_model_nodes`, which re-aggregated
+each touched node's **whole allocation list** (one JSON normalization per
+allocation) after every projected changeset, on every replica, inside the
+read-model write lock every planner reads through.
+
+The read model now keeps a per-node `NodeUsage` aggregate beside each
+cached allocation list; reprojection subtracts it (O(resource dims)), the
+delta path adjusts it with exactly the rows it spliced, and every
+wholesale list reload drops the entry so the next reprojection rebuilds
+it from the list.
+
+**Wall clock per reprojection of 44 touched nodes** (`cargo test
+--release --lib bench_local_reprojection -- --ignored --nocapture`; both
+arms against the same store in the same process — the walk arm clears the
+memo each round, which is cost-for-cost the pre-memo reprojection):
+
+| allocations/node | walk | memo | speedup |
+| --- | --- | --- | --- |
+| 10 | 413.99 µs | **49.93 µs** | 8.3x |
+| 40 | 1.921 ms | **73.64 µs** | 26x |
+
+Read the columns: over a 4x change in fill the walk grows 4.6x while the
+memo arm grows 1.5x (the residual is `ResourcePool::from_node` and the
+index reprojection, which do not scale with fill). This time was
+invisible to the plan-phase timers — it runs after the commit — and it
+was paid under the write lock, so it also stalled every concurrent
+planner's snapshot.
+
+The same change batches a refresh's per-scope epoch reads (one read
+connection + one cached statement for the whole scope set, was ~44
+acquisitions and statement parses per eval, per replica).
+
+**Free-pool re-measurement on this host** (the policy-fingerprint gate
+added one predicate to the cache read): row walk 36.49 µs / 96.57 µs at
+10 / 40 allocations per node against cached 25.32 µs / 28.29 µs — the
+cached path still flat across fill (1.12x over the 4x change), so the
+extra predicate is noise. Absolute numbers are not comparable to the
+2026-08-05 table above (different machine); the within-run arms are the
+comparison.
+
+**Not measured here:** end-to-end throughput, as ever — the ladder is
+the real number. With both the SQL and in-memory fill terms gone, the
+remaining suspects if the slope still does not flatten are outside this
+path entirely.
+
+**Eval critical path** (`cargo bench --bench eval_critical_path_bench`,
+base `c0a175f` vs this change, same host, runs serialized): workers_1
+159.50 → 161.12 ms, workers_4 423.74 → 441.16 ms (quiet re-run; a first
+run that overlapped a background build read 469.93), workers_8 736.48 →
+733.49 ms. No regression beyond this bench's run-to-run spread — it
+drives the Store API directly with empty-placement plans, so the changed
+store paths (refresh aggregation, epoch batching, policy-fingerprint
+predicate) are all near-no-ops on it and the daemon changes are not in
+its path at all; it is recorded as the no-regression check, per the
+convention above.
