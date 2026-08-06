@@ -711,6 +711,8 @@ pub struct Metrics {
     pub eval_claim_total: Arc<CounterVec>,
     /// `legion_eval_handle_seconds{kind}`
     pub eval_handle_seconds: Arc<HistogramVec>,
+    /// `legion_dispatch_send_seconds`
+    pub dispatch_send_seconds: Arc<Histogram>,
     /// `legion_scheduler_plan_candidate_rank`
     pub scheduler_plan_candidate_rank: Arc<Histogram>,
     /// `legion_scheduler_plan_bind_pass{pass}`
@@ -877,6 +879,14 @@ impl Metrics {
             },
             series: Series::new(),
             bounds: DURATION_BUCKETS,
+        });
+        let dispatch_send_seconds = Arc::new(Histogram {
+            meta: FamilyMeta {
+                name: "legion_dispatch_send_seconds",
+                help: "One successful PostWork push to a worker, from send to ack. Dispatch is detached from the eval loop, so this latency no longer appears in legion_eval_handle_seconds - this histogram is where it went. Rising values mean slow or overloaded workers, not a slow scheduler.",
+                labels: &[],
+            },
+            cell: HistogramCell::new(DURATION_BUCKETS),
         });
         let scheduler_plan_candidate_rank = Arc::new(Histogram {
             meta: FamilyMeta {
@@ -1303,6 +1313,7 @@ impl Metrics {
             Arc::clone(&plan_apply_total) as Arc<dyn RenderMetric>,
             Arc::clone(&eval_claim_total) as Arc<dyn RenderMetric>,
             Arc::clone(&eval_handle_seconds) as Arc<dyn RenderMetric>,
+            Arc::clone(&dispatch_send_seconds) as Arc<dyn RenderMetric>,
             Arc::clone(&preemption_plans_total) as Arc<dyn RenderMetric>,
             Arc::clone(&preemptions_total) as Arc<dyn RenderMetric>,
             Arc::clone(&raft_applied_index) as Arc<dyn RenderMetric>,
@@ -1344,6 +1355,7 @@ impl Metrics {
             plan_apply_total,
             eval_claim_total,
             eval_handle_seconds,
+            dispatch_send_seconds,
             scheduler_plan_bind_pass,
             scheduler_plan_candidate_rank,
             eval_conflict_requeues_total,

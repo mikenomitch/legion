@@ -6,8 +6,25 @@ use crate::structs::{
     TaskConfig,
 };
 use std::collections::HashMap;
+use std::sync::{Arc, OnceLock};
 use tokio::runtime::RuntimeFlavor;
+use tokio::sync::Semaphore;
 use tonic::transport::{Channel, Endpoint};
+
+/// Cap on concurrently in-flight `PostWork` sends across all evals.
+///
+/// Detached dispatch means eval workers no longer provide natural
+/// backpressure: a burst of evals could otherwise pile up an unbounded set
+/// of RPC tasks. The cap only bounds concurrency — sends past it queue on
+/// the semaphore, they are not dropped — and it is deliberately generous:
+/// the real volume is bounded by evals in flight times allocations per
+/// eval, and a send is one small unary RPC.
+const MAX_IN_FLIGHT_DISPATCHES: usize = 512;
+
+fn dispatch_permits() -> Arc<Semaphore> {
+    static PERMITS: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    Arc::clone(PERMITS.get_or_init(|| Arc::new(Semaphore::new(MAX_IN_FLIGHT_DISPATCHES))))
+}
 
 #[instrument(err, skip_all)]
 pub fn dispatch_allocations(store: &Store, allocations: &[Allocation]) -> R<()> {
@@ -18,110 +35,131 @@ pub fn dispatch_allocations(store: &Store, allocations: &[Allocation]) -> R<()> 
     let mut task_cache: HashMap<String, HashMap<i64, TaskConfig>> = HashMap::new();
     let mut node_cache: HashMap<String, crate::structs::Node> = HashMap::new();
 
-    // Requests are built first, then sent together. The send used to be a
-    // sequential `await` per allocation, so an eval placing N allocations
-    // paid N worker round trips end to end, on the eval worker's own
-    // thread — and dispatch sits OUTSIDE the plan-phase stopwatch, so none
-    // of it appeared in the measured 41 ms/eval while all of it counted
-    // against the ~298 ms an eval actually occupied a worker.
-    //
-    // Building stays sequential: it is local store reads, and it fills the
-    // task/node caches that make those reads cheap.
+    // Requests are built first, synchronously: it is all local store reads,
+    // a build failure is a real error that must fail the eval, and the
+    // caches make those reads cheap.
     let mut pending: Vec<(String, crate::structs::PostWorkRequest, i64, String)> =
         Vec::with_capacity(allocations.len());
+    let mut clients: HashMap<String, WorkerClient<Channel>> = HashMap::new();
 
-    run_dispatch_future(async {
-        let mut clients: HashMap<String, WorkerClient<Channel>> = HashMap::new();
-        for allocation in allocations {
-            let tasks = task_cache
-                .entry(allocation.job_config_id.clone())
-                .or_default();
-            if tasks.is_empty() {
-                let task_configs =
-                    store.get_task_configs_for_job_config(&allocation.job_config_id)?;
-                for (id, config) in task_configs {
-                    tasks.insert(id, config);
-                }
+    for allocation in allocations {
+        let tasks = task_cache
+            .entry(allocation.job_config_id.clone())
+            .or_default();
+        if tasks.is_empty() {
+            let task_configs = store.get_task_configs_for_job_config(&allocation.job_config_id)?;
+            for (id, config) in task_configs {
+                tasks.insert(id, config);
             }
-            let task = tasks
-                .get(&allocation.task_config_id)
-                .with_context(|| format!("Missing task config {}", allocation.task_config_id))?;
-
-            if !node_cache.contains_key(&allocation.node_id) {
-                let node = store.get_node(&allocation.node_id)?;
-                node_cache.insert(allocation.node_id.clone(), node);
-            }
-            let node = node_cache
-                .get(&allocation.node_id)
-                .context("Missing node in cache")?;
-            let Some(worker_address) = worker_address_for_node(node) else {
-                warn!(
-                    node_id = %allocation.node_id,
-                    "Skipping allocation dispatch; worker address missing"
-                );
-                continue;
-            };
-
-            let instance = match allocation.instance_id.as_deref() {
-                Some(instance_id) => store.get_instance(instance_id)?,
-                None => None,
-            };
-            // Volume mounts are resolved here (not on the worker) so the
-            // worker receives concrete volume ids and the driver attrs from
-            // previous mounts, and never re-derives storage from a jobspec.
-            let volumes =
-                store.volume_mounts_for_allocation(&allocation.job_id, task, instance.as_ref())?;
-            let task_allocation =
-                build_task_allocation(task, allocation, instance.as_ref(), &volumes)?;
-            let request = crate::structs::PostWorkRequest {
-                allocation: Some(task_allocation),
-            };
-
-            if !clients.contains_key(&worker_address) {
-                let endpoint = Endpoint::from_shared(worker_address.clone())?;
-                let channel = endpoint.connect_lazy();
-                clients.insert(worker_address.clone(), WorkerClient::new(channel));
-            }
-            pending.push((
-                worker_address,
-                request,
-                allocation.id,
-                allocation.node_id.clone(),
-            ));
         }
+        let task = tasks
+            .get(&allocation.task_config_id)
+            .with_context(|| format!("Missing task config {}", allocation.task_config_id))?;
 
-        // All sends at once. Each allocation still gets its own client
-        // clone (a `Channel` clone shares the connection pool), so this is
-        // N concurrent RPCs over the same set of connections rather than N
-        // round trips back to back. Failures stay per-allocation and
-        // non-fatal: the heartbeat reply carries the full desired set, so a
-        // dropped push costs at most one heartbeat interval.
-        let sends = pending.into_iter().map(|(address, request, id, node_id)| {
-            let mut client = clients
-                .get(&address)
-                .expect("client inserted above")
-                .clone();
-            async move {
-                match client.post_work(request).await {
-                    Ok(_) => info!(
+        if !node_cache.contains_key(&allocation.node_id) {
+            let node = store.get_node(&allocation.node_id)?;
+            node_cache.insert(allocation.node_id.clone(), node);
+        }
+        let node = node_cache
+            .get(&allocation.node_id)
+            .context("Missing node in cache")?;
+        let Some(worker_address) = worker_address_for_node(node) else {
+            warn!(
+                node_id = %allocation.node_id,
+                "Skipping allocation dispatch; worker address missing"
+            );
+            continue;
+        };
+
+        let instance = match allocation.instance_id.as_deref() {
+            Some(instance_id) => store.get_instance(instance_id)?,
+            None => None,
+        };
+        // Volume mounts are resolved here (not on the worker) so the
+        // worker receives concrete volume ids and the driver attrs from
+        // previous mounts, and never re-derives storage from a jobspec.
+        let volumes =
+            store.volume_mounts_for_allocation(&allocation.job_id, task, instance.as_ref())?;
+        let task_allocation = build_task_allocation(task, allocation, instance.as_ref(), &volumes)?;
+        let request = crate::structs::PostWorkRequest {
+            allocation: Some(task_allocation),
+        };
+
+        if !clients.contains_key(&worker_address) {
+            let endpoint = Endpoint::from_shared(worker_address.clone())?;
+            let channel = endpoint.connect_lazy();
+            clients.insert(worker_address.clone(), WorkerClient::new(channel));
+        }
+        pending.push((
+            worker_address,
+            request,
+            allocation.id,
+            allocation.node_id.clone(),
+        ));
+    }
+
+    // The sends leave the eval's critical path entirely. Dispatch is
+    // best-effort BY DESIGN — the heartbeat reply carries the full desired
+    // set, so a lost push costs at most one heartbeat interval — and the
+    // eval's outcome is already durable once the plan commits, so there is
+    // nothing correct about making the eval worker wait for worker RPCs.
+    // The wait was most of the gap between `legion_eval_handle_seconds`
+    // (~272 ms at 100k allocations) and the plan path (~94 ms): worker
+    // round trips billed to the scheduler's throughput.
+    //
+    // Each send still takes a permit from a global cap, so a burst of
+    // evals queues sends instead of accumulating unbounded RPC tasks.
+    let sends = pending.into_iter().map(|(address, request, id, node_id)| {
+        let mut client = clients
+            .get(&address)
+            .expect("client inserted above")
+            .clone();
+        let permits = dispatch_permits();
+        async move {
+            // Closed-semaphore is impossible (it is never closed); treat
+            // an error like a dropped push and let the heartbeat heal it.
+            let _permit = match permits.acquire_owned().await {
+                Ok(permit) => permit,
+                Err(_) => return,
+            };
+            let started = std::time::Instant::now();
+            match client.post_work(request).await {
+                Ok(_) => {
+                    crate::manager::telemetry::metrics()
+                        .dispatch_send_seconds
+                        .observe(started.elapsed().as_secs_f64());
+                    info!(
                         allocation_id = id,
                         node_id = %node_id,
                         "Dispatched allocation to worker"
-                    ),
-                    Err(err) => warn!(
-                        allocation_id = id,
-                        node_id = %node_id,
-                        error = ?err,
-                        "Failed to dispatch allocation to worker"
-                    ),
+                    )
                 }
+                Err(err) => warn!(
+                    allocation_id = id,
+                    node_id = %node_id,
+                    error = ?err,
+                    "Failed to dispatch allocation to worker"
+                ),
             }
-        });
-        futures::future::join_all(sends).await;
-        Ok::<(), anyhow::Error>(())
-    })?;
+        }
+    });
+    let send_all = futures::future::join_all(sends);
 
-    Ok(())
+    match tokio::runtime::Handle::try_current() {
+        // Detach on a real runtime. `resolve_claimed_eval` runs on the
+        // blocking pool, where the ambient handle is the manager's
+        // multi-thread runtime.
+        Ok(handle) if handle.runtime_flavor() != RuntimeFlavor::CurrentThread => {
+            handle.spawn(send_all);
+            Ok(())
+        }
+        // No runtime (unit tests, one-off tools): keep the old blocking
+        // behavior rather than silently not sending.
+        _ => run_dispatch_future(async {
+            send_all.await;
+            Ok(())
+        }),
+    }
 }
 
 /// Minimum worker protocol version that understands
