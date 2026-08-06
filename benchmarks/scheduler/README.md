@@ -500,3 +500,14 @@ comparison.
 the real number. With both the SQL and in-memory fill terms gone, the
 remaining suspects if the slope still does not flatten are outside this
 path entirely.
+
+**Eval critical path** (`cargo bench --bench eval_critical_path_bench`,
+base `c0a175f` vs this change, same host, runs serialized): workers_1
+159.50 → 161.12 ms, workers_4 423.74 → 441.16 ms (quiet re-run; a first
+run that overlapped a background build read 469.93), workers_8 736.48 →
+733.49 ms. No regression beyond this bench's run-to-run spread — it
+drives the Store API directly with empty-placement plans, so the changed
+store paths (refresh aggregation, epoch batching, policy-fingerprint
+predicate) are all near-no-ops on it and the daemon changes are not in
+its path at all; it is recorded as the no-regression check, per the
+convention above.
