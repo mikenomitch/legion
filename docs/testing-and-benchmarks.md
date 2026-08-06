@@ -221,6 +221,27 @@ whenever `benchmarks/aws/**` changes; nothing in CI touches AWS. The
 end-to-end sim-fleet wire test is `tests/worker_simulation.rs` (runs in
 the normal `cargo test` suite).
 
+The rig submits Legion jobs through `legion-loadgen`
+(`benchmarks/loadgen/`), a benchmark-only binary that holds a small pool
+of gRPC connections open and issues many concurrent `RunJob` calls. It
+is feature-gated so it is not part of an ordinary build:
+
+```bash
+cargo build --release --features loadgen --bin legion-loadgen
+```
+
+It exists because submitting with one `legion job run` process per job
+ceilings at roughly 40-100 jobs/sec, which was low enough that campaign
+cells reported the driver's rate rather than the scheduler's — the
+driver flags that case as `submission.driver_bound: true`.
+
+**It is Legion-only, and that makes it a fairness hazard.** Nomad and
+Kubernetes still submit one CLI process per job, so a cross-system
+comparison must put all three on the shared loop
+(`driver.py run --submitter cli`) or add native submitters for the
+others first. Every cell records which path it took as `submitter` in
+its metrics. See `benchmarks/aws/README.md` § Methodology.
+
 ## Plugin-Related Test Notes
 
 Dynamic plugin tests may depend on plugin build presence.

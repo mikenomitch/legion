@@ -12,12 +12,24 @@ on benchmark-file changes.)
 import json
 import os
 import sys
+import tempfile
+import time
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "workloads"))
 
-from driver import compute_metrics, parse_legion_event, percentile  # noqa: E402
+from driver import (  # noqa: E402
+    K8sAdapter,
+    LegionAdapter,
+    NomadAdapter,
+    RunRecorder,
+    compute_metrics,
+    monotonic_offset_ms,
+    parse_legion_event,
+    percentile,
+    resolve_loadgen_bin,
+)
 import translate  # noqa: E402
 
 FIXTURES = os.path.join(os.path.dirname(__file__), "fixtures")
@@ -237,6 +249,91 @@ class TranslatorShapes(unittest.TestCase):
         # 500 MHz at the fleet's 3000 MHz/core fingerprint -> 167m.
         self.assertEqual(requests["cpu"], "167m")
         self.assertEqual(requests["memory"], "1024Mi")
+
+
+class NativeSubmitterWiring(unittest.TestCase):
+    """The parts of the fast submission path that are pure logic, so a
+    mistake in them is caught here rather than on a cluster: binary
+    discovery, the cross-process clock rebase, and the fairness rule that
+    keeps Nomad/K8s on the shared CLI loop."""
+
+    def test_loadgen_is_found_next_to_the_legion_binary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            legion = os.path.join(tmp, "legion")
+            loadgen = os.path.join(tmp, "legion-loadgen")
+            for path in (legion, loadgen):
+                with open(path, "w") as f:
+                    f.write("#!/bin/sh\n")
+                os.chmod(path, 0o755)
+            self.assertEqual(resolve_loadgen_bin(None, legion), loadgen)
+
+    def test_a_missing_explicit_loadgen_path_falls_back_rather_than_crashing(self):
+        # run-step.sh always passes the rig's install path, so a loadgen box
+        # provisioned before the submitter existed must degrade to the CLI
+        # loop instead of dying on FileNotFoundError mid-cell.
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertIsNone(
+                resolve_loadgen_bin(os.path.join(tmp, "nope"), "/bin/echo")
+            )
+
+    def test_nomad_and_k8s_never_take_a_native_path(self):
+        # The fairness rule, as an assertion: if either of these ever starts
+        # returning True without an equivalent submitter behind it, every
+        # cross-system comparison silently becomes invalid.
+        nomad = NomadAdapter("http://127.0.0.1:4646")
+        k8s = K8sAdapter()
+        self.assertFalse(nomad.submit_all("dir", [], None, 256))
+        self.assertFalse(k8s.submit_all("dir", [], None, 256))
+
+    def test_legion_without_a_submitter_binary_falls_back(self):
+        adapter = LegionAdapter("http://127.0.0.1:4747", loadgen_bin=None)
+        self.assertFalse(adapter.submit_all("dir", [], None, 256))
+
+    def test_batch_submits_land_on_the_placement_clock(self):
+        # The submitter stamps in epoch ms and the driver adds
+        # `monotonic - epoch`; the result has to be comparable to the
+        # placement marks, or every latency in the cell is nonsense.
+        with tempfile.TemporaryDirectory() as tmp:
+            recorder = RunRecorder(tmp)
+            try:
+                offset = monotonic_offset_ms()
+                epoch_now = int(time.time() * 1000)
+                recorder.record_submits(
+                    [{"job": "bench-a-0", "t_ms": epoch_now + offset}]
+                )
+                placed = recorder.record_placement("bench-a-0", 1)
+            finally:
+                recorder.close()
+
+            latency = placed["t_ms"] - recorder.submits["bench-a-0"]
+            # Same instant, two clocks, one process: a couple of ms of
+            # sampling slop is fine; 55 years (an unrebased epoch stamp) is
+            # not, and neither is a negative (a sign error).
+            self.assertGreaterEqual(latency, 0)
+            self.assertLess(latency, 5000)
+
+    def test_batch_submits_feed_the_metrics_unchanged(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            recorder = RunRecorder(tmp)
+            try:
+                recorder.record_submits(
+                    [{"job": "a", "t_ms": 1000}, {"job": "b", "t_ms": 1200}]
+                )
+            finally:
+                recorder.close()
+            events = [
+                {"t_ms": 1500, "job": "a", "count": 2},
+                {"t_ms": 2400, "job": "b", "count": 2},
+            ]
+            metrics = compute_metrics(recorder.submits, events, expected_total=4)
+            self.assertTrue(metrics["complete"])
+            # Latencies 500ms (job a) and 1200ms (job b), two samples each;
+            # nearest-rank p50 over [500, 500, 1200, 1200] is index 2.
+            self.assertEqual(metrics["latency_samples"], 4)
+            self.assertEqual(metrics["p50_ms"], 1200.0)
+            # The last allocation landed 1.2s after the last submit over a
+            # 0.9s window, so the scheduler — not submission — was behind.
+            self.assertFalse(metrics["submission"]["driver_bound"])
 
 
 if __name__ == "__main__":

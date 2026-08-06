@@ -16,6 +16,11 @@ load_rig
 # `dist` result when it is not.
 BUILD_PROFILE="${LEGION_BUILD_PROFILE:-dist}"
 BIN="$REPO_ROOT/target/$BUILD_PROFILE/legion"
+# The rig's native job submitter (benchmarks/loadgen). Built from the same
+# tree, same profile, same commit as the CLI — a submitter built from a
+# different revision than the manager under test would be a fairness-record
+# hole. Feature-gated so it only exists when asked for.
+LOADGEN_BIN="$REPO_ROOT/target/$BUILD_PROFILE/legion-loadgen"
 
 SKIP_BUILD=false FORCE_PLUGINS=false
 for arg in "$@"; do
@@ -75,22 +80,30 @@ fi
 if ! $SKIP_BUILD; then
     if $PLUGINS_CACHED; then
         log "plugins unchanged (fingerprint $PLUGIN_FP) — reusing the staged bundle"
-        log "building legion (dist profile, no plugins; this link is slow by design)"
-        (cd "$REPO_ROOT" && LEGION_SKIP_PLUGIN_BUILD=1 cargo build --profile "$BUILD_PROFILE")
+        log "building legion + legion-loadgen (dist profile, no plugins; this link is slow by design)"
+        (cd "$REPO_ROOT" && LEGION_SKIP_PLUGIN_BUILD=1 cargo build --profile "$BUILD_PROFILE" --features loadgen)
     else
-        log "building legion (dist profile + plugins; this link is slow by design)"
-        (cd "$REPO_ROOT" && LEGION_BUILD_PLUGINS=1 cargo build --profile "$BUILD_PROFILE")
+        log "building legion + legion-loadgen (dist profile + plugins; this link is slow by design)"
+        (cd "$REPO_ROOT" && LEGION_BUILD_PLUGINS=1 cargo build --profile "$BUILD_PROFILE" --features loadgen)
     fi
 fi
 [[ -x "$BIN" ]] || {
     echo "no dist binary at $BIN — run without --skip-build" >&2
     exit 1
 }
+[[ -x "$LOADGEN_BIN" ]] || {
+    echo "no legion-loadgen at $LOADGEN_BIN — build with --features loadgen" >&2
+    exit 1
+}
 REV=$(git -C "$REPO_ROOT" rev-parse HEAD)
 SHA=$(sha256sum "$BIN" | cut -d' ' -f1)
 
+LOADGEN_SHA=$(sha256sum "$LOADGEN_BIN" | cut -d' ' -f1)
+
 log "uploading legion ($REV) to s3://$BUCKET/bin/"
 aws s3 cp --only-show-errors --region "$REGION" "$BIN" "s3://$BUCKET/bin/legion"
+log "uploading legion-loadgen ($REV) to s3://$BUCKET/bin/"
+aws s3 cp --only-show-errors --region "$REGION" "$LOADGEN_BIN" "s3://$BUCKET/bin/legion-loadgen"
 
 # The manager validates task runtimes against their plugin dylibs, so
 # the campaign boxes need the plugins tree in the canonical deployed
@@ -140,10 +153,10 @@ else
         aws s3 cp --only-show-errors --region "$REGION" - "s3://$BUCKET/bin/legion-plugins.meta.json"
 fi
 
-printf '{"git_rev":"%s","sha256":"%s","built_at":"%s"}\n' \
-    "$REV" "$SHA" "$(date -u +%FT%TZ)" |
+printf '{"git_rev":"%s","sha256":"%s","loadgen_sha256":"%s","built_at":"%s"}\n' \
+    "$REV" "$SHA" "$LOADGEN_SHA" "$(date -u +%FT%TZ)" |
     aws s3 cp --only-show-errors --region "$REGION" - "s3://$BUCKET/bin/legion.meta.json"
-log "uploaded (sha256 $SHA)"
+log "uploaded (sha256 $SHA, loadgen $LOADGEN_SHA)"
 
 # Install the CLI on the loadgen box now that it exists in S3.
 #
@@ -154,17 +167,20 @@ log "uploaded (sha256 $SHA)"
 # Every later step needs it: start-sim-fleet.sh mints join tokens with
 # it, run-step.sh queries node counts with it, and both fail with a bare
 # `legion: command not found` a long way from this cause.
-log "installing the legion CLI on the loadgen box"
+log "installing the legion CLI + native submitter on the loadgen box"
 rsh "$LOADGEN_ADDR" "
     sudo aws s3 cp --only-show-errors --region $REGION s3://$BUCKET/bin/legion /opt/legion/bin/legion &&
     sudo chmod +x /opt/legion/bin/legion &&
-    sudo ln -sf /opt/legion/bin/legion /usr/local/bin/legion
+    sudo ln -sf /opt/legion/bin/legion /usr/local/bin/legion &&
+    sudo aws s3 cp --only-show-errors --region $REGION s3://$BUCKET/bin/legion-loadgen /opt/legion/bin/legion-loadgen &&
+    sudo chmod +x /opt/legion/bin/legion-loadgen &&
+    sudo ln -sf /opt/legion/bin/legion-loadgen /usr/local/bin/legion-loadgen
 " >/dev/null || {
-    echo "failed to install the legion CLI on the loadgen box ($LOADGEN_ADDR)" >&2
+    echo "failed to install the legion binaries on the loadgen box ($LOADGEN_ADDR)" >&2
     exit 1
 }
-rsh "$LOADGEN_ADDR" "command -v legion >/dev/null" || {
-    echo "legion still not on PATH on the loadgen box" >&2
+rsh "$LOADGEN_ADDR" "command -v legion >/dev/null && command -v legion-loadgen >/dev/null" || {
+    echo "legion/legion-loadgen still not on PATH on the loadgen box" >&2
     exit 1
 }
-log "legion CLI ready on the loadgen box"
+log "legion CLI + legion-loadgen ready on the loadgen box"

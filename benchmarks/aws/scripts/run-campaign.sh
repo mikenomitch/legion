@@ -83,8 +83,15 @@ RESET_CP=true
 # plane, so a value set only at install time would be reverted before
 # the first cell ran.
 EVAL_THREADS=""
-# Empty leaves run-step.sh's default. Raise it when a cell reports
-# submission.driver_bound, which means the driver set the measured rate.
+# Empty leaves the driver's own default, which differs per submission path
+# (a CLI slot is a whole process; a native slot is one in-flight RPC).
+#
+# A Legion cell reporting `submission.driver_bound` used to mean "raise this";
+# it now usually means the cell fell back to the CLI loop, so check
+# `submitter` in the cell's metrics first. `LEGION_SUBMITTER` (auto|native|cli)
+# selects the path and is inherited by run-step.sh from this environment —
+# set it to `cli` for any campaign whose numbers will sit next to Nomad's or
+# K8s's, per the submission-path rule in README.md § Methodology.
 SUBMIT_CONCURRENCY=""
 # Threaded to run-step so a storm drill after the last cell finds a
 # workload still resident (see run-step.sh).
