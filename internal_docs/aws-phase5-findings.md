@@ -69,6 +69,34 @@ was unmeasurable (no resident workload); re-run with `--keep-jobs` covers
 it, and node-loss replacement is generated internally, so the slow CLI
 driver cannot bound that number.
 
+## Storm with a resident workload (this branch)
+
+`--keep-jobs` landed and the drill re-ran with 25,002 `web_fleet`
+allocations resident when the slice died:
+
+| metric | value |
+| --- | --- |
+| placement gap | **0.006 s** |
+| replaced | 23,935 allocations |
+| recovery time | 86.4 s |
+| **replacement throughput** | **~277 alloc/s sustained** |
+
+The placement gap is the headline: the scheduler never stopped placing
+while it absorbed the loss storm. Replacement work is internally generated,
+so this is a true Legion-bound number — ~46 evals/s of failure-recovery
+scheduling concurrent with the loss processing itself. (For scale:
+Kubernetes' default eviction rate limit is 0.1 nodes/sec, so a loss this
+size takes hours to evict at defaults before rescheduling begins.)
+
+*Open question, recorded rather than glossed:* `replaced_total` of 23,935
+is ~96% of the resident workload, far more than the ~25% a one-of-four
+instance slice should carry, and the drill's expectation query
+(`node_id LIKE 'sim-0-%'`) counted all 25,002 — the slice naming does not
+partition the fleet the way the drill assumes. Either placement
+concentrated on the killed instance's nodes or the fault hit more than one
+slice's processes. The throughput and gap numbers stand on their own; the
+attribution needs the drill's naming fixed before the next run.
+
 ## Corrections from tonight's own analysis
 
 - "~300 ms of eval life unaccounted post-dispatch-detach" — an artifact of
@@ -101,6 +129,4 @@ driver cannot bound that number.
 1. **The fast native submitter** — the gate on every further measurement.
 2. **Re-run the fill ladder behind it** — the slope (1.6×/doubling through
    #193) is untested on this branch because every deep point is a floor.
-3. **Storm with resident workload** — replacement throughput, internally
-   generated, measurable today.
 4. **The eval-thread knee above 32** — same gate.
