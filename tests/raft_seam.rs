@@ -64,6 +64,10 @@ const CLASSIFIED_MUTATIONS: &[&str] = &[
     "destroy_job",
     "get_kv_lock",
     "handle_job_submit",
+    // The batched form: N concurrent RunJobs in one control-lane changeset,
+    // each inside its own savepoint, versions derived through the batch
+    // transaction so same-job submits in one batch are successive.
+    "handle_job_submits",
     "idempotency_record",
     "insert_acl_token",
     "insert_join_token",
@@ -273,6 +277,7 @@ fn lane_for(method: &str) -> Lane {
         | "destroy_job"
         | "get_kv_lock"
         | "handle_job_submit"
+        | "handle_job_submits"
         | "idempotency_record"
         | "insert_acl_token"
         | "insert_join_token"

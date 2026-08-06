@@ -101,7 +101,12 @@ Ranked by project impact; the number is the rank.
   behind (`remove_node` is a control-lane op and may not write a
   scheduler-lane table), inert and ~100 bytes.
 
-## 2. Job intake group-commits per lane; the control-lane submit does not
+## 2. Job intake group-commits per lane; the control-lane submit does not (superseded by 3)
+
+> **Superseded on the control-lane half:** entry 3 batches the submit by
+> threading the version derivation through the batch transaction, which is
+> the prerequisite this entry named. The per-lane structure and the two
+> batched halves below are unchanged.
 
 - **The call:** the two *projection* halves of the job-submit composite —
   the scheduler-lane placement eval (`Store::enqueue_eval*`) and the
@@ -193,7 +198,34 @@ Ranked by project impact; the number is the rank.
   locally; the throughput claim needs the AWS rig. Same reasoning as the
   last entry in this file.
 
-## 3. Meter eval wakes by work, not by the eval table moving
+## 3. Batch the control-lane submit by threading versions through the transaction
+
+- **The call:** group-commit `handle_job_submit` (the last unbatched intake
+  round) by making its version derivation read through the batch
+  transaction (`latest_job_config_tx`) instead of a read connection, so
+  same-job submits in one batch derive successive versions.
+- **Alternatives.** (a) Leave it unbatched, as the intake work originally
+  and correctly chose while the version read went to committed state.
+  (b) Batch it and serialize same-job requests to different batches — a
+  scheduler-side dedupe that adds machinery to preserve a race instead of
+  removing it.
+- **The trade-off.** The submit body now runs against a caller-owned
+  transaction, so its writes and its version read must stay in the same
+  code path forever; a future submit-path read that quietly goes to a read
+  connection reintroduces the race only under batching, where it is
+  routine rather than rare. The test pinning versions 1-then-2 in one
+  batch is the guard.
+- **Why (performance and correctness together).** The local profile showed
+  fsync and pwrite at the top with one control commit (and one
+  synchronous=FULL fsync) per submitted job; measured after batching,
+  applied submit rounds fell to 0.51/job and total per-job quorum rounds
+  from ~3.0 to ~1.5. The version race this dissolves was already in the
+  code with its own apologetic comment — batching forced the fix the
+  single path deserved anyway.
+- **Surface.** None new: the existing
+  `schedulerSettings.job_intake_coalescing` switch gates this half too.
+
+## 4. Meter eval wakes by work, not by the eval table moving
 
 - **The call:** count the evals a changeset makes *claimable* and wake
   exactly that many workers with `notify_one`, instead of calling
@@ -227,7 +259,7 @@ Ranked by project impact; the number is the rank.
   a large `empty` share means workers are being woken for work that does
   not exist.
 
-## 4. Refresh the read model from the changeset delta, giving up self-healing
+## 5. Refresh the read model from the changeset delta, giving up self-healing
 
 - **The call:** after a committed changeset, patch `allocations_by_node`
   from the allocation rows the changeset *named* — one primary-key read
@@ -320,7 +352,7 @@ Ranked by project impact; the number is the rank.
   the node (a pure status UPDATE); placements and removals always bump,
   and the scrub still bounds the rest.
 
-## 5. Fuse claim and complete, rather than making the lane parallel
+## 6. Fuse claim and complete, rather than making the lane parallel
 
 - **The call:** halve the scheduler lane's per-eval quorum rounds by
   fusing the terminal write with the next claim
@@ -351,7 +383,7 @@ Ranked by project impact; the number is the rank.
   worker immediately asks for more work. Do the cheap, safe half first and
   let the measurement decide whether the expensive half is needed.
 
-## 6. The coalescer signals its handoff; the leader does NOT run a second batch
+## 7. The coalescer signals its handoff; the leader does NOT run a second batch
 
 - **The call:** replace the coalescer's poll-and-re-contend wait (a reply
   channel plus a `try_lock` retried every millisecond) with one `Mutex` and
@@ -403,9 +435,9 @@ Ranked by project impact; the number is the rank.
   `a_panicking_leader_does_not_wedge_its_batch_mates`, which hangs
   indefinitely on the old implementation.
 
-## 7. The fused claim is handled before the leadership gate
+## 8. The fused claim is handled before the leadership gate
 
-## 8. Batch the queue's own bookkeeping; leave plan-apply alone
+## 9. Batch the queue's own bookkeeping; leave plan-apply alone
 
 - **The call:** phase 4 batches exactly two things — the claim
   (`Store::claim_evals`) and the terminal write
@@ -441,7 +473,7 @@ Ranked by project impact; the number is the rank.
   `complete_and_claim_next` traffic phase 4 measured at 44/s down to 44/N,
   and leaves the apply question exactly where phase 4 left it.
 
-## 9. The batch is a fair share of the live queue, sized in code, not config
+## 10. The batch is a fair share of the live queue, sized in code, not config
 
 - **The call:** a worker claims `min(pending / evalThreads, 16)` evals, at
   least one, and never waits for the batch to fill. No config knob.
@@ -474,11 +506,11 @@ Ranked by project impact; the number is the rank.
   *cost* of a batch (how much already-handled work a crash re-runs), not
   its benefit.
 
-## 10. A panicked handler writes nothing
+## 11. A panicked handler writes nothing
 
-## 11. Batched enqueue takes a request struct, not N arguments
+## 12. Batched enqueue takes a request struct, not N arguments
 
-## 12. The batch's terminal write is all-or-nothing, and an unobserved eval is simply left out
+## 13. The batch's terminal write is all-or-nothing, and an unobserved eval is simply left out
 
 - **The call:** `complete_evals_and_claim_next` takes only the outcomes the
   worker actually observed. An eval whose handler panicked, or that a
@@ -512,7 +544,7 @@ Ranked by project impact; the number is the rank.
   outcomes we already hold for no gain. (c) gives back most of the win: the
   terminal write is the round phase 4 measured at 44/s.
 
-## 13. Size the read pool from its readers, and publish the negative result
+## 14. Size the read pool from its readers, and publish the negative result
 
 - **The call:** `read_only_conn_pool_size` takes `evalThreads` and returns
   `evalThreads + 4`, capped at 16, instead of
@@ -594,7 +626,7 @@ Ranked by project impact; the number is the rank.
   `legion_store_read_lock_wait_seconds` remains the way to tell whether the
   pool is short.
 
-## 14. The eval worker's own rounds move to the blocking pool, and the terminal write retries before abandoning a batch
+## 15. The eval worker's own rounds move to the blocking pool, and the terminal write retries before abandoning a batch
 
 - **The call:** `claim_evals` and `complete_evals_and_claim_next` run
   under `spawn_blocking` in the eval worker loop (the handler already
@@ -627,7 +659,7 @@ Ranked by project impact; the number is the rank.
   was transient.
 - **Surface.** None. The failure logs gain a `settle_attempts` field.
 
-## 15. The status-projection drain is not supervised as an eval worker
+## 16. The status-projection drain is not supervised as an eval worker
 
 - **The call:** the drain task moved off the eval workers' `JoinSet` onto
   a plain `tokio::spawn`.
@@ -648,7 +680,7 @@ Ranked by project impact; the number is the rank.
   JoinSet is machinery for a case that degrades gracefully without it.
 - **Surface.** None.
 
-## 16. Local benchmarks are reported as a no-regression check only
+## 17. Local benchmarks are reported as a no-regression check only
 
 - **The call:** the PR quotes the local SLO gate as "no regression" and
   explicitly declines to claim a throughput win from it.
@@ -668,7 +700,7 @@ Ranked by project impact; the number is the rank.
   eight scenarios. The real number needs the rig, and the plan's exit
   criterion says so.
 
-## 17. `RunJob` reports `deduplicated` to the loser of an idempotency race
+## 18. `RunJob` reports `deduplicated` to the loser of an idempotency race
 
 - **The call:** `run_job` now uses the boolean `Store::idempotency_record`
   already returns. Two submits carrying the same `idempotency_key`

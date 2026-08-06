@@ -26,6 +26,33 @@ fn dispatch_permits() -> Arc<Semaphore> {
     Arc::clone(PERMITS.get_or_init(|| Arc::new(Semaphore::new(MAX_IN_FLIGHT_DISPATCHES))))
 }
 
+/// Process-wide worker channel cache.
+///
+/// `dispatch_allocations` used to build a fresh lazy channel per CALL, so
+/// every eval re-dialed every worker it placed onto — a sampled manager
+/// under load showed `__connect` among its top kernel calls (~350
+/// connects/sec locally; an eval touching 44 workers at rig rates implies
+/// ~1,300/sec). A tonic `Channel` multiplexes and reconnects on its own,
+/// so one per worker address for the life of the process is the correct
+/// shape. Entries are never evicted: the value is a cheap handle, the key
+/// space is the fleet's address set, and a dead worker's channel simply
+/// fails sends until the address disappears from placements.
+fn cached_worker_client(address: &str) -> R<WorkerClient<Channel>> {
+    static CLIENTS: OnceLock<std::sync::Mutex<HashMap<String, WorkerClient<Channel>>>> =
+        OnceLock::new();
+    let cache = CLIENTS.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let mut guard = cache
+        .lock()
+        .map_err(|_| anyhow::anyhow!("worker client cache poisoned"))?;
+    if let Some(client) = guard.get(address) {
+        return Ok(client.clone());
+    }
+    let endpoint = Endpoint::from_shared(address.to_owned())?;
+    let client = WorkerClient::new(endpoint.connect_lazy());
+    guard.insert(address.to_owned(), client.clone());
+    Ok(client)
+}
+
 #[instrument(err, skip_all)]
 pub fn dispatch_allocations(store: &Store, allocations: &[Allocation]) -> R<()> {
     if allocations.is_empty() {
@@ -86,9 +113,10 @@ pub fn dispatch_allocations(store: &Store, allocations: &[Allocation]) -> R<()> 
         };
 
         if !clients.contains_key(&worker_address) {
-            let endpoint = Endpoint::from_shared(worker_address.clone())?;
-            let channel = endpoint.connect_lazy();
-            clients.insert(worker_address.clone(), WorkerClient::new(channel));
+            clients.insert(
+                worker_address.clone(),
+                cached_worker_client(&worker_address)?,
+            );
         }
         pending.push((
             worker_address,
