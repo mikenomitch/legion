@@ -88,6 +88,45 @@ impl ResourcePolicy {
 
         Ok(Value::Object(normalized))
     }
+
+    /// One allocation's stored resources as the normalized
+    /// [`ResourceRequest`] the usage aggregates and free-pool subtractions
+    /// consume — the exact normalization [`NodeUsage::from_rows`] and
+    /// [`ResourcePool::free_from_rows`] apply per row.
+    pub(crate) fn usage_request(&self, resources: &Value) -> R<ResourceRequest> {
+        let normalized = self.normalize_task_resources(resources, false)?;
+        ResourceRequest::from_value(&normalized)
+    }
+
+    /// A canonical, deterministic rendering of everything in this policy
+    /// that changes what [`Self::normalize_task_resources`] produces.
+    ///
+    /// This is the era tag on every persisted `node_alloc_usage` row: the
+    /// cached aggregate is rows run through *some* policy's normalization,
+    /// and the row-set fingerprint (epoch, count, id sum) cannot see a
+    /// POLICY change — an operator raising `taskResourceDefaults.memory`
+    /// and restarting would otherwise keep serving aggregates computed
+    /// under the old default, understating usage on every quiet node
+    /// indefinitely, which is silent overcommit. A cached row whose
+    /// fingerprint does not match the running policy is simply never
+    /// served, so a policy change costs one rebuild per node.
+    ///
+    /// Deliberately the readable canonical string rather than a hash of
+    /// it: it is written once per cache publish, compared byte-wise, and a
+    /// human debugging a rebuild storm can read WHICH policy wrote a row.
+    /// Keys are sorted so construction order can never produce two
+    /// spellings of one policy.
+    pub(crate) fn fingerprint(&self) -> String {
+        let defaults: std::collections::BTreeMap<&String, &Value> =
+            self.task_defaults.iter().collect();
+        let mut required: Vec<&String> = self.required_custom_resources.iter().collect();
+        required.sort_unstable();
+        let rendered = serde_json::json!({
+            "defaults": defaults,
+            "required": required,
+        });
+        rendered.to_string()
+    }
 }
 
 fn default_task_resource_defaults() -> Map<String, Value> {
@@ -868,8 +907,7 @@ impl NodeUsage {
         let mut usage = NodeUsage::default();
         for (allocation_id, resources) in rows {
             let request = policy
-                .normalize_task_resources(resources, false)
-                .and_then(|normalized| ResourceRequest::from_value(&normalized))
+                .usage_request(resources)
                 .with_context(|| format!("allocation {allocation_id} resources failed to parse"))?;
             usage.add(&request);
         }

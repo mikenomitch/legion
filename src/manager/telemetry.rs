@@ -790,6 +790,8 @@ pub struct Metrics {
     pub heartbeat_sustainable_nodes: Arc<Gauge>,
     /// `legion_nodes_marked_lost_total`
     pub nodes_marked_lost_total: Arc<Counter>,
+    /// `legion_nodes_recovered_total{path}`
+    pub nodes_recovered_total: Arc<CounterVec>,
     /// `legion_liveness_tracked_nodes`
     pub liveness_tracked_nodes: Arc<Gauge>,
     /// `legion_liveness_responsible_seconds`
@@ -862,7 +864,7 @@ impl Metrics {
         let eval_claim_total = Arc::new(CounterVec {
             meta: FamilyMeta {
                 name: "legion_eval_claim_total",
-                help: "Eval claim attempts by an eval worker, by outcome (claimed|empty). Every attempt is a scheduler-lane quorum round whether or not it finds work, so a high `empty` share means workers are being woken for evals that do not exist and the raft lane is paying for it.",
+                help: "Eval claim attempts by an eval worker, by outcome (claimed|empty). An empty attempt produces an empty changeset, which skips the raft entry — its cost is the capture (a savepoint on the write connection) plus a wasted wake, so a high `empty` share means workers are being woken for evals that do not exist and the write path is contending for it.",
                 labels: &["outcome"],
             },
             series: Series::new(),
@@ -1208,6 +1210,14 @@ impl Metrics {
             },
             cell: CounterCell::default(),
         });
+        let nodes_recovered_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_nodes_recovered_total",
+                help: "Lost nodes that came back, by path: 'heartbeat' (the node beat again) or 'reregistration' (the worker re-registered). marked_lost minus recovered is the net loss, and a fleet that flaps shows here instead of showing nothing.",
+                labels: &["path"],
+            },
+            series: Series::new(),
+        });
 
         // Node liveness (docs/node-liveness.md).
         let liveness_tracked_nodes = Arc::new(Gauge {
@@ -1273,6 +1283,7 @@ impl Metrics {
             Arc::clone(&heartbeat_lost_window_seconds) as Arc<dyn RenderMetric>,
             Arc::clone(&heartbeat_sustainable_nodes) as Arc<dyn RenderMetric>,
             Arc::clone(&nodes_marked_lost_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&nodes_recovered_total) as Arc<dyn RenderMetric>,
             Arc::clone(&liveness_tracked_nodes) as Arc<dyn RenderMetric>,
             Arc::clone(&liveness_responsible_seconds) as Arc<dyn RenderMetric>,
             Arc::clone(&liveness_digest_rpcs_total) as Arc<dyn RenderMetric>,
@@ -1372,6 +1383,7 @@ impl Metrics {
             heartbeat_lost_window_seconds,
             heartbeat_sustainable_nodes,
             nodes_marked_lost_total,
+            nodes_recovered_total,
             liveness_tracked_nodes,
             liveness_responsible_seconds,
             liveness_digest_rpcs_total,

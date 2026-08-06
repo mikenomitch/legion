@@ -77,6 +77,24 @@ Ranked by project impact; the number is the rank.
   set — i.e. an in-place `UPDATE` of `allocation.resources`, which nothing
   does today. A future writer that starts mutating `resources` in place
   must clear this table in the same transaction.
+- **Follow-up (2026-08-06): the fingerprint could not see a POLICY
+  change.** The aggregate is rows run through
+  `normalize_task_resources`, which folds in the manager's
+  `taskResourceDefaults` — and the row-set fingerprint is pure row
+  identity, so an operator raising a default and restarting kept every
+  cached row valid while the walk would have produced different numbers:
+  understated usage on every quiet node, indefinitely, i.e. silent
+  overcommit (audit finding, 2026-08-06). Each row now also stores
+  `ResourcePolicy::fingerprint()` — the canonical rendering of the
+  defaults and required custom resources, deliberately the readable
+  string rather than a hash so a rebuild storm names the policy that
+  wrote it — and the read requires it to equal the running policy's.
+  NULL (a pre-column row, or one written by a rolled-back binary whose
+  INSERT names only the original columns) never matches, so both skew
+  directions degrade to one rebuild per node. The alternative — deleting
+  the table at startup on policy change — was rejected because the table
+  is replicated scheduler-lane state and a local startup DELETE would
+  diverge replicas.
 - **Surface.** None. No jobspec, CLI, or API change; identical placement
   decisions. The one thing an operator can observe is the table itself,
   and one known wart: a node removed from the cluster leaves its row
@@ -172,14 +190,43 @@ Ranked by project impact; the number is the rank.
   state — naming the allocation ids or the nodes involved. Neither is
   expected in a healthy cluster; either one appearing repeatedly is the
   signal that the delta's premises are wrong somewhere.
-- **What is left on the table.** Reprojection (`reproject_model_nodes`)
-  still recomputes each touched node's free pool from its whole
-  allocation list, so a fill-scaled term remains in memory even though
-  the SQL one is gone. Measured locally over 44 touched nodes: at 10
-  allocations/node the refresh went 832µs → 496µs, at 40 it went 2.16ms →
-  1.03ms — about 2x, with the remainder now dominated by that
-  reprojection and by the 44 separate per-scope epoch reads. Making
-  either incremental is its own change.
+- **What is left on the table — closed 2026-08-06.** Reprojection
+  (`reproject_model_nodes`) recomputed each touched node's free pool from
+  its whole allocation list — one JSON normalization per allocation, per
+  touched node, on every replica, inside the read-model write lock every
+  planner reads through — so a fill-scaled term survived in memory even
+  after the SQL one was gone, and the phase-4 ladder's slope did not
+  move (~1.65x per doubling before and after, geometric mean). The read
+  model now keeps a per-node `NodeUsage` aggregate beside each cached
+  list (the in-memory sibling of the `node_alloc_usage` row, sharing the
+  same type and equivalence tests): reprojection subtracts the aggregate
+  (O(resource dims)), the delta path adjusts it with exactly the rows it
+  spliced, and EVERY wholesale list reload — scope refresh, scrub, drift
+  fallback, node removal — drops the entry so the next reprojection
+  rebuilds it from the list. An absent entry costs precisely the old
+  walk, so the memo cannot be less correct than what it replaced, and
+  the model-vs-full-reload equivalence test now also asserts every memo
+  entry equals its list's re-aggregation (contributor counts included,
+  which pool equality alone cannot see). Measured locally
+  (`bench_local_reprojection_by_fill`, 44 touched nodes): walk 414µs →
+  memo 50µs at 10 allocations/node, 1.92ms → 74µs at 40 — the memo arm
+  grows 1.5x over a 4x fill change where the walk grows 4.6x. The 44
+  per-scope epoch reads went the same way: one read connection and one
+  cached statement for the whole scope set, instead of one acquisition
+  and one statement parse per scope.
+- **Follow-up (2026-08-06): the full reload could CLOBBER a newer
+  delta.** The rejection-bookkeeping full refresh (submitter thread)
+  reads committed state, then publishes under the write lock — and a
+  delta projection (raft-apply thread) could publish newer state for the
+  same node in between, which the older wholesale insert then erased.
+  Pre-delta that lost update was healed by the next full reload; with
+  deltas it could persist until the scrub reached the node (audit
+  finding, 2026-08-06). The refresh now skips, under the write lock, any
+  scope whose mirror epoch is already ahead of the one it read — safe
+  precisely because what it would have written is provably older. The
+  residual window is a concurrent commit that bumps no scope epoch of
+  the node (a pure status UPDATE); placements and removals always bump,
+  and the scrub still bounds the rest.
 
 ## 4. Fuse claim and complete, rather than making the lane parallel
 
@@ -455,7 +502,61 @@ Ranked by project impact; the number is the rank.
   `legion_store_read_lock_wait_seconds` remains the way to tell whether the
   pool is short.
 
-## 13. Local benchmarks are reported as a no-regression check only
+## 13. The eval worker's own rounds move to the blocking pool, and the terminal write retries before abandoning a batch
+
+- **The call:** `claim_evals` and `complete_evals_and_claim_next` run
+  under `spawn_blocking` in the eval worker loop (the handler already
+  did), and a failed terminal write is retried up to
+  `EVAL_SETTLE_MAX_ATTEMPTS` (3) — with an immediate stop on a typed
+  `NotRaftLeader` — before the batch is abandoned to in-flight recovery.
+- **Alternatives.** (a) Leave the rounds inline: they are "just" store
+  calls, and the runtime has as many workers as cores. (b) Make the whole
+  eval worker a dedicated OS thread instead of an async task. (c) For the
+  retry: add a periodic `requeue_in_flight_evals` sweep on the stable
+  leader instead, which also covers handler panics.
+- **Trade-off.** Two `spawn_blocking` hops per batch cycle add scheduling
+  latency (~µs) to an idle cluster's eval path, and a retried settle can
+  triple the time a genuinely-failing write holds a worker before the
+  batch lands in recovery. (c) is the more complete fix for orphaned
+  evals and remains open — a periodic requeue must not race live
+  handlers, which needs an age threshold tied to the worst-case handler
+  time, so it is a design of its own.
+- **Why (performance, then correctness).** Each inline call parked a
+  tokio runtime worker for a whole scheduler-lane quorum round, and
+  there are only `available_parallelism()` of those (4 on the campaign
+  managers) no matter how high `evalThreads` goes — so past ~4 threads
+  the claims themselves serialized the loop, and the TODO already named
+  this a prerequisite for sweeping past 64 threads. The retry closes the
+  cheaper half of an audit finding: on a leader that never loses
+  leadership, `requeue_in_flight_evals` runs only at startup and on
+  leadership *acquisition*, so one transient write error orphaned up to
+  a whole batch of handled evals forever. Retrying costs nothing when
+  the error is real (the attempts fail fast) and saves the batch when it
+  was transient.
+- **Surface.** None. The failure logs gain a `settle_attempts` field.
+
+## 14. The status-projection drain is not supervised as an eval worker
+
+- **The call:** the drain task moved off the eval workers' `JoinSet` onto
+  a plain `tokio::spawn`.
+- **Alternative.** Tag the JoinSet's members so the supervisor can
+  restart each kind as itself.
+- **Trade-off.** A drain that somehow exits is not restarted; every
+  subsequent projection send fails into the closed channel and falls back
+  to the inline status-lane round — the pre-drain behavior, permanently,
+  until restart.
+- **Why (correctness of supervision).** The eval-worker supervisor
+  replaces ANY exited member with an eval worker, so a dead drain
+  silently became a 17th planner — skewing the batch-fairness arithmetic
+  keyed to `workers` — while the projection queue kept accepting sends
+  into a channel nothing drained (audit finding, 2026-08-06). The drain
+  body is panic-free by construction (the projection itself runs under
+  `spawn_blocking` with both error arms logged), so a supervisor for it
+  buys nothing the fallback does not already guarantee; tagging the
+  JoinSet is machinery for a case that degrades gracefully without it.
+- **Surface.** None.
+
+## 15. Local benchmarks are reported as a no-regression check only
 
 - **The call:** the PR quotes the local SLO gate as "no regression" and
   explicitly declines to claim a throughput win from it.

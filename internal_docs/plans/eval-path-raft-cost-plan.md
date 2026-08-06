@@ -273,6 +273,38 @@ in apply at once, which feeds it.
 
 **Steady-state scheduler-lane rounds per eval: 2 → 2/N.**
 
+### Phase 5 — the in-memory fill term, and hardening (SHIPPED 2026-08-06)
+
+The phase-4 AWS re-measurement showed the fill-degradation slope
+unchanged (~1.65x per doubling) even though both shipped halves provably
+flattened their own paths — so the dominant term was the named next
+suspect, `reproject_model_nodes`, which re-aggregated every touched
+node's whole allocation list (one JSON normalization per allocation)
+after every projected changeset, on every replica, inside the read-model
+write lock. This phase:
+
+- **Memoizes per-node usage in the read model** (`node_usage`, the
+  in-memory sibling of `node_alloc_usage`): reprojection becomes a
+  subtraction over resource dims; the delta path adjusts entries with
+  exactly the rows it spliced; every wholesale reload invalidates.
+  Local A/B (`bench_local_reprojection_by_fill`, 44 nodes): 414µs → 50µs
+  at 10 allocations/node, 1.92ms → 74µs at 40.
+- **Batches the per-scope epoch reads** of a refresh (one connection,
+  one cached statement, was ~44 acquisitions + parses per eval).
+- **Moves the eval loop's claim/settle rounds onto the blocking pool**
+  and retries a failed settle (calls #13) — the prerequisite for
+  sweeping `evalThreads` past 64.
+- **Hardens what phase 4 shipped** (2026-08-06 audit): the
+  `node_alloc_usage` cache gains a policy fingerprint (calls #1
+  follow-up), the wholesale refresh no longer clobbers a newer delta
+  publish (calls #3 follow-up), and the status-projection drain is
+  supervised as itself rather than as an eval worker (calls #14).
+
+**Exit criterion:** the `dense_fleet` 50k/100k/200k ladder, re-run on
+the rig — the slope should now flatten. If it still does not, the next
+suspect is off this path entirely (control-plane CPU at saturation,
+phase-4 findings open item 4).
+
 ## 7. Testing
 
 - `tests/eval_regen_failover.rs`: a batch of one is indistinguishable

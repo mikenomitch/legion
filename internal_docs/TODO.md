@@ -98,16 +98,27 @@ How to use it:
       `submission.driver_bound: false`: **177.27 alloc/sec** at 4 eval
       threads, **219.25** at 16, and **736.1** on `dense_fleet` (44
       allocations per eval), all at 5,000 nodes on three 4-vCPU managers.
-- [ ] **Reprojection still reads a node's whole allocation list.** The
-      read-model refresh now takes the changeset delta (Done below), but
-      `reproject_model_nodes` still recomputes each touched node's free pool
-      from every allocation on it — so a fill-scaled term survives, in memory
-      rather than in SQLite. Locally, over 44 touched nodes, the refresh went
-      832µs → 496µs at 10 allocations/node and 2.16ms → 1.03ms at 40; what
-      remains is that reprojection plus 44 separate per-scope epoch reads,
-      each taking its own read connection. Making either incremental is its
-      own change: the pool would have to be debited and credited by the
-      delta, and the index reprojection consumes the pool.
+- [x] **Reprojection no longer reads a node's whole allocation list**
+      (2026-08-06, phase 5 of
+      [eval-path-raft-cost-plan.md](plans/eval-path-raft-cost-plan.md)).
+      The read model keeps a per-node `NodeUsage` aggregate beside each
+      cached allocation list — the in-memory sibling of `node_alloc_usage`,
+      same type, same equivalence tests — so `reproject_model_nodes` is a
+      subtraction over resource dims instead of one JSON normalization per
+      allocation on the node. The delta path adjusts the memo with exactly
+      the rows it spliced; every wholesale list reload (scope refresh,
+      scrub, drift fallback, node removal) drops the entry and the next
+      reprojection rebuilds it from the list, so an absent entry costs
+      precisely the old walk. The 44 per-scope epoch reads became one read
+      connection + one cached statement. Local A/B
+      (`bench_local_reprojection_by_fill`, 44 touched nodes): 414µs → 50µs
+      at 10 allocations/node, 1.92ms → 74µs at 40 — the memo arm grows
+      1.5x over a 4x fill change where the walk grew 4.6x. Numbers in
+      [benchmarks/scheduler/README.md](../benchmarks/scheduler/README.md);
+      calls in
+      [eval-path-raft-cost-plan_calls.md](calls/eval-path-raft-cost-plan_calls.md)
+      §3. **The `dense_fleet` ladder re-run is the regression test** — see
+      the open re-measure item below.
 - [ ] **Batch the eval loop (claim N, plan N, apply N, complete N).** Now the
       whole remaining cost. With the wake herd fixed and health checks shown
       to be `outcome=empty`, the only meaningful quorum traffic left is
@@ -176,13 +187,35 @@ How to use it:
       [benchmarks/scheduler/README.md](../benchmarks/scheduler/README.md) and
       [scheduler-and-eval-loop.md](../docs/scheduler-and-eval-loop.md#the-per-node-usage-cache).
       **Unmeasured end to end** — see the open item below.
-- [ ] **Re-measure the `dense_fleet` fill ladder.** The per-node usage cache
-      above targets the apply half of the ~1.6x-per-doubling degradation;
-      the read-model refresh half (`cache_refresh_allocation_scopes`,
-      ~1,700 rows per eval on every replica) is untouched. Re-run the
-      50k/100k/200k ladder at 5,000 nodes and see how much of the slope is
-      left. The fingerprint is still an index-only scan proportional to
-      allocations-per-node, so the slope should flatten rather than vanish.
+- [ ] **Re-measure the `dense_fleet` fill ladder.** The 2026-08-05 re-run
+      measured a uniform ~2.4x throughput lift with the slope UNCHANGED
+      (~1.65x per doubling) — which ruled out the per-node usage cache and
+      the delta refresh as the dominant term and pointed at
+      `reproject_model_nodes`. That term is now gone too (the usage memo,
+      2026-08-06 above), so re-run the 50k/100k/200k ladder once more:
+      if the slope still does not flatten, the mechanism is off the
+      store/refresh path entirely and the next measurement is
+      control-plane CPU at saturation
+      ([aws-phase4-findings.md](aws-phase4-findings.md) open item 4).
+- [ ] **`node_alloc_usage` never sheds rows.** Node removal is a
+      control-lane op and may not delete a scheduler-lane row, so a
+      churning fleet accretes one inert ~100-byte row per departed node,
+      in the table, the raft snapshots, and every plan changeset that
+      republishes it. Harmless at rig scale; needs a scheduler-lane sweep
+      (the `prune_node_health_orphans` shape) if node churn becomes a
+      real workload. Same wart class: each applied plan's changeset now
+      carries one `node_alloc_usage` upsert per touched node (~44 ×
+      ~100 B on `dense_fleet`) — the write-side cost of the read-side
+      cache, unmeasured on the rig.
+- [ ] **The read-pool cap re-couples with the runtime on >12-core
+      hosts.** The pool is `evalThreads + 4` capped at 16 for the 1 GiB
+      page-cache budget, but `evalThreads` still defaults to
+      `available_parallelism()` — so a 32-core host runs 32 eval workers
+      against 16 read connections plus inline heartbeat reads, which is
+      the saturating-in-lockstep shape the sizing change argued against.
+      Resolves itself when the `evalThreads` default is decided
+      ([eval-thread-default-plan.md](plans/eval-thread-default-plan.md));
+      until then it is a documented corner, not a defect.
 - [ ] **Decide the `evalThreads` default.** It is `available_parallelism()`,
       which is the 4 that placed slowest in the 2026-08-05 sweep at 5,000
       nodes: 177.27 alloc/s at 4 threads, 208.83 at 8, 219.25 at 16,
@@ -203,18 +236,29 @@ How to use it:
         other scheduler plans too.
   - [ ] `configs/manager.ncl` pins `evalThreads = 4` explicitly, so it has
         to move with the default.
-- [ ] **The eval loop blocks tokio worker threads on quorum rounds.**
-      `store.claim_eval()` (`daemon.rs:1719`) and
-      `store.complete_and_claim_next()` (`:1768`) are synchronous calls made
-      directly in the async loop, not inside the `spawn_blocking` the eval
-      *handler* correctly uses. Each parks a runtime worker thread for a
-      whole scheduler-lane quorum round, and there are
-      `available_parallelism()` of those — 4 on the campaign's managers, no
-      matter how high `evalThreads` goes. While they are parked nothing
-      async runs, including polling the completed handlers. Move both onto
-      the blocking pool. This is now a **prerequisite for sweeping past 64
-      eval threads** — at 128 workers against 4 runtime threads the sweep
-      would be measuring this defect rather than the scheduler.
+- [x] **The eval loop no longer blocks tokio worker threads on quorum
+      rounds** (2026-08-06). The batch claim and the fused settle round
+      both run under `spawn_blocking`, like the handler always did, so a
+      parked quorum round trip never parks a runtime worker — the
+      prerequisite for sweeping past 64 eval threads. The settle round
+      also retries (bounded, `EVAL_SETTLE_MAX_ATTEMPTS`, fail-fast on
+      `NotRaftLeader`) before abandoning a batch: on a STABLE leader
+      nothing else ever recovers an orphaned batch, because
+      `requeue_in_flight_evals` runs only at startup and on leadership
+      acquisition. Calls:
+      [eval-path-raft-cost-plan_calls.md](calls/eval-path-raft-cost-plan_calls.md)
+      §13. The status checker's `mark_nodes_as_lost`/`recheck_lost_nodes`
+      moved onto the blocking pool in the same change.
+- [ ] **A stable leader still never re-sweeps in-flight evals.** The
+      settle retry above shrinks the window; the complete fix is a
+      periodic `requeue_in_flight_evals` with an age threshold safely
+      above the worst-case handler time (conflict backoffs can hold an
+      eval for hundreds of ms × retries), so it cannot race a live
+      handler. Needs that bound stated before it can ship. Related: the
+      terminal write has no `status = 'in_flight'` guard, so a worker
+      that survives a double leadership flap can settle an eval a new
+      leader already requeued and re-claimed — narrow, pre-existing, and
+      widened slightly by batching (audit finding, 2026-08-06).
 - [ ] **`run_dispatch_future` has no `Send` bound** (`dispatcher.rs:408`),
       so holding a `MutexGuard` across an `.await` inside
       `dispatch_allocations` would **compile**. It does not happen today —
@@ -249,11 +293,14 @@ How to use it:
       the coalescer. Find out which by measuring how many threads are
       actually inside `submit_and_apply_plan` at once —
       [aws-phase4-findings.md](aws-phase4-findings.md) item 2.
-- [ ] **Skip the health-check write when nothing changed.**
-      `update_node_health_checks` runs ~134/s on a 5,000-node fleet and every
-      one is `outcome=empty`, so it costs no quorum rounds — but it still
-      takes a savepoint and the write connection each time. Cheap to remove,
-      and it is pure contention against real writes.
+- [x] **Skip the health-check write when nothing changed.** Shipped in
+      #191 (`f8dbd68`) but never checked off here: `update_node_health_checks`
+      compares against the current row on a READ connection first and
+      returns before the write path when nothing changed — no savepoint,
+      no write connection, no replicated-op machinery. The 2026-08-06
+      audit re-verified it end to end. Residual: a *forwarded* health
+      check (leadership-rejection path only) skips the compare on the
+      origin and runs it on the target.
 - [ ] **Re-measure the plan-apply fix on AWS.** Phase 4 of
       [plan-apply-conflict-reduction-plan.md](plans/plan-apply-conflict-reduction-plan.md).
       The two-pass bind is shipped and unit-proven but **unmeasured at
@@ -748,30 +795,32 @@ How to use it:
         `evals_processed_total{kind="node_lost_reschedule"}` at 2752
         against `{kind="job_submit"}` at 66 and a 764-deep queue. Four
         separate causes, each fixable on its own:
-    - [ ] **Equal priority means submissions queue behind recovery.**
-          `claim_eval` orders by `priority DESC, id ASC`
-          (`src/storage/store.rs:12200`) and `node_lost_reschedule`
-          enqueues with no priority, falling back to `DEF_EVAL_PRIORITY`
-          = 50 (`src/constants.rs:65`) — the same value a normal job
-          gets. At equal priority the autoincrement id decides, so a new
-          submit can never overtake an older backlog. Either drop
-          reschedules below the default or give `claim_eval` cross-kind
-          fairness. [preemption plan §on eval
-          starvation](plans/preemption-and-eviction-plan.md) covers the
-          *priority* case and calls it theoretical; this is the equal-
-          priority FIFO case and it is not.
-    - [ ] **Lost nodes with no allocations still cost a full eval.** The
-          `allocs.is_empty()` check is inside the handler
-          (`src/storage/store.rs:10936`), after the enqueue and claim
-          have each been through raft. Push the predicate up to the three
-          enqueue sites (`:5132`, `:5294`, `:12580`).
-    - [ ] **The fan-out is one raft proposal per node, per 2s tick,
-          inline in the status checker.** `mark_nodes_as_lost` loops
-          per node (`src/storage/store.rs:5123-5136`), and
-          `recheck_lost_nodes` re-enqueues every tick for as long as a
-          node stays lost. Batch into one replicated op, and get it off
-          the liveness loop so the checkpoint and gauge refresh still run
-          during the event.
+        **Fixed 2026-08-06** —
+        [node-loss-storm-plan.md](plans/node-loss-storm-plan.md)
+        ([calls](calls/node-loss-storm-plan_calls.md)), public note in
+        [docs/node-liveness.md](../docs/node-liveness.md) § "What a mass
+        loss costs". Status per cause:
+    - [x] **Equal priority means submissions queue behind recovery.**
+          `node_lost_reschedule` evals now enqueue at
+          `default_priority − NODE_LOST_RESCHEDULE_PRIORITY_DROP`
+          (50 − 10 at the defaults), so a new submission overtakes the
+          recovery backlog. Cross-kind `claim_eval` fairness was the
+          rejected alternative ([call 1](calls/node-loss-storm-plan_calls.md)).
+    - [x] **Lost nodes with no allocations still cost a full eval.** The
+          predicate now runs at enqueue time (one chunked indexed query
+          per batch, `Store::nodes_with_allocations`); the recheck
+          re-runs it every tick so a racing in-flight placement is picked
+          up one tick later, and the handler's early-return stays as the
+          backstop.
+    - [x] **The fan-out is one raft proposal per node, per 2s tick,
+          inline in the status checker.** Both `mark_nodes_as_lost` and
+          `recheck_lost_nodes` now go through
+          `Store::enqueue_lost_node_reschedules`: one dedup query, one
+          allocation-filter query, one `enqueue_evals` round for the
+          whole batch (per-node forwarding-aware fallback under split
+          lane leadership), and the checker runs the mark and the recheck
+          on the blocking pool so the tick's gauge refresh and checkpoint
+          never stall behind them.
     - [ ] **Failed evals may not reach `evals_processed_total`.**
           Suspected on the AWS run and then RETRACTED — the counter is
           incremented on both paths at `src/manager/daemon.rs:2267`, and
@@ -781,22 +830,20 @@ How to use it:
           constraints match no node, and confirm
           `evals_processed_total{kind="job_submit",status="error"}`
           moves by exactly one.
-    - [ ] **Recovery is invisible.** Re-registration clears a `lost` row
-          via `SEED_NODE_HEALTH` with no log and no counter, unlike the
-          heartbeat recovery path which logs at
-          `src/storage/store.rs:5620`. Add
-          `legion_nodes_recovered_total{path}` so `lost - recovered` is
-          computable and flapping is visible; today a fleet that dies and
-          comes back reads as if nothing happened.
-        Not a rig-only concern: a single-AZ loss in a three-AZ cluster is
-        ~33% of the fleet, which is *under*
+    - [x] **Recovery is invisible.** `legion_nodes_recovered_total{path}`
+          now counts both paths (`heartbeat`, `reregistration`), the
+          re-registration path logs, and `marked_lost − recovered` is the
+          net loss ([docs/metrics.md](../docs/metrics.md)).
+    - [ ] **Re-measure the storm on the rig.** The 2026-08-04 numbers
+          (submission ~6 s/job behind 2,752 reschedules) are the before;
+          repeat the ~3,000-node loss and expect submissions to keep
+          landing while `legion eval list` shows the backlog at
+          priority 40.
+        Context that still stands: a single-AZ loss in a three-AZ cluster
+        is ~33% of the fleet, *under*
         `LIVENESS_MASS_DISRUPTION_FRACTION` (`src/constants.rs:109`), so
-        the full storm fires unsuppressed. The cadence plan anticipates
-        the loss→reschedule→load loop
-        ([plan §6.4](plans/heartbeat-cadence-at-scale-plan.md)) but sizes
-        it as one eval per *allocation*; it is per node, including nodes
-        with none. Needs a plan before any fix, and a public note in
-        [docs/node-liveness.md](../docs/node-liveness.md).
+        the full storm fires unsuppressed — by design; these fixes are
+        what make that affordable.
   - [ ] **`mark_node_ready` writes `status = "ready"`, which every liveness
         query filters out.** `mark_node_ready_apply`
         (`src/storage/store.rs`) sets `"ready"` rather than `"active"`, so a

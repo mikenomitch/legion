@@ -70,6 +70,31 @@ an operator drained with `legion node cordon` or `legion node drain` is still
 drained when it comes back, because that is a human's intent and a heartbeat
 does not get to overrule it.
 
+Recoveries are counted: `legion_nodes_recovered_total{path}` moves on the
+heartbeat path above (`path="heartbeat"`) and when a worker re-registers
+instead of resuming (`path="reregistration"`).
+`legion_nodes_marked_lost_total` minus this is the fleet's *net* loss — a
+flapping fleet shows as both counters climbing, where before it read as
+steady loss.
+
+### What a mass loss costs
+
+When many nodes go lost in one tick, marking them is **batched**: one
+status-lane commit records the losses, one control-lane commit flips their
+availability, and one scheduler-lane commit enqueues the reschedule evals —
+per tick, regardless of how many nodes dropped. Two more things bound the
+storm:
+
+- **Only nodes that hold allocations get a reschedule eval.** A lost node
+  with nothing on it costs nothing until something lands on it (re-checked
+  every tick).
+- **Reschedule evals run one priority band below the default** (40 against
+  50 at the defaults), so new job submissions overtake the recovery
+  backlog instead of queueing behind it. Recovery still proceeds — the
+  monitor re-drives it every tick — it just no longer freezes the
+  submission path while it does. An explicit `--priority` on a submission
+  behaves exactly as before.
+
 ---
 
 ## What an election does
@@ -263,6 +288,7 @@ Rejected at manager startup, with the offending values named:
 | `legion_liveness_peer_stale{peer}` | **The metric to alert on** for a quiet peer manager. |
 | `legion_liveness_loss_suppressed_total{reason}` | `failover_grace` / `peer_digest_gap` / `mass_disruption`. |
 | `legion_liveness_checkpoint_seconds` | Wall-clock of one checkpoint commit. |
+| `legion_nodes_recovered_total{path}` | Lost nodes that came back: `heartbeat` / `reregistration`. Read beside `legion_nodes_marked_lost_total` for net loss. |
 
 `legion_raft_pipeline_depth{lane="status"}` should sit at approximately zero
 between checkpoints on a steady-state fleet. If it does not, heartbeats are

@@ -87,8 +87,10 @@ rules a cause in or out, and which knob to turn — is in
   The outcomes are mutually exclusive — see
   [late-binding-plan-apply.md](late-binding-plan-apply.md).
 - **`legion_eval_claim_total{outcome}`** (counter) — eval claim attempts by
-  an eval worker: `claimed` found work, `empty` did not. Every attempt is a
-  scheduler-lane quorum round either way, so the `empty` share is the cost of
+  an eval worker: `claimed` found work, `empty` did not. An empty attempt
+  produces an empty changeset, which skips the raft entry; what it still
+  pays is the capture (a savepoint on the write connection) and the wake
+  itself, so the `empty` share is the cost of
   waking a worker for work that does not exist. A large share means the pool
   is being over-woken; a saturated 5,000-node cluster runs at roughly 0.3
   empty claims per second. Claims carried over by the fused
@@ -185,6 +187,10 @@ instrument.
 - **`legion_nodes_marked_lost_total`** (counter) — nodes marked lost after
   missed heartbeats. Distinguishes "nodes went away" from
   `legion_nodes{status="lost"}`'s "nodes are away".
+- **`legion_nodes_recovered_total{path}`** (counter) — lost nodes that came
+  back: `path="heartbeat"` (the node resumed beating) or
+  `path="reregistration"` (the worker re-registered). `marked_lost` minus
+  this is the fleet's net loss; a flapping fleet moves both.
 
 ### Heartbeat cadence
 
