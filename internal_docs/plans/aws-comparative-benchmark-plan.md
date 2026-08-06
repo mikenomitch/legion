@@ -10,7 +10,17 @@ that is being fixed, and the Nomad/K8s campaigns would be compared
 against Legion's worst configuration. Phases 3-5 wait for
 [plan-apply-conflict-reduction-plan.md](plan-apply-conflict-reduction-plan.md).
 The rig itself is now sound — every failure of that campaign was a rig
-bug, all fixed, recorded in calls entries 21-25.
+bug, all fixed, recorded in calls entries 21-22 and 25-27.
+
+**The load generator was the last of those (2026-08-05).** Submission
+was one `legion job run` process per job and ceilinged at ~36-103
+jobs/sec, which several cells reported as Legion's throughput while the
+control plane idled; `legion-loadgen` (`benchmarks/loadgen/`) replaces it
+for Legion with one process and concurrent `RunJob` calls, measured at
+5-7x the CLI loop (1,107-1,492 jobs/sec locally). It is **Legion-only**,
+so phases 3-5 must run
+every system on the shared CLI loop (`LEGION_SUBMITTER=cli`) or grow
+native submitters for Nomad and K8s first — calls entries 23-24.
 
 Phase 0 shipped
 ([worker-simulation-plan.md](worker-simulation-plan.md), 2026-07-30).

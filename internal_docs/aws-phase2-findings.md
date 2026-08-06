@@ -9,7 +9,7 @@ Read this to pick the work back up. The plans it points at own the
 decisions; this is the record of how we got to them.
 
 - Plan: [`plans/aws-comparative-benchmark-plan.md`](plans/aws-comparative-benchmark-plan.md)
-- Calls: [`calls/aws-comparative-benchmark-plan_calls.md`](calls/aws-comparative-benchmark-plan_calls.md) (entries 21-25)
+- Calls: [`calls/aws-comparative-benchmark-plan_calls.md`](calls/aws-comparative-benchmark-plan_calls.md) (entries 21-22 and 25-27; the load-generator fix that followed is 23-24)
 - The night before: [`aws-phase1-findings.md`](aws-phase1-findings.md)
 - Open work: [`TODO.md`](TODO.md)
 
@@ -198,7 +198,7 @@ Each of these has a TODO entry with the evidence.
   caller, no RPC and no CLI verb. An operator decommissioning hardware
   has the same problem the rig does.
 
-**The rig** — see the calls doc entries 21-25 for the reasoning
+**The rig** — see the calls doc entries 21-22 and 25-27 for the reasoning
 - Cells were sized from each scenario's own base (180/304/380
   allocations), so a 1000-node cell placed 180 allocations in 0.8s,
   entirely inside the warmup, and reported `throughput 0.0` while

@@ -226,14 +226,43 @@ How to use it:
       **Planned, not built** —
       [eval-thread-default-plan.md](plans/eval-thread-default-plan.md), which
       deliberately picks no number.
-  - [ ] **Fix the load generator before sweeping again (Phase 0a, the
-        gate).** The driver spawns one `legion job run` CLI process per job,
-        so its rate is bounded by process spawn and gRPC dial, not by
-        Legion. Until a 64-thread cell can report `driver_bound: false`, no
-        point above 32 produces a number. Submit through one long-lived
-        in-process gRPC client; give the loadgen its own instance; shard it
-        if that is not enough. Unblocks the saturation questions in the
-        other scheduler plans too.
+  - [x] **Fix the load generator before sweeping again (Phase 0a, the
+        gate)** (2026-08-05). `legion-loadgen`
+        (`benchmarks/loadgen/main.rs`, `cargo build --features loadgen`)
+        submits a whole workload from one process over a pool of long-lived
+        gRPC channels, with no per-job process spawn or dial. Measured on
+        one macOS box, 5,001 web_fleet jobs, the two paths alternated back
+        to back: **255-260 jobs/sec** on the CLI loop against **1,107-1,492
+        jobs/sec** native on an idle box, and 105/108 against 741/564 on a
+        loaded one — **5-7x either way**. End to end at 600 nodes,
+        submission of 2,001 jobs went from 8.54s to 2.64s and the placement
+        tail after the last submit went from 2.1s to 8.1s, so the scheduler
+        is now the constraint by a fourfold wider margin.
+        `driver.py --submitter {auto,native,cli}` selects it and every cell
+        archives which path it took. The eval-thread sweep above can now be
+        re-run past 32. Calls:
+        [aws-comparative-benchmark-plan_calls.md](calls/aws-comparative-benchmark-plan_calls.md)
+        §23-24.
+  - [ ] **Native submitters for Nomad and K8s, before the next
+        cross-system table.** `legion-loadgen` is Legion-only, so a cell run
+        with `--submitter native` is comparable to another Legion cell and
+        to nothing else; Nomad and K8s still spawn a CLI process per job.
+        Until they have equivalents (Nomad's HTTP API and the apiserver
+        REST API, each over one keep-alive session), every cross-system
+        comparison must force `LEGION_SUBMITTER=cli` on all three. The rule
+        is in `benchmarks/aws/README.md` § Methodology and the path taken is
+        recorded per cell as `submitter` in `metrics.json` and
+        `fairness-record.json`.
+  - [ ] **Burst submission costs measured placement throughput — find out
+        why.** The same 600-node/12,006-allocation cell placed 1,329
+        alloc/sec when the CLI loop paced submission over 8.5s and 1,126
+        alloc/sec when the native submitter delivered the same jobs in
+        2.6s: about 15% lost to receiving the work faster. That is the
+        first look the rig has ever had at Legion under a submission burst,
+        and the obvious suspect is plan-apply conflict
+        ([plan-apply-conflict-reduction-plan.md](plans/plan-apply-conflict-reduction-plan.md)).
+        Measure `legion_plan_apply_total{outcome}` across a paced/burst
+        pair before drawing a conclusion.
   - [ ] `configs/manager.ncl` pins `evalThreads = 4` explicitly, so it has
         to move with the default.
 - [x] **The eval loop no longer blocks tokio worker threads on quorum
@@ -1576,6 +1605,14 @@ Deferred from [job-updated-at-plan.md](plans/job-updated-at-plan.md):
       round trips and the commits. Wants a plan first: batching changes
       idempotency (one key per batch or per job?), partial-failure
       semantics, and ACL scope evaluation, none of which are obvious.
+      **Still open, and now measurable.** The benchmark rig no longer needs
+      it — `legion-loadgen` reaches ~1,100-1,500 jobs/sec against one local
+      manager with unary `RunJob` — but that is also the first honest
+      baseline a `RunJobs` would have to beat, and the per-job control-lane
+      commit is still there underneath it. The loadgen's concurrency curve
+      is the evidence: throughput peaks near 128 in flight and *falls* to
+      607 jobs/sec at 1,024, which is what a serialized commit looks like
+      from the client side.
 - [ ] **`a_task_that_ignores_its_stop_signal_is_killed_at_the_deadline` is
       flaky under parallel load.** Passes alone and in most full runs, fails
       intermittently in `cargo test --all` (seen 2026-08-04). Its own comment

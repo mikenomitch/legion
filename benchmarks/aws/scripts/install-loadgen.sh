@@ -42,12 +42,20 @@ else
     log "         Without it the experiments/ drills cannot inject faults."
 fi
 
-log "installing legion CLI from s3://$BUCKET/bin/legion"
+# Both binaries: the CLI (job/state/events verbs, and the fairness-baseline
+# submit path) and legion-loadgen, the native submitter the driver uses for
+# Legion cells. Without the latter the driver falls back to a process per job
+# and ceilings at ~36-103 jobs/sec, which is what got reported as Legion's
+# throughput in phase 4.
+log "installing legion CLI + legion-loadgen from s3://$BUCKET/bin/"
 rsh "$LOADGEN_ADDR" "
     sudo aws s3 cp --only-show-errors --region $REGION s3://$BUCKET/bin/legion /opt/legion/bin/legion &&
     sudo chmod +x /opt/legion/bin/legion &&
-    sudo ln -sf /opt/legion/bin/legion /usr/local/bin/legion
-" || log "WARNING: legion binary not in S3 yet — run build-and-upload.sh, then re-run"
+    sudo ln -sf /opt/legion/bin/legion /usr/local/bin/legion &&
+    sudo aws s3 cp --only-show-errors --region $REGION s3://$BUCKET/bin/legion-loadgen /opt/legion/bin/legion-loadgen &&
+    sudo chmod +x /opt/legion/bin/legion-loadgen &&
+    sudo ln -sf /opt/legion/bin/legion-loadgen /usr/local/bin/legion-loadgen
+" || log "WARNING: legion binaries not in S3 yet — run build-and-upload.sh, then re-run"
 
 "$(dirname "$0")/gen-targets.sh"
 
