@@ -1733,6 +1733,21 @@ Deferred from [job-updated-at-plan.md](plans/job-updated-at-plan.md):
       is scheduled. Not caused by the plan-apply work — `src/worker/task_manager.rs`
       is untouched by it. Make the assertion independent of the child actually
       having started, or gate on an observed start.
+- [ ] **`acked_write_survives_any_single_node_loss` is bimodally flaky on
+      small hosts.** Seen 2026-08-07 on a 4-core shared VM, debug build:
+      either the whole test completes in ~1s or a round's survivors never
+      re-elect and it dies at the 150s `wait_for` — nothing in between,
+      and the failing state persists for stretches of minutes before
+      clearing. Shown NOT to be caused by the JSONB-affinity migration:
+      interleaved same-window runs had base `3a62fcd` failing 3/4 while
+      the migration branch passed 3/4 (and each side showed the opposite
+      pattern in other windows). The other three tests in
+      `tests/raft_durability.rs` did not flap. Suspect the tight election
+      timeouts the harness itself warns about ("under CPU starvation the
+      tight election timeouts flap leadership") plus this box's scheduling
+      jitter; wants either wider election timeouts under
+      `cfg(debug_assertions)` in the harness or a diagnosis of why a
+      two-survivor cluster can stay leaderless for 150 s.
 - [ ] **`teardown.sh` silently aborts when run non-interactively, leaving the
       whole rig billing.** It prompts `read -r -p "Destroy the entire benchmark
       rig?"` unless `--yes` is passed. Under `nohup ... < /dev/null` (how any
