@@ -1184,6 +1184,17 @@ fn refresh_cluster_gauges(store: &Store) {
         Ok(count) => telemetry.allocations.set(count),
         Err(err) => debug!(error = ?err, "Failed refreshing allocation gauge"),
     }
+    // The read model's view of the fleet next to the DB's (`legion_nodes`
+    // above): a persistent gap between the two is a truncated planning
+    // universe, which previously took sampling plan_submission rows at rig
+    // scale to even suspect (aws-phase5-findings.md).
+    match store.read_model_node_counts() {
+        Ok((all, available)) => telemetry.read_model_nodes.set_all(&[
+            (vec!["all".to_string()], all),
+            (vec!["available".to_string()], available),
+        ]),
+        Err(err) => debug!(error = ?err, "Failed refreshing read-model node gauge"),
+    }
     // Raft engine series from the local metrics view — cheap watch borrows,
     // present on leaders and followers alike. Quorum shape (plan §7-C3:
     // voters/quorum) plus the per-lane progress series (term, commit and

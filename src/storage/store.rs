@@ -3212,6 +3212,23 @@ impl Store {
             .collect())
     }
 
+    /// Node counts as the scheduler's read model sees them: every cached
+    /// node, and the subset the planner actually considers
+    /// (`availability == "available"`). Feeds `legion_read_model_nodes` —
+    /// the DB-derived `legion_nodes` gauge disagreeing with this one is how
+    /// a truncated planning universe becomes visible in one query instead
+    /// of a plan-submission archaeology session (aws-phase5-findings.md).
+    pub fn read_model_node_counts(&self) -> R<(i64, i64)> {
+        let guard = self.read_model_reader()?;
+        let all = guard.nodes.len() as i64;
+        let available = guard
+            .nodes
+            .values()
+            .filter(|node| node.availability == "available")
+            .count() as i64;
+        Ok((all, available))
+    }
+
     /// Ids of every available node. For callers that only need membership
     /// (rollout node gating) — no node payload is cloned.
     pub fn available_node_ids(&self) -> R<HashSet<String>> {

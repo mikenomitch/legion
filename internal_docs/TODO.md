@@ -26,8 +26,12 @@ How to use it:
       `tests/spread_under_raft.rs` plus two scheduler unit tests). Does
       NOT reproduce locally up to 300 nodes with the raft engine on. Next:
       a fleet-scale repro using the worker-registration RPC at the sim's
-      register rate, and a read-model node-count gauge next to
-      `legion_nodes` so this is visible in one query. Findings:
+      register rate. The observability half is done (2026-08-06):
+      `legion_read_model_nodes{set="all"|"available"}` sits next to
+      `legion_nodes` on the same refresh tick
+      ([metrics.md](../docs/metrics.md#cluster-shape)), so a truncated
+      planning universe is one query instead of a plan-submission
+      sampling session. Findings:
       [aws-phase5-findings.md](aws-phase5-findings.md).
 
 - [x] **Batch the control-lane job submit** (the "fuse the five control-lane

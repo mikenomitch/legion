@@ -728,6 +728,8 @@ pub struct Metrics {
     pub heartbeats_total: Arc<Counter>,
     /// `legion_nodes{status}`
     pub nodes: Arc<GaugeVec>,
+    /// `legion_read_model_nodes{set}`
+    pub read_model_nodes: Arc<GaugeVec>,
     /// `legion_allocations`
     pub allocations: Arc<Gauge>,
     /// `legion_store_write_lock_wait_seconds`
@@ -941,6 +943,14 @@ impl Metrics {
                 name: "legion_nodes",
                 help: "Registered worker nodes, by status.",
                 labels: &["status"],
+            },
+            series: Series::new(),
+        });
+        let read_model_nodes = Arc::new(GaugeVec {
+            meta: FamilyMeta {
+                name: "legion_read_model_nodes",
+                help: "Nodes in the in-memory scheduling read model, by set: 'all' is every cached node, 'available' is the planner's candidate universe. A persistent gap against legion_nodes means the scheduler is planning over a truncated fleet.",
+                labels: &["set"],
             },
             series: Series::new(),
         });
@@ -1309,6 +1319,7 @@ impl Metrics {
             Arc::clone(&grpc_requests_total) as Arc<dyn RenderMetric>,
             Arc::clone(&heartbeats_total) as Arc<dyn RenderMetric>,
             Arc::clone(&nodes) as Arc<dyn RenderMetric>,
+            Arc::clone(&read_model_nodes) as Arc<dyn RenderMetric>,
             Arc::clone(&eval_conflict_requeues_total) as Arc<dyn RenderMetric>,
             Arc::clone(&plan_apply_total) as Arc<dyn RenderMetric>,
             Arc::clone(&eval_claim_total) as Arc<dyn RenderMetric>,
@@ -1363,6 +1374,7 @@ impl Metrics {
             preemption_plans_total,
             heartbeats_total,
             nodes,
+            read_model_nodes,
             allocations,
             store_write_lock_wait_seconds,
             store_read_lock_wait_seconds,
@@ -2588,6 +2600,7 @@ mod tests {
             "legion_plan_apply_total",
             "legion_raft_pipeline_depth",
             "legion_raft_pipeline_wait_seconds",
+            "legion_read_model_nodes",
             "legion_runtime_spawn_delay_seconds",
             "legion_runtime_worker_threads",
             "legion_store_coalesce_batch_size",
