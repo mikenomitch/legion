@@ -511,3 +511,56 @@ store paths (refresh aggregation, epoch batching, policy-fingerprint
 predicate) are all near-no-ops on it and the daemon changes are not in
 its path at all; it is recorded as the no-regression check, per the
 convention above.
+
+## JSONB → TEXT column affinity — 2026-08-07
+
+`internal_docs/plans/jsonb-text-affinity-plan.md`. Every JSON column had
+NUMERIC affinity (declared `JSONB` matches no SQLite affinity keyword),
+so every JSON insert first ran `sqlite3AtoF` over the bound blob trying
+to store it as a number — ~4-5% of a sampled manager's CPU, inside the
+plan-apply commit and the intake path. One migration rebuilds all 17
+affected tables with TEXT-affinity columns, preserving column order,
+count, and rowids exactly (raft changesets bind by position, so the
+layout is effectively replication wire format).
+
+**Direct A/B of the mechanism** (standalone rusqlite probe, this host:
+200k-row inserts of a realistic `resources` blob into 3 JSON columns +
+1 timestamp, NUMERIC-affinity twin vs TEXT twin, interleaved rounds):
+the NUMERIC table is **5-10% slower on the raw insert path**, entirely
+`applyNumericAffinity`. That is the cost the migration deletes.
+
+**End-to-end Criterion cells** (base `3a62fcd` via a worktree vs the
+migration, same host — a shared cloud VM, `bench` profile, runs
+serialized on an otherwise idle box, disk usage flat throughout):
+
+| `scheduler_speed/bin_pack/nodes_1000` | before | after | change |
+| --- | --- | --- | --- |
+| allocs_10 | 14.44 ms | 14.45 ms | +0.07% (p=0.94) |
+| allocs_100 | 25.25 ms | 25.47 ms | +0.84% (p=0.33) |
+| allocs_1000 | 308.01 ms | 310.67 ms | +0.86% (p=0.25) |
+| allocs_10000 | 3.621 s | 3.686 s | +1.81% (p=0.02) |
+| allocs_100000 | 34.19 s | 34.17 s | **−0.05% (p=0.90)** |
+
+No change detected — including the 100k-allocation cell, the heaviest
+JSON-write volume in the suite. The eval critical path
+(`eval_claim_apply_complete_latency`) read +8.4%/+4.5%/+4.8% at 1/4/8
+workers, but a control run of the **unchanged baseline against its own
+saved baseline** read "+27%" at workers_1 in the same session — that
+bench's fsync-heavy iterations put these deltas inside its run-to-run
+spread on this host, and its plans carry empty placements so the
+affinity change is a near-no-op on it by construction. Recorded as the
+no-regression check; the mechanism-level probe above is the
+measurement.
+
+**Why the first attempt's numbers were discarded:** both micro
+harnesses leaked their per-iteration store directories
+(`tempdir().keep()`), so a long run filled the disk — the first
+"after" run measured filesystem pressure, then died of ENOSPC
+mid-suite. The eval bench also created its store (running the full
+migration suite twice) **inside** the timed iteration, charging every
+appended migration to a benchmark named claim/apply/complete latency.
+Both fixed in this change: stores ride their `TempDir` guard and drop
+outside the timed section, and the eval bench builds its store in
+`iter_batched` setup. Absolute eval numbers are therefore not
+comparable to earlier records (they no longer include store setup);
+within-run comparisons are unaffected.

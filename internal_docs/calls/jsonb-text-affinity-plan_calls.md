@@ -129,3 +129,31 @@ lookup, rollout ids are foreign-keyed not ordered across pruning — and
 the C-2 rebuild already accepted precisely this for the same tables, so
 matching the precedent keeps the migration's behavior explainable by
 one rule instead of two.
+
+## 6. The eval benchmark stops timing store creation
+
+**The call.** Fixing the benchmark harnesses was folded into this work:
+both micro benches leaked one store directory per iteration
+(`tempdir().keep()`), and `eval_critical_path_bench` built its store —
+running the full migration suite twice — inside the timed iteration.
+The stores now ride their `TempDir` guard (dropped outside the timed
+section) and the eval bench builds its store in `iter_batched` setup.
+
+**The alternative.** Leave the harness alone for comparability with
+every previously recorded number, and accept that this change's
+"before/after" would include ~99 more migration statements in the
+"after" timing.
+
+**The trade-off.** Absolute eval-bench numbers stop being comparable
+with earlier records (they no longer include store setup). Every future
+reader comparing across records has to know this seam.
+
+**Why.** The leak filled the disk over a long run — the first after-run
+measured filesystem pressure and then died of ENOSPC — and the timed
+setup charged every appended migration to a benchmark named
+claim/apply/complete latency, which would have indicted this migration
+(and every future one) for a cost no production eval ever pays:
+migrations run once at startup, not per eval. A benchmark that punishes
+schema migrations in perpetuity is measuring the wrong thing;
+performance work needs instruments that measure what their names claim.
+The seam is recorded in `benchmarks/scheduler/README.md`.
