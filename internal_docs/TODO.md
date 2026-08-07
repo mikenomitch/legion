@@ -26,8 +26,12 @@ How to use it:
       `tests/spread_under_raft.rs` plus two scheduler unit tests). Does
       NOT reproduce locally up to 300 nodes with the raft engine on. Next:
       a fleet-scale repro using the worker-registration RPC at the sim's
-      register rate, and a read-model node-count gauge next to
-      `legion_nodes` so this is visible in one query. Findings:
+      register rate. The observability half is done (2026-08-06):
+      `legion_read_model_nodes{set="all"|"available"}` sits next to
+      `legion_nodes` on the same refresh tick
+      ([metrics.md](../docs/metrics.md#cluster-shape)), so a truncated
+      planning universe is one query instead of a plan-submission
+      sampling session. Findings:
       [aws-phase5-findings.md](aws-phase5-findings.md).
 
 - [x] **Batch the control-lane job submit** (the "fuse the five control-lane
@@ -39,14 +43,30 @@ How to use it:
       locally: per-job quorum rounds ~3.0 -> ~1.5, unit-eval throughput at
       the knee 419.6 -> 476/s. Remaining singles at ~0.5/job are
       arrival-gaps, not a defect.
-- [ ] **JSONB columns carry NUMERIC affinity, so every JSON write parses as
-      a number first.** SQLite's affinity rules give `JSONB` (no TEXT/BLOB
-      substring) NUMERIC affinity; a sampled manager showed ~4-5% of CPU in
-      `sqlite3AtoF`/`applyNumericAffinity` trying to parse whole JSON blobs
-      as numbers on every insert/compare of `resources`, `constraints`,
-      `meta`, etc. Harmless semantically, pure waste. Fix is a column-type
-      migration (TEXT affinity) across the JSON columns - churny, so it
-      wants its own change with before/after profiles.
+- [x] **JSONB columns carry NUMERIC affinity, so every JSON write parses as
+      a number first — fixed** (2026-08-06,
+      [jsonb-text-affinity-plan.md](plans/jsonb-text-affinity-plan.md),
+      doc in [state-store.md](../docs/state-store.md#column-affinity)).
+      All 46 JSON columns across 17 tables rebuilt to TEXT affinity in one
+      migration that preserves column order/count/rowids exactly — the
+      load-bearing property, since raft changesets bind columns by
+      position and a reordering rebuild would corrupt a mixed-version
+      cluster mid-rolling-upgrade. `job_config` (the one CASCADE parent)
+      gets a rename dance, with `job_config_submission`,
+      `job_kv_reference`, and `job_update` rebuilt byte-identically purely
+      to re-point their FKs. Local A/B on the raw JSON insert path: the
+      NUMERIC twin is ~5-10% slower; before/after Criterion cells in
+      [benchmarks/scheduler/README.md](../benchmarks/scheduler/README.md).
+- [ ] **`STRING` and `TIMESTAMP` columns still carry NUMERIC affinity** —
+      deliberately excluded from the fix above. Same wasted parse on
+      every id/timestamp bind, but for these the conversion can
+      *succeed*: numeric-looking ids and unix-seconds timestamps are
+      stored as INTEGERs today, so a re-type changes what future writes
+      store while existing rows stay INTEGER, and INTEGER never
+      compares equal to TEXT — a value-rewriting migration with its own
+      risk budget, not a type rename. See
+      [jsonb-text-affinity-plan_calls.md](calls/jsonb-text-affinity-plan_calls.md)
+      entry 2.
 
 ## In flight (open PRs)
 
@@ -1713,6 +1733,21 @@ Deferred from [job-updated-at-plan.md](plans/job-updated-at-plan.md):
       is scheduled. Not caused by the plan-apply work — `src/worker/task_manager.rs`
       is untouched by it. Make the assertion independent of the child actually
       having started, or gate on an observed start.
+- [ ] **`acked_write_survives_any_single_node_loss` is bimodally flaky on
+      small hosts.** Seen 2026-08-07 on a 4-core shared VM, debug build:
+      either the whole test completes in ~1s or a round's survivors never
+      re-elect and it dies at the 150s `wait_for` — nothing in between,
+      and the failing state persists for stretches of minutes before
+      clearing. Shown NOT to be caused by the JSONB-affinity migration:
+      interleaved same-window runs had base `3a62fcd` failing 3/4 while
+      the migration branch passed 3/4 (and each side showed the opposite
+      pattern in other windows). The other three tests in
+      `tests/raft_durability.rs` did not flap. Suspect the tight election
+      timeouts the harness itself warns about ("under CPU starvation the
+      tight election timeouts flap leadership") plus this box's scheduling
+      jitter; wants either wider election timeouts under
+      `cfg(debug_assertions)` in the harness or a diagnosis of why a
+      two-survivor cluster can stay leaderless for 150 s.
 - [ ] **`teardown.sh` silently aborts when run non-interactively, leaving the
       whole rig billing.** It prompts `read -r -p "Destroy the entire benchmark
       rig?"` unless `--yes` is passed. Under `nohup ... < /dev/null` (how any

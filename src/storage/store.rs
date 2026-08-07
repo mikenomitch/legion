@@ -182,7 +182,7 @@ impl EvalBatchLimits {
 const SORTABLE_TIMESTAMP_FORMAT: &[time::format_description::BorrowedFormatItem<'_>] =
     format_description!("[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:9]Z");
 
-/// Parse a nullable JSONB text column into an optional typed value, mapping
+/// Parse a nullable JSON text column into an optional typed value, mapping
 /// parse failures onto rusqlite conversion errors.
 fn parse_json_column<T: serde::de::DeserializeOwned>(
     idx: usize,
@@ -3210,6 +3210,23 @@ impl Store {
             .values()
             .map(|node| Node::clone(node))
             .collect())
+    }
+
+    /// Node counts as the scheduler's read model sees them: every cached
+    /// node, and the subset the planner actually considers
+    /// (`availability == "available"`). Feeds `legion_read_model_nodes` —
+    /// the DB-derived `legion_nodes` gauge disagreeing with this one is how
+    /// a truncated planning universe becomes visible in one query instead
+    /// of a plan-submission archaeology session (aws-phase5-findings.md).
+    pub fn read_model_node_counts(&self) -> R<(i64, i64)> {
+        let guard = self.read_model_reader()?;
+        let all = guard.nodes.len() as i64;
+        let available = guard
+            .nodes
+            .values()
+            .filter(|node| node.availability == "available")
+            .count() as i64;
+        Ok((all, available))
     }
 
     /// Ids of every available node. For callers that only need membership
@@ -17373,7 +17390,7 @@ fn claim_volume_id(job_id: &str, group: &str, task: &str, name: &str) -> String 
     format!("claim-{label}-{}", &digest[..12])
 }
 
-/// Parse a JSONB object column into a sorted map, tolerating NULL and
+/// Parse a JSON object column into a sorted map, tolerating NULL and
 /// non-object values (both become empty).
 fn parse_json_map_column(
     idx: usize,
