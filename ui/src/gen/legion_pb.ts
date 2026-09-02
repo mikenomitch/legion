@@ -866,8 +866,19 @@ export class RunJobReply extends Message<RunJobReply> {
   message = "";
 
   /**
-   * True when this reply was replayed from a previously recorded result for the
-   * request's `idempotency_key` rather than applied fresh.
+   * True when this reply carries a previously recorded result for the request's
+   * `idempotency_key` rather than this request's own.
+   *
+   * Set in two cases:
+   * - the recorded result was found *before* this request did any work (the
+   *   ordinary retry-after-timeout case); and
+   * - two requests carrying the same key raced, both missed that lookup, and
+   *   this one lost — the manager records the first outcome only, so the loser
+   *   is handed the winner's `message` with `deduplicated = true`. The loser's
+   *   own submit is harmless (an identical spec resolves to "unchanged"), so it
+   *   is corrected rather than failed.
+   *
+   * In both cases `message` describes the recorded outcome, not this request's.
    *
    * @generated from field: bool deduplicated = 2;
    */
@@ -6723,6 +6734,19 @@ export class HeartbeatRequest extends Message<HeartbeatRequest> {
    */
   provisionalClaims: ProvisionalClaimReport[] = [];
 
+  /**
+   * Denials the node datapath recorded since the last heartbeat, one entry
+   * per distinct (allocation, direction, destination, rule), with a count.
+   * The manager turns each into a `net_denied` event carrying the job,
+   * allocation, matched rule, destination, and identity, so "which rule
+   * blocked it" is answerable from the event stream without node access.
+   * Bounded: a node reports at most 256 entries per heartbeat and folds the
+   * rest into a single `truncated` entry.
+   *
+   * @generated from field: repeated legion.NetDenial net_denials = 8;
+   */
+  netDenials: NetDenial[] = [];
+
   constructor(data?: PartialMessage<HeartbeatRequest>) {
     super();
     proto3.util.initPartial(data, this);
@@ -6738,6 +6762,7 @@ export class HeartbeatRequest extends Message<HeartbeatRequest> {
     { no: 5, name: "volume_reports", kind: "message", T: VolumeReport, repeated: true },
     { no: 6, name: "terminated_allocations", kind: "message", T: TerminatedAllocation, repeated: true },
     { no: 7, name: "provisional_claims", kind: "message", T: ProvisionalClaimReport, repeated: true },
+    { no: 8, name: "net_denials", kind: "message", T: NetDenial, repeated: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): HeartbeatRequest {
@@ -6883,6 +6908,19 @@ export class HeartbeatReply extends Message<HeartbeatReply> {
    */
   nextIntervalSeconds?: number;
 
+  /**
+   * The effective network policy for each desired allocation, as a content
+   * hash. The worker fetches a body it has not seen via `FetchNetPolicy`
+   * and caches it; identical merged policies share one hash and one fetch.
+   * An allocation absent from this list has no policy. Delivered every
+   * heartbeat, applied only after a successful one, so a manager outage
+   * keeps the last known good policy (fail-static). Empty on clusters with
+   * no stored policy and no task declaring one — the zero-cost path.
+   *
+   * @generated from field: repeated legion.AllocNetPolicy net_policies = 8;
+   */
+  netPolicies: AllocNetPolicy[] = [];
+
   constructor(data?: PartialMessage<HeartbeatReply>) {
     super();
     proto3.util.initPartial(data, this);
@@ -6898,6 +6936,7 @@ export class HeartbeatReply extends Message<HeartbeatReply> {
     { no: 5, name: "stop_notices", kind: "message", T: StopNotice, repeated: true },
     { no: 6, name: "claim_verdicts", kind: "message", T: ClaimVerdict, repeated: true },
     { no: 7, name: "next_interval_seconds", kind: "scalar", T: 13 /* ScalarType.UINT32 */, opt: true },
+    { no: 8, name: "net_policies", kind: "message", T: AllocNetPolicy, repeated: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): HeartbeatReply {
@@ -14196,6 +14235,17 @@ export class TaskAllocation extends Message<TaskAllocation> {
    */
   provisional?: ProvisionalAllocation;
 
+  /**
+   * JSON `NetworkConfig` as the task declared it: `mode`, `labels`, and any
+   * inline `egress` / `ingress`. Empty when the task declares no `network`
+   * block, so jobs without one stay byte-identical on the wire. The worker
+   * reads `mode` and `labels` from it; the rules themselves arrive merged
+   * with stored policies via `HeartbeatReply.net_policies`.
+   *
+   * @generated from field: string task_network = 20;
+   */
+  taskNetwork = "";
+
   constructor(data?: PartialMessage<TaskAllocation>) {
     super();
     proto3.util.initPartial(data, this);
@@ -14223,6 +14273,7 @@ export class TaskAllocation extends Message<TaskAllocation> {
     { no: 16, name: "task_resources", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 18, name: "task_stop", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 19, name: "provisional", kind: "message", T: ProvisionalAllocation },
+    { no: 20, name: "task_network", kind: "scalar", T: 9 /* ScalarType.STRING */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): TaskAllocation {
@@ -17843,6 +17894,985 @@ export class RaftMemberInfo extends Message<RaftMemberInfo> {
 
   static equals(a: RaftMemberInfo | PlainMessage<RaftMemberInfo> | undefined, b: RaftMemberInfo | PlainMessage<RaftMemberInfo> | undefined): boolean {
     return proto3.util.equals(RaftMemberInfo, a, b);
+  }
+}
+
+/**
+ * A stored network policy object.
+ *
+ * @generated from message legion.NetPolicy
+ */
+export class NetPolicy extends Message<NetPolicy> {
+  /**
+   * Unique name; letters, digits, '-', '_', '.'.
+   *
+   * @generated from field: string name = 1;
+   */
+  name = "";
+
+  /**
+   * Merge priority: higher applies first among `require` policies and wins
+   * among `default` ones.
+   *
+   * @generated from field: int64 priority = 2;
+   */
+  priority = protoInt64.zero;
+
+  /**
+   * `require` or `default`.
+   *
+   * @generated from field: string enforcement = 3;
+   */
+  enforcement = "";
+
+  /**
+   * The whole object as canonical JSON (a `NetPolicyObject`): selector,
+   * enforcement, optional mode, egress, ingress, description. Normalized —
+   * `allow` sugar is already expanded into rules.
+   *
+   * @generated from field: string object_json = 4;
+   */
+  objectJson = "";
+
+  /**
+   * Free-form description from the object.
+   *
+   * @generated from field: string description = 5;
+   */
+  description = "";
+
+  /**
+   * @generated from field: string created_at = 6;
+   */
+  createdAt = "";
+
+  /**
+   * @generated from field: string updated_at = 7;
+   */
+  updatedAt = "";
+
+  constructor(data?: PartialMessage<NetPolicy>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.NetPolicy";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "priority", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 3, name: "enforcement", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "object_json", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 5, name: "description", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 6, name: "created_at", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 7, name: "updated_at", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): NetPolicy {
+    return new NetPolicy().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): NetPolicy {
+    return new NetPolicy().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): NetPolicy {
+    return new NetPolicy().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: NetPolicy | PlainMessage<NetPolicy> | undefined, b: NetPolicy | PlainMessage<NetPolicy> | undefined): boolean {
+    return proto3.util.equals(NetPolicy, a, b);
+  }
+}
+
+/**
+ * Request payload for UpsertNetPolicy.
+ *
+ * @generated from message legion.UpsertNetPolicyRequest
+ */
+export class UpsertNetPolicyRequest extends Message<UpsertNetPolicyRequest> {
+  /**
+   * A `NetPolicyObject` as JSON, exactly as `legion net policy apply -f`
+   * reads it (Nickel evaluated to JSON). Validated on write.
+   *
+   * @generated from field: string object_json = 1;
+   */
+  objectJson = "";
+
+  /**
+   * When set, validate and report which running allocations would be
+   * affected, but write nothing.
+   *
+   * @generated from field: bool dry_run = 2;
+   */
+  dryRun = false;
+
+  constructor(data?: PartialMessage<UpsertNetPolicyRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.UpsertNetPolicyRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "object_json", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "dry_run", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): UpsertNetPolicyRequest {
+    return new UpsertNetPolicyRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): UpsertNetPolicyRequest {
+    return new UpsertNetPolicyRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): UpsertNetPolicyRequest {
+    return new UpsertNetPolicyRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: UpsertNetPolicyRequest | PlainMessage<UpsertNetPolicyRequest> | undefined, b: UpsertNetPolicyRequest | PlainMessage<UpsertNetPolicyRequest> | undefined): boolean {
+    return proto3.util.equals(UpsertNetPolicyRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for UpsertNetPolicy.
+ *
+ * @generated from message legion.UpsertNetPolicyReply
+ */
+export class UpsertNetPolicyReply extends Message<UpsertNetPolicyReply> {
+  /**
+   * The stored (normalized) policy. On a dry run, what would be stored.
+   *
+   * @generated from field: legion.NetPolicy policy = 1;
+   */
+  policy?: NetPolicy;
+
+  /**
+   * Running allocations whose effective policy would change, as
+   * `job/task@allocation` strings. Populated on dry runs and on writes.
+   *
+   * @generated from field: repeated string affected_allocations = 2;
+   */
+  affectedAllocations: string[] = [];
+
+  constructor(data?: PartialMessage<UpsertNetPolicyReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.UpsertNetPolicyReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "policy", kind: "message", T: NetPolicy },
+    { no: 2, name: "affected_allocations", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): UpsertNetPolicyReply {
+    return new UpsertNetPolicyReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): UpsertNetPolicyReply {
+    return new UpsertNetPolicyReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): UpsertNetPolicyReply {
+    return new UpsertNetPolicyReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: UpsertNetPolicyReply | PlainMessage<UpsertNetPolicyReply> | undefined, b: UpsertNetPolicyReply | PlainMessage<UpsertNetPolicyReply> | undefined): boolean {
+    return proto3.util.equals(UpsertNetPolicyReply, a, b);
+  }
+}
+
+/**
+ * Request payload for GetNetPolicyObject.
+ *
+ * @generated from message legion.GetNetPolicyObjectRequest
+ */
+export class GetNetPolicyObjectRequest extends Message<GetNetPolicyObjectRequest> {
+  /**
+   * @generated from field: string name = 1;
+   */
+  name = "";
+
+  constructor(data?: PartialMessage<GetNetPolicyObjectRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetNetPolicyObjectRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetNetPolicyObjectRequest {
+    return new GetNetPolicyObjectRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetNetPolicyObjectRequest {
+    return new GetNetPolicyObjectRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetNetPolicyObjectRequest {
+    return new GetNetPolicyObjectRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetNetPolicyObjectRequest | PlainMessage<GetNetPolicyObjectRequest> | undefined, b: GetNetPolicyObjectRequest | PlainMessage<GetNetPolicyObjectRequest> | undefined): boolean {
+    return proto3.util.equals(GetNetPolicyObjectRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for GetNetPolicyObject.
+ *
+ * @generated from message legion.GetNetPolicyObjectReply
+ */
+export class GetNetPolicyObjectReply extends Message<GetNetPolicyObjectReply> {
+  /**
+   * @generated from field: legion.NetPolicy policy = 1;
+   */
+  policy?: NetPolicy;
+
+  constructor(data?: PartialMessage<GetNetPolicyObjectReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetNetPolicyObjectReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "policy", kind: "message", T: NetPolicy },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetNetPolicyObjectReply {
+    return new GetNetPolicyObjectReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetNetPolicyObjectReply {
+    return new GetNetPolicyObjectReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetNetPolicyObjectReply {
+    return new GetNetPolicyObjectReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetNetPolicyObjectReply | PlainMessage<GetNetPolicyObjectReply> | undefined, b: GetNetPolicyObjectReply | PlainMessage<GetNetPolicyObjectReply> | undefined): boolean {
+    return proto3.util.equals(GetNetPolicyObjectReply, a, b);
+  }
+}
+
+/**
+ * Request payload for ListNetPolicies.
+ *
+ * @generated from message legion.ListNetPoliciesRequest
+ */
+export class ListNetPoliciesRequest extends Message<ListNetPoliciesRequest> {
+  constructor(data?: PartialMessage<ListNetPoliciesRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ListNetPoliciesRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListNetPoliciesRequest {
+    return new ListNetPoliciesRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ListNetPoliciesRequest {
+    return new ListNetPoliciesRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ListNetPoliciesRequest {
+    return new ListNetPoliciesRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ListNetPoliciesRequest | PlainMessage<ListNetPoliciesRequest> | undefined, b: ListNetPoliciesRequest | PlainMessage<ListNetPoliciesRequest> | undefined): boolean {
+    return proto3.util.equals(ListNetPoliciesRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for ListNetPolicies.
+ *
+ * @generated from message legion.ListNetPoliciesReply
+ */
+export class ListNetPoliciesReply extends Message<ListNetPoliciesReply> {
+  /**
+   * @generated from field: repeated legion.NetPolicy policies = 1;
+   */
+  policies: NetPolicy[] = [];
+
+  /**
+   * Monotonic generation of the policy set; changes on every write.
+   *
+   * @generated from field: uint64 generation = 2;
+   */
+  generation = protoInt64.zero;
+
+  constructor(data?: PartialMessage<ListNetPoliciesReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ListNetPoliciesReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "policies", kind: "message", T: NetPolicy, repeated: true },
+    { no: 2, name: "generation", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListNetPoliciesReply {
+    return new ListNetPoliciesReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ListNetPoliciesReply {
+    return new ListNetPoliciesReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ListNetPoliciesReply {
+    return new ListNetPoliciesReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ListNetPoliciesReply | PlainMessage<ListNetPoliciesReply> | undefined, b: ListNetPoliciesReply | PlainMessage<ListNetPoliciesReply> | undefined): boolean {
+    return proto3.util.equals(ListNetPoliciesReply, a, b);
+  }
+}
+
+/**
+ * Request payload for DeleteNetPolicy.
+ *
+ * @generated from message legion.DeleteNetPolicyRequest
+ */
+export class DeleteNetPolicyRequest extends Message<DeleteNetPolicyRequest> {
+  /**
+   * @generated from field: string name = 1;
+   */
+  name = "";
+
+  constructor(data?: PartialMessage<DeleteNetPolicyRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.DeleteNetPolicyRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): DeleteNetPolicyRequest {
+    return new DeleteNetPolicyRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): DeleteNetPolicyRequest {
+    return new DeleteNetPolicyRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): DeleteNetPolicyRequest {
+    return new DeleteNetPolicyRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: DeleteNetPolicyRequest | PlainMessage<DeleteNetPolicyRequest> | undefined, b: DeleteNetPolicyRequest | PlainMessage<DeleteNetPolicyRequest> | undefined): boolean {
+    return proto3.util.equals(DeleteNetPolicyRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for DeleteNetPolicy.
+ *
+ * @generated from message legion.DeleteNetPolicyReply
+ */
+export class DeleteNetPolicyReply extends Message<DeleteNetPolicyReply> {
+  constructor(data?: PartialMessage<DeleteNetPolicyReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.DeleteNetPolicyReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): DeleteNetPolicyReply {
+    return new DeleteNetPolicyReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): DeleteNetPolicyReply {
+    return new DeleteNetPolicyReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): DeleteNetPolicyReply {
+    return new DeleteNetPolicyReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: DeleteNetPolicyReply | PlainMessage<DeleteNetPolicyReply> | undefined, b: DeleteNetPolicyReply | PlainMessage<DeleteNetPolicyReply> | undefined): boolean {
+    return proto3.util.equals(DeleteNetPolicyReply, a, b);
+  }
+}
+
+/**
+ * Request payload for ShowNetPolicy.
+ *
+ * @generated from message legion.ShowNetPolicyRequest
+ */
+export class ShowNetPolicyRequest extends Message<ShowNetPolicyRequest> {
+  /**
+   * Job id.
+   *
+   * @generated from field: string job_id = 1;
+   */
+  jobId = "";
+
+  /**
+   * Task name; when empty and the job has one task, that task.
+   *
+   * @generated from field: string task_name = 2;
+   */
+  taskName = "";
+
+  /**
+   * Node pool to match selectors against; empty means "any pool" (pool
+   * selectors are treated as matching).
+   *
+   * @generated from field: string node_pool = 3;
+   */
+  nodePool = "";
+
+  constructor(data?: PartialMessage<ShowNetPolicyRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ShowNetPolicyRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "job_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "task_name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "node_pool", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ShowNetPolicyRequest {
+    return new ShowNetPolicyRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ShowNetPolicyRequest {
+    return new ShowNetPolicyRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ShowNetPolicyRequest {
+    return new ShowNetPolicyRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ShowNetPolicyRequest | PlainMessage<ShowNetPolicyRequest> | undefined, b: ShowNetPolicyRequest | PlainMessage<ShowNetPolicyRequest> | undefined): boolean {
+    return proto3.util.equals(ShowNetPolicyRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for ShowNetPolicy.
+ *
+ * @generated from message legion.ShowNetPolicyReply
+ */
+export class ShowNetPolicyReply extends Message<ShowNetPolicyReply> {
+  /**
+   * The merged `EffectivePolicy` as JSON: `mode`, `egress`, `ingress`, each
+   * rule and handler carrying `source` (`policy/<name>#<index>` or
+   * `task#<index>`), the ordered `sources`, and the content `hash`.
+   *
+   * @generated from field: string effective_json = 1;
+   */
+  effectiveJson = "";
+
+  /**
+   * Names of the stored policies that matched, in application order.
+   *
+   * @generated from field: repeated string matched_policies = 2;
+   */
+  matchedPolicies: string[] = [];
+
+  /**
+   * The task's declared `network.mode` and the mode the merge resolved.
+   *
+   * @generated from field: string declared_mode = 3;
+   */
+  declaredMode = "";
+
+  /**
+   * @generated from field: string effective_mode = 4;
+   */
+  effectiveMode = "";
+
+  constructor(data?: PartialMessage<ShowNetPolicyReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ShowNetPolicyReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "effective_json", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "matched_policies", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+    { no: 3, name: "declared_mode", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "effective_mode", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ShowNetPolicyReply {
+    return new ShowNetPolicyReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ShowNetPolicyReply {
+    return new ShowNetPolicyReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ShowNetPolicyReply {
+    return new ShowNetPolicyReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ShowNetPolicyReply | PlainMessage<ShowNetPolicyReply> | undefined, b: ShowNetPolicyReply | PlainMessage<ShowNetPolicyReply> | undefined): boolean {
+    return proto3.util.equals(ShowNetPolicyReply, a, b);
+  }
+}
+
+/**
+ * Request payload for TestNetPolicy.
+ *
+ * @generated from message legion.TestNetPolicyRequest
+ */
+export class TestNetPolicyRequest extends Message<TestNetPolicyRequest> {
+  /**
+   * @generated from field: string job_id = 1;
+   */
+  jobId = "";
+
+  /**
+   * @generated from field: string task_name = 2;
+   */
+  taskName = "";
+
+  /**
+   * @generated from field: string node_pool = 3;
+   */
+  nodePool = "";
+
+  /**
+   * Egress test: a destination as `host[:port]`, an IP, or a URL
+   * (`https://api.github.com/user` sets host, port, and path).
+   *
+   * @generated from field: string to = 4;
+   */
+  to = "";
+
+  /**
+   * Ingress test: the peer, as `host[:port]` / IP, optionally with an
+   * identity (`prod:default:checkout:web`).
+   *
+   * @generated from field: string from = 5;
+   */
+  from = "";
+
+  /**
+   * @generated from field: string identity = 6;
+   */
+  identity = "";
+
+  /**
+   * Request-time facts for HTTP chains. Optional.
+   *
+   * @generated from field: string method = 7;
+   */
+  method = "";
+
+  /**
+   * @generated from field: string path = 8;
+   */
+  path = "";
+
+  constructor(data?: PartialMessage<TestNetPolicyRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.TestNetPolicyRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "job_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "task_name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "node_pool", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "to", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 5, name: "from", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 6, name: "identity", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 7, name: "method", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 8, name: "path", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): TestNetPolicyRequest {
+    return new TestNetPolicyRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): TestNetPolicyRequest {
+    return new TestNetPolicyRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): TestNetPolicyRequest {
+    return new TestNetPolicyRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: TestNetPolicyRequest | PlainMessage<TestNetPolicyRequest> | undefined, b: TestNetPolicyRequest | PlainMessage<TestNetPolicyRequest> | undefined): boolean {
+    return proto3.util.equals(TestNetPolicyRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for TestNetPolicy.
+ *
+ * @generated from message legion.TestNetPolicyReply
+ */
+export class TestNetPolicyReply extends Message<TestNetPolicyReply> {
+  /**
+   * `allow`, `deny`, or `defer` (a request-time rule would decide and no
+   * method/path was given).
+   *
+   * @generated from field: string verdict = 1;
+   */
+  verdict = "";
+
+  /**
+   * The rule that decided (`policy/<name>#<index>`, `task#<index>`, or
+   * `fallthrough`); empty on allow-by-absence.
+   *
+   * @generated from field: string source = 2;
+   */
+  source = "";
+
+  /**
+   * The rule's `reason`, if any.
+   *
+   * @generated from field: string reason = 3;
+   */
+  reason = "";
+
+  /**
+   * Which direction was tested and which protocol the chain runs.
+   *
+   * @generated from field: string direction = 4;
+   */
+  direction = "";
+
+  /**
+   * @generated from field: string protocol = 5;
+   */
+  protocol = "";
+
+  /**
+   * Human-readable one-line explanation.
+   *
+   * @generated from field: string explanation = 6;
+   */
+  explanation = "";
+
+  constructor(data?: PartialMessage<TestNetPolicyReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.TestNetPolicyReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "verdict", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "source", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "reason", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "direction", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 5, name: "protocol", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 6, name: "explanation", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): TestNetPolicyReply {
+    return new TestNetPolicyReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): TestNetPolicyReply {
+    return new TestNetPolicyReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): TestNetPolicyReply {
+    return new TestNetPolicyReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: TestNetPolicyReply | PlainMessage<TestNetPolicyReply> | undefined, b: TestNetPolicyReply | PlainMessage<TestNetPolicyReply> | undefined): boolean {
+    return proto3.util.equals(TestNetPolicyReply, a, b);
+  }
+}
+
+/**
+ * Request payload for FetchNetPolicy (worker plane).
+ *
+ * @generated from message legion.FetchNetPolicyRequest
+ */
+export class FetchNetPolicyRequest extends Message<FetchNetPolicyRequest> {
+  /**
+   * Node id of the caller.
+   *
+   * @generated from field: string node_id = 1;
+   */
+  nodeId = "";
+
+  /**
+   * Content hash from `HeartbeatReply.net_policies`.
+   *
+   * @generated from field: string hash = 2;
+   */
+  hash = "";
+
+  constructor(data?: PartialMessage<FetchNetPolicyRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.FetchNetPolicyRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "node_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "hash", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): FetchNetPolicyRequest {
+    return new FetchNetPolicyRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): FetchNetPolicyRequest {
+    return new FetchNetPolicyRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): FetchNetPolicyRequest {
+    return new FetchNetPolicyRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: FetchNetPolicyRequest | PlainMessage<FetchNetPolicyRequest> | undefined, b: FetchNetPolicyRequest | PlainMessage<FetchNetPolicyRequest> | undefined): boolean {
+    return proto3.util.equals(FetchNetPolicyRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for FetchNetPolicy.
+ *
+ * @generated from message legion.FetchNetPolicyReply
+ */
+export class FetchNetPolicyReply extends Message<FetchNetPolicyReply> {
+  /**
+   * The `EffectivePolicy` as JSON. Its `hash` field equals the request hash.
+   *
+   * @generated from field: string effective_json = 1;
+   */
+  effectiveJson = "";
+
+  constructor(data?: PartialMessage<FetchNetPolicyReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.FetchNetPolicyReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "effective_json", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): FetchNetPolicyReply {
+    return new FetchNetPolicyReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): FetchNetPolicyReply {
+    return new FetchNetPolicyReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): FetchNetPolicyReply {
+    return new FetchNetPolicyReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: FetchNetPolicyReply | PlainMessage<FetchNetPolicyReply> | undefined, b: FetchNetPolicyReply | PlainMessage<FetchNetPolicyReply> | undefined): boolean {
+    return proto3.util.equals(FetchNetPolicyReply, a, b);
+  }
+}
+
+/**
+ * One allocation's effective policy, by hash.
+ *
+ * @generated from message legion.AllocNetPolicy
+ */
+export class AllocNetPolicy extends Message<AllocNetPolicy> {
+  /**
+   * @generated from field: int64 allocation_id = 1;
+   */
+  allocationId = protoInt64.zero;
+
+  /**
+   * sha256 of the canonical merged policy JSON.
+   *
+   * @generated from field: string policy_hash = 2;
+   */
+  policyHash = "";
+
+  constructor(data?: PartialMessage<AllocNetPolicy>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.AllocNetPolicy";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "allocation_id", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 2, name: "policy_hash", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): AllocNetPolicy {
+    return new AllocNetPolicy().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): AllocNetPolicy {
+    return new AllocNetPolicy().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): AllocNetPolicy {
+    return new AllocNetPolicy().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: AllocNetPolicy | PlainMessage<AllocNetPolicy> | undefined, b: AllocNetPolicy | PlainMessage<AllocNetPolicy> | undefined): boolean {
+    return proto3.util.equals(AllocNetPolicy, a, b);
+  }
+}
+
+/**
+ * One denial (or run of identical denials) reported by a node datapath.
+ *
+ * @generated from message legion.NetDenial
+ */
+export class NetDenial extends Message<NetDenial> {
+  /**
+   * @generated from field: int64 allocation_id = 1;
+   */
+  allocationId = protoInt64.zero;
+
+  /**
+   * @generated from field: string job_id = 2;
+   */
+  jobId = "";
+
+  /**
+   * @generated from field: string task_name = 3;
+   */
+  taskName = "";
+
+  /**
+   * `egress` or `ingress`.
+   *
+   * @generated from field: string direction = 4;
+   */
+  direction = "";
+
+  /**
+   * `host:port` (egress destination or ingress peer).
+   *
+   * @generated from field: string destination = 5;
+   */
+  destination = "";
+
+  /**
+   * The rule that denied: `policy/<name>#<index>`, `task#<index>`, or
+   * `fallthrough`.
+   *
+   * @generated from field: string source = 6;
+   */
+  source = "";
+
+  /**
+   * The rule's reason, if any.
+   *
+   * @generated from field: string reason = 7;
+   */
+  reason = "";
+
+  /**
+   * `tcp`, `http`, or `dns`.
+   *
+   * @generated from field: string protocol = 8;
+   */
+  protocol = "";
+
+  /**
+   * Verified peer identity, when known.
+   *
+   * @generated from field: string identity = 9;
+   */
+  identity = "";
+
+  /**
+   * Number of identical denials folded into this entry.
+   *
+   * @generated from field: uint32 count = 10;
+   */
+  count = 0;
+
+  /**
+   * The task's `network.labels`, for attribution.
+   *
+   * @generated from field: map<string, string> labels = 11;
+   */
+  labels: { [key: string]: string } = {};
+
+  /**
+   * HTTP mode: the method and path denied, when a request-time rule decided.
+   *
+   * @generated from field: string method = 12;
+   */
+  method = "";
+
+  /**
+   * @generated from field: string path = 13;
+   */
+  path = "";
+
+  constructor(data?: PartialMessage<NetDenial>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.NetDenial";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "allocation_id", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 2, name: "job_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "task_name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "direction", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 5, name: "destination", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 6, name: "source", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 7, name: "reason", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 8, name: "protocol", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 9, name: "identity", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 10, name: "count", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 11, name: "labels", kind: "map", K: 9 /* ScalarType.STRING */, V: {kind: "scalar", T: 9 /* ScalarType.STRING */} },
+    { no: 12, name: "method", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 13, name: "path", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): NetDenial {
+    return new NetDenial().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): NetDenial {
+    return new NetDenial().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): NetDenial {
+    return new NetDenial().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: NetDenial | PlainMessage<NetDenial> | undefined, b: NetDenial | PlainMessage<NetDenial> | undefined): boolean {
+    return proto3.util.equals(NetDenial, a, b);
   }
 }
 

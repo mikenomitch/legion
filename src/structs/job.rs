@@ -2460,7 +2460,12 @@ impl TaskConfig {
     /// implied `network.ports` entry so stored configs are always explicit.
     pub fn normalize_network(&mut self) -> R<()> {
         let name = self.name.clone();
-        crate::structs::network::normalize_task_network(&name, &mut self.network, &mut self.service)
+        crate::structs::network::normalize_task_network(
+            &name,
+            &mut self.network,
+            &mut self.service,
+        )?;
+        crate::structs::network::normalize_task_connect(&name, &mut self.connect)
     }
 
     pub fn validate_network(&self) -> R<()> {
@@ -2501,11 +2506,13 @@ impl TaskConfig {
         // shorthand still counts as a declared static port.
         let mut network = self.network.clone();
         let mut service = self.service.clone();
+        let mut connect = self.connect.clone();
         crate::structs::network::normalize_task_network(&self.name, &mut network, &mut service)?;
+        crate::structs::network::normalize_task_connect(&self.name, &mut connect)?;
         crate::structs::network::validate_task_connect(
             &self.name,
             network.as_ref(),
-            self.connect.as_ref(),
+            connect.as_ref(),
             service.as_ref(),
         )
     }

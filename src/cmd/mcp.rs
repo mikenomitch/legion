@@ -32,11 +32,12 @@ use crate::structs::{
     GetJobInfoRequest, GetJobSpecRequest, GetJobTemplateRequest, GetLedgerRequest, GetNodesRequest,
     GetRolloutStatusRequest, GetStateStoreSchemaRequest, GetVolumeRequest, JobConfig,
     ListEventsRequest, ListInstancesRequest, ListJobActionsRequest, ListJobTemplatesRequest,
-    ListJobsRequest, ListRolloutsRequest, ListServicesRequest, ListVolumeDriversRequest,
-    ListVolumesRequest, PlanJobRequest, QueryStateStoreRequest, RenderJobTemplateRequest,
-    ReplaceInstanceRequest, ResolveServiceRequest, RunJobRequest, RunJobTemplateRequest,
-    SetNodeAvailabilityRequest, StartInstanceRequest, StopInstanceRequest, StopJobRequest,
-    UpsertJobTemplateRequest,
+    ListJobsRequest, ListNetPoliciesRequest, ListRolloutsRequest, ListServicesRequest,
+    ListVolumeDriversRequest, ListVolumesRequest, PlanJobRequest, QueryStateStoreRequest,
+    RenderJobTemplateRequest, ReplaceInstanceRequest, ResolveServiceRequest, RunJobRequest,
+    RunJobTemplateRequest, SetNodeAvailabilityRequest, ShowNetPolicyRequest, StartInstanceRequest,
+    StopInstanceRequest, StopJobRequest, TestNetPolicyRequest, UpsertJobTemplateRequest,
+    UpsertNetPolicyRequest,
 };
 use crate::task_plugins::validate_job_config;
 use serde::Serialize;
@@ -379,6 +380,61 @@ fn tool_defs() -> Vec<ToolDef> {
                 "additionalProperties": false
             }),
             mutates: false,
+        },
+        ToolDef {
+            name: "legion_net_policy_list",
+            description: "List stored network policies (name, priority, enforcement, selector, rules) in merge order.",
+            input_schema: empty_schema,
+            mutates: false,
+        },
+        ToolDef {
+            name: "legion_net_policy_show",
+            description: "Show a task's effective network policy: every matching stored policy merged with the task's own network.egress/ingress, each rule naming the policy it came from, plus the resolved network mode.",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "job": { "type": "string", "description": "Job id." },
+                    "task": { "type": "string", "description": "Task name (optional when the job has one task)." },
+                    "node_pool": { "type": "string", "description": "Node pool to match selectors against (optional)." }
+                },
+                "required": ["job"],
+                "additionalProperties": false
+            }),
+            mutates: false,
+        },
+        ToolDef {
+            name: "legion_net_policy_test",
+            description: "Dry-run a network policy verdict for a task: would it be allowed to reach `to` (egress) or be reached from `from` (ingress)? Returns allow/deny/defer, the deciding rule, and its reason. Sends nothing. Use before retrying a connection that hangs.",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "job": { "type": "string", "description": "Job id." },
+                    "task": { "type": "string", "description": "Task name (optional when the job has one task)." },
+                    "to": { "type": "string", "description": "Egress destination: host[:port], IP, or URL (a URL's path is tested when the chain is HTTP)." },
+                    "from": { "type": "string", "description": "Ingress peer: host[:port] or IP." },
+                    "identity": { "type": "string", "description": "Peer workload identity for ingress tests (optional)." },
+                    "method": { "type": "string", "description": "HTTP method for request-time rules (optional)." },
+                    "path": { "type": "string", "description": "HTTP path for request-time rules (optional)." },
+                    "node_pool": { "type": "string", "description": "Node pool to match selectors against (optional)." }
+                },
+                "required": ["job"],
+                "additionalProperties": false
+            }),
+            mutates: false,
+        },
+        ToolDef {
+            name: "legion_net_policy_apply",
+            description: "Create or replace a network policy object from its JSON (a NetPolicyObject: name, selector, enforcement, egress/ingress). Takes effect on matching running allocations within one heartbeat; no task restarts. Set dry_run to validate and list affected allocations without writing.",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "object": { "type": "object", "description": "The policy object (see docs/network-handlers.md)." },
+                    "dry_run": { "type": "boolean", "description": "Validate and report affected allocations only (default false)." }
+                },
+                "required": ["object"],
+                "additionalProperties": false
+            }),
+            mutates: true,
         },
         ToolDef {
             name: "legion_state_query",
@@ -1137,6 +1193,67 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
         "legion_service_list" => {
             let mut client = connect().await?;
             grpc(client.list_services(ListServicesRequest {})).await
+        }
+        "legion_net_policy_list" => {
+            let mut client = connect().await?;
+            grpc(client.list_net_policies(ListNetPoliciesRequest {})).await
+        }
+        "legion_net_policy_show" => {
+            let job_id = str_arg(&args, "job")?;
+            let task_name = args
+                .get("task")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let node_pool = args
+                .get("node_pool")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let mut client = connect().await?;
+            grpc(client.show_net_policy(ShowNetPolicyRequest {
+                job_id,
+                task_name,
+                node_pool,
+            }))
+            .await
+        }
+        "legion_net_policy_test" => {
+            let job_id = str_arg(&args, "job")?;
+            let get = |key: &str| {
+                args.get(key)
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string()
+            };
+            let mut client = connect().await?;
+            grpc(client.test_net_policy(TestNetPolicyRequest {
+                job_id,
+                task_name: get("task"),
+                node_pool: get("node_pool"),
+                to: get("to"),
+                from: get("from"),
+                identity: get("identity"),
+                method: get("method"),
+                path: get("path"),
+            }))
+            .await
+        }
+        "legion_net_policy_apply" => {
+            let object = args
+                .get("object")
+                .cloned()
+                .ok_or_else(|| "missing required argument: object".to_string())?;
+            let dry_run = args
+                .get("dry_run")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let mut client = connect().await?;
+            grpc(client.upsert_net_policy(UpsertNetPolicyRequest {
+                object_json: object.to_string(),
+                dry_run,
+            }))
+            .await
         }
         "legion_service_resolve" => {
             let service = str_arg(&args, "service")?;

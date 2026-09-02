@@ -1559,6 +1559,27 @@ pub fn get_migrations() -> Migrations<'static> {
         ALTER TABLE worker_type__textaff RENAME TO worker_type;",
         )
         .down(""),
+        // Network policy objects (`legion net policy`, docs/network-handlers.md):
+        // the canonical JSON of a `NetPolicyObject` plus the columns the list
+        // view orders by. `net_policy_meta.generation` is bumped on every
+        // write so the heartbeat builder can skip the merge on clusters where
+        // nothing changed (and skip it entirely where nothing exists).
+        M::up(
+            "CREATE TABLE IF NOT EXISTS net_policy (
+            name STRING PRIMARY KEY,
+            priority INTEGER NOT NULL DEFAULT 0,
+            enforcement STRING NOT NULL DEFAULT 'default',
+            body TEXT NOT NULL,
+            created_at TIMESTAMP NOT NULL,
+            updated_at TIMESTAMP NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS net_policy_meta (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            generation INTEGER NOT NULL DEFAULT 0
+        );
+        INSERT OR IGNORE INTO net_policy_meta (id, generation) VALUES (1, 0);",
+        )
+        .down("DROP TABLE IF EXISTS net_policy; DROP TABLE IF EXISTS net_policy_meta;"),
     ])
 }
 

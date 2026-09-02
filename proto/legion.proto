@@ -645,6 +645,62 @@ service Manager {
   // booting) are excluded unless `include_unhealthy` is set.
   rpc ResolveService (ResolveServiceRequest) returns (ResolveServiceReply);
 
+  // Creates or replaces a network policy object (docs/network-handlers.md).
+  //
+  // A policy is a selector (node pools, namespaces, runtimes, job globs,
+  // labels) plus the egress/ingress rules and handlers to apply to every task
+  // it matches, with `enforcement = "require"` (always applied, ahead of the
+  // task's own block, never weakened) or `"default"` (applied only when the
+  // task declares nothing itself). The object is normalized and validated
+  // here — `allow` sugar is desugared, protocol/handler names checked, and a
+  // `default` policy that would tie with an existing one on priority and
+  // selector is rejected so the winner is never decided at runtime. Takes
+  // effect on every matching running allocation within one heartbeat; no
+  // task is restarted.
+  //
+  // ACL: `net:write`, scoped by the policy's own `nodePools` / `namespaces`
+  // selectors.
+  rpc UpsertNetPolicy (UpsertNetPolicyRequest) returns (UpsertNetPolicyReply);
+
+  // Fetches one stored policy object by name. ACL: `net:read`.
+  rpc GetNetPolicyObject (GetNetPolicyObjectRequest) returns (GetNetPolicyObjectReply);
+
+  // Lists stored policies in merge order: `require` first, then priority
+  // descending, then name. ACL: `net:read`; entries are filtered to the
+  // caller's scope.
+  rpc ListNetPolicies (ListNetPoliciesRequest) returns (ListNetPoliciesReply);
+
+  // Deletes a stored policy. Matching allocations lose it on their next
+  // heartbeat. ACL: `net:write`.
+  rpc DeleteNetPolicy (DeleteNetPolicyRequest) returns (DeleteNetPolicyReply);
+
+  // Shows the *effective* policy for one task of a job: every matching
+  // stored policy merged with the task's inline `network.egress` /
+  // `network.ingress`, with each rule and handler naming the policy it came
+  // from. This is exactly what the node datapath runs — the same merge
+  // function — and the one thing a client cannot compute itself, because
+  // stored policies live in the manager. `node_pool` narrows selector
+  // matching to a pool (a job may land in several). ACL: `net:read` on the
+  // job.
+  rpc ShowNetPolicy (ShowNetPolicyRequest) returns (ShowNetPolicyReply);
+
+  // Dry-runs a verdict: would this task be allowed to reach `to` (egress) or
+  // be reached from `from` (ingress)? Returns the verdict, the rule that
+  // decided it, and its reason, without sending anything — so an operator or
+  // an agent can ask "is that host blocked?" instead of watching a connection
+  // hang. Connect-time rules are evaluated; request-time rules (path,
+  // method, header) are evaluated when `method`/`path` are given, otherwise
+  // reported as `defer`. ACL: `net:read` on the job.
+  rpc TestNetPolicy (TestNetPolicyRequest) returns (TestNetPolicyReply);
+
+  // Worker plane: fetches the merged policy body for a hash the heartbeat
+  // reply named. Policies are content-addressed so a node running a thousand
+  // identical sandboxes fetches one body once; the worker caches by hash and
+  // keeps the last known good body if a fetch fails (fail-static).
+  //
+  // ACL: worker plane (node token).
+  rpc FetchNetPolicy (FetchNetPolicyRequest) returns (FetchNetPolicyReply);
+
   // Resolves an artifact credential stored in KV for a worker about to fetch.
   //
   // Called by workers over their existing authenticated manager channel
@@ -2694,6 +2750,15 @@ message HeartbeatRequest {
   //
   // Default: empty list — nodes running only committed work pay nothing.
   repeated ProvisionalClaimReport provisional_claims = 7;
+
+  // Denials the node datapath recorded since the last heartbeat, one entry
+  // per distinct (allocation, direction, destination, rule), with a count.
+  // The manager turns each into a `net_denied` event carrying the job,
+  // allocation, matched rule, destination, and identity, so "which rule
+  // blocked it" is answerable from the event stream without node access.
+  // Bounded: a node reports at most 256 entries per heartbeat and folds the
+  // rest into a single `truncated` entry.
+  repeated NetDenial net_denials = 8;
 }
 
 // Reply payload for Heartbeat.
@@ -2789,6 +2854,15 @@ message HeartbeatReply {
   //
   // See docs/heartbeat-cadence-and-scale.md.
   optional uint32 next_interval_seconds = 7;
+
+  // The effective network policy for each desired allocation, as a content
+  // hash. The worker fetches a body it has not seen via `FetchNetPolicy`
+  // and caches it; identical merged policies share one hash and one fetch.
+  // An allocation absent from this list has no policy. Delivered every
+  // heartbeat, applied only after a successful one, so a manager outage
+  // keeps the last known good policy (fail-static). Empty on clusters with
+  // no stored policy and no task declaring one — the zero-cost path.
+  repeated AllocNetPolicy net_policies = 8;
 }
 
 // Why one allocation is being stopped.
@@ -4898,6 +4972,13 @@ message TaskAllocation {
   // pre-commit dispatch requires a minimum worker protocol version and falls
   // back to post-commit dispatch per node below it.
   ProvisionalAllocation provisional = 19;
+
+  // JSON `NetworkConfig` as the task declared it: `mode`, `labels`, and any
+  // inline `egress` / `ingress`. Empty when the task declares no `network`
+  // block, so jobs without one stay byte-identical on the wire. The worker
+  // reads `mode` and `labels` from it; the rules themselves arrive merged
+  // with stored policies via `HeartbeatReply.net_policies`.
+  string task_network = 20;
 }
 
 // Request payload for PostWork.
@@ -5999,4 +6080,210 @@ message RaftMemberInfo {
 
   // True for voters, false for learners still catching up.
   bool voter = 4;
+}
+
+// ---------------------------------------------------------------------------
+// Network policy (docs/network-handlers.md)
+// ---------------------------------------------------------------------------
+
+// A stored network policy object.
+message NetPolicy {
+  // Unique name; letters, digits, '-', '_', '.'.
+  string name = 1;
+
+  // Merge priority: higher applies first among `require` policies and wins
+  // among `default` ones.
+  int64 priority = 2;
+
+  // `require` or `default`.
+  string enforcement = 3;
+
+  // The whole object as canonical JSON (a `NetPolicyObject`): selector,
+  // enforcement, optional mode, egress, ingress, description. Normalized —
+  // `allow` sugar is already expanded into rules.
+  string object_json = 4;
+
+  // Free-form description from the object.
+  string description = 5;
+
+  string created_at = 6;
+  string updated_at = 7;
+}
+
+// Request payload for UpsertNetPolicy.
+message UpsertNetPolicyRequest {
+  // A `NetPolicyObject` as JSON, exactly as `legion net policy apply -f`
+  // reads it (Nickel evaluated to JSON). Validated on write.
+  string object_json = 1;
+
+  // When set, validate and report which running allocations would be
+  // affected, but write nothing.
+  bool dry_run = 2;
+}
+
+// Reply payload for UpsertNetPolicy.
+message UpsertNetPolicyReply {
+  // The stored (normalized) policy. On a dry run, what would be stored.
+  NetPolicy policy = 1;
+
+  // Running allocations whose effective policy would change, as
+  // `job/task@allocation` strings. Populated on dry runs and on writes.
+  repeated string affected_allocations = 2;
+}
+
+// Request payload for GetNetPolicyObject.
+message GetNetPolicyObjectRequest {
+  string name = 1;
+}
+
+// Reply payload for GetNetPolicyObject.
+message GetNetPolicyObjectReply {
+  NetPolicy policy = 1;
+}
+
+// Request payload for ListNetPolicies.
+message ListNetPoliciesRequest {}
+
+// Reply payload for ListNetPolicies.
+message ListNetPoliciesReply {
+  repeated NetPolicy policies = 1;
+
+  // Monotonic generation of the policy set; changes on every write.
+  uint64 generation = 2;
+}
+
+// Request payload for DeleteNetPolicy.
+message DeleteNetPolicyRequest {
+  string name = 1;
+}
+
+// Reply payload for DeleteNetPolicy.
+message DeleteNetPolicyReply {}
+
+// Request payload for ShowNetPolicy.
+message ShowNetPolicyRequest {
+  // Job id.
+  string job_id = 1;
+
+  // Task name; when empty and the job has one task, that task.
+  string task_name = 2;
+
+  // Node pool to match selectors against; empty means "any pool" (pool
+  // selectors are treated as matching).
+  string node_pool = 3;
+}
+
+// Reply payload for ShowNetPolicy.
+message ShowNetPolicyReply {
+  // The merged `EffectivePolicy` as JSON: `mode`, `egress`, `ingress`, each
+  // rule and handler carrying `source` (`policy/<name>#<index>` or
+  // `task#<index>`), the ordered `sources`, and the content `hash`.
+  string effective_json = 1;
+
+  // Names of the stored policies that matched, in application order.
+  repeated string matched_policies = 2;
+
+  // The task's declared `network.mode` and the mode the merge resolved.
+  string declared_mode = 3;
+  string effective_mode = 4;
+}
+
+// Request payload for TestNetPolicy.
+message TestNetPolicyRequest {
+  string job_id = 1;
+  string task_name = 2;
+  string node_pool = 3;
+
+  // Egress test: a destination as `host[:port]`, an IP, or a URL
+  // (`https://api.github.com/user` sets host, port, and path).
+  string to = 4;
+
+  // Ingress test: the peer, as `host[:port]` / IP, optionally with an
+  // identity (`prod:default:checkout:web`).
+  string from = 5;
+  string identity = 6;
+
+  // Request-time facts for HTTP chains. Optional.
+  string method = 7;
+  string path = 8;
+}
+
+// Reply payload for TestNetPolicy.
+message TestNetPolicyReply {
+  // `allow`, `deny`, or `defer` (a request-time rule would decide and no
+  // method/path was given).
+  string verdict = 1;
+
+  // The rule that decided (`policy/<name>#<index>`, `task#<index>`, or
+  // `fallthrough`); empty on allow-by-absence.
+  string source = 2;
+
+  // The rule's `reason`, if any.
+  string reason = 3;
+
+  // Which direction was tested and which protocol the chain runs.
+  string direction = 4;
+  string protocol = 5;
+
+  // Human-readable one-line explanation.
+  string explanation = 6;
+}
+
+// Request payload for FetchNetPolicy (worker plane).
+message FetchNetPolicyRequest {
+  // Node id of the caller.
+  string node_id = 1;
+
+  // Content hash from `HeartbeatReply.net_policies`.
+  string hash = 2;
+}
+
+// Reply payload for FetchNetPolicy.
+message FetchNetPolicyReply {
+  // The `EffectivePolicy` as JSON. Its `hash` field equals the request hash.
+  string effective_json = 1;
+}
+
+// One allocation's effective policy, by hash.
+message AllocNetPolicy {
+  int64 allocation_id = 1;
+
+  // sha256 of the canonical merged policy JSON.
+  string policy_hash = 2;
+}
+
+// One denial (or run of identical denials) reported by a node datapath.
+message NetDenial {
+  int64 allocation_id = 1;
+  string job_id = 2;
+  string task_name = 3;
+
+  // `egress` or `ingress`.
+  string direction = 4;
+
+  // `host:port` (egress destination or ingress peer).
+  string destination = 5;
+
+  // The rule that denied: `policy/<name>#<index>`, `task#<index>`, or
+  // `fallthrough`.
+  string source = 6;
+
+  // The rule's reason, if any.
+  string reason = 7;
+
+  // `tcp`, `http`, or `dns`.
+  string protocol = 8;
+
+  // Verified peer identity, when known.
+  string identity = 9;
+
+  // Number of identical denials folded into this entry.
+  uint32 count = 10;
+
+  // The task's `network.labels`, for attribution.
+  map<string, string> labels = 11;
+
+  // HTTP mode: the method and path denied, when a request-time rule decided.
+  string method = 12;
+  string path = 13;
 }

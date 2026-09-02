@@ -68,6 +68,10 @@ Even with `--allow-write`, `legion_state_query` is forced to read-only.
 | `legion_boot_ticket_list` | no | Outstanding boot tickets (metadata only; token bytes are never stored or returned). |
 | `legion_service_list` | no | List declared services with healthy/total endpoint counts — what a job can connect to. |
 | `legion_service_resolve` | no | Resolve a service to its endpoints (address, port, allocation, node, health). |
+| `legion_net_policy_list` | no | List stored network policies (selector, enforcement, rules) in merge order. |
+| `legion_net_policy_show` | no | A task's effective network policy — every matching stored policy merged with its own block, each rule naming its source — and the resolved network mode. |
+| `legion_net_policy_test` | no | Dry-run a verdict: may this task reach `to` / be reached from `from`? Returns allow/deny/defer with the deciding rule and reason; sends nothing. |
+| `legion_net_policy_apply` | **yes** | Create or replace a network policy object; `dry_run` validates and lists affected allocations without writing. |
 | `legion_acl_whoami` | no | ACL status + caller identity (diagnose PermissionDenied). |
 | `legion_events` | no | List scheduler events; poll with `after_id` to tail. |
 | `legion_job_logs` | no | Fetch captured task stdout/stderr for a job. |
@@ -258,6 +262,30 @@ Over MCP the same catalog is `legion_service_list` and `legion_service_resolve`
 > the consumer's feed. It is not cryptographic identity and not a network
 > policy; do not treat it as a security boundary. See
 > [Service Discovery](service-discovery.md#intentions-serviceallow).
+
+## 4b. Network policy: asking before dialing
+
+A connection that a policy denies is closed before it is dialed, which a
+client sees as a reset or a hang. An agent should not have to infer policy
+from timeouts. Two read-only surfaces answer it directly
+([Network Handlers](network-handlers.md)):
+
+```bash
+legion net policy show agent -j                         # the merged policy, rules with sources
+legion net policy test agent --to https://api.github.com/user -j
+# → {"ok":true,"data":{"verdict":"deny","source":"policy/sandbox-egress#3","reason":"…"}}
+```
+
+Over MCP the same are `legion_net_policy_show` and `legion_net_policy_test`.
+When a request *is* denied in HTTP mode, the response itself says why: a
+`403` with `Legion-Denied-By: <policy>/<rule>` and a JSON body naming the
+rule and reason — so an agent inside a sandbox can change its approach
+instead of retrying.
+
+`legion net policy apply` (and `legion_net_policy_apply`) is mutating and
+gated behind `--allow-write`; `--dry-run` / `dry_run` validates the object
+and lists the running allocations whose effective policy would change,
+without writing.
 
 ## 5. Idempotency keys
 

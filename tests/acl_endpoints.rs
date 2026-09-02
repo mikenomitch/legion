@@ -37,6 +37,8 @@ const TEMPLATE_JOB_NAME: &str = "acl-template-job";
 const KV_KEY: &str = "team/config";
 const FIXTURE_POLICY: &str = "fixture-policy";
 const DELETABLE_POLICY: &str = "deletable-policy";
+const FIXTURE_NET_POLICY: &str = "fixture-net-policy";
+const DELETABLE_NET_POLICY: &str = "deletable-net-policy";
 const DELETABLE_USER: &str = "deletable-user";
 
 /// How an endpoint participates in the ACL system.
@@ -92,6 +94,13 @@ fn endpoint_table() -> Vec<(&'static str, Plane)> {
         ("DeleteJobTemplate", Plane::Protected("template:write")),
         ("ListServices", Plane::Protected("job:read")),
         ("ResolveService", Plane::Protected("job:read")),
+        ("UpsertNetPolicy", Plane::Protected("net:write")),
+        ("GetNetPolicyObject", Plane::Protected("net:read")),
+        ("ListNetPolicies", Plane::Protected("net:read")),
+        ("DeleteNetPolicy", Plane::Protected("net:write")),
+        ("ShowNetPolicy", Plane::Protected("net:read")),
+        ("TestNetPolicy", Plane::Protected("net:read")),
+        ("FetchNetPolicy", Plane::Worker),
         ("GetNodes", Plane::Protected("node:read")),
         ("GetHeartbeatCadence", Plane::Protected("node:read")),
         ("GetNode", Plane::Protected("node:read")),
@@ -488,6 +497,70 @@ async fn call_endpoint(
             .map(|_| ()),
         "ResolveService" => svc
             .resolve_service(req(ResolveServiceRequest::default(), token))
+            .await
+            .map(|_| ()),
+        "UpsertNetPolicy" => svc
+            .upsert_net_policy(req(
+                UpsertNetPolicyRequest {
+                    object_json: r#"{"name":"acl-net-policy","enforcement":"default","priority":1,"egress":{"allow":["*.example.com"]}}"#.into(),
+                    dry_run: false,
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "GetNetPolicyObject" => svc
+            .get_net_policy_object(req(
+                GetNetPolicyObjectRequest {
+                    name: FIXTURE_NET_POLICY.into(),
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "ListNetPolicies" => svc
+            .list_net_policies(req(ListNetPoliciesRequest::default(), token))
+            .await
+            .map(|_| ()),
+        "DeleteNetPolicy" => svc
+            .delete_net_policy(req(
+                DeleteNetPolicyRequest {
+                    name: DELETABLE_NET_POLICY.into(),
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "ShowNetPolicy" => svc
+            .show_net_policy(req(
+                ShowNetPolicyRequest {
+                    job_id: JOB_NAME.into(),
+                    task_name: String::new(),
+                    node_pool: String::new(),
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "TestNetPolicy" => svc
+            .test_net_policy(req(
+                TestNetPolicyRequest {
+                    job_id: JOB_NAME.into(),
+                    to: "https://api.example.com".into(),
+                    ..Default::default()
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "FetchNetPolicy" => svc
+            .fetch_net_policy(req(
+                FetchNetPolicyRequest {
+                    node_id: NODE_ID.into(),
+                    hash: "0000".into(),
+                },
+                token,
+            ))
             .await
             .map(|_| ()),
         "GetNodes" => svc
@@ -1076,6 +1149,20 @@ fn seed_fixtures(store: &Store) -> R<Fixtures> {
         }],
     )?;
     let job_config_id = store.get_job_config(JOB_NAME)?.id();
+
+    // Network policy fixtures (docs/network-handlers.md): one to read, one
+    // to delete.
+    for name in [FIXTURE_NET_POLICY, DELETABLE_NET_POLICY] {
+        let object: legion::structs::netpolicy::NetPolicyObject =
+            serde_json::from_value(serde_json::json!({
+                "name": name,
+                "enforcement": "require",
+                "priority": 50,
+                "selector": { "jobs": ["never-matches-*"] },
+                "egress": { "allow": ["*.example.com"] },
+            }))?;
+        store.upsert_net_policy(object)?;
+    }
 
     store.upsert_job_template_version(
         TEMPLATE_NAME,

@@ -3,7 +3,7 @@
 /* eslint-disable */
 // @ts-nocheck
 
-import { AcquireKvLockReply, AcquireKvLockRequest, AdvanceRolloutReply, AdvanceRolloutRequest, BootstrapAclReply, BootstrapAclRequest, CreateAclTokenReply, CreateAclTokenRequest, CreateInstanceReply, CreateInstanceRequest, CreateInstancesReply, CreateInstancesRequest, CreateJoinTokenReply, CreateJoinTokenRequest, DeleteAclPolicyReply, DeleteAclPolicyRequest, DeleteAclTokenReply, DeleteAclTokenRequest, DeleteAclUserReply, DeleteAclUserRequest, DeleteJobTemplateReply, DeleteJobTemplateRequest, DeleteJoinTokenReply, DeleteJoinTokenRequest, DeleteKvReply, DeleteKvRequest, DeleteSavedStateQueryReply, DeleteSavedStateQueryRequest, DeleteVolumeReply, DeleteVolumeRequest, DestroyInstanceReply, DestroyInstanceRequest, DestroyJobReply, DestroyJobRequest, ExecClientFrame, ExecServerFrame, GetAclPolicyReply, GetAclPolicyRequest, GetAllocationLogsReply, GetAllocationLogsRequest, GetArtifactCredentialReply, GetArtifactCredentialRequest, GetAuthMethodsReply, GetAuthMethodsRequest, GetHeartbeatCadenceReply, GetHeartbeatCadenceRequest, GetInstanceReply, GetInstanceRequest, GetJobInfoReply, GetJobInfoRequest, GetJobScaleStatusReply, GetJobScaleStatusRequest, GetJobSpecByConfigRequest, GetJobSpecReply, GetJobSpecRequest, GetJobTemplateReply, GetJobTemplateRequest, GetKvLockReply, GetKvLockRequest, GetKvReply, GetKvRequest, GetLedgerReply, GetLedgerRequest, GetManagerConfigsReply, GetManagerConfigsRequest, GetNodeReply, GetNodeRequest, GetNodesReply, GetNodesRequest, GetObservabilityReply, GetObservabilityRequest, GetRaftJoinTokenReply, GetRaftJoinTokenRequest, GetRaftStatusReply, GetRaftStatusRequest, GetRolloutReply, GetRolloutRequest, GetRolloutStatusReply, GetRolloutStatusRequest, GetStateBackupReply, GetStateBackupRequest, GetStateStoreSchemaReply, GetStateStoreSchemaRequest, GetTaskLogsReply, GetTaskLogsRequest, GetVolumeReply, GetVolumeRequest, HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, IssueBootTicketReply, IssueBootTicketRequest, IssueNodeIdentityTokenReply, IssueNodeIdentityTokenRequest, IssueRaftCommandReply, IssueRaftCommandRequest, IssueWorkloadIdentityTokenReply, IssueWorkloadIdentityTokenRequest, JoinRaftClusterReply, JoinRaftClusterRequest, ListAclPoliciesReply, ListAclPoliciesRequest, ListAclTokensReply, ListAclTokensRequest, ListAclUsersReply, ListAclUsersRequest, ListBootTicketsReply, ListBootTicketsRequest, ListEventsReply, ListEventsRequest, ListInstancesReply, ListInstancesRequest, ListJobActionsReply, ListJobActionsRequest, ListJobSpecHistoryReply, ListJobSpecHistoryRequest, ListJobsReply, ListJobsRequest, ListJobTemplatesReply, ListJobTemplatesRequest, ListJoinTokensReply, ListJoinTokensRequest, ListKvReply, ListKvRequest, ListRaftHistoryReply, ListRaftHistoryRequest, ListRolloutEventsReply, ListRolloutEventsRequest, ListRolloutsReply, ListRolloutsRequest, ListSavedStateQueriesReply, ListSavedStateQueriesRequest, ListServicesReply, ListServicesRequest, ListVolumeDriversReply, ListVolumeDriversRequest, ListVolumesReply, ListVolumesRequest, LoginReply, LoginRequest, NodeLivenessDigestReply, NodeLivenessDigestRequest, PatchKvReply, PatchKvRequest, PlanJobReply, PlanJobRequest, PostWorkReply, PostWorkRequest, PutKvReply, PutKvRequest, QueryStateStoreReply, QueryStateStoreRequest, RaftLaneReply, RaftLaneRequest, RatifyClaimReply, RatifyClaimRequest, ReleaseKvLockReply, ReleaseKvLockRequest, RenderJobTemplateReply, RenderJobTemplateRequest, RenewKvLockReply, RenewKvLockRequest, ReplaceInstanceReply, ReplaceInstanceRequest, ResolveServiceReply, ResolveServiceRequest, RestartWorkerReply, RestartWorkerRequest, RunJobReply, RunJobRequest, RunJobTemplateReply, RunJobTemplateRequest, ScaleTaskReply, ScaleTaskRequest, SchedulerEvent, SetNodeAvailabilityReply, SetNodeAvailabilityRequest, StartClaimReply, StartClaimRequest, StartInstanceReply, StartInstanceRequest, StopInstanceReply, StopInstanceRequest, StopJobReply, StopJobRequest, StopRolloutReply, StopRolloutRequest, StreamEventsRequest, UpdateNodeDynamicReply, UpdateNodeDynamicRequest, UpsertAclPolicyReply, UpsertAclPolicyRequest, UpsertAclUserReply, UpsertAclUserRequest, UpsertJobTemplateReply, UpsertJobTemplateRequest, UpsertSavedStateQueryReply, UpsertSavedStateQueryRequest, WhoAmIReply, WhoAmIRequest, WorkerPreRegisterReply, WorkerPreRegisterRequest, WorkerRegisterReply, WorkerRegisterRequest } from "./legion_pb.js";
+import { AcquireKvLockReply, AcquireKvLockRequest, AdvanceRolloutReply, AdvanceRolloutRequest, BootstrapAclReply, BootstrapAclRequest, CreateAclTokenReply, CreateAclTokenRequest, CreateInstanceReply, CreateInstanceRequest, CreateInstancesReply, CreateInstancesRequest, CreateJoinTokenReply, CreateJoinTokenRequest, DeleteAclPolicyReply, DeleteAclPolicyRequest, DeleteAclTokenReply, DeleteAclTokenRequest, DeleteAclUserReply, DeleteAclUserRequest, DeleteJobTemplateReply, DeleteJobTemplateRequest, DeleteJoinTokenReply, DeleteJoinTokenRequest, DeleteKvReply, DeleteKvRequest, DeleteNetPolicyReply, DeleteNetPolicyRequest, DeleteSavedStateQueryReply, DeleteSavedStateQueryRequest, DeleteVolumeReply, DeleteVolumeRequest, DestroyInstanceReply, DestroyInstanceRequest, DestroyJobReply, DestroyJobRequest, ExecClientFrame, ExecServerFrame, FetchNetPolicyReply, FetchNetPolicyRequest, GetAclPolicyReply, GetAclPolicyRequest, GetAllocationLogsReply, GetAllocationLogsRequest, GetArtifactCredentialReply, GetArtifactCredentialRequest, GetAuthMethodsReply, GetAuthMethodsRequest, GetHeartbeatCadenceReply, GetHeartbeatCadenceRequest, GetInstanceReply, GetInstanceRequest, GetJobInfoReply, GetJobInfoRequest, GetJobScaleStatusReply, GetJobScaleStatusRequest, GetJobSpecByConfigRequest, GetJobSpecReply, GetJobSpecRequest, GetJobTemplateReply, GetJobTemplateRequest, GetKvLockReply, GetKvLockRequest, GetKvReply, GetKvRequest, GetLedgerReply, GetLedgerRequest, GetManagerConfigsReply, GetManagerConfigsRequest, GetNetPolicyObjectReply, GetNetPolicyObjectRequest, GetNodeReply, GetNodeRequest, GetNodesReply, GetNodesRequest, GetObservabilityReply, GetObservabilityRequest, GetRaftJoinTokenReply, GetRaftJoinTokenRequest, GetRaftStatusReply, GetRaftStatusRequest, GetRolloutReply, GetRolloutRequest, GetRolloutStatusReply, GetRolloutStatusRequest, GetStateBackupReply, GetStateBackupRequest, GetStateStoreSchemaReply, GetStateStoreSchemaRequest, GetTaskLogsReply, GetTaskLogsRequest, GetVolumeReply, GetVolumeRequest, HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, IssueBootTicketReply, IssueBootTicketRequest, IssueNodeIdentityTokenReply, IssueNodeIdentityTokenRequest, IssueRaftCommandReply, IssueRaftCommandRequest, IssueWorkloadIdentityTokenReply, IssueWorkloadIdentityTokenRequest, JoinRaftClusterReply, JoinRaftClusterRequest, ListAclPoliciesReply, ListAclPoliciesRequest, ListAclTokensReply, ListAclTokensRequest, ListAclUsersReply, ListAclUsersRequest, ListBootTicketsReply, ListBootTicketsRequest, ListEventsReply, ListEventsRequest, ListInstancesReply, ListInstancesRequest, ListJobActionsReply, ListJobActionsRequest, ListJobSpecHistoryReply, ListJobSpecHistoryRequest, ListJobsReply, ListJobsRequest, ListJobTemplatesReply, ListJobTemplatesRequest, ListJoinTokensReply, ListJoinTokensRequest, ListKvReply, ListKvRequest, ListNetPoliciesReply, ListNetPoliciesRequest, ListRaftHistoryReply, ListRaftHistoryRequest, ListRolloutEventsReply, ListRolloutEventsRequest, ListRolloutsReply, ListRolloutsRequest, ListSavedStateQueriesReply, ListSavedStateQueriesRequest, ListServicesReply, ListServicesRequest, ListVolumeDriversReply, ListVolumeDriversRequest, ListVolumesReply, ListVolumesRequest, LoginReply, LoginRequest, NodeLivenessDigestReply, NodeLivenessDigestRequest, PatchKvReply, PatchKvRequest, PlanJobReply, PlanJobRequest, PostWorkReply, PostWorkRequest, PutKvReply, PutKvRequest, QueryStateStoreReply, QueryStateStoreRequest, RaftLaneReply, RaftLaneRequest, RatifyClaimReply, RatifyClaimRequest, ReleaseKvLockReply, ReleaseKvLockRequest, RenderJobTemplateReply, RenderJobTemplateRequest, RenewKvLockReply, RenewKvLockRequest, ReplaceInstanceReply, ReplaceInstanceRequest, ResolveServiceReply, ResolveServiceRequest, RestartWorkerReply, RestartWorkerRequest, RunJobReply, RunJobRequest, RunJobTemplateReply, RunJobTemplateRequest, ScaleTaskReply, ScaleTaskRequest, SchedulerEvent, SetNodeAvailabilityReply, SetNodeAvailabilityRequest, ShowNetPolicyReply, ShowNetPolicyRequest, StartClaimReply, StartClaimRequest, StartInstanceReply, StartInstanceRequest, StopInstanceReply, StopInstanceRequest, StopJobReply, StopJobRequest, StopRolloutReply, StopRolloutRequest, StreamEventsRequest, TestNetPolicyReply, TestNetPolicyRequest, UpdateNodeDynamicReply, UpdateNodeDynamicRequest, UpsertAclPolicyReply, UpsertAclPolicyRequest, UpsertAclUserReply, UpsertAclUserRequest, UpsertJobTemplateReply, UpsertJobTemplateRequest, UpsertNetPolicyReply, UpsertNetPolicyRequest, UpsertSavedStateQueryReply, UpsertSavedStateQueryRequest, WhoAmIReply, WhoAmIRequest, WorkerPreRegisterReply, WorkerPreRegisterRequest, WorkerRegisterReply, WorkerRegisterRequest } from "./legion_pb.js";
 import { MethodKind } from "@bufbuild/protobuf";
 
 /**
@@ -250,8 +250,9 @@ export const Manager = {
      *
      * The source must evaluate to a record with an optional `description`,
      * an optional `variables` list, and a
-     * `job | not_exported = fun vars => ...` function that
-     * returns the jobspec. Invalid manifests are rejected here, not at run
+     * `job | not_exported = fun vars => ...` function that returns the
+     * jobspec. `not_exported` is what keeps `job` out of the published
+     * manifest. Invalid manifests are rejected here, not at run
      * time. When every declared variable has a default, the manager also
      * trial-renders the template and validates the resulting jobspec.
      * Requires `template:write` scoped to the template name.
@@ -1173,6 +1174,118 @@ export const Manager = {
       name: "ResolveService",
       I: ResolveServiceRequest,
       O: ResolveServiceReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Creates or replaces a network policy object (docs/network-handlers.md).
+     *
+     * A policy is a selector (node pools, namespaces, runtimes, job globs,
+     * labels) plus the egress/ingress rules and handlers to apply to every task
+     * it matches, with `enforcement = "require"` (always applied, ahead of the
+     * task's own block, never weakened) or `"default"` (applied only when the
+     * task declares nothing itself). The object is normalized and validated
+     * here — `allow` sugar is desugared, protocol/handler names checked, and a
+     * `default` policy that would tie with an existing one on priority and
+     * selector is rejected so the winner is never decided at runtime. Takes
+     * effect on every matching running allocation within one heartbeat; no
+     * task is restarted.
+     *
+     * ACL: `net:write`, scoped by the policy's own `nodePools` / `namespaces`
+     * selectors.
+     *
+     * @generated from rpc legion.Manager.UpsertNetPolicy
+     */
+    upsertNetPolicy: {
+      name: "UpsertNetPolicy",
+      I: UpsertNetPolicyRequest,
+      O: UpsertNetPolicyReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Fetches one stored policy object by name. ACL: `net:read`.
+     *
+     * @generated from rpc legion.Manager.GetNetPolicyObject
+     */
+    getNetPolicyObject: {
+      name: "GetNetPolicyObject",
+      I: GetNetPolicyObjectRequest,
+      O: GetNetPolicyObjectReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Lists stored policies in merge order: `require` first, then priority
+     * descending, then name. ACL: `net:read`; entries are filtered to the
+     * caller's scope.
+     *
+     * @generated from rpc legion.Manager.ListNetPolicies
+     */
+    listNetPolicies: {
+      name: "ListNetPolicies",
+      I: ListNetPoliciesRequest,
+      O: ListNetPoliciesReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Deletes a stored policy. Matching allocations lose it on their next
+     * heartbeat. ACL: `net:write`.
+     *
+     * @generated from rpc legion.Manager.DeleteNetPolicy
+     */
+    deleteNetPolicy: {
+      name: "DeleteNetPolicy",
+      I: DeleteNetPolicyRequest,
+      O: DeleteNetPolicyReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Shows the *effective* policy for one task of a job: every matching
+     * stored policy merged with the task's inline `network.egress` /
+     * `network.ingress`, with each rule and handler naming the policy it came
+     * from. This is exactly what the node datapath runs — the same merge
+     * function — and the one thing a client cannot compute itself, because
+     * stored policies live in the manager. `node_pool` narrows selector
+     * matching to a pool (a job may land in several). ACL: `net:read` on the
+     * job.
+     *
+     * @generated from rpc legion.Manager.ShowNetPolicy
+     */
+    showNetPolicy: {
+      name: "ShowNetPolicy",
+      I: ShowNetPolicyRequest,
+      O: ShowNetPolicyReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Dry-runs a verdict: would this task be allowed to reach `to` (egress) or
+     * be reached from `from` (ingress)? Returns the verdict, the rule that
+     * decided it, and its reason, without sending anything — so an operator or
+     * an agent can ask "is that host blocked?" instead of watching a connection
+     * hang. Connect-time rules are evaluated; request-time rules (path,
+     * method, header) are evaluated when `method`/`path` are given, otherwise
+     * reported as `defer`. ACL: `net:read` on the job.
+     *
+     * @generated from rpc legion.Manager.TestNetPolicy
+     */
+    testNetPolicy: {
+      name: "TestNetPolicy",
+      I: TestNetPolicyRequest,
+      O: TestNetPolicyReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Worker plane: fetches the merged policy body for a hash the heartbeat
+     * reply named. Policies are content-addressed so a node running a thousand
+     * identical sandboxes fetches one body once; the worker caches by hash and
+     * keeps the last known good body if a fetch fails (fail-static).
+     *
+     * ACL: worker plane (node token).
+     *
+     * @generated from rpc legion.Manager.FetchNetPolicy
+     */
+    fetchNetPolicy: {
+      name: "FetchNetPolicy",
+      I: FetchNetPolicyRequest,
+      O: FetchNetPolicyReply,
       kind: MethodKind.Unary,
     },
     /**

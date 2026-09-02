@@ -156,11 +156,58 @@
                 command = ["sleep", "1"],
             },
             network = {
-                mode = "auto",  # auto | host (datapath plugins add more)
+                # Datapath: auto | host | gated (docs/network-handlers.md).
+                # `gated` gives the task a namespace holding loopback and the
+                # datapath only, so egress policy is unbypassable; `auto`
+                # picks gated for sandbox and host otherwise. `bridge` /
+                # `cni/<name>` are reserved for the datapath plugin.
+                mode = "auto",
                 ports = [
                     { name = "http", to = 8080 },      # dynamic host port -> task 8080
                     { name = "metrics", static = 9090 },  # fixed host port
                 ],
+                # Attribution keys carried on every net.denied event and
+                # access-log line (never on a metric label). Stored policies
+                # can select on them too.
+                labels = { team = "web", tier = "prod" },
+                # Inline egress policy: the same shape as a stored policy
+                # object, scoped to this task. Merged after every matching
+                # `require` policy; replaces a matching `default` one.
+                egress = {
+                    protocol = "tcp",         # tcp (default) | http — never inferred
+                    policy = "deny",          # fallthrough: allow | deny (deny when `allow` is used)
+                    onError = "deny",         # what a failed handler means: deny | allow
+                    accessLog = false,
+                    # Sugar: host, host:port, cidr, cidr:port — and host/path
+                    # once protocol = "http". Desugars to allow rules ahead of
+                    # `rules`.
+                    allow = ["*.internal.example.com", "10.0.0.0/8:5432"],
+                    rules = [
+                        # First match wins. Connect-time fields (host, port,
+                        # cidr, identity) never touch the byte path; path /
+                        # method / header need protocol = "http".
+                        { match = { host = "telemetry.example.com", port = 443 }, action = "allow" },
+                        { match = { cidr = "169.254.0.0/16" }, action = "deny", reason = "no metadata service" },
+                    ],
+                    # Handlers: code on the path, only when policy is not
+                    # enough. authz = a webhook verdict (cached); proxy = any
+                    # proxy by service / sidecar port / node-local service;
+                    # log; dlp (HTTP bodies, needs protocol = "http").
+                    handlers = [
+                        { handler = "authz", url = "http://policy.internal/check", cache = "30s", timeout = "2s", onError = "deny" },
+                    ],
+                },
+                # Inline ingress policy in front of this task's advertised
+                # ports (ships with the ingress phase; validated today).
+                ingress = {
+                    protocol = "http",
+                    rules = [
+                        { match = { path = "/admin/**" }, action = "deny", reason = "not externally reachable" },
+                    ],
+                    tls = {
+                        mode = "off",          # off | server | mutual
+                    },
+                },
             },
             service = {
                 name = "web",       # defaults to task name
@@ -190,6 +237,37 @@
                     # Strategy override: round_robin (default) | random |
                     # least_conn.
                     { service = "search", balance = "least_conn" },
+                    # HTTP framing and traffic management on a service
+                    # upstream (docs/network-handlers.md): a per-request
+                    # deadline, bounded retries (idempotent methods only by
+                    # default), a canary split by service tag, and outlier
+                    # ejection.
+                    {
+                        service = "api",
+                        http = {
+                            timeout = "3s",
+                            retries = { attempts = 2, on = ["5xx", "connect-failure"], budget = "20%" },
+                            split = [{ tag = "canary", weight = 10 }],
+                            outlier = { consecutive5xx = 5, ejectFor = "30s" },
+                        },
+                    },
+                    # An external upstream: `name` + `to` instead of a
+                    # service. The task gets $LEGION_UPSTREAM_OPENAI on
+                    # loopback and speaks plaintext; Legion originates TLS
+                    # (https / tls schemes), so the body is visible to
+                    # handlers without intercepting anyone's TLS. The scheme
+                    # also decides HTTP framing (http / https).
+                    {
+                        name = "openai",
+                        to = "https://api.openai.com",
+                        handlers = [
+                            {
+                                handler = "dlp",
+                                config = { maxBytes = "1Mi", patterns = ["(AKIA|sk-)[A-Za-z0-9]{16,}"] },
+                                onError = "deny",
+                            },
+                        ],
+                    },
                 ],
             },
             # Workload identities (see docs/workload-identity.md): each named

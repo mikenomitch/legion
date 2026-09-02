@@ -398,3 +398,48 @@ honesty table has to say "on Linux, if you enable it."
 is the kind of default change this repo does not make silently. The sandbox
 operator gets fleet-wide `gated` with one `require` policy on the pool, which
 is the intended path anyway.
+
+---
+
+## 17. The manager's policy-body cache is in memory with a recompute fallback, not a table
+
+**Call.** `FetchNetPolicy(hash)` is served from an in-memory `hash → body`
+map the heartbeat builder fills. On a miss (failover, restart, eviction) the
+manager recomputes the node's desired set through the same merge and serves
+the matching hash. Nothing about merged bodies is persisted.
+
+**Alternatives.** Persist merged bodies in a `net_policy_body` table keyed by
+hash, written by the heartbeat builder — always answerable, no recompute.
+
+**Trade-off.** A cold manager pays one desired-set merge per first fetch of
+each hash, and a body evicted under `NET_POLICY_CACHE_MAX` (4096) costs the
+same. A table would also give a history of every merged policy that ever
+ran, which the in-memory design does not.
+
+**Why (simplicity, and it is derivable state).** The merge is deterministic
+over stored policies plus the task's declared network block, both of which
+are already persisted and replicated. Persisting the output would put a
+write on the heartbeat path — the hottest path in the system — to store
+something any manager can recompute in microseconds. The cache is a
+shortcut for the common case, and correctness never depends on it.
+
+---
+
+## 18. External upstreams verify TLS against the Mozilla roots only, for now
+
+**Call.** `to = "https://…"` / `tls://` originates TLS with `webpki-roots`
+and no client certificate. A pinned CA (`tls.caPath`) is parsed and
+validated on the chain but not yet honored on upstreams.
+
+**Alternatives.** Ship the pin in the same phase — it is one
+`RootCertStore` per upstream.
+
+**Trade-off.** An internal service with a private CA cannot be an external
+upstream until the mTLS phase; the workaround is the catalog (make it a
+Legion service) or a `tcp://` upstream that lets the task do its own TLS.
+
+**Why (phasing).** The mTLS phase owns certificate material — file paths,
+`${artifact}` references, the node CA — and per-upstream trust belongs with
+it rather than as a one-off that would be redone when that phase lands.
+Public APIs, the LLM-gateway case that motivated external upstreams, are
+served today.

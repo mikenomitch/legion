@@ -586,6 +586,21 @@ pub fn build_task_allocation_with(
         Some(stop) => serde_json::to_string(stop).context("Failed to serialize task stop")?,
         None => String::new(),
     };
+    // The declared `network` block: mode, labels, and any inline policy. The
+    // assigned ports travel separately on `network` (an `AllocNetwork`), so
+    // this is only sent when it carries something the datapath reads — a
+    // non-default mode, labels, or an inline chain — keeping jobs that only
+    // declare ports byte-identical on the wire.
+    let task_network = match task.network.as_ref() {
+        Some(network)
+            if network.mode != "auto"
+                || !network.labels.is_empty()
+                || network.declares_policy() =>
+        {
+            serde_json::to_string(network).context("Failed to serialize task network")?
+        }
+        _ => String::new(),
+    };
     Ok(TaskAllocation {
         allocation_id: allocation.id,
         job_id: allocation.job_id.clone(),
@@ -605,6 +620,7 @@ pub fn build_task_allocation_with(
         task_volumes,
         task_resources,
         task_stop,
+        task_network,
         provisional,
     })
 }

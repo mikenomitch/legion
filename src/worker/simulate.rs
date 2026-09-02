@@ -787,6 +787,7 @@ async fn heartbeat_sim_node(
     let acked = node.acked_ids(ready_after);
     fleet.record_reported_allocations(node, acked.len());
     let req = node.credentials.attach(Request::new(HeartbeatRequest {
+        net_denials: Vec::new(),
         // Simulated nodes never take provisional starts: the simulator
         // models scheduler load, and edge boot is a node-local execution
         // path with nothing to model.

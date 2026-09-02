@@ -27,11 +27,16 @@
 //! Choosing *which* endpoint a connection goes to is [`crate::worker::balance`].
 
 use crate::prelude::*;
-use crate::structs::UPSTREAM_LOOPBACK_ADDR;
+use crate::structs::netpolicy::{ConnectFacts, Verdict, PROTOCOL_TCP};
+use crate::structs::{parse_upstream_target, UpstreamTarget, UPSTREAM_LOOPBACK_ADDR};
 use crate::worker::balance::{balancer, default_balancer, Balancer, Endpoint};
+use crate::worker::netd::policy::{egress_connect_verdict, AllocIdentity};
+use crate::worker::netd::{metrics as net_metrics, Denials, PolicyLookup};
 
+use std::net::SocketAddr;
+use std::sync::OnceLock;
 use std::time::Duration;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 
@@ -59,9 +64,14 @@ type UpstreamKey = (i64, String);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpstreamSpec {
     pub allocation_id: i64,
+    /// The upstream key: a catalog service name, or the `name` of an external
+    /// upstream (whose destination is `to`).
     pub service: String,
     pub local_port: u16,
     pub balance: String,
+    /// External destination URL (`tcp://`, `tls://`, `http://`, `https://`);
+    /// `None` for a catalog service, which is dialed from the endpoint feed.
+    pub to: Option<String>,
 }
 
 impl UpstreamSpec {
@@ -82,10 +92,75 @@ struct UpstreamShared {
     /// Live connection count per endpoint address, for load-aware strategies.
     /// Entries are removed at zero so the map stays bounded by live endpoints.
     inflight: Mutex<HashMap<String, usize>>,
+    /// Parsed external destination, when this upstream has one.
+    target: Option<UpstreamTarget>,
+    /// Policy, denial ledger, and TLS shared by every listener.
+    context: Arc<ForwarderContext>,
+}
+
+/// What every listener consults: the allocation's effective policy (egress
+/// rules are evaluated before any dial), the denial ledger the heartbeat
+/// drains, and a lazily built TLS client for `tls://` / `https://` upstreams.
+/// A forwarder built without policy (tests, the pre-policy code path) allows
+/// everything, exactly as before.
+#[derive(Default)]
+pub struct ForwarderContext {
+    policy: Option<Arc<dyn PolicyLookup>>,
+    cache: Option<Arc<crate::worker::netd::NetPolicyCache>>,
+    denials: Option<Arc<Denials>>,
+    tls: OnceLock<Arc<rustls::ClientConfig>>,
+}
+
+impl ForwarderContext {
+    pub fn new(cache: Arc<crate::worker::netd::NetPolicyCache>, denials: Arc<Denials>) -> Self {
+        ForwarderContext {
+            policy: Some(cache.clone() as Arc<dyn PolicyLookup>),
+            cache: Some(cache),
+            denials: Some(denials),
+            tls: OnceLock::new(),
+        }
+    }
+
+    /// The policy cache the heartbeat loop feeds; `None` on a forwarder built
+    /// without policy.
+    pub fn cache(&self) -> Option<&Arc<crate::worker::netd::NetPolicyCache>> {
+        self.cache.as_ref()
+    }
+
+    /// The denial ledger the heartbeat loop drains.
+    pub fn denials(&self) -> Option<&Arc<Denials>> {
+        self.denials.as_ref()
+    }
+
+    fn policy_for(
+        &self,
+        allocation_id: i64,
+    ) -> Option<Arc<crate::structs::netpolicy::EffectivePolicy>> {
+        self.policy.as_ref()?.policy_for(allocation_id)
+    }
+
+    fn identity_for(&self, allocation_id: i64) -> Option<AllocIdentity> {
+        self.policy.as_ref()?.identity_for(allocation_id)
+    }
+
+    /// A rustls client trusting the Mozilla roots (webpki-roots). Built once
+    /// per process; external upstreams that pin a CA are a later phase.
+    fn tls_connector(&self) -> tokio_rustls::TlsConnector {
+        let config = self.tls.get_or_init(|| {
+            let mut roots = rustls::RootCertStore::empty();
+            roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            Arc::new(
+                rustls::ClientConfig::builder()
+                    .with_root_certificates(roots)
+                    .with_no_client_auth(),
+            )
+        });
+        tokio_rustls::TlsConnector::from(config.clone())
+    }
 }
 
 impl UpstreamShared {
-    fn new(spec: &UpstreamSpec) -> Self {
+    fn new(spec: &UpstreamSpec, context: Arc<ForwarderContext>) -> Self {
         // A stored allocation can name a strategy this build no longer has
         // (config validation only ran against the submitting build). Falling
         // back keeps the upstream serving instead of dropping it silently.
@@ -98,12 +173,30 @@ impl UpstreamShared {
             );
             default_balancer()
         });
+        // A destination that fails to parse was validated at submit; a stored
+        // allocation carrying one this build cannot parse is treated as a
+        // service upstream with no endpoints, which closes every connection
+        // rather than dialing something unintended.
+        let target = spec.to.as_deref().and_then(|to| match parse_upstream_target(to) {
+            Ok(target) => Some(target),
+            Err(err) => {
+                warn!(
+                    allocation_id = spec.allocation_id,
+                    upstream = %spec.service,
+                    error = ?err,
+                    "External upstream destination is invalid; the upstream will refuse connections"
+                );
+                None
+            }
+        });
         UpstreamShared {
             allocation_id: spec.allocation_id,
             service: spec.service.clone(),
             balancer,
             endpoints: Mutex::new(Vec::new()),
             inflight: Mutex::new(HashMap::new()),
+            target,
+            context,
         }
     }
 
@@ -143,11 +236,28 @@ impl Listener {
 #[derive(Default)]
 pub struct UpstreamForwarder {
     listeners: Mutex<HashMap<UpstreamKey, Listener>>,
+    context: Arc<ForwarderContext>,
 }
 
 impl UpstreamForwarder {
+    /// A forwarder with no policy: every connection is allowed, as before
+    /// network policy existed. Used by tests and by the pre-policy paths.
     pub fn new() -> Self {
         UpstreamForwarder::default()
+    }
+
+    /// A forwarder that consults `policy` before every dial and records
+    /// denials for the heartbeat to report.
+    pub fn with_context(context: Arc<ForwarderContext>) -> Self {
+        UpstreamForwarder {
+            listeners: Mutex::new(HashMap::new()),
+            context,
+        }
+    }
+
+    /// The shared policy / denial / TLS context.
+    pub fn context(&self) -> &Arc<ForwarderContext> {
+        &self.context
     }
 
     /// Reconcile the running listeners against `desired`.
@@ -196,7 +306,7 @@ impl UpstreamForwarder {
                     // keeping any endpoints already delivered for this upstream.
                     Some(listener) => pending.push((spec, listener.shared.clone())),
                     None => {
-                        let shared = Arc::new(UpstreamShared::new(&spec));
+                        let shared = Arc::new(UpstreamShared::new(&spec, self.context.clone()));
                         pending.push((spec, shared));
                     }
                 }
@@ -375,11 +485,25 @@ async fn run_listener(socket: TcpListener, shared: Arc<UpstreamShared>) {
     }
 }
 
-/// Forward one client connection: pick an endpoint, dial it with a timeout,
-/// fail over to another candidate on error, then splice the sockets.
+/// Forward one client connection.
+///
+/// Policy first: the allocation's effective egress rules are evaluated with
+/// what is known at connect time — the upstream's host (an external
+/// destination's host, or the service name), the port, and for service
+/// upstreams the picked endpoint's address — and a denial closes the
+/// connection before anything is dialed. Then the dial: an external upstream
+/// goes straight to its destination (with TLS originated for `tls://` and
+/// `https://`); a service upstream picks an endpoint, dials it with a timeout,
+/// and fails over to another candidate on error. Finally the two sockets are
+/// spliced.
 ///
 /// Per-connection logging stays at `debug` — this is the hot path.
 async fn forward_connection(mut client: TcpStream, shared: Arc<UpstreamShared>) {
+    if let Some(target) = shared.target.clone() {
+        forward_external(client, shared, target).await;
+        return;
+    }
+
     let mut candidates = shared.endpoints();
     if candidates.is_empty() {
         debug!(
@@ -387,6 +511,7 @@ async fn forward_connection(mut client: TcpStream, shared: Arc<UpstreamShared>) 
             service = %shared.service,
             "No endpoints for upstream; closing connection"
         );
+        net_metrics::connection("egress", PROTOCOL_TCP, "error");
         let _ = client.shutdown().await;
         return;
     }
@@ -403,12 +528,27 @@ async fn forward_connection(mut client: TcpStream, shared: Arc<UpstreamShared>) 
             break;
         }
         let endpoint = candidates.remove(index);
+
+        // Policy, against the endpoint about to be dialed. A rule naming the
+        // service (`host = "db"`) or the endpoint's address/port decides here.
+        let addr: Option<SocketAddr> = endpoint.addr.parse().ok();
+        let facts = ConnectFacts {
+            host: Some(shared.service.as_str()),
+            ip: addr.map(|a| a.ip()),
+            port: addr.map(|a| a.port()).unwrap_or(0),
+            identity: None,
+        };
+        if deny_if_policy_says_so(&shared, &facts, &endpoint.addr).await {
+            let _ = client.shutdown().await;
+            return;
+        }
+
         // Counted from the dial (not from a successful connect) so
         // `least_conn` also sees connections that are still connecting.
         // Released on every exit path, including errors, by `Drop`.
         let _inflight_guard = InflightGuard::acquire(&shared, &endpoint.addr);
 
-        let mut upstream =
+        let upstream =
             match tokio::time::timeout(DIAL_TIMEOUT, TcpStream::connect(&endpoint.addr)).await {
                 Ok(Ok(upstream)) => upstream,
                 Ok(Err(err)) => {
@@ -426,36 +566,14 @@ async fn forward_connection(mut client: TcpStream, shared: Arc<UpstreamShared>) 
                         allocation_id = shared.allocation_id,
                         service = %shared.service,
                         endpoint = %endpoint.addr,
-                        timeout_ms = DIAL_TIMEOUT.as_millis() as u64,
                         "Upstream dial timed out; trying the next endpoint"
                     );
                     continue;
                 }
             };
 
-        debug!(
-            allocation_id = shared.allocation_id,
-            service = %shared.service,
-            endpoint = %endpoint.addr,
-            endpoint_allocation_id = endpoint.allocation_id,
-            node_id = %endpoint.node_id,
-            "Forwarding upstream connection"
-        );
-        match tokio::io::copy_bidirectional(&mut client, &mut upstream).await {
-            Ok((to_upstream, to_client)) => debug!(
-                service = %shared.service,
-                endpoint = %endpoint.addr,
-                to_upstream,
-                to_client,
-                "Upstream connection closed"
-            ),
-            Err(err) => debug!(
-                service = %shared.service,
-                endpoint = %endpoint.addr,
-                error = ?err,
-                "Upstream connection ended with an error"
-            ),
-        }
+        net_metrics::connection("egress", PROTOCOL_TCP, "allow");
+        splice(&shared, &endpoint.addr, client, upstream).await;
         return;
     }
 
@@ -465,7 +583,174 @@ async fn forward_connection(mut client: TcpStream, shared: Arc<UpstreamShared>) 
         attempts = MAX_DIAL_ATTEMPTS,
         "No reachable endpoint for upstream; closing connection"
     );
+    net_metrics::connection("egress", PROTOCOL_TCP, "error");
     let _ = client.shutdown().await;
+}
+
+/// Dial an external upstream's fixed destination, originating TLS when the
+/// scheme asks for it.
+async fn forward_external(
+    mut client: TcpStream,
+    shared: Arc<UpstreamShared>,
+    target: UpstreamTarget,
+) {
+    let facts = ConnectFacts {
+        host: Some(target.host.as_str()),
+        ip: target.host.parse().ok(),
+        port: target.port,
+        identity: None,
+    };
+    let destination = target.addr();
+    if deny_if_policy_says_so(&shared, &facts, &destination).await {
+        let _ = client.shutdown().await;
+        return;
+    }
+    let _inflight_guard = InflightGuard::acquire(&shared, &destination);
+    let upstream = match tokio::time::timeout(DIAL_TIMEOUT, TcpStream::connect(&destination)).await
+    {
+        Ok(Ok(upstream)) => upstream,
+        Ok(Err(err)) => {
+            debug!(
+                allocation_id = shared.allocation_id,
+                upstream = %shared.service,
+                destination = %destination,
+                error = ?err,
+                "External upstream dial failed"
+            );
+            net_metrics::connection("egress", PROTOCOL_TCP, "error");
+            let _ = client.shutdown().await;
+            return;
+        }
+        Err(_) => {
+            debug!(
+                allocation_id = shared.allocation_id,
+                upstream = %shared.service,
+                destination = %destination,
+                "External upstream dial timed out"
+            );
+            net_metrics::connection("egress", PROTOCOL_TCP, "error");
+            let _ = client.shutdown().await;
+            return;
+        }
+    };
+    if !target.tls {
+        net_metrics::connection("egress", PROTOCOL_TCP, "allow");
+        splice(&shared, &destination, client, upstream).await;
+        return;
+    }
+    let server_name = match rustls_pki_types::ServerName::try_from(target.host.clone()) {
+        Ok(name) => name,
+        Err(err) => {
+            warn!(
+                allocation_id = shared.allocation_id,
+                upstream = %shared.service,
+                host = %target.host,
+                error = ?err,
+                "External upstream host is not a valid TLS server name"
+            );
+            net_metrics::connection("egress", PROTOCOL_TCP, "error");
+            let _ = client.shutdown().await;
+            return;
+        }
+    };
+    let connector = shared.context.tls_connector();
+    match tokio::time::timeout(DIAL_TIMEOUT, connector.connect(server_name, upstream)).await {
+        Ok(Ok(tls)) => {
+            net_metrics::connection("egress", PROTOCOL_TCP, "allow");
+            splice(&shared, &destination, client, tls).await;
+        }
+        Ok(Err(err)) => {
+            debug!(
+                allocation_id = shared.allocation_id,
+                upstream = %shared.service,
+                destination = %destination,
+                error = ?err,
+                "External upstream TLS handshake failed"
+            );
+            net_metrics::connection("egress", PROTOCOL_TCP, "error");
+            let _ = client.shutdown().await;
+        }
+        Err(_) => {
+            debug!(
+                allocation_id = shared.allocation_id,
+                upstream = %shared.service,
+                destination = %destination,
+                "External upstream TLS handshake timed out"
+            );
+            net_metrics::connection("egress", PROTOCOL_TCP, "error");
+            let _ = client.shutdown().await;
+        }
+    }
+}
+
+/// Evaluate the allocation's egress policy for one destination. Returns true
+/// when the connection must be closed, having recorded the denial and the
+/// metric. No policy (or an allow / defer verdict) returns false.
+async fn deny_if_policy_says_so(
+    shared: &Arc<UpstreamShared>,
+    facts: &ConnectFacts<'_>,
+    destination: &str,
+) -> bool {
+    let policy = shared.context.policy_for(shared.allocation_id);
+    match egress_connect_verdict(policy.as_deref(), facts) {
+        Verdict::Allow | Verdict::Defer => false,
+        Verdict::Deny { source, reason } => {
+            debug!(
+                allocation_id = shared.allocation_id,
+                upstream = %shared.service,
+                destination = %destination,
+                source = %source,
+                "Egress connection denied by policy"
+            );
+            net_metrics::connection("egress", PROTOCOL_TCP, "deny");
+            if let Some(denials) = shared.context.denials.as_ref() {
+                let who = shared.context.identity_for(shared.allocation_id);
+                denials.record(
+                    shared.allocation_id,
+                    who.as_ref(),
+                    "egress",
+                    PROTOCOL_TCP,
+                    destination,
+                    &source,
+                    reason.as_deref(),
+                    None,
+                    "",
+                    "",
+                );
+            }
+            true
+        }
+    }
+}
+
+/// Splice the two halves and account the bytes.
+async fn splice<U>(
+    shared: &Arc<UpstreamShared>,
+    destination: &str,
+    mut client: TcpStream,
+    mut upstream: U,
+) where
+    U: AsyncRead + AsyncWrite + Unpin,
+{
+    match tokio::io::copy_bidirectional(&mut client, &mut upstream).await {
+        Ok((to_upstream, to_client)) => {
+            net_metrics::bytes("egress", to_upstream);
+            net_metrics::bytes("ingress", to_client);
+            debug!(
+                service = %shared.service,
+                endpoint = %destination,
+                to_upstream,
+                to_client,
+                "Upstream connection closed"
+            )
+        }
+        Err(err) => debug!(
+            service = %shared.service,
+            endpoint = %destination,
+            error = ?err,
+            "Upstream connection ended with an error"
+        ),
+    }
 }
 
 /// Keeps one endpoint's in-flight count accurate for the lifetime of a
@@ -514,6 +799,7 @@ mod tests {
             service: "db".into(),
             local_port: port,
             balance: balance.into(),
+            to: None,
         }
     }
 

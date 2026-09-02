@@ -35,6 +35,7 @@ import Manager from './pages/Manager'
 import Nodes from './pages/Nodes'
 import Rollouts from './pages/Rollouts'
 import Services from './pages/Services'
+import Network from './pages/Network'
 import Volumes from './pages/Volumes'
 import ApiExplorer from './pages/ApiExplorer'
 import Observability from './pages/Observability'
@@ -199,6 +200,7 @@ const Layout = (props: RouteSectionProps) => {
           { kind: 'item', label: 'Jobs', path: '/jobs', title: 'Jobs', copy: 'Every job on the cluster and its health.', icon: 'layers' },
           { kind: 'item', label: 'Templates', path: '/templates', title: 'Templates', copy: 'Reusable job templates with guided parameters.', icon: 'layoutTemplate' },
           { kind: 'item', label: 'Services', path: '/services', title: 'Services', copy: 'Discoverable endpoints and their health.', icon: 'radio' },
+          { kind: 'item', label: 'Network', path: '/network', title: 'Network', copy: 'Egress and ingress policy, upstreams, and handlers.', icon: 'shieldCheck' },
           { kind: 'item', label: 'Rollouts', path: '/rollouts', title: 'Rollouts', copy: 'Version rollouts and their progress.', icon: 'rocket' },
           { kind: 'item', label: 'Volumes', path: '/volumes', title: 'Volumes', copy: 'Persistent storage behind stateful tasks.', icon: 'hardDrive' },
         ],
@@ -893,6 +895,7 @@ const AppRoutes = () => {
       <Route path="/jobs/:id/specs/:configId" component={JobSpecDetail} />
       <Route path="/services" component={Services} />
       <Route path="/services/:name" component={ServiceDetail} />
+      <Route path="/network" component={Network} />
       <Route path="/volumes" component={Volumes} />
       <Route path="/volumes/:id" component={VolumeDetail} />
       <Route path="/deployments" component={() => <Navigate href="/rollouts" />} />

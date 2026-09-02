@@ -1498,6 +1498,17 @@ pub struct WorkerMetrics {
     pub simulated_nodes_target: Arc<Gauge>,
     /// `legion_worker_simulated_registrations_total{outcome}`
     pub simulated_registrations_total: Arc<CounterVec>,
+    /// `legion_net_conns_total{direction,protocol,verdict}` — connections the
+    /// node datapath decided (docs/network-handlers.md). Bounded labels only:
+    /// attribution (job, labels, destination) goes on events and the access
+    /// log, never here.
+    pub net_conns_total: Arc<CounterVec>,
+    /// `legion_net_denied_total{direction}` — connections and requests denied
+    /// by policy.
+    pub net_denied_total: Arc<CounterVec>,
+    /// `legion_net_bytes_total{direction}` — bytes forwarded through the
+    /// datapath (`egress` = task to destination, `ingress` = peer to task).
+    pub net_bytes_total: Arc<CounterVec>,
     families: Vec<Arc<dyn RenderMetric>>,
 }
 
@@ -1608,9 +1619,37 @@ impl WorkerMetrics {
             series: Series::new(),
         });
 
+        let net_conns_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_net_conns_total",
+                help: "Connections decided by the node datapath, by direction (egress|ingress), protocol (tcp|http|dns), and verdict (allow|deny|error).",
+                labels: &["direction", "protocol", "verdict"],
+            },
+            series: Series::new(),
+        });
+        let net_denied_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_net_denied_total",
+                help: "Connections and requests denied by network policy, by direction. Which rule, which destination, and for whom are on the net_denied event, not here.",
+                labels: &["direction"],
+            },
+            series: Series::new(),
+        });
+        let net_bytes_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_net_bytes_total",
+                help: "Bytes forwarded through the node datapath, by direction.",
+                labels: &["direction"],
+            },
+            series: Series::new(),
+        });
+
         let families: Vec<Arc<dyn RenderMetric>> = vec![
             Arc::clone(&allocation_failures_reported_total) as Arc<dyn RenderMetric>,
             Arc::clone(&allocations_running) as Arc<dyn RenderMetric>,
+            Arc::clone(&net_bytes_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&net_conns_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&net_denied_total) as Arc<dyn RenderMetric>,
             Arc::clone(&heartbeat_duration_seconds) as Arc<dyn RenderMetric>,
             Arc::clone(&heartbeats_total) as Arc<dyn RenderMetric>,
             Arc::clone(&provisional_active) as Arc<dyn RenderMetric>,
@@ -1636,6 +1675,9 @@ impl WorkerMetrics {
             simulated_nodes,
             simulated_nodes_target,
             simulated_registrations_total,
+            net_conns_total,
+            net_denied_total,
+            net_bytes_total,
             families,
         }
     }

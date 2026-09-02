@@ -51,6 +51,13 @@ pub enum AclResource {
     /// authorize individual starts without holding `job:write`, which means
     /// "redeploy the fleet". Scope with the job-name selector.
     Boot,
+    /// Network policy objects (`legion net policy`, docs/network-handlers.md):
+    /// `write` applies and deletes stored policies, `read` lists them and
+    /// shows/tests a job's effective policy. Separate from `job` so a pool's
+    /// or namespace's admin can set posture without cluster-wide `job:write`;
+    /// scope with the `pools` / `namespaces` selectors, which match a
+    /// policy's own selector.
+    Net,
 }
 
 impl AclResource {
@@ -67,13 +74,14 @@ impl AclResource {
             AclResource::Template => "template",
             AclResource::Scale => "scale",
             AclResource::Boot => "boot",
+            AclResource::Net => "net",
         }
     }
 
     pub fn all() -> &'static [&'static str] {
         &[
             "job", "node", "kv", "state", "operator", "acl", "exec", "action", "template", "scale",
-            "boot",
+            "boot", "net",
         ]
     }
 }

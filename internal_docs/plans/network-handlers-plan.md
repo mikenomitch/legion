@@ -2,7 +2,14 @@
 
 > **Judgement calls:** [`calls/network-handlers-plan_calls.md`](../calls/network-handlers-plan_calls.md)
 
-> **Status: PLANNED — no code written.** Revision 2. The first revision was
+> **Unified into [service-mesh-plan.md](service-mesh-plan.md), which
+> sequences this plan's phases with the mesh and wins where the two differ.**
+> The one difference: `network.capture` here is `network.mode = "gated"`
+> there (the pre-carved datapath selector), and `proxyEnv` is what
+> `mode = "host"` does when a policy is attached. Everything else in §7 is the
+> detailed design the unified plan points at.
+>
+> **Status: IN EXECUTION (as phases of the unified plan).** Revision 2. The first revision was
 > reviewed against the codebase, against a measured L4-vs-L7 cost study
 > (§2), and against the follow-up questions "how do I get this on every task
 > without writing it in every job" and "does posture scope to a pool or a

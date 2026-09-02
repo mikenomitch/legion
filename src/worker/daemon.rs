@@ -325,7 +325,14 @@ async fn run_worker_with_manager(
     // Node-local connect datapath. It owns no state of its own: every
     // heartbeat reply tells it which loopback listeners to run and where each
     // one may send traffic. Idle (and free) until a task declares upstreams.
-    let forwarder = Arc::new(UpstreamForwarder::new());
+    // The connect datapath, with the policy cache and denial ledger the
+    // heartbeat loop feeds and drains (docs/network-handlers.md).
+    let forwarder = Arc::new(UpstreamForwarder::with_context(Arc::new(
+        crate::worker::forwarder::ForwarderContext::new(
+            Arc::new(crate::worker::netd::NetPolicyCache::new()),
+            Arc::new(crate::worker::netd::Denials::new()),
+        ),
+    )));
     let heartbeat_fut = start_heartbeats(
         name.clone(),
         client.clone(),
@@ -819,7 +826,17 @@ async fn heartbeat_tick(
         // operator looking at capacity must still see it.
         let provisional_claims = crate::worker::edge::claim_reports(task_manager);
 
+        // Denials the datapath recorded since the last beat. Put back on a
+        // failed heartbeat, like every other report on this request.
+        let net_denials = forwarder
+            .context()
+            .denials()
+            .map(|denials| denials.drain())
+            .unwrap_or_default();
+        let net_denials_for_redrive = net_denials.clone();
+
         let req = credentials.attach(tonic::Request::new(HeartbeatRequest {
+            net_denials,
             id: name.to_string(),
             provisional_claims,
             allocation_ids: allocations,
@@ -855,6 +872,9 @@ async fn heartbeat_tick(
                 // dead connection would leave the manager re-dispatching a
                 // reclaim forever.
                 manager.requeue_volume_reports(volume_reports_for_redrive);
+                if let Some(denials) = forwarder.context().denials() {
+                    denials.restore(net_denials_for_redrive);
+                }
                 return Err(err.into());
             }
         };
@@ -911,6 +931,9 @@ async fn heartbeat_tick(
         // The manager acknowledged us, so this reply is authoritative for the
         // connect datapath (see `apply_upstreams` on fail-static semantics).
         apply_upstreams(forwarder, &reply).await;
+        // Same authority for network policy: assignments from this reply,
+        // bodies fetched by hash, last known good kept on any failure.
+        apply_net_policies(forwarder, &mut client_clone, credentials, name, &reply).await;
         // Allocations whose launch was dispatched this tick. Their refresh
         // loops are spawned before the (async, unawaited) launch registers
         // them in the task manager, so they must be treated as live by the
@@ -1083,6 +1106,57 @@ async fn apply_upstreams(forwarder: &UpstreamForwarder, reply: &HeartbeatReply) 
     }
 }
 
+/// Apply the reply's network-policy assignments to the datapath's cache and
+/// fetch any body the node has not seen. Fail-static: a fetch that fails
+/// leaves the allocation on whatever policy it had (or none, in which case a
+/// gated allocation stays closed until a later heartbeat succeeds).
+async fn apply_net_policies(
+    forwarder: &UpstreamForwarder,
+    client: &mut ManagerClient<Channel>,
+    credentials: &Arc<WorkerCredentials>,
+    node_id: &str,
+    reply: &HeartbeatReply,
+) {
+    let Some(cache) = forwarder.context().cache() else {
+        return;
+    };
+    cache.set_identities(crate::worker::netd::policy::identities_from_desired(
+        &reply.desired_allocations,
+    ));
+    let missing = cache.apply_assignments(&reply.net_policies);
+    for hash in missing {
+        let request =
+            credentials.attach(tonic::Request::new(crate::structs::FetchNetPolicyRequest {
+                node_id: node_id.to_string(),
+                hash: hash.clone(),
+            }));
+        match client.fetch_net_policy(request).await {
+            Ok(response) => {
+                let body = response.into_inner().effective_json;
+                match serde_json::from_str::<crate::structs::netpolicy::EffectivePolicy>(&body) {
+                    Ok(policy) => {
+                        if let Err(err) = cache.insert_body(&hash, policy) {
+                            warn!(hash = %hash, error = ?err, "Rejected network policy body");
+                        } else {
+                            debug!(hash = %hash, "Fetched network policy body");
+                        }
+                    }
+                    Err(err) => {
+                        warn!(hash = %hash, error = ?err, "Invalid network policy body from manager");
+                    }
+                }
+            }
+            Err(err) => {
+                warn!(
+                    hash = %hash,
+                    error = ?err,
+                    "Failed to fetch network policy body; keeping last known good"
+                );
+            }
+        }
+    }
+}
+
 /// Derive the listeners a desired allocation set implies: one per upstream of
 /// every allocation whose task declares a `connect` block.
 ///
@@ -1115,6 +1189,7 @@ fn upstream_specs(desired: &[TaskAllocation]) -> Vec<UpstreamSpec> {
                 service: upstream.service.clone(),
                 local_port: upstream.local_port,
                 balance: upstream.balance.clone(),
+                to: upstream.to.clone(),
             });
         }
     }
@@ -1458,6 +1533,7 @@ mod tests {
                 service: "db".into(),
                 local_port: 20003,
                 balance: "least_conn".into(),
+                to: None,
             }]
         );
     }
@@ -1538,6 +1614,7 @@ mod tests {
         };
         let forwarder = UpstreamForwarder::new();
         let reply = HeartbeatReply {
+            net_policies: Vec::new(),
             claim_verdicts: Vec::new(),
             next_interval_seconds: None,
             message: "ack".into(),
@@ -1565,6 +1642,7 @@ mod tests {
                 service: "db".into(),
                 local_port,
                 balance: "least_conn".into(),
+                to: None,
             }]
         );
         // The listener is live on the loopback port the task will dial.

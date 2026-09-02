@@ -40,6 +40,15 @@ time = "0.3.30"
 tokio = { version = "1.0", features = ["macros", "rt-multi-thread", "full"] }
 tokio-stream = "0.1"
 tonic = { version = "0.12.3", features = ["tls"] }
+# The datapath's TLS: originating TLS to external upstreams and terminating
+# it on ingress (docs/network-handlers.md). Same rustls + ring the tonic
+# `tls` feature already pulls in, pinned to `ring` so no second crypto
+# provider enters the build.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+rustls-pki-types = "1"
+rustls-pemfile = "2"
+webpki-roots = "1"
 tonic-web = "0.12.3"
 tower-http = { version = "0.5.2", features = ["cors"] }
 tower = "0.4"
@@ -99,8 +108,8 @@ portable-pty = "0.8.1"
 # does not enable HTTP upgrades, so exec-over-WS needs its own hyper listener).
 tokio-tungstenite = "0.24"
 hyper-tungstenite = "0.15"
-hyper = { version = "1", features = ["server", "http1"] }
-hyper-util = { version = "0.1", features = ["tokio", "server"] }
+hyper = { version = "1", features = ["server", "client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "server", "client-legacy", "http1"] }
 # CLI interactive terminal: raw mode + window size for `legion exec -it`.
 crossterm = "0.28"
 

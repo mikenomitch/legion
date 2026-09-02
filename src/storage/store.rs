@@ -22246,6 +22246,9 @@ mod tests {
         let static_port_task = |name: &str| {
             let mut task = task(name);
             task.network = Some(crate::structs::network::NetworkConfig {
+                labels: Default::default(),
+                egress: None,
+                ingress: None,
                 mode: "host".into(),
                 ports: vec![crate::structs::network::PortConfig {
                     name: "http".into(),
@@ -22344,6 +22347,9 @@ mod tests {
 
         let mut port_task = task("task");
         port_task.network = Some(crate::structs::network::NetworkConfig {
+            labels: Default::default(),
+            egress: None,
+            ingress: None,
             mode: "host".into(),
             ports: vec![crate::structs::network::PortConfig {
                 name: "http".into(),

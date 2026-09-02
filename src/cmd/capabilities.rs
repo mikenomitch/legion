@@ -660,6 +660,59 @@ pub fn catalog() -> Vec<Capability> {
             read_only_safe: true,
         },
         Capability {
+            name: "net.policy.apply",
+            cli: "legion net policy apply -f <FILE> [--dry-run]",
+            grpc: Some("Manager/UpsertNetPolicy"),
+            summary: "Create or replace a network policy object (selector-scoped egress/ingress \
+                 rules and handlers); --dry-run validates and lists affected allocations \
+                 without writing.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "net.policy.list",
+            cli: "legion net policy list",
+            grpc: Some("Manager/ListNetPolicies"),
+            summary: "List stored network policies in merge order (require first, then priority).",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "net.policy.describe",
+            cli: "legion net policy describe <NAME>",
+            grpc: Some("Manager/GetNetPolicyObject"),
+            summary: "Fetch one stored network policy object.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "net.policy.delete",
+            cli: "legion net policy delete <NAME>",
+            grpc: Some("Manager/DeleteNetPolicy"),
+            summary: "Delete a stored network policy; matching allocations lose it on their next \
+                 heartbeat.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "net.policy.show",
+            cli: "legion net policy show <JOB> [--task <TASK>] [--pool <POOL>]",
+            grpc: Some("Manager/ShowNetPolicy"),
+            summary: "Show a task's effective network policy: every matching stored policy merged \
+                 with the task's own block, each rule naming its source.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "net.policy.test",
+            cli: "legion net policy test <JOB> --to <DEST> | --from <PEER> [--method M --path P]",
+            grpc: Some("Manager/TestNetPolicy"),
+            summary: "Dry-run a verdict: would this task be allowed to reach a destination (or be \
+                 reached from a peer)? Names the deciding rule; sends nothing.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
             name: "service.doctor",
             cli: "legion service doctor <SERVICE>",
             grpc: None,

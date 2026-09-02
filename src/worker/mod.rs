@@ -9,6 +9,7 @@ pub mod forwarder;
 pub mod identity;
 pub mod log_sink;
 pub mod logs;
+pub mod netd;
 pub mod node_check;
 pub mod resources;
 pub mod server;

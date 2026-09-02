@@ -16,6 +16,7 @@ pub mod kv;
 pub mod ledger;
 pub mod login;
 pub mod mcp;
+pub mod net;
 pub mod node;
 pub mod oidc;
 pub mod output;

@@ -2688,6 +2688,7 @@ mod tests {
 
     fn provisional_payload(local_key: i64) -> TaskAllocation {
         TaskAllocation {
+            task_network: String::new(),
             allocation_id: local_key,
             job_id: "agent-sandboxes".into(),
             job_config_id: "jc-1".into(),
@@ -3662,11 +3663,13 @@ mod tests {
                         service: "db".into(),
                         local_port: 20003,
                         balance: "round_robin".into(),
+                        to: None,
                     },
                     crate::structs::AllocUpstream {
                         service: "cache".into(),
                         local_port: 6379,
                         balance: "least_conn".into(),
+                        to: None,
                     },
                 ],
             }),

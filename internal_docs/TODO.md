@@ -1289,7 +1289,7 @@ All deferred from the volume plan v1:
 
 ## Service discovery & the mesh
 
-Plan: [service-discovery-final-plan.md](plans/service-discovery-final-plan.md) · docs: [service-discovery.md](../docs/service-discovery.md)
+Plans: [service-mesh-plan.md](plans/service-mesh-plan.md) (**authoritative for the mesh**, in execution), [service-discovery-final-plan.md](plans/service-discovery-final-plan.md) (v1, shipped) · docs: [service-discovery.md](../docs/service-discovery.md)
 
 v1 (catalog, ports, env, `list`/`resolve`/`doctor`) shipped, and so has the
 connect layer: `connect.upstreams`, the per-node L4 forwarder, pluggable
@@ -1327,11 +1327,18 @@ Plan phases (revision 2), in order. Three concepts — policy objects, `gated`
 capture, handlers — plus `legion netd` as the process that outlives the
 worker:
 
-- [ ] Phase 0 — policy + datapath core: `netpolicy` types and the
-      deterministic merge, `net_policy` table + RPCs + `legion net policy
-      apply/list/show/test`, connect-time rules ahead of `splice` in the
-      forwarder, external upstreams with `tls = "originate"`, first metrics on
-      the datapath
+- [x] Phase 0 / M1 — policy + datapath core (2026-09-02): `netpolicy` types
+      and the deterministic merge with provenance, `net_policy` table + the
+      seven RPCs + `AclResource::Net`, `legion net policy
+      apply/list/describe/delete/show/test` (+ capabilities + MCP tools),
+      connect-time rules evaluated in the forwarder before any dial, external
+      upstreams (`name` + `to`, TLS originated for `tls://`/`https://`),
+      content-addressed policy delivery on the heartbeat with a fail-static
+      node cache, `net.denied` / `net.policy_*` events, the three
+      `legion_net_*` metric families, `docs/network-handlers.md`,
+      `configs/policies/sandbox-egress.ncl`, `configs/jobs/sandbox-egress-demo.ncl`.
+      Still open inside M1: the UI (Network page, task/service detail
+      sections) and the `accessLog` writer (lands with HTTP mode).
 - [ ] Phase 1 — HTTP/1.1 mode: path/method/header rules, structured 403s an
       agent can read, built-in `dlp` with a byte cap (h2/h3 rejected at
       submit, deliberately)

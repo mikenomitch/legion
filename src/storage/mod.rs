@@ -5,6 +5,7 @@ pub mod errors;
 pub mod events;
 pub mod liveness;
 pub mod migrations;
+pub mod netpolicy_store;
 pub mod persistence;
 pub mod queries;
 pub mod raft;
