@@ -68,8 +68,10 @@ Worker startup (`run_worker`) flow:
    heartbeat the worker re-registers with its join secret automatically).
 9. Enter steady-state loops:
    - Heartbeats every `heartbeatSeconds` (worker-type config; default 2s,
-     clamped to 1–30s), with ±10% jitter per beat so a fleet that
-     (re)started together does not stay phase-locked.
+     clamped to 1–300s), with ±10% jitter per beat so a fleet that
+     (re)started together does not stay phase-locked. A manager running
+     adaptive cadence can serve a different interval on the heartbeat reply
+     ([heartbeat-cadence-and-scale.md](heartbeat-cadence-and-scale.md)).
    - Node checks every `WORKER_NODE_CHECK_DURATION_SEC` (default 30s).
 
 ### Heartbeat cadence and scale
@@ -77,27 +79,34 @@ Worker startup (`run_worker`) flow:
 The heartbeat interval is the manager-load knob for large fleets: 10k
 workers at the default 2s cadence is 5,000 heartbeat RPCs/second.
 
-- **`heartbeatSeconds`** in a worker-type config raises the cadence
-  fleet-wide (served to workers at pre-registration; a worker talking to
-  an older manager keeps the 2s default). The manager marks a node lost
-  after 10 seconds without a heartbeat, so intervals above ~3s leave
-  fewer than three missed beats of detection margin — the manager logs a
-  warning when loading such a config.
-- **Manager-side group commit**: concurrent heartbeats coalesce into one
-  status-lane store commit (one raft consensus round for the whole
-  batch, up to 128 heartbeats), so heartbeat cost scales with commit
-  rate, not worker count. Semantics per worker are unchanged — each RPC
-  still succeeds only when its heartbeat is durably recorded, and a
-  heartbeat from an unregistered node still errors.
-- **Cheap liveness ticks**: the manager's mark-lost scan compares an
-  integer heartbeat clock (`node_health.last_heartbeat_unix`) against
-  one cutoff — no per-node timestamp parsing — and a bare timestamp
-  refresh of an already-active node skips the scheduler read-model
-  update entirely (status transitions never skip it).
+- **`heartbeatSeconds`** in a worker-type config sets that worker type's
+  cadence (served to workers at pre-registration). The lost-node window
+  MOVES WITH IT: a node is lost after `missedBeatsBeforeLost` (5) missed
+  beats, so `5 x 2s` is the historical fixed 10s and a 60s batch pool gets a
+  300s window without touching the 2s pool's. That is what makes the knob
+  usable — under the old fixed 10s window, anything above ~3s traded
+  detection margin for load.
+- **A steady-state heartbeat costs no raft commit and no fsync.** It is one
+  write into the in-memory liveness table on the manager that owns node
+  status; only status TRANSITIONS are replicated. A manager that does not
+  own liveness reports what it heard in one digest RPC per second, whatever
+  the fleet size. See [node-liveness.md](node-liveness.md).
+- **Group commit still exists** for the paths that do commit — the display
+  checkpoint, and the mixed-version fallback during a manager upgrade:
+  concurrent writes coalesce into one status-lane commit (one raft round for
+  up to 128 nodes).
+- **Cheap liveness ticks**: the mark-lost scan compares monotonic ages held
+  in memory against each node's own window — no per-node timestamp parsing
+  and no database read of the heartbeat clock at all.
+- **One number says whether the fleet is keeping up**:
+  `legion_heartbeat_freshness_ratio`, or `legion node cadence`.
 
 Measured throughput per backend and fleet size lives in
 `benchmarks/scheduler/README.md`
 ([testing-and-benchmarks.md](testing-and-benchmarks.md) has the runner).
+Sizing a control plane for a fleet — the `R x I` formula, the table, and the
+measurement recipe — is in
+[heartbeat-cadence-and-scale.md](heartbeat-cadence-and-scale.md).
 
 ## Manager <-> Worker Communication
 
@@ -135,12 +144,18 @@ Two code paths exist:
 - Operational path (used in runtime):
   - Manager node checker marks stale-heartbeat nodes as lost.
   - Lost-node allocations are removed and reconciled immediately via store functions.
-  - Startup heartbeat grace: heartbeats can only refresh while the manager is
-    up, so after a manager restart every persisted heartbeat looks stale. The
-    checker therefore marks no node lost until the manager itself has been up
-    for a full lost-node window, giving reconnecting workers time to
-    re-heartbeat — a manager outage/restart never deschedules (and thus never
-    kills) tasks on healthy workers.
+  - Failover grace: liveness lives in the memory of the manager that owns
+    node status, so a manager that has just BECOME responsible for it — at
+    process start, or by acquiring status-lane leadership mid-life — inherits
+    nothing. It seeds every active node at `now` and marks nothing lost for
+    `liveness.failoverGrace` (60s), giving reconnecting workers time to
+    check in. A manager restart, an election, or a rolling upgrade therefore
+    never deschedules (and thus never kills) tasks on healthy workers.
+    Keying this on responsibility rather than on process uptime is what makes
+    the election case safe; see [node-liveness.md](node-liveness.md).
+  - Mass-disruption circuit breaker: if more than half the active fleet would
+    be marked lost in a single tick, none of them are, and the manager logs at
+    `error`. A control plane does not lose half its fleet in one tick.
 - Eval path (used in tests/manual eval insertion):
   - `node_drop` / `node_join` eval kinds call equivalent store reconciliation logic.
 

@@ -43,13 +43,18 @@ log() { echo "[smoke $(date -u +%H:%M:%S)] $*" >&2; }
 log "1/3 driver + translator fixture tests"
 python3 -m unittest discover "$AWS_BENCH_ROOT/driver/tests" -v 2>&1 | tail -3
 
+# `--features loadgen` builds the native submitter (benchmarks/loadgen)
+# alongside the CLI. It is feature-gated so ordinary `cargo build`s do not link
+# a second binary, and the smoke test is where its wiring gets exercised: the
+# driver run below asserts the cell went through it.
 log "building legion ($PROFILE, with plugins — the manager validates the noop runtime against its dylib)"
 if [ "$PROFILE" = release ]; then
-    (cd "$REPO_ROOT" && LEGION_BUILD_PLUGINS=1 cargo build --release)
+    (cd "$REPO_ROOT" && LEGION_BUILD_PLUGINS=1 cargo build --release --features loadgen)
 else
-    (cd "$REPO_ROOT" && LEGION_BUILD_PLUGINS=1 cargo build)
+    (cd "$REPO_ROOT" && LEGION_BUILD_PLUGINS=1 cargo build --features loadgen)
 fi
 LEGION="$REPO_ROOT/target/$PROFILE/legion"
+LOADGEN="$REPO_ROOT/target/$PROFILE/legion-loadgen"
 
 WORK=$(mktemp -d -t legion-smoke-XXXXXX)
 MANAGER_PID="" SIM_PID=""
@@ -63,18 +68,18 @@ trap cleanup EXIT
 
 log "2/3 local manager + $NODES-node simulated fleet"
 mkdir -p "$WORK/manager"
-cat >"$WORK/manager/config.jsonnet" <<EOF
+cat >"$WORK/manager/config.ncl" <<EOF
 {
-  storePath: '$WORK/manager/store',
-  workerConfigPath: '$REPO_ROOT/configs/workers/',
-  // Same benchmark defaults as the scenario runner: noop tasks with no
-  // declared resources must fit anywhere.
-  taskResourceDefaults: { cpu: 0, memory: 0, allocations: 1000 },
+  storePath = "$WORK/manager/store",
+  workerConfigPath = "$REPO_ROOT/configs/workers/",
+  # Same benchmark defaults as the scenario runner: noop tasks with no
+  # declared resources must fit anywhere.
+  taskResourceDefaults = { cpu = 0, memory = 0, allocations = 1000 },
 }
 EOF
 # exec so $! is the manager itself, not a wrapper subshell — cleanup
 # must kill the real process or failed runs leak a manager on :4747.
-(cd "$WORK/manager" && exec "$LEGION" start manager -c config.jsonnet) >"$WORK/manager.log" 2>&1 &
+(cd "$WORK/manager" && exec "$LEGION" start manager -c config.ncl) >"$WORK/manager.log" 2>&1 &
 MANAGER_PID=$!
 export LEGION_ADDR="http://127.0.0.1:4747"
 
@@ -130,12 +135,18 @@ python3 "$AWS_BENCH_ROOT/workloads/translate.py" \
     --count-multiplier "$MULTIPLIER" \
     --out "$WORK/workload"
 
+# --submitter native, not auto: this is the gate that proves the native
+# submitter is wired up end to end (built, found, invoked, timestamps rebased
+# onto the driver's clock). `auto` would silently fall back to the CLI loop and
+# the smoke test would still pass with the path it exists to cover untested.
 python3 "$AWS_BENCH_ROOT/driver/driver.py" run \
     --system legion \
     --workload-dir "$WORK/workload" \
     --out "$WORK/run" \
     --manager "$LEGION_ADDR" \
     --legion-bin "$LEGION" \
+    --legion-loadgen-bin "$LOADGEN" \
+    --submitter native \
     --warmup-secs 0 \
     --settle-timeout-secs 120 |
     tee "$WORK/metrics.json"
@@ -145,4 +156,21 @@ COMPLETE=$(jq -r .complete "$WORK/metrics.json")
     echo "driver reported an incomplete run" >&2
     exit 1
 }
-log "smoke PASSED: $(jq -r '"\(.placed_total)/\(.expected_total) placed, \(.throughput_per_sec)/s, p95 \(.p95_ms)ms"' "$WORK/metrics.json")"
+SUBMITTER=$(jq -r .submitter "$WORK/metrics.json")
+[ "$SUBMITTER" = native ] || {
+    echo "cell was submitted via '$SUBMITTER', not the native submitter" >&2
+    exit 1
+}
+# Submit stamps must be on the same clock as the placement events, or every
+# latency in the cell is nonsense. They come from a different process, rebased
+# by --clock-offset-ms, so this is the assertion that keeps that arithmetic
+# honest: a submit that appears AFTER the placement it caused means the rebase
+# is wrong (a raw epoch stamp would be ~55 years in the future here, which is
+# obvious; a sign error would be obvious the other way).
+jq -e '.p50_ms >= 0 and .p99_ms < 3600000 and .latency_samples > 0' \
+    "$WORK/metrics.json" >/dev/null || {
+    echo "implausible latencies — the submitter's clock rebase is wrong:" >&2
+    jq '{p50_ms, p95_ms, p99_ms, latency_samples}' "$WORK/metrics.json" >&2
+    exit 1
+}
+log "smoke PASSED: $(jq -r '"\(.placed_total)/\(.expected_total) placed, \(.throughput_per_sec)/s, p95 \(.p95_ms)ms, submitter \(.submitter), submitted \(.submission.rate_per_sec) jobs/s"' "$WORK/metrics.json")"

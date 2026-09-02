@@ -4,8 +4,8 @@
 One scenario file (benchmarks/scheduler/scenarios/*.json — the schema in
 tests/benchmark_support/mod.rs) becomes:
 
-  legion : one JSON jobspec per job (JSON is valid jsonnet; submitted
-           with `legion job run <file>`)
+  legion : one Nickel jobspec per job (.ncl, submitted with
+           `legion job run <file>`)
   nomad  : one .nomad.hcl job per job (mock driver — nodesim fleets
            advertise it, so placements stay pure-scheduler)
   k8s    : one Deployment manifest per (job, task) as JSON (YAML is a
@@ -83,6 +83,33 @@ def expected_allocations(job_type):
     return job_type["tasks_per_job"] * job_type["task_count_per_task"]
 
 
+def total_expected(scenario, multiplier):
+    """Allocations this scenario yields at `multiplier`, without writing files."""
+    return sum(expected_allocations(jt) for _, jt, _ in iter_jobs(scenario, multiplier))
+
+
+def multiplier_for_target(scenario, target):
+    """The multiplier that lands this scenario near `target` allocations.
+
+    The scenarios were sized for the local micro-benchmarks, where a few
+    dozen nodes make 180-380 allocations a real workload. On the AWS rig
+    they are not: the plan asks for 5-50k allocations across the scale
+    steps, and 180 of them place in under a second — inside the driver's
+    warmup, so the cell reports a throughput of zero and no latency
+    samples at all. Expressing the size as a target rather than a
+    multiplier keeps the three scenarios comparable, since their bases
+    differ (180 / 304 / 380) and one flat multiplier would scatter them.
+
+    Linear because `multiplier` scales job COUNT and each job contributes
+    a fixed allocation count, so total is proportional up to the per-type
+    ceil() in scaled_count().
+    """
+    base = total_expected(scenario, 1.0)
+    if base <= 0:
+        return 1.0
+    return max(0.25, target / base)
+
+
 # --- Legion -----------------------------------------------------------
 
 
@@ -104,6 +131,48 @@ def legion_jobspec(job_name, job_type):
             task["constraints"] = job_type["constraints"]
         tasks.append(task)
     return {"name": job_name, "tasks": tasks}
+
+
+# Nickel keywords that cannot appear as bare record field names.
+NICKEL_KEYWORDS = {
+    "if", "then", "else", "forall", "in", "let", "rec", "match", "null",
+    "true", "false", "fun", "import", "merge", "default", "doc", "optional",
+    "priority", "force", "not_exported",
+}
+
+
+def nickel(value, indent=0):
+    """Render a JSON-shaped Python value as Nickel source.
+
+    JSON is not a subset of Nickel — records use `=` rather than `:` — so
+    the jobspecs are emitted rather than dumped.
+    """
+    pad = "  " * indent
+    inner = "  " * (indent + 1)
+    if isinstance(value, dict):
+        if not value:
+            return "{}"
+        fields = []
+        for key, item in value.items():
+            name = (
+                key
+                if key.isidentifier() and key not in NICKEL_KEYWORDS
+                else json.dumps(key)
+            )
+            fields.append(f"{inner}{name} = {nickel(item, indent + 1)},")
+        return "{\n" + "\n".join(fields) + f"\n{pad}}}"
+    if isinstance(value, list):
+        if not value:
+            return "[]"
+        items = [f"{inner}{nickel(item, indent + 1)}," for item in value]
+        return "[\n" + "\n".join(items) + f"\n{pad}]"
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return repr(value)
+    return json.dumps(value)
 
 
 # --- Nomad ------------------------------------------------------------
@@ -207,7 +276,7 @@ def k8s_deployment(job_name, job_type, task_idx):
 # --- Driver manifest --------------------------------------------------
 
 
-def translate(scenario, system, out_dir, multiplier):
+def translate(scenario, system, out_dir, multiplier, jobspec_format="json"):
     os.makedirs(out_dir, exist_ok=True)
     manifest = {
         "scenario": scenario.get("name"),
@@ -219,9 +288,28 @@ def translate(scenario, system, out_dir, multiplier):
     for job_name, job_type, _idx in iter_jobs(scenario, multiplier):
         expected = expected_allocations(job_type)
         if system == "legion":
-            filename = f"{job_name}.jsonnet"
+            # Pre-rendered JSON, not Nickel, unless asked for.
+            #
+            # `legion job run` accepts either, but a .ncl path makes every
+            # submit evaluate Nickel inside the CLI process. Submission is
+            # one CLI process per job and it is the rig's throughput
+            # ceiling (phase 4: ~36 jobs/sec, which the cells then reported
+            # as Legion's rate), so that evaluation is paid 4,167 times per
+            # cell for a spec that never changes.
+            #
+            # It is also a fairness problem: the Nomad and K8s adapters
+            # both submit pre-rendered artifacts, so only Legion was being
+            # charged for rendering inside the measured path. `nickel`
+            # stays reachable through --jobspec-format ncl, which is the
+            # surface a real user types.
+            if jobspec_format == "ncl":
+                filename = f"{job_name}.ncl"
+                body = nickel(legion_jobspec(job_name, job_type))
+            else:
+                filename = f"{job_name}.json"
+                body = json.dumps(legion_jobspec(job_name, job_type), indent=2)
             with open(os.path.join(out_dir, filename), "w") as f:
-                json.dump(legion_jobspec(job_name, job_type), f, indent=2)
+                f.write(body)
                 f.write("\n")
         elif system == "nomad":
             filename = f"{job_name}.nomad.hcl"
@@ -263,10 +351,33 @@ def main():
         default=1.0,
         help="Scale every job type's job count (allocation scaling per step)",
     )
+    parser.add_argument(
+        "--target-allocations",
+        type=int,
+        default=None,
+        help="Size the workload to about this many allocations, overriding "
+        "--count-multiplier. Preferred for campaign steps: the scenarios' "
+        "own bases differ, so a shared target keeps cells comparable.",
+    )
+    parser.add_argument(
+        "--jobspec-format",
+        choices=["json", "ncl"],
+        default="json",
+        help="Legion jobspec artifact. json (default) is pre-rendered, so a "
+        "submit does not evaluate Nickel inside the CLI process for a spec "
+        "that never changes -- submission is the rig's throughput ceiling, "
+        "and the Nomad and K8s adapters already submit pre-rendered files. "
+        "ncl emits Nickel, which is what a real user writes.",
+    )
     args = parser.parse_args()
 
     scenario = load_scenario(args.scenario)
-    manifest = translate(scenario, args.system, args.out, args.count_multiplier)
+    multiplier = args.count_multiplier
+    if args.target_allocations is not None:
+        multiplier = multiplier_for_target(scenario, args.target_allocations)
+    manifest = translate(
+        scenario, args.system, args.out, multiplier, args.jobspec_format
+    )
     print(
         f"{manifest['scenario']} -> {args.system}: {len(manifest['jobs'])} jobs, "
         f"{manifest['total_expected_allocations']} expected allocations in {args.out}",

@@ -14,7 +14,6 @@ use crate::structs::{
     Submission,
 };
 use crate::task_plugins::{builtin_task_plugin_schemas, validate_job_config};
-use jsonnet::JsonnetVm;
 use serde::Serialize;
 use tabled::Tabled;
 use tempfile::TempDir;
@@ -26,7 +25,7 @@ pub fn config() -> Command {
         .arg(
             Arg::new("path")
                 .value_name("PATH")
-                .help("Path or URL to the job specification to run")
+                .help("Path or URL to the job specification to run (.ncl Nickel, or .json)")
                 .value_hint(ValueHint::AnyPath),
         )
         .arg(priority_arg())
@@ -41,7 +40,7 @@ pub fn config() -> Command {
         .arg(wait_flag())
         .arg(timeout_arg())
         .arg(json_flag())
-        .args(jsonnet_var_args());
+        .args(config_var_args());
 
     let stop_cmd = Command::new("stop")
         .about("Stop a job")
@@ -115,12 +114,12 @@ pub fn config() -> Command {
         .arg(
             Arg::new("path")
                 .value_name("PATH")
-                .help("Path or URL to the job specification to validate")
+                .help("Path or URL to the job specification to validate (.ncl Nickel, or .json)")
                 .required(true)
                 .value_hint(ValueHint::AnyPath),
         )
         .arg(json_flag())
-        .args(jsonnet_var_args());
+        .args(config_var_args());
 
     let schema_cmd = Command::new("schema")
         .about("Emit the JSON Schema for jobspecs and built-in task runtimes")
@@ -152,12 +151,12 @@ pub fn config() -> Command {
         .arg(
             Arg::new("path")
                 .value_name("PATH")
-                .help("Path or URL to the job specification to plan")
+                .help("Path or URL to the job specification to plan (.ncl Nickel, or .json)")
                 .required(true)
                 .value_hint(ValueHint::AnyPath),
         )
         .arg(json_flag())
-        .args(jsonnet_var_args());
+        .args(config_var_args());
 
     let spec_cmd = Command::new("spec")
         .about("Get job spec used to define the job")
@@ -489,14 +488,14 @@ async fn validate_job(arg_matches: &ArgMatches) -> R<()> {
         .get_one::<String>("path")
         .context("missing jobspec path")?;
 
-    // Resolve jsonnet vars. KV-backed vars require the manager; plain vars do
-    // not, so validation stays usable offline for the common case.
-    let vars = jsonnet_vars_from_matches(arg_matches)?;
+    // Resolve configuration vars. KV-backed vars require the manager; plain
+    // vars do not, so validation stays usable offline for the common case.
+    let vars = config_vars_from_matches(arg_matches)?;
     let vars = if kv_keys_from_vars(&vars).is_empty() {
         vars
     } else {
         let mut client = connect_manager_client().await?;
-        resolve_kv_jsonnet_vars_from_manager(&mut client, vars).await?
+        resolve_kv_config_vars_from_manager(&mut client, vars).await?
     };
 
     let resolved = resolve_jobspec_source_async(path).await?;
@@ -540,12 +539,19 @@ async fn validate_job(arg_matches: &ArgMatches) -> R<()> {
         .map(|task| task.group.as_str())
         .collect();
 
+    // Edge boot gate downgrades (docs/edge-boot.md). A task whose declared
+    // `speculativeStart.mode` cannot be honored is capped at `stage` — never
+    // silently, because the symptom otherwise is a speedup that quietly did
+    // not happen.
+    let warnings = speculative_start_warnings(&config);
+
     if format.is_json() {
         output::print_success(&json!({
             "valid": true,
             "job": config.name,
             "tasks": task_count,
             "groups": groups.iter().collect::<Vec<_>>(),
+            "warnings": warnings,
         }));
     } else {
         println!(
@@ -554,9 +560,32 @@ async fn validate_job(arg_matches: &ArgMatches) -> R<()> {
             task_count,
             groups.len()
         );
+        for warning in &warnings {
+            println!("warning: {warning}");
+        }
     }
 
     Ok(())
+}
+
+/// Gate downgrades this jobspec would take at admission, as human-readable
+/// lines. Empty for every job that did not declare `speculativeStart`, and for
+/// every one whose declared gate is honored as written.
+fn speculative_start_warnings(config: &JobConfig) -> Vec<String> {
+    config
+        .tasks
+        .iter()
+        .filter_map(|task| {
+            let declared = task.speculative_start.as_ref()?.resolve().ok()?.mode;
+            let (effective, reason) = crate::manager::dispatcher::effective_gate(task, declared);
+            (effective != declared).then(|| {
+                format!(
+                    "speculativeStart.mode `{declared}` is downgraded to `{effective}`: {}",
+                    reason.unwrap_or_else(|| "an invariant does not permit it".into())
+                )
+            })
+        })
+        .collect()
 }
 
 #[instrument(err, skip_all)]
@@ -583,7 +612,7 @@ pub(crate) fn build_jobspec_schema() -> Value {
     json!({
         "$schema": "http://json-schema.org/draft-07/schema#",
         "title": "Legion Jobspec",
-        "description": "A Legion job specification (the JSON a jsonnet jobspec renders to). \
+        "description": "A Legion job specification (the JSON a Nickel jobspec renders to). \
             A job has a name and one or more tasks (use `task` for a single task or `tasks` for many). \
             Each task's `config` object is validated against the schema for its `runtime` under `taskRuntimes`.",
         "type": "object",
@@ -593,6 +622,12 @@ pub(crate) fn build_jobspec_schema() -> Value {
             "task": { "$ref": "#/$defs/task", "description": "A single task (shorthand for tasks: [task])." },
             "tasks": { "type": "array", "items": { "$ref": "#/$defs/task" }, "description": "List of tasks." },
             "version": { "type": "integer", "description": "Optional jobspec version." },
+            "priority": {
+                "type": "string",
+                "enum": ["critical", "high", "elevated", "normal", "low", "background"],
+                "default": "normal",
+                "description": "Priority band, most important first. Orders the eval queue AND governs preemption: an allocation is only ever displaced by a job in a STRICTLY higher band, never a peer. Choosing a band below `normal` is the consent to be displaced. Claiming a band may require an ACL `bands` grant. See docs/preemption-and-eviction.md."
+            },
             "rollout": { "$ref": "#/$defs/rollout", "description": "Default rollout strategy for the job." },
             "rolloutByGroup": {
                 "type": "object",
@@ -628,7 +663,57 @@ pub(crate) fn build_jobspec_schema() -> Value {
                         }},
                         "description": "Task dependencies that gate start."
                     },
-                    "schedule": { "description": "Batch-only schedule (cron string or {every: duration})." }
+                    "schedule": { "description": "Batch-only schedule (cron string or {every: duration})." },
+                    "stop": {
+                        "type": "object",
+                        "description": "How the platform terminates this task, for every cause (job stop, rollout replacement, drain, reschedule, scale-in, preemption). See docs/graceful-stop.md.",
+                        "properties": {
+                            "signal": {
+                                "type": "string",
+                                "enum": ["SIGTERM", "SIGINT", "SIGQUIT", "SIGHUP", "SIGUSR1", "SIGUSR2"],
+                                "default": "SIGTERM",
+                                "description": "Notice signal, sent to the task's process group. SIGKILL is deliberately not offered: it is the end of the ladder, not a notice."
+                            },
+                            "killAfter": {
+                                "type": "string",
+                                "default": "30s",
+                                "description": "Grace between the signal and SIGKILL, e.g. \"30s\". Capped at 5m — grace may slow a drain, never wedge one."
+                            }
+                        }
+                    },
+                    "disruption": {
+                        "type": "object",
+                        "description": "Floor on how many of this task's allocations VOLUNTARY disruption (preemption) may leave running. Does not bind drain, node loss or job stop. See docs/preemption-and-eviction.md.",
+                        "properties": {
+                            "minAvailable": {
+                                "description": "Absolute count (2) or percent of count (\"50%\", rounded up). Default 0.",
+                                "oneOf": [
+                                    { "type": "integer", "minimum": 0 },
+                                    { "type": "string" }
+                                ]
+                            }
+                        }
+                    },
+                    "speculativeStart": {
+                        "type": "object",
+                        "description": "How far a node may get on a start for this task BEFORE the placement is durable. Absent = off, today's behavior. A task declaring network ports, connect upstreams, or storage whose driver cannot fence a concurrent attach is downgraded to `stage` (reported by `job validate`). See docs/edge-boot.md.",
+                        "properties": {
+                            "mode": {
+                                "type": "string",
+                                "enum": ["off", "stage", "boot", "serve"],
+                                "description": "off (default) = no speculation. stage = fetch artifacts and build the root disk, do not start. boot = also boot, with the network held shut. serve = also open the network; the only mode where a workload that loses its race may already have had externally visible side effects."
+                            },
+                            "ratifyTimeout": {
+                                "type": "string",
+                                "description": "Lease: unratified work is killed at expiry, unconditionally. Default 5s, capped at 2m."
+                            },
+                            "onRefused": {
+                                "type": "string",
+                                "enum": ["kill", "stop"],
+                                "description": "What to do when ratification is refused. kill (default) is a hard destroy; stop runs the normal graceful-stop ladder."
+                            }
+                        }
+                    }
                 }
             },
             "rollout": {
@@ -648,7 +733,11 @@ pub(crate) fn priority_arg() -> Arg {
     Arg::new("priority")
         .long("priority")
         .value_name("PRIORITY")
-        .help("Priority to use for the request (higher runs sooner)")
+        .help(
+            "Eval-queue priority for this request only (higher runs sooner). Overrides the \
+             position implied by the job's `priority` band; it does not change the band, so \
+             it has no effect on preemption",
+        )
         .value_parser(value_parser!(i64))
         .conflicts_with("asap")
 }
@@ -669,61 +758,41 @@ pub(crate) fn priority_from_matches(matches: &ArgMatches) -> Option<i64> {
     }
 }
 
+/// The `--var` family, before KV lookups are resolved.
+///
+/// Every entry ends up as one field of the `vars` record the jobspec is
+/// evaluated with (see `crate::config_lang`). `code` entries carry a Nickel
+/// expression rather than a literal string, so `--var-code count=3` gives a
+/// number and `--var count=3` gives `"3"`.
 #[derive(Default)]
-struct JsonnetVars {
-    ext_vars: Vec<(String, String)>,
-    ext_codes: Vec<(String, String)>,
-    tla_vars: Vec<(String, String)>,
-    tla_codes: Vec<(String, String)>,
-    kv_ext_vars: Vec<(String, String)>,
-    kv_ext_codes: Vec<(String, String)>,
-    kv_tla_vars: Vec<(String, String)>,
-    kv_tla_codes: Vec<(String, String)>,
+struct ConfigVars {
+    strings: Vec<(String, String)>,
+    code: Vec<(String, String)>,
+    kv_strings: Vec<(String, String)>,
+    kv_code: Vec<(String, String)>,
 }
 
-impl JsonnetVars {}
-
-fn jsonnet_var_args() -> Vec<Arg> {
+fn config_var_args() -> Vec<Arg> {
     vec![
         Arg::new("var")
             .long("var")
             .value_name("KEY=VALUE")
-            .help("Set a Jsonnet external string variable (std.extVar)")
+            .help("Set a string field on the jobspec's `vars` record")
             .action(ArgAction::Append),
         Arg::new("kv-var")
             .long("kv-var")
             .value_name("KEY=KV_PATH")
-            .help("Set a Jsonnet external variable from a KV entry (std.extVar)")
+            .help("Set a string field on `vars` from a KV entry")
             .action(ArgAction::Append),
         Arg::new("var-code")
             .long("var-code")
-            .value_name("KEY=CODE")
-            .help("Set a Jsonnet external code variable (std.extVar)")
+            .value_name("KEY=NICKEL")
+            .help("Set a field on `vars` to the value of a Nickel expression")
             .action(ArgAction::Append),
         Arg::new("kv-var-code")
             .long("kv-var-code")
             .value_name("KEY=KV_PATH")
-            .help("Set a Jsonnet external code variable from a KV entry (std.extVar)")
-            .action(ArgAction::Append),
-        Arg::new("arg")
-            .long("arg")
-            .value_name("KEY=VALUE")
-            .help("Set a Jsonnet top-level string argument")
-            .action(ArgAction::Append),
-        Arg::new("kv-arg")
-            .long("kv-arg")
-            .value_name("KEY=KV_PATH")
-            .help("Set a Jsonnet top-level argument from a KV entry")
-            .action(ArgAction::Append),
-        Arg::new("arg-code")
-            .long("arg-code")
-            .value_name("KEY=CODE")
-            .help("Set a Jsonnet top-level code argument")
-            .action(ArgAction::Append),
-        Arg::new("kv-arg-code")
-            .long("kv-arg-code")
-            .value_name("KEY=KV_PATH")
-            .help("Set a Jsonnet top-level code argument from a KV entry")
+            .help("Set a field on `vars` from a KV entry, keeping its JSON type")
             .action(ArgAction::Append),
     ]
 }
@@ -731,12 +800,12 @@ fn jsonnet_var_args() -> Vec<Arg> {
 fn parse_key_value(input: &str) -> R<(String, String)> {
     let (key, value) = input.split_once('=').context("expected KEY=VALUE")?;
     if key.is_empty() {
-        bail!("jsonnet variable key cannot be empty");
+        bail!("configuration variable key cannot be empty");
     }
     Ok((key.to_string(), value.to_string()))
 }
 
-fn collect_jsonnet_vars(
+fn collect_config_vars(
     matches: &ArgMatches,
     flag: &str,
     target: &mut Vec<(String, String)>,
@@ -750,34 +819,32 @@ fn collect_jsonnet_vars(
     Ok(())
 }
 
-fn jsonnet_vars_from_matches(matches: &ArgMatches) -> R<JsonnetVars> {
-    let mut vars = JsonnetVars::default();
+fn config_vars_from_matches(matches: &ArgMatches) -> R<ConfigVars> {
+    let mut vars = ConfigVars::default();
 
-    collect_jsonnet_vars(matches, "var", &mut vars.ext_vars)?;
-    collect_jsonnet_vars(matches, "kv-var", &mut vars.kv_ext_vars)?;
-    collect_jsonnet_vars(matches, "var-code", &mut vars.ext_codes)?;
-    collect_jsonnet_vars(matches, "kv-var-code", &mut vars.kv_ext_codes)?;
-    collect_jsonnet_vars(matches, "arg", &mut vars.tla_vars)?;
-    collect_jsonnet_vars(matches, "kv-arg", &mut vars.kv_tla_vars)?;
-    collect_jsonnet_vars(matches, "arg-code", &mut vars.tla_codes)?;
-    collect_jsonnet_vars(matches, "kv-arg-code", &mut vars.kv_tla_codes)?;
+    collect_config_vars(matches, "var", &mut vars.strings)?;
+    collect_config_vars(matches, "kv-var", &mut vars.kv_strings)?;
+    collect_config_vars(matches, "var-code", &mut vars.code)?;
+    collect_config_vars(matches, "kv-var-code", &mut vars.kv_code)?;
 
     Ok(vars)
 }
 
-fn apply_jsonnet_vars(vm: &mut JsonnetVm, vars: &JsonnetVars) {
-    for (key, value) in &vars.ext_vars {
-        vm.ext_var(key, value);
+/// Evaluates the `--var-code` expressions and assembles the `vars` record.
+///
+/// Later flags win on a repeated key, and code entries are evaluated in the
+/// order they were given so a bad expression names itself in the error.
+fn build_vars(vars: &ConfigVars) -> R<Map<String, Value>> {
+    let mut resolved = Map::new();
+    for (key, value) in &vars.strings {
+        resolved.insert(key.clone(), Value::String(value.clone()));
     }
-    for (key, value) in &vars.ext_codes {
-        vm.ext_code(key, value);
+    for (key, expr) in &vars.code {
+        let value = crate::config_lang::eval_expression(expr)
+            .with_context(|| format!("failed to evaluate --var-code {key}"))?;
+        resolved.insert(key.clone(), value);
     }
-    for (key, value) in &vars.tla_vars {
-        vm.tla_var(key, value);
-    }
-    for (key, value) in &vars.tla_codes {
-        vm.tla_code(key, value);
-    }
+    Ok(resolved)
 }
 
 fn kv_entry_string_value(entry: &KvEntry) -> R<String> {
@@ -788,56 +855,68 @@ fn kv_entry_string_value(entry: &KvEntry) -> R<String> {
     }
 }
 
+/// A KV entry as a Nickel expression preserving its declared type.
+///
+/// JSON is not a subset of Nickel (records use `=`, not `:`), so a JSON or
+/// number entry is threaded through `std.deserialize` rather than pasted in
+/// as source.
 fn kv_entry_code_value(entry: &KvEntry) -> R<String> {
     let value_type = KvValueType::try_from(entry.value_type).unwrap_or(KvValueType::Unspecified);
     match value_type {
         KvValueType::Unspecified => bail!("kv entry {} has unspecified value type", entry.key),
-        KvValueType::String => Ok(serde_json::to_string(&entry.value)?),
-        KvValueType::Number | KvValueType::Json => Ok(entry.value.clone()),
+        KvValueType::String => Ok(nickel_string_literal(&entry.value)),
+        KvValueType::Number | KvValueType::Json => Ok(format!(
+            "std.deserialize 'Json {}",
+            nickel_string_literal(&entry.value)
+        )),
     }
 }
 
-fn resolve_kv_jsonnet_vars<F>(vars: JsonnetVars, mut lookup: F) -> R<JsonnetVars>
+/// Renders a Rust string as a Nickel string literal.
+///
+/// Nickel's escapes are JSON's minus `\u`, plus `%` — which starts string
+/// interpolation when followed by `{`.
+fn nickel_string_literal(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for ch in value.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '%' => out.push_str("\\%"),
+            other => out.push(other),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn resolve_kv_config_vars<F>(vars: ConfigVars, mut lookup: F) -> R<ConfigVars>
 where
     F: FnMut(&str) -> R<KvEntry>,
 {
     let mut vars = vars;
-    let kv_ext_vars = std::mem::take(&mut vars.kv_ext_vars);
-    for (key, kv_key) in kv_ext_vars {
+    let kv_strings = std::mem::take(&mut vars.kv_strings);
+    for (key, kv_key) in kv_strings {
         let entry = lookup(&kv_key)?;
-        vars.ext_vars.push((key, kv_entry_string_value(&entry)?));
+        vars.strings.push((key, kv_entry_string_value(&entry)?));
     }
 
-    let kv_ext_codes = std::mem::take(&mut vars.kv_ext_codes);
-    for (key, kv_key) in kv_ext_codes {
+    let kv_code = std::mem::take(&mut vars.kv_code);
+    for (key, kv_key) in kv_code {
         let entry = lookup(&kv_key)?;
-        vars.ext_codes.push((key, kv_entry_code_value(&entry)?));
-    }
-
-    let kv_tla_vars = std::mem::take(&mut vars.kv_tla_vars);
-    for (key, kv_key) in kv_tla_vars {
-        let entry = lookup(&kv_key)?;
-        vars.tla_vars.push((key, kv_entry_string_value(&entry)?));
-    }
-
-    let kv_tla_codes = std::mem::take(&mut vars.kv_tla_codes);
-    for (key, kv_key) in kv_tla_codes {
-        let entry = lookup(&kv_key)?;
-        vars.tla_codes.push((key, kv_entry_code_value(&entry)?));
+        vars.code.push((key, kv_entry_code_value(&entry)?));
     }
 
     Ok(vars)
 }
 
-fn kv_keys_from_vars(vars: &JsonnetVars) -> Vec<String> {
+fn kv_keys_from_vars(vars: &ConfigVars) -> Vec<String> {
     let mut keys = std::collections::HashSet::new();
-    for (_, key) in vars
-        .kv_ext_vars
-        .iter()
-        .chain(vars.kv_ext_codes.iter())
-        .chain(vars.kv_tla_vars.iter())
-        .chain(vars.kv_tla_codes.iter())
-    {
+    for (_, key) in vars.kv_strings.iter().chain(vars.kv_code.iter()) {
         keys.insert(key.clone());
     }
     keys.into_iter().collect()
@@ -857,17 +936,17 @@ async fn fetch_kv_entry(
     response.into_inner().entry.context("kv entry not found")
 }
 
-async fn resolve_kv_jsonnet_vars_from_manager(
+async fn resolve_kv_config_vars_from_manager(
     client: &mut crate::cmd::helpers::AuthedManagerClient,
-    vars: JsonnetVars,
-) -> R<JsonnetVars> {
+    vars: ConfigVars,
+) -> R<ConfigVars> {
     let mut cache = HashMap::new();
     for key in kv_keys_from_vars(&vars) {
         let entry = fetch_kv_entry(client, &key).await?;
         cache.insert(key, entry);
     }
 
-    resolve_kv_jsonnet_vars(vars, |key| {
+    resolve_kv_config_vars(vars, |key| {
         cache.get(key).cloned().context("kv entry not loaded")
     })
 }
@@ -880,18 +959,53 @@ fn print_json<T: Serialize>(value: &T) {
 }
 
 struct ResolvedJobspec {
-    _temp_dir: TempDir,
+    /// Holds the staging directory open for as long as `path` points into it.
+    /// `None` for a local jobspec, which is read where it already lives.
+    _temp_dir: Option<TempDir>,
     path: PathBuf,
 }
 
+/// The local file a jobspec source names, if it names one.
+///
+/// A bare path is local; so is a `file://` URL, which reaches the same copy in
+/// the artifact fetcher. `Url::to_file_path` does the percent-decoding and
+/// rejects a URL with a foreign host. Everything else (`http(s)://`, `git::`,
+/// `s3://`) has to be fetched.
+fn local_jobspec_path(source: &str) -> Option<PathBuf> {
+    if source.starts_with("file://") {
+        return Url::parse(source).ok()?.to_file_path().ok();
+    }
+    if source.contains("://") || source.starts_with("git::") {
+        return None;
+    }
+    Some(PathBuf::from(source))
+}
+
 fn resolve_jobspec_source(source: &str) -> R<ResolvedJobspec> {
+    // A local jobspec is evaluated in place. Copying it to a temp directory
+    // would strand its relative imports: `import "lib/task.ncl"` resolves
+    // against the file's own directory, and only the one file gets copied, so
+    // staging turns a working spec into "could not find import".
+    //
+    // Only a plain existing file short-circuits. A directory, a `#fragment`
+    // selector, or a missing path falls through to the fetch path below,
+    // which already handles and reports each of those.
+    if let Some(path) = local_jobspec_path(source) {
+        if path.is_file() {
+            return Ok(ResolvedJobspec {
+                _temp_dir: None,
+                path,
+            });
+        }
+    }
+
     let temp_dir = tempfile::tempdir().context("create temporary directory for jobspec")?;
     let fetched_path = crate::artifacts::fetch_source_to_dir(source, temp_dir.path())
         .with_context(|| format!("fetch jobspec from {source}"))?;
     let resolved_path = ensure_jobspec_file(source, &fetched_path)?;
 
     Ok(ResolvedJobspec {
-        _temp_dir: temp_dir,
+        _temp_dir: Some(temp_dir),
         path: resolved_path,
     })
 }
@@ -944,41 +1058,23 @@ fn extract_jobspec_subpath(source: &str) -> R<Option<PathBuf>> {
     Ok(Some(PathBuf::from(fragment)))
 }
 
-fn render_jobspec(job_path: &Path, vars: &JsonnetVars) -> R<(String, Vec<Submission>)> {
-    let mut vm = JsonnetVm::new();
-    let mut submissions = vec![];
-    let job_path_str = job_path.to_string_lossy();
+/// Evaluates a jobspec to JSON, along with every source file it read.
+///
+/// The submissions are stored with the job, so `legion job spec` can show the
+/// exact Nickel a running job was submitted from — imports included.
+fn render_jobspec(job_path: &Path, vars: &ConfigVars) -> R<(String, Vec<Submission>)> {
+    let values = build_vars(vars)?;
+    let (rendered, sources) = crate::config_lang::eval_file_tracked(job_path, Some(&values))
+        .with_context(|| format!("failed to evaluate job spec {}", job_path.display()))?;
 
-    let content = std::fs::read_to_string(job_path)?;
-    let initial_sub = Submission {
-        path: job_path_str.to_string(),
-        content,
-        is_primary: true,
-    };
-    submissions.push(initial_sub);
-
-    vm.import_callback(|_vm, base, rel| {
-        let path = std::path::Path::new(base).join(rel);
-        let path_str = path.to_str().unwrap();
-        let contents = std::fs::read_to_string(&path).unwrap();
-
-        let sub = Submission {
-            path: path_str.to_string(),
-            content: contents.to_string(),
-            is_primary: false,
-        };
-
-        submissions.push(sub);
-
-        Ok((base.into(), contents.to_string()))
-    });
-
-    apply_jsonnet_vars(&mut vm, vars);
-
-    let rendered = vm
-        .evaluate_file(job_path)
-        .map_err(|e| anyhow!("failed to evaluate job spec {}: {e}", job_path.display()))?
-        .to_string();
+    let submissions = sources
+        .into_iter()
+        .map(|source| Submission {
+            path: source.path,
+            content: source.content,
+            is_primary: source.is_primary,
+        })
+        .collect();
 
     Ok((rendered, submissions))
 }
@@ -1299,59 +1395,197 @@ mod tests {
         let cmd = config();
         assert!(cmd
             .clone()
-            .try_get_matches_from(["job", "validate", "spec.jsonnet", "--json"])
+            .try_get_matches_from(["job", "validate", "spec.ncl", "--json"])
             .is_ok());
         assert!(cmd
             .clone()
             .try_get_matches_from(["job", "wait", "demo", "--timeout", "5"])
             .is_ok());
         assert!(cmd
-            .try_get_matches_from([
-                "job",
-                "run",
-                "x.jsonnet",
-                "--wait",
-                "--idempotency-key",
-                "abc"
-            ])
+            .try_get_matches_from(["job", "run", "x.ncl", "--wait", "--idempotency-key", "abc"])
             .is_ok());
+    }
+
+    fn kv_entry(key: &str, value: &str, value_type: KvValueType) -> KvEntry {
+        KvEntry {
+            key: key.to_string(),
+            value: value.into(),
+            value_type: value_type as i32,
+            version: 1,
+            created_at: "now".into(),
+            updated_at: "now".into(),
+        }
     }
 
     #[test]
     fn kv_vars_render_into_jobspec() -> R<()> {
         let dir = tempdir()?;
-        let job_path = dir.path().join("job.jsonnet");
+        let job_path = dir.path().join("job.ncl");
         std::fs::write(
             &job_path,
             r#"
             {
-              name: std.extVar("job_name"),
-              task: {
-                runtime: "noop",
+              name = vars.job_name,
+              task = {
+                runtime = "noop",
               },
             }
             "#,
         )?;
 
-        let mut vars = JsonnetVars::default();
-        vars.kv_ext_vars
+        let mut vars = ConfigVars::default();
+        vars.kv_strings
             .push(("job_name".into(), "jobs/name".into()));
 
-        let resolved = resolve_kv_jsonnet_vars(vars, |key| {
-            Ok(KvEntry {
-                key: key.to_string(),
-                value: "kv-job".into(),
-                value_type: KvValueType::String as i32,
-                version: 1,
-                created_at: "now".into(),
-                updated_at: "now".into(),
-            })
-        })?;
+        let resolved =
+            resolve_kv_config_vars(vars, |key| Ok(kv_entry(key, "kv-job", KvValueType::String)))?;
 
         let (rendered, _subs) = render_jobspec(&job_path, &resolved)?;
         let config: JobConfig = serde_json::from_str(&rendered)?;
         assert_eq!(config.name, "kv-job");
         Ok(())
+    }
+
+    #[test]
+    fn local_jobspec_resolves_in_place_so_imports_still_work() -> R<()> {
+        // Regression: the resolver used to copy a local spec into a temp
+        // directory on its own, which left `import "lib/task.ncl"` looking in
+        // a directory that held nothing but the copy.
+        let dir = tempdir()?;
+        std::fs::create_dir(dir.path().join("lib"))?;
+        std::fs::write(
+            dir.path().join("lib").join("task.ncl"),
+            r#"{ name = "t", runtime = "noop" }"#,
+        )?;
+        let job_path = dir.path().join("job.ncl");
+        std::fs::write(
+            &job_path,
+            r#"
+            let task = import "lib/task.ncl" in
+            { name = "imports", tasks = [task] }
+            "#,
+        )?;
+
+        let resolved = resolve_jobspec_source(job_path.to_str().unwrap())?;
+        assert_eq!(resolved.path, job_path, "spec should be read where it sits");
+
+        let (rendered, subs) = render_jobspec(&resolved.path, &ConfigVars::default())?;
+        let config: JobConfig = serde_json::from_str(&rendered)?;
+        assert_eq!(config.name, "imports");
+        // The imported file is stored with the job, not just the entrypoint.
+        assert_eq!(subs.len(), 2);
+        assert!(subs
+            .iter()
+            .any(|s| s.is_primary && s.path.ends_with("job.ncl")));
+        assert!(subs
+            .iter()
+            .any(|s| !s.is_primary && s.path.ends_with("task.ncl")));
+        Ok(())
+    }
+
+    #[test]
+    fn local_jobspec_paths_are_recognized_without_fetching() {
+        assert_eq!(
+            local_jobspec_path("configs/jobs/demo.ncl"),
+            Some(PathBuf::from("configs/jobs/demo.ncl"))
+        );
+        assert_eq!(
+            local_jobspec_path("/abs/demo.ncl"),
+            Some(PathBuf::from("/abs/demo.ncl"))
+        );
+        assert_eq!(
+            local_jobspec_path("file:///abs/demo.ncl"),
+            Some(PathBuf::from("/abs/demo.ncl"))
+        );
+        // Percent-decoded, which is why this goes through `Url`.
+        assert_eq!(
+            local_jobspec_path("file:///abs/with%20space.ncl"),
+            Some(PathBuf::from("/abs/with space.ncl"))
+        );
+        // Remote sources still stage into a temp directory, which is correct
+        // for them: the fetcher brings the whole tree, imports included.
+        assert_eq!(local_jobspec_path("https://example.com/demo.ncl"), None);
+        assert_eq!(local_jobspec_path("git::https://example.com/r.git"), None);
+        assert_eq!(local_jobspec_path("s3://bucket/demo.ncl"), None);
+    }
+
+    #[test]
+    fn a_missing_local_jobspec_is_reported_by_path() {
+        let Err(err) = resolve_jobspec_source("does/not/exist.ncl") else {
+            panic!("a missing jobspec should not resolve");
+        };
+        assert!(err.to_string().contains("does/not/exist.ncl"), "{err}");
+    }
+
+    #[test]
+    fn json_jobspecs_render_without_nickel() -> R<()> {
+        // Machine-emitted config: the same spec a generator would write out.
+        let dir = tempdir()?;
+        let job_path = dir.path().join("job.json");
+        std::fs::write(
+            &job_path,
+            r#"{"name": "generated", "tasks": [{"name": "t", "runtime": "noop"}]}"#,
+        )?;
+
+        let (rendered, subs) = render_jobspec(&job_path, &ConfigVars::default())?;
+        let config: JobConfig = serde_json::from_str(&rendered)?;
+        assert_eq!(config.name, "generated");
+        assert_eq!(subs.len(), 1);
+        assert!(subs[0].is_primary);
+        Ok(())
+    }
+
+    #[test]
+    fn json_jobspecs_reject_vars() -> R<()> {
+        let dir = tempdir()?;
+        let job_path = dir.path().join("job.json");
+        std::fs::write(&job_path, r#"{"name": "generated"}"#)?;
+
+        let mut vars = ConfigVars::default();
+        vars.strings.push(("image".into(), "nginx".into()));
+        let err = render_jobspec(&job_path, &vars).unwrap_err();
+        assert!(format!("{err:#}").contains("has no variables"), "{err:#}");
+        Ok(())
+    }
+
+    #[test]
+    fn kv_code_vars_keep_their_json_type() -> R<()> {
+        let mut vars = ConfigVars::default();
+        vars.kv_code.push(("count".into(), "jobs/count".into()));
+        vars.kv_code.push(("tags".into(), "jobs/tags".into()));
+        vars.kv_strings.push(("plain".into(), "jobs/plain".into()));
+
+        let resolved = resolve_kv_config_vars(vars, |key| match key {
+            "jobs/count" => Ok(kv_entry(key, "4", KvValueType::Number)),
+            "jobs/tags" => Ok(kv_entry(key, r#"["a","b"]"#, KvValueType::Json)),
+            _ => Ok(kv_entry(key, "text", KvValueType::String)),
+        })?;
+
+        let values = build_vars(&resolved)?;
+        assert_eq!(values["count"], json!(4));
+        assert_eq!(values["tags"], json!(["a", "b"]));
+        assert_eq!(values["plain"], json!("text"));
+        Ok(())
+    }
+
+    #[test]
+    fn var_code_evaluates_nickel_expressions() -> R<()> {
+        let mut vars = ConfigVars::default();
+        vars.strings.push(("image".into(), "nginx".into()));
+        vars.code.push(("count".into(), "1 + 2".into()));
+        vars.code.push(("limits".into(), "{ memory = 512 }".into()));
+
+        let values = build_vars(&vars)?;
+        assert_eq!(values["image"], json!("nginx"));
+        assert_eq!(values["count"], json!(3));
+        assert_eq!(values["limits"], json!({ "memory": 512 }));
+        Ok(())
+    }
+
+    #[test]
+    fn nickel_string_literals_escape_interpolation() {
+        assert_eq!(nickel_string_literal("a%{b}"), r#""a\%{b}""#);
+        assert_eq!(nickel_string_literal("say \"hi\""), r#""say \"hi\"""#);
     }
 }
 
@@ -1559,8 +1793,8 @@ async fn plan_job(arg_matches: &ArgMatches) -> R<()> {
         .get_one::<String>("path")
         .map(String::as_str)
         .context("missing jobspec path")?;
-    let vars = jsonnet_vars_from_matches(arg_matches)?;
-    let vars = resolve_kv_jsonnet_vars_from_manager(&mut client, vars).await?;
+    let vars = config_vars_from_matches(arg_matches)?;
+    let vars = resolve_kv_config_vars_from_manager(&mut client, vars).await?;
     let resolved = resolve_jobspec_source_async(path).await?;
     let (rendered, _submissions) = render_jobspec(&resolved.path, &vars)?;
 
@@ -1579,12 +1813,28 @@ async fn plan_job(arg_matches: &ArgMatches) -> R<()> {
         if !reply.message.is_empty() {
             println!("{}", reply.message);
         }
+        // One line per placement that carries fallback candidates: the
+        // ranked list the apply walk may bind instead of the first choice
+        // under contention (docs/late-binding-plan-apply.md). Quiet when
+        // every placement is a singleton (plan_candidates: 0, coupled
+        // placements, or a pre-candidate manager).
+        let candidate_lines: Vec<String> = allocations
+            .iter()
+            .filter(|alloc| alloc.candidate_nodes.len() > 1)
+            .map(|alloc| format!("{}: {}", alloc.task_name, alloc.candidate_nodes.join(" > ")))
+            .collect();
         let printable_allocations: Vec<JobPlanPrint> =
             allocations.into_iter().map(Into::into).collect();
         if printable_allocations.is_empty() {
             println!("No allocations planned");
         } else {
             print_table(printable_allocations);
+        }
+        if !candidate_lines.is_empty() {
+            println!("Placement candidates (best first; a race falls back down the list):");
+            for line in candidate_lines {
+                println!("  {line}");
+            }
         }
         // One line per task on how candidates were generated: which
         // scheduling index served (or why none did). Quiet when there is
@@ -1648,6 +1898,47 @@ async fn plan_job(arg_matches: &ArgMatches) -> R<()> {
                 println!("  {line}");
             }
         }
+        // Who this submit would displace. Printed last and unmissably,
+        // because it is the one thing in a plan that costs somebody else
+        // something (S3 in the preemption plan: the submit becomes a
+        // decision, not a surprise).
+        if reply.preemptions.is_empty() {
+            if reply.preemption_mode == "off" {
+                println!(
+                    "Preemption: off for this cluster; a higher-band job cannot displace \
+                     lower-band work"
+                );
+            }
+        } else {
+            let verb = if reply.preemption_mode == "observe" {
+                "would preempt (mode: observe — nothing is evicted)"
+            } else {
+                "would preempt"
+            };
+            println!("Preemption: {verb}");
+            // Group by node so the output reads the way an operator thinks
+            // about it: "on node-d, these go".
+            let mut by_node: std::collections::BTreeMap<&str, Vec<&_>> =
+                std::collections::BTreeMap::new();
+            for victim in &reply.preemptions {
+                by_node
+                    .entry(victim.node_id.as_str())
+                    .or_default()
+                    .push(victim);
+            }
+            for (node_id, victims) in by_node {
+                for victim in victims {
+                    println!(
+                        "  {node_id}: {}/{} (alloc {}, priority {}) — {}s grace, requeued",
+                        victim.job_id,
+                        victim.task_name,
+                        victim.allocation_id,
+                        victim.band,
+                        victim.kill_after_seconds
+                    );
+                }
+            }
+        }
     }
 
     Ok(())
@@ -1660,11 +1951,11 @@ async fn run_job(arg_matches: &ArgMatches) -> R<()> {
 
     let job_path = arg_matches
         .get_one::<String>("path")
-        .map_or("./configs/jobs/demo.jsonnet", String::as_str);
+        .map_or("./configs/jobs/demo.ncl", String::as_str);
     let priority = priority_from_matches(arg_matches);
     let idempotency_key = arg_matches.get_one::<String>("idempotency-key").cloned();
-    let vars = jsonnet_vars_from_matches(arg_matches)?;
-    let vars = resolve_kv_jsonnet_vars_from_manager(&mut client, vars).await?;
+    let vars = config_vars_from_matches(arg_matches)?;
+    let vars = resolve_kv_config_vars_from_manager(&mut client, vars).await?;
     let resolved = resolve_jobspec_source_async(job_path).await?;
     let (rendered, submissions) = render_jobspec(&resolved.path, &vars)?;
 

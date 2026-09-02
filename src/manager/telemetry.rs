@@ -55,6 +55,13 @@ const DURATION_BUCKETS: &[f64] = &[
     0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
 ];
 
+/// Bucket bounds (seconds) for runtime-scheduling delay, which is
+/// microseconds on a healthy runtime — [`DURATION_BUCKETS`] would put every
+/// healthy sample in one bucket and lose the signal.
+const SCHEDULER_DELAY_BUCKETS: &[f64] = &[
+    0.00005, 0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 1.0,
+];
+
 /// Bucket bounds for candidate-count histograms (scheduling indexes).
 const COUNT_BUCKETS: &[f64] = &[
     1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1024.0, 4096.0, 16384.0,
@@ -89,6 +96,13 @@ pub struct GaugeCell(AtomicI64);
 impl GaugeCell {
     pub fn set(&self, v: i64) {
         self.0.store(v, Ordering::Relaxed);
+    }
+
+    /// Relative update (`+1` / `-1`), for gauges maintained by paired
+    /// increment/decrement rather than by a periodic refresh — in-flight
+    /// requests, queue depths. One atomic, safe from any thread.
+    pub fn add(&self, delta: i64) {
+        self.0.fetch_add(delta, Ordering::Relaxed);
     }
 
     pub fn get(&self) -> i64 {
@@ -298,6 +312,11 @@ pub struct SampleSnapshot {
 pub enum SampleValue {
     Counter(u64),
     Gauge(i64),
+    /// A gauge whose value is genuinely fractional — a ratio, not a count.
+    /// Kept separate rather than scaling into the integer gauge so the metric
+    /// an operator alerts on reads in the units the docs state
+    /// (`legion_heartbeat_freshness_ratio` is 0.22, never 220).
+    GaugeF64(f64),
     Histogram {
         bounds: &'static [f64],
         /// Per-bucket (NON-cumulative) counts, one per bound plus a final
@@ -333,8 +352,18 @@ impl CounterVec {
     /// Increment the series identified by `labels` (one value per declared
     /// label name, in order).
     pub fn inc(&self, labels: &[&str]) {
+        self.inc_by(labels, 1);
+    }
+
+    /// Add `count` to the series identified by `labels`. For batched events
+    /// (a plan evicting several allocations of one job) where one increment
+    /// per item would be pure overhead.
+    pub fn inc_by(&self, labels: &[&str], count: u64) {
         debug_assert_eq!(labels.len(), self.meta.labels.len());
-        self.series.cell(labels, CounterCell::default).inc();
+        let cell = self.series.cell(labels, CounterCell::default);
+        for _ in 0..count {
+            cell.inc();
+        }
     }
 
     /// Current value of a series (0 when it does not exist). Test/inspection
@@ -384,6 +413,22 @@ impl GaugeVec {
     pub fn set(&self, labels: &[&str], v: i64) {
         debug_assert_eq!(labels.len(), self.meta.labels.len());
         self.series.cell(labels, GaugeCell::default).set(v);
+    }
+
+    /// Relative update of one series. Callers must pair their `+1` with a
+    /// `-1` on every exit path (including cancellation — see
+    /// [`InFlightGuard`]), or the series drifts upward forever.
+    pub fn add(&self, labels: &[&str], delta: i64) {
+        debug_assert_eq!(labels.len(), self.meta.labels.len());
+        self.series.cell(labels, GaugeCell::default).add(delta);
+    }
+
+    /// Current value of a series (0 when it does not exist). Test/inspection
+    /// helper — not needed on hot paths.
+    pub fn get(&self, labels: &[&str]) -> i64 {
+        Series::find(&self.series.snapshot(), labels)
+            .map(|c| c.get())
+            .unwrap_or(0)
     }
 
     /// Replace the whole family: series present in `entries` get their new
@@ -569,6 +614,42 @@ impl RenderMetric for Gauge {
     }
 }
 
+/// Unlabeled gauge with a fractional value (a ratio, a rate).
+pub struct FloatGauge {
+    meta: FamilyMeta,
+    bits: AtomicU64,
+}
+
+impl FloatGauge {
+    pub fn set(&self, v: f64) {
+        self.bits.store(v.to_bits(), Ordering::Relaxed);
+    }
+
+    pub fn get(&self) -> f64 {
+        f64::from_bits(self.bits.load(Ordering::Relaxed))
+    }
+}
+
+impl RenderMetric for FloatGauge {
+    fn render_into(&self, out: &mut String) {
+        render_header(out, &self.meta, "gauge");
+        out.push_str(&format!("{} {}\n", self.meta.name, self.get()));
+    }
+
+    fn snapshot_family(&self) -> FamilySnapshot {
+        FamilySnapshot {
+            name: self.meta.name,
+            help: self.meta.help,
+            kind: SnapshotKind::Gauge,
+            label_names: self.meta.labels,
+            samples: vec![SampleSnapshot {
+                label_values: Vec::new(),
+                value: SampleValue::GaugeF64(self.get()),
+            }],
+        }
+    }
+}
+
 /// Unlabeled histogram.
 pub struct Histogram {
     meta: FamilyMeta,
@@ -618,20 +699,55 @@ pub struct Metrics {
     pub grpc_requests_total: Arc<CounterVec>,
     /// `legion_grpc_request_duration_seconds{method}`
     pub grpc_request_duration_seconds: Arc<HistogramVec>,
+    /// `legion_grpc_in_flight{method}`
+    pub grpc_in_flight: Arc<GaugeVec>,
     /// `legion_evals_processed_total{kind,status}`
     pub evals_processed_total: Arc<CounterVec>,
     /// `legion_eval_queue_depth`
     pub eval_queue_depth: Arc<Gauge>,
     /// `legion_plan_apply_total{outcome}`
     pub plan_apply_total: Arc<CounterVec>,
+    /// `legion_eval_claim_total{outcome}`
+    pub eval_claim_total: Arc<CounterVec>,
+    /// `legion_eval_handle_seconds{kind}`
+    pub eval_handle_seconds: Arc<HistogramVec>,
+    /// `legion_dispatch_send_seconds`
+    pub dispatch_send_seconds: Arc<Histogram>,
+    /// `legion_scheduler_plan_candidate_rank`
+    pub scheduler_plan_candidate_rank: Arc<Histogram>,
+    /// `legion_scheduler_plan_bind_pass{pass}`
+    pub scheduler_plan_bind_pass: Arc<CounterVec>,
+    /// `legion_eval_conflict_requeues_total`
+    pub eval_conflict_requeues_total: Arc<Counter>,
+    /// `legion_preemptions_total{pool,band}` — victims actually evicted.
+    pub preemptions_total: Arc<CounterVec>,
+    /// `legion_preemption_plans_total{outcome}` — preemption passes that
+    /// reached a decision: `placed`, `observe`, or `no_victims`.
+    pub preemption_plans_total: Arc<CounterVec>,
     /// `legion_heartbeats_total`
     pub heartbeats_total: Arc<Counter>,
     /// `legion_nodes{status}`
     pub nodes: Arc<GaugeVec>,
+    /// `legion_read_model_nodes{set}`
+    pub read_model_nodes: Arc<GaugeVec>,
     /// `legion_allocations`
     pub allocations: Arc<Gauge>,
     /// `legion_store_write_lock_wait_seconds`
     pub store_write_lock_wait_seconds: Arc<Histogram>,
+    /// `legion_store_read_lock_wait_seconds`
+    pub store_read_lock_wait_seconds: Arc<Histogram>,
+    /// `legion_store_coalesce_batch_size{path}`
+    pub store_coalesce_batch_size: Arc<HistogramVec>,
+    /// `legion_store_coalesce_wait_seconds{path,role}`
+    pub store_coalesce_wait_seconds: Arc<HistogramVec>,
+    /// `legion_store_coalesce_commit_seconds{path}`
+    pub store_coalesce_commit_seconds: Arc<HistogramVec>,
+    /// `legion_store_coalesce_wait_rounds_total{path}`
+    pub store_coalesce_wait_rounds_total: Arc<CounterVec>,
+    /// `legion_runtime_spawn_delay_seconds`
+    pub runtime_spawn_delay_seconds: Arc<Histogram>,
+    /// `legion_runtime_worker_threads`
+    pub runtime_worker_threads: Arc<Gauge>,
     /// `legion_raft_voters{lane}`
     pub raft_voters: Arc<GaugeVec>,
     /// `legion_raft_quorum{lane}`
@@ -650,8 +766,12 @@ pub struct Metrics {
     pub raft_capture_seconds: Arc<HistogramVec>,
     /// `legion_raft_propose_apply_seconds{lane}`
     pub raft_propose_apply_seconds: Arc<HistogramVec>,
-    /// `legion_raft_ops_total{lane,outcome}`
+    /// `legion_raft_ops_total{lane,op,outcome}`
     pub raft_ops_total: Arc<CounterVec>,
+    /// `legion_raft_pipeline_wait_seconds{lane}`
+    pub raft_pipeline_wait_seconds: Arc<HistogramVec>,
+    /// `legion_raft_pipeline_depth{lane}`
+    pub raft_pipeline_depth: Arc<GaugeVec>,
     /// `legion_scheduler_index_queries_total{index,outcome}`
     pub scheduler_index_queries_total: Arc<CounterVec>,
     /// `legion_scheduler_index_candidates{index}`
@@ -664,6 +784,32 @@ pub struct Metrics {
     pub scheduler_plan_phase_seconds: Arc<HistogramVec>,
     /// `legion_scheduler_lazy_sample_fallback_total`
     pub scheduler_lazy_sample_fallback_total: Arc<Counter>,
+    /// `legion_heartbeat_freshness_ratio` — **the number to alert on.**
+    pub heartbeat_freshness_ratio: Arc<FloatGauge>,
+    /// `legion_heartbeat_served_interval_seconds`
+    pub heartbeat_served_interval_seconds: Arc<Gauge>,
+    /// `legion_heartbeat_lost_window_seconds`
+    pub heartbeat_lost_window_seconds: Arc<Gauge>,
+    /// `legion_heartbeat_sustainable_nodes`
+    pub heartbeat_sustainable_nodes: Arc<Gauge>,
+    /// `legion_nodes_marked_lost_total`
+    pub nodes_marked_lost_total: Arc<Counter>,
+    /// `legion_nodes_recovered_total{path}`
+    pub nodes_recovered_total: Arc<CounterVec>,
+    /// `legion_liveness_tracked_nodes`
+    pub liveness_tracked_nodes: Arc<Gauge>,
+    /// `legion_liveness_responsible_seconds`
+    pub liveness_responsible_seconds: Arc<Gauge>,
+    /// `legion_liveness_digest_rpcs_total{outcome}`
+    pub liveness_digest_rpcs_total: Arc<CounterVec>,
+    /// `legion_liveness_digest_nodes`
+    pub liveness_digest_nodes: Arc<Histogram>,
+    /// `legion_liveness_peer_stale{peer}`
+    pub liveness_peer_stale: Arc<GaugeVec>,
+    /// `legion_liveness_loss_suppressed_total{reason}`
+    pub liveness_loss_suppressed_total: Arc<CounterVec>,
+    /// `legion_liveness_checkpoint_seconds`
+    pub liveness_checkpoint_seconds: Arc<Histogram>,
     /// Render order for the exposition endpoint.
     families: Vec<Arc<dyn RenderMetric>>,
 }
@@ -685,6 +831,14 @@ impl Metrics {
                 labels: &["method"],
             },
             bounds: DURATION_BUCKETS,
+            series: Series::new(),
+        });
+        let grpc_in_flight = Arc::new(GaugeVec {
+            meta: FamilyMeta {
+                name: "legion_grpc_in_flight",
+                help: "gRPC requests currently executing in the manager, by method. Read against legion_runtime_worker_threads: a value that sits at or above the worker-thread count means handlers are blocking the runtime, not that the cluster is busy.",
+                labels: &["method"],
+            },
             series: Series::new(),
         });
         let evals_processed_total = Arc::new(CounterVec {
@@ -711,6 +865,71 @@ impl Metrics {
             },
             series: Series::new(),
         });
+        let eval_claim_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_eval_claim_total",
+                help: "Eval claim attempts by an eval worker, by outcome (claimed|empty). An empty attempt produces an empty changeset, which skips the raft entry — its cost is the capture (a savepoint on the write connection) plus a wasted wake, so a high `empty` share means workers are being woken for evals that do not exist and the write path is contending for it.",
+                labels: &["outcome"],
+            },
+            series: Series::new(),
+        });
+        let eval_handle_seconds = Arc::new(HistogramVec {
+            meta: FamilyMeta {
+                name: "legion_eval_handle_seconds",
+                help: "Wall time to handle one claimed eval end to end: planning, applying, dispatching the allocations, and the post-apply bookkeeping. Read it AGAINST legion_scheduler_plan_phase_seconds{phase=\"total\"} — the difference is everything an eval does outside planning, which is otherwise invisible. Throughput is roughly evalThreads divided by this.",
+                labels: &["kind"],
+            },
+            series: Series::new(),
+            bounds: DURATION_BUCKETS,
+        });
+        let dispatch_send_seconds = Arc::new(Histogram {
+            meta: FamilyMeta {
+                name: "legion_dispatch_send_seconds",
+                help: "One successful PostWork push to a worker, from send to ack. Dispatch is detached from the eval loop, so this latency no longer appears in legion_eval_handle_seconds - this histogram is where it went. Rising values mean slow or overloaded workers, not a slow scheduler.",
+                labels: &[],
+            },
+            cell: HistogramCell::new(DURATION_BUCKETS),
+        });
+        let scheduler_plan_candidate_rank = Arc::new(Histogram {
+            meta: FamilyMeta {
+                name: "legion_scheduler_plan_candidate_rank",
+                help: "Candidate rank each applied placement bound at (0 = the planner's first choice; higher ranks mean a conflict was absorbed by falling back).",
+                labels: &[],
+            },
+            cell: HistogramCell::new(COUNT_BUCKETS),
+        });
+        let scheduler_plan_bind_pass = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_scheduler_plan_bind_pass",
+                help: "Placements bound by the apply walk, by pass: `clean` (the candidate's node epoch was unchanged since the plan snapshot) or `revalidated` (its epoch had moved, and the in-transaction recheck admitted it anyway).",
+                labels: &["pass"],
+            },
+            series: Series::new(),
+        });
+        let eval_conflict_requeues_total = Arc::new(Counter {
+            meta: FamilyMeta {
+                name: "legion_eval_conflict_requeues_total",
+                help: "Evals released back to the pending queue after exhausting plan-conflict retries, instead of failing terminally.",
+                labels: &[],
+            },
+            cell: CounterCell::default(),
+        });
+        let preemptions_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_preemptions_total",
+                help: "Allocations evicted by scheduler preemption, by the victim's node pool and priority band.",
+                labels: &["pool", "band"],
+            },
+            series: Series::new(),
+        });
+        let preemption_plans_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_preemption_plans_total",
+                help: "Preemption passes that reached a decision, by outcome (placed|observe|no_victims).",
+                labels: &["outcome"],
+            },
+            series: Series::new(),
+        });
         let heartbeats_total = Arc::new(Counter {
             meta: FamilyMeta {
                 name: "legion_heartbeats_total",
@@ -724,6 +943,14 @@ impl Metrics {
                 name: "legion_nodes",
                 help: "Registered worker nodes, by status.",
                 labels: &["status"],
+            },
+            series: Series::new(),
+        });
+        let read_model_nodes = Arc::new(GaugeVec {
+            meta: FamilyMeta {
+                name: "legion_read_model_nodes",
+                help: "Nodes in the in-memory scheduling read model, by set: 'all' is every cached node, 'available' is the planner's candidate universe. A persistent gap against legion_nodes means the scheduler is planning over a truncated fleet.",
+                labels: &["set"],
             },
             series: Series::new(),
         });
@@ -742,6 +969,69 @@ impl Metrics {
                 labels: &[],
             },
             cell: HistogramCell::new(DURATION_BUCKETS),
+        });
+        let store_read_lock_wait_seconds = Arc::new(Histogram {
+            meta: FamilyMeta {
+                name: "legion_store_read_lock_wait_seconds",
+                help: "Time spent waiting for one of the store's SQLite read connections. Reads that found a free connection immediately are recorded as 0, so this is the queueing cost of the read pool and not the cost of the query. A rising tail here shows up inside whichever scheduler plan phase happened to be running — historically `task_fetch` — so read it alongside legion_scheduler_plan_phase_seconds.",
+                labels: &[],
+            },
+            cell: HistogramCell::new(DURATION_BUCKETS),
+        });
+        // Coalescer (group commit) instrumentation. Three questions, three
+        // families: does batching engage at all (batch_size), is a submitter
+        // waiting or committing (wait_seconds by role vs commit_seconds), and
+        // how many extra commits it sat through before its own (wait_rounds).
+        let store_coalesce_batch_size = Arc::new(HistogramVec {
+            meta: FamilyMeta {
+                name: "legion_store_coalesce_batch_size",
+                help: "Requests drained into one group commit, by coalesced path (heartbeat|plan_apply). The le=\"1\" bucket is how often batching did not engage at all; a distribution pinned at 1 under load means requests are not arriving while a commit is in flight.",
+                labels: &["path"],
+            },
+            bounds: COUNT_BUCKETS,
+            series: Series::new(),
+        });
+        let store_coalesce_wait_seconds = Arc::new(HistogramVec {
+            meta: FamilyMeta {
+                name: "legion_store_coalesce_wait_seconds",
+                help: "Time a submitter waited before being served, by path and role. role=\"leader\": queued until it won the commit lock (pure contention, commit not yet started). role=\"follower\": queued until another submitter's batch returned its result (contention plus that batch's commit).",
+                labels: &["path", "role"],
+            },
+            bounds: DURATION_BUCKETS,
+            series: Series::new(),
+        });
+        let store_coalesce_commit_seconds = Arc::new(HistogramVec {
+            meta: FamilyMeta {
+                name: "legion_store_coalesce_commit_seconds",
+                help: "Wall-clock of one group commit (the batch runner itself), by path. Compare against legion_store_coalesce_wait_seconds to split 'the commit is slow' from 'submitters are queued behind it'.",
+                labels: &["path"],
+            },
+            bounds: DURATION_BUCKETS,
+            series: Series::new(),
+        });
+        let store_coalesce_wait_rounds_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_store_coalesce_wait_rounds_total",
+                help: "Times a waiting submitter was woken by a finished commit that was neither its own result nor its turn to lead, i.e. it sat through an extra commit. Divided by the wait_seconds count this is the mean number of EXTRA commits a request waits out; 0 means every submitter was served by the first commit it queued behind.",
+                labels: &["path"],
+            },
+            series: Series::new(),
+        });
+        let runtime_spawn_delay_seconds = Arc::new(Histogram {
+            meta: FamilyMeta {
+                name: "legion_runtime_spawn_delay_seconds",
+                help: "Probe: wall-clock from tokio::spawn to that task's first poll, sampled once a second. Microseconds on a healthy runtime; milliseconds mean every worker thread is busy or blocked, which shows up as latency on EVERY handler including trivial ones.",
+                labels: &[],
+            },
+            cell: HistogramCell::new(SCHEDULER_DELAY_BUCKETS),
+        });
+        let runtime_worker_threads = Arc::new(Gauge {
+            meta: FamilyMeta {
+                name: "legion_runtime_worker_threads",
+                help: "Tokio worker threads in this manager's runtime — the ceiling on concurrent blocking handlers, and the denominator for legion_grpc_in_flight.",
+                labels: &[],
+            },
+            cell: GaugeCell::default(),
         });
         let raft_voters = Arc::new(GaugeVec {
             meta: FamilyMeta {
@@ -820,8 +1110,25 @@ impl Metrics {
         let raft_ops_total = Arc::new(CounterVec {
             meta: FamilyMeta {
                 name: "legion_raft_ops_total",
-                help: "Replicated store ops by lane and outcome (applied|empty|not_leader|error). empty = the mutation touched no rows and skipped the raft entry.",
-                labels: &["lane", "outcome"],
+                help: "Replicated store ops by lane, op name, and outcome (applied|empty|not_leader|error). empty = the mutation touched no rows and skipped the raft entry. The op name is what makes a busy lane attributable: a lane's op count is its quorum-round count, so the top ops by rate are the ones setting its cost.",
+                labels: &["lane", "op", "outcome"],
+            },
+            series: Series::new(),
+        });
+        let raft_pipeline_wait_seconds = Arc::new(HistogramVec {
+            meta: FamilyMeta {
+                name: "legion_raft_pipeline_wait_seconds",
+                help: "Time a replicated op sat in a lane's pipeline queue before its (single, per-lane) pipeline thread began executing it. This is queueing, not replication: when it grows while legion_raft_propose_apply_seconds does not, the lane's serialized pipeline is the bottleneck.",
+                labels: &["lane"],
+            },
+            bounds: DURATION_BUCKETS,
+            series: Series::new(),
+        });
+        let raft_pipeline_depth = Arc::new(GaugeVec {
+            meta: FamilyMeta {
+                name: "legion_raft_pipeline_depth",
+                help: "Replicated ops queued to a lane's pipeline thread and not yet started. Sustained depth > 1 means writes on that lane are serialized behind each other.",
+                labels: &["lane"],
             },
             series: Series::new(),
         });
@@ -878,44 +1185,205 @@ impl Metrics {
             cell: CounterCell::default(),
         });
 
+        // Heartbeat cadence (docs/heartbeat-cadence-and-scale.md). All on the
+        // status-lane leader; a manager that does not own liveness reports 0,
+        // which is why the freshness ratio is derived from the store's view
+        // rather than from a per-process RPC counter — under `lanes` topology
+        // an RPC rate is only ever one manager's share.
+        let heartbeat_freshness_ratio = Arc::new(FloatGauge {
+            meta: FamilyMeta {
+                name: "legion_heartbeat_freshness_ratio",
+                help: "Fraction of active nodes that checked in within one heartbeat interval. 1.0 = the fleet is keeping up; false node loss begins at served_interval/lost_window (0.20 at the defaults). 0 on a manager that does not own liveness or a fleet too small to measure.",
+                labels: &[],
+            },
+            bits: AtomicU64::new(0),
+        });
+        let heartbeat_served_interval_seconds = Arc::new(Gauge {
+            meta: FamilyMeta {
+                name: "legion_heartbeat_served_interval_seconds",
+                help: "Heartbeat interval this manager is currently telling workers to use.",
+                labels: &[],
+            },
+            cell: GaugeCell::default(),
+        });
+        let heartbeat_lost_window_seconds = Arc::new(Gauge {
+            meta: FamilyMeta {
+                name: "legion_heartbeat_lost_window_seconds",
+                help: "Lost-node window derived from the served interval (missedBeatsBeforeLost x interval).",
+                labels: &[],
+            },
+            cell: GaugeCell::default(),
+        });
+        let heartbeat_sustainable_nodes = Arc::new(Gauge {
+            meta: FamilyMeta {
+                name: "legion_heartbeat_sustainable_nodes",
+                help: "Nodes this control plane is observed to sustain at the current interval. A LOWER BOUND while the fleet is keeping up: an unsaturated control plane never reveals its ceiling.",
+                labels: &[],
+            },
+            cell: GaugeCell::default(),
+        });
+        let nodes_marked_lost_total = Arc::new(Counter {
+            meta: FamilyMeta {
+                name: "legion_nodes_marked_lost_total",
+                help: "Nodes marked lost after missed heartbeats. Distinguishes 'nodes went away' from legion_nodes{status=\"lost\"}'s 'nodes are away'.",
+                labels: &[],
+            },
+            cell: CounterCell::default(),
+        });
+        let nodes_recovered_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_nodes_recovered_total",
+                help: "Lost nodes that came back, by path: 'heartbeat' (the node beat again) or 'reregistration' (the worker re-registered). marked_lost minus recovered is the net loss, and a fleet that flaps shows here instead of showing nothing.",
+                labels: &["path"],
+            },
+            series: Series::new(),
+        });
+
+        // Node liveness (docs/node-liveness.md).
+        let liveness_tracked_nodes = Arc::new(Gauge {
+            meta: FamilyMeta {
+                name: "legion_liveness_tracked_nodes",
+                help: "Nodes in this manager's in-memory liveness table. Should equal legion_nodes{status=\"active\"} on the status-lane leader; 0 elsewhere.",
+                labels: &[],
+            },
+            cell: GaugeCell::default(),
+        });
+        let liveness_responsible_seconds = Arc::new(Gauge {
+            meta: FamilyMeta {
+                name: "legion_liveness_responsible_seconds",
+                help: "Seconds since this manager became responsible for liveness (process start OR status-lane leadership acquisition, whichever is later). Resets at every acquisition, which is what makes 'we just took over' visible.",
+                labels: &[],
+            },
+            cell: GaugeCell::default(),
+        });
+        let liveness_digest_rpcs_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_liveness_digest_rpcs_total",
+                help: "Liveness digests sent to the status-lane leader, by outcome (ok|not_leader|error|unimplemented). 'unimplemented' means a peer that predates digests leads the lane and heartbeats have fallen back to replicated writes.",
+                labels: &["outcome"],
+            },
+            series: Series::new(),
+        });
+        let liveness_digest_nodes = Arc::new(Histogram {
+            meta: FamilyMeta {
+                name: "legion_liveness_digest_nodes",
+                help: "Node ids carried by one liveness digest.",
+                labels: &[],
+            },
+            cell: HistogramCell::new(COUNT_BUCKETS),
+        });
+        let liveness_peer_stale = Arc::new(GaugeVec {
+            meta: FamilyMeta {
+                name: "legion_liveness_peer_stale",
+                help: "1 while a peer manager has missed several liveness digests. THE metric to alert on for a manager-to-manager problem: without it, one quiet manager looks like its share of the fleet dying.",
+                labels: &["peer"],
+            },
+            series: Series::new(),
+        });
+        let liveness_loss_suppressed_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_liveness_loss_suppressed_total",
+                help: "Would-be node losses the manager declined to act on, by reason (failover_grace|peer_digest_gap|mass_disruption). 'Nothing was marked lost' must never be indistinguishable from 'nothing was wrong'.",
+                labels: &["reason"],
+            },
+            series: Series::new(),
+        });
+        let liveness_checkpoint_seconds = Arc::new(Histogram {
+            meta: FamilyMeta {
+                name: "legion_liveness_checkpoint_seconds",
+                help: "Wall-clock of one replicated liveness checkpoint (the display-only batched write of observed heartbeat times).",
+                labels: &[],
+            },
+            cell: HistogramCell::new(DURATION_BUCKETS),
+        });
+
         let families: Vec<Arc<dyn RenderMetric>> = vec![
+            Arc::clone(&heartbeat_freshness_ratio) as Arc<dyn RenderMetric>,
+            Arc::clone(&heartbeat_served_interval_seconds) as Arc<dyn RenderMetric>,
+            Arc::clone(&heartbeat_lost_window_seconds) as Arc<dyn RenderMetric>,
+            Arc::clone(&heartbeat_sustainable_nodes) as Arc<dyn RenderMetric>,
+            Arc::clone(&nodes_marked_lost_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&nodes_recovered_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&liveness_tracked_nodes) as Arc<dyn RenderMetric>,
+            Arc::clone(&liveness_responsible_seconds) as Arc<dyn RenderMetric>,
+            Arc::clone(&liveness_digest_rpcs_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&liveness_digest_nodes) as Arc<dyn RenderMetric>,
+            Arc::clone(&liveness_peer_stale) as Arc<dyn RenderMetric>,
+            Arc::clone(&liveness_loss_suppressed_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&liveness_checkpoint_seconds) as Arc<dyn RenderMetric>,
             Arc::clone(&allocations) as Arc<dyn RenderMetric>,
             Arc::clone(&eval_queue_depth) as Arc<dyn RenderMetric>,
             Arc::clone(&evals_processed_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&grpc_in_flight) as Arc<dyn RenderMetric>,
             Arc::clone(&grpc_request_duration_seconds) as Arc<dyn RenderMetric>,
             Arc::clone(&grpc_requests_total) as Arc<dyn RenderMetric>,
             Arc::clone(&heartbeats_total) as Arc<dyn RenderMetric>,
             Arc::clone(&nodes) as Arc<dyn RenderMetric>,
+            Arc::clone(&read_model_nodes) as Arc<dyn RenderMetric>,
+            Arc::clone(&eval_conflict_requeues_total) as Arc<dyn RenderMetric>,
             Arc::clone(&plan_apply_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&eval_claim_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&eval_handle_seconds) as Arc<dyn RenderMetric>,
+            Arc::clone(&dispatch_send_seconds) as Arc<dyn RenderMetric>,
+            Arc::clone(&preemption_plans_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&preemptions_total) as Arc<dyn RenderMetric>,
             Arc::clone(&raft_applied_index) as Arc<dyn RenderMetric>,
             Arc::clone(&raft_apply_lag) as Arc<dyn RenderMetric>,
             Arc::clone(&raft_capture_seconds) as Arc<dyn RenderMetric>,
             Arc::clone(&raft_commit_index) as Arc<dyn RenderMetric>,
             Arc::clone(&raft_is_leader) as Arc<dyn RenderMetric>,
             Arc::clone(&raft_ops_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&raft_pipeline_depth) as Arc<dyn RenderMetric>,
+            Arc::clone(&raft_pipeline_wait_seconds) as Arc<dyn RenderMetric>,
             Arc::clone(&raft_propose_apply_seconds) as Arc<dyn RenderMetric>,
             Arc::clone(&raft_quorum) as Arc<dyn RenderMetric>,
             Arc::clone(&raft_term) as Arc<dyn RenderMetric>,
             Arc::clone(&raft_voters) as Arc<dyn RenderMetric>,
+            Arc::clone(&runtime_spawn_delay_seconds) as Arc<dyn RenderMetric>,
+            Arc::clone(&runtime_worker_threads) as Arc<dyn RenderMetric>,
             Arc::clone(&scheduler_index_candidates) as Arc<dyn RenderMetric>,
             Arc::clone(&scheduler_index_maintenance_seconds) as Arc<dyn RenderMetric>,
             Arc::clone(&scheduler_index_queries_total) as Arc<dyn RenderMetric>,
             Arc::clone(&scheduler_index_shadow_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&scheduler_plan_bind_pass) as Arc<dyn RenderMetric>,
+            Arc::clone(&scheduler_plan_candidate_rank) as Arc<dyn RenderMetric>,
             Arc::clone(&scheduler_lazy_sample_fallback_total) as Arc<dyn RenderMetric>,
             Arc::clone(&scheduler_plan_phase_seconds) as Arc<dyn RenderMetric>,
+            Arc::clone(&store_coalesce_batch_size) as Arc<dyn RenderMetric>,
+            Arc::clone(&store_coalesce_commit_seconds) as Arc<dyn RenderMetric>,
+            Arc::clone(&store_coalesce_wait_rounds_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&store_coalesce_wait_seconds) as Arc<dyn RenderMetric>,
             Arc::clone(&store_write_lock_wait_seconds) as Arc<dyn RenderMetric>,
+            Arc::clone(&store_read_lock_wait_seconds) as Arc<dyn RenderMetric>,
         ];
 
         Metrics {
             grpc_requests_total,
             grpc_request_duration_seconds,
+            grpc_in_flight,
             evals_processed_total,
             eval_queue_depth,
             plan_apply_total,
+            eval_claim_total,
+            eval_handle_seconds,
+            dispatch_send_seconds,
+            scheduler_plan_bind_pass,
+            scheduler_plan_candidate_rank,
+            eval_conflict_requeues_total,
+            preemptions_total,
+            preemption_plans_total,
             heartbeats_total,
             nodes,
+            read_model_nodes,
             allocations,
             store_write_lock_wait_seconds,
+            store_read_lock_wait_seconds,
+            store_coalesce_batch_size,
+            store_coalesce_wait_seconds,
+            store_coalesce_commit_seconds,
+            store_coalesce_wait_rounds_total,
+            runtime_spawn_delay_seconds,
+            runtime_worker_threads,
             raft_voters,
             raft_quorum,
             raft_term,
@@ -926,12 +1394,27 @@ impl Metrics {
             raft_capture_seconds,
             raft_propose_apply_seconds,
             raft_ops_total,
+            raft_pipeline_wait_seconds,
+            raft_pipeline_depth,
             scheduler_index_queries_total,
             scheduler_index_candidates,
             scheduler_index_shadow_total,
             scheduler_index_maintenance_seconds,
             scheduler_plan_phase_seconds,
             scheduler_lazy_sample_fallback_total,
+            heartbeat_freshness_ratio,
+            heartbeat_served_interval_seconds,
+            heartbeat_lost_window_seconds,
+            heartbeat_sustainable_nodes,
+            nodes_marked_lost_total,
+            nodes_recovered_total,
+            liveness_tracked_nodes,
+            liveness_responsible_seconds,
+            liveness_digest_rpcs_total,
+            liveness_digest_nodes,
+            liveness_peer_stale,
+            liveness_loss_suppressed_total,
+            liveness_checkpoint_seconds,
             families,
         }
     }
@@ -977,6 +1460,14 @@ pub fn snapshot_initialized_families() -> Vec<FamilySnapshot> {
 /// machinery as the manager registry, separate global: a combined
 /// manager+worker process serves both registries from their own listeners,
 /// and the OTLP push exports whichever registries the process initialized.
+///
+/// A simulated fleet (`legion start worker --simulate N`) reports through
+/// this same registry rather than a parallel one — the process *is* a
+/// worker, just carrying N nodes. Everything here is therefore per-process:
+/// in a fleet the shared families aggregate over every simulated node, and
+/// the `simulated_*` families below describe the fleet itself. Per-node
+/// series are deliberately not exported; at 1,250 nodes per host that is a
+/// cardinality bomb, and the manager already holds the per-node view.
 pub struct WorkerMetrics {
     /// `legion_worker_heartbeats_total{outcome}`
     pub heartbeats_total: Arc<CounterVec>,
@@ -986,6 +1477,27 @@ pub struct WorkerMetrics {
     pub allocations_running: Arc<Gauge>,
     /// `legion_worker_allocation_failures_reported_total`
     pub allocation_failures_reported_total: Arc<Counter>,
+    /// `legion_provisional_starts_total{origin,gate}` — provisional
+    /// allocations admitted on this node (docs/edge-boot.md).
+    pub provisional_starts_total: Arc<CounterVec>,
+    /// `legion_provisional_refused_total{reason}` — ratifications refused.
+    pub provisional_refused_total: Arc<CounterVec>,
+    /// `legion_provisional_killed_total{cause}` — provisional work killed
+    /// (`refused`, `expired`, `failed`).
+    pub provisional_killed_total: Arc<CounterVec>,
+    /// `legion_provisional_ratify_seconds` — admission to verdict.
+    pub provisional_ratify_seconds: Arc<Histogram>,
+    /// `legion_provisional_active` — unratified claims held right now, so
+    /// started-but-unconfirmed capacity is visible rather than invisible.
+    pub provisional_active: Arc<Gauge>,
+    /// `legion_worker_simulated_nodes` — simulated nodes registered by this
+    /// process (`--simulate N`); 0 in a real worker.
+    pub simulated_nodes: Arc<Gauge>,
+    /// `legion_worker_simulated_nodes_target` — the fleet size this process
+    /// was asked for, so a stalled ramp is visible as a gap.
+    pub simulated_nodes_target: Arc<Gauge>,
+    /// `legion_worker_simulated_registrations_total{outcome}`
+    pub simulated_registrations_total: Arc<CounterVec>,
     families: Vec<Arc<dyn RenderMetric>>,
 }
 
@@ -994,7 +1506,7 @@ impl WorkerMetrics {
         let heartbeats_total = Arc::new(CounterVec {
             meta: FamilyMeta {
                 name: "legion_worker_heartbeats_total",
-                help: "Heartbeat round-trips attempted by this worker, by outcome (ok|error|unauthenticated).",
+                help: "Heartbeat round-trips attempted by this worker process, by outcome (ok|error|unauthenticated). Summed over every node in a simulated fleet.",
                 labels: &["outcome"],
             },
             series: Series::new(),
@@ -1010,7 +1522,7 @@ impl WorkerMetrics {
         let allocations_running = Arc::new(Gauge {
             meta: FamilyMeta {
                 name: "legion_worker_allocations_running",
-                help: "Allocations this worker currently runs, as reported on its last heartbeat.",
+                help: "Allocations this worker currently runs, as reported on its last heartbeat. Summed over every node in a simulated fleet (where they are acked, not run).",
                 labels: &[],
             },
             cell: GaugeCell::default(),
@@ -1024,11 +1536,91 @@ impl WorkerMetrics {
             cell: CounterCell::default(),
         });
 
+        let provisional_starts_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_provisional_starts_total",
+                help: "Provisional allocations admitted on this node, by origin (manager|edge) and gate.",
+                labels: &["origin", "gate"],
+            },
+            series: Series::new(),
+        });
+        let provisional_refused_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_provisional_refused_total",
+                help: "Ratifications refused, by reason (instance_claimed|no_capacity|ineligible|expired|ticket_invalid|unknown_target|disabled|internal).",
+                labels: &["reason"],
+            },
+            series: Series::new(),
+        });
+        let provisional_killed_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_provisional_killed_total",
+                help: "Provisional allocations killed, by cause (refused|expired|failed).",
+                labels: &["cause"],
+            },
+            series: Series::new(),
+        });
+        let provisional_ratify_seconds = Arc::new(Histogram {
+            meta: FamilyMeta {
+                name: "legion_provisional_ratify_seconds",
+                help:
+                    "Wall-clock from admitting a provisional allocation to receiving its verdict.",
+                labels: &[],
+            },
+            cell: HistogramCell::new(DURATION_BUCKETS),
+        });
+        let provisional_active = Arc::new(Gauge {
+            meta: FamilyMeta {
+                name: "legion_provisional_active",
+                help: "Unratified provisional allocations this node is holding right now.",
+                labels: &[],
+            },
+            cell: GaugeCell::default(),
+        });
+
+        // Simulated-fleet families. A `--simulate N` process is a worker
+        // process that happens to carry N nodes, so it reports through this
+        // same registry: the families above become fleet-wide aggregates and
+        // these three say how big the fleet is and whether it got there. All
+        // three stay at zero in a real worker.
+        let simulated_nodes = Arc::new(Gauge {
+            meta: FamilyMeta {
+                name: "legion_worker_simulated_nodes",
+                help: "Simulated nodes in this process that have completed registration (0 in a real worker).",
+                labels: &[],
+            },
+            cell: GaugeCell::default(),
+        });
+        let simulated_nodes_target = Arc::new(Gauge {
+            meta: FamilyMeta {
+                name: "legion_worker_simulated_nodes_target",
+                help: "Simulated nodes this process was asked to run (`--simulate N`); 0 in a real worker.",
+                labels: &[],
+            },
+            cell: GaugeCell::default(),
+        });
+        let simulated_registrations_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_worker_simulated_registrations_total",
+                help: "Simulated-node registration attempts, by outcome (ok|error). Counts re-registrations, so it outruns the node count over a long run.",
+                labels: &["outcome"],
+            },
+            series: Series::new(),
+        });
+
         let families: Vec<Arc<dyn RenderMetric>> = vec![
             Arc::clone(&allocation_failures_reported_total) as Arc<dyn RenderMetric>,
             Arc::clone(&allocations_running) as Arc<dyn RenderMetric>,
             Arc::clone(&heartbeat_duration_seconds) as Arc<dyn RenderMetric>,
             Arc::clone(&heartbeats_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&provisional_active) as Arc<dyn RenderMetric>,
+            Arc::clone(&provisional_killed_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&provisional_ratify_seconds) as Arc<dyn RenderMetric>,
+            Arc::clone(&provisional_refused_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&provisional_starts_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&simulated_nodes) as Arc<dyn RenderMetric>,
+            Arc::clone(&simulated_nodes_target) as Arc<dyn RenderMetric>,
+            Arc::clone(&simulated_registrations_total) as Arc<dyn RenderMetric>,
         ];
 
         WorkerMetrics {
@@ -1036,6 +1628,14 @@ impl WorkerMetrics {
             heartbeat_duration_seconds,
             allocations_running,
             allocation_failures_reported_total,
+            provisional_starts_total,
+            provisional_refused_total,
+            provisional_killed_total,
+            provisional_ratify_seconds,
+            provisional_active,
+            simulated_nodes,
+            simulated_nodes_target,
+            simulated_registrations_total,
             families,
         }
     }
@@ -1058,11 +1658,83 @@ pub fn render_worker() -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Runtime saturation probe
+// ---------------------------------------------------------------------------
+
+/// How often [`start_runtime_probe`] samples spawn delay. One spawn a second
+/// is free; the signal it carries (are there any idle worker threads?) is
+/// not obtainable any other way once handlers block.
+const RUNTIME_PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Start the runtime saturation probe on the current tokio runtime.
+///
+/// Every second it spawns a task that does nothing but record how long it
+/// waited to be polled (`legion_runtime_spawn_delay_seconds`), and it
+/// publishes the runtime's worker-thread count once
+/// (`legion_runtime_worker_threads`).
+///
+/// Why this exists: a handler that makes a *blocking* call from an async
+/// context occupies a worker thread without yielding. With every worker
+/// occupied, latency appears on unrelated handlers — even ones that do no
+/// work at all — which reads like "everything is slow" while CPU sits idle
+/// and no single operation is slow. Spawn delay names that condition
+/// directly. Cheap enough to leave on permanently; see docs/metrics.md.
+pub fn start_runtime_probe() {
+    metrics()
+        .runtime_worker_threads
+        .set(tokio::runtime::Handle::current().metrics().num_workers() as i64);
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(RUNTIME_PROBE_INTERVAL);
+        // Delay (not burst) after a missed tick: a saturated runtime must
+        // not be handed a backlog of probe spawns to catch up on.
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            let spawned_at = Instant::now();
+            let probe = tokio::spawn(async move {
+                metrics()
+                    .runtime_spawn_delay_seconds
+                    .observe(spawned_at.elapsed().as_secs_f64());
+            });
+            if probe.await.is_err() {
+                debug!("runtime saturation probe task failed; stopping probe");
+                return;
+            }
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
 // gRPC instrumentation layer
 // ---------------------------------------------------------------------------
 
-/// Tower layer recording `legion_grpc_requests_total` and
-/// `legion_grpc_request_duration_seconds` around the tonic service.
+/// Holds one `legion_grpc_in_flight` increment for the life of a request.
+/// A `Drop` guard rather than a decrement at the end of the future because
+/// a client that hangs up mid-call leaves the future *dropped*, not
+/// completed — decrementing only on the happy path would let the gauge
+/// drift upward forever and turn the saturation signal into noise.
+struct InFlightGuard {
+    method: String,
+}
+
+impl InFlightGuard {
+    fn enter(method: &str) -> Self {
+        metrics().grpc_in_flight.add(&[method], 1);
+        InFlightGuard {
+            method: method.to_string(),
+        }
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        metrics().grpc_in_flight.add(&[&self.method], -1);
+    }
+}
+
+/// Tower layer recording `legion_grpc_requests_total`,
+/// `legion_grpc_request_duration_seconds` and `legion_grpc_in_flight`
+/// around the tonic service.
 ///
 /// The `code` label is the `grpc-status` value when tonic surfaces it in the
 /// response *headers* (trailers-only responses, i.e. every error path);
@@ -1103,9 +1775,15 @@ where
     fn call(&mut self, req: Request<ReqBody>) -> Self::Future {
         let method = grpc_method_label(req.uri().path());
         let started = Instant::now();
+        // Taken here, not inside the future: the request is in flight from
+        // the moment the service accepts it, including any time it spends
+        // waiting for a runtime worker to poll it — which is exactly the
+        // saturation this gauge exists to show.
+        let in_flight = InFlightGuard::enter(&method);
         let fut = self.inner.call(req);
         Box::pin(async move {
             let result = fut.await;
+            drop(in_flight);
             let code = match &result {
                 Ok(resp) => grpc_code_label(resp.headers(), resp.status()),
                 Err(_) => "transport_error".to_string(),
@@ -1914,11 +2592,21 @@ mod tests {
             "legion_allocations",
             "legion_eval_queue_depth",
             "legion_evals_processed_total",
+            "legion_grpc_in_flight",
             "legion_grpc_request_duration_seconds",
             "legion_grpc_requests_total",
             "legion_heartbeats_total",
             "legion_nodes",
             "legion_plan_apply_total",
+            "legion_raft_pipeline_depth",
+            "legion_raft_pipeline_wait_seconds",
+            "legion_read_model_nodes",
+            "legion_runtime_spawn_delay_seconds",
+            "legion_runtime_worker_threads",
+            "legion_store_coalesce_batch_size",
+            "legion_store_coalesce_commit_seconds",
+            "legion_store_coalesce_wait_rounds_total",
+            "legion_store_coalesce_wait_seconds",
             "legion_store_write_lock_wait_seconds",
         ] {
             assert!(
@@ -1927,5 +2615,37 @@ mod tests {
             );
         }
         assert!(out.contains("legion_plan_apply_total{outcome=\"applied\"}"));
+    }
+
+    #[test]
+    fn gauge_vec_add_is_relative_per_series() {
+        let gauge = GaugeVec {
+            meta: FamilyMeta {
+                name: "test_depth",
+                help: "g",
+                labels: &["lane"],
+            },
+            series: Series::new(),
+        };
+        gauge.add(&["status"], 1);
+        gauge.add(&["status"], 1);
+        gauge.add(&["control"], 1);
+        gauge.add(&["status"], -1);
+        assert_eq!(gauge.get(&["status"]), 1);
+        assert_eq!(gauge.get(&["control"]), 1);
+        assert_eq!(gauge.get(&["scheduler"]), 0);
+    }
+
+    #[test]
+    fn in_flight_guard_decrements_when_a_request_is_dropped_unfinished() {
+        let method = "legion.Manager/InFlightGuardTest";
+        let started = metrics().grpc_in_flight.get(&[method]);
+        {
+            let _guard = InFlightGuard::enter(method);
+            assert_eq!(metrics().grpc_in_flight.get(&[method]), started + 1);
+            // No completion path runs here — this is the cancelled-request
+            // case (client hung up, tonic dropped the future).
+        }
+        assert_eq!(metrics().grpc_in_flight.get(&[method]), started);
     }
 }

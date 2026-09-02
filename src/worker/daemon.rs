@@ -194,21 +194,64 @@ async fn run_worker_with_manager(
         // process; seed their refresh loops with an already-expired token so
         // they re-issue immediately.
         if !task.identities.is_empty() {
+            // Same file-delivery mapping the original launch used, so a
+            // refresh rewrites the file the workload is actually reading.
+            let delivery_base = task_manager
+                .lock()
+                .expect("task manager")
+                .file_delivery_base(allocation.id, &task.name, &task.runtime)
+                .map(
+                    |(in_task_root, host_task_dir)| crate::worker::identity::FileDeliveryBase {
+                        in_task_root,
+                        host_task_dir,
+                    },
+                );
             let prepared = task
                 .identities
                 .iter()
                 .map(|identity| PreparedIdentity {
                     identity: identity.clone(),
                     expires_at: 0,
+                    delivery_base: delivery_base.clone(),
                 })
                 .collect();
             identity_manager.spawn_refreshers(allocation.id, prepared, task_manager.clone());
         }
         spawn_health_monitor(task_manager.clone(), allocation, task);
     }
+    // Edge boot: this node serves `Worker.StartClaim` only when its worker
+    // config opts in. Off by default, independently of the manager's switch —
+    // an operator who enables the feature cluster-wide still chooses which
+    // nodes are edges (docs/edge-boot.md).
+    let edge_boot_config: crate::structs::WorkerEdgeBootConfigFull =
+        if config.edge_boot.trim().is_empty() {
+            crate::structs::WorkerEdgeBootConfigFull::default()
+        } else {
+            serde_json::from_str(&config.edge_boot).unwrap_or_else(|err| {
+                warn!(error = ?err, "Invalid edgeBoot worker config; edge starts stay disabled");
+                crate::structs::WorkerEdgeBootConfigFull::default()
+            })
+        };
+    let edge_boot = if edge_boot_config.accept_claims {
+        Some(Arc::new(build_edge_boot_runtime(
+            &edge_boot_config,
+            &manager_addr,
+            &name,
+            &config.pool,
+            client.clone(),
+            credentials.clone(),
+        )))
+    } else {
+        None
+    };
+    if edge_boot.is_some() {
+        info!(worker = %name, pool = %config.pool, "Edge boot enabled: this node accepts boot tickets");
+    }
+
     let worker_node = WorkerDaemonService {
         task_manager: task_manager.clone(),
         identity: Some(identity_manager.clone()),
+        edge_boot: edge_boot.clone(),
     };
     let worker_server_fut = Server::builder()
         .add_service(WorkerServer::new(worker_node))
@@ -251,6 +294,16 @@ async fn run_worker_with_manager(
         "workerAddress".into(),
         Value::String(format!("http://{}:{}", DEF_MANAGER_HOSTNAME, server_port)),
     );
+    // The cadence this node will actually beat at, so the manager can derive
+    // its lost window from it (`missedBeatsBeforeLost x this`) instead of
+    // applying one global constant to a fleet with several cadences. Reported
+    // rather than looked up because the node record carries no worker type —
+    // and it is the RESOLVED value, so what the manager records is what the
+    // worker does. See docs/heartbeat-cadence-and-scale.md.
+    config_attrs.insert(
+        "heartbeatSeconds".into(),
+        json!(heartbeat_interval.as_secs()),
+    );
 
     let registration = RegistrationPayload {
         name: name.clone(),
@@ -262,32 +315,7 @@ async fn run_worker_with_manager(
     register_self(client.clone(), &registration, &credentials).await?;
     info!(worker_name = %name, "Worker registered with manager");
 
-    // Worker telemetry: opt-in Prometheus listener (/metrics + /healthz,
-    // `legion_worker_*` families) so a fleet can prove its workers are not
-    // the bottleneck. Env-var rather than config: workers joined with a bare
-    // token have no config file, and packed multi-worker hosts need
-    // per-process ports anyway (port 0 = ephemeral, logged on bind). See
-    // docs/metrics.md.
-    if let Ok(port) = std::env::var("LEGION_WORKER_TELEMETRY_PORT") {
-        match port.trim().parse::<u16>() {
-            Ok(port) => {
-                let telemetry_addr: std::net::SocketAddr = ([0, 0, 0, 0], port).into();
-                tokio::spawn(async move {
-                    if let Err(err) =
-                        crate::manager::telemetry::serve_worker_telemetry(telemetry_addr).await
-                    {
-                        error!(error = ?err, "worker telemetry listener exited");
-                    }
-                });
-            }
-            Err(_) => warn!(
-                value = %port,
-                "Ignoring LEGION_WORKER_TELEMETRY_PORT: not a valid port number"
-            ),
-        }
-    }
-    // OTLP metrics push (opt-in via the OTEL_* env vars; no-op otherwise).
-    crate::otel::start_metrics_push();
+    start_worker_telemetry();
 
     // Registration just succeeded, so "now" is an honest last-contact time;
     // every successful heartbeat refreshes it. The self-fence watchdog kills
@@ -308,6 +336,7 @@ async fn run_worker_with_manager(
         registration,
         forwarder,
         heartbeat_interval,
+        edge_boot.as_ref().map(|runtime| runtime.spec_cache.clone()),
     );
     let self_fence_fut = start_self_fence_watchdog(task_manager.clone(), last_successful_heartbeat);
     let checks_fut = start_node_checks(
@@ -331,6 +360,61 @@ async fn run_worker_with_manager(
     );
 
     Ok(())
+}
+
+/// Assemble this node's edge-boot runtime: the JWKS-backed ticket verifier,
+/// the spec cache, and the ratifier that calls the manager.
+fn build_edge_boot_runtime(
+    config: &crate::structs::WorkerEdgeBootConfigFull,
+    manager_addr: &str,
+    node_id: &str,
+    pool: &str,
+    client: ManagerClient<Channel>,
+    credentials: Arc<WorkerCredentials>,
+) -> crate::worker::server::EdgeBootRuntime {
+    let refresh = humantime::parse_duration(&config.jwks_refresh)
+        .unwrap_or(crate::worker::boot_ticket::DEFAULT_JWKS_REFRESH);
+    let skew = humantime::parse_duration(&config.clock_skew)
+        .unwrap_or(crate::worker::boot_ticket::DEFAULT_CLOCK_SKEW);
+    // The issuer URL is the manager address the worker already trusts (it is
+    // what its join token pointed at), and the JWKS lives at the well-known
+    // path the manager serves alongside gRPC.
+    let issuer = manager_addr.trim_end_matches('/').to_string();
+    let jwks_url = format!("{issuer}/.well-known/jwks.json");
+    let source = Box::new(crate::worker::boot_ticket::HttpJwksSource::new(
+        jwks_url,
+        Duration::from_secs(5),
+    ));
+    crate::worker::server::EdgeBootRuntime {
+        verifier: Arc::new(crate::worker::boot_ticket::BootTicketVerifier::new(
+            source, issuer, pool, refresh, skew,
+        )),
+        spec_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        node_id: node_id.to_string(),
+        ratifier: Arc::new(ManagerClaimRatifier {
+            client,
+            credentials,
+        }),
+    }
+}
+
+/// Ratifies claims by calling the manager's `RatifyClaim`, authenticated with
+/// this node's own credentials.
+struct ManagerClaimRatifier {
+    client: ManagerClient<Channel>,
+    credentials: Arc<WorkerCredentials>,
+}
+
+#[tonic::async_trait]
+impl crate::worker::server::ClaimRatifier for ManagerClaimRatifier {
+    async fn ratify(
+        &self,
+        request: crate::structs::RatifyClaimRequest,
+    ) -> R<crate::structs::RatifyClaimReply> {
+        let mut client = self.client.clone();
+        let request = self.credentials.attach(tonic::Request::new(request));
+        Ok(client.ratify_claim(request).await?.into_inner())
+    }
 }
 
 #[instrument(err, skip_all)]
@@ -467,19 +551,85 @@ async fn create_manager_client(
 const HEARTBEAT_RETRY_MIN: Duration = Duration::from_millis(500);
 const HEARTBEAT_RETRY_MAX: Duration = Duration::from_secs(10);
 
+/// Start the worker process's telemetry exporters: the opt-in Prometheus
+/// listener (`/metrics` + `/healthz`, the `legion_worker_*` families) so a
+/// fleet can prove its workers are not the bottleneck, plus the OTLP
+/// metrics push (opt-in via the `OTEL_*` env vars; a no-op otherwise).
+///
+/// The listener is an env var rather than a config field deliberately:
+/// workers joined with a bare token have no config file, and packed
+/// multi-worker hosts need per-process ports anyway (port 0 = ephemeral,
+/// logged on bind). See docs/metrics.md.
+///
+/// Shared with the simulated-fleet mode (`worker::simulate`) — a sim host
+/// is exactly the host a scale campaign scrapes, so the two paths must not
+/// drift on how telemetry gets turned on.
+pub(crate) fn start_worker_telemetry() {
+    if let Ok(port) = std::env::var("LEGION_WORKER_TELEMETRY_PORT") {
+        match port.trim().parse::<u16>() {
+            Ok(port) => {
+                let telemetry_addr: std::net::SocketAddr = ([0, 0, 0, 0], port).into();
+                tokio::spawn(async move {
+                    if let Err(err) =
+                        crate::manager::telemetry::serve_worker_telemetry(telemetry_addr).await
+                    {
+                        error!(error = ?err, "worker telemetry listener exited");
+                    }
+                });
+            }
+            Err(_) => warn!(
+                value = %port,
+                "Ignoring LEGION_WORKER_TELEMETRY_PORT: not a valid port number"
+            ),
+        }
+    }
+    crate::otel::start_metrics_push();
+}
+
 /// Heartbeat cadence: worker-type config (`heartbeatSeconds`, clamped to
-/// 1..=30) or the built-in default. The manager's lost window stays 10s,
-/// so intervals above ~3s trade detection margin for load — the manager
-/// warns when serving such a config (docs/architecture-managers-workers.md).
-/// Shared with the simulated-fleet mode (`worker::simulate`), whose
-/// fairness contract is "same cadence resolution as a real worker".
+/// `1..=MAX_WORKER_HEARTBEAT_SECONDS`) or the built-in default.
+///
+/// The clamp used to stop at 30 because the lost window was a fixed 10s, so
+/// anything above ~3s traded detection margin for load. The window now moves
+/// with the cadence (`missedBeatsBeforeLost x this value`), so a slow worker
+/// type is a supported configuration — see
+/// docs/heartbeat-cadence-and-scale.md.
+///
+/// Shared with the simulated-fleet mode (`worker::simulate`), whose fairness
+/// contract is "same cadence resolution as a real worker".
 pub(crate) fn heartbeat_interval_for(config: &WorkerConfig) -> Duration {
-    Duration::from_secs(
-        config
-            .heartbeat_seconds
-            .map(|seconds| u64::from(seconds).clamp(1, 30))
-            .unwrap_or(WORKER_HEARTBEAT_DURATION_SEC),
-    )
+    Duration::from_secs(crate::manager::cadence::clamp_heartbeat_seconds(
+        config.heartbeat_seconds,
+    ))
+}
+
+/// The one-shot re-phase a worker performs when its served interval changes.
+///
+/// When the manager moves the fleet to a new interval, every worker learns it
+/// within one OLD interval and would otherwise re-phase onto the same
+/// boundary — a thundering herd the +-10% steady-state jitter (a slow random
+/// walk) would take a long time to break up. Sleeping `U[0, new)` ONCE spreads
+/// the fleet uniformly across the new period in exactly one beat, at the cost
+/// of one interval of unevenness.
+///
+/// Deliberately not Nomad's permanent `[base, 2*base)` stagger: that costs a
+/// third of the target rate forever, makes the operator's `N/R` arithmetic
+/// wrong by a variable factor, and doubles worst-case detection time.
+pub(crate) fn rephase_sleep(new_interval: Duration) -> Duration {
+    use rand::Rng;
+    new_interval.mul_f64(rand::thread_rng().gen_range(0.0..1.0))
+}
+
+/// Adopt a manager-served interval, if there is one and it differs.
+///
+/// A worker that receives nothing (adaptive cadence off, or an older manager)
+/// keeps its worker-type value — exactly today's behavior. A worker that
+/// receives one is never penalized for honoring it: the manager derives that
+/// node's lost window from the same number, and widens before it tells anyone.
+pub(crate) fn adopt_served_interval(current: Duration, served: Option<u32>) -> Option<Duration> {
+    let served =
+        Duration::from_secs(u64::from(served?).clamp(1, u64::from(MAX_WORKER_HEARTBEAT_SECONDS)));
+    (served != current).then_some(served)
 }
 
 /// The heartbeat sleep, jittered ±10% so a fleet that (re)started together
@@ -516,7 +666,13 @@ async fn start_heartbeats(
     credentials: Arc<WorkerCredentials>,
     registration: RegistrationPayload,
     forwarder: Arc<UpstreamForwarder>,
-    heartbeat_interval: Duration,
+    // The worker-type cadence this worker starts at. Mutable because the
+    // manager may serve a different one on the reply (adaptive cadence,
+    // docs/heartbeat-cadence-and-scale.md).
+    mut heartbeat_interval: Duration,
+    // Edge-boot spec cache to keep warm from the desired set; `None` on a
+    // node that does not accept edge starts.
+    spec_cache: Option<crate::worker::edge::SpecCache>,
 ) -> R<()> {
     let mut backoff = HEARTBEAT_RETRY_MIN;
 
@@ -529,6 +685,7 @@ async fn start_heartbeats(
             &identity_manager,
             &credentials,
             &forwarder,
+            spec_cache.as_ref(),
         )
         .await;
         let worker_metrics = crate::manager::telemetry::worker_metrics();
@@ -536,7 +693,7 @@ async fn start_heartbeats(
             .heartbeat_duration_seconds
             .observe(tick_started.elapsed().as_secs_f64());
         worker_metrics.heartbeats_total.inc(&[match &tick_result {
-            Ok(()) => "ok",
+            Ok(_) => "ok",
             Err(err)
                 if err
                     .downcast_ref::<tonic::Status>()
@@ -547,12 +704,30 @@ async fn start_heartbeats(
             Err(_) => "error",
         }]);
         match tick_result {
-            Ok(()) => {
+            Ok(served) => {
                 *last_successful_heartbeat
                     .lock()
                     .expect("heartbeat clock lock") = std::time::Instant::now();
                 backoff = HEARTBEAT_RETRY_MIN;
-                tokio::time::sleep(jittered_heartbeat_interval(heartbeat_interval)).await;
+                // Adopt a manager-served interval, once, with a full-width
+                // re-phase so a fleet that all learns the new value within one
+                // old interval spreads across the new period instead of
+                // re-phasing onto the same boundary.
+                match adopt_served_interval(heartbeat_interval, served) {
+                    Some(next) => {
+                        info!(
+                            worker = %name,
+                            from_seconds = heartbeat_interval.as_secs(),
+                            to_seconds = next.as_secs(),
+                            "Manager served a new heartbeat interval; re-phasing once"
+                        );
+                        heartbeat_interval = next;
+                        tokio::time::sleep(rephase_sleep(next)).await;
+                    }
+                    None => {
+                        tokio::time::sleep(jittered_heartbeat_interval(heartbeat_interval)).await;
+                    }
+                }
             }
             // The node token can be revoked/rotated (for example ACLs were
             // just enabled, or the manager state was reset). Re-register with
@@ -592,8 +767,13 @@ async fn heartbeat_tick(
     identity_manager: &Arc<WorkerIdentityManager>,
     credentials: &Arc<WorkerCredentials>,
     forwarder: &Arc<UpstreamForwarder>,
-) -> R<()> {
+    spec_cache: Option<&crate::worker::edge::SpecCache>,
+) -> R<Option<u32>> {
     let mut client_clone = client.clone();
+    // The cadence the manager wants, when it dictates one. `None` (the
+    // default, and every pre-adaptive manager) means "keep your worker-type
+    // interval".
+    let served_interval;
 
     {
         let start = std::time::Instant::now();
@@ -634,8 +814,14 @@ async fn heartbeat_tick(
                 .add(failures.len() as u64);
         }
 
+        // Unratified work is reported separately from committed allocations:
+        // the manager cannot reconcile what it has not recorded, but an
+        // operator looking at capacity must still see it.
+        let provisional_claims = crate::worker::edge::claim_reports(task_manager);
+
         let req = credentials.attach(tonic::Request::new(HeartbeatRequest {
             id: name.to_string(),
+            provisional_claims,
             allocation_ids: allocations,
             failed_allocations: failures,
             allocation_health,
@@ -674,6 +860,54 @@ async fn heartbeat_tick(
         };
         debug!(worker = %name, elapsed_ms = start.elapsed().as_millis() as u64, "Heartbeat acknowledged by manager");
         let reply = response.into_inner();
+        served_interval = reply.next_interval_seconds;
+        // The desired set is the other place a node learns job configs it may
+        // later be asked to start from a ticket.
+        if let Some(cache) = spec_cache {
+            crate::worker::edge::remember_specs(cache, &reply.desired_allocations);
+        }
+        // Catch-up verdicts, for claims whose `RatifyClaim` reply was lost
+        // after the manager committed (docs/edge-boot.md). Applied before the
+        // reconcile below so a confirmed claim is already an ordinary
+        // allocation by the time the desired set is compared.
+        for verdict in &reply.claim_verdicts {
+            // The committed payload is already on this reply, in
+            // `desired_allocations` — the manager lists it the moment the
+            // placement commits — so the verdict carries only the decision
+            // and this path costs no extra bytes on the wire.
+            let committed = verdict
+                .confirmed
+                .then(|| {
+                    reply
+                        .desired_allocations
+                        .iter()
+                        .find(|allocation| allocation.allocation_id == verdict.allocation_id)
+                })
+                .flatten();
+            if verdict.confirmed && committed.is_none() {
+                // Confirmed but not yet listed (the read model refreshes just
+                // after the commit): leave the claim alone and pick it up on
+                // the next tick, still inside its lease.
+                debug!(
+                    claim_id = %verdict.claim_id,
+                    allocation_id = verdict.allocation_id,
+                    "Verdict arrived before the allocation appeared in the desired set"
+                );
+                continue;
+            }
+            crate::worker::edge::apply_verdict(
+                task_manager,
+                &verdict.claim_id,
+                committed,
+                crate::structs::edge_boot::RefusalReason::from_wire(verdict.reason),
+                &verdict.detail,
+            );
+        }
+        // The lease is the backstop for every failure the reply path cannot
+        // cover: a partition, a dead manager, a lost verdict. It runs on the
+        // heartbeat tick because that is the one loop guaranteed to keep
+        // running while everything else is stuck.
+        crate::worker::edge::sweep_leases(task_manager);
         // The manager acknowledged us, so this reply is authoritative for the
         // connect datapath (see `apply_upstreams` on fail-static semantics).
         apply_upstreams(forwarder, &reply).await;
@@ -711,7 +945,24 @@ async fn heartbeat_tick(
                 .iter_mut()
                 .filter(|allocation| !running_set.contains(&allocation.allocation_id))
             {
-                match identity_manager.prepare_task_allocation(allocation).await {
+                let delivery_base = task_manager
+                    .lock()
+                    .expect("task manager")
+                    .file_delivery_base(
+                        allocation.allocation_id,
+                        &allocation.task_name,
+                        &allocation.task_runtime,
+                    )
+                    .map(|(in_task_root, host_task_dir)| {
+                        crate::worker::identity::FileDeliveryBase {
+                            in_task_root,
+                            host_task_dir,
+                        }
+                    });
+                match identity_manager
+                    .prepare_task_allocation(allocation, delivery_base)
+                    .await
+                {
                     Ok(prepared) => {
                         prepared_by_alloc.insert(allocation.allocation_id, prepared);
                     }
@@ -743,10 +994,27 @@ async fn heartbeat_tick(
                     )
                 })
                 .collect();
+            // Preemptor links ride the same feed; only preemption notices
+            // carry one, so this map is empty on every other cause.
+            let stop_preemptors = reply
+                .stop_notices
+                .iter()
+                .filter(|notice| !notice.preemptor_job.is_empty())
+                .map(|notice| {
+                    (
+                        notice.allocation_id,
+                        crate::structs::StopNoticePreemptor {
+                            job: notice.preemptor_job.clone(),
+                            band: notice.preemptor_band.clone(),
+                        },
+                    )
+                })
+                .collect();
 
             let new_allocations = {
                 let mut manager = task_manager.lock().expect("task manager");
                 manager.set_stop_causes(stop_causes);
+                manager.set_stop_preemptors(stop_preemptors);
                 manager.reconcile_allocations(&desired)
             };
             if !new_allocations.is_empty() {
@@ -790,7 +1058,7 @@ async fn heartbeat_tick(
         identity_manager.retain(&live);
     }
 
-    Ok(())
+    Ok(served_interval)
 }
 
 /// Drive the node-local connect datapath from one *successful* heartbeat
@@ -1073,6 +1341,7 @@ mod tests {
             },
             Arc::new(UpstreamForwarder::new()),
             Duration::from_secs(WORKER_HEARTBEAT_DURATION_SEC),
+            None,
         ));
 
         // Long enough for several failed attempts (first retry after 500ms).
@@ -1163,6 +1432,7 @@ mod tests {
     /// was assigned at placement time.
     fn connect_allocation(allocation_id: i64, service: &str, local_port: u16) -> TaskAllocation {
         TaskAllocation {
+            provisional: None,
             allocation_id,
             task_connect: json!({ "upstreams": [{ "service": service }] }).to_string(),
             network: json!({
@@ -1195,6 +1465,7 @@ mod tests {
     #[test]
     fn upstream_specs_skip_allocations_without_connect() {
         let plain = TaskAllocation {
+            provisional: None,
             allocation_id: 1,
             network: json!({ "ports": [{ "name": "http", "hostPort": 20000 }] }).to_string(),
             ..TaskAllocation::default()
@@ -1202,11 +1473,13 @@ mod tests {
         // Declared upstreams but no network yet (or a corrupt payload) cannot
         // produce a listener — there is no port to bind.
         let unplaced = TaskAllocation {
+            provisional: None,
             allocation_id: 2,
             task_connect: json!({ "upstreams": [{ "service": "db" }] }).to_string(),
             ..TaskAllocation::default()
         };
         let corrupt = TaskAllocation {
+            provisional: None,
             allocation_id: 3,
             task_connect: json!({ "upstreams": [{ "service": "db" }] }).to_string(),
             network: "{not json".into(),
@@ -1265,6 +1538,8 @@ mod tests {
         };
         let forwarder = UpstreamForwarder::new();
         let reply = HeartbeatReply {
+            claim_verdicts: Vec::new(),
+            next_interval_seconds: None,
             message: "ack".into(),
             desired_allocations: vec![connect_allocation(11, "db", local_port)],
             volume_destroy: Vec::new(),
@@ -1304,6 +1579,7 @@ mod tests {
         apply_upstreams(
             &forwarder,
             &HeartbeatReply {
+                claim_verdicts: Vec::new(),
                 message: "ack".into(),
                 ..HeartbeatReply::default()
             },

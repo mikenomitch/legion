@@ -235,6 +235,38 @@ fn work_root(allocation: &Allocation, instance: &TaskInstance) -> PathBuf {
         .join(".sandbox")
 }
 
+/// Bring a host TAP device administratively up or down.
+///
+/// This is the mechanism behind the `boot` gate (docs/edge-boot.md): a guest
+/// that has booted but is not yet ratified sits behind a shut link, and
+/// ratification is the only thing that raises it. The device itself is
+/// operator-precreated — Legion never creates or destroys TAP devices, it only
+/// changes their link state, so a failure here is an operator's capability
+/// problem (`CAP_NET_ADMIN`) rather than a missing device.
+///
+/// Deliberately shells out to `ip` rather than talking netlink: it is the same
+/// tool an operator debugging the gate would reach for, its failure text is
+/// the failure text they would see by hand, and the call happens twice per
+/// sandbox lifetime rather than on any hot path.
+fn set_tap_link(device: &str, open: bool) -> R<()> {
+    if !cfg!(target_os = "linux") {
+        bail!("the `boot` network gate needs Linux TAP link control; this host is not Linux");
+    }
+    let state = if open { "up" } else { "down" };
+    let output = Command::new("ip")
+        .args(["link", "set", "dev", device, state])
+        .output()
+        .with_context(|| format!("failed to run `ip link set dev {device} {state}`"))?;
+    if !output.status.success() {
+        bail!(
+            "`ip link set dev {device} {state}` failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    debug!(device, state, "Set sandbox TAP link state");
+    Ok(())
+}
+
 /// Path-safe form of an id used as a directory name. Instance ids are already
 /// constrained to `[A-Za-z0-9._-]` by the core, but a task name is not, and
 /// neither may ever produce a traversal.
@@ -727,8 +759,21 @@ impl SandboxTaskPlugin {
             &bundle,
             &config.command,
             &env,
-            &name,
-            &instance.volumes,
+            &oci_bundle::BundleContext {
+                hostname: &name,
+                volumes: &instance.volumes,
+                // The task dir is not mounted for the sandbox runtime: a
+                // microVM has no host bind mounts, and its dev-mode container
+                // must behave the same way so a jobspec does not change
+                // meaning per backend.
+                task_dir: None,
+                // The sandbox runtime has not adopted the enforcement
+                // interface (`ResourceEnforcement::Unsupported`), so worker
+                // core computes no assignment for it and its dev-mode bundle
+                // carries no limits. It is the designed-for next adopter —
+                // see docs/resource-enforcement.md.
+                assignment: None,
+            },
         )?;
         let mut cmd = Command::new(binary);
         cmd.arg("run").arg("--bundle").arg(&bundle).arg(&name);
@@ -901,6 +946,47 @@ impl TaskPlugin for SandboxTaskPlugin {
         Ok(())
     }
 
+    /// A sandbox is the one runtime whose `boot` gate is a real network
+    /// boundary: the guest reaches the outside world through exactly one host
+    /// TAP device (or, in `mode: 'none'`, through nothing at all), so holding
+    /// that device down before ratification physically isolates it.
+    fn network_gate(&self) -> crate::task_plugins::NetworkGate {
+        crate::task_plugins::NetworkGate::Enforced
+    }
+
+    /// Hold the guest's TAP device down (and drop its traffic) until the
+    /// placement is ratified, then bring it up.
+    ///
+    /// The device is attached at boot and only *administratively* shut,
+    /// because Firecracker cannot hotplug a NIC — attaching the interface
+    /// later is not an option, so the gate has to be on the link rather than
+    /// on the attachment. Both operations need `CAP_NET_ADMIN`, which
+    /// `mode: 'tap'` already requires of the operator.
+    ///
+    /// `mode: 'none'` (the default) needs no work: the guest has loopback and
+    /// nothing else, which is strictly stronger than a shut link.
+    fn set_network_gate(
+        &self,
+        allocation: &Allocation,
+        task: &TaskConfig,
+        _instance: &mut TaskInstance,
+        open: bool,
+    ) -> R<()> {
+        let config = SandboxTaskConfig::from_value(&task.config)?;
+        let Some(tap) = config.tap() else {
+            // Loopback-only guest: nothing to gate, and nothing to open.
+            return Ok(());
+        };
+        set_tap_link(&tap.device, open).with_context(|| {
+            format!(
+                "failed to {} TAP device {} for allocation {}",
+                if open { "open" } else { "shut" },
+                tap.device,
+                allocation.id
+            )
+        })
+    }
+
     fn prepare(
         &self,
         allocation: &Allocation,
@@ -977,6 +1063,27 @@ impl TaskPlugin for SandboxTaskPlugin {
         instance.pid = Some(child.id());
         instance.child = Some(child);
         Ok(())
+    }
+
+    /// **No graceful stop.** A sandbox is a guest OS behind a VMM process;
+    /// signalling the VMM terminates the hypervisor, it does not ask the
+    /// workload inside to shut down, and Legion has no in-guest agent to
+    /// relay a notice to. Rather than pretend — signalling the VMM and
+    /// calling the resulting hard stop "graceful" — this runtime declines the
+    /// notice, and the worker tears the allocation down immediately, exactly
+    /// as it did before graceful stop existed.
+    ///
+    /// The consequence is user-visible and documented in
+    /// `docs/graceful-stop.md`: `stop { signal, killAfter }` has no effect on
+    /// `sandbox` tasks.
+    fn stop_with(
+        &self,
+        _allocation: &Allocation,
+        _task: &TaskConfig,
+        _instance: &mut TaskInstance,
+        _ctx: &crate::task_plugins::StopContext,
+    ) -> R<bool> {
+        Ok(false)
     }
 
     fn stop(

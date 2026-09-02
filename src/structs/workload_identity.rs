@@ -34,10 +34,15 @@ pub const LEGION_CLAIM_PREFIX: &str = "legion.io/";
 /// or a `sub` template — overriding them would forge the trust-critical fields.
 pub const RESERVED_CLAIMS: &[&str] = &["iss", "sub", "aud", "exp", "iat", "nbf", "jti", "kid"];
 
-/// Signal names the worker can actually deliver for `changeMode: signal`. Kept
-/// in sync with `parse_signal` in `crate::worker::task_manager`; admission
-/// validates `changeSignal` against this set so a typo fails `job validate`
-/// rather than silently going stale in the refresh loop hours later.
+/// Signal names the worker can actually deliver for `changeMode: signal`, as
+/// bare short names.
+///
+/// Derived from [`crate::signals::SUPPORTED_SIGNALS`], which is the one
+/// vocabulary the whole system shares — admission (`changeSignal` and
+/// `stopSignal`), the worker's `kill(2)` path, and the container runtimes'
+/// `kill` subcommands. Admission validates against it so a typo fails
+/// `job validate` rather than silently going stale in the refresh loop hours
+/// later.
 pub const SUPPORTED_CHANGE_SIGNALS: &[&str] = &[
     "HUP", "INT", "QUIT", "TERM", "USR1", "USR2", "CONT", "WINCH",
 ];
@@ -45,17 +50,22 @@ pub const SUPPORTED_CHANGE_SIGNALS: &[&str] = &[
 /// Normalize a `changeSignal` to its canonical short name (uppercased, optional
 /// `SIG` prefix stripped), erroring if it is not one the worker can deliver.
 pub fn normalize_change_signal(raw: &str) -> R<&'static str> {
-    let trimmed = raw.trim().to_ascii_uppercase();
-    let bare = trimmed.strip_prefix("SIG").unwrap_or(&trimmed);
-    SUPPORTED_CHANGE_SIGNALS
-        .iter()
-        .find(|s| **s == bare)
-        .copied()
-        .with_context(|| {
-            format!(
+    // Validity comes from the shared vocabulary; the short spelling is this
+    // field's own convention and is what callers store.
+    crate::signals::canonical_signal_name(raw)
+        .map_err(|_| {
+            anyhow!(
                 "unsupported changeSignal {raw:?}; supported signals are {}",
                 SUPPORTED_CHANGE_SIGNALS.join(", ")
             )
+        })
+        .and_then(|canonical| {
+            let bare = canonical.strip_prefix("SIG").unwrap_or(&canonical);
+            SUPPORTED_CHANGE_SIGNALS
+                .iter()
+                .find(|candidate| **candidate == bare)
+                .copied()
+                .with_context(|| format!("unsupported changeSignal {raw:?}"))
         })
 }
 

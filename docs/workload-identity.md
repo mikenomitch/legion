@@ -80,33 +80,33 @@ per identity (`subTemplate`). Admission validation enforces the guardrails:
 Declare one or more named identities per task. Each is independent, so one task
 can federate into several providers at once.
 
-```jsonnet
+```nickel
 {
-  name: 'api',
-  runtime: 'exec',
-  identities: [
+  name = "api",
+  runtime = "exec",
+  identities = [
     {
-      name: 'aws',                       // unique per task
-      audience: ['sts.amazonaws.com'],   // non-empty, manager-enforced
-      ttl: '15m',
-      file: { path: '/var/run/legion/identity/aws/token', mode: '0400' },
-      changeMode: 'noop',                // SDK re-reads the file → no reload
+      name = "aws",                       # unique per task
+      audience = ["sts.amazonaws.com"],   # non-empty, manager-enforced
+      ttl = "15m",
+      file = { path = "/var/run/legion/identity/aws/token", mode = "0400" },
+      changeMode = "noop",                # SDK re-reads the file → no reload
     },
     {
-      name: 'vault',
-      audience: ['vault.internal'],
-      ttl: '5m',
-      env: 'VAULT_WORKLOAD_TOKEN',
-      changeMode: 'signal',              // env can't change live → signal
-      changeSignal: 'SIGHUP',
-      extraClaims: { 'app.example.com/tier': 'backend' },
+      name = "vault",
+      audience = ["vault.internal"],
+      ttl = "5m",
+      env = "VAULT_WORKLOAD_TOKEN",
+      changeMode = "signal",              # env can't change live → signal
+      changeSignal = "SIGHUP",
+      extraClaims = { "app.example.com/tier" = "backend" },
     },
   ],
 }
 ```
 
 A full runnable example is at
-[configs/jobs/workload-identity.jsonnet](../configs/jobs/workload-identity.jsonnet).
+[configs/jobs/workload-identity.ncl](../configs/jobs/workload-identity.ncl).
 
 ### Validation rules
 
@@ -115,7 +115,7 @@ A full runnable example is at
 - At least one of `env` or `file` must be set.
 - `extraClaims` are static literals; keys may not be a reserved JWT claim
   (`iss`/`sub`/`aud`/…) or use the `legion.io/*` namespace.
-- **Change mode / delivery compatibility:** `env` + `changeMode: noop` is
+- **Change mode / delivery compatibility:** `env` + `changeMode = "noop"` is
   rejected (env can't refresh in place); `signal` requires `changeSignal`.
 - The task runtime must support the requested delivery (capability gating below).
 
@@ -135,28 +135,58 @@ When a token is re-issued before expiry, `changeMode` governs what happens:
 | Kind | env delivery | file delivery | signal |
 | --- | --- | --- | --- |
 | `exec` | ✅ | ✅ | ✅ |
-| `container` | ✅ | ❌ | ❌ |
+| `container` | ✅ | ✅ (paths under `/legion/task`) | ✅ |
+| `sandbox` | ✅ | ❌ | ❌ |
 | `noop` | ❌ | ❌ | ❌ |
 
-`container` mirrors its existing injection surface (env yes, file no — file
-delivery into a container needs volume plumbing it doesn't yet implement, the
-same limitation as KV file injection). An env-delivered identity on a container
-must therefore refresh via `changeMode: restart`. Specs that ask for an
-unsupported delivery are rejected at admission with an actionable error.
+Specs that ask for an unsupported delivery are rejected at admission with an
+actionable error.
+
+**`container` file paths must resolve under `/legion/task`.** The allocation's
+task directory is bind-mounted there, and nothing else of the host is
+reachable from inside the container, so a destination outside the mount is
+rejected at submit rather than written where the workload could never read it.
+Relative paths resolve against the mount:
+
+```nickel
+identities = [{
+  name = "api",
+  audience = ["sts.amazonaws.com"],
+  file = { path = "/legion/task/identity/token", mode = "0400" },
+  changeMode = "signal",
+  changeSignal = "SIGHUP",
+}],
+```
+
+```
+task api identity "api": file.path "/var/run/legion/token" is outside the
+container task directory; use a path under /legion/task (or a relative path),
+or switch to env delivery
+```
+
+This is the one place a jobspec is not verbatim-portable between the `exec`
+and `container` runtimes — the exec runtime's filesystem *is* the host's, so
+its host-absolute paths stay valid.
+
+Because the *directory* is mounted (never individual files), the worker's
+atomic rewrite-and-rename on rotation is visible inside the running container.
+Paired with `changeMode = "signal"` — which the container runtime delivers to
+the container's init process — a rotation reaches the workload with no restart
+at all. See [docs/task-runtime-container.md](task-runtime-container.md).
 
 ## Manager configuration
 
-```jsonnet
-// manager.jsonnet
+```nickel
+# manager.ncl
 {
-  workloadIdentity: {
-    enabled: true,                              // default false
-    issuer: 'https://manager.example.com:4747', // public HTTPS issuer URL
-    jwksPath: '/.well-known/jwks.json',            // must start with '/'
-    signingAlg: 'ES256',                           // only ES256 is supported
-    defaultTtl: '15m',
-    rotationAge: '24h',
-    subTemplate: '{region}:{job}:{group}:{task}',
+  workloadIdentity = {
+    enabled = true,                              # default false
+    issuer = "https://manager.example.com:4747", # public HTTPS issuer URL
+    jwksPath = "/.well-known/jwks.json",            # must start with '/'
+    signingAlg = "ES256",                           # only ES256 is supported
+    defaultTtl = "15m",
+    rotationAge = "24h",
+    subTemplate = "{region}:{job}:{group}:{task}",
   },
 }
 ```
@@ -321,21 +351,21 @@ removes its delivered token files and per-allocation backing directory.
 
 ## Testing this locally in a basic way
 
-1. Enable workload identity in `configs/manager.jsonnet` (the block is there,
+1. Enable workload identity in `configs/manager.ncl` (the block is there,
    commented):
 
-   ```jsonnet
-   workloadIdentity: {
-     enabled: true,
-     // optional; defaults to http://127.0.0.1:4747 for local testing
-     // issuer: 'https://manager.example.com:4747',
+   ```nickel
+   workloadIdentity = {
+     enabled = true,
+     # optional; defaults to http://127.0.0.1:4747 for local testing
+     # issuer = "https://manager.example.com:4747",
    },
    ```
 
 2. Start a manager (with an in-process worker for a one-machine demo):
 
    ```sh
-   cargo run -- start manager -c configs/manager.jsonnet --run-worker
+   cargo run -- start manager -c configs/manager.ncl --run-worker
    ```
 
    The log line `Workload identity enabled; serving OIDC discovery and JWKS`
@@ -351,7 +381,7 @@ removes its delivered token files and per-allocation backing directory.
 4. Run the example job and find the delivered token:
 
    ```sh
-   cargo run -- job run configs/jobs/workload-identity.jsonnet
+   cargo run -- job run configs/jobs/workload-identity.ncl
    sudo cat /var/run/legion/identity/aws/token   # the 'aws' file identity
    ```
 
@@ -366,16 +396,16 @@ removes its delivered token files and per-allocation backing directory.
 
    (`jwt decode "$TOKEN"` from mike-engel/jwt-cli gives the same view.)
 
-6. Watch a refresh happen: the `aws` identity uses `ttl: '15m'`, so the
+6. Watch a refresh happen: the `aws` identity uses `ttl = "15m"`, so the
    worker rewrites the file after ~7–8 minutes. For a faster demo set
-   `ttl: '1m'` in the jobspec and watch:
+   `ttl = "1m"` in the jobspec and watch:
 
    ```sh
    watch -n5 'sudo stat -c "%y" /var/run/legion/identity/aws/token;      sudo cat /var/run/legion/identity/aws/token | cut -d. -f2 | tr "_-" "/+" | base64 -d 2>/dev/null | jq .exp'
    ```
 
    Each refresh bumps the mtime and `exp`, with no task restart
-   (`changeMode: noop`). The `vault` env identity refreshes its backing file
+   (`changeMode = "noop"`). The `vault` env identity refreshes its backing file
    (`.legion/identity/<alloc>/vault/token`) and SIGHUPs the task instead.
 
 ## Node identities
@@ -387,20 +417,20 @@ a pre-warm fetch that happens before any task exists. **Node identities** are
 identities issued to worker nodes rather than tasks, declared once at the
 cluster level:
 
-```jsonnet
-// manager.jsonnet
+```nickel
+# manager.ncl
 {
-  workloadIdentity: {
-    enabled: true,
-    issuer: 'https://manager.example.com:4747',
-    // ... existing fields ...
+  workloadIdentity = {
+    enabled = true,
+    issuer = "https://manager.example.com:4747",
+    # ... existing fields ...
 
-    nodeIdentities: [
+    nodeIdentities = [
       {
-        name: 'artifact-pull',            // unique cluster-wide
-        audience: ['sts.amazonaws.com'],  // non-empty, like task identities
-        ttl: '15m',                       // optional; cluster default TTL otherwise
-        subTemplate: '{region}:node:{pool}',  // optional; this is the default
+        name = "artifact-pull",            # unique cluster-wide
+        audience = ["sts.amazonaws.com"],  # non-empty, like task identities
+        ttl = "15m",                       # optional; cluster default TTL otherwise
+        subTemplate = "{region}:node:{pool}",  # optional; this is the default
       },
     ],
   },
@@ -435,7 +465,7 @@ Node `subTemplate`s follow the same philosophy as task templates — dumb
 ### Who consumes node identities
 
 The **artifact system** ([docs/artifacts.md](artifacts.md)) is the first
-consumer: a task artifact may set `auth: { nodeIdentity: 'artifact-pull' }`,
+consumer: a task artifact may set `auth = { nodeIdentity = "artifact-pull" }`,
 and cluster-level `artifacts.auth` matchers may route source prefixes to a
 node identity. Cluster matchers may use node identities precisely *because*
 they are cluster-scoped — attaching a per-task identity cluster-wide would
@@ -518,12 +548,12 @@ A task authenticates back to Legion itself with the reserved identity name
 `legion`. Declare it like any other identity, but **omit `audience`** — the
 manager owns it and always stamps `aud` = the cluster issuer:
 
-```jsonnet
-identities: [
+```nickel
+identities = [
   {
-    name: 'legion',                 // reserved control-plane identity
-    // no `audience` — the manager sets it to the cluster issuer
-    file: { path: '/var/run/legion/identity/legion/token', mode: '0400' },
+    name = "legion",                 # reserved control-plane identity
+    # no `audience` — the manager sets it to the cluster issuer
+    file = { path = "/var/run/legion/identity/legion/token", mode = "0400" },
   },
 ]
 ```
@@ -543,12 +573,12 @@ Mapping that verified identity to *permissions* is done with binding rules —
 the same claim→policy mechanism as external JWT auth methods — under
 `workloadIdentity.controlPlaneBindings`:
 
-```jsonnet
-workloadIdentity: {
-  enabled: true,
-  controlPlaneBindings: [
-    // Grant the `kv-reader` policy to any workload whose job is `api`.
-    { claim: 'legion.io/job', value: 'api', policies: ['kv-reader'] },
+```nickel
+workloadIdentity = {
+  enabled = true,
+  controlPlaneBindings = [
+    # Grant the `kv-reader` policy to any workload whose job is `api`.
+    { claim = "legion.io/job", value = "api", policies = ["kv-reader"] },
   ],
 }
 ```

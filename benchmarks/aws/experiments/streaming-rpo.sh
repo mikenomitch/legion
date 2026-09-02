@@ -9,7 +9,7 @@
 #   RPO_secs  = (last_written_seq - last_survived_seq) / WRITE_HZ
 #   gap_secs  = first successful write after the kill - kill time
 #
-# Publish alongside syncInterval (1s in manager-b.jsonnet.tpl) and the
+# Publish alongside syncInterval (1s in manager-b.ncl.tpl) and the
 # lease TTL (15s) — the numbers are functions of both.
 #
 # Usage: streaming-rpo.sh [--write-hz 10] [--campaign <id>]
@@ -35,7 +35,7 @@ CAMPAIGN="${CAMPAIGN:-adhoc-$(date -u +%Y%m%d-%H%M%S)}"
 # Locate the current primary (the ready box).
 PRIMARY_IDX=""
 for idx in 0 1 2; do
-    if curl -fsS -m 3 "http://${CP_PUBLIC_IPS[$idx]}:4749/readyz" >/dev/null 2>&1; then
+    if curl -fsS -m 3 "http://${CP_ADDRS[$idx]}:4749/readyz" >/dev/null 2>&1; then
         PRIMARY_IDX=$idx
         break
     fi
@@ -45,13 +45,13 @@ done
     exit 1
 }
 PRIMARY_PRIVATE="${CP_PRIVATE_IPS[$PRIMARY_IDX]}"
-PRIMARY_PUBLIC="${CP_PUBLIC_IPS[$PRIMARY_IDX]}"
+PRIMARY_PUBLIC="${CP_ADDRS[$PRIMARY_IDX]}"
 log "streaming primary: cp-$PRIMARY_IDX ($PRIMARY_PRIVATE), writing at ${WRITE_HZ}Hz"
 
 RUN_ID="experiments/rpo-$(date -u +%Y%m%d-%H%M%S)"
 REMOTE_OUT="/opt/bench/runs/$CAMPAIGN/$RUN_ID"
 
-rsh "$LOADGEN_PUBLIC_IP" "
+rsh "$LOADGEN_ADDR" "
     set -euo pipefail
     mkdir -p '$REMOTE_OUT'
     export LEGION_ADDR='http://$PRIMARY_PRIVATE:4747'
@@ -73,7 +73,7 @@ rsh "$LOADGEN_PUBLIC_IP" "
 
     KILL_MS=\$(date +%s%3N)
     echo \"\$KILL_MS\" > '$REMOTE_OUT/kill_ms'
-    ssh -o StrictHostKeyChecking=accept-new ubuntu@$PRIMARY_PRIVATE sudo systemctl stop legion-manager
+    $RSH_FROM_LOADGEN ubuntu@$PRIMARY_PRIVATE sudo systemctl stop legion-manager
 
     # Wait for a standby to take the lease (TTL 15s + renew), then find it.
     NEW_PRIMARY=''

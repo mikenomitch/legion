@@ -68,7 +68,7 @@ pub fn catalog() -> Vec<Capability> {
             name: "job.plan",
             cli: "legion job plan <PATH>",
             grpc: Some("Manager/PlanJob"),
-            summary: "Dry-run: preview which nodes allocations would land on.",
+            summary: "Dry-run: preview which nodes allocations would land on, and which running allocations the submit would preempt.",
             mutates: false,
             read_only_safe: true,
         },
@@ -356,6 +356,16 @@ pub fn catalog() -> Vec<Capability> {
             read_only_safe: true,
         },
         Capability {
+            name: "node.cadence",
+            cli: "legion node cadence",
+            grpc: Some("Manager/GetHeartbeatCadence"),
+            summary: "Report whether the fleet is sustaining its heartbeat cadence: freshness \
+                 ratio, lost window, sustainable fleet size, and the heartbeatSeconds value to \
+                 set if it is falling behind.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
             name: "node.cordon",
             cli: "legion node cordon <ID>",
             grpc: Some("Manager/SetNodeAvailability"),
@@ -415,6 +425,39 @@ pub fn catalog() -> Vec<Capability> {
             summary: "Revoke a worker join token.",
             mutates: true,
             read_only_safe: false,
+        },
+        // --- Edge boot (docs/edge-boot.md) ---
+        Capability {
+            name: "boot-ticket.create",
+            cli: "legion boot-ticket create <JOB> --task <T> --pool <P>",
+            grpc: Some("Manager/IssueBootTicket"),
+            summary: "Mint a short-lived capability letting an edge node start one workload.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "boot-ticket.list",
+            cli: "legion boot-ticket list",
+            grpc: Some("Manager/ListBootTickets"),
+            summary: "List outstanding boot tickets (metadata only; token bytes are never shown).",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "sandbox.start",
+            cli: "legion sandbox start <JOB> --id <ID> --node <ADDR> --ticket <T>",
+            grpc: Some("Worker/StartClaim"),
+            summary: "Start a workload directly on an edge node from a boot ticket.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "node.claims",
+            cli: "legion node claims <NODE>",
+            grpc: Some("Manager/GetNode"),
+            summary: "List a node's live provisional (unratified) allocations.",
+            mutates: false,
+            read_only_safe: true,
         },
         Capability {
             name: "events.follow",

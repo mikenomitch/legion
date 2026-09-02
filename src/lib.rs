@@ -1,6 +1,7 @@
 pub mod artifacts;
 pub mod certs;
 pub mod cmd;
+pub mod config_lang;
 pub mod constants;
 pub mod constraints;
 pub mod manager;
@@ -9,6 +10,7 @@ pub mod plugin_runtime;
 pub mod prelude;
 pub mod resources;
 pub mod scheduling_index;
+pub mod signals;
 pub mod storage;
 pub mod structs;
 pub mod task_plugins;

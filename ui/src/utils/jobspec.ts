@@ -215,7 +215,7 @@ export const shortenArtifactDigest = (digest: string): string => {
   return `${prefix}${hex.slice(0, 8)}…`
 }
 
-// Specs are hand-written jsonnet, so accept both the camelCase the manager
+// Specs are hand-written Nickel, so accept both the camelCase the manager
 // serializes and the snake_case people actually type.
 const readEither = (raw: Record<string, unknown>, camel: string, snake: string): unknown =>
   raw[camel] ?? raw[snake]

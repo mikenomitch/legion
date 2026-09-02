@@ -45,6 +45,12 @@ pub enum AclResource {
     /// teammate) can resize a job without the right to redeploy it. Scope
     /// with the job-name selector, like `job` rules.
     Scale,
+    /// Boot tickets (`legion boot-ticket`, docs/edge-boot.md): `read` lists
+    /// outstanding tickets, `write` mints one. Separate from `job` for the
+    /// same reason `scale` is — a platform's ticket minter should be able to
+    /// authorize individual starts without holding `job:write`, which means
+    /// "redeploy the fleet". Scope with the job-name selector.
+    Boot,
 }
 
 impl AclResource {
@@ -60,12 +66,14 @@ impl AclResource {
             AclResource::Action => "action",
             AclResource::Template => "template",
             AclResource::Scale => "scale",
+            AclResource::Boot => "boot",
         }
     }
 
     pub fn all() -> &'static [&'static str] {
         &[
             "job", "node", "kv", "state", "operator", "acl", "exec", "action", "template", "scale",
+            "boot",
         ]
     }
 }
@@ -94,7 +102,7 @@ impl AclAction {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AclRule {
     /// Resource types: `job`, `node`, `kv`, `state`, `operator`, `acl`,
-    /// `exec`, `action`, `template`, `scale`, `*`.
+    /// `exec`, `action`, `template`, `scale`, `boot`, `*`.
     pub resources: Vec<String>,
     /// Actions: `read`, `write`, `*`.
     pub actions: Vec<String>,
@@ -128,6 +136,24 @@ pub struct AclRule {
     /// to plain RunJob submissions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub templates: Option<Vec<String>>,
+    /// Glob selectors over job priority bands (`critical`, `high`,
+    /// `elevated`, `normal`, `low`, `background`) on `job` rules.
+    ///
+    /// This is how "who may claim `critical`" is expressed. It is a selector
+    /// rather than a coarse `operator:write` check because `operator` means
+    /// "raft, manager configs, observability" — gating bands on it would make
+    /// everyone who may submit a critical job a raft administrator, and it
+    /// could not express "team A may use `critical` in their namespace",
+    /// which is the first thing any shared cluster asks for.
+    ///
+    /// Standard selector semantics apply, and they cut both ways here: a rule
+    /// that names `bands` grants nothing to a request with no band attribute,
+    /// and a rule that omits `bands` covers every band. So bands are open by
+    /// default and become a privilege exactly where a policy says so — which
+    /// is why the write path normalizes the band (absent = `normal`) onto the
+    /// scope before enforcing, rather than leaving it unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bands: Option<Vec<String>>,
     /// On `exec` rules: when true, the rule also grants exec into host-level
     /// (unsandboxed) kinds. When absent/false, it matches only sandboxed
     /// kinds. Mirrors Nomad's `alloc-exec` vs `alloc-node-exec` split.
@@ -147,6 +173,7 @@ impl AclRule {
             || self.paths.is_some()
             || self.action_names.is_some()
             || self.templates.is_some()
+            || self.bands.is_some()
     }
 }
 
@@ -172,6 +199,11 @@ pub struct AclScope {
     /// spec-changing write path — that would let a template-scoped identity
     /// push arbitrary specs to a job its template once created.
     pub template: Option<String>,
+    /// Priority band of the job being submitted, on `job` write scopes.
+    /// Always populated (defaulted to `normal`) on the submit path, never on
+    /// reads — a `bands` rule is about what you may *claim*, not about what
+    /// you may look at.
+    pub band: Option<String>,
     /// True when the exec target is a host-level (unsandboxed) kind. Only an
     /// `exec` rule with `host: true` matches such a scope.
     pub host: bool,
@@ -266,6 +298,17 @@ impl AclScope {
         self.template = template;
         self
     }
+
+    /// Attaches the priority band a submission is claiming.
+    ///
+    /// Called on **every** job write path with the band already defaulted, so
+    /// a `bands` rule matches consistently. Leaving it unset for an
+    /// un-banded submit would mean band-scoped policies silently granted
+    /// nothing — the exact failure the selector docs warn about.
+    pub fn with_band(mut self, band: crate::structs::Band) -> Self {
+        self.band = Some(band.as_str().to_string());
+        self
+    }
 }
 
 /// Glob match supporting `*` (any run of characters, including empty).
@@ -357,6 +400,7 @@ fn rule_matches(
         && selector_matches(&rule.paths, &scope.path)
         && selector_matches(&rule.action_names, &scope.action_name)
         && selector_matches(&rule.templates, &scope.template)
+        && selector_matches(&rule.bands, &scope.band)
 }
 
 /// Default-deny evaluation over a flattened rule set.

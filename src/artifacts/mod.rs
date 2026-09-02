@@ -168,7 +168,7 @@ mod tests {
     #[test]
     fn fetch_source_to_dir_handles_bare_paths() -> R<()> {
         let src = tempdir()?;
-        let file = src.path().join("spec.jsonnet");
+        let file = src.path().join("spec.ncl");
         fs::write(&file, "{}")?;
 
         let dest = tempdir()?;
@@ -180,7 +180,7 @@ mod tests {
     #[test]
     fn fetch_source_to_dir_handles_file_urls() -> R<()> {
         let src = tempdir()?;
-        let file = src.path().join("spec.jsonnet");
+        let file = src.path().join("spec.ncl");
         fs::write(&file, "{ name: 'x' }")?;
 
         let dest = tempdir()?;

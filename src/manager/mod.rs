@@ -1,7 +1,9 @@
 pub mod acl;
 pub mod auth_method;
+pub mod cadence;
 pub mod daemon;
 pub mod dispatcher;
+pub mod edge_boot;
 pub mod exec;
 pub mod exec_ws;
 pub mod job_templates;

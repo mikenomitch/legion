@@ -7,12 +7,12 @@ cheap to lose: a replica dies, you take a cold start, nobody pages. As a
 Those want opposite things from a scheduler, so this guide runs both and makes
 the difference explicit in the spec.
 
-Runnable spec: [`configs/jobs/redis.jsonnet`](../../configs/jobs/redis.jsonnet).
+Runnable spec: [`configs/jobs/redis.ncl`](../../configs/jobs/redis.ncl).
 
 ## Run it
 
 ```bash
-legion job run configs/jobs/redis.jsonnet
+legion job run configs/jobs/redis.ncl
 legion volume list --job redis
 ```
 
@@ -30,25 +30,25 @@ legion service resolve redis-cache  # the pool
 
 ## The durable one
 
-```jsonnet
+```nickel
 {
-  name: 'store',
-  runtime: 'exec',
-  count: 1,
-  group: 'store',
+  name = "store",
+  runtime = "exec",
+  count = 1,
+  group = "store",
 
-  stateful: {
-    mode: 'slot',
-    storage: { path: '/var/lib/redis', driver: 'local-dir', params: { size: '5G' } },
+  stateful = {
+    mode = "slot",
+    storage = { path = "/var/lib/redis", driver = "local-dir", params = { size = "5G" } },
   },
 
-  config: {
-    command: [
-      'redis-server',
-      '--dir', '$LEGION_STORAGE_DIR',
-      '--appendonly', 'yes',
-      '--appendfsync', 'everysec',
-      '--port', '$LEGION_PORT_REDIS',
+  config = {
+    command = [
+      "redis-server",
+      "--dir", "$LEGION_STORAGE_DIR",
+      "--appendonly", "yes",
+      "--appendfsync", "everysec",
+      "--port", "$LEGION_PORT_REDIS",
     ],
   },
 }
@@ -68,7 +68,7 @@ you can lose up to a second of writes on a hard kill, in exchange for not
 fsyncing on every command. `--appendfsync always` is the durable-but-slow
 setting if that second matters.
 
-**`count: 1`.** Two Redis processes on one AOF directory corrupt it. Slot mode
+**`count = 1`.** Two Redis processes on one AOF directory corrupt it. Slot mode
 guarantees at most one live allocation per instance even across a network
 partition (see
 [Node loss and fencing](../stateful-workloads.md#node-loss-and-fencing-at-most-one)),
@@ -78,28 +78,28 @@ which is exactly the guarantee this needs.
 
 ```bash
 redis-cli -h <addr> -p <port> SET greeting hello
-legion job run configs/jobs/redis.jsonnet --force-reschedule
+legion job run configs/jobs/redis.ncl --force-reschedule
 # wait for it to come back
 redis-cli -h <addr> -p <port> GET greeting   # "hello"
 ```
 
 ## The cache
 
-```jsonnet
+```nickel
 {
-  name: 'cache',
-  runtime: 'exec',
-  count: 2,
-  group: 'cache',
-  // No `stateful` block at all.
-  config: {
-    command: [
-      'redis-server',
-      '--save', '',
-      '--appendonly', 'no',
-      '--maxmemory', '256mb',
-      '--maxmemory-policy', 'allkeys-lru',
-      '--port', '$LEGION_PORT_REDIS',
+  name = "cache",
+  runtime = "exec",
+  count = 2,
+  group = "cache",
+  # No `stateful` block at all.
+  config = {
+    command = [
+      "redis-server",
+      "--save", "",
+      "--appendonly", "no",
+      "--maxmemory", "256mb",
+      "--maxmemory-policy", "allkeys-lru",
+      "--port", "$LEGION_PORT_REDIS",
     ],
   },
 }
@@ -115,7 +115,7 @@ Scale it freely:
 
 ```bash
 # bump count, resubmit — new replicas start cold and warm up
-legion job run configs/jobs/redis.jsonnet
+legion job run configs/jobs/redis.ncl
 ```
 
 ### If the cache needs scratch space
@@ -123,9 +123,9 @@ legion job run configs/jobs/redis.jsonnet
 Some workloads want a big scratch area without wanting durability. Claim one
 under `volumes` rather than `stateful.storage`:
 
-```jsonnet
-volumes: [{ name: 'scratch', driver: 'tmpfs', params: { size: '1G' },
-            path: '/scratch' }],
+```nickel
+volumes = [{ name = "scratch", driver = "tmpfs", params = { size = "1G" },
+            path = "/scratch" }],
 ```
 
 `tmpfs` is RAM-backed, wiped on unmount, and **Linux only**. It advertises
@@ -163,7 +163,7 @@ lands inside a shell.
 
 | | Cache | Store |
 | --- | --- | --- |
-| `stateful` block | none | `mode: 'slot'` |
+| `stateful` block | none | `mode = "slot"` |
 | Volume | none (or a `tmpfs` claim) | `local-dir` / `nfs` |
 | Persistence | `--save ''`, `--appendonly no` | `--appendonly yes` |
 | Eviction | `maxmemory` + `allkeys-lru` | none — evicting real data is data loss |
@@ -180,11 +180,11 @@ cache. If it is "users are logged out" or "we lost the queue", it is a store.
 rather than starting empty somewhere else. To let it move, put the data on
 network storage:
 
-```jsonnet
-storage: {
-  path: '/var/lib/redis',
-  driver: 'nfs',
-  params: { server: '10.0.0.5', export: '/exports/redis' },
+```nickel
+storage = {
+  path = "/var/lib/redis",
+  driver = "nfs",
+  params = { server = "10.0.0.5", export = "/exports/redis" },
 }
 ```
 
@@ -198,10 +198,10 @@ Redis replication is the better answer — see below.
 For a replicated setup, run the primary and replicas as separate tasks in one
 group. The replica task points at the primary's service address:
 
-```jsonnet
-config: {
-  command: ['redis-server', '--dir', '$LEGION_STORAGE_DIR',
-            '--replicaof', 'redis.service.legion', '6379'],
+```nickel
+config = {
+  command = ["redis-server", "--dir", "$LEGION_STORAGE_DIR",
+            "--replicaof", "redis.service.legion", "6379"],
 },
 ```
 
@@ -209,7 +209,7 @@ Each replica is its own slot instance with its own volume, so a restarted
 replica resyncs from local data instead of a full transfer.
 
 Automatic promotion needs Sentinel (or a client library that handles it).
-Sentinel itself is a stateless task with `count: 3` — it needs no volume, only
+Sentinel itself is a stateless task with `count = 3` — it needs no volume, only
 quorum. Legion's [KV store](../kv-store.md) can hold the current primary
 address for clients that would rather resolve than gossip.
 
@@ -221,7 +221,7 @@ confirms.
 
 **`redis-server` fails with a permissions error on the dir.** The worker's user
 owns the volume directory. Either run the task as that user, or set
-`params: { mode: '0777' }` on the volume (blunt, but honest for a dev cluster).
+`params = { mode = "0777" }` on the volume (blunt, but honest for a dev cluster).
 
 **The store instance will not place.** The node-local pin — see
 [docs/volumes.md](../volumes.md#when-a-replica-will-not-place).

@@ -18,6 +18,22 @@ boundary.
 | `streaming-rpo.sh` | Lease-failover gap + RPO (writes not yet shipped) | legion-b |
 | `soak-24h.sh` | Drift, leaks, eval-queue growth, store growth over 24h of mixed+churn | legion-a or -b |
 | `upgrade-under-load.sh` | Placement disruption during a rolling manager upgrade | legion-a |
+| `packing-density.sh` | How many sim nodes one worker instance really carries | legion-a, legion-b |
+
+One script here is **not** a piggyback experiment and does not need the rig:
+
+| Script | Measures | Where it runs |
+| --- | --- | --- |
+| `heartbeat-commit-probe.sh` | Heartbeat throughput vs. store commit cost — every raft voter and the sim fleet on ONE box | any Linux box with the storage you want to test |
+
+It exists to isolate a single variable behind the ~80 heartbeats/sec
+ceiling the first campaign hit: a developer laptop runs the identical
+code at ~2000/sec on one worker thread, and the difference that a laptop
+cannot reproduce is fsync latency on network-attached storage. Because it
+answers an engineering question rather than a comparison one, it needs no
+identical hardware and no fairness record, so run it on the cheapest box
+with the right disk (the standing operator box at ~$0.37/hr, not the rig
+at ~$2.50/hr).
 
 ## Methodology notes (read before running)
 
@@ -59,6 +75,41 @@ never returns to zero, RSS growth without plateau.
 a time, verify quorum between steps) with the steady workload running;
 `driver.py watch` spans the whole rolling window, and the disruption
 number is the max placement gap observed during it.
+
+**packing-density.sh** — the one drill worth running *before* a campaign
+rather than during one. Every scale step's instance count comes from
+`NODES_PER_INSTANCE=1250` in `run-campaign.sh`, which is the plan's
+estimate and has never been measured. The probe scales the fleet to a
+single instance and climbs an ascending ladder of densities on it,
+holding each long enough for the rate windows to fill, then reads the
+fleet's own `legion_worker_*` series off Prometheus.
+
+A density passes when the fleet fully registers, reports no heartbeat or
+registration failures, and sustains at least 95% of its heartbeat
+cadence with CPU and memory under 85%. The cadence ratio is the
+load-bearing signal: a box that cannot keep N nodes heartbeating on
+schedule is a box whose numbers describe the simulator, not the
+scheduler.
+
+The ladder runs ascending, and the script sorts it. That used to be a
+workaround for a broken wait: `start-sim-fleet.sh` gated on the manager's
+*total* node count with a `>=`, and nodes from an earlier rung linger as
+lost rows until their deterministic names are re-registered, so a
+descending ladder satisfied that wait instantly against stale rows and
+"measured" a fleet it never started. The wait now asserts an exact
+census — right count, all active and available, all named from this
+fleet's slices — so a descending rung fails loudly with the census it
+saw instead. The order is still ascending because the ladder stops at the
+first saturated rung (which only means anything climbing) and because
+each rung's node names contain the previous rung's, so no reset is needed
+between them. The drill also resets the control plane before the ladder
+(`--no-reset` opts out), so it does not count a previous campaign's nodes
+as its own.
+
+Feed the result back with `run-campaign.sh --nodes-per-instance <n>`. A
+measured ceiling above 1,250 cuts instances, cost, and the spot vCPU
+quota a campaign has to clear, all proportionally; one below it means
+earlier cells were measuring the sim fleet.
 
 ## Results
 

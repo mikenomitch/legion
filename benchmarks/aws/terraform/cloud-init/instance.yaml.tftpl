@@ -19,5 +19,14 @@ runcmd:
   - ["/opt/bench/bootstrap.sh"]
 %{ if install_docker ~}
   # Loadgen only: Prometheus + Grafana run as containers (../configs).
-  - ["bash", "-c", "DEBIAN_FRONTEND=noninteractive apt-get install -y docker.io docker-compose-v2 && systemctl enable --now docker && usermod -aG docker ubuntu"]
+  # `docker-compose-v2` stopped resolving on Ubuntu Noble (2026-08-05):
+  # apt failed the WHOLE line, so docker.io never installed either, and
+  # because cloud-init failure was fatal to bringup it killed the campaign
+  # twice before anyone looked at which package was missing. Install the
+  # engine first and on its own, then try the compose plugin from apt, and
+  # fall back to the upstream binary. Compose is only needed for the
+  # loadgen box's Prometheus/Grafana, so it must never take the engine --
+  # or the campaign -- down with it.
+  - ["bash", "-c", "DEBIAN_FRONTEND=noninteractive apt-get install -y docker.io && systemctl enable --now docker && usermod -aG docker ubuntu"]
+  - ["bash", "-c", "DEBIAN_FRONTEND=noninteractive apt-get install -y docker-compose-v2 || (mkdir -p /usr/local/lib/docker/cli-plugins && curl -fsSL https://github.com/docker/compose/releases/download/v2.29.7/docker-compose-linux-x86_64 -o /usr/local/lib/docker/cli-plugins/docker-compose && chmod +x /usr/local/lib/docker/cli-plugins/docker-compose) || echo 'WARNING: docker compose unavailable; the observability stack will not start'"]
 %{ endif ~}

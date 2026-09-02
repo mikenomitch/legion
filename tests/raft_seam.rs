@@ -64,6 +64,10 @@ const CLASSIFIED_MUTATIONS: &[&str] = &[
     "destroy_job",
     "get_kv_lock",
     "handle_job_submit",
+    // The batched form: N concurrent RunJobs in one control-lane changeset,
+    // each inside its own savepoint, versions derived through the batch
+    // transaction so same-job submits in one batch are successive.
+    "handle_job_submits",
     "idempotency_record",
     "insert_acl_token",
     "insert_join_token",
@@ -103,17 +107,24 @@ const CLASSIFIED_MUTATIONS: &[&str] = &[
     // rollout/rollout_event mutation.
     "append_rollout_event",
     "claim_eval",
+    "claim_evals",
+    "complete_and_claim_next",
+    "complete_evals_and_claim_next",
     "complete_eval",
     "complete_eval_with_event",
     "enqueue_eval_after_delay",
+    "enqueue_evals",
+    "enqueue_evals_isolated",
     "insert_eval",
     "prune_stale_evals",
     "release_eval_for_retry",
+    "release_eval_for_retry_with_event",
     "requeue_in_flight_evals",
     "set_eval_status",
     "apply_allocation_plan",
     "apply_plan_submission",
     "submit_and_apply_plan",
+    "submit_and_apply_plan_with_candidates",
     "submit_and_apply_plans",
     "create_keyed_instance",
     "create_rollout",
@@ -123,6 +134,7 @@ const CLASSIFIED_MUTATIONS: &[&str] = &[
     "complete_allocation",
     "get_or_create_slot_instance",
     "insert_plan_submission",
+    "insert_plan_submission_with_candidates",
     "migrate_allocations_to_job_config",
     "place_alloc",
     "prune_rollouts",
@@ -159,6 +171,7 @@ const CLASSIFIED_MUTATIONS: &[&str] = &[
     // are the C-2 composite splits' status-lane halves — `node_health`,
     // `task_status`, and `allocation_health` are single-written by this
     // lane, plan §7-C2.)
+    "checkpoint_node_heartbeats",
     "destroy_job_status_cleanup",
     "emit_event",
     "mark_node_lost",
@@ -169,7 +182,9 @@ const CLASSIFIED_MUTATIONS: &[&str] = &[
     "seed_missing_task_statuses",
     "seed_node_health",
     "seed_task_statuses",
+    "seed_task_statuses_batch",
     "set_node_lost_at",
+    "set_node_lost_windows",
     "set_task_status",
     "update_node_health_checks",
     "update_node_heartbeat",
@@ -190,12 +205,32 @@ const CLASSIFIED_MUTATIONS: &[&str] = &[
 /// closure, and no op name of its own.)
 const DELEGATED_BODIES: &[&str] = &[
     "clear_job_restart_request",
+    // Fuses the eval loop's terminal write with the following claim into
+    // one scheduler-lane round: its closure calls `apply_eval_completion`
+    // (itself a switch over `complete_eval_impl` /
+    // `release_eval_for_retry{,_with_event}_apply`) and then
+    // `claim_eval_apply`. Nested `replicated` calls short-circuit inside a
+    // capture, so the pair lands in one changeset.
+    "complete_and_claim_next",
+    // The batched form of the above: its closure loops
+    // `apply_eval_completion` over the batch and then calls
+    // `claim_evals_apply`, so every terminal write and the following claim
+    // land in one changeset. Batching divides the lane's fixed per-eval
+    // round cost by the batch size.
+    "complete_evals_and_claim_next",
     "complete_eval",
     "complete_eval_with_event",
+    // Serializes its candidate placements in the closure and shares
+    // `insert_plan_submission_apply` with the format-1 wrapper.
+    "insert_plan_submission_with_candidates",
     "request_job_restart",
     // Plan §8 D1 reconciler: inlines its INSERT..SELECT closure and shares
     // seed_task_statuses_apply's semantics (ON CONFLICT DO NOTHING seed).
     "seed_missing_task_statuses",
+    // Batched fan-out: runs `enqueue_eval_after_delay_apply` per request in
+    // one op, so a leadership regeneration or node-loss storm pays quorum
+    // once instead of once per row.
+    "enqueue_evals",
     // D5 group commit: the batch op's closure runs submit_and_apply_plan_apply
     // per plan inside per-plan savepoints; the single-heartbeat op shares
     // update_node_heartbeats_apply with the batched form.
@@ -242,6 +277,7 @@ fn lane_for(method: &str) -> Lane {
         | "destroy_job"
         | "get_kv_lock"
         | "handle_job_submit"
+        | "handle_job_submits"
         | "idempotency_record"
         | "insert_acl_token"
         | "insert_join_token"
@@ -275,16 +311,23 @@ fn lane_for(method: &str) -> Lane {
         "append_rollout_event"
         | "apply_allocation_plan"
         | "claim_eval"
+        | "claim_evals"
+        | "complete_and_claim_next"
+        | "complete_evals_and_claim_next"
         | "complete_eval"
         | "complete_eval_with_event"
         | "enqueue_eval_after_delay"
+        | "enqueue_evals"
+        | "enqueue_evals_isolated"
         | "insert_eval"
         | "prune_stale_evals"
         | "release_eval_for_retry"
+        | "release_eval_for_retry_with_event"
         | "requeue_in_flight_evals"
         | "set_eval_status"
         | "apply_plan_submission"
         | "submit_and_apply_plan"
+        | "submit_and_apply_plan_with_candidates"
         | "submit_and_apply_plans"
         | "create_keyed_instance"
         | "create_rollout"
@@ -293,6 +336,7 @@ fn lane_for(method: &str) -> Lane {
         | "destroy_keyed_instance"
         | "get_or_create_slot_instance"
         | "insert_plan_submission"
+        | "insert_plan_submission_with_candidates"
         | "complete_allocation"
         | "migrate_allocations_to_job_config"
         | "place_alloc"
@@ -319,7 +363,8 @@ fn lane_for(method: &str) -> Lane {
         | "delete_volume"
         | "mark_volume_destroyed"
         | "sync_task_volume_claims" => Lane::Scheduler,
-        "destroy_job_status_cleanup"
+        "checkpoint_node_heartbeats"
+        | "destroy_job_status_cleanup"
         | "emit_event"
         | "mark_node_lost"
         | "mark_node_ready"
@@ -329,7 +374,9 @@ fn lane_for(method: &str) -> Lane {
         | "seed_missing_task_statuses"
         | "seed_node_health"
         | "seed_task_statuses"
+        | "seed_task_statuses_batch"
         | "set_node_lost_at"
+        | "set_node_lost_windows"
         | "set_task_status"
         | "update_node_health_checks"
         | "update_node_heartbeat"

@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use legion::manager::scheduler::{PlanMode, Scheduler};
 use legion::manager::server::ManagerDaemonService;
+use legion::manager::telemetry::{render_worker, worker_metrics};
 use legion::prelude::{json, Context, R};
 use legion::storage::store::Store;
 use legion::structs::{
@@ -151,6 +152,7 @@ async fn simulated_fleet_registers_schedules_and_acks() -> R<()> {
     task.count = TaskCount::new(3);
     task.constraints = json!({ "class": "web" });
     let job = JobConfig {
+        priority: Default::default(),
         name: "sim-it-job".into(),
         tasks: vec![task],
         rollout: None,
@@ -158,7 +160,7 @@ async fn simulated_fleet_registers_schedules_and_acks() -> R<()> {
         version: None,
     };
     let submission = Submission {
-        path: "sim-it.jsonnet".into(),
+        path: "sim-it.ncl".into(),
         content: "{}".into(),
         is_primary: true,
     };
@@ -181,11 +183,81 @@ async fn simulated_fleet_registers_schedules_and_acks() -> R<()> {
     })
     .await;
 
-    // Heartbeats also refresh manager-side liveness.
+    // Heartbeats also refresh manager-side liveness — in the leader's MEMORY,
+    // not in replicated state: a steady-state beat costs no commit
+    // (docs/node-liveness.md). The persisted timestamp column is refreshed by
+    // the display checkpoint, which the status-checker loop drives and this
+    // test does not run.
     let nodes = store.get_nodes()?;
+    for node in &nodes {
+        assert!(
+            store.liveness().last_beat(&node.id).is_some(),
+            "every sim node has heartbeated: {} has no observed beat",
+            node.id
+        );
+    }
+
+    fleet.abort();
+    Ok(())
+}
+
+/// A simulated host is exactly the host a scale campaign scrapes, so the
+/// fleet must feed the process-wide `legion_worker_*` registry rather than
+/// keeping its counts private (docs/metrics.md § Worker).
+///
+/// Asserted as *deltas* against a baseline: the registry is a process
+/// global and the other tests in this binary run fleets of their own
+/// concurrently, so absolute values are not this test's to own.
+#[tokio::test(flavor = "multi_thread")]
+async fn simulated_fleet_feeds_the_worker_metric_registry() -> R<()> {
+    let dir = TempDir::new()?;
+    let store = setup_store(&dir)?;
+    let (manager_addr, _manager) = serve_manager(&store).await?;
+
+    let metrics = worker_metrics();
+    let registrations_before = metrics.simulated_registrations_total.get(&["ok"]);
+    let heartbeats_before = metrics.heartbeats_total.get(&["ok"]);
+
+    let fleet = launch_fleet(&dir, manager_addr, 4).await?;
+    wait_until("fleet registered", || fleet.registered() == 4).await;
+
     assert!(
-        nodes.iter().all(|node| !node.last_heartbeat.is_empty()),
-        "every sim node has heartbeated"
+        metrics.simulated_registrations_total.get(&["ok"]) - registrations_before >= 4,
+        "every sim node's registration is counted"
+    );
+    assert!(
+        metrics.simulated_nodes.get() >= 4,
+        "the fleet-size gauge tracks registered nodes"
+    );
+    assert!(
+        metrics.simulated_nodes_target.get() >= 4,
+        "the target gauge records the requested fleet size"
+    );
+
+    wait_until("heartbeats are counted in the shared registry", || {
+        metrics.heartbeats_total.get(&["ok"]) - heartbeats_before >= 4
+    })
+    .await;
+
+    // The families a campaign scrapes are actually rendered, with the
+    // heartbeat histogram observed rather than merely declared.
+    let rendered = render_worker();
+    for family in [
+        "legion_worker_heartbeats_total",
+        "legion_worker_heartbeat_duration_seconds",
+        "legion_worker_allocations_running",
+        "legion_worker_simulated_nodes",
+        "legion_worker_simulated_nodes_target",
+        "legion_worker_simulated_registrations_total",
+    ] {
+        assert!(
+            rendered.contains(family),
+            "{family} missing from the worker /metrics body"
+        );
+    }
+    assert!(
+        !rendered.contains("legion_worker_heartbeat_duration_seconds_count 0"),
+        "heartbeat durations must be observed, not just declared"
     );
 
     fleet.abort();
@@ -206,6 +278,7 @@ async fn stub_worker_accepts_dispatch_and_rejects_everything_else() -> R<()> {
     worker
         .post_work(PostWorkRequest {
             allocation: Some(TaskAllocation {
+                provisional: None,
                 allocation_id: 999,
                 node_id: "sim-it-web-0".into(),
                 ..TaskAllocation::default()
@@ -219,6 +292,7 @@ async fn stub_worker_accepts_dispatch_and_rejects_everything_else() -> R<()> {
     let status = worker
         .post_work(PostWorkRequest {
             allocation: Some(TaskAllocation {
+                provisional: None,
                 allocation_id: 1000,
                 node_id: "not-a-sim-node".into(),
                 ..TaskAllocation::default()

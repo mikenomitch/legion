@@ -33,9 +33,10 @@ use crate::structs::{
     GetRolloutStatusRequest, GetStateStoreSchemaRequest, GetVolumeRequest, JobConfig,
     ListEventsRequest, ListInstancesRequest, ListJobActionsRequest, ListJobTemplatesRequest,
     ListJobsRequest, ListRolloutsRequest, ListServicesRequest, ListVolumeDriversRequest,
-    ListVolumesRequest, QueryStateStoreRequest, RenderJobTemplateRequest, ReplaceInstanceRequest,
-    ResolveServiceRequest, RunJobRequest, RunJobTemplateRequest, SetNodeAvailabilityRequest,
-    StartInstanceRequest, StopInstanceRequest, StopJobRequest, UpsertJobTemplateRequest,
+    ListVolumesRequest, PlanJobRequest, QueryStateStoreRequest, RenderJobTemplateRequest,
+    ReplaceInstanceRequest, ResolveServiceRequest, RunJobRequest, RunJobTemplateRequest,
+    SetNodeAvailabilityRequest, StartInstanceRequest, StopInstanceRequest, StopJobRequest,
+    UpsertJobTemplateRequest,
 };
 use crate::task_plugins::validate_job_config;
 use serde::Serialize;
@@ -139,6 +140,17 @@ fn tool_defs() -> Vec<ToolDef> {
             mutates: false,
         },
         ToolDef {
+            name: "legion_job_plan",
+            description: "Dry-run a rendered jobspec: which nodes its allocations would land on, and — the reason to run this before submitting — which RUNNING allocations the submit would preempt, with their job, task, priority band and grace window. A non-empty `preemptions` list means the submit costs somebody else something; treat it as requiring confirmation. `preemption_mode` says whether an empty list means \"nothing would be displaced\" or \"preemption is off\".",
+            input_schema: || json!({
+                "type": "object",
+                "properties": { "spec_json": { "type": "string", "description": "Rendered jobspec as a JSON string." } },
+                "required": ["spec_json"],
+                "additionalProperties": false
+            }),
+            mutates: false,
+        },
+        ToolDef {
             name: "legion_rollout_list",
             description: "List rollouts, optionally filtered by job id.",
             input_schema: || json!({
@@ -178,7 +190,7 @@ fn tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "legion_instance_get",
-            description: "Inspect one stateful instance by id (state, slot, current allocation, storage handle).",
+            description: "Inspect one stateful instance by id (state, slot, current allocation, storage handle). Also reports a live PROVISIONAL claim when a node has started this instance but the placement is not durable yet (docs/edge-boot.md) — do not build on a provisional instance, it may still be killed.",
             input_schema: || json!({
                 "type": "object",
                 "properties": { "instance_id": { "type": "string", "description": "Instance id." } },
@@ -237,8 +249,61 @@ fn tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "legion_node_list",
-            description: "List worker nodes and their health.",
+            description: "List worker nodes and their health. Each node carries `heartbeat_source`: `live` means the answering manager observed the beat itself, `checkpoint` means the timestamp comes from a periodic replicated checkpoint and is up to `liveness.checkpointInterval` (30s) behind, empty means none has been observed. The node's `status` is exact either way (docs/node-liveness.md).",
             input_schema: empty_schema,
+            mutates: false,
+        },
+        ToolDef {
+            name: "legion_node_cadence",
+            description: "Report whether the fleet is sustaining its heartbeat cadence. Returns the freshness ratio (1.0 = every node checked in on time; false node loss begins at served_interval/lost_window, 0.20 at the defaults), the per-fleet lost window, the sustainable node count for this control plane, and the `heartbeatSeconds` value to set if the fleet is falling behind. Read this before concluding that nodes have died: a low ratio means the control plane is behind, not that the machines are gone (docs/heartbeat-cadence-and-scale.md).",
+            input_schema: empty_schema,
+            mutates: false,
+        },
+        ToolDef {
+            name: "legion_boot_ticket_create",
+            description: "Mint a boot ticket: a short-lived capability that lets one edge node start one workload without calling a manager (docs/edge-boot.md). Names an exact job config, one task, one instance (or a non-empty instance prefix), one node pool, and a gate ceiling. Single-use by default and revocable only by expiry, so prefer short TTLs. The token is returned ONCE. Mutating.",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "job": { "type": "string", "description": "Job the ticket may start work for." },
+                    "task": { "type": "string", "description": "Task within that job." },
+                    "pool": { "type": "string", "description": "Node pool the ticket may be redeemed in." },
+                    "instance_id": { "type": "string", "description": "Exact instance the ticket may start. Use this or instance_prefix." },
+                    "instance_prefix": { "type": "string", "description": "Any instance with this prefix. Wider capability than instance_id." },
+                    "gate": { "type": "string", "enum": ["stage", "boot", "serve"], "description": "Ceiling on how far the node may get before ratification. Capped by the task's own speculativeStart.mode." },
+                    "job_config_id": { "type": "string", "description": "Pin to an exact job config. Default: the job's current config." },
+                    "ttl": { "type": "string", "description": "Lifetime, e.g. 5m. Default: edgeBoot.defaultTicketTtl." },
+                    "uses": { "type": "integer", "description": "Redemptions allowed. Default 1." },
+                    "idempotency_key": { "type": "string", "description": "Retry-safe key; a repeat returns the ticket already minted." }
+                },
+                "required": ["job", "task", "pool"],
+                "additionalProperties": false
+            }),
+            mutates: true,
+        },
+        ToolDef {
+            name: "legion_boot_ticket_list",
+            description: "List outstanding boot tickets (metadata only — token bytes are never stored or returned). Read-only.",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "job": { "type": "string", "description": "Restrict to one job." }
+                },
+                "additionalProperties": false
+            }),
+            mutates: false,
+        },
+        ToolDef {
+            name: "legion_node_claims",
+            description: "List a node's live provisional (unratified) allocations — work it has started that the store has not recorded yet (docs/edge-boot.md). Use this to see started-but-unconfirmed capacity, and to tell 'still booting' from 'already confirmed'. Read-only.",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "node_id": { "type": "string", "description": "Node ID." }
+                },
+                "required": ["node_id"],
+                "additionalProperties": false
+            }),
             mutates: false,
         },
         ToolDef {
@@ -460,14 +525,14 @@ fn tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "legion_template_upsert",
-            description: "Store Jsonnet source as the next immutable version of a job template. Mutating.",
+            description: "Store Nickel source as the next immutable version of a job template. Mutating.",
             input_schema: || json!({
                 "type": "object",
                 "properties": {
                     "name": { "type": "string", "description": "Template name (lowercase, digits, dashes)." },
-                    "source_jsonnet": { "type": "string", "description": "Self-contained template source with a hidden job(vars):: function." }
+                    "source_nickel": { "type": "string", "description": "Self-contained template source with a `job | not_exported = fun vars => ...` function." }
                 },
-                "required": ["name", "source_jsonnet"],
+                "required": ["name", "source_nickel"],
                 "additionalProperties": false
             }),
             mutates: true,
@@ -721,6 +786,11 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
         }
         "legion_job_schema" => Ok(crate::cmd::job::build_jobspec_schema()),
         "legion_job_validate" => validate_tool(args),
+        "legion_job_plan" => {
+            let parsed_jobspec = str_arg(&args, "spec_json")?;
+            let mut client = connect().await?;
+            grpc(client.plan_job(PlanJobRequest { parsed_jobspec })).await
+        }
         "legion_job_list" => {
             let mut client = connect().await?;
             grpc(client.list_jobs(ListJobsRequest::default())).await
@@ -761,6 +831,10 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
             let mut client = connect().await?;
             grpc(client.get_nodes(GetNodesRequest::default())).await
         }
+        "legion_node_cadence" => {
+            let mut client = connect().await?;
+            grpc(client.get_heartbeat_cadence(crate::structs::GetHeartbeatCadenceRequest {})).await
+        }
         "legion_node_drain" => {
             let node_id = str_arg(&args, "node_id")?;
             let mode = str_arg(&args, "mode")?;
@@ -783,6 +857,47 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
                 idempotency_key,
             }))
             .await
+        }
+        "legion_boot_ticket_create" => {
+            let gate = match opt_str_arg(&args, "gate") {
+                Some(raw) => crate::structs::edge_boot::Gate::parse(&raw)
+                    .map_err(|err| format!("{err:#}"))?,
+                None => crate::structs::edge_boot::Gate::Boot,
+            };
+            let uses = args
+                .get("uses")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(1) as u32;
+            let mut client = connect().await?;
+            grpc(
+                client.issue_boot_ticket(crate::structs::IssueBootTicketRequest {
+                    job: str_arg(&args, "job")?,
+                    task: str_arg(&args, "task")?,
+                    pool: str_arg(&args, "pool")?,
+                    instance_id: opt_str_arg(&args, "instance_id").unwrap_or_default(),
+                    instance_prefix: opt_str_arg(&args, "instance_prefix").unwrap_or_default(),
+                    job_config_id: opt_str_arg(&args, "job_config_id").unwrap_or_default(),
+                    gate: gate.to_wire(),
+                    ttl: opt_str_arg(&args, "ttl").unwrap_or_default(),
+                    uses,
+                    idempotency_key: opt_str_arg(&args, "idempotency_key"),
+                }),
+            )
+            .await
+        }
+        "legion_boot_ticket_list" => {
+            let mut client = connect().await?;
+            grpc(
+                client.list_boot_tickets(crate::structs::ListBootTicketsRequest {
+                    job: opt_str_arg(&args, "job").unwrap_or_default(),
+                }),
+            )
+            .await
+        }
+        "legion_node_claims" => {
+            let id = str_arg(&args, "node_id")?;
+            let mut client = connect().await?;
+            grpc(client.get_node(crate::structs::GetNodeRequest { id })).await
         }
         "legion_acl_whoami" => {
             let mut client = connect().await?;
@@ -1096,11 +1211,11 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
         }
         "legion_template_upsert" => {
             let name = str_arg(&args, "name")?;
-            let source_jsonnet = str_arg(&args, "source_jsonnet")?;
+            let source_nickel = str_arg(&args, "source_nickel")?;
             let mut client = connect().await?;
             grpc(client.upsert_job_template(UpsertJobTemplateRequest {
                 name,
-                source_jsonnet,
+                source_nickel,
             }))
             .await
         }

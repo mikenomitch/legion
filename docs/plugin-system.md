@@ -161,7 +161,7 @@ Contract specifics (the rest follows the common pattern above):
   run on worker staging threads, never the async runtime, and a blocking
   trait keeps the dylib ABI free of async-trait hazards. `resolve()` is an
   optional second method that pins mutable references to digests for
-  `resolve: 'pin'`.
+  `resolve = "pin"`.
 - **Registry resolution order: built-ins first, then dynamic plugins.** A
   plugin is only consulted (lazily loaded, manifest validated) when no
   built-in serves the requested scheme, and loading fails if the plugin's
@@ -184,7 +184,7 @@ design.
 - Reference exec plugin: `plugins/volumes/example/` (a ~60-line shell script).
 
 Entry trait: `VolumeDriver` in `src/volumes/mod.rs`. In the jobspec and API the
-selectable thing is called a **driver** (`storage: { driver: 'nfs' }`); "plugin"
+selectable thing is called a **driver** (`storage = { driver = "nfs" }`); "plugin"
 refers to the packaging that delivers one (`plugins/volumes/<name>/` with a
 `plugin.json`).
 

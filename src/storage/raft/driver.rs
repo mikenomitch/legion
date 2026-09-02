@@ -652,6 +652,13 @@ struct PipelineJob {
     op: &'static str,
     f: ReplicatedOp,
     reply: std_mpsc::Sender<R<Box<dyn Any + Send>>>,
+    /// When the submitter enqueued this job, so the pipeline thread can
+    /// record how long it queued (`legion_raft_pipeline_wait_seconds`).
+    /// One pipeline thread per lane serializes every write on that lane, so
+    /// queue time is a first-class latency component and is invisible in
+    /// the capture/propose histograms that only start once a job is picked
+    /// up.
+    queued_at: std::time::Instant,
 }
 
 /// In-memory operator-facing raft history ring (real transitions, recorded
@@ -1050,17 +1057,28 @@ impl MultiRaftDriver {
         };
         let payload = serde_json::to_vec(op)
             .with_context(|| format!("failed encoding forwarded op {}", op.op_name()))?;
-        let channel = engine
-            .pool
-            .get(&leader_addr)
-            .map_err(|e| anyhow!("malformed leader address {leader_addr}: {e}"))?;
         let secret: tonic::metadata::MetadataValue<tonic::metadata::Ascii> = engine
             .cluster_secret
             .parse()
             .map_err(|_| anyhow!("cluster secret is not valid ascii metadata"))?;
         let group_id = group.wire_name().to_string();
         let op_name = op.op_name();
+        let pool = Arc::clone(&engine.pool);
+        let dial_addr = leader_addr.clone();
         let outcome = Self::block_on_engine(engine, async move {
+            // Dial INSIDE the runtime. `ChannelPool::get` calls
+            // `Endpoint::connect_lazy`, and building a tonic channel spawns
+            // its connection task — which panics outright ("there is no
+            // reactor running") on a thread with no runtime context. Most
+            // callers of this function are synchronous (a write that lands
+            // on a follower reaches it via `Store::forward_after_rejection`),
+            // and the pool hides the hazard: it only bites on the FIRST
+            // forward to a given leader address, so it surfaces right after
+            // leadership moves to a manager this node has not forwarded to
+            // before.
+            let channel = pool
+                .get(&dial_addr)
+                .map_err(|e| anyhow!("malformed leader address {dial_addr}: {e}"))?;
             let mut client =
                 crate::structs::raft_transport_client::RaftTransportClient::new(channel)
                     .max_decoding_message_size(
@@ -1075,8 +1093,8 @@ impl MultiRaftDriver {
             request
                 .metadata_mut()
                 .insert(RAFT_CLUSTER_SECRET_METADATA_KEY, secret);
-            client.forward_lane_write(request).await
-        })?;
+            Ok::<_, anyhow::Error>(client.forward_lane_write(request).await)
+        })??;
         let reply = match outcome {
             Ok(reply) => reply.into_inner(),
             Err(status) => {
@@ -1106,6 +1124,80 @@ impl MultiRaftDriver {
             ForwardOutcome::Failed(message) => Err(anyhow!(
                 "forwarded {op_name} executed on the lane leader and failed: {message}"
             )),
+        }
+    }
+
+    /// The lane's current leader address, when this node knows one.
+    pub(crate) fn lane_leader_addr(&self, lane: Lane) -> Option<String> {
+        self.not_leader_error(lane).leader_addr
+    }
+
+    /// Send one liveness digest to the status-lane leader (liveness plan
+    /// §6.3).
+    ///
+    /// Async by design: the caller is the status-checker loop, which is
+    /// already on the manager's runtime, and a digest is a fire-and-forget
+    /// report rather than a write whose result anything waits on. Nothing here
+    /// blocks a heartbeat.
+    pub(crate) async fn send_liveness_digest(
+        &self,
+        observer_manager_id: String,
+        node_ids: Vec<String>,
+    ) -> crate::storage::liveness::DigestOutcome {
+        use crate::storage::liveness::DigestOutcome;
+
+        let Some(engine) = self.engine.get() else {
+            return DigestOutcome::NoEngine;
+        };
+        let Some(leader_addr) = self.lane_leader_addr(Lane::Status) else {
+            return DigestOutcome::NoLeader;
+        };
+        let Ok(secret) = engine
+            .cluster_secret
+            .parse::<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>()
+        else {
+            return DigestOutcome::Error("cluster secret is not valid ascii".into());
+        };
+        let channel = match engine.pool.get(&leader_addr) {
+            Ok(channel) => channel,
+            Err(err) => {
+                return DigestOutcome::Error(format!(
+                    "malformed status-lane leader address {leader_addr}: {err}"
+                ))
+            }
+        };
+        let mut client = crate::structs::raft_transport_client::RaftTransportClient::new(channel)
+            .max_decoding_message_size(crate::storage::raft::network::RAFT_MAX_MESSAGE_BYTES)
+            .max_encoding_message_size(crate::storage::raft::network::RAFT_MAX_MESSAGE_BYTES);
+        let mut request = tonic::Request::new(crate::structs::NodeLivenessDigestRequest {
+            protocol_version: crate::constants::PROTOCOL_VERSION,
+            observer_manager_id,
+            observed_at_unix_ms: time::OffsetDateTime::now_utc().unix_timestamp() * 1_000,
+            seen_node_ids: node_ids,
+        });
+        request.set_timeout(FORWARD_LANE_WRITE_TIMEOUT);
+        request
+            .metadata_mut()
+            .insert(RAFT_CLUSTER_SECRET_METADATA_KEY, secret);
+        match client.report_node_liveness(request).await {
+            Ok(reply) => {
+                let reply = reply.into_inner();
+                if reply.accepted {
+                    DigestOutcome::Accepted
+                } else {
+                    DigestOutcome::NotLeader {
+                        leader_hint: reply.leader_hint,
+                    }
+                }
+            }
+            // A manager that predates liveness digests answers `Unimplemented`
+            // — the identical degradation `ForwardLaneWrite` shipped with, and
+            // the identical remedy: finish the roll. Until then the sender
+            // falls back to forwarding each heartbeat as a replicated write.
+            Err(status) if status.code() == tonic::Code::Unimplemented => {
+                DigestOutcome::Unimplemented
+            }
+            Err(status) => DigestOutcome::Error(status.to_string()),
         }
     }
 
@@ -1353,7 +1445,9 @@ fn execute_replicated(
     {
         let metrics = raft.metrics().borrow().clone();
         if metrics.state != ServerState::Leader {
-            telemetry.raft_ops_total.inc(&[metric_lane, "not_leader"]);
+            telemetry
+                .raft_ops_total
+                .inc(&[metric_lane, op, "not_leader"]);
             let context = match lane_label {
                 Some(lane) => format!("raft op {op} must run on the {lane} lane's leader"),
                 None => format!("raft op {op} must run on the leader"),
@@ -1374,7 +1468,7 @@ fn execute_replicated(
     let (value, changeset) = match captured {
         Ok(captured) => captured,
         Err(error) => {
-            telemetry.raft_ops_total.inc(&[metric_lane, "error"]);
+            telemetry.raft_ops_total.inc(&[metric_lane, op, "error"]);
             return Err(error);
         }
     };
@@ -1382,7 +1476,7 @@ fn execute_replicated(
         // The mutation touched no rows (e.g. an idempotent no-op): there is
         // no effect to replicate and nothing another replica could apply, so
         // skip the raft entry entirely.
-        telemetry.raft_ops_total.inc(&[metric_lane, "empty"]);
+        telemetry.raft_ops_total.inc(&[metric_lane, op, "empty"]);
         return Ok(value);
     }
     // Capture-time single-writer ownership guard (plan §7-C2, JC-26): every
@@ -1408,9 +1502,9 @@ fn execute_replicated(
         .raft_propose_apply_seconds
         .observe(&[metric_lane], propose_elapsed.as_secs_f64());
     match write_result {
-        Ok(_) => telemetry.raft_ops_total.inc(&[metric_lane, "applied"]),
+        Ok(_) => telemetry.raft_ops_total.inc(&[metric_lane, op, "applied"]),
         Err(err) => {
-            telemetry.raft_ops_total.inc(&[metric_lane, "error"]);
+            telemetry.raft_ops_total.inc(&[metric_lane, op, "error"]);
             return Err(map_write_error(op, lane_label, err));
         }
     }
@@ -1436,8 +1530,20 @@ fn pipeline_loop(
     single_topology: bool,
     jobs: std_mpsc::Receiver<PipelineJob>,
 ) {
+    let group_label = group.wire_name();
+    let telemetry = crate::manager::telemetry::metrics();
     while let Ok(job) = jobs.recv() {
-        let PipelineJob { lane, op, f, reply } = job;
+        let PipelineJob {
+            lane,
+            op,
+            f,
+            reply,
+            queued_at,
+        } = job;
+        telemetry.raft_pipeline_depth.add(&[group_label], -1);
+        telemetry
+            .raft_pipeline_wait_seconds
+            .observe(&[group_label], queued_at.elapsed().as_secs_f64());
         // A panic inside a captured store-method body must not kill the
         // pipeline thread: `capture_mutation` already rolled the capture
         // savepoint back before resuming the unwind, so the store is
@@ -3015,14 +3121,20 @@ impl PersistenceDriver for MultiRaftDriver {
                 .get(&group)
                 .ok_or_else(|| anyhow!("no raft pipeline for lane {}", group.wire_name()))?;
             let (reply_tx, reply_rx) = std_mpsc::channel();
+            let telemetry = crate::manager::telemetry::metrics();
+            telemetry.raft_pipeline_depth.add(&[group.wire_name()], 1);
             sender
                 .send(PipelineJob {
                     lane,
                     op,
                     f,
                     reply: reply_tx,
+                    queued_at: std::time::Instant::now(),
                 })
                 .map_err(|_| {
+                    // The job never reached the (dead) pipeline thread, so
+                    // nothing will decrement the depth for it.
+                    telemetry.raft_pipeline_depth.add(&[group.wire_name()], -1);
                     anyhow!(
                         "raft replication pipeline for lane {} has shut down (op {op})",
                         group.wire_name()

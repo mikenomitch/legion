@@ -14,8 +14,12 @@ from the CLI, the MCP server, the UI, and raw gRPC.
 | `eval.enqueued` | info | An eval was added to the queue. |
 | `eval.completed` | info | An eval handler finished successfully. |
 | `eval.failed` | error | An eval handler returned an error. |
-| `allocation.placed` | info | A plan was applied; one event per apply, with placement details in metadata. |
-| `allocation.removed` | info/warn | Allocations were removed (job stop/update: info; node loss: warn). Metadata carries `cause` — `stop`, `update`, `drain`, `reschedule`, `destroy`, or `node_lost` — omitted when no cause was recorded. See [Stop Causes](graceful-stop.md). |
+| `eval.requeued` | warn | An eval exhausted its plan-conflict retries and was released back to pending with a delay instead of failing (docs/late-binding-plan-apply.md). |
+| `allocation.placed` | info | A plan was applied; one event per apply, with placement details in metadata — including `candidateRank` per placement (0 = first choice) and a `fallbacks` count. |
+| `allocation.removed` | info/warn | Allocations were removed (job stop/update: info; node loss: warn). Metadata carries `cause` — `stop`, `update`, `drain`, `reschedule`, `destroy`, `node_lost`, `scale_in`, or `preempted` — omitted when no cause was recorded. See [Graceful Stop](graceful-stop.md). |
+| `allocation.stopping` | info | Allocations entered their grace window. Metadata carries `cause`, `maxGraceSeconds`, and per-allocation `graceSeconds`. The window is the manager's expectation; the worker's real clock starts when it delivers the signal. See [Graceful Stop](graceful-stop.md). |
+| `allocation.preempted` | warn | Allocations were displaced to make room for higher-band work. Metadata carries the victim's `band` plus `preemptorJob` and `preemptorBand` — the bidirectional link. One event per victim job. See [Preemption and Eviction](preemption-and-eviction.md). |
+| `allocation.preempt_planned` | info | `preemption.mode = "observe"` only: the victim selection ran and committed nothing. Metadata lists the `victims` enforce mode would have taken. |
 | `allocation.failed` | warn | A worker reported an allocation failure (includes the reason). |
 | `allocation.terminated` | info/warn | A task's process exited and the allocation reached a terminal state without being rescheduled (info when the exit was a success, warn otherwise). Metadata carries `success` and the exit message — see [Task Supervision](task-supervision.md). |
 | `allocation.plan_rejected` | warn | A placement plan was rejected by optimistic concurrency (will be retried). |
@@ -40,6 +44,10 @@ from the CLI, the MCP server, the UI, and raw gRPC.
 | `scale.deferred` | info | A scale-in was recorded but deferred until the active rollout completes. |
 | `scale.reset` | info | An override was dropped (explicit `--reset`, or a resubmit that changed the spec count reclaimed ownership). |
 | `rollout.event` | passthrough | Mirror of every rollout event (created, advanced, completed, failed, …). |
+| `alloc.provisional_started` | info | A node started work before the placement was durable ([Edge Boot](edge-boot.md)); claim id, gate, origin, and — for an edge start — the ticket `jti` in metadata. Never the ticket itself. |
+| `alloc.ratified` | info | A provisional allocation became durable; allocation id and ratification latency in metadata. |
+| `alloc.refused` | warn | A ratification was refused and the node is killing the work; the reason code (`instance_claimed`, `no_capacity`, …) is in metadata. |
+| `boot_ticket.issued` | info | A boot ticket was minted; `jti`, scope, and the minting accessor id in metadata. The audit record for "who authorized this start". |
 
 Each event carries: an increasing (but sparse — see
 [cursors](#cursor-based-polling-cli-and-mcp)) `id`, `kind`, `level`
@@ -62,7 +70,7 @@ legion events follow --kind rollout --json   # NDJSON: one envelope per line
 ```
 
 `--kind` matches exactly or by category prefix: `--kind eval` matches
-`eval.enqueued`, `eval.completed`, and `eval.failed`.
+`eval.enqueued`, `eval.completed`, `eval.failed`, and `eval.requeued`.
 
 ### Cursor-based polling (CLI and MCP)
 
@@ -127,7 +135,7 @@ See `proto/legion.proto` for the authoritative message documentation.
   ~chronologically and still increase per lane, which is all the cursor
   contract needs. In `single` topology (and in `local_disk` mode) every ID
   comes from one lane and the low bits are constant.
-- Under `topology: lanes` the live tail is ordered per lane, not globally:
+- Under `topology = "lanes"` the live tail is ordered per lane, not globally:
   two lanes commit independently, so a subscriber can occasionally receive a
   slightly newer lane's event before a slightly older one from another lane.
   The stream only ever emits increasing IDs, so that older event is skipped

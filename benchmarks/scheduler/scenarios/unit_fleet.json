@@ -1,0 +1,24 @@
+{
+  "name": "unit-fleet",
+  "_comment": [
+    "Pure eval-rate scenario: ONE allocation per job, so evals/sec equals",
+    "allocs/sec and nothing is amortized. web_fleet (6 allocs/eval) and",
+    "dense_fleet (44) measure amortized throughput; this measures the",
+    "scheduler's fixed per-eval cost directly. Tiny resources so a local",
+    "fleet never hits capacity."
+  ],
+  "scheduling_policy": "spread",
+  "iterations": 6,
+  "node_profiles": [
+    { "name": "gen", "count": 1, "memory_gb": 16, "cpus": 8,
+      "attrs": { "class": "gen" } }
+  ],
+  "job_types": [
+    { "name": "unit", "count": 100, "tasks_per_job": 1, "task_count_per_task": 1,
+      "resources": { "cpu": 10, "memory": 16 },
+      "constraints": {} }
+  ],
+  "churn_every": 3,
+  "churn_nodes": 6,
+  "slo": { "min_evals_per_sec": 10.0, "max_p99_latency_ms": 500.0 }
+}

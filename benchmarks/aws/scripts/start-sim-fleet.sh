@@ -19,12 +19,19 @@ load_rig
 
 SYSTEM="${1:?usage: start-sim-fleet.sh <legion|nomad|k8s> <total-nodes> [scenario] [manager]}"
 TOTAL="${2:?total node count required}"
-SCENARIO="${3:-$REPO_ROOT/benchmarks/scheduler/scenarios/web_fleet.json}"
+SCENARIO="${3:-$SCENARIOS_DIR/web_fleet.json}"
 MANAGER="${4:-http://${CP_PRIVATE_IPS[0]}:4747}"
+
+# Worker telemetry port for Legion sim fleets. node_exporter owns 9100 on
+# these boxes; the sim process exports the `legion_worker_*` registry here
+# (docs/metrics.md § Worker), and the legion branch below publishes the
+# matching Prometheus file_sd targets. Intra-rig traffic is unrestricted
+# (terraform/security.tf), so no security-group change is needed.
+SIM_TELEMETRY_PORT=9101
 
 mapfile -t WORKERS < <(worker_instances)
 [ "${#WORKERS[@]}" -gt 0 ] || {
-    echo "no InService worker instances — terraform apply -var worker_instances=N first" >&2
+    echo "no InService worker instances — scale the fleet first (run-campaign.sh does this per step)" >&2
     exit 1
 }
 COUNT=${#WORKERS[@]}
@@ -35,10 +42,10 @@ log "starting $SYSTEM sim fleet: $TOTAL nodes over $COUNT instances (~$BASE each
 case "$SYSTEM" in
 legion)
     log "minting a sim join token via loadgen"
-    TOKEN=$(rsh "$LOADGEN_PUBLIC_IP" \
+    TOKEN=$(rsh "$LOADGEN_ADDR" \
         "LEGION_ADDR=$MANAGER legion join-token create --type sim --ttl 24h -j" |
         jq -r '.data.token? // empty' | head -1)
-    [ -n "$TOKEN" ] || TOKEN=$(rsh "$LOADGEN_PUBLIC_IP" \
+    [ -n "$TOKEN" ] || TOKEN=$(rsh "$LOADGEN_ADDR" \
         "LEGION_ADDR=$MANAGER legion join-token create --type sim --ttl 24h" |
         grep -o 'lgnjoin_[A-Za-z0-9_-]*' | head -1)
     [ -n "$TOKEN" ] || {
@@ -49,14 +56,29 @@ legion)
     idx=0
     for line in "${WORKERS[@]}"; do
         read -r instance_id public private <<<"$line"
+        addr=$(worker_addr "$public" "$private")
         slice=$BASE
         [ "$idx" -lt "$EXTRA" ] && slice=$((slice + 1))
         [ "$slice" -gt 0 ] || continue
         log "  $instance_id ($private): $slice nodes"
-        wait_for_ssh "$public" 120
-        rcp "$SCENARIO" "$public:/tmp/profiles.json"
-        rsh "$public" "
-            sudo aws s3 cp --region $REGION s3://$BUCKET/bin/legion /opt/legion/bin/legion &&
+        wait_for_ssh "$addr" 120
+        # sshd answers well before cloud-init has finished: the AWS CLI
+        # v2 install alone is a ~60 MB download. The very next command
+        # fetches the legion binary with `aws`, so racing first boot dies
+        # with a bare "sudo: aws: command not found" on a node that
+        # becomes perfectly good half a minute later. This is not a
+        # one-time bringup concern — the fleet is spot, so instances are
+        # replaced mid-campaign and every replacement re-runs the race.
+        rsh "$addr" "cloud-init status --wait >/dev/null 2>&1 || true"
+        rsh "$addr" "command -v aws >/dev/null 2>&1" || {
+            echo "worker $instance_id ($addr) has no aws CLI after cloud-init:" >&2
+            rsh "$addr" "cloud-init status --long 2>&1 | sed 's/^/  /'" >&2 || true
+            rsh "$addr" "sudo tail -20 /var/log/cloud-init-output.log 2>&1 | sed 's/^/  /'" >&2 || true
+            exit 1
+        }
+        rcp "$SCENARIO" "$addr:/tmp/profiles.json"
+        rsh "$addr" "
+            sudo aws s3 cp --only-show-errors --region $REGION s3://$BUCKET/bin/legion /opt/legion/bin/legion &&
             sudo chmod +x /opt/legion/bin/legion &&
             sudo mv /tmp/profiles.json /opt/legion/configs/profiles.json &&
             sudo tee /etc/systemd/system/legion-sim.service >/dev/null <<UNIT
@@ -74,6 +96,14 @@ ExecStart=/opt/legion/bin/legion start worker $TOKEN \\
 Restart=on-failure
 LimitNOFILE=1048576
 Environment=RUST_LOG=info
+# Without this the fleet dials the worker's OWN 127.0.0.1:4747 (the
+# default when LEGION_ADDR is unset) and every node retries a connection
+# refused forever, while the campaign just sees "registered: 0/N". The
+# address is the control plane's PRIVATE ip: same-VPC traffic to a public
+# ip hairpins out through the internet gateway and no longer matches the
+# security group's intra-rig rule.
+Environment=LEGION_ADDR=$MANAGER
+Environment=LEGION_WORKER_TELEMETRY_PORT=$SIM_TELEMETRY_PORT
 
 [Install]
 WantedBy=multi-user.target
@@ -84,33 +114,65 @@ UNIT
         idx=$((idx + 1))
     done
 
-    log "waiting for $TOTAL registered nodes"
-    deadline=$(($(date +%s) + 600))
-    while :; do
-        registered=$(rsh "$LOADGEN_PUBLIC_IP" \
-            "LEGION_ADDR=$MANAGER legion state query 'SELECT COUNT(*) AS n FROM node' -j" |
-            jq -r '.data.rows[0].n // 0' 2>/dev/null || echo 0)
-        log "  registered: $registered/$TOTAL"
-        [ "$registered" -ge "$TOTAL" ] && break
-        (($(date +%s) < deadline)) || {
-            echo "fleet did not reach $TOTAL nodes in 600s" >&2
-            exit 1
-        }
-        sleep 10
-    done
+    # Publish the sim hosts as Prometheus targets. Written here rather
+    # than in gen-targets.sh so the targets exist exactly while a Legion
+    # sim fleet does: the Nomad and K8s campaigns reuse these same
+    # instances and would otherwise leave a file of dead scrape targets
+    # behind in their fairness records.
+    SIM_TARGETS=$(mktemp)
+    {
+        echo '['
+        first=true
+        for line in "${WORKERS[@]}"; do
+            read -r instance_id _public private <<<"$line"
+            [ -n "$instance_id" ] || continue
+            $first || echo ','
+            first=false
+            printf '  {"targets":["%s:%s"],"labels":{"role":"sim-worker","instance_name":"%s"}}' \
+                "$private" "$SIM_TELEMETRY_PORT" "$instance_id"
+        done
+        echo
+        echo ']'
+    } >"$SIM_TARGETS"
+    rcp "$SIM_TARGETS" "$LOADGEN_ADDR:/opt/bench/observability/targets/sim-workers.json"
+    rm -f "$SIM_TARGETS"
+    log "published ${#WORKERS[@]} sim-worker scrape targets on :$SIM_TELEMETRY_PORT"
+
+    # An EXACT census, not `registered >= TOTAL`.
+    #
+    # The old lower bound passed against the wrong population twice over.
+    # `SELECT COUNT(*) FROM node` counts every row the control plane has
+    # ever seen — nothing in Legion removes a node record — so a 4000-node
+    # experiment's orphans satisfied a 1000-node fleet's wait instantly,
+    # and the "fleet" the next cell measured was 1000 live nodes plus 3000
+    # corpses. It also ignores health, so a fleet where every node had
+    # gone `lost` passed the same gate. assert_fleet (scripts/env.sh)
+    # requires the exact count, all of them active, and every name from
+    # one of THIS fleet's slices, and prints the census when it does not
+    # get it. $idx is the number of slices actually started.
+    log "waiting for exactly $TOTAL active nodes across $idx slice(s)"
+    assert_fleet "$MANAGER" "$TOTAL" "$idx" 600 || exit 1
+
+    # Record what is now running, so the next script does not have to
+    # guess: run-campaign.sh uses it to skip a redundant fleet restart
+    # (every restart marks the whole fleet lost and buries the next cell
+    # in reschedule evals), and run-step.sh uses the slice count to gate
+    # on the same census this wait just passed.
+    write_fleet_state legion "$(basename "$SCENARIO" .json)" "$TOTAL" "$idx" "$MANAGER"
     ;;
 
 nomad)
     idx=0
     for line in "${WORKERS[@]}"; do
         read -r instance_id public private <<<"$line"
+        addr=$(worker_addr "$public" "$private")
         slice=$BASE
         [ "$idx" -lt "$EXTRA" ] && slice=$((slice + 1))
         [ "$slice" -gt 0 ] || continue
         log "  $instance_id ($private): $slice nodesim nodes"
-        wait_for_ssh "$public" 120
-        rsh "$public" "
-            sudo aws s3 cp --region $REGION s3://$BUCKET/bin/nomad-nodesim /opt/legion/bin/nomad-nodesim &&
+        wait_for_ssh "$addr" 120
+        rsh "$addr" "
+            sudo aws s3 cp --only-show-errors --region $REGION s3://$BUCKET/bin/nomad-nodesim /opt/legion/bin/nomad-nodesim &&
             sudo chmod +x /opt/legion/bin/nomad-nodesim &&
             sudo mkdir -p /var/lib/nodesim &&
             sudo tee /etc/systemd/system/nomad-nodesim.service >/dev/null <<UNIT
@@ -138,10 +200,10 @@ k8s)
     # KWOK nodes are API objects — created once, from the loadgen box,
     # shaped by the shared profile split. max pods per fake node is
     # generous: bin-packing pressure comes from cpu/memory requests.
-    rcp "$SCENARIO" "$LOADGEN_PUBLIC_IP:/tmp/profiles.json"
-    rcp "$AWS_BENCH_ROOT/workloads/profile_split.py" "$LOADGEN_PUBLIC_IP:/tmp/profile_split.py"
-    rcp "$AWS_BENCH_ROOT/configs/k8s/kwok-node.yaml.tpl" "$LOADGEN_PUBLIC_IP:/tmp/kwok-node.yaml.tpl"
-    rsh "$LOADGEN_PUBLIC_IP" "
+    rcp "$SCENARIO" "$LOADGEN_ADDR:/tmp/profiles.json"
+    rcp "$AWS_BENCH_ROOT/workloads/profile_split.py" "$LOADGEN_ADDR:/tmp/profile_split.py"
+    rcp "$AWS_BENCH_ROOT/configs/k8s/kwok-node.yaml.tpl" "$LOADGEN_ADDR:/tmp/kwok-node.yaml.tpl"
+    rsh "$LOADGEN_ADDR" "
         set -euo pipefail
         python3 /tmp/profile_split.py --profiles /tmp/profiles.json --total $TOTAL |
         while read -r name cpus memory count attrs; do

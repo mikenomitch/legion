@@ -4,7 +4,7 @@ import { Badge, CodeBlock, Icon, MonoBadge, Note, PageHeader, SectionCard, Spinn
 import { AllocationPorts } from './ServiceEndpoints'
 import type { LedgerAllocation, LedgerNode, NodeMsg } from '../gen/legion_pb'
 import { parseAllocNetwork } from '../utils/allocations'
-import { formatBytes, formatRelativeTime } from '../utils/format'
+import { formatBytes, formatRelativeTime, heartbeatFreshnessHint } from '../utils/format'
 import { summarizeHealthChecks } from '../utils/health'
 import { parseArtifactStates } from '../utils/jobspec'
 import { managerClient } from '../grpcClient'
@@ -616,7 +616,7 @@ export default function NodeDeepView(props: NodeDeepViewProps) {
                   }
                   subtitle={
                     <>
-                      Pool {current.pool || 'default'} · availability {current.availability || '—'} · heartbeat {formatRelativeTime(current.lastHeartbeat)}
+                      Pool {current.pool || 'default'} · availability {current.availability || '—'} · <span title={heartbeatFreshnessHint(current.heartbeatSource)}>heartbeat {formatRelativeTime(current.lastHeartbeat)}</span>
                     </>
                   }
                 />

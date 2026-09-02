@@ -13,8 +13,9 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use crate::artifacts::status::{ArtifactState, ArtifactStatus};
+use crate::manager::scheduler::PlannedPreemption;
 use crate::storage::store::{JobSubmitOutcome, Store};
-use crate::structs::{Allocation, Eval, Node, StopCause};
+use crate::structs::{Allocation, Band, Eval, Node, StopCause};
 
 /// Severity levels used by scheduler events.
 pub const EVENT_LEVEL_INFO: &str = "info";
@@ -230,21 +231,59 @@ pub mod drafts {
         }))
     }
 
+    /// `eval.requeued` — an eval exhausted its in-handler plan-conflict
+    /// retry budget and was released back to the pending queue with a delay
+    /// instead of being terminally failed. Conflict is transient by
+    /// definition, so the work stays visibly pending and runs again once the
+    /// delay elapses (docs/late-binding-plan-apply.md).
+    pub fn eval_requeued(eval: &Eval, error: &anyhow::Error, delay: Duration) -> EventDraft {
+        EventDraft::warn(
+            "eval.requeued",
+            format!(
+                "Eval {} ({}) requeued after plan conflicts; retrying in {}ms",
+                eval.id,
+                eval.kind,
+                delay.as_millis()
+            ),
+        )
+        .job(&eval.job_id)
+        .node(&eval.node_name)
+        .eval(&eval.id)
+        .meta(json!({
+            "evalKind": eval.kind,
+            "delayMs": delay.as_millis() as u64,
+            "error": format!("{error:#}"),
+        }))
+    }
+
     /// `allocation.placed` — a plan was applied. One event per apply with up
     /// to 20 placements detailed in metadata. `None` when nothing was placed.
-    pub fn allocations_placed(job_config_id: &str, placed: &[Allocation]) -> Option<EventDraft> {
+    ///
+    /// `candidate_ranks` is parallel to `placed`: the candidate rank each
+    /// placement bound at (0 = the planner's first choice; >0 = the apply
+    /// walk absorbed a race by falling back —
+    /// docs/late-binding-plan-apply.md). The metadata carries the rank per
+    /// placement and a top-level `fallbacks` count.
+    pub fn allocations_placed(
+        job_config_id: &str,
+        placed: &[Allocation],
+        candidate_ranks: &[usize],
+    ) -> Option<EventDraft> {
         let first = placed.first()?;
         let placements: Vec<Value> = placed
             .iter()
+            .enumerate()
             .take(20)
-            .map(|alloc| {
+            .map(|(index, alloc)| {
                 json!({
                     "allocationId": alloc.id,
                     "nodeId": alloc.node_id,
                     "taskConfigId": alloc.task_config_id,
+                    "candidateRank": candidate_ranks.get(index).copied().unwrap_or(0),
                 })
             })
             .collect();
+        let fallbacks = candidate_ranks.iter().filter(|rank| **rank > 0).count();
         Some(
             EventDraft::info(
                 "allocation.placed",
@@ -258,6 +297,7 @@ pub mod drafts {
             .meta(json!({
                 "jobConfigId": job_config_id,
                 "count": placed.len(),
+                "fallbacks": fallbacks,
                 "placements": placements,
             })),
         )
@@ -357,6 +397,158 @@ pub mod drafts {
         )
     }
 
+    /// `allocation.stopping` (info) — allocations have entered their grace
+    /// window. `None` when nothing was removed or the cause is unknown.
+    ///
+    /// Distinct from `allocation.removed`, which says the rows are gone. This
+    /// says the *processes* are being asked to exit and names how long they
+    /// have — the interval that did not exist before graceful stop, and the
+    /// one an operator watching a drain actually wants to see.
+    ///
+    /// `grace_by_task` maps task config id to `stop.killAfter` seconds. The
+    /// window is the manager's expectation: the worker's real clock starts
+    /// when it delivers the signal, up to one heartbeat later.
+    pub fn allocations_stopping(
+        removed: &[Allocation],
+        cause: StopCause,
+        grace_by_task: &std::collections::HashMap<i64, u64>,
+    ) -> Option<EventDraft> {
+        if removed.is_empty() || !cause.is_known() {
+            return None;
+        }
+        let first = removed.first()?;
+        let max_grace = removed
+            .iter()
+            .filter_map(|alloc| grace_by_task.get(&alloc.task_config_id).copied())
+            .max()
+            .unwrap_or(0);
+        let allocations: Vec<Value> = removed
+            .iter()
+            .take(20)
+            .map(|alloc| {
+                json!({
+                    "allocationId": alloc.id,
+                    "nodeId": alloc.node_id,
+                    "taskConfigId": alloc.task_config_id,
+                    "graceSeconds": grace_by_task.get(&alloc.task_config_id).copied(),
+                })
+            })
+            .collect();
+        Some(
+            EventDraft::info(
+                "allocation.stopping",
+                format!(
+                    "Stopping {} allocation(s) for job {} ({cause}), up to {max_grace}s grace",
+                    removed.len(),
+                    first.job_id
+                ),
+            )
+            .job(&first.job_id)
+            .meta(json!({
+                "count": removed.len(),
+                "cause": cause.as_str(),
+                "maxGraceSeconds": max_grace,
+                "allocations": allocations,
+            })),
+        )
+    }
+
+    /// `allocation.preempted` (warn) — allocations were displaced to make
+    /// room for higher-priority work, naming the preemptor.
+    ///
+    /// The victim -> preemptor link is the point: "Preempted" on its own is
+    /// the complaint Kueue had to retrofit an answer to (its users could not
+    /// tell *which* policy displaced them). One event per victim job, so a
+    /// `legion events list --kind allocation.preempted` reads as a list of
+    /// who lost what to whom.
+    pub fn allocations_preempted(
+        victims: &[Allocation],
+        victim_band: Band,
+        preemptor_job: &str,
+        preemptor_band: Band,
+    ) -> Option<EventDraft> {
+        let first = victims.first()?;
+        let allocations: Vec<Value> = victims
+            .iter()
+            .take(20)
+            .map(|alloc| {
+                json!({
+                    "allocationId": alloc.id,
+                    "nodeId": alloc.node_id,
+                    "taskConfigId": alloc.task_config_id,
+                })
+            })
+            .collect();
+        Some(
+            EventDraft::warn(
+                "allocation.preempted",
+                format!(
+                    "Preempted {} allocation(s) of job {} ({}) to place job {} ({})",
+                    victims.len(),
+                    first.job_id,
+                    victim_band,
+                    preemptor_job,
+                    preemptor_band
+                ),
+            )
+            .job(&first.job_id)
+            .meta(json!({
+                "count": victims.len(),
+                "band": victim_band.as_str(),
+                "preemptorJob": preemptor_job,
+                "preemptorBand": preemptor_band.as_str(),
+                "allocations": allocations,
+            })),
+        )
+    }
+
+    /// `allocation.preempt_planned` (info) — observe mode. The victim
+    /// selection ran and named these allocations, and nothing was evicted.
+    ///
+    /// This is the evidence an operator asked for before enabling
+    /// `enforce`: it says exactly what enforce mode *would* have done, in the
+    /// same vocabulary, without doing it.
+    pub fn preemption_planned(
+        job_config_id: &str,
+        preemptor_job: &str,
+        preemptor_band: Band,
+        victims: &[PlannedPreemption],
+    ) -> Option<EventDraft> {
+        if victims.is_empty() {
+            return None;
+        }
+        let detail: Vec<Value> = victims
+            .iter()
+            .take(20)
+            .map(|victim| {
+                json!({
+                    "allocationId": victim.allocation_id,
+                    "nodeId": victim.node_id,
+                    "jobId": victim.job_id,
+                    "taskName": victim.task_name,
+                    "band": victim.band.as_str(),
+                })
+            })
+            .collect();
+        Some(
+            EventDraft::info(
+                "allocation.preempt_planned",
+                format!(
+                    "Would preempt {} allocation(s) to place job {preemptor_job} \
+                     ({preemptor_band}); preemption mode is observe, nothing was evicted",
+                    victims.len()
+                ),
+            )
+            .job(preemptor_job)
+            .meta(json!({
+                "jobConfigId": job_config_id,
+                "count": victims.len(),
+                "preemptorBand": preemptor_band.as_str(),
+                "victims": detail,
+            })),
+        )
+    }
+
     /// `allocation.failed` — a worker reported an allocation failure.
     pub fn allocation_failed(
         allocation_id: i64,
@@ -409,6 +601,130 @@ pub mod drafts {
                 "taskConfigId": task_config_id,
                 "jobConfigId": job_config_id,
             }))
+    }
+
+    /// `alloc.provisional_started` — a node started work before the
+    /// placement was durable (docs/edge-boot.md).
+    ///
+    /// The ticket appears only as its `jti`: no ticket material ever reaches
+    /// an event, a log line, or a store row.
+    #[allow(clippy::too_many_arguments)]
+    pub fn provisional_started(
+        claim_id: &str,
+        node_id: &str,
+        job_id: &str,
+        job_config_id: &str,
+        task_name: &str,
+        instance_id: &str,
+        gate: &str,
+        origin: &str,
+        ticket_jti: &str,
+    ) -> EventDraft {
+        EventDraft::info(
+            "alloc.provisional_started",
+            format!(
+                "Provisional start {claim_id} on node {node_id} at gate {gate} \
+                 ({origin}-originated)"
+            ),
+        )
+        .job(job_id)
+        .node(node_id)
+        .meta(json!({
+            "claimId": claim_id,
+            "jobConfigId": job_config_id,
+            "taskName": task_name,
+            "instanceId": instance_id,
+            "gate": gate,
+            "origin": origin,
+            "ticketJti": ticket_jti,
+        }))
+    }
+
+    /// `alloc.ratified` — a provisional allocation became durable.
+    #[allow(clippy::too_many_arguments)]
+    pub fn provisional_ratified(
+        claim_id: &str,
+        allocation_id: i64,
+        node_id: &str,
+        job_id: &str,
+        instance_id: &str,
+        gate: &str,
+        latency_ms: u64,
+    ) -> EventDraft {
+        EventDraft::info(
+            "alloc.ratified",
+            format!(
+                "Provisional start {claim_id} ratified as allocation {allocation_id} \
+                 in {latency_ms}ms"
+            ),
+        )
+        .job(job_id)
+        .node(node_id)
+        .allocation(allocation_id)
+        .meta(json!({
+            "claimId": claim_id,
+            "instanceId": instance_id,
+            "gate": gate,
+            "latencyMs": latency_ms,
+        }))
+    }
+
+    /// `alloc.refused` — a ratification was refused and the node is killing
+    /// the work. The reason code is what an on-call responder reads to tell
+    /// "my router double-sent" from "my cluster is full".
+    pub fn provisional_refused(
+        claim_id: &str,
+        node_id: &str,
+        job_id: &str,
+        instance_id: &str,
+        reason: &str,
+        detail: &str,
+    ) -> EventDraft {
+        EventDraft::warn(
+            "alloc.refused",
+            format!("Provisional start {claim_id} refused ({reason}): {detail}"),
+        )
+        .job(job_id)
+        .node(node_id)
+        .meta(json!({
+            "claimId": claim_id,
+            "instanceId": instance_id,
+            "reason": reason,
+            "detail": detail,
+        }))
+    }
+
+    /// `boot_ticket.issued` — a boot ticket was minted. The audit record for
+    /// "who authorized this start"; `jti` and the accessor id only.
+    #[allow(clippy::too_many_arguments)]
+    pub fn boot_ticket_issued(
+        jti: &str,
+        job: &str,
+        task: &str,
+        job_config_id: &str,
+        instance_id: &str,
+        instance_prefix: &str,
+        pool: &str,
+        gate: &str,
+        accessor_id: &str,
+        expires_at_unix: i64,
+    ) -> EventDraft {
+        EventDraft::info(
+            "boot_ticket.issued",
+            format!("Boot ticket {jti} issued for {job}/{task} in pool {pool} at gate {gate}"),
+        )
+        .job(job)
+        .meta(json!({
+            "jti": jti,
+            "task": task,
+            "jobConfigId": job_config_id,
+            "instanceId": instance_id,
+            "instancePrefix": instance_prefix,
+            "pool": pool,
+            "gate": gate,
+            "accessorId": accessor_id,
+            "expiresAtUnix": expires_at_unix,
+        }))
     }
 
     /// `node.registered` — a worker registered (or re-registered).
@@ -905,6 +1221,105 @@ impl EventRecorder<'_> {
         if let Some(draft) = draft {
             self.emit(draft);
         }
+    }
+
+    /// `alloc.provisional_started` — see [`drafts::provisional_started`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn provisional_started(
+        self,
+        claim_id: &str,
+        node_id: &str,
+        job_id: &str,
+        job_config_id: &str,
+        task_name: &str,
+        instance_id: &str,
+        gate: &str,
+        origin: &str,
+        ticket_jti: &str,
+    ) {
+        self.emit(drafts::provisional_started(
+            claim_id,
+            node_id,
+            job_id,
+            job_config_id,
+            task_name,
+            instance_id,
+            gate,
+            origin,
+            ticket_jti,
+        ));
+    }
+
+    /// `alloc.ratified` — see [`drafts::provisional_ratified`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn provisional_ratified(
+        self,
+        claim_id: &str,
+        allocation_id: i64,
+        node_id: &str,
+        job_id: &str,
+        instance_id: &str,
+        gate: &str,
+        latency_ms: u64,
+    ) {
+        self.emit(drafts::provisional_ratified(
+            claim_id,
+            allocation_id,
+            node_id,
+            job_id,
+            instance_id,
+            gate,
+            latency_ms,
+        ));
+    }
+
+    /// `alloc.refused` — see [`drafts::provisional_refused`].
+    pub fn provisional_refused(
+        self,
+        claim_id: &str,
+        node_id: &str,
+        job_id: &str,
+        instance_id: &str,
+        reason: &str,
+        detail: &str,
+    ) {
+        self.emit(drafts::provisional_refused(
+            claim_id,
+            node_id,
+            job_id,
+            instance_id,
+            reason,
+            detail,
+        ));
+    }
+
+    /// `boot_ticket.issued` — see [`drafts::boot_ticket_issued`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn boot_ticket_issued(
+        self,
+        jti: &str,
+        job: &str,
+        task: &str,
+        job_config_id: &str,
+        instance_id: &str,
+        instance_prefix: &str,
+        pool: &str,
+        gate: &str,
+        accessor_id: &str,
+        expires_at_unix: i64,
+    ) {
+        self.emit(drafts::boot_ticket_issued(
+            jti,
+            job,
+            task,
+            job_config_id,
+            instance_id,
+            instance_prefix,
+            pool,
+            gate,
+            accessor_id,
+            expires_at_unix,
+        ));
     }
 
     pub fn scheduler_started(self, eval_threads: usize) {

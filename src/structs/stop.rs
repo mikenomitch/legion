@@ -109,6 +109,94 @@ impl fmt::Display for StopCause {
     }
 }
 
+/// File name of the stop notice, written into the task directory before the
+/// stop signal is delivered. The absolute path is exported to the task at
+/// start as `LEGION_STOP_NOTICE_PATH`.
+pub const STOP_NOTICE_FILE: &str = "stop-notice.json";
+
+/// Env var naming the stop-notice path, set for every task at start.
+pub const STOP_NOTICE_PATH_ENV: &str = "LEGION_STOP_NOTICE_PATH";
+
+/// What a task reads when the platform is shutting it down.
+///
+/// This is the spot-interruption-notice pattern: the signal is the trigger,
+/// the file carries the *why* and the *when*. AWS's two-minute spot notice
+/// spawned an entire handler ecosystem precisely because it is uniform and
+/// machine-readable; a bare SIGTERM is not something a checkpointing job can
+/// branch on.
+///
+/// Written once, immediately before the signal, and left in place — a task
+/// that re-reads it after handling the signal still finds it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskStopNotice {
+    /// Why the platform is stopping this task.
+    pub cause: StopCause,
+    /// RFC 3339 instant after which the task is SIGKILLed. Computed from the
+    /// task's `stop.killAfter` at the moment the notice is written.
+    pub deadline: String,
+    /// The signal that accompanied this notice (`stop.signal`).
+    pub signal: String,
+    /// Seconds of grace between the signal and `deadline`, so a task need not
+    /// parse and subtract timestamps to find out how long it has.
+    pub grace_seconds: u64,
+    /// Who displaced this allocation. Present only when `cause` is
+    /// [`StopCause::Preempted`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preemptor: Option<StopNoticePreemptor>,
+}
+
+/// The job that took this allocation's capacity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StopNoticePreemptor {
+    /// Preempting job name.
+    pub job: String,
+    /// Preempting job's priority band.
+    pub band: String,
+}
+
+#[cfg(test)]
+mod stop_notice_test {
+    use super::*;
+
+    #[test]
+    fn a_notice_serializes_to_the_documented_shape() -> anyhow::Result<()> {
+        let notice = TaskStopNotice {
+            cause: StopCause::Preempted,
+            deadline: "2026-07-28T21:04:05Z".into(),
+            signal: "SIGTERM".into(),
+            grace_seconds: 30,
+            preemptor: Some(StopNoticePreemptor {
+                job: "api".into(),
+                band: "high".into(),
+            }),
+        };
+        let json: serde_json::Value = serde_json::from_str(&serde_json::to_string(&notice)?)?;
+        assert_eq!(json["cause"], "preempted");
+        assert_eq!(json["deadline"], "2026-07-28T21:04:05Z");
+        assert_eq!(json["signal"], "SIGTERM");
+        assert_eq!(json["graceSeconds"], 30);
+        assert_eq!(json["preemptor"]["job"], "api");
+        assert_eq!(json["preemptor"]["band"], "high");
+        Ok(())
+    }
+
+    #[test]
+    fn a_non_preemption_notice_omits_the_preemptor() -> anyhow::Result<()> {
+        let notice = TaskStopNotice {
+            cause: StopCause::Drain,
+            deadline: "2026-07-28T21:04:05Z".into(),
+            signal: "SIGTERM".into(),
+            grace_seconds: 30,
+            preemptor: None,
+        };
+        let encoded = serde_json::to_string(&notice)?;
+        assert!(!encoded.contains("preemptor"), "{encoded}");
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod stop_cause_test {
     use super::*;

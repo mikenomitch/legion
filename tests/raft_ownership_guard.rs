@@ -58,6 +58,7 @@ fn test_node(id: &str) -> Node {
         pool: "default".into(),
         availability: "available".into(),
         last_heartbeat: "2023-01-01T00:00:00Z".into(),
+        heartbeat_source: String::new(),
         config_attrs: json!({ "maxAllocations": 10, "resources": {} }),
         fingerprint_attrs: json!({
             "memory_total": "4294967296",
@@ -73,6 +74,7 @@ fn test_job(name: &str) -> JobConfig {
     // A desired count so the reconcile/reschedule passes place replacements.
     task.count = legion::structs::job::TaskCount::new(1);
     JobConfig {
+        priority: Default::default(),
         rollout: None,
         rollout_by_group: Default::default(),
         name: name.to_string(),
@@ -83,7 +85,7 @@ fn test_job(name: &str) -> JobConfig {
 
 fn submission(name: &str) -> Submission {
     Submission {
-        path: format!("{name}.jsonnet"),
+        path: format!("{name}.ncl"),
         content: format!("job {name}"),
         is_primary: true,
     }

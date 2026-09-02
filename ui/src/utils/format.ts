@@ -39,6 +39,26 @@ export const formatRelativeTime = (timestamp?: string | bigint): string => {
   return formatDistanceToNow(parsed, { addSuffix: true })
 }
 
+// Where a node's last-heartbeat time came from, as a tooltip.
+//
+// Heartbeats live in the memory of the manager that owns node status; only
+// status TRANSITIONS are replicated. On any other manager the timestamp comes
+// from a periodic checkpoint and is up to `liveness.checkpointInterval` (30s)
+// behind — while the node's STATUS is exact everywhere. Surfaced quietly, as
+// a tooltip rather than a column: the status pill answers the operator's
+// actual question, and the freshness caveat should be findable, not loud.
+// See docs/node-liveness.md.
+export const heartbeatFreshnessHint = (source?: string): string | undefined => {
+  switch (source) {
+    case 'live':
+      return 'Observed by this manager, which owns node liveness.'
+    case 'checkpoint':
+      return 'From a replicated checkpoint — up to 30s behind. The node status is exact.'
+    default:
+      return undefined
+  }
+}
+
 const BYTE_UNITS = ['B', 'KiB', 'MiB', 'GiB', 'TiB', 'PiB']
 
 // Human-readable byte size. Node fingerprints report raw byte counts as

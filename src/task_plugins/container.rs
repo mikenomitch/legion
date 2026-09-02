@@ -27,10 +27,31 @@ struct ContainerTaskConfig {
     #[schemars(default = "default_container_env")]
     env: HashMap<String, String>,
 
+    /// Files to materialize in the task directory before the container
+    /// starts, visible inside at `/legion/task/<path>`.
+    ///
+    /// This is the shape KV file injection renders into (see
+    /// `kvInjections.files` in docs/kv-store.md); paths are relative to the
+    /// task directory, and an absolute path under `/legion/task` is accepted
+    /// and treated the same way.
+    #[serde(default)]
+    files: Vec<ContainerInjectedFile>,
+
     /// Additional plugin-specific fields reserved for forward compatibility.
     #[serde(default, flatten)]
     #[schemars(skip)]
     _extra: HashMap<String, Value>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+struct ContainerInjectedFile {
+    /// Destination, relative to `/legion/task` (an absolute path under it is
+    /// also accepted).
+    path: String,
+    /// Octal file mode, e.g. `"0640"`.
+    #[serde(default)]
+    mode: Option<String>,
+    content: String,
 }
 
 impl ContainerTaskConfig {
@@ -88,11 +109,13 @@ impl ContainerRuntime {
         }
     }
 
-    /// Whether this runtime can exec into a running container. Apple's
-    /// `container exec` works; the low-level OCI runtimes need different flag
-    /// handling and are deferred (Q1 in the plan), so they report unsupported.
+    /// Whether this runtime can exec into a running container. Both dialects
+    /// do: Apple's `container exec`, and `<runtime> exec` on youki/runc/crun.
+    /// Reported from runtime detection alone — no probe of the binary (an
+    /// exotic OCI runtime without `exec` fails at session open with its own
+    /// error; see the plan's Q1).
     fn supports_exec(&self) -> bool {
-        matches!(self, Self::AppleContainer)
+        true
     }
 
     /// Confirms the runtime can actually launch a container, with an error the
@@ -142,6 +165,107 @@ fn container_name(allocation: &Allocation) -> String {
     format!("legion-{}", allocation.id)
 }
 
+/// Where the allocation's host task directory is mounted inside the
+/// container. Everything the worker stages — artifacts, KV-rendered files,
+/// identity tokens — is readable here, and refreshes are visible without a
+/// restart because the *directory* is mounted, never individual files.
+const TASK_DIR_MOUNT: &str = crate::constants::CONTAINER_TASK_DIR;
+
+/// The worker-injected env a container can actually use, translated to
+/// in-container paths.
+///
+/// This extends the convention volumes already set (in-task destinations for
+/// isolating runtimes) to the rest of the worker's env:
+///
+/// - `LEGION_TASK_DIR` becomes [`TASK_DIR_MOUNT`];
+/// - `LEGION_ARTIFACT_<NAME>` has the host task-dir prefix swapped for it;
+/// - `LEGION_ALLOC_DIR` is withheld — the alloc dir is *not* mounted, and
+///   pointing env at an invisible path is the bug this translation exists to
+///   fix. It returns if the shared-alloc-dir proposal ever lands.
+///
+/// An artifact staged outside the task dir is omitted rather than leaked as a
+/// dead host path. That cannot happen today; it is defense against a future
+/// stager that stages elsewhere.
+fn translated_worker_env(instance: &TaskInstance) -> Vec<(String, String)> {
+    let mut translated = Vec::new();
+    let task_dir = instance.task_dir.as_ref();
+    for (key, value) in &instance.extra_env {
+        if key == "LEGION_ALLOC_DIR" {
+            continue;
+        }
+        if key == "LEGION_TASK_DIR" {
+            translated.push((key.clone(), TASK_DIR_MOUNT.to_string()));
+            continue;
+        }
+        if let Some(name) = key.strip_prefix("LEGION_ARTIFACT_") {
+            let Some(in_task) = task_dir.and_then(|dir| translate_task_path(dir, value)) else {
+                debug!(
+                    artifact = name,
+                    "Artifact staged outside the task directory is not visible in the container"
+                );
+                continue;
+            };
+            translated.push((key.clone(), in_task));
+            continue;
+        }
+        // Volume vars already carry in-container destinations (the worker
+        // resolved them that way for this runtime).
+        if key.starts_with("LEGION_VOLUME_") || key == "LEGION_STORAGE_DIR" {
+            translated.push((key.clone(), value.clone()));
+        }
+    }
+    translated
+}
+
+/// Write the task's declared files into the host task directory, at the
+/// destinations they will be readable from inside the container.
+///
+/// The path rule is re-checked here rather than trusted from admission — the
+/// same two-layer stance identity naming takes — so a spec that reached this
+/// worker by any other route still cannot write outside the task dir.
+fn materialize_task_files(files: &[ContainerInjectedFile], instance: &TaskInstance) -> R<()> {
+    if files.is_empty() {
+        return Ok(());
+    }
+    let task_dir = instance
+        .task_dir
+        .as_ref()
+        .context("container task declares files but the worker threaded no task directory")?;
+
+    for file in files {
+        let relative =
+            crate::task_plugins::resolve_task_dir_destination(TASK_DIR_MOUNT, &file.path)
+                .map_err(|err| anyhow!("declared file path {err}"))?;
+        let destination = task_dir.join(relative);
+        if let Some(parent) = destination.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create {}", parent.display()))?;
+        }
+        std::fs::write(&destination, file.content.as_bytes())
+            .with_context(|| format!("write {}", destination.display()))?;
+        #[cfg(unix)]
+        if let Some(mode) = file.mode.as_deref() {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(bits) = u32::from_str_radix(mode.trim().trim_start_matches('0'), 8) {
+                std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(bits))
+                    .with_context(|| format!("chmod {}", destination.display()))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Swap a host path's task-dir prefix for the in-container mount point.
+/// `None` when the path is not under the task dir at all.
+fn translate_task_path(task_dir: &std::path::Path, host_path: &str) -> Option<String> {
+    let relative = std::path::Path::new(host_path)
+        .strip_prefix(task_dir)
+        .ok()?;
+    let mut mounted = PathBuf::from(TASK_DIR_MOUNT);
+    mounted.push(relative);
+    Some(mounted.display().to_string())
+}
+
 /// Per-allocation scratch root for the image layout and bundle. Prefers the
 /// worker-provided allocation/task directory; falls back to a temp dir keyed
 /// by allocation id when the worker threaded none through.
@@ -177,6 +301,7 @@ fn build_apple_launch(
     config: &ContainerTaskConfig,
     env: &HashMap<String, String>,
     volumes: &[crate::task_plugins::MountedVolume],
+    task_dir: Option<&std::path::Path>,
     image: &str,
 ) -> Vec<String> {
     let mut args = vec![
@@ -225,6 +350,13 @@ fn build_apple_launch(
         args.push("--env".to_string());
         args.push(format!("{key}={value}"));
     }
+    // The allocation's task directory, before declared volumes so an
+    // explicit volume can still shadow it — the same precedence the mount
+    // list already gives its defaults.
+    if let Some(task_dir) = task_dir {
+        args.push("--volume".to_string());
+        args.push(format!("{}:{TASK_DIR_MOUNT}", task_dir.display()));
+    }
     // Docker-compatible `--volume host:dest[:ro]`. Volumes with no declared
     // path are skipped; admission rejects that for container tasks.
     for volume in volumes {
@@ -244,6 +376,38 @@ fn build_apple_launch(
     args
 }
 
+/// Builds the argv that delivers `signal` to the container's init process.
+///
+/// ```text
+/// Apple:                 container kill --signal SIGHUP legion-<alloc>
+/// OCI (youki/runc/crun): <runtime> kill legion-<alloc> SIGHUP
+/// ```
+///
+/// The signal *name* is passed through rather than a number, so each runtime
+/// does its own resolution. The name is canonicalized first
+/// ([`crate::signals::canonical_signal_name`]) so `hup` and `SIGHUP` reach the
+/// CLI identically.
+fn build_signal_command(
+    oci_runtime: &ContainerRuntime,
+    allocation: &Allocation,
+    signal: &str,
+) -> R<Vec<String>> {
+    let signal = crate::signals::canonical_signal_name(signal)?;
+    let name = container_name(allocation);
+    Ok(match oci_runtime {
+        ContainerRuntime::AppleContainer => vec![
+            APPLE_CONTAINER_BIN.to_string(),
+            "kill".to_string(),
+            "--signal".to_string(),
+            signal,
+            name,
+        ],
+        ContainerRuntime::Oci { binary } => {
+            vec![binary.clone(), "kill".to_string(), name, signal]
+        }
+    })
+}
+
 /// Best-effort removal of a container left behind under this allocation's
 /// name. `run --name` fails outright when the name is taken, which happens
 /// whenever a previous start was not torn down cleanly (worker crash, or a
@@ -258,29 +422,103 @@ fn remove_stale_container(oci_runtime: &ContainerRuntime, name: &str) {
 }
 
 /// Builds the argv that execs `command` inside the allocation's container.
+///
+/// The two dialects differ deliberately:
+///
+/// ```text
+/// Apple:                container exec [--tty --interactive] legion-<alloc> CMD…
+/// OCI (youki/runc/crun): <runtime> exec [--tty] [--env K=V]… legion-<alloc> -- CMD…
+/// ```
+///
+/// - **`--interactive` is Apple-only.** The OCI runtimes have no such flag;
+///   stdin wiring is implicit when `exec` runs in the foreground, which is
+///   how Legion runs it (under the PTY `spawn_pty` allocates, or with piped
+///   stdio from `spawn_pipe`).
+/// - **`--` before the command on the OCI path**, so a remote argv beginning
+///   with `-` cannot be eaten by the runtime's flag parser. Asymmetric on
+///   purpose: Apple's parser reads `--` as the target executable — the same
+///   quirk [`build_apple_launch`] documents.
+/// - **Caller env** (`ExecOptions.env`, e.g. the operator's `TERM`) becomes
+///   repeated `--env K=V` flags on the OCI path; setting it on the runtime
+///   CLI's own process would not reach the container. The Apple path ignores
+///   it, as it always has.
+///
+/// Everything else is inherited from the bundle: `<runtime> exec` builds the
+/// process spec from the bundle's `config.json` — the task's env, cwd, and
+/// user — replacing only argv, and exits with the process's own status.
 fn build_exec_command(
     oci_runtime: &ContainerRuntime,
     allocation_id: i64,
     tty: bool,
     command: &[String],
+    env: &std::collections::BTreeMap<String, String>,
 ) -> Vec<String> {
-    let program = match oci_runtime {
-        ContainerRuntime::AppleContainer => APPLE_CONTAINER_BIN.to_string(),
-        ContainerRuntime::Oci { binary } => binary.clone(),
-    };
     let name = format!("legion-{allocation_id}");
-    let mut argv = vec![program, "exec".to_string()];
-    if tty {
-        argv.push("--tty".to_string());
-        argv.push("--interactive".to_string());
+    match oci_runtime {
+        ContainerRuntime::AppleContainer => {
+            let mut argv = vec![APPLE_CONTAINER_BIN.to_string(), "exec".to_string()];
+            if tty {
+                argv.push("--tty".to_string());
+                argv.push("--interactive".to_string());
+            }
+            argv.push(name);
+            argv.extend(command.iter().cloned());
+            argv
+        }
+        ContainerRuntime::Oci { binary } => {
+            let mut argv = vec![binary.clone(), "exec".to_string()];
+            if tty {
+                argv.push("--tty".to_string());
+            }
+            // BTreeMap iteration is sorted, so the argv is stable across runs.
+            for (key, value) in env {
+                argv.push("--env".to_string());
+                argv.push(format!("{key}={value}"));
+            }
+            argv.push(name);
+            argv.push("--".to_string());
+            argv.extend(command.iter().cloned());
+            argv
+        }
     }
-    argv.push(name);
-    argv.extend(command.iter().cloned());
-    argv
+}
+
+/// Key under which the image config's `StopSignal` is recorded on the
+/// instance at start, so teardown can consult it without re-reading the OCI
+/// layout (which `destroy` may already have removed).
+const IMAGE_STOP_SIGNAL_KEY: &str = "imageStopSignal";
+
+/// The signal to deliver when stopping this container, docker's default
+/// chain: the jobspec's `stop.signal`, else the image config's `StopSignal`,
+/// else `SIGTERM`.
+///
+/// This is why "undeclared" has to survive the trip to the worker as a state
+/// distinct from "declared SIGTERM": only the silent case consults the image.
+/// An image declaring a signal outside Legion's vocabulary is ignored rather
+/// than failing the stop — an unstoppable container is a worse outcome than a
+/// SIGTERM the image did not ask for.
+fn container_stop_signal(task: &TaskConfig, instance: &TaskInstance) -> String {
+    if let Some(stop) = task.stop.as_ref() {
+        return stop.signal.clone();
+    }
+    instance
+        .state
+        .get(IMAGE_STOP_SIGNAL_KEY)
+        .and_then(Value::as_str)
+        .and_then(|declared| match crate::signals::canonical_signal_name(declared) {
+            Ok(signal) => Some(signal),
+            Err(err) => {
+                debug!(declared, error = %err, "Ignoring image StopSignal outside Legion's vocabulary");
+                None
+            }
+        })
+        .unwrap_or_else(|| crate::signals::DEFAULT_STOP_SIGNAL.to_string())
 }
 
 #[derive(Default)]
 pub struct ContainerTaskPlugin;
+
+impl ContainerTaskPlugin {}
 
 impl TaskPlugin for ContainerTaskPlugin {
     fn name(&self) -> &'static str {
@@ -319,17 +557,83 @@ impl TaskPlugin for ContainerTaskPlugin {
         true
     }
 
-    // Identity delivery mirrors the container runtime’s existing injection surface:
-    // env injection is supported, file injection is not (delivering a file into a
-    // container needs volume plumbing the container plugin doesn't yet implement,
-    // same as kv file injection). An env-delivered identity on a container must
-    // therefore refresh via `changeMode: restart`.
+    /// The allocation's task directory is bind-mounted at [`TASK_DIR_MOUNT`],
+    /// so a rendered file written on the host is readable inside — and a
+    /// re-render (atomic rename within the mounted directory) is visible
+    /// without restarting the container.
+    fn supports_kv_file_injection(&self) -> bool {
+        true
+    }
+
     fn supports_identity_env(&self) -> bool {
         true
     }
 
+    /// Same mechanism as KV files: the token is written into the mounted task
+    /// directory. Paired with `changeMode: signal` (which the container
+    /// runtime now also supports), a rotation reaches the workload with no
+    /// restart at all.
+    fn supports_identity_file(&self) -> bool {
+        true
+    }
+
+    /// Container tasks see the task directory at [`TASK_DIR_MOUNT`] and
+    /// nothing else of the host, so every declared file destination must
+    /// resolve under it.
+    fn file_delivery_root(&self) -> Option<&'static str> {
+        Some(TASK_DIR_MOUNT)
+    }
+
     fn supports_artifacts(&self) -> bool {
         true
+    }
+
+    /// Signals reach the container's init through the runtime CLI (see
+    /// [`TaskPlugin::signal`]), so `changeMode: signal` identities and
+    /// declared `stopSignal`s are honored on both platforms.
+    fn supports_signal(&self) -> bool {
+        true
+    }
+
+    /// The OCI runtime creates and owns the container's cgroup, so Legion
+    /// hands it the worker's decision through the generated spec
+    /// (`cgroupsPath` + `linux.resources`) instead of writing cgroup files
+    /// behind its back.
+    fn resource_enforcement(&self) -> crate::task_plugins::ResourceEnforcement {
+        crate::task_plugins::ResourceEnforcement::RuntimeApplied
+    }
+
+    /// Signal the container's *init*, not the tracked pid — the tracked
+    /// process is the runtime CLI supervisor, and killing it would leave the
+    /// workload running unsignaled (the bug this override exists to avoid).
+    fn signal(
+        &self,
+        allocation: &Allocation,
+        task: &TaskConfig,
+        _instance: &mut TaskInstance,
+        signal: &str,
+    ) -> R<()> {
+        let oci_runtime = ContainerRuntime::detect()?;
+        let argv = build_signal_command(&oci_runtime, allocation, signal)?;
+        let (program, args) = argv.split_first().expect("signal argv is never empty");
+        let output = Command::new(program)
+            .args(args)
+            .output()
+            .with_context(|| format!("failed to run `{program}` to signal the container"))?;
+        if !output.status.success() {
+            bail!(
+                "{program} could not deliver {signal} to container {}: {}",
+                container_name(allocation),
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        debug!(
+            allocation_id = allocation.id,
+            task_name = %task.name,
+            signal,
+            "Delivered signal to container init"
+        );
+        Ok(())
     }
 
     fn exec_support(&self) -> ExecSupport {
@@ -359,7 +663,13 @@ impl TaskPlugin for ContainerTaskPlugin {
         // Delegate to the runtime's `exec` subcommand against the running
         // container. The command runs inside the container's namespaces, so
         // it is genuinely sandboxed exec (unlike the exec runtime).
-        opts.command = build_exec_command(&oci_runtime, allocation.id, opts.tty, &opts.command);
+        opts.command = build_exec_command(
+            &oci_runtime,
+            allocation.id,
+            opts.tty,
+            &opts.command,
+            &opts.env,
+        );
 
         info!(
             allocation_id = allocation.id,
@@ -445,12 +755,24 @@ impl TaskPlugin for ContainerTaskPlugin {
             crate::task_plugins::allocation_env(allocation, task)
                 .into_iter()
                 .collect();
+        // Worker-injected env, translated to the in-container view: volume
+        // destinations, `LEGION_TASK_DIR=/legion/task`, and artifact paths
+        // rebased onto the mount. Applied before the task's own env so a
+        // jobspec can still override.
+        let translated = translated_worker_env(instance);
+        for (key, value) in translated {
+            merged_env.insert(key, value);
+        }
         merged_env.extend(config.env.clone());
-        // Volume vars carry the IN-CONTAINER destination (the worker resolved
-        // them that way for this kind), so they are meaningful inside the
-        // container — unlike LEGION_ALLOC_DIR and friends, which name host
-        // paths the container cannot see.
-        merged_env.extend(instance.volume_env());
+
+        // Files the manager rendered for this task (KV file injection) land
+        // in the host task dir, which the mount below makes readable inside.
+        materialize_task_files(&config.files, instance).with_context(|| {
+            format!(
+                "failed to materialize declared files for container task {}",
+                task.name
+            )
+        })?;
 
         // A container still holding this allocation's name would make `run`
         // fail; restarts and worker crashes both leave one behind.
@@ -479,6 +801,7 @@ impl TaskPlugin for ContainerTaskPlugin {
                     &config,
                     &merged_env,
                     &instance.volumes,
+                    instance.task_dir.as_deref(),
                     &image,
                 ));
                 cmd
@@ -490,14 +813,30 @@ impl TaskPlugin for ContainerTaskPlugin {
                 let scratch = work_root(allocation, instance);
                 let layout = oci_image::resolve_layout(&config.image, instance, &scratch)?;
                 let bundle = scratch.join("bundle");
-                oci_bundle::build_bundle(
+                let image_stop_signal = oci_bundle::build_bundle(
                     &layout,
                     &bundle,
                     &config.command,
                     &merged_env,
-                    &container_name(allocation),
-                    &instance.volumes,
+                    &oci_bundle::BundleContext {
+                        hostname: &container_name(allocation),
+                        volumes: &instance.volumes,
+                        task_dir: instance.task_dir.as_deref(),
+                        assignment: instance.resource_assignment.as_ref(),
+                    },
                 )?;
+                // Recorded now, while the layout is still on disk: teardown
+                // needs it (`destroy` removes the scratch tree) and it is the
+                // middle layer of the stop-signal default chain.
+                if let Some(signal) = image_stop_signal {
+                    let signal = Value::String(signal);
+                    match instance.state.as_object_mut() {
+                        Some(state) => {
+                            state.insert(IMAGE_STOP_SIGNAL_KEY.into(), signal);
+                        }
+                        None => instance.state = json!({ IMAGE_STOP_SIGNAL_KEY: signal }),
+                    }
+                }
 
                 info!(
                     allocation_id = allocation.id,
@@ -524,6 +863,89 @@ impl TaskPlugin for ContainerTaskPlugin {
         instance.pid = Some(child.id());
         instance.child = Some(child);
         Ok(())
+    }
+
+    /// Deliver the stop notice **into the container**, not to the launching
+    /// CLI: both runtimes keep the container alive when the foreground
+    /// process is signalled, so signalling the tracked host process would
+    /// notify nobody. The container's init (PID 1 in its namespace) is the
+    /// process the workload actually runs as.
+    fn stop_with(
+        &self,
+        allocation: &Allocation,
+        task: &TaskConfig,
+        instance: &mut TaskInstance,
+        ctx: &crate::task_plugins::StopContext,
+    ) -> R<bool> {
+        let Ok(oci_runtime) = ContainerRuntime::detect() else {
+            return Ok(false);
+        };
+        let name = container_name(allocation);
+        // `ctx.signal` is the worker's resolved ladder, which cannot know
+        // about the image: when the jobspec declared no `stop` block, docker's
+        // chain says the image's own STOPSIGNAL wins before SIGTERM.
+        let signal = container_stop_signal(task, instance);
+        let grace_secs = ctx.grace.as_secs().max(1).to_string();
+        let (program, args): (&str, Vec<String>) = match &oci_runtime {
+            // `runc`/`youki`-style `kill` signals the container init and
+            // returns immediately, which is exactly the contract here — the
+            // worker's reaper owns the deadline.
+            ContainerRuntime::Oci { binary } => (
+                binary.as_str(),
+                vec![
+                    "kill".to_string(),
+                    name.clone(),
+                    // The OCI CLI takes the bare name (`TERM`), not `SIGTERM`.
+                    signal.trim_start_matches("SIG").to_string(),
+                ],
+            ),
+            // Apple's `container stop` signals and then waits out its own
+            // timeout, so it is run detached below rather than inline. It
+            // owns the ladder end-to-end; Legion's `stop.signal` reaches it,
+            // but the runtime may SIGKILL before Legion's deadline if
+            // `killAfter` is longer than what `--time` accepts.
+            ContainerRuntime::AppleContainer => (
+                APPLE_CONTAINER_BIN,
+                vec![
+                    "stop".to_string(),
+                    "--signal".to_string(),
+                    signal.clone(),
+                    "--time".to_string(),
+                    grace_secs,
+                    name.clone(),
+                ],
+            ),
+        };
+        info!(
+            allocation_id = allocation.id,
+            task_name = %task.name,
+            oci_runtime = program,
+            %signal,
+            grace_secs = ctx.grace.as_secs(),
+            cause = %ctx.cause,
+            "Signalling container to stop"
+        );
+        // Spawned, never waited on: `stop_with` runs under the worker's
+        // task-manager mutex and must not hold it for the grace window.
+        // Failures are ignored on purpose — an already-exited container is a
+        // successful stop, and the reaper cleans up either way.
+        match Command::new(program)
+            .args(&args)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(_child) => Ok(true),
+            Err(err) => {
+                warn!(
+                    allocation_id = allocation.id,
+                    task_name = %task.name,
+                    error = %err,
+                    "Failed to signal container; falling back to a hard stop"
+                );
+                Ok(false)
+            }
+        }
     }
 
     fn stop(
@@ -745,6 +1167,7 @@ mod tests {
             &config,
             &config.env,
             &[],
+            None,
             &config.image,
         );
         assert_eq!(args[0], "run");
@@ -774,6 +1197,7 @@ mod tests {
             &config,
             &config.env,
             &[],
+            None,
             &config.image,
         );
         let idx = args
@@ -791,7 +1215,15 @@ mod tests {
             "command": ["echo", "ok"]
         }))?;
         let task = task_with(json!({ "memory": 256, "cores": 2 }), None);
-        let args = build_apple_launch(&alloc(), &task, &config, &config.env, &[], &config.image);
+        let args = build_apple_launch(
+            &alloc(),
+            &task,
+            &config,
+            &config.env,
+            &[],
+            None,
+            &config.image,
+        );
         let memory = args
             .iter()
             .position(|a| a == "--memory")
@@ -807,6 +1239,7 @@ mod tests {
             &config,
             &config.env,
             &[],
+            None,
             &config.image,
         );
         assert!(!bare.contains(&"--memory".to_string()));
@@ -845,6 +1278,7 @@ mod tests {
             &config,
             &config.env,
             &[],
+            None,
             &config.image,
         );
         assert!(args.contains(&"21000:8080".to_string()), "{args:?}");
@@ -881,6 +1315,7 @@ mod tests {
             &config,
             &config.env,
             &[],
+            None,
             &image,
         );
         assert!(args.contains(&image), "{args:?}");
@@ -1085,6 +1520,687 @@ mod tests {
         Ok(())
     }
 
+    /// The OCI dialect: `--tty` but never `--interactive` (runc/crun/youki
+    /// have no such flag), caller env as repeated `--env`, and a `--`
+    /// separator so a command starting with `-` reaches the container instead
+    /// of the runtime's flag parser.
+    #[test]
+    fn oci_exec_argv_uses_the_runtime_dialect() {
+        let oci_runtime = ContainerRuntime::Oci {
+            binary: "runc".into(),
+        };
+        let env = std::collections::BTreeMap::from([("TERM".to_string(), "xterm".to_string())]);
+        let argv = build_exec_command(
+            &oci_runtime,
+            42,
+            true,
+            &["-l".to_string(), "--color".to_string()],
+            &env,
+        );
+        assert_eq!(
+            argv,
+            vec![
+                "runc",
+                "exec",
+                "--tty",
+                "--env",
+                "TERM=xterm",
+                "legion-42",
+                "--",
+                "-l",
+                "--color",
+            ]
+        );
+        assert!(
+            !argv.contains(&"--interactive".to_string()),
+            "OCI runtimes have no --interactive: {argv:?}"
+        );
+
+        // Non-tty one-shot: no --tty, everything else unchanged.
+        let argv = build_exec_command(
+            &oci_runtime,
+            42,
+            false,
+            &["/bin/true".to_string()],
+            &Default::default(),
+        );
+        assert_eq!(argv, vec!["runc", "exec", "legion-42", "--", "/bin/true"]);
+    }
+
+    /// The Apple arm keeps its own dialect: `--interactive` alongside
+    /// `--tty`, no `--` separator (the parser would read it as the target
+    /// executable), and caller env is not forwarded.
+    #[test]
+    fn apple_exec_argv_is_unchanged() {
+        let env = std::collections::BTreeMap::from([("TERM".to_string(), "xterm".to_string())]);
+        let argv = build_exec_command(
+            &ContainerRuntime::AppleContainer,
+            7,
+            true,
+            &["/bin/sh".to_string()],
+            &env,
+        );
+        assert_eq!(
+            argv,
+            vec![
+                APPLE_CONTAINER_BIN,
+                "exec",
+                "--tty",
+                "--interactive",
+                "legion-7",
+                "/bin/sh",
+            ]
+        );
+        assert!(!argv.contains(&"--".to_string()), "{argv:?}");
+        assert!(!argv.contains(&"--env".to_string()), "{argv:?}");
+    }
+
+    /// Exec into a container is sandboxed on every platform, and both
+    /// runtimes support it — the Linux gap this phase closed.
+    #[test]
+    fn exec_support_is_reported_for_every_detected_runtime() {
+        assert!(ContainerRuntime::AppleContainer.supports_exec());
+        assert!(ContainerRuntime::Oci {
+            binary: "youki".into()
+        }
+        .supports_exec());
+
+        let support = ContainerTaskPlugin::default().exec_support();
+        // Detection succeeds on both supported operating systems; the report
+        // is only false on an OS with no container runtime at all.
+        let detected = ContainerRuntime::detect().is_ok();
+        assert_eq!(support.exec, detected);
+        assert_eq!(support.pty, detected);
+        assert!(!support.host_level, "container exec is never host-level");
+    }
+
+    /// The mount goes in before declared volumes, so a job can still shadow
+    /// it deliberately — the same precedence the mount list gives its other
+    /// defaults.
+    #[test]
+    fn apple_launch_mounts_the_task_dir_before_declared_volumes() -> R<()> {
+        let config = ContainerTaskConfig::from_value(&json!({
+            "image": "alpine",
+            "command": ["echo", "ok"]
+        }))?;
+        let volumes = [crate::task_plugins::MountedVolume {
+            name: "data".into(),
+            mode: crate::volumes::VolumeMode::Filesystem,
+            host_path: PathBuf::from("/var/legion/data"),
+            path: Some("/data".into()),
+            fs: None,
+            fresh: false,
+            read_only: false,
+        }];
+        let args = build_apple_launch(
+            &alloc(),
+            &task_with(json!({}), None),
+            &config,
+            &config.env,
+            &volumes,
+            Some(std::path::Path::new("/var/legion/allocs/7/web")),
+            &config.image,
+        );
+
+        let task_mount = args
+            .iter()
+            .position(|arg| arg == "/var/legion/allocs/7/web:/legion/task")
+            .expect("task dir mounted");
+        let volume_mount = args
+            .iter()
+            .position(|arg| arg == "/var/legion/data:/data")
+            .expect("declared volume mounted");
+        assert!(
+            task_mount < volume_mount,
+            "task dir mounts first so a volume can shadow it: {args:?}"
+        );
+
+        // No task dir threaded through (a bare unit-test instance): no mount.
+        let bare = build_apple_launch(
+            &alloc(),
+            &task_with(json!({}), None),
+            &config,
+            &config.env,
+            &[],
+            None,
+            &config.image,
+        );
+        assert!(
+            !bare.iter().any(|arg| arg.contains("/legion/task")),
+            "{bare:?}"
+        );
+        Ok(())
+    }
+
+    /// The env a container actually gets: in-container task dir, artifact
+    /// paths rebased onto the mount, volume vars passed through — and
+    /// `LEGION_ALLOC_DIR` withheld, because the alloc dir is not mounted.
+    #[test]
+    fn worker_env_is_translated_to_the_in_container_view() {
+        let task_dir = PathBuf::from("/var/legion/allocs/7/web");
+        let instance = TaskInstance {
+            task_dir: Some(task_dir.clone()),
+            extra_env: std::collections::BTreeMap::from([
+                (
+                    "LEGION_ALLOC_DIR".to_string(),
+                    "/var/legion/allocs/7".to_string(),
+                ),
+                (
+                    "LEGION_TASK_DIR".to_string(),
+                    task_dir.display().to_string(),
+                ),
+                (
+                    "LEGION_ARTIFACT_MODEL".to_string(),
+                    format!("{}/artifacts/model", task_dir.display()),
+                ),
+                // Staged somewhere the mount does not reach: omitted rather
+                // than leaked as a dead host path.
+                (
+                    "LEGION_ARTIFACT_ELSEWHERE".to_string(),
+                    "/var/cache/legion/blob".to_string(),
+                ),
+                ("LEGION_VOLUME_DATA".to_string(), "/data".to_string()),
+                ("LEGION_STORAGE_DIR".to_string(), "/workspace".to_string()),
+            ]),
+            ..TaskInstance::default()
+        };
+
+        let env: HashMap<String, String> = translated_worker_env(&instance).into_iter().collect();
+        assert_eq!(
+            env.get("LEGION_TASK_DIR").map(String::as_str),
+            Some("/legion/task")
+        );
+        assert_eq!(
+            env.get("LEGION_ARTIFACT_MODEL").map(String::as_str),
+            Some("/legion/task/artifacts/model")
+        );
+        assert!(
+            !env.contains_key("LEGION_ARTIFACT_ELSEWHERE"),
+            "an artifact outside the mount is omitted, not leaked: {env:?}"
+        );
+        assert!(
+            !env.contains_key("LEGION_ALLOC_DIR"),
+            "the alloc dir is not mounted, so its path means nothing inside"
+        );
+        assert_eq!(
+            env.get("LEGION_VOLUME_DATA").map(String::as_str),
+            Some("/data")
+        );
+        assert_eq!(
+            env.get("LEGION_STORAGE_DIR").map(String::as_str),
+            Some("/workspace")
+        );
+    }
+
+    /// Declared files land in the host task dir at the path they will be
+    /// readable from inside, and the path rule is re-checked here rather than
+    /// trusted from admission.
+    #[test]
+    fn declared_files_materialize_under_the_task_dir() -> R<()> {
+        let tmp = tempfile::tempdir()?;
+        let instance = TaskInstance {
+            task_dir: Some(tmp.path().to_path_buf()),
+            ..TaskInstance::default()
+        };
+
+        materialize_task_files(
+            &[
+                ContainerInjectedFile {
+                    path: "config/app.toml".into(),
+                    mode: Some("0640".into()),
+                    content: "tenant=acme\n".into(),
+                },
+                ContainerInjectedFile {
+                    path: "/legion/task/other.txt".into(),
+                    mode: None,
+                    content: "ok".into(),
+                },
+            ],
+            &instance,
+        )?;
+
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("config/app.toml"))?,
+            "tenant=acme\n"
+        );
+        assert_eq!(std::fs::read_to_string(tmp.path().join("other.txt"))?, "ok");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(tmp.path().join("config/app.toml"))?
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o640, "declared mode applied, got {mode:o}");
+        }
+
+        // Defense in depth: a path the worker should never have been handed
+        // still cannot write outside the tree.
+        let err = materialize_task_files(
+            &[ContainerInjectedFile {
+                path: "../escape".into(),
+                mode: None,
+                content: "no".into(),
+            }],
+            &instance,
+        )
+        .expect_err("traversal is refused on the worker too");
+        assert!(err.to_string().contains("escapes"), "{err}");
+        Ok(())
+    }
+
+    #[test]
+    fn signal_argv_is_per_runtime() -> R<()> {
+        let allocation = alloc_with_id(11);
+        assert_eq!(
+            build_signal_command(&ContainerRuntime::AppleContainer, &allocation, "hup")?,
+            vec![
+                APPLE_CONTAINER_BIN,
+                "kill",
+                "--signal",
+                "SIGHUP",
+                "legion-11"
+            ]
+        );
+        assert_eq!(
+            build_signal_command(
+                &ContainerRuntime::Oci {
+                    binary: "crun".into()
+                },
+                &allocation,
+                "SIGHUP",
+            )?,
+            vec!["crun", "kill", "legion-11", "SIGHUP"]
+        );
+
+        // A signal Legion cannot deliver is rejected before it reaches a CLI.
+        assert!(
+            build_signal_command(&ContainerRuntime::AppleContainer, &allocation, "SIGKILL")
+                .is_err()
+        );
+        Ok(())
+    }
+
+    /// Docker's default chain: the jobspec wins, then the image's own
+    /// `StopSignal`, then `SIGTERM`.
+    #[test]
+    fn stop_signal_follows_the_jobspec_then_image_then_sigterm_chain() {
+        let bare = task_with(json!({}), None);
+        let image_signal = TaskInstance {
+            state: json!({ IMAGE_STOP_SIGNAL_KEY: "SIGQUIT" }),
+            ..TaskInstance::default()
+        };
+
+        assert_eq!(
+            container_stop_signal(&bare, &TaskInstance::default()),
+            "SIGTERM"
+        );
+        assert_eq!(container_stop_signal(&bare, &image_signal), "SIGQUIT");
+
+        let declared = TaskConfig {
+            stop: Some(crate::structs::StopConfig {
+                signal: "SIGINT".into(),
+                ..Default::default()
+            }),
+            ..bare.clone()
+        };
+        assert_eq!(
+            container_stop_signal(&declared, &image_signal),
+            "SIGINT",
+            "the jobspec outranks the image"
+        );
+
+        // An image asking for something Legion cannot deliver falls back
+        // rather than making the container unstoppable.
+        let exotic = TaskInstance {
+            state: json!({ IMAGE_STOP_SIGNAL_KEY: "SIGRTMIN+3" }),
+            ..TaskInstance::default()
+        };
+        assert_eq!(container_stop_signal(&bare, &exotic), "SIGTERM");
+    }
+
+    /// End-to-end Linux graceful stop: a container that traps its declared
+    /// signal exits inside the window, and `delete --force` finds it gone.
+    #[test]
+    #[ignore = "requires an OCI runtime (youki/runc/crun) + network"]
+    fn oci_runtime_stop_lets_a_trapping_container_drain() -> R<()> {
+        let binary = std::env::var(OCI_RUNTIME_ENV).unwrap_or_else(|_| DEFAULT_OCI_RUNTIME.into());
+        let plugin = ContainerTaskPlugin::default();
+        let allocation = alloc_with_id(9007);
+        let name = container_name(&allocation);
+        let mut task = container_task(
+            "draintest",
+            json!([
+                "/bin/sh",
+                "-c",
+                "trap 'echo draining; exit 0' INT; while :; do sleep 0.2; done"
+            ]),
+        );
+        task.stop = Some(crate::structs::StopConfig {
+            signal: "SIGINT".into(),
+            kill_after: std::time::Duration::from_secs(30),
+        });
+
+        let tmp = tempfile::tempdir()?;
+        let mut instance = TaskInstance {
+            alloc_dir: Some(tmp.path().to_path_buf()),
+            log_dir: Some(tmp.path().join("logs")),
+            ..TaskInstance::default()
+        };
+        plugin.start(&allocation, &task, &mut instance)?;
+        std::thread::sleep(std::time::Duration::from_secs(3));
+
+        let started = std::time::Instant::now();
+        plugin.stop(&allocation, &task, &mut instance)?;
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_secs(25),
+            "a trapping container must exit well inside its 30s window, took {elapsed:?}"
+        );
+        let stdout =
+            std::fs::read_to_string(instance.log_dir.as_ref().unwrap().join("stdout.log"))?;
+        assert!(stdout.contains("draining"), "trap ran: {stdout:?}");
+        assert!(
+            !Command::new(&binary)
+                .args(["state", &name])
+                .output()?
+                .status
+                .success(),
+            "container is gone after stop"
+        );
+        Ok(())
+    }
+
+    /// The other half: a container that ignores the signal is force-killed at
+    /// the deadline rather than hanging the stop forever.
+    #[test]
+    #[ignore = "requires an OCI runtime (youki/runc/crun) + network"]
+    fn oci_runtime_stop_force_kills_at_the_deadline() -> R<()> {
+        let binary = std::env::var(OCI_RUNTIME_ENV).unwrap_or_else(|_| DEFAULT_OCI_RUNTIME.into());
+        let plugin = ContainerTaskPlugin::default();
+        let allocation = alloc_with_id(9008);
+        let name = container_name(&allocation);
+        let mut task = container_task(
+            "ignoretest",
+            json!(["/bin/sh", "-c", "trap '' TERM; while :; do sleep 0.2; done"]),
+        );
+        task.stop = Some(crate::structs::StopConfig {
+            signal: "SIGTERM".into(),
+            kill_after: std::time::Duration::from_secs(3),
+        });
+
+        let tmp = tempfile::tempdir()?;
+        let mut instance = TaskInstance {
+            alloc_dir: Some(tmp.path().to_path_buf()),
+            ..TaskInstance::default()
+        };
+        plugin.start(&allocation, &task, &mut instance)?;
+        std::thread::sleep(std::time::Duration::from_secs(3));
+
+        let started = std::time::Instant::now();
+        plugin.stop(&allocation, &task, &mut instance)?;
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed >= std::time::Duration::from_secs(3),
+            "the full window must be honored before the kill, took {elapsed:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(20),
+            "and the kill must actually happen at the deadline, took {elapsed:?}"
+        );
+        assert!(
+            !Command::new(&binary)
+                .args(["state", &name])
+                .output()?
+                .status
+                .success(),
+            "container is gone after stop"
+        );
+        Ok(())
+    }
+
+    /// End-to-end Linux exec: start a container, exec a one-shot command into
+    /// it, and assert the task's own env is visible and the exit code
+    /// propagates. Run with:
+    /// `LEGION_OCI_RUNTIME=runc cargo test --lib oci_runtime_exec -- --ignored`
+    #[test]
+    #[ignore = "requires an OCI runtime (youki/runc/crun) + network"]
+    fn oci_runtime_exec_runs_inside_the_container() -> R<()> {
+        use std::io::Read;
+
+        let plugin = ContainerTaskPlugin::default();
+        let allocation = alloc_with_id(9005);
+        let mut task = container_task("exectest", json!(["/bin/sleep", "60"]));
+        task.config["env"] = json!({ "TASK_MARKER": "from-task" });
+
+        let tmp = tempfile::tempdir()?;
+        let mut instance = TaskInstance {
+            alloc_dir: Some(tmp.path().to_path_buf()),
+            log_dir: Some(tmp.path().join("logs")),
+            ..TaskInstance::default()
+        };
+        plugin.start(&allocation, &task, &mut instance)?;
+        std::thread::sleep(std::time::Duration::from_secs(3));
+
+        let opts = ExecOptions::new(
+            vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "echo marker=$TASK_MARKER; exit 3".into(),
+            ],
+            false,
+        );
+        let mut session = plugin.exec(&allocation, &task, &mut instance, opts)?;
+        let mut streams = session.take_output()?;
+        let mut stdout = String::new();
+        streams.stdout.read_to_string(&mut stdout)?;
+        let code = session.wait()?;
+
+        plugin.stop(&allocation, &task, &mut instance)?;
+
+        assert!(
+            stdout.contains("marker=from-task"),
+            "exec'd process inherits the task env: {stdout:?}"
+        );
+        assert_eq!(code, 3, "exec propagates the process's own exit status");
+        Ok(())
+    }
+
+    /// End-to-end Linux interactive exec: a shell round-trip through a PTY.
+    #[test]
+    #[ignore = "requires an OCI runtime (youki/runc/crun) + network"]
+    fn oci_runtime_exec_supports_a_tty_session() -> R<()> {
+        use std::io::Read;
+
+        let plugin = ContainerTaskPlugin::default();
+        let allocation = alloc_with_id(9006);
+        let task = container_task("ttytest", json!(["/bin/sleep", "60"]));
+
+        let tmp = tempfile::tempdir()?;
+        let mut instance = TaskInstance {
+            alloc_dir: Some(tmp.path().to_path_buf()),
+            log_dir: Some(tmp.path().join("logs")),
+            ..TaskInstance::default()
+        };
+        plugin.start(&allocation, &task, &mut instance)?;
+        std::thread::sleep(std::time::Duration::from_secs(3));
+
+        let mut session = plugin.exec(
+            &allocation,
+            &task,
+            &mut instance,
+            ExecOptions::new(vec!["/bin/sh".into()], true),
+        )?;
+        let mut streams = session.take_output()?;
+        session.write_stdin(b"echo pty-round-trip\n")?;
+        session.resize(120, 40)?;
+        session.write_stdin(b"exit 0\n")?;
+        let mut output = String::new();
+        streams.stdout.read_to_string(&mut output)?;
+        session.wait()?;
+
+        plugin.stop(&allocation, &task, &mut instance)?;
+        assert!(output.contains("pty-round-trip"), "pty output: {output:?}");
+        Ok(())
+    }
+
+    /// End-to-end Linux limits: a memory hog dies at its declared limit, and
+    /// the cgroup records the OOM so the failure record can name it.
+    ///
+    /// Run on a node with cgroup v2 and a root worker:
+    /// `LEGION_OCI_RUNTIME=runc cargo test --lib oci_runtime_enforces -- --ignored`
+    #[test]
+    #[ignore = "requires an OCI runtime + cgroup v2 + root"]
+    fn oci_runtime_enforces_a_declared_memory_limit() -> R<()> {
+        let plugin = ContainerTaskPlugin::default();
+        let allocation = alloc_with_id(9009);
+        let mut task = container_task(
+            "oomtest",
+            // Allocate well past the limit; the kernel kills the cgroup.
+            json!([
+                "/bin/sh",
+                "-c",
+                "dd if=/dev/zero of=/dev/shm/fill bs=1M count=512"
+            ]),
+        );
+        task.resources = json!({ "memory": 32 });
+
+        let assignment = crate::task_plugins::ResourceAssignment {
+            slice: crate::task_plugins::Slice::Share,
+            cgroup_path: std::path::PathBuf::from("legion/share/legion-9009"),
+            cores: None,
+            cpu_weight: None,
+            memory_limit_bytes: Some(32 * 1024 * 1024),
+        };
+        let tmp = tempfile::tempdir()?;
+        let mut instance = TaskInstance {
+            alloc_dir: Some(tmp.path().to_path_buf()),
+            log_dir: Some(tmp.path().join("logs")),
+            resource_assignment: Some(assignment.clone()),
+            ..TaskInstance::default()
+        };
+
+        plugin.start(&allocation, &task, &mut instance)?;
+        let status = instance.child.take().expect("child handle").wait()?;
+        assert!(!status.success(), "the hog must not succeed: {status:?}");
+        assert!(
+            crate::worker::resources::oom_kill_count(&assignment) > 0,
+            "the cgroup records the OOM kill that produced the failure"
+        );
+
+        plugin.stop(&allocation, &task, &mut instance)?;
+        Ok(())
+    }
+
+    /// End-to-end Linux pinning: a `cores: 2` container sees exactly its two
+    /// assigned CPUs inside its own namespace.
+    #[test]
+    #[ignore = "requires an OCI runtime + cgroup v2 + root"]
+    fn oci_runtime_pins_a_container_to_its_assigned_cores() -> R<()> {
+        let plugin = ContainerTaskPlugin::default();
+        let allocation = alloc_with_id(9010);
+        let mut task = container_task(
+            "pintest",
+            json!(["/bin/sh", "-c", "grep Cpus_allowed_list /proc/self/status"]),
+        );
+        task.resources = json!({ "cores": 2 });
+
+        let tmp = tempfile::tempdir()?;
+        let mut instance = TaskInstance {
+            alloc_dir: Some(tmp.path().to_path_buf()),
+            log_dir: Some(tmp.path().join("logs")),
+            resource_assignment: Some(crate::task_plugins::ResourceAssignment {
+                slice: crate::task_plugins::Slice::Reserve,
+                cgroup_path: std::path::PathBuf::from("legion/reserve/legion-9010"),
+                cores: Some(vec![0, 1]),
+                cpu_weight: None,
+                memory_limit_bytes: None,
+            }),
+            ..TaskInstance::default()
+        };
+
+        plugin.start(&allocation, &task, &mut instance)?;
+        let status = instance.child.take().expect("child handle").wait()?;
+        assert!(status.success(), "container exited cleanly: {status:?}");
+        let stdout =
+            std::fs::read_to_string(instance.log_dir.as_ref().unwrap().join("stdout.log"))?;
+        assert!(
+            stdout.contains("0-1") || stdout.contains("0,1"),
+            "the container sees exactly its assigned cores: {stdout:?}"
+        );
+
+        plugin.stop(&allocation, &task, &mut instance)?;
+        Ok(())
+    }
+
+    /// End-to-end: a file rendered on the host is readable inside at its
+    /// `/legion/task` path, and a host-side atomic rewrite is visible without
+    /// restarting the container — the property that makes KV re-render and
+    /// identity rotation work at all.
+    #[test]
+    #[ignore = "requires an OCI runtime (youki/runc/crun) + network"]
+    fn oci_runtime_sees_task_dir_files_and_their_rewrites() -> R<()> {
+        use std::io::Read;
+
+        let plugin = ContainerTaskPlugin::default();
+        let allocation = alloc_with_id(9011);
+        let mut task = container_task("filetest", json!(["/bin/sleep", "60"]));
+        task.config["files"] = json!([{
+            "path": "config/app.toml",
+            "content": "tenant=first\n",
+        }]);
+
+        let tmp = tempfile::tempdir()?;
+        let task_dir = tmp.path().join("web");
+        std::fs::create_dir_all(&task_dir)?;
+        let mut instance = TaskInstance {
+            alloc_dir: Some(tmp.path().to_path_buf()),
+            task_dir: Some(task_dir.clone()),
+            log_dir: Some(tmp.path().join("logs")),
+            ..TaskInstance::default()
+        };
+
+        plugin.start(&allocation, &task, &mut instance)?;
+        std::thread::sleep(std::time::Duration::from_secs(3));
+
+        let read_config =
+            |plugin: &ContainerTaskPlugin, instance: &mut TaskInstance| -> R<String> {
+                let mut session = plugin.exec(
+                    &allocation,
+                    &task,
+                    instance,
+                    ExecOptions::new(
+                        vec!["/bin/cat".into(), "/legion/task/config/app.toml".into()],
+                        false,
+                    ),
+                )?;
+                let mut streams = session.take_output()?;
+                let mut out = String::new();
+                streams.stdout.read_to_string(&mut out)?;
+                session.wait()?;
+                Ok(out)
+            };
+
+        assert!(
+            read_config(&plugin, &mut instance)?.contains("tenant=first"),
+            "the rendered file is readable at its in-container path"
+        );
+
+        // Atomic replace, exactly as the worker's refresh machinery does it.
+        let staged = task_dir.join("config/.app.toml.tmp");
+        std::fs::write(&staged, "tenant=second\n")?;
+        std::fs::rename(&staged, task_dir.join("config/app.toml"))?;
+        assert!(
+            read_config(&plugin, &mut instance)?.contains("tenant=second"),
+            "a host-side atomic rewrite is visible inside without a restart"
+        );
+
+        plugin.stop(&allocation, &task, &mut instance)?;
+        Ok(())
+    }
+
     #[test]
     fn launch_command_includes_legion_env() -> R<()> {
         let config = ContainerTaskConfig::from_value(&json!({
@@ -1099,6 +2215,7 @@ mod tests {
             &config,
             &env,
             &[],
+            None,
             &config.image,
         );
         assert!(args.contains(&"LEGION_PORT_HTTP=20000".to_string()));

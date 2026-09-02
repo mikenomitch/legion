@@ -76,6 +76,71 @@
           "refId": "A"
         }
       ]
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Sim fleet: nodes registered vs target",
+      "description": "A gap below target with a flat error rate is a ramp still climbing; a gap with a rising one is a ramp that is stuck. Legion campaigns only — Nomad and K8s fleets are not scraped here.",
+      "gridPos": { "x": 0, "y": 16, "w": 8, "h": 8 },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "targets": [
+        {
+          "expr": "sum(legion_worker_simulated_nodes)",
+          "legendFormat": "registered",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(legion_worker_simulated_nodes_target)",
+          "legendFormat": "target",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Sim fleet: heartbeat and registration rates",
+      "description": "Fleet-wide, summed over every sim host. Failed heartbeats or a nonzero registration-error rate mean the fleet is fighting the manager rather than loading it.",
+      "gridPos": { "x": 8, "y": 16, "w": 8, "h": 8 },
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] },
+      "targets": [
+        {
+          "expr": "sum(rate(legion_worker_heartbeats_total{outcome=\"ok\"}[1m]))",
+          "legendFormat": "heartbeats ok",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(rate(legion_worker_heartbeats_total{outcome!=\"ok\"}[1m]))",
+          "legendFormat": "heartbeats failed",
+          "refId": "B"
+        },
+        {
+          "expr": "sum(rate(legion_worker_simulated_registrations_total{outcome=\"error\"}[1m]))",
+          "legendFormat": "registration errors",
+          "refId": "C"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Sim fleet: heartbeat round-trip p99",
+      "description": "The workers' own view of manager pressure, and the counterpart to the manager's plan-phase histogram: a p99 that climbs with node count is what a scale claim has to explain.",
+      "gridPos": { "x": 16, "y": 16, "w": 8, "h": 8 },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(legion_worker_heartbeat_duration_seconds_bucket[1m])))",
+          "legendFormat": "p99",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(legion_worker_heartbeat_duration_seconds_bucket[1m])))",
+          "legendFormat": "p50",
+          "refId": "B"
+        }
+      ]
     }
   ]
 }

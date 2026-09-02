@@ -481,12 +481,39 @@ async fn get_instance(arg_matches: &ArgMatches) -> R<()> {
     )?
     .into_inner();
 
+    // A live, unratified claim (docs/edge-boot.md): a node has started this
+    // sandbox but the placement is not durable yet. Reported alongside the
+    // instance rather than folded into its state, because it is live node
+    // state and not part of the durable record.
+    let provisional = reply.provisional.as_ref().map(|claim| {
+        json!({
+            "claimId": claim.claim_id,
+            "nodeId": reply.provisional_node_id,
+            "gate": crate::structs::edge_boot::Gate::from_wire(claim.gate).as_str(),
+            "stage": claim.stage,
+            "leaseDeadlineUnix": claim.lease_deadline_unix,
+        })
+    });
+
     if format.is_json() {
-        output::print_success(&reply.instance);
+        output::print_success(&json!({
+            "instance": reply.instance,
+            "provisional": provisional,
+        }));
     } else {
         match reply.instance {
             Some(instance) => print_table(vec![InstanceRow::from(&instance)]),
             None => println!("Instance not found"),
+        }
+        if let Some(provisional) = provisional.as_ref() {
+            println!(
+                "\nprovisional: started on {} at gate {} (stage {}), not yet ratified; \
+                 the node kills it at unix {} if no verdict arrives",
+                provisional["nodeId"].as_str().unwrap_or_default(),
+                provisional["gate"].as_str().unwrap_or_default(),
+                provisional["stage"].as_str().unwrap_or_default(),
+                provisional["leaseDeadlineUnix"],
+            );
         }
     }
     Ok(())

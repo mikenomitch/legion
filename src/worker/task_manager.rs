@@ -1,12 +1,18 @@
 use crate::artifacts::{ArtifactStager, ArtifactStatusBoard, CredentialSource, StagedArtifact};
 use crate::prelude::*;
+use crate::structs::edge_boot::{ClaimStage, Gate, OnRefused};
 use crate::structs::{
     substitute_artifact_tokens, Allocation, AllocationHealth, StopCause, TaskAllocation,
     TaskConfig, TaskOnUnhealthyConfig, VolumeMount, VolumeReport, WorkerArtifactFetchConfigFull,
 };
-use crate::task_plugins::{StopContext, TaskInstance, TaskPluginRegistry};
+use crate::task_plugins::{
+    NetworkGate, ResourceAssignment, ResourceEnforcement, StopContext, TaskInstance,
+    TaskPluginRegistry,
+};
+use crate::worker::claims::{ClaimRecord, ClaimTable, LocalLedger};
 use crate::worker::log_sink::{default_sinks, LogResource, LogSink};
 use crate::worker::logs::{read_allocation_logs, CapturedStream};
+use crate::worker::resources::NodeResourceGovernor;
 use crate::worker::state::{pid_is_running, PersistedAllocation, WorkerStateStore};
 use crate::worker::task_health::{spawn_health_monitor, HealthMonitorHandle};
 use crate::worker::volumes::{volume_env, WorkerVolumeManager};
@@ -48,18 +54,59 @@ pub struct TaskExit {
     pub task_name: String,
     pub exit_code: Option<i32>,
     pub signal: Option<i32>,
+    /// The declared memory limit, in bytes, when the kernel OOM-killed
+    /// something in this task's cgroup before it exited.
+    ///
+    /// Read from `memory.events` at exit for governed allocations, because
+    /// exit code 137 on its own sends the job author hunting through dmesg —
+    /// this is what lets [`Self::describe`] name the limit that fired.
+    pub oom_killed_at_bytes: Option<u64>,
 }
 
 impl TaskExit {
     /// Human-readable rendering used in health status, failure reasons, and
     /// the terminal report.
     pub fn describe(&self) -> String {
-        match (self.exit_code, self.signal) {
+        let status = match (self.exit_code, self.signal) {
             (Some(code), _) => format!("exited with status {code}"),
             (None, Some(signal)) => format!("killed by signal {signal}"),
             (None, None) => "process is gone (exit status unknown)".to_string(),
+        };
+        match self.oom_killed_at_bytes {
+            Some(bytes) => format!(
+                "{status}; task exceeded its {} MiB memory limit and was OOM-killed",
+                bytes / (1024 * 1024)
+            ),
+            None => status,
         }
     }
+}
+
+/// One allocation inside its grace window: signalled, not yet reaped.
+///
+/// Everything the teardown needs is moved in here, because the allocation is
+/// already out of the live maps by the time it lands.
+pub struct TerminatingAllocation {
+    allocation: Allocation,
+    task: TaskConfig,
+    instance: TaskInstance,
+    /// Why it is stopping, for the reap log line.
+    cause: StopCause,
+    /// When the grace window closes and the reaper hard-destroys it.
+    deadline: std::time::Instant,
+    /// Whether teardown removes the allocation directory (false for an
+    /// in-place re-dispatch that will reuse the staged artifacts).
+    remove_dirs: bool,
+}
+
+/// Why [`WorkerTaskManager::reap_terminating`] finished an allocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReapOutcome {
+    /// The task exited inside its grace window — the good path.
+    Exited,
+    /// The grace window closed with the process still running, so it was
+    /// SIGKILLed.
+    Killed,
 }
 
 /// A staging job handed to a dedicated thread: everything needed to fetch a
@@ -68,14 +115,32 @@ pub struct StagingJob {
     pub allocation: Allocation,
     pub task: TaskConfig,
     pub task_dir: PathBuf,
+    /// Gate this launch is held at. [`Gate::Off`] for every ordinary
+    /// allocation; [`Gate::Stage`] stops after `prepare`, which is exactly
+    /// what makes staging overlap the commit without executing anything.
+    pub gate: Gate,
     stager: Arc<ArtifactStager>,
     board: ArtifactStatusBoard,
+}
+
+/// The outcome of ratifying a claim.
+pub struct Ratified {
+    pub claim: ClaimRecord,
+    /// Set when this ratification *started* the workload (a `stage`-gated
+    /// claim), so the caller must spawn its health monitor. `None` for a claim
+    /// that was already running, and for a duplicate verdict — both already
+    /// have one, and a second would double-count restarts.
+    pub start_health_monitor: Option<(Allocation, TaskConfig)>,
 }
 
 /// What `begin_task_allocation` did with a new allocation.
 pub enum BeginOutcome {
     /// No artifacts: the task was prepared and started synchronously.
     Started(Box<(Allocation, TaskConfig)>),
+    /// A provisional allocation at gate `stage`: prepared, not started.
+    /// Nothing outside the node can observe it, and no health monitor runs
+    /// until ratification starts the workload.
+    Staged(Box<(Allocation, TaskConfig)>),
     /// Artifacts declared: the allocation is registered as
     /// `staging artifacts` and the caller must run the staging job on a
     /// blocking thread (see [`launch_task_allocation`]).
@@ -118,6 +183,27 @@ pub struct WorkerTaskManager {
     /// each heartbeat, so this worker holds exactly what the manager
     /// currently knows and needs no expiry logic of its own.
     stop_causes: HashMap<i64, StopCause>,
+    /// Who displaced each preempted allocation, from the same heartbeat feed
+    /// as [`Self::stop_causes`]. Written into the stop notice so a task can
+    /// tell "the platform wanted my capacity for job X" from "my operator
+    /// stopped me", which is the bidirectional link Kueue had to retrofit.
+    /// Only ever populated for [`StopCause::Preempted`].
+    preemptors: HashMap<i64, crate::structs::StopNoticePreemptor>,
+    /// Allocations that have been signalled and are inside their grace
+    /// window. They are out of `instances`/`allocations` already (the manager
+    /// no longer wants them, and the heartbeat must not report them as this
+    /// node's running work), but their process is still alive and their
+    /// storage is still mounted.
+    ///
+    /// This set is the load-bearing piece of graceful stop. `stop()` cannot
+    /// simply wait for a deadline: `reconcile_allocations` runs under this
+    /// struct's mutex inside the async heartbeat loop, so a blocking stop
+    /// would hold the lock heartbeats, the self-fence watchdog and health
+    /// reporting all need — at a 2s cadence a 30s grace would let the manager
+    /// declare the node lost and reschedule everything on it. So the stop
+    /// *signals and returns*, and [`Self::reap_terminating`] finishes the job
+    /// from the supervisor loop.
+    terminating: HashMap<i64, TerminatingAllocation>,
     state_store: WorkerStateStore,
     /// Root of per-allocation directories: `<state dir>/allocs/<alloc_id>/<task>/`.
     alloc_root: PathBuf,
@@ -136,6 +222,19 @@ pub struct WorkerTaskManager {
     /// Resolved mount lists per allocation, kept so a worker restart can
     /// re-mount exactly what the manager last dispatched.
     volume_specs: HashMap<i64, Vec<VolumeMount>>,
+    /// Provisional allocations this node has started but the store has not
+    /// yet recorded (docs/edge-boot.md). Keyed by claim id; each record
+    /// carries the negative worker-local allocation key the maps above use,
+    /// so provisional work flows through every existing path unchanged.
+    claims: ClaimTable,
+    /// This node's advisory view of its own free capacity, so it cannot
+    /// double-admit itself into oversubscription across concurrent claims.
+    ledger: LocalLedger,
+    /// The node's CPU/memory accounting and cgroup hierarchy (see
+    /// `src/worker/resources.rs`). Disabled unless the worker was started
+    /// with `resourceEnforcement.enabled`, in which case it governs every
+    /// runtime that opted into the enforcement interface.
+    resources: NodeResourceGovernor,
 }
 
 impl Default for WorkerTaskManager {
@@ -171,6 +270,8 @@ impl WorkerTaskManager {
             restart_history: HashMap::new(),
             self_fence_windows: HashMap::new(),
             stop_causes: HashMap::new(),
+            preemptors: HashMap::new(),
+            terminating: HashMap::new(),
             state_store,
             alloc_root,
             artifact_status: ArtifactStatusBoard::new(),
@@ -189,6 +290,9 @@ impl WorkerTaskManager {
                 },
             )),
             volume_specs: HashMap::new(),
+            claims: ClaimTable::new(),
+            ledger: LocalLedger::default(),
+            resources: NodeResourceGovernor::from_env(),
         }
     }
 
@@ -345,8 +449,19 @@ impl WorkerTaskManager {
         self.registry.readiness_checks()
     }
 
+    /// The allocation ids this node is running, as the **manager** knows
+    /// them.
+    ///
+    /// Unratified provisional work is deliberately absent: the manager does
+    /// not know about it yet, and reporting a negative local key as a running
+    /// allocation would be a lie the reconcile loop would act on. It is
+    /// reported separately, in `HeartbeatRequest.provisional_claims`.
     pub fn allocations_snapshot(&self) -> Vec<i64> {
-        let mut allocations = self.instances.keys().copied().collect::<Vec<_>>();
+        let mut allocations = self
+            .instances
+            .keys()
+            .filter_map(|local_key| self.external_id(*local_key))
+            .collect::<Vec<_>>();
         allocations.sort_unstable();
         allocations
     }
@@ -354,7 +469,7 @@ impl WorkerTaskManager {
     /// Whether this worker currently runs the allocation (used by identity
     /// refresh loops to stop once the allocation is gone).
     pub fn has_allocation(&self, allocation_id: i64) -> bool {
-        self.instances.contains_key(&allocation_id)
+        self.instances.contains_key(&self.local_key(allocation_id))
     }
 
     /// The tracked process id for an allocation, if any.
@@ -401,23 +516,59 @@ impl WorkerTaskManager {
         Ok(())
     }
 
-    /// Deliver a Unix signal (e.g. "SIGHUP") to the allocation's process —
-    /// the `changeMode: signal` pathway for refreshed identity tokens.
-    pub fn signal_allocation(&self, allocation_id: i64, signal: &str) -> R<()> {
-        let pid = self
-            .allocation_pid(allocation_id)
-            .context("Allocation has no tracked pid to signal")?;
-        send_signal(pid, signal)
+    /// Deliver a Unix signal (e.g. "SIGHUP") to the allocation — the
+    /// `changeMode: signal` pathway for refreshed identity tokens.
+    ///
+    /// Routed through the task runtime, not `kill(2)`: for an isolating
+    /// runtime the tracked pid is a supervisor, and only the plugin knows how
+    /// to reach the workload (see [`crate::task_plugins::TaskPlugin::signal`]).
+    /// The default trait impl is exactly the old behavior, so host-process
+    /// runtimes are unaffected.
+    pub fn signal_allocation(&mut self, allocation_id: i64, signal: &str) -> R<()> {
+        let allocation = self
+            .allocations
+            .get(&allocation_id)
+            .cloned()
+            .context("Allocation not found for signal")?;
+        let task = self
+            .task_configs
+            .get(&allocation_id)
+            .cloned()
+            .context("Task config missing for signal")?;
+        let plugin = self
+            .registry
+            .plugin(&task.runtime)
+            .with_context(|| format!("Task plugin {} not loaded for signal", task.runtime))?;
+        let instance = self
+            .instances
+            .get_mut(&allocation_id)
+            .context("Task instance missing for signal")?;
+        plugin
+            .signal(&allocation, &task, instance, signal)
             .with_context(|| format!("Failed to deliver {signal} to allocation {allocation_id}"))?;
-        info!(allocation_id, signal, pid, "Signaled allocation process");
+        info!(
+            allocation_id,
+            signal,
+            task_runtime = %task.runtime,
+            "Signaled allocation"
+        );
         Ok(())
     }
 
+    /// Per-allocation health, addressed by the ids the manager knows.
+    /// Unratified provisional work is omitted for the same reason it is
+    /// omitted from [`Self::allocations_snapshot`].
     pub fn allocation_health_snapshot(&self) -> Vec<AllocationHealth> {
-        let mut entries = self.allocation_health.values().cloned().collect::<Vec<_>>();
-        for entry in &mut entries {
-            entry.artifact_states = self.artifact_status.snapshot_json(entry.allocation_id);
-        }
+        let mut entries = self
+            .allocation_health
+            .values()
+            .filter_map(|entry| {
+                let mut entry = entry.clone();
+                entry.artifact_states = self.artifact_status.snapshot_json(entry.allocation_id);
+                entry.allocation_id = self.external_id(entry.allocation_id)?;
+                Some(entry)
+            })
+            .collect::<Vec<_>>();
         entries.sort_by_key(|entry| entry.allocation_id);
         entries
     }
@@ -436,6 +587,9 @@ impl WorkerTaskManager {
             .keys()
             .copied()
             .filter(|allocation_id| !self.terminated.contains_key(allocation_id))
+            // An allocation we are deliberately draining is not a task that
+            // crashed: its exit must not feed the restart policy.
+            .filter(|allocation_id| !self.terminating.contains_key(allocation_id))
             .collect::<Vec<_>>();
 
         for allocation_id in candidates {
@@ -486,11 +640,24 @@ impl WorkerTaskManager {
             };
 
             if let Some((exit_code, signal)) = exit {
+                // Read the cgroup's OOM counter *before* teardown removes it.
+                // Best-effort and cheap: one small read, and only for
+                // governed allocations that carry a memory limit.
+                let oom_killed_at_bytes =
+                    instance
+                        .resource_assignment
+                        .as_ref()
+                        .and_then(|assignment| {
+                            let limit = assignment.memory_limit_bytes?;
+                            (crate::worker::resources::oom_kill_count(assignment) > 0)
+                                .then_some(limit)
+                        });
                 exits.push(TaskExit {
                     allocation_id,
                     task_name,
                     exit_code,
                     signal,
+                    oom_killed_at_bytes,
                 });
             }
         }
@@ -568,6 +735,7 @@ impl WorkerTaskManager {
                 task_name: String::new(),
                 exit_code: None,
                 signal: None,
+                oom_killed_at_bytes: None,
             },
         );
         self.set_allocation_health(allocation_id, true, message.clone());
@@ -580,8 +748,18 @@ impl WorkerTaskManager {
         });
     }
 
+    /// Terminal outcomes owed to the manager, addressed by the ids it knows.
+    /// Reports for unratified provisional work are dropped: there is no
+    /// allocation for the manager to complete.
     pub fn drain_terminations(&mut self) -> Vec<TerminatedAllocationReport> {
-        std::mem::take(&mut self.terminated_reports)
+        let reports = std::mem::take(&mut self.terminated_reports);
+        reports
+            .into_iter()
+            .filter_map(|mut report| {
+                report.allocation_id = self.external_id(report.allocation_id)?;
+                Some(report)
+            })
+            .collect()
     }
 
     /// Put drained terminal reports back after a failed heartbeat, so a dead
@@ -590,12 +768,45 @@ impl WorkerTaskManager {
         self.terminated_reports.extend(reports);
     }
 
+    /// Failures owed to the manager, addressed by the ids it knows. A
+    /// failure on unratified provisional work is dropped for the same reason
+    /// a terminal report is: there is nothing for the manager to reschedule,
+    /// and the claim's own kill path already emitted the event.
     pub fn drain_failures(&mut self) -> Vec<FailedAllocationReport> {
-        std::mem::take(&mut self.failed)
+        let failures = std::mem::take(&mut self.failed);
+        failures
+            .into_iter()
+            .filter_map(|mut failure| {
+                failure.allocation_id = self.external_id(failure.allocation_id)?;
+                Some(failure)
+            })
+            .collect()
     }
 
     fn alloc_dir(&self, allocation_id: i64) -> PathBuf {
         self.alloc_root.join(allocation_id.to_string())
+    }
+
+    /// Where an allocation's declared file destinations land on the host,
+    /// for a runtime that mounts its task directory somewhere else.
+    ///
+    /// `Some((in_task_root, host_task_dir))` for such a runtime (the
+    /// `container` runtime's `/legion/task`), `None` for one whose filesystem
+    /// *is* the host's (`exec`), where a declared absolute path is already
+    /// the real path. Used by identity delivery, which writes token files
+    /// before the task starts and must put them where the workload will
+    /// actually look.
+    pub fn file_delivery_base(
+        &mut self,
+        allocation_id: i64,
+        task_name: &str,
+        runtime: &str,
+    ) -> Option<(&'static str, PathBuf)> {
+        if self.registry.load_plugin(runtime, false).is_err() {
+            return None;
+        }
+        let root = self.registry.plugin(runtime)?.file_delivery_root()?;
+        Some((root, self.alloc_dir(allocation_id).join(task_name)))
     }
 
     fn cleanup_alloc_dir(&self, allocation_id: i64) {
@@ -631,6 +842,16 @@ impl WorkerTaskManager {
         instance
             .extra_env
             .insert("LEGION_TASK_DIR".into(), task_dir.display().to_string());
+        // Exported at start, written at stop: a task that wants to react
+        // programmatically to being stopped reads this path from its own
+        // environment and needs no other coordination.
+        instance.extra_env.insert(
+            crate::structs::STOP_NOTICE_PATH_ENV.into(),
+            task_dir
+                .join(crate::structs::STOP_NOTICE_FILE)
+                .display()
+                .to_string(),
+        );
         instance.alloc_dir = Some(alloc_dir);
         instance.task_dir = Some(task_dir);
         Ok(instance)
@@ -658,6 +879,11 @@ impl WorkerTaskManager {
             }
         }
         self.volumes.unmount_for_allocation(allocation_id);
+        let assignment = self
+            .instances
+            .get(&allocation_id)
+            .and_then(|instance| instance.resource_assignment.clone());
+        self.resources.release(allocation_id, assignment.as_ref());
         self.volume_specs.remove(&allocation_id);
         self.instances.remove(&allocation_id);
         self.allocations.remove(&allocation_id);
@@ -665,6 +891,7 @@ impl WorkerTaskManager {
         self.allocation_health.remove(&allocation_id);
         self.self_fence_windows.remove(&allocation_id);
         self.terminated.remove(&allocation_id);
+        self.terminating.remove(&allocation_id);
         self.restart_history.remove(&allocation_id);
         // A task that failed on its own was never stopped by the platform,
         // so any pending notice for it describes a stop that will not happen.
@@ -759,14 +986,43 @@ impl WorkerTaskManager {
     /// Stops allocations the manager no longer wants and returns the new
     /// allocations the caller should hand to [`launch_task_allocation`]
     /// (staging-aware launch must happen without holding this lock).
+    ///
+    /// **Stops order before starts.** Removals are applied first, and while
+    /// anything on this node is still inside its grace window no new
+    /// allocation is launched. That is what makes plan-carried eviction safe
+    /// physically: the manager's plan is atomic *logically* (victims and
+    /// preemptor commit in one transaction), and this serializes the physical
+    /// handover, so the node is never running victim and preemptor
+    /// concurrently past the grace window. The cost — a new allocation
+    /// landing on a node with slow-stopping neighbours inherits their grace
+    /// as start latency — is bounded by the `stop.killAfter` cap and is
+    /// recorded as a judgement call.
+    ///
+    /// Held-back allocations are not lost: they stay in the manager's desired
+    /// set, so the next heartbeat's reconcile returns them again.
     pub fn reconcile_allocations(&mut self, allocations: &[TaskAllocation]) -> Vec<TaskAllocation> {
+        // Desired ids are the manager's; the maps below are keyed by this
+        // node's. They differ only for a ratified provisional allocation,
+        // which keeps the local key it booted under.
         let desired_ids = allocations
             .iter()
-            .map(|allocation| allocation.allocation_id)
+            .map(|allocation| self.local_key(allocation.allocation_id))
+            .collect::<std::collections::HashSet<_>>();
+        // Unratified claims are exempt from the stop sweep for the length of
+        // their lease. The manager cannot list work it does not know about,
+        // so an absence here is not a decision — it is ignorance, and reading
+        // it as "stop this" would make every provisional start die on its
+        // first heartbeat. When the lease expires the claim is killed by
+        // `sweep_expired_claims`, which is the same outcome one tick later
+        // with no new reaper.
+        let protected = self
+            .claims
+            .unratified_local_keys()
+            .into_iter()
             .collect::<std::collections::HashSet<_>>();
         let existing_ids = self.instances.keys().copied().collect::<Vec<_>>();
         for allocation_id in existing_ids {
-            if desired_ids.contains(&allocation_id) {
+            if desired_ids.contains(&allocation_id) || protected.contains(&allocation_id) {
                 continue;
             }
             if let Err(err) = self.stop_allocation(allocation_id) {
@@ -778,11 +1034,24 @@ impl WorkerTaskManager {
             }
         }
 
-        allocations
+        let pending: Vec<TaskAllocation> = allocations
             .iter()
-            .filter(|allocation| !self.instances.contains_key(&allocation.allocation_id))
+            .filter(|allocation| {
+                let local = self.local_key(allocation.allocation_id);
+                !self.instances.contains_key(&local) && !self.terminating.contains_key(&local)
+            })
             .cloned()
-            .collect()
+            .collect();
+
+        if !pending.is_empty() && self.has_terminating() {
+            debug!(
+                held = pending.len(),
+                terminating = self.terminating.len(),
+                "Holding new allocations until in-grace allocations exit"
+            );
+            return Vec::new();
+        }
+        pending
     }
 
     /// Mirror the manager's current stop-notice set (`HeartbeatReply
@@ -801,6 +1070,15 @@ impl WorkerTaskManager {
         self.stop_causes = causes;
     }
 
+    /// Mirror the manager's preemptor links, on the same replace-wholesale
+    /// terms as [`Self::set_stop_causes`].
+    pub fn set_stop_preemptors(
+        &mut self,
+        preemptors: HashMap<i64, crate::structs::StopNoticePreemptor>,
+    ) {
+        self.preemptors = preemptors;
+    }
+
     /// The cause recorded for an allocation, if the manager sent one.
     #[cfg(test)]
     pub(crate) fn stop_cause_for(&self, allocation_id: i64) -> Option<StopCause> {
@@ -811,78 +1089,294 @@ impl WorkerTaskManager {
         self.stop_allocation_inner(allocation_id, true)
     }
 
-    /// Stops an allocation's process and forgets it. `remove_dirs: false`
-    /// keeps the task directory in place so an immediate relaunch of the
-    /// same allocation (in-place re-dispatch) can reuse already-staged
-    /// artifacts via the staging manifest.
+    /// Begins stopping an allocation and forgets it as *running* work.
+    ///
+    /// Returns without waiting. When the task's runtime accepted a stop
+    /// notice, the allocation moves into [`Self::terminating`] with its
+    /// deadline and [`Self::reap_terminating`] finishes it; otherwise the
+    /// teardown happens inline, exactly as it did before graceful stop.
+    ///
+    /// `remove_dirs: false` keeps the task directory in place so an immediate
+    /// relaunch of the same allocation (in-place re-dispatch) can reuse
+    /// already-staged artifacts via the staging manifest.
     fn stop_allocation_inner(&mut self, allocation_id: i64, remove_dirs: bool) -> R<()> {
         if let Some(monitor) = self.health_monitors.remove(&allocation_id) {
             monitor.shutdown();
         }
 
         // Consume the notice: a cause describes one stop, and the allocation
-        // is gone by the end of this function.
+        // leaves the live set by the end of this function.
         let cause = self
             .stop_causes
             .remove(&allocation_id)
             .unwrap_or(StopCause::Unknown);
-        let stop_ctx = StopContext::new(cause);
 
-        let allocation = self.allocations.get(&allocation_id).cloned();
-        let task = self.task_configs.get(&allocation_id).cloned();
-        if let (Some(allocation), Some(task)) = (allocation.as_ref(), task.as_ref()) {
-            info!(
-                allocation_id,
-                task_name = %task.name,
-                cause = %cause,
-                "Stopping allocation"
-            );
-            if let Some(plugin) = self.registry.plugin(&task.runtime) {
-                if let Some(instance) = self.instances.get_mut(&allocation_id) {
-                    if let Err(err) = plugin.stop_with(allocation, task, instance, &stop_ctx) {
-                        warn!(
-                            allocation_id,
-                            task_name = %task.name,
-                            cause = %cause,
-                            error = ?err,
-                            "Failed to stop allocation instance"
-                        );
-                    }
-                    if let Err(err) = plugin.destroy(allocation, task, instance) {
-                        warn!(
-                            allocation_id,
-                            task_name = %task.name,
-                            error = ?err,
-                            "Failed to destroy allocation instance"
-                        );
-                    }
-                }
-            }
-        }
-
-        // Release storage after the process is gone, never before: unmounting
-        // under a live task is how you corrupt a database. Best-effort — the
-        // data survives an unmount by contract, and a stuck driver must not
-        // block teardown.
-        self.volumes.unmount_for_allocation(allocation_id);
-
-        self.instances.remove(&allocation_id);
-        self.allocations.remove(&allocation_id);
-        self.task_configs.remove(&allocation_id);
+        // Drop the live-set bookkeeping first, so nothing downstream (a
+        // heartbeat racing the reap, the supervisor's exit poll) still counts
+        // this allocation as running while it drains.
+        let allocation = self.allocations.remove(&allocation_id);
+        let task = self.task_configs.remove(&allocation_id);
+        let instance = self.instances.remove(&allocation_id);
         self.allocation_health.remove(&allocation_id);
         self.self_fence_windows.remove(&allocation_id);
         self.terminated.remove(&allocation_id);
         self.restart_history.remove(&allocation_id);
         self.artifact_status.remove(allocation_id);
+
+        let (Some(allocation), Some(task), Some(mut instance)) = (allocation, task, instance)
+        else {
+            // Nothing was ever started for this id; there is no process to
+            // wait on, so complete the teardown now. No assignment to release
+            // — `release` still clears any reservation booked against the id.
+            self.finish_teardown(allocation_id, remove_dirs, None);
+            return Ok(());
+        };
+
+        let stop = task.stop_config();
+        let ctx = StopContext::with_ladder(cause, &stop.signal, stop.kill_after);
+        // The notice lands BEFORE the signal, always: a task that wakes on
+        // SIGTERM and immediately reads the file must find it there.
+        self.write_stop_notice(&allocation, &task, &instance, &ctx);
+
+        info!(
+            allocation_id,
+            task_name = %task.name,
+            cause = %cause,
+            signal = %ctx.signal,
+            grace_secs = ctx.grace.as_secs(),
+            "Stopping allocation"
+        );
+
+        let signalled = match self.registry.plugin(&task.runtime) {
+            Some(plugin) => plugin
+                .stop_with(&allocation, &task, &mut instance, &ctx)
+                .unwrap_or_else(|err| {
+                    warn!(
+                        allocation_id,
+                        task_name = %task.name,
+                        cause = %cause,
+                        error = ?err,
+                        "Failed to signal allocation instance; stopping it hard"
+                    );
+                    false
+                }),
+            None => false,
+        };
+
+        if signalled {
+            self.terminating.insert(
+                allocation_id,
+                TerminatingAllocation {
+                    allocation,
+                    task,
+                    instance,
+                    cause,
+                    deadline: ctx.deadline,
+                    remove_dirs,
+                },
+            );
+            self.persist_state();
+            return Ok(());
+        }
+
+        // No notice was delivered (a runtime with no graceful path, no
+        // tracked process, or a failed signal): tear down immediately.
+        self.destroy_and_finish(
+            allocation_id,
+            &allocation,
+            &task,
+            &mut instance,
+            remove_dirs,
+        );
+        Ok(())
+    }
+
+    /// Write the task's stop notice into its task directory, best-effort.
+    ///
+    /// Failures are logged and swallowed on purpose: the notice is an
+    /// advisory convenience, and a full disk (or a task dir a hardened task
+    /// user made unwritable) must never turn a stop into a stuck allocation.
+    fn write_stop_notice(
+        &self,
+        allocation: &Allocation,
+        task: &TaskConfig,
+        instance: &TaskInstance,
+        ctx: &StopContext,
+    ) {
+        let Some(path) = instance
+            .extra_env
+            .get(crate::structs::STOP_NOTICE_PATH_ENV)
+            .map(PathBuf::from)
+        else {
+            return;
+        };
+        let deadline = time::OffsetDateTime::now_utc()
+            + time::Duration::try_from(ctx.grace).unwrap_or(time::Duration::ZERO);
+        let notice = crate::structs::TaskStopNotice {
+            cause: ctx.cause,
+            deadline: deadline
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap_or_default(),
+            signal: ctx.signal.clone(),
+            grace_seconds: ctx.grace.as_secs(),
+            preemptor: self.preemptors.get(&allocation.id).cloned(),
+        };
+        let write = serde_json::to_vec_pretty(&notice)
+            .map_err(std::io::Error::other)
+            .and_then(|bytes| std::fs::write(&path, bytes));
+        if let Err(err) = write {
+            warn!(
+                allocation_id = allocation.id,
+                task_name = %task.name,
+                path = %path.display(),
+                error = ?err,
+                "Failed to write stop notice; stopping anyway"
+            );
+        }
+    }
+
+    /// Run the runtime's `destroy`, then release storage and directories.
+    fn destroy_and_finish(
+        &mut self,
+        allocation_id: i64,
+        allocation: &Allocation,
+        task: &TaskConfig,
+        instance: &mut TaskInstance,
+        remove_dirs: bool,
+    ) {
+        if let Some(plugin) = self.registry.plugin(&task.runtime) {
+            if let Err(err) = plugin.destroy(allocation, task, instance) {
+                warn!(
+                    allocation_id,
+                    task_name = %task.name,
+                    error = ?err,
+                    "Failed to destroy allocation instance"
+                );
+            }
+        }
+        let assignment = instance.resource_assignment.clone();
+        self.finish_teardown(allocation_id, remove_dirs, assignment.as_ref());
+    }
+
+    /// The last teardown step, shared by the immediate and the reaped paths.
+    fn finish_teardown(
+        &mut self,
+        allocation_id: i64,
+        remove_dirs: bool,
+        assignment: Option<&ResourceAssignment>,
+    ) {
+        // Release storage after the process is gone, never before: unmounting
+        // under a live task is how you corrupt a database. Grace is exactly
+        // what decoupled "stop returned" from "process is gone", so this must
+        // stay behind the reap rather than beside the signal. Best-effort —
+        // the data survives an unmount by contract, and a stuck driver must
+        // not block teardown.
+        self.volumes.unmount_for_allocation(allocation_id);
+
+        // Return this allocation's reserved cores to the share slice and drop
+        // its cgroup — for exactly the same reason, and so strictly behind
+        // the reap too: a cgroup still holding a live process will not be
+        // removed, and cores handed back early could be reserved by an
+        // incoming task while the outgoing one is still on them.
+        self.resources.release(allocation_id, assignment);
+
+        self.preemptors.remove(&allocation_id);
         if remove_dirs {
             self.volume_specs.remove(&allocation_id);
-        }
-        if remove_dirs {
             self.cleanup_alloc_dir(allocation_id);
         }
         self.persist_state();
+    }
 
-        Ok(())
+    /// Finish every terminating allocation whose process has exited, and hard
+    /// kill every one whose grace window has closed. Driven by the worker's
+    /// task supervisor (once a second), never by the heartbeat path.
+    ///
+    /// Returns what happened to each, newest ids last, for logging and tests.
+    pub fn reap_terminating(&mut self) -> Vec<(i64, ReapOutcome)> {
+        if self.terminating.is_empty() {
+            return Vec::new();
+        }
+        let now = std::time::Instant::now();
+        let mut ready: Vec<(i64, ReapOutcome)> = Vec::new();
+        for (allocation_id, entry) in self.terminating.iter_mut() {
+            if !Self::instance_process_alive(&mut entry.instance) {
+                ready.push((*allocation_id, ReapOutcome::Exited));
+            } else if now >= entry.deadline {
+                ready.push((*allocation_id, ReapOutcome::Killed));
+            }
+        }
+        ready.sort_unstable_by_key(|(allocation_id, _)| *allocation_id);
+
+        for (allocation_id, outcome) in &ready {
+            let Some(mut entry) = self.terminating.remove(allocation_id) else {
+                continue;
+            };
+            match outcome {
+                ReapOutcome::Exited => info!(
+                    allocation_id = *allocation_id,
+                    task_name = %entry.task.name,
+                    cause = %entry.cause,
+                    "Allocation exited within its grace period"
+                ),
+                ReapOutcome::Killed => warn!(
+                    allocation_id = *allocation_id,
+                    task_name = %entry.task.name,
+                    cause = %entry.cause,
+                    "Allocation ignored its stop signal; killing at the grace deadline"
+                ),
+            }
+            // `destroy` is the hard stop either way. After a clean exit it is
+            // pure teardown (image scratch, cgroup, container row); after a
+            // timeout it is also the SIGKILL.
+            let allocation = entry.allocation.clone();
+            let task = entry.task.clone();
+            let remove_dirs = entry.remove_dirs;
+            self.destroy_and_finish(
+                *allocation_id,
+                &allocation,
+                &task,
+                &mut entry.instance,
+                remove_dirs,
+            );
+        }
+        ready
+    }
+
+    /// Whether a terminating instance's process is still running. Reaps the
+    /// child handle when it has exited so the pid is not left claimed.
+    fn instance_process_alive(instance: &mut TaskInstance) -> bool {
+        if let Some(child) = instance.child.as_mut() {
+            return match child.try_wait() {
+                Ok(Some(_status)) => {
+                    instance.child = None;
+                    instance.pid = None;
+                    false
+                }
+                Ok(None) => true,
+                // An un-waitable child is not evidence of a live process; the
+                // deadline still bounds the wait either way.
+                Err(_) => false,
+            };
+        }
+        match instance.pid {
+            Some(pid) => pid_is_running(pid),
+            None => false,
+        }
+    }
+
+    /// Whether any allocation is still inside its grace window. The worker
+    /// holds new launches while this is true (see
+    /// [`Self::reconcile_allocations`]).
+    pub fn has_terminating(&self) -> bool {
+        !self.terminating.is_empty()
+    }
+
+    /// Allocation ids currently draining, for tests and diagnostics.
+    pub fn terminating_ids(&self) -> Vec<i64> {
+        let mut ids = self.terminating.keys().copied().collect::<Vec<_>>();
+        ids.sort_unstable();
+        ids
     }
 
     /// Whether an allocation is still wanted (used by staging threads to
@@ -900,6 +1394,9 @@ impl WorkerTaskManager {
         task_name: Option<&str>,
         opts: crate::task_plugins::ExecOptions,
     ) -> R<Box<dyn crate::task_plugins::ExecSession>> {
+        // Exec addresses an allocation by the manager's id; translate to the
+        // worker-local key a ratified provisional allocation still runs under.
+        let allocation_id = self.local_key(allocation_id);
         let allocation = self
             .allocations
             .get(&allocation_id)
@@ -946,10 +1443,22 @@ impl WorkerTaskManager {
     /// allocation.
     #[instrument(err, skip_all)]
     pub fn run_allocation(&mut self, allocation: &Allocation, task: &TaskConfig) -> R<()> {
+        self.run_allocation_gated(allocation, task, Gate::Off)
+    }
+
+    /// [`Self::run_allocation`] with an explicit gate; `Gate::Stage` stops
+    /// after `prepare`.
+    pub fn run_allocation_gated(
+        &mut self,
+        allocation: &Allocation,
+        task: &TaskConfig,
+        gate: Gate,
+    ) -> R<()> {
         info!(
             allocation_id = allocation.id,
             task_name = %task.name,
             task_runtime = %task.runtime,
+            gate = %gate,
             "Received task allocation"
         );
 
@@ -958,18 +1467,49 @@ impl WorkerTaskManager {
             .with_context(|| format!("Failed to load task plugin {}", task.runtime))?;
         let instance = self.prepare_instance(allocation, task)?;
         self.instances.insert(allocation.id, instance);
-        self.start_prepared_allocation(allocation, task)
+        self.prepare_registered_allocation(allocation, task)?;
+        if gate == Gate::Stage {
+            self.set_allocation_health(allocation.id, false, "staged (awaiting ratification)");
+            return Ok(());
+        }
+        self.start_registered_allocation(allocation, task, gate)
     }
 
-    /// Runs `consume_artifact` hooks + volume mounts + `prepare` + `start`
-    /// against the already-registered instance, then records the allocation as
-    /// started.
-    fn start_prepared_allocation(&mut self, allocation: &Allocation, task: &TaskConfig) -> R<()> {
+    /// Everything up to (but not including) `start`: volume mounts, artifact
+    /// consumption, and the runtime's own `prepare`.
+    ///
+    /// Split out from [`Self::start_prepared_allocation`] because it is
+    /// exactly the work a provisional allocation at gate `stage` is allowed
+    /// to do — the `stage` gate is a pause between two calls the worker
+    /// already made in sequence, not a new execution path.
+    fn prepare_registered_allocation(
+        &mut self,
+        allocation: &Allocation,
+        task: &TaskConfig,
+    ) -> R<()> {
         // Storage first: a task must never observe a missing or empty data
         // directory because its volume was still being mounted. A failure here
         // fails the allocation, which is the honest outcome — the manager
         // reschedules and the operator sees the driver's error.
         self.mount_allocation_volumes(allocation)?;
+
+        // Resource placement next, and before `prepare()`: a task must never
+        // observe its CPU/memory limits arriving after it started. Runtimes
+        // that did not opt in get `None` and are untouched.
+        let enforcement = self
+            .registry
+            .plugin(&task.runtime)
+            .map(|plugin| plugin.resource_enforcement())
+            .unwrap_or(ResourceEnforcement::Unsupported);
+        let assignment = self
+            .resources
+            .assign(allocation.id, task, enforcement)
+            .with_context(|| {
+                format!(
+                    "failed to place task {} within this node's resource limits",
+                    task.name
+                )
+            })?;
 
         let plugin = self
             .registry
@@ -981,6 +1521,7 @@ impl WorkerTaskManager {
             .get_mut(&allocation.id)
             .context("Task instance missing")?;
         instance.log_dir = Some(log_dir);
+        instance.resource_assignment = assignment;
 
         let staged = instance.staged_artifacts.clone();
         for artifact in &staged {
@@ -1001,6 +1542,51 @@ impl WorkerTaskManager {
             "Preparing task allocation"
         );
         plugin.prepare(allocation, task, instance)?;
+
+        self.allocations.insert(allocation.id, allocation.clone());
+        self.task_configs.insert(allocation.id, task.clone());
+        Ok(())
+    }
+
+    /// The second half: `start` the prepared instance and register it as
+    /// running.
+    ///
+    /// `gate` is [`Gate::Off`] for every ordinary allocation. When it is
+    /// [`Gate::Boot`], the runtime's network gate is shut *before* the
+    /// workload starts, so the guest never has a live interface it could have
+    /// used — the ordering is the guarantee, not the mechanism.
+    fn start_registered_allocation(
+        &mut self,
+        allocation: &Allocation,
+        task: &TaskConfig,
+        gate: Gate,
+    ) -> R<()> {
+        let plugin = self
+            .registry
+            .plugin(&task.runtime)
+            .context("Task plugin not loaded")?;
+        let instance = self
+            .instances
+            .get_mut(&allocation.id)
+            .context("Task instance missing")?;
+
+        if gate == Gate::Boot {
+            if plugin.network_gate() == NetworkGate::Advisory {
+                // Stated loudly rather than assumed: for host-process
+                // runtimes Legion withholds service registration and the
+                // node-local forwarders, but the workload shares the host's
+                // network stack and can still reach the outside world.
+                // docs/edge-boot.md says so; this is the operator's copy.
+                warn!(
+                    allocation_id = allocation.id,
+                    task_runtime = %task.runtime,
+                    "The `boot` gate is advisory for this runtime: Legion withholds service \
+                     registration and upstream forwarders, but the task can still reach the \
+                     network through the host"
+                );
+            }
+            plugin.set_network_gate(allocation, task, instance, false)?;
+        }
 
         info!(
             allocation_id = allocation.id,
@@ -1029,12 +1615,244 @@ impl WorkerTaskManager {
         Ok(())
     }
 
+    // ---------------------------------------------------------------------
+    // Provisional allocations (docs/edge-boot.md)
+    // ---------------------------------------------------------------------
+
+    /// Configure the node's advisory capacity ledger from its own declared
+    /// resources. Called once at worker startup, from the registration
+    /// config the manager served.
+    pub fn configure_ledger(&mut self, ledger: LocalLedger) {
+        self.ledger = ledger;
+    }
+
+    /// Snapshot of the node's live claims, for `legion node claims` and the
+    /// heartbeat report.
+    pub fn claims_snapshot(&self) -> Vec<ClaimRecord> {
+        self.claims.all()
+    }
+
+    /// The unratified claims, for `HeartbeatRequest.provisional_claims`.
+    pub fn unratified_claims(&self) -> Vec<ClaimRecord> {
+        self.claims.unratified()
+    }
+
+    /// Manager-facing allocation id for a worker-local key.
+    ///
+    /// The identity function for everything except a ratified provisional
+    /// allocation, which keeps its negative local key (and therefore its
+    /// directories, its open files, and its running process) and carries the
+    /// manager's id alongside. Nothing is ever rekeyed and no directory ever
+    /// moves — a ratification is a bookkeeping event, not a migration.
+    fn external_id(&self, local_key: i64) -> Option<i64> {
+        if local_key >= 0 {
+            return Some(local_key);
+        }
+        self.claims
+            .by_local_key(local_key)
+            .and_then(|claim| claim.allocation_id)
+    }
+
+    /// Worker-local key for a manager-facing allocation id. The identity
+    /// function unless the id names a ratified claim.
+    pub fn local_key(&self, allocation_id: i64) -> i64 {
+        self.claims
+            .by_allocation_id(allocation_id)
+            .map(|claim| claim.local_key)
+            .unwrap_or(allocation_id)
+    }
+
+    /// Admit and begin a provisional allocation.
+    ///
+    /// Admission is local and total: the ticket (if any) was already
+    /// verified by the caller, this checks the claim table and the resource
+    /// ledger, and *then* commits to running anything. A failure at this
+    /// point has held nothing and started nothing.
+    ///
+    /// Returns the registered claim. The caller runs the work through
+    /// [`launch_provisional_allocation`], which respects the gate.
+    pub fn admit_claim(&mut self, record: ClaimRecord) -> R<ClaimRecord> {
+        let claim_id = record.claim_id.clone();
+        self.ledger.admit(&claim_id, &record.resources)?;
+        match self.claims.insert(record) {
+            Ok(stored) => Ok(stored),
+            Err(err) => {
+                // Nothing is left partially held: a claim the table refuses
+                // releases its ledger reservation on the way out, or the node
+                // would slowly leak capacity to starts that never happened.
+                self.ledger.release_hold(&claim_id);
+                Err(err)
+            }
+        }
+    }
+
+    /// Ratify a claim: the placement committed and the work is now an
+    /// ordinary allocation under the manager's id.
+    ///
+    /// Opens the network for a claim held at gate `boot`, and starts a claim
+    /// that was held at gate `stage` (which prepared everything and stopped
+    /// short of `start`). Returns the claim as it now stands.
+    pub fn ratify_claim(&mut self, claim_id: &str, final_payload: &TaskAllocation) -> R<Ratified> {
+        let claim = self
+            .claims
+            .get(claim_id)
+            .cloned()
+            .with_context(|| format!("no claim {claim_id} on this node"))?;
+        if claim.is_ratified() {
+            // A duplicate verdict (the reply and the heartbeat catch-up both
+            // landed) is a no-op, not an error — and must not start a second
+            // health monitor for work that already has one.
+            return Ok(Ratified {
+                claim,
+                start_health_monitor: None,
+            });
+        }
+        let allocation_id = final_payload.allocation_id;
+
+        let local_key = claim.local_key;
+        // Adopt the committed payload before doing anything with it. The
+        // payload the node booted (or staged) with could not name assigned
+        // ports, the bound instance, or resolved volume mounts — those are
+        // produced by the apply transaction — so this is where a provisional
+        // start stops being provisional in every sense but its local key.
+        let (mut allocation, task) = task_from_allocation(final_payload)?;
+        allocation.id = local_key;
+        self.volume_specs
+            .insert(local_key, parse_volume_mounts(final_payload)?);
+        self.allocations.insert(local_key, allocation.clone());
+        self.task_configs.insert(local_key, task.clone());
+
+        // A `stage`-gated claim starts its workload here, so its health
+        // monitor starts here too — the launch path deliberately did not
+        // spawn one for work that was not running.
+        let mut start_health_monitor = None;
+        match claim.gate {
+            Gate::Stage => {
+                // Everything expensive already happened; this is the start
+                // the gate was holding back.
+                self.start_registered_allocation(&allocation, &task, Gate::Off)?;
+                start_health_monitor = Some((allocation.clone(), task.clone()));
+            }
+            Gate::Boot => {
+                let plugin = self
+                    .registry
+                    .plugin(&task.runtime)
+                    .context("Task plugin not loaded")?;
+                let instance = self
+                    .instances
+                    .get_mut(&local_key)
+                    .context("Task instance missing")?;
+                plugin.set_network_gate(&allocation, &task, instance, true)?;
+            }
+            // `serve` never gated anything, and `off` never got here.
+            Gate::Serve | Gate::Off => {}
+        }
+
+        self.ledger.release_hold(claim_id);
+        self.ledger.commit(local_key, &claim.resources);
+        let ratified = self
+            .claims
+            .ratify(claim_id, allocation_id)
+            .context("claim vanished during ratification")?;
+        // Persist now that the work has an id the cluster agrees on: a
+        // restart from here must restore it, not orphan it.
+        self.persist_state();
+        info!(
+            claim_id,
+            allocation_id,
+            gate = %claim.gate,
+            "Ratified provisional allocation"
+        );
+        Ok(Ratified {
+            claim: ratified,
+            start_health_monitor,
+        })
+    }
+
+    /// Kill a provisional allocation: refused, expired, or withdrawn.
+    ///
+    /// Every failure mode ends here — this is the single kill path the
+    /// design's fail-closed claim rests on. `on_refused: 'stop'` runs the
+    /// task's normal graceful-stop ladder; the default is a hard destroy,
+    /// because the common refusal is "someone else owns this id" and a loser
+    /// lingering is what the at-most-one invariant forbids.
+    pub fn kill_claim(&mut self, claim_id: &str, reason: &str) -> Option<ClaimRecord> {
+        let claim = self.claims.remove(claim_id)?;
+        self.ledger.release_hold(claim_id);
+        warn!(
+            claim_id,
+            local_key = claim.local_key,
+            instance_id = %claim.instance_id,
+            gate = %claim.gate,
+            reason,
+            "Killing provisional allocation"
+        );
+        let graceful = claim.on_refused == OnRefused::Stop;
+        let stopped = if graceful {
+            self.stop_allocation(claim.local_key)
+        } else {
+            self.stop_allocation_inner(claim.local_key, true)
+        };
+        if let Err(err) = stopped {
+            warn!(claim_id, error = ?err, "Failed to stop provisional allocation");
+        }
+        // A provisional allocation the manager never knew about must not be
+        // reported as a failed allocation — there is nothing to reschedule.
+        self.failed
+            .retain(|failure| failure.allocation_id != claim.local_key);
+        self.terminated_reports
+            .retain(|report| report.allocation_id != claim.local_key);
+        self.allocation_health.remove(&claim.local_key);
+        Some(claim)
+    }
+
+    /// Claims whose lease expired without a verdict. The backstop for every
+    /// failure the reply path cannot cover: a partition, a dead manager, a
+    /// lost reply. Returns what was killed, for events and metrics.
+    pub fn sweep_expired_claims(&mut self, now: std::time::Instant) -> Vec<ClaimRecord> {
+        let expired = self.claims.expired(now);
+        let mut killed = Vec::with_capacity(expired.len());
+        for claim in expired {
+            if let Some(claim) = self.kill_claim(&claim.claim_id, "ratification lease expired") {
+                killed.push(claim);
+            }
+        }
+        killed
+    }
+
+    /// Record how far a claim has progressed, for the heartbeat report and
+    /// the `StartClaim` stream.
+    pub fn set_claim_stage(&mut self, claim_id: &str, stage: ClaimStage) {
+        if let Some(claim) = self.claims.get_mut(claim_id) {
+            claim.stage = stage;
+        }
+    }
+
+    /// Whether this node already holds a live claim for an instance.
+    pub fn instance_is_claimed(&self, instance_id: &str) -> bool {
+        self.claims.instance_is_claimed(instance_id)
+    }
+
     /// Entry point for a new allocation from the manager. Tasks without
     /// artifacts start synchronously; artifact-bearing tasks are registered
     /// as `staging artifacts` and return a [`StagingJob`] the caller runs on
     /// a blocking thread (never under this lock — fetches can take minutes
     /// and heartbeats must keep flowing).
     pub fn begin_task_allocation(&mut self, allocation: &TaskAllocation) -> R<BeginOutcome> {
+        self.begin_task_allocation_gated(allocation, Gate::Off)
+    }
+
+    /// [`Self::begin_task_allocation`] with an explicit gate.
+    ///
+    /// `Gate::Off` is the ordinary path. `Gate::Stage` prepares everything
+    /// and stops short of `start`; `Gate::Boot` starts with the runtime's
+    /// network gate shut; `Gate::Serve` starts normally. The allocation id in
+    /// `allocation` is the worker-local claim key for a provisional start.
+    pub fn begin_task_allocation_gated(
+        &mut self,
+        allocation: &TaskAllocation,
+        gate: Gate,
+    ) -> R<BeginOutcome> {
         let (alloc, task) = task_from_allocation(allocation)?;
         // The manager resolved these against the volume table, so they carry
         // concrete ids and the driver attrs from previous mounts. Recorded
@@ -1043,15 +1861,17 @@ impl WorkerTaskManager {
         self.volume_specs
             .insert(alloc.id, parse_volume_mounts(allocation)?);
         // A re-dispatch of an id we already run is an in-place update (for
-        // example a config change reusing the allocation): stop the old
-        // process but keep the task directory — when the artifact list is
-        // unchanged, staging reuses the already-fetched content via the
-        // staging manifest instead of refetching.
+        // example a config change reusing the allocation). The previous
+        // instance is normally gone already: `reconcile_allocations` holds a
+        // re-dispatch back while anything is still terminating. Reaching here
+        // with the id present means that did not happen, so tear it down now
+        // rather than launching over a live process. `remove_dirs: false`
+        // keeps the staged artifacts for the relaunch.
         if self.instances.contains_key(&alloc.id) {
-            info!(
+            warn!(
                 allocation_id = alloc.id,
                 task_name = %task.name,
-                "Re-dispatched allocation; stopping previous instance before relaunch"
+                "Re-dispatched allocation was still present; forcing teardown"
             );
             if let Err(err) = self.stop_allocation_inner(alloc.id, false) {
                 warn!(
@@ -1062,7 +1882,7 @@ impl WorkerTaskManager {
             }
         }
         if task.artifacts.is_empty() {
-            self.run_allocation(&alloc, &task)?;
+            self.run_allocation_gated(&alloc, &task, gate)?;
             // Arm the self-fence watchdog for stateful allocations (0 = no
             // fencing; see the TaskAllocation proto comments). Registered
             // after a successful start and persisted so it survives worker
@@ -1072,6 +1892,11 @@ impl WorkerTaskManager {
                     alloc.id,
                     std::time::Duration::from_secs(allocation.self_terminate_after_seconds),
                 );
+            }
+            if gate == Gate::Stage {
+                // Nothing is running yet, so there is nothing to health
+                // check. The monitor starts with the workload, at ratify.
+                return Ok(BeginOutcome::Staged(Box::new((alloc, task))));
             }
             return Ok(BeginOutcome::Started(Box::new((alloc, task))));
         }
@@ -1128,6 +1953,7 @@ impl WorkerTaskManager {
             allocation: alloc,
             task,
             task_dir,
+            gate,
             stager: self.stager.clone(),
             board: self.artifact_status.clone(),
         })))
@@ -1141,18 +1967,43 @@ impl WorkerTaskManager {
         allocation: &Allocation,
         task: &TaskConfig,
         staged: Vec<StagedArtifact>,
+        gate: Gate,
     ) -> R<()> {
+        // A runtime that mounts the task dir sees staged artifacts at the
+        // in-task path, not the host one — the same rule volume env already
+        // follows. `${artifact.<name>}` interpolation must agree with
+        // `LEGION_ARTIFACT_<NAME>`, so both are translated from one place.
+        let in_task_root = self
+            .registry
+            .plugin(&task.runtime)
+            .and_then(|plugin| plugin.file_delivery_root());
         let mut artifact_paths: HashMap<String, String> = HashMap::new();
         let instance = self
             .instances
             .get_mut(&allocation.id)
             .context("Task instance missing for staged allocation")?;
+        let task_dir = instance.task_dir.clone();
         for artifact in &staged {
             if let Some(name) = artifact.name.as_deref() {
-                let path = artifact.reference_path().display().to_string();
+                let host_path = artifact.reference_path();
                 let env_name = format!("LEGION_ARTIFACT_{}", name.to_uppercase().replace('-', "_"));
-                instance.extra_env.insert(env_name, path.clone());
-                artifact_paths.insert(name.to_string(), path);
+                // The env var keeps the host path here; the runtime plugin
+                // translates it at start (it is the one that knows its own
+                // mount). Interpolation cannot be deferred that way — the
+                // rendered config is what the plugin parses — so it is
+                // translated now.
+                instance
+                    .extra_env
+                    .insert(env_name, host_path.display().to_string());
+                let in_task_path = match (in_task_root, task_dir.as_ref()) {
+                    (Some(root), Some(task_dir)) => host_path
+                        .strip_prefix(task_dir)
+                        .ok()
+                        .map(|relative| PathBuf::from(root).join(relative).display().to_string())
+                        .unwrap_or_else(|| host_path.display().to_string()),
+                    _ => host_path.display().to_string(),
+                };
+                artifact_paths.insert(name.to_string(), in_task_path);
             }
         }
         instance.staged_artifacts = staged;
@@ -1162,7 +2013,15 @@ impl WorkerTaskManager {
         let mut started_task = task.clone();
         substitute_artifact_tokens(&mut started_task.config, &artifact_paths);
 
-        self.start_prepared_allocation(allocation, &started_task)
+        if gate == Gate::Stage {
+            // The whole point of the `stage` gate: everything expensive is
+            // done and nothing is executing. `ratify_claim` runs the start.
+            self.prepare_registered_allocation(allocation, &started_task)?;
+            self.set_allocation_health(allocation.id, false, "staged (awaiting ratification)");
+            return Ok(());
+        }
+        self.prepare_registered_allocation(allocation, &started_task)?;
+        self.start_registered_allocation(allocation, &started_task, gate)
     }
 
     /// Mount the allocation's volumes and expose them to the task.
@@ -1264,7 +2123,11 @@ impl WorkerTaskManager {
         max_bytes: i64,
         tail: bool,
     ) -> R<Vec<CapturedStream>> {
-        let log_dir = self.state_store.allocation_log_dir(allocation_id);
+        // Addressed by the manager's id; a ratified provisional allocation
+        // still writes under the local key it booted with.
+        let log_dir = self
+            .state_store
+            .allocation_log_dir(self.local_key(allocation_id));
         read_allocation_logs(&log_dir, stream, offset, max_bytes, tail)
     }
 
@@ -1276,6 +2139,7 @@ impl WorkerTaskManager {
         let persisted = self.state_store.load()?;
         let mut active = Vec::new();
         let mut restored = Vec::new();
+        let mut restored_claims: Vec<(i64, i64, TaskConfig)> = Vec::new();
 
         for record in persisted {
             let Some(pid) = record.pid else {
@@ -1311,6 +2175,13 @@ impl WorkerTaskManager {
                 .insert("LEGION_TASK_DIR".into(), task_dir.display().to_string());
             instance.alloc_dir = Some(alloc_dir);
             instance.task_dir = Some(task_dir);
+            // Re-adopt the CPU/memory assignment this worker handed out
+            // before it restarted, so the allocator does not hand a running
+            // task's exclusive cores to somebody else.
+            if let Some(assignment) = record.resource_assignment.as_ref() {
+                self.resources.restore(record.allocation.id, assignment);
+                instance.resource_assignment = Some(assignment.clone());
+            }
             self.instances.insert(record.allocation.id, instance);
             self.allocations
                 .insert(record.allocation.id, record.allocation.clone());
@@ -1337,10 +2208,50 @@ impl WorkerTaskManager {
                 );
             }
             self.set_allocation_health(record.allocation.id, false, "restored");
+            // A ratified provisional allocation is restored under the
+            // negative local key it booted with, so its directories, its open
+            // files and its running process all still line up. The alias to
+            // the manager's id is rebuilt here; without it the next heartbeat
+            // would report nothing for an allocation the cluster believes is
+            // running, and the manager would replace a live task.
+            if let Some(external_id) = record.external_id {
+                restored_claims.push((record.allocation.id, external_id, record.task.clone()));
+            }
             active.push(record.clone());
             restored.push((record.allocation, record.task));
         }
 
+        // Seed the key counter below every restored key before rebuilding the
+        // aliases, so a claim admitted after the restart cannot be handed a
+        // key a running allocation is still using.
+        self.claims
+            .reserve_below(restored_claims.iter().map(|(local, _, _)| *local));
+        for (local_key, external_id, task) in restored_claims {
+            let record = ClaimRecord {
+                claim_id: format!("clm_restored_{}", external_id),
+                local_key,
+                gate: Gate::Off,
+                stage: ClaimStage::Serving,
+                lease_deadline: std::time::Instant::now(),
+                lease_deadline_unix: 0,
+                job_id: String::new(),
+                job_config_id: String::new(),
+                task_name: task.name.clone(),
+                instance_id: String::new(),
+                resources: task.resources.clone(),
+                origin: "restored".into(),
+                on_refused: OnRefused::Kill,
+                ticket_jti: String::new(),
+                allocation_id: Some(external_id),
+            };
+            if let Err(err) = self.claims.insert(record) {
+                warn!(external_id, error = ?err, "Failed to restore provisional allocation alias");
+            }
+        }
+
+        // One mask write for the whole restored set, after every
+        // reservation is back in the allocator's view.
+        self.resources.resync_masks();
         self.persist_state_with(&active);
 
         Ok(restored)
@@ -1349,6 +2260,18 @@ impl WorkerTaskManager {
     fn persist_state(&self) {
         let mut records = Vec::new();
         for (allocation_id, allocation) in &self.allocations {
+            // Unratified provisional work is deliberately never persisted: a
+            // worker restart kills it (edge boot plan §6.6), so writing it
+            // down would only create something to clean up. Ratified claims
+            // carry their manager-minted id in `external_id` so a restart
+            // restores the alias along with the allocation.
+            if self
+                .claims
+                .by_local_key(*allocation_id)
+                .is_some_and(|claim| !claim.is_ratified())
+            {
+                continue;
+            }
             let Some(task) = self.task_configs.get(allocation_id) else {
                 continue;
             };
@@ -1372,6 +2295,10 @@ impl WorkerTaskManager {
                 allocation: allocation.clone(),
                 task: task.clone(),
                 pid,
+                resource_assignment: self
+                    .instances
+                    .get(allocation_id)
+                    .and_then(|instance| instance.resource_assignment.clone()),
                 self_terminate_after_secs: self
                     .self_fence_windows
                     .get(allocation_id)
@@ -1381,6 +2308,10 @@ impl WorkerTaskManager {
                     .get(allocation_id)
                     .cloned()
                     .unwrap_or_default(),
+                external_id: self
+                    .claims
+                    .by_local_key(*allocation_id)
+                    .and_then(|claim| claim.allocation_id),
             });
         }
 
@@ -1394,8 +2325,6 @@ impl WorkerTaskManager {
     }
 }
 
-/// Resolve a signal name like "SIGHUP"/"HUP" and deliver it to `pid`.
-#[cfg(unix)]
 /// Split a finished child's status into `(exit_code, signal)`. Unix reports a
 /// signal death as `code: None`, which is exactly the distinction the restart
 /// policy and the operator both want to see.
@@ -1409,41 +2338,6 @@ fn exit_from_status(status: &std::process::ExitStatus) -> (Option<i32>, Option<i
     {
         (status.code(), None)
     }
-}
-
-fn send_signal(pid: u32, signal: &str) -> R<()> {
-    let signum = parse_signal(signal)?;
-    // SAFETY: plain kill(2) with a validated signal number.
-    let rc = unsafe { libc::kill(pid as libc::pid_t, signum) };
-    if rc != 0 {
-        bail!(
-            "kill({pid}, {signal}) failed: {}",
-            std::io::Error::last_os_error()
-        );
-    }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn send_signal(_pid: u32, signal: &str) -> R<()> {
-    bail!("signal delivery ({signal}) is not supported on this platform");
-}
-
-#[cfg(unix)]
-fn parse_signal(name: &str) -> R<libc::c_int> {
-    let normalized = name.trim().to_ascii_uppercase();
-    let stripped = normalized.strip_prefix("SIG").unwrap_or(&normalized);
-    Ok(match stripped {
-        "HUP" => libc::SIGHUP,
-        "INT" => libc::SIGINT,
-        "QUIT" => libc::SIGQUIT,
-        "TERM" => libc::SIGTERM,
-        "USR1" => libc::SIGUSR1,
-        "USR2" => libc::SIGUSR2,
-        "CONT" => libc::SIGCONT,
-        "WINCH" => libc::SIGWINCH,
-        other => bail!("unsupported signal {other:?}"),
-    })
 }
 
 /// Launches one allocation end to end: synchronous start for artifact-less
@@ -1472,10 +2366,126 @@ pub fn launch_task_allocation(
             spawn_health_monitor(manager.clone(), alloc, task);
             Ok(())
         }
+        BeginOutcome::Staged(_) => Ok(()),
         BeginOutcome::Staging(job) => {
             spawn_staging_thread(manager.clone(), *job);
             Ok(())
         }
+    }
+}
+
+/// Launch a provisional allocation, respecting its gate.
+///
+/// The mirror of [`launch_task_allocation`] for work the store has not
+/// recorded yet: the payload's allocation id is the claim's worker-local key,
+/// and a failure is reported through the claim's kill path rather than as a
+/// failed allocation the manager would try to reschedule.
+pub fn launch_provisional_allocation(
+    manager: &Arc<Mutex<WorkerTaskManager>>,
+    allocation: &TaskAllocation,
+    claim_id: &str,
+    gate: Gate,
+) -> R<()> {
+    let outcome = {
+        let mut guard = manager.lock().expect("task manager");
+        match guard.begin_task_allocation_gated(allocation, gate) {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                guard.kill_claim(claim_id, &format!("provisional start failed: {err:#}"));
+                return Err(err);
+            }
+        }
+    };
+
+    match outcome {
+        BeginOutcome::Started(started) => {
+            let (alloc, task) = *started;
+            manager
+                .lock()
+                .expect("task manager")
+                .set_claim_stage(claim_id, stage_for(gate));
+            spawn_health_monitor(manager.clone(), alloc, task);
+            Ok(())
+        }
+        BeginOutcome::Staged(_) => {
+            manager
+                .lock()
+                .expect("task manager")
+                .set_claim_stage(claim_id, ClaimStage::Staged);
+            Ok(())
+        }
+        BeginOutcome::Staging(job) => {
+            spawn_provisional_staging_thread(manager.clone(), *job, claim_id.to_string());
+            Ok(())
+        }
+    }
+}
+
+/// The stage a claim has reached once its launch returns, given its gate.
+fn stage_for(gate: Gate) -> ClaimStage {
+    match gate {
+        Gate::Off | Gate::Stage => ClaimStage::Staged,
+        Gate::Boot => ClaimStage::Booted,
+        Gate::Serve => ClaimStage::Serving,
+    }
+}
+
+/// Stage a provisional allocation's artifacts, then take it to its gate.
+///
+/// Separate from [`spawn_staging_thread`] only in its failure handling: a
+/// provisional start that fails is killed as a claim (releasing its ledger
+/// hold and its instance slot), never reported as a failed allocation — the
+/// manager has no allocation to reschedule.
+fn spawn_provisional_staging_thread(
+    manager: Arc<Mutex<WorkerTaskManager>>,
+    job: StagingJob,
+    claim_id: String,
+) {
+    let allocation_id = job.allocation.id;
+    let gate = job.gate;
+    let manager_for_thread = manager.clone();
+    let claim_for_thread = claim_id.clone();
+    let spawned = std::thread::Builder::new()
+        .name(format!("provisional-staging-{allocation_id}"))
+        .spawn(move || {
+            let manager = manager_for_thread;
+            let result = job.stager.stage_task_artifacts(
+                allocation_id,
+                &job.task_dir,
+                &job.task.artifacts,
+                &job.board,
+            );
+
+            let started = {
+                let mut guard = manager.lock().expect("task manager");
+                if !guard.is_allocation_active(allocation_id) {
+                    debug!(allocation_id, "Claim removed while staging artifacts");
+                    return;
+                }
+                let claim_id = claim_for_thread.as_str();
+                match result.and_then(|staged| {
+                    guard.start_staged_allocation(&job.allocation, &job.task, staged, gate)
+                }) {
+                    Ok(()) => {
+                        guard.set_claim_stage(claim_id, stage_for(gate));
+                        true
+                    }
+                    Err(err) => {
+                        guard.kill_claim(claim_id, &format!("provisional staging failed: {err:#}"));
+                        false
+                    }
+                }
+            };
+            if started && gate != Gate::Stage {
+                spawn_health_monitor(manager, job.allocation, job.task);
+            }
+        });
+    if let Err(err) = spawned {
+        error!(allocation_id, error = ?err, "Failed to spawn provisional staging thread");
+        manager
+            .lock()
+            .expect("task manager")
+            .kill_claim(&claim_id, &format!("spawn staging thread: {err}"));
     }
 }
 
@@ -1503,7 +2513,12 @@ fn spawn_staging_thread(manager: Arc<Mutex<WorkerTaskManager>>, job: StagingJob)
                 }
                 match result {
                     Ok(staged) => {
-                        match guard.start_staged_allocation(&job.allocation, &job.task, staged) {
+                        match guard.start_staged_allocation(
+                            &job.allocation,
+                            &job.task,
+                            staged,
+                            job.gate,
+                        ) {
                             Ok(()) => true,
                             Err(err) => {
                                 guard.record_failure(
@@ -1523,7 +2538,9 @@ fn spawn_staging_thread(manager: Arc<Mutex<WorkerTaskManager>>, job: StagingJob)
                     }
                 }
             };
-            if started {
+            // A staged-but-not-started allocation has nothing to health
+            // check yet; the monitor starts when ratification does.
+            if started && job.gate != Gate::Stage {
                 spawn_health_monitor(manager, job.allocation, job.task);
             }
         });
@@ -1543,6 +2560,13 @@ fn parse_volume_mounts(allocation: &TaskAllocation) -> R<Vec<VolumeMount>> {
         return Ok(Vec::new());
     }
     serde_json::from_str(&allocation.task_volumes).context("Invalid task volumes JSON")
+}
+
+/// Parse a dispatch payload into its allocation and task config. Public so
+/// the edge-boot spec cache can record what a node has been asked to run
+/// without duplicating the parsing rules.
+pub fn task_and_allocation(allocation: &TaskAllocation) -> R<(Allocation, TaskConfig)> {
+    task_from_allocation(allocation)
 }
 
 fn task_from_allocation(allocation: &TaskAllocation) -> R<(Allocation, TaskConfig)> {
@@ -1590,6 +2614,15 @@ fn task_from_allocation(allocation: &TaskAllocation) -> R<(Allocation, TaskConfi
         serde_json::from_str(&allocation.task_resources).context("Invalid task resources JSON")?
     };
 
+    // The declared stop ladder. Empty means the task declared none, which is
+    // not the same as declaring the default: the container runtime consults
+    // the image's own `STOPSIGNAL` only when the jobspec was silent.
+    let stop = if allocation.task_stop.trim().is_empty() {
+        None
+    } else {
+        Some(serde_json::from_str(&allocation.task_stop).context("Invalid task stop JSON")?)
+    };
+
     let task = TaskConfig {
         config: task_config,
         checks,
@@ -1598,6 +2631,7 @@ fn task_from_allocation(allocation: &TaskAllocation) -> R<(Allocation, TaskConfi
         artifacts,
         connect,
         resources,
+        stop,
         ..TaskConfig::new(&allocation.task_name, &allocation.task_runtime)
     };
     let alloc = Allocation {
@@ -1646,6 +2680,317 @@ mod tests {
         let mut manager = WorkerTaskManager::with_state_store(state_store);
         manager.load_builtin_plugins();
         manager
+    }
+
+    // -----------------------------------------------------------------
+    // Provisional allocations (docs/edge-boot.md)
+    // -----------------------------------------------------------------
+
+    fn provisional_payload(local_key: i64) -> TaskAllocation {
+        TaskAllocation {
+            allocation_id: local_key,
+            job_id: "agent-sandboxes".into(),
+            job_config_id: "jc-1".into(),
+            node_id: "node-1".into(),
+            task_config_id: 7,
+            task_name: "workspace".into(),
+            // `exec` rather than `noop`: the noop runtime is a dylib that
+            // is not built for unit tests, and a real host process is the
+            // stronger check anyway — a `stage`-gated claim must leave no
+            // process behind.
+            task_runtime: "exec".into(),
+            task_config: json!({ "command": ["sleep", "30"] }).to_string(),
+            task_checks: String::new(),
+            task_on_unhealthy: String::new(),
+            network: String::new(),
+            task_connect: String::new(),
+            task_artifacts: String::new(),
+            task_identities: String::new(),
+            self_terminate_after_seconds: 0,
+            task_volumes: String::new(),
+            task_resources: json!({ "memory": 256 }).to_string(),
+            task_stop: String::new(),
+            provisional: None,
+        }
+    }
+
+    fn claim_record(claim_id: &str, instance_id: &str, gate: Gate) -> ClaimRecord {
+        ClaimRecord {
+            claim_id: claim_id.into(),
+            local_key: 0,
+            gate,
+            stage: ClaimStage::Claimed,
+            lease_deadline: std::time::Instant::now() + std::time::Duration::from_secs(5),
+            lease_deadline_unix: 0,
+            job_id: "agent-sandboxes".into(),
+            job_config_id: "jc-1".into(),
+            task_name: "workspace".into(),
+            instance_id: instance_id.into(),
+            resources: json!({ "memory": 256 }),
+            origin: "edge".into(),
+            on_refused: OnRefused::Kill,
+            ticket_jti: String::new(),
+            allocation_id: None,
+        }
+    }
+
+    #[test]
+    fn a_stage_gated_claim_prepares_without_starting_anything() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let mut manager = manager_in(&temp_dir);
+        let admitted = manager.admit_claim(claim_record("clm_a", "user-42", Gate::Stage))?;
+
+        let outcome = manager
+            .begin_task_allocation_gated(&provisional_payload(admitted.local_key), Gate::Stage)?;
+        assert!(
+            matches!(outcome, BeginOutcome::Staged(..)),
+            "a stage-gated launch must stop short of start"
+        );
+        // Registered (so it can be stopped) but reported as staged, not
+        // running: nothing outside the node can observe it.
+        assert!(manager.is_allocation_active(admitted.local_key));
+        let health = manager.allocation_health;
+        let entry = health.get(&admitted.local_key).expect("health entry");
+        assert_eq!(entry.status, "staged (awaiting ratification)");
+        Ok(())
+    }
+
+    #[test]
+    fn an_unratified_claim_is_absent_from_everything_the_manager_reads() -> R<()> {
+        // The manager must not be told about work it has not recorded: a
+        // negative local key reported as a running allocation would be a lie
+        // the reconcile loop acts on.
+        let temp_dir = TempDir::new()?;
+        let mut manager = manager_in(&temp_dir);
+        let admitted = manager.admit_claim(claim_record("clm_a", "user-42", Gate::Boot))?;
+        manager
+            .begin_task_allocation_gated(&provisional_payload(admitted.local_key), Gate::Boot)?;
+
+        assert!(manager.allocations_snapshot().is_empty());
+        assert!(manager.allocation_health_snapshot().is_empty());
+        assert_eq!(manager.unratified_claims().len(), 1);
+
+        // Once ratified it appears under the manager's id, and disappears
+        // from the provisional report.
+        let mut committed = provisional_payload(admitted.local_key);
+        committed.allocation_id = 8123;
+        manager.ratify_claim("clm_a", &committed)?;
+        assert_eq!(manager.allocations_snapshot(), vec![8123]);
+        assert!(manager.unratified_claims().is_empty());
+        assert_eq!(manager.local_key(8123), admitted.local_key);
+        Ok(())
+    }
+
+    #[test]
+    fn an_unratified_claim_survives_a_heartbeat_that_omits_it() -> R<()> {
+        // The protection window. The manager cannot list work it does not
+        // know about, so an absence here is ignorance, not a decision —
+        // reading it as "stop this" would kill every provisional start on its
+        // first heartbeat.
+        let temp_dir = TempDir::new()?;
+        let mut manager = manager_in(&temp_dir);
+        let admitted = manager.admit_claim(claim_record("clm_a", "user-42", Gate::Boot))?;
+        manager
+            .begin_task_allocation_gated(&provisional_payload(admitted.local_key), Gate::Boot)?;
+
+        manager.reconcile_allocations(&[]);
+        assert!(
+            manager.is_allocation_active(admitted.local_key),
+            "an unratified claim must not be reconciled away"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_ratified_claim_is_reconciled_like_any_other_allocation() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let mut manager = manager_in(&temp_dir);
+        let admitted = manager.admit_claim(claim_record("clm_a", "user-42", Gate::Boot))?;
+        manager
+            .begin_task_allocation_gated(&provisional_payload(admitted.local_key), Gate::Boot)?;
+        let mut committed = provisional_payload(admitted.local_key);
+        committed.allocation_id = 8123;
+        manager.ratify_claim("clm_a", &committed)?;
+
+        // Still desired: nothing happens, and no relaunch is proposed.
+        let mut desired = provisional_payload(admitted.local_key);
+        desired.allocation_id = 8123;
+        assert!(manager.reconcile_allocations(&[desired]).is_empty());
+        assert!(manager.is_allocation_active(admitted.local_key));
+
+        // No longer desired: the protection window is over, so it stops.
+        manager.reconcile_allocations(&[]);
+        assert!(!manager.is_allocation_active(admitted.local_key));
+        Ok(())
+    }
+
+    #[test]
+    fn an_expired_lease_kills_the_claim_and_releases_its_capacity() -> R<()> {
+        // The backstop for every failure the reply path cannot cover.
+        let temp_dir = TempDir::new()?;
+        let mut manager = manager_in(&temp_dir);
+        manager.configure_ledger(LocalLedger::new(
+            &json!({ "memory": 512 }),
+            &json!({}),
+            None,
+        ));
+        let mut record = claim_record("clm_a", "user-42", Gate::Boot);
+        record.lease_deadline = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        let admitted = manager.admit_claim(record)?;
+        manager
+            .begin_task_allocation_gated(&provisional_payload(admitted.local_key), Gate::Boot)?;
+
+        let killed = manager.sweep_expired_claims(std::time::Instant::now());
+        assert_eq!(killed.len(), 1);
+        assert!(!manager.is_allocation_active(admitted.local_key));
+        // The ledger hold is gone, so the node can admit the next start.
+        manager.admit_claim(claim_record("clm_b", "user-43", Gate::Boot))?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_ratified_claim_is_not_swept_by_its_lease() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let mut manager = manager_in(&temp_dir);
+        let mut record = claim_record("clm_a", "user-42", Gate::Boot);
+        record.lease_deadline = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        let admitted = manager.admit_claim(record)?;
+        manager
+            .begin_task_allocation_gated(&provisional_payload(admitted.local_key), Gate::Boot)?;
+        let mut committed = provisional_payload(admitted.local_key);
+        committed.allocation_id = 8123;
+        manager.ratify_claim("clm_a", &committed)?;
+
+        assert!(manager
+            .sweep_expired_claims(std::time::Instant::now())
+            .is_empty());
+        assert!(manager.is_allocation_active(admitted.local_key));
+        Ok(())
+    }
+
+    #[test]
+    fn a_refused_claim_reports_nothing_to_the_manager() -> R<()> {
+        // A provisional allocation the manager never knew about must not
+        // arrive as a failed allocation: there is nothing to reschedule, and
+        // a phantom failure would look like a real workload dying.
+        let temp_dir = TempDir::new()?;
+        let mut manager = manager_in(&temp_dir);
+        let admitted = manager.admit_claim(claim_record("clm_a", "user-42", Gate::Boot))?;
+        manager
+            .begin_task_allocation_gated(&provisional_payload(admitted.local_key), Gate::Boot)?;
+
+        manager.kill_claim("clm_a", "instance claimed elsewhere");
+        assert!(manager.drain_failures().is_empty());
+        assert!(manager.drain_terminations().is_empty());
+        assert!(manager.allocation_health_snapshot().is_empty());
+        assert!(manager.unratified_claims().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn a_second_claim_for_the_same_instance_is_refused_locally() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let mut manager = manager_in(&temp_dir);
+        manager.admit_claim(claim_record("clm_a", "user-42", Gate::Boot))?;
+        assert!(manager
+            .admit_claim(claim_record("clm_b", "user-42", Gate::Boot))
+            .is_err());
+        assert!(manager.instance_is_claimed("user-42"));
+        Ok(())
+    }
+
+    #[test]
+    fn ratifying_an_unknown_claim_is_an_error_not_a_silent_no_op() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let mut manager = manager_in(&temp_dir);
+        let mut committed = provisional_payload(-1);
+        committed.allocation_id = 8123;
+        assert!(manager.ratify_claim("clm_missing", &committed).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn a_duplicate_verdict_is_a_no_op() -> R<()> {
+        // The RatifyClaim reply and the heartbeat catch-up can both land.
+        let temp_dir = TempDir::new()?;
+        let mut manager = manager_in(&temp_dir);
+        let admitted = manager.admit_claim(claim_record("clm_a", "user-42", Gate::Boot))?;
+        manager
+            .begin_task_allocation_gated(&provisional_payload(admitted.local_key), Gate::Boot)?;
+        let mut committed = provisional_payload(admitted.local_key);
+        committed.allocation_id = 8123;
+        manager.ratify_claim("clm_a", &committed)?;
+        let again = manager.ratify_claim("clm_a", &committed)?;
+        assert_eq!(again.claim.allocation_id, Some(8123));
+        assert!(
+            again.start_health_monitor.is_none(),
+            "a duplicate verdict must not start a second health monitor"
+        );
+        assert_eq!(manager.allocations_snapshot(), vec![8123]);
+        Ok(())
+    }
+
+    #[test]
+    fn ratifying_a_stage_gated_claim_starts_it_and_asks_for_a_health_monitor() -> R<()> {
+        // The `stage` gate is a pause between prepare and start, so this is
+        // the point at which the workload becomes real — and the point at
+        // which it needs supervising.
+        let temp_dir = TempDir::new()?;
+        let mut manager = manager_in(&temp_dir);
+        let admitted = manager.admit_claim(claim_record("clm_a", "user-42", Gate::Stage))?;
+        manager
+            .begin_task_allocation_gated(&provisional_payload(admitted.local_key), Gate::Stage)?;
+
+        let mut committed = provisional_payload(admitted.local_key);
+        committed.allocation_id = 8123;
+        let ratified = manager.ratify_claim("clm_a", &committed)?;
+        assert!(
+            ratified.start_health_monitor.is_some(),
+            "a stage-gated claim starts at ratification and must be monitored"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn ratifying_a_boot_gated_claim_does_not_restart_its_monitor() -> R<()> {
+        // A `boot`-gated claim was already running (and already monitored);
+        // ratification only opens its network.
+        let temp_dir = TempDir::new()?;
+        let mut manager = manager_in(&temp_dir);
+        let admitted = manager.admit_claim(claim_record("clm_a", "user-42", Gate::Boot))?;
+        manager
+            .begin_task_allocation_gated(&provisional_payload(admitted.local_key), Gate::Boot)?;
+
+        let mut committed = provisional_payload(admitted.local_key);
+        committed.allocation_id = 8123;
+        let ratified = manager.ratify_claim("clm_a", &committed)?;
+        assert!(ratified.start_health_monitor.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn ratification_adopts_the_committed_payload() -> R<()> {
+        // The payload a node booted with could not name assigned ports or a
+        // bound instance; the verdict's payload replaces it before anything
+        // starts.
+        let temp_dir = TempDir::new()?;
+        let mut manager = manager_in(&temp_dir);
+        let admitted = manager.admit_claim(claim_record("clm_a", "user-42", Gate::Stage))?;
+        manager
+            .begin_task_allocation_gated(&provisional_payload(admitted.local_key), Gate::Stage)?;
+
+        let mut committed = provisional_payload(admitted.local_key);
+        committed.allocation_id = 8123;
+        committed.task_config =
+            json!({ "command": ["sleep", "30"], "env": { "LEGION_ALLOC_ID": "8123" } }).to_string();
+        manager.ratify_claim("clm_a", &committed)?;
+
+        let stored = manager
+            .task_configs
+            .get(&admitted.local_key)
+            .expect("task config");
+        assert_eq!(stored.config["env"]["LEGION_ALLOC_ID"], json!("8123"));
+        Ok(())
     }
 
     /// The supervisor's eyes: a process that has exited must be seen exactly
@@ -1843,8 +3188,154 @@ mod tests {
 
         let alloc_dir = temp_dir.path().join("allocs").join("5");
         assert!(alloc_dir.is_dir());
+
+        // Graceful stop is two-phase. The reconcile signals and returns, so
+        // the allocation is out of the running set but its directory (and,
+        // crucially, its volumes) are still held.
         let _ = manager.reconcile_allocations(&[]);
-        assert!(!alloc_dir.exists(), "alloc dir must be cleaned on stop");
+        assert_eq!(
+            manager.terminating_ids(),
+            vec![5],
+            "a signalled allocation waits in the terminating set"
+        );
+        assert!(
+            alloc_dir.exists(),
+            "teardown must wait for the process to exit — unmounting under a live task \
+             is how a database gets corrupted"
+        );
+
+        // The reaper finishes it. `true` exits immediately, so this is the
+        // exited path, not the deadline path.
+        let reaped = loop {
+            let reaped = manager.reap_terminating();
+            if !reaped.is_empty() {
+                break reaped;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert_eq!(reaped, vec![(5, ReapOutcome::Exited)]);
+        assert!(!alloc_dir.exists(), "alloc dir must be cleaned once reaped");
+        assert!(manager.terminating_ids().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn a_task_that_ignores_its_stop_signal_is_killed_at_the_deadline() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let mut manager = manager_in(&temp_dir);
+        // Traps SIGTERM and keeps running: the case `killAfter` exists for.
+        let task = TaskConfig {
+            config: json!({"command": ["sh", "-c", "trap '' TERM; sleep 30"]}),
+            stop: Some(crate::structs::StopConfig {
+                signal: "SIGTERM".into(),
+                kill_after: std::time::Duration::ZERO,
+            }),
+            ..TaskConfig::new("stubborn", "exec")
+        };
+        manager.run_allocation(&alloc(), &task)?;
+
+        let _ = manager.reconcile_allocations(&[]);
+        assert_eq!(manager.terminating_ids(), vec![5]);
+
+        // A zero grace window is already expired, so the very first reap
+        // takes it — no sleeping, no flakiness.
+        let reaped = manager.reap_terminating();
+        assert_eq!(
+            reaped,
+            vec![(5, ReapOutcome::Killed)],
+            "a task still running at the deadline is killed, not waited on forever"
+        );
+        assert!(manager.terminating_ids().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn stops_order_before_starts_on_a_node_with_draining_work() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let mut manager = manager_in(&temp_dir);
+        let task = TaskConfig {
+            config: json!({"command": ["sh", "-c", "trap '' TERM; sleep 30"]}),
+            // Zero grace so the reap below is deterministic; the ordering
+            // rule under test is the same at any window length.
+            stop: Some(crate::structs::StopConfig {
+                signal: "SIGTERM".into(),
+                kill_after: std::time::Duration::ZERO,
+            }),
+            ..TaskConfig::new("victim", "exec")
+        };
+        manager.run_allocation(&alloc(), &task)?;
+
+        // The manager's next desired set drops allocation 5 and adds 6 — the
+        // shape a preemption plan produces, since victim and preemptor commit
+        // together and arrive in one heartbeat diff.
+        let preemptor = TaskAllocation {
+            task_stop: String::new(),
+            provisional: None,
+            allocation_id: 6,
+            ..Default::default()
+        };
+        let launch = manager.reconcile_allocations(&[preemptor.clone()]);
+        assert!(
+            launch.is_empty(),
+            "the preemptor must not start while the victim is still running"
+        );
+        assert_eq!(manager.terminating_ids(), vec![5]);
+
+        // Once the victim is gone the next heartbeat's reconcile releases it.
+        // (The manager keeps re-offering the allocation, so nothing is lost.)
+        manager.reap_terminating();
+        assert!(manager.terminating_ids().is_empty());
+        let launch = manager.reconcile_allocations(&[preemptor]);
+        assert_eq!(
+            launch.iter().map(|a| a.allocation_id).collect::<Vec<_>>(),
+            vec![6],
+            "the held-back allocation is offered again once the node is clear"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn every_task_gets_a_stop_notice_path_it_can_read() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let mut manager = manager_in(&temp_dir);
+        let task = TaskConfig {
+            config: json!({"command": ["sh", "-c", "sleep 30"]}),
+            ..TaskConfig::new("noticed", "exec")
+        };
+        manager.run_allocation(&alloc(), &task)?;
+
+        let notice_path = manager
+            .instances
+            .get(&5)
+            .and_then(|instance| instance.extra_env.get(crate::structs::STOP_NOTICE_PATH_ENV))
+            .cloned()
+            .expect("every task is told where its stop notice will be");
+        assert!(
+            !std::path::Path::new(&notice_path).exists(),
+            "the notice is written at stop, not at start"
+        );
+
+        manager.set_stop_causes(HashMap::from([(5, StopCause::Preempted)]));
+        manager.set_stop_preemptors(HashMap::from([(
+            5,
+            crate::structs::StopNoticePreemptor {
+                job: "api".into(),
+                band: "high".into(),
+            },
+        )]));
+        let _ = manager.reconcile_allocations(&[]);
+
+        let notice: crate::structs::TaskStopNotice =
+            serde_json::from_slice(&std::fs::read(&notice_path)?)?;
+        assert_eq!(notice.cause, StopCause::Preempted);
+        assert_eq!(notice.signal, "SIGTERM");
+        assert_eq!(notice.grace_seconds, 30, "the built-in default ladder");
+        assert_eq!(
+            notice.preemptor.as_ref().map(|p| p.job.as_str()),
+            Some("api"),
+            "a preempted task learns who took its capacity"
+        );
+        manager.reap_terminating();
         Ok(())
     }
 
@@ -1970,6 +3461,125 @@ mod tests {
         Ok(())
     }
 
+    /// The regression guard for the heartbeat stall: reconcile must return
+    /// immediately even when the grace window is long. Every other stop test
+    /// uses a zero window, so none of them would catch a blocking wait
+    /// creeping back into `stop_with` — this one uses five minutes.
+    #[test]
+    fn reconcile_never_waits_out_a_grace_period() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let mut manager = manager_in(&temp_dir);
+        let task = TaskConfig {
+            // Ignores SIGTERM, so only the deadline could ever end it.
+            config: json!({
+                "command": ["/bin/sh", "-c", "trap '' TERM; while :; do sleep 0.1; done"],
+            }),
+            stop: Some(crate::structs::StopConfig {
+                signal: "SIGTERM".into(),
+                kill_after: Duration::from_secs(300),
+            }),
+            ..TaskConfig::new("stubborn", "exec")
+        };
+        manager.run_allocation(&alloc(), &task)?;
+        thread::sleep(Duration::from_millis(300));
+
+        let started = std::time::Instant::now();
+        let _ = manager.reconcile_allocations(&[]);
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "reconcile must return immediately, took {elapsed:?}"
+        );
+        assert_eq!(
+            manager.terminating_ids(),
+            vec![alloc().id],
+            "the allocation is draining, not gone"
+        );
+
+        // Not reapable yet either: the deadline is five minutes out and the
+        // process is ignoring the signal.
+        assert!(manager.reap_terminating().is_empty());
+        assert_eq!(manager.terminating_ids(), vec![alloc().id]);
+        Ok(())
+    }
+
+    /// The other half: a task that exits on its signal is reaped by the very
+    /// next supervisor tick rather than waiting out its window.
+    #[test]
+    fn a_drained_task_is_reaped_as_soon_as_it_exits() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let mut manager = manager_in(&temp_dir);
+        let task = TaskConfig {
+            config: json!({
+                "command": ["/bin/sh", "-c", "trap 'exit 0' TERM; while :; do sleep 0.1; done"],
+            }),
+            stop: Some(crate::structs::StopConfig {
+                signal: "SIGTERM".into(),
+                kill_after: Duration::from_secs(300),
+            }),
+            ..TaskConfig::new("drain", "exec")
+        };
+        manager.run_allocation(&alloc(), &task)?;
+        thread::sleep(Duration::from_millis(300));
+
+        let _ = manager.reconcile_allocations(&[]);
+        // The window is five minutes, so anything reaped here was reaped for
+        // exiting, not for timing out.
+        let mut outcome = None;
+        for _ in 0..100 {
+            if let Some(reaped) = manager.reap_terminating().first().copied() {
+                outcome = Some(reaped);
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            outcome,
+            Some((alloc().id, ReapOutcome::Exited)),
+            "a task that honored its stop signal must be reaped on exit, not at the deadline"
+        );
+        Ok(())
+    }
+
+    /// A runtime that cannot deliver a stop notice declines it, and the
+    /// worker tears the allocation down immediately rather than holding it
+    /// for a window nothing can use.
+    #[test]
+    fn a_runtime_that_cannot_signal_is_torn_down_without_a_drain() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let mut manager = manager_in(&temp_dir);
+
+        let allocation = alloc();
+        manager
+            .instances
+            .insert(allocation.id, TaskInstance::default());
+        manager
+            .allocations
+            .insert(allocation.id, allocation.clone());
+        manager.task_configs.insert(
+            allocation.id,
+            TaskConfig {
+                // `sandbox` declines the notice: reaching inside a guest
+                // needs an in-VM agent it does not have.
+                stop: Some(crate::structs::StopConfig {
+                    signal: "SIGTERM".into(),
+                    kill_after: Duration::from_secs(300),
+                }),
+                config: json!({"image": "alpine", "command": ["/bin/sh", "-c", "sleep 1"]}),
+                ..TaskConfig::new("box", "sandbox")
+            },
+        );
+        manager.registry.load_plugin("sandbox", false)?;
+
+        let _ = manager.reconcile_allocations(&[]);
+        assert!(
+            manager.terminating_ids().is_empty(),
+            "a declined notice means no drain window to wait out"
+        );
+        assert!(!manager.instances.contains_key(&allocation.id));
+        Ok(())
+    }
+
     #[test]
     fn stop_causes_are_replaced_wholesale_not_merged() -> R<()> {
         let temp_dir = TempDir::new()?;
@@ -1993,6 +3603,8 @@ mod tests {
         let mut manager = manager_in(&temp_dir);
 
         let ta = TaskAllocation {
+            task_stop: String::new(),
+            provisional: None,
             task_volumes: String::new(),
             allocation_id: 9,
             job_id: "job".into(),
@@ -2011,6 +3623,7 @@ mod tests {
 
             network: String::new(),
             task_connect: String::new(),
+            ..Default::default()
         };
         let new = manager.reconcile_allocations(std::slice::from_ref(&ta));
         assert_eq!(new.len(), 1);
@@ -2111,6 +3724,8 @@ mod tests {
         artifact.name = Some("tool".into());
         artifact.unpack = crate::structs::ArtifactUnpack::File;
         let ta = TaskAllocation {
+            task_stop: String::new(),
+            provisional: None,
             task_volumes: String::new(),
             allocation_id: 11,
             job_id: "job".into(),
@@ -2128,11 +3743,19 @@ mod tests {
             task_resources: String::new(),
             network: String::new(),
             task_connect: String::new(),
+            ..Default::default()
         };
         let outcome = manager.begin_task_allocation(&ta)?;
         let job = match outcome {
             BeginOutcome::Staging(job) => job,
-            BeginOutcome::Started(..) => panic!("artifact task must stage"),
+            other => panic!(
+                "artifact task must stage, got {}",
+                match other {
+                    BeginOutcome::Started(..) => "started",
+                    BeginOutcome::Staged(..) => "staged",
+                    BeginOutcome::Staging(..) => unreachable!(),
+                }
+            ),
         };
 
         // Without a manifest, fresh staging clears the leftovers and fetches.
@@ -2155,6 +3778,8 @@ mod tests {
 
         let artifacts = vec![ArtifactSpec::from_source("https://example.com/tool.tar.gz")];
         let ta = TaskAllocation {
+            task_stop: String::new(),
+            provisional: None,
             task_volumes: String::new(),
             allocation_id: 11,
             job_id: "job".into(),
@@ -2173,12 +3798,13 @@ mod tests {
 
             network: String::new(),
             task_connect: String::new(),
+            ..Default::default()
         };
 
         let outcome = manager.begin_task_allocation(&ta)?;
         let job = match outcome {
             BeginOutcome::Staging(job) => job,
-            BeginOutcome::Started(..) => panic!("artifact task must stage"),
+            _ => panic!("artifact task must stage"),
         };
         assert_eq!(job.task.artifacts.len(), 1);
         assert!(manager.is_allocation_active(11));
@@ -2230,7 +3856,7 @@ mod tests {
                 dir: staged_dir.clone(),
             },
         }];
-        manager.start_staged_allocation(&allocation, &task, staged)?;
+        manager.start_staged_allocation(&allocation, &task, staged, Gate::Off)?;
 
         let instance = manager.instances.get(&allocation.id).expect("instance");
         assert_eq!(

@@ -7,8 +7,8 @@ set -euo pipefail
 source "$(dirname "$0")/env.sh"
 load_rig
 
-for idx in "${!CP_PUBLIC_IPS[@]}"; do
-    ip="${CP_PUBLIC_IPS[$idx]}"
+for idx in "${!CP_ADDRS[@]}"; do
+    ip="${CP_ADDRS[$idx]}"
     log "wiping cp-$idx ($ip)"
     rsh "$ip" "
         sudo systemctl disable --now legion-manager 2>/dev/null || true

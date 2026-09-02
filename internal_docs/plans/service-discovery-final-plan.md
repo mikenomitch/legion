@@ -289,7 +289,7 @@ Two structural guarantees carried from the critique: discovery reads never scale
 O(services × consumers) in any per-consumer payload, and no per-connection O(n)
 rule chains exist anywhere (nothing iptables-shaped in the design).
 
-Benchmark hooks (follow-up, `benches/`): port assignment at 1k/10k existing allocs per
+Benchmark hooks (follow-up, `benchmarks/micro/`): port assignment at 1k/10k existing allocs per
 node; `resolve_service` latency with 10k services × 10 endpoints seeded.
 
 ---

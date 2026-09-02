@@ -28,49 +28,51 @@ use crate::structs::manager_server::Manager;
 use crate::structs::{
     validate_keyed_instance_id, worker_client::WorkerClient, AcquireKvLockReply,
     AcquireKvLockRequest, AdvanceRolloutReply, AdvanceRolloutRequest, AllocationHealth,
-    AllocationLog, CreateInstanceReply, CreateInstanceRequest, CreateInstancesReply,
+    AllocationLog, BootTicket, CreateInstanceReply, CreateInstanceRequest, CreateInstancesReply,
     CreateInstancesRequest, DeleteJobTemplateReply, DeleteJobTemplateRequest, DeleteKvReply,
     DeleteKvRequest, DeleteSavedStateQueryReply, DeleteSavedStateQueryRequest, DeleteVolumeReply,
     DeleteVolumeRequest, DestroyInstanceReply, DestroyInstanceRequest, DestroyJobReply,
     DestroyJobRequest, ExecClientFrame, FailedAllocation, GetAllocationLogsReply,
     GetAllocationLogsRequest, GetArtifactCredentialReply, GetArtifactCredentialRequest,
-    GetInstanceReply, GetInstanceRequest, GetJobInfoReply, GetJobInfoRequest,
-    GetJobScaleStatusReply, GetJobScaleStatusRequest, GetJobSpecByConfigRequest, GetJobSpecReply,
-    GetJobSpecRequest, GetJobTemplateReply, GetJobTemplateRequest, GetKvLockReply,
-    GetKvLockRequest, GetKvReply, GetKvRequest, GetLedgerReply, GetLedgerRequest,
-    GetManagerConfigsReply, GetManagerConfigsRequest, GetNodeReply, GetNodeRequest, GetNodesReply,
-    GetNodesRequest, GetObservabilityReply, GetObservabilityRequest, GetRaftJoinTokenReply,
-    GetRaftJoinTokenRequest, GetRaftStatusReply, GetRaftStatusRequest, GetRolloutReply,
-    GetRolloutRequest, GetRolloutStatusReply, GetRolloutStatusRequest, GetStateBackupReply,
-    GetStateBackupRequest, GetStateStoreSchemaReply, GetStateStoreSchemaRequest,
-    GetTaskLogsRequest, GetVolumeReply, GetVolumeRequest, HealthCheckReply, HealthCheckRequest,
-    HeartbeatReply, HeartbeatRequest, Instance, InstanceInfo, InstanceMode, InstanceState,
+    GetHeartbeatCadenceReply, GetHeartbeatCadenceRequest, GetInstanceReply, GetInstanceRequest,
+    GetJobInfoReply, GetJobInfoRequest, GetJobScaleStatusReply, GetJobScaleStatusRequest,
+    GetJobSpecByConfigRequest, GetJobSpecReply, GetJobSpecRequest, GetJobTemplateReply,
+    GetJobTemplateRequest, GetKvLockReply, GetKvLockRequest, GetKvReply, GetKvRequest,
+    GetLedgerReply, GetLedgerRequest, GetManagerConfigsReply, GetManagerConfigsRequest,
+    GetNodeReply, GetNodeRequest, GetNodesReply, GetNodesRequest, GetObservabilityReply,
+    GetObservabilityRequest, GetRaftJoinTokenReply, GetRaftJoinTokenRequest, GetRaftStatusReply,
+    GetRaftStatusRequest, GetRolloutReply, GetRolloutRequest, GetRolloutStatusReply,
+    GetRolloutStatusRequest, GetStateBackupReply, GetStateBackupRequest, GetStateStoreSchemaReply,
+    GetStateStoreSchemaRequest, GetTaskLogsRequest, GetVolumeReply, GetVolumeRequest,
+    HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, Instance, InstanceInfo,
+    InstanceMode, InstanceState, IssueBootTicketReply, IssueBootTicketRequest,
     IssueNodeIdentityTokenReply, IssueNodeIdentityTokenRequest, IssueRaftCommandReply,
     IssueRaftCommandRequest, IssueWorkloadIdentityTokenReply, IssueWorkloadIdentityTokenRequest,
     JobConfig, JobSpecHistoryItem, JobTemplate, JobTemplateProvenance, JobTemplateSummary,
     JobTemplateVariable, JobTemplateVersionInfo, KvEntry, KvInjectionAction, KvValueType,
-    LedgerNode, ListEventsReply, ListEventsRequest, ListInstancesReply, ListInstancesRequest,
-    ListJobActionsReply, ListJobActionsRequest, ListJobSpecHistoryReply, ListJobSpecHistoryRequest,
-    ListJobTemplatesReply, ListJobTemplatesRequest, ListJobsReply, ListJobsRequest, ListKvReply,
-    ListKvRequest, ListRaftHistoryReply, ListRaftHistoryRequest, ListRolloutEventsReply,
-    ListRolloutEventsRequest, ListRolloutsReply, ListRolloutsRequest, ListSavedStateQueriesReply,
+    LedgerNode, ListBootTicketsReply, ListBootTicketsRequest, ListEventsReply, ListEventsRequest,
+    ListInstancesReply, ListInstancesRequest, ListJobActionsReply, ListJobActionsRequest,
+    ListJobSpecHistoryReply, ListJobSpecHistoryRequest, ListJobTemplatesReply,
+    ListJobTemplatesRequest, ListJobsReply, ListJobsRequest, ListKvReply, ListKvRequest,
+    ListRaftHistoryReply, ListRaftHistoryRequest, ListRolloutEventsReply, ListRolloutEventsRequest,
+    ListRolloutsReply, ListRolloutsRequest, ListSavedStateQueriesReply,
     ListSavedStateQueriesRequest, ListServicesReply, ListServicesRequest, ListVolumeDriversReply,
     ListVolumeDriversRequest, ListVolumesReply, ListVolumesRequest, Node, NodeMsg, PatchKvReply,
     PatchKvRequest, PlanJobReply, PlanJobRequest, PlannedAllocation, PutKvReply, PutKvRequest,
-    QueryStateStoreReply, QueryStateStoreRequest, RaftHistoryEvent, RaftStatus, ReleaseKvLockReply,
-    ReleaseKvLockRequest, RenderJobTemplateReply, RenderJobTemplateRequest, RenewKvLockReply,
-    RenewKvLockRequest, ReplaceInstanceReply, ReplaceInstanceRequest, ResolveServiceReply,
-    ResolveServiceRequest, RestartWorkerReply, RestartWorkerRequest, RolloutAllocationStatus,
-    RolloutEvent, RolloutGroupStatus, RolloutProgression, RolloutReplacement, RunJobReply,
-    RunJobRequest, RunJobTemplateReply, RunJobTemplateRequest, SavedStateQuery, ScaleTaskReply,
-    ScaleTaskRequest, SchedulerEvent, ServiceEndpoint, ServiceSummary, SetNodeAvailabilityReply,
-    SetNodeAvailabilityRequest, StartInstanceReply, StartInstanceRequest, StopInstanceReply,
-    StopInstanceRequest, StopJobReply, StopJobRequest, StopNotice, StopRolloutReply,
-    StopRolloutRequest, StreamEventsRequest, Submission, TaskConfig, TaskOnUnhealthyConfig,
-    TaskScaleStatus, UpdateNodeDynamicReply, UpdateNodeDynamicRequest, UpsertJobTemplateReply,
-    UpsertJobTemplateRequest, UpsertSavedStateQueryReply, UpsertSavedStateQueryRequest,
-    WorkerConfig, WorkerPreRegisterReply, WorkerPreRegisterRequest, WorkerRegisterReply,
-    WorkerRegisterRequest,
+    QueryStateStoreReply, QueryStateStoreRequest, RaftHistoryEvent, RaftStatus, RatifyClaimReply,
+    RatifyClaimRequest, ReleaseKvLockReply, ReleaseKvLockRequest, RenderJobTemplateReply,
+    RenderJobTemplateRequest, RenewKvLockReply, RenewKvLockRequest, ReplaceInstanceReply,
+    ReplaceInstanceRequest, ResolveServiceReply, ResolveServiceRequest, RestartWorkerReply,
+    RestartWorkerRequest, RolloutAllocationStatus, RolloutEvent, RolloutGroupStatus,
+    RolloutProgression, RolloutReplacement, RunJobReply, RunJobRequest, RunJobTemplateReply,
+    RunJobTemplateRequest, SavedStateQuery, ScaleTaskReply, ScaleTaskRequest, SchedulerEvent,
+    ServiceEndpoint, ServiceSummary, SetNodeAvailabilityReply, SetNodeAvailabilityRequest,
+    StartInstanceReply, StartInstanceRequest, StopInstanceReply, StopInstanceRequest, StopJobReply,
+    StopJobRequest, StopNotice, StopRolloutReply, StopRolloutRequest, StreamEventsRequest,
+    Submission, TaskConfig, TaskOnUnhealthyConfig, TaskScaleStatus, UpdateNodeDynamicReply,
+    UpdateNodeDynamicRequest, UpsertJobTemplateReply, UpsertJobTemplateRequest,
+    UpsertSavedStateQueryReply, UpsertSavedStateQueryRequest, WorkerConfig, WorkerPreRegisterReply,
+    WorkerPreRegisterRequest, WorkerRegisterReply, WorkerRegisterRequest,
 };
 use crate::structs::{
     AuthMethodInfo, BootstrapAclReply, BootstrapAclRequest, CreateAclTokenReply,
@@ -172,6 +174,27 @@ struct SubmittedJob {
     message: &'static str,
     job_name: String,
     job_config_id: String,
+    /// Advisory notes appended to the reply message. Today: the one warning
+    /// that a job's priority band cannot do what its author expects because
+    /// preemption is disabled — the Nomad discoverability failure inverted,
+    /// caught at submit rather than discovered from a troubleshooting guide.
+    warnings: Vec<String>,
+}
+
+impl SubmittedJob {
+    /// The reply message plus any warnings, one per line.
+    fn message_with_warnings(&self) -> String {
+        if self.warnings.is_empty() {
+            return self.message.to_string();
+        }
+        let mut message = self.message.to_string();
+        for warning in &self.warnings {
+            message.push('\n');
+            message.push_str("warning: ");
+            message.push_str(warning);
+        }
+        message
+    }
 }
 
 /// Store record -> proto message for one template version.
@@ -181,7 +204,7 @@ fn job_template_to_proto(record: JobTemplateVersionRecord) -> JobTemplate {
         version: record.version,
         latest_version: record.latest_version,
         description: record.description,
-        source_jsonnet: record.source_jsonnet,
+        source_nickel: record.source_nickel,
         variables: record
             .variables
             .into_iter()
@@ -1049,6 +1072,23 @@ pub struct ManagerDaemonService {
     /// Whether `ExecAllocation` is enabled (config `exec.enabled`, default
     /// true). When false the endpoint rejects with FailedPrecondition.
     exec_enabled: bool,
+    /// Edge boot settings (`edgeBoot`, docs/edge-boot.md). Disabled by
+    /// default: with `enabled: false` no ticket can be minted and no claim
+    /// ratified, so a cluster that upgrades and changes nothing grows no new
+    /// authorization surface.
+    edge_boot: crate::structs::EdgeBootConfigFull,
+    /// Last-reported provisional claims per node (docs/edge-boot.md).
+    ///
+    /// In memory on purpose: unratified work lives for seconds, and writing
+    /// it to the store on every heartbeat would put a per-node write on the
+    /// hottest path in the system to describe state that is stale before the
+    /// row lands. A failover shows nothing until the next heartbeat, which is
+    /// at most one interval of incompleteness and never a wrong answer.
+    provisional_claims: Arc<Mutex<HashMap<String, Vec<crate::structs::ProvisionalClaimReport>>>>,
+    /// Heartbeat cadence settings (`heartbeat`, docs/heartbeat-cadence-and-scale.md).
+    /// Adaptive cadence is off unless `targetRatePerSecond` is set, so by
+    /// default this only supplies `missedBeatsBeforeLost` to the cadence report.
+    heartbeat: crate::structs::HeartbeatConfigFull,
 }
 
 impl ManagerDaemonService {
@@ -1075,7 +1115,17 @@ impl ManagerDaemonService {
                 crate::artifacts::FetcherRegistry::with_builtins(),
             )),
             exec_enabled: true,
+            edge_boot: crate::structs::EdgeBootConfigFull::default(),
+            provisional_claims: Arc::new(Mutex::new(HashMap::new())),
+            heartbeat: crate::structs::HeartbeatConfigFull::default(),
         }
+    }
+
+    /// Attach the manager's heartbeat-cadence settings (`run_manager` always
+    /// does; direct service users get the defaults, which serve no interval).
+    pub fn with_heartbeat_config(mut self, heartbeat: crate::structs::HeartbeatConfigFull) -> Self {
+        self.heartbeat = heartbeat;
+        self
     }
 
     /// Drop-in ACL gate for RPC handlers: authenticates the caller and
@@ -1128,7 +1178,10 @@ impl ManagerDaemonService {
         identity: &AclIdentity,
         js: &str,
         mut subs: Vec<Submission>,
-        priority: i64,
+        // Explicit eval-queue override (`--priority`/`--asap`). `None` lets
+        // the job's priority band set the queue position, which is the
+        // default and the point of having one field mean both things.
+        priority: Option<i64>,
         force_reschedule: bool,
         template: Option<&JobTemplateProvenance>,
     ) -> Result<SubmittedJob, Status> {
@@ -1149,11 +1202,31 @@ impl ManagerDaemonService {
         // the template the submission is going through — never the job's
         // stored provenance (that would let a template-scoped identity push
         // arbitrary specs to a job its template once created).
+        // The band is normalized (absent = `normal`) BEFORE enforcement, on
+        // both the plain and the through-a-template submit path. Two
+        // consequences, both required: a `bands`-scoped policy matches
+        // un-banded submissions instead of silently granting nothing, and a
+        // template that renders `priority: 'critical'` is gated by the same
+        // rule as a hand-written spec — a RunJob-only check would be
+        // bypassable by rendering.
         let scope = match template {
             Some(template) => AclScope::job_via_template(&config.name, &template.name),
             None => AclScope::job(&config.name),
-        };
-        acl::enforce(identity, AclResource::Job, AclAction::Write, &scope)?;
+        }
+        .with_band(config.priority);
+        acl::enforce(identity, AclResource::Job, AclAction::Write, &scope).map_err(|status| {
+            if status.code() == tonic::Code::PermissionDenied
+                && config.priority != crate::structs::Band::default()
+            {
+                Status::permission_denied(format!(
+                    "{}: this token's policy does not allow submitting jobs in the `{}`                      priority band (see the `bands` selector in docs/auth-and-acls.md)",
+                    status.message(),
+                    config.priority
+                ))
+            } else {
+                status
+            }
+        })?;
 
         if let Some(template) = template {
             self.enforce_template_collision_guard(identity, &config.name, template)?;
@@ -1315,7 +1388,7 @@ impl ManagerDaemonService {
                     Some(&config.name),
                     Some(&job_config_id),
                     None,
-                    Some(priority),
+                    priority,
                 )
                 .map_err(|e| map_store_error("Error running job", e))
             {
@@ -1340,7 +1413,7 @@ impl ManagerDaemonService {
                     Some(&config.name),
                     Some(&job_config_id),
                     None,
-                    Some(priority),
+                    priority,
                 )
                 .map_err(|e| map_store_error("Error scheduling seeded instance placement", e))
             {
@@ -1360,7 +1433,58 @@ impl ManagerDaemonService {
             message,
             job_name: config.name.clone(),
             job_config_id,
+            warnings: self.band_submit_warnings(&config),
         })
+    }
+
+    /// Warn at submit when a job's priority band cannot do what its author
+    /// almost certainly expects.
+    ///
+    /// This is Nomad's biggest preemption ergonomics failure inverted. There,
+    /// `priority` sits in the jobspec doing nothing until an operator flips a
+    /// cluster API most users never find, and "preemption not working" grew
+    /// its own troubleshooting genre. Here the field always orders the eval
+    /// queue — but if it *cannot* displace running work, the submit says so
+    /// once, at the moment the expectation is formed.
+    fn band_submit_warnings(&self, config: &JobConfig) -> Vec<String> {
+        // Only a band that could displace something has an expectation to
+        // disappoint. `normal` and below are the default posture.
+        if !config.priority.outranks(crate::structs::Band::default()) {
+            return Vec::new();
+        }
+        let settings = match Scheduler::new(&self.store) {
+            Ok(scheduler) => scheduler.preemption_settings().clone(),
+            // A scheduler that will not build is a much louder problem than a
+            // missing advisory line; the submit itself already succeeded.
+            Err(_) => return Vec::new(),
+        };
+        match settings.mode {
+            crate::manager::scheduler::PreemptionMode::Off => vec![format!(
+                "job {} is priority `{}`, but preemption is off for this cluster \
+                 (schedulerSettings.preemption.mode). The band will order the eval queue and \
+                 cannot displace running work. See docs/preemption-and-eviction.md",
+                config.name, config.priority
+            )],
+            crate::manager::scheduler::PreemptionMode::Observe => vec![format!(
+                "job {} is priority `{}`, and preemption is in observe mode: victims will be \
+                 identified and journalled (`allocation.preempt_planned`) but nothing is \
+                 evicted, so the band cannot displace running work yet. See \
+                 docs/preemption-and-eviction.md",
+                config.name, config.priority
+            )],
+            crate::manager::scheduler::PreemptionMode::Enforce
+                if !settings.disabled_pools.is_empty() =>
+            {
+                vec![format!(
+                    "job {} is priority `{}`; preemption is enforced but disabled in pool(s) {}. \
+                     Tasks constrained to those pools cannot displace lower-band work",
+                    config.name,
+                    config.priority,
+                    settings.disabled_pools.join(", ")
+                )]
+            }
+            crate::manager::scheduler::PreemptionMode::Enforce => Vec::new(),
+        }
     }
 
     /// A template run may only create new jobs or update jobs whose latest
@@ -1472,6 +1596,7 @@ impl ManagerDaemonService {
             .map(|identity| identity.name.clone())
             .collect();
         service.exec_enabled = config.exec.enabled;
+        service.heartbeat = config.heartbeat.clone();
         service
     }
 
@@ -1493,6 +1618,129 @@ impl ManagerDaemonService {
     pub fn with_advertise_addr(mut self, advertise_addr: impl Into<String>) -> Self {
         self.advertise_addr = advertise_addr.into();
         self
+    }
+
+    /// Attach the cluster's edge-boot settings (docs/edge-boot.md).
+    pub fn with_edge_boot(mut self, edge_boot: crate::structs::EdgeBootConfigFull) -> Self {
+        self.edge_boot = edge_boot;
+        self
+    }
+
+    /// Render a committed allocation as the dispatch payload a node needs to
+    /// finish a ratified claim. `None` when anything it depends on is already
+    /// gone, which the caller reports rather than papering over.
+    fn committed_payload(
+        &self,
+        allocation_id: i64,
+        claim_id: &str,
+        gate: i32,
+    ) -> Option<crate::structs::TaskAllocation> {
+        let allocation = self
+            .store
+            .get_allocation_by_id(allocation_id)
+            .ok()
+            .flatten()?;
+        let task = self
+            .store
+            .get_task_config_by_id(allocation.task_config_id)
+            .ok()
+            .flatten()?;
+        let instance = match allocation.instance_id.as_deref() {
+            Some(instance_id) => self.store.get_instance(instance_id).ok().flatten(),
+            None => None,
+        };
+        let volumes = self
+            .store
+            .volume_mounts_for_allocation(&allocation.job_id, &task, instance.as_ref())
+            .ok()?;
+        let mut payload = crate::manager::dispatcher::build_task_allocation(
+            &task,
+            &allocation,
+            instance.as_ref(),
+            &volumes,
+        )
+        .ok()?;
+        payload.provisional = Some(crate::structs::ProvisionalAllocation {
+            claim_id: claim_id.to_string(),
+            gate,
+            lease_deadline_unix: 0,
+            instance_id: allocation.instance_id.clone().unwrap_or_default(),
+            origin: "edge".into(),
+            on_refused: String::new(),
+            ticket_jti: String::new(),
+        });
+        Some(payload)
+    }
+
+    /// The live, unratified claim for an instance, and the node holding it.
+    ///
+    /// Reads the same in-memory per-node reports `legion node claims` serves,
+    /// so it inherits the same freshness contract: current within one
+    /// heartbeat, empty (never wrong) after a manager failover.
+    fn provisional_claim_for(
+        &self,
+        instance_id: &str,
+    ) -> (Option<crate::structs::ProvisionalClaimReport>, String) {
+        let Ok(guard) = self.provisional_claims.lock() else {
+            return (None, String::new());
+        };
+        for (node_id, claims) in guard.iter() {
+            if let Some(claim) = claims.iter().find(|claim| claim.instance_id == instance_id) {
+                return (Some(claim.clone()), node_id.clone());
+            }
+        }
+        (None, String::new())
+    }
+
+    /// Verdicts for claims a node is still holding that this manager has
+    /// already decided (`HeartbeatReply.claim_verdicts`).
+    ///
+    /// The `RatifyClaim` reply is the primary channel; this covers the case
+    /// where that reply was lost after the manager committed. Without it the
+    /// node would kill work the cluster believes is running, and the instance
+    /// would stay bound to a dead allocation until the next reschedule.
+    ///
+    /// The lookup is the instance binding itself, so it needs no new state:
+    /// an instance bound to an allocation on *this* node means confirmed, and
+    /// one bound elsewhere means this node lost the race.
+    fn claim_verdicts_for(
+        &self,
+        node_id: &str,
+        claims: &[crate::structs::ProvisionalClaimReport],
+    ) -> Vec<crate::structs::ClaimVerdict> {
+        let mut verdicts = Vec::new();
+        for claim in claims {
+            if claim.instance_id.trim().is_empty() {
+                continue;
+            }
+            let Ok(Some(instance)) = self.store.get_instance(&claim.instance_id) else {
+                continue;
+            };
+            let Some(allocation_id) = instance.current_alloc_id else {
+                continue;
+            };
+            let Ok(Some(allocation)) = self.store.get_allocation_by_id(allocation_id) else {
+                continue;
+            };
+            if allocation.node_id == node_id {
+                verdicts.push(crate::structs::ClaimVerdict {
+                    claim_id: claim.claim_id.clone(),
+                    confirmed: true,
+                    allocation_id,
+                    reason: 0,
+                    detail: String::new(),
+                });
+            } else {
+                verdicts.push(crate::structs::ClaimVerdict {
+                    claim_id: claim.claim_id.clone(),
+                    confirmed: false,
+                    allocation_id: 0,
+                    reason: crate::structs::edge_boot::RefusalReason::InstanceClaimed.to_wire(),
+                    detail: format!("bound to {}", allocation.node_id),
+                });
+            }
+        }
+        verdicts
     }
 
     /// Admission normalization for artifacts (artifact system plan §§1,6,7,8):
@@ -2356,7 +2604,7 @@ impl Manager for ManagerDaemonService {
         let inner = request.into_inner();
         let js = inner.parsed_jobspec;
         let subs = inner.submissions;
-        let priority = inner.priority.unwrap_or(self.store.default_eval_priority);
+        let priority = inner.priority;
         let idempotency_key = inner.idempotency_key.unwrap_or_default();
 
         if let Some(message) = self
@@ -2373,13 +2621,34 @@ impl Manager for ManagerDaemonService {
         let submitted =
             self.submit_rendered_job(&identity, &js, subs, priority, inner.force_reschedule, None)?;
 
-        self.store
-            .idempotency_record(&idempotency_key, "run_job", submitted.message)
+        let message = submitted.message_with_warnings();
+        // The lookup above only catches a duplicate that arrived after the
+        // first one recorded. Two submits carrying the same key CONCURRENTLY
+        // both miss it, and the record is `INSERT OR IGNORE` — so the loser
+        // learns it lost here, and must say so. Reporting `deduplicated:
+        // false` to both would tell a retrying agent it created two
+        // submissions when the key exists precisely to promise it did not.
+        // (Submitting the same spec twice is itself harmless — the second
+        // resolves to `Unchanged` — so the loser is corrected, not failed.)
+        let first = self
+            .store
+            .idempotency_record(&idempotency_key, "run_job", &message)
             .map_err(|e| map_store_error("Error recording idempotency", e))?;
+        let (message, deduplicated) = if first {
+            (message, false)
+        } else {
+            // The winner's recorded response is the authoritative one, and
+            // is what a later retry of this key would be handed.
+            let recorded = self
+                .store
+                .idempotency_lookup(&idempotency_key)
+                .map_err(|e| map_store_error("Error checking idempotency", e))?;
+            (recorded.unwrap_or(message), true)
+        };
 
         Ok(Response::new(RunJobReply {
-            message: submitted.message.into(),
-            deduplicated: false,
+            message,
+            deduplicated,
         }))
     }
 
@@ -2408,7 +2677,7 @@ impl Manager for ManagerDaemonService {
         )?;
 
         let manifest =
-            run_blocking_admission(|| job_templates::parse_manifest(&inner.source_jsonnet))
+            run_blocking_admission(|| job_templates::parse_manifest(&inner.source_nickel))
                 .map_err(|e| Status::invalid_argument(e.to_string()))?;
 
         // When every variable has a default the template is fully renderable
@@ -2422,7 +2691,7 @@ impl Manager for ManagerDaemonService {
             let values = job_templates::resolve_variable_values(&manifest.variables, "{}")
                 .map_err(|e| Status::invalid_argument(e.to_string()))?;
             let rendered = run_blocking_admission(|| {
-                job_templates::render_with_timeout(&inner.source_jsonnet, &values)
+                job_templates::render_with_timeout(&inner.source_nickel, &values)
             })
             .map_err(|e| {
                 Status::invalid_argument(format!("trial render with defaults failed: {e}"))
@@ -2444,7 +2713,7 @@ impl Manager for ManagerDaemonService {
             .upsert_job_template_version(
                 &name,
                 manifest.description.as_deref(),
-                &inner.source_jsonnet,
+                &inner.source_nickel,
                 &manifest.variables,
                 &identity.principal,
             )
@@ -2588,7 +2857,7 @@ impl Manager for ManagerDaemonService {
             job_templates::resolve_variable_values(&template.variables, &inner.variables_json)
                 .map_err(|e| Status::invalid_argument(e.to_string()))?;
         let rendered = run_blocking_admission(|| {
-            job_templates::render_with_timeout(&template.source_jsonnet, &values)
+            job_templates::render_with_timeout(&template.source_nickel, &values)
         })
         .map_err(|e| Status::invalid_argument(e.to_string()))?;
 
@@ -2598,7 +2867,10 @@ impl Manager for ManagerDaemonService {
             &identity,
             AclResource::Job,
             AclAction::Write,
-            &AclScope::job_via_template(&config.name, &template.name),
+            // Same band normalization as the submit path: a render whose
+            // output the caller could not submit should fail here, not at the
+            // submit that follows it.
+            &AclScope::job_via_template(&config.name, &template.name).with_band(config.priority),
         )?;
         validate_job_config(&config).map_err(|e| {
             Status::invalid_argument(format!("rendered jobspec failed validation: {e}"))
@@ -2625,7 +2897,7 @@ impl Manager for ManagerDaemonService {
             AclScope::any(),
         )?;
         let inner = request.into_inner();
-        let priority = inner.priority.unwrap_or(self.store.default_eval_priority);
+        let priority = inner.priority;
         let idempotency_key = inner.idempotency_key.unwrap_or_default();
 
         if let Some(recorded) = self
@@ -2655,7 +2927,7 @@ impl Manager for ManagerDaemonService {
             job_templates::resolve_variable_values(&template.variables, &inner.variables_json)
                 .map_err(|e| Status::invalid_argument(e.to_string()))?;
         let rendered = run_blocking_admission(|| {
-            job_templates::render_with_timeout(&template.source_jsonnet, &values)
+            job_templates::render_with_timeout(&template.source_nickel, &values)
         })
         .map_err(|e| Status::invalid_argument(e.to_string()))?;
 
@@ -2666,7 +2938,7 @@ impl Manager for ManagerDaemonService {
         let subs = vec![
             Submission {
                 path: format!("template://{}/{}", template.name, template.version),
-                content: template.source_jsonnet.clone(),
+                content: template.source_nickel.clone(),
                 is_primary: true,
             },
             Submission {
@@ -2696,7 +2968,7 @@ impl Manager for ManagerDaemonService {
         );
 
         let record = TemplateRunRecord {
-            message: submitted.message.to_string(),
+            message: submitted.message_with_warnings(),
             job_name: submitted.job_name.clone(),
             job_config_id: submitted.job_config_id.clone(),
         };
@@ -3174,10 +3446,10 @@ impl Manager for ManagerDaemonService {
             .map(|existing| artifact_pin_diffs(existing, &config))
             .unwrap_or_default();
 
-        let (plan, task_lookup, index_report, message, matches_existing, same_content) =
+        let (plan, task_lookup, index_report, preemptions, message, matches_existing, same_content) =
             match existing_config {
                 Some(existing) if existing.is_same_as(&config) => {
-                    let (plan, index_report) = scheduler
+                    let (plan, index_report, preemptions) = scheduler
                         .plan_only_with_report(&existing.id(), PlanMode::Fresh)
                         .map_err(|e| {
                             error!("Error planning job {}: {:?}", existing.name, e);
@@ -3196,6 +3468,7 @@ impl Manager for ManagerDaemonService {
                         plan,
                         task_lookup,
                         index_report,
+                        preemptions,
                         "Job config unchanged; showing force-reschedule placements".to_string(),
                         true,
                         true,
@@ -3206,6 +3479,7 @@ impl Manager for ManagerDaemonService {
                         allocations,
                         task_lookup,
                         index_report,
+                        preemptions,
                     } = scheduler
                         .plan_for_config(&config, PlanMode::Fresh, Some(&config.name))
                         .map_err(|e| {
@@ -3216,6 +3490,7 @@ impl Manager for ManagerDaemonService {
                         allocations,
                         task_lookup,
                         index_report,
+                        preemptions,
                         "Job config changed; showing updated placements".to_string(),
                         true,
                         false,
@@ -3226,6 +3501,7 @@ impl Manager for ManagerDaemonService {
                         allocations,
                         task_lookup,
                         index_report,
+                        preemptions,
                     } = scheduler
                         .plan_for_config(&config, PlanMode::Fresh, None)
                         .map_err(|e| {
@@ -3236,6 +3512,7 @@ impl Manager for ManagerDaemonService {
                         allocations,
                         task_lookup,
                         index_report,
+                        preemptions,
                         "Job config new; showing placements".to_string(),
                         false,
                         false,
@@ -3252,6 +3529,7 @@ impl Manager for ManagerDaemonService {
                     .get(&placement.task_config_id)
                     .cloned()
                     .unwrap_or_default(),
+                candidate_nodes: placement.candidates,
             })
             .collect();
 
@@ -3281,12 +3559,26 @@ impl Manager for ManagerDaemonService {
             })
             .collect();
 
+        let preemptions = preemptions
+            .into_iter()
+            .map(|victim| crate::structs::PlannedPreemption {
+                node_id: victim.node_id,
+                job_id: victim.job_id,
+                task_name: victim.task_name,
+                band: victim.band.as_str().to_string(),
+                allocation_id: victim.allocation_id,
+                kill_after_seconds: victim.kill_after_secs,
+            })
+            .collect();
+
         let reply = PlanJobReply {
             allocations,
             message,
             matches_existing,
             same_content,
             index_usage,
+            preemptions,
+            preemption_mode: scheduler.preemption_settings().mode.as_str().to_string(),
         };
 
         Ok(Response::new(reply))
@@ -4421,8 +4713,15 @@ impl Manager for ManagerDaemonService {
             &AclScope::job(&instance.job_id),
         )?;
 
+        // A live, unratified claim for this instance (docs/edge-boot.md). An
+        // instance with no allocation and a sandbox demonstrably running on a
+        // node is otherwise inexplicable; this is the state that explains it.
+        let (provisional, provisional_node_id) = self.provisional_claim_for(&inner.instance_id);
+
         Ok(Response::new(GetInstanceReply {
             instance: Some(map_instance_info(&self.store, instance)),
+            provisional,
+            provisional_node_id,
         }))
     }
 
@@ -4837,10 +5136,31 @@ impl Manager for ManagerDaemonService {
         crate::manager::telemetry::metrics().heartbeats_total.inc();
         let req = request.into_inner();
         let id = req.id;
+        let provisional_claims = req.provisional_claims;
 
-        self.store
-            .update_node_heartbeat(id.clone())
-            .map_err(|e| map_store_error("Error updating node heartbeat", e))?;
+        // Offloaded, not called inline. In steady state this is now cheap —
+        // one read-model lookup and one map write, no commit and no fsync
+        // (docs/node-liveness.md) — but the call is still BLOCKING on the
+        // paths that do commit: a `lost -> active` transition, and the
+        // mixed-version fallback where a status-lane leader that predates
+        // liveness digests makes every beat a replicated write again.
+        //
+        // Running those on a tokio worker thread parks it for the whole
+        // commit, so at most `worker_threads` heartbeats can be in flight —
+        // and, worse, every other heartbeat stays stuck in the gRPC layer
+        // where the coalescer cannot see it. The coalescer batches whatever
+        // is queued when a commit finishes, so starving its queue keeps
+        // batches at size 1 and defeats the group commit entirely
+        // (HEARTBEAT_BATCH_MAX is 128). Measured on gp3 EBS before the
+        // offload: 86 heartbeats/sec, 17% of the 2s cadence, host idle.
+        {
+            let store = self.store.clone();
+            let heartbeat_id = id.clone();
+            tokio::task::spawn_blocking(move || store.update_node_heartbeat(heartbeat_id))
+                .await
+                .map_err(|e| Status::internal(format!("heartbeat task failed: {e}")))?
+                .map_err(|e| map_store_error("Error updating node heartbeat", e))?;
+        }
 
         if let Err(err) = handle_failed_allocations(
             &self.store,
@@ -4885,9 +5205,11 @@ impl Manager for ManagerDaemonService {
         let stop_notices = match self.store.stop_notices_for_node(&id) {
             Ok(notices) => notices
                 .into_iter()
-                .map(|(allocation_id, cause)| StopNotice {
-                    allocation_id,
-                    cause: cause.as_str().to_string(),
+                .map(|notice| StopNotice {
+                    allocation_id: notice.allocation_id,
+                    cause: notice.cause.as_str().to_string(),
+                    preemptor_job: notice.preemptor_job,
+                    preemptor_band: notice.preemptor_band,
                 })
                 .collect(),
             Err(err) => {
@@ -4896,15 +5218,97 @@ impl Manager for ManagerDaemonService {
             }
         };
 
+        // Catch-up verdicts for claims this node is still holding that the
+        // manager has already decided (docs/edge-boot.md). Empty for every
+        // node running only committed work.
+        let claim_verdicts = self.claim_verdicts_for(&id, &provisional_claims);
+        // Keep the operator-visible view current, and drop the entry entirely
+        // when a node reports no claims so the map stays the live set rather
+        // than a history of every node that ever held one.
+        if let Ok(mut guard) = self.provisional_claims.lock() {
+            if provisional_claims.is_empty() {
+                guard.remove(&id);
+            } else {
+                guard.insert(id.clone(), provisional_claims.clone());
+            }
+        }
+
+        // The cadence this manager wants, when it dictates one at all. Absent
+        // by default: adaptive cadence is opt-in, and a worker that receives
+        // nothing keeps its worker-type `heartbeatSeconds`, which is exactly
+        // the historical behavior.
+        let next_interval_seconds = self
+            .store
+            .liveness()
+            .served_interval()
+            .map(|interval| interval.as_secs() as u32);
+
         let reply = HeartbeatReply {
             message: "ack".into(),
             desired_allocations,
             upstream_endpoints,
             volume_destroy,
             stop_notices,
+            claim_verdicts,
+            next_interval_seconds,
         };
 
         Ok(Response::new(reply))
+    }
+
+    #[instrument(skip_all)]
+    async fn get_heartbeat_cadence(
+        &self,
+        request: Request<GetHeartbeatCadenceRequest>,
+    ) -> Result<Response<GetHeartbeatCadenceReply>, Status> {
+        self.check_acl(
+            &request,
+            AclResource::Node,
+            AclAction::Read,
+            AclScope::any(),
+        )?;
+        // A manager that does not lead the status lane does not own liveness,
+        // so it has no snapshot to report. It answers zeros with
+        // `is_liveness_owner: false` rather than a guess: an approximate
+        // freshness ratio is worse than an honest "ask the owner".
+        if !self.store.is_raft_leader(crate::storage::Lane::Status) {
+            return Ok(Response::new(GetHeartbeatCadenceReply {
+                missed_beats_before_lost: self.heartbeat.missed_beats_before_lost,
+                adaptive_enabled: self.heartbeat.adaptive_enabled(),
+                is_liveness_owner: false,
+                ..Default::default()
+            }));
+        }
+        let now = std::time::Instant::now();
+        let snapshot = crate::manager::daemon::liveness_snapshot(&self.store, now)
+            .map_err(|e| map_store_error("Error reading node liveness", e))?;
+        let served = self
+            .store
+            .liveness()
+            .served_interval()
+            .unwrap_or_else(|| self.heartbeat.parsed_min_interval());
+        let report = crate::manager::cadence::cadence_report(
+            &snapshot,
+            served,
+            self.heartbeat.missed_beats_before_lost.max(1),
+            self.heartbeat.headroom,
+            HEARTBEAT_FRESHNESS_MIN_FLEET,
+            self.heartbeat.adaptive_enabled(),
+            served >= self.heartbeat.parsed_max_interval(),
+        );
+        Ok(Response::new(GetHeartbeatCadenceReply {
+            active_nodes: report.active_nodes as u32,
+            served_interval_seconds: report.served_interval.as_secs() as u32,
+            lost_window_seconds: report.lost_window.as_secs() as u32,
+            freshness_ratio: report.freshness_ratio.unwrap_or(0.0),
+            freshness_measurable: report.freshness_ratio.is_some(),
+            sustainable_nodes_estimate: report.sustainable_nodes.unwrap_or(0) as u32,
+            suggested_heartbeat_seconds: report.suggested_heartbeat_seconds.unwrap_or(0) as u32,
+            adaptive_enabled: report.adaptive_enabled,
+            at_max_interval: report.at_max_interval,
+            missed_beats_before_lost: report.missed_beats_before_lost,
+            is_liveness_owner: true,
+        }))
     }
 
     #[instrument(skip_all)]
@@ -4962,6 +5366,7 @@ impl Manager for ManagerDaemonService {
             host_volumes: worker_config.host_volumes,
             heartbeat_seconds: worker_config.heartbeat_seconds,
             resource_enforcement: worker_config.resource_enforcement,
+            edge_boot: worker_config.edge_boot,
         };
 
         let reply = WorkerPreRegisterReply {
@@ -5030,6 +5435,7 @@ impl Manager for ManagerDaemonService {
             availability: "available".to_string(),
             pool: request.pool,
             last_heartbeat: String::new(),
+            heartbeat_source: String::new(),
             health_checks: request.health_checks,
         };
 
@@ -5148,8 +5554,14 @@ impl Manager for ManagerDaemonService {
             &AclScope::pool(&node.pool),
         )?;
 
+        let provisional_claims = self
+            .provisional_claims
+            .lock()
+            .map(|guard| guard.get(&id).cloned().unwrap_or_default())
+            .unwrap_or_default();
         let reply = GetNodeReply {
             node: Some(node.into()),
+            provisional_claims,
         };
         Ok(Response::new(reply))
     }
@@ -6683,6 +7095,351 @@ impl Manager for ManagerDaemonService {
             message: format!("join token `{}` deleted", req.id),
         }))
     }
+
+    // -----------------------------------------------------------------
+    // Edge boot (docs/edge-boot.md)
+    // -----------------------------------------------------------------
+
+    #[instrument(skip_all, fields(job, task, jti))]
+    async fn issue_boot_ticket(
+        &self,
+        request: Request<IssueBootTicketRequest>,
+    ) -> Result<Response<IssueBootTicketReply>, Status> {
+        // Scope is the job named in the body, so authenticate first and
+        // enforce precisely once it is parsed.
+        let identity = self.authenticate_acl(&request)?;
+        let req = request.into_inner();
+        acl::enforce(
+            &identity,
+            AclResource::Boot,
+            AclAction::Write,
+            &AclScope::job(&req.job),
+        )?;
+        tracing::Span::current().record("job", req.job.as_str());
+        tracing::Span::current().record("task", req.task.as_str());
+
+        if !self.edge_boot.enabled {
+            return Err(Status::failed_precondition(
+                "edge boot is not enabled on this manager \
+                 (set edgeBoot.enabled: true in the manager config)",
+            ));
+        }
+        let Some(state) = self.workload_identity.as_ref() else {
+            return Err(Status::failed_precondition(
+                "boot tickets are signed by the workload-identity issuer, which is not enabled \
+                 on this manager (set workloadIdentity.enabled: true)",
+            ));
+        };
+
+        let idempotency_key = req.idempotency_key.clone().unwrap_or_default();
+        if let Some(recorded) = self
+            .store
+            .idempotency_lookup(&idempotency_key)
+            .map_err(|e| map_store_error("Error checking idempotency", e))?
+        {
+            let reply: MintedTicketRecord = serde_json::from_str(&recorded)
+                .map_err(|e| Status::internal(format!("corrupt idempotency record: {e}")))?;
+            return Ok(Response::new(IssueBootTicketReply {
+                ticket: reply.ticket,
+                jti: reply.jti,
+                job_config_id: reply.job_config_id,
+                expires_at_unix: reply.expires_at_unix,
+                deduplicated: true,
+            }));
+        }
+
+        // A ticket names an EXACT job config, never "latest": pinning at mint
+        // is what keeps a redeploy from silently widening what a live ticket
+        // can start.
+        let job_config_id = if req.job_config_id.trim().is_empty() {
+            self.store
+                .get_job_config_optional(&req.job)
+                .map_err(|e| map_store_error("Error resolving job config", e))?
+                .ok_or_else(|| {
+                    Status::not_found(format!("job `{}` has no current config", req.job))
+                })?
+                .id()
+        } else {
+            req.job_config_id.clone()
+        };
+
+        let task = self
+            .store
+            .get_task_configs_for_job_config(&job_config_id)
+            .map_err(|e| map_store_error("Error loading task configs", e))?
+            .into_iter()
+            .map(|(_, task)| task)
+            .find(|task| task.name == req.task)
+            .ok_or_else(|| {
+                Status::not_found(format!(
+                    "job config {job_config_id} has no task `{}`",
+                    req.task
+                ))
+            })?;
+
+        let ttl = match req.ttl.trim() {
+            "" => self.edge_boot.default_ticket_ttl.clone(),
+            raw => raw.to_string(),
+        };
+        let ttl = humantime::parse_duration(&ttl)
+            .map_err(|e| Status::invalid_argument(format!("invalid ttl `{ttl}`: {e}")))?;
+
+        let ticket_request = crate::manager::edge_boot::TicketRequest {
+            job: req.job.clone(),
+            task: req.task.clone(),
+            job_config_id: job_config_id.clone(),
+            instance_id: req.instance_id.clone(),
+            instance_prefix: req.instance_prefix.clone(),
+            pool: req.pool.clone(),
+            gate: crate::structs::edge_boot::Gate::from_wire(req.gate),
+            ttl,
+            uses: if req.uses == 0 { 1 } else { req.uses },
+            accessor_id: identity.accessor_id.clone().unwrap_or_default(),
+        };
+        crate::manager::edge_boot::validate_ticket_request(&ticket_request, &task, &self.edge_boot)
+            .map_err(|e| Status::invalid_argument(format!("{e:#}")))?;
+
+        let jti = crate::structs::edge_boot::new_ticket_id();
+        let minted = crate::manager::edge_boot::mint(
+            state,
+            &ticket_request,
+            &jti,
+            std::time::SystemTime::now(),
+        )
+        .map_err(|e| Status::internal(format!("failed to mint boot ticket: {e:#}")))?;
+        tracing::Span::current().record("jti", jti.as_str());
+
+        self.store
+            .insert_boot_ticket(&minted.record)
+            .map_err(|e| map_store_error("Error recording boot ticket", e))?;
+        self.store.events().boot_ticket_issued(
+            &minted.record.jti,
+            &minted.record.job,
+            &minted.record.task,
+            &minted.record.job_config_id,
+            &minted.record.instance_id,
+            &minted.record.instance_prefix,
+            &minted.record.pool,
+            &minted.record.gate,
+            &minted.record.accessor_id,
+            minted.record.expires_at_unix,
+        );
+
+        let reply = IssueBootTicketReply {
+            ticket: minted.token,
+            jti: minted.record.jti.clone(),
+            job_config_id,
+            expires_at_unix: minted.record.expires_at_unix,
+            deduplicated: false,
+        };
+        // The idempotency record carries the token so a retry returns the
+        // capability that was already minted instead of a second one.
+        let record = serde_json::to_string(&MintedTicketRecord {
+            ticket: reply.ticket.clone(),
+            jti: reply.jti.clone(),
+            job_config_id: reply.job_config_id.clone(),
+            expires_at_unix: reply.expires_at_unix,
+        })
+        .map_err(|e| Status::internal(format!("failed to record idempotency: {e}")))?;
+        self.store
+            .idempotency_record(&idempotency_key, "issue_boot_ticket", &record)
+            .map_err(|e| map_store_error("Error recording idempotency", e))?;
+
+        info!(jti = %reply.jti, job = %req.job, task = %req.task, "Boot ticket issued");
+        Ok(Response::new(reply))
+    }
+
+    #[instrument(skip_all)]
+    async fn list_boot_tickets(
+        &self,
+        request: Request<ListBootTicketsRequest>,
+    ) -> Result<Response<ListBootTicketsReply>, Status> {
+        // Coarse gate before the lookup, precise filtering after — a
+        // credential-less caller must not be able to probe which jobs have
+        // live tickets.
+        let identity = self.check_acl(
+            &request,
+            AclResource::Boot,
+            AclAction::Read,
+            AclScope::any(),
+        )?;
+        let req = request.into_inner();
+        let now_unix = time::OffsetDateTime::now_utc().unix_timestamp();
+        let tickets = self
+            .store
+            .list_boot_tickets(&req.job, now_unix)
+            .map_err(|e| map_store_error("Error listing boot tickets", e))?
+            .into_iter()
+            .filter(|record| {
+                identity.allows(
+                    AclResource::Boot,
+                    AclAction::Read,
+                    &AclScope::job(&record.job),
+                )
+            })
+            .map(|record| BootTicket {
+                gate: crate::structs::edge_boot::Gate::parse(&record.gate)
+                    .unwrap_or_default()
+                    .to_wire(),
+                uses_remaining: record.uses_remaining(),
+                jti: record.jti,
+                job: record.job,
+                task: record.task,
+                job_config_id: record.job_config_id,
+                instance_id: record.instance_id,
+                instance_prefix: record.instance_prefix,
+                pool: record.pool,
+                expires_at_unix: record.expires_at_unix,
+                accessor_id: record.accessor_id,
+                created_at: record.created_at,
+            })
+            .collect();
+        Ok(Response::new(ListBootTicketsReply { tickets }))
+    }
+
+    #[instrument(skip_all, fields(node_id, claim_id, verdict))]
+    async fn ratify_claim(
+        &self,
+        request: Request<RatifyClaimRequest>,
+    ) -> Result<Response<RatifyClaimReply>, Status> {
+        // ACL: worker-plane endpoint — the node that started the work asks
+        // the manager to commit it, authenticated with its node token. The
+        // ticket (when present) is re-verified below; nodes are honest but
+        // are not trusted to be the only holder of a capability.
+        let identity = self.authenticate_acl(&request)?;
+        acl::enforce_worker_plane(&identity)?;
+        let req = request.into_inner();
+        tracing::Span::current().record("node_id", req.node_id.as_str());
+        tracing::Span::current().record("claim_id", req.claim_id.as_str());
+
+        let refuse = |reason: crate::structs::edge_boot::RefusalReason, detail: String| {
+            crate::manager::telemetry::worker_metrics()
+                .provisional_refused_total
+                .inc(&[reason.as_str()]);
+            Ok(Response::new(RatifyClaimReply {
+                confirmed: false,
+                allocation_id: 0,
+                reason: reason.to_wire(),
+                detail,
+                allocation: None,
+            }))
+        };
+
+        // An edge-originated claim carries the ticket that authorized it.
+        if !req.ticket.trim().is_empty() {
+            if !self.edge_boot.enabled {
+                return refuse(
+                    crate::structs::edge_boot::RefusalReason::Disabled,
+                    "edge boot is not enabled on this manager".into(),
+                );
+            }
+            let Some(state) = self.workload_identity.as_ref() else {
+                return refuse(
+                    crate::structs::edge_boot::RefusalReason::Disabled,
+                    "the workload-identity issuer that signs boot tickets is not enabled".into(),
+                );
+            };
+            let node = self
+                .store
+                .get_node(&req.node_id)
+                .map_err(|e| map_store_error("Error loading node", e))?;
+            let now_unix = time::OffsetDateTime::now_utc().unix_timestamp();
+            if let Err(err) = crate::manager::edge_boot::verify_and_spend(
+                &self.store,
+                state,
+                &req.ticket,
+                &req.instance_id,
+                &node.pool,
+                now_unix,
+            ) {
+                return refuse(
+                    crate::structs::edge_boot::RefusalReason::TicketInvalid,
+                    format!("{err:#}"),
+                );
+            }
+        }
+
+        let started = std::time::Instant::now();
+        let claim = crate::manager::edge_boot::ClaimRatification {
+            node_id: &req.node_id,
+            claim_id: &req.claim_id,
+            job_config_id: &req.job_config_id,
+            task_name: &req.task_name,
+            instance_id: &req.instance_id,
+            gate: crate::structs::edge_boot::Gate::from_wire(req.gate),
+        };
+        let verdict = crate::manager::edge_boot::ratify(&self.store, &claim)
+            .map_err(|e| Status::internal(format!("ratification failed: {e:#}")))?;
+
+        let job_id = self
+            .store
+            .job_id_for_job_config(&req.job_config_id)
+            .unwrap_or_default()
+            .unwrap_or_default();
+        match verdict {
+            crate::manager::edge_boot::Verdict::Confirmed { allocation_id } => {
+                let latency_ms = started.elapsed().as_millis() as u64;
+                tracing::Span::current().record("verdict", "confirmed");
+                crate::manager::telemetry::worker_metrics()
+                    .provisional_ratify_seconds
+                    .observe(started.elapsed().as_secs_f64());
+                self.store.events().provisional_ratified(
+                    &req.claim_id,
+                    allocation_id,
+                    &req.node_id,
+                    &job_id,
+                    &req.instance_id,
+                    crate::structs::edge_boot::Gate::from_wire(req.gate).as_str(),
+                    latency_ms,
+                );
+                // The committed payload rides back with the verdict: the
+                // node booted from one that could not name assigned ports,
+                // the bound instance, or resolved mounts, and must replace it
+                // before it starts the workload or opens the gate.
+                let payload = self.committed_payload(allocation_id, &req.claim_id, req.gate);
+                if payload.is_none() {
+                    warn!(
+                        allocation_id,
+                        claim_id = %req.claim_id,
+                        "Ratified allocation could not be rendered; the node will kill the claim"
+                    );
+                }
+                Ok(Response::new(RatifyClaimReply {
+                    confirmed: true,
+                    allocation_id,
+                    reason: 0,
+                    detail: String::new(),
+                    allocation: payload,
+                }))
+            }
+            crate::manager::edge_boot::Verdict::Refused { reason, detail } => {
+                tracing::Span::current().record("verdict", "refused");
+                self.store.events().provisional_refused(
+                    &req.claim_id,
+                    &req.node_id,
+                    &job_id,
+                    &req.instance_id,
+                    reason.as_str(),
+                    &detail,
+                );
+                refuse(reason, detail)
+            }
+        }
+    }
+}
+
+/// The idempotency payload for `IssueBootTicket`.
+///
+/// It carries the signed ticket so a retried mint returns the capability that
+/// already exists rather than minting a second one — two live tickets where
+/// the caller believes there is one is precisely the surface this feature
+/// must not grow.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct MintedTicketRecord {
+    ticket: String,
+    jti: String,
+    job_config_id: String,
+    expires_at_unix: i64,
 }
 
 fn worker_address_for_node(node: &Node) -> Option<String> {
@@ -7356,7 +8113,15 @@ fn build_desired_allocations(
             .entry(allocation.job_config_id.clone())
             .or_default();
         if tasks.is_empty() {
-            let task_configs = store.get_task_configs_for_job_config(&allocation.job_config_id)?;
+            // The cached accessor, deliberately: this runs once per
+            // distinct job config per node per heartbeat, so on a 5,000-node
+            // fleet at a 2s cadence it was ~10k read-connection acquisitions
+            // per second for rows the read model already holds. Task configs
+            // are immutable per `job_config_id` — a change mints a new
+            // config id — which is why the scheduler already reads them this
+            // way and why the cache needs no invalidation.
+            let task_configs =
+                store.cached_task_configs_for_job_config(&allocation.job_config_id)?;
             for (id, config) in task_configs {
                 tasks.insert(id, config);
             }
@@ -7797,6 +8562,7 @@ mod tests {
             dynamic_attrs: "{}".into(),
             health_checks: "{}".into(),
             last_heartbeat: "2023-01-01 00:00:00 +00:00:00".into(),
+            heartbeat_source: String::new(),
         };
         store.insert_node(node)?;
         Ok(())
@@ -7804,7 +8570,7 @@ mod tests {
 
     fn submission() -> Submission {
         Submission {
-            path: "job.jsonnet".into(),
+            path: "job.ncl".into(),
             content: "{}".into(),
             is_primary: true,
         }
@@ -7850,6 +8616,7 @@ mod tests {
     ) -> R<crate::structs::Allocation> {
         insert_node(store, "node-1")?;
         let job = JobConfig {
+            priority: Default::default(),
             name: job_name.into(),
             tasks: vec![task],
             rollout: None,
@@ -8188,6 +8955,7 @@ mod tests {
             ..TaskConfig::new("db", "noop")
         };
         let job = JobConfig {
+            priority: Default::default(),
             name: job_name.into(),
             tasks: vec![task],
             rollout: None,
@@ -8342,6 +9110,7 @@ mod tests {
     #[test]
     fn rollout_launch_config_defaults_to_default_strategy() -> R<()> {
         let config = JobConfig {
+            priority: Default::default(),
             name: "rollout-defaults".into(),
             tasks: vec![TaskConfig::new("api", "noop")],
             rollout: None,
@@ -8361,6 +9130,7 @@ mod tests {
     #[test]
     fn rollout_launch_config_serializes_manual_create_first() -> R<()> {
         let config = JobConfig {
+            priority: Default::default(),
             name: "rollout-manual".into(),
             tasks: vec![TaskConfig::new("api", "noop")],
             rollout: Some(crate::structs::RolloutConfig {
@@ -8387,6 +9157,21 @@ mod tests {
 
     #[tonic::async_trait]
     impl Worker for TestWorker {
+        type StartClaimStream = std::pin::Pin<
+            Box<
+                dyn tokio_stream::Stream<Item = Result<crate::structs::StartClaimReply, Status>>
+                    + Send
+                    + 'static,
+            >,
+        >;
+
+        async fn start_claim(
+            &self,
+            _request: Request<crate::structs::StartClaimRequest>,
+        ) -> Result<Response<Self::StartClaimStream>, Status> {
+            Err(Status::unimplemented("test worker does not accept claims"))
+        }
+
         async fn post_work(
             &self,
             _request: Request<PostWorkRequest>,
@@ -8465,6 +9250,7 @@ mod tests {
             pool: "default".into(),
             availability: "available".into(),
             last_heartbeat: "2023-01-01T00:00:00Z".into(),
+            heartbeat_source: String::new(),
             config_attrs: json!({ "workerAddress": worker_address }),
             fingerprint_attrs: json!({}),
             dynamic_attrs: json!({}),
@@ -9453,12 +10239,17 @@ mod tests {
         Ok(())
     }
 
+    /// KV file injection into containers works now that the task directory
+    /// is mounted — but only at a destination the container can actually see.
+    /// A host-absolute path outside the mount is rejected at submit with the
+    /// fix in the message, rather than staging to a directory the workload
+    /// could never read.
     #[tokio::test]
-    async fn run_job_rejects_file_injection_for_container_tasks() -> R<()> {
+    async fn run_job_scopes_container_file_injection_to_the_task_dir() -> R<()> {
         let store = setup_store()?;
         let manager = ManagerDaemonService::new(store);
 
-        let jobspec = json!({
+        let out_of_range = json!({
             "name": "kv-container-files",
             "task": {
                 "runtime": "container",
@@ -9471,16 +10262,35 @@ mod tests {
                 "config": { "image": "alpine", "command": ["echo", "hi"] }
             }
         });
-        let err = run_jobspec(&manager, jobspec)
+        let err = run_jobspec(&manager, out_of_range)
             .await
-            .expect_err("submit should fail for unsupported file injection");
+            .expect_err("a path outside the mount is unreachable from inside");
 
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        let message = err.message();
+        assert!(message.contains("/legion/task"), "names the fix: {message}");
         assert!(
-            err.message().contains("does not support kv file injection"),
-            "unexpected error message: {}",
-            err.message()
+            message.contains("outside the container task directory"),
+            "unexpected error message: {message}"
         );
+
+        // A relative path resolves against the mount and is accepted.
+        let in_range = json!({
+            "name": "kv-container-files-ok",
+            "task": {
+                "runtime": "container",
+                "files": [
+                    {
+                        "path": "config/app.toml",
+                        "file": { "template": "static-content" }
+                    }
+                ],
+                "config": { "image": "alpine", "command": ["echo", "hi"] }
+            }
+        });
+        run_jobspec(&manager, in_range)
+            .await
+            .expect("a path under the mount is accepted");
         Ok(())
     }
 
@@ -9491,6 +10301,7 @@ mod tests {
         insert_node(&store, "node-a")?;
 
         let v1 = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "replace-rollout".into(),
@@ -9507,6 +10318,7 @@ mod tests {
         let _v1_alloc = store.place_alloc("node-a", v1_task_id)?;
 
         let v2 = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "replace-rollout".into(),
@@ -9581,6 +10393,7 @@ mod tests {
         insert_node(&store, "node-a")?;
 
         let v1 = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "stop-rollout".into(),
@@ -9597,6 +10410,7 @@ mod tests {
         let _v1_alloc = store.place_alloc("node-a", v1_task_id)?;
 
         let v2 = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "stop-rollout".into(),
@@ -9653,6 +10467,7 @@ mod tests {
             pool: "default".into(),
             availability: "available".into(),
             last_heartbeat: "2023-01-01T00:00:00Z".into(),
+            heartbeat_source: String::new(),
             config_attrs: json!({ "node_id": "node-a" }),
             fingerprint_attrs: json!({}),
             dynamic_attrs: json!({ "tier": "edge" }),
@@ -9664,6 +10479,7 @@ mod tests {
             pool: "default".into(),
             availability: "available".into(),
             last_heartbeat: "2023-01-01T00:00:00Z".into(),
+            heartbeat_source: String::new(),
             config_attrs: json!({ "node_id": "node-b" }),
             fingerprint_attrs: json!({}),
             dynamic_attrs: json!({ "tier": "edge" }),
@@ -9678,6 +10494,7 @@ mod tests {
             ..TaskConfig::new("task", "noop")
         };
         let job = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: job_name.clone(),
@@ -9745,6 +10562,7 @@ mod tests {
         insert_node(&store, "node-a")?;
 
         let job = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "job".into(),
@@ -9791,6 +10609,7 @@ mod tests {
         insert_node(&store, "node-a")?;
 
         let job = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "artifact-fail-job".into(),
@@ -9859,6 +10678,7 @@ mod tests {
         insert_node(&store, "node-b")?;
 
         let job = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "job-non-owner".into(),
@@ -9896,6 +10716,7 @@ mod tests {
         insert_node(&store, "node-a")?;
         insert_node(&store, "node-b")?;
         let job = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "health-upsert".into(),
@@ -9962,6 +10783,7 @@ mod tests {
         insert_node(&store, "node-a")?;
 
         let v1 = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "rollout-health".into(),
@@ -9978,6 +10800,7 @@ mod tests {
         let old_alloc = store.place_alloc("node-a", v1_task_id)?;
 
         let v2 = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "rollout-health".into(),
@@ -10047,6 +10870,7 @@ mod tests {
         insert_node(&store, "node-a")?;
 
         let v1 = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "rollout-groups".into(),
@@ -10081,6 +10905,7 @@ mod tests {
         let old_api = store.place_alloc("node-a", v1_api)?;
 
         let v2 = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "rollout-groups".into(),
@@ -10219,6 +11044,7 @@ mod tests {
         insert_node(&store, "node-a")?;
 
         let v1 = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "rollout-events-api".into(),
@@ -10232,6 +11058,7 @@ mod tests {
         let v1_id = store.get_job_config(&v1.name)?.id();
 
         let v2 = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "rollout-events-api".into(),
@@ -10397,6 +11224,7 @@ mod tests {
         insert_node(&store, "node-a")?;
 
         let job = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "job".into(),
@@ -10432,6 +11260,7 @@ mod tests {
         insert_node(&store, "node-a")?;
 
         let job = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "batch-job".into(),
@@ -10505,6 +11334,7 @@ mod tests {
             "allow": allow,
         }))?);
         let job = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: format!("svc-{name}"),
@@ -10537,6 +11367,7 @@ mod tests {
         service: &str,
     ) -> crate::structs::TaskAllocation {
         crate::structs::TaskAllocation {
+            provisional: None,
             allocation_id,
             job_id: job_id.into(),
             task_connect: json!({ "upstreams": [{ "service": service }] }).to_string(),
@@ -10554,6 +11385,7 @@ mod tests {
         seed_upstream_service(&store, "web", 18080, &[], true)?;
 
         let plain = crate::structs::TaskAllocation {
+            provisional: None,
             allocation_id: 1,
             job_id: "plain".into(),
             ..Default::default()
@@ -10669,6 +11501,7 @@ mod tests {
         seed_upstream_service(&store, "web", 18095, &[], true)?;
 
         let corrupt = crate::structs::TaskAllocation {
+            provisional: None,
             allocation_id: 1,
             job_id: "broken".into(),
             task_connect: "{not json".into(),
@@ -10751,6 +11584,7 @@ mod tests {
 
     fn submit_keyed_job(store: &Store, name: &str, tasks: Vec<TaskConfig>) -> R<String> {
         let job = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: name.into(),

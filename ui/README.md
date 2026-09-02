@@ -21,7 +21,7 @@ VITE_MANAGER_ENDPOINT="http://192.168.1.25:4747" npm run dev
 If you are doing UI work and want predictable data without manually creating jobs/workers, start the manager with `LEGION_SEED_UI_DATA=1`.
 
 ```bash
-LEGION_SEED_UI_DATA=1 cargo run -- start manager --run-worker -c configs/manager.jsonnet
+LEGION_SEED_UI_DATA=1 cargo run -- start manager --run-worker -c configs/manager.ncl
 ```
 
 This only seeds when the store is empty and creates demo workers, a demo job, and a couple of KV entries so the UI has real backend data to render.

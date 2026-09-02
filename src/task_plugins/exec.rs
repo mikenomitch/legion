@@ -1,12 +1,18 @@
 use crate::prelude::*;
 use crate::structs::{Allocation, TaskConfig};
 use crate::task_plugins::exec_isolation::{
-    cap_last_cap, capabilities_to_drop, enforcement_enabled, parse_umask, remove_managed_cgroup,
-    ExecHardeningConfig,
+    enforcement_enabled, remove_managed_cgroup, ExecHardeningConfig,
 };
+// Linux-only: these are called from the pre-exec hardening block, which is
+// itself `cfg(target_os = "linux")` because it goes through `libc::prctl`
+// and `PR_CAPBSET_DROP`. Importing them unconditionally made every macOS
+// build warn, and `cargo clippy -- -D warnings` fails on it — green on CI,
+// which is Linux, and broken for anyone developing on a Mac.
+#[cfg(target_os = "linux")]
+use crate::task_plugins::exec_isolation::{cap_last_cap, capabilities_to_drop, parse_umask};
 use crate::task_plugins::{
-    configure_task_log_capture, derived_schema, reap_task_process, spawn_pipe, spawn_pty,
-    spawn_task_process, ExecOptions, ExecSession, ExecSupport, TaskInstance, TaskPlugin,
+    configure_task_log_capture, derived_schema, spawn_pipe, spawn_pty, spawn_task_process,
+    ExecOptions, ExecSession, ExecSupport, TaskInstance, TaskPlugin,
 };
 #[cfg(target_os = "linux")]
 use landlock::{AccessFs, PathBeneath, PathFd, Ruleset, RulesetAttr, RulesetCreatedAttr, ABI};
@@ -295,6 +301,18 @@ impl TaskPlugin for ExecTaskPlugin {
         true
     }
 
+    /// An exec task *is* a host process, so worker core can create its cgroup
+    /// and the plugin simply spawns into it. That puts exec tasks in the same
+    /// hierarchy as container tasks, which is what makes a reserved core
+    /// exclusive against *every* governed workload on the node rather than
+    /// only against other containers.
+    ///
+    /// An explicit `config.cgroup` still wins and opts the task out — it
+    /// keeps meaning what it has always meant: join the cgroup the job named.
+    fn resource_enforcement(&self) -> crate::task_plugins::ResourceEnforcement {
+        crate::task_plugins::ResourceEnforcement::WorkerCgroup
+    }
+
     /// `exec` is the canonical "one host process we spawned" runtime.
     fn supervises_process(&self) -> bool {
         true
@@ -386,17 +404,23 @@ impl TaskPlugin for ExecTaskPlugin {
             .context("exec task command must include at least one entry")?;
 
         let mut linux_options = config.linux_options()?;
-        // Worker-owned resource enforcement: create this allocation's cgroup
-        // and write the task's `resources` into it as real limits. An explicit
-        // `config.cgroup` opts out — the operator named a cgroup they manage.
-        #[cfg(target_os = "linux")]
-        if enforcement_enabled() && linux_options.cgroup.is_none() {
-            linux_options.managed_cgroup =
-                crate::task_plugins::exec_isolation::prepare_managed_cgroup(
-                    allocation.id,
-                    &task.name,
-                    &task.resources,
-                );
+        // Worker-owned resource enforcement: worker core already created this
+        // allocation's cgroup and wrote its limits (see
+        // `src/worker/resources.rs`); the plugin only has to spawn into it.
+        // An explicit `config.cgroup` opts out — the operator named a cgroup
+        // they manage, and admission already rejected combining that with
+        // `cores`, which Legion could not fence inside it.
+        //
+        // The join rides the existing pre_exec sequence rather than
+        // `join_assignment_cgroup`, because ordering matters here: it is
+        // privileged work and must happen before the switch to the task user.
+        // A plugin without that constraint gets the same effect from the
+        // one-call helper.
+        if linux_options.cgroup.is_none() {
+            linux_options.managed_cgroup = instance
+                .resource_assignment
+                .as_ref()
+                .map(|assignment| assignment.cgroup_path.clone());
         }
         // Artifacts stage into the task directory; a landlocked task must be
         // able to read them, so the task dir rides along automatically.
@@ -501,17 +525,29 @@ impl TaskPlugin for ExecTaskPlugin {
         Ok(())
     }
 
+    /// The hard path. The graceful notice is the trait default
+    /// (`signal_task_process` to the tracked process group); the worker's
+    /// reaper calls this once the task has exited or its window has closed.
     fn stop(
         &self,
         allocation: &Allocation,
         task: &TaskConfig,
         instance: &mut TaskInstance,
     ) -> R<()> {
-        reap_task_process(allocation.id, &task.name, instance, "exec");
-        // Best-effort, and only ever removes a cgroup this worker created:
-        // the path is derived from the allocation, not from anything the task
-        // asked for (an explicit `config.cgroup` is the operator's to manage).
-        if enforcement_enabled() {
+        crate::task_plugins::reap_task_process(allocation.id, &task.name, instance, "exec");
+        // Whole-tree teardown, the second thing `WorkerCgroup` buys: a
+        // double-forked descendant that reparented away from the tracked pid
+        // still lives in this cgroup, so `cgroup.kill` reaps it where
+        // `kill(pid)` would have orphaned it. Strictly after the reap, so a
+        // task that drained cleanly inside its window is never SIGKILLed for
+        // the privilege.
+        if let Some(assignment) = instance.resource_assignment.as_ref() {
+            crate::worker::resources::kill_cgroup(assignment);
+        }
+        // The cgroup directory itself is worker core's to remove (it owns the
+        // allocator and the slice masks); this only cleans up the legacy
+        // per-allocation cgroup from before the hierarchy existed.
+        if enforcement_enabled() && instance.resource_assignment.is_none() {
             remove_managed_cgroup(allocation.id, &task.name);
         }
         Ok(())
@@ -872,6 +908,262 @@ mod tests {
         // SAFETY: trivial libc getters with no preconditions.
         let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
         chown_tree(&root, uid, gid)?;
+        Ok(())
+    }
+
+    /// The stop **notice** is delivered and returns immediately: `stop_with`
+    /// runs under the worker's task-manager lock, so a runtime that blocked
+    /// here for the grace window would stall heartbeats. A trapping process
+    /// then exits on its own, inside the window, without anyone killing it.
+    #[cfg(unix)]
+    #[test]
+    fn stop_with_signals_promptly_and_lets_a_trapping_process_drain() -> R<()> {
+        let plugin = ExecTaskPlugin;
+        let allocation = crate::structs::Allocation {
+            id: 4242,
+            status: "running".into(),
+            resources: json!({}),
+            node_id: "node-1".into(),
+            job_config_id: "job-1".into(),
+            task_config_id: 1,
+            job_id: "job".into(),
+            instance_id: None,
+            network: None,
+        };
+        let task = TaskConfig {
+            config: json!({
+                "command": ["/bin/sh", "-c", "trap 'exit 0' TERM; while :; do sleep 0.1; done"],
+            }),
+            stop: Some(crate::structs::StopConfig {
+                signal: "SIGTERM".into(),
+                kill_after: std::time::Duration::from_secs(30),
+            }),
+            ..TaskConfig::new("drain", "exec")
+        };
+
+        let mut instance = TaskInstance::default();
+        plugin.start(&allocation, &task, &mut instance)?;
+        assert!(instance.pid.is_some(), "task process started");
+        // Let the shell reach its `trap` before signalling it, or the test
+        // measures a startup race instead of the stop path.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        let ctx = crate::task_plugins::StopContext::with_ladder(
+            crate::structs::StopCause::Unknown,
+            "SIGTERM",
+            std::time::Duration::from_secs(30),
+        );
+        let started = std::time::Instant::now();
+        let signalled = plugin.stop_with(&allocation, &task, &mut instance, &ctx)?;
+        let elapsed = started.elapsed();
+
+        assert!(signalled, "a tracked host process can be signalled");
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "the notice must not wait out the window, took {elapsed:?}"
+        );
+        // Still tracked: the notice is not the kill, and the worker's reaper
+        // owns the handle until the process actually goes away.
+        assert!(
+            instance.pid.is_some(),
+            "the process is draining, not reaped"
+        );
+
+        // It drains on its own, well inside the 30s window. Polled through
+        // the child handle, not `kill(pid, 0)`: an exited-but-unreaped child
+        // is a zombie, and a liveness probe would call it alive forever.
+        let mut exited = false;
+        for _ in 0..200 {
+            if !matches!(
+                instance.child.as_mut().expect("child handle").try_wait(),
+                Ok(None)
+            ) {
+                exited = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(exited, "a trapping process exits on its stop signal");
+        plugin.stop(&allocation, &task, &mut instance)?;
+        Ok(())
+    }
+
+    /// And `stop` is the hard step: a process that ignored the notice is
+    /// killed, promptly. The window belongs to the worker's reaper, so this
+    /// call must not wait one out either.
+    #[cfg(unix)]
+    #[test]
+    fn stop_hard_kills_a_process_that_ignored_the_notice() -> R<()> {
+        let plugin = ExecTaskPlugin;
+        let allocation = crate::structs::Allocation {
+            id: 4243,
+            status: "running".into(),
+            resources: json!({}),
+            node_id: "node-1".into(),
+            job_config_id: "job-1".into(),
+            task_config_id: 1,
+            job_id: "job".into(),
+            instance_id: None,
+            network: None,
+        };
+        let task = TaskConfig {
+            config: json!({
+                "command": ["/bin/sh", "-c", "trap '' TERM; while :; do sleep 0.1; done"],
+            }),
+            stop: Some(crate::structs::StopConfig {
+                signal: "SIGTERM".into(),
+                kill_after: std::time::Duration::from_secs(1),
+            }),
+            ..TaskConfig::new("stubborn", "exec")
+        };
+
+        let mut instance = TaskInstance::default();
+        plugin.start(&allocation, &task, &mut instance)?;
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let pid = instance.pid.expect("pid");
+
+        let ctx = crate::task_plugins::StopContext::with_ladder(
+            crate::structs::StopCause::Unknown,
+            "SIGTERM",
+            std::time::Duration::from_secs(1),
+        );
+        plugin.stop_with(&allocation, &task, &mut instance, &ctx)?;
+        // It traps TERM, so it is still alive when the reaper gives up.
+        assert!(
+            crate::signals::pid_alive(pid),
+            "the task ignored its notice"
+        );
+
+        let started = std::time::Instant::now();
+        plugin.stop(&allocation, &task, &mut instance)?;
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "the hard kill must not wait out a window, took {elapsed:?}"
+        );
+        assert!(instance.pid.is_none(), "the process was reaped");
+        Ok(())
+    }
+
+    /// The `WorkerCgroup` adoption, asserted at the seam a unit test can
+    /// reach: the assignment becomes the cgroup the child is spawned into,
+    /// and an explicit `config.cgroup` still wins (back-compat).
+    #[test]
+    fn the_assignment_supplies_the_cgroup_unless_the_job_named_one() -> R<()> {
+        let plugin = ExecTaskPlugin;
+        let assignment = crate::task_plugins::ResourceAssignment {
+            slice: crate::task_plugins::Slice::Share,
+            cgroup_path: std::path::PathBuf::from("legion/share/legion-3"),
+            cores: None,
+            cpu_weight: Some(500),
+            memory_limit_bytes: Some(64 * 1024 * 1024),
+        };
+
+        // No explicit cgroup: the worker's assignment is what the task joins.
+        let mut options = plugin.config_linux_options(&json!({ "command": ["true"] }))?;
+        let instance = TaskInstance {
+            resource_assignment: Some(assignment.clone()),
+            ..TaskInstance::default()
+        };
+        if options.cgroup.is_none() {
+            options.managed_cgroup = instance
+                .resource_assignment
+                .as_ref()
+                .map(|assignment| assignment.cgroup_path.clone());
+        }
+        assert_eq!(
+            options.managed_cgroup.as_deref(),
+            Some(std::path::Path::new("legion/share/legion-3"))
+        );
+
+        // An explicit cgroup opts the task out of the Legion hierarchy: it
+        // keeps meaning what it has always meant.
+        let mut named = plugin.config_linux_options(&json!({
+            "command": ["true"],
+            "cgroup": "workloads/demo",
+        }))?;
+        if named.cgroup.is_none() {
+            named.managed_cgroup = Some(assignment.cgroup_path.clone());
+        }
+        assert_eq!(named.cgroup.as_deref(), Some("workloads/demo"));
+        assert_eq!(named.managed_cgroup, None);
+        Ok(())
+    }
+
+    /// End-to-end Linux: an exec task's declared `memory` becomes a real
+    /// `memory.max` on the cgroup worker core created for it, and a
+    /// double-forked descendant is reaped by `cgroup.kill` where the
+    /// tracked-pid path would have orphaned it.
+    ///
+    /// Run on a node with cgroup v2 and a root worker.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires cgroup v2 + root"]
+    fn exec_tasks_join_their_worker_created_cgroup() -> R<()> {
+        let plugin = ExecTaskPlugin;
+        let allocation = crate::structs::Allocation {
+            id: 9101,
+            status: "running".into(),
+            resources: json!({}),
+            node_id: "node-1".into(),
+            job_config_id: "job-1".into(),
+            task_config_id: 1,
+            job_id: "job".into(),
+            instance_id: None,
+            network: None,
+        };
+        let task = TaskConfig {
+            config: json!({
+                // A double-forked grandchild that outlives its parent: the
+                // case cgroup.kill exists to catch.
+                "command": ["/bin/sh", "-c", "(sleep 300 &) ; sleep 300"],
+            }),
+            resources: json!({ "memory": 64 }),
+            ..TaskConfig::new("cgrouptest", "exec")
+        };
+
+        let mut governor = crate::worker::resources::NodeResourceGovernor::from_env();
+        assert!(
+            governor.enabled(),
+            "run this test with resourceEnforcement enabled"
+        );
+        let assignment = governor
+            .assign(
+                allocation.id,
+                &task,
+                crate::task_plugins::ResourceEnforcement::WorkerCgroup,
+            )?
+            .expect("governed");
+
+        let mut instance = TaskInstance {
+            resource_assignment: Some(assignment.clone()),
+            ..TaskInstance::default()
+        };
+        plugin.start(&allocation, &task, &mut instance)?;
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        let dir = assignment.absolute_cgroup_path();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("memory.max"))?.trim(),
+            (64u64 * 1024 * 1024).to_string(),
+            "the declared memory limit is a real cgroup limit"
+        );
+        let procs = std::fs::read_to_string(dir.join("cgroup.procs"))?;
+        assert!(
+            procs.lines().count() >= 2,
+            "the task and its double-forked grandchild are both in the cgroup: {procs:?}"
+        );
+
+        plugin.stop(&allocation, &task, &mut instance)?;
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let remaining = std::fs::read_to_string(dir.join("cgroup.procs")).unwrap_or_default();
+        assert!(
+            remaining.trim().is_empty(),
+            "cgroup.kill reaped the whole tree: {remaining:?}"
+        );
+
+        governor.release(allocation.id, Some(&assignment));
         Ok(())
     }
 

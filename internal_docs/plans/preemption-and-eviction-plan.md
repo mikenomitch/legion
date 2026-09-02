@@ -2,13 +2,32 @@
 
 > **Judgement calls:** [`calls/preemption-and-eviction-plan_calls.md`](../calls/preemption-and-eviction-plan_calls.md)
 
-**Status: IN EXECUTION.** Phase 1 is split into 1a (stop causes) and 1b
-(graceful termination); **Phase 1a has shipped** — see
-[`docs/graceful-stop.md`](../../docs/graceful-stop.md). Phases 1b, 2, 3 and 4
-are not built. Deliberately deferred from v1: fair-share / hierarchical
-queues, oversubscription and node-pressure eviction, suspend-based preemption,
+**Status: SHIPPED.** Phase 1 was split into 1a (stop causes) and 1b (graceful
+termination); **1a, 1b, 2 and 3 have all shipped**, along with Phase 4's UI
+item. Public docs:
+[`docs/graceful-stop.md`](../../docs/graceful-stop.md) and
+[`docs/preemption-and-eviction.md`](../../docs/preemption-and-eviction.md).
+
+Two deviations from the plan as written, both recorded in the
+[judgement calls](../calls/preemption-and-eviction-plan_calls.md):
+
+- **Six bands, not four.** `elevated` and `background` were added between and
+  below the original four, which kept their names and their eval priorities
+  exactly (call 5).
+- **Phase 1b broke the `stop_with` ABI** — `R<()>` → `R<bool>` — and added the
+  plugin ABI version symbol this plan listed as a to-do, so a stale dylib
+  fails at load rather than mismatching silently (call 8).
+
+Still open from Phase 4, deliberately: `legion node drain` rate limiting via
+the disruption vocabulary (evaluated and not taken — drain has its own
+deadline-bounded semantics, and giving it a budget re-opens exactly the
+cluster-wedge risk call 10 exists to avoid), and the fair-share revisit note.
+
+Deliberately deferred from v1: fair-share / hierarchical queues,
+oversubscription and node-pressure eviction, suspend-based preemption,
 descheduler-style rebalancing, network/device-aware victim selection, and a
-preemption plugin seam (each is a named non-goal below).
+preemption plugin seam (each is a named non-goal below, and each is restated
+in the public doc's Known limitations).
 
 **Phase 1 was split during implementation.** The original Phase 1 bundled the
 stop *cause* with the stop *ladder*. Two findings forced them apart:
@@ -784,7 +803,7 @@ destroy and node loss. Nothing waits on preemption.
 **Explicitly not in 1a:** any change to *when* a task dies. Termination is
 still immediate.
 
-### Phase 1b — Graceful termination
+### Phase 1b — Graceful termination (SHIPPED)
 
 The stop ladder, which 1a deliberately left out. Ordered by what blocks what:
 
@@ -812,27 +831,36 @@ The stop ladder, which 1a deliberately left out. Ordered by what blocks what:
 6. **Stops-before-starts** reconcile ordering, which Phase 3 needs so a node
    never runs victim and preemptor concurrently.
 
-**Open question for 1b, from the review that split this phase:** stops-before-starts
-puts the victim's shutdown on the preemptor's critical path, so a task that
-ignores SIGTERM delays an incident-response scale-up by up to `killAfter`. The
-5m cap is the only backstop today. Decide between a shorter preemption-specific
-grace and starting the preemptor once capacity is *accounted* rather than
-*physically free*.
+**Open question for 1b, from the review that split this phase — resolved by
+taking neither option.** Stops-before-starts puts the victim's shutdown on the
+preemptor's critical path, so a task that ignores its stop signal delays an
+incident-response scale-up by up to `killAfter`. A preemption-specific grace
+would have made the ladder cause-dependent, which is exactly the per-path
+divergence call 9 exists to prevent; starting the preemptor on *accounted*
+rather than *physically free* capacity would let a container runtime briefly
+run victim and preemptor concurrently on the same reserved memory. Shipped as
+specified — the 5m `killAfter` cap is the backstop, and a job that wants
+faster displacement sets a shorter `killAfter` on the work it expects to be
+displaced. Documented as a known limitation.
 
 **Version-skew note for 1b** (1a needs none — an old worker simply ignores
 `stop_notices`): stops-before-starts is worker-side, so a new manager with an
 old worker may start the preemptor while the victim still runs — a transient
-oversubscription, not merely a graceless stop. Gate `enforce` on a minimum
-worker protocol version, or make the plan tolerate the overlap.
+oversubscription, not merely a graceless stop. **Shipped tolerating the
+overlap** rather than gating `enforce` on a worker protocol version: a version
+gate would make preemption silently inert on any fleet with one stale worker,
+which is the discoverability failure this plan spends its Nomad section
+arguing against. `docs/preemption-and-eviction.md` § Upgrading tells operators
+to upgrade workers first, or run `observe` until the fleet is uniform.
 
-### Phase 2 — Priority bands
+### Phase 2 — Priority bands (SHIPPED)
 `priority` on JobConfig (+ column, proto, validation), band → eval-priority
 mapping, `critical` ACL gate, CLI/UI showing the band (`job list`, `job
 status`, Jobs page), submit-time warning when preemption is off, maximal
 jsonnet + docs. **Win standalone:** important work dequeues first under
 contention, and the vocabulary for preemption exists and is governed.
 
-### Phase 3 — Preemption
+### Phase 3 — Preemption (SHIPPED)
 Victim eligibility + selection + reprieve pass, node choice, `evictions`
 through `PlanOutcome`/`plan_submission`/apply (one transaction: deletes,
 inserts, requeue evals, events), `preemption { mode, disabledPools,
@@ -841,8 +869,9 @@ mode, events + metrics, the no-placement error text, public doc
 `docs/preemption-and-eviction.md`, and the read-model/epoch gap fix (TODO §
 Scheduling) as a prerequisite or co-landing. **Win:** S1 end to end.
 
-### Phase 4 — Governance and operations polish
-Preemption history on the UI job page, `legion node drain` gaining optional
+### Phase 4 — Governance and operations polish (PARTIAL)
+Preemption history on the UI job page (**shipped**, along with the band badge
+on the job header and the `priority` column in `job list`), `legion node drain` gaining optional
 rate limiting via the same disruption vocabulary (evaluate then — deliberately
 not v1), fair-share revisit note. Each item independently droppable.
 
@@ -924,9 +953,10 @@ Regression:
 
 ## Open Questions
 
-1. **Default `killAfter` — 30s or 15s?** 30s matches K8s muscle memory and
-   is safer for flush-on-exit; 15s tightens drain and preemption latency.
-   Lean: 30s.
+1. ~~**Default `killAfter` — 30s or 15s?**~~ **Resolved: 30s**, matching K8s
+   muscle memory and safer for flush-on-exit. Preemption latency is bounded by
+   it, and a job that wants faster displacement of its own work sets a shorter
+   `killAfter` on that work.
 2. **Strict priority DESC eval ordering can starve `low` evals** behind a
    sustained stream of higher ones. Today's queue depth makes this
    theoretical. Lean: accept, add priority aging only if a real queue shows
@@ -934,9 +964,9 @@ Regression:
 3. **Should `disruption.minAvailable` also gate future autoscaler scale-in
    and rebalancing?** Lean: yes — it is the "voluntary disruption" budget,
    and saying so now keeps the vocabulary from forking later.
-4. **Notice delivery beyond the file+signal** (e.g. an env-pointed FIFO or
-   an exec-style hook): defer until a real consumer (the mesh's
-   drain-before-SIGTERM) exists. Lean: file is enough for v1.
+4. ~~**Notice delivery beyond the file+signal**~~ **Resolved: file is enough.**
+   Shipped as `LEGION_STOP_NOTICE_PATH` + the signal. Revisit when a real
+   consumer (the mesh's drain-before-SIGTERM) exists.
 5. ~~**Per-namespace band caps shape** (Phase 4): config map
    (`priority.maxBandByNamespace`) vs ACL-native.~~ **Resolved: ACL-native.**
    A `bands` selector on `job` rules (see § Job priority) covers both the
@@ -946,8 +976,8 @@ Regression:
    onto them the moment anyone asked for per-team rather than per-namespace
    scoping.
 
-6. **Should the per-pool preemption toggle be ACL-adjacent rather than
-   manager config?** `disabledPools` lives in `schedulerSettings`, so a
+6. **Still open. Should the per-pool preemption toggle be ACL-adjacent rather
+   than manager config?** `disabledPools` lives in `schedulerSettings`, so a
    pool-scoped operator cannot exempt their own pool without cluster-config
    access — even though `pools` already exists as an ACL selector. Lean:
    config for v1, named here so the asymmetry is a decision rather than an

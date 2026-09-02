@@ -19,17 +19,62 @@ mod exec_session;
 mod microvm;
 mod oci_bundle;
 mod oci_image;
+pub mod resource_enforcement;
 mod sandbox;
 mod schema_docs;
 
 pub use container::ContainerTaskPlugin;
 pub use exec::ExecTaskPlugin;
 pub use exec_session::{spawn_pipe, spawn_pty, ExecOptions, ExecOutputStreams, ExecSession};
+pub use resource_enforcement::{
+    join_assignment_cgroup, ResourceAssignment, ResourceEnforcement, Slice, CGROUP_ROOT,
+};
 pub use sandbox::SandboxTaskPlugin;
 pub use schema_docs::{
     builtin_task_plugin_schemas, render_builtin_task_plugin_schemas_markdown,
     validate_builtin_task_plugin_schemas,
 };
+
+/// Generation of the `TaskPlugin` vtable that a dynamically loaded plugin
+/// must have been compiled against.
+///
+/// `plugins/tasks/` is a public extension point loaded through a bare
+/// `extern "C" fn() -> Box<dyn TaskPlugin>`, which carries no type
+/// information: a dylib built against an older trait layout would load
+/// happily and then call the wrong slots. Bumping this constant — and the
+/// [`declare_task_plugin_abi!`] symbol every plugin exports — turns that
+/// silent corruption into a load-time error naming the fix.
+///
+/// - `1` — the trait as of Phase 1a (`stop_with(..) -> R<()>`), which no
+///   plugin ever needed to override because the cause was informational.
+/// - `2` — graceful stop (Phase 1b): `stop_with` returns `R<bool>` ("a notice
+///   was delivered; the process is still running") and [`StopContext`] gained
+///   `signal`, `deadline` and `grace`.
+pub const TASK_PLUGIN_ABI_VERSION: u32 = 2;
+
+/// Symbol name the loader looks for. A plugin declares it with
+/// [`declare_task_plugin_abi!`].
+const TASK_PLUGIN_ABI_SYMBOL: &[u8] = b"legion_task_plugin_abi_version";
+
+/// Export the task-plugin ABI generation this plugin was compiled against.
+/// Every dylib under `plugins/tasks/<name>/` must invoke this once, next to
+/// its `get` constructor.
+///
+/// ```ignore
+/// legion::declare_task_plugin_abi!();
+///
+/// #[no_mangle]
+/// pub extern "C" fn get() -> Box<dyn TaskPlugin> { Box::new(MyPlugin) }
+/// ```
+#[macro_export]
+macro_rules! declare_task_plugin_abi {
+    () => {
+        #[no_mangle]
+        pub extern "C" fn legion_task_plugin_abi_version() -> u32 {
+            $crate::task_plugins::TASK_PLUGIN_ABI_VERSION
+        }
+    };
+}
 
 pub fn spawn_task_process(cmd: &mut Command) -> R<Child> {
     #[cfg(unix)]
@@ -109,23 +154,142 @@ fn open_log_file(path: &std::path::Path) -> R<std::fs::File> {
         .with_context(|| format!("failed to open log file {}", path.display()))
 }
 
-/// Why a task is being stopped, handed to [`TaskPlugin::stop_with`].
+/// Why — and how — a task is being stopped, handed to
+/// [`TaskPlugin::stop_with`].
 ///
-/// Phase 1a carries the cause and nothing else — the shutdown itself is still
-/// immediate for every in-tree runtime. The struct exists now, ahead of the
-/// behavior, so the cause has a stable home to travel in and so Phase 1b can
-/// add `signal` and `deadline` without touching a single call site again.
-#[derive(Debug, Clone, Default)]
+/// `stop_with` is the **notice**, not the kill: a runtime delivers `signal`
+/// and returns promptly. The worker keeps the allocation in a terminating set
+/// until the process actually exits, or until `deadline` passes and
+/// [`TaskPlugin::destroy`] takes it out hard. A runtime must never block for
+/// the grace window itself — `stop_with` runs under the task-manager mutex
+/// that the heartbeat, the self-fence watchdog and health reporting all need
+/// (see `internal_docs/plans/preemption-and-eviction-plan.md` § Phase 1b).
+#[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct StopContext {
     /// Why the platform is stopping this allocation.
     pub cause: StopCause,
+    /// The notice signal to deliver (`stop.signal`, default `SIGTERM`).
+    pub signal: String,
+    /// When the grace window closes. After this instant the worker's reaper
+    /// hard-destroys whatever is left.
+    pub deadline: std::time::Instant,
+    /// How long the grace window is, from the moment the signal is sent.
+    /// Carried alongside `deadline` because it is the value a runtime hands
+    /// to a stop-with-timeout API (`runc kill` + wait, a container CLI's
+    /// `--time`), where an absolute instant is not expressible.
+    pub grace: std::time::Duration,
+}
+
+impl Default for StopContext {
+    fn default() -> Self {
+        Self::new(StopCause::default())
+    }
 }
 
 impl StopContext {
-    /// A context carrying just a cause.
+    /// A context with the default ladder (`SIGTERM`, 30s), for callers that
+    /// have no task config to hand — test helpers and the legacy `stop()`
+    /// bridge.
     pub fn new(cause: StopCause) -> Self {
-        Self { cause }
+        Self::with_ladder(cause, "SIGTERM", std::time::Duration::from_secs(30))
+    }
+
+    /// A context carrying an explicit ladder, as the worker builds it from
+    /// the task's `stop` block.
+    pub fn with_ladder(cause: StopCause, signal: &str, grace: std::time::Duration) -> Self {
+        Self {
+            cause,
+            signal: signal.to_string(),
+            deadline: std::time::Instant::now() + grace,
+            grace,
+        }
+    }
+
+    /// Whether the grace window has closed.
+    pub fn expired(&self) -> bool {
+        std::time::Instant::now() >= self.deadline
+    }
+}
+
+/// The portable signal numbers behind [`crate::structs::STOP_SIGNALS`].
+/// Kept here rather than pulled from `libc` so the mapping is identical on
+/// every platform the worker builds for, including the non-Unix builds where
+/// signalling degrades to a hard kill.
+pub(crate) fn stop_signal_number(signal: &str) -> Option<i32> {
+    match signal {
+        "SIGHUP" => Some(1),
+        "SIGINT" => Some(2),
+        "SIGQUIT" => Some(3),
+        "SIGTERM" => Some(15),
+        "SIGUSR1" => Some(10),
+        "SIGUSR2" => Some(12),
+        _ => None,
+    }
+}
+
+/// Deliver a stop notice signal to a task's tracked process, without waiting.
+///
+/// Returns `true` when a signal was actually delivered. `false` means the
+/// caller should fall back to a hard stop: there is no process to signal, the
+/// platform has no signals, or the signal name is not one Legion delivers.
+///
+/// Unlike [`reap_task_process`] this leaves `instance.child` / `instance.pid`
+/// in place — the process is still running, the worker's supervisor still
+/// polls it for exit, and the reaper still needs the handle to kill it at the
+/// deadline.
+pub(crate) fn signal_task_process(
+    allocation_id: i64,
+    task_name: &str,
+    instance: &TaskInstance,
+    runtime: &str,
+    signal: &str,
+) -> bool {
+    let Some(pid) = instance
+        .child
+        .as_ref()
+        .map(|child| child.id())
+        .or(instance.pid)
+    else {
+        return false;
+    };
+    let Some(number) = stop_signal_number(signal) else {
+        warn!(
+            allocation_id,
+            task_name, runtime, signal, "Unknown stop signal; falling back to a hard stop"
+        );
+        return false;
+    };
+
+    #[cfg(unix)]
+    {
+        // Tasks are spawned into their own session (`setsid` in
+        // `spawn_task_process`), so signalling the process GROUP reaches a
+        // shell-wrapped task's children too — the common case where the
+        // tracked pid is `sh -c` and the real workload is its child. A
+        // negative pid is the POSIX spelling for "the group".
+        let delivered = unsafe { libc::kill(-(pid as i32), number) } == 0
+            || unsafe { libc::kill(pid as i32, number) } == 0;
+        if delivered {
+            info!(
+                allocation_id,
+                task_name, runtime, pid, signal, "Sent stop signal to task process"
+            );
+        } else {
+            // ESRCH — already gone. That is a successful stop, and the
+            // reaper will notice the exit on its next tick.
+            debug!(
+                allocation_id,
+                task_name, runtime, pid, signal, "Task process was already gone when signalled"
+            );
+        }
+        // Either way there is nothing left to hard-kill right now.
+        true
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (allocation_id, task_name, runtime, number, pid);
+        false
     }
 }
 
@@ -194,6 +358,15 @@ pub struct TaskInstance {
     /// real mounts; host-process runtimes just read `LEGION_VOLUME_*` from
     /// [`Self::extra_env`], which the worker already filled in.
     pub volumes: Vec<MountedVolume>,
+    /// What worker core decided for this allocation's CPU and memory (see
+    /// [`ResourceAssignment`]), filled in before `prepare()` for every
+    /// runtime whose [`TaskPlugin::resource_enforcement`] is not
+    /// `Unsupported`.
+    ///
+    /// `None` means nothing is governed — enforcement off, a non-Linux
+    /// worker, or an unported runtime — and a plugin that ignores the field
+    /// entirely behaves exactly as it does today.
+    pub resource_assignment: Option<ResourceAssignment>,
 }
 
 impl TaskInstance {
@@ -307,10 +480,53 @@ pub trait TaskPlugin: Send + Sync {
         false
     }
 
+    /// Where this runtime's tasks see their task directory, when that is not
+    /// the host path.
+    ///
+    /// `None` (the default) means the task shares the host filesystem, so a
+    /// file-delivery destination is a host-absolute path and anything goes —
+    /// the `exec` runtime's position. `Some(root)` means the worker mounts
+    /// the task directory at `root` inside an isolated filesystem, and every
+    /// declared destination (`kvInjections.files[].path`, identity
+    /// `file.path`) must resolve under it, because nothing else is reachable
+    /// from in there. Relative destinations resolve against `root`.
+    ///
+    /// Admission enforces the rule; the worker re-checks before joining a
+    /// declared path onto the host task directory (the same two-layer stance
+    /// identity naming already takes for traversal).
+    fn file_delivery_root(&self) -> Option<&'static str> {
+        None
+    }
+
     /// Whether this runtime can deliver a Unix signal to the running task (needed
     /// for an identity with `changeMode: signal`).
     fn supports_signal(&self) -> bool {
         false
+    }
+
+    /// Deliver a Unix signal (by name, e.g. `"SIGHUP"`) to the running task.
+    ///
+    /// The default signals the tracked pid, which is correct wherever the
+    /// tracked process *is* the workload — the `exec` runtime, and any plugin
+    /// that spawns its task directly. Isolating runtimes override it to reach
+    /// inside: for a container the tracked pid is the runtime CLI supervisor,
+    /// and signaling that kills the supervisor while the container runs on.
+    ///
+    /// Called by the worker for `changeMode: signal` identity refreshes and by
+    /// graceful stop. A runtime that returns `false` from
+    /// [`TaskPlugin::supports_signal`] is never asked (admission rejects the
+    /// specs that would ask), so the default is a safety net, not a contract.
+    fn signal(
+        &self,
+        allocation: &Allocation,
+        _task: &TaskConfig,
+        instance: &mut TaskInstance,
+        signal: &str,
+    ) -> R<()> {
+        let pid = instance.pid.with_context(|| {
+            format!("allocation {} has no tracked pid to signal", allocation.id)
+        })?;
+        crate::signals::send_signal(pid, signal)
     }
 
     /// Whether the task's execution is a host process this worker tracks —
@@ -347,6 +563,22 @@ pub trait TaskPlugin: Send + Sync {
 
     fn supports_artifacts(&self) -> bool {
         false
+    }
+
+    /// How this runtime participates in worker-enforced resource placement
+    /// (see [`ResourceEnforcement`] and `docs/resource-enforcement.md`).
+    ///
+    /// The default is `Unsupported`: worker core computes no assignment and
+    /// touches no cgroup, so `resources` stay scheduling-only — exactly the
+    /// behavior every runtime had before this method existed, which is what
+    /// keeps third-party dylib plugins working untouched.
+    ///
+    /// Opting in is one line for a runtime whose task is a host process
+    /// (`WorkerCgroup` + [`join_assignment_cgroup`] at spawn) and one field
+    /// read for a runtime that confines its own workload (`RuntimeApplied`,
+    /// which the `container` runtime writes into the generated OCI spec).
+    fn resource_enforcement(&self) -> ResourceEnforcement {
+        ResourceEnforcement::Unsupported
     }
 
     /// Desugars runtime-config fields into artifacts (artifact system plan §8).
@@ -413,26 +645,48 @@ pub trait TaskPlugin: Send + Sync {
         Ok(())
     }
 
-    /// Stop an allocation, told *why* it is being stopped.
+    /// Begin stopping an allocation, told *why* and *how*.
     ///
-    /// This is the form the worker calls. The default delegates to
-    /// [`TaskPlugin::stop`], so a runtime that does not care about the cause
-    /// — and every out-of-tree plugin compiled before this method existed —
-    /// keeps working untouched.
+    /// This is the form the worker calls, and it is the **notice**, not the
+    /// kill: deliver `ctx.signal` and return promptly. Returning `Ok(true)`
+    /// means "a notice was delivered, the process is still running" — the
+    /// worker then holds the allocation in its terminating set until the
+    /// process exits or `ctx.deadline` passes, and calls
+    /// [`TaskPlugin::destroy`] at whichever comes first. `Ok(false)` means
+    /// the runtime could not signal (no tracked process, no signal support)
+    /// and the worker should tear down immediately, exactly as it did before
+    /// graceful stop existed.
     ///
-    /// Runtimes override this when the cause changes how they shut down. In
-    /// Phase 1a nothing does: [`StopContext`] carries the cause only, and
-    /// termination is still immediate for every in-tree runtime. Phase 1b
-    /// extends the context with a signal and a deadline, at which point the
-    /// exec and container runtimes grow real stop ladders here.
+    /// **Never block for the grace window here.** `stop_with` runs under the
+    /// worker's task-manager mutex, which the heartbeat, the self-fence
+    /// watchdog, health reporting and log maintenance all need; holding it
+    /// for 30s would let the manager declare the node lost and reschedule
+    /// everything on it.
+    ///
+    /// The default delivers the signal through the shared host-process path,
+    /// which is right for every runtime whose execution model is "one process
+    /// we spawned". A runtime with its own shutdown protocol (containers,
+    /// microVMs) overrides. An out-of-tree plugin compiled before this method
+    /// existed keeps its old behavior: it inherits this default, which falls
+    /// back to `Ok(false)` -> immediate `stop()` + `destroy()` when it tracks
+    /// no host process.
     fn stop_with(
         &self,
         allocation: &Allocation,
         task: &TaskConfig,
         instance: &mut TaskInstance,
-        _ctx: &StopContext,
-    ) -> R<()> {
-        self.stop(allocation, task, instance)
+        ctx: &StopContext,
+    ) -> R<bool> {
+        if !self.supervises_process() {
+            return Ok(false);
+        }
+        Ok(signal_task_process(
+            allocation.id,
+            &task.name,
+            instance,
+            self.name(),
+            &ctx.signal,
+        ))
     }
 
     fn destroy(
@@ -443,6 +697,52 @@ pub trait TaskPlugin: Send + Sync {
     ) -> R<()> {
         Ok(())
     }
+
+    /// How strong this runtime's network gate is for a provisional start held
+    /// at gate `boot` (docs/edge-boot.md).
+    ///
+    /// The default is [`NetworkGate::Advisory`]: the worker still withholds
+    /// service registration and the node-local upstream forwarders (both fall
+    /// out of the allocation not being in the store yet), but nothing stops
+    /// the workload dialing out through the host's own stack. That is the
+    /// honest answer for host-process runtimes, and it is stated as a
+    /// limitation in the public doc rather than papered over.
+    fn network_gate(&self) -> NetworkGate {
+        NetworkGate::Advisory
+    }
+
+    /// Open or shut this allocation's network.
+    ///
+    /// Called with `open: false` immediately before `start` when a
+    /// provisional allocation is held at gate `boot`, and with `open: true`
+    /// when it is ratified. Runtimes reporting [`NetworkGate::Advisory`] may
+    /// leave this as the no-op default.
+    fn set_network_gate(
+        &self,
+        _allocation: &Allocation,
+        _task: &TaskConfig,
+        _instance: &mut TaskInstance,
+        _open: bool,
+    ) -> R<()> {
+        Ok(())
+    }
+}
+
+/// How much a runtime's `boot`-gate network hold is actually worth.
+///
+/// This asymmetry is deliberate and load-bearing for the security story:
+/// untrusted code belongs in a microVM, which is the same advice
+/// `docs/task-runtime-sandbox.md` already gives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetworkGate {
+    /// A real boundary: the workload physically cannot reach the network
+    /// before ratification (a microVM whose only interface is held down, or
+    /// one with no interface at all).
+    Enforced,
+    /// Legion withholds what it controls — service registration and the
+    /// node-local forwarders — but the workload shares the host's network
+    /// stack and can still reach the outside world.
+    Advisory,
 }
 
 pub struct LoadedTaskPlugin {
@@ -517,6 +817,10 @@ pub fn validate_job_config(config: &JobConfig) -> R<()> {
         task.validate_identities()?;
         task.validate_artifacts()?;
         task.validate_actions()?;
+        task.validate_stop()?;
+        task.validate_disruption()?;
+        task.validate_speculative_start()
+            .map_err(|err| anyhow!(err))?;
         if !task.artifacts.is_empty() {
             registry.load_plugin(&task.runtime, false)?;
             let plugin = registry
@@ -572,6 +876,22 @@ pub fn validate_job_config(config: &JobConfig) -> R<()> {
                         identity.name
                     );
                 }
+            }
+        }
+        // Resource rules that only bite on a runtime the worker can actually
+        // confine. Checked at admission so a spec that would be silently
+        // meaningless (or unimplementable) fails at `job validate` instead of
+        // at the node.
+        {
+            registry.load_plugin(&task.runtime, false)?;
+            let plugin = registry
+                .plugin(&task.runtime)
+                .context("task plugin loaded but missing")?;
+            if plugin.resource_enforcement() != ResourceEnforcement::Unsupported {
+                validate_governed_resources(task)?;
+            }
+            if let Some(root) = plugin.file_delivery_root() {
+                validate_file_delivery_paths(task, root)?;
             }
         }
         if task.schedule.is_some() && task.lifecycle != TaskLifecycle::Batch {
@@ -715,6 +1035,133 @@ pub fn validate_job_config(config: &JobConfig) -> R<()> {
     Ok(())
 }
 
+/// Resolve a declared file-delivery destination against an isolating
+/// runtime's task-dir mount, returning the path *relative to the task
+/// directory* — which is exactly what the worker joins onto the host task dir.
+///
+/// Accepts a relative path (resolved against `root`) or an absolute path
+/// inside `root`. Rejects anything else, including `..` traversal that would
+/// climb out, so the check is the same at admission and on the worker.
+pub fn resolve_task_dir_destination(root: &str, declared: &str) -> Result<PathBuf, String> {
+    let declared = declared.trim();
+    if declared.is_empty() {
+        return Err("path cannot be empty".to_string());
+    }
+    let path = std::path::Path::new(declared);
+    let relative = if path.is_absolute() {
+        path.strip_prefix(root).map_err(|_| {
+            format!(
+                "{declared:?} is outside the container task directory; use a path under {root} \
+                 (or a relative path), or switch to env delivery"
+            )
+        })?
+    } else {
+        path
+    };
+
+    // Normalize, refusing any component that could climb out. `.` is dropped;
+    // `..` is a hard error rather than something to resolve, so the message
+    // stays about the destination the author wrote.
+    let mut normalized = PathBuf::new();
+    for component in relative.components() {
+        match component {
+            std::path::Component::Normal(part) => normalized.push(part),
+            std::path::Component::CurDir => {}
+            std::path::Component::RootDir if normalized.as_os_str().is_empty() => {}
+            _ => {
+                return Err(format!(
+                    "{declared:?} escapes the container task directory; use a path under {root}"
+                ))
+            }
+        }
+    }
+    if normalized.as_os_str().is_empty() {
+        return Err(format!(
+            "{declared:?} names the task directory itself, not a file inside it"
+        ));
+    }
+    Ok(normalized)
+}
+
+/// Every file-delivery destination on a task whose runtime mounts its task
+/// directory must land inside that mount — the one place a jobspec is not
+/// verbatim-portable between the `exec` and `container` runtimes.
+fn validate_file_delivery_paths(task: &TaskConfig, root: &str) -> R<()> {
+    if let Some(injections) = task.kv_injections.as_ref() {
+        for file in &injections.files {
+            resolve_task_dir_destination(root, &file.path)
+                .map_err(|err| anyhow!("task {} kvInjections.files path {err}", task.name))?;
+        }
+    }
+    for identity in &task.identities {
+        let Some(file) = identity.file.as_ref() else {
+            continue;
+        };
+        resolve_task_dir_destination(root, &file.path).map_err(|err| {
+            anyhow!(
+                "task {} identity {:?}: file.path {err}",
+                task.name,
+                identity.name
+            )
+        })?;
+    }
+    Ok(())
+}
+
+/// The `resources` rules that apply to a runtime the worker can confine
+/// (`container`, `exec`) — Nomad's, because the semantics are Nomad's.
+///
+/// Both rules reject specs that were previously accepted-and-ignored, which
+/// is deliberate: `cores: 1.5` was silently rounded on macOS and dropped on
+/// Linux, and `cores` + `cpu` together asked for two different CPU contracts
+/// on one task. Every message names the fix.
+fn validate_governed_resources(task: &TaskConfig) -> R<()> {
+    let cores = crate::worker::resources::declared_cores(&task.resources);
+    let cpu_mhz = crate::worker::resources::cpu_weight_shares(&task.resources);
+
+    if let Some(cores) = cores {
+        if cores.fract() != 0.0 {
+            bail!(
+                "task {} declares resources.cores {cores}, which must be a whole number on the \
+                 {} runtime: `cores` reserves exclusive CPUs and a cpuset cannot hold a fraction \
+                 of one. Round it, or use `cpu` (MHz) for a proportional share instead",
+                task.name,
+                task.runtime,
+            );
+        }
+        if cpu_mhz.is_some() {
+            bail!(
+                "task {} declares both resources.cores and resources.cpu: they are two different \
+                 CPU contracts (exclusive whole CPUs vs. a proportional share of the shared \
+                 pool) and cannot both hold. Declare `cores` for latency-sensitive work, or \
+                 `cpu` (MHz) for everything else",
+                task.name,
+            );
+        }
+    }
+
+    // An explicit `config.cgroup` on an exec task opts it out of Legion's
+    // hierarchy, so Legion cannot promise exclusivity inside it.
+    if cores.is_some() {
+        let named_cgroup = task
+            .config
+            .get("cgroup")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        if let Some(cgroup) = named_cgroup {
+            bail!(
+                "task {} declares resources.cores together with config.cgroup ({cgroup:?}): an \
+                 explicit cgroup is one Legion does not manage, so it cannot fence other tasks \
+                 off the cores you reserved. Drop `cores` (use `cpu` MHz instead), or drop \
+                 `cgroup` and let the worker place the task",
+                task.name,
+            );
+        }
+    }
+    Ok(())
+}
+
 fn validate_task_dependencies(config: &JobConfig) -> R<()> {
     let mut task_lookup: HashMap<String, &TaskConfig> = HashMap::new();
     for task in &config.tasks {
@@ -838,6 +1285,7 @@ fn load_task_plugin(name: &str) -> R<LoadedTaskPlugin> {
             let path = paths.dylib.to_string_lossy().into_owned();
             unsafe {
                 let lib = Library::new(&path)?;
+                check_task_plugin_abi(&lib, other)?;
                 let plugin = {
                     let func: Symbol<unsafe extern "C" fn() -> Box<dyn TaskPlugin>> =
                         lib.get(b"get")?;
@@ -846,6 +1294,33 @@ fn load_task_plugin(name: &str) -> R<LoadedTaskPlugin> {
                 Ok(LoadedTaskPlugin::new(plugin, Some(lib)))
             }
         }
+    }
+}
+
+/// Refuse a dylib whose `TaskPlugin` vtable predates this build.
+///
+/// A missing symbol is treated as a mismatch, not as "assume compatible":
+/// every plugin that predates [`TASK_PLUGIN_ABI_VERSION`] also predates the
+/// trait changes the constant exists to guard, so the two cases need the same
+/// answer. Both produce an error that names the rebuild.
+unsafe fn check_task_plugin_abi(lib: &Library, name: &str) -> R<()> {
+    let declared: Option<u32> = lib
+        .get::<unsafe extern "C" fn() -> u32>(TASK_PLUGIN_ABI_SYMBOL)
+        .ok()
+        .map(|symbol| symbol());
+    match declared {
+        Some(version) if version == TASK_PLUGIN_ABI_VERSION => Ok(()),
+        Some(version) => bail!(
+            "task plugin {name} was built against task-plugin ABI {version}, but this \
+             manager/worker speaks ABI {TASK_PLUGIN_ABI_VERSION}. Rebuild the plugin against \
+             this Legion version (see docs/task-runtime-plugins.md)"
+        ),
+        None => bail!(
+            "task plugin {name} declares no task-plugin ABI version, so it predates ABI \
+             {TASK_PLUGIN_ABI_VERSION} and its TaskPlugin vtable cannot be trusted. Add \
+             `legion::declare_task_plugin_abi!();` beside the plugin's `get` constructor and \
+             rebuild (see docs/task-runtime-plugins.md)"
+        ),
     }
 }
 
@@ -954,14 +1429,19 @@ mod tests {
     }
 
     #[test]
-    fn stop_with_falls_back_to_stop_for_plugins_that_do_not_override_it() -> R<()> {
-        // The ABI promise of Phase 1a: adding the cause did NOT break any
-        // plugin. A runtime that only knows `stop` is still stopped.
+    fn a_plugin_that_supervises_no_process_declines_the_stop_notice() -> R<()> {
+        // Phase 1b changed what `stop_with` means: it is now "deliver the
+        // notice and return", reporting whether a notice was actually
+        // delivered. A runtime that tracks no host process cannot deliver
+        // one, and says so — which is the signal the worker uses to tear the
+        // allocation down immediately, exactly as it did before grace
+        // existed. `stop()` is still what stops it; the difference is that
+        // the worker now calls it via `destroy` rather than via `stop_with`.
         let plugin = LegacyStopPlugin::default();
         let mut instance = TaskInstance::default();
         let ctx = StopContext::new(crate::structs::StopCause::Preempted);
 
-        plugin.stop_with(
+        let signalled = plugin.stop_with(
             &alloc(),
             &TaskConfig::new("legacy-task", "legacy-stop"),
             &mut instance,
@@ -969,10 +1449,55 @@ mod tests {
         )?;
 
         assert!(
-            plugin.stopped.load(std::sync::atomic::Ordering::SeqCst),
-            "stop_with must delegate to stop when a plugin does not override it"
+            !signalled,
+            "a runtime with no tracked process must report that no notice was delivered"
         );
         Ok(())
+    }
+
+    #[test]
+    fn the_stop_context_carries_the_whole_ladder() {
+        let ctx = StopContext::with_ladder(
+            crate::structs::StopCause::Preempted,
+            "SIGQUIT",
+            std::time::Duration::from_secs(45),
+        );
+        assert_eq!(ctx.signal, "SIGQUIT");
+        assert_eq!(ctx.grace, std::time::Duration::from_secs(45));
+        assert!(!ctx.expired(), "a fresh 45s window is not expired");
+
+        // The zero-grace case is the degenerate ladder a `killAfter: 0s`
+        // would produce: the deadline is already here, so the reaper takes it
+        // on its next tick rather than waiting.
+        let immediate = StopContext::with_ladder(
+            crate::structs::StopCause::Stop,
+            "SIGTERM",
+            std::time::Duration::ZERO,
+        );
+        assert!(immediate.expired());
+    }
+
+    #[test]
+    fn stop_signals_map_to_their_portable_numbers() {
+        // The mapping is hard-coded rather than pulled from libc so it is
+        // identical on every platform the worker builds for.
+        assert_eq!(stop_signal_number("SIGTERM"), Some(15));
+        assert_eq!(stop_signal_number("SIGINT"), Some(2));
+        assert_eq!(stop_signal_number("SIGQUIT"), Some(3));
+        assert_eq!(stop_signal_number("SIGHUP"), Some(1));
+        assert_eq!(stop_signal_number("SIGUSR1"), Some(10));
+        assert_eq!(stop_signal_number("SIGUSR2"), Some(12));
+        // SIGKILL is deliberately absent: it is the END of the ladder, not a
+        // notice, and letting a task ask for it as `stop.signal` would mean
+        // opting into no grace at all while looking like it had some.
+        assert_eq!(stop_signal_number("SIGKILL"), None);
+        // Every signal the jobspec accepts must be deliverable.
+        for signal in crate::structs::STOP_SIGNALS {
+            assert!(
+                stop_signal_number(signal).is_some(),
+                "{signal} is offered in the jobspec but cannot be delivered"
+            );
+        }
     }
 
     #[test]
@@ -1055,6 +1580,7 @@ mod tests {
     #[test]
     fn service_task_cannot_depend_on_service_completion() {
         let config = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "invalid".into(),
@@ -1116,6 +1642,7 @@ mod tests {
     #[test]
     fn non_batch_task_cannot_define_schedule() {
         let config = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "invalid".into(),
@@ -1137,6 +1664,7 @@ mod tests {
     #[test]
     fn sidecar_requires_primary_in_group() {
         let config = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "invalid".into(),
@@ -1156,6 +1684,7 @@ mod tests {
     #[test]
     fn validates_default_rollout_strategy() -> R<()> {
         let config = JobConfig {
+            priority: Default::default(),
             rollout: Some(crate::structs::RolloutConfig {
                 strategy: Some("default".into()),
                 ..Default::default()
@@ -1176,6 +1705,7 @@ mod tests {
     #[test]
     fn rejects_unknown_rollout_strategy() {
         let config = JobConfig {
+            priority: Default::default(),
             rollout: Some(crate::structs::RolloutConfig {
                 strategy: Some("does-not-exist".into()),
                 ..Default::default()
@@ -1211,6 +1741,7 @@ mod tests {
     #[test]
     fn rejects_create_first_rollout_on_stateful_task() {
         let config = JobConfig {
+            priority: Default::default(),
             rollout: Some(crate::structs::RolloutConfig {
                 replacement: Some(RolloutReplacement::CreateFirst),
                 ..Default::default()
@@ -1233,6 +1764,7 @@ mod tests {
     fn allows_stop_first_rollout_on_stateful_task() -> R<()> {
         // Default (stop-first) replacement on a stateful task is fine.
         let config = JobConfig {
+            priority: Default::default(),
             rollout: Some(crate::structs::RolloutConfig {
                 replacement: Some(RolloutReplacement::DestroyFirst),
                 ..Default::default()
@@ -1246,6 +1778,7 @@ mod tests {
 
         // No rollout block at all is also fine.
         let no_rollout = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "stateful-norollout".into(),
@@ -1266,6 +1799,7 @@ mod tests {
     #[test]
     fn accepts_sequential_slots_rollout_on_slot_group() -> R<()> {
         let config = JobConfig {
+            priority: Default::default(),
             rollout: Some(crate::structs::RolloutConfig {
                 slots: Some(sequential_slots(Some(1))),
                 ..Default::default()
@@ -1282,6 +1816,7 @@ mod tests {
     fn rejects_slots_rollout_on_group_without_slot_task() {
         // Stateless group.
         let config = JobConfig {
+            priority: Default::default(),
             rollout: Some(crate::structs::RolloutConfig {
                 slots: Some(sequential_slots(None)),
                 ..Default::default()
@@ -1302,6 +1837,7 @@ mod tests {
 
         // Keyed-mode stateful group is also not a slot pool.
         let keyed = JobConfig {
+            priority: Default::default(),
             rollout: Some(crate::structs::RolloutConfig {
                 slots: Some(sequential_slots(None)),
                 ..Default::default()
@@ -1329,6 +1865,7 @@ mod tests {
     fn rejects_update_from_at_or_above_slot_count() {
         // stateful_slot_task() has count 2; updateFrom 2 would update nothing.
         let config = JobConfig {
+            priority: Default::default(),
             rollout: Some(crate::structs::RolloutConfig {
                 slots: Some(sequential_slots(Some(2))),
                 ..Default::default()
@@ -1350,6 +1887,7 @@ mod tests {
         // Global slots apply to every group; the stateless `web` group makes
         // the spec invalid, with a pointer at rolloutByGroup scoping.
         let config = JobConfig {
+            priority: Default::default(),
             rollout: Some(crate::structs::RolloutConfig {
                 slots: Some(sequential_slots(None)),
                 ..Default::default()
@@ -1374,6 +1912,7 @@ mod tests {
 
         // Scoping the slots block to the slot group fixes it.
         let scoped = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: std::collections::BTreeMap::from([(
                 "default".to_string(),
@@ -1396,6 +1935,210 @@ mod tests {
         validate_job_config(&scoped).expect("group-scoped slots block is valid");
     }
 
+    /// The path rule, at the level admission and the worker both call.
+    #[test]
+    fn file_destinations_resolve_against_the_task_dir_mount() {
+        let root = "/legion/task";
+        // Relative resolves against the mount.
+        assert_eq!(
+            resolve_task_dir_destination(root, "config/app.toml").expect("relative is in range"),
+            Path::new("config/app.toml")
+        );
+        // Absolute-in-range keeps its remainder.
+        assert_eq!(
+            resolve_task_dir_destination(root, "/legion/task/identity/token")
+                .expect("absolute in range"),
+            Path::new("identity/token")
+        );
+        // `./` noise is normalized away.
+        assert_eq!(
+            resolve_task_dir_destination(root, "./a/./b").expect("normalizes"),
+            Path::new("a/b")
+        );
+
+        // Out of range names the fix and the alternative.
+        let err = resolve_task_dir_destination(root, "/var/run/legion/token")
+            .expect_err("outside the mount");
+        assert!(err.contains("/legion/task"), "{err}");
+        assert!(err.contains("env delivery"), "{err}");
+
+        // Traversal cannot climb out, however it is spelled.
+        for escape in ["../escape", "a/../../escape", "/legion/task/../escape"] {
+            assert!(
+                resolve_task_dir_destination(root, escape).is_err(),
+                "{escape} must be refused"
+            );
+        }
+        // The mount point itself is a directory, not a destination.
+        assert!(resolve_task_dir_destination(root, "/legion/task").is_err());
+        assert!(resolve_task_dir_destination(root, "").is_err());
+    }
+
+    /// The declared roots per built-in runtime — the contract validation and
+    /// the worker's translation both key off.
+    #[test]
+    fn the_builtin_runtimes_declare_their_file_delivery_roots() {
+        assert_eq!(
+            ContainerTaskPlugin.file_delivery_root(),
+            Some("/legion/task")
+        );
+        // The exec runtime's filesystem is the host's: nothing to translate.
+        assert_eq!(ExecTaskPlugin.file_delivery_root(), None);
+        assert_eq!(LegacyStopPlugin::default().file_delivery_root(), None);
+    }
+
+    // --- resource enforcement: the interface contract, and the validation
+    // rules that come with it ---
+
+    /// The three modes, asserted generically over the trait, so the next
+    /// adopter — in-tree or dylib — inherits this suite instead of writing
+    /// one. Each mode is a promise about what worker core does on the
+    /// plugin's behalf.
+    #[test]
+    fn the_enforcement_contract_holds_for_all_three_modes() {
+        struct ModePlugin(ResourceEnforcement);
+        impl TaskPlugin for ModePlugin {
+            fn name(&self) -> &'static str {
+                "mode-plugin"
+            }
+            fn resource_enforcement(&self) -> ResourceEnforcement {
+                self.0
+            }
+        }
+
+        let mut governor = crate::worker::resources::NodeResourceGovernor::disabled();
+        let task = TaskConfig {
+            resources: json!({ "memory": 64 }),
+            ..TaskConfig::new("api", "mode-plugin")
+        };
+
+        for mode in [
+            ResourceEnforcement::Unsupported,
+            ResourceEnforcement::WorkerCgroup,
+            ResourceEnforcement::RuntimeApplied,
+        ] {
+            let plugin = ModePlugin(mode);
+            assert_eq!(plugin.resource_enforcement(), mode);
+            // A disabled governor (the default worker) never assigns,
+            // whatever the mode — the opt-in promise.
+            assert!(governor
+                .assign(1, &task, plugin.resource_enforcement())
+                .expect("disabled governor never fails")
+                .is_none());
+        }
+
+        // And a plugin that never mentions enforcement is `Unsupported`,
+        // which is what keeps unported dylib plugins behaving as today.
+        assert_eq!(
+            LegacyStopPlugin::default().resource_enforcement(),
+            ResourceEnforcement::Unsupported
+        );
+
+        // `join_assignment_cgroup` is a no-op without an assignment, so a
+        // `WorkerCgroup` plugin can call it unconditionally.
+        let mut cmd = Command::new("true");
+        crate::task_plugins::join_assignment_cgroup(&mut cmd, &TaskInstance::default())
+            .expect("no assignment is not an error");
+    }
+
+    /// The built-ins' declared modes are part of the contract: exclusivity is
+    /// only node-wide because `container` and `exec` share one hierarchy.
+    #[test]
+    fn the_builtin_runtimes_declare_their_modes() {
+        assert_eq!(
+            ContainerTaskPlugin.resource_enforcement(),
+            ResourceEnforcement::RuntimeApplied
+        );
+        assert_eq!(
+            ExecTaskPlugin.resource_enforcement(),
+            ResourceEnforcement::WorkerCgroup
+        );
+        // The sandbox runtime is the designed-for next adopter, not one yet.
+        assert_eq!(
+            SandboxTaskPlugin.resource_enforcement(),
+            ResourceEnforcement::Unsupported
+        );
+    }
+
+    /// A cpuset cannot hold half a CPU. This was silently rounded on macOS
+    /// and dropped on Linux before, so the rejection is a tightening — the
+    /// message names both fixes.
+    #[test]
+    fn governed_runtimes_reject_fractional_cores() {
+        let task = TaskConfig {
+            resources: json!({ "cores": 1.5 }),
+            config: json!({"image": "alpine", "command": ["echo", "hi"]}),
+            ..TaskConfig::new("api", "container")
+        };
+        let err = validate_job_config(&job_with(task)).expect_err("half a core is not a cpuset");
+        let message = err.to_string();
+        assert!(message.contains("whole number"), "{message}");
+        assert!(message.contains("cpu"), "{message}");
+
+        // Whole numbers are fine, on both governed runtimes.
+        for (runtime, config) in [
+            ("container", json!({"image": "alpine", "command": ["x"]})),
+            ("exec", json!({"command": ["true"]})),
+        ] {
+            validate_job_config(&job_with(TaskConfig {
+                resources: json!({ "cores": 2 }),
+                config,
+                ..TaskConfig::new("api", runtime)
+            }))
+            .expect("whole cores are valid");
+        }
+    }
+
+    /// `cores` and `cpu` are two different CPU contracts; asking for both has
+    /// no coherent meaning (Nomad's rule).
+    #[test]
+    fn governed_runtimes_reject_cores_and_cpu_together() {
+        let task = TaskConfig {
+            resources: json!({ "cores": 2, "cpu": 500 }),
+            config: json!({"image": "alpine", "command": ["echo", "hi"]}),
+            ..TaskConfig::new("api", "container")
+        };
+        let err = validate_job_config(&job_with(task)).expect_err("two CPU contracts");
+        let message = err.to_string();
+        assert!(message.contains("both"), "{message}");
+        assert!(message.contains("cores"), "{message}");
+    }
+
+    /// Legion cannot promise exclusivity inside a cgroup it does not manage.
+    #[test]
+    fn exec_rejects_cores_with_an_explicit_cgroup() {
+        let task = TaskConfig {
+            resources: json!({ "cores": 1 }),
+            config: json!({"command": ["true"], "cgroup": "workloads/demo"}),
+            ..TaskConfig::new("api", "exec")
+        };
+        let err = validate_job_config(&job_with(task)).expect_err("cannot fence a foreign cgroup");
+        let message = err.to_string();
+        assert!(message.contains("config.cgroup"), "{message}");
+        assert!(message.contains("cores"), "{message}");
+
+        // An explicit cgroup on its own is still fine — it means what it has
+        // always meant, and back-compat is the whole point.
+        validate_job_config(&job_with(TaskConfig {
+            resources: json!({ "memory": 64 }),
+            config: json!({"command": ["true"], "cgroup": "workloads/demo"}),
+            ..TaskConfig::new("api", "exec")
+        }))
+        .expect("an explicit cgroup alone stays valid");
+    }
+
+    /// An ungoverned runtime keeps accepting whatever it accepted before:
+    /// its `resources` are scheduling-only, so there is nothing to enforce
+    /// and nothing to reject.
+    #[test]
+    fn ungoverned_runtimes_keep_accepting_scheduling_only_resources() -> R<()> {
+        validate_job_config(&job_with(TaskConfig {
+            resources: json!({ "cores": 1.5, "cpu": 500 }),
+            config: json!({"image": "alpine", "command": ["/bin/sh", "-c", "sleep 1"]}),
+            ..TaskConfig::new("box", "sandbox")
+        }))
+    }
+
     #[test]
     fn builtin_plugin_schemas_have_descriptions_and_defaults() -> R<()> {
         validate_builtin_task_plugin_schemas()?;
@@ -1408,6 +2151,7 @@ mod tests {
 
     fn job_with(task: TaskConfig) -> JobConfig {
         JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: "identity-job".into(),
@@ -1438,15 +2182,55 @@ mod tests {
         validate_job_config(&job_with(task))
     }
 
+    /// Identity file delivery works in containers now that the task dir is
+    /// mounted — at a destination under the mount. The FHS-conventional path
+    /// the exec runtime uses is not reachable from inside, and the error says
+    /// so with the fix.
     #[test]
-    fn container_task_rejects_file_identity() {
-        let task = TaskConfig {
+    fn container_task_scopes_identity_files_to_the_task_dir() -> R<()> {
+        let err = validate_job_config(&job_with(TaskConfig {
             identities: vec![file_identity("aws")],
             config: json!({"image": "alpine", "command": ["echo", "hi"]}),
             ..TaskConfig::new("api", "container")
-        };
-        let err = validate_job_config(&job_with(task)).expect_err("container has no file delivery");
-        assert!(err.to_string().contains("identity file delivery"), "{err}");
+        }))
+        .expect_err("/var/run/legion/... is outside the mount");
+        let message = err.to_string();
+        assert!(message.contains("/legion/task"), "names the fix: {message}");
+        assert!(
+            message.contains("outside the container task directory"),
+            "{message}"
+        );
+
+        // The absolute in-range form, and the relative form, both work.
+        for path in ["/legion/task/identity/token", "identity/token"] {
+            validate_job_config(&job_with(TaskConfig {
+                identities: vec![WorkloadIdentity {
+                    name: "aws".into(),
+                    audience: vec!["sts.amazonaws.com".into()],
+                    file: Some(WorkloadIdentityFile {
+                        path: path.into(),
+                        mode: Some("0400".into()),
+                    }),
+                    ..Default::default()
+                }],
+                config: json!({"image": "alpine", "command": ["echo", "hi"]}),
+                ..TaskConfig::new("api", "container")
+            }))
+            .unwrap_or_else(|err| panic!("{path} should be accepted: {err}"));
+        }
+        Ok(())
+    }
+
+    /// The exec runtime is untouched: its filesystem *is* the host's, so a
+    /// host-absolute destination stays valid. This is the one place a jobspec
+    /// is not verbatim-portable between the two runtimes.
+    #[test]
+    fn exec_task_keeps_host_absolute_file_destinations() -> R<()> {
+        validate_job_config(&job_with(TaskConfig {
+            identities: vec![file_identity("aws")],
+            config: json!({"command": ["true"]}),
+            ..TaskConfig::new("api", "exec")
+        }))
     }
 
     #[test]
@@ -1466,8 +2250,12 @@ mod tests {
         validate_job_config(&job_with(task))
     }
 
+    /// The container runtime signals the container's init through its runtime
+    /// CLI, so a token can be refreshed with a signal instead of a full
+    /// container restart. (This test asserted the opposite before the signal
+    /// seam landed.)
     #[test]
-    fn container_task_rejects_signal_change_mode() {
+    fn container_task_accepts_signal_change_mode() -> R<()> {
         let identity = WorkloadIdentity {
             name: "vault".into(),
             audience: vec!["vault.internal".into()],
@@ -1481,8 +2269,53 @@ mod tests {
             config: json!({"image": "alpine", "command": ["echo", "hi"]}),
             ..TaskConfig::new("api", "container")
         };
-        let err = validate_job_config(&job_with(task)).expect_err("container cannot signal");
+        validate_job_config(&job_with(task))
+    }
+
+    /// A runtime with nothing to signal still rejects the mode at submit,
+    /// rather than accepting a refresh contract it cannot honor.
+    #[test]
+    fn sandbox_task_still_rejects_signal_change_mode() {
+        let identity = WorkloadIdentity {
+            name: "vault".into(),
+            audience: vec!["vault.internal".into()],
+            env: Some("VAULT_TOKEN".into()),
+            change_mode: ChangeMode::Signal,
+            change_signal: Some("SIGHUP".into()),
+            ..Default::default()
+        };
+        let task = TaskConfig {
+            identities: vec![identity],
+            config: json!({"image": "alpine", "command": ["/bin/sh", "-c", "sleep 1"]}),
+            ..TaskConfig::new("box", "sandbox")
+        };
+        let err = validate_job_config(&job_with(task)).expect_err("sandbox cannot signal");
         assert!(err.to_string().contains("signaling"), "{err}");
+    }
+
+    /// The trait default is the pre-existing worker behavior: signal the
+    /// tracked pid. A plugin that never overrides `signal` keeps it, and a
+    /// plugin with no tracked process gets an error naming the allocation
+    /// rather than a silent no-op.
+    #[test]
+    fn default_signal_targets_the_tracked_pid() -> R<()> {
+        let plugin = LegacyStopPlugin::default();
+        let task = TaskConfig::new("legacy-task", "legacy-stop");
+
+        let mut empty = TaskInstance::default();
+        let err = plugin
+            .signal(&alloc(), &task, &mut empty, "SIGHUP")
+            .expect_err("no pid to signal");
+        assert!(err.to_string().contains("no tracked pid"), "{err}");
+
+        // Our own pid, with a signal that is a no-op for a process that does
+        // not handle it: proves the default reaches kill(2) successfully.
+        let mut instance = TaskInstance {
+            pid: Some(std::process::id()),
+            ..TaskInstance::default()
+        };
+        plugin.signal(&alloc(), &task, &mut instance, "SIGWINCH")?;
+        Ok(())
     }
 
     #[test]

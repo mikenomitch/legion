@@ -6,8 +6,8 @@
 //! parameter as a single staged file — no network involved, which makes it a
 //! self-contained example of the dylib fetcher contract:
 //!
-//! ```jsonnet
-//! artifacts: [{ source: 'demo://example/hello.txt?content=hi', name: 'hello' }]
+//! ```nickel
+//! artifacts = [{ source = "demo://example/hello.txt?content=hi", name = "hello" }]
 //! ```
 //!
 //! The host resolves unknown schemes to `plugins/artifacts/<scheme>/` and

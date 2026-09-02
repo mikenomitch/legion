@@ -289,7 +289,7 @@ function TemplateDetailContent() {
   const [publishError, setPublishError] = createSignal('')
   createEffect(() => {
     const current = template()
-    if (current && !editorOpen()) setEditorSource(current.sourceJsonnet)
+    if (current && !editorOpen()) setEditorSource(current.sourceNickel)
   })
 
   const publishVersion = async (event: Event) => {
@@ -299,7 +299,7 @@ function TemplateDetailContent() {
     try {
       await managerClient.upsertJobTemplate({
         name: templateName(),
-        sourceJsonnet: editorSource(),
+        sourceNickel: editorSource(),
       })
       setEditorOpen(false)
       setVersion(undefined)
@@ -491,7 +491,7 @@ function TemplateDetailContent() {
                 title="Source"
                 description={`v${current().version}, created ${formatDate(current().createdAt)}${current().createdBy ? ` by ${current().createdBy}` : ''}.`}
               >
-                <CodeBlock code={current().sourceJsonnet} maxHClass="max-h-[36rem]" label="template source" />
+                <CodeBlock code={current().sourceNickel} maxHClass="max-h-[36rem]" label="template source" />
               </SectionCard>
             </div>
           </>

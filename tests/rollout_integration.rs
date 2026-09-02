@@ -44,6 +44,7 @@ fn insert_node(store: &Store, id: &str) -> R<()> {
         dynamic_attrs: "{}".into(),
         health_checks: json!({ "worker": "pass" }).to_string(),
         last_heartbeat: "2023-01-01T00:00:00Z".into(),
+        heartbeat_source: String::new(),
     };
     store.insert_node(node)?;
     Ok(())
@@ -53,7 +54,7 @@ fn run_request(jobspec: String, name: &str) -> RunJobRequest {
     RunJobRequest {
         parsed_jobspec: jobspec,
         submissions: vec![Submission {
-            path: format!("{name}.jsonnet"),
+            path: format!("{name}.ncl"),
             content: name.to_string(),
             is_primary: true,
         }],

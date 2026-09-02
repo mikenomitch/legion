@@ -8,7 +8,19 @@ set -euo pipefail
 NODE_EXPORTER_VERSION="${node_exporter_version}"
 
 DEBIAN_FRONTEND=noninteractive apt-get update -y
-DEBIAN_FRONTEND=noninteractive apt-get install -y chrony jq unzip awscli gettext-base
+DEBIAN_FRONTEND=noninteractive apt-get install -y chrony jq unzip gettext-base curl
+
+# AWS CLI v2 from the bundled installer, NOT `apt-get install awscli`:
+# Ubuntu 24.04 (noble) dropped the awscli package from the archive
+# entirely, so the apt route fails the whole cloud-init run with
+# "Package 'awscli' has no installation candidate". The archive's v1 was
+# also behind the commands the campaign scripts use.
+if ! command -v aws >/dev/null 2>&1; then
+  curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
+  unzip -q /tmp/awscliv2.zip -d /tmp
+  /tmp/aws/install
+  rm -rf /tmp/aws /tmp/awscliv2.zip
+fi
 
 # node_exporter: pinned release, dedicated user, systemd-managed.
 useradd --no-create-home --shell /usr/sbin/nologin node_exporter || true
@@ -37,3 +49,30 @@ systemctl enable --now node_exporter
 
 # Directories the campaign scripts install into.
 mkdir -p /opt/legion/bin /opt/legion/configs /var/lib/legion
+
+# Put the store on local NVMe when the instance type has any. Every raft
+# commit fsyncs, and on gp3 that fsync — not the scheduler — caps
+# control-plane throughput: the same code and topology measured ~86
+# heartbeats/sec on gp3 against ~2000/sec on NVMe
+# (experiments/heartbeat-commit-probe.sh, 2026-08-03). Instances without
+# instance storage (the spot workers, the loadgen) simply skip this and
+# keep using the EBS root, which is fine — neither runs a raft store.
+#
+# Identified by model string rather than device name: the NVMe numbering
+# is not stable across instance types, and on Nitro the EBS root is also
+# an nvme* device, so /dev/nvme1n1 is a guess and this is not.
+INSTANCE_STORE=$(lsblk -dno NAME,MODEL 2>/dev/null |
+  awk '/Instance Storage/ { print "/dev/" $1; exit }')
+if [ -n "$${INSTANCE_STORE}" ]; then
+  # ext4, not xfs: e2fsprogs is always present on the base image and
+  # xfsprogs is not, and this must not add a package dependency to a
+  # first-boot script whose failure aborts the whole cloud-init run.
+  mkfs.ext4 -F -q "$${INSTANCE_STORE}"
+  mount -o noatime "$${INSTANCE_STORE}" /var/lib/legion
+  # Deliberately NOT added to /etc/fstab. The volume is ephemeral and
+  # comes back blank (and unformatted) after any stop/start, so an fstab
+  # entry would fail the next boot rather than help it. The rig recreates
+  # instances instead of stopping them.
+  echo "instance store $${INSTANCE_STORE} mounted at /var/lib/legion" \
+    >/var/log/legion-instance-store.log
+fi

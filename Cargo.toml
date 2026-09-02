@@ -8,8 +8,11 @@ edition = "2021"
 [dependencies]
 clap = { version = "4.5.48", features = ["cargo", "derive"] }
 futures = "0.3"
-# jsonnet-rs = "0.17.0"
-jsonnet-rs = { git = "https://github.com/mikenomitch/rust-jsonnet" }
+# Nickel is Legion's configuration language: job specs, manager/worker
+# configs, and ACL policies are all `.ncl` files evaluated to JSON. Default
+# features (repl, markdown, doc, format) pull in rustyline/topiary/tree-sitter
+# and are not used by the embedded evaluator.
+nickel-lang-core = { version = "0.18.0", default-features = false }
 jsonwebtoken = "9.1.0"
 libloading = "0.8.1"
 prost = "0.13.3"
@@ -110,13 +113,38 @@ criterion = "0.5.1"
 [build-dependencies]
 tonic-build = "0.12.3"
 
+# Benchmarks all live under `benchmarks/` — the Criterion targets below in
+# `benchmarks/micro/`, alongside the scenario-driven scheduler harness
+# (`benchmarks/scheduler/`) and the AWS comparison rig (`benchmarks/aws/`).
+# That is why each target names its `path` instead of relying on Cargo's
+# default `benches/` discovery. See `benchmarks/README.md`.
 [[bench]]
 name = "scheduler_bench"
+path = "benchmarks/micro/scheduler_bench.rs"
 harness = false
 
 [[bench]]
 name = "eval_critical_path_bench"
+path = "benchmarks/micro/eval_critical_path_bench.rs"
 harness = false
+
+# The AWS rig's native job submitter. Not part of the product: it exists
+# because the rig's per-job `legion job run` process spawn ceilinged at ~36-103
+# jobs/sec and was being reported as Legion's throughput. It links against this
+# crate's own generated client so the proto has exactly one source of truth.
+#
+# Behind a feature so an ordinary `cargo build` does not link a second copy of
+# the binary for a tool nobody but the rig runs. CI lints it via
+# `--all-features`; `benchmarks/aws/scripts/local-smoke.sh` and
+# `build-and-upload.sh` build it explicitly.
+[[bin]]
+name = "legion-loadgen"
+path = "benchmarks/loadgen/main.rs"
+required-features = ["loadgen"]
+
+[features]
+# Builds the `legion-loadgen` bin above. No effect on the `legion` binary.
+loadgen = []
 
 # Profile for shipped binaries: `cargo build --profile dist`.
 #
@@ -135,6 +163,19 @@ harness = false
 # the final link, taking several minutes against about one for `--release`. That
 # is why this is a separate profile: `--release` stays fast for local work, and
 # only release artifacts pay for the smaller binary. Debug builds are unaffected.
+# Same optimizations as `dist` minus the parts that dominate LINK time:
+# `fat` LTO with one codegen unit takes ~25 minutes on the benchmark
+# operator box, which is longer than some measurement windows allow. Thin
+# LTO across 16 units builds in roughly a third of that and is within a
+# few percent at runtime. Use it when the alternative is no measurement at
+# all -- and say so, because it is NOT the shipping binary and a cell
+# built this way is not directly comparable to a `dist` cell.
+[profile.distfast]
+inherits = "release"
+lto = "thin"
+codegen-units = 16
+strip = "symbols"
+
 [profile.dist]
 inherits = "release"
 # Collapse dead code and duplicated generics across every crate in the tree.

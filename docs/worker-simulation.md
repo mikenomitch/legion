@@ -74,7 +74,7 @@ legion node list -j | jq '[.data[] | select(.config_attrs.simulated)] | length'
 
 Simulated nodes are **not capacity**. Keep simulated fleets out of
 production clusters, or at minimum keep real workloads off them with a
-constraint (for example `constraints: { simulated: { operator: "is_not_set" } }`).
+constraint (for example `constraints = { simulated = { operator = "is_not_set" } }`).
 
 ## Behavior and fidelity
 
@@ -83,8 +83,12 @@ constraint (for example `constraints: { simulated: { operator: "is_not_set" } }`
   ±10%-jittered by the same code as a real worker — see
   [architecture-managers-workers.md](architecture-managers-workers.md)),
   30s health-check reports, exponential retry with re-registration on
-  `Unauthenticated`. The manager's lost-node detection (no heartbeat
-  for 10s) applies to simulated nodes unchanged.
+  `Unauthenticated`. A sim node reports its resolved cadence at
+  registration and honors a manager-served interval (with the same one-shot
+  re-phase) exactly as a real worker does, so a scale run measures the real
+  controller. The manager's lost-node detection applies unchanged — the
+  window is `missedBeatsBeforeLost x that node's interval`, 10s at the
+  defaults ([heartbeat-cadence-and-scale.md](heartbeat-cadence-and-scale.md)).
 - **Shared channels.** Nodes multiplex over a small pool of gRPC
   channels (one per 256 nodes, max 16), so one process holds a
   handful of connections regardless of fleet size.
@@ -102,6 +106,33 @@ constraint (for example `constraints: { simulated: { operator: "is_not_set" } }`
   cumulative failures, and acked allocations — scripts can watch this
   to confirm a fleet is healthy.
 
+## Metrics
+
+A sim host exports the ordinary worker registry, from the ordinary
+opt-in listener — set `LEGION_WORKER_TELEMETRY_PORT` and scrape
+`/metrics` as you would on any worker
+([metrics.md § Worker](metrics.md#worker)). The listener starts before
+the registration ramp, so a scrape during ramp-up shows the climb.
+
+```bash
+LEGION_WORKER_TELEMETRY_PORT=9101 legion start worker "$TOKEN" --simulate 1250
+curl -s localhost:9101/metrics | grep legion_worker_
+```
+
+The familiar families (`legion_worker_heartbeats_total`,
+`legion_worker_heartbeat_duration_seconds`,
+`legion_worker_allocations_running`) aggregate over the whole fleet —
+this is a worker process carrying N nodes, so its metrics are
+per-process, not per-node. Three more describe the fleet:
+`legion_worker_simulated_nodes`, `..._nodes_target`, and
+`legion_worker_simulated_registrations_total{outcome}`. Registered
+nodes short of target with a flat `error` counter means the ramp is
+still climbing; short of target with a rising one means it is stuck.
+
+Per-node series are deliberately not exported (cardinality, and the
+manager already has that view), and OTLP push works here exactly as it
+does for a real worker.
+
 ## Limitations
 
 - `legion exec`, log streaming (`legion job logs`), and worker restart
@@ -113,6 +144,11 @@ constraint (for example `constraints: { simulated: { operator: "is_not_set" } }`
   not converge there. Use plain (checkless) noop tasks for load.
 - Failure reports, workload identity, service-discovery upstreams, and
   artifact staging are not simulated.
+- The fleet-wide allocation gauge is maintained incrementally and
+  repaired from authoritative state every 30s, so under heavy churn a
+  scrape can disagree with the manager by a few allocations; aborting a
+  fleet leaves the gauges at their teardown values rather than zero.
+  Counters and the heartbeat histogram are exact.
 - All nodes in one process share one advertised dispatch address; the
   manager's per-node connection cost is therefore understated at very
   large N (real fleets dial N addresses). Recorded in the benchmark

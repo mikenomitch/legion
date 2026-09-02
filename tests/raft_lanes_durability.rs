@@ -472,6 +472,7 @@ fn test_node_msg(id: &str) -> NodeMsg {
         pool: "default".into(),
         availability: "available".into(),
         last_heartbeat: "2023-01-01T00:00:00Z".into(),
+        heartbeat_source: String::new(),
         config_attrs: json!({ "maxAllocations": 100, "resources": {} }),
         fingerprint_attrs: json!({
             "memory_total": "4294967296",
@@ -484,6 +485,7 @@ fn test_node_msg(id: &str) -> NodeMsg {
 
 fn test_job(name: &str) -> JobConfig {
     JobConfig {
+        priority: Default::default(),
         rollout: None,
         rollout_by_group: Default::default(),
         name: name.to_string(),
@@ -494,7 +496,7 @@ fn test_job(name: &str) -> JobConfig {
 
 fn submission(name: &str, content: &str) -> Submission {
     Submission {
-        path: format!("{name}.jsonnet"),
+        path: format!("{name}.ncl"),
         content: content.to_string(),
         is_primary: true,
     }

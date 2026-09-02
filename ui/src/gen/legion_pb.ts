@@ -51,6 +51,158 @@ proto3.util.setEnumType(KvValueType, "legion.KvValueType", [
 ]);
 
 /**
+ * How far a node may get on a start before the placement is durable
+ * (docs/edge-boot.md). Both the task's `speculativeStart.mode` and a boot
+ * ticket's `legion.io/gate` claim carry one of these; the LOWER of the two
+ * always wins, so neither a jobspec nor a ticket can raise the other's
+ * ceiling.
+ *
+ * @generated from enum legion.GateLevel
+ */
+export enum GateLevel {
+  /**
+   * No speculation: today's behavior. The node is told about the allocation
+   * only after the commit. This is the default for every task.
+   *
+   * @generated from enum value: GATE_OFF = 0;
+   */
+  GATE_OFF = 0,
+
+  /**
+   * The node may fetch artifacts, pull images, build root disks, and
+   * provision (but not attach) node-local volumes before the commit. It may
+   * NOT start the workload. Nothing outside the node can observe a staged
+   * claim; the only cost of losing the race is wasted local work.
+   *
+   * @generated from enum value: GATE_STAGE = 1;
+   */
+  GATE_STAGE = 1,
+
+  /**
+   * Everything `GATE_STAGE` allows, plus booting the guest and running the
+   * workload with its network held shut. It may NOT open the network,
+   * register in service discovery, attach shared storage, or obtain any
+   * Legion-issued identity until ratified.
+   *
+   * The network gate is a real boundary for the `sandbox` runtime (the TAP
+   * device is held down with a default-drop filter) and a weaker one for
+   * host runtimes — see docs/edge-boot.md "What the gate does and does not
+   * stop".
+   *
+   * @generated from enum value: GATE_BOOT = 2;
+   */
+  GATE_BOOT = 2,
+
+  /**
+   * Everything `GATE_BOOT` allows, plus opening the network immediately.
+   * The fastest mode, and the only one where a workload that loses its race
+   * may already have produced externally visible side effects before it is
+   * killed. It still cannot obtain a Legion-issued identity or attach shared
+   * storage, so a loser can never act as the winner inside the cluster.
+   *
+   * @generated from enum value: GATE_SERVE = 3;
+   */
+  GATE_SERVE = 3,
+}
+// Retrieve enum metadata with: proto3.getEnumType(GateLevel)
+proto3.util.setEnumType(GateLevel, "legion.GateLevel", [
+  { no: 0, name: "GATE_OFF" },
+  { no: 1, name: "GATE_STAGE" },
+  { no: 2, name: "GATE_BOOT" },
+  { no: 3, name: "GATE_SERVE" },
+]);
+
+/**
+ * Why a ratification was refused. Workers treat an unrecognized value as
+ * `REFUSAL_UNSPECIFIED` and kill the work anyway — fail-closed under skew.
+ *
+ * @generated from enum legion.ClaimRefusalReason
+ */
+export enum ClaimRefusalReason {
+  /**
+   * Reason not stated (or from a newer manager than this worker knows).
+   *
+   * @generated from enum value: REFUSAL_UNSPECIFIED = 0;
+   */
+  REFUSAL_UNSPECIFIED = 0,
+
+  /**
+   * Another allocation already owns this instance id. The expected outcome
+   * of two edges racing for one sandbox: the first ratification binds, this
+   * one loses.
+   *
+   * @generated from enum value: REFUSAL_INSTANCE_CLAIMED = 1;
+   */
+  REFUSAL_INSTANCE_CLAIMED = 1,
+
+  /**
+   * The node no longer has room for the placement, as re-validated on the
+   * fresh node row inside the apply transaction.
+   *
+   * @generated from enum value: REFUSAL_NO_CAPACITY = 2;
+   */
+  REFUSAL_NO_CAPACITY = 2,
+
+  /**
+   * The node does not satisfy the task's constraints/permit, or is cordoned,
+   * draining, or lost.
+   *
+   * @generated from enum value: REFUSAL_INELIGIBLE = 3;
+   */
+  REFUSAL_INELIGIBLE = 3,
+
+  /**
+   * The claim's lease expired before the ratification reached the manager.
+   *
+   * @generated from enum value: REFUSAL_EXPIRED = 4;
+   */
+  REFUSAL_EXPIRED = 4,
+
+  /**
+   * The boot ticket was invalid: bad signature, wrong audience, wrong pool,
+   * expired, or a `jti` already spent (single-use replay).
+   *
+   * @generated from enum value: REFUSAL_TICKET_INVALID = 5;
+   */
+  REFUSAL_TICKET_INVALID = 5,
+
+  /**
+   * The job config, task, or instance named by the claim does not exist.
+   *
+   * @generated from enum value: REFUSAL_UNKNOWN_TARGET = 6;
+   */
+  REFUSAL_UNKNOWN_TARGET = 6,
+
+  /**
+   * Edge boot is disabled on this manager (`edgeBoot.enabled: false`).
+   *
+   * @generated from enum value: REFUSAL_DISABLED = 7;
+   */
+  REFUSAL_DISABLED = 7,
+
+  /**
+   * The manager failed to apply the ratification for an internal reason
+   * (a store error, a raft election in progress). Retriable within the
+   * lease; fatal at the deadline.
+   *
+   * @generated from enum value: REFUSAL_INTERNAL = 8;
+   */
+  REFUSAL_INTERNAL = 8,
+}
+// Retrieve enum metadata with: proto3.getEnumType(ClaimRefusalReason)
+proto3.util.setEnumType(ClaimRefusalReason, "legion.ClaimRefusalReason", [
+  { no: 0, name: "REFUSAL_UNSPECIFIED" },
+  { no: 1, name: "REFUSAL_INSTANCE_CLAIMED" },
+  { no: 2, name: "REFUSAL_NO_CAPACITY" },
+  { no: 3, name: "REFUSAL_INELIGIBLE" },
+  { no: 4, name: "REFUSAL_EXPIRED" },
+  { no: 5, name: "REFUSAL_TICKET_INVALID" },
+  { no: 6, name: "REFUSAL_UNKNOWN_TARGET" },
+  { no: 7, name: "REFUSAL_DISABLED" },
+  { no: 8, name: "REFUSAL_INTERNAL" },
+]);
+
+/**
  * Request payload for WorkerPreRegister.
  *
  * @generated from message legion.WorkerPreRegisterRequest
@@ -213,6 +365,55 @@ export class WorkerConfig extends Message<WorkerConfig> {
    */
   hostVolumes = "";
 
+  /**
+   * How often this worker heartbeats the manager, in seconds (worker-type
+   * config `heartbeatSeconds`). Workers clamp the value to 1..=30 and add
+   * ±10% jitter per beat. The manager marks a node lost after 10s without
+   * a heartbeat, so values above ~3 trade detection margin for load; the
+   * manager logs a warning when serving such a config. At large fleets the
+   * cadence is the manager-load knob: 10k workers at the default 2s is
+   * 5,000 heartbeats/second.
+   *
+   * Default: unset (workers use the built-in 2s default).
+   *
+   * @generated from field: optional uint32 heartbeat_seconds = 11;
+   */
+  heartbeatSeconds?: number;
+
+  /**
+   * JSON-encoded resource-enforcement settings for this worker (see
+   * docs/task-supervision.md). Shape:
+   * `{"enabled":true,"cgroupParent":"legion"}`.
+   *
+   * When enabled, a Linux worker puts each `exec` task in a cgroup v2 subtree
+   * it creates under `cgroupParent` and writes the task's `resources` there as
+   * real limits (`memory.max`, `cpu.max`), instead of treating them as
+   * scheduling arithmetic only. Off by default: turning declared resources
+   * into kernel limits can OOM-kill a workload whose declaration was only ever
+   * an estimate, so it is a deliberate per-worker choice.
+   *
+   * Default: empty string (enforcement off; `resources` stays advisory for
+   * `exec` tasks).
+   *
+   * @generated from field: string resource_enforcement = 12;
+   */
+  resourceEnforcement = "";
+
+  /**
+   * JSON-encoded edge-boot settings for this worker (see docs/edge-boot.md).
+   * Shape: `{"acceptClaims":true,"jwksRefresh":"5m","clockSkew":"30s"}`.
+   *
+   * `acceptClaims` decides whether this node serves `Worker.StartClaim` — that
+   * is, whether it will start work on a boot ticket at all. Off by default,
+   * independently of the manager's `edgeBoot.enabled`: an operator who turns
+   * the feature on cluster-wide still chooses which nodes are edges.
+   *
+   * Default: empty string (this node accepts no edge starts).
+   *
+   * @generated from field: string edge_boot = 13;
+   */
+  edgeBoot = "";
+
   constructor(data?: PartialMessage<WorkerConfig>) {
     super();
     proto3.util.initPartial(data, this);
@@ -231,6 +432,9 @@ export class WorkerConfig extends Message<WorkerConfig> {
     { no: 8, name: "max_allocations", kind: "scalar", T: 13 /* ScalarType.UINT32 */, opt: true },
     { no: 9, name: "artifacts", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 10, name: "host_volumes", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 11, name: "heartbeat_seconds", kind: "scalar", T: 13 /* ScalarType.UINT32 */, opt: true },
+    { no: 12, name: "resource_enforcement", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 13, name: "edge_boot", kind: "scalar", T: 9 /* ScalarType.STRING */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): WorkerConfig {
@@ -571,11 +775,16 @@ export class RunJobRequest extends Message<RunJobRequest> {
   submissions: Submission[] = [];
 
   /**
-   * Optional eval priority override.
+   * Optional eval-queue priority override for THIS submission.
    *
-   * Higher values are processed sooner in the eval queue.
-   * Default when omitted: manager `default_priority`
-   * (`50` in built-in config defaults).
+   * Higher values are processed sooner in the eval queue. This overrides the
+   * queue position only; it does not change the job's priority band, and so
+   * it has no effect on preemption.
+   *
+   * Default when omitted: the eval priority implied by the jobspec's
+   * `priority` band — `critical` 90, `high` 70, `elevated` 60, `normal` 50,
+   * `low` 30, `background` 15 — falling back to the manager's
+   * `defaultPriority` (50) for a job whose band cannot be resolved.
    *
    * @generated from field: optional int64 priority = 3;
    */
@@ -705,7 +914,7 @@ export class JobTemplateVariable extends Message<JobTemplateVariable> {
   /**
    * Variable key. Must match `[a-zA-Z_][a-zA-Z0-9_]*`. The rendered
    * template receives all declared keys as fields of the single `vars`
-   * object passed to its `job(vars)` function.
+   * record its `job` function is applied to.
    *
    * @generated from field: string key = 1;
    */
@@ -886,11 +1095,11 @@ export class JobTemplate extends Message<JobTemplate> {
   description?: string;
 
   /**
-   * Raw Jsonnet source of this version.
+   * Raw Nickel source of this version.
    *
-   * @generated from field: string source_jsonnet = 5;
+   * @generated from field: string source_nickel = 5;
    */
-  sourceJsonnet = "";
+  sourceNickel = "";
 
   /**
    * Declared variables from the manifest, in declaration order.
@@ -925,7 +1134,7 @@ export class JobTemplate extends Message<JobTemplate> {
     { no: 2, name: "version", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
     { no: 3, name: "latest_version", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
     { no: 4, name: "description", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
-    { no: 5, name: "source_jsonnet", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 5, name: "source_nickel", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 6, name: "variables", kind: "message", T: JobTemplateVariable, repeated: true },
     { no: 7, name: "created_at", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 8, name: "created_by", kind: "scalar", T: 9 /* ScalarType.STRING */ },
@@ -1085,12 +1294,12 @@ export class UpsertJobTemplateRequest extends Message<UpsertJobTemplateRequest> 
   name = "";
 
   /**
-   * Full Jsonnet source. Must be self-contained (imports are rejected) and
+   * Full Nickel source. Must be self-contained (imports are rejected) and
    * at most 512 KiB. See JobTemplate for the required document shape.
    *
-   * @generated from field: string source_jsonnet = 2;
+   * @generated from field: string source_nickel = 2;
    */
-  sourceJsonnet = "";
+  sourceNickel = "";
 
   constructor(data?: PartialMessage<UpsertJobTemplateRequest>) {
     super();
@@ -1101,7 +1310,7 @@ export class UpsertJobTemplateRequest extends Message<UpsertJobTemplateRequest> 
   static readonly typeName = "legion.UpsertJobTemplateRequest";
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
     { no: 1, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
-    { no: 2, name: "source_jsonnet", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "source_nickel", kind: "scalar", T: 9 /* ScalarType.STRING */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): UpsertJobTemplateRequest {
@@ -3250,6 +3459,34 @@ export class PlanJobReply extends Message<PlanJobReply> {
    */
   indexUsage: TaskIndexUsage[] = [];
 
+  /**
+   * Allocations this plan would displace to make room for `allocations`.
+   *
+   * Empty when the plan places without preemption, which is the common case:
+   * the preemption pass only runs for a task that could not otherwise be
+   * placed. Populated in `enforce` mode (what a submit would evict) and in
+   * `observe` mode (what enforce mode *would* evict, given that observe
+   * commits nothing) — so the preview answers the same question either way.
+   *
+   * This is a plan against a snapshot, not a reservation. The real submit
+   * re-plans, so the victims it takes may differ if the cluster moved in
+   * between. See docs/preemption-and-eviction.md.
+   *
+   * @generated from field: repeated legion.PlannedPreemption preemptions = 6;
+   */
+  preemptions: PlannedPreemption[] = [];
+
+  /**
+   * The cluster's preemption mode at plan time: `enforce`, `observe` or
+   * `off`. Present so a client can explain an empty `preemptions` list —
+   * "nothing needed displacing" and "preemption is off" look identical
+   * otherwise, which is exactly the discoverability failure this field
+   * exists to prevent.
+   *
+   * @generated from field: string preemption_mode = 7;
+   */
+  preemptionMode = "";
+
   constructor(data?: PartialMessage<PlanJobReply>) {
     super();
     proto3.util.initPartial(data, this);
@@ -3263,6 +3500,8 @@ export class PlanJobReply extends Message<PlanJobReply> {
     { no: 3, name: "matches_existing", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
     { no: 4, name: "same_content", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
     { no: 5, name: "index_usage", kind: "message", T: TaskIndexUsage, repeated: true },
+    { no: 6, name: "preemptions", kind: "message", T: PlannedPreemption, repeated: true },
+    { no: 7, name: "preemption_mode", kind: "scalar", T: 9 /* ScalarType.STRING */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): PlanJobReply {
@@ -3279,6 +3518,89 @@ export class PlanJobReply extends Message<PlanJobReply> {
 
   static equals(a: PlanJobReply | PlainMessage<PlanJobReply> | undefined, b: PlanJobReply | PlainMessage<PlanJobReply> | undefined): boolean {
     return proto3.util.equals(PlanJobReply, a, b);
+  }
+}
+
+/**
+ * One allocation a plan would displace.
+ *
+ * @generated from message legion.PlannedPreemption
+ */
+export class PlannedPreemption extends Message<PlannedPreemption> {
+  /**
+   * Node the victim runs on, which is also the node the preemptor would be
+   * placed on: preemption only ever frees the node it places onto.
+   *
+   * @generated from field: string node_id = 1;
+   */
+  nodeId = "";
+
+  /**
+   * Victim's job name.
+   *
+   * @generated from field: string job_id = 2;
+   */
+  jobId = "";
+
+  /**
+   * Victim's task name.
+   *
+   * @generated from field: string task_name = 3;
+   */
+  taskName = "";
+
+  /**
+   * Victim's priority band. Always strictly below the preempting job's.
+   *
+   * @generated from field: string band = 4;
+   */
+  band = "";
+
+  /**
+   * Victim's allocation ID.
+   *
+   * @generated from field: int64 allocation_id = 5;
+   */
+  allocationId = protoInt64.zero;
+
+  /**
+   * The victim's `stop.killAfter` in seconds — how long it gets between the
+   * stop signal and SIGKILL (docs/graceful-stop.md).
+   *
+   * @generated from field: uint64 kill_after_seconds = 6;
+   */
+  killAfterSeconds = protoInt64.zero;
+
+  constructor(data?: PartialMessage<PlannedPreemption>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.PlannedPreemption";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "node_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "job_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "task_name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "band", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 5, name: "allocation_id", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 6, name: "kill_after_seconds", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): PlannedPreemption {
+    return new PlannedPreemption().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): PlannedPreemption {
+    return new PlannedPreemption().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): PlannedPreemption {
+    return new PlannedPreemption().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: PlannedPreemption | PlainMessage<PlannedPreemption> | undefined, b: PlannedPreemption | PlainMessage<PlannedPreemption> | undefined): boolean {
+    return proto3.util.equals(PlannedPreemption, a, b);
   }
 }
 
@@ -3362,6 +3684,20 @@ export class TaskIndexUsage extends Message<TaskIndexUsage> {
    */
   reason = "";
 
+  /**
+   * When bounded candidate scoring engaged for any of this task's
+   * placements (the fleet-size threshold in the manager's
+   * `schedulerSettings.score_sample` was met), the number of eligible
+   * nodes actually scored per placement: the placement is the best of
+   * this many uniformly drawn feasible candidates rather than of every
+   * feasible node. 0 means every placement was scored exactly.
+   * Feasibility (constraints, permits, resources) is never sampled — a
+   * sampled placement is always a valid one.
+   *
+   * @generated from field: uint32 score_sampled = 10;
+   */
+  scoreSampled = 0;
+
   constructor(data?: PartialMessage<TaskIndexUsage>) {
     super();
     proto3.util.initPartial(data, this);
@@ -3379,6 +3715,7 @@ export class TaskIndexUsage extends Message<TaskIndexUsage> {
     { no: 7, name: "fell_back", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
     { no: 8, name: "shadow_agreement", kind: "scalar", T: 8 /* ScalarType.BOOL */, opt: true },
     { no: 9, name: "reason", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 10, name: "score_sampled", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): TaskIndexUsage {
@@ -3425,6 +3762,21 @@ export class PlannedAllocation extends Message<PlannedAllocation> {
    */
   taskName = "";
 
+  /**
+   * Ranked candidate node IDs for this placement, best first; the first
+   * entry is always node_id. At apply time the store binds the placement to
+   * the first candidate whose node epoch is unchanged since planning, so
+   * under contention the allocation may land on a lower-ranked
+   * (near-equivalent by score) candidate instead of node_id. A single entry
+   * means no fallback: the placement applies to node_id or the plan is
+   * rejected and retried. Empty only when the manager predates candidate
+   * lists. Controlled by schedulerSettings.plan_candidates; see
+   * docs/late-binding-plan-apply.md.
+   *
+   * @generated from field: repeated string candidate_nodes = 4;
+   */
+  candidateNodes: string[] = [];
+
   constructor(data?: PartialMessage<PlannedAllocation>) {
     super();
     proto3.util.initPartial(data, this);
@@ -3436,6 +3788,7 @@ export class PlannedAllocation extends Message<PlannedAllocation> {
     { no: 1, name: "node_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 2, name: "task_config_id", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
     { no: 3, name: "task_name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "candidate_nodes", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): PlannedAllocation {
@@ -3564,6 +3917,353 @@ export class StopJobReply extends Message<StopJobReply> {
 
   static equals(a: StopJobReply | PlainMessage<StopJobReply> | undefined, b: StopJobReply | PlainMessage<StopJobReply> | undefined): boolean {
     return proto3.util.equals(StopJobReply, a, b);
+  }
+}
+
+/**
+ * Request payload for ScaleTask (docs/autoscaling.md).
+ *
+ * @generated from message legion.ScaleTaskRequest
+ */
+export class ScaleTaskRequest extends Message<ScaleTaskRequest> {
+  /**
+   * Job name.
+   *
+   * @generated from field: string name = 1;
+   */
+  name = "";
+
+  /**
+   * Task group, when the job has more than one scalable task. Optional:
+   * a job with exactly one scalable task needs neither selector; an
+   * ambiguous request is rejected with the candidate list.
+   *
+   * @generated from field: optional string task_group = 2;
+   */
+  taskGroup?: string;
+
+  /**
+   * Task name, same rules as `task_group`.
+   *
+   * @generated from field: optional string task_name = 3;
+   */
+  taskName?: string;
+
+  /**
+   * The desired count. Required unless `reset` is set. Keyed stateful
+   * tasks (no count) and `count: { per: ... }` tasks are rejected.
+   *
+   * @generated from field: optional uint32 count = 4;
+   */
+  count?: number;
+
+  /**
+   * Drop the override (and any pending scale-in) and return ownership of
+   * the count to the job spec. Mutually exclusive with `count`.
+   *
+   * @generated from field: bool reset = 5;
+   */
+  reset = false;
+
+  /**
+   * Free-text audit note recorded on the override and in the
+   * `scale.applied` event.
+   *
+   * @generated from field: optional string reason = 6;
+   */
+  reason?: string;
+
+  /**
+   * Optional idempotency key. See `RunJobRequest.idempotency_key`.
+   *
+   * @generated from field: optional string idempotency_key = 7;
+   */
+  idempotencyKey?: string;
+
+  constructor(data?: PartialMessage<ScaleTaskRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ScaleTaskRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "task_group", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 3, name: "task_name", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 4, name: "count", kind: "scalar", T: 13 /* ScalarType.UINT32 */, opt: true },
+    { no: 5, name: "reset", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 6, name: "reason", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 7, name: "idempotency_key", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ScaleTaskRequest {
+    return new ScaleTaskRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ScaleTaskRequest {
+    return new ScaleTaskRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ScaleTaskRequest {
+    return new ScaleTaskRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ScaleTaskRequest | PlainMessage<ScaleTaskRequest> | undefined, b: ScaleTaskRequest | PlainMessage<ScaleTaskRequest> | undefined): boolean {
+    return proto3.util.equals(ScaleTaskRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for ScaleTask.
+ *
+ * @generated from message legion.ScaleTaskReply
+ */
+export class ScaleTaskReply extends Message<ScaleTaskReply> {
+  /**
+   * Human-readable outcome, e.g.
+   * `"web/default/web: 4 -> 6 (spec count 2; override active)"` or the
+   * deferral notice
+   * `"deferred: rollout web-7 is in progress; scale-in to 2 applies when it completes"`.
+   *
+   * @generated from field: string message = 1;
+   */
+  message = "";
+
+  /**
+   * True when replayed from a recorded result for the request's
+   * `idempotency_key` rather than applied fresh.
+   *
+   * @generated from field: bool deduplicated = 2;
+   */
+  deduplicated = false;
+
+  /**
+   * True when the request was a scale-in during an active rollout and was
+   * recorded as pending rather than applied (see ScaleTask's RPC comment).
+   *
+   * @generated from field: bool deferred = 3;
+   */
+  deferred = false;
+
+  constructor(data?: PartialMessage<ScaleTaskReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ScaleTaskReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "message", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "deduplicated", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 3, name: "deferred", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ScaleTaskReply {
+    return new ScaleTaskReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ScaleTaskReply {
+    return new ScaleTaskReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ScaleTaskReply {
+    return new ScaleTaskReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ScaleTaskReply | PlainMessage<ScaleTaskReply> | undefined, b: ScaleTaskReply | PlainMessage<ScaleTaskReply> | undefined): boolean {
+    return proto3.util.equals(ScaleTaskReply, a, b);
+  }
+}
+
+/**
+ * Request payload for GetJobScaleStatus.
+ *
+ * @generated from message legion.GetJobScaleStatusRequest
+ */
+export class GetJobScaleStatusRequest extends Message<GetJobScaleStatusRequest> {
+  /**
+   * Job name.
+   *
+   * @generated from field: string name = 1;
+   */
+  name = "";
+
+  constructor(data?: PartialMessage<GetJobScaleStatusRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetJobScaleStatusRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetJobScaleStatusRequest {
+    return new GetJobScaleStatusRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetJobScaleStatusRequest {
+    return new GetJobScaleStatusRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetJobScaleStatusRequest {
+    return new GetJobScaleStatusRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetJobScaleStatusRequest | PlainMessage<GetJobScaleStatusRequest> | undefined, b: GetJobScaleStatusRequest | PlainMessage<GetJobScaleStatusRequest> | undefined): boolean {
+    return proto3.util.equals(GetJobScaleStatusRequest, a, b);
+  }
+}
+
+/**
+ * One task's scale state (GetJobScaleStatus).
+ *
+ * @generated from message legion.TaskScaleStatus
+ */
+export class TaskScaleStatus extends Message<TaskScaleStatus> {
+  /**
+   * Task group name.
+   *
+   * @generated from field: string task_group = 1;
+   */
+  taskGroup = "";
+
+  /**
+   * Task name.
+   *
+   * @generated from field: string task_name = 2;
+   */
+  taskName = "";
+
+  /**
+   * The spec's `count.num` in the latest job config version.
+   *
+   * @generated from field: uint32 spec_count = 3;
+   */
+  specCount = 0;
+
+  /**
+   * The applied override count, when one exists.
+   *
+   * @generated from field: optional uint32 override_count = 4;
+   */
+  overrideCount?: number;
+
+  /**
+   * A recorded scale-in waiting for the active rollout to finish, when
+   * one exists.
+   *
+   * @generated from field: optional uint32 pending_count = 5;
+   */
+  pendingCount?: number;
+
+  /**
+   * The count the scheduler currently converges to
+   * (`override_count` if set, else `spec_count`).
+   *
+   * @generated from field: uint32 effective_count = 6;
+   */
+  effectiveCount = 0;
+
+  /**
+   * Who set the override: `operator` today; `autoscaler` when the policy
+   * evaluator ships.
+   *
+   * @generated from field: string source = 7;
+   */
+  source = "";
+
+  /**
+   * The audit note recorded with the override, if any.
+   *
+   * @generated from field: string reason = 8;
+   */
+  reason = "";
+
+  /**
+   * RFC 3339 timestamp of the last override write; empty when no
+   * override exists.
+   *
+   * @generated from field: string updated_at = 9;
+   */
+  updatedAt = "";
+
+  constructor(data?: PartialMessage<TaskScaleStatus>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.TaskScaleStatus";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "task_group", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "task_name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "spec_count", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 4, name: "override_count", kind: "scalar", T: 13 /* ScalarType.UINT32 */, opt: true },
+    { no: 5, name: "pending_count", kind: "scalar", T: 13 /* ScalarType.UINT32 */, opt: true },
+    { no: 6, name: "effective_count", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 7, name: "source", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 8, name: "reason", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 9, name: "updated_at", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): TaskScaleStatus {
+    return new TaskScaleStatus().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): TaskScaleStatus {
+    return new TaskScaleStatus().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): TaskScaleStatus {
+    return new TaskScaleStatus().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: TaskScaleStatus | PlainMessage<TaskScaleStatus> | undefined, b: TaskScaleStatus | PlainMessage<TaskScaleStatus> | undefined): boolean {
+    return proto3.util.equals(TaskScaleStatus, a, b);
+  }
+}
+
+/**
+ * Reply payload for GetJobScaleStatus.
+ *
+ * @generated from message legion.GetJobScaleStatusReply
+ */
+export class GetJobScaleStatusReply extends Message<GetJobScaleStatusReply> {
+  /**
+   * One entry per task in the job's latest config, spec-order.
+   *
+   * @generated from field: repeated legion.TaskScaleStatus tasks = 1;
+   */
+  tasks: TaskScaleStatus[] = [];
+
+  constructor(data?: PartialMessage<GetJobScaleStatusReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetJobScaleStatusReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "tasks", kind: "message", T: TaskScaleStatus, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetJobScaleStatusReply {
+    return new GetJobScaleStatusReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetJobScaleStatusReply {
+    return new GetJobScaleStatusReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetJobScaleStatusReply {
+    return new GetJobScaleStatusReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetJobScaleStatusReply | PlainMessage<GetJobScaleStatusReply> | undefined, b: GetJobScaleStatusReply | PlainMessage<GetJobScaleStatusReply> | undefined): boolean {
+    return proto3.util.equals(GetJobScaleStatusReply, a, b);
   }
 }
 
@@ -4684,6 +5384,31 @@ export class GetInstanceReply extends Message<GetInstanceReply> {
    */
   instance?: InstanceInfo;
 
+  /**
+   * A node has started this instance but the placement is not durable yet
+   * (docs/edge-boot.md). Set only while a claim is live and unratified; the
+   * moment it is confirmed the instance has an ordinary `current_alloc_id`
+   * and this goes away.
+   *
+   * This is what makes "started but not yet confirmed" a state an operator or
+   * an agent can see, rather than an instance that inexplicably has no
+   * allocation while a sandbox is demonstrably running on a node.
+   *
+   * Derived from the reporting node's last heartbeat and held in manager
+   * memory, so after a manager failover it is unset until that node's next
+   * heartbeat — briefly incomplete, never wrong.
+   *
+   * @generated from field: legion.ProvisionalClaimReport provisional = 2;
+   */
+  provisional?: ProvisionalClaimReport;
+
+  /**
+   * Node holding that claim. Empty when `provisional` is unset.
+   *
+   * @generated from field: string provisional_node_id = 3;
+   */
+  provisionalNodeId = "";
+
   constructor(data?: PartialMessage<GetInstanceReply>) {
     super();
     proto3.util.initPartial(data, this);
@@ -4693,6 +5418,8 @@ export class GetInstanceReply extends Message<GetInstanceReply> {
   static readonly typeName = "legion.GetInstanceReply";
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
     { no: 1, name: "instance", kind: "message", T: InstanceInfo },
+    { no: 2, name: "provisional", kind: "message", T: ProvisionalClaimReport },
+    { no: 3, name: "provisional_node_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetInstanceReply {
@@ -5566,6 +6293,19 @@ export class Job extends Message<Job> {
    */
   updatedAt = protoInt64.zero;
 
+  /**
+   * Priority band of the job's latest config: `critical`, `high`,
+   * `elevated`, `normal` (the default), `low`, or `background`.
+   *
+   * The band orders the eval queue and governs preemption: an allocation may
+   * only ever be displaced by a job in a STRICTLY higher band, never by a
+   * peer. See docs/preemption-and-eviction.md. Empty only when read from a
+   * manager that predates bands.
+   *
+   * @generated from field: string priority = 6;
+   */
+  priority = "";
+
   constructor(data?: PartialMessage<Job>) {
     super();
     proto3.util.initPartial(data, this);
@@ -5579,6 +6319,7 @@ export class Job extends Message<Job> {
     { no: 3, name: "status", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 4, name: "created_at", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
     { no: 5, name: "updated_at", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 6, name: "priority", kind: "scalar", T: 9 /* ScalarType.STRING */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): Job {
@@ -5948,6 +6689,40 @@ export class HeartbeatRequest extends Message<HeartbeatRequest> {
    */
   volumeReports: VolumeReport[] = [];
 
+  /**
+   * Allocations whose task process reached a terminal state since the last
+   * heartbeat *without* failing — the task exited with a status its `restart`
+   * policy treats as done (see docs/task-supervision.md). Failures travel in
+   * `failed_allocations` instead, because the manager reschedules those.
+   *
+   * This is what makes a batch task's success real: the manager marks the
+   * allocation complete and the task successful only when a worker says the
+   * process exited successfully, instead of assuming it at placement.
+   *
+   * Sent only by workers at protocol version 2 and above.
+   *
+   * Default: empty list.
+   *
+   * @generated from field: repeated legion.TerminatedAllocation terminated_allocations = 6;
+   */
+  terminatedAllocations: TerminatedAllocation[] = [];
+
+  /**
+   * Unratified provisional allocations this node is currently holding (see
+   * docs/edge-boot.md). Reported on every heartbeat so started-but-
+   * unconfirmed work is visible to an operator looking at capacity, and so a
+   * manager that already decided a claim can re-deliver its verdict in
+   * `HeartbeatReply.claim_verdicts` when the `RatifyClaim` reply was lost.
+   *
+   * Claims disappear from this list the moment they are confirmed (they
+   * become ordinary allocations and appear in `allocation_ids`) or killed.
+   *
+   * Default: empty list — nodes running only committed work pay nothing.
+   *
+   * @generated from field: repeated legion.ProvisionalClaimReport provisional_claims = 7;
+   */
+  provisionalClaims: ProvisionalClaimReport[] = [];
+
   constructor(data?: PartialMessage<HeartbeatRequest>) {
     super();
     proto3.util.initPartial(data, this);
@@ -5961,6 +6736,8 @@ export class HeartbeatRequest extends Message<HeartbeatRequest> {
     { no: 3, name: "failed_allocations", kind: "message", T: FailedAllocation, repeated: true },
     { no: 4, name: "allocation_health", kind: "message", T: AllocationHealth, repeated: true },
     { no: 5, name: "volume_reports", kind: "message", T: VolumeReport, repeated: true },
+    { no: 6, name: "terminated_allocations", kind: "message", T: TerminatedAllocation, repeated: true },
+    { no: 7, name: "provisional_claims", kind: "message", T: ProvisionalClaimReport, repeated: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): HeartbeatRequest {
@@ -6018,6 +6795,94 @@ export class HeartbeatReply extends Message<HeartbeatReply> {
    */
   volumeDestroy: VolumeDestroyRequest[] = [];
 
+  /**
+   * Current endpoint set for every upstream declared by the desired
+   * allocations on this node (see `TaskAllocation.task_connect`). This is the
+   * service-discovery feed for the node-local forwarders: the worker applies
+   * it to the running forwarders and the next accepted connection is balanced
+   * across the addresses listed here.
+   *
+   * One entry per (allocation, upstream service) pair, refreshed on every
+   * heartbeat — that is, every `WORKER_HEARTBEAT_DURATION_SEC` (2s), which is
+   * the endpoint refresh cadence a consumer observes after a backend comes up,
+   * goes unhealthy, or moves.
+   *
+   * Default: empty list when no desired allocation declares upstreams. The
+   * manager performs no catalog work at all in that case, so nodes running
+   * only plain jobs pay nothing for this field.
+   *
+   * @generated from field: repeated legion.UpstreamEndpoints upstream_endpoints = 4;
+   */
+  upstreamEndpoints: UpstreamEndpoints[] = [];
+
+  /**
+   * Why the manager is stopping allocations on this node.
+   *
+   * Workers learn that an allocation should stop by noticing it is *absent*
+   * from `desired_allocations` — an absence carries no reason, so a drain, a
+   * rollout replacement, a `job stop` and a reschedule were historically
+   * indistinguishable to the worker and to anything reading its logs. This
+   * field supplies the missing reason, letting the worker hand a
+   * `StopCause` to the task runtime and log why each task went away.
+   *
+   * Delivery is **best effort and advisory**. The manager records a notice in
+   * the same transaction that removes the allocation, re-sends every live
+   * notice on each heartbeat, and prunes notices by age
+   * (`STOP_NOTICE_RETENTION_SECS`, 10 minutes). A worker that reconciles
+   * before the notice reaches it — or one talking to a manager older than
+   * this field — stops the allocation with cause `unknown` rather than
+   * waiting. A stop is never delayed or skipped for want of a notice.
+   *
+   * The list is a snapshot, not a delta: each heartbeat carries every notice
+   * the manager currently holds for this node, and the worker replaces its
+   * copy wholesale.
+   *
+   * Default: empty list when no allocation on this node was recently removed.
+   *
+   * @generated from field: repeated legion.StopNotice stop_notices = 5;
+   */
+  stopNotices: StopNotice[] = [];
+
+  /**
+   * Catch-up verdicts for claims the worker reported in
+   * `HeartbeatRequest.provisional_claims` that the manager has already
+   * decided (see `ClaimVerdict`). The `RatifyClaim` reply is the primary
+   * channel; this covers the case where that reply was lost after the
+   * manager committed.
+   *
+   * Default: empty list.
+   *
+   * @generated from field: repeated legion.ClaimVerdict claim_verdicts = 6;
+   */
+  claimVerdicts: ClaimVerdict[] = [];
+
+  /**
+   * The interval, in seconds, the manager wants this worker to heartbeat at.
+   *
+   * Present only when the manager runs adaptive cadence
+   * (`heartbeat.targetRatePerSecond` in the manager config); absent means
+   * "keep using your worker-type `heartbeatSeconds`", which is the default and
+   * reproduces Legion's historical behavior exactly.
+   *
+   * The manager derives this node's lost-node window from the SAME value
+   * (`missedBeatsBeforeLost x interval`), so a worker that honors a slower
+   * cadence is never penalized for it. A worker that ignores the field — an
+   * older build — is also never penalized: the manager widens a node's window
+   * the moment it decides to slow down, before any worker has been told, and
+   * only narrows a window after observing that node actually beating at the
+   * faster rate.
+   *
+   * A worker that adopts a new interval sleeps one uniform `[0, interval)`
+   * before resuming its normal jittered cadence, so a fleet that all learns
+   * the new value within one old interval spreads across the new period
+   * instead of re-phasing onto the same boundary.
+   *
+   * See docs/heartbeat-cadence-and-scale.md.
+   *
+   * @generated from field: optional uint32 next_interval_seconds = 7;
+   */
+  nextIntervalSeconds?: number;
+
   constructor(data?: PartialMessage<HeartbeatReply>) {
     super();
     proto3.util.initPartial(data, this);
@@ -6029,6 +6894,10 @@ export class HeartbeatReply extends Message<HeartbeatReply> {
     { no: 1, name: "message", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 2, name: "desired_allocations", kind: "message", T: TaskAllocation, repeated: true },
     { no: 3, name: "volume_destroy", kind: "message", T: VolumeDestroyRequest, repeated: true },
+    { no: 4, name: "upstream_endpoints", kind: "message", T: UpstreamEndpoints, repeated: true },
+    { no: 5, name: "stop_notices", kind: "message", T: StopNotice, repeated: true },
+    { no: 6, name: "claim_verdicts", kind: "message", T: ClaimVerdict, repeated: true },
+    { no: 7, name: "next_interval_seconds", kind: "scalar", T: 13 /* ScalarType.UINT32 */, opt: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): HeartbeatReply {
@@ -6045,6 +6914,183 @@ export class HeartbeatReply extends Message<HeartbeatReply> {
 
   static equals(a: HeartbeatReply | PlainMessage<HeartbeatReply> | undefined, b: HeartbeatReply | PlainMessage<HeartbeatReply> | undefined): boolean {
     return proto3.util.equals(HeartbeatReply, a, b);
+  }
+}
+
+/**
+ * Why one allocation is being stopped.
+ *
+ * Sent in `HeartbeatReply.stop_notices`. See that field for delivery
+ * semantics and `docs/graceful-stop.md` for the full contract.
+ *
+ * @generated from message legion.StopNotice
+ */
+export class StopNotice extends Message<StopNotice> {
+  /**
+   * Allocation the manager removed. Matches an ID the worker previously
+   * received in `HeartbeatReply.desired_allocations`.
+   *
+   * @generated from field: int64 allocation_id = 1;
+   */
+  allocationId = protoInt64.zero;
+
+  /**
+   * Why it was removed. One of:
+   *
+   * - `stop` — the job, or a keyed instance of it, was stopped by a user.
+   * - `update` — replaced by a newer job config (a rollout or in-place
+   *   update).
+   * - `drain` — the node is draining and its work is moving elsewhere.
+   * - `reschedule` — moved by the scheduler (failure recovery, `onLost`
+   *   handling, or a scheduler-driven move).
+   * - `destroy` — the job was destroyed outright.
+   * - `node_lost` — the node was removed or declared lost, clearing its
+   *   allocations.
+   * - `preempted` — displaced to make room for higher-priority work
+   *   (docs/preemption-and-eviction.md).
+   * - `scale_in` — the task's count was lowered by `legion job scale` and
+   *   this allocation was surplus.
+   *
+   * Workers treat an unrecognized value as `unknown` and stop the allocation
+   * anyway, so the manager may add causes without a coordinated upgrade.
+   *
+   * @generated from field: string cause = 2;
+   */
+  cause = "";
+
+  /**
+   * Name of the job that displaced this allocation. Set only when `cause` is
+   * `preempted`; empty otherwise. The worker copies it into the on-disk stop
+   * notice (`LEGION_STOP_NOTICE_PATH`) so a task can tell "the platform
+   * wanted my capacity for job X" from "my operator stopped me".
+   *
+   * Best-effort, like the cause itself: a stop that reconciles before its
+   * notice arrives is still carried out, just without attribution.
+   *
+   * @generated from field: string preemptor_job = 3;
+   */
+  preemptorJob = "";
+
+  /**
+   * Priority band of the job named in `preemptor_job` (`critical`, `high`,
+   * `elevated`, `normal`, `low`, `background`). Empty when `preemptor_job`
+   * is.
+   *
+   * @generated from field: string preemptor_band = 4;
+   */
+  preemptorBand = "";
+
+  constructor(data?: PartialMessage<StopNotice>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.StopNotice";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "allocation_id", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 2, name: "cause", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "preemptor_job", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "preemptor_band", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): StopNotice {
+    return new StopNotice().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): StopNotice {
+    return new StopNotice().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): StopNotice {
+    return new StopNotice().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: StopNotice | PlainMessage<StopNotice> | undefined, b: StopNotice | PlainMessage<StopNotice> | undefined): boolean {
+    return proto3.util.equals(StopNotice, a, b);
+  }
+}
+
+/**
+ * The endpoints one allocation may currently reach for one upstream service.
+ *
+ * Sent in `HeartbeatReply.upstream_endpoints`, this is the manager's answer to
+ * "where should this allocation's forwarder for service X send traffic right
+ * now". It is a snapshot, not a delta: each heartbeat carries the full list.
+ *
+ * @generated from message legion.UpstreamEndpoints
+ */
+export class UpstreamEndpoints extends Message<UpstreamEndpoints> {
+  /**
+   * Allocation consuming the service — the allocation whose task declared this
+   * upstream in its `connect` block. Identifies which node-local forwarder the
+   * endpoint list applies to.
+   *
+   * @generated from field: int64 allocation_id = 1;
+   */
+  allocationId = protoInt64.zero;
+
+  /**
+   * Upstream service name, exactly as written in the task's
+   * `connect.upstreams[].service`. Echoed so the worker can match the list to
+   * one of its listeners without relying on ordering.
+   *
+   * @generated from field: string service = 2;
+   */
+  service = "";
+
+  /**
+   * Endpoints the consumer may dial, already filtered by the manager:
+   *
+   * - **healthy only** — an endpoint appears when its latest health snapshot is
+   *   healthy *and* its node is alive, the same liveness rule `ResolveService`
+   *   applies. Unhealthy or lost backends are simply absent.
+   * - **intention filtered** — when the target service declares
+   *   `service.allow`, an endpoint is visible only if that list is empty,
+   *   contains `"*"`, or contains the consuming allocation's job id. A denied
+   *   consumer receives an empty list rather than an error.
+   *
+   * Endpoint fields carry the same meaning as in `ResolveServiceReply`; a
+   * consumer dials `address:port`, and skips entries whose `address` is empty
+   * or whose `port` is 0 (the backing node advertises no address yet).
+   *
+   * An empty list is authoritative and means "send no traffic": it is how a
+   * scaled-to-zero, unhealthy, or intention-denied service is reported.
+   * Workers only replace their endpoint list on a *successful* heartbeat, so a
+   * manager outage leaves the last known good set in place (fail-static)
+   * rather than blackholing traffic.
+   *
+   * @generated from field: repeated legion.ServiceEndpoint endpoints = 3;
+   */
+  endpoints: ServiceEndpoint[] = [];
+
+  constructor(data?: PartialMessage<UpstreamEndpoints>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.UpstreamEndpoints";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "allocation_id", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 2, name: "service", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "endpoints", kind: "message", T: ServiceEndpoint, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): UpstreamEndpoints {
+    return new UpstreamEndpoints().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): UpstreamEndpoints {
+    return new UpstreamEndpoints().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): UpstreamEndpoints {
+    return new UpstreamEndpoints().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: UpstreamEndpoints | PlainMessage<UpstreamEndpoints> | undefined, b: UpstreamEndpoints | PlainMessage<UpstreamEndpoints> | undefined): boolean {
+    return proto3.util.equals(UpstreamEndpoints, a, b);
   }
 }
 
@@ -6303,6 +7349,88 @@ export class FailedAllocation extends Message<FailedAllocation> {
 }
 
 /**
+ * A terminal, non-failure allocation outcome reported by a worker: the task's
+ * process exited and the task's `restart` policy says that is the end of it
+ * (see docs/task-supervision.md).
+ *
+ * @generated from message legion.TerminatedAllocation
+ */
+export class TerminatedAllocation extends Message<TerminatedAllocation> {
+  /**
+   * Allocation that reached the terminal state.
+   *
+   * @generated from field: int64 allocation_id = 1;
+   */
+  allocationId = protoInt64.zero;
+
+  /**
+   * True when the exit status was one the task counts as success
+   * (`restart.successExitCodes`, default `[0]`). A task whose policy is
+   * `never` can also terminate unsuccessfully; the manager marks the
+   * allocation complete either way and records the status.
+   *
+   * @generated from field: bool success = 2;
+   */
+  success = false;
+
+  /**
+   * Process exit code. Unset when the process was killed by a signal, or when
+   * the worker only re-adopted the pid after a restart and never had a handle
+   * to reap.
+   *
+   * @generated from field: optional int32 exit_code = 3;
+   */
+  exitCode?: number;
+
+  /**
+   * Signal that killed the process, when it was killed by one (Unix only).
+   *
+   * @generated from field: optional int32 signal = 4;
+   */
+  signal?: number;
+
+  /**
+   * Human-readable rendering of the same facts, e.g. `exited with status 0`
+   * or `killed by signal 9`. Carried so events and the UI do not have to
+   * re-derive wording from the numbers.
+   *
+   * @generated from field: string message = 5;
+   */
+  message = "";
+
+  constructor(data?: PartialMessage<TerminatedAllocation>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.TerminatedAllocation";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "allocation_id", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 2, name: "success", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 3, name: "exit_code", kind: "scalar", T: 5 /* ScalarType.INT32 */, opt: true },
+    { no: 4, name: "signal", kind: "scalar", T: 5 /* ScalarType.INT32 */, opt: true },
+    { no: 5, name: "message", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): TerminatedAllocation {
+    return new TerminatedAllocation().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): TerminatedAllocation {
+    return new TerminatedAllocation().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): TerminatedAllocation {
+    return new TerminatedAllocation().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: TerminatedAllocation | PlainMessage<TerminatedAllocation> | undefined, b: TerminatedAllocation | PlainMessage<TerminatedAllocation> | undefined): boolean {
+    return proto3.util.equals(TerminatedAllocation, a, b);
+  }
+}
+
+/**
  * Allocation health snapshot item from worker to manager.
  *
  * @generated from message legion.AllocationHealth
@@ -6543,9 +7671,36 @@ export class NodeMsg extends Message<NodeMsg> {
    *
    * On worker registration this starts empty and is set on first heartbeat.
    *
+   * FRESHNESS CAVEAT: read `heartbeat_source` before trusting this as a live
+   * clock. Heartbeats are tracked in the status-lane leader's memory and only
+   * status transitions are replicated, so on any other manager this value
+   * comes from a periodic checkpoint and can be up to
+   * `liveness.checkpointInterval` (30s by default) behind. The node's
+   * `status` is exact everywhere.
+   *
    * @generated from field: string last_heartbeat = 9;
    */
   lastHeartbeat = "";
+
+  /**
+   * Where `last_heartbeat` came from on the manager that answered:
+   *
+   * - `"live"` — this manager owns liveness and observed the beat itself. The
+   *   timestamp is current.
+   * - `"checkpoint"` — a replicated checkpoint, accurate to within
+   *   `liveness.checkpointInterval`. It records the time the beat was
+   *   OBSERVED, not the time the checkpoint was written, so it is coarse
+   *   rather than wrong.
+   * - `""` — no heartbeat has been observed, or checkpoints are disabled
+   *   (`liveness.checkpointInterval: "0s"`), in which case a non-owning
+   *   manager reports no time rather than an approximate one.
+   *
+   * Additive: a client built before this field ignores it and sees exactly
+   * today's `last_heartbeat`. See docs/node-liveness.md.
+   *
+   * @generated from field: string heartbeat_source = 10;
+   */
+  heartbeatSource = "";
 
   constructor(data?: PartialMessage<NodeMsg>) {
     super();
@@ -6564,6 +7719,7 @@ export class NodeMsg extends Message<NodeMsg> {
     { no: 7, name: "dynamic_attrs", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 8, name: "health_checks", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 9, name: "last_heartbeat", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 10, name: "heartbeat_source", kind: "scalar", T: 9 /* ScalarType.STRING */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): NodeMsg {
@@ -6580,6 +7736,190 @@ export class NodeMsg extends Message<NodeMsg> {
 
   static equals(a: NodeMsg | PlainMessage<NodeMsg> | undefined, b: NodeMsg | PlainMessage<NodeMsg> | undefined): boolean {
     return proto3.util.equals(NodeMsg, a, b);
+  }
+}
+
+/**
+ * Request payload for GetHeartbeatCadence. No parameters: the report is
+ * always fleet-wide, because the question it answers ("is the control plane
+ * keeping up?") has no per-node answer.
+ *
+ * @generated from message legion.GetHeartbeatCadenceRequest
+ */
+export class GetHeartbeatCadenceRequest extends Message<GetHeartbeatCadenceRequest> {
+  constructor(data?: PartialMessage<GetHeartbeatCadenceRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetHeartbeatCadenceRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetHeartbeatCadenceRequest {
+    return new GetHeartbeatCadenceRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetHeartbeatCadenceRequest {
+    return new GetHeartbeatCadenceRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetHeartbeatCadenceRequest {
+    return new GetHeartbeatCadenceRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetHeartbeatCadenceRequest | PlainMessage<GetHeartbeatCadenceRequest> | undefined, b: GetHeartbeatCadenceRequest | PlainMessage<GetHeartbeatCadenceRequest> | undefined): boolean {
+    return proto3.util.equals(GetHeartbeatCadenceRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for GetHeartbeatCadence — one fleet's cadence report.
+ *
+ * The arithmetic behind every field is published in
+ * docs/heartbeat-cadence-and-scale.md; the short version is
+ * `sustainable_nodes ~= R x I`, where `R` is heartbeat commits per second this
+ * control plane sustains and `I` is the interval.
+ *
+ * @generated from message legion.GetHeartbeatCadenceReply
+ */
+export class GetHeartbeatCadenceReply extends Message<GetHeartbeatCadenceReply> {
+  /**
+   * Active nodes this manager currently tracks.
+   *
+   * @generated from field: uint32 active_nodes = 1;
+   */
+  activeNodes = 0;
+
+  /**
+   * The interval, in seconds, this manager is currently telling workers to
+   * use. With adaptive cadence off this is the configured floor
+   * (`heartbeat.minInterval`, 2s by default) and workers keep their
+   * worker-type `heartbeatSeconds` instead.
+   *
+   * @generated from field: uint32 served_interval_seconds = 2;
+   */
+  servedIntervalSeconds = 0;
+
+  /**
+   * The lost-node window derived from it:
+   * `missed_beats_before_lost x served_interval_seconds`.
+   *
+   * @generated from field: uint32 lost_window_seconds = 3;
+   */
+  lostWindowSeconds = 0;
+
+  /**
+   * Fraction of active nodes that checked in within one interval, 0.0 to 1.0.
+   * 1.0 means the fleet is keeping up. False node loss begins when this falls
+   * below `served_interval_seconds / lost_window_seconds` — 0.20 at the
+   * defaults. Zero, with `freshness_measurable` false, on a fleet too small to
+   * measure (under 20 nodes) or on a manager that does not own liveness.
+   *
+   * @generated from field: double freshness_ratio = 4;
+   */
+  freshnessRatio = 0;
+
+  /**
+   * Whether `freshness_ratio` means anything. False on a tiny fleet, where the
+   * ratio is pure noise, and on a non-owning manager.
+   *
+   * @generated from field: bool freshness_measurable = 5;
+   */
+  freshnessMeasurable = false;
+
+  /**
+   * Nodes this control plane is OBSERVED to sustain at the current interval.
+   *
+   * A lower bound, not a ceiling: a control plane that is comfortably keeping
+   * up never reveals how much more it could take, so this reads as roughly the
+   * current fleet size until the fleet is actually pressed.
+   *
+   * @generated from field: uint32 sustainable_nodes_estimate = 6;
+   */
+  sustainableNodesEstimate = 0;
+
+  /**
+   * The value to put in `heartbeatSeconds` for a fleet this size on this
+   * control plane, at the configured headroom. The remedy is computed, not
+   * left as a formula for the operator to evaluate mid-incident.
+   *
+   * @generated from field: uint32 suggested_heartbeat_seconds = 7;
+   */
+  suggestedHeartbeatSeconds = 0;
+
+  /**
+   * Whether `heartbeat.targetRatePerSecond` is set, i.e. whether the manager
+   * dictates cadence at all. Off by default.
+   *
+   * @generated from field: bool adaptive_enabled = 8;
+   */
+  adaptiveEnabled = false;
+
+  /**
+   * True when the controller wanted to back off further but hit
+   * `heartbeat.maxInterval`. Backing off is not infinite; past this point the
+   * answer is more control plane, and the manager warns rather than slowing
+   * the fleet down further.
+   *
+   * @generated from field: bool at_max_interval = 9;
+   */
+  atMaxInterval = false;
+
+  /**
+   * Missed beats before a node is marked lost
+   * (`heartbeat.missedBeatsBeforeLost`, 5 by default).
+   *
+   * @generated from field: uint32 missed_beats_before_lost = 10;
+   */
+  missedBeatsBeforeLost = 0;
+
+  /**
+   * Whether the manager that answered owns liveness — that is, leads the
+   * status lane (always true outside raft mode and in `single` topology). When
+   * false, every number above is zero: a manager that does not own liveness
+   * reports nothing rather than guessing.
+   *
+   * @generated from field: bool is_liveness_owner = 11;
+   */
+  isLivenessOwner = false;
+
+  constructor(data?: PartialMessage<GetHeartbeatCadenceReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetHeartbeatCadenceReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "active_nodes", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 2, name: "served_interval_seconds", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 3, name: "lost_window_seconds", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 4, name: "freshness_ratio", kind: "scalar", T: 1 /* ScalarType.DOUBLE */ },
+    { no: 5, name: "freshness_measurable", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 6, name: "sustainable_nodes_estimate", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 7, name: "suggested_heartbeat_seconds", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 8, name: "adaptive_enabled", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 9, name: "at_max_interval", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 10, name: "missed_beats_before_lost", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 11, name: "is_liveness_owner", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetHeartbeatCadenceReply {
+    return new GetHeartbeatCadenceReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetHeartbeatCadenceReply {
+    return new GetHeartbeatCadenceReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetHeartbeatCadenceReply {
+    return new GetHeartbeatCadenceReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetHeartbeatCadenceReply | PlainMessage<GetHeartbeatCadenceReply> | undefined, b: GetHeartbeatCadenceReply | PlainMessage<GetHeartbeatCadenceReply> | undefined): boolean {
+    return proto3.util.equals(GetHeartbeatCadenceReply, a, b);
   }
 }
 
@@ -6785,6 +8125,22 @@ export class GetNodeReply extends Message<GetNodeReply> {
    */
   node?: NodeMsg;
 
+  /**
+   * Provisional (unratified) allocations this node reported on its most
+   * recent heartbeat — work it has started that the store has not recorded
+   * (docs/edge-boot.md). This is what makes started-but-unconfirmed capacity
+   * visible instead of invisible.
+   *
+   * Live state, not durable: the manager holds the last report in memory, so
+   * a failover shows an empty list until the node's next heartbeat (at most
+   * one heartbeat interval). It is never wrong, only briefly incomplete.
+   *
+   * Default: empty list.
+   *
+   * @generated from field: repeated legion.ProvisionalClaimReport provisional_claims = 2;
+   */
+  provisionalClaims: ProvisionalClaimReport[] = [];
+
   constructor(data?: PartialMessage<GetNodeReply>) {
     super();
     proto3.util.initPartial(data, this);
@@ -6794,6 +8150,7 @@ export class GetNodeReply extends Message<GetNodeReply> {
   static readonly typeName = "legion.GetNodeReply";
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
     { no: 1, name: "node", kind: "message", T: NodeMsg, opt: true },
+    { no: 2, name: "provisional_claims", kind: "message", T: ProvisionalClaimReport, repeated: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetNodeReply {
@@ -9550,6 +10907,25 @@ export class ServiceSummary extends Message<ServiceSummary> {
    */
   meta: { [key: string]: string } = {};
 
+  /**
+   * Connect intentions declared in the task's `service.allow`: the job IDs
+   * permitted to reach this service through a `connect.upstreams` entry.
+   *
+   * Empty — the default — means *every* job may connect, and so does a single
+   * `"*"` entry; the two are reported verbatim rather than normalized so
+   * tooling can tell "no policy declared" from "explicitly open". Intentions
+   * gate the connect datapath only: they filter the endpoint list a consuming
+   * allocation receives in `HeartbeatReply.upstream_endpoints`, and never
+   * affect who may *read* the catalog through ListServices/ResolveService.
+   *
+   * Reported here so a read-only caller (`job:read`) can explain why its
+   * consumer resolves to nothing — `legion service doctor` prints this list —
+   * without needing state-store access to the underlying task config.
+   *
+   * @generated from field: repeated string allow = 8;
+   */
+  allow: string[] = [];
+
   constructor(data?: PartialMessage<ServiceSummary>) {
     super();
     proto3.util.initPartial(data, this);
@@ -9565,6 +10941,7 @@ export class ServiceSummary extends Message<ServiceSummary> {
     { no: 5, name: "total_count", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
     { no: 6, name: "tags", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
     { no: 7, name: "meta", kind: "map", K: 9 /* ScalarType.STRING */, V: {kind: "scalar", T: 9 /* ScalarType.STRING */} },
+    { no: 8, name: "allow", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ServiceSummary {
@@ -12653,14 +14030,39 @@ export class TaskAllocation extends Message<TaskAllocation> {
   taskOnUnhealthy = "";
 
   /**
-   * JSON-encoded assigned network payload (address + ports) for this
-   * allocation, matching the `AllocNetwork` shape. Workers use it to inject
-   * `LEGION_PORT_*` / `LEGION_ADDR_*` environment variables into the task.
-   * Empty string when the task declares no network block.
+   * JSON-encoded assigned network payload (address + ports + upstreams) for
+   * this allocation, matching the `AllocNetwork` shape. Workers use it to
+   * inject `LEGION_PORT_*` / `LEGION_ADDR_*` environment variables into the
+   * task, and — when the task declares upstreams — the `upstreams` array
+   * (`[{"service":"db","localPort":20003,"balance":"round_robin"}]`) carries
+   * the loopback ports the node-local forwarders listen on, surfaced to the
+   * task as `LEGION_UPSTREAM_*`.
+   *
+   * Empty string when the task declares no network block and no upstreams.
    *
    * @generated from field: string network = 14;
    */
   network = "";
+
+  /**
+   * JSON-encoded `connect` block declared by the task, matching the
+   * `ConnectConfig` shape: `{"upstreams":[{"service":"db"},
+   * {"service":"cache","localPort":6379,"balance":"least_conn"}]}`.
+   *
+   * This is the *declared* form (which services the task dials and with which
+   * balancing strategy); the *assigned* loopback ports live in `network`
+   * alongside the task's host ports, because both come out of the same
+   * per-node port space. The worker starts one loopback TCP forwarder per
+   * upstream and load-balances new connections across that service's healthy
+   * endpoints, which the manager refreshes every heartbeat in
+   * `HeartbeatReply.upstream_endpoints`.
+   *
+   * Empty string (not `{}`) when the task declares no upstreams, so jobs that
+   * do not use connect stay byte-identical on the wire.
+   *
+   * @generated from field: string task_connect = 17;
+   */
+  taskConnect = "";
 
   /**
    * JSON-encoded list of normalized artifact specs for this task.
@@ -12755,6 +14157,45 @@ export class TaskAllocation extends Message<TaskAllocation> {
    */
   taskResources = "";
 
+  /**
+   * The task's declared stop ladder (`stop { signal, killAfter }`) as JSON,
+   * e.g. `{"signal":"SIGINT","killAfter":"90s"}`.
+   *
+   * Carried on the allocation because the worker never sees a jobspec: it
+   * rebuilds a TaskConfig from these scalar fields, so a task-level block not
+   * on this message does not exist on the worker and every stop would silently
+   * use the default ladder.
+   *
+   * Empty string when the task declared none, which is NOT the same as
+   * declaring the default: the `container` runtime on Linux consults the
+   * image's own `STOPSIGNAL` before falling back to `SIGTERM`, and can only do
+   * that when it knows the jobspec was silent. Runtimes with nothing to signal
+   * (`noop`) ignore the field entirely.
+   *
+   * @generated from field: string task_stop = 18;
+   */
+  taskStop = "";
+
+  /**
+   * Present only when this dispatch is a *provisional* start: work the node
+   * may begin before the placement is durable (docs/edge-boot.md).
+   *
+   * When set, `allocation_id` is 0 — the manager mints allocation ids inside
+   * the apply transaction, so a not-yet-committed placement has none. The
+   * node keys the work by `provisional.claim_id` instead, and learns its
+   * allocation id from the ratification verdict.
+   *
+   * Absent on every allocation of a job that did not opt into
+   * `speculativeStart`, so a cluster that upgrades and changes nothing sends
+   * byte-identical payloads. An old worker that ignores this field would run
+   * the allocation immediately with no gate and no lease, which is why
+   * pre-commit dispatch requires a minimum worker protocol version and falls
+   * back to post-commit dispatch per node below it.
+   *
+   * @generated from field: legion.ProvisionalAllocation provisional = 19;
+   */
+  provisional?: ProvisionalAllocation;
+
   constructor(data?: PartialMessage<TaskAllocation>) {
     super();
     proto3.util.initPartial(data, this);
@@ -12774,11 +14215,14 @@ export class TaskAllocation extends Message<TaskAllocation> {
     { no: 9, name: "task_checks", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 10, name: "task_on_unhealthy", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 14, name: "network", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 17, name: "task_connect", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 11, name: "task_artifacts", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 12, name: "task_identities", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 13, name: "self_terminate_after_seconds", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
     { no: 15, name: "task_volumes", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 16, name: "task_resources", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 18, name: "task_stop", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 19, name: "provisional", kind: "message", T: ProvisionalAllocation },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): TaskAllocation {
@@ -14854,6 +16298,1200 @@ export class DeleteJoinTokenReply extends Message<DeleteJoinTokenReply> {
 
   static equals(a: DeleteJoinTokenReply | PlainMessage<DeleteJoinTokenReply> | undefined, b: DeleteJoinTokenReply | PlainMessage<DeleteJoinTokenReply> | undefined): boolean {
     return proto3.util.equals(DeleteJoinTokenReply, a, b);
+  }
+}
+
+/**
+ * The provisional half of a dispatch: everything a worker needs to run work
+ * that is not yet durable, and to kill it if it never becomes durable.
+ *
+ * Absent on every allocation of a job that did not opt into
+ * `speculativeStart`, so today's dispatch payloads are unchanged on the wire.
+ *
+ * @generated from message legion.ProvisionalAllocation
+ */
+export class ProvisionalAllocation extends Message<ProvisionalAllocation> {
+  /**
+   * Claim id (`clm_<uuid>`), minted by whoever asked for the start. This is
+   * the correlation key for the whole lifecycle: the worker keys its claim
+   * table by it, ratification names it, and it appears in every event.
+   *
+   * @generated from field: string claim_id = 1;
+   */
+  claimId = "";
+
+  /**
+   * How far this start may get before ratification.
+   *
+   * @generated from field: legion.GateLevel gate = 2;
+   */
+  gate = GateLevel.GATE_OFF;
+
+  /**
+   * Unix seconds after which the worker MUST kill this work unconditionally
+   * if it has not been ratified. This is the lease, and it is the backstop
+   * for every failure mode the reply path cannot cover — a partition, a dead
+   * manager, a lost reply.
+   *
+   * @generated from field: int64 lease_deadline_unix = 3;
+   */
+  leaseDeadlineUnix = protoInt64.zero;
+
+  /**
+   * Instance id this claim is racing for, when the task is stateful. Empty
+   * for stateless tasks. Stable from the first millisecond, which is why an
+   * edge addresses a sandbox by this rather than by an allocation id that
+   * does not exist yet.
+   *
+   * @generated from field: string instance_id = 4;
+   */
+  instanceId = "";
+
+  /**
+   * How the start was authorized: `manager` (pre-commit dispatch from a
+   * manager that is applying the plan right now) or `edge` (a node acting on
+   * a boot ticket).
+   *
+   * @generated from field: string origin = 5;
+   */
+  origin = "";
+
+  /**
+   * What to do when ratification is refused: `kill` (default — a hard
+   * destroy) or `stop` (the task's normal graceful-stop ladder, then
+   * removal). Mirrors `speculativeStart.onRefused`.
+   *
+   * @generated from field: string on_refused = 6;
+   */
+  onRefused = "";
+
+  /**
+   * The boot ticket's `jti`, for edge-originated starts. Carried into
+   * ratification so the manager can enforce single use, and into the audit
+   * events so a start is traceable to the capability that authorized it.
+   * Never the ticket itself — no ticket material ever appears in a log,
+   * event, or store row.
+   *
+   * @generated from field: string ticket_jti = 7;
+   */
+  ticketJti = "";
+
+  constructor(data?: PartialMessage<ProvisionalAllocation>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ProvisionalAllocation";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "claim_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "gate", kind: "enum", T: proto3.getEnumType(GateLevel) },
+    { no: 3, name: "lease_deadline_unix", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 4, name: "instance_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 5, name: "origin", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 6, name: "on_refused", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 7, name: "ticket_jti", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ProvisionalAllocation {
+    return new ProvisionalAllocation().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ProvisionalAllocation {
+    return new ProvisionalAllocation().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ProvisionalAllocation {
+    return new ProvisionalAllocation().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ProvisionalAllocation | PlainMessage<ProvisionalAllocation> | undefined, b: ProvisionalAllocation | PlainMessage<ProvisionalAllocation> | undefined): boolean {
+    return proto3.util.equals(ProvisionalAllocation, a, b);
+  }
+}
+
+/**
+ * One unratified claim a worker is holding, reported on every heartbeat.
+ *
+ * This is what makes started-but-unconfirmed work visible to an operator
+ * looking at capacity, and it is the catch-up channel's key: a manager that
+ * sees a claim it has already decided replies with a verdict in
+ * `HeartbeatReply.claim_verdicts`.
+ *
+ * @generated from message legion.ProvisionalClaimReport
+ */
+export class ProvisionalClaimReport extends Message<ProvisionalClaimReport> {
+  /**
+   * Claim id.
+   *
+   * @generated from field: string claim_id = 1;
+   */
+  claimId = "";
+
+  /**
+   * Job config this claim runs an exact version of.
+   *
+   * @generated from field: string job_config_id = 2;
+   */
+  jobConfigId = "";
+
+  /**
+   * Task name within that config.
+   *
+   * @generated from field: string task_name = 3;
+   */
+  taskName = "";
+
+  /**
+   * Instance id being raced for, empty for stateless tasks.
+   *
+   * @generated from field: string instance_id = 4;
+   */
+  instanceId = "";
+
+  /**
+   * Gate level actually in force (the lower of the task's mode and any
+   * ticket ceiling).
+   *
+   * @generated from field: legion.GateLevel gate = 5;
+   */
+  gate = GateLevel.GATE_OFF;
+
+  /**
+   * How far the claim has actually progressed: `claimed`, `staged`,
+   * `booted`, or `serving`.
+   *
+   * @generated from field: string stage = 6;
+   */
+  stage = "";
+
+  /**
+   * Unix seconds at which the worker kills this claim if still unratified.
+   *
+   * @generated from field: int64 lease_deadline_unix = 7;
+   */
+  leaseDeadlineUnix = protoInt64.zero;
+
+  /**
+   * JSON-encoded resource request this claim is holding in the node's local
+   * ledger, so the manager can show unratified usage alongside committed
+   * usage.
+   *
+   * @generated from field: string resources = 8;
+   */
+  resources = "";
+
+  constructor(data?: PartialMessage<ProvisionalClaimReport>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ProvisionalClaimReport";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "claim_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "job_config_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "task_name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "instance_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 5, name: "gate", kind: "enum", T: proto3.getEnumType(GateLevel) },
+    { no: 6, name: "stage", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 7, name: "lease_deadline_unix", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 8, name: "resources", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ProvisionalClaimReport {
+    return new ProvisionalClaimReport().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ProvisionalClaimReport {
+    return new ProvisionalClaimReport().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ProvisionalClaimReport {
+    return new ProvisionalClaimReport().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ProvisionalClaimReport | PlainMessage<ProvisionalClaimReport> | undefined, b: ProvisionalClaimReport | PlainMessage<ProvisionalClaimReport> | undefined): boolean {
+    return proto3.util.equals(ProvisionalClaimReport, a, b);
+  }
+}
+
+/**
+ * A ratification verdict delivered out-of-band on a heartbeat.
+ *
+ * The primary delivery is the `RatifyClaim` reply. This field exists because
+ * that reply can be lost (the connection dies after the manager committed):
+ * without it the worker would kill work the cluster believes is running, and
+ * the instance would be bound to a dead allocation until the next reschedule.
+ *
+ * @generated from message legion.ClaimVerdict
+ */
+export class ClaimVerdict extends Message<ClaimVerdict> {
+  /**
+   * Claim the verdict is about.
+   *
+   * @generated from field: string claim_id = 1;
+   */
+  claimId = "";
+
+  /**
+   * True when the claim was confirmed and `allocation_id` is set.
+   *
+   * @generated from field: bool confirmed = 2;
+   */
+  confirmed = false;
+
+  /**
+   * Manager-minted allocation id, set only when `confirmed`.
+   *
+   * @generated from field: int64 allocation_id = 3;
+   */
+  allocationId = protoInt64.zero;
+
+  /**
+   * Why it was refused, when not confirmed.
+   *
+   * @generated from field: legion.ClaimRefusalReason reason = 4;
+   */
+  reason = ClaimRefusalReason.REFUSAL_UNSPECIFIED;
+
+  /**
+   * Human-readable detail (`bound to node-a`), for logs and `legion instance
+   * get`. Never contains ticket material.
+   *
+   * @generated from field: string detail = 5;
+   */
+  detail = "";
+
+  constructor(data?: PartialMessage<ClaimVerdict>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ClaimVerdict";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "claim_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "confirmed", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 3, name: "allocation_id", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 4, name: "reason", kind: "enum", T: proto3.getEnumType(ClaimRefusalReason) },
+    { no: 5, name: "detail", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ClaimVerdict {
+    return new ClaimVerdict().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ClaimVerdict {
+    return new ClaimVerdict().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ClaimVerdict {
+    return new ClaimVerdict().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ClaimVerdict | PlainMessage<ClaimVerdict> | undefined, b: ClaimVerdict | PlainMessage<ClaimVerdict> | undefined): boolean {
+    return proto3.util.equals(ClaimVerdict, a, b);
+  }
+}
+
+/**
+ * Request payload for IssueBootTicket.
+ *
+ * @generated from message legion.IssueBootTicketRequest
+ */
+export class IssueBootTicketRequest extends Message<IssueBootTicketRequest> {
+  /**
+   * Job the ticket may start work for. Required; also the ACL scope.
+   *
+   * @generated from field: string job = 1;
+   */
+  job = "";
+
+  /**
+   * Task within that job. Required — a ticket names one task, never a whole
+   * group.
+   *
+   * @generated from field: string task = 2;
+   */
+  task = "";
+
+  /**
+   * Exact job config id the ticket authorizes. Optional: when empty the
+   * manager pins the job's current config at mint time and returns it in the
+   * reply. A ticket NEVER means "latest" — pinning at mint is what keeps a
+   * redeploy from silently widening what a live ticket can start.
+   *
+   * @generated from field: string job_config_id = 3;
+   */
+  jobConfigId = "";
+
+  /**
+   * Exactly one of these bounds which instance may be started:
+   *
+   * - `instance_id` — one specific sandbox. The narrowest capability.
+   * - `instance_prefix` — any instance whose id starts with this string.
+   *   Must be non-empty; an empty prefix would authorize every instance of
+   *   the task. Lets a platform mint one ticket per user cohort rather than
+   *   one per request, at the cost of a wider capability if the node holding
+   *   it is compromised.
+   *
+   * Both empty is rejected for stateful tasks.
+   *
+   * @generated from field: string instance_id = 4;
+   */
+  instanceId = "";
+
+  /**
+   * @generated from field: string instance_prefix = 5;
+   */
+  instancePrefix = "";
+
+  /**
+   * Node pool the ticket may be redeemed in. Required: a ticket says what
+   * may run AND where. The worker checks this against its own pool offline.
+   *
+   * @generated from field: string pool = 6;
+   */
+  pool = "";
+
+  /**
+   * Ceiling on how far a redeeming node may get before ratification. The
+   * task's own `speculativeStart.mode` also caps it, and the lower of the
+   * two always wins. `GATE_OFF` mints a ticket that can stage nothing —
+   * rejected as a mistake.
+   *
+   * @generated from field: legion.GateLevel gate = 7;
+   */
+  gate = GateLevel.GATE_OFF;
+
+  /**
+   * Requested lifetime, e.g. `"5m"`. Defaults to `edgeBoot.defaultTicketTtl`
+   * and is clamped to `edgeBoot.maxTicketTtl`. Revocation is by TTL only
+   * (see docs/edge-boot.md) — the fast path cannot consult a revocation list
+   * without becoming the round trip the ticket exists to avoid.
+   *
+   * @generated from field: string ttl = 8;
+   */
+  ttl = "";
+
+  /**
+   * How many times the ticket may be ratified. Defaults to 1 (single use).
+   * Enforced at the manager through the idempotency table, so two nodes
+   * presented the same ticket both boot but only the first is confirmed.
+   *
+   * @generated from field: uint32 uses = 9;
+   */
+  uses = 0;
+
+  /**
+   * Optional idempotency key. A repeat with the same key returns the
+   * originally minted ticket rather than minting a second capability.
+   *
+   * @generated from field: optional string idempotency_key = 10;
+   */
+  idempotencyKey?: string;
+
+  constructor(data?: PartialMessage<IssueBootTicketRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.IssueBootTicketRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "job", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "task", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "job_config_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "instance_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 5, name: "instance_prefix", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 6, name: "pool", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 7, name: "gate", kind: "enum", T: proto3.getEnumType(GateLevel) },
+    { no: 8, name: "ttl", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 9, name: "uses", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 10, name: "idempotency_key", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): IssueBootTicketRequest {
+    return new IssueBootTicketRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): IssueBootTicketRequest {
+    return new IssueBootTicketRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): IssueBootTicketRequest {
+    return new IssueBootTicketRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: IssueBootTicketRequest | PlainMessage<IssueBootTicketRequest> | undefined, b: IssueBootTicketRequest | PlainMessage<IssueBootTicketRequest> | undefined): boolean {
+    return proto3.util.equals(IssueBootTicketRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for IssueBootTicket.
+ *
+ * @generated from message legion.IssueBootTicketReply
+ */
+export class IssueBootTicketReply extends Message<IssueBootTicketReply> {
+  /**
+   * The signed ticket. This is the only time the manager returns it — the
+   * store keeps metadata (`jti`, scope, expiry, accessor) for audit and
+   * single-use enforcement, never the token bytes.
+   *
+   * @generated from field: string ticket = 1;
+   */
+  ticket = "";
+
+  /**
+   * The ticket's `jti`, safe to log and to correlate against events.
+   *
+   * @generated from field: string jti = 2;
+   */
+  jti = "";
+
+  /**
+   * Exact job config the ticket is pinned to.
+   *
+   * @generated from field: string job_config_id = 3;
+   */
+  jobConfigId = "";
+
+  /**
+   * Expiry, unix seconds.
+   *
+   * @generated from field: int64 expires_at_unix = 4;
+   */
+  expiresAtUnix = protoInt64.zero;
+
+  /**
+   * True when this reply replayed an earlier mint for the same idempotency
+   * key rather than minting a new ticket.
+   *
+   * @generated from field: bool deduplicated = 5;
+   */
+  deduplicated = false;
+
+  constructor(data?: PartialMessage<IssueBootTicketReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.IssueBootTicketReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "ticket", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "jti", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "job_config_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "expires_at_unix", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 5, name: "deduplicated", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): IssueBootTicketReply {
+    return new IssueBootTicketReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): IssueBootTicketReply {
+    return new IssueBootTicketReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): IssueBootTicketReply {
+    return new IssueBootTicketReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: IssueBootTicketReply | PlainMessage<IssueBootTicketReply> | undefined, b: IssueBootTicketReply | PlainMessage<IssueBootTicketReply> | undefined): boolean {
+    return proto3.util.equals(IssueBootTicketReply, a, b);
+  }
+}
+
+/**
+ * Request payload for ListBootTickets.
+ *
+ * @generated from message legion.ListBootTicketsRequest
+ */
+export class ListBootTicketsRequest extends Message<ListBootTicketsRequest> {
+  /**
+   * Restrict to tickets for one job. Empty lists every ticket the caller is
+   * allowed to see.
+   *
+   * @generated from field: string job = 1;
+   */
+  job = "";
+
+  constructor(data?: PartialMessage<ListBootTicketsRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ListBootTicketsRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "job", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListBootTicketsRequest {
+    return new ListBootTicketsRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ListBootTicketsRequest {
+    return new ListBootTicketsRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ListBootTicketsRequest {
+    return new ListBootTicketsRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ListBootTicketsRequest | PlainMessage<ListBootTicketsRequest> | undefined, b: ListBootTicketsRequest | PlainMessage<ListBootTicketsRequest> | undefined): boolean {
+    return proto3.util.equals(ListBootTicketsRequest, a, b);
+  }
+}
+
+/**
+ * One outstanding boot ticket, metadata only.
+ *
+ * @generated from message legion.BootTicket
+ */
+export class BootTicket extends Message<BootTicket> {
+  /**
+   * Ticket id (`jti`).
+   *
+   * @generated from field: string jti = 1;
+   */
+  jti = "";
+
+  /**
+   * Job the ticket authorizes starts for.
+   *
+   * @generated from field: string job = 2;
+   */
+  job = "";
+
+  /**
+   * Task within that job.
+   *
+   * @generated from field: string task = 3;
+   */
+  task = "";
+
+  /**
+   * Exact job config the ticket is pinned to.
+   *
+   * @generated from field: string job_config_id = 4;
+   */
+  jobConfigId = "";
+
+  /**
+   * Instance id it may start, when narrowed to one.
+   *
+   * @generated from field: string instance_id = 5;
+   */
+  instanceId = "";
+
+  /**
+   * Instance prefix it may start, when narrowed to a cohort.
+   *
+   * @generated from field: string instance_prefix = 6;
+   */
+  instancePrefix = "";
+
+  /**
+   * Node pool it may be redeemed in.
+   *
+   * @generated from field: string pool = 7;
+   */
+  pool = "";
+
+  /**
+   * Gate ceiling.
+   *
+   * @generated from field: legion.GateLevel gate = 8;
+   */
+  gate = GateLevel.GATE_OFF;
+
+  /**
+   * Remaining redemptions.
+   *
+   * @generated from field: uint32 uses_remaining = 9;
+   */
+  usesRemaining = 0;
+
+  /**
+   * Expiry, unix seconds.
+   *
+   * @generated from field: int64 expires_at_unix = 10;
+   */
+  expiresAtUnix = protoInt64.zero;
+
+  /**
+   * ACL accessor id that minted it — who to ask about a start you did not
+   * expect. Never a token secret.
+   *
+   * @generated from field: string accessor_id = 11;
+   */
+  accessorId = "";
+
+  /**
+   * Mint time, RFC3339.
+   *
+   * @generated from field: string created_at = 12;
+   */
+  createdAt = "";
+
+  constructor(data?: PartialMessage<BootTicket>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.BootTicket";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "jti", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "job", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "task", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "job_config_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 5, name: "instance_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 6, name: "instance_prefix", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 7, name: "pool", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 8, name: "gate", kind: "enum", T: proto3.getEnumType(GateLevel) },
+    { no: 9, name: "uses_remaining", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 10, name: "expires_at_unix", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 11, name: "accessor_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 12, name: "created_at", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): BootTicket {
+    return new BootTicket().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): BootTicket {
+    return new BootTicket().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): BootTicket {
+    return new BootTicket().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: BootTicket | PlainMessage<BootTicket> | undefined, b: BootTicket | PlainMessage<BootTicket> | undefined): boolean {
+    return proto3.util.equals(BootTicket, a, b);
+  }
+}
+
+/**
+ * Reply payload for ListBootTickets.
+ *
+ * @generated from message legion.ListBootTicketsReply
+ */
+export class ListBootTicketsReply extends Message<ListBootTicketsReply> {
+  /**
+   * Live tickets, newest first.
+   *
+   * @generated from field: repeated legion.BootTicket tickets = 1;
+   */
+  tickets: BootTicket[] = [];
+
+  constructor(data?: PartialMessage<ListBootTicketsReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ListBootTicketsReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "tickets", kind: "message", T: BootTicket, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListBootTicketsReply {
+    return new ListBootTicketsReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ListBootTicketsReply {
+    return new ListBootTicketsReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ListBootTicketsReply {
+    return new ListBootTicketsReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ListBootTicketsReply | PlainMessage<ListBootTicketsReply> | undefined, b: ListBootTicketsReply | PlainMessage<ListBootTicketsReply> | undefined): boolean {
+    return proto3.util.equals(ListBootTicketsReply, a, b);
+  }
+}
+
+/**
+ * Request payload for RatifyClaim (worker plane).
+ *
+ * @generated from message legion.RatifyClaimRequest
+ */
+export class RatifyClaimRequest extends Message<RatifyClaimRequest> {
+  /**
+   * Node making the claim. Must match the node token on the request.
+   *
+   * @generated from field: string node_id = 1;
+   */
+  nodeId = "";
+
+  /**
+   * Claim being ratified.
+   *
+   * @generated from field: string claim_id = 2;
+   */
+  claimId = "";
+
+  /**
+   * Exact job config the work runs.
+   *
+   * @generated from field: string job_config_id = 3;
+   */
+  jobConfigId = "";
+
+  /**
+   * Task within that config.
+   *
+   * @generated from field: string task_name = 4;
+   */
+  taskName = "";
+
+  /**
+   * Instance id being bound, empty for stateless tasks.
+   *
+   * @generated from field: string instance_id = 5;
+   */
+  instanceId = "";
+
+  /**
+   * Gate level the work is currently held at, for the audit trail.
+   *
+   * @generated from field: legion.GateLevel gate = 6;
+   */
+  gate = GateLevel.GATE_OFF;
+
+  /**
+   * Boot ticket that authorized the start, for edge-originated claims. The
+   * manager re-verifies it (nodes are honest but not trusted to be the only
+   * holder) and spends its `jti` when the ticket is single-use. Empty for
+   * manager-originated claims, which were authorized by the submit that
+   * produced them.
+   *
+   * @generated from field: string ticket = 7;
+   */
+  ticket = "";
+
+  constructor(data?: PartialMessage<RatifyClaimRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.RatifyClaimRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "node_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "claim_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "job_config_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "task_name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 5, name: "instance_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 6, name: "gate", kind: "enum", T: proto3.getEnumType(GateLevel) },
+    { no: 7, name: "ticket", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): RatifyClaimRequest {
+    return new RatifyClaimRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): RatifyClaimRequest {
+    return new RatifyClaimRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): RatifyClaimRequest {
+    return new RatifyClaimRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: RatifyClaimRequest | PlainMessage<RatifyClaimRequest> | undefined, b: RatifyClaimRequest | PlainMessage<RatifyClaimRequest> | undefined): boolean {
+    return proto3.util.equals(RatifyClaimRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for RatifyClaim.
+ *
+ * @generated from message legion.RatifyClaimReply
+ */
+export class RatifyClaimReply extends Message<RatifyClaimReply> {
+  /**
+   * True when the placement committed. The worker opens the network and the
+   * claim becomes an ordinary allocation.
+   *
+   * @generated from field: bool confirmed = 1;
+   */
+  confirmed = false;
+
+  /**
+   * Manager-minted allocation id, set only when `confirmed`.
+   *
+   * @generated from field: int64 allocation_id = 2;
+   */
+  allocationId = protoInt64.zero;
+
+  /**
+   * Why it was refused, when not confirmed.
+   *
+   * @generated from field: legion.ClaimRefusalReason reason = 3;
+   */
+  reason = ClaimRefusalReason.REFUSAL_UNSPECIFIED;
+
+  /**
+   * Human-readable detail for logs and `legion instance get`.
+   *
+   * @generated from field: string detail = 4;
+   */
+  detail = "";
+
+  /**
+   * The committed allocation, in the exact form an ordinary dispatch would
+   * have carried it: the manager-minted id, the assigned network, and the
+   * resolved volume mounts.
+   *
+   * Present only when `confirmed`. This is what lets a provisional start
+   * finish as a *normal* allocation rather than as a second-class one: the
+   * node replaces the payload it booted with (which could not name ports or
+   * volumes, because those are assigned inside the apply transaction) before
+   * it starts the workload or opens the network.
+   *
+   * It carries the same `provisional.claim_id`, so a node can match it to the
+   * claim without trusting field ordering.
+   *
+   * @generated from field: legion.TaskAllocation allocation = 5;
+   */
+  allocation?: TaskAllocation;
+
+  constructor(data?: PartialMessage<RatifyClaimReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.RatifyClaimReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "confirmed", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 2, name: "allocation_id", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 3, name: "reason", kind: "enum", T: proto3.getEnumType(ClaimRefusalReason) },
+    { no: 4, name: "detail", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 5, name: "allocation", kind: "message", T: TaskAllocation },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): RatifyClaimReply {
+    return new RatifyClaimReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): RatifyClaimReply {
+    return new RatifyClaimReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): RatifyClaimReply {
+    return new RatifyClaimReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: RatifyClaimReply | PlainMessage<RatifyClaimReply> | undefined, b: RatifyClaimReply | PlainMessage<RatifyClaimReply> | undefined): boolean {
+    return proto3.util.equals(RatifyClaimReply, a, b);
+  }
+}
+
+/**
+ * Request payload for Worker.StartClaim (the edge entry point).
+ *
+ * @generated from message legion.StartClaimRequest
+ */
+export class StartClaimRequest extends Message<StartClaimRequest> {
+  /**
+   * Signed boot ticket authorizing this start. Verified entirely offline
+   * against the cached JWKS; a node that cannot reach any manager can still
+   * admit a start.
+   *
+   * @generated from field: string ticket = 1;
+   */
+  ticket = "";
+
+  /**
+   * Instance id to start. Must equal the ticket's `legion.io/instance`, or
+   * begin with its `legion.io/instance_prefix`.
+   *
+   * @generated from field: string instance_id = 2;
+   */
+  instanceId = "";
+
+  /**
+   * Caller-minted claim id (`clm_<uuid>`). Supplying it makes the call
+   * retry-safe: a repeat with the same id joins the existing claim's stream
+   * instead of starting a second sandbox.
+   *
+   * @generated from field: string claim_id = 3;
+   */
+  claimId = "";
+
+  /**
+   * Requested gate ceiling. Capped by both the ticket's gate and the task's
+   * `speculativeStart.mode`; the lowest of the three wins.
+   *
+   * @generated from field: legion.GateLevel gate = 4;
+   */
+  gate = GateLevel.GATE_OFF;
+
+  /**
+   * Verify the ticket and local admission, then report what WOULD happen and
+   * stop — no artifacts fetched, nothing booted, no claim held. For agents
+   * and routers that want to self-correct before mutating anything.
+   *
+   * @generated from field: bool dry_run = 5;
+   */
+  dryRun = false;
+
+  constructor(data?: PartialMessage<StartClaimRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.StartClaimRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "ticket", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "instance_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "claim_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "gate", kind: "enum", T: proto3.getEnumType(GateLevel) },
+    { no: 5, name: "dry_run", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): StartClaimRequest {
+    return new StartClaimRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): StartClaimRequest {
+    return new StartClaimRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): StartClaimRequest {
+    return new StartClaimRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: StartClaimRequest | PlainMessage<StartClaimRequest> | undefined, b: StartClaimRequest | PlainMessage<StartClaimRequest> | undefined): boolean {
+    return proto3.util.equals(StartClaimRequest, a, b);
+  }
+}
+
+/**
+ * One transition on a StartClaim stream. The caller learns each stage
+ * without polling; a router may begin routing at `booted` and must expect
+ * `refused` at any point up to `ratified`.
+ *
+ * @generated from message legion.StartClaimReply
+ */
+export class StartClaimReply extends Message<StartClaimReply> {
+  /**
+   * Claim id (echoed, or the one the worker minted).
+   *
+   * @generated from field: string claim_id = 1;
+   */
+  claimId = "";
+
+  /**
+   * Lifecycle stage reached: `admitted`, `staged`, `booted`, `serving`,
+   * `ratified`, or `refused`.
+   *
+   * @generated from field: string stage = 2;
+   */
+  stage = "";
+
+  /**
+   * Manager-minted allocation id, set on the `ratified` frame only.
+   *
+   * @generated from field: int64 allocation_id = 3;
+   */
+  allocationId = protoInt64.zero;
+
+  /**
+   * Refusal reason, set on the `refused` frame only.
+   *
+   * @generated from field: legion.ClaimRefusalReason reason = 4;
+   */
+  reason = ClaimRefusalReason.REFUSAL_UNSPECIFIED;
+
+  /**
+   * Human-readable detail for the frame.
+   *
+   * @generated from field: string detail = 5;
+   */
+  detail = "";
+
+  /**
+   * Gate level in force for this claim, after intersecting the request, the
+   * ticket, and the task's own mode.
+   *
+   * @generated from field: legion.GateLevel gate = 6;
+   */
+  gate = GateLevel.GATE_OFF;
+
+  constructor(data?: PartialMessage<StartClaimReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.StartClaimReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "claim_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "stage", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "allocation_id", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 4, name: "reason", kind: "enum", T: proto3.getEnumType(ClaimRefusalReason) },
+    { no: 5, name: "detail", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 6, name: "gate", kind: "enum", T: proto3.getEnumType(GateLevel) },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): StartClaimReply {
+    return new StartClaimReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): StartClaimReply {
+    return new StartClaimReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): StartClaimReply {
+    return new StartClaimReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: StartClaimReply | PlainMessage<StartClaimReply> | undefined, b: StartClaimReply | PlainMessage<StartClaimReply> | undefined): boolean {
+    return proto3.util.equals(StartClaimReply, a, b);
+  }
+}
+
+/**
+ * One manager's report of the nodes it is hearing from.
+ *
+ * @generated from message legion.NodeLivenessDigestRequest
+ */
+export class NodeLivenessDigestRequest extends Message<NodeLivenessDigestRequest> {
+  /**
+   * Sender's wire-protocol version, so a receiver can refuse a digest it
+   * cannot interpret rather than silently dropping nodes from liveness.
+   *
+   * @generated from field: uint32 protocol_version = 1;
+   */
+  protocolVersion = 0;
+
+  /**
+   * The reporting manager's string id ("host:port"). The leader keys its
+   * per-peer staleness tracking on this, and raises
+   * `legion_liveness_peer_stale{peer}` for it when the digests stop.
+   *
+   * @generated from field: string observer_manager_id = 2;
+   */
+  observerManagerId = "";
+
+  /**
+   * When the sender took this observation, unix milliseconds. Advisory: the
+   * receiver times peer staleness on its OWN clock, because two managers'
+   * wall clocks disagreeing must not turn into node loss.
+   *
+   * @generated from field: int64 observed_at_unix_ms = 3;
+   */
+  observedAtUnixMs = protoInt64.zero;
+
+  /**
+   * Every node this manager has received a heartbeat from since its last
+   * digest. Authoritative for this peer: the leader REPLACES the peer's
+   * previous claimed set, so a node that moved managers is not left attributed
+   * to the old one.
+   *
+   * @generated from field: repeated string seen_node_ids = 4;
+   */
+  seenNodeIds: string[] = [];
+
+  constructor(data?: PartialMessage<NodeLivenessDigestRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.NodeLivenessDigestRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "protocol_version", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 2, name: "observer_manager_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "observed_at_unix_ms", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 4, name: "seen_node_ids", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): NodeLivenessDigestRequest {
+    return new NodeLivenessDigestRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): NodeLivenessDigestRequest {
+    return new NodeLivenessDigestRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): NodeLivenessDigestRequest {
+    return new NodeLivenessDigestRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: NodeLivenessDigestRequest | PlainMessage<NodeLivenessDigestRequest> | undefined, b: NodeLivenessDigestRequest | PlainMessage<NodeLivenessDigestRequest> | undefined): boolean {
+    return proto3.util.equals(NodeLivenessDigestRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for RaftTransport.ReportNodeLiveness.
+ *
+ * @generated from message legion.NodeLivenessDigestReply
+ */
+export class NodeLivenessDigestReply extends Message<NodeLivenessDigestReply> {
+  /**
+   * True when the receiver leads the status lane and merged the digest.
+   *
+   * @generated from field: bool accepted = 1;
+   */
+  accepted = false;
+
+  /**
+   * True when the receiver does NOT lead the status lane. The sender re-targets
+   * using `leader_hint`, exactly as ForwardLaneWrite callers do; until it
+   * does, its nodes are covered by the previous leader's `peerDigestGrace`.
+   *
+   * @generated from field: bool not_status_leader = 2;
+   */
+  notStatusLeader = false;
+
+  /**
+   * The receiver's own view of who leads the status lane, as "host:port".
+   * Empty when it does not know (mid-election).
+   *
+   * @generated from field: string leader_hint = 3;
+   */
+  leaderHint = "";
+
+  constructor(data?: PartialMessage<NodeLivenessDigestReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.NodeLivenessDigestReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "accepted", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 2, name: "not_status_leader", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 3, name: "leader_hint", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): NodeLivenessDigestReply {
+    return new NodeLivenessDigestReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): NodeLivenessDigestReply {
+    return new NodeLivenessDigestReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): NodeLivenessDigestReply {
+    return new NodeLivenessDigestReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: NodeLivenessDigestReply | PlainMessage<NodeLivenessDigestReply> | undefined, b: NodeLivenessDigestReply | PlainMessage<NodeLivenessDigestReply> | undefined): boolean {
+    return proto3.util.equals(NodeLivenessDigestReply, a, b);
   }
 }
 

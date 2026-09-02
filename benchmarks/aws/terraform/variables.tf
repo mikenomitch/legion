@@ -54,9 +54,40 @@ variable "control_plane_count" {
 }
 
 variable "control_plane_type" {
-  description = "On-demand instance type for the control plane (4 vCPU / 16 GiB in the plan)."
+  description = <<-EOT
+    On-demand instance type for the control plane (4 vCPU / 16 GiB in the
+    plan). Default `m6id.xlarge` — same 4 vCPU / 16 GiB as the `m7i.xlarge`
+    it replaces, but with 237 GB of LOCAL NVMe, which cloud-init mounts at
+    /var/lib/legion so every raft data dir lands on it.
+
+    This is a measurement decision, not a tuning one. Measured 2026-08-03
+    with `experiments/heartbeat-commit-probe.sh`, identical code and a
+    3-voter lanes topology, varying only the disk:
+
+      gp3 (EBS root)   ~86 heartbeats/sec   (17% of a 2s cadence)
+      local NVMe     ~2000 heartbeats/sec   (100%)
+
+    A raft commit fsyncs, and on network-attached storage that fsync — not
+    the scheduler — sets control-plane throughput. Leaving the campaign on
+    gp3 would publish a comparison of EBS latency wearing three different
+    schedulers' clothes.
+
+    It is NOT a thumb on the scale for Legion. The systems are affected
+    unequally *by architecture*: Nomad resets an in-memory timer on the
+    leader per heartbeat (`resetHeartbeatTimer`, no raft write), K8s writes
+    a small Lease to etcd (KEP-589 shrank it from the 15 KB Node object),
+    and Legion replicates every heartbeat through the status lane. Fast
+    local disk is what stops that architectural difference from being
+    swamped by storage latency — and identical hardware for all three is
+    still the rule (judgement call 3).
+
+    The trade, which belongs in every fairness record: instance-store NVMe
+    is EPHEMERAL. It does not survive a stop/start or a replacement, which
+    is a genuine deployment difference from the EBS-backed control planes
+    many operators run on purpose.
+  EOT
   type        = string
-  default     = "m7i.xlarge"
+  default     = "m6id.xlarge"
 }
 
 variable "control_plane_disk_gb" {
@@ -68,9 +99,16 @@ variable "control_plane_disk_gb" {
 # --- Load / metrics ----------------------------------------------------
 
 variable "loadgen_type" {
+  # 2 vCPU was not enough, and it silently capped every cell rather than
+  # failing. This box runs Prometheus and Grafana AND the driver, and the
+  # driver spawns one CLI process per submitted job; on an m7i.large that
+  # ceilinged submission at ~36 jobs/sec, which the phase-4 campaign then
+  # reported as Legion throughput while the control plane idled at 8% CPU.
+  # Sized so the driver, not the box, is the limit -- and the driver now
+  # says so in `submission.driver_bound` when it is still the constraint.
   description = "On-demand instance type for the Prometheus + Grafana + driver box."
   type        = string
-  default     = "m7i.large"
+  default     = "m7i.4xlarge"
 }
 
 variable "loadgen_disk_gb" {
@@ -83,14 +121,50 @@ variable "loadgen_disk_gb" {
 
 variable "worker_instances" {
   description = <<-EOT
-    Spot instances hosting simulated nodes. At ~1,250 sim nodes per
-    instance: 1k step -> 1, 2k -> 2, 5k -> 4, 10k -> 8, and the one-off
-    20k validation burst -> 16. Scale between steps with
-    `terraform apply -var worker_instances=N` — the ASG replaces nothing
-    on the way down/up, so the control plane is untouched.
+    INITIAL count of spot instances hosting simulated nodes. At ~1,250
+    sim nodes per instance: 1k step -> 1, 2k -> 2, 5k -> 4, 10k -> 8, and
+    the one-off 20k validation burst -> 16.
+
+    Campaigns scale between steps through the ASG API rather than
+    terraform (scripts/env.sh: scale_workers), so the ASG ignores drift
+    on desired_capacity and changing this variable after bringup does
+    nothing to a running fleet. The ASG replaces nothing on the way
+    up/down either way, so the control plane is untouched.
+
+    1,250 is the plan's estimate, not a measurement. Run
+    `experiments/packing-density.sh` once against the standing rig to
+    find this fleet's real ceiling: a higher density needs fewer
+    instances per step, which cuts both cost and the spot vCPU quota a
+    campaign has to clear.
   EOT
   type        = number
   default     = 1
+}
+
+variable "worker_on_demand_percentage" {
+  description = <<-EOT
+    Share of the sim-worker fleet launched on-demand instead of spot
+    (0-100). Default 0 = all spot, the cheapest way to run a campaign.
+
+    Raise it when a region's spot vCPU quota cannot cover a step. Spot
+    and on-demand are separate AWS quotas, so a 50/50 split draws half
+    the fleet from each and neither limit has to cover the whole fleet:
+    at 8 vCPU per instance the 20k validation burst is 128 vCPU — 64
+    from each bucket at 50, versus 128 from one at 0.
+
+    It costs money: on-demand runs roughly 3x spot for these types. A
+    2-hour validation burst at 100 is a few dollars more; a 24h soak is
+    not. It also removes spot reclaims for that share of the fleet,
+    which is a fidelity difference, not just a price one — so
+    collect.sh records the setting in every cell's fairness record.
+  EOT
+  type        = number
+  default     = 0
+
+  validation {
+    condition     = var.worker_on_demand_percentage >= 0 && var.worker_on_demand_percentage <= 100
+    error_message = "worker_on_demand_percentage must be between 0 and 100."
+  }
 }
 
 variable "worker_instance_types" {
@@ -109,6 +183,33 @@ variable "worker_disk_gb" {
 }
 
 # --- Results / streaming storage ---------------------------------------
+
+variable "archive_bucket" {
+  description = <<-EOT
+    Name of an EXISTING S3 bucket, managed outside this terraform, to
+    mirror campaign results into. Optional, and strongly recommended for
+    any run whose numbers you intend to keep.
+
+    The rig's own bucket is `force_destroy` — `teardown.sh` deletes it
+    with everything inside — and teardown's pre-destroy sync writes to
+    whatever machine ran it, which for an unattended campaign is exactly
+    the disposable thing you might lose. A bucket terraform does not
+    manage cannot be destroyed by terraform, so results mirrored here
+    outlive both the VM and the teardown.
+
+    Create one once, outside any campaign:
+
+      aws s3 mb s3://my-legion-benchmarks --region us-east-1
+
+    then set archive_bucket = "my-legion-benchmarks". The rig is granted
+    read and write on it, deliberately NOT delete: the durable copy
+    should not be erasable by anything running inside a disposable rig.
+
+    Empty (the default) means no mirror, and teardown says so loudly.
+  EOT
+  type        = string
+  default     = ""
+}
 
 variable "results_bucket_prefix" {
   description = "S3 bucket name prefix (a random suffix is appended). Holds campaign archives, the Legion B streaming replica + lease, and the uploaded legion binary."

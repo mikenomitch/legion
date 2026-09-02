@@ -271,10 +271,14 @@ fn export_request(
                         attributes: attributes(family.label_names, &sample.label_values),
                         start_time_unix_nano: started_unix_nano,
                         time_unix_nano: now,
-                        value: Some(number_data_point::Value::AsInt(match sample.value {
-                            SampleValue::Gauge(v) => v,
-                            _ => 0,
-                        })),
+                        // Fractional gauges (ratios) export as doubles so a
+                        // freshness ratio does not arrive at the collector
+                        // truncated to 0.
+                        value: Some(match sample.value {
+                            SampleValue::GaugeF64(v) => number_data_point::Value::AsDouble(v),
+                            SampleValue::Gauge(v) => number_data_point::Value::AsInt(v),
+                            _ => number_data_point::Value::AsInt(0),
+                        }),
                         ..Default::default()
                     })
                     .collect(),

@@ -58,6 +58,7 @@ fn insert_node(store: &Store, id: &str) -> R<()> {
         dynamic_attrs: "{}".into(),
         health_checks: json!({ "worker": "pass" }).to_string(),
         last_heartbeat: "2023-01-01T00:00:00Z".into(),
+        heartbeat_source: String::new(),
     };
     store.insert_node(node)?;
     Ok(())
@@ -67,7 +68,7 @@ fn run_request(jobspec: String, name: &str) -> RunJobRequest {
     RunJobRequest {
         parsed_jobspec: jobspec,
         submissions: vec![Submission {
-            path: format!("{name}.jsonnet"),
+            path: format!("{name}.ncl"),
             content: name.to_string(),
             is_primary: true,
         }],
@@ -156,6 +157,7 @@ fn task_allocation(
     artifacts: serde_json::Value,
 ) -> TaskAllocation {
     TaskAllocation {
+        provisional: None,
         task_volumes: String::new(),
         allocation_id: id,
         job_id: "job".into(),
@@ -173,6 +175,7 @@ fn task_allocation(
         task_resources: String::new(),
         network: String::new(),
         task_connect: String::new(),
+        ..Default::default()
     }
 }
 
@@ -238,11 +241,17 @@ fn exec_task_stages_http_artifact_and_runs_from_task_dir() -> R<()> {
         assert!(states.contains("\"name\":\"tool\""), "{states}");
     }
 
-    // Manager drops the allocation -> worker destroys it and removes dirs.
+    // Manager drops the allocation -> the worker signals it, then reaps it
+    // once the process is gone. Teardown deliberately waits for the exit:
+    // the alloc dir (and any volumes under it) must not be removed while a
+    // task can still be writing to them (docs/graceful-stop.md).
     let _ = manager.lock().unwrap().reconcile_allocations(&[]);
     assert!(
-        !temp_dir.path().join("allocs").join("21").exists(),
-        "alloc dir removed on destroy"
+        wait_until(Duration::from_secs(15), || {
+            manager.lock().unwrap().reap_terminating();
+            !temp_dir.path().join("allocs").join("21").exists()
+        }),
+        "alloc dir removed once the stopped task has exited"
     );
 
     server.join().ok();

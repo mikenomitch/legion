@@ -1,12 +1,16 @@
 pub mod artifact_credentials;
 pub mod balance;
+pub mod boot_ticket;
+pub mod claims;
 pub mod daemon;
+pub mod edge;
 pub mod exec;
 pub mod forwarder;
 pub mod identity;
 pub mod log_sink;
 pub mod logs;
 pub mod node_check;
+pub mod resources;
 pub mod server;
 pub mod simulate;
 pub mod state;

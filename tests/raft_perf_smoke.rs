@@ -474,6 +474,7 @@ fn ab_node_msg(id: &str) -> NodeMsg {
         pool: "default".into(),
         availability: "available".into(),
         last_heartbeat: "2023-01-01T00:00:00Z".into(),
+        heartbeat_source: String::new(),
         config_attrs: json!({ "maxAllocations": 10000, "resources": {} }),
         fingerprint_attrs: json!({
             "memory_total": "4294967296",
@@ -488,6 +489,7 @@ fn ab_job(name: &str) -> JobConfig {
     let mut task = TaskConfig::new("svc", "noop");
     task.count = legion::structs::job::TaskCount::new(1);
     JobConfig {
+        priority: Default::default(),
         rollout: None,
         rollout_by_group: Default::default(),
         name: name.to_string(),
@@ -498,7 +500,7 @@ fn ab_job(name: &str) -> JobConfig {
 
 fn ab_submission(name: &str, content: &str) -> Submission {
     Submission {
-        path: format!("{name}.jsonnet"),
+        path: format!("{name}.ncl"),
         content: content.to_string(),
         is_primary: true,
     }

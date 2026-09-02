@@ -57,6 +57,7 @@ fn test_node(id: &str) -> Node {
         pool: "default".into(),
         availability: "available".into(),
         last_heartbeat: "2023-01-01T00:00:00Z".into(),
+        heartbeat_source: String::new(),
         config_attrs: json!({ "maxAllocations": 10, "resources": {} }),
         fingerprint_attrs: json!({
             "memory_total": "4294967296",
@@ -69,6 +70,7 @@ fn test_node(id: &str) -> Node {
 
 fn test_job(name: &str) -> JobConfig {
     JobConfig {
+        priority: Default::default(),
         rollout: None,
         rollout_by_group: Default::default(),
         name: name.to_string(),
@@ -79,7 +81,7 @@ fn test_job(name: &str) -> JobConfig {
 
 fn submission(name: &str) -> Submission {
     Submission {
-        path: format!("{name}.jsonnet"),
+        path: format!("{name}.ncl"),
         content: format!("job {name}"),
         is_primary: true,
     }
@@ -350,6 +352,7 @@ fn concurrent_plan_applies_group_commit_with_isolation() -> R<()> {
                         "fresh",
                         &[(node_id, task_id)],
                         &versions,
+                        &[],
                     ),
                 )
             })
@@ -399,7 +402,7 @@ fn replicated_ops_record_raft_engine_metrics() -> R<()> {
     for needle in [
         "legion_raft_capture_seconds_bucket{lane=\"control\",le=\"+Inf\"}",
         "legion_raft_propose_apply_seconds_bucket{lane=\"control\",le=\"+Inf\"}",
-        "legion_raft_ops_total{lane=\"control\",outcome=\"applied\"}",
+        "legion_raft_ops_total{lane=\"control\",op=\"put_kv\",outcome=\"applied\"}",
     ] {
         assert!(
             rendered.contains(needle),
@@ -446,6 +449,7 @@ fn concurrent_planners_cannot_oversubscribe(topology: &str) -> R<()> {
         let mut task = TaskConfig::new("svc", "noop");
         task.resources = json!({ "memory": 3000 });
         let job = JobConfig {
+            priority: Default::default(),
             rollout: None,
             rollout_by_group: Default::default(),
             name: name.to_string(),

@@ -2,10 +2,40 @@
 
 Assorted notes on how to develop Legion
 
+### Build prerequisites on a bare Linux box
+
+macOS and the GitHub Actions runners both satisfy these already, which is
+why nothing else mentions them. A fresh Ubuntu machine does not, and the
+failures are a long way from their cause:
+
+```bash
+sudo apt-get install -y build-essential pkg-config libssl-dev \
+    protobuf-compiler clang libclang-dev
+```
+
+- **`protobuf-compiler`** — `build.rs` compiles `proto/legion.proto`
+  through `tonic-build`. CI installs this one explicitly.
+- **`clang` + `libclang-dev`** — `rusqlite` is built with the `session`
+  feature (raft persistence replicates write effects as SQLite session
+  changesets, see `docs/multi-raft.md`), which forces `libsqlite3-sys` to
+  run `bindgen` at build time. `bindgen` needs libclang *and* clang's own
+  builtin headers. Without them the build dies deep in a dependency with
+  `sqlite3/sqlite3.h:35:10: fatal error: 'stdarg.h' file not found`,
+  which reads like a missing libc rather than a missing clang.
+  `build-essential` does not cover it — that gives you gcc.
+
+`benchmarks/aws/scripts/bootstrap-operator-box.sh` installs this set on
+the box it builds, and verifies the toolchain is reachable over a
+*non-interactive* SSH before it starts a campaign. That second part
+matters: rustup adds `~/.cargo/bin` to the PATH via `~/.bashrc`, which
+Ubuntu's `.bashrc` skips for non-interactive shells, so `ssh host "cargo
+build"` fails with `command not found` on a box where an interactive
+login finds cargo fine.
+
 ### Running locally
 
 <!-- Run the manager -->
-cargo run -- start manager -c configs/manager.jsonnet
+cargo run -- start manager -c configs/manager.ncl
 <!-- Join the cluster as a worker node (note the port and lack of tls) -->
 LEGION_ADDR=http://127.0.0.1:4748 cargo run -- join -a
 <!-- Now you can make calls to legion (note that the port is different, should be TLS in the future) -->

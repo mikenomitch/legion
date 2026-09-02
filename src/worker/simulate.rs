@@ -24,12 +24,12 @@ use crate::structs::{
 };
 use crate::worker::daemon::{
     connect_manager_with_retry, heartbeat_interval_for, jittered_heartbeat_interval,
-    WorkerCredentials,
+    start_worker_telemetry, WorkerCredentials,
 };
 
 use serde::Deserialize;
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tonic::{transport::Channel, Request, Response, Status, Streaming};
 
@@ -217,6 +217,14 @@ fn config_attrs_for(
     }
     attrs.insert("simulated".into(), json!(true));
     attrs.insert("workerAddress".into(), Value::String(worker_address.into()));
+    // The cadence contract is SHARED with the real worker, not forked: a sim
+    // node reports the interval it will beat at exactly as a real one does, so
+    // the manager derives the same lost window for it and the benchmark rig
+    // exercises the real arithmetic rather than a parallel implementation.
+    attrs.insert(
+        "heartbeatSeconds".into(),
+        json!(crate::worker::daemon::heartbeat_interval_for(config).as_secs()),
+    );
     Value::Object(attrs)
 }
 
@@ -235,6 +243,11 @@ struct SimNode {
     /// Desired allocations and when each was first seen (for
     /// `--ready-after`). Fed by heartbeat replies and `PostWork` dispatch.
     allocations: Mutex<HashMap<i64, Instant>>,
+    /// How many allocations this node reported on its last heartbeat. Only
+    /// the *delta* against it feeds the fleet-wide gauge, so keeping the
+    /// process-wide total current costs O(1) per heartbeat instead of a
+    /// walk over every node in the fleet.
+    reported_acked: AtomicUsize,
 }
 
 impl SimNode {
@@ -280,6 +293,12 @@ struct SimFleet {
     registered: AtomicU64,
     heartbeats_ok: AtomicU64,
     heartbeats_failed: AtomicU64,
+    /// Allocations reported as running across the whole fleet, maintained
+    /// by per-node deltas and mirrored into
+    /// `legion_worker_allocations_running`. The summary loop re-derives it
+    /// from the authoritative per-node sets, so a lost update corrects
+    /// itself within one summary interval rather than drifting forever.
+    reported_allocations: AtomicI64,
 }
 
 impl SimFleet {
@@ -288,6 +307,47 @@ impl SimFleet {
             .values()
             .map(|node| node.acked_ids(ready_after).len())
             .sum()
+    }
+
+    /// Fold one node's just-reported allocation count into the fleet-wide
+    /// gauge. O(1): only the change against what this node last reported
+    /// moves the total.
+    fn record_reported_allocations(&self, node: &SimNode, reported: usize) {
+        let previous = node.reported_acked.swap(reported, Ordering::Relaxed);
+        let delta = reported as i64 - previous as i64;
+        if delta == 0 {
+            return;
+        }
+        let total = self
+            .reported_allocations
+            .fetch_add(delta, Ordering::Relaxed)
+            + delta;
+        crate::manager::telemetry::worker_metrics()
+            .allocations_running
+            .set(total);
+    }
+
+    /// Re-derive the fleet gauges from the authoritative per-node state.
+    /// Called on the summary cadence: both incremental paths above are racy
+    /// read-modify-writes against a gauge, so this bounds any drift to one
+    /// summary interval instead of letting it accumulate.
+    ///
+    /// It sums what each node last *reported*, not what each node currently
+    /// holds — that is both the invariant the deltas maintain (so the repair
+    /// cannot itself desync the total) and what the family means: "as
+    /// reported on its last heartbeat".
+    fn resync_gauges(&self) {
+        let reported: i64 = self
+            .nodes
+            .values()
+            .map(|node| node.reported_acked.load(Ordering::Relaxed) as i64)
+            .sum();
+        self.reported_allocations.store(reported, Ordering::Relaxed);
+        let metrics = crate::manager::telemetry::worker_metrics();
+        metrics.allocations_running.set(reported);
+        metrics
+            .simulated_nodes
+            .set(self.registered.load(Ordering::Relaxed) as i64);
     }
 }
 
@@ -334,6 +394,27 @@ impl Worker for SimWorkerService {
     ) -> Result<Response<GetTaskLogsReply>, Status> {
         Err(Status::unimplemented(
             "simulated workers run no tasks and capture no logs",
+        ))
+    }
+
+    type StartClaimStream = std::pin::Pin<
+        Box<
+            dyn tokio_stream::Stream<Item = Result<crate::structs::StartClaimReply, Status>>
+                + Send
+                + 'static,
+        >,
+    >;
+
+    /// Simulated nodes never accept edge starts. The simulator exists to load
+    /// the scheduler; edge boot is a node-local execution path with no
+    /// scheduler cost to model, and pretending to accept a claim would report
+    /// capacity the fleet does not have.
+    async fn start_claim(
+        &self,
+        _request: Request<crate::structs::StartClaimRequest>,
+    ) -> Result<Response<Self::StartClaimStream>, Status> {
+        Err(Status::unimplemented(
+            "simulated workers do not accept edge starts",
         ))
     }
 
@@ -506,6 +587,7 @@ pub async fn launch_simulated_fleet(
                     fingerprint_attrs: fingerprint.clone(),
                     credentials: WorkerCredentials::with_join_secret(join_secret.clone()),
                     allocations: Mutex::new(HashMap::new()),
+                    reported_acked: AtomicUsize::new(0),
                 }),
             );
         }
@@ -516,7 +598,18 @@ pub async fn launch_simulated_fleet(
         registered: AtomicU64::new(0),
         heartbeats_ok: AtomicU64::new(0),
         heartbeats_failed: AtomicU64::new(0),
+        reported_allocations: AtomicI64::new(0),
     });
+
+    // A sim host is exactly the host a scale campaign scrapes, so it exports
+    // the same `legion_worker_*` registry a real worker does — the families
+    // aggregated over the fleet, plus the `simulated_*` ones describing the
+    // fleet itself (docs/metrics.md § Worker). Started before the
+    // registration ramp so a scrape during ramp-up shows the climb.
+    start_worker_telemetry();
+    let metrics = crate::manager::telemetry::worker_metrics();
+    metrics.simulated_nodes_target.set(opts.count as i64);
+    metrics.simulated_nodes.set(0);
 
     let server_fleet = fleet.clone();
     let server_task = tokio::spawn(async move {
@@ -570,7 +663,10 @@ async fn run_sim_node(
     loop {
         match register_sim_node(&client, &node).await {
             Ok(()) => {
-                fleet.registered.fetch_add(1, Ordering::Relaxed);
+                let registered = fleet.registered.fetch_add(1, Ordering::Relaxed) + 1;
+                crate::manager::telemetry::worker_metrics()
+                    .simulated_nodes
+                    .set(registered as i64);
                 break;
             }
             Err(err) => {
@@ -581,7 +677,11 @@ async fn run_sim_node(
         }
     }
 
-    let heartbeat_interval = fleet.heartbeat_interval;
+    // Mutable for the same reason the real worker's is: a manager running
+    // adaptive cadence serves an interval on the reply, and the sim fleet
+    // honors it so a scale run measures the real controller rather than a
+    // fleet that ignores it.
+    let mut heartbeat_interval = fleet.heartbeat_interval;
     let ticks_per_health_check = ((WORKER_NODE_CHECK_DURATION_SEC as f64
         / heartbeat_interval.as_secs_f64().max(0.001))
     .round() as u64)
@@ -589,8 +689,22 @@ async fn run_sim_node(
     let mut backoff = SIM_RETRY_MIN;
     let mut tick: u64 = 0;
     loop {
-        match heartbeat_sim_node(&client, &node, ready_after).await {
-            Ok(()) => {
+        // Timed and classified exactly as the real worker's loop does it
+        // (`daemon::run_heartbeat_loop`), so a campaign reads one set of
+        // `legion_worker_heartbeat*` families whichever fleet produced it.
+        let tick_started = Instant::now();
+        let tick_result = heartbeat_sim_node(&client, &node, &fleet, ready_after).await;
+        let metrics = crate::manager::telemetry::worker_metrics();
+        metrics
+            .heartbeat_duration_seconds
+            .observe(tick_started.elapsed().as_secs_f64());
+        metrics.heartbeats_total.inc(&[match &tick_result {
+            Ok(_) => "ok",
+            Err(status) if status.code() == tonic::Code::Unauthenticated => "unauthenticated",
+            Err(_) => "error",
+        }]);
+        match tick_result {
+            Ok(served) => {
                 fleet.heartbeats_ok.fetch_add(1, Ordering::Relaxed);
                 backoff = SIM_RETRY_MIN;
                 if tick.is_multiple_of(ticks_per_health_check) {
@@ -605,7 +719,15 @@ async fn run_sim_node(
                     }
                 }
                 tick += 1;
-                tokio::time::sleep(jittered_heartbeat_interval(heartbeat_interval)).await;
+                match crate::worker::daemon::adopt_served_interval(heartbeat_interval, served) {
+                    Some(next) => {
+                        heartbeat_interval = next;
+                        tokio::time::sleep(crate::worker::daemon::rephase_sleep(next)).await;
+                    }
+                    None => {
+                        tokio::time::sleep(jittered_heartbeat_interval(heartbeat_interval)).await;
+                    }
+                }
             }
             Err(status) if status.code() == tonic::Code::Unauthenticated => {
                 warn!(node = %node.name, "Sim heartbeat unauthenticated; re-registering");
@@ -631,6 +753,14 @@ async fn run_sim_node(
 }
 
 async fn register_sim_node(client: &ManagerClient<Channel>, node: &SimNode) -> R<()> {
+    let outcome = register_sim_node_inner(client, node).await;
+    crate::manager::telemetry::worker_metrics()
+        .simulated_registrations_total
+        .inc(&[if outcome.is_ok() { "ok" } else { "error" }]);
+    outcome
+}
+
+async fn register_sim_node_inner(client: &ManagerClient<Channel>, node: &SimNode) -> R<()> {
     let req = Request::new(WorkerRegisterRequest {
         name: node.name.clone(),
         pool: node.pool.clone(),
@@ -651,11 +781,18 @@ async fn register_sim_node(client: &ManagerClient<Channel>, node: &SimNode) -> R
 async fn heartbeat_sim_node(
     client: &ManagerClient<Channel>,
     node: &SimNode,
+    fleet: &SimFleet,
     ready_after: Duration,
-) -> Result<(), Status> {
+) -> Result<Option<u32>, Status> {
+    let acked = node.acked_ids(ready_after);
+    fleet.record_reported_allocations(node, acked.len());
     let req = node.credentials.attach(Request::new(HeartbeatRequest {
+        // Simulated nodes never take provisional starts: the simulator
+        // models scheduler load, and edge boot is a node-local execution
+        // path with nothing to model.
+        provisional_claims: Vec::new(),
         id: node.name.clone(),
-        allocation_ids: node.acked_ids(ready_after),
+        allocation_ids: acked,
         failed_allocations: Vec::new(),
         allocation_health: Vec::new(),
         volume_reports: Vec::new(),
@@ -669,7 +806,7 @@ async fn heartbeat_sim_node(
         .map(|allocation| allocation.allocation_id)
         .collect();
     node.reconcile_allocations(&desired);
-    Ok(())
+    Ok(reply.next_interval_seconds)
 }
 
 /// Periodic fleet-status line — cheap enough for campaign scripts to
@@ -679,6 +816,7 @@ async fn run_summary_loop(fleet: Arc<SimFleet>, opts: SimulateOptions) {
     let mut last_at = Instant::now();
     loop {
         tokio::time::sleep(SIM_SUMMARY_INTERVAL).await;
+        fleet.resync_gauges();
         let ok = fleet.heartbeats_ok.load(Ordering::Relaxed);
         let elapsed = last_at.elapsed().as_secs_f64().max(0.001);
         let rate = (ok - last_ok) as f64 / elapsed;
@@ -801,6 +939,7 @@ mod tests {
             fingerprint_attrs: "{}".into(),
             credentials: WorkerCredentials::default(),
             allocations: Mutex::new(HashMap::new()),
+            reported_acked: AtomicUsize::new(0),
         };
         node.accept_allocations([1, 2]);
         // Instantly acked with no delay...
@@ -814,6 +953,78 @@ mod tests {
         let mut acked = node.acked_ids(Duration::ZERO);
         acked.sort();
         assert_eq!(acked, vec![2, 3]);
+    }
+
+    fn sim_node(name: &str) -> Arc<SimNode> {
+        Arc::new(SimNode {
+            name: name.into(),
+            pool: "default".into(),
+            config_attrs: "{}".into(),
+            fingerprint_attrs: "{}".into(),
+            credentials: WorkerCredentials::default(),
+            allocations: Mutex::new(HashMap::new()),
+            reported_acked: AtomicUsize::new(0),
+        })
+    }
+
+    fn sim_fleet(names: &[&str]) -> Arc<SimFleet> {
+        Arc::new(SimFleet {
+            nodes: names
+                .iter()
+                .map(|name| ((*name).to_string(), sim_node(name)))
+                .collect(),
+            heartbeat_interval: Duration::from_secs(1),
+            registered: AtomicU64::new(0),
+            heartbeats_ok: AtomicU64::new(0),
+            heartbeats_failed: AtomicU64::new(0),
+            reported_allocations: AtomicI64::new(0),
+        })
+    }
+
+    /// The fleet-wide allocation total is maintained by per-node deltas
+    /// rather than a walk over the fleet, so the arithmetic has to hold
+    /// across growth, shrink, and repeated identical reports.
+    #[test]
+    fn reported_allocations_track_per_node_deltas() {
+        let fleet = sim_fleet(&["a", "b"]);
+        let a = fleet.nodes["a"].clone();
+        let b = fleet.nodes["b"].clone();
+
+        fleet.record_reported_allocations(&a, 3);
+        fleet.record_reported_allocations(&b, 2);
+        assert_eq!(fleet.reported_allocations.load(Ordering::Relaxed), 5);
+
+        // A node reporting the same count again must not double-count.
+        fleet.record_reported_allocations(&a, 3);
+        assert_eq!(fleet.reported_allocations.load(Ordering::Relaxed), 5);
+
+        // Shrink (allocations stopped) subtracts.
+        fleet.record_reported_allocations(&a, 1);
+        assert_eq!(fleet.reported_allocations.load(Ordering::Relaxed), 3);
+
+        // Drained fleet returns to zero, not to a floor.
+        fleet.record_reported_allocations(&a, 0);
+        fleet.record_reported_allocations(&b, 0);
+        assert_eq!(fleet.reported_allocations.load(Ordering::Relaxed), 0);
+    }
+
+    /// The summary-cadence repair must re-derive exactly the quantity the
+    /// deltas maintain — sum of last-reported counts — or it would desync
+    /// the total it exists to fix.
+    #[test]
+    fn resync_repairs_a_lost_delta_without_desyncing() {
+        let fleet = sim_fleet(&["a", "b"]);
+        fleet.record_reported_allocations(&fleet.nodes["a"].clone(), 4);
+        fleet.record_reported_allocations(&fleet.nodes["b"].clone(), 6);
+
+        // Simulate a lost update (the racy read-modify-write on the gauge).
+        fleet.reported_allocations.store(3, Ordering::Relaxed);
+        fleet.resync_gauges();
+        assert_eq!(fleet.reported_allocations.load(Ordering::Relaxed), 10);
+
+        // And the repaired total still tracks subsequent deltas correctly.
+        fleet.record_reported_allocations(&fleet.nodes["a"].clone(), 5);
+        assert_eq!(fleet.reported_allocations.load(Ordering::Relaxed), 11);
     }
 
     #[test]
@@ -830,14 +1041,25 @@ mod tests {
         );
         assert!(default_interval.as_secs() as i64 * 2 <= DEF_LOST_NODE_AT_SEC);
 
+        // The clamp widened from 30 to 300 once the lost window began moving
+        // with the cadence (docs/heartbeat-cadence-and-scale.md); the sim
+        // fleet follows it because the helper is shared, not forked.
         let configured = WorkerConfig {
             heartbeat_seconds: Some(120),
             ..WorkerConfig::default()
         };
         assert_eq!(
             heartbeat_interval_for(&configured),
-            Duration::from_secs(30),
+            Duration::from_secs(120),
             "sim fleets follow the same clamp as real workers"
+        );
+        let over_clamp = WorkerConfig {
+            heartbeat_seconds: Some(4000),
+            ..WorkerConfig::default()
+        };
+        assert_eq!(
+            heartbeat_interval_for(&over_clamp),
+            Duration::from_secs(u64::from(MAX_WORKER_HEARTBEAT_SECONDS))
         );
     }
 }

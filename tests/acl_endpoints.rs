@@ -93,6 +93,7 @@ fn endpoint_table() -> Vec<(&'static str, Plane)> {
         ("ListServices", Plane::Protected("job:read")),
         ("ResolveService", Plane::Protected("job:read")),
         ("GetNodes", Plane::Protected("node:read")),
+        ("GetHeartbeatCadence", Plane::Protected("node:read")),
         ("GetNode", Plane::Protected("node:read")),
         ("RestartWorker", Plane::Protected("node:write")),
         ("SetNodeAvailability", Plane::Protected("node:write")),
@@ -148,6 +149,14 @@ fn endpoint_table() -> Vec<(&'static str, Plane)> {
         ("CreateJoinToken", Plane::Protected("node:write")),
         ("ListJoinTokens", Plane::Protected("node:read")),
         ("DeleteJoinToken", Plane::Protected("node:write")),
+        // The `boot` resource is deliberately separate from `job`
+        // (docs/edge-boot.md): a platform's ticket minter authorizes
+        // individual starts without holding the right to redeploy the fleet.
+        ("IssueBootTicket", Plane::Protected("boot:write")),
+        ("ListBootTickets", Plane::Protected("boot:read")),
+        // Worker plane: the node that started the work asks the manager to
+        // commit it, authenticated with its node token.
+        ("RatifyClaim", Plane::Worker),
         ("UpsertAclPolicy", Plane::Protected("acl:write")),
         ("GetAclPolicy", Plane::Protected("acl:read")),
         ("ListAclPolicies", Plane::Protected("acl:read")),
@@ -186,17 +195,17 @@ fn req<T>(inner: T, token: Option<&str>) -> Request<T> {
 fn template_source(job_name: &str) -> String {
     format!(
         r#"{{
-  description: 'acl fixture template',
-  variables: [],
-  job(vars):: {{
-    name: '{job_name}',
-    tasks: [{{
-      name: 'main',
-      runtime: 'exec',
-      count: 1,
-      config: {{ command: ['echo', 'ok'] }},
-      resources: {{}},
-      constraints: {{}},
+  description = "acl fixture template",
+  variables = [],
+  job | not_exported = fun vars => {{
+    name = "{job_name}",
+    tasks = [{{
+      name = "main",
+      runtime = "exec",
+      count = 1,
+      config = {{ command = ["echo", "ok"] }},
+      resources = {{}},
+      constraints = {{}},
     }}],
   }},
 }}"#
@@ -288,7 +297,7 @@ async fn call_endpoint(
             .upsert_job_template(req(
                 UpsertJobTemplateRequest {
                     name: TEMPLATE_NAME.into(),
-                    source_jsonnet: template_source(TEMPLATE_JOB_NAME),
+                    source_nickel: template_source(TEMPLATE_JOB_NAME),
                 },
                 token,
             ))
@@ -483,6 +492,10 @@ async fn call_endpoint(
             .map(|_| ()),
         "GetNodes" => svc
             .get_nodes(req(GetNodesRequest::default(), token))
+            .await
+            .map(|_| ()),
+        "GetHeartbeatCadence" => svc
+            .get_heartbeat_cadence(req(GetHeartbeatCadenceRequest {}, token))
             .await
             .map(|_| ()),
         "GetNode" => svc
@@ -887,6 +900,43 @@ async fn call_endpoint(
             .list_join_tokens(req(ListJoinTokensRequest {}, token))
             .await
             .map(|_| ()),
+        "IssueBootTicket" => svc
+            .issue_boot_ticket(req(
+                IssueBootTicketRequest {
+                    job: JOB_NAME.into(),
+                    task: "web".into(),
+                    job_config_id: String::new(),
+                    instance_id: "acl-instance".into(),
+                    instance_prefix: String::new(),
+                    pool: "default".into(),
+                    gate: GateLevel::GateStage as i32,
+                    ttl: "5m".into(),
+                    uses: 1,
+                    idempotency_key: None,
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "ListBootTickets" => svc
+            .list_boot_tickets(req(ListBootTicketsRequest { job: String::new() }, token))
+            .await
+            .map(|_| ()),
+        "RatifyClaim" => svc
+            .ratify_claim(req(
+                RatifyClaimRequest {
+                    node_id: NODE_ID.into(),
+                    claim_id: "clm_acl".into(),
+                    job_config_id: fx.job_config_id.clone(),
+                    task_name: "web".into(),
+                    instance_id: String::new(),
+                    gate: GateLevel::GateStage as i32,
+                    ticket: String::new(),
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
         "DeleteJoinToken" => svc
             .delete_join_token(req(
                 DeleteJoinTokenRequest {
@@ -1013,6 +1063,7 @@ fn seed_fixtures(store: &Store) -> R<Fixtures> {
         dynamic_attrs: "{}".into(),
         health_checks: "[]".into(),
         last_heartbeat: "2026-01-01T00:00:00Z".into(),
+        heartbeat_source: String::new(),
     })?;
 
     let config: JobConfig = serde_json::from_str(&jobspec(JOB_NAME))?;
@@ -1640,6 +1691,175 @@ async fn template_scoped_policy_gates_submission_channel() -> R<()> {
     Ok(())
 }
 
+/// Priority-band scoping: the `bands` selector on `job` rules is what makes
+/// `critical` a privilege instead of a label anyone can claim.
+///
+/// This test exists because `every_manager_rpc_is_classified` cannot catch
+/// its regression: band enforcement is CONDITIONAL logic inside an endpoint
+/// that already has an ACL check, so dropping it leaves that suite green
+/// while the top band silently opens to everyone.
+#[tokio::test]
+async fn band_scoped_policy_gates_the_priority_a_job_may_claim() -> R<()> {
+    let (svc, _fixtures, _) = setup_enabled()?;
+    let authenticator = svc.auth.clone();
+
+    // May submit anything up to `high`, and nothing above it.
+    svc.store.upsert_acl_policy(
+        "band-limited",
+        "",
+        r#"[{"resources": ["job"], "actions": ["read", "write"],
+             "bands": ["high", "elevated", "normal", "low", "background"]}]"#,
+    )?;
+    let (_, secret) = authenticator
+        .mint_token(
+            &svc.store,
+            "band-limited",
+            "client",
+            &["band-limited".into()],
+            None,
+        )
+        .map_err(|s| anyhow!(s.to_string()))?;
+
+    let banded_spec = |name: &str, priority: Option<&str>| {
+        let mut spec = serde_json::json!({
+            "name": name,
+            "tasks": [{
+                "name": "main",
+                "runtime": "exec",
+                "count": 1,
+                "config": { "command": ["echo", "ok"] },
+                "resources": {},
+                "constraints": {},
+            }],
+        });
+        if let Some(priority) = priority {
+            spec["priority"] = serde_json::Value::String(priority.into());
+        }
+        spec.to_string()
+    };
+    let run = |spec: String, secret: String| {
+        let svc = &svc;
+        async move {
+            svc.run_job(req(
+                RunJobRequest {
+                    parsed_jobspec: spec,
+                    submissions: vec![],
+                    priority: None,
+                    force_reschedule: false,
+                    idempotency_key: None,
+                },
+                Some(&secret),
+            ))
+            .await
+        }
+    };
+
+    // Allowed: a band the policy names.
+    run(banded_spec("band-high", Some("high")), secret.clone())
+        .await
+        .expect("a token granted `high` may submit `high`");
+
+    // Allowed: an UNBANDED job. This is the normalization rule doing its
+    // work — absent `priority` means `normal`, and the scope carries the
+    // defaulted band, so a `bands` policy still matches. Without that, every
+    // band-scoped policy would silently stop granting ordinary submissions.
+    run(banded_spec("band-absent", None), secret.clone())
+        .await
+        .expect("an unbanded submit is a `normal` submit, and `normal` is granted");
+
+    // Denied: the one band the policy withholds.
+    let status = run(
+        banded_spec("band-critical", Some("critical")),
+        secret.clone(),
+    )
+    .await
+    .expect_err("a token without `critical` must not claim it");
+    assert_eq!(status.code(), Code::PermissionDenied);
+    assert!(
+        status.message().contains("critical"),
+        "the denial names the band that was refused: {}",
+        status.message()
+    );
+
+    // Denied through a template too: rendering is not a way around the gate.
+    // A RunJob-only check would be bypassable exactly here.
+    svc.store.upsert_job_template_version(
+        "band-escalation",
+        None,
+        r#"{
+  description = "renders a critical job",
+  variables = [],
+  job | not_exported = fun vars => {
+    name = "band-template-job",
+    "priority" = "critical",
+    tasks = [{
+      name = "main",
+      runtime = "noop",
+      count = 1,
+      config = {},
+      resources = {},
+      constraints = {},
+    }],
+  },
+}"#,
+        &[],
+        "fixture",
+    )?;
+    svc.store.upsert_acl_policy(
+        "band-limited-template",
+        "",
+        r#"[{"resources": ["job"], "actions": ["read", "write"],
+             "bands": ["high", "normal"], "templates": ["band-escalation"]},
+            {"resources": ["template"], "actions": ["read"],
+             "templates": ["band-escalation"]}]"#,
+    )?;
+    let (_, template_secret) = authenticator
+        .mint_token(
+            &svc.store,
+            "band-limited-template",
+            "client",
+            &["band-limited-template".into()],
+            None,
+        )
+        .map_err(|s| anyhow!(s.to_string()))?;
+    let status = svc
+        .run_job_template(req(
+            RunJobTemplateRequest {
+                name: "band-escalation".into(),
+                version: None,
+                variables_json: "{}".into(),
+                priority: None,
+                force_reschedule: false,
+                idempotency_key: None,
+            },
+            Some(&template_secret),
+        ))
+        .await
+        .expect_err("a template that renders `critical` is gated like a hand-written spec");
+    assert_eq!(status.code(), Code::PermissionDenied);
+
+    // A policy with no `bands` selector covers every band — bands are open
+    // by default and become a privilege only where a policy says so.
+    svc.store.upsert_acl_policy(
+        "band-unrestricted",
+        "",
+        r#"[{"resources": ["job"], "actions": ["read", "write"]}]"#,
+    )?;
+    let (_, open_secret) = authenticator
+        .mint_token(
+            &svc.store,
+            "band-unrestricted",
+            "client",
+            &["band-unrestricted".into()],
+            None,
+        )
+        .map_err(|s| anyhow!(s.to_string()))?;
+    run(banded_spec("band-open", Some("critical")), open_secret)
+        .await
+        .expect("an unscoped job:write policy still grants every band");
+    Ok(())
+}
+
 /// KV path scoping: reads/writes under the granted prefix succeed, others are
 /// denied, deny rules carve out subtrees, and ListKv filters entries.
 #[tokio::test]
@@ -1720,6 +1940,7 @@ async fn node_pool_scoped_policy_limits_node_access() -> R<()> {
         dynamic_attrs: "{}".into(),
         health_checks: "[]".into(),
         last_heartbeat: "2026-01-01T00:00:00Z".into(),
+        heartbeat_source: String::new(),
     })?;
 
     svc.store.upsert_acl_policy(

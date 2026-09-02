@@ -1,15 +1,49 @@
 # AWS Comparative Benchmark: Legion vs Nomad vs Kubernetes
 
-**Status: IN EXECUTION** — phase 0 shipped
-([worker-simulation-plan.md](worker-simulation-plan.md), 2026-07-30);
-phase 1's rig is fully prepared and locally validated in
-`benchmarks/aws/` (Terraform `validate`-clean, campaign/experiment
-scripts, translator + driver with a fixture-tested dry-run gate,
-`scripts/local-smoke.sh` green end-to-end against a real manager + sim
-fleet) but **not yet applied to a real AWS account** — phase 1's exit
-criterion (1k-node cloud smoke) awaits one. Phases 2-5 not started;
-the Nomad/K8s install scripts and driver adapters are written but
-marked TO-VERIFY until their phases run.
+**Status: IN EXECUTION** — phase 2 is blocked on the scheduler, not on
+the rig. The second campaign (2026-08-04,
+[findings](../aws-phase2-findings.md)) ran Legion A across 1k/2k/5k
+nodes and found that **74% of plan applies are rejected and re-planned**,
+with throughput *falling* as eval threads are added. No comparative
+number should be published from this state: it would measure a defect
+that is being fixed, and the Nomad/K8s campaigns would be compared
+against Legion's worst configuration. Phases 3-5 wait for
+[plan-apply-conflict-reduction-plan.md](plan-apply-conflict-reduction-plan.md).
+The rig itself is now sound — every failure of that campaign was a rig
+bug, all fixed, recorded in calls entries 21-22 and 25-27.
+
+**The load generator was the last of those (2026-08-05).** Submission
+was one `legion job run` process per job and ceilinged at ~36-103
+jobs/sec, which several cells reported as Legion's throughput while the
+control plane idled; `legion-loadgen` (`benchmarks/loadgen/`) replaces it
+for Legion with one process and concurrent `RunJob` calls, measured at
+5-7x the CLI loop (1,107-1,492 jobs/sec locally). It is **Legion-only**,
+so phases 3-5 must run
+every system on the shared CLI loop (`LEGION_SUBMITTER=cli`) or grow
+native submitters for Nomad and K8s first — calls entries 23-24.
+
+Phase 0 shipped
+([worker-simulation-plan.md](worker-simulation-plan.md), 2026-07-30).
+**Phase 1 is complete** — its exit criterion passed on real AWS
+2026-08-02/03 ([findings](../aws-phase1-findings.md)), though that
+night's numbers measured the heartbeat ceiling rather than the scheduler
+and must not be quoted. **Phase 2 ran 2026-08-04** and is the source of
+the blocker above. Phases 3-5 (Nomad, K8s, analysis) not started; their
+install scripts and driver adapters remain TO-VERIFY until they run.
+
+Packing density is **measured at 4,000 nodes/instance** (99% cadence, 1%
+CPU, 3% memory on a `c7i.2xlarge`), retiring the plan's 1,250 estimate
+and the contaminated 125 from phase 1. Every scale step therefore needs
+far fewer spot instances than the topology table below assumes: 10k
+nodes is 3 instances, and the 20k validation burst is 5 — comfortably
+inside both the ASG's 20-instance cap and the 256 vCPU spot quota, so the
+quota increase phase 1 called for is **not needed**.
+
+Campaigns can be run unattended since 2026-08-02:
+`scripts/remote-campaign.sh` drives them from the loadgen box so a run
+does not depend on the operator's machine staying awake or holding one
+IP, and the spot fleet is released whenever a campaign exits. Also
+TO-VERIFY until phase 1 runs on a real account. See calls entries 11-13.
 
 > **Judgement calls:** [`../calls/aws-comparative-benchmark-plan_calls.md`](../calls/aws-comparative-benchmark-plan_calls.md)
 
@@ -149,7 +183,29 @@ warm-up period discarded.
   counts transitions to placed/running-equivalent state).
 - **Placement latency**: submit→placed p50/p95/p99 (driver timestamps).
 - **Recovery**: storm scenario time-to-100%-replaced.
-- **Control-plane cost**: CPU/mem per manager (node_exporter), and for
+- **Control-plane memory vs load**: peak and mean bytes per role at every
+  scale step, so memory is comparable across low/medium/high load the
+  same way throughput is. The scale steps (1k/2k/5k/10k) are the load
+  axis — no separate experiment is needed, because every cell is already
+  archived at a known node count. `collect.sh` records two series per
+  cell and reduces them into `memory.json` next to `metrics.json`:
+  - `used` = `MemTotal - MemAvailable`. What the box needs provisioned.
+  - `anon` = used minus page cache and buffers. The closer proxy for the
+    manager's own footprint. The split matters: on the idle rig the
+    control plane measures 1.63 GB used against 0.92 GB anon, so page
+    cache is ~40% of `used`, and a SQLite-backed store only grows that
+    share. Reporting `used` alone would overstate resident cost.
+
+  **Known limitation:** this is whole-box memory from node_exporter, not
+  the manager process's RSS. Legion registers no process collector, so
+  `process_resident_memory_bytes` is not exposed on `:4749`. The
+  control-plane boxes run nothing else of consequence, so box memory
+  tracks the manager closely, but these numbers are an upper bound and
+  must be reported as such. Adding a process collector is the real fix
+  and is deliberately *not* done mid-campaign: it changes the binary
+  under test and so invalidates the fairness record for every cell
+  already collected.
+- **Control-plane cost**: CPU per manager (node_exporter), and for
   Legion the per-phase histogram (`legion_scheduler_plan_phase_seconds`)
   — the phase curves are what make projection defensible rather than
   hand-wavy. K8s: `scheduler_framework_extension_point_duration_seconds`
