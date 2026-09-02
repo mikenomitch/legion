@@ -34,7 +34,7 @@
                     ],
                     rules = [
                         {
-                            match = { header = { authorization = "*" } },
+                            when = { header = { authorization = "*" } },
                             action = "deny",
                             reason = "credentials must not leave the sandbox",
                         },

@@ -506,9 +506,24 @@ impl AllocUpstream {
 #[serde(rename_all = "camelCase")]
 pub struct AllocPort {
     pub name: String,
+    /// The advertised port: what the catalog, `resolve`, and health checks
+    /// target, and — without an ingress chain — what the task binds.
     pub host_port: u16,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub to: Option<u16>,
+    /// With an ingress chain (docs/network-handlers.md), the port the task
+    /// actually binds: the node datapath owns `host_port` and forwards to
+    /// this one through the chain. `LEGION_PORT_<label>` carries this value
+    /// so the task's instruction — bind `$LEGION_PORT_<label>` — is unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub private_port: Option<u16>,
+}
+
+impl AllocPort {
+    /// The port the task binds.
+    pub fn bind_port(&self) -> u16 {
+        self.private_port.unwrap_or(self.host_port)
+    }
 }
 
 /// Concrete network facts for one allocation: the node address serving its
@@ -559,7 +574,7 @@ impl AllocNetwork {
         let mut pairs = Vec::new();
         for port in &self.ports {
             let label = sanitize_env_label(&port.name);
-            pairs.push((format!("LEGION_PORT_{label}"), port.host_port.to_string()));
+            pairs.push((format!("LEGION_PORT_{label}"), port.bind_port().to_string()));
             if let Some(to) = port.to {
                 pairs.push((format!("LEGION_PORT_TO_{label}"), to.to_string()));
             }
@@ -787,6 +802,20 @@ pub fn assign_allocation_ports_with_vips(
     service_ports: &HashMap<String, u16>,
     vip_block: Option<&str>,
 ) -> R<(Vec<AllocPort>, Vec<AllocUpstream>)> {
+    assign_allocation_ports_full(network, connect, used, service_ports, vip_block, false)
+}
+
+/// [`assign_allocation_ports_with_vips`] plus, when `ingress` is set, a
+/// second, private port per declared port: the datapath binds the advertised
+/// one and the task binds the private one.
+pub fn assign_allocation_ports_full(
+    network: Option<&NetworkConfig>,
+    connect: Option<&ConnectConfig>,
+    used: &HashSet<u16>,
+    service_ports: &HashMap<String, u16>,
+    vip_block: Option<&str>,
+    ingress: bool,
+) -> R<(Vec<AllocPort>, Vec<AllocUpstream>)> {
     const NO_PORTS: &[PortConfig] = &[];
     const NO_UPSTREAMS: &[UpstreamConfig] = &[];
     let ports = network.map_or(NO_PORTS, |network| network.ports.as_slice());
@@ -808,6 +837,7 @@ pub fn assign_allocation_ports_with_vips(
                 name: port.name.clone(),
                 host_port: static_port,
                 to: port.to,
+                private_port: None,
             });
         }
     }
@@ -841,6 +871,7 @@ pub fn assign_allocation_ports_with_vips(
             name: port.name.clone(),
             host_port,
             to: port.to,
+            private_port: None,
         });
     }
     for upstream in upstreams {
@@ -860,6 +891,19 @@ pub fn assign_allocation_ports_with_vips(
             vip: None,
             canonical_port: None,
         });
+    }
+
+    // Ingress: every advertised port gets a private twin from the same
+    // dynamic range; the datapath owns the advertised one.
+    if ingress {
+        for port in assigned.iter_mut() {
+            let private = next_dynamic_port(
+                &mut cursor,
+                &mut taken,
+                &format!("port '{}' private (ingress) port", port.name),
+            )?;
+            port.private_port = Some(private);
+        }
     }
 
     // VIPs: in declaration order so `<block>.2` is the first upstream the
@@ -1376,6 +1420,7 @@ mod tests {
                 name: "http-2".into(),
                 host_port: 20000,
                 to: Some(8080),
+                private_port: None,
             }],
             upstreams: Vec::new(),
             vip_block: None,
@@ -1430,6 +1475,56 @@ mod tests {
         assert_eq!(config.upstreams[0].balance_name(), "least_conn");
         assert!(is_known_balance(&config.upstreams[0].balance_name()));
         assert!(is_known_balance(DEFAULT_BALANCE));
+    }
+
+    /// Ingress: the datapath owns every advertised port and the task binds
+    /// a private twin from the same range (docs/network-handlers.md).
+    #[test]
+    fn ingress_gives_every_advertised_port_a_private_twin() -> R<()> {
+        let network = NetworkConfig {
+            ports: vec![
+                PortConfig {
+                    name: "http".into(),
+                    static_port: Some(8080),
+                    to: None,
+                },
+                PortConfig {
+                    name: "admin".into(),
+                    static_port: None,
+                    to: None,
+                },
+            ],
+            ..NetworkConfig::default()
+        };
+        let (ports, _) = assign_allocation_ports_full(
+            Some(&network),
+            None,
+            &HashSet::new(),
+            &HashMap::new(),
+            None,
+            true,
+        )?;
+        assert_eq!(ports.len(), 2);
+        assert_eq!(ports[0].host_port, 8080, "the advertised port is untouched");
+        let private = ports[0].private_port.expect("a private twin");
+        assert_ne!(private, 8080);
+        assert_eq!(ports[0].bind_port(), private, "the task binds the twin");
+        let all: HashSet<u16> = ports
+            .iter()
+            .flat_map(|port| [port.host_port, port.private_port.unwrap()])
+            .collect();
+        assert_eq!(
+            all.len(),
+            4,
+            "advertised and private ports are all distinct"
+        );
+
+        // Without an ingress chain nothing changes: the task binds the
+        // advertised port itself.
+        let (plain, _) = assign_allocation_ports(Some(&network), None, &HashSet::new())?;
+        assert!(plain.iter().all(|port| port.private_port.is_none()));
+        assert_eq!(plain[0].bind_port(), 8080);
+        Ok(())
     }
 
     #[test]

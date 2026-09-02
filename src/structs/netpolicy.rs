@@ -316,7 +316,9 @@ pub struct ChainConfig {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct RuleConfig {
-    #[serde(rename = "match", default)]
+    /// Written `when` (`match` is a Nickel keyword; it is still accepted as
+    /// an alias for JSON callers).
+    #[serde(rename = "when", alias = "match", default)]
     pub matcher: RuleMatch,
     /// `allow` or `deny`.
     pub action: String,

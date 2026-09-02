@@ -15,6 +15,7 @@ use crate::structs::{
     DeleteNetPolicyRequest, GetNetPolicyObjectRequest, ListNetPoliciesRequest, NetPolicy,
     ShowNetPolicyRequest, TestNetPolicyRequest, UpsertNetPolicyRequest,
 };
+use serde::Serialize;
 use std::path::Path;
 use tabled::{Table, Tabled};
 
@@ -105,6 +106,11 @@ pub fn config() -> Command {
                         .arg(json_flag()),
                 )
                 .subcommand(
+                    job_scope(Command::new("doctor"))
+                        .about("Walk a task's network layers — policy, mode, capture, listeners, gate — and name the first one that is wrong")
+                        .arg(json_flag()),
+                )
+                .subcommand(
                     job_scope(Command::new("test"))
                         .about("Dry-run a verdict: may this task reach --to, or be reached from --from?")
                         .arg(Arg::new("to").long("to").help("Egress destination: host[:port], IP, or URL"))
@@ -125,6 +131,7 @@ pub async fn handle(matches: &ArgMatches) -> R<()> {
             Some(("describe", sub)) => describe(sub).await,
             Some(("delete", sub)) => delete(sub).await,
             Some(("show", sub)) => show(sub).await,
+            Some(("doctor", sub)) => doctor(sub).await,
             Some(("test", sub)) => test(sub).await,
             _ => unreachable!(),
         },
@@ -582,5 +589,259 @@ async fn test(matches: &ArgMatches) -> R<()> {
         _ => "?",
     };
     println!("{mark} {} {}", reply.verdict, reply.explanation);
+    Ok(())
+}
+
+/// One layer of the `doctor` walk.
+#[derive(Serialize, Clone)]
+pub(crate) struct DoctorStep {
+    layer: &'static str,
+    status: &'static str,
+    detail: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hint: Option<String>,
+}
+
+/// A node's datapath status for one allocation (`ShowNetPolicyReply.node_status_json`).
+#[derive(serde::Deserialize, Default, Clone)]
+#[serde(rename_all = "camelCase")]
+struct NodeStatus {
+    #[serde(default)]
+    node_id: String,
+    #[serde(default)]
+    allocation_id: i64,
+    #[serde(default)]
+    mode: String,
+    #[serde(default)]
+    capture_ready: bool,
+    #[serde(default)]
+    policy_hash: String,
+    #[serde(default)]
+    upstreams_bound: Vec<String>,
+    #[serde(default)]
+    ingress_bound: Vec<String>,
+    #[serde(default)]
+    resolver_ready: bool,
+    #[serde(default)]
+    proxy_ready: bool,
+    #[serde(default)]
+    gate_shut: bool,
+    #[serde(default)]
+    problems: Vec<String>,
+}
+
+/// The ladder: policy resolved → mode and whether it is enforced → datapath
+/// ready (namespace, listeners, resolver, proxy) → gate → problems. Stops
+/// at the first failure with a verdict, a cause, and a fix hint — the
+/// `legion service doctor` contract.
+pub(crate) fn diagnose_network(
+    job_id: &str,
+    task_name: &str,
+    reply: &crate::structs::ShowNetPolicyReply,
+) -> Vec<DoctorStep> {
+    let effective: EffectivePolicy =
+        serde_json::from_str(&reply.effective_json).unwrap_or_default();
+    let statuses: Vec<NodeStatus> = reply
+        .node_status_json
+        .iter()
+        .filter_map(|json| serde_json::from_str(json).ok())
+        .collect();
+    let mut steps = Vec::new();
+
+    // 1. Policy.
+    if effective.is_empty() {
+        steps.push(DoctorStep {
+            layer: "policy",
+            status: "info",
+            detail: format!("no network policy applies to {job_id}/{task_name}; everything is allowed"),
+            hint: Some("apply one with `legion net policy apply -f <file.ncl>` or add `network.egress` to the task".into()),
+        });
+    } else {
+        let sources = if reply.matched_policies.is_empty() {
+            "the task's own block".to_string()
+        } else {
+            format!(
+                "stored {} + the task's own block",
+                reply.matched_policies.join(", ")
+            )
+        };
+        let summary = |chain: Option<&crate::structs::netpolicy::EffectiveChain>| match chain {
+            Some(chain) => format!(
+                "{} {} {} rules {} handlers",
+                chain.protocol,
+                chain.policy,
+                chain.rules.len(),
+                chain.handlers.len()
+            ),
+            None => "none".to_string(),
+        };
+        steps.push(DoctorStep {
+            layer: "policy",
+            status: "ok",
+            detail: format!(
+                "policy resolved from {sources}: egress {}, ingress {}",
+                summary(effective.egress.as_ref()),
+                summary(effective.ingress.as_ref())
+            ),
+            hint: None,
+        });
+        if let Some(ingress) = effective.ingress.as_ref() {
+            if ingress.denies_by_default() && ingress.rules.iter().all(|r| r.rule.action == "deny")
+            {
+                steps.push(DoctorStep {
+                    layer: "policy",
+                    status: "warn",
+                    detail: "the ingress chain denies everything, including this task's own health checks".into(),
+                    hint: Some("add an allow rule for the checker (e.g. `when = { cidr = \"127.0.0.0/8\" }`) or the consumers".into()),
+                });
+            }
+        }
+    }
+
+    // 2. Mode and enforcement.
+    let mode = reply.effective_mode.as_str();
+    let enforced = mode == "gated";
+    steps.push(DoctorStep {
+        layer: "mode",
+        status: if enforced { "ok" } else { "info" },
+        detail: if enforced {
+            "network.mode is gated: the task's namespace has no route except the datapath (enforced)".into()
+        } else {
+            format!("network.mode is {mode}: egress policy is cooperative (upstreams, resolver, proxy env); a raw dial bypasses it")
+        },
+        hint: (!enforced && effective.egress.is_some())
+            .then(|| "for an unbypassable boundary set `network.mode = \"gated\"` (Linux, container/exec) or impose it with a `require` policy".to_string()),
+    });
+
+    // 3. Datapath readiness, per running allocation.
+    if statuses.is_empty() {
+        steps.push(DoctorStep {
+            layer: "datapath",
+            status: if effective.is_empty() { "info" } else { "warn" },
+            detail: "no running allocation has reported datapath status yet".into(),
+            hint: Some("the node reports it on its next heartbeat; if the task is not running, that is the problem to fix first (`legion job status`)".into()),
+        });
+        return steps;
+    }
+    for status in &statuses {
+        let alloc = if status.node_id.is_empty() {
+            status.allocation_id.to_string()
+        } else {
+            format!("{} on {}", status.allocation_id, status.node_id)
+        };
+        if status.mode == "gated" && !status.capture_ready {
+            steps.push(DoctorStep {
+                layer: "datapath",
+                status: "fail",
+                detail: format!(
+                    "allocation {alloc}: gated capture is not ready — the task has no network"
+                ),
+                hint: Some(status.problems.join("; ")),
+            });
+            return steps;
+        }
+        if !status.problems.is_empty() {
+            steps.push(DoctorStep {
+                layer: "datapath",
+                status: "warn",
+                detail: format!("allocation {alloc}: {}", status.problems.join("; ")),
+                hint: None,
+            });
+        }
+        if !effective.is_empty() && status.policy_hash.is_empty() {
+            steps.push(DoctorStep {
+                layer: "datapath",
+                status: if status.mode == "gated" { "fail" } else { "warn" },
+                detail: format!("allocation {alloc}: the node has not received the policy body yet (fail-closed while gated)"),
+                hint: Some("the worker fetches it by hash on its next heartbeat; persistent means the manager could not serve FetchNetPolicy — check manager logs".into()),
+            });
+            return steps;
+        }
+        if !status.policy_hash.is_empty()
+            && !effective.hash.is_empty()
+            && status.policy_hash != effective.hash
+        {
+            steps.push(DoctorStep {
+                layer: "datapath",
+                status: "info",
+                detail: format!("allocation {alloc}: enforcing an older policy ({}…) than the manager computes ({}…); converges on the next heartbeat", &status.policy_hash[..8.min(status.policy_hash.len())], &effective.hash[..8.min(effective.hash.len())]),
+                hint: None,
+            });
+        }
+        if status.gate_shut {
+            steps.push(DoctorStep {
+                layer: "gate",
+                status: "warn",
+                detail: format!("allocation {alloc}: the edge-boot gate is shut — every connection is denied until the placement is ratified"),
+                hint: Some("normal for a `boot`-gated provisional start; see docs/edge-boot.md".into()),
+            });
+        }
+        steps.push(DoctorStep {
+            layer: "datapath",
+            status: "ok",
+            detail: format!(
+                "allocation {alloc}: mode {}, {} upstream listener(s), {} ingress listener(s), resolver {}, proxy {}",
+                status.mode,
+                status.upstreams_bound.len(),
+                status.ingress_bound.len(),
+                if status.resolver_ready { "up" } else { "n/a" },
+                if status.proxy_ready { "up" } else { "n/a" },
+            ),
+            hint: None,
+        });
+    }
+    steps
+}
+
+/// The overall verdict: the worst status any step reached.
+pub(crate) fn doctor_verdict(steps: &[DoctorStep]) -> &'static str {
+    if steps.iter().any(|s| s.status == "fail") {
+        "fail"
+    } else if steps.iter().any(|s| s.status == "warn") {
+        "warn"
+    } else {
+        "ok"
+    }
+}
+
+async fn doctor(matches: &ArgMatches) -> R<()> {
+    let format = OutputFormat::from_matches(matches);
+    let (job_id, task_name, node_pool) = job_scope_args(matches);
+    let mut client = connect_manager_client().await?;
+    let reply = output::resolve(
+        format,
+        "net doctor",
+        client
+            .show_net_policy(ShowNetPolicyRequest {
+                job_id: job_id.clone(),
+                task_name: task_name.clone(),
+                node_pool,
+            })
+            .await,
+    )?
+    .into_inner();
+    let steps = diagnose_network(&job_id, &task_name, &reply);
+    let worst = doctor_verdict(&steps);
+    if format.is_json() {
+        output::print_success(&json!({
+            "job": job_id,
+            "task": task_name,
+            "verdict": worst,
+            "steps": steps,
+        }));
+        return Ok(());
+    }
+    for step in &steps {
+        let mark = match step.status {
+            "ok" => "✓",
+            "info" => "·",
+            "warn" => "!",
+            _ => "✗",
+        };
+        println!("{mark} {:<9} {}", step.layer, step.detail);
+        if let Some(hint) = step.hint.as_deref().filter(|h| !h.is_empty()) {
+            println!("  → {hint}");
+        }
+    }
     Ok(())
 }

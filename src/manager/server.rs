@@ -1106,6 +1106,11 @@ pub struct ManagerDaemonService {
     /// re-read at most every `NET_POLICY_GENERATION_TTL`, so a cluster with
     /// no policies pays a mutex read per heartbeat rather than a query.
     net_policy_generation: Arc<Mutex<Option<(std::time::Instant, u64)>>>,
+    /// The datapath status each node last reported for its allocations
+    /// (docs/network-handlers.md). In memory like `provisional_claims`: it
+    /// is at most one heartbeat stale and a failover shows nothing until
+    /// the next beat, never a wrong answer.
+    net_status: Arc<Mutex<HashMap<String, Vec<crate::structs::NetAllocStatus>>>>,
 }
 
 /// Distinct merged policy bodies kept in memory.
@@ -1142,6 +1147,7 @@ impl ManagerDaemonService {
             heartbeat: crate::structs::HeartbeatConfigFull::default(),
             net_policy_cache: Arc::new(Mutex::new(HashMap::new())),
             net_policy_generation: Arc::new(Mutex::new(None)),
+            net_status: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -5274,6 +5280,15 @@ impl Manager for ManagerDaemonService {
         for denial in &req.net_denials {
             self.store.events().net_denied(&id, denial);
         }
+        // The node's own view of its datapath, replaced wholesale per node.
+        {
+            let mut status = self.net_status.lock().unwrap_or_else(|p| p.into_inner());
+            if req.net_status.is_empty() {
+                status.remove(&id);
+            } else {
+                status.insert(id.clone(), req.net_status.clone());
+            }
+        }
         // Reclaim work for this node. Re-sent every heartbeat until the worker
         // confirms, so a worker that dies mid-destroy simply retries.
         let volume_destroy = build_volume_destroy_requests(&self.store, &id);
@@ -6363,11 +6378,13 @@ impl Manager for ManagerDaemonService {
             .mode
             .clone()
             .unwrap_or_else(|| declared_mode.clone());
+        let node_status_json = self.net_status_for_task(&req.job_id, &task.name);
         Ok(Response::new(ShowNetPolicyReply {
             effective_json: serde_json::to_string(&effective).unwrap_or_default(),
             matched_policies: matched,
             declared_mode,
             effective_mode,
+            node_status_json,
         }))
     }
 
@@ -8740,6 +8757,40 @@ impl ManagerDaemonService {
         Ok((task, facts))
     }
 
+    /// The datapath status nodes last reported for this task's running
+    /// allocations, as JSON, for `net doctor` and the UI.
+    fn net_status_for_task(&self, job_id: &str, task_name: &str) -> Vec<String> {
+        let Ok(allocations) = self.store.allocs_for_job(job_id) else {
+            return Vec::new();
+        };
+        let mut task_allocs: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        let mut configs: HashMap<i64, bool> = HashMap::new();
+        for allocation in &allocations {
+            let is_task = *configs.entry(allocation.task_config_id).or_insert_with(|| {
+                self.store
+                    .get_task_config_by_id(allocation.task_config_id)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|task| task.name == task_name)
+            });
+            if is_task {
+                task_allocs.insert(allocation.id);
+            }
+        }
+        let status = self.net_status.lock().unwrap_or_else(|p| p.into_inner());
+        let mut out = Vec::new();
+        for (node_id, entries) in status.iter() {
+            for entry in entries {
+                if task_allocs.contains(&entry.allocation_id) {
+                    out.push(
+                        serde_json::to_string(&net_status_json(node_id, entry)).unwrap_or_default(),
+                    );
+                }
+            }
+        }
+        out
+    }
+
     /// Running allocations whose effective policy would change if `object`
     /// were applied, as `job/task@allocation`. Best effort; used by dry runs
     /// and the applied event.
@@ -8837,6 +8888,23 @@ fn enforce_net_policy_scope(
         acl::enforce(identity, AclResource::Net, action, &AclScope::pool(pool))?;
     }
     Ok(())
+}
+
+/// A `NetAllocStatus` as the JSON the CLI and UI read.
+fn net_status_json(node_id: &str, status: &crate::structs::NetAllocStatus) -> Value {
+    json!({
+        "nodeId": node_id,
+        "allocationId": status.allocation_id,
+        "mode": status.mode,
+        "captureReady": status.capture_ready,
+        "policyHash": status.policy_hash,
+        "upstreamsBound": status.upstreams_bound,
+        "ingressBound": status.ingress_bound,
+        "resolverReady": status.resolver_ready,
+        "proxyReady": status.proxy_ready,
+        "gateShut": status.gate_shut,
+        "problems": status.problems,
+    })
 }
 
 fn net_policy_to_proto(

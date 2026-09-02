@@ -521,3 +521,23 @@ allowed*. Coupling them would make `gated` a policy in disguise and break
 the one-liner story (`egress = { allow = [...] }` is where deny-by-default
 comes from). The fail-closed rules exist for the one case where the node
 genuinely does not know the answer yet, and only there.
+
+---
+
+## 22. Rules say `when`, not `match`
+
+**Call.** The rule matcher is written `when = { host = "..." }`. `match` is
+still accepted as an alias for JSON callers (MCP, the API), but every doc,
+example, and `legion net policy describe` output says `when`.
+
+**Alternatives.** Keep `match` and require Nickel authors to quote it
+(`"match" = { ... }`), as `"priority"` already has to be quoted; or rename to
+`on` / `if`.
+
+**Trade-off.** Two accepted spellings for one field, forever; anyone who
+learned `match` from the first revision of this plan retypes it.
+
+**Why.** `match` is a Nickel keyword — the unquoted form fails to parse, and
+a rule language whose most common word needs quoting is not "simple rules
+for sandboxes". `when` reads as the sentence it is (`when host is X, deny`)
+and collides with nothing. Simplicity of the surface.

@@ -16,6 +16,7 @@ export type RuleMatch = {
 }
 
 export type EffectiveRule = {
+  when?: RuleMatch
   match?: RuleMatch
   action: string
   reason?: string
@@ -129,7 +130,7 @@ function ChainView(props: { direction: 'egress' | 'ingress'; chain: EffectiveCha
                 >
                   {rule.action}
                 </span>
-                <span class="font-mono text-xs text-ink">{describeMatch(rule.match)}</span>
+                <span class="font-mono text-xs text-ink">{describeMatch(rule.when ?? rule.match)}</span>
                 <SourceBadge source={rule.source} />
                 <Show when={rule.reason}>
                   <span class="text-xs text-muted">— {rule.reason}</span>
@@ -163,12 +164,102 @@ function ChainView(props: { direction: 'egress' | 'ingress'; chain: EffectiveCha
   )
 }
 
-// The effective policy for one task, as `legion net policy show` prints it.
+// What the node running each allocation says its datapath is doing
+// (`ShowNetPolicyReply.node_status_json`, one line per allocation) — the
+// difference between "a policy exists" and "the policy is enforced".
+export type NodeStatus = {
+  nodeId?: string
+  allocationId?: number
+  mode?: string
+  captureReady?: boolean
+  policyHash?: string
+  upstreamsBound?: string[]
+  ingressBound?: string[]
+  resolverReady?: boolean
+  proxyReady?: boolean
+  gateShut?: boolean
+  problems?: string[]
+}
+
+export const parseNodeStatuses = (lines?: string[]): NodeStatus[] =>
+  (lines ?? []).flatMap((line) => {
+    try {
+      return [JSON.parse(line) as NodeStatus]
+    } catch {
+      return []
+    }
+  })
+
+export function DatapathStatus(props: { statuses: NodeStatus[]; policyHash?: string }) {
+  return (
+    <Show
+      when={props.statuses.length > 0}
+      fallback={
+        <p class="text-xs text-faint">
+          No running allocation has reported datapath status yet; nodes report it on their next heartbeat.
+        </p>
+      }
+    >
+      <ul class="space-y-2">
+        <For each={props.statuses}>
+          {(status) => {
+            const gated = () => status.mode === 'gated'
+            const pending = () => !!props.policyHash && !status.policyHash
+            const live = () => !!status.policyHash && (!props.policyHash || status.policyHash === props.policyHash)
+            return (
+              <li class="rounded-md border border-line bg-surface2/40 p-3">
+                <div class="flex flex-wrap items-center gap-2 text-sm">
+                  <span class="font-mono text-xs text-ink">alloc {status.allocationId ?? '?'}</span>
+                  <Show when={status.nodeId}>
+                    <span class="text-xs text-muted">
+                      on <span class="font-mono">{status.nodeId}</span>
+                    </span>
+                  </Show>
+                  <Badge tone={gated() ? 'info' : 'neutral'}>{status.mode || 'host'}</Badge>
+                  <Badge tone={gated() ? (status.captureReady ? 'ok' : 'danger') : 'neutral'} dot>
+                    {gated() ? (status.captureReady ? 'enforced' : 'no network') : 'cooperative'}
+                  </Badge>
+                  <Show when={props.policyHash || status.policyHash}>
+                    <Badge tone={pending() ? (gated() ? 'danger' : 'warn') : live() ? 'ok' : 'neutral'}>
+                      {pending() ? 'policy pending' : live() ? 'policy live' : 'older policy'}
+                    </Badge>
+                  </Show>
+                  <Show when={status.gateShut}>
+                    <Badge tone="warn">boot gate shut</Badge>
+                  </Show>
+                </div>
+                <div class="mt-1 flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted">
+                  <span>{status.upstreamsBound?.length ?? 0} upstream listener(s)</span>
+                  <span>{status.ingressBound?.length ?? 0} ingress listener(s)</span>
+                  <Show when={status.resolverReady}>
+                    <span>resolver up</span>
+                  </Show>
+                  <Show when={status.proxyReady}>
+                    <span>egress proxy up</span>
+                  </Show>
+                </div>
+                <Show when={(status.problems?.length ?? 0) > 0}>
+                  <ul class="mt-1 space-y-0.5 text-xs text-danger">
+                    <For each={status.problems ?? []}>{(problem) => <li>{problem}</li>}</For>
+                  </ul>
+                </Show>
+              </li>
+            )
+          }}
+        </For>
+      </ul>
+    </Show>
+  )
+}
+
+// The effective policy for one task, as `legion net policy show` prints it,
+// plus what each node running it says the datapath is doing.
 export function EffectivePolicyView(props: {
   policy?: EffectivePolicy
   declaredMode?: string
   effectiveMode?: string
   matched?: string[]
+  nodeStatus?: string[]
 }) {
   return (
     <div class="space-y-3">
@@ -205,6 +296,12 @@ export function EffectivePolicyView(props: {
         <Show when={props.policy?.ingress}>
           <ChainView direction="ingress" chain={props.policy!.ingress!} />
         </Show>
+      </Show>
+      <Show when={props.nodeStatus !== undefined}>
+        <div>
+          <div class="mb-1 text-xs font-semibold uppercase tracking-wider text-muted">Datapath</div>
+          <DatapathStatus statuses={parseNodeStatuses(props.nodeStatus)} policyHash={props.policy?.hash} />
+        </div>
       </Show>
     </div>
   )

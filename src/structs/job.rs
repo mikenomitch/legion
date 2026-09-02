@@ -1260,6 +1260,10 @@ impl StatefulStorageConfig {
 /// window is an operator-owned maximum, not an application-owned one.
 pub const MAX_KILL_AFTER: Duration = Duration::from_secs(5 * 60);
 
+/// Ceiling on `stop.drain`. Same reasoning as [`MAX_KILL_AFTER`]: a drain
+/// may slow a rollout, never wedge one.
+pub const MAX_DRAIN: Duration = Duration::from_secs(5 * 60);
+
 fn default_stop_signal() -> String {
     "SIGTERM".to_string()
 }
@@ -1296,6 +1300,19 @@ pub struct StopConfig {
         serialize_with = "serialize_duration"
     )]
     pub kill_after: Duration,
+    /// How long the allocation keeps serving *after* it has left the service
+    /// catalog and *before* the notice signal is sent, so consumers on other
+    /// nodes learn it is gone before it stops accepting
+    /// (docs/graceful-stop.md). Applies only to tasks with a `service`
+    /// block. Unset: one heartbeat interval of the node running it. `0s`
+    /// disables. Capped at [`MAX_DRAIN`].
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_duration",
+        serialize_with = "serialize_optional_duration"
+    )]
+    pub drain: Option<Duration>,
 }
 
 impl Default for StopConfig {
@@ -1303,6 +1320,7 @@ impl Default for StopConfig {
         Self {
             signal: default_stop_signal(),
             kill_after: default_kill_after(),
+            drain: None,
         }
     }
 }
@@ -1323,6 +1341,16 @@ impl StopConfig {
                 humantime::format_duration(self.kill_after),
                 humantime::format_duration(MAX_KILL_AFTER)
             );
+        }
+        if let Some(drain) = self.drain {
+            if drain > MAX_DRAIN {
+                bail!(
+                    "task {task} stop.drain {} exceeds the {} maximum: a drain may slow a \
+                     rollout, never wedge it (see docs/graceful-stop.md)",
+                    humantime::format_duration(drain),
+                    humantime::format_duration(MAX_DRAIN)
+                );
+            }
         }
         Ok(())
     }

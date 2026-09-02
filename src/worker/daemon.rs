@@ -343,10 +343,14 @@ async fn run_worker_with_manager(
     let net_proxies = Arc::new(crate::worker::netd::proxy::EgressProxies::new(
         net_context.clone(),
     ));
+    let net_ingress = Arc::new(crate::worker::netd::ingress::IngressListeners::new(
+        net_context.clone(),
+    ));
     let forwarder = Arc::new(
         UpstreamForwarder::with_context(net_context)
             .with_dns(net_dns)
-            .with_proxies(net_proxies),
+            .with_proxies(net_proxies)
+            .with_ingress(net_ingress),
     );
     let heartbeat_fut = start_heartbeats(
         name.clone(),
@@ -700,6 +704,13 @@ async fn start_heartbeats(
 
     loop {
         let tick_started = std::time::Instant::now();
+        // Stops on this tick drain for one interval of the cadence the node
+        // is actually on — how long every other node needs to learn an
+        // endpoint is gone (docs/graceful-stop.md).
+        task_manager
+            .lock()
+            .expect("task manager")
+            .set_drain_window(heartbeat_interval);
         let tick_result = heartbeat_tick(
             &name,
             &client,
@@ -849,9 +860,15 @@ async fn heartbeat_tick(
             .map(|denials| denials.drain())
             .unwrap_or_default();
         let net_denials_for_redrive = net_denials.clone();
+        // The datapath's status for the allocations it was last told about.
+        let net_status = {
+            let last = LAST_DESIRED.lock().unwrap_or_else(|p| p.into_inner());
+            net_status(forwarder, &last)
+        };
 
         let req = credentials.attach(tonic::Request::new(HeartbeatRequest {
             net_denials,
+            net_status,
             id: name.to_string(),
             provisional_claims,
             allocation_ids: allocations,
@@ -949,6 +966,7 @@ async fn heartbeat_tick(
         // Same authority for network policy: assignments from this reply,
         // bodies fetched by hash, last known good kept on any failure.
         apply_net_policies(forwarder, &mut client_clone, credentials, name, &reply).await;
+        *LAST_DESIRED.lock().unwrap_or_else(|p| p.into_inner()) = reply.desired_allocations.clone();
         // Allocations whose launch was dispatched this tick. Their refresh
         // loops are spawned before the (async, unawaited) launch registers
         // them in the task manager, so they must be treated as live by the
@@ -1130,6 +1148,11 @@ async fn apply_upstreams(forwarder: &UpstreamForwarder, reply: &HeartbeatReply) 
     if let Some(proxies) = forwarder.proxies() {
         proxies.sync(&proxy_specs(&reply.desired_allocations)).await;
     }
+    if let Some(ingress) = forwarder.ingress() {
+        ingress
+            .sync(&ingress_specs(&reply.desired_allocations))
+            .await;
+    }
     for update in &reply.upstream_endpoints {
         forwarder.set_endpoints(
             update.allocation_id,
@@ -1282,6 +1305,11 @@ fn dns_specs(desired: &[TaskAllocation]) -> Vec<crate::worker::netd::dns::DnsSpe
     specs
 }
 
+/// The desired allocations from the last successful heartbeat, so the next
+/// request can report the datapath's status for them.
+static LAST_DESIRED: std::sync::LazyLock<Mutex<Vec<TaskAllocation>>> =
+    std::sync::LazyLock::new(|| Mutex::new(Vec::new()));
+
 /// Allocations this worker created a gated namespace for, so departures can
 /// be torn down. Process-wide: there is one worker per process, and a
 /// namespace outliving a worker restart is found again by path.
@@ -1299,6 +1327,152 @@ fn proxy_specs(desired: &[TaskAllocation]) -> Vec<crate::worker::netd::proxy::Pr
             listen: None,
         })
         .collect()
+}
+
+/// The ingress listeners a desired set implies: one per advertised port
+/// that was given a private twin at placement (the task has an ingress
+/// chain), bound in the host namespace and dialing the private port inside
+/// the task's namespace when it has one.
+fn ingress_specs(desired: &[TaskAllocation]) -> Vec<crate::worker::netd::ingress::IngressSpec> {
+    let mut specs = Vec::new();
+    for allocation in desired {
+        if allocation.network.trim().is_empty() {
+            continue;
+        }
+        let Ok(network) = serde_json::from_str::<AllocNetwork>(&allocation.network) else {
+            continue;
+        };
+        let netns = network
+            .is_gated()
+            .then(|| crate::worker::netd::netns::netns_path(allocation.allocation_id));
+        for port in &network.ports {
+            let Some(private_port) = port.private_port else {
+                continue;
+            };
+            specs.push(crate::worker::netd::ingress::IngressSpec {
+                allocation_id: allocation.allocation_id,
+                label: port.name.clone(),
+                host_port: port.host_port,
+                private_port,
+                netns: netns.clone(),
+                bind: None,
+            });
+        }
+    }
+    specs
+}
+
+/// What the datapath reports about each desired allocation on the next
+/// heartbeat (`NetAllocStatus`): the node's own answer to "is this
+/// enforced?", read back by `legion net doctor` and the UI.
+fn net_status(
+    forwarder: &UpstreamForwarder,
+    desired: &[TaskAllocation],
+) -> Vec<crate::structs::NetAllocStatus> {
+    let bound_upstreams: HashMap<i64, Vec<String>> =
+        forwarder
+            .active()
+            .into_iter()
+            .fold(HashMap::new(), |mut acc, spec| {
+                acc.entry(spec.allocation_id)
+                    .or_default()
+                    .push(spec.service);
+                acc
+            });
+    let resolvers: std::collections::HashSet<i64> = forwarder
+        .dns()
+        .map(|dns| dns.active().into_iter().collect())
+        .unwrap_or_default();
+    let ingress_bound: HashMap<i64, Vec<String>> = forwarder
+        .ingress()
+        .map(|ingress| {
+            ingress.active().into_iter().fold(
+                HashMap::<i64, Vec<String>>::new(),
+                |mut acc, (id, label)| {
+                    acc.entry(id).or_default().push(label);
+                    acc
+                },
+            )
+        })
+        .unwrap_or_default();
+    let cache = forwarder.context().cache();
+    let mut out = Vec::new();
+    for allocation in desired {
+        let network: Option<AllocNetwork> = if allocation.network.trim().is_empty() {
+            None
+        } else {
+            serde_json::from_str(&allocation.network).ok()
+        };
+        let Some(network) = network else {
+            continue;
+        };
+        let id = allocation.allocation_id;
+        let gated = network.is_gated();
+        let expected_upstreams = network.upstreams.len();
+        let expected_ingress = network
+            .ports
+            .iter()
+            .filter(|p| p.private_port.is_some())
+            .count();
+        if !gated && expected_upstreams == 0 && expected_ingress == 0 && network.vip_block.is_none()
+        {
+            continue;
+        }
+        let upstreams = bound_upstreams.get(&id).cloned().unwrap_or_default();
+        let ingress = ingress_bound.get(&id).cloned().unwrap_or_default();
+        let resolver_ready = resolvers.contains(&id);
+        let proxy_ready = forwarder
+            .proxies()
+            .is_some_and(|proxies| proxies.address(id).is_some());
+        let mut problems: Vec<String> = forwarder
+            .ingress()
+            .map(|ingress| ingress.problems(id))
+            .unwrap_or_default();
+        let namespace_ready = !gated || crate::worker::netd::netns::netns_exists(id);
+        if gated && !namespace_ready {
+            problems.push("gated network namespace does not exist yet".into());
+        }
+        if gated && !proxy_ready {
+            problems.push("egress proxy is not bound inside the namespace".into());
+        }
+        if upstreams.len() < expected_upstreams {
+            problems.push(format!(
+                "{} of {} upstream listeners bound",
+                upstreams.len(),
+                expected_upstreams
+            ));
+        }
+        if network.vip_block.is_some() && !resolver_ready {
+            problems.push(
+                "allocation resolver is not bound (port 53 needs CAP_NET_BIND_SERVICE)".into(),
+            );
+        }
+        let capture_ready = if gated {
+            namespace_ready && proxy_ready && upstreams.len() >= expected_upstreams
+        } else {
+            true
+        };
+        let policy_hash = cache
+            .filter(|cache| cache.is_ready(id))
+            .and_then(|cache| cache.hash_for(id))
+            .unwrap_or_default();
+        out.push(crate::structs::NetAllocStatus {
+            allocation_id: id,
+            mode: network
+                .mode
+                .clone()
+                .unwrap_or_else(|| crate::structs::netpolicy::MODE_HOST.to_string()),
+            capture_ready,
+            policy_hash,
+            upstreams_bound: upstreams,
+            ingress_bound: ingress,
+            resolver_ready,
+            proxy_ready,
+            gate_shut: gated && crate::worker::netd::netns::gate_is_shut(id),
+            problems,
+        });
+    }
+    out
 }
 
 /// Allocations whose effective `network.mode` is `gated`.

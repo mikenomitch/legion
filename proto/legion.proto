@@ -2759,6 +2759,13 @@ message HeartbeatRequest {
   // Bounded: a node reports at most 256 entries per heartbeat and folds the
   // rest into a single `truncated` entry.
   repeated NetDenial net_denials = 8;
+
+  // The node datapath's view of each desired allocation's networking: its
+  // mode, whether its namespace and listeners are ready, which policy hash
+  // it is enforcing. `legion net doctor` and the UI read this back through
+  // ShowNetPolicy so "is it enforced?" is answered by the node that
+  // enforces it, not inferred by the manager.
+  repeated NetAllocStatus net_status = 9;
 }
 
 // Reply payload for Heartbeat.
@@ -6186,6 +6193,12 @@ message ShowNetPolicyReply {
   // The task's declared `network.mode` and the mode the merge resolved.
   string declared_mode = 3;
   string effective_mode = 4;
+
+  // The node datapath's last-reported status for this task's allocations
+  // (one entry per running allocation; empty when none has reported), as
+  // JSON `NetAllocStatus` objects. Best effort and at most one heartbeat
+  // stale.
+  repeated string node_status_json = 5;
 }
 
 // Request payload for TestNetPolicy.
@@ -6286,4 +6299,39 @@ message NetDenial {
   // HTTP mode: the method and path denied, when a request-time rule decided.
   string method = 12;
   string path = 13;
+}
+
+// The node datapath's status for one allocation, reported on the heartbeat.
+message NetAllocStatus {
+  int64 allocation_id = 1;
+
+  // Effective `network.mode` the allocation runs in (`host` or `gated`).
+  string mode = 2;
+
+  // `gated` only: the namespace exists and every listener inside it is bound
+  // (upstream ports, VIPs, resolver, egress proxy). A gated allocation whose
+  // capture is not ready has no network.
+  bool capture_ready = 3;
+
+  // The policy hash the datapath is enforcing; empty while pending.
+  string policy_hash = 4;
+
+  // Upstream keys whose listener is bound.
+  repeated string upstreams_bound = 5;
+
+  // Port labels whose ingress listener is bound on the advertised port.
+  repeated string ingress_bound = 6;
+
+  // Whether the allocation's resolver is serving.
+  bool resolver_ready = 7;
+
+  // Whether the egress proxy is serving (gated only).
+  bool proxy_ready = 8;
+
+  // Whether the edge-boot gate is currently shut for this allocation.
+  bool gate_shut = 9;
+
+  // Human-readable problems the datapath has with this allocation, e.g.
+  // "port 8080 ingress listener: address in use".
+  repeated string problems = 10;
 }

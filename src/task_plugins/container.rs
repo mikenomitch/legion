@@ -335,10 +335,12 @@ fn build_apple_launch(
     if let Some(network) = allocation.network.as_ref() {
         for port in &network.ports {
             args.push("--publish".to_string());
+            // With an ingress chain the datapath owns the advertised port and
+            // the container is published on its private twin.
             args.push(format!(
                 "{}:{}",
-                port.host_port,
-                port.to.unwrap_or(port.host_port)
+                port.bind_port(),
+                port.to.unwrap_or(port.bind_port())
             ));
         }
     }
@@ -1309,11 +1311,13 @@ mod tests {
                     name: "http".into(),
                     host_port: 21000,
                     to: Some(8080),
+                    private_port: None,
                 },
                 crate::structs::network::AllocPort {
                     name: "metrics".into(),
                     host_port: 21001,
                     to: None,
+                    private_port: None,
                 },
             ],
             vip_block: None,
@@ -1926,6 +1930,7 @@ mod tests {
         task.stop = Some(crate::structs::StopConfig {
             signal: "SIGINT".into(),
             kill_after: std::time::Duration::from_secs(30),
+            drain: None,
         });
 
         let tmp = tempfile::tempdir()?;
@@ -1975,6 +1980,7 @@ mod tests {
         task.stop = Some(crate::structs::StopConfig {
             signal: "SIGTERM".into(),
             kill_after: std::time::Duration::from_secs(3),
+            drain: None,
         });
 
         let tmp = tempfile::tempdir()?;

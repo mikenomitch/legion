@@ -165,3 +165,60 @@ datapath component; putting it in a mesh plan would be scope for its own sake.
 UI already answer "what services exist and what are they tagged." A resolver
 is a security-sensitive component; every record type it serves is surface to
 get right. Nothing asked for this.
+
+---
+
+## 8. Drain is worker-side timing keyed to the heartbeat interval, not a manager state
+
+**Call.** The manager keeps doing what it does — delete the allocation row,
+which withdraws the endpoint from every node's feed on that node's next
+heartbeat. The *worker*, on learning the allocation is undesired, moves it
+out of the live set and holds the signal for one heartbeat interval (or
+`stop.drain`) before the ladder. Only tasks with a `service` block drain;
+`"0s"` opts out; `5m` caps it.
+
+```nickel
+stop = { drain = "5s" }   # default: one heartbeat interval of the node
+```
+
+**Alternatives.** A `draining` allocation status in the store with a
+manager-side timer that deletes the row later (a new state, a new sweep, a
+new thing to reconcile after failover); or consumer-side retry on refused
+connections in the forwarder (hides the symptom, costs a round trip per
+rollout step, and does nothing for direct dialers).
+
+**Trade-off.** The window is a bound, not an acknowledgement — a node whose
+heartbeat is late learns late, and a connection it opens in that gap is still
+refused. Nothing is persisted: a worker restart mid-drain signals at restore,
+which is what grace already does. Every rollout step of a service task is one
+interval slower.
+
+**Why.** No new state, RPC, or failure mode; the read model already removes
+the endpoint on the same heartbeat that removes the allocation, so the only
+missing piece was the order on the worker. Simplicity, and the plan's own
+framing (§3.6: "an ordering change, not new machinery").
+
+---
+
+## 9. The datapath owns the advertised port; the task binds a private twin
+
+**Call.** With an ingress chain, the advertised port — `LEGION_PORT_<L>` as
+consumers and the catalog see it — is bound by the datapath on the host, and
+the task is handed a second, private port from the same dynamic range as its
+own `LEGION_PORT_<L>`. Nothing in the task changes; the task cannot take the
+advertised port back because the bind fails.
+
+**Alternatives.** Transparent redirect (iptables `REDIRECT` / eBPF) to a
+datapath port — kernel-dependent, root-only, absent on macOS. Or ask the task
+to bind a documented private port itself — a jobspec change per task, and
+nothing stops it binding the advertised one anyway.
+
+**Trade-off.** One more port per advertised port from the dynamic range; the
+task sees the datapath as its peer (attribution is in the access log until
+PROXY v2 lands with external handlers); health checks traverse the chain, so
+a deny-all ingress denies its own checker (`net doctor` warns, the doc says
+to allow `127.0.0.0/8`).
+
+**Why.** Enforceable everywhere with one mechanism and zero jobspec change —
+name-is-config applied to inbound. Simplicity and extensibility (the same
+listener is where PROXY v2, mTLS termination, and wake-on-request attach).

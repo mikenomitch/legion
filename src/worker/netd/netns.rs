@@ -254,6 +254,29 @@ pub async fn bind_udp(netns: Option<PathBuf>, addr: SocketAddr) -> R<tokio::net:
     tokio::net::UdpSocket::from_std(std_socket).context("register socket with tokio")
 }
 
+/// Connect to `addr` from inside `netns` (or the host namespace when
+/// `None`) — how an ingress listener in the host namespace reaches a gated
+/// task's private port. The connect itself is blocking on a helper thread;
+/// the resulting stream is registered with tokio.
+pub async fn connect_tcp(netns: Option<PathBuf>, addr: SocketAddr) -> R<tokio::net::TcpStream> {
+    let std_stream = tokio::task::spawn_blocking(move || -> R<std::net::TcpStream> {
+        let connect = || -> R<std::net::TcpStream> {
+            let stream =
+                std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(2))
+                    .with_context(|| format!("connect {addr}"))?;
+            stream.set_nonblocking(true)?;
+            Ok(stream)
+        };
+        match netns {
+            Some(path) => within(&path, connect),
+            None => connect(),
+        }
+    })
+    .await
+    .context("connect task panicked")??;
+    tokio::net::TcpStream::from_std(std_stream).context("register stream with tokio")
+}
+
 /// Gate markers: the edge-boot `boot` gate for a gated allocation is
 /// "policy withheld", expressed as a file the runtime creates before start
 /// and removes at ratification, so the datapath (which the runtime cannot

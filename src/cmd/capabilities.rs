@@ -704,6 +704,16 @@ pub fn catalog() -> Vec<Capability> {
             read_only_safe: true,
         },
         Capability {
+            name: "net.doctor",
+            cli: "legion net doctor <JOB> [--task <TASK>]",
+            grpc: Some("Manager/ShowNetPolicy"),
+            summary: "Walk a task's network layers — policy resolved, mode and whether it is \
+                 enforced, datapath readiness per allocation, the edge-boot gate — and name \
+                 the first one that is wrong with a fix hint.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
             name: "net.policy.test",
             cli: "legion net policy test <JOB> --to <DEST> | --from <PEER> [--method M --path P]",
             grpc: Some("Manager/TestNetPolicy"),

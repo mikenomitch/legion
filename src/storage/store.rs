@@ -10934,6 +10934,48 @@ impl Store {
             .and_then(|port| port.to.or(port.static_port)))
     }
 
+    /// Whether a stored policy matching this task declares an ingress chain.
+    /// Cheap when no policy exists (the generation counter is zero).
+    fn policy_declares_ingress(
+        &self,
+        tx: &Connection,
+        node_id: &str,
+        task_id: i64,
+        network: Option<&crate::structs::NetworkConfig>,
+    ) -> R<bool> {
+        if self.net_policy_generation().unwrap_or(0) == 0 {
+            return Ok(false);
+        }
+        let (runtime, job_id): (String, String) = match tx
+            .query_row(
+                "SELECT runtime, job_id FROM task_config WHERE id = ?;",
+                [task_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?
+        {
+            Some(row) => row,
+            None => return Ok(false),
+        };
+        let pool: Option<String> = tx
+            .query_row("SELECT pool FROM node WHERE id = ?;", [node_id], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        let facts = crate::structs::netpolicy::NetSelectorFacts {
+            node_pool: pool,
+            namespace: String::new(),
+            runtime,
+            job: job_id,
+            labels: network.map(|n| n.labels.clone()).unwrap_or_default(),
+        };
+        Ok(self
+            .list_net_policies()?
+            .into_iter()
+            .map(|record| record.object)
+            .any(|policy| policy.ingress.is_some() && policy.selector.matches(&facts)))
+    }
+
     /// The `network.mode` an allocation runs in: the task's declared mode
     /// (`auto` resolved per runtime), overridden by the highest-priority
     /// matching `require` policy that sets one. Resolved at placement — a
@@ -11088,12 +11130,18 @@ impl Store {
             (None, HashMap::new())
         };
 
-        let (ports, upstreams) = crate::structs::assign_allocation_ports_with_vips(
+        // An ingress chain — inline, or from a matching stored policy — means
+        // the datapath owns the advertised ports and the task binds private
+        // twins. Decided here because ports are assigned here.
+        let has_ingress = network.as_ref().is_some_and(|n| n.ingress.is_some())
+            || self.policy_declares_ingress(tx, node_id, task_id, network.as_ref())?;
+        let (ports, upstreams) = crate::structs::assign_allocation_ports_full(
             network.as_ref(),
             connect.as_ref(),
             &used,
             &service_ports,
             vip_block.as_deref(),
+            has_ingress,
         )
         .with_context(|| format!("failed to assign ports on node {node_id}"))?;
         let address = tx

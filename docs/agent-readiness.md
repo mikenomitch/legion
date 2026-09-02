@@ -70,7 +70,7 @@ Even with `--allow-write`, `legion_state_query` is forced to read-only.
 | `legion_service_resolve` | no | Resolve a service to its endpoints (address, port, allocation, node, health). |
 | `legion_net_policy_list` | no | List stored network policies (selector, enforcement, rules) in merge order. |
 | `legion_net_policy_show` | no | A task's effective network policy — every matching stored policy merged with its own block, each rule naming its source — and the resolved network mode. |
-| `legion_net_policy_test` | no | Dry-run a verdict: may this task reach `to` / be reached from `from`? Returns allow/deny/defer with the deciding rule and reason; sends nothing. |
+| `legion_net_policy_test`, `legion_net_doctor` | no | Dry-run a verdict: may this task reach `to` / be reached from `from`? Returns allow/deny/defer with the deciding rule and reason; sends nothing. |
 | `legion_net_policy_apply` | **yes** | Create or replace a network policy object; `dry_run` validates and lists affected allocations without writing. |
 | `legion_acl_whoami` | no | ACL status + caller identity (diagnose PermissionDenied). |
 | `legion_events` | no | List scheduler events; poll with `after_id` to tail. |

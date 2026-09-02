@@ -84,7 +84,7 @@ const EXAMPLE_POLICY = `{
     "policy": "deny",
     "allow": ["*.pypi.org", "files.pythonhosted.org", "api.github.com/repos/**"],
     "rules": [
-      { "match": { "header": { "authorization": "*" } }, "action": "deny",
+      { "when": { "header": { "authorization": "*" } }, "action": "deny",
         "reason": "credentials must not leave the sandbox" }
     ]
   }
@@ -341,6 +341,7 @@ function NetworkContent() {
                   declaredMode={shown()!.declaredMode}
                   effectiveMode={shown()!.effectiveMode}
                   matched={shown()!.matchedPolicies}
+                  nodeStatus={shown()!.nodeStatusJson}
                 />
               </div>
             </Show>

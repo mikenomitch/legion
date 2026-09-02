@@ -535,6 +535,7 @@ function TaskDetailContent() {
                   declaredMode={data()!.netPolicy!.declaredMode}
                   effectiveMode={data()!.netPolicy!.effectiveMode}
                   matched={data()!.netPolicy!.matchedPolicies}
+                  nodeStatus={data()!.netPolicy!.nodeStatusJson}
                 />
               </SectionCard>
             </Show>

@@ -423,6 +423,21 @@ fn tool_defs() -> Vec<ToolDef> {
             mutates: false,
         },
         ToolDef {
+            name: "legion_net_doctor",
+            description: "Walk a task's network from policy to datapath and say where it breaks: the resolved policy, whether the mode enforces it (gated) or relies on cooperation (host), and per running allocation whether the node's datapath is ready (namespace, listeners, resolver, proxy), enforcing the current policy hash, or fail-closed (policy pending, boot gate shut). Returns a verdict (ok|warn|fail) and the steps with fix hints. Read-only.",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "job": { "type": "string", "description": "Job id." },
+                    "task": { "type": "string", "description": "Task name (optional when the job has one task)." },
+                    "node_pool": { "type": "string", "description": "Node pool to match selectors against (optional)." }
+                },
+                "required": ["job"],
+                "additionalProperties": false
+            }),
+            mutates: false,
+        },
+        ToolDef {
             name: "legion_net_policy_apply",
             description: "Create or replace a network policy object from its JSON (a NetPolicyObject: name, selector, enforcement, egress/ingress). Takes effect on matching running allocations within one heartbeat; no task restarts. Set dry_run to validate and list affected allocations without writing.",
             input_schema: || json!({
@@ -1238,6 +1253,33 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
                 path: get("path"),
             }))
             .await
+        }
+        "legion_net_doctor" => {
+            let job_id = str_arg(&args, "job")?;
+            let get = |key: &str| {
+                args.get(key)
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string()
+            };
+            let task_name = get("task");
+            let mut client = connect().await?;
+            let reply = client
+                .show_net_policy(ShowNetPolicyRequest {
+                    job_id: job_id.clone(),
+                    task_name: task_name.clone(),
+                    node_pool: get("node_pool"),
+                })
+                .await
+                .map_err(|status| format!("{}: {}", status.code(), status.message()))?
+                .into_inner();
+            let steps = crate::cmd::net::diagnose_network(&job_id, &task_name, &reply);
+            Ok(json!({
+                "job": job_id,
+                "task": task_name,
+                "verdict": crate::cmd::net::doctor_verdict(&steps),
+                "steps": steps,
+            }))
         }
         "legion_net_policy_apply" => {
             let object = args

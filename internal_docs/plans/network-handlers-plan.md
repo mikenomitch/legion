@@ -352,9 +352,9 @@ egress = {
     onError = "deny",                 # deny | allow — what a failed handler means
     accessLog = true,
     rules = [
-        { match = { host = "*.pypi.org" },                                    action = "allow" },
-        { match = { host = "api.github.com", path = "/repos/**", method = ["GET"] }, action = "allow" },
-        { match = { header = { authorization = "*" } },                       action = "deny",
+        { when = { host = "*.pypi.org" },                                    action = "allow" },
+        { when = { host = "api.github.com", path = "/repos/**", method = ["GET"] }, action = "allow" },
+        { when = { header = { authorization = "*" } },                       action = "deny",
           reason = "credentials must not leave the sandbox" },
     ],
     handlers = [
@@ -381,7 +381,7 @@ network = {
             clientCa = "legion",
             requireIdentity = ["prod:*:checkout:*", "prod:*:billing:*"],
         },
-        rules = [{ match = { path = "/admin/**" }, action = "deny", reason = "not externally reachable" }],
+        rules = [{ when = { path = "/admin/**" }, action = "deny", reason = "not externally reachable" }],
     },
 },
 ```
@@ -543,7 +543,7 @@ legion net policy test <job> --to https://api.github.com/user   # dry-run a verd
 # configs/policies/sandbox-egress.ncl
 {
     name = "sandbox-egress",
-    priority = 100,
+    "priority" = 100,
     selector = {
         nodePools = ["untrusted"],       # node.pool — real today
         namespaces = ["sandboxes"],      # matches everything until namespaces land

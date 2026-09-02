@@ -189,8 +189,8 @@
                         # First match wins. Connect-time fields (host, port,
                         # cidr, identity) never touch the byte path; path /
                         # method / header need protocol = "http".
-                        { match = { host = "telemetry.example.com", port = 443 }, action = "allow" },
-                        { match = { cidr = "169.254.0.0/16" }, action = "deny", reason = "no metadata service" },
+                        { when = { host = "telemetry.example.com", port = 443 }, action = "allow" },
+                        { when = { cidr = "169.254.0.0/16" }, action = "deny", reason = "no metadata service" },
                     ],
                     # Handlers: code on the path, only when policy is not
                     # enough. authz = a webhook verdict (cached); proxy = any
@@ -205,7 +205,7 @@
                 ingress = {
                     protocol = "http",
                     rules = [
-                        { match = { path = "/admin/**" }, action = "deny", reason = "not externally reachable" },
+                        { when = { path = "/admin/**" }, action = "deny", reason = "not externally reachable" },
                     ],
                     tls = {
                         mode = "off",          # off | server | mutual
@@ -401,6 +401,12 @@
                 # Grace between the signal and SIGKILL. Default 30s, capped
                 # at 5m — grace may slow a drain, never wedge one.
                 killAfter = "30s",
+                # Only for tasks with a `service` block: how long the task
+                # keeps serving after it has left the catalog and before the
+                # signal is sent, so consumers on other nodes learn it is
+                # gone first (docs/graceful-stop.md). Unset = one heartbeat
+                # interval of the node; "0s" disables; capped at 5m.
+                drain = "5s",
             },
             # A floor on how many of this task's allocations VOLUNTARY
             # disruption may take (docs/preemption-and-eviction.md).

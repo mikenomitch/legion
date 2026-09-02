@@ -12,7 +12,7 @@
     # Higher applies first among `require` policies and wins among `default`
     # ones. Two `default` policies that tie on priority with overlapping
     # selectors are rejected at apply.
-    priority = 100,
+    "priority" = 100,
 
     # Which tasks this applies to. Every list is an OR; the fields are an AND;
     # an empty selector matches every task on the cluster.
@@ -43,7 +43,7 @@
         rules = [
             # Explicit rules run after the `allow` sugar; first match wins.
             {
-                match = { header = { authorization = "*" } },
+                when = { header = { authorization = "*" } },
                 action = "deny",
                 reason = "credentials must not leave the sandbox",
             },

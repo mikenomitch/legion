@@ -6747,6 +6747,17 @@ export class HeartbeatRequest extends Message<HeartbeatRequest> {
    */
   netDenials: NetDenial[] = [];
 
+  /**
+   * The node datapath's view of each desired allocation's networking: its
+   * mode, whether its namespace and listeners are ready, which policy hash
+   * it is enforcing. `legion net doctor` and the UI read this back through
+   * ShowNetPolicy so "is it enforced?" is answered by the node that
+   * enforces it, not inferred by the manager.
+   *
+   * @generated from field: repeated legion.NetAllocStatus net_status = 9;
+   */
+  netStatus: NetAllocStatus[] = [];
+
   constructor(data?: PartialMessage<HeartbeatRequest>) {
     super();
     proto3.util.initPartial(data, this);
@@ -6763,6 +6774,7 @@ export class HeartbeatRequest extends Message<HeartbeatRequest> {
     { no: 6, name: "terminated_allocations", kind: "message", T: TerminatedAllocation, repeated: true },
     { no: 7, name: "provisional_claims", kind: "message", T: ProvisionalClaimReport, repeated: true },
     { no: 8, name: "net_denials", kind: "message", T: NetDenial, repeated: true },
+    { no: 9, name: "net_status", kind: "message", T: NetAllocStatus, repeated: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): HeartbeatRequest {
@@ -18408,6 +18420,16 @@ export class ShowNetPolicyReply extends Message<ShowNetPolicyReply> {
    */
   effectiveMode = "";
 
+  /**
+   * The node datapath's last-reported status for this task's allocations
+   * (one entry per running allocation; empty when none has reported), as
+   * JSON `NetAllocStatus` objects. Best effort and at most one heartbeat
+   * stale.
+   *
+   * @generated from field: repeated string node_status_json = 5;
+   */
+  nodeStatusJson: string[] = [];
+
   constructor(data?: PartialMessage<ShowNetPolicyReply>) {
     super();
     proto3.util.initPartial(data, this);
@@ -18420,6 +18442,7 @@ export class ShowNetPolicyReply extends Message<ShowNetPolicyReply> {
     { no: 2, name: "matched_policies", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
     { no: 3, name: "declared_mode", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 4, name: "effective_mode", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 5, name: "node_status_json", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ShowNetPolicyReply {
@@ -18873,6 +18896,120 @@ export class NetDenial extends Message<NetDenial> {
 
   static equals(a: NetDenial | PlainMessage<NetDenial> | undefined, b: NetDenial | PlainMessage<NetDenial> | undefined): boolean {
     return proto3.util.equals(NetDenial, a, b);
+  }
+}
+
+/**
+ * The node datapath's status for one allocation, reported on the heartbeat.
+ *
+ * @generated from message legion.NetAllocStatus
+ */
+export class NetAllocStatus extends Message<NetAllocStatus> {
+  /**
+   * @generated from field: int64 allocation_id = 1;
+   */
+  allocationId = protoInt64.zero;
+
+  /**
+   * Effective `network.mode` the allocation runs in (`host` or `gated`).
+   *
+   * @generated from field: string mode = 2;
+   */
+  mode = "";
+
+  /**
+   * `gated` only: the namespace exists and every listener inside it is bound
+   * (upstream ports, VIPs, resolver, egress proxy). A gated allocation whose
+   * capture is not ready has no network.
+   *
+   * @generated from field: bool capture_ready = 3;
+   */
+  captureReady = false;
+
+  /**
+   * The policy hash the datapath is enforcing; empty while pending.
+   *
+   * @generated from field: string policy_hash = 4;
+   */
+  policyHash = "";
+
+  /**
+   * Upstream keys whose listener is bound.
+   *
+   * @generated from field: repeated string upstreams_bound = 5;
+   */
+  upstreamsBound: string[] = [];
+
+  /**
+   * Port labels whose ingress listener is bound on the advertised port.
+   *
+   * @generated from field: repeated string ingress_bound = 6;
+   */
+  ingressBound: string[] = [];
+
+  /**
+   * Whether the allocation's resolver is serving.
+   *
+   * @generated from field: bool resolver_ready = 7;
+   */
+  resolverReady = false;
+
+  /**
+   * Whether the egress proxy is serving (gated only).
+   *
+   * @generated from field: bool proxy_ready = 8;
+   */
+  proxyReady = false;
+
+  /**
+   * Whether the edge-boot gate is currently shut for this allocation.
+   *
+   * @generated from field: bool gate_shut = 9;
+   */
+  gateShut = false;
+
+  /**
+   * Human-readable problems the datapath has with this allocation, e.g.
+   * "port 8080 ingress listener: address in use".
+   *
+   * @generated from field: repeated string problems = 10;
+   */
+  problems: string[] = [];
+
+  constructor(data?: PartialMessage<NetAllocStatus>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.NetAllocStatus";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "allocation_id", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 2, name: "mode", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "capture_ready", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 4, name: "policy_hash", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 5, name: "upstreams_bound", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+    { no: 6, name: "ingress_bound", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+    { no: 7, name: "resolver_ready", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 8, name: "proxy_ready", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 9, name: "gate_shut", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 10, name: "problems", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): NetAllocStatus {
+    return new NetAllocStatus().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): NetAllocStatus {
+    return new NetAllocStatus().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): NetAllocStatus {
+    return new NetAllocStatus().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: NetAllocStatus | PlainMessage<NetAllocStatus> | undefined, b: NetAllocStatus | PlainMessage<NetAllocStatus> | undefined): boolean {
+    return proto3.util.equals(NetAllocStatus, a, b);
   }
 }
 

@@ -170,6 +170,13 @@ pub struct HttpSettings {
     pub allocation_id: i64,
     pub key: String,
     pub target: Option<UpstreamTarget>,
+    /// `"egress"` (an upstream listener) or `"ingress"` (an advertised port
+    /// in front of the task): selects the chain, the metric labels, and how
+    /// denials are attributed.
+    pub direction: &'static str,
+    /// For ingress into a gated task: dial the private port inside this
+    /// namespace.
+    pub netns: Option<PathBuf>,
     pub context: Arc<ForwarderContext>,
     pub balancer: Arc<dyn Balancer>,
     pub endpoints: Arc<Mutex<Vec<Endpoint>>>,
@@ -262,6 +269,8 @@ impl HttpSettings {
             allocation_id,
             key,
             target,
+            direction: "egress",
+            netns: None,
             context,
             balancer,
             endpoints,
@@ -277,6 +286,39 @@ impl HttpSettings {
             dlp,
             log_handler,
         }
+    }
+
+    /// Settings for an ingress listener: HTTP/1.1 in front of the task's
+    /// private port, judged against the *ingress* chain. No traffic
+    /// management (there is exactly one backend), no handlers yet.
+    pub fn for_ingress(
+        allocation_id: i64,
+        label: String,
+        private_port: u16,
+        netns: Option<PathBuf>,
+        context: Arc<ForwarderContext>,
+        log_dir: Option<PathBuf>,
+    ) -> Self {
+        let mut settings = HttpSettings::new(
+            allocation_id,
+            label,
+            Some(UpstreamTarget {
+                host: "127.0.0.1".to_string(),
+                port: private_port,
+                tls: false,
+                http: true,
+            }),
+            None,
+            &[],
+            context,
+            crate::worker::balance::default_balancer(),
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(Mutex::new(HashMap::new())),
+            log_dir,
+        );
+        settings.direction = "ingress";
+        settings.netns = netns;
+        settings
     }
 
     /// Endpoints that are not currently ejected.
@@ -485,8 +527,15 @@ async fn handle(req: Request<Incoming>, settings: Arc<HttpSettings>) -> Response
     settings.budget.note_request();
 
     // 1. Policy.
+    let direction = settings.direction;
     let policy = settings.context.policy_for(settings.allocation_id);
-    let chain: Option<&EffectiveChain> = policy.as_ref().and_then(|p| p.egress.as_ref());
+    let chain: Option<&EffectiveChain> = policy.as_ref().and_then(|p| {
+        if direction == "ingress" {
+            p.ingress.as_ref()
+        } else {
+            p.egress.as_ref()
+        }
+    });
     if let Some(chain) = chain {
         let facts = RequestFacts {
             host: Some(fact_host.as_str()),
@@ -500,10 +549,10 @@ async fn handle(req: Request<Incoming>, settings: Arc<HttpSettings>) -> Response
         if let Verdict::Deny { source, reason } =
             crate::structs::netpolicy::evaluate_request(chain, &facts)
         {
-            net_metrics::connection("egress", PROTOCOL_HTTP, "deny");
+            net_metrics::connection(direction, PROTOCOL_HTTP, "deny");
             settings.context.record_denial(
                 settings.allocation_id,
-                "egress",
+                direction,
                 PROTOCOL_HTTP,
                 &destination,
                 &source,
@@ -562,7 +611,7 @@ async fn handle(req: Request<Incoming>, settings: Arc<HttpSettings>) -> Response
                 for dlp in &settings.dlp {
                     if bytes.len() as u64 > dlp.max_bytes {
                         if dlp.on_error_deny {
-                            net_metrics::connection("egress", PROTOCOL_HTTP, "deny");
+                            net_metrics::connection(direction, PROTOCOL_HTTP, "deny");
                             settings.context.record_denial(
                                 settings.allocation_id,
                                 "egress",
@@ -586,7 +635,7 @@ async fn handle(req: Request<Incoming>, settings: Arc<HttpSettings>) -> Response
                     let text = String::from_utf8_lossy(&bytes);
                     if let Some(pattern) = dlp.patterns.iter().find(|p| p.is_match(&text)) {
                         let reason = format!("body matches dlp pattern {}", pattern.as_str());
-                        net_metrics::connection("egress", PROTOCOL_HTTP, "deny");
+                        net_metrics::connection(direction, PROTOCOL_HTTP, "deny");
                         settings.context.record_denial(
                             settings.allocation_id,
                             "egress",
@@ -629,7 +678,7 @@ async fn handle(req: Request<Incoming>, settings: Arc<HttpSettings>) -> Response
                 let deny = settings.dlp.iter().any(|d| d.on_error_deny);
                 debug!(upstream = %settings.key, error = %err, "dlp could not buffer the request body");
                 if deny {
-                    net_metrics::connection("egress", PROTOCOL_HTTP, "deny");
+                    net_metrics::connection(direction, PROTOCOL_HTTP, "deny");
                     let source = settings
                         .dlp
                         .first()
@@ -698,7 +747,7 @@ async fn handle(req: Request<Incoming>, settings: Arc<HttpSettings>) -> Response
                 if let Verdict::Deny { source, reason } =
                     crate::structs::netpolicy::evaluate_request(chain, &facts)
                 {
-                    net_metrics::connection("egress", PROTOCOL_HTTP, "deny");
+                    net_metrics::connection(direction, PROTOCOL_HTTP, "deny");
                     settings.context.record_denial(
                         settings.allocation_id,
                         "egress",
@@ -751,7 +800,7 @@ async fn handle(req: Request<Incoming>, settings: Arc<HttpSettings>) -> Response
                     last_error = Some(format!("upstream answered {}", status.as_u16()));
                     continue;
                 }
-                net_metrics::connection("egress", PROTOCOL_HTTP, "allow");
+                net_metrics::connection(direction, PROTOCOL_HTTP, "allow");
                 if let Some(chain) = chain {
                     access_log(
                         &settings,
@@ -801,7 +850,7 @@ async fn handle(req: Request<Incoming>, settings: Arc<HttpSettings>) -> Response
         }
     }
 
-    net_metrics::connection("egress", PROTOCOL_HTTP, "error");
+    net_metrics::connection(direction, PROTOCOL_HTTP, "error");
     let message = last_error.unwrap_or_else(|| "upstream unavailable".into());
     let status = if message.contains("deadline") {
         StatusCode::GATEWAY_TIMEOUT
@@ -852,10 +901,20 @@ async fn attempt_request(
     body: Bytes,
     host_header: Option<&str>,
 ) -> Result<Response<OutBody>, AttemptError> {
-    let stream = match tokio::time::timeout(DIAL_TIMEOUT, TcpStream::connect(addr)).await {
-        Ok(Ok(stream)) => stream,
-        Ok(Err(err)) => return Err(AttemptError::Connect(err.to_string())),
-        Err(_) => return Err(AttemptError::Connect("dial timed out".into())),
+    let stream = match settings.netns.clone() {
+        Some(netns) => {
+            let socket: std::net::SocketAddr = addr
+                .parse()
+                .map_err(|_| AttemptError::Connect(format!("invalid address {addr}")))?;
+            crate::worker::netd::netns::connect_tcp(Some(netns), socket)
+                .await
+                .map_err(|err| AttemptError::Connect(err.to_string()))?
+        }
+        None => match tokio::time::timeout(DIAL_TIMEOUT, TcpStream::connect(addr)).await {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(err)) => return Err(AttemptError::Connect(err.to_string())),
+            Err(_) => return Err(AttemptError::Connect("dial timed out".into())),
+        },
     };
     let _ = stream.set_nodelay(true);
 
@@ -984,7 +1043,7 @@ async fn write_access_line(
         "job": identity.as_ref().map(|i| i.job_id.clone()).unwrap_or_default(),
         "task": identity.as_ref().map(|i| i.task_name.clone()).unwrap_or_default(),
         "labels": identity.as_ref().map(|i| i.labels.clone()).unwrap_or_default(),
-        "direction": "egress",
+        "direction": settings.direction,
         "protocol": "http",
         "upstream": settings.key,
         "destination": settings.target.as_ref().map(|t| t.addr()).unwrap_or_else(|| settings.key.clone()),

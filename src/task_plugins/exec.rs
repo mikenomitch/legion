@@ -988,6 +988,7 @@ mod tests {
             stop: Some(crate::structs::StopConfig {
                 signal: "SIGTERM".into(),
                 kill_after: std::time::Duration::from_secs(30),
+                drain: None,
             }),
             ..TaskConfig::new("drain", "exec")
         };
@@ -1064,6 +1065,7 @@ mod tests {
             stop: Some(crate::structs::StopConfig {
                 signal: "SIGTERM".into(),
                 kill_after: std::time::Duration::from_secs(1),
+                drain: None,
             }),
             ..TaskConfig::new("stubborn", "exec")
         };

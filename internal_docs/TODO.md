@@ -1376,9 +1376,23 @@ worker:
 - [ ] Phase 4 — `gated` for `sandbox`: no guest NIC, `legion-guest-agent`
       (SOCKS5 + CONNECT + DNS) over vsock. Shares the agent with VM forking
       and microVM `exec`. **Core use case complete here**
-- [ ] Phase 5 — ingress chains: advertised/private port split, `netd` binds
-      advertised ports, `legion net doctor`, capabilities + MCP. Unblocks the
-      autoscaler's wake-on-request scale-to-zero
+- [x] Phase 5 / M6 — ingress chains, drain-before-stop, `legion net doctor`
+      (2026-09-02): a task with an ingress chain (its own or a `require`
+      policy's) gets a private twin for every advertised port at placement;
+      the datapath binds the advertised port on the host, judges each
+      accepted connection against the chain (peer address; the request head
+      in HTTP mode), splices or proxies to the twin inside the gated
+      namespace, and fails closed while gated with policy pending or the
+      boot gate shut. `stop.drain`: a service task leaves the catalog, keeps
+      serving one heartbeat interval (or `stop.drain`), then takes the
+      ladder; starts are held back meanwhile. `legion net doctor` /
+      `legion_net_doctor` walk policy → mode → per-allocation node status
+      (`NetAllocStatus` on the heartbeat; shown under **Datapath** in the
+      UI's task Network section). Not done: the autoscaler's wake-on-request
+      hook (the listener exists; the scale-from-zero signal is the
+      autoscaler plan's), PROXY protocol v2 to the task (M7), persisting the
+      drain/grace sets across a worker restart (a restart mid-window
+      signals at restore, as grace already did).
 - [ ] Phase 6 — external handlers (`authz` webhook, `proxy` by
       service/port/node, PROXY v2, `net handler test`) and mTLS: (a)
       bring-your-own PKI, (b) Legion workload CA; kTLS passthrough behind a

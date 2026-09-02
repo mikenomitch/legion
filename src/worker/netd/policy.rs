@@ -123,6 +123,12 @@ impl NetPolicyCache {
         state.by_alloc.contains_key(&allocation_id)
     }
 
+    /// The hash the manager named for this allocation, if any.
+    pub fn hash_for(&self, allocation_id: i64) -> Option<String> {
+        let state = self.state.read().unwrap_or_else(|p| p.into_inner());
+        state.by_alloc.get(&allocation_id).cloned()
+    }
+
     /// Hashes currently assigned but not yet fetched.
     pub fn pending_hashes(&self) -> Vec<String> {
         let state = self.state.read().unwrap_or_else(|p| p.into_inner());

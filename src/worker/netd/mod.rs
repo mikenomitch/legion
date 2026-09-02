@@ -21,6 +21,7 @@
 
 pub mod dns;
 pub mod http;
+pub mod ingress;
 pub mod netns;
 pub mod policy;
 pub mod proxy;

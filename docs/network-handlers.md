@@ -111,8 +111,8 @@ network = {
         accessLog = false,
         allow = ["*.pypi.org", "api.github.com:443", "10.0.0.0/8:5432"],
         rules = [
-            { match = { host = "telemetry.example.com" }, action = "allow" },
-            { match = { cidr = "169.254.0.0/16" }, action = "deny", reason = "no metadata service" },
+            { when = { host = "telemetry.example.com" }, action = "allow" },
+            { when = { cidr = "169.254.0.0/16" }, action = "deny", reason = "no metadata service" },
         ],
         handlers = [],
     },
@@ -153,7 +153,7 @@ heartbeat — no restart, no rollout, no job edit.
 # configs/policies/sandbox-egress.ncl
 {
     name = "sandbox-egress",
-    priority = 100,
+    "priority" = 100,
     selector = {
         nodePools = ["untrusted"],       # node.pool globs
         namespaces = ["default"],        # every job is in `default` until namespaces land
@@ -350,9 +350,64 @@ policy with only that host.
 
 Requirements and limits: Linux; the worker needs `CAP_SYS_ADMIN` (it already
 does, for `exec` hardening's mount namespace and for running the OCI
-runtime); IPv4 loopback only inside the namespace; no raw UDP, no ICMP, no
-inbound to undeclared ports (ingress is the next phase). macOS has no
-namespaces: `gated` is rejected at start there with that reason.
+runtime); IPv4 loopback only inside the namespace; no raw UDP, no ICMP; no
+inbound except through the datapath's ingress listeners (below). macOS has
+no namespaces: `gated` is rejected at start there with that reason.
+
+## Ingress
+
+Declare an `ingress` chain on a task — or impose one with a `require`
+policy object — and the datapath fronts every port the task advertises:
+
+```nickel
+network = {
+    ports = [{ name = "http", static = 8080 }],
+    ingress = {
+        protocol = "http",
+        policy = "deny",
+        rules = [
+            { when = { identity = "auto:web:*" }, action = "allow" },     # <region>:<job>:<group>:<task>
+            { when = { cidr = "127.0.0.0/8" }, action = "allow", reason = "health checks" },
+        ],
+        accessLog = true,
+    },
+},
+```
+
+- **The advertised port is the datapath's.** `LEGION_PORT_HTTP` as
+  consumers see it — the port in the catalog and in `LEGION_UPSTREAM_*`
+  feeds — is bound by the node's datapath on the host. The task is handed
+  a **private twin** from the same dynamic range as *its* `LEGION_PORT_HTTP`
+  (a container's port publish uses the twin too), so nothing in the task
+  changes. The task cannot take the advertised port back: the bind fails
+  because the address is taken. That is what makes ingress enforceable on
+  every runtime and platform, not only gated Linux.
+- **Every accepted connection is judged** against the ingress chain with
+  the peer's address (`cidr`, `port`), and, from the mTLS phase, the peer's
+  attributed identity (`identity`). In HTTP mode the request head is judged
+  too, with the same request rules, `dlp`, structured `403`s and access log
+  as egress. A denial closes the connection and records `net.denied` with
+  `direction = ingress`.
+- **Allowed connections are spliced** to the twin — inside the allocation's
+  namespace when it is gated, on the host otherwise — or proxied per request
+  in HTTP mode.
+- **Gated allocations fail closed** on ingress exactly as on egress: while
+  the policy is pending or the boot gate is shut, nothing is accepted.
+- **Health checks go through the chain** — the checker dials the advertised
+  port — so a chain that denies everything also denies the checker. Allow
+  `cidr = "127.0.0.0/8"` for a node-local checker; `legion net doctor`
+  warns when a chain would deny its own checks.
+
+Limits: TCP only; the task sees the datapath as the peer (the attributed
+peer is in the access log until the PROXY-protocol handoff lands with
+external handlers); one listener per advertised port per allocation — the
+cluster edge and per-tag routing on ingress are not this feature.
+
+**Rollouts.** A task with a `service` block drains before it stops: it
+leaves the catalog, keeps serving for one heartbeat interval (or
+[`stop.drain`](graceful-stop.md)), and only then takes the stop ladder, so a
+consumer dialing it through an upstream sees no `connection refused` while a
+rollout replaces it.
 
 ## CLI
 
@@ -364,7 +419,20 @@ legion net policy delete <name>
 legion net policy show <job> [--task <task>] [--pool <pool>]    # the effective policy
 legion net policy test <job> --to <dest> [--method M --path P]  # dry-run a verdict
 legion net policy test <job> --from <peer> [--identity <sub>]
+legion net doctor <job> [--task <task>]                         # policy → mode → datapath
 ```
+
+`net doctor` walks a task's network the way `service doctor` walks a
+service: the resolved policy and where each chain came from; whether the
+effective mode *enforces* it (`gated`) or relies on cooperation (`host`,
+with the hint to gate it); then, per running allocation, what the node
+reports — the namespace and every listener bound, resolver and egress proxy
+serving, the policy hash the datapath is enforcing versus the one the
+manager computes, `policy-pending` or a shut boot gate (fail-closed while
+gated), and any problem the node has (an ingress listener that could not
+bind, say). It stops at the first failure with a fix hint. Nodes report this
+status on every heartbeat, and the same lines appear in the UI's task
+Network section.
 
 Every subcommand takes `--json`/`-j` and emits the standard envelope. `apply
 --dry-run` validates and lists the running allocations whose effective policy
@@ -372,10 +440,10 @@ would change. `test` answers `allow`, `deny` (with the deciding rule and its
 reason), or `defer` — a request-time rule would decide and no method/path
 was given.
 
-`show` and `test` are also MCP tools (`legion_net_policy_show`,
-`legion_net_policy_test`, read-only) and `apply` is a mutating one
-(`legion_net_policy_apply`), so an agent can ask "is that host blocked?"
-instead of watching a connection hang.
+`show`, `test` and `doctor` are also MCP tools (`legion_net_policy_show`,
+`legion_net_policy_test`, `legion_net_doctor`, read-only) and `apply` is a
+mutating one (`legion_net_policy_apply`), so an agent can ask "is that host
+blocked?" instead of watching a connection hang.
 
 ## Observability
 
@@ -389,6 +457,12 @@ instead of watching a connection hang.
 - **Access log** (`accessLog = true`, or a `log` handler): one NDJSON line
   per request in HTTP mode, at `<worker logs>/<allocation>/net-access.log`.
   L4 connections are counted in metrics, not logged per connection.
+- **Datapath status**: every heartbeat carries, per allocation, the node's
+  view of its datapath — mode, capture readiness, the enforced policy hash,
+  bound upstream and ingress listeners, resolver and proxy state, the boot
+  gate, and problems. `legion net policy show` returns it as
+  `node_status_json`, `legion net doctor` interprets it, and the UI's task
+  Network section shows it under **Datapath**.
 
 ## ACLs
 
@@ -418,8 +492,10 @@ more than it is.
   On macOS egress stays cooperative and there are no VIPs, per-allocation
   resolvers, or gated namespaces. `sandbox` gets `gated` when its guest
   agent ships.
-- **Ingress chains are validated, not yet served.** Nothing binds a task's
-  advertised port yet; that is the ingress phase.
+- **Ingress is enforced everywhere it applies**: the datapath owns the
+  advertised port and the task binds a private twin, on every runtime and
+  platform. TCP only; the task sees the datapath as the peer until the
+  PROXY-protocol handoff ships with external handlers.
 - **`tls` on chains is validated, not yet terminated**; external upstreams
   originate TLS today. Bring-your-own certificates and the cluster CA are the
   mTLS phase.

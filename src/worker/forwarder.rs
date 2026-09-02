@@ -377,6 +377,8 @@ pub struct UpstreamForwarder {
     dns: Option<Arc<crate::worker::netd::dns::NetDns>>,
     /// Per-allocation egress proxies inside gated namespaces.
     proxies: Option<Arc<crate::worker::netd::proxy::EgressProxies>>,
+    /// Ingress listeners in front of advertised ports.
+    ingress: Option<Arc<crate::worker::netd::ingress::IngressListeners>>,
 }
 
 impl UpstreamForwarder {
@@ -394,7 +396,22 @@ impl UpstreamForwarder {
             context,
             dns: None,
             proxies: None,
+            ingress: None,
         }
+    }
+
+    /// Attach the ingress listeners.
+    pub fn with_ingress(
+        mut self,
+        ingress: Arc<crate::worker::netd::ingress::IngressListeners>,
+    ) -> Self {
+        self.ingress = Some(ingress);
+        self
+    }
+
+    /// The ingress listeners, when attached.
+    pub fn ingress(&self) -> Option<&Arc<crate::worker::netd::ingress::IngressListeners>> {
+        self.ingress.as_ref()
     }
 
     /// Attach the gated-namespace egress proxies.
