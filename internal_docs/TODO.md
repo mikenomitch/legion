@@ -290,9 +290,15 @@ How to use it:
       (~1.65x per doubling) — which ruled out the per-node usage cache and
       the delta refresh as the dominant term and pointed at
       `reproject_model_nodes`. That term is now gone too (the usage memo,
-      2026-08-06 above), so re-run the 50k/100k/200k ladder once more:
-      if the slope still does not flatten, the mechanism is off the
-      store/refresh path entirely and the next measurement is
+      2026-08-06 above), and so is the planner's own fill term: the
+      2026-09-02 pass reproduced a fill slope locally (`plan_under_fill`:
+      `plan_only` 2.55 → 7.07 ms from an empty 5,000-node fleet to 40
+      allocations per node) and removed it — no step of a plan walks the
+      cluster's allocations any more, and a local plan commit publishes
+      its rows as a delta rather than reloading every touched node's list
+      (Done, below). Re-run the 50k/100k/200k ladder once more: if the
+      slope still does not flatten, the mechanism is off the planner and
+      store/refresh paths entirely and the next measurement is
       control-plane CPU at saturation
       ([aws-phase4-findings.md](aws-phase4-findings.md) open item 4).
 - [ ] **`node_alloc_usage` never sheds rows.** Node removal is a
@@ -622,7 +628,40 @@ How to use it:
       a plan batch is now ONE transaction on every backend — one fsync
       locally instead of one per plan — and its post-apply `task_status`
       projection is one status-lane write for the batch instead of one
-      per plan. Further wins want profiling, not this list.
+      per plan. The 2026-09-02 pass (next entry) took the per-placement
+      constants and the cluster-fill slope; further wins want profiling,
+      not this list.
+- [x] **Planning cost no longer grows with cluster fill, and the
+      per-placement passes stop re-answering answered questions**
+      (2026-09-02, phase 4 of
+      [scheduler-performance-plan.md](plans/scheduler-performance-plan.md);
+      calls #1-#5 in
+      [scheduler-performance-plan_calls.md](calls/scheduler-performance-plan_calls.md);
+      doc in
+      [scheduler-and-eval-loop.md](../docs/scheduler-and-eval-loop.md#node-candidate-construction)).
+      A new `plan_under_fill` Criterion group reproduces the AWS
+      `dense_fleet` slope locally (5,000 nodes, 0/10/40 allocations per
+      node): on the base, `plan_only` went 2.55 → 7.07 ms across the fill
+      because five-to-six per-plan walks over every allocation in the
+      cluster filtered for the planned job. Now the read model keeps a
+      per-job allocation index maintained by the same writes as the
+      per-node lists, so a plan touches only its own job's rows; a local
+      plan commit publishes its rows through the same delta the raft
+      apply path projects; `eligible_nodes` no longer re-runs the permit
+      per candidate per placement (a restriction-map allocation each,
+      ~100k per plan on the 1,000-allocation cells); the scoring cache
+      indexes by candidate address instead of hashing id strings; and the
+      apply and eval paths' per-node statements go through the statement
+      cache. Before/after (same host, Criterion, base
+      `c3291c9`) in
+      [benchmarks/scheduler/README.md](../benchmarks/scheduler/README.md).
+      **The AWS ladder is not re-run** — see the open re-measure item
+      above. Deferred, deliberately: the two remaining O(fleet) terms per
+      plan (the snapshot's two map clones and the per-plan `node_lookup`
+      build) are constants in fleet size, not fill, and measured small
+      next to the removed terms; the `plan_and_apply` cell under
+      `local_disk` still pays the inline status-projection commit the
+      daemon defers to its drain task.
 - [x] Scheduler performance measurement stack
       ([plan](plans/scheduler-performance-plan.md),
       [calls](calls/scheduler-performance-plan_calls.md),
