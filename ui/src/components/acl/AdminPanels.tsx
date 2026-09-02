@@ -1,6 +1,6 @@
 import { For, Show, createResource, createSignal } from 'solid-js'
 import { managerClient } from '../../grpcClient'
-import { Badge, Button, ConfirmButton, CopyButton, Field, Note, SectionCard, TableShell, checkboxClass, cx, inputClass, tableClass, tdClass, textareaClass, thClass, theadClass, trHoverClass } from '../ui'
+import { Badge, Button, ConfirmButton, CopyButton, Field, Note, RelativeTime, SectionCard, TableShell, checkboxClass, cx, inputClass, tableClass, tdClass, textareaClass, thClass, theadClass, trHoverClass } from '../ui'
 
 function errorText(err: unknown): string {
   return err instanceof Error ? err.message : String(err)
@@ -149,7 +149,7 @@ export function PoliciesPanel() {
                     <tr class={trHoverClass}>
                       <td class={cx(tdClass, 'font-mono text-xs font-medium')}>{policy.name}</td>
                       <td class={cx(tdClass, 'text-muted')}>{policy.description}</td>
-                      <td class={cx(tdClass, 'whitespace-nowrap text-xs text-faint')}>{policy.updatedAt}</td>
+                      <td class={cx(tdClass, 'whitespace-nowrap text-xs text-faint')}><RelativeTime value={policy.updatedAt} /></td>
                       <td class={cx(tdClass, 'text-right')}>
                         <div class="inline-flex items-center gap-1.5">
                           <Button size="xs" onClick={() => edit(policy.name)}>Edit</Button>
@@ -272,7 +272,11 @@ export function TokensPanel() {
                           <For each={token.policies}>{(policy) => <Badge tone="neutral">{policy}</Badge>}</For>
                         </span>
                       </td>
-                      <td class={cx(tdClass, 'whitespace-nowrap text-xs text-faint')}>{token.expiresAt ?? 'never'}</td>
+                      <td class={cx(tdClass, 'whitespace-nowrap text-xs text-faint')}>
+                        <Show when={token.expiresAt} fallback="never">
+                          <RelativeTime value={token.expiresAt} />
+                        </Show>
+                      </td>
                       <td class={cx(tdClass, 'text-right')}>
                         <ConfirmButton label="Revoke" size="xs" onConfirm={() => void revoke(token.accessorId)} />
                       </td>
@@ -382,7 +386,7 @@ export function UsersPanel() {
                           <For each={user.policies}>{(policy) => <Badge tone="neutral">{policy}</Badge>}</For>
                         </span>
                       </td>
-                      <td class={cx(tdClass, 'whitespace-nowrap text-xs text-faint')}>{user.updatedAt}</td>
+                      <td class={cx(tdClass, 'whitespace-nowrap text-xs text-faint')}><RelativeTime value={user.updatedAt} /></td>
                       <td class={cx(tdClass, 'text-right')}>
                         <ConfirmButton label="Delete" size="xs" onConfirm={() => void remove(user.username)} />
                       </td>
@@ -515,7 +519,11 @@ export function JoinTokensPanel() {
                       <td class={cx(tdClass, 'font-mono text-xs')}>{token.id}</td>
                       <td class={tdClass}>{token.workerType}</td>
                       <td class={cx(tdClass, 'text-muted')}>{token.description}</td>
-                      <td class={cx(tdClass, 'whitespace-nowrap text-xs text-faint')}>{token.expiresAt ?? 'never'}</td>
+                      <td class={cx(tdClass, 'whitespace-nowrap text-xs text-faint')}>
+                        <Show when={token.expiresAt} fallback="never">
+                          <RelativeTime value={token.expiresAt} />
+                        </Show>
+                      </td>
                       <td class={cx(tdClass, 'text-right')}>
                         <ConfirmButton label="Revoke" size="xs" onConfirm={() => void revoke(token.id)} />
                       </td>

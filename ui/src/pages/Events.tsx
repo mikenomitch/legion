@@ -1,9 +1,9 @@
+import { A } from '@solidjs/router'
 import { For, Show, createMemo, createSignal, onCleanup, onMount } from 'solid-js'
 import { AccessGate } from '../components/AccessGate'
 import type { SchedulerEvent } from '../gen/legion_pb'
 import { managerClient } from '../grpcClient'
-import { formatRelativeTime } from '../utils/format'
-import { Badge, Button, Dot, EmptyState, Icon, SectionCard, cx, inputClass, selectClass } from '../components/ui'
+import { Badge, Button, Dot, EmptyState, Icon, RelativeTime, SectionCard, cx, inputClass, selectClass } from '../components/ui'
 import { statusTone, type Tone } from '../utils/status'
 
 const MAX_BUFFERED_EVENTS = 750
@@ -206,14 +206,24 @@ function EventsContent() {
                     <span class="font-mono text-xs text-faint">{event.kind}</span>
                     <span class="min-w-0 flex-1 truncate text-ink">{event.message}</span>
                     <Show when={event.jobId}>
-                      <span class="rounded bg-surface2 px-1.5 py-0.5 font-mono text-2xs text-muted">job={event.jobId}</span>
+                      <A
+                        href={`/jobs/${encodeURIComponent(event.jobId!)}`}
+                        class="rounded bg-surface2 px-1.5 py-0.5 font-mono text-2xs text-muted hover:text-brass-strong"
+                        onClick={(clickEvent) => clickEvent.stopPropagation()}
+                      >
+                        job={event.jobId}
+                      </A>
                     </Show>
                     <Show when={event.nodeId}>
-                      <span class="rounded bg-surface2 px-1.5 py-0.5 font-mono text-2xs text-muted">node={event.nodeId}</span>
+                      <A
+                        href={`/nodes/${encodeURIComponent(event.nodeId!)}`}
+                        class="rounded bg-surface2 px-1.5 py-0.5 font-mono text-2xs text-muted hover:text-brass-strong"
+                        onClick={(clickEvent) => clickEvent.stopPropagation()}
+                      >
+                        node={event.nodeId}
+                      </A>
                     </Show>
-                    <span class="whitespace-nowrap text-xs text-faint" title={event.createdAt}>
-                      {formatRelativeTime(event.createdAt)}
-                    </span>
+                    <RelativeTime value={event.createdAt} class="whitespace-nowrap text-xs text-faint" />
                   </button>
                   <Show when={expandedId() === event.id}>
                     <div class="space-y-2 border-t border-line bg-surface2/40 px-3.5 py-2.5 text-xs">

@@ -250,8 +250,9 @@ export const Manager = {
      *
      * The source must evaluate to a record with an optional `description`,
      * an optional `variables` list, and a
-     * `job | not_exported = fun vars => ...` function that
-     * returns the jobspec. Invalid manifests are rejected here, not at run
+     * `job | not_exported = fun vars => ...` function that returns the
+     * jobspec. `not_exported` is what keeps `job` out of the published
+     * manifest. Invalid manifests are rejected here, not at run
      * time. When every declared variable has a default, the manager also
      * trial-renders the template and validates the resulting jobspec.
      * Requires `template:write` scoped to the template name.

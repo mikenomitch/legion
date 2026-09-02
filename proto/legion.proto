@@ -2528,6 +2528,12 @@ message ListJobsRequest {
   //
   // Default: `20`.
   optional uint32 page_size = 5;
+
+  // Keep only jobs whose status equals this value (case-insensitive, exact —
+  // `run` does not match `running`; use `query` for substring search).
+  // Applied after `query` and before paging, so `total_count` reflects the
+  // filtered set. Omit or leave empty to return every status.
+  optional string status = 6;
 }
 
 // Job metadata record.
@@ -2572,6 +2578,13 @@ message Job {
 message ListJobsReply {
   // Jobs known to manager for the requested page.
   repeated Job jobs = 1;
+
+  // Number of jobs per status string (`running`, `stopped`, `failed`, …),
+  // counted over every job the caller may read that matches `query` — BEFORE
+  // the `status` filter and before paging. A client rendering a status filter
+  // can therefore show stable counts on every option while one is selected.
+  // Statuses with no jobs are absent rather than zero.
+  map<string, uint32> status_counts = 5;
 
   // Total number of records matching the filter before pagination.
   uint32 total_count = 2;

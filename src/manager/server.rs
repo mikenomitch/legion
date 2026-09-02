@@ -3718,6 +3718,22 @@ impl Manager for ManagerDaemonService {
             });
         }
 
+        // Counted before the status filter on purpose: a filter control that
+        // shows "failed (3)" must keep saying 3 while "running" is selected.
+        let mut status_counts: HashMap<String, u32> = HashMap::new();
+        for job in &jobs {
+            *status_counts.entry(job.status.clone()).or_insert(0) += 1;
+        }
+
+        if let Some(status) = request
+            .status
+            .as_deref()
+            .map(str::trim)
+            .filter(|status| !status.is_empty())
+        {
+            jobs.retain(|job| job.status.eq_ignore_ascii_case(status));
+        }
+
         jobs.sort_by(|a, b| {
             let ordering = match sort_by.as_str() {
                 "name" => a.name.cmp(&b.name),
@@ -3744,6 +3760,7 @@ impl Manager for ManagerDaemonService {
             total_count,
             page: page as u32,
             page_size: page_size as u32,
+            status_counts,
         }))
     }
 
@@ -8643,6 +8660,76 @@ mod tests {
             identity_name: identity_name.into(),
             node_id: node_id.into(),
         })
+    }
+
+    fn submit_plain_job(store: &Store, job_name: &str) -> R<()> {
+        let job = JobConfig {
+            priority: Default::default(),
+            name: job_name.into(),
+            tasks: vec![TaskConfig::new(&format!("{job_name}-task"), "service")],
+            rollout: None,
+            rollout_by_group: Default::default(),
+            version: None,
+        };
+        store.handle_job_submit(&job, &[submission()])?;
+        Ok(())
+    }
+
+    /// `ListJobs.status` narrows the page to one status (case-insensitively)
+    /// while `status_counts` keeps counting the whole query-matched set, so a
+    /// filter control can show "stopped (1)" while "running" is selected.
+    #[tokio::test]
+    async fn list_jobs_filters_by_status_and_reports_counts() -> R<()> {
+        let store = setup_store()?;
+        submit_plain_job(&store, "list-a")?;
+        submit_plain_job(&store, "list-b")?;
+        submit_plain_job(&store, "other-c")?;
+        store.stop_job("list-b")?;
+        let manager = ManagerDaemonService::new(store);
+
+        let all = manager
+            .list_jobs(Request::new(ListJobsRequest::default()))
+            .await?
+            .into_inner();
+        assert_eq!(all.total_count, 3);
+        assert_eq!(all.status_counts.get("stopped"), Some(&1));
+        assert_eq!(all.status_counts.values().sum::<u32>(), 3);
+
+        let stopped = manager
+            .list_jobs(Request::new(ListJobsRequest {
+                status: Some("STOPPED".into()),
+                ..Default::default()
+            }))
+            .await?
+            .into_inner();
+        assert_eq!(stopped.total_count, 1);
+        assert_eq!(stopped.jobs.len(), 1);
+        assert_eq!(stopped.jobs[0].name, "list-b");
+        // The counts are unchanged by the status filter itself …
+        assert_eq!(stopped.status_counts, all.status_counts);
+
+        // … but they do follow the free-text query.
+        let queried = manager
+            .list_jobs(Request::new(ListJobsRequest {
+                query: Some("list-".into()),
+                status: Some("stopped".into()),
+                ..Default::default()
+            }))
+            .await?
+            .into_inner();
+        assert_eq!(queried.total_count, 1);
+        assert_eq!(queried.status_counts.values().sum::<u32>(), 2);
+
+        // An exact match: a prefix never matches a status.
+        let prefix = manager
+            .list_jobs(Request::new(ListJobsRequest {
+                status: Some("stop".into()),
+                ..Default::default()
+            }))
+            .await?
+            .into_inner();
+        assert_eq!(prefix.total_count, 0);
+        Ok(())
     }
 
     #[tokio::test]

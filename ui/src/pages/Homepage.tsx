@@ -1,50 +1,52 @@
 import { A } from '@solidjs/router'
-import { For, Show, createMemo, createResource, createSignal, onCleanup, onMount } from 'solid-js'
-import { EmptyState, LoadingRows, MonoBadge, Note, SectionCard, StatCard, StatusBadge, TableShell, linkClass, tableClass, tdClass, thClass, theadClass, trHoverClass } from '../components/ui'
+import { For, Show, createMemo, createResource } from 'solid-js'
+import { Badge, EmptyState, LoadingRows, MonoBadge, Note, RelativeTime, SectionCard, StatCard, StatusBadge, TableShell, linkClass, tableClass, tdClass, thClass, theadClass, trHoverClass } from '../components/ui'
 import { managerClient } from '../grpcClient'
-import { asDisplay, formatRelativeTime, heartbeatFreshnessHint } from '../utils/format'
+import { asDisplay, heartbeatFreshnessHint } from '../utils/format'
 import { summarizeHealthChecks } from '../utils/health'
-import { statusTone } from '../utils/status'
-import { POLL_INTERVAL_MS } from '../utils/polling'
+import { statusTone, type Tone } from '../utils/status'
+import { retainOnError, swallowDenied, usePoll } from '../utils/polling'
+
+const eventTone = (level: string): Tone => (statusTone(level) === 'info' ? 'neutral' : statusTone(level))
 
 export default function Homepage() {
   // Poll while the page is mounted so the dashboard stays live; the previous
   // value is kept during refetches so the tables never flash.
-  const [tick, setTick] = createSignal(0)
-  onMount(() => {
-    const timer = setInterval(() => setTick((value) => value + 1), POLL_INTERVAL_MS)
-    onCleanup(() => clearInterval(timer))
-  })
+  const tick = usePoll()
 
   // +1 because a 0 source is falsy to createResource and would skip the first fetch.
   // The overview is reachable by every identity, so each stat degrades to
-  // empty when its RPC is denied rather than throwing into the page.
-  const [ledger] = createResource(() => tick() + 1, async () => {
-    try {
-      return (await managerClient.getLedger({})).nodes
-    } catch {
-      return []
-    }
-  })
+  // empty when its RPC is denied rather than throwing into the page; an
+  // outage keeps the last numbers up (the connection banner reports it).
+  const [ledger] = createResource(
+    () => tick() + 1,
+    retainOnError(
+      swallowDenied(async () => (await managerClient.getLedger({})).nodes, []),
+      () => 'ledger',
+    ),
+  )
   const [rollouts] = createResource(
     () => tick() + 1,
-    async () => {
-      try {
-        return (await managerClient.listRollouts({ activeOnly: true, page: 1, pageSize: 20 })).rollouts
-      } catch {
-        return []
-      }
-    },
+    retainOnError(
+      swallowDenied(async () => (await managerClient.listRollouts({ activeOnly: true, page: 1, pageSize: 20 })).rollouts, []),
+      () => 'rollouts',
+    ),
   )
   const [services] = createResource(
     () => tick() + 1,
-    async () => {
-      try {
-        return (await managerClient.listServices({})).services
-      } catch {
-        return []
-      }
-    },
+    retainOnError(
+      swallowDenied(async () => (await managerClient.listServices({})).services, []),
+      () => 'services',
+    ),
+  )
+  // The last few scheduler events give the overview a pulse: a placement, a
+  // failed allocation, a node that went quiet. operator:read garnish.
+  const [events] = createResource(
+    () => tick() + 1,
+    retainOnError(
+      swallowDenied(async () => (await managerClient.listEvents({ limit: 8 })).events.slice().reverse(), []),
+      () => 'events',
+    ),
   )
 
   const props = { ledger, rollouts }
@@ -68,6 +70,7 @@ export default function Homepage() {
   // a slot on the overview next to workers and allocations.
   const allServices = createMemo(() => services() ?? [])
   const servicesUp = createMemo(() => allServices().filter((service) => service.healthyCount > 0).length)
+  const recentEvents = createMemo(() => events() ?? [])
 
   return (
     <Show when={props.ledger() !== undefined || !props.ledger.loading} fallback={<LoadingRows rows={6} class="p-0" />}>
@@ -153,7 +156,7 @@ export default function Homepage() {
                           </td>
                           <td class={tdClass}><StatusBadge status={rollout.status} /></td>
                           <td class={tdClass}><span class="font-mono text-xs text-muted">{asDisplay(rollout.toJobConfigId)}</span></td>
-                          <td class={tdClass + ' whitespace-nowrap text-right text-xs text-faint'}>{formatRelativeTime(rollout.updatedAt)}</td>
+                          <td class={tdClass + ' whitespace-nowrap text-right text-xs text-faint'}><RelativeTime value={rollout.updatedAt} /></td>
                         </tr>
                       )}
                     </For>
@@ -163,54 +166,101 @@ export default function Homepage() {
             </SectionCard>
           </Show>
 
-          <SectionCard title="Workers" flush actions={<A href="/nodes" class={linkClass}>View all</A>}>
-            <Show
-              when={workers().length > 0}
-              fallback={
-                <EmptyState
-                  icon="server"
-                  title="No workers connected"
-                  body="Join a worker with `legion agent --join <manager>` and it will appear here."
-                />
-              }
-            >
-              <TableShell>
-                <table class={tableClass}>
-                  <thead class={theadClass}>
-                    <tr>
-                      <th class={thClass}>Worker</th>
-                      <th class={thClass}>Status</th>
-                      <th class={thClass}>Health</th>
-                      <th class={thClass}>Pool</th>
-                      <th class={thClass + ' text-right'}>Allocations</th>
-                      <th class={thClass + ' text-right'}>Heartbeat</th>
-                    </tr>
-                  </thead>
-                  <tbody class="divide-y divide-line">
-                    <For each={workers()}>
-                      {(entry) => {
-                        const health = summarizeHealthChecks(entry.node?.healthChecks)
-                        return (
-                          <tr class={trHoverClass}>
-                            <td class={tdClass}>
-                              <A href={`/nodes/${encodeURIComponent(entry.node?.id ?? '')}`} class="font-medium hover:text-brass-strong">
-                                {entry.node?.id ?? 'unknown'}
-                              </A>
-                            </td>
-                            <td class={tdClass}><StatusBadge status={entry.node?.status} /></td>
-                            <td class={tdClass}><StatusBadge status={health.label} /></td>
-                            <td class={tdClass + ' text-muted'}>{entry.node?.pool || 'default'}</td>
-                            <td class={tdClass + ' text-right tabular-nums text-muted'}>{entry.allocations.length}</td>
-                            <td class={tdClass + ' whitespace-nowrap text-right text-xs text-faint'}><span title={heartbeatFreshnessHint(entry.node?.heartbeatSource)}>{formatRelativeTime(entry.node?.lastHeartbeat)}</span></td>
-                          </tr>
-                        )
-                      }}
-                    </For>
-                  </tbody>
-                </table>
-              </TableShell>
-            </Show>
-          </SectionCard>
+          <div class="grid gap-5 2xl:grid-cols-[minmax(0,3fr)_minmax(0,2fr)]">
+            <SectionCard title="Workers" flush actions={<A href="/nodes" class={linkClass}>View all</A>}>
+              <Show
+                when={workers().length > 0}
+                fallback={
+                  <EmptyState
+                    icon="server"
+                    title="No workers connected"
+                    body="Create a join token on the Workers page, run the printed `legion join <token>` on a host, and it will appear here."
+                  >
+                    <A href="/nodes" class={`${linkClass} mt-1 text-xs`}>Open Workers</A>
+                  </EmptyState>
+                }
+              >
+                <TableShell>
+                  <table class={tableClass}>
+                    <thead class={theadClass}>
+                      <tr>
+                        <th class={thClass}>Worker</th>
+                        <th class={thClass}>Status</th>
+                        <th class={thClass}>Health</th>
+                        <th class={thClass}>Pool</th>
+                        <th class={thClass + ' text-right'}>Allocations</th>
+                        <th class={thClass + ' text-right'}>Heartbeat</th>
+                      </tr>
+                    </thead>
+                    <tbody class="divide-y divide-line">
+                      <For each={workers()}>
+                        {(entry) => {
+                          const health = summarizeHealthChecks(entry.node?.healthChecks)
+                          return (
+                            <tr class={trHoverClass}>
+                              <td class={tdClass}>
+                                <A href={`/nodes/${encodeURIComponent(entry.node?.id ?? '')}`} class="whitespace-nowrap font-medium hover:text-brass-strong">
+                                  {entry.node?.id ?? 'unknown'}
+                                </A>
+                                <Show when={entry.node?.availability && entry.node.availability !== 'available'}>
+                                  <Badge tone="warn" class="ml-2 uppercase tracking-wide">{entry.node!.availability}</Badge>
+                                </Show>
+                              </td>
+                              <td class={tdClass}><StatusBadge status={entry.node?.status} /></td>
+                              <td class={tdClass}><StatusBadge status={health.label} tone={health.tone} /></td>
+                              <td class={tdClass + ' text-muted'}>{entry.node?.pool || 'default'}</td>
+                              <td class={tdClass + ' text-right tabular-nums text-muted'}>{entry.allocations.length}</td>
+                              <td class={tdClass + ' whitespace-nowrap text-right text-xs text-faint'}>
+                                <RelativeTime value={entry.node?.lastHeartbeat} title={heartbeatFreshnessHint(entry.node?.heartbeatSource)} />
+                              </td>
+                            </tr>
+                          )
+                        }}
+                      </For>
+                    </tbody>
+                  </table>
+                </TableShell>
+              </Show>
+            </SectionCard>
+
+            <SectionCard title="Recent activity" flush actions={<A href="/events" class={linkClass}>Live stream</A>}>
+              <Show
+                when={recentEvents().length > 0}
+                fallback={
+                  <EmptyState
+                    icon="activity"
+                    title="Nothing has happened yet"
+                    body="Scheduler events — placements, failures, node changes — show up here as they occur."
+                  />
+                }
+              >
+                <ul class="divide-y divide-line">
+                  <For each={recentEvents()}>
+                    {(event) => (
+                      <li class="flex items-start gap-2.5 px-4 py-2 text-sm">
+                        <Badge tone={eventTone(event.level)} class="mt-0.5 shrink-0 uppercase">{event.level}</Badge>
+                        <span class="min-w-0 flex-1">
+                          <span class="block truncate text-ink" title={event.message}>{event.message}</span>
+                          <span class="block truncate font-mono text-2xs text-faint">
+                            {event.kind}
+                            <Show when={event.jobId}>
+                              {' · '}
+                              <A href={`/jobs/${encodeURIComponent(event.jobId!)}`} class="hover:text-brass-strong">{event.jobId}</A>
+                            </Show>
+                            <Show when={event.nodeId}>
+                              {' · '}
+                              <A href={`/nodes/${encodeURIComponent(event.nodeId!)}`} class="hover:text-brass-strong">{event.nodeId}</A>
+                            </Show>
+                          </span>
+                        </span>
+                        <RelativeTime value={event.createdAt} class="shrink-0 whitespace-nowrap text-xs text-faint" />
+                      </li>
+                    )}
+                  </For>
+                </ul>
+              </Show>
+            </SectionCard>
+          </div>
 
           <SectionCard title="Allocations" flush>
             <Show

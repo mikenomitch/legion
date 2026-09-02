@@ -1,8 +1,9 @@
-import { For, Show, createEffect, createMemo, createResource, createSignal, onCleanup } from 'solid-js'
+import { For, Show, createEffect, createMemo, createResource, createSignal } from 'solid-js'
 import { AccessGate } from '../components/AccessGate'
 import { managerClient } from '../grpcClient'
 import { EmptyState, Icon, Note, SectionCard, checkboxClass, cx, inputClass } from '../components/ui'
 import { badgeToneClasses, statusTone } from '../utils/status'
+import { retainOnError, usePoll } from '../utils/polling'
 
 type LogSignal = {
   raw: string
@@ -241,20 +242,17 @@ function SignalCard(props: {
 }
 
 function ObservabilityContent() {
-  const [o11y, o11yActions] = createResource(async () => managerClient.getObservability({ maxLines: 200 }))
   const [liveUpdating, setLiveUpdating] = createSignal(true)
   const [searchTerm, setSearchTerm] = createSignal('')
   const [expandedLogIds, setExpandedLogIds] = createSignal<Set<string>>(new Set())
 
-  createEffect(() => {
-    if (!liveUpdating()) {
-      return
-    }
-    const timer = setInterval(() => {
-      void o11yActions.refetch()
-    }, 2000)
-    onCleanup(() => clearInterval(timer))
-  })
+  // Live update is the poll; pausing it freezes the source so the resource
+  // keeps its last reply without refetching.
+  const tick = usePoll()
+  const [o11y] = createResource(
+    () => (liveUpdating() ? tick() + 1 : false),
+    retainOnError(async () => managerClient.getObservability({ maxLines: 200 }), () => 'logs'),
+  )
 
   const parsedLogs = createMemo(() =>
     (o11y()?.logs ?? [])

@@ -1,6 +1,6 @@
-import { For, Show, createEffect, createSignal, onCleanup, onMount } from 'solid-js'
+import { For, Show, createEffect, createMemo, createSignal, onCleanup, onMount } from 'solid-js'
 import { managerClient } from '../grpcClient'
-import { Button, Dot, Note, cx, selectClass } from './ui'
+import { Button, Dot, Icon, Note, cx, inputClass, selectClass } from './ui'
 
 // Live-tailing task log viewer.
 //
@@ -43,6 +43,8 @@ export default function LogViewer(props: LogViewerProps) {
   const [lastUpdated, setLastUpdated] = createSignal<number | undefined>()
   const [error, setError] = createSignal<string>('')
   const [truncated, setTruncated] = createSignal(false)
+  // A grep over the buffer: matching lines only, with the hit highlighted.
+  const [filter, setFilter] = createSignal('')
 
   // Non-reactive bookkeeping for incremental reads.
   const offsets = new Map<string, bigint>() // `${alloc}:${stream}` -> next byte offset
@@ -160,9 +162,36 @@ export default function LogViewer(props: LogViewerProps) {
     if (nearBottom !== follow()) setFollow(nearBottom)
   }
 
-  const visibleLines = () => {
+  const allocLines = () => {
     const af = allocFilter()
     return af === 'all' ? lines() : lines().filter((l) => l.alloc === af)
+  }
+  const needle = createMemo(() => filter().trim().toLowerCase())
+  const visibleLines = () => {
+    const q = needle()
+    return q ? allocLines().filter((l) => l.text.toLowerCase().includes(q)) : allocLines()
+  }
+
+  // Split a line around each case-insensitive hit so the hit can be marked.
+  const highlight = (text: string) => {
+    const q = needle()
+    if (!q) return text
+    const parts: Array<{ text: string; hit: boolean }> = []
+    const lower = text.toLowerCase()
+    let from = 0
+    for (;;) {
+      const at = lower.indexOf(q, from)
+      if (at < 0) break
+      if (at > from) parts.push({ text: text.slice(from, at), hit: false })
+      parts.push({ text: text.slice(at, at + q.length), hit: true })
+      from = at + q.length
+    }
+    if (from < text.length) parts.push({ text: text.slice(from), hit: false })
+    return (
+      <For each={parts}>
+        {(part) => (part.hit ? <mark class="rounded-sm bg-amber-400/40 text-inherit">{part.text}</mark> : part.text)}
+      </For>
+    )
   }
 
   const clear = () => {
@@ -219,6 +248,18 @@ export default function LogViewer(props: LogViewerProps) {
           </select>
         </Show>
 
+        <div class="relative min-w-[12rem] flex-1">
+          <Icon name="search" size={13} class="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-faint" />
+          <input
+            type="search"
+            value={filter()}
+            onInput={(e) => setFilter(e.currentTarget.value)}
+            placeholder="Find in logs…"
+            class={cx(inputClass, 'py-1 pl-8 text-xs')}
+            aria-label="Find in logs"
+          />
+        </div>
+
         <div class="ml-auto flex items-center gap-1.5">
           <button
             type="button"
@@ -260,7 +301,7 @@ export default function LogViewer(props: LogViewerProps) {
       >
         <Show
           when={visibleLines().length > 0}
-          fallback={<p class="text-neutral-500">Waiting for log output…</p>}
+          fallback={<p class="text-neutral-500">{needle() ? `No lines match "${filter().trim()}".` : 'Waiting for log output…'}</p>}
         >
           <For each={visibleLines()}>
             {(line) => (
@@ -276,7 +317,7 @@ export default function LogViewer(props: LogViewerProps) {
                   {line.stream === 'stderr' ? 'E' : 'O'}
                 </span>
                 <span class={line.stream === 'stderr' ? 'text-red-300' : 'text-neutral-200'}>
-                  {line.text || ' '}
+                  {line.text ? highlight(line.text) : ' '}
                 </span>
               </div>
             )}
@@ -286,8 +327,10 @@ export default function LogViewer(props: LogViewerProps) {
 
       <div class="flex items-center justify-between text-2xs text-faint">
         <span class="tabular-nums">
-          {visibleLines().length} line{visibleLines().length === 1 ? '' : 's'} buffered
-          <Show when={visibleLines().length >= MAX_LINES}> (capped at {MAX_LINES})</Show>
+          <Show when={needle()} fallback={<>{visibleLines().length} line{visibleLines().length === 1 ? '' : 's'} buffered</>}>
+            {visibleLines().length} of {allocLines().length} lines match
+          </Show>
+          <Show when={allocLines().length >= MAX_LINES}> (capped at {MAX_LINES})</Show>
         </span>
         <Show when={lastUpdated()}>
           <span>updated {new Date(lastUpdated()!).toLocaleTimeString()}</span>

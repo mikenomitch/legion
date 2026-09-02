@@ -2,6 +2,7 @@ import { For, Show, createEffect, createMemo, createSignal } from 'solid-js'
 import { AccessGate } from '../components/AccessGate'
 import { managerClient } from '../grpcClient'
 import { canWriteAny } from '../utils/acl'
+import { JUMP_MODIFIER_LABEL } from '../utils/jumpHints'
 import type { SavedStateQuery, StateStoreSchemaObject } from '../gen/legion_pb'
 import { Badge, Button, ConfirmButton, Icon, Note, SectionCard, Spinner, Tabs, checkboxClass, cx, inputClass, textareaClass } from '../components/ui'
 
@@ -297,7 +298,7 @@ function StateExplorerContent() {
             value={query()}
             onInput={(event) => setQuery(event.currentTarget.value)}
             onKeyDown={(event) => {
-              if (event.metaKey && event.key === 'Enter') {
+              if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
                 event.preventDefault()
                 void runQuery()
               }
@@ -330,7 +331,7 @@ function StateExplorerContent() {
               <input type="checkbox" class={checkboxClass} checked={allowWrite()} onChange={(event) => setAllowWrite(event.currentTarget.checked)} />
               Allow write queries
             </label>
-            <Button variant="primary" size="md" icon="play" onClick={() => void runQuery()} disabled={isRunning()} title="⌘Enter">
+            <Button variant="primary" size="md" icon="play" onClick={() => void runQuery()} disabled={isRunning()} title={`${JUMP_MODIFIER_LABEL}↵ runs the query`}>
               {isRunning() ? 'Running…' : 'Run query'}
             </Button>
           </div>
