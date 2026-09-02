@@ -2,298 +2,399 @@
 
 Decisions taken while designing
 [`plans/network-handlers-plan.md`](../plans/network-handlers-plan.md). The plan
-is **PLANNED, not implemented** — these are design-time calls, and any that get
-revisited during implementation should be edited in place with what actually
-happened, not appended as a second opinion.
+is **PLANNED, not implemented** — these are design-time calls. Revision 2 of
+the plan reversed six of revision 1's calls; each reversal is marked
+**↩ reversed** with what the first version got wrong, because a reversal is the
+entry most worth reading.
 
 **Entries are ranked by project impact, highest first; an entry's number is its
 rank.** Insert new entries at their rank and renumber rather than appending.
 
 ---
 
-## 1. A handler is an out-of-process proxy, not an in-process plugin
+## 1. `gated` capture is a property of the network namespace, not a sandbox feature — ↩ reversed
 
-**Call.** The extension tier for "run my own code on the network path" is
-`handler: 'proxy'` — an ordinary Legion service or a sidecar task that Legion
-connects to, with metadata in a PROXY protocol v2 header (TCP/UDP) or `Legion-*`
-request headers (HTTP). There is no `plugins/nethandlers/` `cdylib` category,
-now or planned. The only in-process tier is a closed `const HANDLERS` table of
-built-ins that ship in the binary.
+**Call.** Unbypassable capture is defined as *"the workload's network namespace
+contains only loopback and a listener Legion owns."* `sandbox` implements it
+with no guest NIC and vsock; `container` and `exec` implement it with an empty
+network namespace that `netd` creates, binds into, and the workload joins.
+Enforced for all three on Linux. `netd` implements the existing
+`TaskPlugin::network_gate()` hook for gated allocations as *policy withheld*,
+which makes edge-boot's `boot` gate a real boundary on every runtime.
 
-```jsonnet
-egress: { chain: [{ handler: 'proxy', service: 'egress-guard', onError: 'deny' }] }
+```nickel
+network = { capture = "gated" },   # default for sandbox; opt-in for container/exec
 ```
 
-**Alternatives.** (a) A `cdylib` plugin kind, which is what every other
-extensible surface in Legion is — task runtimes, scheduling policies, node
-checks, rollout strategies, artifact fetchers — and which the recipe in
-`docs/plugin-system.md` makes almost mechanical to add. (b) WASM handlers first,
-as the mesh doc's Part D recommends for "arbitrary code between services".
+**What revision 1 said.** Unbypassable capture was sandbox-only, built on
+vsock, and the honesty table listed `container` and `exec` egress as
+permanently cooperative because "Linux containers run in the host netns."
 
-**Trade-off.** A userspace hop per connection, and off-node latency when the
-handler is a service rather than a sidecar. A `cdylib` handler would be a
-function call. We also give up compile-time typing of the handler contract: a
-handler that mis-frames its output produces a runtime failure, not a build error
-— which is why `legion net handler test` is in the same phase as the feature.
+**Alternatives.** (a) Revision 1's shape — vsock is the feature, other
+runtimes wait for the datapath/CNI plugin. (b) Full netns-per-allocation with
+veth/bridge/IPAM — the datapath plugin, done properly.
 
-**Why (simplicity, and the failure domain).** The mesh doc already wrote the
-argument down and it applies with more force here: a panic in a `cdylib` handler
-kills the worker's whole datapath, not one connection, and the datapath sees
-*every* workload's traffic on the node — arbitrary native code there is a
-cross-tenant exfiltration primitive. The `async` datapath makes it worse, since
-the dylib ABI is hostile to `async` traits. Out-of-process costs a hop and buys
-a crash boundary, a resource boundary, any language, and — the part that matters
-most — **zero new machinery**: a handler is a task, so it already has images,
-artifacts, resources, health checks, restart policy, logs, ACLs, and rollouts.
-WASM (plan phase 8) is strictly better than `cdylib` and strictly more work than
-a service; shipping the service tier first means the WASM tier can be judged on
-demand rather than on speculation.
+**Trade-off.** `netd` now needs `CAP_SYS_ADMIN` on Linux to create namespaces
+and `setns` into them — the same privilege the worker already exercises for
+`exec` hardening's mount namespace and for running `youki`, so no *new*
+privilege, but a new place it is used. Inside a gated namespace v1 capture is
+proxy-env, not transparent: a tool that ignores `HTTP_PROXY` has no route and
+fails. macOS gets none of it.
 
----
-
-## 2. Sandbox egress is captured by removing the guest NIC, not by firewalling it
-
-**Call.** `sandbox` gains `net: 'gated'`, in which the microVM has **no network
-device at all**. A `legion-guest-agent` offers SOCKS5 + HTTP CONNECT on guest
-loopback and tunnels every stream over `vsock` to the node-local chain; a
-guest-side redirect catches processes that ignore `HTTP_PROXY`. Ingress arrives
-the same way, in reverse.
-
-**Alternatives.** (a) `mode: 'tap'` plus host `nftables` rules pointing at the
-chain — the conventional answer, and the one the existing `TapNet` code is
-already shaped for. (b) Build the planned datapath/CNI plugin first and do
-capture properly with netns per allocation.
-
-**Trade-off.** A guest agent is a new component that must be built into the root
-disk, versioned with the host, and kept working across hypervisors. Every stream
-pays a vsock hop. And it is `sandbox`-only: `container` on Linux runs in the
-**host** network namespace today (asserted by test at `oci_bundle.rs:669`), so
-container and `exec` egress stays cooperative proxy-env — which the plan's
-capture table states to the user rather than hiding.
-
-**Why (simplicity, and it is a security boundary).** A firewall rule set is a
-configuration you can get wrong; an absent device is not. `gated` needs no
-`CAP_NET_ADMIN`, no bridge, no host addressing plan, and no per-node
-`nftables` state, which means it is the same on every worker and cannot drift.
-The cost is also lower than it looks: the sandbox runtime already builds the
-guest root disk and generates `/legion/init`, and two other planned features
-want the same agent — VM forking needs it to reconfigure identity on resume
-(`sandbox-snapshots-and-fast-start-plan.md`), and `exec` into a microVM is
-blocked on exactly a vsock guest agent (`docs/task-runtime-sandbox.md`). One
-component, three features. Option (b) is the right long-term datapath and
-remains planned; it is not a prerequisite for this, and making it one would put
-the core use case behind a subsystem nobody has started.
+**Why (simplicity, and it is a security boundary).** The first version
+confused the transport with the property. Once the property is "an absent
+device," every runtime that can have a namespace can have the property, the
+public doc's honesty table flips two rows from *Yes, bypassable* to *No*, and
+there is one concept to explain instead of "sandboxes are special." It also
+costs almost nothing: the OCI bundle already declares four namespaces and
+omits this one (`oci_bundle.rs:576`); adding one with a `path` is the whole
+container change. And it closes a gap edge-boot documented honestly — "a
+`boot`-gated `exec` task can still reach the network through the host's own
+stack" — without that plan changing at all. (b) remains the right long-term
+datapath and is not a prerequisite — an *empty* namespace needs no IPAM, no
+bridge, and no plan.
 
 ---
 
-## 3. Egress ships before ingress, inverting the order the request stated
+## 2. Policy is not a handler; connect-time rules never touch the byte path — ↩ reversed
 
-**Call.** Phases 0–2 build egress (chain core, HTTP mode, sandbox capture) and
-the core use case is complete at phase 2. Ingress is phase 3.
+**Call.** `rules` is a separate key from `handlers`. A rule is evaluated at the
+earliest point that can decide it — host/port/SNI/identity at connect or DNS
+resolution, method/path/header at the HTTP request head, body patterns only
+inside a `dlp` handler with a byte cap. A chain with only connect-time rules
+never leaves L4: allow → `splice`, deny → close, nothing parsed.
 
-**Alternatives.** Ingress first, which is the order the feature was asked for
-("inject ingress and egress handlers"), and which is the easier demo — an
-ingress proxy in front of a web service is a thing everyone can picture.
+**What revision 1 said.** `{ handler = "rules", rules = [...] }` — rules were
+a hop in the chain like any other, which put every rule set on the byte path
+whether or not it needed bytes.
 
-**Trade-off.** The mTLS scenario (S3) and the autoscaler's wake-on-request
-dependency both wait three phases longer than they otherwise would.
+**Alternatives.** Keep rules as a handler; it is one concept fewer in the
+jobspec and the chain is uniform.
 
-**Why.** All three capabilities the request actually named — per-user
-observability, dynamically locking down endpoints, filtering the context that
-egresses — are **egress** capabilities. Ingress serves authentication, which
-needs the workload CA anyway (call 6), so building ingress first would either
-ship it without mTLS or drag the CA forward into phase 1. Egress also has a
-seam already: one line at `forwarder.rs:444`. Ingress has none, and creating one
-means changing what the catalog advertises versus what the task binds (call 4).
-Cheaper first, and it is what was actually being asked for.
+**Trade-off.** Two keys instead of one, and a user has to learn that `rules`
+and `handlers` are different kinds of thing. Some rules (a path match) still
+force L7, so the cost is not uniformly zero — the doc has to say which rules
+cost what.
 
----
-
-## 4. An ingress chain changes what `LEGION_PORT_<label>` contains, rather than adding a second variable
-
-**Call.** With an ingress chain, Legion binds the *advertised* host port and the
-task binds a private one — and `LEGION_PORT_<label>` holds the **private**
-value. The catalog, `legion service resolve`, and health checks all target the
-advertised port. `AllocPort` gains `private_port`.
-
-**Alternatives.** Keep `LEGION_PORT_<label>` as the public port and add
-`LEGION_BIND_<label>` for what the task should actually bind — which is more
-explicit and does not change the meaning of an existing variable.
-
-**Trade-off.** The value in `LEGION_PORT_http` is no longer necessarily the port
-a consumer dials, so a task that *prints* its address for a human is now
-printing the wrong one. And health checks traverse the chain, so a deny-all
-ingress rule fails your own health check and rolls the deployment back.
-
-**Why (simplicity).** The instruction every Legion job already follows is "bind
-`$LEGION_PORT_<label>`", and it should stay true whether or not somebody put a
-chain in front of you — a job author should be able to add an ingress chain to a
-running service without touching the image. A second variable makes every job
-author learn both and pick correctly, forever, to serve a case most of them will
-never hit. The health-check consequence is arguably a feature — a check should
-test what a consumer experiences — but it is a genuine footgun, so
-`legion net doctor` names that case explicitly and the public doc states it.
+**Why (performance, measured).** Tensorlake's attribution: removing L7
+interpretation from a proxy took throughput from 1.12 to 2.07 GB/s and CPU from
+0.90 to 0.50 s/GB; kTLS + `splice` on top added only 2.07 → 2.50. So the L7
+hop is ~2× throughput and ~45% CPU, and the single most valuable property the
+datapath can have is *not entering L7 unless a rule needs it*. "Deny
+everything but three hosts" is the sandbox default and is decidable at
+connect time; making it pay the L7 tax because rules were modeled as a filter
+would have thrown the whole gain away on day one. This also gives a second,
+independent argument for entry 11 (never infer `protocol`).
 
 ---
 
-## 5. Dynamic policy rides the heartbeat, fail-static; no KV watch is built
+## 3. External upstreams replace TLS interception as the way to see egress bodies — ↩ reversed
 
-**Call.** `rulesFrom: 'kv://…'` is rendered by the manager and shipped in the
-heartbeat reply next to `upstream_endpoints`, swapped only after a *successful*
-heartbeat. A KV write reaches every live workload within one heartbeat (2s) with
-no restart and no rollout; a manager outage keeps the last known good rules.
+**Call.** `connect.upstreams` gains external destinations:
+`{ name = "openai", to = "https://api.openai.com", handlers = [...] }`. The
+task gets `LEGION_UPSTREAM_OPENAI=127.0.0.1:<port>`, speaks plaintext to it,
+and `netd` originates TLS. The body is visible on the host because the
+workload was pointed at a gateway. TLS `inspect` (MITM) is gone from every
+phase.
 
-**Alternatives.** Add the `WatchKv` server-streaming RPC that `docs/kv-store.md`
-readers keep expecting, and have each worker subscribe. It is the obvious
-design, and it would be lower-latency and useful to more than this feature.
-
-**Trade-off.** Up to one heartbeat interval of staleness, and net policy is
-welded to the heartbeat's health — if heartbeats are failing you keep old
-policy (which is the right failure, but it is a failure mode to explain). It
-also declines to build something several other features would use.
-
-**Why (simplicity, and the failure semantics).** There is no KV watch and no KV
-broadcast channel in the store today; `WatchKv` means a second broadcast channel
-on `Store`, a new streaming RPC, per-worker subscription lifecycle, and
-reconnection semantics — a subsystem, to deliver 2 seconds. The heartbeat path
-already exists, already carries a policy-shaped payload, and already has the
-*correct* failure semantics for a security control: fail-static, last known good,
-explicit-empty-is-authoritative. A watch stream would have to reinvent all three
-and would get them wrong the first time. The 3am job-to-be-done is "under a
-minute"; 2 seconds clears it by a factor of thirty.
-
----
-
-## 6. mTLS ships bring-your-own-PKI first and a Legion workload CA second
-
-**Call.** Phase 5a accepts operator-supplied cert/key/CA (files or
-`${artifact.<name>}`) and can terminate, verify, and originate with them. Phase
-5b adds `certFrom: 'legion'` — a cluster workload CA issuing short-lived certs
-whose SAN is the workload-identity `sub`.
-
-**Alternatives.** Build the CA first and only ever support Legion-issued certs.
-It is one code path instead of two, and it is what makes intentions
-cryptographic — the outstanding item the service-discovery plan has been waiting
-on.
-
-**Trade-off.** Two certificate-source code paths, and phase 5a ships an mTLS
-story that does not yet make `service.allow` cryptographic — so for one phase
-the docs have to say "mTLS, but intentions are still control-plane".
-
-**Why.** There is genuinely no workload CA today — `src/certs.rs` is a dev-TLS
-fixture generator sitting behind `#[allow(dead_code)]`, not an issuer — so 5b is
-real new machinery: issuance, rotation, revocation, trust distribution, and a
-new root of trust for the cluster. Every operator who already has an internal CA
-can be served *without any of that*, and 5a is close to just wiring rustls to
-paths. Shipping it first means the ingress chain is useful the moment it exists,
-and the CA gets designed against a working consumer instead of in the abstract.
-
----
-
-## 7. `protocol` is declared, never inferred from the shape of a rule
-
-**Call.** `egress.protocol` defaults to `tcp`. A path in an `allow` entry or a
-`path` match in a `tcp` chain is a **submit-time error** naming the field and
-the fix, not a signal to switch the chain to HTTP.
-
-```
-egress.allow[1] 'api.github.com/repos/**' matches on a path, but
-egress.protocol is 'tcp'. Set protocol: 'http' to match on paths, or
-drop the path to match the host only.
+```sh
+# in the sandbox
+export OPENAI_BASE_URL="http://$LEGION_UPSTREAM_OPENAI/v1"
 ```
 
-**Alternatives.** Infer: an entry containing a `/` after the host means HTTP.
-This is what most people would expect, it makes the one-liner cover both cases,
-and it removes a line of boilerplate from the common sandbox spec.
+**What revision 1 said.** `egress.tls.mode = "inspect"` — Legion terminates
+TLS with a cluster CA injected into the sandbox trust store, runs the chain on
+plaintext, re-encrypts. Gated behind `allowTlsInspect`, sandbox-only, called
+"MITM" in the doc, and defended as "the only way to filter what egresses over
+HTTPS."
 
-**Trade-off.** The most useful one-liner — HTTP path rules for a sandbox — costs
-an extra line. That is the exact line the progressive-disclosure grammar was
-supposed to save.
+**Alternatives.** Keep `inspect` alongside upstreams for apps that cannot be
+pointed at a gateway (a hardcoded URL in a binary).
 
-**Why (simplicity, at 3am).** Inference here silently changes the *security
-posture* of the chain: HTTP mode terminates and parses, matches on paths a TLS
-chain cannot see, and behaves differently on a connection upgrade. A rule set
-that quietly became L7 because someone typed a slash — or quietly stayed L4
-because they typed a hostname with a trailing slash — is a policy you cannot
-review by reading. This is the same class of bug the service-discovery plan
-called out in Istio: config that instantly changes traffic behavior through a
-default nobody looked at. One extra line, and the spec says what it does.
+**Trade-off.** An app that cannot be re-pointed gets SNI/host-level control
+only, not body filtering. That is a real gap, documented as one, and it is the
+gap that would justify revisiting MITM — with a use case rather than in the
+abstract.
 
----
-
-## 8. Per-user attribution goes to events and access logs, never to metric labels
-
-**Call.** `network.labels` (e.g. `{ user: 'alice' }`) appears on every event and
-every access-log line, and on **no** metric. Metrics keep bounded labels only:
-`direction`, `protocol`, `verdict`, `handler`, and job/task where the job count
-is bounded.
-
-**Alternatives.** Put the label set on the metrics too, which is what "add o11y
-per user" most directly asks for and what a Grafana dashboard wants.
-
-**Trade-off.** "Requests per user" is a log query, not a PromQL query. Anyone
-who wanted a per-user rate panel has to run it through their log pipeline.
-
-**Why (it would not have worked).** The metrics registry caps a family at 256
-label combinations and folds the overflow into `"other"`
-(`docs/metrics.md`). A per-user label on a fleet of sandboxes blows that cap on
-the first thousand users and **silently destroys the metric** — you would not
-get expensive cardinality, you would get a broken series and a dashboard that
-lies. Events and logs are the unbounded-cardinality surface Legion already has,
-they are already streamed and already queryable, and a denial event carrying the
-user and the matched rule is a better artifact for the billing and audit
-questions than a counter is anyway.
+**Why (simplicity, and the trust story).** The first version missed that
+Legion already has the non-MITM shape: `connect.upstreams` is "dial a name
+through a loopback port the forwarder owns," and an external name is the same
+thing with a static target. Every AI-gateway product works this way for the
+same reason. The result: Legion never holds a CA that can impersonate the
+public internet, the recommended path serves the LLM use case that motivated
+the feature, it works on every runtime and platform (no capture needed — it is
+opt-in by address), and the plan loses a whole security-review-shaped section.
+A design that needed a MITM to serve its second scenario was telling us
+something.
 
 ---
 
-## 9. Version skew is a placement constraint, not a best-effort ignore
+## 4. Handlers are out-of-process — a webhook or a proxy, never a `cdylib`
 
-**Call.** A manager must refuse to place an allocation with a chain on a worker
-whose fingerprint does not advertise chain support. The allocation stays
-unplaced with a legible reason rather than running.
+**Call.** Two external tiers: `authz` (Legion POSTs metadata, receives a
+verdict, caches it; no bytes) and `proxy` (any service or sidecar; PROXY v2 or
+`Legion-*` headers; no SDK). Built-ins come from a closed `const HANDLERS`
+table. There is no `plugins/nethandlers/` `cdylib` kind, now or planned.
 
-**Alternatives.** Let it run — the older worker simply ignores the unknown
-`task_net_chain` field, which is the ordinary proto forward-compatibility
-behavior and what every other field in this system does. Managers upgrade first
-per `docs/upgrades.md`, so the window is short.
+**Alternatives.** (a) A `cdylib` kind, which is what every other extensible
+surface in Legion is and which `docs/plugin-system.md` makes mechanical. (b)
+WASM first, per the mesh doc's Part D.
 
-**Trade-off.** A mixed-version cluster can leave chained jobs unplaceable
-mid-upgrade, which looks like a capacity failure to anyone who has not read the
-upgrade note. Chains become the first thing in Legion that gates placement on a
-worker version.
+**Trade-off.** A userspace hop per connection for `proxy`, one cached RPC per
+new (identity, destination) for `authz`, and no compile-time typing of the
+contract — hence `legion net handler test` in the same phase.
 
-**Why (security boundary).** The default forward-compat behavior here is
-"quietly run the untrusted workload with its egress policy removed" — the single
-worst outcome this feature can produce, and it would be invisible: the task is
-Running, healthy, and unfiltered. An unplaced allocation with a clear reason is
-a page; a silently unfiltered sandbox is an incident nobody opens. Anywhere a
-field is a policy rather than a preference, ignoring it must be louder than
-failing.
+**Why (the failure domain, then simplicity).** A panic in an in-process
+handler kills the node's datapath, and that datapath sees every workload's
+traffic — arbitrary native code there is a cross-tenant exfil primitive. The
+`async` datapath makes the dylib ABI worse. Out-of-process buys a crash
+boundary, a resource boundary, any language, and zero new machinery: a handler
+is a task, with images, health, restart, logs, ACLs, and rollouts already.
+WASM is strictly better than `cdylib` and strictly more work than a service;
+shipping the service tier first lets WASM be judged on demand.
 
 ---
 
-## 10. TLS `inspect` ships, but operator-gated and effectively sandbox-only
+## 5. `authz` is the first external handler, not `proxy` — new in revision 2
 
-**Call.** `egress.tls.mode: 'inspect'` terminates TLS, runs the chain on
-plaintext, and re-encrypts to the destination — a MITM. It requires the cluster
-operator to set `network.allowTlsInspect: true`, and it is only workable where
-Legion controls the trust store, which today means `sandbox`. The public doc
-uses the word "MITM" and says the workload can see the substituted issuer.
+**Call.** The simplest way to run custom logic is a webhook:
+`{ handler = "authz", url = "http://policy.internal/check", cache = "30s" }`.
+`netd` sends JSON metadata (identity, labels, instance key, destination, HTTP
+head in HTTP mode) and gets `{ verdict, reason?, ttl? }`.
 
-**Alternatives.** Don't ship it. SNI and destination matching (`passthrough`)
-cover "which hosts may I reach" without decrypting anything, and decrypting a
-user's traffic is a serious thing for a scheduler to offer.
+**Alternatives.** Revision 1 had only `proxy`: every custom decision cost a
+correct, streaming, upgrade-preserving HTTP proxy.
 
-**Trade-off.** Legion ships a credential-visible interception path. Anyone who
-enables it can read every secret their workloads send, and the feature's
-existence invites use in places where it is not defensible.
+**Trade-off.** A second external contract to document and conformance-test.
+A cached allow can outlive a policy change by up to its `ttl` (capped at 5m).
 
-**Why.** "Granular filtering of the context that egresses" is one of the three
-things the feature was asked for, and it is **unachievable without inspection** —
-an approved destination is not an approved payload, and the payload is inside
-TLS. The honest options were to ship it with the safety rails visible or to
-ship a feature that quietly cannot do what it claims. It is defensible here
-specifically because a sandbox's root filesystem is one Legion built, for code
-the operator is already sandboxing — and indefensible almost everywhere else,
-which is why the gate is a cluster-level operator decision and not a jobspec
-field.
+**Why (simplicity).** "Ask my service whether this is OK" is what most custom
+logic actually is, and it is what Envoy `ext_authz`, OPA, and admission
+webhooks all converged on. A 200/403 endpoint is an afternoon in any language;
+a correct HTTP proxy is not. With caching it is also cheaper than a proxy hop —
+one RPC per distinct (identity, destination), not per connection.
+
+---
+
+## 6. The datapath is `legion netd`, a separate process from the same binary — ↩ reversed
+
+**Call.** Listeners, namespaces, vsock sockets, and the policy cache live in a
+process the worker spawns and supervises, with fd handoff on restart. The
+worker keeps control-plane duties. `netd` readiness gates gated task start;
+`netd` health is node health.
+
+**What revision 1 said.** Nothing — the chain lived in the worker process by
+default, as the forwarder does today.
+
+**Alternatives.** (a) Stay in-process and do listener fd handoff across worker
+restarts — keeps one process. (b) Accept the connection loss and document it.
+
+**Trade-off.** A second long-lived process per node to supervise, upgrade,
+and reason about, against a codebase whose headline is one binary; an IPC
+boundary between worker and datapath; macOS keeps the in-process path so there
+are two arrangements to test.
+
+**Why (it is a security boundary that must not blink).** Tasks already survive
+a worker restart (`restore_allocations`, `task_manager.rs:2138`); the
+forwarder does not (`daemon.rs:328`, `forwarder.rs:334` `Drop`). Today that is
+a papercut. Under `gated`, the datapath is *the only network path* a workload
+has — a worker upgrade would sever every sandbox on the node, and they would
+keep running, healthy-looking, with a dead network. Tensorlake decoupled their
+forwarder from the orchestrator for exactly this. (a) fixes restart but not
+the crash boundary: an HTTP-parser panic would still take the heartbeat loop
+with it. "One binary" survives because `netd` is a subcommand, not a second
+install.
+
+---
+
+## 7. Cluster posture is a stored, selector-scoped policy object, not manager config — ↩ reversed
+
+**Call.** `legion net policy apply -f …` writes a raft-replicated object with a
+`selector` (`nodePools`, `namespaces`, `runtimes`, `jobs`, `labels`), a
+`priority`, and `enforcement = "require" | "default"`. A task's inline
+`network.egress` is the same object scoped to that task. Merge is
+deterministic and every merged rule names its source. `rulesFrom = "kv://"`
+is gone.
+
+**What revision 1 said.** `network.defaultEgress` in `configs/manager.ncl`,
+plus `rulesFrom = "kv://…"` on the task for dynamic rules.
+
+**Alternatives.** Keep config for cluster-wide and add pool/namespace blocks
+under it — no new table, no new RPCs.
+
+**Trade-off.** A new table, six RPCs, a new `AclResource::Net`, and a CLI verb
+family. A `require` policy applied to a pool with running jobs changes them on
+the next heartbeat, which is powerful and therefore needs `apply --dry-run`.
+
+**Why (correctness under raft, then simplicity).** With a manager group, a
+config-file posture is whatever the current leader's file says — a drifted
+file on one manager is a silent hole that appears after a failover. And it
+cannot change without a restart, which defeats the 3am requirement. The ACL
+system already solved exactly this shape; copying it is less new design than
+inventing pool/namespace config blocks. Folding `rulesFrom` in was the
+simplification: policy objects *are* the dynamic layer, so a second mechanism
+for the same job was pure surface.
+
+---
+
+## 8. Policy is delivered content-addressed over the heartbeat, fail-static — refined
+
+**Call.** `HeartbeatReply` carries `[{ allocation_id, policy_hash }]`; `netd`
+fetches a missing hash once and caches it. Swap only after a successful
+heartbeat; last-known-good on failure; explicit empty is authoritative; a
+gated allocation with no policy yet has no network.
+
+**Alternatives.** (a) Ship the merged rule set per allocation per heartbeat —
+revision 1's implicit shape. (b) Add `WatchKv` and let workers subscribe.
+
+**Trade-off.** One extra RPC on a cache miss, and up to one heartbeat (2s) of
+staleness. Fail-closed-before-first-policy means a gated task's start waits on
+the control plane.
+
+**Why (performance, then failure semantics).** (a) is O(allocations) per
+heartbeat; a node with a thousand sandboxes under one policy would ship the
+same rules a thousand times every two seconds. Hashing makes it O(distinct
+policies). (b) is a subsystem — a second broadcast channel, a streaming RPC,
+subscription lifecycle — to save 2s, and a watch stream would have to reinvent
+fail-static, last-known-good, and explicit-empty and would get them wrong the
+first time. The heartbeat already has the right semantics for a security
+control.
+
+---
+
+## 9. DNS is served by the datapath inside a gated namespace — new in revision 2
+
+**Call.** `netd` (and the guest agent, in a VM) answers DNS on loopback.
+Resolution happens on the host; connect-time rules are evaluated at
+resolution; a denied host is `NXDOMAIN` plus a `net_denied` event; non-loopback
+DNS has no route.
+
+**Alternatives.** Leave DNS to the proxy (`socks5h://`, HTTP CONNECT by name)
+and give the namespace no resolver.
+
+**Trade-off.** A resolver to implement and keep correct (TTLs, negative
+caching, search domains), inside a component that is supposed to be boring.
+
+**Why (a security boundary the first version left open).** Revision 1 did not
+mention DNS. A no-NIC sandbox cannot resolve anything, which breaks every
+tool that resolves before connecting — and if it *could* reach a resolver,
+DNS is the textbook exfiltration channel. Serving it on loopback closes the
+channel by construction, makes denial one round trip instead of a hanging
+connect, and is the cheapest place a rule can be decided (entry 2). It also
+dovetails with the service-discovery plan's node-local DNS item.
+
+---
+
+## 10. Egress ships before ingress
+
+**Call.** Phases 0–4 build egress; the core sandbox use case completes at
+phase 4. Ingress is phase 5.
+
+**Alternatives.** Ingress first — the order the request stated, and the easier
+demo.
+
+**Trade-off.** mTLS ingress and the autoscaler's wake-on-request wait longer.
+
+**Why.** Every capability the request named — per-user observability,
+dynamic endpoint lockdown, filtering what leaves — is egress. Ingress's
+marquee scenario needs the CA anyway. Egress also has a seam
+(`forwarder.rs:444`); ingress has none.
+
+---
+
+## 11. `protocol` is declared, never inferred from the shape of a rule
+
+**Call.** `egress.protocol` defaults to `tcp`; a path in a `tcp` chain is a
+submit-time error naming the fix.
+
+**Alternatives.** Infer HTTP from a `/` in an `allow` entry — the one-liner
+would cover both cases.
+
+**Trade-off.** The most useful one-liner costs an extra line.
+
+**Why (simplicity at 3am, and now performance).** Inference silently changes
+the chain's security posture *and* — per entry 2 — its cost by ~2×. A rule
+set that became L7 because someone typed a slash is a policy you cannot
+review by reading and a bill you did not agree to.
+
+---
+
+## 12. Version skew is a placement constraint, not a best-effort ignore
+
+**Call.** A manager refuses to place a captured or policied allocation on a
+worker whose fingerprint lacks support, with a legible reason.
+
+**Alternatives.** Ordinary proto forward-compat: the old worker ignores the
+field and runs the task.
+
+**Trade-off.** Chained jobs can be unplaceable mid-upgrade; the first thing in
+Legion that gates placement on worker version.
+
+**Why (security boundary).** The default behavior here is "quietly run the
+untrusted workload with its policy removed, reporting healthy." An unplaced
+allocation is a page; a silently unfiltered sandbox is an incident nobody
+opens.
+
+---
+
+## 13. An ingress chain changes what `LEGION_PORT_<label>` contains, rather than adding a variable
+
+**Call.** `LEGION_PORT_<label>` holds the private port the task binds; the
+advertised port is what the catalog and checks target.
+
+**Alternatives.** `LEGION_BIND_<label>` alongside — more explicit.
+
+**Trade-off.** A task printing its own address prints the wrong one; health
+checks traverse the chain, so deny-all ingress fails your own check.
+
+**Why (simplicity).** "Bind `$LEGION_PORT_<label>`" stays true for every job,
+chain or not; a service can gain an ingress chain without touching its image.
+`doctor` names the health-check case.
+
+---
+
+## 14. mTLS ships bring-your-own-PKI first, a Legion workload CA second
+
+**Call.** 6a: `certPath`/`keyPath`/`clientCa`. 6b: `certFrom = "legion"`.
+
+**Alternatives.** CA first, only ever Legion-issued certs.
+
+**Trade-off.** Two cert-source paths; for one phase, mTLS exists but
+`service.allow` is still control-plane.
+
+**Why.** There is no workload CA today (`src/certs.rs` is a dev fixture); 6b
+is issuance, rotation, revocation, and a new root of trust. Every operator
+with an internal CA can be served without any of it.
+
+---
+
+## 15. Attribution goes to events and logs, never to metric labels
+
+**Call.** `network.labels`, instance key, and identity appear on every event
+and access-log line and on no metric.
+
+**Alternatives.** Label the metrics — what a dashboard wants.
+
+**Trade-off.** "Requests per user" is a log query.
+
+**Why (it would not have worked).** The registry caps a family at 256 label
+combinations and folds overflow into `"other"` — a per-user label on a sandbox
+fleet silently destroys the series on the first thousand users.
+
+---
+
+## 16. `gated` defaults on for `sandbox` and off for `container`/`exec`
+
+**Call.** `capture = "gated"` is the default only where it is today's behavior
+plus a proxy (`sandbox` already has no network by default). Containers and
+exec keep host networking unless a task or a `require` policy says otherwise.
+
+**Alternatives.** Default `gated` everywhere on Linux — the secure default.
+
+**Trade-off.** Two runtimes stay cooperative until someone opts in; the
+honesty table has to say "on Linux, if you enable it."
+
+**Why (rollout).** A container that loses host networking on a Legion upgrade
+is the kind of default change this repo does not make silently. The sandbox
+operator gets fleet-wide `gated` with one `require` policy on the pool, which
+is the intended path anyway.

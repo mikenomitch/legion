@@ -1302,7 +1302,7 @@ plan's own adoption order:
 - [ ] **mTLS between forwarders**, so `service.allow` intentions rest on
       cryptographic workload identity (which has shipped) rather than on the
       control plane filtering the endpoint feed — now owned by
-      [network-handlers-plan.md](plans/network-handlers-plan.md) phase 5, which
+      [network-handlers-plan.md](plans/network-handlers-plan.md) phase 6b, which
       needs the same workload CA and reads `service.allow` as its policy input
 - [ ] L7 waypoint (retries, timeouts, canary split), then sandboxed WASM
       middleware filters. Traffic *management* stays here; the policy and
@@ -1323,38 +1323,56 @@ egress, mTLS, and sandbox capture. The datapath half (overlay, CNI,
 fingerprinters) is still unplanned and remains the service-discovery plan's
 item 2.
 
-Chain phases, in the plan's order:
+Plan phases (revision 2), in order. Three concepts — policy objects, `gated`
+capture, handlers — plus `legion netd` as the process that outlives the
+worker:
 
-- [ ] Phase 0 — chain core + egress: `netchain` module, `NetHandler` trait +
-      `HANDLERS` table, built-in `rules`/`log` at `forwarder.rs:444`, general
-      egress listener (SOCKS5 + HTTP CONNECT), first metrics on the datapath
-- [ ] Phase 1 — HTTP/1.1 protocol mode: host/path/method/header rules, `redact`
-      (h2/h3 rejected at submit, deliberately)
-- [ ] Phase 2 — sandbox `net: 'gated'`: no guest NIC, `legion-guest-agent` over
-      vsock, guest-side redirect. Shares the guest agent with VM forking and
-      microVM `exec`
-- [ ] Phase 3 — ingress chains: advertised/private port split,
-      `legion net doctor | policy | log`, capabilities + MCP. Unblocks the
+- [ ] Phase 0 — policy + datapath core: `netpolicy` types and the
+      deterministic merge, `net_policy` table + RPCs + `legion net policy
+      apply/list/show/test`, connect-time rules ahead of `splice` in the
+      forwarder, external upstreams with `tls = "originate"`, first metrics on
+      the datapath
+- [ ] Phase 1 — HTTP/1.1 mode: path/method/header rules, structured 403s an
+      agent can read, built-in `dlp` with a byte cap (h2/h3 rejected at
+      submit, deliberately)
+- [ ] Phase 2 — `gated` on Linux for `container` and `exec`: `netd`-owned
+      empty network namespaces, loopback proxy + DNS inside, the edge-boot
+      `network_gate` implemented as policy-withheld (closes edge-boot's
+      deferred "per-destination policy for the gated state"), readiness
+      gating, `net_capture_unavailable`
+- [ ] Phase 3 — `legion netd` as a supervised process with fd handoff; node
+      health. Required before the datapath becomes a sandbox's only path
+- [ ] Phase 4 — `gated` for `sandbox`: no guest NIC, `legion-guest-agent`
+      (SOCKS5 + CONNECT + DNS) over vsock. Shares the agent with VM forking
+      and microVM `exec`. **Core use case complete here**
+- [ ] Phase 5 — ingress chains: advertised/private port split, `netd` binds
+      advertised ports, `legion net doctor`, capabilities + MCP. Unblocks the
       autoscaler's wake-on-request scale-to-zero
-- [ ] Phase 4 — external handlers (`handler: 'proxy'` by service or sidecar
-      port), PROXY v2 metadata, `legion net handler test`
-- [ ] Phase 5 — mTLS: (a) bring-your-own PKI, (b) Legion workload CA
-- [ ] Phase 6 — TLS `inspect` for sandboxes, operator-gated
-- [ ] Phase 7 — UDP chains
+- [ ] Phase 6 — external handlers (`authz` webhook, `proxy` by
+      service/port/node, PROXY v2, `net handler test`) and mTLS: (a)
+      bring-your-own PKI, (b) Legion workload CA; kTLS passthrough behind a
+      probe
+- [ ] Phase 7 — UDP (SOCKS5 `UDP ASSOCIATE`) and transparent capture (TUN +
+      userspace stack in the gated namespace)
 - [ ] Phase 8 — sandboxed WASM handlers (in-process `cdylib` handlers are
-      deliberately not planned — see calls entry 1)
+      deliberately not planned — see calls entry 4)
+- [ ] Publish `pool` and `nodeId` into worker `config_attrs`
+      ([daemon.rs:281](../src/worker/daemon.rs)) so `count.per` can express
+      one-per-node handler jobs — also what the pool-scheduling item above
+      needs
 
-Still unplanned, and not covered by the chain plan:
+Deliberately not in the plan (see its §5): TLS interception / MITM — external
+upstreams are the body-visible route; rate limits and quotas; a cluster-edge
+load balancer.
+
+Still unplanned, and not covered by the plan:
 
 - [ ] Overlay network. Unix-domain-socket transport is on the table.
 - [ ] CNI, or a custom networking plugin that can speak CNI
 - [ ] Networking fingerprinters (so service discovery can pick a datapath per node)
 - [ ] Port forwarding
-- [ ] Transparent (non-cooperative) egress capture for `container` — needs the
-      datapath plugin, since Linux containers run in the host network namespace
-      today ([oci_bundle.rs:669](../src/task_plugins/oci_bundle.rs) asserts it)
-- [ ] Cluster-edge ingress load balancer. The chain plan's ingress is
-      node-local, in front of one allocation; a cluster edge is separate work
+- [ ] Cluster-edge ingress load balancer. The plan's ingress is node-local,
+      in front of one allocation; a cluster edge is separate work
 
 ## Persistence & cluster operations
 
