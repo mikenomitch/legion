@@ -1,9 +1,10 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use serde_json::json;
+use std::cell::RefCell;
 use std::time::Duration;
 use tempfile::{Builder, TempDir};
 
-use legion::manager::scheduler::{PlanMode, Scheduler};
+use legion::manager::scheduler::{PlanMode, PlanTimings, Scheduler};
 use legion::storage::store::Store;
 use legion::structs::{
     config::ManagerConfigFull, JobConfig, NodeMsg, Submission, TaskConfig, TaskCount,
@@ -382,8 +383,13 @@ fn plan_under_fill_benchmark(c: &mut Criterion) {
 
         // A fresh job per iteration (submitted in the untimed setup), so
         // every apply is a first placement and the state drift across the
-        // run is six allocations per iteration against the fill.
+        // run is six allocations per iteration against the fill. The
+        // per-phase `PlanTimings` of every measured plan are averaged and
+        // printed after the cell, so a run also says WHERE the time went
+        // at each fill level (the same phases as the
+        // `legion_scheduler_plan_phase_seconds` metric).
         let mut next_job = 0usize;
+        let timings: RefCell<Vec<PlanTimings>> = RefCell::new(Vec::new());
         group.bench_function(
             BenchmarkId::new("plan_and_apply", format!("fill_{per_node}")),
             |b| {
@@ -402,15 +408,43 @@ fn plan_under_fill_benchmark(c: &mut Criterion) {
                             .plan_and_apply(&job_config_id, PlanMode::Fresh)
                             .expect("plan");
                         assert_eq!(outcome.allocations.len(), FILL_PLACEMENTS_PER_JOB as usize);
+                        timings.borrow_mut().push(outcome.timings.clone());
                         outcome
                     },
                     criterion::BatchSize::PerIteration,
                 );
             },
         );
+        print_phase_means(
+            &format!("plan_under_fill/plan_and_apply/fill_{per_node}"),
+            &timings.borrow(),
+        );
     }
 
     group.finish();
+}
+
+/// Mean per-phase microseconds over every plan a cell measured, in the
+/// order the phases run.
+fn print_phase_means(cell: &str, samples: &[PlanTimings]) {
+    if samples.is_empty() {
+        return;
+    }
+    let mean = |pick: fn(&PlanTimings) -> u64| {
+        samples.iter().map(pick).sum::<u64>() as f64 / samples.len() as f64
+    };
+    eprintln!(
+        "{cell} phase means over {} plans (us): nodes {:.0}, versions {:.0}, tasks {:.0}, \
+         capacity {:.0}, build {:.0}, apply {:.0}, total {:.0}",
+        samples.len(),
+        mean(|t| t.available_nodes_us),
+        mean(|t| t.version_sample_us),
+        mean(|t| t.task_fetch_us),
+        mean(|t| t.capacity_snapshot_us),
+        mean(|t| t.build_plan_us),
+        mean(|t| t.apply_us),
+        mean(|t| t.total_us),
+    );
 }
 
 criterion_group!(
