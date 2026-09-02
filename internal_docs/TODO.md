@@ -1393,10 +1393,51 @@ worker:
       autoscaler plan's), PROXY protocol v2 to the task (M7), persisting the
       drain/grace sets across a worker restart (a restart mid-window
       signals at restore, as grace already did).
-- [ ] Phase 6 — external handlers (`authz` webhook, `proxy` by
-      service/port/node, PROXY v2, `net handler test`) and mTLS: (a)
-      bring-your-own PKI, (b) Legion workload CA; kTLS passthrough behind a
-      probe
+- [x] Phase 6 / M7 — external handlers and mTLS (2026-09-02): `authz`
+      webhooks (facts in, cached verdict out, `onError`) and `proxy` hand-offs
+      (PROXY v2 with Legion TLVs on TCP, absolute-form + `Legion-*` headers on
+      HTTP; targets `service` / `node` / sidecar `port`, endpoints fed on the
+      heartbeat as `for_handler`) on every path — upstream splices, HTTP mode,
+      the gated egress proxy, ingress; per-hop health in `NetAllocStatus`,
+      `legion net doctor` and the UI; `legion net handler test`. TLS: ingress
+      chains terminate `server`/`mutual` with BYO files or the mesh; the mesh
+      is a manager-held CA (`net_mesh_ca`, control lane) issuing 24h node
+      certificates over `IssueNodeCertificate`, node-to-node mTLS with the
+      workload identity attributed in a PROXY v2 TLV, `requireIdentity`,
+      `mesh_tls` on the endpoint feed, `legion net ca show|rotate`. Not done:
+      the kTLS/`splice` passthrough (a terminated connection is copied in
+      user space — measure before adding), `local_first` balancing (M10 with
+      templates), certificate revocation beyond the lifetime, an ingress
+      `proxy` hop into a gated task's namespace, and workload certificates on
+      demand (`certFrom = "legion"` on a task's *own* TLS — deferred with the
+      plan's "workload certs on demand").
+- [x] M8 — service graph (2026-09-02): every calling datapath (upstream
+      listeners, the gated egress proxy, HTTP mode) records per-(upstream,
+      tag) samples — requests/connections, errors, denials, latency, bytes —
+      drained on the heartbeat (`net_edges`, restored on failure, bounded at
+      4,096 keys); the manager folds them into 15 minutes of per-minute
+      buckets per (caller job, task, service, tag); `ListServiceEdges` merges
+      declared upstreams (`task_config.connect`, latest job config) with the
+      allow verdict and the observed RED; `legion service edges`, MCP
+      `legion_service_edges`; UI: the Network page opens with the graph
+      (callers → services, width by rps, dashed silent, red for denials /
+      errors / disallowed) over the edges table, Service detail gains
+      **Callers**. Not done: ingress-side attribution (edges are
+      caller-recorded), persistence across manager failover (the window
+      refills from heartbeats), and a manager-side unit test of the fold —
+      the ledger and the RPC path are tested, the fold arithmetic is not.
+- [x] M10 — templates and `local_first` (2026-09-02): `connect.templates`
+      render files from the upstreams and the endpoint feed (`service`,
+      `range endpoints`, `env`) before launch and on every heartbeat that
+      changes the result, atomic writes, `changeMode` noop/signal/restart
+      with `coalesce` and `splay`, fail-static by construction, validated at
+      submit (unknown action, undeclared upstream, escaping destination);
+      render problems in `NetAllocStatus.problems`. `balance = "local_first"`
+      in the registry, widening when no local endpoint is healthy. Not done:
+      `{{ kv }}` inside connect templates (KV injection already renders
+      manager-side), conditionals, and rendering into a *sandbox* guest
+      (the file lands in the host task dir; the guest sees it only where the
+      runtime mounts that dir).
 - [ ] Phase 7 — UDP (SOCKS5 `UDP ASSOCIATE`) and transparent capture (TUN +
       userspace stack in the gated namespace)
 - [ ] Phase 8 — sandboxed WASM handlers (in-process `cdylib` handlers are

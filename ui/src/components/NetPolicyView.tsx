@@ -167,6 +167,16 @@ function ChainView(props: { direction: 'egress' | 'ingress'; chain: EffectiveCha
 // What the node running each allocation says its datapath is doing
 // (`ShowNetPolicyReply.node_status_json`, one line per allocation) — the
 // difference between "a policy exists" and "the policy is enforced".
+export type NodeHandlerStatus = {
+  source: string
+  handler: string
+  target?: string
+  healthy?: boolean
+  lastError?: string
+  calls?: number
+  errors?: number
+}
+
 export type NodeStatus = {
   nodeId?: string
   allocationId?: number
@@ -179,6 +189,10 @@ export type NodeStatus = {
   proxyReady?: boolean
   gateShut?: boolean
   problems?: string[]
+  handlers?: NodeHandlerStatus[]
+  tlsReady?: boolean
+  tlsError?: string
+  meshIdentity?: boolean
 }
 
 export const parseNodeStatuses = (lines?: string[]): NodeStatus[] =>
@@ -227,6 +241,12 @@ export function DatapathStatus(props: { statuses: NodeStatus[]; policyHash?: str
                   <Show when={status.gateShut}>
                     <Badge tone="warn">boot gate shut</Badge>
                   </Show>
+                  <Show when={status.tlsReady === false}>
+                    <Badge tone="danger">tls not ready</Badge>
+                  </Show>
+                  <Show when={status.meshIdentity}>
+                    <Badge tone="info">mesh cert</Badge>
+                  </Show>
                 </div>
                 <div class="mt-1 flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted">
                   <span>{status.upstreamsBound?.length ?? 0} upstream listener(s)</span>
@@ -241,6 +261,29 @@ export function DatapathStatus(props: { statuses: NodeStatus[]; policyHash?: str
                 <Show when={(status.problems?.length ?? 0) > 0}>
                   <ul class="mt-1 space-y-0.5 text-xs text-danger">
                     <For each={status.problems ?? []}>{(problem) => <li>{problem}</li>}</For>
+                  </ul>
+                </Show>
+                <Show when={(status.handlers?.length ?? 0) > 0}>
+                  <ul class="mt-2 space-y-1 border-t border-line pt-2 text-xs">
+                    <For each={status.handlers ?? []}>
+                      {(hop) => (
+                        <li class="flex flex-wrap items-baseline gap-x-2 gap-y-1">
+                          <Badge tone={hop.healthy ? 'ok' : 'danger'} dot>
+                            {hop.healthy ? 'healthy' : 'failing'}
+                          </Badge>
+                          <span class="font-mono text-ink">
+                            {hop.handler} → {hop.target || '?'}
+                          </span>
+                          <SourceBadge source={hop.source} />
+                          <span class="text-faint">
+                            {hop.calls ?? 0} calls · {hop.errors ?? 0} errors
+                          </span>
+                          <Show when={hop.lastError}>
+                            <span class="text-danger">— {hop.lastError}</span>
+                          </Show>
+                        </li>
+                      )}
+                    </For>
                   </ul>
                 </Show>
               </li>

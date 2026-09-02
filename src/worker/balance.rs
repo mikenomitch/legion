@@ -54,6 +54,9 @@ pub struct Endpoint {
     /// The backing service's tags (`service.tags`), for weighted splits by
     /// tag in HTTP mode. Empty when the feed carried none.
     pub tags: Vec<String>,
+    /// The endpoint terminates mesh TLS: dial it with the node certificate
+    /// and name the consuming workload in a PROXY v2 TLV.
+    pub mesh_tls: bool,
 }
 
 /// Picks which endpoint a new connection goes to.
@@ -87,7 +90,19 @@ const BALANCERS: &[BalancerRow] = &[
     ("round_robin", default_balancer),
     ("random", || Arc::new(Random)),
     ("least_conn", || Arc::new(LeastConn::default())),
+    ("local_first", || Arc::new(LocalFirst::default())),
 ];
+
+/// This node's id, for `local_first`. Set once by the worker at startup.
+static LOCAL_NODE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+pub fn set_local_node(node_id: &str) {
+    let _ = LOCAL_NODE.set(node_id.to_string());
+}
+
+pub fn local_node() -> Option<&'static str> {
+    LOCAL_NODE.get().map(String::as_str)
+}
 
 /// The strategy names config validation accepts, in canonical form. Read
 /// straight off `BALANCERS`, so it always describes what this build can
@@ -146,6 +161,41 @@ impl Balancer for RoundRobin {
     }
 }
 
+/// Locality first: round-robin over the endpoints on this node, widening to
+/// every endpoint when no healthy one is local. Fail-open on purpose — a
+/// caller never waits for a local backend that is not there.
+#[derive(Debug, Default)]
+struct LocalFirst {
+    cursor: AtomicUsize,
+}
+
+impl Balancer for LocalFirst {
+    fn name(&self) -> &'static str {
+        "local_first"
+    }
+
+    fn pick(&self, endpoints: &[Endpoint], _inflight: &HashMap<String, usize>) -> Option<usize> {
+        if endpoints.is_empty() {
+            return None;
+        }
+        let local: Vec<usize> = match local_node() {
+            Some(node) => endpoints
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| e.node_id == node)
+                .map(|(i, _)| i)
+                .collect(),
+            None => Vec::new(),
+        };
+        let turn = self.cursor.fetch_add(1, Ordering::Relaxed);
+        if local.is_empty() {
+            Some(turn % endpoints.len())
+        } else {
+            Some(local[turn % local.len()])
+        }
+    }
+}
+
 /// Uniform random choice. Stateless, and the best default when many clients
 /// share one backend set (no synchronized cursors).
 #[derive(Debug)]
@@ -199,12 +249,57 @@ impl Balancer for LeastConn {
 mod tests {
     use super::*;
 
+    #[test]
+    fn local_first_prefers_this_node_and_widens_when_nothing_is_local() {
+        set_local_node("node-a");
+        let endpoints = vec![
+            Endpoint {
+                addr: "10.0.0.1:1".into(),
+                allocation_id: 1,
+                node_id: "node-b".into(),
+                tags: Vec::new(),
+                mesh_tls: false,
+            },
+            Endpoint {
+                addr: "10.0.0.2:1".into(),
+                allocation_id: 2,
+                node_id: "node-a".into(),
+                tags: Vec::new(),
+                mesh_tls: false,
+            },
+            Endpoint {
+                addr: "10.0.0.3:1".into(),
+                allocation_id: 3,
+                node_id: "node-a".into(),
+                tags: Vec::new(),
+                mesh_tls: false,
+            },
+        ];
+        let strategy = balancer("local_first").unwrap();
+        let picks: Vec<usize> = (0..4)
+            .map(|_| strategy.pick(&endpoints, &HashMap::new()).unwrap())
+            .collect();
+        assert!(picks.iter().all(|i| *i == 1 || *i == 2), "{picks:?}");
+        assert!(
+            picks.contains(&1) && picks.contains(&2),
+            "round-robins the local pair: {picks:?}"
+        );
+        let remote_only = vec![endpoints[0].clone()];
+        assert_eq!(
+            strategy.pick(&remote_only, &HashMap::new()),
+            Some(0),
+            "widens when nothing is local"
+        );
+        assert!(balancer_names().contains(&"local_first"));
+    }
+
     fn endpoint(addr: &str) -> Endpoint {
         Endpoint {
             addr: addr.to_string(),
             allocation_id: 1,
             node_id: "node-a".into(),
             tags: Vec::new(),
+            mesh_tls: false,
         }
     }
 

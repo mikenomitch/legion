@@ -2,6 +2,7 @@ import { A } from '@solidjs/router'
 import { For, Show, createMemo, createResource, createSignal, onCleanup, onMount } from 'solid-js'
 import { AccessGate } from '../components/AccessGate'
 import { EffectivePolicyView, parseEffectivePolicy } from '../components/NetPolicyView'
+import { ServiceGraph, edgeTone } from '../components/ServiceGraph'
 import {
   Badge,
   Button,
@@ -106,6 +107,17 @@ function NetworkContent() {
   )
   const required = createMemo(() => rows().filter((row) => row.policy.enforcement === 'require').length)
 
+  // The service graph: every node's datapath folded into (caller, service)
+  // edges over the last five minutes.
+  const GRAPH_WINDOW_SECS = 300
+  const [edges] = createResource(
+    () => tick() + 1,
+    async () => managerClient.listServiceEdges({ service: '', windowSecs: GRAPH_WINDOW_SECS }),
+  )
+  const edgeList = () => edges()?.edges ?? []
+  const troubledEdges = createMemo(() => edgeList().filter((edge) => edgeTone(edge) === 'danger').length)
+  const activeEdges = createMemo(() => edgeList().filter((edge) => Number(edge.requests) > 0).length)
+
   // --- apply / dry-run ---------------------------------------------------
   const [draft, setDraft] = createSignal('')
   const [applying, setApplying] = createSignal(false)
@@ -176,17 +188,40 @@ function NetworkContent() {
     <div>
       <PageHeader
         eyebrow="Network"
-        title="Network policy"
-        subtitle="Selector-scoped egress and ingress rules, external upstreams, and handlers on the node datapath. Policies apply to matching tasks within one heartbeat; nothing restarts."
+        title="Network"
+        subtitle="Who calls whom on the datapath, with request rates, errors and denials; and the selector-scoped egress and ingress policy that decides it. Policies apply to matching tasks within one heartbeat; nothing restarts."
       />
 
-      <div class="mb-4 grid gap-3 sm:grid-cols-3">
+      <div class="mb-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-5">
+        <StatCard
+          label="Active edges"
+          value={<span class="tabular-nums">{activeEdges()}</span>}
+          hint={`Caller → service pairs that talked in the last ${GRAPH_WINDOW_SECS / 60} min.`}
+          icon="network"
+        />
+        <StatCard
+          label="Troubled edges"
+          value={<span class="tabular-nums">{troubledEdges()}</span>}
+          tone={troubledEdges() > 0 ? 'danger' : 'ok'}
+          hint="Denials, errors above 5%, or a caller the service does not allow."
+        />
         <StatCard label="Stored policies" value={<span class="tabular-nums">{rows().length}</span>} icon="shieldCheck" />
         <StatCard label="Required" value={<span class="tabular-nums">{required()}</span>} hint="Applied ahead of every task's own block; never weakened." />
         <StatCard label="Generation" value={<span class="font-mono text-base">{String(policies()?.generation ?? 0)}</span>} hint="Bumps on every write." />
       </div>
 
       <div class="space-y-4">
+        <SectionCard
+          title="Service graph"
+          description="What every node's datapath observed, folded by the manager: one edge per caller and service, with RED over the window. Click an edge to highlight it."
+        >
+          <Show when={!edges.error} fallback={<Note tone="danger">{String((edges.error as Error)?.message ?? edges.error)}</Note>}>
+            <Show when={edges() || !edges.loading} fallback={<LoadingRows rows={3} class="p-0" />}>
+              <ServiceGraph edges={edgeList()} windowSecs={Number(edges()?.windowSecs ?? GRAPH_WINDOW_SECS)} />
+            </Show>
+          </Show>
+        </SectionCard>
+
         <SectionCard
           title="Policies"
           description="In merge order: every required policy by priority, then the one default that wins for a task."

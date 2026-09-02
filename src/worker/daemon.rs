@@ -23,6 +23,7 @@ use crate::worker::{
 use futures::join;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 use std::sync::RwLock;
 use std::time::Duration;
 use tonic::{transport::Channel, transport::Server, Response};
@@ -316,6 +317,7 @@ async fn run_worker_with_manager(
     };
     register_self(client.clone(), &registration, &credentials).await?;
     info!(worker_name = %name, "Worker registered with manager");
+    crate::worker::balance::set_local_node(&name);
 
     start_worker_telemetry();
 
@@ -860,6 +862,10 @@ async fn heartbeat_tick(
             .map(|denials| denials.drain())
             .unwrap_or_default();
         let net_denials_for_redrive = net_denials.clone();
+        // Service-graph samples since the last beat; same restore-on-failure
+        // contract as the denials.
+        let net_edges = forwarder.context().edges().drain();
+        let net_edges_for_redrive = net_edges.clone();
         // The datapath's status for the allocations it was last told about.
         let net_status = {
             let last = LAST_DESIRED.lock().unwrap_or_else(|p| p.into_inner());
@@ -869,6 +875,7 @@ async fn heartbeat_tick(
         let req = credentials.attach(tonic::Request::new(HeartbeatRequest {
             net_denials,
             net_status,
+            net_edges,
             id: name.to_string(),
             provisional_claims,
             allocation_ids: allocations,
@@ -907,6 +914,7 @@ async fn heartbeat_tick(
                 if let Some(denials) = forwarder.context().denials() {
                     denials.restore(net_denials_for_redrive);
                 }
+                forwarder.context().edges().restore(net_edges_for_redrive);
                 return Err(err.into());
             }
         };
@@ -963,9 +971,13 @@ async fn heartbeat_tick(
         // The manager acknowledged us, so this reply is authoritative for the
         // connect datapath (see `apply_upstreams` on fail-static semantics).
         apply_upstreams(forwarder, &reply).await;
+        // Config-file templates, rendered from the same feed; written before
+        // any launch below so a task starts with its files in place.
+        apply_templates(task_manager, &reply).await;
         // Same authority for network policy: assignments from this reply,
         // bodies fetched by hash, last known good kept on any failure.
         apply_net_policies(forwarder, &mut client_clone, credentials, name, &reply).await;
+        apply_mesh_identity(forwarder, &mut client_clone, credentials, name).await;
         *LAST_DESIRED.lock().unwrap_or_else(|p| p.into_inner()) = reply.desired_allocations.clone();
         // Allocations whose launch was dispatched this tick. Their refresh
         // loops are spawned before the (async, unawaited) launch registers
@@ -1153,12 +1165,193 @@ async fn apply_upstreams(forwarder: &UpstreamForwarder, reply: &HeartbeatReply) 
             .sync(&ingress_specs(&reply.desired_allocations))
             .await;
     }
+    let context = forwarder.context();
+    let mut mesh_wanted = false;
     for update in &reply.upstream_endpoints {
-        forwarder.set_endpoints(
-            update.allocation_id,
-            &update.service,
-            dialable_endpoints(update),
+        let endpoints = dialable_endpoints(update);
+        mesh_wanted |= endpoints.iter().any(|endpoint| endpoint.mesh_tls);
+        if update.for_handler {
+            // A `proxy` handler's target: dialed on hand-off, no listener.
+            context.set_handler_endpoints(update.allocation_id, &update.service, endpoints);
+        } else {
+            forwarder.set_endpoints(update.allocation_id, &update.service, endpoints);
+        }
+    }
+    let live: std::collections::HashSet<i64> = reply
+        .desired_allocations
+        .iter()
+        .map(|allocation| allocation.allocation_id)
+        .collect();
+    context.retain_allocations(&live);
+    // The node needs a mesh certificate when it dials a mesh endpoint or
+    // terminates mesh TLS on an advertised port.
+    mesh_wanted |= reply.desired_allocations.iter().any(|allocation| {
+        !allocation.network.trim().is_empty()
+            && serde_json::from_str::<AllocNetwork>(&allocation.network)
+                .map(|network| network.ingress_tls.as_deref() == Some("legion"))
+                .unwrap_or(false)
+    });
+    context.set_mesh_wanted(mesh_wanted);
+}
+
+/// Templates rendered on this node (docs/service-discovery.md, "Templates").
+static TEMPLATES: LazyLock<crate::worker::templates::TemplateEngine> =
+    LazyLock::new(crate::worker::templates::TemplateEngine::new);
+
+/// Render every desired allocation's `connect.templates` from this reply's
+/// endpoint feed: the first time before the task launches, then on every
+/// heartbeat that changes a file, applying `changeMode` after `coalesce`
+/// and `splay`.
+async fn apply_templates(task_manager: &Arc<Mutex<WorkerTaskManager>>, reply: &HeartbeatReply) {
+    use crate::worker::templates::{ChangeAction, TemplateContext};
+    let live: std::collections::HashSet<i64> = reply
+        .desired_allocations
+        .iter()
+        .map(|a| a.allocation_id)
+        .collect();
+    TEMPLATES.retain(&live);
+    for allocation in &reply.desired_allocations {
+        if allocation.task_connect.trim().is_empty() {
+            continue;
+        }
+        let Ok(connect) =
+            serde_json::from_str::<crate::structs::ConnectConfig>(&allocation.task_connect)
+        else {
+            continue;
+        };
+        if connect.templates.is_empty() {
+            continue;
+        }
+        let network: Option<AllocNetwork> = if allocation.network.trim().is_empty() {
+            None
+        } else {
+            serde_json::from_str(&allocation.network).ok()
+        };
+        let endpoints: std::collections::BTreeMap<String, Vec<Endpoint>> = reply
+            .upstream_endpoints
+            .iter()
+            .filter(|u| u.allocation_id == allocation.allocation_id && !u.for_handler)
+            .map(|u| (u.service.clone(), dialable_endpoints(u)))
+            .collect();
+        let (running, base) = {
+            let mut manager = task_manager.lock().expect("task manager");
+            let running = manager.has_allocation(allocation.allocation_id);
+            let base = manager.file_delivery_base(
+                allocation.allocation_id,
+                &allocation.task_name,
+                &allocation.task_runtime,
+            );
+            let task_dir = manager.task_dir_for(allocation.allocation_id, &allocation.task_name);
+            (running, (base, task_dir))
+        };
+        let (delivery, task_dir) = base;
+        let (in_task_root, host_task_dir) = match delivery {
+            Some((root, dir)) => (Some(root), dir),
+            None => (None, task_dir),
+        };
+        let mut env: std::collections::BTreeMap<String, String> = network
+            .as_ref()
+            .map(|n| n.env_pairs().into_iter().collect())
+            .unwrap_or_default();
+        env.insert(
+            "LEGION_ALLOC_ID".into(),
+            allocation.allocation_id.to_string(),
         );
+        env.insert(
+            "LEGION_TASK_DIR".into(),
+            host_task_dir.display().to_string(),
+        );
+        let context = TemplateContext {
+            network: network.as_ref(),
+            endpoints: &endpoints,
+            env: &env,
+        };
+        let actions = TEMPLATES.render_allocation(
+            allocation.allocation_id,
+            &connect.templates,
+            &context,
+            in_task_root,
+            &host_task_dir,
+            !running,
+        );
+        for action in actions {
+            let task_manager = task_manager.clone();
+            let allocation_id = allocation.allocation_id;
+            tokio::spawn(async move {
+                let (splay, act): (std::time::Duration, ChangeAction) = match &action {
+                    ChangeAction::Signal { splay, .. } | ChangeAction::Restart { splay } => {
+                        (*splay, action.clone())
+                    }
+                };
+                if !splay.is_zero() {
+                    let jitter = rand::random::<u64>() % (splay.as_millis().max(1) as u64);
+                    tokio::time::sleep(std::time::Duration::from_millis(jitter)).await;
+                }
+                let mut manager = task_manager.lock().expect("task manager");
+                let result = match act {
+                    ChangeAction::Signal { signal, .. } => {
+                        manager.signal_allocation(allocation_id, &signal)
+                    }
+                    ChangeAction::Restart { .. } => manager.restart_allocation(allocation_id),
+                };
+                if let Err(err) = result {
+                    warn!(allocation_id, error = ?err, "Template change action failed");
+                } else {
+                    info!(allocation_id, "Applied template change");
+                }
+            });
+        }
+    }
+}
+
+/// Keep the node's mesh certificate current (docs/network-handlers.md,
+/// "mTLS"): issued on the first heartbeat after anything on the node needs
+/// it, re-issued after a third of its lifetime. Fail-static: an issuance
+/// that fails keeps the certificate the node has, and a node without one
+/// refuses mesh flows rather than sending them in the clear.
+async fn apply_mesh_identity(
+    forwarder: &UpstreamForwarder,
+    client: &mut ManagerClient<Channel>,
+    credentials: &Arc<WorkerCredentials>,
+    node_id: &str,
+) {
+    let context = forwarder.context();
+    if !context.mesh_needs_refresh() {
+        return;
+    }
+    let request = credentials.attach(tonic::Request::new(
+        crate::structs::IssueNodeCertificateRequest {
+            node_id: node_id.to_string(),
+        },
+    ));
+    match client.issue_node_certificate(request).await {
+        Ok(response) => {
+            let reply = response.into_inner();
+            match crate::worker::netd::tls::MeshIdentity::from_pem(
+                node_id,
+                &reply.cert_pem,
+                &reply.key_pem,
+                &reply.ca_pem,
+                reply.expires_at,
+            )
+            .and_then(|identity| context.set_mesh_identity(identity))
+            {
+                Ok(()) => info!(
+                    node_id,
+                    expires_at = reply.expires_at,
+                    "Mesh node certificate issued"
+                ),
+                Err(err) => warn!(error = ?err, "Rejected mesh node certificate"),
+            }
+        }
+        Err(status) if status.code() == tonic::Code::Unimplemented => {
+            debug!("Manager predates mesh certificates; mesh TLS stays unavailable")
+        }
+        Err(status) => warn!(
+            code = ?status.code(),
+            message = status.message(),
+            "Failed to issue the mesh node certificate; keeping the current one"
+        ),
     }
 }
 
@@ -1173,6 +1366,7 @@ async fn apply_net_policies(
     node_id: &str,
     reply: &HeartbeatReply,
 ) {
+    forwarder.context().set_node_id(node_id);
     let Some(cache) = forwarder.context().cache() else {
         return;
     };
@@ -1456,6 +1650,16 @@ fn net_status(
             .filter(|cache| cache.is_ready(id))
             .and_then(|cache| cache.hash_for(id))
             .unwrap_or_default();
+        let (tls_ready, tls_error) = forwarder.context().ingress_tls_status(id);
+        if !tls_ready {
+            problems.push(format!("ingress TLS: {tls_error}"));
+        }
+        problems.extend(TEMPLATES.problems(id));
+        if network.ingress_tls.as_deref() == Some("legion")
+            && forwarder.context().mesh_identity().is_none()
+        {
+            problems.push("mesh certificate not issued yet".into());
+        }
         out.push(crate::structs::NetAllocStatus {
             allocation_id: id,
             mode: network
@@ -1470,6 +1674,23 @@ fn net_status(
             proxy_ready,
             gate_shut: gated && crate::worker::netd::netns::gate_is_shut(id),
             problems,
+            handlers: forwarder
+                .context()
+                .handler_statuses(id)
+                .into_iter()
+                .map(|h| crate::structs::NetHandlerStatus {
+                    source: h.source,
+                    handler: h.handler,
+                    target: h.target,
+                    healthy: h.healthy,
+                    last_error: h.last_error.unwrap_or_default(),
+                    calls: h.calls,
+                    errors: h.errors,
+                })
+                .collect(),
+            tls_ready,
+            tls_error,
+            mesh_identity: forwarder.context().mesh_identity().is_some(),
         });
     }
     out
@@ -1556,6 +1777,7 @@ fn dialable_endpoints(update: &UpstreamEndpoints) -> Vec<Endpoint> {
             allocation_id: endpoint.allocation_id,
             node_id: endpoint.node_id.clone(),
             tags: endpoint.tags.clone(),
+            mesh_tls: false,
         })
         .collect()
 }
@@ -1919,6 +2141,7 @@ mod tests {
     fn dialable_endpoints_drop_entries_the_worker_cannot_dial() {
         let update = UpstreamEndpoints {
             allocation_id: 11,
+            for_handler: false,
             service: "db".into(),
             endpoints: vec![
                 crate::structs::ServiceEndpoint {
@@ -1950,6 +2173,7 @@ mod tests {
                 allocation_id: 42,
                 node_id: "node-b".into(),
                 tags: Vec::new(),
+                mesh_tls: false,
             }]
         );
     }
@@ -1975,6 +2199,7 @@ mod tests {
             stop_notices: Vec::new(),
             upstream_endpoints: vec![UpstreamEndpoints {
                 allocation_id: 11,
+                for_handler: false,
                 service: "db".into(),
                 endpoints: vec![crate::structs::ServiceEndpoint {
                     address: "10.0.0.5".into(),

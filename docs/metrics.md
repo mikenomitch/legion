@@ -453,6 +453,11 @@ view of worker readiness. Default: disabled.
 - **`legion_net_bytes_total{direction}`** (counter) — bytes forwarded through
   the datapath (`egress` = task to destination, `ingress` = destination to
   task).
+- **`legion_net_handler_total{handler,outcome}`** (counter) — external
+  handler calls (`authz`, `proxy`) by outcome: `allow`, `deny`, `proxy` (the
+  flow was handed off), `error` (timeout, bad reply, no endpoint).
+- **`legion_net_handler_seconds`** (histogram) — wall-clock of one `authz`
+  webhook call; cache hits are not observed.
   A rising `error` rate is the worker-side view of manager unreachability;
   `unauthenticated` means the node credential was revoked/rotated and the
   worker is re-registering.

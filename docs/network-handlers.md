@@ -281,19 +281,183 @@ per-allocation resolver. Documented, not hidden.
 
 ## Handlers
 
-Handlers are code on the path and appear only when declared. `log` and
-`dlp` run today in HTTP mode; `authz` and `proxy` are validated at submit
-and run from the external-handlers phase:
+Handlers are code on the path and appear only when declared, on a chain
+(`egress.handlers`, `ingress.handlers`, on a task or a policy object) or on
+one upstream (`connect.upstreams[].handlers`). They run in order after the
+rules have allowed the flow; the chain's hops first, then the upstream's.
 
 | `handler` | What it does | Sees bytes |
 | --- | --- | --- |
-| `authz` | POSTs the connection's facts to `url` and caches the verdict for `cache` (at most 5m) | no |
-| `proxy` | hands the flow to any proxy — a catalog `service`, a sidecar's `port` label, or a `node`-local service — with a PROXY protocol v2 header (TCP) or `Legion-*` headers (HTTP) | yes |
+| `authz` | POSTs the flow's facts to `url` and reads back a verdict, cached per (hop, identity, destination[, method, path]) for `cache` (default `10s`, at most `5m`) | no |
+| `proxy` | hands the flow to any proxy — a catalog `service`, its `node`-local endpoints, or a sidecar's `port` label in the same job — with a PROXY protocol v2 header (TCP) or `Legion-*` headers (HTTP) | yes |
 | `log` | access log for this hop | as declared |
 | `dlp` | rejects HTTP bodies matching `config.patterns` up to `config.maxBytes` (needs `protocol = "http"`) | yes |
 
 Every hop has a `timeout` (default `2s`) and an `onError` (`deny` by
-default). There is no syntax for an unbounded handler.
+default). There is no syntax for an unbounded handler, and a hop that
+cannot be reached — a webhook that times out, a proxy with no endpoint —
+fails the chain **closed** unless it says `onError = "allow"`.
+
+```nickel
+egress = {
+    protocol = "http",
+    allow = ["api.github.com/**"],
+    handlers = [
+        { handler = "authz", url = "http://policy.internal:8080/check", cache = "30s" },
+        { handler = "proxy", service = "egress-filter", onError = "deny" },
+    ],
+},
+```
+
+### `authz` — ask your service
+
+The webhook is what most custom logic actually is: "may *this* workload
+talk to *that*?" Legion asks it once per new (identity, destination) pair
+and caches the answer.
+
+**Request** (`POST`, `application/json`, header `Legion-Handler: authz`):
+
+```json
+{
+  "allocation": 41, "job": "agent-7", "task": "sandbox",
+  "identity": "auto:agent-7:default:sandbox",
+  "labels": { "user": "alice", "tier": "free" }, "node": "node-3",
+  "direction": "egress", "protocol": "http",
+  "destination": "api.github.com:443", "host": "api.github.com", "port": 443,
+  "peerIdentity": null,
+  "method": "GET", "path": "/repos/x", "headers": [["host", "api.github.com"]]
+}
+```
+
+`method`, `path` and `headers` are present in HTTP mode only; `authorization`,
+`cookie` and `proxy-authorization` are never forwarded. `peerIdentity` is
+the verified client on ingress.
+
+**Reply** (`200`): `{ "verdict": "allow" | "deny", "reason": "...", "ttl": "1m" }`.
+Anything else — a non-2xx status, a body that is not JSON, a verdict that is
+not `allow`/`deny`, a timeout — is a handler error and takes `onError`. A
+`deny` is a policy denial like any other: the connection closes (or the
+request gets a `403` naming the hop as `Legion-Denied-By`), a `net.denied`
+event carries the reason, and `legion net policy show` names the hop.
+
+**Where it runs.** On L4 paths (an upstream splice, the gated egress proxy's
+`CONNECT`/SOCKS, an ingress splice) the webhook is called at connect time
+with the connect-time facts. In HTTP mode it is called per request with the
+request head — one call per new (identity, destination, method, path), then
+the cache.
+
+### `proxy` — bring your own proxy
+
+A `proxy` hop takes the flow. Legion dials the proxy and hands it the
+connection with everything it needs to decide or filter, then splices:
+
+- **TCP** (an L4 upstream, `CONNECT`, SOCKS5, an ingress splice): the
+  connection starts with a **PROXY protocol v2** header — source and
+  destination addresses, plus Legion TLVs `0xE0` identity, `0xE1` the
+  original destination as `host:port` (or the task's private port on
+  ingress), `0xE2` allocation id, `0xE3` labels (`k=v;...`), `0xE4`
+  direction, `0xE5` job, `0xE6` task. HAProxy, Envoy, nginx and Caddy read
+  the addresses and ignore the TLVs they do not know; `proxyProtocol = false`
+  omits the header for a proxy that cannot take one.
+- **HTTP** (an HTTP-mode upstream, an absolute-URI request through the
+  gated proxy): the request reaches the proxy in **absolute form**
+  (`GET http://api.example/x HTTP/1.1`) with headers `Legion-Identity`,
+  `Legion-Allocation`, `Legion-Job`, `Legion-Task`, `Legion-Labels`,
+  `Legion-Direction`, `Legion-Destination`, and `Legion-Peer-Identity` on
+  ingress. The proxy answers for the origin; a `4xx` from it is the denial.
+
+Targets: `service = "x"` (any healthy endpoint of catalog service `x`,
+round-robin), `node = "x"` (only endpoints of `x` on the same node — a
+per-node filter run as a system job), or `port = "filter"` (a sidecar task in
+the same job with a port of that label, on this node). The manager feeds
+the endpoints on the heartbeat like an upstream's; a target with no endpoint
+is a handler error (`onError`).
+
+An ingress `proxy` hop hands the *inbound* connection to the proxy, which
+reaches the task on the private port named in the header; that works for a
+task in host mode (the proxy can dial the port) — a gated task's private
+port is inside its namespace, which an external proxy cannot enter.
+
+### Health, and `legion net handler test`
+
+Every hop the datapath has run is reported on the heartbeat
+(`NetAllocStatus.handlers`: source, kind, target, healthy, calls, errors,
+last error) and shown by `legion net doctor` and under **Datapath** in the
+UI's task Network section. Before wiring a handler in:
+
+```bash
+legion net handler test http://policy.internal:8080/check   # authz: sample facts → verdict?
+legion net handler test 10.0.0.9:9000                       # proxy: accepts a PROXY v2 header?
+```
+
+The probe sends one synthetic request the way the datapath would and prints
+each check (`reachable`, `status_2xx`, `verdict`, `ttl`; or `proxy_protocol`)
+with a fix. Non-zero exit when a check fails. Also an MCP tool
+(`legion_net_handler_test`).
+
+## mTLS
+
+Legion terminates and originates TLS; a handler never sees it. Two kinds of
+material, chosen per chain:
+
+```nickel
+ingress = {
+    tls = {
+        mode = "mutual",                      # off | server | mutual
+        certFrom = "legion",                  # the mesh: this node's certificate
+        clientCa = "legion",                  # verify peers against the mesh CA
+        requireIdentity = ["auto:web:*"],     # workload globs a peer must match
+    },
+},
+```
+
+| Field | Meaning |
+| --- | --- |
+| `mode` | `server` presents a certificate; `mutual` also **verifies** the client's. Egress: `passthrough` (default, opaque) or `originate` (external upstreams; TLS from the node, plaintext from the task). |
+| `certFrom = "legion"` | the node's mesh certificate (below). Omit it and give `certPath`/`keyPath` for bring-your-own files on the node (or staged artifacts). |
+| `clientCa` | `"legion"` (the mesh CA) or a CA bundle path; required for `mutual`. |
+| `requireIdentity` | identity globs; a verified peer outside them is refused with `Legion-Denied-By: tls/requireIdentity` and a `net.denied` event. Empty = any verified peer. |
+| `caPath` | egress `originate`: verify the destination against this bundle instead of the system roots. |
+
+**Bring-your-own PKI.** With `certPath`/`keyPath` (and `clientCa` for
+`mutual`), the advertised port terminates TLS with your certificate and a
+`mutual` peer's identity is its certificate's first URI SAN, else its first
+DNS SAN, else its CN — that string is what `identity` rules and
+`requireIdentity` match.
+
+**The mesh (`certFrom = "legion"`).** The manager keeps one cluster **mesh
+CA** (created on first use, replicated with the control lane) and issues each
+worker node a short-lived **node certificate** — SANs `<node>.node.legion` and
+`legion://node/<node id>`, valid 24 hours, refreshed by the worker after 8 —
+over the authenticated worker channel (`IssueNodeCertificate`). Nothing is
+written to disk on the node. Then:
+
+- A task whose ingress chain says `mode = "mutual", certFrom = "legion"` has
+  its advertised port terminate **node-to-node mTLS**. The catalog marks the
+  endpoint `mesh_tls`; every consumer's datapath dials it with its own node
+  certificate, verifies the peer node, and names the consuming **workload**
+  (`<region>:<job>:<group>:<task>`) in a PROXY v2 TLV inside the session.
+  The receiving node trusts that attribution because the peer proved it is a
+  node, and feeds it to `identity` rules, `requireIdentity`, and `authz`.
+- A plain client dialing the port directly is refused at the handshake. A
+  non-Legion client that must reach it presents a certificate from the mesh
+  CA (`legion net ca show` prints the CA; certificates for outsiders are not
+  issued by Legion) or goes through a Legion task.
+- Workloads never hold certificates: identity is attributed by the node,
+  which is what keeps a per-user sandbox's identity out of the sandbox.
+
+`legion net ca show` prints the CA certificate (never the key);
+`legion net ca rotate` replaces it — every node re-issues on its next
+heartbeat, and until it has, peers on different CAs refuse each other. Never
+plaintext.
+
+**Doctor.** `legion net doctor` reports `tls` as a layer: BYO files that do
+not parse, or a mesh certificate the node has not been issued yet (mesh peers
+are refused until then, and the allocation's `problems` say so).
+
+Limits: no kTLS/`splice` fast path yet — a terminated mesh connection is
+copied in user space; TLS 1.2 and 1.3; no certificate revocation (the
+24-hour lifetime is the revocation).
 
 ## `network.mode`
 
@@ -409,6 +573,58 @@ leaves the catalog, keeps serving for one heartbeat interval (or
 consumer dialing it through an upstream sees no `connection refused` while a
 rollout replaces it.
 
+## Service graph
+
+Who calls whom, with RED — the reason to adopt a mesh, and the first thing
+on the UI's Network page.
+
+Every calling datapath — an upstream listener, the gated egress proxy, an
+HTTP-mode request — records what it saw per (upstream, endpoint tag) since
+the last heartbeat: connections or requests, errors (5xx, or no endpoint
+reached), denials, latency, bytes. The samples ride the heartbeat
+(`HeartbeatRequest.net_edges`, restored on a failed beat) and the manager
+folds them into per-minute buckets per (caller job, caller task, service,
+tag), keeping 15 minutes in memory. An edge appears within one heartbeat of
+the first call.
+
+```bash
+legion service edges                 # the whole graph, last 5 minutes
+legion service edges api --window 15m
+```
+
+```
+CALLER          SERVICE   TAG     STATE                 RPS    ERRORS     DENIED  LATENCY avg/max  LAST SEEN
+web/server      api       -       healthy (declared)    12.40  0 (0.0%)   0       18ms/240ms       3s ago
+web/server      api       canary  some errors           1.30   4 (1.0%)   0       22ms/910ms       3s ago
+agent-7/sandbox api       -       denials               0.00   0 (0.0%)   17      -                9s ago
+batch/loader    db        -       declared, silent      0.00   0 (0.0%)   0       -                never
+```
+
+Each edge says whether the caller's latest job config **declares** the
+upstream, whether the service's `allow` intentions **admit** the caller, and
+what was **observed**: requests per second, error rate, denials, average and
+max latency (HTTP mode), bytes. A declared upstream that never called shows
+as `declared, silent`; a caller that calls without declaring (through the
+gated proxy, say) shows without the `declared` mark; an edge into a service
+whose `allow` list excludes the caller is `not allowed`. Tags come from the
+endpoint the call was balanced to, so a `split` canary has its own row —
+per-tag RED side by side.
+
+The UI's **Network** page draws the graph (callers left, services right;
+line width by request rate; dashed for silent, red for denials, errors above
+5%, or a disallowed caller) over the same table, and a **Service** page
+lists its callers. `ListServiceEdges` and the MCP tool
+`legion_service_edges` return the same edges (`job:read`, like the catalog).
+
+What is *not* on the graph: ingress-side attribution (edges are recorded by
+the caller, so a client outside Legion dialing an advertised port is not an
+edge — its denials are still events), traffic that bypasses the datapath in
+`host` mode, and anything older than 15 minutes (the graph is in memory on
+the manager; a failover starts it empty and the next heartbeats refill it).
+Through the gated proxy, an external host is a node of the graph (service =
+the destination host), bounded at 4,096 distinct edges per node between
+heartbeats.
+
 ## CLI
 
 ```bash
@@ -419,7 +635,9 @@ legion net policy delete <name>
 legion net policy show <job> [--task <task>] [--pool <pool>]    # the effective policy
 legion net policy test <job> --to <dest> [--method M --path P]  # dry-run a verdict
 legion net policy test <job> --from <peer> [--identity <sub>]
-legion net doctor <job> [--task <task>]                         # policy → mode → datapath
+legion net doctor <job> [--task <task>]                         # policy → mode → datapath → handlers → tls
+legion net handler test <url|host:port>                         # probe an authz webhook or a proxy
+legion net ca show | rotate                                     # the mesh CA
 ```
 
 `net doctor` walks a task's network the way `service doctor` walks a
@@ -440,15 +658,19 @@ would change. `test` answers `allow`, `deny` (with the deciding rule and its
 reason), or `defer` — a request-time rule would decide and no method/path
 was given.
 
-`show`, `test` and `doctor` are also MCP tools (`legion_net_policy_show`,
-`legion_net_policy_test`, `legion_net_doctor`, read-only) and `apply` is a
-mutating one (`legion_net_policy_apply`), so an agent can ask "is that host
-blocked?" instead of watching a connection hang.
+`show`, `test`, `doctor`, `handler test` and `ca show` are also MCP tools
+(`legion_net_policy_show`, `legion_net_policy_test`, `legion_net_doctor`,
+`legion_net_handler_test`, `legion_net_ca_show`) and `apply` and `ca rotate`
+are mutating ones (`legion_net_policy_apply`, `legion_net_ca_rotate`), so an
+agent can ask "is that host blocked?" instead of watching a connection hang.
 
 ## Observability
 
 - **Metrics** (worker registry, bounded labels): `legion_net_conns_total{direction,protocol,verdict}`,
-  `legion_net_denied_total{direction}`, `legion_net_bytes_total{direction}`.
+  `legion_net_denied_total{direction}`, `legion_net_bytes_total{direction}`,
+  `legion_net_handler_total{handler,outcome}` (authz/proxy calls by
+  allow|deny|proxy|error), `legion_net_handler_seconds` (webhook latency,
+  cache misses only).
   Attribution is never a metric label — the registry caps label combinations
   and a per-user label would silently destroy the series.
 - **Events**: `net.denied` (warn) with the destination, the deciding rule,
@@ -466,12 +688,13 @@ blocked?" instead of watching a connection hang.
 
 ## ACLs
 
-A new resource, `net`: `read` lists policies and shows/tests a job's
-effective policy (scoped by job name); `write` applies and deletes policies,
-scoped by `pools`, which is matched against the policy's own
-`selector.nodePools` — so a pool's admin can set posture for their pool
-without cluster-wide write. A cluster-wide policy (no pools in its
-selector) needs unscoped `net:write`.
+A new resource, `net`: `read` lists policies, shows/tests a job's
+effective policy (scoped by job name), and reads the mesh CA certificate;
+`write` applies and deletes policies, scoped by `pools`, which is matched
+against the policy's own `selector.nodePools` — so a pool's admin can set
+posture for their pool without cluster-wide write. A cluster-wide policy (no
+pools in its selector) and `ca rotate` need unscoped `net:write`.
+`IssueNodeCertificate` is worker-plane: a node may only mint its own.
 
 ## Current scope and limitations
 
@@ -479,11 +702,10 @@ What ships now is the **policy and upstream layer on the connect datapath**;
 the phases below are laid out in the plan and named here so nothing reads as
 more than it is.
 
-- **Rules are enforced on the connect datapath** — connect-time rules on
-  every `connect.upstreams` dial, request-time rules (path, method, header),
-  `dlp`, and the `http` traffic block in HTTP mode. The `authz` and `proxy`
-  handlers are validated at submit and run from the external-handlers phase;
-  `log` and `dlp` run today.
+- **Rules and handlers are enforced on the datapath** — connect-time rules
+  on every dial, request-time rules (path, method, header), `dlp`, the
+  `http` traffic block, and the external `authz` and `proxy` hops on every
+  path (upstream splices, HTTP mode, the gated egress proxy, ingress).
 - **Egress is cooperative in `host` mode, unbypassable in `gated` mode.**
   In `host` mode policy applies to traffic that goes through an upstream and
   to names resolved through the allocation's resolver; a process that dials
@@ -496,9 +718,12 @@ more than it is.
   advertised port and the task binds a private twin, on every runtime and
   platform. TCP only; the task sees the datapath as the peer until the
   PROXY-protocol handoff ships with external handlers.
-- **`tls` on chains is validated, not yet terminated**; external upstreams
-  originate TLS today. Bring-your-own certificates and the cluster CA are the
-  mTLS phase.
+- **TLS**: ingress chains terminate `server`/`mutual` TLS with your files
+  or the mesh certificate; the mesh is node-to-node mTLS with attributed
+  workload identity, never per-workload certificates. No kTLS fast path (a
+  terminated connection is copied in user space), no revocation beyond the
+  24-hour lifetime, and an ingress `proxy` hop cannot reach a *gated* task's
+  private port.
 - **No HTTP/2 or HTTP/3** (`protocol = "h2"` is rejected with that reason),
   no UDP, no WASM handlers, no TLS interception — the last by design:
   external upstreams are the body-visible route.

@@ -24,6 +24,7 @@
 use crate::prelude::*;
 use crate::structs::netpolicy::{ConnectFacts, RequestFacts, Verdict, PROTOCOL_HTTP, PROTOCOL_TCP};
 use crate::worker::forwarder::ForwarderContext;
+use crate::worker::netd::handlers::{self, HopFacts, HopOutcome, ProxyTarget};
 use crate::worker::netd::metrics as net_metrics;
 use crate::worker::netd::netns;
 use crate::worker::netd::policy::egress_connect_verdict;
@@ -253,6 +254,48 @@ fn judge(
     }
 }
 
+/// The external hops on the allocation's effective egress chain.
+async fn hops(proxy: &Arc<Proxy>, facts: &HopFacts<'_>) -> HopOutcome {
+    let hops = handlers::hops_for(&proxy.context, proxy.allocation_id, "egress", None, &[]);
+    if hops.is_empty() {
+        return HopOutcome::Allow;
+    }
+    handlers::run(&proxy.context, &hops, facts).await
+}
+
+/// Dial a `proxy` handler's target and start it with the PROXY v2 header.
+async fn dial_proxy_target(
+    proxy: &Arc<Proxy>,
+    target: &ProxyTarget,
+    facts: &HopFacts<'_>,
+    client_addr: Option<SocketAddr>,
+) -> Option<TcpStream> {
+    let mut stream =
+        match tokio::time::timeout(DIAL_TIMEOUT, TcpStream::connect(&target.addr)).await {
+            Ok(Ok(stream)) => stream,
+            other => {
+                let err = match other {
+                    Ok(Err(err)) => err.to_string(),
+                    _ => "dial timed out".to_string(),
+                };
+                proxy.context.note_handler(
+                    proxy.allocation_id,
+                    &target.source,
+                    crate::structs::netpolicy::HANDLER_PROXY,
+                    &target.addr,
+                    Err(format!("dial {}: {err}", target.addr)),
+                );
+                return None;
+            }
+        };
+    if target.proxy_protocol {
+        let destination = handlers::resolve_addr(facts.destination).await;
+        let header = handlers::proxy_header(&proxy.context, facts, client_addr, destination);
+        stream.write_all(&header).await.ok()?;
+    }
+    Some(stream)
+}
+
 async fn handle(client: TcpStream, proxy: Arc<Proxy>) {
     let mut first = [0u8; 1];
     match client.peek(&mut first).await {
@@ -360,6 +403,10 @@ async fn handle_http(mut client: TcpStream, proxy: Arc<Proxy>) {
         let ip = host.parse::<IpAddr>().ok();
         if let Err((source, reason)) = judge(&proxy, Some(&host), ip, port, None) {
             net_metrics::connection("egress", PROTOCOL_TCP, "deny");
+            proxy
+                .context
+                .edges()
+                .record_denied(proxy.allocation_id, &host, PROTOCOL_TCP);
             proxy.context.record_denial(
                 proxy.allocation_id,
                 "egress",
@@ -373,20 +420,60 @@ async fn handle_http(mut client: TcpStream, proxy: Arc<Proxy>) {
             deny_http(&mut client, &source, reason.as_deref(), &destination).await;
             return;
         }
-        let upstream = match tokio::time::timeout(
-            DIAL_TIMEOUT,
-            TcpStream::connect((host.as_str(), port)),
-        )
-        .await
-        {
-            Ok(Ok(stream)) => stream,
-            _ => {
-                net_metrics::connection("egress", PROTOCOL_TCP, "error");
-                let _ = client
-                    .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-                    .await;
+        let hop_facts = HopFacts {
+            allocation_id: proxy.allocation_id,
+            direction: "egress",
+            protocol: PROTOCOL_TCP,
+            destination: &destination,
+            host: Some(&host),
+            ip,
+            port,
+            ..Default::default()
+        };
+        let upstream = match hops(&proxy, &hop_facts).await {
+            HopOutcome::Allow => {
+                match tokio::time::timeout(DIAL_TIMEOUT, TcpStream::connect((host.as_str(), port)))
+                    .await
+                {
+                    Ok(Ok(stream)) => Some(stream),
+                    _ => None,
+                }
+            }
+            HopOutcome::Deny { source, reason } => {
+                net_metrics::connection("egress", PROTOCOL_TCP, "deny");
+                proxy
+                    .context
+                    .edges()
+                    .record_denied(proxy.allocation_id, &host, PROTOCOL_TCP);
+                proxy.context.record_denial(
+                    proxy.allocation_id,
+                    "egress",
+                    PROTOCOL_TCP,
+                    &destination,
+                    &source,
+                    reason.as_deref(),
+                    "CONNECT",
+                    "",
+                );
+                deny_http(&mut client, &source, reason.as_deref(), &destination).await;
                 return;
             }
+            HopOutcome::Proxy(target) => {
+                dial_proxy_target(&proxy, &target, &hop_facts, client.peer_addr().ok()).await
+            }
+        };
+        let Some(upstream) = upstream else {
+            net_metrics::connection("egress", PROTOCOL_TCP, "error");
+            proxy
+                .context
+                .edges()
+                .record_connection(proxy.allocation_id, &host, None, false);
+            let _ = client
+                .write_all(
+                    b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await;
+            return;
         };
         if client
             .write_all(format!("{version} 200 Connection Established\r\n\r\n").as_bytes())
@@ -396,7 +483,11 @@ async fn handle_http(mut client: TcpStream, proxy: Arc<Proxy>) {
             return;
         }
         net_metrics::connection("egress", PROTOCOL_TCP, "allow");
-        splice(client, upstream, &head[head_end..]).await;
+        proxy
+            .context
+            .edges()
+            .record_connection(proxy.allocation_id, &host, None, true);
+        splice(&proxy, &host, client, upstream, &head[head_end..]).await;
         return;
     }
 
@@ -430,6 +521,10 @@ async fn handle_http(mut client: TcpStream, proxy: Arc<Proxy>) {
         Some((&method, path_only, &headers)),
     ) {
         net_metrics::connection("egress", PROTOCOL_HTTP, "deny");
+        proxy
+            .context
+            .edges()
+            .record_denied(proxy.allocation_id, &host, PROTOCOL_HTTP);
         proxy.context.record_denial(
             proxy.allocation_id,
             "egress",
@@ -443,11 +538,97 @@ async fn handle_http(mut client: TcpStream, proxy: Arc<Proxy>) {
         deny_http(&mut client, &source, reason.as_deref(), &destination).await;
         return;
     }
+    let hop_facts = HopFacts {
+        allocation_id: proxy.allocation_id,
+        direction: "egress",
+        protocol: PROTOCOL_HTTP,
+        destination: &destination,
+        host: Some(&host),
+        ip,
+        port,
+        method: Some(&method),
+        path: Some(path_only),
+        headers: &headers,
+        ..Default::default()
+    };
+    let mut via_proxy: Option<(TcpStream, Vec<(String, String)>)> = None;
+    match hops(&proxy, &hop_facts).await {
+        HopOutcome::Allow => {}
+        HopOutcome::Deny { source, reason } => {
+            net_metrics::connection("egress", PROTOCOL_HTTP, "deny");
+            proxy
+                .context
+                .edges()
+                .record_denied(proxy.allocation_id, &host, PROTOCOL_HTTP);
+            proxy.context.record_denial(
+                proxy.allocation_id,
+                "egress",
+                PROTOCOL_HTTP,
+                &destination,
+                &source,
+                reason.as_deref(),
+                &method,
+                path_only,
+            );
+            deny_http(&mut client, &source, reason.as_deref(), &destination).await;
+            return;
+        }
+        HopOutcome::Proxy(target) => {
+            let extra = handlers::legion_headers(&proxy.context, &hop_facts);
+            // An HTTP proxy speaks HTTP: no PROXY header, the request itself
+            // says where it is going.
+            let plain = ProxyTarget {
+                proxy_protocol: false,
+                ..target
+            };
+            match dial_proxy_target(&proxy, &plain, &hop_facts, client.peer_addr().ok()).await {
+                Some(stream) => via_proxy = Some((stream, extra)),
+                None => {
+                    net_metrics::connection("egress", PROTOCOL_HTTP, "error");
+                    let _ = client
+                        .write_all(
+                            b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .await;
+                    return;
+                }
+            }
+        }
+    }
+    if let Some((mut upstream, extra)) = via_proxy {
+        // Forward in absolute form, as the external proxy expects, with
+        // the Legion attribution headers.
+        let mut forwarded = format!("{method} {target} {version}\r\n");
+        for (name, value) in &headers {
+            if name == "proxy-connection" || name == "connection" || name == "keep-alive" {
+                continue;
+            }
+            forwarded.push_str(&format!("{name}: {value}\r\n"));
+        }
+        for (name, value) in &extra {
+            forwarded.push_str(&format!("{name}: {value}\r\n"));
+        }
+        forwarded.push_str("connection: close\r\n\r\n");
+        if upstream.write_all(forwarded.as_bytes()).await.is_err() {
+            return;
+        }
+        net_metrics::connection("egress", PROTOCOL_HTTP, "allow");
+        proxy
+            .context
+            .edges()
+            .record_connection(proxy.allocation_id, &host, None, true);
+        splice(&proxy, &host, client, upstream, &head[head_end..]).await;
+        return;
+    }
     let upstream =
         match tokio::time::timeout(DIAL_TIMEOUT, TcpStream::connect((host.as_str(), port))).await {
             Ok(Ok(stream)) => stream,
             _ => {
                 net_metrics::connection("egress", PROTOCOL_HTTP, "error");
+                proxy
+                    .context
+                    .edges()
+                    .record_connection(proxy.allocation_id, &host, None, false);
                 let _ = client
                 .write_all(
                     b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
@@ -477,11 +658,21 @@ async fn handle_http(mut client: TcpStream, proxy: Arc<Proxy>) {
         return;
     }
     net_metrics::connection("egress", PROTOCOL_HTTP, "allow");
-    splice(client, upstream, &head[head_end..]).await;
+    proxy
+        .context
+        .edges()
+        .record_connection(proxy.allocation_id, &host, None, true);
+    splice(&proxy, &host, client, upstream, &head[head_end..]).await;
 }
 
 /// Write any bytes read past the head to the upstream, then splice.
-async fn splice(mut client: TcpStream, mut upstream: TcpStream, leftover: &[u8]) {
+async fn splice(
+    proxy: &Proxy,
+    host: &str,
+    mut client: TcpStream,
+    mut upstream: TcpStream,
+    leftover: &[u8],
+) {
     if !leftover.is_empty() && upstream.write_all(leftover).await.is_err() {
         return;
     }
@@ -489,6 +680,14 @@ async fn splice(mut client: TcpStream, mut upstream: TcpStream, leftover: &[u8])
         Ok((up, down)) => {
             net_metrics::bytes("egress", up);
             net_metrics::bytes("ingress", down);
+            proxy.context.edges().record_bytes(
+                proxy.allocation_id,
+                host,
+                None,
+                PROTOCOL_TCP,
+                up,
+                down,
+            );
         }
         Err(err) => debug!(error = ?err, "Egress proxy tunnel ended with an error"),
     }
@@ -567,6 +766,10 @@ async fn handle_socks5(mut client: TcpStream, proxy: Arc<Proxy>) {
     let destination = format!("{host}:{port}");
     if let Err((source, reason)) = judge(&proxy, Some(&host), ip, port, None) {
         net_metrics::connection("egress", PROTOCOL_TCP, "deny");
+        proxy
+            .context
+            .edges()
+            .record_denied(proxy.allocation_id, &host, PROTOCOL_TCP);
         proxy.context.record_denial(
             proxy.allocation_id,
             "egress",
@@ -583,17 +786,61 @@ async fn handle_socks5(mut client: TcpStream, proxy: Arc<Proxy>) {
             .await;
         return;
     }
-    let upstream =
-        match tokio::time::timeout(DIAL_TIMEOUT, TcpStream::connect((host.as_str(), port))).await {
-            Ok(Ok(stream)) => stream,
-            _ => {
-                net_metrics::connection("egress", PROTOCOL_TCP, "error");
-                let _ = client
-                    .write_all(&[0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
-                    .await;
-                return;
+    let hop_facts = HopFacts {
+        allocation_id: proxy.allocation_id,
+        direction: "egress",
+        protocol: PROTOCOL_TCP,
+        destination: &destination,
+        host: Some(&host),
+        ip,
+        port,
+        ..Default::default()
+    };
+    let upstream = match hops(&proxy, &hop_facts).await {
+        HopOutcome::Allow => {
+            match tokio::time::timeout(DIAL_TIMEOUT, TcpStream::connect((host.as_str(), port)))
+                .await
+            {
+                Ok(Ok(stream)) => Some(stream),
+                _ => None,
             }
-        };
+        }
+        HopOutcome::Deny { source, reason } => {
+            net_metrics::connection("egress", PROTOCOL_TCP, "deny");
+            proxy
+                .context
+                .edges()
+                .record_denied(proxy.allocation_id, &host, PROTOCOL_TCP);
+            proxy.context.record_denial(
+                proxy.allocation_id,
+                "egress",
+                PROTOCOL_TCP,
+                &destination,
+                &source,
+                reason.as_deref(),
+                "",
+                "",
+            );
+            let _ = client
+                .write_all(&[0x05, 0x02, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                .await;
+            return;
+        }
+        HopOutcome::Proxy(target) => {
+            dial_proxy_target(&proxy, &target, &hop_facts, client.peer_addr().ok()).await
+        }
+    };
+    let Some(upstream) = upstream else {
+        net_metrics::connection("egress", PROTOCOL_TCP, "error");
+        proxy
+            .context
+            .edges()
+            .record_connection(proxy.allocation_id, &host, None, false);
+        let _ = client
+            .write_all(&[0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+            .await;
+        return;
+    };
     if client
         .write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
         .await
@@ -602,7 +849,11 @@ async fn handle_socks5(mut client: TcpStream, proxy: Arc<Proxy>) {
         return;
     }
     net_metrics::connection("egress", PROTOCOL_TCP, "allow");
-    splice(client, upstream, &[]).await;
+    proxy
+        .context
+        .edges()
+        .record_connection(proxy.allocation_id, &host, None, true);
+    splice(&proxy, &host, client, upstream, &[]).await;
 }
 
 #[cfg(test)]
@@ -729,6 +980,221 @@ mod tests {
             "{drained:?}"
         );
         assert!(drained.iter().any(|d| d.path == "/secret"), "{drained:?}");
+    }
+
+    /// A "filter" proxy: reads the PROXY v2 header, then answers an HTTP
+    /// request with what the header said (or echoes the request head for an
+    /// HTTP-mode hand-off), so the test can see the attribution arrive.
+    async fn filter_proxy() -> SocketAddr {
+        use crate::worker::netd::proxyproto::{self, tlv};
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let (header, mut leftover) =
+                        proxyproto::read_header(&mut stream).await.unwrap();
+                    if !leftover.windows(4).any(|w| w == b"\r\n\r\n") {
+                        let mut buf = vec![0u8; 4096];
+                        let n = stream.read(&mut buf).await.unwrap_or(0);
+                        leftover.extend_from_slice(&buf[..n]);
+                    }
+                    let head = String::from_utf8_lossy(&leftover).to_string();
+                    let body = match header {
+                        Some(header) => format!(
+                            "proxied identity={} destination={} direction={} alloc={} first={}",
+                            header.text(tlv::IDENTITY).unwrap_or_default(),
+                            header.text(tlv::DESTINATION).unwrap_or_default(),
+                            header.text(tlv::DIRECTION).unwrap_or_default(),
+                            header.text(tlv::ALLOCATION).unwrap_or_default(),
+                            head.lines().next().unwrap_or_default()
+                        ),
+                        None => format!("plain head={}", head.replace("\r\n", "|")),
+                    };
+                    let _ = stream
+                        .write_all(
+                            format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())
+                                .as_bytes(),
+                        )
+                        .await;
+                });
+            }
+        });
+        addr
+    }
+
+    async fn proxies_with_handler(
+        egress: serde_json::Value,
+    ) -> (Arc<EgressProxies>, Arc<ForwarderContext>, SocketAddr) {
+        let cache = Arc::new(NetPolicyCache::new());
+        let denials = Arc::new(Denials::new());
+        let mut object: NetPolicyObject = serde_json::from_value(json!({
+            "name": "p", "enforcement": "require", "egress": egress
+        }))
+        .unwrap();
+        object.normalize_and_validate().unwrap();
+        let policy = merge_policies(&[object], InlinePolicy::default());
+        let hash = policy.hash.clone();
+        cache.apply_assignments(&[AllocNetPolicy {
+            allocation_id: 5,
+            policy_hash: hash.clone(),
+        }]);
+        cache.insert_body(&hash, policy).unwrap();
+        cache.set_identities(
+            [(
+                5,
+                crate::worker::netd::policy::AllocIdentity {
+                    job_id: "web".into(),
+                    task_name: "server".into(),
+                    group: "default".into(),
+                    labels: Default::default(),
+                    ports: Default::default(),
+                },
+            )]
+            .into_iter()
+            .collect(),
+        );
+        let context = Arc::new(ForwarderContext::new(cache, denials));
+        let proxies = Arc::new(EgressProxies::new(context.clone()));
+        proxies
+            .sync(&[ProxySpec {
+                allocation_id: 5,
+                netns: None,
+                listen: Some("127.0.0.1:0".parse().unwrap()),
+            }])
+            .await;
+        let addr = proxies.address(5).expect("proxy bound");
+        (proxies, context, addr)
+    }
+
+    /// A `proxy` handler takes the flow: CONNECT and SOCKS5 tunnels start
+    /// at the filter with a PROXY v2 header naming the workload and the
+    /// destination; an absolute-URI request reaches it in absolute form
+    /// with `Legion-*` headers.
+    #[tokio::test]
+    async fn proxy_handler_hands_flows_off_with_attribution() {
+        let filter = filter_proxy().await;
+        let (_proxies, context, addr) = proxies_with_handler(json!({
+            "protocol": "http",
+            "handlers": [{ "handler": "proxy", "service": "filter" }]
+        }))
+        .await;
+        context.set_handler_endpoints(
+            5,
+            "filter",
+            vec![crate::worker::balance::Endpoint {
+                addr: filter.to_string(),
+                allocation_id: 90,
+                node_id: "node-x".into(),
+                tags: Vec::new(),
+                mesh_tls: false,
+            }],
+        );
+
+        // CONNECT: the tunnel is to the filter, which saw the header.
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(b"CONNECT api.example:443 HTTP/1.1\r\nHost: api.example:443\r\n\r\n")
+            .await
+            .unwrap();
+        let mut buf = vec![0u8; 256];
+        let n = stream.read(&mut buf).await.unwrap();
+        assert!(String::from_utf8_lossy(&buf[..n]).contains("200 Connection Established"));
+        stream
+            .write_all(b"GET /x HTTP/1.1\r\nHost: api.example\r\n\r\n")
+            .await
+            .unwrap();
+        let mut out = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(3), stream.read_to_end(&mut out)).await;
+        let text = String::from_utf8_lossy(&out).to_string();
+        assert!(
+            text.contains("proxied identity=auto:web:default:server destination=api.example:443 direction=egress alloc=5 first=GET /x HTTP/1.1"),
+            "{text}"
+        );
+
+        // Absolute URI: the filter gets the request in absolute form plus
+        // the attribution headers; no PROXY header on an HTTP hand-off.
+        let text = raw(
+            addr,
+            b"GET http://api.example/y HTTP/1.1\r\nHost: api.example\r\n\r\n",
+        )
+        .await;
+        assert!(
+            text.contains("plain head=GET http://api.example/y HTTP/1.1|"),
+            "{text}"
+        );
+        assert!(
+            text.contains("legion-identity: auto:web:default:server"),
+            "{text}"
+        );
+        assert!(
+            text.contains("legion-destination: api.example:80"),
+            "{text}"
+        );
+        assert!(text.contains("legion-allocation: 5"), "{text}");
+
+        // SOCKS5 CONNECT by name.
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        stream.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+        let mut greet = [0u8; 2];
+        stream.read_exact(&mut greet).await.unwrap();
+        let name = b"api.example";
+        let mut req = vec![0x05, 0x01, 0x00, 0x03, name.len() as u8];
+        req.extend_from_slice(name);
+        req.extend_from_slice(&443u16.to_be_bytes());
+        stream.write_all(&req).await.unwrap();
+        let mut reply = [0u8; 10];
+        stream.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply[1], 0x00, "socks connect succeeded");
+        stream
+            .write_all(b"GET /z HTTP/1.1\r\nHost: api.example\r\n\r\n")
+            .await
+            .unwrap();
+        let mut out = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(3), stream.read_to_end(&mut out)).await;
+        assert!(String::from_utf8_lossy(&out).contains("destination=api.example:443"));
+
+        let statuses = context.handler_statuses(5);
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0].handler, "proxy");
+        assert!(statuses[0].healthy);
+        assert_eq!(statuses[0].calls, 3);
+    }
+
+    /// A proxy handler with no endpoints fails the chain closed (or open
+    /// with `onError = "allow"`), and the datapath reports the hop unhealthy.
+    #[tokio::test]
+    async fn proxy_handler_without_endpoints_fails_closed() {
+        let origin_port = origin().await;
+        let (_proxies, context, addr) = proxies_with_handler(json!({
+            "protocol": "http",
+            "handlers": [{ "handler": "proxy", "service": "nowhere" }]
+        }))
+        .await;
+        let response = raw(
+            addr,
+            format!("GET http://127.0.0.1:{origin_port}/ok HTTP/1.1\r\nHost: x\r\n\r\n").as_bytes(),
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+        assert!(response.contains("has no endpoint"), "{response}");
+        let statuses = context.handler_statuses(5);
+        assert!(!statuses[0].healthy);
+
+        let (_proxies, _context, addr) = proxies_with_handler(json!({
+            "protocol": "http",
+            "handlers": [{ "handler": "proxy", "service": "nowhere", "onError": "allow" }]
+        }))
+        .await;
+        let response = raw(
+            addr,
+            format!("GET http://127.0.0.1:{origin_port}/ok HTTP/1.1\r\nHost: x\r\n\r\n").as_bytes(),
+        )
+        .await;
+        assert!(response.contains("saw GET /ok"), "{response}");
     }
 
     #[tokio::test]

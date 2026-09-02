@@ -21,18 +21,21 @@
 //! names that case.
 
 use crate::prelude::*;
-use crate::structs::netpolicy::{ConnectFacts, Verdict, PROTOCOL_TCP};
+use crate::structs::netpolicy::{ConnectFacts, Verdict, PROTOCOL_TCP, TLS_MUTUAL, TLS_SERVER};
 use crate::worker::forwarder::ForwarderContext;
+use crate::worker::netd::handlers::{self, HopFacts, HopOutcome};
 use crate::worker::netd::http::{self, HttpSettings};
 use crate::worker::netd::metrics as net_metrics;
 use crate::worker::netd::netns;
 use crate::worker::netd::policy::ingress_connect_verdict;
+use crate::worker::netd::proxyproto::{self, tlv, Prefixed};
+use crate::worker::netd::tls::{self as net_tls, PeerIdentity};
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::Duration;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 
@@ -254,21 +257,19 @@ async fn run(listener: TcpListener, shared: Arc<Shared>) {
     }
 }
 
+/// How long a TLS handshake may take before the connection is dropped.
+const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+
 async fn handle(mut client: TcpStream, peer: SocketAddr, shared: Arc<Shared>) {
-    let policy = shared.context.policy_for(shared.spec.allocation_id);
-    let facts = ConnectFacts {
-        host: None,
-        ip: Some(peer.ip()),
-        port: shared.spec.host_port,
-        identity: None,
-    };
+    let allocation_id = shared.spec.allocation_id;
+    let policy = shared.context.policy_for(allocation_id);
     let block = if shared.gated() {
-        if netns::gate_is_shut(shared.spec.allocation_id) {
+        if netns::gate_is_shut(allocation_id) {
             Some((
                 "gate".to_string(),
                 Some("network gate is shut until the placement is ratified".to_string()),
             ))
-        } else if policy.is_none() && !shared.context.policy_known(shared.spec.allocation_id) {
+        } else if policy.is_none() && !shared.context.policy_known(allocation_id) {
             Some((
                 "policy-pending".to_string(),
                 Some("network policy has not arrived yet".to_string()),
@@ -279,17 +280,128 @@ async fn handle(mut client: TcpStream, peer: SocketAddr, shared: Arc<Shared>) {
     } else {
         None
     };
+
+    // TLS termination, when the effective ingress chain asks for it.
+    let tls = policy
+        .as_ref()
+        .and_then(|p| p.ingress.as_ref())
+        .and_then(|chain| chain.tls.clone())
+        .filter(|tls| matches!(tls.mode.as_str(), TLS_SERVER | TLS_MUTUAL));
+    let Some(tls) = tls else {
+        serve_accepted(client, Vec::new(), peer, None, shared, block, policy).await;
+        return;
+    };
+    let config = match shared
+        .context
+        .ingress_server_config(allocation_id, &shared.spec.label, &tls)
+    {
+        Ok(config) => config,
+        Err(err) => {
+            debug!(
+                allocation_id,
+                label = %shared.spec.label,
+                error = %err,
+                "Ingress TLS material is not usable; refusing the connection"
+            );
+            net_metrics::connection("ingress", PROTOCOL_TCP, "error");
+            let _ = client.shutdown().await;
+            return;
+        }
+    };
+    let acceptor = tokio_rustls::TlsAcceptor::from(config);
+    let mut stream =
+        match tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(client)).await {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(err)) => {
+                debug!(allocation_id, peer = %peer, error = ?err, "Ingress TLS handshake failed");
+                net_metrics::connection("ingress", PROTOCOL_TCP, "error");
+                return;
+            }
+            Err(_) => {
+                net_metrics::connection("ingress", PROTOCOL_TCP, "error");
+                return;
+            }
+        };
+    let peer_identity = stream
+        .get_ref()
+        .1
+        .peer_certificates()
+        .and_then(net_tls::peer_identity);
+    let (identity, leftover) = match peer_identity {
+        // A node peer names the workload it forwards for in a PROXY v2
+        // header — trusted because the peer proved it is a node.
+        Some(PeerIdentity::Node(node)) => match proxyproto::read_header(&mut stream).await {
+            Ok((Some(header), leftover)) => (
+                header
+                    .text(tlv::IDENTITY)
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| Some(format!("node:{node}"))),
+                leftover,
+            ),
+            Ok((None, leftover)) => (Some(format!("node:{node}")), leftover),
+            Err(_) => return,
+        },
+        Some(PeerIdentity::Other(identity)) => (Some(identity), Vec::new()),
+        None => (None, Vec::new()),
+    };
+    if !net_tls::identity_allowed(&tls.require_identity, identity.as_deref()) {
+        let reason = format!(
+            "peer identity {} is not in tls.requireIdentity",
+            identity.as_deref().unwrap_or("(none)")
+        );
+        net_metrics::connection("ingress", PROTOCOL_TCP, "deny");
+        shared.context.record_denial_for(
+            allocation_id,
+            identity.as_deref(),
+            "ingress",
+            PROTOCOL_TCP,
+            &peer.to_string(),
+            "tls/requireIdentity",
+            Some(&reason),
+            "",
+            "",
+        );
+        let _ = stream.shutdown().await;
+        return;
+    }
+    serve_accepted(stream, leftover, peer, identity, shared, block, policy).await;
+}
+
+/// The rest of the ingress path once the transport is settled: the chain
+/// at connect time, external handlers, then HTTP mode or a splice to the
+/// task's private port.
+async fn serve_accepted<S>(
+    client: S,
+    leftover: Vec<u8>,
+    peer: SocketAddr,
+    identity: Option<String>,
+    shared: Arc<Shared>,
+    block: Option<(String, Option<String>)>,
+    policy: Option<Arc<crate::structs::netpolicy::EffectivePolicy>>,
+) where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let mut client = Prefixed::new(leftover, client);
+    let allocation_id = shared.spec.allocation_id;
+    let peer_text = peer.to_string();
+    let facts = ConnectFacts {
+        host: None,
+        ip: Some(peer.ip()),
+        port: shared.spec.host_port,
+        identity: identity.as_deref(),
+    };
     let verdict = match block {
         Some((source, reason)) => Verdict::Deny { source, reason },
         None => ingress_connect_verdict(policy.as_deref(), &facts),
     };
     if let Verdict::Deny { source, reason } = verdict {
         net_metrics::connection("ingress", PROTOCOL_TCP, "deny");
-        shared.context.record_denial(
-            shared.spec.allocation_id,
+        shared.context.record_denial_for(
+            allocation_id,
+            identity.as_deref(),
             "ingress",
             PROTOCOL_TCP,
-            &peer.to_string(),
+            &peer_text,
             &source,
             reason.as_deref(),
             "",
@@ -299,8 +411,105 @@ async fn handle(mut client: TcpStream, peer: SocketAddr, shared: Arc<Shared>) {
         return;
     }
 
+    // External handlers at connect time (HTTP mode runs them with the
+    // request head instead).
+    let hop_facts = HopFacts {
+        allocation_id,
+        direction: "ingress",
+        protocol: PROTOCOL_TCP,
+        destination: &peer_text,
+        host: None,
+        ip: Some(peer.ip()),
+        port: shared.spec.host_port,
+        identity: identity.as_deref(),
+        ..Default::default()
+    };
+    let hops = handlers::hops_for(&shared.context, allocation_id, "ingress", None, &[]);
+    if !hops.is_empty() && shared.http_settings().is_none() {
+        match handlers::run(&shared.context, &hops, &hop_facts).await {
+            HopOutcome::Allow => {}
+            HopOutcome::Deny { source, reason } => {
+                net_metrics::connection("ingress", PROTOCOL_TCP, "deny");
+                shared.context.record_denial_for(
+                    allocation_id,
+                    identity.as_deref(),
+                    "ingress",
+                    PROTOCOL_TCP,
+                    &peer_text,
+                    &source,
+                    reason.as_deref(),
+                    "",
+                    "",
+                );
+                let _ = client.shutdown().await;
+                return;
+            }
+            HopOutcome::Proxy(target) => {
+                // The proxy reaches the task on the private port named in
+                // the header's DESTINATION TLV.
+                let private = format!("127.0.0.1:{}", shared.spec.private_port);
+                let mut proxy = match tokio::time::timeout(
+                    Duration::from_secs(2),
+                    TcpStream::connect(&target.addr),
+                )
+                .await
+                {
+                    Ok(Ok(stream)) => stream,
+                    other => {
+                        let err = match other {
+                            Ok(Err(err)) => err.to_string(),
+                            _ => "dial timed out".to_string(),
+                        };
+                        shared.context.note_handler(
+                            allocation_id,
+                            &target.source,
+                            crate::structs::netpolicy::HANDLER_PROXY,
+                            &target.addr,
+                            Err(format!("dial {}: {err}", target.addr)),
+                        );
+                        net_metrics::connection("ingress", PROTOCOL_TCP, "error");
+                        let _ = client.shutdown().await;
+                        return;
+                    }
+                };
+                if target.proxy_protocol {
+                    let header_facts = HopFacts {
+                        destination: &private,
+                        ..hop_facts.clone()
+                    };
+                    let header = handlers::proxy_header(
+                        &shared.context,
+                        &header_facts,
+                        Some(peer),
+                        private.parse().ok(),
+                    );
+                    if proxy.write_all(&header).await.is_err() {
+                        return;
+                    }
+                }
+                net_metrics::connection("ingress", PROTOCOL_TCP, "allow");
+                match tokio::io::copy_bidirectional(&mut client, &mut proxy).await {
+                    Ok((in_bytes, out_bytes)) => {
+                        net_metrics::bytes("ingress", in_bytes);
+                        net_metrics::bytes("egress", out_bytes);
+                    }
+                    Err(err) => debug!(error = ?err, "Ingress hand-off ended with an error"),
+                }
+                return;
+            }
+        }
+    }
+
     if let Some(settings) = shared.http_settings() {
-        http::serve(client, settings).await;
+        http::serve_with(
+            client,
+            settings,
+            http::ConnInfo {
+                identity,
+                peer: Some(peer),
+            },
+        )
+        .await;
         return;
     }
 
@@ -309,7 +518,7 @@ async fn handle(mut client: TcpStream, peer: SocketAddr, shared: Arc<Shared>) {
         Ok(stream) => stream,
         Err(err) => {
             debug!(
-                allocation_id = shared.spec.allocation_id,
+                allocation_id,
                 label = %shared.spec.label,
                 error = ?err,
                 "Ingress could not reach the task's private port"
@@ -454,6 +663,120 @@ mod tests {
         ingress.sync(&[]).await;
         assert!(ingress.active().is_empty());
         assert!(TcpStream::connect(("127.0.0.1", host_port)).await.is_err());
+    }
+
+    /// Mesh mTLS end to end: node B fronts a task with a mutual, mesh-issued
+    /// ingress chain; node A dials with its node certificate and names the
+    /// workload in a PROXY v2 header. The chain sees that identity, so an
+    /// `identity` rule and `requireIdentity` decide; a plain client and a
+    /// workload outside `requireIdentity` are refused.
+    #[tokio::test]
+    async fn mesh_mtls_ingress_attributes_the_peer_workload() {
+        use crate::manager::mesh_ca::{generate_ca, issue_node_cert, node_dns_name};
+        use crate::worker::netd::proxyproto::{self, tlv};
+        use crate::worker::netd::tls::MeshIdentity;
+
+        let private = free_port().await;
+        task_on(private).await;
+        let host_port = free_port().await;
+
+        let (ca_pem, ca_key) = generate_ca().unwrap();
+        let (a_cert, a_key, a_exp) = issue_node_cert(&ca_pem, &ca_key, "node-a").unwrap();
+        let (b_cert, b_key, b_exp) = issue_node_cert(&ca_pem, &ca_key, "node-b").unwrap();
+
+        // Node B: the ingress side.
+        let cache = Arc::new(NetPolicyCache::new());
+        let denials = Arc::new(Denials::new());
+        let effective = policy(json!({
+            "policy": "deny",
+            "tls": { "mode": "mutual", "certFrom": "legion", "clientCa": "legion",
+                     "requireIdentity": ["auto:web:*", "auto:ops:*"] },
+            "rules": [ { "when": { "identity": "auto:web:*" }, "action": "allow" } ]
+        }));
+        let hash = effective.hash.clone();
+        cache.apply_assignments(&[AllocNetPolicy {
+            allocation_id: 21,
+            policy_hash: hash.clone(),
+        }]);
+        cache.insert_body(&hash, effective).unwrap();
+        let context_b =
+            Arc::new(ForwarderContext::new(cache, denials.clone()).with_node_id("node-b".into()));
+        context_b
+            .set_mesh_identity(
+                MeshIdentity::from_pem("node-b", &b_cert, &b_key, &ca_pem, b_exp).unwrap(),
+            )
+            .unwrap();
+        let ingress = IngressListeners::new(context_b.clone());
+        ingress
+            .sync(&[IngressSpec {
+                allocation_id: 21,
+                label: "http".into(),
+                host_port,
+                private_port: private,
+                netns: None,
+                bind: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            }])
+            .await;
+        assert_eq!(ingress.active(), vec![(21, "http".to_string())]);
+        assert_eq!(context_b.ingress_tls_status(21), (true, String::new()));
+
+        // Node A: a consumer's datapath dialing the advertised port.
+        let context_a = Arc::new(
+            ForwarderContext::new(Arc::new(NetPolicyCache::new()), Arc::new(Denials::new()))
+                .with_node_id("node-a".into()),
+        );
+        context_a
+            .set_mesh_identity(
+                MeshIdentity::from_pem("node-a", &a_cert, &a_key, &ca_pem, a_exp).unwrap(),
+            )
+            .unwrap();
+        let dial = |identity: &'static str| {
+            let context_a = context_a.clone();
+            async move {
+                let connector = context_a.mesh_connector().unwrap();
+                let stream = TcpStream::connect(("127.0.0.1", host_port)).await.unwrap();
+                let name = crate::worker::netd::tls::server_name(&node_dns_name("node-b")).unwrap();
+                let mut tls = connector.connect(name, stream).await.unwrap();
+                let header =
+                    proxyproto::encode(None, None, &[(tlv::IDENTITY, identity.as_bytes())]);
+                tls.write_all(&header).await.unwrap();
+                tls.write_all(b"GET /hello HTTP/1.1\r\nHost: svc\r\nConnection: close\r\n\r\n")
+                    .await
+                    .unwrap();
+                let mut out = Vec::new();
+                let _ =
+                    tokio::time::timeout(Duration::from_secs(3), tls.read_to_end(&mut out)).await;
+                String::from_utf8_lossy(&out).to_string()
+            }
+        };
+
+        let ok = dial("auto:web:default:server").await;
+        assert!(ok.contains("task saw GET /hello"), "{ok}");
+
+        // Allowed by requireIdentity, but no rule allows `ops`: the chain's
+        // deny fallthrough, attributed to the workload.
+        let denied = dial("auto:ops:default:cli").await;
+        assert!(denied.is_empty(), "{denied}");
+        // Outside requireIdentity entirely.
+        let refused = dial("auto:db:default:pg").await;
+        assert!(refused.is_empty(), "{refused}");
+        let drained = denials.drain();
+        assert!(
+            drained
+                .iter()
+                .any(|d| d.identity == "auto:ops:default:cli" && d.source == "fallthrough"),
+            "{drained:?}"
+        );
+        assert!(
+            drained
+                .iter()
+                .any(|d| d.identity == "auto:db:default:pg" && d.source == "tls/requireIdentity"),
+            "{drained:?}"
+        );
+
+        // A plain TCP client never gets past the handshake.
+        let plain = request(host_port, "GET /hello HTTP/1.1\r\nHost: svc\r\n\r\n").await;
+        assert!(!plain.contains("task saw"), "{plain}");
     }
 
     #[tokio::test]

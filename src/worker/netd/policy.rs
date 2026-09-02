@@ -27,7 +27,12 @@ pub const MAX_DENIALS_PER_HEARTBEAT: usize = 256;
 pub struct AllocIdentity {
     pub job_id: String,
     pub task_name: String,
+    /// The task's group — part of the workload identity subject.
+    pub group: String,
     pub labels: BTreeMap<String, String>,
+    /// The allocation's assigned ports by label (`AllocPort::host_port`),
+    /// so a `proxy` handler can name a sidecar's `port` label.
+    pub ports: BTreeMap<String, u16>,
 }
 
 #[derive(Default)]
@@ -102,6 +107,16 @@ impl NetPolicyCache {
     pub fn set_identities(&self, identities: HashMap<i64, AllocIdentity>) {
         let mut state = self.state.write().unwrap_or_else(|p| p.into_inner());
         state.identities = identities;
+    }
+
+    /// Every allocation's attribution facts (the desired set as of the last
+    /// heartbeat).
+    pub fn identities(&self) -> HashMap<i64, AllocIdentity> {
+        self.state
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .identities
+            .clone()
     }
 
     /// Whether the allocation's policy body is present (a gated allocation
@@ -326,12 +341,31 @@ pub fn identities_from_desired(
                 .map(|network| network.labels)
                 .unwrap_or_default()
         };
+        let group = serde_json::from_str::<serde_json::Value>(&allocation.task_config)
+            .ok()
+            .and_then(|v| v.get("group").and_then(|g| g.as_str()).map(str::to_string))
+            .unwrap_or_else(|| "default".to_string());
+        let ports = if allocation.network.trim().is_empty() {
+            BTreeMap::new()
+        } else {
+            serde_json::from_str::<crate::structs::AllocNetwork>(&allocation.network)
+                .map(|network| {
+                    network
+                        .ports
+                        .iter()
+                        .map(|port| (port.name.clone(), port.host_port))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
         out.insert(
             allocation.allocation_id,
             AllocIdentity {
                 job_id: allocation.job_id.clone(),
                 task_name: allocation.task_name.clone(),
+                group,
                 labels,
+                ports,
             },
         );
     }
@@ -410,6 +444,8 @@ mod tests {
     fn denials_fold_by_key_and_bound_the_heartbeat() {
         let denials = Denials::new();
         let who = AllocIdentity {
+            group: "default".into(),
+            ports: BTreeMap::new(),
             job_id: "agent".into(),
             task_name: "sandbox".into(),
             labels: [("user".to_string(), "alice".to_string())]

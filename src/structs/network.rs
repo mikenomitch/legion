@@ -237,12 +237,45 @@ pub fn allow_permits(allow: &[String], job_id: &str) -> bool {
 pub struct ConnectConfig {
     #[serde(default)]
     pub upstreams: Vec<UpstreamConfig>,
+    /// Config files rendered from the upstreams and their endpoint feed
+    /// (docs/service-discovery.md, "Templates").
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub templates: Vec<ConnectTemplate>,
 }
 
 impl ConnectConfig {
     pub fn is_empty(&self) -> bool {
         self.upstreams.is_empty()
     }
+}
+
+/// One rendered file: `{{ service "x" }}`, `{{ range endpoints "x" }}`,
+/// `{{ env "X" }}` over the task's upstreams, re-rendered on every heartbeat
+/// that changes the result.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ConnectTemplate {
+    /// Unique within the task; names the file in status and problems.
+    pub name: String,
+    /// Where the file lands, relative to the task directory (or an absolute
+    /// path inside the runtime's task-dir mount).
+    pub destination: String,
+    /// The template text.
+    pub source: String,
+    /// `noop` (default: rewrite the file), `signal` (send `changeSignal`),
+    /// or `restart`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change_signal: Option<String>,
+    /// Random delay before acting on a change, so a fleet does not reload
+    /// in lockstep. Default `0s`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub splay: Option<String>,
+    /// Wait for the feed to settle this long between actions (the file is
+    /// rewritten at once; the signal or restart waits). Default `0s`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coalesce: Option<String>,
 }
 
 /// One declared upstream: a catalog service (`service`) or an external
@@ -554,6 +587,13 @@ pub struct AllocNetwork {
     /// (treated as `host`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
+    /// How the allocation's advertised ports terminate TLS, resolved at
+    /// placement from the effective ingress chain: `legion` (the mesh — a
+    /// consuming node originates mesh TLS to it), `byo` (operator files), or
+    /// absent (plaintext). Read by the catalog projection into
+    /// `ServiceEndpoint.mesh_tls`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ingress_tls: Option<String>,
 }
 
 impl AllocNetwork {
@@ -709,6 +749,10 @@ pub struct ServiceEndpointRow {
     pub meta: BTreeMap<String, String>,
     /// `network.ports` entry the service advertises, when it names a label.
     pub port_label: Option<String>,
+    /// The advertised port terminates mesh TLS (`AllocNetwork::ingress_tls`
+    /// is `legion`); consumers must dial it with their node certificate.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub mesh_tls: bool,
 }
 
 /// Uppercase a port label for env var use, mapping non-alphanumerics to `_`.
@@ -1217,6 +1261,72 @@ pub fn normalize_task_connect(task_name: &str, connect: &mut Option<ConnectConfi
     let Some(connect_config) = connect.as_mut() else {
         return Ok(());
     };
+    let declared: HashSet<String> = connect_config
+        .upstreams
+        .iter()
+        .map(|u| u.key().to_string())
+        .collect();
+    let mut names: HashSet<String> = HashSet::new();
+    for template in connect_config.templates.iter_mut() {
+        template.name = template.name.trim().to_string();
+        let what = format!("task {task_name} connect.templates '{}'", template.name);
+        if template.name.is_empty() {
+            bail!("task {task_name} connect.templates entries need a name");
+        }
+        if !names.insert(template.name.clone()) {
+            bail!("{what}: duplicate template name");
+        }
+        if template.destination.trim().is_empty() {
+            bail!("{what}: destination is required");
+        }
+        if std::path::Path::new(template.destination.trim())
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            bail!("{what}: destination must stay inside the task directory (no `..`)");
+        }
+        if template.source.trim().is_empty() {
+            bail!("{what}: source is required");
+        }
+        crate::worker::templates::validate_source(&template.source)
+            .map_err(|err| anyhow::anyhow!("{what}: {err}"))?;
+        for key in crate::worker::templates::referenced_upstreams(&template.source) {
+            if !declared.contains(&key) {
+                bail!(
+                    "{what}: refers to upstream {key:?}, which this task does not declare in \
+                     connect.upstreams"
+                );
+            }
+        }
+        if let Some(mode) = template.change_mode.as_mut() {
+            *mode = mode.trim().to_ascii_lowercase();
+            if !matches!(mode.as_str(), "noop" | "signal" | "restart") {
+                bail!("{what}: changeMode must be noop, signal, or restart");
+            }
+            if mode == "signal" {
+                let signal = template
+                    .change_signal
+                    .as_deref()
+                    .map(str::trim)
+                    .unwrap_or("");
+                if signal.is_empty() {
+                    bail!("{what}: changeMode = \"signal\" needs changeSignal");
+                }
+                if !crate::structs::STOP_SIGNALS.contains(&signal) {
+                    bail!(
+                        "{what}: changeSignal must be one of {}",
+                        crate::structs::STOP_SIGNALS.join(", ")
+                    );
+                }
+            }
+        }
+        for (field, value) in [("splay", &template.splay), ("coalesce", &template.coalesce)] {
+            if let Some(value) = value.as_deref() {
+                crate::structs::netpolicy::parse_duration(value)
+                    .map_err(|err| anyhow::anyhow!("{what}.{field}: {err}"))?;
+            }
+        }
+    }
     for upstream in connect_config.upstreams.iter_mut() {
         if let Some(name) = upstream.name.as_mut() {
             *name = name.trim().to_string();
@@ -1425,6 +1535,7 @@ mod tests {
             upstreams: Vec::new(),
             vip_block: None,
             mode: None,
+            ingress_tls: None,
         };
 
         let pairs = network.env_pairs();
@@ -1619,6 +1730,7 @@ mod tests {
             }],
             vip_block: None,
             mode: None,
+            ingress_tls: None,
         };
 
         let lookup: std::collections::HashMap<_, _> = network.env_pairs().into_iter().collect();

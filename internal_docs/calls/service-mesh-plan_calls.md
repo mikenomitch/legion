@@ -222,3 +222,123 @@ to allow `127.0.0.0/8`).
 **Why.** Enforceable everywhere with one mechanism and zero jobspec change —
 name-is-config applied to inbound. Simplicity and extensibility (the same
 listener is where PROXY v2, mTLS termination, and wake-on-request attach).
+
+---
+
+## 10. The mesh CA issues node certificates with manager-generated keys, not CSRs
+
+**Call.** `IssueNodeCertificate` returns a certificate *and* its private key
+over the authenticated, TLS-capable worker channel; the node keeps both in
+memory only and re-issues after a restart. The CA itself is generated on
+first use and stored in the replicated state store.
+
+**Alternatives.** A CSR flow (the node generates the key, the manager signs)
+— the textbook shape; or reusing the workload-identity signing key as the CA
+(one fewer secret).
+
+**Trade-off.** The key crosses the wire once per issuance (24h) and lives in
+the manager's memory for the duration of the call; a compromised manager
+could mint node identities — which it already can, holding every node
+token. Reusing the JWT key would have tied mesh rotation to token rotation.
+
+**Why.** Simplicity: one RPC, no CSR parsing, nothing on the node's disk, and
+rotation is "delete the row". The threat this must resist is a workload or
+an outsider forging a node, not the manager — and the manager is already the
+root of trust for everything a node is told. Calls entry 2's shape (node
+identity, attributed workload) is what makes a 24-hour node credential enough.
+
+---
+
+## 11. Handler endpoints ride the upstream feed with a flag, not a new message
+
+**Call.** A `proxy` hop's target endpoints arrive in
+`HeartbeatReply.upstream_endpoints` marked `for_handler = true`; the worker
+routes them to the handler table instead of a listener. The manager computes
+them from the cached effective policy (plus the task's own upstream
+handlers), so a node with no handlers pays one pass over its policy hashes.
+
+**Alternatives.** A separate `handler_endpoints` message (cleaner types, one
+more thing every worker version must know); or having the worker resolve
+targets itself via `ResolveService` on hand-off (a control-plane RPC on the
+byte path, and fail-static lost).
+
+**Trade-off.** One boolean that consumers of the feed must respect; an old
+worker would start a listener for a handler target (harmless, unused).
+
+**Why.** The endpoint feed already has the right semantics — healthy only,
+intention-filtered, replaced only on a successful heartbeat — and the
+datapath doctrine is "no control-plane call on the byte path". Extensibility
+with the least surface.
+
+---
+
+## 12. `authz` is called at connect time on L4 paths and per request in HTTP mode, never both
+
+**Call.** A webhook sees connect-time facts on a splice, `CONNECT`, SOCKS or
+an ingress splice, and the request head in HTTP mode — one call per flow
+unit, cached per (hop, identity, destination[, method, path]) with a
+`10s` default TTL.
+
+**Alternatives.** Always call at connect time and again per request (two
+calls for the first request of an HTTP connection); or only ever at connect
+time (no path/method for the webhook).
+
+**Trade-off.** In HTTP mode a webhook that only cares about hosts is asked
+per distinct path until the cache warms; the default TTL means a revoked
+allow can live 10 seconds (bounded by `cache`, capped at 5m).
+
+**Why.** The webhook exists so custom logic does not have to be a proxy; in
+HTTP mode the request head *is* the interesting fact. Performance: one call
+per new key, and the L7 cost is only paid where the operator already chose
+`protocol = "http"` (handlers plan §7.1).
+
+---
+
+## 13. Graph edges are recorded on the calling side and folded on the manager, never stored
+
+**Call.** Each node's datapath keeps deltas per (allocation, upstream, tag)
+between heartbeats; the manager folds them into 15 minutes of per-minute
+buckets in memory and serves `ListServiceEdges` from those plus the declared
+upstreams. Nothing is written to the state store.
+
+**Alternatives.** Record on the receiving side (ingress) as well, for
+attribution of outside callers; persist buckets in the store for history and
+failover; or export samples only as Prometheus metrics and let a TSDB draw
+the graph.
+
+**Trade-off.** A caller outside Legion is not an edge (its denials are still
+events); a manager failover starts the graph empty; 15 minutes is the whole
+history — longer views are the metrics endpoint's job. Per-tag rows come
+free from the balancer's choice, so a canary reads as its own edge.
+
+**Why.** Performance and simplicity: the caller already knows the upstream
+and the tag with no lookup, the heartbeat already carries reports with a
+restore-on-failure contract, and an in-memory window costs no replicated
+writes at all — the graph is a projection, like the catalog (calls entry 1's
+doctrine). Metric labels could not carry (caller, service) pairs without
+blowing the bounded-label rule (handlers plan §7.11).
+
+---
+
+## 14. Templates live under `connect`, render on the worker, and know three functions
+
+**Call.** `connect.templates` (not a top-level `templates` block) renders files
+on the worker from the task's upstreams and the endpoint feed the node
+already holds, with exactly `service`, `range endpoints`, and `env`.
+
+**Alternatives.** A top-level task block (needs a new `task_config` column,
+migration, and dispatch field); manager-side rendering pushed on the
+heartbeat (a render per allocation per beat on the manager, and a second
+copy of the feed on the wire); a real template engine (`tera`, `minijinja`)
+with conditionals and filters.
+
+**Trade-off.** No `{{ kv }}` in these templates (KV injection already
+renders manager-side, and mixing two engines in one file would be worse than
+two files); no conditionals — a template that needs logic is a script that
+reads the file. The `connect` placement means a task with templates but no
+upstreams has nothing to render, which is the point.
+
+**Why.** Templates exist to consume upstreams, so they belong with them; the
+worker has the feed, the task dir, and the signal path already; and three
+functions are what consul-template users actually use. Simplicity, and
+performance (no manager work per beat).

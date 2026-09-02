@@ -714,11 +714,50 @@ pub fn catalog() -> Vec<Capability> {
             read_only_safe: true,
         },
         Capability {
+            name: "net.handler.test",
+            cli: "legion net handler test <URL|HOST:PORT>",
+            grpc: None,
+            summary: "Conformance-probe an external handler the way the datapath uses it: an \
+                 authz webhook must answer a verdict to a sample facts payload; a proxy must \
+                 accept a PROXY v2 header. Sends one synthetic request to the handler; never \
+                 touches the cluster.",
+            mutates: false,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "net.ca.show",
+            cli: "legion net ca show",
+            grpc: Some("Manager/GetMeshCa"),
+            summary: "Print the mesh CA certificate (never the key): what an outside client \
+                 trusts to reach a mesh-TLS port, or verifies a node certificate against.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "net.ca.rotate",
+            cli: "legion net ca rotate",
+            grpc: Some("Manager/RotateMeshCa"),
+            summary: "Replace the mesh CA. Every node re-issues its certificate on its next \
+                 heartbeat; expect one heartbeat interval of refused mesh connections.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
             name: "net.policy.test",
             cli: "legion net policy test <JOB> --to <DEST> | --from <PEER> [--method M --path P]",
             grpc: Some("Manager/TestNetPolicy"),
             summary: "Dry-run a verdict: would this task be allowed to reach a destination (or be \
                  reached from a peer)? Names the deciding rule; sends nothing.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "service.edges",
+            cli: "legion service edges [SERVICE] [--window 5m]",
+            grpc: Some("Manager/ListServiceEdges"),
+            summary: "The service graph: who calls whom through the datapath, with request \
+                 rate, error rate, denials and latency per (caller, service, tag) over the \
+                 window, plus declared-but-silent upstreams and the allow verdict.",
             mutates: false,
             read_only_safe: true,
         },

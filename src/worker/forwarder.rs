@@ -32,14 +32,17 @@ use crate::structs::netpolicy::{ConnectFacts, Verdict, PROTOCOL_TCP};
 use crate::structs::UpstreamHttpConfig;
 use crate::structs::{parse_upstream_target, UpstreamTarget, UPSTREAM_LOOPBACK_ADDR};
 use crate::worker::balance::{balancer, default_balancer, Balancer, Endpoint};
+use crate::worker::netd::handlers::{self, HopFacts, HopOutcome, ProxyTarget};
 use crate::worker::netd::http::HttpSettings;
 use crate::worker::netd::policy::{egress_connect_verdict, AllocIdentity};
+use crate::worker::netd::tls::MeshIdentity;
 use crate::worker::netd::{metrics as net_metrics, Denials, PolicyLookup};
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::OnceLock;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{OnceLock, RwLock};
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
@@ -124,12 +127,22 @@ struct UpstreamShared {
     gated: bool,
 }
 
+/// `proxy` handler targets by (allocation, service).
+type HandlerEndpoints = HashMap<(i64, String), Vec<Endpoint>>;
+/// Ingress TLS configs by (allocation, port label): the fingerprint of what
+/// built each, and the result.
+type IngressTlsConfigs =
+    HashMap<(i64, String), (String, Result<Arc<rustls::ServerConfig>, String>)>;
+/// `authz` verdicts by cache key: (allowed, reason, expires).
+type AuthzCache = HashMap<String, (bool, Option<String>, Instant)>;
+
 /// What every listener consults: the allocation's effective policy (egress
 /// rules are evaluated before any dial), the denial ledger the heartbeat
 /// drains, and a lazily built TLS client for `tls://` / `https://` upstreams.
 /// A forwarder built without policy (tests, the pre-policy code path) allows
 /// everything, exactly as before.
 #[derive(Default)]
+
 pub struct ForwarderContext {
     policy: Option<Arc<dyn PolicyLookup>>,
     cache: Option<Arc<crate::worker::netd::NetPolicyCache>>,
@@ -138,6 +151,48 @@ pub struct ForwarderContext {
     /// Where allocation logs live (`<logs>/<allocation id>/`); access logs
     /// are written next to the task's own logs.
     logs_base_dir: Option<PathBuf>,
+    /// This node's id (`node` proxy targets, the mesh certificate).
+    node_id: OnceLock<String>,
+    /// `proxy` handler targets, from the heartbeat feed (`for_handler`).
+    handler_endpoints: Mutex<HandlerEndpoints>,
+    /// What every external hop has done lately, keyed (allocation, source).
+    handler_health: Mutex<HashMap<(i64, String), HandlerHealth>>,
+    handler_pick: AtomicUsize,
+    /// `authz` verdicts: key → (allowed, reason, expires).
+    authz_cache: Mutex<AuthzCache>,
+    http_client: OnceLock<reqwest::Client>,
+    /// The node's mesh credential and the client config built from it.
+    mesh: RwLock<Option<(Arc<MeshIdentity>, Arc<rustls::ClientConfig>)>>,
+    /// Whether anything on this node needs a mesh certificate.
+    mesh_wanted: AtomicBool,
+    /// Ingress TLS configs per (allocation, port label): the fingerprint of
+    /// what built it, and the result (an error is reported as `tls_error`).
+    ingress_tls: Mutex<IngressTlsConfigs>,
+    /// Service-graph samples since the last heartbeat.
+    edges: Arc<crate::worker::netd::graph::EdgeLedger>,
+}
+
+/// One external handler hop as the datapath has seen it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HandlerHealth {
+    pub handler: String,
+    pub target: String,
+    pub healthy: bool,
+    pub last_error: Option<String>,
+    pub calls: u64,
+    pub errors: u64,
+}
+
+/// [`HandlerHealth`] with its source, for the heartbeat report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HandlerStatus {
+    pub source: String,
+    pub handler: String,
+    pub target: String,
+    pub healthy: bool,
+    pub last_error: Option<String>,
+    pub calls: u64,
+    pub errors: u64,
 }
 
 impl ForwarderContext {
@@ -148,7 +203,294 @@ impl ForwarderContext {
             denials: Some(denials),
             tls: OnceLock::new(),
             logs_base_dir: None,
+            node_id: OnceLock::new(),
+            handler_endpoints: Mutex::new(HashMap::new()),
+            handler_health: Mutex::new(HashMap::new()),
+            handler_pick: AtomicUsize::new(0),
+            authz_cache: Mutex::new(HashMap::new()),
+            http_client: OnceLock::new(),
+            mesh: RwLock::new(None),
+            mesh_wanted: AtomicBool::new(false),
+            ingress_tls: Mutex::new(HashMap::new()),
+            edges: Arc::new(crate::worker::netd::graph::EdgeLedger::new()),
         }
+    }
+
+    /// The service-graph ledger the heartbeat drains.
+    pub fn edges(&self) -> &Arc<crate::worker::netd::graph::EdgeLedger> {
+        &self.edges
+    }
+
+    /// This node's id, for `node`-local proxy targets and the mesh.
+    pub fn with_node_id(self, node_id: String) -> Self {
+        let _ = self.node_id.set(node_id);
+        self
+    }
+
+    /// Same, after construction (the first heartbeat knows the id).
+    pub fn set_node_id(&self, node_id: &str) {
+        let _ = self.node_id.set(node_id.to_string());
+    }
+
+    pub fn node_id(&self) -> Option<String> {
+        self.node_id.get().cloned()
+    }
+
+    // ----- external handlers -------------------------------------------
+
+    /// Endpoints a `proxy` handler may hand a flow to, from the feed.
+    pub fn set_handler_endpoints(
+        &self,
+        allocation_id: i64,
+        service: &str,
+        endpoints: Vec<Endpoint>,
+    ) {
+        lock(&self.handler_endpoints).insert((allocation_id, service.to_string()), endpoints);
+    }
+
+    pub fn handler_endpoints_for(&self, allocation_id: i64, service: &str) -> Vec<Endpoint> {
+        lock(&self.handler_endpoints)
+            .get(&(allocation_id, service.to_string()))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Forget feeds and health for allocations that left the node.
+    pub fn retain_allocations(&self, live: &std::collections::HashSet<i64>) {
+        lock(&self.handler_endpoints).retain(|(id, _), _| live.contains(id));
+        lock(&self.handler_health).retain(|(id, _), _| live.contains(id));
+        lock(&self.ingress_tls).retain(|(id, _), _| live.contains(id));
+    }
+
+    pub fn next_handler_pick(&self) -> usize {
+        self.handler_pick.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Record what a hop just did.
+    pub fn note_handler(
+        &self,
+        allocation_id: i64,
+        source: &str,
+        handler: &str,
+        target: &str,
+        result: Result<(), String>,
+    ) {
+        let mut health = lock(&self.handler_health);
+        let entry = health
+            .entry((allocation_id, source.to_string()))
+            .or_default();
+        entry.handler = handler.to_string();
+        entry.target = target.to_string();
+        entry.calls += 1;
+        match result {
+            Ok(()) => {
+                entry.healthy = true;
+                entry.last_error = None;
+            }
+            Err(err) => {
+                entry.healthy = false;
+                entry.errors += 1;
+                entry.last_error = Some(err);
+            }
+        }
+    }
+
+    /// Every hop the datapath has run for an allocation, by source.
+    pub fn handler_statuses(&self, allocation_id: i64) -> Vec<HandlerStatus> {
+        let health = lock(&self.handler_health);
+        let mut out: Vec<HandlerStatus> = health
+            .iter()
+            .filter(|((id, _), _)| *id == allocation_id)
+            .map(|((_, source), h)| HandlerStatus {
+                source: source.clone(),
+                handler: h.handler.clone(),
+                target: h.target.clone(),
+                healthy: h.healthy,
+                last_error: h.last_error.clone(),
+                calls: h.calls,
+                errors: h.errors,
+            })
+            .collect();
+        out.sort_by(|a, b| a.source.cmp(&b.source));
+        out
+    }
+
+    pub fn authz_cached(&self, key: &str) -> Option<(bool, Option<String>)> {
+        let cache = lock(&self.authz_cache);
+        cache
+            .get(key)
+            .filter(|(_, _, expires)| *expires > Instant::now())
+            .map(|(allowed, reason, _)| (*allowed, reason.clone()))
+    }
+
+    pub fn authz_store(&self, key: String, allowed: bool, reason: Option<String>, ttl: Duration) {
+        if ttl.is_zero() {
+            return;
+        }
+        let mut cache = lock(&self.authz_cache);
+        if cache.len() >= crate::worker::netd::handlers::AUTHZ_CACHE_MAX {
+            let now = Instant::now();
+            cache.retain(|_, (_, _, expires)| *expires > now);
+            if cache.len() >= crate::worker::netd::handlers::AUTHZ_CACHE_MAX {
+                cache.clear();
+            }
+        }
+        cache.insert(key, (allowed, reason, Instant::now() + ttl));
+    }
+
+    /// The HTTP client webhooks are called with (no redirects, rustls).
+    pub fn http_client(&self) -> &reqwest::Client {
+        self.http_client.get_or_init(|| {
+            reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .user_agent("legion-netd")
+                .build()
+                .unwrap_or_default()
+        })
+    }
+
+    /// The workload identity subject (`<region>:<job>:<group>:<task>`) of
+    /// an allocation — what a webhook, a PROXY v2 TLV, and an `identity`
+    /// rule on the receiving side all see.
+    pub fn identity_string_for(&self, allocation_id: i64) -> Option<String> {
+        let who = self.identity_for(allocation_id)?;
+        Some(format!(
+            "{}:{}:{}:{}",
+            crate::constants::DEF_CLUSTER_REGION,
+            who.job_id,
+            who.group,
+            who.task_name
+        ))
+    }
+
+    /// A sidecar's advertised port on this node: another allocation of the
+    /// same job with a port of that label.
+    pub fn sidecar_port(&self, allocation_id: i64, label: &str) -> Option<u16> {
+        let cache = self.cache.as_ref()?;
+        let identities = cache.identities();
+        let job = identities.get(&allocation_id)?.job_id.clone();
+        let mut candidates: Vec<(i64, u16)> = identities
+            .iter()
+            .filter(|(id, who)| **id != allocation_id && who.job_id == job)
+            .filter_map(|(id, who)| who.ports.get(label).map(|port| (*id, *port)))
+            .collect();
+        candidates.sort();
+        candidates.first().map(|(_, port)| *port)
+    }
+
+    // ----- the mesh ----------------------------------------------------
+
+    pub fn set_mesh_wanted(&self, wanted: bool) {
+        self.mesh_wanted.store(wanted, Ordering::Relaxed);
+    }
+
+    pub fn mesh_wanted(&self) -> bool {
+        self.mesh_wanted.load(Ordering::Relaxed)
+    }
+
+    /// Whether the worker should (re)issue its node certificate now.
+    pub fn mesh_needs_refresh(&self) -> bool {
+        if !self.mesh_wanted() {
+            return false;
+        }
+        match self.mesh.read().unwrap_or_else(|p| p.into_inner()).as_ref() {
+            Some((identity, _)) => identity.needs_refresh(),
+            None => true,
+        }
+    }
+
+    pub fn set_mesh_identity(&self, identity: MeshIdentity) -> R<()> {
+        let client = identity.client_config()?;
+        *self.mesh.write().unwrap_or_else(|p| p.into_inner()) = Some((Arc::new(identity), client));
+        // Ingress configs built from the previous certificate are stale.
+        lock(&self.ingress_tls).clear();
+        Ok(())
+    }
+
+    pub fn mesh_identity(&self) -> Option<Arc<MeshIdentity>> {
+        self.mesh
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .map(|(identity, _)| identity.clone())
+    }
+
+    /// Dial a mesh endpoint: trust the mesh CA, present the node certificate.
+    pub fn mesh_connector(&self) -> Option<tokio_rustls::TlsConnector> {
+        self.mesh
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .map(|(_, client)| tokio_rustls::TlsConnector::from(client.clone()))
+    }
+
+    /// The server config for an ingress listener's chain, built once per
+    /// (allocation, label, material) and rebuilt when the material changes.
+    pub fn ingress_server_config(
+        &self,
+        allocation_id: i64,
+        label: &str,
+        tls: &crate::structs::netpolicy::TlsConfig,
+    ) -> Result<Arc<rustls::ServerConfig>, String> {
+        let mesh = self.mesh_identity();
+        let fingerprint = format!(
+            "{}|{}",
+            serde_json::to_string(tls).unwrap_or_default(),
+            mesh.as_ref().map(|m| m.expires_at).unwrap_or(0)
+        );
+        let key = (allocation_id, label.to_string());
+        {
+            let cache = lock(&self.ingress_tls);
+            if let Some((fp, result)) = cache.get(&key) {
+                if *fp == fingerprint {
+                    return result.clone();
+                }
+            }
+        }
+        let mutual = tls.mode == crate::structs::netpolicy::TLS_MUTUAL;
+        let result: Result<Arc<rustls::ServerConfig>, String> =
+            if tls.cert_from.as_deref() == Some("legion") {
+                match mesh {
+                    Some(identity) => identity
+                        .server_config(mutual)
+                        .map_err(|err| format!("mesh server config: {err:#}")),
+                    None => Err("mesh certificate not issued yet".to_string()),
+                }
+            } else if mutual && tls.client_ca.as_deref() == Some("legion") {
+                // BYO server cert, mesh clients.
+                match mesh {
+                    Some(identity) => crate::worker::netd::tls::byo_server_config(
+                        &crate::structs::netpolicy::TlsConfig {
+                            client_ca: None,
+                            mode: crate::structs::netpolicy::TLS_SERVER.to_string(),
+                            ..tls.clone()
+                        },
+                    )
+                    .and_then(|_| identity.server_config(true))
+                    .map_err(|err| format!("{err:#}")),
+                    None => Err("mesh certificate not issued yet".to_string()),
+                }
+            } else {
+                crate::worker::netd::tls::byo_server_config(tls).map_err(|err| format!("{err:#}"))
+            };
+        if let Err(err) = &result {
+            debug!(allocation_id, label, error = %err, "Ingress TLS material is not usable");
+        }
+        lock(&self.ingress_tls).insert(key, (fingerprint, result.clone()));
+        result
+    }
+
+    /// (ready, error) for the allocation's ingress TLS material.
+    pub fn ingress_tls_status(&self, allocation_id: i64) -> (bool, String) {
+        let cache = lock(&self.ingress_tls);
+        for ((id, _), (_, result)) in cache.iter() {
+            if *id == allocation_id {
+                if let Err(err) = result {
+                    return (false, err.clone());
+                }
+            }
+        }
+        (true, String::new())
     }
 
     /// Where to write per-allocation access logs.
@@ -177,6 +519,33 @@ impl ForwarderContext {
         method: &str,
         path: &str,
     ) {
+        self.record_denial_for(
+            allocation_id,
+            None,
+            direction,
+            protocol,
+            destination,
+            source,
+            reason,
+            method,
+            path,
+        );
+    }
+
+    /// [`Self::record_denial`] with the verified peer identity (ingress).
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_denial_for(
+        &self,
+        allocation_id: i64,
+        identity: Option<&str>,
+        direction: &str,
+        protocol: &str,
+        destination: &str,
+        source: &str,
+        reason: Option<&str>,
+        method: &str,
+        path: &str,
+    ) {
         let Some(denials) = self.denials.as_ref() else {
             return;
         };
@@ -189,7 +558,7 @@ impl ForwarderContext {
             destination,
             source,
             reason,
-            None,
+            identity,
             method,
             path,
         );
@@ -749,6 +1118,12 @@ async fn forward_connection(mut client: TcpStream, shared: Arc<UpstreamShared>) 
             "No endpoints for upstream; closing connection"
         );
         net_metrics::connection("egress", PROTOCOL_TCP, "error");
+        shared.context.edges().record_connection(
+            shared.allocation_id,
+            &shared.service,
+            None,
+            false,
+        );
         let _ = client.shutdown().await;
         return;
     }
@@ -778,6 +1153,29 @@ async fn forward_connection(mut client: TcpStream, shared: Arc<UpstreamShared>) 
         if deny_if_policy_says_so(&shared, &facts, &endpoint.addr).await {
             let _ = client.shutdown().await;
             return;
+        }
+        // External handlers: a webhook may deny, a proxy may take the flow.
+        let hop_facts = HopFacts {
+            allocation_id: shared.allocation_id,
+            direction: "egress",
+            protocol: PROTOCOL_TCP,
+            destination: &endpoint.addr,
+            host: Some(shared.service.as_str()),
+            ip: addr.map(|a| a.ip()),
+            port: addr.map(|a| a.port()).unwrap_or(0),
+            ..Default::default()
+        };
+        match run_hops(&shared, &hop_facts).await {
+            HopOutcome::Allow => {}
+            HopOutcome::Deny { source, reason } => {
+                deny_connection(&shared, &endpoint.addr, &source, reason.as_deref());
+                let _ = client.shutdown().await;
+                return;
+            }
+            HopOutcome::Proxy(target) => {
+                hand_off(&shared, client, &hop_facts, target, addr).await;
+                return;
+            }
         }
 
         // Counted from the dial (not from a successful connect) so
@@ -809,6 +1207,16 @@ async fn forward_connection(mut client: TcpStream, shared: Arc<UpstreamShared>) 
                 }
             };
 
+        shared.context.edges().record_connection(
+            shared.allocation_id,
+            &shared.service,
+            endpoint.tags.first().map(String::as_str),
+            true,
+        );
+        if endpoint.mesh_tls {
+            mesh_splice(&shared, client, upstream, &endpoint, &hop_facts).await;
+            return;
+        }
         net_metrics::connection("egress", PROTOCOL_TCP, "allow");
         splice(&shared, &endpoint.addr, client, upstream).await;
         return;
@@ -821,6 +1229,10 @@ async fn forward_connection(mut client: TcpStream, shared: Arc<UpstreamShared>) 
         "No reachable endpoint for upstream; closing connection"
     );
     net_metrics::connection("egress", PROTOCOL_TCP, "error");
+    shared
+        .context
+        .edges()
+        .record_connection(shared.allocation_id, &shared.service, None, false);
     let _ = client.shutdown().await;
 }
 
@@ -842,10 +1254,41 @@ async fn forward_external(
         let _ = client.shutdown().await;
         return;
     }
+    let hop_facts = HopFacts {
+        allocation_id: shared.allocation_id,
+        direction: "egress",
+        protocol: PROTOCOL_TCP,
+        destination: &destination,
+        host: Some(target.host.as_str()),
+        ip: target.host.parse().ok(),
+        port: target.port,
+        ..Default::default()
+    };
+    match run_hops(&shared, &hop_facts).await {
+        HopOutcome::Allow => {}
+        HopOutcome::Deny { source, reason } => {
+            deny_connection(&shared, &destination, &source, reason.as_deref());
+            let _ = client.shutdown().await;
+            return;
+        }
+        HopOutcome::Proxy(proxy_target) => {
+            let resolved = handlers::resolve_addr(&destination).await;
+            hand_off(&shared, client, &hop_facts, proxy_target, resolved).await;
+            return;
+        }
+    }
     let _inflight_guard = InflightGuard::acquire(&shared, &destination);
     let upstream = match tokio::time::timeout(DIAL_TIMEOUT, TcpStream::connect(&destination)).await
     {
-        Ok(Ok(upstream)) => upstream,
+        Ok(Ok(upstream)) => {
+            shared.context.edges().record_connection(
+                shared.allocation_id,
+                &shared.service,
+                None,
+                true,
+            );
+            upstream
+        }
         Ok(Err(err)) => {
             debug!(
                 allocation_id = shared.allocation_id,
@@ -963,6 +1406,11 @@ async fn deny_if_policy_says_so(
                 "Egress connection denied by policy"
             );
             net_metrics::connection("egress", PROTOCOL_TCP, "deny");
+            shared.context.edges().record_denied(
+                shared.allocation_id,
+                &shared.service,
+                PROTOCOL_TCP,
+            );
             shared.context.record_denial(
                 shared.allocation_id,
                 "egress",
@@ -979,6 +1427,166 @@ async fn deny_if_policy_says_so(
 }
 
 /// Splice the two halves and account the bytes.
+/// The external hops that apply to this listener's flows: the effective
+/// egress chain's, then the upstream's own.
+async fn run_hops(shared: &Arc<UpstreamShared>, facts: &HopFacts<'_>) -> HopOutcome {
+    let hops = handlers::hops_for(
+        &shared.context,
+        shared.allocation_id,
+        "egress",
+        Some(&shared.service),
+        &shared.handlers,
+    );
+    if hops.is_empty() {
+        return HopOutcome::Allow;
+    }
+    handlers::run(&shared.context, &hops, facts).await
+}
+
+fn deny_connection(
+    shared: &Arc<UpstreamShared>,
+    destination: &str,
+    source: &str,
+    reason: Option<&str>,
+) {
+    debug!(
+        allocation_id = shared.allocation_id,
+        upstream = %shared.service,
+        destination = %destination,
+        source = %source,
+        "Egress connection denied by a handler"
+    );
+    net_metrics::connection("egress", PROTOCOL_TCP, "deny");
+    shared
+        .context
+        .edges()
+        .record_denied(shared.allocation_id, &shared.service, PROTOCOL_TCP);
+    shared.context.record_denial(
+        shared.allocation_id,
+        "egress",
+        PROTOCOL_TCP,
+        destination,
+        source,
+        reason,
+        "",
+        "",
+    );
+}
+
+/// Hand a flow to a `proxy` handler: dial it, write the PROXY v2 header
+/// naming the workload and the original destination, then splice.
+async fn hand_off(
+    shared: &Arc<UpstreamShared>,
+    mut client: TcpStream,
+    facts: &HopFacts<'_>,
+    target: ProxyTarget,
+    destination: Option<SocketAddr>,
+) {
+    let mut proxy = match tokio::time::timeout(DIAL_TIMEOUT, TcpStream::connect(&target.addr)).await
+    {
+        Ok(Ok(stream)) => stream,
+        other => {
+            let err = match other {
+                Ok(Err(err)) => err.to_string(),
+                _ => "dial timed out".to_string(),
+            };
+            debug!(
+                allocation_id = shared.allocation_id,
+                upstream = %shared.service,
+                proxy = %target.addr,
+                error = %err,
+                "Proxy handler dial failed"
+            );
+            shared.context.note_handler(
+                shared.allocation_id,
+                &target.source,
+                crate::structs::netpolicy::HANDLER_PROXY,
+                &target.addr,
+                Err(format!("dial {}: {err}", target.addr)),
+            );
+            net_metrics::connection("egress", PROTOCOL_TCP, "error");
+            let _ = client.shutdown().await;
+            return;
+        }
+    };
+    if target.proxy_protocol {
+        let header =
+            handlers::proxy_header(&shared.context, facts, client.peer_addr().ok(), destination);
+        if proxy.write_all(&header).await.is_err() {
+            net_metrics::connection("egress", PROTOCOL_TCP, "error");
+            let _ = client.shutdown().await;
+            return;
+        }
+    }
+    net_metrics::connection("egress", PROTOCOL_TCP, "allow");
+    splice(shared, &target.addr, client, proxy).await;
+}
+
+/// Dial a mesh endpoint: TLS with this node's certificate, verify the peer
+/// node, name the workload in a PROXY v2 header, then splice.
+async fn mesh_splice(
+    shared: &Arc<UpstreamShared>,
+    mut client: TcpStream,
+    upstream: TcpStream,
+    endpoint: &Endpoint,
+    facts: &HopFacts<'_>,
+) {
+    let Some(connector) = shared.context.mesh_connector() else {
+        debug!(
+            allocation_id = shared.allocation_id,
+            service = %shared.service,
+            endpoint = %endpoint.addr,
+            "Endpoint needs mesh TLS but this node holds no mesh certificate yet"
+        );
+        net_metrics::connection("egress", PROTOCOL_TCP, "error");
+        let _ = client.shutdown().await;
+        return;
+    };
+    let server_name = match crate::worker::netd::tls::server_name(
+        &crate::manager::mesh_ca::node_dns_name(&endpoint.node_id),
+    ) {
+        Ok(name) => name,
+        Err(err) => {
+            debug!(error = %err, "Mesh endpoint node name is not a valid server name");
+            net_metrics::connection("egress", PROTOCOL_TCP, "error");
+            let _ = client.shutdown().await;
+            return;
+        }
+    };
+    match tokio::time::timeout(DIAL_TIMEOUT, connector.connect(server_name, upstream)).await {
+        Ok(Ok(mut tls)) => {
+            let header = handlers::proxy_header(
+                &shared.context,
+                facts,
+                client.peer_addr().ok(),
+                endpoint.addr.parse().ok(),
+            );
+            if tls.write_all(&header).await.is_err() {
+                net_metrics::connection("egress", PROTOCOL_TCP, "error");
+                let _ = client.shutdown().await;
+                return;
+            }
+            net_metrics::connection("egress", PROTOCOL_TCP, "allow");
+            splice(shared, &endpoint.addr, client, tls).await;
+        }
+        Ok(Err(err)) => {
+            debug!(
+                allocation_id = shared.allocation_id,
+                service = %shared.service,
+                endpoint = %endpoint.addr,
+                error = ?err,
+                "Mesh TLS handshake failed"
+            );
+            net_metrics::connection("egress", PROTOCOL_TCP, "error");
+            let _ = client.shutdown().await;
+        }
+        Err(_) => {
+            net_metrics::connection("egress", PROTOCOL_TCP, "error");
+            let _ = client.shutdown().await;
+        }
+    }
+}
+
 async fn splice<U>(
     shared: &Arc<UpstreamShared>,
     destination: &str,
@@ -987,10 +1595,23 @@ async fn splice<U>(
 ) where
     U: AsyncRead + AsyncWrite + Unpin,
 {
+    let tag = shared
+        .endpoints()
+        .iter()
+        .find(|e| e.addr == destination)
+        .and_then(|e| e.tags.first().cloned());
     match tokio::io::copy_bidirectional(&mut client, &mut upstream).await {
         Ok((to_upstream, to_client)) => {
             net_metrics::bytes("egress", to_upstream);
             net_metrics::bytes("ingress", to_client);
+            shared.context.edges().record_bytes(
+                shared.allocation_id,
+                &shared.service,
+                tag.as_deref(),
+                PROTOCOL_TCP,
+                to_upstream,
+                to_client,
+            );
             debug!(
                 service = %shared.service,
                 endpoint = %destination,
@@ -1069,6 +1690,7 @@ mod tests {
             allocation_id: 1,
             node_id: "node-a".into(),
             tags: Vec::new(),
+            mesh_tls: false,
         }
     }
 

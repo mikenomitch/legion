@@ -380,6 +380,17 @@ pub struct DeclaredService {
     pub meta: BTreeMap<String, String>,
 }
 
+/// A task that declares `connect.upstreams` in its job's latest config —
+/// the declared half of a service-graph edge (docs/network-handlers.md,
+/// "Service graph").
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DeclaredConsumer {
+    pub job_id: String,
+    pub task_name: String,
+    pub upstreams: Vec<crate::structs::UpstreamConfig>,
+}
+
 /// What [`Store::plan_capacity_snapshot`] hands the scheduler: current
 /// allocations by node plus the cached free pools, cloned under one guard,
 /// and the read-model generation those were published at (the lazy
@@ -10976,6 +10987,78 @@ impl Store {
             .any(|policy| policy.ingress.is_some() && policy.selector.matches(&facts)))
     }
 
+    /// How the allocation's advertised ports terminate TLS — `legion`,
+    /// `byo`, or none — from the effective ingress chain the same merge the
+    /// heartbeat runs would produce for this (job, task, node). Resolved at
+    /// placement because the catalog projection reads it off the allocation
+    /// row for every consumer's endpoint feed.
+    fn ingress_tls_at_placement(
+        &self,
+        tx: &Connection,
+        node_id: &str,
+        task_id: i64,
+        network: Option<&crate::structs::NetworkConfig>,
+    ) -> R<Option<String>> {
+        let (runtime, job_id): (String, String) = match tx
+            .query_row(
+                "SELECT runtime, job_id FROM task_config WHERE id = ?;",
+                [task_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?
+        {
+            Some(row) => row,
+            None => return Ok(None),
+        };
+        let matching: Vec<crate::structs::netpolicy::NetPolicyObject> =
+            if self.net_policy_generation().unwrap_or(0) > 0 {
+                let pool: Option<String> = tx
+                    .query_row("SELECT pool FROM node WHERE id = ?;", [node_id], |row| {
+                        row.get(0)
+                    })
+                    .optional()?;
+                let facts = crate::structs::netpolicy::NetSelectorFacts {
+                    node_pool: pool,
+                    namespace: String::new(),
+                    runtime,
+                    job: job_id,
+                    labels: network.map(|n| n.labels.clone()).unwrap_or_default(),
+                };
+                self.list_net_policies()?
+                    .into_iter()
+                    .map(|record| record.object)
+                    .filter(|policy| policy.selector.matches(&facts))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+        let effective = crate::structs::netpolicy::merge_policies(
+            &matching,
+            crate::structs::netpolicy::InlinePolicy {
+                mode: None,
+                egress: None,
+                ingress: network.and_then(|n| n.ingress.as_ref()),
+            },
+        );
+        Ok(effective
+            .ingress
+            .as_ref()
+            .and_then(|chain| chain.tls.as_ref())
+            .filter(|tls| {
+                matches!(
+                    tls.mode.as_str(),
+                    crate::structs::netpolicy::TLS_SERVER | crate::structs::netpolicy::TLS_MUTUAL
+                )
+            })
+            .map(|tls| {
+                if tls.cert_from.as_deref() == Some("legion") {
+                    "legion".to_string()
+                } else {
+                    "byo".to_string()
+                }
+            }))
+    }
+
     /// The `network.mode` an allocation runs in: the task's declared mode
     /// (`auto` resolved per runtime), overridden by the highest-priority
     /// matching `require` policy that sets one. Resolved at placement — a
@@ -11154,12 +11237,18 @@ impl Store {
             .and_then(|attrs| worker_address_host(&attrs));
 
         let mode = self.effective_network_mode(tx, node_id, task_id, network.as_ref())?;
+        let ingress_tls = if has_ingress {
+            self.ingress_tls_at_placement(tx, node_id, task_id, network.as_ref())?
+        } else {
+            None
+        };
         Ok(Some(crate::structs::AllocNetwork {
             address,
             ports,
             upstreams,
             vip_block,
             mode,
+            ingress_tls,
         }))
     }
 
@@ -12416,6 +12505,9 @@ impl Store {
                 allow: service.allow.clone(),
                 meta: service.meta_strings(),
                 port_label: service.port_label().map(str::to_string),
+                mesh_tls: network
+                    .as_ref()
+                    .is_some_and(|network| network.ingress_tls.as_deref() == Some("legion")),
             });
         }
 
@@ -12458,6 +12550,45 @@ impl Store {
             });
         }
         Ok(declared)
+    }
+
+    /// Every task in the latest config of every job that declares
+    /// `connect.upstreams` — the declared half of the service graph.
+    pub fn declared_consumers(&self) -> R<Vec<DeclaredConsumer>> {
+        let conn = self.read_connection()?;
+        let mut stmt = conn.prepare(
+            "SELECT tc.name, tc.connect, tc.job_id
+             FROM task_config tc
+             INNER JOIN job_config jc ON jc.id = tc.job_config_id
+             INNER JOIN (
+                 SELECT job_id, MAX(version) AS version FROM job_config GROUP BY job_id
+             ) latest ON latest.job_id = jc.job_id AND latest.version = jc.version
+             WHERE tc.connect IS NOT NULL;",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (task_name, connect_raw, job_id) = row?;
+            let connect: crate::structs::ConnectConfig = match from_str(&connect_raw) {
+                Ok(connect) => connect,
+                Err(_) => continue,
+            };
+            if connect.upstreams.is_empty() {
+                continue;
+            }
+            out.push(DeclaredConsumer {
+                job_id,
+                task_name,
+                upstreams: connect.upstreams,
+            });
+        }
+        Ok(out)
     }
 
     pub fn allocation_health_for_job_config(

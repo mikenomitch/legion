@@ -829,6 +829,12 @@ impl WorkerTaskManager {
         Some((root, self.alloc_dir(allocation_id).join(task_name)))
     }
 
+    /// The host task directory (`allocs/<alloc>/<task>/`), whether or not
+    /// the task has started yet.
+    pub fn task_dir_for(&self, allocation_id: i64, task_name: &str) -> PathBuf {
+        self.alloc_dir(allocation_id).join(task_name)
+    }
+
     fn cleanup_alloc_dir(&self, allocation_id: i64) {
         let dir = self.alloc_dir(allocation_id);
         if dir.exists() {
@@ -3953,6 +3959,7 @@ mod tests {
                 ],
                 vip_block: None,
                 mode: None,
+                ingress_tls: None,
             }),
             ..alloc()
         };

@@ -20,11 +20,15 @@
 //! setup and teardown. Nothing here reaches into the heartbeat loop.
 
 pub mod dns;
+pub mod graph;
+pub mod handlers;
 pub mod http;
 pub mod ingress;
 pub mod netns;
 pub mod policy;
 pub mod proxy;
+pub mod proxyproto;
+pub mod tls;
 
 pub use policy::{Denials, NetPolicyCache, PolicyLookup};
 
@@ -47,5 +51,14 @@ pub mod metrics {
         crate::manager::telemetry::worker_metrics()
             .net_bytes_total
             .inc_by(&[direction], count);
+    }
+
+    /// One external handler call: `outcome` is allow|deny|proxy|error.
+    pub fn handler(handler: &str, outcome: &str, seconds: f64) {
+        let metrics = crate::manager::telemetry::worker_metrics();
+        metrics.net_handler_total.inc(&[handler, outcome]);
+        if seconds > 0.0 {
+            metrics.net_handler_seconds.observe(seconds);
+        }
     }
 }

@@ -93,6 +93,7 @@ fn endpoint_table() -> Vec<(&'static str, Plane)> {
         ("RunJobTemplate", Plane::Protected("job:write")),
         ("DeleteJobTemplate", Plane::Protected("template:write")),
         ("ListServices", Plane::Protected("job:read")),
+        ("ListServiceEdges", Plane::Protected("job:read")),
         ("ResolveService", Plane::Protected("job:read")),
         ("UpsertNetPolicy", Plane::Protected("net:write")),
         ("GetNetPolicyObject", Plane::Protected("net:read")),
@@ -100,6 +101,8 @@ fn endpoint_table() -> Vec<(&'static str, Plane)> {
         ("DeleteNetPolicy", Plane::Protected("net:write")),
         ("ShowNetPolicy", Plane::Protected("net:read")),
         ("TestNetPolicy", Plane::Protected("net:read")),
+        ("GetMeshCa", Plane::Protected("net:read")),
+        ("RotateMeshCa", Plane::Protected("net:write")),
         ("FetchNetPolicy", Plane::Worker),
         ("GetNodes", Plane::Protected("node:read")),
         ("GetHeartbeatCadence", Plane::Protected("node:read")),
@@ -145,6 +148,7 @@ fn endpoint_table() -> Vec<(&'static str, Plane)> {
         ("ListVolumeDrivers", Plane::Protected("node:read")),
         ("IssueWorkloadIdentityToken", Plane::Worker),
         ("IssueNodeIdentityToken", Plane::Worker),
+        ("IssueNodeCertificate", Plane::Worker),
         ("GetAllocationLogs", Plane::Protected("job:read")),
         ("ExecAllocation", Plane::Protected("exec:write")),
         ("ListJobActions", Plane::Protected("job:read")),
@@ -495,6 +499,10 @@ async fn call_endpoint(
             .list_services(req(ListServicesRequest::default(), token))
             .await
             .map(|_| ()),
+        "ListServiceEdges" => svc
+            .list_service_edges(req(ListServiceEdgesRequest::default(), token))
+            .await
+            .map(|_| ()),
         "ResolveService" => svc
             .resolve_service(req(ResolveServiceRequest::default(), token))
             .await
@@ -551,6 +559,14 @@ async fn call_endpoint(
                 },
                 token,
             ))
+            .await
+            .map(|_| ()),
+        "GetMeshCa" => svc
+            .get_mesh_ca(req(GetMeshCaRequest {}, token))
+            .await
+            .map(|_| ()),
+        "RotateMeshCa" => svc
+            .rotate_mesh_ca(req(RotateMeshCaRequest {}, token))
             .await
             .map(|_| ()),
         "FetchNetPolicy" => svc
@@ -879,6 +895,15 @@ async fn call_endpoint(
                 IssueWorkloadIdentityTokenRequest {
                     alloc_id: 1,
                     identity_name: "default".into(),
+                    node_id: NODE_ID.into(),
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "IssueNodeCertificate" => svc
+            .issue_node_certificate(req(
+                IssueNodeCertificateRequest {
                     node_id: NODE_ID.into(),
                 },
                 token,

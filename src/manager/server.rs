@@ -39,13 +39,14 @@ use crate::structs::{
     GetJobSpecByConfigRequest, GetJobSpecReply, GetJobSpecRequest, GetJobTemplateReply,
     GetJobTemplateRequest, GetKvLockReply, GetKvLockRequest, GetKvReply, GetKvRequest,
     GetLedgerReply, GetLedgerRequest, GetManagerConfigsReply, GetManagerConfigsRequest,
-    GetNodeReply, GetNodeRequest, GetNodesReply, GetNodesRequest, GetObservabilityReply,
-    GetObservabilityRequest, GetRaftJoinTokenReply, GetRaftJoinTokenRequest, GetRaftStatusReply,
-    GetRaftStatusRequest, GetRolloutReply, GetRolloutRequest, GetRolloutStatusReply,
-    GetRolloutStatusRequest, GetStateBackupReply, GetStateBackupRequest, GetStateStoreSchemaReply,
-    GetStateStoreSchemaRequest, GetTaskLogsRequest, GetVolumeReply, GetVolumeRequest,
-    HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, Instance, InstanceInfo,
-    InstanceMode, InstanceState, IssueBootTicketReply, IssueBootTicketRequest,
+    GetMeshCaReply, GetMeshCaRequest, GetNodeReply, GetNodeRequest, GetNodesReply, GetNodesRequest,
+    GetObservabilityReply, GetObservabilityRequest, GetRaftJoinTokenReply, GetRaftJoinTokenRequest,
+    GetRaftStatusReply, GetRaftStatusRequest, GetRolloutReply, GetRolloutRequest,
+    GetRolloutStatusReply, GetRolloutStatusRequest, GetStateBackupReply, GetStateBackupRequest,
+    GetStateStoreSchemaReply, GetStateStoreSchemaRequest, GetTaskLogsRequest, GetVolumeReply,
+    GetVolumeRequest, HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest,
+    Instance, InstanceInfo, InstanceMode, InstanceState, IssueBootTicketReply,
+    IssueBootTicketRequest, IssueNodeCertificateReply, IssueNodeCertificateRequest,
     IssueNodeIdentityTokenReply, IssueNodeIdentityTokenRequest, IssueRaftCommandReply,
     IssueRaftCommandRequest, IssueWorkloadIdentityTokenReply, IssueWorkloadIdentityTokenRequest,
     JobConfig, JobSpecHistoryItem, JobTemplate, JobTemplateProvenance, JobTemplateSummary,
@@ -56,23 +57,25 @@ use crate::structs::{
     ListJobTemplatesRequest, ListJobsReply, ListJobsRequest, ListKvReply, ListKvRequest,
     ListRaftHistoryReply, ListRaftHistoryRequest, ListRolloutEventsReply, ListRolloutEventsRequest,
     ListRolloutsReply, ListRolloutsRequest, ListSavedStateQueriesReply,
-    ListSavedStateQueriesRequest, ListServicesReply, ListServicesRequest, ListVolumeDriversReply,
-    ListVolumeDriversRequest, ListVolumesReply, ListVolumesRequest, Node, NodeMsg, PatchKvReply,
-    PatchKvRequest, PlanJobReply, PlanJobRequest, PlannedAllocation, PutKvReply, PutKvRequest,
+    ListSavedStateQueriesRequest, ListServiceEdgesReply, ListServiceEdgesRequest,
+    ListServicesReply, ListServicesRequest, ListVolumeDriversReply, ListVolumeDriversRequest,
+    ListVolumesReply, ListVolumesRequest, Node, NodeMsg, PatchKvReply, PatchKvRequest,
+    PlanJobReply, PlanJobRequest, PlannedAllocation, PutKvReply, PutKvRequest,
     QueryStateStoreReply, QueryStateStoreRequest, RaftHistoryEvent, RaftStatus, RatifyClaimReply,
     RatifyClaimRequest, ReleaseKvLockReply, ReleaseKvLockRequest, RenderJobTemplateReply,
     RenderJobTemplateRequest, RenewKvLockReply, RenewKvLockRequest, ReplaceInstanceReply,
     ReplaceInstanceRequest, ResolveServiceReply, ResolveServiceRequest, RestartWorkerReply,
     RestartWorkerRequest, RolloutAllocationStatus, RolloutEvent, RolloutGroupStatus,
-    RolloutProgression, RolloutReplacement, RunJobReply, RunJobRequest, RunJobTemplateReply,
-    RunJobTemplateRequest, SavedStateQuery, ScaleTaskReply, ScaleTaskRequest, SchedulerEvent,
-    ServiceEndpoint, ServiceSummary, SetNodeAvailabilityReply, SetNodeAvailabilityRequest,
-    StartInstanceReply, StartInstanceRequest, StopInstanceReply, StopInstanceRequest, StopJobReply,
-    StopJobRequest, StopNotice, StopRolloutReply, StopRolloutRequest, StreamEventsRequest,
-    Submission, TaskConfig, TaskOnUnhealthyConfig, TaskScaleStatus, UpdateNodeDynamicReply,
-    UpdateNodeDynamicRequest, UpsertJobTemplateReply, UpsertJobTemplateRequest,
-    UpsertSavedStateQueryReply, UpsertSavedStateQueryRequest, WorkerConfig, WorkerPreRegisterReply,
-    WorkerPreRegisterRequest, WorkerRegisterReply, WorkerRegisterRequest,
+    RolloutProgression, RolloutReplacement, RotateMeshCaReply, RotateMeshCaRequest, RunJobReply,
+    RunJobRequest, RunJobTemplateReply, RunJobTemplateRequest, SavedStateQuery, ScaleTaskReply,
+    ScaleTaskRequest, SchedulerEvent, ServiceEdge, ServiceEndpoint, ServiceSummary,
+    SetNodeAvailabilityReply, SetNodeAvailabilityRequest, StartInstanceReply, StartInstanceRequest,
+    StopInstanceReply, StopInstanceRequest, StopJobReply, StopJobRequest, StopNotice,
+    StopRolloutReply, StopRolloutRequest, StreamEventsRequest, Submission, TaskConfig,
+    TaskOnUnhealthyConfig, TaskScaleStatus, UpdateNodeDynamicReply, UpdateNodeDynamicRequest,
+    UpsertJobTemplateReply, UpsertJobTemplateRequest, UpsertSavedStateQueryReply,
+    UpsertSavedStateQueryRequest, WorkerConfig, WorkerPreRegisterReply, WorkerPreRegisterRequest,
+    WorkerRegisterReply, WorkerRegisterRequest,
 };
 use crate::structs::{
     AllocNetPolicy, DeleteNetPolicyReply, DeleteNetPolicyRequest, FetchNetPolicyReply,
@@ -1106,6 +1109,11 @@ pub struct ManagerDaemonService {
     /// re-read at most every `NET_POLICY_GENERATION_TTL`, so a cluster with
     /// no policies pays a mutex read per heartbeat rather than a query.
     net_policy_generation: Arc<Mutex<Option<(std::time::Instant, u64)>>>,
+    /// The service graph: per (caller job, caller task, service, tag), the
+    /// last 15 minutes of per-minute buckets folded from every node's
+    /// `net_edges` heartbeat samples. In memory: a failover loses at most the
+    /// window, and the next heartbeats refill it.
+    net_edges: Arc<Mutex<HashMap<EdgeKey, EdgeWindow>>>,
     /// The datapath status each node last reported for its allocations
     /// (docs/network-handlers.md). In memory like `provisional_claims`: it
     /// is at most one heartbeat stale and a failover shows nothing until
@@ -1148,6 +1156,7 @@ impl ManagerDaemonService {
             net_policy_cache: Arc::new(Mutex::new(HashMap::new())),
             net_policy_generation: Arc::new(Mutex::new(None)),
             net_status: Arc::new(Mutex::new(HashMap::new())),
+            net_edges: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -5127,6 +5136,99 @@ impl Manager for ManagerDaemonService {
         }))
     }
 
+    async fn get_mesh_ca(
+        &self,
+        request: Request<GetMeshCaRequest>,
+    ) -> Result<Response<GetMeshCaReply>, Status> {
+        self.check_acl(&request, AclResource::Net, AclAction::Read, AclScope::any())?;
+        let ca = self
+            .store
+            .mesh_ca()
+            .map_err(|e| map_store_error("Error reading the mesh CA", e))?;
+        Ok(Response::new(match ca {
+            Some(ca) => GetMeshCaReply {
+                cert_pem: ca.cert_pem,
+                created_at: ca.created_at,
+            },
+            None => GetMeshCaReply::default(),
+        }))
+    }
+
+    async fn rotate_mesh_ca(
+        &self,
+        request: Request<RotateMeshCaRequest>,
+    ) -> Result<Response<RotateMeshCaReply>, Status> {
+        let identity = self.check_acl(
+            &request,
+            AclResource::Net,
+            AclAction::Write,
+            AclScope::any(),
+        )?;
+        let ca = self
+            .store
+            .rotate_mesh_ca()
+            .map_err(|e| map_store_error("Error rotating the mesh CA", e))?;
+        info!(
+            accessor = identity.accessor_id.as_deref().unwrap_or("-"),
+            "Rotated the mesh CA; nodes re-issue on their next heartbeat"
+        );
+        Ok(Response::new(RotateMeshCaReply {
+            cert_pem: ca.cert_pem,
+            created_at: ca.created_at,
+        }))
+    }
+
+    #[instrument(skip_all, fields(node_id))]
+    async fn issue_node_certificate(
+        &self,
+        request: Request<IssueNodeCertificateRequest>,
+    ) -> Result<Response<IssueNodeCertificateReply>, Status> {
+        // ACL: worker-plane endpoint. Node ownership is bound to the
+        // authenticated principal (same trust model as node identity tokens).
+        let identity = self.authenticate_acl(&request)?;
+        acl::enforce_worker_plane(&identity)?;
+        let caller_is_management = identity.is_management;
+        let caller_principal = identity.principal.clone();
+        let audit_only = identity.audit_only;
+        let req = request.into_inner();
+        tracing::Span::current().record("node_id", req.node_id.as_str());
+        if !caller_is_management && caller_principal != format!("node:{}", req.node_id) {
+            if audit_only {
+                warn!(
+                    target: "acl_audit",
+                    principal = %caller_principal,
+                    node_id = %req.node_id,
+                    "audit-only: a certificate for another node would have been refused"
+                );
+            } else {
+                return Err(Status::permission_denied(format!(
+                    "worker {caller_principal:?} may not request a certificate for node {:?}",
+                    req.node_id
+                )));
+            }
+        }
+        self.store
+            .get_node(&req.node_id)
+            .map_err(|_| Status::not_found(format!("node {:?} is not registered", req.node_id)))?;
+        let ca = self
+            .store
+            .ensure_mesh_ca()
+            .map_err(|e| map_store_error("Error creating the mesh CA", e))?;
+        let (cert_pem, key_pem, expires_at) =
+            crate::manager::mesh_ca::issue_node_cert(&ca.cert_pem, &ca.key_pem, &req.node_id)
+                .map_err(|e| {
+                    error!(error = ?e, "Error signing a node certificate");
+                    Status::internal("failed to sign the node certificate")
+                })?;
+        info!(node_id = %req.node_id, expires_at, "Issued mesh node certificate");
+        Ok(Response::new(IssueNodeCertificateReply {
+            cert_pem,
+            key_pem,
+            ca_pem: ca.cert_pem,
+            expires_at,
+        }))
+    }
+
     #[instrument(skip_all, fields(node_id, identity_name))]
     async fn issue_node_identity_token(
         &self,
@@ -5270,11 +5372,14 @@ impl Manager for ManagerDaemonService {
         // (no store access at all) when no desired allocation uses connect, and
         // is infallible by construction: a connect-layer problem must never
         // stop this node from reconciling its allocations.
-        let upstream_endpoints = build_upstream_endpoints(&self.store, &desired_allocations);
+        let mut upstream_endpoints = build_upstream_endpoints(&self.store, &desired_allocations);
         // Effective network policy per desired allocation, as content hashes.
         // Same contract as the endpoint feed: no store access when no policy
         // exists and no task declares one; never fails the heartbeat.
         let net_policies = self.build_net_policies(&id, &desired_allocations);
+        // `proxy` handler targets ride the same feed, flagged `for_handler`.
+        upstream_endpoints
+            .extend(self.build_handler_endpoints(&desired_allocations, &net_policies));
         // Denials the node's datapath recorded, turned into events so "which
         // rule blocked it" is answerable without node access.
         for denial in &req.net_denials {
@@ -5288,6 +5393,14 @@ impl Manager for ManagerDaemonService {
             } else {
                 status.insert(id.clone(), req.net_status.clone());
             }
+        }
+        // Service-graph samples: fold into per-(caller, service) windows.
+        if !req.net_edges.is_empty() {
+            let callers: HashMap<i64, (String, String)> = desired_allocations
+                .iter()
+                .map(|a| (a.allocation_id, (a.job_id.clone(), a.task_name.clone())))
+                .collect();
+            self.fold_net_edges(&req.net_edges, &callers);
         }
         // Reclaim work for this node. Re-sent every heartbeat until the worker
         // confirms, so a worker that dies mid-destroy simply retries.
@@ -6560,6 +6673,131 @@ impl Manager for ManagerDaemonService {
     }
 
     #[instrument(skip_all)]
+    async fn list_service_edges(
+        &self,
+        request: Request<ListServiceEdgesRequest>,
+    ) -> Result<Response<ListServiceEdgesReply>, Status> {
+        // Like the catalog, a projection over jobs and allocations: job:read.
+        self.check_acl(&request, AclResource::Job, AclAction::Read, AclScope::any())?;
+        let req = request.into_inner();
+        let window_secs = if req.window_secs == 0 {
+            300
+        } else {
+            req.window_secs.clamp(60, (EDGE_WINDOW_MINUTES * 60) as u32)
+        };
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let since_minute = now / 60 - i64::from(window_secs / 60);
+
+        // Observed edges. `latency_ms_avg` accumulates the sum until the
+        // division below.
+        let mut edges: std::collections::BTreeMap<EdgeKey, ServiceEdge> =
+            std::collections::BTreeMap::new();
+        {
+            let windows = self.net_edges.lock().unwrap_or_else(|p| p.into_inner());
+            for ((job, task, service, tag), window) in windows.iter() {
+                let mut edge = ServiceEdge {
+                    caller_job: job.clone(),
+                    caller_task: task.clone(),
+                    service: service.clone(),
+                    tag: tag.clone(),
+                    protocol: window.protocol.clone(),
+                    allowed: true,
+                    last_seen_unix: window.last_seen,
+                    ..Default::default()
+                };
+                for bucket in window.buckets.iter().filter(|b| b.minute >= since_minute) {
+                    edge.requests += bucket.requests;
+                    edge.errors += bucket.errors;
+                    edge.denied += bucket.denied;
+                    edge.latency_ms_avg += bucket.latency_ms_sum as f64;
+                    edge.latency_ms_max = edge.latency_ms_max.max(bucket.latency_ms_max);
+                    edge.bytes_out += bucket.bytes_out;
+                    edge.bytes_in += bucket.bytes_in;
+                }
+                edges.insert(
+                    (job.clone(), task.clone(), service.clone(), tag.clone()),
+                    edge,
+                );
+            }
+        }
+
+        // Declared edges, and the allow verdict for every edge.
+        let allow_by_service: HashMap<String, Vec<String>> = self
+            .store
+            .declared_services()
+            .map_err(|e| map_store_error("Error listing declared services", e))?
+            .into_iter()
+            .map(|s| (s.service, s.allow))
+            .collect();
+        let consumers = self
+            .store
+            .declared_consumers()
+            .map_err(|e| map_store_error("Error listing declared consumers", e))?;
+        for consumer in consumers {
+            for upstream in &consumer.upstreams {
+                let service = upstream.key().to_string();
+                // Tagged observed edges for the same (caller, service) are
+                // declared too.
+                let mut any = false;
+                for ((job, task, svc, _), edge) in edges.iter_mut() {
+                    if *job == consumer.job_id && *task == consumer.task_name && *svc == service {
+                        edge.declared = true;
+                        any = true;
+                    }
+                }
+                if !any {
+                    edges.insert(
+                        (
+                            consumer.job_id.clone(),
+                            consumer.task_name.clone(),
+                            service.clone(),
+                            String::new(),
+                        ),
+                        ServiceEdge {
+                            caller_job: consumer.job_id.clone(),
+                            caller_task: consumer.task_name.clone(),
+                            service,
+                            declared: true,
+                            allowed: true,
+                            ..Default::default()
+                        },
+                    );
+                }
+            }
+        }
+        let secs = f64::from(window_secs);
+        for ((job, _, service, _), edge) in edges.iter_mut() {
+            if let Some(allow) = allow_by_service.get(service) {
+                edge.allowed = crate::structs::allow_permits(allow, job);
+            }
+            edge.rps = edge.requests as f64 / secs;
+            edge.error_rate = if edge.requests + edge.errors > 0 {
+                edge.errors as f64 / (edge.requests + edge.errors) as f64
+            } else {
+                0.0
+            };
+            if edge.requests > 0 {
+                edge.latency_ms_avg /= edge.requests as f64;
+            }
+        }
+        let filter = req.service.trim();
+        let mut out: Vec<ServiceEdge> = edges
+            .into_values()
+            .filter(|edge| filter.is_empty() || edge.service == filter || edge.caller_job == filter)
+            .collect();
+        out.sort_by(|a, b| {
+            a.service
+                .cmp(&b.service)
+                .then_with(|| a.caller_job.cmp(&b.caller_job))
+                .then_with(|| a.caller_task.cmp(&b.caller_task))
+                .then_with(|| a.tag.cmp(&b.tag))
+        });
+        Ok(Response::new(ListServiceEdgesReply {
+            edges: out,
+            window_secs,
+        }))
+    }
+
     async fn list_services(
         &self,
         request: Request<ListServicesRequest>,
@@ -6647,6 +6885,7 @@ impl Manager for ManagerDaemonService {
                 tags: endpoint.tags,
                 meta: endpoint.meta.into_iter().collect(),
                 port_label: endpoint.port_label.unwrap_or_default(),
+                mesh_tls: endpoint.mesh_tls,
             })
             .collect();
 
@@ -8759,6 +8998,158 @@ impl ManagerDaemonService {
 
     /// The datapath status nodes last reported for this task's running
     /// allocations, as JSON, for `net doctor` and the UI.
+    /// Endpoint lists for every `proxy` handler target (`service` or `node`)
+    /// on the desired allocations' effective chains and upstreams, so the
+    /// datapath can hand a flow to an external proxy without a listener of
+    /// its own. Empty on nodes with no handler anywhere — the common case
+    /// costs one pass over the policy hashes.
+    fn build_handler_endpoints(
+        &self,
+        desired: &[crate::structs::TaskAllocation],
+        policies: &[crate::structs::AllocNetPolicy],
+    ) -> Vec<crate::structs::UpstreamEndpoints> {
+        use crate::structs::netpolicy::HANDLER_PROXY;
+        let mut wanted: Vec<(i64, String, String)> = Vec::new();
+        let by_alloc: HashMap<i64, &str> = policies
+            .iter()
+            .map(|p| (p.allocation_id, p.policy_hash.as_str()))
+            .collect();
+        for allocation in desired {
+            let mut services: Vec<String> = Vec::new();
+            if let Some(hash) = by_alloc.get(&allocation.allocation_id) {
+                let cached = {
+                    let cache = self
+                        .net_policy_cache
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner());
+                    cache.get(*hash).cloned()
+                };
+                if let Some(policy) = cached {
+                    for chain in [policy.egress.as_ref(), policy.ingress.as_ref()]
+                        .into_iter()
+                        .flatten()
+                    {
+                        for hop in &chain.handlers {
+                            if hop.handler.handler == HANDLER_PROXY {
+                                if let Some(service) =
+                                    hop.handler.service.as_ref().or(hop.handler.node.as_ref())
+                                {
+                                    services.push(service.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if !allocation.task_connect.trim().is_empty() {
+                if let Ok(connect) =
+                    serde_json::from_str::<crate::structs::ConnectConfig>(&allocation.task_connect)
+                {
+                    for upstream in &connect.upstreams {
+                        for hop in &upstream.handlers {
+                            if hop.handler == HANDLER_PROXY {
+                                if let Some(service) = hop.service.as_ref().or(hop.node.as_ref()) {
+                                    services.push(service.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            services.sort();
+            services.dedup();
+            for service in services {
+                wanted.push((allocation.allocation_id, service, allocation.job_id.clone()));
+            }
+        }
+        if wanted.is_empty() {
+            return Vec::new();
+        }
+        let mut resolved: HashMap<String, Vec<crate::structs::ServiceEndpointRow>> = HashMap::new();
+        let mut out = Vec::new();
+        for (allocation_id, service, job_id) in wanted {
+            if !resolved.contains_key(&service) {
+                let rows = self
+                    .store
+                    .service_endpoints(Some(&service))
+                    .unwrap_or_default();
+                resolved.insert(service.clone(), rows);
+            }
+            let endpoints = resolved[&service]
+                .iter()
+                .filter(|row| row.healthy && crate::structs::allow_permits(&row.allow, &job_id))
+                .map(|row| ServiceEndpoint {
+                    service: row.service.clone(),
+                    job_id: row.job_id.clone(),
+                    task_name: row.task_name.clone(),
+                    allocation_id: row.allocation_id,
+                    node_id: row.node_id.clone(),
+                    address: row.address.clone().unwrap_or_default(),
+                    port: u32::from(row.port.unwrap_or(0)),
+                    healthy: row.healthy,
+                    health_status: row.health_status.clone(),
+                    tags: row.tags.clone(),
+                    meta: row.meta.clone().into_iter().collect(),
+                    port_label: row.port_label.clone().unwrap_or_default(),
+                    mesh_tls: row.mesh_tls,
+                })
+                .collect();
+            out.push(crate::structs::UpstreamEndpoints {
+                allocation_id,
+                service,
+                endpoints,
+                for_handler: true,
+            });
+        }
+        out
+    }
+
+    /// Fold one node's edge samples into the graph windows.
+    fn fold_net_edges(
+        &self,
+        samples: &[crate::structs::NetEdgeSample],
+        callers: &HashMap<i64, (String, String)>,
+    ) {
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let minute = now / 60;
+        let mut edges = self.net_edges.lock().unwrap_or_else(|p| p.into_inner());
+        for sample in samples {
+            let Some((job, task)) = callers.get(&sample.allocation_id) else {
+                continue;
+            };
+            let key = (
+                job.clone(),
+                task.clone(),
+                sample.service.clone(),
+                sample.tag.clone(),
+            );
+            let window = edges.entry(key).or_default();
+            if !sample.protocol.is_empty() {
+                window.protocol = sample.protocol.clone();
+            }
+            window.last_seen = now;
+            if window.buckets.back().is_none_or(|b| b.minute != minute) {
+                window.buckets.push_back(EdgeBucket {
+                    minute,
+                    ..Default::default()
+                });
+                while window.buckets.len() as i64 > EDGE_WINDOW_MINUTES {
+                    window.buckets.pop_front();
+                }
+            }
+            let bucket = window.buckets.back_mut().expect("bucket just pushed");
+            bucket.requests += sample.requests;
+            bucket.errors += sample.errors;
+            bucket.denied += sample.denied;
+            bucket.latency_ms_sum += sample.latency_ms_sum;
+            bucket.latency_ms_max = bucket.latency_ms_max.max(sample.latency_ms_max);
+            bucket.bytes_out += sample.bytes_out;
+            bucket.bytes_in += sample.bytes_in;
+        }
+        // Idle edges age out with their last bucket.
+        edges.retain(|_, window| now - window.last_seen <= EDGE_WINDOW_MINUTES * 60);
+    }
+
     fn net_status_for_task(&self, job_id: &str, task_name: &str) -> Vec<String> {
         let Ok(allocations) = self.store.allocs_for_job(job_id) else {
             return Vec::new();
@@ -8891,6 +9282,31 @@ fn enforce_net_policy_scope(
 }
 
 /// A `NetAllocStatus` as the JSON the CLI and UI read.
+/// (caller job, caller task, service, tag).
+type EdgeKey = (String, String, String, String);
+
+/// Minutes of per-minute buckets the manager keeps per edge.
+const EDGE_WINDOW_MINUTES: i64 = 15;
+
+#[derive(Debug, Default, Clone)]
+struct EdgeBucket {
+    minute: i64,
+    requests: u64,
+    errors: u64,
+    denied: u64,
+    latency_ms_sum: u64,
+    latency_ms_max: u64,
+    bytes_out: u64,
+    bytes_in: u64,
+}
+
+#[derive(Debug, Default, Clone)]
+struct EdgeWindow {
+    protocol: String,
+    last_seen: i64,
+    buckets: std::collections::VecDeque<EdgeBucket>,
+}
+
 fn net_status_json(node_id: &str, status: &crate::structs::NetAllocStatus) -> Value {
     json!({
         "nodeId": node_id,
@@ -8904,6 +9320,18 @@ fn net_status_json(node_id: &str, status: &crate::structs::NetAllocStatus) -> Va
         "proxyReady": status.proxy_ready,
         "gateShut": status.gate_shut,
         "problems": status.problems,
+        "handlers": status.handlers.iter().map(|h| json!({
+            "source": h.source,
+            "handler": h.handler,
+            "target": h.target,
+            "healthy": h.healthy,
+            "lastError": h.last_error,
+            "calls": h.calls,
+            "errors": h.errors,
+        })).collect::<Vec<_>>(),
+        "tlsReady": status.tls_ready,
+        "tlsError": status.tls_error,
+        "meshIdentity": status.mesh_identity,
     })
 }
 
@@ -9036,6 +9464,7 @@ fn build_upstream_endpoints(
                         tags: row.tags,
                         meta: row.meta.into_iter().collect(),
                         port_label: row.port_label.unwrap_or_default(),
+                        mesh_tls: row.mesh_tls,
                     })
                     .collect::<Vec<_>>();
                 resolved.insert(key.clone(), endpoints);
@@ -9051,6 +9480,7 @@ fn build_upstream_endpoints(
                 allocation_id: allocation.allocation_id,
                 service: upstream.service.clone(),
                 endpoints,
+                for_handler: false,
             });
         }
     }

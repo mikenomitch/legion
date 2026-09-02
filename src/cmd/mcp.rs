@@ -29,15 +29,15 @@ use crate::structs::{
     exec_client_frame, exec_server_frame, CreateInstanceRequest, CreateInstancesRequest,
     DeleteJobTemplateRequest, DeleteVolumeRequest, DestroyInstanceRequest, DestroyJobRequest,
     ExecClientFrame, ExecInput, ExecStart, GetAllocationLogsRequest, GetInstanceRequest,
-    GetJobInfoRequest, GetJobSpecRequest, GetJobTemplateRequest, GetLedgerRequest, GetNodesRequest,
-    GetRolloutStatusRequest, GetStateStoreSchemaRequest, GetVolumeRequest, JobConfig,
-    ListEventsRequest, ListInstancesRequest, ListJobActionsRequest, ListJobTemplatesRequest,
-    ListJobsRequest, ListNetPoliciesRequest, ListRolloutsRequest, ListServicesRequest,
-    ListVolumeDriversRequest, ListVolumesRequest, PlanJobRequest, QueryStateStoreRequest,
-    RenderJobTemplateRequest, ReplaceInstanceRequest, ResolveServiceRequest, RunJobRequest,
-    RunJobTemplateRequest, SetNodeAvailabilityRequest, ShowNetPolicyRequest, StartInstanceRequest,
-    StopInstanceRequest, StopJobRequest, TestNetPolicyRequest, UpsertJobTemplateRequest,
-    UpsertNetPolicyRequest,
+    GetJobInfoRequest, GetJobSpecRequest, GetJobTemplateRequest, GetLedgerRequest,
+    GetMeshCaRequest, GetNodesRequest, GetRolloutStatusRequest, GetStateStoreSchemaRequest,
+    GetVolumeRequest, JobConfig, ListEventsRequest, ListInstancesRequest, ListJobActionsRequest,
+    ListJobTemplatesRequest, ListJobsRequest, ListNetPoliciesRequest, ListRolloutsRequest,
+    ListServiceEdgesRequest, ListServicesRequest, ListVolumeDriversRequest, ListVolumesRequest,
+    PlanJobRequest, QueryStateStoreRequest, RenderJobTemplateRequest, ReplaceInstanceRequest,
+    ResolveServiceRequest, RotateMeshCaRequest, RunJobRequest, RunJobTemplateRequest,
+    SetNodeAvailabilityRequest, ShowNetPolicyRequest, StartInstanceRequest, StopInstanceRequest,
+    StopJobRequest, TestNetPolicyRequest, UpsertJobTemplateRequest, UpsertNetPolicyRequest,
 };
 use crate::task_plugins::validate_job_config;
 use serde::Serialize;
@@ -382,6 +382,19 @@ fn tool_defs() -> Vec<ToolDef> {
             mutates: false,
         },
         ToolDef {
+            name: "legion_service_edges",
+            description: "The service graph: who calls whom through the datapath, with requests per second, error rate, denials, latency and bytes per (caller job, caller task, service, tag) over the window; declared-but-silent upstreams; and whether the service's allow list admits each caller. Read-only.",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "service": { "type": "string", "description": "Only edges into or out of this service (optional)." },
+                    "window_secs": { "type": "integer", "description": "Window in seconds, 60..900 (default 300)." }
+                },
+                "additionalProperties": false
+            }),
+            mutates: false,
+        },
+        ToolDef {
             name: "legion_net_policy_list",
             description: "List stored network policies (name, priority, enforcement, selector, rules) in merge order.",
             input_schema: empty_schema,
@@ -436,6 +449,32 @@ fn tool_defs() -> Vec<ToolDef> {
                 "additionalProperties": false
             }),
             mutates: false,
+        },
+        ToolDef {
+            name: "legion_net_handler_test",
+            description: "Conformance-probe an external network handler the way the datapath would use it: an authz webhook URL (http[s]://...) gets a sample facts payload and must answer {verdict: allow|deny}; a proxy at host:port must accept a PROXY protocol v2 header. Sends one synthetic request to the handler; never touches the cluster. Use before wiring a handler into a policy.",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "target": { "type": "string", "description": "Webhook URL or proxy host:port." },
+                    "timeout": { "type": "string", "description": "Per-probe timeout (default 2s)." }
+                },
+                "required": ["target"],
+                "additionalProperties": false
+            }),
+            mutates: false,
+        },
+        ToolDef {
+            name: "legion_net_ca_show",
+            description: "The mesh CA certificate (PEM, never the key) behind certFrom = \"legion\": what a non-Legion client trusts to reach a mesh-TLS port. Empty until the first node asks for a certificate.",
+            input_schema: empty_schema,
+            mutates: false,
+        },
+        ToolDef {
+            name: "legion_net_ca_rotate",
+            description: "Replace the mesh CA. Every node re-issues its certificate on its next heartbeat; until then peers on different CAs refuse each other (never plaintext). Mutating.",
+            input_schema: empty_schema,
+            mutates: true,
         },
         ToolDef {
             name: "legion_net_policy_apply",
@@ -1209,6 +1248,23 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
             let mut client = connect().await?;
             grpc(client.list_services(ListServicesRequest {})).await
         }
+        "legion_service_edges" => {
+            let service = args
+                .get("service")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let window_secs = args
+                .get("window_secs")
+                .and_then(Value::as_u64)
+                .unwrap_or(300) as u32;
+            let mut client = connect().await?;
+            grpc(client.list_service_edges(ListServiceEdgesRequest {
+                service,
+                window_secs,
+            }))
+            .await
+        }
         "legion_net_policy_list" => {
             let mut client = connect().await?;
             grpc(client.list_net_policies(ListNetPoliciesRequest {})).await
@@ -1280,6 +1336,24 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
                 "verdict": crate::cmd::net::doctor_verdict(&steps),
                 "steps": steps,
             }))
+        }
+        "legion_net_handler_test" => {
+            let target = str_arg(&args, "target")?;
+            let timeout = args
+                .get("timeout")
+                .and_then(Value::as_str)
+                .and_then(|t| crate::structs::netpolicy::parse_duration(t).ok())
+                .unwrap_or(std::time::Duration::from_secs(2));
+            let probe = crate::cmd::net::probe_handler(&target, timeout).await;
+            serde_json::to_value(probe).map_err(|e| e.to_string())
+        }
+        "legion_net_ca_show" => {
+            let mut client = connect().await?;
+            grpc(client.get_mesh_ca(GetMeshCaRequest {})).await
+        }
+        "legion_net_ca_rotate" => {
+            let mut client = connect().await?;
+            grpc(client.rotate_mesh_ca(RotateMeshCaRequest {})).await
         }
         "legion_net_policy_apply" => {
             let object = args

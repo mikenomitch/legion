@@ -789,6 +789,7 @@ async fn heartbeat_sim_node(
     let req = node.credentials.attach(Request::new(HeartbeatRequest {
         net_denials: Vec::new(),
         net_status: Vec::new(),
+        net_edges: Vec::new(),
         // Simulated nodes never take provisional starts: the simulator
         // models scheduler load, and edge boot is a node-local execution
         // path with nothing to model.

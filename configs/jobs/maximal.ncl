@@ -193,22 +193,38 @@
                         { when = { cidr = "169.254.0.0/16" }, action = "deny", reason = "no metadata service" },
                     ],
                     # Handlers: code on the path, only when policy is not
-                    # enough. authz = a webhook verdict (cached); proxy = any
-                    # proxy by service / sidecar port / node-local service;
+                    # enough, run in order after the rules allow the flow.
+                    # authz = a webhook verdict, cached per (identity,
+                    # destination) for `cache` (default 10s, max 5m);
+                    # proxy = hand the flow to any proxy (PROXY v2 header on
+                    # TCP, Legion-* headers on HTTP) by catalog service /
+                    # node-local service / a sidecar's port label;
                     # log; dlp (HTTP bodies, needs protocol = "http").
+                    # Every hop: timeout (default 2s) and onError (deny).
                     handlers = [
                         { handler = "authz", url = "http://policy.internal/check", cache = "30s", timeout = "2s", onError = "deny" },
+                        { handler = "proxy", service = "egress-filter", proxyProtocol = true, onError = "deny" },
                     ],
                 },
                 # Inline ingress policy in front of this task's advertised
-                # ports (ships with the ingress phase; validated today).
+                # ports: the datapath binds the advertised port, the task
+                # binds a private twin (docs/network-handlers.md, "Ingress").
                 ingress = {
                     protocol = "http",
                     rules = [
                         { when = { path = "/admin/**" }, action = "deny", reason = "not externally reachable" },
+                        # Peer identity is known with tls.mode = "mutual".
+                        { when = { identity = "auto:web:*" }, action = "allow" },
                     ],
+                    # TLS on the advertised port. server | mutual with
+                    # certFrom = "legion" (the node's mesh certificate; peers
+                    # verified against the mesh CA with clientCa = "legion")
+                    # or certPath/keyPath (+ clientCa bundle) for your own PKI.
                     tls = {
                         mode = "off",          # off | server | mutual
+                        # certFrom = "legion",
+                        # clientCa = "legion",
+                        # requireIdentity = ["auto:web:*"],
                     },
                 },
             },
@@ -238,7 +254,8 @@
                     # vars. Must not collide with a static port above.
                     { service = "cache", localPort = 6379 },
                     # Strategy override: round_robin (default) | random |
-                    # least_conn.
+                    # least_conn | local_first (same-node endpoints first,
+                    # widening when none is healthy locally).
                     { service = "search", balance = "least_conn" },
                     # HTTP framing and traffic management on a service
                     # upstream (docs/network-handlers.md): a per-request
@@ -270,6 +287,23 @@
                                 onError = "deny",
                             },
                         ],
+                    },
+                ],
+                # Config files rendered from the upstreams and their live
+                # endpoint feed (docs/service-discovery.md, "Templates"):
+                # written before the task starts and on every heartbeat
+                # that changes the result. Functions: service "<key>"
+                # [host|port], range endpoints "<key>" (.address .port
+                # .node .allocation .tags), env "<NAME>".
+                templates = [
+                    {
+                        name = "backends",
+                        destination = "local/backends.cfg",   # under the task directory
+                        source = "db = {{ service \"db\" }}\n{{ range endpoints \"search\" }}server {{ .address }}:{{ .port }} # {{ .node }}\n{{ end }}",
+                        changeMode = "signal",     # noop (default) | signal | restart
+                        changeSignal = "SIGHUP",
+                        coalesce = "2s",           # let the feed settle before acting
+                        splay = "5s",              # random delay before the action
                     },
                 ],
             },

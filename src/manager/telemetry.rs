@@ -1509,6 +1509,11 @@ pub struct WorkerMetrics {
     /// `legion_net_bytes_total{direction}` — bytes forwarded through the
     /// datapath (`egress` = task to destination, `ingress` = peer to task).
     pub net_bytes_total: Arc<CounterVec>,
+    /// `legion_net_handler_total{handler,outcome}` — external handler calls
+    /// (`authz`, `proxy`) by outcome (allow|deny|proxy|error).
+    pub net_handler_total: Arc<CounterVec>,
+    /// `legion_net_handler_seconds` — wall-clock of one `authz` webhook call.
+    pub net_handler_seconds: Arc<Histogram>,
     families: Vec<Arc<dyn RenderMetric>>,
 }
 
@@ -1643,6 +1648,22 @@ impl WorkerMetrics {
             },
             series: Series::new(),
         });
+        let net_handler_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_net_handler_total",
+                help: "External network handler calls (authz webhooks, proxy hand-offs) by handler and outcome (allow|deny|proxy|error).",
+                labels: &["handler", "outcome"],
+            },
+            series: Series::new(),
+        });
+        let net_handler_seconds = Arc::new(Histogram {
+            meta: FamilyMeta {
+                name: "legion_net_handler_seconds",
+                help: "Wall-clock of one authz webhook call, cache misses only.",
+                labels: &[],
+            },
+            cell: HistogramCell::new(DURATION_BUCKETS),
+        });
 
         let families: Vec<Arc<dyn RenderMetric>> = vec![
             Arc::clone(&allocation_failures_reported_total) as Arc<dyn RenderMetric>,
@@ -1650,6 +1671,8 @@ impl WorkerMetrics {
             Arc::clone(&net_bytes_total) as Arc<dyn RenderMetric>,
             Arc::clone(&net_conns_total) as Arc<dyn RenderMetric>,
             Arc::clone(&net_denied_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&net_handler_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&net_handler_seconds) as Arc<dyn RenderMetric>,
             Arc::clone(&heartbeat_duration_seconds) as Arc<dyn RenderMetric>,
             Arc::clone(&heartbeats_total) as Arc<dyn RenderMetric>,
             Arc::clone(&provisional_active) as Arc<dyn RenderMetric>,
@@ -1678,6 +1701,8 @@ impl WorkerMetrics {
             net_conns_total,
             net_denied_total,
             net_bytes_total,
+            net_handler_total,
+            net_handler_seconds,
             families,
         }
     }

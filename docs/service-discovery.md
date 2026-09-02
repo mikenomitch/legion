@@ -180,6 +180,7 @@ client task gets three independent listeners on three distinct ports.
 | `round_robin` *(default)* | Hand out endpoints in order, wrapping around. Even spread, no state to warm up. |
 | `random` | Uniform random pick. Best when many clients share one backend set — no synchronized cursors. |
 | `least_conn` | Fewest in-flight connections wins; ties break round-robin. For long-lived or uneven connections. |
+| `local_first` | Round-robin over the endpoints on the *same node* as the caller; widens to every endpoint when none is local. Fail-open on purpose: a caller never waits for a local backend that is not there. |
 
 Names are normalized before lookup — trimmed, lowercased, `-` mapped to `_` —
 so `Least-Conn` and `least_conn` are the same strategy. An unknown name is
@@ -294,15 +295,65 @@ the config-ordering footgun this design avoids. An upstream whose service has no
 healthy endpoints simply gets an empty list at runtime, which
 `legion service doctor <svc>` will explain.
 
-### What connect is not (v1)
+### Templates: config files from the feed
 
-- **L4 only.** TCP, and balancing is per *connection*, not per request. A
-  long-lived HTTP keep-alive or gRPC channel stays on the backend it first
-  landed on; open a new connection to be rebalanced.
-- **No mid-stream retries.** Failover happens while dialing; once bytes have
-  flowed, a broken backend is the client's error to handle.
-- **No encryption or peer identity** — see the intentions scope note above.
-- **No DNS names, no sidecar, no netns, no UDP.**
+Some clients read backends from a file, not an env var — HAProxy, nginx, a
+database driver's config. `connect.templates` renders such files from the
+task's upstreams and their live endpoint feed, before the task starts and
+again on every heartbeat that changes the result:
+
+```nickel
+connect = {
+    upstreams = [{ service = "db" }, { service = "api" }],
+    templates = [
+        {
+            name = "backends",
+            destination = "local/backends.cfg",   # under the task directory
+            source = m%"
+                db = {{ service "db" }}
+                {{ range endpoints "api" }}
+                server {{ .address }}:{{ .port }} # {{ .node }} {{ .tags }}
+                {{ end }}
+                alloc = {{ env "LEGION_ALLOC_ID" }}
+            "%,
+            changeMode = "signal",     # noop (default) | signal | restart
+            changeSignal = "SIGHUP",
+            coalesce = "2s",           # let the feed settle before acting
+            splay = "5s",              # random delay so a fleet does not reload at once
+        },
+    ],
+},
+```
+
+Three functions, one loop, nothing else to learn:
+
+| Action | Renders |
+| --- | --- |
+| `{{ service "db" }}` | the address the task dials for the upstream — `<vip>:<canonical port>` on Linux, `127.0.0.1:<local port>` elsewhere; `"host"` / `"port"` as a second argument select a part. Every connection still goes through the node's datapath, so policy, handlers and the graph apply. |
+| `{{ range endpoints "db" }} … {{ end }}` | one copy of the body per healthy endpoint the manager last fed, with `.address`, `.port`, `.node`, `.allocation`, `.tags` |
+| `{{ env "NAME" }}` | the Legion-injected environment (`LEGION_*`), empty when unset |
+
+The file is written atomically (temp file + rename) when its content changes,
+and `changeMode` then says what the task should hear: nothing (most clients
+re-read on their own), `changeSignal`, or a restart. `coalesce` holds the
+signal until the feed has been quiet for that long (the file is always
+current); `splay` adds a random delay up to that long. Fail-static: a manager
+outage leaves the feed, and the file, exactly as they were. A template that
+names an upstream the task does not declare, uses an unknown action, or
+points outside the task directory is rejected at submit; a render problem at
+runtime shows in `legion net doctor` and the task's Network section. Templates
+are not a general engine — no conditionals, no arithmetic — by design.
+
+### What connect is not
+
+- **Balancing is per connection** in L4 mode: a long-lived keep-alive or
+  gRPC channel stays on the backend it first landed on. HTTP mode balances,
+  retries and splits per request — see
+  [network-handlers.md](network-handlers.md).
+- **No mid-stream retries** in L4 mode. Failover happens while dialing.
+- **No UDP.** Names (`<service>.svc.legion`), namespaces (`mode = "gated"`),
+  mTLS, handlers and the service graph all live in
+  [network-handlers.md](network-handlers.md).
 
 ### Platform behavior
 
@@ -401,14 +452,19 @@ macOS has no network-namespace isolation, so all tasks share the host port
 space — dynamic ports (task ports *and* upstream ports) avoid collisions; static
 ports are first-come-first-served per node.
 
-## What's next (planned)
+## Beyond discovery
 
-Shipped since v1: `connect.upstreams`, the per-node L4 forwarder, pluggable
-balancing, and connect-path intentions (`service.allow`) — all described above.
+Everything the mesh adds on top of the catalog — names (`<service>.svc.legion`
+from a node-local resolver), HTTP mode with retries and canary splits, gated
+namespaces, mTLS on node identity, external handlers, templates, and the
+service graph — is documented in [network-handlers.md](network-handlers.md).
+Still planned there: UDP, transparent capture, and WASM handlers.
 
-Still planned: DNS (`<service>.svc.legion` from a node-local resolver), template
-functions (`{{ range endpoints "db" }}`), the `datapath` plugin ABI
-(bridge/CNI), **mTLS** so intentions rest on cryptographic workload identity
-rather than the control plane alone, the opt-in L7 layer with WASM middleware,
-and the observability service graph. See the
-[final plan](../internal_docs/plans/service-discovery-final-plan.md) §8.
+## Who calls a service
+
+`legion service edges [<service>]` — and the Network page in the UI — show
+the service graph: every caller that reaches a service through its
+datapath, with request rate, errors, denials and latency over the last
+minutes, plus declared-but-silent upstreams and whether the service's
+`allow` intentions admit each caller. See
+[network-handlers.md](network-handlers.md#service-graph).

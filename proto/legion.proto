@@ -449,6 +449,31 @@ service Manager {
   rpc IssueNodeIdentityToken (IssueNodeIdentityTokenRequest)
       returns (IssueNodeIdentityTokenReply);
 
+  // Issue a short-lived **mesh certificate** for a worker node — the
+  // credential behind `certFrom = "legion"` (docs/network-handlers.md,
+  // "mTLS"). The first call creates the cluster's mesh CA (replicated with
+  // the control lane); every call signs a fresh key pair for the node with
+  // `<node>.node.legion` and `legion://node/<node id>` as its SANs, valid for
+  // 24 hours. Workers call it on their heartbeat loop once any allocation on
+  // the node terminates or originates mesh TLS, and again after a third of
+  // the lifetime has passed.
+  //
+  // The node's *workload* identities are never certificates: a dialing node
+  // names the workload it forwards for in a PROXY protocol v2 TLV inside the
+  // node-to-node TLS session, and the receiving node trusts that attribution
+  // because the peer proved it is a node.
+  //
+  // Called by the worker for its own node. Authorization is identical to
+  // IssueNodeIdentityToken: the caller's authenticated per-node principal
+  // (`node:<node_id>`) must match the request's `node_id`.
+  //
+  // Errors:
+  // - NotFound: no node with `node_id` is registered.
+  // - PermissionDenied: `node_id` does not match the caller's credential.
+  // - Internal: the CA could not be created or signing failed.
+  rpc IssueNodeCertificate (IssueNodeCertificateRequest)
+      returns (IssueNodeCertificateReply);
+
   // Worker heartbeat endpoint.
   //
   // Workers send runtime state, failures, and allocation health snapshots.
@@ -637,6 +662,15 @@ service Manager {
   // and no way for the catalog to drift from scheduler state.
   rpc ListServices (ListServicesRequest) returns (ListServicesReply);
 
+  // The service graph: who calls whom, with RED (docs/network-handlers.md,
+  // "Service graph"). One edge per (caller job, caller task, service, tag):
+  // what the callers *declared* (a `connect.upstreams` entry, and whether the
+  // service's `allow` intentions admit it) and what their datapaths
+  // *observed* over the window — requests, errors, denials, latency, bytes,
+  // folded from every node's heartbeat. Observed edges appear within one
+  // heartbeat of the first call. Like ListServices, a projection: `job:read`.
+  rpc ListServiceEdges (ListServiceEdgesRequest) returns (ListServiceEdgesReply);
+
   // Resolves one service name to its endpoint addresses and ports.
   //
   // By default only healthy endpoints are returned: an endpoint is healthy
@@ -692,6 +726,18 @@ service Manager {
   // method, header) are evaluated when `method`/`path` are given, otherwise
   // reported as `defer`. ACL: `net:read` on the job.
   rpc TestNetPolicy (TestNetPolicyRequest) returns (TestNetPolicyReply);
+
+  // The mesh CA certificate — what an operator hands a non-Legion client
+  // that must reach a mesh-TLS port, or verifies a node certificate against.
+  // Never the key. Empty `cert_pem` when no node has asked for a certificate
+  // yet (the CA is created on first use). ACL: `net:read`.
+  rpc GetMeshCa (GetMeshCaRequest) returns (GetMeshCaReply);
+
+  // Replace the mesh CA. Every node re-issues its certificate on its next
+  // heartbeat (within one interval); until a node has, its peers on the new
+  // CA refuse it and it refuses them — expect a heartbeat's worth of
+  // refused mesh connections, never plaintext. ACL: `net:write` (unscoped).
+  rpc RotateMeshCa (RotateMeshCaRequest) returns (RotateMeshCaReply);
 
   // Worker plane: fetches the merged policy body for a hash the heartbeat
   // reply named. Policies are content-addressed so a node running a thousand
@@ -2695,6 +2741,55 @@ message IssueNodeIdentityTokenReply {
   string name = 3;
 }
 
+// Request payload for GetMeshCa.
+message GetMeshCaRequest {}
+
+// Reply payload for GetMeshCa.
+message GetMeshCaReply {
+  // The CA certificate, PEM; empty when none exists yet.
+  string cert_pem = 1;
+
+  // When the current CA was created (RFC 3339); empty when none exists.
+  string created_at = 2;
+}
+
+// Request payload for RotateMeshCa.
+message RotateMeshCaRequest {}
+
+// Reply payload for RotateMeshCa.
+message RotateMeshCaReply {
+  // The new CA certificate, PEM.
+  string cert_pem = 1;
+
+  // When it was created (RFC 3339).
+  string created_at = 2;
+}
+
+// Request payload for IssueNodeCertificate.
+message IssueNodeCertificateRequest {
+  // The worker node the certificate is for. Must match the caller's
+  // authenticated per-node credential.
+  string node_id = 1;
+}
+
+// Reply payload for IssueNodeCertificate.
+message IssueNodeCertificateReply {
+  // The node certificate, PEM. SANs: `<node>.node.legion` and
+  // `legion://node/<node id>`.
+  string cert_pem = 1;
+
+  // The certificate's private key, PEM. Treat as a secret: never log it,
+  // never write it to disk — the worker holds it in memory and re-issues
+  // after a restart.
+  string key_pem = 2;
+
+  // The mesh CA certificate, PEM. What a node verifies its peers against.
+  string ca_pem = 3;
+
+  // Certificate expiry as Unix seconds.
+  int64 expires_at = 4;
+}
+
 // Request payload for Heartbeat.
 message HeartbeatRequest {
   // Worker/node ID sending heartbeat.
@@ -2766,6 +2861,50 @@ message HeartbeatRequest {
   // ShowNetPolicy so "is it enforced?" is answered by the node that
   // enforces it, not inferred by the manager.
   repeated NetAllocStatus net_status = 9;
+
+  // The service graph's raw material: what each allocation's datapath saw
+  // per (upstream service, endpoint tag) since the last heartbeat — request
+  // and connection counts, errors, denials, latency, bytes. Deltas, folded
+  // by the manager into per-(caller, service) windows for ListServiceEdges.
+  // Restored on a failed heartbeat like every other report on this request.
+  repeated NetEdgeSample net_edges = 10;
+}
+
+// One edge sample: an allocation talking to a service through its datapath
+// since the last heartbeat (docs/network-handlers.md, "Service graph").
+message NetEdgeSample {
+  // The calling allocation; the manager maps it to (job, task).
+  int64 allocation_id = 1;
+
+  // The upstream key: a catalog service name, or an external upstream's
+  // `name`.
+  string service = 2;
+
+  // The endpoint's service tag the flow was balanced to (HTTP mode with a
+  // `split`, or the endpoint's first tag); empty when untagged or external.
+  string tag = 3;
+
+  // `tcp` (connections) or `http` (requests).
+  string protocol = 4;
+
+  // Requests (HTTP mode) or connections (L4) that reached an endpoint.
+  uint64 requests = 5;
+
+  // Requests answered 5xx, and connections or requests that failed to reach
+  // any endpoint (dial errors, timeouts, no endpoints).
+  uint64 errors = 6;
+
+  // Connections or requests denied by policy or a handler.
+  uint64 denied = 7;
+
+  // HTTP mode: sum and max of request latency, milliseconds, over
+  // `requests`.
+  uint64 latency_ms_sum = 8;
+  uint64 latency_ms_max = 9;
+
+  // Bytes toward the service and back.
+  uint64 bytes_out = 10;
+  uint64 bytes_in = 11;
 }
 
 // Reply payload for Heartbeat.
@@ -2952,6 +3091,14 @@ message UpstreamEndpoints {
   // manager outage leaves the last known good set in place (fail-static)
   // rather than blackholing traffic.
   repeated ServiceEndpoint endpoints = 3;
+
+  // True when this list resolves a `proxy` **handler's** target
+  // (`handlers = [{ handler = "proxy", service = "..." }]` on the
+  // allocation's effective policy or one of its upstreams) rather than a
+  // `connect.upstreams` entry. The worker keeps the two apart: handler
+  // targets are dialed by the datapath when a chain hands a flow off, and
+  // never get a loopback listener of their own.
+  bool for_handler = 4;
 }
 
 // One volume operation outcome reported by a worker.
@@ -4129,6 +4276,73 @@ message ServiceEndpoint {
   // Name of the `network.ports` entry this endpoint advertises, when the
   // service names a port label rather than a literal port number.
   string port_label = 12;
+
+  // True when the endpoint's advertised port terminates **mesh TLS** — its
+  // task's ingress chain has `tls = { mode = "mutual", certFrom = "legion" }`
+  // (docs/network-handlers.md). A consuming node's datapath then originates
+  // TLS with its own node certificate and names the consuming workload in a
+  // PROXY protocol v2 TLV; a plain client dialing the port directly is
+  // refused at the handshake.
+  bool mesh_tls = 13;
+}
+
+// Request payload for ListServiceEdges.
+message ListServiceEdgesRequest {
+  // Only edges into (or out of) this service; empty for the whole graph.
+  string service = 1;
+
+  // Window the observed counters are summed over, seconds. Default 300,
+  // at most 900 (the manager keeps 15 minutes of per-minute buckets).
+  uint32 window_secs = 2;
+}
+
+// One edge of the service graph.
+message ServiceEdge {
+  // The caller: the job and task whose datapath made the calls (or declared
+  // the upstream).
+  string caller_job = 1;
+  string caller_task = 2;
+
+  // The callee: a catalog service name, or an external upstream's `name`.
+  string service = 3;
+
+  // The endpoint tag the calls were balanced to; empty when untagged.
+  string tag = 4;
+
+  // `tcp`, `http`, or empty for a declared-only edge.
+  string protocol = 5;
+
+  // The caller's latest job config declares this service as an upstream.
+  bool declared = 6;
+
+  // The service's `allow` intentions admit the caller (always true for an
+  // external upstream or an undeclared service).
+  bool allowed = 7;
+
+  // Observed over the window (zero for a declared-only edge).
+  uint64 requests = 8;
+  uint64 errors = 9;
+  uint64 denied = 10;
+  double latency_ms_avg = 11;
+  uint64 latency_ms_max = 12;
+  uint64 bytes_out = 13;
+  uint64 bytes_in = 14;
+
+  // Requests per second and error rate over the window.
+  double rps = 15;
+  double error_rate = 16;
+
+  // When the manager last folded a sample for this edge, Unix seconds; 0 for
+  // a declared-only edge.
+  int64 last_seen_unix = 17;
+}
+
+// Reply payload for ListServiceEdges.
+message ListServiceEdgesReply {
+  repeated ServiceEdge edges = 1;
+
+  // The window the counters cover, seconds.
+  uint32 window_secs = 2;
 }
 
 // Reply payload for ResolveService.
@@ -6334,4 +6548,45 @@ message NetAllocStatus {
   // Human-readable problems the datapath has with this allocation, e.g.
   // "port 8080 ingress listener: address in use".
   repeated string problems = 10;
+
+  // Every external handler hop on the allocation's effective chains and
+  // upstreams (`authz`, `proxy`), with the health the datapath has observed.
+  repeated NetHandlerStatus handlers = 11;
+
+  // Whether the ingress chain's TLS material is loaded: the BYO files parse,
+  // or the node holds a mesh certificate for `certFrom = "legion"`. Always
+  // true when no ingress chain terminates TLS.
+  bool tls_ready = 12;
+
+  // Why `tls_ready` is false, when it is.
+  string tls_error = 13;
+
+  // Whether this node currently holds a mesh certificate.
+  bool mesh_identity = 14;
+}
+
+// One external handler hop as the datapath sees it.
+message NetHandlerStatus {
+  // Where the hop came from: `policy/<name>#<index>`, `task#<index>`, or
+  // `upstream/<key>#<index>`.
+  string source = 1;
+
+  // `authz` or `proxy`.
+  string handler = 2;
+
+  // The webhook URL, or the resolved proxy target (`service`, `node`, or
+  // `port` label) and how many endpoints it currently has.
+  string target = 3;
+
+  // False once the last call failed (timeout, connection refused, bad
+  // reply) or the proxy target has no endpoint. A chain fails closed on an
+  // unhealthy hop unless the hop says `onError = "allow"`.
+  bool healthy = 4;
+
+  // The last failure, if any.
+  string last_error = 5;
+
+  // Calls and failures since the worker started.
+  uint64 calls = 6;
+  uint64 errors = 7;
 }

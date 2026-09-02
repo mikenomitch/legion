@@ -2184,6 +2184,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "webpki-roots",
+ "x509-parser",
 ]
 
 [[package]]

@@ -15,6 +15,7 @@ import {
   cx,
   linkClass,
 } from '../../components/ui'
+import { ServiceEdgesTable } from '../../components/ServiceGraph'
 import { managerClient } from '../../grpcClient'
 import { POLL_INTERVAL_MS } from '../../utils/polling'
 import { diagnoseService, type DiagnosisLevel } from '../../utils/services'
@@ -47,13 +48,18 @@ function ServiceDetailContent() {
   const [data] = createResource(
     () => [serviceName(), tick()] as const,
     async ([name]) => {
-      const [list, resolved] = await Promise.all([
+      const [list, resolved, graph] = await Promise.all([
         managerClient.listServices({}),
         managerClient.resolveService({ service: name, includeUnhealthy: true }),
+        managerClient.listServiceEdges({ service: name, windowSecs: 300 }).catch(() => undefined),
       ])
       return {
         summary: list.services.find((entry) => entry.service === name),
         endpoints: resolved.endpoints,
+        // Callers into this service; a job:read token that cannot see the
+        // graph simply gets no callers section.
+        edges: graph?.edges.filter((edge) => edge.service === name) ?? [],
+        windowSecs: Number(graph?.windowSecs ?? 300),
       }
     },
   )
@@ -138,6 +144,24 @@ function ServiceDetailContent() {
                     ? 'Every endpoint is failing its checks or sitting on a dead node. See the diagnosis below.'
                     : 'Nothing is placed for this service yet. See the diagnosis below.'
                 }
+              />
+            </SectionCard>
+
+            <SectionCard
+              title="Callers"
+              description={`Who reaches this service through an upstream: declared consumers and what their datapaths observed over the last ${Math.round((data()?.windowSecs ?? 300) / 60)} min.`}
+              flush
+              actions={
+                <A class={linkClass} href="/network">
+                  Service graph
+                </A>
+              }
+            >
+              <ServiceEdgesTable
+                edges={data()?.edges ?? []}
+                hideService
+                emptyTitle="No callers"
+                emptyBody="No job declares this service as an upstream, and nothing has called it through the datapath in the window."
               />
             </SectionCard>
 

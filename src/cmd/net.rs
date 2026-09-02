@@ -12,8 +12,9 @@ use crate::cmd::output::{self, CliError, OutputFormat};
 use crate::prelude::*;
 use crate::structs::netpolicy::{EffectivePolicy, NetPolicyObject};
 use crate::structs::{
-    DeleteNetPolicyRequest, GetNetPolicyObjectRequest, ListNetPoliciesRequest, NetPolicy,
-    ShowNetPolicyRequest, TestNetPolicyRequest, UpsertNetPolicyRequest,
+    DeleteNetPolicyRequest, GetMeshCaRequest, GetNetPolicyObjectRequest, ListNetPoliciesRequest,
+    NetPolicy, RotateMeshCaRequest, ShowNetPolicyRequest, TestNetPolicyRequest,
+    UpsertNetPolicyRequest,
 };
 use serde::Serialize;
 use std::path::Path;
@@ -106,11 +107,6 @@ pub fn config() -> Command {
                         .arg(json_flag()),
                 )
                 .subcommand(
-                    job_scope(Command::new("doctor"))
-                        .about("Walk a task's network layers — policy, mode, capture, listeners, gate — and name the first one that is wrong")
-                        .arg(json_flag()),
-                )
-                .subcommand(
                     job_scope(Command::new("test"))
                         .about("Dry-run a verdict: may this task reach --to, or be reached from --from?")
                         .arg(Arg::new("to").long("to").help("Egress destination: host[:port], IP, or URL"))
@@ -118,6 +114,43 @@ pub fn config() -> Command {
                         .arg(Arg::new("identity").long("identity").help("Peer workload identity (ingress)"))
                         .arg(Arg::new("method").long("method").help("HTTP method (request-time rules)"))
                         .arg(Arg::new("path").long("path").help("HTTP path (request-time rules)"))
+                        .arg(json_flag()),
+                ),
+        )
+        .subcommand(
+            job_scope(Command::new("doctor"))
+                .about("Walk a task's network layers — policy, mode, datapath, handlers, TLS, gate — and name the first one that is wrong")
+                .arg(json_flag()),
+        )
+        .subcommand(
+            Command::new("handler")
+                .about("External handlers: authz webhooks and proxies")
+                .subcommand_required(true)
+                .subcommand(
+                    Command::new("test")
+                        .about("Conformance-probe a handler: an authz webhook URL (http[s]://...) or a proxy at host:port")
+                        .arg(Arg::new("target").required(true).help("Webhook URL or proxy host:port"))
+                        .arg(
+                            Arg::new("timeout")
+                                .long("timeout")
+                                .default_value("2s")
+                                .help("Per-probe timeout"),
+                        )
+                        .arg(json_flag()),
+                ),
+        )
+        .subcommand(
+            Command::new("ca")
+                .about("The mesh CA behind certFrom = \"legion\"")
+                .subcommand_required(true)
+                .subcommand(
+                    Command::new("show")
+                        .about("Print the mesh CA certificate (PEM) — what an outside client trusts to reach a mesh port")
+                        .arg(json_flag()),
+                )
+                .subcommand(
+                    Command::new("rotate")
+                        .about("Replace the mesh CA; every node re-issues its certificate on its next heartbeat")
                         .arg(json_flag()),
                 ),
         )
@@ -131,12 +164,308 @@ pub async fn handle(matches: &ArgMatches) -> R<()> {
             Some(("describe", sub)) => describe(sub).await,
             Some(("delete", sub)) => delete(sub).await,
             Some(("show", sub)) => show(sub).await,
-            Some(("doctor", sub)) => doctor(sub).await,
             Some(("test", sub)) => test(sub).await,
+            _ => unreachable!(),
+        },
+        Some(("doctor", sub)) => doctor(sub).await,
+        Some(("handler", handler)) => match handler.subcommand() {
+            Some(("test", sub)) => handler_test(sub).await,
+            _ => unreachable!(),
+        },
+        Some(("ca", ca)) => match ca.subcommand() {
+            Some(("show", sub)) => ca_show(sub).await,
+            Some(("rotate", sub)) => ca_rotate(sub).await,
             _ => unreachable!(),
         },
         _ => unreachable!(),
     }
+}
+
+/// One check of a handler probe.
+#[derive(Serialize, Clone, Debug)]
+pub(crate) struct ProbeCheck {
+    pub name: &'static str,
+    pub ok: bool,
+    pub detail: String,
+}
+
+/// What `net handler test` found.
+#[derive(Serialize, Clone, Debug)]
+pub(crate) struct HandlerProbe {
+    pub kind: &'static str,
+    pub target: String,
+    pub ok: bool,
+    pub latency_ms: u64,
+    pub checks: Vec<ProbeCheck>,
+}
+
+/// Probe a handler the way the datapath would use it: an `authz` webhook
+/// gets a sample facts payload and must answer a verdict; a `proxy` gets a
+/// connection that starts with a PROXY v2 header and must keep it open.
+/// Sends one synthetic request; never touches the cluster.
+pub(crate) async fn probe_handler(target: &str, timeout: std::time::Duration) -> HandlerProbe {
+    use crate::worker::netd::proxyproto::{self, tlv};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let started = std::time::Instant::now();
+    let mut checks = Vec::new();
+    if target.starts_with("http://") || target.starts_with("https://") {
+        let body = json!({
+            "allocation": 0,
+            "job": "legion-handler-test",
+            "task": "probe",
+            "identity": "auto:legion-handler-test:default:probe",
+            "labels": { "probe": "true" },
+            "direction": "egress",
+            "protocol": "http",
+            "destination": "example.com:443",
+            "host": "example.com",
+            "port": 443,
+            "method": "GET",
+            "path": "/",
+            "headers": [],
+        });
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap_or_default();
+        let response = client
+            .post(target)
+            .timeout(timeout)
+            .header("content-type", "application/json")
+            .header("legion-handler", "authz")
+            .body(body.to_string())
+            .send()
+            .await;
+        let mut ok = false;
+        match response {
+            Ok(response) => {
+                let status = response.status();
+                checks.push(ProbeCheck {
+                    name: "reachable",
+                    ok: true,
+                    detail: format!(
+                        "answered {} in {} ms",
+                        status.as_u16(),
+                        started.elapsed().as_millis()
+                    ),
+                });
+                checks.push(ProbeCheck {
+                    name: "status_2xx",
+                    ok: status.is_success(),
+                    detail: format!("HTTP {}", status.as_u16()),
+                });
+                let text = response.text().await.unwrap_or_default();
+                match serde_json::from_str::<serde_json::Value>(&text) {
+                    Ok(value) => {
+                        let verdict = value
+                            .get("verdict")
+                            .and_then(|v| v.as_str())
+                            .map(|v| v.trim().to_ascii_lowercase());
+                        let valid = matches!(verdict.as_deref(), Some("allow") | Some("deny"));
+                        checks.push(ProbeCheck {
+                            name: "verdict",
+                            ok: valid,
+                            detail: match verdict {
+                                Some(v) if valid => format!("verdict = {v}"),
+                                Some(v) => format!("verdict {v:?} is not allow|deny"),
+                                None => "reply has no \"verdict\" field".into(),
+                            },
+                        });
+                        if let Some(ttl) = value.get("ttl").and_then(|t| t.as_str()) {
+                            let parsed = crate::structs::netpolicy::parse_duration(ttl).is_ok();
+                            checks.push(ProbeCheck {
+                                name: "ttl",
+                                ok: parsed,
+                                detail: if parsed {
+                                    format!("ttl = {ttl}")
+                                } else {
+                                    format!("ttl {ttl:?} is not a duration")
+                                },
+                            });
+                        }
+                        ok = status.is_success() && valid;
+                    }
+                    Err(err) => checks.push(ProbeCheck {
+                        name: "json",
+                        ok: false,
+                        detail: format!("reply is not JSON: {err}"),
+                    }),
+                }
+            }
+            Err(err) => checks.push(ProbeCheck {
+                name: "reachable",
+                ok: false,
+                detail: format!("{err}"),
+            }),
+        }
+        return HandlerProbe {
+            kind: "authz",
+            target: target.to_string(),
+            ok,
+            latency_ms: started.elapsed().as_millis() as u64,
+            checks,
+        };
+    }
+
+    let mut ok = false;
+    match tokio::time::timeout(timeout, tokio::net::TcpStream::connect(target)).await {
+        Ok(Ok(mut stream)) => {
+            checks.push(ProbeCheck {
+                name: "reachable",
+                ok: true,
+                detail: format!("connected in {} ms", started.elapsed().as_millis()),
+            });
+            let header = proxyproto::encode(
+                None,
+                "127.0.0.1:443".parse().ok(),
+                &[
+                    (tlv::IDENTITY, b"auto:legion-handler-test:default:probe"),
+                    (tlv::DESTINATION, b"example.com:443"),
+                    (tlv::ALLOCATION, b"0"),
+                    (tlv::DIRECTION, b"egress"),
+                ],
+            );
+            match stream.write_all(&header).await {
+                Ok(()) => {
+                    // A proxy that rejects the header closes at once; one that
+                    // accepts it waits for payload.
+                    let mut buf = [0u8; 1];
+                    let accepted = !matches!(
+                        tokio::time::timeout(
+                            std::time::Duration::from_millis(500),
+                            stream.read(&mut buf),
+                        )
+                        .await,
+                        Ok(Ok(0)) | Ok(Err(_))
+                    );
+                    checks.push(ProbeCheck {
+                        name: "proxy_protocol",
+                        ok: accepted,
+                        detail: if accepted {
+                            "kept the connection open after a PROXY v2 header".into()
+                        } else {
+                            "closed the connection on the PROXY v2 header (set proxyProtocol = false, or enable PROXY protocol on the proxy)".into()
+                        },
+                    });
+                    ok = accepted;
+                }
+                Err(err) => checks.push(ProbeCheck {
+                    name: "proxy_protocol",
+                    ok: false,
+                    detail: format!("write failed: {err}"),
+                }),
+            }
+        }
+        Ok(Err(err)) => checks.push(ProbeCheck {
+            name: "reachable",
+            ok: false,
+            detail: format!("{err}"),
+        }),
+        Err(_) => checks.push(ProbeCheck {
+            name: "reachable",
+            ok: false,
+            detail: "dial timed out".into(),
+        }),
+    }
+    HandlerProbe {
+        kind: "proxy",
+        target: target.to_string(),
+        ok,
+        latency_ms: started.elapsed().as_millis() as u64,
+        checks,
+    }
+}
+
+async fn handler_test(matches: &ArgMatches) -> R<()> {
+    let format = OutputFormat::from_matches(matches);
+    let target = matches
+        .get_one::<String>("target")
+        .expect("required")
+        .clone();
+    let timeout = matches
+        .get_one::<String>("timeout")
+        .and_then(|t| crate::structs::netpolicy::parse_duration(t).ok())
+        .unwrap_or(std::time::Duration::from_secs(2));
+    let probe = probe_handler(&target, timeout).await;
+    if format.is_json() {
+        output::print_success(&probe);
+    } else {
+        println!(
+            "{} {} {} ({} ms)",
+            if probe.ok { "✓" } else { "✗" },
+            probe.kind,
+            probe.target,
+            probe.latency_ms
+        );
+        for check in &probe.checks {
+            println!(
+                "  {} {:<15} {}",
+                if check.ok { "✓" } else { "✗" },
+                check.name,
+                check.detail
+            );
+        }
+    }
+    if !probe.ok {
+        return Err(output::fail_local(
+            format,
+            CliError::local(
+                "handler_test_failed",
+                "the handler did not pass the conformance probe",
+                Some("fix the checks marked ✗ above; the datapath would fail this hop closed"),
+            ),
+        ));
+    }
+    Ok(())
+}
+
+async fn ca_show(matches: &ArgMatches) -> R<()> {
+    let format = OutputFormat::from_matches(matches);
+    let mut client = connect_manager_client().await?;
+    let reply = output::resolve(
+        format,
+        "mesh ca",
+        client.get_mesh_ca(GetMeshCaRequest {}).await,
+    )?
+    .into_inner();
+    if format.is_json() {
+        output::print_success(&json!({
+            "certPem": reply.cert_pem,
+            "createdAt": reply.created_at,
+            "exists": !reply.cert_pem.is_empty(),
+        }));
+        return Ok(());
+    }
+    if reply.cert_pem.is_empty() {
+        println!("no mesh CA yet — it is created when the first node asks for a certificate");
+        return Ok(());
+    }
+    print!("{}", reply.cert_pem);
+    Ok(())
+}
+
+async fn ca_rotate(matches: &ArgMatches) -> R<()> {
+    let format = OutputFormat::from_matches(matches);
+    let mut client = connect_manager_client().await?;
+    let reply = output::resolve(
+        format,
+        "rotate mesh ca",
+        client.rotate_mesh_ca(RotateMeshCaRequest {}).await,
+    )?
+    .into_inner();
+    if format.is_json() {
+        output::print_success(&json!({
+            "certPem": reply.cert_pem,
+            "createdAt": reply.created_at,
+        }));
+        return Ok(());
+    }
+    println!(
+        "rotated the mesh CA at {}; nodes re-issue their certificates on their next heartbeat",
+        reply.created_at
+    );
+    Ok(())
 }
 
 /// Evaluate a `.ncl` (or read a `.json`) policy file to its JSON text.
@@ -628,6 +957,38 @@ struct NodeStatus {
     gate_shut: bool,
     #[serde(default)]
     problems: Vec<String>,
+    #[serde(default)]
+    handlers: Vec<NodeHandlerStatus>,
+    #[serde(default = "default_true")]
+    tls_ready: bool,
+    #[serde(default)]
+    tls_error: String,
+    #[serde(default)]
+    mesh_identity: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// One external hop as the node reports it.
+#[derive(serde::Deserialize, Default, Clone)]
+#[serde(rename_all = "camelCase")]
+struct NodeHandlerStatus {
+    #[serde(default)]
+    source: String,
+    #[serde(default)]
+    handler: String,
+    #[serde(default)]
+    target: String,
+    #[serde(default)]
+    healthy: bool,
+    #[serde(default)]
+    last_error: String,
+    #[serde(default)]
+    calls: u64,
+    #[serde(default)]
+    errors: u64,
 }
 
 /// The ladder: policy resolved → mode and whether it is enforced → datapath
@@ -774,6 +1135,47 @@ pub(crate) fn diagnose_network(
                 status: "warn",
                 detail: format!("allocation {alloc}: the edge-boot gate is shut — every connection is denied until the placement is ratified"),
                 hint: Some("normal for a `boot`-gated provisional start; see docs/edge-boot.md".into()),
+            });
+        }
+        // TLS material: an ingress chain that terminates TLS needs its
+        // files (or the mesh certificate) before it accepts anything.
+        if !status.tls_ready {
+            steps.push(DoctorStep {
+                layer: "tls",
+                status: "fail",
+                detail: format!("allocation {alloc}: ingress TLS is not ready — {}", status.tls_error),
+                hint: Some("for certPath/keyPath, put the files on the node (or stage them as artifacts); for certFrom = \"legion\", the node issues its certificate on its next heartbeat".into()),
+            });
+            return steps;
+        }
+        let wants_mesh = effective
+            .ingress
+            .as_ref()
+            .and_then(|c| c.tls.as_ref())
+            .is_some_and(|t| t.cert_from.as_deref() == Some("legion"));
+        if wants_mesh && !status.mesh_identity {
+            steps.push(DoctorStep {
+                layer: "tls",
+                status: "warn",
+                detail: format!("allocation {alloc}: the node holds no mesh certificate yet; mesh peers are refused until it does"),
+                hint: Some("issued on the node's next heartbeat (IssueNodeCertificate); persistent means the manager could not create the mesh CA — check manager logs".into()),
+            });
+        }
+        // External handlers: each hop the datapath has run, with its health.
+        for hop in &status.handlers {
+            steps.push(DoctorStep {
+                layer: "handler",
+                status: if hop.healthy { "ok" } else { "warn" },
+                detail: format!(
+                    "allocation {alloc}: {} {} → {} ({} calls, {} errors){}",
+                    hop.source,
+                    hop.handler,
+                    hop.target,
+                    hop.calls,
+                    hop.errors,
+                    if hop.last_error.is_empty() { String::new() } else { format!(" — last error: {}", hop.last_error) }
+                ),
+                hint: (!hop.healthy).then(|| "the chain fails closed on this hop unless it says onError = \"allow\"; `legion net handler test <target>` probes it directly".to_string()),
             });
         }
         steps.push(DoctorStep {

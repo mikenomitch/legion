@@ -1580,6 +1580,18 @@ pub fn get_migrations() -> Migrations<'static> {
         INSERT OR IGNORE INTO net_policy_meta (id, generation) VALUES (1, 0);",
         )
         .down("DROP TABLE IF EXISTS net_policy; DROP TABLE IF EXISTS net_policy_meta;"),
+        // The mesh CA behind `certFrom = "legion"` (docs/network-handlers.md):
+        // one row, created on the first IssueNodeCertificate, replicated
+        // with the control lane so every manager signs with the same key.
+        M::up(
+            "CREATE TABLE IF NOT EXISTS net_mesh_ca (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            cert_pem TEXT NOT NULL,
+            key_pem TEXT NOT NULL,
+            created_at TIMESTAMP NOT NULL
+        );",
+        )
+        .down("DROP TABLE IF EXISTS net_mesh_ca;"),
     ])
 }
 

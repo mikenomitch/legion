@@ -1322,6 +1322,7 @@ mod tests {
             ],
             vip_block: None,
             mode: None,
+            ingress_tls: None,
         });
         let args = build_apple_launch(
             &allocation,

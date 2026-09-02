@@ -13,7 +13,7 @@ use crate::storage::store::Store;
 use crate::storage::Lane;
 use crate::structs::netpolicy::{find_default_tie, NetPolicyObject};
 
-use rusqlite::{named_params, OptionalExtension, Row};
+use rusqlite::{named_params, params, OptionalExtension, Row};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
@@ -169,6 +169,94 @@ impl Store {
         let count: i64 =
             conn.query_row("SELECT COUNT(*) FROM net_policy;", [], |row| row.get(0))?;
         Ok(count.max(0) as u64)
+    }
+}
+
+/// The cluster's mesh CA (`net_mesh_ca`), PEM-encoded.
+#[derive(Debug, Clone)]
+pub struct MeshCa {
+    pub cert_pem: String,
+    pub key_pem: String,
+    pub created_at: String,
+}
+
+impl Store {
+    /// The mesh CA, if one has been created.
+    pub fn mesh_ca(&self) -> R<Option<MeshCa>> {
+        let conn = self.read_connection()?;
+        conn.query_row(
+            "SELECT cert_pem, key_pem, created_at FROM net_mesh_ca WHERE id = 1;",
+            [],
+            |row| {
+                Ok(MeshCa {
+                    cert_pem: row.get(0)?,
+                    key_pem: row.get(1)?,
+                    created_at: row.get(2)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    /// The mesh CA, created on first use. Generation happens *before* the
+    /// replicated write so every manager applies the same bytes; a race
+    /// between two first callers is settled by `INSERT OR IGNORE` and the
+    /// loser reads back the winner's CA.
+    #[instrument(err, skip_all)]
+    pub fn ensure_mesh_ca(&self) -> R<MeshCa> {
+        if let Some(existing) = self.mesh_ca()? {
+            return Ok(existing);
+        }
+        let (cert_pem, key_pem) = crate::manager::mesh_ca::generate_ca()?;
+        let created_at = OffsetDateTime::now_utc().format(&Rfc3339)?;
+        let candidate = MeshCa {
+            cert_pem,
+            key_pem,
+            created_at,
+        };
+        self.replicated(Lane::Control, "ensure_mesh_ca", move |s| {
+            s.ensure_mesh_ca_apply(candidate.clone())
+        })
+    }
+
+    fn ensure_mesh_ca_apply(&self, candidate: MeshCa) -> R<MeshCa> {
+        let conn = self.write_connection()?;
+        conn.execute(
+            "INSERT OR IGNORE INTO net_mesh_ca (id, cert_pem, key_pem, created_at)
+             VALUES (1, ?1, ?2, ?3);",
+            params![candidate.cert_pem, candidate.key_pem, candidate.created_at],
+        )?;
+        drop(conn);
+        self.mesh_ca()?
+            .ok_or_else(|| anyhow::anyhow!("mesh CA row missing after insert"))
+    }
+
+    /// Replace the mesh CA. Every node re-issues its certificate on its
+    /// next refresh; peers still on the old CA are refused until they do.
+    /// An operator action (`legion net ca rotate`).
+    #[instrument(err, skip_all)]
+    pub fn rotate_mesh_ca(&self) -> R<MeshCa> {
+        let (cert_pem, key_pem) = crate::manager::mesh_ca::generate_ca()?;
+        let created_at = OffsetDateTime::now_utc().format(&Rfc3339)?;
+        let next = MeshCa {
+            cert_pem,
+            key_pem,
+            created_at,
+        };
+        self.replicated(Lane::Control, "rotate_mesh_ca", move |s| {
+            let conn = s.write_connection()?;
+            conn.execute(
+                "INSERT INTO net_mesh_ca (id, cert_pem, key_pem, created_at)
+                 VALUES (1, ?1, ?2, ?3)
+                 ON CONFLICT(id) DO UPDATE SET
+                    cert_pem = excluded.cert_pem,
+                    key_pem = excluded.key_pem,
+                    created_at = excluded.created_at;",
+                params![next.cert_pem, next.key_pem, next.created_at],
+            )?;
+            Ok(next.clone())
+        })
     }
 }
 

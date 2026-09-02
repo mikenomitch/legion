@@ -33,6 +33,7 @@ use crate::structs::netpolicy::{
 use crate::structs::{UpstreamHttpConfig, UpstreamTarget};
 use crate::worker::balance::{Balancer, Endpoint};
 use crate::worker::forwarder::ForwarderContext;
+use crate::worker::netd::handlers::{self, HopFacts, HopOutcome, ProxyTarget};
 use crate::worker::netd::metrics as net_metrics;
 
 use bytes::Bytes;
@@ -40,9 +41,11 @@ use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::Incoming;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 /// How long an upstream dial may take before it counts as a connect failure.
@@ -192,6 +195,17 @@ pub struct HttpSettings {
     outliers: Mutex<HashMap<String, OutlierState>>,
     dlp: Vec<Dlp>,
     log_handler: bool,
+    /// The upstream's own handlers (`connect.upstreams[].handlers`); the
+    /// external ones (`authz`, `proxy`) run per request after the chain's.
+    pub handlers: Vec<HandlerConfig>,
+}
+
+/// What a listener knows about one accepted connection.
+#[derive(Debug, Clone, Default)]
+pub struct ConnInfo {
+    /// The verified peer identity (ingress with mutual TLS).
+    pub identity: Option<String>,
+    pub peer: Option<SocketAddr>,
 }
 
 impl HttpSettings {
@@ -285,6 +299,7 @@ impl HttpSettings {
             outliers: Mutex::new(HashMap::new()),
             dlp,
             log_handler,
+            handlers: handlers.to_vec(),
         }
     }
 
@@ -428,10 +443,21 @@ impl HttpSettings {
 
 /// Serve one accepted connection in HTTP mode until the client closes it.
 pub async fn serve(client: TcpStream, settings: Arc<HttpSettings>) {
+    serve_with(client, settings, ConnInfo::default()).await
+}
+
+/// Serve one accepted connection — plain or TLS-terminated — knowing who is
+/// on the other end.
+pub async fn serve_with<S>(client: S, settings: Arc<HttpSettings>, conn: ConnInfo)
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let io = TokioIo::new(client);
+    let conn = Arc::new(conn);
     let service = hyper::service::service_fn(move |req: Request<Incoming>| {
         let settings = settings.clone();
-        async move { Ok::<_, hyper::Error>(handle(req, settings).await) }
+        let conn = conn.clone();
+        async move { Ok::<_, hyper::Error>(handle(req, settings, conn).await) }
     });
     if let Err(err) = hyper::server::conn::http1::Builder::new()
         .preserve_header_case(true)
@@ -491,7 +517,11 @@ fn error_response(status: StatusCode, message: String) -> Response<OutBody> {
 }
 
 /// One request end to end.
-async fn handle(req: Request<Incoming>, settings: Arc<HttpSettings>) -> Response<OutBody> {
+async fn handle(
+    req: Request<Incoming>,
+    settings: Arc<HttpSettings>,
+    conn: Arc<ConnInfo>,
+) -> Response<OutBody> {
     let started = Instant::now();
     let method = req.method().as_str().to_ascii_uppercase();
     let path = req
@@ -541,7 +571,7 @@ async fn handle(req: Request<Incoming>, settings: Arc<HttpSettings>) -> Response
             host: Some(fact_host.as_str()),
             ip: fact_host.parse().ok(),
             port: fact_port,
-            identity: None,
+            identity: conn.identity.as_deref(),
             method: &method,
             path: path.split('?').next().unwrap_or("/"),
             headers: &headers,
@@ -574,13 +604,83 @@ async fn handle(req: Request<Incoming>, settings: Arc<HttpSettings>) -> Response
                 0,
             )
             .await;
+            note_edge_denied(&settings);
             return denied_response(
-                "egress",
+                direction,
                 &settings.key,
                 &destination,
                 &source,
                 reason.as_deref(),
             );
+        }
+    }
+
+    // 1b. External handlers, with the request head: a webhook may deny, a
+    // proxy may take the request.
+    let path_only = path.split('?').next().unwrap_or("/").to_string();
+    let hop_facts = HopFacts {
+        allocation_id: settings.allocation_id,
+        direction,
+        protocol: PROTOCOL_HTTP,
+        destination: &destination,
+        host: Some(fact_host.as_str()),
+        ip: fact_host.parse().ok(),
+        port: fact_port,
+        identity: conn.identity.as_deref(),
+        method: Some(&method),
+        path: Some(&path_only),
+        headers: &headers,
+    };
+    let hops = handlers::hops_for(
+        &settings.context,
+        settings.allocation_id,
+        direction,
+        Some(&settings.key),
+        &settings.handlers,
+    );
+    let mut hand_off: Option<ProxyTarget> = None;
+    if !hops.is_empty() {
+        match handlers::run(&settings.context, &hops, &hop_facts).await {
+            HopOutcome::Allow => {}
+            HopOutcome::Deny { source, reason } => {
+                net_metrics::connection(direction, PROTOCOL_HTTP, "deny");
+                settings.context.record_denial_for(
+                    settings.allocation_id,
+                    conn.identity.as_deref(),
+                    direction,
+                    PROTOCOL_HTTP,
+                    &destination,
+                    &source,
+                    reason.as_deref(),
+                    &method,
+                    &path_only,
+                );
+                if let Some(chain) = chain {
+                    access_log(
+                        &settings,
+                        chain,
+                        &method,
+                        &path,
+                        host_header.as_deref(),
+                        403,
+                        "deny",
+                        Some(&source),
+                        started,
+                        0,
+                        0,
+                    )
+                    .await;
+                }
+                note_edge_denied(&settings);
+                return denied_response(
+                    direction,
+                    &settings.key,
+                    &destination,
+                    &source,
+                    reason.as_deref(),
+                );
+            }
+            HopOutcome::Proxy(target) => hand_off = Some(target),
         }
     }
 
@@ -614,7 +714,7 @@ async fn handle(req: Request<Incoming>, settings: Arc<HttpSettings>) -> Response
                             net_metrics::connection(direction, PROTOCOL_HTTP, "deny");
                             settings.context.record_denial(
                                 settings.allocation_id,
-                                "egress",
+                                direction,
                                 PROTOCOL_HTTP,
                                 &destination,
                                 &dlp.source,
@@ -622,8 +722,9 @@ async fn handle(req: Request<Incoming>, settings: Arc<HttpSettings>) -> Response
                                 &method,
                                 &path,
                             );
+                            note_edge_denied(&settings);
                             return denied_response(
-                                "egress",
+                                direction,
                                 &settings.key,
                                 &destination,
                                 &dlp.source,
@@ -638,7 +739,7 @@ async fn handle(req: Request<Incoming>, settings: Arc<HttpSettings>) -> Response
                         net_metrics::connection(direction, PROTOCOL_HTTP, "deny");
                         settings.context.record_denial(
                             settings.allocation_id,
-                            "egress",
+                            direction,
                             PROTOCOL_HTTP,
                             &destination,
                             &dlp.source,
@@ -662,8 +763,9 @@ async fn handle(req: Request<Incoming>, settings: Arc<HttpSettings>) -> Response
                             )
                             .await;
                         }
+                        note_edge_denied(&settings);
                         return denied_response(
-                            "egress",
+                            direction,
                             &settings.key,
                             &destination,
                             &dlp.source,
@@ -684,8 +786,9 @@ async fn handle(req: Request<Incoming>, settings: Arc<HttpSettings>) -> Response
                         .first()
                         .map(|d| d.source.clone())
                         .unwrap_or_default();
+                    note_edge_denied(&settings);
                     return denied_response(
-                        "egress",
+                        direction,
                         &settings.key,
                         &destination,
                         &source,
@@ -700,6 +803,74 @@ async fn handle(req: Request<Incoming>, settings: Arc<HttpSettings>) -> Response
         }
     };
     let bytes_in = body_bytes.len() as u64;
+
+    // A `proxy` hop: one attempt, to the proxy, in absolute form with the
+    // Legion attribution headers; the proxy answers for the origin.
+    if let Some(target) = hand_off {
+        let scheme = if settings.target.as_ref().is_some_and(|t| t.tls) {
+            "https"
+        } else {
+            "http"
+        };
+        let authority = match settings.target.as_ref() {
+            Some(target) => target.addr(),
+            None => host_header.clone().unwrap_or_else(|| settings.key.clone()),
+        };
+        let hand = HandOff {
+            scheme,
+            authority,
+            headers: handlers::legion_headers(&settings.context, &hop_facts),
+        };
+        let outcome = attempt_request(
+            &settings,
+            &target.addr,
+            &parts,
+            body_bytes.clone(),
+            host_header.as_deref(),
+            Some(&hand),
+            None,
+        )
+        .await;
+        return match outcome {
+            Ok(response) => {
+                let status = response.status();
+                net_metrics::connection(direction, PROTOCOL_HTTP, "allow");
+                note_edge_request(&settings, None, Some(status.as_u16()), started, bytes_in);
+                if let Some(chain) = chain {
+                    access_log(
+                        &settings,
+                        chain,
+                        &method,
+                        &path,
+                        host_header.as_deref(),
+                        status.as_u16(),
+                        "allow",
+                        Some(&target.source),
+                        started,
+                        bytes_in,
+                        0,
+                    )
+                    .await;
+                }
+                response
+            }
+            Err(err) => {
+                settings.context.note_handler(
+                    settings.allocation_id,
+                    &target.source,
+                    crate::structs::netpolicy::HANDLER_PROXY,
+                    &target.addr,
+                    Err(err.to_string()),
+                );
+                net_metrics::connection(direction, PROTOCOL_HTTP, "error");
+                note_edge_request(&settings, None, None, started, bytes_in);
+                error_response(
+                    StatusCode::BAD_GATEWAY,
+                    format!("proxy handler {}: {err}", target.source),
+                )
+            }
+        };
+    }
 
     // 2. Attempts.
     let retry = settings.retry.clone();
@@ -718,12 +889,14 @@ async fn handle(req: Request<Incoming>, settings: Arc<HttpSettings>) -> Response
                 break;
             }
         }
-        let addr = match settings.target.as_ref() {
-            Some(target) => target.addr(),
+        let (addr, mesh_endpoint, edge_tag) = match settings.target.as_ref() {
+            Some(target) => (target.addr(), None, None),
             None => match settings.pick(&candidates) {
                 Some(endpoint) => {
                     candidates.retain(|e| e.addr != endpoint.addr);
-                    endpoint.addr
+                    let mesh = endpoint.mesh_tls.then(|| endpoint.clone());
+                    let tag = endpoint.tags.first().cloned();
+                    (endpoint.addr, mesh, tag)
                 }
                 None => {
                     last_error = Some("no healthy endpoints".into());
@@ -739,7 +912,7 @@ async fn handle(req: Request<Incoming>, settings: Arc<HttpSettings>) -> Response
                     host: Some(settings.key.as_str()),
                     ip: socket.map(|s| s.ip()),
                     port: socket.map(|s| s.port()).unwrap_or(0),
-                    identity: None,
+                    identity: conn.identity.as_deref(),
                     method: &method,
                     path: path.split('?').next().unwrap_or("/"),
                     headers: &headers,
@@ -750,7 +923,7 @@ async fn handle(req: Request<Incoming>, settings: Arc<HttpSettings>) -> Response
                     net_metrics::connection(direction, PROTOCOL_HTTP, "deny");
                     settings.context.record_denial(
                         settings.allocation_id,
-                        "egress",
+                        direction,
                         PROTOCOL_HTTP,
                         &addr,
                         &source,
@@ -758,8 +931,9 @@ async fn handle(req: Request<Incoming>, settings: Arc<HttpSettings>) -> Response
                         &method,
                         facts.path,
                     );
+                    note_edge_denied(&settings);
                     return denied_response(
-                        "egress",
+                        direction,
                         &settings.key,
                         &addr,
                         &source,
@@ -780,6 +954,8 @@ async fn handle(req: Request<Incoming>, settings: Arc<HttpSettings>) -> Response
             &parts,
             body_bytes.clone(),
             host_header.as_deref(),
+            None,
+            mesh_endpoint.as_ref(),
         );
         let outcome = match remaining {
             Some(remaining) => match tokio::time::timeout(remaining, attempt_future).await {
@@ -801,6 +977,13 @@ async fn handle(req: Request<Incoming>, settings: Arc<HttpSettings>) -> Response
                     continue;
                 }
                 net_metrics::connection(direction, PROTOCOL_HTTP, "allow");
+                note_edge_request(
+                    &settings,
+                    edge_tag.as_deref(),
+                    Some(status.as_u16()),
+                    started,
+                    bytes_in,
+                );
                 if let Some(chain) = chain {
                     access_log(
                         &settings,
@@ -851,6 +1034,7 @@ async fn handle(req: Request<Incoming>, settings: Arc<HttpSettings>) -> Response
     }
 
     net_metrics::connection(direction, PROTOCOL_HTTP, "error");
+    note_edge_request(&settings, None, None, started, bytes_in);
     let message = last_error.unwrap_or_else(|| "upstream unavailable".into());
     let status = if message.contains("deadline") {
         StatusCode::GATEWAY_TIMEOUT
@@ -876,6 +1060,40 @@ async fn handle(req: Request<Incoming>, settings: Arc<HttpSettings>) -> Response
     error_response(status, message)
 }
 
+/// Service-graph sample for one egress request (docs/network-handlers.md,
+/// "Service graph"). Ingress listeners are not edges: the graph is who calls
+/// whom, recorded on the calling side.
+fn note_edge_request(
+    settings: &Arc<HttpSettings>,
+    tag: Option<&str>,
+    status: Option<u16>,
+    started: Instant,
+    bytes_in: u64,
+) {
+    if settings.direction != "egress" {
+        return;
+    }
+    settings.context.edges().record_request(
+        settings.allocation_id,
+        &settings.key,
+        tag,
+        status,
+        started.elapsed().as_millis() as u64,
+        bytes_in,
+        0,
+    );
+}
+
+fn note_edge_denied(settings: &Arc<HttpSettings>) {
+    if settings.direction != "egress" {
+        return;
+    }
+    settings
+        .context
+        .edges()
+        .record_denied(settings.allocation_id, &settings.key, PROTOCOL_HTTP);
+}
+
 enum AttemptError {
     Connect(String),
     Reset(String),
@@ -892,14 +1110,26 @@ impl std::fmt::Display for AttemptError {
     }
 }
 
+/// A `proxy` hop in HTTP mode: send the request to the proxy in absolute
+/// form with the attribution headers.
+struct HandOff {
+    scheme: &'static str,
+    authority: String,
+    headers: Vec<(String, String)>,
+}
+
 /// Dial `addr`, send the request, and return the response with its body
-/// streamed through.
+/// streamed through. `hand_off` sends it to a proxy instead of the origin;
+/// `mesh` dials a mesh endpoint with this node's certificate and names the
+/// workload in a PROXY v2 header before the request.
 async fn attempt_request(
     settings: &Arc<HttpSettings>,
     addr: &str,
     parts: &http::request::Parts,
     body: Bytes,
     host_header: Option<&str>,
+    hand_off: Option<&HandOff>,
+    mesh: Option<&Endpoint>,
 ) -> Result<Response<OutBody>, AttemptError> {
     let stream = match settings.netns.clone() {
         Some(netns) => {
@@ -918,13 +1148,16 @@ async fn attempt_request(
     };
     let _ = stream.set_nodelay(true);
 
-    let mut builder = Request::builder().method(parts.method.clone()).uri(
-        parts
-            .uri
-            .path_and_query()
-            .map(|pq| pq.as_str())
-            .unwrap_or("/"),
-    );
+    let path_and_query = parts
+        .uri
+        .path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or("/");
+    let uri = match hand_off {
+        Some(hand) => format!("{}://{}{}", hand.scheme, hand.authority, path_and_query),
+        None => path_and_query.to_string(),
+    };
+    let mut builder = Request::builder().method(parts.method.clone()).uri(uri);
     for (name, value) in parts.headers.iter() {
         let lower = name.as_str().to_ascii_lowercase();
         if HOP_BY_HOP.contains(&lower.as_str()) || lower == "host" {
@@ -945,12 +1178,48 @@ async fn attempt_request(
         None => host_header.unwrap_or(addr).to_string(),
     };
     builder = builder.header("host", host);
+    if let Some(hand) = hand_off {
+        for (name, value) in &hand.headers {
+            builder = builder.header(name.as_str(), value.as_str());
+        }
+    }
     let request = builder
         .body(full(body))
         .map_err(|err| AttemptError::Reset(err.to_string()))?;
 
+    if let Some(endpoint) = mesh {
+        let connector = settings
+            .context
+            .mesh_connector()
+            .ok_or_else(|| AttemptError::Connect("no mesh certificate yet".into()))?;
+        let server_name = crate::worker::netd::tls::server_name(
+            &crate::manager::mesh_ca::node_dns_name(&endpoint.node_id),
+        )
+        .map_err(|err| AttemptError::Connect(err.to_string()))?;
+        let mut tls = connector
+            .connect(server_name, stream)
+            .await
+            .map_err(|err| AttemptError::Connect(format!("mesh tls: {err}")))?;
+        let header = handlers::proxy_header(
+            &settings.context,
+            &HopFacts {
+                allocation_id: settings.allocation_id,
+                direction: "egress",
+                protocol: PROTOCOL_HTTP,
+                destination: addr,
+                ..Default::default()
+            },
+            None,
+            addr.parse().ok(),
+        );
+        tls.write_all(&header)
+            .await
+            .map_err(|err| AttemptError::Reset(err.to_string()))?;
+        return send_over(TokioIo::new(tls), request).await;
+    }
+
     let response = match settings.target.as_ref() {
-        Some(target) if target.tls => {
+        Some(target) if target.tls && hand_off.is_none() => {
             let server_name = rustls_pki_types::ServerName::try_from(target.host.clone())
                 .map_err(|err| AttemptError::Connect(err.to_string()))?;
             let tls = settings
