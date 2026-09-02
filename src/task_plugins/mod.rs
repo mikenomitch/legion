@@ -711,6 +711,14 @@ pub trait TaskPlugin: Send + Sync {
         NetworkGate::Advisory
     }
 
+    /// [`TaskPlugin::network_gate`] for one allocation: runtimes whose gate
+    /// strength depends on the allocation's `network.mode` (a gated
+    /// namespace is a real boundary; host networking is not) answer here.
+    /// Defaults to the runtime-wide answer.
+    fn network_gate_for(&self, _allocation: &Allocation) -> NetworkGate {
+        self.network_gate()
+    }
+
     /// Open or shut this allocation's network.
     ///
     /// Called with `open: false` immediately before `start` when a
@@ -726,6 +734,27 @@ pub trait TaskPlugin: Send + Sync {
     ) -> R<()> {
         Ok(())
     }
+}
+
+/// Whether an allocation runs in a gated namespace (`network.mode = "gated"`,
+/// docs/network-handlers.md) — the shared answer for host runtimes' gate
+/// strength and namespace entry.
+pub fn allocation_is_gated(allocation: &Allocation) -> bool {
+    allocation
+        .network
+        .as_ref()
+        .is_some_and(|network| network.is_gated())
+}
+
+/// The edge-boot gate for a gated allocation is "policy withheld": a marker
+/// the datapath checks per connection (`netd::netns::set_gate`). Host
+/// runtimes call this from `set_network_gate`; it is a no-op for allocations
+/// that are not gated.
+pub fn set_gated_namespace_gate(allocation: &Allocation, open: bool) -> R<()> {
+    if !allocation_is_gated(allocation) {
+        return Ok(());
+    }
+    crate::worker::netd::netns::set_gate(allocation.id, !open)
 }
 
 /// How much a runtime's `boot`-gate network hold is actually worth.

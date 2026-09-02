@@ -51,6 +51,9 @@ pub struct Endpoint {
     pub addr: String,
     pub allocation_id: i64,
     pub node_id: String,
+    /// The backing service's tags (`service.tags`), for weighted splits by
+    /// tag in HTTP mode. Empty when the feed carried none.
+    pub tags: Vec<String>,
 }
 
 /// Picks which endpoint a new connection goes to.
@@ -201,6 +204,7 @@ mod tests {
             addr: addr.to_string(),
             allocation_id: 1,
             node_id: "node-a".into(),
+            tags: Vec::new(),
         }
     }
 

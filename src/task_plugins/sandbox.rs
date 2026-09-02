@@ -773,6 +773,9 @@ impl SandboxTaskPlugin {
                 // carries no limits. It is the designed-for next adopter —
                 // see docs/resource-enforcement.md.
                 assignment: None,
+                resolver: None,
+                resolv_conf: None,
+                netns: None,
             },
         )?;
         let mut cmd = Command::new(binary);

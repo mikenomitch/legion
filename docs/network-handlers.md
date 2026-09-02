@@ -57,19 +57,42 @@ legion net policy test agent --to https://api.github.com/user   # would this be 
 ## What the datapath does today
 
 Every connection a task makes through an upstream — `LEGION_UPSTREAM_<KEY>`,
-a loopback port the node owns — passes through the node's forwarder. Before
-it dials, the forwarder evaluates the task's **effective egress policy** with
-what is known at connect time: the destination host (the service name, or
-an external upstream's host), the port, and for service upstreams the
-endpoint about to be dialed. A denial closes the connection without dialing,
-increments `legion_net_denied_total`, and is reported on the next heartbeat
-as a `net.denied` event naming the rule. An allowed connection is spliced;
-nothing is parsed.
+a loopback port the node owns — passes through the node's forwarder, which
+runs in one of two modes:
 
-That is the whole per-connection cost of a connect-time policy: one rule
-walk, no bytes inspected. Rules that need the HTTP request (a path, a
-method, a header) are the HTTP phase's work and are validated today, run
-tomorrow — see [Current scope](#current-scope-and-limitations).
+**L4 (the default).** Before dialing, the forwarder evaluates the task's
+**effective egress policy** with what is known at connect time: the
+destination host (the service name, or an external upstream's host), the
+port, and for service upstreams the endpoint about to be dialed. A denial
+closes the connection without dialing, increments `legion_net_denied_total`,
+and is reported on the next heartbeat as a `net.denied` event naming the
+rule. An allowed connection is spliced; nothing is parsed. That is the whole
+per-connection cost of a connect-time policy — one rule walk, no bytes
+inspected.
+
+**HTTP mode.** An upstream is parsed as HTTP/1.1 when it declares HTTP — an
+`http://`/`https://` target, an `http` block, or a `dlp` handler — or when
+the effective egress policy is `protocol = "http"`. Per request:
+
+1. The chain is evaluated with the request head (method, path, headers) on
+   top of the connect-time facts. A denial is a `403` whose body and
+   `Legion-Denied-By` / `Legion-Denied-Reason` headers name the rule, so a
+   client — an agent in a sandbox — reads *why* instead of retrying.
+2. `dlp` handlers buffer the body up to `maxBytes` and reject a match.
+3. Traffic management from the upstream's `http` block: a per-request
+   `timeout`; `retries` for idempotent methods only (by default) on
+   connect failures and 5xx, under a `budget` (default 20% of requests per
+   minute); a weighted `split` by service tag; `outlier` ejection of an
+   endpoint after `consecutive5xx` failures for `ejectFor`.
+4. One upstream connection per request, TLS originated for `https://`, the
+   `Host` header rewritten to an external target's host.
+
+`accessLog = true` on the chain (or a `log` handler) writes one NDJSON line
+per request to `<worker logs>/<allocation>/net-access.log`, carrying the
+task's labels, the verdict, the deciding rule, status, bytes, and duration.
+
+HTTP mode is HTTP/1.1 only: no HTTP/2, no WebSocket upgrades. A task that
+needs those uses a `tcp://`/`tls://` upstream and an L4 policy.
 
 ## Policy
 
@@ -212,13 +235,55 @@ export OPENAI_BASE_URL="http://$LEGION_UPSTREAM_OPENAI/v1"
 public internet. `to` must not carry a path or query; the task chooses paths.
 
 The `http` block on an upstream (`timeout`, `retries`, `split`, `outlier`)
-and per-upstream `handlers` are validated at submit today and run in the
-HTTP phase; see below.
+turns on HTTP mode with traffic management; per-upstream `handlers` run
+there too. See [What the datapath does today](#what-the-datapath-does-today).
+
+## Name-is-config: `<key>.svc.legion`
+
+On Linux, every allocation that declares upstreams is assigned a loopback
+/24 of its own at placement (`127.42.<b>`, unique per node — the whole 127/8
+is loopback on Linux with no configuration). In it:
+
+- **`.1` is the allocation's resolver**, exported as `LEGION_DNS`. It answers
+  `<key>.svc.legion` (and bare `<key>`, via the `svc.legion` search domain)
+  with that allocation's upstream VIP; SRV carries the port. Everything else
+  is forwarded to the host's resolvers — after the egress policy has judged
+  the name, so a host the policy would deny is `NXDOMAIN` in one round trip
+  and a `net.denied` event (`protocol: dns`), never a hanging connect. Names
+  are not judged when the chain matches on CIDRs (the address is what the
+  rule needs).
+- **`.2` onward are the upstream VIPs**, one per `connect.upstreams` entry in
+  declaration order, each listening on the upstream's **canonical port**: a
+  pinned `localPort`, else the port the service declared on its own task
+  (`network.ports[].to`, or its static port), else an external target's
+  port, else the dynamic loopback port. `db.svc.legion:5432` works because
+  the `db` service declared 5432.
+
+Both addresses reach the same listener state, so policy, HTTP mode, and
+endpoints are identical whichever one the task dials. The loopback port and
+`LEGION_UPSTREAM_<KEY>` are unchanged; the name is additive.
+
+| Env var | Value |
+| --- | --- |
+| `LEGION_DNS` | `127.42.<b>.1` — the allocation's resolver |
+| `LEGION_UPSTREAM_HOST_<KEY>` | `<key>.svc.legion` |
+| `LEGION_UPSTREAM_VIP_<KEY>` | `<vip>:<canonical port>` |
+
+**Who gets the resolver automatically.** A `container` task's `/etc/resolv.conf`
+is generated to point at it (`search svc.legion`, `ndots:1`). An `exec` task
+gets `LEGION_DNS` and keeps the host resolver unless it opts in — a hardened
+`exec` with a private mount namespace will get the generated file in the
+gated phase. A `sandbox` gets the guest-side resolver in the gated phase.
+
+**macOS** configures only `127.0.0.1` on `lo0`, so no VIP block is assigned
+there: upstreams keep their loopback ports and env vars, and there is no
+per-allocation resolver. Documented, not hidden.
 
 ## Handlers
 
-Handlers are code on the path and appear only when declared. Their names are
-validated at submit; the datapath runs them from the HTTP phase onward:
+Handlers are code on the path and appear only when declared. `log` and
+`dlp` run today in HTTP mode; `authz` and `proxy` are validated at submit
+and run from the external-handlers phase:
 
 | `handler` | What it does | Sees bytes |
 | --- | --- | --- |
@@ -234,13 +299,60 @@ default). There is no syntax for an unbounded handler.
 
 | `mode` | Meaning | Default for |
 | --- | --- | --- |
-| `host` | host networking; policy is cooperative (proxy env vars) | `container`, `exec` |
-| `gated` | the namespace holds loopback and the datapath only — unbypassable (gated phase) | `sandbox` |
-| `auto` | `gated` where the runtime and platform can, else `host` | — |
+| `host` | host networking; policy is cooperative (proxy env vars, upstreams, the resolver) | `container`, `exec`, `sandbox` (until its vsock transport lands) |
+| `gated` | the workload's network namespace holds loopback and the datapath only — **unbypassable** on Linux for `container` and `exec` | — |
+| `auto` | `host` today; `gated` for `sandbox` once its guest agent ships | — |
 | `bridge`, `cni/<name>` | reserved for the datapath plugin; rejected at submit | — |
 
-The value is validated today and read from the gated phase on. A stored
-`require` policy can impose it for a pool.
+The effective mode is resolved **at placement**: the task's own value, or the
+one imposed by the highest-priority matching `require` policy (`mode` on a
+policy object). A namespace is a start-time property, so a policy that
+changes `mode` affects the next placement, not a running allocation.
+
+### Gated mode
+
+With `mode = "gated"` the worker creates an empty network namespace for the
+allocation before it starts — `/var/run/netns/legion-<allocation>`, loopback
+up, no other interface, no route — and binds every datapath listener
+*inside* it: the upstream loopback ports, the VIPs, the allocation's resolver
+at `127.42.<b>.1:53`, and an **egress proxy** at `127.0.0.1:1080`. A
+`container` joins the namespace by path (an OCI `network` namespace entry);
+an `exec` task enters it with `setns` before exec, ahead of dropping
+privileges. The worker dials out from the *host* namespace, so the listeners
+are the only door.
+
+Inside, the task gets:
+
+| Env var | Value |
+| --- | --- |
+| `LEGION_NETWORK_MODE` | `gated` |
+| `LEGION_EGRESS_PROXY`, `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` | `http://127.0.0.1:1080` |
+| `NO_PROXY` | `localhost,127.0.0.0/8,svc.legion` |
+
+The proxy speaks HTTP `CONNECT` (TLS and anything opaque, judged by host and
+port), absolute-URI plain HTTP (judged by the request head too, forwarded in
+origin form one request per connection), and SOCKS5 `CONNECT` (domain-name
+targets judged by name). Every denial is a `403` with `Legion-Denied-By`, or
+a SOCKS "connection not allowed", and a `net.denied` event. **A tool that
+ignores the proxy variables has no route and fails** — that failure is the
+enforcement, not a gap. Transparent capture (a TUN inside the namespace so
+unmodified tools work) is a later phase.
+
+Two fail-closed rules apply only to gated allocations: while the
+allocation's policy has not arrived yet (`policy-pending`) and while its
+[edge-boot](edge-boot.md) `boot` gate is shut (`gate`), every listener denies.
+A gated allocation with *no* policy at all — nothing matched, nothing inline
+— is told so explicitly and allows everything through the proxy, with
+attribution. The `boot` gate is therefore a real boundary for gated
+`container` and `exec` tasks, not the advisory one host networking gets, and
+a gated task can be allowed the package registry before ratification by a
+policy with only that host.
+
+Requirements and limits: Linux; the worker needs `CAP_SYS_ADMIN` (it already
+does, for `exec` hardening's mount namespace and for running the OCI
+runtime); IPv4 loopback only inside the namespace; no raw UDP, no ICMP, no
+inbound to undeclared ports (ingress is the next phase). macOS has no
+namespaces: `gated` is rejected at start there with that reason.
 
 ## CLI
 
@@ -274,8 +386,9 @@ instead of watching a connection hang.
 - **Events**: `net.denied` (warn) with the destination, the deciding rule,
   the reason, the peer identity, and the task's `network.labels`;
   `net.policy_applied` and `net.policy_deleted` (info).
-- **Access log** (`accessLog = true`): from the HTTP phase, one NDJSON line
-  per connection or request in the allocation's log directory.
+- **Access log** (`accessLog = true`, or a `log` handler): one NDJSON line
+  per request in HTTP mode, at `<worker logs>/<allocation>/net-access.log`.
+  L4 connections are counted in metrics, not logged per connection.
 
 ## ACLs
 
@@ -292,16 +405,19 @@ What ships now is the **policy and upstream layer on the connect datapath**;
 the phases below are laid out in the plan and named here so nothing reads as
 more than it is.
 
-- **Connect-time rules only are enforced today** (host, port, cidr,
-  identity) — on every `connect.upstreams` dial, service or external. Rules
-  on path, method, and header, the `dlp` handler, the `http` traffic block,
-  and per-upstream `handlers` are **validated at submit and run from the HTTP
-  phase**.
-- **Egress is cooperative for `container` and `exec`.** Policy applies to
-  traffic that goes through an upstream. A process that dials a raw address
-  bypasses it; the gated phase closes that on Linux with `mode = "gated"`
-  (an empty network namespace holding loopback and the datapath). On macOS
-  egress stays cooperative.
+- **Rules are enforced on the connect datapath** — connect-time rules on
+  every `connect.upstreams` dial, request-time rules (path, method, header),
+  `dlp`, and the `http` traffic block in HTTP mode. The `authz` and `proxy`
+  handlers are validated at submit and run from the external-handlers phase;
+  `log` and `dlp` run today.
+- **Egress is cooperative in `host` mode, unbypassable in `gated` mode.**
+  In `host` mode policy applies to traffic that goes through an upstream and
+  to names resolved through the allocation's resolver; a process that dials
+  a raw address bypasses it. `mode = "gated"` (Linux, `container` and
+  `exec`) closes that: the namespace has no route except Legion's listeners.
+  On macOS egress stays cooperative and there are no VIPs, per-allocation
+  resolvers, or gated namespaces. `sandbox` gets `gated` when its guest
+  agent ships.
 - **Ingress chains are validated, not yet served.** Nothing binds a task's
   advertised port yet; that is the ingress phase.
 - **`tls` on chains is validated, not yet terminated**; external upstreams

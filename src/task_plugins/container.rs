@@ -521,6 +521,26 @@ pub struct ContainerTaskPlugin;
 impl ContainerTaskPlugin {}
 
 impl TaskPlugin for ContainerTaskPlugin {
+    /// A gated allocation's namespace is a real boundary: nothing leaves it
+    /// except through the datapath, which holds its policy until ratified.
+    fn network_gate_for(&self, allocation: &Allocation) -> crate::task_plugins::NetworkGate {
+        if crate::task_plugins::allocation_is_gated(allocation) {
+            crate::task_plugins::NetworkGate::Enforced
+        } else {
+            crate::task_plugins::NetworkGate::Advisory
+        }
+    }
+
+    fn set_network_gate(
+        &self,
+        allocation: &Allocation,
+        _task: &TaskConfig,
+        _instance: &mut TaskInstance,
+        open: bool,
+    ) -> R<()> {
+        crate::task_plugins::set_gated_namespace_gate(allocation, open)
+    }
+
     fn name(&self) -> &'static str {
         "container"
     }
@@ -813,6 +833,28 @@ impl TaskPlugin for ContainerTaskPlugin {
                 let scratch = work_root(allocation, instance);
                 let layout = oci_image::resolve_layout(&config.image, instance, &scratch)?;
                 let bundle = scratch.join("bundle");
+                // Name-is-config: point the container at the allocation's
+                // own resolver when it was assigned one.
+                let resolver = allocation
+                    .network
+                    .as_ref()
+                    .and_then(|network| network.resolver_address());
+                // A gated allocation joins the namespace the worker created
+                // for it (docs/network-handlers.md); its absence is a hard
+                // stop rather than a silent fall back to host networking.
+                let gated_netns = if crate::task_plugins::allocation_is_gated(allocation) {
+                    let path = crate::worker::netd::netns::netns_path(allocation.id);
+                    if !path.exists() {
+                        bail!(
+                            "gated network namespace {} is not ready; the worker creates it before \
+                             start and retries on its next heartbeat",
+                            path.display()
+                        );
+                    }
+                    Some(path)
+                } else {
+                    None
+                };
                 let image_stop_signal = oci_bundle::build_bundle(
                     &layout,
                     &bundle,
@@ -823,6 +865,9 @@ impl TaskPlugin for ContainerTaskPlugin {
                         volumes: &instance.volumes,
                         task_dir: instance.task_dir.as_deref(),
                         assignment: instance.resource_assignment.as_ref(),
+                        resolver: resolver.as_deref(),
+                        resolv_conf: None,
+                        netns: gated_netns.as_deref(),
                     },
                 )?;
                 // Recorded now, while the layout is still on disk: teardown
@@ -1271,6 +1316,8 @@ mod tests {
                     to: None,
                 },
             ],
+            vip_block: None,
+            mode: None,
         });
         let args = build_apple_launch(
             &allocation,

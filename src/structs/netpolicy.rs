@@ -885,6 +885,15 @@ impl EffectiveChain {
             .iter()
             .all(|rule| !rule.rule.matcher.needs_request())
     }
+
+    /// Whether any rule matches on a CIDR — in which case a name cannot be
+    /// judged at resolution time (the address is not known yet) and DNS must
+    /// answer and let the connect-time check decide.
+    pub fn uses_cidr(&self) -> bool {
+        self.rules
+            .iter()
+            .any(|rule| rule.rule.matcher.cidr.is_some())
+    }
 }
 
 /// The whole merged policy for one allocation.
@@ -1184,8 +1193,11 @@ fn connect_parts_match(
     port: u16,
     identity: Option<&str>,
 ) -> bool {
+    // Port 0 means "not known yet" (a DNS-time check): a port constraint is
+    // then treated as satisfied, so resolution is never refused for a name
+    // the connect-time check would allow.
     if let Some(want) = matcher.port {
-        if want != port {
+        if port != 0 && want != port {
             return false;
         }
     }

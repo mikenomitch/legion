@@ -157,9 +157,12 @@
             },
             network = {
                 # Datapath: auto | host | gated (docs/network-handlers.md).
-                # `gated` gives the task a namespace holding loopback and the
-                # datapath only, so egress policy is unbypassable; `auto`
-                # picks gated for sandbox and host otherwise. `bridge` /
+                # `gated` (Linux, container and exec) gives the task an empty
+                # network namespace holding loopback and the datapath only —
+                # upstream ports, VIPs, its resolver, and an egress proxy at
+                # 127.0.0.1:1080 exported as HTTP_PROXY/HTTPS_PROXY/ALL_PROXY
+                # — so egress policy is unbypassable. `auto` is host today. A
+                # `require` policy can impose a mode for a pool. `bridge` /
                 # `cni/<name>` are reserved for the datapath plugin.
                 mode = "auto",
                 ports = [

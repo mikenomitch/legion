@@ -19,7 +19,11 @@
 //! §3.1 / network-handlers-plan §7.8): policy in, telemetry out, capture
 //! setup and teardown. Nothing here reaches into the heartbeat loop.
 
+pub mod dns;
+pub mod http;
+pub mod netns;
 pub mod policy;
+pub mod proxy;
 
 pub use policy::{Denials, NetPolicyCache, PolicyLookup};
 

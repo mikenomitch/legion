@@ -114,6 +114,15 @@ impl NetPolicyCache {
         }
     }
 
+    /// Whether the manager has named a policy hash for this allocation at
+    /// all (as opposed to "no policy applies"). Together with `is_ready`
+    /// this distinguishes *pending* — a gated allocation must fail closed —
+    /// from *known empty*.
+    pub fn has_assignment(&self, allocation_id: i64) -> bool {
+        let state = self.state.read().unwrap_or_else(|p| p.into_inner());
+        state.by_alloc.contains_key(&allocation_id)
+    }
+
     /// Hashes currently assigned but not yet fetched.
     pub fn pending_hashes(&self) -> Vec<String> {
         let state = self.state.read().unwrap_or_else(|p| p.into_inner());

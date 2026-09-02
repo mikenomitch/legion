@@ -96,6 +96,12 @@ checks = [
 
 ## Environment variables
 
+> On Linux an allocation with upstreams also gets `LEGION_DNS` (its own
+> resolver) and, per upstream, `LEGION_UPSTREAM_HOST_<KEY>` /
+> `LEGION_UPSTREAM_VIP_<KEY>`, so `<key>.svc.legion:<port>` works in a URL or
+> config file with no env plumbing. See
+> [Network Handlers — Name-is-config](network-handlers.md#name-is-config-keysvclegion).
+
 Every task gets its identity and assigned ports injected (user-declared env
 wins on conflicts):
 
@@ -120,6 +126,14 @@ A task is never handed the endpoints of services it did not ask for — the
 environment is O(its own ports + its own upstreams), never O(cluster services).
 
 ## Connecting to services: the `connect` block
+
+> **External destinations, HTTP mode, and policy.** An upstream can also be
+> an external destination (`{ name = "openai", to = "https://api.openai.com" }`),
+> carry an `http` block (timeouts, budgeted retries, canary split by tag,
+> outlier ejection), and be governed by egress policy — all on the same
+> loopback forwarder. That surface is documented in
+> [Network Handlers](network-handlers.md).
+
 
 Discovery tells you *where* a service is. `connect` closes the last mile: the
 task gets one fixed local address per upstream, and the worker load-balances

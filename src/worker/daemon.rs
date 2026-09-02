@@ -149,6 +149,8 @@ async fn run_worker_with_manager(
 
     let name = resolve_worker_name(name_override, config.name_prefix.clone())?;
     let state_path = WorkerStateStore::path_for_worker(&name);
+    // Access logs sit next to each allocation's own logs.
+    let logs_base_dir = WorkerStateStore::new(state_path.clone()).logs_base_dir();
     let task_manager = Arc::new(Mutex::new(WorkerTaskManager::with_state_store(
         WorkerStateStore::new(state_path),
     )));
@@ -327,12 +329,25 @@ async fn run_worker_with_manager(
     // one may send traffic. Idle (and free) until a task declares upstreams.
     // The connect datapath, with the policy cache and denial ledger the
     // heartbeat loop feeds and drains (docs/network-handlers.md).
-    let forwarder = Arc::new(UpstreamForwarder::with_context(Arc::new(
+    let net_context = Arc::new(
         crate::worker::forwarder::ForwarderContext::new(
             Arc::new(crate::worker::netd::NetPolicyCache::new()),
             Arc::new(crate::worker::netd::Denials::new()),
-        ),
-    )));
+        )
+        .with_logs_base_dir(logs_base_dir.clone()),
+    );
+    let net_dns = Arc::new(crate::worker::netd::dns::NetDns::new(
+        net_context.clone(),
+        crate::worker::netd::dns::NetDns::host_forwarders(),
+    ));
+    let net_proxies = Arc::new(crate::worker::netd::proxy::EgressProxies::new(
+        net_context.clone(),
+    ));
+    let forwarder = Arc::new(
+        UpstreamForwarder::with_context(net_context)
+            .with_dns(net_dns)
+            .with_proxies(net_proxies),
+    );
     let heartbeat_fut = start_heartbeats(
         name.clone(),
         client.clone(),
@@ -1034,6 +1049,18 @@ async fn heartbeat_tick(
                 })
                 .collect();
 
+            // Gated namespaces exist before anything starts (and the
+            // datapath listeners inside them are bound by apply_upstreams,
+            // which ran above on this same reply).
+            {
+                // The guard is never held across the await: take the set
+                // out, reconcile, put it back.
+                let mut gated = std::mem::take(
+                    &mut *GATED_ALLOCATIONS.lock().unwrap_or_else(|p| p.into_inner()),
+                );
+                apply_net_capture(&desired, &mut gated).await;
+                *GATED_ALLOCATIONS.lock().unwrap_or_else(|p| p.into_inner()) = gated;
+            }
             let new_allocations = {
                 let mut manager = task_manager.lock().expect("task manager");
                 manager.set_stop_causes(stop_causes);
@@ -1097,6 +1124,12 @@ async fn heartbeat_tick(
 async fn apply_upstreams(forwarder: &UpstreamForwarder, reply: &HeartbeatReply) {
     let specs = upstream_specs(&reply.desired_allocations);
     forwarder.sync(&specs).await;
+    if let Some(dns) = forwarder.dns() {
+        dns.sync(&dns_specs(&reply.desired_allocations)).await;
+    }
+    if let Some(proxies) = forwarder.proxies() {
+        proxies.sync(&proxy_specs(&reply.desired_allocations)).await;
+    }
     for update in &reply.upstream_endpoints {
         forwarder.set_endpoints(
             update.allocation_id,
@@ -1183,17 +1216,155 @@ fn upstream_specs(desired: &[TaskAllocation]) -> Vec<UpstreamSpec> {
                 continue;
             }
         };
+        // The declaration side carries the `http` block and handlers, keyed
+        // the same way the assigned loopback ports are.
+        let declared: crate::structs::ConnectConfig =
+            serde_json::from_str(&allocation.task_connect).unwrap_or_default();
+        let netns = network
+            .is_gated()
+            .then(|| crate::worker::netd::netns::netns_path(allocation.allocation_id));
         for upstream in &network.upstreams {
+            let declaration = declared
+                .upstreams
+                .iter()
+                .find(|candidate| candidate.key() == upstream.service);
             specs.push(UpstreamSpec {
                 allocation_id: allocation.allocation_id,
                 service: upstream.service.clone(),
                 local_port: upstream.local_port,
                 balance: upstream.balance.clone(),
                 to: upstream.to.clone(),
+                http: declaration.and_then(|d| d.http.clone()),
+                handlers: declaration.map(|d| d.handlers.clone()).unwrap_or_default(),
+                vip: upstream.vip.clone(),
+                canonical_port: upstream.canonical_port,
+                netns: netns.clone(),
             });
         }
     }
     specs
+}
+
+/// The per-allocation resolvers a desired set implies: one per allocation
+/// that was assigned a VIP block, answering `<key>.svc.legion` with that
+/// allocation's upstream VIPs.
+fn dns_specs(desired: &[TaskAllocation]) -> Vec<crate::worker::netd::dns::DnsSpec> {
+    let mut specs = Vec::new();
+    for allocation in desired {
+        if allocation.network.trim().is_empty() {
+            continue;
+        }
+        let Ok(network) = serde_json::from_str::<AllocNetwork>(&allocation.network) else {
+            continue;
+        };
+        let Some(resolver) = network
+            .resolver_address()
+            .and_then(|addr| addr.parse::<std::net::Ipv4Addr>().ok())
+        else {
+            continue;
+        };
+        let names = network
+            .vip_names()
+            .into_iter()
+            .filter_map(|(key, (vip, port))| {
+                Some((key, (vip.parse::<std::net::Ipv4Addr>().ok()?, port)))
+            })
+            .collect();
+        specs.push(crate::worker::netd::dns::DnsSpec {
+            allocation_id: allocation.allocation_id,
+            resolver,
+            names,
+            netns: network
+                .is_gated()
+                .then(|| crate::worker::netd::netns::netns_path(allocation.allocation_id)),
+        });
+    }
+    specs
+}
+
+/// Allocations this worker created a gated namespace for, so departures can
+/// be torn down. Process-wide: there is one worker per process, and a
+/// namespace outliving a worker restart is found again by path.
+static GATED_ALLOCATIONS: std::sync::LazyLock<Mutex<std::collections::HashSet<i64>>> =
+    std::sync::LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
+
+/// The egress proxies a desired set implies: one inside every gated
+/// allocation's namespace.
+fn proxy_specs(desired: &[TaskAllocation]) -> Vec<crate::worker::netd::proxy::ProxySpec> {
+    gated_allocation_ids(desired)
+        .into_iter()
+        .map(|allocation_id| crate::worker::netd::proxy::ProxySpec {
+            allocation_id,
+            netns: Some(crate::worker::netd::netns::netns_path(allocation_id)),
+            listen: None,
+        })
+        .collect()
+}
+
+/// Allocations whose effective `network.mode` is `gated`.
+fn gated_allocation_ids(desired: &[TaskAllocation]) -> Vec<i64> {
+    desired
+        .iter()
+        .filter(|allocation| {
+            !allocation.network.trim().is_empty()
+                && serde_json::from_str::<AllocNetwork>(&allocation.network)
+                    .map(|network| network.is_gated())
+                    .unwrap_or(false)
+        })
+        .map(|allocation| allocation.allocation_id)
+        .collect()
+}
+
+/// Gated namespaces: created for every gated allocation in the desired set
+/// *before* anything is started (a container joins the namespace at start;
+/// an exec task enters it before exec), and removed for allocations that
+/// have left it. Runs on the heartbeat tick ahead of reconcile so the
+/// ordering is structural, not a race. Failures are logged and retried on
+/// the next tick; a gated task whose namespace is missing refuses to start
+/// with a clear error rather than starting unconfined.
+async fn apply_net_capture(
+    desired: &[TaskAllocation],
+    previously_gated: &mut std::collections::HashSet<i64>,
+) {
+    if !crate::worker::netd::netns::platform_supports_netns() {
+        return;
+    }
+    let wanted: std::collections::HashSet<i64> =
+        gated_allocation_ids(desired).into_iter().collect();
+    for allocation_id in wanted.iter().copied() {
+        if crate::worker::netd::netns::netns_exists(allocation_id) {
+            continue;
+        }
+        let created =
+            tokio::task::spawn_blocking(move || crate::worker::netd::netns::create(allocation_id))
+                .await;
+        match created {
+            Ok(Ok(path)) => {
+                info!(allocation_id, path = %path.display(), "Created gated network namespace")
+            }
+            Ok(Err(err)) => {
+                warn!(allocation_id, error = ?err, "Failed to create gated network namespace; the task will not start until it exists")
+            }
+            Err(err) => warn!(allocation_id, error = ?err, "Namespace creation task panicked"),
+        }
+    }
+    for allocation_id in previously_gated.iter().copied() {
+        if wanted.contains(&allocation_id) {
+            continue;
+        }
+        let destroyed =
+            tokio::task::spawn_blocking(move || crate::worker::netd::netns::destroy(allocation_id))
+                .await;
+        match destroyed {
+            Ok(Ok(())) => debug!(allocation_id, "Removed gated network namespace"),
+            Ok(Err(err)) => {
+                warn!(allocation_id, error = ?err, "Failed to remove gated network namespace")
+            }
+            Err(err) => warn!(allocation_id, error = ?err, "Namespace removal task panicked"),
+        }
+        let _ = crate::worker::netd::netns::set_gate(allocation_id, false);
+    }
+    *previously_gated = wanted;
 }
 
 /// Endpoints from one `UpstreamEndpoints` entry that the forwarder can
@@ -1210,6 +1381,7 @@ fn dialable_endpoints(update: &UpstreamEndpoints) -> Vec<Endpoint> {
             addr: format!("{}:{}", endpoint.address, endpoint.port),
             allocation_id: endpoint.allocation_id,
             node_id: endpoint.node_id.clone(),
+            tags: endpoint.tags.clone(),
         })
         .collect()
 }
@@ -1534,6 +1706,11 @@ mod tests {
                 local_port: 20003,
                 balance: "least_conn".into(),
                 to: None,
+                http: None,
+                handlers: Vec::new(),
+                vip: None,
+                canonical_port: None,
+                netns: None,
             }]
         );
     }
@@ -1598,6 +1775,7 @@ mod tests {
                 addr: "10.0.0.5:20001".into(),
                 allocation_id: 42,
                 node_id: "node-b".into(),
+                tags: Vec::new(),
             }]
         );
     }
@@ -1643,6 +1821,11 @@ mod tests {
                 local_port,
                 balance: "least_conn".into(),
                 to: None,
+                http: None,
+                handlers: Vec::new(),
+                vip: None,
+                canonical_port: None,
+                netns: None,
             }]
         );
         // The listener is live on the loopback port the task will dial.

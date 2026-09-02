@@ -27,13 +27,17 @@
 //! Choosing *which* endpoint a connection goes to is [`crate::worker::balance`].
 
 use crate::prelude::*;
+use crate::structs::netpolicy::HandlerConfig;
 use crate::structs::netpolicy::{ConnectFacts, Verdict, PROTOCOL_TCP};
+use crate::structs::UpstreamHttpConfig;
 use crate::structs::{parse_upstream_target, UpstreamTarget, UPSTREAM_LOOPBACK_ADDR};
 use crate::worker::balance::{balancer, default_balancer, Balancer, Endpoint};
+use crate::worker::netd::http::HttpSettings;
 use crate::worker::netd::policy::{egress_connect_verdict, AllocIdentity};
 use crate::worker::netd::{metrics as net_metrics, Denials, PolicyLookup};
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
@@ -72,6 +76,19 @@ pub struct UpstreamSpec {
     /// External destination URL (`tcp://`, `tls://`, `http://`, `https://`);
     /// `None` for a catalog service, which is dialed from the endpoint feed.
     pub to: Option<String>,
+    /// `connect.upstreams[].http` — turns on HTTP mode with traffic management.
+    pub http: Option<UpstreamHttpConfig>,
+    /// `connect.upstreams[].handlers` — run in HTTP mode.
+    pub handlers: Vec<HandlerConfig>,
+    /// Name-is-config: the VIP (`127.42.b.n`) and canonical port this
+    /// upstream is also served on, so `<key>.svc.legion:<port>` reaches the
+    /// same listener state. `None` on platforms without 127/8 routing.
+    pub vip: Option<String>,
+    pub canonical_port: Option<u16>,
+    /// The gated namespace to bind inside (`network.mode = "gated"`); `None`
+    /// binds in the host namespace. A gated listener fails closed while its
+    /// policy is pending or its edge-boot gate is shut.
+    pub netns: Option<PathBuf>,
 }
 
 impl UpstreamSpec {
@@ -88,14 +105,23 @@ struct UpstreamShared {
     service: String,
     balancer: Arc<dyn Balancer>,
     /// Latest endpoint snapshot from the manager. Replaced wholesale.
-    endpoints: Mutex<Vec<Endpoint>>,
+    endpoints: Arc<Mutex<Vec<Endpoint>>>,
     /// Live connection count per endpoint address, for load-aware strategies.
     /// Entries are removed at zero so the map stays bounded by live endpoints.
-    inflight: Mutex<HashMap<String, usize>>,
+    inflight: Arc<Mutex<HashMap<String, usize>>>,
     /// Parsed external destination, when this upstream has one.
     target: Option<UpstreamTarget>,
     /// Policy, denial ledger, and TLS shared by every listener.
     context: Arc<ForwarderContext>,
+    /// The upstream's `http` block and handlers, as declared.
+    http_config: Option<UpstreamHttpConfig>,
+    handlers: Vec<HandlerConfig>,
+    /// HTTP-mode state, built on first use (an upstream can enter HTTP mode
+    /// through its own declaration or through the effective policy's
+    /// `protocol = "http"`, which is only known once policy arrives).
+    http: OnceLock<Arc<HttpSettings>>,
+    /// Whether this listener lives in a gated namespace (fail-closed rules).
+    gated: bool,
 }
 
 /// What every listener consults: the allocation's effective policy (egress
@@ -109,6 +135,9 @@ pub struct ForwarderContext {
     cache: Option<Arc<crate::worker::netd::NetPolicyCache>>,
     denials: Option<Arc<Denials>>,
     tls: OnceLock<Arc<rustls::ClientConfig>>,
+    /// Where allocation logs live (`<logs>/<allocation id>/`); access logs
+    /// are written next to the task's own logs.
+    logs_base_dir: Option<PathBuf>,
 }
 
 impl ForwarderContext {
@@ -118,7 +147,52 @@ impl ForwarderContext {
             cache: Some(cache),
             denials: Some(denials),
             tls: OnceLock::new(),
+            logs_base_dir: None,
         }
+    }
+
+    /// Where to write per-allocation access logs.
+    pub fn with_logs_base_dir(mut self, dir: PathBuf) -> Self {
+        self.logs_base_dir = Some(dir);
+        self
+    }
+
+    /// The access-log directory for one allocation, when logging is set up.
+    pub fn log_dir_for(&self, allocation_id: i64) -> Option<PathBuf> {
+        self.logs_base_dir
+            .as_ref()
+            .map(|base| base.join(allocation_id.to_string()))
+    }
+
+    /// Record a denial for the next heartbeat (no-op without a ledger).
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_denial(
+        &self,
+        allocation_id: i64,
+        direction: &str,
+        protocol: &str,
+        destination: &str,
+        source: &str,
+        reason: Option<&str>,
+        method: &str,
+        path: &str,
+    ) {
+        let Some(denials) = self.denials.as_ref() else {
+            return;
+        };
+        let who = self.identity_for(allocation_id);
+        denials.record(
+            allocation_id,
+            who.as_ref(),
+            direction,
+            protocol,
+            destination,
+            source,
+            reason,
+            None,
+            method,
+            path,
+        );
     }
 
     /// The policy cache the heartbeat loop feeds; `None` on a forwarder built
@@ -132,20 +206,30 @@ impl ForwarderContext {
         self.denials.as_ref()
     }
 
-    fn policy_for(
+    pub fn policy_for(
         &self,
         allocation_id: i64,
     ) -> Option<Arc<crate::structs::netpolicy::EffectivePolicy>> {
         self.policy.as_ref()?.policy_for(allocation_id)
     }
 
-    fn identity_for(&self, allocation_id: i64) -> Option<AllocIdentity> {
+    pub fn identity_for(&self, allocation_id: i64) -> Option<AllocIdentity> {
         self.policy.as_ref()?.identity_for(allocation_id)
+    }
+
+    /// Whether the allocation's policy state is *known* — a body is cached
+    /// for the hash the manager named — as opposed to still pending. A
+    /// forwarder without a cache treats everything as known (and allowed).
+    pub fn policy_known(&self, allocation_id: i64) -> bool {
+        match self.cache.as_ref() {
+            Some(cache) => cache.has_assignment(allocation_id) && cache.is_ready(allocation_id),
+            None => true,
+        }
     }
 
     /// A rustls client trusting the Mozilla roots (webpki-roots). Built once
     /// per process; external upstreams that pin a CA are a later phase.
-    fn tls_connector(&self) -> tokio_rustls::TlsConnector {
+    pub fn tls_connector(&self) -> tokio_rustls::TlsConnector {
         let config = self.tls.get_or_init(|| {
             let mut roots = rustls::RootCertStore::empty();
             roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
@@ -193,11 +277,58 @@ impl UpstreamShared {
             allocation_id: spec.allocation_id,
             service: spec.service.clone(),
             balancer,
-            endpoints: Mutex::new(Vec::new()),
-            inflight: Mutex::new(HashMap::new()),
+            endpoints: Arc::new(Mutex::new(Vec::new())),
+            inflight: Arc::new(Mutex::new(HashMap::new())),
             target,
             context,
+            http_config: spec.http.clone(),
+            handlers: spec.handlers.clone(),
+            http: OnceLock::new(),
+            gated: spec.netns.is_some(),
         }
+    }
+
+    /// Whether this upstream declares HTTP itself (an `http` block, an
+    /// `http://`/`https://` target, or handlers that need bodies).
+    fn declares_http(&self) -> bool {
+        self.http_config.is_some()
+            || self.target.as_ref().is_some_and(|t| t.http)
+            || self
+                .handlers
+                .iter()
+                .any(|h| h.handler == crate::structs::netpolicy::HANDLER_DLP)
+    }
+
+    /// HTTP-mode settings when this connection must be parsed: the upstream
+    /// declares HTTP, or the allocation's effective egress policy is an HTTP
+    /// chain. `None` means splice bytes.
+    fn http_settings(self: &Arc<Self>) -> Option<Arc<HttpSettings>> {
+        let policy_http = self
+            .context
+            .policy_for(self.allocation_id)
+            .and_then(|p| p.egress.as_ref().map(|c| c.is_http()))
+            .unwrap_or(false);
+        if !(self.declares_http() || policy_http) {
+            return None;
+        }
+        Some(
+            self.http
+                .get_or_init(|| {
+                    Arc::new(HttpSettings::new(
+                        self.allocation_id,
+                        self.service.clone(),
+                        self.target.clone(),
+                        self.http_config.as_ref(),
+                        &self.handlers,
+                        self.context.clone(),
+                        self.balancer.clone(),
+                        self.endpoints.clone(),
+                        self.inflight.clone(),
+                        self.context.log_dir_for(self.allocation_id),
+                    ))
+                })
+                .clone(),
+        )
     }
 
     fn endpoints(&self) -> Vec<Endpoint> {
@@ -216,6 +347,10 @@ struct Listener {
     /// The accept loop. `None` while the port cannot be bound; `sync` retries
     /// every heartbeat, and the endpoint list survives the retry.
     task: Option<JoinHandle<()>>,
+    /// The VIP accept loop (`<vip>:<canonical port>`), sharing the same
+    /// state; `None` when no VIP was assigned or its bind failed (which only
+    /// costs the DNS name — the loopback port keeps working).
+    vip_task: Option<JoinHandle<()>>,
     /// Whether the current bind failure was already warned about, so a
     /// permanently occupied port warns once and then stays at debug.
     bind_warned: bool,
@@ -237,6 +372,11 @@ impl Listener {
 pub struct UpstreamForwarder {
     listeners: Mutex<HashMap<UpstreamKey, Listener>>,
     context: Arc<ForwarderContext>,
+    /// Per-allocation resolvers (docs/network-handlers.md, name-is-config);
+    /// `None` on a forwarder built without one.
+    dns: Option<Arc<crate::worker::netd::dns::NetDns>>,
+    /// Per-allocation egress proxies inside gated namespaces.
+    proxies: Option<Arc<crate::worker::netd::proxy::EgressProxies>>,
 }
 
 impl UpstreamForwarder {
@@ -252,7 +392,31 @@ impl UpstreamForwarder {
         UpstreamForwarder {
             listeners: Mutex::new(HashMap::new()),
             context,
+            dns: None,
+            proxies: None,
         }
+    }
+
+    /// Attach the gated-namespace egress proxies.
+    pub fn with_proxies(mut self, proxies: Arc<crate::worker::netd::proxy::EgressProxies>) -> Self {
+        self.proxies = Some(proxies);
+        self
+    }
+
+    /// The egress proxies, when attached.
+    pub fn proxies(&self) -> Option<&Arc<crate::worker::netd::proxy::EgressProxies>> {
+        self.proxies.as_ref()
+    }
+
+    /// Attach the per-allocation resolvers, reconciled by `sync_dns`.
+    pub fn with_dns(mut self, dns: Arc<crate::worker::netd::dns::NetDns>) -> Self {
+        self.dns = Some(dns);
+        self
+    }
+
+    /// The resolvers, when attached.
+    pub fn dns(&self) -> Option<&Arc<crate::worker::netd::dns::NetDns>> {
+        self.dns.as_ref()
     }
 
     /// The shared policy / denial / TLS context.
@@ -289,6 +453,9 @@ impl UpstreamForwarder {
                     return true;
                 }
                 if let Some(task) = listener.task.take() {
+                    stopped.push(task);
+                }
+                if let Some(task) = listener.vip_task.take() {
                     stopped.push(task);
                 }
                 debug!(
@@ -383,7 +550,10 @@ impl UpstreamForwarder {
 
     async fn start_listener(&self, spec: UpstreamSpec, shared: Arc<UpstreamShared>) {
         let key = spec.key();
-        match TcpListener::bind((UPSTREAM_LOOPBACK_ADDR, spec.local_port)).await {
+        let addr: SocketAddr = format!("{UPSTREAM_LOOPBACK_ADDR}:{}", spec.local_port)
+            .parse()
+            .expect("loopback socket address");
+        match crate::worker::netd::netns::bind_tcp(spec.netns.clone(), addr).await {
             Ok(socket) => {
                 debug!(
                     allocation_id = spec.allocation_id,
@@ -393,12 +563,14 @@ impl UpstreamForwarder {
                     "Started upstream forwarder listener"
                 );
                 let task = tokio::spawn(run_listener(socket, shared.clone()));
+                let vip_task = bind_vip(&spec, &shared).await;
                 lock(&self.listeners).insert(
                     key,
                     Listener {
                         spec,
                         shared,
                         task: Some(task),
+                        vip_task,
                         bind_warned: false,
                     },
                 );
@@ -433,10 +605,50 @@ impl UpstreamForwarder {
                         spec,
                         shared,
                         task: None,
+                        vip_task: None,
                         bind_warned: true,
                     },
                 );
             }
+        }
+    }
+}
+
+/// Bind the upstream's VIP listener (`<vip>:<canonical port>`), when it has
+/// one and the platform routes 127/8. Shares the listener state, so policy,
+/// endpoints, and HTTP mode are identical whichever address the task dials.
+async fn bind_vip(spec: &UpstreamSpec, shared: &Arc<UpstreamShared>) -> Option<JoinHandle<()>> {
+    let (Some(vip), Some(port)) = (spec.vip.as_deref(), spec.canonical_port) else {
+        return None;
+    };
+    if !crate::structs::platform_supports_vip_blocks() {
+        return None;
+    }
+    let addr: SocketAddr = match format!("{vip}:{port}").parse() {
+        Ok(addr) => addr,
+        Err(_) => return None,
+    };
+    match crate::worker::netd::netns::bind_tcp(spec.netns.clone(), addr).await {
+        Ok(socket) => {
+            debug!(
+                allocation_id = spec.allocation_id,
+                upstream = %spec.service,
+                vip = %vip,
+                port,
+                "Started upstream VIP listener"
+            );
+            Some(tokio::spawn(run_listener(socket, shared.clone())))
+        }
+        Err(err) => {
+            debug!(
+                allocation_id = spec.allocation_id,
+                upstream = %spec.service,
+                vip = %vip,
+                port,
+                error = ?err,
+                "Failed to bind upstream VIP listener; the loopback port still serves"
+            );
+            None
         }
     }
 }
@@ -447,6 +659,9 @@ impl Drop for UpstreamForwarder {
         // forwarder and keep the ports bound.
         for listener in lock(&self.listeners).values_mut() {
             if let Some(task) = listener.task.take() {
+                task.abort();
+            }
+            if let Some(task) = listener.vip_task.take() {
                 task.abort();
             }
         }
@@ -499,6 +714,11 @@ async fn run_listener(socket: TcpListener, shared: Arc<UpstreamShared>) {
 ///
 /// Per-connection logging stays at `debug` — this is the hot path.
 async fn forward_connection(mut client: TcpStream, shared: Arc<UpstreamShared>) {
+    // HTTP mode parses requests instead of splicing; see `netd::http`.
+    if let Some(settings) = shared.http_settings() {
+        crate::worker::netd::http::serve(client, settings).await;
+        return;
+    }
     if let Some(target) = shared.target.clone() {
         forward_external(client, shared, target).await;
         return;
@@ -692,7 +912,30 @@ async fn deny_if_policy_says_so(
     destination: &str,
 ) -> bool {
     let policy = shared.context.policy_for(shared.allocation_id);
-    match egress_connect_verdict(policy.as_deref(), facts) {
+    // A gated allocation fails closed: while its policy is still pending, or
+    // while its edge-boot gate is shut, nothing leaves.
+    let gated_block = if shared.gated {
+        if crate::worker::netd::netns::gate_is_shut(shared.allocation_id) {
+            Some((
+                "gate".to_string(),
+                Some("network gate is shut until the placement is ratified".to_string()),
+            ))
+        } else if policy.is_none() && !shared.context.policy_known(shared.allocation_id) {
+            Some((
+                "policy-pending".to_string(),
+                Some("network policy has not arrived yet".to_string()),
+            ))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let verdict = match gated_block {
+        Some((source, reason)) => Verdict::Deny { source, reason },
+        None => egress_connect_verdict(policy.as_deref(), facts),
+    };
+    match verdict {
         Verdict::Allow | Verdict::Defer => false,
         Verdict::Deny { source, reason } => {
             debug!(
@@ -703,21 +946,16 @@ async fn deny_if_policy_says_so(
                 "Egress connection denied by policy"
             );
             net_metrics::connection("egress", PROTOCOL_TCP, "deny");
-            if let Some(denials) = shared.context.denials.as_ref() {
-                let who = shared.context.identity_for(shared.allocation_id);
-                denials.record(
-                    shared.allocation_id,
-                    who.as_ref(),
-                    "egress",
-                    PROTOCOL_TCP,
-                    destination,
-                    &source,
-                    reason.as_deref(),
-                    None,
-                    "",
-                    "",
-                );
-            }
+            shared.context.record_denial(
+                shared.allocation_id,
+                "egress",
+                PROTOCOL_TCP,
+                destination,
+                &source,
+                reason.as_deref(),
+                "",
+                "",
+            );
             true
         }
     }
@@ -800,6 +1038,11 @@ mod tests {
             local_port: port,
             balance: balance.into(),
             to: None,
+            http: None,
+            handlers: Vec::new(),
+            vip: None,
+            canonical_port: None,
+            netns: None,
         }
     }
 
@@ -808,6 +1051,7 @@ mod tests {
             addr: addr.to_string(),
             allocation_id: 1,
             node_id: "node-a".into(),
+            tags: Vec::new(),
         }
     }
 

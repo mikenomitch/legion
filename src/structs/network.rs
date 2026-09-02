@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -16,6 +16,57 @@ pub const UPSTREAM_LOOPBACK_ADDR: &str = "127.0.0.1";
 
 /// Strategy used when an upstream does not name one.
 pub const DEFAULT_BALANCE: &str = "round_robin";
+
+/// The DNS zone a task's upstreams are reachable under: `<key>.svc.legion`.
+pub const SVC_ZONE: &str = "svc.legion";
+
+/// Second octet of every allocation VIP block: `127.<VIP_SECOND_OCTET>.b`.
+/// Fixed so a stray `127.0.x.x` listener (or `127.0.0.1` itself) can never
+/// collide with an assigned block; `b` is the per-node counter (0..=255).
+pub const VIP_SECOND_OCTET: u8 = 42;
+
+/// Highest per-node VIP block index; 256 allocations with upstreams per
+/// node before assignment fails loudly.
+pub const VIP_BLOCK_MAX: u8 = 255;
+
+/// The first host octet used for upstream VIPs (`.1` is the resolver).
+pub const VIP_FIRST_HOST: u8 = 2;
+
+/// Where the egress proxy listens inside a gated namespace.
+pub const GATED_PROXY_ADDR: &str = "127.0.0.1";
+pub const GATED_PROXY_PORT: u16 = 1080;
+
+/// Resolve a task's declared `network.mode` for a runtime: `auto` is `host`
+/// for every runtime today (`sandbox` moves to `gated` when its vsock
+/// transport lands), and an explicit value is itself.
+pub fn resolve_network_mode(declared: &str, _runtime: &str) -> String {
+    let declared = declared.trim().to_ascii_lowercase();
+    if declared.is_empty() || declared == crate::structs::netpolicy::MODE_AUTO {
+        crate::structs::netpolicy::MODE_HOST.to_string()
+    } else {
+        declared
+    }
+}
+
+/// Whether this platform routes all of 127/8 to loopback without
+/// configuration (Linux does; macOS only has `127.0.0.1` on `lo0`).
+pub fn platform_supports_vip_blocks() -> bool {
+    cfg!(target_os = "linux")
+}
+
+/// Pick the next free VIP block (`127.42.<b>`) on a node.
+pub fn next_vip_block(used_blocks: &HashSet<String>) -> R<String> {
+    for b in 0..=VIP_BLOCK_MAX {
+        let block = format!("127.{VIP_SECOND_OCTET}.{b}");
+        if !used_blocks.contains(&block) {
+            return Ok(block);
+        }
+    }
+    bail!(
+        "no free VIP block on this node ({} allocations with upstreams already placed)",
+        u16::from(VIP_BLOCK_MAX) + 1
+    )
+}
 
 /// Canonicalize a user-written strategy name: trim, lowercase, and treat `-`
 /// as `_` so `least-conn` and `Least_Conn` both mean `least_conn`.
@@ -422,12 +473,31 @@ pub struct AllocUpstream {
     /// rows written before external upstreams existed parse unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub to: Option<String>,
+    /// Loopback VIP (`127.a.b.n`) the node datapath also listens on, so
+    /// `<key>.svc.legion` resolves to it (docs/network-handlers.md,
+    /// "Name-is-config"). Assigned at placement from the allocation's
+    /// `AllocNetwork::vip_block`; absent for rows placed before VIPs existed
+    /// and on platforms without a routable 127/8 (macOS).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vip: Option<String>,
+    /// The port the VIP listens on: the upstream's pinned `localPort`, else
+    /// the service's declared in-task port, else an external target's port,
+    /// else the dynamic loopback port. `db.svc.legion:5432` works because
+    /// this is 5432 for a service that declared it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical_port: Option<u16>,
 }
 
 impl AllocUpstream {
     /// `127.0.0.1:<local_port>` — what `LEGION_UPSTREAM_<SERVICE>` contains.
     pub fn address(&self) -> String {
         format!("{UPSTREAM_LOOPBACK_ADDR}:{}", self.local_port)
+    }
+
+    /// `<vip>:<canonical port>` when a VIP was assigned — what
+    /// `<key>.svc.legion` resolves to.
+    pub fn vip_address(&self) -> Option<String> {
+        Some(format!("{}:{}", self.vip.as_ref()?, self.canonical_port?))
     }
 }
 
@@ -456,6 +526,19 @@ pub struct AllocNetwork {
     /// connect existed keep parsing and keep serializing unchanged.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub upstreams: Vec<AllocUpstream>,
+    /// The allocation's loopback /24 (`127.a.b`), unique per node, assigned
+    /// at placement when the task declares upstreams: `.1` is its DNS
+    /// resolver, `.2` onward its upstream VIPs. Linux only — the whole 127/8
+    /// is loopback there with no configuration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vip_block: Option<String>,
+    /// The effective `network.mode` resolved at placement: the task's own
+    /// (`auto` resolved per runtime) unless a matching `require` policy
+    /// imposes one. `gated` means the workload's namespace holds loopback and
+    /// the datapath only. Absent on rows placed before modes were resolved
+    /// (treated as `host`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
 }
 
 impl AllocNetwork {
@@ -495,8 +578,61 @@ impl AllocNetwork {
                 format!("LEGION_UPSTREAM_PORT_{label}"),
                 upstream.local_port.to_string(),
             ));
+            if let Some(vip_address) = upstream.vip_address() {
+                // Name-is-config: the same upstream by DNS name, on the port
+                // the service declared.
+                pairs.push((
+                    format!("LEGION_UPSTREAM_HOST_{label}"),
+                    format!("{}.{SVC_ZONE}", upstream.service),
+                ));
+                pairs.push((format!("LEGION_UPSTREAM_VIP_{label}"), vip_address));
+            }
+        }
+        if let Some(resolver) = self.resolver_address() {
+            pairs.push(("LEGION_DNS".to_string(), resolver));
+        }
+        if self.is_gated() {
+            // The only door out of a gated namespace. NO_PROXY keeps the
+            // task's own loopback, its VIPs, and the zone off the proxy.
+            let proxy = format!("http://{GATED_PROXY_ADDR}:{GATED_PROXY_PORT}");
+            pairs.push(("LEGION_EGRESS_PROXY".to_string(), proxy.clone()));
+            pairs.push(("LEGION_NETWORK_MODE".to_string(), "gated".to_string()));
+            pairs.push(("HTTP_PROXY".to_string(), proxy.clone()));
+            pairs.push(("HTTPS_PROXY".to_string(), proxy.clone()));
+            pairs.push(("ALL_PROXY".to_string(), proxy));
+            pairs.push((
+                "NO_PROXY".to_string(),
+                format!("localhost,127.0.0.0/8,{SVC_ZONE}"),
+            ));
+        } else if let Some(mode) = self.mode.as_deref() {
+            pairs.push(("LEGION_NETWORK_MODE".to_string(), mode.to_string()));
         }
         pairs
+    }
+
+    /// Whether the allocation runs in a gated namespace.
+    pub fn is_gated(&self) -> bool {
+        self.mode.as_deref() == Some(crate::structs::netpolicy::MODE_GATED)
+    }
+
+    /// The allocation's resolver address (`127.a.b.1`), when a VIP block was
+    /// assigned.
+    pub fn resolver_address(&self) -> Option<String> {
+        self.vip_block.as_ref().map(|block| format!("{block}.1"))
+    }
+
+    /// `<key>` → `(vip, canonical port)` for every upstream with a VIP: what
+    /// the allocation's resolver answers for `<key>.svc.legion`.
+    pub fn vip_names(&self) -> BTreeMap<String, (String, u16)> {
+        self.upstreams
+            .iter()
+            .filter_map(|upstream| {
+                Some((
+                    upstream.service.clone(),
+                    (upstream.vip.clone()?, upstream.canonical_port?),
+                ))
+            })
+            .collect()
     }
 }
 
@@ -637,6 +773,20 @@ pub fn assign_allocation_ports(
     connect: Option<&ConnectConfig>,
     used: &HashSet<u16>,
 ) -> R<(Vec<AllocPort>, Vec<AllocUpstream>)> {
+    assign_allocation_ports_with_vips(network, connect, used, &HashMap::new(), None)
+}
+
+/// [`assign_allocation_ports`] plus VIP assignment: `service_ports` maps a
+/// service name to the port it declared (its in-task `to`, or static port),
+/// and `vip_block` is the allocation's `127.a.b` block when the platform has
+/// one. Upstream `i` gets `<block>.<2 + i>` on its canonical port.
+pub fn assign_allocation_ports_with_vips(
+    network: Option<&NetworkConfig>,
+    connect: Option<&ConnectConfig>,
+    used: &HashSet<u16>,
+    service_ports: &HashMap<String, u16>,
+    vip_block: Option<&str>,
+) -> R<(Vec<AllocPort>, Vec<AllocUpstream>)> {
     const NO_PORTS: &[PortConfig] = &[];
     const NO_UPSTREAMS: &[UpstreamConfig] = &[];
     let ports = network.map_or(NO_PORTS, |network| network.ports.as_slice());
@@ -674,6 +824,8 @@ pub fn assign_allocation_ports(
                 local_port,
                 balance: upstream.balance_name(),
                 to: upstream.to.clone(),
+                vip: None,
+                canonical_port: None,
             });
         }
     }
@@ -705,7 +857,39 @@ pub fn assign_allocation_ports(
             local_port,
             balance: upstream.balance_name(),
             to: upstream.to.clone(),
+            vip: None,
+            canonical_port: None,
         });
+    }
+
+    // VIPs: in declaration order so `<block>.2` is the first upstream the
+    // task wrote, which keeps `legion net doctor` output legible.
+    if let Some(block) = vip_block {
+        for upstream in upstreams {
+            let key = upstream.key();
+            let Some(assigned_upstream) = assigned_upstreams.iter_mut().find(|u| u.service == key)
+            else {
+                continue;
+            };
+            let index = upstreams.iter().position(|u| u.key() == key).unwrap_or(0);
+            let host = usize::from(VIP_FIRST_HOST) + index;
+            if host > 254 {
+                bail!("upstream '{key}' has no free VIP in block {block} (at most 253 upstreams per task)");
+            }
+            let canonical_port = upstream
+                .local_port
+                .or_else(|| service_ports.get(key).copied())
+                .or_else(|| {
+                    upstream
+                        .to
+                        .as_deref()
+                        .and_then(|to| parse_upstream_target(to).ok())
+                        .map(|target| target.port)
+                })
+                .unwrap_or(assigned_upstream.local_port);
+            assigned_upstream.vip = Some(format!("{block}.{host}"));
+            assigned_upstream.canonical_port = Some(canonical_port);
+        }
     }
 
     Ok((assigned, assigned_upstreams))
@@ -1194,6 +1378,8 @@ mod tests {
                 to: Some(8080),
             }],
             upstreams: Vec::new(),
+            vip_block: None,
+            mode: None,
         };
 
         let pairs = network.env_pairs();
@@ -1333,7 +1519,11 @@ mod tests {
                 local_port: 20003,
                 balance: DEFAULT_BALANCE.into(),
                 to: None,
+                vip: None,
+                canonical_port: None,
             }],
+            vip_block: None,
+            mode: None,
         };
 
         let lookup: std::collections::HashMap<_, _> = network.env_pairs().into_iter().collect();
@@ -1480,6 +1670,89 @@ mod tests {
             json!([{ "service": "api", "http": { "timeout": "3s", "retries": { "attempts": 2, "budget": "20%" }, "outlier": { "consecutive5xx": 5, "ejectFor": "30s" } } }]),
         );
         validate_task_connect("api", None, Some(&ok), None).unwrap();
+    }
+
+    #[test]
+    fn vip_blocks_and_canonical_ports() {
+        let mut used_blocks = HashSet::new();
+        assert_eq!(next_vip_block(&used_blocks).unwrap(), "127.42.0");
+        used_blocks.insert("127.42.0".to_string());
+        assert_eq!(next_vip_block(&used_blocks).unwrap(), "127.42.1");
+        for b in 0..=255u16 {
+            used_blocks.insert(format!("127.42.{b}"));
+        }
+        assert!(next_vip_block(&used_blocks).is_err());
+
+        let connect = connect(json!([
+            { "service": "db" },
+            { "service": "cache", "localPort": 6379 },
+            { "name": "openai", "to": "https://api.openai.com" },
+            { "service": "unknown" }
+        ]));
+        let service_ports: HashMap<String, u16> = [("db".to_string(), 5432)].into_iter().collect();
+        let (_, upstreams) = assign_allocation_ports_with_vips(
+            None,
+            Some(&connect),
+            &HashSet::new(),
+            &service_ports,
+            Some("127.42.7"),
+        )
+        .unwrap();
+        let by_key = |key: &str| upstreams.iter().find(|u| u.service == key).unwrap().clone();
+        assert_eq!(by_key("db").vip.as_deref(), Some("127.42.7.2"));
+        assert_eq!(
+            by_key("db").canonical_port,
+            Some(5432),
+            "the service's declared port"
+        );
+        assert_eq!(by_key("cache").vip.as_deref(), Some("127.42.7.3"));
+        assert_eq!(
+            by_key("cache").canonical_port,
+            Some(6379),
+            "a pinned localPort wins"
+        );
+        assert_eq!(
+            by_key("openai").canonical_port,
+            Some(443),
+            "an external target's port"
+        );
+        let unknown = by_key("unknown");
+        assert_eq!(
+            unknown.canonical_port,
+            Some(unknown.local_port),
+            "falls back to the dynamic port"
+        );
+
+        let network = AllocNetwork {
+            upstreams: upstreams.clone(),
+            vip_block: Some("127.42.7".into()),
+            ..Default::default()
+        };
+        let env = network.env_pairs();
+        assert!(env
+            .iter()
+            .any(|(k, v)| k == "LEGION_DNS" && v == "127.42.7.1"));
+        assert!(env
+            .iter()
+            .any(|(k, v)| k == "LEGION_UPSTREAM_HOST_DB" && v == "db.svc.legion"));
+        assert!(env
+            .iter()
+            .any(|(k, v)| k == "LEGION_UPSTREAM_VIP_DB" && v == "127.42.7.2:5432"));
+        assert_eq!(network.vip_names()["db"], ("127.42.7.2".to_string(), 5432));
+
+        // Without a block nothing changes, including the env.
+        let (_, plain) = assign_allocation_ports(None, Some(&connect), &HashSet::new()).unwrap();
+        assert!(plain
+            .iter()
+            .all(|u| u.vip.is_none() && u.canonical_port.is_none()));
+        let env = AllocNetwork {
+            upstreams: plain,
+            ..Default::default()
+        }
+        .env_pairs();
+        assert!(!env
+            .iter()
+            .any(|(k, _)| k == "LEGION_DNS" || k.starts_with("LEGION_UPSTREAM_HOST_")));
     }
 
     #[test]

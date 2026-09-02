@@ -1339,14 +1339,38 @@ worker:
       `configs/policies/sandbox-egress.ncl`, `configs/jobs/sandbox-egress-demo.ncl`.
       Still open inside M1: the UI (Network page, task/service detail
       sections) and the `accessLog` writer (lands with HTTP mode).
-- [ ] Phase 1 — HTTP/1.1 mode: path/method/header rules, structured 403s an
-      agent can read, built-in `dlp` with a byte cap (h2/h3 rejected at
-      submit, deliberately)
-- [ ] Phase 2 — `gated` on Linux for `container` and `exec`: `netd`-owned
-      empty network namespaces, loopback proxy + DNS inside, the edge-boot
-      `network_gate` implemented as policy-withheld (closes edge-boot's
-      deferred "per-destination policy for the gated state"), readiness
-      gating, `net_capture_unavailable`
+- [x] Phase 1 / M2 — HTTP/1.1 mode (2026-09-02): request-time rules
+      (path/method/header) on upstreams in HTTP mode, structured 403s
+      (`Legion-Denied-By`, JSON body), built-in `dlp` with a byte cap and
+      `log`, the NDJSON access log, and the upstream `http` traffic block —
+      per-request timeout, budgeted retries for idempotent methods, weighted
+      split by service tag, outlier ejection (the waypoint, folded into the
+      upstream listener). h2/h3/WebSocket upgrades rejected or unsupported,
+      deliberately. `authz` / `proxy` handlers still skip with a debug log
+      until the external-handlers phase.
+- [x] M3 — name-is-config (2026-09-02): per-allocation loopback /24 on
+      Linux (`127.42.<b>`), `.1` a resolver answering `<key>.svc.legion` with
+      the allocation's upstream VIPs (`.2`+) on canonical ports, egress policy
+      applied at resolution (`NXDOMAIN` + `net.denied` for a denied name),
+      external names forwarded to the host resolvers; `LEGION_DNS`,
+      `LEGION_UPSTREAM_HOST_*`, `LEGION_UPSTREAM_VIP_*`; containers get a
+      generated `resolv.conf`. macOS: no VIPs, documented. Open inside M3:
+      the generated `resolv.conf` for hardened `exec` (lands with gated).
+- [x] Phase 2 / M4 — `gated` on Linux for `container` and `exec`
+      (2026-09-02): worker-owned empty network namespaces
+      (`/var/run/netns/legion-<alloc>`, created ahead of reconcile on the
+      heartbeat, removed on departure), every datapath listener bound inside
+      (upstream ports, VIPs, resolver, egress proxy), an egress proxy
+      speaking HTTP CONNECT / absolute-URI HTTP / SOCKS5 with policy, proxy
+      env injected, containers join by OCI namespace path, exec `setns`s
+      before exec; effective `network.mode` resolved at placement (task or a
+      `require` policy's `mode`); fail-closed while policy is pending or the
+      edge-boot gate is shut (`network_gate_for` → Enforced for gated
+      allocations, the gate as a marker file), closing edge-boot's deferred
+      per-destination policy for the gated state. Not done: a
+      `net_capture_unavailable` health signal (a missing namespace fails the
+      start with a clear error instead — it is retried each heartbeat), and
+      transparent capture (tools that ignore `HTTP_PROXY` have no route).
 - [ ] Phase 3 — `legion netd` as a supervised process with fd handoff; node
       health. Required before the datapath becomes a sandbox's only path
 - [ ] Phase 4 — `gated` for `sandbox`: no guest NIC, `legion-guest-agent`

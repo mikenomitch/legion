@@ -1571,7 +1571,7 @@ impl WorkerTaskManager {
             .context("Task instance missing")?;
 
         if gate == Gate::Boot {
-            if plugin.network_gate() == NetworkGate::Advisory {
+            if plugin.network_gate_for(allocation) == NetworkGate::Advisory {
                 // Stated loudly rather than assumed: for host-process
                 // runtimes Legion withholds service registration and the
                 // node-local forwarders, but the workload shares the host's
@@ -3664,14 +3664,20 @@ mod tests {
                         local_port: 20003,
                         balance: "round_robin".into(),
                         to: None,
+                        vip: None,
+                        canonical_port: None,
                     },
                     crate::structs::AllocUpstream {
                         service: "cache".into(),
                         local_port: 6379,
                         balance: "least_conn".into(),
                         to: None,
+                        vip: None,
+                        canonical_port: None,
                     },
                 ],
+                vip_block: None,
+                mode: None,
             }),
             ..alloc()
         };

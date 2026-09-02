@@ -443,3 +443,81 @@ Legion service) or a `tcp://` upstream that lets the task do its own TLS.
 it rather than as a one-off that would be redone when that phase lands.
 Public APIs, the LLM-gateway case that motivated external upstreams, are
 served today.
+
+---
+
+## 19. Gated namespaces are created with syscalls, not by shelling out to `ip`
+
+**Call.** `netd::netns` creates a namespace with `unshare(CLONE_NEWNET)` on a
+throwaway thread, brings loopback up with `SIOCSIFFLAGS`, and bind-mounts
+`/proc/thread-self/ns/net` at `/var/run/netns/legion-<allocation>` — the
+`ip netns` path convention, without the tool.
+
+**Alternatives.** Shell out to `ip netns add` / `ip netns exec ... ip link
+set lo up`, which is what the sandbox runtime's TAP gate does (`set_tap_link`
+deliberately uses `ip` so an operator sees the same failure text they would
+by hand).
+
+**Trade-off.** ~60 lines of `unsafe` FFI (an `ifreq` layout, `mount`,
+`umount2`, `setns`) that the `ip` route would not need, and a new place
+`CAP_SYS_ADMIN` is exercised.
+
+**Why (a real dependency, discovered).** The image this was built in has no
+iproute2 at all, and nothing in Legion's install story promises it. The TAP
+gate can require it because `mode = "tap"` already requires an operator who
+builds host networking by hand; `gated` is meant to need nothing but the
+worker's existing privileges. The path convention is kept so `ip netns exec`
+and `nsenter --net=` both still work for the operator who has them.
+
+---
+
+## 20. The effective `network.mode` is resolved at placement, not live
+
+**Call.** `AllocNetwork.mode` is computed in `assign_allocation_network` —
+the task's declared mode (`auto` → `host`), overridden by the
+highest-priority matching `require` policy that sets one — and persisted on
+the allocation. A policy that later changes `mode` affects the next
+placement of that task, not the running allocation.
+
+**Alternatives.** Resolve it on the worker from the live effective policy,
+like the rules themselves, so a `require: mode = "gated"` applied to a pool
+re-gates running tasks on the next heartbeat.
+
+**Trade-off.** "Apply a gated policy to a pool" does not make already-running
+tasks gated until they are rescheduled; `legion net policy show` says
+`effective mode` from the *next* placement's point of view. The plan's "no
+restart" promise holds for rules and handlers but not for mode.
+
+**Why (correctness).** A namespace is a start-time property: a container
+joins it in its OCI spec and an exec task enters it before exec. Moving a
+running process between namespaces is not a thing the runtimes can do, and
+pretending otherwise — flipping the allocation's listeners into a namespace
+its process is not in — would be exactly the silent "policy says gated,
+traffic is not" failure the placement-constraint call (12) exists to rule
+out. Recording the mode on the allocation row also makes `legion net doctor`
+and the UI truthful about what the process is actually in.
+
+---
+
+## 21. A gated allocation with no policy allows through the proxy; one whose policy is pending denies
+
+**Call.** The manager names a policy hash for every gated allocation even
+when the merge is empty. On the node, `has_assignment && is_ready` means
+"known"; a known-empty policy allows everything through the datapath (still
+attributed and logged), while an assignment whose body has not arrived —
+or a shut edge-boot gate — denies with `policy-pending` / `gate` as the
+source.
+
+**Alternatives.** Deny whenever there is no chain (gated = deny-by-default
+until someone writes rules), which is the strictest reading of "gated".
+
+**Trade-off.** An operator who sets `mode = "gated"` and writes no policy
+gets an observed-but-open workload, not a sealed one; the doc has to say
+that the default verdict is still `allow` unless a policy says otherwise.
+
+**Why (simplicity, and what "gated" means).** `mode` answers *where the
+traffic goes* — through Legion, unbypassably; `policy` answers *what is
+allowed*. Coupling them would make `gated` a policy in disguise and break
+the one-liner story (`egress = { allow = [...] }` is where deny-by-default
+comes from). The fail-closed rules exist for the one case where the node
+genuinely does not know the answer yet, and only there.

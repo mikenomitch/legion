@@ -8646,7 +8646,14 @@ impl ManagerDaemonService {
                     .unwrap_or_default(),
             };
             let (effective, _) = merge_net_policies(&stored, &facts, network.as_ref());
-            if effective.is_empty() {
+            // A gated allocation is told about an *empty* policy too, so the
+            // node can tell "known: nothing applies" (allow through the
+            // datapath) from "pending" (fail closed).
+            let gated = network
+                .as_ref()
+                .is_some_and(|n| n.mode == crate::structs::netpolicy::MODE_GATED)
+                || effective.mode.as_deref() == Some(crate::structs::netpolicy::MODE_GATED);
+            if effective.is_empty() && !gated {
                 continue;
             }
             self.remember_net_policy(&effective);
