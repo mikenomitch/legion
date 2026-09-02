@@ -21,6 +21,7 @@ mod oci_bundle;
 mod oci_image;
 pub mod resource_enforcement;
 mod sandbox;
+pub use sandbox::vsock_socket_base_for;
 mod schema_docs;
 
 pub use container::ContainerTaskPlugin;

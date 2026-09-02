@@ -69,9 +69,11 @@ Plans, roadmaps, to-do lists, and development notes live in
 
 - [Service Discovery](service-discovery.md) — declaring services and finding
   healthy endpoints.
-- [Network Handlers](network-handlers.md) — egress/ingress policy objects,
-  external upstreams with TLS origination, handlers, `gated` networking, and
-  `legion net policy`.
+- [Network Handlers](network-handlers.md) — the built-in service mesh:
+  egress/ingress policy objects, HTTP mode with retries and canary splits,
+  `<service>.svc.legion` names, `gated` networking (namespaces, and vsock for
+  sandboxes), ingress chains, `authz`/`proxy` handlers, mTLS with the mesh
+  CA, the service graph, drain-before-stop, and `legion net`.
 - [KV Store](kv-store.md) — CRUD, versioning, locks, and reactive task updates.
 - [Auth & ACLs](auth-and-acls.md) — tokens, policies, scopes, and enforcement.
 - [Workload Identity (OIDC)](workload-identity.md) — short-lived, verifiable task

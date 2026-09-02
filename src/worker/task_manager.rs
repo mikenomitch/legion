@@ -829,6 +829,11 @@ impl WorkerTaskManager {
         Some((root, self.alloc_dir(allocation_id).join(task_name)))
     }
 
+    /// Root of per-allocation directories (`<state>/allocs/`).
+    pub fn alloc_root(&self) -> &std::path::Path {
+        &self.alloc_root
+    }
+
     /// The host task directory (`allocs/<alloc>/<task>/`), whether or not
     /// the task has started yet.
     pub fn task_dir_for(&self, allocation_id: i64, task_name: &str) -> PathBuf {

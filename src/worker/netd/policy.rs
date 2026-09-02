@@ -109,6 +109,17 @@ impl NetPolicyCache {
         state.identities = identities;
     }
 
+    /// Every cached body by hash, for persistence across worker restarts.
+    pub fn bodies(&self) -> Vec<(String, EffectivePolicy)> {
+        self.state
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .bodies
+            .iter()
+            .map(|(hash, body)| (hash.clone(), (**body).clone()))
+            .collect()
+    }
+
     /// Every allocation's attribution facts (the desired set as of the last
     /// heartbeat).
     pub fn identities(&self) -> HashMap<i64, AllocIdentity> {

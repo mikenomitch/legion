@@ -21,6 +21,7 @@
 
 pub mod dns;
 pub mod graph;
+pub mod guest_agent;
 pub mod handlers;
 pub mod http;
 pub mod ingress;
@@ -28,6 +29,7 @@ pub mod netns;
 pub mod policy;
 pub mod proxy;
 pub mod proxyproto;
+pub mod state;
 pub mod tls;
 
 pub use policy::{Denials, NetPolicyCache, PolicyLookup};

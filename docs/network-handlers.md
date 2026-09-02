@@ -273,7 +273,8 @@ endpoints are identical whichever one the task dials. The loopback port and
 is generated to point at it (`search svc.legion`, `ndots:1`). An `exec` task
 gets `LEGION_DNS` and keeps the host resolver unless it opts in — a hardened
 `exec` with a private mount namespace will get the generated file in the
-gated phase. A `sandbox` gets the guest-side resolver in the gated phase.
+gated phase. A gated `sandbox` gets the guest agent's relay as its resolver
+(`nameserver 127.0.0.1` in the guest's `resolv.conf`; see "Sandboxes").
 
 **macOS** configures only `127.0.0.1` on `lo0`, so no VIP block is assigned
 there: upstreams keep their loopback ports and env vars, and there is no
@@ -463,9 +464,9 @@ copied in user space; TLS 1.2 and 1.3; no certificate revocation (the
 
 | `mode` | Meaning | Default for |
 | --- | --- | --- |
-| `host` | host networking; policy is cooperative (proxy env vars, upstreams, the resolver) | `container`, `exec`, `sandbox` (until its vsock transport lands) |
-| `gated` | the workload's network namespace holds loopback and the datapath only — **unbypassable** on Linux for `container` and `exec` | — |
-| `auto` | `host` today; `gated` for `sandbox` once its guest agent ships | — |
+| `host` | host networking; policy is cooperative (proxy env vars, upstreams, the resolver) | `container`, `exec`, `sandbox` |
+| `gated` | the workload's network namespace holds loopback and the datapath only — **unbypassable** on Linux for `container` and `exec`; for a `sandbox`, a microVM with no NIC whose only way out is a vsock to the datapath (see "Sandboxes") | — |
+| `auto` | `host` today for every runtime; the sandbox default flips to `gated` once the vsock transport has been exercised on a real VMM in CI | — |
 | `bridge`, `cni/<name>` | reserved for the datapath plugin; rejected at submit | — |
 
 The effective mode is resolved **at placement**: the task's own value, or the
@@ -512,11 +513,76 @@ attribution. The `boot` gate is therefore a real boundary for gated
 a gated task can be allowed the package registry before ratification by a
 policy with only that host.
 
+### Sandboxes
+
+A `sandbox` task with `network.mode = "gated"` boots a microVM with **no
+network interface at all**. Its only way out is a virtio-vsock device whose
+host end is the node datapath: the worker binds the allocation's egress
+proxy on the VMM's host socket for guest port 1080 and its resolver on the
+one for port 53 (`<alloc dir>/.sandbox/vsock.sock_1080` and `_53`, the
+naming both Firecracker and cloud-hypervisor use), before the guest boots.
+Inside the guest, the generated init starts `legion guest-agent` — the
+worker's own binary, copied into the rootfs as `/legion/legion` — before the
+task's command. The agent relays `127.0.0.1:1080` to host vsock port 1080
+and `127.0.0.1:53/udp` to host port 53 (DNS-over-TCP framing), so the same
+`HTTP_PROXY` / `ALL_PROXY` / `LEGION_EGRESS_PROXY` variables and the same
+`resolv.conf` a gated container gets work unchanged: every connection is
+judged by the node, and the guest cannot bypass it because there is nothing
+else to bypass to.
+
+What is enforced and what is not:
+
+- The guest is untrusted end to end: policy, handlers, identity and the
+  graph all run on the host side of the vsock. The agent decides nothing.
+- A gated sandbox cannot also have a TAP device (`config.network.mode = "tap"`
+  is rejected at start), and needs a microVM backend — with `hypervisor =
+  "dev"` (a container standing in for a VM) the start fails with that reason
+  rather than running unprotected.
+- The edge-boot `boot` gate is the same policy-withheld marker the vsock
+  listeners check, so a provisional sandbox has no network until ratified.
+- `legion net doctor` and the UI report the sandbox like any gated
+  allocation: `capture_ready` means both host sockets are bound.
+
+Honest status: the host side (VMM configuration, listeners, status) and the
+agent are implemented and unit-tested over Unix sockets with the VMMs'
+naming; an end-to-end boot with a real VMM is not part of this repository's
+CI (no KVM there), which is why `auto` still means `host` for sandboxes. If
+the copied binary cannot run on the image's libc, init says so on the
+console and the guest has no network — fail-closed, and `net doctor` shows
+the proxy never connecting. UDP inside the guest and transparent capture
+remain the deferred phase.
+
 Requirements and limits: Linux; the worker needs `CAP_SYS_ADMIN` (it already
 does, for `exec` hardening's mount namespace and for running the OCI
 runtime); IPv4 loopback only inside the namespace; no raw UDP, no ICMP; no
 inbound except through the datapath's ingress listeners (below). macOS has
 no namespaces: `gated` is rejected at start there with that reason.
+
+## The datapath across worker restarts
+
+Tasks survive a worker restart (the worker re-adopts their processes from
+its state file). So does their network: the worker writes what the datapath
+was last told — the desired set, the endpoint feed, the policy assignments
+and their bodies — to `netd_state.json` beside `worker_state.json` after
+every successful heartbeat that changed it, and a restarting worker replays
+it *before* its first heartbeat. Namespaces persist on their own (bind
+mounts under `/var/run/netns`); the replay re-binds every listener inside
+and beside them: upstream ports, VIPs, resolvers, egress proxies, ingress
+ports, plus identities and policy bodies, for the allocations that survived.
+Fail-static on disk: a node that restarts while the manager is down comes
+back with exactly the datapath it had.
+
+Connections *in flight* across the restart drop — the listeners are new
+sockets — and there is a gap of the process's own start time. The plan's
+`legion netd` process split (listener hand-off with `SCM_RIGHTS`, zero
+dropped connections) is deferred; this covers the failure that mattered:
+a gated sandbox whose worker was upgraded no longer loses its network until
+the manager is reachable again.
+
+A gated allocation whose capture is not ready — a namespace or listener
+missing, a vsock socket unbound — is reported **unhealthy** with
+`net_capture_unavailable: <problems>` on the heartbeat, so a rollout does
+not count it as up and `legion net doctor` names the cause.
 
 ## Ingress
 
@@ -712,8 +778,9 @@ more than it is.
   a raw address bypasses it. `mode = "gated"` (Linux, `container` and
   `exec`) closes that: the namespace has no route except Legion's listeners.
   On macOS egress stays cooperative and there are no VIPs, per-allocation
-  resolvers, or gated namespaces. `sandbox` gets `gated` when its guest
-  agent ships.
+  resolvers, or gated namespaces. A gated `sandbox` is captured over vsock
+  (implemented and unit-tested; not yet exercised on a real VMM in CI, so
+  its `auto` still resolves to `host`).
 - **Ingress is enforced everywhere it applies**: the datapath owns the
   advertised port and the task binds a private twin, on every runtime and
   platform. TCP only; the task sees the datapath as the peer until the

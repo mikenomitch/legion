@@ -28,11 +28,12 @@ use crate::worker::netd::handlers::{self, HopFacts, HopOutcome, ProxyTarget};
 use crate::worker::netd::metrics as net_metrics;
 use crate::worker::netd::netns;
 use crate::worker::netd::policy::egress_connect_verdict;
+use crate::worker::netd::proxyproto::Prefixed;
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 
@@ -53,6 +54,17 @@ pub struct ProxySpec {
     pub netns: Option<PathBuf>,
     /// Bind here instead of `127.0.0.1:1080` (tests).
     pub listen: Option<SocketAddr>,
+    /// A gated *sandbox*: listen on this Unix socket — the host end of the
+    /// guest's vsock port 1080 — instead of a TCP port.
+    pub unix: Option<PathBuf>,
+}
+
+impl ProxySpec {
+    /// A gated listener fails closed while policy is pending or the boot
+    /// gate is shut: one inside a namespace, or the host end of a vsock.
+    pub fn gated(&self) -> bool {
+        self.netns.is_some() || self.unix.is_some()
+    }
 }
 
 struct Listener {
@@ -110,7 +122,8 @@ impl EgressProxies {
         }
     }
 
-    /// The bound address of an allocation's proxy, when it is serving.
+    /// The bound address of an allocation's proxy, when it is serving on a
+    /// TCP port (a vsock-backed proxy has none; see [`Self::is_running`]).
     pub fn address(&self, allocation_id: i64) -> Option<SocketAddr> {
         let listeners = lock(&self.listeners);
         let listener = listeners.get(&allocation_id)?;
@@ -118,7 +131,19 @@ impl EgressProxies {
         running.then_some(listener.addr).flatten()
     }
 
+    /// Whether an allocation's proxy is serving, on a port or a socket.
+    pub fn is_running(&self, allocation_id: i64) -> bool {
+        let listeners = lock(&self.listeners);
+        listeners
+            .get(&allocation_id)
+            .is_some_and(|l| l.task.as_ref().is_some_and(|t| !t.is_finished()))
+    }
+
     async fn start(&self, spec: ProxySpec) {
+        if let Some(path) = spec.unix.clone() {
+            self.start_unix(spec, path).await;
+            return;
+        }
         let addr = spec
             .listen
             .unwrap_or_else(|| SocketAddr::new(IpAddr::V4(PROXY_ADDR), PROXY_PORT));
@@ -128,7 +153,7 @@ impl EgressProxies {
                 debug!(allocation_id = spec.allocation_id, addr = ?bound, "Started egress proxy");
                 let shared = Arc::new(Proxy {
                     allocation_id: spec.allocation_id,
-                    gated: spec.netns.is_some(),
+                    gated: spec.gated(),
                     context: self.context.clone(),
                 });
                 let task = tokio::spawn(run(listener, shared));
@@ -146,6 +171,52 @@ impl EgressProxies {
                     allocation_id = spec.allocation_id,
                     error = ?err,
                     "Failed to bind egress proxy; retrying on the next heartbeat"
+                );
+                lock(&self.listeners).insert(
+                    spec.allocation_id,
+                    Listener {
+                        spec,
+                        task: None,
+                        addr: None,
+                    },
+                );
+            }
+        }
+    }
+}
+
+impl EgressProxies {
+    /// The host end of a gated sandbox's vsock: a Unix socket the VMM
+    /// connects guest-initiated streams to.
+    async fn start_unix(&self, spec: ProxySpec, path: PathBuf) {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::remove_file(&path);
+        match tokio::net::UnixListener::bind(&path) {
+            Ok(listener) => {
+                debug!(allocation_id = spec.allocation_id, path = %path.display(), "Started egress proxy on vsock host socket");
+                let shared = Arc::new(Proxy {
+                    allocation_id: spec.allocation_id,
+                    gated: true,
+                    context: self.context.clone(),
+                });
+                let task = tokio::spawn(run_unix(listener, shared));
+                lock(&self.listeners).insert(
+                    spec.allocation_id,
+                    Listener {
+                        spec,
+                        task: Some(task),
+                        addr: None,
+                    },
+                );
+            }
+            Err(err) => {
+                warn!(
+                    allocation_id = spec.allocation_id,
+                    path = %path.display(),
+                    error = ?err,
+                    "Failed to bind egress proxy socket; retrying on the next heartbeat"
                 );
                 lock(&self.listeners).insert(
                     spec.allocation_id,
@@ -184,6 +255,23 @@ struct Proxy {
 
 async fn run(listener: TcpListener, proxy: Arc<Proxy>) {
     loop {
+        let (client, peer) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            Err(err) => {
+                debug!(error = ?err, "Egress proxy accept failed");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+        };
+        let proxy = proxy.clone();
+        tokio::spawn(async move {
+            handle(client, Some(peer), proxy).await;
+        });
+    }
+}
+
+async fn run_unix(listener: tokio::net::UnixListener, proxy: Arc<Proxy>) {
+    loop {
         let (client, _) = match listener.accept().await {
             Ok(accepted) => accepted,
             Err(err) => {
@@ -194,7 +282,7 @@ async fn run(listener: TcpListener, proxy: Arc<Proxy>) {
         };
         let proxy = proxy.clone();
         tokio::spawn(async move {
-            handle(client, proxy).await;
+            handle(client, None, proxy).await;
         });
     }
 }
@@ -296,12 +384,25 @@ async fn dial_proxy_target(
     Some(stream)
 }
 
-async fn handle(client: TcpStream, proxy: Arc<Proxy>) {
+async fn handle<S>(mut client: S, peer: Option<SocketAddr>, proxy: Arc<Proxy>)
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    // The first byte says which protocol the client speaks; it is handed
+    // back to the handler in front of the stream.
     let mut first = [0u8; 1];
-    match client.peek(&mut first).await {
-        Ok(1) if first[0] == 0x05 => handle_socks5(client, proxy).await,
-        Ok(1) => handle_http(client, proxy).await,
-        _ => {}
+    let n = match client.read(&mut first).await {
+        Ok(n) => n,
+        Err(_) => return,
+    };
+    if n == 0 {
+        return;
+    }
+    let client = Prefixed::new(first.to_vec(), client);
+    if first[0] == 0x05 {
+        handle_socks5(client, peer, proxy).await
+    } else {
+        handle_http(client, peer, proxy).await
     }
 }
 
@@ -309,7 +410,7 @@ async fn handle(client: TcpStream, proxy: Arc<Proxy>) {
 // HTTP: CONNECT and absolute-URI requests
 // ---------------------------------------------------------------------------
 
-async fn read_head(client: &mut TcpStream) -> Option<Vec<u8>> {
+async fn read_head<S: AsyncRead + Unpin>(client: &mut S) -> Option<Vec<u8>> {
     let mut buf = Vec::with_capacity(1024);
     let mut chunk = [0u8; 1024];
     loop {
@@ -347,7 +448,12 @@ fn split_host_port(target: &str, default_port: u16) -> (String, u16) {
     }
 }
 
-async fn deny_http(client: &mut TcpStream, source: &str, reason: Option<&str>, destination: &str) {
+async fn deny_http<S: AsyncWrite + Unpin>(
+    client: &mut S,
+    source: &str,
+    reason: Option<&str>,
+    destination: &str,
+) {
     let body = json!({
         "legion": {
             "denied": true,
@@ -375,7 +481,10 @@ async fn deny_http(client: &mut TcpStream, source: &str, reason: Option<&str>, d
     let _ = client.shutdown().await;
 }
 
-async fn handle_http(mut client: TcpStream, proxy: Arc<Proxy>) {
+async fn handle_http<S>(mut client: S, peer: Option<SocketAddr>, proxy: Arc<Proxy>)
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let Some(head) = read_head(&mut client).await else {
         return;
     };
@@ -458,9 +567,7 @@ async fn handle_http(mut client: TcpStream, proxy: Arc<Proxy>) {
                 deny_http(&mut client, &source, reason.as_deref(), &destination).await;
                 return;
             }
-            HopOutcome::Proxy(target) => {
-                dial_proxy_target(&proxy, &target, &hop_facts, client.peer_addr().ok()).await
-            }
+            HopOutcome::Proxy(target) => dial_proxy_target(&proxy, &target, &hop_facts, peer).await,
         };
         let Some(upstream) = upstream else {
             net_metrics::connection("egress", PROTOCOL_TCP, "error");
@@ -581,7 +688,7 @@ async fn handle_http(mut client: TcpStream, proxy: Arc<Proxy>) {
                 proxy_protocol: false,
                 ..target
             };
-            match dial_proxy_target(&proxy, &plain, &hop_facts, client.peer_addr().ok()).await {
+            match dial_proxy_target(&proxy, &plain, &hop_facts, peer).await {
                 Some(stream) => via_proxy = Some((stream, extra)),
                 None => {
                     net_metrics::connection("egress", PROTOCOL_HTTP, "error");
@@ -666,13 +773,15 @@ async fn handle_http(mut client: TcpStream, proxy: Arc<Proxy>) {
 }
 
 /// Write any bytes read past the head to the upstream, then splice.
-async fn splice(
+async fn splice<S>(
     proxy: &Proxy,
     host: &str,
-    mut client: TcpStream,
+    mut client: S,
     mut upstream: TcpStream,
     leftover: &[u8],
-) {
+) where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     if !leftover.is_empty() && upstream.write_all(leftover).await.is_err() {
         return;
     }
@@ -697,7 +806,10 @@ async fn splice(
 // SOCKS5 CONNECT
 // ---------------------------------------------------------------------------
 
-async fn handle_socks5(mut client: TcpStream, proxy: Arc<Proxy>) {
+async fn handle_socks5<S>(mut client: S, peer: Option<SocketAddr>, proxy: Arc<Proxy>)
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     // Greeting: VER NMETHODS METHODS...
     let mut hdr = [0u8; 2];
     if client.read_exact(&mut hdr).await.is_err() || hdr[0] != 0x05 {
@@ -826,9 +938,7 @@ async fn handle_socks5(mut client: TcpStream, proxy: Arc<Proxy>) {
                 .await;
             return;
         }
-        HopOutcome::Proxy(target) => {
-            dial_proxy_target(&proxy, &target, &hop_facts, client.peer_addr().ok()).await
-        }
+        HopOutcome::Proxy(target) => dial_proxy_target(&proxy, &target, &hop_facts, peer).await,
     };
     let Some(upstream) = upstream else {
         net_metrics::connection("egress", PROTOCOL_TCP, "error");
@@ -912,6 +1022,7 @@ mod tests {
                 allocation_id: 5,
                 netns: None,
                 listen: Some("127.0.0.1:0".parse().unwrap()),
+                unix: None,
             }])
             .await;
         let addr = proxies.address(5).expect("proxy bound");
@@ -1064,6 +1175,7 @@ mod tests {
                 allocation_id: 5,
                 netns: None,
                 listen: Some("127.0.0.1:0".parse().unwrap()),
+                unix: None,
             }])
             .await;
         let addr = proxies.address(5).expect("proxy bound");
@@ -1195,6 +1307,74 @@ mod tests {
         )
         .await;
         assert!(response.contains("saw GET /ok"), "{response}");
+    }
+
+    /// The host end of a gated sandbox's vsock is a Unix socket; the proxy
+    /// speaks exactly the same protocol on it.
+    #[tokio::test]
+    async fn the_proxy_serves_a_vsock_host_socket() {
+        let origin_port = origin().await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let cache = Arc::new(NetPolicyCache::new());
+        let denials = Arc::new(Denials::new());
+        let mut object: NetPolicyObject = serde_json::from_value(json!({
+            "name": "p", "enforcement": "require",
+            "egress": { "protocol": "http", "allow": ["127.0.0.1/ok/**"] }
+        }))
+        .unwrap();
+        object.normalize_and_validate().unwrap();
+        let policy = merge_policies(&[object], InlinePolicy::default());
+        let hash = policy.hash.clone();
+        cache.apply_assignments(&[AllocNetPolicy {
+            allocation_id: 9,
+            policy_hash: hash.clone(),
+        }]);
+        cache.insert_body(&hash, policy).unwrap();
+        let context = Arc::new(ForwarderContext::new(cache, denials.clone()));
+        let proxies = EgressProxies::new(context);
+        let socket = crate::worker::netd::guest_agent::host_socket_path(
+            &dir.path().join("vsock.sock"),
+            crate::worker::netd::guest_agent::PROXY_PORT,
+        );
+        proxies
+            .sync(&[ProxySpec {
+                allocation_id: 9,
+                netns: None,
+                listen: None,
+                unix: Some(socket.clone()),
+            }])
+            .await;
+        assert!(proxies.is_running(9));
+        assert!(
+            proxies.address(9).is_none(),
+            "a socket-backed proxy has no port"
+        );
+
+        let mut stream = tokio::net::UnixStream::connect(&socket).await.unwrap();
+        stream
+            .write_all(
+                format!("GET http://127.0.0.1:{origin_port}/ok/vsock HTTP/1.1\r\nHost: x\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut out = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(3), stream.read_to_end(&mut out)).await;
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.contains("saw GET /ok/vsock"), "{text}");
+
+        let mut stream = tokio::net::UnixStream::connect(&socket).await.unwrap();
+        stream
+            .write_all(
+                format!("GET http://127.0.0.1:{origin_port}/secret HTTP/1.1\r\nHost: x\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut out = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(3), stream.read_to_end(&mut out)).await;
+        assert!(String::from_utf8_lossy(&out).starts_with("HTTP/1.1 403"));
+        assert!(denials.drain().iter().any(|d| d.path == "/secret"));
     }
 
     #[tokio::test]

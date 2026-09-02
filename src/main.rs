@@ -27,6 +27,7 @@ fn cli() -> Command {
         .subcommand(cmd::kv::config())
         .subcommand(cmd::service::config())
         .subcommand(cmd::net::config())
+        .subcommand(cmd::guest_agent::config())
         .subcommand(cmd::volume::config())
         .subcommand(cmd::state::config())
         .subcommand(cmd::raft::config())
@@ -80,6 +81,7 @@ async fn main() -> R<()> {
         Some(("kv", sub_matches)) => cmd::kv::handle(sub_matches).await?,
         Some(("service", sub_matches)) => cmd::service::handle(sub_matches).await?,
         Some(("net", sub_matches)) => cmd::net::handle(sub_matches).await?,
+        Some(("guest-agent", sub_matches)) => cmd::guest_agent::handle(sub_matches).await?,
         Some(("volume", sub_matches)) => cmd::volume::handle(sub_matches).await?,
         Some(("state", sub_matches)) => cmd::state::handle(sub_matches).await?,
         Some(("raft", sub_matches)) => cmd::raft::handle(sub_matches).await?,

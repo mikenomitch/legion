@@ -2,7 +2,18 @@
 
 > **Judgement calls:** [`calls/service-mesh-plan_calls.md`](../calls/service-mesh-plan_calls.md)
 
-> **Status: IN EXECUTION.** This is the authoritative plan for everything
+> **Status: SHIPPED (M1–M10), with two named deferrals.** Every phase in §4
+> is in `main`'s history on this branch and documented in
+> [docs/network-handlers.md](../../docs/network-handlers.md); the honest
+> list of what each phase left out is in
+> [TODO.md](../TODO.md) under Networking. Deferred, by name: the
+> `legion netd` **process split** with `SCM_RIGHTS` hand-off (M5 shipped as
+> datapath persistence + replay before the first heartbeat — calls entry
+> 17), and flipping `network.mode = "auto"` to `gated` for sandboxes until
+> the vsock path has booted on a real VMM in CI (calls entry 16). Still
+> planned beyond this plan: UDP, transparent capture, WASM handlers, kTLS.
+>
+> This is the authoritative plan for everything
 > east-west and edge in Legion after service-discovery v1. It **unifies** two
 > documents and wins over both where they differ:
 >

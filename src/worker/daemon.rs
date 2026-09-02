@@ -150,6 +150,11 @@ async fn run_worker_with_manager(
 
     let name = resolve_worker_name(name_override, config.name_prefix.clone())?;
     let state_path = WorkerStateStore::path_for_worker(&name);
+    // The datapath's persisted inputs, replayed before the first heartbeat
+    // (docs/network-handlers.md, "The datapath across worker restarts").
+    let _ = NETD_STATE.set(crate::worker::netd::state::NetdStateStore::beside(
+        &state_path,
+    ));
     // Access logs sit next to each allocation's own logs.
     let logs_base_dir = WorkerStateStore::new(state_path.clone()).logs_base_dir();
     let task_manager = Arc::new(Mutex::new(WorkerTaskManager::with_state_store(
@@ -354,6 +359,9 @@ async fn run_worker_with_manager(
             .with_proxies(net_proxies)
             .with_ingress(net_ingress),
     );
+    // Restored tasks are still running: give them their network back now,
+    // not on the first successful heartbeat.
+    restore_datapath(&forwarder, &task_manager).await;
     let heartbeat_fut = start_heartbeats(
         name.clone(),
         client.clone(),
@@ -871,6 +879,24 @@ async fn heartbeat_tick(
             let last = LAST_DESIRED.lock().unwrap_or_else(|p| p.into_inner());
             net_status(forwarder, &last)
         };
+        // A gated allocation whose capture is not ready has no network: say
+        // so in its health, so rollouts and `doctor` see it rather than a
+        // task that looks fine and cannot reach anything.
+        {
+            let mut manager = task_manager.lock().expect("task manager");
+            for status in &net_status {
+                if status.mode == crate::structs::netpolicy::MODE_GATED
+                    && !status.capture_ready
+                    && manager.has_allocation(status.allocation_id)
+                {
+                    manager.set_allocation_health(
+                        status.allocation_id,
+                        false,
+                        format!("net_capture_unavailable: {}", status.problems.join("; ")),
+                    );
+                }
+            }
+        }
 
         let req = credentials.attach(tonic::Request::new(HeartbeatRequest {
             net_denials,
@@ -970,7 +996,12 @@ async fn heartbeat_tick(
         crate::worker::edge::sweep_leases(task_manager);
         // The manager acknowledged us, so this reply is authoritative for the
         // connect datapath (see `apply_upstreams` on fail-static semantics).
-        apply_upstreams(forwarder, &reply).await;
+        let alloc_root = task_manager
+            .lock()
+            .expect("task manager")
+            .alloc_root()
+            .to_path_buf();
+        apply_upstreams(forwarder, &reply, &alloc_root).await;
         // Config-file templates, rendered from the same feed; written before
         // any launch below so a task starts with its files in place.
         apply_templates(task_manager, &reply).await;
@@ -979,6 +1010,7 @@ async fn heartbeat_tick(
         apply_net_policies(forwarder, &mut client_clone, credentials, name, &reply).await;
         apply_mesh_identity(forwarder, &mut client_clone, credentials, name).await;
         *LAST_DESIRED.lock().unwrap_or_else(|p| p.into_inner()) = reply.desired_allocations.clone();
+        persist_datapath(forwarder, &reply);
         // Allocations whose launch was dispatched this tick. Their refresh
         // loops are spawned before the (async, unawaited) launch registers
         // them in the task manager, so they must be treated as live by the
@@ -1151,14 +1183,21 @@ async fn heartbeat_tick(
 /// traffic. Within a successful reply an empty endpoint list *is* authoritative
 /// (a killed or intention-denied backend must stop receiving traffic), while an
 /// upstream missing from `upstream_endpoints` entirely keeps its current list.
-async fn apply_upstreams(forwarder: &UpstreamForwarder, reply: &HeartbeatReply) {
+async fn apply_upstreams(
+    forwarder: &UpstreamForwarder,
+    reply: &HeartbeatReply,
+    alloc_root: &std::path::Path,
+) {
     let specs = upstream_specs(&reply.desired_allocations);
     forwarder.sync(&specs).await;
     if let Some(dns) = forwarder.dns() {
-        dns.sync(&dns_specs(&reply.desired_allocations)).await;
+        dns.sync(&dns_specs(&reply.desired_allocations, alloc_root))
+            .await;
     }
     if let Some(proxies) = forwarder.proxies() {
-        proxies.sync(&proxy_specs(&reply.desired_allocations)).await;
+        proxies
+            .sync(&proxy_specs(&reply.desired_allocations, alloc_root))
+            .await;
     }
     if let Some(ingress) = forwarder.ingress() {
         ingress
@@ -1192,6 +1231,138 @@ async fn apply_upstreams(forwarder: &UpstreamForwarder, reply: &HeartbeatReply) 
                 .unwrap_or(false)
     });
     context.set_mesh_wanted(mesh_wanted);
+}
+
+/// Where the datapath's inputs are persisted across restarts.
+static NETD_STATE: std::sync::OnceLock<crate::worker::netd::state::NetdStateStore> =
+    std::sync::OnceLock::new();
+/// Hash of the last persisted state, so an unchanged reply costs no write.
+static LAST_NETD_STATE_HASH: LazyLock<Mutex<u64>> = LazyLock::new(|| Mutex::new(0));
+
+/// Save what this reply told the datapath, when it differs from the last
+/// save. Off the heartbeat path (a blocking task), owner-only, atomic.
+fn persist_datapath(forwarder: &UpstreamForwarder, reply: &HeartbeatReply) {
+    let Some(store) = NETD_STATE.get() else {
+        return;
+    };
+    let state = crate::worker::netd::state::NetdState {
+        desired: reply.desired_allocations.clone(),
+        upstream_endpoints: reply.upstream_endpoints.clone(),
+        net_policies: reply.net_policies.clone(),
+        policy_bodies: forwarder
+            .context()
+            .cache()
+            .map(|cache| cache.bodies())
+            .unwrap_or_default(),
+    };
+    let hash = {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        serde_json::to_string(&state)
+            .unwrap_or_default()
+            .hash(&mut hasher);
+        hasher.finish()
+    };
+    {
+        let mut last = LAST_NETD_STATE_HASH
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if *last == hash {
+            return;
+        }
+        *last = hash;
+    }
+    let path = store.path().to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let store = crate::worker::netd::state::NetdStateStore::beside(&path);
+        if let Err(err) = store.save(&state) {
+            warn!(path = %path.display(), error = ?err, "Failed to persist datapath state");
+        }
+    });
+}
+
+/// Replay the persisted datapath inputs: listeners, VIPs, resolvers, egress
+/// proxies, ingress ports, identities and policy bodies come back from
+/// disk, so restored allocations have their network before the manager is
+/// even contacted. Namespaces persist on their own (bind mounts under
+/// `/var/run/netns`); this re-binds what lives inside and beside them.
+async fn restore_datapath(
+    forwarder: &UpstreamForwarder,
+    task_manager: &Arc<Mutex<WorkerTaskManager>>,
+) {
+    let Some(store) = NETD_STATE.get() else {
+        return;
+    };
+    restore_datapath_from(forwarder, task_manager, store).await;
+}
+
+/// [`restore_datapath`] against an explicit store (tests).
+async fn restore_datapath_from(
+    forwarder: &UpstreamForwarder,
+    task_manager: &Arc<Mutex<WorkerTaskManager>>,
+    store: &crate::worker::netd::state::NetdStateStore,
+) {
+    let state = match store.load() {
+        Ok(state) => state,
+        Err(err) => {
+            warn!(error = ?err, "Ignoring unreadable datapath state");
+            return;
+        }
+    };
+    if state.is_empty() {
+        return;
+    }
+    // Only allocations that survived the restart get their datapath back;
+    // the rest is the manager's to re-dispatch or forget.
+    let live: std::collections::HashSet<i64> = task_manager
+        .lock()
+        .expect("task manager")
+        .allocations_snapshot()
+        .into_iter()
+        .collect();
+    let desired: Vec<TaskAllocation> = state
+        .desired
+        .into_iter()
+        .filter(|a| live.contains(&a.allocation_id))
+        .collect();
+    if desired.is_empty() {
+        return;
+    }
+    let reply = HeartbeatReply {
+        desired_allocations: desired.clone(),
+        upstream_endpoints: state
+            .upstream_endpoints
+            .into_iter()
+            .filter(|u| live.contains(&u.allocation_id))
+            .collect(),
+        net_policies: state
+            .net_policies
+            .into_iter()
+            .filter(|p| live.contains(&p.allocation_id))
+            .collect(),
+        ..Default::default()
+    };
+    if let Some(cache) = forwarder.context().cache() {
+        cache.set_identities(crate::worker::netd::policy::identities_from_desired(
+            &desired,
+        ));
+        let _ = cache.apply_assignments(&reply.net_policies);
+        for (hash, body) in state.policy_bodies {
+            let _ = cache.insert_body(&hash, body);
+        }
+    }
+    let alloc_root = task_manager
+        .lock()
+        .expect("task manager")
+        .alloc_root()
+        .to_path_buf();
+    apply_upstreams(forwarder, &reply, &alloc_root).await;
+    *LAST_DESIRED.lock().unwrap_or_else(|p| p.into_inner()) = desired.clone();
+    info!(
+        allocations = desired.len(),
+        listeners = forwarder.active().len(),
+        "Restored the datapath from disk ahead of the first heartbeat"
+    );
 }
 
 /// Templates rendered on this node (docs/service-discovery.md, "Templates").
@@ -1465,7 +1636,10 @@ fn upstream_specs(desired: &[TaskAllocation]) -> Vec<UpstreamSpec> {
 /// The per-allocation resolvers a desired set implies: one per allocation
 /// that was assigned a VIP block, answering `<key>.svc.legion` with that
 /// allocation's upstream VIPs.
-fn dns_specs(desired: &[TaskAllocation]) -> Vec<crate::worker::netd::dns::DnsSpec> {
+fn dns_specs(
+    desired: &[TaskAllocation],
+    alloc_root: &std::path::Path,
+) -> Vec<crate::worker::netd::dns::DnsSpec> {
     let mut specs = Vec::new();
     for allocation in desired {
         if allocation.network.trim().is_empty() {
@@ -1487,13 +1661,19 @@ fn dns_specs(desired: &[TaskAllocation]) -> Vec<crate::worker::netd::dns::DnsSpe
                 Some((key, (vip.parse::<std::net::Ipv4Addr>().ok()?, port)))
             })
             .collect();
+        let sandbox = is_gated_sandbox(allocation);
         specs.push(crate::worker::netd::dns::DnsSpec {
             allocation_id: allocation.allocation_id,
             resolver,
             names,
-            netns: network
-                .is_gated()
+            netns: (network.is_gated() && !sandbox)
                 .then(|| crate::worker::netd::netns::netns_path(allocation.allocation_id)),
+            unix: sandbox.then(|| {
+                crate::worker::netd::guest_agent::host_socket_path(
+                    &sandbox_vsock_base(alloc_root, allocation.allocation_id),
+                    crate::worker::netd::guest_agent::DNS_PORT,
+                )
+            }),
         });
     }
     specs
@@ -1512,15 +1692,32 @@ static GATED_ALLOCATIONS: std::sync::LazyLock<Mutex<std::collections::HashSet<i6
 
 /// The egress proxies a desired set implies: one inside every gated
 /// allocation's namespace.
-fn proxy_specs(desired: &[TaskAllocation]) -> Vec<crate::worker::netd::proxy::ProxySpec> {
-    gated_allocation_ids(desired)
+fn proxy_specs(
+    desired: &[TaskAllocation],
+    alloc_root: &std::path::Path,
+) -> Vec<crate::worker::netd::proxy::ProxySpec> {
+    let mut specs: Vec<crate::worker::netd::proxy::ProxySpec> = gated_allocation_ids(desired)
         .into_iter()
         .map(|allocation_id| crate::worker::netd::proxy::ProxySpec {
             allocation_id,
             netns: Some(crate::worker::netd::netns::netns_path(allocation_id)),
             listen: None,
+            unix: None,
         })
-        .collect()
+        .collect();
+    // Gated sandboxes: the proxy is the host end of the guest's vsock port.
+    for allocation in desired.iter().filter(|a| is_gated_sandbox(a)) {
+        specs.push(crate::worker::netd::proxy::ProxySpec {
+            allocation_id: allocation.allocation_id,
+            netns: None,
+            listen: None,
+            unix: Some(crate::worker::netd::guest_agent::host_socket_path(
+                &sandbox_vsock_base(alloc_root, allocation.allocation_id),
+                crate::worker::netd::guest_agent::PROXY_PORT,
+            )),
+        });
+    }
+    specs
 }
 
 /// The ingress listeners a desired set implies: one per advertised port
@@ -1617,12 +1814,16 @@ fn net_status(
         let resolver_ready = resolvers.contains(&id);
         let proxy_ready = forwarder
             .proxies()
-            .is_some_and(|proxies| proxies.address(id).is_some());
+            .is_some_and(|proxies| proxies.is_running(id));
+        // A gated sandbox has no namespace: its capture is the vsock host
+        // sockets, bound like any listener.
+        let vsock_sandbox = gated && allocation.task_runtime == "sandbox";
         let mut problems: Vec<String> = forwarder
             .ingress()
             .map(|ingress| ingress.problems(id))
             .unwrap_or_default();
-        let namespace_ready = !gated || crate::worker::netd::netns::netns_exists(id);
+        let namespace_ready =
+            !gated || vsock_sandbox || crate::worker::netd::netns::netns_exists(id);
         if gated && !namespace_ready {
             problems.push("gated network namespace does not exist yet".into());
         }
@@ -1697,17 +1898,31 @@ fn net_status(
 }
 
 /// Allocations whose effective `network.mode` is `gated`.
+fn is_gated(allocation: &TaskAllocation) -> bool {
+    !allocation.network.trim().is_empty()
+        && serde_json::from_str::<AllocNetwork>(&allocation.network)
+            .map(|network| network.is_gated())
+            .unwrap_or(false)
+}
+
+/// A gated sandbox is captured over vsock, not a namespace.
+fn is_gated_sandbox(allocation: &TaskAllocation) -> bool {
+    is_gated(allocation) && allocation.task_runtime == "sandbox"
+}
+
+/// Gated allocations that get a network namespace (container, exec).
 fn gated_allocation_ids(desired: &[TaskAllocation]) -> Vec<i64> {
     desired
         .iter()
-        .filter(|allocation| {
-            !allocation.network.trim().is_empty()
-                && serde_json::from_str::<AllocNetwork>(&allocation.network)
-                    .map(|network| network.is_gated())
-                    .unwrap_or(false)
-        })
+        .filter(|allocation| is_gated(allocation) && !is_gated_sandbox(allocation))
         .map(|allocation| allocation.allocation_id)
         .collect()
+}
+
+/// The host-side vsock socket base of a gated sandbox
+/// (`<allocs>/<id>/.sandbox/vsock.sock`), from the worker's allocation root.
+fn sandbox_vsock_base(alloc_root: &std::path::Path, allocation_id: i64) -> PathBuf {
+    crate::task_plugins::vsock_socket_base_for(&alloc_root.join(allocation_id.to_string()))
 }
 
 /// Gated namespaces: created for every gated allocation in the desired set
@@ -1953,6 +2168,115 @@ mod tests {
     /// Regression: heartbeat failures used to `?`-exit the loop, leaving
     /// tasks running with no supervision and no self-fencing. The loop must
     /// survive an unreachable manager and keep retrying.
+    /// A restarted worker re-binds the datapath for the allocations it
+    /// re-adopted, from disk, before any heartbeat.
+    #[tokio::test]
+    async fn restored_datapath_rebinds_listeners_for_surviving_allocations() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let state_path = temp_dir.path().join("worker_state.json");
+        let task_manager = Arc::new(Mutex::new(WorkerTaskManager::with_state_store(
+            WorkerStateStore::new(state_path.clone()),
+        )));
+        task_manager.lock().unwrap().load_builtin_plugins();
+        // An allocation that "survived": running in the task manager.
+        let allocation = crate::structs::Allocation {
+            id: 31,
+            status: "running".into(),
+            resources: json!({}),
+            node_id: "node-1".into(),
+            job_config_id: "job-1".into(),
+            task_config_id: 1,
+            job_id: "web".into(),
+            instance_id: None,
+            network: None,
+        };
+        let task = crate::structs::TaskConfig {
+            config: json!({"command": ["sleep", "30"]}),
+            ..crate::structs::TaskConfig::new("server", "exec")
+        };
+        task_manager
+            .lock()
+            .unwrap()
+            .run_allocation(&allocation, &task)?;
+
+        let local_port = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await?
+            .local_addr()?
+            .port();
+        let store = crate::worker::netd::state::NetdStateStore::beside(&state_path);
+        store.save(&crate::worker::netd::state::NetdState {
+            desired: vec![
+                TaskAllocation {
+                    allocation_id: 31,
+                    job_id: "web".into(),
+                    task_name: "server".into(),
+                    task_runtime: "exec".into(),
+                    task_connect: json!({ "upstreams": [{ "service": "db" }] }).to_string(),
+                    network: json!({
+                        "upstreams": [{ "service": "db", "localPort": local_port, "balance": "round_robin" }]
+                    })
+                    .to_string(),
+                    ..Default::default()
+                },
+                // Not running here any more: its datapath is not restored.
+                TaskAllocation {
+                    allocation_id: 32,
+                    job_id: "web".into(),
+                    task_name: "gone".into(),
+                    task_runtime: "exec".into(),
+                    task_connect: json!({ "upstreams": [{ "service": "db" }] }).to_string(),
+                    network: json!({
+                        "upstreams": [{ "service": "db", "localPort": local_port + 1, "balance": "round_robin" }]
+                    })
+                    .to_string(),
+                    ..Default::default()
+                },
+            ],
+            upstream_endpoints: vec![UpstreamEndpoints {
+                allocation_id: 31,
+                service: "db".into(),
+                endpoints: vec![crate::structs::ServiceEndpoint {
+                    address: "10.0.0.5".into(),
+                    port: 5432,
+                    allocation_id: 90,
+                    node_id: "node-b".into(),
+                    ..Default::default()
+                }],
+                for_handler: false,
+            }],
+            ..Default::default()
+        })?;
+
+        let forwarder = UpstreamForwarder::with_context(Arc::new(
+            crate::worker::forwarder::ForwarderContext::new(
+                Arc::new(crate::worker::netd::NetPolicyCache::new()),
+                Arc::new(crate::worker::netd::Denials::new()),
+            ),
+        ));
+        restore_datapath_from(&forwarder, &task_manager, &store).await;
+        let active: Vec<(i64, String)> = forwarder
+            .active()
+            .into_iter()
+            .map(|spec| (spec.allocation_id, spec.service))
+            .collect();
+        assert_eq!(active, vec![(31, "db".to_string())]);
+        assert_eq!(
+            LAST_DESIRED
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|a| a.allocation_id)
+                .collect::<Vec<_>>(),
+            vec![31]
+        );
+        // The listener is really bound, with the persisted endpoint feed.
+        assert!(tokio::net::TcpStream::connect(("127.0.0.1", local_port))
+            .await
+            .is_ok());
+        task_manager.lock().unwrap().reconcile_allocations(&[]);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn heartbeat_loop_survives_failed_heartbeats() -> R<()> {
         let temp_dir = TempDir::new()?;
@@ -2211,7 +2535,7 @@ mod tests {
             }],
         };
 
-        apply_upstreams(&forwarder, &reply).await;
+        apply_upstreams(&forwarder, &reply, std::path::Path::new("/tmp")).await;
         assert_eq!(
             forwarder.active(),
             vec![UpstreamSpec {
@@ -2243,6 +2567,7 @@ mod tests {
                 message: "ack".into(),
                 ..HeartbeatReply::default()
             },
+            std::path::Path::new("/tmp"),
         )
         .await;
         assert!(forwarder.active().is_empty());

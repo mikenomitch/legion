@@ -224,6 +224,19 @@ fn sandbox_name(allocation: &Allocation) -> String {
     format!("legion-sbx-{}", allocation.id)
 }
 
+/// The host-side vsock socket base of a gated sandbox: the VMM multiplexes
+/// guest ports onto `<base>_<port>`, which is where the node datapath
+/// listens. Derived from the allocation directory alone so the worker can
+/// bind the listeners before the guest boots.
+pub fn vsock_socket_base(scratch: &Path) -> PathBuf {
+    scratch.join("vsock.sock")
+}
+
+/// [`vsock_socket_base`] from the allocation directory the worker owns.
+pub fn vsock_socket_base_for(alloc_dir: &Path) -> PathBuf {
+    vsock_socket_base(&alloc_dir.join(".sandbox"))
+}
+
 /// Per-allocation scratch: image layout, extracted rootfs, root disk, and the
 /// VMM control socket. Removed on destroy.
 fn work_root(allocation: &Allocation, instance: &TaskInstance) -> PathBuf {
@@ -610,11 +623,23 @@ impl SandboxTaskPlugin {
             .cwd
             .clone()
             .or_else(|| image_config.working_dir.clone());
+        // A gated sandbox has no NIC: its vsock device is the only way out,
+        // and the guest agent (this binary, copied in) makes the host
+        // datapath reachable on the guest's loopback.
+        let gated = crate::task_plugins::allocation_is_gated(allocation);
+        if gated && config.tap().is_some() {
+            bail!(
+                "sandbox task {} is network.mode = \"gated\" but its config declares a TAP \
+                 device; a gated guest has no NIC (drop config.network, or set mode = \"host\")",
+                task.name
+            );
+        }
         let mut payload = GuestPayload {
             command: config.command.clone(),
             env: guest_env,
             cwd: payload_cwd,
             disk_mounts: volumes.mounts,
+            guest_agent: gated,
         };
 
         let staged = instance.staged_artifacts.clone();
@@ -681,9 +706,16 @@ impl SandboxTaskPlugin {
             memory_mib: config.memory_mib(),
             tap: config.tap(),
             api_socket: scratch.join("vmm.sock"),
+            vsock: gated.then(|| microvm::VsockSpec {
+                cid: microvm::vsock_cid(allocation.id),
+                socket: vsock_socket_base(&scratch),
+            }),
         };
         // A stale socket from a previous boot makes the VMM refuse to start.
         let _ = std::fs::remove_file(&spec.api_socket);
+        if let Some(vsock) = spec.vsock.as_ref() {
+            let _ = std::fs::remove_file(&vsock.socket);
+        }
 
         match hypervisor {
             Backend::CloudHypervisor { binary } => {
@@ -976,6 +1008,11 @@ impl TaskPlugin for SandboxTaskPlugin {
         open: bool,
     ) -> R<()> {
         let config = SandboxTaskConfig::from_value(&task.config)?;
+        if crate::task_plugins::allocation_is_gated(allocation) {
+            // A gated guest's only door is the datapath: the gate is the
+            // policy-withheld marker every vsock listener checks.
+            return crate::task_plugins::set_gated_namespace_gate(allocation, open);
+        }
         let Some(tap) = config.tap() else {
             // Loopback-only guest: nothing to gate, and nothing to open.
             return Ok(());
@@ -1017,6 +1054,15 @@ impl TaskPlugin for SandboxTaskPlugin {
         let config = SandboxTaskConfig::from_value(&task.config)?;
         let hypervisor = Backend::detect(config.hypervisor.as_deref())?;
         if !hypervisor.is_microvm() {
+            if crate::task_plugins::allocation_is_gated(allocation) {
+                bail!(
+                    "sandbox task {} is network.mode = \"gated\", which needs a microVM backend \
+                     (cloud-hypervisor or firecracker) for its vsock datapath; this node resolved \
+                     `{}` — set the task's hypervisor, or use network.mode = \"host\"",
+                    task.name,
+                    hypervisor.label()
+                );
+            }
             warn!(
                 allocation_id = allocation.id,
                 task_name = %task.name,

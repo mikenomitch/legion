@@ -1371,11 +1371,33 @@ worker:
       `net_capture_unavailable` health signal (a missing namespace fails the
       start with a clear error instead — it is retried each heartbeat), and
       transparent capture (tools that ignore `HTTP_PROXY` have no route).
-- [ ] Phase 3 — `legion netd` as a supervised process with fd handoff; node
-      health. Required before the datapath becomes a sandbox's only path
-- [ ] Phase 4 — `gated` for `sandbox`: no guest NIC, `legion-guest-agent`
-      (SOCKS5 + CONNECT + DNS) over vsock. Shares the agent with VM forking
-      and microVM `exec`. **Core use case complete here**
+- [x] Phase 3 / M5 — datapath across worker restarts, and capture health
+      (2026-09-02), in a bounded form: the worker persists the datapath's
+      inputs (`netd_state.json`: desired set, endpoint feed, policy
+      assignments and bodies, owner-only, written when changed) and replays
+      them before its first heartbeat, re-binding every listener for the
+      allocations that survived the restart; a gated allocation whose
+      capture is not ready is reported unhealthy (`net_capture_unavailable`).
+      **Not done, deliberately:** the `legion netd` process split with
+      `SCM_RIGHTS` listener hand-off (zero dropped connections across a
+      worker upgrade) — in-flight connections drop at restart and the gap is
+      the process start time; see service-mesh calls entry 17.
+- [x] Phase 4 / M9 — `gated` for `sandbox` over vsock (2026-09-02): a gated
+      sandbox boots with no NIC and a virtio-vsock device on both VMMs
+      (`--vsock` / `"vsock"`), the worker binds the allocation's egress proxy
+      and resolver on the VMM's host sockets (`vsock.sock_1080`, `_53`)
+      before boot, and the generated init starts `legion guest-agent` (this
+      binary copied into the rootfs) which relays `127.0.0.1:1080` and
+      `127.0.0.1:53/udp` (DNS-over-TCP framing) to the host over `AF_VSOCK`;
+      TAP + gated rejected, dev-mode backends refused for gated; the boot
+      gate is the policy-withheld marker; status via `is_running`. **Not
+      verified on a real VMM** (no KVM in this environment): host side and
+      agent are unit-tested over Unix sockets with the VMMs' naming, so
+      `auto` still resolves to `host` for sandboxes until an end-to-end boot
+      runs in CI. Also open: the agent shares nothing yet with VM forking or
+      microVM `exec` (the vsock device is there; the exec channel is not),
+      and a musl-static agent for images whose libc cannot run the worker
+      binary.
 - [x] Phase 5 / M6 — ingress chains, drain-before-stop, `legion net doctor`
       (2026-09-02): a task with an ingress chain (its own or a `require`
       policy's) gets a private twin for every advertised port at placement;

@@ -55,6 +55,10 @@ pub struct DnsSpec {
     pub names: BTreeMap<String, (Ipv4Addr, u16)>,
     /// The gated namespace to bind inside, if any.
     pub netns: Option<std::path::PathBuf>,
+    /// A gated *sandbox*: serve DNS-over-TCP framing on this Unix socket —
+    /// the host end of the guest's vsock port 53 — instead of binding the
+    /// resolver address (the guest agent relays UDP queries to it).
+    pub unix: Option<std::path::PathBuf>,
 }
 
 struct Server {
@@ -67,6 +71,7 @@ struct Server {
 impl Server {
     fn is_running(&self) -> bool {
         self.udp.as_ref().is_some_and(|t| !t.is_finished())
+            || self.tcp.as_ref().is_some_and(|t| !t.is_finished())
     }
 }
 
@@ -166,6 +171,45 @@ impl NetDns {
     }
 
     async fn start(&self, spec: DnsSpec) {
+        if let Some(path) = spec.unix.clone() {
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::remove_file(&path);
+            match tokio::net::UnixListener::bind(&path) {
+                Ok(listener) => {
+                    debug!(allocation_id = spec.allocation_id, path = %path.display(), "Started allocation resolver on vsock host socket");
+                    let shared = Arc::new(Resolver {
+                        spec: spec.clone(),
+                        context: self.context.clone(),
+                        forwarders: self.forwarders.clone(),
+                    });
+                    let task = tokio::spawn(run_unix(listener, shared));
+                    lock(&self.servers).insert(
+                        spec.allocation_id,
+                        Server {
+                            spec,
+                            udp: None,
+                            tcp: Some(task),
+                            bind_warned: false,
+                        },
+                    );
+                }
+                Err(err) => {
+                    warn!(allocation_id = spec.allocation_id, path = %path.display(), error = ?err, "Failed to bind resolver socket; retrying on the next heartbeat");
+                    lock(&self.servers).insert(
+                        spec.allocation_id,
+                        Server {
+                            spec,
+                            udp: None,
+                            tcp: None,
+                            bind_warned: true,
+                        },
+                    );
+                }
+            }
+            return;
+        }
         let addr = SocketAddr::new(IpAddr::V4(spec.resolver), DNS_PORT);
         let udp = crate::worker::netd::netns::bind_udp(spec.netns.clone(), addr).await;
         let tcp = crate::worker::netd::netns::bind_tcp(spec.netns.clone(), addr).await;
@@ -273,9 +317,8 @@ async fn run_udp(socket: UdpSocket, resolver: Arc<Resolver>) {
 }
 
 async fn run_tcp(listener: TcpListener, resolver: Arc<Resolver>) {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     loop {
-        let (mut stream, _) = match listener.accept().await {
+        let (stream, _) = match listener.accept().await {
             Ok(accepted) => accepted,
             Err(err) => {
                 debug!(error = ?err, "Resolver accept failed");
@@ -284,24 +327,46 @@ async fn run_tcp(listener: TcpListener, resolver: Arc<Resolver>) {
             }
         };
         let resolver = resolver.clone();
-        tokio::spawn(async move {
-            // RFC 1035 §4.2.2 framing: two-byte length prefix.
-            let mut len_buf = [0u8; 2];
-            if stream.read_exact(&mut len_buf).await.is_err() {
-                return;
+        tokio::spawn(serve_stream(stream, resolver));
+    }
+}
+
+async fn run_unix(listener: tokio::net::UnixListener, resolver: Arc<Resolver>) {
+    loop {
+        let (stream, _) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            Err(err) => {
+                debug!(error = ?err, "Resolver accept failed");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
             }
-            let len = usize::from(u16::from_be_bytes(len_buf));
-            let mut query = vec![0u8; len];
-            if stream.read_exact(&mut query).await.is_err() {
-                return;
-            }
-            if let Some(response) = answer(&resolver, &query).await {
-                let mut framed = Vec::with_capacity(response.len() + 2);
-                framed.extend_from_slice(&(response.len() as u16).to_be_bytes());
-                framed.extend_from_slice(&response);
-                let _ = stream.write_all(&framed).await;
-            }
-        });
+        };
+        let resolver = resolver.clone();
+        tokio::spawn(serve_stream(stream, resolver));
+    }
+}
+
+/// One DNS-over-TCP exchange (RFC 1035 §4.2.2 framing: two-byte length
+/// prefix), on a TCP or a vsock-backed stream.
+async fn serve_stream<S>(mut stream: S, resolver: Arc<Resolver>)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut len_buf = [0u8; 2];
+    if stream.read_exact(&mut len_buf).await.is_err() {
+        return;
+    }
+    let len = usize::from(u16::from_be_bytes(len_buf));
+    let mut query = vec![0u8; len];
+    if stream.read_exact(&mut query).await.is_err() {
+        return;
+    }
+    if let Some(response) = answer(&resolver, &query).await {
+        let mut framed = Vec::with_capacity(response.len() + 2);
+        framed.extend_from_slice(&(response.len() as u16).to_be_bytes());
+        framed.extend_from_slice(&response);
+        let _ = stream.write_all(&framed).await;
     }
 }
 
@@ -656,6 +721,7 @@ mod tests {
                     .into_iter()
                     .collect(),
                 netns: None,
+                unix: None,
             },
             context,
             forwarders: vec![stub_addr],

@@ -715,9 +715,19 @@
                 kernel_args = "quiet",
                 network = {
                     # "none" (default, loopback only) or "tap" with a
-                    # pre-created host TAP device.
+                    # pre-created host TAP device. Not used when the task's
+                    # own `network.mode` below is "gated".
                     mode = "none",
                 },
+            },
+            # The task-level network block applies to sandboxes too: "gated"
+            # boots the guest with no NIC and a vsock to the node datapath,
+            # where the egress policy decides (docs/network-handlers.md,
+            # "Sandboxes"). "auto" is "host" until the vsock path is
+            # exercised on a real VMM in CI.
+            network = {
+                mode = "gated",
+                egress = { allow = ["pypi.org", "files.pythonhosted.org"] },
             },
             resources = {
                 cpus = 1,

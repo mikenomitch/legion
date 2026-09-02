@@ -9,7 +9,8 @@
 > `mode = "host"` does when a policy is attached. Everything else in §7 is the
 > detailed design the unified plan points at.
 >
-> **Status: IN EXECUTION (as phases of the unified plan).** Revision 2. The first revision was
+> **Status: SHIPPED (as phases M1–M9 of the unified plan; see its header
+> for the two named deferrals).** Revision 2. The first revision was
 > reviewed against the codebase, against a measured L4-vs-L7 cost study
 > (§2), and against the follow-up questions "how do I get this on every task
 > without writing it in every job" and "does posture scope to a pool or a

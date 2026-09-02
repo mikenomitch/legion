@@ -342,3 +342,70 @@ upstreams has nothing to render, which is the point.
 worker has the feed, the task dir, and the signal path already; and three
 functions are what consul-template users actually use. Simplicity, and
 performance (no manager work per beat).
+
+---
+
+## 15. The guest agent is the worker binary itself, copied into the rootfs
+
+**Call.** A gated sandbox's guest agent is `legion guest-agent`, a hidden
+subcommand of the one Legion binary, copied to `/legion/legion` when the
+root disk is built and started by the generated init before the command.
+
+**Alternatives.** A separate statically linked agent crate (musl) shipped as
+a second artifact; a shell-only relay (impossible — nothing in busybox
+speaks vsock); requiring images to bundle an agent.
+
+**Trade-off.** A glibc worker binary will not run on a musl (Alpine) image —
+init reports it on the console and the guest has no network, which is the
+fail-closed outcome but not a working one; the root disk grows by the size
+of the binary. A static agent is the follow-up (TODO).
+
+**Why.** Simplicity of shipping: "one binary" is a headline property of the
+project, the agent needs `libc` sockets and threads only, and the copy costs
+nothing to build. Correctness first, footprint second.
+
+---
+
+## 16. `auto` stays `host` for sandboxes until the vsock path boots in CI
+
+**Call.** The mode table's promise — `auto` = `gated` for `sandbox` — is not
+flipped in this phase. `network.mode = "gated"` on a sandbox is fully wired
+and opt-in; `auto` resolves to `host` for every runtime.
+
+**Alternatives.** Flip the default now (the plan's end state), trusting the
+unit tests over Unix sockets.
+
+**Trade-off.** Sandbox authors must write one line to get the boundary this
+work exists for, until the flip.
+
+**Why.** A default that has never been exercised end to end on the hardware
+it targets (no KVM in this repository's CI) would be a default nobody has
+seen work. The safe change is opt-in first, flip after a real boot —
+honesty over ceremony.
+
+---
+
+## 17. The datapath survives a worker restart by replaying persisted inputs, not by becoming a process
+
+**Call.** M5 ships as persistence: the worker saves what the datapath was
+told (desired set, endpoint feed, policy assignments and bodies) and replays
+it before the first heartbeat after a restart. `legion netd` as a separate,
+supervised process with `SCM_RIGHTS` listener hand-off — the plan's §3.1 —
+is deferred.
+
+**Alternatives.** The process split as planned (a Unix-socket control
+protocol, a supervisor, fd hand-off on upgrade, its own crash domain).
+
+**Trade-off.** In-flight connections drop when the worker restarts, and
+there is a gap of the process start time (hundreds of milliseconds) rather
+than zero; a panic in the datapath still takes the worker with it.
+
+**Why.** The failure this phase exists to fix is "a gated sandbox loses its
+network until the manager is reachable again after a worker upgrade" — and
+that is a *persistence* failure, fixed in full here without a second
+process, a control protocol, or a supervisor to get wrong. The split
+remains the right end state for zero-drop upgrades and crash isolation; it
+is the largest single piece of the plan, and shipping the durable half first
+keeps every other phase testable in this repository. Simplicity now,
+extensibility kept (the datapath's inputs are already a serialisable
+message — the split's wire format).
