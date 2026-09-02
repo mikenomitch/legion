@@ -1,7 +1,7 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use serde_json::json;
 use std::time::Duration;
-use tempfile::Builder;
+use tempfile::{Builder, TempDir};
 
 use legion::manager::scheduler::{PlanMode, Scheduler};
 use legion::storage::store::Store;
@@ -12,24 +12,32 @@ use legion::structs::{
 const SCALE_STEPS: &[usize] = &[10, 100, 1_000, 10_000, 100_000];
 const JOB_COUNT: usize = 10;
 
-fn store_path(prefix: &str) -> anyhow::Result<String> {
-    let store_dir = Builder::new().prefix(prefix).tempdir()?.keep();
-    Ok(store_dir
+/// The `TempDir` guard rides alongside the path so the on-disk store is
+/// deleted when the iteration's tuple drops. The previous `.keep()` leaked
+/// one store directory per iteration — at the 100k-allocation cells that
+/// filled the disk over a run and skewed late samples with filesystem
+/// pressure.
+fn store_path(prefix: &str) -> anyhow::Result<(String, TempDir)> {
+    let store_dir = Builder::new().prefix(prefix).tempdir()?;
+    let path = store_dir
+        .path()
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("Error parsing store path"))?
-        .to_string())
+        .to_string();
+    Ok((path, store_dir))
 }
 
-fn setup_store(policy: &str) -> anyhow::Result<Store> {
+fn setup_store(policy: &str) -> anyhow::Result<(Store, TempDir)> {
     setup_store_with_settings(policy, None)
 }
 
 fn setup_store_with_settings(
     policy: &str,
     scheduler_settings: Option<serde_json::Value>,
-) -> anyhow::Result<Store> {
+) -> anyhow::Result<(Store, TempDir)> {
+    let (store_path, store_dir) = store_path("legion-scheduler-bench-")?;
     let store_config = ManagerConfigFull {
-        store_path: store_path("khepri-scheduler-bench-")?,
+        store_path,
         scheduling_policy: policy.into(),
         task_resource_defaults: Some(json!({
             "cpu": 0,
@@ -42,7 +50,7 @@ fn setup_store_with_settings(
 
     let store = Store::start_storage(&store_config)?;
     store.reset_all_tables()?;
-    Ok(store)
+    Ok((store, store_dir))
 }
 
 fn default_fingerprint() -> serde_json::Value {
@@ -128,13 +136,16 @@ fn scheduler_speed_benchmark(c: &mut Criterion) {
                 group.bench_function(bench_id, |b| {
                     b.iter_batched(
                         || {
-                            let store = setup_store(policy).expect("store");
+                            let (store, dir) = setup_store(policy).expect("store");
                             insert_uniform_nodes(&store, node_count).expect("nodes");
                             let jobs = make_jobs(allocation_count);
                             let job_ids = submit_jobs(&store, &jobs).expect("jobs");
-                            (store, job_ids)
+                            (store, dir, job_ids)
                         },
-                        |(store, job_ids)| {
+                        // Returning the store and its tempdir moves their
+                        // drops (connection close + directory removal)
+                        // outside the timed section.
+                        |(store, dir, job_ids)| {
                             for job_config_id in job_ids {
                                 let scheduler = Scheduler::new(&store).expect("scheduler");
                                 let outcome = scheduler
@@ -142,6 +153,7 @@ fn scheduler_speed_benchmark(c: &mut Criterion) {
                                     .expect("plan");
                                 assert!(!outcome.allocations.is_empty());
                             }
+                            (store, dir)
                         },
                         criterion::BatchSize::LargeInput,
                     );
@@ -227,14 +239,15 @@ fn candidate_construction_benchmark(c: &mut Criterion) {
             group.bench_function(bench_id, |b| {
                 b.iter_batched(
                     || {
-                        let store = setup_store_with_settings("bin_pack", Some(settings.clone()))
-                            .expect("store");
+                        let (store, dir) =
+                            setup_store_with_settings("bin_pack", Some(settings.clone()))
+                                .expect("store");
                         insert_regional_nodes(&store, node_count).expect("nodes");
                         let job = make_constrained_job(12, 2);
                         let ids = submit_jobs(&store, std::slice::from_ref(&job)).expect("job");
-                        (store, ids)
+                        (store, dir, ids)
                     },
-                    |(store, job_ids)| {
+                    |(store, dir, job_ids)| {
                         let scheduler = Scheduler::new(&store).expect("scheduler");
                         for job_config_id in job_ids {
                             let plan = scheduler
@@ -242,6 +255,8 @@ fn candidate_construction_benchmark(c: &mut Criterion) {
                                 .expect("plan");
                             assert!(!plan.is_empty());
                         }
+                        drop(scheduler);
+                        (store, dir)
                     },
                     criterion::BatchSize::LargeInput,
                 );

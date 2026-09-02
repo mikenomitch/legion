@@ -108,6 +108,7 @@ When one is required and what goes in it:
 | [plan-path-scale-levers-plan.md](plans/plan-path-scale-levers-plan.md) | shipped (D4/D5/D6, 2026-07-30; batch-as-a-transaction, 2026-08-03) |
 | [plan-apply-conflict-reduction-plan.md](plans/plan-apply-conflict-reduction-plan.md) | in execution (two-pass bind + candidate-list restoration + decorrelated tails landed; **measured on AWS 2026-08-04: rejections 31.9% -> 0%**, but throughput unchanged — see [aws-phase3-findings.md](aws-phase3-findings.md); the throughput half of that cell is retracted by [aws-phase4-findings.md](aws-phase4-findings.md), which found the rig measuring its own submission rate) |
 | [eval-path-raft-cost-plan.md](plans/eval-path-raft-cost-plan.md) | in execution (claim/complete fusion + batched enqueue + eval-loop batching landed; phase 5 — in-memory reprojection memo + audit hardening — landed 2026-08-06; the AWS re-measurement is not run) |
+| [jsonb-text-affinity-plan.md](plans/jsonb-text-affinity-plan.md) | shipped 2026-08-06 (every JSON column rebuilt to TEXT affinity; `STRING`/`TIMESTAMP` columns deliberately left NUMERIC — see the calls doc) |
 | [node-loss-storm-plan.md](plans/node-loss-storm-plan.md) | shipped 2026-08-06 (below-default reschedule priority, empty-node filter, single-round batched fan-out, recovery counter); the AWS storm re-measurement is not run |
 | [eval-thread-default-plan.md](plans/eval-thread-default-plan.md) | planned; **deliberately picks no number** (the 2026-08-05 sweep rose monotonically 177.27 → 251.68 alloc/s from 4 to 32 eval threads and its 64-thread cell was driver-bound, so `available_parallelism()` is wrong but the knee is unmeasured; Phase 0a is load-generator work and gates everything) |
 | [bounded-candidate-scoring-plan.md](plans/bounded-candidate-scoring-plan.md) | shipped (opt-in `score_sample`, 2026-07-30) |
@@ -160,6 +161,7 @@ by project impact. The full template and a worked example:
 - [host-convergence-plan_calls.md](calls/host-convergence-plan_calls.md)
 - [host-process-supervision-plan_calls.md](calls/host-process-supervision-plan_calls.md)
 - [job-templates-plan_calls.md](calls/job-templates-plan_calls.md)
+- [jsonb-text-affinity-plan_calls.md](calls/jsonb-text-affinity-plan_calls.md)
 - [job-updated-at-plan_calls.md](calls/job-updated-at-plan_calls.md)
 - [kv-reactive-task-updates-plan_calls.md](calls/kv-reactive-task-updates-plan_calls.md)
 - [liveness-off-the-raft-path-plan_calls.md](calls/liveness-off-the-raft-path-plan_calls.md)

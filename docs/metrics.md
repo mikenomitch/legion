@@ -180,6 +180,13 @@ instrument.
   (`active`, `lost`, ...). Refreshed on the node-status-checker tick
   (`workerCheckSeconds`), so it lags by at most one tick; a status that
   empties out drops to `0` rather than disappearing.
+- **`legion_read_model_nodes{set}`** (gauge) — nodes in the manager's
+  in-memory scheduling read model, refreshed on the same tick:
+  `set="all"` is every cached node, `set="available"` is the planner's
+  candidate universe. In steady state `set="all"` equals `legion_nodes`
+  summed over statuses; a persistent gap means the scheduler is planning
+  over a truncated view of the fleet, which previously required sampling
+  `plan_submission` rows to even suspect.
 - **`legion_allocations`** (gauge) — live allocations tracked by the
   manager. Refreshed on the same tick.
 - **`legion_heartbeats_total`** (counter) — worker heartbeat RPCs accepted
