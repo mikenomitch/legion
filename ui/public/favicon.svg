@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32">
+  <!-- Legion standard (vexillum) on the brass tile used by the sidebar mark. -->
+  <rect width="32" height="32" rx="7" fill="#1e1c17"/>
+  <rect x="1" y="1" width="30" height="30" rx="6" fill="none" stroke="#d6b45a" stroke-opacity="0.35"/>
+  <g fill="none" stroke="#d6b45a" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M16 8v18"/>
+    <path d="M8 10h16"/>
+    <path d="M10.5 10v9l2.8-1.7 2.7 1.7 2.7-1.7 2.8 1.7v-9"/>
+  </g>
+  <circle cx="16" cy="5.5" r="1.6" fill="#d6b45a"/>
+</svg>

@@ -1645,23 +1645,24 @@ Deferred from [ui-jump-hints-plan.md](plans/ui-jump-hints-plan.md):
       the reserved-key list, not measured
       ([calls entry 1](calls/ui-jump-hints-plan_calls.md))
 
-- [ ] `ui/src/gen/legion_pb.ts` has drifted from `proto/legion.proto` — it is
-      missing `WorkerConfig.heartbeat_seconds`, `TaskAllocation.task_connect`,
-      `HeartbeatReply.upstream_endpoints` + the whole `UpstreamEndpoints`
-      message, `ServiceSummary.allow`, and `PlannedAllocation.score_sampled`.
-      Nothing in the UI reads them yet, so it typechecks; regenerate with
-      `protoc -I proto --es_out=ui/src/gen --es_opt=target=ts proto/legion.proto`
-      (needs `ui/node_modules/.bin` on PATH) and add it to CI, or the next
-      person to need one of those fields will hand-write it too
+Deferred from [ui-holistic-polish-plan.md](plans/ui-holistic-polish-plan.md):
 
-Deferred from [job-updated-at-plan.md](plans/job-updated-at-plan.md):
-
-- [ ] Per-page label for `SharedIndex`'s last column. It is hard-coded to
-      "Updated", but Nodes puts `last_heartbeat` under it — a different signal
-      wearing the same name ([calls entry 2](calls/job-updated-at-plan_calls.md))
-- [ ] Show created/updated on the job detail page header. The index was where
-      the wrong value was being read, so the header was left alone; it is a
-      layout change with its own design surface
+- [ ] Restart worker from the worker page. `RestartWorker` exists and the CLI
+      has `legion node restart`; it restarts the worker *process*, which wants
+      its own confirmation copy before it sits next to Cordon / Drain
+- [ ] A polled page whose one RPC keeps failing while the manager is otherwise
+      up shows its last good data with no local hint — `retainOnError` keeps
+      the last value and only the connection banner reports outages. A
+      per-card "stale since" marker would close the gap
+      ([calls entry 3](calls/ui-holistic-polish-plan_calls.md))
+- [ ] ⌘K recents are per browser (localStorage); per-identity recents would
+      need a manager-side store
+      ([calls entry 7](calls/ui-holistic-polish-plan_calls.md))
+- [ ] The CI generated-client check trusts the runner's apt `protoc`; pin it
+      (buf, or a release download) if a runner image bump ever produces a
+      false drift ([calls entry 9](calls/ui-holistic-polish-plan_calls.md))
+- [ ] A toast primitive, should a feature need feedback away from the control
+      that caused it; every message so far is an inline `Note`
 
 ## Cross-cutting
 
@@ -2353,6 +2354,22 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
       readably ([plan](plans/job-updated-at-plan.md),
       [calls](calls/job-updated-at-plan_calls.md),
       [docs](../docs/jobs-tasks-and-scheduling.md#job-timestamps-created_at-and-updated_at)).
+- [x] Holistic polish (2026-09-02): every index and detail page polls (one
+      `usePoll` helper, visibility-paused, last data kept across a transient
+      failure); **Stop job**, **Cordon / Drain / Uncordon**, and a **Scale**
+      panel in the UI; a lost-contact banner with retry; `?` shortcut sheet,
+      recents and actions in ⌘K, per-page tab titles, a favicon, a real
+      not-found page; Jobs status chips backed by new `ListJobs.status` +
+      `status_counts` fields (also `legion job list --status` and the MCP
+      tool); the Workers index shows liveness as the status with health and a
+      "Heartbeat" column; route-level code splitting (initial bundle
+      1.6 MB → 0.58 MB); a `ui-build` CI job with a generated-client drift
+      check ([plan](plans/ui-holistic-polish-plan.md),
+      [calls](calls/ui-holistic-polish-plan_calls.md),
+      [docs](../docs/ui-architecture.md)). Closed the job-updated-at
+      deferrals (created/updated on the job header, per-page last-column
+      label) and the stale "gen has drifted" item — the client was already
+      current, and CI now keeps it so.
 
 ## AWS rig: mitigations in place for the node-deregistration and plugin-build gaps
 

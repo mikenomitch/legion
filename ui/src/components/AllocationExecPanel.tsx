@@ -7,9 +7,14 @@ import { For, Show, createResource, createSignal } from 'solid-js'
 import { managerClient } from '../grpcClient'
 import { allows, jobScope } from '../utils/acl'
 import type { JobAction } from '../gen/legion_pb'
-import ExecTerminal from './ExecTerminal'
+import { lazyComponent } from './LazyPage'
 import type { ExecStartOptions } from '../lib/execSocket'
-import { Badge, Button, Icon, checkboxClass, cx, inputClass, selectClass } from './ui'
+import { Badge, Button, Icon, Spinner, checkboxClass, cx, inputClass, selectClass } from './ui'
+
+// xterm.js is the single heaviest dependency in the app and only a terminal
+// needs it, so it arrives when the first session opens rather than with the
+// overview.
+const ExecTerminal = lazyComponent(() => import('./ExecTerminal'), <Spinner label="Loading terminal…" />)
 
 interface Props {
   allocationId: bigint

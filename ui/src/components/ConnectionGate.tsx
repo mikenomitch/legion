@@ -6,35 +6,13 @@ import {
   connectionStatus,
   managerAddress,
 } from '../utils/connection'
-import { Button, Icon, Spinner } from './ui'
+import { Button, Icon, PageSkeleton, Spinner } from './ui'
 
-// Stand-in for the page while the first manager call is in flight. It mirrors
-// the shape most pages take (stat row, then a table) so the layout does not
-// jump when the real content lands.
-const PageSkeleton = () => (
-  <div role="status" aria-label="Loading" class="space-y-5">
-    <div class="grid grid-cols-2 gap-3 lg:grid-cols-4">
-      {Array.from({ length: 4 }).map(() => (
-        <div class="rounded-lg border border-line bg-surface p-3.5 shadow-card">
-          <div class="skeleton h-2.5 w-20" />
-          <div class="skeleton mt-3 h-6 w-16" />
-        </div>
-      ))}
-    </div>
-    <div class="overflow-hidden rounded-lg border border-line bg-surface shadow-card">
-      <div class="border-b border-line px-4 py-3">
-        <div class="skeleton h-2.5 w-28" />
-      </div>
-      <div class="space-y-2 p-4">
-        {Array.from({ length: 5 }).map(() => (
-          <div class="skeleton h-8" />
-        ))}
-      </div>
-    </div>
-  </div>
-)
+// How often the gate retries on its own while the manager is unreachable —
+// a manager that is still starting should let the user in without a click.
+const AUTO_RETRY_MS = 5_000
 
-const UnreachableCard = (props: { onRetry: () => void }) => (
+const UnreachableCard = (props: { onRetry: () => void; retrying: boolean }) => (
   <div class="flex justify-center py-10">
     <div class="w-full max-w-lg rounded-lg border border-line bg-surface p-6 shadow-card">
       <div class="flex items-start gap-3">
@@ -59,9 +37,14 @@ const UnreachableCard = (props: { onRetry: () => void }) => (
               · Point the UI elsewhere with <code class="font-mono text-muted">VITE_MANAGER_ENDPOINT</code>
             </li>
           </ul>
-          <Button variant="primary" size="md" icon="refresh" class="mt-4" onClick={props.onRetry}>
-            Retry
-          </Button>
+          <div class="mt-4 flex flex-wrap items-center gap-3">
+            <Button variant="primary" size="md" icon="refresh" onClick={props.onRetry} disabled={props.retrying}>
+              {props.retrying ? 'Retrying…' : 'Retry now'}
+            </Button>
+            <span class="text-xs text-faint" aria-live="polite">
+              Retrying automatically every {AUTO_RETRY_MS / 1000} seconds.
+            </span>
+          </div>
         </div>
       </div>
     </div>
@@ -73,25 +56,45 @@ const UnreachableCard = (props: { onRetry: () => void }) => (
 // page fail on its own with no address and no way to retry.
 export function ConnectionGate(props: { children: JSX.Element }) {
   const [slow, setSlow] = createSignal(false)
+  const [retrying, setRetrying] = createSignal(false)
   let hintTimer: ReturnType<typeof setTimeout> | undefined
+  let retryTimer: ReturnType<typeof setTimeout> | undefined
 
   const clearHintTimer = () => {
     if (hintTimer) clearTimeout(hintTimer)
     hintTimer = undefined
   }
+  const clearRetryTimer = () => {
+    if (retryTimer) clearTimeout(retryTimer)
+    retryTimer = undefined
+  }
 
   const attempt = () => {
+    clearRetryTimer()
     setSlow(false)
     clearHintTimer()
     hintTimer = setTimeout(() => setSlow(true), SLOW_CONNECT_HINT_MS)
+    // The first attempt gets the skeleton; later ones keep the card up and
+    // only mark its button, so the address and the error stay readable.
+    setRetrying(connectionStatus() === 'unreachable')
     void connectToManager().finally(() => {
       clearHintTimer()
       setSlow(false)
+      setRetrying(false)
+      if (connectionStatus() === 'unreachable') {
+        retryTimer = setTimeout(() => {
+          if (!document.hidden) attempt()
+          else retryTimer = setTimeout(attempt, AUTO_RETRY_MS)
+        }, AUTO_RETRY_MS)
+      }
     })
   }
 
   onMount(attempt)
-  onCleanup(clearHintTimer)
+  onCleanup(() => {
+    clearHintTimer()
+    clearRetryTimer()
+  })
 
   return (
     <Switch>
@@ -108,7 +111,7 @@ export function ConnectionGate(props: { children: JSX.Element }) {
         </div>
       </Match>
       <Match when={connectionStatus() === 'unreachable'}>
-        <UnreachableCard onRetry={attempt} />
+        <UnreachableCard onRetry={attempt} retrying={retrying()} />
       </Match>
       <Match when={connectionStatus() === 'connected'}>{props.children}</Match>
     </Switch>

@@ -93,6 +93,35 @@ export const fetchAllocationRuntime = async (
   return runtime
 }
 
+// Live per-task status for one job, straight from the state store: the
+// ledger only carries task_config_id (not names) and an initial deploy has
+// no rollout, so this join is the authoritative running/success/failed per
+// task. Empty on denial or an older manager; callers fall back to the
+// rollout-derived view.
+export const fetchTaskStatusByName = async (jobId: string): Promise<Map<string, string>> => {
+  const escaped = jobId.replace(/'/g, "''")
+  const sql =
+    'SELECT tc.name AS task_name, COALESCE(ts.status, a.status) AS status ' +
+    'FROM allocation a JOIN task_config tc ON tc.id = a.task_config_id ' +
+    'LEFT JOIN task_status ts ON ts.task_config_id = a.task_config_id ' +
+    `WHERE tc.job_id = '${escaped}'`
+  const statusByName = new Map<string, string>()
+  try {
+    const response = await managerClient.queryStateStore({ sql })
+    for (const row of response.rows) {
+      try {
+        const parsed = JSON.parse(row.json) as { task_name?: string; status?: string }
+        if (parsed.task_name) statusByName.set(parsed.task_name, parsed.status ?? '')
+      } catch {
+        // ignore malformed rows
+      }
+    }
+  } catch {
+    // Denied state-store read or an older manager: no live status.
+  }
+  return statusByName
+}
+
 // "unknown" is deliberate: no snapshot yet reads very differently from a
 // failing check, and the status vocabulary already tones it as a warning.
 export const allocationHealthLabel = (runtime: AllocationRuntime | undefined): string => {

@@ -2,7 +2,9 @@ import { For, Show, createMemo, createResource, createSignal } from 'solid-js'
 import { AccessGate } from '../components/AccessGate'
 import { managerClient } from '../grpcClient'
 import { allows } from '../utils/acl'
-import { Badge, Button, CodeBlock, ConfirmButton, DefList, EmptyState, Field, Icon, Note, SectionCard, Spinner, StatusBadge, cx, inputClass } from '../components/ui'
+import { Badge, Button, CodeBlock, ConfirmButton, DefList, EmptyState, Field, Icon, Note, RelativeTime, SectionCard, Spinner, StatusBadge, cx, inputClass } from '../components/ui'
+import { formatDateTime } from '../utils/format'
+import { INDEX_POLL_INTERVAL_MS, retainOnError, usePoll } from '../utils/polling'
 
 const raftCommands = [
   { label: 'Trigger Election', command: 'trigger-election', destructive: false },
@@ -19,8 +21,17 @@ function RaftContent() {
   const [joinToken, setJoinToken] = createSignal('')
   const [joinTokenExpiry, setJoinTokenExpiry] = createSignal('')
 
-  const [status, statusActions] = createResource(async () => managerClient.getRaftStatus({}))
-  const [history, historyActions] = createResource(async () => managerClient.listRaftHistory({ limit: 100 }))
+  // Polled: an election or a membership change in progress is exactly what
+  // someone on this page is waiting to see.
+  const tick = usePoll(INDEX_POLL_INTERVAL_MS)
+  const [status, statusActions] = createResource(
+    () => tick() + 1,
+    retainOnError(async () => managerClient.getRaftStatus({}), () => 'status'),
+  )
+  const [history, historyActions] = createResource(
+    () => tick() + 1,
+    retainOnError(async () => managerClient.listRaftHistory({ limit: 100 }), () => 'history'),
+  )
 
   const refresh = async () => {
     await Promise.all([statusActions.refetch(), historyActions.refetch()])
@@ -167,7 +178,7 @@ function RaftContent() {
             </Show>
             <Show when={joinToken()}>
               <div class="mt-3 space-y-1.5">
-                <p class="eyebrow">Join token <span class="normal-case text-faint">· expires {joinTokenExpiry()}</span></p>
+                <p class="eyebrow">Join token <span class="normal-case text-faint">· expires {formatDateTime(joinTokenExpiry())}</span></p>
                 <CodeBlock code={joinToken()} maxHClass="max-h-24" />
               </div>
             </Show>
@@ -191,7 +202,7 @@ function RaftContent() {
                     <Badge tone="neutral" mono>#{event.eventId.toString()}</Badge>
                     <StatusBadge status={event.eventType} />
                     <span class="min-w-0 flex-1 text-ink">{event.message}</span>
-                    <span class="whitespace-nowrap font-mono text-2xs text-faint">{event.createdAt}</span>
+                    <RelativeTime value={event.createdAt} class="whitespace-nowrap text-2xs text-faint" />
                   </div>
                   <p class="mt-1 text-xs text-faint">
                     actor {event.actor} · target {event.target ?? '—'} · term {event.term.toString()} · leader {event.leaderId ?? '—'}

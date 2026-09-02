@@ -4,7 +4,7 @@ import SharedIndex from '../components/SharedIndex'
 import { checkboxClass } from '../components/ui'
 import { managerClient } from '../grpcClient'
 import { debounced } from '../utils/debounce'
-import { formatRelativeTime } from '../utils/format'
+import { INDEX_POLL_INTERVAL_MS, retainOnError, swallowDenied, usePoll } from '../utils/polling'
 
 const isActiveStatus = (status: string) => !['completed', 'failed', 'cancelled', 'completed_incomplete'].includes(status.toLowerCase())
 
@@ -15,19 +15,20 @@ function RolloutsContent() {
   const [pageSize, setPageSize] = createSignal(20)
   const searchQuery = debounced(search)
   const [activeOnly, setActiveOnly] = createSignal(false)
+  const tick = usePoll(INDEX_POLL_INTERVAL_MS)
 
   createEffect(() => {
     search(); sort(); activeOnly(); setPage(1)
   })
 
   // node:read garnish; degrade for job-scoped tokens (see Jobs.tsx).
-  const [ledger] = createResource(async () => {
-    try {
-      return (await managerClient.getLedger({})).nodes
-    } catch {
-      return []
-    }
-  })
+  const [ledger] = createResource(
+    () => tick() + 1,
+    retainOnError(
+      swallowDenied(async () => (await managerClient.getLedger({})).nodes, []),
+      () => 'ledger',
+    ),
+  )
   const placementCounts = createMemo(() => {
     const counts = new Map<string, number>()
     for (const node of ledger() ?? []) {
@@ -39,11 +40,14 @@ function RolloutsContent() {
   })
 
   const [data] = createResource(
-    () => ({ search: searchQuery(), sort: sort(), page: page(), pageSize: pageSize(), activeOnly: activeOnly() }),
-    async (input) => {
-      const [sortBy, sortOrder] = input.sort.split(':')
-      return managerClient.listRollouts({ query: input.search, sortBy, sortOrder, page: input.page, pageSize: input.pageSize, activeOnly: input.activeOnly })
-    },
+    () => ({ search: searchQuery(), sort: sort(), page: page(), pageSize: pageSize(), activeOnly: activeOnly(), tick: tick() }),
+    retainOnError(
+      async (input: { search: string; sort: string; page: number; pageSize: number; activeOnly: boolean; tick: number }) => {
+        const [sortBy, sortOrder] = input.sort.split(':')
+        return managerClient.listRollouts({ query: input.search, sortBy, sortOrder, page: input.page, pageSize: input.pageSize, activeOnly: input.activeOnly })
+      },
+      (input) => `${input.search}|${input.sort}|${input.page}|${input.pageSize}|${input.activeOnly}`,
+    ),
   )
 
   const prioritized = createMemo(() => {
@@ -80,7 +84,7 @@ function RolloutsContent() {
         title: rollout.jobId,
         subtitle: `Rollout #${rollout.id}`,
         status: rollout.status,
-        updatedAt: formatRelativeTime(rollout.updatedAt),
+        updatedAt: rollout.updatedAt,
         href: `/rollouts/${rollout.id}`,
         cells: {
           target: <span class="font-mono text-xs">{rollout.toJobConfigId}</span>,

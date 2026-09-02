@@ -1,6 +1,6 @@
 import { A, useParams } from '@solidjs/router'
 import { AccessGate } from '../../components/AccessGate'
-import { For, Show, createMemo, createResource, createSignal, onCleanup, onMount } from 'solid-js'
+import { For, Show, createMemo, createResource, createSignal } from 'solid-js'
 import { ServiceEndpointsTable, ServiceTags } from '../../components/ServiceEndpoints'
 import {
   Badge,
@@ -16,7 +16,7 @@ import {
   linkClass,
 } from '../../components/ui'
 import { managerClient } from '../../grpcClient'
-import { POLL_INTERVAL_MS } from '../../utils/polling'
+import { retainOnError, usePoll } from '../../utils/polling'
 import { diagnoseService, type DiagnosisLevel } from '../../utils/services'
 
 const stepIcon: Record<DiagnosisLevel, 'check' | 'x' | 'alertTriangle'> = {
@@ -35,27 +35,25 @@ function ServiceDetailContent() {
   const params = useParams()
   const serviceName = createMemo(() => decodeURIComponent(params.name))
   const [onlyHealthy, setOnlyHealthy] = createSignal(false)
-  const [tick, setTick] = createSignal(0)
-
-  onMount(() => {
-    const timer = setInterval(() => setTick((value) => value + 1), POLL_INTERVAL_MS)
-    onCleanup(() => clearInterval(timer))
-  })
+  const tick = usePoll()
 
   // Always resolve with unhealthy included: this page exists to explain why an
   // endpoint is missing, and filtering happens client-side.
   const [data] = createResource(
     () => [serviceName(), tick()] as const,
-    async ([name]) => {
-      const [list, resolved] = await Promise.all([
-        managerClient.listServices({}),
-        managerClient.resolveService({ service: name, includeUnhealthy: true }),
-      ])
-      return {
-        summary: list.services.find((entry) => entry.service === name),
-        endpoints: resolved.endpoints,
-      }
-    },
+    retainOnError(
+      async ([name]: readonly [string, number]) => {
+        const [list, resolved] = await Promise.all([
+          managerClient.listServices({}),
+          managerClient.resolveService({ service: name, includeUnhealthy: true }),
+        ])
+        return {
+          summary: list.services.find((entry) => entry.service === name),
+          endpoints: resolved.endpoints,
+        }
+      },
+      ([name]) => name,
+    ),
   )
 
   const endpoints = () => data()?.endpoints ?? []
