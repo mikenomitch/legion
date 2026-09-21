@@ -1516,6 +1516,34 @@ Plans: [persistence-plan.md](plans/persistence-plan.md), [multi-raft-persistence
       job type, or just a richer `count`? (`count: {num: 1, per: "id"}`
       approximates it today but does not converge newly joined nodes.)
 
+## KV & secrets
+
+Plan: [kv-encryption-plan.md](plans/kv-encryption-plan.md) · docs: [kv-store.md](../docs/kv-store.md) (the shipped page; `docs/kv-encryption.md` lands with phase 1)
+
+- [ ] **KV values encrypted at rest.** Today `kv_entry.value` is plaintext in
+      the store, every backup, the streamed replica, the raft log and every
+      snapshot — and `state:read` reads it all regardless of `kv` path ACLs.
+      The plan is envelope encryption with a replicated keyring: a root key
+      that never enters the store (`file` by default, minted on first start;
+      `env`; `exec` for any KMS), wrapped data keys in raft, AES-256-GCM per
+      value with the key path as AAD, on by default with a lazy migration,
+      and `legion keyring …` for status/rotation/rewrap. A missing root key
+      locks KV and names the file; it never stops the manager. Alternatives
+      with pros/cons are in the plan's §11.
+  - [ ] Phase 1 — encrypt on write / decrypt on read, `file`/`env` providers,
+        locked mode, the mixed-version initialization gate, backup reminder
+        and restore fail-fast, `legion keyring status`, `docs/kv-encryption.md`
+  - [ ] Phase 2 — automatic data-key rotation, background rewrap + GC,
+        `root-key generate|rewrap`, `rewrap --plaintext`, `reset` break-glass,
+        metrics/events/UI card
+  - [ ] Phase 3 — `exec` root-key provider, `legion keyring provider test`,
+        reference plugins for AWS KMS and Vault Transit
+  - [ ] Phase 4 — root key delivered to joining managers by the raft join flow
+  - [ ] **Follow-up needing its own plan:** the *rendered* copies of KV values
+        in `job_config` / `task_config` and the worker state file stay
+        plaintext (plan §6.9, calls doc #10) — encrypt the derived columns, or
+        move rendering to the worker.
+
 ## Auth, TLS & security
 
 Plan: [auth-acl-plan.md](plans/auth-acl-plan.md) · docs: [auth-and-acls.md](../docs/auth-and-acls.md)
