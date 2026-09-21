@@ -748,6 +748,18 @@ pub struct Metrics {
     pub runtime_spawn_delay_seconds: Arc<Histogram>,
     /// `legion_runtime_worker_threads`
     pub runtime_worker_threads: Arc<Gauge>,
+    /// `legion_keyring_unlocked`
+    pub keyring_unlocked: Arc<Gauge>,
+    /// `legion_keyring_keys{state}`
+    pub keyring_keys: Arc<GaugeVec>,
+    /// `legion_keyring_active_key_age_seconds`
+    pub keyring_active_key_age_seconds: Arc<Gauge>,
+    /// `legion_kv_rows{encryption}`
+    pub kv_rows: Arc<GaugeVec>,
+    /// `legion_kv_decrypt_failures_total{reason}`
+    pub kv_decrypt_failures_total: Arc<CounterVec>,
+    /// `legion_keyring_provider_calls_total{op,outcome}`
+    pub keyring_provider_calls_total: Arc<CounterVec>,
     /// `legion_raft_voters{lane}`
     pub raft_voters: Arc<GaugeVec>,
     /// `legion_raft_quorum{lane}`
@@ -1038,6 +1050,55 @@ impl Metrics {
                 name: "legion_raft_voters",
                 help: "Voting members of each raft lane's group, as known by this manager.",
                 labels: &["lane"],
+            },
+            series: Series::new(),
+        });
+        // KV encryption at rest (docs/kv-encryption.md).
+        let keyring_unlocked = Arc::new(Gauge {
+            meta: FamilyMeta {
+                name: "legion_keyring_unlocked",
+                help: "1 when this manager can encrypt and decrypt every KV value (every data key unwrapped), 0 when the keyring is locked, disabled, or not initialized yet. Alert on 0 while encryption is enabled.",
+                labels: &[],
+            },
+            cell: GaugeCell::default(),
+        });
+        let keyring_keys = Arc::new(GaugeVec {
+            meta: FamilyMeta {
+                name: "legion_keyring_keys",
+                help: "Data keys in the KV keyring by state (active|retired). More than one for longer than a rewrap means a retired key still has values under it.",
+                labels: &["state"],
+            },
+            series: Series::new(),
+        });
+        let keyring_active_key_age_seconds = Arc::new(Gauge {
+            meta: FamilyMeta {
+                name: "legion_keyring_active_key_age_seconds",
+                help: "Age of the active KV data key. Rotates automatically at encryption.dataKeyRotationAge (default 30 days).",
+                labels: &[],
+            },
+            cell: GaugeCell::default(),
+        });
+        let kv_rows = Arc::new(GaugeVec {
+            meta: FamilyMeta {
+                name: "legion_kv_rows",
+                help: "KV entries by storage form (encrypted|plaintext). Plaintext rows after enabling encryption are pre-upgrade values a rewrap has not converted yet.",
+                labels: &["encryption"],
+            },
+            series: Series::new(),
+        });
+        let kv_decrypt_failures_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_kv_decrypt_failures_total",
+                help: "KV reads that could not be decrypted, by reason: locked (the data key is not unwrapped on this manager — root key missing) or corrupt (the stored ciphertext failed authentication).",
+                labels: &["reason"],
+            },
+            series: Series::new(),
+        });
+        let keyring_provider_calls_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_keyring_provider_calls_total",
+                help: "Calls to the root key provider (describe|wrap|unwrap) by outcome (ok|error). Never on a KV read or write path.",
+                labels: &["op", "outcome"],
             },
             series: Series::new(),
         });
@@ -1339,6 +1400,12 @@ impl Metrics {
             Arc::clone(&raft_quorum) as Arc<dyn RenderMetric>,
             Arc::clone(&raft_term) as Arc<dyn RenderMetric>,
             Arc::clone(&raft_voters) as Arc<dyn RenderMetric>,
+            Arc::clone(&keyring_unlocked) as Arc<dyn RenderMetric>,
+            Arc::clone(&keyring_keys) as Arc<dyn RenderMetric>,
+            Arc::clone(&keyring_active_key_age_seconds) as Arc<dyn RenderMetric>,
+            Arc::clone(&kv_rows) as Arc<dyn RenderMetric>,
+            Arc::clone(&kv_decrypt_failures_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&keyring_provider_calls_total) as Arc<dyn RenderMetric>,
             Arc::clone(&runtime_spawn_delay_seconds) as Arc<dyn RenderMetric>,
             Arc::clone(&runtime_worker_threads) as Arc<dyn RenderMetric>,
             Arc::clone(&scheduler_index_candidates) as Arc<dyn RenderMetric>,
@@ -1384,6 +1451,12 @@ impl Metrics {
             store_coalesce_wait_rounds_total,
             runtime_spawn_delay_seconds,
             runtime_worker_threads,
+            keyring_unlocked,
+            keyring_keys,
+            keyring_active_key_age_seconds,
+            kv_rows,
+            kv_decrypt_failures_total,
+            keyring_provider_calls_total,
             raft_voters,
             raft_quorum,
             raft_term,

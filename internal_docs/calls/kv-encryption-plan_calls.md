@@ -388,3 +388,122 @@ feature: the follow-ups that encrypt derived columns or signing keys will
 reuse it unchanged, and renaming a config block later is a migration for
 every operator. Naming it for what it *is* now avoids that; naming it for
 what it covers today would be wrong in one release.
+
+---
+
+The entries below were made while implementing the plan (2026-09-21). They
+are ranked among themselves; each sits below the design-time calls above
+because none of them constrains the public surface the way those do.
+
+## 15. Keys already unwrapped stay usable until a restart
+
+**Call.** `Keyring::load_rows` keeps every data key that is already unwrapped
+in memory and only asks the provider for rows it has not seen. Consequently a
+root key file that goes missing (or is replaced with the wrong key) while a
+manager is running does not lock anything: reads and writes continue on the
+keys in memory, and the loss bites at the next start, where nothing is in
+memory yet.
+
+**Alternatives.** Re-unwrap every row on every reload, so a lost file locks
+the keyring within one reload (the plan's §6.7 table reads that way).
+
+**Trade-off.** `legion keyring status` on a running manager can say
+`unlocked` while the file on disk is already gone; the operator finds out at
+the next restart, or from a joiner that receives no bundle. Tests that want
+to observe a lock must restart the store (which is what
+`a_missing_root_key_locks_reads_and_writes_but_not_deletes` does).
+
+**Why (simplicity at 3am, and correctness).** The leader installs the key it
+just generated directly into memory before the provider has necessarily
+re-read the file, and the `exec` provider must never be called on the raft
+apply thread; both fall out naturally when a reload is "unwrap what is new"
+rather than "re-verify everything". And a running manager losing its ability
+to serve KV because a file vanished under it is a worse incident than one
+that keeps serving until someone restarts it on purpose.
+
+## 16. Reads self-heal by reloading a local provider once before failing
+
+**Call.** `Store::kv_entry_from_raw` retries a `KeyringLocked` read once after
+`load_keyring()` when the provider is `file` or `env`. A data key that just
+replicated in, or a root key that just appeared on disk, is one file read
+away, so the read succeeds instead of failing until the next 15-second tick.
+
+**Alternatives.** Fail the read and rely on the keyring loop's tick (plus the
+wake on every replicated keyring change) to reload.
+
+**Trade-off.** A read that is genuinely locked pays one extra file read
+before it errors. `exec` providers get no such retry (a KMS call on a read
+path is exactly what the design forbids) and rely on the loop.
+
+**Why (ergonomics).** The docs promise "copy the file into place and the
+next read works" with no restart; this is what makes that sentence true.
+
+## 17. The upgrade gate reads a schema-version header on every transport reply
+
+**Call.** Every `RaftTransport` reply carries `x-legion-schema-version` (the
+answering build's migration count); the leader's network layer records it
+per peer, and `voters_missing_schema_version` compares every voter against
+`KEYRING_SCHEMA_VERSION` (pinned to the keyring migration by a test). A
+voter that has never answered, or runs a build that predates the header, is
+"missing", which fails closed.
+
+**Alternatives.** (a) Put the version into raft membership metadata at join
+time — but a member's version changes at every upgrade without a re-join.
+(b) Add a dedicated peer-version RPC — another RPC to version.
+
+**Trade-off.** The map is only as fresh as the last reply, so a freshly
+elected leader sees every peer as missing until its first AppendEntries
+round completes (milliseconds), and the keyring loop retries every 15
+seconds. The header is a few bytes on every reply.
+
+**Why (correctness with no new protocol).** The leader already talks to
+every follower on every heartbeat; a reply header is free, needs no new RPC,
+and is exactly as current as the cluster's own liveness.
+
+## 18. The join flow delivers the root key in the first release, not Phase 4
+
+**Call.** `JoinRaftClusterReply.root_key_bundle` shipped with everything
+else: the leader seals its file/env root key material under
+HKDF-SHA256(cluster secret) bound to the cluster id, and the joiner writes it
+to its own key file only if none exists.
+
+**Alternatives.** Ship Phases 1–3 first and let multi-manager operators copy
+the file by hand for a release, as the plan's phasing said.
+
+**Trade-off.** Anyone holding the cluster secret (the join token) receives
+the root key by joining. That widens nothing — a joined manager receives the
+whole database — and is stated in the doc. `exec` clusters get no bundle.
+
+**Why (ergonomics, and the test suites demanded it).** "Join the cluster"
+being one command is the headline promise, and the existing raft suites
+(`raft_membership`, `raft_lanes`) read KV values on joiners after apply: with
+encryption on by default they cannot pass without it.
+
+## 19. `GetKeyringStatus` computes the next-step hint server-side
+
+**Call.** The reply's `hint` field is one sentence chosen by the manager
+(copy the root key from here; run `legion keyring rewrap`; waiting for
+manager X to upgrade; nothing to do). The CLI and the UI print it verbatim.
+
+**Alternatives.** Let each client derive advice from the structured fields.
+
+**Trade-off.** English in an RPC reply, and a hint that cannot be localized
+or restyled per client without a server change.
+
+**Why (ergonomics for the average operator).** The person reading
+`legion keyring status` at 3am wants the sentence, not the fields; putting
+it on the server means every surface — CLI, UI card, MCP tool — says the
+same thing, and the wording is tested once.
+
+## 20. `env` root keys accept commas as line separators
+
+**Call.** The `env` provider splits `LEGION_ROOT_KEY` on commas as well as
+newlines, so a two-key rotation window fits in one environment variable.
+
+**Alternatives.** Newlines only (identical to the file).
+
+**Trade-off.** A base64 line can never contain a comma, so the split is
+unambiguous; the cost is one more rule to document.
+
+**Why (ergonomics).** Environment variables with embedded newlines are
+awkward in systemd units, Kubernetes manifests, and shells; commas are not.

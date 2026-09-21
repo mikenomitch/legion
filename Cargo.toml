@@ -67,6 +67,12 @@ opentelemetry-proto = { version = "0.27", default-features = false, features = [
 opentelemetry-semantic-conventions = "0.27"
 tracing-opentelemetry = "0.28"
 sha2 = "0.10.8"
+# KV encryption at rest (docs/kv-encryption.md): AES-256-GCM for values and
+# for wrapping data keys, HKDF for the raft-join root key bundle. `ring` is
+# already in the tree via jsonwebtoken/rustls/rcgen — no new crate.
+ring = "0.17"
+# Key material is wiped from memory when dropped.
+zeroize = "1"
 tabled = "0.16.0"
 lazy_static = "1.4.0"
 anyhow = "1.0.100"

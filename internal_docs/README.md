@@ -95,7 +95,7 @@ When one is required and what goes in it:
 | [host-process-supervision-plan.md](plans/host-process-supervision-plan.md) | in execution (phases 1–3 landed; phase 4 uncommitted) |
 | [job-templates-plan.md](plans/job-templates-plan.md) | in execution |
 | [job-updated-at-plan.md](plans/job-updated-at-plan.md) | shipped (detail-page header + node column label deferred) |
-| [kv-encryption-plan.md](plans/kv-encryption-plan.md) | planned (KV values encrypted at rest: envelope encryption with a replicated keyring, root key outside the store, on by default, `file`/`env`/`exec` root-key providers; four phases, alternatives with pros/cons in §11) |
+| [kv-encryption-plan.md](plans/kv-encryption-plan.md) | shipped (all four phases, 2026-09-21: KV values encrypted at rest by default, replicated keyring with the root key outside the store, `file`/`env`/`exec` providers, rotation + rewrap, join-time root key delivery; rendered task-config copies deliberately left for a follow-up plan) |
 | [kv-reactive-task-updates-plan.md](plans/kv-reactive-task-updates-plan.md) | shipped |
 | [late-binding-plan-apply-plan.md](plans/late-binding-plan-apply-plan.md) | shipped (phases 0–3; Phase 4 backlog deferred) |
 | [persistence-plan.md](plans/persistence-plan.md) | phases 0–1, 3 done |

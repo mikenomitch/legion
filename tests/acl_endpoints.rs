@@ -106,6 +106,13 @@ fn endpoint_table() -> Vec<(&'static str, Plane)> {
         ("IssueRaftCommand", Plane::Protected("operator:write")),
         ("GetRaftJoinToken", Plane::Protected("operator:write")),
         ("GetStateBackup", Plane::Protected("operator:write")),
+        // KV encryption keyring (docs/kv-encryption.md): `operator`, like
+        // raft and manager config — keys are cluster plumbing, not KV data.
+        ("GetKeyringStatus", Plane::Protected("operator:read")),
+        ("RotateDataKey", Plane::Protected("operator:write")),
+        ("RewrapKv", Plane::Protected("operator:write")),
+        ("RewrapRootKey", Plane::Protected("operator:write")),
+        ("ResetKeyring", Plane::Protected("operator:write")),
         ("PutKv", Plane::Protected("kv:write")),
         ("GetKv", Plane::Protected("kv:read")),
         ("ListKv", Plane::Protected("kv:read")),
@@ -573,6 +580,29 @@ async fn call_endpoint(
         // destination under the fixture store's directory each call.
         "GetStateBackup" => svc
             .get_state_backup(req(GetStateBackupRequest::default(), token))
+            .await
+            .map(|_| ()),
+        "GetKeyringStatus" => svc
+            .get_keyring_status(req(GetKeyringStatusRequest::default(), token))
+            .await
+            .map(|_| ()),
+        "RotateDataKey" => svc
+            .rotate_data_key(req(RotateDataKeyRequest::default(), token))
+            .await
+            .map(|_| ()),
+        "RewrapKv" => svc
+            .rewrap_kv(req(RewrapKvRequest::default(), token))
+            .await
+            .map(|_| ()),
+        "RewrapRootKey" => svc
+            .rewrap_root_key(req(RewrapRootKeyRequest::default(), token))
+            .await
+            .map(|_| ()),
+        // An empty `confirm` is refused as InvalidArgument once authorized —
+        // the matrix only checks that the refusal is not an auth error, and
+        // a fixture store must never actually be reset.
+        "ResetKeyring" => svc
+            .reset_keyring(req(ResetKeyringRequest::default(), token))
             .await
             .map(|_| ()),
         "PutKv" => svc

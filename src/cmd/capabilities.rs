@@ -528,6 +528,47 @@ pub fn catalog() -> Vec<Capability> {
             mutates: true,
             read_only_safe: false,
         },
+        // --- KV encryption keyring (docs/kv-encryption.md) ---
+        Capability {
+            name: "keyring.status",
+            cli: "legion keyring status",
+            grpc: Some("Manager/GetKeyringStatus"),
+            summary: "Show KV encryption on this manager: root key, data keys, plaintext rows, and the next step.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "keyring.rotate",
+            cli: "legion keyring rotate",
+            grpc: Some("Manager/RotateDataKey"),
+            summary: "Rotate the KV data key now; values are re-encrypted in the background.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "keyring.rewrap",
+            cli: "legion keyring rewrap [--plaintext]",
+            grpc: Some("Manager/RewrapKv"),
+            summary: "Re-encrypt every KV value under the active data key (or decrypt all with --plaintext).",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "keyring.root_key_rewrap",
+            cli: "legion keyring root-key rewrap",
+            grpc: Some("Manager/RewrapRootKey"),
+            summary: "Re-wrap every data key under the current root key (completes a root key rotation).",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "keyring.reset",
+            cli: "legion keyring reset --i-understand-encrypted-values-will-be-lost",
+            grpc: Some("Manager/ResetKeyring"),
+            summary: "Break glass after losing the root key: delete undecryptable values and start a fresh keyring.",
+            mutates: true,
+            read_only_safe: false,
+        },
         // --- Auth & ACL ---
         Capability {
             name: "acl.whoami",

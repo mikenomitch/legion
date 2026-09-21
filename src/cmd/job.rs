@@ -1422,6 +1422,7 @@ mod tests {
             version: 1,
             created_at: "now".into(),
             updated_at: "now".into(),
+            encrypted: false,
         }
     }
 

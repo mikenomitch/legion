@@ -121,6 +121,13 @@ impl From<WireInstallSnapshotRequest> for InstallSnapshotRequest<TypeConfig> {
 #[derive(Default)]
 pub(crate) struct ChannelPool {
     channels: Mutex<HashMap<String, Channel>>,
+    /// Schema version each peer last advertised on a transport reply
+    /// (`x-legion-schema-version`, see `migrations::schema_version`). The
+    /// leader hears from every follower on each AppendEntries round, so this
+    /// is fresh within a heartbeat interval; a peer that has never answered,
+    /// or runs a build that predates the header, is simply absent. Read by
+    /// version-gated features (the KV keyring's upgrade gate).
+    schema_versions: Mutex<HashMap<NodeId, u32>>,
     /// Partition test hook (`Store::raft_set_outbound_blocked`): while set,
     /// every outbound raft RPC from this node fails as [`Unreachable`]
     /// before dialing. Combined with dropping the node's inbound transport
@@ -143,6 +150,32 @@ impl ChannelPool {
 
     fn outbound_blocked(&self) -> bool {
         self.outbound_blocked.load(Ordering::SeqCst)
+    }
+
+    /// Record the schema version `peer` advertised on a reply.
+    pub(crate) fn record_schema_version(&self, peer: NodeId, version: u32) {
+        self.schema_versions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(peer, version);
+    }
+
+    /// The schema version `peer` last advertised, if it ever has.
+    pub(crate) fn schema_version_of(&self, peer: NodeId) -> Option<u32> {
+        self.schema_versions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&peer)
+            .copied()
+    }
+
+    /// Forget a peer's advertised version (test hook: simulates a voter
+    /// running a build that predates the header).
+    pub(crate) fn forget_schema_version(&self, peer: NodeId) {
+        self.schema_versions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&peer);
     }
 
     /// Returns the pooled channel for `host_port`, creating it lazily.
@@ -278,21 +311,29 @@ impl RaftTransportNetwork {
         req.metadata_mut()
             .insert(RAFT_CLUSTER_SECRET_METADATA_KEY, secret);
 
-        let reply = send(&mut client, req)
-            .await
-            .map_err(|status| {
-                tracing::debug!(
-                    lane = self.lane.wire_name(),
-                    target = self.target,
-                    addr = %self.host_port,
-                    rpc = rpc_name,
-                    code = ?status.code(),
-                    "raft transport rpc failed: {}",
-                    status.message()
-                );
-                status_to_rpc_error(&status)
-            })?
-            .into_inner();
+        let reply = send(&mut client, req).await.map_err(|status| {
+            tracing::debug!(
+                lane = self.lane.wire_name(),
+                target = self.target,
+                addr = %self.host_port,
+                rpc = rpc_name,
+                code = ?status.code(),
+                "raft transport rpc failed: {}",
+                status.message()
+            );
+            status_to_rpc_error(&status)
+        })?;
+        // The peer stamps every reply with the schema version its build
+        // migrates to; remember it for version-gated features.
+        if let Some(version) = reply
+            .metadata()
+            .get(crate::storage::raft::RAFT_SCHEMA_VERSION_METADATA_KEY)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u32>().ok())
+        {
+            self.pool.record_schema_version(self.target, version);
+        }
+        let reply = reply.into_inner();
 
         let result: Result<Reply, RemoteErr> = serde_json::from_slice(&reply.payload)
             .map_err(|e| RPCError::Network(NetworkError::new(&e)))?;

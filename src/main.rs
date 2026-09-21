@@ -25,6 +25,7 @@ fn cli() -> Command {
         .subcommand(cmd::ledger::config())
         .subcommand(cmd::events::config())
         .subcommand(cmd::kv::config())
+        .subcommand(cmd::keyring::config())
         .subcommand(cmd::service::config())
         .subcommand(cmd::volume::config())
         .subcommand(cmd::state::config())
@@ -77,6 +78,7 @@ async fn main() -> R<()> {
         Some(("ledger", sub_matches)) => cmd::ledger::handle(sub_matches).await?,
         Some(("events", sub_matches)) => cmd::events::handle(sub_matches).await?,
         Some(("kv", sub_matches)) => cmd::kv::handle(sub_matches).await?,
+        Some(("keyring", sub_matches)) => cmd::keyring::handle(sub_matches).await?,
         Some(("service", sub_matches)) => cmd::service::handle(sub_matches).await?,
         Some(("volume", sub_matches)) => cmd::volume::handle(sub_matches).await?,
         Some(("state", sub_matches)) => cmd::state::handle(sub_matches).await?,

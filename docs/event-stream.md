@@ -48,6 +48,12 @@ from the CLI, the MCP server, the UI, and raw gRPC.
 | `alloc.ratified` | info | A provisional allocation became durable; allocation id and ratification latency in metadata. |
 | `alloc.refused` | warn | A ratification was refused and the node is killing the work; the reason code (`instance_claimed`, `no_capacity`, …) is in metadata. |
 | `boot_ticket.issued` | info | A boot ticket was minted; `jti`, scope, and the minting accessor id in metadata. The audit record for "who authorized this start". |
+| `keyring.initialized` | info | The KV keyring got its first data key ([KV Encryption at Rest](kv-encryption.md)); key id, root key id, and provider in metadata. Never any key material. |
+| `keyring.rotated` | info | A new active data key; the old one is retired and rewrapped away in the background. Key id and reason (`operator request`, the rotation age, or the encryption-count guard) in metadata. |
+| `keyring.rewrap_completed` | info | Every value is under the active data key (or, with `plaintext: true`, a plaintext row); counts and the retired keys collected in metadata. |
+| `keyring.root_key_rewrapped` | info | Every data key is wrapped under the current root key; its id in metadata. |
+| `keyring.locked` / `keyring.unlocked` | warn / info | This manager lost or regained the ability to unwrap a data key (a missing root key, a provider outage). `locked` carries the key ids and reasons. |
+| `keyring.reset` | warn | Break-glass reset: the deleted KV key paths and dropped data keys are in metadata. |
 
 Each event carries: an increasing (but sparse — see
 [cursors](#cursor-based-polling-cli-and-mcp)) `id`, `kind`, `level`

@@ -25,6 +25,7 @@ use crate::storage::store::{
 };
 use crate::structs::acl::{AclAction, AclIdentity, AclResource, AclScope};
 use crate::structs::manager_server::Manager;
+// KV encryption keyring surface (docs/kv-encryption.md).
 use crate::structs::{
     validate_keyed_instance_id, worker_client::WorkerClient, AcquireKvLockReply,
     AcquireKvLockRequest, AdvanceRolloutReply, AdvanceRolloutRequest, AllocationHealth,
@@ -85,6 +86,11 @@ use crate::structs::{
     StopCause, UpsertAclPolicyReply, UpsertAclPolicyRequest, UpsertAclUserReply,
     UpsertAclUserRequest, WhoAmIReply, WhoAmIRequest,
 };
+use crate::structs::{
+    BackupEncryptionInfo, GetKeyringStatusReply, GetKeyringStatusRequest, KeyringKeyInfo,
+    KeyringRewrapProgress, ResetKeyringReply, ResetKeyringRequest, RewrapKvReply, RewrapKvRequest,
+    RewrapRootKeyReply, RewrapRootKeyRequest, RotateDataKeyReply, RotateDataKeyRequest,
+};
 use crate::task_plugins::validate_job_config;
 use crate::tracing_util::{o11y_enabled, read_recent_observability};
 
@@ -122,7 +128,163 @@ fn map_store_error(action: &str, err: anyhow::Error) -> Status {
         StorageError::DatabaseCorrupt
         | StorageError::DatabaseIo { .. }
         | StorageError::Sqlite { .. } => Status::internal(message),
+        // Root key not available on this manager: the operator-facing
+        // message names the key, the provider, and the path; it clears the
+        // moment the root key is placed, so it is a retryable precondition.
+        StorageError::KeyringLocked { .. } => Status::failed_precondition(message),
+        StorageError::KvCiphertextInvalid { .. } => Status::internal(message),
     }
+}
+
+/// The exact confirmation `ResetKeyring` requires.
+pub const KEYRING_RESET_CONFIRMATION: &str = "DELETE-UNDECRYPTABLE-VALUES";
+
+/// The one sentence `legion keyring status` prints as the next step
+/// (docs/kv-encryption.md). Empty when there is nothing to do.
+fn keyring_hint(
+    snapshot: &crate::storage::keyring::KeyringSnapshot,
+    plaintext_rows: i64,
+    pending_rewrap: i64,
+    raft_follower: bool,
+) -> String {
+    match snapshot.state.as_str() {
+        "disabled" => {
+            if plaintext_rows > 0 || snapshot.rows.is_empty() {
+                "KV encryption is off (encryption.enabled = false); values are stored as \
+                 plaintext. Remove the setting (the default is on) to encrypt them."
+                    .to_string()
+            } else {
+                "KV encryption is off (encryption.enabled = false) but encrypted values remain; \
+                 run `legion keyring rewrap --plaintext` to convert them, or turn encryption \
+                 back on."
+                    .to_string()
+            }
+        }
+        "pending_upgrade" => snapshot.pending_upgrade.clone().unwrap_or_default(),
+        "uninitialized" => {
+            if raft_follower {
+                "The control-lane leader initializes the keyring; this manager follows.".to_string()
+            } else {
+                "The keyring has no data key yet; the manager creates one on its next start or \
+                 keyring tick (values are stored as plaintext until then)."
+                    .to_string()
+            }
+        }
+        "locked" => {
+            if let Some(err) = &snapshot.provider_error {
+                return format!(
+                    "Root key provider `{}` at {} failed: {err}. Fix the provider, then check \
+                     `legion keyring status` again.",
+                    snapshot.provider, snapshot.location
+                );
+            }
+            let mut root_key_ids: Vec<String> = snapshot
+                .locked
+                .iter()
+                .map(|locked| locked.root_key_id.clone())
+                .collect();
+            root_key_ids.sort();
+            root_key_ids.dedup();
+            format!(
+                "Root key {} is not available on this manager (provider `{}` at {}). Copy it \
+                 from a manager that has it — or from where you keep it — into place (or set \
+                 {}), then check `legion keyring status` again; reads and writes under the \
+                 affected data key(s) fail until then. If the key is gone for good: `legion \
+                 keyring reset --i-understand-encrypted-values-will-be-lost`.",
+                root_key_ids.join(", "),
+                snapshot.provider,
+                snapshot.location,
+                crate::storage::keyring::DEF_ROOT_KEY_ENV,
+            )
+        }
+        _ => {
+            if let Some(err) = &snapshot.rewrap_error {
+                return format!(
+                    "The last rewrap failed: {err}. Run `legion keyring rewrap` to retry."
+                );
+            }
+            if snapshot.rewrap_running {
+                return format!("A rewrap is converting {pending_rewrap} value(s); nothing to do.");
+            }
+            if plaintext_rows > 0 {
+                return format!(
+                    "{plaintext_rows} value(s) are still stored as plaintext (written before \
+                     encryption was on). Run `legion keyring rewrap` to encrypt them now, or let \
+                     the manager's keyring tick do it."
+                );
+            }
+            if pending_rewrap > 0 {
+                return format!(
+                    "{pending_rewrap} value(s) are still under a retired data key. Run `legion \
+                     keyring rewrap` to finish now, or wait for the background rewrap."
+                );
+            }
+            String::new()
+        }
+    }
+}
+
+/// The keyring as the answering manager sees it, with the one-line next
+/// step (`GetKeyringStatus`, `legion keyring status`).
+fn keyring_status_reply(svc: &ManagerDaemonService) -> Result<GetKeyringStatusReply, Status> {
+    let keyring = svc.store.keyring();
+    let snapshot = keyring.snapshot();
+    let counts = svc
+        .store
+        .kv_encryption_counts()
+        .map_err(|e| map_store_error("Error counting kv rows", e))?;
+    let pending = svc
+        .store
+        .kv_rows_pending_rewrap(false)
+        .map_err(|e| map_store_error("Error counting kv rows", e))?;
+    let plaintext_rows = counts.get(&None).copied().unwrap_or(0);
+    let encrypted_rows: i64 = counts
+        .iter()
+        .filter(|(key, _)| key.is_some())
+        .map(|(_, count)| *count)
+        .sum();
+    let keys: Vec<KeyringKeyInfo> = keyring
+        .describe_keys(&counts)
+        .into_iter()
+        .map(|described| KeyringKeyInfo {
+            key_id: described.row.key_id,
+            state: described.row.state,
+            algorithm: described.row.algorithm,
+            created_at: described.row.created_at,
+            retired_at: described.row.retired_at,
+            root_key_id: described.row.root_key_id,
+            root_provider: described.row.root_provider,
+            value_count: described.value_count,
+            unwrapped: described.unwrapped,
+            error: described.error.unwrap_or_default(),
+        })
+        .collect();
+    let active_key_age_seconds = keyring
+        .active_key()
+        .map(|(_, created)| (OffsetDateTime::now_utc().unix_timestamp() - created).max(0))
+        .unwrap_or(0);
+    let raft_follower = svc.store.raft_status().is_some()
+        && !svc.store.is_raft_leader(crate::storage::Lane::Control);
+    let hint = keyring_hint(&snapshot, plaintext_rows, pending, raft_follower);
+    Ok(GetKeyringStatusReply {
+        enabled: snapshot.enabled,
+        state: snapshot.state,
+        root_key_provider: snapshot.provider,
+        root_key_location: snapshot.location,
+        root_key_id: snapshot.root_key_id.unwrap_or_default(),
+        keys,
+        plaintext_rows,
+        encrypted_rows,
+        rewrap: Some(KeyringRewrapProgress {
+            pending,
+            running: snapshot.rewrap_running,
+            last_error: snapshot.rewrap_error.unwrap_or_default(),
+        }),
+        data_key_rotation_age: humantime::format_duration(snapshot.rotation_age).to_string(),
+        active_key_age_seconds,
+        hint,
+        manager: svc.advertise_addr.clone(),
+    })
 }
 
 /// Whether a mapped store error was the typed raft not-the-leader rejection
@@ -6094,10 +6256,226 @@ impl Manager for ManagerDaemonService {
             .store
             .state_backup(out)
             .map_err(|e| map_store_error("Error creating state backup", e))?;
+        // Tell the operator, right where the backup is reported, what the
+        // file does NOT contain: the root key (docs/kv-encryption.md).
+        let snapshot = self.store.keyring().snapshot();
+        let counts = self
+            .store
+            .kv_encryption_counts()
+            .map_err(|e| map_store_error("Error counting kv rows", e))?;
+        let mut root_key_ids: Vec<String> = snapshot
+            .rows
+            .iter()
+            .map(|row| row.root_key_id.clone())
+            .collect();
+        root_key_ids.sort();
+        root_key_ids.dedup();
         Ok(Response::new(GetStateBackupReply {
             path: info.path.display().to_string(),
             bytes: info.bytes,
             applied_index: info.applied_index,
+            encryption: Some(BackupEncryptionInfo {
+                enabled: snapshot.enabled,
+                root_key_provider: snapshot.provider,
+                root_key_location: snapshot.location,
+                root_key_ids,
+                plaintext_rows: counts.get(&None).copied().unwrap_or(0),
+            }),
+        }))
+    }
+
+    #[instrument(skip_all)]
+    async fn get_keyring_status(
+        &self,
+        request: Request<GetKeyringStatusRequest>,
+    ) -> Result<Response<GetKeyringStatusReply>, Status> {
+        self.check_acl(
+            &request,
+            AclResource::Operator,
+            AclAction::Read,
+            AclScope::none(),
+        )?;
+        Ok(Response::new(keyring_status_reply(self)?))
+    }
+
+    #[instrument(skip_all)]
+    async fn rotate_data_key(
+        &self,
+        request: Request<RotateDataKeyRequest>,
+    ) -> Result<Response<RotateDataKeyReply>, Status> {
+        self.check_acl(
+            &request,
+            AclResource::Operator,
+            AclAction::Write,
+            AclScope::none(),
+        )?;
+        let req = request.into_inner();
+        let idempotency_key = req.idempotency_key.unwrap_or_default();
+        if let Some(message) = self
+            .store
+            .idempotency_lookup(&idempotency_key)
+            .map_err(|e| map_store_error("Error checking idempotency", e))?
+        {
+            let recorded: Value = serde_json::from_str(&message).unwrap_or_default();
+            return Ok(Response::new(RotateDataKeyReply {
+                key_id: recorded["keyId"].as_str().unwrap_or_default().to_string(),
+                retired_key_id: recorded["retiredKeyId"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+                deduplicated: true,
+            }));
+        }
+        let retired_key_id = self
+            .store
+            .keyring()
+            .active_key()
+            .map(|(id, _)| id)
+            .unwrap_or_default();
+        let row = self
+            .store
+            .rotate_data_key("operator request")
+            .map_err(|e| map_store_error("Error rotating the KV data key", e))?;
+        // The keyring loop starts the background rewrap right away.
+        self.store.keyring().wake();
+        let message = json!({ "keyId": row.key_id, "retiredKeyId": retired_key_id }).to_string();
+        self.store
+            .idempotency_record(&idempotency_key, "rotate_data_key", &message)
+            .map_err(|e| map_store_error("Error recording idempotency", e))?;
+        Ok(Response::new(RotateDataKeyReply {
+            key_id: row.key_id,
+            retired_key_id,
+            deduplicated: false,
+        }))
+    }
+
+    #[instrument(skip_all)]
+    async fn rewrap_kv(
+        &self,
+        request: Request<RewrapKvRequest>,
+    ) -> Result<Response<RewrapKvReply>, Status> {
+        self.check_acl(
+            &request,
+            AclResource::Operator,
+            AclAction::Write,
+            AclScope::none(),
+        )?;
+        let req = request.into_inner();
+        let idempotency_key = req.idempotency_key.unwrap_or_default();
+        if let Some(message) = self
+            .store
+            .idempotency_lookup(&idempotency_key)
+            .map_err(|e| map_store_error("Error checking idempotency", e))?
+        {
+            let recorded: Value = serde_json::from_str(&message).unwrap_or_default();
+            return Ok(Response::new(RewrapKvReply {
+                rewrapped: recorded["rewrapped"].as_i64().unwrap_or(0),
+                remaining: recorded["remaining"].as_i64().unwrap_or(0),
+                collected_keys: Vec::new(),
+                deduplicated: true,
+            }));
+        }
+        let run = self
+            .store
+            .run_rewrap(req.plaintext)
+            .map_err(|e| map_store_error("Error rewrapping kv values", e))?;
+        let message = json!({ "rewrapped": run.rewrapped, "remaining": run.remaining }).to_string();
+        self.store
+            .idempotency_record(&idempotency_key, "rewrap_kv", &message)
+            .map_err(|e| map_store_error("Error recording idempotency", e))?;
+        Ok(Response::new(RewrapKvReply {
+            rewrapped: run.rewrapped,
+            remaining: run.remaining,
+            collected_keys: run.collected_keys,
+            deduplicated: false,
+        }))
+    }
+
+    #[instrument(skip_all)]
+    async fn rewrap_root_key(
+        &self,
+        request: Request<RewrapRootKeyRequest>,
+    ) -> Result<Response<RewrapRootKeyReply>, Status> {
+        self.check_acl(
+            &request,
+            AclResource::Operator,
+            AclAction::Write,
+            AclScope::none(),
+        )?;
+        let req = request.into_inner();
+        let idempotency_key = req.idempotency_key.unwrap_or_default();
+        if let Some(message) = self
+            .store
+            .idempotency_lookup(&idempotency_key)
+            .map_err(|e| map_store_error("Error checking idempotency", e))?
+        {
+            let recorded: Value = serde_json::from_str(&message).unwrap_or_default();
+            return Ok(Response::new(RewrapRootKeyReply {
+                keys: recorded["keys"].as_i64().unwrap_or(0),
+                root_key_id: recorded["rootKeyId"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+                skipped: Vec::new(),
+                deduplicated: true,
+            }));
+        }
+        let outcome = self
+            .store
+            .rewrap_root_key()
+            .map_err(|e| map_store_error("Error rewrapping the KV keyring", e))?;
+        let message = json!({ "keys": outcome.rows, "rootKeyId": outcome.root_key_id }).to_string();
+        self.store
+            .idempotency_record(&idempotency_key, "rewrap_root_key", &message)
+            .map_err(|e| map_store_error("Error recording idempotency", e))?;
+        Ok(Response::new(RewrapRootKeyReply {
+            keys: outcome.rows as i64,
+            root_key_id: outcome.root_key_id,
+            skipped: outcome.skipped,
+            deduplicated: false,
+        }))
+    }
+
+    #[instrument(skip_all)]
+    async fn reset_keyring(
+        &self,
+        request: Request<ResetKeyringRequest>,
+    ) -> Result<Response<ResetKeyringReply>, Status> {
+        self.check_acl(
+            &request,
+            AclResource::Operator,
+            AclAction::Write,
+            AclScope::none(),
+        )?;
+        let req = request.into_inner();
+        if req.confirm != KEYRING_RESET_CONFIRMATION {
+            return Err(Status::invalid_argument(format!(
+                "keyring reset deletes every KV value this manager cannot decrypt; confirm with \
+                 `confirm = \"{KEYRING_RESET_CONFIRMATION}\"` (the CLI flag is \
+                 --i-understand-encrypted-values-will-be-lost)"
+            )));
+        }
+        let outcome = self
+            .store
+            .reset_keyring()
+            .map_err(|e| map_store_error("Error resetting the KV keyring", e))?;
+        // Every deleted value is a delete for the jobs that depended on it:
+        // they fail through `missing_kv_dependency` and recover on a put.
+        for key in &outcome.deleted_values {
+            if !self.queue_kv_change(key, true) {
+                reconcile_kv_changes(&self.store, &[(key.clone(), true)])?;
+            }
+        }
+        let active_key_id = self
+            .store
+            .keyring()
+            .active_key()
+            .map(|(id, _)| id)
+            .unwrap_or_default();
+        Ok(Response::new(ResetKeyringReply {
+            deleted_values: outcome.deleted_values,
+            dropped_keys: outcome.dropped_keys,
+            active_key_id,
         }))
     }
 

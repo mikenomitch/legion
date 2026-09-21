@@ -320,6 +320,24 @@ fn tool_defs() -> Vec<ToolDef> {
             mutates: false,
         },
         ToolDef {
+            name: "legion_keyring_status",
+            description: "Show KV encryption at rest on the answering manager (docs/kv-encryption.md): whether it is enabled, the root key provider and location, whether every data key is unwrapped (state unlocked|locked|pending_upgrade|uninitialized|disabled), the data keys with their value counts, how many rows are still plaintext, rewrap progress, and a one-line `hint` with the next step when something needs doing.",
+            input_schema: empty_schema,
+            mutates: false,
+        },
+        ToolDef {
+            name: "legion_keyring_rotate",
+            description: "Rotate the KV data key now: a new active key is created, the old one is retired but kept, and every value is re-encrypted under the new key in the background (no job restarts). Mutating; retry-safe with idempotency_key.",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "idempotency_key": { "type": "string", "description": "Optional key to deduplicate retries." }
+                },
+                "additionalProperties": false
+            }),
+            mutates: true,
+        },
+        ToolDef {
             name: "legion_node_drain",
             description: "Cordon, drain, or uncordon a worker node. cordon = stop new placements (existing allocations keep running); drain = cordon + evict allocations (stateless move immediately, stateful stay protected by their stateful.onLost policy); uncordon = make the node schedulable again. Mutating.",
             input_schema: || json!({
@@ -852,6 +870,16 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
         "legion_node_cadence" => {
             let mut client = connect().await?;
             grpc(client.get_heartbeat_cadence(crate::structs::GetHeartbeatCadenceRequest {})).await
+        }
+        "legion_keyring_status" => {
+            let mut client = connect().await?;
+            grpc(client.get_keyring_status(crate::structs::GetKeyringStatusRequest {})).await
+        }
+        "legion_keyring_rotate" => {
+            let idempotency_key = opt_str_arg(&args, "idempotency_key");
+            let mut client = connect().await?;
+            grpc(client.rotate_data_key(crate::structs::RotateDataKeyRequest { idempotency_key }))
+                .await
         }
         "legion_node_drain" => {
             let node_id = str_arg(&args, "node_id")?;

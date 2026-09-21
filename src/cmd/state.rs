@@ -169,6 +169,13 @@ async fn run_backup(out: Option<String>, format: OutputFormat) -> R<()> {
             "path": response.path,
             "bytes": response.bytes,
             "appliedIndex": response.applied_index,
+            "encryption": response.encryption.as_ref().map(|enc| json!({
+                "enabled": enc.enabled,
+                "rootKeyProvider": enc.root_key_provider,
+                "rootKeyLocation": enc.root_key_location,
+                "rootKeyIds": enc.root_key_ids,
+                "plaintextRows": enc.plaintext_rows,
+            })),
         }));
         return Ok(());
     }
@@ -180,6 +187,27 @@ async fn run_backup(out: Option<String>, format: OutputFormat) -> R<()> {
     println!("  bytes:         {}", response.bytes);
     println!("  applied index: {}", response.applied_index);
     println!("Restore with: legion start manager --restore-from <path> (see docs/upgrades.md)");
+    // What the file does NOT contain, said where the file is reported
+    // (docs/kv-encryption.md): a backup without its root key restores to a
+    // locked keyring.
+    if let Some(enc) = response.encryption.as_ref().filter(|enc| enc.enabled) {
+        let ids = if enc.root_key_ids.is_empty() {
+            "(none yet)".to_string()
+        } else {
+            enc.root_key_ids.join(", ")
+        };
+        println!(
+            "KV values in this backup are encrypted. Root key {ids} ({} provider, {}) is NOT \
+             included — keep it with the backup.",
+            enc.root_key_provider, enc.root_key_location
+        );
+        if enc.plaintext_rows > 0 {
+            println!(
+                "  {} value(s) are still plaintext rows; `legion keyring rewrap` encrypts them.",
+                enc.plaintext_rows
+            );
+        }
+    }
     Ok(())
 }
 

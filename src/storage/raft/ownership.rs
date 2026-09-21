@@ -150,6 +150,10 @@ const TABLE_OWNERS: &[(&str, Owner)] = &[
     ("job_kv_reference", Owner::Lane(Lane::Control)),
     ("saved_state_query", Owner::Lane(Lane::Control)),
     ("signing_key", Owner::Lane(Lane::Control)),
+    // KV encryption keyring (docs/kv-encryption.md): the wrapped data keys.
+    // Control lane with `kv_entry`, so a rewrap batch (value rows + key
+    // state) is one changeset.
+    ("keyring_key", Owner::Lane(Lane::Control)),
     // Job templates are operator intent, like the job specs they render
     // into: written only by UpsertJobTemplate/DeleteJobTemplate, and read
     // (never written) on the submit path.

@@ -1,0 +1,56 @@
+#!/bin/sh
+# Legion `exec` root-key provider backed by AWS KMS (docs/kv-encryption.md).
+#
+#   encryption = { rootKey = { provider = "exec",
+#     command = ["/usr/local/bin/legion-kms-aws", "--key-id", "arn:aws:kms:us-east-1:123456789012:key/…"] } }
+#
+# Reads one JSON request on stdin, prints one JSON reply on stdout. Needs the
+# `aws` CLI and credentials allowed to `kms:Encrypt` / `kms:Decrypt` /
+# `kms:DescribeKey` on the key. The data key id rides along as the KMS
+# encryption context, so a wrapped blob is bound to its keyring row.
+#
+# Test before use:  legion keyring provider test -- legion-kms-aws --key-id <arn>
+set -eu
+
+KEY_ID=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --key-id) KEY_ID="$2"; shift 2 ;;
+    *) echo "legion-kms-aws: unknown argument $1" >&2; exit 2 ;;
+  esac
+done
+[ -n "$KEY_ID" ] || { echo "legion-kms-aws: --key-id is required" >&2; exit 2; }
+
+req=$(cat)
+field() { printf '%s' "$req" | sed -n "s/.*\"$1\":\"\([^\"]*\)\".*/\1/p"; }
+op=$(field op)
+
+case "$op" in
+  describe)
+    arn=$(aws kms describe-key --key-id "$KEY_ID" --query 'KeyMetadata.Arn' --output text)
+    printf '{"key_id":"%s"}\n' "$arn"
+    ;;
+  wrap)
+    dk=$(field key_id)
+    pt=$(field plaintext)
+    ct=$(aws kms encrypt --key-id "$KEY_ID" --plaintext "$pt" \
+          --encryption-context "legion_data_key=$dk" \
+          --query CiphertextBlob --output text)
+    arn=$(aws kms describe-key --key-id "$KEY_ID" --query 'KeyMetadata.Arn' --output text)
+    printf '{"ciphertext":"%s","key_id":"%s"}\n' "$ct" "$arn"
+    ;;
+  unwrap)
+    dk=$(field key_id)
+    ct=$(field ciphertext)
+    # `--ciphertext-blob` wants base64 from the CLI; KMS knows which key
+    # produced it, so a rotated KMS key still unwraps old blobs.
+    pt=$(aws kms decrypt --ciphertext-blob "$ct" \
+          --encryption-context "legion_data_key=$dk" \
+          --query Plaintext --output text)
+    printf '{"plaintext":"%s"}\n' "$pt"
+    ;;
+  *)
+    echo "legion-kms-aws: unknown op '$op'" >&2
+    exit 2
+    ;;
+esac

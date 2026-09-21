@@ -1253,6 +1253,47 @@ impl MultiRaftDriver {
         })
     }
 
+    /// Voters (by name) whose advertised schema version is unknown or below
+    /// `required` — the KV keyring's upgrade gate (docs/kv-encryption.md,
+    /// docs/upgrades.md). Peers advertise their version on every transport
+    /// reply (`x-legion-schema-version`); a voter that has not answered yet,
+    /// or runs a build that predates the header, is reported as missing.
+    /// This node counts as its own build. Before the engine starts every
+    /// voter is missing, which fails closed.
+    pub(crate) fn voters_missing_schema_version(&self, required: u32) -> Vec<String> {
+        let Some(engine) = self.engine.get() else {
+            return vec!["(raft engine not started)".to_string()];
+        };
+        let Some(metrics) = Self::control_metrics(engine) else {
+            return vec!["(control lane not started)".to_string()];
+        };
+        let membership = metrics.membership_config.membership().clone();
+        let mut behind: Vec<String> = membership
+            .voter_ids()
+            .filter(|id| {
+                if *id == self.raft_id {
+                    crate::storage::migrations::schema_version() < required
+                } else {
+                    !matches!(engine.pool.schema_version_of(*id), Some(version) if version >= required)
+                }
+            })
+            .map(|id| member_name(&metrics, id))
+            .collect();
+        behind.sort();
+        behind.dedup();
+        behind
+    }
+
+    /// Test hook for the upgrade gate: forget what `peer` advertised, as if
+    /// it ran a build without the schema-version header. Reachable through
+    /// `Store::raft_forget_peer_schema_version` so integration tests (which
+    /// link the non-test library) can drive it.
+    pub(crate) fn forget_peer_schema_version(&self, peer: NodeId) {
+        if let Some(engine) = self.engine.get() {
+            engine.pool.forget_schema_version(peer);
+        }
+    }
+
     fn is_leader_inner(&self, lane: Lane) -> bool {
         let Some(engine) = self.engine.get() else {
             return false;
@@ -1588,6 +1629,7 @@ fn pipeline_loop(
 /// transport failure) retries, since the joining manager typically starts
 /// before its own listener — and sometimes before the leader — is
 /// reachable.
+#[allow(clippy::too_many_arguments)]
 async fn join_cluster_loop(
     token: String,
     leader_addr: String,
@@ -1596,6 +1638,7 @@ async fn join_cluster_loop(
     cluster_secret: String,
     topology: String,
     history: Arc<StdMutex<HistoryState>>,
+    store: Store,
 ) {
     use crate::structs::raft_transport_client::RaftTransportClient;
 
@@ -1640,6 +1683,7 @@ async fn join_cluster_loop(
                     leader = %leader_addr,
                     "Joined raft cluster: added as learner on every lane and promoted to voter"
                 );
+                adopt_root_key_bundle(&store, &cluster_secret, &reply);
                 MultiRaftDriver::push_history(
                     &history,
                     "membership",
@@ -1685,6 +1729,43 @@ async fn join_cluster_loop(
             }
         }
     }
+}
+
+/// Store the KV root key a leader handed this joiner (docs/kv-encryption.md),
+/// then unwrap whatever data keys the snapshot install already brought. A
+/// joiner that already holds root key material keeps it untouched.
+fn adopt_root_key_bundle(store: &Store, cluster_secret: &str, reply: &JoinRaftClusterReply) {
+    if reply.root_key_bundle.is_empty() {
+        return;
+    }
+    let keyring = store.keyring();
+    let material = match crate::storage::keyring::open_root_bundle(
+        cluster_secret,
+        &reply.cluster_id,
+        &reply.root_key_bundle,
+    ) {
+        Ok(material) => material,
+        Err(err) => {
+            warn!(
+                error = ?err,
+                "The leader sent a KV root key this manager could not open; place the root key \
+                 by hand (`legion keyring status` on the leader names it)"
+            );
+            return;
+        }
+    };
+    match keyring.provider().import_material(&material) {
+        Ok(true) => info!(
+            location = %keyring.provider().location(),
+            "Received the cluster's KV root key from the leader and stored it"
+        ),
+        Ok(false) => debug!("KV root key already present on this manager; leaving it untouched"),
+        Err(err) => {
+            warn!(error = ?err, "Failed storing the KV root key received from the leader");
+            return;
+        }
+    }
+    store.keyring_rows_changed();
 }
 
 // ── metrics → history projection ─────────────────────────────────────────
@@ -2288,9 +2369,37 @@ struct EngineJoinHandler {
     data_dir: PathBuf,
     lanes: HashMap<Lane, Raft>,
     history: Arc<StdMutex<HistoryState>>,
+    /// The KV keyring, so a join reply can carry the cluster's root key to
+    /// the joiner when the provider exports it (docs/kv-encryption.md).
+    keyring: crate::storage::keyring::Keyring,
 }
 
 impl EngineJoinHandler {
+    /// The root key material for a joiner, sealed for transit — or empty
+    /// when encryption is off or the provider keeps its key to itself
+    /// (`exec`). Never fails a join: a bundle that cannot be built is
+    /// logged and the joiner is told nothing, exactly like an `exec`
+    /// cluster, and its keyring reports locked until the operator places
+    /// the key.
+    fn root_key_bundle(&self) -> Vec<u8> {
+        if !self.keyring.enabled() {
+            return Vec::new();
+        }
+        let Some(material) = self.keyring.provider().export_material() else {
+            return Vec::new();
+        };
+        match crate::storage::keyring::seal_root_bundle(
+            &self.cluster_secret,
+            &self.cluster_id,
+            &material,
+        ) {
+            Ok(bundle) => bundle,
+            Err(err) => {
+                warn!(error = ?err, "Could not seal the KV root key for a joining manager");
+                Vec::new()
+            }
+        }
+    }
     /// Current membership of every lane, for the join reply's peer-table
     /// seed.
     fn group_memberships(&self) -> Vec<RaftGroupMembership> {
@@ -2707,6 +2816,7 @@ impl RaftJoinHandler for EngineJoinHandler {
             assigned_raft_id: member_id,
             cluster_id: self.cluster_id.clone(),
             groups: self.group_memberships(),
+            root_key_bundle: self.root_key_bundle(),
         })
     }
 }
@@ -3056,6 +3166,7 @@ impl PersistenceDriver for MultiRaftDriver {
             data_dir: data_dir.clone(),
             lanes: lanes.clone(),
             history: self.history.clone(),
+            keyring: store.keyring().clone(),
         });
         self.registry
             .set(RaftTransportRegistry {
@@ -3170,6 +3281,7 @@ impl PersistenceDriver for MultiRaftDriver {
                     cluster_secret.clone(),
                     canonical_topology(&self.cfg.topology).to_string(),
                     self.history.clone(),
+                    engine_store.clone(),
                 ));
             }
         }

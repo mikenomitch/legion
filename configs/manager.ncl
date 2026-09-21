@@ -121,6 +121,26 @@
   # a single restart/rollout per job; the final config always reflects the
   # latest KV state. 0 reconciles synchronously on every KV write.
   # kvDebounceMs = 500,
+  # KV encryption at rest (docs/kv-encryption.md). ON BY DEFAULT with no
+  # block at all: every KV value is AES-256-GCM under a data key that is
+  # itself wrapped by a root key the manager mints at
+  # <storePath>/keys/root.key on first start. Keep that file with your
+  # backups; a manager joining a raft cluster receives it automatically.
+  # `legion keyring status` shows the state and the next step, if any.
+  # Everything below matches the built-in defaults.
+  # encryption = {
+  #   enabled = true,
+  #   rootKey = {
+  #     provider = "file",                        # "file" | "env" | "exec"
+  #     # path = "/var/lib/legion/keys/root.key", # file: default <storePath>/keys/root.key
+  #     # var = "LEGION_ROOT_KEY",                # env: the variable holding the key line(s)
+  #     # command = ["legion-kms-aws", "--key-id", "arn:aws:kms:…:key/…"],  # exec: a KMS helper
+  #     # timeout = "10s",                        # exec: per-call limit
+  #   },
+  #   # Age past which the active data key is rotated automatically; values
+  #   # are re-encrypted under the new key in the background afterwards.
+  #   dataKeyRotationAge = "720h",
+  # },
   # Cluster-level artifact settings (docs/artifacts.md). Everything here is
   # optional; the values below match the built-in defaults.
   artifacts = {

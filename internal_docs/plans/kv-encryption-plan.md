@@ -2,12 +2,22 @@
 
 > **Judgement calls:** [`calls/kv-encryption-plan_calls.md`](../calls/kv-encryption-plan_calls.md)
 
-Status: **PLANNED** (nothing implemented; written 2026-09-21). Deliberately
-deferred out of this plan and named as such: native cloud-KMS providers (the
-`exec` provider covers them), a manual-unlock / passphrase mode, encrypting the
-*rendered* copies of KV values in `job_config` / `task_config`, and any
-worker-side at-rest protection. Each is a follow-up plan, not a hidden gap —
-see §4 (non-goals) and §6.9 (what this does and does not close).
+Status: **SHIPPED** (all four phases, 2026-09-21; plan written the same day).
+Public page: [`docs/kv-encryption.md`](../../docs/kv-encryption.md). What
+shipped differs from the text below in a few places, each recorded in the
+calls doc: keys already unwrapped in memory stay usable until a restart (so
+losing the key file mid-flight never takes running reads down — the next
+start is where it bites); reads self-heal by reloading a local provider once
+before failing; the upgrade gate reads each voter's schema version from a
+header on every raft transport reply rather than from the membership view;
+`legion keyring provider test` ships the conformance harness; and the join
+flow delivers the root key in Phase 1's own release rather than a later one,
+because the raft test suites needed it. Deliberately deferred and named as
+such: native cloud-KMS providers (the `exec` provider covers them), a
+manual-unlock / passphrase mode, encrypting the *rendered* copies of KV values
+in `job_config` / `task_config`, and any worker-side at-rest protection. Each
+is a follow-up plan, not a hidden gap — see §4 (non-goals) and §6.9 (what this
+does and does not close).
 
 Legion's KV store is the cluster's secret store: artifact credentials
 (`auth.kv`), `$path/key` references in jobspecs, and `{{ kv "…" }}` templates
@@ -19,9 +29,11 @@ KV values at rest with a key hierarchy that keeps the one key that matters
 *out* of the store, so a copy of the database — a leaked backup, a bucket
 listing, a snapshot on a decommissioned manager — is worthless on its own.
 
-The user-facing page, when this ships, will be `docs/kv-encryption.md` with a
-cross-reference from `docs/kv-store.md`, `docs/upgrades.md` (backups) and
-`docs/auth-and-acls.md` (`state:read`). Until then, the plan is the design.
+The user-facing page is `docs/kv-encryption.md`, cross-referenced from
+`docs/kv-store.md`, `docs/upgrades.md` (backups, the upgrade gate),
+`docs/auth-and-acls.md` (`state:read`), `docs/metrics.md`,
+`docs/event-stream.md`, `docs/persistence-streaming.md`, and
+`docs/agent-readiness.md`. The plan stays as the design record.
 
 ---
 

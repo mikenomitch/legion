@@ -70,6 +70,9 @@ Plans, roadmaps, to-do lists, and development notes live in
 - [Service Discovery](service-discovery.md) — declaring services and finding
   healthy endpoints.
 - [KV Store](kv-store.md) — CRUD, versioning, locks, and reactive task updates.
+- [KV Encryption at Rest](kv-encryption.md) — on by default: the root key
+  outside the store, wrapped data keys inside it, rotation, backups, and
+  what to do when a key is missing.
 - [Auth & ACLs](auth-and-acls.md) — tokens, policies, scopes, and enforcement.
 - [Workload Identity (OIDC)](workload-identity.md) — short-lived, verifiable task
   identity for external providers.

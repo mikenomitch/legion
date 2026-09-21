@@ -453,3 +453,115 @@ fn three_node_cluster_membership_failover_and_convergence() -> R<()> {
 
     Ok(())
 }
+
+/// KV encryption at rest across a cluster (docs/kv-encryption.md): the
+/// bootstrap node mints the root key and the first data key at start; a
+/// joiner receives the root key as part of joining and reads values that
+/// were encrypted before it existed; the leader's upgrade gate tracks what
+/// every voter advertises on the transport; and a rotation on the leader
+/// reaches the follower.
+#[test]
+fn joiners_receive_the_root_key_and_the_upgrade_gate_tracks_voters() -> R<()> {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()?;
+    let dir = tempfile::tempdir()?;
+    let root = dir.path();
+    let key_file = |name: &str| root.join(name).join("store").join("keys").join("root.key");
+
+    let a = start_node(&rt, root, "mgr-a", true, None)?;
+    assert_eq!(
+        a.store().keyring().snapshot().state,
+        "unlocked",
+        "a single-voter bootstrap initializes its keyring at start"
+    );
+    assert!(
+        key_file("mgr-a").exists(),
+        "the root key was minted under storePath"
+    );
+    a.store()
+        .put_kv("secrets/db", "hunter2", KvValueType::String, None, None)?;
+    let (stored, key_id) = a.store().kv_stored_form("secrets/db")?.expect("row exists");
+    assert_ne!(stored, "hunter2", "the row holds ciphertext");
+    assert!(key_id.is_some());
+
+    // ── The joiner gets the root key with the join, then reads the value ──
+    let (token, _expires) = a.store().issue_raft_join_token("test")?;
+    let b = start_node(&rt, root, "mgr-b", false, Some(token))?;
+    wait_for(Duration::from_secs(120), "joiner promoted to voter", || {
+        a.store()
+            .raft_status()
+            .map(|s| s.voters.contains(&"mgr-b".to_string()))
+            .unwrap_or(false)
+    });
+    wait_for(
+        Duration::from_secs(30),
+        "the joiner holds the cluster's root key",
+        || key_file("mgr-b").exists(),
+    );
+    assert_eq!(
+        std::fs::read_to_string(key_file("mgr-a"))?,
+        std::fs::read_to_string(key_file("mgr-b"))?,
+        "the joiner's key file is byte-identical to the leader's"
+    );
+    {
+        let store = b.store().clone();
+        wait_for(
+            Duration::from_secs(90),
+            "the joiner decrypts a value written before it joined",
+            || kv_value(&store, "secrets/db").as_deref() == Some("hunter2"),
+        );
+    }
+    assert_eq!(b.store().keyring().snapshot().state, "unlocked");
+    let (stored_on_b, _) = b
+        .store()
+        .kv_stored_form("secrets/db")?
+        .expect("replicated row");
+    assert_eq!(stored_on_b, stored, "replicas hold the same ciphertext");
+
+    // ── The upgrade gate follows what voters advertise on the transport ──
+    assert_eq!(
+        a.store().keyring_upgrade_gate(),
+        None,
+        "every voter advertises the keyring schema"
+    );
+    let mut saw_closed = false;
+    for _ in 0..20 {
+        a.store().raft_forget_peer_schema_version("mgr-b")?;
+        if let Some(reason) = a.store().keyring_upgrade_gate() {
+            assert!(reason.contains("mgr-b"), "{reason}");
+            saw_closed = true;
+            break;
+        }
+        // A heartbeat reply re-advertised it between the two calls; retry.
+    }
+    assert!(saw_closed, "forgetting a voter's version closes the gate");
+    wait_for(
+        Duration::from_secs(30),
+        "the next transport reply re-advertises mgr-b's schema version",
+        || a.store().keyring_upgrade_gate().is_none(),
+    );
+
+    // ── A rotation on the leader reaches the follower ────────────────────
+    let rotated = a.store().rotate_data_key("test")?;
+    a.store().put_kv(
+        "secrets/after",
+        "post-rotation",
+        KvValueType::String,
+        None,
+        None,
+    )?;
+    {
+        let store = b.store().clone();
+        wait_for(
+            Duration::from_secs(90),
+            "the follower reads a value under the rotated key",
+            || kv_value(&store, "secrets/after").as_deref() == Some("post-rotation"),
+        );
+    }
+    let rows = b.store().list_keyring_rows()?;
+    assert_eq!(rows[0].key_id, rotated.key_id);
+    assert_eq!(rows[0].state, "active");
+    Ok(())
+}

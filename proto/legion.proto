@@ -581,6 +581,60 @@ service Manager {
   // Requires `operator:write`.
   rpc GetStateBackup (GetStateBackupRequest) returns (GetStateBackupReply);
 
+  // Reports the KV encryption keyring on THIS manager (docs/kv-encryption.md):
+  // whether encryption is on, whether every data key is unwrapped here
+  // (`unlocked`) or which ones are not (`locked`, with the reason and the
+  // root key location), the data keys with how many values each protects,
+  // how many rows are still plaintext, and a one-line `hint` naming the
+  // next step when there is one. Every manager answers for itself, because
+  // the root key is per-manager state — ask each one when diagnosing.
+  //
+  // Requires `operator:read`.
+  rpc GetKeyringStatus (GetKeyringStatusRequest) returns (GetKeyringStatusReply);
+
+  // Rotates the KV data key: a new active key is written in one replicated
+  // control-lane write and the previous key is retired but kept, so values
+  // already stored stay readable. The manager then re-encrypts every value
+  // under the new key in the background (versions and timestamps untouched,
+  // no job restarts) and garbage-collects the retired key once nothing
+  // references it. Automatic at `encryption.dataKeyRotationAge`; this RPC
+  // is the on-demand form (an offboarding, a suspected exposure).
+  //
+  // Raft: leader-only (a follower answers FAILED_PRECONDITION naming the
+  // leader). Requires `operator:write`. Retry-safe via `idempotency_key`.
+  rpc RotateDataKey (RotateDataKeyRequest) returns (RotateDataKeyReply);
+
+  // Re-encrypts KV values in batches until every value is under the active
+  // data key — or, with `plaintext = true`, decrypts every value into a
+  // plaintext row (the step before `encryption.enabled = false` or a
+  // downgrade). Runs to completion before replying; each batch is one
+  // replicated write of at most 256 rows. Values are unchanged, so nothing
+  // on the KV-reactive path fires.
+  //
+  // Raft: leader-only. Requires `operator:write`. Retry-safe via
+  // `idempotency_key` (a repeat simply finds nothing left to do).
+  rpc RewrapKv (RewrapKvRequest) returns (RewrapKvReply);
+
+  // Re-wraps every data key under the root key provider's CURRENT key, in
+  // one replicated write, without touching any value. This is how a root
+  // key rotation completes: for the `file`/`env` providers, put the new key
+  // FIRST (older keys stay for unwrapping), call this, then remove the old
+  // key everywhere; for an `exec` provider, after the KMS key changed.
+  //
+  // Raft: leader-only. Requires `operator:write`. Retry-safe via
+  // `idempotency_key`.
+  rpc RewrapRootKey (RewrapRootKeyRequest) returns (RewrapRootKeyReply);
+
+  // Break-glass recovery when the root key is gone for good: deletes every
+  // KV value this manager cannot decrypt, drops the data keys it cannot
+  // unwrap, initializes a fresh keyring, and reports exactly which keys
+  // were lost. Jobs that referenced a deleted value fail through the
+  // normal `missing_kv_dependency` path and recover when the value is put
+  // back. `confirm` must equal `DELETE-UNDECRYPTABLE-VALUES`.
+  //
+  // Raft: leader-only. Requires `operator:write`.
+  rpc ResetKeyring (ResetKeyringRequest) returns (ResetKeyringReply);
+
   // Applies dynamic attribute updates to a node and triggers affected evaluations.
   rpc UpdateNodeDynamic (UpdateNodeDynamicRequest)
     returns (UpdateNodeDynamicReply);
@@ -3655,6 +3709,212 @@ message GetStateBackupReply {
 
   // Raft applied log index captured in the backup (0 outside raft mode).
   uint64 applied_index = 3;
+
+  // How KV values are held in this backup (docs/kv-encryption.md). When
+  // `enabled`, the file carries ciphertext plus the WRAPPED data keys and is
+  // useless without the root key, which is deliberately NOT in it:
+  // `root_key_provider` / `root_key_location` say where to find it and
+  // `root_key_ids` which key(s) a restore will need. Keep them together.
+  BackupEncryptionInfo encryption = 4;
+}
+
+// Request payload for GetKeyringStatus. No fields: the reply describes the
+// manager that answers.
+message GetKeyringStatusRequest {}
+
+// One data key in the KV keyring (see GetKeyringStatusReply).
+message KeyringKeyInfo {
+  // Data key id (`dk_…`). Values reference it in `kv_entry.enc_key_id`.
+  string key_id = 1;
+
+  // `active` (encrypts new writes) or `retired` (still decrypts what it
+  // protected until the rewrap converts those values).
+  string state = 2;
+
+  // Cipher this key is used with (`aes-256-gcm`).
+  string algorithm = 3;
+
+  // Unix seconds the key was created.
+  int64 created_at = 4;
+
+  // Unix seconds the key was retired; unset while active.
+  optional int64 retired_at = 5;
+
+  // Id of the root key this data key is wrapped under, and the provider
+  // kind that wrapped it.
+  string root_key_id = 6;
+  string root_provider = 7;
+
+  // KV values currently encrypted under this key.
+  int64 value_count = 8;
+
+  // Whether THIS manager has unwrapped the key. `false` means the values
+  // under it are unreadable here; `error` says why.
+  bool unwrapped = 9;
+  string error = 10;
+}
+
+// Progress of the background rewrap (see GetKeyringStatusReply).
+message KeyringRewrapProgress {
+  // Values not yet under the active data key (plaintext rows included).
+  int64 pending = 1;
+
+  // Whether the manager's keyring loop is currently converting them.
+  bool running = 2;
+
+  // Last rewrap error on this manager, if any (cleared on success).
+  string last_error = 3;
+}
+
+// Reply payload for GetKeyringStatus.
+message GetKeyringStatusReply {
+  // `encryption.enabled` on this manager.
+  bool enabled = 1;
+
+  // `disabled` | `uninitialized` | `pending_upgrade` | `unlocked` | `locked`.
+  //
+  // `uninitialized`: enabled, but no data key exists yet (the leader has
+  // not run initialization); values are written as plaintext rows until it
+  // does. `pending_upgrade`: raft, and a voter runs a build without the
+  // keyring, so the leader is deliberately holding off (`hint` names the
+  // manager). `locked`: at least one data key cannot be unwrapped here.
+  string state = 2;
+
+  // Root key provider kind (`file` | `env` | `exec`) and where it looks.
+  string root_key_provider = 3;
+  string root_key_location = 4;
+
+  // Id of the root key the provider would wrap with right now, when it has
+  // material.
+  string root_key_id = 5;
+
+  // Data keys, active first.
+  repeated KeyringKeyInfo keys = 6;
+
+  // KV rows stored as plaintext / encrypted.
+  int64 plaintext_rows = 7;
+  int64 encrypted_rows = 8;
+
+  // Background rewrap state.
+  KeyringRewrapProgress rewrap = 9;
+
+  // Configured `encryption.dataKeyRotationAge` and the active key's age.
+  string data_key_rotation_age = 10;
+  int64 active_key_age_seconds = 11;
+
+  // The one thing to do next, in plain language, when there is one
+  // (copy the root key from another manager, run a rewrap, finish an
+  // upgrade). Empty when everything is as it should be.
+  string hint = 12;
+
+  // The manager answering (`host:port`), since the keyring is per-manager.
+  string manager = 13;
+}
+
+// Request payload for RotateDataKey.
+message RotateDataKeyRequest {
+  // Optional idempotency key. A repeated call with the same key returns the
+  // recorded outcome with `deduplicated = true` instead of rotating again.
+  optional string idempotency_key = 1;
+}
+
+// Reply payload for RotateDataKey.
+message RotateDataKeyReply {
+  // The new active data key.
+  string key_id = 1;
+
+  // The data key it retired (empty when there was none).
+  string retired_key_id = 2;
+
+  // True when a previous call with the same idempotency key already
+  // rotated and this reply is its recorded outcome.
+  bool deduplicated = 3;
+}
+
+// Request payload for RewrapKv.
+message RewrapKvRequest {
+  // Decrypt every value into a plaintext row instead of re-encrypting
+  // under the active key. The step before disabling encryption or
+  // downgrading to a build without the keyring.
+  bool plaintext = 1;
+
+  // Optional idempotency key (see RotateDataKeyRequest).
+  optional string idempotency_key = 2;
+}
+
+// Reply payload for RewrapKv.
+message RewrapKvReply {
+  // Values rewritten by this call.
+  int64 rewrapped = 1;
+
+  // Values still pending afterwards (0 on a completed run; non-zero only
+  // when a batch failed — the message says why).
+  int64 remaining = 2;
+
+  // Retired data keys garbage-collected once nothing referenced them.
+  repeated string collected_keys = 3;
+
+  bool deduplicated = 4;
+}
+
+// Request payload for RewrapRootKey.
+message RewrapRootKeyRequest {
+  // Optional idempotency key (see RotateDataKeyRequest).
+  optional string idempotency_key = 1;
+}
+
+// Reply payload for RewrapRootKey.
+message RewrapRootKeyReply {
+  // Data keys now wrapped under `root_key_id`.
+  int64 keys = 1;
+
+  // The root key everything is wrapped under after this call.
+  string root_key_id = 2;
+
+  // Data keys left untouched because this manager cannot unwrap them.
+  repeated string skipped = 3;
+
+  bool deduplicated = 4;
+}
+
+// Request payload for ResetKeyring.
+message ResetKeyringRequest {
+  // Must be exactly `DELETE-UNDECRYPTABLE-VALUES`.
+  string confirm = 1;
+}
+
+// Reply payload for ResetKeyring.
+message ResetKeyringReply {
+  // KV key paths whose values were deleted because nothing could decrypt them.
+  repeated string deleted_values = 1;
+
+  // Data key ids dropped from the keyring.
+  repeated string dropped_keys = 2;
+
+  // The active data key after the reset.
+  string active_key_id = 3;
+}
+
+// How a state backup's KV values are protected (see GetStateBackupReply).
+message BackupEncryptionInfo {
+  // `encryption.enabled` on the manager that wrote the backup.
+  bool enabled = 1;
+
+  // Root key provider: `file`, `env`, or `exec`.
+  string root_key_provider = 2;
+
+  // Where the root key lives: the key file path, the variable name, or the
+  // provider command. Never the key itself.
+  string root_key_location = 3;
+
+  // Ids of the root keys the backup's data keys are wrapped under
+  // (`rk_…` fingerprints, or a KMS key id for `exec`). A restore needs
+  // every one of them available to read every value.
+  repeated string root_key_ids = 4;
+
+  // Values still stored as plaintext rows (pre-encryption rows a rewrap has
+  // not converted). 0 once `legion keyring rewrap` has run to completion.
+  int64 plaintext_rows = 5;
 }
 
 // Type discriminator for KV values.
@@ -3695,6 +3955,14 @@ message KvEntry {
 
   // RFC3339 update timestamp.
   string updated_at = 6;
+
+  // Whether the value is stored encrypted at rest (docs/kv-encryption.md).
+  //
+  // `value` is always the plaintext on the wire; this only reports how the
+  // row is held in the store. `false` for rows written before encryption
+  // was enabled (or with `encryption.enabled = false`) that no rewrap has
+  // converted yet — `legion keyring status` counts them.
+  bool encrypted = 7;
 }
 
 // KV lock record.
@@ -5987,6 +6255,15 @@ message JoinRaftClusterReply {
   // Current membership of every active raft group, so the joiner can seed
   // its peer table before its first snapshot install.
   repeated RaftGroupMembership groups = 3;
+
+  // The cluster's KV root key material for the joiner (docs/kv-encryption.md),
+  // so "join the cluster" is one command on a cluster whose root key lives
+  // in a file: AES-256-GCM under a key derived (HKDF-SHA256) from the
+  // cluster secret, bound to the cluster id. Empty when the leader's
+  // provider does not export material (`exec` — a KMS-held key never
+  // leaves the KMS) or has none. The joiner writes it to its own key file
+  // only if that file does not exist yet, never overwriting one.
+  bytes root_key_bundle = 4;
 }
 
 // Membership of one raft group ("lane").

@@ -12,6 +12,7 @@ pub mod instance;
 pub mod job;
 pub mod join;
 pub mod join_token;
+pub mod keyring;
 pub mod kv;
 pub mod ledger;
 pub mod login;

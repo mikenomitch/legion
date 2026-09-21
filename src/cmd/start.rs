@@ -147,7 +147,8 @@ pub async fn handle(sub_matches: &ArgMatches) -> R<()> {
             // Restore runs BEFORE the store (and any raft engine) starts:
             // the backup becomes the initial state the engine adopts (plan
             // §A5; docs/upgrades.md "Backup and restore").
-            if let Some(backup) = arg_matches.get_one::<String>("restore-from") {
+            let restore_from = arg_matches.get_one::<String>("restore-from").cloned();
+            if let Some(backup) = &restore_from {
                 let force = arg_matches.get_flag("force-restore");
                 let store_path = config.with_defaults().store_path;
                 let restored = crate::storage::store::Store::restore_from_backup(
@@ -161,7 +162,7 @@ pub async fn handle(sub_matches: &ArgMatches) -> R<()> {
                     "Restored state store from backup; starting manager"
                 );
             }
-            run_manager(config, run_worker).await
+            crate::manager::daemon::run_manager_with(config, run_worker, restore_from).await
         }
         _ => {
             let config_path = sub_matches

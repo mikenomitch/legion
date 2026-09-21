@@ -114,6 +114,9 @@ impl Lane {
 /// only inside join tokens; checked by `server::RaftTransportService` and
 /// attached by `network::RaftTransportNetwork`.
 pub(crate) const RAFT_CLUSTER_SECRET_METADATA_KEY: &str = "x-legion-raft-secret";
+/// Reply metadata key carrying the answering manager's schema version (the
+/// migration count its build knows); see `raft::server::stamp_schema_version`.
+pub(crate) const RAFT_SCHEMA_VERSION_METADATA_KEY: &str = "x-legion-schema-version";
 
 /// Handles `RaftTransport.Join` requests on the leader. Implemented by the
 /// driver's `EngineJoinHandler` (token validation, learner add on every

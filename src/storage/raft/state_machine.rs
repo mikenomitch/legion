@@ -588,6 +588,9 @@ impl StoreStateMachine {
         // The read model caches rows from tables this install may have
         // replaced; rebuild it from the committed state.
         self.store.refresh_read_model()?;
+        // The control lane's dump carries `keyring_key`: unwrap whatever
+        // data keys arrived with it.
+        self.store.keyring_rows_changed();
 
         // Verify: the applied marker now reported for this lane must equal
         // the snapshot meta.
