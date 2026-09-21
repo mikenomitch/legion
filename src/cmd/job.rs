@@ -167,7 +167,15 @@ pub fn config() -> Command {
         )
         .arg(json_flag());
 
-    let list_cmd = Command::new("list").about("List all jobs").arg(json_flag());
+    let list_cmd = Command::new("list")
+        .about("List all jobs")
+        .arg(
+            Arg::new("status")
+                .long("status")
+                .value_name("STATUS")
+                .help("Only jobs with this exact status (e.g. running, stopped, failed)"),
+        )
+        .arg(json_flag());
 
     let logs_cmd = Command::new("logs")
         .about("Fetch captured stdout/stderr for a job's allocations")
@@ -2009,6 +2017,7 @@ async fn list_jobs(arg_matches: &ArgMatches) -> R<()> {
 
     let mut client = connect_manager_client().await?;
     let request = tonic::Request::new(ListJobsRequest {
+        status: arg_matches.get_one::<String>("status").cloned(),
         ..Default::default()
     });
     let response = output::resolve(

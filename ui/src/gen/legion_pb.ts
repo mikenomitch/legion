@@ -6220,6 +6220,16 @@ export class ListJobsRequest extends Message<ListJobsRequest> {
    */
   pageSize?: number;
 
+  /**
+   * Keep only jobs whose status equals this value (case-insensitive, exact —
+   * `run` does not match `running`; use `query` for substring search).
+   * Applied after `query` and before paging, so `total_count` reflects the
+   * filtered set. Omit or leave empty to return every status.
+   *
+   * @generated from field: optional string status = 6;
+   */
+  status?: string;
+
   constructor(data?: PartialMessage<ListJobsRequest>) {
     super();
     proto3.util.initPartial(data, this);
@@ -6233,6 +6243,7 @@ export class ListJobsRequest extends Message<ListJobsRequest> {
     { no: 3, name: "sort_order", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
     { no: 4, name: "page", kind: "scalar", T: 13 /* ScalarType.UINT32 */, opt: true },
     { no: 5, name: "page_size", kind: "scalar", T: 13 /* ScalarType.UINT32 */, opt: true },
+    { no: 6, name: "status", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListJobsRequest {
@@ -6364,6 +6375,17 @@ export class ListJobsReply extends Message<ListJobsReply> {
   jobs: Job[] = [];
 
   /**
+   * Number of jobs per status string (`running`, `stopped`, `failed`, …),
+   * counted over every job the caller may read that matches `query` — BEFORE
+   * the `status` filter and before paging. A client rendering a status filter
+   * can therefore show stable counts on every option while one is selected.
+   * Statuses with no jobs are absent rather than zero.
+   *
+   * @generated from field: map<string, uint32> status_counts = 5;
+   */
+  statusCounts: { [key: string]: number } = {};
+
+  /**
    * Total number of records matching the filter before pagination.
    *
    * @generated from field: uint32 total_count = 2;
@@ -6393,6 +6415,7 @@ export class ListJobsReply extends Message<ListJobsReply> {
   static readonly typeName = "legion.ListJobsReply";
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
     { no: 1, name: "jobs", kind: "message", T: Job, repeated: true },
+    { no: 5, name: "status_counts", kind: "map", K: 9 /* ScalarType.STRING */, V: {kind: "scalar", T: 13 /* ScalarType.UINT32 */} },
     { no: 2, name: "total_count", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
     { no: 3, name: "page", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
     { no: 4, name: "page_size", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },

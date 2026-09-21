@@ -1,13 +1,24 @@
 import { A, Navigate, Route, Router, useLocation, useNavigate, type RouteSectionProps } from '@solidjs/router'
 import { ErrorBoundary, For, Show, createEffect, createMemo, createResource, createSignal, on, onCleanup, onMount, type JSX } from 'solid-js'
-import Breadcrumbs from './components/Breadcrumbs'
+import Breadcrumbs, { buildCrumbs, isKnownSection } from './components/Breadcrumbs'
 import { AclBanner } from './components/AclBanner'
 import { ConnectionGate } from './components/ConnectionGate'
-import { Icon, JumpHint, PageHeader, cx, type IconName } from './components/ui'
+import { lazyPage } from './components/LazyPage'
+import { ShortcutsHelp } from './components/ShortcutsHelp'
+import { Button, Dot, Icon, JumpHint, Kbd, PageHeader, RelativeTime, cx, type IconName } from './components/ui'
 import { managerClient } from './grpcClient'
 import { ROUTE_RESOURCE, canRead, isAnonymous } from './utils/acl'
 import { commandPaletteIndexItems } from './utils/commandPalette'
-import { connectionStatus, managerAddress } from './utils/connection'
+import {
+  connectionStatus,
+  identityError,
+  lostSince,
+  managerAddress,
+  managerIdentity,
+  managerLink,
+  probeManagerLink,
+  startConnectionWatchdog,
+} from './utils/connection'
 import {
   assignNavHintLetters,
   hasJumpModifier,
@@ -17,6 +28,8 @@ import {
   jumpLetterFromEvent,
   setJumpHintsVisible,
 } from './utils/jumpHints'
+import { clearRecents, recents, recordRecent } from './utils/recents'
+import type { Tone } from './utils/status'
 import Access from './pages/Access'
 import OidcCallback from './pages/OidcCallback'
 import Events from './pages/Events'
@@ -33,17 +46,22 @@ import Jobs from './pages/Jobs'
 import KeyValue from './pages/KeyValue'
 import Manager from './pages/Manager'
 import Nodes from './pages/Nodes'
+import NotFound from './pages/NotFound'
 import Rollouts from './pages/Rollouts'
 import Services from './pages/Services'
 import Network from './pages/Network'
 import Volumes from './pages/Volumes'
-import ApiExplorer from './pages/ApiExplorer'
-import Observability from './pages/Observability'
 import TestingUtils from './pages/TestingUtils'
-import StateExplorer from './pages/StateExplorer'
 import Raft from './pages/Raft'
 import Templates from './pages/Templates'
 import TemplateDetail from './pages/details/TemplateDetail'
+
+// The developer tools carry the heaviest code (the API Explorer ships the
+// generated proto sources as text for its docs), so they load on first
+// visit rather than on every visit to the overview.
+const ApiExplorer = lazyPage(() => import('./pages/ApiExplorer'))
+const StateExplorer = lazyPage(() => import('./pages/StateExplorer'))
+const Observability = lazyPage(() => import('./pages/Observability'))
 
 type SidebarItem = {
   kind: 'item'
@@ -67,11 +85,25 @@ type CommandPaletteItem = {
   searchText: string
   href: string
   group: string
+  // An action rather than a destination: run it instead of navigating.
+  run?: () => void
+  icon?: IconName
 }
 
 type SidebarNode = SidebarItem | SidebarSection
 
 const detailRoutes = new Set(['jobs', 'nodes', 'manager', 'rollouts', 'services', 'templates', 'volumes'])
+
+// The section a detail URL belongs to, as the ⌘K "Recent" group names it.
+const RECENT_KINDS: Record<string, string> = {
+  jobs: 'Jobs',
+  nodes: 'Workers',
+  manager: 'Managers',
+  rollouts: 'Rollouts',
+  services: 'Services',
+  templates: 'Templates',
+  volumes: 'Volumes',
+}
 
 // Anonymous callers keep the whole sidebar: they have not had a chance to
 // authenticate, and an app that hides every destination looks broken rather
@@ -154,6 +186,28 @@ const RouteErrorBoundary = (props: { children: JSX.Element }) => {
   )
 }
 
+// Who the manager thinks this browser is, for the sidebar footer. One line,
+// because it is glanced at, not read: the Access page has the detail.
+const identitySummary = (): { label: string; detail: string; tone: Tone } => {
+  const identity = managerIdentity()
+  if (!identity) {
+    return identityError()
+      ? { label: 'Credential rejected', detail: 'The stored token was refused — open Access to fix it', tone: 'danger' }
+      : { label: 'Resolving identity…', detail: '', tone: 'neutral' }
+  }
+  if (!identity.aclEnabled) {
+    return { label: 'ACLs off · full access', detail: 'Every caller has full access until acl.enabled is set', tone: 'warn' }
+  }
+  if (identity.source === 'anonymous') {
+    return { label: 'Not logged in', detail: 'ACLs are enforced — log in to see your cluster', tone: 'warn' }
+  }
+  return {
+    label: identity.principal || identity.tokenType || 'authenticated',
+    detail: `${identity.tokenType || 'token'} via ${identity.source}${identity.auditOnly ? ' · audit-only' : ''}`,
+    tone: identity.auditOnly ? 'info' : 'ok',
+  }
+}
+
 const Layout = (props: RouteSectionProps) => {
   const location = useLocation()
   const navigate = useNavigate()
@@ -164,6 +218,7 @@ const Layout = (props: RouteSectionProps) => {
   // overlay with room for labels, so it ignores the preference while open.
   const isNavCollapsed = () => navCollapsePref() && !isNavOpen()
   const [theme, setTheme] = createSignal<'light' | 'dark'>(resolveInitialTheme())
+  const [shortcutsOpen, setShortcutsOpen] = createSignal(false)
   // Waits for the connection probe: firing this before we know the manager is
   // reachable just produces a second failure to ignore.
   // The probe MUST swallow its own failure. GetObservability needs
@@ -189,6 +244,12 @@ const Layout = (props: RouteSectionProps) => {
   let commandPaletteInput: HTMLInputElement | undefined
   const isActiveNavPath = (path: string) =>
     path === '/' ? location.pathname === '/' : location.pathname === path || location.pathname.startsWith(`${path}/`)
+
+  // Once the first connect succeeds, keep checking that the manager is still
+  // there; the banner below the topbar reports when it is not.
+  createEffect(() => {
+    if (connectionStatus() === 'connected') startConnectionWatchdog()
+  })
 
   const navItems = createMemo(() => {
     const base: SidebarNode[] = [
@@ -285,10 +346,23 @@ const Layout = (props: RouteSectionProps) => {
     () => new Map(navHintLetters().filter((entry) => entry.letter).map((entry) => [entry.letter, entry.path])),
   )
 
+  const toggleTheme = () => setTheme((value) => (value === 'dark' ? 'light' : 'dark'))
+
   const commandPaletteEntries = createMemo(() => {
     const query = commandPaletteQuery().trim().toLowerCase()
     const deduped = new Map<string, CommandPaletteItem>()
     const entries: CommandPaletteItem[] = [
+      // Recent pages come first: with no query they are the most likely
+      // destination, and with one they still match by name.
+      ...recents().map((entry) => ({
+        id: `recent:${entry.href}`,
+        label: entry.label,
+        description: entry.kind,
+        searchText: `${entry.label} ${entry.kind}`.toLowerCase(),
+        href: entry.href,
+        group: 'Recent',
+        icon: 'history' as const,
+      })),
       ...flattenedNavItems().map((entry) => ({
         id: `nav:${entry.path}`,
         label: entry.label,
@@ -296,6 +370,7 @@ const Layout = (props: RouteSectionProps) => {
         searchText: entry.label.toLowerCase(),
         href: entry.path,
         group: 'Navigation',
+        icon: entry.icon,
       })),
       ...commandPaletteIndexItems().map((entry) => ({
         id: `index:${entry.id}`,
@@ -305,6 +380,40 @@ const Layout = (props: RouteSectionProps) => {
         href: entry.href,
         group: entry.source,
       })),
+      {
+        id: 'action:theme',
+        label: theme() === 'dark' ? 'Switch to light mode' : 'Switch to dark mode',
+        description: 'Theme',
+        searchText: 'theme light dark mode switch toggle',
+        href: '#theme',
+        group: 'Actions',
+        run: toggleTheme,
+        icon: theme() === 'dark' ? ('sun' as const) : ('moon' as const),
+      },
+      {
+        id: 'action:shortcuts',
+        label: 'Keyboard shortcuts',
+        description: 'Every key the UI answers to',
+        searchText: 'keyboard shortcuts help keys cheat sheet',
+        href: '#shortcuts',
+        group: 'Actions',
+        run: () => setShortcutsOpen(true),
+        icon: 'keyboard' as const,
+      },
+      ...(recents().length > 0
+        ? [
+            {
+              id: 'action:clear-recents',
+              label: 'Clear recent pages',
+              description: 'Forget the pages listed under Recent',
+              searchText: 'clear recent pages history forget',
+              href: '#clear-recents',
+              group: 'Actions',
+              run: clearRecents,
+              icon: 'trash' as const,
+            },
+          ]
+        : []),
     ]
 
     for (const entry of entries) {
@@ -345,9 +454,13 @@ const Layout = (props: RouteSectionProps) => {
     paletteReturnFocus = null
   }
 
-  const executeCommand = (href: string) => {
+  const executeCommand = (entry: Pick<CommandPaletteItem, 'href' | 'run'>) => {
     closeCommandPalette()
-    navigate(href)
+    if (entry.run) {
+      entry.run()
+      return
+    }
+    navigate(entry.href)
   }
 
   const handleCommandPaletteNavigation = (event: KeyboardEvent) => {
@@ -378,7 +491,7 @@ const Layout = (props: RouteSectionProps) => {
       event.preventDefault()
       const entry = commandPaletteEntries()[commandPaletteSelected()]
       if (entry) {
-        executeCommand(entry.href)
+        executeCommand(entry)
       }
       return true
     }
@@ -388,7 +501,7 @@ const Layout = (props: RouteSectionProps) => {
       const segments = normalized.split('/').filter(Boolean)
       if (segments.length > 1) {
         segments.pop()
-        executeCommand(`/${segments.join('/')}`)
+        executeCommand({ href: `/${segments.join('/')}` })
       }
       return true
     }
@@ -400,13 +513,13 @@ const Layout = (props: RouteSectionProps) => {
     const segments = normalized.split('/').filter(Boolean)
     if (segments.length <= 1) {
       if (location.pathname !== '/') {
-        executeCommand('/')
+        executeCommand({ href: '/' })
       }
       return
     }
 
     segments.pop()
-    executeCommand(`/${segments.join('/')}`)
+    executeCommand({ href: `/${segments.join('/')}` })
   }
 
   const isPaletteSearchTarget = (event: Event): boolean => {
@@ -426,6 +539,11 @@ const Layout = (props: RouteSectionProps) => {
   }
 
   const onGlobalCommandPaletteKeydown = (event: KeyboardEvent) => {
+    if (event.key === 'Escape' && shortcutsOpen()) {
+      event.preventDefault()
+      setShortcutsOpen(false)
+      return
+    }
     if (event.key === 'Escape' && isNavOpen()) {
       setIsNavOpen(false)
       return
@@ -443,6 +561,16 @@ const Layout = (props: RouteSectionProps) => {
       return
     }
 
+    // `?` opens the cheat sheet, the way it does on GitHub and Linear. It is
+    // Shift+/ on most layouts, so match the produced character, not the code.
+    if (event.key === '?' && !event.metaKey && !event.ctrlKey && !event.altKey && !isEditableTarget(event)) {
+      event.preventDefault()
+      setShortcutsOpen((value) => !value)
+      return
+    }
+
+    if (shortcutsOpen()) return
+
     if ((event.key.toLowerCase() === 'u') && !event.metaKey && !event.ctrlKey && !event.altKey && !isEditableTarget(event)) {
       // Don't hijack the key while a link/button has focus (keyboard users).
       const active = document.activeElement as HTMLElement | null
@@ -455,6 +583,7 @@ const Layout = (props: RouteSectionProps) => {
     if (!(event.metaKey || event.ctrlKey) || event.key.toLowerCase() !== 'k') return
 
     event.preventDefault()
+    setShortcutsOpen(false)
     openCommandPalette()
   }
 
@@ -474,7 +603,7 @@ const Layout = (props: RouteSectionProps) => {
   // key that opens it. Both keydown and keyup carry the modifier flags, so one
   // handler on each covers press and release.
   const syncJumpHints = (event: KeyboardEvent) => {
-    setJumpHintsVisible(hasJumpModifier(event) && !commandPaletteOpen())
+    setJumpHintsVisible(hasJumpModifier(event) && !commandPaletteOpen() && !shortcutsOpen())
   }
 
   // ⌘Tab and friends take focus without ever delivering the keyup, which would
@@ -484,7 +613,7 @@ const Layout = (props: RouteSectionProps) => {
   // Visibility stays a pure function of the modifier, so keeping it held after a
   // jump simply labels the page you landed on.
   const onJumpHintKeydown = (event: KeyboardEvent) => {
-    if (commandPaletteOpen() || !hasJumpModifier(event) || event.altKey) return
+    if (commandPaletteOpen() || shortcutsOpen() || !hasJumpModifier(event) || event.altKey) return
 
     // Sidebar items carry Shift because plain ⌘+letter belongs to the browser.
     if (event.shiftKey) {
@@ -521,7 +650,7 @@ const Layout = (props: RouteSectionProps) => {
 
   // ⌘K reveals the hints on its way to opening the palette; drop them once it is.
   createEffect(() => {
-    if (commandPaletteOpen()) hideJumpHints()
+    if (commandPaletteOpen() || shortcutsOpen()) hideJumpHints()
   })
 
   createEffect(() => {
@@ -552,6 +681,28 @@ const Layout = (props: RouteSectionProps) => {
       () => {
         setIsNavOpen(false)
         closeCommandPalette()
+        setShortcutsOpen(false)
+      },
+    ),
+  )
+
+  // Every detail page you open becomes a ⌘K "Recent" entry, from the URL
+  // alone — no page has to know. Task pages name both the task and its job.
+  createEffect(
+    on(
+      () => location.pathname,
+      (pathname) => {
+        const segments = (pathname.replace(/\/+$/, '') || '/').split('/').filter(Boolean)
+        const kind = segments.length >= 2 ? RECENT_KINDS[segments[0]] : undefined
+        if (!kind) return
+        const id = decodePathSegment(segments[1])
+        if (segments[0] === 'jobs' && segments[2] === 'specs') return
+        if (segments[0] === 'jobs' && segments[2] === 'tasks' && segments[3]) {
+          recordRecent({ href: pathname, label: `${decodePathSegment(segments[3])} · ${id}`, kind: 'Tasks' })
+          return
+        }
+        if (segments.length > 2) return
+        recordRecent({ href: pathname, label: segments[0] === 'rollouts' ? `Rollout #${id}` : id, kind })
       },
     ),
   )
@@ -594,10 +745,27 @@ const Layout = (props: RouteSectionProps) => {
     }
   })
 
+  // The tab title reads innermost-first ("web · api · Jobs · Legion") so
+  // twenty open tabs are tellable apart by their first word.
+  createEffect(() => {
+    const labels = buildCrumbs(location.pathname)
+      .slice(1)
+      .map((crumb) => crumb.label)
+      .filter((label) => label !== 'Tasks' && label !== 'Specs')
+    document.title = [...(labels.length > 0 ? labels.reverse() : ['Overview']), 'Legion'].join(' · ')
+  })
+
   const isDetailRoute = () => {
     const normalized = location.pathname.replace(/\/+$/, '') || '/'
     const segments = normalized.split('/').filter(Boolean)
     return segments.length > 1 && detailRoutes.has(segments[0] ?? '')
+  }
+
+  // An unknown URL renders the not-found card, which carries its own
+  // heading; the generic header would name the nearest nav item instead.
+  const isUnknownRoute = () => {
+    const segments = (location.pathname.replace(/\/+$/, '') || '/').split('/').filter(Boolean)
+    return !isKnownSection(segments[0])
   }
 
   const NavLink = (itemProps: { item: SidebarItem }) => (
@@ -705,24 +873,57 @@ const Layout = (props: RouteSectionProps) => {
               )}
             </For>
           </nav>
-          <div
-            class={cx('border-t border-line py-3', isNavCollapsed() ? 'px-2' : 'px-4')}
-            onMouseEnter={(event) => showNavTooltip(event.currentTarget, `Manager · ${managerAddress}`)}
-            onMouseLeave={hideNavTooltip}
-          >
-            <Show
-              when={!isNavCollapsed()}
-              fallback={
-                <div class="flex justify-center text-faint">
-                  <Icon name="network" size={15} />
-                </div>
-              }
+          {/* Who you are, and where you are connected. Both link to the page
+              that can change them. */}
+          <div class={cx('space-y-1 border-t border-line py-2.5', isNavCollapsed() ? 'px-2' : 'px-2.5')}>
+            <A
+              href="/access"
+              class={cx(
+                'flex items-center rounded-md py-1.5 text-xs text-muted transition-colors hover:bg-surface2 hover:text-ink',
+                isNavCollapsed() ? 'justify-center px-2' : 'gap-2.5 px-2.5',
+              )}
+              aria-label={`Identity: ${identitySummary().label}`}
+              title={identitySummary().detail || undefined}
+              onMouseEnter={(event) => showNavTooltip(event.currentTarget, identitySummary().label)}
+              onMouseLeave={hideNavTooltip}
+              onFocus={(event) => showNavTooltip(event.currentTarget, identitySummary().label)}
+              onBlur={hideNavTooltip}
             >
-              <p class="eyebrow mb-1">Manager</p>
-              <p class="truncate font-mono text-2xs text-muted" title={managerAddress}>
-                {managerAddress.replace(/^https?:\/\//, '')}
-              </p>
-            </Show>
+              <span class="relative flex shrink-0 items-center justify-center text-faint">
+                <Icon name="user" size={15} />
+                <Dot tone={identitySummary().tone} class="absolute -bottom-0.5 -right-1 ring-2 ring-surface" />
+              </span>
+              <Show when={!isNavCollapsed()}>
+                <span class="min-w-0 flex-1">
+                  <span class="block truncate font-medium text-ink">{identitySummary().label}</span>
+                  <Show when={identitySummary().detail}>
+                    <span class="block truncate text-2xs text-faint">{identitySummary().detail}</span>
+                  </Show>
+                </span>
+              </Show>
+            </A>
+            <div
+              class={cx('flex items-center py-1 text-2xs text-faint', isNavCollapsed() ? 'justify-center px-2' : 'gap-2.5 px-2.5')}
+              onMouseEnter={(event) => showNavTooltip(event.currentTarget, `Manager · ${managerAddress}`)}
+              onMouseLeave={hideNavTooltip}
+            >
+              <span class="relative flex shrink-0 items-center justify-center">
+                <Icon name="network" size={15} />
+                <Dot
+                  tone={managerLink() === 'ok' ? 'ok' : 'danger'}
+                  pulse={managerLink() !== 'ok'}
+                  class="absolute -bottom-0.5 -right-1 ring-2 ring-surface"
+                />
+              </span>
+              <Show when={!isNavCollapsed()}>
+                <span class="min-w-0 flex-1">
+                  <span class="eyebrow block">Manager</span>
+                  <span class="block truncate font-mono text-2xs text-muted" title={managerAddress}>
+                    {managerAddress.replace(/^https?:\/\//, '')}
+                  </span>
+                </span>
+              </Show>
+            </div>
           </div>
         </aside>
         <Show when={navTooltip()}>
@@ -746,6 +947,32 @@ const Layout = (props: RouteSectionProps) => {
         </Show>
         <div class="relative flex min-h-screen min-w-0 flex-1 flex-col">
           <AclBanner />
+          <Show when={managerLink() === 'lost'}>
+            <div
+              role="alert"
+              class="flex items-center justify-between gap-3 border-b border-red-500/25 bg-red-500/10 px-4 py-2 text-sm text-red-800 dark:text-red-200 md:px-6"
+            >
+              <p class="flex min-w-0 items-center gap-2">
+                <Icon name="wifiOff" size={15} class="shrink-0" />
+                <span class="min-w-0">
+                  <span class="font-semibold">Lost contact with the manager</span> at{' '}
+                  <span class="font-mono text-xs">{managerAddress.replace(/^https?:\/\//, '')}</span>
+                  <Show when={lostSince()}>
+                    {(since) => (
+                      <>
+                        {' '}
+                        <RelativeTime value={new Date(since()).toISOString()} />
+                      </>
+                    )}
+                  </Show>
+                  . Retrying every few seconds — what is on screen may be stale.
+                </span>
+              </p>
+              <Button size="xs" variant="ghost" icon="refresh" class="shrink-0 text-inherit" onClick={() => void probeManagerLink()}>
+                Retry now
+              </Button>
+            </div>
+          </Show>
           <div class="sticky top-0 z-20 flex h-12 items-center gap-3 border-b border-line bg-canvas/85 px-4 backdrop-blur md:px-6">
             <button
               type="button"
@@ -767,7 +994,7 @@ const Layout = (props: RouteSectionProps) => {
             >
               <Icon name="search" size={13} />
               <span>Search…</span>
-              <kbd class="rounded border border-line bg-surface2 px-1 font-mono text-2xs">⌘K</kbd>
+              <Kbd>⌘K</Kbd>
             </button>
             <button
               type="button"
@@ -779,17 +1006,28 @@ const Layout = (props: RouteSectionProps) => {
             </button>
             <button
               type="button"
+              class="hidden rounded-md p-1.5 text-muted transition-colors hover:bg-surface2 hover:text-ink sm:inline-flex"
+              onClick={() => setShortcutsOpen((value) => !value)}
+              aria-label="Keyboard shortcuts"
+              title="Keyboard shortcuts (?)"
+            >
+              <Icon name="keyboard" size={16} />
+            </button>
+            <button
+              type="button"
               class="rounded-md p-1.5 text-muted transition-colors hover:bg-surface2 hover:text-ink"
-              onClick={() => setTheme((value) => (value === 'dark' ? 'light' : 'dark'))}
+              onClick={toggleTheme}
               aria-label={theme() === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'}
             >
               <Icon name={theme() === 'dark' ? 'sun' : 'moon'} size={16} />
             </button>
           </div>
+          <ShortcutsHelp open={shortcutsOpen()} onClose={() => setShortcutsOpen(false)} />
           <Show when={commandPaletteOpen()}>
             <div
               class="fixed inset-0 z-50 flex items-start justify-center bg-black/50 p-4 pt-[12vh] backdrop-blur-[2px]"
               data-command-palette
+              data-modal
               onClick={closeCommandPalette}
               onKeyDown={(event) => {
                 // Keep focus on the search input — the palette is keyboard-driven.
@@ -813,7 +1051,7 @@ const Layout = (props: RouteSectionProps) => {
                     value={commandPaletteQuery()}
                     onInput={(event) => setCommandPaletteQuery(event.currentTarget.value)}
                     onKeyDown={onCommandPaletteKeydown}
-                    placeholder="Jump to a page, job, node…"
+                    placeholder="Jump to a page, job, worker, or recent page…"
                     class="w-full border-none bg-transparent p-0 text-sm text-ink placeholder:text-faint focus:outline-none focus:ring-0"
                     role="combobox"
                     aria-expanded="true"
@@ -821,7 +1059,7 @@ const Layout = (props: RouteSectionProps) => {
                     aria-activedescendant={`command-palette-option-${commandPaletteSelected()}`}
                     aria-label="Search command palette"
                   />
-                  <kbd class="rounded border border-line bg-surface2 px-1.5 py-0.5 font-mono text-2xs text-faint">esc</kbd>
+                  <Kbd>esc</Kbd>
                 </div>
                 <div id="command-palette-listbox" role="listbox" aria-label="Destinations" class="max-h-[22rem] overflow-auto p-1.5 text-sm">
                   <Show
@@ -839,15 +1077,20 @@ const Layout = (props: RouteSectionProps) => {
                             aria-selected={isActive()}
                             tabindex={-1}
                             onMouseEnter={() => setCommandPaletteSelected(index())}
-                            onClick={() => executeCommand(entry.href)}
+                            onClick={() => executeCommand(entry)}
                             class={cx(
                               'flex w-full items-center justify-between gap-3 rounded-md px-3 py-2 text-left transition-colors',
                               isActive() ? 'bg-brass/10' : 'hover:bg-surface2',
                             )}
                           >
-                            <span class="min-w-0">
-                              <span class={cx('block truncate font-medium', isActive() ? 'text-ink' : 'text-ink')}>{entry.label}</span>
-                              <span class="block truncate text-xs text-faint">{entry.description}</span>
+                            <span class="flex min-w-0 items-center gap-2.5">
+                              <Show when={entry.icon}>
+                                <Icon name={entry.icon!} size={14} class={cx('shrink-0', isActive() ? 'text-brass' : 'text-faint')} />
+                              </Show>
+                              <span class="min-w-0">
+                                <span class="block truncate font-medium text-ink">{entry.label}</span>
+                                <span class="block truncate text-xs text-faint">{entry.description}</span>
+                              </span>
                             </span>
                             <span class={cx('shrink-0 text-2xs uppercase tracking-wide', isActive() ? 'text-brass' : 'text-faint')}>{entry.group}</span>
                           </button>
@@ -860,12 +1103,13 @@ const Layout = (props: RouteSectionProps) => {
                   <span><kbd class="font-mono">↑↓</kbd> navigate</span>
                   <span><kbd class="font-mono">↵</kbd> open</span>
                   <span><kbd class="font-mono">esc</kbd> close</span>
+                  <span class="ml-auto"><kbd class="font-mono">?</kbd> all shortcuts</span>
                 </div>
               </div>
             </div>
           </Show>
           <main class="flex-1 min-w-0 px-4 py-6 md:px-8">
-            <Show when={!isDetailRoute()}>
+            <Show when={!isDetailRoute() && !isUnknownRoute()}>
               <PageHeader title={pageMeta().title} subtitle={pageMeta().subtitle} />
             </Show>
             <ConnectionGate>
@@ -909,7 +1153,7 @@ const AppRoutes = () => {
       <Route path="/observability" component={Observability} />
       <Route path="/state-explorer" component={StateExplorer} />
       <Route path="/testing" component={TestingUtils} />
-      <Route path="*" component={Homepage} />
+      <Route path="*" component={NotFound} />
     </Route>
   )
 }

@@ -86,6 +86,19 @@ fn empty_schema() -> Value {
     json!({ "type": "object", "properties": {}, "additionalProperties": false })
 }
 
+fn job_list_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "status": {
+                "type": "string",
+                "description": "Only jobs with this exact status (case-insensitive), e.g. running, stopped, failed. Omit for all."
+            }
+        },
+        "additionalProperties": false
+    })
+}
+
 fn name_arg_schema() -> Value {
     json!({
         "type": "object",
@@ -107,8 +120,8 @@ fn tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "legion_job_list",
-            description: "List all jobs and their status.",
-            input_schema: empty_schema,
+            description: "List jobs and their status, optionally only those in one status. The reply's status_counts gives the per-status totals.",
+            input_schema: job_list_schema,
             mutates: false,
         },
         ToolDef {
@@ -902,8 +915,13 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
             grpc(client.plan_job(PlanJobRequest { parsed_jobspec })).await
         }
         "legion_job_list" => {
+            let status = opt_str_arg(&args, "status");
             let mut client = connect().await?;
-            grpc(client.list_jobs(ListJobsRequest::default())).await
+            grpc(client.list_jobs(ListJobsRequest {
+                status,
+                ..Default::default()
+            }))
+            .await
         }
         "legion_job_info" => {
             let name = str_arg(&args, "name")?;

@@ -87,6 +87,23 @@ What they measure:
 
     A change is only real if it exceeds that floor. Report both, and say which
     it is.
+  - `plan_under_fill` group: the cluster-fill axis. A 5,000-node fleet is
+    pre-filled with 0 / 10 / 40 allocations per node from other jobs (through
+    the store's allocation writer, so the fill is not itself a scheduling
+    measurement), then a six-placement job is planned against it as
+    `plan_only` (the planning phases alone, no state drift between
+    iterations) and as `plan_and_apply` (a fresh job per iteration). A cost
+    that is flat across the fill levels is a per-plan constant; one that
+    grows with them is proportional to how full the cluster is rather than
+    to the job being placed — the slope the AWS `dense_fleet` ladder
+    measured, which neither of the groups above can reproduce because both
+    start from an empty cluster. The `plan_and_apply` cells also print the
+    mean per-phase `PlanTimings` breakdown of every plan they measured, so a
+    run says where the time went at each fill level. Those cells include
+    two local commits per plan (the apply, plus — without the daemon's
+    drain task — the inline status projection) and swing more run to run
+    on a VM than the read-only cells do; read `plan_only` for planning
+    cost and the phase means for where apply time goes.
 - `eval_critical_path_bench`: end-to-end enqueue -> claim -> apply -> complete
   latency under 1/4/8 concurrent eval workers (write-lock contention).
 - `plan_contention`: N-way concurrent single-allocation submits against one

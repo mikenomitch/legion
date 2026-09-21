@@ -1,17 +1,18 @@
 import { A, useNavigate, useParams } from '@solidjs/router'
 import { AccessGate } from '../../components/AccessGate'
-import { For, Show, createMemo, createResource, createSignal, onCleanup, onMount } from 'solid-js'
-import { Badge, CodeBlock, ConfirmButton, EmptyState, MonoBadge, Note, PageHeader, SectionCard, Spinner, StatusBadge, TableShell, Tabs, linkClass, tableClass, tdClass, thClass, theadClass, trHoverClass } from '../../components/ui'
+import { For, Show, createMemo, createResource, createSignal } from 'solid-js'
+import { Badge, CodeBlock, ConfirmButton, EmptyState, MonoBadge, Note, PageHeader, RelativeTime, SectionCard, Spinner, StatusBadge, TableShell, Tabs, linkClass, tableClass, tdClass, thClass, theadClass, trHoverClass } from '../../components/ui'
 import DagVisualization from '../../components/DagVisualization'
+import ScalePanel from '../../components/ScalePanel'
 import { AllocationPorts, ServiceEndpointsTable, ServiceTags } from '../../components/ServiceEndpoints'
 import { GetLedgerReply, InstanceInfo } from '../../gen/legion_pb'
 import LogViewer from '../../components/LogViewer'
 import { managerClient } from '../../grpcClient'
 import { allows, jobScope } from '../../utils/acl'
-import { allocationHealthLabel, fetchAllocationRuntime, parseAllocNetwork } from '../../utils/allocations'
-import { formatDate, formatRelativeTime } from '../../utils/format'
+import { allocationHealthLabel, fetchAllocationRuntime, fetchTaskStatusByName, parseAllocNetwork } from '../../utils/allocations'
+import { formatDate, pluralize } from '../../utils/format'
 import { buildTaskInstancesByName, buildTaskInstancesFromStatuses, extractJobSpecData, topoSortTaskNames, type TaskInstanceSummary } from '../../utils/jobspec'
-import { POLL_INTERVAL_MS } from '../../utils/polling'
+import { INDEX_POLL_INTERVAL_MS, retainOnError, usePoll } from '../../utils/polling'
 
 // A storage handle is `{plugin}/{volume_id}`; plugin names never contain a
 // slash, so the split is unambiguous.
@@ -26,28 +27,33 @@ function JobDetailContent() {
   const [actionFailed, setActionFailed] = createSignal(false)
 
   // Keyed on the route param so navigating job→job (e.g. via the command
-  // palette) refetches instead of showing the previous job's data.
-  const [jobData] = createResource(jobName, async () => {
+  // palette) refetches instead of showing the previous job's data, and polled
+  // at the slow cadence (this is ~8 RPCs) so allocations, rollouts and the
+  // spec list follow the cluster without a reload.
+  const pageTick = usePoll(INDEX_POLL_INTERVAL_MS)
+  const [jobData, { refetch: refetchJob }] = createResource(
+    () => [jobName(), pageTick()] as const,
+    retainOnError(async ([name]: readonly [string, number]) => {
     const [jobInfo, ledger, rollouts, spec, specHistory, services, preemptions] = await Promise.all([
-      managerClient.getJobInfo({ name: jobName() }),
+      managerClient.getJobInfo({ name: name }),
       // node:read garnish (allocation placement); job-scoped tokens
       // still get the rest of the page.
       managerClient.getLedger({}).catch(() => new GetLedgerReply()),
-      managerClient.listRollouts({ jobId: jobName(), activeOnly: false, page: 1, pageSize: 200 }),
-      managerClient.getJobSpec({ name: jobName() }),
-      managerClient.listJobSpecHistory({ name: jobName() }),
+      managerClient.listRollouts({ jobId: name, activeOnly: false, page: 1, pageSize: 200 }),
+      managerClient.getJobSpec({ name: name }),
+      managerClient.listJobSpecHistory({ name: name }),
       managerClient.listServices({}),
       // Preemption history: what displaced this job's allocations, and when.
       // Best-effort — the event journal is bounded (~10k rows), so this is an
       // observability surface rather than an audit log, and a job whose
       // preemptions have aged out simply shows none.
       managerClient
-        .listEvents({ kind: 'allocation.preempted', jobId: jobName(), limit: 20 })
+        .listEvents({ kind: 'allocation.preempted', jobId: name, limit: 20 })
         .then((reply) => reply.events)
         .catch(() => []),
     ])
 
-    const jobId = jobInfo.job?.id ?? jobName()
+    const jobId = jobInfo.job?.id ?? name
     const allocations = ledger.nodes.flatMap((node) =>
       node.allocations.filter((allocation) => allocation.jobId === jobId),
     )
@@ -71,6 +77,7 @@ function JobDetailContent() {
     ).flat()
 
     return {
+      name,
       job: jobInfo.job,
       template: jobInfo.template,
       allocations,
@@ -84,43 +91,18 @@ function JobDetailContent() {
       endpoints,
       preemptions,
     }
-  })
+  }, ([name]) => name),
+  )
 
   // Live per-task status, polled from the manager state store. The ledger only
   // exposes task_config_id (not names) and initial deploys have no rollout, so
   // we join task_config -> allocation -> task_status to get authoritative
   // running/success/failed status per task. Falls back gracefully on error.
-  const [statusTick, setStatusTick] = createSignal(0)
-  onMount(() => {
-    const timer = setInterval(() => setStatusTick((value) => value + 1), 3000)
-    onCleanup(() => clearInterval(timer))
-  })
+  const statusTick = usePoll(3000)
 
   const [liveRuntime] = createResource(
     () => [jobName(), statusTick()] as const,
-    async ([name]) => {
-      try {
-        const escaped = name.replace(/'/g, "''")
-        const sql =
-          'SELECT tc.name AS task_name, COALESCE(ts.status, a.status) AS status ' +
-          'FROM allocation a JOIN task_config tc ON tc.id = a.task_config_id ' +
-          'LEFT JOIN task_status ts ON ts.task_config_id = a.task_config_id ' +
-          `WHERE tc.job_id = '${escaped}'`
-        const response = await managerClient.queryStateStore({ sql })
-        const statusByName = new Map<string, string>()
-        for (const row of response.rows) {
-          try {
-            const parsed = JSON.parse(row.json) as { task_name?: string; status?: string }
-            if (parsed.task_name) statusByName.set(parsed.task_name, parsed.status ?? '')
-          } catch {
-            // ignore malformed rows
-          }
-        }
-        return buildTaskInstancesFromStatuses(statusByName)
-      } catch {
-        return new Map<string, TaskInstanceSummary>()
-      }
-    },
+    async ([name]) => buildTaskInstancesFromStatuses(await fetchTaskStatusByName(name)),
   )
 
   // Latest health snapshot per allocation, refreshed with the status poll.
@@ -143,16 +125,16 @@ function JobDetailContent() {
   )
 
   const statefulTasks = createMemo(() => (jobData()?.taskSpec?.tasks ?? []).filter((task) => task.stateful))
+  // Keyed tasks have no count, so the scale panel shows them read-only.
+  const keyedTaskNames = createMemo(
+    () => new Set(statefulTasks().filter((task) => task.stateful?.mode === 'keyed').map((task) => task.name)),
+  )
 
   // Stateful instances for this job, polled at the standard interval while the
   // page is mounted (scoped to this route; the interval is torn down on
   // navigation). The fetcher returns the previous array when nothing changed
   // so polling does not cause needless table rerenders.
-  const [instanceTick, setInstanceTick] = createSignal(0)
-  onMount(() => {
-    const timer = setInterval(() => setInstanceTick((value) => value + 1), POLL_INTERVAL_MS)
-    onCleanup(() => clearInterval(timer))
-  })
+  const instanceTick = usePoll()
 
   let lastInstances: InstanceInfo[] = []
   const [instances] = createResource(
@@ -193,6 +175,24 @@ function JobDetailContent() {
     return tasks.some((task) => task.dependsOn.some((dependency) => names.has(dependency.task)))
   })
 
+  const mayWrite = () => allows('job', 'write', jobScope(jobName(), jobData()?.template?.name))
+  // Stop is offered while there is something to stop; destroy needs a
+  // stopped job first, which is why both live here. Note that `done` is the
+  // manager's word for "submission accepted and scheduled", not "finished".
+  const isStoppable = () => !['stopped', 'failed', 'destroyed'].includes((jobData()?.job?.status ?? '').toLowerCase())
+
+  const stopJob = async () => {
+    try {
+      const response = await managerClient.stopJob({ name: jobName() })
+      setActionFailed(false)
+      setActionMessage(response.message || 'Stop requested — allocations are being torn down.')
+      void refetchJob()
+    } catch (error) {
+      setActionFailed(true)
+      setActionMessage(`Stop failed: ${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
+
   const destroyJob = async () => {
     try {
       const response = await managerClient.destroyJob({ name: jobName() })
@@ -207,15 +207,30 @@ function JobDetailContent() {
   }
 
   return (
-    <Show when={!jobData.loading} fallback={<div class="py-6"><Spinner label="Loading job…" /></div>}>
-      <Show when={!jobData.error && jobData()} fallback={<Note tone="danger">Failed to load job.</Note>}>
+    <Show when={!jobData.error} fallback={<Note tone="danger">Failed to load job {jobName()}: {String(jobData.error?.message ?? jobData.error)}</Note>}>
+      <Show when={jobData()?.name === jobName()} fallback={<div class="py-6"><Spinner label="Loading job…" /></div>}>
         <div>
           <PageHeader
             eyebrow="Job"
             title={jobData()!.job?.name || jobData()!.job?.id}
+            subtitle={
+              <>
+                Created <RelativeTime value={jobData()!.job?.createdAt} />
+                <Show when={jobData()!.job && jobData()!.job!.updatedAt !== jobData()!.job!.createdAt}>
+                  {' · '}updated <RelativeTime value={jobData()!.job?.updatedAt} />
+                </Show>
+              </>
+            }
             badges={
               <>
-                <StatusBadge status={jobData()!.job?.status || 'unknown'} />
+                <StatusBadge
+                  status={jobData()!.job?.status || 'unknown'}
+                  title={
+                    (jobData()!.job?.status ?? '').toLowerCase() === 'done'
+                      ? 'Submitted and scheduled. "done" is the manager\'s word for an accepted job, not a finished one — see the task cards for what is running.'
+                      : undefined
+                  }
+                />
                 {/* The priority band decides what this job can displace and
                     what can displace it, so it belongs beside the status
                     rather than buried in the spec. */}
@@ -229,7 +244,7 @@ function JobDetailContent() {
                     </MonoBadge>
                   )}
                 </Show>
-                <Badge tone="neutral">{jobData()!.allocations.length} allocation{jobData()!.allocations.length === 1 ? '' : 's'}</Badge>
+                <Badge tone="neutral">{pluralize(jobData()!.allocations.length, 'allocation')}</Badge>
                 <Show when={jobData()!.template}>
                   {(template) => (
                     <A href={`/templates/${encodeURIComponent(template().name)}`}>
@@ -242,11 +257,22 @@ function JobDetailContent() {
               </>
             }
             actions={
-              <ConfirmButton
-                label="Delete job"
-                onConfirm={() => void destroyJob()}
-                disabled={!allows('job', 'write', jobScope(jobName(), jobData()!.template?.name))}
-              />
+              <>
+                <Show when={isStoppable()}>
+                  <ConfirmButton
+                    label="Stop job"
+                    confirmLabel="Stop every allocation?"
+                    icon="square"
+                    onConfirm={() => void stopJob()}
+                    disabled={!mayWrite()}
+                  />
+                </Show>
+                <ConfirmButton
+                  label="Delete job"
+                  onConfirm={() => void destroyJob()}
+                  disabled={!mayWrite()}
+                />
+              </>
             }
           />
           <Show when={actionMessage()}>
@@ -340,6 +366,8 @@ function JobDetailContent() {
                   </div>
                 </Show>
               </SectionCard>
+
+              <ScalePanel jobName={jobName()} tick={statusTick} keyedTasks={keyedTaskNames()} />
 
               {/* Where this job is reachable. Endpoints are derived from the
                   allocations plus health, so this is the honest answer to
@@ -548,7 +576,7 @@ function JobDetailContent() {
                                   <A class="hover:text-brass-strong" href={`/jobs/${encodeURIComponent(jobName())}/specs/${encodeURIComponent(rollout.toJobConfigId)}`}>{rollout.toJobConfigId}</A>
                                 </span>
                               </td>
-                              <td class={tdClass + ' whitespace-nowrap text-right text-xs text-faint'}>{formatRelativeTime(rollout.updatedAt)}</td>
+                              <td class={tdClass + ' whitespace-nowrap text-right text-xs text-faint'}><RelativeTime value={rollout.updatedAt} /></td>
                             </tr>
                           )}
                         </For>
@@ -594,8 +622,8 @@ function JobDetailContent() {
                             })()
                             return (
                               <tr class={trHoverClass}>
-                                <td class={tdClass + ' whitespace-nowrap text-xs text-faint'} title={formatDate(event.createdAt)}>
-                                  {formatRelativeTime(event.createdAt)}
+                                <td class={tdClass + ' whitespace-nowrap text-xs text-faint'}>
+                                  <RelativeTime value={event.createdAt} />
                                 </td>
                                 <td class={tdClass}>
                                   <Show when={meta.preemptorJob} fallback={<span class="text-faint">—</span>}>

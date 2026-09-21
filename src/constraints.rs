@@ -121,6 +121,42 @@ impl PermitSet {
     }
 
     pub fn is_permitted(&self, node: &Node) -> bool {
+        // A node's restrictions are its pool plus whatever its `restriction`
+        // config block declares. Almost no node declares one, and for those
+        // the restriction map would hold exactly one entry — so build no map
+        // at all: answer both checks (every rule holds against the
+        // restrictions; every restriction is matched by some rule) straight
+        // from the pool string. This runs once per node per task on the
+        // candidate scan, so a map allocation here was a measurable share of
+        // candidate construction at fleet scale. The general path below is
+        // unchanged and gives the same answer whenever it is taken.
+        let declared = node
+            .config_attrs
+            .as_object()
+            .and_then(|attrs| attrs.get("restriction"))
+            .and_then(Value::as_object)
+            .filter(|block| !block.is_empty());
+        if declared.is_none() {
+            let holds = self.rules.iter().all(|rule| {
+                if rule.key == "pool" {
+                    match rule.operator {
+                        Operator::IsSet => true,
+                        Operator::IsNotSet => false,
+                        _ => rule.matches_pool(&node.pool),
+                    }
+                } else {
+                    // The only attribute is `pool`, so every other key is
+                    // unset: `is_not_set` holds, nothing else can.
+                    rule.operator == Operator::IsNotSet
+                }
+            });
+            return holds
+                && self
+                    .rules
+                    .iter()
+                    .any(|rule| rule.key == "pool" && rule.matches_pool(&node.pool));
+        }
+
         let restrictions = node_restrictions(node);
 
         if !self
@@ -316,21 +352,7 @@ fn parse_operator(value: &Value) -> R<Operator> {
 
 impl Rule {
     fn matches(&self, node: &Node, distinct: Option<&DistinctTracker>) -> bool {
-        match self.operator {
-            Operator::IsSet => {
-                return node_attr(node, &self.key).is_some_and(|value| !value.is_null())
-            }
-            Operator::IsNotSet => {
-                return node_attr(node, &self.key).is_none_or(|value| value.is_null())
-            }
-            _ => {}
-        }
-
-        let Some(attr) = node_attr(node, &self.key) else {
-            return false;
-        };
-
-        self.matches_value(attr, distinct)
+        self.matches_attr(node_attr(node, &self.key), distinct)
     }
 
     fn matches_attrs(
@@ -338,17 +360,37 @@ impl Rule {
         attrs: &serde_json::Map<String, Value>,
         distinct: Option<&DistinctTracker>,
     ) -> bool {
+        self.matches_attr(attrs.get(&self.key), distinct)
+    }
+
+    /// The rule against an already-resolved attribute (`None` when the
+    /// key is absent): `is_set`/`is_not_set` answer on presence, everything
+    /// else needs a value. The one body behind both lookups above.
+    fn matches_attr(&self, attr: Option<&Value>, distinct: Option<&DistinctTracker>) -> bool {
         match self.operator {
-            Operator::IsSet => return attrs.get(&self.key).is_some_and(|value| !value.is_null()),
-            Operator::IsNotSet => return attrs.get(&self.key).is_none_or(|value| value.is_null()),
+            Operator::IsSet => return attr.is_some_and(|value| !value.is_null()),
+            Operator::IsNotSet => return attr.is_none_or(|value| value.is_null()),
             _ => {}
         }
 
-        let Some(attr) = attrs.get(&self.key) else {
+        let Some(attr) = attr else {
             return false;
         };
 
         self.matches_value(attr, distinct)
+    }
+
+    /// [`Self::matches_value`] against a node's pool without materializing
+    /// the pool as a JSON value: the `=`/`!=` every permit carries compare
+    /// strings directly (a string value equals `Value::String` exactly when
+    /// the strings are equal), and the remaining operators — rare in a
+    /// permit — take the general matcher on a temporary value.
+    fn matches_pool(&self, pool: &str) -> bool {
+        match self.operator {
+            Operator::Eq => self.value.as_ref().and_then(Value::as_str) == Some(pool),
+            Operator::NotEq => self.value.as_ref().and_then(Value::as_str) != Some(pool),
+            _ => self.matches_value(&Value::String(pool.to_string()), None),
+        }
     }
 
     fn matches_value(&self, attr: &Value, distinct: Option<&DistinctTracker>) -> bool {
@@ -563,6 +605,54 @@ mod tests {
 
         assert!(!constraints.is_satisfied(&node, Some(&tracker)));
 
+        Ok(())
+    }
+
+    /// The allocation-free permit path (a node with no `restriction`
+    /// block) must answer exactly as the general path does. The oracle is
+    /// the general path itself: a node whose restriction block re-declares
+    /// its own pool builds the same one-entry restriction map the
+    /// block-less node stands for, so the two must always agree.
+    #[test]
+    fn permit_fast_path_agrees_with_the_restriction_map_path() -> R<()> {
+        let permits = [
+            json!({}),
+            json!({ "pool": "default" }),
+            json!({ "pool": "gpu" }),
+            json!([{ "key": "pool", "operator": "!=", "value": "default" }]),
+            json!([{ "key": "pool", "operator": "matches", "value": "^gp" }]),
+            json!([{ "key": "pool", "operator": "is_set" }]),
+            json!([{ "key": "pool", "operator": "is_not_set" }]),
+            json!([{ "key": "team", "operator": "is_not_set" }]),
+            json!([{ "key": "team", "operator": "is_set" }]),
+            json!({ "team": "a" }),
+            json!([{ "key": "pool", "operator": ">", "value": 1 }]),
+            json!({ "pool": 7 }),
+        ];
+        let pools = ["default", "gpu", "batch"];
+        for permit in &permits {
+            let permit_set = PermitSet::new(permit)?;
+            for pool in pools {
+                let mut bare = make_node(json!({ "tier": "web" }));
+                bare.pool = pool.into();
+                let mut oracle =
+                    make_node(json!({ "tier": "web", "restriction": { "pool": pool } }));
+                oracle.pool = pool.into();
+                let mut empty_block = make_node(json!({ "restriction": {} }));
+                empty_block.pool = pool.into();
+                let expected = permit_set.is_permitted(&oracle);
+                assert_eq!(
+                    permit_set.is_permitted(&bare),
+                    expected,
+                    "permit {permit} on pool {pool}"
+                );
+                assert_eq!(
+                    permit_set.is_permitted(&empty_block),
+                    expected,
+                    "permit {permit} on pool {pool} with an empty block"
+                );
+            }
+        }
         Ok(())
     }
 

@@ -452,6 +452,19 @@ reference, so a plan's snapshot costs refcount bumps rather than a
 fleet-sized filter/sort/copy; any node mutation invalidates the cached
 list and the next plan rebuilds it.
 
+The read model also keeps a per-job index of allocations by node,
+maintained by the same writes that maintain the per-node allocation lists.
+A plan takes its own job's entry with the snapshot and derives everything
+it needs about its existing allocations from it — the rows a fresh plan
+replaces (and so does not count against capacity), the counts a reschedule
+still has to place, group pinning, `distinct` seeding, and the scoring
+cache's per-node task presence. Nothing in a plan walks every allocation
+in the cluster, so planning cost does not grow with how full the cluster
+is, only with the job being placed. After a plan commits, its placed and
+evicted rows are published into the read model as a delta (one indexed
+read per placed row) on every backend, the same projection the raft apply
+path runs from a committed changeset.
+
 Per task, the candidate set is then built one of two ways:
 
 - **Scan** (the baseline): every available node is tested against the
@@ -490,6 +503,14 @@ Selection policy:
 - optional score jitter on reschedule mode for less deterministic stickiness
 
 Resource fitting is enforced before node can be selected.
+
+Constraints, permit, and volume-driver support are applied once, when the
+task's candidate list is built; the per-placement passes (eligibility,
+load bounds, scoring) only re-test what changes between placements —
+remaining capacity and `distinct` coverage — and index their per-node
+state by candidate position rather than by node id. Per-placement cost is
+therefore a small constant per candidate; on large fleets `score_sample`
+(below) bounds the candidate count itself.
 
 ### Bounded candidate scoring (`score_sample`)
 

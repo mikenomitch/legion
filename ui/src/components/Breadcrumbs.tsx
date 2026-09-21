@@ -13,6 +13,8 @@ const sectionLabels: Record<string, string> = {
   jobs: 'Jobs',
   templates: 'Templates',
   rollouts: 'Rollouts',
+  services: 'Services',
+  volumes: 'Volumes',
   raft: 'Raft',
   events: 'Events',
   kv: 'KV Store',
@@ -21,7 +23,13 @@ const sectionLabels: Record<string, string> = {
   'state-explorer': 'State Explorer',
   observability: 'Observability',
   testing: 'Testing',
+  oidc: 'Single sign-on',
+  deployments: 'Rollouts',
 }
+
+/** True when the first path segment is a section the app has a page for. */
+export const isKnownSection = (segment: string | undefined): boolean =>
+  segment === undefined || Object.prototype.hasOwnProperty.call(sectionLabels, segment)
 
 const decodeSegment = (value: string) => {
   try {
@@ -48,6 +56,8 @@ const labelForSegment = (segments: readonly string[], index: number): string => 
   if (previous === 'nodes') return decoded
   if (previous === 'manager') return decoded
   if (previous === 'rollouts') return decoded
+  if (previous === 'services') return decoded
+  if (previous === 'volumes') return decoded
   if (previous === 'specs') return decoded
   if (previous === 'tasks') return decoded
 
@@ -64,6 +74,7 @@ export const buildCrumbs = (pathname: string): Breadcrumb[] => {
   if (normalized === '/') return crumbs
 
   const segments = normalized.split('/').filter(Boolean)
+  if (!isKnownSection(segments[0])) return [...crumbs, { label: 'Not found' }]
 
   let href = ''
   segments.forEach((segment, index) => {

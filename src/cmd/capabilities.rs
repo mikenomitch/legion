@@ -42,9 +42,9 @@ pub fn catalog() -> Vec<Capability> {
         // --- Jobs: read ---
         Capability {
             name: "job.list",
-            cli: "legion job list",
+            cli: "legion job list [--status STATUS]",
             grpc: Some("Manager/ListJobs"),
-            summary: "List all jobs and their status.",
+            summary: "List all jobs and their status, optionally filtered to one status.",
             mutates: false,
             read_only_safe: true,
         },

@@ -1,9 +1,11 @@
 import { formatDistanceToNow } from 'date-fns'
 
-const toDate = (timestamp?: string | bigint): Date | undefined => {
+export const toDate = (timestamp?: string | bigint | number): Date | undefined => {
   if (timestamp === undefined || timestamp === null) return undefined
-  if (typeof timestamp === 'bigint') {
-    const millis = Number(timestamp) * 1000
+  if (typeof timestamp === 'bigint' || typeof timestamp === 'number') {
+    const numeric = Number(timestamp)
+    if (!Number.isFinite(numeric) || numeric === 0) return undefined
+    const millis = numeric * 1000
     const date = new Date(millis)
     return Number.isNaN(date.getTime()) ? undefined : date
   }
@@ -24,7 +26,7 @@ const toDate = (timestamp?: string | bigint): Date | undefined => {
   return Number.isNaN(parsed.getTime()) ? undefined : parsed
 }
 
-export const formatDate = (timestamp?: string | bigint): string => {
+export const formatDate = (timestamp?: string | bigint | number): string => {
   const parsed = toDate(timestamp)
   if (!parsed) return '—'
   return new Intl.DateTimeFormat('en', {
@@ -33,7 +35,18 @@ export const formatDate = (timestamp?: string | bigint): string => {
   }).format(parsed)
 }
 
-export const formatRelativeTime = (timestamp?: string | bigint): string => {
+// Absolute time with seconds, for tooltips on relative labels: the relative
+// text answers "how long ago", the tooltip answers "when exactly".
+export const formatDateTime = (timestamp?: string | bigint | number): string => {
+  const parsed = toDate(timestamp)
+  if (!parsed) return '—'
+  return new Intl.DateTimeFormat('en', {
+    dateStyle: 'medium',
+    timeStyle: 'medium',
+  }).format(parsed)
+}
+
+export const formatRelativeTime = (timestamp?: string | bigint | number): string => {
   const parsed = toDate(timestamp)
   if (!parsed) return '—'
   return formatDistanceToNow(parsed, { addSuffix: true })
@@ -79,3 +92,7 @@ export const asDisplay = (value?: string | bigint): string => {
   if (typeof value === 'bigint') return value.toString()
   return value === '' ? '—' : value
 }
+
+// "1 allocation" / "3 allocations": the singular/plural dance, once.
+export const pluralize = (count: number, singular: string, plural = `${singular}s`): string =>
+  `${count} ${count === 1 ? singular : plural}`

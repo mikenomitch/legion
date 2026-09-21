@@ -33,7 +33,9 @@ $ legion job scale multi --task api --count 3   # disambiguate multi-task jobs
 - `--json` / `-j` emits the standard envelope; `--idempotency-key` makes the
   RPC retry-safe (`deduplicated = true` on replay).
 - Everything is also available over gRPC (`ScaleTask`) and MCP
-  (`legion_job_scale`, write-gated).
+  (`legion_job_scale`, write-gated), and the job page in the UI has a
+  **Scale** card with the same per-task view and Scale / Reset controls
+  ([UI architecture](ui-architecture.md)).
 
 `legion job scale <name>` (no `--count`) shows the effective picture per
 task: `web/default/web: count 6 (spec 2, scaled by operator)`.

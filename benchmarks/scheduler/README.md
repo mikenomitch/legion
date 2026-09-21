@@ -564,3 +564,117 @@ outside the timed section, and the eval bench builds its store in
 `iter_batched` setup. Absolute eval numbers are therefore not
 comparable to earlier records (they no longer include store setup);
 within-run comparisons are unaffected.
+
+## Plan-path constants and the cluster-fill slope — 2026-09-02
+
+**Host: 4-vCPU Linux VM (Claude Code remote env), `bench` profile
+(release), local_disk, runs serialized on an otherwise idle box.** Base is
+`c3291c9` (the commit that adds the `plan_under_fill` group, on top of the
+#196 merge); the "after" column is this change set. Every cell is
+Criterion's median against the saved base baseline; `scheduler_speed`
+cells ran with `--sample-size 20` on both sides (their 10k-node setups
+insert 10,000 nodes per iteration). The `plan_and_apply` cells are
+fsync-bound on this VM and swing ±20% run to run — read `plan_only` for
+planning cost.
+
+The pass had two targets, both found by adding the fill axis to the
+micro benchmarks: costs that scaled with **cluster fill** and costs that
+scaled with **fleet size per placement**, neither of which had anything to
+do with the job being placed.
+
+- **Fill.** `plan_under_fill/plan_only` went 2.55 → 7.07 ms from an empty
+  5,000-node fleet to 40 allocations per node (200k allocations) on the
+  base, planning the same six placements. Five to six per-plan walks
+  over every allocation in the cluster (the Fresh drop, two count
+  passes, group pinning, the `distinct` seed, and the scoring cache's
+  per-candidate walk) each filtered for the planned job. Fusing them into
+  one walk took the slope to ~2.1 ms per 200k (round 1, below); a per-job
+  allocation index in the read model — maintained by the same writes as
+  the per-node lists — takes it out entirely, and the post-commit refresh
+  now publishes a plan's rows as the same delta the raft apply path
+  projects instead of reloading every touched node's list.
+- **Fleet per placement.** `eligible_nodes` re-ran the task's permit over
+  every candidate on every placement, allocating a restriction map per
+  candidate each time, for a question the candidate list had already
+  answered; the scoring cache hashed each node's id string three times
+  per candidate per placement. The permit re-check is gone (the fast
+  `is_permitted` path that replaced the map allocation also speeds the
+  scan that builds candidate lists), and the cache indexes by candidate
+  address.
+- **Statement parsing.** The per-node statements inside the plan-apply
+  commit (epoch bump, usage fingerprint and cache read, usage upsert),
+  the per-plan submission insert/select/update and task-state load, the
+  eval claim/complete/count statements, and the scheduler's small
+  per-plan reads all re-parsed their SQL on every call. All go through
+  `prepare_cached` now, and a scope-epoch read no longer seeds a row
+  first.
+
+| Cell | base (median) | after (median) | change |
+| --- | --- | --- | --- |
+| `candidate_construction/indexes_off/nodes_1000` | 2.8519 ms | 2.3642 ms | -17.101% |
+| `candidate_construction/indexes_on/nodes_1000` | 2.9096 ms | 2.3249 ms | -20.095% |
+| `candidate_construction/indexes_off/nodes_5000` | 15.386 ms | 11.971 ms | -22.200% |
+| `candidate_construction/indexes_on/nodes_5000` | 9.3330 ms | 8.1300 ms | -12.890% |
+| `candidate_construction/indexes_off/nodes_10000` | 31.575 ms | 23.416 ms | -25.839% |
+| `candidate_construction/indexes_on/nodes_10000` | 15.965 ms | 14.104 ms | -11.657% |
+| `plan_under_fill/plan_only/fill_0` | 2.5532 ms | 1.9633 ms | -26.114% |
+| `plan_under_fill/plan_and_apply/fill_0` | 15.050 ms | 3.9539 ms | -66.976% |
+| `plan_under_fill/plan_only/fill_10` | 4.1905 ms | 2.9454 ms | -29.700% |
+| `plan_under_fill/plan_and_apply/fill_10` | 14.572 ms | 4.5034 ms | -63.303% |
+| `plan_under_fill/plan_only/fill_40` | 7.0677 ms | 2.8559 ms | -59.683% |
+| `plan_under_fill/plan_and_apply/fill_40` | 16.139 ms | 4.7164 ms | -67.799% |
+| `scheduler_speed/bin_pack/nodes_1000_allocs_100` | 21.492 ms | 16.611 ms | -22.710% |
+| `scheduler_speed/bin_pack/nodes_1000_allocs_1000` | 254.19 ms | 106.05 ms | -58.279% |
+| `scheduler_speed/bin_pack/nodes_10000_allocs_100` | 100.70 ms | 86.142 ms | -14.458% |
+| `scheduler_speed/bin_pack/nodes_10000_allocs_1000` | 365.04 ms | 185.54 ms | -49.173% |
+| `eval_claim_apply_complete_latency/workers_1` | 27.703 ms | 20.335 ms | -26.597% |
+| `eval_claim_apply_complete_latency/workers_4` | 248.36 ms | 174.50 ms | -29.738% |
+| `eval_claim_apply_complete_latency/workers_8` | 493.22 ms | 357.81 ms | -27.453% |
+
+Readings:
+
+- **The fill slope is gone.** `plan_only` reads 1.96 / 2.95 / 2.86 ms
+  at 0 / 10 / 40 allocations per node: flat between 10 and 40, where the
+  base grew 4.19 → 7.07 ms. The step between 0 and 10 is not fill but
+  fleet — at fill 0 no node has an allocation list at all, so the
+  snapshot's per-node map clone and the scoring cache's per-candidate
+  lookups against it cost nothing; from the first allocation per node
+  onward they cost O(fleet), and then stay there (the phase means below
+  show `capacity` 371 → 715 → 763 µs). Round 1 (walk fusion only, no
+  index) still read 1.94 / 2.97 / 4.02 ms — the one remaining walk —
+  which is what motivated the index.
+- **Per-placement cost dropped by the map allocation.** The
+  1,000-allocation `scheduler_speed` cells halved (10 jobs of 100
+  placements each: ~100k redundant permit checks per plan on the base);
+  `candidate_construction` — one to two placements per task — gained
+  12-26%, mostly from the allocation-free `is_permitted` on the scan
+  (5k-10k nodes × 12 tasks of permit checks per plan).
+- **The eval critical path dropped 27-30%** at 1/4/8 workers from the
+  statement cache alone: that bench drives the store API with
+  empty-placement plans, so nothing else in this change set is on its
+  path.
+- **`plan_and_apply` dropped ~3.8x at every fill level**, and the
+  attribution is by elimination: round 1 of this change set (everything
+  except the delta publish and the job index) left the cell where the
+  base was (15.5 ms at fill 0, within its 12-17 ms spread); round 2
+  took it to 3.95 ms (tight, 3.6-4.0 ms), and of the round-2 changes
+  only the delta publish is on the apply path. So the post-commit
+  reload — one full per-node allocation reload plus reprojection per
+  touched node, even on an empty fleet — was the bulk of a local
+  plan's apply cost, ahead of the commit itself; the after-phase means
+  below put `apply` at ~1.4 ms including the commit. The base's
+  variance (12-17 ms) went with it. The printed phase means are the
+  reading for where the remaining apply time goes:
+
+  Mean microseconds per phase over every measured plan (after):
+
+| fill | plans | nodes | versions | tasks | capacity | build | apply | total |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 0 | 1725 | 89 | 10 | 50 | 371 | 1747 | 1372 | 3710 |
+| 10 | 1387 | 91 | 13 | 52 | 715 | 1993 | 1346 | 4320 |
+| 40 | 1387 | 85 | 13 | 54 | 763 | 2025 | 1441 | 4519 |
+
+**Not measured here:** the AWS ladder. The 5,000-node `dense_fleet`
+cells that first showed the fill degradation are the real number and
+have not been re-run; `plan_under_fill` is the local stand-in and the
+regression test for this change set.

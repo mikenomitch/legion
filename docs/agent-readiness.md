@@ -50,7 +50,7 @@ Even with `--allow-write`, `legion_state_query` is forced to read-only.
 | Tool | Mutates | Purpose |
 | --- | --- | --- |
 | `legion_capabilities` | no | List the operation catalog. |
-| `legion_job_list` | no | List jobs. |
+| `legion_job_list` | no | List jobs, optionally only those in one `status`; the reply's `status_counts` gives per-status totals. |
 | `legion_job_info` | no | Inspect one job. |
 | `legion_job_spec` | no | Fetch a job's source submissions. |
 | `legion_job_schema` | no | JSON Schema for jobspecs + task runtimes. |
