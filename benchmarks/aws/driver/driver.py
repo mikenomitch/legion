@@ -54,6 +54,7 @@ A run directory contains:
 """
 
 import argparse
+import re
 import concurrent.futures
 import json
 import os
@@ -62,6 +63,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.request
 
 
 # Default parallelism per submission path. They are different numbers because
@@ -109,6 +111,46 @@ def percentile(sorted_values, fraction):
         return 0.0
     idx = round((len(sorted_values) - 1) * fraction)
     return float(sorted_values[idx])
+
+
+def submission_rate_series(submits, bucket_secs=60.0):
+    """Jobs submitted per bucket from the first submit, in order.
+
+    Phase 5 saw the CLI loop's rate sag from 89 to 17 jobs/sec across a
+    day and nobody noticed until the archives were re-read, because
+    `submission.rate_per_sec` is one average over the whole cell. A series
+    shows a sag as a slope. Buckets with no submits are kept as zeros so the
+    series is a timeline, not a histogram of busy minutes.
+    """
+    if not submits or bucket_secs <= 0:
+        return []
+    stamps = sorted(submits.values())
+    first = stamps[0]
+    width_ms = bucket_secs * 1000.0
+    buckets = int((stamps[-1] - first) // width_ms) + 1
+    series = [0] * buckets
+    for stamp in stamps:
+        series[int((stamp - first) // width_ms)] += 1
+    return series
+
+
+def parse_prometheus_gauge(text, name):
+    """Sum of every sample of `name` in Prometheus text exposition, or None
+    when the family is absent. Labelled samples are summed; `name{...}` and
+    bare `name` both match, `name_total` and `name_created` do not."""
+    total = None
+    for line in text.splitlines():
+        if not line or line.startswith("#"):
+            continue
+        match = re.match(r"^([A-Za-z_:][A-Za-z0-9_:]*)(\{[^}]*\})?\s+(\S+)", line)
+        if not match or match.group(1) != name:
+            continue
+        try:
+            value = float(match.group(3))
+        except ValueError:
+            continue
+        total = value if total is None else total + value
+    return total
 
 
 def compute_metrics(submits, events, expected_total, warmup_secs=0.0, kill_time_ms=None):
@@ -218,6 +260,10 @@ def compute_metrics(submits, events, expected_total, warmup_secs=0.0, kill_time_
             # True means throughput_per_sec is a floor for the system under
             # test and an accurate measure of nothing but this driver.
             "driver_bound": driver_bound,
+            # Jobs submitted per minute from the first submit. A flat series
+            # is a healthy driver; a falling one is the phase-5 sag (89 ->
+            # 17 jobs/sec over a day) that a single average hides.
+            "per_minute": submission_rate_series(submits),
         }
         if driver_bound:
             print(
@@ -496,6 +542,33 @@ class LegionAdapter:
     def watch_alive(self):
         return self._follower is not None and self._follower.poll() is None
 
+    def metrics_url(self):
+        """The manager's Prometheus endpoint: `server.port + 2` by convention
+        (docs/metrics.md), unless the run named one."""
+        if getattr(self, "_metrics_url", None):
+            return self._metrics_url
+        from urllib.parse import urlsplit, urlunsplit
+
+        parts = urlsplit(self.manager_addr)
+        port = (parts.port or 4747) + 2
+        netloc = f"{parts.hostname}:{port}"
+        return urlunsplit((parts.scheme or "http", netloc, "/metrics", "", ""))
+
+    def snapshot_counters(self, timeout=5.0):
+        """The manager's own view of live allocations, for the counting
+        cross-check. None when the endpoint is unreachable — the check is
+        advisory and must never fail a cell on its own."""
+        try:
+            with urllib.request.urlopen(self.metrics_url(), timeout=timeout) as response:
+                text = response.read().decode("utf-8", "replace")
+        except Exception as err:  # noqa: BLE001 — advisory path
+            return {"error": f"{type(err).__name__}: {err}", "url": self.metrics_url()}
+        return {
+            "url": self.metrics_url(),
+            "allocations": parse_prometheus_gauge(text, "legion_allocations"),
+            "plan_apply_applied": parse_prometheus_gauge(text, "legion_plan_apply_total"),
+        }
+
     def stop_watch(self):
         if self._follower:
             self._follower.terminate()
@@ -709,7 +782,20 @@ def cmd_run(args):
 
     recorder = RunRecorder(args.out)
     adapter = make_adapter(args)
+    if getattr(args, "metrics_url", None) and hasattr(adapter, "metrics_url"):
+        adapter._metrics_url = args.metrics_url
     adapter.start_watch(recorder)
+
+    # The follower counts placements by parsing one NDJSON event stream on
+    # one Python thread. It has kept up so far because `allocation.placed`
+    # is coalesced per plan apply, but at native-submitter rates it is the
+    # next plausible floor — and a follower that silently drops events
+    # reports a slower scheduler, not a broken driver. So the manager's own
+    # allocation gauge is sampled before and after, and the delta is
+    # compared with the follower's count at the end.
+    counters_before = (
+        adapter.snapshot_counters() if hasattr(adapter, "snapshot_counters") else None
+    )
 
     print(
         f"submitting {len(manifest['jobs'])} jobs "
@@ -880,8 +966,59 @@ def cmd_run(args):
     # cell is comparable to another Legion cell and to nothing else. Recorded
     # per cell so an archive can be checked rather than trusted.
     metrics["submitter"] = submitter
+    if counters_before is not None:
+        metrics["cross_check"] = cross_check_counts(
+            counters_before, adapter.snapshot_counters, recorder.placed_total()
+        )
+        if metrics["cross_check"].get("agree") is False:
+            print(
+                "WARNING: COUNTING DISAGREEMENT. The event follower saw "
+                f"{metrics['cross_check']['follower_placed']} placements but the "
+                "manager's legion_allocations gauge moved by "
+                f"{metrics['cross_check']['manager_allocations_delta']}. Either the "
+                "follower dropped events (the driver, not the scheduler, set "
+                "this cell's throughput) or the fleet carried allocations from "
+                "a previous cell. Read throughput_per_sec as suspect.",
+                file=sys.stderr,
+            )
     print(json.dumps(metrics, indent=2))
     return 0 if metrics["complete"] else 1
+
+
+def cross_check_counts(before, snapshot, follower_placed, settle_secs=6.0, poll_secs=1.0):
+    """Compare the follower's placement count with the manager's gauge delta.
+
+    The gauge refreshes on a periodic tick, so the final sample is re-taken
+    for up to `settle_secs` while it is still moving; the comparison uses
+    the last reading. Absent or unreachable counters produce
+    `available: false` rather than a verdict.
+    """
+    if not before or before.get("allocations") is None:
+        return {"available": False, "reason": before.get("error") if before else "no snapshot"}
+    after = snapshot()
+    deadline = time.monotonic() + settle_secs
+    while after.get("allocations") is not None and time.monotonic() < deadline:
+        delta = after["allocations"] - before["allocations"]
+        if delta >= follower_placed:
+            break
+        time.sleep(poll_secs)
+        again = snapshot()
+        if again.get("allocations") is None or again["allocations"] == after["allocations"]:
+            after = again if again.get("allocations") is not None else after
+            break
+        after = again
+    if after.get("allocations") is None:
+        return {"available": False, "reason": after.get("error", "gauge absent")}
+    delta = int(round(after["allocations"] - before["allocations"]))
+    return {
+        "available": True,
+        "metrics_url": after.get("url"),
+        "follower_placed": follower_placed,
+        "manager_allocations_before": before["allocations"],
+        "manager_allocations_after": after["allocations"],
+        "manager_allocations_delta": delta,
+        "agree": delta == follower_placed,
+    }
 
 
 def cmd_watch(args):
@@ -1009,6 +1146,14 @@ def main():
     run.add_argument("--nomad-bin", default="nomad")
     run.add_argument("--kubectl-bin", default="kubectl")
     run.add_argument("--kubeconfig", default=None)
+    run.add_argument(
+        "--metrics-url",
+        default=None,
+        help="The manager's Prometheus endpoint for the end-of-cell counting "
+        "cross-check (legion only). Default: --manager's host on server.port "
+        "+ 2, per docs/metrics.md. The check is advisory: an unreachable "
+        "endpoint records `cross_check.available: false` and nothing else.",
+    )
     run.set_defaults(func=cmd_run)
 
     watch = sub.add_parser(

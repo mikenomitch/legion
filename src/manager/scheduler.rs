@@ -2272,16 +2272,32 @@ impl<'a> Scheduler<'a> {
             IndexQueryOutcome::Candidates(candidates) => candidates,
         };
 
-        let mut verified: Vec<&'b Node> = candidates
+        // Each candidate keeps the rank of the index cell it came from, so
+        // the truncation below can tell "better cell" from "same cell":
+        // nodes in one cell are indistinguishable to the index, and a cut
+        // that took the first `budget` of them (sorted by id) handed every
+        // plan the same lowest-id nodes — the one-slice concentration of
+        // aws-phase5-findings.md. An unordered query carries no ranks; every
+        // node then shares rank 0, and the untruncated path re-sorts by id.
+        let ranked: Vec<(&'b Node, u32)> = candidates
             .node_ids
             .iter()
-            .filter_map(|id| node_lookup.get(id.as_str()).copied())
-            .filter(|node| {
+            .enumerate()
+            .filter_map(|(position, id)| {
+                node_lookup.get(id.as_str()).copied().map(|node| {
+                    (
+                        node,
+                        candidates.cell_ranks.get(position).copied().unwrap_or(0),
+                    )
+                })
+            })
+            .filter(|(node, _)| {
                 constraint_set.is_satisfied(node, None)
                     && permit_set.is_permitted(node)
                     && node_provides_volume_drivers(node, required_drivers)
             })
             .collect();
+        let mut verified: Vec<&'b Node> = ranked.iter().map(|(node, _)| *node).collect();
 
         if candidates.mode == IndexMode::Shadow {
             // The scan stays authoritative; the index runs alongside and any
@@ -2356,7 +2372,7 @@ impl<'a> Scheduler<'a> {
             .inc(&[candidates.index.as_str(), "used"]);
         let budget = self.candidate_budget(needed);
         if allow_truncation && verified.len() > budget {
-            verified.truncate(budget);
+            verified = crate::scheduling_index::truncate_within_boundary_cell(ranked, budget);
             usage.truncated = true;
         } else {
             verified.sort_by(|a, b| a.id.cmp(&b.id));

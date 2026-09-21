@@ -157,11 +157,27 @@ measured a WORST-CASE loss, and the 86 s / 6 ms numbers held.
 
 ## Open, in priority order
 
-1. **The planner's node universe truncates to one slice at rig scale** —
-   see the storm section for the full elimination record. Next probe: a
-   fleet-scale repro with worker-registration RPCs (not `insert_node`) at
-   the sim's register rate, and read-model introspection (expose the
-   read model's node count as a gauge next to `legion_nodes`).
+1. ~~**The planner's node universe truncates to one slice at rig scale**~~
+   **Root-caused and fixed (2026-09-21).** It was never the read model or
+   the projection path: the read model held all 5,000 nodes. It was the
+   scheduling index's candidate **budget**. `web_fleet` tasks need 4
+   allocations, so `candidate_budget` is 64; the default `fit` index arms
+   at 128 nodes; every idle sim node of a profile projects to the same
+   (cpu, memory, disk) cell; and the scheduler's post-verification
+   truncation cut the best-first list at the budget — that cell's
+   sorted-id prefix — so `sim-0-*` was the entire
+   universe of every plan until those nodes hit `maxAllocations` — which
+   is exactly the cap-fill, class-independent, next-slice-after-loss shape
+   the drill recorded. The `spread_under_raft.rs` repro could not see it
+   because `count: 50` lifts the budget to 400, above its 300-node fleet,
+   so it never truncated. The cut inside a tied cell is now a uniform
+   sample of the cell (`scheduling_index::truncate_within_boundary_cell`,
+   calls entry 14); `tests/index_truncation_spread.rs` is the rig shape
+   at 1/8 scale (4 slices x 150 identical nodes, 40 jobs x 4, spread) and
+   on the old code places 104/56/0/0 across the four slices; fixed, it
+   places 49/30/43/38. Every
+   "at 5,000 nodes" number in this file still stands as an A/B; the
+   absolute fill ladder needs re-measuring behind the native submitter.
 2. **The fast native submitter** — the gate on every further measurement.
 2. **Re-run the fill ladder behind it** — the slope (1.6×/doubling through
    #193) is untested on this branch because every deep point is a floor.

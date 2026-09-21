@@ -15,24 +15,25 @@ How to use it:
 
 ---
 
-- [ ] **The planner's node universe truncates to one slice at rig scale.**
-      The 2026-08-06 storm drill found ALL of a 25k-allocation `spread`
-      workload on one quarter of a 5,000-node fleet, replacements packing
-      the next quarter, nodes filled to exactly `maxAllocations`, and —
-      decisively — every candidate in sampled `plan_submission` rows from
-      one slice, across constraint classes. Eliminated: naming,
-      availability, class/pool distribution, tie-breaks, cache
-      invalidation, and the capture/projection path (pinned by
-      `tests/spread_under_raft.rs` plus two scheduler unit tests). Does
-      NOT reproduce locally up to 300 nodes with the raft engine on. Next:
-      a fleet-scale repro using the worker-registration RPC at the sim's
-      register rate. The observability half is done (2026-08-06):
-      `legion_read_model_nodes{set="all"|"available"}` sits next to
-      `legion_nodes` on the same refresh tick
-      ([metrics.md](../docs/metrics.md#cluster-shape)), so a truncated
-      planning universe is one query instead of a plan-submission
-      sampling session. Findings:
-      [aws-phase5-findings.md](aws-phase5-findings.md).
+- [ ] **Re-run the dense_fleet fill ladder and the eval-thread sweep behind
+      the native submitter, on the candidate-sampling fix.** Every deep
+      point in phases 4–5 was `driver_bound`, and every cell also carried
+      the index-truncation bug below (planner universe = 64 lowest ids),
+      so the 1.6x-per-doubling fill slope and the thread knee above 32
+      are both unmeasured on current code. Use
+      `run-campaign.sh --system legion-a --scenarios dense_fleet --steps
+      "5000" --allocs-per-node-sweep "10 20 40"` with `--submitter native`,
+      and read `submission.driver_bound`, `submission.per_minute`, and
+      `cross_check.agree` before trusting a cell.
+- [ ] **The `fit` index does not see `maxAllocations`.** A node at its
+      allocation cap still projects into a fitting (cpu, memory, disk)
+      cell, so under `bin_pack` (tight order: fullest fitting cell first)
+      capped nodes rank at the FRONT of a truncated candidate list and
+      spend budget on nodes the ledger then rejects; the plan pays a
+      `refills` scan when the list runs dry. Fix shape: project the
+      `allocations` pseudo-resource as a fourth dim (or a cap flag that
+      moves the node to the non-fitting tail) so the ordering-not-filtering
+      invariant holds. Needs the ladder above to size it.
 
 - [x] **Batch the control-lane job submit** (the "fuse the five control-lane
       rounds" item, right-sized). The two `clear_*` rounds were already
@@ -1942,6 +1943,21 @@ Deferred from [job-updated-at-plan.md](plans/job-updated-at-plan.md):
 
 docs: [scheduler-and-eval-loop.md](../docs/scheduler-and-eval-loop.md), [jobs-tasks-and-scheduling.md](../docs/jobs-tasks-and-scheduling.md)
 
+- [x] **The planner's node universe truncated to one slice at rig scale —
+      root-caused and fixed** (2026-09-21,
+      [findings](aws-phase5-findings.md#open-in-priority-order),
+      [calls](calls/scheduling-index-plan_calls.md) #14,
+      [docs](../docs/scheduling-indexes.md)). Not the read model: the
+      scheduling index's candidate budget (64 for a task needing 4) was
+      applied as a cut of the best-first verified list, i.e. one tied
+      cell's sorted-id prefix, so every plan saw the same lowest-id nodes.
+      The cut inside a tied cell is now a uniform sample of the cell
+      (`truncate_within_boundary_cell`); `tests/index_truncation_spread.rs`
+      pins the rig shape (4 slices x 150 identical nodes, 40 jobs x 4,
+      spread): 104/56/0/0 per slice on the old code, 49/30/43/38 fixed.
+      Candidate
+      construction cost is unchanged within noise
+      ([benchmarks/scheduler/README.md](../benchmarks/scheduler/README.md)).
 - [x] **The read-model refresh takes the changeset delta, not a whole-node
       reload.** 2026-08-05, from the phase-4 fill-scaling finding
       ([findings](aws-phase4-findings.md),

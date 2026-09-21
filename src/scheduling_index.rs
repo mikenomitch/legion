@@ -13,6 +13,13 @@
 //! with an unbounded budget the scheduler's re-verified candidates equal
 //! today's full scan, which is what the equivalence tests pin down.
 //!
+//! Within one cell the index has no preference, so when a budget cut lands
+//! inside a cell the remainder is sampled uniformly from that cell rather
+//! than taken as its sorted-id prefix. A prefix would make every planner's
+//! candidate universe the same lowest-id nodes of the boundary cell, which is
+//! how a `spread` workload once concentrated on one quarter of a fleet
+//! (`internal_docs/aws-phase5-findings.md`).
+//!
 //! The index only ever *proposes* candidates. Every consumer re-verifies them
 //! through the ordinary constraint/permit/ledger chain, so a stale or wrong
 //! index costs a refill or a worse pick, never an invalid placement.
@@ -513,9 +520,67 @@ pub struct IndexCandidates {
     /// Candidate node ids, best-first per the index's order. With no budget
     /// this is the entire shard.
     pub node_ids: Vec<String>,
+    /// Parallel to `node_ids`: the rank of the cell each id came from in
+    /// the walk (0 = best-fitting). Nodes sharing a rank are
+    /// indistinguishable to the index, which is what a caller that
+    /// truncates AFTER re-verification needs to know — it must sample the
+    /// boundary cell rather than cut it at the budget
+    /// ([`truncate_within_boundary_cell`]). Empty for an unordered query.
+    pub cell_ranks: Vec<u32>,
     /// Shard population before any budget truncation.
     pub partition_size: usize,
     pub truncated: bool,
+}
+
+/// Cut a best-first list of `(item, cell rank)` down to `budget` items.
+///
+/// Every rank that fits entirely is kept whole and in order. The rank the
+/// cut lands in is sampled uniformly at random for the remaining slots —
+/// never taken as a prefix — because the index has no preference between
+/// nodes of one cell, and a prefix would give every plan the same few
+/// nodes of that cell (the lowest ids: the failure recorded in
+/// `internal_docs/aws-phase5-findings.md`). Output keeps input order.
+pub fn truncate_within_boundary_cell<T>(ranked: Vec<(T, u32)>, budget: usize) -> Vec<T> {
+    if ranked.len() <= budget {
+        return ranked.into_iter().map(|(item, _)| item).collect();
+    }
+    // Find the boundary rank: the first rank whose end passes the budget.
+    let mut whole_end = 0usize; // items before the boundary rank
+    let mut boundary_end = ranked.len();
+    let mut index = 0usize;
+    while index < ranked.len() {
+        let rank = ranked[index].1;
+        let mut end = index;
+        while end < ranked.len() && ranked[end].1 == rank {
+            end += 1;
+        }
+        if end > budget {
+            whole_end = index;
+            boundary_end = end;
+            break;
+        }
+        index = end;
+    }
+    let remaining = budget - whole_end;
+    let mut picks =
+        rand::seq::index::sample(&mut rand::thread_rng(), boundary_end - whole_end, remaining)
+            .into_vec();
+    picks.sort_unstable();
+    let mut picks = picks.into_iter().peekable();
+    let mut out = Vec::with_capacity(budget);
+    for (position, (item, _)) in ranked.into_iter().enumerate() {
+        if position < whole_end {
+            out.push(item);
+        } else if position < boundary_end {
+            if picks.peek() == Some(&(position - whole_end)) {
+                picks.next();
+                out.push(item);
+            }
+        } else {
+            break;
+        }
+    }
+    out
 }
 
 /// What a query attempt produced.
@@ -645,6 +710,7 @@ impl IndexSet {
                 index: spec.name.clone(),
                 mode: spec.mode,
                 node_ids: Vec::new(),
+                cell_ranks: Vec::new(),
                 partition_size: 0,
                 truncated: false,
             });
@@ -666,8 +732,9 @@ impl IndexSet {
         // Order every occupied cell: the orthant (every bucket covers the
         // request's) first by weighted distance — ascending for tight,
         // descending for loose — then the provably-non-fitting tail, closest
-        // first. Cell key breaks ties so output is deterministic. Skipped
-        // entirely for unordered queries (the caller re-orders).
+        // first. Cell key breaks ties between cells so the cell walk is
+        // deterministic. Skipped entirely for unordered queries (the caller
+        // re-orders).
         let mut cells: Vec<(&Vec<u16>, &Vec<String>)> = shard.cells.iter().collect();
         if ordered {
             let ranked = |cell: &[u16]| -> (u8, f64) {
@@ -710,23 +777,39 @@ impl IndexSet {
         }
 
         let partition_size: usize = cells.iter().map(|(_, ids)| ids.len()).sum();
-        let mut node_ids = Vec::with_capacity(budget.unwrap_or(partition_size).min(partition_size));
-        'outer: for (_, ids) in &cells {
-            for id in ids.iter() {
-                if let Some(budget) = budget {
-                    if node_ids.len() >= budget {
-                        break 'outer;
-                    }
-                }
-                node_ids.push(id.clone());
-            }
+        // Tag every id with its cell's rank in the walk. Within a cell the
+        // index has no opinion, so a budget cut that lands inside a cell
+        // samples it (`truncate_within_boundary_cell`) — the sorted-id
+        // prefix it used to take is what packed a 5,000-node fleet onto
+        // its lexicographically-first 1,250 nodes (aws-phase5-findings.md).
+        // The scheduler asks for the whole shard and truncates AFTER
+        // re-verification, so the ranks travel with the ids.
+        let mut ranked: Vec<(String, u32)> = Vec::with_capacity(partition_size);
+        for (rank, (_, ids)) in cells.iter().enumerate() {
+            ranked.extend(ids.iter().map(|id| (id.clone(), rank as u32)));
         }
+        let (node_ids, cell_ranks): (Vec<String>, Vec<u32>) = match budget {
+            Some(budget) if budget < ranked.len() => truncate_within_boundary_cell(
+                ranked
+                    .into_iter()
+                    .map(|(id, rank)| ((id, rank), rank))
+                    .collect(),
+                budget,
+            )
+            .into_iter()
+            .unzip(),
+            _ => ranked.into_iter().unzip(),
+        };
+        // Unordered queries carry no meaningful ranks (the walk was not
+        // sorted), and the caller re-orders anyway.
+        let cell_ranks = if ordered { cell_ranks } else { Vec::new() };
         let truncated = node_ids.len() < partition_size;
 
         IndexQueryOutcome::Candidates(IndexCandidates {
             index: spec.name.clone(),
             mode: spec.mode,
             node_ids,
+            cell_ranks,
             partition_size,
             truncated,
         })
@@ -1175,6 +1258,153 @@ mod tests {
         assert_eq!(candidates.node_ids, vec!["medium", "large"]);
         assert_eq!(candidates.partition_size, 4);
         assert!(candidates.truncated);
+    }
+
+    /// The rig's shape in miniature: many identical nodes in ONE cell and a
+    /// budget far below the cell. The cut must not be the sorted-id prefix,
+    /// and repeated queries must reach past it.
+    #[test]
+    fn budget_cut_inside_a_tied_cell_samples_rather_than_prefixes() {
+        let nodes: Vec<Node> = (0..4)
+            .flat_map(|slice| {
+                (0..250).map(move |n| {
+                    make_node(
+                        &format!("sim-{slice}-web-{n:03}"),
+                        "default",
+                        json!({ "resources": { "vram": 1024 } }),
+                    )
+                })
+            })
+            .collect();
+        let (set, _) = set_for(
+            json!({ "indexes": { "fit": false, "vram": ["pool", "resources.vram"] } }),
+            nodes,
+        );
+        let bindings = HashMap::from([("pool".to_string(), json!("default"))]);
+        let request = HashMap::from([("vram".to_string(), 512.0)]);
+
+        let mut seen: HashSet<String> = HashSet::new();
+        for _ in 0..20 {
+            let IndexQueryOutcome::Candidates(candidates) =
+                set.query(&bindings, &request, Some(64))
+            else {
+                panic!("expected candidates");
+            };
+            assert_eq!(candidates.node_ids.len(), 64);
+            assert_eq!(candidates.partition_size, 1000);
+            assert!(candidates.truncated);
+            // Not the prefix: a uniform 64-of-1000 sample lands entirely in
+            // slice 0 (the first 250 ids) with probability ~(1/4)^64.
+            let slice0 = candidates
+                .node_ids
+                .iter()
+                .filter(|id| id.starts_with("sim-0-"))
+                .count();
+            assert!(
+                slice0 < 64,
+                "candidates were the sorted-id prefix: {:?}",
+                candidates.node_ids
+            );
+            seen.extend(candidates.node_ids.iter().cloned());
+        }
+        // 20 draws of 64 from 1,000 reach far beyond any single prefix.
+        assert!(
+            seen.len() > 400,
+            "queries kept returning the same nodes: {}",
+            seen.len()
+        );
+    }
+
+    /// The sample only touches the cell the cut lands in: better-ranked
+    /// cells are still included whole and in rank order.
+    #[test]
+    fn boundary_cell_truncation_keeps_whole_ranks_and_samples_the_cut() {
+        // ranks: 0 (2 items), 1 (3 items), 2 (100 items); budget 10 → both
+        // whole ranks (5) plus 5 sampled from rank 2, in order.
+        let ranked: Vec<(usize, u32)> = (0..2)
+            .map(|i| (i, 0))
+            .chain((2..5).map(|i| (i, 1)))
+            .chain((5..105).map(|i| (i, 2)))
+            .collect();
+        let mut union: HashSet<usize> = HashSet::new();
+        for _ in 0..30 {
+            let out = truncate_within_boundary_cell(ranked.clone(), 10);
+            assert_eq!(out.len(), 10);
+            assert_eq!(&out[..5], &[0, 1, 2, 3, 4]);
+            assert!(out.windows(2).all(|w| w[0] < w[1]), "order kept: {out:?}");
+            assert!(out[5..].iter().all(|i| (5..105).contains(i)));
+            union.extend(out[5..].iter().copied());
+        }
+        assert!(
+            union.len() > 40,
+            "the cut is a prefix, not a sample: {}",
+            union.len()
+        );
+        // No cut needed.
+        assert_eq!(
+            truncate_within_boundary_cell(vec![(7usize, 0), (8, 1)], 5),
+            vec![7, 8]
+        );
+        // Budget 0.
+        assert!(truncate_within_boundary_cell(ranked.clone(), 0).is_empty());
+    }
+
+    #[test]
+    fn ordered_queries_carry_cell_ranks() {
+        let (set, _) = set_for(
+            json!({ "indexes": { "fit": false, "vram": ["pool", "resources.vram"] } }),
+            fit_nodes(),
+        );
+        let bindings = HashMap::from([("pool".to_string(), json!("default"))]);
+        let request = HashMap::from([("vram".to_string(), 512.0)]);
+        let IndexQueryOutcome::Candidates(candidates) = set.query(&bindings, &request, None) else {
+            panic!("expected candidates");
+        };
+        assert_eq!(
+            candidates.node_ids,
+            vec!["medium", "large", "small", "none"]
+        );
+        assert_eq!(candidates.cell_ranks, vec![0, 1, 2, 3]);
+        let IndexQueryOutcome::Candidates(unordered) =
+            set.query_with_order(&bindings, &request, None, false)
+        else {
+            panic!("expected candidates");
+        };
+        assert!(unordered.cell_ranks.is_empty());
+    }
+
+    #[test]
+    fn budget_cut_keeps_better_cells_whole_and_first() {
+        let mut nodes = vec![make_node(
+            "exact",
+            "default",
+            json!({ "resources": { "vram": 600 } }),
+        )];
+        nodes.extend((0..100).map(|n| {
+            make_node(
+                &format!("loose-{n:03}"),
+                "default",
+                json!({ "resources": { "vram": 65536 } }),
+            )
+        }));
+        let (set, _) = set_for(
+            json!({ "indexes": { "fit": false, "vram": ["pool", "resources.vram"] } }),
+            nodes,
+        );
+        let bindings = HashMap::from([("pool".to_string(), json!("default"))]);
+        let request = HashMap::from([("vram".to_string(), 512.0)]);
+        let IndexQueryOutcome::Candidates(candidates) = set.query(&bindings, &request, Some(8))
+        else {
+            panic!("expected candidates");
+        };
+        assert_eq!(candidates.node_ids.len(), 8);
+        assert_eq!(
+            candidates.node_ids[0], "exact",
+            "tight order: nearest fit first"
+        );
+        assert!(candidates.node_ids[1..]
+            .iter()
+            .all(|id| id.starts_with("loose-")));
     }
 
     #[test]
