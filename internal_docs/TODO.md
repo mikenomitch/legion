@@ -1328,29 +1328,27 @@ All deferred from the volume plan v1:
 
 ## Service discovery & the mesh
 
-Plans: [service-mesh-plan.md](plans/service-mesh-plan.md) (**authoritative for the mesh**, in execution), [service-discovery-final-plan.md](plans/service-discovery-final-plan.md) (v1, shipped) · docs: [service-discovery.md](../docs/service-discovery.md)
+Plans: [service-mesh-plan.md](plans/service-mesh-plan.md) (**authoritative for the mesh**; shipped M1–M10 with two named deferrals), [service-discovery-final-plan.md](plans/service-discovery-final-plan.md) (v1, shipped) · docs: [service-discovery.md](../docs/service-discovery.md), [network-handlers.md](../docs/network-handlers.md)
 
 v1 (catalog, ports, env, `list`/`resolve`/`doctor`) shipped, and so has the
-connect layer: `connect.upstreams`, the per-node L4 forwarder, pluggable
-balancing, and control-plane intentions. What is left of the v2 mesh, in the
-plan's own adoption order:
+v2 mesh: `connect.upstreams`, the per-node forwarder, pluggable balancing
+(`local_first` included), intentions, node-local DNS and VIPs, templates,
+mTLS on workload identity, RED metrics with the service graph, and
+drain-before-stop — phase by phase, with what each left open, under
+[Networking](#networking) below. What the mesh plan's adoption order still
+has open:
 
-- [ ] Node-local DNS + template functions (no-NAT resolver, TCP fallback,
-      `ndots:1`, coalesce/splay/fail-static)
-- [ ] Datapath plugin ABI + bridge/CNI shim (`mode: 'auto'`)
-- [ ] **mTLS between forwarders**, so `service.allow` intentions rest on
-      cryptographic workload identity (which has shipped) rather than on the
-      control plane filtering the endpoint feed — now owned by
-      [network-handlers-plan.md](plans/network-handlers-plan.md) phase 6b, which
-      needs the same workload CA and reads `service.allow` as its policy input
-- [ ] L7 waypoint (retries, timeouts, canary split), then sandboxed WASM
-      middleware filters. Traffic *management* stays here; the policy and
-      observation path is [network-handlers-plan.md](plans/network-handlers-plan.md),
-      and WASM filters are that plan's phase 8 — whichever lands first should
-      host the other's filters rather than growing a second sandbox
-- [ ] Mesh observability: RED metrics + service graph, `doctor` gaining
-      live-traffic evidence
-- [ ] Drain-before-SIGTERM (rollout integration)
+- [ ] Datapath plugin ABI + bridge/CNI shim (`mode: 'auto'` picking a real
+      overlay). The datapath half — overlay, CNI, fingerprinters — is still
+      unplanned; it remains the service-discovery plan's item 2.
+- [ ] Sandboxed WASM middleware filters on the L7 path (retries, timeouts,
+      weighted split and outlier ejection shipped in M2 inside the upstream
+      listener). They are the handlers plan's phase 8 — whichever of the two
+      plans grows a sandbox first should host the other's filters rather
+      than growing a second one.
+- [ ] `legion net doctor` citing live-traffic evidence: it walks policy →
+      mode → datapath status (M6) but does not yet pull the task's edges
+      from the service graph (M8) into its verdict.
 
 ## Networking
 

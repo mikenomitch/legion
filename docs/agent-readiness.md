@@ -70,7 +70,12 @@ Even with `--allow-write`, `legion_state_query` is forced to read-only.
 | `legion_service_resolve` | no | Resolve a service to its endpoints (address, port, allocation, node, health). |
 | `legion_net_policy_list` | no | List stored network policies (selector, enforcement, rules) in merge order. |
 | `legion_net_policy_show` | no | A task's effective network policy — every matching stored policy merged with its own block, each rule naming its source — and the resolved network mode. |
-| `legion_net_policy_test`, `legion_service_edges`, `legion_net_doctor`, `legion_net_handler_test`, `legion_net_ca_show` | no | Dry-run a verdict: may this task reach `to` / be reached from `from`? Returns allow/deny/defer with the deciding rule and reason; sends nothing. |
+| `legion_net_policy_test` | no | Dry-run a verdict: may this task reach `to` / be reached from `from`? Returns allow/deny/defer with the deciding rule and reason; sends nothing. |
+| `legion_net_doctor` | no | Walk a task's network from policy to datapath and say where it breaks: the resolved policy, whether the mode enforces it, and per allocation whether the node's datapath is ready, enforcing the current policy, or fail-closed. Returns ok/warn/fail with fix hints. |
+| `legion_net_handler_test` | no | Conformance-probe an external handler the way the datapath would use it: an authz webhook must answer `{verdict}` to a sample facts payload; a proxy must accept a PROXY v2 header. One synthetic request; never touches the cluster. |
+| `legion_service_edges` | no | The service graph: who calls whom through the datapath, with request rate, errors, denials, latency and bytes per (caller, service) over the window, plus declared-but-silent upstreams and whether each caller is on the service's allow list. |
+| `legion_net_ca_show` | no | The mesh CA certificate (PEM, never the key) that non-Legion clients trust to reach a mesh-TLS port. |
+| `legion_net_ca_rotate` | **yes** | Replace the mesh CA; every node re-issues its certificate on its next heartbeat, and peers on different CAs refuse each other until then. |
 | `legion_net_policy_apply` | **yes** | Create or replace a network policy object; `dry_run` validates and lists affected allocations without writing. |
 | `legion_acl_whoami` | no | ACL status + caller identity (diagnose PermissionDenied). |
 | `legion_events` | no | List scheduler events; poll with `after_id` to tail. |
