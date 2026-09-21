@@ -596,6 +596,25 @@ CONTROL: that path is untouched by the change):
 | indexes_off / nodes_10000 (control) | 31.70 ms | 36.57 ms | +15.4% (p=0.00) |
 | indexes_on / nodes_10000 | 16.50 ms | 17.00 ms | +3.0% (p=0.11) |
 
+**End to end, through the worker-registration RPC** (release binary,
+one local manager with `schedulingPolicy = "spread"`, four
+`legion start worker --simulate 150` processes named `sim-0` .. `sim-3`
+registering at 250/s — the rig's shape, 1/8 scale): `legion_nodes` and
+`legion_read_model_nodes{set="available"}` both read 600 (the read model
+was never truncated), 40 `exec` jobs x 4 allocations submitted from 40
+concurrent CLI processes in 0.35 s, and the allocation table afterwards:
+
+| slice | allocations |
+| --- | --- |
+| sim-0 | 35 |
+| sim-1 | 41 |
+| sim-2 | 43 |
+| sim-3 | 41 |
+
+160 allocations on 160 distinct nodes; `legion_scheduler_index_candidates`
+averaged 128 per query against a 600-node shard, so every plan was
+index-served and truncated, and the sample still covered the fleet.
+
 The untouched control cells drifted +3% to +15% between the two runs
 (the 10k control's interval was 34.0–40.8 ms), so this session's noise
 floor is above the +3% the changed cells moved, and every changed cell's

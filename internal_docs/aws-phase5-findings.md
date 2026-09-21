@@ -175,7 +175,8 @@ measured a WORST-CASE loss, and the 86 s / 6 ms numbers held.
    calls entry 14); `tests/index_truncation_spread.rs` is the rig shape
    at 1/8 scale (4 slices x 150 identical nodes, 40 jobs x 4, spread) and
    on the old code places 104/56/0/0 across the four slices; fixed, it
-   places 49/30/43/38. Every
+   places 49/30/43/38; a release binary with four `--simulate 150` slices
+   registering through the real RPC placed 35/41/43/41. Every
    "at 5,000 nodes" number in this file still stands as an A/B; the
    absolute fill ladder needs re-measuring behind the native submitter.
 2. **The fast native submitter** — the gate on every further measurement.
