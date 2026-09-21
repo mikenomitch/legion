@@ -330,22 +330,38 @@ impl Store {
         }
         let key_id = row.key_id.clone();
         self.keyring.install_generated(row, key);
-        self.emit_event(
-            EventDraft::info(
-                "keyring.initialized",
-                format!("KV encryption initialized with data key {key_id}"),
-            )
-            .meta(json!({
-                "keyId": key_id,
-                "rootKeyId": root_key_id,
-                "provider": provider.kind(),
-            })),
-        );
+        // Deliberately a log line and not a scheduler event: every fresh
+        // store initializes once at start, and an event there would put a
+        // row in every new cluster's journal before any real work happened.
+        // Rotation, rewrap, lock/unlock, and reset — the transitions an
+        // operator acts on — do emit events.
         Ok(KeyringInit::Initialized {
             key_id,
             root_key_id,
             minted_root_key,
         })
+    }
+
+    /// Test helper: give this store the same `keyring_key` rows as `other`,
+    /// as a replica that applied the same `initialize_keyring` entry has.
+    /// Two stores started independently each mint their own data key, so a
+    /// changeset captured on one only decrypts on the other after this
+    /// (both must also share the root key — see
+    /// `keyring::test_support::shared_root_key_path`).
+    #[cfg(test)]
+    pub(crate) fn adopt_keyring_from(&self, other: &Store) -> R<()> {
+        let rows = other.list_keyring_rows()?;
+        {
+            let mut conn = self.write_connection()?;
+            let tx = Self::write_tx(&mut conn)?;
+            tx.execute("DELETE FROM keyring_key;", [])?;
+            for row in &rows {
+                Self::insert_keyring_row_in(&tx, row)?;
+            }
+            tx.commit()?;
+        }
+        self.keyring_rows_changed();
+        Ok(())
     }
 
     /// Insert the first row only if the table is still empty (idempotency

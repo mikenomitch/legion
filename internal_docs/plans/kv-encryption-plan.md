@@ -822,7 +822,9 @@ path — a real ACL fix that comes for free.
   with the rewrap scan and on the metrics tick),
   `legion_kv_decrypt_failures_total{reason="locked"|"corrupt"}` (counter),
   `legion_keyring_provider_calls_total{op,outcome}` (counter, `exec`).
-- **Events** (`docs/event-stream.md`): `keyring.initialized`,
+- **Events** (`docs/event-stream.md`; as shipped, first-start
+  initialization is a log line rather than an event — calls doc #21):
+  `keyring.initialized`,
   `keyring.rotated {key_id}`, `keyring.rewrap_completed {rows}`,
   `keyring.locked {root_key_id}`, `keyring.unlocked`. Never a key byte.
 - **Logs**: key ids only. The root key file path is logged; its contents

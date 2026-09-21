@@ -507,3 +507,23 @@ unambiguous; the cost is one more rule to document.
 
 **Why (ergonomics).** Environment variables with embedded newlines are
 awkward in systemd units, Kubernetes manifests, and shells; commas are not.
+
+## 21. First-start initialization is a log line, not a scheduler event
+
+**Call.** `ensure_keyring_initialized` logs the minted root key path and the
+first data key id; it emits no `keyring.initialized` event. Rotation,
+rewrap completion, root-key rewrap, lock/unlock transitions, and reset do
+emit events.
+
+**Alternatives.** Emit the event the plan listed, so the journal records
+when encryption began.
+
+**Trade-off.** No journal entry marks the moment a cluster started
+encrypting; the manager log and `legion keyring status` (key creation
+times) carry it instead.
+
+**Why (simplicity, and it broke nothing else).** Every fresh store
+initializes once at start, so the event would be the first row in every new
+cluster's journal before any real work — and it shifted event ids and
+counts in every test that reasons about the journal. The transitions an
+operator actually acts on all stay as events.

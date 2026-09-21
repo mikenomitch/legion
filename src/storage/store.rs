@@ -18089,13 +18089,17 @@ mod tests {
             .context("Error creating temp store directory")?
             .keep();
 
-        let store_config = ManagerConfigFull {
+        let mut store_config = ManagerConfigFull {
             store_path: store_dir
                 .to_str()
                 .context("Error parsing store path")?
                 .to_string(),
             ..Default::default()
         };
+        // Test stores stand in for replicas of one cluster (changesets and
+        // snapshots move between them), so they share one root key.
+        store_config.encryption.root_key.path =
+            Some(crate::storage::keyring::test_support::shared_root_key_path());
 
         let store = Store::start_storage(&store_config)?;
         store.reset_all_tables()?;
@@ -25749,6 +25753,9 @@ mod tests {
     fn capture_mutation_rolls_back_and_apply_reproduces_on_a_second_store() -> R<()> {
         let src = setup_store()?;
         let dst = setup_store()?;
+        // Replicas share the cluster's data keys (KV values replicate as
+        // ciphertext).
+        dst.adopt_keyring_from(&src)?;
 
         let (entry, changeset) = raft_capture::capture_mutation(&src, Lane::Control, |s| {
             s.put_kv("cfg/db", "postgres://one", KvValueType::String, None, None)
@@ -25793,6 +25800,7 @@ mod tests {
     fn nested_replicated_calls_compose_into_one_changeset() -> R<()> {
         let src = setup_store()?;
         let dst = setup_store()?;
+        dst.adopt_keyring_from(&src)?;
 
         // Both put_kv calls are public replicated methods; inside an active
         // capture they must run inline (JC-13) and land in ONE changeset.

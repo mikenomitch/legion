@@ -1357,6 +1357,37 @@ pub fn test_exec_provider(command: &[String], timeout: Duration) -> Vec<Provider
     checks
 }
 
+/// Test support: one root key shared by every store a test process starts.
+///
+/// Stores built by the crate's unit tests stand in for replicas of ONE
+/// cluster (a changeset captured on one is applied on another, a snapshot
+/// built on one is installed on another), and replicas of one cluster share
+/// a root key — a joiner receives it with the join. Pointing every test
+/// store at this file gives them that relationship without each test
+/// copying key files around; a test that wants a manager with a *different*
+/// key sets `encryption.rootKey.path` itself.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::RootKeyProvider;
+    use std::sync::OnceLock;
+
+    /// Path of the process-wide shared root key file, minted on first use.
+    pub(crate) fn shared_root_key_path() -> String {
+        static PATH: OnceLock<String> = OnceLock::new();
+        PATH.get_or_init(|| {
+            let dir = tempfile::Builder::new()
+                .prefix("legion-test-root-key-")
+                .tempdir()
+                .expect("tempdir for the shared test root key")
+                .keep();
+            let provider = super::FileRootKey::new(dir.join(super::ROOT_KEY_FILE));
+            provider.mint().expect("mint the shared test root key");
+            provider.path().display().to_string()
+        })
+        .clone()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

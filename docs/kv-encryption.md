@@ -334,9 +334,10 @@ Metrics ([Metrics](metrics.md)): `legion_keyring_unlocked`,
 `legion_keyring_provider_calls_total{op,outcome}`. Alert on
 `legion_keyring_unlocked == 0` while encryption is enabled.
 
-Events ([Event Stream](event-stream.md)): `keyring.initialized`,
-`keyring.rotated`, `keyring.rewrap_completed`, `keyring.root_key_rewrapped`,
-`keyring.locked`, `keyring.unlocked`, `keyring.reset`. Never a key byte.
+Events ([Event Stream](event-stream.md)): `keyring.rotated`,
+`keyring.rewrap_completed`, `keyring.root_key_rewrapped`, `keyring.locked`,
+`keyring.unlocked`, `keyring.reset`. Never a key byte. First-start
+initialization is a log line, not an event.
 
 Logs name key ids and the root key's location, never its contents.
 
