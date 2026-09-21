@@ -1748,7 +1748,12 @@ Deferred from [job-updated-at-plan.md](plans/job-updated-at-plan.md):
       tight election timeouts flap leadership") plus this box's scheduling
       jitter; wants either wider election timeouts under
       `cfg(debug_assertions)` in the harness or a diagnosis of why a
-      two-survivor cluster can stay leaderless for 150 s.
+      two-survivor cluster can stay leaderless for 150 s. Seen again
+      2026-09-21 on the candidate-sampling branch, same shape (~1 s or the
+      150 s wait, nothing between): interleaved single-test runs had base
+      `cafbe80` at 2/3 passing and the branch at 1/4, with the base
+      failure identical to the branch's, so still environmental. It was
+      also the one failure the full suite produced that night.
 - [ ] **`teardown.sh` silently aborts when run non-interactively, leaving the
       whole rig billing.** It prompts `read -r -p "Destroy the entire benchmark
       rig?"` unless `--yes` is passed. Under `nohup ... < /dev/null` (how any
