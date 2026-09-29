@@ -383,6 +383,24 @@ and tear it down when the campaign is over.
   which is a floor and not a measurement. A Legion-vs-Legion sweep
   (scaling, saturation, eval-thread) is what `native` is for; a
   Legion-vs-Nomad-vs-K8s table is not.
+- **The counting path is checked, not trusted.** The driver counts
+  placements by parsing one `legion events follow` NDJSON stream on one
+  Python thread. Coalescing (`allocation.placed` carries the plan's count)
+  has kept that ahead of the scheduler so far, but at native-submitter
+  rates it is the next plausible floor, and a follower that drops events
+  reports a *slower scheduler*, not a broken driver. So every Legion cell
+  samples the manager's own `legion_allocations` gauge before submission
+  and after settling and archives the comparison as `cross_check` in
+  `metrics.json` (`agree: false` also prints a warning). The endpoint is
+  `--manager`'s host on `server.port + 2` unless `--metrics-url` says
+  otherwise; unreachable records `available: false` and nothing else.
+  Read a disagreeing cell's throughput as suspect — either the follower
+  fell behind or the fleet carried allocations from a previous cell.
+- **Submission rate is a series, not an average.**
+  `submission.per_minute` is jobs submitted per minute from the first
+  submit. The phase-5 CLI loop sagged from 89 to 17 jobs/sec over a day
+  and the per-cell average hid it; a falling series is the driver
+  degrading and is visible without re-reading archives.
 - **Driver-side clocks.** Submit and placed timestamps are taken by the
   same driver process for every system; no cross-host clock skew enters
   a latency, and all systems pay the same stream-delivery latency. The

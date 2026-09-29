@@ -25,10 +25,13 @@ from driver import (  # noqa: E402
     NomadAdapter,
     RunRecorder,
     compute_metrics,
+    cross_check_counts,
     monotonic_offset_ms,
     parse_legion_event,
+    parse_prometheus_gauge,
     percentile,
     resolve_loadgen_bin,
+    submission_rate_series,
 )
 import translate  # noqa: E402
 
@@ -141,6 +144,74 @@ class StormFixture(unittest.TestCase):
         )
         self.assertIsNone(metrics["storm"]["recovery_secs"])
         self.assertEqual(metrics["storm"]["replaced_total"], 0)
+
+
+class SubmissionRateSeries(unittest.TestCase):
+    def test_series_is_a_timeline_with_empty_buckets_kept(self):
+        submits = {"a": 0, "b": 1_000, "c": 59_999, "d": 180_000}
+        self.assertEqual(submission_rate_series(submits), [3, 0, 0, 1])
+
+    def test_series_rides_the_submission_block(self):
+        submits = {f"j{i}": i * 30_000 for i in range(6)}  # one every 30s, 2.5 min
+        events = [{"t_ms": 30_000 * i + 500, "job": f"j{i}", "count": 1} for i in range(6)]
+        metrics = compute_metrics(submits, events, 6, warmup_secs=0.0)
+        self.assertEqual(metrics["submission"]["per_minute"], [2, 2, 2])
+
+    def test_empty(self):
+        self.assertEqual(submission_rate_series({}), [])
+
+
+class PrometheusGaugeParsing(unittest.TestCase):
+    TEXT = (
+        "# HELP legion_allocations live allocations\n"
+        "# TYPE legion_allocations gauge\n"
+        "legion_allocations 25002\n"
+        "legion_allocations_created 1.7e9\n"
+        'legion_plan_apply_total{outcome="applied"} 2897\n'
+        'legion_plan_apply_total{outcome="fallback"} 2104\n'
+        "legion_nodes{status=\"active\"} 5000\n"
+    )
+
+    def test_bare_gauge(self):
+        self.assertEqual(parse_prometheus_gauge(self.TEXT, "legion_allocations"), 25002.0)
+
+    def test_labelled_samples_are_summed(self):
+        self.assertEqual(parse_prometheus_gauge(self.TEXT, "legion_plan_apply_total"), 5001.0)
+
+    def test_absent_family_is_none(self):
+        self.assertIsNone(parse_prometheus_gauge(self.TEXT, "legion_evals"))
+
+
+class CountingCrossCheck(unittest.TestCase):
+    def test_agreement(self):
+        before = {"allocations": 100.0}
+        result = cross_check_counts(
+            before, lambda: {"allocations": 160.0, "url": "u"}, 60, settle_secs=0.0
+        )
+        self.assertTrue(result["available"])
+        self.assertTrue(result["agree"])
+        self.assertEqual(result["manager_allocations_delta"], 60)
+
+    def test_disagreement_is_reported_not_raised(self):
+        before = {"allocations": 100.0}
+        result = cross_check_counts(
+            before, lambda: {"allocations": 150.0}, 60, settle_secs=0.0
+        )
+        self.assertFalse(result["agree"])
+
+    def test_gauge_that_is_still_moving_is_re_sampled(self):
+        readings = iter([{"allocations": 130.0}, {"allocations": 160.0}])
+        before = {"allocations": 100.0}
+        result = cross_check_counts(
+            before, lambda: next(readings), 60, settle_secs=5.0, poll_secs=0.0
+        )
+        self.assertTrue(result["agree"])
+
+    def test_unreachable_endpoint_is_advisory(self):
+        result = cross_check_counts({"error": "boom"}, lambda: {}, 60)
+        self.assertEqual(result, {"available": False, "reason": "boom"})
+        result = cross_check_counts({"allocations": 1.0}, lambda: {"error": "x"}, 5, settle_secs=0.0)
+        self.assertFalse(result["available"])
 
 
 class LegionEventParsing(unittest.TestCase):

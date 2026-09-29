@@ -155,6 +155,16 @@ shard. If placement exhausts a truncated list while the fleet still has
 room, the scheduler widens back to the full scan mid-task and keeps going
 (`refills` in the explain output).
 
+Truncation walks cells best-first and includes every cell it reaches
+whole; when the budget runs out *inside* a cell, the remainder is a
+**uniform random sample of that cell**, not its lowest node ids. Nodes in
+one cell are indistinguishable to the index, and a fixed prefix would hand
+every plan the same few nodes: on a fleet of identically-shaped nodes that
+is one failure domain packed to its cap while the rest sit idle, with
+`spread` scoring only ever choosing among the prefix. Expect a truncated
+candidate list to differ between two otherwise identical `job plan` runs;
+the untruncated set never does.
+
 ## Seeing what happened: `job plan`
 
 `legion job plan` reports, per task, exactly how candidates were generated:

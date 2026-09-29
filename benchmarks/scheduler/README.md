@@ -678,3 +678,60 @@ Readings:
 cells that first showed the fill degradation are the real number and
 have not been re-run; `plan_under_fill` is the local stand-in and the
 regression test for this change set.
+
+## Truncated candidates sample the boundary cell — 2026-09-21
+
+The fix for the phase-5 one-slice concentration
+(`internal_docs/aws-phase5-findings.md`, calls entry 14 in
+`internal_docs/calls/scheduling-index-plan_calls.md`): the scheduler's
+post-verification truncation used to cut the best-first candidate list at
+the budget, which on a fleet of identically-shaped nodes is one index
+cell's sorted-id prefix. `IndexSet::query` now tags each candidate with
+its cell rank and `truncate_within_boundary_cell` keeps whole ranks and
+samples the rank the cut lands in. Extra work per plan: one `u32` per
+shard member and a `sample(k of n)` on the boundary cell only.
+
+**Behavioural before/after** (`tests/index_truncation_spread.rs`: 4
+slices x 150 identical nodes, 40 jobs x 4 allocations, `spread`, budget
+128 of 600): allocations per slice **104 / 56 / 0 / 0** before,
+**49 / 30 / 43 / 38** after. Slices 2 and 3 never received a candidate
+on the old code.
+
+**Criterion, `candidate_construction`** (this host — a shared 4-vCPU
+cloud VM — base vs branch, runs serialized, `indexes_off` cells are a
+CONTROL: that path is untouched by the change):
+
+| cell | before | after | change |
+| --- | --- | --- | --- |
+| indexes_off / nodes_1000 (control) | 3.18 ms | 3.41 ms | +7.1% (p=0.01) |
+| indexes_on / nodes_1000 | 3.20 ms | 3.29 ms | +2.8% (p=0.14) |
+| indexes_off / nodes_5000 (control) | 16.22 ms | 16.74 ms | +3.2% (p=0.03) |
+| indexes_on / nodes_5000 | 9.95 ms | 10.31 ms | +3.6% (p=0.05) |
+| indexes_off / nodes_10000 (control) | 31.70 ms | 36.57 ms | +15.4% (p=0.00) |
+| indexes_on / nodes_10000 | 16.50 ms | 17.00 ms | +3.0% (p=0.11) |
+
+**End to end, through the worker-registration RPC** (release binary,
+one local manager with `schedulingPolicy = "spread"`, four
+`legion start worker --simulate 150` processes named `sim-0` .. `sim-3`
+registering at 250/s — the rig's shape, 1/8 scale): `legion_nodes` and
+`legion_read_model_nodes{set="available"}` both read 600 (the read model
+was never truncated), 40 `exec` jobs x 4 allocations submitted from 40
+concurrent CLI processes in 0.35 s, and the allocation table afterwards:
+
+| slice | allocations |
+| --- | --- |
+| sim-0 | 35 |
+| sim-1 | 41 |
+| sim-2 | 43 |
+| sim-3 | 41 |
+
+160 allocations on 160 distinct nodes; `legion_scheduler_index_candidates`
+averaged 128 per query against a 600-node shard, so every plan was
+index-served and truncated, and the sample still covered the fleet.
+
+The untouched control cells drifted +3% to +15% between the two runs
+(the 10k control's interval was 34.0–40.8 ms), so this session's noise
+floor is above the +3% the changed cells moved, and every changed cell's
+interval overlaps zero. Read as: no detectable cost, on a host that
+cannot resolve one below ~5%. The 5k/10k `indexes_on` cells remain
+~40-50% faster than the scan, unchanged from the baseline.

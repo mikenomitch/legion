@@ -15,24 +15,16 @@ How to use it:
 
 ---
 
-- [ ] **The planner's node universe truncates to one slice at rig scale.**
-      The 2026-08-06 storm drill found ALL of a 25k-allocation `spread`
-      workload on one quarter of a 5,000-node fleet, replacements packing
-      the next quarter, nodes filled to exactly `maxAllocations`, and —
-      decisively — every candidate in sampled `plan_submission` rows from
-      one slice, across constraint classes. Eliminated: naming,
-      availability, class/pool distribution, tie-breaks, cache
-      invalidation, and the capture/projection path (pinned by
-      `tests/spread_under_raft.rs` plus two scheduler unit tests). Does
-      NOT reproduce locally up to 300 nodes with the raft engine on. Next:
-      a fleet-scale repro using the worker-registration RPC at the sim's
-      register rate. The observability half is done (2026-08-06):
-      `legion_read_model_nodes{set="all"|"available"}` sits next to
-      `legion_nodes` on the same refresh tick
-      ([metrics.md](../docs/metrics.md#cluster-shape)), so a truncated
-      planning universe is one query instead of a plan-submission
-      sampling session. Findings:
-      [aws-phase5-findings.md](aws-phase5-findings.md).
+- [ ] **The `fit` index does not see `maxAllocations`.** A node at its
+      allocation cap still projects into a fitting (cpu, memory, disk)
+      cell, so under `bin_pack` (tight order: fullest fitting cell first)
+      capped nodes rank at the FRONT of a truncated candidate list and
+      spend budget on nodes the ledger then rejects; the plan pays a
+      `refills` scan when the list runs dry. Fix shape: project the
+      `allocations` pseudo-resource as a fourth dim (or a cap flag that
+      moves the node to the non-fitting tail) so the ordering-not-filtering
+      invariant holds. Needs the `dense_fleet` fill-ladder re-measure
+      (Scheduling & placement) to size it.
 
 - [x] **Batch the control-lane job submit** (the "fuse the five control-lane
       rounds" item, right-sized). The two `clear_*` rounds were already
@@ -301,6 +293,14 @@ How to use it:
       store/refresh paths entirely and the next measurement is
       control-plane CPU at saturation
       ([aws-phase4-findings.md](aws-phase4-findings.md) open item 4).
+      Two conditions for the re-run to mean anything: every deep cell in
+      phases 4–5 was `driver_bound`, AND every cell carried the
+      index-truncation bug (planner universe = the ~64 lowest node ids,
+      fixed 2026-09-21, Done below), so submit with `--submitter native`
+      and read `submission.driver_bound`, `submission.per_minute`, and
+      `cross_check.agree` before trusting a cell. Re-run the eval-thread
+      sweep above 32 in the same session — its knee is unmeasured for the
+      same two reasons.
 - [ ] **`node_alloc_usage` never sheds rows.** Node removal is a
       control-lane op and may not delete a scheduler-lane row, so a
       churning fleet accretes one inert ~100-byte row per departed node,
@@ -1980,7 +1980,12 @@ Deferred from [ui-holistic-polish-plan.md](plans/ui-holistic-polish-plan.md):
       tight election timeouts flap leadership") plus this box's scheduling
       jitter; wants either wider election timeouts under
       `cfg(debug_assertions)` in the harness or a diagnosis of why a
-      two-survivor cluster can stay leaderless for 150 s.
+      two-survivor cluster can stay leaderless for 150 s. Seen again
+      2026-09-21 on the candidate-sampling branch, same shape (~1 s or the
+      150 s wait, nothing between): interleaved single-test runs had base
+      `cafbe80` at 2/3 passing and the branch at 1/4, with the base
+      failure identical to the branch's, so still environmental. It was
+      also the one failure the full suite produced that night.
 - [ ] **`teardown.sh` silently aborts when run non-interactively, leaving the
       whole rig billing.** It prompts `read -r -p "Destroy the entire benchmark
       rig?"` unless `--yes` is passed. Under `nohup ... < /dev/null` (how any
@@ -2175,6 +2180,21 @@ Deferred from [ui-holistic-polish-plan.md](plans/ui-holistic-polish-plan.md):
 
 docs: [scheduler-and-eval-loop.md](../docs/scheduler-and-eval-loop.md), [jobs-tasks-and-scheduling.md](../docs/jobs-tasks-and-scheduling.md)
 
+- [x] **The planner's node universe truncated to one slice at rig scale —
+      root-caused and fixed** (2026-09-21,
+      [findings](aws-phase5-findings.md#open-in-priority-order),
+      [calls](calls/scheduling-index-plan_calls.md) #14,
+      [docs](../docs/scheduling-indexes.md)). Not the read model: the
+      scheduling index's candidate budget (64 for a task needing 4) was
+      applied as a cut of the best-first verified list, i.e. one tied
+      cell's sorted-id prefix, so every plan saw the same lowest-id nodes.
+      The cut inside a tied cell is now a uniform sample of the cell
+      (`truncate_within_boundary_cell`); `tests/index_truncation_spread.rs`
+      pins the rig shape (4 slices x 150 identical nodes, 40 jobs x 4,
+      spread): 104/56/0/0 per slice on the old code, 49/30/43/38 fixed.
+      Candidate
+      construction cost is unchanged within noise
+      ([benchmarks/scheduler/README.md](../benchmarks/scheduler/README.md)).
 - [x] **The read-model refresh takes the changeset delta, not a whole-node
       reload.** 2026-08-05, from the phase-4 fill-scaling finding
       ([findings](aws-phase4-findings.md),

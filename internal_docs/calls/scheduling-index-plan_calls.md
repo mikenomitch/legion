@@ -93,3 +93,35 @@ Entries are ranked by project impact, highest first.
     `schedulerSettings`) rather than live reload. Index lifecycle inside
     the read-model lock is the risky code path; not mutating it at runtime
     removes a class of bugs from v1 for a minor operator inconvenience.
+14. **(execution) A budget cut inside a tied cell samples the cell
+    uniformly; it does not take the cell's sorted-id prefix.** Found by
+    the 2026-08-06 storm drill (aws-phase5-findings.md): 25,002 `spread`
+    allocations on the first-registered quarter of a 5,000-node fleet,
+    every sampled `plan_submission` candidate list drawn from that one
+    slice. Cause: identically-shaped idle nodes project to ONE cell, a
+    task needing 4 allocations gets a 64-candidate budget, and the
+    scheduler — which asks for the whole shard best-first and truncates
+    AFTER re-verification (entry 7) — cut the verified list at the budget,
+    i.e. took that cell's sorted-id prefix. `sim-0-*` sorts first, so
+    every plan's universe was the same 64 nodes until they hit
+    `maxAllocations`, and `spread` scored among those. Fix: the query tags
+    each candidate with its cell rank (`IndexCandidates::cell_ranks`),
+    and `truncate_within_boundary_cell` keeps whole ranks and samples the
+    rank the cut lands in (`rand::seq::index::sample`, order preserved);
+    the same helper serves a budgeted `query()`. The walk across cells
+    stays deterministic. Alternatives: (a) a per-query rotating
+    offset into the cell — deterministic, but concurrent planners on the
+    same rotation still collide, and rotation state is one more thing to
+    keep coherent under the read-model lock; (b) shuffle the whole shard
+    order — throws away the nearest-fit ordering that is the index's
+    reason to exist; (c) raise the budget — hides the bug behind fleet
+    size, and the phase-5 fleet was 78x the budget; (d) a `distinct`-style
+    sub-key (hash of node id) inside cells — deterministic and fair, but
+    it fixes the sample per fleet, so two planners racing for the same
+    cell get identical lists, which is the contention late-binding apply
+    exists to absorb rather than provoke. Cost: a truncated candidate list
+    now differs between two identical `job plan` runs (documented in
+    docs/scheduling-indexes.md); the untruncated set is unchanged, so the
+    scan-equivalence property still holds. Ranked here because it decided
+    fleet utilization and failure-domain spreading at scale — one instance
+    loss took 96% of the workload on the rig.
