@@ -527,3 +527,24 @@ initializes once at start, so the event would be the first row in every new
 cluster's journal before any real work — and it shifted event ids and
 counts in every test that reasons about the journal. The transitions an
 operator actually acts on all stay as events.
+
+## 22. A leader mints its root key before answering a join
+
+**Call.** `root_key_bundle` (the join reply) mints the root key when the
+`file` provider has none yet, instead of answering with an empty bundle.
+
+**Alternatives.** Leave minting to the keyring maintenance loop and let a
+joiner that arrived first fetch the key later (a new "pull the root key"
+RPC), or document that operators must start the bootstrap manager alone
+first.
+
+**Trade-off.** The join handler now does a small piece of keyring work
+(one file write, once per cluster) that otherwise belongs to the
+maintenance loop.
+
+**Why (simplicity/ease).** Every manager of a fresh cluster starts at once;
+the first join can beat the loop's first tick. A joiner receives the root
+key only with its join reply, so an empty bundle would leave it locked the
+moment the first data key replicates — "join the cluster" would stop
+being one command exactly in the default, zero-config path. `env` and
+`exec` providers cannot mint and behave as before.

@@ -2385,8 +2385,30 @@ impl EngineJoinHandler {
         if !self.keyring.enabled() {
             return Vec::new();
         }
-        let Some(material) = self.keyring.provider().export_material() else {
-            return Vec::new();
+        // A join can arrive before this leader's keyring loop has run
+        // (every manager of a fresh cluster starts at once), so mint the
+        // root key here rather than answer with nothing: a joiner only
+        // receives the key with its join reply, and one that joined
+        // empty-handed would be locked the moment the first data key
+        // replicates. Providers that cannot mint (`env`, `exec`) still
+        // answer with what they have.
+        let provider = self.keyring.provider();
+        let material = match provider.export_material() {
+            Some(material) => material,
+            None => {
+                match provider.mint() {
+                    Ok(Some(id)) => info!(
+                        root_key_id = %id,
+                        "Minted the KV root key ahead of a manager join"
+                    ),
+                    Ok(None) => {}
+                    Err(err) => warn!(error = ?err, "Could not mint the KV root key for a join"),
+                }
+                let Some(material) = provider.export_material() else {
+                    return Vec::new();
+                };
+                material
+            }
         };
         match crate::storage::keyring::seal_root_bundle(
             &self.cluster_secret,

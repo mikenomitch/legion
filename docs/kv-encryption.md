@@ -172,8 +172,11 @@ replica and decrypt locally.
   root key from the leader as part of joining** and writes it to its own key
   file, so "join the cluster" stays one command. The key crosses the wire
   encrypted under a key derived from the cluster secret (the same secret the
-  join token carries). A manager that already has a key file keeps it. You
-  can also place the file by hand before starting the joiner.
+  join token carries). A leader that has not minted its key yet (every
+  manager of a fresh cluster starting at once) mints it before answering
+  the join, so a joiner never leaves empty-handed. A manager that already
+  has a key file keeps it. You can also place the file by hand before
+  starting the joiner.
 - **`env` / `exec`:** set the variable, or install the helper and its
   credentials, on every manager. Nothing is delivered on join.
 
