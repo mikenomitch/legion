@@ -40,13 +40,14 @@ use crate::structs::{
     GetJobSpecByConfigRequest, GetJobSpecReply, GetJobSpecRequest, GetJobTemplateReply,
     GetJobTemplateRequest, GetKvLockReply, GetKvLockRequest, GetKvReply, GetKvRequest,
     GetLedgerReply, GetLedgerRequest, GetManagerConfigsReply, GetManagerConfigsRequest,
-    GetNodeReply, GetNodeRequest, GetNodesReply, GetNodesRequest, GetObservabilityReply,
-    GetObservabilityRequest, GetRaftJoinTokenReply, GetRaftJoinTokenRequest, GetRaftStatusReply,
-    GetRaftStatusRequest, GetRolloutReply, GetRolloutRequest, GetRolloutStatusReply,
-    GetRolloutStatusRequest, GetStateBackupReply, GetStateBackupRequest, GetStateStoreSchemaReply,
-    GetStateStoreSchemaRequest, GetTaskLogsRequest, GetVolumeReply, GetVolumeRequest,
-    HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, Instance, InstanceInfo,
-    InstanceMode, InstanceState, IssueBootTicketReply, IssueBootTicketRequest,
+    GetMeshCaReply, GetMeshCaRequest, GetNodeReply, GetNodeRequest, GetNodesReply, GetNodesRequest,
+    GetObservabilityReply, GetObservabilityRequest, GetRaftJoinTokenReply, GetRaftJoinTokenRequest,
+    GetRaftStatusReply, GetRaftStatusRequest, GetRolloutReply, GetRolloutRequest,
+    GetRolloutStatusReply, GetRolloutStatusRequest, GetStateBackupReply, GetStateBackupRequest,
+    GetStateStoreSchemaReply, GetStateStoreSchemaRequest, GetTaskLogsRequest, GetVolumeReply,
+    GetVolumeRequest, HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest,
+    Instance, InstanceInfo, InstanceMode, InstanceState, IssueBootTicketReply,
+    IssueBootTicketRequest, IssueNodeCertificateReply, IssueNodeCertificateRequest,
     IssueNodeIdentityTokenReply, IssueNodeIdentityTokenRequest, IssueRaftCommandReply,
     IssueRaftCommandRequest, IssueWorkloadIdentityTokenReply, IssueWorkloadIdentityTokenRequest,
     JobConfig, JobSpecHistoryItem, JobTemplate, JobTemplateProvenance, JobTemplateSummary,
@@ -57,23 +58,32 @@ use crate::structs::{
     ListJobTemplatesRequest, ListJobsReply, ListJobsRequest, ListKvReply, ListKvRequest,
     ListRaftHistoryReply, ListRaftHistoryRequest, ListRolloutEventsReply, ListRolloutEventsRequest,
     ListRolloutsReply, ListRolloutsRequest, ListSavedStateQueriesReply,
-    ListSavedStateQueriesRequest, ListServicesReply, ListServicesRequest, ListVolumeDriversReply,
-    ListVolumeDriversRequest, ListVolumesReply, ListVolumesRequest, Node, NodeMsg, PatchKvReply,
-    PatchKvRequest, PlanJobReply, PlanJobRequest, PlannedAllocation, PutKvReply, PutKvRequest,
+    ListSavedStateQueriesRequest, ListServiceEdgesReply, ListServiceEdgesRequest,
+    ListServicesReply, ListServicesRequest, ListVolumeDriversReply, ListVolumeDriversRequest,
+    ListVolumesReply, ListVolumesRequest, Node, NodeMsg, PatchKvReply, PatchKvRequest,
+    PlanJobReply, PlanJobRequest, PlannedAllocation, PutKvReply, PutKvRequest,
     QueryStateStoreReply, QueryStateStoreRequest, RaftHistoryEvent, RaftStatus, RatifyClaimReply,
     RatifyClaimRequest, ReleaseKvLockReply, ReleaseKvLockRequest, RenderJobTemplateReply,
     RenderJobTemplateRequest, RenewKvLockReply, RenewKvLockRequest, ReplaceInstanceReply,
     ReplaceInstanceRequest, ResolveServiceReply, ResolveServiceRequest, RestartWorkerReply,
     RestartWorkerRequest, RolloutAllocationStatus, RolloutEvent, RolloutGroupStatus,
-    RolloutProgression, RolloutReplacement, RunJobReply, RunJobRequest, RunJobTemplateReply,
-    RunJobTemplateRequest, SavedStateQuery, ScaleTaskReply, ScaleTaskRequest, SchedulerEvent,
-    ServiceEndpoint, ServiceSummary, SetNodeAvailabilityReply, SetNodeAvailabilityRequest,
-    StartInstanceReply, StartInstanceRequest, StopInstanceReply, StopInstanceRequest, StopJobReply,
-    StopJobRequest, StopNotice, StopRolloutReply, StopRolloutRequest, StreamEventsRequest,
-    Submission, TaskConfig, TaskOnUnhealthyConfig, TaskScaleStatus, UpdateNodeDynamicReply,
-    UpdateNodeDynamicRequest, UpsertJobTemplateReply, UpsertJobTemplateRequest,
-    UpsertSavedStateQueryReply, UpsertSavedStateQueryRequest, WorkerConfig, WorkerPreRegisterReply,
-    WorkerPreRegisterRequest, WorkerRegisterReply, WorkerRegisterRequest,
+    RolloutProgression, RolloutReplacement, RotateMeshCaReply, RotateMeshCaRequest, RunJobReply,
+    RunJobRequest, RunJobTemplateReply, RunJobTemplateRequest, SavedStateQuery, ScaleTaskReply,
+    ScaleTaskRequest, SchedulerEvent, ServiceEdge, ServiceEndpoint, ServiceSummary,
+    SetNodeAvailabilityReply, SetNodeAvailabilityRequest, StartInstanceReply, StartInstanceRequest,
+    StopInstanceReply, StopInstanceRequest, StopJobReply, StopJobRequest, StopNotice,
+    StopRolloutReply, StopRolloutRequest, StreamEventsRequest, Submission, TaskConfig,
+    TaskOnUnhealthyConfig, TaskScaleStatus, UpdateNodeDynamicReply, UpdateNodeDynamicRequest,
+    UpsertJobTemplateReply, UpsertJobTemplateRequest, UpsertSavedStateQueryReply,
+    UpsertSavedStateQueryRequest, WorkerConfig, WorkerPreRegisterReply, WorkerPreRegisterRequest,
+    WorkerRegisterReply, WorkerRegisterRequest,
+};
+use crate::structs::{
+    AllocNetPolicy, DeleteNetPolicyReply, DeleteNetPolicyRequest, FetchNetPolicyReply,
+    FetchNetPolicyRequest, GetNetPolicyObjectReply, GetNetPolicyObjectRequest,
+    ListNetPoliciesReply, ListNetPoliciesRequest, NetPolicy, ShowNetPolicyReply,
+    ShowNetPolicyRequest, TestNetPolicyReply, TestNetPolicyRequest, UpsertNetPolicyReply,
+    UpsertNetPolicyRequest,
 };
 use crate::structs::{
     AuthMethodInfo, BootstrapAclReply, BootstrapAclRequest, CreateAclTokenReply,
@@ -1251,7 +1261,32 @@ pub struct ManagerDaemonService {
     /// Adaptive cadence is off unless `targetRatePerSecond` is set, so by
     /// default this only supplies `missedBeatsBeforeLost` to the cadence report.
     heartbeat: crate::structs::HeartbeatConfigFull,
+    /// Merged network policies by content hash (docs/network-handlers.md),
+    /// filled by the heartbeat builder and served by `FetchNetPolicy`. In
+    /// memory on purpose: the merge is deterministic, so any manager can
+    /// recompute a body from the same inputs after a failover; this is only
+    /// a shortcut for the common case. Bounded (`NET_POLICY_CACHE_MAX`).
+    net_policy_cache: Arc<Mutex<HashMap<String, crate::structs::netpolicy::EffectivePolicy>>>,
+    /// (when read, policy generation) — the store's generation counter,
+    /// re-read at most every `NET_POLICY_GENERATION_TTL`, so a cluster with
+    /// no policies pays a mutex read per heartbeat rather than a query.
+    net_policy_generation: Arc<Mutex<Option<(std::time::Instant, u64)>>>,
+    /// The service graph: per (caller job, caller task, service, tag), the
+    /// last 15 minutes of per-minute buckets folded from every node's
+    /// `net_edges` heartbeat samples. In memory: a failover loses at most the
+    /// window, and the next heartbeats refill it.
+    net_edges: Arc<Mutex<HashMap<EdgeKey, EdgeWindow>>>,
+    /// The datapath status each node last reported for its allocations
+    /// (docs/network-handlers.md). In memory like `provisional_claims`: it
+    /// is at most one heartbeat stale and a failover shows nothing until
+    /// the next beat, never a wrong answer.
+    net_status: Arc<Mutex<HashMap<String, Vec<crate::structs::NetAllocStatus>>>>,
 }
+
+/// Distinct merged policy bodies kept in memory.
+const NET_POLICY_CACHE_MAX: usize = 4096;
+/// How stale the cached policy generation may be before the store is asked.
+const NET_POLICY_GENERATION_TTL: Duration = Duration::from_secs(1);
 
 impl ManagerDaemonService {
     /// Service with ACLs disabled (tests, embedded use).
@@ -1280,7 +1315,56 @@ impl ManagerDaemonService {
             edge_boot: crate::structs::EdgeBootConfigFull::default(),
             provisional_claims: Arc::new(Mutex::new(HashMap::new())),
             heartbeat: crate::structs::HeartbeatConfigFull::default(),
+            net_policy_cache: Arc::new(Mutex::new(HashMap::new())),
+            net_policy_generation: Arc::new(Mutex::new(None)),
+            net_status: Arc::new(Mutex::new(HashMap::new())),
+            net_edges: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// The store's network-policy generation, cached for
+    /// `NET_POLICY_GENERATION_TTL`. Zero means no policy has ever been
+    /// written on this cluster.
+    fn net_policy_generation_cached(&self) -> u64 {
+        let now = std::time::Instant::now();
+        {
+            let cached = self
+                .net_policy_generation
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if let Some((read_at, generation)) = *cached {
+                if now.duration_since(read_at) < NET_POLICY_GENERATION_TTL {
+                    return generation;
+                }
+            }
+        }
+        let generation = self.store.net_policy_generation().unwrap_or(0);
+        *self
+            .net_policy_generation
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some((now, generation));
+        generation
+    }
+
+    /// Forget the cached generation (after a write on this manager).
+    fn bump_net_policy_generation(&self) {
+        *self
+            .net_policy_generation
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = None;
+    }
+
+    fn remember_net_policy(&self, policy: &crate::structs::netpolicy::EffectivePolicy) {
+        let mut cache = self
+            .net_policy_cache
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if cache.len() >= NET_POLICY_CACHE_MAX && !cache.contains_key(&policy.hash) {
+            cache.clear();
+        }
+        cache
+            .entry(policy.hash.clone())
+            .or_insert_with(|| policy.clone());
     }
 
     /// Attach the manager's heartbeat-cadence settings (`run_manager` always
@@ -5231,6 +5315,99 @@ impl Manager for ManagerDaemonService {
         }))
     }
 
+    async fn get_mesh_ca(
+        &self,
+        request: Request<GetMeshCaRequest>,
+    ) -> Result<Response<GetMeshCaReply>, Status> {
+        self.check_acl(&request, AclResource::Net, AclAction::Read, AclScope::any())?;
+        let ca = self
+            .store
+            .mesh_ca()
+            .map_err(|e| map_store_error("Error reading the mesh CA", e))?;
+        Ok(Response::new(match ca {
+            Some(ca) => GetMeshCaReply {
+                cert_pem: ca.cert_pem,
+                created_at: ca.created_at,
+            },
+            None => GetMeshCaReply::default(),
+        }))
+    }
+
+    async fn rotate_mesh_ca(
+        &self,
+        request: Request<RotateMeshCaRequest>,
+    ) -> Result<Response<RotateMeshCaReply>, Status> {
+        let identity = self.check_acl(
+            &request,
+            AclResource::Net,
+            AclAction::Write,
+            AclScope::any(),
+        )?;
+        let ca = self
+            .store
+            .rotate_mesh_ca()
+            .map_err(|e| map_store_error("Error rotating the mesh CA", e))?;
+        info!(
+            accessor = identity.accessor_id.as_deref().unwrap_or("-"),
+            "Rotated the mesh CA; nodes re-issue on their next heartbeat"
+        );
+        Ok(Response::new(RotateMeshCaReply {
+            cert_pem: ca.cert_pem,
+            created_at: ca.created_at,
+        }))
+    }
+
+    #[instrument(skip_all, fields(node_id))]
+    async fn issue_node_certificate(
+        &self,
+        request: Request<IssueNodeCertificateRequest>,
+    ) -> Result<Response<IssueNodeCertificateReply>, Status> {
+        // ACL: worker-plane endpoint. Node ownership is bound to the
+        // authenticated principal (same trust model as node identity tokens).
+        let identity = self.authenticate_acl(&request)?;
+        acl::enforce_worker_plane(&identity)?;
+        let caller_is_management = identity.is_management;
+        let caller_principal = identity.principal.clone();
+        let audit_only = identity.audit_only;
+        let req = request.into_inner();
+        tracing::Span::current().record("node_id", req.node_id.as_str());
+        if !caller_is_management && caller_principal != format!("node:{}", req.node_id) {
+            if audit_only {
+                warn!(
+                    target: "acl_audit",
+                    principal = %caller_principal,
+                    node_id = %req.node_id,
+                    "audit-only: a certificate for another node would have been refused"
+                );
+            } else {
+                return Err(Status::permission_denied(format!(
+                    "worker {caller_principal:?} may not request a certificate for node {:?}",
+                    req.node_id
+                )));
+            }
+        }
+        self.store
+            .get_node(&req.node_id)
+            .map_err(|_| Status::not_found(format!("node {:?} is not registered", req.node_id)))?;
+        let ca = self
+            .store
+            .ensure_mesh_ca()
+            .map_err(|e| map_store_error("Error creating the mesh CA", e))?;
+        let (cert_pem, key_pem, expires_at) =
+            crate::manager::mesh_ca::issue_node_cert(&ca.cert_pem, &ca.key_pem, &req.node_id)
+                .map_err(|e| {
+                    error!(error = ?e, "Error signing a node certificate");
+                    Status::internal("failed to sign the node certificate")
+                })?;
+        info!(node_id = %req.node_id, expires_at, "Issued mesh node certificate");
+        Ok(Response::new(IssueNodeCertificateReply {
+            cert_pem,
+            key_pem,
+            ca_pem: ca.cert_pem,
+            expires_at,
+        }))
+    }
+
     #[instrument(skip_all, fields(node_id, identity_name))]
     async fn issue_node_identity_token(
         &self,
@@ -5374,7 +5551,36 @@ impl Manager for ManagerDaemonService {
         // (no store access at all) when no desired allocation uses connect, and
         // is infallible by construction: a connect-layer problem must never
         // stop this node from reconciling its allocations.
-        let upstream_endpoints = build_upstream_endpoints(&self.store, &desired_allocations);
+        let mut upstream_endpoints = build_upstream_endpoints(&self.store, &desired_allocations);
+        // Effective network policy per desired allocation, as content hashes.
+        // Same contract as the endpoint feed: no store access when no policy
+        // exists and no task declares one; never fails the heartbeat.
+        let net_policies = self.build_net_policies(&id, &desired_allocations);
+        // `proxy` handler targets ride the same feed, flagged `for_handler`.
+        upstream_endpoints
+            .extend(self.build_handler_endpoints(&desired_allocations, &net_policies));
+        // Denials the node's datapath recorded, turned into events so "which
+        // rule blocked it" is answerable without node access.
+        for denial in &req.net_denials {
+            self.store.events().net_denied(&id, denial);
+        }
+        // The node's own view of its datapath, replaced wholesale per node.
+        {
+            let mut status = self.net_status.lock().unwrap_or_else(|p| p.into_inner());
+            if req.net_status.is_empty() {
+                status.remove(&id);
+            } else {
+                status.insert(id.clone(), req.net_status.clone());
+            }
+        }
+        // Service-graph samples: fold into per-(caller, service) windows.
+        if !req.net_edges.is_empty() {
+            let callers: HashMap<i64, (String, String)> = desired_allocations
+                .iter()
+                .map(|a| (a.allocation_id, (a.job_id.clone(), a.task_name.clone())))
+                .collect();
+            self.fold_net_edges(&req.net_edges, &callers);
+        }
         // Reclaim work for this node. Re-sent every heartbeat until the worker
         // confirms, so a worker that dies mid-destroy simply retries.
         let volume_destroy = build_volume_destroy_requests(&self.store, &id);
@@ -5423,6 +5629,7 @@ impl Manager for ManagerDaemonService {
             .map(|interval| interval.as_secs() as u32);
 
         let reply = HeartbeatReply {
+            net_policies,
             message: "ack".into(),
             desired_allocations,
             upstream_endpoints,
@@ -6529,6 +6736,463 @@ impl Manager for ManagerDaemonService {
     }
 
     #[instrument(skip_all)]
+    async fn upsert_net_policy(
+        &self,
+        request: Request<UpsertNetPolicyRequest>,
+    ) -> Result<Response<UpsertNetPolicyReply>, Status> {
+        // Coarse gate before the body is parsed, precise per-pool scope after.
+        let identity = self.check_acl(
+            &request,
+            AclResource::Net,
+            AclAction::Write,
+            AclScope::any(),
+        )?;
+        let req = request.into_inner();
+        let mut object: crate::structs::netpolicy::NetPolicyObject =
+            serde_json::from_str(&req.object_json)
+                .map_err(|e| Status::invalid_argument(format!("invalid net policy object: {e}")))?;
+        object
+            .normalize_and_validate()
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        enforce_net_policy_scope(&identity, AclAction::Write, &object)?;
+
+        let affected = self.affected_allocations_for_policy(&object);
+        if req.dry_run {
+            return Ok(Response::new(UpsertNetPolicyReply {
+                policy: Some(net_policy_to_proto(&object, "", "")),
+                affected_allocations: affected,
+            }));
+        }
+        let record = self
+            .store
+            .upsert_net_policy(object)
+            .map_err(|e| map_store_error("Error saving net policy", e))?;
+        self.bump_net_policy_generation();
+        self.store.events().net_policy_applied(
+            &record.object.name,
+            &record.object.enforcement,
+            record.object.priority,
+            affected.len(),
+        );
+        Ok(Response::new(UpsertNetPolicyReply {
+            policy: Some(net_policy_to_proto(
+                &record.object,
+                &record.created_at,
+                &record.updated_at,
+            )),
+            affected_allocations: affected,
+        }))
+    }
+
+    #[instrument(skip_all)]
+    async fn get_net_policy_object(
+        &self,
+        request: Request<GetNetPolicyObjectRequest>,
+    ) -> Result<Response<GetNetPolicyObjectReply>, Status> {
+        let identity =
+            self.check_acl(&request, AclResource::Net, AclAction::Read, AclScope::any())?;
+        let name = request.into_inner().name;
+        let record = self
+            .store
+            .get_net_policy(&name)
+            .map_err(|e| map_store_error("Error loading net policy", e))?
+            .ok_or_else(|| Status::not_found(format!("net policy '{name}' not found")))?;
+        enforce_net_policy_scope(&identity, AclAction::Read, &record.object)?;
+        Ok(Response::new(GetNetPolicyObjectReply {
+            policy: Some(net_policy_to_proto(
+                &record.object,
+                &record.created_at,
+                &record.updated_at,
+            )),
+        }))
+    }
+
+    #[instrument(skip_all)]
+    async fn list_net_policies(
+        &self,
+        request: Request<ListNetPoliciesRequest>,
+    ) -> Result<Response<ListNetPoliciesReply>, Status> {
+        let identity =
+            self.check_acl(&request, AclResource::Net, AclAction::Read, AclScope::any())?;
+        let records = self
+            .store
+            .list_net_policies()
+            .map_err(|e| map_store_error("Error listing net policies", e))?;
+        let policies = records
+            .iter()
+            .filter(|record| {
+                enforce_net_policy_scope(&identity, AclAction::Read, &record.object).is_ok()
+            })
+            .map(|record| {
+                net_policy_to_proto(&record.object, &record.created_at, &record.updated_at)
+            })
+            .collect();
+        let generation = self.store.net_policy_generation().unwrap_or(0);
+        Ok(Response::new(ListNetPoliciesReply {
+            policies,
+            generation,
+        }))
+    }
+
+    #[instrument(skip_all)]
+    async fn delete_net_policy(
+        &self,
+        request: Request<DeleteNetPolicyRequest>,
+    ) -> Result<Response<DeleteNetPolicyReply>, Status> {
+        let identity = self.check_acl(
+            &request,
+            AclResource::Net,
+            AclAction::Write,
+            AclScope::any(),
+        )?;
+        let name = request.into_inner().name;
+        let record = self
+            .store
+            .get_net_policy(&name)
+            .map_err(|e| map_store_error("Error loading net policy", e))?
+            .ok_or_else(|| Status::not_found(format!("net policy '{name}' not found")))?;
+        enforce_net_policy_scope(&identity, AclAction::Write, &record.object)?;
+        self.store
+            .delete_net_policy(&name)
+            .map_err(|e| map_store_error("Error deleting net policy", e))?;
+        self.bump_net_policy_generation();
+        self.store.events().net_policy_deleted(&name);
+        Ok(Response::new(DeleteNetPolicyReply {}))
+    }
+
+    #[instrument(skip_all)]
+    async fn show_net_policy(
+        &self,
+        request: Request<ShowNetPolicyRequest>,
+    ) -> Result<Response<ShowNetPolicyReply>, Status> {
+        let identity =
+            self.check_acl(&request, AclResource::Net, AclAction::Read, AclScope::any())?;
+        let req = request.into_inner();
+        acl::enforce(
+            &identity,
+            AclResource::Net,
+            AclAction::Read,
+            &AclScope::job(&req.job_id),
+        )?;
+        let (task, facts) =
+            self.net_policy_task_facts(&req.job_id, &req.task_name, &req.node_pool)?;
+        let (effective, matched) = self.effective_net_policy(&facts, task.network.as_ref());
+        let declared_mode = task
+            .network
+            .as_ref()
+            .map(|n| n.mode.clone())
+            .unwrap_or_else(|| "auto".to_string());
+        let effective_mode = effective
+            .mode
+            .clone()
+            .unwrap_or_else(|| declared_mode.clone());
+        let node_status_json = self.net_status_for_task(&req.job_id, &task.name);
+        Ok(Response::new(ShowNetPolicyReply {
+            effective_json: serde_json::to_string(&effective).unwrap_or_default(),
+            matched_policies: matched,
+            declared_mode,
+            effective_mode,
+            node_status_json,
+        }))
+    }
+
+    #[instrument(skip_all)]
+    async fn test_net_policy(
+        &self,
+        request: Request<TestNetPolicyRequest>,
+    ) -> Result<Response<TestNetPolicyReply>, Status> {
+        use crate::structs::netpolicy::{
+            evaluate_connect, evaluate_request, ConnectFacts, RequestFacts, Verdict,
+        };
+        let identity =
+            self.check_acl(&request, AclResource::Net, AclAction::Read, AclScope::any())?;
+        let req = request.into_inner();
+        acl::enforce(
+            &identity,
+            AclResource::Net,
+            AclAction::Read,
+            &AclScope::job(&req.job_id),
+        )?;
+        let (task, facts) =
+            self.net_policy_task_facts(&req.job_id, &req.task_name, &req.node_pool)?;
+        let (effective, _) = self.effective_net_policy(&facts, task.network.as_ref());
+
+        let (direction, chain, target) = if !req.to.trim().is_empty() {
+            (
+                "egress",
+                effective.egress.as_ref(),
+                req.to.trim().to_string(),
+            )
+        } else if !req.from.trim().is_empty() {
+            (
+                "ingress",
+                effective.ingress.as_ref(),
+                req.from.trim().to_string(),
+            )
+        } else {
+            return Err(Status::invalid_argument(
+                "set `to` (egress) or `from` (ingress)",
+            ));
+        };
+        let parsed = parse_test_target(&target);
+        let (host, ip, port, mut path) = parsed;
+        if !req.path.trim().is_empty() {
+            path = Some(req.path.trim().to_string());
+        }
+        let Some(chain) = chain else {
+            return Ok(Response::new(TestNetPolicyReply {
+                verdict: "allow".into(),
+                source: String::new(),
+                reason: String::new(),
+                direction: direction.into(),
+                protocol: String::new(),
+                explanation: format!(
+                    "no {direction} policy applies to this task; everything is allowed"
+                ),
+            }));
+        };
+        let identity_str = req.identity.trim();
+        let identity_opt = (!identity_str.is_empty()).then_some(identity_str);
+        let verdict = if !req.method.trim().is_empty() || path.is_some() {
+            if !chain.is_http() {
+                // A tcp chain never sees requests; report the connect verdict.
+                evaluate_connect(
+                    chain,
+                    &ConnectFacts {
+                        host: host.as_deref(),
+                        ip,
+                        port,
+                        identity: identity_opt,
+                    },
+                )
+            } else {
+                let method = if req.method.trim().is_empty() {
+                    "GET"
+                } else {
+                    req.method.trim()
+                };
+                evaluate_request(
+                    chain,
+                    &RequestFacts {
+                        host: host.as_deref(),
+                        ip,
+                        port,
+                        identity: identity_opt,
+                        method,
+                        path: path.as_deref().unwrap_or("/"),
+                        headers: &[],
+                    },
+                )
+            }
+        } else {
+            evaluate_connect(
+                chain,
+                &ConnectFacts {
+                    host: host.as_deref(),
+                    ip,
+                    port,
+                    identity: identity_opt,
+                },
+            )
+        };
+        let (verdict_str, source, reason) = match &verdict {
+            Verdict::Allow => ("allow".to_string(), String::new(), String::new()),
+            Verdict::Deny { source, reason } => (
+                "deny".to_string(),
+                source.clone(),
+                reason.clone().unwrap_or_default(),
+            ),
+            Verdict::Defer => ("defer".to_string(), String::new(), String::new()),
+        };
+        let explanation = match &verdict {
+            Verdict::Allow if chain.denies_by_default() => format!("{target}: allowed by a rule"),
+            Verdict::Allow => format!("{target}: allowed (no rule matched; policy is allow)"),
+            Verdict::Deny { source, reason } => match reason {
+                Some(reason) => format!("{target}: denied by {source} — {reason}"),
+                None => format!("{target}: denied by {source}"),
+            },
+            Verdict::Defer => format!(
+                "{target}: a request-time rule (path/method/header) would decide; pass --method/--path to test it"
+            ),
+        };
+        Ok(Response::new(TestNetPolicyReply {
+            verdict: verdict_str,
+            source,
+            reason,
+            direction: direction.into(),
+            protocol: chain.protocol.clone(),
+            explanation,
+        }))
+    }
+
+    #[instrument(skip_all)]
+    async fn fetch_net_policy(
+        &self,
+        request: Request<FetchNetPolicyRequest>,
+    ) -> Result<Response<FetchNetPolicyReply>, Status> {
+        // ACL: worker-plane endpoint (nodes fetch the merged policy bodies the
+        // heartbeat reply named for allocations placed on them).
+        let identity = self.authenticate_acl(&request)?;
+        acl::enforce_worker_plane(&identity)?;
+        let req = request.into_inner();
+        if req.hash.trim().is_empty() {
+            return Err(Status::invalid_argument("hash is required"));
+        }
+        let cached = {
+            let cache = self
+                .net_policy_cache
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            cache.get(&req.hash).cloned()
+        };
+        let policy = match cached {
+            Some(policy) => policy,
+            None => {
+                // A failover or restart emptied the cache: recompute from the
+                // node's desired set, which is what produced the hash.
+                let desired = build_desired_allocations(&self.store, &req.node_id, &[])
+                    .map_err(|e| map_store_error("Error building desired allocations", e))?;
+                let _ = self.build_net_policies(&req.node_id, &desired);
+                let cache = self
+                    .net_policy_cache
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                cache.get(&req.hash).cloned().ok_or_else(|| {
+                    Status::not_found(format!("no policy body for hash {}", req.hash))
+                })?
+            }
+        };
+        Ok(Response::new(FetchNetPolicyReply {
+            effective_json: serde_json::to_string(&policy).unwrap_or_default(),
+        }))
+    }
+
+    #[instrument(skip_all)]
+    async fn list_service_edges(
+        &self,
+        request: Request<ListServiceEdgesRequest>,
+    ) -> Result<Response<ListServiceEdgesReply>, Status> {
+        // Like the catalog, a projection over jobs and allocations: job:read.
+        self.check_acl(&request, AclResource::Job, AclAction::Read, AclScope::any())?;
+        let req = request.into_inner();
+        let window_secs = if req.window_secs == 0 {
+            300
+        } else {
+            req.window_secs.clamp(60, (EDGE_WINDOW_MINUTES * 60) as u32)
+        };
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let since_minute = now / 60 - i64::from(window_secs / 60);
+
+        // Observed edges. `latency_ms_avg` accumulates the sum until the
+        // division below.
+        let mut edges: std::collections::BTreeMap<EdgeKey, ServiceEdge> =
+            std::collections::BTreeMap::new();
+        {
+            let windows = self.net_edges.lock().unwrap_or_else(|p| p.into_inner());
+            for ((job, task, service, tag), window) in windows.iter() {
+                let mut edge = ServiceEdge {
+                    caller_job: job.clone(),
+                    caller_task: task.clone(),
+                    service: service.clone(),
+                    tag: tag.clone(),
+                    protocol: window.protocol.clone(),
+                    allowed: true,
+                    last_seen_unix: window.last_seen,
+                    ..Default::default()
+                };
+                for bucket in window.buckets.iter().filter(|b| b.minute >= since_minute) {
+                    edge.requests += bucket.requests;
+                    edge.errors += bucket.errors;
+                    edge.denied += bucket.denied;
+                    edge.latency_ms_avg += bucket.latency_ms_sum as f64;
+                    edge.latency_ms_max = edge.latency_ms_max.max(bucket.latency_ms_max);
+                    edge.bytes_out += bucket.bytes_out;
+                    edge.bytes_in += bucket.bytes_in;
+                }
+                edges.insert(
+                    (job.clone(), task.clone(), service.clone(), tag.clone()),
+                    edge,
+                );
+            }
+        }
+
+        // Declared edges, and the allow verdict for every edge.
+        let allow_by_service: HashMap<String, Vec<String>> = self
+            .store
+            .declared_services()
+            .map_err(|e| map_store_error("Error listing declared services", e))?
+            .into_iter()
+            .map(|s| (s.service, s.allow))
+            .collect();
+        let consumers = self
+            .store
+            .declared_consumers()
+            .map_err(|e| map_store_error("Error listing declared consumers", e))?;
+        for consumer in consumers {
+            for upstream in &consumer.upstreams {
+                let service = upstream.key().to_string();
+                // Tagged observed edges for the same (caller, service) are
+                // declared too.
+                let mut any = false;
+                for ((job, task, svc, _), edge) in edges.iter_mut() {
+                    if *job == consumer.job_id && *task == consumer.task_name && *svc == service {
+                        edge.declared = true;
+                        any = true;
+                    }
+                }
+                if !any {
+                    edges.insert(
+                        (
+                            consumer.job_id.clone(),
+                            consumer.task_name.clone(),
+                            service.clone(),
+                            String::new(),
+                        ),
+                        ServiceEdge {
+                            caller_job: consumer.job_id.clone(),
+                            caller_task: consumer.task_name.clone(),
+                            service,
+                            declared: true,
+                            allowed: true,
+                            ..Default::default()
+                        },
+                    );
+                }
+            }
+        }
+        let secs = f64::from(window_secs);
+        for ((job, _, service, _), edge) in edges.iter_mut() {
+            if let Some(allow) = allow_by_service.get(service) {
+                edge.allowed = crate::structs::allow_permits(allow, job);
+            }
+            edge.rps = edge.requests as f64 / secs;
+            edge.error_rate = if edge.requests + edge.errors > 0 {
+                edge.errors as f64 / (edge.requests + edge.errors) as f64
+            } else {
+                0.0
+            };
+            if edge.requests > 0 {
+                edge.latency_ms_avg /= edge.requests as f64;
+            }
+        }
+        let filter = req.service.trim();
+        let mut out: Vec<ServiceEdge> = edges
+            .into_values()
+            .filter(|edge| filter.is_empty() || edge.service == filter || edge.caller_job == filter)
+            .collect();
+        out.sort_by(|a, b| {
+            a.service
+                .cmp(&b.service)
+                .then_with(|| a.caller_job.cmp(&b.caller_job))
+                .then_with(|| a.caller_task.cmp(&b.caller_task))
+                .then_with(|| a.tag.cmp(&b.tag))
+        });
+        Ok(Response::new(ListServiceEdgesReply {
+            edges: out,
+            window_secs,
+        }))
+    }
+
     async fn list_services(
         &self,
         request: Request<ListServicesRequest>,
@@ -6616,6 +7280,7 @@ impl Manager for ManagerDaemonService {
                 tags: endpoint.tags,
                 meta: endpoint.meta.into_iter().collect(),
                 port_label: endpoint.port_label.unwrap_or_default(),
+                mesh_tls: endpoint.mesh_tls,
             })
             .collect();
 
@@ -8569,6 +9234,554 @@ fn build_desired_allocations(
 /// property, without taking the node's whole allocation reconciliation (and,
 /// after each stateful task's fence window, its running allocations) down with
 /// it.
+impl ManagerDaemonService {
+    /// Effective network policy for every desired allocation, as content
+    /// hashes. Zero store access when the cluster has no policy (cached
+    /// generation) and no task on this node declares one.
+    fn build_net_policies(
+        &self,
+        node_id: &str,
+        desired: &[crate::structs::TaskAllocation],
+    ) -> Vec<AllocNetPolicy> {
+        use crate::structs::netpolicy::NetSelectorFacts;
+        let any_inline = desired
+            .iter()
+            .any(|allocation| !allocation.task_network.trim().is_empty());
+        if self.net_policy_generation_cached() == 0 && !any_inline {
+            return Vec::new();
+        }
+        // Stored policies once per heartbeat; the node's pool once, and only
+        // when a policy could select on it.
+        let stored: Vec<crate::structs::netpolicy::NetPolicyObject> = match self
+            .store
+            .list_net_policies()
+        {
+            Ok(records) => records.into_iter().map(|record| record.object).collect(),
+            Err(err) => {
+                warn!(node_id = %node_id, error = ?err, "Skipping net policies; listing failed");
+                return Vec::new();
+            }
+        };
+        let needs_pool = stored.iter().any(|p| !p.selector.node_pools.is_empty());
+        let node_pool = if needs_pool {
+            self.store.get_node(node_id).ok().map(|node| node.pool)
+        } else {
+            None
+        };
+        let mut out = Vec::new();
+        for allocation in desired {
+            let network: Option<crate::structs::NetworkConfig> =
+                if allocation.task_network.trim().is_empty() {
+                    None
+                } else {
+                    match serde_json::from_str(&allocation.task_network) {
+                        Ok(network) => Some(network),
+                        Err(err) => {
+                            warn!(
+                                allocation_id = allocation.allocation_id,
+                                error = ?err,
+                                "Skipping net policy; invalid task network payload"
+                            );
+                            continue;
+                        }
+                    }
+                };
+            let facts = NetSelectorFacts {
+                node_pool: node_pool.clone(),
+                namespace: String::new(),
+                runtime: allocation.task_runtime.clone(),
+                job: allocation.job_id.clone(),
+                labels: network
+                    .as_ref()
+                    .map(|n| n.labels.clone())
+                    .unwrap_or_default(),
+            };
+            let (effective, _) = merge_net_policies(&stored, &facts, network.as_ref());
+            // A gated allocation is told about an *empty* policy too, so the
+            // node can tell "known: nothing applies" (allow through the
+            // datapath) from "pending" (fail closed).
+            let gated = network
+                .as_ref()
+                .is_some_and(|n| n.mode == crate::structs::netpolicy::MODE_GATED)
+                || effective.mode.as_deref() == Some(crate::structs::netpolicy::MODE_GATED);
+            if effective.is_empty() && !gated {
+                continue;
+            }
+            self.remember_net_policy(&effective);
+            out.push(AllocNetPolicy {
+                allocation_id: allocation.allocation_id,
+                policy_hash: effective.hash.clone(),
+            });
+        }
+        out
+    }
+
+    /// The effective policy for one task, given selector facts. Returns the
+    /// merge and the matched stored policy names in application order.
+    fn effective_net_policy(
+        &self,
+        facts: &crate::structs::netpolicy::NetSelectorFacts,
+        network: Option<&crate::structs::NetworkConfig>,
+    ) -> (crate::structs::netpolicy::EffectivePolicy, Vec<String>) {
+        let stored: Vec<crate::structs::netpolicy::NetPolicyObject> = self
+            .store
+            .list_net_policies()
+            .map(|records| records.into_iter().map(|record| record.object).collect())
+            .unwrap_or_default();
+        merge_net_policies(&stored, facts, network)
+    }
+
+    /// Resolve (job, task) to the task config and its selector facts.
+    fn net_policy_task_facts(
+        &self,
+        job_id: &str,
+        task_name: &str,
+        node_pool: &str,
+    ) -> Result<
+        (
+            crate::structs::TaskConfig,
+            crate::structs::netpolicy::NetSelectorFacts,
+        ),
+        Status,
+    > {
+        if job_id.trim().is_empty() {
+            return Err(Status::invalid_argument("job_id is required"));
+        }
+        let config = self
+            .store
+            .get_job_config_optional(job_id)
+            .map_err(|e| map_store_error("Error loading job", e))?
+            .ok_or_else(|| Status::not_found(format!("job '{job_id}' not found")))?;
+        let task = if task_name.trim().is_empty() {
+            if config.tasks.len() == 1 {
+                config.tasks[0].clone()
+            } else {
+                return Err(Status::invalid_argument(format!(
+                    "job '{job_id}' has {} tasks; name one with task_name ({})",
+                    config.tasks.len(),
+                    config
+                        .tasks
+                        .iter()
+                        .map(|t| t.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )));
+            }
+        } else {
+            config
+                .tasks
+                .iter()
+                .find(|t| t.name == task_name)
+                .cloned()
+                .ok_or_else(|| {
+                    Status::not_found(format!("task '{task_name}' not found in job '{job_id}'"))
+                })?
+        };
+        let facts = crate::structs::netpolicy::NetSelectorFacts {
+            node_pool: (!node_pool.trim().is_empty()).then(|| node_pool.trim().to_string()),
+            namespace: String::new(),
+            runtime: task.runtime.clone(),
+            job: job_id.to_string(),
+            labels: task
+                .network
+                .as_ref()
+                .map(|n| n.labels.clone())
+                .unwrap_or_default(),
+        };
+        Ok((task, facts))
+    }
+
+    /// The datapath status nodes last reported for this task's running
+    /// allocations, as JSON, for `net doctor` and the UI.
+    /// Endpoint lists for every `proxy` handler target (`service` or `node`)
+    /// on the desired allocations' effective chains and upstreams, so the
+    /// datapath can hand a flow to an external proxy without a listener of
+    /// its own. Empty on nodes with no handler anywhere — the common case
+    /// costs one pass over the policy hashes.
+    fn build_handler_endpoints(
+        &self,
+        desired: &[crate::structs::TaskAllocation],
+        policies: &[crate::structs::AllocNetPolicy],
+    ) -> Vec<crate::structs::UpstreamEndpoints> {
+        use crate::structs::netpolicy::HANDLER_PROXY;
+        let mut wanted: Vec<(i64, String, String)> = Vec::new();
+        let by_alloc: HashMap<i64, &str> = policies
+            .iter()
+            .map(|p| (p.allocation_id, p.policy_hash.as_str()))
+            .collect();
+        for allocation in desired {
+            let mut services: Vec<String> = Vec::new();
+            if let Some(hash) = by_alloc.get(&allocation.allocation_id) {
+                let cached = {
+                    let cache = self
+                        .net_policy_cache
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner());
+                    cache.get(*hash).cloned()
+                };
+                if let Some(policy) = cached {
+                    for chain in [policy.egress.as_ref(), policy.ingress.as_ref()]
+                        .into_iter()
+                        .flatten()
+                    {
+                        for hop in &chain.handlers {
+                            if hop.handler.handler == HANDLER_PROXY {
+                                if let Some(service) =
+                                    hop.handler.service.as_ref().or(hop.handler.node.as_ref())
+                                {
+                                    services.push(service.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if !allocation.task_connect.trim().is_empty() {
+                if let Ok(connect) =
+                    serde_json::from_str::<crate::structs::ConnectConfig>(&allocation.task_connect)
+                {
+                    for upstream in &connect.upstreams {
+                        for hop in &upstream.handlers {
+                            if hop.handler == HANDLER_PROXY {
+                                if let Some(service) = hop.service.as_ref().or(hop.node.as_ref()) {
+                                    services.push(service.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            services.sort();
+            services.dedup();
+            for service in services {
+                wanted.push((allocation.allocation_id, service, allocation.job_id.clone()));
+            }
+        }
+        if wanted.is_empty() {
+            return Vec::new();
+        }
+        let mut resolved: HashMap<String, Vec<crate::structs::ServiceEndpointRow>> = HashMap::new();
+        let mut out = Vec::new();
+        for (allocation_id, service, job_id) in wanted {
+            if !resolved.contains_key(&service) {
+                let rows = self
+                    .store
+                    .service_endpoints(Some(&service))
+                    .unwrap_or_default();
+                resolved.insert(service.clone(), rows);
+            }
+            let endpoints = resolved[&service]
+                .iter()
+                .filter(|row| row.healthy && crate::structs::allow_permits(&row.allow, &job_id))
+                .map(|row| ServiceEndpoint {
+                    service: row.service.clone(),
+                    job_id: row.job_id.clone(),
+                    task_name: row.task_name.clone(),
+                    allocation_id: row.allocation_id,
+                    node_id: row.node_id.clone(),
+                    address: row.address.clone().unwrap_or_default(),
+                    port: u32::from(row.port.unwrap_or(0)),
+                    healthy: row.healthy,
+                    health_status: row.health_status.clone(),
+                    tags: row.tags.clone(),
+                    meta: row.meta.clone().into_iter().collect(),
+                    port_label: row.port_label.clone().unwrap_or_default(),
+                    mesh_tls: row.mesh_tls,
+                })
+                .collect();
+            out.push(crate::structs::UpstreamEndpoints {
+                allocation_id,
+                service,
+                endpoints,
+                for_handler: true,
+            });
+        }
+        out
+    }
+
+    /// Fold one node's edge samples into the graph windows.
+    fn fold_net_edges(
+        &self,
+        samples: &[crate::structs::NetEdgeSample],
+        callers: &HashMap<i64, (String, String)>,
+    ) {
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let minute = now / 60;
+        let mut edges = self.net_edges.lock().unwrap_or_else(|p| p.into_inner());
+        for sample in samples {
+            let Some((job, task)) = callers.get(&sample.allocation_id) else {
+                continue;
+            };
+            let key = (
+                job.clone(),
+                task.clone(),
+                sample.service.clone(),
+                sample.tag.clone(),
+            );
+            let window = edges.entry(key).or_default();
+            if !sample.protocol.is_empty() {
+                window.protocol = sample.protocol.clone();
+            }
+            window.last_seen = now;
+            if window.buckets.back().is_none_or(|b| b.minute != minute) {
+                window.buckets.push_back(EdgeBucket {
+                    minute,
+                    ..Default::default()
+                });
+                while window.buckets.len() as i64 > EDGE_WINDOW_MINUTES {
+                    window.buckets.pop_front();
+                }
+            }
+            let bucket = window.buckets.back_mut().expect("bucket just pushed");
+            bucket.requests += sample.requests;
+            bucket.errors += sample.errors;
+            bucket.denied += sample.denied;
+            bucket.latency_ms_sum += sample.latency_ms_sum;
+            bucket.latency_ms_max = bucket.latency_ms_max.max(sample.latency_ms_max);
+            bucket.bytes_out += sample.bytes_out;
+            bucket.bytes_in += sample.bytes_in;
+        }
+        // Idle edges age out with their last bucket.
+        edges.retain(|_, window| now - window.last_seen <= EDGE_WINDOW_MINUTES * 60);
+    }
+
+    fn net_status_for_task(&self, job_id: &str, task_name: &str) -> Vec<String> {
+        let Ok(allocations) = self.store.allocs_for_job(job_id) else {
+            return Vec::new();
+        };
+        let mut task_allocs: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        let mut configs: HashMap<i64, bool> = HashMap::new();
+        for allocation in &allocations {
+            let is_task = *configs.entry(allocation.task_config_id).or_insert_with(|| {
+                self.store
+                    .get_task_config_by_id(allocation.task_config_id)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|task| task.name == task_name)
+            });
+            if is_task {
+                task_allocs.insert(allocation.id);
+            }
+        }
+        let status = self.net_status.lock().unwrap_or_else(|p| p.into_inner());
+        let mut out = Vec::new();
+        for (node_id, entries) in status.iter() {
+            for entry in entries {
+                if task_allocs.contains(&entry.allocation_id) {
+                    out.push(
+                        serde_json::to_string(&net_status_json(node_id, entry)).unwrap_or_default(),
+                    );
+                }
+            }
+        }
+        out
+    }
+
+    /// Running allocations whose effective policy would change if `object`
+    /// were applied, as `job/task@allocation`. Best effort; used by dry runs
+    /// and the applied event.
+    fn affected_allocations_for_policy(
+        &self,
+        object: &crate::structs::netpolicy::NetPolicyObject,
+    ) -> Vec<String> {
+        use crate::structs::netpolicy::NetSelectorFacts;
+        let Ok(allocations) = self.store.get_allocs() else {
+            return Vec::new();
+        };
+        let mut nodes: HashMap<String, Option<String>> = HashMap::new();
+        let mut configs: HashMap<i64, crate::structs::TaskConfig> = HashMap::new();
+        let mut out = Vec::new();
+        for allocation in allocations {
+            let pool = nodes
+                .entry(allocation.node_id.clone())
+                .or_insert_with(|| {
+                    self.store
+                        .get_node(&allocation.node_id)
+                        .ok()
+                        .map(|n| n.pool)
+                })
+                .clone();
+            let task = match configs.get(&allocation.task_config_id) {
+                Some(task) => task.clone(),
+                None => match self.store.get_task_config_by_id(allocation.task_config_id) {
+                    Ok(Some(task)) => {
+                        configs.insert(allocation.task_config_id, task.clone());
+                        task
+                    }
+                    _ => continue,
+                },
+            };
+            let facts = NetSelectorFacts {
+                node_pool: pool,
+                namespace: String::new(),
+                runtime: task.runtime.clone(),
+                job: allocation.job_id.clone(),
+                labels: task
+                    .network
+                    .as_ref()
+                    .map(|n| n.labels.clone())
+                    .unwrap_or_default(),
+            };
+            if object.selector.matches(&facts) {
+                out.push(format!(
+                    "{}/{}@{}",
+                    allocation.job_id, task.name, allocation.id
+                ));
+            }
+        }
+        out
+    }
+}
+
+/// Merge the stored policies that match `facts` with a task's inline block.
+fn merge_net_policies(
+    stored: &[crate::structs::netpolicy::NetPolicyObject],
+    facts: &crate::structs::netpolicy::NetSelectorFacts,
+    network: Option<&crate::structs::NetworkConfig>,
+) -> (crate::structs::netpolicy::EffectivePolicy, Vec<String>) {
+    use crate::structs::netpolicy::{merge_policies, InlinePolicy};
+    let matching: Vec<crate::structs::netpolicy::NetPolicyObject> = stored
+        .iter()
+        .filter(|policy| policy.selector.matches(facts))
+        .cloned()
+        .collect();
+    let inline = InlinePolicy {
+        mode: network.map(|n| n.mode.as_str()).filter(|m| *m != "auto"),
+        egress: network.and_then(|n| n.egress.as_ref()),
+        ingress: network.and_then(|n| n.ingress.as_ref()),
+    };
+    let effective = merge_policies(&matching, inline);
+    let matched = effective
+        .sources
+        .iter()
+        .filter_map(|source| source.strip_prefix("policy/").map(|s| s.to_string()))
+        .collect();
+    (effective, matched)
+}
+
+/// Per-pool scope enforcement for a policy object: a caller must hold the
+/// action on every pool the selector names (or on any pool when it names
+/// none, i.e. a cluster-wide policy).
+fn enforce_net_policy_scope(
+    identity: &crate::structs::AclIdentity,
+    action: AclAction,
+    object: &crate::structs::netpolicy::NetPolicyObject,
+) -> Result<(), Status> {
+    if object.selector.node_pools.is_empty() {
+        return acl::enforce(identity, AclResource::Net, action, &AclScope::none());
+    }
+    for pool in &object.selector.node_pools {
+        acl::enforce(identity, AclResource::Net, action, &AclScope::pool(pool))?;
+    }
+    Ok(())
+}
+
+/// A `NetAllocStatus` as the JSON the CLI and UI read.
+/// (caller job, caller task, service, tag).
+type EdgeKey = (String, String, String, String);
+
+/// Minutes of per-minute buckets the manager keeps per edge.
+const EDGE_WINDOW_MINUTES: i64 = 15;
+
+#[derive(Debug, Default, Clone)]
+struct EdgeBucket {
+    minute: i64,
+    requests: u64,
+    errors: u64,
+    denied: u64,
+    latency_ms_sum: u64,
+    latency_ms_max: u64,
+    bytes_out: u64,
+    bytes_in: u64,
+}
+
+#[derive(Debug, Default, Clone)]
+struct EdgeWindow {
+    protocol: String,
+    last_seen: i64,
+    buckets: std::collections::VecDeque<EdgeBucket>,
+}
+
+fn net_status_json(node_id: &str, status: &crate::structs::NetAllocStatus) -> Value {
+    json!({
+        "nodeId": node_id,
+        "allocationId": status.allocation_id,
+        "mode": status.mode,
+        "captureReady": status.capture_ready,
+        "policyHash": status.policy_hash,
+        "upstreamsBound": status.upstreams_bound,
+        "ingressBound": status.ingress_bound,
+        "resolverReady": status.resolver_ready,
+        "proxyReady": status.proxy_ready,
+        "gateShut": status.gate_shut,
+        "problems": status.problems,
+        "handlers": status.handlers.iter().map(|h| json!({
+            "source": h.source,
+            "handler": h.handler,
+            "target": h.target,
+            "healthy": h.healthy,
+            "lastError": h.last_error,
+            "calls": h.calls,
+            "errors": h.errors,
+        })).collect::<Vec<_>>(),
+        "tlsReady": status.tls_ready,
+        "tlsError": status.tls_error,
+        "meshIdentity": status.mesh_identity,
+    })
+}
+
+fn net_policy_to_proto(
+    object: &crate::structs::netpolicy::NetPolicyObject,
+    created_at: &str,
+    updated_at: &str,
+) -> NetPolicy {
+    NetPolicy {
+        name: object.name.clone(),
+        priority: object.priority,
+        enforcement: object.enforcement.clone(),
+        object_json: serde_json::to_string(object).unwrap_or_default(),
+        description: object.description.clone(),
+        created_at: created_at.to_string(),
+        updated_at: updated_at.to_string(),
+    }
+}
+
+/// `host[:port]`, an IP, or a URL → (host, ip, port, path) for `TestNetPolicy`.
+fn parse_test_target(
+    target: &str,
+) -> (
+    Option<String>,
+    Option<std::net::IpAddr>,
+    u16,
+    Option<String>,
+) {
+    if let Ok(parsed) = crate::structs::parse_upstream_target(target) {
+        let ip = parsed.host.parse().ok();
+        return (Some(parsed.host), ip, parsed.port, None);
+    }
+    if let Some((scheme, rest)) = target.split_once("://") {
+        // A URL with a path: split it off and parse the authority.
+        let (authority, path) = match rest.find('/') {
+            Some(slash) => (&rest[..slash], Some(rest[slash..].to_string())),
+            None => (rest, None),
+        };
+        if let Ok(parsed) =
+            crate::structs::parse_upstream_target(&format!("{scheme}://{authority}"))
+        {
+            let ip = parsed.host.parse().ok();
+            return (Some(parsed.host), ip, parsed.port, path);
+        }
+    }
+    let (host, port) = match target.rsplit_once(':') {
+        Some((host, port)) if port.chars().all(|c| c.is_ascii_digit()) && !port.is_empty() => {
+            (host.to_string(), port.parse().unwrap_or(0))
+        }
+        _ => (target.to_string(), 0),
+    };
+    let ip = host.parse().ok();
+    (Some(host.to_ascii_lowercase()), ip, port, None)
+}
+
 fn build_upstream_endpoints(
     store: &Store,
     desired: &[crate::structs::TaskAllocation],
@@ -8605,6 +9818,11 @@ fn build_upstream_endpoints(
                 }
             };
         for upstream in &connect.upstreams {
+            // External upstreams dial a fixed destination; the worker reads it
+            // off `AllocUpstream.to` and needs no endpoint feed.
+            if upstream.is_external() {
+                continue;
+            }
             let key = (upstream.service.clone(), allocation.job_id.clone());
             if !resolved.contains_key(&key) {
                 let rows = match store.service_endpoints(Some(&upstream.service)) {
@@ -8641,6 +9859,7 @@ fn build_upstream_endpoints(
                         tags: row.tags,
                         meta: row.meta.into_iter().collect(),
                         port_label: row.port_label.unwrap_or_default(),
+                        mesh_tls: row.mesh_tls,
                     })
                     .collect::<Vec<_>>();
                 resolved.insert(key.clone(), endpoints);
@@ -8656,6 +9875,7 @@ fn build_upstream_endpoints(
                 allocation_id: allocation.allocation_id,
                 service: upstream.service.clone(),
                 endpoints,
+                for_handler: false,
             });
         }
     }

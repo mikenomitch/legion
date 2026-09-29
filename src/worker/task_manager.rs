@@ -99,6 +99,17 @@ pub struct TerminatingAllocation {
     remove_dirs: bool,
 }
 
+/// An allocation between "left the catalog" and "signalled": it keeps
+/// serving until `until`, then takes the ladder like any other stop.
+pub struct DrainingAllocation {
+    allocation: Allocation,
+    task: TaskConfig,
+    instance: TaskInstance,
+    cause: StopCause,
+    remove_dirs: bool,
+    until: std::time::Instant,
+}
+
 /// Why [`WorkerTaskManager::reap_terminating`] finished an allocation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReapOutcome {
@@ -204,6 +215,12 @@ pub struct WorkerTaskManager {
     /// *signals and returns*, and [`Self::reap_terminating`] finishes the job
     /// from the supervisor loop.
     terminating: HashMap<i64, TerminatingAllocation>,
+    /// Allocations inside their drain window: out of the live set and off
+    /// the catalog, still serving, not yet signalled (docs/graceful-stop.md).
+    draining: HashMap<i64, DrainingAllocation>,
+    /// The default drain window — the node's heartbeat interval, set by the
+    /// daemon each tick. Zero until it is, which is also what tests get.
+    drain_window: std::time::Duration,
     state_store: WorkerStateStore,
     /// Root of per-allocation directories: `<state dir>/allocs/<alloc_id>/<task>/`.
     alloc_root: PathBuf,
@@ -272,6 +289,8 @@ impl WorkerTaskManager {
             stop_causes: HashMap::new(),
             preemptors: HashMap::new(),
             terminating: HashMap::new(),
+            draining: HashMap::new(),
+            drain_window: std::time::Duration::ZERO,
             state_store,
             alloc_root,
             artifact_status: ArtifactStatusBoard::new(),
@@ -590,6 +609,7 @@ impl WorkerTaskManager {
             // An allocation we are deliberately draining is not a task that
             // crashed: its exit must not feed the restart policy.
             .filter(|allocation_id| !self.terminating.contains_key(allocation_id))
+            .filter(|allocation_id| !self.draining.contains_key(allocation_id))
             .collect::<Vec<_>>();
 
         for allocation_id in candidates {
@@ -807,6 +827,17 @@ impl WorkerTaskManager {
         }
         let root = self.registry.plugin(runtime)?.file_delivery_root()?;
         Some((root, self.alloc_dir(allocation_id).join(task_name)))
+    }
+
+    /// Root of per-allocation directories (`<state>/allocs/`).
+    pub fn alloc_root(&self) -> &std::path::Path {
+        &self.alloc_root
+    }
+
+    /// The host task directory (`allocs/<alloc>/<task>/`), whether or not
+    /// the task has started yet.
+    pub fn task_dir_for(&self, allocation_id: i64, task_name: &str) -> PathBuf {
+        self.alloc_dir(allocation_id).join(task_name)
     }
 
     fn cleanup_alloc_dir(&self, allocation_id: i64) {
@@ -1038,16 +1069,21 @@ impl WorkerTaskManager {
             .iter()
             .filter(|allocation| {
                 let local = self.local_key(allocation.allocation_id);
-                !self.instances.contains_key(&local) && !self.terminating.contains_key(&local)
+                !self.instances.contains_key(&local)
+                    && !self.terminating.contains_key(&local)
+                    && !self.draining.contains_key(&local)
             })
             .cloned()
             .collect();
 
-        if !pending.is_empty() && self.has_terminating() {
+        // A draining allocation still holds its ports and its process, so it
+        // holds starts back exactly as an in-grace one does.
+        if !pending.is_empty() && (self.has_terminating() || self.has_draining()) {
             debug!(
                 held = pending.len(),
                 terminating = self.terminating.len(),
-                "Holding new allocations until in-grace allocations exit"
+                draining = self.draining.len(),
+                "Holding new allocations until stopping allocations exit"
             );
             return Vec::new();
         }
@@ -1132,6 +1168,120 @@ impl WorkerTaskManager {
             return Ok(());
         };
 
+        // Drain before the signal (docs/graceful-stop.md): a task that
+        // advertises a service keeps serving for one drain window after it
+        // has left the catalog, so consumers on other nodes learn it is gone
+        // before it stops accepting. Purely an ordering change — this node's
+        // forwarder stopped routing to it on the heartbeat that removed it.
+        let drain = self.drain_window_for(&task, remove_dirs);
+        if !drain.is_zero() && Self::instance_process_alive(&mut instance) {
+            info!(
+                allocation_id,
+                task_name = %task.name,
+                cause = %cause,
+                drain_ms = drain.as_millis() as u64,
+                "Draining allocation before stop"
+            );
+            self.draining.insert(
+                allocation_id,
+                DrainingAllocation {
+                    allocation,
+                    task,
+                    instance,
+                    cause,
+                    remove_dirs,
+                    until: std::time::Instant::now() + drain,
+                },
+            );
+            return Ok(());
+        }
+        self.signal_and_terminate(
+            allocation_id,
+            allocation,
+            task,
+            instance,
+            cause,
+            remove_dirs,
+        );
+        Ok(())
+    }
+
+    /// How long `task` drains before its signal: `stop.drain` when set,
+    /// otherwise the node's heartbeat interval. Zero for a task with no
+    /// `service` (nothing routes to it) and for an in-place re-dispatch
+    /// (`remove_dirs: false`: the same allocation relaunches at once and
+    /// needs its ports back).
+    fn drain_window_for(&self, task: &TaskConfig, remove_dirs: bool) -> std::time::Duration {
+        if !remove_dirs || task.service.is_none() {
+            return std::time::Duration::ZERO;
+        }
+        task.stop_config()
+            .drain
+            .unwrap_or(self.drain_window)
+            .min(crate::structs::MAX_DRAIN)
+    }
+
+    /// The default drain window for stops on this node — its heartbeat
+    /// interval, which is how long every other node needs to learn an
+    /// endpoint is gone.
+    pub fn set_drain_window(&mut self, window: std::time::Duration) {
+        self.drain_window = window;
+    }
+
+    /// Advance every allocation whose drain window has closed (or whose
+    /// process exited on its own) to the signal step. Driven by the task
+    /// supervisor beside [`Self::reap_terminating`]. Returns the ids moved.
+    pub fn reap_draining(&mut self) -> Vec<i64> {
+        if self.draining.is_empty() {
+            return Vec::new();
+        }
+        let now = std::time::Instant::now();
+        let mut ready: Vec<i64> = self
+            .draining
+            .iter_mut()
+            .filter_map(|(allocation_id, entry)| {
+                (now >= entry.until || !Self::instance_process_alive(&mut entry.instance))
+                    .then_some(*allocation_id)
+            })
+            .collect();
+        ready.sort_unstable();
+        for allocation_id in &ready {
+            if let Some(entry) = self.draining.remove(allocation_id) {
+                self.signal_and_terminate(
+                    *allocation_id,
+                    entry.allocation,
+                    entry.task,
+                    entry.instance,
+                    entry.cause,
+                    entry.remove_dirs,
+                );
+            }
+        }
+        ready
+    }
+
+    pub fn has_draining(&self) -> bool {
+        !self.draining.is_empty()
+    }
+
+    /// Allocation ids inside their drain window, for tests and diagnostics.
+    pub fn draining_ids(&self) -> Vec<i64> {
+        let mut ids = self.draining.keys().copied().collect::<Vec<_>>();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// The signal step of the ladder: notice, signal, then the terminating
+    /// set (graceful) or an immediate teardown.
+    fn signal_and_terminate(
+        &mut self,
+        allocation_id: i64,
+        allocation: Allocation,
+        task: TaskConfig,
+        mut instance: TaskInstance,
+        cause: StopCause,
+        remove_dirs: bool,
+    ) {
         let stop = task.stop_config();
         let ctx = StopContext::with_ladder(cause, &stop.signal, stop.kill_after);
         // The notice lands BEFORE the signal, always: a task that wakes on
@@ -1176,7 +1326,7 @@ impl WorkerTaskManager {
                 },
             );
             self.persist_state();
-            return Ok(());
+            return;
         }
 
         // No notice was delivered (a runtime with no graceful path, no
@@ -1188,7 +1338,6 @@ impl WorkerTaskManager {
             &mut instance,
             remove_dirs,
         );
-        Ok(())
     }
 
     /// Write the task's stop notice into its task directory, best-effort.
@@ -1571,7 +1720,7 @@ impl WorkerTaskManager {
             .context("Task instance missing")?;
 
         if gate == Gate::Boot {
-            if plugin.network_gate() == NetworkGate::Advisory {
+            if plugin.network_gate_for(allocation) == NetworkGate::Advisory {
                 // Stated loudly rather than assumed: for host-process
                 // runtimes Legion withholds service registration and the
                 // node-local forwarders, but the workload shares the host's
@@ -2703,6 +2852,7 @@ mod tests {
 
     fn provisional_payload(local_key: i64) -> TaskAllocation {
         TaskAllocation {
+            task_network: String::new(),
             allocation_id: local_key,
             job_id: "agent-sandboxes".into(),
             job_config_id: "jc-1".into(),
@@ -3254,6 +3404,7 @@ mod tests {
             stop: Some(crate::structs::StopConfig {
                 signal: "SIGTERM".into(),
                 kill_after: std::time::Duration::ZERO,
+                drain: None,
             }),
             ..TaskConfig::new("stubborn", "exec")
         };
@@ -3286,6 +3437,7 @@ mod tests {
             stop: Some(crate::structs::StopConfig {
                 signal: "SIGTERM".into(),
                 kill_after: std::time::Duration::ZERO,
+                drain: None,
             }),
             ..TaskConfig::new("victim", "exec")
         };
@@ -3503,6 +3655,7 @@ mod tests {
             stop: Some(crate::structs::StopConfig {
                 signal: "SIGTERM".into(),
                 kill_after: Duration::from_secs(300),
+                drain: None,
             }),
             ..TaskConfig::new("stubborn", "exec")
         };
@@ -3529,6 +3682,138 @@ mod tests {
         Ok(())
     }
 
+    fn wait_for_reap(manager: &mut WorkerTaskManager) -> Vec<(i64, ReapOutcome)> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let reaped = manager.reap_terminating();
+            if !reaped.is_empty() {
+                return reaped;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "allocation was never reaped"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Drain before stop (docs/graceful-stop.md): a task that advertises a
+    /// service leaves the live set at once but is not signalled until its
+    /// drain window closes, then takes the ordinary ladder.
+    #[test]
+    fn a_service_task_drains_before_its_signal() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let mut manager = manager_in(&temp_dir);
+        manager.set_drain_window(Duration::from_millis(300));
+        let task = TaskConfig {
+            config: json!({"command": ["sleep", "30"]}),
+            service: Some(serde_json::from_value(json!({"port": 8080}))?),
+            ..TaskConfig::new("web", "exec")
+        };
+        manager.run_allocation(&alloc(), &task)?;
+
+        assert!(manager.reconcile_allocations(&[]).is_empty());
+        assert_eq!(manager.draining_ids(), vec![alloc().id]);
+        assert!(manager.terminating_ids().is_empty(), "not signalled yet");
+        assert!(
+            !manager.is_allocation_active(alloc().id),
+            "out of the live set"
+        );
+        assert!(
+            manager.reap_draining().is_empty(),
+            "the window has not closed"
+        );
+
+        thread::sleep(Duration::from_millis(350));
+        assert_eq!(manager.reap_draining(), vec![alloc().id]);
+        assert!(manager.draining_ids().is_empty());
+        assert_eq!(
+            manager.terminating_ids(),
+            vec![alloc().id],
+            "now on the ladder"
+        );
+        wait_for_reap(&mut manager);
+        assert!(manager.terminating_ids().is_empty());
+        Ok(())
+    }
+
+    /// Nothing routes to a task without a service, so it is signalled at
+    /// once — the drain window must not slow every stop on the node.
+    #[test]
+    fn a_task_without_a_service_is_not_drained() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let mut manager = manager_in(&temp_dir);
+        manager.set_drain_window(Duration::from_millis(300));
+        let task = TaskConfig {
+            config: json!({"command": ["sleep", "30"]}),
+            ..TaskConfig::new("batch", "exec")
+        };
+        manager.run_allocation(&alloc(), &task)?;
+        assert!(manager.reconcile_allocations(&[]).is_empty());
+        assert!(manager.draining_ids().is_empty());
+        assert_eq!(manager.terminating_ids(), vec![alloc().id]);
+        wait_for_reap(&mut manager);
+        Ok(())
+    }
+
+    /// `stop.drain = "0s"` opts a service task out of the window.
+    #[test]
+    fn stop_drain_zero_disables_the_window() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let mut manager = manager_in(&temp_dir);
+        manager.set_drain_window(Duration::from_millis(300));
+        let task = TaskConfig {
+            config: json!({"command": ["sleep", "30"]}),
+            service: Some(serde_json::from_value(json!({"port": 8080}))?),
+            stop: Some(crate::structs::StopConfig {
+                drain: Some(Duration::ZERO),
+                ..Default::default()
+            }),
+            ..TaskConfig::new("web", "exec")
+        };
+        manager.run_allocation(&alloc(), &task)?;
+        assert!(manager.reconcile_allocations(&[]).is_empty());
+        assert!(manager.draining_ids().is_empty());
+        assert_eq!(manager.terminating_ids(), vec![alloc().id]);
+        wait_for_reap(&mut manager);
+        Ok(())
+    }
+
+    /// A draining allocation holds starts back exactly as an in-grace one
+    /// does: it still owns its ports.
+    #[test]
+    fn a_draining_allocation_holds_new_starts_back() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let mut manager = manager_in(&temp_dir);
+        manager.set_drain_window(Duration::from_millis(200));
+        let task = TaskConfig {
+            config: json!({"command": ["sleep", "30"]}),
+            service: Some(serde_json::from_value(json!({"port": 8080}))?),
+            ..TaskConfig::new("web", "exec")
+        };
+        manager.run_allocation(&alloc(), &task)?;
+        let replacement = TaskAllocation {
+            allocation_id: 6,
+            ..provisional_payload(6)
+        };
+        assert!(
+            manager
+                .reconcile_allocations(std::slice::from_ref(&replacement))
+                .is_empty(),
+            "held while the old allocation drains"
+        );
+        assert_eq!(manager.draining_ids(), vec![alloc().id]);
+        thread::sleep(Duration::from_millis(250));
+        manager.reap_draining();
+        wait_for_reap(&mut manager);
+        let launch = manager.reconcile_allocations(&[replacement]);
+        assert_eq!(
+            launch.iter().map(|a| a.allocation_id).collect::<Vec<_>>(),
+            vec![6]
+        );
+        Ok(())
+    }
+
     /// The other half: a task that exits on its signal is reaped by the very
     /// next supervisor tick rather than waiting out its window.
     #[test]
@@ -3542,6 +3827,7 @@ mod tests {
             stop: Some(crate::structs::StopConfig {
                 signal: "SIGTERM".into(),
                 kill_after: Duration::from_secs(300),
+                drain: None,
             }),
             ..TaskConfig::new("drain", "exec")
         };
@@ -3590,6 +3876,7 @@ mod tests {
                 stop: Some(crate::structs::StopConfig {
                     signal: "SIGTERM".into(),
                     kill_after: Duration::from_secs(300),
+                    drain: None,
                 }),
                 config: json!({"image": "alpine", "command": ["/bin/sh", "-c", "sleep 1"]}),
                 ..TaskConfig::new("box", "sandbox")
@@ -3688,13 +3975,22 @@ mod tests {
                         service: "db".into(),
                         local_port: 20003,
                         balance: "round_robin".into(),
+                        to: None,
+                        vip: None,
+                        canonical_port: None,
                     },
                     crate::structs::AllocUpstream {
                         service: "cache".into(),
                         local_port: 6379,
                         balance: "least_conn".into(),
+                        to: None,
+                        vip: None,
+                        canonical_port: None,
                     },
                 ],
+                vip_block: None,
+                mode: None,
+                ingress_tls: None,
             }),
             ..alloc()
         };

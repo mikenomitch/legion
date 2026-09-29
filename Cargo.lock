@@ -2154,6 +2154,9 @@ dependencies = [
  "ring",
  "rusqlite",
  "rusqlite_migration",
+ "rustls",
+ "rustls-pemfile",
+ "rustls-pki-types",
  "rustyriver",
  "schemars 0.8.22",
  "semver",
@@ -2167,6 +2170,7 @@ dependencies = [
  "tempfile",
  "time",
  "tokio",
+ "tokio-rustls",
  "tokio-stream",
  "tokio-tungstenite",
  "tonic",
@@ -2181,6 +2185,8 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "zeroize",
+ "webpki-roots",
+ "x509-parser",
 ]
 
 [[package]]

@@ -6,6 +6,7 @@ pub mod events;
 pub mod keyring;
 pub mod liveness;
 pub mod migrations;
+pub mod netpolicy_store;
 pub mod persistence;
 pub mod queries;
 pub mod raft;

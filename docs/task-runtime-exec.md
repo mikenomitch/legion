@@ -77,6 +77,24 @@ Spawn helper sets a new session (`setsid`) on Unix so task processes survive wor
 - When `landlock` is configured, the task directory is appended to
   `read_write_paths` automatically so staged artifacts stay readable.
 
+## Networking: `host` and `gated`
+
+By default a `exec` task shares the host's network (`network.mode =
+"host"`): declared ports are host ports, `connect.upstreams` are loopback
+ports the node datapath owns, and egress policy applies to traffic that goes
+through those upstreams and to names resolved through the allocation's
+resolver (`LEGION_DNS`) — cooperatively.
+
+With `network.mode = "gated"` (Linux) the worker creates an empty network
+namespace for the allocation before it starts and the process enters it with `setns` before exec (ahead of the user switch and landlock). The namespace
+holds loopback and the datapath's listeners only — upstream ports, VIPs,
+the resolver, and an egress proxy at `127.0.0.1:1080` exported as
+`HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` — so egress policy is
+unbypassable: a tool that ignores the proxy has no route. The full model,
+the fail-closed rules, and the limits (no raw UDP, no ICMP, no inbound to
+undeclared ports, Linux only) are in
+[Network Handlers](network-handlers.md#gated-mode).
+
 ## Capability Summary
 
 | Capability | Supported |
