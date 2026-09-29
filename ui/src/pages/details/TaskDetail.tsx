@@ -6,6 +6,7 @@ import { Badge, DefList, EmptyState, Note, PageHeader, SectionCard, Spinner, Sta
 import LogViewer from '../../components/LogViewer'
 import { managerClient } from '../../grpcClient'
 import { INDEX_POLL_INTERVAL_MS, retainOnError, usePoll } from '../../utils/polling'
+import { EffectivePolicyView, parseEffectivePolicy } from '../../components/NetPolicyView'
 import AllocationExecPanel from '../../components/AllocationExecPanel'
 import { AllocationPorts, ServiceEndpointsTable, ServiceTags } from '../../components/ServiceEndpoints'
 import { allocationHealthLabel, fetchAllocationRuntime, fetchTaskStatusByName, parseAllocNetwork } from '../../utils/allocations'
@@ -93,9 +94,17 @@ function TaskDetailContent() {
           .catch(() => [])
       : []
 
+    // The task's effective network policy (docs/network-handlers.md): stored
+    // policies merged with its own block, each rule naming its source. A
+    // job-scoped token without net:read simply gets no section.
+    const netPolicy = await managerClient
+      .showNetPolicy({ jobId: job, taskName: task, nodePool: '' })
+      .catch(() => undefined)
+
     return {
       key: `${job}/${task}`,
       job: jobInfo.job,
+      netPolicy,
       taskSpec,
       taskInstances,
       jobAllocations,
@@ -523,6 +532,22 @@ function TaskDetailContent() {
                     </For>
                   </div>
                 </Show>
+              </SectionCard>
+            </Show>
+
+            <Show when={data()!.netPolicy}>
+              <SectionCard
+                title="Network"
+                description="What this task's egress and ingress are held to: stored policies merged with its own block, each rule naming its source."
+                actions={<A class={linkClass} href="/network">Policies</A>}
+              >
+                <EffectivePolicyView
+                  policy={parseEffectivePolicy(data()!.netPolicy!.effectiveJson)}
+                  declaredMode={data()!.netPolicy!.declaredMode}
+                  effectiveMode={data()!.netPolicy!.effectiveMode}
+                  matched={data()!.netPolicy!.matchedPolicies}
+                  nodeStatus={data()!.netPolicy!.nodeStatusJson}
+                />
               </SectionCard>
             </Show>
 

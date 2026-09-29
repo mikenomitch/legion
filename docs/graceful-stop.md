@@ -23,12 +23,17 @@ to diverge early.
   stop = {
     signal = "SIGTERM",   # default
     killAfter = "30s",    # default; SIGKILL after this grace window
+    drain = "5s",         # service tasks only; default one heartbeat interval
   },
 }
 ```
 
 When the platform stops a task:
 
+0. **If the task advertises a `service`**, it first leaves the catalog and
+   keeps serving for the **drain window** — `stop.drain`, or one heartbeat
+   interval of its node — so consumers on other nodes learn it is gone
+   before it stops accepting.
 1. The worker writes the **stop notice** into the task directory.
 2. It sends `stop.signal` to the task's process group.
 3. It waits, up to `stop.killAfter`, for the process to exit.
@@ -58,6 +63,37 @@ asking for more is rejected at submit with the cap named.
 A task that exits promptly is reaped promptly — `killAfter` is a deadline, not
 a delay. The only thing that waits the full window is a task that ignores its
 signal.
+
+### `stop.drain`
+
+Only for tasks with a [`service`](service-discovery.md) block; ignored
+otherwise, because nothing routes to a task that advertises nothing.
+
+The problem it solves: the manager withdraws a stopping allocation from every
+node's endpoint feed on that node's *next* heartbeat, but the node running
+the allocation learns to stop it on *its* next heartbeat — so without a
+drain, a consumer on another node can be routed to an endpoint that has
+already received `SIGTERM`, and sees `connection refused` during every
+rollout. The drain window closes that gap by ordering: the allocation leaves
+the live set and the catalog first, keeps serving, and is signalled only
+after the window — by which time every other node has heard.
+
+- **Default: one heartbeat interval** of the node running the task (the
+  cadence it is actually on, including a manager-served one), because that
+  is exactly how long the rest of the cluster needs.
+- **`"0s"` disables it** for a task whose consumers retry anyway.
+- **Capped at `5m`**, like `killAfter`, and for the same reason.
+- An in-place re-dispatch of the same allocation (an artifact-only update)
+  never drains: the allocation relaunches at once and needs its ports.
+- A draining allocation still holds its ports and its process, so new
+  allocations for the node are held back until it is gone — exactly as an
+  in-grace allocation holds them.
+- The window is a bound, not an acknowledgement: a node whose heartbeat is
+  late learns late, and a connection it opens in that gap is still refused.
+
+`legion job status` shows the allocation gone as soon as the drain starts;
+the worker logs `Draining allocation before stop` with the window, then the
+ordinary `Stopping allocation` line when the signal goes.
 
 ## The stop notice
 

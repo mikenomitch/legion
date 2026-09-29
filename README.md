@@ -29,6 +29,7 @@ Full index: [docs/README.md](docs/README.md).
 - [Preemption and Eviction](docs/preemption-and-eviction.md)
 - [Edge Boot (starting work before the placement is durable, boot tickets)](docs/edge-boot.md)
 - [Service Discovery](docs/service-discovery.md)
+- [Network Handlers](docs/network-handlers.md)
 - [State Store](docs/state-store.md)
 - [Node Liveness](docs/node-liveness.md) and [Heartbeat Cadence and Scale](docs/heartbeat-cadence-and-scale.md)
 - [Streaming Persistence](docs/persistence-streaming.md) and [Running Raft](docs/raft-operations.md)

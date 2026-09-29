@@ -13,6 +13,7 @@ pub mod eval;
 pub mod instance;
 pub mod job;
 pub mod ledger;
+pub mod netpolicy;
 pub mod network;
 pub mod node;
 pub mod stop;

@@ -156,11 +156,77 @@
                 command = ["sleep", "1"],
             },
             network = {
-                mode = "auto",  # auto | host (datapath plugins add more)
+                # Datapath: auto | host | gated (docs/network-handlers.md).
+                # `gated` (Linux, container and exec) gives the task an empty
+                # network namespace holding loopback and the datapath only —
+                # upstream ports, VIPs, its resolver, and an egress proxy at
+                # 127.0.0.1:1080 exported as HTTP_PROXY/HTTPS_PROXY/ALL_PROXY
+                # — so egress policy is unbypassable. `auto` is host today. A
+                # `require` policy can impose a mode for a pool. `bridge` /
+                # `cni/<name>` are reserved for the datapath plugin.
+                mode = "auto",
                 ports = [
                     { name = "http", to = 8080 },      # dynamic host port -> task 8080
                     { name = "metrics", static = 9090 },  # fixed host port
                 ],
+                # Attribution keys carried on every net.denied event and
+                # access-log line (never on a metric label). Stored policies
+                # can select on them too.
+                labels = { team = "web", tier = "prod" },
+                # Inline egress policy: the same shape as a stored policy
+                # object, scoped to this task. Merged after every matching
+                # `require` policy; replaces a matching `default` one.
+                egress = {
+                    protocol = "tcp",         # tcp (default) | http — never inferred
+                    policy = "deny",          # fallthrough: allow | deny (deny when `allow` is used)
+                    onError = "deny",         # what a failed handler means: deny | allow
+                    accessLog = false,
+                    # Sugar: host, host:port, cidr, cidr:port — and host/path
+                    # once protocol = "http". Desugars to allow rules ahead of
+                    # `rules`.
+                    allow = ["*.internal.example.com", "10.0.0.0/8:5432"],
+                    rules = [
+                        # First match wins. Connect-time fields (host, port,
+                        # cidr, identity) never touch the byte path; path /
+                        # method / header need protocol = "http".
+                        { when = { host = "telemetry.example.com", port = 443 }, action = "allow" },
+                        { when = { cidr = "169.254.0.0/16" }, action = "deny", reason = "no metadata service" },
+                    ],
+                    # Handlers: code on the path, only when policy is not
+                    # enough, run in order after the rules allow the flow.
+                    # authz = a webhook verdict, cached per (identity,
+                    # destination) for `cache` (default 10s, max 5m);
+                    # proxy = hand the flow to any proxy (PROXY v2 header on
+                    # TCP, Legion-* headers on HTTP) by catalog service /
+                    # node-local service / a sidecar's port label;
+                    # log; dlp (HTTP bodies, needs protocol = "http").
+                    # Every hop: timeout (default 2s) and onError (deny).
+                    handlers = [
+                        { handler = "authz", url = "http://policy.internal/check", cache = "30s", timeout = "2s", onError = "deny" },
+                        { handler = "proxy", service = "egress-filter", proxyProtocol = true, onError = "deny" },
+                    ],
+                },
+                # Inline ingress policy in front of this task's advertised
+                # ports: the datapath binds the advertised port, the task
+                # binds a private twin (docs/network-handlers.md, "Ingress").
+                ingress = {
+                    protocol = "http",
+                    rules = [
+                        { when = { path = "/admin/**" }, action = "deny", reason = "not externally reachable" },
+                        # Peer identity is known with tls.mode = "mutual".
+                        { when = { identity = "auto:web:*" }, action = "allow" },
+                    ],
+                    # TLS on the advertised port. server | mutual with
+                    # certFrom = "legion" (the node's mesh certificate; peers
+                    # verified against the mesh CA with clientCa = "legion")
+                    # or certPath/keyPath (+ clientCa bundle) for your own PKI.
+                    tls = {
+                        mode = "off",          # off | server | mutual
+                        # certFrom = "legion",
+                        # clientCa = "legion",
+                        # requireIdentity = ["auto:web:*"],
+                    },
+                },
             },
             service = {
                 name = "web",       # defaults to task name
@@ -188,8 +254,57 @@
                     # vars. Must not collide with a static port above.
                     { service = "cache", localPort = 6379 },
                     # Strategy override: round_robin (default) | random |
-                    # least_conn.
+                    # least_conn | local_first (same-node endpoints first,
+                    # widening when none is healthy locally).
                     { service = "search", balance = "least_conn" },
+                    # HTTP framing and traffic management on a service
+                    # upstream (docs/network-handlers.md): a per-request
+                    # deadline, bounded retries (idempotent methods only by
+                    # default), a canary split by service tag, and outlier
+                    # ejection.
+                    {
+                        service = "api",
+                        http = {
+                            timeout = "3s",
+                            retries = { attempts = 2, on = ["5xx", "connect-failure"], budget = "20%" },
+                            split = [{ tag = "canary", weight = 10 }],
+                            outlier = { consecutive5xx = 5, ejectFor = "30s" },
+                        },
+                    },
+                    # An external upstream: `name` + `to` instead of a
+                    # service. The task gets $LEGION_UPSTREAM_OPENAI on
+                    # loopback and speaks plaintext; Legion originates TLS
+                    # (https / tls schemes), so the body is visible to
+                    # handlers without intercepting anyone's TLS. The scheme
+                    # also decides HTTP framing (http / https).
+                    {
+                        name = "openai",
+                        to = "https://api.openai.com",
+                        handlers = [
+                            {
+                                handler = "dlp",
+                                config = { maxBytes = "1Mi", patterns = ["(AKIA|sk-)[A-Za-z0-9]{16,}"] },
+                                onError = "deny",
+                            },
+                        ],
+                    },
+                ],
+                # Config files rendered from the upstreams and their live
+                # endpoint feed (docs/service-discovery.md, "Templates"):
+                # written before the task starts and on every heartbeat
+                # that changes the result. Functions: service "<key>"
+                # [host|port], range endpoints "<key>" (.address .port
+                # .node .allocation .tags), env "<NAME>".
+                templates = [
+                    {
+                        name = "backends",
+                        destination = "local/backends.cfg",   # under the task directory
+                        source = "db = {{ service \"db\" }}\n{{ range endpoints \"search\" }}server {{ .address }}:{{ .port }} # {{ .node }}\n{{ end }}",
+                        changeMode = "signal",     # noop (default) | signal | restart
+                        changeSignal = "SIGHUP",
+                        coalesce = "2s",           # let the feed settle before acting
+                        splay = "5s",              # random delay before the action
+                    },
                 ],
             },
             # Workload identities (see docs/workload-identity.md): each named
@@ -320,6 +435,12 @@
                 # Grace between the signal and SIGKILL. Default 30s, capped
                 # at 5m — grace may slow a drain, never wedge one.
                 killAfter = "30s",
+                # Only for tasks with a `service` block: how long the task
+                # keeps serving after it has left the catalog and before the
+                # signal is sent, so consumers on other nodes learn it is
+                # gone first (docs/graceful-stop.md). Unset = one heartbeat
+                # interval of the node; "0s" disables; capped at 5m.
+                drain = "5s",
             },
             # A floor on how many of this task's allocations VOLUNTARY
             # disruption may take (docs/preemption-and-eviction.md).
@@ -594,9 +715,19 @@
                 kernel_args = "quiet",
                 network = {
                     # "none" (default, loopback only) or "tap" with a
-                    # pre-created host TAP device.
+                    # pre-created host TAP device. Not used when the task's
+                    # own `network.mode` below is "gated".
                     mode = "none",
                 },
+            },
+            # The task-level network block applies to sandboxes too: "gated"
+            # boots the guest with no NIC and a vsock to the node datapath,
+            # where the egress policy decides (docs/network-handlers.md,
+            # "Sandboxes"). "auto" is "host" until the vsock path is
+            # exercised on a real VMM in CI.
+            network = {
+                mode = "gated",
+                egress = { allow = ["pypi.org", "files.pythonhosted.org"] },
             },
             resources = {
                 cpus = 1,

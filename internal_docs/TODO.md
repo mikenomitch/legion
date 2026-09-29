@@ -1328,35 +1328,196 @@ All deferred from the volume plan v1:
 
 ## Service discovery & the mesh
 
-Plan: [service-discovery-final-plan.md](plans/service-discovery-final-plan.md) · docs: [service-discovery.md](../docs/service-discovery.md)
+Plans: [service-mesh-plan.md](plans/service-mesh-plan.md) (**authoritative for the mesh**; shipped M1–M10 with two named deferrals), [service-discovery-final-plan.md](plans/service-discovery-final-plan.md) (v1, shipped) · docs: [service-discovery.md](../docs/service-discovery.md), [network-handlers.md](../docs/network-handlers.md)
 
 v1 (catalog, ports, env, `list`/`resolve`/`doctor`) shipped, and so has the
-connect layer: `connect.upstreams`, the per-node L4 forwarder, pluggable
-balancing, and control-plane intentions. What is left of the v2 mesh, in the
-plan's own adoption order:
+v2 mesh: `connect.upstreams`, the per-node forwarder, pluggable balancing
+(`local_first` included), intentions, node-local DNS and VIPs, templates,
+mTLS on workload identity, RED metrics with the service graph, and
+drain-before-stop — phase by phase, with what each left open, under
+[Networking](#networking) below. What the mesh plan's adoption order still
+has open:
 
-- [ ] Node-local DNS + template functions (no-NAT resolver, TCP fallback,
-      `ndots:1`, coalesce/splay/fail-static)
-- [ ] Datapath plugin ABI + bridge/CNI shim (`mode: 'auto'`)
-- [ ] **mTLS between forwarders**, so `service.allow` intentions rest on
-      cryptographic workload identity (which has shipped) rather than on the
-      control plane filtering the endpoint feed
-- [ ] L7 waypoint (retries, timeouts, canary split), then sandboxed WASM
-      middleware filters
-- [ ] Mesh observability: RED metrics + service graph, `doctor` gaining
-      live-traffic evidence
-- [ ] Drain-before-SIGTERM (rollout integration)
+- [ ] Datapath plugin ABI + bridge/CNI shim (`mode: 'auto'` picking a real
+      overlay). The datapath half — overlay, CNI, fingerprinters — is still
+      unplanned; it remains the service-discovery plan's item 2.
+- [ ] Sandboxed WASM middleware filters on the L7 path (retries, timeouts,
+      weighted split and outlier ejection shipped in M2 inside the upstream
+      listener). They are the handlers plan's phase 8 — whichever of the two
+      plans grows a sandbox first should host the other's filters rather
+      than growing a second one.
+- [ ] `legion net doctor` citing live-traffic evidence: it walks policy →
+      mode → datapath status (M6) but does not yet pull the task's edges
+      from the service graph (M8) into its verdict.
 
 ## Networking
 
-No plan yet — this needs one before any code.
+Plan: [network-handlers-plan.md](plans/network-handlers-plan.md) (ingress/egress
+chains) · calls: [network-handlers-plan_calls.md](calls/network-handlers-plan_calls.md)
+
+The chain plan covers the proxy/middleware half of this section — ingress,
+egress, mTLS, and sandbox capture. The datapath half (overlay, CNI,
+fingerprinters) is still unplanned and remains the service-discovery plan's
+item 2.
+
+Plan phases (revision 2), in order. Three concepts — policy objects, `gated`
+capture, handlers — plus `legion netd` as the process that outlives the
+worker:
+
+- [x] Phase 0 / M1 — policy + datapath core (2026-09-02): `netpolicy` types
+      and the deterministic merge with provenance, `net_policy` table + the
+      seven RPCs + `AclResource::Net`, `legion net policy
+      apply/list/describe/delete/show/test` (+ capabilities + MCP tools),
+      connect-time rules evaluated in the forwarder before any dial, external
+      upstreams (`name` + `to`, TLS originated for `tls://`/`https://`),
+      content-addressed policy delivery on the heartbeat with a fail-static
+      node cache, `net.denied` / `net.policy_*` events, the three
+      `legion_net_*` metric families, `docs/network-handlers.md`,
+      `configs/policies/sandbox-egress.ncl`, `configs/jobs/sandbox-egress-demo.ncl`.
+      Still open inside M1: the UI (Network page, task/service detail
+      sections) and the `accessLog` writer (lands with HTTP mode).
+- [x] Phase 1 / M2 — HTTP/1.1 mode (2026-09-02): request-time rules
+      (path/method/header) on upstreams in HTTP mode, structured 403s
+      (`Legion-Denied-By`, JSON body), built-in `dlp` with a byte cap and
+      `log`, the NDJSON access log, and the upstream `http` traffic block —
+      per-request timeout, budgeted retries for idempotent methods, weighted
+      split by service tag, outlier ejection (the waypoint, folded into the
+      upstream listener). h2/h3/WebSocket upgrades rejected or unsupported,
+      deliberately. `authz` / `proxy` handlers still skip with a debug log
+      until the external-handlers phase.
+- [x] M3 — name-is-config (2026-09-02): per-allocation loopback /24 on
+      Linux (`127.42.<b>`), `.1` a resolver answering `<key>.svc.legion` with
+      the allocation's upstream VIPs (`.2`+) on canonical ports, egress policy
+      applied at resolution (`NXDOMAIN` + `net.denied` for a denied name),
+      external names forwarded to the host resolvers; `LEGION_DNS`,
+      `LEGION_UPSTREAM_HOST_*`, `LEGION_UPSTREAM_VIP_*`; containers get a
+      generated `resolv.conf`. macOS: no VIPs, documented. Open inside M3:
+      the generated `resolv.conf` for hardened `exec` (lands with gated).
+- [x] Phase 2 / M4 — `gated` on Linux for `container` and `exec`
+      (2026-09-02): worker-owned empty network namespaces
+      (`/var/run/netns/legion-<alloc>`, created ahead of reconcile on the
+      heartbeat, removed on departure), every datapath listener bound inside
+      (upstream ports, VIPs, resolver, egress proxy), an egress proxy
+      speaking HTTP CONNECT / absolute-URI HTTP / SOCKS5 with policy, proxy
+      env injected, containers join by OCI namespace path, exec `setns`s
+      before exec; effective `network.mode` resolved at placement (task or a
+      `require` policy's `mode`); fail-closed while policy is pending or the
+      edge-boot gate is shut (`network_gate_for` → Enforced for gated
+      allocations, the gate as a marker file), closing edge-boot's deferred
+      per-destination policy for the gated state. Not done: a
+      `net_capture_unavailable` health signal (a missing namespace fails the
+      start with a clear error instead — it is retried each heartbeat), and
+      transparent capture (tools that ignore `HTTP_PROXY` have no route).
+- [x] Phase 3 / M5 — datapath across worker restarts, and capture health
+      (2026-09-02), in a bounded form: the worker persists the datapath's
+      inputs (`netd_state.json`: desired set, endpoint feed, policy
+      assignments and bodies, owner-only, written when changed) and replays
+      them before its first heartbeat, re-binding every listener for the
+      allocations that survived the restart; a gated allocation whose
+      capture is not ready is reported unhealthy (`net_capture_unavailable`).
+      **Not done, deliberately:** the `legion netd` process split with
+      `SCM_RIGHTS` listener hand-off (zero dropped connections across a
+      worker upgrade) — in-flight connections drop at restart and the gap is
+      the process start time; see service-mesh calls entry 17.
+- [x] Phase 4 / M9 — `gated` for `sandbox` over vsock (2026-09-02): a gated
+      sandbox boots with no NIC and a virtio-vsock device on both VMMs
+      (`--vsock` / `"vsock"`), the worker binds the allocation's egress proxy
+      and resolver on the VMM's host sockets (`vsock.sock_1080`, `_53`)
+      before boot, and the generated init starts `legion guest-agent` (this
+      binary copied into the rootfs) which relays `127.0.0.1:1080` and
+      `127.0.0.1:53/udp` (DNS-over-TCP framing) to the host over `AF_VSOCK`;
+      TAP + gated rejected, dev-mode backends refused for gated; the boot
+      gate is the policy-withheld marker; status via `is_running`. **Not
+      verified on a real VMM** (no KVM in this environment): host side and
+      agent are unit-tested over Unix sockets with the VMMs' naming, so
+      `auto` still resolves to `host` for sandboxes until an end-to-end boot
+      runs in CI. Also open: the agent shares nothing yet with VM forking or
+      microVM `exec` (the vsock device is there; the exec channel is not),
+      and a musl-static agent for images whose libc cannot run the worker
+      binary.
+- [x] Phase 5 / M6 — ingress chains, drain-before-stop, `legion net doctor`
+      (2026-09-02): a task with an ingress chain (its own or a `require`
+      policy's) gets a private twin for every advertised port at placement;
+      the datapath binds the advertised port on the host, judges each
+      accepted connection against the chain (peer address; the request head
+      in HTTP mode), splices or proxies to the twin inside the gated
+      namespace, and fails closed while gated with policy pending or the
+      boot gate shut. `stop.drain`: a service task leaves the catalog, keeps
+      serving one heartbeat interval (or `stop.drain`), then takes the
+      ladder; starts are held back meanwhile. `legion net doctor` /
+      `legion_net_doctor` walk policy → mode → per-allocation node status
+      (`NetAllocStatus` on the heartbeat; shown under **Datapath** in the
+      UI's task Network section). Not done: the autoscaler's wake-on-request
+      hook (the listener exists; the scale-from-zero signal is the
+      autoscaler plan's), PROXY protocol v2 to the task (M7), persisting the
+      drain/grace sets across a worker restart (a restart mid-window
+      signals at restore, as grace already did).
+- [x] Phase 6 / M7 — external handlers and mTLS (2026-09-02): `authz`
+      webhooks (facts in, cached verdict out, `onError`) and `proxy` hand-offs
+      (PROXY v2 with Legion TLVs on TCP, absolute-form + `Legion-*` headers on
+      HTTP; targets `service` / `node` / sidecar `port`, endpoints fed on the
+      heartbeat as `for_handler`) on every path — upstream splices, HTTP mode,
+      the gated egress proxy, ingress; per-hop health in `NetAllocStatus`,
+      `legion net doctor` and the UI; `legion net handler test`. TLS: ingress
+      chains terminate `server`/`mutual` with BYO files or the mesh; the mesh
+      is a manager-held CA (`net_mesh_ca`, control lane) issuing 24h node
+      certificates over `IssueNodeCertificate`, node-to-node mTLS with the
+      workload identity attributed in a PROXY v2 TLV, `requireIdentity`,
+      `mesh_tls` on the endpoint feed, `legion net ca show|rotate`. Not done:
+      the kTLS/`splice` passthrough (a terminated connection is copied in
+      user space — measure before adding), `local_first` balancing (M10 with
+      templates), certificate revocation beyond the lifetime, an ingress
+      `proxy` hop into a gated task's namespace, and workload certificates on
+      demand (`certFrom = "legion"` on a task's *own* TLS — deferred with the
+      plan's "workload certs on demand").
+- [x] M8 — service graph (2026-09-02): every calling datapath (upstream
+      listeners, the gated egress proxy, HTTP mode) records per-(upstream,
+      tag) samples — requests/connections, errors, denials, latency, bytes —
+      drained on the heartbeat (`net_edges`, restored on failure, bounded at
+      4,096 keys); the manager folds them into 15 minutes of per-minute
+      buckets per (caller job, task, service, tag); `ListServiceEdges` merges
+      declared upstreams (`task_config.connect`, latest job config) with the
+      allow verdict and the observed RED; `legion service edges`, MCP
+      `legion_service_edges`; UI: the Network page opens with the graph
+      (callers → services, width by rps, dashed silent, red for denials /
+      errors / disallowed) over the edges table, Service detail gains
+      **Callers**. Not done: ingress-side attribution (edges are
+      caller-recorded), persistence across manager failover (the window
+      refills from heartbeats), and a manager-side unit test of the fold —
+      the ledger and the RPC path are tested, the fold arithmetic is not.
+- [x] M10 — templates and `local_first` (2026-09-02): `connect.templates`
+      render files from the upstreams and the endpoint feed (`service`,
+      `range endpoints`, `env`) before launch and on every heartbeat that
+      changes the result, atomic writes, `changeMode` noop/signal/restart
+      with `coalesce` and `splay`, fail-static by construction, validated at
+      submit (unknown action, undeclared upstream, escaping destination);
+      render problems in `NetAllocStatus.problems`. `balance = "local_first"`
+      in the registry, widening when no local endpoint is healthy. Not done:
+      `{{ kv }}` inside connect templates (KV injection already renders
+      manager-side), conditionals, and rendering into a *sandbox* guest
+      (the file lands in the host task dir; the guest sees it only where the
+      runtime mounts that dir).
+- [ ] Phase 7 — UDP (SOCKS5 `UDP ASSOCIATE`) and transparent capture (TUN +
+      userspace stack in the gated namespace)
+- [ ] Phase 8 — sandboxed WASM handlers (in-process `cdylib` handlers are
+      deliberately not planned — see calls entry 4)
+- [ ] Publish `pool` and `nodeId` into worker `config_attrs`
+      ([daemon.rs:281](../src/worker/daemon.rs)) so `count.per` can express
+      one-per-node handler jobs — also what the pool-scheduling item above
+      needs
+
+Deliberately not in the plan (see its §5): TLS interception / MITM — external
+upstreams are the body-visible route; rate limits and quotas; a cluster-edge
+load balancer.
+
+Still unplanned, and not covered by the plan:
 
 - [ ] Overlay network. Unix-domain-socket transport is on the table.
 - [ ] CNI, or a custom networking plugin that can speak CNI
 - [ ] Networking fingerprinters (so service discovery can pick a datapath per node)
 - [ ] Port forwarding
-- [ ] Ingress proxy / load balancer, running as a core-binary app that can also
-      be split out into its own job
+- [ ] Cluster-edge ingress load balancer. The plan's ingress is node-local,
+      in front of one allocation; a cluster edge is separate work
 
 ## Persistence & cluster operations
 
