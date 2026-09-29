@@ -2502,6 +2502,13 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
 - [x] Streaming SQLite replication, Litestream-style, with optional lease failover
 - [x] Raft control plane: leader election, failover controls, membership,
       observability, CLI and UI operations
+- [x] Snapshot install no longer loses the writes that follow it (2026-09-29):
+      the WAL checkpointer's connection is now closed and reopened with every
+      other connection when `install_state_db` swaps the state file. Left open
+      on the replaced inode it checkpointed the new file's WAL into the old
+      one and truncated it, which reverted a fresh joiner to the seed image
+      (`tests/raft_durability.rs` caught it once the KV encryption merge
+      shifted the timing)
 
 ## Workload identity
 

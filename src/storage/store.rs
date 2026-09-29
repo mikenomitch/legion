@@ -58,7 +58,7 @@ use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{MutexGuard, OnceLock, RwLock};
+use std::sync::{MutexGuard, OnceLock, RwLock, Weak};
 use std::time::{Duration, Instant};
 use time::format_description::well_known::Rfc3339;
 use time::macros::format_description;
@@ -891,6 +891,13 @@ impl OwnAllocationUsage {
 pub struct Store {
     pub write_conn: MemSafeConn,
     pub read_conns: Arc<Vec<MemSafeConn>>,
+    /// The WAL checkpointer thread's own connection (see
+    /// [`Store::spawn_wal_checkpointer`]). Held here so
+    /// [`Store::install_state_db`] can close and reopen it with every other
+    /// connection when it swaps the database file: a connection left open on
+    /// the replaced inode would checkpoint the NEW file's WAL into the OLD
+    /// file and then truncate it, silently losing every write since the swap.
+    checkpoint_conn: MemSafeConn,
     // Filesystem path of the state database (`<storePath>/store.sqlite`).
     // Needed by snapshot install (atomic DB swap + connection reopen) and by
     // `state_backup`'s default destination (plan §A5).
@@ -1448,6 +1455,7 @@ impl Store {
         let write_conn = Store::create_write_conn(&db_path, raft_enabled)?;
         let _migrations = Store::create_initial_tables(&Arc::clone(&write_conn))?;
         let read_conns = Store::create_read_pool(&db_path, config.eval_threads)?;
+        let checkpoint_conn: MemSafeConn = Arc::new(Mutex::new(Connection::open(&db_path)?));
         let resource_policy = ResourcePolicy::from_manager_config(config)?;
         let index_settings = Arc::new(IndexSettings::from_scheduler_settings(
             config.scheduler_settings.as_ref(),
@@ -1458,6 +1466,7 @@ impl Store {
         let store = Store {
             write_conn,
             read_conns: Arc::new(read_conns),
+            checkpoint_conn,
             db_path: Arc::new(db_path.clone()),
             read_index: Arc::new(AtomicUsize::new(0)),
             scheduling_policy: config.scheduling_policy.clone(),
@@ -1527,7 +1536,7 @@ impl Store {
         // upgrade gate), otherwise the daemon's keyring loop retries.
         store.initialize_keyring_at_start();
 
-        Store::spawn_wal_checkpointer(&db_path);
+        Store::spawn_wal_checkpointer(Arc::downgrade(&store.checkpoint_conn));
 
         Ok(store)
     }
@@ -1543,21 +1552,24 @@ impl Store {
     /// threshold in `configure_connection` still bounds the WAL if this
     /// thread ever stalls.
     ///
-    /// The thread holds only its own connection and a path, so it never
-    /// keeps a `Store` alive; it exits when the checkpoint connection
-    /// errors hard (e.g. the file is gone after a test teardown).
-    fn spawn_wal_checkpointer(db_path: &Path) {
-        let path = db_path.to_path_buf();
+    /// The thread holds only a weak handle to the store's checkpoint
+    /// connection, so it never keeps a `Store` alive and exits once the last
+    /// store clone is gone. The connection itself lives in the store so a
+    /// state-db swap (`install_state_db`) reopens it along with every other
+    /// connection; the thread just borrows it for each checkpoint.
+    fn spawn_wal_checkpointer(conn: Weak<Mutex<Connection>>) {
         std::thread::Builder::new()
             .name("wal-checkpoint".into())
             .spawn(move || {
-                let conn = match Connection::open(&path) {
-                    Ok(conn) => conn,
-                    Err(_) => return,
-                };
                 let mut consecutive_failures = 0u32;
                 loop {
                     std::thread::sleep(std::time::Duration::from_millis(1000));
+                    let Some(conn) = conn.upgrade() else {
+                        return;
+                    };
+                    let Ok(conn) = conn.lock() else {
+                        return;
+                    };
                     match conn.query_row(
                         "PRAGMA wal_checkpoint(PASSIVE);",
                         [],
@@ -2491,15 +2503,21 @@ impl Store {
         for conn in self.read_conns.iter() {
             read_guards.push(Self::lock_conn(conn, "install")?);
         }
+        let mut checkpoint_guard = Self::lock_conn(&self.checkpoint_conn, "install")?;
 
-        // Step 1: close the old connections (readers first; the write
-        // connection closes last so SQLite's last-close WAL checkpoint runs
-        // against the old file). The placeholder in-memory connections keep
-        // the mutexes valid if any later step fails.
+        // Step 1: close the old connections (readers and the checkpointer
+        // first; the write connection closes last so SQLite's last-close
+        // WAL checkpoint runs against the old file). The placeholder
+        // in-memory connections keep the mutexes valid if any later step
+        // fails. Every connection to the file must go, the checkpointer's
+        // included: one left open on the old inode would later checkpoint
+        // the new file's WAL (same name) into the old file and truncate it.
         for guard in read_guards.iter_mut() {
             let old = std::mem::replace(&mut **guard, Connection::open_in_memory()?);
             drop(old);
         }
+        let old = std::mem::replace(&mut *checkpoint_guard, Connection::open_in_memory()?);
+        drop(old);
         let old = std::mem::replace(&mut *write_guard, Connection::open_in_memory()?);
         drop(old);
         let wal = self.db_path.with_extension("sqlite-wal");
@@ -2534,6 +2552,8 @@ impl Store {
             conn.pragma_update(None, "query_only", "ON")?;
             **guard = conn;
         }
+        *checkpoint_guard = Connection::open(&*self.db_path)?;
+        drop(checkpoint_guard);
         drop(read_guards);
         drop(write_guard);
 
