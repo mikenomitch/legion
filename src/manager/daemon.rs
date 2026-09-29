@@ -589,10 +589,10 @@ pub fn keyring_tick(store: &Store) -> R<()> {
                     info!("KV encryption waits for the manager upgrade to finish: {reason}");
                 }
             }
-            crate::storage::store::KeyringInit::NoRootKey(reason) => {
-                if before.provider_error.is_none() {
-                    warn!("KV encryption cannot start: {reason}");
-                }
+            crate::storage::store::KeyringInit::NoRootKey(reason)
+                if before.provider_error.is_none() =>
+            {
+                warn!("KV encryption cannot start: {reason}");
             }
             _ => {}
         }

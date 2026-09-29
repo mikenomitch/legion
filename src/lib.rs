@@ -1,3 +1,8 @@
+// `tonic::Status` is 176 bytes, so every gRPC handler (including the
+// generated service traits) trips clippy's `result_large_err` on Rust 1.98+.
+// The type is tonic's; boxing it at every boundary would fight the framework.
+#![allow(clippy::result_large_err)]
+
 pub mod artifacts;
 pub mod certs;
 pub mod cmd;
