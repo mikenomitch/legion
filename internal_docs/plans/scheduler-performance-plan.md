@@ -7,7 +7,13 @@ v2 + realistic scenarios, backend matrix runner, `PlanTimings` +
 two) shipped the same day with before/after in
 `benchmarks/scheduler/README.md`. Phase 4 remains open by design — the
 next measured targets (O(fleet) version sample, per-plan snapshot
-rebuild) are architecture-review items D4/D6.
+rebuild) are architecture-review items D4/D6. The 2026-09-02 pass added
+the cluster-fill axis to the micro benchmarks (`plan_under_fill`) and
+removed every per-plan term that scaled with it (a per-job allocation
+index in the read model, delta publishing for local plan commits), along
+with the per-placement permit re-check and id-string hashing in the
+scoring cache and the uncached statements on the apply and eval paths —
+calls #1-#5, numbers in `benchmarks/scheduler/README.md`.
 
 > **Judgement calls:** [`../calls/scheduler-performance-plan_calls.md`](../calls/scheduler-performance-plan_calls.md)
 

@@ -131,7 +131,15 @@ good run. That is the number to beat.
 - **Does `build_plan` scale with fleet size?** 7.90 ms/eval at 5k this
   session against 9.82 ms in phase 2, so it did not improve much when
   conflicts went to zero. Still unexplained against a bounded 33-64
-  candidate list.
+  candidate list. *Partly answered locally, 2026-09-02:* two costs inside
+  `build_plan` scaled with the fleet and the fill regardless of the
+  candidate list — every placement re-ran the task's permit over every
+  candidate (a restriction-map allocation per candidate per placement),
+  and every plan walked every allocation in the cluster five or six
+  times to find its own job's rows. Both are gone
+  ([TODO](TODO.md), "Planning cost no longer grows with cluster fill");
+  `plan_under_fill` is the local regression test. The 5k-node cell is
+  still to be re-measured on the rig.
 - **Is there a node-deregistration story?** Still no. `Store::remove_node`
   is implemented, correct, tested, and has no caller. Every campaign
   works around it with a control-plane reset.

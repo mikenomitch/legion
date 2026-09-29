@@ -1,32 +1,42 @@
 import { createEffect, createMemo, createResource, createSignal } from 'solid-js'
 import { AccessGate } from '../components/AccessGate'
 import SharedIndex from '../components/SharedIndex'
+import { FilterChips, type FilterChip } from '../components/ui'
 import { managerClient } from '../grpcClient'
 import { debounced } from '../utils/debounce'
-import { formatRelativeTime } from '../utils/format'
+import { INDEX_POLL_INTERVAL_MS, retainOnError, swallowDenied, usePoll } from '../utils/polling'
+import { statusTone } from '../utils/status'
+
+// The order the status chips appear in: the states an operator acts on
+// first, then the quiet ones. Anything the manager emits that is not listed
+// still gets a chip, after these.
+const STATUS_ORDER = ['running', 'pending', 'failed', 'stopped', 'done', 'complete']
 
 function JobsContent() {
   const [search, setSearch] = createSignal('')
   const [sort, setSort] = createSignal('updated_at:desc')
+  const [status, setStatus] = createSignal('all')
   const [page, setPage] = createSignal(1)
   const [pageSize, setPageSize] = createSignal(20)
   const searchQuery = debounced(search)
+  const tick = usePoll(INDEX_POLL_INTERVAL_MS)
 
   createEffect(() => {
     search()
     sort()
+    status()
     setPage(1)
   })
 
   // Allocation counts are garnish needing node:read; a job-scoped token
   // (job:read only) must still get the list, so denial degrades to empty.
-  const [ledger] = createResource(async () => {
-    try {
-      return (await managerClient.getLedger({})).nodes
-    } catch {
-      return []
-    }
-  })
+  const [ledger] = createResource(
+    () => tick() + 1,
+    retainOnError(
+      swallowDenied(async () => (await managerClient.getLedger({})).nodes, []),
+      () => 'ledger',
+    ),
+  )
   const jobAllocationCounts = createMemo(() => {
     const map = new Map<string, number>()
     for (const node of ledger() ?? []) {
@@ -37,13 +47,41 @@ function JobsContent() {
     return map
   })
 
+  // Retained across a failed poll (keyed on the query, so a new search still
+  // shows its own outcome): the rows stay up and the banner reports the outage.
   const [data] = createResource(
-    () => ({ search: searchQuery(), sort: sort(), page: page(), pageSize: pageSize() }),
-    async (input) => {
-      const [sortBy, sortOrder] = input.sort.split(':')
-      return managerClient.listJobs({ query: input.search, sortBy, sortOrder, page: input.page, pageSize: input.pageSize })
-    },
+    () => ({ search: searchQuery(), sort: sort(), status: status(), page: page(), pageSize: pageSize(), tick: tick() }),
+    retainOnError(
+      async (input: { search: string; sort: string; status: string; page: number; pageSize: number; tick: number }) => {
+        const [sortBy, sortOrder] = input.sort.split(':')
+        return managerClient.listJobs({
+          query: input.search,
+          sortBy,
+          sortOrder,
+          page: input.page,
+          pageSize: input.pageSize,
+          status: input.status === 'all' ? undefined : input.status,
+        })
+      },
+      (input) => `${input.search}|${input.sort}|${input.status}|${input.page}|${input.pageSize}`,
+    ),
   )
+
+  // Chips come from the server's per-status counts over the whole
+  // query-matched set, so they hold still while one is selected.
+  const chips = createMemo<FilterChip[]>(() => {
+    const counts = data()?.statusCounts ?? {}
+    const known = Object.keys(counts)
+    const ordered = [
+      ...STATUS_ORDER.filter((entry) => known.includes(entry)),
+      ...known.filter((entry) => !STATUS_ORDER.includes(entry)).sort(),
+    ]
+    const total = Object.values(counts).reduce((sum, count) => sum + count, 0)
+    return [
+      { id: 'all', label: 'All', count: total },
+      ...ordered.map((entry) => ({ id: entry, label: entry, count: counts[entry], tone: statusTone(entry) })),
+    ]
+  })
 
   return (
     <SharedIndex
@@ -58,6 +96,9 @@ function JobsContent() {
         { label: 'Created (oldest)', value: 'created_at:asc' },
         { label: 'Name (A-Z)', value: 'name:asc' },
       ]}
+      chips={<FilterChips label="Filter by status" chips={chips()} active={status()} onChange={setStatus} />}
+      filtered={status() !== 'all'}
+      onClearFilters={() => setStatus('all')}
       columns={[{ key: 'allocations', header: 'Allocations', class: 'text-right' }]}
       loading={data.loading || ledger.loading}
       error={data.error ? 'Failed to load jobs.' : undefined}
@@ -67,7 +108,7 @@ function JobsContent() {
         status: job.status || 'unknown',
         // The column is "Updated": show the job's mtime, not its birth time.
         // Equal to createdAt until the job is resubmitted or changes status.
-        updatedAt: formatRelativeTime(job.updatedAt),
+        updatedAt: job.updatedAt,
         href: `/jobs/${encodeURIComponent(job.name || job.id)}`,
         cells: {
           allocations: <span class="tabular-nums">{jobAllocationCounts().get(job.id) ?? 0}</span>,
@@ -82,7 +123,7 @@ function JobsContent() {
         setPage(1)
       }}
       emptyLabel="No jobs yet"
-      emptyHint="Submit a job with `legion job submit <spec>` and it will appear here."
+      emptyHint="Submit one with `legion job run <spec.ncl>` — or run a template from the Templates page — and it will appear here."
     />
   )
 }

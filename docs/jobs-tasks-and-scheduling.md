@@ -206,7 +206,8 @@ availability excludes a node from **all** new placements without touching its
 health, heartbeats, or running allocations.
 
 The `SetNodeAvailability` RPC (CLI: `legion node cordon|drain|uncordon <ID>`,
-MCP: `legion_node_drain`) drives three operator flows:
+MCP: `legion_node_drain`, UI: the Cordon / Drain / Uncordon buttons on the
+worker page) drives three operator flows:
 
 - **Cordon** (`availability = "drained"`, `evict = false`): the node stops
   receiving new placements; existing allocations keep running. Emits

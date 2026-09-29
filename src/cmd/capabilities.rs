@@ -42,9 +42,9 @@ pub fn catalog() -> Vec<Capability> {
         // --- Jobs: read ---
         Capability {
             name: "job.list",
-            cli: "legion job list",
+            cli: "legion job list [--status STATUS]",
             grpc: Some("Manager/ListJobs"),
-            summary: "List all jobs and their status.",
+            summary: "List all jobs and their status, optionally filtered to one status.",
             mutates: false,
             read_only_safe: true,
         },
@@ -656,6 +656,118 @@ pub fn catalog() -> Vec<Capability> {
             grpc: Some("Manager/ResolveService"),
             summary: "Resolve a service to its healthy endpoint addresses; --one prints a single \
                  random address:port for scripts.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "net.policy.apply",
+            cli: "legion net policy apply -f <FILE> [--dry-run]",
+            grpc: Some("Manager/UpsertNetPolicy"),
+            summary: "Create or replace a network policy object (selector-scoped egress/ingress \
+                 rules and handlers); --dry-run validates and lists affected allocations \
+                 without writing.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "net.policy.list",
+            cli: "legion net policy list",
+            grpc: Some("Manager/ListNetPolicies"),
+            summary: "List stored network policies in merge order (require first, then priority).",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "net.policy.describe",
+            cli: "legion net policy describe <NAME>",
+            grpc: Some("Manager/GetNetPolicyObject"),
+            summary: "Fetch one stored network policy object.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "net.policy.delete",
+            cli: "legion net policy delete <NAME>",
+            grpc: Some("Manager/DeleteNetPolicy"),
+            summary: "Delete a stored network policy; matching allocations lose it on their next \
+                 heartbeat.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "net.policy.show",
+            cli: "legion net policy show <JOB> [--task <TASK>] [--pool <POOL>]",
+            grpc: Some("Manager/ShowNetPolicy"),
+            summary: "Show a task's effective network policy: every matching stored policy merged \
+                 with the task's own block, each rule naming its source.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "net.doctor",
+            cli: "legion net doctor <JOB> [--task <TASK>]",
+            grpc: Some("Manager/ShowNetPolicy"),
+            summary: "Walk a task's network layers — policy resolved, mode and whether it is \
+                 enforced, datapath readiness per allocation, the edge-boot gate — and name \
+                 the first one that is wrong with a fix hint.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "sandbox.guest-agent",
+            cli: "legion guest-agent",
+            grpc: None,
+            summary: "Internal: the gated sandbox guest agent, started by the generated guest \
+                 init inside a microVM to relay the guest's loopback proxy and DNS ports to the \
+                 node datapath over vsock. Not for operators or agents to run.",
+            mutates: false,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "net.handler.test",
+            cli: "legion net handler test <URL|HOST:PORT>",
+            grpc: None,
+            summary: "Conformance-probe an external handler the way the datapath uses it: an \
+                 authz webhook must answer a verdict to a sample facts payload; a proxy must \
+                 accept a PROXY v2 header. Sends one synthetic request to the handler; never \
+                 touches the cluster.",
+            mutates: false,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "net.ca.show",
+            cli: "legion net ca show",
+            grpc: Some("Manager/GetMeshCa"),
+            summary: "Print the mesh CA certificate (never the key): what an outside client \
+                 trusts to reach a mesh-TLS port, or verifies a node certificate against.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "net.ca.rotate",
+            cli: "legion net ca rotate",
+            grpc: Some("Manager/RotateMeshCa"),
+            summary: "Replace the mesh CA. Every node re-issues its certificate on its next \
+                 heartbeat; expect one heartbeat interval of refused mesh connections.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "net.policy.test",
+            cli: "legion net policy test <JOB> --to <DEST> | --from <PEER> [--method M --path P]",
+            grpc: Some("Manager/TestNetPolicy"),
+            summary: "Dry-run a verdict: would this task be allowed to reach a destination (or be \
+                 reached from a peer)? Names the deciding rule; sends nothing.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "service.edges",
+            cli: "legion service edges [SERVICE] [--window 5m]",
+            grpc: Some("Manager/ListServiceEdges"),
+            summary: "The service graph: who calls whom through the datapath, with request \
+                 rate, error rate, denials and latency per (caller, service, tag) over the \
+                 window, plus declared-but-silent upstreams and the allow verdict.",
             mutates: false,
             read_only_safe: true,
         },

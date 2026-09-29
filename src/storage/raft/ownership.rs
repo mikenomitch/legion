@@ -163,6 +163,12 @@ const TABLE_OWNERS: &[(&str, Owner)] = &[
     ("node", Owner::Lane(Lane::Control)),
     ("worker_type", Owner::Lane(Lane::Control)),
     ("acl_policy", Owner::Lane(Lane::Control)),
+    // Network policy objects (docs/network-handlers.md): applied and deleted
+    // through the control lane like ACL policies; the generation counter is
+    // bumped inside the same replicated write.
+    ("net_policy", Owner::Lane(Lane::Control)),
+    ("net_policy_meta", Owner::Lane(Lane::Control)),
+    ("net_mesh_ca", Owner::Lane(Lane::Control)),
     ("acl_token", Owner::Lane(Lane::Control)),
     ("acl_user", Owner::Lane(Lane::Control)),
     ("join_token", Owner::Lane(Lane::Control)),

@@ -27,6 +27,7 @@ export type AclResource =
   | 'action'
   | 'template'
   | 'scale'
+  | 'net'
 
 export type AclActionKind = 'read' | 'write'
 
@@ -185,6 +186,7 @@ export const isAnonymous = (): boolean => {
  */
 export const ROUTE_RESOURCE: Record<string, AclResource> = {
   '/jobs': 'job',
+  '/network': 'net',
   '/services': 'job',
   '/rollouts': 'job',
   // Volumes are job-scoped storage, gated under `job` like their RPCs.

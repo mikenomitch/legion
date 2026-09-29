@@ -223,6 +223,31 @@ fn worker_address_host(config_attrs: &Value) -> Option<String> {
 /// the few writers copy-on-write via `Arc::make_mut`.
 pub type SharedNodeAllocations = HashMap<String, Arc<Vec<Allocation>>>;
 
+/// One allocation as the read model's job index carries it: enough for a
+/// plan to know which of its own rows sit on a node without touching the
+/// row itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AllocationRef {
+    pub(crate) id: i64,
+    pub(crate) job_config_id: String,
+    pub(crate) task_config_id: i64,
+}
+
+impl AllocationRef {
+    fn of(allocation: &Allocation) -> Self {
+        AllocationRef {
+            id: allocation.id,
+            job_config_id: allocation.job_config_id.clone(),
+            task_config_id: allocation.task_config_id,
+        }
+    }
+}
+
+/// A job's allocations by node — the shape
+/// [`Store::plan_capacity_snapshot`] hands the scheduler for the job it
+/// plans.
+pub(crate) type JobAllocationsByNode = HashMap<String, Vec<AllocationRef>>;
+
 #[derive(Debug, Clone, Default)]
 pub struct SchedulingReadModel {
     /// Nodes are `Arc`'d so a plan's snapshot is refcount bumps, not deep
@@ -292,11 +317,129 @@ pub struct SchedulingReadModel {
     /// reprojection cost before the memo existed. Never published on its
     /// own: all writes happen under the same lock as the list they mirror.
     pub(crate) node_usage: HashMap<String, NodeUsage>,
+    /// Secondary index over `allocations_by_node`: every job's allocations
+    /// by node, keyed by job id. What lets a plan find its own job's rows —
+    /// the ones a Fresh plan drops, the ones a Reschedule counts, the
+    /// group and `distinct` seeds — without walking every allocation in
+    /// the cluster, which was the last per-plan cost that grew with
+    /// cluster fill rather than with the job being placed. Strictly
+    /// derived from `allocations_by_node` and written under the same
+    /// lock, by the same operations: a splice indexes or unindexes its
+    /// row, a whole-list replacement goes through
+    /// [`Self::set_node_allocations`], a node removal through
+    /// [`Self::remove_node_allocations`], and a full model load rebuilds
+    /// it ([`Self::rebuild_job_index`]).
+    pub(crate) allocations_by_job: HashMap<String, JobAllocationsByNode>,
+    /// The job index's reverse: which jobs have an entry for each node.
+    /// What lets a wholesale list replacement drop the node's entries
+    /// wholesale too — from whatever state the index was in, not from
+    /// what the previous list said — so a full reload of a node heals
+    /// its index entries exactly as it heals its list.
+    pub(crate) jobs_by_node: HashMap<String, HashSet<String>>,
+}
+
+impl SchedulingReadModel {
+    /// Rebuild the job index from `allocations_by_node`. The full model
+    /// load uses this; every incremental path maintains the index in
+    /// place.
+    pub(crate) fn rebuild_job_index(&mut self) {
+        self.allocations_by_job.clear();
+        self.jobs_by_node.clear();
+        let lists: Vec<Arc<Vec<Allocation>>> = self.allocations_by_node.values().cloned().collect();
+        for list in lists {
+            for allocation in list.iter() {
+                self.index_allocation(allocation);
+            }
+        }
+    }
+
+    fn index_allocation(&mut self, allocation: &Allocation) {
+        self.index_allocation_ref(
+            &allocation.job_id,
+            &allocation.node_id,
+            AllocationRef::of(allocation),
+        );
+    }
+
+    fn index_allocation_ref(&mut self, job_id: &str, node_id: &str, reference: AllocationRef) {
+        self.allocations_by_job
+            .entry(job_id.to_string())
+            .or_default()
+            .entry(node_id.to_string())
+            .or_default()
+            .push(reference);
+        self.jobs_by_node
+            .entry(node_id.to_string())
+            .or_default()
+            .insert(job_id.to_string());
+    }
+
+    fn unindex_allocation(&mut self, allocation: &Allocation) {
+        let Some(nodes) = self.allocations_by_job.get_mut(&allocation.job_id) else {
+            return;
+        };
+        let mut node_emptied = false;
+        if let Some(references) = nodes.get_mut(&allocation.node_id) {
+            references.retain(|reference| reference.id != allocation.id);
+            if references.is_empty() {
+                nodes.remove(&allocation.node_id);
+                node_emptied = true;
+            }
+        }
+        if nodes.is_empty() {
+            self.allocations_by_job.remove(&allocation.job_id);
+        }
+        if node_emptied {
+            if let Some(jobs) = self.jobs_by_node.get_mut(&allocation.node_id) {
+                jobs.remove(&allocation.job_id);
+                if jobs.is_empty() {
+                    self.jobs_by_node.remove(&allocation.node_id);
+                }
+            }
+        }
+    }
+
+    /// Drop every index entry for `node_id`, whichever jobs they belong
+    /// to. Driven by the reverse index rather than by the node's cached
+    /// list, so it is exact even when that list had drifted.
+    fn unindex_node(&mut self, node_id: &str) {
+        let Some(jobs) = self.jobs_by_node.remove(node_id) else {
+            return;
+        };
+        for job_id in jobs {
+            if let Some(nodes) = self.allocations_by_job.get_mut(&job_id) {
+                nodes.remove(node_id);
+                if nodes.is_empty() {
+                    self.allocations_by_job.remove(&job_id);
+                }
+            }
+        }
+    }
+
+    /// Replace a node's whole cached allocation list, rebuilding the
+    /// node's job-index entries from the new rows.
+    fn set_node_allocations(&mut self, node_id: String, allocations: Vec<Allocation>) {
+        self.unindex_node(&node_id);
+        for allocation in &allocations {
+            self.index_allocation(allocation);
+        }
+        self.allocations_by_node
+            .insert(node_id, Arc::new(allocations));
+    }
+
+    /// Drop a node's cached allocation list (the node left the fleet),
+    /// and its job-index entries with it.
+    fn remove_node_allocations(&mut self, node_id: &str) {
+        self.unindex_node(node_id);
+        self.allocations_by_node.remove(node_id);
+    }
 }
 
 /// The allocation-row changes one committed changeset names, collected by
-/// [`Store::project_changeset_side_effects`] and applied to the read model
-/// by [`Store::cache_apply_allocation_delta`] — the delta that replaces
+/// [`Store::project_changeset_side_effects`] (and, for a locally committed
+/// plan, by [`Store::emit_plan_effects`] from the rows the plan itself
+/// wrote) and applied to the read model by
+/// [`Store::cache_apply_allocation_delta`] — the delta that replaces
 /// reloading every touched node's whole allocation list.
 #[derive(Debug, Default)]
 struct AllocationDelta {
@@ -380,14 +523,28 @@ pub struct DeclaredService {
     pub meta: BTreeMap<String, String>,
 }
 
+/// A task that declares `connect.upstreams` in its job's latest config —
+/// the declared half of a service-graph edge (docs/network-handlers.md,
+/// "Service graph").
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DeclaredConsumer {
+    pub job_id: String,
+    pub task_name: String,
+    pub upstreams: Vec<crate::structs::UpstreamConfig>,
+}
+
 /// What [`Store::plan_capacity_snapshot`] hands the scheduler: current
 /// allocations by node plus the cached free pools, cloned under one guard,
-/// and the read-model generation those were published at (the lazy
-/// version-sample fence — see [`SchedulingReadModel::generation`]).
+/// the read-model generation those were published at (the lazy
+/// version-sample fence — see [`SchedulingReadModel::generation`]), and
+/// the planned job's own allocations by node from the job index (see
+/// [`SchedulingReadModel::allocations_by_job`]).
 pub(crate) type PlanCapacityParts = (
     SharedNodeAllocations,
     HashMap<String, Arc<ResourcePool>>,
     u64,
+    JobAllocationsByNode,
 );
 
 #[derive(Debug, Clone)]
@@ -643,17 +800,37 @@ struct PlanApplyEffects {
     node_ids: BTreeSet<String>,
     /// Job-config scopes whose epochs need republishing.
     job_config_ids: BTreeSet<String>,
+    /// Ids of the allocation rows the plan inserted — the exact rows the
+    /// read model splices in, so the refresh is one indexed read per
+    /// placement rather than a reload of every touched node's list.
+    inserted: BTreeSet<i64>,
+    /// `(id, node)` of the allocation rows the plan deleted (its
+    /// evictions), spliced out the same way.
+    removed: Vec<(i64, String)>,
 }
 
 impl PlanApplyEffects {
-    /// Mark the scopes of allocations this plan placed or removed. Both
-    /// directions land in one refresh: it reads committed state, so the
-    /// mirror never passes through the intermediate state a
-    /// remove-then-add pair of refreshes exposed.
-    fn touch_allocations(&mut self, allocations: &[Allocation]) {
+    /// Record the allocations this plan placed: their scopes need
+    /// republishing, and the rows themselves splice into the read model
+    /// as inserts.
+    fn touch_placed(&mut self, allocations: &[Allocation]) {
         for allocation in allocations {
             self.node_ids.insert(allocation.node_id.clone());
             self.job_config_ids.insert(allocation.job_config_id.clone());
+            self.inserted.insert(allocation.id);
+        }
+    }
+
+    /// Record the allocations this plan evicted: same scopes, spliced
+    /// out. Placed and evicted rows land in ONE publish (they are one
+    /// delta), so the mirror never passes through the intermediate state
+    /// a remove-then-add pair of refreshes exposed.
+    fn touch_evicted(&mut self, allocations: &[Allocation]) {
+        for allocation in allocations {
+            self.node_ids.insert(allocation.node_id.clone());
+            self.job_config_ids.insert(allocation.job_config_id.clone());
+            self.removed
+                .push((allocation.id, allocation.node_id.clone()));
         }
     }
 
@@ -661,6 +838,8 @@ impl PlanApplyEffects {
         self.events.extend(other.events);
         self.node_ids.extend(other.node_ids);
         self.job_config_ids.extend(other.job_config_ids);
+        self.inserted.extend(other.inserted);
+        self.removed.extend(other.removed);
     }
 }
 
@@ -2478,7 +2657,11 @@ impl Store {
             // Populated by the reprojection below, node by node, while the
             // model is still private to this builder.
             node_usage: HashMap::new(),
+            // Built from the lists just loaded, below.
+            allocations_by_job: HashMap::new(),
+            jobs_by_node: HashMap::new(),
         };
+        model.rebuild_job_index();
         let id_refs: Vec<&str> = node_ids.iter().map(String::as_str).collect();
         Self::reproject_model_nodes(&mut model, &self.resource_policy, &id_refs);
 
@@ -2640,7 +2823,7 @@ impl Store {
         }
         let mut guard = self.read_model_writer()?;
         guard.nodes.remove(id);
-        guard.allocations_by_node.remove(id);
+        guard.remove_node_allocations(id);
         guard.indexes.remove_node(id);
         guard.node_pools.remove(id);
         guard.node_usage.remove(id);
@@ -2743,7 +2926,7 @@ impl Store {
                 continue;
             }
             published_nodes.push(node_id.clone());
-            guard.allocations_by_node.insert(node_id, Arc::new(allocs));
+            guard.set_node_allocations(node_id, allocs);
         }
         for (node_id, usage) in usage_per_node {
             if node_stale(&node_id) {
@@ -2987,9 +3170,7 @@ impl Store {
                 // A node that left the fleet between the read and here must
                 // not be resurrected in the allocation map.
                 if guard.nodes.contains_key(&node_id) {
-                    guard
-                        .allocations_by_node
-                        .insert(node_id.clone(), Arc::new(allocations));
+                    guard.set_node_allocations(node_id.clone(), allocations);
                     match scrubbed_usage {
                         Some(usage) => {
                             guard.node_usage.insert(node_id.clone(), usage);
@@ -3046,7 +3227,9 @@ impl Store {
         let index = allocations
             .iter()
             .position(|allocation| allocation.id == allocation_id)?;
-        Some(allocations.remove(index))
+        let removed = allocations.remove(index);
+        model.unindex_allocation(&removed);
+        Some(removed)
     }
 
     /// Splices one allocation into its node's cached list, replacing any
@@ -3059,6 +3242,9 @@ impl Store {
         allocation: Allocation,
         expected: CachedEntry,
     ) -> (bool, Option<Allocation>) {
+        let job_id = allocation.job_id.clone();
+        let node_id = allocation.node_id.clone();
+        let reference = AllocationRef::of(&allocation);
         let entry = model
             .allocations_by_node
             .entry(allocation.node_id.clone())
@@ -3082,6 +3268,10 @@ impl Store {
                 None
             }
         };
+        if let Some(replaced) = &replaced {
+            model.unindex_allocation(replaced);
+        }
+        model.index_allocation_ref(&job_id, &node_id, reference);
         (as_expected, replaced)
     }
 
@@ -3283,12 +3473,17 @@ impl Store {
     /// via [`Store::expected_versions_if_unchanged`], which only returns a
     /// sample if the generation still equals the one returned here (proving
     /// the late sample equals a pre-capacity one).
-    pub(crate) fn plan_capacity_snapshot(&self) -> R<PlanCapacityParts> {
+    pub(crate) fn plan_capacity_snapshot(&self, job_id: &str) -> R<PlanCapacityParts> {
         let guard = self.read_model_reader()?;
         Ok((
             guard.allocations_by_node.clone(),
             guard.node_pools.clone(),
             guard.generation,
+            guard
+                .allocations_by_job
+                .get(job_id)
+                .cloned()
+                .unwrap_or_default(),
         ))
     }
 
@@ -3302,11 +3497,8 @@ impl Store {
     pub fn job_band_for_job_config(&self, job_config_id: &str) -> R<(String, Band)> {
         let conn = self.read_connection()?;
         let row: Option<(String, String)> = conn
-            .query_row(
-                "SELECT job_id, priority FROM job_config WHERE id = ?;",
-                [job_config_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
+            .prepare_cached("SELECT job_id, priority FROM job_config WHERE id = ?;")?
+            .query_row([job_config_id], |row| Ok((row.get(0)?, row.get(1)?)))
             .optional()?;
         Ok(match row {
             Some((job_id, band)) => (job_id, Band::from_stored(&band)),
@@ -3553,12 +3745,21 @@ impl Store {
     }
 
     fn scope_epoch_tx(&self, tx: &Connection, scope_type: &str, scope_id: &str) -> R<i64> {
+        // Read first: a scope the plan touches almost always exists (its
+        // node has been bumped before), and the `INSERT OR IGNORE` seed was
+        // a second statement per candidate on the apply walk. A miss seeds
+        // the row exactly as before and reads as the seed value.
+        let epoch: Option<i64> = tx
+            .prepare_cached(
+                "SELECT epoch FROM allocation_epoch_partition WHERE scope_type = ?1 AND scope_id = ?2;",
+            )?
+            .query_row(params![scope_type, scope_id], |row| row.get(0))
+            .optional()?;
+        if let Some(epoch) = epoch {
+            return Ok(epoch);
+        }
         self.ensure_scope_epoch_tx(tx, scope_type, scope_id)?;
-        let mut stmt = tx.prepare_cached(
-            "SELECT epoch FROM allocation_epoch_partition WHERE scope_type = ?1 AND scope_id = ?2;",
-        )?;
-        let epoch = stmt.query_row(params![scope_type, scope_id], |row| row.get(0))?;
-        Ok(epoch)
+        Ok(0)
     }
 
     fn scope_vector_epochs_tx(
@@ -3588,7 +3789,8 @@ impl Store {
         const BUMP: &str = "UPDATE allocation_epoch_partition SET epoch = epoch + 1 \
              WHERE scope_type = ?1 AND scope_id = ?2 RETURNING epoch;";
         if let Some(epoch) = tx
-            .query_row(BUMP, params![scope_type, scope_id], |row| row.get(0))
+            .prepare_cached(BUMP)?
+            .query_row(params![scope_type, scope_id], |row| row.get(0))
             .optional()?
         {
             return Ok(epoch);
@@ -3596,7 +3798,8 @@ impl Store {
         // First write for this scope: seed it, then bump. The seed is 0, so
         // the bump lands on 1 exactly as the old four-statement form did.
         self.ensure_scope_epoch_tx(tx, scope_type, scope_id)?;
-        tx.query_row(BUMP, params![scope_type, scope_id], |row| row.get(0))
+        tx.prepare_cached(BUMP)?
+            .query_row(params![scope_type, scope_id], |row| row.get(0))
             .optional()?
             .context("epoch row vanished between insert and bump")
     }
@@ -3751,20 +3954,23 @@ impl Store {
         let expected_job_epoch = *expected_versions
             .get(&Self::scope_vector_key("job_config", job_config_id))
             .unwrap_or(&0);
-        let id = conn.query_row(
-            "INSERT INTO plan_submission(job_config_id, mode, placements, expected_epoch, expected_version_vector, status, created_at, evictions, target_instance) VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6, ?7, ?8) RETURNING id;",
-            params![
-                job_config_id,
-                mode,
-                placements_json,
-                expected_job_epoch,
-                expected_vector_json,
-                created_at,
-                evictions_json,
-                target_instance
-            ],
-            |row| row.get(0),
-        )?;
+        let id = conn
+            .prepare_cached(
+                "INSERT INTO plan_submission(job_config_id, mode, placements, expected_epoch, expected_version_vector, status, created_at, evictions, target_instance) VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6, ?7, ?8) RETURNING id;",
+            )?
+            .query_row(
+                params![
+                    job_config_id,
+                    mode,
+                    placements_json,
+                    expected_job_epoch,
+                    expected_vector_json,
+                    created_at,
+                    evictions_json,
+                    target_instance
+                ],
+                |row| row.get(0),
+            )?;
 
         Ok(PlanSubmission {
             id,
@@ -4343,18 +4549,43 @@ impl Store {
     }
 
     /// Emit the side effects a committed plan (or batch of plans) made
-    /// real: the staged events, then one coherent read-model refresh over
+    /// real: the staged events, then one coherent read-model publish over
     /// every allocation scope the commit touched. Both funnels no-op
     /// under an active capture, where the raft apply path re-projects
     /// them from the committed changeset instead (JC-11).
+    ///
+    /// The publish is a DELTA: the plan knows exactly which allocation
+    /// rows it inserted and deleted, so the read model is patched with
+    /// those rows — one indexed read per placement — rather than reloaded
+    /// one whole allocation list per touched node. The reload cost
+    /// O(allocations on the node) per node per plan, growing with cluster
+    /// fill while the plan did not (it was the post-commit half of the
+    /// `plan_under_fill` slope). This is the same delta the raft apply
+    /// path already projects from a committed changeset, so the local and
+    /// replicated read models are now maintained by one code path; the
+    /// delta reloads any node whose cache contradicts it and scrubs one
+    /// node in full per application, exactly as it does for changesets.
     fn emit_plan_effects(&self, effects: PlanApplyEffects) -> R<()> {
         for event in effects.events {
             self.publish_staged(Some(event));
         }
-        if !effects.node_ids.is_empty() || !effects.job_config_ids.is_empty() {
-            self.cache_refresh_allocation_scopes(&effects.node_ids, &effects.job_config_ids)?;
+        if effects.node_ids.is_empty() && effects.job_config_ids.is_empty() {
+            return Ok(());
         }
-        Ok(())
+        if effects.inserted.is_empty() && effects.removed.is_empty() {
+            // Scopes without rows (defensive — every scope here comes from
+            // a placed or evicted row): the full reload is the safe answer.
+            return self
+                .cache_refresh_allocation_scopes(&effects.node_ids, &effects.job_config_ids);
+        }
+        let delta = AllocationDelta {
+            upserts: effects.inserted.clone(),
+            inserts: effects.inserted,
+            moved: BTreeSet::new(),
+            removals: effects.removed,
+            usable: true,
+        };
+        self.cache_apply_allocation_delta(&delta, &effects.node_ids, &effects.job_config_ids)
     }
 
     /// [`Self::apply_plan_submission_apply`] on a caller-supplied
@@ -4389,10 +4620,10 @@ impl Store {
             if reverted.is_some() {
                 tx.execute_batch("ROLLBACK TO legion_plan_body; RELEASE legion_plan_body;")?;
             }
-            tx.execute(
+            tx.prepare_cached(
                 "UPDATE plan_submission SET status = 'rejected', rejection_reason = ?1 WHERE id = ?2;",
-                params![reason, submission.id],
-            )?;
+            )?
+            .execute(params![reason, submission.id])?;
             let latest_versions = self.scope_vector_epochs_tx(tx, &submission.expected_versions)?;
             let rejected_event = self.stage_event_locked(
                 tx,
@@ -4443,12 +4674,14 @@ impl Store {
             String,
             String,
             Option<String>,
-        ) = tx.query_row(
-            "SELECT placements, mode, evictions, target_instance FROM plan_submission \
-             WHERE id = ?1;",
-            [submission.id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-        )?;
+        ) = tx
+            .prepare_cached(
+                "SELECT placements, mode, evictions, target_instance FROM plan_submission \
+                 WHERE id = ?1;",
+            )?
+            .query_row([submission.id], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })?;
         let placements = Self::parse_plan_submission_placements(&placements_json)?;
         let evictions: Vec<PlanEviction> = serde_json::from_str(&evictions_json)?;
         // Only a ratification sets this, and it always carries exactly one
@@ -4861,10 +5094,10 @@ impl Store {
             tx.execute_batch("RELEASE legion_plan_body;")?;
         }
 
-        tx.execute(
+        tx.prepare_cached(
             "UPDATE plan_submission SET status = 'applied', rejection_reason = NULL WHERE id = ?1;",
-            [submission.id],
-        )?;
+        )?
+        .execute([submission.id])?;
         let placed_event =
             drafts::allocations_placed(&submission.job_config_id, &allocations, &candidate_ranks)
                 .and_then(|draft| self.stage_event_locked(tx, draft));
@@ -4875,8 +5108,8 @@ impl Store {
         // Evicted and placed rows refresh together, in one read of
         // committed state — the mirror never passes through the
         // intermediate state a remove-then-add pair of refreshes exposed.
-        effects.touch_allocations(&preempted.victims);
-        effects.touch_allocations(&allocations);
+        effects.touch_evicted(&preempted.victims);
+        effects.touch_placed(&allocations);
         let fallbacks = candidate_ranks.iter().filter(|rank| **rank > 0).count();
         info!(
             submission_id = submission.id,
@@ -5025,11 +5258,11 @@ impl Store {
     /// the walk it replaces.
     fn node_alloc_fingerprint_tx(&self, tx: &Connection, node_id: &str) -> R<(i64, i64, i64)> {
         let epoch = self.scope_epoch_tx(tx, "node", node_id)?;
-        let (count, id_sum): (i64, i64) = tx.query_row(
-            "SELECT COUNT(*), COALESCE(SUM(a.id), 0) FROM allocation a WHERE a.node_id = ?1;",
-            [node_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
+        let (count, id_sum): (i64, i64) = tx
+            .prepare_cached(
+                "SELECT COUNT(*), COALESCE(SUM(a.id), 0) FROM allocation a WHERE a.node_id = ?1;",
+            )?
+            .query_row([node_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
         Ok((epoch, count, id_sum))
     }
 
@@ -5051,10 +5284,12 @@ impl Store {
         // migration note). NULL — a row written before the column existed,
         // or by an older binary — never matches, so it rebuilds.
         let cached: Option<String> = tx
-            .query_row(
+            .prepare_cached(
                 "SELECT usage_json FROM node_alloc_usage \
                  WHERE node_id = ?1 AND alloc_epoch = ?2 AND alloc_count = ?3 \
                    AND alloc_id_sum = ?4 AND policy_fingerprint = ?5;",
+            )?
+            .query_row(
                 params![
                     node_id,
                     epoch,
@@ -5219,7 +5454,7 @@ impl Store {
                 );
                 continue;
             }
-            tx.execute(
+            tx.prepare_cached(
                 "INSERT INTO node_alloc_usage \
                      (node_id, alloc_epoch, alloc_count, alloc_id_sum, usage_json, \
                       policy_fingerprint) \
@@ -5230,15 +5465,15 @@ impl Store {
                      alloc_id_sum = excluded.alloc_id_sum, \
                      usage_json = excluded.usage_json, \
                      policy_fingerprint = excluded.policy_fingerprint;",
-                params![
-                    snapshot.node_id,
-                    epoch,
-                    count,
-                    id_sum,
-                    serde_json::to_string(&snapshot.total)?,
-                    self.resource_policy_fingerprint.as_ref()
-                ],
-            )?;
+            )?
+            .execute(params![
+                snapshot.node_id,
+                epoch,
+                count,
+                id_sum,
+                serde_json::to_string(&snapshot.total)?,
+                self.resource_policy_fingerprint.as_ref()
+            ])?;
         }
         Ok(())
     }
@@ -8348,11 +8583,8 @@ impl Store {
     pub fn job_id_for_job_config(&self, job_config_id: &str) -> R<Option<String>> {
         let conn = self.read_connection()?;
         let job_id = conn
-            .query_row(
-                "SELECT job_id FROM job_config WHERE id = ?;",
-                [job_config_id],
-                |row| row.get(0),
-            )
+            .prepare_cached("SELECT job_id FROM job_config WHERE id = ?;")?
+            .query_row([job_config_id], |row| row.get(0))
             .optional()?;
         Ok(job_id)
     }
@@ -10671,8 +10903,9 @@ impl Store {
         job_config_id: &str,
     ) -> R<HashMap<i64, TaskStatusState>> {
         let conn = self.read_connection()?;
-        let mut stmt = conn
-            .prepare("SELECT task_config_id, status FROM task_status WHERE job_config_id = ?;")?;
+        let mut stmt = conn.prepare_cached(
+            "SELECT task_config_id, status FROM task_status WHERE job_config_id = ?;",
+        )?;
         let rows = stmt.query_map([job_config_id], |row| {
             let task_id: i64 = row.get(0)?;
             let status: String = row.get(1)?;
@@ -10865,11 +11098,13 @@ impl Store {
             Value,
             Option<String>,
             Option<String>,
-        ) = tx.query_row(
-            "SELECT job_config_id, resources, network, connect FROM task_config WHERE id = ?;",
-            [task_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-        )?;
+        ) = tx
+            .prepare_cached(
+                "SELECT job_config_id, resources, network, connect FROM task_config WHERE id = ?;",
+            )?
+            .query_row([task_id], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })?;
 
         let network =
             self.assign_allocation_network(tx, node_id, task_id, network_raw, connect_raw)?;
@@ -10890,6 +11125,224 @@ impl Store {
     /// kinds share the node's one port space) so concurrent placements in the
     /// same tx or committed earlier cannot collide. Static conflicts fail
     /// placement with a node-scoped error.
+    /// The port a service declared on its own task — its port label's
+    /// in-task `to`, else its static host port — so a consumer's VIP can
+    /// listen on the number the service is known by. `None` when the service
+    /// is not (yet) submitted or declares only a dynamic port with no `to`.
+    fn declared_service_port(&self, tx: &Connection, service: &str) -> R<Option<u16>> {
+        let mut stmt = tx.prepare_cached(
+            "SELECT network, service FROM task_config
+             WHERE service IS NOT NULL AND json_valid(service)
+               AND COALESCE(json_extract(service, '$.name'), name) = ?
+             ORDER BY id DESC LIMIT 1;",
+        )?;
+        let row = stmt
+            .query_row([service], |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                ))
+            })
+            .optional()?;
+        let Some((network_raw, service_raw)) = row else {
+            return Ok(None);
+        };
+        let (Some(network_raw), Some(service_raw)) = (network_raw, service_raw) else {
+            return Ok(None);
+        };
+        let network: crate::structs::NetworkConfig = match from_str(&network_raw) {
+            Ok(network) => network,
+            Err(_) => return Ok(None),
+        };
+        let service_config: crate::structs::ServiceConfig = match from_str(&service_raw) {
+            Ok(config) => config,
+            Err(_) => return Ok(None),
+        };
+        let label = match service_config.port_label() {
+            Some(label) => label.to_string(),
+            None => return Ok(None),
+        };
+        Ok(network
+            .ports
+            .iter()
+            .find(|port| port.name == label)
+            .and_then(|port| port.to.or(port.static_port)))
+    }
+
+    /// Whether a stored policy matching this task declares an ingress chain.
+    /// Cheap when no policy exists (the generation counter is zero).
+    fn policy_declares_ingress(
+        &self,
+        tx: &Connection,
+        node_id: &str,
+        task_id: i64,
+        network: Option<&crate::structs::NetworkConfig>,
+    ) -> R<bool> {
+        if self.net_policy_generation().unwrap_or(0) == 0 {
+            return Ok(false);
+        }
+        let (runtime, job_id): (String, String) = match tx
+            .query_row(
+                "SELECT runtime, job_id FROM task_config WHERE id = ?;",
+                [task_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?
+        {
+            Some(row) => row,
+            None => return Ok(false),
+        };
+        let pool: Option<String> = tx
+            .query_row("SELECT pool FROM node WHERE id = ?;", [node_id], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        let facts = crate::structs::netpolicy::NetSelectorFacts {
+            node_pool: pool,
+            namespace: String::new(),
+            runtime,
+            job: job_id,
+            labels: network.map(|n| n.labels.clone()).unwrap_or_default(),
+        };
+        Ok(self
+            .list_net_policies()?
+            .into_iter()
+            .map(|record| record.object)
+            .any(|policy| policy.ingress.is_some() && policy.selector.matches(&facts)))
+    }
+
+    /// How the allocation's advertised ports terminate TLS — `legion`,
+    /// `byo`, or none — from the effective ingress chain the same merge the
+    /// heartbeat runs would produce for this (job, task, node). Resolved at
+    /// placement because the catalog projection reads it off the allocation
+    /// row for every consumer's endpoint feed.
+    fn ingress_tls_at_placement(
+        &self,
+        tx: &Connection,
+        node_id: &str,
+        task_id: i64,
+        network: Option<&crate::structs::NetworkConfig>,
+    ) -> R<Option<String>> {
+        let (runtime, job_id): (String, String) = match tx
+            .query_row(
+                "SELECT runtime, job_id FROM task_config WHERE id = ?;",
+                [task_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?
+        {
+            Some(row) => row,
+            None => return Ok(None),
+        };
+        let matching: Vec<crate::structs::netpolicy::NetPolicyObject> =
+            if self.net_policy_generation().unwrap_or(0) > 0 {
+                let pool: Option<String> = tx
+                    .query_row("SELECT pool FROM node WHERE id = ?;", [node_id], |row| {
+                        row.get(0)
+                    })
+                    .optional()?;
+                let facts = crate::structs::netpolicy::NetSelectorFacts {
+                    node_pool: pool,
+                    namespace: String::new(),
+                    runtime,
+                    job: job_id,
+                    labels: network.map(|n| n.labels.clone()).unwrap_or_default(),
+                };
+                self.list_net_policies()?
+                    .into_iter()
+                    .map(|record| record.object)
+                    .filter(|policy| policy.selector.matches(&facts))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+        let effective = crate::structs::netpolicy::merge_policies(
+            &matching,
+            crate::structs::netpolicy::InlinePolicy {
+                mode: None,
+                egress: None,
+                ingress: network.and_then(|n| n.ingress.as_ref()),
+            },
+        );
+        Ok(effective
+            .ingress
+            .as_ref()
+            .and_then(|chain| chain.tls.as_ref())
+            .filter(|tls| {
+                matches!(
+                    tls.mode.as_str(),
+                    crate::structs::netpolicy::TLS_SERVER | crate::structs::netpolicy::TLS_MUTUAL
+                )
+            })
+            .map(|tls| {
+                if tls.cert_from.as_deref() == Some("legion") {
+                    "legion".to_string()
+                } else {
+                    "byo".to_string()
+                }
+            }))
+    }
+
+    /// The `network.mode` an allocation runs in: the task's declared mode
+    /// (`auto` resolved per runtime), overridden by the highest-priority
+    /// matching `require` policy that sets one. Resolved at placement — a
+    /// namespace is a start-time property — so a later policy change affects
+    /// the next placement, not a running allocation.
+    fn effective_network_mode(
+        &self,
+        tx: &Connection,
+        node_id: &str,
+        task_id: i64,
+        network: Option<&crate::structs::NetworkConfig>,
+    ) -> R<Option<String>> {
+        let (runtime, job_id): (String, String) = match tx
+            .query_row(
+                "SELECT runtime, job_id FROM task_config WHERE id = ?;",
+                [task_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?
+        {
+            Some(row) => row,
+            None => return Ok(None),
+        };
+        let declared = network.map(|n| n.mode.as_str()).unwrap_or("auto");
+        let mut mode = crate::structs::resolve_network_mode(declared, &runtime);
+        // Stored policies are rare on the placement path; the generation
+        // check makes a cluster without any of them pay one indexed read.
+        if self.net_policy_generation().unwrap_or(0) > 0 {
+            let pool: Option<String> = tx
+                .query_row("SELECT pool FROM node WHERE id = ?;", [node_id], |row| {
+                    row.get(0)
+                })
+                .optional()?;
+            let facts = crate::structs::netpolicy::NetSelectorFacts {
+                node_pool: pool,
+                namespace: String::new(),
+                runtime: runtime.clone(),
+                job: job_id,
+                labels: network.map(|n| n.labels.clone()).unwrap_or_default(),
+            };
+            let mut required: Vec<crate::structs::netpolicy::NetPolicyObject> = self
+                .list_net_policies()?
+                .into_iter()
+                .map(|record| record.object)
+                .filter(|policy| {
+                    policy.is_required() && policy.mode.is_some() && policy.selector.matches(&facts)
+                })
+                .collect();
+            required.sort_by(|a, b| {
+                b.priority
+                    .cmp(&a.priority)
+                    .then_with(|| a.name.cmp(&b.name))
+            });
+            if let Some(imposed) = required.first().and_then(|p| p.mode.clone()) {
+                mode = crate::structs::resolve_network_mode(&imposed, &runtime);
+            }
+        }
+        Ok(Some(mode))
+    }
+
     fn assign_allocation_network(
         &self,
         tx: &Connection,
@@ -10919,10 +11372,23 @@ impl Store {
             .as_ref()
             .is_some_and(|connect| !connect.upstreams.is_empty());
         if !has_ports && !has_upstreams {
-            return Ok(None);
+            // No ports and no upstreams: the row carries a network only when
+            // a mode other than `host` applies (the task asked for `gated`,
+            // or a required policy imposes it), so plain jobs stay unchanged.
+            let mode = self.effective_network_mode(tx, node_id, task_id, network.as_ref())?;
+            return Ok(match mode.as_deref() {
+                Some(mode) if mode != crate::structs::netpolicy::MODE_HOST => {
+                    Some(crate::structs::AllocNetwork {
+                        mode: Some(mode.to_string()),
+                        ..Default::default()
+                    })
+                }
+                _ => None,
+            });
         }
 
         let mut used: HashSet<u16> = HashSet::new();
+        let mut used_blocks: HashSet<String> = HashSet::new();
         let mut stmt = tx.prepare_cached(
             "SELECT network FROM allocation WHERE node_id = ? AND network IS NOT NULL;",
         )?;
@@ -10938,24 +11404,72 @@ impl Store {
                     .iter()
                     .map(|upstream| upstream.local_port),
             );
+            if let Some(block) = existing.vip_block.as_ref() {
+                used_blocks.insert(block.clone());
+            }
         }
 
-        let (ports, upstreams) =
-            crate::structs::assign_allocation_ports(network.as_ref(), connect.as_ref(), &used)
-                .with_context(|| format!("failed to assign ports on node {node_id}"))?;
+        // Name-is-config (docs/network-handlers.md): an allocation with
+        // upstreams gets a loopback /24 so `<key>.svc.legion` can resolve to
+        // a VIP on the port the service declared. Only where the platform
+        // routes 127/8; a block that cannot be assigned is not a placement
+        // failure — the loopback ports still work — so this is best effort.
+        let (vip_block, service_ports) = if has_upstreams
+            && crate::structs::platform_supports_vip_blocks()
+        {
+            let block = crate::structs::next_vip_block(&used_blocks).ok();
+            if block.is_none() {
+                warn!(node_id = %node_id, "No free VIP block; upstreams get loopback ports only");
+            }
+            let mut service_ports: HashMap<String, u16> = HashMap::new();
+            if let Some(connect) = connect.as_ref() {
+                for upstream in &connect.upstreams {
+                    if upstream.is_external() {
+                        continue;
+                    }
+                    if let Some(port) = self.declared_service_port(tx, &upstream.service)? {
+                        service_ports.insert(upstream.key().to_string(), port);
+                    }
+                }
+            }
+            (block, service_ports)
+        } else {
+            (None, HashMap::new())
+        };
+
+        // An ingress chain — inline, or from a matching stored policy — means
+        // the datapath owns the advertised ports and the task binds private
+        // twins. Decided here because ports are assigned here.
+        let has_ingress = network.as_ref().is_some_and(|n| n.ingress.is_some())
+            || self.policy_declares_ingress(tx, node_id, task_id, network.as_ref())?;
+        let (ports, upstreams) = crate::structs::assign_allocation_ports_full(
+            network.as_ref(),
+            connect.as_ref(),
+            &used,
+            &service_ports,
+            vip_block.as_deref(),
+            has_ingress,
+        )
+        .with_context(|| format!("failed to assign ports on node {node_id}"))?;
         let address = tx
-            .query_row(
-                "SELECT config_attrs FROM node WHERE id = ?;",
-                [node_id],
-                |row| row.get::<_, Value>(0),
-            )
+            .prepare_cached("SELECT config_attrs FROM node WHERE id = ?;")
+            .and_then(|mut stmt| stmt.query_row([node_id], |row| row.get::<_, Value>(0)))
             .ok()
             .and_then(|attrs| worker_address_host(&attrs));
 
+        let mode = self.effective_network_mode(tx, node_id, task_id, network.as_ref())?;
+        let ingress_tls = if has_ingress {
+            self.ingress_tls_at_placement(tx, node_id, task_id, network.as_ref())?
+        } else {
+            None
+        };
         Ok(Some(crate::structs::AllocNetwork {
             address,
             ports,
             upstreams,
+            vip_block,
+            mode,
+            ingress_tls,
         }))
     }
 
@@ -11001,11 +11515,11 @@ impl Store {
 
         if let Some(instance_id) = allocation.instance_id.as_deref() {
             let now = Self::now_rfc3339()?;
-            tx.execute(
+            tx.prepare_cached(
                 "UPDATE instance SET state = 'active', current_alloc_id = ?1, updated_at = ?2 \
                  WHERE instance_id = ?3;",
-                params![allocation.id, now, instance_id],
-            )?;
+            )?
+            .execute(params![allocation.id, now, instance_id])?;
         }
 
         Ok(allocation)
@@ -11696,10 +12210,11 @@ impl Store {
             Value,
             Option<String>,
             Option<String>,
-        ) = tx.query_row(
-            "SELECT job_config_id, resources, constraints, permit, network, connect FROM task_config WHERE id = ?;",
-            [task_id],
-            |row| {
+        ) = tx
+            .prepare_cached(
+                "SELECT job_config_id, resources, constraints, permit, network, connect FROM task_config WHERE id = ?;",
+            )?
+            .query_row([task_id], |row| {
                 Ok((
                     row.get(0)?,
                     row.get(1)?,
@@ -11708,8 +12223,7 @@ impl Store {
                     row.get(4)?,
                     row.get(5)?,
                 ))
-            },
-        )?;
+            })?;
 
         let constraint_set = ConstraintSet::new(&constraints)
             .with_context(|| format!("Failed to parse constraints for task {task_id}"))?;
@@ -12212,6 +12726,9 @@ impl Store {
                 allow: service.allow.clone(),
                 meta: service.meta_strings(),
                 port_label: service.port_label().map(str::to_string),
+                mesh_tls: network
+                    .as_ref()
+                    .is_some_and(|network| network.ingress_tls.as_deref() == Some("legion")),
             });
         }
 
@@ -12254,6 +12771,45 @@ impl Store {
             });
         }
         Ok(declared)
+    }
+
+    /// Every task in the latest config of every job that declares
+    /// `connect.upstreams` — the declared half of the service graph.
+    pub fn declared_consumers(&self) -> R<Vec<DeclaredConsumer>> {
+        let conn = self.read_connection()?;
+        let mut stmt = conn.prepare(
+            "SELECT tc.name, tc.connect, tc.job_id
+             FROM task_config tc
+             INNER JOIN job_config jc ON jc.id = tc.job_config_id
+             INNER JOIN (
+                 SELECT job_id, MAX(version) AS version FROM job_config GROUP BY job_id
+             ) latest ON latest.job_id = jc.job_id AND latest.version = jc.version
+             WHERE tc.connect IS NOT NULL;",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (task_name, connect_raw, job_id) = row?;
+            let connect: crate::structs::ConnectConfig = match from_str(&connect_raw) {
+                Ok(connect) => connect,
+                Err(_) => continue,
+            };
+            if connect.upstreams.is_empty() {
+                continue;
+            }
+            out.push(DeclaredConsumer {
+                job_id,
+                task_name,
+                upstreams: connect.upstreams,
+            });
+        }
+        Ok(out)
     }
 
     pub fn allocation_health_for_job_config(
@@ -12720,14 +13276,17 @@ impl Store {
         task_name: &str,
     ) -> R<Option<TaskScale>> {
         let conn = self.read_connection()?;
-        Ok(conn
-            .query_row(
+        let scale = conn
+            .prepare_cached(
                 "SELECT job_id, task_group, task_name, count, pending_count, base_count, source, reason, principal, updated_at \
                  FROM task_scale WHERE job_id = ?1 AND task_group = ?2 AND task_name = ?3;",
+            )?
+            .query_row(
                 params![job_id, task_group, task_name],
                 Self::task_scale_from_row,
             )
-            .optional()?)
+            .optional()?;
+        Ok(scale)
     }
 
     /// Every override row for a job.
@@ -14057,13 +14616,13 @@ impl Store {
     #[instrument(err, skip_all)]
     pub fn count_live_keyed_instances(&self, job_id: &str, group: &str, task_name: &str) -> R<u32> {
         let conn = self.read_connection()?;
-        let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM instance \
-             WHERE job_id = ?1 AND group_name = ?2 AND task_name = ?3 \
-             AND mode = 'keyed' AND state NOT IN ('terminated', 'stopped');",
-            params![job_id, group, task_name],
-            |row| row.get(0),
-        )?;
+        let count: i64 = conn
+            .prepare_cached(
+                "SELECT COUNT(*) FROM instance \
+                 WHERE job_id = ?1 AND group_name = ?2 AND task_name = ?3 \
+                 AND mode = 'keyed' AND state NOT IN ('terminated', 'stopped');",
+            )?
+            .query_row(params![job_id, group, task_name], |row| row.get(0))?;
         Ok(count.max(0) as u32)
     }
 
@@ -14107,14 +14666,16 @@ impl Store {
         exclude_job_config_id: &str,
     ) -> R<u32> {
         let conn = self.read_connection()?;
-        let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM allocation \
-             INNER JOIN instance ON instance.instance_id = allocation.instance_id \
-             WHERE instance.job_id = ?1 AND instance.group_name = ?2 \
-             AND instance.mode = 'slot' AND allocation.job_config_id != ?3;",
-            params![job_id, group, exclude_job_config_id],
-            |row| row.get(0),
-        )?;
+        let count: i64 = conn
+            .prepare_cached(
+                "SELECT COUNT(*) FROM allocation \
+                 INNER JOIN instance ON instance.instance_id = allocation.instance_id \
+                 WHERE instance.job_id = ?1 AND instance.group_name = ?2 \
+                 AND instance.mode = 'slot' AND allocation.job_config_id != ?3;",
+            )?
+            .query_row(params![job_id, group, exclude_job_config_id], |row| {
+                row.get(0)
+            })?;
         Ok(count.max(0) as u32)
     }
 
@@ -14400,7 +14961,7 @@ impl Store {
         let tx = Self::write_tx(&mut conn)?;
 
         let eval = tx
-            .query_row(
+            .prepare_cached(
                 "UPDATE eval
                 SET status = 'in_flight'
                 WHERE id = (
@@ -14411,9 +14972,10 @@ impl Store {
                     LIMIT 1
                 )
                 RETURNING id, status, type, job_id, job_config_id, node_id, priority, ready_at;",
-                named_params! {":now": Self::sortable_now()?},
-                |row| self.eval_from_row(row),
-            )
+            )?
+            .query_row(named_params! {":now": Self::sortable_now()?}, |row| {
+                self.eval_from_row(row)
+            })
             .optional()?;
 
         let Some(mut eval) = eval else {
@@ -14438,7 +15000,7 @@ impl Store {
         // Matching on `ready_at` matters because a delayed eval is a timer,
         // not a queued duplicate: a batch task's next scheduled `job_update`
         // must survive an unrelated `job_update` running now.
-        tx.execute(
+        tx.prepare_cached(
             "DELETE FROM eval
             WHERE status = 'pending'
               AND id != :id
@@ -14448,14 +15010,14 @@ impl Store {
                 (:job_id IS NOT NULL AND :job_id != '' AND job_id = :job_id)
                 OR (:node_id IS NOT NULL AND :node_id != '' AND node_id = :node_id)
               );",
-            named_params! {
-                ":id": eval_id,
-                ":type": eval.kind,
-                ":now": Self::sortable_now()?,
-                ":job_id": if eval.job_id.trim().is_empty() { None::<String> } else { Some(eval.job_id.clone()) },
-                ":node_id": if eval.node_name.trim().is_empty() { None::<String> } else { Some(eval.node_name.clone()) },
-            },
-        )?;
+        )?
+        .execute(named_params! {
+            ":id": eval_id,
+            ":type": eval.kind,
+            ":now": Self::sortable_now()?,
+            ":job_id": if eval.job_id.trim().is_empty() { None::<String> } else { Some(eval.job_id.clone()) },
+            ":node_id": if eval.node_name.trim().is_empty() { None::<String> } else { Some(eval.node_name.clone()) },
+        })?;
 
         // Cheapest accurate point for the queue-depth gauge: the claim (and
         // its superseded-eval sweep) just changed the pending count, and the
@@ -14908,11 +15470,9 @@ impl Store {
     /// `legion_eval_queue_depth` gauge accurate at the points where the
     /// pending set changes (enqueue, claim, startup requeue).
     fn pending_eval_count_tx(conn: &Connection) -> R<i64> {
-        Ok(conn.query_row(
-            "SELECT COUNT(*) FROM eval WHERE status = 'pending';",
-            [],
-            |row| row.get(0),
-        )?)
+        Ok(conn
+            .prepare_cached("SELECT COUNT(*) FROM eval WHERE status = 'pending';")?
+            .query_row([], |row| row.get(0))?)
     }
 
     #[instrument(err, skip_all)]
@@ -15033,9 +15593,11 @@ impl Store {
         let tx = Self::write_tx(&mut conn)?;
 
         if succeeded {
-            tx.execute("DELETE FROM eval WHERE id = ?;", [eval_id])?;
+            tx.prepare_cached("DELETE FROM eval WHERE id = ?;")?
+                .execute([eval_id])?;
         } else {
-            tx.execute("UPDATE eval SET status = 'failed' WHERE id = ?;", [eval_id])?;
+            tx.prepare_cached("UPDATE eval SET status = 'failed' WHERE id = ?;")?
+                .execute([eval_id])?;
         }
         let staged = event.and_then(|draft| self.stage_event_locked(&tx, draft));
         tx.commit()?;
@@ -17231,7 +17793,7 @@ impl Store {
     #[instrument(err, skip_all)]
     pub fn pinned_placements_for_task(&self, task_id: i64) -> R<Vec<(String, String)>> {
         let conn = self.read_connection()?;
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT instance.instance_id, volume.node_id \
              FROM instance \
              INNER JOIN volume ON volume.instance_id = instance.instance_id \
@@ -22246,6 +22808,9 @@ mod tests {
         let static_port_task = |name: &str| {
             let mut task = task(name);
             task.network = Some(crate::structs::network::NetworkConfig {
+                labels: Default::default(),
+                egress: None,
+                ingress: None,
                 mode: "host".into(),
                 ports: vec![crate::structs::network::PortConfig {
                     name: "http".into(),
@@ -22344,6 +22909,9 @@ mod tests {
 
         let mut port_task = task("task");
         port_task.network = Some(crate::structs::network::NetworkConfig {
+            labels: Default::default(),
+            egress: None,
+            ingress: None,
             mode: "host".into(),
             ports: vec![crate::structs::network::PortConfig {
                 name: "http".into(),
@@ -25901,6 +26469,20 @@ mod tests {
     /// every reader (`allocations_by_node.get(..)` unwraps to `&[]`), and
     /// SQLite promises no row order without an ORDER BY, so neither
     /// distinction is allowed to fail the comparison.
+    /// The job index as sorted `(job, node) -> [allocation id]`, so two
+    /// indexes compare regardless of hash or insertion order.
+    fn job_index_view(model: &SchedulingReadModel) -> BTreeMap<(String, String), Vec<i64>> {
+        let mut view = BTreeMap::new();
+        for (job_id, nodes) in &model.allocations_by_job {
+            for (node_id, references) in nodes {
+                let mut ids: Vec<i64> = references.iter().map(|reference| reference.id).collect();
+                ids.sort_unstable();
+                view.insert((job_id.clone(), node_id.clone()), ids);
+            }
+        }
+        view
+    }
+
     fn allocation_cache_view(model: &SchedulingReadModel) -> R<BTreeMap<String, Vec<String>>> {
         let mut view = BTreeMap::new();
         for (node_id, allocations) in &model.allocations_by_node {
@@ -25958,6 +26540,20 @@ mod tests {
             allocation_cache_view(&cached)?,
             allocation_cache_view(&truth)?,
             "{label}: allocations_by_node must equal a full reload"
+        );
+        // The job index is only sound if it equals a rebuild from the lists
+        // it mirrors, on every publish path — a stale entry would let a plan
+        // miscount its own allocations.
+        let mut rebuilt = cached.clone();
+        rebuilt.rebuild_job_index();
+        assert_eq!(
+            job_index_view(&cached),
+            job_index_view(&rebuilt),
+            "{label}: the job index must equal a rebuild from allocations_by_node"
+        );
+        assert_eq!(
+            cached.jobs_by_node, rebuilt.jobs_by_node,
+            "{label}: the job index's reverse must equal a rebuild"
         );
         assert_eq!(
             node_pool_view(&cached),

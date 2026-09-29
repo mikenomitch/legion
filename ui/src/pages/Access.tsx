@@ -3,7 +3,7 @@ import { getStoredToken, managerClient, setStoredToken } from '../grpcClient'
 import { canRead } from '../utils/acl'
 import { beginOidcLogin, rememberClientId } from '../utils/oidc'
 import { identityError, managerIdentity, refreshManagerIdentity } from '../utils/connection'
-import { Badge, Button, DefList, Field, Note, SectionCard, Spinner, StatusBadge, Tabs, cx, inputClass, selectClass } from '../components/ui'
+import { Badge, Button, DefList, Field, Note, RelativeTime, SectionCard, Spinner, StatusBadge, Tabs, cx, inputClass, selectClass } from '../components/ui'
 import {
   JoinTokensPanel,
   PoliciesPanel,
@@ -206,7 +206,7 @@ export default function Access() {
                         <span class="text-faint">—</span>
                       ),
                     ],
-                    ...(identity().expiresAt ? ([['Expires', identity().expiresAt]] as Array<[string, string]>) : []),
+                    ...(identity().expiresAt ? [['Expires', <RelativeTime value={identity().expiresAt} />] as [string, any]] : []),
                   ]}
                 />
               )}

@@ -15,7 +15,10 @@
 use crate::cmd::helpers::{connect_manager_client, json_flag, AuthedManagerClient};
 use crate::cmd::output::{self, CliError, OutputFormat};
 use crate::prelude::*;
-use crate::structs::{ListServicesRequest, ResolveServiceRequest, ServiceEndpoint, ServiceSummary};
+use crate::structs::{
+    ListServiceEdgesRequest, ListServicesRequest, ResolveServiceRequest, ServiceEdge,
+    ServiceEndpoint, ServiceSummary,
+};
 use rand::seq::SliceRandom;
 use serde::Serialize;
 use tabled::{Table, Tabled};
@@ -89,6 +92,18 @@ pub fn config() -> Command {
                 .arg(json_flag()),
         )
         .subcommand(
+            Command::new("edges")
+                .about("The service graph: who calls whom through the datapath, with request rate, errors, denials and latency")
+                .arg(Arg::new("service").help("Only edges into or out of this service (optional)"))
+                .arg(
+                    Arg::new("window")
+                        .long("window")
+                        .default_value("5m")
+                        .help("Window the counters cover (1m to 15m)"),
+                )
+                .arg(json_flag()),
+        )
+        .subcommand(
             Command::new("doctor")
                 .about("Walks the discovery layers for a service and names the failing one")
                 .arg(
@@ -106,8 +121,147 @@ pub async fn handle(matches: &ArgMatches) -> R<()> {
         Some(("list", sub)) => list(sub).await,
         Some(("resolve", sub)) => resolve(sub).await,
         Some(("doctor", sub)) => doctor(sub).await,
+        Some(("edges", sub)) => edges(sub).await,
         _ => unreachable!(),
     }
+}
+
+/// Machine-readable projection of one service-graph edge.
+fn edge_json(edge: &ServiceEdge) -> Value {
+    json!({
+        "callerJob": edge.caller_job,
+        "callerTask": edge.caller_task,
+        "service": edge.service,
+        "tag": edge.tag,
+        "protocol": edge.protocol,
+        "declared": edge.declared,
+        "allowed": edge.allowed,
+        "requests": edge.requests,
+        "errors": edge.errors,
+        "denied": edge.denied,
+        "rps": edge.rps,
+        "errorRate": edge.error_rate,
+        "latencyMsAvg": edge.latency_ms_avg,
+        "latencyMsMax": edge.latency_ms_max,
+        "bytesOut": edge.bytes_out,
+        "bytesIn": edge.bytes_in,
+        "lastSeenUnix": edge.last_seen_unix,
+    })
+}
+
+#[derive(Tabled)]
+struct EdgeRow {
+    #[tabled(rename = "CALLER")]
+    caller: String,
+    #[tabled(rename = "SERVICE")]
+    service: String,
+    #[tabled(rename = "TAG")]
+    tag: String,
+    #[tabled(rename = "STATE")]
+    state: String,
+    #[tabled(rename = "RPS")]
+    rps: String,
+    #[tabled(rename = "ERRORS")]
+    errors: String,
+    #[tabled(rename = "DENIED")]
+    denied: String,
+    #[tabled(rename = "LATENCY avg/max")]
+    latency: String,
+    #[tabled(rename = "LAST SEEN")]
+    last_seen: String,
+}
+
+fn edge_state(edge: &ServiceEdge) -> &'static str {
+    if !edge.allowed {
+        "not allowed"
+    } else if edge.denied > 0 {
+        "denials"
+    } else if edge.requests == 0 {
+        if edge.declared {
+            "declared, silent"
+        } else {
+            "silent"
+        }
+    } else if edge.error_rate >= 0.05 {
+        "failing"
+    } else if edge.error_rate > 0.0 {
+        "some errors"
+    } else {
+        "healthy"
+    }
+}
+
+async fn edges(matches: &ArgMatches) -> R<()> {
+    let format = OutputFormat::from_matches(matches);
+    let service = matches
+        .get_one::<String>("service")
+        .cloned()
+        .unwrap_or_default();
+    let window_secs = matches
+        .get_one::<String>("window")
+        .and_then(|w| crate::structs::netpolicy::parse_duration(w).ok())
+        .map(|d| d.as_secs() as u32)
+        .unwrap_or(300);
+    let mut client = connect_manager_client().await?;
+    let reply = output::resolve(
+        format,
+        "service edges",
+        client
+            .list_service_edges(ListServiceEdgesRequest {
+                service,
+                window_secs,
+            })
+            .await,
+    )?
+    .into_inner();
+    if format.is_json() {
+        output::print_success(&json!({
+            "windowSecs": reply.window_secs,
+            "edges": reply.edges.iter().map(edge_json).collect::<Vec<_>>(),
+        }));
+        return Ok(());
+    }
+    if reply.edges.is_empty() {
+        println!(
+            "no edges in the last {}s: nothing declares an upstream, and nothing called one",
+            reply.window_secs
+        );
+        return Ok(());
+    }
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    let rows: Vec<EdgeRow> = reply
+        .edges
+        .iter()
+        .map(|edge| EdgeRow {
+            caller: format!("{}/{}", edge.caller_job, edge.caller_task),
+            service: edge.service.clone(),
+            tag: if edge.tag.is_empty() {
+                "-".into()
+            } else {
+                edge.tag.clone()
+            },
+            state: format!(
+                "{}{}",
+                edge_state(edge),
+                if edge.declared { " (declared)" } else { "" }
+            ),
+            rps: format!("{:.2}", edge.rps),
+            errors: format!("{} ({:.1}%)", edge.errors, edge.error_rate * 100.0),
+            denied: edge.denied.to_string(),
+            latency: if edge.protocol == "http" && edge.requests > 0 {
+                format!("{:.0}ms/{}ms", edge.latency_ms_avg, edge.latency_ms_max)
+            } else {
+                "-".into()
+            },
+            last_seen: if edge.last_seen_unix == 0 {
+                "never".into()
+            } else {
+                format!("{}s ago", (now - edge.last_seen_unix).max(0))
+            },
+        })
+        .collect();
+    println!("{}", Table::new(rows));
+    Ok(())
 }
 
 /// Machine-readable projection of a service summary.
@@ -648,6 +802,7 @@ mod tests {
             tags: Vec::new(),
             meta: Default::default(),
             port_label: String::new(),
+            mesh_tls: false,
         }
     }
 

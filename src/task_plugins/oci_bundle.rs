@@ -19,6 +19,7 @@ use std::path::{Component, Path, PathBuf};
 
 /// Image config fields we carry from the OCI layout into the runtime spec,
 /// plus the ordered layer blob paths to extract.
+#[derive(Default)]
 pub(crate) struct ImageConfig {
     pub(crate) env: Vec<String>,
     pub(crate) working_dir: Option<String>,
@@ -85,7 +86,28 @@ pub(crate) fn build_bundle(
     // (`postgres`, `nobody:nogroup`) map to their real uid/gid instead of
     // silently running as root.
     let user = resolve_user(&rootfs, image.user.as_deref());
-    let spec = build_spec(command, env, &image, &user, ctx);
+    // A per-allocation resolver gets its own resolv.conf in the bundle, bind
+    // mounted over the image's. Written here, next to config.json, so it
+    // lives exactly as long as the bundle.
+    let resolv_conf = match ctx.resolver {
+        Some(resolver) => {
+            let path = bundle_dir.join("resolv.conf");
+            std::fs::write(&path, resolv_conf_contents(resolver))
+                .with_context(|| format!("write {}", path.display()))?;
+            Some(path)
+        }
+        None => None,
+    };
+    let ctx = BundleContext {
+        hostname: ctx.hostname,
+        volumes: ctx.volumes,
+        task_dir: ctx.task_dir,
+        assignment: ctx.assignment,
+        resolver: ctx.resolver,
+        resolv_conf: resolv_conf.as_deref(),
+        netns: ctx.netns,
+    };
+    let spec = build_spec(command, env, &image, &user, &ctx);
     let config_path = bundle_dir.join("config.json");
     std::fs::write(&config_path, serde_json::to_vec_pretty(&spec)?)
         .with_context(|| format!("write {}", config_path.display()))?;
@@ -293,7 +315,7 @@ fn merge_env(
 
 /// The image `User` resolved to concrete ids, plus the home directory when it
 /// came from a passwd entry (images expect `HOME` set, as Docker does).
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Default)]
 struct ResolvedUser {
     uid: u32,
     gid: u32,
@@ -390,19 +412,48 @@ fn lookup_group(rootfs: &Path, group: &str) -> Option<u32> {
 /// Read-only bind mounts of the host's DNS/hosts files, when they exist. The
 /// container shares host networking, so without these the rootfs has no
 /// resolver config and every name lookup fails.
-fn dns_mounts() -> Vec<Value> {
-    ["/etc/resolv.conf", "/etc/hosts"]
-        .iter()
-        .filter(|path| Path::new(path).is_file())
-        .map(|path| {
-            json!({
-                "destination": path,
-                "type": "bind",
-                "source": path,
-                "options": ["bind", "ro"],
-            })
-        })
-        .collect()
+fn dns_mounts(resolv_conf: Option<&Path>) -> Vec<Value> {
+    let mut mounts: Vec<Value> = Vec::new();
+    match resolv_conf {
+        // The allocation's own resolver (name-is-config): its resolv.conf,
+        // generated into the bundle, over the image's.
+        Some(path) => mounts.push(json!({
+            "destination": "/etc/resolv.conf",
+            "type": "bind",
+            "source": path,
+            "options": ["bind", "ro"],
+        })),
+        None => {
+            if Path::new("/etc/resolv.conf").is_file() {
+                mounts.push(json!({
+                    "destination": "/etc/resolv.conf",
+                    "type": "bind",
+                    "source": "/etc/resolv.conf",
+                    "options": ["bind", "ro"],
+                }));
+            }
+        }
+    }
+    if Path::new("/etc/hosts").is_file() {
+        mounts.push(json!({
+            "destination": "/etc/hosts",
+            "type": "bind",
+            "source": "/etc/hosts",
+            "options": ["bind", "ro"],
+        }));
+    }
+    mounts
+}
+
+/// `resolv.conf` for a task whose resolver is the allocation's own: one
+/// nameserver, the `svc.legion` search domain so `db` resolves as
+/// `db.svc.legion`, and `ndots:1` so external names never pay a failed
+/// search-domain probe (the K8s `ndots:5` tax, avoided on purpose).
+pub(crate) fn resolv_conf_contents(resolver: &str) -> String {
+    format!(
+        "nameserver {resolver}\nsearch {}\noptions ndots:1\n",
+        crate::structs::SVC_ZONE
+    )
 }
 
 /// Builds an OCI runtime spec. Based on the standard `runc spec` default, with:
@@ -489,6 +540,18 @@ pub(crate) struct BundleContext<'a> {
     pub(crate) task_dir: Option<&'a Path>,
     /// Worker-computed CPU/memory placement, for a `RuntimeApplied` runtime.
     pub(crate) assignment: Option<&'a crate::task_plugins::ResourceAssignment>,
+    /// The allocation's own resolver (`LEGION_DNS`, docs/network-handlers.md
+    /// "Name-is-config"). When set, the container gets a generated
+    /// `/etc/resolv.conf` pointing at it instead of the host's, so
+    /// `<key>.svc.legion` resolves and egress policy applies at resolution.
+    pub(crate) resolver: Option<&'a str>,
+    /// Filled in by `build_bundle`: the generated resolv.conf's host path.
+    pub(crate) resolv_conf: Option<&'a Path>,
+    /// A gated network namespace (`network.mode = "gated"`) the container
+    /// joins instead of the host's: `/var/run/netns/legion-<allocation>`,
+    /// created by the worker before start and holding loopback plus the
+    /// datapath's listeners only.
+    pub(crate) netns: Option<&'a Path>,
 }
 
 fn build_spec(
@@ -519,7 +582,7 @@ fn build_spec(
         json!({ "destination": "/sys", "type": "sysfs", "source": "sysfs",
               "options": ["nosuid", "noexec", "nodev", "ro"] }),
     ];
-    mounts.extend(dns_mounts());
+    mounts.extend(dns_mounts(ctx.resolv_conf));
     // The allocation's task directory, read-write, at the canonical mount
     // point. The *directory* is mounted, never individual files: the worker
     // replaces rendered files atomically by rename, which stays visible
@@ -536,6 +599,19 @@ fn build_spec(
     // Volumes last so a job can deliberately shadow a default mount point —
     // the task-dir mount included.
     mounts.extend(volume_mounts(ctx.volumes));
+
+    // Namespaces: pid/ipc/uts/mount as before, plus — for a gated
+    // allocation — the worker-created network namespace, joined by path. A
+    // task without one shares the host's network, exactly as before.
+    let mut namespaces = vec![
+        json!({ "type": "pid" }),
+        json!({ "type": "ipc" }),
+        json!({ "type": "uts" }),
+        json!({ "type": "mount" }),
+    ];
+    if let Some(netns) = ctx.netns {
+        namespaces.push(json!({ "type": "network", "path": netns.display().to_string() }));
+    }
 
     // The device-cgroup deny rule is unconditional; declared limits are
     // layered over it, so a task that declares nothing keeps exactly the
@@ -573,12 +649,7 @@ fn build_spec(
         "mounts": mounts,
         "linux": {
             "resources": linux_resources,
-            "namespaces": [
-                { "type": "pid" },
-                { "type": "ipc" },
-                { "type": "uts" },
-                { "type": "mount" }
-            ],
+            "namespaces": namespaces,
             "maskedPaths": [
                 "/proc/acpi", "/proc/asound", "/proc/kcore", "/proc/keys",
                 "/proc/latency_stats", "/proc/timer_list", "/proc/timer_stats",
@@ -654,6 +725,75 @@ mod tests {
         )
         .expect("group");
         dir
+    }
+
+    #[test]
+    fn gated_context_joins_the_network_namespace_by_path() {
+        let image = ImageConfig::default();
+        let user = ResolvedUser::default();
+        let netns = Path::new("/var/run/netns/legion-7");
+        let ctx = BundleContext {
+            hostname: "legion-7",
+            volumes: &[],
+            task_dir: None,
+            assignment: None,
+            resolver: Some("127.42.0.1"),
+            resolv_conf: None,
+            netns: Some(netns),
+        };
+        let spec = build_spec(
+            &["true".to_string()],
+            &Default::default(),
+            &image,
+            &user,
+            &ctx,
+        );
+        let namespaces = spec["linux"]["namespaces"].as_array().unwrap();
+        let network = namespaces
+            .iter()
+            .find(|n| n["type"] == "network")
+            .expect("network namespace");
+        assert_eq!(network["path"], "/var/run/netns/legion-7");
+        // Not gated: no network namespace, as before.
+        let plain = BundleContext { netns: None, ..ctx };
+        let spec = build_spec(
+            &["true".to_string()],
+            &Default::default(),
+            &image,
+            &user,
+            &plain,
+        );
+        assert!(!spec["linux"]["namespaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n["type"] == "network"));
+    }
+
+    #[test]
+    fn allocation_resolver_replaces_the_host_resolv_conf() {
+        let generated = Path::new("/bundle/resolv.conf");
+        let mounts = dns_mounts(Some(generated));
+        let resolv = mounts
+            .iter()
+            .find(|m| m["destination"] == "/etc/resolv.conf")
+            .expect("resolv.conf mount");
+        assert_eq!(resolv["source"], "/bundle/resolv.conf");
+        assert_eq!(resolv["options"][1], "ro");
+        // Without a resolver the host file is used, as before.
+        let mounts = dns_mounts(None);
+        if Path::new("/etc/resolv.conf").is_file() {
+            let resolv = mounts
+                .iter()
+                .find(|m| m["destination"] == "/etc/resolv.conf")
+                .unwrap();
+            assert_eq!(resolv["source"], "/etc/resolv.conf");
+        }
+        let contents = resolv_conf_contents("127.42.3.1");
+        assert_eq!(
+            contents,
+            "nameserver 127.42.3.1\nsearch svc.legion\noptions ndots:1\n"
+        );
     }
 
     #[test]
@@ -761,6 +901,9 @@ mod tests {
                 volumes: &volumes,
                 task_dir: None,
                 assignment: None,
+                resolver: None,
+                resolv_conf: None,
+                netns: None,
             },
         );
 
@@ -823,6 +966,9 @@ mod tests {
                 volumes: &[],
                 task_dir: None,
                 assignment,
+                resolver: None,
+                resolv_conf: None,
+                netns: None,
             },
         )
     }
@@ -932,6 +1078,9 @@ mod tests {
                 }],
                 task_dir: Some(Path::new("/var/legion/allocs/42/web")),
                 assignment: None,
+                resolver: None,
+                resolv_conf: None,
+                netns: None,
             },
         );
 
@@ -990,6 +1139,9 @@ mod tests {
                 volumes: &[],
                 task_dir: None,
                 assignment: None,
+                resolver: None,
+                resolv_conf: None,
+                netns: None,
             },
         );
         let env = spec["process"]["env"].as_array().unwrap();

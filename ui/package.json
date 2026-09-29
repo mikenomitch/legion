@@ -6,6 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
+    "typecheck": "tsc --noEmit",
+    "gen": "protoc -I ../proto --plugin=protoc-gen-connect-es=./node_modules/.bin/protoc-gen-connect-es --plugin=protoc-gen-es=./node_modules/.bin/protoc-gen-es --connect-es_out=src/gen --connect-es_opt=target=ts --es_out=src/gen --es_opt=target=ts ../proto/legion.proto",
     "preview": "vite preview"
   },
   "dependencies": {
@@ -18,7 +20,6 @@
     "@solidjs/router": "^0.13.6",
     "@xterm/addon-fit": "^0.11.0",
     "@xterm/xterm": "^6.0.0",
-    "d3": "^7.9.0",
     "date-fns": "^4.1.0",
     "solid-js": "^1.8.5"
   },

@@ -251,6 +251,17 @@ plugin) pre-creates the device and Legion attaches it. `LEGION_PORT_*` /
 `LEGION_ADDR_*` are still exported into the guest, but nothing maps host ports
 into the VM yet.
 
+**Gated networking.** Set the *task's* `network.mode = "gated"` (the block
+next to `service`/`connect`, not `config.network`) and the guest boots with
+no NIC at all; its only way out is a vsock to the node datapath, where every
+connection is judged by policy, handlers and identity. The worker binds the
+host end before boot, and the generated init starts `legion guest-agent`
+(this binary, copied into the rootfs) to relay the guest's loopback proxy and
+resolver ports over the vsock. See
+[network-handlers.md](network-handlers.md#sandboxes) for the mechanics, what
+is enforced, and the honest status (unit-tested over Unix sockets; not yet
+boot-tested on a VMM in CI).
+
 That single, operator-owned interface is also what makes `sandbox` the one
 runtime whose [edge boot](edge-boot.md) `boot` gate is a **real** network
 boundary. A guest started before its placement is durable boots with the TAP

@@ -1,6 +1,6 @@
 import { A, useParams } from '@solidjs/router'
 import { AccessGate } from '../../components/AccessGate'
-import { For, Show, createMemo, createResource, createSignal, onCleanup, onMount } from 'solid-js'
+import { For, Show, createMemo, createResource } from 'solid-js'
 import {
   Badge,
   CodeBlock,
@@ -8,13 +8,13 @@ import {
   LoadingRows,
   Note,
   PageHeader,
+  RelativeTime,
   SectionCard,
   cx,
   linkClass,
 } from '../../components/ui'
 import { managerClient } from '../../grpcClient'
-import { formatDate, formatRelativeTime } from '../../utils/format'
-import { POLL_INTERVAL_MS } from '../../utils/polling'
+import { retainOnError, usePoll } from '../../utils/polling'
 import { parseJsonMap, volumePinsPlacement, volumeScope, volumeScopeHint, volumeStateTone } from '../../utils/volumes'
 
 // One line per state, so the page answers "what is happening to my data right
@@ -31,22 +31,20 @@ const STATE_COPY: Record<string, string> = {
 function VolumeDetailContent() {
   const params = useParams()
   const volumeId = createMemo(() => decodeURIComponent(params.id))
-  const [tick, setTick] = createSignal(0)
-
-  onMount(() => {
-    const timer = setInterval(() => setTick((value) => value + 1), POLL_INTERVAL_MS)
-    onCleanup(() => clearInterval(timer))
-  })
+  const tick = usePoll()
 
   const [data] = createResource(
     () => [volumeId(), tick()] as const,
-    async ([id]) => {
-      const [volume, drivers] = await Promise.all([
-        managerClient.getVolume({ volumeId: id }),
-        managerClient.listVolumeDrivers({}),
-      ])
-      return { volume: volume.volume, drivers: drivers.drivers }
-    },
+    retainOnError(
+      async ([id]: readonly [string, number]) => {
+        const [volume, drivers] = await Promise.all([
+          managerClient.getVolume({ volumeId: id }),
+          managerClient.listVolumeDrivers({}),
+        ])
+        return { volume: volume.volume, drivers: drivers.drivers }
+      },
+      ([id]) => id,
+    ),
   )
 
   const volume = () => data()?.volume
@@ -175,8 +173,8 @@ function VolumeDetailContent() {
                         <span class="text-faint">not yet mounted</span>
                       ),
                     ],
-                    ['Created', <span title={formatDate(vol().createdAt)}>{formatRelativeTime(vol().createdAt)}</span>],
-                    ['Updated', <span title={formatDate(vol().updatedAt)}>{formatRelativeTime(vol().updatedAt)}</span>],
+                    ['Created', <RelativeTime value={vol().createdAt} />],
+                    ['Updated', <RelativeTime value={vol().updatedAt} />],
                   ]}
                 />
                 <Show when={vol().mountPath}>

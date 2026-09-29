@@ -5,7 +5,7 @@ import { Button, Field, Note, SectionCard, inputClass, textareaClass } from '../
 import { managerClient } from '../grpcClient'
 import { canWriteAny } from '../utils/acl'
 import { debounced } from '../utils/debounce'
-import { formatRelativeTime } from '../utils/format'
+import { INDEX_POLL_INTERVAL_MS, retainOnError, usePoll } from '../utils/polling'
 
 const errorText = (error: unknown): string =>
   error instanceof Error ? error.message : String(error)
@@ -34,6 +34,7 @@ function TemplatesContent() {
   const [page, setPage] = createSignal(1)
   const [pageSize, setPageSize] = createSignal(20)
   const searchQuery = debounced(search)
+  const tick = usePoll(INDEX_POLL_INTERVAL_MS)
 
   createEffect(() => {
     search()
@@ -42,8 +43,11 @@ function TemplatesContent() {
   })
 
   const [data, { refetch }] = createResource(
-    () => ({ search: searchQuery() }),
-    async (input) => managerClient.listJobTemplates({ query: input.search || undefined }),
+    () => ({ search: searchQuery(), tick: tick() }),
+    retainOnError(
+      async (input: { search: string; tick: number }) => managerClient.listJobTemplates({ query: input.search || undefined }),
+      (input) => input.search,
+    ),
   )
 
   const sorted = createMemo(() => {
@@ -162,7 +166,7 @@ function TemplatesContent() {
           id: template.name,
           title: template.name,
           subtitle: template.description,
-          updatedAt: formatRelativeTime(template.updatedAt),
+          updatedAt: template.updatedAt,
           href: `/templates/${encodeURIComponent(template.name)}`,
           cells: {
             version: <span class="tabular-nums">v{template.latestVersion}</span>,
@@ -178,7 +182,7 @@ function TemplatesContent() {
           setPage(1)
         }}
         emptyLabel="No templates yet"
-        emptyHint="Publish one with `legion template create <name> -f template.ncl` or the editor below."
+        emptyHint="Publish one with `legion template create <name> -f template.ncl`, or press New template above."
       />
 
     </div>

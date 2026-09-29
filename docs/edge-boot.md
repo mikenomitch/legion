@@ -203,12 +203,20 @@ plainly:
   a NIC — and held administratively **down**; ratification brings it up. Both
   operations need `CAP_NET_ADMIN`, which `network.mode = "tap"` already requires
   of the operator.
-- **`container` / `exec` — advisory.** Legion withholds what it controls:
-  service registration and the node-local upstream forwarders, neither of which
-  is created until ratification. But the workload shares the host's network
-  stack and **can still reach the network through it.** Host-level egress
-  filtering for these runtimes is the operator's job. The worker logs a warning
-  every time it starts a `boot`-gated task on such a runtime.
+- **`container` / `exec` with `network.mode = "gated"` — enforced.** The
+  workload runs in an empty network namespace whose only way out is the node
+  datapath ([Network Handlers](network-handlers.md#gated-mode)), and the
+  datapath holds the allocation's policy — every listener denies with source
+  `gate` — until ratification opens it. Unlike the TAP gate this is
+  per-destination: a policy with only the package registry lets a gated task
+  fetch dependencies *before* ratification and nothing else.
+- **`container` / `exec` in `host` mode — advisory.** Legion withholds what it
+  controls: service registration and the node-local upstream forwarders,
+  neither of which is created until ratification. But the workload shares the
+  host's network stack and **can still reach the network through it.**
+  Host-level egress filtering for these runtimes is the operator's job. The
+  worker logs a warning every time it starts a `boot`-gated task on such a
+  runtime.
 
 Untrusted code belongs in a microVM, which is the same advice
 [`docs/task-runtime-sandbox.md`](task-runtime-sandbox.md) already gives.
@@ -463,8 +471,9 @@ Stated here rather than left for a bug report:
 - **No island mode.** An unratified start that cannot reach a manager dies when
   its lease expires. Surviving a long control-plane outage is a separate design
   with its own consistency argument.
-- **The `boot` gate is advisory for `container` and `exec`** (see [What the
-  gate does and does not stop](#what-the-gate-does-and-does-not-stop)).
+- **The `boot` gate is advisory for `container` and `exec` in `host` mode**
+  (see [What the gate does and does not stop](#what-the-gate-does-and-does-not-stop));
+  `network.mode = "gated"` makes it a real, per-destination boundary on Linux.
 - **The `sandbox` network gate is link state only.** Legion holds the TAP
   device down; it does not install a per-interface default-drop filter.
   Operators who want belt-and-braces isolation should add one themselves.

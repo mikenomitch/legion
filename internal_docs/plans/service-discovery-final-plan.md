@@ -335,6 +335,14 @@ by the same script. Failure of any step is a release blocker for the claim it ve
 
 ## 8. Mesh follow-on (kept as plan)
 
+> **Superseded for the mesh by [service-mesh-plan.md](service-mesh-plan.md)**,
+> which re-examines every item below (its §2) and unifies the result with the
+> ingress/egress handlers plan. Where this section and that plan differ, that
+> plan wins: DNS resolves to a per-upstream VIP rather than raw endpoints,
+> mTLS is on node identity, there is no separate L7 waypoint, and the
+> datapath plugin remains deferred. This section stays as the record of the
+> original adoption order.
+
 Adoption path stays exactly as designed post-critique, now DX-annotated:
 
 1. **DNS + templates** (v2 first): the no-SDK consumption path; no-NAT resolver, TCP
