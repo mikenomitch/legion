@@ -21,27 +21,28 @@ VITE_MANAGER_ENDPOINT="http://192.168.1.25:4747" npm run dev
 If you are doing UI work and want predictable data without manually creating jobs/workers, start the manager with `LEGION_SEED_UI_DATA=1`.
 
 ```bash
-LEGION_SEED_UI_DATA=1 cargo run -- start manager --run-worker -c configs/manager.jsonnet
+LEGION_SEED_UI_DATA=1 cargo run -- start manager --run-worker -c configs/manager.ncl
 ```
 
 This only seeds when the store is empty and creates demo workers, a demo job, and a couple of KV entries so the UI has real backend data to render.
 
 ## Generating gRPC clients
 
-The generated client stubs live in `src/gen` and can be recreated with:
+The generated client stubs live in `src/gen`. Regenerate them after any change
+to `proto/legion.proto` (needs `protoc` on the PATH; the two plugins are npm
+dev dependencies):
 
 ```bash
-npx protoc \
-  -I ../proto \
-  --plugin=protoc-gen-connect-es=./node_modules/.bin/protoc-gen-connect-es \
-  --plugin=protoc-gen-es=./node_modules/.bin/protoc-gen-es \
-  --connect-es_out=src/gen --connect-es_opt=target=ts \
-  --es_out=src/gen --es_opt=target=ts \
-  ../proto/legion.proto
+npm run gen
 ```
+
+CI runs the same command on every UI or proto change and fails if the
+committed files differ, so a proto change cannot merge without its client.
 
 ## Available scripts
 
 - `npm run dev` – start the dev server
+- `npm run typecheck` – type-check without building
 - `npm run build` – type-check and produce a production build
+- `npm run gen` – regenerate `src/gen` from the proto
 - `npm run preview` – preview the production build locally

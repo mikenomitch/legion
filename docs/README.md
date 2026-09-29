@@ -9,6 +9,9 @@ Plans, roadmaps, to-do lists, and development notes live in
 
 ## Architecture
 
+- [Configuration Language](configuration-language.md) — Nickel: the syntax
+  essentials, the `vars` binding behind `--var`, imports, where imports are
+  refused, and the `.json` path for machine-emitted config.
 - [Managers and Workers](architecture-managers-workers.md) — cluster shape,
   responsibilities, and the manager/worker protocol.
 - [Scheduler and Eval Loop](scheduler-and-eval-loop.md) — the control loop that
@@ -21,6 +24,11 @@ Plans, roadmaps, to-do lists, and development notes live in
 - [Jobs, Tasks, and Scheduling](jobs-tasks-and-scheduling.md) — job spec shapes,
   placement semantics, and edge cases.
 - [State Store](state-store.md) — manager and worker persistence.
+- [Node Liveness](node-liveness.md) — where a node's "is it there?" answer
+  lives, what an election does to it, and why a heartbeat costs no commit.
+- [Heartbeat Cadence and Scale](heartbeat-cadence-and-scale.md) — sizing a
+  control plane for a fleet, the per-node lost window, and the freshness
+  ratio that says whether the fleet is keeping up.
 - [UI Architecture](ui-architecture.md) — the SolidJS app and its design system.
 
 ## Workloads
@@ -61,6 +69,11 @@ Plans, roadmaps, to-do lists, and development notes live in
 
 - [Service Discovery](service-discovery.md) — declaring services and finding
   healthy endpoints.
+- [Network Handlers](network-handlers.md) — the built-in service mesh:
+  egress/ingress policy objects, HTTP mode with retries and canary splits,
+  `<service>.svc.legion` names, `gated` networking (namespaces, and vsock for
+  sandboxes), ingress chains, `authz`/`proxy` handlers, mTLS with the mesh
+  CA, the service graph, drain-before-stop, and `legion net`.
 - [KV Store](kv-store.md) — CRUD, versioning, locks, and reactive task updates.
 - [Auth & ACLs](auth-and-acls.md) — tokens, policies, scopes, and enforcement.
 - [Workload Identity (OIDC)](workload-identity.md) — short-lived, verifiable task
@@ -72,6 +85,10 @@ Plans, roadmaps, to-do lists, and development notes live in
 
 - [Logging](logging.md) — task log capture, tailing, rotation, shipping, OTLP.
 - [Observability](observability.md) — current tracing and metrics state.
+- [Diagnosing Scheduler Performance](diagnosing-scheduler-performance.md) —
+  symptom-first: throughput fell when you scaled up, the box is idle but
+  capped, new work waits behind a backlog. What to read, what its
+  neighbouring metric rules out, and what to change.
 - [Event Stream](event-stream.md) — scheduler events as history and live tail.
 - [Streaming Persistence](persistence-streaming.md) — WAL shipping and
   lease-fenced failover.

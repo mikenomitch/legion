@@ -17,7 +17,8 @@ use crate::resources::{ResourcePolicy, ResourcePool, ResourceRequest, ResourceVa
 use crate::scheduling_index::{IndexMode, IndexQueryOutcome};
 use crate::storage::errors::StorageError;
 use crate::storage::store::{
-    PlanApplyOutcome, PlanSubmissionPlacement, SharedNodeAllocations, Store,
+    AllocationRef, JobAllocationsByNode, PlanApplyOutcome, PlanSubmissionPlacement,
+    SharedNodeAllocations, Store,
 };
 use crate::structs::{
     Allocation, Band, JobConfig, Node, TaskConfig, TaskDependencyCondition, TaskLifecycle,
@@ -215,6 +216,54 @@ struct BuiltPlan {
     observed_preemptions: Vec<PlannedPreemption>,
 }
 
+/// The planned config's own allocations, indexed by node: every node that
+/// holds at least one allocation of the config being planned, with the
+/// task config id of each. Built ONCE per plan from the capacity snapshot
+/// — in the same pass that drops a Fresh plan's replaced rows — and
+/// consulted by every step that used to walk the whole cluster's
+/// allocations for the same answer: required counts, group pinning,
+/// `distinct` seeding, and the scoring cache's per-node task presence.
+/// Small by construction (one job's allocations), where each of the walks
+/// it replaces was O(every allocation in the cluster) per plan and so
+/// scaled with cluster fill rather than with the job being placed.
+type OwnAllocationsByNode = HashMap<String, Vec<i64>>;
+
+/// Which allocation rows a plan drops from its capacity snapshot before
+/// planning, so they are not counted against node capacity.
+#[derive(Debug, Clone, Copy)]
+enum SnapshotDrop<'a> {
+    /// None — a Reschedule plan counts everything that is running.
+    Nothing,
+    /// Every allocation of a job: a Fresh plan replaces the job wholesale
+    /// (its handler already dropped the rows, or drops them the moment
+    /// the plan applies), so counting them would demand headroom for two
+    /// copies of the job.
+    Job(&'a str),
+    /// Every allocation of one config: the read-only preview of the same.
+    JobConfig(&'a str),
+}
+
+impl SnapshotDrop<'_> {
+    /// Whether the rule drops this row.
+    fn matches(&self, allocation: &Allocation) -> bool {
+        match self {
+            SnapshotDrop::Nothing => false,
+            SnapshotDrop::Job(job_id) => allocation.job_id == *job_id,
+            SnapshotDrop::JobConfig(job_config_id) => allocation.job_config_id == *job_config_id,
+        }
+    }
+
+    /// [`Self::matches`] for an entry of `job_id`'s job-index entry, which
+    /// carries no job id of its own.
+    fn matches_ref(&self, job_id: &str, reference: &AllocationRef) -> bool {
+        match self {
+            SnapshotDrop::Nothing => false,
+            SnapshotDrop::Job(dropped) => *dropped == job_id,
+            SnapshotDrop::JobConfig(job_config_id) => reference.job_config_id == *job_config_id,
+        }
+    }
+}
+
 /// One plan's capacity state, taken from the read model in a single lock
 /// acquisition: the allocations the plan places against, the cached free
 /// pools, and the nodes whose allocation set the plan itself changed by
@@ -228,6 +277,9 @@ struct CapacitySnapshot {
     /// lazy version sample compares against at submit time (see
     /// `Store::expected_versions_if_unchanged`).
     generation: u64,
+    /// The planned config's surviving allocations, by node (see
+    /// [`OwnAllocationsByNode`]).
+    own_by_node: OwnAllocationsByNode,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -582,9 +634,64 @@ struct TaskAffinityCache {
     total_weight: f64,
 }
 
+/// A candidate's identity within one plan: the address of its `Node` in
+/// the plan's node snapshot. Every candidate list a plan builds borrows
+/// from the same `Vec<Arc<Node>>`, so two `&Node`s naming the same node
+/// share an address, and the scoring cache can key its per-node state by
+/// that address instead of by id string — one multiply to hash, where the
+/// id was a SipHash of the string, three times per candidate per
+/// placement. Never dereferenced: only compared and hashed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct NodeKey(usize);
+
+impl NodeKey {
+    fn of(node: &Node) -> Self {
+        NodeKey(node as *const Node as usize)
+    }
+}
+
+/// The hasher behind [`NodeKey`]: a multiplicative mix of the address.
+/// Heap addresses share their low bits (alignment) and their high bits
+/// (the arena), so the high half is folded in before and after the
+/// multiply to spread both into the bits the table indexes by.
+#[derive(Debug, Default, Clone, Copy)]
+struct NodeKeyHasher(u64);
+
+impl std::hash::Hasher for NodeKeyHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        // Not reached for `NodeKey` (a `usize` hashes through
+        // `write_usize`); kept total for the trait.
+        for byte in bytes {
+            self.0 = (self.0 ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+
+    fn write_usize(&mut self, value: usize) {
+        let mut mixed = value as u64;
+        mixed ^= mixed >> 32;
+        mixed = mixed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        mixed ^= mixed >> 29;
+        self.0 = mixed;
+    }
+}
+
+type NodeKeyIndex = HashMap<NodeKey, usize, std::hash::BuildHasherDefault<NodeKeyHasher>>;
+
+/// Per-candidate scoring state for one task's placements, built once per
+/// candidate list and patched as placements land.
+///
+/// State lives in a `Vec` parallel to the candidate list, found by
+/// [`NodeKey`] — so the per-placement passes (eligibility, load bounds,
+/// scoring) index by node address rather than hashing each node's id
+/// string, and construction clones no ids.
 #[derive(Debug, Clone)]
 struct PlanScoringCache {
-    node_states: HashMap<String, NodeScoringState>,
+    states: Vec<NodeScoringState>,
+    index: NodeKeyIndex,
     affinity: TaskAffinityCache,
     common_demand: CommonResourceDemand,
     group_name: Option<String>,
@@ -601,8 +708,8 @@ impl PlanScoringCache {
         task_id: i64,
         task_config: &TaskConfig,
         affinity_set: &AffinitySet,
-        job_config_id: &str,
         allocations_by_node: &SharedNodeAllocations,
+        own_by_node: &OwnAllocationsByNode,
         task_name_to_id: &HashMap<String, i64>,
         task_id_to_group: &HashMap<i64, String>,
         planned_task_allocations: &HashMap<String, Vec<i64>>,
@@ -613,100 +720,95 @@ impl PlanScoringCache {
         let group_name = task_id_to_group.get(&task_id).cloned();
         let affinity = TaskAffinityCache::new(task_config, task_name_to_id);
         let common_demand = CommonResourceDemand::from_request(task_request);
-
-        let node_states = candidates
-            .iter()
-            .map(|node| {
-                let node_id = node.id.clone();
-                let existing_allocs = allocations_by_node.get(&node_id);
-                let planned_ids = planned_task_allocations
-                    .get(&node_id)
-                    .cloned()
-                    .unwrap_or_default();
-
-                let mut task_presence = HashSet::new();
-                let mut same_task_allocations = 0usize;
-                let mut same_group_allocations = 0usize;
-                let assigned_count = existing_allocs.map_or(0, |allocs| allocs.len())
-                    + planned.get(&node_id).copied().unwrap_or_default();
-
-                if let Some(allocs) = existing_allocs {
-                    for alloc in allocs.iter() {
-                        if alloc.job_config_id != job_config_id {
-                            continue;
-                        }
-                        task_presence.insert(alloc.task_config_id);
-                        if alloc.task_config_id == task_id {
-                            same_task_allocations += 1;
-                        }
-                        if group_name.as_ref().is_some_and(|group| {
-                            task_id_to_group
-                                .get(&alloc.task_config_id)
-                                .is_some_and(|alloc_group| alloc_group == group)
-                        }) {
-                            same_group_allocations += 1;
-                        }
-                    }
-                }
-
-                for planned_task_id in &planned_ids {
-                    task_presence.insert(*planned_task_id);
-                    if *planned_task_id == task_id {
-                        same_task_allocations += 1;
-                    }
-                    if group_name.as_ref().is_some_and(|group| {
-                        task_id_to_group
-                            .get(planned_task_id)
-                            .is_some_and(|alloc_group| alloc_group == group)
-                    }) {
-                        same_group_allocations += 1;
-                    }
-                }
-
-                let (common_resources, common_feasibility_bitmap, can_fit_task_request) =
-                    resource_ledger
-                        .pools
-                        .get(&node_id)
-                        .map(|pool| {
-                            let common_resources = CommonResourceAvailability::from_pool(pool);
-                            let bitmap = common_resources.feasibility_bitmap(&common_demand);
-                            (common_resources, bitmap, pool.can_fit(task_request))
-                        })
-                        .unwrap_or_else(|| {
-                            (
-                                CommonResourceAvailability::default(),
-                                0,
-                                resource_ledger.can_fit(&node_id, task_request),
-                            )
-                        });
-
-                (
-                    node_id,
-                    NodeScoringState {
-                        assigned_count,
-                        same_task_allocations,
-                        same_group_allocations,
-                        task_presence,
-                        base_affinity: affinity_set.score(node),
-                        can_fit_task_request,
-                        common_resources,
-                        common_feasibility_bitmap,
-                    },
-                )
+        let in_group = |other_task_id: i64| {
+            group_name.as_ref().is_some_and(|group| {
+                task_id_to_group
+                    .get(&other_task_id)
+                    .is_some_and(|other_group| other_group == group)
             })
-            .collect();
+        };
+
+        let mut states = Vec::with_capacity(candidates.len());
+        let mut index =
+            NodeKeyIndex::with_capacity_and_hasher(candidates.len(), Default::default());
+        for (position, node) in candidates.iter().enumerate() {
+            let node_id = node.id.as_str();
+            let assigned_count = allocations_by_node
+                .get(node_id)
+                .map_or(0, |allocations| allocations.len())
+                + planned.get(node_id).copied().unwrap_or_default();
+
+            // The planned config's allocations already on this node come
+            // from the plan's own-allocation index — not from a walk of
+            // every allocation the node holds, which made building this
+            // cache O(allocations on the candidate fleet) per task.
+            let existing_own = own_by_node.get(node_id).map(Vec::as_slice).unwrap_or(&[]);
+            let planned_own = planned_task_allocations
+                .get(node_id)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            let mut task_presence = HashSet::new();
+            let mut same_task_allocations = 0usize;
+            let mut same_group_allocations = 0usize;
+            for other_task_id in existing_own.iter().chain(planned_own) {
+                task_presence.insert(*other_task_id);
+                if *other_task_id == task_id {
+                    same_task_allocations += 1;
+                }
+                if in_group(*other_task_id) {
+                    same_group_allocations += 1;
+                }
+            }
+
+            let (common_resources, common_feasibility_bitmap, can_fit_task_request) =
+                resource_ledger
+                    .pools
+                    .get(node_id)
+                    .map(|pool| {
+                        let common_resources = CommonResourceAvailability::from_pool(pool);
+                        let bitmap = common_resources.feasibility_bitmap(&common_demand);
+                        (common_resources, bitmap, pool.can_fit(task_request))
+                    })
+                    .unwrap_or_else(|| {
+                        (
+                            CommonResourceAvailability::default(),
+                            0,
+                            resource_ledger.can_fit(node_id, task_request),
+                        )
+                    });
+
+            index.insert(NodeKey::of(node), position);
+            states.push(NodeScoringState {
+                assigned_count,
+                same_task_allocations,
+                same_group_allocations,
+                task_presence,
+                base_affinity: affinity_set.score(node),
+                can_fit_task_request,
+                common_resources,
+                common_feasibility_bitmap,
+            });
+        }
 
         Self {
-            node_states,
+            states,
+            index,
             affinity,
             common_demand,
             group_name,
         }
     }
 
-    fn can_fit_task_request(&self, node_id: &str) -> bool {
-        self.node_states
-            .get(node_id)
+    /// This candidate's state, or `None` for a node the cache was not
+    /// built from.
+    fn state_of(&self, node: &Node) -> Option<&NodeScoringState> {
+        self.index
+            .get(&NodeKey::of(node))
+            .map(|position| &self.states[*position])
+    }
+
+    fn can_fit_task_request(&self, node: &Node) -> bool {
+        self.state_of(node)
             .map(|state| {
                 let required_bitmap = self.required_common_bitmap();
                 let common_feasible =
@@ -718,29 +820,31 @@ impl PlanScoringCache {
 
     fn update_after_placement(
         &mut self,
-        node_id: &str,
+        node: &Node,
         task_id: i64,
         task_id_to_group: &HashMap<i64, String>,
         resource_ledger: &ResourceLedger,
         task_request: &ResourceRequest,
     ) {
-        if let Some(state) = self.node_states.get_mut(node_id) {
-            state.assigned_count += 1;
-            state.same_task_allocations += 1;
-            if self.group_name.as_ref().is_some_and(|group| {
-                task_id_to_group
-                    .get(&task_id)
-                    .is_some_and(|task_group| task_group == group)
-            }) {
-                state.same_group_allocations += 1;
-            }
-            state.task_presence.insert(task_id);
-            state.common_resources.consume(&self.common_demand);
-            state.common_feasibility_bitmap = state
-                .common_resources
-                .feasibility_bitmap(&self.common_demand);
-            state.can_fit_task_request = resource_ledger.can_fit(node_id, task_request);
+        let Some(position) = self.index.get(&NodeKey::of(node)).copied() else {
+            return;
+        };
+        let state = &mut self.states[position];
+        state.assigned_count += 1;
+        state.same_task_allocations += 1;
+        if self.group_name.as_ref().is_some_and(|group| {
+            task_id_to_group
+                .get(&task_id)
+                .is_some_and(|task_group| task_group == group)
+        }) {
+            state.same_group_allocations += 1;
         }
+        state.task_presence.insert(task_id);
+        state.common_resources.consume(&self.common_demand);
+        state.common_feasibility_bitmap = state
+            .common_resources
+            .feasibility_bitmap(&self.common_demand);
+        state.can_fit_task_request = resource_ledger.can_fit(&node.id, task_request);
     }
 
     /// Recompute one node's capacity view from the ledger.
@@ -751,14 +855,15 @@ impl PlanScoringCache {
     /// adjusted by a delta.
     fn refresh_node(
         &mut self,
-        node_id: &str,
+        node: &Node,
         resource_ledger: &ResourceLedger,
         task_request: &ResourceRequest,
     ) {
-        let Some(state) = self.node_states.get_mut(node_id) else {
+        let Some(position) = self.index.get(&NodeKey::of(node)).copied() else {
             return;
         };
-        match resource_ledger.pools.get(node_id) {
+        let state = &mut self.states[position];
+        match resource_ledger.pools.get(node.id.as_str()) {
             Some(pool) => {
                 state.common_resources = CommonResourceAvailability::from_pool(pool);
                 state.common_feasibility_bitmap = state
@@ -811,20 +916,27 @@ impl CommonResourceDemand {
 }
 
 impl CommonResourceAvailability {
+    /// The four common dims of a free pool. One pass over the pool's
+    /// handful of entries, matching names by string compare, rather than
+    /// four hash lookups: this runs once per candidate per task, so at
+    /// fleet scale the lookups were a measurable share of building the
+    /// scoring cache. A dim the pool lacks, or carries as items, reads as
+    /// `0.0`, exactly as the lookups did.
     fn from_pool(pool: &ResourcePool) -> Self {
-        fn amount(values: &HashMap<String, ResourceValue>, key: &str) -> f64 {
-            match values.get(key) {
-                Some(ResourceValue::Amount(value)) => *value,
-                _ => 0.0,
+        let mut availability = CommonResourceAvailability::default();
+        for (name, value) in &pool.values {
+            let ResourceValue::Amount(amount) = value else {
+                continue;
+            };
+            match name.as_str() {
+                "memory" => availability.memory = *amount,
+                "cpu" => availability.cpu = *amount,
+                "cores" => availability.cores = *amount,
+                "allocations" => availability.allocations = *amount,
+                _ => {}
             }
         }
-
-        CommonResourceAvailability {
-            memory: amount(&pool.values, "memory"),
-            cpu: amount(&pool.values, "cpu"),
-            cores: amount(&pool.values, "cores"),
-            allocations: amount(&pool.values, "allocations"),
-        }
+        availability
     }
 
     fn consume(&mut self, demand: &CommonResourceDemand) {
@@ -904,6 +1016,11 @@ pub struct Scheduler<'a> {
     nodes_considered: Option<NodesConsidered>,
     score_sample: Option<ScoreSample>,
     plan_candidates: PlanCandidatesSetting,
+    /// `schedulerSettings.plan_apply_batch_max` — how many plans one group
+    /// commit may carry, and so how many plans can race for the same node
+    /// scores at once. Sizes the fallback sampling pool
+    /// ([`Self::fallback_pool_width`]).
+    plan_apply_batch_max: usize,
     /// `schedulerSettings.preemption`. Parsed here for the same reason as the
     /// settings above — and so a typo'd `mode` fails the manager at startup
     /// rather than quietly evicting production work on the first busy plan.
@@ -936,6 +1053,7 @@ impl<'a> Scheduler<'a> {
             nodes_considered: None,
             score_sample: None,
             plan_candidates: PlanCandidatesSetting::default(),
+            plan_apply_batch_max: Store::plan_apply_batch_max(store.scheduler_settings.as_ref()),
             preemption: PreemptionSettings::default(),
         };
         scheduler.weights = scheduler.scheduler_weights()?;
@@ -989,21 +1107,21 @@ impl<'a> Scheduler<'a> {
             }
         }
 
-        let drop_own = |allocation: &Allocation| allocation.job_config_id == job_config_id;
-        let snapshot = self.capacity_snapshot(if matches!(mode, PlanMode::Fresh) {
-            Some(&drop_own)
-        } else {
-            None
-        })?;
-
-        let required_counts = Self::required_counts_for_mode(
-            &tasks,
-            mode.clone(),
-            job_config_id,
-            &snapshot.allocations_by_node,
-        );
-
+        // The config's job names its entry in the read model's job index,
+        // and its band decides what the plan may preempt.
         let preemptor = self.store.job_band_for_job_config(job_config_id)?;
+        let snapshot = self.capacity_snapshot(
+            job_config_id,
+            &preemptor.0,
+            if matches!(mode, PlanMode::Fresh) {
+                SnapshotDrop::JobConfig(job_config_id)
+            } else {
+                SnapshotDrop::Nothing
+            },
+        )?;
+
+        let required_counts =
+            Self::required_counts_for_mode(&tasks, mode.clone(), &snapshot.own_by_node);
         let BuiltPlan {
             placements,
             index_report,
@@ -1049,28 +1167,77 @@ impl<'a> Scheduler<'a> {
     /// replaces.
     fn capacity_snapshot(
         &self,
-        should_drop: Option<&dyn Fn(&Allocation) -> bool>,
+        job_config_id: &str,
+        job_id: &str,
+        drop: SnapshotDrop<'_>,
     ) -> R<CapacitySnapshot> {
-        let (mut allocations_by_node, pools, generation) = self.store.plan_capacity_snapshot()?;
-        let mut freed_nodes = HashSet::new();
-        if let Some(should_drop) = should_drop {
-            for (node_id, allocations) in allocations_by_node.iter_mut() {
-                // `Arc::make_mut` copies the vector even when nothing would
-                // be dropped, so check read-only first: only the planned
-                // job's own nodes pay for a copy.
-                if !allocations.iter().any(should_drop) {
-                    continue;
-                }
-                Arc::make_mut(allocations).retain(|allocation| !should_drop(allocation));
-                freed_nodes.insert(node_id.clone());
-            }
-        }
+        let (mut allocations_by_node, pools, generation, job_allocations) =
+            self.store.plan_capacity_snapshot(job_id)?;
+        let (own_by_node, freed_nodes) = Self::index_own_allocations(
+            job_config_id,
+            job_id,
+            &job_allocations,
+            &mut allocations_by_node,
+            drop,
+        );
         Ok(CapacitySnapshot {
             allocations_by_node,
             pools,
             freed_nodes,
             generation,
+            own_by_node,
         })
+    }
+
+    /// Drops the rows `drop` names from the snapshot (recording the nodes
+    /// it touched, whose free pools the ledger recomputes) and indexes the
+    /// surviving allocations of the planned config by node
+    /// ([`OwnAllocationsByNode`]) — both from the read model's job-index
+    /// entry for `job_id`, so the work is O(the job's allocations).
+    ///
+    /// No step of a plan walks the cluster's allocations any more. Each
+    /// consumer of the index used to run its own full walk — five or six
+    /// per plan, every one filtering for the same job — which made
+    /// planning cost proportional to how full the cluster was rather than
+    /// to the job being placed (the fill slope `plan_under_fill` in
+    /// `benchmarks/micro/scheduler_bench.rs` measures). The drop still
+    /// re-tests the actual rows of each listed node, so a stale index
+    /// entry can only cost a needless pass over one node's list, never a
+    /// wrong drop.
+    fn index_own_allocations(
+        job_config_id: &str,
+        job_id: &str,
+        job_allocations: &JobAllocationsByNode,
+        allocations_by_node: &mut SharedNodeAllocations,
+        drop: SnapshotDrop<'_>,
+    ) -> (OwnAllocationsByNode, HashSet<String>) {
+        let mut own_by_node = OwnAllocationsByNode::new();
+        let mut freed_nodes = HashSet::new();
+        for (node_id, references) in job_allocations {
+            let mut drops = false;
+            let mut own: Vec<i64> = Vec::new();
+            for reference in references {
+                if drop.matches_ref(job_id, reference) {
+                    drops = true;
+                    continue;
+                }
+                if reference.job_config_id == job_config_id {
+                    own.push(reference.task_config_id);
+                }
+            }
+            if drops {
+                if let Some(allocations) = allocations_by_node.get_mut(node_id) {
+                    // `Arc::make_mut` copies the vector, so only a node
+                    // that actually loses a row pays for one.
+                    Arc::make_mut(allocations).retain(|allocation| !drop.matches(allocation));
+                    freed_nodes.insert(node_id.clone());
+                }
+            }
+            if !own.is_empty() {
+                own_by_node.insert(node_id.clone(), own);
+            }
+        }
+        (own_by_node, freed_nodes)
     }
 
     #[instrument(skip_all)]
@@ -1106,16 +1273,29 @@ impl<'a> Scheduler<'a> {
             .map(|(id, task, _count)| (*id, task.name.clone()))
             .collect::<HashMap<_, _>>();
 
-        let drop_cleared =
-            |allocation: &Allocation| Some(allocation.job_id.as_str()) == clear_job_id;
-        let snapshot = self.capacity_snapshot(clear_job_id.is_some().then_some(&drop_cleared))?;
-
-        let required_counts = Self::required_counts_for_mode(
-            &tasks,
-            mode.clone(),
+        // The preview can only clear the planned job's own rows: that is
+        // the entry the read model's job index serves, and every caller
+        // asks for exactly that (a dry run of a resubmit).
+        if let Some(clear_job_id) = clear_job_id {
+            if clear_job_id != job_config.name {
+                bail!(
+                    "plan_for_config can only clear the planned job's own allocations \
+                     (planning {}, asked to clear {clear_job_id})",
+                    job_config.name
+                );
+            }
+        }
+        let snapshot = self.capacity_snapshot(
             &job_config.id(),
-            &snapshot.allocations_by_node,
-        );
+            &job_config.name,
+            match clear_job_id {
+                Some(job_id) => SnapshotDrop::Job(job_id),
+                None => SnapshotDrop::Nothing,
+            },
+        )?;
+
+        let required_counts =
+            Self::required_counts_for_mode(&tasks, mode.clone(), &snapshot.own_by_node);
 
         let BuiltPlan {
             placements,
@@ -1285,16 +1465,18 @@ impl<'a> Scheduler<'a> {
             } else {
                 None
             };
-            let drop_replaced = |allocation: &Allocation| {
-                Some(allocation.job_id.as_str()) == replaced_job_id.as_deref()
-            };
             let capacity_snapshot_started = std::time::Instant::now();
-            let snapshot =
-                self.capacity_snapshot(replaced_job_id.is_some().then_some(&drop_replaced))?;
+            let snapshot = self.capacity_snapshot(
+                job_config_id,
+                &preemptor_job,
+                match replaced_job_id.as_deref() {
+                    Some(job_id) => SnapshotDrop::Job(job_id),
+                    None => SnapshotDrop::Nothing,
+                },
+            )?;
             timings.capacity_snapshot_us = capacity_snapshot_started.elapsed().as_micros() as u64;
             let snapshot_generation = snapshot.generation;
-            let existing_counts =
-                Self::existing_alloc_counts_by_task(job_config_id, &snapshot.allocations_by_node);
+            let existing_counts = Self::existing_alloc_counts_by_task(&snapshot.own_by_node);
             if let Some(task_targets) = task_targets {
                 for (task_id, _config, desired) in &mut tasks {
                     if let Some(target) = task_targets.get(task_id) {
@@ -1305,12 +1487,8 @@ impl<'a> Scheduler<'a> {
                 }
             }
 
-            let required_counts = Self::required_counts_for_mode(
-                &tasks,
-                mode.clone(),
-                job_config_id,
-                &snapshot.allocations_by_node,
-            );
+            let required_counts =
+                Self::required_counts_for_mode(&tasks, mode.clone(), &snapshot.own_by_node);
 
             let build_started = std::time::Instant::now();
             let BuiltPlan {
@@ -1596,16 +1774,13 @@ impl<'a> Scheduler<'a> {
         expected
     }
 
-    fn existing_alloc_counts_by_task(
-        job_config_id: &str,
-        allocations_by_node: &SharedNodeAllocations,
-    ) -> HashMap<i64, u32> {
+    /// Allocations of the planned config per task, from the plan's
+    /// own-allocation index.
+    fn existing_alloc_counts_by_task(own_by_node: &OwnAllocationsByNode) -> HashMap<i64, u32> {
         let mut counts = HashMap::new();
-        for allocations in allocations_by_node.values() {
-            for allocation in allocations.iter() {
-                if allocation.job_config_id == job_config_id {
-                    *counts.entry(allocation.task_config_id).or_default() += 1;
-                }
+        for task_ids in own_by_node.values() {
+            for task_id in task_ids {
+                *counts.entry(*task_id).or_default() += 1;
             }
         }
         counts
@@ -1614,8 +1789,7 @@ impl<'a> Scheduler<'a> {
     fn required_counts_for_mode(
         tasks: &[(i64, TaskConfig, u32)],
         mode: PlanMode,
-        job_config_id: &str,
-        allocations_by_node: &SharedNodeAllocations,
+        own_by_node: &OwnAllocationsByNode,
     ) -> HashMap<i64, u32> {
         if matches!(mode, PlanMode::Fresh) {
             return tasks
@@ -1624,15 +1798,7 @@ impl<'a> Scheduler<'a> {
                 .collect();
         }
 
-        let mut placed_by_task: HashMap<i64, u32> = HashMap::new();
-        for allocations in allocations_by_node.values() {
-            for alloc in allocations.iter() {
-                if alloc.job_config_id == job_config_id {
-                    *placed_by_task.entry(alloc.task_config_id).or_default() += 1;
-                }
-            }
-        }
-
+        let placed_by_task = Self::existing_alloc_counts_by_task(own_by_node);
         tasks
             .iter()
             .map(|(id, _config, desired)| {
@@ -1643,17 +1809,12 @@ impl<'a> Scheduler<'a> {
     }
 
     fn existing_alloc_counts_by_task_node(
-        job_config_id: &str,
-        allocations_by_node: &SharedNodeAllocations,
+        own_by_node: &OwnAllocationsByNode,
     ) -> HashMap<(i64, String), u32> {
         let mut counts = HashMap::new();
-        for (node_id, allocations) in allocations_by_node {
-            for alloc in allocations.iter() {
-                if alloc.job_config_id == job_config_id {
-                    *counts
-                        .entry((alloc.task_config_id, node_id.clone()))
-                        .or_default() += 1;
-                }
+        for (node_id, task_ids) in own_by_node {
+            for task_id in task_ids {
+                *counts.entry((*task_id, node_id.clone())).or_default() += 1;
             }
         }
 
@@ -1711,6 +1872,7 @@ impl<'a> Scheduler<'a> {
             pools,
             freed_nodes,
             generation: _,
+            own_by_node,
         } = capacity;
         // The body reads allocations by reference throughout (the owned map
         // outlives the plan); the pools move into the ledger below.
@@ -1733,7 +1895,7 @@ impl<'a> Scheduler<'a> {
         let mut nodes_considered_rng =
             StdRng::from_rng(rand::thread_rng()).context("Failed to seed nodes_considered RNG")?;
         let existing_alloc_counts_by_task_node =
-            Self::existing_alloc_counts_by_task_node(job_config_id, allocations_by_node);
+            Self::existing_alloc_counts_by_task_node(&own_by_node);
         let node_lookup: HashMap<&str, &Node> = nodes
             .iter()
             .map(|node| (node.id.as_str(), &**node))
@@ -1806,13 +1968,9 @@ impl<'a> Scheduler<'a> {
         }
 
         let mut group_assignments: HashMap<GroupKey, String> = HashMap::new();
-        for (node_id, allocations) in allocations_by_node {
-            for allocation in allocations.iter() {
-                if allocation.job_config_id != job_config_id {
-                    continue;
-                }
-                let Some((group_name, per_key)) = task_group_map.get(&allocation.task_config_id)
-                else {
+        for (node_id, task_ids) in &own_by_node {
+            for task_config_id in task_ids {
+                let Some((group_name, per_key)) = task_group_map.get(task_config_id) else {
                     continue;
                 };
                 if group_sizes.get(group_name).copied().unwrap_or(0) <= 1 {
@@ -1905,7 +2063,7 @@ impl<'a> Scheduler<'a> {
                 &task_config,
                 &nodes,
                 resource_policy,
-                allocations_by_node,
+                &own_by_node,
                 &node_lookup,
                 needed,
                 index_armed,
@@ -1982,6 +2140,7 @@ impl<'a> Scheduler<'a> {
                         job_config_id,
                         candidates_for_group,
                         allocations_by_node,
+                        &own_by_node,
                         &task_name_to_id,
                         &task_id_to_group,
                         &mut planned_task_allocations,
@@ -2031,6 +2190,7 @@ impl<'a> Scheduler<'a> {
                     job_config_id,
                     candidates_for_group,
                     allocations_by_node,
+                    &own_by_node,
                     &task_name_to_id,
                     &task_id_to_group,
                     &mut planned_task_allocations,
@@ -2074,18 +2234,28 @@ impl<'a> Scheduler<'a> {
     /// fit math (docs/late-binding-plan-apply.md).
     ///
     /// Coupling edges:
-    /// - **overlapping candidate lists** — the planner's ledger assumed at
-    ///   most one of the two lands on the shared node; two independent
-    ///   fallbacks onto it could oversubscribe capacity (or collide static
-    ///   ports);
     /// - **a task with a `distinct` constraint** — the tracker couples that
     ///   task's placements even across disjoint node lists (two nodes can
     ///   share a zone);
     /// - **membership in the same multi-task co-placement group** — the
     ///   group is one selection unit.
     ///
+    /// **Overlapping candidate lists are NOT an edge.** They were, on the
+    /// theory that two independent fallbacks onto a shared node could
+    /// oversubscribe it — but the apply walk debits each bind from the
+    /// node's in-transaction free pool before the next placement is
+    /// considered (`apply_plan_submission_on`), so the second placement
+    /// sees the capacity the first spent and skips the node if it no
+    /// longer fits; static ports are re-read there too. Keeping the edge
+    /// cost far more than it bought: any multi-placement job into one pool
+    /// overlaps by construction, so *every* placement of it collapsed to a
+    /// one-element list and the plan degenerated to the pre-candidate
+    /// all-or-nothing CAS. That is what drove plan rejection to 73.6% on
+    /// the 5000-node benchmark
+    /// (internal_docs/plans/plan-apply-conflict-reduction-plan.md).
+    ///
     /// Singleton components keep their fallback lists and walk
-    /// independently at apply; components of size >1 keep today's
+    /// independently at apply; components of size >1 keep the
     /// all-or-nothing epoch CAS on their exact chosen nodes.
     fn decouple_plan_components(
         placements: &mut [PlannedAllocation],
@@ -2114,18 +2284,9 @@ impl<'a> Scheduler<'a> {
 
         let mut parent: Vec<usize> = (0..placements.len()).collect();
         {
-            let mut by_node: HashMap<&str, usize> = HashMap::new();
             let mut by_distinct_task: HashMap<i64, usize> = HashMap::new();
             let mut by_group: HashMap<&str, usize> = HashMap::new();
             for (index, placement) in placements.iter().enumerate() {
-                for node_id in &placement.candidates {
-                    match by_node.entry(node_id.as_str()) {
-                        Entry::Occupied(entry) => union(&mut parent, *entry.get(), index),
-                        Entry::Vacant(entry) => {
-                            entry.insert(index);
-                        }
-                    }
-                }
                 let has_distinct = distinct_keys_by_task
                     .get(&placement.task_config_id)
                     .is_some_and(|keys| !keys.is_empty());
@@ -2165,9 +2326,15 @@ impl<'a> Scheduler<'a> {
 
     /// Budget for a truncated (index-served) candidate list: a generous
     /// multiple of what the task still needs, floored so small counts still
-    /// see real choice before scoring.
-    fn candidate_budget(needed: u32) -> usize {
-        (needed as usize).saturating_mul(8).max(64)
+    /// see real choice before scoring, and never narrower than the pool the
+    /// fallback tail samples from — truncating below that would hand every
+    /// concurrent planner the same few nodes again
+    /// ([`Self::fallback_pool_width`]).
+    fn candidate_budget(&self, needed: u32) -> usize {
+        (needed as usize)
+            .saturating_mul(8)
+            .max(64)
+            .max(self.fallback_pool_width())
     }
 
     /// Today's authoritative candidate filter: constraints, permit, and
@@ -2341,7 +2508,7 @@ impl<'a> Scheduler<'a> {
         metrics
             .scheduler_index_queries_total
             .inc(&[candidates.index.as_str(), "used"]);
-        let budget = Self::candidate_budget(needed);
+        let budget = self.candidate_budget(needed);
         if allow_truncation && verified.len() > budget {
             verified.truncate(budget);
             usage.truncated = true;
@@ -2361,7 +2528,7 @@ impl<'a> Scheduler<'a> {
         task_config: &'b TaskConfig,
         nodes: &'b [Arc<Node>],
         resource_policy: &ResourcePolicy,
-        allocations_by_node: &SharedNodeAllocations,
+        own_by_node: &OwnAllocationsByNode,
         node_lookup: &HashMap<&'b str, &'b Node>,
         needed: u32,
         index_armed: bool,
@@ -2389,7 +2556,7 @@ impl<'a> Scheduler<'a> {
         let affinity_set = AffinitySet::new(&task_config.affinities)
             .with_context(|| format!("Failed to parse affinities for task {}", task_config.name))?;
         let distinct_tracker =
-            Self::build_distinct_tracker(constraint_set, task_id, allocations_by_node, node_lookup);
+            Self::build_distinct_tracker(constraint_set, task_id, own_by_node, node_lookup);
         // Storage is a hard placement requirement: a node without the task's
         // volume driver (or with it installed-but-unusable) can never run the
         // task, so filter it out here rather than letting the task start and
@@ -2467,6 +2634,7 @@ impl<'a> Scheduler<'a> {
         job_config_id: &str,
         candidates: &[&'b Node],
         allocations_by_node: &SharedNodeAllocations,
+        own_by_node: &OwnAllocationsByNode,
         task_name_to_id: &HashMap<String, i64>,
         task_id_to_group: &HashMap<i64, String>,
         planned_task_allocations: &mut HashMap<String, Vec<i64>>,
@@ -2492,8 +2660,8 @@ impl<'a> Scheduler<'a> {
             task_id,
             task_config,
             &plan.affinity_set,
-            job_config_id,
             allocations_by_node,
+            own_by_node,
             task_name_to_id,
             task_id_to_group,
             planned_task_allocations,
@@ -2530,7 +2698,6 @@ impl<'a> Scheduler<'a> {
             let mut eligible = Self::eligible_nodes(
                 &candidates,
                 plan.constraint_set(),
-                plan.permit_set(),
                 plan.distinct_tracker.as_ref(),
                 &scoring_cache,
             );
@@ -2569,8 +2736,8 @@ impl<'a> Scheduler<'a> {
                     task_id,
                     task_config,
                     &plan.affinity_set,
-                    job_config_id,
                     allocations_by_node,
+                    own_by_node,
                     task_name_to_id,
                     task_id_to_group,
                     planned_task_allocations,
@@ -2581,7 +2748,6 @@ impl<'a> Scheduler<'a> {
                 eligible = Self::eligible_nodes(
                     &candidates,
                     plan.constraint_set(),
-                    plan.permit_set(),
                     plan.distinct_tracker.as_ref(),
                     &scoring_cache,
                 );
@@ -2627,11 +2793,13 @@ impl<'a> Scheduler<'a> {
                     // again for the next one — freeing its capacity twice on
                     // paper and evicting one allocation to pay for two.
                     preemption.retire_victims(&chosen.node_id, &chosen.victims);
-                    scoring_cache.refresh_node(
-                        &chosen.node_id,
-                        resource_ledger,
-                        &plan.task_request,
-                    );
+                    if let Some(chosen_node) = node_lookup.get(chosen.node_id.as_str()) {
+                        scoring_cache.refresh_node(
+                            chosen_node,
+                            resource_ledger,
+                            &plan.task_request,
+                        );
+                    }
                     preemption
                         .victims
                         .extend(chosen.victims.iter().map(|victim| PlannedPreemption {
@@ -2791,7 +2959,8 @@ impl<'a> Scheduler<'a> {
                 (ranked[0].clone(), ranked)
             };
 
-            if let Some(node) = node_lookup.get(node_id.as_str()) {
+            let placed_node = node_lookup.get(node_id.as_str()).copied();
+            if let Some(node) = placed_node {
                 let wanted = task_local_volume_bytes(node, task_config);
                 if wanted > 0 {
                     *planned_local_bytes.entry(node_id.clone()).or_default() += wanted;
@@ -2803,18 +2972,20 @@ impl<'a> Scheduler<'a> {
                 .or_default()
                 .push(task_id);
             if let Some(tracker) = plan.distinct_tracker.as_mut() {
-                if let Some(node) = node_lookup.get(node_id.as_str()) {
+                if let Some(node) = placed_node {
                     tracker.insert_from_node(node);
                 }
             }
             resource_ledger.consume(&node_id, &plan.task_request)?;
-            scoring_cache.update_after_placement(
-                &node_id,
-                task_id,
-                task_id_to_group,
-                resource_ledger,
-                &plan.task_request,
-            );
+            if let Some(node) = placed_node {
+                scoring_cache.update_after_placement(
+                    node,
+                    task_id,
+                    task_id_to_group,
+                    resource_ledger,
+                    &plan.task_request,
+                );
+            }
             placements.push(PlannedAllocation {
                 node_id,
                 task_config_id: task_id,
@@ -2889,13 +3060,15 @@ impl<'a> Scheduler<'a> {
                 });
             }
             let scored = score_nodes_with_cache(&eligible, affinity_set, scoring_cache, weights);
+            let fallback_width = self.fallback_pool_width();
             let ranked = if let Some(rng) = reschedule_rng.as_mut() {
-                Self::ranked_candidate_list(scored, true, candidates_setting, rng)
+                Self::ranked_candidate_list(scored, true, candidates_setting, fallback_width, rng)
             } else {
                 Self::ranked_candidate_list(
                     scored,
                     false,
                     candidates_setting,
+                    fallback_width,
                     &mut rand::thread_rng(),
                 )
             };
@@ -2953,13 +3126,16 @@ impl<'a> Scheduler<'a> {
     /// within the 1% jitter band. Ranks 1.. are sampled without
     /// replacement, score-weighted, from the near-tie band (nodes within
     /// `setting.band` of the best score); when the band holds fewer nodes
-    /// than the list needs, the remaining slots fill straight down the
-    /// ranking in score order. All randomness runs here, at plan time, on
-    /// the planning manager — the apply walk is deterministic.
+    /// than the list needs, the remaining slots are sampled — again
+    /// without replacement — from the best `fallback_width` nodes below
+    /// the band, and kept in score order. All randomness runs here, at
+    /// plan time, on the planning manager — the apply walk is
+    /// deterministic.
     fn ranked_candidate_list<'b, RNG: rand::Rng + ?Sized>(
         scored: Vec<(&'b Node, f64)>,
         jitter_head: bool,
         setting: PlanCandidatesSetting,
+        fallback_width: usize,
         rng: &mut RNG,
     ) -> Option<Vec<&'b Node>> {
         if scored.is_empty() {
@@ -3026,10 +3202,20 @@ impl<'a> Scheduler<'a> {
             list.push(band.swap_remove(chosen).0);
         }
 
-        // Partial selection, not a full sort: this fallback runs whenever the
-        // band is thinner than the list (the common bin_pack case), and the
-        // below-band set is nearly the whole fleet — O(n log n) per placement
-        // was measurable at 10k nodes where O(n + m log m) is free.
+        // Below-band fill, for when the band is thinner than the list (the
+        // common bin_pack case). Take the top `width` by score, then sample
+        // the slots we still need from that pool without replacement.
+        //
+        // The sampling is the point. Taking the top `need` deterministically
+        // — what this did — hands every concurrent planner the *same*
+        // fallback nodes in the same order, so a burst's fallbacks collide
+        // exactly as their first choices did and the tail buys nothing.
+        // Sampling from a pool sized to the number of placements that can
+        // be in flight at once decorrelates them.
+        //
+        // Still a partial selection, not a full sort: the below-band set is
+        // nearly the whole fleet, and O(n + w log w) was measurably cheaper
+        // than O(n log n) per placement at 10k nodes.
         let need = k.saturating_sub(list.len()).min(below.len());
         if need > 0 {
             let descending = |left: &(&Node, f64), right: &(&Node, f64)| {
@@ -3038,7 +3224,15 @@ impl<'a> Scheduler<'a> {
                     .partial_cmp(&left.1)
                     .unwrap_or(std::cmp::Ordering::Equal)
             };
-            below.select_nth_unstable_by(need - 1, descending);
+            let width = fallback_width.max(need).min(below.len());
+            below.select_nth_unstable_by(width - 1, descending);
+            below.truncate(width);
+            // Partial Fisher-Yates: `need` draws without replacement, then
+            // back into score order so a lower rank is never a better node.
+            for index in 0..need {
+                let pick = rng.gen_range(index..below.len());
+                below.swap(index, pick);
+            }
             below.truncate(need);
             below.sort_by(descending);
             for (node, _) in below {
@@ -3047,6 +3241,21 @@ impl<'a> Scheduler<'a> {
         }
 
         Some(list)
+    }
+
+    /// How wide a score-ordered pool the below-band fallback tail is
+    /// sampled from, before it is clamped to the eligible set.
+    ///
+    /// Sized to the placements that can race for the same scores at once:
+    /// one group commit's worth of plans (`plan_apply_batch_max`, default
+    /// 16) times a plan's placement count, for which the candidate-list
+    /// length (default 8) is the stand-in available here. 128 at the
+    /// defaults. Wider costs placement quality (the tail reaches further
+    /// down the ranking); narrower re-correlates concurrent planners,
+    /// which is the collision this exists to break.
+    fn fallback_pool_width(&self) -> usize {
+        self.plan_apply_batch_max
+            .saturating_mul(self.plan_candidates.count.max(1))
     }
 
     /// Candidate nodes this task is *allowed* on but does not currently fit
@@ -3258,10 +3467,20 @@ impl<'a> Scheduler<'a> {
         Ok(Some(choice))
     }
 
+    /// The subset of `candidates` one placement may still use: the nodes
+    /// the `distinct` tracker allows whose remaining capacity fits the
+    /// task.
+    ///
+    /// Constraints, permit, and volume-driver support are deliberately
+    /// NOT re-tested here. Every candidate list a placement receives was
+    /// built by `scan_base_eligible` / `indexed_base_eligible` (or
+    /// filtered down from one), which applied all three once, and none of
+    /// them can change during a plan. Re-running the permit per placement
+    /// — as this did — was the dominant per-placement cost at fleet
+    /// scale, for a question the candidate list already answers.
     fn eligible_nodes<'b>(
         candidates: &[&'b Node],
         constraint_set: &ConstraintSet,
-        permit_set: &PermitSet,
         distinct_tracker: Option<&DistinctTracker>,
         scoring_cache: &PlanScoringCache,
     ) -> Vec<&'b Node> {
@@ -3269,11 +3488,10 @@ impl<'a> Scheduler<'a> {
             .iter()
             .copied()
             .filter(|node| {
-                permit_set.is_permitted(node)
-                    && distinct_tracker
-                        .map(|tracker| constraint_set.distinct_satisfied(node, tracker))
-                        .unwrap_or(true)
-                    && scoring_cache.can_fit_task_request(&node.id)
+                distinct_tracker
+                    .map(|tracker| constraint_set.distinct_satisfied(node, tracker))
+                    .unwrap_or(true)
+                    && scoring_cache.can_fit_task_request(node)
             })
             .collect()
     }
@@ -3713,10 +3931,14 @@ impl<'a> Scheduler<'a> {
         Ok(weights)
     }
 
+    /// Seed a task's `distinct` tracker with the attribute values its
+    /// existing allocations already occupy. A task config belongs to
+    /// exactly one job config, so the plan's own-allocation index holds
+    /// every node the task is on.
     fn build_distinct_tracker<'b>(
         constraints: &ConstraintSet,
         task_id: i64,
-        allocations_by_node: &SharedNodeAllocations,
+        own_by_node: &OwnAllocationsByNode,
         node_lookup: &HashMap<&'b str, &'b Node>,
     ) -> Option<DistinctTracker> {
         let distinct_keys = constraints.distinct_keys();
@@ -3725,11 +3947,8 @@ impl<'a> Scheduler<'a> {
         }
 
         let mut tracker = DistinctTracker::new(&distinct_keys);
-        for (node_id, allocations) in allocations_by_node {
-            if allocations
-                .iter()
-                .any(|alloc| alloc.task_config_id == task_id)
-            {
+        for (node_id, task_ids) in own_by_node {
+            if task_ids.contains(&task_id) {
                 if let Some(node) = node_lookup.get(node_id.as_str()) {
                     tracker.insert_from_node(node);
                 }
@@ -4159,8 +4378,7 @@ fn cached_load_bounds(eligible: &[&Node], scoring_cache: &PlanScoringCache) -> C
     let mut max_load: Option<usize> = None;
     for node in eligible {
         let load = scoring_cache
-            .node_states
-            .get(node.id.as_str())
+            .state_of(node)
             .map(|state| state.assigned_count)
             .unwrap_or_default();
         min_load = Some(min_load.map_or(load, |min| min.min(load)));
@@ -4184,7 +4402,7 @@ fn score_node_with_cache(
     weights: SchedulerWeights,
     bounds: CachedLoadBounds,
 ) -> f64 {
-    let state = scoring_cache.node_states.get(node.id.as_str());
+    let state = scoring_cache.state_of(node);
     let load = state.map(|s| s.assigned_count).unwrap_or_default() as f64;
     let (spread_score, bin_pack_score) = if bounds.range > 0.0 {
         (
@@ -4431,6 +4649,7 @@ mod tests {
             dynamic_attrs: dynamic_attrs.to_string(),
             health_checks: "{}".into(),
             last_heartbeat: "2023-01-01 00:00:00 +00:00:00".into(),
+            heartbeat_source: String::new(),
         }
     }
 
@@ -4542,7 +4761,7 @@ mod tests {
 
     fn dummy_submission() -> Submission {
         Submission {
-            path: "job.jsonnet".into(),
+            path: "job.ncl".into(),
             content: "{}".into(),
             is_primary: true,
         }
@@ -5032,6 +5251,125 @@ mod tests {
         Ok(())
     }
 
+    /// The staleness half of the storm-drill repro: a fleet that GROWS
+    /// after the available-nodes cache is first warmed. On the rig, nodes
+    /// register over ~20 seconds while the manager is already serving
+    /// planner reads; if registration does not invalidate the cache, every
+    /// later plan sees only the early registrants — which is exactly the
+    /// observed shape (25,002 allocations on the first-registered slice).
+    #[test]
+    fn nodes_registered_after_a_plan_are_visible_to_the_next_plan() -> R<()> {
+        let store = setup_store_with_scheduler("spread", None)?;
+        for index in 0..25 {
+            store.insert_node(make_node_msg(&format!("n-{index:03}"), json!({})))?;
+        }
+
+        // Warm the cache: plan and apply one job against the small fleet.
+        let warm = JobConfig {
+            priority: Default::default(),
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "warm".into(),
+            tasks: vec![TaskConfig {
+                count: TaskCount::new(10),
+                ..TaskConfig::new("api", "noop")
+            }],
+            version: None,
+        };
+        store.handle_job_submit(&warm, &[dummy_submission()])?;
+        let warm_id = store.get_job_config(&warm.name)?.id();
+        Scheduler::new(&store)?.plan_and_apply(&warm_id, PlanMode::Fresh)?;
+
+        // The fleet quadruples AFTER that plan.
+        for index in 25..100 {
+            store.insert_node(make_node_msg(&format!("n-{index:03}"), json!({})))?;
+        }
+
+        let job = JobConfig {
+            priority: Default::default(),
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "after-growth".into(),
+            tasks: vec![TaskConfig {
+                count: TaskCount::new(50),
+                ..TaskConfig::new("api", "noop")
+            }],
+            version: None,
+        };
+        store.handle_job_submit(&job, &[dummy_submission()])?;
+        let job_id = store.get_job_config(&job.name)?.id();
+        let outcome = Scheduler::new(&store)?.plan_and_apply(&job_id, PlanMode::Fresh)?;
+        assert_eq!(outcome.allocations.len(), 50);
+
+        let on_new_nodes = outcome
+            .allocations
+            .iter()
+            .filter(|alloc| alloc.node_id.as_str() >= "n-025")
+            .count();
+        println!("on nodes registered after the first plan: {on_new_nodes}/50");
+        // 75 of 100 nodes are new and empty; spread should put the great
+        // majority there. Zero means the planner never saw them.
+        assert!(
+            on_new_nodes >= 25,
+            "planner is blind to late-registered nodes: {on_new_nodes}/50 landed on them"
+        );
+        Ok(())
+    }
+
+    /// Repro for the 2026-08-06 storm-drill finding: 25,002 spread-policy
+    /// allocations all landed on the first-registered quarter of a
+    /// 5,000-node fleet, and their replacements packed the NEXT quarter.
+    /// Spread on a uniformly empty fleet must not concentrate.
+    #[test]
+    fn spread_on_an_empty_fleet_does_not_concentrate_on_low_node_ids() -> R<()> {
+        let store = setup_store_with_scheduler("spread", None)?;
+        for index in 0..100 {
+            store.insert_node(make_node_msg(&format!("n-{index:03}"), json!({})))?;
+        }
+
+        let job = JobConfig {
+            priority: Default::default(),
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "spread-repro".into(),
+            tasks: vec![TaskConfig {
+                count: TaskCount::new(50),
+                ..TaskConfig::new("api", "noop")
+            }],
+            version: None,
+        };
+        store.handle_job_submit(&job, &[dummy_submission()])?;
+        let job_config_id = store.get_job_config(&job.name)?.id();
+        let scheduler = Scheduler::new(&store)?;
+        let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
+        assert_eq!(outcome.allocations.len(), 50);
+
+        // 50 replicas over 100 empty identical nodes: the bottom half of the
+        // id ordering should NOT hold materially more than the top half. On
+        // the fleet that motivated this test the bottom quarter held 100%.
+        let low = outcome
+            .allocations
+            .iter()
+            .filter(|alloc| alloc.node_id.as_str() < "n-050")
+            .count();
+        let distinct: std::collections::HashSet<&str> = outcome
+            .allocations
+            .iter()
+            .map(|alloc| alloc.node_id.as_str())
+            .collect();
+        println!("low-half {low}/50, distinct nodes {}", distinct.len());
+        assert!(
+            (15..=35).contains(&low),
+            "spread concentrated: {low}/50 on the low half of the id order"
+        );
+        assert!(
+            distinct.len() >= 40,
+            "spread stacked replicas: only {} distinct nodes for 50 allocations",
+            distinct.len()
+        );
+        Ok(())
+    }
+
     #[test]
     fn count_per_attribute_places_allocations_per_group() -> R<()> {
         let store = setup_store_with_scheduler("spread", None)?;
@@ -5242,6 +5580,7 @@ mod tests {
             pool: "default".into(),
             availability: "available".into(),
             last_heartbeat: "2023-01-01 00:00:00 +00:00:00".into(),
+            heartbeat_source: String::new(),
             config_attrs: json!({ "role": "db" }),
             fingerprint_attrs: json!({ "arch": "arm64" }),
             dynamic_attrs: json!({ "zone": "us-east" }),
@@ -5353,6 +5692,7 @@ mod tests {
                 pool: "default".into(),
                 availability: "available".into(),
                 last_heartbeat: String::new(),
+                heartbeat_source: String::new(),
                 config_attrs: json!({"zone": "us-east"}),
                 fingerprint_attrs: default_fingerprint(),
                 dynamic_attrs: json!({}),
@@ -5364,6 +5704,7 @@ mod tests {
                 pool: "default".into(),
                 availability: "available".into(),
                 last_heartbeat: String::new(),
+                heartbeat_source: String::new(),
                 config_attrs: json!({"zone": "us-west"}),
                 fingerprint_attrs: default_fingerprint(),
                 dynamic_attrs: json!({}),
@@ -5384,8 +5725,8 @@ mod tests {
         let task_id_to_group = HashMap::new();
         let affinity_set = AffinitySet::new(&task.affinities)?;
         let constraint_set = ConstraintSet::new(&task.constraints)?;
-        let permit_set = PermitSet::new(&task.permit)?;
         let mut distinct_tracker = DistinctTracker::new(&constraint_set.distinct_keys());
+        let own_by_node = OwnAllocationsByNode::new();
         let mut pools = HashMap::new();
         for node in &nodes {
             pools.insert(node.id.clone(), Arc::new(ResourcePool::from_node(node)?));
@@ -5398,8 +5739,8 @@ mod tests {
             task_id,
             &task,
             &affinity_set,
-            "job-1",
             &allocations_by_node,
+            &own_by_node,
             &task_name_to_id,
             &task_id_to_group,
             &planned_task_allocations,
@@ -5411,7 +5752,6 @@ mod tests {
         let eligible = Scheduler::eligible_nodes(
             &candidate_refs,
             &constraint_set,
-            &permit_set,
             Some(&distinct_tracker),
             &scoring_cache,
         );
@@ -5642,6 +5982,7 @@ mod tests {
             pool: "default".into(),
             availability: "available".into(),
             last_heartbeat: String::new(),
+            heartbeat_source: String::new(),
             config_attrs: json!({}),
             fingerprint_attrs: json!({
                 "memory_total": "536870912",
@@ -5672,13 +6013,14 @@ mod tests {
         let task_name_to_id = HashMap::from([(task.name.clone(), task_id)]);
         let task_id_to_group = HashMap::new();
         let affinity_set = AffinitySet::new(&task.affinities)?;
+        let own_by_node = OwnAllocationsByNode::new();
         let mut cache = PlanScoringCache::from_plan(
             &candidate_refs,
             task_id,
             &task,
             &affinity_set,
-            "job-1",
             &allocations_by_node,
+            &own_by_node,
             &task_name_to_id,
             &task_id_to_group,
             &planned_task_allocations,
@@ -5687,15 +6029,15 @@ mod tests {
             &request,
         );
 
-        assert!(cache.can_fit_task_request("node-a"));
+        assert!(cache.can_fit_task_request(&nodes[0]));
         ledger.consume("node-a", &request)?;
         *planned.entry("node-a".to_string()).or_default() += 1;
         planned_task_allocations
             .entry("node-a".to_string())
             .or_default()
             .push(task_id);
-        cache.update_after_placement("node-a", task_id, &task_id_to_group, &ledger, &request);
-        assert!(cache.can_fit_task_request("node-a"));
+        cache.update_after_placement(&nodes[0], task_id, &task_id_to_group, &ledger, &request);
+        assert!(cache.can_fit_task_request(&nodes[0]));
 
         ledger.consume("node-a", &request)?;
         *planned.entry("node-a".to_string()).or_default() += 1;
@@ -5703,11 +6045,11 @@ mod tests {
             .entry("node-a".to_string())
             .or_default()
             .push(task_id);
-        cache.update_after_placement("node-a", task_id, &task_id_to_group, &ledger, &request);
-        assert!(!cache.can_fit_task_request("node-a"));
+        cache.update_after_placement(&nodes[0], task_id, &task_id_to_group, &ledger, &request);
+        assert!(!cache.can_fit_task_request(&nodes[0]));
         assert_eq!(
             ledger.can_fit("node-a", &request),
-            cache.can_fit_task_request("node-a")
+            cache.can_fit_task_request(&nodes[0])
         );
 
         Ok(())
@@ -5720,6 +6062,7 @@ mod tests {
             pool: "default".into(),
             availability: "available".into(),
             last_heartbeat: String::new(),
+            heartbeat_source: String::new(),
             config_attrs: json!({}),
             fingerprint_attrs,
             dynamic_attrs: json!({}),
@@ -6148,12 +6491,18 @@ mod tests {
             ),
         ]);
 
-        let required = Scheduler::required_counts_for_mode(
-            &tasks,
-            PlanMode::Reschedule,
+        let mut allocations_by_node = allocations_by_node;
+        let job_index = job_index_for(&allocations_by_node, "job-1");
+        let (own_by_node, freed_nodes) = Scheduler::index_own_allocations(
             "cfg-1",
-            &allocations_by_node,
+            "job-1",
+            &job_index,
+            &mut allocations_by_node,
+            SnapshotDrop::Nothing,
         );
+        assert!(freed_nodes.is_empty());
+        let required =
+            Scheduler::required_counts_for_mode(&tasks, PlanMode::Reschedule, &own_by_node);
 
         assert_eq!(required.get(&1), Some(&2));
         assert_eq!(required.get(&2), Some(&1));
@@ -6229,12 +6578,130 @@ mod tests {
             ),
         ]);
 
-        let indexed = Scheduler::existing_alloc_counts_by_task_node("cfg-1", &allocations_by_node);
+        let mut allocations_by_node = allocations_by_node;
+        let job_index = job_index_for(&allocations_by_node, "job-1");
+        let (own_by_node, _freed_nodes) = Scheduler::index_own_allocations(
+            "cfg-1",
+            "job-1",
+            &job_index,
+            &mut allocations_by_node,
+            SnapshotDrop::Nothing,
+        );
+        let indexed = Scheduler::existing_alloc_counts_by_task_node(&own_by_node);
 
         assert_eq!(indexed.get(&(1, "node-a".to_string())), Some(&2));
         assert_eq!(indexed.get(&(1, "node-b".to_string())), Some(&1));
         assert_eq!(indexed.get(&(2, "node-a".to_string())), Some(&1));
         assert!(!indexed.contains_key(&(2, "node-b".to_string())));
+    }
+
+    /// The planned job's entry of the read model's job index, as
+    /// `Store::plan_capacity_snapshot` would hand it over.
+    fn job_index_for(
+        allocations_by_node: &SharedNodeAllocations,
+        job_id: &str,
+    ) -> JobAllocationsByNode {
+        let mut model = crate::storage::store::SchedulingReadModel {
+            allocations_by_node: allocations_by_node.clone(),
+            ..Default::default()
+        };
+        model.rebuild_job_index();
+        model.allocations_by_job.remove(job_id).unwrap_or_default()
+    }
+
+    #[test]
+    fn index_own_allocations_drops_and_indexes_from_the_job_index() {
+        let allocation = |id: i64, job: &str, config: &str, task: i64, node: &str| Allocation {
+            id,
+            job_id: job.into(),
+            job_config_id: config.into(),
+            task_config_id: task,
+            node_id: node.into(),
+            status: "running".into(),
+            resources: json!({}),
+            instance_id: None,
+            network: None,
+        };
+        let snapshot = || {
+            SharedNodeAllocations::from([
+                (
+                    "node-a".to_string(),
+                    Arc::new(vec![
+                        allocation(1, "job-1", "cfg-1", 1, "node-a"),
+                        allocation(2, "job-1", "cfg-1", 2, "node-a"),
+                        allocation(3, "other", "cfg-other", 9, "node-a"),
+                    ]),
+                ),
+                (
+                    "node-b".to_string(),
+                    // The previous config of the same job: dropped by a
+                    // Fresh plan, never part of the planned config's index.
+                    Arc::new(vec![allocation(4, "job-1", "cfg-0", 7, "node-b")]),
+                ),
+                (
+                    "node-c".to_string(),
+                    Arc::new(vec![allocation(5, "other", "cfg-other", 9, "node-c")]),
+                ),
+            ])
+        };
+
+        // Nothing dropped (Reschedule): the index holds exactly the
+        // planned config's rows, by node, and no list is touched.
+        let mut untouched = snapshot();
+        let job_index = job_index_for(&untouched, "job-1");
+        let (own, freed) = Scheduler::index_own_allocations(
+            "cfg-1",
+            "job-1",
+            &job_index,
+            &mut untouched,
+            SnapshotDrop::Nothing,
+        );
+        assert!(freed.is_empty());
+        assert_eq!(own.len(), 1);
+        assert_eq!(own.get("node-a").map(Vec::as_slice), Some(&[1, 2][..]));
+        assert_eq!(untouched["node-a"].len(), 3);
+        assert_eq!(untouched["node-b"].len(), 1);
+
+        // A Fresh plan drops the whole JOB's rows: the freed set names
+        // every node that lost one, the surviving lists keep other jobs'
+        // rows, and the index is empty because the config's own rows went
+        // with the job's.
+        let mut dropped = snapshot();
+        let job_index = job_index_for(&dropped, "job-1");
+        let (own, freed) = Scheduler::index_own_allocations(
+            "cfg-1",
+            "job-1",
+            &job_index,
+            &mut dropped,
+            SnapshotDrop::Job("job-1"),
+        );
+        assert!(own.is_empty());
+        assert_eq!(
+            freed,
+            HashSet::from(["node-a".to_string(), "node-b".to_string()])
+        );
+        assert_eq!(dropped["node-a"].len(), 1);
+        assert_eq!(dropped["node-a"][0].id, 3);
+        assert!(dropped["node-b"].is_empty());
+        assert_eq!(dropped["node-c"].len(), 1);
+
+        // The preview drops one CONFIG: the previous config's row on
+        // node-b stays (and is counted), so only node-a's list changes.
+        let mut previewed = snapshot();
+        let job_index = job_index_for(&previewed, "job-1");
+        let (own, freed) = Scheduler::index_own_allocations(
+            "cfg-1",
+            "job-1",
+            &job_index,
+            &mut previewed,
+            SnapshotDrop::JobConfig("cfg-1"),
+        );
+        assert!(own.is_empty());
+        assert_eq!(freed, HashSet::from(["node-a".to_string()]));
+        assert_eq!(previewed["node-a"].len(), 1);
+        assert_eq!(previewed["node-a"][0].id, 3);
+        assert_eq!(previewed["node-b"].len(), 1);
+        assert_eq!(previewed["node-c"].len(), 1);
     }
 
     #[test]
@@ -6860,8 +7327,18 @@ mod tests {
         Ok(())
     }
 
+    /// The lazy (post-planning) version sample still produces a real
+    /// fence: the applied plan bumps its nodes' epochs, so a later
+    /// submission carrying pre-apply epochs is visibly stale.
+    ///
+    /// Asserted on the epoch itself rather than through a rejection: a
+    /// stale node epoch is no longer a rejection on its own — the apply
+    /// walk revalidates such a candidate and binds it when it still fits
+    /// (see `plan_walk_rebinds_an_epoch_dirty_candidate_that_still_fits`).
+    /// What the epoch still buys is ordering information, and that is what
+    /// this test pins.
     #[test]
-    fn lazy_version_sample_is_the_default_and_fences_a_second_job() -> R<()> {
+    fn lazy_version_sample_is_the_default_and_bumps_node_epochs() -> R<()> {
         let store = setup_store()?;
         store.insert_node(make_node_msg("node-a", json!({})))?;
 
@@ -6872,25 +7349,13 @@ mod tests {
         let outcome = scheduler.plan_and_apply(&first, PlanMode::Fresh)?;
         assert_eq!(outcome.allocations.len(), 1);
 
-        // The applied plan carried expected versions from the LATE sample;
-        // it must have fenced normally — a stale re-apply of the same
-        // submission shape for a second job sees the bumped node epoch.
-        let second = submit_job(&store, "job-lazy-b", vec![TaskConfig::new("api", "noop")])?;
-        let stale = BTreeMap::from([
-            (format!("job_config:{second}"), 0),
-            ("node:node-a".to_string(), 0),
-        ]);
-        let submission = store.insert_plan_submission(
-            &second,
-            "fresh",
-            &[("node-a".to_string(), task_id_for(&store, &second, "api")?)],
-            &stale,
-        )?;
+        let after = store.allocation_version_vector_for_candidates(&first, &["node-a"])?;
+        let node_epoch = after
+            .get("node:node-a")
+            .copied()
+            .expect("the sample covers the placed node");
         assert!(
-            matches!(
-                store.apply_plan_submission(&submission)?,
-                crate::storage::store::PlanApplyOutcome::Rejected { .. }
-            ),
+            node_epoch > 0,
             "the lazy-sampled apply must have bumped the node epoch"
         );
 
@@ -7259,6 +7724,7 @@ mod tests {
             pool: "default".into(),
             availability: "available".into(),
             last_heartbeat: "2023-01-01T00:00:00Z".into(),
+            heartbeat_source: String::new(),
             config_attrs: json!({}),
             fingerprint_attrs: json!({}),
             dynamic_attrs: json!({}),
@@ -7285,7 +7751,7 @@ mod tests {
         };
         let mut rng = StdRng::seed_from_u64(7);
 
-        let list = Scheduler::ranked_candidate_list(scored, false, setting, &mut rng)
+        let list = Scheduler::ranked_candidate_list(scored, false, setting, 128, &mut rng)
             .expect("non-empty scored list");
         assert_eq!(list.len(), 4);
         assert_eq!(list[0].id, "node-0", "the head must be the true argmax");
@@ -7315,7 +7781,7 @@ mod tests {
         };
         let mut rng = StdRng::seed_from_u64(3);
 
-        let list = Scheduler::ranked_candidate_list(scored, false, setting, &mut rng)
+        let list = Scheduler::ranked_candidate_list(scored, false, setting, 128, &mut rng)
             .expect("non-empty scored list");
         let ids: Vec<&str> = list.iter().map(|node| node.id.as_str()).collect();
         assert_eq!(
@@ -7336,14 +7802,17 @@ mod tests {
         };
         let mut rng = StdRng::seed_from_u64(1);
 
-        let list = Scheduler::ranked_candidate_list(scored, false, setting, &mut rng)
+        let list = Scheduler::ranked_candidate_list(scored, false, setting, 128, &mut rng)
             .expect("non-empty scored list");
         assert_eq!(list.len(), 1, "count 0 restores single-node selection");
         assert_ne!(list[0].id, "node-0", "the singleton is still the argmax");
     }
 
+    /// Overlap is no longer a coupling edge: the apply walk debits each
+    /// bind from the shared node's in-transaction free pool, so two
+    /// placements landing on it cannot oversubscribe it.
     #[test]
-    fn decouple_components_shrinks_overlapping_lists_only() {
+    fn decouple_components_keeps_overlapping_lists() {
         let mut placements = vec![
             planned("node-a", 1, &["node-a", "node-b"]),
             planned("node-c", 2, &["node-c", "node-b"]),
@@ -7355,17 +7824,20 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
         );
-        assert_eq!(placements[0].candidates, vec!["node-a".to_string()]);
-        assert_eq!(placements[1].candidates, vec!["node-c".to_string()]);
-        assert_eq!(
-            placements[2].candidates,
-            vec!["node-e".to_string(), "node-f".to_string()],
-            "the disjoint placement keeps its fallback list"
-        );
+        for placement in &placements {
+            assert_eq!(
+                placement.candidates.len(),
+                2,
+                "an overlapping list is not a coupled component"
+            );
+        }
     }
 
+    /// The same reversal for a transitive chain — the shape that used to
+    /// collapse an entire plan because two of its placements shared one
+    /// fallback node.
     #[test]
-    fn decouple_components_transitive_overlap_is_one_component() {
+    fn decouple_components_transitive_overlap_is_not_coupled() {
         let mut placements = vec![
             planned("node-a", 1, &["node-a", "node-b"]),
             planned("node-b", 2, &["node-b", "node-c"]),
@@ -7378,11 +7850,7 @@ mod tests {
             &HashMap::new(),
         );
         for placement in &placements {
-            assert_eq!(
-                placement.candidates.len(),
-                1,
-                "transitive overlap couples the whole chain"
-            );
+            assert_eq!(placement.candidates.len(), 2);
         }
     }
 
@@ -7783,8 +8251,15 @@ mod tests {
         Ok(())
     }
 
+    /// The reversal that motivated the conflict-reduction work: replicas
+    /// of one task into one pool overlap by construction, and coupling
+    /// them on that overlap collapsed every placement to a one-element
+    /// list — the pre-candidate all-or-nothing CAS, for the single most
+    /// common job shape there is. They now keep their lists; the apply
+    /// walk's in-transaction pool debit is what keeps two of them off one
+    /// node's last slot.
     #[test]
-    fn count_two_placements_on_a_shared_pool_are_coupled_singletons() -> R<()> {
+    fn count_two_placements_on_a_shared_pool_keep_their_candidate_lists() -> R<()> {
         let store = setup_store()?;
         for index in 0..5 {
             store.insert_node(make_node_msg(&format!("node-{index}"), json!({})))?;
@@ -7802,10 +8277,14 @@ mod tests {
         let placements = scheduler.plan_only(&job_config_id, PlanMode::Fresh)?;
         assert_eq!(placements.len(), 2);
         for placement in &placements {
+            assert!(
+                placement.candidates.len() > 1,
+                "same-pool replicas keep a fallback list: {:?}",
+                placement.candidates
+            );
             assert_eq!(
-                placement.candidates,
-                vec![placement.node_id.clone()],
-                "same-pool replicas overlap and must keep all-or-nothing semantics"
+                placement.candidates[0], placement.node_id,
+                "rank 0 is still the planner's own choice"
             );
         }
         Ok(())

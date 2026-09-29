@@ -5,9 +5,11 @@ import { For, Show, createMemo, createResource } from 'solid-js'
 import { Badge, DefList, EmptyState, Note, PageHeader, SectionCard, Spinner, StatusBadge, TableShell, linkClass, tableClass, tdClass, thClass, theadClass, trHoverClass } from '../../components/ui'
 import LogViewer from '../../components/LogViewer'
 import { managerClient } from '../../grpcClient'
+import { INDEX_POLL_INTERVAL_MS, retainOnError, usePoll } from '../../utils/polling'
+import { EffectivePolicyView, parseEffectivePolicy } from '../../components/NetPolicyView'
 import AllocationExecPanel from '../../components/AllocationExecPanel'
 import { AllocationPorts, ServiceEndpointsTable, ServiceTags } from '../../components/ServiceEndpoints'
-import { allocationHealthLabel, fetchAllocationRuntime, parseAllocNetwork } from '../../utils/allocations'
+import { allocationHealthLabel, fetchAllocationRuntime, fetchTaskStatusByName, parseAllocNetwork } from '../../utils/allocations'
 import {
   artifactProgressPercent,
   buildTaskInstancesByName,
@@ -45,27 +47,34 @@ function TaskDetailContent() {
   const jobName = createMemo(() => decodeURIComponent(params.id))
   const taskName = createMemo(() => decodeURIComponent(params.taskName))
 
-  // Keyed on the route params so task→task navigation refetches.
-  const [data] = createResource(() => `${jobName()}/${taskName()}`, async () => {
-    const [jobInfo, rollouts, spec, ledger, allocationHealth, volumes] = await Promise.all([
-      managerClient.getJobInfo({ name: jobName() }),
-      managerClient.listRollouts({ jobId: jobName(), activeOnly: false, page: 1, pageSize: 200 }),
-      managerClient.getJobSpec({ name: jobName() }),
+  // Keyed on the route params so task→task navigation refetches, and polled
+  // at the slow cadence so health, endpoints and allocations stay current.
+  const tick = usePoll(INDEX_POLL_INTERVAL_MS)
+  const [data] = createResource(
+    () => [jobName(), taskName(), tick()] as const,
+    retainOnError(async ([job, task]: readonly [string, string, number]) => {
+    const [jobInfo, rollouts, spec, ledger, allocationHealth, liveStatus, volumes] = await Promise.all([
+      managerClient.getJobInfo({ name: job }),
+      managerClient.listRollouts({ jobId: job, activeOnly: false, page: 1, pageSize: 200 }),
+      managerClient.getJobSpec({ name: job }),
       // node:read garnish (allocation placement); job-scoped tokens
       // still get the rest of the page.
       managerClient.getLedger({}).catch(() => new GetLedgerReply()),
-      fetchAllocationRuntime(jobName()),
+      fetchAllocationRuntime(job),
+      // The same live status the job page's task cards show, so the two
+      // pages never disagree about whether this task is running.
+      fetchTaskStatusByName(job),
       // Actual volumes rather than the declaration: this page should answer
       // "where is my data and is it healthy", which the spec cannot.
-      managerClient.listVolumes({ jobId: jobName() }).catch(() => ({ volumes: [] })),
+      managerClient.listVolumes({ jobId: job }).catch(() => ({ volumes: [] })),
     ])
 
     const latestRollout = rollouts.rollouts[0]
     const rolloutStatus = latestRollout ? await managerClient.getRolloutStatus({ id: latestRollout.id }) : undefined
 
-    const taskSpec = extractJobSpecData(spec.submissions)?.tasks.find((task) => task.name === taskName())
+    const taskSpec = extractJobSpecData(spec.submissions)?.tasks.find((entry) => entry.name === task)
     const instancesByTask = buildTaskInstancesByName(rolloutStatus?.groups ?? [])
-    const taskInstances = instancesByTask.get(taskName())
+    const taskInstances = instancesByTask.get(task)
 
     // All running allocations for this job (from the ledger), regardless of
     // whether a rollout produced them. The exec panel targets these; the
@@ -73,35 +82,46 @@ function TaskDetailContent() {
     const runnable = new Set(['placed', 'active', 'running'])
     const jobAllocations = ledger.nodes
       .flatMap((node) => node.allocations)
-      .filter((alloc) => alloc.jobId === jobName() && runnable.has(alloc.status))
+      .filter((alloc) => alloc.jobId === job && runnable.has(alloc.status))
 
     // Endpoints for the service this task declares (if any), unhealthy
     // included so a failing endpoint is visible rather than absent.
-    const serviceName = taskSpec?.service ? (taskSpec.service.name ?? taskName()) : undefined
+    const serviceName = taskSpec?.service ? (taskSpec.service.name ?? task) : undefined
     const endpoints = serviceName
       ? await managerClient
           .resolveService({ service: serviceName, includeUnhealthy: true })
-          .then((reply) => reply.endpoints.filter((endpoint) => endpoint.taskName === taskName()))
+          .then((reply) => reply.endpoints.filter((endpoint) => endpoint.taskName === task))
           .catch(() => [])
       : []
 
+    // The task's effective network policy (docs/network-handlers.md): stored
+    // policies merged with its own block, each rule naming its source. A
+    // job-scoped token without net:read simply gets no section.
+    const netPolicy = await managerClient
+      .showNetPolicy({ jobId: job, taskName: task, nodePool: '' })
+      .catch(() => undefined)
+
     return {
+      key: `${job}/${task}`,
       job: jobInfo.job,
+      netPolicy,
       taskSpec,
       taskInstances,
       jobAllocations,
       latestRollout,
       groups: rolloutStatus?.groups ?? [],
       allocationHealth,
+      liveStatus: liveStatus.get(task),
       serviceName,
       endpoints,
       // Tombstones belong on the Volumes page (which has a filter for them);
       // here they are just noise between the reader and their live storage.
       volumes: volumes.volumes.filter(
-        (volume) => volume.taskName === taskName() && volume.state !== 'destroyed',
+        (volume) => volume.taskName === task && volume.state !== 'destroyed',
       ),
     }
-  })
+  }, ([job, task]) => `${job}/${task}`),
+  )
 
   // The ledger identifies allocations by task_config_id only, so the task name
   // comes from the same state-store lookup that carries health.
@@ -129,8 +149,8 @@ function TaskDetailContent() {
   })
 
   return (
-    <Show when={!data.loading} fallback={<div class="py-6"><Spinner label="Loading task…" /></div>}>
-      <Show when={!data.error && data()} fallback={<Note tone="danger">Failed to load task details.</Note>}>
+    <Show when={!data.error} fallback={<Note tone="danger">Failed to load task details: {String(data.error?.message ?? data.error)}</Note>}>
+      <Show when={data()?.key === `${jobName()}/${taskName()}`} fallback={<div class="py-6"><Spinner label="Loading task…" /></div>}>
         <div>
           <PageHeader
             eyebrow="Task"
@@ -143,7 +163,7 @@ function TaskDetailContent() {
                 </A>
               </>
             }
-            badges={<StatusBadge status={data()!.taskInstances?.statuses[0] ?? 'unknown'} />}
+            badges={<StatusBadge status={data()!.liveStatus || data()!.taskInstances?.statuses[0] || 'unknown'} />}
           />
 
           <div class="space-y-4">
@@ -512,6 +532,22 @@ function TaskDetailContent() {
                     </For>
                   </div>
                 </Show>
+              </SectionCard>
+            </Show>
+
+            <Show when={data()!.netPolicy}>
+              <SectionCard
+                title="Network"
+                description="What this task's egress and ingress are held to: stored policies merged with its own block, each rule naming its source."
+                actions={<A class={linkClass} href="/network">Policies</A>}
+              >
+                <EffectivePolicyView
+                  policy={parseEffectivePolicy(data()!.netPolicy!.effectiveJson)}
+                  declaredMode={data()!.netPolicy!.declaredMode}
+                  effectiveMode={data()!.netPolicy!.effectiveMode}
+                  matched={data()!.netPolicy!.matchedPolicies}
+                  nodeStatus={data()!.netPolicy!.nodeStatusJson}
+                />
               </SectionCard>
             </Show>
 

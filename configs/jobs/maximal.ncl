@@ -1,0 +1,775 @@
+{
+    name = "maximal-demo",
+    version = 1,
+    # How important this job is, relative to everything else on the cluster
+    # (docs/preemption-and-eviction.md). One of, most important first:
+    #
+    #   critical   — never preempted; gate it with an ACL `bands` selector
+    #   high       — production work that pages someone when it stops
+    #   elevated   — matters more than the default, not on the paging path
+    #   normal     — the default; everything that does not say otherwise
+    #   low        — may be displaced when the cluster is full
+    #   background — first to go; no completion expectation at all
+    #
+    # The band does two things with one field: it sets the job's default
+    # eval-queue priority (90/70/60/50/30/15), and it governs preemption.
+    # Preemption is strictly CROSS-band — an allocation is only ever a victim
+    # of a job in a STRICTLY higher band, never a peer — so choosing a band
+    # below `normal` is the consent to be displaced.
+    "priority" = "high",
+    rollout = {
+        strategy = "default",
+        progression = "auto",
+        # Stateful groups (frontend's slot task, sandboxes' keyed task) cannot
+        # use createFirst — two live allocations would share one instance id +
+        # storage handle (see docs/stateful-workloads.md). Default to the safe
+        # stop-first replacement globally; exercise createFirst on the
+        # stateless `prep` group below.
+        replacement = "destroyFirst",
+        inPlace = false,
+        percentSteps = [10, 25, 50, 100],
+        stepStagger = "15s",
+        allocationStagger = "2s",
+        minHealthyTime = "10s",
+        healthyDeadline = "5m",
+        ignoreHealthChecks = false,
+        capacityBlockTimeout = "10m",
+        onCapacityTimeout = "rollback",
+        rollbackOnFailure = true,
+        onHealthDeadline = "rollback",
+        batchKillAfter = "30m",
+    },
+    rolloutByGroup = {
+        frontend = {
+            # Ordinal-aware rollout for the group's slot-mode stateful task
+            # (see docs/stateful-workloads.md "Ordered rollouts for slot
+            # pools"). Only valid on groups with a slot-mode stateful task,
+            # which is why it is scoped here rather than globally.
+            slots = {
+                # "sequential" (K8s OrderedReady analog): replace ONE slot
+                # at a time, highest ordinal first (count-1 .. 0), each step
+                # gated on the previous slot's replacement passing the
+                # rollout health criteria. Defines its own one-slot-per-step
+                # progression, so it replaces the global step mode
+                # (percentSteps above) for this group and cannot be combined
+                # with step modes in the same block. Default: "parallel"
+                # (today's behavior).
+                order = "sequential",
+                # Staged/partitioned updates (K8s partition analog): only
+                # slots >= updateFrom are updated; lower slots keep running
+                # their current allocations. Resubmit with a lower value to
+                # promote the new config to more slots (0 = everything).
+                # Must be < the slot task's count. Requires order:
+                # "sequential". 0 is the same as omitting the field.
+                updateFrom = 0,
+            },
+            inPlace = true,
+        },
+        # prep is stateless, so createFirst (replace-before-stop) is safe here
+        # and exercises the strategy that stateful groups forbid.
+        prep = {
+            replacement = "createFirst",
+        },
+    },
+    tasks = [
+        {
+            name = "web",
+            count = 2,
+            runtime = "exec",
+            group = "frontend",
+            lifecycle = "service",
+            # Cross-group dependency: service and batch tasks may depend on
+            # tasks in any group. web is not planned until the prep group's
+            # batch task has succeeded. (A service may only take a
+            # complete/success condition on a batch task — services never
+            # complete.)
+            dependsOn = [
+                {
+                    task = "batch",
+                    condition = "success",
+                },
+            ],
+            # Stable instance identity (see docs/stateful-workloads.md):
+            # slot mode gives each replica an ordinal slot 0..count-1 whose
+            # instance id and storage handle survive reschedules. The task
+            # sees LEGION_INSTANCE_ID / LEGION_INSTANCE_SLOT /
+            # LEGION_INSTANCE_MODE (and LEGION_ALLOC_ID) in its env.
+            stateful = {
+                mode = "slot",  # the default; shown for completeness
+                # Node-loss fencing (at-most-one; see docs/stateful-workloads.md
+                # "Node loss and fencing"): the worker self-fences this task
+                # after losing manager contact for selfTerminateAfter; the
+                # manager only replaces an allocation on a lost node after
+                # replaceAfter (must be > selfTerminateAfter; "never" = wait
+                # for node recovery or `legion instance replace`). Optional:
+                # defaults are selfTerminateAfter 90s, replaceAfter 2x that.
+                onLost = {
+                    selfTerminateAfter = "90s",
+                    replaceAfter = "3m",
+                },
+                # Per-instance persistent storage, materialized by a volume
+                # driver on whatever node the instance lands on (see
+                # docs/volumes.md). Each slot gets its OWN volume, reattached
+                # on every reschedule — replica 2's disk is replica 2's disk.
+                storage = {
+                    # Where the task sees it. For `container` tasks this is a
+                    # real bind mount; `exec` tasks run in the host mount
+                    # namespace and read $LEGION_STORAGE_DIR instead.
+                    path = "/var/lib/web",
+                    # Volume driver. Defaults to "local-dir" (a directory on
+                    # the worker's disk, node-local). "nfs" is the built-in
+                    # network option, which lets instances reschedule anywhere.
+                    driver = "local-dir",
+                    # How the task consumes it: "filesystem" (a directory —
+                    # the default, and what exec/container want) or "block" (a
+                    # raw device or disk image a microVM attaches). Admission
+                    # rejects a mode the task runtime or the plugin cannot serve.
+                    mode = "filesystem",
+                    # Passed to the driver verbatim; it declares which are
+                    # required (`legion volume drivers` lists them).
+                    params = { size = "10G" },
+                    # K8s persistentVolumeClaimRetentionPolicy analogs (both
+                    # default true = Retain). retainOnScaleIn ~ whenScaled;
+                    # retainOnStop ~ whenDeleted and governs `job stop` only
+                    # (`job destroy` always deletes every instance record).
+                    retainOnScaleIn = true,
+                    retainOnStop = true,
+                },
+            },
+            # Claims on storage that exists independently of any instance —
+            # an operator's host path, an NFS export, scratch space (see
+            # docs/volumes.md). Unlike stateful.storage these are shared, are
+            # never provisioned or reclaimed by instance churn, and are valid
+            # on STATELESS tasks too. Each becomes LEGION_VOLUME_<NAME>.
+            volumes = [
+                {
+                    name = "models",
+                    # The `host` driver claims a path the operator declared in
+                    # the worker config's `hostVolumes` map, by name.
+                    driver = "host",
+                    params = { name = "models" },
+                    path = "/models",
+                    readOnly = true,
+                },
+            ],
+            config = {
+                command = ["sleep", "1"],
+            },
+            network = {
+                # Datapath: auto | host | gated (docs/network-handlers.md).
+                # `gated` (Linux, container and exec) gives the task an empty
+                # network namespace holding loopback and the datapath only —
+                # upstream ports, VIPs, its resolver, and an egress proxy at
+                # 127.0.0.1:1080 exported as HTTP_PROXY/HTTPS_PROXY/ALL_PROXY
+                # — so egress policy is unbypassable. `auto` is host today. A
+                # `require` policy can impose a mode for a pool. `bridge` /
+                # `cni/<name>` are reserved for the datapath plugin.
+                mode = "auto",
+                ports = [
+                    { name = "http", to = 8080 },      # dynamic host port -> task 8080
+                    { name = "metrics", static = 9090 },  # fixed host port
+                ],
+                # Attribution keys carried on every net.denied event and
+                # access-log line (never on a metric label). Stored policies
+                # can select on them too.
+                labels = { team = "web", tier = "prod" },
+                # Inline egress policy: the same shape as a stored policy
+                # object, scoped to this task. Merged after every matching
+                # `require` policy; replaces a matching `default` one.
+                egress = {
+                    protocol = "tcp",         # tcp (default) | http — never inferred
+                    policy = "deny",          # fallthrough: allow | deny (deny when `allow` is used)
+                    onError = "deny",         # what a failed handler means: deny | allow
+                    accessLog = false,
+                    # Sugar: host, host:port, cidr, cidr:port — and host/path
+                    # once protocol = "http". Desugars to allow rules ahead of
+                    # `rules`.
+                    allow = ["*.internal.example.com", "10.0.0.0/8:5432"],
+                    rules = [
+                        # First match wins. Connect-time fields (host, port,
+                        # cidr, identity) never touch the byte path; path /
+                        # method / header need protocol = "http".
+                        { when = { host = "telemetry.example.com", port = 443 }, action = "allow" },
+                        { when = { cidr = "169.254.0.0/16" }, action = "deny", reason = "no metadata service" },
+                    ],
+                    # Handlers: code on the path, only when policy is not
+                    # enough, run in order after the rules allow the flow.
+                    # authz = a webhook verdict, cached per (identity,
+                    # destination) for `cache` (default 10s, max 5m);
+                    # proxy = hand the flow to any proxy (PROXY v2 header on
+                    # TCP, Legion-* headers on HTTP) by catalog service /
+                    # node-local service / a sidecar's port label;
+                    # log; dlp (HTTP bodies, needs protocol = "http").
+                    # Every hop: timeout (default 2s) and onError (deny).
+                    handlers = [
+                        { handler = "authz", url = "http://policy.internal/check", cache = "30s", timeout = "2s", onError = "deny" },
+                        { handler = "proxy", service = "egress-filter", proxyProtocol = true, onError = "deny" },
+                    ],
+                },
+                # Inline ingress policy in front of this task's advertised
+                # ports: the datapath binds the advertised port, the task
+                # binds a private twin (docs/network-handlers.md, "Ingress").
+                ingress = {
+                    protocol = "http",
+                    rules = [
+                        { when = { path = "/admin/**" }, action = "deny", reason = "not externally reachable" },
+                        # Peer identity is known with tls.mode = "mutual".
+                        { when = { identity = "auto:web:*" }, action = "allow" },
+                    ],
+                    # TLS on the advertised port. server | mutual with
+                    # certFrom = "legion" (the node's mesh certificate; peers
+                    # verified against the mesh CA with clientCa = "legion")
+                    # or certPath/keyPath (+ clientCa bundle) for your own PKI.
+                    tls = {
+                        mode = "off",          # off | server | mutual
+                        # certFrom = "legion",
+                        # clientCa = "legion",
+                        # requireIdentity = ["auto:web:*"],
+                    },
+                },
+            },
+            service = {
+                name = "web",       # defaults to task name
+                port = "http",      # label from network.ports; or a number/'dynamic' to declare inline
+                tags = ["v1", "public"],
+                meta = { protocol = "http" },
+                # Connect intentions (see docs/service-discovery.md): job ids
+                # allowed to reach this service through a `connect` upstream.
+                # Omit the field (or use ["*"]) to allow every job. Denied
+                # consumers simply get an empty endpoint list; enforcement is
+                # control-plane + forwarder, not cryptographic identity.
+                allow = ["gateway", "maximal-demo"],
+            },
+            # Services this task dials, each via a node-local loopback
+            # forwarder that load-balances across the upstream's healthy
+            # endpoints. The task reads $LEGION_UPSTREAM_<SERVICE>
+            # ("127.0.0.1:<port>") and $LEGION_UPSTREAM_PORT_<SERVICE>.
+            # The named service need not exist yet.
+            connect = {
+                upstreams = [
+                    # Minimal form: loopback port assigned at placement out of
+                    # the same per-node range as host ports.
+                    { service = "db" },
+                    # Pin the loopback port for clients that cannot read env
+                    # vars. Must not collide with a static port above.
+                    { service = "cache", localPort = 6379 },
+                    # Strategy override: round_robin (default) | random |
+                    # least_conn | local_first (same-node endpoints first,
+                    # widening when none is healthy locally).
+                    { service = "search", balance = "least_conn" },
+                    # HTTP framing and traffic management on a service
+                    # upstream (docs/network-handlers.md): a per-request
+                    # deadline, bounded retries (idempotent methods only by
+                    # default), a canary split by service tag, and outlier
+                    # ejection.
+                    {
+                        service = "api",
+                        http = {
+                            timeout = "3s",
+                            retries = { attempts = 2, on = ["5xx", "connect-failure"], budget = "20%" },
+                            split = [{ tag = "canary", weight = 10 }],
+                            outlier = { consecutive5xx = 5, ejectFor = "30s" },
+                        },
+                    },
+                    # An external upstream: `name` + `to` instead of a
+                    # service. The task gets $LEGION_UPSTREAM_OPENAI on
+                    # loopback and speaks plaintext; Legion originates TLS
+                    # (https / tls schemes), so the body is visible to
+                    # handlers without intercepting anyone's TLS. The scheme
+                    # also decides HTTP framing (http / https).
+                    {
+                        name = "openai",
+                        to = "https://api.openai.com",
+                        handlers = [
+                            {
+                                handler = "dlp",
+                                config = { maxBytes = "1Mi", patterns = ["(AKIA|sk-)[A-Za-z0-9]{16,}"] },
+                                onError = "deny",
+                            },
+                        ],
+                    },
+                ],
+                # Config files rendered from the upstreams and their live
+                # endpoint feed (docs/service-discovery.md, "Templates"):
+                # written before the task starts and on every heartbeat
+                # that changes the result. Functions: service "<key>"
+                # [host|port], range endpoints "<key>" (.address .port
+                # .node .allocation .tags), env "<NAME>".
+                templates = [
+                    {
+                        name = "backends",
+                        destination = "local/backends.cfg",   # under the task directory
+                        source = "db = {{ service \"db\" }}\n{{ range endpoints \"search\" }}server {{ .address }}:{{ .port }} # {{ .node }}\n{{ end }}",
+                        changeMode = "signal",     # noop (default) | signal | restart
+                        changeSignal = "SIGHUP",
+                        coalesce = "2s",           # let the feed settle before acting
+                        splay = "5s",              # random delay before the action
+                    },
+                ],
+            },
+            # Workload identities (see docs/workload-identity.md): each named
+            # identity gets its own short-lived OIDC token, delivered as a
+            # file and/or env var and refreshed in place by the worker.
+            # Requires workloadIdentity.enabled on the manager; inert
+            # otherwise.
+            identities = [
+                {
+                    name = "aws",
+                    audience = ["sts.amazonaws.com"],
+                    ttl = "15m",
+                    file = {
+                        path = "/var/run/legion/identity/aws/token",
+                        mode = "0400",
+                    },
+                    changeMode = "noop",
+                },
+                {
+                    # Reserved control-plane identity: authenticates back to
+                    # Legion itself. Omit `audience` — the manager owns it and
+                    # stamps aud = the cluster issuer.
+                    name = "legion",
+                    file = {
+                        path = "/var/run/legion/identity/legion/token",
+                        mode = "0400",
+                    },
+                    changeMode = "noop",
+                },
+            ],
+            # Task-level KV policy defaults; entries override field-by-field
+            # (see docs/kv-store.md "Reactive updates"). Keys are camelCase.
+            kv = {
+                watch = true,
+                onChange = "restart",
+                onDelete = "fail",
+            },
+            env = [
+                {
+                    name = "FEATURE_FLAGS",
+                    value = {
+                        template = "{{ kv \"flags/global\" }}",
+                    },
+                    # watch is inherited from the task defaults above.
+                    kv = {
+                        onChange = "rollout",
+                        onDelete = "none",
+                    },
+                },
+            ],
+            files = [
+                {
+                    path = "/tmp/legion/runtime.conf",
+                    mode = "0640",
+                    file = {
+                        template = "tenant={{ kv \"tenant/id\" }}\n",
+                    },
+                },
+            ],
+            resources = {
+                cpus = 1.5,
+                memory = 512,
+                disk = 1024,
+            },
+            constraints = {
+                role = "web",
+                region = "us-east",
+            },
+            permit = [
+                {
+                    key = "pool",
+                    operator = "equal",
+                    value = "default",
+                },
+            ],
+            checks = [
+                {
+                    type = "boot",
+                    name = "HTTP Boot /health",
+                    kind = "http",
+                    path = "/health",
+                    port = "http",  # port label -> resolved to the assigned host port
+                    every = "5s",
+                    timeout = "2s",
+                    unhealthy_after_count = 1,
+                },
+                {
+                    type = "health",
+                    kind = "http",
+                    path = "/health",
+                    port = "http",  # port label -> resolved to the assigned host port
+                    every = "10s",
+                    timeout = "2s",
+                    unhealthy_after_count = 1,
+                },
+            ],
+            on_unhealthy = {
+                restart_count = 3,
+                restart_period = "30m",
+                restart_delay = "30s",
+                move_count = 3,
+                move_period = "30m",
+                move_delay = "30s",
+            },
+            # What happens when the task PROCESS exits, as opposed to a health
+            # check failing (see docs/task-supervision.md). Both paths spend
+            # the same local restart budget above; this block only decides
+            # whether an exit is worth restarting for.
+            restart = {
+                # always | onFailure | never. Default: "always" for
+                # service/sidecar, "onFailure" for batch.
+                policy = "always",
+                # Wait before relaunching. Defaults to
+                # on_unhealthy.restart_delay when omitted.
+                delay = "5s",
+                # Exit codes counted as success. Default [0].
+                successExitCodes = [0],
+            },
+            # How the platform terminates this task, whoever initiates it:
+            # `job stop`, a rollout replacement, a drain, a reschedule, a
+            # scale-in, or preemption all use this one ladder
+            # (docs/graceful-stop.md). Both fields are optional.
+            stop = {
+                # The notice signal. One of SIGTERM (default), SIGINT,
+                # SIGQUIT, SIGHUP, SIGUSR1, SIGUSR2. SIGKILL is deliberately
+                # not offered: it is the end of the ladder, not a notice.
+                signal = "SIGTERM",
+                # Grace between the signal and SIGKILL. Default 30s, capped
+                # at 5m — grace may slow a drain, never wedge one.
+                killAfter = "30s",
+                # Only for tasks with a `service` block: how long the task
+                # keeps serving after it has left the catalog and before the
+                # signal is sent, so consumers on other nodes learn it is
+                # gone first (docs/graceful-stop.md). Unset = one heartbeat
+                # interval of the node; "0s" disables; capped at 5m.
+                drain = "5s",
+            },
+            # A floor on how many of this task's allocations VOLUNTARY
+            # disruption may take (docs/preemption-and-eviction.md).
+            # Preemption is the only consumer today. Deliberately does not
+            # bind drain, node loss or `job stop`: a floor that can block
+            # maintenance is the documented cluster-wedge.
+            disruption = {
+                # Absolute count (2) or percent of count ("50%"). Percentages
+                # round UP: "50%" of 5 protects 3. Default 0 — choosing a
+                # preemptible band donates the whole task.
+                minAvailable = "50%",
+            },
+            # How far a node may get on a start for this task BEFORE the
+            # placement is durable (docs/edge-boot.md). Absent = `off`,
+            # today's behavior: dispatch happens after the commit and the
+            # wire payload carries no provisional block at all.
+            speculativeStart = {
+                # 'off' (default) | 'stage' | 'boot' | 'serve'.
+                #   stage — fetch artifacts, pull the image, build the root
+                #           disk; do not start the workload.
+                #   boot  — also boot the guest, with its network held shut.
+                #   serve — also open the network immediately. The only mode
+                #           where a workload that LOSES its race may already
+                #           have had externally visible side effects.
+                # A task with declared ports, connect upstreams, or storage
+                # whose driver cannot fence a concurrent attach is downgraded
+                # to `stage` — reported by `legion job validate`.
+                mode = "stage",
+                # Lease = unratified work is killed at expiry, unconditionally.
+                # Default 5s, capped at 2m.
+                ratifyTimeout = "5s",
+                # What to do when ratification is refused. 'kill' (default,
+                # a hard destroy) or 'stop' (the normal graceful-stop ladder).
+                onRefused = "kill",
+            },
+            affinities = [
+                {
+                    key = "zone",
+                    operator = "=",
+                    value = "us-east-1a",
+                    multiplier = 2.0,
+                },
+                {
+                    key = "instance_type",
+                    operator = "matches",
+                    value = "^c[0-9].*",
+                    multiplier = 1.0,
+                },
+            ],
+        },
+        {
+            name = "batch",
+            count = {
+                num = 3,
+                per = "region",
+            },
+            runtime = "exec",
+            group = "prep",
+            lifecycle = "batch",
+            schedule = "every 15m",
+            # Artifacts fetched into the task directory before start
+            # (docs/artifacts.md). A bare string is the minimal form; the
+            # object form adds naming, verification, unpack, pinning, and
+            # auth controls.
+            artifacts = [
+                # Minimal = fetch + auto-unpack into the task directory.
+                "https://github.com/acme/tool/releases/download/v1.4/tool-linux-amd64.tar.gz",
+                {
+                    source = "s3://acme-builds/api/v42.tar.gz",
+                    # Handle for ${artifact.build} / LEGION_ARTIFACT_BUILD.
+                    name = "build",
+                    # Relative to the task directory.
+                    dest = "build/",
+                    checksum = "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+                    # auto (default) | archive | file
+                    unpack = "auto",
+                    # Credential JSON read from Legion KV at fetch time.
+                    auth = { kv = "secrets/build-store" },
+                },
+                {
+                    source = "git::https://github.com/acme/repo?ref=v1.2.0",
+                    name = "repo",
+                    dest = "src/",
+                    # pin (default) resolves the ref to a commit SHA at
+                    # submit; always re-resolves at every staging.
+                    resolve = "always",
+                },
+                {
+                    source = "oci://registry.acme.io/models/embedder@sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                    name = "model",
+                    # ORAS layer selection by media type.
+                    mediaType = "application/vnd.acme.model.weights.v1",
+                    dest = "models/",
+                },
+                {
+                    source = "https://releases.acme.io/bin/runner",
+                    name = "runner",
+                    unpack = "file",
+                    # chmod for single-file artifacts.
+                    mode = "0755",
+                },
+            ],
+            config = {
+                command = ["sleep", "1"],
+                env = {
+                    # Worker-side interpolation of staged artifact paths.
+                    MODEL_DIR = "${artifact.model}",
+                    BUILD_DIR = "${artifact.build}",
+                },
+            },
+            resources = {
+                cpus = 0.5,
+                memory = 256,
+            },
+            constraints = [
+                {
+                    key = "cpu",
+                    value = "amd",
+                },
+                {
+                    key = "zone",
+                    operator = "distinct",
+                },
+            ],
+            affinities = {
+                node_class = "spot",
+            },
+        },
+        {
+            name = "shell",
+            count = 1,
+            runtime = "exec",
+            group = "frontend",
+            lifecycle = "sidecar",
+            # Sidecars are group-bound: they run alongside their group's
+            # primary task, so they may only depend on tasks in their own
+            # group (a cross-group dependency here is rejected at
+            # validation — put it on the group's primary instead, as web
+            # does above).
+            dependsOn = [
+                {
+                    task = "web",
+                    condition = "start",
+                },
+            ],
+            config = {
+                command = ["echo", "hello", "from", "exec"],
+                env = {
+                    LEGION_TASK = "exec",
+                },
+                cwd = ".",
+                user = "nobody",
+                oom_adj = 100,
+                cgroup = "legion/demo",
+                landlock = {
+                    read_only_paths = ["/usr", "/bin"],
+                    read_write_paths = ["/tmp"],
+                },
+                # Process hardening (Linux; ignored with a warning elsewhere).
+                # See docs/task-supervision.md.
+                hardening = {
+                    # prctl(PR_SET_NO_NEW_PRIVS): no privilege gain through
+                    # setuid binaries or file capabilities, ever.
+                    noNewPrivileges = true,
+                    # Private mount namespace + a tmpfs over /tmp, invisible
+                    # to every other task on the node. Needs a worker with
+                    # CAP_SYS_ADMIN.
+                    privateTmp = true,
+                    # Bounding-set drops. ["all"] drops everything; named
+                    # capabilities work with or without the CAP_ prefix.
+                    # Needs CAP_SETPCAP on the worker.
+                    capabilities = { drop = ["all"] },
+                    # Octal file-mode creation mask.
+                    umask = "0027",
+                    # Scheduling niceness, -20..=19.
+                    nice = 5,
+                },
+            },
+            resources = {
+                cpus = 0.1,
+                memory = 128,
+            },
+            constraints = {
+                os = "linux",
+            },
+            affinities = {
+                region = "us-west",
+                same_node_as = "web",
+            },
+        },
+        {
+            name = "sandbox",
+            runtime = "exec",
+            group = "sandboxes",
+            lifecycle = "service",
+            # Keyed-mode stateful task (see docs/stateful-workloads.md):
+            # instances are created/destroyed on demand via
+            # `legion instance create maximal-demo --group sandboxes` /
+            # `legion instance destroy <id>`. count does NOT drive keyed
+            # tasks — zero instances means zero allocations — and each id is
+            # never recycled after destroy. The task sees
+            # LEGION_INSTANCE_ID / LEGION_INSTANCE_MODE ("keyed") and
+            # LEGION_ALLOC_ID in its env (no LEGION_INSTANCE_SLOT).
+            stateful = {
+                mode = "keyed",
+                # "uuid" = server mints ids when --id is omitted;
+                # "caller" = --id is required. Explicit ids always honored.
+                idSource = "uuid",
+                storage = {
+                    # Opaque per-instance handle, reattached across
+                    # reschedules and dropped on destroy.
+                    path = "/workspace",
+                },
+            },
+            config = {
+                command = ["sleep", "600"],
+            },
+            resources = {
+                cpus = 0.25,
+                memory = 128,
+            },
+            constraints = {
+                os = "linux",
+            },
+            affinities = {
+                node_class = "sandbox",
+            },
+        },
+        {
+            # microVM sandbox (see docs/task-kind-sandbox.md). Same shape as
+            # the container kind plus what a VM needs: guest size and a
+            # kernel. Persistent state is a *block-mode volume*: a guest
+            # kernel attaches a block device, not a host directory, so this
+            # is the one task kind that sets `mode = "block"` on its storage.
+            name = "microvm",
+            runtime = "sandbox",
+            group = "microvms",
+            stateful = {
+                mode = "slot",
+                storage = {
+                    # Where the guest init mounts the volume. The local-dir
+                    # driver serves a formatted disk image; the worker hands
+                    # it to the kind; the VMM attaches it as /dev/vdb.
+                    path = "/workspace",
+                    mode = "block",
+                    params = { size = "1G", fs = "ext4" },
+                },
+            },
+            config = {
+                image = "alpine:latest",
+                command = ["/bin/sh", "-c", "echo hello from a microVM; sleep 600"],
+                env = {
+                    LEGION_TASK = "sandbox",
+                },
+                # Guest working directory (defaults to the image's).
+                cwd = "/workspace",
+                # Guest sizing; defaults are 1 vCPU / 512 MiB.
+                vcpus = 1,
+                memory_mib = 512,
+                # Writable scratch in the ephemeral root disk, on top of the
+                # image contents (default 256). Anything written outside the
+                # volume mount lives here and dies with the allocation.
+                rootfs_headroom_mib = 256,
+                # "auto" (default) = cloud-hypervisor then firecracker on
+                # Linux+KVM, Apple `container` on macOS. "dev" runs without a
+                # VM (namespaces only on Linux) for machines without KVM.
+                hypervisor = "auto",
+                # Uncompressed guest kernel; falls back to
+                # LEGION_SANDBOX_KERNEL, then /var/lib/legion/kernels/vmlinux.
+                # An ${artifact.<name>} reference works here too.
+                kernel = "/var/lib/legion/kernels/vmlinux",
+                kernel_args = "quiet",
+                network = {
+                    # "none" (default, loopback only) or "tap" with a
+                    # pre-created host TAP device. Not used when the task's
+                    # own `network.mode` below is "gated".
+                    mode = "none",
+                },
+            },
+            # The task-level network block applies to sandboxes too: "gated"
+            # boots the guest with no NIC and a vsock to the node datapath,
+            # where the egress policy decides (docs/network-handlers.md,
+            # "Sandboxes"). "auto" is "host" until the vsock path is
+            # exercised on a real VMM in CI.
+            network = {
+                mode = "gated",
+                egress = { allow = ["pypi.org", "files.pythonhosted.org"] },
+            },
+            resources = {
+                cpus = 1,
+                memory = 512,
+            },
+            constraints = {
+                # A microVM needs KVM, so keep these on a Linux pool. On macOS
+                # the kind falls back to Apple `container` dev mode.
+                os = "linux",
+            },
+            affinities = {
+                node_class = "sandbox",
+            },
+        },
+        {
+            name = "container",
+            count = 1,
+            runtime = "container",
+            config = {
+                image = "alpine:latest",
+                command = ["echo", "hello", "from", "container"],
+                env = {
+                    LEGION_TASK = "container",
+                },
+            },
+            resources = {
+                # Real limits on Linux when the worker runs with
+                # `resourceEnforcement.enabled` (see docs/resource-enforcement.md):
+                # memory (MiB) becomes a hard cgroup limit, `cores` becomes
+                # *exclusive pinned CPUs* (whole numbers only), and `cpu`
+                # (MHz) becomes a proportional cpu.weight. A task declares
+                # `cores` OR `cpu`, never both. On macOS the same two fields
+                # size the Apple `container` guest VM instead.
+                cores = 1,
+                memory = 256,
+            },
+            constraints = {
+                os = "macos",
+            },
+            affinities = {
+                region = "us-west",
+            },
+        },
+    ],
+}

@@ -101,26 +101,26 @@ only in what an unratified workload can do to the outside world.
 
 ## The jobspec surface
 
-```jsonnet
+```nickel
 {
-  name: 'workspace',
-  runtime: 'sandbox',
-  group: 'sandboxes',
-  stateful: { mode: 'keyed', storage: { path: '/workspace', mode: 'block' } },
+  name = "workspace",
+  runtime = "sandbox",
+  group = "sandboxes",
+  stateful = { mode = "keyed", storage = { path = "/workspace", mode = "block" } },
 
-  // How far this node may get before the placement is durable.
-  speculativeStart: {
-    mode: 'boot',           // 'off' (default) | 'stage' | 'boot' | 'serve'
-    ratifyTimeout: '5s',    // lease; unratified work is killed at expiry
-    onRefused: 'kill',      // 'kill' (default) | 'stop' (graceful, then remove)
+  # How far this node may get before the placement is durable.
+  speculativeStart = {
+    mode = "boot",           # 'off' (default) | 'stage' | 'boot' | 'serve'
+    ratifyTimeout = "5s",    # lease; unratified work is killed at expiry
+    onRefused = "kill",      # 'kill' (default) | 'stop' (graceful, then remove)
   },
 
-  config: { image: 'alpine:latest', vcpus: 2, memory_mib: 1024 },
+  config = { image = "alpine:latest", vcpus = 2, memory_mib = 1024 },
 }
 ```
 
-**Defaults.** `mode: 'off'`, `ratifyTimeout: '5s'` (capped at `2m`),
-`onRefused: 'kill'`. An absent block means `off` and costs nothing.
+**Defaults.** `mode = "off"`, `ratifyTimeout = "5s"` (capped at `2m`),
+`onRefused = "kill"`. An absent block means `off` and costs nothing.
 
 The block is validated at **submit**, not at dispatch: an unrecognized `mode`
 or `onRefused`, or a `ratifyTimeout` of zero or over the cap, fails
@@ -129,13 +129,13 @@ be discovered as a latency regression weeks later, by someone who was not there
 when it was written.
 
 ```console
-$ legion job run api.jsonnet
+$ legion job run api.ncl
 error: task a: invalid speculativeStart mode "boott" (off|stage|boot|serve)
 ```
 
 `kill` is the default because the common refusal is "someone else owns this
 id", and a loser lingering is precisely what the at-most-one invariant forbids.
-`onRefused: 'stop'` runs the task's normal graceful-stop ladder
+`onRefused = "stop"` runs the task's normal graceful-stop ladder
 ([`docs/graceful-stop.md`](graceful-stop.md)) instead, for workloads that want
 to flush before disappearing.
 
@@ -146,7 +146,7 @@ starting it earlier would need something the apply transaction has not produced
 yet. Both are reported by `legion job validate` before the deploy:
 
 ```console
-$ legion job validate api.jsonnet
+$ legion job validate api.ncl
 Jobspec 'api' is valid: 1 task(s) across 1 group(s)
 warning: speculativeStart.mode `serve` is downgraded to `stage`: task `api`
 declares network ports, which are assigned when the placement commits; gates
@@ -198,17 +198,25 @@ weaker one for host runtimes.** This asymmetry is deliberate and worth stating
 plainly:
 
 - **`sandbox` / microVM — enforced.** The guest reaches the outside world
-  through exactly one host TAP device (or, in `network.mode: 'none'`, through
+  through exactly one host TAP device (or, in `network.mode = "none"`, through
   nothing at all). The device is attached at boot — Firecracker cannot hotplug
   a NIC — and held administratively **down**; ratification brings it up. Both
-  operations need `CAP_NET_ADMIN`, which `network.mode: 'tap'` already requires
+  operations need `CAP_NET_ADMIN`, which `network.mode = "tap"` already requires
   of the operator.
-- **`container` / `exec` — advisory.** Legion withholds what it controls:
-  service registration and the node-local upstream forwarders, neither of which
-  is created until ratification. But the workload shares the host's network
-  stack and **can still reach the network through it.** Host-level egress
-  filtering for these runtimes is the operator's job. The worker logs a warning
-  every time it starts a `boot`-gated task on such a runtime.
+- **`container` / `exec` with `network.mode = "gated"` — enforced.** The
+  workload runs in an empty network namespace whose only way out is the node
+  datapath ([Network Handlers](network-handlers.md#gated-mode)), and the
+  datapath holds the allocation's policy — every listener denies with source
+  `gate` — until ratification opens it. Unlike the TAP gate this is
+  per-destination: a policy with only the package registry lets a gated task
+  fetch dependencies *before* ratification and nothing else.
+- **`container` / `exec` in `host` mode — advisory.** Legion withholds what it
+  controls: service registration and the node-local upstream forwarders,
+  neither of which is created until ratification. But the workload shares the
+  host's network stack and **can still reach the network through it.**
+  Host-level egress filtering for these runtimes is the operator's job. The
+  worker logs a warning every time it starts a `boot`-gated task on such a
+  runtime.
 
 Untrusted code belongs in a microVM, which is the same advice
 [`docs/task-runtime-sandbox.md`](task-runtime-sandbox.md) already gives.
@@ -369,19 +377,19 @@ under skew.
 
 ### Manager
 
-```jsonnet
+```nickel
 {
-  edgeBoot: {
-    enabled: true,            // default false
-    defaultTicketTtl: '5m',
-    maxTicketTtl: '1h',
-    maxProvisionalPerNode: 32,
+  edgeBoot = {
+    enabled = true,            # default false
+    defaultTicketTtl = "5m",
+    maxTicketTtl = "1h",
+    maxProvisionalPerNode = 32,
   },
-  workloadIdentity: { enabled: true },  // boot tickets are signed by this issuer
+  workloadIdentity = { enabled = true },  # boot tickets are signed by this issuer
 }
 ```
 
-`enabled: false` refuses `IssueBootTicket` and any ticket-bearing
+`enabled = false` refuses `IssueBootTicket` and any ticket-bearing
 `RatifyClaim`. **Manager-side speculative dispatch does not need this switch**
 — it opens no new authorization surface, and a job's own `speculativeStart`
 block is enough.
@@ -392,14 +400,14 @@ radius from "runs what it was given" to "runs anything a live ticket names".
 
 ### Worker
 
-```jsonnet
+```nickel
 {
-  workerType: 'edge',
-  pool: 'edge-eu',
-  edgeBoot: {
-    acceptClaims: true,   // default false
-    jwksRefresh: '5m',
-    clockSkew: '30s',
+  workerType = "edge",
+  pool = "edge-eu",
+  edgeBoot = {
+    acceptClaims = true,   # default false
+    jwksRefresh = "5m",
+    clockSkew = "30s",
   },
 }
 ```
@@ -463,8 +471,9 @@ Stated here rather than left for a bug report:
 - **No island mode.** An unratified start that cannot reach a manager dies when
   its lease expires. Surviving a long control-plane outage is a separate design
   with its own consistency argument.
-- **The `boot` gate is advisory for `container` and `exec`** (see [What the
-  gate does and does not stop](#what-the-gate-does-and-does-not-stop)).
+- **The `boot` gate is advisory for `container` and `exec` in `host` mode**
+  (see [What the gate does and does not stop](#what-the-gate-does-and-does-not-stop));
+  `network.mode = "gated"` makes it a real, per-destination boundary on Linux.
 - **The `sandbox` network gate is link state only.** Legion holds the TAP
   device down; it does not install a per-interface default-drop filter.
   Operators who want belt-and-braces isolation should add one themselves.

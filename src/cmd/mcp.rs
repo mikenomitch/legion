@@ -29,14 +29,15 @@ use crate::structs::{
     exec_client_frame, exec_server_frame, CreateInstanceRequest, CreateInstancesRequest,
     DeleteJobTemplateRequest, DeleteVolumeRequest, DestroyInstanceRequest, DestroyJobRequest,
     ExecClientFrame, ExecInput, ExecStart, GetAllocationLogsRequest, GetInstanceRequest,
-    GetJobInfoRequest, GetJobSpecRequest, GetJobTemplateRequest, GetLedgerRequest, GetNodesRequest,
-    GetRolloutStatusRequest, GetStateStoreSchemaRequest, GetVolumeRequest, JobConfig,
-    ListEventsRequest, ListInstancesRequest, ListJobActionsRequest, ListJobTemplatesRequest,
-    ListJobsRequest, ListRolloutsRequest, ListServicesRequest, ListVolumeDriversRequest,
-    ListVolumesRequest, PlanJobRequest, QueryStateStoreRequest, RenderJobTemplateRequest,
-    ReplaceInstanceRequest, ResolveServiceRequest, RunJobRequest, RunJobTemplateRequest,
-    SetNodeAvailabilityRequest, StartInstanceRequest, StopInstanceRequest, StopJobRequest,
-    UpsertJobTemplateRequest,
+    GetJobInfoRequest, GetJobSpecRequest, GetJobTemplateRequest, GetLedgerRequest,
+    GetMeshCaRequest, GetNodesRequest, GetRolloutStatusRequest, GetStateStoreSchemaRequest,
+    GetVolumeRequest, JobConfig, ListEventsRequest, ListInstancesRequest, ListJobActionsRequest,
+    ListJobTemplatesRequest, ListJobsRequest, ListNetPoliciesRequest, ListRolloutsRequest,
+    ListServiceEdgesRequest, ListServicesRequest, ListVolumeDriversRequest, ListVolumesRequest,
+    PlanJobRequest, QueryStateStoreRequest, RenderJobTemplateRequest, ReplaceInstanceRequest,
+    ResolveServiceRequest, RotateMeshCaRequest, RunJobRequest, RunJobTemplateRequest,
+    SetNodeAvailabilityRequest, ShowNetPolicyRequest, StartInstanceRequest, StopInstanceRequest,
+    StopJobRequest, TestNetPolicyRequest, UpsertJobTemplateRequest, UpsertNetPolicyRequest,
 };
 use crate::task_plugins::validate_job_config;
 use serde::Serialize;
@@ -85,6 +86,19 @@ fn empty_schema() -> Value {
     json!({ "type": "object", "properties": {}, "additionalProperties": false })
 }
 
+fn job_list_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "status": {
+                "type": "string",
+                "description": "Only jobs with this exact status (case-insensitive), e.g. running, stopped, failed. Omit for all."
+            }
+        },
+        "additionalProperties": false
+    })
+}
+
 fn name_arg_schema() -> Value {
     json!({
         "type": "object",
@@ -106,8 +120,8 @@ fn tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "legion_job_list",
-            description: "List all jobs and their status.",
-            input_schema: empty_schema,
+            description: "List jobs and their status, optionally only those in one status. The reply's status_counts gives the per-status totals.",
+            input_schema: job_list_schema,
             mutates: false,
         },
         ToolDef {
@@ -249,7 +263,13 @@ fn tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "legion_node_list",
-            description: "List worker nodes and their health.",
+            description: "List worker nodes and their health. Each node carries `heartbeat_source`: `live` means the answering manager observed the beat itself, `checkpoint` means the timestamp comes from a periodic replicated checkpoint and is up to `liveness.checkpointInterval` (30s) behind, empty means none has been observed. The node's `status` is exact either way (docs/node-liveness.md).",
+            input_schema: empty_schema,
+            mutates: false,
+        },
+        ToolDef {
+            name: "legion_node_cadence",
+            description: "Report whether the fleet is sustaining its heartbeat cadence. Returns the freshness ratio (1.0 = every node checked in on time; false node loss begins at served_interval/lost_window, 0.20 at the defaults), the per-fleet lost window, the sustainable node count for this control plane, and the `heartbeatSeconds` value to set if the fleet is falling behind. Read this before concluding that nodes have died: a low ratio means the control plane is behind, not that the machines are gone (docs/heartbeat-cadence-and-scale.md).",
             input_schema: empty_schema,
             mutates: false,
         },
@@ -373,6 +393,115 @@ fn tool_defs() -> Vec<ToolDef> {
                 "additionalProperties": false
             }),
             mutates: false,
+        },
+        ToolDef {
+            name: "legion_service_edges",
+            description: "The service graph: who calls whom through the datapath, with requests per second, error rate, denials, latency and bytes per (caller job, caller task, service, tag) over the window; declared-but-silent upstreams; and whether the service's allow list admits each caller. Read-only.",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "service": { "type": "string", "description": "Only edges into or out of this service (optional)." },
+                    "window_secs": { "type": "integer", "description": "Window in seconds, 60..900 (default 300)." }
+                },
+                "additionalProperties": false
+            }),
+            mutates: false,
+        },
+        ToolDef {
+            name: "legion_net_policy_list",
+            description: "List stored network policies (name, priority, enforcement, selector, rules) in merge order.",
+            input_schema: empty_schema,
+            mutates: false,
+        },
+        ToolDef {
+            name: "legion_net_policy_show",
+            description: "Show a task's effective network policy: every matching stored policy merged with the task's own network.egress/ingress, each rule naming the policy it came from, plus the resolved network mode.",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "job": { "type": "string", "description": "Job id." },
+                    "task": { "type": "string", "description": "Task name (optional when the job has one task)." },
+                    "node_pool": { "type": "string", "description": "Node pool to match selectors against (optional)." }
+                },
+                "required": ["job"],
+                "additionalProperties": false
+            }),
+            mutates: false,
+        },
+        ToolDef {
+            name: "legion_net_policy_test",
+            description: "Dry-run a network policy verdict for a task: would it be allowed to reach `to` (egress) or be reached from `from` (ingress)? Returns allow/deny/defer, the deciding rule, and its reason. Sends nothing. Use before retrying a connection that hangs.",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "job": { "type": "string", "description": "Job id." },
+                    "task": { "type": "string", "description": "Task name (optional when the job has one task)." },
+                    "to": { "type": "string", "description": "Egress destination: host[:port], IP, or URL (a URL's path is tested when the chain is HTTP)." },
+                    "from": { "type": "string", "description": "Ingress peer: host[:port] or IP." },
+                    "identity": { "type": "string", "description": "Peer workload identity for ingress tests (optional)." },
+                    "method": { "type": "string", "description": "HTTP method for request-time rules (optional)." },
+                    "path": { "type": "string", "description": "HTTP path for request-time rules (optional)." },
+                    "node_pool": { "type": "string", "description": "Node pool to match selectors against (optional)." }
+                },
+                "required": ["job"],
+                "additionalProperties": false
+            }),
+            mutates: false,
+        },
+        ToolDef {
+            name: "legion_net_doctor",
+            description: "Walk a task's network from policy to datapath and say where it breaks: the resolved policy, whether the mode enforces it (gated) or relies on cooperation (host), and per running allocation whether the node's datapath is ready (namespace, listeners, resolver, proxy), enforcing the current policy hash, or fail-closed (policy pending, boot gate shut). Returns a verdict (ok|warn|fail) and the steps with fix hints. Read-only.",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "job": { "type": "string", "description": "Job id." },
+                    "task": { "type": "string", "description": "Task name (optional when the job has one task)." },
+                    "node_pool": { "type": "string", "description": "Node pool to match selectors against (optional)." }
+                },
+                "required": ["job"],
+                "additionalProperties": false
+            }),
+            mutates: false,
+        },
+        ToolDef {
+            name: "legion_net_handler_test",
+            description: "Conformance-probe an external network handler the way the datapath would use it: an authz webhook URL (http[s]://...) gets a sample facts payload and must answer {verdict: allow|deny}; a proxy at host:port must accept a PROXY protocol v2 header. Sends one synthetic request to the handler; never touches the cluster. Use before wiring a handler into a policy.",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "target": { "type": "string", "description": "Webhook URL or proxy host:port." },
+                    "timeout": { "type": "string", "description": "Per-probe timeout (default 2s)." }
+                },
+                "required": ["target"],
+                "additionalProperties": false
+            }),
+            mutates: false,
+        },
+        ToolDef {
+            name: "legion_net_ca_show",
+            description: "The mesh CA certificate (PEM, never the key) behind certFrom = \"legion\": what a non-Legion client trusts to reach a mesh-TLS port. Empty until the first node asks for a certificate.",
+            input_schema: empty_schema,
+            mutates: false,
+        },
+        ToolDef {
+            name: "legion_net_ca_rotate",
+            description: "Replace the mesh CA. Every node re-issues its certificate on its next heartbeat; until then peers on different CAs refuse each other (never plaintext). Mutating.",
+            input_schema: empty_schema,
+            mutates: true,
+        },
+        ToolDef {
+            name: "legion_net_policy_apply",
+            description: "Create or replace a network policy object from its JSON (a NetPolicyObject: name, selector, enforcement, egress/ingress). Takes effect on matching running allocations within one heartbeat; no task restarts. Set dry_run to validate and list affected allocations without writing.",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "object": { "type": "object", "description": "The policy object (see docs/network-handlers.md)." },
+                    "dry_run": { "type": "boolean", "description": "Validate and report affected allocations only (default false)." }
+                },
+                "required": ["object"],
+                "additionalProperties": false
+            }),
+            mutates: true,
         },
         ToolDef {
             name: "legion_state_query",
@@ -519,14 +648,14 @@ fn tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "legion_template_upsert",
-            description: "Store Jsonnet source as the next immutable version of a job template. Mutating.",
+            description: "Store Nickel source as the next immutable version of a job template. Mutating.",
             input_schema: || json!({
                 "type": "object",
                 "properties": {
                     "name": { "type": "string", "description": "Template name (lowercase, digits, dashes)." },
-                    "source_jsonnet": { "type": "string", "description": "Self-contained template source with a hidden job(vars):: function." }
+                    "source_nickel": { "type": "string", "description": "Self-contained template source with a `job | not_exported = fun vars => ...` function." }
                 },
-                "required": ["name", "source_jsonnet"],
+                "required": ["name", "source_nickel"],
                 "additionalProperties": false
             }),
             mutates: true,
@@ -786,8 +915,13 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
             grpc(client.plan_job(PlanJobRequest { parsed_jobspec })).await
         }
         "legion_job_list" => {
+            let status = opt_str_arg(&args, "status");
             let mut client = connect().await?;
-            grpc(client.list_jobs(ListJobsRequest::default())).await
+            grpc(client.list_jobs(ListJobsRequest {
+                status,
+                ..Default::default()
+            }))
+            .await
         }
         "legion_job_info" => {
             let name = str_arg(&args, "name")?;
@@ -824,6 +958,10 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
         "legion_node_list" => {
             let mut client = connect().await?;
             grpc(client.get_nodes(GetNodesRequest::default())).await
+        }
+        "legion_node_cadence" => {
+            let mut client = connect().await?;
+            grpc(client.get_heartbeat_cadence(crate::structs::GetHeartbeatCadenceRequest {})).await
         }
         "legion_node_drain" => {
             let node_id = str_arg(&args, "node_id")?;
@@ -1128,6 +1266,129 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
             let mut client = connect().await?;
             grpc(client.list_services(ListServicesRequest {})).await
         }
+        "legion_service_edges" => {
+            let service = args
+                .get("service")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let window_secs = args
+                .get("window_secs")
+                .and_then(Value::as_u64)
+                .unwrap_or(300) as u32;
+            let mut client = connect().await?;
+            grpc(client.list_service_edges(ListServiceEdgesRequest {
+                service,
+                window_secs,
+            }))
+            .await
+        }
+        "legion_net_policy_list" => {
+            let mut client = connect().await?;
+            grpc(client.list_net_policies(ListNetPoliciesRequest {})).await
+        }
+        "legion_net_policy_show" => {
+            let job_id = str_arg(&args, "job")?;
+            let task_name = args
+                .get("task")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let node_pool = args
+                .get("node_pool")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let mut client = connect().await?;
+            grpc(client.show_net_policy(ShowNetPolicyRequest {
+                job_id,
+                task_name,
+                node_pool,
+            }))
+            .await
+        }
+        "legion_net_policy_test" => {
+            let job_id = str_arg(&args, "job")?;
+            let get = |key: &str| {
+                args.get(key)
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string()
+            };
+            let mut client = connect().await?;
+            grpc(client.test_net_policy(TestNetPolicyRequest {
+                job_id,
+                task_name: get("task"),
+                node_pool: get("node_pool"),
+                to: get("to"),
+                from: get("from"),
+                identity: get("identity"),
+                method: get("method"),
+                path: get("path"),
+            }))
+            .await
+        }
+        "legion_net_doctor" => {
+            let job_id = str_arg(&args, "job")?;
+            let get = |key: &str| {
+                args.get(key)
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string()
+            };
+            let task_name = get("task");
+            let mut client = connect().await?;
+            let reply = client
+                .show_net_policy(ShowNetPolicyRequest {
+                    job_id: job_id.clone(),
+                    task_name: task_name.clone(),
+                    node_pool: get("node_pool"),
+                })
+                .await
+                .map_err(|status| format!("{}: {}", status.code(), status.message()))?
+                .into_inner();
+            let steps = crate::cmd::net::diagnose_network(&job_id, &task_name, &reply);
+            Ok(json!({
+                "job": job_id,
+                "task": task_name,
+                "verdict": crate::cmd::net::doctor_verdict(&steps),
+                "steps": steps,
+            }))
+        }
+        "legion_net_handler_test" => {
+            let target = str_arg(&args, "target")?;
+            let timeout = args
+                .get("timeout")
+                .and_then(Value::as_str)
+                .and_then(|t| crate::structs::netpolicy::parse_duration(t).ok())
+                .unwrap_or(std::time::Duration::from_secs(2));
+            let probe = crate::cmd::net::probe_handler(&target, timeout).await;
+            serde_json::to_value(probe).map_err(|e| e.to_string())
+        }
+        "legion_net_ca_show" => {
+            let mut client = connect().await?;
+            grpc(client.get_mesh_ca(GetMeshCaRequest {})).await
+        }
+        "legion_net_ca_rotate" => {
+            let mut client = connect().await?;
+            grpc(client.rotate_mesh_ca(RotateMeshCaRequest {})).await
+        }
+        "legion_net_policy_apply" => {
+            let object = args
+                .get("object")
+                .cloned()
+                .ok_or_else(|| "missing required argument: object".to_string())?;
+            let dry_run = args
+                .get("dry_run")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let mut client = connect().await?;
+            grpc(client.upsert_net_policy(UpsertNetPolicyRequest {
+                object_json: object.to_string(),
+                dry_run,
+            }))
+            .await
+        }
         "legion_service_resolve" => {
             let service = str_arg(&args, "service")?;
             let include_unhealthy = args
@@ -1201,11 +1462,11 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
         }
         "legion_template_upsert" => {
             let name = str_arg(&args, "name")?;
-            let source_jsonnet = str_arg(&args, "source_jsonnet")?;
+            let source_nickel = str_arg(&args, "source_nickel")?;
             let mut client = connect().await?;
             grpc(client.upsert_job_template(UpsertJobTemplateRequest {
                 name,
-                source_jsonnet,
+                source_nickel,
             }))
             .await
         }

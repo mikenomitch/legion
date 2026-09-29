@@ -163,6 +163,12 @@ const TABLE_OWNERS: &[(&str, Owner)] = &[
     ("node", Owner::Lane(Lane::Control)),
     ("worker_type", Owner::Lane(Lane::Control)),
     ("acl_policy", Owner::Lane(Lane::Control)),
+    // Network policy objects (docs/network-handlers.md): applied and deleted
+    // through the control lane like ACL policies; the generation counter is
+    // bumped inside the same replicated write.
+    ("net_policy", Owner::Lane(Lane::Control)),
+    ("net_policy_meta", Owner::Lane(Lane::Control)),
+    ("net_mesh_ca", Owner::Lane(Lane::Control)),
     ("acl_token", Owner::Lane(Lane::Control)),
     ("acl_user", Owner::Lane(Lane::Control)),
     ("join_token", Owner::Lane(Lane::Control)),
@@ -199,6 +205,16 @@ const TABLE_OWNERS: &[(&str, Owner)] = &[
     // commutative: the insert is an upsert (`INSERT OR REPLACE`), which the
     // commutative class forbids.
     ("allocation_stop_notice", Owner::Lane(Lane::Scheduler)),
+    // `node_alloc_usage` caches the aggregated allocation usage of a node
+    // for the plan-apply capacity recheck, next to a fingerprint of the rows
+    // it was derived from (see the migration that creates it). Written by
+    // exactly one op — `apply_plan_submission`, at the end of a plan it
+    // applied — which is a scheduler-lane op writing it in the same capture
+    // as the placements it describes. Derived state, so a replica needs no
+    // special handling: it receives the leader's rows like any other, and a
+    // new leader's first plan revalidates them against the live allocation
+    // rows before trusting them.
+    ("node_alloc_usage", Owner::Lane(Lane::Scheduler)),
     ("instance", Owner::Lane(Lane::Scheduler)),
     // `volume` rides the scheduler lane: a volume's lifecycle is bound to its
     // instance (`instance` is already scheduler-owned, and `place_alloc`

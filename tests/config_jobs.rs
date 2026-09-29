@@ -1,4 +1,4 @@
-use jsonnet::JsonnetVm;
+use legion::config_lang;
 use legion::manager::rollout_strategy::validate_rollout_strategy_name;
 use legion::plugin_runtime::plugin_paths;
 use legion::structs::JobConfig;
@@ -6,53 +6,32 @@ use legion::task_plugins::{validate_job_config, TaskPluginRegistry};
 use legion::util::plugin_root_dir;
 use serde_json::Value;
 
-#[derive(Default)]
-struct JsonnetVars {
-    ext_vars: Vec<(String, String)>,
-    ext_codes: Vec<(String, String)>,
-    tla_vars: Vec<(String, String)>,
-    tla_codes: Vec<(String, String)>,
+/// Evaluates a shipped example the way `legion job run` does.
+///
+/// A `.json` example is handed no variables: JSON cannot read them, and
+/// supplying them is an error rather than a silent no-op.
+fn render_job_spec(path: &str, vars: &serde_json::Map<String, Value>) -> String {
+    let vars = match config_lang::format_for(path) {
+        config_lang::ConfigFormat::Json => None,
+        config_lang::ConfigFormat::Nickel => Some(vars),
+    };
+    config_lang::eval_file_with_vars(path, vars)
+        .unwrap_or_else(|e| panic!("{path} should evaluate:\n{e:#}"))
 }
 
-fn render_job_spec(path: &str, vars: &JsonnetVars) -> String {
-    let mut vm = JsonnetVm::new();
-    vm.import_callback(|_vm, base, rel| {
-        let path = std::path::Path::new(base).join(rel);
-        let contents = std::fs::read_to_string(&path).expect("imported file should read");
-        Ok((base.into(), contents))
-    });
-
-    for (key, value) in &vars.ext_vars {
-        vm.ext_var(key, value);
-    }
-    for (key, value) in &vars.ext_codes {
-        vm.ext_code(key, value);
-    }
-    for (key, value) in &vars.tla_vars {
-        vm.tla_var(key, value);
-    }
-    for (key, value) in &vars.tla_codes {
-        vm.tla_code(key, value);
-    }
-
-    let rendered = vm
-        .evaluate_file(path)
-        .expect("jsonnet should evaluate")
-        .to_string();
-    rendered
-}
-
-fn default_jsonnet_vars() -> JsonnetVars {
-    JsonnetVars {
-        ext_vars: vec![
-            ("task_runtime".to_string(), "exec".to_string()),
-            ("task_count".to_string(), "1".to_string()),
-            ("message".to_string(), "hello".to_string()),
-        ],
-        ext_codes: vec![],
-        tla_vars: vec![("job_name".to_string(), "vars-default".to_string())],
-        tla_codes: vec![("cpu".to_string(), "100".to_string())],
-    }
+/// The `vars` record the examples are exercised with.
+///
+/// Only `vars.ncl` reads any of it; every other example ignores `vars`
+/// entirely, which is the point — an unparameterized jobspec never has to
+/// mention it.
+fn default_vars() -> serde_json::Map<String, Value> {
+    let mut vars = serde_json::Map::new();
+    vars.insert("job_name".into(), Value::from("vars-default"));
+    vars.insert("task_runtime".into(), Value::from("exec"));
+    vars.insert("task_count".into(), Value::from(1));
+    vars.insert("message".into(), Value::from("hello"));
+    vars.insert("cpu".into(), Value::from(100));
+    vars
 }
 
 fn value_is_non_empty(value: &Value) -> bool {
@@ -73,12 +52,12 @@ fn config_jobs_parse() {
     for entry in std::fs::read_dir(&jobs_dir).expect("jobs dir should read") {
         let entry = entry.expect("entry should read");
         let path = entry.path();
-        if path.extension().and_then(|ext| ext.to_str()) != Some("jsonnet") {
+        if !config_lang::is_config_file(&path) {
             continue;
         }
 
         let path_str = path.to_string_lossy();
-        let rendered = render_job_spec(&path_str, &default_jsonnet_vars());
+        let rendered = render_job_spec(&path_str, &default_vars());
         let config: JobConfig = serde_json::from_str(&rendered)
             .unwrap_or_else(|e| panic!("failed to parse {}: {}", path_str, e));
 
@@ -145,12 +124,12 @@ fn config_jobs_pass_full_validation() {
     for entry in std::fs::read_dir(&jobs_dir).expect("jobs dir should read") {
         let entry = entry.expect("entry should read");
         let path = entry.path();
-        if path.extension().and_then(|ext| ext.to_str()) != Some("jsonnet") {
+        if !config_lang::is_config_file(&path) {
             continue;
         }
 
         let path_str = path.to_string_lossy();
-        let rendered = render_job_spec(&path_str, &default_jsonnet_vars());
+        let rendered = render_job_spec(&path_str, &default_vars());
         let config: JobConfig = serde_json::from_str(&rendered)
             .unwrap_or_else(|e| panic!("failed to parse {}: {}", path_str, e));
 
@@ -168,7 +147,7 @@ fn config_jobs_pass_full_validation() {
 }
 
 // The canonical example must always validate end to end with builtin task
-// kinds only, so `legion job validate configs/jobs/maximal.jsonnet` works on
+// kinds only, so `legion job validate configs/jobs/maximal.ncl` works on
 // any checkout without built plugins. No skip gate on purpose: if maximal
 // ever grows a plugin-only surface, this failing is the prompt to decide
 // that deliberately.
@@ -177,14 +156,14 @@ fn maximal_job_spec_passes_full_validation() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("configs")
         .join("jobs")
-        .join("maximal.jsonnet");
+        .join("maximal.ncl");
     let path_str = path.to_string_lossy();
-    let rendered = render_job_spec(&path_str, &default_jsonnet_vars());
+    let rendered = render_job_spec(&path_str, &default_vars());
     let config: JobConfig = serde_json::from_str(&rendered)
         .unwrap_or_else(|e| panic!("failed to parse {}: {}", path_str, e));
 
     validate_job_config(&config)
-        .unwrap_or_else(|e| panic!("maximal.jsonnet failed full validation: {:#}", e));
+        .unwrap_or_else(|e| panic!("maximal.ncl failed full validation: {:#}", e));
 }
 
 #[test]
@@ -192,9 +171,9 @@ fn maximal_job_spec_parse() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("configs")
         .join("jobs")
-        .join("maximal.jsonnet");
+        .join("maximal.ncl");
     let path_str = path.to_string_lossy();
-    let rendered = render_job_spec(&path_str, &default_jsonnet_vars());
+    let rendered = render_job_spec(&path_str, &default_vars());
     let config: JobConfig = serde_json::from_str(&rendered)
         .unwrap_or_else(|e| panic!("failed to parse {}: {}", path_str, e));
 
@@ -297,34 +276,23 @@ fn variable_job_spec_renders_with_different_values() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("configs")
         .join("jobs")
-        .join("vars.jsonnet");
+        .join("vars.ncl");
     let path_str = path.to_string_lossy();
 
-    let vars_one = JsonnetVars {
-        ext_vars: vec![
-            ("task_runtime".to_string(), "exec".to_string()),
-            ("task_count".to_string(), "1".to_string()),
-            ("message".to_string(), "hello-one".to_string()),
-        ],
-        tla_vars: vec![("job_name".to_string(), "vars-one".to_string())],
-        tla_codes: vec![("cpu".to_string(), "100".to_string())],
-        ..JsonnetVars::default()
-    };
+    let mut vars_one = default_vars();
+    vars_one.insert("job_name".into(), Value::from("vars-one"));
+    vars_one.insert("message".into(), Value::from("hello-one"));
 
     let rendered_one = render_job_spec(&path_str, &vars_one);
     let config_one: JobConfig = serde_json::from_str(&rendered_one)
         .unwrap_or_else(|e| panic!("failed to parse {}: {}", path_str, e));
 
-    let vars_two = JsonnetVars {
-        ext_vars: vec![
-            ("task_runtime".to_string(), "container".to_string()),
-            ("task_count".to_string(), "2".to_string()),
-            ("message".to_string(), "hello-two".to_string()),
-        ],
-        tla_vars: vec![("job_name".to_string(), "vars-two".to_string())],
-        tla_codes: vec![("cpu".to_string(), "250".to_string())],
-        ..JsonnetVars::default()
-    };
+    let mut vars_two = default_vars();
+    vars_two.insert("job_name".into(), Value::from("vars-two"));
+    vars_two.insert("task_runtime".into(), Value::from("container"));
+    vars_two.insert("task_count".into(), Value::from(2));
+    vars_two.insert("message".into(), Value::from("hello-two"));
+    vars_two.insert("cpu".into(), Value::from(250));
 
     let rendered_two = render_job_spec(&path_str, &vars_two);
     let config_two: JobConfig = serde_json::from_str(&rendered_two)
@@ -336,4 +304,208 @@ fn variable_job_spec_renders_with_different_values() {
     assert_ne!(config_one.tasks[0].runtime, config_two.tasks[0].runtime);
     assert_ne!(config_one.tasks[0].count, config_two.tasks[0].count);
     assert_ne!(config_one.tasks[0].resources, config_two.tasks[0].resources);
+}
+
+/// The shipped manager configs evaluate and deserialize.
+///
+/// `legion start manager -c …` is the only thing that reads these, and a
+/// stale example is only noticed when someone tries to boot from it.
+#[test]
+fn config_manager_files_parse() {
+    let configs_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("configs");
+
+    let mut seen = 0;
+    for entry in std::fs::read_dir(&configs_dir).expect("configs dir should read") {
+        let path = entry.expect("entry should read").path();
+        if !config_lang::is_config_file(&path) {
+            continue;
+        }
+
+        let path_str = path.to_string_lossy();
+        let rendered = config_lang::eval_file(&path)
+            .unwrap_or_else(|e| panic!("{path_str} should evaluate:\n{e:#}"));
+        serde_json::from_str::<legion::structs::ManagerConfig>(&rendered)
+            .unwrap_or_else(|e| panic!("{path_str} is not a manager config: {e}"));
+        seen += 1;
+    }
+
+    assert!(
+        seen >= 3,
+        "expected the shipped manager configs, found {seen}"
+    );
+}
+
+/// The shipped worker configs evaluate and deserialize.
+///
+/// The manager loads every file in `workerConfigPath` at startup, so a
+/// broken example here fails the whole boot, not just one job.
+#[test]
+fn config_worker_files_parse() {
+    let workers_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("configs")
+        .join("workers");
+
+    let mut seen = 0;
+    for entry in std::fs::read_dir(&workers_dir).expect("workers dir should read") {
+        let path = entry.expect("entry should read").path();
+        if !config_lang::is_config_file(&path) {
+            continue;
+        }
+
+        let path_str = path.to_string_lossy();
+        let rendered = config_lang::eval_file(&path)
+            .unwrap_or_else(|e| panic!("{path_str} should evaluate:\n{e:#}"));
+        serde_json::from_str::<legion::structs::WorkerConfigAlt>(&rendered)
+            .unwrap_or_else(|e| panic!("{path_str} is not a worker config: {e}"));
+        seen += 1;
+    }
+
+    assert!(
+        seen >= 3,
+        "expected the shipped worker configs, found {seen}"
+    );
+}
+
+/// The shipped job template evaluates, publishes a manifest, and renders.
+///
+/// This is the one example that goes through the manager's sandboxed
+/// template path rather than the client-side jobspec path.
+#[test]
+fn config_template_files_parse() {
+    let templates_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("configs")
+        .join("templates");
+
+    let mut seen = 0;
+    for entry in std::fs::read_dir(&templates_dir).expect("templates dir should read") {
+        let path = entry.expect("entry should read").path();
+        // Nickel only: a template declares `job` as a function of its
+        // variables, so unlike every other config surface it has no JSON form.
+        if path.extension().and_then(|ext| ext.to_str()) != Some(config_lang::CONFIG_EXTENSION) {
+            continue;
+        }
+
+        let path_str = path.to_string_lossy();
+        let source = std::fs::read_to_string(&path).expect("template source should read");
+        let manifest = legion::manager::job_templates::parse_manifest(&source)
+            .unwrap_or_else(|e| panic!("{path_str} is not a valid template:\n{e:#}"));
+
+        // Every declared variable has a default here, so the template renders
+        // with no caller input — the same trial render the manager runs at
+        // publish time.
+        let values = legion::manager::job_templates::resolve_variable_values(
+            &manifest.variables,
+            r#"{"scene": "demo"}"#,
+        )
+        .unwrap_or_else(|e| panic!("{path_str} defaults do not resolve: {e:#}"));
+        let rendered = legion::manager::job_templates::render_with_timeout(&source, &values)
+            .unwrap_or_else(|e| panic!("{path_str} does not render:\n{e:#}"));
+        let config: JobConfig = serde_json::from_str(&rendered)
+            .unwrap_or_else(|e| panic!("{path_str} renders invalid json: {e}"));
+        validate_job_config(&config)
+            .unwrap_or_else(|e| panic!("{path_str} renders an invalid jobspec: {e:#}"));
+        seen += 1;
+    }
+
+    assert!(seen >= 1, "expected the shipped job template, found {seen}");
+}
+
+/// A JSON jobspec is accepted anywhere a Nickel one is.
+///
+/// The shipped `machine-generated.json` is covered by the directory scans
+/// above; this pins the property those scans rely on — that the two languages
+/// are two spellings of one job, not two dialects with different reach.
+#[test]
+fn json_and_nickel_jobspecs_produce_the_same_job() {
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    let json_path = dir.path().join("job.json");
+    std::fs::write(
+        &json_path,
+        r#"{
+          "name": "equivalent",
+          "priority": "high",
+          "tasks": [{
+            "name": "server",
+            "runtime": "exec",
+            "lifecycle": "service",
+            "group": "api",
+            "count": 2,
+            "resources": {"cpu": 200, "memory": 256},
+            "config": {"command": ["echo", "hi"]}
+          }]
+        }"#,
+    )
+    .expect("write json spec");
+
+    let ncl_path = dir.path().join("job.ncl");
+    std::fs::write(
+        &ncl_path,
+        r#"{
+          name = "equivalent",
+          priority = "high",
+          tasks = [{
+            name = "server",
+            runtime = "exec",
+            lifecycle = "service",
+            group = "api",
+            count = 2,
+            resources = { cpu = 200, memory = 256 },
+            config = { command = ["echo", "hi"] },
+          }],
+        }"#,
+    )
+    .expect("write nickel spec");
+
+    let from_json: JobConfig = serde_json::from_str(&render_job_spec(
+        &json_path.to_string_lossy(),
+        &default_vars(),
+    ))
+    .expect("json spec should deserialize");
+    let from_ncl: JobConfig = serde_json::from_str(&render_job_spec(
+        &ncl_path.to_string_lossy(),
+        &default_vars(),
+    ))
+    .expect("nickel spec should deserialize");
+
+    assert_eq!(from_json, from_ncl);
+    validate_job_config(&from_json).expect("json spec should pass full validation");
+}
+
+/// Nickel reads an imported `.json` file natively.
+///
+/// This is the path for mixing the two: generated data, hand-written
+/// structure. It is also what the local-jobspec resolution fix protects —
+/// the import has to resolve against the spec's own directory.
+#[test]
+fn a_nickel_jobspec_can_import_generated_json() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(dir.path().join("fleet.json"), r#"{"count": 3, "cpu": 150}"#)
+        .expect("write generated json");
+
+    let spec = dir.path().join("job.ncl");
+    std::fs::write(
+        &spec,
+        r#"
+        let fleet = import "fleet.json" in
+        {
+          name = "hybrid",
+          tasks = [{
+            name = "server",
+            runtime = "exec",
+            group = "api",
+            count = fleet.count,
+            resources = { cpu = fleet.cpu },
+            config = { command = ["echo", "hybrid"] },
+          }],
+        }
+        "#,
+    )
+    .expect("write spec");
+
+    let rendered = render_job_spec(&spec.to_string_lossy(), &default_vars());
+    let config: JobConfig = serde_json::from_str(&rendered).expect("should deserialize");
+    assert_eq!(config.name, "hybrid");
+    assert_eq!(config.tasks[0].count.num, 3);
+    validate_job_config(&config).expect("hybrid spec should pass full validation");
 }

@@ -407,7 +407,7 @@ impl VolumeRequest {
     }
 
     /// A param as a string, whether the jobspec wrote it as a string, number,
-    /// or bool. Jsonnet users write `size: '10G'` and `port: 2049`
+    /// or bool. Nickel users write `size = "10G"` and `port = 2049`
     /// interchangeably; drivers should not have to care.
     pub fn param_str(&self, key: &str) -> Option<String> {
         param_str(&self.params, key)
@@ -431,7 +431,7 @@ impl VolumeRequest {
     }
 }
 
-/// String view of a param value, accepting the JSON scalar shapes jsonnet
+/// String view of a param value, accepting the JSON scalar shapes Nickel
 /// produces.
 pub fn param_str(params: &BTreeMap<String, Value>, key: &str) -> Option<String> {
     match params.get(key)? {

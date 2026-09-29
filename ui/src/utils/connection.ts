@@ -42,6 +42,9 @@ export { connectionError, connectionStatus, identityError, managerIdentity }
 // answers Unauthenticated, for example), which is not a connection problem.
 const UNREACHABLE_CODES = new Set<Code>([Code.Unknown, Code.Unavailable, Code.DeadlineExceeded])
 
+const isUnreachable = (error: unknown): boolean =>
+  !(error instanceof ConnectError) || UNREACHABLE_CODES.has(error.code)
+
 const describeError = (error: unknown): string => {
   if (error instanceof ConnectError) return error.rawMessage || error.message
   return error instanceof Error ? error.message : String(error)
@@ -76,8 +79,7 @@ export const connectToManager = (): Promise<void> => {
       setConnectionStatus('connected')
     })
     .catch((error: unknown) => {
-      const unreachable = !(error instanceof ConnectError) || UNREACHABLE_CODES.has(error.code)
-      if (!unreachable) {
+      if (!isUnreachable(error)) {
         // Reached the manager; it just refused this call (usually a stale
         // token). Let the app in and report it where identity is shown.
         setManagerIdentity(null)
@@ -93,4 +95,78 @@ export const connectToManager = (): Promise<void> => {
     })
 
   return inFlight
+}
+
+/*
+ * The watchdog: once connected, keep asking whether the manager is still
+ * there. The first probe gates the app; this one never does — pages keep
+ * showing their last data, and a banner says the numbers may be stale until
+ * contact returns. A restarted or partitioned manager is otherwise something
+ * the operator only discovers when every card errors at once.
+ */
+
+export type ManagerLink = 'ok' | 'lost'
+
+const [managerLink, setManagerLink] = createSignal<ManagerLink>('ok')
+const [lostSince, setLostSince] = createSignal<number | null>(null)
+
+export { lostSince, managerLink }
+
+const WATCHDOG_INTERVAL_MS = 10_000
+// Retry faster once contact is lost: the banner should clear within seconds
+// of the manager coming back, not within a leisurely ten.
+const WATCHDOG_LOST_INTERVAL_MS = 3_000
+const WATCHDOG_TIMEOUT_MS = 6_000
+
+let watchdogTimer: ReturnType<typeof setTimeout> | undefined
+let probeInFlight: Promise<void> | undefined
+
+/** One reachability probe; also what the banner's Retry button calls. */
+export const probeManagerLink = (): Promise<void> => {
+  if (probeInFlight) return probeInFlight
+  probeInFlight = managerClient
+    .whoAmI({}, { timeoutMs: WATCHDOG_TIMEOUT_MS })
+    .then(() => {
+      if (managerLink() === 'lost') {
+        setManagerLink('ok')
+        setLostSince(null)
+        // Contact returned: the identity may have changed on the way (a
+        // restarted manager with ACLs newly enabled, say).
+        void refreshManagerIdentity()
+      }
+    })
+    .catch((error: unknown) => {
+      if (isUnreachable(error) && managerLink() === 'ok') {
+        setManagerLink('lost')
+        setLostSince(Date.now())
+      }
+    })
+    .finally(() => {
+      probeInFlight = undefined
+    })
+  return probeInFlight
+}
+
+const scheduleProbe = () => {
+  if (watchdogTimer) clearTimeout(watchdogTimer)
+  const delay = managerLink() === 'lost' ? WATCHDOG_LOST_INTERVAL_MS : WATCHDOG_INTERVAL_MS
+  watchdogTimer = setTimeout(async () => {
+    // A hidden tab neither needs the banner nor should keep the manager busy.
+    if (!document.hidden && connectionStatus() === 'connected') await probeManagerLink()
+    scheduleProbe()
+  }, delay)
+}
+
+let watchdogStarted = false
+
+/** Idempotent; the layout calls it once the first connect has succeeded. */
+export const startConnectionWatchdog = () => {
+  if (watchdogStarted) return
+  watchdogStarted = true
+  scheduleProbe()
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden && connectionStatus() === 'connected') {
+      void probeManagerLink().then(scheduleProbe)
+    }
+  })
 }

@@ -15,20 +15,25 @@ to diverge early.
 
 ## The ladder
 
-```jsonnet
+```nickel
 {
-  name: 'web',
-  runtime: 'container',
-  // How this task is stopped, whoever initiates it. Both fields optional.
-  stop: {
-    signal: 'SIGTERM',   // default
-    killAfter: '30s',    // default; SIGKILL after this grace window
+  name = "web",
+  runtime = "container",
+  # How this task is stopped, whoever initiates it. Both fields optional.
+  stop = {
+    signal = "SIGTERM",   # default
+    killAfter = "30s",    # default; SIGKILL after this grace window
+    drain = "5s",         # service tasks only; default one heartbeat interval
   },
 }
 ```
 
 When the platform stops a task:
 
+0. **If the task advertises a `service`**, it first leaves the catalog and
+   keeps serving for the **drain window** — `stop.drain`, or one heartbeat
+   interval of its node — so consumers on other nodes learn it is gone
+   before it stops accepting.
 1. The worker writes the **stop notice** into the task directory.
 2. It sends `stop.signal` to the task's process group.
 3. It waits, up to `stop.killAfter`, for the process to exit.
@@ -58,6 +63,37 @@ asking for more is rejected at submit with the cap named.
 A task that exits promptly is reaped promptly — `killAfter` is a deadline, not
 a delay. The only thing that waits the full window is a task that ignores its
 signal.
+
+### `stop.drain`
+
+Only for tasks with a [`service`](service-discovery.md) block; ignored
+otherwise, because nothing routes to a task that advertises nothing.
+
+The problem it solves: the manager withdraws a stopping allocation from every
+node's endpoint feed on that node's *next* heartbeat, but the node running
+the allocation learns to stop it on *its* next heartbeat — so without a
+drain, a consumer on another node can be routed to an endpoint that has
+already received `SIGTERM`, and sees `connection refused` during every
+rollout. The drain window closes that gap by ordering: the allocation leaves
+the live set and the catalog first, keeps serving, and is signalled only
+after the window — by which time every other node has heard.
+
+- **Default: one heartbeat interval** of the node running the task (the
+  cadence it is actually on, including a manager-served one), because that
+  is exactly how long the rest of the cluster needs.
+- **`"0s"` disables it** for a task whose consumers retry anyway.
+- **Capped at `5m`**, like `killAfter`, and for the same reason.
+- An in-place re-dispatch of the same allocation (an artifact-only update)
+  never drains: the allocation relaunches at once and needs its ports.
+- A draining allocation still holds its ports and its process, so new
+  allocations for the node are held back until it is gone — exactly as an
+  in-grace allocation holds them.
+- The window is a bound, not an acknowledgement: a node whose heartbeat is
+  late learns late, and a connection it opens in that gap is still refused.
+
+`legion job status` shows the allocation gone as soon as the drain starts;
+the worker logs `Draining allocation before stop` with the window, then the
+ordinary `Stopping allocation` line when the signal goes.
 
 ## The stop notice
 
@@ -280,7 +316,7 @@ it just reports `unknown` and carries no preemptor link.
 - **The grace window costs stop latency for everyone.** Stops that used to be
   instantaneous now take up to `killAfter`. This is the intended behavior
   change and it applies to jobs that declare no `stop` block: the default
-  ladder is `SIGTERM` + `30s`, not a hard kill. Set `stop: { killAfter: '0s' }`
+  ladder is `SIGTERM` + `30s`, not a hard kill. Set `stop = { killAfter = "0s" }`
   on a task that genuinely wants the old behavior.
 - **Starts wait behind co-located stops.** A new allocation landing on a node
   with in-grace allocations waits for them, even when it is unrelated to
@@ -294,7 +330,7 @@ it just reports `unknown` and carries no preemptor link.
   returns all removals; filter on the `cause` metadata key client-side.
 - **Causes are per-removal-batch in the journal, per-allocation on the wire.**
   A `job stop` that removes 12 allocations produces one `allocation.removed`
-  event with `count: 12`, and 12 individual notices.
+  event with `count = 12`, and 12 individual notices.
 - **Allocation IDs are reused.** An allocation ID freed by a deletion can be
   assigned to a new allocation. A stale notice is overwritten when the new
   allocation is itself removed, so a mislabel would require a worker to stop

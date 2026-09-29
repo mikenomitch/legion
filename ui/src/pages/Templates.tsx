@@ -5,24 +5,24 @@ import { Button, Field, Note, SectionCard, inputClass, textareaClass } from '../
 import { managerClient } from '../grpcClient'
 import { canWriteAny } from '../utils/acl'
 import { debounced } from '../utils/debounce'
-import { formatRelativeTime } from '../utils/format'
+import { INDEX_POLL_INTERVAL_MS, retainOnError, usePoll } from '../utils/polling'
 
 const errorText = (error: unknown): string =>
   error instanceof Error ? error.message : String(error)
 
 const STARTER_SOURCE = `{
-  description: 'What this template runs.',
-  variables: [
-    { key: 'name', type: 'string', label: 'Job name suffix' },
-    { key: 'replicas', type: 'number', default: 1 },
+  description = "What this template runs.",
+  variables = [
+    { key = "name", type = "string", label = "Job name suffix" },
+    { key = "replicas", type = "number", "default" = 1 },
   ],
-  job(vars):: {
-    name: 'example-' + vars.name,
-    tasks: [{
-      name: 'main',
-      runtime: 'exec',
-      count: vars.replicas,
-      config: { command: ['echo', 'hello from ' + vars.name] },
+  job | not_exported = fun vars => {
+    name = "example-%{vars.name}",
+    tasks = [{
+      name = "main",
+      runtime = "exec",
+      count = vars.replicas,
+      config = { command = ["echo", "hello from %{vars.name}"] },
     }],
   },
 }
@@ -34,6 +34,7 @@ function TemplatesContent() {
   const [page, setPage] = createSignal(1)
   const [pageSize, setPageSize] = createSignal(20)
   const searchQuery = debounced(search)
+  const tick = usePoll(INDEX_POLL_INTERVAL_MS)
 
   createEffect(() => {
     search()
@@ -42,8 +43,11 @@ function TemplatesContent() {
   })
 
   const [data, { refetch }] = createResource(
-    () => ({ search: searchQuery() }),
-    async (input) => managerClient.listJobTemplates({ query: input.search || undefined }),
+    () => ({ search: searchQuery(), tick: tick() }),
+    retainOnError(
+      async (input: { search: string; tick: number }) => managerClient.listJobTemplates({ query: input.search || undefined }),
+      (input) => input.search,
+    ),
   )
 
   const sorted = createMemo(() => {
@@ -74,7 +78,7 @@ function TemplatesContent() {
     try {
       const reply = await managerClient.upsertJobTemplate({
         name: newName().trim(),
-        sourceJsonnet: newSource(),
+        sourceNickel: newSource(),
       })
       const stored = reply.template
       setCreateNotice(
@@ -95,7 +99,7 @@ function TemplatesContent() {
       <Show when={editorOpen()}>
         <SectionCard
           title="New template"
-          description="One self-contained Jsonnet file: metadata, typed variables, and a hidden job(vars):: function."
+          description="One self-contained Nickel file: metadata, typed variables, and a `job | not_exported = fun vars => …` function."
         >
           <form class="flex flex-col gap-3" onSubmit={createTemplate}>
             <Field label="Name" hint="Lowercase letters, digits, and dashes.">
@@ -107,7 +111,7 @@ function TemplatesContent() {
                 required
               />
             </Field>
-            <Field label="Jsonnet source">
+            <Field label="Nickel source">
               <textarea
                 class={`${textareaClass} h-72 font-mono text-xs`}
                 value={newSource()}
@@ -162,7 +166,7 @@ function TemplatesContent() {
           id: template.name,
           title: template.name,
           subtitle: template.description,
-          updatedAt: formatRelativeTime(template.updatedAt),
+          updatedAt: template.updatedAt,
           href: `/templates/${encodeURIComponent(template.name)}`,
           cells: {
             version: <span class="tabular-nums">v{template.latestVersion}</span>,
@@ -178,7 +182,7 @@ function TemplatesContent() {
           setPage(1)
         }}
         emptyLabel="No templates yet"
-        emptyHint="Publish one with `legion template create <name> -f template.jsonnet` or the editor below."
+        emptyHint="Publish one with `legion template create <name> -f template.ncl`, or press New template above."
       />
 
     </div>

@@ -12,7 +12,6 @@ use crate::structs::{
     ListAclPoliciesRequest, ListAclTokensRequest, ListAclUsersRequest, UpsertAclPolicyRequest,
     UpsertAclUserRequest, WhoAmIRequest,
 };
-use jsonnet::JsonnetVm;
 use tabled::Tabled;
 
 pub fn config() -> Command {
@@ -36,7 +35,7 @@ pub fn config() -> Command {
         .arg_required_else_help(true)
         .subcommand(
             Command::new("apply")
-                .about("Create or replace a policy from a rules file (JSON or Jsonnet)")
+                .about("Create or replace a policy from a rules file (JSON or Nickel)")
                 .arg(Arg::new("name").value_name("NAME").required(true))
                 .arg(
                     Arg::new("file")
@@ -297,7 +296,7 @@ async fn whoami(format: OutputFormat) -> R<()> {
     Ok(())
 }
 
-/// Reads policy rules from a file (JSON or Jsonnet) or an inline string.
+/// Reads policy rules from a file (JSON or Nickel) or an inline string.
 /// Accepts either a bare rules array or `{description?, rules: [...]}`.
 fn read_policy_source(
     file: Option<&String>,
@@ -305,19 +304,10 @@ fn read_policy_source(
     description_flag: Option<&String>,
 ) -> R<(String, String)> {
     let raw = match (file, inline) {
-        (Some(path), None) => {
-            if path.ends_with(".jsonnet") {
-                let mut vm = JsonnetVm::new();
-                let rendered = vm
-                    .evaluate_file(path)
-                    .map_err(|e| anyhow!("Error rendering policy jsonnet {path}: {e}"))?
-                    .to_string();
-                rendered
-            } else {
-                std::fs::read_to_string(path)
-                    .with_context(|| format!("failed to read policy file {path}"))?
-            }
-        }
+        // Both languages go through the one loader: `.json` is parsed, and
+        // anything else is evaluated as Nickel.
+        (Some(path), None) => crate::config_lang::eval_file(path)
+            .with_context(|| format!("Error rendering policy {path}"))?,
         (None, Some(inline)) => inline.clone(),
         (Some(_), Some(_)) => bail!("provide either FILE or --rules, not both"),
         (None, None) => bail!("provide a policy FILE or --rules <json>"),

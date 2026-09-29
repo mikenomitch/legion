@@ -19,16 +19,70 @@ At manager startup:
 
 Each worker loop:
 
-1. `claim_eval()` atomically marks one `pending` eval as `in_flight`.
-2. Executes `Eval::handle(store)`.
-3. `complete_eval()`:
-   - success -> delete eval row
-   - failure -> set status `failed`
+1. `claim_evals()` atomically marks a **batch** of `pending` evals as
+   `in_flight`.
+2. Executes `Eval::handle(store)` for each one, in claim order, one at a
+   time.
+3. `complete_evals_and_claim_next()` writes every outcome — success deletes
+   the eval row, failure sets status `failed`, a transient rejection returns
+   the row to `pending` after a delay — **and** claims the next batch, in one
+   operation.
 
 When queue is empty, workers block on either:
 
 - `Notify` wake-up (`enqueue_eval` of zero-delay work), or
 - timeout until next delayed eval `ready_at`.
+
+### Batching
+
+Steps 1 and 3 are fixed costs paid per *round*, not per eval. On a
+replicated (raft) manager each is a quorum round on the scheduler lane, and
+that lane drains through a single pipeline thread — so a cluster doing a
+little work per eval hits a ceiling that has nothing to do with the work.
+Taking N evals through one cycle divides those two rounds by N.
+
+The batch is sized to the queue, not to a timer:
+
+- **It never waits to fill.** A worker takes whatever is claimable right now
+  and starts working. Idle latency is unchanged.
+- **It is a fair share, not a grab.** Each worker takes at most
+  `pending_evals / evalThreads` rows, so a burst of work spreads across
+  workers instead of serializing behind the first one to wake.
+- **It is capped at 16** rows per worker regardless of queue depth.
+- **A shallow queue yields a batch of one**, which behaves exactly like the
+  unbatched loop.
+
+There is no configuration for this; the two inputs — live queue depth and
+`evalThreads` — are already known to the loop.
+
+Batching does not change what evals do or the order they run in. Each eval
+still runs its own handler and applies its own plan in its own operation,
+and the claim still drains in `priority DESC, id ASC` order across the whole
+batch, so a low-priority eval can never overtake a high-priority one by
+riding in someone's batch.
+
+**Failure isolation.** Only outcomes the worker actually *observed* are
+written. If one eval's handler panics or is cancelled, its siblings still
+settle normally and that eval is simply omitted — its row stays `in_flight`
+and returns to the queue via `requeue_in_flight_evals()` (run on startup and
+on raft leadership acquisition). The same applies to the whole batch if the
+terminal write itself fails, or if the worker or manager dies mid-batch:
+nothing is written, every row stays `in_flight`, and recovery requeues them.
+An eval is never marked failed on the strength of an unknown outcome,
+because failed evals are not retried.
+
+The cost of that safety is bounded re-execution: an eval handled inside a
+batch whose terminal write never lands will run again after recovery. Eval
+handlers are idempotent convergence steps, so this is wasted work rather
+than duplicated effects, and the batch cap bounds how much of it a single
+crash can cause.
+
+**Leadership.** A worker that loses scheduler-lane leadership part-way
+through a batch stops there and leaves the remainder `in_flight` for the new
+leader, rather than running work whose writes cannot commit. A batch can
+never be half-applied across a leadership change: the terminal write for the
+whole batch is a single replicated operation that either commits or does
+not.
 
 ## Eval Queue Semantics
 
@@ -113,12 +167,15 @@ propose→quorum-commit→apply instead of two.
 Since the late-binding change
 ([late-binding-plan-apply.md](late-binding-plan-apply.md)), a plan carries
 an ordered **candidate list** per placement instead of a single node, and
-the apply transaction binds each placement to the first candidate whose
-node epoch is unchanged since planning. A concurrent plan that touched the
-first choice costs a fallback rank instead of a whole-plan rejection.
-Coupled placements (overlapping lists, shared `distinct` keys, multi-task
-groups) keep exact all-or-nothing semantics. Defaults on
-(`schedulerSettings.plan_candidates: 8`); `0` disables it and restores
+the apply transaction binds each placement in two passes: first the
+best candidate whose node epoch is unchanged since planning, then — for
+placements that found none — the best candidate that still passes the
+transaction's own re-validation, epoch or no epoch. A concurrent plan that
+touched the first choice costs a fallback rank, or nothing at all, instead
+of a whole-plan rejection. Coupled placements (shared `distinct` keys,
+multi-task groups) keep exact all-or-nothing semantics; overlapping
+candidate lists are not coupling. Defaults on
+(`schedulerSettings.plan_candidates = 8`); `0` disables it and restores
 single-node submissions. The epoch sample (lazy or eager, below) covers
 the union of every placement's candidate list, and candidate submissions
 take the same group commit as single-node ones.
@@ -137,7 +194,7 @@ mid-plan, the scheduler re-plans once with the eager whole-fleet sample
 (unconditionally safe), counted by the
 `legion_scheduler_lazy_sample_fallback_total` metric.
 
-`schedulerSettings.lazy_version_sample: false` restores the eager sample
+`schedulerSettings.lazy_version_sample = false` restores the eager sample
 on every plan. Correctness never depends on this setting — the lazy path
 falls back on its own whenever it cannot prove equivalence.
 
@@ -151,13 +208,103 @@ own epoch-CAS verdict inside a per-plan savepoint. A plan that fails
 mid-apply rolls back alone; its batch-mates commit. A lone plan takes
 the single-plan path unchanged, so idle-cluster latency is unaffected.
 
-- `schedulerSettings.plan_apply_coalescing: false` restores one commit
-  per plan.
+The batch is one transaction on **every** backend, so a local
+(`local_disk` / `streaming`) manager pays one fsync for the batch
+instead of one per plan, exactly as a raft manager pays one quorum
+round. The batch holds the store's write connection for the whole
+transaction — the same rule every other multi-statement write follows —
+so no unrelated write can land inside it.
+
+What the batch produces is published **once, after that commit**:
+
+- **One read-model refresh** over the union of every plan's allocation
+  scopes, read from committed state. Evicted and placed rows refresh
+  together, so the mirror never shows an intermediate state.
+- **One status-lane `task_status` projection** covering every allocation
+  the batch placed, instead of one per plan. Lifecycle-derived task
+  statuses are a status-lane write that follows the scheduler-lane apply
+  (see [multi-raft.md](multi-raft.md) on lanes); batching it turns N
+  follow-up writes — N more raft rounds under `lanes` — into one.
+- **Every staged event**, in id order. Nothing is broadcast before the
+  batch is durable.
+
+During the batch the read model still shows pre-batch state for the
+scopes it is about to change. That is the same window the epoch fence
+already covers: a plan built against it fails its compare-and-set at
+apply, so a stale read model costs a conflict, never an
+oversubscription.
+
+- `schedulerSettings.plan_apply_coalescing = false` restores one commit
+  per plan, one status projection per plan, and one read-model refresh
+  per plan. This is the only escape hatch — there is no separate switch
+  for the local commit amortization or the batched status projection.
 - `schedulerSettings.plan_apply_batch_max` (default 16, max 128) caps
   plans per batch.
 
+Known limitation: a batch is bounded by `plan_apply_batch_max`, and a
+larger batch holds the write connection (and, on raft, one log entry)
+for proportionally longer. Raising it past the default trades tail
+latency for other writers against fewer commits; the raft append-entries
+deadline (`heartbeatIntervalMs`) is the real ceiling, which is why the
+cap exists.
+
 Worker heartbeats batch the same way on the status lane (see
 [architecture-managers-workers.md](architecture-managers-workers.md)).
+
+### Job intake group-commits too
+
+Submitting a job is a composite across all three raft lanes: the
+**control** lane writes the job and its config, the **status** lane seeds
+one `pending` `task_status` row per task, and the **scheduler** lane
+enqueues the placement eval. Under `lanes` that is three quorum rounds per
+submitted job, and a client that submits many jobs at once pays all three
+per job.
+
+Two of the three now batch. Concurrent submitters coalesce their
+scheduler-lane enqueue into one op and their status-lane seed into another
+— the same group commit plans use, with per-request savepoints so one bad
+submission fails alone and its batch-mates still commit. A lane is its own
+raft group with its own pipeline, so a batch can never span lanes; that is
+why there are two coalescers and not one.
+
+What does **not** change:
+
+- **A lone submit is untouched.** There is no accumulation window. A
+  single `legion job run` on an idle cluster goes straight to the commit
+  slot and takes the single-op path, exactly as before.
+- **Queue order.** Evals are still claimed strictly by
+  `priority DESC, id ASC`. A batch inserts in arrival order and each eval
+  still derives its own priority (an explicit `--priority`/`--asap`
+  override, else the job's band).
+- **Idempotency.** `RunJob`'s `idempotency_key` still arbitrates before
+  anything is written, and the loser of a concurrent same-key submit is
+  told so (`deduplicated: true`, carrying the winner's message).
+- **The control-lane write.** `handle_job_submit` is deliberately *not*
+  batched: it derives a config's next version from committed state, so two
+  submits of the same job inside one uncommitted batch would compute the
+  same version. Intake therefore costs one quorum round per job, not zero.
+
+`schedulerSettings.job_intake_coalescing = false` restores one op per
+submitter on both lanes. Batch size is capped at 64 per lane and is not
+configurable.
+
+Whether batching is actually engaging is visible in
+`legion_store_coalesce_batch_size{path="eval_enqueue"}` and
+`{path="task_status_seed"}` — compare the `le="1"` bucket against `_count`
+([metrics.md](metrics.md)). Serial submitters never overlap, so a
+`for` loop over jobspecs will sit at 1 and there is nothing to tune.
+
+The control-lane half batches too: concurrent `RunJob`s coalesce into one
+`handle_job_submits` commit, each request inside its own savepoint so a
+failing submit rolls back alone. What makes this safe is that version
+derivation reads *through the batch transaction*: two submits of the same
+job in one batch derive successive versions (N+1 then N+2) because the
+second sees the first's in-transaction write — the same property that fixes
+the long-standing version race for concurrent single submits. A
+`NotRaftLeader` rejection re-runs each request singly with the typed error
+each caller's standing-split handling expects. With all three halves
+batched, a 32-wide submit burst costs roughly 1.5 quorum rounds per job
+where it once cost 3.
 
 ### Observing where plan time goes
 
@@ -186,15 +333,78 @@ every placement against the **fresh** node row before inserting it:
   arithmetic as the planner's ledger) and every placement must still fit,
   with earlier placements in the same plan debited.
 
-A failed re-validation rejects the whole plan the same way a stale epoch
-does; the eval handler's conflict retry then re-plans against the node's
-real state. Port assignments were always re-read in the apply
+#### The per-node usage cache
+
+Rebuilding that free pool used to read **every** allocation row on the node
+and parse every stored `resources` blob, inside the serialized plan-apply
+commit. The cost of committing a plan therefore grew with how full the
+cluster was while the plan's own work stayed constant: on a 5,000-node
+fleet, the same ~44 placements read ~440 allocation rows with 50,000
+allocations live and ~1,760 with 200,000.
+
+A node's total allocation usage is now cached in `node_alloc_usage`, one
+row per node. The cache is **validated, never trusted**: each row stores a
+fingerprint of the allocation rows it was computed from — the node's
+allocation epoch, the row count, and the sum of the allocation ids — and
+the apply path recomputes that fingerprint (an index-only read that touches
+no row bodies and parses no JSON) before using the cached value. If it does
+not match, the pool is rebuilt from the rows exactly as before, and the
+plan refreshes the row on its way out.
+
+What this means in practice:
+
+- **The number is unchanged.** The same capacity arithmetic, the same
+  overcommit policy, the same exclusion of a Fresh plan's own job. Cached
+  and rebuilt pools can differ only by a floating-point rounding step,
+  because the cache subtracts one summed total where the rebuild subtracts
+  each allocation in turn.
+- **Nothing has to maintain it.** Any path that adds or removes an
+  allocation — a placement, a stop, a preemption, a node removal, a job
+  destroy — invalidates the affected rows implicitly, because it moves the
+  fingerprint. A stale, wrong, or missing row costs one rebuild; it can
+  never inflate a node's free capacity.
+- **Version skew is safe in both directions.** A manager binary without
+  this feature neither reads nor writes the table, so a leader on either
+  side of an upgrade simply finds the fingerprints stale and rebuilds. The
+  table is created empty with no backfill.
+- **A resource-policy change invalidates it.** Each row also records a
+  fingerprint of the resource policy (`taskResourceDefaults`,
+  `customResources`) that normalized it, and a row from any other policy —
+  including one written before the fingerprint existed — is rebuilt rather
+  than served. Without this, raising a task default and restarting would
+  keep serving aggregates computed under the old default on every node
+  whose rows had not moved, understating usage indefinitely. A policy
+  change therefore costs one rebuild per node, the same as a cold start.
+
+The scheduler's **in-memory read model keeps the same aggregate per node**
+(beside each node's cached allocation list), so re-deriving a node's free
+pool and index projections after a committed change — which happens on
+every replica, inside the write lock every planner reads through — is a
+subtraction over resource dimensions instead of a re-parse of every
+allocation on the node. The memo is maintained only by splices that know
+the exact rows they moved; every wholesale list reload drops it, and the
+next reprojection rebuilds it from the list (the same walk every
+reprojection used to pay). It shares `NodeUsage` — and the equivalence
+tests — with the persistent cache above.
+
+Known limitation: removing a node leaves its cache row behind (the removal
+runs on a different raft lane than the table's writer). The row is inert
+and roughly 100 bytes.
+
+A failed re-validation on *every* candidate is what rejects a plan; the
+eval handler's conflict retry then re-plans against the node's real
+state. Since the two-pass bind, this re-validation — not the node epoch —
+is what decides whether a contended placement lands. Port assignments were always re-read in the apply
 transaction; these checks give availability, constraints, and resources
 the same apply-time guarantee.
 
 ### Conflict handling
 
-A stale epoch causes plan rejection with a conflict error. The eval handler retries conflicts with bounded attempts via `Eval::plan_with_conflict_retries`.
+A rejected plan raises a conflict error, which the eval handler retries
+with bounded attempts via `Eval::plan_with_conflict_retries`. A stale
+*job-config* epoch always rejects; a stale *node* epoch only rejects when
+the re-validation above also fails (or for an edge-boot ratification, which
+keeps the hard node-epoch check).
 
 Since the late-binding change, exhausting that in-handler budget no longer
 fails the eval: the eval is released back to the pending queue with a
@@ -216,11 +426,11 @@ clamped to 100–60000, plus uniform jitter of up to the base).
 
 Example manager config:
 
-```jsonnet
+```nickel
 {
-  schedulerSettings: {
-    plan_conflict_max_retries: 8,
-    plan_conflict_requeue_delay_ms: 500,
+  schedulerSettings = {
+    plan_conflict_max_retries = 8,
+    plan_conflict_requeue_delay_ms = 500,
   },
 }
 ```
@@ -241,6 +451,19 @@ free-capacity pool are cached in the scheduler read model and shared by
 reference, so a plan's snapshot costs refcount bumps rather than a
 fleet-sized filter/sort/copy; any node mutation invalidates the cached
 list and the next plan rebuilds it.
+
+The read model also keeps a per-job index of allocations by node,
+maintained by the same writes that maintain the per-node allocation lists.
+A plan takes its own job's entry with the snapshot and derives everything
+it needs about its existing allocations from it — the rows a fresh plan
+replaces (and so does not count against capacity), the counts a reschedule
+still has to place, group pinning, `distinct` seeding, and the scoring
+cache's per-node task presence. Nothing in a plan walks every allocation
+in the cluster, so planning cost does not grow with how full the cluster
+is, only with the job being placed. After a plan commits, its placed and
+evicted rows are published into the read model as a delta (one indexed
+read per placed row) on every backend, the same projection the raft apply
+path runs from a committed changeset.
 
 Per task, the candidate set is then built one of two ways:
 
@@ -281,16 +504,24 @@ Selection policy:
 
 Resource fitting is enforced before node can be selected.
 
+Constraints, permit, and volume-driver support are applied once, when the
+task's candidate list is built; the per-placement passes (eligibility,
+load bounds, scoring) only re-test what changes between placements —
+remaining capacity and `distinct` coverage — and index their per-node
+state by candidate position rather than by node id. Per-placement cost is
+therefore a small constant per candidate; on large fleets `score_sample`
+(below) bounds the candidate count itself.
+
 ### Bounded candidate scoring (`score_sample`)
 
 By default every placement scores **every** feasible node — exact
 placement, at a per-placement cost that grows with fleet size. On large
 fleets, `schedulerSettings.score_sample` bounds it:
 
-```jsonnet
+```nickel
 {
-  schedulerSettings: {
-    score_sample: { min_nodes: 1024, sample: 128 },
+  schedulerSettings = {
+    score_sample = { min_nodes = 1024, sample = 128 },
   },
 }
 ```

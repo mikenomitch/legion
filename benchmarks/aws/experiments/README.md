@@ -91,11 +91,20 @@ load-bearing signal: a box that cannot keep N nodes heartbeating on
 schedule is a box whose numbers describe the simulator, not the
 scheduler.
 
-The ladder must be ascending, and the script enforces it.
-`start-sim-fleet.sh` waits on the manager's *total* node count, and nodes
-from an earlier step linger as lost rows until their deterministic names
-are re-registered — so a descending ladder would satisfy that wait
-instantly against stale rows and measure nothing.
+The ladder runs ascending, and the script sorts it. That used to be a
+workaround for a broken wait: `start-sim-fleet.sh` gated on the manager's
+*total* node count with a `>=`, and nodes from an earlier rung linger as
+lost rows until their deterministic names are re-registered, so a
+descending ladder satisfied that wait instantly against stale rows and
+"measured" a fleet it never started. The wait now asserts an exact
+census — right count, all active and available, all named from this
+fleet's slices — so a descending rung fails loudly with the census it
+saw instead. The order is still ascending because the ladder stops at the
+first saturated rung (which only means anything climbing) and because
+each rung's node names contain the previous rung's, so no reset is needed
+between them. The drill also resets the control plane before the ladder
+(`--no-reset` opts out), so it does not count a previous campaign's nodes
+as its own.
 
 Feed the result back with `run-campaign.sh --nodes-per-instance <n>`. A
 measured ceiling above 1,250 cuts instances, cost, and the spot vCPU

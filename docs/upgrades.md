@@ -77,7 +77,7 @@ but the degradation is worth knowing before you enable `enforce`:
   can briefly hold memory the preemptor was placed against.
 
 Both are reasons to **upgrade workers before enabling
-`schedulerSettings.preemption.mode: enforce`** on a mixed fleet, or to run
+`schedulerSettings.preemption.mode = "enforce"`** on a mixed fleet, or to run
 `observe` until the fleet is uniform
 ([preemption-and-eviction.md](preemption-and-eviction.md)). Preemption is
 deliberately not gated on a minimum worker protocol version: a gate would make
@@ -156,6 +156,16 @@ other. During a rolling manager upgrade the plane tolerates skew:
   typed leader-hint rejection it would have produced before forwarding
   existed. Upgrade managers first (the standard order below) and the
   window closes.
+- The liveness digest RPC (`ReportNodeLiveness`, added 2026-08-03) degrades
+  the same way and with the same remedy: an older manager answers
+  `Unimplemented`, the sender counts
+  `legion_liveness_digest_rpcs_total{outcome="unimplemented"}` and falls back
+  to forwarding each heartbeat as a replicated write — correct, just slower.
+  It clears the moment status-lane leadership lands on an upgraded manager.
+  **Downgrade all managers together**: a partial downgrade that leaves an old
+  manager leading the status lane while a new one holds the display
+  checkpoint is the one unsafe combination, and it resolves within one lost
+  window. See [node-liveness.md](node-liveness.md).
 - Payloads inside the transport are versioned by `PROTOCOL_VERSION`;
   undecodable payloads name mixed manager protocol versions in their
   error.
@@ -163,7 +173,7 @@ other. During a rolling manager upgrade the plane tolerates skew:
   ([late-binding-plan-apply.md](late-binding-plan-apply.md)) that
   pre-candidate managers cannot parse. The standard same-version upgrade
   order covers this; for a mixed-version manager fleet held longer than
-  an upgrade window, set `schedulerSettings.plan_candidates: 0` until
+  an upgrade window, set `schedulerSettings.plan_candidates = 0` until
   every peer is level — it holds format-2 emission off entirely.
 
 ## Raft persistence upgrades
@@ -173,7 +183,7 @@ other. During a rolling manager upgrade the plane tolerates skew:
 On the **first** raft start — no raft data dir yet — with an existing,
 non-empty `store.sqlite`, the existing database simply **becomes the
 initial state machine content**. No import step, no seed tooling: set
-`persistence.type: 'raft'` with `raft.bootstrap: true` on the existing
+`persistence.type = "raft"` with `raft.bootstrap = true` on the existing
 manager and start it. It elects itself leader of a single-voter cluster,
 and every subsequent mutation is a replicated raft entry applied on top of
 the adopted state. Jobs, allocations, KV, ACLs — everything the manager
@@ -229,8 +239,7 @@ restored database's raft bookkeeping (`raft_applied` and the
 
 - in `local_disk` mode the manager simply starts from the backup's state;
 - in raft mode the restored state becomes the **adopted baseline of a
-  fresh cluster** — restore onto the bootstrap node (`raft.bootstrap:
-  true`, a fresh `raft.dataDir`), start it, then join the other managers,
+  fresh cluster** — restore onto the bootstrap node (`raft.bootstrap = true`, a fresh `raft.dataDir`), start it, then join the other managers,
   which receive the restored state via snapshot install. Do not restore a
   backup into an existing cluster's member: seed a fresh cluster instead
   (the fresh-bootstrap rule above).
@@ -240,11 +249,11 @@ restored database's raft bookkeeping (`raft_applied` and the
 At first raft engine start the state DB is stamped with the cluster's
 identity (derived from the cluster secret). A later start whose identity
 does not match — typically a wiped `raft.dataDir` (cluster secret
-included) plus `bootstrap: true` minting a fresh secret — is **refused**:
+included) plus `bootstrap = true` minting a fresh secret — is **refused**:
 bootstrapping a new cluster over an existing cluster's data would
 split-brain against any surviving members. Restore the original
 `raft.dataDir`/`clusterSecret`, or set
-`persistence.raft.forceNewCluster: true` to deliberately re-stamp the DB
+`persistence.raft.forceNewCluster = true` to deliberately re-stamp the DB
 once the old cluster is fully retired. (`--restore-from` clears the stamp
 along with `raft_applied` — a restore *is* an explicit "seed a fresh
 cluster" action — so the fresh-bootstrap restore flow above needs no
@@ -254,6 +263,6 @@ override.)
 
 To leave raft mode, stop the managers, keep one node's `store.sqlite`
 (any converged replica — or a `legion state backup` file), set
-`persistence.type: 'local_disk'` on that node, and delete/ignore
+`persistence.type = "local_disk"` on that node, and delete/ignore
 `raft.dataDir`. Committed state is a plain SQLite database at every point
 in time.

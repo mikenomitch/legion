@@ -12,39 +12,57 @@ too many races was failed terminally.
 Late-binding apply changes what a plan *is*: each placement carries an
 ordered **candidate list** instead of a single node, and the final node
 choice happens at commit time. The applier binds each placement to the
-first candidate that is still free; a race costs a rank instead of a
-retry. Losing every candidate — now the rare case — requeues the eval
-instead of failing it, so acknowledged work is never silently dropped.
+best candidate that still fits, re-deriving "fits" from committed state
+inside the apply transaction; a race costs a rank instead of a retry, and
+a race that changed nothing material costs nothing at all. Losing every
+candidate — now the rare case, and one that means the pool is out of
+room — requeues the eval instead of failing it, so acknowledged work is
+never silently dropped.
 
 Both halves default on. Nothing changes in job specs; the knobs are
 manager-level `schedulerSettings`.
 
 ## The model
 
-- **"Free" means "epoch unchanged".** The scheduler samples every
-  candidate node's allocation epoch before planning. At apply, a
-  candidate whose epoch still matches provably has the same allocation
-  set the planner verified fit against — the epoch *is* the fit proof,
-  carried forward. The applier never re-derives free capacity from
-  competing allocations.
-- **What the epoch cannot prove is rechecked.** A worker
-  re-registration that *shrinks* a node's totals (or changes
-  `reservedResources` / `maxAllocations`) bumps no allocation epoch, so
-  the walk re-reads the fresh node row and re-checks that the task still
-  fits inside the node's current totals before binding to it.
-- **The walk is conservative.** A candidate whose epoch moved is skipped
-  even if it would still fit; the placement falls back to the next
-  candidate, a near-equivalent by score (see below). Skips also absorb
-  cordons/drains, node loss, constraint changes, shrunken node totals,
-  and static-port collisions that landed between snapshot and apply —
-  each costs a rank where it used to reject the plan.
+- **The bind runs in two passes.** Pass 1 (`clean`) walks the candidates
+  in rank order and binds the first whose node allocation epoch is
+  unchanged since the plan snapshot — so an uncontended placement lands
+  on the planner's first choice, exactly as it would with no contention
+  at all. Pass 2 (`revalidated`) revisits, still in rank order, only the
+  candidates pass 1 skipped, and binds the first that passes the full
+  in-transaction recheck.
+- **The epoch is a ranking hint, not the fit proof.** A moved epoch means
+  *somebody else placed something on this node*, which is not the same as
+  *this no longer fits*. Everything the epoch used to stand in for is
+  re-derived inside the apply transaction, against committed rows: the
+  fresh node row and its availability, constraints and permit, free
+  capacity rebuilt from the node's current totals (`reservedResources`
+  and `maxAllocations` included, with this plan's own binds debited as
+  it goes), static ports, and the `distinct` tracker. A candidate that
+  passes all of that fits, whoever else touched the node.
+- **Rejection means "does not fit".** A plan is rejected only when no
+  candidate survives *both* passes, and the reason names the real cause
+  ("no longer has capacity for task 41", "does not satisfy constraints")
+  rather than staleness. A rising `rejected` counter is a capacity or
+  constraint signal, not a contention signal.
+- **Skips still absorb the rest.** Cordons and drains, node loss,
+  constraint changes, shrunken node totals, and static-port collisions
+  that landed between snapshot and apply each cost a rank rather than
+  rejecting the plan.
+- **Ratifications keep the hard epoch check.** A plan carrying a
+  `target_instance` ([edge boot](edge-boot.md)) asks "bind this sandbox
+  on this node, or tell me who beat me to it". A moved epoch there may
+  mean another plan already owns the sandbox, which no capacity recheck
+  can disprove, so pass 2 does not run for it.
 - **The job-config epoch stays a hard check.** Two plans for the same job
   config still serialize all-or-nothing; candidate lists never weaken
   that.
 - **Races self-resolve.** Applies are serialized (locally, and by log
   order under raft), and each walk runs against committed state: racer 1
-  binds the shared first choice, racer 2 sees its epoch moved and slides
-  to its second candidate, and so on. No coordination, no retry.
+  binds the shared first choice; racer 2 sees its epoch moved, tries its
+  other candidates, and — if none of them is clean either — comes back to
+  the shared node and binds it too, provided it still has room. No
+  coordination, no retry.
 - **The walk is deterministic.** All randomness (tie-breaking, tail
   sampling) runs at plan time on the planning manager. Apply is a pure
   function of the submission and committed state, so raft replicas hold
@@ -69,9 +87,10 @@ Rank 0 is exactly the node the scheduler would have picked before this
 feature — uncontended plans pay zero quality tax. The remaining ranks are
 sampled score-weighted, without replacement, from the **near-tie band**
 (nodes within `band` of the best score, default 1%); if the band is
-thinner than the list, remaining slots fill straight down the ranking in
-score order. Sampled tails decorrelate concurrent planners, so a short
-list (default 8) survives bursts much larger than 8.
+thinner than the list, the remaining slots are sampled — again without
+replacement — from the best 128 nodes below the band, and kept in score
+order. Sampled tails decorrelate concurrent planners, so a short list
+(default 8) survives bursts much larger than 8.
 
 Fallback placements land inside the band by construction, so the quality
 cost of a race is bounded — and paid only when a race actually happened.
@@ -81,8 +100,6 @@ cost of a race is bounded — and paid only when a race actually happened.
 Two placements in one plan are **coupled** when independent fallbacks
 could invalidate their combined fit math:
 
-- their candidate lists overlap (two fallbacks onto the shared node could
-  oversubscribe it, or collide static ports);
 - they belong to a task with a `distinct` constraint (the constraint
   couples that task's placements even across disjoint node lists — two
   different nodes can share a zone);
@@ -90,14 +107,23 @@ could invalidate their combined fit math:
   scheduling unit).
 
 Coupling is transitive (connected components). Placements in a coupled
-component keep today's exact, all-or-nothing apply on their chosen nodes.
-Singleton components — including every single-task job, and tasks of one
-job constrained to disjoint pools — walk independently.
+component keep an exact, all-or-nothing apply on their chosen nodes.
+Everything else — including every single-task job, and every replica of a
+count-N service — walks independently.
 
-Practical consequence: a count-N service on one pool behaves exactly as
-before this feature, while the motivating workloads (many independent
-single-task jobs; heterogeneous jobs whose tasks target different pools)
-get full fallback behavior.
+**Overlapping candidate lists are not coupling.** Two placements of one
+plan may name the same node, and both may land on it: the walk debits
+each bind from that node's free pool before considering the next
+placement, and re-reads its static ports, so the second placement binds
+only if the node still fits it. (This was a coupling edge once. Because
+replicas of one service into one pool overlap by construction, it
+collapsed every such plan back to a single-node, all-or-nothing apply —
+the common case getting none of this feature's benefit.)
+
+Within one plan, a task's replicas prefer *not* to stack on a node the
+plan already bound them to — but only when falling back. Rank 0 is
+whatever the planner's own capacity ledger chose, so `bin_pack` still
+packs replicas together when that is what it decided.
 
 ## The requeue backstop
 
@@ -119,24 +145,24 @@ this feature's.
 
 Manager-level `schedulerSettings` (no job-spec surface):
 
-```jsonnet
+```nickel
 {
-  schedulerSettings: {
-    // Candidates per placement. 0 disables candidate lists entirely and
-    // restores single-node plan submissions (today's pre-candidate
-    // behavior, and the mixed-version kill switch). Shorthand:
-    plan_candidates: 8,
+  schedulerSettings = {
+    # Candidates per placement. 0 disables candidate lists entirely and
+    # restores single-node plan submissions (today's pre-candidate
+    # behavior, and the mixed-version kill switch). Shorthand:
+    plan_candidates = 8,
 
-    // Full form when the defaults need overriding:
-    // plan_candidates: {
-    //   count: 8,    // list length per placement (clamped to 0..=32)
-    //   band: 0.01,  // score band the fallback tail is sampled from
-    // },
+    # Full form when the defaults need overriding:
+    # plan_candidates = {
+    #   count = 8,    # list length per placement (clamped to 0..=32)
+    #   band = 0.01,  # score band the fallback tail is sampled from
+    # },
 
-    // Delay before a conflict-exhausted eval is retried (ms; default
-    // 1000, clamped to 100..=60000; uniform jitter of up to the base is
-    // added so requeued racers do not re-collide in lockstep).
-    plan_conflict_requeue_delay_ms: 1000,
+    # Delay before a conflict-exhausted eval is retried (ms; default
+    # 1000, clamped to 100..=60000; uniform jitter of up to the base is
+    # added so requeued racers do not re-collide in lockstep).
+    plan_conflict_requeue_delay_ms = 1000,
   },
 }
 ```
@@ -158,16 +184,21 @@ candidates on, those retries are rarely spent.
 - **Metrics** ([metrics.md](metrics.md)):
   - `legion_scheduler_plan_candidate_rank` — histogram of the rank each
     placement bound at;
+  - `legion_scheduler_plan_bind_pass{pass}` — `clean` (the candidate's
+    node epoch was untouched) vs `revalidated` (its epoch had moved and
+    the in-transaction recheck admitted it anyway). A rising
+    `revalidated` share is contention being absorbed;
   - `legion_plan_apply_total{outcome}` — `applied` (all first-choice),
     `fallback` (applied, at least one placement slid down its list), and
     `rejected` are mutually exclusive, so contention absorbed vs. plans
     lost is visible at a glance;
   - `legion_eval_conflict_requeues_total` — requeue-backstop trips.
 
-Reading the signals: sustained `fallback` outcomes mean races are being
-absorbed (working as designed); sustained `rejected` on a pool that also
-shows deep candidate ranks means the pool is effectively full — add
-capacity rather than tuning the scheduler.
+Reading the signals: sustained `fallback` outcomes and a healthy
+`revalidated` share mean races are being absorbed (working as designed);
+sustained `rejected` means placements no longer fit anywhere they were
+allowed to go — add capacity, or look at the constraints, rather than
+tuning the scheduler.
 
 ## Rollout and version compatibility
 
@@ -176,12 +207,13 @@ Candidate-carrying plans are stored as a new submission format
 forever, so upgrading is seamless — but an *older* manager cannot parse
 format-2 rows. Under raft, follow the standard same-version upgrade order
 ([upgrades.md](upgrades.md)). If you must run a mixed-version manager
-fleet beyond an upgrade window, set `plan_candidates: 0` until the fleet
+fleet beyond an upgrade window, set `plan_candidates = 0` until the fleet
 is level: it holds format-2 emission off entirely.
 
-`plan_candidates: 0` also restores the previous placement behavior
-byte-for-byte (single-node submissions, all-or-nothing apply). The
-requeue backstop is independent of the setting and always on.
+`plan_candidates = 0` also restores single-node submissions. It does not
+turn the two-pass bind off: a single-candidate plan whose node was
+touched is still revalidated and bound if it still fits. The requeue
+backstop is independent of the setting and always on.
 
 ## Known limitations
 
@@ -190,17 +222,21 @@ requeue backstop is independent of the setting and always on.
   backstop). When a replan finds *no* capacity at all, the eval still
   fails terminally with a placement error — capacity exhaustion is not a
   conflict.
-- **Coupled components don't fall back.** A count-N service on one pool
-  gains nothing yet; striping disjoint lists across identical replicas
-  and per-component partial commit are deliberate backlog items in the
-  design plan.
+- **Coupled components don't fall back.** A task with a `distinct`
+  constraint, and a multi-task co-placement group, still apply
+  all-or-nothing on their chosen nodes. Striping disjoint lists across
+  identical replicas and per-component partial commit are deliberate
+  backlog items in the design plan.
 - **Policy plugins.** Third-party scheduling-policy plugins select a
   single node and expose no ranking, so their placements carry singleton
   lists (exact-CAS semantics). The built-in `bin_pack` and `spread`
   policies build full lists in both Fresh and Reschedule modes.
-- **Conservative skips spread bursts.** Under contention, epoch skips
-  spread allocations across the near-tie band even where `bin_pack`
-  would happily have stacked them; capacity-aware skipping is a named
+- **`spread` loosens slightly under contention.** Pass 2 can bind a node
+  that received an allocation moments earlier, where the old
+  epoch-skipping walk would have moved on to an emptier one. The effect
+  is bounded (pass 2 only runs where pass 1 bound nothing, and walks the
+  same score-ordered list), and it is the same mechanism that makes
+  `bin_pack` pack *better* than it used to. Policy-aware apply is a named
   backlog item, gated on fallback-rank metrics.
 - **A fallback discards speculative staging.** A task that opted into
   [edge boot](edge-boot.md)'s `speculativeStart` has its payload

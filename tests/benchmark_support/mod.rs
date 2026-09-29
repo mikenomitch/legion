@@ -265,6 +265,7 @@ pub fn insert_profile_node(store: &Store, profile: &NodeProfile, id: &str) -> an
         dynamic_attrs: json!({}).to_string(),
         health_checks: "{}".into(),
         last_heartbeat: "2023-01-01 00:00:00 +00:00:00".into(),
+        heartbeat_source: String::new(),
     };
     store.insert_node(node)?;
     Ok(())
@@ -281,7 +282,7 @@ pub fn insert_fleet(store: &Store, scenario: &SchedulerScenario) -> anyhow::Resu
 
 pub fn submit_jobs(store: &Store, scenario: &SchedulerScenario) -> anyhow::Result<Vec<String>> {
     let submission = Submission {
-        path: "benchmark.jsonnet".into(),
+        path: "benchmark.ncl".into(),
         content: "{}".into(),
         is_primary: true,
     };

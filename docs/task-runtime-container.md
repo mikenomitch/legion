@@ -145,12 +145,12 @@ being scheduling bookkeeping alone. Both ride the allocation payload
 Stopping a container delivers a signal, waits, and only then kills. Both
 halves are declarable per task, next to `resources`:
 
-```jsonnet
-task: {
-  name: 'db',
-  runtime: 'container',
-  config: { image: 'postgres:16', command: ['postgres'] },
-  stop: { signal: 'SIGINT', killAfter: '90s' },   // defaults: SIGTERM, 30s
+```nickel
+task = {
+  name = "db",
+  runtime = "container",
+  config = { image = "postgres:16", command = ["postgres"] },
+  stop = { signal = "SIGINT", killAfter = "90s" },   # defaults: SIGTERM, 30s
 }
 ```
 
@@ -195,7 +195,7 @@ runtime CLI (`container kill --signal` on macOS, `<runtime> kill` on Linux) —
 would leave the workload running unsignaled.
 
 That is what lets a container task declare an identity with
-`changeMode: 'signal'`: on token rotation the worker rewrites the token file
+`changeMode = "signal"`: on token rotation the worker rewrites the token file
 inside the mounted task directory and signals the container, and the workload
 re-reads it with no restart. See
 [docs/workload-identity.md](workload-identity.md).
@@ -235,14 +235,14 @@ reachable from inside the container, so a destination outside the mount is
 rejected at submit rather than staged where the workload could never read it.
 Relative paths resolve against the mount:
 
-```jsonnet
-kvInjections: { files: [
-  { path: 'config/app.toml', file: { template: '...' } },  // -> /legion/task/config/app.toml
+```nickel
+kvInjections = { files = [
+  { path = "config/app.toml", file = { template = "..." } },  # -> /legion/task/config/app.toml
 ] },
-identities: [{
-  name: 'api',
-  file: { path: '/legion/task/identity/token' },           // absolute form, in range
-  changeMode: 'signal', changeSignal: 'SIGHUP',
+identities = [{
+  name = "api",
+  file = { path = "/legion/task/identity/token" },           # absolute form, in range
+  changeMode = "signal", changeSignal = "SIGHUP",
 }],
 ```
 
@@ -269,7 +269,7 @@ capability set are unchanged.
 images (see [docs/artifacts.md](artifacts.md)):
 
 - **Image desugaring (behind a cluster flag):** when the manager config sets
-  `artifacts.containerImageDesugar: true`, the `image` field is desugared at
+  `artifacts.containerImageDesugar = true`, the `image` field is desugared at
   admission into an implicit `oci://` artifact named `image` (Docker Hub
   shorthand expands, e.g. `alpine:latest` ->
   `oci://docker.io/library/alpine:latest`). The worker pulls it through the
@@ -298,6 +298,24 @@ images (see [docs/artifacts.md](artifacts.md)):
   `${artifact.<name>}` carry the in-container path. See
   [The task directory](#the-task-directory-legiontask).
 
+## Networking: `host` and `gated`
+
+By default a `container` task shares the host's network (`network.mode =
+"host"`): declared ports are host ports, `connect.upstreams` are loopback
+ports the node datapath owns, and egress policy applies to traffic that goes
+through those upstreams and to names resolved through the allocation's
+resolver (`LEGION_DNS`) — cooperatively.
+
+With `network.mode = "gated"` (Linux) the worker creates an empty network
+namespace for the allocation before it starts and the container joins it by path through an OCI `network` namespace entry. The namespace
+holds loopback and the datapath's listeners only — upstream ports, VIPs,
+the resolver, and an egress proxy at `127.0.0.1:1080` exported as
+`HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` — so egress policy is
+unbypassable: a tool that ignores the proxy has no route. The full model,
+the fail-closed rules, and the limits (no raw UDP, no ICMP, no inbound to
+undeclared ports, Linux only) are in
+[Network Handlers](network-handlers.md#gated-mode).
+
 ## Capability Summary
 
 | Capability | Supported |
@@ -315,13 +333,13 @@ images (see [docs/artifacts.md](artifacts.md)):
 | Exec / interactive PTY | ✅ / ✅ on both Apple `container` and the Linux OCI runtimes (sandboxed) — see [docs/exec-and-actions.md](exec-and-actions.md) |
 
 Container exec runs inside the container's namespaces, so it is sandboxed
-(`host: false`): an `exec:write` rule without `host` suffices.
+(`host = false`): an `exec:write` rule without `host` suffices.
 
 ## Examples
 
-- [`configs/jobs/mac-container.jsonnet`](../configs/jobs/mac-container.jsonnet)
+- [`configs/jobs/mac-container.ncl`](../configs/jobs/mac-container.ncl)
   — batch task: env, declared resources sizing the guest.
-- [`configs/jobs/mac-container-service.jsonnet`](../configs/jobs/mac-container-service.jsonnet)
+- [`configs/jobs/mac-container-service.ncl`](../configs/jobs/mac-container-service.ncl)
   — long-running service: dynamic port publishing, health checks, service
   discovery, exec, and declared actions.
 

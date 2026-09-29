@@ -5,8 +5,6 @@ use crate::structs::ManagerConfig;
 use crate::worker::daemon::run_worker;
 use crate::worker::simulate::{run_simulated_workers, SimulateOptions};
 
-use jsonnet::JsonnetVm;
-
 pub fn config() -> Command {
     let manager_cmd = Command::new("manager")
         .about("Start a manager node")
@@ -177,12 +175,8 @@ pub async fn handle(sub_matches: &ArgMatches) -> R<()> {
 
 #[instrument(skip_all)]
 fn parse_config(config_path: &str) -> R<ManagerConfig> {
-    // Pluginify jsonnet
-    let mut vm = JsonnetVm::new();
-    let rendered = vm
-        .evaluate_file(config_path)
-        .map_err(|e| anyhow!("failed to evaluate config {config_path}: {e}"))?
-        .to_string();
+    let rendered = crate::config_lang::eval_file(config_path)
+        .with_context(|| format!("failed to evaluate manager config {config_path}"))?;
 
     let config: ManagerConfig = serde_json::from_str(&rendered)
         .with_context(|| format!("failed to deserialize manager config from {config_path}"))?;

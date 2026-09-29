@@ -50,7 +50,7 @@ pub fn allocation_status_is_terminal(status: &str) -> bool {
 }
 
 // === Manager ===
-pub const DEF_CONFIG_PATH: &str = "./configs/manager.jsonnet";
+pub const DEF_CONFIG_PATH: &str = "./configs/manager.ncl";
 
 // Manager config file
 pub const DEF_WORKER_CONFIG_PATH: &str = "./configs/workers/";
@@ -63,13 +63,77 @@ pub const DEF_MANAGER_ADDRESS: &str = "http://127.0.0.1:4747";
 pub const DEF_WORKER_CHECK_SEC: u64 = 2;
 pub const DEF_SCHEDULING_POLICY: &str = "bin_pack";
 pub const DEF_EVAL_PRIORITY: i64 = 50;
+// How far below the cluster's default eval priority a `node_lost_reschedule`
+// eval is enqueued. The eval queue is strict `priority DESC, id ASC`, so at
+// EQUAL priority a mass node-loss event's recovery backlog runs strictly
+// ahead of every newer submission (measured on the 2026-08-04 AWS rig: ~3,000
+// lost nodes slowed job submission to ~6s per job behind 2,752 queued
+// reschedules). Recovery is bulk background work that the monitor re-drives
+// every tick; a submission is someone waiting. One band below the default
+// lets submissions overtake the backlog while reschedules still outrank
+// anything an operator explicitly deprioritized.
+pub const NODE_LOST_RESCHEDULE_PRIORITY_DROP: i64 = 10;
 pub const DEF_ROLLOUT_RETENTION_DAYS: u64 = 30;
 // Debounce window (ms) for KV-driven job reconciliation: rapid puts/deletes
 // to watched keys are coalesced and applied once per quiet window. 0 applies
 // every KV write synchronously (see docs/kv-store.md).
 pub const DEF_KV_DEBOUNCE_MS: u64 = 500;
-// Amount of time since last heartbeat before a node is considered lost
+// Amount of time since last heartbeat before a node is considered lost.
+//
+// No longer a global cutoff: a node's window is `missedBeatsBeforeLost x that
+// node's heartbeat interval` (heartbeat-cadence plan §6.4), recorded per node
+// in `node_health.lost_after_seconds`. This constant is what that arithmetic
+// reproduces at the defaults (5 x 2s) and the fallback for a row written
+// before the column existed. See docs/heartbeat-cadence-and-scale.md.
 pub const DEF_LOST_NODE_AT_SEC: i64 = 10;
+
+// === Heartbeat cadence and node liveness ===
+// (docs/heartbeat-cadence-and-scale.md, docs/node-liveness.md)
+/// Missed heartbeats before a node is marked lost. The lost window is ALWAYS
+/// this times the node's own heartbeat interval, so `5 x 2s` reproduces the
+/// historical fixed 10s exactly.
+pub const DEF_MISSED_BEATS_BEFORE_LOST: u32 = 5;
+/// Floor on a manager-served heartbeat interval, whatever the fleet size.
+pub const DEF_HEARTBEAT_MIN_INTERVAL_SEC: u64 = 2;
+/// Ceiling on a manager-served interval: past this the manager stops backing
+/// off and warns instead, because the answer is more control plane.
+pub const DEF_HEARTBEAT_MAX_INTERVAL_SEC: u64 = 120;
+/// Headroom factor in the sizing formula `heartbeatSeconds >= H x N / R`.
+/// 2 means "run at half the measured ceiling so a burst is not an outage".
+pub const DEF_HEARTBEAT_HEADROOM: f64 = 2.0;
+/// Upper clamp on a worker type's `heartbeatSeconds`. Widened from the
+/// historical 30 once the lost window began moving with the cadence.
+pub const MAX_WORKER_HEARTBEAT_SECONDS: u32 = 300;
+/// Freshness ratio below which the manager warns that the fleet is not
+/// sustaining its cadence (`legion_heartbeat_freshness_ratio`).
+pub const HEARTBEAT_FRESHNESS_WARN_RATIO: f64 = 0.5;
+/// Consecutive sub-threshold ticks before the freshness warning fires, and
+/// how often it may repeat. Debounced so a single slow tick is not a page.
+pub const HEARTBEAT_FRESHNESS_WARN_TICKS: u32 = 3;
+pub const HEARTBEAT_FRESHNESS_WARN_INTERVAL_SEC: u64 = 60;
+/// Fleets smaller than this have too few nodes for the freshness ratio (and
+/// the mass-disruption circuit breaker) to mean anything.
+pub const HEARTBEAT_FRESHNESS_MIN_FLEET: usize = 20;
+/// Fraction of the active fleet that, if it would be marked lost in ONE tick,
+/// means the control plane broke rather than the fleet. Mark none, log error.
+pub const LIVENESS_MASS_DISRUPTION_FRACTION: f64 = 0.5;
+/// After acquiring status-lane leadership (or starting the process), mark
+/// nothing lost for this long: a new leader inherits no liveness state and
+/// rebuilds it from incoming heartbeats (Nomad's `failover_heartbeat_ttl`).
+pub const DEF_LIVENESS_FAILOVER_GRACE_SEC: u64 = 60;
+/// How often a manager that does NOT lead the status lane reports the nodes
+/// it heard from to the leader. One RPC per manager per interval.
+pub const DEF_LIVENESS_DIGEST_INTERVAL_SEC: u64 = 1;
+/// How long the leader keeps trusting a silent peer manager's last digest.
+/// Nodes that peer last claimed are not eligible to be marked lost inside it.
+pub const DEF_LIVENESS_PEER_DIGEST_GRACE_SEC: u64 = 30;
+/// How often the status-lane leader replicates a batched heartbeat
+/// checkpoint so every manager can show an approximate last-heartbeat time.
+/// Display only — a checkpoint is never read back as liveness. 0 disables.
+pub const DEF_LIVENESS_CHECKPOINT_INTERVAL_SEC: u64 = 30;
+/// Smallest non-zero `checkpointInterval`; anything faster re-creates the
+/// per-heartbeat commit load the liveness plan exists to remove.
+pub const MIN_LIVENESS_CHECKPOINT_INTERVAL_SEC: u64 = 5;
 // Cluster region stamped into workload-identity claims/sub. Legion has no
 // multi-region concept yet; "auto" matches the documented default subject
 // shape (see docs/workload-identity.md).

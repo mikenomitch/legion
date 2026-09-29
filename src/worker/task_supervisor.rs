@@ -74,6 +74,7 @@ pub async fn start_task_supervisor(task_manager: Arc<Mutex<WorkerTaskManager>>) 
             // window is not a supervised exit to restart, and clearing it
             // here is what releases the node for allocations the reconcile
             // is holding back.
+            manager.reap_draining();
             manager.reap_terminating();
             manager.poll_task_exits()
         };

@@ -559,6 +559,7 @@ fn test_node_msg(id: &str) -> NodeMsg {
         pool: "default".into(),
         availability: "available".into(),
         last_heartbeat: "2023-01-01T00:00:00Z".into(),
+        heartbeat_source: String::new(),
         config_attrs: json!({ "maxAllocations": 10, "resources": {} }),
         fingerprint_attrs: json!({
             "memory_total": "4294967296",
@@ -600,7 +601,7 @@ fn test_job_with_volume(name: &str, count: u32) -> JobConfig {
 
 fn submission(name: &str, content: &str) -> Submission {
     Submission {
-        path: format!("{name}.jsonnet"),
+        path: format!("{name}.ncl"),
         content: content.to_string(),
         is_primary: true,
     }
@@ -1866,6 +1867,200 @@ fn worker_heartbeats_forward_across_a_status_lane_split() -> R<()> {
         "replicas converge after the forwarded writes",
         || hashes_converged(&all),
     );
+    Ok(())
+}
+
+/// Steady-state worker liveness reaches the status-lane leader by DIGEST,
+/// under a standing lane split, without a single replicated write
+/// (liveness-off-the-raft-path plan §6.3, phase 4).
+///
+/// This is the test the whole design exists for: the worker dials mgr-a,
+/// mgr-a leads nothing, and mgr-b — which owns node status — nonetheless
+/// knows the node is alive, at the cost of ONE manager-plane RPC rather than
+/// one raft commit per beat.
+#[test]
+fn worker_liveness_reaches_the_status_leader_by_digest() -> R<()> {
+    let _serial = cluster_gate();
+    init_trace();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()?;
+    let dir = tempfile::tempdir()?;
+    let (a, b, c) = start_cluster(&rt, dir.path(), 10_000)?;
+    let all = [&a, &b, &c];
+    wait_for_co_location(
+        &all,
+        Duration::from_secs(90),
+        "bring-up leaves one manager leading all three lanes",
+    );
+
+    // An ACTIVE node — the steady-state case. (A node in any other status
+    // makes its next heartbeat a transition, which is still replicated by
+    // design and is what `worker_heartbeats_forward_across_a_status_lane_split`
+    // covers.)
+    let mut node = test_node_msg("digest-node");
+    node.status = "active".into();
+    a.store().insert_node(node)?;
+
+    set_convergence(&all, false)?;
+    move_lane_leadership(&b, "status", Duration::from_secs(60));
+    wait_for(
+        Duration::from_secs(60),
+        "mgr-b leads the status lane while mgr-a keeps control",
+        || b.leads_lane("status") && a.leads_lane("control"),
+    );
+    // mgr-b owns liveness now, so it seeds its table the way the status
+    // checker does on acquisition.
+    b.store()
+        .liveness()
+        .become_responsible(&["digest-node".into()]);
+
+    // The beat lands on mgr-a, which leads nothing. It costs NO commit: the
+    // persisted clock is untouched and the id is queued for the digest.
+    a.store().update_node_heartbeat("digest-node".to_string())?;
+    assert_eq!(
+        a.store().get_node("digest-node")?.last_heartbeat,
+        "2023-01-01T00:00:00Z",
+        "a steady-state heartbeat must not reach the raft path"
+    );
+
+    // One RPC carries every id mgr-a heard from to the status-lane leader.
+    let seen = a.store().liveness().drain_pending_digest();
+    assert_eq!(seen, vec!["digest-node".to_string()]);
+    let outcome = rt.block_on(a.store().report_node_liveness("mgr-a", seen));
+    assert_eq!(
+        outcome,
+        legion::storage::liveness::DigestOutcome::Accepted,
+        "the status-lane leader must accept a peer's liveness digest"
+    );
+    assert!(
+        b.store().liveness().last_beat("digest-node").is_some(),
+        "the leader must know a node it never heard from directly"
+    );
+
+    // And the leader's periodic checkpoint is what makes the timestamp
+    // readable on every manager — display state, two commits a minute.
+    let beats: Vec<(String, i64)> = b
+        .store()
+        .liveness()
+        .snapshot()
+        .into_iter()
+        .map(|(id, beat)| (id, beat.unix))
+        .collect();
+    b.store().checkpoint_node_heartbeats(&beats)?;
+    wait_for(
+        Duration::from_secs(60),
+        "the liveness checkpoint replicates to every manager",
+        || {
+            [&a, &b, &c].iter().all(|node| {
+                node.store()
+                    .get_node("digest-node")
+                    .map(|node| node.last_heartbeat != "2023-01-01T00:00:00Z")
+                    .unwrap_or(false)
+            })
+        },
+    );
+
+    set_convergence(&all, true)?;
+    wait_for(
+        Duration::from_secs(120),
+        "replicas converge after the checkpoint",
+        || hashes_converged(&all),
+    );
+    Ok(())
+}
+
+/// A status-lane election marks ZERO nodes lost, on a manager that has been
+/// up since before the fleet's persisted heartbeats went stale
+/// (liveness-off-the-raft-path plan §12, phase 2 acceptance).
+///
+/// Today this manager would mark the whole fleet lost on its first tick: the
+/// old grace was keyed on PROCESS uptime, and a manager that acquires
+/// status-lane leadership mid-life has plenty of that.
+#[test]
+fn status_lane_election_marks_no_nodes_lost() -> R<()> {
+    use legion::manager::cadence::{decide_lost_nodes, LossContext};
+    use legion::manager::daemon::liveness_snapshot;
+
+    let _serial = cluster_gate();
+    init_trace();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()?;
+    let dir = tempfile::tempdir()?;
+    let (a, b, c) = start_cluster(&rt, dir.path(), 10_000)?;
+    let all = [&a, &b, &c];
+    wait_for_co_location(
+        &all,
+        Duration::from_secs(90),
+        "bring-up leaves one manager leading all three lanes",
+    );
+
+    // A fleet whose persisted heartbeats are stale by construction — which
+    // is what EVERY fleet's persisted heartbeats look like to a manager that
+    // has just taken over.
+    for index in 0..25 {
+        let mut node = test_node_msg(&format!("fleet-{index}"));
+        node.status = "active".into();
+        a.store().insert_node(node)?;
+    }
+
+    set_convergence(&all, false)?;
+    move_lane_leadership(&b, "status", Duration::from_secs(60));
+    wait_for(
+        Duration::from_secs(60),
+        "mgr-b leads the status lane",
+        || b.leads_lane("status"),
+    );
+
+    // Acquisition seeds every active node at `now` rather than at its
+    // persisted timestamp, and the grace clock starts HERE — not at process
+    // start, which for mgr-b was long ago.
+    let active: Vec<String> = b
+        .store()
+        .active_node_liveness_rows()?
+        .into_iter()
+        .map(|row| row.id)
+        .collect();
+    assert_eq!(active.len(), 25);
+    b.store().liveness().become_responsible(&active);
+
+    let snapshot = liveness_snapshot(b.store(), Instant::now())?;
+    assert_eq!(snapshot.len(), 25);
+    // Inside the grace, and — because of the seed — outside it too.
+    for responsible_for in [Duration::from_secs(1), Duration::from_secs(3600)] {
+        let decision = decide_lost_nodes(
+            &snapshot,
+            &LossContext {
+                responsible_for,
+                ..Default::default()
+            },
+        );
+        assert!(
+            decision.lost.is_empty(),
+            "an election must not mark a healthy fleet lost (responsible_for={responsible_for:?})"
+        );
+    }
+
+    // The negative control: without it, "never mark anything lost" would
+    // satisfy every assertion above. A genuinely silent node still goes.
+    let long_ago = Instant::now() - Duration::from_secs(3600);
+    b.store()
+        .liveness()
+        .observe_at("fleet-0", long_ago, 1_600_000_000);
+    let snapshot = liveness_snapshot(b.store(), Instant::now())?;
+    let decision = decide_lost_nodes(
+        &snapshot,
+        &LossContext {
+            responsible_for: Duration::from_secs(3600),
+            ..Default::default()
+        },
+    );
+    assert_eq!(decision.lost, vec!["fleet-0".to_string()]);
+
+    set_convergence(&all, true)?;
     Ok(())
 }
 

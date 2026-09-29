@@ -16,6 +16,13 @@ pub struct Node {
     pub pool: String,
     pub availability: String,
     pub last_heartbeat: String,
+    /// Where `last_heartbeat` came from on the manager that answered:
+    /// `"live"` (this manager owns liveness and saw the beat),
+    /// `"checkpoint"` (a replicated checkpoint, accurate to within
+    /// `liveness.checkpointInterval`), or empty (never observed, or
+    /// checkpoints disabled). See docs/node-liveness.md.
+    #[serde(default)]
+    pub heartbeat_source: String,
     pub config_attrs: Value,
     pub fingerprint_attrs: Value,
     pub dynamic_attrs: Value,
@@ -35,6 +42,7 @@ impl From<Node> for NodeMsg {
             pool: node.pool,
             availability: node.availability,
             last_heartbeat: node.last_heartbeat,
+            heartbeat_source: node.heartbeat_source,
             config_attrs: config_str,
             fingerprint_attrs: fp_str,
             dynamic_attrs: da_str,
@@ -56,6 +64,7 @@ impl From<NodeMsg> for Node {
             pool: node.pool,
             availability: node.availability,
             last_heartbeat: node.last_heartbeat,
+            heartbeat_source: node.heartbeat_source,
             config_attrs: config_map,
             fingerprint_attrs: fp_map,
             dynamic_attrs: da_map,
@@ -124,17 +133,26 @@ pub struct NodePrint {
     pub status: String,
     pub pool: String,
     pub availability: String,
+    /// Suffixed `(checkpoint)` on a manager that does not own liveness, so an
+    /// operator reading the column knows the clock is approximate and the
+    /// STATUS beside it is not. See docs/node-liveness.md.
     pub last_heartbeat: String,
 }
 
 impl From<Node> for NodePrint {
     fn from(node: Node) -> Self {
+        let last_heartbeat = match node.heartbeat_source.as_str() {
+            "checkpoint" if !node.last_heartbeat.is_empty() => {
+                format!("{} (checkpoint)", node.last_heartbeat)
+            }
+            _ => node.last_heartbeat,
+        };
         NodePrint {
             id: node.id,
             status: node.status,
             pool: node.pool,
             availability: node.availability,
-            last_heartbeat: node.last_heartbeat,
+            last_heartbeat,
         }
     }
 }

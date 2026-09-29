@@ -1,0 +1,483 @@
+# AWS phase 4 — the rig was measuring itself
+
+**Date:** 2026-08-05. **Branch:** `aws-day-3`. **Status:** the throughput
+numbers from phases 2 and 3 are retracted; the latency and CPU numbers stand.
+
+## The finding
+
+Every `web_fleet` throughput number this project has produced is the benchmark
+driver's submission ceiling, not Legion's scheduling rate.
+
+The driver submits one `legion job run` **CLI process per job** from a thread
+pool of 4, on an `m7i.large` — 2 vCPU, shared with Prometheus and Grafana. That
+capped submission at ~36 jobs/sec. When the scheduler is faster than that, the
+cell reports the driver's rate and nothing says so.
+
+| cell | jobs | submit span | submit rate | × allocs/job | reported throughput |
+| --- | --- | --- | --- | --- | --- |
+| A | 4,167 | 114.97 s | 36.24/s | 6.0 → 217 | **203.19** |
+| B | 4,167 | 136.37 s | 30.56/s | 6.0 → 183 | **164.72** |
+
+The confirming detail is the drain: the last allocation landed **0.169 s** after
+the last submit in cell A and **0.097 s** in cell B. Legion was never behind, at
+any point, in either cell. The control plane sat at **8% CPU of four cores**
+with an **empty eval queue**.
+
+`25,002 / 4,167 = 6.0` allocations per job exactly, and `36.24 × 6 ≈ 217`. The
+reported throughput is arithmetically the submission rate.
+
+### What this explains
+
+Every anomaly phases 2–4 chased, at once:
+
+- 8% CPU on the control plane, and no thread over 40%.
+- `eval_queue_depth` at 0 for the 16-thread cells — the workers were starved.
+- Throughput *falling* from 4 → 16 eval threads (more workers dividing a fixed
+  arrival rate, each paying a wasted claim).
+- The group-commit coalescer never batching (1.07 at 4 threads, 1.17 at 16):
+  submitters cannot overlap when work arrives one job at a time.
+- The wake-herd fix showing no throughput gain — it cannot, on a starved rig.
+
+### What survives
+
+The **2.53× is not entirely false, but its ratio is meaningless.** The 80.35
+baseline *was* a real scheduler measurement: eval queue depth peaked at 576 and
+p99 placement latency was 103.4 s, so the scheduler was genuinely behind. The
+after number was a measurement of the load generator. What the phase-3 work
+supports:
+
+- p99 placement latency 103.4 s → **17.8 s**, p50 49.4 s → 11.9 s.
+- 25,002 / 25,002 placed, 0 rejections.
+- The scheduler stopped being the bottleneck at this arrival rate.
+
+**Legion's actual maximum throughput is unmeasured.** 203.19 alloc/sec is a
+floor, not a ceiling.
+
+## Why it went unnoticed for three sessions
+
+The knowledge was in the repo the whole time. `driver.py`'s own submit loop
+carries the warning:
+
+> Submission has to outpace placement or the driver, not the system under
+> test, sets the measured rate.
+
+and `dense_fleet.json`, written earlier in this same session, says:
+
+> the driver — a 2-vCPU loadgen box spawning one CLI process per submit —
+> reaches its ceiling long before the control plane reaches its own.
+
+Both were written and then not applied to the numbers coming out the other end.
+The rig had no check that turned that knowledge into a failure, so it reported
+driver-bound cells as results, exactly as it once
+[reported cells that measured nothing](aws-phase3-findings.md).
+
+## Fixes
+
+**Detection (`c0d9a44`).** The driver compares the drain after the last submit
+against the measured window and emits
+`submission{jobs, span_secs, rate_per_sec, drain_secs, driver_bound}`, warning
+loudly when it is the constraint. Validated against both archived cells: both
+flag `driver_bound: true`.
+
+**Ceiling.** `loadgen_type` `m7i.large` → `m7i.4xlarge` (16 vCPU);
+`--submit-concurrency` 4 → 32, settable per cell through `run-campaign.sh`.
+
+**Cost per submit (`17564bd`).** The rig emitted one `.ncl` per Legion job, so
+every submit evaluated Nickel inside the CLI for a spec that never changes.
+Measured, 20 runs of `job validate` on one spec: **39 ms for `.ncl` against
+10.75 ms for `.json`** — rendering was ~28 ms of every submit. It was also
+unfair, since the Nomad and K8s adapters already submit pre-rendered artifacts,
+so only Legion paid rendering inside the measured path. Now JSON by default,
+with `--jobspec-format ncl` keeping the path a real user types.
+
+## Scheduler work done anyway, and what is known about it
+
+Both are correct on their merits and both are **unmeasured on AWS**.
+
+**Wake herd (`8019227`).** `project_changeset_side_effects` called
+`notify_waiters()` on *any* `eval` row change, waking every parked worker. Each
+answers with `claim_eval`, a scheduler-lane quorum round whether or not it finds
+work, and every eval crosses that path three times (enqueued, claimed,
+completed). Measured cost: **16,678 scheduler-lane raft ops at 4 threads against
+47,096 at 16**, for identical work. Now wakes one worker per newly-claimable
+eval. A capture-level test pins it at 3 wakes before, 1 after.
+
+**Async status projection (`e357f58`).** Takes the `task_status` projection off
+the plan-apply path.
+
+## Instrumentation added
+
+- `legion_eval_claim_total{outcome}` — an empty claim costs a full quorum round
+  and was invisible. Its absence is what hid the herd.
+- `legion_raft_ops_total` gained an **`op`** label. `collect.sh` had been
+  grouping `by (lane, op)` against a metric with no such label and silently
+  getting lane totals back, which is why the status lane was unattributable.
+
+## The first unstarved measurement
+
+Cell G, 2026-08-05 14:05, `web_fleet` 5,000 nodes, `evalThreads=4`, on a
+16-vCPU loadgen with concurrency 32 and pre-rendered JSON:
+
+| metric | value |
+| --- | --- |
+| submission rate | **89.62 jobs/sec** (was 36.24) |
+| drain after last submit | **101.05 s** |
+| `driver_bound` | **false** |
+| throughput | **177.27 alloc/sec** (~29.5 evals/sec) |
+| p50 / p99 placement | 63.4 s / 100.8 s |
+| placed | 25,002 / 25,002 |
+
+Submission demands 538 alloc/sec and Legion delivers 177, so it is ~3x behind
+with a 101-second backlog. This is real saturation.
+
+Note the driver-bound figure (203.19) was *higher* than the true one. A slow
+driver paces work so the scheduler never falls behind, which flatters both
+throughput and latency.
+
+## What the raft lanes are actually doing
+
+Measured live during cell G with the new `op` label — the first time any of
+this was attributable:
+
+| lane | op | rate |
+| --- | --- | --- |
+| status | **`update_node_health_checks`** | **178.7/s** |
+| scheduler | `complete_and_claim_next` | 26.6/s |
+| status | `update_task_statuses_for_allocations` | 25.3/s |
+| scheduler | `submit_and_apply_plan_with_candidates` | 25.3/s |
+| status | `seed_task_statuses` | 21.1/s |
+| control | `handle_job_submit` | 21.1/s |
+| control | `idempotency_record` | 21.1/s |
+| control | `replace_job_kv_references` | 21.1/s |
+| control | `clear_job_failed_status` | 21.1/s |
+| control | `clear_job_stopped_status` | 21.1/s |
+| scheduler | `enqueue_eval_after_delay` | 21.1/s |
+| scheduler | `sync_task_volume_claims` | 21.1/s |
+
+Two findings, and the first corrects a guess made earlier in this document's
+own history:
+
+1. **The status lane is not allocation state transitions.**
+   `update_task_statuses_for_allocations` is already batched at one round per
+   eval (25.3/s), not one per allocation. The dominator is
+   `update_node_health_checks` at **178.7/s** — 7x the eval rate — and it
+   scales with FLEET SIZE, not workload. Heartbeats were moved off raft to the
+   local liveness tracker; health checks were not.
+
+2. **Job submit costs five separate control-lane quorum rounds.**
+   `handle_job_submit`, `idempotency_record`, `replace_job_kv_references`,
+   `clear_job_failed_status` and `clear_job_stopped_status` all run at exactly
+   the submission rate. They are one logical operation and are candidates to
+   fuse into one round, the same way `complete_and_claim_next` fused the eval
+   queue's pair.
+
+## The wake herd, measured
+
+Cells G and H are the same binary on the same rig, differing only in
+`evalThreads`, and both report `driver_bound: false`:
+
+| cell | evalThreads | throughput | p50 | p99 | submit rate | drain |
+| --- | --- | --- | --- | --- | --- | --- |
+| G | 4 | 177.27 alloc/s | 63.4 s | 100.8 s | 89.62/s | 101.05 s |
+| **H** | **16** | **219.25 alloc/s** | 54.1 s | 67.3 s | 69.21/s | 56.97 s |
+
+**+23.7% throughput from concurrency, and p99 down 33%.** Before the fix the
+same comparison ran the other way (203.19 at 4 threads against 164.72 at 16).
+The sign of the relationship flipped, which is the result the fix predicted and
+the one a starved rig could never have shown.
+
+`legion_eval_claim_total` during cell H: **0.3 empty claims/sec** on the
+scheduler lane, against a herd that used to put 30,000 extra ops on that lane
+per cell.
+
+## What the raft ops cost, by outcome
+
+The op label alone is misleading — `Store::replicated` skips the raft entry
+entirely when a mutation's changeset is empty, so a high op rate can be free.
+Split by outcome, during cell H:
+
+| lane | op | outcome | rate |
+| --- | --- | --- | --- |
+| status | `update_node_health_checks` | **empty** | 133.9/s |
+| scheduler | `complete_and_claim_next` | applied | 44/s |
+| status | `update_task_statuses_for_allocations` | applied | 16.2/s |
+| scheduler | `submit_and_apply_plans` | applied | 11.2/s |
+| scheduler | `submit_and_apply_plan_with_candidates` | applied | 9.3/s |
+| scheduler | `claim_eval` | **empty** | 0.3/s |
+| control | `clear_job_failed_status` | **empty** | 0/s |
+
+This retires two targets this document previously named:
+
+- **`update_node_health_checks` is not a bottleneck.** A local probe
+  (`capture_mutation` on an unchanged versus changed value) returns a
+  **0-byte** changeset when the health check is unchanged and 65 bytes when it
+  is not, so these never reach quorum. The residual cost is the capture itself
+  — a savepoint and a write-connection acquisition ~134 times a second — which
+  is real lock contention but not a raft round.
+- **The five control-lane rounds per job submit are mostly empty too**
+  (`clear_job_failed_status` at `empty`), so fusing them buys much less than
+  their op rate suggested.
+
+The genuine quorum cost is the eval path: `complete_and_claim_next` at 44/s
+plus ~20/s of plan applies.
+
+## The real ceiling at scale: the plan-apply commit is serialized
+
+The `dense_fleet` ladder found a cliff, and chasing it corrected a wrong
+diagnosis of my own.
+
+| allocations | throughput | drain |
+| --- | --- | --- |
+| 50,000 | 736.1 alloc/s | 58.0 s |
+| 100,000 | 456.58 alloc/s | 177.8 s |
+
+Plan phases at 100,000: `apply` **354 ms** of a 381 ms total — 93%.
+
+> **Do not compare that against the 36.86 ms total from cell A.** Cell A was
+> driver-bound, so it measured an IDLE control plane with no queueing. Putting
+> 21 ms of idle `apply` next to 354 ms of saturated `apply` reads as a 17x
+> scaling cliff and is nothing of the kind. Compare saturated points only:
+
+| allocations | apply | build_plan | capacity_snapshot | total |
+| --- | --- | --- | --- | --- |
+| 100,000 | 354 ms | 20 ms | 4 ms | 381 ms |
+| 200,000 | 415 ms | 32 ms | 8 ms | 465 ms |
+
+**+22% for 2x the data** — sublinear. `build_plan` and `capacity_snapshot` do
+grow with the live allocation count and `apply` is dominated by queueing, which
+is a load effect rather than a data-size one.
+
+The first guess was that SQLite was thrashing its 2 MiB default page cache.
+That was wrong twice over — the cliff it was explaining was an artifact of
+comparing an idle cell to a saturated one, and the timer boundary rules out
+reads anyway: `apply_us` wraps the whole
+`replicated()` call, so it contains the coalescer wait, the raft propose, the
+quorum round trip and the post-commit cache refresh — it is not a
+SQLite-read timer. Measured during the 200,000 cell:
+
+| metric | value |
+| --- | --- |
+| coalescer **follower wait** | **347 ms** |
+| coalescer commit | 138 ms |
+| coalescer leader wait | 66 ms |
+| batch size | 1.32 |
+| scheduler pipeline wait | 20 ms |
+
+**The 354 ms is 347 ms of queueing.** Plan-apply holds a single commit lock,
+one commit costs 138 ms at this scale, and 16 eval threads pile up behind it.
+Throughput follows directly: ~7 commits/sec x 44 allocations is the observed
+rate. The page cache was raised anyway as a cheap hedge on the 138 ms, but it
+is not the explanation and the commit message says so.
+
+Note the batch size: **1.32**, with 16 threads contending.
+
+> **Corrected.** This was first read as the coalescer failing to batch — being
+> waited on without doing the work that would justify the wait. That is wrong.
+> The queue is FIFO and a leader drains ALL of it, so the accumulation window
+> is already the whole previous commit; 1.32 is simply the ARRIVAL RATE at the
+> coalescer (1 leader + 0.32 followers per commit). No timer-free change can
+> raise it, and a timer is ruled out because it would tax the uncontended
+> single-submitter case. The 347 ms is therefore not lost amortization — it is
+> what a submitter waits while the commit ahead of it runs, plus a 1 ms
+> polling handoff. Only the handoff is recoverable; the commit itself is the
+> real cost, which points back at making commits cheaper rather than grouping
+> them.
+
+### Reads the scheduler should not be doing
+
+The planner reads the in-memory `SchedulingReadModel` — that is why
+`build_plan` stays at 20 ms. The apply path deliberately re-reads committed
+state inside the transaction, and must: the fence cannot bind against a cache
+refreshed only after commit.
+
+The avoidable read is on the write-back side. After commit,
+`cache_refresh_allocation_scopes` calls `allocs_for_node` for every touched
+node and re-reads that node's ENTIRE allocation list, though the changeset
+already names exactly which allocations changed. At ~40 allocations per node
+across ~44 nodes that is ~1,700 rows re-read per eval to learn about 44
+changes, on every replica.
+
+## Throughput degrades ~1.6x per doubling of live allocations
+
+The full `dense_fleet` ladder, all `driver_bound: false`, 16 eval threads:
+
+| allocations | throughput | ratio |
+| --- | --- | --- |
+| 50,000 | 736.1 alloc/s | — |
+| 100,000 | 456.58 alloc/s | /1.61 |
+| 200,000 | 272.91 alloc/s | /1.67 |
+
+Consistent across both steps, and the plan path does not explain it: plan total
+grew only 381 -> 465 ms (+22%) across the last step while throughput fell 40%.
+The missing time is outside the plan-phase timers.
+
+**Mechanism (hypothesis, testable).** Both hot paths read *every allocation on
+a node*, and allocations-per-node grows with cluster fill while the work per
+eval does not:
+
+- `free_pool_for_node_tx`, inside the apply transaction —
+  `SELECT ... FROM allocation WHERE node_id = ?`, memoized per node per apply.
+- `cache_refresh_allocation_scopes`, after commit on EVERY replica —
+  `allocs_for_node` per touched node, re-reading the node's whole list.
+
+At 5,000 nodes that is 10 allocations/node at 50,000 and **40 at 200,000**. An
+eval touching ~44 nodes therefore reads ~440 rows at the bottom of the ladder
+and ~1,760 at the top — 4x the work for identical placement counts, purely
+from fill. The refresh half runs outside the plan timers, which is why plan
+time barely moved.
+
+**The fix this implies** is to stop re-reading: the changeset already names
+exactly which allocations changed, so the read model can take a delta instead
+of a full per-node reload. That trades the current self-healing property (a
+full reload cannot drift) for cost that scales with the fleet rather than with
+the change, so it needs care rather than enthusiasm.
+
+An interim change already landed: the refresh now uses one read connection and
+one cached statement instead of one acquisition and one parse per node. That
+removes 44 acquisitions per eval from a pool sized to the core count, but it
+does not reduce the rows read.
+
+**Shipped since (apply half only, unmeasured):** `free_pool_for_node_tx` no
+longer reads the node's allocation rows on the common path. The node's total
+usage is cached per node in `node_alloc_usage` and validated on every read
+against a fingerprint of the live rows — the node allocation epoch, the row
+count, and the sum of the allocation ids — so a stale entry costs a rebuild
+and can never inflate free capacity. What is left of the scan is that
+fingerprint, which reads `idx_allocation_node_id` only: no row bodies, no
+JSON. A Fresh plan's own allocations are gathered once per plan rather than
+re-filtered on every node the bind walk touches. The refresh half below is
+untouched, so the ladder above should flatten, not go flat.
+
+Local A/B on the rebuild (`bench_local_free_pool`, both arms on one
+store): 15.573 → 8.635 µs per pool at 10 allocations/node, 37.764 →
+9.358 µs at 40. Over that 4x fill change the old path grows 2.4x and the
+new one 1.08x. Whether that moves the ladder is unmeasured — see
+[benchmarks/scheduler/README.md](../benchmarks/scheduler/README.md).
+
+## The eval-thread sweep: no serial wall at this scale
+
+`web_fleet`, 5,000 nodes, 25,002 allocations, one campaign per thread count
+(evalThreads is a control-plane setting), read pool at its shipped size of 4:
+
+| eval threads | throughput | verdict |
+| --- | --- | --- |
+| 4 | 177.27 alloc/s | Legion-bound |
+| 8 | 208.83 alloc/s | Legion-bound |
+| 16 | 219.25 alloc/s | Legion-bound |
+| 32 | **251.68 alloc/s** | Legion-bound |
+| 64 | **>=263.08 alloc/s** | **driver-bound — floor only** |
+
+Two conclusions and one caveat.
+
+**There is no serial wall here.** Throughput rises monotonically to at least 32
+threads. An earlier reading of 4 -> 8 -> 16 (+17.8%, then +5.0%) looked like a
+plateau and was called one; 32 threads then added another 14.8%. The +5% was
+noise in the trend, not a ceiling. Cheaper commits should therefore raise a
+rising curve rather than lift a fixed one.
+
+**The read pool is probably not the concurrency gate.** All of these ran with
+4 read connections. If that capped effective concurrency near 4, 32 threads
+could not have beaten 16. The earlier derivation of "~4 effective workers"
+from throughput divided by plan-path latency is therefore suspect.
+
+**At 64 threads the rig could not feed Legion.** Submission fell to 46.73
+jobs/sec and the last allocation landed 0.62s after the last submit, so the
+cell is a floor. Without `submission.driver_bound` this would have read as
+"263 against 252, only +4%, we have plateaued" — the third false finding the
+detector has caught today. **The knee above 32 is unmeasured and needs a
+faster load generator, not a bigger cluster.**
+
+*Caveat:* submission rate declined across the sweep (89.62, 77.09, 58.10,
+46.73 jobs/sec). Some of that is likely `RunJob` acknowledgement slowing as
+the manager gets busier, which means the cells are not perfectly matched. The
+Legion-bound cells are still valid measurements of Legion — `driver_bound` is
+false for all of them — but the submit rates are not a controlled variable.
+
+## The PR measured: a constant factor, not a flatter curve
+
+Binary built from the merge HEAD `101e74c` and verified against the fairness
+record's git rev. 5,000-node fleet, three m6id.xlarge managers, 16 eval
+threads, every cell `driver_bound: false` unless noted.
+
+| allocations | before | after | gain |
+| --- | --- | --- | --- |
+| 50,000 | 736.1 alloc/s | **1,721.54 alloc/s** | 2.34x |
+| 100,000 | 456.58 alloc/s | **1,170.9 alloc/s** | 2.56x |
+| 200,000 | 272.91 alloc/s | **636.62 alloc/s** | 2.33x |
+| web_fleet 25,002 | 219.25 alloc/s | **>=336.33 alloc/s** | driver-bound floor |
+
+**The fill-degradation slope did not move.** Per doubling of live allocations:
+1.61 then 1.67 before, 1.47 then 1.84 after — geometric mean **1.64 against
+1.65**. The curve shifted up by a uniform ~2.4x and kept its shape.
+
+That is a useful negative result, because two of the changes existed
+specifically to attack it and both provably flattened their own path: the
+free pool grows 1.08x over a 4x fill change where the row walk grew 2.4x, and
+the delta refresh is proportional to the changeset rather than to fill. **So
+neither was the dominant term.** The next suspect is `reproject_model_nodes`,
+which still recomputes each touched node's pool from its whole allocation
+list on every refresh.
+
+An interim reading of the 50k->100k step alone ("1.47, modestly flatter") was
+called early and was wrong — the second step went the other way. Two points
+are not a trend.
+
+### Mechanism metrics, which did move
+
+| metric | before | after |
+| --- | --- | --- |
+| evals settled per claim round | 1 | **86.8** |
+| group-commit batch size | 1.32 | **3.10** |
+| empty claims, scheduler lane | ~2,600/cell | **0.3/s** |
+| eval handle vs plan total | not measurable | **272 ms vs 94 ms** |
+
+The last row is the one to keep: **65% of an eval's life is outside the plan
+path**, in dispatch and bookkeeping. Every plan-phase-based inference made
+earlier in this document was blind to that, which is precisely how the "~4
+effective workers" derivation went wrong.
+
+The coalescer batch size roughly doubling is a second-order effect and worth
+noting: it was argued (correctly) that batch size reflects ARRIVAL RATE and
+cannot be raised directly. Cheaper claim rounds meant more submitters arrived
+during each commit, so it rose on its own.
+
+## Open, in priority order
+
+1. **Find what actually drives the fill degradation.** Measured at ~1.65x per
+   doubling both before and after this work, so it is neither
+   `free_pool_for_node_tx` nor `cache_refresh_allocation_scopes`. Next
+   suspect: `reproject_model_nodes`.
+2. ~~**Stop re-reading whole nodes on the read-model refresh.**~~ **Shipped
+   2026-08-05, unmeasured at scale.** `cache_apply_allocation_delta` reads
+   exactly the rows the changeset names, by primary key, and splices them
+   into the cached per-node lists; the full reload stays as the fallback and
+   as the path for every non-changeset caller. Self-healing is bounded rather
+   than free now: a per-node fallback on contradiction, a whole-changeset
+   fallback on anything unclassifiable, and a round-robin scrub of one node
+   per projected changeset. Locally, over 44 touched nodes, the refresh is
+   ~2x faster at both 10 and 40 allocations per node.
+   `free_pool_for_node_tx` shipped in the same batch and no longer reads a
+   node's rows on the common path either. **The ladder is the regression
+   test for both** — if this was the mechanism, the ~1.6x-per-doubling
+   degradation should flatten. If it does not, the remaining suspect is
+   `reproject_model_nodes`, which still recomputes each touched node's pool
+   from its whole list.
+2. **Make the plan-apply commit cheaper.** 347 ms of follower wait against a
+   138 ms commit is the ceiling at scale, and since batch size reflects
+   arrival rate rather than a batching defect, grouping cannot help — only a
+   shorter commit can.
+3. **Find the eval-thread knee**, which needs a FASTER LOAD GENERATOR: the
+   rig became the constraint at 64 threads, so the knee above 32 cannot be
+   seen with one CLI process per submitted job.
+4. **Measure control-plane CPU at saturation.** Every CPU figure so far (8% of
+   four cores) came from a driver-bound cell — an idle system. Whether the
+   ceiling is CPU or serialization is still unmeasured, and it decides which of
+   1 and 2 matters more.
+3. **Capture cost, not raft cost.** 134 empty captures/sec still take the write
+   connection. Skipping the write when the value is unchanged would remove
+   them entirely.
+3. **A real bulk-submit path.** One CLI process per job is a poor way to drive
+   load even at 16 vCPU. A long-lived submitter speaking gRPC directly would
+   remove the rig's ceiling rather than raise it. This is a benchmark-harness
+   change, not a product one — `job run` taking multiple paths would be a
+   user-facing CLI surface and needs a plan.

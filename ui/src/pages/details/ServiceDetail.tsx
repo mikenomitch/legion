@@ -1,6 +1,6 @@
 import { A, useParams } from '@solidjs/router'
 import { AccessGate } from '../../components/AccessGate'
-import { For, Show, createMemo, createResource, createSignal, onCleanup, onMount } from 'solid-js'
+import { For, Show, createMemo, createResource, createSignal } from 'solid-js'
 import { ServiceEndpointsTable, ServiceTags } from '../../components/ServiceEndpoints'
 import {
   Badge,
@@ -15,8 +15,9 @@ import {
   cx,
   linkClass,
 } from '../../components/ui'
+import { ServiceEdgesTable } from '../../components/ServiceGraph'
 import { managerClient } from '../../grpcClient'
-import { POLL_INTERVAL_MS } from '../../utils/polling'
+import { retainOnError, usePoll } from '../../utils/polling'
 import { diagnoseService, type DiagnosisLevel } from '../../utils/services'
 
 const stepIcon: Record<DiagnosisLevel, 'check' | 'x' | 'alertTriangle'> = {
@@ -35,27 +36,30 @@ function ServiceDetailContent() {
   const params = useParams()
   const serviceName = createMemo(() => decodeURIComponent(params.name))
   const [onlyHealthy, setOnlyHealthy] = createSignal(false)
-  const [tick, setTick] = createSignal(0)
-
-  onMount(() => {
-    const timer = setInterval(() => setTick((value) => value + 1), POLL_INTERVAL_MS)
-    onCleanup(() => clearInterval(timer))
-  })
+  const tick = usePoll()
 
   // Always resolve with unhealthy included: this page exists to explain why an
   // endpoint is missing, and filtering happens client-side.
   const [data] = createResource(
     () => [serviceName(), tick()] as const,
-    async ([name]) => {
-      const [list, resolved] = await Promise.all([
-        managerClient.listServices({}),
-        managerClient.resolveService({ service: name, includeUnhealthy: true }),
-      ])
-      return {
-        summary: list.services.find((entry) => entry.service === name),
-        endpoints: resolved.endpoints,
-      }
-    },
+    retainOnError(
+      async ([name]: readonly [string, number]) => {
+        const [list, resolved, graph] = await Promise.all([
+          managerClient.listServices({}),
+          managerClient.resolveService({ service: name, includeUnhealthy: true }),
+          managerClient.listServiceEdges({ service: name, windowSecs: 300 }).catch(() => undefined),
+        ])
+        return {
+          summary: list.services.find((entry) => entry.service === name),
+          endpoints: resolved.endpoints,
+          // Callers into this service; a job:read token that cannot see the
+          // graph simply gets no callers section.
+          edges: graph?.edges.filter((edge) => edge.service === name) ?? [],
+          windowSecs: Number(graph?.windowSecs ?? 300),
+        }
+      },
+      ([name]) => name,
+    ),
   )
 
   const endpoints = () => data()?.endpoints ?? []
@@ -138,6 +142,24 @@ function ServiceDetailContent() {
                     ? 'Every endpoint is failing its checks or sitting on a dead node. See the diagnosis below.'
                     : 'Nothing is placed for this service yet. See the diagnosis below.'
                 }
+              />
+            </SectionCard>
+
+            <SectionCard
+              title="Callers"
+              description={`Who reaches this service through an upstream: declared consumers and what their datapaths observed over the last ${Math.round((data()?.windowSecs ?? 300) / 60)} min.`}
+              flush
+              actions={
+                <A class={linkClass} href="/network">
+                  Service graph
+                </A>
+              }
+            >
+              <ServiceEdgesTable
+                edges={data()?.edges ?? []}
+                hideService
+                emptyTitle="No callers"
+                emptyBody="No job declares this service as an upstream, and nothing has called it through the datapath in the window."
               />
             </SectionCard>
 

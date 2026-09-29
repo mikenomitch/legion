@@ -39,6 +39,28 @@ architecture and behavior docs are public.
   manager heartbeat ceiling that was fsync-bound through raft. Start here
   to pick that work back up — what was measured, what was fixed, what we
   got wrong, and what to do next.
+- [aws-phase2-findings.md](aws-phase2-findings.md) — the second AWS run
+  (2026-08-04), and the one that found the scheduler's actual ceiling:
+  **74% of plan applies are rejected and re-planned**, so throughput
+  *falls* as eval threads are added. Also the five-row throughput table
+  that is now the regression test for every scheduler change, what the
+  rig got wrong (every cell of the first campaign was invalid, each for a
+  different reason), and one claim retracted after checking the source.
+- [aws-phase5-findings.md](aws-phase5-findings.md) — the fifth AWS run: the
+  scheduler now outruns the CLI load generator at every fill level; the
+  night's commit-path and intake fixes with their evidence
+- [aws-phase4-findings.md](aws-phase4-findings.md) — the fourth AWS run: the
+  rig was measuring its own submission ceiling, so phases 2-3 throughput
+  numbers are retracted
+- [aws-phase3-findings.md](aws-phase3-findings.md) — the third AWS run
+  (2026-08-04), which measured #189 and **retired the phase-2
+  diagnosis**: plan-apply rejections went 31.9% -> **0%**, per-eval plan
+  time fell 36%, p99 fell 42% — and throughput did not move (86.6 ->
+  80.35 alloc/sec at 5,000 nodes). Conflicts were real and are fixed, but
+  they were never the ceiling; `apply` (the raft commit) is 67% of plan
+  time and the scheduler runs ~7x below what its own planning cost
+  permits. Also a read-connection-pool hypothesis raised and refuted
+  in the same session.
 - [development.md](development.md) — running locally, Linux worker containers,
   gRPC poking, CI lint baseline.
 - [rustyriver-migration.md](rustyriver-migration.md) — porting streaming
@@ -59,6 +81,7 @@ When one is required and what goes in it:
 
 | Plan | Status |
 | --- | --- |
+| [adaptive-scheduler-concurrency-plan.md](plans/adaptive-scheduler-concurrency-plan.md) | planned (Phase 0 is a gate; sequenced behind late-binding Phase 4 striping) |
 | [artifact-system-plan.md](plans/artifact-system-plan.md) | shipped |
 | [artifact-cache-and-prewarm-plan.md](plans/artifact-cache-and-prewarm-plan.md) | planned |
 | [autoscaler-plan.md](plans/autoscaler-plan.md) | planned |
@@ -79,24 +102,34 @@ When one is required and what goes in it:
 | [multi-cluster-federation-plan.md](plans/multi-cluster-federation-plan.md) | planned |
 | [multi-raft-persistence-plan.md](plans/multi-raft-persistence-plan.md) | planned |
 | [namespaces-plan.md](plans/namespaces-plan.md) | planned (namespace object + namespace-scoped ACLs; quota/pools and namespaced KV deferred) |
+| [service-mesh-plan.md](plans/service-mesh-plan.md) | **authoritative for the mesh**; shipped M1–M10 (policy, HTTP mode, name-is-config, gated, ingress, handlers, mTLS, graph, sandbox vsock, templates) with two named deferrals — unifies the SD §8 follow-on with the handlers plan |
+| [network-handlers-plan.md](plans/network-handlers-plan.md) | shipped as phases of service-mesh-plan (policy objects, `gated` mode, handlers); the `legion netd` process split is the deferred piece |
+| [nickel-config-language-plan.md](plans/nickel-config-language-plan.md) | shipped (2026-08-03; jsonnet removed, no compat shim) |
 | [scheduler-performance-plan.md](plans/scheduler-performance-plan.md) | in execution |
 | [scheduler-architecture-review-plan.md](plans/scheduler-architecture-review-plan.md) | proposals accepted; D1/D4/D5/D6 graduated into the two plans below, D8's local slice into the heartbeat plan |
-| [plan-path-scale-levers-plan.md](plans/plan-path-scale-levers-plan.md) | shipped (D4/D5/D6, 2026-07-30) |
+| [plan-path-scale-levers-plan.md](plans/plan-path-scale-levers-plan.md) | shipped (D4/D5/D6, 2026-07-30; batch-as-a-transaction, 2026-08-03) |
+| [plan-apply-conflict-reduction-plan.md](plans/plan-apply-conflict-reduction-plan.md) | in execution (two-pass bind + candidate-list restoration + decorrelated tails landed; **measured on AWS 2026-08-04: rejections 31.9% -> 0%**, but throughput unchanged — see [aws-phase3-findings.md](aws-phase3-findings.md); the throughput half of that cell is retracted by [aws-phase4-findings.md](aws-phase4-findings.md), which found the rig measuring its own submission rate) |
+| [eval-path-raft-cost-plan.md](plans/eval-path-raft-cost-plan.md) | in execution (claim/complete fusion + batched enqueue + eval-loop batching landed; phase 5 — in-memory reprojection memo + audit hardening — landed 2026-08-06; the AWS re-measurement is not run) |
+| [jsonb-text-affinity-plan.md](plans/jsonb-text-affinity-plan.md) | shipped 2026-08-06 (every JSON column rebuilt to TEXT affinity; `STRING`/`TIMESTAMP` columns deliberately left NUMERIC — see the calls doc) |
+| [node-loss-storm-plan.md](plans/node-loss-storm-plan.md) | shipped 2026-08-06 (below-default reschedule priority, empty-node filter, single-round batched fan-out, recovery counter); the AWS storm re-measurement is not run |
+| [eval-thread-default-plan.md](plans/eval-thread-default-plan.md) | planned; **deliberately picks no number** (the 2026-08-05 sweep rose monotonically 177.27 → 251.68 alloc/s from 4 to 32 eval threads and its 64-thread cell was driver-bound, so `available_parallelism()` is wrong but the knee is unmeasured; Phase 0a is load-generator work and gates everything) |
 | [bounded-candidate-scoring-plan.md](plans/bounded-candidate-scoring-plan.md) | shipped (opt-in `score_sample`, 2026-07-30) |
 | [heartbeat-scale-plan.md](plans/heartbeat-scale-plan.md) | shipped (benchmark + batching + liveness + cadence, 2026-07-30) |
-| [heartbeat-cadence-at-scale-plan.md](plans/heartbeat-cadence-at-scale-plan.md) | planned (sizing + freshness warning + per-node lost windows + opt-in adaptive cadence) |
-| [liveness-off-the-raft-path-plan.md](plans/liveness-off-the-raft-path-plan.md) | planned (D8: heartbeats leave raft — leader-memory liveness, transitions-only replication, failover grace, display checkpoint) |
-| [aws-comparative-benchmark-plan.md](plans/aws-comparative-benchmark-plan.md) | in execution (phases 0-1; campaigns await AWS account) |
+| [heartbeat-cadence-at-scale-plan.md](plans/heartbeat-cadence-at-scale-plan.md) | **shipped** 2026-08-03 (sizing + freshness warning + per-node lost windows + opt-in adaptive cadence); the AWS reproduction is not run |
+| [liveness-off-the-raft-path-plan.md](plans/liveness-off-the-raft-path-plan.md) | **shipped** 2026-08-03 (D8: heartbeats leave raft — leader-memory liveness, transitions-only replication, failover grace, digest, display checkpoint); phase 1's AWS measurement is not run |
+| [aws-comparative-benchmark-plan.md](plans/aws-comparative-benchmark-plan.md) | in execution (phases 0-2 run on real AWS; phases 3-5 blocked on the scheduler, not the rig — see [aws-phase2-findings.md](aws-phase2-findings.md)) |
 | [worker-simulation-plan.md](plans/worker-simulation-plan.md) | shipped (2026-07-30) |
+| [scheduler-diagnosis-tooling-plan.md](plans/scheduler-diagnosis-tooling-plan.md) | planned (`legion scheduler diagnose` + the metric gaps that blocked the 2026-08-04 diagnosis) |
 | [scheduler-plan-snapshot-plan.md](plans/scheduler-plan-snapshot-plan.md) | shipped |
 | [scheduling-index-plan.md](plans/scheduling-index-plan.md) | shipped (phases 0–3; group-path + backlog deferred) |
-| [service-discovery-final-plan.md](plans/service-discovery-final-plan.md) | authoritative; v1 in progress |
+| [service-discovery-final-plan.md](plans/service-discovery-final-plan.md) | v1 shipped; §8 mesh follow-on superseded by service-mesh-plan.md |
 | [service-discovery-plan.md](plans/service-discovery-plan.md) | superseded (rationale + full mesh design) |
 | [service-discovery-mesh-and-config.md](plans/service-discovery-mesh-and-config.md) | superseded (cookbook + mesh extensions) |
 | [service-discovery-critique.md](plans/service-discovery-critique.md) | superseded (self-critique) |
 | [stateful-workloads-and-instance-identity-plan.md](plans/stateful-workloads-and-instance-identity-plan.md) | shipped |
 | [task-runtime-rename-plan.md](plans/task-runtime-rename-plan.md) | shipped |
 | [ui-jump-hints-plan.md](plans/ui-jump-hints-plan.md) | shipped |
+| [ui-holistic-polish-plan.md](plans/ui-holistic-polish-plan.md) | shipped (2026-09-02; embedding the UI in the binary deliberately left open) |
 | [workload-identity-oidc-plan.md](plans/workload-identity-oidc-plan.md) | shipped (task identities) |
 | [volume-plugin-system-plan.md](plans/volume-plugin-system-plan.md) | shipped (v1; CSI bridge + snapshot/clone deferred) |
 | [sandbox-snapshots-and-fast-start-plan.md](plans/sandbox-snapshots-and-fast-start-plan.md) | planned (§0 convergence shipped with the sandbox kind) |
@@ -131,14 +164,20 @@ by project impact. The full template and a worked example:
 - [host-convergence-plan_calls.md](calls/host-convergence-plan_calls.md)
 - [host-process-supervision-plan_calls.md](calls/host-process-supervision-plan_calls.md)
 - [job-templates-plan_calls.md](calls/job-templates-plan_calls.md)
+- [jsonb-text-affinity-plan_calls.md](calls/jsonb-text-affinity-plan_calls.md)
 - [job-updated-at-plan_calls.md](calls/job-updated-at-plan_calls.md)
+- [ui-holistic-polish-plan_calls.md](calls/ui-holistic-polish-plan_calls.md)
 - [kv-reactive-task-updates-plan_calls.md](calls/kv-reactive-task-updates-plan_calls.md)
 - [liveness-off-the-raft-path-plan_calls.md](calls/liveness-off-the-raft-path-plan_calls.md)
 - [manager-contention-instrumentation_calls.md](calls/manager-contention-instrumentation_calls.md)
 - [multi-cluster-federation-plan_calls.md](calls/multi-cluster-federation-plan_calls.md)
 - [multi-raft-persistence-plan_calls.md](calls/multi-raft-persistence-plan_calls.md)
 - [namespaces-plan_calls.md](calls/namespaces-plan_calls.md)
+- [network-handlers-plan_calls.md](calls/network-handlers-plan_calls.md)
+- [service-mesh-plan_calls.md](calls/service-mesh-plan_calls.md)
+- [nickel-config-language-plan_calls.md](calls/nickel-config-language-plan_calls.md)
 - [persistence-plan_calls.md](calls/persistence-plan_calls.md)
+- [plan-apply-conflict-reduction-plan_calls.md](calls/plan-apply-conflict-reduction-plan_calls.md)
 - [plan-path-scale-levers-plan_calls.md](calls/plan-path-scale-levers-plan_calls.md)
 - [pre-benchmark-hardening_calls.md](calls/pre-benchmark-hardening_calls.md)
 - [preemption-and-eviction-plan_calls.md](calls/preemption-and-eviction-plan_calls.md)

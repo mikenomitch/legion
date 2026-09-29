@@ -57,34 +57,34 @@ grant cannot be turned into an arbitrary shell.
 
 Add an `actions` array to a task in the job spec:
 
-```jsonnet
+```nickel
 {
-  name: 'web',
-  task: {
-    name: 'api',
-    runtime: 'container',
-    config: { image: 'ghcr.io/acme/api:1.4', command: ['/srv/api'] },
-    actions: [
+  name = "web",
+  task = {
+    name = "api",
+    runtime = "container",
+    config = { image = "ghcr.io/acme/api:1.4", command = ["/srv/api"] },
+    actions = [
       {
-        name: 'flush-cache',                       // [a-z0-9-]{1,128}, unique per task
-        description: 'Flush the in-memory cache',
-        command: ['/srv/api', 'admin', 'flush-cache', '--scope', '${param.scope}'],
-        params: [
+        name = "flush-cache",                       # [a-z0-9-]{1,128}, unique per task
+        description = "Flush the in-memory cache",
+        command = ["/srv/api", "admin", "flush-cache", "--scope", "${param.scope}"],
+        params = [
           {
-            name: 'scope',
-            type: 'enum',                          // string | int | bool | enum
-            values: ['all', 'sessions', 'assets'],
-            default: 'sessions',
+            name = "scope",
+            type = "enum",                          # string | int | bool | enum
+            values = ["all", "sessions", "assets"],
+            "default" = "sessions",
           },
         ],
       },
       {
-        name: 'tail-slowlog',
-        command: ['/usr/bin/tail', '-n', '${param.lines}', '/var/log/slow.log'],
-        params: [
-          { name: 'lines', type: 'int', default: '100', min: 1, max: 10000 },
+        name = "tail-slowlog",
+        command = ["/usr/bin/tail", "-n", "${param.lines}", "/var/log/slow.log"],
+        params = [
+          { name = "lines", type = "int", "default" = "100", min = 1, max = 10000 },
         ],
-        timeout: '60s',
+        timeout = "60s",
       },
     ],
   },
@@ -153,20 +153,20 @@ Rule selectors:
 
 - `names` — job names (glob), as elsewhere.
 - `action_names` — action names (glob), on `action` rules.
-- `host: true` — on `exec` rules, also permits exec into **host-level** runtimes
+- `host = true` — on `exec` rules, also permits exec into **host-level** runtimes
   (the `exec` runtime). Without it, an `exec` rule matches only sandboxed
   runtimes (`container`, `sandbox`).
 
-```jsonnet
+```nickel
 [
-  // Full shell into team-a's container jobs, but not host-level tasks:
-  { resources: ["exec"],   actions: ["write"], names: ["team-a-*"] },
-  // Host-level exec too (admins):
-  { resources: ["exec"],   actions: ["write"], names: ["*"], host: true },
-  // On-call: may run only the curated actions on the web job, no raw shell:
-  { resources: ["action"], actions: ["write"], names: ["web"],
-    action_names: ["restart-*", "flush-cache"] },
-  { resources: ["job"],    actions: ["read"],  names: ["web"] },  // to discover them
+  # Full shell into team-a's container jobs, but not host-level tasks:
+  { resources = ["exec"],   actions = ["write"], names = ["team-a-*"] },
+  # Host-level exec too (admins):
+  { resources = ["exec"],   actions = ["write"], names = ["*"], host = true },
+  # On-call: may run only the curated actions on the web job, no raw shell:
+  { resources = ["action"], actions = ["write"], names = ["web"],
+    action_names = ["restart-*", "flush-cache"] },
+  { resources = ["job"],    actions = ["read"],  names = ["web"] },  # to discover them
 ]
 ```
 
@@ -195,10 +195,10 @@ There is no interactive PTY over MCP — these tools are one-shot only.
 Exec is on by default (it is still per-caller default-deny once ACLs are
 enabled). A hardened deployment can turn it off entirely in the manager config:
 
-```jsonnet
-// configs/manager.jsonnet
+```nickel
+# configs/manager.ncl
 {
-  exec: { enabled: false },   // ExecAllocation rejects; the WS bridge is not started
+  exec = { enabled = false },   # ExecAllocation rejects; the WS bridge is not started
 }
 ```
 

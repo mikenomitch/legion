@@ -47,6 +47,7 @@ fn test_node(id: &str) -> Node {
         pool: "default".into(),
         availability: "available".into(),
         last_heartbeat: "2023-01-01T00:00:00Z".into(),
+        heartbeat_source: String::new(),
         config_attrs: json!({ "maxAllocations": 10, "resources": {} }),
         fingerprint_attrs: json!({
             "memory_total": "4294967296",
@@ -74,7 +75,7 @@ fn cascade_reliant_deletes_survive_raft_apply() -> R<()> {
     let outcome = store.handle_job_submit(
         &job,
         &[Submission {
-            path: "cascade-job.jsonnet".into(),
+            path: "cascade-job.ncl".into(),
             content: "job cascade-job".into(),
             is_primary: true,
         }],

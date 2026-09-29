@@ -237,6 +237,7 @@ fn test_node(id: &str) -> Node {
         pool: "default".into(),
         availability: "available".into(),
         last_heartbeat: "2023-01-01T00:00:00Z".into(),
+        heartbeat_source: String::new(),
         config_attrs: json!({ "maxAllocations": 10, "resources": {} }),
         fingerprint_attrs: json!({
             "memory_total": "4294967296",
@@ -265,7 +266,7 @@ fn test_job(name: &str, count: u32, version: u32) -> JobConfig {
 
 fn submission(name: &str) -> Submission {
     Submission {
-        path: format!("{name}.jsonnet"),
+        path: format!("{name}.ncl"),
         content: format!("job {name}"),
         is_primary: true,
     }
@@ -282,24 +283,55 @@ fn evals_of_kind(store: &Store, kind: &str) -> Vec<String> {
 }
 
 /// Drain the eval queue with the REAL handlers, the way the daemon's eval
-/// workers do: claim → handle → complete (success or failure). Returns the
+/// workers do: claim a BATCH → handle each → settle the batch and claim the
+/// next, all through the batched scheduler-lane ops. Returns the
 /// `(kind, ok)` pairs processed.
+///
+/// Driving the batched ops from here is deliberate. Every other test of
+/// them runs against a single-node store, where `Store::replicated`
+/// short-circuits and the batch never touches raft at all. This is the only
+/// harness that puts `claim_evals` / `complete_evals_and_claim_next` through
+/// a real capture: several write-connection grabs and several row mutations
+/// inside one changeset, proposed to a quorum and applied on followers.
 fn process_eval_queue(store: &Store) -> R<Vec<(String, bool)>> {
+    use legion::storage::events::drafts;
+    use legion::storage::store::{EvalBatchLimits, EvalCompletion};
+
+    // A small cap with one worker: the batch is the whole ready queue, so
+    // the multi-eval path is what actually runs here rather than a
+    // degenerate batch of one.
+    let limits = EvalBatchLimits { max: 8, workers: 1 };
+
     let mut out = Vec::new();
-    while let Some(eval) = store.claim_eval()? {
-        let ok = match eval.handle(store) {
-            Ok(outcome) => {
-                eprintln!("eval {} ({}) done: {outcome}", eval.id, eval.kind);
-                true
-            }
-            Err(err) => {
-                eprintln!("eval {} ({}) failed: {err:#}", eval.id, eval.kind);
-                false
-            }
-        };
-        store.complete_eval(&eval.id, ok)?;
-        out.push((eval.kind.clone(), ok));
-        assert!(out.len() < 60, "eval queue is not draining");
+    let mut batch = store.claim_evals(limits)?;
+    while !batch.is_empty() {
+        let mut completions: Vec<(String, EvalCompletion)> = Vec::with_capacity(batch.len());
+        for eval in &batch {
+            let started = std::time::Instant::now();
+            let (ok, event) = match eval.handle(store) {
+                Ok(outcome) => {
+                    eprintln!("eval {} ({}) done: {outcome}", eval.id, eval.kind);
+                    (
+                        true,
+                        drafts::eval_completed(eval, &outcome, started.elapsed()),
+                    )
+                }
+                Err(err) => {
+                    eprintln!("eval {} ({}) failed: {err:#}", eval.id, eval.kind);
+                    (false, drafts::eval_failed(eval, &err, started.elapsed()))
+                }
+            };
+            completions.push((
+                eval.id.clone(),
+                EvalCompletion::Finished {
+                    succeeded: ok,
+                    event,
+                },
+            ));
+            out.push((eval.kind.clone(), ok));
+            assert!(out.len() < 60, "eval queue is not draining");
+        }
+        batch = store.complete_evals_and_claim_next(completions, limits)?;
     }
     Ok(out)
 }

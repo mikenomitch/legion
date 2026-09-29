@@ -31,87 +31,87 @@ caching/pre-warming layer is a separate, not-yet-implemented plan
 `identities` — not inside the runtime-specific `config`. A bare source string is
 a complete artifact spec:
 
-```jsonnet
+```nickel
 {
-  name: 'tool',
-  runtime: 'exec',
-  lifecycle: 'batch',
-  artifacts: [
-    'https://github.com/acme/tool/releases/download/v1.4/tool-linux-amd64.tar.gz',
+  name = "tool",
+  runtime = "exec",
+  lifecycle = "batch",
+  artifacts = [
+    "https://github.com/acme/tool/releases/download/v1.4/tool-linux-amd64.tar.gz",
   ],
-  config: {
-    // Archives auto-unpack into the task directory; cwd defaults there too.
-    command: ['./tool', '--once'],
+  config = {
+    # Archives auto-unpack into the task directory; cwd defaults there too.
+    command = ["./tool", "--once"],
   },
 }
 ```
 
 The full object form:
 
-```jsonnet
-artifacts: [
+```nickel
+artifacts = [
   {
-    // Scheme picks the fetcher: https://, http://, file://, git:// (or the
-    // go-getter style git::https://…), s3://, oci://.
-    source: 's3://acme-builds/api/v42.tar.gz',
+    # Scheme picks the fetcher: https://, http://, file://, git:// (or the
+    # go-getter style git::https://…), s3://, oci://.
+    source = "s3://acme-builds/api/v42.tar.gz",
 
-    // Optional handle for referencing the staged artifact from task config.
-    // Required for ${artifact.<name>} / LEGION_ARTIFACT_<NAME>.
-    // Lowercase [a-z0-9_-]+, unique within the task.
-    name: 'build',
+    # Optional handle for referencing the staged artifact from task config.
+    # Required for ${artifact.<name>} / LEGION_ARTIFACT_<NAME>.
+    # Lowercase [a-z0-9_-]+, unique within the task.
+    name = "build",
 
-    // Destination, relative to the task directory. Absolute and escaping
-    // paths are rejected. Default: '.' for archives/trees, the source
-    // basename for single files. A trailing '/' on a single-file dest means
-    // "this directory, keep the basename".
-    dest: 'build/',
+    # Destination, relative to the task directory. Absolute and escaping
+    # paths are rejected. Default: "." for archives/trees, the source
+    # basename for single files. A trailing "/" on a single-file dest means
+    # "this directory, keep the basename".
+    dest = "build/",
 
-    // 'sha256:<64 hex>'. Presence makes the artifact immutable and
-    // verification mandatory (verified while streaming; corrupt bytes never
-    // reach the task directory).
-    checksum: 'sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08',
+    # 'sha256:<64 hex>'. Presence makes the artifact immutable and
+    # verification mandatory (verified while streaming; corrupt bytes never
+    # reach the task directory).
+    checksum = "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
 
-    // 'auto' (default: unpacks .tar.gz/.tgz/.tar/.gz by extension),
-    // 'archive' (force; fails if not a readable archive), or
-    // 'file' (never unpack; stage the raw file).
-    unpack: 'auto',
+    # "auto" (default: unpacks .tar.gz/.tgz/.tar/.gz by extension),
+    # "archive" (force; fails if not a readable archive), or
+    # "file" (never unpack; stage the raw file).
+    unpack = "auto",
 
-    // For mutable references (OCI tags, git branches/tags): 'pin' (default)
-    // resolves to a digest at submit; 'always' re-resolves at every staging.
-    resolve: 'pin',
+    # For mutable references (OCI tags, git branches/tags): "pin" (default)
+    # resolves to a digest at submit; "always" re-resolves at every staging.
+    resolve = "pin",
 
-    // Auth override. Omitted => cluster artifacts.auth matchers apply.
-    // Exactly one of kv / identity / nodeIdentity.
-    auth: { kv: 'secrets/build-store' },
+    # Auth override. Omitted => cluster artifacts.auth matchers apply.
+    # Exactly one of kv / identity / nodeIdentity.
+    auth = { kv = "secrets/build-store" },
 
-    // Octal chmod applied to single-file artifacts (handy for bare binaries;
-    // also applied to ORAS layer files).
-    mode: '0755',
+    # Octal chmod applied to single-file artifacts (handy for bare binaries;
+    # also applied to ORAS layer files).
+    mode = "0755",
   },
 ]
 ```
 
 OCI sources support digest pinning and ORAS layer selection:
 
-```jsonnet
-artifacts: [
+```nickel
+artifacts = [
   {
-    name: 'model',
-    source: 'oci://registry.acme.io/models/embedder@sha256:abc…',
-    // ORAS multi-file artifacts: pick layers by media type (oci:// only).
-    // Omit to materialize the whole artifact as an OCI image layout.
-    mediaType: 'application/vnd.acme.model.weights.v1',
-    dest: 'models/',
+    name = "model",
+    source = "oci://registry.acme.io/models/embedder@sha256:abc…",
+    # ORAS multi-file artifacts: pick layers by media type (oci:// only).
+    # Omit to materialize the whole artifact as an OCI image layout.
+    mediaType = "application/vnd.acme.model.weights.v1",
+    dest = "models/",
   },
 ]
 ```
 
 A runnable example exercising every field is the `batch` task in
-[configs/jobs/maximal.jsonnet](../configs/jobs/maximal.jsonnet).
+[configs/jobs/maximal.ncl](../configs/jobs/maximal.ncl).
 
 Two read-only annotations appear on stored/normalized specs (the manager
 writes them at admission; user specs never set them): `pinnedFrom` (the
-original mutable reference when `resolve: pin` rewrote `source` to a digest)
+original mutable reference when `resolve = "pin"` rewrote `source` to a digest)
 and `authOrigin` (`"task"` or `"cluster"` — where the effective auth came
 from).
 
@@ -194,17 +194,17 @@ Both expand to the staged *file path* for single files and the *destination
 directory* for everything else (unpacked archives, git trees, ORAS layer
 directories, OCI layouts).
 
-```jsonnet
+```nickel
 {
-  name: 'embedder',
-  runtime: 'exec',
-  artifacts: [
-    { name: 'tool',  source: 'https://releases.acme.io/embed/v1.4.tar.gz', checksum: 'sha256:9f86…' },
-    { name: 'model', source: 'oci://registry.acme.io/models/embedder@sha256:abc…', mediaType: 'application/vnd.acme.model.weights.v1' },
+  name = "embedder",
+  runtime = "exec",
+  artifacts = [
+    { name = "tool",  source = "https://releases.acme.io/embed/v1.4.tar.gz", checksum = "sha256:9f86…" },
+    { name = "model", source = "oci://registry.acme.io/models/embedder@sha256:abc…", mediaType = "application/vnd.acme.model.weights.v1" },
   ],
-  config: {
-    command: ['${artifact.tool}/bin/embed', '--weights', '${artifact.model}/weights.bin'],
-    env: { MODEL_DIR: '${artifact.model}' },
+  config = {
+    command = ["${artifact.tool}/bin/embed", "--weights", "${artifact.model}/weights.bin"],
+    env = { MODEL_DIR = "${artifact.model}" },
   },
 }
 ```
@@ -228,27 +228,27 @@ same fetcher registry — one fetch stack in the tree.
 
 Three doors, one resolution path. Per artifact:
 
-```jsonnet
-auth: { kv: 'secrets/ghcr-pull' }              // secret-based (works today)
-auth: { identity: 'aws' }                      // task workload identity (pending)
-auth: { identity: 'aws', assumeRole: 'arn:aws:iam::123:role/artifact-pull' }
-auth: { nodeIdentity: 'artifact-pull' }        // node workload identity (pending)
+```nickel
+auth = { kv = "secrets/ghcr-pull" }              # secret-based (works today)
+auth = { identity = "aws" }                      # task workload identity (pending)
+auth = { identity = "aws", assumeRole = "arn:aws:iam::123:role/artifact-pull" }
+auth = { nodeIdentity = "artifact-pull" }        # node workload identity (pending)
 ```
 
 Most specs should carry no `auth` at all — cluster defaults route sources to
 credentials centrally:
 
-```jsonnet
-// manager.jsonnet
+```nickel
+# manager.ncl
 {
-  artifacts: {
-    allowedSchemes: ['https', 's3', 'oci', 'git', 'file'],  // the default; plain http needs opt-in
-    auth: [
-      // First match wins. Matchers are scheme://host/path globs: `*` matches
-      // within one path segment, `**` crosses segments. git::https://…
-      // sources match git:// patterns.
-      { match: 'oci://ghcr.io/acme/**', kv: 'secrets/ghcr-pull' },
-      { match: 's3://acme-tooling/**',  nodeIdentity: 'artifact-pull' },
+  artifacts = {
+    allowedSchemes = ["https", "s3", "oci", "git", "file"],  # the default; plain http needs opt-in
+    auth = [
+      # First match wins. Matchers are scheme://host/path globs: `*` matches
+      # within one path segment, `**` crosses segments. git::https://…
+      # sources match git:// patterns.
+      { "match" = "oci://ghcr.io/acme/**", kv = "secrets/ghcr-pull" },
+      { "match" = "s3://acme-tooling/**",  nodeIdentity = "artifact-pull" },
     ],
   },
 }
@@ -263,7 +263,7 @@ security boundary, and silently attaching one cluster-wide would blur it.
 
 > **Matchers are baked at admission.** The manager evaluates `artifacts.auth`
 > when a job is submitted and persists the *effective* auth on the normalized
-> artifact list (annotated `authOrigin: "cluster"`). Changing the matchers
+> artifact list (annotated `authOrigin = "cluster"`). Changing the matchers
 > therefore affects the **next submit**, not jobs already in flight.
 > Credential *values* are still resolved late, on the worker, at fetch time —
 > so rotating a KV credential needs no re-submit (below).
@@ -274,12 +274,12 @@ The credential lives in Legion KV as a JSON object with a `type`
 discriminator:
 
 ```jsonc
-{ "type": "basic",  "username": "ci-pull", "password": "…" }          // http(s), oci, git
-{ "type": "bearer", "token": "…" }                                     // http(s), oci, git
+{ "type": "basic",  "username": "ci-pull", "password": "…" }             // http(s), oci, git
+{ "type": "bearer", "token": "…" }                                       // http(s), oci, git
 { "type": "aws",    "accessKeyId": "…", "secretAccessKey": "…",
   "sessionToken": "…", "region": "us-east-1",
-  "endpoint": "https://minio.internal:9000" }                          // s3 (sessionToken/region/endpoint optional)
-{ "type": "headers", "headers": { "X-Api-Key": "…" } }                 // http(s) escape hatch
+  "endpoint": "https://minio.internal:9000" }                            // s3 (sessionToken/region/endpoint optional)
+{ "type": "headers", "headers": { "X-Api-Key": "…" } }                   // http(s) escape hatch
 ```
 
 The worker reads the value over its authenticated manager channel via the
@@ -321,8 +321,8 @@ a bearer token to stores that trust Legion's issuer ("it is Legion task
 > phases 2 and 4 (`IssueWorkloadIdentityToken` RPC + worker-side delivery).
 > Until those land, a fetch using `identity`/`nodeIdentity` fails with an
 > actionable error suggesting `auth.kv` or anonymous access, and a
-> `resolve: 'pin'` submit on an identity-authed mutable source fails
-> suggesting `resolve: 'always'`. Everything else in this document works
+> `resolve = "pin"` submit on an identity-authed mutable source fails
+> suggesting `resolve = "always"`. Everything else in this document works
 > without it.
 
 ### Security properties
@@ -339,10 +339,10 @@ a bearer token to stores that trust Legion's issuer ("it is Legion task
 - `allowedSchemes` is enforced at admission **and** on the worker
   (`artifacts.fetch.allowedSchemes`) — defense in depth.
 
-## Pinning: `resolve: 'pin'` vs `'always'`
+## Pinning: `resolve = "pin"` vs `'always'`
 
 Mutable references — OCI **tags** and git **branches/tags** — default to
-`resolve: 'pin'`:
+`resolve = "pin"`:
 
 - At submit, the manager calls the fetcher's `resolve()` (manifest-digest
   lookup for OCI, `git ls-remote` for git) and persists the **pinned** source
@@ -362,9 +362,9 @@ Mutable references — OCI **tags** and git **branches/tags** — default to
 - Resolution uses the same auth chain a worker would; the manager reads KV
   credentials directly from its own store. If resolution fails (bad
   reference, unreachable registry, identity-authed source), the submit fails
-  with the fetch error and the suggestion to set `resolve: 'always'`.
+  with the fetch error and the suggestion to set `resolve = "always"`.
 
-`resolve: 'always'` passes the reference through unchanged; each staging
+`resolve = "always"` passes the reference through unchanged; each staging
 fetches whatever the tag/branch points at *then*. This is the explicit
 "track the tag" option, with the documented cost that allocations of one job
 config may run different bytes if the reference moves mid-rollout.
@@ -413,7 +413,7 @@ all-or-nothing and falls back to a full fresh fetch when:
 - the artifact list changed in any way (the fingerprint covers the
   normalized, pinned specs — so a moved pinned digest refetches),
 - any recorded payload path is missing from the task directory,
-- any artifact sets `resolve: 'always'` (the explicit "re-resolve at every
+- any artifact sets `resolve = "always"` (the explicit "re-resolve at every
   staging" contract disables reuse for the whole task), or
 - the previous run never finished (no manifest is written until every
   artifact staged successfully; partial content is cleared before the fresh
@@ -424,18 +424,18 @@ another node always fetch fresh, and explicit stops/removals delete the task
 directory. Cross-allocation and cross-node caching remain the
 [cache plan's](../internal_docs/plans/artifact-cache-and-prewarm-plan.md) territory.
 
-```jsonnet
-// configs/workers/default.jsonnet — values shown are the defaults
+```nickel
+# configs/workers/default.ncl — values shown are the defaults
 {
-  workerType: 'default',
-  pool: 'default',
-  artifacts: {
-    fetch: {
-      parallelism: 4,           // concurrent fetches per worker
-      attempts: 3,              // per-artifact tries before the allocation fails
-      timeout: '10m',           // overall fetch deadline per artifact
-      maxArtifactSize: '50GiB', // per-artifact cap; also bounds decompression
-      // allowedSchemes: [...]  // worker-side allowlist (defaults to the cluster default)
+  workerType = "default",
+  pool = "default",
+  artifacts = {
+    fetch = {
+      parallelism = 4,           # concurrent fetches per worker
+      attempts = 3,              # per-artifact tries before the allocation fails
+      timeout = "10m",           # overall fetch deadline per artifact
+      maxArtifactSize = "50GiB", # per-artifact cap; also bounds decompression
+      # allowedSchemes = [...]  # worker-side allowlist (defaults to the cluster default)
     },
   },
 }
@@ -463,14 +463,14 @@ heartbeat (`AllocationHealth.artifact_states`, a JSON array); the manager
 persists them on allocation health and serves them everywhere allocation
 health already flows:
 
-```jsonc
+```nickel
 [
-  { "name": "tool",  "source": "https://releases.acme.io/embed/v1.4.tar.gz",
-    "state": "staged", "digest": "sha256:9f86…", "attempts": 1, "durationMs": 412 },
-  { "name": "model", "source": "oci://registry.acme.io/models/embedder@sha256:abc…",
-    "state": "fetching", "attempts": 1, "bytesFetched": 1610612736, "bytesTotal": 4294967296 },
-  { "name": "cfg",   "source": "s3://acme-builds/cfg.tar.gz",
-    "state": "failed", "attempts": 3, "error": "… (credentials from kv secrets/build-store)" }
+  { "name" = "tool",  "source" = "https://releases.acme.io/embed/v1.4.tar.gz",
+    "state" = "staged", "digest" = "sha256:9f86…", "attempts" = 1, "durationMs" = 412 },
+  { "name" = "model", "source" = "oci://registry.acme.io/models/embedder@sha256:abc…",
+    "state" = "fetching", "attempts" = 1, "bytesFetched" = 1610612736, "bytesTotal" = 4294967296 },
+  { "name" = "cfg",   "source" = "s3://acme-builds/cfg.tar.gz",
+    "state" = "failed", "attempts" = 3, "error" = "… (credentials from kv secrets/build-store)" }
 ]
 ```
 
@@ -580,12 +580,12 @@ unpack, retries, status reporting — is shared pipeline code; the plugin only
 moves bytes. Fetchers are deliberately *blocking* (they run on staging
 threads, never the async runtime), which keeps the dylib boundary free of
 async-trait hazards. Optionally implement `resolve()` to support
-`resolve: 'pin'` for mutable references.
+`resolve = "pin"` for mutable references.
 
 A complete worked example ships at
 [plugins/artifacts/demo](../plugins/artifacts/demo/): a `demo://` fetcher
 that materializes the URL's `content` query parameter as a staged file —
-`artifacts: ['demo://example/hello.txt?content=hi']`.
+`artifacts = ["demo://example/hello.txt?content=hi"]`.
 
 Remember the allowlists: a custom scheme must be added to the cluster's
 `artifacts.allowedSchemes` *and* (if customized) the worker's
@@ -621,7 +621,7 @@ Remember the allowlists: a custom scheme must be added to the cluster's
   so its `LEGION_ARTIFACT_*` var is omitted rather than pointing at a dead
   host path.
 - **Archive formats** are `.tar.gz`/`.tgz`/`.tar`/`.gz`; `zip`/`zstd` are
-  not yet recognized (use `unpack: 'file'` to stage such files as-is).
+  not yet recognized (use `unpack = "file"` to stage such files as-is).
 - **Fetch failures consume `on_unhealthy` budgets** (see
   [Failure semantics](#staging-mechanics)); there is no dedicated
   `onFetchFailure` policy yet.

@@ -2,7 +2,7 @@ import { A, useNavigate } from '@solidjs/router'
 import { createEffect, For, onCleanup, onMount, Show, createSignal, type JSX } from 'solid-js'
 import { clearCommandPaletteIndexItems, setCommandPaletteIndexItems } from '../utils/commandPalette'
 import { JUMP_MODIFIER_LABEL, indexHintKey, useIndexJumpTargets } from '../utils/jumpHints'
-import { Button, EmptyState, Icon, JumpHint, LoadingRows, Note, SectionCard, StatusBadge, cx, inputClass, jumpHintGutterClass, selectClass, tableClass, tdClass, thClass, theadClass, trHoverClass } from './ui'
+import { Button, EmptyState, Icon, JumpHint, Kbd, LoadingRows, Note, RelativeTime, SectionCard, StatusBadge, cx, inputClass, jumpHintGutterClass, selectClass, tableClass, tdClass, thClass, theadClass, trHoverClass } from './ui'
 import type { Tone } from '../utils/status'
 
 export type IndexSortOption = { label: string; value: string }
@@ -16,7 +16,12 @@ export type IndexItem = {
   subtitle?: string
   status?: string
   statusTone?: Tone
-  updatedAt: string
+  /// The raw timestamp; the index renders it relative with the exact time
+  /// as the tooltip.
+  updatedAt?: string | bigint | number
+  /// Extra tooltip text on the time — used for the node list's heartbeat
+  /// freshness caveat (docs/node-liveness.md).
+  updatedAtTitle?: string
   href: string
   cells?: Record<string, JSX.Element>
 }
@@ -40,10 +45,19 @@ type SharedIndexProps = {
   emptyLabel: string
   emptyHint?: string
   extraFilters?: JSX.Element
+  // A second row under the search — status chips and the like.
+  chips?: JSX.Element
+  // True while a chip/filter other than the search narrows the list, so the
+  // empty state offers to clear it.
+  filtered?: boolean
+  onClearFilters?: () => void
   // Page-level actions, rendered at the end of the filter row.
   actions?: JSX.Element
   // Hide the Status column for entities that have no meaningful status (e.g. manager config snapshots).
   hideStatus?: boolean
+  // Header of the last column. "Updated" by default; the node list shows a
+  // heartbeat there, which is a different signal and deserves its own name.
+  updatedLabel?: string
 }
 
 export default function SharedIndex(props: SharedIndexProps) {
@@ -78,7 +92,7 @@ export default function SharedIndex(props: SharedIndexProps) {
   const isTextInputTarget = (event: KeyboardEvent): boolean => {
     const target = event.target as HTMLElement | null
     if (!target || !target.closest) return false
-    if (target.closest('[data-command-palette]')) return true
+    if (target.closest('[data-modal]')) return true
     if (target.closest('input, textarea, select')) return true
     if (target.closest('[contenteditable]')) return true
     return false
@@ -117,7 +131,8 @@ export default function SharedIndex(props: SharedIndexProps) {
 
   const onGlobalIndexNavigation = (event: KeyboardEvent) => {
     if (event.metaKey || event.ctrlKey || event.altKey) return
-    if (document.querySelector('[data-command-palette]')) return
+    // A dialog (⌘K, the shortcut sheet) owns the keyboard while it is open.
+    if (document.querySelector('[data-modal]')) return
     if (isTextInputTarget(event)) return
     // Never steal activation from a focused link/button — Tab-focus and the
     // j/k virtual selection are separate systems and the focused element wins.
@@ -157,6 +172,8 @@ export default function SharedIndex(props: SharedIndexProps) {
     clearCommandPaletteIndexItems()
   })
 
+  const singular = () => props.entityLabel.replace(/s$/, '')
+
   return (
     <div class="space-y-3">
       <div class="flex flex-wrap items-center gap-2">
@@ -182,6 +199,10 @@ export default function SharedIndex(props: SharedIndexProps) {
         {props.actions}
       </div>
 
+      <Show when={props.chips}>
+        <div>{props.chips}</div>
+      </Show>
+
       <SectionCard flush>
         {/* Keep the previous rows visible during a refetch — only show the
             skeleton when there is nothing to display yet. */}
@@ -191,11 +212,25 @@ export default function SharedIndex(props: SharedIndexProps) {
               when={props.items.length > 0}
               fallback={
                 <Show
-                  when={props.search.trim()}
+                  when={props.search.trim() || props.filtered}
                   fallback={<EmptyState icon="search" title={props.emptyLabel} body={props.emptyHint} />}
                 >
-                  <EmptyState icon="search" title={`No ${props.entityLabel.toLowerCase()} match "${props.search.trim()}"`}>
-                    <Button size="xs" class="mt-1" onClick={() => props.onSearch('')}>Clear search</Button>
+                  <EmptyState
+                    icon="search"
+                    title={
+                      props.search.trim()
+                        ? `No ${props.entityLabel.toLowerCase()} match "${props.search.trim()}"`
+                        : `No ${props.entityLabel.toLowerCase()} match these filters`
+                    }
+                  >
+                    <div class="mt-1 flex items-center gap-2">
+                      <Show when={props.search.trim()}>
+                        <Button size="xs" onClick={() => props.onSearch('')}>Clear search</Button>
+                      </Show>
+                      <Show when={props.filtered && props.onClearFilters}>
+                        <Button size="xs" onClick={() => props.onClearFilters?.()}>Show all</Button>
+                      </Show>
+                    </div>
                   </EmptyState>
                 </Show>
               }
@@ -204,12 +239,12 @@ export default function SharedIndex(props: SharedIndexProps) {
                 <table class={tableClass}>
                   <thead class={theadClass}>
                     <tr>
-                      <th class={cx(thClass, jumpHintGutterClass())}>{props.entityLabel.replace(/s$/, '')}</th>
+                      <th class={cx(thClass, jumpHintGutterClass())}>{singular()}</th>
                       <Show when={!props.hideStatus}>
                         <th class={thClass}>Status</th>
                       </Show>
                       <For each={props.columns ?? []}>{(column) => <th class={cx(thClass, column.class)}>{column.header}</th>}</For>
-                      <th class={cx(thClass, 'text-right')}>Updated</th>
+                      <th class={cx(thClass, 'text-right')}>{props.updatedLabel ?? 'Updated'}</th>
                     </tr>
                   </thead>
                   <tbody class="divide-y divide-line" ref={indexListRef} data-index-list>
@@ -243,7 +278,9 @@ export default function SharedIndex(props: SharedIndexProps) {
                           <For each={props.columns ?? []}>
                             {(column) => <td class={cx(tdClass, 'text-muted', column.class)}>{item.cells?.[column.key] ?? '—'}</td>}
                           </For>
-                          <td class={cx(tdClass, 'whitespace-nowrap text-right text-xs text-faint')}>{item.updatedAt}</td>
+                          <td class={cx(tdClass, 'whitespace-nowrap text-right text-xs text-faint')}>
+                            <RelativeTime value={item.updatedAt} title={item.updatedAtTitle} />
+                          </td>
                         </tr>
                       )}
                     </For>
@@ -275,11 +312,9 @@ export default function SharedIndex(props: SharedIndexProps) {
         </footer>
       </SectionCard>
 
-      <p class="text-2xs text-faint">
-        <kbd class="rounded border border-line bg-surface2 px-1 font-mono">j</kbd>/<kbd class="rounded border border-line bg-surface2 px-1 font-mono">k</kbd> to move ·{' '}
-        <kbd class="rounded border border-line bg-surface2 px-1 font-mono">o</kbd> to open ·{' '}
-        <kbd class="rounded border border-line bg-surface2 px-1 font-mono">{JUMP_MODIFIER_LABEL}</kbd> to number the rows ·{' '}
-        <kbd class="rounded border border-line bg-surface2 px-1 font-mono">{JUMP_MODIFIER_LABEL}K</kbd> to search everything
+      <p class="flex flex-wrap items-center gap-x-1.5 gap-y-1 text-2xs text-faint">
+        <Kbd>j</Kbd>/<Kbd>k</Kbd> to move · <Kbd>o</Kbd> to open · hold <Kbd>{JUMP_MODIFIER_LABEL}</Kbd> to number the rows ·{' '}
+        <Kbd>{JUMP_MODIFIER_LABEL}K</Kbd> to search everything · <Kbd>?</Kbd> for every shortcut
       </p>
     </div>
   )

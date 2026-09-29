@@ -3,7 +3,7 @@ import { AccessGate } from '../components/AccessGate'
 import SharedIndex from '../components/SharedIndex'
 import { managerClient } from '../grpcClient'
 import { debounced } from '../utils/debounce'
-import { formatRelativeTime } from '../utils/format'
+import { INDEX_POLL_INTERVAL_MS, retainOnError, usePoll } from '../utils/polling'
 
 function ManagerContent() {
   const [search, setSearch] = createSignal('')
@@ -11,6 +11,7 @@ function ManagerContent() {
   const [page, setPage] = createSignal(1)
   const [pageSize, setPageSize] = createSignal(20)
   const searchQuery = debounced(search)
+  const tick = usePoll(INDEX_POLL_INTERVAL_MS)
 
   createEffect(() => {
     search()
@@ -19,17 +20,20 @@ function ManagerContent() {
   })
 
   const [data] = createResource(
-    () => ({ search: searchQuery(), sort: sort(), page: page(), pageSize: pageSize() }),
-    async (input) => {
-      const [sortBy, sortOrder] = input.sort.split(':')
-      return managerClient.getManagerConfigs({
-        query: input.search,
-        sortBy,
-        sortOrder,
-        page: input.page,
-        pageSize: input.pageSize,
-      })
-    },
+    () => ({ search: searchQuery(), sort: sort(), page: page(), pageSize: pageSize(), tick: tick() }),
+    retainOnError(
+      async (input: { search: string; sort: string; page: number; pageSize: number; tick: number }) => {
+        const [sortBy, sortOrder] = input.sort.split(':')
+        return managerClient.getManagerConfigs({
+          query: input.search,
+          sortBy,
+          sortOrder,
+          page: input.page,
+          pageSize: input.pageSize,
+        })
+      },
+      (input) => `${input.search}|${input.sort}|${input.page}|${input.pageSize}`,
+    ),
   )
 
   return (
@@ -51,7 +55,7 @@ function ManagerContent() {
         id: config.nodeId,
         title: config.nodeId,
         subtitle: 'Configuration snapshot',
-        updatedAt: formatRelativeTime(config.updatedAt),
+        updatedAt: config.updatedAt,
         href: `/manager/${encodeURIComponent(config.nodeId)}`,
       }))}
       page={Number(data()?.page ?? page())}

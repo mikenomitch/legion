@@ -160,7 +160,7 @@ async fn simulated_fleet_registers_schedules_and_acks() -> R<()> {
         version: None,
     };
     let submission = Submission {
-        path: "sim-it.jsonnet".into(),
+        path: "sim-it.ncl".into(),
         content: "{}".into(),
         is_primary: true,
     };
@@ -183,12 +183,19 @@ async fn simulated_fleet_registers_schedules_and_acks() -> R<()> {
     })
     .await;
 
-    // Heartbeats also refresh manager-side liveness.
+    // Heartbeats also refresh manager-side liveness — in the leader's MEMORY,
+    // not in replicated state: a steady-state beat costs no commit
+    // (docs/node-liveness.md). The persisted timestamp column is refreshed by
+    // the display checkpoint, which the status-checker loop drives and this
+    // test does not run.
     let nodes = store.get_nodes()?;
-    assert!(
-        nodes.iter().all(|node| !node.last_heartbeat.is_empty()),
-        "every sim node has heartbeated"
-    );
+    for node in &nodes {
+        assert!(
+            store.liveness().last_beat(&node.id).is_some(),
+            "every sim node has heartbeated: {} has no observed beat",
+            node.id
+        );
+    }
 
     fleet.abort();
     Ok(())

@@ -6,6 +6,7 @@ A distributed scheduler similar to Kubernetes or Nomad.
 
 Full index: [docs/README.md](docs/README.md).
 
+- [Configuration Language (Nickel)](docs/configuration-language.md)
 - [Managers and Workers](docs/architecture-managers-workers.md)
 - [Plugin System](docs/plugin-system.md)
 - [Scheduler and Eval Loop](docs/scheduler-and-eval-loop.md)
@@ -28,10 +29,13 @@ Full index: [docs/README.md](docs/README.md).
 - [Preemption and Eviction](docs/preemption-and-eviction.md)
 - [Edge Boot (starting work before the placement is durable, boot tickets)](docs/edge-boot.md)
 - [Service Discovery](docs/service-discovery.md)
+- [Network Handlers](docs/network-handlers.md)
 - [State Store](docs/state-store.md)
+- [Node Liveness](docs/node-liveness.md) and [Heartbeat Cadence and Scale](docs/heartbeat-cadence-and-scale.md)
 - [Streaming Persistence](docs/persistence-streaming.md) and [Running Raft](docs/raft-operations.md)
 - [Logging (task logs, tailing, rotation, shipping, OTLP traces)](docs/logging.md)
 - [Observability](docs/observability.md)
+- [Diagnosing Scheduler Performance](docs/diagnosing-scheduler-performance.md)
 - [UI Architecture](docs/ui-architecture.md)
 - [KV Store](docs/kv-store.md)
 - [Auth & ACLs](docs/auth-and-acls.md)
@@ -67,6 +71,8 @@ It aims to be differentiated from the above based on the following:
 - Other Benefits:
   - OTEL compliant tracing, logs, and metrics
   - Well-documented GRPC interface
-  - Jsonnet configuration language for simple and DRY job specifications
-  - Raft is optional. Making life simpler — plain local SQLite by default, real quorum-replicated manager state (`persistence.type: raft`) when you need HA ([docs/multi-raft.md](docs/multi-raft.md))
+  - Nickel configuration language for simple and DRY job specifications —
+    with plain `.json` accepted anywhere for machine-emitted config
+    ([docs/configuration-language.md](docs/configuration-language.md))
+  - Raft is optional. Making life simpler — plain local SQLite by default, real quorum-replicated manager state (`persistence.type = "raft"`) when you need HA ([docs/multi-raft.md](docs/multi-raft.md))
   - Can easily be used as a library

@@ -16,7 +16,8 @@ written and syntax/unit-checked, unexercised against real AWS. So is
 `bootstrap-operator-box.sh` — its AWS calls and phase chain have been
 run end-to-end against stubbed `aws`/`ssh` binaries and nothing more.
 Treat the first `launch` as a test of the bootstrap as much as of the
-rig.
+rig. `bake-operator-ami.sh` is in that same state: every path exercised
+against a stubbed `aws`, no image baked against real AWS yet.
 
 ## Layout
 
@@ -26,7 +27,8 @@ rig.
 | `configs/` | Rendered-per-campaign config templates: Legion A (raft lanes), Legion B (streaming + S3 lease), Nomad servers, kubeadm + KWOK, Prometheus + Grafana stack. |
 | `workloads/` | `translate.py`: scenario JSON → Legion jobspecs / Nomad jobs / K8s Deployments, plus the driver's expectation manifest. `profile_split.py`: the shared fleet-shape split. |
 | `driver/` | `driver.py`: submits, watches placements, computes throughput/latency/recovery. `tests/`: the fixture suite that keeps the counting math honest. |
-| `scripts/` | The runbook, as executables (below). `bootstrap-operator-box.sh` builds the box you drive from; `phase1.sh` is the whole of phase 1, checkpointed. |
+| `../loadgen/` | `legion-loadgen`: the native Legion job submitter (`cargo build --features loadgen`). Legion-only on purpose — read the submission-path rule under Methodology before comparing a cell built with it to another system. |
+| `scripts/` | The runbook, as executables (below). `bootstrap-operator-box.sh` builds the box you drive from (`bake-operator-ami.sh` bakes its toolchain into an AMI first, from the one shared `operator-toolchain.sh`); `phase1.sh` is the whole of phase 1, checkpointed. |
 | `experiments/` | Piggyback drills: storm, failover, streaming RPO, 24h soak, upgrade-under-load. See `experiments/README.md`. |
 | `dashboards/` | Grafana boards provisioned onto the loadgen box. |
 | `analysis/` | `fit_curves.py`: scaling fits + 20k/50k projections with prediction intervals and validation deltas. |
@@ -48,6 +50,40 @@ The credentials build the box and are never copied onto it — it carries
 an IAM instance role instead. What it runs, checkpointed so a failure
 resumes rather than restarts, is `scripts/phase1.sh`: the six steps of
 the manual runbook below, ending at phase 1's exit criterion.
+
+### Bake the operator AMI first (one command, once per region)
+
+The box installs its whole toolchain — build-essential, protoc, clang,
+terraform, AWS CLI v2, rustup — at first boot. Measured on this rig,
+`cloud-init analyze blame` put `modules-final/config-scripts_user` at
+**3245 seconds (54 minutes)** on one launch and ~14 minutes on another:
+same instance type, same region, same script. It is nearly all
+`apt-get`, and it is paid before a single line of Legion compiles.
+
+Pay it once, into an AMI:
+
+```bash
+benchmarks/aws/scripts/bake-operator-ami.sh --region us-east-1   # ~20 min
+benchmarks/aws/scripts/bake-operator-ami.sh --show               # what is baked
+```
+
+`launch` then finds that image by tag and first boot is seconds instead
+of an hour. Cost is a c7i.large for the length of the bake plus ~$0.05/mo
+for the snapshot.
+
+**Nothing requires it.** With no baked AMI, `create` says so — naming the
+bake command — and installs the toolchain in user-data exactly as it
+always did. The slow path is a supported path, not a broken one;
+`--slow-bootstrap` takes it deliberately.
+
+**One list, two paths.** Both the bake and the fallback run
+`scripts/operator-toolchain.sh`, the single copy of what gets installed.
+The image is tagged with that file's hash, so when the toolchain changes,
+`create` reports the baked image as stale and falls back rather than
+launching a box missing the tool that was just added. Re-bake when it
+says so, and otherwise every few months so a new box is not `apt-get
+upgrade`-ing through a season of security updates. AMIs are regional —
+bake in the region the campaign runs in.
 
 **Why a separate box rather than your laptop.** `build-and-upload.sh`
 compiles the dist binary and plugin dylibs *for the rig's Linux x86_64
@@ -96,6 +132,9 @@ scripts/local-smoke.sh
 cp terraform/terraform.tfvars.example terraform/terraform.tfvars   # edit
 scripts/bringup.sh
 scripts/build-and-upload.sh          # dist binary + plugins -> S3
+                                     # (plugins are fingerprinted and only
+                                     #  rebuilt when they change; force with
+                                     #  --force-plugins)
 
 # 2. Legion campaign, both HA modes. One command each: scales the spot
 #    fleet per step, starts sim fleets, drives every workload, collects,
@@ -109,6 +148,10 @@ scripts/install-legion-b.sh
 scripts/run-campaign.sh --system legion-b
 
 # 3-4. Competitor campaigns (same boxes, serially — phase 3/4).
+#      LEGION_SUBMITTER=cli on the Legion campaigns these are compared
+#      against — see the submission-path rule under Methodology. Without
+#      it, Legion submits natively and Nomad/K8s spawn a process per job,
+#      and the table compares submitters instead of schedulers.
 scripts/install-nomad.sh  && scripts/run-campaign.sh --system nomad
 scripts/install-k8s.sh    && scripts/run-campaign.sh --system k8s
 
@@ -129,6 +172,61 @@ The 20k validation burst is one extra flag pass:
 `scripts/run-campaign.sh --system legion-a --steps "20000"` (the ASG
 tops out at 20 instances; `fit_curves.py` automatically treats a 20k
 cell as validation, not as fit input).
+
+### Saturating the scheduler (the other axis)
+
+Node count is one axis; allocations per node is the other, and it is the
+one that decides whether the scheduler is being asked for real work. A
+saturation sweep runs several densities at one node count, on one fleet,
+one cell per point:
+
+```bash
+scripts/run-campaign.sh --system legion-a --steps "5000" \
+    --allocs-per-node-sweep "5 10 20 40 80"
+```
+
+Each point lands in its own archive (`…-5000n-a25000`, `…-a50000`, …),
+and `fit_curves.py` prints the curve — including the points where the
+cluster stopped converging, which is the answer the sweep is looking for.
+The points deliberately share one fleet: restarting it between them puts
+a node-loss storm in the middle of the curve.
+
+`--allocs-per-node N` (default 5) sets the density for an ordinary
+scaling campaign, which is what puts the four steps at 5k/10k/25k/50k
+allocations.
+
+### Eval concurrency (`--eval-threads`)
+
+The third axis, and the one phase 2 found pointing the wrong way: more
+eval threads *cost* throughput (4 → 16 gave -12% at 1k nodes and -11% at
+5k) because the extra planners collided and their plans were discarded.
+Re-measuring that is how plan-apply conflict reduction gets judged, so
+the manager's `evalThreads` is rendered per campaign rather than
+hardcoded in `configs/legion/manager-a.ncl.tpl`:
+
+```bash
+scripts/run-campaign.sh --system legion-a --steps "1000 5000" --eval-threads 16
+```
+
+It is a control-plane setting, not a per-cell one, so it is one value per
+campaign — a sweep is one campaign per point, and each campaign's
+rendered config (archived in the fairness record) states the value it
+actually ran. `legion-a` only; passing it to another system is an error
+rather than a silent no-op, because a cell archived as a 16-thread result
+whose config says 4 is worse than a failed run.
+
+### Every campaign resets the control plane first
+
+`run-campaign.sh` wipes and reinstalls the control plane before its first
+step (`scripts/reset-control-plane.sh`, `--no-reset-control-plane` to opt
+out). This is load-bearing, not hygiene: **Legion cannot deregister a
+node**, so `stop-sim-fleet.sh` leaves every node record behind and the
+node table becomes a high-water mark of every fleet the boxes have ever
+carried. A 1,000-node cell run after a 4,000-node experiment otherwise
+measures a scheduler holding 3,000 corpses while reporting itself as a
+1,000-node result. Every cell now also gates on an exact node census —
+right count, all active and available, all named from this fleet's
+slices — and refuses to run otherwise, printing what it actually saw.
 
 ## Unattended runs (overnight, or from a cloud shell)
 
@@ -263,9 +361,37 @@ and tear it down when the campaign is over.
   asserting it. The metrics are per sim *process* (~1,250 nodes), not per
   node — see docs/metrics.md § Worker. Nomad and K8s fleets are not
   scraped this way, so worker-side cost is only compared via instance CPU.
+- **Submission paths are not interchangeable — the one rule that
+  invalidates a comparison if you break it.** Legion has a native
+  submitter, `legion-loadgen` (`benchmarks/loadgen/main.rs`): one
+  process, a few long-lived gRPC connections, hundreds of concurrent
+  `RunJob` calls. Nomad and K8s do not; they still spawn a CLI process
+  per job, which is the shared loop that made the comparison fair in the
+  first place. **A cross-system comparison must therefore either run all
+  three with `--submitter cli` (`LEGION_SUBMITTER=cli` for
+  `run-step.sh`), or add equivalent native submitters for Nomad and K8s
+  first.** Anything else compares submitters, not schedulers, and it does
+  so in Legion's favour. Every cell archives the path it took as
+  `submitter` in both `metrics.json` and `fairness-record.json`, so this
+  is checkable after the fact rather than a thing to remember.
+
+  The submitter exists because the CLI loop was not fast enough to
+  measure Legion's weakest case. `web_fleet` is ~6 allocations per job,
+  so its ~36-103 jobs/sec ceiling is only ~600 alloc/sec of demand, and
+  Legion already served ≥336 alloc/sec while the driver was the
+  constraint — every such cell reported `submission.driver_bound: true`,
+  which is a floor and not a measurement. A Legion-vs-Legion sweep
+  (scaling, saturation, eval-thread) is what `native` is for; a
+  Legion-vs-Nomad-vs-K8s table is not.
 - **Driver-side clocks.** Submit and placed timestamps are taken by the
   same driver process for every system; no cross-host clock skew enters
-  a latency, and all systems pay the same stream-delivery latency.
+  a latency, and all systems pay the same stream-delivery latency. The
+  native submitter is the one exception, and it is closed rather than
+  waived: it runs in its own process, so it stamps in UNIX epoch
+  milliseconds and the driver hands it the `monotonic - epoch` offset
+  (`--clock-offset-ms`) that rebases those stamps onto the same clock
+  its placement events use. Same host, same tick rate; only an NTP
+  *step* mid-cell could skew a latency.
 - **Expectation manifests.** The translator declares how many
   allocations every job must produce; the driver reports shortfalls
   (`complete: false`) instead of averaging over them.
@@ -290,6 +416,22 @@ and tear it down when the campaign is over.
 - Batch workloads translate to K8s Deployments (not Jobs) so all three
   systems schedule "keep N running" semantics; noted in the fairness
   record.
-- `collect.sh` snapshots Prometheus over a trailing window, not the
-  exact cell window; the driver's own timestamps are authoritative for
-  the reported numbers.
+- `collect.sh` snapshots Prometheus over the cell's own window when
+  `run-step.sh` supplies one (`CELL_START_EPOCH`), and falls back to a
+  trailing 2h superset otherwise; the fairness record says which. The
+  driver's own timestamps remain authoritative for the reported numbers.
+- **Nothing removes node records.** There is no deregistration RPC
+  (`Store::remove_node` has no production caller), so a fleet's nodes
+  outlive it and only a control-plane reset clears them. Node names are
+  therefore reused run to run on purpose — a unique per-run prefix would
+  make every run leak its whole fleet instead of overwriting the last
+  one's. The consequences are handled by the reset at campaign start and
+  the per-cell census gate, but the underlying gap is real.
+- **Fleet churn contaminates the cell that follows it.** Every fleet
+  stop/start marks thousands of nodes lost and raises a reschedule eval
+  per node (measured: 5,760 reschedules against 2,503 job submissions at
+  the 10k step), which competes with the cell's own submissions for the
+  eval workers. Cells now avoid the restart where they can, wait for the
+  backlog to drain where they cannot, and archive the depth they started
+  from in `pre-cell.json` and the fairness record — but a cell that
+  started from a non-zero backlog is still a cell to read carefully.

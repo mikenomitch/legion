@@ -1,9 +1,11 @@
 import { formatDistanceToNow } from 'date-fns'
 
-const toDate = (timestamp?: string | bigint): Date | undefined => {
+export const toDate = (timestamp?: string | bigint | number): Date | undefined => {
   if (timestamp === undefined || timestamp === null) return undefined
-  if (typeof timestamp === 'bigint') {
-    const millis = Number(timestamp) * 1000
+  if (typeof timestamp === 'bigint' || typeof timestamp === 'number') {
+    const numeric = Number(timestamp)
+    if (!Number.isFinite(numeric) || numeric === 0) return undefined
+    const millis = numeric * 1000
     const date = new Date(millis)
     return Number.isNaN(date.getTime()) ? undefined : date
   }
@@ -24,7 +26,7 @@ const toDate = (timestamp?: string | bigint): Date | undefined => {
   return Number.isNaN(parsed.getTime()) ? undefined : parsed
 }
 
-export const formatDate = (timestamp?: string | bigint): string => {
+export const formatDate = (timestamp?: string | bigint | number): string => {
   const parsed = toDate(timestamp)
   if (!parsed) return '—'
   return new Intl.DateTimeFormat('en', {
@@ -33,10 +35,41 @@ export const formatDate = (timestamp?: string | bigint): string => {
   }).format(parsed)
 }
 
-export const formatRelativeTime = (timestamp?: string | bigint): string => {
+// Absolute time with seconds, for tooltips on relative labels: the relative
+// text answers "how long ago", the tooltip answers "when exactly".
+export const formatDateTime = (timestamp?: string | bigint | number): string => {
+  const parsed = toDate(timestamp)
+  if (!parsed) return '—'
+  return new Intl.DateTimeFormat('en', {
+    dateStyle: 'medium',
+    timeStyle: 'medium',
+  }).format(parsed)
+}
+
+export const formatRelativeTime = (timestamp?: string | bigint | number): string => {
   const parsed = toDate(timestamp)
   if (!parsed) return '—'
   return formatDistanceToNow(parsed, { addSuffix: true })
+}
+
+// Where a node's last-heartbeat time came from, as a tooltip.
+//
+// Heartbeats live in the memory of the manager that owns node status; only
+// status TRANSITIONS are replicated. On any other manager the timestamp comes
+// from a periodic checkpoint and is up to `liveness.checkpointInterval` (30s)
+// behind — while the node's STATUS is exact everywhere. Surfaced quietly, as
+// a tooltip rather than a column: the status pill answers the operator's
+// actual question, and the freshness caveat should be findable, not loud.
+// See docs/node-liveness.md.
+export const heartbeatFreshnessHint = (source?: string): string | undefined => {
+  switch (source) {
+    case 'live':
+      return 'Observed by this manager, which owns node liveness.'
+    case 'checkpoint':
+      return 'From a replicated checkpoint — up to 30s behind. The node status is exact.'
+    default:
+      return undefined
+  }
 }
 
 const BYTE_UNITS = ['B', 'KiB', 'MiB', 'GiB', 'TiB', 'PiB']
@@ -59,3 +92,7 @@ export const asDisplay = (value?: string | bigint): string => {
   if (typeof value === 'bigint') return value.toString()
   return value === '' ? '—' : value
 }
+
+// "1 allocation" / "3 allocations": the singular/plural dance, once.
+export const pluralize = (count: number, singular: string, plural = `${singular}s`): string =>
+  `${count} ${count === 1 ? singular : plural}`

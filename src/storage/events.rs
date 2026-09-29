@@ -1010,6 +1010,92 @@ pub mod drafts {
     /// `volume.mounted` — a worker materialized a volume at a host path. For
     /// a node-local volume this is also the moment its instance becomes pinned
     /// to that node.
+    /// A network policy denied a connection or request (docs/network-handlers.md).
+    /// One event per folded denial row a node reported: `count` says how
+    /// many identical denials it stands for.
+    pub fn net_denied(node_id: &str, denial: &crate::structs::NetDenial) -> EventDraft {
+        let what = if denial.method.is_empty() {
+            denial.destination.clone()
+        } else {
+            format!(
+                "{} {} on {}",
+                denial.method, denial.path, denial.destination
+            )
+        };
+        let message = if denial.reason.is_empty() {
+            format!(
+                "Denied {} {} for {}/{} by {} (x{})",
+                denial.direction,
+                what,
+                denial.job_id,
+                denial.task_name,
+                denial.source,
+                denial.count.max(1)
+            )
+        } else {
+            format!(
+                "Denied {} {} for {}/{} by {}: {} (x{})",
+                denial.direction,
+                what,
+                denial.job_id,
+                denial.task_name,
+                denial.source,
+                denial.reason,
+                denial.count.max(1)
+            )
+        };
+        let mut draft = EventDraft::warn("net.denied", message).node(node_id);
+        if !denial.job_id.is_empty() {
+            draft = draft.job(&denial.job_id);
+        }
+        if denial.allocation_id != 0 {
+            draft = draft.allocation(denial.allocation_id);
+        }
+        draft.meta(json!({
+            "direction": denial.direction,
+            "protocol": denial.protocol,
+            "destination": denial.destination,
+            "source": denial.source,
+            "reason": denial.reason,
+            "identity": denial.identity,
+            "task": denial.task_name,
+            "count": denial.count,
+            "labels": denial.labels,
+            "method": denial.method,
+            "path": denial.path,
+        }))
+    }
+
+    /// A network policy object was created or replaced.
+    pub fn net_policy_applied(
+        name: &str,
+        enforcement: &str,
+        priority: i64,
+        affected: usize,
+    ) -> EventDraft {
+        EventDraft::info(
+            "net.policy_applied",
+            format!(
+                "Network policy {name} applied ({enforcement}, priority {priority}); {affected} running allocation(s) affected"
+            ),
+        )
+        .meta(json!({
+            "policy": name,
+            "enforcement": enforcement,
+            "priority": priority,
+            "affectedAllocations": affected,
+        }))
+    }
+
+    /// A network policy object was deleted.
+    pub fn net_policy_deleted(name: &str) -> EventDraft {
+        EventDraft::info(
+            "net.policy_deleted",
+            format!("Network policy {name} deleted"),
+        )
+        .meta(json!({ "policy": name }))
+    }
+
     pub fn volume_mounted(
         volume: &crate::structs::Volume,
         node_id: &str,
@@ -1512,6 +1598,23 @@ impl EventRecorder<'_> {
 
     pub fn artifact_pinned(self, job_id: &str, pins: &[ArtifactPin]) {
         self.emit_opt(drafts::artifact_pinned(job_id, pins));
+    }
+
+    pub fn net_denied(self, node_id: &str, denial: &crate::structs::NetDenial) {
+        self.emit(drafts::net_denied(node_id, denial));
+    }
+
+    pub fn net_policy_applied(self, name: &str, enforcement: &str, priority: i64, affected: usize) {
+        self.emit(drafts::net_policy_applied(
+            name,
+            enforcement,
+            priority,
+            affected,
+        ));
+    }
+
+    pub fn net_policy_deleted(self, name: &str) {
+        self.emit(drafts::net_policy_deleted(name));
     }
 
     pub fn volume_mounted(self, volume: &crate::structs::Volume, node_id: &str, path: &str) {

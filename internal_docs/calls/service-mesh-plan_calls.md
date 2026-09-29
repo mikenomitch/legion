@@ -1,0 +1,411 @@
+# Judgement Calls: The Built-in Service Mesh (unified plan)
+
+Decisions taken while re-examining the service-discovery mesh follow-on and
+unifying it with the network handlers plan
+([`plans/service-mesh-plan.md`](../plans/service-mesh-plan.md)). Calls that
+belong to policy, capture, and handlers specifically live in
+[`network-handlers-plan_calls.md`](network-handlers-plan_calls.md); these are
+the calls that changed the *mesh* design.
+
+**Entries are ranked by project impact, highest first; an entry's number is its
+rank.**
+
+---
+
+## 1. DNS resolves a service to the task's upstream VIP, never to raw endpoints
+
+**Call.** `<service>.svc.legion` answers with a per-allocation VIP in
+`127.0.0.0/8` on which `netd` listens on the service's canonical port. No A
+record ever names a backend node.
+
+```
+db.svc.legion  →  127.42.0.3   (netd listens on 127.42.0.3:5432)
+```
+
+**Alternatives.** The service-discovery plan's design: A records of every
+healthy endpoint, randomized, capped, TC-bit + TCP fallback for large sets,
+VIP "recommended" for load balancing.
+
+**Trade-off.** DNS-direct is gone as a consumption mode: a client that wants
+the raw endpoint list uses `legion service resolve` or the API. A VIP is
+per-allocation state on the node. macOS cannot do 127/8 VIPs without root
+`ifconfig lo0 alias`, so it keeps loopback ports and an SRV answer — two
+platform behaviors to document.
+
+**Why (simplicity, and it would not have worked).** Legion services live on
+dynamic host ports. An A record carries no port, so "resolve `db` by DNS and
+connect" was never going to reach a dynamic-port service without SRV support
+that almost no client has. The critique had already concluded VIP-first (B3)
+and spent two more rows (B1, B2) mitigating DNS-direct's failure modes. Making
+the VIP the *only* answer deletes all of that machinery, makes `db.svc.legion:5432`
+work in any URL or config file, and keeps balancing where it is health-aware
+— in the forwarder.
+
+---
+
+## 2. mTLS is on node identity with attributed workload identity, not per-workload certificates
+
+**Call.** The manager runs a **node CA**. `netd`↔`netd` hops are mTLS on node
+certs (SAN = `{region}:node:{pool}`). The sending `netd` attributes the
+workload in a PROXY v2 TLV; the receiving `netd` trusts the node peer and
+enforces intentions on the attribution. Per-workload certs are an on-demand
+feature for tasks that do their own TLS.
+
+**Alternatives.** The original plan: a workload CA issuing a short-lived cert
+per allocation, rotated, presented by the forwarder on the workload's behalf.
+Cryptographically stronger — the identity is proven by the cert, not asserted
+by a trusted node.
+
+**Trade-off.** A compromised node can misattribute any workload on it. That is
+also true of the per-workload design (the node's forwarder holds every
+workload's key), so the *practical* trust boundary is the same; the
+*cryptographic* one is weaker and the doc says so.
+
+**Why (performance, then simplicity).** The critique named the cert-rotation
+storm (A5) as a real risk: N×allocations short-lived certs is the Istio
+problem. N nodes is not. It is also ztunnel's model, which the industry
+arrived at for the same reason. And one CA that issues node certs closes the
+long-standing "worker mTLS / per-node credentials" TODO — raft transport auth
+gets the same certificates — so the mesh's identity work pays for the control
+plane's too.
+
+---
+
+## 3. There is no waypoint; L7 traffic management is `connect.upstreams[].http`
+
+**Call.** Retries, timeouts, canary split, and outlier ejection are options on
+an upstream, executed by `netd`'s HTTP mode on that upstream's listener. No
+separate per-service proxy, no plugin.
+
+**Alternatives.** The SD plan's waypoint: an Envoy/pingora datapath plugin
+attached per service identity, so L7 cost is paid only by services that ask.
+
+**Trade-off.** No Envoy feature parity, ever, by this route — `netd`'s HTTP
+implementation is the ceiling. No per-*service* L7 policy set by the service
+owner; it is per-*consumer*, set on the upstream. (Ingress `rules` cover the
+service owner's side.)
+
+**Why (simplicity).** The waypoint's justification was "L7 is opt-in." An
+`http` block on an upstream is also opt-in, at the same granularity, and it is
+one datapath to operate, benchmark, and secure instead of two. Legion's claim
+is the simplest scheduler to run; a second proxy with its own lifecycle,
+plugin ABI, and upgrade story would have been the mesh doing exactly what the
+plan's own tenets warned against.
+
+---
+
+## 4. `capture` becomes a value of `network.mode` — ↩ changes the handlers plan
+
+**Call.** The handlers plan's `network.capture = "gated" | "proxyEnv"` is
+replaced by `network.mode = "host" | "gated" | "auto"`, with `bridge` and
+`cni/<name>` reserved.
+
+**Alternatives.** Keep `capture` as a separate key so `mode` stays free for
+the datapath plugin.
+
+**Trade-off.** `mode` now means "which datapath" and `gated` is a datapath
+that assigns no IP, which is a slightly odd member of a list that will one
+day include `bridge`.
+
+**Why (simplicity).** `mode` has been parsed, stored, and read by nothing
+since service-discovery v1, reserved for precisely this — selecting how a
+task's network is built. Two fields that both answer "how is this task
+wired" would be the config-ordering footgun in miniature. `gated` *is* a
+datapath: loopback plus `netd`.
+
+---
+
+## 5. The datapath plugin stays deferred; gated namespaces are the isolation story
+
+**Call.** No `DatapathPlugin` ABI, no bridge, no CNI shim in this plan.
+
+**Alternatives.** Build it, as the SD plan's phase 4 — it is the item every
+comparison with Nomad/K8s raises.
+
+**Trade-off.** No per-allocation routable IP, so a workload that must be
+reached on arbitrary ports by IP, or must do raw UDP/ICMP, is not served. The
+CNI ecosystem stays outside.
+
+**Why (simplicity, and the buyer).** Everything in §1 of the plan — find,
+reach, control, see — is delivered by VIPs, gated namespaces, and `netd`
+without IPAM. Per-allocation IPs serve a different buyer (lift-and-shift of
+IP-centric software) and carry a platform-specific subsystem with them. The
+seam is kept open in `network.mode`; the work is not started.
+
+---
+
+## 6. Drain-before-stop is an ordering change, included; self-preservation is deferred
+
+**Call.** M6 marks an allocation draining before `SIGTERM`, withdrawing it
+from the feed and letting connections finish. The catalog's self-preservation
+on correlated failure is left for the discovery side.
+
+**Alternatives.** Do both here (they were listed together), or neither.
+
+**Trade-off.** A zone-wide health blip still mass-evicts from the feed; the
+forwarder fails static only on a *manager* outage, not on a correlated
+*health* failure.
+
+**Why.** Drain needs no new machinery — the per-node forwarder already
+outlives the app, so it is purely "stop routing, wait, then stop." Self-
+preservation is a detector-trust policy on the catalog projection, with no
+datapath component; putting it in a mesh plan would be scope for its own sake.
+
+---
+
+## 7. DNS-SD metadata records are dropped
+
+**Call.** No `_services.legion` PTR enumeration and no `meta.<svc>` TXT.
+
+**Alternatives.** Ship them — cheap once a resolver exists.
+
+**Trade-off.** No metadata-over-DNS for clients that cannot call the API.
+
+**Why (simplicity).** `legion service list`, `resolve`, the MCP tools, and the
+UI already answer "what services exist and what are they tagged." A resolver
+is a security-sensitive component; every record type it serves is surface to
+get right. Nothing asked for this.
+
+---
+
+## 8. Drain is worker-side timing keyed to the heartbeat interval, not a manager state
+
+**Call.** The manager keeps doing what it does — delete the allocation row,
+which withdraws the endpoint from every node's feed on that node's next
+heartbeat. The *worker*, on learning the allocation is undesired, moves it
+out of the live set and holds the signal for one heartbeat interval (or
+`stop.drain`) before the ladder. Only tasks with a `service` block drain;
+`"0s"` opts out; `5m` caps it.
+
+```nickel
+stop = { drain = "5s" }   # default: one heartbeat interval of the node
+```
+
+**Alternatives.** A `draining` allocation status in the store with a
+manager-side timer that deletes the row later (a new state, a new sweep, a
+new thing to reconcile after failover); or consumer-side retry on refused
+connections in the forwarder (hides the symptom, costs a round trip per
+rollout step, and does nothing for direct dialers).
+
+**Trade-off.** The window is a bound, not an acknowledgement — a node whose
+heartbeat is late learns late, and a connection it opens in that gap is still
+refused. Nothing is persisted: a worker restart mid-drain signals at restore,
+which is what grace already does. Every rollout step of a service task is one
+interval slower.
+
+**Why.** No new state, RPC, or failure mode; the read model already removes
+the endpoint on the same heartbeat that removes the allocation, so the only
+missing piece was the order on the worker. Simplicity, and the plan's own
+framing (§3.6: "an ordering change, not new machinery").
+
+---
+
+## 9. The datapath owns the advertised port; the task binds a private twin
+
+**Call.** With an ingress chain, the advertised port — `LEGION_PORT_<L>` as
+consumers and the catalog see it — is bound by the datapath on the host, and
+the task is handed a second, private port from the same dynamic range as its
+own `LEGION_PORT_<L>`. Nothing in the task changes; the task cannot take the
+advertised port back because the bind fails.
+
+**Alternatives.** Transparent redirect (iptables `REDIRECT` / eBPF) to a
+datapath port — kernel-dependent, root-only, absent on macOS. Or ask the task
+to bind a documented private port itself — a jobspec change per task, and
+nothing stops it binding the advertised one anyway.
+
+**Trade-off.** One more port per advertised port from the dynamic range; the
+task sees the datapath as its peer (attribution is in the access log until
+PROXY v2 lands with external handlers); health checks traverse the chain, so
+a deny-all ingress denies its own checker (`net doctor` warns, the doc says
+to allow `127.0.0.0/8`).
+
+**Why.** Enforceable everywhere with one mechanism and zero jobspec change —
+name-is-config applied to inbound. Simplicity and extensibility (the same
+listener is where PROXY v2, mTLS termination, and wake-on-request attach).
+
+---
+
+## 10. The mesh CA issues node certificates with manager-generated keys, not CSRs
+
+**Call.** `IssueNodeCertificate` returns a certificate *and* its private key
+over the authenticated, TLS-capable worker channel; the node keeps both in
+memory only and re-issues after a restart. The CA itself is generated on
+first use and stored in the replicated state store.
+
+**Alternatives.** A CSR flow (the node generates the key, the manager signs)
+— the textbook shape; or reusing the workload-identity signing key as the CA
+(one fewer secret).
+
+**Trade-off.** The key crosses the wire once per issuance (24h) and lives in
+the manager's memory for the duration of the call; a compromised manager
+could mint node identities — which it already can, holding every node
+token. Reusing the JWT key would have tied mesh rotation to token rotation.
+
+**Why.** Simplicity: one RPC, no CSR parsing, nothing on the node's disk, and
+rotation is "delete the row". The threat this must resist is a workload or
+an outsider forging a node, not the manager — and the manager is already the
+root of trust for everything a node is told. Calls entry 2's shape (node
+identity, attributed workload) is what makes a 24-hour node credential enough.
+
+---
+
+## 11. Handler endpoints ride the upstream feed with a flag, not a new message
+
+**Call.** A `proxy` hop's target endpoints arrive in
+`HeartbeatReply.upstream_endpoints` marked `for_handler = true`; the worker
+routes them to the handler table instead of a listener. The manager computes
+them from the cached effective policy (plus the task's own upstream
+handlers), so a node with no handlers pays one pass over its policy hashes.
+
+**Alternatives.** A separate `handler_endpoints` message (cleaner types, one
+more thing every worker version must know); or having the worker resolve
+targets itself via `ResolveService` on hand-off (a control-plane RPC on the
+byte path, and fail-static lost).
+
+**Trade-off.** One boolean that consumers of the feed must respect; an old
+worker would start a listener for a handler target (harmless, unused).
+
+**Why.** The endpoint feed already has the right semantics — healthy only,
+intention-filtered, replaced only on a successful heartbeat — and the
+datapath doctrine is "no control-plane call on the byte path". Extensibility
+with the least surface.
+
+---
+
+## 12. `authz` is called at connect time on L4 paths and per request in HTTP mode, never both
+
+**Call.** A webhook sees connect-time facts on a splice, `CONNECT`, SOCKS or
+an ingress splice, and the request head in HTTP mode — one call per flow
+unit, cached per (hop, identity, destination[, method, path]) with a
+`10s` default TTL.
+
+**Alternatives.** Always call at connect time and again per request (two
+calls for the first request of an HTTP connection); or only ever at connect
+time (no path/method for the webhook).
+
+**Trade-off.** In HTTP mode a webhook that only cares about hosts is asked
+per distinct path until the cache warms; the default TTL means a revoked
+allow can live 10 seconds (bounded by `cache`, capped at 5m).
+
+**Why.** The webhook exists so custom logic does not have to be a proxy; in
+HTTP mode the request head *is* the interesting fact. Performance: one call
+per new key, and the L7 cost is only paid where the operator already chose
+`protocol = "http"` (handlers plan §7.1).
+
+---
+
+## 13. Graph edges are recorded on the calling side and folded on the manager, never stored
+
+**Call.** Each node's datapath keeps deltas per (allocation, upstream, tag)
+between heartbeats; the manager folds them into 15 minutes of per-minute
+buckets in memory and serves `ListServiceEdges` from those plus the declared
+upstreams. Nothing is written to the state store.
+
+**Alternatives.** Record on the receiving side (ingress) as well, for
+attribution of outside callers; persist buckets in the store for history and
+failover; or export samples only as Prometheus metrics and let a TSDB draw
+the graph.
+
+**Trade-off.** A caller outside Legion is not an edge (its denials are still
+events); a manager failover starts the graph empty; 15 minutes is the whole
+history — longer views are the metrics endpoint's job. Per-tag rows come
+free from the balancer's choice, so a canary reads as its own edge.
+
+**Why.** Performance and simplicity: the caller already knows the upstream
+and the tag with no lookup, the heartbeat already carries reports with a
+restore-on-failure contract, and an in-memory window costs no replicated
+writes at all — the graph is a projection, like the catalog (calls entry 1's
+doctrine). Metric labels could not carry (caller, service) pairs without
+blowing the bounded-label rule (handlers plan §7.11).
+
+---
+
+## 14. Templates live under `connect`, render on the worker, and know three functions
+
+**Call.** `connect.templates` (not a top-level `templates` block) renders files
+on the worker from the task's upstreams and the endpoint feed the node
+already holds, with exactly `service`, `range endpoints`, and `env`.
+
+**Alternatives.** A top-level task block (needs a new `task_config` column,
+migration, and dispatch field); manager-side rendering pushed on the
+heartbeat (a render per allocation per beat on the manager, and a second
+copy of the feed on the wire); a real template engine (`tera`, `minijinja`)
+with conditionals and filters.
+
+**Trade-off.** No `{{ kv }}` in these templates (KV injection already
+renders manager-side, and mixing two engines in one file would be worse than
+two files); no conditionals — a template that needs logic is a script that
+reads the file. The `connect` placement means a task with templates but no
+upstreams has nothing to render, which is the point.
+
+**Why.** Templates exist to consume upstreams, so they belong with them; the
+worker has the feed, the task dir, and the signal path already; and three
+functions are what consul-template users actually use. Simplicity, and
+performance (no manager work per beat).
+
+---
+
+## 15. The guest agent is the worker binary itself, copied into the rootfs
+
+**Call.** A gated sandbox's guest agent is `legion guest-agent`, a hidden
+subcommand of the one Legion binary, copied to `/legion/legion` when the
+root disk is built and started by the generated init before the command.
+
+**Alternatives.** A separate statically linked agent crate (musl) shipped as
+a second artifact; a shell-only relay (impossible — nothing in busybox
+speaks vsock); requiring images to bundle an agent.
+
+**Trade-off.** A glibc worker binary will not run on a musl (Alpine) image —
+init reports it on the console and the guest has no network, which is the
+fail-closed outcome but not a working one; the root disk grows by the size
+of the binary. A static agent is the follow-up (TODO).
+
+**Why.** Simplicity of shipping: "one binary" is a headline property of the
+project, the agent needs `libc` sockets and threads only, and the copy costs
+nothing to build. Correctness first, footprint second.
+
+---
+
+## 16. `auto` stays `host` for sandboxes until the vsock path boots in CI
+
+**Call.** The mode table's promise — `auto` = `gated` for `sandbox` — is not
+flipped in this phase. `network.mode = "gated"` on a sandbox is fully wired
+and opt-in; `auto` resolves to `host` for every runtime.
+
+**Alternatives.** Flip the default now (the plan's end state), trusting the
+unit tests over Unix sockets.
+
+**Trade-off.** Sandbox authors must write one line to get the boundary this
+work exists for, until the flip.
+
+**Why.** A default that has never been exercised end to end on the hardware
+it targets (no KVM in this repository's CI) would be a default nobody has
+seen work. The safe change is opt-in first, flip after a real boot —
+honesty over ceremony.
+
+---
+
+## 17. The datapath survives a worker restart by replaying persisted inputs, not by becoming a process
+
+**Call.** M5 ships as persistence: the worker saves what the datapath was
+told (desired set, endpoint feed, policy assignments and bodies) and replays
+it before the first heartbeat after a restart. `legion netd` as a separate,
+supervised process with `SCM_RIGHTS` listener hand-off — the plan's §3.1 —
+is deferred.
+
+**Alternatives.** The process split as planned (a Unix-socket control
+protocol, a supervisor, fd hand-off on upgrade, its own crash domain).
+
+**Trade-off.** In-flight connections drop when the worker restarts, and
+there is a gap of the process start time (hundreds of milliseconds) rather
+than zero; a panic in the datapath still takes the worker with it.
+
+**Why.** The failure this phase exists to fix is "a gated sandbox loses its
+network until the manager is reachable again after a worker upgrade" — and
+that is a *persistence* failure, fixed in full here without a second
+process, a control protocol, or a supervisor to get wrong. The split
+remains the right end state for zero-drop upgrades and crash isolation; it
+is the largest single piece of the plan, and shipping the durable half first
+keeps every other phase testable in this repository. Simplicity now,
+extensibility kept (the datapath's inputs are already a serialisable
+message — the split's wire format).

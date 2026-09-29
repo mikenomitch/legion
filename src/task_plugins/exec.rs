@@ -1,9 +1,15 @@
 use crate::prelude::*;
 use crate::structs::{Allocation, TaskConfig};
 use crate::task_plugins::exec_isolation::{
-    cap_last_cap, capabilities_to_drop, enforcement_enabled, parse_umask, remove_managed_cgroup,
-    ExecHardeningConfig,
+    enforcement_enabled, remove_managed_cgroup, ExecHardeningConfig,
 };
+// Linux-only: these are called from the pre-exec hardening block, which is
+// itself `cfg(target_os = "linux")` because it goes through `libc::prctl`
+// and `PR_CAPBSET_DROP`. Importing them unconditionally made every macOS
+// build warn, and `cargo clippy -- -D warnings` fails on it — green on CI,
+// which is Linux, and broken for anyone developing on a Mac.
+#[cfg(target_os = "linux")]
+use crate::task_plugins::exec_isolation::{cap_last_cap, capabilities_to_drop, parse_umask};
 use crate::task_plugins::{
     configure_task_log_capture, derived_schema, spawn_pipe, spawn_pty, spawn_task_process,
     ExecOptions, ExecSession, ExecSupport, TaskInstance, TaskPlugin,
@@ -192,6 +198,7 @@ impl ExecTaskConfig {
             managed_cgroup: None,
             hardening: self.hardening.clone(),
             user: None,
+            netns: None,
         })
     }
 }
@@ -207,6 +214,11 @@ struct ExecLinuxOptions {
     /// task did not name a cgroup of its own.
     managed_cgroup: Option<std::path::PathBuf>,
     hardening: Option<ExecHardeningConfig>,
+    /// A gated network namespace (`network.mode = "gated"`) to enter before
+    /// exec: `/var/run/netns/legion-<allocation>`, created by the worker
+    /// ahead of start. Entered before the user switch (it needs the
+    /// worker's privileges) and before landlock.
+    netns: Option<std::path::PathBuf>,
     /// User to switch to inside the child, when the plugin owns the switch
     /// (privileged hardening steps must run before dropping privileges, and
     /// `Command::uid` drops them before pre-exec closures run).
@@ -248,6 +260,26 @@ impl ExecTaskPlugin {
 }
 
 impl TaskPlugin for ExecTaskPlugin {
+    /// A gated allocation's namespace is a real boundary: nothing leaves it
+    /// except through the datapath, which holds its policy until ratified.
+    fn network_gate_for(&self, allocation: &Allocation) -> crate::task_plugins::NetworkGate {
+        if crate::task_plugins::allocation_is_gated(allocation) {
+            crate::task_plugins::NetworkGate::Enforced
+        } else {
+            crate::task_plugins::NetworkGate::Advisory
+        }
+    }
+
+    fn set_network_gate(
+        &self,
+        allocation: &Allocation,
+        _task: &TaskConfig,
+        _instance: &mut TaskInstance,
+        open: bool,
+    ) -> R<()> {
+        crate::task_plugins::set_gated_namespace_gate(allocation, open)
+    }
+
     fn name(&self) -> &'static str {
         "exec"
     }
@@ -398,6 +430,20 @@ impl TaskPlugin for ExecTaskPlugin {
             .context("exec task command must include at least one entry")?;
 
         let mut linux_options = config.linux_options()?;
+        // A gated allocation runs inside the namespace the worker created
+        // for it (docs/network-handlers.md). Its absence is a hard stop, not
+        // a silent fall back to host networking.
+        if crate::task_plugins::allocation_is_gated(allocation) {
+            let path = crate::worker::netd::netns::netns_path(allocation.id);
+            if !path.exists() {
+                bail!(
+                    "gated network namespace {} is not ready; the worker creates it before start \
+                     and retries on its next heartbeat",
+                    path.display()
+                );
+            }
+            linux_options.netns = Some(path);
+        }
         // Worker-owned resource enforcement: worker core already created this
         // allocation's cgroup and wrote its limits (see
         // `src/worker/resources.rs`); the plugin only has to spawn into it.
@@ -603,6 +649,17 @@ fn configure_linux_process_options(
                     .join("cgroup.procs");
                 std::fs::write(cgroup_procs, std::process::id().to_string())
                     .map_err(std::io::Error::other)?;
+            }
+
+            // 1.5 Gated networking: enter the allocation's namespace, whose
+            //     only way out is the datapath's listeners. Before the user
+            //     switch (setns needs CAP_SYS_ADMIN) and before landlock.
+            if let Some(ref netns) = options.netns {
+                let file = std::fs::File::open(netns)?;
+                use std::os::fd::AsRawFd;
+                if libc::setns(file.as_raw_fd(), libc::CLONE_NEWNET) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
             }
 
             if let Some(ref hardening) = options.hardening {
@@ -931,6 +988,7 @@ mod tests {
             stop: Some(crate::structs::StopConfig {
                 signal: "SIGTERM".into(),
                 kill_after: std::time::Duration::from_secs(30),
+                drain: None,
             }),
             ..TaskConfig::new("drain", "exec")
         };
@@ -1007,6 +1065,7 @@ mod tests {
             stop: Some(crate::structs::StopConfig {
                 signal: "SIGTERM".into(),
                 kill_after: std::time::Duration::from_secs(1),
+                drain: None,
             }),
             ..TaskConfig::new("stubborn", "exec")
         };

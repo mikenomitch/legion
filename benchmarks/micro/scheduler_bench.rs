@@ -1,9 +1,10 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use serde_json::json;
+use std::cell::RefCell;
 use std::time::Duration;
-use tempfile::Builder;
+use tempfile::{Builder, TempDir};
 
-use legion::manager::scheduler::{PlanMode, Scheduler};
+use legion::manager::scheduler::{PlanMode, PlanTimings, Scheduler};
 use legion::storage::store::Store;
 use legion::structs::{
     config::ManagerConfigFull, JobConfig, NodeMsg, Submission, TaskConfig, TaskCount,
@@ -12,24 +13,32 @@ use legion::structs::{
 const SCALE_STEPS: &[usize] = &[10, 100, 1_000, 10_000, 100_000];
 const JOB_COUNT: usize = 10;
 
-fn store_path(prefix: &str) -> anyhow::Result<String> {
-    let store_dir = Builder::new().prefix(prefix).tempdir()?.keep();
-    Ok(store_dir
+/// The `TempDir` guard rides alongside the path so the on-disk store is
+/// deleted when the iteration's tuple drops. The previous `.keep()` leaked
+/// one store directory per iteration — at the 100k-allocation cells that
+/// filled the disk over a run and skewed late samples with filesystem
+/// pressure.
+fn store_path(prefix: &str) -> anyhow::Result<(String, TempDir)> {
+    let store_dir = Builder::new().prefix(prefix).tempdir()?;
+    let path = store_dir
+        .path()
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("Error parsing store path"))?
-        .to_string())
+        .to_string();
+    Ok((path, store_dir))
 }
 
-fn setup_store(policy: &str) -> anyhow::Result<Store> {
+fn setup_store(policy: &str) -> anyhow::Result<(Store, TempDir)> {
     setup_store_with_settings(policy, None)
 }
 
 fn setup_store_with_settings(
     policy: &str,
     scheduler_settings: Option<serde_json::Value>,
-) -> anyhow::Result<Store> {
+) -> anyhow::Result<(Store, TempDir)> {
+    let (store_path, store_dir) = store_path("legion-scheduler-bench-")?;
     let store_config = ManagerConfigFull {
-        store_path: store_path("khepri-scheduler-bench-")?,
+        store_path,
         scheduling_policy: policy.into(),
         task_resource_defaults: Some(json!({
             "cpu": 0,
@@ -42,7 +51,7 @@ fn setup_store_with_settings(
 
     let store = Store::start_storage(&store_config)?;
     store.reset_all_tables()?;
-    Ok(store)
+    Ok((store, store_dir))
 }
 
 fn default_fingerprint() -> serde_json::Value {
@@ -66,6 +75,7 @@ fn make_node_msg(id: &str, attrs: serde_json::Value) -> NodeMsg {
         dynamic_attrs: json!({}).to_string(),
         health_checks: "{}".into(),
         last_heartbeat: "2023-01-01 00:00:00 +00:00:00".into(),
+        heartbeat_source: String::new(),
     }
 }
 
@@ -100,7 +110,7 @@ fn make_jobs(total_allocations: usize) -> Vec<JobConfig> {
 fn submit_jobs(store: &Store, jobs: &[JobConfig]) -> anyhow::Result<Vec<String>> {
     let mut ids = Vec::with_capacity(jobs.len());
     let submission = Submission {
-        path: "bench.jsonnet".into(),
+        path: "bench.ncl".into(),
         content: "{}".into(),
         is_primary: true,
     };
@@ -127,13 +137,16 @@ fn scheduler_speed_benchmark(c: &mut Criterion) {
                 group.bench_function(bench_id, |b| {
                     b.iter_batched(
                         || {
-                            let store = setup_store(policy).expect("store");
+                            let (store, dir) = setup_store(policy).expect("store");
                             insert_uniform_nodes(&store, node_count).expect("nodes");
                             let jobs = make_jobs(allocation_count);
                             let job_ids = submit_jobs(&store, &jobs).expect("jobs");
-                            (store, job_ids)
+                            (store, dir, job_ids)
                         },
-                        |(store, job_ids)| {
+                        // Returning the store and its tempdir moves their
+                        // drops (connection close + directory removal)
+                        // outside the timed section.
+                        |(store, dir, job_ids)| {
                             for job_config_id in job_ids {
                                 let scheduler = Scheduler::new(&store).expect("scheduler");
                                 let outcome = scheduler
@@ -141,6 +154,7 @@ fn scheduler_speed_benchmark(c: &mut Criterion) {
                                     .expect("plan");
                                 assert!(!outcome.allocations.is_empty());
                             }
+                            (store, dir)
                         },
                         criterion::BatchSize::LargeInput,
                     );
@@ -226,14 +240,15 @@ fn candidate_construction_benchmark(c: &mut Criterion) {
             group.bench_function(bench_id, |b| {
                 b.iter_batched(
                     || {
-                        let store = setup_store_with_settings("bin_pack", Some(settings.clone()))
-                            .expect("store");
+                        let (store, dir) =
+                            setup_store_with_settings("bin_pack", Some(settings.clone()))
+                                .expect("store");
                         insert_regional_nodes(&store, node_count).expect("nodes");
                         let job = make_constrained_job(12, 2);
                         let ids = submit_jobs(&store, std::slice::from_ref(&job)).expect("job");
-                        (store, ids)
+                        (store, dir, ids)
                     },
-                    |(store, job_ids)| {
+                    |(store, dir, job_ids)| {
                         let scheduler = Scheduler::new(&store).expect("scheduler");
                         for job_config_id in job_ids {
                             let plan = scheduler
@@ -241,6 +256,8 @@ fn candidate_construction_benchmark(c: &mut Criterion) {
                                 .expect("plan");
                             assert!(!plan.is_empty());
                         }
+                        drop(scheduler);
+                        (store, dir)
                     },
                     criterion::BatchSize::LargeInput,
                 );
@@ -251,9 +268,189 @@ fn candidate_construction_benchmark(c: &mut Criterion) {
     group.finish();
 }
 
+// ---------------------------------------------------------------------------
+// Planning under cluster fill
+// ---------------------------------------------------------------------------
+//
+// The AWS `dense_fleet` ladder loses ~1.65x throughput per doubling of live
+// allocations on a fixed 5,000-node fleet while the planned job stays the
+// same size. Neither group above can reproduce that: `scheduler_speed`
+// starts from an empty cluster and `candidate_construction` from an
+// unallocated one, so any per-plan cost that scales with *other jobs'*
+// allocations is invisible to both. This group pre-fills a 5,000-node fleet
+// with 0/10/40 allocations per node from filler jobs, then plans a
+// six-placement job (the AWS per-eval shape) against it — as a read-only
+// plan (`plan_only`, the planning phases alone) and as a full
+// plan-and-apply. A cost that is flat across the fill axis is a per-plan
+// constant; one that grows with it is the slope the ladder measured.
+
+const FILL_NODES: usize = 5_000;
+const FILL_PER_NODE: &[usize] = &[0, 10, 40];
+const FILL_JOBS: usize = 10;
+const FILL_PLACEMENTS_PER_JOB: u32 = 6;
+/// Placements per `apply_allocation_plan` call while filling. Chunked by
+/// node range so every node's allocation list is reloaded into the read
+/// model once, with all its rows, rather than once per allocation.
+const FILL_CHUNK_NODES: usize = 125;
+
+/// Fill every node with `per_node` allocations spread across `FILL_JOBS`
+/// filler jobs, through the store's allocation writer rather than the
+/// scheduler, so the fill is fast and independent of the code under test.
+fn fill_fleet(store: &Store, node_count: usize, per_node: usize) -> anyhow::Result<()> {
+    if per_node == 0 {
+        return Ok(());
+    }
+    let mut filler_task_ids = Vec::with_capacity(FILL_JOBS);
+    for job_idx in 0..FILL_JOBS {
+        let job = JobConfig {
+            priority: Default::default(),
+            name: format!("filler-{job_idx}"),
+            tasks: vec![TaskConfig {
+                count: TaskCount::new((node_count * per_node / FILL_JOBS) as u32),
+                ..TaskConfig::new("filler", "noop")
+            }],
+            rollout: None,
+            rollout_by_group: Default::default(),
+            version: None,
+        };
+        let job_config_id = submit_jobs(store, std::slice::from_ref(&job))?
+            .pop()
+            .expect("one id per job");
+        let tasks = store.cached_task_configs_for_job_config(&job_config_id)?;
+        filler_task_ids.push(tasks[0].0);
+    }
+
+    let mut placements = Vec::with_capacity(FILL_CHUNK_NODES * per_node);
+    for node_idx in 0..node_count {
+        for slot in 0..per_node {
+            let task_id = filler_task_ids[(node_idx * per_node + slot) % FILL_JOBS];
+            placements.push((format!("node-{node_idx}"), task_id));
+        }
+        if (node_idx + 1) % FILL_CHUNK_NODES == 0 || node_idx + 1 == node_count {
+            store.apply_allocation_plan(&placements)?;
+            placements.clear();
+        }
+    }
+    Ok(())
+}
+
+fn make_fill_job(name: &str) -> JobConfig {
+    JobConfig {
+        priority: Default::default(),
+        name: name.to_string(),
+        tasks: vec![TaskConfig {
+            count: TaskCount::new(FILL_PLACEMENTS_PER_JOB),
+            ..TaskConfig::new("svc", "noop")
+        }],
+        rollout: None,
+        rollout_by_group: Default::default(),
+        version: None,
+    }
+}
+
+fn plan_under_fill_benchmark(c: &mut Criterion) {
+    let mut group = c.benchmark_group("plan_under_fill");
+    group.warm_up_time(Duration::from_millis(500));
+    group.measurement_time(Duration::from_secs(5));
+    group.sample_size(20);
+
+    for &per_node in FILL_PER_NODE {
+        // One filled store per fill level, shared by both cells: the fill
+        // is the expensive part of the setup and neither cell's measured
+        // work depends on the other's.
+        let (store, _dir) = setup_store("bin_pack").expect("store");
+        insert_uniform_nodes(&store, FILL_NODES).expect("nodes");
+        fill_fleet(&store, FILL_NODES, per_node).expect("fill");
+
+        let planned_job = make_fill_job("planned");
+        let planned_id = submit_jobs(&store, std::slice::from_ref(&planned_job))
+            .expect("planned job")
+            .pop()
+            .expect("one id");
+        group.bench_function(
+            BenchmarkId::new("plan_only", format!("fill_{per_node}")),
+            |b| {
+                b.iter(|| {
+                    let scheduler = Scheduler::new(&store).expect("scheduler");
+                    let plan = scheduler
+                        .plan_only(&planned_id, PlanMode::Fresh)
+                        .expect("plan");
+                    assert_eq!(plan.len(), FILL_PLACEMENTS_PER_JOB as usize);
+                    plan
+                })
+            },
+        );
+
+        // A fresh job per iteration (submitted in the untimed setup), so
+        // every apply is a first placement and the state drift across the
+        // run is six allocations per iteration against the fill. The
+        // per-phase `PlanTimings` of every measured plan are averaged and
+        // printed after the cell, so a run also says WHERE the time went
+        // at each fill level (the same phases as the
+        // `legion_scheduler_plan_phase_seconds` metric).
+        let mut next_job = 0usize;
+        let timings: RefCell<Vec<PlanTimings>> = RefCell::new(Vec::new());
+        group.bench_function(
+            BenchmarkId::new("plan_and_apply", format!("fill_{per_node}")),
+            |b| {
+                b.iter_batched(
+                    || {
+                        next_job += 1;
+                        let job = make_fill_job(&format!("applied-{next_job}"));
+                        submit_jobs(&store, std::slice::from_ref(&job))
+                            .expect("job")
+                            .pop()
+                            .expect("one id")
+                    },
+                    |job_config_id| {
+                        let scheduler = Scheduler::new(&store).expect("scheduler");
+                        let outcome = scheduler
+                            .plan_and_apply(&job_config_id, PlanMode::Fresh)
+                            .expect("plan");
+                        assert_eq!(outcome.allocations.len(), FILL_PLACEMENTS_PER_JOB as usize);
+                        timings.borrow_mut().push(outcome.timings.clone());
+                        outcome
+                    },
+                    criterion::BatchSize::PerIteration,
+                );
+            },
+        );
+        print_phase_means(
+            &format!("plan_under_fill/plan_and_apply/fill_{per_node}"),
+            &timings.borrow(),
+        );
+    }
+
+    group.finish();
+}
+
+/// Mean per-phase microseconds over every plan a cell measured, in the
+/// order the phases run.
+fn print_phase_means(cell: &str, samples: &[PlanTimings]) {
+    if samples.is_empty() {
+        return;
+    }
+    let mean = |pick: fn(&PlanTimings) -> u64| {
+        samples.iter().map(pick).sum::<u64>() as f64 / samples.len() as f64
+    };
+    eprintln!(
+        "{cell} phase means over {} plans (us): nodes {:.0}, versions {:.0}, tasks {:.0}, \
+         capacity {:.0}, build {:.0}, apply {:.0}, total {:.0}",
+        samples.len(),
+        mean(|t| t.available_nodes_us),
+        mean(|t| t.version_sample_us),
+        mean(|t| t.task_fetch_us),
+        mean(|t| t.capacity_snapshot_us),
+        mean(|t| t.build_plan_us),
+        mean(|t| t.apply_us),
+        mean(|t| t.total_us),
+    );
+}
+
 criterion_group!(
     benches,
     scheduler_speed_benchmark,
-    candidate_construction_benchmark
+    candidate_construction_benchmark,
+    plan_under_fill_benchmark
 );
 criterion_main!(benches);

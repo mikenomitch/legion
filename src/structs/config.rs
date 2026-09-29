@@ -7,9 +7,13 @@ use serde_json::Value;
 pub const DEF_SCHEDULER_AUTO_ANTI_AFFINITY_WEIGHT: f64 = 0.2;
 
 use crate::prelude::{
-    bail, Context, DEF_EVAL_PRIORITY, DEF_KV_DEBOUNCE_MS, DEF_MANAGER_HOSTNAME,
-    DEF_MANAGER_INSECURE_PORT, DEF_MANAGER_SERVER_PORT, DEF_ROLLOUT_RETENTION_DAYS,
-    DEF_SCHEDULING_POLICY, DEF_STORE_PATH, DEF_WORKER_CHECK_SEC, DEF_WORKER_CONFIG_PATH, R,
+    bail, Context, DEF_EVAL_PRIORITY, DEF_HEARTBEAT_HEADROOM, DEF_HEARTBEAT_MAX_INTERVAL_SEC,
+    DEF_HEARTBEAT_MIN_INTERVAL_SEC, DEF_KV_DEBOUNCE_MS, DEF_LIVENESS_CHECKPOINT_INTERVAL_SEC,
+    DEF_LIVENESS_DIGEST_INTERVAL_SEC, DEF_LIVENESS_FAILOVER_GRACE_SEC,
+    DEF_LIVENESS_PEER_DIGEST_GRACE_SEC, DEF_MANAGER_HOSTNAME, DEF_MANAGER_INSECURE_PORT,
+    DEF_MANAGER_SERVER_PORT, DEF_MISSED_BEATS_BEFORE_LOST, DEF_ROLLOUT_RETENTION_DAYS,
+    DEF_SCHEDULING_POLICY, DEF_STORE_PATH, DEF_WORKER_CHECK_SEC, DEF_WORKER_CONFIG_PATH,
+    MIN_LIVENESS_CHECKPOINT_INTERVAL_SEC, R,
 };
 use crate::structs::workload_identity::NodeIdentityConfig;
 
@@ -110,6 +114,366 @@ pub struct ManagerConfig {
     /// authorization surface and must be an explicit operator decision.
     #[serde(default)]
     pub edge_boot: Option<EdgeBootConfig>,
+    /// Heartbeat cadence and the lost-node window derived from it (see
+    /// docs/heartbeat-cadence-and-scale.md). Omitting it reproduces the
+    /// historical 2s cadence and 10s window exactly.
+    #[serde(default)]
+    pub heartbeat: Option<HeartbeatConfig>,
+    /// Node liveness: the failover grace, the peer digest, and the display
+    /// checkpoint (see docs/node-liveness.md).
+    #[serde(default)]
+    pub liveness: Option<LivenessConfig>,
+}
+
+/// Heartbeat cadence and node liveness windows
+/// (docs/heartbeat-cadence-and-scale.md).
+///
+/// Omitting the whole block reproduces Legion's historical behavior exactly:
+/// workers keep their worker-type `heartbeatSeconds`, nothing adapts, and
+/// `missedBeatsBeforeLost: 5` x the 2s default is the historical fixed 10s
+/// lost window.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct HeartbeatConfig {
+    /// Aggregate heartbeat rate this control plane will accept, per second.
+    ///
+    /// When set, the manager computes each worker's interval from FLEET SIZE
+    /// (`headroom x nodes / rate`) and serves it on the heartbeat reply, so
+    /// cadence backs off as the fleet grows instead of healthy nodes being
+    /// marked lost. Unset (the default) means workers keep their worker-type
+    /// `heartbeatSeconds` and nothing adapts.
+    ///
+    /// Off by default on purpose: a system that quietly slows its own
+    /// heartbeats to score better on a throughput benchmark is cheating.
+    /// Measure yours with `legion node cadence`.
+    #[serde(default)]
+    pub target_rate_per_second: Option<f64>,
+    /// Floor on the served interval, never crossed however small the fleet.
+    /// Default `2s`.
+    #[serde(default)]
+    pub min_interval: Option<String>,
+    /// Ceiling on the served interval. Where the manager gives up backing off
+    /// and warns instead. Default `120s`.
+    #[serde(default)]
+    pub max_interval: Option<String>,
+    /// Missed beats before a node is lost. The lost window is ALWAYS this
+    /// times that node's own interval — `5 x 2s` is the historical 10s.
+    /// Default 5.
+    #[serde(default)]
+    pub missed_beats_before_lost: Option<u32>,
+    /// Headroom factor in the sizing formula. 2 means "run at half the
+    /// measured ceiling so a burst is not an outage". Default 2.
+    #[serde(default)]
+    pub headroom: Option<f64>,
+}
+
+/// Resolved [`HeartbeatConfig`].
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct HeartbeatConfigFull {
+    pub target_rate_per_second: Option<f64>,
+    pub min_interval: String,
+    pub max_interval: String,
+    pub missed_beats_before_lost: u32,
+    pub headroom: f64,
+}
+
+impl Default for HeartbeatConfigFull {
+    fn default() -> Self {
+        HeartbeatConfigFull {
+            target_rate_per_second: None,
+            min_interval: format!("{DEF_HEARTBEAT_MIN_INTERVAL_SEC}s"),
+            max_interval: format!("{DEF_HEARTBEAT_MAX_INTERVAL_SEC}s"),
+            missed_beats_before_lost: DEF_MISSED_BEATS_BEFORE_LOST,
+            headroom: DEF_HEARTBEAT_HEADROOM,
+        }
+    }
+}
+
+impl HeartbeatConfig {
+    pub fn with_defaults(&self) -> HeartbeatConfigFull {
+        let defaults = HeartbeatConfigFull::default();
+        HeartbeatConfigFull {
+            target_rate_per_second: self.target_rate_per_second,
+            min_interval: self.min_interval.clone().unwrap_or(defaults.min_interval),
+            max_interval: self.max_interval.clone().unwrap_or(defaults.max_interval),
+            missed_beats_before_lost: self
+                .missed_beats_before_lost
+                .unwrap_or(defaults.missed_beats_before_lost),
+            headroom: self.headroom.unwrap_or(defaults.headroom),
+        }
+    }
+}
+
+impl From<HeartbeatConfigFull> for HeartbeatConfig {
+    fn from(val: HeartbeatConfigFull) -> Self {
+        HeartbeatConfig {
+            target_rate_per_second: val.target_rate_per_second,
+            min_interval: Some(val.min_interval),
+            max_interval: Some(val.max_interval),
+            missed_beats_before_lost: Some(val.missed_beats_before_lost),
+            headroom: Some(val.headroom),
+        }
+    }
+}
+
+impl HeartbeatConfigFull {
+    pub fn parsed_min_interval(&self) -> Duration {
+        parse_humantime_or(
+            &self.min_interval,
+            &format!("{DEF_HEARTBEAT_MIN_INTERVAL_SEC}s"),
+        )
+    }
+
+    pub fn parsed_max_interval(&self) -> Duration {
+        parse_humantime_or(
+            &self.max_interval,
+            &format!("{DEF_HEARTBEAT_MAX_INTERVAL_SEC}s"),
+        )
+    }
+
+    /// Whether the manager dictates cadence at all.
+    pub fn adaptive_enabled(&self) -> bool {
+        self.target_rate_per_second.is_some_and(|rate| rate > 0.0)
+    }
+
+    /// Reject configurations whose numbers cannot hold together, naming the
+    /// offending values. Checked at manager startup, not discovered later as
+    /// a fleet that will not converge.
+    pub fn validate(&self) -> R<()> {
+        if let Some(rate) = self.target_rate_per_second {
+            if !(rate.is_finite() && rate > 0.0) {
+                bail!(
+                    "heartbeat.targetRatePerSecond must be a positive number (got {rate}); \
+                     omit it entirely to disable adaptive cadence"
+                );
+            }
+        }
+        if self.missed_beats_before_lost == 0 {
+            bail!(
+                "heartbeat.missedBeatsBeforeLost must be at least 1: a node cannot be lost \
+                 before it has missed a beat"
+            );
+        }
+        if !(self.headroom.is_finite() && self.headroom >= 1.0) {
+            bail!(
+                "heartbeat.headroom must be at least 1.0 (got {}); 2 runs the control plane \
+                 at half its measured ceiling",
+                self.headroom
+            );
+        }
+        let min = self.parsed_min_interval();
+        let max = self.parsed_max_interval();
+        if min.is_zero() {
+            bail!(
+                "heartbeat.minInterval must be greater than zero (got {})",
+                self.min_interval
+            );
+        }
+        if max < min {
+            bail!(
+                "heartbeat.maxInterval ({}) is below heartbeat.minInterval ({})",
+                self.max_interval,
+                self.min_interval
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Node liveness: where heartbeat state lives and how it survives an election
+/// (docs/node-liveness.md).
+///
+/// Heartbeats are tracked in the status-lane leader's MEMORY; only status
+/// transitions are replicated. Every field is optional and omitting the block
+/// reproduces the built-in defaults.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct LivenessConfig {
+    /// Accumulation window for the heartbeat group commit. `0ms` (the
+    /// default) is commit-while-you-can batching. Once liveness is in leader
+    /// memory a steady-state heartbeat does not commit at all, so this
+    /// applies only to the checkpoint and to the mixed-version forwarding
+    /// fallback.
+    #[serde(default)]
+    pub batch_window: Option<String>,
+    /// After acquiring status-lane leadership (or starting the process), mark
+    /// nothing lost for this long. Default `60s`. A new leader inherits no
+    /// liveness state and rebuilds it from incoming heartbeats, so an
+    /// election must not be a fleet-wide outage. Nomad uses 5m; Legion's lost
+    /// window is 10s rather than 30s, so a sixth of that is enough.
+    #[serde(default)]
+    pub failover_grace: Option<String>,
+    /// How often a manager that does NOT lead the status lane reports the
+    /// nodes it heard from to the leader. ONE RPC per manager per interval,
+    /// whatever the fleet size. Default `1s`.
+    #[serde(default)]
+    pub digest_interval: Option<String>,
+    /// How long the leader keeps trusting a peer manager's last digest.
+    /// Default `30s`. Nodes last claimed by a silent peer are not marked lost
+    /// inside this window: a manager-to-manager problem must not present as
+    /// fleet-wide node loss.
+    #[serde(default)]
+    pub peer_digest_grace: Option<String>,
+    /// How often the leader replicates a batched heartbeat checkpoint so
+    /// every manager can show an approximate "last heartbeat" time. Default
+    /// `30s`. DISPLAY ONLY — a checkpoint is never read back as liveness,
+    /// including on election. `0s` disables checkpoints entirely; non-leaders
+    /// then show no heartbeat time rather than an approximate one.
+    #[serde(default)]
+    pub checkpoint_interval: Option<String>,
+}
+
+/// Resolved [`LivenessConfig`].
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct LivenessConfigFull {
+    pub batch_window: String,
+    pub failover_grace: String,
+    pub digest_interval: String,
+    pub peer_digest_grace: String,
+    pub checkpoint_interval: String,
+}
+
+impl Default for LivenessConfigFull {
+    fn default() -> Self {
+        LivenessConfigFull {
+            batch_window: "0ms".into(),
+            failover_grace: format!("{DEF_LIVENESS_FAILOVER_GRACE_SEC}s"),
+            digest_interval: format!("{DEF_LIVENESS_DIGEST_INTERVAL_SEC}s"),
+            peer_digest_grace: format!("{DEF_LIVENESS_PEER_DIGEST_GRACE_SEC}s"),
+            checkpoint_interval: format!("{DEF_LIVENESS_CHECKPOINT_INTERVAL_SEC}s"),
+        }
+    }
+}
+
+impl LivenessConfig {
+    pub fn with_defaults(&self) -> LivenessConfigFull {
+        let defaults = LivenessConfigFull::default();
+        LivenessConfigFull {
+            batch_window: self.batch_window.clone().unwrap_or(defaults.batch_window),
+            failover_grace: self
+                .failover_grace
+                .clone()
+                .unwrap_or(defaults.failover_grace),
+            digest_interval: self
+                .digest_interval
+                .clone()
+                .unwrap_or(defaults.digest_interval),
+            peer_digest_grace: self
+                .peer_digest_grace
+                .clone()
+                .unwrap_or(defaults.peer_digest_grace),
+            checkpoint_interval: self
+                .checkpoint_interval
+                .clone()
+                .unwrap_or(defaults.checkpoint_interval),
+        }
+    }
+}
+
+impl From<LivenessConfigFull> for LivenessConfig {
+    fn from(val: LivenessConfigFull) -> Self {
+        LivenessConfig {
+            batch_window: Some(val.batch_window),
+            failover_grace: Some(val.failover_grace),
+            digest_interval: Some(val.digest_interval),
+            peer_digest_grace: Some(val.peer_digest_grace),
+            checkpoint_interval: Some(val.checkpoint_interval),
+        }
+    }
+}
+
+impl LivenessConfigFull {
+    pub fn parsed_batch_window(&self) -> Duration {
+        parse_humantime_or(&self.batch_window, "0ms")
+    }
+
+    pub fn parsed_failover_grace(&self) -> Duration {
+        parse_humantime_or(
+            &self.failover_grace,
+            &format!("{DEF_LIVENESS_FAILOVER_GRACE_SEC}s"),
+        )
+    }
+
+    pub fn parsed_digest_interval(&self) -> Duration {
+        parse_humantime_or(
+            &self.digest_interval,
+            &format!("{DEF_LIVENESS_DIGEST_INTERVAL_SEC}s"),
+        )
+    }
+
+    pub fn parsed_peer_digest_grace(&self) -> Duration {
+        parse_humantime_or(
+            &self.peer_digest_grace,
+            &format!("{DEF_LIVENESS_PEER_DIGEST_GRACE_SEC}s"),
+        )
+    }
+
+    /// `None` when checkpoints are disabled (`checkpointInterval: "0s"`).
+    pub fn parsed_checkpoint_interval(&self) -> Option<Duration> {
+        let parsed = parse_humantime_or(
+            &self.checkpoint_interval,
+            &format!("{DEF_LIVENESS_CHECKPOINT_INTERVAL_SEC}s"),
+        );
+        (!parsed.is_zero()).then_some(parsed)
+    }
+
+    /// The runtime view of this block.
+    pub fn settings(&self) -> crate::storage::liveness::LivenessSettings {
+        crate::storage::liveness::LivenessSettings {
+            failover_grace: self.parsed_failover_grace(),
+            digest_interval: self.parsed_digest_interval(),
+            peer_digest_grace: self.parsed_peer_digest_grace(),
+            checkpoint_interval: self.parsed_checkpoint_interval(),
+            batch_window: self.parsed_batch_window(),
+        }
+    }
+
+    /// Reject combinations that cannot hold together, naming the values.
+    ///
+    /// `lost_window` is the smallest window any node in this cluster runs
+    /// with, so the caller passes it in: a grace shorter than the window it is
+    /// protecting is not a grace.
+    pub fn validate(&self, lost_window: Duration) -> R<()> {
+        let grace = self.parsed_failover_grace();
+        if grace < lost_window {
+            bail!(
+                "liveness.failoverGrace ({}) is shorter than the lost-node window ({}s): a \
+                 grace shorter than the window it protects gives the fleet no time to check \
+                 in after an election",
+                self.failover_grace,
+                lost_window.as_secs()
+            );
+        }
+        let digest = self.parsed_digest_interval();
+        let peer_grace = self.parsed_peer_digest_grace();
+        if digest.is_zero() {
+            bail!(
+                "liveness.digestInterval must be greater than zero (got {})",
+                self.digest_interval
+            );
+        }
+        if digest >= peer_grace {
+            bail!(
+                "liveness.digestInterval ({}) must be shorter than liveness.peerDigestGrace \
+                 ({}): a peer must get several chances to report before it is considered quiet",
+                self.digest_interval,
+                self.peer_digest_grace
+            );
+        }
+        if let Some(checkpoint) = self.parsed_checkpoint_interval() {
+            if checkpoint < Duration::from_secs(MIN_LIVENESS_CHECKPOINT_INTERVAL_SEC) {
+                bail!(
+                    "liveness.checkpointInterval ({}) must be either 0s (disabled) or at least \
+                     {MIN_LIVENESS_CHECKPOINT_INTERVAL_SEC}s: anything faster re-creates the \
+                     per-heartbeat commit load that keeping liveness off the raft path removes",
+                    self.checkpoint_interval
+                );
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Manager-side edge boot settings (docs/edge-boot.md).
@@ -1036,6 +1400,10 @@ pub struct ManagerConfigFull {
     pub telemetry: TelemetryConfigFull,
     #[serde(default)]
     pub edge_boot: EdgeBootConfigFull,
+    #[serde(default)]
+    pub heartbeat: HeartbeatConfigFull,
+    #[serde(default)]
+    pub liveness: LivenessConfigFull,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -1185,6 +1553,8 @@ impl From<ManagerConfigFull> for ManagerConfig {
             }),
             telemetry: Some(val.telemetry.into()),
             edge_boot: Some(val.edge_boot.into()),
+            heartbeat: Some(val.heartbeat.into()),
+            liveness: Some(val.liveness.into()),
         }
     }
 }
@@ -1256,6 +1626,16 @@ impl ManagerConfig {
                 .as_ref()
                 .map(EdgeBootConfig::with_defaults)
                 .unwrap_or_default(),
+            heartbeat: self
+                .heartbeat
+                .as_ref()
+                .map(HeartbeatConfig::with_defaults)
+                .unwrap_or_default(),
+            liveness: self
+                .liveness
+                .as_ref()
+                .map(LivenessConfig::with_defaults)
+                .unwrap_or_default(),
         }
     }
 }
@@ -1282,6 +1662,8 @@ impl Default for ManagerConfigFull {
             exec: ExecConfigFull::default(),
             telemetry: TelemetryConfigFull::default(),
             edge_boot: EdgeBootConfigFull::default(),
+            heartbeat: HeartbeatConfigFull::default(),
+            liveness: LivenessConfigFull::default(),
         }
     }
 }

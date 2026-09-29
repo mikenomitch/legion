@@ -6,7 +6,7 @@ use crate::constants::{
 };
 use crate::constraints::{ConstraintSet, DistinctTracker, PermitSet};
 use crate::prelude::*;
-use crate::resources::{ResourcePolicy, ResourcePool, ResourceRequest};
+use crate::resources::{NodeUsage, ResourcePolicy, ResourcePool, ResourceRequest};
 use crate::scheduling_index::{IndexSet, IndexSettings};
 use crate::storage::errors::StorageError;
 use crate::storage::events::{drafts, EventDraft, SchedulerEventFilter, SchedulerEventRecord};
@@ -57,7 +57,7 @@ use std::time::{Duration, Instant};
 use time::format_description::well_known::Rfc3339;
 use time::macros::format_description;
 use time::{Duration as TimeDuration, OffsetDateTime};
-use tokio::sync::{broadcast, Notify};
+use tokio::sync::{broadcast, mpsc, Notify};
 
 // warning incorrectly
 #[allow(dead_code)]
@@ -68,13 +68,121 @@ pub enum Msg {
 pub type MemSafeConn = Arc<Mutex<Connection>>;
 const READ_MODEL_LOCK_ERROR: &str = "Error locking read model";
 
+/// One `RunJob` submission headed for the control-lane group commit.
+#[derive(Debug, Clone)]
+pub struct JobSubmitRequest {
+    pub config: JobConfig,
+    pub subs: Vec<Submission>,
+    pub template: Option<JobTemplateProvenance>,
+}
+
+/// One eval to enqueue, for the batched [`Store::enqueue_evals`].
+#[derive(Debug, Clone)]
+pub struct EvalRequest {
+    pub kind: String,
+    pub job_id: Option<String>,
+    pub job_config_id: Option<String>,
+    pub node_id: Option<String>,
+    pub priority: Option<i64>,
+    pub delay: Duration,
+}
+
+impl EvalRequest {
+    /// An immediate eval for a job and its config — the shape every
+    /// fan-out loop needs.
+    pub fn for_job(kind: &str, job_id: &str, job_config_id: &str) -> Self {
+        Self {
+            kind: kind.to_owned(),
+            job_id: Some(job_id.to_owned()),
+            job_config_id: Some(job_config_id.to_owned()),
+            node_id: None,
+            priority: None,
+            delay: Duration::ZERO,
+        }
+    }
+}
+
+/// How a handled eval should be written back, so the terminal write can be
+/// fused with the next claim into one scheduler-lane round
+/// ([`Store::complete_and_claim_next`]).
+///
+/// This exists so the eval worker can *decide* an outcome without also
+/// *writing* it: deciding happens on the blocking pool, writing happens on
+/// the lane, and keeping them separate is what lets the write be batched
+/// with the following claim.
+#[derive(Debug, Clone)]
+pub enum EvalCompletion {
+    /// Terminal. `succeeded` deletes the row; otherwise it is marked
+    /// `failed` (and failed evals are never retried).
+    Finished { succeeded: bool, event: EventDraft },
+    /// Back to `pending` after `delay` — the eval must run again. Used for
+    /// foreign-lane `NotRaftLeader` rejections and plan-conflict
+    /// exhaustion, both of which are transient and would otherwise drop
+    /// acknowledged work.
+    Released {
+        delay: Duration,
+        event: Option<EventDraft>,
+    },
+}
+
+/// How many evals one worker may take through the loop together
+/// ([`Store::claim_evals`], [`Store::complete_evals_and_claim_next`]).
+///
+/// Batching amortizes the scheduler lane's fixed per-eval cost over N
+/// evals — but it must not do that by letting one worker vacuum the queue
+/// while its peers idle. With `evalThreads` workers sharing one queue, a
+/// greedy claim of a 16-eval burst would serialize behind one worker work
+/// that all 16 could have run at once, which is a throughput *loss* on
+/// exactly the bursty fan-out (a lost AZ, a leadership regeneration) that
+/// matters most.
+///
+/// So the batch is a fair share of what is actually queued, capped by
+/// `max`, and the claim never waits for the batch to fill: at low queue
+/// depth every worker gets a batch of one and behaves exactly as it did
+/// before batching existed.
+///
+/// The fair share is also what keeps the wake accounting honest. The
+/// notifier issues one permit per newly-claimable eval (`notify_one` in
+/// `project_changeset_side_effects`), so a worker that swallowed a whole
+/// burst would leave its woken peers claiming nothing — re-creating the
+/// empty claims that fix removed. Taking `pending / workers` leaves work
+/// for every permit that was issued, and below `workers` deep the share is
+/// one, which is exactly the pre-batching behavior the fix was measured
+/// against.
+#[derive(Debug, Clone, Copy)]
+pub struct EvalBatchLimits {
+    /// Hard ceiling on one worker's batch, however deep the queue is. Caps
+    /// how long a worker can hold rows `in_flight` before its terminal
+    /// write lands, which is what a crash mid-batch costs in re-run work.
+    pub max: usize,
+    /// How many eval workers share this queue (`evalThreads`) — the
+    /// divisor for the fair share.
+    pub workers: usize,
+}
+
+impl EvalBatchLimits {
+    /// This worker's share of a queue holding `pending` unclaimed rows.
+    ///
+    /// `pending` counts every pending row, including ones whose `ready_at`
+    /// is still in the future, so it is an UPPER bound on what is
+    /// claimable. That is the right side to err on: overestimating costs
+    /// one extra claim attempt that returns nothing and ends the batch,
+    /// while underestimating would leave ready work sitting for a whole
+    /// loop iteration.
+    fn share_of(&self, pending: i64) -> usize {
+        let workers = self.workers.max(1);
+        let pending = pending.max(0) as usize;
+        (pending / workers).clamp(1, self.max.max(1))
+    }
+}
+
 /// RFC3339 with the subsecond field pinned to nine digits, so the rendered
 /// string sorts lexicographically in chronological order. Used for any
 /// timestamp SQL compares or orders by (see `Store::sortable_timestamp`).
 const SORTABLE_TIMESTAMP_FORMAT: &[time::format_description::BorrowedFormatItem<'_>] =
     format_description!("[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:9]Z");
 
-/// Parse a nullable JSONB text column into an optional typed value, mapping
+/// Parse a nullable JSON text column into an optional typed value, mapping
 /// parse failures onto rusqlite conversion errors.
 fn parse_json_column<T: serde::de::DeserializeOwned>(
     idx: usize,
@@ -114,6 +222,31 @@ fn worker_address_host(config_attrs: &Value) -> Option<String> {
 /// snapshot bumps refcounts instead of deep-cloning every allocation, and
 /// the few writers copy-on-write via `Arc::make_mut`.
 pub type SharedNodeAllocations = HashMap<String, Arc<Vec<Allocation>>>;
+
+/// One allocation as the read model's job index carries it: enough for a
+/// plan to know which of its own rows sit on a node without touching the
+/// row itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AllocationRef {
+    pub(crate) id: i64,
+    pub(crate) job_config_id: String,
+    pub(crate) task_config_id: i64,
+}
+
+impl AllocationRef {
+    fn of(allocation: &Allocation) -> Self {
+        AllocationRef {
+            id: allocation.id,
+            job_config_id: allocation.job_config_id.clone(),
+            task_config_id: allocation.task_config_id,
+        }
+    }
+}
+
+/// A job's allocations by node — the shape
+/// [`Store::plan_capacity_snapshot`] hands the scheduler for the job it
+/// plans.
+pub(crate) type JobAllocationsByNode = HashMap<String, Vec<AllocationRef>>;
 
 #[derive(Debug, Clone, Default)]
 pub struct SchedulingReadModel {
@@ -173,6 +306,187 @@ pub struct SchedulingReadModel {
     /// plan, so churny fleets pay at most what they paid before this cache
     /// existed.
     pub(crate) available_nodes_cache: Option<Arc<Vec<Arc<Node>>>>,
+    /// Per-node aggregated allocation usage ([`NodeUsage`]) — the memo that
+    /// makes reprojection O(resource dims) instead of O(allocations on the
+    /// node). Strictly derived from `allocations_by_node`: the delta path
+    /// adjusts an entry only when it knows the exact rows it spliced, and
+    /// EVERY wholesale list replacement (scope refresh, scrub, drift
+    /// reload, node removal) drops the entry so the next reprojection
+    /// rebuilds it from the list. An absent entry is always safe — it costs
+    /// one `NodeUsage::from_rows` walk, which is exactly what every
+    /// reprojection cost before the memo existed. Never published on its
+    /// own: all writes happen under the same lock as the list they mirror.
+    pub(crate) node_usage: HashMap<String, NodeUsage>,
+    /// Secondary index over `allocations_by_node`: every job's allocations
+    /// by node, keyed by job id. What lets a plan find its own job's rows —
+    /// the ones a Fresh plan drops, the ones a Reschedule counts, the
+    /// group and `distinct` seeds — without walking every allocation in
+    /// the cluster, which was the last per-plan cost that grew with
+    /// cluster fill rather than with the job being placed. Strictly
+    /// derived from `allocations_by_node` and written under the same
+    /// lock, by the same operations: a splice indexes or unindexes its
+    /// row, a whole-list replacement goes through
+    /// [`Self::set_node_allocations`], a node removal through
+    /// [`Self::remove_node_allocations`], and a full model load rebuilds
+    /// it ([`Self::rebuild_job_index`]).
+    pub(crate) allocations_by_job: HashMap<String, JobAllocationsByNode>,
+    /// The job index's reverse: which jobs have an entry for each node.
+    /// What lets a wholesale list replacement drop the node's entries
+    /// wholesale too — from whatever state the index was in, not from
+    /// what the previous list said — so a full reload of a node heals
+    /// its index entries exactly as it heals its list.
+    pub(crate) jobs_by_node: HashMap<String, HashSet<String>>,
+}
+
+impl SchedulingReadModel {
+    /// Rebuild the job index from `allocations_by_node`. The full model
+    /// load uses this; every incremental path maintains the index in
+    /// place.
+    pub(crate) fn rebuild_job_index(&mut self) {
+        self.allocations_by_job.clear();
+        self.jobs_by_node.clear();
+        let lists: Vec<Arc<Vec<Allocation>>> = self.allocations_by_node.values().cloned().collect();
+        for list in lists {
+            for allocation in list.iter() {
+                self.index_allocation(allocation);
+            }
+        }
+    }
+
+    fn index_allocation(&mut self, allocation: &Allocation) {
+        self.index_allocation_ref(
+            &allocation.job_id,
+            &allocation.node_id,
+            AllocationRef::of(allocation),
+        );
+    }
+
+    fn index_allocation_ref(&mut self, job_id: &str, node_id: &str, reference: AllocationRef) {
+        self.allocations_by_job
+            .entry(job_id.to_string())
+            .or_default()
+            .entry(node_id.to_string())
+            .or_default()
+            .push(reference);
+        self.jobs_by_node
+            .entry(node_id.to_string())
+            .or_default()
+            .insert(job_id.to_string());
+    }
+
+    fn unindex_allocation(&mut self, allocation: &Allocation) {
+        let Some(nodes) = self.allocations_by_job.get_mut(&allocation.job_id) else {
+            return;
+        };
+        let mut node_emptied = false;
+        if let Some(references) = nodes.get_mut(&allocation.node_id) {
+            references.retain(|reference| reference.id != allocation.id);
+            if references.is_empty() {
+                nodes.remove(&allocation.node_id);
+                node_emptied = true;
+            }
+        }
+        if nodes.is_empty() {
+            self.allocations_by_job.remove(&allocation.job_id);
+        }
+        if node_emptied {
+            if let Some(jobs) = self.jobs_by_node.get_mut(&allocation.node_id) {
+                jobs.remove(&allocation.job_id);
+                if jobs.is_empty() {
+                    self.jobs_by_node.remove(&allocation.node_id);
+                }
+            }
+        }
+    }
+
+    /// Drop every index entry for `node_id`, whichever jobs they belong
+    /// to. Driven by the reverse index rather than by the node's cached
+    /// list, so it is exact even when that list had drifted.
+    fn unindex_node(&mut self, node_id: &str) {
+        let Some(jobs) = self.jobs_by_node.remove(node_id) else {
+            return;
+        };
+        for job_id in jobs {
+            if let Some(nodes) = self.allocations_by_job.get_mut(&job_id) {
+                nodes.remove(node_id);
+                if nodes.is_empty() {
+                    self.allocations_by_job.remove(&job_id);
+                }
+            }
+        }
+    }
+
+    /// Replace a node's whole cached allocation list, rebuilding the
+    /// node's job-index entries from the new rows.
+    fn set_node_allocations(&mut self, node_id: String, allocations: Vec<Allocation>) {
+        self.unindex_node(&node_id);
+        for allocation in &allocations {
+            self.index_allocation(allocation);
+        }
+        self.allocations_by_node
+            .insert(node_id, Arc::new(allocations));
+    }
+
+    /// Drop a node's cached allocation list (the node left the fleet),
+    /// and its job-index entries with it.
+    fn remove_node_allocations(&mut self, node_id: &str) {
+        self.unindex_node(node_id);
+        self.allocations_by_node.remove(node_id);
+    }
+}
+
+/// The allocation-row changes one committed changeset names, collected by
+/// [`Store::project_changeset_side_effects`] (and, for a locally committed
+/// plan, by [`Store::emit_plan_effects`] from the rows the plan itself
+/// wrote) and applied to the read model by
+/// [`Store::cache_apply_allocation_delta`] — the delta that replaces
+/// reloading every touched node's whole allocation list.
+#[derive(Debug, Default)]
+struct AllocationDelta {
+    /// Every allocation row this changeset created or changed, by id. Their
+    /// committed content is re-read by primary key (one indexed row each)
+    /// and spliced into the owning node's cached list.
+    upserts: BTreeSet<i64>,
+    /// The subset of `upserts` the changeset INSERTed, which must therefore
+    /// NOT already be cached.
+    inserts: BTreeSet<i64>,
+    /// The subset of `upserts` whose UPDATE changed `node_id`, so the row is
+    /// legitimately absent from its new node's cached list (its removal from
+    /// the old node is in `removals`).
+    moved: BTreeSet<i64>,
+    /// `(allocation id, node)` pairs this changeset removed from a node's
+    /// list: DELETE records, plus the old side of a move.
+    removals: Vec<(i64, String)>,
+    /// Cleared the moment an allocation record cannot be classified — the id
+    /// or the owning node is not in the record and cannot be derived. The
+    /// whole changeset then takes the self-healing full-reload path instead,
+    /// because a delta with a hole in it is worse than no delta at all.
+    usable: bool,
+}
+
+impl AllocationDelta {
+    fn new() -> Self {
+        AllocationDelta {
+            usable: true,
+            ..Default::default()
+        }
+    }
+
+    /// Whether this changeset moved any allocation row at all. An in-place
+    /// UPDATE names no node (unchanged columns are absent from the record),
+    /// so the scope sets can be empty while there is still work to splice.
+    fn is_empty(&self) -> bool {
+        self.upserts.is_empty() && self.removals.is_empty()
+    }
+}
+
+/// What the delta path expects to find in a node's cached allocation list
+/// for the row it is about to splice in. A mismatch is drift, and drift
+/// sends that node down the full-reload path.
+#[derive(Debug, Clone, Copy)]
+enum CachedEntry {
+    Absent,
+    Present,
 }
 
 #[derive(Debug)]
@@ -209,14 +523,28 @@ pub struct DeclaredService {
     pub meta: BTreeMap<String, String>,
 }
 
+/// A task that declares `connect.upstreams` in its job's latest config —
+/// the declared half of a service-graph edge (docs/network-handlers.md,
+/// "Service graph").
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DeclaredConsumer {
+    pub job_id: String,
+    pub task_name: String,
+    pub upstreams: Vec<crate::structs::UpstreamConfig>,
+}
+
 /// What [`Store::plan_capacity_snapshot`] hands the scheduler: current
 /// allocations by node plus the cached free pools, cloned under one guard,
-/// and the read-model generation those were published at (the lazy
-/// version-sample fence — see [`SchedulingReadModel::generation`]).
+/// the read-model generation those were published at (the lazy
+/// version-sample fence — see [`SchedulingReadModel::generation`]), and
+/// the planned job's own allocations by node from the job index (see
+/// [`SchedulingReadModel::allocations_by_job`]).
 pub(crate) type PlanCapacityParts = (
     SharedNodeAllocations,
     HashMap<String, Arc<ResourcePool>>,
     u64,
+    JobAllocationsByNode,
 );
 
 #[derive(Debug, Clone)]
@@ -288,6 +616,44 @@ struct AppliedEvictions {
     events: Vec<SchedulerEventRecord>,
     /// `(pool, band, count)` rows for `legion_preemptions_total`.
     metric_rows: Vec<(String, String, u64)>,
+}
+
+/// What a heartbeat from a given node costs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BeatDisposition {
+    /// The node is registered and already active: memory only, no commit.
+    Active,
+    /// The node is registered but not active (lost, or drained by a loss):
+    /// the beat carries a status transition and must be replicated.
+    Transition,
+    /// Not a registered node. The heartbeat is rejected — a ghost worker must
+    /// not think it is healthy, because its self-fence clock feeds off
+    /// heartbeat success.
+    Ghost,
+}
+
+/// One active node's replicated liveness row, for the status checker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveNodeLiveness {
+    pub id: String,
+    /// Persisted heartbeat clock. DISPLAY state once liveness is off the raft
+    /// path; `None` on a row written before the integer column existed.
+    pub last_heartbeat_unix: Option<i64>,
+    /// This node's own lost window in seconds. `None` falls back to
+    /// [`DEF_LOST_NODE_AT_SEC`], so a pre-migration row behaves exactly as it
+    /// always did.
+    pub lost_after_seconds: Option<i64>,
+}
+
+impl ActiveNodeLiveness {
+    /// The window to compare this node against.
+    pub fn window(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(
+            self.lost_after_seconds
+                .filter(|seconds| *seconds > 0)
+                .unwrap_or(DEF_LOST_NODE_AT_SEC) as u64,
+        )
+    }
 }
 
 /// One live stop notice, as the heartbeat feed serves it.
@@ -393,6 +759,128 @@ impl PlanPlacements {
 
 type PlanApplyReply = (PlanSubmission, PlanApplyOutcome);
 
+/// One plan's slot in a group commit: what the submitter gets back, plus
+/// whether the batch leader already ran this plan's post-apply
+/// bookkeeping (batched across the whole group — see
+/// `Store::batch_apply_bookkeeping`). A submitter whose bookkeeping was
+/// not done runs it itself, which is also the uncoalesced path.
+#[derive(Debug)]
+struct PlanApplySlot {
+    reply: PlanApplyReply,
+    bookkeeping_done: bool,
+}
+
+impl PlanApplySlot {
+    /// A reply whose bookkeeping still belongs to its submitter.
+    fn unbooked(reply: PlanApplyReply) -> Self {
+        PlanApplySlot {
+            reply,
+            bookkeeping_done: false,
+        }
+    }
+}
+
+/// Side effects a plan apply produced but must not perform until its
+/// transaction has COMMITTED: the event broadcast, and the read-model
+/// refresh for the allocation scopes it touched.
+///
+/// Returning them instead of firing them in place is what lets a group
+/// commit run many plans in one transaction: mid-transaction, a refresh
+/// would read PRE-batch state through the read connections and publish a
+/// read model missing the batch's own placements, and a broadcast would
+/// announce a placement that is not durable yet. Under raft both are
+/// suppressed anyway and re-projected from the committed changeset
+/// (JC-11); this is the same rule made explicit for every backend.
+#[derive(Debug, Default)]
+struct PlanApplyEffects {
+    /// Staged event rows, in the order they were staged — which is id
+    /// order, the order subscribers must observe them in.
+    events: Vec<SchedulerEventRecord>,
+    /// Node scopes whose allocations and epochs need republishing.
+    node_ids: BTreeSet<String>,
+    /// Job-config scopes whose epochs need republishing.
+    job_config_ids: BTreeSet<String>,
+    /// Ids of the allocation rows the plan inserted — the exact rows the
+    /// read model splices in, so the refresh is one indexed read per
+    /// placement rather than a reload of every touched node's list.
+    inserted: BTreeSet<i64>,
+    /// `(id, node)` of the allocation rows the plan deleted (its
+    /// evictions), spliced out the same way.
+    removed: Vec<(i64, String)>,
+}
+
+impl PlanApplyEffects {
+    /// Record the allocations this plan placed: their scopes need
+    /// republishing, and the rows themselves splice into the read model
+    /// as inserts.
+    fn touch_placed(&mut self, allocations: &[Allocation]) {
+        for allocation in allocations {
+            self.node_ids.insert(allocation.node_id.clone());
+            self.job_config_ids.insert(allocation.job_config_id.clone());
+            self.inserted.insert(allocation.id);
+        }
+    }
+
+    /// Record the allocations this plan evicted: same scopes, spliced
+    /// out. Placed and evicted rows land in ONE publish (they are one
+    /// delta), so the mirror never passes through the intermediate state
+    /// a remove-then-add pair of refreshes exposed.
+    fn touch_evicted(&mut self, allocations: &[Allocation]) {
+        for allocation in allocations {
+            self.node_ids.insert(allocation.node_id.clone());
+            self.job_config_ids.insert(allocation.job_config_id.clone());
+            self.removed
+                .push((allocation.id, allocation.node_id.clone()));
+        }
+    }
+
+    fn merge(&mut self, other: PlanApplyEffects) {
+        self.events.extend(other.events);
+        self.node_ids.extend(other.node_ids);
+        self.job_config_ids.extend(other.job_config_ids);
+        self.inserted.extend(other.inserted);
+        self.removed.extend(other.removed);
+    }
+}
+
+/// A node's total allocation usage together with the fingerprint of the
+/// rows it was derived from — the in-flight form of a `node_alloc_usage`
+/// row (see `Store::free_pool_for_node_tx`).
+///
+/// The plan carries one per node it built a pool for, keeps it in step with
+/// its own placements, and publishes it at the end of a successful apply
+/// only if the live rows still agree with it.
+#[derive(Debug, Clone)]
+struct NodeUsageSnapshot {
+    node_id: String,
+    /// Allocation rows on the node, and the sum of their ids. Together with
+    /// the node's allocation epoch these are the fingerprint; the epoch is
+    /// read fresh at publish time because the plan's own placements bump it.
+    count: i64,
+    id_sum: i64,
+    /// Usage of EVERY allocation on the node — never a job-filtered subset,
+    /// so the cached value is usable by the next plan whichever job it is
+    /// for.
+    total: NodeUsage,
+}
+
+/// The planned job's own allocations, per node: the rows a Fresh plan's
+/// free pool must not count, gathered once per plan.
+#[derive(Debug, Default)]
+struct OwnAllocationUsage {
+    by_node: HashMap<String, Vec<ResourceRequest>>,
+    /// Nodes where one of the job's own rows would not parse. Subtracting
+    /// what cannot be read is impossible, so these nodes take the exact
+    /// row-filtering path instead.
+    unreadable: HashSet<String>,
+}
+
+impl OwnAllocationUsage {
+    fn requests_on(&self, node_id: &str) -> impl Iterator<Item = &ResourceRequest> {
+        self.by_node.get(node_id).into_iter().flatten()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Store {
     pub write_conn: MemSafeConn,
@@ -410,10 +898,30 @@ pub struct Store {
     /// at startup on malformed declarations).
     pub index_settings: Arc<IndexSettings>,
     pub resource_policy: ResourcePolicy,
+    /// Canonical fingerprint of `resource_policy`
+    /// ([`ResourcePolicy::fingerprint`]), computed once — it gates every
+    /// `node_alloc_usage` cache read, and serializing the policy per read
+    /// would put JSON work back on the path the cache exists to clear.
+    resource_policy_fingerprint: Arc<str>,
     persistence_driver: Arc<dyn PersistenceDriver>,
     read_model: Arc<RwLock<SchedulingReadModel>>,
     // Cross-task wake signal for eval workers waiting on an empty queue.
     eval_notify: Arc<Notify>,
+    // Where a plan apply hands off its task_status projection, when a
+    // drain task is running to receive it.
+    //
+    // The projection is a full STATUS-lane quorum round, and it used to run
+    // synchronously inside the scheduler-lane apply — so `apply` paid two
+    // round trips on two different raft groups, each with its own
+    // single-threaded pipeline. It is also the one write on that path the
+    // code already treats as losable: a `NotRaftLeader` here is
+    // warn-and-continue, because the status leader's reconciler and the
+    // workers' own reports re-derive the same rows.
+    //
+    // `None` means no drain task is installed (tests, embedded uses), and
+    // the projection runs inline exactly as before — so behaviour is
+    // unchanged anywhere the daemon is not running.
+    status_projection_tx: Arc<OnceLock<mpsc::UnboundedSender<Vec<Allocation>>>>,
     // Live fan-out of scheduler events to StreamEvents subscribers. Persisted
     // history lives in the scheduler_event table; this only carries new events.
     event_tx: broadcast::Sender<SchedulerEventRecord>,
@@ -443,11 +951,42 @@ pub struct Store {
     // capture → one raft propose/quorum round for the whole batch — with
     // per-plan savepoint isolation inside. Shared across clones so every
     // eval worker feeds the same queue.
-    plan_coalescer: Arc<crate::storage::coalesce::Coalescer<PlanApplyRequest, PlanApplyReply>>,
+    plan_coalescer: Arc<crate::storage::coalesce::Coalescer<PlanApplyRequest, PlanApplySlot>>,
     // Heartbeat group commit (heartbeat-scale plan §2): concurrent
     // update_node_heartbeat callers coalesce into one status-lane op
-    // stamping every batched node id.
+    // stamping every batched node id. Still the path for the display
+    // checkpoint and for the mixed-version forwarding fallback; a
+    // steady-state heartbeat no longer reaches it at all (liveness plan §6).
     heartbeat_coalescer: Arc<crate::storage::coalesce::Coalescer<String, ()>>,
+    // Job-intake group commits (eval-path raft cost plan §"intake"). One
+    // submitted job costs one scheduler-lane round (the placement eval) and
+    // one status-lane round (the `task_status` seed), and a client that
+    // submits N jobs at once pays both N times. A lane is a raft group with
+    // its own pipeline, so a batch cannot span lanes — hence one coalescer
+    // per lane rather than one for the composite. Shared across clones so
+    // every gRPC worker thread feeds the same two queues.
+    eval_enqueue_coalescer: Arc<crate::storage::coalesce::Coalescer<EvalRequest, Eval>>,
+    task_status_seed_coalescer: Arc<crate::storage::coalesce::Coalescer<String, ()>>,
+    job_submit_coalescer:
+        Arc<crate::storage::coalesce::Coalescer<JobSubmitRequest, JobSubmitOutcome>>,
+    // Node liveness as leader-local soft state (liveness plan §6.2). A
+    // steady-state heartbeat is one write into this table: no raft commit,
+    // no fsync, no pipeline-thread hop. Shared across clones so the gRPC
+    // handler and the status-checker tick see the same table.
+    liveness: Arc<crate::storage::liveness::LivenessTable>,
+    // Missed beats before a node is lost, from `heartbeat.missedBeatsBeforeLost`.
+    // A node's window is ALWAYS this times its own interval.
+    missed_beats_before_lost: u32,
+    // Round-robin scrub queue for the delta read-model refresh
+    // ([`Store::cache_apply_allocation_delta`]). The changeset projection
+    // patches `allocations_by_node` from the rows a commit NAMED instead of
+    // reloading every touched node in full, and a delta — unlike a reload —
+    // cannot repair a cache entry that is already wrong. This queue is the
+    // bound: every delta refresh also reloads ONE node in full, drawn from a
+    // queue refilled with the whole fleet when it empties, so a drifted entry
+    // is repaired within one sweep of the fleet rather than never. Shared
+    // across clones so the sweep is per-process, not per-clone.
+    alloc_scrub_queue: Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 /// Result of [`Store::state_backup`]: where the backup landed, its size,
@@ -599,7 +1138,7 @@ pub struct JobTemplateVersionRecord {
     pub version: u32,
     pub latest_version: u32,
     pub description: Option<String>,
-    pub source_jsonnet: String,
+    pub source_nickel: String,
     pub variables: Vec<JobTemplateVariableRecord>,
     pub created_at: String,
     pub created_by: String,
@@ -669,8 +1208,149 @@ pub const CONN_LOCK_ERROR: &str = "Error locking database connection";
 /// §8, D1), which all scope themselves to each job's latest config.
 const LATEST_CONFIG_FOR_JOB: &str = "(SELECT jc.id FROM job_config jc \
      WHERE jc.job_id = j.id ORDER BY jc.created_at DESC LIMIT 1)";
-const READ_ONLY_CONN_POOL_SIZE: usize = 2;
+/// Read connections beyond the eval workers' own, for the readers that do
+/// not come from the eval pool: worker heartbeats (`allocs_for_node` once
+/// per node per `WORKER_HEARTBEAT_DURATION_SEC`), the read-only gRPC/UI
+/// surface, the metrics scrape, and the background reconcilers. None of
+/// those is deeply concurrent on its own — each is a short indexed read
+/// issued from a request handler — but together they are what a planner
+/// would otherwise queue behind.
+const READ_POOL_SERVING_HEADROOM: usize = 4;
+
+/// Hard cap on the read pool, set by MEMORY and by nothing else. It is
+/// **not** a measured knee — the eval-thread sweep never found one, because
+/// its 64-thread cell was limited by the load generator rather than by
+/// Legion, so where read concurrency would stop paying is unknown.
+///
+/// What is known is the cost: each connection carries its own page cache
+/// capped at [`SQLITE_CACHE_SIZE_KIB`] (64 MiB), so the pool's worst case is
+/// `size * 64 MiB` — 1 GiB here. `cache_size` is a cap that SQLite fills
+/// lazily, so a small cluster never reaches it, but a 200,000-allocation
+/// working set will: every connection independently pulls in the same hot
+/// `allocation` pages, so the caches do not share and the worst case is
+/// the real case at scale. A manager that wants more read concurrency
+/// than this wants a smaller per-connection cache first.
+const READ_POOL_MAX: usize = 16;
+
+/// Read-only SQLite connections shared by every reader in the manager.
+///
+/// **The pool is NOT a scheduler concurrency gate. That is measured, not
+/// argued.** The 2026-08-05 eval-thread sweep at 5,000 nodes ran every cell
+/// with this pool at 4 connections (`available_parallelism()` on the
+/// campaign's 4-vCPU managers) and throughput rose monotonically with eval
+/// workers anyway:
+///
+/// | eval threads | throughput |
+/// | ---: | ---: |
+/// | 4 | 177.27 alloc/s |
+/// | 8 | 208.83 alloc/s |
+/// | 16 | 219.25 alloc/s |
+/// | 32 | 251.68 alloc/s |
+/// | 64 | >= 263.08 alloc/s (load generator became the constraint) |
+///
+/// Four connections carried 32 concurrent planners and 5,000 nodes of
+/// heartbeats. If the pool capped effective concurrency near 4, going from
+/// 16 to 32 threads could not have bought 14.8%.
+///
+/// The suspicion it retires was arithmetic: throughput divided by
+/// plan-path latency came out at ~3.96 "effective workers" against 16
+/// configured, next to 4 cores and 4 connections. That derivation used the
+/// wrong denominator. `legion_scheduler_plan_phase_seconds{phase="total"}`
+/// times **planning only**, so Little's law over it counts evals in the
+/// *planning stage*, not busy workers — a worker in `claim_eval`, dispatch,
+/// post-apply bookkeeping, or a conflict-retry backoff is busy and
+/// invisible to it. 3.96 out of 16 says planning was about a quarter of an
+/// eval's wall time, which is what `legion_eval_handle_seconds` was added
+/// to show ("the difference is everything an eval does outside planning").
+/// It never said anything about a cap at 4.
+///
+/// The code agrees: no read connection is held across a quorum round,
+/// across an `.await`, or across `build_plan`. Planning reads the in-memory
+/// `SchedulingReadModel`, `plan_and_apply_internal` holds no read guard
+/// when it calls `submit_and_apply_plan_with_candidates`, and the apply
+/// runs on the WRITE connection inside `replicated()`. Every acquisition on
+/// the path is one leaf store method wide, so the pool cannot serialize two
+/// planners against each other. It shows up as queueing latency, never as
+/// mutual exclusion.
+///
+/// **So why change it at all? The basis was wrong, not the size.** The pool
+/// was `available_parallelism().max(4)` on the argument that these reads
+/// are CPU-bound page-cache hits and one connection per core saturates
+/// them. That argument does not survive contact with the workload:
+///
+/// - The readers are latency-bound. A saturated 5,000-node control plane
+///   measured **8% CPU across four cores**, and a read that misses the
+///   64 MiB page cache is a `pread` — the connection's mutex is held for
+///   the whole of an I/O wait that uses no CPU at all.
+/// - Holds are not uniform. Most acquisitions are one indexed statement,
+///   but `cache_refresh_allocation_scopes` holds ONE connection across a
+///   loop of up to ~44 per-node queries (~1,700 rows at 200,000
+///   allocations), after every plan-apply, **on every replica**.
+/// - Sizing the pool AT the core count couples it to the tokio runtime's
+///   width. `build_desired_allocations` and the rest of the heartbeat body
+///   run *inline on a runtime worker thread* (only `update_node_heartbeat`
+///   is offloaded), so a heartbeat that queues for a connection parks one
+///   of `available_parallelism()` runtime threads. This is a structural
+///   coupling, not an observed failure — the sweep above shows 4
+///   connections holding up fine — but two unrelated resources should not
+///   saturate at the same instant by construction.
+///
+/// **What it is sized from instead:** the concurrent readers the manager
+/// actually runs — `evalThreads` (an eval worker is one reader at a time,
+/// its handler being synchronous end to end) plus
+/// [`READ_POOL_SERVING_HEADROOM`], capped at [`READ_POOL_MAX`].
+///
+/// **What this deliberately does not claim.** No throughput win: the sweep
+/// says the old size was adequate through 32 eval threads at this fleet
+/// size and fill, and nothing here has been measured against it. The cap is
+/// [`READ_POOL_MAX`] because that is the memory budget, **not** because
+/// anyone has seen a knee there — the sweep's own knee is unmeasured, since
+/// the 64-thread cell was limited by the load generator rather than by
+/// Legion. Sizing for a knee nobody has seen would be guesswork. This is a
+/// correction to the reasoning and a bounded hedge for the higher
+/// `evalThreads` values the sweep shows operators will want, and it should
+/// be read as nothing more.
+///
+/// If reads really are queueing, `legion_store_read_lock_wait_seconds` says
+/// so directly — reach for that before assuming. With the pool sized from
+/// the readers rather than the cores, a nonzero wait means a reader is
+/// holding a connection too long, and the fix for that is to issue fewer or
+/// shorter reads, not to hold more connections.
+///
+/// (Historical: this was 2, and 2 really was a serialization point — the
+/// `task_fetch` plan phase grew 100x between the 1,000- and 5,000-node
+/// cells, 0.14 ms -> 14.96 ms. Phase 3 then measured `task_fetch` at
+/// 0.65 ms at 5,000 nodes on that same two-connection binary, so even that
+/// was coupled to the plan-conflict rate rather than to fleet size.)
+fn read_only_conn_pool_size(eval_threads: usize) -> usize {
+    // `eval_threads` comes straight from operator config and is a `usize`,
+    // so 0 is expressible; the daemon clamps it to at least one worker and
+    // so does this.
+    eval_threads
+        .max(1)
+        .saturating_add(READ_POOL_SERVING_HEADROOM)
+        .min(READ_POOL_MAX)
+}
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Page cache per connection, as a NEGATIVE `cache_size` — SQLite reads a
+/// negative value as kibibytes rather than pages, so this is 64 MiB whatever
+/// the page size is.
+///
+/// SQLite's default is 2 MiB, which a real cluster outgrows immediately: a
+/// 5,000-node fleet holding 100,000 allocations has an `allocation` table plus
+/// indexes far larger than that, and the scheduler's hot path re-reads it
+/// constantly (free pools per node, epochs per scope, the read model's
+/// refresh). Past the default the cache thrashes and every read becomes a
+/// page fetch. The 2026-08-05 AWS campaign measured the plan `apply` phase
+/// going from 21 ms per eval at 25,000 allocations to 354 ms at 100,000 —
+/// a 17x rise from a 4x data increase, which is a cliff rather than a slope.
+///
+/// Generous is safe here: `cache_size` is a CAP, not a preallocation. SQLite
+/// grows the cache lazily as pages are actually read, so a small deployment
+/// never pays for a limit it does not reach, while a large one stops
+/// thrashing.
+const SQLITE_CACHE_SIZE_KIB: i64 = -65536;
 // Live subscribers that fall this many events behind must catch up from the
 // scheduler_event table (StreamEvents handles the Lagged case).
 const EVENT_BROADCAST_CAPACITY: usize = 1_024;
@@ -682,6 +1362,27 @@ const EVENT_PRUNE_INTERVAL: i64 = 256;
 // (heartbeat-scale plan §2): 128 single-row upserts is a small changeset,
 // and the cap bounds both the IN-list and the raft entry size.
 const HEARTBEAT_BATCH_MAX: usize = 128;
+// Job-intake group commits are capped per batch. Both batched ops are
+// single-row-per-request inserts against one table, so the changeset stays
+// small; the cap bounds the raft entry and the time the batch holds the
+// write connection. Higher than the plan cap (16) because these rows are
+// tiny next to a plan's placement set, and the intake path's concurrency is
+// the client fan-out, which is what we want to absorb in one round.
+const EVAL_ENQUEUE_BATCH_MAX: usize = 64;
+
+/// Cap for the control-lane job-submit group commit. Same reasoning as the
+/// eval-enqueue cap: bounded by what a submit burst realistically piles up
+/// while one commit is in flight, and by how much work a single control-lane
+/// changeset should carry.
+const JOB_SUBMIT_BATCH_MAX: usize = 64;
+const TASK_STATUS_SEED_BATCH_MAX: usize = 64;
+// The submit composite's status-lane seed, shared by the single-seed op and
+// the group commit so the two forms can never drift apart.
+const SEED_TASK_STATUSES_SQL: &str =
+    "INSERT INTO task_status (task_config_id, job_id, job_config_id, status, updated_at)
+     SELECT id, job_id, job_config_id, ?2, ?3
+     FROM task_config WHERE job_config_id = ?1
+     ON CONFLICT(task_config_id) DO NOTHING;";
 // Middle bits of a scheduler_event id carrying the per-process sequence:
 // the high bits carry unix milliseconds and the low `Lane::ID_STRIDE_BITS`
 // carry the minting lane's residue (see `next_scheduler_event_id`).
@@ -716,13 +1417,14 @@ impl Store {
 
         let write_conn = Store::create_write_conn(&db_path, raft_enabled)?;
         let _migrations = Store::create_initial_tables(&Arc::clone(&write_conn))?;
-        let read_conns = Store::create_read_pool(&db_path)?;
+        let read_conns = Store::create_read_pool(&db_path, config.eval_threads)?;
         let resource_policy = ResourcePolicy::from_manager_config(config)?;
         let index_settings = Arc::new(IndexSettings::from_scheduler_settings(
             config.scheduler_settings.as_ref(),
             &config.scheduling_policy,
         )?);
 
+        let resource_policy_fingerprint: Arc<str> = resource_policy.fingerprint().into();
         let store = Store {
             write_conn,
             read_conns: Arc::new(read_conns),
@@ -734,9 +1436,11 @@ impl Store {
             scheduler_settings: config.scheduler_settings.clone(),
             index_settings,
             resource_policy,
+            resource_policy_fingerprint,
             persistence_driver,
             read_model: Arc::new(RwLock::new(SchedulingReadModel::default())),
             eval_notify: Arc::new(Notify::new()),
+            status_projection_tx: Arc::new(OnceLock::new()),
             event_tx: broadcast::channel(EVENT_BROADCAST_CAPACITY).0,
             raft_mode: Arc::new(AtomicBool::new(false)),
             replication: Arc::new(OnceLock::new()),
@@ -751,7 +1455,23 @@ impl Store {
                 "heartbeat",
                 HEARTBEAT_BATCH_MAX,
             )),
+            eval_enqueue_coalescer: Arc::new(crate::storage::coalesce::Coalescer::new(
+                "eval_enqueue",
+                EVAL_ENQUEUE_BATCH_MAX,
+            )),
+            job_submit_coalescer: Arc::new(crate::storage::coalesce::Coalescer::new(
+                "job_submit",
+                JOB_SUBMIT_BATCH_MAX,
+            )),
+            task_status_seed_coalescer: Arc::new(crate::storage::coalesce::Coalescer::new(
+                "task_status_seed",
+                TASK_STATUS_SEED_BATCH_MAX,
+            )),
+            liveness: Arc::new(crate::storage::liveness::LivenessTable::new()),
+            missed_beats_before_lost: config.heartbeat.missed_beats_before_lost.max(1),
+            alloc_scrub_queue: Arc::new(std::sync::Mutex::new(Vec::new())),
         };
+        store.liveness.configure(config.liveness.settings());
 
         store.refresh_read_model()?;
 
@@ -765,7 +1485,57 @@ impl Store {
             store.persistence_driver.clone().start_engine(&store)?;
         }
 
+        Store::spawn_wal_checkpointer(&db_path);
+
         Ok(store)
+    }
+
+    /// Checkpoint the WAL from a dedicated connection, off the write path.
+    ///
+    /// With autocheckpointing alone, whichever writer crossed the page
+    /// threshold paid the whole checkpoint inline — inside the serialized
+    /// plan-apply commit, where a sample profile showed the batch body
+    /// dominated by pwrite. PASSIVE checkpoints never block writers or
+    /// readers; they simply move as many WAL frames into the main database
+    /// as they can without contention, and the raised `wal_autocheckpoint`
+    /// threshold in `configure_connection` still bounds the WAL if this
+    /// thread ever stalls.
+    ///
+    /// The thread holds only its own connection and a path, so it never
+    /// keeps a `Store` alive; it exits when the checkpoint connection
+    /// errors hard (e.g. the file is gone after a test teardown).
+    fn spawn_wal_checkpointer(db_path: &Path) {
+        let path = db_path.to_path_buf();
+        std::thread::Builder::new()
+            .name("wal-checkpoint".into())
+            .spawn(move || {
+                let conn = match Connection::open(&path) {
+                    Ok(conn) => conn,
+                    Err(_) => return,
+                };
+                let mut consecutive_failures = 0u32;
+                loop {
+                    std::thread::sleep(std::time::Duration::from_millis(1000));
+                    match conn.query_row(
+                        "PRAGMA wal_checkpoint(PASSIVE);",
+                        [],
+                        // (busy, log_frames, checkpointed_frames)
+                        |row| row.get::<_, i64>(0),
+                    ) {
+                        Ok(_) => consecutive_failures = 0,
+                        Err(_) => {
+                            consecutive_failures += 1;
+                            // A store that has been torn down (tests, or a
+                            // wiped data dir) errors forever; stop rather
+                            // than spin on a dead file.
+                            if consecutive_failures > 30 {
+                                return;
+                            }
+                        }
+                    }
+                }
+            })
+            .ok();
     }
 
     /// Clone handed to the raft engine (state machines, pipeline threads):
@@ -841,6 +1611,37 @@ impl Store {
         {
             Some(driver) => driver.is_leader(lane),
             None => true,
+        }
+    }
+
+    /// `host:port` of the manager that leads `lane`, when this node knows one.
+    /// `None` outside raft mode and mid-election.
+    pub(crate) fn lane_leader_hint(&self, lane: crate::storage::Lane) -> Option<String> {
+        self.persistence_driver
+            .as_any()
+            .downcast_ref::<crate::storage::raft::driver::MultiRaftDriver>()
+            .and_then(|driver| driver.lane_leader_addr(lane))
+    }
+
+    /// Report the nodes this manager has heard from to the status-lane leader
+    /// (liveness plan §6.3). A no-op outside raft mode, where this manager IS
+    /// the leader and its own table is the truth.
+    pub async fn report_node_liveness(
+        &self,
+        observer_manager_id: &str,
+        node_ids: Vec<String>,
+    ) -> crate::storage::liveness::DigestOutcome {
+        match self
+            .persistence_driver
+            .as_any()
+            .downcast_ref::<crate::storage::raft::driver::MultiRaftDriver>()
+        {
+            Some(driver) => {
+                driver
+                    .send_liveness_digest(observer_manager_id.to_string(), node_ids)
+                    .await
+            }
+            None => crate::storage::liveness::DigestOutcome::NoEngine,
         }
     }
 
@@ -1143,14 +1944,33 @@ impl Store {
         }
 
         conn.pragma_update(None, "foreign_keys", "ON")?;
+        conn.pragma_update(None, "cache_size", SQLITE_CACHE_SIZE_KIB)?;
+        // The default cache holds 16 statements; the plan-apply walk alone
+        // cycles through more than that, so hot statements were being
+        // evicted and re-parsed. Sized to hold every statement the manager
+        // uses steadily, with room to spare — a cached statement is a few KiB.
+        conn.set_prepared_statement_cache_capacity(128);
+
+        if !read_only {
+            // WAL checkpointing is moved OFF the commit path: with the
+            // default (1000 pages), whichever writer crossed the threshold
+            // paid the whole checkpoint inline, inside the serialized
+            // plan-apply commit — a sample profile showed the batch body
+            // dominated by pwrite. A background thread checkpoints
+            // passively every second (see `spawn_wal_checkpointer`); this
+            // raised threshold only backstops it if that thread stalls, so
+            // the WAL stays bounded either way.
+            conn.pragma_update(None, "wal_autocheckpoint", 4000)?;
+        }
 
         Ok(())
     }
 
     #[instrument(err, skip_all)]
-    fn create_read_pool(db_path: &Path) -> R<Vec<MemSafeConn>> {
-        let mut read_conns = Vec::with_capacity(READ_ONLY_CONN_POOL_SIZE);
-        for _ in 0..READ_ONLY_CONN_POOL_SIZE {
+    fn create_read_pool(db_path: &Path, eval_threads: usize) -> R<Vec<MemSafeConn>> {
+        let size = read_only_conn_pool_size(eval_threads);
+        let mut read_conns = Vec::with_capacity(size);
+        for _ in 0..size {
             read_conns.push(Self::create_readonly_conn(db_path)?);
         }
         Ok(read_conns)
@@ -1185,10 +2005,18 @@ impl Store {
         let lock_wait_started = Instant::now();
         let guard = conn.lock().map_err(|_| anyhow!(CONN_LOCK_ERROR))?;
         let waited = lock_wait_started.elapsed();
-        if connection_kind == "write" {
-            crate::manager::telemetry::metrics()
+        // Both kinds are observed. The read side was unmeasured, which is
+        // why its cost was invisible: every millisecond spent queueing for
+        // a read connection was attributed to whichever plan phase
+        // happened to be holding the stopwatch (`task_fetch`, usually),
+        // with no metric anywhere naming the real resource.
+        match connection_kind {
+            "write" => crate::manager::telemetry::metrics()
                 .store_write_lock_wait_seconds
-                .observe(waited.as_secs_f64());
+                .observe(waited.as_secs_f64()),
+            _ => crate::manager::telemetry::metrics()
+                .store_read_lock_wait_seconds
+                .observe(waited.as_secs_f64()),
         }
         debug!(
             connection_kind,
@@ -1672,9 +2500,30 @@ impl Store {
 
     pub(crate) fn read_connection(&self) -> R<MutexGuard<'_, Connection>> {
         let pool = self.read_conns.as_slice();
-        let index = self.read_index.fetch_add(1, Ordering::Relaxed);
-        let conn = pool.get(index % pool.len()).unwrap_or(&self.write_conn);
-        Self::lock_conn(conn, "read")
+        if pool.is_empty() {
+            return Self::lock_conn(&self.write_conn, "read");
+        }
+        let start = self.read_index.fetch_add(1, Ordering::Relaxed);
+
+        // Take any free connection before waiting on a busy one. Plain
+        // round-robin picked a slot and then *blocked* on it, so a reader
+        // could sit behind a long query while its neighbour sat idle —
+        // which makes a pool of N behave worse than N under load, and is
+        // half of why two connections hurt as much as they did.
+        for offset in 0..pool.len() {
+            let conn = &pool[(start.wrapping_add(offset)) % pool.len()];
+            if let Ok(guard) = conn.try_lock() {
+                crate::manager::telemetry::metrics()
+                    .store_read_lock_wait_seconds
+                    .observe(0.0);
+                return Ok(guard);
+            }
+        }
+
+        // Every connection is busy: queue on the one this caller drew, so
+        // waiters still spread across the pool rather than piling onto a
+        // single slot.
+        Self::lock_conn(&pool[start % pool.len()], "read")
     }
 
     fn read_model_reader(&self) -> R<std::sync::RwLockReadGuard<'_, SchedulingReadModel>> {
@@ -1805,7 +2654,14 @@ impl Store {
             // previous model's counter + 1 when it publishes the rebuild.
             generation: 0,
             available_nodes_cache: None,
+            // Populated by the reprojection below, node by node, while the
+            // model is still private to this builder.
+            node_usage: HashMap::new(),
+            // Built from the lists just loaded, below.
+            allocations_by_job: HashMap::new(),
+            jobs_by_node: HashMap::new(),
         };
+        model.rebuild_job_index();
         let id_refs: Vec<&str> = node_ids.iter().map(String::as_str).collect();
         Self::reproject_model_nodes(&mut model, &self.resource_policy, &id_refs);
 
@@ -1819,6 +2675,18 @@ impl Store {
     /// allocation changes — calls this inside the same write lock as the
     /// mutation, so derived state is never observable out of step with
     /// `nodes`. Unavailable or deleted nodes lose both.
+    ///
+    /// The pool comes from the per-node [`NodeUsage`] memo
+    /// (`SchedulingReadModel::node_usage`) when one is cached: subtracting
+    /// the aggregate is O(resource dims), where the row walk this replaces
+    /// re-normalized every allocation's resources JSON on the node — an
+    /// O(allocations-on-node) cost, per touched node, on every replica,
+    /// inside this write lock, that grew with cluster FILL while the change
+    /// being projected did not (the fill-degradation mechanism named in
+    /// aws-phase4-findings.md). A node with no memo entry pays one
+    /// [`NodeUsage::from_rows`] walk here — the exact cost every call paid
+    /// before the memo — and caches the result. A node whose rows fail to
+    /// parse keeps the row walk's fits-nothing posture and caches nothing.
     fn reproject_model_nodes(
         model: &mut SchedulingReadModel,
         policy: &ResourcePolicy,
@@ -1829,15 +2697,39 @@ impl Store {
         }
         let started = Instant::now();
         for node_id in node_ids {
-            match model.nodes.get(*node_id) {
+            // Arc clone, not a borrow: the memo insert below needs `model`
+            // mutably while the node is still in hand.
+            let node = model.nodes.get(*node_id).cloned();
+            match node {
                 Some(node) if node.availability == "available" => {
-                    let allocations = model
-                        .allocations_by_node
-                        .get(*node_id)
-                        .map(|allocations| allocations.as_slice())
-                        .unwrap_or(&[]);
-                    let pool = ResourcePool::free_for_node(node, allocations, policy);
-                    model.indexes.reindex_node(node, &pool);
+                    let pool = match model.node_usage.get(*node_id) {
+                        Some(usage) => ResourcePool::free_from_usage(&node, usage),
+                        None => {
+                            let allocations = model
+                                .allocations_by_node
+                                .get(*node_id)
+                                .map(|allocations| allocations.as_slice())
+                                .unwrap_or(&[]);
+                            match NodeUsage::from_rows(
+                                allocations
+                                    .iter()
+                                    .map(|allocation| (allocation.id, &allocation.resources)),
+                                policy,
+                            ) {
+                                Ok(usage) => {
+                                    let pool = ResourcePool::free_from_usage(&node, &usage);
+                                    model.node_usage.insert((*node_id).to_string(), usage);
+                                    pool
+                                }
+                                // A row nobody could read: the row walk owns
+                                // this case — it warns naming the node and
+                                // yields the fits-nothing empty pool — and no
+                                // aggregate is cached for it.
+                                Err(_) => ResourcePool::free_for_node(&node, allocations, policy),
+                            }
+                        }
+                    };
+                    model.indexes.reindex_node(&node, &pool);
                     model
                         .node_pools
                         .insert((*node_id).to_string(), Arc::new(pool));
@@ -1931,9 +2823,10 @@ impl Store {
         }
         let mut guard = self.read_model_writer()?;
         guard.nodes.remove(id);
-        guard.allocations_by_node.remove(id);
+        guard.remove_node_allocations(id);
         guard.indexes.remove_node(id);
         guard.node_pools.remove(id);
+        guard.node_usage.remove(id);
         guard.available_nodes_cache = None;
         // Removing a node removes its allocations from the capacity view.
         guard.generation = guard.generation.wrapping_add(1);
@@ -1960,43 +2853,478 @@ impl Store {
             return Ok(());
         }
         // 1. Epochs first.
-        let mut epochs: Vec<(String, i64)> = Vec::new();
-        for node_id in node_ids {
-            epochs.push((
-                Self::scope_vector_key("node", node_id),
-                self.allocation_epoch_for_scope("node", node_id)?,
-            ));
-        }
-        for job_config_id in job_config_ids {
-            epochs.push((
-                Self::scope_vector_key("job_config", job_config_id),
-                self.allocation_epoch_for_scope("job_config", job_config_id)?,
-            ));
-        }
-        // 2. Allocations second.
+        let epochs = self.read_allocation_scope_epochs(node_ids, job_config_ids)?;
+        // 2. Allocations second, over ONE connection with ONE cached
+        //    statement.
+        //
+        //    `allocs_for_node` takes a fresh read connection and re-prepares
+        //    the statement on every call, and this loop runs once per node a
+        //    plan touched — up to 44 on the AWS `dense_fleet` shape. That was
+        //    44 acquisitions from a pool sized to the core count (4 on the
+        //    campaign's managers) and 44 statement parses, per eval, on every
+        //    replica: the refresh was contending with the planning it exists
+        //    to serve.
         let mut per_node: Vec<(String, Vec<Allocation>)> = Vec::new();
-        for node_id in node_ids {
-            per_node.push((node_id.clone(), self.allocs_for_node(node_id)?));
+        {
+            let conn = self.read_connection()?;
+            let mut stmt = conn.prepare_cached(GET_ALLOCS_FOR_NODE.as_str())?;
+            for node_id in node_ids {
+                let allocs = Self::collect_rows(
+                    stmt.query_map([node_id], |row| self.allocation_from_row(row))?,
+                )?;
+                per_node.push((node_id.clone(), allocs));
+            }
         }
+        // Re-aggregate each reloaded node's usage memo from the fresh rows
+        // HERE, outside the write lock, so the JSON normalization cost never
+        // extends the lock hold (`SchedulingReadModel::node_usage`). A node
+        // whose rows fail to parse gets no aggregate; reprojection then
+        // takes the row walk's fits-nothing path for it.
+        let usage_per_node: Vec<(String, Option<NodeUsage>)> = per_node
+            .iter()
+            .map(|(node_id, allocs)| {
+                let usage = NodeUsage::from_rows(
+                    allocs
+                        .iter()
+                        .map(|allocation| (allocation.id, &allocation.resources)),
+                    &self.resource_policy,
+                )
+                .ok();
+                (node_id.clone(), usage)
+            })
+            .collect();
         // 3. Publish atomically, then re-derive the affected nodes' free
         // pools and index projections from the refreshed allocations —
         // inside the same lock, so `node_pools`/`indexes` can never be
         // observed out of step with `allocations_by_node` (the
         // plan-snapshot cache's own invariant).
+        //
+        // A scope whose mirror epoch is already AHEAD of the one this
+        // refresh read is skipped wholesale (list, usage, epoch): a delta
+        // projection published newer state for it between our reads and
+        // this lock, and overwriting that with our older snapshot would be
+        // a lost update the deltas cannot see afterwards — a splice
+        // contradicts the cache only when it touches the erased rows, so
+        // the hole could otherwise persist until the round-robin scrub
+        // reached the node (adversarial finding, 2026-08-06). Skipping is
+        // safe precisely because what we would have written is OLDER than
+        // what is there. The residual window is a concurrent commit that
+        // bumps NO scope epoch of the node (a pure status UPDATE);
+        // placements and removals — the capacity-bearing changes — always
+        // bump, and the scrub still bounds the rest.
         let mut guard = self.read_model_writer()?;
+        let stale_scopes: HashSet<&str> = epochs
+            .iter()
+            .filter(|(key, epoch)| guard.scope_epochs.get(key).copied().unwrap_or(0) > *epoch)
+            .map(|(key, _)| key.as_str())
+            .collect();
+        let node_stale =
+            |node_id: &str| stale_scopes.contains(Self::scope_vector_key("node", node_id).as_str());
+        let mut published_nodes: Vec<String> = Vec::with_capacity(per_node.len());
         for (node_id, allocs) in per_node {
-            guard.allocations_by_node.insert(node_id, Arc::new(allocs));
+            if node_stale(&node_id) {
+                continue;
+            }
+            published_nodes.push(node_id.clone());
+            guard.set_node_allocations(node_id, allocs);
         }
-        for (key, epoch) in epochs {
-            guard.scope_epochs.insert(key, epoch);
+        for (node_id, usage) in usage_per_node {
+            if node_stale(&node_id) {
+                continue;
+            }
+            match usage {
+                Some(usage) => {
+                    guard.node_usage.insert(node_id, usage);
+                }
+                None => {
+                    guard.node_usage.remove(&node_id);
+                }
+            }
         }
-        // Every allocation/epoch publish funnels through here; the bump is
-        // what lets in-flight lazy-sample plans detect this publish (see
-        // `SchedulingReadModel::generation`).
+        for (key, epoch) in epochs.iter() {
+            if stale_scopes.contains(key.as_str()) {
+                continue;
+            }
+            guard.scope_epochs.insert(key.clone(), *epoch);
+        }
+        // Every allocation/epoch publish bumps the counter (this path and
+        // the delta path below); the bump is what lets in-flight lazy-sample
+        // plans detect the publish (see `SchedulingReadModel::generation`).
         guard.generation = guard.generation.wrapping_add(1);
-        let affected: Vec<&str> = node_ids.iter().map(String::as_str).collect();
+        let affected: Vec<&str> = published_nodes.iter().map(String::as_str).collect();
         Self::reproject_model_nodes(&mut guard, &self.resource_policy, &affected);
         Ok(())
+    }
+
+    /// The epoch half of an allocation-scope refresh, read BEFORE any
+    /// allocation row (both refresh paths call this first — the ordering is
+    /// the mirror's coherence invariant, see
+    /// [`Self::cache_refresh_allocation_scopes`]).
+    fn read_allocation_scope_epochs(
+        &self,
+        node_ids: &BTreeSet<String>,
+        job_config_ids: &BTreeSet<String>,
+    ) -> R<Vec<(String, i64)>> {
+        let mut epochs: Vec<(String, i64)> =
+            Vec::with_capacity(node_ids.len() + job_config_ids.len());
+        // ONE read connection and ONE cached statement for the whole scope
+        // set. This runs after every plan apply on every replica, over the
+        // ~44 nodes a dense plan touches — as separate
+        // `allocation_epoch_for_scope` calls it was 44 read-pool
+        // acquisitions and 44 statement parses per eval, contending with the
+        // planners the pool exists to serve.
+        let conn = self.read_connection()?;
+        let mut stmt = conn.prepare_cached(
+            "SELECT epoch FROM allocation_epoch_partition WHERE scope_type = ?1 AND scope_id = ?2;",
+        )?;
+        let mut read = |scope_type: &str, scope_id: &str| -> R<i64> {
+            let epoch: Option<i64> = stmt
+                .query_row(params![scope_type, scope_id], |row| row.get(0))
+                .optional()?;
+            Ok(epoch.unwrap_or(0))
+        };
+        for node_id in node_ids {
+            epochs.push((
+                Self::scope_vector_key("node", node_id),
+                read("node", node_id)?,
+            ));
+        }
+        for job_config_id in job_config_ids {
+            epochs.push((
+                Self::scope_vector_key("job_config", job_config_id),
+                read("job_config", job_config_id)?,
+            ));
+        }
+        Ok(epochs)
+    }
+
+    /// Refresh the allocation cache and the epoch mirror from the rows a
+    /// committed changeset NAMED, instead of reloading every touched node's
+    /// whole allocation list.
+    ///
+    /// **Why.** [`Self::cache_refresh_allocation_scopes`] reloads each
+    /// touched node in full, so its cost scales with how FULL the cluster is
+    /// while the change being projected does not: on the AWS `dense_fleet`
+    /// shape (5,000 nodes) a plan touching ~44 nodes reloaded ~440 rows at
+    /// 50,000 allocations and ~1,760 at 200,000 — to learn about the ~44
+    /// allocations the changeset already named precisely. Throughput fell
+    /// 736 → 457 → 273 alloc/s across those three fills, ~1.6x per doubling,
+    /// and this refresh runs outside the plan-phase timers, which is part of
+    /// why the time was invisible. Reading the named rows by primary key
+    /// makes the cost proportional to the CHANGE (~44 indexed single-row
+    /// reads), not to the fill.
+    ///
+    /// **What this gives up.** The full reload is self-healing: whatever the
+    /// in-memory model held is replaced by the truth from SQLite, so drift
+    /// cannot persist. A delta cannot self-heal — it can only be correct if
+    /// the entry it patches was already correct. Three things bound that:
+    ///
+    /// 1. **Fallback on contradiction.** Every splice is checked against the
+    ///    cached list (a DELETE must find its row, an INSERT must not, an
+    ///    in-place UPDATE must). Any node whose delta contradicts the cache
+    ///    is reloaded in full through the self-healing path — same for a row
+    ///    the changeset created or changed that is not in committed state,
+    ///    which falls the WHOLE changeset back to the old path.
+    /// 2. **Unclassifiable changesets never take this path.** The caller
+    ///    ([`Self::project_changeset_side_effects`]) only builds a delta when
+    ///    it could name the id and the owning node of every allocation
+    ///    record; anything else uses the full reload.
+    /// 3. **A round-robin scrub.** Each call also reloads ONE node in full
+    ///    (`alloc_scrub_queue`), so drift on a node the deltas never touch
+    ///    again — the dangerous case, a node wrongly believed full that the
+    ///    scheduler then never writes to — is repaired within one sweep of
+    ///    the fleet.
+    ///
+    /// Correctness also rests on serialized application: `allocation` is
+    /// owned by the scheduler raft lane (`raft::ownership`), whose state
+    /// machine applies (and therefore projects) one changeset at a time, so
+    /// the cached list this patches is exactly committed state minus this
+    /// changeset.
+    ///
+    /// Publishing is identical to the full path: epochs read first,
+    /// everything published under ONE write-lock acquisition, `generation`
+    /// bumped, and the touched nodes reprojected inside that lock.
+    fn cache_apply_allocation_delta(
+        &self,
+        delta: &AllocationDelta,
+        node_ids: &BTreeSet<String>,
+        job_config_ids: &BTreeSet<String>,
+    ) -> R<()> {
+        if capture::in_capture() {
+            return Ok(());
+        }
+        // 1. Epochs first, exactly as the full path reads them.
+        let epochs = self.read_allocation_scope_epochs(node_ids, job_config_ids)?;
+
+        // 2. The named rows second, over ONE connection with cached
+        //    statements — one indexed single-row read per created/changed
+        //    allocation, plus the one scrubbed node's list.
+        let scrub_node = self.next_alloc_scrub_node()?;
+        let mut upserted: Vec<Allocation> = Vec::with_capacity(delta.upserts.len());
+        let mut missing: Vec<i64> = Vec::new();
+        let mut scrubbed: Option<(String, Vec<Allocation>)> = None;
+        {
+            let conn = self.read_connection()?;
+            let mut by_id = conn.prepare_cached(GET_ALLOCATION_BY_ID.as_str())?;
+            for id in &delta.upserts {
+                match by_id
+                    .query_row([id], |row| self.allocation_from_row(row))
+                    .optional()?
+                {
+                    Some(allocation) => upserted.push(allocation),
+                    None => missing.push(*id),
+                }
+            }
+            if let Some(node_id) = &scrub_node {
+                let mut for_node = conn.prepare_cached(GET_ALLOCS_FOR_NODE.as_str())?;
+                let allocations = Self::collect_rows(
+                    for_node.query_map([node_id], |row| self.allocation_from_row(row))?,
+                )?;
+                scrubbed = Some((node_id.clone(), allocations));
+            }
+        }
+        // A row the changeset created or changed that committed state does
+        // not have contradicts the premise of the whole delta, and we cannot
+        // even name its node to reload it. Fall back to the self-healing
+        // path for this changeset's scopes — which is exactly what this
+        // projection did before deltas existed.
+        if !missing.is_empty() {
+            warn!(
+                allocation_ids = ?missing,
+                "Changeset named allocations that are not in committed state; \
+                 reloading the affected scopes in full"
+            );
+            return self.cache_refresh_allocation_scopes(node_ids, job_config_ids);
+        }
+
+        // Re-aggregate the scrubbed node's usage memo off-lock, like the
+        // full-refresh path does — the JSON normalization must not extend
+        // the write-lock hold.
+        let scrubbed_usage: Option<NodeUsage> = scrubbed.as_ref().and_then(|(_, allocations)| {
+            NodeUsage::from_rows(
+                allocations
+                    .iter()
+                    .map(|allocation| (allocation.id, &allocation.resources)),
+                &self.resource_policy,
+            )
+            .ok()
+        });
+
+        // 3. Publish atomically. Nodes whose delta contradicts the cache are
+        //    collected here and reloaded in full AFTER the lock is dropped —
+        //    a reload needs the database, and holding the write lock across
+        //    SQLite reads would stall every plan.
+        let mut drifted: BTreeSet<String> = BTreeSet::new();
+        let mut touched: BTreeSet<String> = BTreeSet::new();
+        {
+            let mut guard = self.read_model_writer()?;
+            // Removals first: an UPDATE that moved an allocation between
+            // nodes is a removal from the old node plus an upsert into the
+            // new one, and the removal has to land before the upsert.
+            for (id, node_id) in &delta.removals {
+                match Self::cache_drop_allocation_entry(&mut guard, node_id, *id) {
+                    Some(removed) => Self::cache_adjust_node_usage(
+                        &mut guard,
+                        &self.resource_policy,
+                        node_id,
+                        Some(&removed.resources),
+                        None,
+                    ),
+                    None => {
+                        drifted.insert(node_id.clone());
+                    }
+                }
+                touched.insert(node_id.clone());
+            }
+            for allocation in upserted {
+                // A new row must not already be cached, and a row moved to
+                // another node was just removed from its old list, so both
+                // are legitimately absent. An in-place update must be there.
+                let expected = if delta.inserts.contains(&allocation.id)
+                    || delta.moved.contains(&allocation.id)
+                {
+                    CachedEntry::Absent
+                } else {
+                    CachedEntry::Present
+                };
+                let node_id = allocation.node_id.clone();
+                let added_resources = allocation.resources.clone();
+                let (as_expected, replaced) =
+                    Self::cache_splice_allocation_entry(&mut guard, allocation, expected);
+                if !as_expected {
+                    drifted.insert(node_id.clone());
+                }
+                Self::cache_adjust_node_usage(
+                    &mut guard,
+                    &self.resource_policy,
+                    &node_id,
+                    replaced.as_ref().map(|replaced| &replaced.resources),
+                    Some(&added_resources),
+                );
+                touched.insert(node_id);
+            }
+            // The scrub's wholesale reload lands last so it wins over any
+            // splice into the same node — it is the newer read of the two,
+            // and its memo entry replaces whatever the splices left.
+            if let Some((node_id, allocations)) = scrubbed {
+                // A node that left the fleet between the read and here must
+                // not be resurrected in the allocation map.
+                if guard.nodes.contains_key(&node_id) {
+                    guard.set_node_allocations(node_id.clone(), allocations);
+                    match scrubbed_usage {
+                        Some(usage) => {
+                            guard.node_usage.insert(node_id.clone(), usage);
+                        }
+                        None => {
+                            guard.node_usage.remove(&node_id);
+                        }
+                    }
+                    touched.insert(node_id);
+                }
+            }
+            // A drifted node's list no longer matches what the memo was
+            // adjusted toward; drop the entry so the reprojection below
+            // rebuilds it from the list actually published, and the full
+            // reload after the lock re-aggregates it from committed state.
+            for node_id in &drifted {
+                guard.node_usage.remove(node_id);
+            }
+            for (key, epoch) in epochs {
+                guard.scope_epochs.insert(key, epoch);
+            }
+            guard.generation = guard.generation.wrapping_add(1);
+            // Only nodes whose allocation list actually moved need their
+            // free pool and index projections re-derived: a node that merely
+            // had its epoch bumped holds the same allocations, hence the
+            // same pool. Reprojection is O(allocations on the node), so this
+            // is the same fill-scaling saving as the reads above.
+            let affected: Vec<&str> = touched.iter().map(String::as_str).collect();
+            Self::reproject_model_nodes(&mut guard, &self.resource_policy, &affected);
+        }
+
+        if !drifted.is_empty() {
+            warn!(
+                nodes = ?drifted,
+                "Allocation delta contradicted the cached read model; reloading those nodes in full"
+            );
+            self.cache_refresh_allocation_scopes(&drifted, &BTreeSet::new())?;
+        }
+        Ok(())
+    }
+
+    /// Removes `allocation_id` from `node_id`'s cached list, returning the
+    /// removed row so the caller can take its usage back out of the node's
+    /// [`NodeUsage`] memo. `None` means the row was not there — the cache
+    /// disagrees with committed state, the delta path's drift signal.
+    fn cache_drop_allocation_entry(
+        model: &mut SchedulingReadModel,
+        node_id: &str,
+        allocation_id: i64,
+    ) -> Option<Allocation> {
+        let entry = model.allocations_by_node.get_mut(node_id)?;
+        // Copy-on-write: a plan may still hold the previous snapshot.
+        let allocations = Arc::make_mut(entry);
+        let index = allocations
+            .iter()
+            .position(|allocation| allocation.id == allocation_id)?;
+        let removed = allocations.remove(index);
+        model.unindex_allocation(&removed);
+        Some(removed)
+    }
+
+    /// Splices one allocation into its node's cached list, replacing any
+    /// entry with the same id. The `bool` reports whether the list held
+    /// what `expected` said it would — `false` is the delta path's drift
+    /// signal — and the `Option` carries the row this splice replaced, so
+    /// the caller can swap its usage out of the node's [`NodeUsage`] memo.
+    fn cache_splice_allocation_entry(
+        model: &mut SchedulingReadModel,
+        allocation: Allocation,
+        expected: CachedEntry,
+    ) -> (bool, Option<Allocation>) {
+        let job_id = allocation.job_id.clone();
+        let node_id = allocation.node_id.clone();
+        let reference = AllocationRef::of(&allocation);
+        let entry = model
+            .allocations_by_node
+            .entry(allocation.node_id.clone())
+            .or_default();
+        let allocations = Arc::make_mut(entry);
+        let existing = allocations
+            .iter()
+            .position(|candidate| candidate.id == allocation.id);
+        let as_expected = match expected {
+            CachedEntry::Absent => existing.is_none(),
+            CachedEntry::Present => existing.is_some(),
+        };
+        let replaced = match existing {
+            Some(index) => Some(std::mem::replace(&mut allocations[index], allocation)),
+            None => {
+                allocations.push(allocation);
+                // Keep the list in id order, which is the order a full
+                // reload produces (the node_id index scans by rowid), so the
+                // two paths are comparable row for row.
+                allocations.sort_unstable_by_key(|allocation| allocation.id);
+                None
+            }
+        };
+        if let Some(replaced) = &replaced {
+            model.unindex_allocation(replaced);
+        }
+        model.index_allocation_ref(&job_id, &node_id, reference);
+        (as_expected, replaced)
+    }
+
+    /// Applies one splice's effect to a node's [`NodeUsage`] memo: the
+    /// replaced/removed row's usage comes out, the inserted row's goes in.
+    /// A node with no memo entry needs nothing — the next reprojection
+    /// rebuilds it from the list. A row whose resources fail to parse
+    /// poisons the aggregate, so the entry is dropped instead and the next
+    /// reprojection takes the row walk's fits-nothing path.
+    fn cache_adjust_node_usage(
+        model: &mut SchedulingReadModel,
+        policy: &ResourcePolicy,
+        node_id: &str,
+        removed_resources: Option<&Value>,
+        added_resources: Option<&Value>,
+    ) {
+        if !model.node_usage.contains_key(node_id) {
+            return;
+        }
+        let removed_request = removed_resources.map(|resources| policy.usage_request(resources));
+        let added_request = added_resources.map(|resources| policy.usage_request(resources));
+        let parses = |request: &Option<R<ResourceRequest>>| !matches!(request, Some(Err(_)));
+        if !parses(&removed_request) || !parses(&added_request) {
+            model.node_usage.remove(node_id);
+            return;
+        }
+        let Some(usage) = model.node_usage.get_mut(node_id) else {
+            return;
+        };
+        if let Some(Ok(request)) = removed_request {
+            usage.remove(&request);
+        }
+        if let Some(Ok(request)) = added_request {
+            usage.add(&request);
+        }
+    }
+
+    /// Next node in the round-robin allocation scrub (see
+    /// `Store::alloc_scrub_queue`). `None` only when the fleet is empty.
+    ///
+    /// Refilling costs one pass over the node ids per sweep of the fleet, so
+    /// the scrub is amortized O(1) node ids per changeset on top of the one
+    /// node's allocation list it reloads.
+    fn next_alloc_scrub_node(&self) -> R<Option<String>> {
+        let mut queue = self
+            .alloc_scrub_queue
+            .lock()
+            .map_err(|_| anyhow!("allocation scrub queue lock poisoned"))?;
+        if queue.is_empty() {
+            let model = self.read_model_reader()?;
+            queue.extend(model.nodes.keys().cloned());
+        }
+        Ok(queue.pop())
     }
 
     /// Scope sets (nodes + job configs) touched by a batch of allocations.
@@ -2074,6 +3402,23 @@ impl Store {
             .collect())
     }
 
+    /// Node counts as the scheduler's read model sees them: every cached
+    /// node, and the subset the planner actually considers
+    /// (`availability == "available"`). Feeds `legion_read_model_nodes` —
+    /// the DB-derived `legion_nodes` gauge disagreeing with this one is how
+    /// a truncated planning universe becomes visible in one query instead
+    /// of a plan-submission archaeology session (aws-phase5-findings.md).
+    pub fn read_model_node_counts(&self) -> R<(i64, i64)> {
+        let guard = self.read_model_reader()?;
+        let all = guard.nodes.len() as i64;
+        let available = guard
+            .nodes
+            .values()
+            .filter(|node| node.availability == "available")
+            .count() as i64;
+        Ok((all, available))
+    }
+
     /// Ids of every available node. For callers that only need membership
     /// (rollout node gating) — no node payload is cloned.
     pub fn available_node_ids(&self) -> R<HashSet<String>> {
@@ -2128,12 +3473,17 @@ impl Store {
     /// via [`Store::expected_versions_if_unchanged`], which only returns a
     /// sample if the generation still equals the one returned here (proving
     /// the late sample equals a pre-capacity one).
-    pub(crate) fn plan_capacity_snapshot(&self) -> R<PlanCapacityParts> {
+    pub(crate) fn plan_capacity_snapshot(&self, job_id: &str) -> R<PlanCapacityParts> {
         let guard = self.read_model_reader()?;
         Ok((
             guard.allocations_by_node.clone(),
             guard.node_pools.clone(),
             guard.generation,
+            guard
+                .allocations_by_job
+                .get(job_id)
+                .cloned()
+                .unwrap_or_default(),
         ))
     }
 
@@ -2147,11 +3497,8 @@ impl Store {
     pub fn job_band_for_job_config(&self, job_config_id: &str) -> R<(String, Band)> {
         let conn = self.read_connection()?;
         let row: Option<(String, String)> = conn
-            .query_row(
-                "SELECT job_id, priority FROM job_config WHERE id = ?;",
-                [job_config_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
+            .prepare_cached("SELECT job_id, priority FROM job_config WHERE id = ?;")?
+            .query_row([job_config_id], |row| Ok((row.get(0)?, row.get(1)?)))
             .optional()?;
         Ok(match row {
             Some((job_id, band)) => (job_id, Band::from_stored(&band)),
@@ -2384,21 +3731,35 @@ impl Store {
     }
 
     fn ensure_scope_epoch_tx(&self, tx: &Connection, scope_type: &str, scope_id: &str) -> R<()> {
-        tx.execute(
+        // prepare_cached throughout this file's hot paths: the plan-apply
+        // walk runs these statements hundreds of times per batch, and a
+        // sample profile of the batch body showed ~15% of its time inside
+        // SQLite's PARSER (sqlite3RunParser/yy_reduce) — rusqlite's
+        // `Connection::execute`/`query_row` re-parse on every call, and only
+        // `prepare_cached` hits the statement cache.
+        let mut stmt = tx.prepare_cached(
             "INSERT OR IGNORE INTO allocation_epoch_partition(scope_type, scope_id, epoch) VALUES (?1, ?2, 0);",
-            params![scope_type, scope_id],
         )?;
+        stmt.execute(params![scope_type, scope_id])?;
         Ok(())
     }
 
     fn scope_epoch_tx(&self, tx: &Connection, scope_type: &str, scope_id: &str) -> R<i64> {
+        // Read first: a scope the plan touches almost always exists (its
+        // node has been bumped before), and the `INSERT OR IGNORE` seed was
+        // a second statement per candidate on the apply walk. A miss seeds
+        // the row exactly as before and reads as the seed value.
+        let epoch: Option<i64> = tx
+            .prepare_cached(
+                "SELECT epoch FROM allocation_epoch_partition WHERE scope_type = ?1 AND scope_id = ?2;",
+            )?
+            .query_row(params![scope_type, scope_id], |row| row.get(0))
+            .optional()?;
+        if let Some(epoch) = epoch {
+            return Ok(epoch);
+        }
         self.ensure_scope_epoch_tx(tx, scope_type, scope_id)?;
-        let epoch = tx.query_row(
-            "SELECT epoch FROM allocation_epoch_partition WHERE scope_type = ?1 AND scope_id = ?2;",
-            params![scope_type, scope_id],
-            |row| row.get(0),
-        )?;
-        Ok(epoch)
+        Ok(0)
     }
 
     fn scope_vector_epochs_tx(
@@ -2415,13 +3776,32 @@ impl Store {
         Ok(latest)
     }
 
+    /// Bump a scope's epoch and return the new value.
+    ///
+    /// One statement on the hot path, not four. This used to be
+    /// `ensure` + `UPDATE` + `ensure` again + `SELECT`, and a plan bumps
+    /// one scope per bound node plus the job config — about 28 statements
+    /// per plan on the benchmark workload, all inside the capture that the
+    /// scheduler lane executes serially. `UPDATE … RETURNING` collapses
+    /// the common case (the row exists) to a single round through SQLite;
+    /// the insert only runs when the scope is genuinely new.
     fn bump_scope_epoch_tx(&self, tx: &Connection, scope_type: &str, scope_id: &str) -> R<i64> {
+        const BUMP: &str = "UPDATE allocation_epoch_partition SET epoch = epoch + 1 \
+             WHERE scope_type = ?1 AND scope_id = ?2 RETURNING epoch;";
+        if let Some(epoch) = tx
+            .prepare_cached(BUMP)?
+            .query_row(params![scope_type, scope_id], |row| row.get(0))
+            .optional()?
+        {
+            return Ok(epoch);
+        }
+        // First write for this scope: seed it, then bump. The seed is 0, so
+        // the bump lands on 1 exactly as the old four-statement form did.
         self.ensure_scope_epoch_tx(tx, scope_type, scope_id)?;
-        tx.execute(
-            "UPDATE allocation_epoch_partition SET epoch = epoch + 1 WHERE scope_type = ?1 AND scope_id = ?2;",
-            params![scope_type, scope_id],
-        )?;
-        self.scope_epoch_tx(tx, scope_type, scope_id)
+        tx.prepare_cached(BUMP)?
+            .query_row(params![scope_type, scope_id], |row| row.get(0))
+            .optional()?
+            .context("epoch row vanished between insert and bump")
     }
 
     fn bump_job_config_epoch_tx(&self, tx: &Connection, job_config_id: &str) -> R<i64> {
@@ -2543,27 +3923,54 @@ impl Store {
         evictions: &[PlanEviction],
         target_instance: &str,
     ) -> R<PlanSubmission> {
+        let conn = self.write_connection()?;
+        self.insert_plan_submission_on(
+            &conn,
+            job_config_id,
+            mode,
+            placements_json,
+            expected_versions,
+            evictions,
+            target_instance,
+        )
+    }
+
+    /// [`Self::insert_plan_submission_apply`] on a caller-supplied
+    /// connection, so the row can join the transaction the plan itself
+    /// applies in (the fused op, and every plan inside a group commit).
+    fn insert_plan_submission_on(
+        &self,
+        conn: &Connection,
+        job_config_id: &str,
+        mode: &str,
+        placements_json: &str,
+        expected_versions: &BTreeMap<String, i64>,
+        evictions: &[PlanEviction],
+        target_instance: &str,
+    ) -> R<PlanSubmission> {
         let created_at = OffsetDateTime::now_utc().format(&Rfc3339)?;
         let evictions_json = serde_json::to_string(evictions)?;
         let expected_vector_json = serde_json::to_string(expected_versions)?;
         let expected_job_epoch = *expected_versions
             .get(&Self::scope_vector_key("job_config", job_config_id))
             .unwrap_or(&0);
-        let conn = self.write_connection()?;
-        let id = conn.query_row(
-            "INSERT INTO plan_submission(job_config_id, mode, placements, expected_epoch, expected_version_vector, status, created_at, evictions, target_instance) VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6, ?7, ?8) RETURNING id;",
-            params![
-                job_config_id,
-                mode,
-                placements_json,
-                expected_job_epoch,
-                expected_vector_json,
-                created_at,
-                evictions_json,
-                target_instance
-            ],
-            |row| row.get(0),
-        )?;
+        let id = conn
+            .prepare_cached(
+                "INSERT INTO plan_submission(job_config_id, mode, placements, expected_epoch, expected_version_vector, status, created_at, evictions, target_instance) VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6, ?7, ?8) RETURNING id;",
+            )?
+            .query_row(
+                params![
+                    job_config_id,
+                    mode,
+                    placements_json,
+                    expected_job_epoch,
+                    expected_vector_json,
+                    created_at,
+                    evictions_json,
+                    target_instance
+                ],
+                |row| row.get(0),
+            )?;
 
         Ok(PlanSubmission {
             id,
@@ -2634,14 +4041,7 @@ impl Store {
             evictions: evictions.to_vec(),
             target_instance: target_instance.to_owned(),
         };
-        let (submission, outcome) = if self.plan_apply_coalescing_enabled() {
-            let coalescer = Arc::clone(&self.plan_coalescer);
-            coalescer.submit(request, |batch| self.run_plan_apply_batch(batch))?
-        } else {
-            self.submit_and_apply_plan_replicated(request)?
-        };
-        self.plan_apply_bookkeeping(&outcome)?;
-        Ok((submission, outcome))
+        self.submit_and_apply_plan_coalesced(request)
     }
 
     /// `schedulerSettings.plan_apply_coalescing` — default true.
@@ -2653,10 +4053,25 @@ impl Store {
             .unwrap_or(true)
     }
 
+    /// `schedulerSettings.job_intake_coalescing` — default true. The one
+    /// escape hatch for BOTH job-intake group commits (the scheduler-lane
+    /// eval enqueue and the status-lane `task_status` seed); off, each
+    /// submitter proposes its own op exactly as it did before batching.
+    /// Deliberately one switch rather than two: they are halves of the same
+    /// composite, and an operator diagnosing a submit-path incident wants to
+    /// take the whole change out, not half of it.
+    fn job_intake_coalescing_enabled(&self) -> bool {
+        self.scheduler_settings
+            .as_ref()
+            .and_then(|settings| settings.get("job_intake_coalescing"))
+            .and_then(Value::as_bool)
+            .unwrap_or(true)
+    }
+
     /// `schedulerSettings.plan_apply_batch_max` — default 16, clamped to
     /// 1..=128. Caps how many plans one group commit may carry, bounding
     /// the size of the replicated changeset (raft append-entries budget).
-    fn plan_apply_batch_max(settings: Option<&Value>) -> usize {
+    pub(crate) fn plan_apply_batch_max(settings: Option<&Value>) -> usize {
         settings
             .and_then(|settings| settings.get("plan_apply_batch_max"))
             .and_then(Value::as_u64)
@@ -2673,111 +4088,110 @@ impl Store {
         match request.placements {
             PlanPlacements::Nodes(_) => {
                 self.replicated(Lane::Scheduler, "submit_and_apply_plan", move |s| {
-                    s.submit_and_apply_plan_apply(
-                        &request.job_config_id,
-                        &request.mode,
-                        &request.placements,
-                        &request.expected_versions,
-                        &request.evictions,
-                        &request.target_instance,
-                    )
+                    s.submit_and_apply_plan_apply(&request)
                 })
             }
             PlanPlacements::Candidates(_) => self.replicated(
                 Lane::Scheduler,
                 "submit_and_apply_plan_with_candidates",
-                move |s| {
-                    s.submit_and_apply_plan_with_candidates_apply(
-                        &request.job_config_id,
-                        &request.mode,
-                        &request.placements,
-                        &request.expected_versions,
-                        &request.evictions,
-                        &request.target_instance,
-                    )
-                },
+                move |s| s.submit_and_apply_plan_with_candidates_apply(&request),
             ),
         }
     }
 
-    /// One plan of either format, applied on the current connection: the
-    /// group commit's per-plan body.
-    fn apply_plan_request(&self, request: &PlanApplyRequest) -> R<PlanApplyReply> {
-        match request.placements {
-            PlanPlacements::Nodes(_) => self.submit_and_apply_plan_apply(
-                &request.job_config_id,
-                &request.mode,
-                &request.placements,
-                &request.expected_versions,
-                &request.evictions,
-                &request.target_instance,
-            ),
-            PlanPlacements::Candidates(_) => self.submit_and_apply_plan_with_candidates_apply(
-                &request.job_config_id,
-                &request.mode,
-                &request.placements,
-                &request.expected_versions,
-                &request.evictions,
-                &request.target_instance,
-            ),
-        }
+    /// The format-1 op body.
+    fn submit_and_apply_plan_apply(&self, request: &PlanApplyRequest) -> R<PlanApplyReply> {
+        self.submit_and_apply_plan_txn(request)
+    }
+
+    /// The format-2 (candidate list) op body: the same walk under its own
+    /// op name, so the raft log says which submission shape ran
+    /// (docs/late-binding-plan-apply.md).
+    fn submit_and_apply_plan_with_candidates_apply(
+        &self,
+        request: &PlanApplyRequest,
+    ) -> R<PlanApplyReply> {
+        self.submit_and_apply_plan_txn(request)
+    }
+
+    /// One plan in its own write transaction: insert the submission, run
+    /// the walk, commit, then emit the side effects the commit made real.
+    /// The group commit runs the same body ([`Self::submit_and_apply_plan_on`])
+    /// against a transaction it opened for the whole batch instead.
+    fn submit_and_apply_plan_txn(&self, request: &PlanApplyRequest) -> R<PlanApplyReply> {
+        let mut conn = self.write_connection()?;
+        let tx = Self::write_tx(&mut conn)?;
+        let (reply, effects) = self.submit_and_apply_plan_on(&tx, request)?;
+        tx.commit()?;
+        // Emitted while the write guard is still held, so subscribers
+        // observe events in strict id order.
+        self.emit_plan_effects(effects)?;
+        Ok(reply)
+    }
+
+    /// One plan of either format, applied on `tx`: insert the submission
+    /// row and run the candidate walk, returning the side effects the
+    /// caller must emit once `tx` commits. Format 1 and format 2 share
+    /// this body — the submission's serialized shape is what differs, not
+    /// the walk (docs/late-binding-plan-apply.md).
+    fn submit_and_apply_plan_on(
+        &self,
+        tx: &Connection,
+        request: &PlanApplyRequest,
+    ) -> R<(PlanApplyReply, PlanApplyEffects)> {
+        let placements_json = request.placements.to_json()?;
+        let submission = self.insert_plan_submission_on(
+            tx,
+            &request.job_config_id,
+            &request.mode,
+            &placements_json,
+            &request.expected_versions,
+            &request.evictions,
+            &request.target_instance,
+        )?;
+        let (outcome, effects) = self.apply_plan_submission_on(tx, &submission)?;
+        Ok(((submission, outcome), effects))
     }
 
     /// Batch leader body for the plan-apply group commit: run every
-    /// drained plan inside ONE replicated op. Under raft this is one
-    /// capture → one propose → one quorum round → one apply transaction
-    /// for the whole batch; on local backends the plans run back-to-back
-    /// exactly as they would have serially (WAL-mode commits are not the
-    /// local cost, so no outer transaction is added — see the plan's
-    /// judgement calls).
+    /// drained plan inside ONE replicated op, then do the whole batch's
+    /// post-apply bookkeeping once.
     ///
-    /// Failure isolation: under capture, each plan runs inside its own
-    /// savepoint, so a failing plan rolls back alone and cannot poison
-    /// batch-mates (epoch-CAS rejections are not failures — they commit a
-    /// `rejected` submission row exactly as the single-plan op does). If
-    /// the batch op itself fails (capture/propose machinery), nothing was
-    /// applied — the capture rolled back — so every plan re-runs singly
-    /// through the pre-D5 path; any plan the failed propose DID commit
-    /// (a lost-leadership race) is then rejected by its own epoch CAS,
-    /// never applied twice.
-    fn run_plan_apply_batch(&self, batch: Vec<PlanApplyRequest>) -> Vec<R<PlanApplyReply>> {
+    /// **One transaction, one commit, on every backend.** The batch opens
+    /// a single write transaction and holds the write connection for its
+    /// whole duration, exactly as every other multi-statement write in
+    /// this store does. Locally that is one fsync for N plans instead of
+    /// N; under raft the transaction nests inside the capture savepoint,
+    /// so it stays one capture → one propose → one quorum round → one
+    /// apply transaction for the batch. Holding the connection is also
+    /// what makes the amortization *safe*: no unrelated writer can land
+    /// its own transaction inside the batch's, where its commit would not
+    /// be durable until the batch's and its own read-model refresh would
+    /// read pre-batch state (the hazard that deferred this locally —
+    /// judgement call #6).
+    ///
+    /// Failure isolation: each plan runs inside its own savepoint, so a
+    /// failing plan rolls back alone and cannot poison batch-mates
+    /// (epoch-CAS rejections are not failures — they commit a `rejected`
+    /// submission row exactly as the single-plan op does). If the batch
+    /// op itself fails before its commit, nothing was applied, so every
+    /// plan re-runs singly through the pre-D5 path; any plan a failed
+    /// propose DID commit (a lost-leadership race) is then rejected by
+    /// its own epoch CAS, never applied twice.
+    fn run_plan_apply_batch(&self, batch: Vec<PlanApplyRequest>) -> Vec<R<PlanApplySlot>> {
         if batch.len() == 1 {
             let request = batch.into_iter().next().expect("length checked");
-            return vec![self.submit_and_apply_plan_replicated(request)];
+            return vec![self
+                .submit_and_apply_plan_replicated(request)
+                .map(PlanApplySlot::unbooked)];
         }
 
         let rerun = batch.clone();
         let batch_size = batch.len();
         let batched = self.replicated(Lane::Scheduler, "submit_and_apply_plans", move |s| {
-            let isolate = capture::in_capture();
-            let mut results: Vec<R<PlanApplyReply>> = Vec::with_capacity(batch.len());
-            for request in &batch {
-                if isolate {
-                    // Savepoint-machinery errors abort the whole capture
-                    // (`?`): a leftover savepoint would corrupt the stack
-                    // for batch-mates, and a full rollback + re-run-singly
-                    // is the safe recovery.
-                    s.exec_on_write_conn("SAVEPOINT legion_plan_batch_item;")?;
-                    match s.apply_plan_request(request) {
-                        Ok(reply) => {
-                            s.exec_on_write_conn("RELEASE legion_plan_batch_item;")?;
-                            results.push(Ok(reply));
-                        }
-                        Err(err) => {
-                            s.exec_on_write_conn(
-                                "ROLLBACK TO legion_plan_batch_item; \
-                                 RELEASE legion_plan_batch_item;",
-                            )?;
-                            results.push(Err(err));
-                        }
-                    }
-                } else {
-                    results.push(s.apply_plan_request(request));
-                }
-            }
-            Ok(results)
+            s.run_plan_batch_txn(&batch)
         });
-        match batched {
+        let results = match batched {
             Ok(results) => results,
             Err(batch_err) => {
                 warn!(
@@ -2785,44 +4199,79 @@ impl Store {
                     error = %batch_err,
                     "Batched plan apply failed before commit; re-running each plan singly"
                 );
-                rerun
+                return rerun
                     .into_iter()
-                    .map(|request| self.submit_and_apply_plan_replicated(request))
-                    .collect()
+                    .map(|request| {
+                        self.submit_and_apply_plan_replicated(request)
+                            .map(PlanApplySlot::unbooked)
+                    })
+                    .collect();
+            }
+        };
+        // One epoch self-heal and one status-lane task_status projection
+        // for the whole batch (see `batch_apply_bookkeeping`). When that
+        // does not complete, each submitter runs its own instead, so a
+        // hard failure is attributed to the plan that caused it.
+        let bookkeeping_done = self.batch_apply_bookkeeping(&results);
+        results
+            .into_iter()
+            .map(|result| {
+                result.map(|reply| PlanApplySlot {
+                    reply,
+                    bookkeeping_done,
+                })
+            })
+            .collect()
+    }
+
+    /// The group commit's transaction: every drained plan applied inside
+    /// one write transaction, each fenced by its own savepoint, with the
+    /// batch's side effects emitted once after the single commit.
+    fn run_plan_batch_txn(&self, batch: &[PlanApplyRequest]) -> R<Vec<R<PlanApplyReply>>> {
+        let mut conn = self.write_connection()?;
+        let tx = Self::write_tx(&mut conn)?;
+        let mut results: Vec<R<PlanApplyReply>> = Vec::with_capacity(batch.len());
+        let mut effects = PlanApplyEffects::default();
+        for request in batch {
+            // Savepoint-machinery errors abort the whole batch (`?`): a
+            // leftover savepoint would corrupt the stack for batch-mates,
+            // and a full rollback + re-run-singly is the safe recovery.
+            tx.execute_batch("SAVEPOINT legion_plan_batch_item;")?;
+            match self.submit_and_apply_plan_on(&tx, request) {
+                Ok((reply, plan_effects)) => {
+                    tx.execute_batch("RELEASE legion_plan_batch_item;")?;
+                    effects.merge(plan_effects);
+                    results.push(Ok(reply));
+                }
+                Err(err) => {
+                    tx.execute_batch(
+                        "ROLLBACK TO legion_plan_batch_item; \
+                         RELEASE legion_plan_batch_item;",
+                    )?;
+                    results.push(Err(err));
+                }
             }
         }
-    }
-
-    /// Run raw SQL on the write connection, acquiring and releasing the
-    /// connection lock for just this statement (savepoint control inside
-    /// batched ops, where holding a transaction handle across the
-    /// per-plan calls would deadlock their own `write_connection` locks).
-    fn exec_on_write_conn(&self, sql: &str) -> R<()> {
-        let conn = self.write_connection()?;
-        conn.execute_batch(sql)?;
-        Ok(())
-    }
-
-    fn submit_and_apply_plan_apply(
-        &self,
-        job_config_id: &str,
-        mode: &str,
-        placements: &PlanPlacements,
-        expected_versions: &BTreeMap<String, i64>,
-        evictions: &[PlanEviction],
-        target_instance: &str,
-    ) -> R<(PlanSubmission, PlanApplyOutcome)> {
-        let placements_json = placements.to_json()?;
-        let submission = self.insert_plan_submission_apply(
-            job_config_id,
-            mode,
-            &placements_json,
-            expected_versions,
-            evictions,
-            target_instance,
-        )?;
-        let outcome = self.apply_plan_submission_apply(&submission)?;
-        Ok((submission, outcome))
+        // The batch's single commit. Only now may its effects be seen:
+        // every staged event in id order, then one coherent read-model
+        // refresh over the union of every plan's scopes.
+        tx.commit()?;
+        // Past the commit this function may NOT fail: its caller's
+        // recovery is to re-run every plan singly, which after a commit
+        // would apply the batch twice. A refresh that cannot publish
+        // (a poisoned read-model lock) leaves the mirror stale for these
+        // scopes until the next publish or a rejection's self-heal, which
+        // costs conflicts, not correctness — the apply-time fence never
+        // trusts the mirror. See the plan's judgement call #10.
+        if let Err(err) = self.emit_plan_effects(effects) {
+            error!(
+                plans = batch.len(),
+                error = %err,
+                "Batched plan apply committed but could not publish its read model; \
+                 the next allocation publish or rejection self-heal reconciles it"
+            );
+        }
+        Ok(results)
     }
 
     /// [`Self::submit_and_apply_plan`] for format-2 (candidate list)
@@ -2855,36 +4304,23 @@ impl Store {
             // its keyed instance through the single-node entry point.
             target_instance: String::new(),
         };
-        let (submission, outcome) = if self.plan_apply_coalescing_enabled() {
+        self.submit_and_apply_plan_coalesced(request)
+    }
+
+    /// Submit one plan through the group commit (or straight to the
+    /// single-plan op when coalescing is off), then run whatever
+    /// post-apply bookkeeping the batch leader did not already do for it.
+    fn submit_and_apply_plan_coalesced(&self, request: PlanApplyRequest) -> R<PlanApplyReply> {
+        let slot = if self.plan_apply_coalescing_enabled() {
             let coalescer = Arc::clone(&self.plan_coalescer);
             coalescer.submit(request, |batch| self.run_plan_apply_batch(batch))?
         } else {
-            self.submit_and_apply_plan_replicated(request)?
+            PlanApplySlot::unbooked(self.submit_and_apply_plan_replicated(request)?)
         };
-        self.plan_apply_bookkeeping(&outcome)?;
-        Ok((submission, outcome))
-    }
-
-    /// [`Self::submit_and_apply_plan_apply`] under the format-2 op name: the
-    /// insert and the candidate walk are the same body — the submission's
-    /// serialized shape is what differs (docs/late-binding-plan-apply.md).
-    fn submit_and_apply_plan_with_candidates_apply(
-        &self,
-        job_config_id: &str,
-        mode: &str,
-        placements: &PlanPlacements,
-        expected_versions: &BTreeMap<String, i64>,
-        evictions: &[PlanEviction],
-        target_instance: &str,
-    ) -> R<(PlanSubmission, PlanApplyOutcome)> {
-        self.submit_and_apply_plan_apply(
-            job_config_id,
-            mode,
-            placements,
-            expected_versions,
-            evictions,
-            target_instance,
-        )
+        if !slot.bookkeeping_done {
+            self.plan_apply_bookkeeping(&slot.reply.1)?;
+        }
+        Ok(slot.reply)
     }
 
     pub fn apply_plan_submission(&self, submission: &PlanSubmission) -> R<PlanApplyOutcome> {
@@ -2900,6 +4336,92 @@ impl Store {
     /// `submit_and_apply_plan`: epoch-mirror self-heal on rejection,
     /// status-lane task_status projection on success.
     fn plan_apply_bookkeeping(&self, outcome: &PlanApplyOutcome) -> R<()> {
+        let mut rejected_nodes = BTreeSet::new();
+        let mut rejected_job_configs = BTreeSet::new();
+        let mut placed: &[Allocation] = &[];
+        match outcome {
+            PlanApplyOutcome::Rejected {
+                latest_versions, ..
+            } => Self::collect_rejected_scopes(
+                latest_versions,
+                &mut rejected_nodes,
+                &mut rejected_job_configs,
+            ),
+            PlanApplyOutcome::Applied(applied) => placed = &applied.allocations,
+        }
+        self.run_apply_bookkeeping(&rejected_nodes, &rejected_job_configs, placed)
+    }
+
+    /// Post-apply bookkeeping for a whole group commit, run once by the
+    /// batch leader: ONE epoch self-heal covering every rejected plan's
+    /// scopes, and ONE status-lane `task_status` projection covering
+    /// every allocation the batch placed. The projection dedupes by task
+    /// config, and the job-config epoch CAS makes two *applied* plans for
+    /// the same config inside one batch impossible, so the union is
+    /// exactly what N per-plan projections would have written.
+    ///
+    /// Returns whether the batched path completed. On any failure the
+    /// submitters run their own `plan_apply_bookkeeping` instead, so a
+    /// hard error is attributed to the plan that caused it — the same
+    /// re-run-singly idiom the batch itself uses. Both halves are
+    /// idempotent, so the repeat costs nothing but the work.
+    fn batch_apply_bookkeeping(&self, results: &[R<PlanApplyReply>]) -> bool {
+        let mut rejected_nodes = BTreeSet::new();
+        let mut rejected_job_configs = BTreeSet::new();
+        let mut placed: Vec<Allocation> = Vec::new();
+        for (_, outcome) in results.iter().filter_map(|result| result.as_ref().ok()) {
+            match outcome {
+                PlanApplyOutcome::Rejected {
+                    latest_versions, ..
+                } => Self::collect_rejected_scopes(
+                    latest_versions,
+                    &mut rejected_nodes,
+                    &mut rejected_job_configs,
+                ),
+                PlanApplyOutcome::Applied(applied) => {
+                    placed.extend_from_slice(&applied.allocations)
+                }
+            }
+        }
+        match self.run_apply_bookkeeping(&rejected_nodes, &rejected_job_configs, &placed) {
+            Ok(()) => true,
+            Err(err) => {
+                warn!(
+                    plans = results.len(),
+                    error = %err,
+                    "Batched plan bookkeeping failed; each plan will run its own"
+                );
+                false
+            }
+        }
+    }
+
+    /// The scopes a rejection proved stale, split by kind.
+    fn collect_rejected_scopes(
+        latest_versions: &BTreeMap<String, i64>,
+        node_ids: &mut BTreeSet<String>,
+        job_config_ids: &mut BTreeSet<String>,
+    ) {
+        for key in latest_versions.keys() {
+            match Self::parse_scope_vector_key(key) {
+                Ok(("node", id)) => {
+                    node_ids.insert(id.to_string());
+                }
+                Ok(("job_config", id)) => {
+                    job_config_ids.insert(id.to_string());
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// The bookkeeping body, over one plan's scopes or a whole batch's.
+    fn run_apply_bookkeeping(
+        &self,
+        rejected_nodes: &BTreeSet<String>,
+        rejected_job_configs: &BTreeSet<String>,
+        placed: &[Allocation],
+    ) -> R<()> {
         // Self-heal the epoch mirror on rejection: the CAS just proved the
         // sampler's mirror was behind the database for these scopes (a
         // competing plan applied, or a write path bumped an epoch without a
@@ -2907,24 +4429,8 @@ impl Store {
         // allocations second, like every mirror update — makes the retry
         // sample fresh state instead of failing on the same stale entries
         // forever.
-        if let PlanApplyOutcome::Rejected {
-            latest_versions, ..
-        } = outcome
-        {
-            let mut node_ids = BTreeSet::new();
-            let mut job_config_ids = BTreeSet::new();
-            for key in latest_versions.keys() {
-                match Self::parse_scope_vector_key(key) {
-                    Ok(("node", id)) => {
-                        node_ids.insert(id.to_string());
-                    }
-                    Ok(("job_config", id)) => {
-                        job_config_ids.insert(id.to_string());
-                    }
-                    _ => {}
-                }
-            }
-            self.cache_refresh_allocation_scopes(&node_ids, &job_config_ids)?;
+        if !rejected_nodes.is_empty() || !rejected_job_configs.is_empty() {
+            self.cache_refresh_allocation_scopes(rejected_nodes, rejected_job_configs)?;
         }
         // Lifecycle-derived task_status transitions are status-lane writes
         // (plan §7-C2, C-2), so they follow the scheduler-lane apply as a
@@ -2940,13 +4446,33 @@ impl Store {
         // derivable — the status leader's seed reconciler and the workers'
         // own status reports converge them — so a typed `NotRaftLeader`
         // here is warn-and-continue; any other error still fails.
-        if let PlanApplyOutcome::Applied(applied) = outcome {
-            if let Err(err) = self.update_task_statuses_for_allocations(&applied.allocations) {
+        //
+        // When a drain task is installed the projection is HANDED OFF
+        // rather than run here: it is a second quorum round, on a second
+        // raft group, inside the scheduler lane's own apply, and the
+        // paragraph above is the argument for why it does not need to be
+        // synchronous — the rows are derivable and losing them is already
+        // tolerated. Deferring it takes that round off the eval's critical
+        // path. Without a drain task (tests, embedded use) it still runs
+        // inline, unchanged.
+        if !placed.is_empty() {
+            if let Some(tx) = self.status_projection_tx.get() {
+                // Unbounded: the drain coalesces, and dropping a
+                // projection here would be a silent correctness hole
+                // rather than backpressure. A closed channel means the
+                // daemon is shutting down, in which case the reconciler
+                // covers it on the next leadership acquisition.
+                if tx.send(placed.to_vec()).is_ok() {
+                    return Ok(());
+                }
+                debug!("status projection drain is gone; projecting inline");
+            }
+            if let Err(err) = self.update_task_statuses_for_allocations(placed) {
                 if !crate::storage::raft::driver::NotRaftLeader::in_chain(&err) {
                     return Err(err);
                 }
                 warn!(
-                    allocations = applied.allocations.len(),
+                    allocations = placed.len(),
                     error = %err,
                     "status-lane task_status projection deferred: this node does not lead \
                      the status lane; worker reports and the status leader's reconciler \
@@ -3012,6 +4538,65 @@ impl Store {
     /// plan's backlog). The walk is a pure function of the submission and
     /// committed state: all randomness ran at plan time.
     fn apply_plan_submission_apply(&self, submission: &PlanSubmission) -> R<PlanApplyOutcome> {
+        let mut conn = self.write_connection()?;
+        let tx = Self::write_tx(&mut conn)?;
+        let (outcome, effects) = self.apply_plan_submission_on(&tx, submission)?;
+        tx.commit()?;
+        // Emitted while the write guard is still held, so subscribers
+        // observe events in strict id order.
+        self.emit_plan_effects(effects)?;
+        Ok(outcome)
+    }
+
+    /// Emit the side effects a committed plan (or batch of plans) made
+    /// real: the staged events, then one coherent read-model publish over
+    /// every allocation scope the commit touched. Both funnels no-op
+    /// under an active capture, where the raft apply path re-projects
+    /// them from the committed changeset instead (JC-11).
+    ///
+    /// The publish is a DELTA: the plan knows exactly which allocation
+    /// rows it inserted and deleted, so the read model is patched with
+    /// those rows — one indexed read per placement — rather than reloaded
+    /// one whole allocation list per touched node. The reload cost
+    /// O(allocations on the node) per node per plan, growing with cluster
+    /// fill while the plan did not (it was the post-commit half of the
+    /// `plan_under_fill` slope). This is the same delta the raft apply
+    /// path already projects from a committed changeset, so the local and
+    /// replicated read models are now maintained by one code path; the
+    /// delta reloads any node whose cache contradicts it and scrubs one
+    /// node in full per application, exactly as it does for changesets.
+    fn emit_plan_effects(&self, effects: PlanApplyEffects) -> R<()> {
+        for event in effects.events {
+            self.publish_staged(Some(event));
+        }
+        if effects.node_ids.is_empty() && effects.job_config_ids.is_empty() {
+            return Ok(());
+        }
+        if effects.inserted.is_empty() && effects.removed.is_empty() {
+            // Scopes without rows (defensive — every scope here comes from
+            // a placed or evicted row): the full reload is the safe answer.
+            return self
+                .cache_refresh_allocation_scopes(&effects.node_ids, &effects.job_config_ids);
+        }
+        let delta = AllocationDelta {
+            upserts: effects.inserted.clone(),
+            inserts: effects.inserted,
+            moved: BTreeSet::new(),
+            removals: effects.removed,
+            usable: true,
+        };
+        self.cache_apply_allocation_delta(&delta, &effects.node_ids, &effects.job_config_ids)
+    }
+
+    /// [`Self::apply_plan_submission_apply`] on a caller-supplied
+    /// transaction, returning the side effects to emit once that
+    /// transaction commits. The group commit runs this once per plan
+    /// inside the batch's single transaction.
+    fn apply_plan_submission_on(
+        &self,
+        tx: &Connection,
+        submission: &PlanSubmission,
+    ) -> R<(PlanApplyOutcome, PlanApplyEffects)> {
         let tx_started = Instant::now();
         debug!(
             submission_id = submission.id,
@@ -3019,49 +4604,51 @@ impl Store {
             expected_scope_count = submission.expected_versions.len(),
             "Applying plan submission"
         );
-        let mut conn = self.write_connection()?;
-        let tx = Self::write_tx(&mut conn)?;
 
-        // `reverted_evictions` is `Some(n)` once this plan has staged
-        // evictions inside the `legion_plan_evictions` savepoint: a rejection
-        // still COMMITS (it persists the rejected row and its event), so the
-        // victims must be rolled back first — a plan that is not happening
-        // may not displace anything.
-        let reject = |tx: rusqlite::Savepoint<'_>,
+        // `reverted` is `Some(n)` once this plan has written anything
+        // inside the `legion_plan_body` savepoint — evictions, or the
+        // placements of a multi-placement plan. A rejection still COMMITS
+        // (it persists the rejected row and its event), so that work must
+        // be rolled back first: a plan that is not happening may neither
+        // displace anything nor leave a partially-bound placement behind.
+        // The rollback runs before the UPDATE and the event below, so the
+        // rejection itself survives the commit.
+        let reject = |tx: &Connection,
                       reason: String,
-                      reverted_evictions: Option<usize>|
-         -> R<PlanApplyOutcome> {
-            if reverted_evictions.is_some() {
-                tx.execute_batch(
-                    "ROLLBACK TO legion_plan_evictions; RELEASE legion_plan_evictions;",
-                )?;
+                      reverted: Option<usize>|
+         -> R<(PlanApplyOutcome, PlanApplyEffects)> {
+            if reverted.is_some() {
+                tx.execute_batch("ROLLBACK TO legion_plan_body; RELEASE legion_plan_body;")?;
             }
-            tx.execute(
+            tx.prepare_cached(
                 "UPDATE plan_submission SET status = 'rejected', rejection_reason = ?1 WHERE id = ?2;",
-                params![reason, submission.id],
-            )?;
-            let latest_versions =
-                self.scope_vector_epochs_tx(&tx, &submission.expected_versions)?;
+            )?
+            .execute(params![reason, submission.id])?;
+            let latest_versions = self.scope_vector_epochs_tx(tx, &submission.expected_versions)?;
             let rejected_event = self.stage_event_locked(
-                &tx,
+                tx,
                 drafts::plan_rejected(&submission.job_config_id, &reason),
             );
-            tx.commit()?;
-            self.publish_staged(rejected_event);
             warn!(
                 submission_id = submission.id,
                 job_config_id = %submission.job_config_id,
-                reverted_evictions = reverted_evictions.unwrap_or_default(),
+                reverted_writes = reverted.unwrap_or_default(),
                 duration_ms = tx_started.elapsed().as_millis() as u64,
                 "Rejected plan submission: {reason}"
             );
             crate::manager::telemetry::metrics()
                 .plan_apply_total
                 .inc(&["rejected"]);
-            Ok(PlanApplyOutcome::Rejected {
-                reason,
-                latest_versions,
-            })
+            Ok((
+                PlanApplyOutcome::Rejected {
+                    reason,
+                    latest_versions,
+                },
+                PlanApplyEffects {
+                    events: rejected_event.into_iter().collect(),
+                    ..PlanApplyEffects::default()
+                },
+            ))
         };
 
         // The job-config epoch is a hard, all-or-nothing check: it is what
@@ -3073,7 +4660,7 @@ impl Store {
             .get(&job_scope_key)
             .copied()
             .unwrap_or_default();
-        let latest_job_epoch = self.scope_epoch_tx(&tx, "job_config", &submission.job_config_id)?;
+        let latest_job_epoch = self.scope_epoch_tx(tx, "job_config", &submission.job_config_id)?;
         if latest_job_epoch != expected_job_epoch {
             let reason = format!(
                 "plan epoch for job config {} is stale; expected {}, latest {}",
@@ -3087,12 +4674,14 @@ impl Store {
             String,
             String,
             Option<String>,
-        ) = tx.query_row(
-            "SELECT placements, mode, evictions, target_instance FROM plan_submission \
-             WHERE id = ?1;",
-            [submission.id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-        )?;
+        ) = tx
+            .prepare_cached(
+                "SELECT placements, mode, evictions, target_instance FROM plan_submission \
+                 WHERE id = ?1;",
+            )?
+            .query_row([submission.id], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })?;
         let placements = Self::parse_plan_submission_placements(&placements_json)?;
         let evictions: Vec<PlanEviction> = serde_json::from_str(&evictions_json)?;
         // Only a ratification sets this, and it always carries exactly one
@@ -3132,15 +4721,22 @@ impl Store {
         let mut pre_eviction_node_epochs: HashMap<String, i64> = HashMap::new();
         for eviction in &evictions {
             if let Entry::Vacant(entry) = pre_eviction_node_epochs.entry(eviction.node_id.clone()) {
-                let epoch = self.scope_epoch_tx(&tx, "node", &eviction.node_id)?;
+                let epoch = self.scope_epoch_tx(tx, "node", &eviction.node_id)?;
                 entry.insert(epoch);
             }
         }
-        let eviction_savepoint = !evictions.is_empty();
-        if eviction_savepoint {
-            tx.execute_batch("SAVEPOINT legion_plan_evictions;")?;
+        // The savepoint covers the evictions AND the placement walk. A
+        // plan that binds its first placement and then finds no candidate
+        // for its second must leave nothing behind: the rejection commits,
+        // and without this the bound allocation would commit with it —
+        // rows nothing announced, belonging to a plan the store says did
+        // not happen. Skipped for the common single-placement,
+        // no-eviction plan, which has nothing to undo.
+        let body_savepoint = !evictions.is_empty() || placements.len() > 1;
+        if body_savepoint {
+            tx.execute_batch("SAVEPOINT legion_plan_body;")?;
         }
-        let preempted = self.apply_plan_evictions_tx(&tx, submission, &evictions)?;
+        let preempted = self.apply_plan_evictions_tx(tx, submission, &evictions)?;
 
         // Node rows load LAZILY, per candidate actually attempted, memoized
         // for the plan. The walk usually binds rank 0, so eagerly loading
@@ -3173,18 +4769,48 @@ impl Store {
         // be double counted. Reschedule plans drop nothing.
         let drop_own = plan_mode == "fresh";
         let mut free_pools: HashMap<String, ResourcePool> = HashMap::new();
+        // What each rebuilt pool was derived from, kept so the plan can hand
+        // the next plan a usable cache (see `publish_node_usage_tx`). Absent
+        // for a node whose pool came from the uncached fallback.
+        let mut pool_usage: HashMap<String, NodeUsageSnapshot> = HashMap::new();
+        // The planned job's OWN allocations, aggregated per node, read once
+        // for the whole plan instead of re-filtered on every node the walk
+        // touches. Only a Fresh plan needs it; it is read lazily so a plan
+        // that never builds a pool never pays for it.
+        //
+        // One query over `idx_allocation_job_config_id` costs O(this job's
+        // allocations) — bounded by the job the eval is already planning,
+        // and unaffected by how full the rest of the cluster is, which is
+        // the entire point of the rewrite below.
+        let mut own_usage: Option<OwnAllocationUsage> = None;
+
+        // Building one free pool costs at least a per-node fingerprint scan
+        // (and a full rebuild when the cache misses), and the two-pass walk
+        // below can attempt every candidate of every placement. Cap the
+        // distinct nodes one plan may rebuild a pool for, so a pathological
+        // plan (hundreds of placements × a long candidate list, all of them
+        // contended) cannot stretch the group commit's single transaction.
+        // Generous by construction: a plan that binds rank 0 everywhere
+        // needs exactly one rebuild per distinct node.
+        let pool_rebuild_budget = placements.len().saturating_mul(4).max(256);
 
         let mut allocations = Vec::new();
         let mut candidate_ranks: Vec<usize> = Vec::new();
+        // Which pass bound each allocation: `false` = clean, `true` =
+        // revalidated. Emitted as `legion_scheduler_plan_bind_pass` after
+        // the plan commits.
+        let mut bind_passes: Vec<bool> = Vec::new();
         let mut task_states: HashMap<i64, AllocationTaskState> = HashMap::new();
         let mut task_requests: HashMap<i64, Option<ResourceRequest>> = HashMap::new();
+        // Nodes this plan has already bound a replica of a given task onto.
+        // Pass 1 avoids stacking a task's replicas; pass 2 relaxes it (see
+        // the walk below).
+        let mut plan_binds: HashSet<(i64, String)> = HashSet::new();
         for placement in &placements {
             let task_id = placement.task_id;
             let state = match task_states.entry(task_id) {
                 Entry::Occupied(entry) => entry.into_mut(),
-                Entry::Vacant(entry) => {
-                    entry.insert(self.load_allocation_task_state(&tx, task_id)?)
-                }
+                Entry::Vacant(entry) => entry.insert(self.load_allocation_task_state(tx, task_id)?),
             };
             let request = match task_requests.entry(task_id) {
                 Entry::Occupied(entry) => entry.into_mut(),
@@ -3196,30 +4822,89 @@ impl Store {
                 ),
             };
 
-            // Walk the ranked candidates; bind the first that is still free
-            // ("free" = epoch unchanged) and still valid on its fresh row.
-            // Every skip is conservative: a touched-but-still-fitting node
-            // costs a near-equivalent fallback, never correctness.
+            // Walk the ranked candidates in two passes.
+            //
+            // **Pass 1 (`clean`)** is the pre-two-pass walk, byte for
+            // byte: in rank order, bind the first candidate whose node
+            // epoch is unchanged since the plan snapshot and whose fresh
+            // row still checks out. Uncontended placements therefore keep
+            // the planner's argmax and placement quality is untouched.
+            //
+            // **Pass 2 (`revalidated`)** revisits — still in rank order —
+            // only the candidates pass 1 deferred: those whose node epoch
+            // moved, and those the replica rule held back. The node epoch
+            // is a *ranking hint* that the node's allocation set is
+            // unchanged, not the fit proof it once was, because everything
+            // it stands in for is re-derived below inside this serialized
+            // apply transaction against committed rows: the node row and
+            // its availability, constraints and permit, capacity from a
+            // free pool rebuilt in-transaction (`reservedResources` /
+            // `maxAllocations` included, with this plan's own binds
+            // debited), static ports, and the `distinct` tracker. A
+            // candidate that passes all of those fits, whoever else
+            // touched the node meanwhile. Job-level count double-spend is
+            // fenced separately, by the job-config epoch above, which
+            // stays hard and all-or-nothing.
+            //
+            // The one exception is a ratification (`target_instance`,
+            // docs/edge-boot.md): there a moved epoch may mean somebody
+            // already owns this sandbox, which no capacity recheck can
+            // disprove, so the epoch stays a hard gate and pass 2 never
+            // runs.
+            let revalidation_allowed = target_instance.is_none();
             let mut bound = false;
             let mut first_skip_reason: Option<String> = None;
-            for (rank, node_id) in placement.candidates.iter().enumerate() {
-                let node_scope_key = Self::scope_vector_key("node", node_id);
-                let expected_epoch = submission
-                    .expected_versions
-                    .get(&node_scope_key)
-                    .copied()
-                    .unwrap_or_default();
-                let latest_epoch = match pre_eviction_node_epochs.get(node_id) {
-                    Some(epoch) => *epoch,
-                    None => self.scope_epoch_tx(&tx, "node", node_id)?,
-                };
-                if latest_epoch != expected_epoch {
-                    if first_skip_reason.is_none() {
-                        first_skip_reason = Some(format!(
-                            "node {node_id} epoch moved (expected {expected_epoch}, latest {latest_epoch})"
-                        ));
+            let mut first_stale_reason: Option<String> = None;
+            // `(rank, revalidated)`. Pass-2 entries are appended as pass 1
+            // defers them, so they are only reached once every pass-1
+            // entry has been tried, and they keep rank order among
+            // themselves. Deterministic, like the rest of the walk.
+            let mut attempts: Vec<(usize, bool)> = (0..placement.candidates.len())
+                .map(|rank| (rank, false))
+                .collect();
+            let mut attempt_index = 0;
+            while attempt_index < attempts.len() {
+                let (rank, revalidated) = attempts[attempt_index];
+                attempt_index += 1;
+                let node_id = &placement.candidates[rank];
+                if !revalidated {
+                    let node_scope_key = Self::scope_vector_key("node", node_id);
+                    let expected_epoch = submission
+                        .expected_versions
+                        .get(&node_scope_key)
+                        .copied()
+                        .unwrap_or_default();
+                    let latest_epoch = match pre_eviction_node_epochs.get(node_id) {
+                        Some(epoch) => *epoch,
+                        None => self.scope_epoch_tx(tx, "node", node_id)?,
+                    };
+                    if latest_epoch != expected_epoch {
+                        if first_stale_reason.is_none() {
+                            first_stale_reason = Some(format!(
+                                "node {node_id} epoch moved (expected {expected_epoch}, latest {latest_epoch})"
+                            ));
+                        }
+                        if revalidation_allowed {
+                            attempts.push((rank, true));
+                        }
+                        continue;
                     }
-                    continue;
+                    // Replicas of one task prefer distinct nodes *when they
+                    // fall back*: without this, every replica's tail
+                    // converges on the same near-tie nodes and a contended
+                    // plan stacks a service onto one machine. Rank 0 is
+                    // exempt — the planner's ledger already decided
+                    // whether replicas share a node, and under `bin_pack`
+                    // stacking them is the point. A preference, not a
+                    // constraint: pass 2 stacks them when nothing else
+                    // fits, and `distinct` remains the constraint for
+                    // callers who need the guarantee.
+                    if rank > 0 && plan_binds.contains(&(task_id, node_id.clone())) {
+                        if revalidation_allowed {
+                            attempts.push((rank, true));
+                        }
+                        continue;
+                    }
                 }
 
                 // Availability is re-validated on the FRESH node row, not
@@ -3235,7 +4920,8 @@ impl Store {
                     Entry::Occupied(entry) => entry.into_mut(),
                     Entry::Vacant(entry) => {
                         let row = tx
-                            .query_row(&node_row_sql, [node_id], |row| self.node_from_row(row))
+                            .prepare_cached(&node_row_sql)?
+                            .query_row([node_id], |row| self.node_from_row(row))
                             .optional()?;
                         entry.insert(row)
                     }
@@ -3272,14 +4958,37 @@ impl Store {
                 // moved" class, so it skips rather than rejects: a node
                 // whose totals shrank mid-plan hands the placement to the
                 // next candidate.
+                if !free_pools.contains_key(node_id.as_str())
+                    && free_pools.len() >= pool_rebuild_budget
+                {
+                    if first_skip_reason.is_none() {
+                        first_skip_reason = Some(format!(
+                            "node {node_id} was not checked: this plan exhausted its \
+                             {pool_rebuild_budget}-node capacity-recheck budget"
+                        ));
+                    }
+                    continue;
+                }
                 let pool = match free_pools.entry(node_id.clone()) {
                     Entry::Occupied(entry) => entry.into_mut(),
-                    Entry::Vacant(entry) => entry.insert(self.free_pool_for_node_tx(
-                        &tx,
-                        node,
-                        &submission.job_config_id,
-                        drop_own,
-                    )?),
+                    Entry::Vacant(entry) => {
+                        if drop_own && own_usage.is_none() {
+                            own_usage =
+                                Some(self.own_allocation_usage_tx(tx, &submission.job_config_id)?);
+                        }
+                        let own = own_usage.as_ref();
+                        let (pool, snapshot) = self.free_pool_for_node_tx(
+                            tx,
+                            node,
+                            &submission.job_config_id,
+                            drop_own,
+                            own,
+                        )?;
+                        if let Some(snapshot) = snapshot {
+                            pool_usage.insert(node_id.clone(), snapshot);
+                        }
+                        entry.insert(pool)
+                    }
                 };
                 // Unparseable task resources fit nowhere — the same
                 // fits-nothing posture as `ResourcePool::free_from_rows`
@@ -3301,7 +5010,7 @@ impl Store {
                 // candidate. Any other error (config parse, SQL) is a real
                 // failure and propagates.
                 let network = match self.assign_allocation_network(
-                    &tx,
+                    tx,
                     node_id,
                     task_id,
                     state.network_raw.clone(),
@@ -3322,7 +5031,7 @@ impl Store {
                 };
 
                 let allocation = self.insert_allocation_with_data(
-                    &tx,
+                    tx,
                     node_id,
                     task_id,
                     &state.job_config_id,
@@ -3343,45 +5052,64 @@ impl Store {
                 if let Some(tracker) = state.distinct.as_mut() {
                     tracker.insert_from_node(node);
                 }
+                plan_binds.insert((task_id, node_id.clone()));
+                // Counted once the plan is known to have applied — a
+                // rejection rolls these binds back, and a metric that
+                // counted them would overstate the pass-2 win.
+                bind_passes.push(revalidated);
                 bound = true;
                 break;
             }
 
             if !bound {
+                // Name the real cause. With pass 2 in play, every
+                // candidate has been re-derived against committed state,
+                // so a rejection means no candidate *fits* — capacity, a
+                // constraint, a cordon, a port. Only a ratification (which
+                // skips pass 2) can still be rejected for staleness alone.
+                let cause = first_skip_reason
+                    .or(first_stale_reason)
+                    .unwrap_or_else(|| "no candidates listed".to_string());
                 let reason = format!(
-                    "no candidate for task {} could bind: all {} candidate(s) were stale or invalid since the plan snapshot ({})",
+                    "no candidate for task {} could bind: none of its {} candidate(s) still fits ({})",
                     task_id,
                     placement.candidates.len(),
-                    first_skip_reason
-                        .unwrap_or_else(|| "no candidates listed".to_string()),
+                    cause,
                 );
                 return reject(
                     tx,
                     reason,
-                    eviction_savepoint.then_some(preempted.victims.len()),
+                    body_savepoint.then(|| preempted.victims.len() + allocations.len()),
                 );
             }
         }
 
         if !allocations.is_empty() {
-            self.bump_epochs_for_allocations_tx(&tx, &allocations)?;
+            self.bump_epochs_for_allocations_tx(tx, &allocations)?;
         }
-        if eviction_savepoint {
-            tx.execute_batch("RELEASE legion_plan_evictions;")?;
+        // Hand the next plan a warm cache. Runs AFTER the epoch bumps above,
+        // because the epoch is part of the fingerprint the next plan checks.
+        self.publish_node_usage_tx(tx, &mut pool_usage, &allocations, &task_requests)?;
+        if body_savepoint {
+            tx.execute_batch("RELEASE legion_plan_body;")?;
         }
 
-        tx.execute(
+        tx.prepare_cached(
             "UPDATE plan_submission SET status = 'applied', rejection_reason = NULL WHERE id = ?1;",
-            [submission.id],
-        )?;
+        )?
+        .execute([submission.id])?;
         let placed_event =
             drafts::allocations_placed(&submission.job_config_id, &allocations, &candidate_ranks)
-                .and_then(|draft| self.stage_event_locked(&tx, draft));
-        tx.commit()?;
-        self.publish_staged(placed_event);
-        for event in preempted.events {
-            self.publish_staged(Some(event));
-        }
+                .and_then(|draft| self.stage_event_locked(tx, draft));
+        let mut effects = PlanApplyEffects {
+            events: placed_event.into_iter().chain(preempted.events).collect(),
+            ..PlanApplyEffects::default()
+        };
+        // Evicted and placed rows refresh together, in one read of
+        // committed state — the mirror never passes through the
+        // intermediate state a remove-then-add pair of refreshes exposed.
+        effects.touch_evicted(&preempted.victims);
+        effects.touch_placed(&allocations);
         let fallbacks = candidate_ranks.iter().filter(|rank| **rank > 0).count();
         info!(
             submission_id = submission.id,
@@ -3394,16 +5122,16 @@ impl Store {
             "Applied plan submission transaction"
         );
 
-        // Mirror maintenance in the same order as every other path: drop the
-        // evicted rows before adding the placements that replaced them, so
-        // the mirror never briefly shows both.
-        if !preempted.victims.is_empty() {
-            self.cache_remove_allocations(&preempted.victims)?;
-        }
-        self.cache_add_allocations(&allocations)?;
         let metrics = crate::manager::telemetry::metrics();
         for rank in &candidate_ranks {
             metrics.scheduler_plan_candidate_rank.observe(*rank as f64);
+        }
+        for revalidated in &bind_passes {
+            metrics.scheduler_plan_bind_pass.inc(&[if *revalidated {
+                "revalidated"
+            } else {
+                "clean"
+            }]);
         }
         // Outcomes are mutually exclusive so an operator can split "no race
         // happened" from "a race was absorbed" at a glance: `applied` means
@@ -3420,10 +5148,13 @@ impl Store {
             metrics.preemption_plans_total.inc(&["placed"]);
         }
 
-        Ok(PlanApplyOutcome::Applied(AppliedPlan {
-            allocations,
-            candidate_ranks,
-        }))
+        Ok((
+            PlanApplyOutcome::Applied(AppliedPlan {
+                allocations,
+                candidate_ranks,
+            }),
+            effects,
+        ))
     }
 
     /// Free capacity for one node, rebuilt from the rows the apply
@@ -3431,13 +5162,58 @@ impl Store {
     /// replacement of the job's allocations; see the call site in
     /// `apply_plan_submission_apply` for why the pool is recomputed at
     /// apply time rather than trusted from the planner's snapshot.
+    ///
+    /// The number this returns is unchanged. How it is obtained is not.
+    ///
+    /// The original form read every allocation row on the node and parsed
+    /// every `resources` blob, inside the serialized plan-apply commit — so
+    /// committing a plan cost O(allocations on the node) while the plan's
+    /// own work stayed constant. At 5,000 nodes the same ~44 placements read
+    /// ~440 rows with 50k allocations live and ~1,760 with 200k, and
+    /// measured throughput fell 736 -> 457 -> 273 alloc/s across those
+    /// fills.
+    ///
+    /// Now the total usage of the node comes from the `node_alloc_usage`
+    /// cache, trusted only when a fingerprint of the live rows — the node's
+    /// allocation epoch, the row count, and the sum of the allocation ids —
+    /// still matches the one stored beside it. The fingerprint reads only
+    /// `idx_allocation_node_id`: no row bodies, no JSON. On a miss this
+    /// falls back to exactly the old walk.
+    ///
+    /// `own` carries the planned job's own allocations (aggregated per node,
+    /// read once per plan), so a Fresh plan's "everything except mine" is
+    /// *total − own* rather than a per-node filtered re-read.
+    ///
+    /// Returns the pool and, when it was computed the cached way, the
+    /// snapshot the caller needs to publish an updated cache entry.
     fn free_pool_for_node_tx(
         &self,
         tx: &Connection,
         node: &Node,
         job_config_id: &str,
         drop_own: bool,
-    ) -> R<ResourcePool> {
+        own: Option<&OwnAllocationUsage>,
+    ) -> R<(ResourcePool, Option<NodeUsageSnapshot>)> {
+        // A node whose own allocations could not be parsed cannot have
+        // `own` subtracted from its total, so it takes the exact old path.
+        let own_unreadable = own.is_some_and(|own| own.unreadable.contains(node.id.as_str()));
+        if !own_unreadable {
+            if let Some(snapshot) = self.node_usage_tx(tx, &node.id)? {
+                let mut usage = snapshot.total.clone();
+                if let Some(own) = own {
+                    for request in own.requests_on(&node.id) {
+                        usage.remove(request);
+                    }
+                }
+                return Ok((ResourcePool::free_from_usage(node, &usage), Some(snapshot)));
+            }
+        }
+
+        // Fallback: the pre-cache walk, byte for byte. Reached when a row on
+        // the node has resources nothing can parse — `free_from_rows` owns
+        // the "then the node fits nothing" rule and the warning that names
+        // the offending row, and a value derived from a row nobody could
+        // read must never enter the cache.
         let mut stmt = tx.prepare_cached(
             "SELECT a.id, a.resources FROM allocation a \
              WHERE a.node_id = ?1 AND (?2 = 0 OR a.job_config_id NOT IN (\
@@ -3448,11 +5224,258 @@ impl Store {
             params![node.id, i64::from(drop_own), job_config_id],
             |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Value>(1)?)),
         )?)?;
-        Ok(ResourcePool::free_from_rows(
-            node,
+        Ok((
+            ResourcePool::free_from_rows(
+                node,
+                rows.iter().map(|(id, resources)| (*id, resources)),
+                &self.resource_policy,
+            ),
+            None,
+        ))
+    }
+
+    /// The fingerprint of a node's allocation rows: `(epoch, count, id
+    /// sum)`. What makes the `node_alloc_usage` cache a cache rather than a
+    /// denormalized invariant somebody has to remember to maintain.
+    ///
+    /// Each part covers a way the row set can move:
+    ///
+    /// - **count** catches inserts and deletes, whatever path made them —
+    ///   including the removal paths that bump only the job-config epoch
+    ///   (`remove_allocation_by_id`, `remove_allocs_for_job_config`), which
+    ///   is why the epoch alone would not do.
+    /// - **id sum** catches a delete paired with an insert that keeps the
+    ///   count.
+    /// - **epoch** catches the one case the first two miss: SQLite reuses a
+    ///   rowid once the highest row is deleted, so deleting the newest
+    ///   allocation and placing another on the same node can reproduce both
+    ///   the count and the sum. Every insert path bumps the node's
+    ///   allocation epoch, so an id reuse cannot also reproduce this.
+    ///
+    /// The count and sum come straight out of `idx_allocation_node_id`,
+    /// which covers both columns — the scan touches no row bodies and parses
+    /// no JSON, which is what makes it ~two orders of magnitude cheaper than
+    /// the walk it replaces.
+    fn node_alloc_fingerprint_tx(&self, tx: &Connection, node_id: &str) -> R<(i64, i64, i64)> {
+        let epoch = self.scope_epoch_tx(tx, "node", node_id)?;
+        let (count, id_sum): (i64, i64) = tx
+            .prepare_cached(
+                "SELECT COUNT(*), COALESCE(SUM(a.id), 0) FROM allocation a WHERE a.node_id = ?1;",
+            )?
+            .query_row([node_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        Ok((epoch, count, id_sum))
+    }
+
+    /// Total usage of every allocation on a node, as of this transaction:
+    /// served from `node_alloc_usage` when its fingerprint still matches the
+    /// live rows, rebuilt (from the same rows the old walk read) when it
+    /// does not.
+    ///
+    /// `None` means "no aggregate can be formed" — a row on the node has
+    /// resources that do not parse — and the caller must take the exact
+    /// row-by-row path. Nothing is cached in that case, so the node keeps
+    /// paying for the walk until the bad row is corrected or removed.
+    fn node_usage_tx(&self, tx: &Connection, node_id: &str) -> R<Option<NodeUsageSnapshot>> {
+        let (epoch, count, id_sum) = self.node_alloc_fingerprint_tx(tx, node_id)?;
+        // `policy_fingerprint` is part of the validation, not a filter
+        // nicety: the row-set fingerprint cannot see the resource policy
+        // changing across a restart, and an aggregate normalized under an
+        // old policy must never be served under a new one (see the
+        // migration note). NULL — a row written before the column existed,
+        // or by an older binary — never matches, so it rebuilds.
+        let cached: Option<String> = tx
+            .prepare_cached(
+                "SELECT usage_json FROM node_alloc_usage \
+                 WHERE node_id = ?1 AND alloc_epoch = ?2 AND alloc_count = ?3 \
+                   AND alloc_id_sum = ?4 AND policy_fingerprint = ?5;",
+            )?
+            .query_row(
+                params![
+                    node_id,
+                    epoch,
+                    count,
+                    id_sum,
+                    self.resource_policy_fingerprint.as_ref()
+                ],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(cached) = cached {
+            match serde_json::from_str::<NodeUsage>(&cached) {
+                Ok(total) => {
+                    return Ok(Some(NodeUsageSnapshot {
+                        node_id: node_id.to_string(),
+                        count,
+                        id_sum,
+                        total,
+                    }))
+                }
+                // Only reachable if the column was written by something that
+                // is not this code. Treated as a miss rather than an error:
+                // the rebuild below overwrites it with a readable value.
+                Err(error) => warn!(
+                    node_id,
+                    %error,
+                    "Cached node allocation usage did not deserialize; rebuilding it"
+                ),
+            }
+        }
+
+        let mut stmt =
+            tx.prepare_cached("SELECT a.id, a.resources FROM allocation a WHERE a.node_id = ?1;")?;
+        let rows = Self::collect_rows(stmt.query_map([node_id], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, Value>(1)?))
+        })?)?;
+        let total = match NodeUsage::from_rows(
             rows.iter().map(|(id, resources)| (*id, resources)),
             &self.resource_policy,
-        ))
+        ) {
+            Ok(total) => total,
+            Err(_) => return Ok(None),
+        };
+        Ok(Some(NodeUsageSnapshot {
+            node_id: node_id.to_string(),
+            count,
+            id_sum,
+            total,
+        }))
+    }
+
+    /// Every allocation the planned job already owns, aggregated per node —
+    /// the rows a Fresh plan's pool must NOT count, read once for the whole
+    /// plan.
+    ///
+    /// This is the same row set the old query excluded with its
+    /// `job_config_id NOT IN (configs of this job)` clause, only gathered
+    /// from the other side: one pass over `idx_allocation_job_config_id`
+    /// costs O(the job's own allocations), where re-filtering per node cost
+    /// O(allocations on that node) × (nodes the walk touched).
+    fn own_allocation_usage_tx(
+        &self,
+        tx: &Connection,
+        job_config_id: &str,
+    ) -> R<OwnAllocationUsage> {
+        let mut stmt = tx.prepare_cached(
+            "SELECT a.node_id, a.id, a.resources FROM allocation a \
+             WHERE a.job_config_id IN (\
+                 SELECT id FROM job_config WHERE job_id = \
+                     (SELECT job_id FROM job_config WHERE id = ?1));",
+        )?;
+        let rows = Self::collect_rows(stmt.query_map([job_config_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Value>(2)?,
+            ))
+        })?)?;
+
+        let mut own = OwnAllocationUsage::default();
+        for (node_id, allocation_id, resources) in rows {
+            let request = self
+                .resource_policy
+                .normalize_task_resources(&resources, false)
+                .and_then(|normalized| ResourceRequest::from_value(&normalized));
+            match request {
+                Ok(request) => own.by_node.entry(node_id).or_default().push(request),
+                // A row this plan's own job owns that cannot be read is not
+                // fatal — the old query simply excluded it without looking.
+                // But "total minus own" cannot subtract what it cannot
+                // parse, so the node falls back to the filtered walk, which
+                // excludes the row the same way the old code did.
+                Err(error) => {
+                    warn!(
+                        node_id,
+                        allocation_id,
+                        %error,
+                        "Planned job's own allocation resources failed to parse; \
+                         rebuilding that node's free pool the uncached way"
+                    );
+                    own.unreadable.insert(node_id);
+                }
+            }
+        }
+        Ok(own)
+    }
+
+    /// Publish an updated `node_alloc_usage` row for every node this plan
+    /// rebuilt a pool for, so the next plan on those nodes reads one row
+    /// instead of every allocation on them.
+    ///
+    /// The safety of the whole cache lives here, in one rule: a row is
+    /// written only when the live fingerprint is *exactly* the one this plan
+    /// predicted — the count and id sum it read, plus precisely the
+    /// allocations it inserted. Anything else that touched the node's rows
+    /// inside this transaction (now or after a future edit to the apply
+    /// path) breaks that equality, and the entry is dropped instead of
+    /// published, sending the next plan through a rebuild.
+    ///
+    /// That is what keeps a cached number from drifting away from reality.
+    /// A free-capacity number that reads lower than the truth costs a
+    /// placement; one that reads higher OVERCOMMITS THE NODE, so the cache
+    /// never publishes a value it cannot tie to the exact set of rows it was
+    /// computed from.
+    fn publish_node_usage_tx(
+        &self,
+        tx: &Connection,
+        pool_usage: &mut HashMap<String, NodeUsageSnapshot>,
+        placed: &[Allocation],
+        task_requests: &HashMap<i64, Option<ResourceRequest>>,
+    ) -> R<()> {
+        if pool_usage.is_empty() {
+            return Ok(());
+        }
+        for allocation in placed {
+            let Some(snapshot) = pool_usage.get_mut(allocation.node_id.as_str()) else {
+                continue;
+            };
+            // The request the walk fitted and debited, not a re-parse of the
+            // row: `insert_allocation_with_data` stores the very value that
+            // produced it, and a placement whose resources did not parse
+            // could not have bound (`can_fit` is false for `None`).
+            let Some(Some(request)) = task_requests.get(&allocation.task_config_id) else {
+                pool_usage.remove(allocation.node_id.as_str());
+                continue;
+            };
+            snapshot.total.add(request);
+            snapshot.count += 1;
+            snapshot.id_sum += allocation.id;
+        }
+
+        for snapshot in pool_usage.values() {
+            let (epoch, count, id_sum) = self.node_alloc_fingerprint_tx(tx, &snapshot.node_id)?;
+            if count != snapshot.count || id_sum != snapshot.id_sum {
+                // Something moved this node's rows that this plan did not
+                // account for. Publishing here would be the drift that
+                // overcommits, so publish nothing.
+                debug!(
+                    node_id = %snapshot.node_id,
+                    "Node allocation rows moved unexpectedly during plan apply; \
+                     leaving its usage cache to be rebuilt"
+                );
+                continue;
+            }
+            tx.prepare_cached(
+                "INSERT INTO node_alloc_usage \
+                     (node_id, alloc_epoch, alloc_count, alloc_id_sum, usage_json, \
+                      policy_fingerprint) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+                 ON CONFLICT(node_id) DO UPDATE SET \
+                     alloc_epoch = excluded.alloc_epoch, \
+                     alloc_count = excluded.alloc_count, \
+                     alloc_id_sum = excluded.alloc_id_sum, \
+                     usage_json = excluded.usage_json, \
+                     policy_fingerprint = excluded.policy_fingerprint;",
+            )?
+            .execute(params![
+                snapshot.node_id,
+                epoch,
+                count,
+                id_sum,
+                serde_json::to_string(&snapshot.total)?,
+                self.resource_policy_fingerprint.as_ref()
+            ])?;
+        }
+        Ok(())
     }
 
     /// Commit a plan's evictions: delete the victims, release their
@@ -3865,8 +5888,27 @@ impl Store {
     }
 
     fn node_from_row(&self, row: &Row<'_>) -> Result<Node, rusqlite::Error> {
+        let id: String = row.get(0)?;
+        // Heartbeat freshness, stated rather than implied (liveness plan
+        // §6.5). On the manager that OWNS liveness the in-memory observation
+        // is the live truth and beats the column outright; anywhere else the
+        // column is a checkpoint that is at most `checkpointInterval` behind,
+        // and the reader is told so. The node's STATUS is exact either way —
+        // that is the replicated half, and it does not regress.
+        let (last_heartbeat, heartbeat_source) = match self.live_heartbeat(&id) {
+            Some(observed) => (observed, "live".to_string()),
+            None => {
+                let persisted: String = row.get(8)?;
+                let source = if persisted.is_empty() {
+                    String::new()
+                } else {
+                    "checkpoint".to_string()
+                };
+                (persisted, source)
+            }
+        };
         let node = Node {
-            id: row.get(0)?,
+            id,
             pool: row.get(1)?,
             status: row.get(2)?,
             availability: row.get(3)?,
@@ -3874,10 +5916,24 @@ impl Store {
             fingerprint_attrs: row.get(5)?,
             dynamic_attrs: row.get(6)?,
             health_checks: row.get(7)?,
-            last_heartbeat: row.get(8)?,
+            last_heartbeat,
+            heartbeat_source,
         };
 
         Ok(node)
+    }
+
+    /// The heartbeat time this manager observed itself, when it owns liveness.
+    /// `None` on a manager that does not, which is what makes the reader fall
+    /// back to the replicated checkpoint and say so.
+    fn live_heartbeat(&self, id: &str) -> Option<String> {
+        let table = self.liveness();
+        table.responsible_since()?;
+        let beat = table.last_beat(id)?;
+        OffsetDateTime::from_unix_timestamp(beat.unix)
+            .ok()?
+            .format(&Rfc3339)
+            .ok()
     }
 
     fn eval_from_row(&self, row: &Row<'_>) -> Result<Eval, rusqlite::Error> {
@@ -4811,9 +6867,7 @@ impl Store {
             s.mark_nodes_as_lost_apply(&ids_owned)
         })?;
         self.sync_node_availability(ids, "unavailable")?;
-        for node_id in ids {
-            self.enqueue_lost_node_reschedule(node_id)?;
-        }
+        self.enqueue_lost_node_reschedules(ids)?;
         Ok(())
     }
 
@@ -4844,30 +6898,111 @@ impl Store {
 
         Ok(())
     }
-    /// Enqueue the scheduler-lane reschedule pass for a lost node as its own
-    /// scheduler-lane eval op (plan §7-C2, C-2), skipping the enqueue while one is
-    /// already pending/in-flight for the node (the monitor re-drives every
-    /// tick, so a completed pass is re-enqueued on the next tick until the
-    /// node recovers or nothing is left to free — the recheck-loop
-    /// behavior, now eval-shaped).
-    fn enqueue_lost_node_reschedule(&self, node_id: &str) -> R<()> {
-        let already_queued: bool = {
-            let conn = self.read_connection()?;
-            conn.query_row(
-                "SELECT EXISTS (
-                     SELECT 1 FROM eval
-                     WHERE status IN ('pending', 'in_flight')
-                       AND type = 'node_lost_reschedule' AND node_id = ?1
-                 );",
-                [node_id],
-                |row| row.get(0),
-            )?
-        };
-        if already_queued {
+    /// Enqueue the scheduler-lane reschedule pass for a batch of lost nodes
+    /// (plan §7-C2, C-2): drop nodes with a pass already pending/in-flight,
+    /// drop nodes with NOTHING to reschedule, and enqueue the remainder in
+    /// ONE scheduler-lane round. The monitor re-drives every tick, so a
+    /// completed pass — or an allocation that lands on a lost node after a
+    /// filter — is picked up on the next tick until the node recovers or
+    /// nothing is left to free.
+    ///
+    /// This used to be one EXISTS probe plus one scheduler-lane quorum
+    /// round PER NODE, inline in the status checker: the 2026-08-04 AWS rig
+    /// measured a ~3,000-node loss producing 2,752 reschedule evals against
+    /// 66 job submissions with a 764-deep queue, and most of those nodes
+    /// had nothing on them (the empty check lived inside the eval handler,
+    /// after the enqueue, claim, and terminal write had each been through
+    /// raft).
+    ///
+    /// The evals are enqueued BELOW the default priority
+    /// ([`NODE_LOST_RESCHEDULE_PRIORITY_DROP`]): the queue is strict
+    /// `priority DESC, id ASC`, so at equal priority a recovery backlog
+    /// starves every newer submission behind it.
+    fn enqueue_lost_node_reschedules(&self, node_ids: &[String]) -> R<()> {
+        if node_ids.is_empty() {
             return Ok(());
         }
-        self.enqueue_eval("node_lost_reschedule", None, None, Some(node_id), None)?;
-        Ok(())
+        let already_queued = self.queued_lost_node_reschedules()?;
+        let with_allocations = self.nodes_with_allocations(node_ids)?;
+        let priority = self
+            .default_eval_priority
+            .saturating_sub(crate::constants::NODE_LOST_RESCHEDULE_PRIORITY_DROP);
+        let requests: Vec<EvalRequest> = node_ids
+            .iter()
+            .filter(|node_id| {
+                !already_queued.contains(*node_id) && with_allocations.contains(*node_id)
+            })
+            .map(|node_id| EvalRequest {
+                kind: "node_lost_reschedule".to_owned(),
+                job_id: None,
+                job_config_id: None,
+                node_id: Some(node_id.clone()),
+                priority: Some(priority),
+                delay: Duration::ZERO,
+            })
+            .collect();
+        if requests.is_empty() {
+            return Ok(());
+        }
+        match self.enqueue_evals(requests) {
+            Ok(_) => Ok(()),
+            // The batched enqueue is not forwarding-aware (a new wire
+            // variant would be a cross-version message; judgement call).
+            // Under split lane leadership — this status-lane leader does
+            // not lead the scheduler lane — fall back to the per-node
+            // forwarding path, which is exactly what every enqueue was
+            // before batching.
+            Err(err) if crate::storage::raft::driver::NotRaftLeader::in_chain(&err) => {
+                for node_id in node_ids {
+                    if already_queued.contains(node_id) || !with_allocations.contains(node_id) {
+                        continue;
+                    }
+                    self.enqueue_eval(
+                        "node_lost_reschedule",
+                        None,
+                        None,
+                        Some(node_id),
+                        Some(priority),
+                    )?;
+                }
+                Ok(())
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Nodes (of `node_ids`) that currently hold at least one allocation
+    /// row. Chunked `IN` so a mass-loss batch stays inside SQLite's bound
+    /// parameter limit.
+    fn nodes_with_allocations(&self, node_ids: &[String]) -> R<HashSet<String>> {
+        let mut with_allocations = HashSet::new();
+        let conn = self.read_connection()?;
+        for chunk in node_ids.chunks(500) {
+            let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+            let sql = format!(
+                "SELECT DISTINCT node_id FROM allocation WHERE node_id IN ({placeholders});"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(params_from_iter(chunk), |row| row.get::<_, String>(0))?;
+            for row in rows {
+                with_allocations.insert(row?);
+            }
+        }
+        Ok(with_allocations)
+    }
+
+    /// Node ids with a `node_lost_reschedule` eval already pending or in
+    /// flight — one query for the whole fleet instead of one EXISTS probe
+    /// per node per tick (heartbeat-scale plan §4).
+    fn queued_lost_node_reschedules(&self) -> R<HashSet<String>> {
+        let conn = self.read_connection()?;
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT node_id FROM eval
+             WHERE status IN ('pending', 'in_flight')
+               AND type = 'node_lost_reschedule' AND node_id IS NOT NULL;",
+        )?;
+        let queued = Self::collect_rows(stmt.query_map([], |row| row.get(0))?)?;
+        Ok(queued.into_iter().collect())
     }
 
     /// When the node was marked lost (RFC3339), or `None` while it is not
@@ -4949,41 +7084,16 @@ impl Store {
         if node_ids.is_empty() {
             return;
         }
-        // One query for every lost node's pending/in-flight reschedule eval
-        // instead of one EXISTS probe per node per tick (heartbeat-scale
-        // plan §4): the semantics are identical — re-enqueue whenever no
-        // eval is queued — but a 2,000-node partition costs one query per
-        // tick, not 2,000.
-        let already_queued: HashSet<String> = {
-            let queued = (|| -> R<Vec<String>> {
-                let conn = self.read_connection()?;
-                let mut stmt = conn.prepare(
-                    "SELECT DISTINCT node_id FROM eval
-                     WHERE status IN ('pending', 'in_flight')
-                       AND type = 'node_lost_reschedule' AND node_id IS NOT NULL;",
-                )?;
-                let queued = Self::collect_rows(stmt.query_map([], |row| row.get(0))?)?;
-                Ok(queued)
-            })();
-            match queued {
-                Ok(queued) => queued.into_iter().collect(),
-                Err(err) => {
-                    warn!(error = ?err, "Failed listing queued lost-node reschedules");
-                    return;
-                }
-            }
-        };
-        for node_id in node_ids {
-            if already_queued.contains(&node_id) {
-                continue;
-            }
-            if let Err(err) = self.enqueue_lost_node_reschedule(&node_id) {
-                warn!(
-                    %node_id,
-                    error = ?err,
-                    "Failed enqueueing lost-node reschedule eval"
-                );
-            }
+        // Dedup, the nothing-to-reschedule filter, and the single-round
+        // batched enqueue all live in the helper, shared with
+        // `mark_nodes_as_lost` — a 2,000-node partition costs two queries
+        // and one scheduler-lane round per tick, not 2,000 probes and
+        // 2,000 rounds.
+        if let Err(err) = self.enqueue_lost_node_reschedules(&node_ids) {
+            warn!(
+                error = ?err,
+                "Failed enqueueing lost-node reschedule evals"
+            );
         }
     }
 
@@ -4998,6 +7108,20 @@ impl Store {
     /// seeds, until the worker's first heartbeat/health-check upserts it.
     #[instrument(err, skip_all)]
     pub fn insert_node(&self, node: NodeMsg) -> R<Node> {
+        // Read the pre-registration status first: the seed below resets a
+        // stale `lost` row (a re-registering node is by definition not
+        // lost), and that reset was the ONE recovery path with no log and
+        // no counter — a fleet that died and re-registered read as if
+        // nothing had happened.
+        let was_lost = self
+            .read_model_reader()
+            .map(|guard| {
+                guard
+                    .nodes
+                    .get(&node.id)
+                    .is_some_and(|cached| cached.status == "lost")
+            })
+            .unwrap_or(false);
         let seed = node.clone();
         let registered = self.replicated(Lane::Control, "insert_node", move |s| {
             s.insert_node_apply(node)
@@ -5005,6 +7129,15 @@ impl Store {
         self.replicated(Lane::Status, "seed_node_health", move |s| {
             s.seed_node_health_apply(&seed)
         })?;
+        if was_lost {
+            info!(
+                node_id = %registered.id,
+                "Node re-registered after being marked lost; it is schedulable again"
+            );
+            crate::manager::telemetry::metrics()
+                .nodes_recovered_total
+                .inc(&["reregistration"]);
+        }
         Ok(registered)
     }
 
@@ -5043,6 +7176,7 @@ impl Store {
                 ":status": node.status,
                 ":last_heartbeat": node.last_heartbeat,
                 ":health_checks": node.health_checks,
+                ":lost_after_seconds": self.registered_lost_window_seconds(node),
             },
         )?;
         drop(conn);
@@ -5237,8 +7371,254 @@ impl Store {
     /// to the lane leader; the worker's RPC surface is unchanged.
     #[instrument(err, skip_all)]
     pub fn update_node_heartbeat(&self, id: String) -> R<()> {
-        let coalescer = Arc::clone(&self.heartbeat_coalescer);
-        coalescer.submit(id, |batch| self.run_heartbeat_batch(batch))
+        match self.beat_disposition(&id) {
+            BeatDisposition::Ghost => Err(anyhow::Error::new(StorageError::not_found("node", id))),
+            BeatDisposition::Transition => {
+                // `lost -> active` is NEW information no reconciler can
+                // re-derive, so it stays replicated — the status-lane write
+                // this path has always used, forwarding included. Rare by
+                // construction: a node transitions twice per outage, not
+                // thirty times a minute.
+                //
+                // Deliberately NOT `mark_node_ready`: that writes status
+                // `"ready"`, which every liveness query filters out (they all
+                // match `"active"`), so recovering through it would drop the
+                // node out of the liveness scan and out of
+                // `legion_nodes{status="active"}`. This is the same composite
+                // shape with the correct status value.
+                self.update_node_heartbeat_forwarding(id.clone())?;
+                self.restore_availability_after_loss(&id);
+                self.liveness.observe(&id);
+                Ok(())
+            }
+            BeatDisposition::Active => {
+                if self.liveness.digest_fallback() {
+                    // Mixed-version window (liveness plan §10): a manager that
+                    // predates `ReportNodeLiveness` is leading the status
+                    // lane, so this beat has to travel as the replicated write
+                    // every manager version understands. Correct, just slower;
+                    // it resolves when the roll finishes.
+                    let coalescer = Arc::clone(&self.heartbeat_coalescer);
+                    coalescer.submit(id.clone(), |batch| self.run_heartbeat_batch(batch))?;
+                }
+                self.liveness.observe(&id);
+                Ok(())
+            }
+        }
+    }
+
+    /// Put a recovered node back in the scheduling pool.
+    ///
+    /// Node loss is a CROSS-LANE composite: the status lane records `lost`,
+    /// and the control lane flips `node.availability` to `unavailable` — and
+    /// `availability` is the column the scheduler actually gates placement on
+    /// ([`Self::available_node_arcs`]). Clearing only the status half would
+    /// leave a returned node reading `active` in `legion node list` while
+    /// never receiving work again, which presents as a scheduler bug and is
+    /// almost impossible to diagnose from the outside. Recovery has to undo
+    /// both halves, because loss did both.
+    ///
+    /// **Only `unavailable` -> `available`.** `drained` is OPERATOR intent
+    /// (`legion node cordon` / `drain`), so a node an operator cordoned must
+    /// still be cordoned when it comes back: a heartbeat may never un-cordon a
+    /// node. This guard is what `mark_node_ready` lacks.
+    ///
+    /// Best effort on purpose. The beat has already succeeded and the node is
+    /// already `active`, so a control-lane rejection here must not fail the
+    /// worker's RPC — its stateful self-fence clock feeds off heartbeat
+    /// success. The next beat retries, because the disposition stays
+    /// `Transition` until the flip lands.
+    fn restore_availability_after_loss(&self, id: &str) {
+        match self.get_node(id) {
+            Ok(node) if node.availability == "unavailable" => {
+                match self.sync_node_availability(&[id.to_string()], "available") {
+                    Ok(()) => {
+                        info!(
+                            node_id = %id,
+                            "Node heartbeated after being marked lost; it is schedulable again"
+                        );
+                        // `marked_lost` minus this is the fleet's net loss;
+                        // without it a fleet that dies and comes back reads
+                        // as if nothing happened.
+                        crate::manager::telemetry::metrics()
+                            .nodes_recovered_total
+                            .inc(&["heartbeat"]);
+                    }
+                    Err(err) => warn!(
+                        node_id = %id,
+                        error = ?err,
+                        "Node recovered but its availability flip was rejected; \
+                         retrying on its next heartbeat"
+                    ),
+                }
+            }
+            // Already available, or deliberately drained by an operator.
+            Ok(_) => {}
+            Err(err) => debug!(
+                node_id = %id,
+                error = ?err,
+                "Could not read node to restore its availability after recovery"
+            ),
+        }
+    }
+
+    /// The liveness soft-state table (liveness plan §6.2).
+    pub fn liveness(&self) -> &Arc<crate::storage::liveness::LivenessTable> {
+        &self.liveness
+    }
+
+    /// Missed beats before a node is lost (`heartbeat.missedBeatsBeforeLost`).
+    pub fn missed_beats_before_lost(&self) -> u32 {
+        self.missed_beats_before_lost
+    }
+
+    /// What a heartbeat from `id` costs: nothing, a transition, or a rejection.
+    ///
+    /// Answered from the in-memory read model rather than the database, so
+    /// the hottest path in the system does not open a connection. The read
+    /// model is the same view the scheduler places from, so a node it does not
+    /// have is a node no manager will schedule onto either.
+    fn beat_disposition(&self, id: &str) -> BeatDisposition {
+        let Ok(guard) = self.read_model_reader() else {
+            // A poisoned read model is not a reason to reject a live worker;
+            // fall back to the replicated path, which reads the database.
+            return BeatDisposition::Transition;
+        };
+        match guard.nodes.get(id) {
+            None => BeatDisposition::Ghost,
+            Some(node) if node.status == "active" && node.availability != "unavailable" => {
+                BeatDisposition::Active
+            }
+            Some(_) => BeatDisposition::Transition,
+        }
+    }
+
+    /// Every active node's liveness row for the tick: its id, the persisted
+    /// heartbeat clock, and its own lost window.
+    ///
+    /// The timestamp columns are DISPLAY state once liveness is off the raft
+    /// path — the tick reads the in-memory table for freshness and uses this
+    /// only for the per-node window and the active set. They are still read
+    /// here so a manager running the mixed-version forwarding fallback (whose
+    /// beats do land in the database) is not blind.
+    #[instrument(err, skip_all)]
+    pub fn active_node_liveness_rows(&self) -> R<Vec<ActiveNodeLiveness>> {
+        let conn = self.read_connection()?;
+        // Anchored on `node` (a node_health row orphaned by node removal must
+        // not resurrect a ghost), same as `get_node_ids_and_heartbeats`.
+        let sql = "SELECT node.id, node_health.last_heartbeat_unix, node_health.lost_after_seconds
+                   FROM node LEFT JOIN node_health ON node_health.node_id = node.id
+                   WHERE COALESCE(node_health.status, 'active') = 'active'";
+        let mut stmt = conn.prepare(sql)?;
+        let rows = Self::collect_rows(stmt.query_map([], |row| {
+            Ok(ActiveNodeLiveness {
+                id: row.get(0)?,
+                last_heartbeat_unix: row.get(1)?,
+                lost_after_seconds: row.get(2)?,
+            })
+        })?)?;
+        Ok(rows)
+    }
+
+    /// Replicate the display checkpoint: one batched status-lane commit
+    /// stamping each node's ACTUAL last observed beat time (liveness plan
+    /// §6.5).
+    ///
+    /// Two rules make this safe, and neither is negotiable:
+    ///
+    /// - **A checkpoint is never read back as liveness.** Not by the tick, not
+    ///   on election, not ever. `become_responsible` seeds at `now` precisely
+    ///   so a 30s-stale checkpoint can never become a loss decision.
+    /// - **It records the OBSERVED time, not the write time.** A downgraded or
+    ///   older manager reading the column sees a truthful (if coarse) value
+    ///   rather than one claiming the whole fleet beat in lockstep.
+    #[instrument(err, skip_all)]
+    pub fn checkpoint_node_heartbeats(&self, beats: &[(String, i64)]) -> R<()> {
+        if beats.is_empty() {
+            return Ok(());
+        }
+        let beats = beats.to_vec();
+        self.replicated(Lane::Status, "checkpoint_node_heartbeats", move |s| {
+            s.checkpoint_node_heartbeats_apply(&beats)
+        })
+    }
+
+    fn checkpoint_node_heartbeats_apply(&self, beats: &[(String, i64)]) -> R<()> {
+        let conn = self.write_connection()?;
+        // Only ever refreshes the timestamp of a node the store already
+        // believes active: a checkpoint must not create a health row, revive a
+        // lost node, or clear `lost_at`. Those are transitions and they travel
+        // their own replicated paths.
+        let mut stmt = conn.prepare(
+            "INSERT INTO node_health (node_id, status, last_heartbeat, last_heartbeat_unix, lost_at, health_checks)
+             SELECT id, 'active', ?2, ?3, NULL, '{}' FROM node WHERE id = ?1
+             ON CONFLICT(node_id) DO UPDATE SET
+                 last_heartbeat = excluded.last_heartbeat,
+                 last_heartbeat_unix = excluded.last_heartbeat_unix
+             WHERE node_health.status = 'active';",
+        )?;
+        for (id, unix) in beats {
+            let text = OffsetDateTime::from_unix_timestamp(*unix)
+                .unwrap_or_else(|_| OffsetDateTime::now_utc())
+                .format(&Rfc3339)?;
+            stmt.execute(rusqlite::params![id, text, unix])?;
+        }
+        Ok(())
+    }
+
+    /// Record each node's lost window (`missedBeatsBeforeLost x its
+    /// interval`). Replicated, but rare: registration, and a served-cadence
+    /// change (heartbeat-cadence plan §6.4).
+    #[instrument(err, skip_all)]
+    pub fn set_node_lost_windows(&self, windows: &[(String, i64)]) -> R<()> {
+        if windows.is_empty() {
+            return Ok(());
+        }
+        let windows = windows.to_vec();
+        self.replicated(Lane::Status, "set_node_lost_windows", move |s| {
+            s.set_node_lost_windows_apply(&windows)
+        })
+    }
+
+    fn set_node_lost_windows_apply(&self, windows: &[(String, i64)]) -> R<()> {
+        let conn = self.write_connection()?;
+        let mut stmt =
+            conn.prepare("UPDATE node_health SET lost_after_seconds = ?2 WHERE node_id = ?1;")?;
+        for (id, seconds) in windows {
+            stmt.execute(rusqlite::params![id, seconds])?;
+        }
+        Ok(())
+    }
+
+    /// The lost window to seed a registering node with:
+    /// `missedBeatsBeforeLost x the cadence that node reports it will use`.
+    ///
+    /// The worker puts its RESOLVED interval in `config_attrs.heartbeatSeconds`
+    /// at registration, which is how a cluster running a 2s latency-sensitive
+    /// pool and a 60s batch pool gets a correct window for each without one
+    /// global constant (heartbeat-cadence plan §6.4(4)). A worker built before
+    /// that reported nothing, so it falls back to the default cadence — the
+    /// same value such a worker actually uses.
+    fn registered_lost_window_seconds(&self, node: &NodeMsg) -> i64 {
+        let reported = serde_json::from_str::<Value>(&node.config_attrs)
+            .ok()
+            .and_then(|attrs| attrs.get("heartbeatSeconds")?.as_u64());
+        let interval = reported
+            .map(|seconds| seconds.clamp(1, u64::from(MAX_WORKER_HEARTBEAT_SECONDS)))
+            .unwrap_or(WORKER_HEARTBEAT_DURATION_SEC);
+        (interval * u64::from(self.missed_beats_before_lost.max(1))) as i64
+    }
+
+    /// Every registered node's id and its currently recorded lost window.
+    #[instrument(err, skip_all)]
+    pub fn node_lost_windows(&self) -> R<Vec<(String, Option<i64>)>> {
+        let conn = self.read_connection()?;
+        let mut stmt = conn.prepare(
+            "SELECT node.id, node_health.lost_after_seconds
+             FROM node LEFT JOIN node_health ON node_health.node_id = node.id;",
+        )?;
+        let rows = Self::collect_rows(stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?)?;
+        Ok(rows)
     }
 
     /// Batch leader body for heartbeat group commit: dedupe the drained
@@ -5463,6 +7843,21 @@ impl Store {
 
     #[instrument(err, skip_all)]
     pub fn update_node_health_checks(&self, id: &str, health_checks: &str) -> R<()> {
+        // A worker re-reports the same health checks on every beat, so most
+        // of these calls have nothing to record. They were not free: the
+        // changeset comes out empty and never reaches quorum, but the apply
+        // still takes the WRITE connection, runs the upsert, re-reads the
+        // node and refreshes its cache entry — and the write connection is
+        // the same one the serialized plan-apply commit needs. The
+        // 2026-08-05 AWS campaign measured 134 of these a second against a
+        // 5,000-node fleet, every one of them `outcome=empty`, all of it
+        // contending with scheduling.
+        //
+        // Comparing first costs a read-connection lookup, which does not
+        // block the writer.
+        if self.node_health_checks_unchanged(id, health_checks)? {
+            return Ok(());
+        }
         match self.update_node_health_checks_local(id, health_checks) {
             Err(err) if crate::storage::raft::driver::NotRaftLeader::in_chain(&err) => self
                 .forward_after_rejection(
@@ -5474,6 +7869,23 @@ impl Store {
                 ),
             other => other,
         }
+    }
+
+    /// Whether `node_health` already holds exactly these health checks.
+    ///
+    /// False when the row is missing, so a node that has never reported still
+    /// takes the write path — the apply's own `EXISTS (SELECT 1 FROM node)`
+    /// guard then decides whether there is anything to write to.
+    fn node_health_checks_unchanged(&self, id: &str, health_checks: &str) -> R<bool> {
+        let conn = self.read_connection()?;
+        let current: Option<String> = conn
+            .query_row(
+                "SELECT health_checks FROM node_health WHERE node_id = ?;",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(current.as_deref() == Some(health_checks))
     }
 
     pub(crate) fn update_node_health_checks_local(&self, id: &str, health_checks: &str) -> R<()> {
@@ -6039,6 +8451,47 @@ impl Store {
         Ok((rollout, rollout_by_group))
     }
 
+    /// The latest stored config for `name`, read THROUGH the given
+    /// transaction. This is what makes job submits batchable: the version
+    /// derivation in `handle_job_submit_tx` must see writes earlier in the
+    /// same batch transaction (a second submit of one job in a batch derives
+    /// N+2, not a duplicate N+1), and the read-connection variant below
+    /// structurally cannot — it reads committed state, which is also the
+    /// standing "race condition here with the version" the old comment
+    /// admitted for concurrent submits.
+    fn latest_job_config_tx(&self, tx: &Connection, name: &str) -> R<Option<JobConfig>> {
+        let maybe: Option<(JobConfig, String)> = tx
+            .prepare_cached(&GET_JOB_CONFIG)?
+            .query_row([name], |row| {
+                let job_config_id: String = row.get(0)?;
+                let meta: Value = row.get(3)?;
+                let (rollout, rollout_by_group) = Self::rollout_meta_from_value(meta)?;
+                Ok((
+                    JobConfig {
+                        name: row.get(1)?,
+                        tasks: vec![],
+                        priority: Band::from_stored(&row.get::<_, String>(7)?),
+                        rollout,
+                        rollout_by_group,
+                        version: Some(row.get(4)?),
+                    },
+                    job_config_id,
+                ))
+            })
+            .optional()?;
+        let Some((job_config, jc_id)) = maybe else {
+            return Ok(None);
+        };
+        let tasks = Self::collect_rows(
+            tx.prepare_cached(&GET_TASK_FOR_JOB_CONIFG)?
+                .query_map([jc_id], |row| self.task_config_from_row(row))?,
+        )?;
+        Ok(Some(JobConfig {
+            tasks,
+            ..job_config
+        }))
+    }
+
     pub fn get_job_config_optional(&self, name: &str) -> R<Option<JobConfig>> {
         let conn = self.read_connection()?;
         let maybe_job_config: Option<(JobConfig, String)> = conn
@@ -6130,11 +8583,8 @@ impl Store {
     pub fn job_id_for_job_config(&self, job_config_id: &str) -> R<Option<String>> {
         let conn = self.read_connection()?;
         let job_id = conn
-            .query_row(
-                "SELECT job_id FROM job_config WHERE id = ?;",
-                [job_config_id],
-                |row| row.get(0),
-            )
+            .prepare_cached("SELECT job_id FROM job_config WHERE id = ?;")?
+            .query_row([job_config_id], |row| row.get(0))
             .optional()?;
         Ok(job_id)
     }
@@ -6274,12 +8724,31 @@ impl Store {
         subs: &[Submission],
         template: Option<&JobTemplateProvenance>,
     ) -> R<JobSubmitOutcome> {
-        let config = config.clone();
-        let subs = subs.to_vec();
-        let template = template.cloned();
-        let outcome = self.replicated(Lane::Control, "handle_job_submit", move |s| {
-            s.handle_job_submit_apply(&config, &subs, template.as_ref())
-        })?;
+        let request = JobSubmitRequest {
+            config: config.clone(),
+            subs: subs.to_vec(),
+            template: template.cloned(),
+        };
+        // A submit raised from INSIDE another op's capture must stay part of
+        // that capture (`replicated` short-circuits there); routing it
+        // through the coalescer would wait on a leader that needs the very
+        // lane pipeline the caller holds.
+        let outcome = if capture::in_capture()
+            || capture::in_apply()
+            || !self.job_intake_coalescing_enabled()
+        {
+            let JobSubmitRequest {
+                config,
+                subs,
+                template,
+            } = request;
+            self.replicated(Lane::Control, "handle_job_submit", move |s| {
+                s.handle_job_submit_apply(&config, &subs, template.as_ref())
+            })?
+        } else {
+            let coalescer = Arc::clone(&self.job_submit_coalescer);
+            coalescer.submit(request, |batch| self.run_job_submit_batch(batch))?
+        };
         // The status half runs for EVERY outcome, `Unchanged` included
         // (JC-40 composite-retry idempotency): if a previous attempt's
         // control half committed and its status half was rejected — the
@@ -6292,10 +8761,7 @@ impl Store {
         // NOTHING`, so the repeat costs one no-op statement — and under raft
         // an empty changeset skips the raft entry entirely (JC-26), so a
         // steady-state resubmit does not even reach the log.
-        let job_config_id = outcome.job_config_id().to_string();
-        if let Err(err) = self.replicated(Lane::Status, "seed_task_statuses", move |s| {
-            s.seed_task_statuses_apply(&job_config_id)
-        }) {
+        if let Err(err) = self.seed_task_statuses_coalesced(outcome.job_config_id()) {
             if !crate::storage::raft::driver::NotRaftLeader::in_chain(&err) {
                 return Err(err);
             }
@@ -6353,6 +8819,117 @@ impl Store {
         Ok(outcome)
     }
 
+    /// The status-lane half of the submit composite, group-committing with
+    /// whatever other submits are in flight.
+    ///
+    /// The seed is one quorum round per submitted job on a THIRD raft group
+    /// (16.6 applied/s on the AWS 5,000-node run, in lockstep with the
+    /// submission rate). A lane is its own raft group with its own
+    /// single-threaded pipeline, so this cannot share the scheduler-lane
+    /// batch — it gets its own coalescer, and a concurrent burst of submits
+    /// pays one status-lane round instead of one each.
+    ///
+    /// A lone submitter takes the single-seed op unchanged.
+    fn seed_task_statuses_coalesced(&self, job_config_id: &str) -> R<()> {
+        // Same reasoning as the eval enqueue: an in-capture caller must stay
+        // in its own capture rather than wait on a leader that needs the
+        // pipeline it is holding.
+        if capture::in_capture() || capture::in_apply() || !self.job_intake_coalescing_enabled() {
+            return self.seed_task_statuses_replicated(job_config_id.to_owned());
+        }
+        let coalescer = Arc::clone(&self.task_status_seed_coalescer);
+        coalescer.submit(job_config_id.to_owned(), |batch| {
+            self.run_task_status_seed_batch(batch)
+        })
+    }
+
+    /// The single-seed replicated op — the group commit's batch-of-one fast
+    /// path, its not-the-leader fallback, and the
+    /// `job_intake_coalescing: false` path.
+    fn seed_task_statuses_replicated(&self, job_config_id: String) -> R<()> {
+        self.replicated(Lane::Status, "seed_task_statuses", move |s| {
+            s.seed_task_statuses_apply(&job_config_id)
+        })
+    }
+
+    /// Batch leader body for the status-lane seed group commit.
+    ///
+    /// Requests are NOT deduplicated: two concurrent submits of the same
+    /// config (an idempotent resubmit racing the original) are two
+    /// submitters owed two results, and the seed is `ON CONFLICT DO
+    /// NOTHING`, so the repeat costs one no-op statement and keeps the
+    /// result mapping a plain 1:1 by index.
+    ///
+    /// Failure isolation and the not-the-leader fallback mirror the eval
+    /// enqueue: each seed runs in its own savepoint, and a typed rejection
+    /// (this node does not lead the status lane) re-runs every request as
+    /// its own op so each caller still sees the `NotRaftLeader` its
+    /// standing-split tolerance matches on — that tolerance is what lets a
+    /// submit succeed while the status leader's reconciler finishes the
+    /// half later.
+    fn run_task_status_seed_batch(&self, batch: Vec<String>) -> Vec<R<()>> {
+        if batch.len() == 1 {
+            let job_config_id = batch.into_iter().next().expect("length checked");
+            return vec![self.seed_task_statuses_replicated(job_config_id)];
+        }
+        let size = batch.len();
+        let rerun = batch.clone();
+        match self.replicated(Lane::Status, "seed_task_statuses_batch", move |s| {
+            s.seed_task_statuses_batch_apply(&batch)
+        }) {
+            Ok(results) => results,
+            Err(err) if crate::storage::raft::driver::NotRaftLeader::in_chain(&err) => {
+                debug!(
+                    batch = size,
+                    "Batched task-status seed rejected by the status lane; seeding each singly"
+                );
+                rerun
+                    .into_iter()
+                    .map(|job_config_id| self.seed_task_statuses_replicated(job_config_id))
+                    .collect()
+            }
+            Err(err) => {
+                let message = format!("batched task-status seed failed: {err:#}");
+                warn!(batch = size, error = %err, "Batched task-status seed failed");
+                (0..size).map(|_| Err(anyhow!(message.clone()))).collect()
+            }
+        }
+    }
+
+    /// The group commit's op body: every batched seed in ONE write
+    /// transaction, each fenced by its own savepoint so a failing seed
+    /// rolls back alone. One result per request, in request order.
+    fn seed_task_statuses_batch_apply(&self, batch: &[String]) -> R<Vec<R<()>>> {
+        let mut conn = self.write_connection()?;
+        let tx = Self::write_tx(&mut conn)?;
+        let now = Self::now_rfc3339()?;
+        let mut results: Vec<R<()>> = Vec::with_capacity(batch.len());
+        for job_config_id in batch {
+            // Savepoint-machinery errors abort the whole batch (`?`): a
+            // leftover savepoint corrupts the stack for the batch-mates
+            // behind it, and the caller's recovery is a clean rollback.
+            tx.execute_batch("SAVEPOINT legion_status_seed_item;")?;
+            match tx.execute(
+                SEED_TASK_STATUSES_SQL,
+                params![job_config_id, TaskStatusState::Pending.as_str(), now],
+            ) {
+                Ok(_) => {
+                    tx.execute_batch("RELEASE legion_status_seed_item;")?;
+                    results.push(Ok(()));
+                }
+                Err(err) => {
+                    tx.execute_batch(
+                        "ROLLBACK TO legion_status_seed_item; \
+                         RELEASE legion_status_seed_item;",
+                    )?;
+                    results.push(Err(err.into()));
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(results)
+    }
+
     /// Status-lane seed of the submit composite: one `pending` row per task
     /// config of the just-written job config (task identity comes from the
     /// control-lane rows, read here).
@@ -6360,10 +8937,7 @@ impl Store {
         let conn = self.write_connection()?;
         let now = Self::now_rfc3339()?;
         conn.execute(
-            "INSERT INTO task_status (task_config_id, job_id, job_config_id, status, updated_at)
-             SELECT id, job_id, job_config_id, ?2, ?3
-             FROM task_config WHERE job_config_id = ?1
-             ON CONFLICT(task_config_id) DO NOTHING;",
+            SEED_TASK_STATUSES_SQL,
             params![job_config_id, TaskStatusState::Pending.as_str(), now],
         )?;
         Ok(())
@@ -6434,21 +9008,179 @@ impl Store {
         subs: &[Submission],
         template: Option<&JobTemplateProvenance>,
     ) -> R<JobSubmitOutcome> {
+        let mut conn = self.write_connection()?;
+        let tx = Self::write_tx(&mut conn)?;
+        let (outcome, staged) = self.handle_job_submit_tx(&tx, config, subs, template)?;
+        tx.commit()
+            .map_err(|_| anyhow!("Error committing transaction"))?;
+        drop(conn);
+        self.finish_job_submit(&outcome, staged)?;
+        Ok(outcome)
+    }
+
+    /// Post-commit half of a submit: broadcast the staged events and warm
+    /// the task-config cache. Shared by the single op and the batch, and
+    /// run once per SUCCESSFUL request after its transaction committed.
+    fn finish_job_submit(
+        &self,
+        outcome: &JobSubmitOutcome,
+        staged: Vec<SchedulerEventRecord>,
+    ) -> R<()> {
+        for event in staged {
+            self.publish_staged(Some(event));
+        }
+        let cached_tasks = self.get_task_configs_for_job_config(outcome.job_config_id())?;
+        self.cache_set_task_configs_for_job_config(outcome.job_config_id(), cached_tasks)?;
+        Ok(())
+    }
+
+    /// Batch leader body for the job-submit group commit: every drained
+    /// submit in ONE control-lane op, each request inside its own savepoint
+    /// so a failing submit rolls back alone and its batch-mates still
+    /// commit. Same-job submits in one batch derive successive versions
+    /// correctly because the version read goes through this transaction
+    /// (`latest_job_config_tx`).
+    fn handle_job_submits_apply(&self, batch: &[JobSubmitRequest]) -> Vec<R<JobSubmitOutcome>> {
+        let mut conn = match self.write_connection() {
+            Ok(conn) => conn,
+            Err(err) => {
+                let msg = format!("job-submit batch could not open a write connection: {err:#}");
+                return batch.iter().map(|_| Err(anyhow!(msg.clone()))).collect();
+            }
+        };
+        let tx = match Self::write_tx(&mut conn) {
+            Ok(tx) => tx,
+            Err(err) => {
+                let msg = format!("job-submit batch could not open a transaction: {err:#}");
+                return batch.iter().map(|_| Err(anyhow!(msg.clone()))).collect();
+            }
+        };
+
+        let mut results: Vec<R<JobSubmitOutcome>> = Vec::with_capacity(batch.len());
+        let mut finished: Vec<(JobSubmitOutcome, Vec<SchedulerEventRecord>)> = Vec::new();
+        for request in batch {
+            if let Err(err) = tx.execute_batch("SAVEPOINT legion_submit_item;") {
+                results.push(Err(anyhow!("job-submit item savepoint failed: {err:#}")));
+                continue;
+            }
+            match self.handle_job_submit_tx(
+                &tx,
+                &request.config,
+                &request.subs,
+                request.template.as_ref(),
+            ) {
+                Ok((outcome, staged)) => {
+                    if let Err(err) = tx.execute_batch("RELEASE legion_submit_item;") {
+                        results.push(Err(anyhow!("job-submit item release failed: {err:#}")));
+                        continue;
+                    }
+                    results.push(Ok(outcome.clone()));
+                    finished.push((outcome, staged));
+                }
+                Err(err) => {
+                    let _ = tx.execute_batch(
+                        "ROLLBACK TO legion_submit_item; RELEASE legion_submit_item;",
+                    );
+                    results.push(Err(err));
+                }
+            }
+        }
+
+        if let Err(err) = tx.commit() {
+            let msg = format!("job-submit batch commit failed: {err:#}");
+            return batch.iter().map(|_| Err(anyhow!(msg.clone()))).collect();
+        }
+        drop(conn);
+        for (outcome, staged) in finished {
+            if let Err(err) = self.finish_job_submit(&outcome, staged) {
+                warn!(
+                    job_config_id = outcome.job_config_id(),
+                    error = ?err,
+                    "Post-commit submit bookkeeping failed; the read model heals via projection"
+                );
+            }
+        }
+        results
+    }
+
+    /// Group-commit entry for a submit: coalesce concurrent `RunJob`s into
+    /// one control-lane round. Mirrors `run_eval_enqueue_batch`'s contract —
+    /// a `NotRaftLeader` rejection re-runs each request singly (nothing was
+    /// proposed, and each caller keeps the typed rejection its
+    /// standing-split tolerance matches on); any other batch error is
+    /// reported to every member rather than re-run, because an error out of
+    /// `replicated` can straddle a commit and a re-run could double-submit.
+    fn run_job_submit_batch(&self, batch: Vec<JobSubmitRequest>) -> Vec<R<JobSubmitOutcome>> {
+        if batch.len() == 1 {
+            let request = batch.into_iter().next().expect("length checked");
+            return vec![
+                self.replicated(Lane::Control, "handle_job_submit", move |s| {
+                    s.handle_job_submit_apply(
+                        &request.config,
+                        &request.subs,
+                        request.template.as_ref(),
+                    )
+                }),
+            ];
+        }
+        let size = batch.len();
+        let rerun = batch.clone();
+        match self.replicated(Lane::Control, "handle_job_submits", move |s| {
+            Ok(s.handle_job_submits_apply(&batch))
+        }) {
+            Ok(results) => results,
+            Err(err) if crate::storage::raft::driver::NotRaftLeader::in_chain(&err) => {
+                debug!(
+                    batch = size,
+                    "Batched job submit rejected by the control lane; running each singly"
+                );
+                rerun
+                    .into_iter()
+                    .map(|request| {
+                        self.replicated(Lane::Control, "handle_job_submit", move |s| {
+                            s.handle_job_submit_apply(
+                                &request.config,
+                                &request.subs,
+                                request.template.as_ref(),
+                            )
+                        })
+                    })
+                    .collect()
+            }
+            Err(err) => {
+                let msg = format!("job-submit group commit failed: {err:#}");
+                (0..size).map(|_| Err(anyhow!(msg.clone()))).collect()
+            }
+        }
+    }
+
+    /// The whole submit write, against a caller-owned transaction, with the
+    /// version derivation reading THROUGH that transaction (see
+    /// `latest_job_config_tx`). Stages events but does not publish them and
+    /// does not commit — the caller does both, which is what lets the batch
+    /// runner wrap each request in its own savepoint inside one commit.
+    fn handle_job_submit_tx(
+        &self,
+        tx: &Connection,
+        config: &JobConfig,
+        subs: &[Submission],
+        template: Option<&JobTemplateProvenance>,
+    ) -> R<(JobSubmitOutcome, Vec<SchedulerEventRecord>)> {
         let config = self.normalize_job_config(config)?;
-        // Note: There is a race condition here with the version
-        // I think this should prob be all in a single lock, but
-        // I am not going to worry about this for now
 
         let mut next_version = 1;
         let mut last_versions_id: Option<String> = None;
         let mut was_update = false;
 
-        if let Some(latest_job_config) = self.get_job_config_optional(&config.name)? {
+        if let Some(latest_job_config) = self.latest_job_config_tx(tx, &config.name)? {
             // if latest_job_config is deep equal to config, return unchanged
             if latest_job_config.is_same_as(&config) {
-                return Ok(JobSubmitOutcome::Unchanged {
-                    job_config_id: latest_job_config.id(),
-                });
+                return Ok((
+                    JobSubmitOutcome::Unchanged {
+                        job_config_id: latest_job_config.id(),
+                    },
+                    Vec::new(),
+                ));
             } else {
                 next_version = latest_job_config.version.unwrap_or(0) + 1;
                 last_versions_id = Some(latest_job_config.id());
@@ -6456,9 +9188,7 @@ impl Store {
             }
         }
 
-        let mut conn = self.write_connection()?;
         let now = OffsetDateTime::now_utc().unix_timestamp();
-        let tx = Self::write_tx(&mut conn)?;
 
         let get_job_res = tx.query_row(&GET_JOB, [config.name.clone()], |row| {
             self.job_from_row(row)
@@ -6700,25 +9430,18 @@ impl Store {
         } else {
             JobSubmitOutcome::Created { job_config_id }
         };
-        let submit_event =
+        let mut staged: Vec<SchedulerEventRecord> =
             drafts::job_submit_outcome(&job.id, &outcome, next_version, config.tasks.len())
-                .and_then(|draft| self.stage_event_locked(&tx, draft));
-        let scale_reset_events: Vec<_> = scale_reset_events
-            .into_iter()
-            .filter_map(|draft| self.stage_event_locked(&tx, draft))
-            .collect();
-        tx.commit()
-            .map_err(|_| anyhow!("Error committing transaction"))?;
-        self.publish_staged(submit_event);
-        for staged in scale_reset_events {
-            self.publish_staged(Some(staged));
-        }
-        drop(conn);
+                .and_then(|draft| self.stage_event_locked(tx, draft))
+                .into_iter()
+                .collect();
+        staged.extend(
+            scale_reset_events
+                .into_iter()
+                .filter_map(|draft| self.stage_event_locked(tx, draft)),
+        );
 
-        let cached_tasks = self.get_task_configs_for_job_config(outcome.job_config_id())?;
-        self.cache_set_task_configs_for_job_config(outcome.job_config_id(), cached_tasks)?;
-
-        Ok(outcome)
+        Ok((outcome, staged))
     }
 
     pub fn normalize_job_config(&self, config: &JobConfig) -> R<JobConfig> {
@@ -7216,6 +9939,12 @@ impl Store {
         let mut node_ids: HashSet<String> = HashSet::new();
         let mut alloc_node_ids: HashSet<String> = HashSet::new();
         let mut alloc_reread_ids: HashSet<i64> = HashSet::new();
+        // The allocation rows this changeset actually moved, which is what
+        // the read model is refreshed FROM (see
+        // `Store::cache_apply_allocation_delta`). The scope sets above stay
+        // exactly as they were: they still drive the epoch mirror, and they
+        // are the fallback's reload set whenever the delta is unusable.
+        let mut alloc_delta = AllocationDelta::new();
         let mut task_job_config_ids: HashSet<String> = HashSet::new();
         // Epoch scopes bumped by this changeset (the plan-fence mirror —
         // see `SchedulingReadModel::scope_epochs`): the changeset's own
@@ -7226,7 +9955,7 @@ impl Store {
         let mut epoch_job_scopes: BTreeSet<String> = BTreeSet::new();
         let mut task_reread_ids: HashSet<i64> = HashSet::new();
         let mut event_ids: Vec<i64> = Vec::new();
-        let mut eval_touched = false;
+        let mut evals_made_claimable = 0usize;
 
         // Column positions come from the live schema (changeset records use
         // the table's declared column order), so this cannot drift from
@@ -7292,27 +10021,69 @@ impl Store {
                 "allocation" => {
                     let node_idx =
                         self.changeset_column_index(&mut column_cache, "allocation", "node_id")?;
+                    let id_idx =
+                        self.changeset_column_index(&mut column_cache, "allocation", "id")?;
+                    // The row id is what makes a delta possible: the
+                    // changeset names every allocation this commit moved, so
+                    // the read model can be patched from those rows instead
+                    // of reloading each touched node's whole list. Anything
+                    // this arm cannot name unambiguously clears
+                    // `alloc_delta.usable`, and the whole changeset then
+                    // takes the old self-healing full-reload path.
                     match action {
                         Action::SQLITE_INSERT => {
-                            if let Ok(value) = item.new_value(node_idx) {
-                                if let Ok(node_id) = value.as_str() {
-                                    alloc_node_ids.insert(node_id.to_owned());
+                            let node_id = item
+                                .new_value(node_idx)
+                                .ok()
+                                .and_then(|value| value.as_str().ok().map(str::to_owned));
+                            let id = item
+                                .new_value(id_idx)
+                                .ok()
+                                .and_then(|value| value.as_i64().ok());
+                            if let Some(node_id) = &node_id {
+                                alloc_node_ids.insert(node_id.clone());
+                            }
+                            match (id, node_id) {
+                                (Some(id), Some(_)) => {
+                                    alloc_delta.inserts.insert(id);
+                                    alloc_delta.upserts.insert(id);
                                 }
+                                _ => alloc_delta.usable = false,
                             }
                         }
                         Action::SQLITE_DELETE => {
-                            if let Ok(value) = item.old_value(node_idx) {
-                                if let Ok(node_id) = value.as_str() {
-                                    alloc_node_ids.insert(node_id.to_owned());
+                            let node_id = item
+                                .old_value(node_idx)
+                                .ok()
+                                .and_then(|value| value.as_str().ok().map(str::to_owned));
+                            let id = item
+                                .old_value(id_idx)
+                                .ok()
+                                .and_then(|value| value.as_i64().ok());
+                            if let Some(node_id) = &node_id {
+                                alloc_node_ids.insert(node_id.clone());
+                            }
+                            match (id, node_id) {
+                                (Some(id), Some(node_id)) => {
+                                    alloc_delta.removals.push((id, node_id));
                                 }
+                                _ => alloc_delta.usable = false,
                             }
                         }
                         _ => {
                             // UPDATE: unchanged columns are absent from the
-                            // record. Collect whichever sides are present; if
-                            // node_id itself did not change, fall back to
-                            // re-reading the row by PK.
+                            // record, so a present OLD node_id means the
+                            // allocation MOVED — it leaves the old node's
+                            // cached list and joins the new one. Collect
+                            // whichever sides are present; if node_id itself
+                            // did not change, fall back to re-reading the row
+                            // by PK (only the fallback needs that — the delta
+                            // learns the node from the row it re-reads).
                             let mut found = false;
+                            let moved_from = item
+                                .old_value(node_idx)
+                                .ok()
+                                .and_then(|value| value.as_str().ok().map(str::to_owned));
                             for value in [item.old_value(node_idx), item.new_value(node_idx)]
                                 .into_iter()
                                 .flatten()
@@ -7322,17 +10093,24 @@ impl Store {
                                     found = true;
                                 }
                             }
-                            if !found {
-                                let id_idx = self.changeset_column_index(
-                                    &mut column_cache,
-                                    "allocation",
-                                    "id",
-                                )?;
-                                if let Some(id) =
-                                    item.old_value(id_idx).ok().and_then(|v| v.as_i64().ok())
-                                {
-                                    alloc_reread_ids.insert(id);
+                            // The primary key is always in an update's old
+                            // record, changed or not.
+                            let id = item
+                                .old_value(id_idx)
+                                .ok()
+                                .and_then(|value| value.as_i64().ok());
+                            match id {
+                                Some(id) => {
+                                    alloc_delta.upserts.insert(id);
+                                    if let Some(node_id) = moved_from {
+                                        alloc_delta.moved.insert(id);
+                                        alloc_delta.removals.push((id, node_id));
+                                    }
+                                    if !found {
+                                        alloc_reread_ids.insert(id);
+                                    }
                                 }
+                                None => alloc_delta.usable = false,
                             }
                         }
                     }
@@ -7384,7 +10162,29 @@ impl Store {
                     }
                 }
                 "eval" => {
-                    eval_touched = true;
+                    // Count the evals this changeset made CLAIMABLE, rather
+                    // than noting that the table moved at all. Every eval
+                    // crosses this arm at least three times (enqueued,
+                    // claimed, completed), and only the first of those is
+                    // work for a parked worker — waking the pool for the
+                    // other two hands every worker a `claim_eval`, and each
+                    // one of those is a scheduler-lane quorum round that
+                    // comes back empty.
+                    let status_idx =
+                        self.changeset_column_index(&mut column_cache, "eval", "status")?;
+                    // An UPDATE's new record carries only the columns that
+                    // changed, so a row whose status held still reads as
+                    // absent here — which is exactly the answer we want.
+                    let became_claimable =
+                        matches!(action, Action::SQLITE_INSERT | Action::SQLITE_UPDATE)
+                            && item
+                                .new_value(status_idx)
+                                .ok()
+                                .and_then(|value| value.as_str().ok().map(|s| s == "pending"))
+                                .unwrap_or(false);
+                    if became_claimable {
+                        evals_made_claimable += 1;
+                    }
                 }
                 "allocation_epoch_partition" => {
                     let type_idx = self.changeset_column_index(
@@ -7425,10 +10225,14 @@ impl Store {
         drop(iter);
 
         // Resolve rows whose owning scope was not carried by the update
-        // record.
-        for id in alloc_reread_ids {
-            if let Some(allocation) = self.get_allocation_by_id(id)? {
-                alloc_node_ids.insert(allocation.node_id);
+        // record. Only the full-reload path needs this: it reloads BY NODE,
+        // so it cannot proceed without the node id, while the delta path
+        // reads the row itself and learns the node from it.
+        if !alloc_delta.usable {
+            for id in alloc_reread_ids {
+                if let Some(allocation) = self.get_allocation_by_id(id)? {
+                    alloc_node_ids.insert(allocation.node_id);
+                }
             }
         }
         for id in task_reread_ids {
@@ -7464,10 +10268,24 @@ impl Store {
         // nodes' free pools/indexes inside that lock — so a sampler can
         // never pair a new epoch with a stale cache, and the plan-snapshot
         // cache never observes pools out of step with allocations.
+        //
+        // Which path: the DELTA (`cache_apply_allocation_delta`) whenever
+        // this changeset's allocation records were all classifiable, because
+        // a full reload costs one whole allocation list per touched node —
+        // work that grows with cluster FILL while the change being projected
+        // does not. `cache_refresh_allocation_scopes` remains the path for
+        // everything else, and the delta falls back to it on contradiction.
         let mut refresh_nodes: BTreeSet<String> = alloc_node_ids.into_iter().collect();
         refresh_nodes.extend(epoch_node_scopes);
-        if !refresh_nodes.is_empty() || !epoch_job_scopes.is_empty() {
-            self.cache_refresh_allocation_scopes(&refresh_nodes, &epoch_job_scopes)?;
+        // An in-place allocation UPDATE names no scope at all (its record
+        // carries only the columns that changed), so the delta's own rows
+        // have to keep the refresh alive on their own.
+        if !refresh_nodes.is_empty() || !epoch_job_scopes.is_empty() || !alloc_delta.is_empty() {
+            if alloc_delta.usable {
+                self.cache_apply_allocation_delta(&alloc_delta, &refresh_nodes, &epoch_job_scopes)?;
+            } else {
+                self.cache_refresh_allocation_scopes(&refresh_nodes, &epoch_job_scopes)?;
+            }
         }
         for job_config_id in task_job_config_ids {
             let tasks = self.get_task_configs_for_job_config(&job_config_id)?;
@@ -7504,8 +10322,15 @@ impl Store {
             }
         }
 
-        if eval_touched {
-            self.eval_notify.notify_waiters();
+        // One wake per newly-claimable eval. `notify_one` hands the permit to
+        // a single parked worker (or stores it for the next one to park), so
+        // the pool issues one claim per unit of work instead of one claim per
+        // worker per eval transition. Under-waking is bounded rather than
+        // lost: `wait_for_next_eval` sizes its park by
+        // `next_pending_eval_delay`, which is zero while any eval is ready,
+        // so a worker that missed a permit re-checks instead of sleeping.
+        for _ in 0..evals_made_claimable {
+            self.eval_notify.notify_one();
         }
 
         Ok(())
@@ -8078,8 +10903,9 @@ impl Store {
         job_config_id: &str,
     ) -> R<HashMap<i64, TaskStatusState>> {
         let conn = self.read_connection()?;
-        let mut stmt = conn
-            .prepare("SELECT task_config_id, status FROM task_status WHERE job_config_id = ?;")?;
+        let mut stmt = conn.prepare_cached(
+            "SELECT task_config_id, status FROM task_status WHERE job_config_id = ?;",
+        )?;
         let rows = stmt.query_map([job_config_id], |row| {
             let task_id: i64 = row.get(0)?;
             let status: String = row.get(1)?;
@@ -8272,11 +11098,13 @@ impl Store {
             Value,
             Option<String>,
             Option<String>,
-        ) = tx.query_row(
-            "SELECT job_config_id, resources, network, connect FROM task_config WHERE id = ?;",
-            [task_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-        )?;
+        ) = tx
+            .prepare_cached(
+                "SELECT job_config_id, resources, network, connect FROM task_config WHERE id = ?;",
+            )?
+            .query_row([task_id], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })?;
 
         let network =
             self.assign_allocation_network(tx, node_id, task_id, network_raw, connect_raw)?;
@@ -8297,6 +11125,224 @@ impl Store {
     /// kinds share the node's one port space) so concurrent placements in the
     /// same tx or committed earlier cannot collide. Static conflicts fail
     /// placement with a node-scoped error.
+    /// The port a service declared on its own task — its port label's
+    /// in-task `to`, else its static host port — so a consumer's VIP can
+    /// listen on the number the service is known by. `None` when the service
+    /// is not (yet) submitted or declares only a dynamic port with no `to`.
+    fn declared_service_port(&self, tx: &Connection, service: &str) -> R<Option<u16>> {
+        let mut stmt = tx.prepare_cached(
+            "SELECT network, service FROM task_config
+             WHERE service IS NOT NULL AND json_valid(service)
+               AND COALESCE(json_extract(service, '$.name'), name) = ?
+             ORDER BY id DESC LIMIT 1;",
+        )?;
+        let row = stmt
+            .query_row([service], |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                ))
+            })
+            .optional()?;
+        let Some((network_raw, service_raw)) = row else {
+            return Ok(None);
+        };
+        let (Some(network_raw), Some(service_raw)) = (network_raw, service_raw) else {
+            return Ok(None);
+        };
+        let network: crate::structs::NetworkConfig = match from_str(&network_raw) {
+            Ok(network) => network,
+            Err(_) => return Ok(None),
+        };
+        let service_config: crate::structs::ServiceConfig = match from_str(&service_raw) {
+            Ok(config) => config,
+            Err(_) => return Ok(None),
+        };
+        let label = match service_config.port_label() {
+            Some(label) => label.to_string(),
+            None => return Ok(None),
+        };
+        Ok(network
+            .ports
+            .iter()
+            .find(|port| port.name == label)
+            .and_then(|port| port.to.or(port.static_port)))
+    }
+
+    /// Whether a stored policy matching this task declares an ingress chain.
+    /// Cheap when no policy exists (the generation counter is zero).
+    fn policy_declares_ingress(
+        &self,
+        tx: &Connection,
+        node_id: &str,
+        task_id: i64,
+        network: Option<&crate::structs::NetworkConfig>,
+    ) -> R<bool> {
+        if self.net_policy_generation().unwrap_or(0) == 0 {
+            return Ok(false);
+        }
+        let (runtime, job_id): (String, String) = match tx
+            .query_row(
+                "SELECT runtime, job_id FROM task_config WHERE id = ?;",
+                [task_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?
+        {
+            Some(row) => row,
+            None => return Ok(false),
+        };
+        let pool: Option<String> = tx
+            .query_row("SELECT pool FROM node WHERE id = ?;", [node_id], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        let facts = crate::structs::netpolicy::NetSelectorFacts {
+            node_pool: pool,
+            namespace: String::new(),
+            runtime,
+            job: job_id,
+            labels: network.map(|n| n.labels.clone()).unwrap_or_default(),
+        };
+        Ok(self
+            .list_net_policies()?
+            .into_iter()
+            .map(|record| record.object)
+            .any(|policy| policy.ingress.is_some() && policy.selector.matches(&facts)))
+    }
+
+    /// How the allocation's advertised ports terminate TLS — `legion`,
+    /// `byo`, or none — from the effective ingress chain the same merge the
+    /// heartbeat runs would produce for this (job, task, node). Resolved at
+    /// placement because the catalog projection reads it off the allocation
+    /// row for every consumer's endpoint feed.
+    fn ingress_tls_at_placement(
+        &self,
+        tx: &Connection,
+        node_id: &str,
+        task_id: i64,
+        network: Option<&crate::structs::NetworkConfig>,
+    ) -> R<Option<String>> {
+        let (runtime, job_id): (String, String) = match tx
+            .query_row(
+                "SELECT runtime, job_id FROM task_config WHERE id = ?;",
+                [task_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?
+        {
+            Some(row) => row,
+            None => return Ok(None),
+        };
+        let matching: Vec<crate::structs::netpolicy::NetPolicyObject> =
+            if self.net_policy_generation().unwrap_or(0) > 0 {
+                let pool: Option<String> = tx
+                    .query_row("SELECT pool FROM node WHERE id = ?;", [node_id], |row| {
+                        row.get(0)
+                    })
+                    .optional()?;
+                let facts = crate::structs::netpolicy::NetSelectorFacts {
+                    node_pool: pool,
+                    namespace: String::new(),
+                    runtime,
+                    job: job_id,
+                    labels: network.map(|n| n.labels.clone()).unwrap_or_default(),
+                };
+                self.list_net_policies()?
+                    .into_iter()
+                    .map(|record| record.object)
+                    .filter(|policy| policy.selector.matches(&facts))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+        let effective = crate::structs::netpolicy::merge_policies(
+            &matching,
+            crate::structs::netpolicy::InlinePolicy {
+                mode: None,
+                egress: None,
+                ingress: network.and_then(|n| n.ingress.as_ref()),
+            },
+        );
+        Ok(effective
+            .ingress
+            .as_ref()
+            .and_then(|chain| chain.tls.as_ref())
+            .filter(|tls| {
+                matches!(
+                    tls.mode.as_str(),
+                    crate::structs::netpolicy::TLS_SERVER | crate::structs::netpolicy::TLS_MUTUAL
+                )
+            })
+            .map(|tls| {
+                if tls.cert_from.as_deref() == Some("legion") {
+                    "legion".to_string()
+                } else {
+                    "byo".to_string()
+                }
+            }))
+    }
+
+    /// The `network.mode` an allocation runs in: the task's declared mode
+    /// (`auto` resolved per runtime), overridden by the highest-priority
+    /// matching `require` policy that sets one. Resolved at placement — a
+    /// namespace is a start-time property — so a later policy change affects
+    /// the next placement, not a running allocation.
+    fn effective_network_mode(
+        &self,
+        tx: &Connection,
+        node_id: &str,
+        task_id: i64,
+        network: Option<&crate::structs::NetworkConfig>,
+    ) -> R<Option<String>> {
+        let (runtime, job_id): (String, String) = match tx
+            .query_row(
+                "SELECT runtime, job_id FROM task_config WHERE id = ?;",
+                [task_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?
+        {
+            Some(row) => row,
+            None => return Ok(None),
+        };
+        let declared = network.map(|n| n.mode.as_str()).unwrap_or("auto");
+        let mut mode = crate::structs::resolve_network_mode(declared, &runtime);
+        // Stored policies are rare on the placement path; the generation
+        // check makes a cluster without any of them pay one indexed read.
+        if self.net_policy_generation().unwrap_or(0) > 0 {
+            let pool: Option<String> = tx
+                .query_row("SELECT pool FROM node WHERE id = ?;", [node_id], |row| {
+                    row.get(0)
+                })
+                .optional()?;
+            let facts = crate::structs::netpolicy::NetSelectorFacts {
+                node_pool: pool,
+                namespace: String::new(),
+                runtime: runtime.clone(),
+                job: job_id,
+                labels: network.map(|n| n.labels.clone()).unwrap_or_default(),
+            };
+            let mut required: Vec<crate::structs::netpolicy::NetPolicyObject> = self
+                .list_net_policies()?
+                .into_iter()
+                .map(|record| record.object)
+                .filter(|policy| {
+                    policy.is_required() && policy.mode.is_some() && policy.selector.matches(&facts)
+                })
+                .collect();
+            required.sort_by(|a, b| {
+                b.priority
+                    .cmp(&a.priority)
+                    .then_with(|| a.name.cmp(&b.name))
+            });
+            if let Some(imposed) = required.first().and_then(|p| p.mode.clone()) {
+                mode = crate::structs::resolve_network_mode(&imposed, &runtime);
+            }
+        }
+        Ok(Some(mode))
+    }
+
     fn assign_allocation_network(
         &self,
         tx: &Connection,
@@ -8326,12 +11372,26 @@ impl Store {
             .as_ref()
             .is_some_and(|connect| !connect.upstreams.is_empty());
         if !has_ports && !has_upstreams {
-            return Ok(None);
+            // No ports and no upstreams: the row carries a network only when
+            // a mode other than `host` applies (the task asked for `gated`,
+            // or a required policy imposes it), so plain jobs stay unchanged.
+            let mode = self.effective_network_mode(tx, node_id, task_id, network.as_ref())?;
+            return Ok(match mode.as_deref() {
+                Some(mode) if mode != crate::structs::netpolicy::MODE_HOST => {
+                    Some(crate::structs::AllocNetwork {
+                        mode: Some(mode.to_string()),
+                        ..Default::default()
+                    })
+                }
+                _ => None,
+            });
         }
 
         let mut used: HashSet<u16> = HashSet::new();
-        let mut stmt = tx
-            .prepare("SELECT network FROM allocation WHERE node_id = ? AND network IS NOT NULL;")?;
+        let mut used_blocks: HashSet<String> = HashSet::new();
+        let mut stmt = tx.prepare_cached(
+            "SELECT network FROM allocation WHERE node_id = ? AND network IS NOT NULL;",
+        )?;
         let rows = stmt.query_map([node_id], |row| row.get::<_, Option<String>>(0))?;
         for row in rows {
             let Some(raw) = row? else { continue };
@@ -8344,24 +11404,72 @@ impl Store {
                     .iter()
                     .map(|upstream| upstream.local_port),
             );
+            if let Some(block) = existing.vip_block.as_ref() {
+                used_blocks.insert(block.clone());
+            }
         }
 
-        let (ports, upstreams) =
-            crate::structs::assign_allocation_ports(network.as_ref(), connect.as_ref(), &used)
-                .with_context(|| format!("failed to assign ports on node {node_id}"))?;
+        // Name-is-config (docs/network-handlers.md): an allocation with
+        // upstreams gets a loopback /24 so `<key>.svc.legion` can resolve to
+        // a VIP on the port the service declared. Only where the platform
+        // routes 127/8; a block that cannot be assigned is not a placement
+        // failure — the loopback ports still work — so this is best effort.
+        let (vip_block, service_ports) = if has_upstreams
+            && crate::structs::platform_supports_vip_blocks()
+        {
+            let block = crate::structs::next_vip_block(&used_blocks).ok();
+            if block.is_none() {
+                warn!(node_id = %node_id, "No free VIP block; upstreams get loopback ports only");
+            }
+            let mut service_ports: HashMap<String, u16> = HashMap::new();
+            if let Some(connect) = connect.as_ref() {
+                for upstream in &connect.upstreams {
+                    if upstream.is_external() {
+                        continue;
+                    }
+                    if let Some(port) = self.declared_service_port(tx, &upstream.service)? {
+                        service_ports.insert(upstream.key().to_string(), port);
+                    }
+                }
+            }
+            (block, service_ports)
+        } else {
+            (None, HashMap::new())
+        };
+
+        // An ingress chain — inline, or from a matching stored policy — means
+        // the datapath owns the advertised ports and the task binds private
+        // twins. Decided here because ports are assigned here.
+        let has_ingress = network.as_ref().is_some_and(|n| n.ingress.is_some())
+            || self.policy_declares_ingress(tx, node_id, task_id, network.as_ref())?;
+        let (ports, upstreams) = crate::structs::assign_allocation_ports_full(
+            network.as_ref(),
+            connect.as_ref(),
+            &used,
+            &service_ports,
+            vip_block.as_deref(),
+            has_ingress,
+        )
+        .with_context(|| format!("failed to assign ports on node {node_id}"))?;
         let address = tx
-            .query_row(
-                "SELECT config_attrs FROM node WHERE id = ?;",
-                [node_id],
-                |row| row.get::<_, Value>(0),
-            )
+            .prepare_cached("SELECT config_attrs FROM node WHERE id = ?;")
+            .and_then(|mut stmt| stmt.query_row([node_id], |row| row.get::<_, Value>(0)))
             .ok()
             .and_then(|attrs| worker_address_host(&attrs));
 
+        let mode = self.effective_network_mode(tx, node_id, task_id, network.as_ref())?;
+        let ingress_tls = if has_ingress {
+            self.ingress_tls_at_placement(tx, node_id, task_id, network.as_ref())?
+        } else {
+            None
+        };
         Ok(Some(crate::structs::AllocNetwork {
             address,
             ports,
             upstreams,
+            vip_block,
+            mode,
+            ingress_tls,
         }))
     }
 
@@ -8401,17 +11509,17 @@ impl Store {
             ":created_at_unix": OffsetDateTime::now_utc().unix_timestamp(),
         };
 
-        let allocation = tx.query_row(&INSERT_ALLOCATION, params, |row| {
-            self.allocation_from_row(row)
-        })?;
+        let allocation = tx
+            .prepare_cached(&INSERT_ALLOCATION)?
+            .query_row(params, |row| self.allocation_from_row(row))?;
 
         if let Some(instance_id) = allocation.instance_id.as_deref() {
             let now = Self::now_rfc3339()?;
-            tx.execute(
+            tx.prepare_cached(
                 "UPDATE instance SET state = 'active', current_alloc_id = ?1, updated_at = ?2 \
                  WHERE instance_id = ?3;",
-                params![allocation.id, now, instance_id],
-            )?;
+            )?
+            .execute(params![allocation.id, now, instance_id])?;
         }
 
         Ok(allocation)
@@ -8444,10 +11552,11 @@ impl Store {
             String,
             i64,
             Option<String>,
-        ) = tx.query_row(
-            "SELECT job_id, group_name, name, count, stateful FROM task_config WHERE id = ?;",
-            [task_id],
-            |row| {
+        ) = tx
+            .prepare_cached(
+                "SELECT job_id, group_name, name, count, stateful FROM task_config WHERE id = ?;",
+            )?
+            .query_row([task_id], |row| {
                 Ok((
                     row.get(0)?,
                     row.get(1)?,
@@ -8455,8 +11564,7 @@ impl Store {
                     row.get(3)?,
                     row.get(4)?,
                 ))
-            },
-        )?;
+            })?;
 
         let Some(stateful) = stateful else {
             return Ok(None);
@@ -9102,10 +12210,11 @@ impl Store {
             Value,
             Option<String>,
             Option<String>,
-        ) = tx.query_row(
-            "SELECT job_config_id, resources, constraints, permit, network, connect FROM task_config WHERE id = ?;",
-            [task_id],
-            |row| {
+        ) = tx
+            .prepare_cached(
+                "SELECT job_config_id, resources, constraints, permit, network, connect FROM task_config WHERE id = ?;",
+            )?
+            .query_row([task_id], |row| {
                 Ok((
                     row.get(0)?,
                     row.get(1)?,
@@ -9114,8 +12223,7 @@ impl Store {
                     row.get(4)?,
                     row.get(5)?,
                 ))
-            },
-        )?;
+            })?;
 
         let constraint_set = ConstraintSet::new(&constraints)
             .with_context(|| format!("Failed to parse constraints for task {task_id}"))?;
@@ -9618,6 +12726,9 @@ impl Store {
                 allow: service.allow.clone(),
                 meta: service.meta_strings(),
                 port_label: service.port_label().map(str::to_string),
+                mesh_tls: network
+                    .as_ref()
+                    .is_some_and(|network| network.ingress_tls.as_deref() == Some("legion")),
             });
         }
 
@@ -9660,6 +12771,45 @@ impl Store {
             });
         }
         Ok(declared)
+    }
+
+    /// Every task in the latest config of every job that declares
+    /// `connect.upstreams` — the declared half of the service graph.
+    pub fn declared_consumers(&self) -> R<Vec<DeclaredConsumer>> {
+        let conn = self.read_connection()?;
+        let mut stmt = conn.prepare(
+            "SELECT tc.name, tc.connect, tc.job_id
+             FROM task_config tc
+             INNER JOIN job_config jc ON jc.id = tc.job_config_id
+             INNER JOIN (
+                 SELECT job_id, MAX(version) AS version FROM job_config GROUP BY job_id
+             ) latest ON latest.job_id = jc.job_id AND latest.version = jc.version
+             WHERE tc.connect IS NOT NULL;",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (task_name, connect_raw, job_id) = row?;
+            let connect: crate::structs::ConnectConfig = match from_str(&connect_raw) {
+                Ok(connect) => connect,
+                Err(_) => continue,
+            };
+            if connect.upstreams.is_empty() {
+                continue;
+            }
+            out.push(DeclaredConsumer {
+                job_id,
+                task_name,
+                upstreams: connect.upstreams,
+            });
+        }
+        Ok(out)
     }
 
     pub fn allocation_health_for_job_config(
@@ -10126,14 +13276,17 @@ impl Store {
         task_name: &str,
     ) -> R<Option<TaskScale>> {
         let conn = self.read_connection()?;
-        Ok(conn
-            .query_row(
+        let scale = conn
+            .prepare_cached(
                 "SELECT job_id, task_group, task_name, count, pending_count, base_count, source, reason, principal, updated_at \
                  FROM task_scale WHERE job_id = ?1 AND task_group = ?2 AND task_name = ?3;",
+            )?
+            .query_row(
                 params![job_id, task_group, task_name],
                 Self::task_scale_from_row,
             )
-            .optional()?)
+            .optional()?;
+        Ok(scale)
     }
 
     /// Every override row for a job.
@@ -11463,13 +14616,13 @@ impl Store {
     #[instrument(err, skip_all)]
     pub fn count_live_keyed_instances(&self, job_id: &str, group: &str, task_name: &str) -> R<u32> {
         let conn = self.read_connection()?;
-        let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM instance \
-             WHERE job_id = ?1 AND group_name = ?2 AND task_name = ?3 \
-             AND mode = 'keyed' AND state NOT IN ('terminated', 'stopped');",
-            params![job_id, group, task_name],
-            |row| row.get(0),
-        )?;
+        let count: i64 = conn
+            .prepare_cached(
+                "SELECT COUNT(*) FROM instance \
+                 WHERE job_id = ?1 AND group_name = ?2 AND task_name = ?3 \
+                 AND mode = 'keyed' AND state NOT IN ('terminated', 'stopped');",
+            )?
+            .query_row(params![job_id, group, task_name], |row| row.get(0))?;
         Ok(count.max(0) as u32)
     }
 
@@ -11513,14 +14666,16 @@ impl Store {
         exclude_job_config_id: &str,
     ) -> R<u32> {
         let conn = self.read_connection()?;
-        let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM allocation \
-             INNER JOIN instance ON instance.instance_id = allocation.instance_id \
-             WHERE instance.job_id = ?1 AND instance.group_name = ?2 \
-             AND instance.mode = 'slot' AND allocation.job_config_id != ?3;",
-            params![job_id, group, exclude_job_config_id],
-            |row| row.get(0),
-        )?;
+        let count: i64 = conn
+            .prepare_cached(
+                "SELECT COUNT(*) FROM allocation \
+                 INNER JOIN instance ON instance.instance_id = allocation.instance_id \
+                 WHERE instance.job_id = ?1 AND instance.group_name = ?2 \
+                 AND instance.mode = 'slot' AND allocation.job_config_id != ?3;",
+            )?
+            .query_row(params![job_id, group, exclude_job_config_id], |row| {
+                row.get(0)
+            })?;
         Ok(count.max(0) as u32)
     }
 
@@ -11627,13 +14782,186 @@ impl Store {
         self.replicated(Lane::Scheduler, "claim_eval", move |s| s.claim_eval_apply())
     }
 
+    /// Claim a whole batch of evals in ONE scheduler-lane op.
+    ///
+    /// The claim round is a FIXED cost per round, not per eval, so taking N
+    /// evals through it together divides it by N. The AWS phase-3/4 data is
+    /// what makes this worth doing: at 5,000 nodes `web_fleet` (6
+    /// allocations per eval) sustained 219 alloc/s while `dense_fleet` (44
+    /// per eval) sustained 736 — 7x the work per eval bought 3.4x the
+    /// throughput on the same cluster and the same thread count, which is
+    /// the signature of a per-eval cost dominating.
+    ///
+    /// Batch size is a fair share of what is *actually* queued
+    /// ([`EvalBatchLimits`]) and the loop never waits for the batch to
+    /// fill, so an idle cluster still claims exactly one eval and pays
+    /// exactly what it pays today.
+    ///
+    /// Ordering is preserved ACROSS the batch: each pass reuses
+    /// `claim_eval_apply`, which takes the head of `priority DESC, id ASC`,
+    /// so a lower-priority eval is only ever reached after every
+    /// higher-priority one — batching changes how many rounds the queue
+    /// costs, not which eval runs next.
+    #[instrument(err, skip_all)]
+    pub fn claim_evals(&self, limits: EvalBatchLimits) -> R<Vec<Eval>> {
+        self.replicated(Lane::Scheduler, "claim_evals", move |s| {
+            s.claim_evals_apply(limits)
+        })
+    }
+
+    fn claim_evals_apply(&self, limits: EvalBatchLimits) -> R<Vec<Eval>> {
+        let take = {
+            // The WRITE connection, not a read one: inside a capture the
+            // completions this op already applied live in an uncommitted
+            // savepoint that only this connection can see, so a read
+            // connection would size the batch off the previous round's
+            // queue depth.
+            let conn = self.write_connection()?;
+            limits.share_of(Self::pending_eval_count_tx(&conn)?)
+        };
+
+        let mut claimed = Vec::with_capacity(take);
+        for _ in 0..take {
+            // Reused verbatim so a batched claim can never drift from a
+            // single one: same ordering, same superseded-eval sweep, same
+            // queue-depth gauge.
+            match self.claim_eval_apply()? {
+                Some(eval) => claimed.push(eval),
+                // Dry queue. Return what we have instead of waiting for
+                // the batch to fill — this cluster is idle far more often
+                // than it is saturated, and lingering would trade idle
+                // latency for throughput that is not being asked for.
+                None => break,
+            }
+        }
+
+        if claimed.len() > 1 {
+            debug!(
+                claimed = claimed.len(),
+                requested = take,
+                "Claimed a batch of evals in one scheduler-lane op"
+            );
+        }
+        Ok(claimed)
+    }
+
+    /// Settle a whole batch of handled evals AND claim the next batch, in
+    /// ONE scheduler-lane op — the batched form of
+    /// [`Self::complete_and_claim_next`].
+    ///
+    /// `completions` holds an entry for exactly the evals whose outcome the
+    /// caller **observed**. An eval the caller claimed but whose handler
+    /// panicked, was cancelled, or was never reached (leadership moved
+    /// mid-batch) must simply be OMITTED: its row stays `in_flight` and
+    /// `requeue_in_flight_evals` recovers it, which is the same contract
+    /// the single-eval loop has always had. Omission is the only safe
+    /// answer for an unknown outcome — a failed eval is never retried, so
+    /// inventing a failure is how acknowledged work vanishes.
+    ///
+    /// The op is all-or-nothing by construction (`replicated`
+    /// short-circuits inside a capture, so every write lands in one
+    /// changeset). That is deliberate for the *terminal writes*: if the op
+    /// is rejected — a lost leadership, a write error — nothing is written
+    /// and every member of the batch stays `in_flight` for recovery. No
+    /// eval can be half-completed, and none can be completed twice. It is
+    /// NOT plan-apply: the per-plan savepoint isolation that lets one
+    /// rejected plan spare its neighbours lives in `submit_and_apply_plans`
+    /// and is untouched here, because each eval still applies its own plan
+    /// in its own op.
+    #[instrument(err, skip_all)]
+    pub fn complete_evals_and_claim_next(
+        &self,
+        completions: Vec<(String, EvalCompletion)>,
+        limits: EvalBatchLimits,
+    ) -> R<Vec<Eval>> {
+        self.replicated(Lane::Scheduler, "complete_evals_and_claim_next", move |s| {
+            for (eval_id, completion) in completions {
+                s.apply_eval_completion(&eval_id, completion)?;
+            }
+            s.claim_evals_apply(limits)
+        })
+    }
+
+    /// Finish the eval a worker just handled AND claim its next one, in a
+    /// single scheduler-lane op.
+    ///
+    /// The eval worker loop uses the batched
+    /// [`Self::complete_evals_and_claim_next`] instead; this single-eval
+    /// form is the one-at-a-time semantics the batch must preserve, and is
+    /// what the one-shot callers (and the tests that pin those semantics)
+    /// use.
+    ///
+    /// Every eval used to cost two quorum rounds on this lane that had
+    /// nothing to do with the work itself: one to claim it and one to
+    /// finish it. They bracket a loop in which the same worker immediately
+    /// claims again, so the pair is pure queue overhead — and the AWS
+    /// phase-3 campaign put the scheduler lane, not the planner, at the
+    /// throughput ceiling (each eval spent ~86% of its wall time outside
+    /// the measured plan phases). Fusing them halves the lane's
+    /// per-eval round count.
+    ///
+    /// This is sound for the same reason the pieces are: `replicated`
+    /// short-circuits when it is already inside a capture
+    /// ([`Self::replicated`]), so the two writes land in one changeset and
+    /// commit or roll back together. A worker that dies between them
+    /// leaves the current eval `in_flight`, which is exactly the state
+    /// `requeue_in_flight_evals` already recovers — the same window the
+    /// unfused pair had, not a new one.
+    ///
+    /// Returns the next claimable eval, or `None` when the queue is empty
+    /// (or holds only delayed work), in which case the caller parks.
+    #[instrument(err, skip(self, completion))]
+    pub fn complete_and_claim_next(
+        &self,
+        eval_id: &str,
+        completion: EvalCompletion,
+    ) -> R<Option<Eval>> {
+        let eval_id = eval_id.to_owned();
+        self.replicated(Lane::Scheduler, "complete_and_claim_next", move |s| {
+            s.apply_eval_completion(&eval_id, completion)?;
+            s.claim_eval_apply()
+        })
+    }
+
+    /// Write a handled eval's outcome as its own scheduler-lane op, for
+    /// callers with no following claim to fuse it with (see
+    /// [`Self::complete_and_claim_next`], which is what the eval worker
+    /// loop uses).
+    pub fn apply_eval_completion_standalone(
+        &self,
+        eval_id: &str,
+        completion: EvalCompletion,
+    ) -> R<()> {
+        let eval_id = eval_id.to_owned();
+        self.replicated(Lane::Scheduler, "complete_eval", move |s| {
+            s.apply_eval_completion(&eval_id, completion)
+        })
+    }
+
+    /// The terminal write for a handled eval, shared by the fused and
+    /// unfused paths so the two can never drift.
+    fn apply_eval_completion(&self, eval_id: &str, completion: EvalCompletion) -> R<()> {
+        match completion {
+            EvalCompletion::Finished { succeeded, event } => {
+                self.complete_eval_impl(eval_id, succeeded, Some(event))
+            }
+            EvalCompletion::Released {
+                delay,
+                event: Some(event),
+            } => self.release_eval_for_retry_with_event_apply(eval_id, delay, event),
+            EvalCompletion::Released { delay, event: None } => {
+                self.release_eval_for_retry_apply(eval_id, delay)
+            }
+        }
+    }
+
     fn claim_eval_apply(&self) -> R<Option<Eval>> {
         let tx_started = Instant::now();
         let mut conn = self.write_connection()?;
         let tx = Self::write_tx(&mut conn)?;
 
         let eval = tx
-            .query_row(
+            .prepare_cached(
                 "UPDATE eval
                 SET status = 'in_flight'
                 WHERE id = (
@@ -11644,9 +14972,10 @@ impl Store {
                     LIMIT 1
                 )
                 RETURNING id, status, type, job_id, job_config_id, node_id, priority, ready_at;",
-                named_params! {":now": Self::sortable_now()?},
-                |row| self.eval_from_row(row),
-            )
+            )?
+            .query_row(named_params! {":now": Self::sortable_now()?}, |row| {
+                self.eval_from_row(row)
+            })
             .optional()?;
 
         let Some(mut eval) = eval else {
@@ -11671,7 +15000,7 @@ impl Store {
         // Matching on `ready_at` matters because a delayed eval is a timer,
         // not a queued duplicate: a batch task's next scheduled `job_update`
         // must survive an unrelated `job_update` running now.
-        tx.execute(
+        tx.prepare_cached(
             "DELETE FROM eval
             WHERE status = 'pending'
               AND id != :id
@@ -11681,14 +15010,14 @@ impl Store {
                 (:job_id IS NOT NULL AND :job_id != '' AND job_id = :job_id)
                 OR (:node_id IS NOT NULL AND :node_id != '' AND node_id = :node_id)
               );",
-            named_params! {
-                ":id": eval_id,
-                ":type": eval.kind,
-                ":now": Self::sortable_now()?,
-                ":job_id": if eval.job_id.trim().is_empty() { None::<String> } else { Some(eval.job_id.clone()) },
-                ":node_id": if eval.node_name.trim().is_empty() { None::<String> } else { Some(eval.node_name.clone()) },
-            },
-        )?;
+        )?
+        .execute(named_params! {
+            ":id": eval_id,
+            ":type": eval.kind,
+            ":now": Self::sortable_now()?,
+            ":job_id": if eval.job_id.trim().is_empty() { None::<String> } else { Some(eval.job_id.clone()) },
+            ":node_id": if eval.node_name.trim().is_empty() { None::<String> } else { Some(eval.node_name.clone()) },
+        })?;
 
         // Cheapest accurate point for the queue-depth gauge: the claim (and
         // its superseded-eval sweep) just changed the pending count, and the
@@ -11713,6 +15042,47 @@ impl Store {
     // Expose a clone so runtime worker tasks can await wake notifications.
     pub fn eval_notifier(&self) -> Arc<Notify> {
         Arc::clone(&self.eval_notify)
+    }
+
+    /// Install the deferred task_status projection queue and take its
+    /// receiving half. Called once, by the daemon, when it spawns the
+    /// drain task; every later call gets `None`.
+    ///
+    /// Until this is called the projection runs inline inside the plan
+    /// apply, which is the behaviour every test and embedded caller
+    /// already depends on.
+    pub fn install_status_projection_queue(
+        &self,
+    ) -> Option<mpsc::UnboundedReceiver<Vec<Allocation>>> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        match self.status_projection_tx.set(tx) {
+            Ok(()) => Some(rx),
+            Err(_) => None,
+        }
+    }
+
+    /// Apply one drained batch of task_status projections.
+    ///
+    /// Separate from [`Self::update_task_statuses_for_allocations`] only so
+    /// the drain task has an entry point that owns the same
+    /// "derivable, so a foreign-lane rejection is not fatal" rule the
+    /// inline path has.
+    pub fn project_task_statuses(&self, placed: &[Allocation]) -> R<()> {
+        if placed.is_empty() {
+            return Ok(());
+        }
+        if let Err(err) = self.update_task_statuses_for_allocations(placed) {
+            if !crate::storage::raft::driver::NotRaftLeader::in_chain(&err) {
+                return Err(err);
+            }
+            warn!(
+                allocations = placed.len(),
+                error = %err,
+                "status-lane task_status projection skipped: this node does not lead the \
+                 status lane; worker reports and the status leader's reconciler converge them"
+            );
+        }
+        Ok(())
     }
 
     // Returns how long until the earliest pending eval becomes claimable.
@@ -11762,11 +15132,14 @@ impl Store {
             .set(pending);
 
         if updated > 0 && !capture::in_capture() {
-            // Recovery moved work from in_flight->pending; wake all waiters.
-            // Under capture the rows are not committed yet, so the wake is
-            // deferred to apply time — `project_changeset_side_effects`
-            // notifies on any eval change, on every replica (JC-11/JC-41).
-            self.eval_notify.notify_waiters();
+            // Recovery moved work from in_flight->pending; wake one worker
+            // per recovered eval. Under capture the rows are not committed
+            // yet, so the wake is deferred to apply time —
+            // `project_changeset_side_effects` counts the same transition on
+            // every replica (JC-11/JC-41).
+            for _ in 0..updated {
+                self.eval_notify.notify_one();
+            }
         }
 
         Ok(updated as u64)
@@ -11856,10 +15229,14 @@ impl Store {
             let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
             Self::collect_rows(rows)?
         };
-        for (job_id, to_config) in rollout_targets {
-            self.enqueue_eval("rollout_tick", Some(&job_id), Some(&to_config), None, None)?;
-            enqueued += 1;
-        }
+        // One op for the whole fan-out. This runs on every leadership
+        // acquisition, so on a large cluster it was one quorum round per
+        // mid-flight rollout before the new leader could do anything else.
+        let rollout_requests: Vec<EvalRequest> = rollout_targets
+            .iter()
+            .map(|(job_id, to_config)| EvalRequest::for_job("rollout_tick", job_id, to_config))
+            .collect();
+        enqueued += self.enqueue_evals(rollout_requests)?.len() as u64;
 
         // Active jobs without a live rollout.
         let job_targets: Vec<(String, Option<String>, bool)> = {
@@ -11888,6 +15265,7 @@ impl Store {
             })?;
             Self::collect_rows(rows)?
         };
+        let mut job_requests: Vec<EvalRequest> = Vec::new();
         for (job_id, latest_config, restart_requested) in job_targets {
             let Some(latest_config) = latest_config else {
                 continue;
@@ -11939,9 +15317,12 @@ impl Store {
                     }
                 }
             };
-            self.enqueue_eval(kind, Some(&job_id), Some(&latest_config), None, None)?;
-            enqueued += 1;
+            job_requests.push(EvalRequest::for_job(kind, &job_id, &latest_config));
         }
+        // Flushed once rather than per job. The loop body above has its own
+        // side effects (stale-config migration and cleanup) that must stay
+        // interleaved, so only the enqueues are batched.
+        enqueued += self.enqueue_evals(job_requests)?.len() as u64;
 
         // Stopped jobs whose teardown tail was lost with the old leader.
         let stop_targets: Vec<(String, Option<String>)> = {
@@ -11974,16 +15355,18 @@ impl Store {
             let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
             Self::collect_rows(rows)?
         };
-        for (job_id, job_config_id) in stop_targets {
-            self.enqueue_eval(
-                "job_stop",
-                Some(&job_id),
-                job_config_id.as_deref(),
-                None,
-                None,
-            )?;
-            enqueued += 1;
-        }
+        let stop_requests: Vec<EvalRequest> = stop_targets
+            .iter()
+            .map(|(job_id, job_config_id)| EvalRequest {
+                kind: "job_stop".to_owned(),
+                job_id: Some(job_id.clone()),
+                job_config_id: job_config_id.clone(),
+                node_id: None,
+                priority: None,
+                delay: Duration::ZERO,
+            })
+            .collect();
+        enqueued += self.enqueue_evals(stop_requests)?.len() as u64;
 
         let drained_nodes: Vec<String> = {
             let conn = self.read_connection()?;
@@ -12016,14 +15399,28 @@ impl Store {
             drop(stmt);
             nodes
         };
-        for node_id in drained_nodes {
-            self.enqueue_eval("node_drain", None, None, Some(&node_id), None)?;
-            enqueued += 1;
-        }
-        for node_id in lost_nodes {
-            self.enqueue_eval("node_lost_reschedule", None, None, Some(&node_id), None)?;
-            enqueued += 1;
-        }
+        // Both node fan-outs in one op. This is the storm path: an AZ loss
+        // is ~33% of a fleet, so `lost_nodes` alone was thousands of
+        // quorum rounds on the scheduler lane before a new leader could
+        // schedule anything.
+        let node_requests: Vec<EvalRequest> = drained_nodes
+            .iter()
+            .map(|node_id| (node_id, "node_drain"))
+            .chain(
+                lost_nodes
+                    .iter()
+                    .map(|node_id| (node_id, "node_lost_reschedule")),
+            )
+            .map(|(node_id, kind)| EvalRequest {
+                kind: kind.to_owned(),
+                job_id: None,
+                job_config_id: None,
+                node_id: Some(node_id.clone()),
+                priority: None,
+                delay: Duration::ZERO,
+            })
+            .collect();
+        enqueued += self.enqueue_evals(node_requests)?.len() as u64;
         Ok(enqueued)
     }
 
@@ -12073,11 +15470,9 @@ impl Store {
     /// `legion_eval_queue_depth` gauge accurate at the points where the
     /// pending set changes (enqueue, claim, startup requeue).
     fn pending_eval_count_tx(conn: &Connection) -> R<i64> {
-        Ok(conn.query_row(
-            "SELECT COUNT(*) FROM eval WHERE status = 'pending';",
-            [],
-            |row| row.get(0),
-        )?)
+        Ok(conn
+            .prepare_cached("SELECT COUNT(*) FROM eval WHERE status = 'pending';")?
+            .query_row([], |row| row.get(0))?)
     }
 
     #[instrument(err, skip_all)]
@@ -12198,9 +15593,11 @@ impl Store {
         let tx = Self::write_tx(&mut conn)?;
 
         if succeeded {
-            tx.execute("DELETE FROM eval WHERE id = ?;", [eval_id])?;
+            tx.prepare_cached("DELETE FROM eval WHERE id = ?;")?
+                .execute([eval_id])?;
         } else {
-            tx.execute("UPDATE eval SET status = 'failed' WHERE id = ?;", [eval_id])?;
+            tx.prepare_cached("UPDATE eval SET status = 'failed' WHERE id = ?;")?
+                .execute([eval_id])?;
         }
         let staged = event.and_then(|draft| self.stage_event_locked(&tx, draft));
         tx.commit()?;
@@ -12233,6 +15630,29 @@ impl Store {
         )
     }
 
+    /// Enqueue one eval, group-committing with whatever other enqueues are
+    /// in flight.
+    ///
+    /// This is the scheduler-lane half of the job-intake composite, and on
+    /// the AWS 5,000-node run it was the single busiest replicated op in the
+    /// system (19.1 applied/s against 21.9 evals/s) for one reason: it is
+    /// one quorum round per submitted job, and the client submits jobs
+    /// concurrently. The eval loop's own bookkeeping had already been
+    /// batched (`complete_evals_and_claim_next`, 0.19 rounds/eval); the
+    /// intake path had not.
+    ///
+    /// Concurrent callers therefore coalesce (`storage/coalesce.rs`):
+    /// enqueues that arrive while a commit is in flight ride the next
+    /// batch as ONE scheduler-lane op, each row fenced by its own savepoint.
+    /// There is no timer and no linger — a lone caller on an idle cluster
+    /// goes straight to the commit slot and takes the single-enqueue path
+    /// below, unchanged and no slower than before.
+    ///
+    /// Queue semantics are untouched. `claim_eval` orders by
+    /// `priority DESC, id ASC`; the coalescer's queue is FIFO and its leader
+    /// drains from the front, so a batch inserts in arrival order and each
+    /// row still derives its own priority (explicit override, else the job's
+    /// band) inside its own savepoint.
     pub fn enqueue_eval_after_delay(
         &self,
         kind: &str,
@@ -12242,26 +15662,59 @@ impl Store {
         priority: Option<i64>,
         delay: Duration,
     ) -> R<Eval> {
-        // Forwarding wrapper (plan §8, D2): the enqueue is the scheduler
-        // half of many composites (RPC submit tails, failure-report
-        // reschedules, drain evictions). Regeneration re-derives lost
-        // enqueues eventually; forwarding lands them immediately, from any
-        // node.
-        match self.enqueue_eval_after_delay_local(
+        let request = EvalRequest {
+            kind: kind.to_owned(),
+            job_id: job_id.map(str::to_owned),
+            job_config_id: job_config_id.map(str::to_owned),
+            node_id: node_id.map(str::to_owned),
+            priority,
+            delay,
+        };
+        // An enqueue raised from INSIDE another op's capture must stay part
+        // of that capture (`replicated` short-circuits there, which is how
+        // composites fuse into one changeset). Routing it through the
+        // coalescer would hand it to a leader that needs the very lane
+        // pipeline this caller is holding — a deadlock, not a slow path.
+        if capture::in_capture() || capture::in_apply() || !self.job_intake_coalescing_enabled() {
+            return self.enqueue_eval_forwarding(request);
+        }
+        let coalescer = Arc::clone(&self.eval_enqueue_coalescer);
+        coalescer.submit(request, |batch| self.run_eval_enqueue_batch(batch))
+    }
+
+    /// The single-enqueue op with leader forwarding — the group commit's
+    /// batch-of-one fast path, its not-the-leader fallback, and the
+    /// `job_intake_coalescing: false` path. Exactly the pre-batching
+    /// operation.
+    fn enqueue_eval_forwarding(&self, request: EvalRequest) -> R<Eval> {
+        let EvalRequest {
             kind,
             job_id,
             job_config_id,
             node_id,
             priority,
             delay,
+        } = request;
+        // Forwarding wrapper (plan §8, D2): the enqueue is the scheduler
+        // half of many composites (RPC submit tails, failure-report
+        // reschedules, drain evictions). Regeneration re-derives lost
+        // enqueues eventually; forwarding lands them immediately, from any
+        // node.
+        match self.enqueue_eval_after_delay_local(
+            &kind,
+            job_id.as_deref(),
+            job_config_id.as_deref(),
+            node_id.as_deref(),
+            priority,
+            delay,
         ) {
             Err(err) if crate::storage::raft::driver::NotRaftLeader::in_chain(&err) => self
                 .forward_after_rejection(
                     crate::storage::raft::forward::ForwardableLaneWrite::EnqueueEval {
-                        kind: kind.to_owned(),
-                        job_id: job_id.map(str::to_owned),
-                        job_config_id: job_config_id.map(str::to_owned),
-                        node_id: node_id.map(str::to_owned),
+                        kind,
+                        job_id,
+                        job_config_id,
+                        node_id,
                         priority,
                         delay_ms: delay.as_millis() as u64,
                     },
@@ -12269,6 +15722,115 @@ impl Store {
                 ),
             other => other,
         }
+    }
+
+    /// Batch leader body for the eval-enqueue group commit: every drained
+    /// enqueue in ONE scheduler-lane op.
+    ///
+    /// **Failure isolation.** Each request runs through
+    /// `enqueue_eval_after_delay_apply`, which opens and commits its own
+    /// savepoint, so a request that fails (an unrepresentable delay, a
+    /// constraint violation) rolls back alone and its batch-mates still
+    /// commit — one bad `job run` cannot take down the 31 submitted
+    /// alongside it. That is why the op returns `Vec<R<Eval>>` rather than
+    /// the all-or-nothing `R<Vec<Eval>>` [`Self::enqueue_evals`] gives its
+    /// fan-out callers.
+    ///
+    /// **Not-the-leader.** A typed rejection means this node does not lead
+    /// the scheduler lane, and nothing was proposed. Every request then
+    /// takes the single-enqueue forwarding path individually — slower, but
+    /// it is the wire op every manager version understands, and it keeps
+    /// the typed `NotRaftLeader` in each caller's own error chain, which is
+    /// what the submit path's standing-split tolerance matches on.
+    ///
+    /// **Any other batch failure** is reported to every member rather than
+    /// re-run: unlike a local rejection, an error out of `replicated` can
+    /// straddle a commit (a leadership race after the propose), and
+    /// re-running would risk enqueueing the batch twice. A duplicate eval is
+    /// only wasted work, but a spurious one is still a lie about what the
+    /// caller's write did.
+    fn run_eval_enqueue_batch(&self, batch: Vec<EvalRequest>) -> Vec<R<Eval>> {
+        if batch.len() == 1 {
+            let request = batch.into_iter().next().expect("length checked");
+            return vec![self.enqueue_eval_forwarding(request)];
+        }
+        let size = batch.len();
+        let forwarded = batch.clone();
+        match self.replicated(Lane::Scheduler, "enqueue_evals_isolated", move |s| {
+            Ok(s.enqueue_evals_isolated_apply(&batch))
+        }) {
+            Ok(results) => results,
+            Err(err) if crate::storage::raft::driver::NotRaftLeader::in_chain(&err) => {
+                debug!(
+                    batch = size,
+                    "Batched eval enqueue rejected by the scheduler lane; forwarding each enqueue"
+                );
+                forwarded
+                    .into_iter()
+                    .map(|request| self.enqueue_eval_forwarding(request))
+                    .collect()
+            }
+            Err(err) => {
+                // `anyhow::Error` is not `Clone`, and every member is owed
+                // its own result, so the shared cause travels as text.
+                let message = format!("batched eval enqueue failed: {err:#}");
+                warn!(batch = size, error = %err, "Batched eval enqueue failed");
+                (0..size).map(|_| Err(anyhow!(message.clone()))).collect()
+            }
+        }
+    }
+
+    /// The group commit's op body: every batched request applied in its own
+    /// savepoint, one result each, in request order. Insert order is arrival
+    /// order, so the `id ASC` half of the claim ordering matches what
+    /// unbatched submitters would have produced.
+    fn enqueue_evals_isolated_apply(&self, batch: &[EvalRequest]) -> Vec<R<Eval>> {
+        batch
+            .iter()
+            .map(|request| {
+                self.enqueue_eval_after_delay_apply(
+                    &request.kind,
+                    request.job_id.as_deref(),
+                    request.job_config_id.as_deref(),
+                    request.node_id.as_deref(),
+                    request.priority,
+                    request.delay,
+                )
+            })
+            .collect()
+    }
+
+    /// Enqueue many evals in ONE scheduler-lane op.
+    ///
+    /// Every enqueue used to be its own quorum round, which is what made
+    /// fan-out loops expensive rather than merely numerous: a leadership
+    /// change runs `regenerate_scheduling_evals` over every active job,
+    /// and a node-loss storm raises one per affected job config (phase 2
+    /// measured 5,760 reschedule evals against 2,503 submissions). The
+    /// rows are independent, so batching them changes only how many times
+    /// quorum is paid.
+    ///
+    /// Returns the created evals in request order. An empty request list
+    /// proposes nothing.
+    pub fn enqueue_evals(&self, requests: Vec<EvalRequest>) -> R<Vec<Eval>> {
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.replicated(Lane::Scheduler, "enqueue_evals", move |s| {
+            requests
+                .iter()
+                .map(|request| {
+                    s.enqueue_eval_after_delay_apply(
+                        &request.kind,
+                        request.job_id.as_deref(),
+                        request.job_config_id.as_deref(),
+                        request.node_id.as_deref(),
+                        request.priority,
+                        request.delay,
+                    )
+                })
+                .collect()
+        })
     }
 
     pub(crate) fn enqueue_eval_after_delay_local(
@@ -13151,7 +16713,7 @@ impl Store {
             version: row.get::<_, i64>(1)? as u32,
             latest_version: row.get::<_, i64>(7)? as u32,
             description: row.get(3)?,
-            source_jsonnet: row.get(2)?,
+            source_nickel: row.get(2)?,
             variables,
             created_at: row.get(5)?,
             created_by: row.get(6)?,
@@ -13165,7 +16727,7 @@ impl Store {
         &self,
         name: &str,
         description: Option<&str>,
-        source_jsonnet: &str,
+        source_nickel: &str,
         variables: &[JobTemplateVariableRecord],
         created_by: &str,
     ) -> R<JobTemplateVersionRecord> {
@@ -13199,19 +16761,19 @@ impl Store {
             },
         )?;
         tx.execute(
-            "INSERT INTO job_template_version (template_name, version, description, source_jsonnet, variables, created_by, created_at) VALUES (:name, :version, :description, :source, :variables, :created_by, :now);",
+            "INSERT INTO job_template_version (template_name, version, description, source_nickel, variables, created_by, created_at) VALUES (:name, :version, :description, :source, :variables, :created_by, :now);",
             named_params! {
                 ":name": name,
                 ":version": next_version,
                 ":description": description,
-                ":source": source_jsonnet,
+                ":source": source_nickel,
                 ":variables": variables_json,
                 ":created_by": created_by,
                 ":now": now,
             },
         )?;
         let stored = tx.query_row(
-            "SELECT tv.template_name, tv.version, tv.source_jsonnet, tv.description, tv.variables, tv.created_at, tv.created_by, t.latest_version
+            "SELECT tv.template_name, tv.version, tv.source_nickel, tv.description, tv.variables, tv.created_at, tv.created_by, t.latest_version
              FROM job_template_version tv
              INNER JOIN job_template t ON t.name = tv.template_name
              WHERE tv.template_name = ? AND tv.version = ?;",
@@ -13230,7 +16792,7 @@ impl Store {
         version: Option<u32>,
     ) -> R<JobTemplateVersionRecord> {
         let conn = self.read_connection()?;
-        let base = "SELECT tv.template_name, tv.version, tv.source_jsonnet, tv.description, tv.variables, tv.created_at, tv.created_by, t.latest_version
+        let base = "SELECT tv.template_name, tv.version, tv.source_nickel, tv.description, tv.variables, tv.created_at, tv.created_by, t.latest_version
              FROM job_template_version tv
              INNER JOIN job_template t ON t.name = tv.template_name
              WHERE tv.template_name = ?";
@@ -14231,7 +17793,7 @@ impl Store {
     #[instrument(err, skip_all)]
     pub fn pinned_placements_for_task(&self, task_id: i64) -> R<Vec<(String, String)>> {
         let conn = self.read_connection()?;
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT instance.instance_id, volume.node_id \
              FROM instance \
              INNER JOIN volume ON volume.instance_id = instance.instance_id \
@@ -14390,7 +17952,7 @@ fn claim_volume_id(job_id: &str, group: &str, task: &str, name: &str) -> String 
     format!("claim-{label}-{}", &digest[..12])
 }
 
-/// Parse a JSONB object column into a sorted map, tolerating NULL and
+/// Parse a JSON object column into a sorted map, tolerating NULL and
 /// non-object values (both become empty).
 fn parse_json_map_column(
     idx: usize,
@@ -14454,6 +18016,245 @@ mod tests {
     use crate::manager::scheduler::{PlanMode, Scheduler};
     use rusqlite::params;
     use tempfile::Builder;
+
+    /// Both connection kinds get a page cache big enough to hold a real
+    /// cluster's hot tables. SQLite's 2 MiB default made the plan-apply phase
+    /// cliff from 21 ms to 354 ms per eval between 25,000 and 100,000
+    /// allocations on the 2026-08-05 AWS campaign.
+    /// A repeated health check must not reach the write path.
+    ///
+    /// It produced an EMPTY changeset and so never reached quorum, but the
+    /// apply still took the write connection — the one the serialized
+    /// plan-apply commit needs — ran the upsert, re-read the node and
+    /// refreshed its cache. The AWS campaign measured 134 of these a second
+    /// against a 5,000-node fleet, all of them contending with scheduling.
+    #[test]
+    fn a_repeated_health_check_does_not_take_the_write_path() -> R<()> {
+        let store = setup_store()?;
+        let mut msg = crate::structs::NodeMsg::default();
+        msg.id = "hc-node".into();
+        msg.status = "ready".into();
+        msg.config_attrs = "{}".into();
+        msg.fingerprint_attrs = "{}".into();
+        msg.dynamic_attrs = "{}".into();
+        msg.health_checks = "{}".into();
+        store.insert_node(msg)?;
+
+        // First report is a real change and must be written.
+        store.update_node_health_checks("hc-node", "{\"disk\":\"ok\"}")?;
+        assert!(store.node_health_checks_unchanged("hc-node", "{\"disk\":\"ok\"}")?);
+
+        // A different value is still a change.
+        assert!(!store.node_health_checks_unchanged("hc-node", "{\"disk\":\"full\"}")?);
+        store.update_node_health_checks("hc-node", "{\"disk\":\"full\"}")?;
+        assert!(store.node_health_checks_unchanged("hc-node", "{\"disk\":\"full\"}")?);
+
+        // A node with no health row yet must NOT be treated as unchanged, or
+        // its first report would be dropped.
+        assert!(!store.node_health_checks_unchanged("never-reported", "{}")?);
+        Ok(())
+    }
+
+    /// The property that makes job submits batchable at all: version
+    /// derivation reads THROUGH the batch transaction, so two submits of
+    /// the SAME job in one batch derive successive versions instead of
+    /// both computing N+1 — which is exactly the race the old
+    /// read-connection derivation carried (its own comment admitted it)
+    /// and the reason the intake work originally declined to batch this
+    /// op.
+    #[test]
+    fn same_job_submits_in_one_batch_derive_successive_versions() -> R<()> {
+        let store = setup_store()?;
+        let v1 = JobConfig {
+            priority: Default::default(),
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "batched-job".into(),
+            tasks: vec![TaskConfig {
+                count: TaskCount::new(1),
+                ..TaskConfig::new("api", "noop")
+            }],
+            version: None,
+        };
+        let mut v2 = v1.clone();
+        v2.tasks[0].count = TaskCount::new(2);
+        let sub = |n: &str| Submission {
+            path: format!("{n}.ncl"),
+            content: format!("job {n}"),
+            is_primary: true,
+        };
+        let batch = vec![
+            JobSubmitRequest {
+                config: v1,
+                subs: vec![sub("v1")],
+                template: None,
+            },
+            JobSubmitRequest {
+                config: v2,
+                subs: vec![sub("v2")],
+                template: None,
+            },
+        ];
+        let results = store.handle_job_submits_apply(&batch);
+        assert_eq!(results.len(), 2);
+        let first = results[0].as_ref().expect("first submit");
+        let second = results[1].as_ref().expect("second submit");
+        assert!(matches!(first, JobSubmitOutcome::Created { .. }));
+        assert!(
+            matches!(second, JobSubmitOutcome::Updated { .. }),
+            "the second same-job submit must see the first's in-transaction write"
+        );
+        let latest = store
+            .get_job_config_optional("batched-job")?
+            .expect("stored config");
+        assert_eq!(
+            latest.version,
+            Some(2),
+            "versions must be successive, not racing duplicates of 1"
+        );
+
+        // A failing member must roll back alone: an unparseable config (a
+        // task count of zero is normalized fine, so use a duplicate
+        // identical config which reports Unchanged — a benign case) plus a
+        // fresh job around it still commits.
+        let unchanged = JobSubmitRequest {
+            config: latest.clone(),
+            subs: vec![sub("v2")],
+            template: None,
+        };
+        let fresh = JobSubmitRequest {
+            config: JobConfig {
+                priority: Default::default(),
+                rollout: None,
+                rollout_by_group: Default::default(),
+                name: "batched-other".into(),
+                tasks: vec![TaskConfig {
+                    count: TaskCount::new(1),
+                    ..TaskConfig::new("api", "noop")
+                }],
+                version: None,
+            },
+            subs: vec![sub("other")],
+            template: None,
+        };
+        let results = store.handle_job_submits_apply(&[unchanged, fresh]);
+        assert!(matches!(
+            results[0].as_ref().expect("unchanged"),
+            JobSubmitOutcome::Unchanged { .. }
+        ));
+        assert!(matches!(
+            results[1].as_ref().expect("fresh"),
+            JobSubmitOutcome::Created { .. }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn connections_raise_the_page_cache_off_the_sqlite_default() -> R<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("cache.sqlite");
+
+        // Read-only connections have to be configured against a database that
+        // already exists, so make it with the write path first.
+        let writer = Connection::open(&path)?;
+        Store::configure_connection(&writer, false, false)?;
+        let cached: i64 = writer.query_row("PRAGMA cache_size;", [], |r| r.get(0))?;
+        assert_eq!(
+            cached, SQLITE_CACHE_SIZE_KIB,
+            "the write connection must carry an explicit page cache, not SQLite's 2 MiB default"
+        );
+
+        let reader = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        Store::configure_connection(&reader, true, false)?;
+        let cached: i64 = reader.query_row("PRAGMA cache_size;", [], |r| r.get(0))?;
+        assert_eq!(
+            cached, SQLITE_CACHE_SIZE_KIB,
+            "read connections serve the scheduler's hot path and need the cache most"
+        );
+        Ok(())
+    }
+
+    /// The read pool is sized from the readers the manager runs, not from
+    /// the host's core count. The four properties that matter:
+    ///
+    /// 1. it tracks `evalThreads` (the eval workers are the concurrent
+    ///    readers whose queueing would matter), with headroom for the
+    ///    heartbeat/RPC/telemetry readers that do not come from that pool;
+    /// 2. it is capped, because each connection carries its own 64 MiB
+    ///    page-cache cap and those caches do not share;
+    /// 3. it never collapses to a serialization point, whatever an
+    ///    operator writes in the config; and
+    /// 4. it is decoupled from the tokio runtime's width, which is the
+    ///    structural reason the core count was the wrong basis.
+    ///
+    /// Note what is deliberately NOT asserted: any relationship to
+    /// throughput. The 2026-08-05 sweep placed 251.68 alloc/s at 32 eval
+    /// threads with only four connections, so this rule is a correction to
+    /// the sizing *argument* and a bounded hedge, not a performance claim.
+    #[test]
+    fn read_pool_is_sized_from_readers_and_capped_by_page_cache() {
+        // Tracks evalThreads with headroom. The AWS campaign's managers
+        // are 4-vCPU, so the old core-count rule gave exactly 4 whether
+        // the operator ran 4 eval workers or 32.
+        assert_eq!(read_only_conn_pool_size(4), 4 + READ_POOL_SERVING_HEADROOM);
+        assert_eq!(
+            read_only_conn_pool_size(8),
+            8 + READ_POOL_SERVING_HEADROOM,
+            "raising evalThreads must raise the pool with it — under the old \
+             rule both of these were the core count"
+        );
+
+        // Capped by memory, not by an observed knee: 64 eval workers do
+        // not get 64 x 64 MiB of page cache. The sweep ran 64 threads but
+        // its load generator, not Legion, was the constraint there, so
+        // nobody has seen where read concurrency stops paying.
+        assert_eq!(read_only_conn_pool_size(64), READ_POOL_MAX);
+        assert_eq!(read_only_conn_pool_size(usize::MAX), READ_POOL_MAX);
+
+        // Never a serialization point, even at evalThreads = 0.
+        assert_eq!(read_only_conn_pool_size(0), 1 + READ_POOL_SERVING_HEADROOM);
+        assert!(
+            read_only_conn_pool_size(1) >= 4,
+            "the floor that keeps a small host off the two-connection cliff"
+        );
+
+        // On the manager sizes this actually runs on, the pool is strictly
+        // wider than the tokio runtime. Heartbeat reads run inline on
+        // runtime threads, so a pool the same size as the core count lets
+        // read queueing turn straight into a parked runtime. No cell has
+        // been observed doing that — this asserts the coupling is gone by
+        // construction rather than fixing a measured failure.
+        for cores in 1..=(READ_POOL_MAX - READ_POOL_SERVING_HEADROOM) {
+            assert!(
+                read_only_conn_pool_size(cores) > cores,
+                "with the default evalThreads = available_parallelism(), a \
+                 {cores}-core manager must get more connections than runtime \
+                 threads"
+            );
+        }
+
+        // Monotonic, so the rule cannot surprise an operator who turns
+        // evalThreads up.
+        for threads in 0..(READ_POOL_MAX * 2) {
+            assert!(
+                read_only_conn_pool_size(threads + 1) >= read_only_conn_pool_size(threads),
+                "pool size must not shrink as evalThreads grows (at {threads})"
+            );
+        }
+
+        // The cap is a memory budget, so state it as one: the pool's
+        // worst-case page cache stays at or under 1 GiB. If
+        // SQLITE_CACHE_SIZE_KIB grows, this is what forces READ_POOL_MAX
+        // to be reconsidered rather than silently multiplying.
+        const ONE_GIB_IN_KIB: i64 = 1024 * 1024;
+        let worst_case_kib = READ_POOL_MAX as i64 * -SQLITE_CACHE_SIZE_KIB;
+        assert!(
+            worst_case_kib <= ONE_GIB_IN_KIB,
+            "{READ_POOL_MAX} connections x {} KiB of page cache = {worst_case_kib} KiB, \
+             over the 1 GiB budget the cap exists to hold",
+            -SQLITE_CACHE_SIZE_KIB
+        );
+    }
 
     /// Adversarial regression (durability past the purge horizon): in raft
     /// mode the state DB must run `synchronous = FULL` — raft purges its log
@@ -14546,6 +18347,7 @@ mod tests {
             pool: "default".into(),
             availability: "available".into(),
             last_heartbeat: "2023-01-01T00:00:00Z".into(),
+            heartbeat_source: String::new(),
             config_attrs: json!({}),
             fingerprint_attrs: json!({}),
             dynamic_attrs: json!({}),
@@ -14564,6 +18366,7 @@ mod tests {
             dynamic_attrs: "{}".into(),
             health_checks: "{}".into(),
             last_heartbeat: "2023-01-01 00:00:00 +00:00:00".into(),
+            heartbeat_source: String::new(),
         }
     }
 
@@ -14825,6 +18628,31 @@ mod tests {
         for handle in handles {
             handle.join().expect("heartbeat thread panicked")?;
         }
+        // A steady-state heartbeat costs NO replicated commit (liveness plan
+        // §6.1): every beat lands in the in-memory table, and the database
+        // timestamp columns are refreshed only by the display checkpoint.
+        assert_eq!(store.liveness().tracked(), 16);
+        let conn = store.read_connection()?;
+        let stamped: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM node_health
+             WHERE node_id LIKE 'hb-conc-%' AND last_heartbeat_unix IS NOT NULL;",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            stamped, 0,
+            "heartbeats must not reach the raft path in steady state"
+        );
+
+        // The checkpoint is what makes the column readable on any manager,
+        // and it records the OBSERVED time rather than the write time.
+        let beats: Vec<(String, i64)> = store
+            .liveness()
+            .snapshot()
+            .into_iter()
+            .map(|(id, beat)| (id, beat.unix))
+            .collect();
+        store.checkpoint_node_heartbeats(&beats)?;
         let conn = store.read_connection()?;
         let stamped: i64 = conn.query_row(
             "SELECT COUNT(*) FROM node_health
@@ -14917,7 +18745,7 @@ mod tests {
             version: None,
         };
         let submission = Submission {
-            path: "pool-prop.jsonnet".into(),
+            path: "pool-prop.ncl".into(),
             content: "{}".into(),
             is_primary: true,
         };
@@ -14988,8 +18816,13 @@ mod tests {
             vec![("node-one".to_string(), String::new(), None)]
         );
 
-        // ...and the first heartbeat (an upsert) creates the row again.
+        // ...and the first CHECKPOINT (an upsert) creates the row again.
+        // The heartbeat itself no longer writes: it lands in the in-memory
+        // liveness table, and the checkpoint replicates what was observed
+        // (liveness plan §6.5).
         store.update_node_heartbeat("node-one".to_string())?;
+        let beat = store.liveness().last_beat("node-one").context("observed")?;
+        store.checkpoint_node_heartbeats(&[("node-one".to_string(), beat.unix)])?;
         let recreated: i64 = {
             let conn = store.read_connection()?;
             conn.query_row(
@@ -15081,7 +18914,7 @@ mod tests {
         store.handle_job_submit(
             &job,
             &[Submission {
-                path: "job.jsonnet".into(),
+                path: "job.ncl".into(),
                 content: "{}".into(),
                 is_primary: true,
             }],
@@ -15128,7 +18961,7 @@ mod tests {
         store.handle_job_submit(
             &job,
             &[Submission {
-                path: "job.jsonnet".into(),
+                path: "job.ncl".into(),
                 content: "{}".into(),
                 is_primary: true,
             }],
@@ -15153,7 +18986,7 @@ mod tests {
         store.handle_job_submit(
             &job,
             &[Submission {
-                path: "job.jsonnet".into(),
+                path: "job.ncl".into(),
                 content: "{}".into(),
                 is_primary: true,
             }],
@@ -15181,7 +19014,7 @@ mod tests {
         store.handle_job_submit(
             &job,
             &[Submission {
-                path: "job.jsonnet".into(),
+                path: "job.ncl".into(),
                 content: "{}".into(),
                 is_primary: true,
             }],
@@ -15228,7 +19061,7 @@ mod tests {
         store.handle_job_submit(
             &job,
             &[Submission {
-                path: "job.jsonnet".into(),
+                path: "job.ncl".into(),
                 content: "{}".into(),
                 is_primary: true,
             }],
@@ -15259,7 +19092,7 @@ mod tests {
         store.handle_job_submit(
             &updated_job,
             &[Submission {
-                path: "job.jsonnet".into(),
+                path: "job.ncl".into(),
                 content: "{}".into(),
                 is_primary: true,
             }],
@@ -15403,7 +19236,7 @@ mod tests {
         store.handle_job_submit(
             &job,
             &[Submission {
-                path: "job.jsonnet".into(),
+                path: "job.ncl".into(),
                 content: "{}".into(),
                 is_primary: true,
             }],
@@ -15701,12 +19534,12 @@ mod tests {
     #[test]
     fn handle_job_submit_adds_new_job() -> R<()> {
         let sub_one = Submission {
-            path: "sub-1.jsonnet".into(),
+            path: "sub-1.ncl".into(),
             content: "sub-1".into(),
             is_primary: true,
         };
         let sub_two = Submission {
-            path: "sub-2.libsonnet".into(),
+            path: "sub-2.ncl".into(),
             content: "sub-2".into(),
             is_primary: false,
         };
@@ -15814,7 +19647,7 @@ mod tests {
         let result = store.handle_job_submit(
             &job_config,
             &[Submission {
-                path: "sub-1.jsonnet".into(),
+                path: "sub-1.ncl".into(),
                 content: "sub-1".into(),
                 is_primary: true,
             }],
@@ -15830,7 +19663,7 @@ mod tests {
     #[test]
     fn handle_job_submit_updates_job_properly() -> R<()> {
         let orib_sub = Submission {
-            path: "sub-1.jsonnet".into(),
+            path: "sub-1.ncl".into(),
             content: "sub-1".into(),
             is_primary: true,
         };
@@ -16012,7 +19845,7 @@ mod tests {
             version: None,
         };
         let job_one_subs = vec![Submission {
-            path: "job-one-sub.jsonnet".into(),
+            path: "job-one-sub.ncl".into(),
             content: "job-one".into(),
             is_primary: true,
         }];
@@ -16037,7 +19870,7 @@ mod tests {
             version: None,
         };
         let job_two_subs = vec![Submission {
-            path: "job-two-sub.jsonnet".into(),
+            path: "job-two-sub.ncl".into(),
             content: "job-two".into(),
             is_primary: true,
         }];
@@ -16113,12 +19946,12 @@ mod tests {
 
         let submissions = vec![
             Submission {
-                path: "sub-1.jsonnet".into(),
+                path: "sub-1.ncl".into(),
                 content: "sub-1".into(),
                 is_primary: true,
             },
             Submission {
-                path: "sub-2.jsonnet".into(),
+                path: "sub-2.ncl".into(),
                 content: "sub-2".into(),
                 is_primary: false,
             },
@@ -16179,7 +20012,7 @@ mod tests {
         let store = setup_store()?;
 
         let shared_submission = Submission {
-            path: "shared.jsonnet".into(),
+            path: "shared.ncl".into(),
             content: "shared-content".into(),
             is_primary: true,
         };
@@ -16240,6 +20073,41 @@ mod tests {
         assert_eq!(job_two_submission_refs, 1);
 
         Ok(())
+    }
+
+    /// The batch a worker takes is a fair SHARE of the live queue, never a
+    /// greedy grab: with N workers sharing one queue, a worker that
+    /// vacuumed a burst would serialize work its idle peers could have run
+    /// in parallel. The important boundary is the low end — a shallow queue
+    /// must yield a batch of exactly one, so an idle cluster behaves
+    /// exactly as it did before batching existed.
+    #[test]
+    fn eval_batch_share_tracks_queue_depth_and_never_starves_peers() {
+        let limits = EvalBatchLimits {
+            max: 16,
+            workers: 16,
+        };
+
+        // Shallow queue: one each, so all 16 workers get work.
+        assert_eq!(limits.share_of(0), 1);
+        assert_eq!(limits.share_of(1), 1);
+        assert_eq!(limits.share_of(16), 1);
+        // Deep enough to divide: each worker takes its share, no more.
+        assert_eq!(limits.share_of(64), 4);
+        assert_eq!(limits.share_of(160), 10);
+        // Saturated: capped, so a crash mid-batch re-runs a bounded amount.
+        assert_eq!(limits.share_of(100_000), 16);
+
+        // Degenerate inputs cannot produce a zero-sized batch (which would
+        // spin the worker) or panic.
+        let degenerate = EvalBatchLimits { max: 0, workers: 0 };
+        assert_eq!(degenerate.share_of(-5), 1);
+        assert_eq!(degenerate.share_of(1_000), 1);
+
+        // A single-worker manager is the batch's best case, still capped.
+        let solo = EvalBatchLimits { max: 8, workers: 1 };
+        assert_eq!(solo.share_of(3), 3);
+        assert_eq!(solo.share_of(3_000), 8);
     }
 
     #[test]
@@ -16383,6 +20251,254 @@ mod tests {
         Ok(())
     }
 
+    // ── job-intake group commit ──────────────────────────────────────────
+
+    /// The whole no-linger promise: an uncontended submitter must not be
+    /// able to tell that batching exists. It leads a batch of ONE, which
+    /// takes the pre-batching single-enqueue op, so the row it gets back is
+    /// the row it always got.
+    #[test]
+    fn a_batch_of_one_enqueue_is_the_single_enqueue_it_replaced() -> R<()> {
+        let store = setup_store()?;
+
+        // Through the coalescer (the public path).
+        let coalesced = store.enqueue_eval("job_submit", Some("a"), Some("a:1"), None, Some(70))?;
+        // The pre-batching op, called directly. A different job only because
+        // claiming one eval sweeps away same-kind pending evals for the same
+        // job, which would hide the second row below.
+        let single = store.enqueue_eval_forwarding(EvalRequest {
+            kind: "job_submit".into(),
+            job_id: Some("b".into()),
+            job_config_id: Some("b:1".into()),
+            node_id: None,
+            priority: Some(70),
+            delay: Duration::ZERO,
+        })?;
+
+        assert_eq!(coalesced.kind, single.kind);
+        assert_eq!(coalesced.status, single.status);
+        assert_eq!(coalesced.job_id, "a");
+        assert_eq!(single.job_id, "b");
+        assert_eq!(coalesced.priority, single.priority);
+        assert_eq!(
+            single.id.parse::<i64>()?,
+            coalesced.id.parse::<i64>()? + 1,
+            "the coalesced enqueue must have taken the same INSERT, one id earlier"
+        );
+        // And both are real, claimable rows in arrival order.
+        assert_eq!(store.claim_eval()?.context("first")?.id, coalesced.id);
+        assert_eq!(store.claim_eval()?.context("second")?.id, single.id);
+        Ok(())
+    }
+
+    /// The contended case, through the public API: whatever way the batches
+    /// fall, every submitter gets its OWN eval exactly once and every row
+    /// lands. This is the property the coalescer's ticketing is for — a
+    /// submitter handed a batch-mate's eval id would have the eval loop
+    /// working on someone else's job.
+    #[test]
+    fn concurrent_enqueues_each_get_their_own_eval() -> R<()> {
+        let store = setup_store()?;
+        const SUBMITTERS: usize = 24;
+
+        let handles: Vec<_> = (0..SUBMITTERS)
+            .map(|i| {
+                let store = store.clone();
+                std::thread::spawn(move || {
+                    let job = format!("job-{i}");
+                    store
+                        .enqueue_eval(
+                            "job_submit",
+                            Some(&job),
+                            Some(&format!("{job}:1")),
+                            None,
+                            None,
+                        )
+                        .map(|eval| (job, eval))
+                })
+            })
+            .collect();
+
+        let mut ids = BTreeSet::new();
+        for handle in handles {
+            let (job, eval) = handle.join().expect("submitter panicked")?;
+            assert_eq!(
+                eval.job_id, job,
+                "a submitter was handed someone else's eval"
+            );
+            assert!(ids.insert(eval.id.clone()), "duplicate eval id {}", eval.id);
+        }
+
+        let rows: i64 =
+            store
+                .read_connection()?
+                .query_row("SELECT COUNT(*) FROM eval;", [], |row| row.get(0))?;
+        assert_eq!(rows as usize, SUBMITTERS, "every enqueue must have landed");
+        Ok(())
+    }
+
+    /// Per-request failure isolation. One request that cannot be applied
+    /// must fail alone: batching a `job run` behind 31 others must never let
+    /// one bad submission reject the other 31.
+    #[test]
+    fn a_failing_enqueue_does_not_fail_its_batch_mates() -> R<()> {
+        let store = setup_store()?;
+        let good = |kind: &str| EvalRequest {
+            kind: kind.into(),
+            job_id: Some("j".into()),
+            job_config_id: Some("j:1".into()),
+            node_id: None,
+            priority: Some(50),
+            delay: Duration::ZERO,
+        };
+        // `Duration::MAX` exceeds what `time::Duration` can represent, so
+        // computing this row's `ready_at` fails — inside its own savepoint.
+        let poison = EvalRequest {
+            delay: Duration::MAX,
+            ..good("poison")
+        };
+
+        let results = store.run_eval_enqueue_batch(vec![good("first"), poison, good("third")]);
+        assert_eq!(results.len(), 3, "one result per request, always");
+        assert!(results[0].is_ok(), "batch-mate ahead of the failure");
+        assert!(results[1].is_err(), "the failing request must fail itself");
+        assert!(results[2].is_ok(), "batch-mate behind the failure");
+
+        // The rolled-back row left nothing behind, and the survivors are
+        // claimable in arrival order.
+        let kinds: Vec<String> = std::iter::from_fn(|| store.claim_eval().transpose())
+            .map(|eval| eval.map(|eval| eval.kind))
+            .collect::<R<Vec<String>>>()?;
+        assert_eq!(kinds, vec!["first".to_string(), "third".to_string()]);
+        Ok(())
+    }
+
+    /// A batch must not disturb the queue: `claim_eval` takes
+    /// `priority DESC, id ASC`, so a batch has to insert in arrival order
+    /// and let each row derive its own priority.
+    #[test]
+    fn a_batch_preserves_priority_then_arrival_ordering() -> R<()> {
+        let store = setup_store()?;
+        let request = |kind: &str, priority: i64| EvalRequest {
+            kind: kind.into(),
+            job_id: Some("j".into()),
+            job_config_id: Some("j:1".into()),
+            node_id: None,
+            priority: Some(priority),
+            delay: Duration::ZERO,
+        };
+        // Arrival order deliberately not priority order.
+        let results = store.run_eval_enqueue_batch(vec![
+            request("normal-first", 50),
+            request("urgent-first", 90),
+            request("normal-second", 50),
+            request("urgent-second", 90),
+        ]);
+        for result in &results {
+            assert!(result.is_ok(), "every request in this batch is valid");
+        }
+
+        let kinds: Vec<String> = std::iter::from_fn(|| store.claim_eval().transpose())
+            .map(|eval| eval.map(|eval| eval.kind))
+            .collect::<R<Vec<String>>>()?;
+        assert_eq!(
+            kinds,
+            vec![
+                "urgent-first".to_string(),
+                "urgent-second".to_string(),
+                "normal-first".to_string(),
+                "normal-second".to_string(),
+            ],
+            "priority DESC then id ASC — batching must not reorder either half"
+        );
+        Ok(())
+    }
+
+    /// The status-lane half of the same composite. A batched seed writes
+    /// exactly the rows N single seeds would, and a duplicated request (two
+    /// concurrent submits of the same config) is the no-op it is supposed to
+    /// be rather than a lost result.
+    #[test]
+    fn a_batched_task_status_seed_writes_what_single_seeds_would() -> R<()> {
+        let store = setup_store()?;
+        let first = submit_job(
+            &store,
+            "seed-batch-a",
+            vec![
+                TaskConfig::new("api", "noop"),
+                TaskConfig::new("web", "noop"),
+            ],
+        )?;
+        let second = submit_job(&store, "seed-batch-b", vec![TaskConfig::new("api", "noop")])?;
+
+        // Start from a clean slate so the batch is what writes the rows.
+        {
+            let conn = store.write_connection()?;
+            conn.execute("DELETE FROM task_status;", [])?;
+        }
+
+        // The duplicate is deliberate: it must get its own `Ok`, not be
+        // deduplicated out of the result list.
+        let ids = vec![first.clone(), second.clone(), second.clone()];
+        let results = store.run_task_status_seed_batch(ids);
+        assert_eq!(results.len(), 3, "one result per request, duplicates too");
+        for result in &results {
+            assert!(result.is_ok(), "no seed in this batch can fail");
+        }
+
+        let seeded: i64 =
+            store
+                .read_connection()?
+                .query_row("SELECT COUNT(*) FROM task_status;", [], |row| row.get(0))?;
+        assert_eq!(
+            seeded, 3,
+            "one pending row per task config, and the repeat is a no-op"
+        );
+        Ok(())
+    }
+
+    /// Idempotency under concurrency, which batching makes more likely
+    /// rather than less: two submits carrying the same key both miss the
+    /// pre-submit lookup, so the RECORD is what arbitrates. Exactly one
+    /// caller may be told it was first, and the loser must be able to read
+    /// the winner's response — that pair is what `RunJob` turns into
+    /// `deduplicated`.
+    #[test]
+    fn concurrent_submits_of_one_idempotency_key_have_exactly_one_winner() -> R<()> {
+        let store = setup_store()?;
+        let winners = Arc::new(AtomicUsize::new(0));
+
+        let handles: Vec<_> = (0..8)
+            .map(|i| {
+                let store = store.clone();
+                let winners = Arc::clone(&winners);
+                std::thread::spawn(move || -> R<()> {
+                    if store.idempotency_record("race-key", "run_job", &format!("reply {i}"))? {
+                        winners.fetch_add(1, Ordering::SeqCst);
+                    }
+                    Ok(())
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().expect("submitter panicked")?;
+        }
+
+        assert_eq!(
+            winners.load(Ordering::SeqCst),
+            1,
+            "exactly one concurrent submit may report itself as the first"
+        );
+        let recorded = store
+            .idempotency_lookup("race-key")?
+            .context("the winner's response must be replayable")?;
+        assert!(
+            recorded.starts_with("reply "),
+            "the loser reads the winner's recorded response, got {recorded:?}"
+        );
+        Ok(())
+    }
+
     #[test]
     fn sortable_timestamps_sort_chronologically() -> R<()> {
         let base = OffsetDateTime::from_unix_timestamp(1_700_000_000)?;
@@ -16513,7 +20629,7 @@ mod tests {
         };
 
         let submission = [Submission {
-            path: "job.jsonnet".into(),
+            path: "job.ncl".into(),
             content: "job".into(),
             is_primary: true,
         }];
@@ -16584,7 +20700,7 @@ mod tests {
         store.handle_job_submit(
             &job,
             &[Submission {
-                path: "job.jsonnet".into(),
+                path: "job.ncl".into(),
                 content: "job".into(),
                 is_primary: true,
             }],
@@ -16616,7 +20732,7 @@ mod tests {
         store.handle_job_submit(
             &job_v1,
             &[Submission {
-                path: "v1.jsonnet".into(),
+                path: "v1.ncl".into(),
                 content: "v1".into(),
                 is_primary: true,
             }],
@@ -16639,7 +20755,7 @@ mod tests {
         store.handle_job_submit(
             &job_v2,
             &[Submission {
-                path: "v2.jsonnet".into(),
+                path: "v2.ncl".into(),
                 content: "v2".into(),
                 is_primary: true,
             }],
@@ -16679,7 +20795,7 @@ mod tests {
         store.handle_job_submit(
             &job,
             &[Submission {
-                path: "job.jsonnet".into(),
+                path: "job.ncl".into(),
                 content: "job".into(),
                 is_primary: true,
             }],
@@ -16749,7 +20865,7 @@ mod tests {
         store.handle_job_submit(
             &job,
             &[Submission {
-                path: "job.jsonnet".into(),
+                path: "job.ncl".into(),
                 content: "job".into(),
                 is_primary: true,
             }],
@@ -16792,7 +20908,7 @@ mod tests {
         store.handle_job_submit(
             &job,
             &[Submission {
-                path: "job.jsonnet".into(),
+                path: "job.ncl".into(),
                 content: "job".into(),
                 is_primary: true,
             }],
@@ -16835,7 +20951,7 @@ mod tests {
         store.handle_job_submit(
             &job,
             &[Submission {
-                path: format!("{name}.jsonnet"),
+                path: format!("{name}.ncl"),
                 content: name.into(),
                 is_primary: true,
             }],
@@ -16894,13 +21010,25 @@ mod tests {
 
         assert_eq!(results.len(), 3);
         assert!(
-            matches!(results[0], Ok((_, PlanApplyOutcome::Applied(_)))),
+            matches!(
+                results[0],
+                Ok(PlanApplySlot {
+                    reply: (_, PlanApplyOutcome::Applied(_)),
+                    ..
+                })
+            ),
             "first plan must apply: {:?}",
             results[0]
         );
         assert!(results[1].is_err(), "poisoned plan must fail alone");
         assert!(
-            matches!(results[2], Ok((_, PlanApplyOutcome::Applied(_)))),
+            matches!(
+                results[2],
+                Ok(PlanApplySlot {
+                    reply: (_, PlanApplyOutcome::Applied(_)),
+                    ..
+                })
+            ),
             "batch-mate after the failure must still apply: {:?}",
             results[2]
         );
@@ -16913,32 +21041,113 @@ mod tests {
     fn plan_batch_keeps_per_plan_cas_verdicts() -> R<()> {
         let store = setup_store()?;
         store.insert_node(make_node_msg("node-a", "ready"))?;
+        store.insert_node(make_node_msg("node-b", "ready"))?;
         let (job_a, task_a) = submit_named_job(&store, "cas-job-a")?;
         let (job_b, task_b) = submit_named_job(&store, "cas-job-b")?;
 
-        let fresh =
-            store.allocation_version_vector(&job_a, &HashSet::from(["node-a".to_string()]))?;
-        // Stale by construction: bump node-a's epoch after sampling.
+        // Stale by construction, on the check that is still hard and
+        // all-or-nothing: the JOB-CONFIG epoch. (A stale *node* epoch is
+        // now revalidated and rebound — see
+        // `plan_walk_rebinds_an_epoch_dirty_candidate_that_still_fits`.)
         let stale =
-            store.allocation_version_vector(&job_b, &HashSet::from(["node-a".to_string()]))?;
+            store.allocation_version_vector(&job_a, &HashSet::from(["node-a".to_string()]))?;
         store.place_alloc("node-a", task_a)?;
+        let fresh =
+            store.allocation_version_vector(&job_b, &HashSet::from(["node-b".to_string()]))?;
 
-        let results = store.run_plan_apply_batch(vec![PlanApplyRequest {
-            job_config_id: job_b.clone(),
-            mode: "fresh".into(),
-            placements: PlanPlacements::Nodes(vec![("node-a".to_string(), task_b)]),
-            expected_versions: stale,
-            evictions: Vec::new(),
-            target_instance: String::new(),
-        }]);
+        let results = store.run_plan_apply_batch(vec![
+            PlanApplyRequest {
+                job_config_id: job_a.clone(),
+                mode: "fresh".into(),
+                placements: PlanPlacements::Nodes(vec![("node-a".to_string(), task_a)]),
+                expected_versions: stale,
+                evictions: Vec::new(),
+                target_instance: String::new(),
+            },
+            PlanApplyRequest {
+                job_config_id: job_b.clone(),
+                mode: "fresh".into(),
+                placements: PlanPlacements::Nodes(vec![("node-b".to_string(), task_b)]),
+                expected_versions: fresh,
+                evictions: Vec::new(),
+                target_instance: String::new(),
+            },
+        ]);
         assert!(
-            matches!(results[0], Ok((_, PlanApplyOutcome::Rejected { .. }))),
-            "stale epochs must reject inside a batch exactly as they do alone: {:?}",
+            matches!(
+                results[0],
+                Ok(PlanApplySlot {
+                    reply: (_, PlanApplyOutcome::Rejected { .. }),
+                    ..
+                })
+            ),
+            "a stale job-config epoch must reject inside a batch exactly as it does alone: {:?}",
             results[0]
         );
+        assert!(
+            matches!(
+                results[1],
+                Ok(PlanApplySlot {
+                    reply: (_, PlanApplyOutcome::Applied(_)),
+                    ..
+                })
+            ),
+            "a batch-mate's rejection must not poison the next plan: {:?}",
+            results[1]
+        );
+        Ok(())
+    }
 
-        // And a fresh sample for the untouched job still applies.
-        let _ = fresh;
+    /// Plans queued in one group commit routinely overlap: independent
+    /// jobs planned against the same snapshot pick the same best node, so
+    /// every plan after the first in the batch carries a node epoch its
+    /// batch-mate just bumped. With the two-pass bind they all apply while
+    /// the node has room, instead of all but one rejecting.
+    #[test]
+    fn plan_batch_of_overlapping_plans_all_apply_when_capacity_allows() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(NodeMsg {
+            config_attrs: json!({ "maxAllocations": 4 }).to_string(),
+            ..make_node_msg("node-a", "ready")
+        })?;
+
+        // Every plan samples the SAME pre-batch epochs and targets the
+        // same node — the shape the AWS benchmark produced at scale.
+        let mut batch = Vec::new();
+        for index in 0..4 {
+            let (job_config_id, task_id) =
+                submit_named_job(&store, &format!("overlap-job-{index}"))?;
+            let versions = store.allocation_version_vector(
+                &job_config_id,
+                &HashSet::from(["node-a".to_string()]),
+            )?;
+            batch.push(PlanApplyRequest {
+                job_config_id,
+                mode: "fresh".into(),
+                placements: PlanPlacements::Candidates(vec![PlanSubmissionPlacement {
+                    task_id,
+                    candidates: vec!["node-a".to_string()],
+                }]),
+                expected_versions: versions,
+                evictions: Vec::new(),
+                target_instance: String::new(),
+            });
+        }
+
+        let results = store.run_plan_apply_batch(batch);
+        for (index, result) in results.iter().enumerate() {
+            assert!(
+                matches!(
+                    result,
+                    Ok(PlanApplySlot {
+                        reply: (_, PlanApplyOutcome::Applied(_)),
+                        ..
+                    })
+                ),
+                "plan {index} of the batch must apply: {result:?}"
+            );
+        }
+        assert_eq!(store.allocs_for_node("node-a")?.len(), 4);
         Ok(())
     }
 
@@ -16982,6 +21191,246 @@ mod tests {
         Ok(())
     }
 
+    /// Count every commit on the store's write connection from now on.
+    /// SQLite fires the commit hook once per transaction that reaches the
+    /// disk, so this counts exactly the fsyncs a local backend pays.
+    fn count_write_commits(store: &Store) -> R<Arc<AtomicUsize>> {
+        let commits = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&commits);
+        let conn = store
+            .write_conn
+            .lock()
+            .map_err(|_| anyhow!("write connection lock poisoned"))?;
+        conn.commit_hook(Some(move || {
+            counter.fetch_add(1, Ordering::Relaxed);
+            // `true` would ABORT the commit — the hook only observes.
+            false
+        }));
+        Ok(commits)
+    }
+
+    /// Build `count` independent single-placement plan requests, each on
+    /// its own node and job config, so nothing in the set conflicts.
+    fn independent_plan_requests(
+        store: &Store,
+        prefix: &str,
+        count: usize,
+    ) -> R<Vec<PlanApplyRequest>> {
+        let mut requests = Vec::with_capacity(count);
+        for index in 0..count {
+            let node = format!("{prefix}-node-{index}");
+            store.insert_node(make_node_msg(&node, "ready"))?;
+            let (job_config_id, task_id) =
+                submit_named_job(store, &format!("{prefix}-job-{index}"))?;
+            let expected_versions =
+                store.allocation_version_vector(&job_config_id, &HashSet::from([node.clone()]))?;
+            requests.push(PlanApplyRequest {
+                job_config_id,
+                mode: "fresh".into(),
+                placements: PlanPlacements::Nodes(vec![(node, task_id)]),
+                expected_versions,
+                evictions: Vec::new(),
+                target_instance: String::new(),
+            });
+        }
+        Ok(requests)
+    }
+
+    #[test]
+    fn local_plan_batch_commits_once_and_projects_statuses_once() -> R<()> {
+        let store = setup_store()?;
+        let singly = independent_plan_requests(&store, "singly", 3)?;
+        let batched = independent_plan_requests(&store, "batched", 3)?;
+        let commits = count_write_commits(&store)?;
+
+        // Baseline: the pre-batch shape — each plan commits alone and
+        // projects its own task statuses on the status lane.
+        for request in singly {
+            let (_, outcome) = store.submit_and_apply_plan_replicated(request)?;
+            store.plan_apply_bookkeeping(&outcome)?;
+        }
+        let alone = commits.swap(0, Ordering::Relaxed);
+        assert_eq!(
+            alone, 6,
+            "three plans applied singly: one commit per plan plus one status projection per plan"
+        );
+
+        // Batched: one transaction for the three plans, one status-lane
+        // projection for every allocation they placed.
+        let results = store.run_plan_apply_batch(batched);
+        let together = commits.load(Ordering::Relaxed);
+        assert_eq!(
+            results.len(),
+            3,
+            "every batched plan gets its own result: {results:?}"
+        );
+        for result in &results {
+            assert!(
+                matches!(
+                    result,
+                    Ok(PlanApplySlot {
+                        reply: (_, PlanApplyOutcome::Applied(_)),
+                        bookkeeping_done: true,
+                    })
+                ),
+                "batched plans apply and have their bookkeeping done for them: {result:?}"
+            );
+        }
+        assert_eq!(
+            together, 2,
+            "three batched plans: one commit for the batch, one for its status projection"
+        );
+
+        // Same end state as applying them one at a time.
+        for index in 0..3 {
+            assert_eq!(
+                store
+                    .allocs_for_node(&format!("batched-node-{index}"))?
+                    .len(),
+                1
+            );
+        }
+        Ok(())
+    }
+
+    /// Wall-clock A/B for the group commit's local amortization, on
+    /// conflict-free plans so the measurement is the write path and not
+    /// optimistic-concurrency contention (which dominates the macro
+    /// scheduler benchmark). Numbers land in
+    /// `benchmarks/scheduler/README.md`.
+    ///
+    /// ```bash
+    /// cargo test --release --lib bench_local_plan_batch -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "benchmark; run with --release --ignored --nocapture"]
+    fn bench_local_plan_batch_commit_amortization() -> R<()> {
+        const BATCH: usize = 16;
+        const REPS: usize = 20;
+
+        let mut singly_ms = Vec::with_capacity(REPS);
+        let mut batched_ms = Vec::with_capacity(REPS);
+        for rep in 0..REPS {
+            let store = setup_store()?;
+            let alone = independent_plan_requests(&store, &format!("a{rep}"), BATCH)?;
+            let together = independent_plan_requests(&store, &format!("b{rep}"), BATCH)?;
+
+            let started = Instant::now();
+            for request in alone {
+                let (_, outcome) = store.submit_and_apply_plan_replicated(request)?;
+                store.plan_apply_bookkeeping(&outcome)?;
+            }
+            singly_ms.push(started.elapsed().as_secs_f64() * 1_000.0);
+
+            let started = Instant::now();
+            let results = store.run_plan_apply_batch(together);
+            batched_ms.push(started.elapsed().as_secs_f64() * 1_000.0);
+            assert!(results.iter().all(|result| result.is_ok()));
+        }
+
+        let median = |mut samples: Vec<f64>| -> f64 {
+            samples.sort_by(|a, b| a.partial_cmp(b).expect("no NaN"));
+            samples[samples.len() / 2]
+        };
+        let singly = median(singly_ms);
+        let batched = median(batched_ms);
+        println!(
+            "plan batch of {BATCH} ({REPS} reps, medians): singly {singly:.2} ms, \
+             batched {batched:.2} ms ({:.2}x)",
+            singly / batched
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn local_plan_batch_publishes_one_read_model_refresh_after_its_commit() -> R<()> {
+        let store = setup_store()?;
+        let requests = independent_plan_requests(&store, "refresh", 3)?;
+        let before = store.read_model_generation()?;
+
+        let results = store.run_plan_apply_batch(requests);
+        assert!(results.iter().all(|result| result.is_ok()));
+
+        let after = store.read_model_generation()?;
+        assert_eq!(
+            after.wrapping_sub(before),
+            1,
+            "the batch publishes ONE coherent refresh over the union of its scopes, \
+             not one per plan"
+        );
+        // And that one refresh is coherent with the committed rows: a
+        // mid-transaction refresh would have read pre-batch state and left
+        // the mirror empty (the hazard that deferred this — the plan's
+        // judgement call #6).
+        for index in 0..3 {
+            let node = format!("refresh-node-{index}");
+            let mirrored = store
+                .scheduling_read_model()?
+                .allocations_by_node
+                .get(&node)
+                .map(|allocs| allocs.len())
+                .unwrap_or_default();
+            assert_eq!(
+                mirrored,
+                store.allocs_for_node(&node)?.len(),
+                "read model and database must agree for {node} after the batch"
+            );
+            assert_eq!(mirrored, 1);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn local_plan_batch_broadcasts_no_event_before_it_commits() -> R<()> {
+        let store = setup_store()?;
+        let requests = independent_plan_requests(&store, "events", 3)?;
+        let mut subscriber = store.subscribe_events();
+
+        // Sample how many events had been broadcast at each commit. The
+        // batch's own commit is the first one, and nothing it staged may
+        // have been announced yet.
+        let probe = store.subscribe_events();
+        let seen_at_commit = Arc::new(Mutex::new(Vec::new()));
+        {
+            let recorder = Arc::clone(&seen_at_commit);
+            let conn = store
+                .write_conn
+                .lock()
+                .map_err(|_| anyhow!("write connection lock poisoned"))?;
+            conn.commit_hook(Some(move || {
+                if let Ok(mut samples) = recorder.lock() {
+                    samples.push(probe.len());
+                }
+                false
+            }));
+        }
+
+        let results = store.run_plan_apply_batch(requests);
+        assert!(results.iter().all(|result| result.is_ok()));
+
+        let samples = seen_at_commit
+            .lock()
+            .map_err(|_| anyhow!("sample lock poisoned"))?
+            .clone();
+        assert_eq!(
+            samples.first().copied(),
+            Some(0),
+            "no event may be broadcast before the batch's transaction commits: {samples:?}"
+        );
+
+        let mut placed = 0;
+        while let Ok(event) = subscriber.try_recv() {
+            if event.kind == "allocation.placed" {
+                placed += 1;
+            }
+        }
+        assert_eq!(
+            placed, 3,
+            "every plan's placement event is still published, once the batch is durable"
+        );
+        Ok(())
+    }
+
     #[test]
     fn plan_submission_rejects_stale_epoch_for_same_job_config() -> R<()> {
         let store = setup_store()?;
@@ -16998,7 +21447,7 @@ mod tests {
         store.handle_job_submit(
             &job,
             &[Submission {
-                path: "job.jsonnet".into(),
+                path: "job.ncl".into(),
                 content: "job".into(),
                 is_primary: true,
             }],
@@ -17037,59 +21486,89 @@ mod tests {
         Ok(())
     }
 
+    /// Two jobs onto one node, the second carrying pre-apply (stale) node
+    /// epochs. The node scope no longer fences on the epoch alone: when
+    /// the node still has room the second plan binds, and when it does not
+    /// — the case the fence existed to protect — it is rejected on the
+    /// in-transaction capacity recheck. `maxAllocations` makes the two
+    /// halves differ by exactly one number.
     #[test]
-    fn plan_submission_rejects_stale_epoch_for_shared_node_scope() -> R<()> {
-        let store = setup_store()?;
-        store.insert_node(make_node_msg("node-a", "ready"))?;
+    fn plan_submission_shared_node_scope_binds_when_it_fits_and_rejects_when_full() -> R<()> {
+        for (max_allocations, expect_applied) in [(2, true), (1, false)] {
+            let store = setup_store()?;
+            store.insert_node(NodeMsg {
+                config_attrs: json!({ "maxAllocations": max_allocations }).to_string(),
+                ..make_node_msg("node-a", "ready")
+            })?;
 
-        let make_job = |name: &str, task_name: &str| JobConfig {
-            priority: Default::default(),
-            rollout: None,
-            rollout_by_group: Default::default(),
-            name: name.into(),
-            tasks: vec![TaskConfig::new(task_name, "noop")],
-            version: None,
-        };
+            let make_job = |name: &str, task_name: &str| JobConfig {
+                priority: Default::default(),
+                rollout: None,
+                rollout_by_group: Default::default(),
+                name: name.into(),
+                tasks: vec![TaskConfig::new(task_name, "noop")],
+                version: None,
+            };
 
-        let submission = [Submission {
-            path: "job.jsonnet".into(),
-            content: "job".into(),
-            is_primary: true,
-        }];
-        store.handle_job_submit(&make_job("job-scope-a", "task-a"), &submission)?;
-        store.handle_job_submit(&make_job("job-scope-b", "task-b"), &submission)?;
+            let submissions = [Submission {
+                path: "job.ncl".into(),
+                content: "job".into(),
+                is_primary: true,
+            }];
+            store.handle_job_submit(&make_job("job-scope-a", "task-a"), &submissions)?;
+            store.handle_job_submit(&make_job("job-scope-b", "task-b"), &submissions)?;
 
-        let job_a_config = store.get_job_config("job-scope-a")?.id();
-        let job_b_config = store.get_job_config("job-scope-b")?.id();
-        let task_a = task_id_for(&store, "task-a", "job-scope-a")?;
-        let task_b = task_id_for(&store, "task-b", "job-scope-b")?;
+            let job_a_config = store.get_job_config("job-scope-a")?.id();
+            let job_b_config = store.get_job_config("job-scope-b")?.id();
+            let task_a = task_id_for(&store, "task-a", "job-scope-a")?;
+            let task_b = task_id_for(&store, "task-b", "job-scope-b")?;
 
-        let job_a_versions = store
-            .allocation_version_vector(&job_a_config, &HashSet::from(["node-a".to_string()]))?;
-        let job_b_versions = store
-            .allocation_version_vector(&job_b_config, &HashSet::from(["node-a".to_string()]))?;
+            let job_a_versions = store
+                .allocation_version_vector(&job_a_config, &HashSet::from(["node-a".to_string()]))?;
+            // Sampled BEFORE the first plan applies, so these epochs are
+            // stale by the time the second plan is applied.
+            let job_b_versions = store
+                .allocation_version_vector(&job_b_config, &HashSet::from(["node-a".to_string()]))?;
 
-        let first = store.insert_plan_submission(
-            &job_a_config,
-            "fresh",
-            &[("node-a".to_string(), task_a)],
-            &job_a_versions,
-        )?;
-        let second = store.insert_plan_submission(
-            &job_b_config,
-            "fresh",
-            &[("node-a".to_string(), task_b)],
-            &job_b_versions,
-        )?;
+            let first = store.insert_plan_submission(
+                &job_a_config,
+                "fresh",
+                &[("node-a".to_string(), task_a)],
+                &job_a_versions,
+            )?;
+            let second = store.insert_plan_submission(
+                &job_b_config,
+                "fresh",
+                &[("node-a".to_string(), task_b)],
+                &job_b_versions,
+            )?;
 
-        assert!(matches!(
-            store.apply_plan_submission(&first)?,
-            PlanApplyOutcome::Applied(_)
-        ));
-        assert!(matches!(
-            store.apply_plan_submission(&second)?,
-            PlanApplyOutcome::Rejected { .. }
-        ));
+            assert!(matches!(
+                store.apply_plan_submission(&first)?,
+                PlanApplyOutcome::Applied(_)
+            ));
+            match store.apply_plan_submission(&second)? {
+                PlanApplyOutcome::Applied(_) => assert!(
+                    expect_applied,
+                    "a full node must not be bound by a stale-epoch plan"
+                ),
+                PlanApplyOutcome::Rejected { reason, .. } => {
+                    assert!(
+                        !expect_applied,
+                        "a stale epoch alone must not reject the plan"
+                    );
+                    assert!(
+                        reason.contains("no longer has capacity"),
+                        "the rejection must name capacity: {reason}"
+                    );
+                }
+            }
+            assert_eq!(
+                store.allocs_for_node("node-a")?.len(),
+                if expect_applied { 2 } else { 1 },
+                "the node never exceeds maxAllocations"
+            );
+        }
 
         Ok(())
     }
@@ -17116,7 +21595,7 @@ mod tests {
         store.handle_job_submit(
             &job,
             &[Submission {
-                path: "job.jsonnet".into(),
+                path: "job.ncl".into(),
                 content: "job".into(),
                 is_primary: true,
             }],
@@ -17160,6 +21639,970 @@ mod tests {
         Ok(())
     }
 
+    // ---------------------------------------------------------------
+    // `node_alloc_usage`: the plan-apply free-pool cache
+    //
+    // The cache's only job is to produce the SAME number the row walk
+    // produced, more cheaply. A free-capacity number that reads lower than
+    // the truth costs a placement; one that reads higher overcommits the
+    // node. So the tests below are equivalence tests against the walk they
+    // replaced, kept verbatim as the oracle.
+    // ---------------------------------------------------------------
+
+    /// The pre-cache body of `free_pool_for_node_tx`, verbatim: read every
+    /// allocation row on the node (minus the planned job's own, on a Fresh
+    /// plan) and subtract them one at a time. Every test in this section
+    /// asserts the cached path agrees with this.
+    fn free_pool_the_old_way(
+        store: &Store,
+        tx: &Connection,
+        node: &Node,
+        job_config_id: &str,
+        drop_own: bool,
+    ) -> R<ResourcePool> {
+        let mut stmt = tx.prepare(
+            "SELECT a.id, a.resources FROM allocation a \
+             WHERE a.node_id = ?1 AND (?2 = 0 OR a.job_config_id NOT IN (\
+                 SELECT id FROM job_config WHERE job_id = \
+                     (SELECT job_id FROM job_config WHERE id = ?3)));",
+        )?;
+        let rows = Store::collect_rows(stmt.query_map(
+            params![node.id, i64::from(drop_own), job_config_id],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Value>(1)?)),
+        )?)?;
+        Ok(ResourcePool::free_from_rows(
+            node,
+            rows.iter().map(|(id, resources)| (*id, resources)),
+            &store.resource_policy,
+        ))
+    }
+
+    /// Two pools agree. Amounts compare with a tolerance because the
+    /// aggregate computes `capacity − (a₁ + a₂ + …)` where the walk computes
+    /// `((capacity − a₁) − a₂) − …`: the same sum, associated differently,
+    /// so they can differ by a float rounding step. Anything larger means a
+    /// whole allocation went missing, which is the bug these tests exist to
+    /// catch.
+    fn assert_pool_eq(actual: &ResourcePool, expected: &ResourcePool, what: &str) {
+        let actual_keys: BTreeSet<&String> = actual.values.keys().collect();
+        let expected_keys: BTreeSet<&String> = expected.values.keys().collect();
+        assert_eq!(actual_keys, expected_keys, "{what}: resource dims differ");
+        for (name, expected_value) in &expected.values {
+            match (&actual.values[name], expected_value) {
+                (
+                    crate::resources::ResourceValue::Amount(got),
+                    crate::resources::ResourceValue::Amount(want),
+                ) => {
+                    let agrees = got == want
+                        || (got.is_finite()
+                            && want.is_finite()
+                            && (got - want).abs() <= 1e-9 * want.abs().max(1.0));
+                    assert!(agrees, "{what}: {name} is {got}, expected {want}");
+                }
+                (
+                    crate::resources::ResourceValue::Items(got),
+                    crate::resources::ResourceValue::Items(want),
+                ) => assert_eq!(got, want, "{what}: {name} items differ"),
+                (got, want) => panic!("{what}: {name} changed kind: {got:?} vs {want:?}"),
+            }
+        }
+    }
+
+    /// Assert the cached path and the walk agree for every node, in both
+    /// `drop_own` modes, and return the snapshots so a caller can publish
+    /// them and re-assert against a WARM cache.
+    fn assert_free_pools_match(
+        store: &Store,
+        tx: &Connection,
+        node_ids: &[&str],
+        job_config_id: &str,
+        label: &str,
+    ) -> R<HashMap<String, NodeUsageSnapshot>> {
+        let mut snapshots = HashMap::new();
+        for drop_own in [false, true] {
+            let own = match drop_own {
+                true => Some(store.own_allocation_usage_tx(tx, job_config_id)?),
+                false => None,
+            };
+            for node_id in node_ids {
+                let node = store.get_node(node_id)?;
+                let expected = free_pool_the_old_way(store, tx, &node, job_config_id, drop_own)?;
+                let (actual, snapshot) = store.free_pool_for_node_tx(
+                    tx,
+                    &node,
+                    job_config_id,
+                    drop_own,
+                    own.as_ref(),
+                )?;
+                assert_pool_eq(
+                    &actual,
+                    &expected,
+                    &format!("{label}: {node_id} (drop_own={drop_own})"),
+                );
+                if let Some(snapshot) = snapshot {
+                    snapshots.insert((*node_id).to_string(), snapshot);
+                }
+            }
+        }
+        Ok(snapshots)
+    }
+
+    fn usage_node_msg(id: &str, config_attrs: &str) -> NodeMsg {
+        NodeMsg {
+            config_attrs: config_attrs.to_string(),
+            // Two cores at 2 GHz and 8 GiB, in the worker's own reporting
+            // shape (byte counts and frequencies arrive as strings), so the
+            // pools under test hold real numbers rather than infinities.
+            fingerprint_attrs: json!({
+                "memory_total": "8589934592",
+                "cpus": {
+                    "0": { "frequency": "2000" },
+                    "1": { "frequency": "2000" },
+                },
+            })
+            .to_string(),
+            ..make_node_msg(id, "ready")
+        }
+    }
+
+    fn insert_usage_job(store: &Store, job_id: &str, config_ids: &[&str]) -> R<()> {
+        let conn = store.write_connection()?;
+        conn.execute(
+            "INSERT INTO job (id, name, status, created_at) VALUES (?1, ?1, 'running', '2026-01-01T00:00:00Z');",
+            [job_id],
+        )?;
+        for (version, config_id) in config_ids.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO job_config (id, name, type, meta, version, created_at, job_id) \
+                 VALUES (?1, ?2, 'service', '{}', ?3, '2026-01-01T00:00:00Z', ?2);",
+                params![config_id, job_id, version as i64 + 1],
+            )?;
+        }
+        Ok(())
+    }
+
+    fn insert_usage_allocation(
+        store: &Store,
+        id: i64,
+        node_id: &str,
+        job_config_id: &str,
+        resources: Value,
+    ) -> R<()> {
+        let conn = store.write_connection()?;
+        conn.execute(
+            "INSERT INTO allocation (id, status, resources, node_id, job_config_id, task_config_id) \
+             VALUES (?1, 'running', ?2, ?3, ?4, 1);",
+            params![id, resources, node_id, job_config_id],
+        )?;
+        Ok(())
+    }
+
+    /// The core equivalence test: across an empty node, nodes carrying
+    /// amount-typed, item-typed and mixed-kind allocations, and both
+    /// `drop_own` modes, the cached free pool equals the one the row walk
+    /// built — on a cold cache (which rebuilds) and again on a warm one
+    /// (which reads the stored aggregate).
+    #[test]
+    fn cached_free_pool_matches_the_row_walk_across_resource_shapes() -> R<()> {
+        let store = setup_store()?;
+        // `node-plain` has only what the fingerprint reports; `node-rich`
+        // adds a device list, a custom counter, a reservation and an
+        // allocation cap, so every branch of the pool arithmetic is live.
+        store.insert_node(usage_node_msg("node-empty", "{}"))?;
+        store.insert_node(usage_node_msg("node-plain", "{}"))?;
+        store.insert_node(usage_node_msg(
+            "node-rich",
+            &json!({
+                "maxAllocations": 8,
+                "resources": { "gpu": ["g0", "g1", "g2"], "widgets": 6 },
+                "reservedResources": { "memory": 512 },
+            })
+            .to_string(),
+        ))?;
+
+        // Two configs of the planned job (a Fresh plan sees the previous
+        // config's rows too) and one unrelated job.
+        insert_usage_job(&store, "own-job", &["own-cfg-1", "own-cfg-2"])?;
+        insert_usage_job(&store, "other-job", &["other-cfg"])?;
+
+        insert_usage_allocation(&store, 1, "node-plain", "own-cfg-1", json!({"cpu": 500}))?;
+        insert_usage_allocation(
+            &store,
+            2,
+            "node-plain",
+            "other-cfg",
+            json!({"cpu": 250, "memory": 1024}),
+        )?;
+        // Same dim, two kinds: `gpu` as a device list from one job and as a
+        // plain counter from another. The pool resolves whichever matches
+        // its own kind and ignores the other, per row — the aggregate has to
+        // reproduce that.
+        insert_usage_allocation(
+            &store,
+            3,
+            "node-rich",
+            "own-cfg-1",
+            json!({"cpu": 100, "gpu": ["g0"], "widgets": 2}),
+        )?;
+        insert_usage_allocation(
+            &store,
+            4,
+            "node-rich",
+            "own-cfg-2",
+            json!({"memory": 256, "gpu": 1}),
+        )?;
+        insert_usage_allocation(
+            &store,
+            5,
+            "node-rich",
+            "other-cfg",
+            json!({"cpu": 100, "gpu": ["g1"], "widgets": 1, "fractional": 0.1}),
+        )?;
+        // A zero-amount demand: the walk still CREATES the pool entry, so
+        // the aggregate must too, or the dim would silently read as absent.
+        insert_usage_allocation(&store, 6, "node-rich", "other-cfg", json!({"scratch": 0}))?;
+
+        let nodes = ["node-empty", "node-plain", "node-rich"];
+        let mut conn = store.write_connection()?;
+        let tx = Store::write_tx(&mut conn)?;
+
+        // Cold: nothing cached, so every node rebuilds.
+        let mut snapshots = assert_free_pools_match(&store, &tx, &nodes, "own-cfg-2", "cold")?;
+        assert_eq!(
+            snapshots.len(),
+            nodes.len(),
+            "every node should have produced a cacheable aggregate"
+        );
+
+        // Warm: publish what the rebuild found, then assert the stored
+        // aggregate produces the identical pool.
+        store.publish_node_usage_tx(&tx, &mut snapshots, &[], &HashMap::new())?;
+        assert_free_pools_match(&store, &tx, &nodes, "own-cfg-2", "warm")?;
+
+        // And from the other job's point of view, where "own" is a
+        // different set of rows but the cached total is the same one.
+        assert_free_pools_match(&store, &tx, &nodes, "other-cfg", "warm/other-job")?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// An allocation whose stored resources cannot be parsed keeps its old
+    /// meaning — the node fits nothing — and is never allowed to enter the
+    /// cache, because a cached value derived from a row nobody could read
+    /// would outlive the row that produced it.
+    #[test]
+    fn an_unparseable_allocation_row_bypasses_the_cache_entirely() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(usage_node_msg("node-bad", "{}"))?;
+        insert_usage_job(&store, "own-job", &["own-cfg"])?;
+        insert_usage_job(&store, "other-job", &["other-cfg"])?;
+        insert_usage_allocation(&store, 1, "node-bad", "other-cfg", json!({"cpu": "lots"}))?;
+        insert_usage_allocation(&store, 2, "node-bad", "own-cfg", json!({"cpu": 100}))?;
+
+        let mut conn = store.write_connection()?;
+        let tx = Store::write_tx(&mut conn)?;
+        let snapshots = assert_free_pools_match(&store, &tx, &["node-bad"], "own-cfg", "poisoned")?;
+        assert!(
+            snapshots.is_empty(),
+            "a node with an unreadable allocation must not be cached"
+        );
+        let cached: i64 = tx.query_row("SELECT COUNT(*) FROM node_alloc_usage;", [], |row| {
+            row.get(0)
+        })?;
+        assert_eq!(cached, 0);
+
+        // The planned job's OWN row being unreadable is different: a Fresh
+        // plan never counted it, so the node still fits things — it just
+        // cannot take the subtracting path.
+        tx.execute(
+            "UPDATE allocation SET resources = ?1 WHERE id = 1;",
+            [json!({"cpu": 100})],
+        )?;
+        tx.execute(
+            "UPDATE allocation SET resources = ?1 WHERE id = 2;",
+            [json!({"cpu": "lots"})],
+        )?;
+        let own = store.own_allocation_usage_tx(&tx, "own-cfg")?;
+        assert!(own.unreadable.contains("node-bad"));
+        assert_free_pools_match(&store, &tx, &["node-bad"], "own-cfg", "poisoned-own")?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The drift case, which is the one that matters: after inserts,
+    /// removals and an eviction driven through the real store paths, the
+    /// cached pool still equals the walk's. A cached number that survived a
+    /// mutation it did not see would overcommit the node.
+    #[test]
+    fn the_usage_cache_stays_correct_across_inserts_removals_and_evictions() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "ready"))?;
+        store.insert_node(make_node_msg("node-b", "ready"))?;
+
+        let (job_config_id, task_id) = submit_walk_job(&store, "usage-drift", task("task"))?;
+        let (victim_config_id, victim_task) =
+            submit_walk_job(&store, "usage-victim", task("victim"))?;
+
+        let check = |label: &str| -> R<()> {
+            let mut conn = store.write_connection()?;
+            let tx = Store::write_tx(&mut conn)?;
+            assert_free_pools_match(&store, &tx, &["node-a", "node-b"], &job_config_id, label)?;
+            tx.commit()?;
+            Ok(())
+        };
+
+        // 1. A plan apply, which both reads the pools and publishes the
+        //    cache entries the next plan will trust.
+        let expected_versions = store.allocation_version_vector(
+            &job_config_id,
+            &HashSet::from(["node-a".to_string(), "node-b".to_string()]),
+        )?;
+        let submission = store.insert_plan_submission_with_candidates(
+            &job_config_id,
+            "fresh",
+            &[PlanSubmissionPlacement {
+                task_id,
+                candidates: vec!["node-a".to_string()],
+            }],
+            &expected_versions,
+        )?;
+        assert!(matches!(
+            store.apply_plan_submission(&submission)?,
+            PlanApplyOutcome::Applied(_)
+        ));
+        check("after a plan apply")?;
+        let warm: i64 = store.read_connection()?.query_row(
+            "SELECT COUNT(*) FROM node_alloc_usage WHERE node_id = 'node-a';",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(warm, 1, "the apply should have left a usable cache entry");
+
+        // 2. An insert through a path that is not plan apply.
+        let victim = store.place_alloc("node-a", victim_task)?;
+        check("after place_alloc")?;
+
+        // 3. A removal that bumps only the JOB-CONFIG epoch, never the
+        //    node's — the case a node-epoch-only validator would miss.
+        store.remove_allocation_by_id(victim.id)?;
+        check("after remove_allocation_by_id")?;
+
+        // 4. An eviction inside a plan: the victim's row disappears in the
+        //    same transaction that reads the pool.
+        let victim = store.place_alloc("node-b", victim_task)?;
+        let expected_versions = store.allocation_version_vector(
+            &job_config_id,
+            &HashSet::from(["node-a".to_string(), "node-b".to_string()]),
+        )?;
+        let (_, outcome) = store.submit_and_apply_plan_with_candidates(
+            &job_config_id,
+            "reschedule",
+            &[PlanSubmissionPlacement {
+                task_id,
+                candidates: vec!["node-b".to_string()],
+            }],
+            &expected_versions,
+            &[PlanEviction {
+                allocation_id: victim.id,
+                node_id: "node-b".into(),
+                job_id: "usage-victim".into(),
+                job_config_id: victim_config_id,
+                task_config_id: victim_task,
+                band: Band::default().as_str().to_string(),
+            }],
+        )?;
+        assert!(matches!(outcome, PlanApplyOutcome::Applied(_)));
+        check("after a preempting plan")?;
+
+        // 5. Wholesale removal of the job's allocations.
+        store.remove_allocs_for_job("usage-drift")?;
+        check("after remove_allocs_for_job")?;
+        Ok(())
+    }
+
+    /// A published cache entry must describe the rows that are actually
+    /// there. This is the invariant `publish_node_usage_tx` enforces by
+    /// re-reading the fingerprint before it writes; assert it end to end.
+    #[test]
+    fn a_published_usage_row_fingerprints_the_live_allocation_rows() -> R<()> {
+        let store = setup_store()?;
+        // A fingerprinted node, so the pool holds finite numbers a planted
+        // value can visibly move.
+        store.insert_node(usage_node_msg("node-a", "{}"))?;
+        let (job_config_id, task_id) = submit_walk_job(&store, "usage-fingerprint", task("task"))?;
+
+        let expected_versions = store
+            .allocation_version_vector(&job_config_id, &HashSet::from(["node-a".to_string()]))?;
+        let submission = store.insert_plan_submission_with_candidates(
+            &job_config_id,
+            "fresh",
+            &[PlanSubmissionPlacement {
+                task_id,
+                candidates: vec!["node-a".to_string()],
+            }],
+            &expected_versions,
+        )?;
+        assert!(matches!(
+            store.apply_plan_submission(&submission)?,
+            PlanApplyOutcome::Applied(_)
+        ));
+
+        let mut conn = store.write_connection()?;
+        let tx = Store::write_tx(&mut conn)?;
+        let (epoch, count, id_sum) = store.node_alloc_fingerprint_tx(&tx, "node-a")?;
+        let (stored_epoch, stored_count, stored_sum): (i64, i64, i64) = tx.query_row(
+            "SELECT alloc_epoch, alloc_count, alloc_id_sum FROM node_alloc_usage \
+             WHERE node_id = 'node-a';",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        assert_eq!(
+            (stored_epoch, stored_count, stored_sum),
+            (epoch, count, id_sum)
+        );
+        assert_eq!(stored_count, 1, "one placement, one row");
+
+        // The fast path is really the one being taken. Plant a distinctive
+        // (wrong) aggregate under the matching fingerprint: if the next read
+        // reflects it, the row was served from the cache rather than
+        // rebuilt. Without this, the whole change could silently regress to
+        // "rebuild every time" and every equivalence test would still pass.
+        let node = store.get_node("node-a")?;
+        let before = store
+            .free_pool_for_node_tx(&tx, &node, &job_config_id, false, None)?
+            .0;
+        tx.execute(
+            "UPDATE node_alloc_usage SET usage_json = ?1 WHERE node_id = 'node-a';",
+            [r#"{"dims":{"cpu":{"amount_contributors":1,"amount":777.0,"items":{}}}}"#],
+        )?;
+        let after = store
+            .free_pool_for_node_tx(&tx, &node, &job_config_id, false, None)?
+            .0;
+        assert_ne!(
+            before.amount("cpu"),
+            after.amount("cpu"),
+            "the cached aggregate is not being read"
+        );
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// A cached aggregate is rows run through SOME policy's normalization,
+    /// and the row-set fingerprint cannot see the policy changing across a
+    /// restart — so the policy fingerprint must gate the read. A row whose
+    /// fingerprint is not the running policy's (here: one written before
+    /// the column existed, carrying NULL, and one planted with a foreign
+    /// fingerprint) must be rebuilt from the rows, not served.
+    #[test]
+    fn a_usage_row_from_another_policy_is_rebuilt_not_served() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(usage_node_msg("node-a", "{}"))?;
+        let (job_config_id, task_id) = submit_walk_job(&store, "usage-policy", task("task"))?;
+
+        let expected_versions = store
+            .allocation_version_vector(&job_config_id, &HashSet::from(["node-a".to_string()]))?;
+        let submission = store.insert_plan_submission_with_candidates(
+            &job_config_id,
+            "fresh",
+            &[PlanSubmissionPlacement {
+                task_id,
+                candidates: vec!["node-a".to_string()],
+            }],
+            &expected_versions,
+        )?;
+        assert!(matches!(
+            store.apply_plan_submission(&submission)?,
+            PlanApplyOutcome::Applied(_)
+        ));
+
+        let mut conn = store.write_connection()?;
+        let tx = Store::write_tx(&mut conn)?;
+        let stored: Option<String> = tx.query_row(
+            "SELECT policy_fingerprint FROM node_alloc_usage WHERE node_id = 'node-a';",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            stored.as_deref(),
+            Some(store.resource_policy_fingerprint.as_ref()),
+            "a published row must carry the policy that normalized it"
+        );
+
+        // Plant a distinctive wrong aggregate under a FOREIGN policy
+        // fingerprint but an otherwise valid row-set fingerprint. If the
+        // read still trusts row identity alone, the planted value leaks
+        // into the pool; the policy gate must send it through the rebuild,
+        // which reproduces the true pool.
+        let node = store.get_node("node-a")?;
+        let true_pool = store
+            .free_pool_for_node_tx(&tx, &node, &job_config_id, false, None)?
+            .0;
+        tx.execute(
+            "UPDATE node_alloc_usage SET \
+                 usage_json = ?1, policy_fingerprint = ?2 WHERE node_id = 'node-a';",
+            params![
+                r#"{"dims":{"cpu":{"amount_contributors":1,"amount":777.0,"items":{}}}}"#,
+                "some-other-policy"
+            ],
+        )?;
+        let repooled = store
+            .free_pool_for_node_tx(&tx, &node, &job_config_id, false, None)?
+            .0;
+        assert_eq!(
+            true_pool.amount("cpu"),
+            repooled.amount("cpu"),
+            "a row from another policy must be rebuilt, not served"
+        );
+
+        // NULL — a pre-column row, or one written by a rolled-back binary —
+        // must behave the same way.
+        tx.execute(
+            "UPDATE node_alloc_usage SET \
+                 usage_json = ?1, policy_fingerprint = NULL WHERE node_id = 'node-a';",
+            [r#"{"dims":{"cpu":{"amount_contributors":1,"amount":777.0,"items":{}}}}"#],
+        )?;
+        let renulled = store
+            .free_pool_for_node_tx(&tx, &node, &job_config_id, false, None)?
+            .0;
+        assert_eq!(
+            true_pool.amount("cpu"),
+            renulled.amount("cpu"),
+            "a NULL-fingerprint row must be rebuilt, not served"
+        );
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Wall-clock A/B for the free-pool rebuild, at two cluster fills, both
+    /// paths measured against the SAME store in the same process so the
+    /// comparison is the function and not the machine.
+    ///
+    /// This is the local stand-in for the AWS `dense_fleet` ladder, which
+    /// measured throughput falling 736.1 → 456.58 → 272.91 alloc/s as live
+    /// allocations went 50k → 100k → 200k at 5,000 nodes. What a single-node
+    /// run *can* show is the per-node cost that ladder is made of, and how
+    /// it moves with allocations-per-node.
+    ///
+    /// ```bash
+    /// cargo test --release --lib bench_local_free_pool -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "benchmark; run with --release --ignored --nocapture"]
+    fn bench_local_free_pool_rebuild_by_fill() -> R<()> {
+        const NODES: usize = 50;
+        const ROUNDS: usize = 20;
+
+        for per_node in [10usize, 40] {
+            let store = setup_store()?;
+            insert_usage_job(&store, "bench-job", &["bench-cfg"])?;
+            insert_usage_job(&store, "bench-other", &["other-cfg"])?;
+            let mut allocation_id = 0i64;
+            for node in 0..NODES {
+                let node_id = format!("bench-node-{node}");
+                store.insert_node(usage_node_msg(&node_id, "{}"))?;
+                for index in 0..per_node {
+                    allocation_id += 1;
+                    // One in ten belongs to the planned job, so the
+                    // `drop_own` path has something real to subtract.
+                    let config = match index % 10 {
+                        0 => "bench-cfg",
+                        _ => "other-cfg",
+                    };
+                    insert_usage_allocation(
+                        &store,
+                        allocation_id,
+                        &node_id,
+                        config,
+                        json!({ "cpu": 10, "memory": 8 }),
+                    )?;
+                }
+            }
+            let nodes: Vec<Node> = (0..NODES)
+                .map(|node| store.get_node(&format!("bench-node-{node}")))
+                .collect::<R<_>>()?;
+
+            let mut conn = store.write_connection()?;
+            let tx = Store::write_tx(&mut conn)?;
+
+            let started = Instant::now();
+            for _ in 0..ROUNDS {
+                for node in &nodes {
+                    free_pool_the_old_way(&store, &tx, node, "bench-cfg", true)?;
+                }
+            }
+            let old = started.elapsed() / (ROUNDS * NODES) as u32;
+
+            // Warm the cache the way a plan apply would, then measure the
+            // steady state: fingerprint check plus one aggregate.
+            let mut snapshots: HashMap<String, NodeUsageSnapshot> = HashMap::new();
+            for node in 0..NODES {
+                let node_id = format!("bench-node-{node}");
+                if let Some(snapshot) = store.node_usage_tx(&tx, &node_id)? {
+                    snapshots.insert(node_id, snapshot);
+                }
+            }
+            store.publish_node_usage_tx(&tx, &mut snapshots, &[], &HashMap::new())?;
+
+            let own = store.own_allocation_usage_tx(&tx, "bench-cfg")?;
+            let started = Instant::now();
+            for _ in 0..ROUNDS {
+                for node in &nodes {
+                    store.free_pool_for_node_tx(&tx, node, "bench-cfg", true, Some(&own))?;
+                }
+            }
+            let new = started.elapsed() / (ROUNDS * NODES) as u32;
+
+            println!("free pool @ {per_node} allocations/node: row walk {old:?}, cached {new:?}");
+            tx.commit()?;
+        }
+        Ok(())
+    }
+
+    /// Hotspot loop for the batch body: one 40-allocs/node store, thirty
+    /// 10-plan batches over rotating node ranges, no capture. Exists to be
+    /// sample-profiled (`sample <pid>` on macOS, `perf` on Linux) — the
+    /// commit-split bench says WHERE the commit's time is (the body, not
+    /// the diff or the changeset apply); this says what the body spends it
+    /// on.
+    ///
+    /// ```bash
+    /// cargo test --release --lib bench_plan_body_hotspot_loop -- --ignored --nocapture &
+    /// sample legion 5 -file /tmp/body.sample.txt   # while it runs
+    /// ```
+    #[test]
+    #[ignore = "profiling harness; run with --release --ignored --nocapture"]
+    fn bench_plan_body_hotspot_loop() -> R<()> {
+        const NODES: usize = 1000;
+        const PLANS: usize = 10;
+        const PLACEMENTS_PER_PLAN: usize = 44;
+        const ROUNDS: usize = 200;
+
+        let store = setup_store()?;
+        let conn = store.write_connection()?;
+        conn.execute(
+            "INSERT INTO job (id, name, status, created_at) \
+             VALUES ('filler', 'filler', 'running', '2026-01-01T00:00:00Z');",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO job_config (id, name, type, meta, version, created_at, job_id) \
+             VALUES ('filler-cfg', 'filler', 'service', '{}', 1, '2026-01-01T00:00:00Z', 'filler');",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO task_config (id, count, name, runtime, config, resources, constraints, job_id, job_config_id) \
+             VALUES (1, 1, 'filler-task', 'noop', '{}', '{\"cpu\": 10, \"memory\": 8}', '{}', 'filler', 'filler-cfg');",
+            [],
+        )?;
+        drop(conn);
+        for node in 0..NODES {
+            store.insert_node(usage_node_msg(&format!("bench-node-{node}"), "{}"))?;
+        }
+        let conn = store.write_connection()?;
+        let mut alloc_id = 0i64;
+        for node in 0..NODES {
+            for _ in 0..40 {
+                alloc_id += 1;
+                conn.execute(
+                    "INSERT INTO allocation (id, status, resources, node_id, job_config_id, task_config_id) \
+                     VALUES (?1, 'running', '{\"cpu\": 10, \"memory\": 8}', ?2, 'filler-cfg', 1);",
+                    params![alloc_id, format!("bench-node-{node}")],
+                )?;
+            }
+        }
+        drop(conn);
+
+        // Streamed (not captured) so an external profiler can key off it:
+        // everything before this line is store construction, not the body.
+        eprintln!("LOOP START");
+        let mut total = std::time::Duration::ZERO;
+        for round in 0..ROUNDS {
+            let mut batch = Vec::with_capacity(PLANS);
+            for plan in 0..PLANS {
+                let job_id = format!("bench-job-{round}-{plan}");
+                let config_id = format!("bench-cfg-{round}-{plan}");
+                let task_id = 1000 + (round * PLANS + plan) as i64;
+                let conn = store.write_connection()?;
+                conn.execute(
+                    "INSERT INTO job (id, name, status, created_at) VALUES (?1, ?1, 'running', '2026-01-01T00:00:00Z');",
+                    [&job_id],
+                )?;
+                conn.execute(
+                    "INSERT INTO job_config (id, name, type, meta, version, created_at, job_id) \
+                     VALUES (?1, ?2, 'service', '{}', 1, '2026-01-01T00:00:00Z', ?2);",
+                    params![config_id, job_id],
+                )?;
+                conn.execute(
+                    "INSERT INTO task_config (id, count, name, runtime, config, resources, constraints, job_id, job_config_id) \
+                     VALUES (?1, ?2, 'bench-task', 'noop', '{}', '{\"cpu\": 10, \"memory\": 8}', '{}', ?3, ?4);",
+                    params![task_id, PLACEMENTS_PER_PLAN as i64, job_id, config_id],
+                )?;
+                drop(conn);
+                // Rotate the node range so successive rounds spread over the
+                // fleet the way a live scheduler would.
+                let base =
+                    (round * 61 + plan * PLACEMENTS_PER_PLAN) % (NODES - PLACEMENTS_PER_PLAN);
+                let nodes: HashSet<String> = (0..PLACEMENTS_PER_PLAN)
+                    .map(|slot| format!("bench-node-{}", base + slot))
+                    .collect();
+                let expected_versions = store.allocation_version_vector(&config_id, &nodes)?;
+                let placements: Vec<PlanSubmissionPlacement> = nodes
+                    .iter()
+                    .map(|node| PlanSubmissionPlacement {
+                        task_id,
+                        candidates: vec![node.clone()],
+                    })
+                    .collect();
+                batch.push(PlanApplyRequest {
+                    job_config_id: config_id,
+                    mode: "submit".into(),
+                    placements: PlanPlacements::Candidates(placements),
+                    expected_versions,
+                    evictions: Vec::new(),
+                    target_instance: String::new(),
+                });
+            }
+            let started = Instant::now();
+            let results = store.run_plan_batch_txn(&batch)?;
+            total += started.elapsed();
+            for result in &results {
+                assert!(result.is_ok(), "hotspot loop rejected a plan: {result:?}");
+            }
+        }
+        println!(
+            "hotspot loop: {ROUNDS} batches, body mean {:?}",
+            total / ROUNDS as u32
+        );
+        Ok(())
+    }
+
+    /// Split the serialized plan-apply commit into its three parts, at two
+    /// cluster fills: executing the batch body, capturing it (execute +
+    /// session diff + rollback), and applying the captured changeset — the
+    /// last being what the leader AND every follower pay per commit.
+    ///
+    /// Why this exists: the AWS ladder measured the group commit at 108.7 ms
+    /// with 50k live allocations and 285 ms at 200k (batch ~9.6), while the
+    /// quorum round itself stayed under 8 ms — so whatever grows with fill
+    /// is in the local SQLite work this bench isolates. Three store-path
+    /// fixes each flattened their own cost and the ladder's ~1.6x-per-
+    /// doubling slope never moved; this is the instrument for finding the
+    /// term that does move it.
+    ///
+    /// ```bash
+    /// cargo test --release --lib bench_plan_batch_commit_split -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "benchmark; run with --release --ignored --nocapture"]
+    fn bench_plan_batch_commit_split() -> R<()> {
+        use crate::storage::raft::capture::{apply_changeset, capture_mutation};
+
+        const NODES: usize = 1000;
+        const PLANS: usize = 10;
+        const PLACEMENTS_PER_PLAN: usize = 44;
+
+        // Arms mutate the store (a committed body, an applied changeset), so
+        // each arm gets its own identically-built store: same fill, no
+        // contamination between measurements.
+        let build = |per_node: usize| -> R<(Store, Vec<PlanApplyRequest>)> {
+            let store = setup_store()?;
+            let conn = store.write_connection()?;
+            // Filler load: what the cluster is already running.
+            conn.execute(
+                "INSERT INTO job (id, name, status, created_at) \
+                 VALUES ('filler', 'filler', 'running', '2026-01-01T00:00:00Z');",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO job_config (id, name, type, meta, version, created_at, job_id) \
+                 VALUES ('filler-cfg', 'filler', 'service', '{}', 1, '2026-01-01T00:00:00Z', 'filler');",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO task_config (id, count, name, runtime, config, resources, constraints, job_id, job_config_id) \
+                 VALUES (1, 1, 'filler-task', 'noop', '{}', '{\"cpu\": 10, \"memory\": 8}', '{}', 'filler', 'filler-cfg');",
+                [],
+            )?;
+            drop(conn);
+
+            for node in 0..NODES {
+                store.insert_node(usage_node_msg(&format!("bench-node-{node}"), "{}"))?;
+            }
+            let conn = store.write_connection()?;
+            let mut alloc_id = 0i64;
+            for node in 0..NODES {
+                for _ in 0..per_node {
+                    alloc_id += 1;
+                    conn.execute(
+                        "INSERT INTO allocation (id, status, resources, node_id, job_config_id, task_config_id) \
+                         VALUES (?1, 'running', '{\"cpu\": 10, \"memory\": 8}', ?2, 'filler-cfg', 1);",
+                        params![alloc_id, format!("bench-node-{node}")],
+                    )?;
+                }
+            }
+            drop(conn);
+
+            // The batch under test: PLANS fresh submits, dense_fleet-shaped
+            // (single-candidate placements on disjoint nodes, so every
+            // placement binds first choice and no fallback walking muddies
+            // the timing).
+            let mut batch = Vec::with_capacity(PLANS);
+            for plan in 0..PLANS {
+                let job_id = format!("bench-job-{plan}");
+                let config_id = format!("bench-cfg-{plan}");
+                let task_id = 1000 + plan as i64;
+                let conn = store.write_connection()?;
+                conn.execute(
+                    "INSERT INTO job (id, name, status, created_at) VALUES (?1, ?1, 'running', '2026-01-01T00:00:00Z');",
+                    [&job_id],
+                )?;
+                conn.execute(
+                    "INSERT INTO job_config (id, name, type, meta, version, created_at, job_id) \
+                     VALUES (?1, ?2, 'service', '{}', 1, '2026-01-01T00:00:00Z', ?2);",
+                    params![config_id, job_id],
+                )?;
+                conn.execute(
+                    "INSERT INTO task_config (id, count, name, runtime, config, resources, constraints, job_id, job_config_id) \
+                     VALUES (?1, ?2, 'bench-task', 'noop', '{}', '{\"cpu\": 10, \"memory\": 8}', '{}', ?3, ?4);",
+                    params![task_id, PLACEMENTS_PER_PLAN as i64, job_id, config_id],
+                )?;
+                drop(conn);
+
+                let nodes: HashSet<String> = (0..PLACEMENTS_PER_PLAN)
+                    .map(|slot| format!("bench-node-{}", plan * PLACEMENTS_PER_PLAN + slot))
+                    .collect();
+                let expected_versions = store.allocation_version_vector(&config_id, &nodes)?;
+                let placements: Vec<PlanSubmissionPlacement> = nodes
+                    .iter()
+                    .map(|node| PlanSubmissionPlacement {
+                        task_id,
+                        candidates: vec![node.clone()],
+                    })
+                    .collect();
+                batch.push(PlanApplyRequest {
+                    job_config_id: config_id,
+                    mode: "submit".into(),
+                    placements: PlanPlacements::Candidates(placements),
+                    expected_versions,
+                    evictions: Vec::new(),
+                    target_instance: String::new(),
+                });
+            }
+            Ok((store, batch))
+        };
+
+        for per_node in [10usize, 40] {
+            // Arm 1: the batch body alone, committed for real.
+            let (store, batch) = build(per_node)?;
+            let started = Instant::now();
+            let results = store.run_plan_batch_txn(&batch)?;
+            let body = started.elapsed();
+            for result in &results {
+                assert!(result.is_ok(), "body arm rejected a plan: {result:?}");
+            }
+
+            // Arm 2: the same body under capture (execute + diff + rollback),
+            // then the changeset applied — leader-side cost is capture +
+            // apply + the ~4-8 ms quorum round the rig measures separately.
+            let (store, batch) = build(per_node)?;
+            let started = Instant::now();
+            let ((), changeset) = capture_mutation(&store, Lane::Scheduler, |s| {
+                for result in s.run_plan_batch_txn(&batch)? {
+                    result?;
+                }
+                Ok(())
+            })?;
+            let capture = started.elapsed();
+
+            let started = Instant::now();
+            apply_changeset(&store, &changeset)?;
+            let apply = started.elapsed();
+
+            println!(
+                "commit split @ {per_node} allocs/node ({} live rows): \
+                 body {body:?}, capture {capture:?} (diff+rollback {:?}), \
+                 changeset apply {apply:?}, changeset {} KiB",
+                NODES * per_node,
+                capture.saturating_sub(body),
+                changeset.len() / 1024,
+            );
+        }
+        Ok(())
+    }
+
+    /// Wall-clock A/B for the read-model reprojection, at two cluster
+    /// fills — the in-memory sibling of `bench_local_free_pool_rebuild_by_fill`.
+    ///
+    /// Reprojection runs after every projected changeset, on every replica,
+    /// INSIDE the read-model write lock every planner reads through. The
+    /// walk arm re-aggregates each touched node's whole allocation list
+    /// (`NodeUsage::from_rows` — one JSON normalization per allocation),
+    /// which is what every reprojection did before the
+    /// `SchedulingReadModel::node_usage` memo; the memo arm subtracts the
+    /// cached aggregate (O(resource dims) per node). 44 touched nodes is
+    /// the AWS `dense_fleet` per-eval shape.
+    ///
+    /// ```bash
+    /// cargo test --release --lib bench_local_reprojection -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "benchmark; run with --release --ignored --nocapture"]
+    fn bench_local_reprojection_by_fill() -> R<()> {
+        const NODES: usize = 50;
+        const TOUCHED: usize = 44;
+        const ROUNDS: u32 = 200;
+
+        for per_node in [10usize, 40] {
+            let store = setup_store()?;
+            insert_usage_job(&store, "bench-job", &["bench-cfg"])?;
+            let mut allocation_id = 0i64;
+            for node in 0..NODES {
+                let node_id = format!("bench-node-{node}");
+                store.insert_node(usage_node_msg(&node_id, "{}"))?;
+                for _ in 0..per_node {
+                    allocation_id += 1;
+                    insert_usage_allocation(
+                        &store,
+                        allocation_id,
+                        &node_id,
+                        "bench-cfg",
+                        json!({ "cpu": 10, "memory": 8 }),
+                    )?;
+                }
+            }
+            store.refresh_read_model()?;
+
+            let touched: Vec<String> = (0..TOUCHED).map(|i| format!("bench-node-{i}")).collect();
+            let touched_refs: Vec<&str> = touched.iter().map(String::as_str).collect();
+            let mut guard = store.read_model_writer()?;
+
+            // Walk arm: the memo is dropped before every pass, so each pass
+            // pays the full per-allocation re-aggregation — the pre-memo
+            // reprojection, cost for cost.
+            let started = Instant::now();
+            for _ in 0..ROUNDS {
+                guard.node_usage.clear();
+                Store::reproject_model_nodes(&mut guard, &store.resource_policy, &touched_refs);
+            }
+            let walk = started.elapsed() / ROUNDS;
+
+            // Memo arm: steady state — every touched node's aggregate is
+            // cached, as it is after any reprojection has run once.
+            Store::reproject_model_nodes(&mut guard, &store.resource_policy, &touched_refs);
+            let started = Instant::now();
+            for _ in 0..ROUNDS {
+                Store::reproject_model_nodes(&mut guard, &store.resource_policy, &touched_refs);
+            }
+            let memo = started.elapsed() / ROUNDS;
+
+            println!(
+                "reprojection of {TOUCHED} nodes @ {per_node} allocations/node: \
+                 walk {walk:?}, memo {memo:?}"
+            );
+        }
+        Ok(())
+    }
+
     fn submit_walk_job(store: &Store, name: &str, task: TaskConfig) -> R<(String, i64)> {
         let task_name = task.name.clone();
         let job = JobConfig {
@@ -17173,7 +22616,7 @@ mod tests {
         store.handle_job_submit(
             &job,
             &[Submission {
-                path: "job.jsonnet".into(),
+                path: "job.ncl".into(),
                 content: "job".into(),
                 is_primary: true,
             }],
@@ -17223,8 +22666,14 @@ mod tests {
         Ok(())
     }
 
+    /// Pass 2 of the bind walk: every candidate's epoch moved, so pass 1
+    /// binds nothing — but the in-transaction revalidation says they still
+    /// fit, so the placement binds rather than rejecting. This is the
+    /// behavior change at the heart of
+    /// `internal_docs/plans/plan-apply-conflict-reduction-plan.md`; the
+    /// same shape used to reject the plan outright.
     #[test]
-    fn plan_walk_rejects_when_all_candidates_are_stale() -> R<()> {
+    fn plan_walk_rebinds_an_epoch_dirty_candidate_that_still_fits() -> R<()> {
         let store = setup_store()?;
         store.insert_node(make_node_msg("node-a", "ready"))?;
         store.insert_node(make_node_msg("node-b", "ready"))?;
@@ -17250,13 +22699,63 @@ mod tests {
         store.place_alloc("node-b", rival_task)?;
 
         match store.apply_plan_submission(&submission)? {
+            PlanApplyOutcome::Applied(applied) => {
+                assert_eq!(applied.allocations.len(), 1);
+                assert_eq!(
+                    applied.allocations[0].node_id, "node-a",
+                    "pass 2 walks the same rank order, so rank 0 wins again"
+                );
+                assert_eq!(applied.candidate_ranks, vec![0]);
+            }
+            PlanApplyOutcome::Rejected { reason, .. } => {
+                bail!("an epoch-dirty candidate that still fits must bind: {reason}")
+            }
+        }
+        Ok(())
+    }
+
+    /// The negative half of the pass-2 contract: epoch-dirty *and* out of
+    /// room still rejects, and the reason names the capacity, not the
+    /// staleness — an operator reading it should be told to add nodes.
+    #[test]
+    fn plan_walk_rejects_when_every_epoch_dirty_candidate_is_full() -> R<()> {
+        let store = setup_store()?;
+        // One allocation slot per node, so the rival below fills it.
+        let full_node = |id: &str| NodeMsg {
+            config_attrs: json!({ "maxAllocations": 1 }).to_string(),
+            ..make_node_msg(id, "ready")
+        };
+        store.insert_node(full_node("node-a"))?;
+        store.insert_node(full_node("node-b"))?;
+
+        let (job_config_id, task_id) = submit_walk_job(&store, "walk-full", task("task"))?;
+        let (_, rival_task) = submit_walk_job(&store, "walk-full-rival", task("rival"))?;
+
+        let expected_versions = store.allocation_version_vector(
+            &job_config_id,
+            &HashSet::from(["node-a".to_string(), "node-b".to_string()]),
+        )?;
+        let submission = store.insert_plan_submission_with_candidates(
+            &job_config_id,
+            "fresh",
+            &[PlanSubmissionPlacement {
+                task_id,
+                candidates: vec!["node-a".to_string(), "node-b".to_string()],
+            }],
+            &expected_versions,
+        )?;
+
+        store.place_alloc("node-a", rival_task)?;
+        store.place_alloc("node-b", rival_task)?;
+
+        match store.apply_plan_submission(&submission)? {
             PlanApplyOutcome::Rejected { reason, .. } => {
                 assert!(
-                    reason.contains("no candidate"),
-                    "unexpected rejection reason: {reason}"
+                    reason.contains("no candidate") && reason.contains("no longer has capacity"),
+                    "the rejection must name capacity, not staleness: {reason}"
                 );
             }
-            PlanApplyOutcome::Applied(_) => bail!("expected an all-candidates-stale rejection"),
+            PlanApplyOutcome::Applied(_) => bail!("a full node must not be bound"),
         }
         Ok(())
     }
@@ -17309,6 +22808,9 @@ mod tests {
         let static_port_task = |name: &str| {
             let mut task = task(name);
             task.network = Some(crate::structs::network::NetworkConfig {
+                labels: Default::default(),
+                egress: None,
+                ingress: None,
                 mode: "host".into(),
                 ports: vec![crate::structs::network::PortConfig {
                     name: "http".into(),
@@ -17347,6 +22849,108 @@ mod tests {
             }
             PlanApplyOutcome::Rejected { reason, .. } => {
                 bail!("expected the port-collision candidate to be skipped: {reason}");
+            }
+        }
+        Ok(())
+    }
+
+    /// What replaced the planner's overlap coupling edge: two placements
+    /// of ONE plan may now name the same node, and the walk's
+    /// in-transaction debit is what keeps them from oversubscribing it.
+    /// One allocation slot, two placements, both listing only `node-a` —
+    /// the second must be rejected on capacity, not admitted because its
+    /// epoch happened to be clean.
+    #[test]
+    fn plan_walk_debit_stops_two_placements_of_one_plan_oversubscribing() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(NodeMsg {
+            config_attrs: json!({ "maxAllocations": 1 }).to_string(),
+            ..make_node_msg("node-a", "ready")
+        })?;
+
+        let (job_config_id, task_id) = submit_walk_job(&store, "walk-debit", task("task"))?;
+        let expected_versions = store
+            .allocation_version_vector(&job_config_id, &HashSet::from(["node-a".to_string()]))?;
+        let placement = || PlanSubmissionPlacement {
+            task_id,
+            candidates: vec!["node-a".to_string()],
+        };
+        let submission = store.insert_plan_submission_with_candidates(
+            &job_config_id,
+            "fresh",
+            &[placement(), placement()],
+            &expected_versions,
+        )?;
+
+        match store.apply_plan_submission(&submission)? {
+            PlanApplyOutcome::Rejected { reason, .. } => {
+                assert!(
+                    reason.contains("no longer has capacity"),
+                    "the second placement must lose on capacity: {reason}"
+                );
+            }
+            PlanApplyOutcome::Applied(applied) => bail!(
+                "two placements were admitted onto a one-slot node: {:?}",
+                applied.allocations
+            ),
+        }
+        assert!(store.allocs_for_node("node-a")?.is_empty());
+        Ok(())
+    }
+
+    /// The same guard for static ports: two placements of one plan cannot
+    /// both claim port 18080 on one node, because the walk re-reads the
+    /// node's ports (including the row it just inserted) per bind.
+    #[test]
+    fn plan_walk_port_check_separates_two_placements_of_one_plan() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "ready"))?;
+        store.insert_node(make_node_msg("node-b", "ready"))?;
+
+        let mut port_task = task("task");
+        port_task.network = Some(crate::structs::network::NetworkConfig {
+            labels: Default::default(),
+            egress: None,
+            ingress: None,
+            mode: "host".into(),
+            ports: vec![crate::structs::network::PortConfig {
+                name: "http".into(),
+                static_port: Some(18080),
+                to: None,
+            }],
+        });
+        let (job_config_id, task_id) = submit_walk_job(&store, "walk-port-pair", port_task)?;
+
+        let expected_versions = store.allocation_version_vector(
+            &job_config_id,
+            &HashSet::from(["node-a".to_string(), "node-b".to_string()]),
+        )?;
+        let placement = || PlanSubmissionPlacement {
+            task_id,
+            candidates: vec!["node-a".to_string(), "node-b".to_string()],
+        };
+        let submission = store.insert_plan_submission_with_candidates(
+            &job_config_id,
+            "fresh",
+            &[placement(), placement()],
+            &expected_versions,
+        )?;
+
+        match store.apply_plan_submission(&submission)? {
+            PlanApplyOutcome::Applied(applied) => {
+                let nodes: Vec<&str> = applied
+                    .allocations
+                    .iter()
+                    .map(|allocation| allocation.node_id.as_str())
+                    .collect();
+                assert_eq!(nodes.len(), 2);
+                assert_ne!(
+                    nodes[0], nodes[1],
+                    "both placements claimed port 18080 on one node"
+                );
+            }
+            PlanApplyOutcome::Rejected { reason, .. } => {
+                bail!("both placements had a free node available: {reason}")
             }
         }
         Ok(())
@@ -17485,7 +23089,7 @@ mod tests {
         store.handle_job_submit(
             &job,
             &[Submission {
-                path: "job.jsonnet".into(),
+                path: "job.ncl".into(),
                 content: "job".into(),
                 is_primary: true,
             }],
@@ -17536,7 +23140,7 @@ mod tests {
         store.handle_job_submit(
             &job,
             &[Submission {
-                path: "job.jsonnet".into(),
+                path: "job.ncl".into(),
                 content: "job".into(),
                 is_primary: true,
             }],
@@ -17606,7 +23210,7 @@ mod tests {
         store.handle_job_submit(
             &job,
             &[Submission {
-                path: "job.jsonnet".into(),
+                path: "job.ncl".into(),
                 content: "{}".into(),
                 is_primary: true,
             }],
@@ -17685,7 +23289,7 @@ mod tests {
         store.handle_job_submit(
             &job,
             &[Submission {
-                path: "job.jsonnet".into(),
+                path: "job.ncl".into(),
                 content: "{}".into(),
                 is_primary: true,
             }],
@@ -17717,7 +23321,7 @@ mod tests {
         store.handle_job_submit(
             &job,
             &[Submission {
-                path: "job.jsonnet".into(),
+                path: "job.ncl".into(),
                 content: "{}".into(),
                 is_primary: true,
             }],
@@ -17905,7 +23509,7 @@ mod tests {
         store.handle_job_submit(
             &job,
             &[Submission {
-                path: "job.jsonnet".into(),
+                path: "job.ncl".into(),
                 content: "{}".into(),
                 is_primary: true,
             }],
@@ -18305,7 +23909,7 @@ mod tests {
         store.handle_job_submit(
             &v1,
             &[Submission {
-                path: "job.jsonnet".into(),
+                path: "job.ncl".into(),
                 content: "{}".into(),
                 is_primary: true,
             }],
@@ -18326,7 +23930,7 @@ mod tests {
         store.handle_job_submit(
             &v2,
             &[Submission {
-                path: "job.jsonnet".into(),
+                path: "job.ncl".into(),
                 content: "{}".into(),
                 is_primary: true,
             }],
@@ -18378,7 +23982,7 @@ mod tests {
         store.handle_job_submit(
             &v1,
             &[Submission {
-                path: "job.jsonnet".into(),
+                path: "job.ncl".into(),
                 content: "{}".into(),
                 is_primary: true,
             }],
@@ -18399,7 +24003,7 @@ mod tests {
         store.handle_job_submit(
             &v2,
             &[Submission {
-                path: "job.jsonnet".into(),
+                path: "job.ncl".into(),
                 content: "{}".into(),
                 is_primary: true,
             }],
@@ -18464,7 +24068,7 @@ mod tests {
         store.handle_job_submit(
             &config,
             &[Submission {
-                path: "job.jsonnet".into(),
+                path: "job.ncl".into(),
                 content: "{}".into(),
                 is_primary: true,
             }],
@@ -19817,7 +25421,7 @@ mod tests {
         store.handle_job_submit(
             &job,
             &[Submission {
-                path: "job.jsonnet".into(),
+                path: "job.ncl".into(),
                 content: format!("{{ marker: '{marker}' }}"),
                 is_primary: true,
             }],
@@ -20002,7 +25606,7 @@ mod tests {
         store.handle_job_submit(
             &job,
             &[Submission {
-                path: "job.jsonnet".into(),
+                path: "job.ncl".into(),
                 content: "{}".into(),
                 is_primary: true,
             }],
@@ -20251,9 +25855,9 @@ mod tests {
         // Latest fetch returns v2; explicit fetch still returns v1 verbatim.
         let latest = store.get_job_template_version("tpl", None)?;
         assert_eq!(latest.version, 2);
-        assert_eq!(latest.source_jsonnet, "src-v2");
+        assert_eq!(latest.source_nickel, "src-v2");
         let pinned = store.get_job_template_version("tpl", Some(1))?;
-        assert_eq!(pinned.source_jsonnet, "src-v1");
+        assert_eq!(pinned.source_nickel, "src-v1");
         assert_eq!(pinned.latest_version, 2);
         assert_eq!(pinned.variables.len(), 1);
 
@@ -20820,7 +26424,7 @@ mod tests {
             store.handle_job_submit(
                 &job,
                 &[Submission {
-                    path: "job.jsonnet".into(),
+                    path: "job.ncl".into(),
                     content: "job".into(),
                     is_primary: true,
                 }],
@@ -20850,6 +26454,383 @@ mod tests {
         Ok(())
     }
 
+    /// Capture a mutation the way a lane leader does — locally rolled back —
+    /// and then apply the committed changeset back into the same store. That
+    /// apply is the projection every replica runs, and the only caller of
+    /// the delta read-model refresh.
+    fn apply_captured<T>(store: &Store, f: impl FnOnce(&Store) -> R<T>) -> R<T> {
+        let (value, changeset) = raft_capture::capture_mutation(store, Lane::Scheduler, f)?;
+        raft_capture::apply_changeset(store, &changeset)?;
+        Ok(value)
+    }
+
+    /// The allocation cache, normalized for comparison against a full
+    /// reload. An absent entry and an empty list mean the same thing to
+    /// every reader (`allocations_by_node.get(..)` unwraps to `&[]`), and
+    /// SQLite promises no row order without an ORDER BY, so neither
+    /// distinction is allowed to fail the comparison.
+    /// The job index as sorted `(job, node) -> [allocation id]`, so two
+    /// indexes compare regardless of hash or insertion order.
+    fn job_index_view(model: &SchedulingReadModel) -> BTreeMap<(String, String), Vec<i64>> {
+        let mut view = BTreeMap::new();
+        for (job_id, nodes) in &model.allocations_by_job {
+            for (node_id, references) in nodes {
+                let mut ids: Vec<i64> = references.iter().map(|reference| reference.id).collect();
+                ids.sort_unstable();
+                view.insert((job_id.clone(), node_id.clone()), ids);
+            }
+        }
+        view
+    }
+
+    fn allocation_cache_view(model: &SchedulingReadModel) -> R<BTreeMap<String, Vec<String>>> {
+        let mut view = BTreeMap::new();
+        for (node_id, allocations) in &model.allocations_by_node {
+            if allocations.is_empty() {
+                continue;
+            }
+            let mut rendered = Vec::new();
+            for allocation in allocations.iter() {
+                rendered.push(serde_json::to_string(allocation)?);
+            }
+            rendered.sort();
+            view.insert(node_id.clone(), rendered);
+        }
+        Ok(view)
+    }
+
+    /// The derived free-capacity pools, rendered order-stably (both the map
+    /// and the item sets inside it are hashed).
+    fn node_pool_view(model: &SchedulingReadModel) -> BTreeMap<String, BTreeMap<String, String>> {
+        model
+            .node_pools
+            .iter()
+            .map(|(node_id, pool)| {
+                let values = pool
+                    .values
+                    .iter()
+                    .map(|(resource, value)| {
+                        let rendered = match value {
+                            crate::resources::ResourceValue::Amount(amount) => {
+                                format!("amount:{amount}")
+                            }
+                            crate::resources::ResourceValue::Items(items) => {
+                                let mut items: Vec<&str> =
+                                    items.iter().map(String::as_str).collect();
+                                items.sort_unstable();
+                                format!("items:{}", items.join(","))
+                            }
+                        };
+                        (resource.clone(), rendered)
+                    })
+                    .collect();
+                (node_id.clone(), values)
+            })
+            .collect()
+    }
+
+    /// The delta refresh's whole contract: after a changeset is projected,
+    /// the read model must hold exactly what a full reload of committed
+    /// state would produce — allocations, the pools derived from them, and
+    /// the epoch mirror.
+    fn assert_model_matches_full_reload(store: &Store, label: &str) -> R<()> {
+        let cached = store.scheduling_read_model()?;
+        let truth = store.load_read_model()?;
+        assert_eq!(
+            allocation_cache_view(&cached)?,
+            allocation_cache_view(&truth)?,
+            "{label}: allocations_by_node must equal a full reload"
+        );
+        // The job index is only sound if it equals a rebuild from the lists
+        // it mirrors, on every publish path — a stale entry would let a plan
+        // miscount its own allocations.
+        let mut rebuilt = cached.clone();
+        rebuilt.rebuild_job_index();
+        assert_eq!(
+            job_index_view(&cached),
+            job_index_view(&rebuilt),
+            "{label}: the job index must equal a rebuild from allocations_by_node"
+        );
+        assert_eq!(
+            cached.jobs_by_node, rebuilt.jobs_by_node,
+            "{label}: the job index's reverse must equal a rebuild"
+        );
+        assert_eq!(
+            node_pool_view(&cached),
+            node_pool_view(&truth),
+            "{label}: node_pools must equal a full reload"
+        );
+        for (scope, epoch) in &truth.scope_epochs {
+            assert_eq!(
+                cached.scope_epochs.get(scope),
+                Some(epoch),
+                "{label}: epoch mirror for {scope} must equal committed state"
+            );
+        }
+        // The usage memo is only sound if every entry equals the aggregate
+        // of the list it mirrors — contributor counts included, which the
+        // pool comparison above cannot see (a wrong count with the right sum
+        // yields the right pool today and the wrong one on the next splice).
+        for (node_id, usage) in &cached.node_usage {
+            let allocations = cached
+                .allocations_by_node
+                .get(node_id)
+                .map(|allocations| allocations.as_slice())
+                .unwrap_or(&[]);
+            let rebuilt = NodeUsage::from_rows(
+                allocations
+                    .iter()
+                    .map(|allocation| (allocation.id, &allocation.resources)),
+                &store.resource_policy,
+            )
+            .with_context(|| format!("{label}: node {node_id} memo list failed to aggregate"))?;
+            assert_eq!(
+                usage, &rebuilt,
+                "{label}: node {node_id} usage memo must equal its list's aggregate"
+            );
+        }
+        Ok(())
+    }
+
+    /// Point the round-robin scrub at one specific node, so a test can prove
+    /// which mechanism repaired a cache entry: the delta's own fallback, or
+    /// the scrub.
+    fn aim_scrub_at(store: &Store, node_id: &str) -> R<()> {
+        let mut queue = store
+            .alloc_scrub_queue
+            .lock()
+            .map_err(|_| anyhow!("scrub queue lock poisoned"))?;
+        *queue = vec![node_id.to_string()];
+        Ok(())
+    }
+
+    /// The node the scrub is parked on while a test proves something about
+    /// the delta itself. Nothing is ever placed here, so a scrub of it can
+    /// neither hide a bad splice nor repair one.
+    const SCRUB_PARK_NODE: &str = "node-park";
+
+    /// [`apply_captured`] with the scrub parked (see [`SCRUB_PARK_NODE`]):
+    /// whatever the read model looks like afterwards, the delta put it
+    /// there.
+    fn apply_captured_delta_only<T>(store: &Store, f: impl FnOnce(&Store) -> R<T>) -> R<T> {
+        aim_scrub_at(store, SCRUB_PARK_NODE)?;
+        apply_captured(store, f)
+    }
+
+    /// Add an allocation to a node's cached list that committed state does
+    /// not have — the drift a delta refresh cannot see, because no changeset
+    /// will ever name it.
+    fn plant_phantom_allocation(store: &Store, node_id: &str, template: &Allocation) -> R<i64> {
+        let mut guard = store.read_model_writer()?;
+        let entry = guard
+            .allocations_by_node
+            .entry(node_id.to_string())
+            .or_default();
+        let allocations = Arc::make_mut(entry);
+        let phantom_id = 900_000 + allocations.len() as i64;
+        allocations.push(Allocation {
+            id: phantom_id,
+            node_id: node_id.to_string(),
+            ..template.clone()
+        });
+        Ok(phantom_id)
+    }
+
+    /// The delta refresh replaces a full per-node reload, so the only thing
+    /// that makes it safe is producing the same model: after inserts,
+    /// in-place updates, deletes, an eviction, and a mixed changeset, the
+    /// delta-refreshed read model must equal what a full reload of committed
+    /// state would build.
+    #[test]
+    fn a_delta_refreshed_read_model_equals_a_full_reload() -> R<()> {
+        let store = setup_store()?;
+        for node_id in ["node-a", "node-b", SCRUB_PARK_NODE] {
+            store.insert_node(make_node_msg(node_id, "ready"))?;
+        }
+        let (job_config_id, task_id) = submit_named_job(&store, "delta-demo")?;
+
+        // INSERT, on two different nodes.
+        let first = apply_captured_delta_only(&store, |s| s.place_alloc("node-a", task_id))?;
+        assert_model_matches_full_reload(&store, "insert")?;
+        let second = apply_captured_delta_only(&store, |s| s.place_alloc("node-b", task_id))?;
+        assert_model_matches_full_reload(&store, "second insert")?;
+        assert_eq!(
+            store
+                .cached_allocations_by_node()?
+                .get("node-a")
+                .map(Vec::len),
+            Some(1),
+            "the delta spliced the placement into node-a's list"
+        );
+
+        // UPDATE in place: a status change names no node at all (only the
+        // changed column rides the record), so this is the case that has to
+        // find its node from the row it re-reads.
+        apply_captured_delta_only(&store, |s| s.complete_allocation(first.id, true))?;
+        assert_model_matches_full_reload(&store, "in-place update")?;
+        assert_eq!(
+            store
+                .cached_allocations_by_node()?
+                .get("node-a")
+                .and_then(|allocs| allocs.first())
+                .map(|alloc| alloc.status.clone())
+                .as_deref(),
+            Some(ALLOCATION_STATUS_COMPLETE),
+            "the delta patched the changed row rather than reloading the node"
+        );
+
+        // DELETE.
+        apply_captured_delta_only(&store, |s| s.remove_allocation_by_id(second.id))?;
+        assert_model_matches_full_reload(&store, "delete")?;
+        assert!(
+            store
+                .cached_allocations_by_node()?
+                .get("node-b")
+                .map_or(true, Vec::is_empty),
+            "node-b's only allocation was removed"
+        );
+
+        // EVICTION: a removal that carries a stop notice and a cause, the
+        // shape preemption and drain commit.
+        let victim = apply_captured_delta_only(&store, |s| s.place_alloc("node-b", task_id))?;
+        apply_captured_delta_only(&store, |s| {
+            s.remove_allocation_by_id_because(victim.id, StopCause::Preempted)
+        })?;
+        assert_model_matches_full_reload(&store, "eviction")?;
+
+        // MIXED: two placements, a removal, and a status change in ONE
+        // changeset, across both nodes.
+        let doomed = apply_captured_delta_only(&store, |s| s.place_alloc("node-a", task_id))?;
+        apply_captured_delta_only(&store, |s| {
+            s.place_alloc("node-a", task_id)?;
+            s.place_alloc("node-b", task_id)?;
+            s.remove_allocation_by_id(doomed.id)?;
+            s.complete_allocation(first.id, false)?;
+            Ok(())
+        })?;
+        assert_model_matches_full_reload(&store, "mixed changeset")?;
+
+        // A Fresh plan's wholesale replacement: every allocation of the job
+        // config retired in one changeset.
+        apply_captured_delta_only(&store, |s| s.remove_allocs_for_job_config(&job_config_id))?;
+        assert_model_matches_full_reload(&store, "wholesale removal")?;
+        Ok(())
+    }
+
+    /// The property the delta gives up is self-healing: it can only patch
+    /// entries that were already right. So a delta that contradicts the
+    /// cache — here a removal whose row is not in the cached list — must
+    /// hand that node to the full reload, which is self-healing and takes
+    /// the unrelated phantom with it.
+    #[test]
+    fn a_delta_that_contradicts_the_cache_reloads_that_node_in_full() -> R<()> {
+        let store = setup_store()?;
+        for node_id in ["node-a", "node-b"] {
+            store.insert_node(make_node_msg(node_id, "ready"))?;
+        }
+        let (_job_config_id, task_id) = submit_named_job(&store, "drift-demo")?;
+        let first = apply_captured(&store, |s| s.place_alloc("node-a", task_id))?;
+        apply_captured(&store, |s| s.place_alloc("node-a", task_id))?;
+
+        // Corrupt node-a's cached list: drop a row committed state has, and
+        // add one it does not.
+        let phantom_id = plant_phantom_allocation(&store, "node-a", &first)?;
+        {
+            let mut guard = store.read_model_writer()?;
+            let entry = guard
+                .allocations_by_node
+                .get_mut("node-a")
+                .context("node-a allocations")?;
+            Arc::make_mut(entry).retain(|allocation| allocation.id != first.id);
+        }
+
+        // Keep the scrub away from node-a, so any repair must come from the
+        // delta's own fallback.
+        aim_scrub_at(&store, "node-b")?;
+        apply_captured(&store, |s| s.remove_allocation_by_id(first.id))?;
+
+        let cached = store.cached_allocations_by_node()?;
+        let node_a = cached.get("node-a").context("node-a allocations")?;
+        assert!(
+            !node_a.iter().any(|allocation| allocation.id == phantom_id),
+            "the contradicted node must be reloaded in full, phantom and all: {node_a:?}"
+        );
+        assert_model_matches_full_reload(&store, "contradicted delta")?;
+        Ok(())
+    }
+
+    /// The same fallback, from the other direction: a changeset that names a
+    /// row committed state does not have cannot be spliced at all — the
+    /// delta cannot even say which node it belonged to — so the whole
+    /// changeset's scopes go back to the full reload.
+    #[test]
+    fn a_delta_naming_an_uncommitted_row_falls_back_to_a_full_reload() -> R<()> {
+        let store = setup_store()?;
+        for node_id in ["node-a", "node-b"] {
+            store.insert_node(make_node_msg(node_id, "ready"))?;
+        }
+        let (_job_config_id, task_id) = submit_named_job(&store, "missing-demo")?;
+        let placed = apply_captured(&store, |s| s.place_alloc("node-a", task_id))?;
+        let phantom_id = plant_phantom_allocation(&store, "node-a", &placed)?;
+
+        aim_scrub_at(&store, "node-b")?;
+        let mut delta = AllocationDelta::new();
+        delta.upserts.insert(4_242);
+        delta.inserts.insert(4_242);
+        store.cache_apply_allocation_delta(
+            &delta,
+            &BTreeSet::from(["node-a".to_string()]),
+            &BTreeSet::new(),
+        )?;
+
+        let cached = store.cached_allocations_by_node()?;
+        let node_a = cached.get("node-a").context("node-a allocations")?;
+        assert!(
+            !node_a.iter().any(|allocation| allocation.id == phantom_id),
+            "an unsplicable delta must reload its scopes in full: {node_a:?}"
+        );
+        assert_model_matches_full_reload(&store, "unsplicable delta")?;
+        Ok(())
+    }
+
+    /// Drift on a node no later changeset touches is the dangerous case — a
+    /// node wrongly believed full is a node the scheduler then never writes
+    /// to, so no delta ever visits it again. The round-robin scrub is what
+    /// bounds that: one node reloaded in full per projected changeset,
+    /// refilled with the whole fleet when the queue empties.
+    #[test]
+    fn the_allocation_scrub_repairs_a_node_no_delta_touches() -> R<()> {
+        let store = setup_store()?;
+        for node_id in ["node-a", "node-b"] {
+            store.insert_node(make_node_msg(node_id, "ready"))?;
+        }
+        let (_job_config_id, task_id) = submit_named_job(&store, "scrub-demo")?;
+        let placed = apply_captured(&store, |s| s.place_alloc("node-b", task_id))?;
+        let phantom_id = plant_phantom_allocation(&store, "node-b", &placed)?;
+
+        // A changeset that touches only node-a. Without the scrub node-b
+        // would keep its phantom forever.
+        aim_scrub_at(&store, "node-b")?;
+        apply_captured(&store, |s| s.place_alloc("node-a", task_id))?;
+
+        let cached = store.cached_allocations_by_node()?;
+        let node_b = cached.get("node-b").context("node-b allocations")?;
+        assert!(
+            !node_b.iter().any(|allocation| allocation.id == phantom_id),
+            "the scrub must repair a node the delta never named: {node_b:?}"
+        );
+        assert_model_matches_full_reload(&store, "scrubbed node")?;
+
+        // The queue refills with the whole fleet once it drains, so the
+        // sweep continues rather than stopping at the first pass.
+        let refilled = store.next_alloc_scrub_node()?;
+        assert!(
+            refilled.is_some(),
+            "an emptied scrub queue must refill from the fleet"
+        );
+        Ok(())
+    }
+
     /// JC-40 composite-retry idempotency: when the status half of the
     /// submit composite is lost (rejected on a node that did not lead the
     /// status lane yet), the client's retry re-submits the identical config
@@ -20868,7 +26849,7 @@ mod tests {
             version: None,
         };
         let subs = [Submission {
-            path: "job.jsonnet".into(),
+            path: "job.ncl".into(),
             content: "job".into(),
             is_primary: true,
         }];

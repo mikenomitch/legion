@@ -12,8 +12,13 @@ Legion uses a mixed strategy:
 Integration tests currently include:
 
 - `tests/config_jobs.rs`
-  - validates all Jsonnet job configs deserialize to `JobConfig`.
+  - evaluates every shipped `configs/jobs/*.ncl` and validates it the way the
+    manager does on submit, not just that it deserializes to `JobConfig`.
   - validates maximal config shape.
+  - evaluates the shipped manager configs (`configs/*.ncl`) and worker configs
+    (`configs/workers/*.ncl`) into their config structs.
+  - parses the shipped job template, resolves its defaults, renders it through
+    the manager's sandboxed path, and validates the result.
 - `tests/scheduler_integration.rs`
   - end-to-end scheduling scenarios (constraints, permit, count.per, reschedule behavior).
 - `tests/eval_loop.rs`
@@ -82,6 +87,23 @@ What they measure:
 
     A change is only real if it exceeds that floor. Report both, and say which
     it is.
+  - `plan_under_fill` group: the cluster-fill axis. A 5,000-node fleet is
+    pre-filled with 0 / 10 / 40 allocations per node from other jobs (through
+    the store's allocation writer, so the fill is not itself a scheduling
+    measurement), then a six-placement job is planned against it as
+    `plan_only` (the planning phases alone, no state drift between
+    iterations) and as `plan_and_apply` (a fresh job per iteration). A cost
+    that is flat across the fill levels is a per-plan constant; one that
+    grows with them is proportional to how full the cluster is rather than
+    to the job being placed — the slope the AWS `dense_fleet` ladder
+    measured, which neither of the groups above can reproduce because both
+    start from an empty cluster. The `plan_and_apply` cells also print the
+    mean per-phase `PlanTimings` breakdown of every plan they measured, so a
+    run says where the time went at each fill level. Those cells include
+    two local commits per plan (the apply, plus — without the daemon's
+    drain task — the inline status projection) and swing more run to run
+    on a VM than the read-only cells do; read `plan_only` for planning
+    cost and the phase means for where apply time goes.
 - `eval_critical_path_bench`: end-to-end enqueue -> claim -> apply -> complete
   latency under 1/4/8 concurrent eval workers (write-lock contention).
 - `plan_contention`: N-way concurrent single-allocation submits against one
@@ -139,6 +161,22 @@ LEGION_BENCH_BACKENDS=local_disk,raft1 LEGION_HEARTBEAT_NODES=1000,5000 \
 
 Recorded results live in `benchmarks/scheduler/README.md`, with the host
 and build profile noted alongside every table.
+
+**A heartbeat number states which storage it was taken on**, and whether
+liveness was on the raft path. Since a steady-state heartbeat costs no
+commit ([node-liveness.md](node-liveness.md)), a modern number measures the
+gRPC handler; a number from a cluster in the mixed-version fallback measures
+the commit path, and the two are not comparable. The gp3-to-NVMe ratio is the
+single figure that tells them apart: near 1.0 means liveness is off the raft
+path, ~25x means it is not.
+
+**A throughput number carries the cadence it was achieved at.** A system that
+quietly slows its own heartbeats to score better is cheating, so every
+benchmark run records the served interval and
+`legion_heartbeat_freshness_ratio` alongside throughput, and comparative runs
+either pin all systems to the same interval or report all three systems'
+*achieved* cadence. Adaptive cadence is off by default for exactly this
+reason ([heartbeat-cadence-and-scale.md](heartbeat-cadence-and-scale.md)).
 
 ### Measuring scheduler event-stream overhead
 
@@ -199,6 +237,27 @@ CI runs the fixture tests, `terraform validate`, and shell syntax checks
 whenever `benchmarks/aws/**` changes; nothing in CI touches AWS. The
 end-to-end sim-fleet wire test is `tests/worker_simulation.rs` (runs in
 the normal `cargo test` suite).
+
+The rig submits Legion jobs through `legion-loadgen`
+(`benchmarks/loadgen/`), a benchmark-only binary that holds a small pool
+of gRPC connections open and issues many concurrent `RunJob` calls. It
+is feature-gated so it is not part of an ordinary build:
+
+```bash
+cargo build --release --features loadgen --bin legion-loadgen
+```
+
+It exists because submitting with one `legion job run` process per job
+ceilings at roughly 40-100 jobs/sec, which was low enough that campaign
+cells reported the driver's rate rather than the scheduler's — the
+driver flags that case as `submission.driver_bound: true`.
+
+**It is Legion-only, and that makes it a fairness hazard.** Nomad and
+Kubernetes still submit one CLI process per job, so a cross-system
+comparison must put all three on the shared loop
+(`driver.py run --submitter cli`) or add native submitters for the
+others first. Every cell records which path it took as `submitter` in
+its metrics. See `benchmarks/aws/README.md` § Methodology.
 
 ## Plugin-Related Test Notes
 

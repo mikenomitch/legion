@@ -13,14 +13,14 @@ Design background lives in [internal_docs/plans/service-discovery-final-plan.md]
 
 The one-liner — a bare port number declares and advertises the port:
 
-```jsonnet
+```nickel
 {
-    name: "redis-job",
-    tasks: [{
-        name: "redis",
-        runtime: "exec",
-        config: { command: ["redis-server", "--port", "6379"] },
-        service: { port: 6379 },   // -> service "redis", static port 6379
+    name = "redis-job",
+    tasks = [{
+        name = "redis",
+        runtime = "exec",
+        config = { command = ["redis-server", "--port", "6379"] },
+        service = { port = 6379 },   # -> service "redis", static port 6379
     }],
 }
 ```
@@ -35,20 +35,20 @@ legion service doctor redis     # layer-by-layer diagnosis when something's off
 
 And to *use* it from another task — one block, one env var:
 
-```jsonnet
-connect: { upstreams: [{ service: "redis" }] },   // -> $LEGION_UPSTREAM_REDIS
+```nickel
+connect = { upstreams = [{ service = "redis" }] },   # -> $LEGION_UPSTREAM_REDIS
 ```
 
 See [Connecting to services](#connecting-to-services-the-connect-block).
 
 ## Declaring ports: the `network` block
 
-```jsonnet
-network: {
-    mode: "auto",                        // auto | host
-    ports: [
-        { name: "http", to: 8080 },      // no `static` -> dynamic host port (20000-32000)
-        { name: "metrics", static: 9090 }, // fixed host port
+```nickel
+network = {
+    mode = "auto",                        # auto | host
+    ports = [
+        { name = "http", to = 8080 },      # no `static` -> dynamic host port (20000-32000)
+        { name = "metrics", static = 9090 }, # fixed host port
     ],
 },
 ```
@@ -62,15 +62,15 @@ network: {
 
 ## Advertising: the `service` block
 
-```jsonnet
-service: {
-    name: "web",          // defaults to the task name
-    port: "http",         // a network.ports label...
-    // port: 6379,        // ...or a number  -> declares a static port inline
-    // port: "dynamic",   // ...or 'dynamic' -> declares a dynamic port inline
-    tags: ["v1"],
-    meta: { protocol: "http" },
-    // allow: ["gateway"],   // optional connect intentions; see below
+```nickel
+service = {
+    name = "web",          # defaults to the task name
+    port = "http",         # a network.ports label...
+    # port = 6379,        # ...or a number  -> declares a static port inline
+    # port = "dynamic",   # ...or "dynamic" -> declares a dynamic port inline
+    tags = ["v1"],
+    meta = { protocol = "http" },
+    # allow = ["gateway"],   # optional connect intentions; see below
 },
 ```
 
@@ -88,13 +88,19 @@ running; add checks to gate registration on real readiness.
 A check's `port` may name a port label — it resolves to the assigned host port
 at runtime:
 
-```jsonnet
-checks: [
-    { type: "health", kind: "tcp", port: "http", every: "5s", timeout: "2s" },
+```nickel
+checks = [
+    { type = "health", kind = "tcp", port = "http", every = "5s", timeout = "2s" },
 ],
 ```
 
 ## Environment variables
+
+> On Linux an allocation with upstreams also gets `LEGION_DNS` (its own
+> resolver) and, per upstream, `LEGION_UPSTREAM_HOST_<KEY>` /
+> `LEGION_UPSTREAM_VIP_<KEY>`, so `<key>.svc.legion:<port>` works in a URL or
+> config file with no env plumbing. See
+> [Network Handlers — Name-is-config](network-handlers.md#name-is-config-keysvclegion).
 
 Every task gets its identity and assigned ports injected (user-declared env
 wins on conflicts):
@@ -121,21 +127,29 @@ environment is O(its own ports + its own upstreams), never O(cluster services).
 
 ## Connecting to services: the `connect` block
 
+> **External destinations, HTTP mode, and policy.** An upstream can also be
+> an external destination (`{ name = "openai", to = "https://api.openai.com" }`),
+> carry an `http` block (timeouts, budgeted retries, canary split by tag,
+> outlier ejection), and be governed by egress policy — all on the same
+> loopback forwarder. That surface is documented in
+> [Network Handlers](network-handlers.md).
+
+
 Discovery tells you *where* a service is. `connect` closes the last mile: the
 task gets one fixed local address per upstream, and the worker load-balances
 every connection made to it across that service's healthy endpoints. No client
 library, no sidecar, no DNS, no service-specific code.
 
-```jsonnet
+```nickel
 {
-    name: "api",
-    kind: "exec",
-    config: { command: ["sh", "-c", "exec ./api"] },
-    connect: {
-        upstreams: [
-            { service: "db" },                             // dynamic local port
-            { service: "cache", localPort: 6379 },         // pinned local port
-            { service: "search", balance: "least_conn" },  // strategy override
+    name = "api",
+    kind = "exec",
+    config = { command = ["sh", "-c", "exec ./api"] },
+    connect = {
+        upstreams = [
+            { service = "db" },                             # dynamic local port
+            { service = "cache", localPort = 6379 },         # pinned local port
+            { service = "search", balance = "least_conn" },  # strategy override
         ],
     },
 }
@@ -156,7 +170,7 @@ per-node dynamic range (20000–32000) and the same used-port set as task ports,
 so an upstream port can never collide with a host port on that node. `balance`
 overrides the strategy for that one upstream.
 
-Upstream ports are per *allocation*, exactly like host ports: a `count: 3`
+Upstream ports are per *allocation*, exactly like host ports: a `count = 3`
 client task gets three independent listeners on three distinct ports.
 
 ### Balancing strategies
@@ -166,6 +180,7 @@ client task gets three independent listeners on three distinct ports.
 | `round_robin` *(default)* | Hand out endpoints in order, wrapping around. Even spread, no state to warm up. |
 | `random` | Uniform random pick. Best when many clients share one backend set — no synchronized cursors. |
 | `least_conn` | Fewest in-flight connections wins; ties break round-robin. For long-lived or uneven connections. |
+| `local_first` | Round-robin over the endpoints on the *same node* as the caller; widens to every endpoint when none is local. Fail-open on purpose: a caller never waits for a local backend that is not there. |
 
 Names are normalized before lookup — trimmed, lowercased, `-` mapped to `_` —
 so `Least-Conn` and `least_conn` are the same strategy. An unknown name is
@@ -232,10 +247,10 @@ Per-connection logging stays at `debug`.
 
 A service can name the jobs allowed to reach it through connect:
 
-```jsonnet
-service: {
-    port: "http",
-    allow: ["gateway", "api"],   // job ids; absent or ["*"] = every job
+```nickel
+service = {
+    port = "http",
+    allow = ["gateway", "api"],   # job ids; absent or ["*"] = every job
 },
 ```
 
@@ -280,15 +295,65 @@ the config-ordering footgun this design avoids. An upstream whose service has no
 healthy endpoints simply gets an empty list at runtime, which
 `legion service doctor <svc>` will explain.
 
-### What connect is not (v1)
+### Templates: config files from the feed
 
-- **L4 only.** TCP, and balancing is per *connection*, not per request. A
-  long-lived HTTP keep-alive or gRPC channel stays on the backend it first
-  landed on; open a new connection to be rebalanced.
-- **No mid-stream retries.** Failover happens while dialing; once bytes have
-  flowed, a broken backend is the client's error to handle.
-- **No encryption or peer identity** — see the intentions scope note above.
-- **No DNS names, no sidecar, no netns, no UDP.**
+Some clients read backends from a file, not an env var — HAProxy, nginx, a
+database driver's config. `connect.templates` renders such files from the
+task's upstreams and their live endpoint feed, before the task starts and
+again on every heartbeat that changes the result:
+
+```nickel
+connect = {
+    upstreams = [{ service = "db" }, { service = "api" }],
+    templates = [
+        {
+            name = "backends",
+            destination = "local/backends.cfg",   # under the task directory
+            source = m%"
+                db = {{ service "db" }}
+                {{ range endpoints "api" }}
+                server {{ .address }}:{{ .port }} # {{ .node }} {{ .tags }}
+                {{ end }}
+                alloc = {{ env "LEGION_ALLOC_ID" }}
+            "%,
+            changeMode = "signal",     # noop (default) | signal | restart
+            changeSignal = "SIGHUP",
+            coalesce = "2s",           # let the feed settle before acting
+            splay = "5s",              # random delay so a fleet does not reload at once
+        },
+    ],
+},
+```
+
+Three functions, one loop, nothing else to learn:
+
+| Action | Renders |
+| --- | --- |
+| `{{ service "db" }}` | the address the task dials for the upstream — `<vip>:<canonical port>` on Linux, `127.0.0.1:<local port>` elsewhere; `"host"` / `"port"` as a second argument select a part. Every connection still goes through the node's datapath, so policy, handlers and the graph apply. |
+| `{{ range endpoints "db" }} … {{ end }}` | one copy of the body per healthy endpoint the manager last fed, with `.address`, `.port`, `.node`, `.allocation`, `.tags` |
+| `{{ env "NAME" }}` | the Legion-injected environment (`LEGION_*`), empty when unset |
+
+The file is written atomically (temp file + rename) when its content changes,
+and `changeMode` then says what the task should hear: nothing (most clients
+re-read on their own), `changeSignal`, or a restart. `coalesce` holds the
+signal until the feed has been quiet for that long (the file is always
+current); `splay` adds a random delay up to that long. Fail-static: a manager
+outage leaves the feed, and the file, exactly as they were. A template that
+names an upstream the task does not declare, uses an unknown action, or
+points outside the task directory is rejected at submit; a render problem at
+runtime shows in `legion net doctor` and the task's Network section. Templates
+are not a general engine — no conditionals, no arithmetic — by design.
+
+### What connect is not
+
+- **Balancing is per connection** in L4 mode: a long-lived keep-alive or
+  gRPC channel stays on the backend it first landed on. HTTP mode balances,
+  retries and splits per request — see
+  [network-handlers.md](network-handlers.md).
+- **No mid-stream retries** in L4 mode. Failover happens while dialing.
+- **No UDP.** Names (`<service>.svc.legion`), namespaces (`mode = "gated"`),
+  mTLS, handlers and the service graph all live in
+  [network-handlers.md](network-handlers.md).
 
 ### Platform behavior
 
@@ -346,10 +411,10 @@ tell "unhealthy" apart from "not allowed".
 ```bash
 # terminal 1                          # terminal 2
 cargo run -- start manager \          cargo run -- join <TOKEN>
-  -c configs/manager.jsonnet
+  -c configs/manager.ncl
 
 # terminal 3
-cargo run -- job run configs/jobs/service-demo.jsonnet
+cargo run -- job run configs/jobs/service-demo.ncl
 cargo run -- service resolve web -j
 curl "http://$(cargo run -q -- service resolve web --one)"
 
@@ -362,13 +427,13 @@ cargo run -- service doctor web       # names the failing layer
 
 ### ...and the connect path
 
-[`configs/jobs/connect-demo.jsonnet`](../configs/jobs/connect-demo.jsonnet) runs
+[`configs/jobs/connect-demo.ncl`](../configs/jobs/connect-demo.ncl) runs
 two `web` backends plus a `client` task that curls `$LEGION_UPSTREAM_WEB` in a
 loop. Each backend serves its own allocation id, so the balancing is visible in
 the client's logs:
 
 ```bash
-cargo run -- job run configs/jobs/connect-demo.jsonnet
+cargo run -- job run configs/jobs/connect-demo.ncl
 cargo run -- service resolve web              # two healthy endpoints
 cargo run -- job logs connect-demo --tail     # client alternates between them
 
@@ -387,14 +452,19 @@ macOS has no network-namespace isolation, so all tasks share the host port
 space — dynamic ports (task ports *and* upstream ports) avoid collisions; static
 ports are first-come-first-served per node.
 
-## What's next (planned)
+## Beyond discovery
 
-Shipped since v1: `connect.upstreams`, the per-node L4 forwarder, pluggable
-balancing, and connect-path intentions (`service.allow`) — all described above.
+Everything the mesh adds on top of the catalog — names (`<service>.svc.legion`
+from a node-local resolver), HTTP mode with retries and canary splits, gated
+namespaces, mTLS on node identity, external handlers, templates, and the
+service graph — is documented in [network-handlers.md](network-handlers.md).
+Still planned there: UDP, transparent capture, and WASM handlers.
 
-Still planned: DNS (`<service>.svc.legion` from a node-local resolver), template
-functions (`{{ range endpoints "db" }}`), the `datapath` plugin ABI
-(bridge/CNI), **mTLS** so intentions rest on cryptographic workload identity
-rather than the control plane alone, the opt-in L7 layer with WASM middleware,
-and the observability service graph. See the
-[final plan](../internal_docs/plans/service-discovery-final-plan.md) §8.
+## Who calls a service
+
+`legion service edges [<service>]` — and the Network page in the UI — show
+the service graph: every caller that reaches a service through its
+datapath, with request rate, errors, denials and latency over the last
+minutes, plus declared-but-silent upstreams and whether the service's
+`allow` intentions admit each caller. See
+[network-handlers.md](network-handlers.md#service-graph).

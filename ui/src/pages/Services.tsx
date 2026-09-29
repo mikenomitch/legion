@@ -1,6 +1,6 @@
 import { A } from '@solidjs/router'
 import { AccessGate } from '../components/AccessGate'
-import { For, Show, createEffect, createMemo, createResource, createSignal, onCleanup, onMount } from 'solid-js'
+import { For, Show, createEffect, createMemo, createResource, createSignal, onCleanup } from 'solid-js'
 import { ServiceTags } from '../components/ServiceEndpoints'
 import {
   Badge,
@@ -24,7 +24,7 @@ import {
 import { managerClient } from '../grpcClient'
 import { clearCommandPaletteIndexItems, setCommandPaletteIndexItems } from '../utils/commandPalette'
 import { indexHintKey, useIndexJumpTargets } from '../utils/jumpHints'
-import { POLL_INTERVAL_MS } from '../utils/polling'
+import { retainOnError, usePoll } from '../utils/polling'
 
 // Health of a service as a whole: every endpoint healthy, some, or none.
 const serviceTone = (healthy: number, total: number) => {
@@ -41,16 +41,11 @@ const serviceStatus = (healthy: number, total: number) => {
 
 function ServicesContent() {
   const [search, setSearch] = createSignal('')
-  const [tick, setTick] = createSignal(0)
-
-  onMount(() => {
-    const timer = setInterval(() => setTick((value) => value + 1), POLL_INTERVAL_MS)
-    onCleanup(() => clearInterval(timer))
-  })
+  const tick = usePoll()
 
   const [services] = createResource(
     () => tick() + 1,
-    async () => (await managerClient.listServices({})).services,
+    retainOnError(async () => (await managerClient.listServices({})).services, () => 'services'),
   )
 
   const filtered = createMemo(() => {

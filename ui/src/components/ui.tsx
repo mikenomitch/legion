@@ -1,6 +1,8 @@
 import { A } from '@solidjs/router'
-import { Show, createSignal, onCleanup, splitProps, type JSX } from 'solid-js'
+import { For, Show, createSignal, onCleanup, splitProps, type JSX } from 'solid-js'
+import { formatDateTime, formatRelativeTime, toDate } from '../utils/format'
 import { jumpHintsVisible } from '../utils/jumpHints'
+import { now } from '../utils/polling'
 import { badgeToneClasses, dotToneClasses, noteToneClasses, statusTone, textToneClasses, type Tone } from '../utils/status'
 
 /*
@@ -53,6 +55,17 @@ const ICON_PATHS: Record<string, string> = {
   hardDrive: 'M22 12H2 M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z M6 16h.01 M10 16h.01',
   stethoscope: 'M11 2v2a4 4 0 0 1-8 0V2 M7 8v3a6 6 0 0 0 12 0V9 M19 9a2 2 0 1 0 0-4 2 2 0 0 0 0 4z M13 20a3 3 0 1 0 6 0v-3',
   layoutTemplate: 'M4 3h16a1 1 0 0 1 1 1v5a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1z M4 14h7a1 1 0 0 1 1 1v5a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1v-5a1 1 0 0 1 1-1z M17 14h3a1 1 0 0 1 1 1v5a1 1 0 0 1-1 1h-3a1 1 0 0 1-1-1v-5a1 1 0 0 1 1-1z',
+  keyboard: 'M4 4h16a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2z M6 8h.01 M10 8h.01 M14 8h.01 M18 8h.01 M8 12h.01 M12 12h.01 M16 12h.01 M7 16h10',
+  history: 'M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8 M3 3v5h5 M12 7v5l4 2',
+  sliders: 'M21 4h-7 M10 4H3 M21 12h-9 M8 12H3 M21 20h-5 M12 20H3 M14 2v4 M8 10v4 M16 18v4',
+  ban: 'M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20z M4.9 4.9l14.2 14.2',
+  activity: 'M22 12h-4l-3 9L9 3l-3 9H2',
+  user: 'M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2 M12 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8z',
+  clock: 'M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20z M12 6v6l4 2',
+  compass: 'M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20z m4.24-14.24-2.12 6.36-6.36 2.12 2.12-6.36 6.36-2.12z',
+  minus: 'M5 12h14',
+  square: 'M5 3h14a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2z',
+  wifiOff: 'M2 2l20 20 M8.5 16.5a5 5 0 0 1 7 0 M2 8.82a15 15 0 0 1 4.17-2.65 M10.66 5c4.01-.36 8.14.9 11.34 3.76 M16.85 11.25a10 10 0 0 1 2.22 1.68 M5 13a10 10 0 0 1 5.24-2.76 M12 20h.01',
 }
 
 export type IconName = keyof typeof ICON_PATHS
@@ -561,6 +574,121 @@ export function CodeBlock(props: { code: string; class?: string; maxHClass?: str
         </div>
       </Show>
       <pre class={cx('overflow-auto p-3 font-mono text-xs leading-relaxed text-ink', props.maxHClass ?? 'max-h-80')}>{props.code}</pre>
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Time
+// ---------------------------------------------------------------------------
+
+/**
+ * "3 minutes ago" with the exact time as the tooltip, kept fresh by the
+ * shared clock in utils/polling so it keeps aging on pages that never
+ * refetch. `title` prepends an extra caveat (the heartbeat source note).
+ */
+export function RelativeTime(props: { value?: string | bigint | number; title?: string; class?: string }) {
+  const label = () => {
+    now()
+    return formatRelativeTime(props.value)
+  }
+  const absolute = () => formatDateTime(props.value)
+  const tooltip = () => (props.title ? `${absolute()} · ${props.title}` : absolute())
+  return (
+    <Show when={toDate(props.value)} fallback={<span class={cx('text-faint', props.class)}>—</span>}>
+      {(date) => (
+        <time datetime={date().toISOString()} title={tooltip()} class={props.class}>
+          {label()}
+        </time>
+      )}
+    </Show>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Keyboard
+// ---------------------------------------------------------------------------
+
+export function Kbd(props: { children: JSX.Element; class?: string }) {
+  return (
+    <kbd class={cx('inline-flex min-w-[1.25rem] items-center justify-center rounded border border-line bg-surface2 px-1 font-mono text-2xs text-muted', props.class)}>
+      {props.children}
+    </kbd>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Filters
+// ---------------------------------------------------------------------------
+
+export type FilterChip = { id: string; label: string; count?: number; tone?: Tone }
+
+/**
+ * One-of-N filter as a row of pills, each carrying its count. Counts come
+ * from the server over the unfiltered set, so they hold still while a chip
+ * is selected — the reader can see what the other choices would give them.
+ */
+export function FilterChips(props: { chips: readonly FilterChip[]; active: string; onChange: (id: string) => void; label?: string; class?: string }) {
+  return (
+    <div class={cx('flex flex-wrap items-center gap-1.5', props.class)} role="group" aria-label={props.label ?? 'Filter'}>
+      <For each={props.chips}>
+        {(chip) => {
+          const active = () => chip.id === props.active
+          return (
+            <button
+              type="button"
+              aria-pressed={active()}
+              onClick={() => props.onChange(chip.id)}
+              class={cx(
+                'inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs font-medium transition-colors',
+                active()
+                  ? 'border-brass/50 bg-brass/10 text-ink'
+                  : 'border-line bg-surface text-muted hover:border-line-strong hover:text-ink',
+              )}
+            >
+              <Show when={chip.tone && chip.tone !== 'neutral'}>
+                <Dot tone={chip.tone} />
+              </Show>
+              {chip.label}
+              <Show when={chip.count !== undefined}>
+                <span class={cx('tabular-nums', active() ? 'text-brass-strong' : 'text-faint')}>{chip.count}</span>
+              </Show>
+            </button>
+          )
+        }}
+      </For>
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Page placeholders
+// ---------------------------------------------------------------------------
+
+// Stand-in for a page that has not arrived yet. It mirrors the shape most
+// pages take (stat row, then a table) so the layout does not jump when the
+// real content lands.
+export function PageSkeleton() {
+  return (
+    <div role="status" aria-label="Loading" class="space-y-5">
+      <div class="grid grid-cols-2 gap-3 lg:grid-cols-4">
+        {Array.from({ length: 4 }).map(() => (
+          <div class="rounded-lg border border-line bg-surface p-3.5 shadow-card">
+            <div class="skeleton h-2.5 w-20" />
+            <div class="skeleton mt-3 h-6 w-16" />
+          </div>
+        ))}
+      </div>
+      <div class="overflow-hidden rounded-lg border border-line bg-surface shadow-card">
+        <div class="border-b border-line px-4 py-3">
+          <div class="skeleton h-2.5 w-28" />
+        </div>
+        <div class="space-y-2 p-4">
+          {Array.from({ length: 5 }).map(() => (
+            <div class="skeleton h-8" />
+          ))}
+        </div>
+      </div>
     </div>
   )
 }

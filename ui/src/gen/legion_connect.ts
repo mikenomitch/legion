@@ -3,7 +3,7 @@
 /* eslint-disable */
 // @ts-nocheck
 
-import { AcquireKvLockReply, AcquireKvLockRequest, AdvanceRolloutReply, AdvanceRolloutRequest, BootstrapAclReply, BootstrapAclRequest, CreateAclTokenReply, CreateAclTokenRequest, CreateInstanceReply, CreateInstanceRequest, CreateInstancesReply, CreateInstancesRequest, CreateJoinTokenReply, CreateJoinTokenRequest, DeleteAclPolicyReply, DeleteAclPolicyRequest, DeleteAclTokenReply, DeleteAclTokenRequest, DeleteAclUserReply, DeleteAclUserRequest, DeleteJobTemplateReply, DeleteJobTemplateRequest, DeleteJoinTokenReply, DeleteJoinTokenRequest, DeleteKvReply, DeleteKvRequest, DeleteSavedStateQueryReply, DeleteSavedStateQueryRequest, DeleteVolumeReply, DeleteVolumeRequest, DestroyInstanceReply, DestroyInstanceRequest, DestroyJobReply, DestroyJobRequest, ExecClientFrame, ExecServerFrame, GetAclPolicyReply, GetAclPolicyRequest, GetAllocationLogsReply, GetAllocationLogsRequest, GetArtifactCredentialReply, GetArtifactCredentialRequest, GetAuthMethodsReply, GetAuthMethodsRequest, GetInstanceReply, GetInstanceRequest, GetJobInfoReply, GetJobInfoRequest, GetJobScaleStatusReply, GetJobScaleStatusRequest, GetJobSpecByConfigRequest, GetJobSpecReply, GetJobSpecRequest, GetJobTemplateReply, GetJobTemplateRequest, GetKvLockReply, GetKvLockRequest, GetKvReply, GetKvRequest, GetLedgerReply, GetLedgerRequest, GetManagerConfigsReply, GetManagerConfigsRequest, GetNodeReply, GetNodeRequest, GetNodesReply, GetNodesRequest, GetObservabilityReply, GetObservabilityRequest, GetRaftJoinTokenReply, GetRaftJoinTokenRequest, GetRaftStatusReply, GetRaftStatusRequest, GetRolloutReply, GetRolloutRequest, GetRolloutStatusReply, GetRolloutStatusRequest, GetStateBackupReply, GetStateBackupRequest, GetStateStoreSchemaReply, GetStateStoreSchemaRequest, GetTaskLogsReply, GetTaskLogsRequest, GetVolumeReply, GetVolumeRequest, HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, IssueNodeIdentityTokenReply, IssueNodeIdentityTokenRequest, IssueRaftCommandReply, IssueRaftCommandRequest, IssueWorkloadIdentityTokenReply, IssueWorkloadIdentityTokenRequest, JoinRaftClusterReply, JoinRaftClusterRequest, ListAclPoliciesReply, ListAclPoliciesRequest, ListAclTokensReply, ListAclTokensRequest, ListAclUsersReply, ListAclUsersRequest, ListEventsReply, ListEventsRequest, ListInstancesReply, ListInstancesRequest, ListJobActionsReply, ListJobActionsRequest, ListJobSpecHistoryReply, ListJobSpecHistoryRequest, ListJobsReply, ListJobsRequest, ListJobTemplatesReply, ListJobTemplatesRequest, ListJoinTokensReply, ListJoinTokensRequest, ListKvReply, ListKvRequest, ListRaftHistoryReply, ListRaftHistoryRequest, ListRolloutEventsReply, ListRolloutEventsRequest, ListRolloutsReply, ListRolloutsRequest, ListSavedStateQueriesReply, ListSavedStateQueriesRequest, ListServicesReply, ListServicesRequest, ListVolumeDriversReply, ListVolumeDriversRequest, ListVolumesReply, ListVolumesRequest, LoginReply, LoginRequest, PatchKvReply, PatchKvRequest, PlanJobReply, PlanJobRequest, PostWorkReply, PostWorkRequest, PutKvReply, PutKvRequest, QueryStateStoreReply, QueryStateStoreRequest, RaftLaneReply, RaftLaneRequest, ReleaseKvLockReply, ReleaseKvLockRequest, RenderJobTemplateReply, RenderJobTemplateRequest, RenewKvLockReply, RenewKvLockRequest, ReplaceInstanceReply, ReplaceInstanceRequest, ResolveServiceReply, ResolveServiceRequest, RestartWorkerReply, RestartWorkerRequest, RunJobReply, RunJobRequest, RunJobTemplateReply, RunJobTemplateRequest, ScaleTaskReply, ScaleTaskRequest, SchedulerEvent, SetNodeAvailabilityReply, SetNodeAvailabilityRequest, StartInstanceReply, StartInstanceRequest, StopInstanceReply, StopInstanceRequest, StopJobReply, StopJobRequest, StopRolloutReply, StopRolloutRequest, StreamEventsRequest, UpdateNodeDynamicReply, UpdateNodeDynamicRequest, UpsertAclPolicyReply, UpsertAclPolicyRequest, UpsertAclUserReply, UpsertAclUserRequest, UpsertJobTemplateReply, UpsertJobTemplateRequest, UpsertSavedStateQueryReply, UpsertSavedStateQueryRequest, WhoAmIReply, WhoAmIRequest, WorkerPreRegisterReply, WorkerPreRegisterRequest, WorkerRegisterReply, WorkerRegisterRequest } from "./legion_pb.js";
+import { AcquireKvLockReply, AcquireKvLockRequest, AdvanceRolloutReply, AdvanceRolloutRequest, BootstrapAclReply, BootstrapAclRequest, CreateAclTokenReply, CreateAclTokenRequest, CreateInstanceReply, CreateInstanceRequest, CreateInstancesReply, CreateInstancesRequest, CreateJoinTokenReply, CreateJoinTokenRequest, DeleteAclPolicyReply, DeleteAclPolicyRequest, DeleteAclTokenReply, DeleteAclTokenRequest, DeleteAclUserReply, DeleteAclUserRequest, DeleteJobTemplateReply, DeleteJobTemplateRequest, DeleteJoinTokenReply, DeleteJoinTokenRequest, DeleteKvReply, DeleteKvRequest, DeleteNetPolicyReply, DeleteNetPolicyRequest, DeleteSavedStateQueryReply, DeleteSavedStateQueryRequest, DeleteVolumeReply, DeleteVolumeRequest, DestroyInstanceReply, DestroyInstanceRequest, DestroyJobReply, DestroyJobRequest, ExecClientFrame, ExecServerFrame, FetchNetPolicyReply, FetchNetPolicyRequest, GetAclPolicyReply, GetAclPolicyRequest, GetAllocationLogsReply, GetAllocationLogsRequest, GetArtifactCredentialReply, GetArtifactCredentialRequest, GetAuthMethodsReply, GetAuthMethodsRequest, GetHeartbeatCadenceReply, GetHeartbeatCadenceRequest, GetInstanceReply, GetInstanceRequest, GetJobInfoReply, GetJobInfoRequest, GetJobScaleStatusReply, GetJobScaleStatusRequest, GetJobSpecByConfigRequest, GetJobSpecReply, GetJobSpecRequest, GetJobTemplateReply, GetJobTemplateRequest, GetKvLockReply, GetKvLockRequest, GetKvReply, GetKvRequest, GetLedgerReply, GetLedgerRequest, GetManagerConfigsReply, GetManagerConfigsRequest, GetMeshCaReply, GetMeshCaRequest, GetNetPolicyObjectReply, GetNetPolicyObjectRequest, GetNodeReply, GetNodeRequest, GetNodesReply, GetNodesRequest, GetObservabilityReply, GetObservabilityRequest, GetRaftJoinTokenReply, GetRaftJoinTokenRequest, GetRaftStatusReply, GetRaftStatusRequest, GetRolloutReply, GetRolloutRequest, GetRolloutStatusReply, GetRolloutStatusRequest, GetStateBackupReply, GetStateBackupRequest, GetStateStoreSchemaReply, GetStateStoreSchemaRequest, GetTaskLogsReply, GetTaskLogsRequest, GetVolumeReply, GetVolumeRequest, HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, IssueBootTicketReply, IssueBootTicketRequest, IssueNodeCertificateReply, IssueNodeCertificateRequest, IssueNodeIdentityTokenReply, IssueNodeIdentityTokenRequest, IssueRaftCommandReply, IssueRaftCommandRequest, IssueWorkloadIdentityTokenReply, IssueWorkloadIdentityTokenRequest, JoinRaftClusterReply, JoinRaftClusterRequest, ListAclPoliciesReply, ListAclPoliciesRequest, ListAclTokensReply, ListAclTokensRequest, ListAclUsersReply, ListAclUsersRequest, ListBootTicketsReply, ListBootTicketsRequest, ListEventsReply, ListEventsRequest, ListInstancesReply, ListInstancesRequest, ListJobActionsReply, ListJobActionsRequest, ListJobSpecHistoryReply, ListJobSpecHistoryRequest, ListJobsReply, ListJobsRequest, ListJobTemplatesReply, ListJobTemplatesRequest, ListJoinTokensReply, ListJoinTokensRequest, ListKvReply, ListKvRequest, ListNetPoliciesReply, ListNetPoliciesRequest, ListRaftHistoryReply, ListRaftHistoryRequest, ListRolloutEventsReply, ListRolloutEventsRequest, ListRolloutsReply, ListRolloutsRequest, ListSavedStateQueriesReply, ListSavedStateQueriesRequest, ListServiceEdgesReply, ListServiceEdgesRequest, ListServicesReply, ListServicesRequest, ListVolumeDriversReply, ListVolumeDriversRequest, ListVolumesReply, ListVolumesRequest, LoginReply, LoginRequest, NodeLivenessDigestReply, NodeLivenessDigestRequest, PatchKvReply, PatchKvRequest, PlanJobReply, PlanJobRequest, PostWorkReply, PostWorkRequest, PutKvReply, PutKvRequest, QueryStateStoreReply, QueryStateStoreRequest, RaftLaneReply, RaftLaneRequest, RatifyClaimReply, RatifyClaimRequest, ReleaseKvLockReply, ReleaseKvLockRequest, RenderJobTemplateReply, RenderJobTemplateRequest, RenewKvLockReply, RenewKvLockRequest, ReplaceInstanceReply, ReplaceInstanceRequest, ResolveServiceReply, ResolveServiceRequest, RestartWorkerReply, RestartWorkerRequest, RotateMeshCaReply, RotateMeshCaRequest, RunJobReply, RunJobRequest, RunJobTemplateReply, RunJobTemplateRequest, ScaleTaskReply, ScaleTaskRequest, SchedulerEvent, SetNodeAvailabilityReply, SetNodeAvailabilityRequest, ShowNetPolicyReply, ShowNetPolicyRequest, StartClaimReply, StartClaimRequest, StartInstanceReply, StartInstanceRequest, StopInstanceReply, StopInstanceRequest, StopJobReply, StopJobRequest, StopRolloutReply, StopRolloutRequest, StreamEventsRequest, TestNetPolicyReply, TestNetPolicyRequest, UpdateNodeDynamicReply, UpdateNodeDynamicRequest, UpsertAclPolicyReply, UpsertAclPolicyRequest, UpsertAclUserReply, UpsertAclUserRequest, UpsertJobTemplateReply, UpsertJobTemplateRequest, UpsertNetPolicyReply, UpsertNetPolicyRequest, UpsertSavedStateQueryReply, UpsertSavedStateQueryRequest, WhoAmIReply, WhoAmIRequest, WorkerPreRegisterReply, WorkerPreRegisterRequest, WorkerRegisterReply, WorkerRegisterRequest } from "./legion_pb.js";
 import { MethodKind } from "@bufbuild/protobuf";
 
 /**
@@ -248,9 +248,11 @@ export const Manager = {
     /**
      * Creates the next immutable version of a named job template.
      *
-     * The source must evaluate to an object with an optional `description`,
-     * an optional `variables` list, and a hidden `job(vars)::` function that
-     * returns the jobspec. Invalid manifests are rejected here, not at run
+     * The source must evaluate to a record with an optional `description`,
+     * an optional `variables` list, and a
+     * `job | not_exported = fun vars => ...` function that returns the
+     * jobspec. `not_exported` is what keeps `job` out of the published
+     * manifest. Invalid manifests are rejected here, not at run
      * time. When every declared variable has a default, the manager also
      * trial-renders the template and validates the resulting jobspec.
      * Requires `template:write` scoped to the template name.
@@ -745,6 +747,38 @@ export const Manager = {
       kind: MethodKind.Unary,
     },
     /**
+     * Issue a short-lived **mesh certificate** for a worker node — the
+     * credential behind `certFrom = "legion"` (docs/network-handlers.md,
+     * "mTLS"). The first call creates the cluster's mesh CA (replicated with
+     * the control lane); every call signs a fresh key pair for the node with
+     * `<node>.node.legion` and `legion://node/<node id>` as its SANs, valid for
+     * 24 hours. Workers call it on their heartbeat loop once any allocation on
+     * the node terminates or originates mesh TLS, and again after a third of
+     * the lifetime has passed.
+     *
+     * The node's *workload* identities are never certificates: a dialing node
+     * names the workload it forwards for in a PROXY protocol v2 TLV inside the
+     * node-to-node TLS session, and the receiving node trusts that attribution
+     * because the peer proved it is a node.
+     *
+     * Called by the worker for its own node. Authorization is identical to
+     * IssueNodeIdentityToken: the caller's authenticated per-node principal
+     * (`node:<node_id>`) must match the request's `node_id`.
+     *
+     * Errors:
+     * - NotFound: no node with `node_id` is registered.
+     * - PermissionDenied: `node_id` does not match the caller's credential.
+     * - Internal: the CA could not be created or signing failed.
+     *
+     * @generated from rpc legion.Manager.IssueNodeCertificate
+     */
+    issueNodeCertificate: {
+      name: "IssueNodeCertificate",
+      I: IssueNodeCertificateRequest,
+      O: IssueNodeCertificateReply,
+      kind: MethodKind.Unary,
+    },
+    /**
      * Worker heartbeat endpoint.
      *
      * Workers send runtime state, failures, and allocation health snapshots.
@@ -791,6 +825,29 @@ export const Manager = {
       name: "GetNode",
       I: GetNodeRequest,
       O: GetNodeReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Reports whether this fleet is sustaining its heartbeat cadence, and what
+     * to do about it if it is not.
+     *
+     * Read-only and cheap: every field is derived from the liveness snapshot the
+     * status checker already takes each tick, so calling this costs no extra
+     * scan. Backs `legion node cadence`.
+     *
+     * Answer with care on a manager that does not lead the status lane: it does
+     * not own liveness, so it reports zeros rather than a guess. Ask any manager
+     * and check `is_liveness_owner` in the reply.
+     *
+     * ACL: node:read, unscoped (the report is fleet-wide).
+     * See docs/heartbeat-cadence-and-scale.md.
+     *
+     * @generated from rpc legion.Manager.GetHeartbeatCadence
+     */
+    getHeartbeatCadence: {
+      name: "GetHeartbeatCadence",
+      I: GetHeartbeatCadenceRequest,
+      O: GetHeartbeatCadenceReply,
       kind: MethodKind.Unary,
     },
     /**
@@ -1136,6 +1193,23 @@ export const Manager = {
       kind: MethodKind.Unary,
     },
     /**
+     * The service graph: who calls whom, with RED (docs/network-handlers.md,
+     * "Service graph"). One edge per (caller job, caller task, service, tag):
+     * what the callers *declared* (a `connect.upstreams` entry, and whether the
+     * service's `allow` intentions admit it) and what their datapaths
+     * *observed* over the window — requests, errors, denials, latency, bytes,
+     * folded from every node's heartbeat. Observed edges appear within one
+     * heartbeat of the first call. Like ListServices, a projection: `job:read`.
+     *
+     * @generated from rpc legion.Manager.ListServiceEdges
+     */
+    listServiceEdges: {
+      name: "ListServiceEdges",
+      I: ListServiceEdgesRequest,
+      O: ListServiceEdgesReply,
+      kind: MethodKind.Unary,
+    },
+    /**
      * Resolves one service name to its endpoint addresses and ports.
      *
      * By default only healthy endpoints are returned: an endpoint is healthy
@@ -1149,6 +1223,146 @@ export const Manager = {
       name: "ResolveService",
       I: ResolveServiceRequest,
       O: ResolveServiceReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Creates or replaces a network policy object (docs/network-handlers.md).
+     *
+     * A policy is a selector (node pools, namespaces, runtimes, job globs,
+     * labels) plus the egress/ingress rules and handlers to apply to every task
+     * it matches, with `enforcement = "require"` (always applied, ahead of the
+     * task's own block, never weakened) or `"default"` (applied only when the
+     * task declares nothing itself). The object is normalized and validated
+     * here — `allow` sugar is desugared, protocol/handler names checked, and a
+     * `default` policy that would tie with an existing one on priority and
+     * selector is rejected so the winner is never decided at runtime. Takes
+     * effect on every matching running allocation within one heartbeat; no
+     * task is restarted.
+     *
+     * ACL: `net:write`, scoped by the policy's own `nodePools` / `namespaces`
+     * selectors.
+     *
+     * @generated from rpc legion.Manager.UpsertNetPolicy
+     */
+    upsertNetPolicy: {
+      name: "UpsertNetPolicy",
+      I: UpsertNetPolicyRequest,
+      O: UpsertNetPolicyReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Fetches one stored policy object by name. ACL: `net:read`.
+     *
+     * @generated from rpc legion.Manager.GetNetPolicyObject
+     */
+    getNetPolicyObject: {
+      name: "GetNetPolicyObject",
+      I: GetNetPolicyObjectRequest,
+      O: GetNetPolicyObjectReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Lists stored policies in merge order: `require` first, then priority
+     * descending, then name. ACL: `net:read`; entries are filtered to the
+     * caller's scope.
+     *
+     * @generated from rpc legion.Manager.ListNetPolicies
+     */
+    listNetPolicies: {
+      name: "ListNetPolicies",
+      I: ListNetPoliciesRequest,
+      O: ListNetPoliciesReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Deletes a stored policy. Matching allocations lose it on their next
+     * heartbeat. ACL: `net:write`.
+     *
+     * @generated from rpc legion.Manager.DeleteNetPolicy
+     */
+    deleteNetPolicy: {
+      name: "DeleteNetPolicy",
+      I: DeleteNetPolicyRequest,
+      O: DeleteNetPolicyReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Shows the *effective* policy for one task of a job: every matching
+     * stored policy merged with the task's inline `network.egress` /
+     * `network.ingress`, with each rule and handler naming the policy it came
+     * from. This is exactly what the node datapath runs — the same merge
+     * function — and the one thing a client cannot compute itself, because
+     * stored policies live in the manager. `node_pool` narrows selector
+     * matching to a pool (a job may land in several). ACL: `net:read` on the
+     * job.
+     *
+     * @generated from rpc legion.Manager.ShowNetPolicy
+     */
+    showNetPolicy: {
+      name: "ShowNetPolicy",
+      I: ShowNetPolicyRequest,
+      O: ShowNetPolicyReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Dry-runs a verdict: would this task be allowed to reach `to` (egress) or
+     * be reached from `from` (ingress)? Returns the verdict, the rule that
+     * decided it, and its reason, without sending anything — so an operator or
+     * an agent can ask "is that host blocked?" instead of watching a connection
+     * hang. Connect-time rules are evaluated; request-time rules (path,
+     * method, header) are evaluated when `method`/`path` are given, otherwise
+     * reported as `defer`. ACL: `net:read` on the job.
+     *
+     * @generated from rpc legion.Manager.TestNetPolicy
+     */
+    testNetPolicy: {
+      name: "TestNetPolicy",
+      I: TestNetPolicyRequest,
+      O: TestNetPolicyReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * The mesh CA certificate — what an operator hands a non-Legion client
+     * that must reach a mesh-TLS port, or verifies a node certificate against.
+     * Never the key. Empty `cert_pem` when no node has asked for a certificate
+     * yet (the CA is created on first use). ACL: `net:read`.
+     *
+     * @generated from rpc legion.Manager.GetMeshCa
+     */
+    getMeshCa: {
+      name: "GetMeshCa",
+      I: GetMeshCaRequest,
+      O: GetMeshCaReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Replace the mesh CA. Every node re-issues its certificate on its next
+     * heartbeat (within one interval); until a node has, its peers on the new
+     * CA refuse it and it refuses them — expect a heartbeat's worth of
+     * refused mesh connections, never plaintext. ACL: `net:write` (unscoped).
+     *
+     * @generated from rpc legion.Manager.RotateMeshCa
+     */
+    rotateMeshCa: {
+      name: "RotateMeshCa",
+      I: RotateMeshCaRequest,
+      O: RotateMeshCaReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Worker plane: fetches the merged policy body for a hash the heartbeat
+     * reply named. Policies are content-addressed so a node running a thousand
+     * identical sandboxes fetches one body once; the worker caches by hash and
+     * keeps the last known good body if a fetch fails (fail-static).
+     *
+     * ACL: worker plane (node token).
+     *
+     * @generated from rpc legion.Manager.FetchNetPolicy
+     */
+    fetchNetPolicy: {
+      name: "FetchNetPolicy",
+      I: FetchNetPolicyRequest,
+      O: FetchNetPolicyReply,
       kind: MethodKind.Unary,
     },
     /**
@@ -1485,6 +1699,73 @@ export const Manager = {
       O: DeleteJoinTokenReply,
       kind: MethodKind.Unary,
     },
+    /**
+     * Mints a boot ticket: a short-lived, narrow capability that lets an edge
+     * node start one workload on its own, without any call to a manager
+     * (docs/edge-boot.md). Requires `boot:write`, scoped by job name.
+     *
+     * The ticket is a JWT signed by the cluster's workload-identity signer and
+     * verified offline by the worker against the published JWKS. It names an
+     * exact job config, one task, the instance id (or a non-empty instance
+     * prefix) it may start, the node pool it may run in, and the furthest gate
+     * level the start may reach. Tickets are single-use by default; a second
+     * ratification carrying the same `jti` is refused.
+     *
+     * `boot:write` is deliberately separate from `job:write`: a platform's
+     * ticket minter should be able to authorize individual starts without
+     * holding the right to redeploy the fleet.
+     *
+     * Refused with FailedPrecondition when `edgeBoot.enabled` is false on the
+     * manager — minting is an explicit operator decision, because it grows a
+     * compromised node's blast radius from "runs what it was given" to "runs
+     * anything a live ticket names".
+     *
+     * @generated from rpc legion.Manager.IssueBootTicket
+     */
+    issueBootTicket: {
+      name: "IssueBootTicket",
+      I: IssueBootTicketRequest,
+      O: IssueBootTicketReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Lists outstanding boot tickets (metadata only — never the token bytes).
+     * Requires `boot:read`. Rows expire with the ticket, so this is the live
+     * set of capabilities the cluster has handed out.
+     *
+     * @generated from rpc legion.Manager.ListBootTickets
+     */
+    listBootTickets: {
+      name: "ListBootTickets",
+      I: ListBootTicketsRequest,
+      O: ListBootTicketsReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Ratifies a provisional allocation: the durable commit that decides who
+     * really owns an instance (docs/edge-boot.md).
+     *
+     * Worker plane — called by the node that started the work, authenticated
+     * with its node token. The manager turns the claim into an ordinary plan
+     * submission with a single placement on the calling node and applies it
+     * through the same transaction every other placement goes through, with
+     * the same epoch compare-and-set, the same constraint re-validation, and
+     * the same at-most-one-live-allocation instance binding. A refusal here is
+     * that apply failing; there is no second code path for correctness.
+     *
+     * The reply is the verdict: `confirmed` carries the manager-minted
+     * allocation id (the worker opens the network and the work becomes a normal
+     * allocation), `refused` carries a machine-readable reason the worker kills
+     * the work with.
+     *
+     * @generated from rpc legion.Manager.RatifyClaim
+     */
+    ratifyClaim: {
+      name: "RatifyClaim",
+      I: RatifyClaimRequest,
+      O: RatifyClaimReply,
+      kind: MethodKind.Unary,
+    },
   }
 } as const;
 
@@ -1541,6 +1822,33 @@ export const Worker = {
       I: ExecClientFrame,
       O: ExecServerFrame,
       kind: MethodKind.BiDiStreaming,
+    },
+    /**
+     * Starts work on this node from a boot ticket, without any call to a
+     * manager on the critical path (docs/edge-boot.md).
+     *
+     * This is the edge entry point: a platform's router hands the node a
+     * ticket it minted ahead of time, the node verifies it offline against the
+     * cached JWKS, admits it against its own free resources, and boots to the
+     * gate level. Ratification runs in parallel and its verdict arrives on
+     * this same stream.
+     *
+     * Server-streaming so the caller learns each transition without polling —
+     * a router may begin routing at `booted` and must be prepared for
+     * `refused` at any point until `ratified`.
+     *
+     * Rejected with FailedPrecondition unless the worker was configured with
+     * `edgeBoot.acceptClaims: true`. Callers are authorized by the ticket
+     * alone; the worker holds no user credentials and verifies no other
+     * identity.
+     *
+     * @generated from rpc legion.Worker.StartClaim
+     */
+    startClaim: {
+      name: "StartClaim",
+      I: StartClaimRequest,
+      O: StartClaimReply,
+      kind: MethodKind.ServerStreaming,
     },
   }
 } as const;
@@ -1684,6 +1992,43 @@ export const RaftTransport = {
       name: "ForwardLaneWrite",
       I: RaftLaneRequest,
       O: RaftLaneReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Reports which nodes a manager has personally received heartbeats from,
+     * to the manager that leads the status lane.
+     *
+     * This is what keeps liveness off the raft path under `lanes` topology with
+     * a standing leadership split. Workers dial ONE manager forever, so a
+     * manager that leads nothing still receives their beats; rather than
+     * forwarding each beat as a replicated write (the pre-digest behavior, kept
+     * as the mixed-version fallback), it batches the ids it heard from and sends
+     * one of these per `liveness.digestInterval`. The cost is
+     * `managers x 1 RPC/interval`, independent of fleet size — at 1000 nodes
+     * across 3 managers, 2 RPCs a second carrying ~333 ids each, against ~500
+     * forwarded raft writes a second before.
+     *
+     * Pushed rather than pulled deliberately: a pull would make the lost
+     * decision itself depend on a fan-out completing, so a manager that was slow
+     * at tick time would make its nodes look dead. A push lets the leader hold
+     * the last digest, know how old it is, and DECLINE to decide — see
+     * `liveness.peerDigestGrace`.
+     *
+     * Carries ids only, not per-node times. Ids plus the digest's own timestamp
+     * decide liveness at `digestInterval` resolution, and it keeps the message
+     * small and the merge trivial.
+     *
+     * ACL: manager-plane internal, authenticated by cluster secret metadata —
+     * it is not a `Manager` RPC, so it takes no ACL row and
+     * `tests/acl_endpoints.rs::every_manager_rpc_is_classified` does not cover
+     * it. See docs/node-liveness.md.
+     *
+     * @generated from rpc legion.RaftTransport.ReportNodeLiveness
+     */
+    reportNodeLiveness: {
+      name: "ReportNodeLiveness",
+      I: NodeLivenessDigestRequest,
+      O: NodeLivenessDigestReply,
       kind: MethodKind.Unary,
     },
   }

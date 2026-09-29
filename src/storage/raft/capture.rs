@@ -608,6 +608,83 @@ mod tests {
         Ok(store.get_kv(key)?.map(|entry| entry.value))
     }
 
+    /// Wakes for the eval pool are metered by WORK, not by the eval table
+    /// moving.
+    ///
+    /// Every eval crosses the projection at least three times (enqueued,
+    /// claimed, completed) and the pool used to be woken for all three, with
+    /// `notify_waiters`. Each woken worker answers with a `claim_eval` — a
+    /// capture on the write connection, and a scheduler-lane quorum round
+    /// whenever it finds work — so a pool of N paid N claims per transition
+    /// and N-1 came back empty.
+    /// The AWS phase-3 campaign measured 2.8x the scheduler-lane raft ops at
+    /// 16 workers versus 4, for identical work, and LOWER throughput.
+    #[test]
+    fn projection_wakes_one_worker_per_claimable_eval() -> R<()> {
+        let store = setup_store()?;
+        let notifier = store.eval_notifier();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()?;
+
+        // Three parked probes stand in for three idle eval workers, enabled
+        // before the transition so none can be missed. The old behavior woke
+        // all three for any eval row change; the fix must wake exactly as
+        // many as there are newly claimable evals.
+        macro_rules! wakes_from {
+            ($action:stmt) => {{
+                let a = notifier.notified();
+                let b = notifier.notified();
+                let c = notifier.notified();
+                tokio::pin!(a, b, c);
+                runtime.block_on(async {
+                    a.as_mut().enable();
+                    b.as_mut().enable();
+                    c.as_mut().enable();
+                });
+                $action
+                runtime.block_on(async {
+                    let mut count = 0usize;
+                    for fut in [a, b, c] {
+                        if tokio::time::timeout(Duration::from_millis(120), fut)
+                            .await
+                            .is_ok()
+                        {
+                            count += 1;
+                        }
+                    }
+                    count
+                })
+            }};
+        }
+
+        // One enqueued eval is one unit of work nobody is doing yet.
+        let ((), enqueued) = capture_mutation(&store, Lane::Scheduler, |s| {
+            s.enqueue_eval("job_reschedule", Some("a"), Some("ac"), None, None)?;
+            Ok(())
+        })?;
+        let woke = wakes_from!(apply_changeset(&store, &enqueued)?);
+        assert_eq!(
+            woke, 1,
+            "one claimable eval must wake exactly one worker; waking the pool \
+             spends a quorum round per worker to discover an empty queue"
+        );
+
+        // Claiming moves pending -> in_flight. That is a worker TAKING work,
+        // not work appearing, so nobody may be woken for it.
+        let ((), claimed) = capture_mutation(&store, Lane::Scheduler, |s| {
+            s.claim_eval()?;
+            Ok(())
+        })?;
+        let woke = wakes_from!(apply_changeset(&store, &claimed)?);
+        assert_eq!(
+            woke, 0,
+            "a claim takes work off the queue; it must wake nobody"
+        );
+
+        Ok(())
+    }
+
     /// Adversarial regression (capture/apply interleave): a committed
     /// changeset applied WHILE a capture is in progress on the same store
     /// must survive the capture's rollback. Before the fix, the apply took

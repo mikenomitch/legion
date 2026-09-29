@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use serde_json::{json, Map, Value};
 
@@ -87,6 +87,45 @@ impl ResourcePolicy {
         }
 
         Ok(Value::Object(normalized))
+    }
+
+    /// One allocation's stored resources as the normalized
+    /// [`ResourceRequest`] the usage aggregates and free-pool subtractions
+    /// consume — the exact normalization [`NodeUsage::from_rows`] and
+    /// [`ResourcePool::free_from_rows`] apply per row.
+    pub(crate) fn usage_request(&self, resources: &Value) -> R<ResourceRequest> {
+        let normalized = self.normalize_task_resources(resources, false)?;
+        ResourceRequest::from_value(&normalized)
+    }
+
+    /// A canonical, deterministic rendering of everything in this policy
+    /// that changes what [`Self::normalize_task_resources`] produces.
+    ///
+    /// This is the era tag on every persisted `node_alloc_usage` row: the
+    /// cached aggregate is rows run through *some* policy's normalization,
+    /// and the row-set fingerprint (epoch, count, id sum) cannot see a
+    /// POLICY change — an operator raising `taskResourceDefaults.memory`
+    /// and restarting would otherwise keep serving aggregates computed
+    /// under the old default, understating usage on every quiet node
+    /// indefinitely, which is silent overcommit. A cached row whose
+    /// fingerprint does not match the running policy is simply never
+    /// served, so a policy change costs one rebuild per node.
+    ///
+    /// Deliberately the readable canonical string rather than a hash of
+    /// it: it is written once per cache publish, compared byte-wise, and a
+    /// human debugging a rebuild storm can read WHICH policy wrote a row.
+    /// Keys are sorted so construction order can never produce two
+    /// spellings of one policy.
+    pub(crate) fn fingerprint(&self) -> String {
+        let defaults: std::collections::BTreeMap<&String, &Value> =
+            self.task_defaults.iter().collect();
+        let mut required: Vec<&String> = self.required_custom_resources.iter().collect();
+        required.sort_unstable();
+        let rendered = serde_json::json!({
+            "defaults": defaults,
+            "required": required,
+        });
+        rendered.to_string()
     }
 }
 
@@ -197,6 +236,7 @@ mod tests {
             pool: "default".into(),
             availability: "available".into(),
             last_heartbeat: String::new(),
+            heartbeat_source: String::new(),
             config_attrs: json!({}),
             fingerprint_attrs,
             dynamic_attrs: json!({}),
@@ -287,6 +327,156 @@ mod tests {
         let pool = ResourcePool::free_for_node(&node, &[allocation], &policy);
         assert_eq!(pool.amount("memory"), Some(1024.0 - 256.0));
         assert_eq!(pool.amount("cpu"), Some(1000.0 - 100.0));
+    }
+
+    fn usage_test_policy() -> ResourcePolicy {
+        ResourcePolicy::from_manager_config(&ManagerConfigFull::default()).expect("policy")
+    }
+
+    fn request(resources: Value) -> ResourceRequest {
+        let policy = usage_test_policy();
+        let normalized = policy
+            .normalize_task_resources(&resources, false)
+            .expect("normalize");
+        ResourceRequest::from_value(&normalized).expect("request")
+    }
+
+    /// The pools the two paths build must agree dim for dim. Amounts carry a
+    /// tolerance because the aggregate re-associates the sum; see the
+    /// `NodeUsage` docs.
+    fn assert_same_pool(aggregate: &ResourcePool, walk: &ResourcePool, what: &str) {
+        let aggregate_keys: std::collections::BTreeSet<&String> = aggregate.values.keys().collect();
+        let walk_keys: std::collections::BTreeSet<&String> = walk.values.keys().collect();
+        assert_eq!(aggregate_keys, walk_keys, "{what}: dims differ");
+        for (name, expected) in &walk.values {
+            match (&aggregate.values[name], expected) {
+                (ResourceValue::Amount(got), ResourceValue::Amount(want)) => assert!(
+                    got == want || (got - want).abs() <= 1e-9 * want.abs().max(1.0),
+                    "{what}: {name} is {got}, expected {want}"
+                ),
+                (ResourceValue::Items(got), ResourceValue::Items(want)) => {
+                    assert_eq!(got, want, "{what}: {name} items differ")
+                }
+                (got, want) => panic!("{what}: {name} kind changed: {got:?} vs {want:?}"),
+            }
+        }
+    }
+
+    /// The property the whole cache rests on: subtracting an aggregate is
+    /// the same as subtracting the rows one at a time — including for dims
+    /// that arrive as devices from one allocation and as a counter from
+    /// another, and for a zero-amount demand, which still has to CREATE the
+    /// pool entry.
+    #[test]
+    fn free_from_usage_matches_the_row_walk() {
+        let policy = usage_test_policy();
+        let mut node = node_with_fingerprint(json!({
+            "memory_total": "1073741824",
+            "cpus": { "cpu-1": { "frequency": "1000" } },
+        }));
+        node.config_attrs = json!({
+            "maxAllocations": 4,
+            "resources": { "gpu": ["g0", "g1", "g2"], "widgets": 6 },
+            "reservedResources": { "memory": 128 },
+        });
+
+        let rows = [
+            (1i64, json!({ "cpu": 100, "gpu": ["g0"], "widgets": 2 })),
+            (2, json!({ "memory": 64, "gpu": 1 })),
+            (3, json!({ "scratch": 0, "fractional": 0.1 })),
+            (4, json!({ "cpu": 50, "gpu": ["g1"] })),
+        ];
+
+        let walk = ResourcePool::free_from_rows(
+            &node,
+            rows.iter().map(|(id, value)| (*id, value)),
+            &policy,
+        );
+        let usage = NodeUsage::from_rows(rows.iter().map(|(id, value)| (*id, value)), &policy)
+            .expect("agg");
+        assert_same_pool(
+            &ResourcePool::free_from_usage(&node, &usage),
+            &walk,
+            "all rows",
+        );
+
+        // And the `drop_own` shape: total minus one job's rows must equal
+        // the walk over everyone else's, which is how a Fresh plan's pool is
+        // built without re-reading the node.
+        let mut others = usage.clone();
+        others.remove(&request(rows[0].1.clone()));
+        others.remove(&request(rows[3].1.clone()));
+        let walk_without = ResourcePool::free_from_rows(
+            &node,
+            rows[1..3].iter().map(|(id, value)| (*id, value)),
+            &policy,
+        );
+        assert_same_pool(
+            &ResourcePool::free_from_usage(&node, &others),
+            &walk_without,
+            "own rows dropped",
+        );
+    }
+
+    /// `remove` is the exact inverse of `add`, contributor counts included:
+    /// a dim must DISAPPEAR when its last contributor leaves rather than
+    /// linger as a zero, because a lingering zero would create a pool entry
+    /// the row walk never created.
+    #[test]
+    fn node_usage_add_and_remove_are_inverses() {
+        let mut usage = NodeUsage::default();
+        let a = request(json!({ "cpu": 100, "gpu": ["g0"], "scratch": 0 }));
+        let b = request(json!({ "cpu": 250, "gpu": ["g0", "g1"] }));
+
+        usage.add(&a);
+        usage.add(&b);
+        usage.remove(&b);
+        let mut only_a = NodeUsage::default();
+        only_a.add(&a);
+        assert_eq!(usage, only_a, "removing b must leave exactly a");
+
+        usage.remove(&a);
+        assert_eq!(usage, NodeUsage::default(), "the aggregate must empty out");
+    }
+
+    /// Two allocations claiming the same device is a bug elsewhere, but the
+    /// aggregate must not turn it into free capacity: releasing one holder
+    /// leaves the device taken while the other still holds it.
+    #[test]
+    fn items_are_counted_not_set_unioned() {
+        let mut usage = NodeUsage::default();
+        let a = request(json!({ "gpu": ["g0"] }));
+        let b = request(json!({ "gpu": ["g0"] }));
+        usage.add(&a);
+        usage.add(&b);
+        usage.remove(&a);
+        // Device lists are tokenized (`value_token` JSON-encodes each
+        // element), so read the count back rather than guessing the spelling.
+        assert_eq!(
+            usage.dims["gpu"]
+                .items
+                .values()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![1],
+            "the surviving holder must keep the device"
+        );
+    }
+
+    /// An allocation whose resources cannot be parsed must not produce an
+    /// aggregate at all: `free_from_rows` answers that case with "the node
+    /// fits nothing", and a cached value must never stand in for a row
+    /// nobody could read.
+    #[test]
+    fn unparseable_rows_refuse_to_aggregate() {
+        let policy = usage_test_policy();
+        let rows = [(7i64, json!({ "cpu": "a lot" }))];
+        let error = NodeUsage::from_rows(rows.iter().map(|(id, value)| (*id, value)), &policy)
+            .expect_err("expected the bad row to be refused");
+        assert!(
+            error.to_string().contains("allocation 7"),
+            "the error should name the row: {error}"
+        );
     }
 }
 
@@ -573,6 +763,204 @@ impl ResourcePool {
                 }
             }
         }
+    }
+}
+
+/// One dimension of a [`NodeUsage`] aggregate.
+///
+/// Both halves are kept because a dim can legally arrive as a number from
+/// one allocation (`gpu: 2`) and as a device list from another
+/// (`gpu: ["g0"]`). [`ResourcePool::apply_usage`] silently ignores whichever
+/// kind does not match the pool's own — an `Items` demand against an
+/// `Amount` pool entry is a no-op and vice versa — so the aggregate carries
+/// both and lets the pool make the same choice it would have made row by
+/// row.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct UsageDim {
+    /// How many allocations contributed a *numeric* value here. Tracked
+    /// separately from the sum because `apply_usage` CREATES a missing pool
+    /// entry at zero before subtracting: "one allocation asked for 0 cpu"
+    /// and "no allocation mentioned cpu" leave different pools, and only a
+    /// contributor count can tell them apart once the amounts are summed.
+    #[serde(default)]
+    pub(crate) amount_contributors: u32,
+    #[serde(default)]
+    pub(crate) amount: f64,
+    /// item -> how many allocations hold it. A multiset, not a set: if two
+    /// allocations somehow claim the same device, removing one of them must
+    /// not hand the device back to the pool.
+    #[serde(default)]
+    pub(crate) items: BTreeMap<String, u32>,
+}
+
+impl UsageDim {
+    /// Nothing contributes to this dim any more, so it must disappear
+    /// rather than linger as a zero — see `amount_contributors`.
+    fn is_empty(&self) -> bool {
+        self.amount_contributors == 0 && self.items.is_empty()
+    }
+}
+
+/// The aggregated resource usage of a *set* of allocations on one node:
+/// exactly what [`ResourcePool::free_from_rows`] subtracts from the node's
+/// fingerprinted capacity, held as a single value so the plan-apply
+/// transaction can cache it per node instead of re-reading and re-parsing
+/// every allocation row on that node (see `Store::free_pool_for_node_tx`).
+///
+/// Two properties make it a faithful stand-in for the row-by-row
+/// subtraction:
+///
+/// - **Kind-faithful**, per [`UsageDim`]: numeric and item demands on the
+///   same dim are kept apart, so the pool resolves them exactly as it would
+///   have per row.
+/// - **Reversible**: [`Self::remove`] is the exact inverse of [`Self::add`],
+///   down to the contributor counts. That is what lets a Fresh plan's
+///   "everything except this job's own allocations" be computed as
+///   *total − own* rather than by re-reading everyone else's rows.
+///
+/// The one place the two forms are not bit-identical is float association:
+/// the aggregate computes `capacity − (a₁ + a₂ + …)` where the row walk
+/// computes `((capacity − a₁) − a₂) − …`. Both are correct sums of the same
+/// numbers and differ by at most a rounding step — never by a whole
+/// allocation's worth of capacity, which is the property that matters for
+/// overcommit.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct NodeUsage {
+    /// `BTreeMap`, not `HashMap`: this value is serialized into a replicated
+    /// row, and replicas compare table content byte for byte.
+    pub(crate) dims: BTreeMap<String, UsageDim>,
+}
+
+impl NodeUsage {
+    /// Fold one allocation's normalized demands into the aggregate.
+    pub(crate) fn add(&mut self, request: &ResourceRequest) {
+        for (name, demand) in &request.values {
+            let dim = self.dims.entry(name.clone()).or_default();
+            match demand {
+                ResourceValue::Amount(amount) => {
+                    dim.amount_contributors += 1;
+                    dim.amount += amount;
+                }
+                ResourceValue::Items(items) => {
+                    for item in items {
+                        *dim.items.entry(item.clone()).or_insert(0) += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Take one allocation's demands back out — the exact inverse of
+    /// [`Self::add`]. Used to turn "every allocation on the node" into
+    /// "every allocation except the planned job's own", which is what a
+    /// Fresh plan's pool is.
+    ///
+    /// Saturating on the counters rather than panicking: a caller removing
+    /// something it never added is a bug, but one that must not take the
+    /// apply transaction down. The counters can only under-report, which
+    /// makes the aggregate look *more* used, not less.
+    pub(crate) fn remove(&mut self, request: &ResourceRequest) {
+        for (name, demand) in &request.values {
+            let Some(dim) = self.dims.get_mut(name) else {
+                continue;
+            };
+            match demand {
+                ResourceValue::Amount(amount) => {
+                    dim.amount_contributors = dim.amount_contributors.saturating_sub(1);
+                    dim.amount -= amount;
+                    if dim.amount_contributors == 0 {
+                        // The last numeric contributor left, so the residue
+                        // of summing and un-summing floats goes with it.
+                        dim.amount = 0.0;
+                    }
+                }
+                ResourceValue::Items(items) => {
+                    for item in items {
+                        if let Some(count) = dim.items.get_mut(item) {
+                            *count = count.saturating_sub(1);
+                            if *count == 0 {
+                                dim.items.remove(item);
+                            }
+                        }
+                    }
+                }
+            }
+            if dim.is_empty() {
+                self.dims.remove(name);
+            }
+        }
+    }
+
+    /// Aggregate `(allocation id, stored resources)` rows the way
+    /// [`ResourcePool::free_from_rows`] consumes them.
+    ///
+    /// Errors — naming the offending allocation — when a row's resources do
+    /// not parse. That is deliberately NOT the "node fits nothing" posture
+    /// `free_from_rows` takes: an aggregate is cached and reused, so a value
+    /// derived from a row nobody could read must never be stored. The caller
+    /// falls back to the row walk, which applies (and logs) the fits-nothing
+    /// rule itself.
+    pub(crate) fn from_rows<'a>(
+        rows: impl IntoIterator<Item = (i64, &'a Value)>,
+        policy: &ResourcePolicy,
+    ) -> R<Self> {
+        let mut usage = NodeUsage::default();
+        for (allocation_id, resources) in rows {
+            let request = policy
+                .usage_request(resources)
+                .with_context(|| format!("allocation {allocation_id} resources failed to parse"))?;
+            usage.add(&request);
+        }
+        Ok(usage)
+    }
+}
+
+impl ResourcePool {
+    /// Subtract a pre-aggregated [`NodeUsage`] from the node's fingerprinted
+    /// capacity. The aggregate counterpart of
+    /// [`ResourcePool::free_from_rows`], and deliberately total in the same
+    /// way: a node whose own resources do not parse fits nothing.
+    ///
+    /// The per-dim arithmetic mirrors [`ResourcePool::apply_usage`]
+    /// statement for statement, because the whole point of the aggregate is
+    /// that it produces the same pool the row walk would have.
+    pub(crate) fn free_from_usage(node: &Node, usage: &NodeUsage) -> ResourcePool {
+        let mut pool = match ResourcePool::from_node(node) {
+            Ok(pool) => pool,
+            Err(error) => {
+                warn!(
+                    node_id = %node.id,
+                    %error,
+                    "Node resources failed to parse; node will fit no tasks until corrected"
+                );
+                return ResourcePool {
+                    values: HashMap::new(),
+                };
+            }
+        };
+        for (name, dim) in &usage.dims {
+            if dim.amount_contributors > 0 {
+                // `or_insert` before subtracting, exactly as `apply_usage`
+                // does: a dim the node never fingerprinted becomes a real
+                // (negative) entry the moment a task asks for it, which is
+                // what makes `can_fit` reject the ask.
+                let entry = pool
+                    .values
+                    .entry(name.clone())
+                    .or_insert(ResourceValue::Amount(0.0));
+                if let ResourceValue::Amount(available) = entry {
+                    *available -= dim.amount;
+                }
+            }
+            if !dim.items.is_empty() {
+                if let Some(ResourceValue::Items(available)) = pool.values.get_mut(name) {
+                    for item in dim.items.keys() {
+                        available.remove(item);
+                    }
+                }
+            }
+        }
+        pool
     }
 }
 

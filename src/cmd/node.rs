@@ -2,8 +2,8 @@ use crate::cmd::helpers::{connect_manager_client, json_flag, print_table};
 use crate::cmd::output::{self, OutputFormat};
 use crate::prelude::*;
 use crate::structs::{
-    GetNodeRequest, GetNodesRequest, Node, NodePrint, RestartWorkerRequest,
-    SetNodeAvailabilityRequest, UpdateNodeDynamicRequest,
+    GetHeartbeatCadenceRequest, GetNodeRequest, GetNodesRequest, Node, NodePrint,
+    RestartWorkerRequest, SetNodeAvailabilityRequest, UpdateNodeDynamicRequest,
 };
 
 /// Optional idempotency key for mutating node operations; the manager
@@ -114,11 +114,26 @@ pub fn config() -> Command {
         .arg(idempotency_arg())
         .arg(json_flag());
 
+    let cadence_cmd = Command::new("cadence")
+        .about("Report whether this fleet is sustaining its heartbeat cadence")
+        .long_about(
+            "\
+        Report whether this fleet is sustaining its heartbeat cadence\n\
+        \n\
+        Answers the question an operator has at 3am — are the machines gone,\n\
+        or is the control plane just behind? — and hands back the\n\
+        `heartbeatSeconds` value to set for a fleet this size on this control\n\
+        plane. See docs/heartbeat-cadence-and-scale.md.\
+        ",
+        )
+        .arg(json_flag());
+
     Command::new("node")
         .about("Interact with nodes")
         .subcommand_required(true)
         .arg_required_else_help(true)
         .subcommand(get_nodes_cmd)
+        .subcommand(cadence_cmd)
         .subcommand(update_node_cmd)
         .subcommand(node_info_cmd)
         .subcommand(node_claims_cmd)
@@ -171,6 +186,10 @@ pub async fn handle(sub_matches: &ArgMatches) -> R<()> {
 
             let format = OutputFormat::from_matches(arg_matches);
             update_node(id.into(), dynamic_diff, format).await
+        }
+        Some(("cadence", arg_matches)) => {
+            let format = OutputFormat::from_matches(arg_matches);
+            get_heartbeat_cadence(format).await
         }
         Some(("claims", arg_matches)) => {
             let id = arg_matches
@@ -236,6 +255,101 @@ async fn get_nodes(format: OutputFormat) -> R<()> {
     } else {
         let printable_nodes: Vec<NodePrint> = nodes.into_iter().map(Into::into).collect();
         print_table(printable_nodes);
+    }
+
+    Ok(())
+}
+
+/// `legion node cadence` — is the fleet keeping up, and what to set if not.
+///
+/// Deliberately a command rather than only a metric: an operator debugging
+/// "why did detection take 90s" needs the answer without a Prometheus scrape,
+/// and cadence changes make cluster behavior time-varying.
+#[instrument(err, skip_all)]
+async fn get_heartbeat_cadence(format: OutputFormat) -> R<()> {
+    let mut client = connect_manager_client().await?;
+    let reply = output::resolve(
+        format,
+        "failed to fetch heartbeat cadence",
+        client
+            .get_heartbeat_cadence(tonic::Request::new(GetHeartbeatCadenceRequest {}))
+            .await,
+    )?
+    .into_inner();
+
+    if format.is_json() {
+        output::print_success(&json!({
+            "activeNodes": reply.active_nodes,
+            "servedIntervalSeconds": reply.served_interval_seconds,
+            "lostWindowSeconds": reply.lost_window_seconds,
+            "missedBeatsBeforeLost": reply.missed_beats_before_lost,
+            "freshnessRatio": reply.freshness_ratio,
+            "freshnessMeasurable": reply.freshness_measurable,
+            "sustainableNodesEstimate": reply.sustainable_nodes_estimate,
+            "suggestedHeartbeatSeconds": reply.suggested_heartbeat_seconds,
+            "adaptiveEnabled": reply.adaptive_enabled,
+            "atMaxInterval": reply.at_max_interval,
+            "isLivenessOwner": reply.is_liveness_owner,
+        }));
+        return Ok(());
+    }
+
+    if !reply.is_liveness_owner {
+        println!(
+            "This manager does not own node liveness (it does not lead the status lane).\n\
+             Ask the manager that does — `legion raft status` names it."
+        );
+        return Ok(());
+    }
+
+    println!("Fleet             {} nodes", reply.active_nodes);
+    println!(
+        "Served interval   {}s{}",
+        reply.served_interval_seconds,
+        if reply.adaptive_enabled {
+            if reply.at_max_interval {
+                "  (adaptive, AT MAX — add control-plane capacity)"
+            } else {
+                "  (adaptive)"
+            }
+        } else {
+            "  (workers use their worker-type heartbeatSeconds)"
+        }
+    );
+    println!(
+        "Lost window       {}s  ({} missed beats)",
+        reply.lost_window_seconds, reply.missed_beats_before_lost
+    );
+    if reply.freshness_measurable {
+        // The danger threshold and the ratio are in the same units, which is
+        // what makes this explainable rather than a number to look up.
+        let false_loss_at =
+            f64::from(reply.served_interval_seconds) / f64::from(reply.lost_window_seconds.max(1));
+        let verdict = if reply.freshness_ratio < false_loss_at {
+            " ── FALSE LOSS IN PROGRESS"
+        } else if reply.freshness_ratio < 0.5 {
+            " ── FALLING BEHIND"
+        } else {
+            ""
+        };
+        println!(
+            "Freshness         {:.2}{}  (false loss below {:.2})",
+            reply.freshness_ratio, verdict, false_loss_at
+        );
+        println!(
+            "Sustainable       ~{} nodes at {}s on this control plane",
+            reply.sustainable_nodes_estimate, reply.served_interval_seconds
+        );
+        println!(
+            "Suggested         heartbeatSeconds: {}   (lost window {}s)",
+            reply.suggested_heartbeat_seconds,
+            reply.suggested_heartbeat_seconds * reply.missed_beats_before_lost
+        );
+    } else {
+        println!(
+            "Freshness         not measurable on a fleet this small (under {} nodes)",
+            crate::prelude::HEARTBEAT_FRESHNESS_MIN_FLEET
+        );
     }
 
     Ok(())

@@ -46,6 +46,7 @@ fn insert_node(store: &Store, id: &str, pool: &str, config_attrs: Value) {
         dynamic_attrs: json!({}).to_string(),
         health_checks: "{}".into(),
         last_heartbeat: "2023-01-01 00:00:00 +00:00:00".into(),
+        heartbeat_source: String::new(),
     };
     store.insert_node(node).expect("insert node");
 }
@@ -68,7 +69,7 @@ fn insert_fleet(store: &Store) {
 
 fn submit_job(store: &Store, job: &JobConfig) -> String {
     let submission = Submission {
-        path: "test.jsonnet".into(),
+        path: "test.ncl".into(),
         content: "{}".into(),
         is_primary: true,
     };
@@ -187,8 +188,18 @@ fn shadow_equivalence_holds_across_constraint_shapes() {
 
 #[test]
 fn truncation_kicks_in_and_still_places() {
-    // 200 nodes in one region: the candidate budget (max(64, 8*needed)) is
-    // well below the eligible count, so the index truncates.
+    // 200 nodes in one region: the candidate budget is well below the
+    // eligible count, so the index truncates.
+    //
+    // The budget is `max(8*needed, 64, decorrelation_window)` and the
+    // window is 128 at defaults, so it is the window that binds here.
+    // That widening is deliberate (plan-apply-conflict-reduction-plan.md):
+    // the fallback tail is sampled from the top-W by score, and a budget
+    // narrower than W would hand every concurrent planner the same short
+    // list — which is the conflict this test's subject, truncation, must
+    // not reintroduce. What this test is actually for is unchanged: with
+    // 200 eligible against a 128 budget the index still truncates, and
+    // all three placements still land.
     let store = store_with(Some(json!({
         "index_min_nodes": 1,
         "indexes": { "topo": ["pool", "region"] },
@@ -219,8 +230,8 @@ fn truncation_kicks_in_and_still_places() {
     let usage = &report[0];
     assert_eq!(usage.index.as_deref(), Some("topo"));
     assert_eq!(usage.mode, Some("on"));
-    assert!(usage.truncated, "200 eligible vs budget 64 must truncate");
-    assert_eq!(usage.candidates, 64);
+    assert!(usage.truncated, "200 eligible vs budget 128 must truncate");
+    assert_eq!(usage.candidates, 128);
     assert_eq!(usage.refills, 0);
 }
 

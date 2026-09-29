@@ -1430,13 +1430,23 @@ fn retire_old_allocations_for_group(
             _ => None,
         };
 
-        for allocation in old_allocs.into_iter().take(to_remove) {
-            let _ = store.remove_allocation_by_id_because(allocation.id, StopCause::Update)?;
-            outcome.removed += 1;
-            if let (Some(indices), Some(instance_id)) =
-                (slot_indices.as_ref(), allocation.instance_id.as_deref())
-            {
-                if let Some(slot) = indices.get(instance_id) {
+        // One replicated op for the whole batch, not one per allocation.
+        // This used to be a loop over `remove_allocation_by_id_because`,
+        // which is a raft quorum round each: a step retiring 25% of a
+        // 10,000-allocation job cost 2,500 sequential round trips in a
+        // single tick. `remove_allocations` writes the same rows, releases
+        // the same instance bindings, bumps the same epochs and stages the
+        // same stop notices, in one transaction.
+        let batch: Vec<_> = old_allocs.into_iter().take(to_remove).collect();
+        store.remove_allocations(&batch, StopCause::Update)?;
+        outcome.removed += batch.len();
+        if let Some(indices) = slot_indices.as_ref() {
+            for allocation in &batch {
+                if let Some(slot) = allocation
+                    .instance_id
+                    .as_deref()
+                    .and_then(|instance_id| indices.get(instance_id))
+                {
                     outcome.removed_slots.push(*slot);
                 }
             }
@@ -1983,6 +1993,7 @@ mod tests {
             dynamic_attrs: "{}".into(),
             health_checks: json!({ "worker": "pass" }).to_string(),
             last_heartbeat: "2023-01-01T00:00:00Z".into(),
+            heartbeat_source: String::new(),
         };
         store.insert_node(node)?;
         Ok(())
@@ -1990,7 +2001,7 @@ mod tests {
 
     fn submission() -> Submission {
         Submission {
-            path: "job.jsonnet".into(),
+            path: "job.ncl".into(),
             content: "{}".into(),
             is_primary: true,
         }

@@ -6,6 +6,7 @@ import { Badge, Button, ConfirmButton, Icon, Note, PageHeader, SectionCard, Spin
 import { managerClient } from '../../grpcClient'
 import { allows, jobScope } from '../../utils/acl'
 import { formatDate } from '../../utils/format'
+import { retainOnError, usePoll } from '../../utils/polling'
 import { artifactProgressPercent, parseArtifactStates } from '../../utils/jobspec'
 
 const isRolloutDone = (status: string) => {
@@ -33,20 +34,29 @@ function RolloutDetailContent() {
   const [logFilter, setLogFilter] = createSignal('')
   const [message, setMessage] = createSignal('')
 
-  const [data, { refetch }] = createResource(rolloutId, async () => {
-    const [status, events, ledger] = await Promise.all([
-      managerClient.getRolloutStatus({ id: rolloutId() }),
-      managerClient.listRolloutEvents({ rolloutId: rolloutId(), limit: 1000 }),
-      // node:read garnish (allocation placement); job-scoped tokens
-      // still get the rest of the page.
-      managerClient.getLedger({}).catch(() => new GetLedgerReply()),
-    ])
-    const rollout = status.rollout
-    const placed = rollout
-      ? ledger.nodes.flatMap((node) => node.allocations).filter((allocation) => allocation.jobConfigId === rollout.toJobConfigId)
-      : []
-    return { status, rollout, events: events.events, placed }
-  })
+  // A rollout is something you watch happen, so the page polls at the live
+  // cadence; the previous state stays on screen between fetches.
+  const tick = usePoll()
+  const [data, { refetch }] = createResource(
+    () => [rolloutId(), tick()] as const,
+    retainOnError(
+      async ([id]: readonly [bigint, number]) => {
+        const [status, events, ledger] = await Promise.all([
+          managerClient.getRolloutStatus({ id }),
+          managerClient.listRolloutEvents({ rolloutId: id, limit: 1000 }),
+          // node:read garnish (allocation placement); job-scoped tokens
+          // still get the rest of the page.
+          managerClient.getLedger({}).catch(() => new GetLedgerReply()),
+        ])
+        const rollout = status.rollout
+        const placed = rollout
+          ? ledger.nodes.flatMap((node) => node.allocations).filter((allocation) => allocation.jobConfigId === rollout.toJobConfigId)
+          : []
+        return { id, status, rollout, events: events.events, placed }
+      },
+      ([id]) => String(id),
+    ),
+  )
 
   const filteredEvents = createMemo(() => {
     const q = logFilter().trim().toLowerCase()
@@ -73,12 +83,15 @@ function RolloutDetailContent() {
   }
 
   return (
-    <Show when={!data.loading} fallback={<div class="py-6"><Spinner label="Loading rollout…" /></div>}>
-      <Show when={!data.error && data()?.rollout} fallback={<Note tone="danger">Failed to load rollout.</Note>}>
+    <Show when={!data.error} fallback={<Note tone="danger">Failed to load rollout #{params.id}: {String(data.error?.message ?? data.error)}</Note>}>
+      <Show when={data()?.id === rolloutId() && data()?.rollout} fallback={<div class="py-6"><Spinner label="Loading rollout…" /></div>}>
         {(() => {
-          const rollout = data()!.rollout!
-          const isManualProgression = rollout.progression?.toLowerCase() === 'manual'
-          const done = isRolloutDone(rollout.status)
+          // Accessors rather than values: the page polls, and reading data()
+          // here would re-run this whole block (and remount the filter
+          // input) on every refetch.
+          const rollout = () => data()!.rollout!
+          const isManualProgression = () => rollout().progression?.toLowerCase() === 'manual'
+          const done = () => isRolloutDone(rollout().status)
 
           return (
             <div>
@@ -87,46 +100,46 @@ function RolloutDetailContent() {
                 title={`#${params.id}`}
                 badges={
                   <>
-                    <StatusBadge status={rollout.status} />
+                    <StatusBadge status={rollout().status} />
                     <Badge tone="neutral">{data()!.placed.length} placed</Badge>
                   </>
                 }
                 subtitle={
                   <>
                     Job{' '}
-                    <A href={`/jobs/${encodeURIComponent(rollout.jobId)}`} class={linkClass}>
-                      {rollout.jobId}
+                    <A href={`/jobs/${encodeURIComponent(rollout().jobId)}`} class={linkClass}>
+                      {rollout().jobId}
                     </A>
                     <span class="mx-2 text-faint">·</span>
                     <span class="font-mono text-xs">
-                      <A class="hover:text-brass-strong" href={`/jobs/${encodeURIComponent(rollout.jobId)}/specs/${encodeURIComponent(rollout.fromJobConfigId || '')}`}>
-                        {rollout.fromJobConfigId || '—'}
+                      <A class="hover:text-brass-strong" href={`/jobs/${encodeURIComponent(rollout().jobId)}/specs/${encodeURIComponent(rollout().fromJobConfigId || '')}`}>
+                        {rollout().fromJobConfigId || '—'}
                       </A>
                       {' → '}
-                      <A class="hover:text-brass-strong" href={`/jobs/${encodeURIComponent(rollout.jobId)}/specs/${encodeURIComponent(rollout.toJobConfigId)}`}>
-                        {rollout.toJobConfigId}
+                      <A class="hover:text-brass-strong" href={`/jobs/${encodeURIComponent(rollout().jobId)}/specs/${encodeURIComponent(rollout().toJobConfigId)}`}>
+                        {rollout().toJobConfigId}
                       </A>
                     </span>
                   </>
                 }
                 actions={
                   <>
-                    <Show when={isManualProgression}>
+                    <Show when={isManualProgression()}>
                       <Button
                         variant="primary"
                         icon="play"
                         onClick={() => void advance()}
-                        disabled={!allows('job', 'write', jobScope(rollout.jobId))}
+                        disabled={!allows('job', 'write', jobScope(rollout().jobId))}
                       >
                         Advance
                       </Button>
                     </Show>
-                    <Show when={!done}>
+                    <Show when={!done()}>
                       <ConfirmButton
                         label="Stop"
                         icon="pause"
                         onConfirm={() => void stop()}
-                        disabled={!allows('job', 'write', jobScope(rollout.jobId))}
+                        disabled={!allows('job', 'write', jobScope(rollout().jobId))}
                       />
                     </Show>
                   </>

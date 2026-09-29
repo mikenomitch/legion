@@ -224,6 +224,207 @@ wait_for_workers() { # wait_for_workers <count> [timeout-secs]
     done
 }
 
+# --- The sim fleet's identity, and how a cell proves it ----------------
+#
+# start-sim-fleet.sh names slice `i` with `--name-prefix sim-<i>`, and
+# src/worker/simulate.rs appends `-<profile>-<n>`, so every node this rig
+# creates is `sim-<slice>-<profile>-<n>`. Those names are REUSED run to
+# run, deliberately: Legion has no node-deregistration RPC
+# (`Store::remove_node` exists but has nothing calling it in production),
+# so a stopped fleet leaves every row behind. Name reuse is the only
+# thing bounding the node table — a unique per-run prefix would make
+# every run leak its whole fleet instead of overwriting the last one's.
+#
+# The consequence a cell has to defend against: the node table is a
+# high-water mark of every fleet the control plane has ever seen. A
+# 4000-node experiment followed by a 1000-node cell leaves 3000 orphan
+# rows, all of them `lost`, all of them still counted by
+# `SELECT COUNT(*) FROM node`. That is why the gates below assert an
+# EXACT census instead of a lower bound.
+SIM_NAME_PREFIX="${SIM_NAME_PREFIX:-sim}"
+
+# What start-sim-fleet.sh last started, written on the loadgen box so any
+# later script (run-step.sh, run-campaign.sh) can ask what is actually
+# running rather than assume.
+FLEET_STATE_REMOTE="${FLEET_STATE_REMOTE:-/opt/bench/runs/fleet-state.json}"
+
+# One SQL census of the manager's node table -> a JSON object:
+#   {"total":N,"active":N,"lost":N,"other":N,"unavailable":N,"foreign_ids":N}
+#
+# `foreign_ids` counts rows whose name is NOT from one of this fleet's
+# slices: leftovers from a wider fleet (`sim-4-…` when this run has three
+# instances), from another scenario (the profile name is part of the
+# node name), or a real worker that wandered in. Health comes from
+# `node_health` — the `node.status` column was moved there by the
+# node/node_health split, and an absent row means `active`, which is the
+# same COALESCE every liveness query in src/storage/store.rs uses.
+#
+# `unavailable` is counted separately because it is a different failure
+# with the same symptom: `node.availability` is the column the SCHEDULER
+# gates placement on, node loss sets it to `unavailable` on the control
+# lane, and recovery has to undo both halves. A node that came back
+# `active` but stayed `unavailable` reads as healthy everywhere and never
+# receives work — src/storage/store.rs calls that out as presenting like
+# a scheduler bug and being almost impossible to diagnose from outside.
+node_census() { # node_census <manager-addr> <slice-count>
+    local manager="$1" slices="$2" i like=""
+    for ((i = 0; i < slices; i++)); do
+        [ -n "$like" ] && like="$like OR "
+        like="${like}node.id LIKE '$SIM_NAME_PREFIX-$i-%'"
+    done
+    # No slices means no name can be legitimate, so every row is foreign.
+    [ -n "$like" ] || like="0=1"
+    local sql="SELECT COUNT(*) AS total,
+        COALESCE(SUM(CASE WHEN COALESCE(h.status,'active')='active' THEN 1 ELSE 0 END),0) AS active,
+        COALESCE(SUM(CASE WHEN COALESCE(h.status,'active')='lost' THEN 1 ELSE 0 END),0) AS lost,
+        COALESCE(SUM(CASE WHEN COALESCE(h.status,'active') NOT IN ('active','lost') THEN 1 ELSE 0 END),0) AS other,
+        COALESCE(SUM(CASE WHEN node.availability <> 'available' THEN 1 ELSE 0 END),0) AS unavailable,
+        COALESCE(SUM(CASE WHEN ($like) THEN 0 ELSE 1 END),0) AS foreign_ids
+        FROM node LEFT JOIN node_health h ON h.node_id = node.id"
+    # `{}` for every failure mode — unreachable manager, an error
+    # envelope, jq given nothing to read. The caller reads a missing
+    # `.total` as "could not census" and keeps waiting, which is the only
+    # safe reading: an unanswered query is not evidence of a good fleet.
+    local out
+    out=$(rsh "$LOADGEN_ADDR" "LEGION_ADDR=$manager legion state query \"$sql\" -j" 2>/dev/null |
+        jq -c '.data.rows[0] // {}' 2>/dev/null || true)
+    [ -n "$out" ] || out='{}'
+    printf '%s\n' "$out"
+}
+
+census_line() { # census_line <census-json> <expected>
+    jq -r --arg want "$2" \
+        '"total=\(.total // "?") active=\(.active // "?") lost=\(.lost // "?") other=\(.other // "?") unavailable=\(.unavailable // "?") foreign=\(.foreign_ids // "?") expected=\($want)"' \
+        <<<"$1" 2>/dev/null || echo "census unreadable: $1"
+}
+
+# Assert the fleet is EXACTLY what this cell asked for, or fail.
+#
+#   assert_fleet <manager> <expected-nodes> <slice-count> [timeout-secs]
+#
+# This replaced `registered -ge NODES`, which passed on two populations
+# that make a cell worthless and say nothing in the log:
+#   * 4000 rows when the cell wanted 1000 — a previous, wider experiment's
+#     orphans, so the cell measured a scheduler carrying four times the
+#     nodes it reports;
+#   * a fleet where every node is `lost` — COUNT(*) does not look at
+#     health, so a completely dead fleet satisfied a >= gate.
+# Both are silent failures, which is why the assertion is exact and why
+# the observed census is printed on failure.
+#
+# Retries, because registration is genuinely progressive: rows appear as
+# the sim processes work through `--register-rate`, and a node that just
+# re-registered can sit `lost` for a tick until its first heartbeat lands.
+# It does NOT retry when total already EXCEEDS expected: nothing removes
+# a node row, so that number only ever grows and waiting is pure cost.
+assert_fleet() { # assert_fleet <manager> <expected> <slices> [timeout]
+    local manager="$1" want="$2" slices="$3" timeout="${4:-600}"
+    local deadline census total
+    deadline=$(($(date +%s) + timeout))
+    while :; do
+        census=$(node_census "$manager" "$slices")
+        total=$(jq -r '.total // -1' <<<"$census" 2>/dev/null || echo -1)
+        if [ "$total" = "-1" ]; then
+            log "  census unavailable (manager not answering state queries yet)"
+        else
+            log "  fleet census: $(census_line "$census" "$want")"
+            if jq -e --argjson want "$want" \
+                '.total == $want and .active == $want and .unavailable == 0 and .foreign_ids == 0' \
+                >/dev/null <<<"$census" 2>/dev/null; then
+                return 0
+            fi
+            if [ "$total" -gt "$want" ] 2>/dev/null; then
+                echo "fleet is LARGER than this cell asked for: $(census_line "$census" "$want")" >&2
+                echo "  Legion has no node-deregistration RPC, so those rows never leave on" >&2
+                echo "  their own and no amount of waiting will fix this. Reset the control" >&2
+                echo "  plane before the campaign: scripts/reset-control-plane.sh --system <s>" >&2
+                return 1
+            fi
+        fi
+        (($(date +%s) < deadline)) || {
+            echo "fleet never reached an exact census in ${timeout}s: $(census_line "$census" "$want")" >&2
+            echo "  Wanted $want rows, every one of them active AND available, every" >&2
+            echo "  name from $SIM_NAME_PREFIX-<0..$((slices - 1))>-*." >&2
+            return 1
+        }
+        sleep 10
+    done
+}
+
+# What the running sim fleet is, as JSON, or {} when nothing recorded it.
+fleet_state() {
+    rsh "$LOADGEN_ADDR" "cat '$FLEET_STATE_REMOTE' 2>/dev/null" 2>/dev/null |
+        jq -c . 2>/dev/null || echo '{}'
+}
+
+write_fleet_state() { # write_fleet_state <system> <scenario> <nodes> <slices> <manager>
+    local json
+    json=$(jq -n --arg system "$1" --arg scenario "$2" --argjson nodes "$3" \
+        --argjson slices "$4" --arg manager "$5" --arg started_at "$(date -u +%FT%TZ)" \
+        '{system: $system, scenario: $scenario, nodes: $nodes, slices: $slices,
+          manager: $manager, started_at: $started_at}')
+    rsh "$LOADGEN_ADDR" "mkdir -p \$(dirname '$FLEET_STATE_REMOTE') &&
+        cat >'$FLEET_STATE_REMOTE'" <<<"$json"
+}
+
+clear_fleet_state() {
+    rsh "$LOADGEN_ADDR" "rm -f '$FLEET_STATE_REMOTE'" 2>/dev/null || true
+}
+
+# Backlog of scheduler work the manager has not started yet: pending +
+# in-flight evals. This is the number a cell has to start from zero-ish,
+# because a fleet stop/start marks thousands of nodes lost and each loss
+# raises a reschedule eval — measured at 5760 reschedules against 2503
+# submits, i.e. the cell's job submissions were a minority of the work
+# the eval workers were doing, and the "throughput" it reported was the
+# scheduler splitting its attention with the churn we caused.
+eval_backlog() { # eval_backlog <manager-addr>
+    rsh "$LOADGEN_ADDR" "LEGION_ADDR=$1 legion state query \
+        \"SELECT COUNT(*) AS n FROM eval WHERE status IN ('pending','in_flight')\" -j" 2>/dev/null |
+        jq -r '.data.rows[0].n // -1' 2>/dev/null || echo -1
+}
+
+# Wait for that backlog to drain before a cell starts measuring.
+#
+#   wait_for_eval_drain <manager> [floor] [timeout-secs]
+#
+# Echoes the backlog it settled at on stdout (so the caller can archive
+# it) and never fails the cell: a contaminated cell that says so in its
+# archive is worth more than a cell that refused to run.
+wait_for_eval_drain() { # -> settled depth on stdout
+    local manager="$1" floor="${2:-10}" timeout="${3:-600}"
+    local deadline depth quiet=0
+    deadline=$(($(date +%s) + timeout))
+    while :; do
+        depth=$(eval_backlog "$manager")
+        if [ "$depth" = "-1" ]; then
+            log "  eval backlog unreadable — continuing without a drain wait"
+            echo -1
+            return 0
+        fi
+        if [ "$depth" -le "$floor" ]; then
+            quiet=$((quiet + 1))
+            # Two consecutive quiet polls, because the queue dips between
+            # a loss storm's batches and one sample lands in the dip.
+            if [ "$quiet" -ge 2 ]; then
+                log "  eval backlog drained to $depth"
+                echo "$depth"
+                return 0
+            fi
+        else
+            quiet=0
+            log "  eval backlog $depth (waiting for <= $floor)"
+        fi
+        (($(date +%s) < deadline)) || {
+            log "  WARNING: eval backlog still $depth after ${timeout}s — this cell competes"
+            log "           with that churn; the depth is recorded in its archive"
+            echo "$depth"
+            return 0
+        }
+        sleep 5
+    done
+}
+
 rsh() { # rsh <ip> <command...>
     local ip="$1"
     shift

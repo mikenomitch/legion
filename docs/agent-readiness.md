@@ -50,7 +50,7 @@ Even with `--allow-write`, `legion_state_query` is forced to read-only.
 | Tool | Mutates | Purpose |
 | --- | --- | --- |
 | `legion_capabilities` | no | List the operation catalog. |
-| `legion_job_list` | no | List jobs. |
+| `legion_job_list` | no | List jobs, optionally only those in one `status`; the reply's `status_counts` gives per-status totals. |
 | `legion_job_info` | no | Inspect one job. |
 | `legion_job_spec` | no | Fetch a job's source submissions. |
 | `legion_job_schema` | no | JSON Schema for jobspecs + task runtimes. |
@@ -62,11 +62,21 @@ Even with `--allow-write`, `legion_state_query` is forced to read-only.
 | `legion_volume_list` | no | List volumes — the storage behind stateful instances. Filters by job/node/plugin/instance/state. |
 | `legion_volume_get` | no | Inspect one volume: plugin, params, node pin, mount path, last driver error. |
 | `legion_volume_drivers` | no | Volume plugins installed across the cluster and which nodes can use them. Answers "why was my job rejected for plugin X". |
-| `legion_node_list` | no | List worker nodes. |
+| `legion_node_list` | no | List worker nodes. Each carries `heartbeat_source` — see the freshness note below. |
+| `legion_node_cadence` | no | Is the fleet sustaining its heartbeat cadence? Freshness ratio, lost window, sustainable fleet size, and the `heartbeatSeconds` to set if it is falling behind ([heartbeat-cadence-and-scale.md](heartbeat-cadence-and-scale.md)). |
 | `legion_node_claims` | no | A node's live provisional (unratified) allocations — started-but-unconfirmed work ([edge-boot.md](edge-boot.md)). Tells "still booting" from "already confirmed". |
 | `legion_boot_ticket_list` | no | Outstanding boot tickets (metadata only; token bytes are never stored or returned). |
 | `legion_service_list` | no | List declared services with healthy/total endpoint counts — what a job can connect to. |
 | `legion_service_resolve` | no | Resolve a service to its endpoints (address, port, allocation, node, health). |
+| `legion_net_policy_list` | no | List stored network policies (selector, enforcement, rules) in merge order. |
+| `legion_net_policy_show` | no | A task's effective network policy — every matching stored policy merged with its own block, each rule naming its source — and the resolved network mode. |
+| `legion_net_policy_test` | no | Dry-run a verdict: may this task reach `to` / be reached from `from`? Returns allow/deny/defer with the deciding rule and reason; sends nothing. |
+| `legion_net_doctor` | no | Walk a task's network from policy to datapath and say where it breaks: the resolved policy, whether the mode enforces it, and per allocation whether the node's datapath is ready, enforcing the current policy, or fail-closed. Returns ok/warn/fail with fix hints. |
+| `legion_net_handler_test` | no | Conformance-probe an external handler the way the datapath would use it: an authz webhook must answer `{verdict}` to a sample facts payload; a proxy must accept a PROXY v2 header. One synthetic request; never touches the cluster. |
+| `legion_service_edges` | no | The service graph: who calls whom through the datapath, with request rate, errors, denials, latency and bytes per (caller, service) over the window, plus declared-but-silent upstreams and whether each caller is on the service's allow list. |
+| `legion_net_ca_show` | no | The mesh CA certificate (PEM, never the key) that non-Legion clients trust to reach a mesh-TLS port. |
+| `legion_net_ca_rotate` | **yes** | Replace the mesh CA; every node re-issues its certificate on its next heartbeat, and peers on different CAs refuse each other until then. |
+| `legion_net_policy_apply` | **yes** | Create or replace a network policy object; `dry_run` validates and lists affected allocations without writing. |
 | `legion_acl_whoami` | no | ACL status + caller identity (diagnose PermissionDenied). |
 | `legion_events` | no | List scheduler events; poll with `after_id` to tail. |
 | `legion_job_logs` | no | Fetch captured task stdout/stderr for a job. |
@@ -81,12 +91,12 @@ Even with `--allow-write`, `legion_state_query` is forced to read-only.
 | `legion_job_scale_status` | no | Per-task spec vs override vs effective counts. |
 | `legion_job_destroy` | **yes** | Destroy a job. |
 | `legion_template_run` | **yes** | Render a template with variables and submit the job (supports `idempotency_key`). |
-| `legion_template_upsert` | **yes** | Store Jsonnet as the next immutable version of a template. |
+| `legion_template_upsert` | **yes** | Store Nickel as the next immutable version of a template. |
 | `legion_template_delete` | **yes** | Delete a template and all of its versions (running jobs are unaffected). |
 | `legion_instance_create` | **yes** | Create a keyed-mode stateful instance (never-recycled id; supports `idempotency_key`). |
 | `legion_instance_destroy` | **yes** | Destroy a keyed instance, stop its allocation, drop its storage (supports `idempotency_key`). |
 | `legion_instance_replace` | **yes** | Force-replace an instance's allocation stuck on a LOST node (skips the `onLost.replaceAfter` loss-confirmation gate; split-brain risk if the node is only partitioned; supports `idempotency_key`). |
-| `legion_volume_delete` | **yes** | Delete a volume and reclaim its storage. DESTROYS DATA; `force: true` tombstones without driver confirmation for a node that is gone for good (supports `idempotency_key`). |
+| `legion_volume_delete` | **yes** | Delete a volume and reclaim its storage. DESTROYS DATA; `force = true` tombstones without driver confirmation for a node that is gone for good (supports `idempotency_key`). |
 | `legion_boot_ticket_create` | **yes** | Mint a boot ticket: a short-lived capability letting one edge node start one workload without a manager call ([edge-boot.md](edge-boot.md)). Revocable only by expiry, so prefer short TTLs (supports `idempotency_key`). |
 
 Tool errors are returned in-band (`result.isError = true` with a text payload),
@@ -94,6 +104,25 @@ following MCP convention; transport/protocol errors use JSON-RPC `error`.
 
 The transport contract is one JSON message per line. In MCP mode Legion routes
 all console logs to **stderr** so stdout stays a clean protocol stream.
+
+### Reading a node's last heartbeat honestly
+
+`NodeMsg.last_heartbeat` is **not** always a live clock, and an agent that
+treats it as one will draw wrong conclusions. Heartbeats are tracked in the
+memory of the manager that owns node status; only status *transitions* are
+replicated. Every node therefore carries `heartbeat_source`:
+
+- `live` — the answering manager observed the beat itself. Current.
+- `checkpoint` — from a periodic replicated checkpoint, up to
+  `liveness.checkpointInterval` (30s by default) behind.
+- `""` — no beat observed, or checkpoints are disabled.
+
+**The node's `status` is exact on every manager**, so `status` is what to
+branch on. Use `last_heartbeat` for display and for ordering, not as evidence
+that a node has just died — and when a lot of nodes look stale at once, call
+`legion_node_cadence` before concluding anything: a low freshness ratio means
+the control plane is behind, not that the machines are gone. See
+[node-liveness.md](node-liveness.md).
 
 ## 2. Structured output envelope
 
@@ -129,20 +158,31 @@ and the MCP `tools/list`; keep it in sync when adding operations
 
 ## 4. Authoring jobs: schema + validate
 
-Agents author far more reliably against a schema than against free-form Jsonnet.
+Agents author far more reliably against a schema than against free-form Nickel.
 
 ```bash
 # Get the jobspec JSON Schema, including the live per-runtime task config schemas:
 legion job schema --json
 
 # Render and deeply validate a jobspec WITHOUT submitting it:
-legion job validate ./configs/jobs/demo.jsonnet --json
+legion job validate ./configs/jobs/demo.ncl --json
 ```
 
 `job validate` runs the exact validation the manager applies on submit
 (`validate_job_config`), so an agent can self-correct before touching the cluster.
 The schema embeds the built-in task-runtime config schemas (`exec`, `container`, …)
 under `taskRuntimes`, derived from the typed Rust structs.
+
+**Write the spec as `.json`, not `.ncl`.** An agent generating a jobspec is the
+machine-emitted case the JSON path exists for: `legion job schema` describes
+the JSON, an agent already emits JSON, and a `.json` file is accepted anywhere
+a `.ncl` one is. Going through Nickel means generating a second syntax whose
+records use `=` — and a JSON object handed to the Nickel parser fails as
+`invalid contract expression`, which is a bad error to have to self-correct
+from. Nickel is for the humans reading the spec afterward; if the job needs to
+be *both* generated and readable, emit a `.json` data file and import it from a
+short hand-written `.ncl`. See
+[Configuration Language](configuration-language.md#json-for-machine-emitted-config).
 
 Runtime configs are checked *typed*, not just against their JSON schema, so
 mistakes an agent could not otherwise see — an unknown capability name in
@@ -175,11 +215,11 @@ An agent authoring a multi-task system should never have to invent, inject, or
 reconcile addresses. Declare the producer's port once and let the consumer name
 the service ([Service Discovery](service-discovery.md)):
 
-```jsonnet
-// producer
-service: { port: 8080, allow: ["api"] },      // allow is optional; omit = any job
-// consumer
-connect: { upstreams: [{ service: "db", balance: "least_conn" }] },
+```nickel
+# producer
+service = { port = 8080, allow = ["api"] },      # allow is optional; omit = any job
+# consumer
+connect = { upstreams = [{ service = "db", balance = "least_conn" }] },
 ```
 
 The consumer's task then dials `$LEGION_UPSTREAM_DB` (`127.0.0.1:<port>`) and
@@ -228,13 +268,37 @@ Over MCP the same catalog is `legion_service_list` and `legion_service_resolve`
 > policy; do not treat it as a security boundary. See
 > [Service Discovery](service-discovery.md#intentions-serviceallow).
 
+## 4b. Network policy: asking before dialing
+
+A connection that a policy denies is closed before it is dialed, which a
+client sees as a reset or a hang. An agent should not have to infer policy
+from timeouts. Two read-only surfaces answer it directly
+([Network Handlers](network-handlers.md)):
+
+```bash
+legion net policy show agent -j                         # the merged policy, rules with sources
+legion net policy test agent --to https://api.github.com/user -j
+# → {"ok":true,"data":{"verdict":"deny","source":"policy/sandbox-egress#3","reason":"…"}}
+```
+
+Over MCP the same are `legion_net_policy_show` and `legion_net_policy_test`.
+When a request *is* denied in HTTP mode, the response itself says why: a
+`403` with `Legion-Denied-By: <policy>/<rule>` and a JSON body naming the
+rule and reason — so an agent inside a sandbox can change its approach
+instead of retrying.
+
+`legion net policy apply` (and `legion_net_policy_apply`) is mutating and
+gated behind `--allow-write`; `--dry-run` / `dry_run` validates the object
+and lists the running allocations whose effective policy would change,
+without writing.
+
 ## 5. Idempotency keys
 
 Mutating job operations accept an optional idempotency key so an agent can retry
 after a timeout without risking a double-apply:
 
 ```bash
-legion job run demo.jsonnet --idempotency-key deploy-2026-05-29-001
+legion job run demo.ncl --idempotency-key deploy-2026-05-29-001
 legion job stop demo        --idempotency-key stop-demo-001
 legion job destroy demo     --idempotency-key destroy-demo-001
 legion instance create sandbox-demo --id user-42 --idempotency-key sbx-user-42
@@ -248,11 +312,19 @@ result was replayed. Backed by the `idempotency_record` table
 [`src/storage/store.rs`](../src/storage/store.rs)). An empty/absent key disables
 deduplication.
 
+**Concurrent** requests carrying the same key are a separate case from a retry:
+both miss the recorded result, so the *record* arbitrates. `job run` handles
+this — exactly one caller is told it was first, and the loser is handed the
+winner's message with `deduplicated: true`. Known limitation: the other mutating
+RPCs (`job stop`, `job destroy`, `job scale`, the `instance` verbs) still report
+`deduplicated: false` to both sides of such a race. Sequential retries — the
+case the key is really for — are correct on every one of them.
+
 ## 6. Closing the loop: waiting for convergence
 
 ```bash
 # Submit and block until the resulting rollout converges:
-legion job run demo.jsonnet --wait --timeout 180 --json
+legion job run demo.ncl --wait --timeout 180 --json
 
 # Or wait on an existing job's latest rollout:
 legion job wait demo --json
@@ -265,7 +337,7 @@ tracked `rolloutId`. A non-converged wait exits non-zero.
 
 > **Scope note:** `wait` tracks **rollouts**, which are the convergence signal for
 > updates to existing jobs. A brand-new job with no prior version has no rollout
-> to track and reports `status: "no_rollout"`. For deeper post-deploy inspection,
+> to track and reports `status = "no_rollout"`. For deeper post-deploy inspection,
 > use rollout events and the state store (below).
 
 Other loop-closing signals available to agents today:
@@ -427,8 +499,8 @@ All client commands and the MCP server honour:
    (or `legion template run … --idempotency-key … --wait`).
 6. **Verify**: inspect the `wait` result, `rollout events`, and `state query`.
 
-Prefer read-only operations; treat anything with `mutates: true` /
-`readOnlySafe: false` as requiring confirmation.
+Prefer read-only operations; treat anything with `mutates = true` /
+`readOnlySafe = false` as requiring confirmation.
 
 **Reacting to being stopped.** An agent-run task is told when the platform is
 shutting it down: `LEGION_STOP_NOTICE_PATH` names a JSON file written just

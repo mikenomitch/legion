@@ -48,13 +48,21 @@ fn setup_store(scheduler_settings: Value) -> R<Store> {
     Ok(store)
 }
 
-fn insert_node(store: &Store, id: &str) -> R<()> {
+/// `max_allocations` caps the node's allocation slots (`maxAllocations`),
+/// which is how a test asks for genuine capacity contention: with memory
+/// alone the pool is far too roomy for two planners to ever fight over a
+/// node's last slot.
+fn insert_node(store: &Store, id: &str, max_allocations: Option<u64>) -> R<()> {
+    let config_attrs = match max_allocations {
+        Some(max) => json!({ "maxAllocations": max }).to_string(),
+        None => "{}".to_string(),
+    };
     store.insert_node(NodeMsg {
         id: id.to_string(),
         pool: "default".into(),
         status: "active".into(),
         availability: "available".into(),
-        config_attrs: "{}".into(),
+        config_attrs,
         fingerprint_attrs: json!({
             "memory_total": "8589934592",
             "cpus": {
@@ -66,6 +74,7 @@ fn insert_node(store: &Store, id: &str) -> R<()> {
         dynamic_attrs: "{}".into(),
         health_checks: "{}".into(),
         last_heartbeat: "2023-01-01 00:00:00 +00:00:00".into(),
+        heartbeat_source: String::new(),
     })?;
     Ok(())
 }
@@ -87,7 +96,7 @@ fn submit_job(store: &Store, name: &str) -> R<()> {
     store.handle_job_submit(
         &job,
         &[Submission {
-            path: "job.jsonnet".into(),
+            path: "job.ncl".into(),
             content: "job".into(),
             is_primary: true,
         }],
@@ -170,11 +179,16 @@ fn run_burst(
     jobs: usize,
     nodes: usize,
     workers: usize,
+    max_allocations_per_node: Option<u64>,
     scheduler_settings: Value,
 ) -> R<BurstMetrics> {
     let store = setup_store(scheduler_settings)?;
     for index in 0..nodes {
-        insert_node(&store, &format!("node-{index:03}"))?;
+        insert_node(
+            &store,
+            &format!("node-{index:03}"),
+            max_allocations_per_node,
+        )?;
     }
 
     // Seed one allocation so bin_pack has a deterministic argmax from the
@@ -291,6 +305,7 @@ fn burst_at_headroom_never_drops_work() -> R<()> {
         32,
         12,
         8,
+        None,
         json!({ "plan_conflict_requeue_delay_ms": 100 }),
     )?;
     with_candidates.print();
@@ -305,6 +320,7 @@ fn burst_at_headroom_never_drops_work() -> R<()> {
         32,
         12,
         8,
+        None,
         json!({ "plan_candidates": 0, "plan_conflict_requeue_delay_ms": 100 }),
     )?;
     without_candidates.print();
@@ -322,9 +338,18 @@ fn burst_at_headroom_never_drops_work() -> R<()> {
     Ok(())
 }
 
-/// Phase 1 end to end: with a one-attempt retry budget and no candidate
-/// lists, conflict exhaustion is near-certain — and every exhausted eval
+/// The requeue backstop end to end: with a one-attempt retry budget, a
+/// single lost race exhausts an eval's budget — and every exhausted eval
 /// must requeue (visibly) and place, never fail.
+///
+/// The contention has to be *capacity* contention. Node-epoch collisions
+/// used to supply it for free, but a plan whose candidate merely had its
+/// epoch bumped is now revalidated and bound
+/// (internal_docs/plans/plan-apply-conflict-reduction-plan.md), so this
+/// same burst runs clean on a roomy pool. Three allocation slots per node
+/// over 12 nodes is 36 slots for 33 allocations: planners genuinely fight
+/// over the last slots of the `bin_pack` argmax, and the losers reject on
+/// the in-transaction capacity recheck.
 #[test]
 fn conflict_exhaustion_requeues_and_places() -> R<()> {
     let metrics = run_burst(
@@ -332,6 +357,7 @@ fn conflict_exhaustion_requeues_and_places() -> R<()> {
         32,
         12,
         8,
+        Some(3),
         json!({
             "plan_candidates": 0,
             "plan_conflict_max_retries": 1,
@@ -371,6 +397,7 @@ fn contention_matrix() -> R<()> {
                 jobs,
                 nodes,
                 8,
+                None,
                 json!({
                     "plan_candidates": candidates,
                     "plan_conflict_requeue_delay_ms": 100,

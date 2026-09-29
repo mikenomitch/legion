@@ -8,8 +8,11 @@ edition = "2021"
 [dependencies]
 clap = { version = "4.5.48", features = ["cargo", "derive"] }
 futures = "0.3"
-# jsonnet-rs = "0.17.0"
-jsonnet-rs = { git = "https://github.com/mikenomitch/rust-jsonnet" }
+# Nickel is Legion's configuration language: job specs, manager/worker
+# configs, and ACL policies are all `.ncl` files evaluated to JSON. Default
+# features (repl, markdown, doc, format) pull in rustyline/topiary/tree-sitter
+# and are not used by the embedded evaluator.
+nickel-lang-core = { version = "0.18.0", default-features = false }
 jsonwebtoken = "9.1.0"
 libloading = "0.8.1"
 prost = "0.13.3"
@@ -37,6 +40,17 @@ time = "0.3.30"
 tokio = { version = "1.0", features = ["macros", "rt-multi-thread", "full"] }
 tokio-stream = "0.1"
 tonic = { version = "0.12.3", features = ["tls"] }
+# The datapath's TLS: originating TLS to external upstreams and terminating
+# it on ingress (docs/network-handlers.md). Same rustls + ring the tonic
+# `tls` feature already pulls in, pinned to `ring` so no second crypto
+# provider enters the build.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+rustls-pki-types = "1"
+rustls-pemfile = "2"
+webpki-roots = "1"
+# Reads the SANs off a verified mesh peer certificate (docs/network-handlers.md).
+x509-parser = "0.16"
 tonic-web = "0.12.3"
 tower-http = { version = "0.5.2", features = ["cors"] }
 tower = "0.4"
@@ -96,8 +110,8 @@ portable-pty = "0.8.1"
 # does not enable HTTP upgrades, so exec-over-WS needs its own hyper listener).
 tokio-tungstenite = "0.24"
 hyper-tungstenite = "0.15"
-hyper = { version = "1", features = ["server", "http1"] }
-hyper-util = { version = "0.1", features = ["tokio", "server"] }
+hyper = { version = "1", features = ["server", "client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "server", "client-legacy", "http1"] }
 # CLI interactive terminal: raw mode + window size for `legion exec -it`.
 crossterm = "0.28"
 
@@ -125,6 +139,24 @@ name = "eval_critical_path_bench"
 path = "benchmarks/micro/eval_critical_path_bench.rs"
 harness = false
 
+# The AWS rig's native job submitter. Not part of the product: it exists
+# because the rig's per-job `legion job run` process spawn ceilinged at ~36-103
+# jobs/sec and was being reported as Legion's throughput. It links against this
+# crate's own generated client so the proto has exactly one source of truth.
+#
+# Behind a feature so an ordinary `cargo build` does not link a second copy of
+# the binary for a tool nobody but the rig runs. CI lints it via
+# `--all-features`; `benchmarks/aws/scripts/local-smoke.sh` and
+# `build-and-upload.sh` build it explicitly.
+[[bin]]
+name = "legion-loadgen"
+path = "benchmarks/loadgen/main.rs"
+required-features = ["loadgen"]
+
+[features]
+# Builds the `legion-loadgen` bin above. No effect on the `legion` binary.
+loadgen = []
+
 # Profile for shipped binaries: `cargo build --profile dist`.
 #
 # Legion is distributed as one binary that is manager, worker, CLI, and MCP
@@ -142,6 +174,19 @@ harness = false
 # the final link, taking several minutes against about one for `--release`. That
 # is why this is a separate profile: `--release` stays fast for local work, and
 # only release artifacts pay for the smaller binary. Debug builds are unaffected.
+# Same optimizations as `dist` minus the parts that dominate LINK time:
+# `fat` LTO with one codegen unit takes ~25 minutes on the benchmark
+# operator box, which is longer than some measurement windows allow. Thin
+# LTO across 16 units builds in roughly a third of that and is within a
+# few percent at runtime. Use it when the alternative is no measurement at
+# all -- and say so, because it is NOT the shipping binary and a cell
+# built this way is not directly comparable to a `dist` cell.
+[profile.distfast]
+inherits = "release"
+lto = "thin"
+codegen-units = 16
+strip = "symbols"
+
 [profile.dist]
 inherits = "release"
 # Collapse dead code and duplicated generics across every crate in the tree.

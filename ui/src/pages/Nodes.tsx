@@ -3,11 +3,12 @@ import { AccessGate } from '../components/AccessGate'
 import { Show, createEffect, createMemo, createResource, createSignal } from 'solid-js'
 import SharedIndex from '../components/SharedIndex'
 import { CreateJoinTokenForm } from '../components/acl/AdminPanels'
-import { Button, SectionCard, linkClass } from '../components/ui'
+import { Badge, Button, SectionCard, StatusBadge, linkClass } from '../components/ui'
 import { managerClient } from '../grpcClient'
 import { debounced } from '../utils/debounce'
-import { formatRelativeTime } from '../utils/format'
+import { heartbeatFreshnessHint } from '../utils/format'
 import { summarizeHealthChecks } from '../utils/health'
+import { INDEX_POLL_INTERVAL_MS, retainOnError, usePoll } from '../utils/polling'
 
 function NodesContent() {
   const [search, setSearch] = createSignal('')
@@ -16,6 +17,7 @@ function NodesContent() {
   const [pageSize, setPageSize] = createSignal(20)
   const [joinTokenOpen, setJoinTokenOpen] = createSignal(false)
   const searchQuery = debounced(search)
+  const tick = usePoll(INDEX_POLL_INTERVAL_MS)
 
   createEffect(() => {
     search()
@@ -23,7 +25,10 @@ function NodesContent() {
     setPage(1)
   })
 
-  const [ledger] = createResource(async () => (await managerClient.getLedger({})).nodes)
+  const [ledger] = createResource(
+    () => tick() + 1,
+    retainOnError(async () => (await managerClient.getLedger({})).nodes, () => 'ledger'),
+  )
 
   const allocationCounts = createMemo(() => {
     const counts = new Map<string, number>()
@@ -36,17 +41,20 @@ function NodesContent() {
   })
 
   const [data] = createResource(
-    () => ({ search: searchQuery(), sort: sort(), page: page(), pageSize: pageSize() }),
-    async (input) => {
-      const [sortBy, sortOrder] = input.sort.split(':')
-      return managerClient.getNodes({
-        query: input.search,
-        sortBy,
-        sortOrder,
-        page: input.page,
-        pageSize: input.pageSize,
-      })
-    },
+    () => ({ search: searchQuery(), sort: sort(), page: page(), pageSize: pageSize(), tick: tick() }),
+    retainOnError(
+      async (input: { search: string; sort: string; page: number; pageSize: number; tick: number }) => {
+        const [sortBy, sortOrder] = input.sort.split(':')
+        return managerClient.getNodes({
+          query: input.search,
+          sortBy,
+          sortOrder,
+          page: input.page,
+          pageSize: input.pageSize,
+        })
+      },
+      (input) => `${input.search}|${input.sort}|${input.page}|${input.pageSize}`,
+    ),
   )
 
   return (
@@ -85,10 +93,12 @@ function NodesContent() {
           { label: 'Last heartbeat (newest)', value: 'last_heartbeat:desc' },
         ]}
         columns={[
+          { key: 'health', header: 'Health' },
           { key: 'pool', header: 'Pool' },
           { key: 'availability', header: 'Availability' },
           { key: 'allocations', header: 'Allocations', class: 'text-right' },
         ]}
+        updatedLabel="Heartbeat"
         loading={data.loading || ledger.loading}
         error={data.error ? 'Failed to load workers.' : undefined}
         items={(data()?.nodes ?? []).map((node) => {
@@ -96,13 +106,23 @@ function NodesContent() {
           return {
             id: node.id,
             title: node.id,
-            status: health.label,
-            statusTone: health.tone,
-            updatedAt: formatRelativeTime(node.lastHeartbeat),
+            // Liveness (ready / lost / down) is the status; the health checks
+            // the worker reports are a separate column, as on the overview.
+            status: node.status || 'unknown',
+            updatedAt: node.lastHeartbeat,
+            updatedAtTitle: heartbeatFreshnessHint(node.heartbeatSource),
             href: `/nodes/${encodeURIComponent(node.id)}`,
             cells: {
+              health: <StatusBadge status={health.label} tone={health.tone} />,
               pool: node.pool || 'default',
-              availability: node.availability || '—',
+              availability:
+                node.availability && node.availability !== 'available' ? (
+                  <Badge tone={node.availability === 'drained' ? 'warn' : 'danger'} dot class="uppercase tracking-wide">
+                    {node.availability}
+                  </Badge>
+                ) : (
+                  node.availability || '—'
+                ),
               allocations: <span class="tabular-nums">{allocationCounts().get(node.id) ?? 0}</span>,
             },
           }
@@ -116,7 +136,7 @@ function NodesContent() {
           setPage(1)
         }}
         emptyLabel="No workers connected"
-        emptyHint="Create a join token above, then run the printed command on the worker host."
+        emptyHint="Create a join token above, then run the printed `legion join <token>` command on the worker host."
       />
     </div>
   )

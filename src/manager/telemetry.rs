@@ -312,6 +312,11 @@ pub struct SampleSnapshot {
 pub enum SampleValue {
     Counter(u64),
     Gauge(i64),
+    /// A gauge whose value is genuinely fractional — a ratio, not a count.
+    /// Kept separate rather than scaling into the integer gauge so the metric
+    /// an operator alerts on reads in the units the docs state
+    /// (`legion_heartbeat_freshness_ratio` is 0.22, never 220).
+    GaugeF64(f64),
     Histogram {
         bounds: &'static [f64],
         /// Per-bucket (NON-cumulative) counts, one per bound plus a final
@@ -609,6 +614,42 @@ impl RenderMetric for Gauge {
     }
 }
 
+/// Unlabeled gauge with a fractional value (a ratio, a rate).
+pub struct FloatGauge {
+    meta: FamilyMeta,
+    bits: AtomicU64,
+}
+
+impl FloatGauge {
+    pub fn set(&self, v: f64) {
+        self.bits.store(v.to_bits(), Ordering::Relaxed);
+    }
+
+    pub fn get(&self) -> f64 {
+        f64::from_bits(self.bits.load(Ordering::Relaxed))
+    }
+}
+
+impl RenderMetric for FloatGauge {
+    fn render_into(&self, out: &mut String) {
+        render_header(out, &self.meta, "gauge");
+        out.push_str(&format!("{} {}\n", self.meta.name, self.get()));
+    }
+
+    fn snapshot_family(&self) -> FamilySnapshot {
+        FamilySnapshot {
+            name: self.meta.name,
+            help: self.meta.help,
+            kind: SnapshotKind::Gauge,
+            label_names: self.meta.labels,
+            samples: vec![SampleSnapshot {
+                label_values: Vec::new(),
+                value: SampleValue::GaugeF64(self.get()),
+            }],
+        }
+    }
+}
+
 /// Unlabeled histogram.
 pub struct Histogram {
     meta: FamilyMeta,
@@ -666,8 +707,16 @@ pub struct Metrics {
     pub eval_queue_depth: Arc<Gauge>,
     /// `legion_plan_apply_total{outcome}`
     pub plan_apply_total: Arc<CounterVec>,
+    /// `legion_eval_claim_total{outcome}`
+    pub eval_claim_total: Arc<CounterVec>,
+    /// `legion_eval_handle_seconds{kind}`
+    pub eval_handle_seconds: Arc<HistogramVec>,
+    /// `legion_dispatch_send_seconds`
+    pub dispatch_send_seconds: Arc<Histogram>,
     /// `legion_scheduler_plan_candidate_rank`
     pub scheduler_plan_candidate_rank: Arc<Histogram>,
+    /// `legion_scheduler_plan_bind_pass{pass}`
+    pub scheduler_plan_bind_pass: Arc<CounterVec>,
     /// `legion_eval_conflict_requeues_total`
     pub eval_conflict_requeues_total: Arc<Counter>,
     /// `legion_preemptions_total{pool,band}` — victims actually evicted.
@@ -679,10 +728,14 @@ pub struct Metrics {
     pub heartbeats_total: Arc<Counter>,
     /// `legion_nodes{status}`
     pub nodes: Arc<GaugeVec>,
+    /// `legion_read_model_nodes{set}`
+    pub read_model_nodes: Arc<GaugeVec>,
     /// `legion_allocations`
     pub allocations: Arc<Gauge>,
     /// `legion_store_write_lock_wait_seconds`
     pub store_write_lock_wait_seconds: Arc<Histogram>,
+    /// `legion_store_read_lock_wait_seconds`
+    pub store_read_lock_wait_seconds: Arc<Histogram>,
     /// `legion_store_coalesce_batch_size{path}`
     pub store_coalesce_batch_size: Arc<HistogramVec>,
     /// `legion_store_coalesce_wait_seconds{path,role}`
@@ -713,7 +766,7 @@ pub struct Metrics {
     pub raft_capture_seconds: Arc<HistogramVec>,
     /// `legion_raft_propose_apply_seconds{lane}`
     pub raft_propose_apply_seconds: Arc<HistogramVec>,
-    /// `legion_raft_ops_total{lane,outcome}`
+    /// `legion_raft_ops_total{lane,op,outcome}`
     pub raft_ops_total: Arc<CounterVec>,
     /// `legion_raft_pipeline_wait_seconds{lane}`
     pub raft_pipeline_wait_seconds: Arc<HistogramVec>,
@@ -731,6 +784,32 @@ pub struct Metrics {
     pub scheduler_plan_phase_seconds: Arc<HistogramVec>,
     /// `legion_scheduler_lazy_sample_fallback_total`
     pub scheduler_lazy_sample_fallback_total: Arc<Counter>,
+    /// `legion_heartbeat_freshness_ratio` — **the number to alert on.**
+    pub heartbeat_freshness_ratio: Arc<FloatGauge>,
+    /// `legion_heartbeat_served_interval_seconds`
+    pub heartbeat_served_interval_seconds: Arc<Gauge>,
+    /// `legion_heartbeat_lost_window_seconds`
+    pub heartbeat_lost_window_seconds: Arc<Gauge>,
+    /// `legion_heartbeat_sustainable_nodes`
+    pub heartbeat_sustainable_nodes: Arc<Gauge>,
+    /// `legion_nodes_marked_lost_total`
+    pub nodes_marked_lost_total: Arc<Counter>,
+    /// `legion_nodes_recovered_total{path}`
+    pub nodes_recovered_total: Arc<CounterVec>,
+    /// `legion_liveness_tracked_nodes`
+    pub liveness_tracked_nodes: Arc<Gauge>,
+    /// `legion_liveness_responsible_seconds`
+    pub liveness_responsible_seconds: Arc<Gauge>,
+    /// `legion_liveness_digest_rpcs_total{outcome}`
+    pub liveness_digest_rpcs_total: Arc<CounterVec>,
+    /// `legion_liveness_digest_nodes`
+    pub liveness_digest_nodes: Arc<Histogram>,
+    /// `legion_liveness_peer_stale{peer}`
+    pub liveness_peer_stale: Arc<GaugeVec>,
+    /// `legion_liveness_loss_suppressed_total{reason}`
+    pub liveness_loss_suppressed_total: Arc<CounterVec>,
+    /// `legion_liveness_checkpoint_seconds`
+    pub liveness_checkpoint_seconds: Arc<Histogram>,
     /// Render order for the exposition endpoint.
     families: Vec<Arc<dyn RenderMetric>>,
 }
@@ -786,6 +865,31 @@ impl Metrics {
             },
             series: Series::new(),
         });
+        let eval_claim_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_eval_claim_total",
+                help: "Eval claim attempts by an eval worker, by outcome (claimed|empty). An empty attempt produces an empty changeset, which skips the raft entry — its cost is the capture (a savepoint on the write connection) plus a wasted wake, so a high `empty` share means workers are being woken for evals that do not exist and the write path is contending for it.",
+                labels: &["outcome"],
+            },
+            series: Series::new(),
+        });
+        let eval_handle_seconds = Arc::new(HistogramVec {
+            meta: FamilyMeta {
+                name: "legion_eval_handle_seconds",
+                help: "Wall time to handle one claimed eval end to end: planning, applying, dispatching the allocations, and the post-apply bookkeeping. Read it AGAINST legion_scheduler_plan_phase_seconds{phase=\"total\"} — the difference is everything an eval does outside planning, which is otherwise invisible. Throughput is roughly evalThreads divided by this.",
+                labels: &["kind"],
+            },
+            series: Series::new(),
+            bounds: DURATION_BUCKETS,
+        });
+        let dispatch_send_seconds = Arc::new(Histogram {
+            meta: FamilyMeta {
+                name: "legion_dispatch_send_seconds",
+                help: "One successful PostWork push to a worker, from send to ack. Dispatch is detached from the eval loop, so this latency no longer appears in legion_eval_handle_seconds - this histogram is where it went. Rising values mean slow or overloaded workers, not a slow scheduler.",
+                labels: &[],
+            },
+            cell: HistogramCell::new(DURATION_BUCKETS),
+        });
         let scheduler_plan_candidate_rank = Arc::new(Histogram {
             meta: FamilyMeta {
                 name: "legion_scheduler_plan_candidate_rank",
@@ -793,6 +897,14 @@ impl Metrics {
                 labels: &[],
             },
             cell: HistogramCell::new(COUNT_BUCKETS),
+        });
+        let scheduler_plan_bind_pass = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_scheduler_plan_bind_pass",
+                help: "Placements bound by the apply walk, by pass: `clean` (the candidate's node epoch was unchanged since the plan snapshot) or `revalidated` (its epoch had moved, and the in-transaction recheck admitted it anyway).",
+                labels: &["pass"],
+            },
+            series: Series::new(),
         });
         let eval_conflict_requeues_total = Arc::new(Counter {
             meta: FamilyMeta {
@@ -834,6 +946,14 @@ impl Metrics {
             },
             series: Series::new(),
         });
+        let read_model_nodes = Arc::new(GaugeVec {
+            meta: FamilyMeta {
+                name: "legion_read_model_nodes",
+                help: "Nodes in the in-memory scheduling read model, by set: 'all' is every cached node, 'available' is the planner's candidate universe. A persistent gap against legion_nodes means the scheduler is planning over a truncated fleet.",
+                labels: &["set"],
+            },
+            series: Series::new(),
+        });
         let allocations = Arc::new(Gauge {
             meta: FamilyMeta {
                 name: "legion_allocations",
@@ -850,10 +970,18 @@ impl Metrics {
             },
             cell: HistogramCell::new(DURATION_BUCKETS),
         });
+        let store_read_lock_wait_seconds = Arc::new(Histogram {
+            meta: FamilyMeta {
+                name: "legion_store_read_lock_wait_seconds",
+                help: "Time spent waiting for one of the store's SQLite read connections. Reads that found a free connection immediately are recorded as 0, so this is the queueing cost of the read pool and not the cost of the query. A rising tail here shows up inside whichever scheduler plan phase happened to be running — historically `task_fetch` — so read it alongside legion_scheduler_plan_phase_seconds.",
+                labels: &[],
+            },
+            cell: HistogramCell::new(DURATION_BUCKETS),
+        });
         // Coalescer (group commit) instrumentation. Three questions, three
         // families: does batching engage at all (batch_size), is a submitter
         // waiting or committing (wait_seconds by role vs commit_seconds), and
-        // how much of the wait is the 1ms re-contend poll (wait_rounds).
+        // how many extra commits it sat through before its own (wait_rounds).
         let store_coalesce_batch_size = Arc::new(HistogramVec {
             meta: FamilyMeta {
                 name: "legion_store_coalesce_batch_size",
@@ -884,7 +1012,7 @@ impl Metrics {
         let store_coalesce_wait_rounds_total = Arc::new(CounterVec {
             meta: FamilyMeta {
                 name: "legion_store_coalesce_wait_rounds_total",
-                help: "Times a submitter's 1ms wait for a reply timed out and it re-contended for the commit lock. Divided by the wait_seconds count this is the mean number of poll rounds per request — the part of heartbeat latency that is the coalescer's own polling rather than any commit.",
+                help: "Times a waiting submitter was woken by a finished commit that was neither its own result nor its turn to lead, i.e. it sat through an extra commit. Divided by the wait_seconds count this is the mean number of EXTRA commits a request waits out; 0 means every submitter was served by the first commit it queued behind.",
                 labels: &["path"],
             },
             series: Series::new(),
@@ -982,8 +1110,8 @@ impl Metrics {
         let raft_ops_total = Arc::new(CounterVec {
             meta: FamilyMeta {
                 name: "legion_raft_ops_total",
-                help: "Replicated store ops by lane and outcome (applied|empty|not_leader|error). empty = the mutation touched no rows and skipped the raft entry.",
-                labels: &["lane", "outcome"],
+                help: "Replicated store ops by lane, op name, and outcome (applied|empty|not_leader|error). empty = the mutation touched no rows and skipped the raft entry. The op name is what makes a busy lane attributable: a lane's op count is its quorum-round count, so the top ops by rate are the ones setting its cost.",
+                labels: &["lane", "op", "outcome"],
             },
             series: Series::new(),
         });
@@ -1057,7 +1185,132 @@ impl Metrics {
             cell: CounterCell::default(),
         });
 
+        // Heartbeat cadence (docs/heartbeat-cadence-and-scale.md). All on the
+        // status-lane leader; a manager that does not own liveness reports 0,
+        // which is why the freshness ratio is derived from the store's view
+        // rather than from a per-process RPC counter — under `lanes` topology
+        // an RPC rate is only ever one manager's share.
+        let heartbeat_freshness_ratio = Arc::new(FloatGauge {
+            meta: FamilyMeta {
+                name: "legion_heartbeat_freshness_ratio",
+                help: "Fraction of active nodes that checked in within one heartbeat interval. 1.0 = the fleet is keeping up; false node loss begins at served_interval/lost_window (0.20 at the defaults). 0 on a manager that does not own liveness or a fleet too small to measure.",
+                labels: &[],
+            },
+            bits: AtomicU64::new(0),
+        });
+        let heartbeat_served_interval_seconds = Arc::new(Gauge {
+            meta: FamilyMeta {
+                name: "legion_heartbeat_served_interval_seconds",
+                help: "Heartbeat interval this manager is currently telling workers to use.",
+                labels: &[],
+            },
+            cell: GaugeCell::default(),
+        });
+        let heartbeat_lost_window_seconds = Arc::new(Gauge {
+            meta: FamilyMeta {
+                name: "legion_heartbeat_lost_window_seconds",
+                help: "Lost-node window derived from the served interval (missedBeatsBeforeLost x interval).",
+                labels: &[],
+            },
+            cell: GaugeCell::default(),
+        });
+        let heartbeat_sustainable_nodes = Arc::new(Gauge {
+            meta: FamilyMeta {
+                name: "legion_heartbeat_sustainable_nodes",
+                help: "Nodes this control plane is observed to sustain at the current interval. A LOWER BOUND while the fleet is keeping up: an unsaturated control plane never reveals its ceiling.",
+                labels: &[],
+            },
+            cell: GaugeCell::default(),
+        });
+        let nodes_marked_lost_total = Arc::new(Counter {
+            meta: FamilyMeta {
+                name: "legion_nodes_marked_lost_total",
+                help: "Nodes marked lost after missed heartbeats. Distinguishes 'nodes went away' from legion_nodes{status=\"lost\"}'s 'nodes are away'.",
+                labels: &[],
+            },
+            cell: CounterCell::default(),
+        });
+        let nodes_recovered_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_nodes_recovered_total",
+                help: "Lost nodes that came back, by path: 'heartbeat' (the node beat again) or 'reregistration' (the worker re-registered). marked_lost minus recovered is the net loss, and a fleet that flaps shows here instead of showing nothing.",
+                labels: &["path"],
+            },
+            series: Series::new(),
+        });
+
+        // Node liveness (docs/node-liveness.md).
+        let liveness_tracked_nodes = Arc::new(Gauge {
+            meta: FamilyMeta {
+                name: "legion_liveness_tracked_nodes",
+                help: "Nodes in this manager's in-memory liveness table. Should equal legion_nodes{status=\"active\"} on the status-lane leader; 0 elsewhere.",
+                labels: &[],
+            },
+            cell: GaugeCell::default(),
+        });
+        let liveness_responsible_seconds = Arc::new(Gauge {
+            meta: FamilyMeta {
+                name: "legion_liveness_responsible_seconds",
+                help: "Seconds since this manager became responsible for liveness (process start OR status-lane leadership acquisition, whichever is later). Resets at every acquisition, which is what makes 'we just took over' visible.",
+                labels: &[],
+            },
+            cell: GaugeCell::default(),
+        });
+        let liveness_digest_rpcs_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_liveness_digest_rpcs_total",
+                help: "Liveness digests sent to the status-lane leader, by outcome (ok|not_leader|error|unimplemented). 'unimplemented' means a peer that predates digests leads the lane and heartbeats have fallen back to replicated writes.",
+                labels: &["outcome"],
+            },
+            series: Series::new(),
+        });
+        let liveness_digest_nodes = Arc::new(Histogram {
+            meta: FamilyMeta {
+                name: "legion_liveness_digest_nodes",
+                help: "Node ids carried by one liveness digest.",
+                labels: &[],
+            },
+            cell: HistogramCell::new(COUNT_BUCKETS),
+        });
+        let liveness_peer_stale = Arc::new(GaugeVec {
+            meta: FamilyMeta {
+                name: "legion_liveness_peer_stale",
+                help: "1 while a peer manager has missed several liveness digests. THE metric to alert on for a manager-to-manager problem: without it, one quiet manager looks like its share of the fleet dying.",
+                labels: &["peer"],
+            },
+            series: Series::new(),
+        });
+        let liveness_loss_suppressed_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_liveness_loss_suppressed_total",
+                help: "Would-be node losses the manager declined to act on, by reason (failover_grace|peer_digest_gap|mass_disruption). 'Nothing was marked lost' must never be indistinguishable from 'nothing was wrong'.",
+                labels: &["reason"],
+            },
+            series: Series::new(),
+        });
+        let liveness_checkpoint_seconds = Arc::new(Histogram {
+            meta: FamilyMeta {
+                name: "legion_liveness_checkpoint_seconds",
+                help: "Wall-clock of one replicated liveness checkpoint (the display-only batched write of observed heartbeat times).",
+                labels: &[],
+            },
+            cell: HistogramCell::new(DURATION_BUCKETS),
+        });
+
         let families: Vec<Arc<dyn RenderMetric>> = vec![
+            Arc::clone(&heartbeat_freshness_ratio) as Arc<dyn RenderMetric>,
+            Arc::clone(&heartbeat_served_interval_seconds) as Arc<dyn RenderMetric>,
+            Arc::clone(&heartbeat_lost_window_seconds) as Arc<dyn RenderMetric>,
+            Arc::clone(&heartbeat_sustainable_nodes) as Arc<dyn RenderMetric>,
+            Arc::clone(&nodes_marked_lost_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&nodes_recovered_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&liveness_tracked_nodes) as Arc<dyn RenderMetric>,
+            Arc::clone(&liveness_responsible_seconds) as Arc<dyn RenderMetric>,
+            Arc::clone(&liveness_digest_rpcs_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&liveness_digest_nodes) as Arc<dyn RenderMetric>,
+            Arc::clone(&liveness_peer_stale) as Arc<dyn RenderMetric>,
+            Arc::clone(&liveness_loss_suppressed_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&liveness_checkpoint_seconds) as Arc<dyn RenderMetric>,
             Arc::clone(&allocations) as Arc<dyn RenderMetric>,
             Arc::clone(&eval_queue_depth) as Arc<dyn RenderMetric>,
             Arc::clone(&evals_processed_total) as Arc<dyn RenderMetric>,
@@ -1066,8 +1319,12 @@ impl Metrics {
             Arc::clone(&grpc_requests_total) as Arc<dyn RenderMetric>,
             Arc::clone(&heartbeats_total) as Arc<dyn RenderMetric>,
             Arc::clone(&nodes) as Arc<dyn RenderMetric>,
+            Arc::clone(&read_model_nodes) as Arc<dyn RenderMetric>,
             Arc::clone(&eval_conflict_requeues_total) as Arc<dyn RenderMetric>,
             Arc::clone(&plan_apply_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&eval_claim_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&eval_handle_seconds) as Arc<dyn RenderMetric>,
+            Arc::clone(&dispatch_send_seconds) as Arc<dyn RenderMetric>,
             Arc::clone(&preemption_plans_total) as Arc<dyn RenderMetric>,
             Arc::clone(&preemptions_total) as Arc<dyn RenderMetric>,
             Arc::clone(&raft_applied_index) as Arc<dyn RenderMetric>,
@@ -1088,6 +1345,7 @@ impl Metrics {
             Arc::clone(&scheduler_index_maintenance_seconds) as Arc<dyn RenderMetric>,
             Arc::clone(&scheduler_index_queries_total) as Arc<dyn RenderMetric>,
             Arc::clone(&scheduler_index_shadow_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&scheduler_plan_bind_pass) as Arc<dyn RenderMetric>,
             Arc::clone(&scheduler_plan_candidate_rank) as Arc<dyn RenderMetric>,
             Arc::clone(&scheduler_lazy_sample_fallback_total) as Arc<dyn RenderMetric>,
             Arc::clone(&scheduler_plan_phase_seconds) as Arc<dyn RenderMetric>,
@@ -1096,6 +1354,7 @@ impl Metrics {
             Arc::clone(&store_coalesce_wait_rounds_total) as Arc<dyn RenderMetric>,
             Arc::clone(&store_coalesce_wait_seconds) as Arc<dyn RenderMetric>,
             Arc::clone(&store_write_lock_wait_seconds) as Arc<dyn RenderMetric>,
+            Arc::clone(&store_read_lock_wait_seconds) as Arc<dyn RenderMetric>,
         ];
 
         Metrics {
@@ -1105,14 +1364,20 @@ impl Metrics {
             evals_processed_total,
             eval_queue_depth,
             plan_apply_total,
+            eval_claim_total,
+            eval_handle_seconds,
+            dispatch_send_seconds,
+            scheduler_plan_bind_pass,
             scheduler_plan_candidate_rank,
             eval_conflict_requeues_total,
             preemptions_total,
             preemption_plans_total,
             heartbeats_total,
             nodes,
+            read_model_nodes,
             allocations,
             store_write_lock_wait_seconds,
+            store_read_lock_wait_seconds,
             store_coalesce_batch_size,
             store_coalesce_wait_seconds,
             store_coalesce_commit_seconds,
@@ -1137,6 +1402,19 @@ impl Metrics {
             scheduler_index_maintenance_seconds,
             scheduler_plan_phase_seconds,
             scheduler_lazy_sample_fallback_total,
+            heartbeat_freshness_ratio,
+            heartbeat_served_interval_seconds,
+            heartbeat_lost_window_seconds,
+            heartbeat_sustainable_nodes,
+            nodes_marked_lost_total,
+            nodes_recovered_total,
+            liveness_tracked_nodes,
+            liveness_responsible_seconds,
+            liveness_digest_rpcs_total,
+            liveness_digest_nodes,
+            liveness_peer_stale,
+            liveness_loss_suppressed_total,
+            liveness_checkpoint_seconds,
             families,
         }
     }
@@ -1220,6 +1498,22 @@ pub struct WorkerMetrics {
     pub simulated_nodes_target: Arc<Gauge>,
     /// `legion_worker_simulated_registrations_total{outcome}`
     pub simulated_registrations_total: Arc<CounterVec>,
+    /// `legion_net_conns_total{direction,protocol,verdict}` — connections the
+    /// node datapath decided (docs/network-handlers.md). Bounded labels only:
+    /// attribution (job, labels, destination) goes on events and the access
+    /// log, never here.
+    pub net_conns_total: Arc<CounterVec>,
+    /// `legion_net_denied_total{direction}` — connections and requests denied
+    /// by policy.
+    pub net_denied_total: Arc<CounterVec>,
+    /// `legion_net_bytes_total{direction}` — bytes forwarded through the
+    /// datapath (`egress` = task to destination, `ingress` = peer to task).
+    pub net_bytes_total: Arc<CounterVec>,
+    /// `legion_net_handler_total{handler,outcome}` — external handler calls
+    /// (`authz`, `proxy`) by outcome (allow|deny|proxy|error).
+    pub net_handler_total: Arc<CounterVec>,
+    /// `legion_net_handler_seconds` — wall-clock of one `authz` webhook call.
+    pub net_handler_seconds: Arc<Histogram>,
     families: Vec<Arc<dyn RenderMetric>>,
 }
 
@@ -1330,9 +1624,55 @@ impl WorkerMetrics {
             series: Series::new(),
         });
 
+        let net_conns_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_net_conns_total",
+                help: "Connections decided by the node datapath, by direction (egress|ingress), protocol (tcp|http|dns), and verdict (allow|deny|error).",
+                labels: &["direction", "protocol", "verdict"],
+            },
+            series: Series::new(),
+        });
+        let net_denied_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_net_denied_total",
+                help: "Connections and requests denied by network policy, by direction. Which rule, which destination, and for whom are on the net_denied event, not here.",
+                labels: &["direction"],
+            },
+            series: Series::new(),
+        });
+        let net_bytes_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_net_bytes_total",
+                help: "Bytes forwarded through the node datapath, by direction.",
+                labels: &["direction"],
+            },
+            series: Series::new(),
+        });
+        let net_handler_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_net_handler_total",
+                help: "External network handler calls (authz webhooks, proxy hand-offs) by handler and outcome (allow|deny|proxy|error).",
+                labels: &["handler", "outcome"],
+            },
+            series: Series::new(),
+        });
+        let net_handler_seconds = Arc::new(Histogram {
+            meta: FamilyMeta {
+                name: "legion_net_handler_seconds",
+                help: "Wall-clock of one authz webhook call, cache misses only.",
+                labels: &[],
+            },
+            cell: HistogramCell::new(DURATION_BUCKETS),
+        });
+
         let families: Vec<Arc<dyn RenderMetric>> = vec![
             Arc::clone(&allocation_failures_reported_total) as Arc<dyn RenderMetric>,
             Arc::clone(&allocations_running) as Arc<dyn RenderMetric>,
+            Arc::clone(&net_bytes_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&net_conns_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&net_denied_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&net_handler_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&net_handler_seconds) as Arc<dyn RenderMetric>,
             Arc::clone(&heartbeat_duration_seconds) as Arc<dyn RenderMetric>,
             Arc::clone(&heartbeats_total) as Arc<dyn RenderMetric>,
             Arc::clone(&provisional_active) as Arc<dyn RenderMetric>,
@@ -1358,6 +1698,11 @@ impl WorkerMetrics {
             simulated_nodes,
             simulated_nodes_target,
             simulated_registrations_total,
+            net_conns_total,
+            net_denied_total,
+            net_bytes_total,
+            net_handler_total,
+            net_handler_seconds,
             families,
         }
     }
@@ -2322,6 +2667,7 @@ mod tests {
             "legion_plan_apply_total",
             "legion_raft_pipeline_depth",
             "legion_raft_pipeline_wait_seconds",
+            "legion_read_model_nodes",
             "legion_runtime_spawn_delay_seconds",
             "legion_runtime_worker_threads",
             "legion_store_coalesce_batch_size",

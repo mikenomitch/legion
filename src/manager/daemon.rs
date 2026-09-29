@@ -5,16 +5,15 @@ use crate::manager::server::ManagerDaemonService;
 use crate::manager::workload_identity::WorkloadIdentityState;
 use crate::storage::events::drafts;
 use crate::storage::persistence::PersistenceRole;
-use crate::storage::store::Store;
+use crate::storage::store::{EvalBatchLimits, EvalCompletion, Store};
 use crate::structs::{
-    manager_server::ManagerServer, Eval, JobConfig, KvValueType, ManagerConfig, Node, NodeMsg,
+    manager_server::ManagerServer, Eval, JobConfig, KvValueType, ManagerConfig, NodeMsg,
     Submission, TaskConfig, TlsConfigFull, WorkerConfig as WorkerConfigMsg, WorkerConfigAlt,
 };
 use crate::worker::daemon::run_worker_local;
 
 use futures::join;
 use http::Method;
-use jsonnet::JsonnetVm;
 use rand::Rng;
 use std::fs;
 use std::sync::Arc;
@@ -55,6 +54,28 @@ const EVAL_NOT_LEADER_RETRY_JITTER_MS: u64 = 1_000;
 // most. Retry across that window instead of failing manager startup.
 const STARTUP_WRITE_ATTEMPTS: usize = 20;
 const STARTUP_WRITE_RETRY_DELAY: Duration = Duration::from_millis(500);
+// Hard ceiling on how many evals one worker takes through claim → handle →
+// complete together (`Store::claim_evals`). The batch is really sized as a
+// fair share of the live queue depth, so this only binds on a deep queue;
+// it is deliberately NOT a config knob, because the useful value follows
+// queue depth and `evalThreads`, both of which the loop already knows.
+//
+// 16 is chosen against what a batch COSTS, not what it saves: a worker
+// holds its whole batch `in_flight` until the terminal write lands, so a
+// crash mid-batch re-runs up to this many already-handled evals (handlers
+// are idempotent convergence steps, so re-running is safe, just wasted).
+// Sixteen keeps that bounded while still dividing the lane's per-eval round
+// cost by an order of magnitude on a saturated queue.
+const MAX_EVAL_BATCH: usize = 16;
+
+/// How many times an eval worker retries the batch terminal write before
+/// abandoning the batch to in-flight recovery. Bounded because retrying
+/// forever would wedge the worker on a persistent write error; more than
+/// one because on a STABLE leader nothing else ever recovers the batch
+/// (`requeue_in_flight_evals` runs only at startup and on leadership
+/// acquisition), so giving up on the first transient error orphaned up to
+/// a whole batch of handled evals.
+const EVAL_SETTLE_MAX_ATTEMPTS: u32 = 3;
 
 #[instrument(err, skip_all)]
 pub async fn run_manager(config: ManagerConfig, run_worker: bool) -> R<()> {
@@ -76,6 +97,17 @@ pub async fn run_manager(config: ManagerConfig, run_worker: bool) -> R<()> {
     crate::artifacts::auth::validate_cluster_artifacts_config(
         &full_config.artifacts,
         &node_identity_names,
+    )?;
+    // Heartbeat cadence and liveness: reject combinations that cannot hold
+    // together, naming the offending values. A grace shorter than the window
+    // it protects, or a checkpoint fast enough to re-create the commit load
+    // this design removes, is a configuration error and belongs at startup
+    // rather than in an incident (docs/heartbeat-cadence-and-scale.md,
+    // docs/node-liveness.md).
+    full_config.heartbeat.validate()?;
+    full_config.liveness.validate(
+        full_config.heartbeat.parsed_min_interval()
+            * full_config.heartbeat.missed_beats_before_lost.max(1),
     )?;
     let manager_node_id = format!("{}:{}", full_config.server.host, full_config.server.port);
     let store = Store::start_storage(&full_config)?;
@@ -404,8 +436,15 @@ pub async fn run_manager(config: ManagerConfig, run_worker: bool) -> R<()> {
 
     println!("Manager node starting on {addr}");
 
-    let node_checker_fut =
-        start_node_status_checker(store_copy_a, full_config.worker_check_seconds);
+    let node_checker_fut = start_node_status_checker(
+        store_copy_a,
+        LivenessCheckerConfig {
+            check_interval: Duration::from_secs(full_config.worker_check_seconds),
+            heartbeat: full_config.heartbeat.clone(),
+            liveness: full_config.liveness.clone(),
+            manager_node_id: manager_node_id.clone(),
+        },
+    );
     let eval_loop_fut = start_eval_loop(store_copy_b, full_config.eval_threads);
     let manager_host = resolve_manager_host(&full_config.server.host);
     let manager_addr = format!("http://{}:{}", manager_host, full_config.server.port);
@@ -587,6 +626,7 @@ fn seed_ui_test_data(store: &Store) -> R<()> {
         ])
         .to_string(),
         last_heartbeat: now.clone(),
+        heartbeat_source: String::new(),
     })?;
     store.insert_node(NodeMsg {
         id: "demo-worker-b".into(),
@@ -605,6 +645,7 @@ fn seed_ui_test_data(store: &Store) -> R<()> {
         ])
         .to_string(),
         last_heartbeat: now,
+        heartbeat_source: String::new(),
     })?;
 
     let job = JobConfig {
@@ -679,12 +720,57 @@ fn load_server_tls_identity(tls: &TlsConfigFull) -> R<Option<Identity>> {
     Ok(Some(Identity::from_pem(cert, key)))
 }
 
+/// Everything the status checker needs from the manager config, resolved once
+/// at startup so the loop itself reads no config.
+#[derive(Debug, Clone)]
+pub struct LivenessCheckerConfig {
+    pub check_interval: Duration,
+    pub heartbeat: crate::structs::HeartbeatConfigFull,
+    pub liveness: crate::structs::LivenessConfigFull,
+    /// This manager's own id, as the digest identifies its sender.
+    pub manager_node_id: String,
+}
+
+/// The interval this manager currently serves, and the ladder state behind it.
+///
+/// With adaptive cadence off (the default) the served interval is just the
+/// floor — the manager tells workers nothing and they keep their worker-type
+/// `heartbeatSeconds`. The value is still tracked because the freshness ratio
+/// and the sizing arithmetic need an interval to be "on time" relative to.
+struct ServedCadence {
+    ladder: crate::manager::cadence::LadderState,
+    at_max: bool,
+}
+
 #[instrument(err, skip_all)]
-async fn start_node_status_checker(store: Store, check_seconds: u64) -> R<()> {
+async fn start_node_status_checker(store: Store, config: LivenessCheckerConfig) -> R<()> {
+    use crate::manager::cadence::{self, LadderState};
+
     info!("Beginning node status checker loop");
-    let started_at = std::time::Instant::now();
-    let check_interval = Duration::from_secs(check_seconds);
-    let mut was_status_leader = true;
+    let check_interval = config.check_interval;
+    let min_interval = config.heartbeat.parsed_min_interval();
+    let max_interval = config.heartbeat.parsed_max_interval();
+    let missed_beats = config.heartbeat.missed_beats_before_lost.max(1);
+    let adaptive = config.heartbeat.adaptive_enabled();
+    let liveness_settings = config.liveness.settings();
+    store.liveness().configure(liveness_settings.clone());
+
+    let mut cadence_state = ServedCadence {
+        ladder: LadderState::new(min_interval),
+        at_max: false,
+    };
+    // Freshness warning debounce: 3 consecutive sub-threshold ticks, then at
+    // most one line a minute. A single slow tick is not a page.
+    let mut low_freshness_ticks: u32 = 0;
+    let mut last_freshness_warn: Option<std::time::Instant> = None;
+    let mut last_checkpoint: Option<std::time::Instant> = None;
+    let mut last_digest: Option<std::time::Instant> = None;
+    // Starts false so PROCESS START takes the same path as an election: seed
+    // the liveness table, start the grace clock, log the acquisition. Before
+    // this, the grace was keyed on process uptime and a manager that had been
+    // up for hours could acquire status-lane leadership mid-life and start
+    // marking lost on its very next tick (liveness plan §5.4).
+    let mut was_status_leader = false;
     // Rollout reconciliation piggybacks on this loop but gates on the
     // SCHEDULER lane (C-2 rollout consolidation) — under `lanes` topology
     // the status and scheduler leaders can be different nodes, so it runs
@@ -705,27 +791,195 @@ async fn start_node_status_checker(store: Store, check_seconds: u64) -> R<()> {
         let status_leader = store.is_raft_leader(crate::storage::Lane::Status);
         if status_leader {
             if !was_status_leader {
-                info!("Raft status-lane leadership acquired; node status checker resuming");
+                // Responsibility for liveness starts HERE, not at process
+                // start. A new leader inherits no liveness state, so it seeds
+                // every active node at `now` and marks nothing lost for
+                // `failoverGrace` while the fleet checks back in. Seeding from
+                // the persisted timestamps instead would mark the whole fleet
+                // lost on the first tick, because those timestamps are stale
+                // by construction on a manager that has just taken over.
+                let active = match store.active_node_liveness_rows() {
+                    Ok(rows) => rows.into_iter().map(|row| row.id).collect::<Vec<_>>(),
+                    Err(err) => {
+                        warn!(error = ?err, "Failed reading active nodes to seed liveness");
+                        Vec::new()
+                    }
+                };
+                store.liveness().become_responsible(&active);
+                info!(
+                    seeded_nodes = active.len(),
+                    failover_grace_secs = liveness_settings.failover_grace.as_secs(),
+                    "Status-lane liveness responsibility acquired; marking nothing lost until \
+                     the fleet has had its failover grace to check in"
+                );
                 was_status_leader = true;
             }
-            let node_ids_to_update =
-                nodes_to_mark_lost(store.get_node_ids_and_heartbeats()?, started_at.elapsed());
+            let now = std::time::Instant::now();
+            let snapshot = match liveness_snapshot(&store, now) {
+                Ok(snapshot) => snapshot,
+                Err(err) => {
+                    warn!(error = ?err, "Failed reading node liveness; skipping this tick");
+                    tokio::time::sleep(check_interval).await;
+                    continue;
+                }
+            };
+            let peer_gap = store.liveness().peer_gap_at(now);
+            let decision = cadence::decide_lost_nodes(
+                &snapshot,
+                &cadence::LossContext {
+                    responsible_for: store.liveness().responsible_for_at(now),
+                    failover_grace: liveness_settings.failover_grace,
+                    peer_gap_nodes: peer_gap.suppressed.clone(),
+                    ..cadence::LossContext::default()
+                },
+            );
+            report_liveness_metrics(
+                &store,
+                &snapshot,
+                &decision,
+                &peer_gap,
+                cadence_state.ladder.served,
+                missed_beats,
+                now,
+            );
+            for (reason, count) in &decision.suppressed {
+                match reason {
+                    cadence::SuppressionReason::MassDisruption => error!(
+                        would_be_lost = count,
+                        active_nodes = snapshot.len(),
+                        "More than half this fleet would be marked lost in one tick; marking \
+                         NONE. A control plane does not lose half its fleet in one tick — \
+                         believe the control plane broke, not the fleet \
+                         (docs/heartbeat-cadence-and-scale.md)"
+                    ),
+                    cadence::SuppressionReason::PeerDigestGap => info!(
+                        suppressed = count,
+                        peers = ?peer_gap.stale_peers,
+                        "Holding node losses for a peer manager that has stopped reporting \
+                         liveness; a manager-to-manager problem is not fleet-wide node loss"
+                    ),
+                    cadence::SuppressionReason::FailoverGrace => debug!(
+                        suppressed = count,
+                        "Inside the liveness failover grace; marking nothing lost"
+                    ),
+                }
+            }
+            let node_ids_to_update = decision.lost;
 
             // Warn-and-continue rather than `?`: under `lanes` topology the
             // status-lane leader may not lead the control lane, and the
             // composite's control half (`sync_node_availability`) is then
             // rejected with that lane's leader hint. The checker must keep
             // ticking — the mark is retried every tick until it lands.
-            if let Err(err) = store.mark_nodes_as_lost(&node_ids_to_update) {
+            //
+            // On the blocking pool: the mark is up to three quorum rounds
+            // (status, control, the batched reschedule enqueue), and running
+            // it inline here parked a runtime worker and stalled the tick.
+            let mark_result = {
+                let store_for_mark = store.clone();
+                let ids_for_mark = node_ids_to_update.clone();
+                tokio::task::spawn_blocking(move || {
+                    store_for_mark.mark_nodes_as_lost(&ids_for_mark)
+                })
+                .await
+                .unwrap_or_else(|join_error| {
+                    Err(anyhow::anyhow!("mark-lost task failed: {join_error:?}"))
+                })
+            };
+            if let Err(err) = mark_result {
                 warn!(error = ?err, "Failed marking nodes lost; will retry next tick");
+            } else if !node_ids_to_update.is_empty() {
+                crate::manager::telemetry::metrics()
+                    .nodes_marked_lost_total
+                    .add(node_ids_to_update.len() as u64);
+                for id in &node_ids_to_update {
+                    store.liveness().forget(id);
+                }
+            }
+
+            // Cadence: recompute what to serve, warn when the fleet is not
+            // sustaining it, and keep the per-node windows honest.
+            let report = cadence::cadence_report(
+                &snapshot,
+                cadence_state.ladder.served,
+                missed_beats,
+                config.heartbeat.headroom,
+                HEARTBEAT_FRESHNESS_MIN_FLEET,
+                adaptive,
+                cadence_state.at_max,
+            );
+            if adaptive {
+                let target = cadence::target_interval(
+                    snapshot.len(),
+                    config.heartbeat.target_rate_per_second.unwrap_or(0.0),
+                    config.heartbeat.headroom,
+                    min_interval,
+                    max_interval,
+                );
+                cadence_state.at_max = target >= max_interval;
+                let next = cadence::advance_ladder(
+                    &cadence_state.ladder,
+                    target,
+                    check_interval,
+                    min_interval,
+                    max_interval,
+                );
+                if next.served != cadence_state.ladder.served {
+                    info!(
+                        active_nodes = snapshot.len(),
+                        from_seconds = cadence_state.ladder.served.as_secs(),
+                        to_seconds = next.served.as_secs(),
+                        "Serving a new heartbeat interval for this fleet size"
+                    );
+                    apply_served_cadence(
+                        &store,
+                        &snapshot,
+                        cadence_state.ladder.served,
+                        next.served,
+                        missed_beats,
+                    );
+                }
+                cadence_state.ladder = next;
+                // Only a manager running adaptive cadence puts an interval on
+                // the reply. With it off, workers keep their worker-type value
+                // and the wire field stays absent, which is what makes the
+                // default path bit-for-bit identical to before.
+                store
+                    .liveness()
+                    .set_served_interval(Some(cadence_state.ladder.served));
+            }
+            warn_on_stale_cadence(
+                &report,
+                &mut low_freshness_ticks,
+                &mut last_freshness_warn,
+                snapshot.len(),
+            );
+
+            // Display checkpoint: the ONE heartbeat-derived write that still
+            // reaches raft, and it is two commits a minute rather than one per
+            // beat per node. Never read back as liveness.
+            if let Some(interval) = liveness_settings.checkpoint_interval {
+                if last_checkpoint.is_none_or(|at| at.elapsed() >= interval) {
+                    last_checkpoint = Some(std::time::Instant::now());
+                    write_liveness_checkpoint(&store, now);
+                }
             }
             // Stateful allocations on lost nodes are gated behind their
             // onLost.replaceAfter loss-confirmation window (see
             // docs/stateful-workloads.md "Node loss and fencing"). Re-run the
             // reschedule path for still-lost nodes every tick so replacement
             // proceeds automatically once a window elapses — no operator
-            // action needed.
-            store.recheck_lost_nodes();
+            // action needed. Blocking pool: it reads the queue and may
+            // propose a scheduler-lane round.
+            {
+                let store_for_recheck = store.clone();
+                if let Err(join_error) =
+                    tokio::task::spawn_blocking(move || store_for_recheck.recheck_lost_nodes())
+                        .await
+                {
+                    warn!("Lost-node recheck task failed: {join_error:?}");
+                }
+            }
             // node_health rows orphaned by node removal (`remove_node` is a
             // control-lane op and must not delete status-lane rows — plan
             // §7-C2, C-1) are swept here on the status-lane leader. Harmless
@@ -760,9 +1014,29 @@ async fn start_node_status_checker(store: Store, check_seconds: u64) -> R<()> {
                 ),
                 Err(err) => warn!(error = ?err, "Failed seeding missing task statuses"),
             }
-        } else if was_status_leader {
-            info!("Not the status-lane raft leader; node status checker idling until elected");
-            was_status_leader = false;
+        } else {
+            if was_status_leader {
+                info!("Not the status-lane raft leader; node status checker idling until elected");
+                // Stop being responsible: a re-acquisition must start a FRESH
+                // grace clock, not resume the one from the last term.
+                store.liveness().relinquish();
+                was_status_leader = false;
+            }
+            // Liveness digest (liveness plan §6.3): a manager that does not
+            // lead the status lane still receives heartbeats — workers dial
+            // one fixed manager forever — so it batches the ids it heard from
+            // and sends ONE RPC per interval to the leader. The cost is
+            // `managers x 1 RPC/second`, not `nodes x 1 write per interval`.
+            if last_digest.is_none_or(|at| at.elapsed() >= liveness_settings.digest_interval) {
+                last_digest = Some(std::time::Instant::now());
+                send_liveness_digest(&store, &config.manager_node_id).await;
+            }
+            crate::manager::telemetry::metrics()
+                .liveness_responsible_seconds
+                .set(0);
+            crate::manager::telemetry::metrics()
+                .liveness_tracked_nodes
+                .set(0);
         }
 
         // Scheduler-lane piggyback: rollout reconciliation runs wherever the
@@ -910,6 +1184,17 @@ fn refresh_cluster_gauges(store: &Store) {
         Ok(count) => telemetry.allocations.set(count),
         Err(err) => debug!(error = ?err, "Failed refreshing allocation gauge"),
     }
+    // The read model's view of the fleet next to the DB's (`legion_nodes`
+    // above): a persistent gap between the two is a truncated planning
+    // universe, which previously took sampling plan_submission rows at rig
+    // scale to even suspect (aws-phase5-findings.md).
+    match store.read_model_node_counts() {
+        Ok((all, available)) => telemetry.read_model_nodes.set_all(&[
+            (vec!["all".to_string()], all),
+            (vec!["available".to_string()], available),
+        ]),
+        Err(err) => debug!(error = ?err, "Failed refreshing read-model node gauge"),
+    }
     // Raft engine series from the local metrics view — cheap watch borrows,
     // present on leaders and followers alike. Quorum shape (plan §7-C3:
     // voters/quorum) plus the per-lane progress series (term, commit and
@@ -951,62 +1236,278 @@ fn refresh_cluster_gauges(store: &Store) {
     }
 }
 
-/// Which active nodes to mark lost, given their last heartbeats and how long
-/// this manager process has been up.
+/// Every active node's age and window, as the lost decision sees them.
 ///
-/// Heartbeats only refresh while the manager is up, so time the manager spent
-/// down must not count as missed heartbeats: right after a manager restart
-/// every persisted heartbeat looks stale, and marking those nodes lost would
-/// deschedule — and therefore kill — every healthy task in the cluster before
-/// its worker had a chance to reconnect. No node is marked lost until the
-/// manager has been up for a full lost-node window; live workers heartbeat
-/// every `WORKER_HEARTBEAT_DURATION_SEC` and retry with a capped backoff, so
-/// they re-establish contact well within it.
+/// The AGE comes from the in-memory liveness table, not from the database: a
+/// steady-state heartbeat no longer writes a timestamp anywhere, so the
+/// persisted clock is display state (liveness plan §6.5). The WINDOW comes
+/// from the replicated row, because it is a configured value rather than an
+/// observation and every manager must agree on it.
+///
+/// A node the table has never seen — registered since this manager became
+/// responsible — is seeded at `now` on first sighting and is therefore never
+/// lost on the tick that discovers it.
+///
 /// Public for the heartbeat scale benchmark
-/// (`tests/heartbeat_scale_benchmark.rs`), which times one liveness pass;
-/// not part of any stable API.
-///
-/// Nodes whose row carries the integer heartbeat clock compare against one
-/// precomputed cutoff — no per-node timestamp parsing (heartbeat-scale
-/// plan §4; at 10k nodes the old per-tick RFC3339 parse storm was 5,000
-/// parses/second). Rows without it (written before the column existed)
-/// fall back to parsing the text, with unparseable-means-lost preserved.
-pub fn nodes_to_mark_lost(
-    nodes_with_heartbeats: Vec<(String, String, Option<i64>)>,
-    manager_uptime: Duration,
-) -> Vec<String> {
-    if manager_uptime < Duration::from_secs(DEF_LOST_NODE_AT_SEC as u64) {
-        return Vec::new();
-    }
-    let unix_cutoff = OffsetDateTime::now_utc().unix_timestamp() - DEF_LOST_NODE_AT_SEC;
-    nodes_with_heartbeats
+/// (`tests/heartbeat_scale_benchmark.rs`), which times one liveness pass; not
+/// part of any stable API.
+pub fn liveness_snapshot(
+    store: &Store,
+    now: std::time::Instant,
+) -> R<Vec<crate::manager::cadence::NodeLiveness>> {
+    let rows = store.active_node_liveness_rows()?;
+    let unix_now = OffsetDateTime::now_utc().unix_timestamp();
+    let table = store.liveness();
+    let active: std::collections::HashSet<String> = rows.iter().map(|row| row.id.clone()).collect();
+    // Keep the table the LIVE set: nodes removed or already lost drop out, so
+    // `legion_liveness_tracked_nodes` stays comparable with
+    // `legion_nodes{status="active"}` instead of accumulating history.
+    table.retain(&active);
+    let snapshot = rows
         .into_iter()
-        .filter(|(id, heartbeat, heartbeat_unix)| {
-            if let Some(heartbeat_unix) = heartbeat_unix {
-                let too_slow = *heartbeat_unix < unix_cutoff;
-                if too_slow {
-                    warn!("Node {} heartbeat too slow - marking as lost", id);
-                }
-                return too_slow;
-            }
-            match Node::last_heartbeat_too_slow(heartbeat) {
-                Ok(too_slow) => {
-                    if too_slow {
-                        warn!("Node {} heartbeat too slow - marking as lost", id);
-                    }
-                    too_slow
-                }
-                Err(e) => {
-                    warn!(
-                        "Error checking heartbeat - marking node {} lost: {:?}",
-                        id, e
-                    );
-                    true
-                }
+        .map(|row| {
+            let beat = table.seed_if_missing_at(&row.id, now, unix_now);
+            let window = row.window();
+            crate::manager::cadence::NodeLiveness {
+                id: row.id,
+                age: now.saturating_duration_since(beat.at),
+                window,
             }
         })
-        .map(|(id, _heartbeat, _unix)| id)
-        .collect()
+        .collect();
+    Ok(snapshot)
+}
+
+/// Report the nodes this manager has heard from to the status-lane leader.
+///
+/// Costs ONE RPC per manager per `digestInterval`, whatever the fleet size —
+/// against the ~`N/interval` forwarded raft writes per second the pre-digest
+/// path cost. A failure is not an error to a worker: the leader still holds
+/// this peer's last digest and will not mark its nodes lost inside
+/// `peerDigestGrace`, which is exactly the fail-safe the push (rather than a
+/// pull) buys.
+async fn send_liveness_digest(store: &Store, manager_node_id: &str) {
+    use crate::storage::liveness::DigestOutcome;
+
+    let seen = store.liveness().drain_pending_digest();
+    if seen.is_empty() {
+        return;
+    }
+    let count = seen.len();
+    let outcome = store.report_node_liveness(manager_node_id, seen).await;
+    let telemetry = crate::manager::telemetry::metrics();
+    telemetry
+        .liveness_digest_rpcs_total
+        .inc(&[outcome.metric_label()]);
+    telemetry.liveness_digest_nodes.observe(count as f64);
+    match &outcome {
+        DigestOutcome::Accepted => {
+            store.liveness().set_digest_fallback(false);
+            debug!(
+                nodes = count,
+                "Reported node liveness to the status-lane leader"
+            );
+        }
+        // A peer that predates digests leads the lane. Fall back to forwarding
+        // each heartbeat as a replicated write — today's behavior, and correct;
+        // it resolves when leadership lands on an upgraded manager.
+        DigestOutcome::Unimplemented => {
+            if !store.liveness().digest_fallback() {
+                warn!(
+                    "The status-lane leader does not accept liveness digests (a manager that \
+                     predates them). Falling back to a replicated write per heartbeat until the \
+                     manager upgrade finishes (docs/upgrades.md)"
+                );
+            }
+            store.liveness().set_digest_fallback(true);
+        }
+        DigestOutcome::NotLeader { leader_hint } => {
+            debug!(%leader_hint, "Liveness digest reached a manager that no longer leads the status lane");
+        }
+        DigestOutcome::NoLeader | DigestOutcome::NoEngine => {}
+        DigestOutcome::Error(message) => {
+            debug!(%message, nodes = count, "Liveness digest failed; the leader's peer grace covers this window");
+        }
+    }
+}
+
+/// Publish the liveness and cadence gauges for one tick.
+fn report_liveness_metrics(
+    store: &Store,
+    snapshot: &[crate::manager::cadence::NodeLiveness],
+    decision: &crate::manager::cadence::LossDecision,
+    peer_gap: &crate::storage::liveness::PeerGap,
+    served_interval: Duration,
+    missed_beats: u32,
+    now: std::time::Instant,
+) {
+    let telemetry = crate::manager::telemetry::metrics();
+    telemetry
+        .liveness_tracked_nodes
+        .set(store.liveness().tracked() as i64);
+    telemetry
+        .liveness_responsible_seconds
+        .set(store.liveness().responsible_for_at(now).as_secs() as i64);
+    telemetry
+        .heartbeat_served_interval_seconds
+        .set(served_interval.as_secs() as i64);
+    telemetry
+        .heartbeat_lost_window_seconds
+        .set((served_interval * missed_beats).as_secs() as i64);
+    let ratio = crate::manager::cadence::freshness_ratio(
+        snapshot,
+        served_interval,
+        HEARTBEAT_FRESHNESS_MIN_FLEET,
+    );
+    telemetry
+        .heartbeat_freshness_ratio
+        .set(ratio.unwrap_or(0.0));
+    telemetry.heartbeat_sustainable_nodes.set(
+        ratio
+            .map(|ratio| (snapshot.len() as f64 * ratio).round() as i64)
+            .unwrap_or(0),
+    );
+    for (reason, count) in &decision.suppressed {
+        telemetry
+            .liveness_loss_suppressed_total
+            .inc_by(&[reason.as_str()], *count as u64);
+    }
+    let mut peer_series: Vec<(Vec<String>, i64)> = peer_gap
+        .stale_peers
+        .iter()
+        .map(|peer| (vec![peer.clone()], 1))
+        .collect();
+    peer_series.extend(
+        peer_gap
+            .fresh_peers
+            .iter()
+            .map(|peer| (vec![peer.clone()], 0)),
+    );
+    telemetry.liveness_peer_stale.set_all(&peer_series);
+}
+
+/// Fire the runtime cadence warning, debounced.
+///
+/// Fires only after `HEARTBEAT_FRESHNESS_WARN_TICKS` consecutive sub-threshold
+/// ticks and at most once a minute, because the point is to reach an operator
+/// BEFORE the collapse, not to fill the log during one.
+fn warn_on_stale_cadence(
+    report: &crate::manager::cadence::CadenceReport,
+    low_ticks: &mut u32,
+    last_warn: &mut Option<std::time::Instant>,
+    active_nodes: usize,
+) {
+    let Some(ratio) = report.freshness_ratio else {
+        *low_ticks = 0;
+        return;
+    };
+    if ratio >= HEARTBEAT_FRESHNESS_WARN_RATIO {
+        *low_ticks = 0;
+        return;
+    }
+    *low_ticks += 1;
+    if *low_ticks < HEARTBEAT_FRESHNESS_WARN_TICKS {
+        return;
+    }
+    let due = last_warn.is_none_or(|at| {
+        at.elapsed() >= Duration::from_secs(HEARTBEAT_FRESHNESS_WARN_INTERVAL_SEC)
+    });
+    if !due {
+        return;
+    }
+    *last_warn = Some(std::time::Instant::now());
+    warn!(
+        nodes = active_nodes,
+        served_interval_secs = report.served_interval.as_secs(),
+        freshness = ratio,
+        lost_window_secs = report.lost_window.as_secs(),
+        at_max_interval = report.at_max_interval,
+        "{}",
+        crate::manager::cadence::freshness_warning(report)
+    );
+}
+
+/// Write the display checkpoint: every tracked node's ACTUAL last observed
+/// beat time, in one batched status-lane commit.
+fn write_liveness_checkpoint(store: &Store, now: std::time::Instant) {
+    let beats: Vec<(String, i64)> = store
+        .liveness()
+        .snapshot()
+        .into_iter()
+        .map(|(id, beat)| (id, beat.unix))
+        .collect();
+    if beats.is_empty() {
+        return;
+    }
+    let count = beats.len();
+    let started = std::time::Instant::now();
+    match store.checkpoint_node_heartbeats(&beats) {
+        Ok(()) => {
+            crate::manager::telemetry::metrics()
+                .liveness_checkpoint_seconds
+                .observe(started.elapsed().as_secs_f64());
+            debug!(
+                nodes = count,
+                age_secs = now.elapsed().as_secs(),
+                "Replicated the liveness display checkpoint"
+            );
+        }
+        // Never fatal and never retried tightly: a checkpoint is display
+        // state, so a missed one costs a stale column for one interval.
+        Err(err) => debug!(error = ?err, "Failed writing the liveness checkpoint"),
+    }
+}
+
+/// Move every node's lost window when the served interval changes.
+///
+/// The asymmetry is the safety argument (heartbeat-cadence plan §6.4):
+///
+/// - **Widening happens immediately**, the moment the manager DECIDES to slow
+///   down and before any worker has been told. A worker that never gets the
+///   message is protected.
+/// - **Narrowing waits for confirmation** — a node keeps its wide window until
+///   it is observed actually beating at the faster cadence. A worker that
+///   missed the speed-up is never punished for obeying the last instruction it
+///   received. This is Consul's session-TTL contract, per node.
+fn apply_served_cadence(
+    store: &Store,
+    snapshot: &[crate::manager::cadence::NodeLiveness],
+    previous: Duration,
+    next: Duration,
+    missed_beats: u32,
+) {
+    let widening = next > previous;
+    let window = crate::manager::cadence::lost_window_for(next, missed_beats);
+    let table = store.liveness();
+    let updates: Vec<(String, i64)> = snapshot
+        .iter()
+        .filter(|node| {
+            if widening {
+                return true;
+            }
+            // Narrowing: only nodes we have SEEN beat at the new, faster
+            // cadence. `gap` is the interval between this node's last two
+            // observed beats; 1.5x leaves room for jitter and one slow tick.
+            table
+                .last_beat(&node.id)
+                .and_then(|beat| beat.gap)
+                .is_some_and(|gap| gap <= next.mul_f64(1.5))
+        })
+        .map(|node| (node.id.clone(), window.as_secs() as i64))
+        .collect();
+    if updates.is_empty() {
+        return;
+    }
+    let count = updates.len();
+    match store.set_node_lost_windows(&updates) {
+        Ok(()) => info!(
+            nodes = count,
+            window_secs = window.as_secs(),
+            widening,
+            "Moved per-node lost windows with the served cadence"
+        ),
+        Err(err) => warn!(error = ?err, "Failed updating per-node lost windows; will retry"),
+    }
 }
 
 #[instrument(err, skip_all)]
@@ -1127,15 +1628,31 @@ async fn start_eval_loop(store: Store, max_threads: usize) -> R<()> {
         });
     }
 
+    // Every worker shares the queue, so each takes only its share of it —
+    // see `EvalBatchLimits`.
+    let batch_limits = EvalBatchLimits {
+        max: MAX_EVAL_BATCH,
+        workers: max_threads,
+    };
+
     let mut join_set = JoinSet::new();
+    // Before the workers: once this is installed, plan applies hand their
+    // task_status projection here instead of paying a status-lane quorum
+    // round inline. Installing it after would leave the first few applies
+    // on the synchronous path for no reason.
+    if let Some(rx) = store.install_status_projection_queue() {
+        spawn_status_projection_drain(&store, rx);
+    }
     for worker_id in 0..max_threads {
-        spawn_eval_worker(&mut join_set, &store, worker_id);
+        spawn_eval_worker(&mut join_set, &store, worker_id, batch_limits);
     }
 
     let mut next_worker_id = max_threads;
     // Supervises workers forever: any worker exit/crash is immediately replaced.
     loop {
-        if !restart_eval_worker_after_exit(&mut join_set, &store, &mut next_worker_id).await {
+        if !restart_eval_worker_after_exit(&mut join_set, &store, &mut next_worker_id, batch_limits)
+            .await
+        {
             break;
         }
     }
@@ -1147,6 +1664,7 @@ async fn restart_eval_worker_after_exit(
     join_set: &mut JoinSet<()>,
     store: &Store,
     next_worker_id: &mut usize,
+    batch_limits: EvalBatchLimits,
 ) -> bool {
     match join_set.join_next().await {
         Some(Ok(())) => {
@@ -1164,23 +1682,114 @@ async fn restart_eval_worker_after_exit(
     let worker_id = *next_worker_id;
     *next_worker_id = next_worker_id.saturating_add(1);
     info!(worker_id, "Spawning replacement eval worker");
-    spawn_eval_worker(join_set, store, worker_id);
+    spawn_eval_worker(join_set, store, worker_id, batch_limits);
     true
 }
 
-fn spawn_eval_worker(join_set: &mut JoinSet<()>, store: &Store, worker_id: usize) {
+/// Drain deferred task_status projections off the plan-apply path.
+///
+/// Each projection is a status-lane quorum round. Running it inside the
+/// scheduler-lane apply meant every applied plan paid two round trips on
+/// two raft groups before the eval could finish. Here it is one round per
+/// DRAIN instead of one per plan: whatever has queued up while the last
+/// round was in flight is merged and projected together, which is the
+/// same amortization the plan-apply coalescer already gets.
+///
+/// Losing a batch is survivable by design — the rows are derived from
+/// allocations that are already committed, and the status leader's
+/// reconciler plus the workers' own reports re-derive them. That is why
+/// this can be off the critical path at all.
+///
+/// Deliberately NOT in the eval workers' `JoinSet`: the supervisor there
+/// replaces any exited member with an eval worker, so a drain that died
+/// would silently become a 17th planner while every future projection
+/// send failed into a closed channel (the send path then falls back to
+/// the inline status-lane round, so correctness held — but the
+/// off-critical-path optimization was permanently and invisibly off, and
+/// the extra worker skewed the batch-fairness arithmetic). The drain body
+/// is panic-free by construction — the projection itself runs under
+/// `spawn_blocking` and both error arms are logged — so a plain spawn
+/// needs no supervisor of its own; if it ever does exit, the closed
+/// channel degrades every send to the inline path, unchanged behavior.
+fn spawn_status_projection_drain(
+    store: &Store,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<Vec<crate::structs::Allocation>>,
+) {
+    let store = store.clone();
+    tokio::spawn(async move {
+        info!("Task-status projection drain started");
+        while let Some(first) = rx.recv().await {
+            let mut batch = first;
+            // Take everything else already queued. The projection dedupes
+            // by task config internally, so merging is free.
+            while let Ok(more) = rx.try_recv() {
+                batch.extend(more);
+            }
+            let store_for_write = store.clone();
+            let size = batch.len();
+            // spawn_blocking: this is a raft propose plus a SQLite write,
+            // and it must not park a runtime worker.
+            match tokio::task::spawn_blocking(move || store_for_write.project_task_statuses(&batch))
+                .await
+            {
+                Ok(Ok(())) => debug!(allocations = size, "Projected task statuses"),
+                Ok(Err(e)) => warn!(allocations = size, "Task-status projection failed: {e:#}"),
+                Err(e) => warn!("Task-status projection task failed: {e:?}"),
+            }
+        }
+        info!("Task-status projection drain stopped");
+    });
+}
+
+fn spawn_eval_worker(
+    join_set: &mut JoinSet<()>,
+    store: &Store,
+    worker_id: usize,
+    batch_limits: EvalBatchLimits,
+) {
     // Each worker shares the same notifier. enqueue/requeue paths wake sleepers.
     let store_for_eval = store.clone();
     let notifier = store.eval_notifier();
 
-    join_set.spawn(async move { eval_worker_loop(store_for_eval, notifier, worker_id).await });
+    join_set.spawn(async move {
+        eval_worker_loop(store_for_eval, notifier, worker_id, batch_limits).await
+    });
 }
 
-async fn eval_worker_loop(store: Store, notifier: Arc<Notify>, worker_id: usize) {
+/// One eval worker: claim a batch, take every member of it through the
+/// handler, settle the batch and claim the next one — forever.
+///
+/// The loop works in BATCHES rather than single evals because every fixed
+/// cost in the cycle is paid per round, not per eval, and the 2026-08-05
+/// AWS campaign says that fixed cost is what is left: once the wake herd
+/// was fixed, the only real scheduler-lane quorum traffic was
+/// `complete_and_claim_next` at 44/s (against ~44 evals/s) plus ~20/s of
+/// plan applies. The amortization curve agrees from the other side — same
+/// 5,000-node cluster, same 16 eval threads, `web_fleet` (6 allocations per
+/// eval) sustained 219 alloc/s while `dense_fleet` (44 per eval) sustained
+/// 736. 7x the work per eval for 3.4x the throughput: throughput tracking
+/// work-per-eval rather than work is the signature of a per-eval cost
+/// dominating, so the lever is fewer cycles per eval.
+///
+/// What batching does NOT change: the evals in a batch are still handled
+/// strictly one at a time, in claim order, each applying its own plan in its
+/// own op. Only the queue's own bookkeeping — the claim round and the
+/// terminal-write round — is shared.
+async fn eval_worker_loop(
+    store: Store,
+    notifier: Arc<Notify>,
+    worker_id: usize,
+    batch_limits: EvalBatchLimits,
+) {
     info!(worker_id, "Eval worker started");
 
     let mut error_backoff = ERROR_BACKOFF_MIN;
     let mut was_leader = true;
+    // The evals handed back by the previous iteration's fused
+    // complete-and-claim. Carrying them here is what removes the
+    // scheduler-lane rounds: the round that finished the last batch also
+    // claimed this one. Empty means "ask the queue".
+    let mut claimed_ahead: Vec<Eval> = Vec::new();
     loop {
         // Leader-only scheduling (raft mode, JC-41): the eval queue is
         // REPLICATED — followers hold every eval row but never ACT on the
@@ -1190,7 +1799,14 @@ async fn eval_worker_loop(store: Store, notifier: Arc<Notify>, worker_id: usize)
         // which point they inherit the real pending queue (the acquisition
         // hook below only reconciles). Non-raft backends always report
         // leadership here.
-        if !store.is_raft_leader(crate::storage::Lane::Scheduler) {
+        // Evals already claimed by the previous iteration's fused write
+        // are handled before anything else, including the leadership gate:
+        // we held leadership when they were claimed, and dropping them here
+        // would leave the rows `in_flight` for `requeue_in_flight_evals` to
+        // rescue later. If leadership really has moved, the terminal write
+        // fails with `NotRaftLeader` and lands in the error path below,
+        // which is the same recovery the unfused loop had.
+        if claimed_ahead.is_empty() && !store.is_raft_leader(crate::storage::Lane::Scheduler) {
             if was_leader {
                 info!(
                     worker_id,
@@ -1206,50 +1822,194 @@ async fn eval_worker_loop(store: Store, notifier: Arc<Notify>, worker_id: usize)
             was_leader = true;
         }
         let claim_started = std::time::Instant::now();
-        match store.claim_eval() {
-            Ok(Some(eval)) => {
-                error_backoff = ERROR_BACKOFF_MIN;
-                info!(
-                    worker_id,
-                    eval_id = %eval.id,
-                    kind = %eval.kind,
-                    claim_eval_ms = claim_started.elapsed().as_millis() as u64,
-                    "Claimed eval for dispatch"
-                );
-                // Eval handling is synchronous end to end — SQLite writes,
-                // raft-proposal waits, and the plan-conflict retry loop's
-                // backoff sleeps (`plan_with_conflict_retries`), which can
-                // hold the thread for hundreds of milliseconds per retry.
-                // Run it on the blocking pool so those stalls never park a
-                // tokio runtime worker; awaiting the handle keeps this
-                // worker's one-eval-at-a-time ordering.
-                let store_for_handler = store.clone();
-                if let Err(join_error) = tokio::task::spawn_blocking(move || {
-                    handle_claimed_eval(&store_for_handler, worker_id, &eval)
-                })
-                .await
-                {
-                    error!(worker_id, "Eval handler task failed: {join_error:?}");
+        // A batch carried over by the previous `complete_evals_and_claim_next`
+        // was already paid for by that round, so only a claim that actually
+        // hit the store is metered below.
+        let carried_ahead = !claimed_ahead.is_empty();
+        let batch = if carried_ahead {
+            std::mem::take(&mut claimed_ahead)
+        } else {
+            // On the blocking pool, like the handler below: a claim is a
+            // scheduler-lane quorum round, and running it inline here
+            // parked a tokio runtime worker for the whole round trip.
+            // There are only `available_parallelism()` runtime workers no
+            // matter how high `evalThreads` goes, so at high thread counts
+            // the claims themselves were what serialized the loop.
+            let store_for_claim = store.clone();
+            let claimed =
+                tokio::task::spawn_blocking(move || store_for_claim.claim_evals(batch_limits))
+                    .await
+                    .unwrap_or_else(|join_error| {
+                        Err(anyhow::anyhow!("eval claim task failed: {join_error:?}"))
+                    });
+            match claimed {
+                Ok(batch) => batch,
+                Err(e) => {
+                    error!(
+                        worker_id,
+                        claim_eval_ms = claim_started.elapsed().as_millis() as u64,
+                        "Error claiming next eval batch: {:?}",
+                        e
+                    );
+                    tokio::time::sleep(error_backoff).await;
+                    error_backoff = std::cmp::min(error_backoff * 2, ERROR_BACKOFF_MAX);
+                    continue;
                 }
             }
-            Ok(None) => {
-                debug!(
+        };
+        // An empty claim yields an empty changeset, which skips the raft
+        // entry — but it still pays the capture (a savepoint on the write
+        // connection) and the wake that produced it, so the empty share is
+        // the cost of waking a worker for nothing — the thundering-herd
+        // signal this counter exists for.
+        // Batching does not change what a tick means here: it is still one
+        // round, so `claimed` counts rounds that found work rather than
+        // evals. That is deliberate — dividing `evals_processed_total` by
+        // this counter is exactly the evals-per-round ratio batching is
+        // meant to raise, and there is no other way to see it.
+        if !carried_ahead {
+            crate::manager::telemetry::metrics()
+                .eval_claim_total
+                .inc(&[if batch.is_empty() { "empty" } else { "claimed" }]);
+        }
+
+        if batch.is_empty() {
+            debug!(
+                worker_id,
+                claim_eval_ms = claim_started.elapsed().as_millis() as u64,
+                "No eval claimed; worker entering wait path"
+            );
+            // Queue is empty (or only delayed work exists), so park until notified or due.
+            wait_for_next_eval(&store, &notifier, worker_id).await;
+            continue;
+        }
+
+        error_backoff = ERROR_BACKOFF_MIN;
+        info!(
+            worker_id,
+            batch_size = batch.len(),
+            claim_eval_ms = claim_started.elapsed().as_millis() as u64,
+            "Claimed eval batch for dispatch"
+        );
+
+        // Outcomes we ACTUALLY OBSERVED, one entry per eval. An eval whose
+        // handler panicked, or that leadership loss stopped us reaching, is
+        // deliberately absent: `complete_evals_and_claim_next` settles only
+        // what is listed, so an unobserved eval stays `in_flight` for
+        // `requeue_in_flight_evals` to recover instead of having an outcome
+        // invented for it. That is the per-eval isolation the single-eval
+        // loop had, preserved across the batch — one member failing neither
+        // completes its siblings nor completes itself.
+        let mut completions: Vec<(String, EvalCompletion)> = Vec::with_capacity(batch.len());
+        for (index, eval) in batch.iter().enumerate() {
+            // Stop the batch the moment this node stops leading the lane.
+            // Everything from here on would fail its own writes anyway, and
+            // the terminal write below cannot land either — abandoning the
+            // remainder to in-flight recovery is both cheaper and the only
+            // outcome that cannot half-apply a batch across a leadership
+            // change. Skipped for the first eval, which keeps the carried
+            // batch's "we held leadership when we claimed it" contract.
+            if index > 0 && !store.is_raft_leader(crate::storage::Lane::Scheduler) {
+                warn!(
                     worker_id,
-                    claim_eval_ms = claim_started.elapsed().as_millis() as u64,
-                    "No eval claimed; worker entering wait path"
+                    abandoned = batch.len() - index,
+                    "Lost scheduler-lane leadership mid-batch; leaving the rest in flight"
                 );
-                // Queue is empty (or only delayed work exists), so park until notified or due.
-                wait_for_next_eval(&store, &notifier, worker_id).await;
+                break;
             }
-            Err(e) => {
-                error!(
-                    worker_id,
-                    claim_eval_ms = claim_started.elapsed().as_millis() as u64,
-                    "Error claiming next eval: {:?}",
-                    e
-                );
-                tokio::time::sleep(error_backoff).await;
-                error_backoff = std::cmp::min(error_backoff * 2, ERROR_BACKOFF_MAX);
+            // Eval handling is synchronous end to end — SQLite writes,
+            // raft-proposal waits, and the plan-conflict retry loop's
+            // backoff sleeps (`plan_with_conflict_retries`), which can
+            // hold the thread for hundreds of milliseconds per retry.
+            // Run it on the blocking pool so those stalls never park a
+            // tokio runtime worker; awaiting the handle keeps this
+            // worker's one-eval-at-a-time ordering, batch or not.
+            let store_for_handler = store.clone();
+            let eval_for_handler = eval.clone();
+            // Timed end to end because the plan-phase histograms only
+            // cover planning: an eval also dispatches its allocations and
+            // runs post-apply bookkeeping, and the difference between
+            // this and `plan_phase_seconds{phase="total"}` is the only
+            // way to see that half. Still PER EVAL under batching — the
+            // handlers run one at a time, so a per-batch timer would blur
+            // kinds together and make the histogram unreadable.
+            let handle_started = std::time::Instant::now();
+            let handled = tokio::task::spawn_blocking(move || {
+                resolve_claimed_eval(&store_for_handler, worker_id, &eval_for_handler)
+            })
+            .await;
+            crate::manager::telemetry::metrics()
+                .eval_handle_seconds
+                .observe(&[&eval.kind], handle_started.elapsed().as_secs_f64());
+            match handled {
+                Ok(completion) => completions.push((eval.id.clone(), completion)),
+                // The handler panicked or was cancelled. Its outcome is
+                // unknown, so record nothing for it and CARRY ON with the
+                // rest of the batch: its siblings' outcomes are known and
+                // must not be thrown away because this one is not.
+                Err(join_error) => {
+                    error!(
+                        worker_id,
+                        eval_id = %eval.id,
+                        "Eval handler task failed: {join_error:?}"
+                    );
+                }
+            }
+        }
+
+        // One scheduler-lane round settles the whole batch and claims the
+        // next one, instead of two rounds per eval. On the blocking pool
+        // for the same reason as the claim above.
+        //
+        // The terminal write is RETRIED (bounded) before the completions
+        // are dropped: a transient write error on a leader that never
+        // loses leadership used to abandon every handled member of the
+        // batch as `in_flight` forever, because `requeue_in_flight_evals`
+        // only runs at startup and on leadership ACQUISITION — a stable
+        // leader has no third chance. A retry burns nothing but this
+        // worker's time; giving up still leaves the batch recoverable by
+        // the existing paths, and a leadership loss fails fast on its
+        // first attempt (the retries hit the same typed rejection).
+        let settled = completions.len();
+        let mut settle_attempts = 0;
+        loop {
+            let store_for_settle = store.clone();
+            let completions_for_attempt = completions.clone();
+            let outcome = tokio::task::spawn_blocking(move || {
+                store_for_settle
+                    .complete_evals_and_claim_next(completions_for_attempt, batch_limits)
+            })
+            .await
+            .unwrap_or_else(|join_error| {
+                Err(anyhow::anyhow!("eval settle task failed: {join_error:?}"))
+            });
+            match outcome {
+                Ok(next) => {
+                    claimed_ahead = next;
+                    error_backoff = ERROR_BACKOFF_MIN;
+                    break;
+                }
+                Err(e) => {
+                    settle_attempts += 1;
+                    // Nothing was written — the op is one changeset — so
+                    // every member of the batch is still `in_flight` and
+                    // recoverable.
+                    error!(
+                        worker_id,
+                        batch_size = batch.len(),
+                        settled,
+                        settle_attempts,
+                        "Error writing eval batch outcomes and claiming next: {:?}",
+                        e
+                    );
+                    tokio::time::sleep(error_backoff).await;
+                    error_backoff = std::cmp::min(error_backoff * 2, ERROR_BACKOFF_MAX);
+                    if settle_attempts >= EVAL_SETTLE_MAX_ATTEMPTS
+                        || crate::storage::raft::driver::NotRaftLeader::in_chain(&e)
+                    {
+                        break;
+                    }
+                }
             }
         }
     }
@@ -1452,28 +2212,69 @@ mod tests {
             dynamic_attrs: "{}".into(),
             health_checks: "{}".into(),
             last_heartbeat,
+            heartbeat_source: String::new(),
         }
     }
 
+    /// A manager that has just become responsible for liveness must not
+    /// deschedule a fleet whose persisted heartbeats are stale by
+    /// construction.
+    ///
+    /// This is the test the old process-uptime grace only half passed: it
+    /// covered a process RESTART, but not a manager up for hours that acquires
+    /// status-lane leadership mid-life (liveness plan §5.4). Both take the
+    /// same path now, because responsibility — not uptime — starts the clock.
     #[test]
-    fn nodes_to_mark_lost_waits_for_startup_heartbeat_grace() -> R<()> {
-        let lost_window = DEF_LOST_NODE_AT_SEC as u64;
-        // No unix clock on these rows: exercises the text-parse fallback.
-        let nodes = vec![
-            ("stale-node".to_string(), rfc3339_seconds_ago(120)?, None),
-            ("fresh-node".to_string(), rfc3339_seconds_ago(0)?, None),
-        ];
+    fn acquiring_liveness_responsibility_marks_nothing_lost() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(node_msg("stale-node", rfc3339_seconds_ago(3600)?))?;
+        store.insert_node(node_msg("fresh-node", rfc3339_seconds_ago(0)?))?;
 
-        // Right after a manager restart every persisted heartbeat looks
-        // stale; nothing may be marked lost until workers have had a full
-        // window to reconnect.
-        assert!(nodes_to_mark_lost(nodes.clone(), Duration::ZERO).is_empty());
-        assert!(nodes_to_mark_lost(nodes.clone(), Duration::from_secs(lost_window - 1)).is_empty());
+        // Acquisition seeds every active node at `now`, so a persisted
+        // heartbeat an hour old produces no candidates at all...
+        store
+            .liveness()
+            .become_responsible(&["stale-node".into(), "fresh-node".into()]);
+        let snapshot = liveness_snapshot(&store, std::time::Instant::now())?;
+        assert_eq!(snapshot.len(), 2);
+        assert!(snapshot
+            .iter()
+            .all(|node| node.age < Duration::from_secs(1)));
+        let settled = crate::manager::cadence::LossContext {
+            responsible_for: Duration::from_secs(3600),
+            ..Default::default()
+        };
+        assert!(
+            crate::manager::cadence::decide_lost_nodes(&snapshot, &settled)
+                .lost
+                .is_empty(),
+            "a stale persisted timestamp must never be a loss decision"
+        );
 
-        // Once the manager has been up a full window, silence means real loss
-        // — and only for the silent node.
+        // ...and even a genuinely silent node is held while the failover
+        // grace runs.
+        let long_ago = std::time::Instant::now() - Duration::from_secs(600);
+        store.liveness().observe_at(
+            "stale-node",
+            long_ago,
+            OffsetDateTime::now_utc().unix_timestamp() - 600,
+        );
+        let snapshot = liveness_snapshot(&store, std::time::Instant::now())?;
+        let in_grace = crate::manager::cadence::LossContext {
+            responsible_for: Duration::from_secs(1),
+            ..Default::default()
+        };
+        let decision = crate::manager::cadence::decide_lost_nodes(&snapshot, &in_grace);
+        assert!(decision.lost.is_empty());
         assert_eq!(
-            nodes_to_mark_lost(nodes, Duration::from_secs(lost_window)),
+            decision.suppressed_count(crate::manager::cadence::SuppressionReason::FailoverGrace),
+            1
+        );
+
+        // Past the grace, silence means real loss — and only for the silent
+        // node.
+        assert_eq!(
+            crate::manager::cadence::decide_lost_nodes(&snapshot, &settled).lost,
             vec!["stale-node".to_string()]
         );
         Ok(())
@@ -1509,7 +2310,7 @@ mod tests {
         store.handle_job_submit(
             &job,
             &[Submission {
-                path: "job.jsonnet".into(),
+                path: "job.ncl".into(),
                 content: "{}".into(),
                 is_primary: true,
             }],
@@ -1521,9 +2322,18 @@ mod tests {
         )?;
         store.place_alloc("node-1", task_id)?;
 
+        let settled = crate::manager::cadence::LossContext {
+            responsible_for: Duration::from_secs(3600),
+            ..Default::default()
+        };
+
         // First status-checker tick of the freshly restarted manager: the
         // node must stay active and keep its allocation.
-        let to_mark = nodes_to_mark_lost(store.get_node_ids_and_heartbeats()?, Duration::ZERO);
+        store
+            .liveness()
+            .become_responsible(&["node-1".into(), "node-2".into()]);
+        let snapshot = liveness_snapshot(&store, std::time::Instant::now())?;
+        let to_mark = crate::manager::cadence::decide_lost_nodes(&snapshot, &settled).lost;
         store.mark_nodes_as_lost(&to_mark)?;
         assert_eq!(store.get_node("node-1")?.status, "active");
         assert_eq!(
@@ -1532,12 +2342,16 @@ mod tests {
             "allocation must survive a manager restart"
         );
 
-        // The grace elapsed and the node still never heartbeated: now it is
-        // genuinely lost and its allocations reschedule off it.
-        let to_mark = nodes_to_mark_lost(
-            store.get_node_ids_and_heartbeats()?,
-            Duration::from_secs(DEF_LOST_NODE_AT_SEC as u64),
+        // The node still never heartbeated after the manager came back: now
+        // it is genuinely lost and its allocations reschedule off it.
+        let long_ago = std::time::Instant::now() - Duration::from_secs(600);
+        store.liveness().observe_at(
+            "node-1",
+            long_ago,
+            OffsetDateTime::now_utc().unix_timestamp() - 600,
         );
+        let snapshot = liveness_snapshot(&store, std::time::Instant::now())?;
+        let to_mark = crate::manager::cadence::decide_lost_nodes(&snapshot, &settled).lost;
         assert_eq!(to_mark, vec!["node-1".to_string()]);
         store.mark_nodes_as_lost(&to_mark)?;
         // The reschedule tail is eval-mediated since C-2: pump the queue
@@ -1555,6 +2369,47 @@ mod tests {
             store.allocs_for_node("node-2")?.len(),
             1,
             "the surviving node receives the rescheduled allocation"
+        );
+        Ok(())
+    }
+
+    /// Two worker types with different cadences coexist, each with its own
+    /// window. Impossible under the old global cutoff, and the reason the
+    /// per-node column exists (heartbeat-cadence plan §6.4(4)).
+    #[test]
+    fn per_worker_type_cadences_get_their_own_windows() -> R<()> {
+        let store = setup_store()?;
+        let mut fast = node_msg("fast-node", rfc3339_seconds_ago(0)?);
+        fast.config_attrs = json!({ "heartbeatSeconds": 2 }).to_string();
+        let mut slow = node_msg("slow-node", rfc3339_seconds_ago(0)?);
+        slow.config_attrs = json!({ "heartbeatSeconds": 60 }).to_string();
+        store.insert_node(fast)?;
+        store.insert_node(slow)?;
+
+        store
+            .liveness()
+            .become_responsible(&["fast-node".into(), "slow-node".into()]);
+        // Both silent for 55 seconds: the 2s node is long gone, the 60s node
+        // has not even missed a beat.
+        let unix = OffsetDateTime::now_utc().unix_timestamp() - 55;
+        let silent_since = std::time::Instant::now() - Duration::from_secs(55);
+        store.liveness().observe_at("fast-node", silent_since, unix);
+        store.liveness().observe_at("slow-node", silent_since, unix);
+
+        let snapshot = liveness_snapshot(&store, std::time::Instant::now())?;
+        let windows: HashMap<String, Duration> = snapshot
+            .iter()
+            .map(|node| (node.id.clone(), node.window))
+            .collect();
+        assert_eq!(windows["fast-node"], Duration::from_secs(10));
+        assert_eq!(windows["slow-node"], Duration::from_secs(300));
+        let settled = crate::manager::cadence::LossContext {
+            responsible_for: Duration::from_secs(3600),
+            ..Default::default()
+        };
+        assert_eq!(
+            crate::manager::cadence::decide_lost_nodes(&snapshot, &settled).lost,
+            vec!["fast-node".to_string()]
         );
         Ok(())
     }
@@ -1612,8 +2467,16 @@ mod tests {
         let mut next_worker_id = 1;
 
         join_set.spawn(async {});
-        let restarted =
-            restart_eval_worker_after_exit(&mut join_set, &store, &mut next_worker_id).await;
+        let restarted = restart_eval_worker_after_exit(
+            &mut join_set,
+            &store,
+            &mut next_worker_id,
+            EvalBatchLimits {
+                max: MAX_EVAL_BATCH,
+                workers: 1,
+            },
+        )
+        .await;
 
         assert!(restarted);
         assert_eq!(next_worker_id, 2);
@@ -1715,7 +2578,29 @@ fn not_leader_retry_delay(eval_id: &str) -> Duration {
 /// for retry on foreign-lane rejections and plan-conflict exhaustion, fail
 /// terminally otherwise. Public so integration tests (the plan-contention
 /// harness) can drive the real worker logic, requeue backstop included.
+/// Handle a claimed eval and write its outcome immediately, as its own
+/// scheduler-lane op.
+///
+/// The eval worker loop uses [`resolve_claimed_eval`] instead, so it can
+/// fuse this write with the next claim. This wrapper stays for callers
+/// that handle a single eval outside the loop (tests, and any one-shot
+/// path), where there is no following claim to fuse with.
 pub fn handle_claimed_eval(store: &Store, worker_id: usize, eval: &Eval) {
+    let completion = resolve_claimed_eval(store, worker_id, eval);
+    if let Err(e) = store.apply_eval_completion_standalone(&eval.id, completion) {
+        error!(worker_id, "Error writing eval {} outcome: {:?}", eval.id, e);
+    }
+}
+
+/// Run a claimed eval and decide how it should be written back, WITHOUT
+/// writing it.
+///
+/// Splitting the decision from the write is what lets the caller fuse the
+/// terminal write with the next claim into one scheduler-lane round
+/// (`Store::complete_and_claim_next`). The AWS phase-3 campaign measured
+/// the scheduler lane, not the planner, as the throughput ceiling, and
+/// claim+complete were two of the ~4 rounds every eval spent there.
+pub fn resolve_claimed_eval(store: &Store, worker_id: usize, eval: &Eval) -> EvalCompletion {
     let started = std::time::Instant::now();
     info!(
         worker_id,
@@ -1737,9 +2622,9 @@ pub fn handle_claimed_eval(store: &Store, worker_id: usize, eval: &Eval) {
                 "Eval {} handled successfully: {}", eval.id, message
             );
             clear_not_leader_attempts(&eval.id);
-            let completed = drafts::eval_completed(eval, &message, started.elapsed());
-            if let Err(e) = store.complete_eval_with_event(&eval.id, true, completed) {
-                error!(worker_id, "Error completing eval {}: {:?}", eval.id, e);
+            EvalCompletion::Finished {
+                succeeded: true,
+                event: drafts::eval_completed(eval, &message, started.elapsed()),
             }
         }
         // A NotRaftLeader rejection means a cross-lane half of the eval's
@@ -1757,11 +2642,9 @@ pub fn handle_claimed_eval(store: &Store, worker_id: usize, eval: &Eval) {
                 retry_delay_ms = retry_delay.as_millis() as u64,
                 "Eval hit a foreign-lane leader rejection; releasing for retry: {e:#}"
             );
-            if let Err(release_err) = store.release_eval_for_retry(&eval.id, retry_delay) {
-                error!(
-                    worker_id,
-                    "Error releasing eval {} for retry: {:?}", eval.id, release_err
-                );
+            EvalCompletion::Released {
+                delay: retry_delay,
+                event: None,
             }
         }
         // Plan-conflict exhaustion is transient by definition: the plan lost
@@ -1784,27 +2667,17 @@ pub fn handle_claimed_eval(store: &Store, worker_id: usize, eval: &Eval) {
             crate::manager::telemetry::metrics()
                 .eval_conflict_requeues_total
                 .inc();
-            let requeued = drafts::eval_requeued(eval, &e, delay);
-            if let Err(release_err) =
-                store.release_eval_for_retry_with_event(&eval.id, delay, requeued)
-            {
-                error!(
-                    worker_id,
-                    "Error requeueing eval {} after plan conflict: {:?}", eval.id, release_err
-                );
+            EvalCompletion::Released {
+                delay,
+                event: Some(drafts::eval_requeued(eval, &e, delay)),
             }
         }
         Err(e) => {
             error!(worker_id, eval_id = %eval.id, elapsed_ms = started.elapsed().as_millis() as u64, "Error handling eval {}: {:?}", eval.id, e);
             clear_not_leader_attempts(&eval.id);
-            let failed = drafts::eval_failed(eval, &e, started.elapsed());
-            if let Err(complete_err) = store.complete_eval_with_event(&eval.id, false, failed) {
-                error!(
-                    worker_id,
-                    "Error marking eval {} as failed after handling error: {:?}",
-                    eval.id,
-                    complete_err
-                );
+            EvalCompletion::Finished {
+                succeeded: false,
+                event: drafts::eval_failed(eval, &e, started.elapsed()),
             }
         }
     }
@@ -1819,16 +2692,11 @@ fn error_is_not_raft_leader(error: &anyhow::Error) -> bool {
 
 #[instrument(err, skip_all)]
 fn parse_worker_config(config_path: &str) -> R<WorkerConfigAlt> {
-    // Pluginify jsonnet
-    let mut vm = JsonnetVm::new();
-    let rendered = vm
-        .evaluate_file(config_path)
-        .map_err(|e| {
-            let err = anyhow!("Error parsing worker config at path {config_path}: {e}");
-            error!("{err}");
-            err
-        })?
-        .to_string();
+    let rendered = crate::config_lang::eval_file(config_path).map_err(|e| {
+        let err = e.context(format!("Error parsing worker config at path {config_path}"));
+        error!("{err}");
+        err
+    })?;
 
     let config: WorkerConfigAlt = serde_json::from_str(&rendered)
         .with_context(|| format!("Error parsing worker config at path {config_path}"))?;
@@ -1843,6 +2711,13 @@ async fn load_initial_data(store: &Store, config: &ManagerConfig) -> R<()> {
 
     for path in sub_paths {
         let path = path.unwrap().path();
+        // Only the two configuration extensions. The directory is a normal
+        // one an operator edits, so it collects `README.md` files and editor
+        // swap files, and neither should be fed to a config parser.
+        if !crate::config_lang::is_config_file(&path) {
+            debug!(path = %path.display(), "skipping non-config file in worker config directory");
+            continue;
+        }
         let path_str = path.to_str().unwrap();
         let wcp = parse_worker_config(path_str)?;
 
@@ -1942,20 +2817,49 @@ async fn load_initial_data(store: &Store, config: &ManagerConfig) -> R<()> {
         };
 
         if let Some(seconds) = wcp.heartbeat_seconds {
-            if !(1..=30).contains(&seconds) {
+            // The clamp widened from 1..=30 the moment the lost window began
+            // moving with the cadence (heartbeat-cadence plan §7). Under the
+            // old fixed 10s window every value above 3 traded detection margin
+            // for load; now `missedBeatsBeforeLost x heartbeatSeconds` IS the
+            // window, so a slow worker type is a supported configuration
+            // rather than a trap.
+            if !(1..=MAX_WORKER_HEARTBEAT_SECONDS).contains(&seconds) {
                 bail!(
-                    "worker config {path_str}: heartbeatSeconds must be between 1 and 30, \
-                     got {seconds}"
+                    "worker config {path_str}: heartbeatSeconds must be between 1 and \
+                     {MAX_WORKER_HEARTBEAT_SECONDS}, got {seconds}"
                 );
             }
-            if seconds > 3 {
-                warn!(
-                    worker_type = %wcp.worker_type,
-                    heartbeat_seconds = seconds,
-                    "heartbeatSeconds above 3: the 10s lost-node window leaves fewer than \
-                     three missed beats before workers are marked lost"
+            let missed = config
+                .with_defaults()
+                .heartbeat
+                .missed_beats_before_lost
+                .max(1);
+            let window = u64::from(seconds) * u64::from(missed);
+            // The §1 hazard, caught at config load rather than discovered as
+            // spontaneous stateful task death: a worker kills its own stateful
+            // tasks after `selfTerminateAfter` without manager contact, so a
+            // lost window at or past that fence means a HEALTHY worker
+            // self-fences between beats.
+            let self_terminate = crate::structs::job::DEFAULT_SELF_TERMINATE_AFTER.as_secs();
+            if window >= self_terminate {
+                bail!(
+                    "worker config {path_str}: heartbeatSeconds {seconds} x \
+                     missedBeatsBeforeLost {missed} is a {window}s lost window, at or past the \
+                     {self_terminate}s stateful self-fence (stateful.onLost.selfTerminateAfter). \
+                     A healthy worker would kill its own stateful tasks between beats. Lower \
+                     heartbeatSeconds, lower missedBeatsBeforeLost, or raise \
+                     selfTerminateAfter on the jobs that run here \
+                     (docs/heartbeat-cadence-and-scale.md)"
                 );
             }
+            info!(
+                worker_type = %wcp.worker_type,
+                heartbeat_seconds = seconds,
+                lost_window_seconds = window,
+                missed_beats = missed,
+                "Worker type heartbeat cadence: real node failures on this worker type take \
+                 up to the lost window to detect"
+            );
         }
 
         let wc = WorkerConfigMsg {

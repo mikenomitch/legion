@@ -18,6 +18,26 @@ clock takes submit and placed marks, so no cross-host clock skew enters
 a latency, and all three systems pay the same stream-delivery latency.
 That methodology choice is recorded in the campaign fairness notes.
 
+FAIRNESS RULE — SUBMISSION PATHS ARE NOT INTERCHANGEABLE
+--------------------------------------------------------
+Legion has a second, much faster submission path: `legion-loadgen`, a
+native binary that holds a few gRPC connections open and issues many
+concurrent RunJob calls (`benchmarks/loadgen/main.rs`). Nomad and K8s
+have no equivalent; they still spawn one CLI process per job, which is
+the shared loop that made the three-system comparison fair.
+
+So a number produced with `--submitter native` is comparable to another
+Legion number, and to NOTHING ELSE. Any cross-system comparison must
+either
+
+  * run all three with `--submitter cli`, or
+  * add equivalent native submitters for Nomad and K8s first.
+
+The submitter used is recorded in every cell's metrics as `submitter`,
+so an archive can always be checked rather than trusted. This is a
+correctness property of the benchmark, not a preference — see
+benchmarks/aws/README.md § Methodology.
+
 Subcommands:
   run     drive a workload live (legion fully supported; nomad/k8s
           adapters ship for their campaign phases and are marked
@@ -34,16 +54,47 @@ A run directory contains:
 """
 
 import argparse
+import concurrent.futures
 import json
 import os
+import shutil
 import subprocess
 import sys
 import threading
 import time
 
 
+# Default parallelism per submission path. They are different numbers because
+# a "slot" costs wildly different things: on the CLI loop it is a whole OS
+# process (so the useful count is bounded by the loadgen box's vCPUs), and on
+# the native submitter it is one in-flight unary RPC (so the useful count is
+# bounded by what keeps the manager's request handling busy). --submit-concurrency
+# overrides either.
+CLI_SUBMIT_CONCURRENCY = 32
+# Matches legion-loadgen's own default, which was measured rather than picked:
+# submission throughput peaks around here and falls off past a few hundred in
+# flight, because the surplus only queues at the manager's control-lane commit.
+NATIVE_SUBMIT_CONCURRENCY = 128
+
+
 def now_ms():
     return int(time.monotonic() * 1000)
+
+
+def monotonic_offset_ms():
+    """Milliseconds to add to a UNIX-epoch stamp to put it on now_ms()'s clock.
+
+    `legion-loadgen` runs in its own process and so cannot share this one's
+    monotonic clock — Python's `time.monotonic()` and Rust's `Instant` are
+    both deliberately opaque, epoch-less readings. Epoch time is the only
+    clock two processes can name the same instant on, so the submitter stamps
+    in epoch ms and the driver hands it this offset to rebase with.
+
+    Both clocks tick at the same rate, so the offset is stable for the length
+    of a cell; only an NTP *step* mid-cell could skew a latency, and the rig's
+    hosts slew rather than step.
+    """
+    return now_ms() - int(time.time() * 1000)
 
 
 # ---------------------------------------------------------------------
@@ -71,6 +122,21 @@ def compute_metrics(submits, events, expected_total, warmup_secs=0.0, kill_time_
     placed_total = sum(event["count"] for event in events)
     first_submit = min(submits.values()) if submits else 0
     warmup_end = first_submit + int(warmup_secs * 1000)
+
+    # A cell shorter than its own warm-up measures nothing: every placement
+    # is excluded and the cell reports `throughput_per_sec: 0.0` alongside
+    # `complete: true`, which reads as a catastrophic result rather than a
+    # missing one. That is not hypothetical — the 2026-08-04 phase-3
+    # campaign lost its 1,000-node throughput number exactly this way, at
+    # the default 30s warm-up.
+    #
+    # Fall back to measuring the whole run rather than nothing, and say so
+    # in the metrics: a number with `warmup_applied: false` is comparable
+    # to nothing else, but it is honest and it is not zero.
+    last_event = max((event["t_ms"] for event in events), default=warmup_end)
+    warmup_applied = last_event > warmup_end
+    if not warmup_applied:
+        warmup_end = first_submit
 
     latencies = []
     window_placed = 0
@@ -112,7 +178,59 @@ def compute_metrics(submits, events, expected_total, warmup_secs=0.0, kill_time_
         "p99_ms": percentile(latencies, 0.99),
         "latency_samples": len(latencies),
         "warmup_secs": warmup_secs,
+        # False means the cell finished inside its own warm-up and the
+        # numbers above cover the WHOLE run, warm-up included. Read such a
+        # cell as a floor, and shorten `--warmup` before comparing it.
+        "warmup_applied": warmup_applied,
     }
+
+    # Is this cell measuring the system under test, or the driver?
+    #
+    # Submission is a CLI process per job from a thread pool, so it has its
+    # own ceiling, and when the scheduler is faster than that ceiling the
+    # cell reports the DRIVER's rate with no sign that it has done so. The
+    # 2026-08-05 phase-4 campaign is the worked example: 4,167 jobs went out
+    # over 114.97s (36.24 jobs/sec) and the cell reported 203.19 alloc/sec,
+    # which is 36.24 x 6 allocations per job. The control plane sat at 8%
+    # CPU with an empty eval queue. Three sessions of "throughput" numbers
+    # were submission rates.
+    #
+    # The signal is the lag between the two streams: if placement finishes
+    # essentially when submission does, placement was never behind, and the
+    # rate is submission's. Report it rather than leaving it to be noticed.
+    if submits and events:
+        last_submit = max(submits.values())
+        submit_span = (last_submit - first_submit) / 1000.0
+        submit_rate = len(submits) / submit_span if submit_span > 0 else None
+        # How long after the last job was submitted the last allocation
+        # landed. Near zero means the scheduler was never the constraint.
+        drain_secs = (last_event - last_submit) / 1000.0
+        window = metrics["steady_window_secs"] or 0.0
+        driver_bound = window > 0 and drain_secs < 0.1 * window
+        metrics["submission"] = {
+            "jobs": len(submits),
+            "span_secs": round(submit_span, 3),
+            "rate_per_sec": round(submit_rate, 2) if submit_rate else None,
+            # Placement time left after the last submit. A cell whose
+            # scheduler is the constraint keeps draining after submission
+            # stops; one that is driver-bound finishes with it.
+            "drain_secs": round(drain_secs, 3),
+            # True means throughput_per_sec is a floor for the system under
+            # test and an accurate measure of nothing but this driver.
+            "driver_bound": driver_bound,
+        }
+        if driver_bound:
+            print(
+                f"WARNING: DRIVER-BOUND CELL. Submission ran at "
+                f"{submit_rate:.1f} jobs/sec and the last allocation landed "
+                f"{drain_secs:.1f}s after the last submit, so the scheduler "
+                f"was never behind. throughput_per_sec="
+                f"{metrics['throughput_per_sec']} is this driver's ceiling, "
+                f"NOT the system's. Raise --submit-concurrency, use a bigger "
+                f"loadgen box, or use a scenario with more allocations per "
+                f"job before comparing this number to anything.",
+                file=sys.stderr,
+            )
 
     if kill_time_ms is not None:
         replacements = [event for event in events if event["t_ms"] >= kill_time_ms]
@@ -179,7 +297,24 @@ class RunRecorder:
         self._raw_file = open(os.path.join(out_dir, "raw-events.ndjson"), "w")
 
     def record_submit(self, job):
-        self.submits[job] = now_ms()
+        # Locked because submission is concurrent (--submit-concurrency).
+        # CPython would make the bare assignment atomic anyway, but the
+        # timestamp is a measurement input and this is cheap.
+        with self._lock:
+            self.submits[job] = now_ms()
+
+    def record_submits(self, rows):
+        """Ingest a whole batch of submit stamps taken by another process.
+
+        The native submitter (`legion-loadgen`) records its own timestamps —
+        that is the point, since the driver never sees the individual RPCs —
+        and hands them back in the same `[{"job", "t_ms"}]` shape this class
+        writes. They arrive already rebased onto this process's clock via
+        --clock-offset-ms, so nothing here converts anything.
+        """
+        with self._lock:
+            for row in rows:
+                self.submits[row["job"]] = int(row["t_ms"])
 
     def record_placement(self, job, count):
         event = {"t_ms": now_ms(), "job": job, "count": count}
@@ -197,6 +332,15 @@ class RunRecorder:
         with self._lock:
             return sum(event["count"] for event in self.events)
 
+    def close(self):
+        """Release the NDJSON handles without computing metrics.
+
+        `finalize()` is the normal path and closes them itself; this exists
+        for callers that only wanted the recording side (the fixture tests),
+        so a run dir is never left with open handles."""
+        self._events_file.close()
+        self._raw_file.close()
+
     def finalize(self, expected_total, warmup_secs, kill_time_ms=None):
         with open(os.path.join(self.out_dir, "submits.json"), "w") as f:
             json.dump(
@@ -204,8 +348,7 @@ class RunRecorder:
                 f,
                 indent=2,
             )
-        self._events_file.close()
-        self._raw_file.close()
+        self.close()
         metrics = compute_metrics(
             self.submits, self.events, expected_total, warmup_secs, kill_time_ms
         )
@@ -220,20 +363,56 @@ class RunRecorder:
 # ---------------------------------------------------------------------
 
 
-class LegionAdapter:
-    """Fully supported: submits via `legion job run -j`, watches
-    `legion events follow -j --kind allocation` NDJSON."""
+def resolve_loadgen_bin(explicit, legion_bin):
+    """Where the native submitter lives, or None.
 
-    def __init__(self, manager_addr, legion_bin="legion"):
+    Looked up next to the `legion` binary first (that is how the rig
+    installs it, and how a local `cargo build` lays it out) and then on
+    PATH. Returning None is not an error here — `--submitter auto` falls
+    back to the CLI loop and says so, so a box that has not been
+    re-provisioned still produces a (slower, honest) cell.
+    """
+    def usable(path):
+        return path and os.path.isfile(path) and os.access(path, os.X_OK)
+
+    if explicit:
+        # Validated rather than trusted: run-step.sh always passes the rig's
+        # install path, and a box provisioned before the submitter existed
+        # would otherwise die on FileNotFoundError instead of falling back.
+        return explicit if usable(explicit) else None
+    sibling = os.path.join(
+        os.path.dirname(os.path.abspath(legion_bin)), "legion-loadgen"
+    )
+    if usable(sibling):
+        return sibling
+    return shutil.which("legion-loadgen")
+
+
+class LegionAdapter:
+    """Fully supported: submits via `legion-loadgen` (or `legion job run
+    -j` on the CLI path), watches `legion events follow -j --kind
+    allocation` NDJSON."""
+
+    def __init__(self, manager_addr, legion_bin="legion", loadgen_bin=None):
+        self.manager_addr = manager_addr
         self.env = dict(os.environ, LEGION_ADDR=manager_addr)
         self.legion_bin = legion_bin
+        # None means "CLI loop only" — set by cmd_run from --submitter.
+        self.loadgen_bin = loadgen_bin
         self._follower = None
 
     def start_watch(self, recorder):
+        # Keep the follower's stderr. Discarding it cost a 10-minute cell
+        # that reported 0 placements: the follower had exited, the pump
+        # loop ended with it, and the driver sat in its settle loop
+        # waiting for a stream that was no longer there -- with the one
+        # explanation written to /dev/null.
+        self._stderr_path = os.path.join(recorder.out_dir, "follower-stderr.log")
+        self._stderr_file = open(self._stderr_path, "w")
         self._follower = subprocess.Popen(
             [self.legion_bin, "events", "follow", "-j", "--kind", "allocation"],
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            stderr=self._stderr_file,
             env=self.env,
             text=True,
         )
@@ -251,6 +430,56 @@ class LegionAdapter:
         # or early placements race the stream and vanish.
         time.sleep(1.0)
 
+    def submit_all(self, workload_dir, jobs, recorder, concurrency):
+        """Submit the whole workload with the native submitter.
+
+        Returns False when there is no submitter binary, which leaves the
+        caller on the shared CLI loop. Anything else that goes wrong raises:
+        a cell short of its expected count must fail, not average over the
+        gap.
+
+        LEGION-ONLY, and that asymmetry is deliberate — see the fairness rule
+        in this module's docstring before comparing the resulting number to a
+        Nomad or K8s cell.
+        """
+        if not self.loadgen_bin:
+            return False
+
+        # The submitter's own output, kept next to the run rather than in a
+        # temp dir: when a cell disagrees with itself, the raw stamps are the
+        # evidence. `recorder.finalize()` still writes the canonical
+        # submits.json, so the run-dir format is unchanged.
+        raw_path = os.path.join(recorder.out_dir, "submitter-submits.json")
+        command = [
+            self.loadgen_bin,
+            "--workload-dir", workload_dir,
+            "--out", raw_path,
+            "--manager", self.manager_addr,
+            "--concurrency", str(max(1, concurrency)),
+            # Sampled here, immediately before the child starts, so its epoch
+            # stamps land on this process's monotonic clock — the same clock
+            # that takes the placement marks.
+            "--clock-offset-ms", str(monotonic_offset_ms()),
+        ]
+        result = subprocess.run(command, capture_output=True, env=self.env, text=True)
+        if result.stderr:
+            sys.stderr.write(result.stderr)
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"legion-loadgen failed (exit {result.returncode}): "
+                f"{result.stdout.strip()}"
+            )
+
+        with open(raw_path) as f:
+            rows = json.load(f)
+        if len(rows) != len(jobs):
+            raise RuntimeError(
+                f"legion-loadgen recorded {len(rows)} submits for a workload of "
+                f"{len(jobs)} jobs; the cell cannot reach its expected count"
+            )
+        recorder.record_submits(rows)
+        return True
+
     def submit(self, path, job_name):
         result = subprocess.run(
             [self.legion_bin, "job", "run", path, "-j"],
@@ -264,9 +493,14 @@ class LegionAdapter:
         if not reply.get("ok"):
             raise RuntimeError(f"legion job run {job_name} rejected: {reply}")
 
+    def watch_alive(self):
+        return self._follower is not None and self._follower.poll() is None
+
     def stop_watch(self):
         if self._follower:
             self._follower.terminate()
+        if getattr(self, "_stderr_file", None):
+            self._stderr_file.close()
 
 
 class NomadAdapter:
@@ -312,6 +546,14 @@ class NomadAdapter:
         thread.start()
         time.sleep(1.0)
 
+    def submit_all(self, workload_dir, jobs, recorder, concurrency):
+        # No native submitter for Nomad, so the shared CLI loop it is. This
+        # is the fairness baseline: giving Legion a native submitter and
+        # leaving Nomad on process-per-job would compare the submitters, not
+        # the schedulers. Adding one here (nomad's HTTP API from a
+        # long-lived session) is what a cross-system phase needs first.
+        return False
+
     def submit(self, path, job_name):
         result = subprocess.run(
             [self.nomad_bin, "job", "run", "-detach", path],
@@ -321,6 +563,9 @@ class NomadAdapter:
         )
         if result.returncode != 0:
             raise RuntimeError(f"nomad job run {job_name} failed: {result.stderr}")
+
+    def watch_alive(self):
+        return not self._stop.is_set()
 
     def stop_watch(self):
         self._stop.set()
@@ -387,6 +632,12 @@ class K8sAdapter:
         thread.start()
         time.sleep(1.0)
 
+    def submit_all(self, workload_dir, jobs, recorder, concurrency):
+        # Same as Nomad: no native submitter, so the shared CLI loop keeps
+        # the comparison honest. The equivalent here would be the apiserver
+        # REST API over one keep-alive session rather than kubectl per job.
+        return False
+
     def submit(self, path, job_name):
         result = subprocess.run(
             [self.kubectl_bin, "apply", "-f", path],
@@ -397,6 +648,9 @@ class K8sAdapter:
         if result.returncode != 0:
             raise RuntimeError(f"kubectl apply {job_name} failed: {result.stderr}")
 
+    def watch_alive(self):
+        return self._watcher is not None and self._watcher.poll() is None
+
     def stop_watch(self):
         if self._watcher:
             self._watcher.terminate()
@@ -404,7 +658,26 @@ class K8sAdapter:
 
 def make_adapter(args):
     if args.system == "legion":
-        return LegionAdapter(args.manager, legion_bin=args.legion_bin)
+        # --submitter decides whether the native path is even wired up, so
+        # the adapter cannot silently take it. `cli` hands back an adapter
+        # with no submitter at all, which is the switch a cross-system
+        # comparison must throw.
+        mode = getattr(args, "submitter", "auto")
+        loadgen_bin = None
+        if mode != "cli":
+            loadgen_bin = resolve_loadgen_bin(
+                getattr(args, "legion_loadgen_bin", None), args.legion_bin
+            )
+            if mode == "native" and not loadgen_bin:
+                raise SystemExit(
+                    "--submitter native: no legion-loadgen binary found next to "
+                    f"{args.legion_bin} or on PATH. Build it with "
+                    "`cargo build --release --features loadgen --bin legion-loadgen`, "
+                    "or pass --legion-loadgen-bin."
+                )
+        return LegionAdapter(
+            args.manager, legion_bin=args.legion_bin, loadgen_bin=loadgen_bin
+        )
     if args.system == "nomad":
         return NomadAdapter(args.manager, nomad_bin=args.nomad_bin)
     if args.system == "k8s":
@@ -418,6 +691,18 @@ def make_adapter(args):
 
 
 def cmd_run(args):
+    if args.submitter == "native" and args.submit_gap_ms:
+        # Refused rather than silently downgraded: a run that asked for the
+        # native path and got the CLI loop would archive `submitter: "cli"`
+        # and leave the operator wondering why. The two flags want opposite
+        # things anyway.
+        raise SystemExit(
+            "--submitter native and --submit-gap-ms are contradictory: pacing "
+            "is implemented on the CLI loop only, because the native submitter "
+            "exists to remove the submission ceiling rather than to hold it. "
+            "Drop one."
+        )
+
     with open(os.path.join(args.workload_dir, "manifest.json")) as f:
         manifest = json.load(f)
     expected_total = manifest["total_expected_allocations"]
@@ -431,20 +716,153 @@ def cmd_run(args):
         f"({expected_total} expected allocations) to {args.system}",
         file=sys.stderr,
     )
-    for job in manifest["jobs"]:
-        recorder.record_submit(job["name"])
-        adapter.submit(os.path.join(args.workload_dir, job["file"]), job["name"])
-        if args.submit_gap_ms:
-            time.sleep(args.submit_gap_ms / 1000.0)
 
-    deadline = time.monotonic() + args.settle_timeout_secs
+    # The native path first, when the system has one and the run allows it.
+    # `--submit-gap-ms` is deliberately not forwarded: pacing exists to make
+    # submission SLOWER, and a paced cell has no use for a submitter built to
+    # remove the ceiling — so a paced run stays on the shared loop, where the
+    # gap has always been implemented.
+    submitter = "cli"
+    if not args.submit_gap_ms:
+        native_concurrency = (
+            args.submit_concurrency
+            if args.submit_concurrency is not None
+            else NATIVE_SUBMIT_CONCURRENCY
+        )
+        if adapter.submit_all(
+            args.workload_dir, manifest["jobs"], recorder, native_concurrency
+        ):
+            submitter = "native"
+
+    if submitter == "cli":
+        cli_concurrency = (
+            args.submit_concurrency
+            if args.submit_concurrency is not None
+            else CLI_SUBMIT_CONCURRENCY
+        )
+
+        def submit_one(job):
+            # Stamp inside the worker, immediately before the call, or the
+            # submit->placed latency picks up queueing in this pool.
+            recorder.record_submit(job["name"])
+            adapter.submit(os.path.join(args.workload_dir, job["file"]), job["name"])
+            if args.submit_gap_ms:
+                time.sleep(args.submit_gap_ms / 1000.0)
+
+        # Submission has to outpace placement or the driver, not the system
+        # under test, sets the measured rate. Serially it does not come
+        # close: each submit is a fresh CLI process plus an RPC, which
+        # measured 25ms -- about 40 jobs/sec -- and on a clean 1000-node
+        # cluster Legion placed every job before the next one arrived (last
+        # placement landed 0.0s after the last submit). That run measured
+        # subprocess spawn, not the scheduler.
+        #
+        # Raising the pool only moves the ceiling; it does not remove it,
+        # because the per-job cost is a whole process. This loop is now the
+        # FAIRNESS BASELINE rather than the fast path: it is what Nomad and
+        # K8s use, and what a cross-system comparison must force Legion onto
+        # with --submitter cli.
+        if cli_concurrency > 1:
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=cli_concurrency
+            ) as pool:
+                # list() so a failed submit raises here rather than being
+                # silently dropped -- a cell short of its expected count must
+                # fail loudly, not average over the gap.
+                list(pool.map(submit_one, manifest["jobs"]))
+        else:
+            for job in manifest["jobs"]:
+                submit_one(job)
+
+    if args.system == "legion" and submitter == "cli":
+        # Said out loud every time, because a CLI-loop Legion cell is a floor
+        # and the reader has to know before they read the throughput. What to
+        # do about it differs: a deliberate `--submitter cli` run is the
+        # fairness baseline and is behaving correctly, while an `auto` run
+        # that landed here is a box missing its submitter.
+        remedy = (
+            "This is the cross-system fairness baseline, so the number is a "
+            "floor by design."
+            if args.submitter == "cli"
+            else "No legion-loadgen binary was found — install it (or pass "
+            "--legion-loadgen-bin) to measure the scheduler instead."
+        )
+        print(
+            "note: submitting via the per-job CLI loop. Its ceiling is process "
+            "spawn, so it is set by the loadgen box and not by Legion "
+            "(36-103 jobs/sec on the rig's m7i loadgen; a few hundred on a "
+            "fast laptop), and --submit-concurrency moves it without removing "
+            "it. Check `submission.driver_bound` before reading the "
+            f"throughput. {remedy}",
+            file=sys.stderr,
+        )
+
+    # Two clocks, because a fixed wall-clock deadline cannot tell "the
+    # cluster stopped converging" from "this cell is simply bigger".
+    # A 200k-allocation saturation point needs ~10 minutes at 350
+    # alloc/sec just to finish healthily, so a flat 600s would report it
+    # incomplete for arithmetic reasons and the sweep would read that as
+    # the scheduler's ceiling — the exact class of measurement error that
+    # invalidated phase 1.
+    #
+    #   stall  — no placement at all for this long. THIS is "stopped
+    #            converging", and it is independent of cell size.
+    #   settle — an absolute cap so a pathologically slow trickle still
+    #            ends the cell. Scaled from the expected allocation count
+    #            when the caller leaves it at 0 (= derive it).
+    settle_timeout = args.settle_timeout_secs
+    if settle_timeout <= 0:
+        # 20 alloc/sec is a deliberately pessimistic floor — an order of
+        # magnitude under the slowest cell ever measured (86.6/sec) — so
+        # the cap only ever fires on a system that is not really working.
+        settle_timeout = max(600.0, expected_total / 20.0)
+    print(
+        f"settling: stall timeout {args.stall_timeout_secs}s, "
+        f"absolute cap {settle_timeout:.0f}s ({expected_total} expected)",
+        file=sys.stderr,
+    )
+
+    outcome = "complete"
+    deadline = time.monotonic() + settle_timeout
+    last_progress = time.monotonic()
+    last_placed = recorder.placed_total()
     while time.monotonic() < deadline:
-        if recorder.placed_total() >= expected_total:
+        placed = recorder.placed_total()
+        if placed >= expected_total:
+            break
+        if placed > last_placed:
+            last_placed = placed
+            last_progress = time.monotonic()
+        elif (
+            args.stall_timeout_secs > 0
+            and time.monotonic() - last_progress > args.stall_timeout_secs
+        ):
+            outcome = "stalled"
+            print(
+                f"STALLED: no placement for {args.stall_timeout_secs}s at "
+                f"{placed}/{expected_total} — the cluster stopped converging; "
+                f"metrics record the shortfall",
+                file=sys.stderr,
+            )
+            break
+        # A dead watcher is not a slow cluster, and waiting out the full
+        # settle timeout to report zero placements hides which one it
+        # was. Fail as soon as the stream is gone, and say where its
+        # stderr went.
+        if not adapter.watch_alive():
+            outcome = "watcher_died"
+            print(
+                f"ERROR: the event watcher exited mid-run after "
+                f"{recorder.placed_total()}/{expected_total} placements. "
+                f"The cell measured nothing; see {args.out}/follower-stderr.log",
+                file=sys.stderr,
+            )
             break
         time.sleep(0.25)
     else:
+        outcome = "timeout"
         print(
-            f"WARNING: settle timeout after {args.settle_timeout_secs}s "
+            f"WARNING: settle cap reached after {settle_timeout:.0f}s "
             f"({recorder.placed_total()}/{expected_total} placed) — "
             f"metrics record the shortfall",
             file=sys.stderr,
@@ -452,6 +870,16 @@ def cmd_run(args):
 
     adapter.stop_watch()
     metrics = recorder.finalize(expected_total, args.warmup_secs)
+    # Why the cell ended, in the archive. An incomplete cell that stalled
+    # is a scheduler result; one that hit the cap is a rig result; and
+    # they are indistinguishable from `complete: false` alone.
+    metrics["outcome"] = outcome
+    metrics["settle_timeout_secs"] = round(settle_timeout, 1)
+    # Which submission path produced this cell. Load-bearing for the fairness
+    # rule at the top of this file: `native` is Legion-only, so a `native`
+    # cell is comparable to another Legion cell and to nothing else. Recorded
+    # per cell so an archive can be checked rather than trusted.
+    metrics["submitter"] = submitter
     print(json.dumps(metrics, indent=2))
     return 0 if metrics["complete"] else 1
 
@@ -521,8 +949,62 @@ def main():
     run.add_argument("--out", required=True, help="run directory to write")
     run.add_argument("--manager", default="http://127.0.0.1:4747", help="manager/server address")
     run.add_argument("--warmup-secs", type=float, default=5.0)
-    run.add_argument("--settle-timeout-secs", type=float, default=600.0)
-    run.add_argument("--submit-gap-ms", type=int, default=0)
+    run.add_argument(
+        "--settle-timeout-secs",
+        type=float,
+        default=0.0,
+        help="Absolute cap on the settle wait. 0 (the default) derives it "
+        "from the expected allocation count at a pessimistic 20/sec floor, "
+        "so a large saturation cell is not cut off for arithmetic reasons.",
+    )
+    run.add_argument(
+        "--stall-timeout-secs",
+        type=float,
+        default=120.0,
+        help="End the cell when no placement has landed for this long. This "
+        "is the real 'stopped converging' signal, and unlike the cap it does "
+        "not move with cell size. 0 disables it, leaving only the cap.",
+    )
+    run.add_argument(
+        "--submit-gap-ms",
+        type=int,
+        default=0,
+        help="Sleep this long after each submit. Pacing only makes sense on "
+        "the CLI loop, so any non-zero value keeps the run on that path.",
+    )
+    run.add_argument(
+        "--submit-concurrency",
+        type=int,
+        default=None,
+        help="Jobs submitted in parallel. Means the same thing on both paths "
+        f"but defaults differently: {CLI_SUBMIT_CONCURRENCY} on the CLI loop, "
+        f"where each slot is a whole process, and {NATIVE_SUBMIT_CONCURRENCY} "
+        "on the native submitter, where each slot is one in-flight RPC. 1 "
+        "restores the serial loop. On the CLI path this is the setting that "
+        "decides whether a cell measures the scheduler or the driver: at an "
+        "old default of 4 on a 2-vCPU loadgen box, submission ceilinged at "
+        "~36 jobs/sec and phase 4 reported that as Legion throughput while "
+        "the control plane idled at 8% CPU. Check "
+        "`submission.driver_bound` in the output before trusting a number.",
+    )
+    run.add_argument(
+        "--submitter",
+        choices=["auto", "native", "cli"],
+        default="auto",
+        help="How Legion jobs are submitted. `native` uses legion-loadgen, a "
+        "long-lived process holding a few gRPC connections open — the only "
+        "path fast enough to leave the scheduler as the constraint. `cli` "
+        "forces the per-job CLI loop that Nomad and K8s use, and is REQUIRED "
+        "for any cross-system comparison (see this file's fairness rule). "
+        "`auto` (default) takes native when the binary is present and falls "
+        "back to cli with a warning. No effect on nomad/k8s, which have no "
+        "native submitter. The choice is archived as `submitter` in metrics.",
+    )
+    run.add_argument(
+        "--legion-loadgen-bin",
+        default=None,
+        help="Path to legion-loadgen. Default: next to --legion-bin, then PATH.",
+    )
     run.add_argument("--legion-bin", default="legion")
     run.add_argument("--nomad-bin", default="nomad")
     run.add_argument("--kubectl-bin", default="kubectl")

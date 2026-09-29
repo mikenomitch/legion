@@ -20,10 +20,28 @@ Startup (`Store::start_storage`):
 `Store` maintains:
 
 - one write connection (`write_conn`)
-- a small read-only pool (`read_conns`, query-only)
-- round-robin read selection
+- a read-only pool (`read_conns`, query-only)
+- round-robin read selection, with steal-on-contention
 
 This reduces lock contention for read-heavy paths.
+
+The pool holds `evalThreads + 4` connections, capped at 16. Eval workers are
+the manager's concurrent readers, and the `+ 4` covers the readers that are
+not eval workers: worker heartbeats, the read-only gRPC and UI surface, the
+metrics scrape, and the background reconcilers. A reader takes any free
+connection before it queues on a busy one, so one slow query does not stall
+the readers behind it.
+
+The cap exists for memory, not contention. Every connection carries its own
+SQLite page cache capped at 64 MiB (`cache_size = -65536`), and the caches do
+not share — 16 connections is a 1 GiB ceiling for a cluster whose working set
+is large enough to reach it. `cache_size` is a cap that SQLite fills lazily,
+so a small deployment holds only what it reads.
+
+There is no separate configuration field for the pool size; raising
+`evalThreads` widens it. `legion_store_read_lock_wait_seconds`
+([metrics.md](metrics.md)) is how you tell whether it is short — its `le="0"`
+bucket against `_count` is how often a reader found a free connection at once.
 
 ## Read Model Cache
 
@@ -50,10 +68,14 @@ step with the nodes and allocations it came from.
 Main tables (see migrations):
 
 - `node` (identity/pool/attrs/availability), `node_health` (liveness:
-  status, last heartbeat, lost-at marker, health checks — split out so the
-  raft status lane is the table's single writer; readers hydrate `Node` via
-  a `node ⟕ node_health` join, and a node that has not heartbeated yet
-  hydrates registration defaults)
+  status, last heartbeat, lost-at marker, this node's own lost window
+  `lost_after_seconds`, health checks — split out so the raft status lane is
+  the table's single writer; readers hydrate `Node` via a
+  `node ⟕ node_health` join, and a node that has not heartbeated yet
+  hydrates registration defaults). Note that `last_heartbeat` /
+  `last_heartbeat_unix` are **display state**: a steady-state heartbeat
+  writes nothing here, and the columns are refreshed by a periodic
+  checkpoint (see [node-liveness.md](node-liveness.md))
 - `worker_type`
 - `job`, `job_config`, `task_config`, `task_status`, `job_update`
 - `allocation`
@@ -61,9 +83,36 @@ Main tables (see migrations):
 - `manager_config`
 - `kv_entry`, `kv_lock`, `job_kv_reference`
 - `allocation_epoch`, `plan_submission`
+- `node_alloc_usage` — a **cache**, not a source of truth: one row per node
+  holding the aggregated resource usage of that node's allocations, beside a
+  fingerprint of the rows it was derived from **and of the resource policy
+  that normalized them**. Read only by the plan-apply capacity recheck, and
+  only when both fingerprints still match — a row written under a different
+  `taskResourceDefaults`/`customResources` configuration is rebuilt, never
+  served
+  (see [scheduler-and-eval-loop.md](scheduler-and-eval-loop.md#the-per-node-usage-cache))
 - `rollout`, `allocation_health`, `rollout_event`
 - `instance` (stateful identity), `volume` (the storage its handle points at —
   see [volumes.md](volumes.md))
+
+### Column Affinity
+
+JSON payload columns (`allocation.resources`, `plan_submission.placements`,
+`task_config.*`, node attributes, and the rest) are declared `TEXT`. They
+were originally declared `JSONB`, which SQLite's affinity rules silently
+map to NUMERIC affinity — meaning every insert first attempted to parse
+the whole JSON blob as a number before storing it as text (measurable CPU
+waste on the plan-apply and job-intake write paths, for a conversion that
+can never succeed on a JSON object). A migration rebuilds all affected
+tables in place; data, column order, indexes, and rowids are preserved
+exactly, so the change is invisible outside a profiler and a rolling
+manager upgrade across it is safe.
+
+`STRING` and `TIMESTAMP` columns intentionally keep NUMERIC affinity: for
+those, SQLite's numeric conversion can succeed (numeric-looking ids,
+unix-seconds timestamps), so re-typing them would change what is stored
+and break comparisons against existing rows. See the known-limitations
+entry in `internal_docs/TODO.md`.
 
 ## Allocation Epoch and Plan Submission Safety
 
@@ -112,6 +161,18 @@ selects how durable the writes are:
   every manager — replicas cannot diverge. The read-model cache and event
   stream are projected from the committed changeset at apply time, so
   followers get both for free and nothing is visible before quorum commit.
+  That projection is a **delta**: the changeset names exactly which
+  allocation rows moved, so the cache patches those rows instead of
+  reloading every touched node's allocation list, and the cost of a commit
+  follows the size of the change rather than how full the cluster is. A
+  delta cannot repair a cache entry that is already wrong, so three things
+  bound that: any node whose delta contradicts the cache is reloaded in
+  full, any changeset whose allocation records cannot be classified falls
+  back to the full reload wholesale, and one node per projected changeset is
+  reloaded in full on a round-robin sweep of the fleet. The fallbacks log at
+  `warn` naming the allocation ids or nodes involved; they are not expected
+  in a healthy cluster, and repeated occurrences mean the cache and
+  committed state are disagreeing.
   In raft mode, `write_connection()` outside the capture/apply paths fails
   loudly (a runtime bypass guard), so no code path can mutate state
   without replicating it. Snapshots, log compaction, membership, and
@@ -124,7 +185,7 @@ Server-side backups exist in every mode: `legion state backup` (a
 
 ## What Is Not Implemented Yet
 
-- Raft `topology: 'lanes'` (independent per-domain raft groups) is
+- Raft `topology = "lanes"` (independent per-domain raft groups) is
   runnable and measured but stays **opt-in** — `single` remains the
   recommended default. See `docs/multi-raft.md` § "Topology: `single` vs
   `lanes`".

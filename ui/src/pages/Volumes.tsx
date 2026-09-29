@@ -1,6 +1,6 @@
 import { A } from '@solidjs/router'
 import { AccessGate } from '../components/AccessGate'
-import { For, Show, createEffect, createMemo, createResource, createSignal, onCleanup, onMount } from 'solid-js'
+import { For, Show, createEffect, createMemo, createResource, createSignal, onCleanup } from 'solid-js'
 import {
   Badge,
   EmptyState,
@@ -8,6 +8,7 @@ import {
   JumpHint,
   LoadingRows,
   Note,
+  RelativeTime,
   SectionCard,
   StatCard,
   TableShell,
@@ -23,9 +24,8 @@ import {
 } from '../components/ui'
 import { managerClient } from '../grpcClient'
 import { clearCommandPaletteIndexItems, setCommandPaletteIndexItems } from '../utils/commandPalette'
-import { formatRelativeTime } from '../utils/format'
 import { indexHintKey, useIndexJumpTargets } from '../utils/jumpHints'
-import { POLL_INTERVAL_MS } from '../utils/polling'
+import { retainOnError, usePoll } from '../utils/polling'
 import {
   driverScope,
   driverScopeTone,
@@ -37,20 +37,15 @@ import {
 function VolumesContent() {
   const [search, setSearch] = createSignal('')
   const [stateFilter, setStateFilter] = createSignal('live')
-  const [tick, setTick] = createSignal(0)
-
-  onMount(() => {
-    const timer = setInterval(() => setTick((value) => value + 1), POLL_INTERVAL_MS)
-    onCleanup(() => clearInterval(timer))
-  })
+  const tick = usePoll()
 
   const [volumes] = createResource(
     () => tick() + 1,
-    async () => (await managerClient.listVolumes({})).volumes,
+    retainOnError(async () => (await managerClient.listVolumes({})).volumes, () => 'volumes'),
   )
   const [drivers] = createResource(
     () => tick() + 1,
-    async () => (await managerClient.listVolumeDrivers({})).drivers,
+    retainOnError(async () => (await managerClient.listVolumeDrivers({})).drivers, () => 'drivers'),
   )
 
   const filtered = createMemo(() => {
@@ -254,7 +249,7 @@ function VolumesContent() {
                           </Show>
                         </td>
                         <td class={cx(tdClass, 'whitespace-nowrap text-right text-xs text-faint')}>
-                          {formatRelativeTime(volume.updatedAt)}
+                          <RelativeTime value={volume.updatedAt} />
                         </td>
                       </tr>
                     )}

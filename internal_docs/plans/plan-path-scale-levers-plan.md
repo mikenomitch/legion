@@ -1,14 +1,17 @@
 # Plan-Path Scale Levers (lazy version sample, group commit, cheap snapshots)
 
-**Status: SHIPPED** (2026-07-30, all three phases) — graduates proposals
-D4, D5, and D6 from
+**Status: SHIPPED** (2026-07-30, phases 1-3; 2026-08-03, phase 4) —
+graduates proposals D4, D5, and D6 from
 [`scheduler-architecture-review-plan.md`](scheduler-architecture-review-plan.md)
 into one implementation plan; they share machinery (the read-model
 generation counter) and tests (the oversubscription fence suite).
 Before/after numbers in `benchmarks/scheduler/README.md`; public doc in
-`docs/scheduler-and-eval-loop.md`. Deliberately deferred: local-backend
-commit amortization for plan batches (judgement call #6), status-lane
-batching of the post-apply `task_status` projection.
+`docs/scheduler-and-eval-loop.md`.
+
+Phase 4 (2026-08-03) closed the two items phases 1-3 deliberately
+deferred: local-backend commit amortization for plan batches (judgement
+call #6, now reversed) and status-lane batching of the post-apply
+`task_status` projection. Nothing from this plan is outstanding.
 
 > **Judgement calls:** [`../calls/plan-path-scale-levers-plan_calls.md`](../calls/plan-path-scale-levers-plan_calls.md)
 
@@ -202,6 +205,58 @@ near-free, which helps every plan, not just streaks:
 Same effect as the proposal (per-plan snapshot cost stops being a
 measured phase), no staleness, no cache invalidation logic.
 
+### 5. Phase 4 — the two costs D5 left on the table
+
+D5 shipped the coalescer but paid its amortization only under raft, and
+only for the plan write itself. Two per-plan costs survived it:
+
+1. **Local backends still committed per plan.** The batch ran its
+   members back-to-back, each with its own commit, because a plan's
+   post-apply read-model refresh reads committed state through the read
+   connections — mid-batch it would publish a mirror missing the batch's
+   own placements (judgement call #6). One fsync per plan is exactly the
+   cost group commit exists to remove, and `local_disk` is the default
+   backend.
+2. **The status projection stayed per plan.** Lifecycle-derived
+   `task_status` transitions are a status-lane write that follows the
+   scheduler-lane apply, run by each submitter after the coalescer
+   returned (`plan_apply_bookkeeping`). A batch of N plans therefore
+   paid one plan commit *plus N status writes* — N more raft rounds
+   under `lanes`.
+
+Both fall out of one structural change: **make the batch a real
+transaction and give the plan body a transaction to run in.**
+
+- `apply_plan_submission_on(tx, submission)` and
+  `submit_and_apply_plan_on(tx, request)` carry the existing bodies,
+  unchanged, against a caller-supplied connection. The single-plan ops
+  wrap them in their own transaction; the group commit opens ONE
+  transaction for the whole batch and runs each plan inside its own
+  `legion_plan_batch_item` savepoint.
+- The batch **holds the write connection** for the whole transaction,
+  like every other multi-statement write in the store. This is what
+  makes the amortization safe: without it an unrelated writer could
+  open its transaction inside the batch's, where its commit would not
+  be durable until the batch's and its own read-model refresh would
+  read pre-batch state. (An outer savepoint with the connection
+  released between plans — the obvious smaller change — has exactly
+  that hole.)
+- The plan body stops *performing* its side effects and **returns**
+  them (`PlanApplyEffects`: staged events, touched allocation scopes).
+  The transaction's owner emits them after the commit: events in id
+  order, then one coherent read-model refresh over the union of the
+  batch's scopes. Under capture both funnels no-op as before and the
+  raft apply path re-projects from the committed changeset (JC-11).
+- The batch leader runs the batch's **post-apply bookkeeping** once —
+  one epoch self-heal over every rejected plan's scopes, one status-lane
+  `task_status` projection over every allocation the batch placed — and
+  tells each submitter it is done (`PlanApplySlot::bookkeeping_done`).
+  If the batched bookkeeping fails, submitters run their own, so a hard
+  error is still attributed to the plan that caused it.
+
+Surface: none. No new config key — `plan_apply_coalescing: false` still
+restores the pre-D5 shape end to end.
+
 ## Config surface
 
 ```jsonnet
@@ -226,6 +281,9 @@ No proto, wire, or on-disk changes. No migration.
    `capacity_snapshot` phases.
 3. **D5 group commit** (coalescer + batched store op + config gates).
    Ships alone; benchmark with a concurrent driver (see below).
+4. **Batch-as-a-transaction** (`_on(tx, …)` seams, returned effects,
+   batched bookkeeping). Ships alone; benchmark local_disk and raft1
+   with a concurrent driver, and assert the commit count directly.
 
 ## Testing plan
 
@@ -245,6 +303,23 @@ No proto, wire, or on-disk changes. No migration.
   per phase; a new concurrent driver mode
   (`LEGION_BENCH_CONCURRENCY=N`) so group commit is actually exercised;
   SLO gate stays green.
+- Phase 4 adds, in `src/storage/store.rs`:
+  - `local_plan_batch_commits_once_and_projects_statuses_once` — a
+    SQLite **commit hook** counts the transactions that actually reach
+    the disk. Three plans applied singly cost 6 commits (one each, plus
+    one status projection each); the same three batched cost 2 (one for
+    the batch, one for its status projection). This asserts the
+    amortization mechanically rather than inferring it from a timing.
+  - `local_plan_batch_publishes_one_read_model_refresh_after_its_commit`
+    — the read-model generation advances exactly once for a batch, and
+    the mirror agrees with the committed rows afterwards (a
+    mid-transaction refresh would have left it empty).
+  - `local_plan_batch_broadcasts_no_event_before_it_commits` — the
+    commit hook samples how many events had been broadcast when the
+    batch committed; it must be zero, and all of them must arrive after.
+  - the existing `plan_batch_isolates_batch_mate_outcomes` and
+    `plan_batch_keeps_per_plan_cas_verdicts` now cover per-item
+    savepoint isolation on the local path too.
 
 ## Rollout
 
@@ -278,3 +353,13 @@ compatibility concern (all state shapes unchanged).
   `benchmarks/scheduler/README.md`; the coalescer mechanism itself
   measures 5.3–6.7x on the CAS-free heartbeat path.** Partially met —
   accepted with the late-binding plan as the named follow-up.
+- Phase 4: a batch commits once on local backends and projects task
+  statuses once, with the fence suite and every raft suite green.
+  **Measured: a 3-plan batch drops from 6 disk commits to 2 (SQLite
+  commit hook, exact); a conflict-free batch of 16 on `local_disk`
+  drops from 31.99 ms to 4.33 ms (7.4x, medians of 20 reps). The macro
+  matrix does not resolve the change — run-to-run spread on this host
+  (raft1 `steady-small`: 29.0/40.2/52.3 evals/s across three identical
+  runs) exceeds any delta, and those cells are conflict-bound at
+  112-129%. Recorded that way in `benchmarks/scheduler/README.md`.
+  Full suite green.** ✓

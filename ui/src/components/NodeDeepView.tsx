@@ -1,20 +1,24 @@
 import { A } from '@solidjs/router'
-import { For, Show, createMemo, createResource, createSignal, onCleanup, onMount, type JSX, type Resource } from 'solid-js'
-import { Badge, CodeBlock, Icon, MonoBadge, Note, PageHeader, SectionCard, Spinner, StatusBadge, TableShell, cx, tableClass, tdClass, thClass, theadClass, trHoverClass } from './ui'
+import { For, Show, createMemo, createResource, createSignal, type JSX, type Resource } from 'solid-js'
+import { Badge, CodeBlock, Icon, MonoBadge, Note, PageHeader, RelativeTime, SectionCard, Spinner, StatusBadge, TableShell, cx, tableClass, tdClass, thClass, theadClass, trHoverClass } from './ui'
+import NodeAvailabilityControls, { type AvailabilityOutcome } from './NodeAvailabilityControls'
 import { AllocationPorts } from './ServiceEndpoints'
 import type { LedgerAllocation, LedgerNode, NodeMsg } from '../gen/legion_pb'
 import { parseAllocNetwork } from '../utils/allocations'
-import { formatBytes, formatRelativeTime } from '../utils/format'
+import { formatBytes, heartbeatFreshnessHint, pluralize } from '../utils/format'
 import { summarizeHealthChecks } from '../utils/health'
 import { parseArtifactStates } from '../utils/jobspec'
 import { managerClient } from '../grpcClient'
-import { POLL_INTERVAL_MS } from '../utils/polling'
+import { retainOnError, usePoll } from '../utils/polling'
 import type { Tone } from '../utils/status'
 import { shortVolumeId, volumePinsPlacement, volumeStateTone } from '../utils/volumes'
 
 export interface NodeDeepViewProps {
   nodes: Resource<readonly NodeMsg[] | undefined>
   ledger: Resource<readonly LedgerNode[] | undefined>
+  // Called after an operator action (cordon/drain/uncordon) so the owner can
+  // refetch right away instead of waiting for the next poll.
+  onChanged?: () => void
 }
 
 const isPlainObject = (value: unknown): value is Record<string, unknown> =>
@@ -505,20 +509,20 @@ const DEFAULT_SECTION_STATE: Record<NodeSectionKey, boolean> = {
 
 export default function NodeDeepView(props: NodeDeepViewProps) {
   const [sectionOpen, setSectionOpen] = createSignal(DEFAULT_SECTION_STATE)
-  const [volumeTick, setVolumeTick] = createSignal(0)
-  onMount(() => {
-    const timer = setInterval(() => setVolumeTick((value) => value + 1), POLL_INTERVAL_MS)
-    onCleanup(() => clearInterval(timer))
-  })
+  const [outcome, setOutcome] = createSignal<AvailabilityOutcome | null>(null)
+  const volumeTick = usePoll()
   // Volumes living on this node. Losing the node means losing (or at least
   // stranding) these, so they belong on the node page, not just the job's.
   const [nodeVolumes] = createResource(
-    () => [props.nodes()?.[0]?.id, volumeTick()] as const,
-    async ([nodeId]) => {
-      if (!nodeId) return []
-      const reply = await managerClient.listVolumes({ nodeId })
-      return reply.volumes.filter((volume) => volume.state !== 'destroyed')
-    },
+    () => [props.nodes.latest?.[0]?.id, volumeTick()] as const,
+    retainOnError(
+      async ([nodeId]: readonly [string | undefined, number]) => {
+        if (!nodeId) return []
+        const reply = await managerClient.listVolumes({ nodeId })
+        return reply.volumes.filter((volume) => volume.state !== 'destroyed')
+      },
+      ([nodeId]) => nodeId ?? '',
+    ),
   )
   const allocationsByNode = createMemo(() => {
     const map = new Map<string, readonly LedgerAllocation[]>()
@@ -595,33 +599,68 @@ export default function NodeDeepView(props: NodeDeepViewProps) {
   })
 
   return (
-    <Show when={!props.nodes.loading} fallback={<div class="py-6"><Spinner label="Loading worker…" /></div>}>
-      <Show when={!props.nodes.error} fallback={<Note tone="danger">Failed to load worker.</Note>}>
+    <Show when={!props.nodes.error} fallback={<Note tone="danger">Failed to load worker: {String(props.nodes.error?.message ?? props.nodes.error)}</Note>}>
+      <Show when={props.nodes() !== undefined} fallback={<div class="py-6"><Spinner label="Loading worker…" /></div>}>
         <Show when={node()} fallback={<Note tone="warn">Worker not found.</Note>}>
           {(currentNode) => {
-            const current = currentNode()
-            const parsed = parsedNodeData()
-            if (!parsed) return null
+            // Accessors, not snapshots: the page polls, and a value captured
+            // here once would show the node as it was on first render.
+            const current = () => currentNode()
+            const parsed = () => parsedNodeData()!
             return (
               <div>
                 <PageHeader
                   eyebrow="Worker"
-                  title={current.id || 'Unknown worker'}
+                  title={current().id || 'Unknown worker'}
                   badges={
                     <>
-                      <StatusBadge status={current.status || 'unknown'} />
-                      <Badge tone={parsed.healthSummary.tone} dot class="uppercase tracking-wide">{parsed.healthSummary.label}</Badge>
-                      <Badge tone="neutral">{allocations().length} allocation{allocations().length === 1 ? '' : 's'}</Badge>
+                      <StatusBadge status={current().status || 'unknown'} />
+                      <Badge tone={parsed().healthSummary.tone} dot class="uppercase tracking-wide">{parsed().healthSummary.label}</Badge>
+                      <Show when={current().availability && current().availability !== 'available'}>
+                        <Badge
+                          tone={current().availability === 'drained' ? 'warn' : 'danger'}
+                          dot
+                          class="uppercase tracking-wide"
+                          title="Availability: the scheduler only places new work on available nodes"
+                        >
+                          {current().availability}
+                        </Badge>
+                      </Show>
+                      <Badge tone="neutral">{pluralize(allocations().length, 'allocation')}</Badge>
                     </>
                   }
                   subtitle={
                     <>
-                      Pool {current.pool || 'default'} · availability {current.availability || '—'} · heartbeat {formatRelativeTime(current.lastHeartbeat)}
+                      Pool {current().pool || 'default'} · availability {current().availability || '—'} · heartbeat{' '}
+                      <RelativeTime value={current().lastHeartbeat} title={heartbeatFreshnessHint(current().heartbeatSource)} />
                     </>
+                  }
+                  actions={
+                    <NodeAvailabilityControls
+                      node={current()}
+                      onOutcome={(result) => {
+                        setOutcome(result)
+                        props.onChanged?.()
+                      }}
+                    />
                   }
                 />
 
                 <div class="space-y-4">
+                  <Show when={outcome()}>
+                    {(result) => (
+                      <div aria-live="polite">
+                        <Note tone={result().failed ? 'danger' : 'ok'} onDismiss={() => setOutcome(null)}>{result().message}</Note>
+                      </div>
+                    )}
+                  </Show>
+                  <Show when={current().availability === 'drained'}>
+                    <Note tone="warn">
+                      <span class="font-medium">This node is out of the scheduling pool.</span> Nothing new is placed
+                      here until it is uncordoned. Allocations that were evicted by a drain reschedule elsewhere;
+                      stateful ones stay under their <code class="font-mono text-xs">stateful.onLost</code> policy.
+                    </Note>
+                  </Show>
                   <SectionCard title="Allocations" flush>
                     <Show when={allocations().length > 0} fallback={<p class="px-4 py-4 text-sm text-muted">No allocations assigned.</p>}>
                       <TableShell>
@@ -711,7 +750,7 @@ export default function NodeDeepView(props: NodeDeepViewProps) {
                     <div class="p-3.5">
                       <div class="mb-3 flex items-center justify-between">
                         <p class="text-xs text-muted">Overall status</p>
-                        <Badge tone={parsed.healthSummary.tone} dot class="uppercase tracking-wide">{parsed.healthSummary.label}</Badge>
+                        <Badge tone={parsed().healthSummary.tone} dot class="uppercase tracking-wide">{parsed().healthSummary.label}</Badge>
                       </div>
                       <Show
                         when={healthEntries().length > 0}

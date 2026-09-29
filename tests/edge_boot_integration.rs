@@ -46,6 +46,7 @@ fn node(id: &str) -> NodeMsg {
         pool: "edge-eu".into(),
         availability: "available".into(),
         last_heartbeat: "now".into(),
+        heartbeat_source: String::new(),
         config_attrs: json!({
             "workerAddress": format!("http://{id}:4848"),
             "protocolVersion": 2,
@@ -97,7 +98,7 @@ fn submit(store: &Store) -> R<String> {
     store.handle_job_submit(
         &config,
         &[legion::structs::Submission {
-            path: "job.jsonnet".into(),
+            path: "job.ncl".into(),
             content: "{}".into(),
             is_primary: true,
         }],

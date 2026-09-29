@@ -1127,6 +1127,80 @@ impl MultiRaftDriver {
         }
     }
 
+    /// The lane's current leader address, when this node knows one.
+    pub(crate) fn lane_leader_addr(&self, lane: Lane) -> Option<String> {
+        self.not_leader_error(lane).leader_addr
+    }
+
+    /// Send one liveness digest to the status-lane leader (liveness plan
+    /// §6.3).
+    ///
+    /// Async by design: the caller is the status-checker loop, which is
+    /// already on the manager's runtime, and a digest is a fire-and-forget
+    /// report rather than a write whose result anything waits on. Nothing here
+    /// blocks a heartbeat.
+    pub(crate) async fn send_liveness_digest(
+        &self,
+        observer_manager_id: String,
+        node_ids: Vec<String>,
+    ) -> crate::storage::liveness::DigestOutcome {
+        use crate::storage::liveness::DigestOutcome;
+
+        let Some(engine) = self.engine.get() else {
+            return DigestOutcome::NoEngine;
+        };
+        let Some(leader_addr) = self.lane_leader_addr(Lane::Status) else {
+            return DigestOutcome::NoLeader;
+        };
+        let Ok(secret) = engine
+            .cluster_secret
+            .parse::<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>()
+        else {
+            return DigestOutcome::Error("cluster secret is not valid ascii".into());
+        };
+        let channel = match engine.pool.get(&leader_addr) {
+            Ok(channel) => channel,
+            Err(err) => {
+                return DigestOutcome::Error(format!(
+                    "malformed status-lane leader address {leader_addr}: {err}"
+                ))
+            }
+        };
+        let mut client = crate::structs::raft_transport_client::RaftTransportClient::new(channel)
+            .max_decoding_message_size(crate::storage::raft::network::RAFT_MAX_MESSAGE_BYTES)
+            .max_encoding_message_size(crate::storage::raft::network::RAFT_MAX_MESSAGE_BYTES);
+        let mut request = tonic::Request::new(crate::structs::NodeLivenessDigestRequest {
+            protocol_version: crate::constants::PROTOCOL_VERSION,
+            observer_manager_id,
+            observed_at_unix_ms: time::OffsetDateTime::now_utc().unix_timestamp() * 1_000,
+            seen_node_ids: node_ids,
+        });
+        request.set_timeout(FORWARD_LANE_WRITE_TIMEOUT);
+        request
+            .metadata_mut()
+            .insert(RAFT_CLUSTER_SECRET_METADATA_KEY, secret);
+        match client.report_node_liveness(request).await {
+            Ok(reply) => {
+                let reply = reply.into_inner();
+                if reply.accepted {
+                    DigestOutcome::Accepted
+                } else {
+                    DigestOutcome::NotLeader {
+                        leader_hint: reply.leader_hint,
+                    }
+                }
+            }
+            // A manager that predates liveness digests answers `Unimplemented`
+            // — the identical degradation `ForwardLaneWrite` shipped with, and
+            // the identical remedy: finish the roll. Until then the sender
+            // falls back to forwarding each heartbeat as a replicated write.
+            Err(status) if status.code() == tonic::Code::Unimplemented => {
+                DigestOutcome::Unimplemented
+            }
+            Err(status) => DigestOutcome::Error(status.to_string()),
+        }
+    }
+
     /// Partition test hook: block/unblock every outbound raft transport RPC
     /// from this node (see `Store::raft_set_outbound_blocked` and
     /// `ChannelPool::set_outbound_blocked`). Errors before engine start.
@@ -1371,7 +1445,9 @@ fn execute_replicated(
     {
         let metrics = raft.metrics().borrow().clone();
         if metrics.state != ServerState::Leader {
-            telemetry.raft_ops_total.inc(&[metric_lane, "not_leader"]);
+            telemetry
+                .raft_ops_total
+                .inc(&[metric_lane, op, "not_leader"]);
             let context = match lane_label {
                 Some(lane) => format!("raft op {op} must run on the {lane} lane's leader"),
                 None => format!("raft op {op} must run on the leader"),
@@ -1392,7 +1468,7 @@ fn execute_replicated(
     let (value, changeset) = match captured {
         Ok(captured) => captured,
         Err(error) => {
-            telemetry.raft_ops_total.inc(&[metric_lane, "error"]);
+            telemetry.raft_ops_total.inc(&[metric_lane, op, "error"]);
             return Err(error);
         }
     };
@@ -1400,7 +1476,7 @@ fn execute_replicated(
         // The mutation touched no rows (e.g. an idempotent no-op): there is
         // no effect to replicate and nothing another replica could apply, so
         // skip the raft entry entirely.
-        telemetry.raft_ops_total.inc(&[metric_lane, "empty"]);
+        telemetry.raft_ops_total.inc(&[metric_lane, op, "empty"]);
         return Ok(value);
     }
     // Capture-time single-writer ownership guard (plan §7-C2, JC-26): every
@@ -1426,9 +1502,9 @@ fn execute_replicated(
         .raft_propose_apply_seconds
         .observe(&[metric_lane], propose_elapsed.as_secs_f64());
     match write_result {
-        Ok(_) => telemetry.raft_ops_total.inc(&[metric_lane, "applied"]),
+        Ok(_) => telemetry.raft_ops_total.inc(&[metric_lane, op, "applied"]),
         Err(err) => {
-            telemetry.raft_ops_total.inc(&[metric_lane, "error"]);
+            telemetry.raft_ops_total.inc(&[metric_lane, op, "error"]);
             return Err(map_write_error(op, lane_label, err));
         }
     }

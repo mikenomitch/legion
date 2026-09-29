@@ -14,7 +14,7 @@ and the UI shows a dismissable warning. Design rationale and roadmap live in
 
 ```bash
 # 1. Enable ACLs in the manager config and restart the manager.
-#    configs/manager.jsonnet:
+#    configs/manager.ncl:
 #      acl: { enabled: true },
 
 # 2. Mint the one-time initial management token.
@@ -45,11 +45,12 @@ legion acl whoami
 | `state` | raw state store, saved queries | SQL reads, schema | SQL writes, saved queries |
 | `operator` | raft, manager configs, observability | status/history/logs | raft commands, raft join tokens |
 | `acl` | tokens, policies, users | list/get | create/update/delete |
-| `exec` | exec into a running allocation | — | open a session (`host: true` for host-level runtimes) |
+| `exec` | exec into a running allocation | — | open a session (`host = true` for host-level runtimes) |
 | `action` | run declared actions on an allocation | — | run an action (scope with `action_names`) |
 | `template` | job templates | list/inspect | publish versions, delete (scope with `templates`) |
 | `scale` | task count overrides ([Scaling Jobs](autoscaling.md)) | scale status | `job scale` / reset (scope by job name) — deliberately separate from `job:write`, so a principal can resize without redeploy rights |
 | `boot` | boot tickets ([Edge Boot](edge-boot.md)) | list outstanding tickets | mint a ticket (scope by job name) — separate from `job:write` for the same reason `scale` is: a platform's ticket minter authorizes individual starts without the right to redeploy the fleet |
+| `net` | network policy objects ([Network Handlers](network-handlers.md)) | list policies; show or test a job's effective policy (scope by job name) | apply or delete a policy — scope with `pools`, which is matched against the policy's own `selector.nodePools`, so a pool's admin can set posture for their pool without cluster-wide write |
 
 Actions are `read` and `write` (`write` does not imply `read`; grant both).
 `state:read` is powerful — it can read every table in the state store —
@@ -59,13 +60,13 @@ grant it sparingly.
 
 A policy is a named JSON array of rules:
 
-```jsonnet
+```nickel
 [
-  { resources: ["job"],  actions: ["read", "write"], names: ["web-*"] },
-  { resources: ["kv"],   actions: ["read"],          paths: ["team-a/*"] },
-  { resources: ["node"], actions: ["read"],          pools: ["gpu-*"] },
-  // explicit deny always wins, across all attached policies:
-  { resources: ["*"],    actions: ["*"], effect: "deny", paths: ["team-a/secrets/*"] },
+  { resources = ["job"],  actions = ["read", "write"], names = ["web-*"] },
+  { resources = ["kv"],   actions = ["read"],          paths = ["team-a/*"] },
+  { resources = ["node"], actions = ["read"],          pools = ["gpu-*"] },
+  # explicit deny always wins, across all attached policies:
+  { resources = ["*"],    actions = ["*"], effect = "deny", paths = ["team-a/secrets/*"] },
 ]
 ```
 
@@ -77,17 +78,17 @@ A policy is a named JSON array of rules:
   `templates` (job-template names), and `bands` (job priority bands). A rule
   with a selector only matches requests carrying that attribute.
 - List endpoints filter to what the caller can read: a token scoped to
-  `paths: ["team-a/*"]` sees only `team-a/` keys in `legion kv list`.
+  `paths = ["team-a/*"]` sees only `team-a/` keys in `legion kv list`.
 
 **Restricting an account to specific job templates.** Because a rule with a
 selector never matches a request lacking that attribute, a `job` rule
 carrying `templates` grants submission *only through* those templates —
 raw `legion job run` stays denied:
 
-```jsonnet
+```nickel
 [
-  { resources: ["template"], actions: ["read"], templates: ["render"] },
-  { resources: ["job"], actions: ["read", "write"], templates: ["render"] },
+  { resources = ["template"], actions = ["read"], templates = ["render"] },
+  { resources = ["job"], actions = ["read", "write"], templates = ["render"] },
 ]
 ```
 
@@ -102,14 +103,14 @@ collision guard and which endpoints carry the template attribute.
 band means nothing — everyone sets it. The `bands` selector on `job` rules is
 the gate:
 
-```jsonnet
+```nickel
 [
-  // prod owners may claim anything, including the never-preempted top band
-  { resources: ["job"], actions: ["write"], namespaces: ["prod"],
-    bands: ["critical", "high", "elevated", "normal", "low", "background"] },
-  // everyone else tops out at `high`
-  { resources: ["job"], actions: ["read", "write"],
-    bands: ["high", "elevated", "normal", "low", "background"] },
+  # prod owners may claim anything, including the never-preempted top band
+  { resources = ["job"], actions = ["write"], namespaces = ["prod"],
+    bands = ["critical", "high", "elevated", "normal", "low", "background"] },
+  # everyone else tops out at `high`
+  { resources = ["job"], actions = ["read", "write"],
+    bands = ["high", "elevated", "normal", "low", "background"] },
 ]
 ```
 
@@ -126,7 +127,7 @@ Three things worth knowing:
 A refused submit names the band:
 
 ```console
-$ legion job run api.jsonnet   # priority: 'critical'
+$ legion job run api.ncl   # priority: 'critical'
 error: permission denied: this token's policy does not allow submitting jobs
 in the `critical` priority band (see the `bands` selector in
 docs/auth-and-acls.md)
@@ -137,8 +138,10 @@ and observability, so gating bands on it would make everyone who may submit a
 critical job a raft administrator, and it could not express "team A may use
 `critical` in their namespace".
 
-Manage with `legion acl policy apply|list|get|delete`. Files can be JSON or
-Jsonnet (either a bare rules array or `{description, rules}`).
+Manage with `legion acl policy apply|list|get|delete`. A policy file is Nickel
+(`.ncl`) or JSON (`.json`), read by the same rules as every other Legion
+config — see [Configuration Language](configuration-language.md). Either shape
+works: a bare rules array, or `{description, rules}`.
 
 ### Tokens
 
@@ -149,7 +152,7 @@ credential), attached policy names, and an optional expiry. Create/inspect/
 revoke with `legion acl token create|list|delete`. Only a management token
 can create another management token.
 
-Lifetime bounds: set `acl: { tokenMaxTtl: "720h" }` to require every client
+Lifetime bounds: set `acl = { tokenMaxTtl = "720h" }` to require every client
 token (created or login-minted) to expire within the bound; management
 tokens are exempt. Expired ACL and join tokens are rejected at
 authentication time and pruned hourly.
@@ -189,7 +192,7 @@ Built-in methods:
   Access page offers the same as a "Continue with <method>" button (redirect
   URI `<ui origin>/oidc/callback`). Binding rules map verified claims (for
   example `groups`) onto policies.
-- **Webhook**: `type: "webhook"` delegates verification to your own HTTP
+- **Webhook**: `type = "webhook"` delegates verification to your own HTTP
   endpoint — the recommended way to integrate LDAP, SAML bridges, or bespoke
   identity systems in any language. Legion POSTs
   `{"method", "username", "password", "jwt"}` and expects
@@ -201,21 +204,21 @@ Custom identity sources can also be registered programmatically through the
 same `AuthMethod` interface when embedding Legion as a library
 (`Authenticator::register_method`) — see [docs/plugin-system.md](plugin-system.md).
 
-```jsonnet
-acl: {
-  enabled: true,
-  authMethods: [
+```nickel
+acl = {
+  enabled = true,
+  authMethods = [
     {
-      name: "corp-oidc",
-      type: "oidc",                      // or "jwt" with jwksUrl/jwksJson/hmacSecret
-      issuer: "https://idp.example.com",
-      boundAudiences: ["legion"],
-      userClaim: "email",
-      bindingRules: [
-        { claim: "groups", value: "platform", policies: ["ops"] },
-        { policies: ["base-read"] },     // unconditional
+      name = "corp-oidc",
+      type = "oidc",                      # or "jwt" with jwksUrl/jwksJson/hmacSecret
+      issuer = "https://idp.example.com",
+      boundAudiences = ["legion"],
+      userClaim = "email",
+      bindingRules = [
+        { claim = "groups", value = "platform", policies = ["ops"] },
+        { policies = ["base-read"] },     # unconditional
       ],
-      tokenTtl: "8h",
+      tokenTtl = "8h",
     },
   ],
 },
@@ -225,7 +228,7 @@ acl: {
 
 Two ramps for enabling ACLs on a live cluster without breaking anyone:
 
-1. **Audit-only**: `acl: { enabled: true, auditOnly: true }` — every denial
+1. **Audit-only**: `acl = { enabled = true, auditOnly = true }` — every denial
    is logged (tracing target `acl_audit`, with principal, accessor ID,
    resource, action, and scope) but allowed. Watch the log, write policies,
    then drop `auditOnly`.
@@ -274,9 +277,9 @@ below already covers transport encryption).
 
 The manager listener serves TLS when configured:
 
-```jsonnet
-server: {
-  tls: { enabled: true, certPath: "/etc/legion/server.pem", keyPath: "/etc/legion/server.key" },
+```nickel
+server = {
+  tls = { enabled = true, certPath = "/etc/legion/server.pem", keyPath = "/etc/legion/server.key" },
 },
 ```
 

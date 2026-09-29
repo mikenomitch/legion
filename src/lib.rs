@@ -1,6 +1,7 @@
 pub mod artifacts;
 pub mod certs;
 pub mod cmd;
+pub mod config_lang;
 pub mod constants;
 pub mod constraints;
 pub mod manager;

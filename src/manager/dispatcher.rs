@@ -6,8 +6,52 @@ use crate::structs::{
     TaskConfig,
 };
 use std::collections::HashMap;
+use std::sync::{Arc, OnceLock};
 use tokio::runtime::RuntimeFlavor;
+use tokio::sync::Semaphore;
 use tonic::transport::{Channel, Endpoint};
+
+/// Cap on concurrently in-flight `PostWork` sends across all evals.
+///
+/// Detached dispatch means eval workers no longer provide natural
+/// backpressure: a burst of evals could otherwise pile up an unbounded set
+/// of RPC tasks. The cap only bounds concurrency — sends past it queue on
+/// the semaphore, they are not dropped — and it is deliberately generous:
+/// the real volume is bounded by evals in flight times allocations per
+/// eval, and a send is one small unary RPC.
+const MAX_IN_FLIGHT_DISPATCHES: usize = 512;
+
+fn dispatch_permits() -> Arc<Semaphore> {
+    static PERMITS: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    Arc::clone(PERMITS.get_or_init(|| Arc::new(Semaphore::new(MAX_IN_FLIGHT_DISPATCHES))))
+}
+
+/// Process-wide worker channel cache.
+///
+/// `dispatch_allocations` used to build a fresh lazy channel per CALL, so
+/// every eval re-dialed every worker it placed onto — a sampled manager
+/// under load showed `__connect` among its top kernel calls (~350
+/// connects/sec locally; an eval touching 44 workers at rig rates implies
+/// ~1,300/sec). A tonic `Channel` multiplexes and reconnects on its own,
+/// so one per worker address for the life of the process is the correct
+/// shape. Entries are never evicted: the value is a cheap handle, the key
+/// space is the fleet's address set, and a dead worker's channel simply
+/// fails sends until the address disappears from placements.
+fn cached_worker_client(address: &str) -> R<WorkerClient<Channel>> {
+    static CLIENTS: OnceLock<std::sync::Mutex<HashMap<String, WorkerClient<Channel>>>> =
+        OnceLock::new();
+    let cache = CLIENTS.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let mut guard = cache
+        .lock()
+        .map_err(|_| anyhow::anyhow!("worker client cache poisoned"))?;
+    if let Some(client) = guard.get(address) {
+        return Ok(client.clone());
+    }
+    let endpoint = Endpoint::from_shared(address.to_owned())?;
+    let client = WorkerClient::new(endpoint.connect_lazy());
+    guard.insert(address.to_owned(), client.clone());
+    Ok(client)
+}
 
 #[instrument(err, skip_all)]
 pub fn dispatch_allocations(store: &Store, allocations: &[Allocation]) -> R<()> {
@@ -18,83 +62,132 @@ pub fn dispatch_allocations(store: &Store, allocations: &[Allocation]) -> R<()> 
     let mut task_cache: HashMap<String, HashMap<i64, TaskConfig>> = HashMap::new();
     let mut node_cache: HashMap<String, crate::structs::Node> = HashMap::new();
 
-    run_dispatch_future(async {
-        let mut clients: HashMap<String, WorkerClient<Channel>> = HashMap::new();
-        for allocation in allocations {
-            let tasks = task_cache
-                .entry(allocation.job_config_id.clone())
-                .or_default();
-            if tasks.is_empty() {
-                let task_configs =
-                    store.get_task_configs_for_job_config(&allocation.job_config_id)?;
-                for (id, config) in task_configs {
-                    tasks.insert(id, config);
-                }
+    // Requests are built first, synchronously: it is all local store reads,
+    // a build failure is a real error that must fail the eval, and the
+    // caches make those reads cheap.
+    let mut pending: Vec<(String, crate::structs::PostWorkRequest, i64, String)> =
+        Vec::with_capacity(allocations.len());
+    let mut clients: HashMap<String, WorkerClient<Channel>> = HashMap::new();
+
+    for allocation in allocations {
+        let tasks = task_cache
+            .entry(allocation.job_config_id.clone())
+            .or_default();
+        if tasks.is_empty() {
+            let task_configs = store.get_task_configs_for_job_config(&allocation.job_config_id)?;
+            for (id, config) in task_configs {
+                tasks.insert(id, config);
             }
-            let task = tasks
-                .get(&allocation.task_config_id)
-                .with_context(|| format!("Missing task config {}", allocation.task_config_id))?;
+        }
+        let task = tasks
+            .get(&allocation.task_config_id)
+            .with_context(|| format!("Missing task config {}", allocation.task_config_id))?;
 
-            if !node_cache.contains_key(&allocation.node_id) {
-                let node = store.get_node(&allocation.node_id)?;
-                node_cache.insert(allocation.node_id.clone(), node);
-            }
-            let node = node_cache
-                .get(&allocation.node_id)
-                .context("Missing node in cache")?;
-            let Some(worker_address) = worker_address_for_node(node) else {
-                warn!(
-                    node_id = %allocation.node_id,
-                    "Skipping allocation dispatch; worker address missing"
-                );
-                continue;
-            };
-
-            let instance = match allocation.instance_id.as_deref() {
-                Some(instance_id) => store.get_instance(instance_id)?,
-                None => None,
-            };
-            // Volume mounts are resolved here (not on the worker) so the
-            // worker receives concrete volume ids and the driver attrs from
-            // previous mounts, and never re-derives storage from a jobspec.
-            let volumes =
-                store.volume_mounts_for_allocation(&allocation.job_id, task, instance.as_ref())?;
-            let task_allocation =
-                build_task_allocation(task, allocation, instance.as_ref(), &volumes)?;
-            let request = crate::structs::PostWorkRequest {
-                allocation: Some(task_allocation),
-            };
-
-            let client = if let Some(client) = clients.get_mut(&worker_address) {
-                client
-            } else {
-                let endpoint = Endpoint::from_shared(worker_address.clone())?;
-                let channel = endpoint.connect_lazy();
-                clients.insert(worker_address.clone(), WorkerClient::new(channel));
-                clients
-                    .get_mut(&worker_address)
-                    .context("Failed to build worker client")?
-            };
-
-            if let Err(err) = client.post_work(request).await {
-                warn!(
-                    allocation_id = allocation.id,
-                    node_id = %allocation.node_id,
-                    error = ?err,
-                    "Failed to dispatch allocation to worker"
-                );
-                continue;
-            }
-            info!(
-                allocation_id = allocation.id,
+        if !node_cache.contains_key(&allocation.node_id) {
+            let node = store.get_node(&allocation.node_id)?;
+            node_cache.insert(allocation.node_id.clone(), node);
+        }
+        let node = node_cache
+            .get(&allocation.node_id)
+            .context("Missing node in cache")?;
+        let Some(worker_address) = worker_address_for_node(node) else {
+            warn!(
                 node_id = %allocation.node_id,
-                "Dispatched allocation to worker"
+                "Skipping allocation dispatch; worker address missing"
+            );
+            continue;
+        };
+
+        let instance = match allocation.instance_id.as_deref() {
+            Some(instance_id) => store.get_instance(instance_id)?,
+            None => None,
+        };
+        // Volume mounts are resolved here (not on the worker) so the
+        // worker receives concrete volume ids and the driver attrs from
+        // previous mounts, and never re-derives storage from a jobspec.
+        let volumes =
+            store.volume_mounts_for_allocation(&allocation.job_id, task, instance.as_ref())?;
+        let task_allocation = build_task_allocation(task, allocation, instance.as_ref(), &volumes)?;
+        let request = crate::structs::PostWorkRequest {
+            allocation: Some(task_allocation),
+        };
+
+        if !clients.contains_key(&worker_address) {
+            clients.insert(
+                worker_address.clone(),
+                cached_worker_client(&worker_address)?,
             );
         }
-        Ok::<(), anyhow::Error>(())
-    })?;
+        pending.push((
+            worker_address,
+            request,
+            allocation.id,
+            allocation.node_id.clone(),
+        ));
+    }
 
-    Ok(())
+    // The sends leave the eval's critical path entirely. Dispatch is
+    // best-effort BY DESIGN — the heartbeat reply carries the full desired
+    // set, so a lost push costs at most one heartbeat interval — and the
+    // eval's outcome is already durable once the plan commits, so there is
+    // nothing correct about making the eval worker wait for worker RPCs.
+    // The wait was most of the gap between `legion_eval_handle_seconds`
+    // (~272 ms at 100k allocations) and the plan path (~94 ms): worker
+    // round trips billed to the scheduler's throughput.
+    //
+    // Each send still takes a permit from a global cap, so a burst of
+    // evals queues sends instead of accumulating unbounded RPC tasks.
+    let sends = pending.into_iter().map(|(address, request, id, node_id)| {
+        let mut client = clients
+            .get(&address)
+            .expect("client inserted above")
+            .clone();
+        let permits = dispatch_permits();
+        async move {
+            // Closed-semaphore is impossible (it is never closed); treat
+            // an error like a dropped push and let the heartbeat heal it.
+            let _permit = match permits.acquire_owned().await {
+                Ok(permit) => permit,
+                Err(_) => return,
+            };
+            let started = std::time::Instant::now();
+            match client.post_work(request).await {
+                Ok(_) => {
+                    crate::manager::telemetry::metrics()
+                        .dispatch_send_seconds
+                        .observe(started.elapsed().as_secs_f64());
+                    info!(
+                        allocation_id = id,
+                        node_id = %node_id,
+                        "Dispatched allocation to worker"
+                    )
+                }
+                Err(err) => warn!(
+                    allocation_id = id,
+                    node_id = %node_id,
+                    error = ?err,
+                    "Failed to dispatch allocation to worker"
+                ),
+            }
+        }
+    });
+    let send_all = futures::future::join_all(sends);
+
+    match tokio::runtime::Handle::try_current() {
+        // Detach on a real runtime. `resolve_claimed_eval` runs on the
+        // blocking pool, where the ambient handle is the manager's
+        // multi-thread runtime.
+        Ok(handle) if handle.runtime_flavor() != RuntimeFlavor::CurrentThread => {
+            handle.spawn(send_all);
+            Ok(())
+        }
+        // No runtime (unit tests, one-off tools): keep the old blocking
+        // behavior rather than silently not sending.
+        _ => run_dispatch_future(async {
+            send_all.await;
+            Ok(())
+        }),
+    }
 }
 
 /// Minimum worker protocol version that understands
@@ -493,6 +586,21 @@ pub fn build_task_allocation_with(
         Some(stop) => serde_json::to_string(stop).context("Failed to serialize task stop")?,
         None => String::new(),
     };
+    // The declared `network` block: mode, labels, and any inline policy. The
+    // assigned ports travel separately on `network` (an `AllocNetwork`), so
+    // this is only sent when it carries something the datapath reads — a
+    // non-default mode, labels, or an inline chain — keeping jobs that only
+    // declare ports byte-identical on the wire.
+    let task_network = match task.network.as_ref() {
+        Some(network)
+            if network.mode != "auto"
+                || !network.labels.is_empty()
+                || network.declares_policy() =>
+        {
+            serde_json::to_string(network).context("Failed to serialize task network")?
+        }
+        _ => String::new(),
+    };
     Ok(TaskAllocation {
         allocation_id: allocation.id,
         job_id: allocation.job_id.clone(),
@@ -512,6 +620,7 @@ pub fn build_task_allocation_with(
         task_volumes,
         task_resources,
         task_stop,
+        task_network,
         provisional,
     })
 }
@@ -1134,6 +1243,7 @@ mod tests {
             pool: "default".into(),
             availability: "available".into(),
             last_heartbeat: "now".into(),
+            heartbeat_source: String::new(),
             config_attrs: json!({ "workerAddress": "http://127.0.0.1:4848" }),
             fingerprint_attrs: json!({}),
             dynamic_attrs: json!({}),
@@ -1156,6 +1266,7 @@ mod tests {
             pool: "default".into(),
             availability: "available".into(),
             last_heartbeat: "now".into(),
+            heartbeat_source: String::new(),
             config_attrs: json!({"workerAddress": "http://127.0.0.1:4848"}),
             fingerprint_attrs: json!({}),
             dynamic_attrs: json!({}),

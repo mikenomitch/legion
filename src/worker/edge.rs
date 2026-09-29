@@ -231,6 +231,7 @@ mod worker_edge_test {
 
     fn payload() -> TaskAllocation {
         TaskAllocation {
+            task_network: String::new(),
             allocation_id: 0,
             job_id: "agent-sandboxes".into(),
             job_config_id: "jc-1".into(),

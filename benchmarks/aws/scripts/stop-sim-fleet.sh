@@ -23,4 +23,12 @@ rsh "$LOADGEN_ADDR" \
 rsh "$LOADGEN_ADDR" \
     "echo '[]' >/opt/bench/observability/targets/sim-workers.json" || true
 
-log "sim fleets stopped"
+# Forget the recorded fleet. Nothing here removes the NODE RECORDS — there
+# is no deregistration RPC, so every node this fleet registered stays in
+# the store, `lost`, until a fleet of the same names re-registers over it
+# or the control plane is reset (scripts/reset-control-plane.sh). What
+# this clears is only the claim that a fleet is running, so the next
+# campaign does not reuse a fleet that has just been shut down.
+clear_fleet_state
+
+log "sim fleets stopped (node records remain — see reset-control-plane.sh)"
