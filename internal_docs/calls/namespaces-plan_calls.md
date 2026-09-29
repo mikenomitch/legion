@@ -26,7 +26,7 @@ error: job 'web' not found in namespace 'default'
 hint: a job named 'web' exists in namespace 'prod'; retry with -n prod
 
 # Phase 2 changes nothing about that. It only stops rejecting this:
-$ legion job run web.jsonnet -n dev     # while prod/web already exists
+$ legion job run web.ncl -n dev     # while prod/web already exists
 ```
 
 **Alternatives.** (a) Ship the compound key in one phase — the honest
@@ -56,19 +56,25 @@ distrust a tenancy feature permanently.
 ## 2. Namespaces are explicitly not an isolation boundary, and the docs lead with it
 
 **Call.** A namespace is a naming, authorization and governance boundary.
-Compute isolation is node pools (shipped); stronger isolation is federation
-(planned). The non-goal is stated first in the public page, in the proto
-comment on `Namespace`, and in `legion namespace --help` — not in a
+Compute isolation is node pools (shipped); network isolation is
+`network.mode = "gated"` plus net policies (shipped with the mesh — see
+[docs/network-handlers.md](../../docs/network-handlers.md)); stronger isolation
+is federation (planned). The non-goal is stated first in the public page, in
+the proto comment on `Namespace`, and in `legion namespace --help` — not in a
 limitations section at the bottom.
 
 **Alternatives.** (a) Make namespaces do isolation work: implicit node-pool
-binding, per-namespace network segmentation. (b) Say nothing and let users
-infer, which is what every surveyed system did first.
+binding, or a namespace that implies `gated` network mode for everything in it.
+(b) Say nothing and let users infer, which is what every surveyed system did
+first.
 
 **Trade-off.** Users arriving from Kubernetes will ask why namespace `prod`
 does not keep its work off `dev`'s machines, and the answer is a second
 concept (`allowedPools`, Phase 5) rather than a property of the first. We pay
-one extra explanation per new operator.
+one extra explanation per new operator. (a) is also the more tempting option
+now that `gated` exists and a namespace *could* carry a default network mode —
+and it stays rejected: a namespace that silently changes a workload's
+networking would make the tenancy boundary the thing that breaks a deploy.
 
 **Why (simplicity).** "A namespace is not a security boundary" is the single
 most-repeated correction in the Kubernetes ecosystem, Consul needed admin
@@ -88,7 +94,7 @@ policy applies to it. That semantic is kept. The hazard is surfaced at the two
 moments it can bite:
 
 ```console
-$ legion acl policy apply team-a --rules @team-a.json
+$ legion acl policy apply team-a --rules @team-a.ncl
 Applied policy 'team-a'.
 warning: rule 0 (job:read,write) has no `namespaces` selector — it applies to
          all 4 namespaces, including any created later.
@@ -154,15 +160,15 @@ as the default.
 **Call.** Add `AclResource::Namespace`, scoped by the existing `namespaces`
 selector, so "a team lead may create `team-a-*` namespaces" is expressible:
 
-```jsonnet
-{ resources: ['namespace'], actions: ['write'], namespaces: ['team-a-*'] }
+```nickel
+{ resources = ["namespace"], actions = ["write"], namespaces = ["team-a-*"] }
 ```
 
 **Alternatives.** (a) Gate namespace CRUD on `operator:write`, adding no
 vocabulary. (b) Gate it on `acl:write`, since a namespace is arguably part of
 the authorization model.
 
-**Trade-off.** A twelfth resource in a list the plan elsewhere argues should
+**Trade-off.** A thirteenth resource in a list the plan elsewhere argues should
 stay short, and one more row in the docs table and the endpoint test.
 
 **Why (simplicity, via precedent).** `operator` means raft, manager configs
@@ -210,7 +216,7 @@ refusal is a state you can always get out of.
 **Call.**
 
 ```console
-$ legion job run api.jsonnet -n dev      # api.jsonnet declares namespace: 'prod'
+$ legion job run api.ncl -n dev      # api.ncl declares namespace = "prod"
 error: jobspec declares namespace 'prod' but -n specified 'dev'
 hint: remove one; a jobspec that names its namespace does not need the flag
 ```

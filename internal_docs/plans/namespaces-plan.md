@@ -5,7 +5,7 @@
 **Status: PLANNED.** Nothing here is built. The ACL rule vocabulary already
 contains a `namespaces` selector and the scope struct already carries a
 `namespace` field — both hardcoded to the constant `"default"`
-(`src/structs/acl.rs:213`). This plan turns that placeholder into a real
+(`src/structs/acl.rs:221`). This plan turns that placeholder into a real
 tenancy boundary, and says explicitly which parts of "namespace" from
 Kubernetes and Nomad Legion is **not** copying.
 
@@ -62,7 +62,7 @@ What breaks:
   exist yet.
 - **Several global name spaces are cross-tenant leaks waiting to happen.**
   The idempotency table is keyed by the caller-supplied key alone
-  (`src/storage/store.rs:13087`): team B replaying `deploy-1` gets team A's
+  (`src/storage/store.rs:16649`): team B replaying `deploy-1` gets team A's
   recorded reply. Service names are global, so the second team to advertise
   `web` competes for the same catalog entry the first team's `connect` block
   resolves. Neither is a namespace bug today only because there are no
@@ -75,7 +75,7 @@ And the sharpest one:
   `{"resources": ["job"], "actions": ["*"], "namespaces": ["prod"]}` gets a
   policy that authorizes **nothing at all**, with no validation error and no
   warning. Every scope in the product is stamped `"default"`
-  (`src/structs/acl.rs:230`), and a selector that names a value the request
+  (`src/structs/acl.rs:238`), and a selector that names a value the request
   never carries fails closed. This is documented behavior
   (`docs/auth-and-acls.md`: "jobs live in `default` until namespaces land")
   but it is exactly the shape of footgun that gets discovered at 3am.
@@ -90,12 +90,13 @@ Legion's namespace support today is **vocabulary without values**. The pieces:
 
 | Piece | Location | State |
 | --- | --- | --- |
-| `namespaces` rule selector | `src/structs/acl.rs:113` | Real, glob-matched, unit-tested |
-| `AclScope.namespace` | `src/structs/acl.rs:189` | Real field |
-| `DEFAULT_NAMESPACE = "default"` | `src/structs/acl.rs:213` | The only value ever produced |
-| `AclScope::job/exec/action/job_via_template` | `src/structs/acl.rs:230-292` | All hardcode `DEFAULT_NAMESPACE` |
-| UI mirror `DEFAULT_NAMESPACE` | `ui/src/utils/acl.ts:58` | Same constant, same hardcode |
+| `namespaces` rule selector | `src/structs/acl.rs:122` | Real, glob-matched, unit-tested |
+| `AclScope.namespace` | `src/structs/acl.rs:194` | Real field |
+| `DEFAULT_NAMESPACE = "default"` | `src/structs/acl.rs:221` | The only value ever produced |
+| `AclScope::job/exec/action/job_via_template` | `src/structs/acl.rs:238-301` | All hardcode `DEFAULT_NAMESPACE` |
+| UI mirror `DEFAULT_NAMESPACE` | `ui/src/utils/acl.ts:59` | Same constant, same hardcode |
 | Audit log `namespace` field | `src/manager/acl.rs:633` | Always `default` or `-` |
+| Net-policy `NetSelector.namespaces` | `src/structs/netpolicy.rs:106` | Real glob list, matched against a fact that is always `default` |
 | Jobspec `namespace` field | — | Does not exist |
 | `Namespace` object / RPC / CLI | — | Does not exist |
 
@@ -134,33 +135,33 @@ Legion's namespace support today is **vocabulary without values**. The pieces:
 ### 2.2 The code the design has to fit
 
 - **Job identity is a global name.** `store.get_job(name)`
-  (`src/storage/store.rs:5585`) is a single-column lookup. The `job` table has
+  (`src/storage/store.rs:7997`) is a single-column lookup. The `job` table has
   `id` as its primary key with a `name` column
   (`src/storage/migrations.rs:37`); uniqueness of `name` is enforced by the
-  submit path's existence check (`src/manager/server.rs:1492`), not by an
+  submit path's existence check (`src/manager/server.rs:1608`), not by an
   index. `job_config`, `task_config`, `allocation`, `eval`, `job_update` all
   hang off `job_id`, so **the foreign-key graph does not need to change** —
   only the way a name is resolved to an id.
 - **Job names are barely validated.** Volume names and template names have
-  validators (`src/structs/job.rs:1407`, `src/manager/job_templates.rs:54`);
+  validators (`src/structs/job.rs:1435`, `src/manager/job_templates.rs:52`);
   job names have a length check and nothing else. Any qualified-reference
   syntax has to reckon with that (§ 7.2).
-- **ACL enforcement is centralized and already scope-shaped.** 72 `check_acl`
-  call sites across 106 manager RPCs, 23 of which build an `AclScope::job(...)`
+- **ACL enforcement is centralized and already scope-shaped.** 82 `check_acl`
+  call sites across 119 manager RPCs, 25 of which build an `AclScope::job(...)`
   (`src/manager/server.rs`). Adding the namespace is a mechanical change at
   each site plus a compile-time push: making `AclScope::job` take a namespace
   turns every missed site into a build error.
 - **List endpoints already filter per item.** `list_jobs`
-  (`src/manager/server.rs:3641`) gates on `AclScope::any()` then `retain`s on
+  (`src/manager/server.rs:3758`) gates on `AclScope::any()` then `retain`s on
   `identity.allows(...)`. Namespace filtering rides the same path.
 - **`tests/acl_endpoints.rs` is a hard gate.** `every_manager_rpc_is_classified`
   parses the proto and fails the build for an unclassified RPC, so new
   namespace RPCs cannot ship unprotected.
 - **Events are all-or-nothing.** `list_events` / `stream_events` gate on
-  `operator:read` with `AclScope::none()` (`src/manager/server.rs:3133`) and do
+  `operator:read` with `AclScope::none()` (`src/manager/server.rs:3250`) and do
   no per-item filtering. A namespace tenant either sees every event in the
   cluster or none. This is a real gap the design has to close (Phase 3).
-- **Idempotency is globally keyed** (`src/storage/store.rs:13087`).
+- **Idempotency is globally keyed** (`src/storage/store.rs:16649`).
 - **Services are a projection of allocations**, keyed by service name
   (`docs/service-discovery.md`); `connect` upstreams and `allow` intentions
   reference bare service names.
@@ -363,11 +364,15 @@ namespace object accumulate a second policy vocabulary that overlaps ACLs.
 
 - **Namespaces are not an isolation boundary.** No network isolation, no
   kernel isolation, no implicit node separation. A namespace is a *naming,
-  authorization and governance* boundary. Compute isolation is what node
-  pools are for, and stronger isolation is what federation is for. This will
-  be stated in the public doc, in the CLI help, and in the proto comment,
-  because every prior system that left it implicit had users assume the
-  opposite.
+  authorization and governance* boundary. Compute isolation is what node pools
+  are for, network isolation is what `network.mode = "gated"` and net policies
+  are for ([docs/network-handlers.md](../../docs/network-handlers.md)), and
+  stronger isolation is what federation is for. Creating a namespace changes
+  none of them, and a namespace never implies a network mode — a tenancy
+  boundary that silently rewires a workload's networking is a tenancy boundary
+  that breaks deploys. This will be stated in the public doc, in the CLI help,
+  and in the proto comment, because every prior system that left it implicit
+  had users assume the opposite.
 - **No hierarchical namespaces.** `team-a/prod` as a *nested object* is out.
   Glob matching on flat names (`namespaces: ["team-a-*"]`) covers the
   delegation cases we can actually name today, and Vault's hierarchy is the
@@ -462,19 +467,19 @@ free.
 
 A namespace is a small, mostly-empty object. It exists to be *referred to*.
 
-```jsonnet
-// namespaces/prod.jsonnet
+```nickel
+# namespaces/prod.ncl
 {
-  name: 'prod',
-  description: 'Production workloads',
-  meta: { owner: 'platform', slack: '#prod-alerts' },
+  name = "prod",
+  description = "Production workloads",
+  meta = { owner = "platform", slack = "#prod-alerts" },
 }
 ```
 
 ```bash
 legion namespace list                      # NAME | JOBS | DESCRIPTION | CREATED
 legion namespace create prod --description "Production workloads"
-legion namespace apply prod -f namespaces/prod.jsonnet
+legion namespace apply prod -f namespaces/prod.ncl
 legion namespace get prod -j
 legion namespace delete staging-old
 legion namespace delete staging-old --cascade
@@ -482,7 +487,7 @@ legion namespace delete staging-old --cascade
 
 Rules:
 
-- **Name grammar** is the template-name grammar (`src/manager/job_templates.rs:54`):
+- **Name grammar** is the template-name grammar (`src/manager/job_templates.rs:52`):
   lowercase letters, digits and dashes, starting and ending alphanumeric, ≤ 64
   chars. `*` and `all` are reserved (they are the wildcard in every read
   surface); `default` always exists and cannot be deleted.
@@ -536,7 +541,7 @@ addressable with `-n`; the error message says so.
 rule:**
 
 ```console
-$ legion job run api.jsonnet -n dev      # api.jsonnet declares namespace: 'prod'
+$ legion job run api.ncl -n dev      # api.ncl declares namespace = "prod"
 error: jobspec declares namespace 'prod' but -n specified 'dev'
 hint: remove one; a jobspec that names its namespace does not need the flag
 ```
@@ -560,15 +565,15 @@ failure the "check before you fetch" rule in AGENTS.md exists to prevent.
 
 ### 7.3 The jobspec surface
 
-```jsonnet
+```nickel
 {
-  name: 'api',
-  namespace: 'prod',        // optional; defaults to the active namespace
-  tasks: [ /* ... */ ],
+  name = "api",
+  namespace = "prod",        # optional; defaults to the active namespace
+  tasks = [ ],
 }
 ```
 
-One new optional string. It goes into `configs/jobs/maximal.jsonnet` with the
+One new optional string. It goes into `configs/jobs/maximal.ncl` with the
 rest. Tasks get `$LEGION_NAMESPACE` in their environment alongside the job and
 task names, so a workload can label its own metrics and logs without the
 operator plumbing it through.
@@ -579,14 +584,14 @@ operator plumbing it through.
 globs, and already composes with `names`, `bands`, `templates` and the rest.
 What changes is that it starts matching something real.
 
-```jsonnet
-// team-a's policy, complete
+```nickel
+# team-a's policy, complete
 [
-  { resources: ['job', 'exec', 'action', 'scale', 'boot'],
-    actions: ['read', 'write'], namespaces: ['team-a'] },
-  { resources: ['namespace'], actions: ['read'], namespaces: ['team-a'] },
-  { resources: ['kv'], actions: ['read', 'write'], paths: ['team-a/*'] },
-  { resources: ['node'], actions: ['read'] },
+  { resources = ["job", "exec", "action", "scale", "boot", "net"],
+    actions = ["read", "write"], namespaces = ["team-a"] },
+  { resources = ["namespace"], actions = ["read"], namespaces = ["team-a"] },
+  { resources = ["kv"], actions = ["read", "write"], paths = ["team-a/*"] },
+  { resources = ["node"], actions = ["read"] },
 ]
 ```
 
@@ -610,11 +615,13 @@ namespaces" is expressible on day one.
 
 | Namespaced | Cluster-scoped |
 | --- | --- |
-| `job`, `exec`, `action`, `scale`, `boot`, `template`¹ | `node`, `operator`, `state`, `acl`, `kv`² |
+| `job`, `exec`, `action`, `scale`, `boot`, `net`¹, `template`² | `node`, `operator`, `state`, `acl`, `kv`³ |
 
-¹ Templates become namespaced in Phase 4; until then they are cluster-scoped
+¹ `net` already documents itself as scoped by `pools` / `namespaces`
+(`src/structs/acl.rs:54-60`); it needs no rule-surface change, only real values.
+² Templates become namespaced in Phase 4; until then they are cluster-scoped
 and a `templates` selector means what it means today.
-² KV stays path-scoped (§ 5 non-goals).
+³ KV stays path-scoped (§ 5 non-goals).
 
 **The omitted-selector hazard, answered.** A rule with no `namespaces`
 selector matches **every** namespace, including ones created later. That is
@@ -625,7 +632,7 @@ model rests on. Instead the hazard is made *visible*, three ways:
 1. `legion acl policy apply` warns at write time:
 
    ```console
-   $ legion acl policy apply team-a --rules @team-a.json
+   $ legion acl policy apply team-a --rules @team-a.ncl
    Applied policy 'team-a'.
    warning: rule 0 (job:read,write) has no `namespaces` selector — it applies to
             all 4 namespaces, including any created later.
@@ -643,14 +650,14 @@ model rests on. Instead the hazard is made *visible*, three ways:
 3. The upgrade note in `docs/upgrades.md` and the public page say it plainly.
 
 **Enforcement mechanics.** `AclScope::job(name)` becomes
-`AclScope::job(namespace, name)` — a signature change, so every one of the 23
+`AclScope::job(namespace, name)` — a signature change, so every one of the 25
 call sites in `src/manager/server.rs` becomes a compile error until it supplies
 a namespace. The same applies to `exec`, `action`, `job_via_template`. Nothing
 can be forgotten silently. The coarse-then-precise pattern is unchanged: gate
 with `AclScope::any()` before a lookup, enforce the precise
 `(namespace, name)` scope after it.
 
-**List filtering** already works per item (`src/manager/server.rs:3641`); with
+**List filtering** already works per item (`src/manager/server.rs:3758`); with
 the namespace stamped on the item's scope, a `team-a` token sees `team-a`'s
 jobs and nothing else, with or without `-n`.
 
@@ -659,19 +666,42 @@ jobs and nothing else, with or without `-n`.
 These are the parts a "namespaces" feature usually forgets, and each one is a
 tenant-visible bug if it is left out.
 
-**Service discovery (Phase 3).** A service inherits its job's namespace.
-Catalog entries are keyed `(namespace, service)`. `connect` upstreams resolve
-same-namespace by default; crossing requires naming it *and* being allowed:
+**Service discovery and the mesh (Phase 3).** A service inherits its job's
+namespace. Catalog entries are keyed `(namespace, service)`. `connect`
+upstreams resolve same-namespace by default; crossing requires naming it *and*
+being allowed by the target's intentions (which are job ids, so they become
+namespace-qualified along with jobs):
 
-```jsonnet
-service: { port: 8080, allow: ['gateway', 'team-b/frontend'] },
-connect: { upstreams: [{ service: 'redis' },                    // same namespace
-                       { service: 'auth', namespace: 'shared' }] },
+```nickel
+service = { port = 8080, allow = ["gateway", "team-b/frontend"] },
+connect = { upstreams = [
+  { service = "redis" },                          # same namespace
+  { service = "auth", namespace = "shared" },     # explicit crossing
+] },
 ```
 
+The mesh now gives services **DNS names** — `<service>.svc.legion`
+([docs/service-discovery.md](../../docs/service-discovery.md),
+[service-mesh-plan.md](service-mesh-plan.md)) — so namespacing the catalog has
+to name the DNS shape too. Proposal, following Kubernetes because operators
+already read it fluently: the fully qualified form gains a namespace label,
+`<service>.<namespace>.svc.legion`, and the short form `<service>.svc.legion`
+continues to resolve **within the requesting allocation's own namespace**. The
+short form staying same-namespace is what keeps every existing jobspec correct
+and makes the common case the un-typed one; the long form is what makes a
+deliberate crossing visible in the config that does it.
+
 Until this phase lands, **namespaces do not isolate discovery** — two
-namespaces' `web` services share a catalog name. That sentence goes in the
-public doc from Phase 1, not Phase 3.
+namespaces' `web` services share one catalog name and one DNS name. That
+sentence goes in the public doc from Phase 1, not Phase 3.
+
+Net policies (`NetSelector`, `src/structs/netpolicy.rs:106`) already carry a
+`namespaces` glob list against a `NetSelectorFacts.namespace` that is always
+`default`, so they inherit real values from Phase 1 with no change to the
+policy surface at all — a selector an operator writes today starts scoping the
+day namespaces ship. This is the second consumer waiting on this plan, and the
+reason Phase 1 stamps the namespace onto the selector facts rather than only
+onto ACL scopes.
 
 **Workload identity (Phase 2, and it is a security dependency).** The default
 subject template is `{region}:{job}:{group}:{task}`
@@ -690,13 +720,13 @@ the other's token. So:
   once a second namespace exists, naming the risk.
 
 **Idempotency keys (Phase 1).** The record table is keyed by the caller's key
-alone (`src/storage/store.rs:13087`), so two tenants using `deploy-1` share a
+alone (`src/storage/store.rs:16649`), so two tenants using `deploy-1` share a
 record and the second one gets the first one's reply. The key becomes
 `(namespace, key)`, with `-` for cluster-scoped operations. Migration:
 existing rows land in `default`.
 
 **Events (Phase 3).** `list_events`/`stream_events` gate on `operator:read`
-and filter nothing (`src/manager/server.rs:3133`). Events gain a `namespace`
+and filter nothing (`src/manager/server.rs:3250`). Events gain a `namespace`
 field, and the endpoints gain a second path: a caller with `job:read` in a
 namespace may read that namespace's events, filtered per item like every other
 list. `operator:read` continues to see everything, including cluster-scoped
@@ -713,12 +743,12 @@ migration.
 Once the object exists, the governance requests that have been accumulating
 have somewhere to live:
 
-```jsonnet
+```nickel
 {
-  name: 'team-a',
-  quota: { cpu: 200000, memory: '512Gi', jobs: 200 },   // cluster-wide caps
-  allowedPools: ['shared-*', 'team-a-gpu'],             // where its jobs may land
-  allowedRuntimes: ['container', 'sandbox'],            // which task kinds it may use
+  name = "team-a",
+  quota = { cpu = 200000, memory = "512Gi", jobs = 200 },  # cluster-wide caps
+  allowedPools = ["shared-*", "team-a-gpu"],              # where its jobs may land
+  allowedRuntimes = ["container", "sandbox"],              # which task kinds it may use
 }
 ```
 
@@ -872,6 +902,11 @@ first-class selection.**
   Explorer) the switcher is **absent**, not greyed out, and the page header
   carries a small "cluster-scoped" tag. A control that appears everywhere but
   works in half the places is worse than one that appears where it works.
+  Network is the one page that is *neither*: a net policy is a cluster object
+  whose selector names namespaces (`ROUTE_RESOURCE['/network'] = 'net'`,
+  `ui/src/utils/acl.ts:189`), so it keeps the switcher as a **filter over which
+  policies apply to the selected namespace**, and says so in the header rather
+  than pretending the page is scoped.
 - **"All namespaces" is a real selection**, not a checkbox: it shows a
   namespace column, groups by namespace where grouping helps (the Jobs table),
   and is the default for anyone whose token can read more than one namespace.
@@ -1150,10 +1185,12 @@ an aggregate query at admission for exactly that reason.
   (not-found in the wrong namespace, non-empty delete, the omitted-selector
   hazard) and — first and loudest — the isolation non-goal. Updates to
   `docs/auth-and-acls.md` (the `namespaces` selector becomes real; the
-  existing `namespaces: ['prod']` example stops being a no-op),
-  `docs/service-discovery.md`, `docs/workload-identity.md`,
+  existing `namespaces = ["prod"]` example stops being a no-op),
+  `docs/network-handlers.md` (its `selector.namespaces` stops matching every
+  job, and the two "until namespaces land" notes come out),
+  `docs/service-discovery.md` (the DNS shape), `docs/workload-identity.md`,
   `docs/agent-readiness.md`, `docs/upgrades.md`, `docs/README.md`,
-  `README.md`, and `configs/jobs/maximal.jsonnet`.
+  `README.md`, and `configs/jobs/maximal.ncl`.
 - **TODO.md** gets the open item now and the check-offs per phase; the
   "per-namespace band caps" claim gets corrected in the same change as Phase 1.
 
