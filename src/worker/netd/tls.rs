@@ -225,10 +225,8 @@ pub fn peer_identity(chain: &[CertificateDer<'_>]) -> Option<PeerIdentity> {
                         uri = Some(value.to_string());
                     }
                 }
-                GeneralName::DNSName(value) => {
-                    if dns.is_none() {
-                        dns = Some(value.to_string());
-                    }
+                GeneralName::DNSName(value) if dns.is_none() => {
+                    dns = Some(value.to_string());
                 }
                 _ => {}
             }

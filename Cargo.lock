@@ -2151,6 +2151,7 @@ dependencies = [
  "rcgen",
  "regex",
  "reqwest 0.12.28",
+ "ring",
  "rusqlite",
  "rusqlite_migration",
  "rustls",
@@ -2183,6 +2184,7 @@ dependencies = [
  "tracing-opentelemetry",
  "tracing-subscriber",
  "url",
+ "zeroize",
  "webpki-roots",
  "x509-parser",
 ]

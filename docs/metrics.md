@@ -429,6 +429,33 @@ of that engine (the queue is a consequence of its one-thread-per-lane
 design), which is why they carry the prefix despite being recorded off the
 leader path.
 
+### KV encryption keyring
+
+All from the answering manager's point of view — the root key is
+per-manager state ([kv-encryption.md](kv-encryption.md)).
+
+- **`legion_keyring_unlocked`** (gauge) — `1` when this manager can encrypt
+  and decrypt every KV value (every data key unwrapped), `0` when the
+  keyring is locked, disabled, or not initialized yet. Alert on `0` while
+  `encryption.enabled` is true: a root key is missing here.
+- **`legion_keyring_keys{state}`** (gauge) — data keys by state (`active`
+  | `retired`). A `retired` count that stays above zero longer than a rewrap
+  takes means values still sit under an old key.
+- **`legion_keyring_active_key_age_seconds`** (gauge) — age of the active
+  data key; it rotates automatically at `encryption.dataKeyRotationAge`
+  (default 30 days).
+- **`legion_kv_rows{encryption}`** (gauge) — KV entries by storage form
+  (`encrypted` | `plaintext`). Plaintext rows after enabling encryption are
+  pre-upgrade values a rewrap has not converted yet.
+- **`legion_kv_decrypt_failures_total{reason}`** (counter) — reads that
+  could not be decrypted: `locked` (the data key is not unwrapped on this
+  manager) or `corrupt` (the ciphertext failed authentication — modified on
+  disk, moved between keys, or written under a different root key).
+- **`legion_keyring_provider_calls_total{op,outcome}`** (counter) — root
+  key provider calls (`describe` | `wrap` | `unwrap`) by outcome (`ok` |
+  `error`). Never on a KV read or write path; a rising `error` series with
+  an `exec` provider is a KMS problem.
+
 ### Worker
 
 Workers can expose their own Prometheus listener, opt-in via the

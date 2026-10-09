@@ -2831,6 +2831,21 @@ mod tests {
         manager
     }
 
+    /// Block until `marker` exists — a task's own signal that it reached
+    /// the point a test needs it at (a trap installed, a loop entered).
+    /// Panics rather than hanging if the task never gets there.
+    fn wait_for_marker(marker: &std::path::Path) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !marker.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the task never created {}",
+                marker.display()
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     // -----------------------------------------------------------------
     // Provisional allocations (docs/edge-boot.md)
     // -----------------------------------------------------------------
@@ -3374,8 +3389,18 @@ mod tests {
         let temp_dir = TempDir::new()?;
         let mut manager = manager_in(&temp_dir);
         // Traps SIGTERM and keeps running: the case `killAfter` exists for.
+        // The shell creates `trapped` once the trap is in place: a signal
+        // that lands before then kills it like any other process, which on
+        // a loaded machine turned this test's `Killed` into `Exited`.
+        let trapped = temp_dir.path().join("trapped");
         let task = TaskConfig {
-            config: json!({"command": ["sh", "-c", "trap '' TERM; sleep 30"]}),
+            config: json!({
+                "command": [
+                    "sh",
+                    "-c",
+                    format!("trap '' TERM; : > '{}'; sleep 30", trapped.display()),
+                ],
+            }),
             stop: Some(crate::structs::StopConfig {
                 signal: "SIGTERM".into(),
                 kill_after: std::time::Duration::ZERO,
@@ -3384,12 +3409,13 @@ mod tests {
             ..TaskConfig::new("stubborn", "exec")
         };
         manager.run_allocation(&alloc(), &task)?;
+        wait_for_marker(&trapped);
 
         let _ = manager.reconcile_allocations(&[]);
         assert_eq!(manager.terminating_ids(), vec![5]);
 
         // A zero grace window is already expired, so the very first reap
-        // takes it — no sleeping, no flakiness.
+        // takes it — no sleeping on the deadline.
         let reaped = manager.reap_terminating();
         assert_eq!(
             reaped,

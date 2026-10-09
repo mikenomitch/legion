@@ -588,6 +588,9 @@ impl StoreStateMachine {
         // The read model caches rows from tables this install may have
         // replaced; rebuild it from the committed state.
         self.store.refresh_read_model()?;
+        // The control lane's dump carries `keyring_key`: unwrap whatever
+        // data keys arrived with it.
+        self.store.keyring_rows_changed();
 
         // Verify: the applied marker now reported for this lane must equal
         // the snapshot meta.
@@ -1052,13 +1055,17 @@ mod tests {
             .tempdir()
             .context("Error creating temp store directory")?
             .keep();
-        let store_config = ManagerConfigFull {
+        let mut store_config = ManagerConfigFull {
             store_path: store_dir
                 .to_str()
                 .context("Error parsing store path")?
                 .to_string(),
             ..Default::default()
         };
+        // Snapshots built on one store install on another: replicas of one
+        // cluster share a root key (docs/kv-encryption.md).
+        store_config.encryption.root_key.path =
+            Some(crate::storage::keyring::test_support::shared_root_key_path());
         let store = Store::start_storage(&store_config)?;
         store.reset_all_tables()?;
         Ok(store)
@@ -1106,6 +1113,9 @@ mod tests {
     async fn apply_replays_a_real_captured_changeset_and_advances_applied_state() -> R<()> {
         let leader = setup_store()?;
         let follower = setup_store()?;
+        // A follower has applied the leader's `initialize_keyring` entry
+        // before any KV entry: same data keys (values replicate encrypted).
+        follower.adopt_keyring_from(&leader)?;
 
         // Capture a real mutation on the leader (rolled back locally).
         let (kv, changeset) = capture::capture_mutation(&leader, Lane::Control, |s| {

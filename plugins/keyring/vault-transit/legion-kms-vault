@@ -1,0 +1,55 @@
+#!/bin/sh
+# Legion `exec` root-key provider backed by HashiCorp Vault Transit
+# (docs/kv-encryption.md).
+#
+#   encryption = { rootKey = { provider = "exec",
+#     command = ["/usr/local/bin/legion-kms-vault", "--key", "legion-kv"] } }
+#
+# Reads one JSON request on stdin, prints one JSON reply on stdout. Needs the
+# `vault` CLI with VAULT_ADDR and a token allowed to `update` on
+# `transit/encrypt/<key>` and `transit/decrypt/<key>` (and `read` on
+# `transit/keys/<key>` for describe). Create the key once with
+# `vault write -f transit/keys/legion-kv`. The data key id rides along as the
+# Vault `context` (derived keys) or is simply ignored by a non-derived key.
+#
+# Test before use:  legion keyring provider test -- legion-kms-vault --key legion-kv
+set -eu
+
+KEY=""
+MOUNT="transit"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --key) KEY="$2"; shift 2 ;;
+    --mount) MOUNT="$2"; shift 2 ;;
+    *) echo "legion-kms-vault: unknown argument $1" >&2; exit 2 ;;
+  esac
+done
+[ -n "$KEY" ] || { echo "legion-kms-vault: --key is required" >&2; exit 2; }
+
+req=$(cat)
+field() { printf '%s' "$req" | sed -n "s/.*\"$1\":\"\([^\"]*\)\".*/\1/p"; }
+op=$(field op)
+
+case "$op" in
+  describe)
+    version=$(vault read -field=latest_version "$MOUNT/keys/$KEY")
+    printf '{"key_id":"vault:%s/%s:v%s"}\n' "$MOUNT" "$KEY" "$version"
+    ;;
+  wrap)
+    pt=$(field plaintext)
+    ct=$(vault write -field=ciphertext "$MOUNT/encrypt/$KEY" plaintext="$pt")
+    version=$(vault read -field=latest_version "$MOUNT/keys/$KEY")
+    # Vault's ciphertext is text ("vault:v1:…"); the contract wants base64.
+    printf '{"ciphertext":"%s","key_id":"vault:%s/%s:v%s"}\n' \
+      "$(printf '%s' "$ct" | base64 | tr -d '\n')" "$MOUNT" "$KEY" "$version"
+    ;;
+  unwrap)
+    ct=$(field ciphertext | base64 -d)
+    pt=$(vault write -field=plaintext "$MOUNT/decrypt/$KEY" ciphertext="$ct")
+    printf '{"plaintext":"%s"}\n' "$pt"
+    ;;
+  *)
+    echo "legion-kms-vault: unknown op '$op'" >&2
+    exit 2
+    ;;
+esac

@@ -3,7 +3,7 @@ import { AccessGate } from '../components/AccessGate'
 import { managerClient } from '../grpcClient'
 import { allows } from '../utils/acl'
 import { KvEntry, KvValueType } from '../gen/legion_pb'
-import { Badge, Button, ConfirmButton, EmptyState, Field, Icon, Note, SectionCard, Spinner, cx, inputClass, selectClass, textareaClass } from '../components/ui'
+import { Badge, Button, ConfirmButton, EmptyState, Field, Icon, Note, SectionCard, Spinner, StatusBadge, cx, inputClass, selectClass, textareaClass } from '../components/ui'
 
 type TreeNode = {
   name: string
@@ -275,7 +275,25 @@ function KeyValueContent() {
 
         <SectionCard
           title={selectedEntry() ? 'Edit entry' : 'New entry'}
-          description={selectedEntry() ? <span class="font-mono">{selectedEntry()!.key}</span> : 'Create a key/value entry.'}
+          description={
+            selectedEntry() ? (
+              <span class="inline-flex items-center gap-2">
+                <span class="font-mono">{selectedEntry()!.key}</span>
+                {/* How the row is held at rest (docs/kv-encryption.md); the value on the wire is always plaintext. */}
+                <StatusBadge
+                  status={selectedEntry()!.encrypted ? 'encrypted at rest' : 'plaintext at rest'}
+                  tone={selectedEntry()!.encrypted ? 'ok' : 'warn'}
+                  title={
+                    selectedEntry()!.encrypted
+                      ? 'Stored encrypted under the KV keyring'
+                      : 'Stored as a plaintext row (written before encryption was on, or with encryption disabled); `legion keyring rewrap` converts it'
+                  }
+                />
+              </span>
+            ) : (
+              'Create a key/value entry.'
+            )
+          }
           actions={
             <Show when={selectedEntry()}>
               <ConfirmButton

@@ -1,7 +1,28 @@
 use rusqlite_migration::{Migrations, M};
 
+/// The schema version (migration count) at which the KV encryption keyring
+/// landed (`keyring_key` + `kv_entry.enc_key_id`, docs/kv-encryption.md).
+/// A raft leader will not initialize the keyring — and therefore never
+/// writes an encrypted row or a keyring row — until every voter advertises
+/// at least this version, because a manager below it cannot apply such a
+/// changeset. Pinned by `keyring_schema_version_matches_the_migration`.
+pub const KEYRING_SCHEMA_VERSION: u32 = 129;
+
+/// The schema version this binary migrates a store to: the number of
+/// migrations it knows. Advertised to raft peers as
+/// `x-legion-schema-version` so version-gated features can tell whether
+/// every voter can apply what they are about to write.
+pub fn schema_version() -> u32 {
+    static VERSION: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *VERSION.get_or_init(|| migration_list().len() as u32)
+}
+
 pub fn get_migrations() -> Migrations<'static> {
-    Migrations::new(vec![
+    Migrations::new(migration_list())
+}
+
+fn migration_list() -> Vec<M<'static>> {
+    vec![
         M::up(
             "CREATE TABLE IF NOT EXISTS node (
             id STRING PRIMARY KEY,
@@ -1592,13 +1613,74 @@ pub fn get_migrations() -> Migrations<'static> {
         );",
         )
         .down("DROP TABLE IF EXISTS net_mesh_ca;"),
-    ])
+        // KV encryption at rest (docs/kv-encryption.md). `enc_key_id` names
+        // the data key a value is encrypted under; NULL is a plaintext row
+        // (written before this migration, or with encryption disabled) and
+        // stays readable until a rewrap converts it. `keyring_key` holds the
+        // data keys WRAPPED by the root key — the root key itself never
+        // enters the store, so this table (and every backup, snapshot, and
+        // changeset carrying it) is useless without the key file, env var,
+        // or KMS that wraps it. Control lane, with kv_entry. Bumping this
+        // pair must keep KEYRING_SCHEMA_VERSION in step (see its test).
+        M::up("ALTER TABLE kv_entry ADD COLUMN enc_key_id STRING;").down(""),
+        M::up(
+            "CREATE TABLE IF NOT EXISTS keyring_key (
+            key_id STRING PRIMARY KEY,
+            algorithm STRING NOT NULL,
+            wrapped_key BLOB NOT NULL,
+            root_key_id STRING NOT NULL,
+            root_provider STRING NOT NULL,
+            state STRING NOT NULL,
+            created_at INTEGER NOT NULL,
+            retired_at INTEGER
+        )",
+        )
+        .down("DROP TABLE IF EXISTS keyring_key;"),
+    ]
 }
 
 #[cfg(test)]
 mod migrations_test {
     use super::*;
     use rusqlite::Connection;
+
+    /// `KEYRING_SCHEMA_VERSION` is what the raft upgrade gate compares peer
+    /// versions against, so it must be exactly the migration that creates
+    /// `keyring_key` — walk the list and find it, rather than trust a number.
+    #[test]
+    fn keyring_schema_version_matches_the_migration() -> anyhow::Result<()> {
+        let migrations = get_migrations();
+        let total = schema_version() as usize;
+        assert!(total >= KEYRING_SCHEMA_VERSION as usize);
+        let has_keyring = |conn: &Connection| -> anyhow::Result<bool> {
+            let count: i64 = conn.query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'keyring_key';",
+                [],
+                |row| row.get(0),
+            )?;
+            Ok(count == 1)
+        };
+        let mut conn = Connection::open_in_memory()?;
+        migrations.to_version(&mut conn, KEYRING_SCHEMA_VERSION as usize - 1)?;
+        assert!(
+            !has_keyring(&conn)?,
+            "keyring_key exists one version BEFORE KEYRING_SCHEMA_VERSION"
+        );
+        let has_column = |conn: &Connection| -> anyhow::Result<bool> {
+            let mut stmt = conn.prepare("PRAGMA table_info(kv_entry);")?;
+            let names = stmt
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(names.iter().any(|name| name == "enc_key_id"))
+        };
+        migrations.to_version(&mut conn, KEYRING_SCHEMA_VERSION as usize)?;
+        assert!(
+            has_keyring(&conn)? && has_column(&conn)?,
+            "KEYRING_SCHEMA_VERSION must be the migration that creates keyring_key \
+             (the column migration directly precedes it)"
+        );
+        Ok(())
+    }
 
     /// A cluster created before the `kind` -> `runtime` rename must migrate its
     /// existing task rows in place, with the values preserved.

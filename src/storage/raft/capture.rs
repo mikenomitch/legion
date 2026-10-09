@@ -594,13 +594,17 @@ mod tests {
             .tempdir()
             .context("Error creating temp store directory")?
             .keep();
-        let config = ManagerConfigFull {
+        let mut config = ManagerConfigFull {
             store_path: dir
                 .to_str()
                 .context("Error parsing store path")?
                 .to_string(),
             ..Default::default()
         };
+        // Captured on one store, applied on another: replicas of one
+        // cluster share a root key (docs/kv-encryption.md).
+        config.encryption.root_key.path =
+            Some(crate::storage::keyring::test_support::shared_root_key_path());
         Store::start_storage(&config)
     }
 
@@ -1052,6 +1056,9 @@ mod tests {
     fn node_local_tables_are_filtered_out_of_apply_but_evals_are_not() -> R<()> {
         let src = setup_store()?;
         let dst = setup_store()?;
+        // Replicas share the cluster's data keys (KV values replicate as
+        // ciphertext).
+        dst.adopt_keyring_from(&src)?;
         let ((), changeset) = capture_mutation(&src, Lane::Scheduler, |s| {
             s.put_kv("filtered/key", "v", KvValueType::String, None, None)?;
             let conn = s.write_connection()?;

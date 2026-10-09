@@ -175,6 +175,18 @@ other. During a rolling manager upgrade the plane tolerates skew:
   order covers this; for a mixed-version manager fleet held longer than
   an upgrade window, set `schedulerSettings.plan_candidates = 0` until
   every peer is level — it holds format-2 emission off entirely.
+- The KV encryption keyring ([kv-encryption.md](kv-encryption.md)) adds a
+  table and a column that a pre-keyring manager cannot apply — and, unlike
+  other schema additions, would be written to *by the leader on its own* at
+  startup. So the leader gates itself: every transport reply carries the
+  answering manager's schema version, and the keyring is not initialized
+  (no encrypted row is ever written) until every voter advertises a build
+  that has it. `legion keyring status` reports `pending upgrade` naming the
+  managers still to upgrade; KV values are stored exactly as before until
+  then. Nothing to set, nothing to run — finish the rolling upgrade.
+  **Downgrading** past this release afterwards means a database ahead of
+  the binary (refused at open): run `legion keyring rewrap --plaintext`
+  first, then restore a pre-upgrade backup.
 
 ## Raft persistence upgrades
 
@@ -228,7 +240,11 @@ path via `VACUUM INTO` (default: a timestamped file under
 index the backup captures. Works in every persistence mode; in raft mode
 it is leader-only (a non-leader answers `FAILED_PRECONDITION` naming the
 leader). The backup is a plain SQLite database — copy it off-host with
-ordinary tooling.
+ordinary tooling. **KV values in it are encrypted** and the root key is
+deliberately not in it: the reply (and the CLI's last line) name the root
+key's provider and location, and `--restore-from` on a host without it
+refuses to serve until it is copied into place. Keep the key with the
+backup. See [KV Encryption at Rest](kv-encryption.md).
 
 **Restore** (`legion start manager --restore-from <backup>`): before the
 store (and any raft engine) starts, the backup is copied into place as

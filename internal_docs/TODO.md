@@ -1677,6 +1677,31 @@ Plans: [persistence-plan.md](plans/persistence-plan.md), [multi-raft-persistence
       job type, or just a richer `count`? (`count: {num: 1, per: "id"}`
       approximates it today but does not converge newly joined nodes.)
 
+## KV & secrets
+
+Plan: [kv-encryption-plan.md](plans/kv-encryption-plan.md) · docs: [kv-encryption.md](../docs/kv-encryption.md)
+
+- [ ] **Encrypt the rendered copies of KV values, or stop making them.**
+      Encryption at rest (shipped, see Done) covers `kv_entry.value` only: the
+      *rendered* results of `$key` references and `{{ kv "…" }}` templates in
+      `job_config` / `task_config`, the worker's state file, and task
+      directories stay plaintext (plan §6.9, calls doc #10). Needs its own
+      plan: encrypt the derived columns under the same keyring, or move
+      rendering to the worker (Nomad's `template` + Variables model) so the
+      manager never materializes secrets.
+- [ ] **Native KMS root-key providers** (AWS KMS, GCP KMS, Azure Key Vault,
+      Vault Transit linked into the binary). Deferred on purpose — the `exec`
+      provider plus the reference scripts under `plugins/keyring/` cover every
+      KMS without a cloud SDK in the binary (calls doc #7). Revisit only if
+      the shell-out contract proves too fragile in practice.
+- [ ] **A `passphrase` / manual-unlock root-key provider** (Docker autolock,
+      Vault Shamir): the manager starts with KV locked until `legion keyring
+      unlock`. The provider trait already fits it; nobody has asked yet.
+- [ ] **`legion kv list` fails as a whole when one listed value is under a
+      locked data key.** Simple and loud, but a partial listing with a
+      per-row "locked" marker might serve an incident better; needs
+      `KvEntry` to carry an unavailability reason.
+
 ## Auth, TLS & security
 
 Plan: [auth-acl-plan.md](plans/auth-acl-plan.md) · docs: [auth-and-acls.md](../docs/auth-and-acls.md)
@@ -2454,6 +2479,33 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
 - [x] Reactive updates: injection into env and files, watch/on_change/on_delete
       policy, dependency graph, debounce, per-runtime capability gating
 
+[encryption plan](plans/kv-encryption-plan.md) · [docs](../docs/kv-encryption.md)
+
+- [x] **KV values encrypted at rest, on by default** (2026-09-21): AES-256-GCM
+      per value with the key path as AAD, under data keys wrapped by a root
+      key that never enters the store; wrapped data keys replicate in the
+      `keyring_key` table; a root key is minted at `<storePath>/keys/root.key`
+      on first start; lazy migration keeps pre-upgrade plaintext rows readable
+      until a rewrap; `state:read` now sees ciphertext, closing the KV path-ACL
+      bypass
+  - [x] Phase 1 — encrypt on write / decrypt on read, `file`/`env` providers,
+        locked-not-dead mode with the exact next step in the error, the
+        mixed-version initialization gate (every raft transport reply carries
+        the answering manager's schema version), backup reply + CLI reminder,
+        restore fail-fast, `legion keyring status` with a server-computed hint
+  - [x] Phase 2 — automatic data-key rotation (`dataKeyRotationAge`, 2³¹
+        encryption guard), background rewrap that never bumps versions or
+        restarts jobs, retired-key GC, `root-key generate|rewrap`,
+        `rewrap --plaintext`, `reset` break-glass, `legion_keyring_*` metrics,
+        `keyring.*` events, the Manager-page card and the KV-page badge
+  - [x] Phase 3 — `exec` root-key provider (JSON on stdin/stdout, never on a
+        KV read or write path), `legion keyring provider test` conformance
+        harness, reference helpers for AWS KMS and Vault Transit under
+        `plugins/keyring/`
+  - [x] Phase 4 — a joining manager receives the root key inside the raft join
+        reply (sealed under a key derived from the cluster secret), so "join
+        the cluster" stays one command
+
 ## Service discovery (v1)
 
 [plan](plans/service-discovery-final-plan.md) · [docs](../docs/service-discovery.md)
@@ -2507,6 +2559,13 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
 - [x] Streaming SQLite replication, Litestream-style, with optional lease failover
 - [x] Raft control plane: leader election, failover controls, membership,
       observability, CLI and UI operations
+- [x] Snapshot install no longer loses the writes that follow it (2026-09-29):
+      the WAL checkpointer's connection is now closed and reopened with every
+      other connection when `install_state_db` swaps the state file. Left open
+      on the replaced inode it checkpointed the new file's WAL into the old
+      one and truncated it, which reverted a fresh joiner to the seed image
+      (`tests/raft_durability.rs` caught it once the KV encryption merge
+      shifted the timing)
 
 ## Workload identity
 

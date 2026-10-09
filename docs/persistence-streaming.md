@@ -65,6 +65,12 @@ let secrets = import "secrets.ncl" in
   rustyriver's `FileReplicaClient` (useful for tests and single-host backups).
 - empty string — replication is disabled (local SQLite only).
 
+KV values inside the shipped WAL frames are ciphertext
+([KV Encryption at Rest](kv-encryption.md)), and the root key that decrypts
+them is never part of the replica. Segments written *before* encryption was
+enabled keep whatever plaintext they held until the replica's retention
+removes them — rotate retention after enabling if that history matters.
+
 ## Runtime Behavior
 
 On manager startup in `streaming` mode:

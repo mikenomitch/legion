@@ -79,6 +79,17 @@ const EVAL_SETTLE_MAX_ATTEMPTS: u32 = 3;
 
 #[instrument(err, skip_all)]
 pub async fn run_manager(config: ManagerConfig, run_worker: bool) -> R<()> {
+    run_manager_with(config, run_worker, None).await
+}
+
+/// [`run_manager`] with the `--restore-from` provenance: when a backup was
+/// just copied into place, the manager refuses to serve if the restored KV
+/// values cannot be decrypted here (docs/kv-encryption.md, "Backups").
+pub async fn run_manager_with(
+    config: ManagerConfig,
+    run_worker: bool,
+    restored_from: Option<String>,
+) -> R<()> {
     info!("Starting manager node");
 
     let full_config = config.with_defaults();
@@ -111,6 +122,12 @@ pub async fn run_manager(config: ManagerConfig, run_worker: bool) -> R<()> {
     )?;
     let manager_node_id = format!("{}:{}", full_config.server.host, full_config.server.port);
     let store = Store::start_storage(&full_config)?;
+    // A restore is an explicit operator action with the operator present:
+    // fail fast, naming the missing root key, rather than serve a cluster
+    // whose secrets are unreadable.
+    if let Some(backup) = &restored_from {
+        store.verify_keyring_after_restore(backup)?;
+    }
     // Startup-time mutations are leader-only in raft mode (they replicate
     // like any other write; a follower would be rejected with a leader hint
     // anyway) — and leadership is PER LANE: under `lanes` topology a node
@@ -182,6 +199,10 @@ pub async fn run_manager(config: ManagerConfig, run_worker: bool) -> R<()> {
                     {
                         warn!(error = ?err, "Failed upserting manager config after leadership acquisition");
                     }
+                    // The keyring loop initializes/rotates/rewraps on the
+                    // leader only; wake it so a new leader picks that up now
+                    // instead of on its next tick.
+                    watch_store.keyring().wake();
                 }
                 was_control_leader = control_leader;
                 let scheduler_leader = watch_store.is_raft_leader(crate::storage::Lane::Scheduler);
@@ -199,6 +220,8 @@ pub async fn run_manager(config: ManagerConfig, run_worker: bool) -> R<()> {
     let store_copy_a = store.clone();
 
     let store_copy_b = store.clone();
+
+    let store_for_keyring = store.clone();
 
     // Workload identity (OIDC issuer): only constructed when enabled. The
     // signing keys are restored from (or first-boot persisted to) the store,
@@ -467,14 +490,135 @@ pub async fn run_manager(config: ManagerConfig, run_worker: bool) -> R<()> {
         }
         Ok::<(), anyhow::Error>(())
     };
+    let keyring_fut = start_keyring_maintenance(store_for_keyring);
     let _res = join!(
         start_server_fut,
         node_checker_fut,
         eval_loop_fut,
         worker_fut,
-        rotation_fut
+        rotation_fut,
+        keyring_fut
     );
 
+    Ok(())
+}
+
+/// How often the keyring loop ticks when nothing wakes it earlier.
+const KEYRING_TICK_INTERVAL: Duration = Duration::from_secs(15);
+
+/// Background KV keyring maintenance (docs/kv-encryption.md). On every
+/// manager: unwrap data keys that arrive by replication, or a root key that
+/// appears on disk, and keep the gauges fresh. On the control-lane leader
+/// only: initialize the keyring once the raft upgrade gate opens, rotate the
+/// data key at `dataKeyRotationAge`, rewrap values under the active key
+/// (including plaintext rows from before the upgrade), and collect retired
+/// keys. Woken by every replicated keyring change and by leadership
+/// acquisition; ticks every 15s otherwise. Provider calls (a KMS, for
+/// `exec`) run on the blocking pool, never on the raft apply thread.
+async fn start_keyring_maintenance(store: Store) -> R<()> {
+    let keyring = store.keyring().clone();
+    loop {
+        tokio::select! {
+            _ = keyring.wait_for_change() => {}
+            _ = tokio::time::sleep(KEYRING_TICK_INTERVAL) => {}
+        }
+        let tick_store = store.clone();
+        match tokio::task::spawn_blocking(move || keyring_tick(&tick_store)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => warn!(error = ?err, "KV keyring maintenance tick failed"),
+            Err(err) => warn!(error = ?err, "KV keyring maintenance tick panicked"),
+        }
+    }
+}
+
+/// One pass of [`start_keyring_maintenance`]; also what tests drive directly.
+pub fn keyring_tick(store: &Store) -> R<()> {
+    let keyring = store.keyring();
+    let before = keyring.snapshot();
+
+    // Anything locked, a provider error, or an exec provider (whose reload
+    // is deferred to this loop): try to unwrap again.
+    let needs_reload = !before.locked.is_empty()
+        || before.provider_error.is_some()
+        || keyring.provider().kind() == crate::storage::keyring::PROVIDER_EXEC;
+    if needs_reload {
+        let unlocked = store.load_keyring()?;
+        if !unlocked.is_empty() {
+            info!(keys = ?unlocked, "Unwrapped KV data keys");
+        }
+    }
+    let after = keyring.snapshot();
+    if before.state == "locked" && after.state == "unlocked" {
+        store.emit_event(crate::storage::events::EventDraft::info(
+            "keyring.unlocked",
+            "KV keyring unlocked: every data key is available on this manager",
+        ));
+    } else if before.state != "locked" && after.state == "locked" {
+        let reasons: Vec<String> = after
+            .locked
+            .iter()
+            .map(|locked| format!("{}: {}", locked.key_id, locked.reason))
+            .collect();
+        store.emit_event(
+            crate::storage::events::EventDraft::warn(
+                "keyring.locked",
+                "KV keyring locked: a data key cannot be unwrapped on this manager",
+            )
+            .meta(json!({ "keys": reasons })),
+        );
+    }
+
+    if keyring.enabled() && store.is_raft_leader(crate::storage::Lane::Control) {
+        match store.ensure_keyring_initialized()? {
+            crate::storage::store::KeyringInit::Initialized {
+                key_id,
+                root_key_id,
+                minted_root_key,
+            } => {
+                if minted_root_key {
+                    info!(
+                        root_key_id = %root_key_id,
+                        path = %keyring.provider().location(),
+                        "Minted the KV root key — keep this file with your backups and on every manager"
+                    );
+                }
+                info!(key_id = %key_id, "Initialized the KV keyring");
+            }
+            crate::storage::store::KeyringInit::PendingUpgrade(reason) => {
+                if before.pending_upgrade.as_deref() != Some(reason.as_str()) {
+                    info!("KV encryption waits for the manager upgrade to finish: {reason}");
+                }
+            }
+            crate::storage::store::KeyringInit::NoRootKey(reason)
+                if before.provider_error.is_none() =>
+            {
+                warn!("KV encryption cannot start: {reason}");
+            }
+            _ => {}
+        }
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        if let Some(reason) = keyring.rotation_due(now) {
+            match store.rotate_data_key(&reason) {
+                Ok(_) => {}
+                Err(err) => warn!(error = ?err, "Automatic KV data key rotation failed"),
+            }
+        }
+        if keyring.snapshot().can_encrypt()
+            && !keyring.rewrap_running()
+            && store.kv_rows_pending_rewrap(false)? > 0
+        {
+            match store.run_rewrap(false) {
+                Ok(run) => info!(
+                    rewrapped = run.rewrapped,
+                    collected = ?run.collected_keys,
+                    "Background KV rewrap finished"
+                ),
+                Err(err) => warn!(error = ?err, "Background KV rewrap failed"),
+            }
+        }
+    }
+
+    store.refresh_keyring_gauges();
     Ok(())
 }
 
@@ -1170,6 +1314,9 @@ fn leadership_acquired(was_leader: bool, is_leader: bool) -> bool {
 /// extra loop or per-write bookkeeping is needed.
 fn refresh_cluster_gauges(store: &Store) {
     let telemetry = crate::manager::telemetry::metrics();
+    // KV keyring gauges ride the same tick, so a locked keyring shows within
+    // one scrape even between the keyring loop's own ticks.
+    store.refresh_keyring_gauges();
     match store.node_status_counts() {
         Ok(counts) => {
             let entries: Vec<(Vec<String>, i64)> = counts

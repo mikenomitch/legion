@@ -10190,6 +10190,17 @@ export class GetStateBackupReply extends Message<GetStateBackupReply> {
    */
   appliedIndex = protoInt64.zero;
 
+  /**
+   * How KV values are held in this backup (docs/kv-encryption.md). When
+   * `enabled`, the file carries ciphertext plus the WRAPPED data keys and is
+   * useless without the root key, which is deliberately NOT in it:
+   * `root_key_provider` / `root_key_location` say where to find it and
+   * `root_key_ids` which key(s) a restore will need. Keep them together.
+   *
+   * @generated from field: legion.BackupEncryptionInfo encryption = 4;
+   */
+  encryption?: BackupEncryptionInfo;
+
   constructor(data?: PartialMessage<GetStateBackupReply>) {
     super();
     proto3.util.initPartial(data, this);
@@ -10201,6 +10212,7 @@ export class GetStateBackupReply extends Message<GetStateBackupReply> {
     { no: 1, name: "path", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 2, name: "bytes", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
     { no: 3, name: "applied_index", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 4, name: "encryption", kind: "message", T: BackupEncryptionInfo },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetStateBackupReply {
@@ -10217,6 +10229,843 @@ export class GetStateBackupReply extends Message<GetStateBackupReply> {
 
   static equals(a: GetStateBackupReply | PlainMessage<GetStateBackupReply> | undefined, b: GetStateBackupReply | PlainMessage<GetStateBackupReply> | undefined): boolean {
     return proto3.util.equals(GetStateBackupReply, a, b);
+  }
+}
+
+/**
+ * Request payload for GetKeyringStatus. No fields: the reply describes the
+ * manager that answers.
+ *
+ * @generated from message legion.GetKeyringStatusRequest
+ */
+export class GetKeyringStatusRequest extends Message<GetKeyringStatusRequest> {
+  constructor(data?: PartialMessage<GetKeyringStatusRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetKeyringStatusRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetKeyringStatusRequest {
+    return new GetKeyringStatusRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetKeyringStatusRequest {
+    return new GetKeyringStatusRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetKeyringStatusRequest {
+    return new GetKeyringStatusRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetKeyringStatusRequest | PlainMessage<GetKeyringStatusRequest> | undefined, b: GetKeyringStatusRequest | PlainMessage<GetKeyringStatusRequest> | undefined): boolean {
+    return proto3.util.equals(GetKeyringStatusRequest, a, b);
+  }
+}
+
+/**
+ * One data key in the KV keyring (see GetKeyringStatusReply).
+ *
+ * @generated from message legion.KeyringKeyInfo
+ */
+export class KeyringKeyInfo extends Message<KeyringKeyInfo> {
+  /**
+   * Data key id (`dk_…`). Values reference it in `kv_entry.enc_key_id`.
+   *
+   * @generated from field: string key_id = 1;
+   */
+  keyId = "";
+
+  /**
+   * `active` (encrypts new writes) or `retired` (still decrypts what it
+   * protected until the rewrap converts those values).
+   *
+   * @generated from field: string state = 2;
+   */
+  state = "";
+
+  /**
+   * Cipher this key is used with (`aes-256-gcm`).
+   *
+   * @generated from field: string algorithm = 3;
+   */
+  algorithm = "";
+
+  /**
+   * Unix seconds the key was created.
+   *
+   * @generated from field: int64 created_at = 4;
+   */
+  createdAt = protoInt64.zero;
+
+  /**
+   * Unix seconds the key was retired; unset while active.
+   *
+   * @generated from field: optional int64 retired_at = 5;
+   */
+  retiredAt?: bigint;
+
+  /**
+   * Id of the root key this data key is wrapped under, and the provider
+   * kind that wrapped it.
+   *
+   * @generated from field: string root_key_id = 6;
+   */
+  rootKeyId = "";
+
+  /**
+   * @generated from field: string root_provider = 7;
+   */
+  rootProvider = "";
+
+  /**
+   * KV values currently encrypted under this key.
+   *
+   * @generated from field: int64 value_count = 8;
+   */
+  valueCount = protoInt64.zero;
+
+  /**
+   * Whether THIS manager has unwrapped the key. `false` means the values
+   * under it are unreadable here; `error` says why.
+   *
+   * @generated from field: bool unwrapped = 9;
+   */
+  unwrapped = false;
+
+  /**
+   * @generated from field: string error = 10;
+   */
+  error = "";
+
+  constructor(data?: PartialMessage<KeyringKeyInfo>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.KeyringKeyInfo";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "key_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "state", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "algorithm", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "created_at", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 5, name: "retired_at", kind: "scalar", T: 3 /* ScalarType.INT64 */, opt: true },
+    { no: 6, name: "root_key_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 7, name: "root_provider", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 8, name: "value_count", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 9, name: "unwrapped", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 10, name: "error", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): KeyringKeyInfo {
+    return new KeyringKeyInfo().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): KeyringKeyInfo {
+    return new KeyringKeyInfo().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): KeyringKeyInfo {
+    return new KeyringKeyInfo().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: KeyringKeyInfo | PlainMessage<KeyringKeyInfo> | undefined, b: KeyringKeyInfo | PlainMessage<KeyringKeyInfo> | undefined): boolean {
+    return proto3.util.equals(KeyringKeyInfo, a, b);
+  }
+}
+
+/**
+ * Progress of the background rewrap (see GetKeyringStatusReply).
+ *
+ * @generated from message legion.KeyringRewrapProgress
+ */
+export class KeyringRewrapProgress extends Message<KeyringRewrapProgress> {
+  /**
+   * Values not yet under the active data key (plaintext rows included).
+   *
+   * @generated from field: int64 pending = 1;
+   */
+  pending = protoInt64.zero;
+
+  /**
+   * Whether the manager's keyring loop is currently converting them.
+   *
+   * @generated from field: bool running = 2;
+   */
+  running = false;
+
+  /**
+   * Last rewrap error on this manager, if any (cleared on success).
+   *
+   * @generated from field: string last_error = 3;
+   */
+  lastError = "";
+
+  constructor(data?: PartialMessage<KeyringRewrapProgress>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.KeyringRewrapProgress";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "pending", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 2, name: "running", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 3, name: "last_error", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): KeyringRewrapProgress {
+    return new KeyringRewrapProgress().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): KeyringRewrapProgress {
+    return new KeyringRewrapProgress().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): KeyringRewrapProgress {
+    return new KeyringRewrapProgress().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: KeyringRewrapProgress | PlainMessage<KeyringRewrapProgress> | undefined, b: KeyringRewrapProgress | PlainMessage<KeyringRewrapProgress> | undefined): boolean {
+    return proto3.util.equals(KeyringRewrapProgress, a, b);
+  }
+}
+
+/**
+ * Reply payload for GetKeyringStatus.
+ *
+ * @generated from message legion.GetKeyringStatusReply
+ */
+export class GetKeyringStatusReply extends Message<GetKeyringStatusReply> {
+  /**
+   * `encryption.enabled` on this manager.
+   *
+   * @generated from field: bool enabled = 1;
+   */
+  enabled = false;
+
+  /**
+   * `disabled` | `uninitialized` | `pending_upgrade` | `unlocked` | `locked`.
+   *
+   * `uninitialized`: enabled, but no data key exists yet (the leader has
+   * not run initialization); values are written as plaintext rows until it
+   * does. `pending_upgrade`: raft, and a voter runs a build without the
+   * keyring, so the leader is deliberately holding off (`hint` names the
+   * manager). `locked`: at least one data key cannot be unwrapped here.
+   *
+   * @generated from field: string state = 2;
+   */
+  state = "";
+
+  /**
+   * Root key provider kind (`file` | `env` | `exec`) and where it looks.
+   *
+   * @generated from field: string root_key_provider = 3;
+   */
+  rootKeyProvider = "";
+
+  /**
+   * @generated from field: string root_key_location = 4;
+   */
+  rootKeyLocation = "";
+
+  /**
+   * Id of the root key the provider would wrap with right now, when it has
+   * material.
+   *
+   * @generated from field: string root_key_id = 5;
+   */
+  rootKeyId = "";
+
+  /**
+   * Data keys, active first.
+   *
+   * @generated from field: repeated legion.KeyringKeyInfo keys = 6;
+   */
+  keys: KeyringKeyInfo[] = [];
+
+  /**
+   * KV rows stored as plaintext / encrypted.
+   *
+   * @generated from field: int64 plaintext_rows = 7;
+   */
+  plaintextRows = protoInt64.zero;
+
+  /**
+   * @generated from field: int64 encrypted_rows = 8;
+   */
+  encryptedRows = protoInt64.zero;
+
+  /**
+   * Background rewrap state.
+   *
+   * @generated from field: legion.KeyringRewrapProgress rewrap = 9;
+   */
+  rewrap?: KeyringRewrapProgress;
+
+  /**
+   * Configured `encryption.dataKeyRotationAge` and the active key's age.
+   *
+   * @generated from field: string data_key_rotation_age = 10;
+   */
+  dataKeyRotationAge = "";
+
+  /**
+   * @generated from field: int64 active_key_age_seconds = 11;
+   */
+  activeKeyAgeSeconds = protoInt64.zero;
+
+  /**
+   * The one thing to do next, in plain language, when there is one
+   * (copy the root key from another manager, run a rewrap, finish an
+   * upgrade). Empty when everything is as it should be.
+   *
+   * @generated from field: string hint = 12;
+   */
+  hint = "";
+
+  /**
+   * The manager answering (`host:port`), since the keyring is per-manager.
+   *
+   * @generated from field: string manager = 13;
+   */
+  manager = "";
+
+  constructor(data?: PartialMessage<GetKeyringStatusReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetKeyringStatusReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "enabled", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 2, name: "state", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "root_key_provider", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "root_key_location", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 5, name: "root_key_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 6, name: "keys", kind: "message", T: KeyringKeyInfo, repeated: true },
+    { no: 7, name: "plaintext_rows", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 8, name: "encrypted_rows", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 9, name: "rewrap", kind: "message", T: KeyringRewrapProgress },
+    { no: 10, name: "data_key_rotation_age", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 11, name: "active_key_age_seconds", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 12, name: "hint", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 13, name: "manager", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetKeyringStatusReply {
+    return new GetKeyringStatusReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetKeyringStatusReply {
+    return new GetKeyringStatusReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetKeyringStatusReply {
+    return new GetKeyringStatusReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetKeyringStatusReply | PlainMessage<GetKeyringStatusReply> | undefined, b: GetKeyringStatusReply | PlainMessage<GetKeyringStatusReply> | undefined): boolean {
+    return proto3.util.equals(GetKeyringStatusReply, a, b);
+  }
+}
+
+/**
+ * Request payload for RotateDataKey.
+ *
+ * @generated from message legion.RotateDataKeyRequest
+ */
+export class RotateDataKeyRequest extends Message<RotateDataKeyRequest> {
+  /**
+   * Optional idempotency key. A repeated call with the same key returns the
+   * recorded outcome with `deduplicated = true` instead of rotating again.
+   *
+   * @generated from field: optional string idempotency_key = 1;
+   */
+  idempotencyKey?: string;
+
+  constructor(data?: PartialMessage<RotateDataKeyRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.RotateDataKeyRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "idempotency_key", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): RotateDataKeyRequest {
+    return new RotateDataKeyRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): RotateDataKeyRequest {
+    return new RotateDataKeyRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): RotateDataKeyRequest {
+    return new RotateDataKeyRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: RotateDataKeyRequest | PlainMessage<RotateDataKeyRequest> | undefined, b: RotateDataKeyRequest | PlainMessage<RotateDataKeyRequest> | undefined): boolean {
+    return proto3.util.equals(RotateDataKeyRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for RotateDataKey.
+ *
+ * @generated from message legion.RotateDataKeyReply
+ */
+export class RotateDataKeyReply extends Message<RotateDataKeyReply> {
+  /**
+   * The new active data key.
+   *
+   * @generated from field: string key_id = 1;
+   */
+  keyId = "";
+
+  /**
+   * The data key it retired (empty when there was none).
+   *
+   * @generated from field: string retired_key_id = 2;
+   */
+  retiredKeyId = "";
+
+  /**
+   * True when a previous call with the same idempotency key already
+   * rotated and this reply is its recorded outcome.
+   *
+   * @generated from field: bool deduplicated = 3;
+   */
+  deduplicated = false;
+
+  constructor(data?: PartialMessage<RotateDataKeyReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.RotateDataKeyReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "key_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "retired_key_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "deduplicated", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): RotateDataKeyReply {
+    return new RotateDataKeyReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): RotateDataKeyReply {
+    return new RotateDataKeyReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): RotateDataKeyReply {
+    return new RotateDataKeyReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: RotateDataKeyReply | PlainMessage<RotateDataKeyReply> | undefined, b: RotateDataKeyReply | PlainMessage<RotateDataKeyReply> | undefined): boolean {
+    return proto3.util.equals(RotateDataKeyReply, a, b);
+  }
+}
+
+/**
+ * Request payload for RewrapKv.
+ *
+ * @generated from message legion.RewrapKvRequest
+ */
+export class RewrapKvRequest extends Message<RewrapKvRequest> {
+  /**
+   * Decrypt every value into a plaintext row instead of re-encrypting
+   * under the active key. The step before disabling encryption or
+   * downgrading to a build without the keyring.
+   *
+   * @generated from field: bool plaintext = 1;
+   */
+  plaintext = false;
+
+  /**
+   * Optional idempotency key (see RotateDataKeyRequest).
+   *
+   * @generated from field: optional string idempotency_key = 2;
+   */
+  idempotencyKey?: string;
+
+  constructor(data?: PartialMessage<RewrapKvRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.RewrapKvRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "plaintext", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 2, name: "idempotency_key", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): RewrapKvRequest {
+    return new RewrapKvRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): RewrapKvRequest {
+    return new RewrapKvRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): RewrapKvRequest {
+    return new RewrapKvRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: RewrapKvRequest | PlainMessage<RewrapKvRequest> | undefined, b: RewrapKvRequest | PlainMessage<RewrapKvRequest> | undefined): boolean {
+    return proto3.util.equals(RewrapKvRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for RewrapKv.
+ *
+ * @generated from message legion.RewrapKvReply
+ */
+export class RewrapKvReply extends Message<RewrapKvReply> {
+  /**
+   * Values rewritten by this call.
+   *
+   * @generated from field: int64 rewrapped = 1;
+   */
+  rewrapped = protoInt64.zero;
+
+  /**
+   * Values still pending afterwards (0 on a completed run; non-zero only
+   * when a batch failed — the message says why).
+   *
+   * @generated from field: int64 remaining = 2;
+   */
+  remaining = protoInt64.zero;
+
+  /**
+   * Retired data keys garbage-collected once nothing referenced them.
+   *
+   * @generated from field: repeated string collected_keys = 3;
+   */
+  collectedKeys: string[] = [];
+
+  /**
+   * @generated from field: bool deduplicated = 4;
+   */
+  deduplicated = false;
+
+  constructor(data?: PartialMessage<RewrapKvReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.RewrapKvReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "rewrapped", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 2, name: "remaining", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 3, name: "collected_keys", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+    { no: 4, name: "deduplicated", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): RewrapKvReply {
+    return new RewrapKvReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): RewrapKvReply {
+    return new RewrapKvReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): RewrapKvReply {
+    return new RewrapKvReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: RewrapKvReply | PlainMessage<RewrapKvReply> | undefined, b: RewrapKvReply | PlainMessage<RewrapKvReply> | undefined): boolean {
+    return proto3.util.equals(RewrapKvReply, a, b);
+  }
+}
+
+/**
+ * Request payload for RewrapRootKey.
+ *
+ * @generated from message legion.RewrapRootKeyRequest
+ */
+export class RewrapRootKeyRequest extends Message<RewrapRootKeyRequest> {
+  /**
+   * Optional idempotency key (see RotateDataKeyRequest).
+   *
+   * @generated from field: optional string idempotency_key = 1;
+   */
+  idempotencyKey?: string;
+
+  constructor(data?: PartialMessage<RewrapRootKeyRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.RewrapRootKeyRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "idempotency_key", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): RewrapRootKeyRequest {
+    return new RewrapRootKeyRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): RewrapRootKeyRequest {
+    return new RewrapRootKeyRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): RewrapRootKeyRequest {
+    return new RewrapRootKeyRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: RewrapRootKeyRequest | PlainMessage<RewrapRootKeyRequest> | undefined, b: RewrapRootKeyRequest | PlainMessage<RewrapRootKeyRequest> | undefined): boolean {
+    return proto3.util.equals(RewrapRootKeyRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for RewrapRootKey.
+ *
+ * @generated from message legion.RewrapRootKeyReply
+ */
+export class RewrapRootKeyReply extends Message<RewrapRootKeyReply> {
+  /**
+   * Data keys now wrapped under `root_key_id`.
+   *
+   * @generated from field: int64 keys = 1;
+   */
+  keys = protoInt64.zero;
+
+  /**
+   * The root key everything is wrapped under after this call.
+   *
+   * @generated from field: string root_key_id = 2;
+   */
+  rootKeyId = "";
+
+  /**
+   * Data keys left untouched because this manager cannot unwrap them.
+   *
+   * @generated from field: repeated string skipped = 3;
+   */
+  skipped: string[] = [];
+
+  /**
+   * @generated from field: bool deduplicated = 4;
+   */
+  deduplicated = false;
+
+  constructor(data?: PartialMessage<RewrapRootKeyReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.RewrapRootKeyReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "keys", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 2, name: "root_key_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "skipped", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+    { no: 4, name: "deduplicated", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): RewrapRootKeyReply {
+    return new RewrapRootKeyReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): RewrapRootKeyReply {
+    return new RewrapRootKeyReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): RewrapRootKeyReply {
+    return new RewrapRootKeyReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: RewrapRootKeyReply | PlainMessage<RewrapRootKeyReply> | undefined, b: RewrapRootKeyReply | PlainMessage<RewrapRootKeyReply> | undefined): boolean {
+    return proto3.util.equals(RewrapRootKeyReply, a, b);
+  }
+}
+
+/**
+ * Request payload for ResetKeyring.
+ *
+ * @generated from message legion.ResetKeyringRequest
+ */
+export class ResetKeyringRequest extends Message<ResetKeyringRequest> {
+  /**
+   * Must be exactly `DELETE-UNDECRYPTABLE-VALUES`.
+   *
+   * @generated from field: string confirm = 1;
+   */
+  confirm = "";
+
+  constructor(data?: PartialMessage<ResetKeyringRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ResetKeyringRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "confirm", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ResetKeyringRequest {
+    return new ResetKeyringRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ResetKeyringRequest {
+    return new ResetKeyringRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ResetKeyringRequest {
+    return new ResetKeyringRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ResetKeyringRequest | PlainMessage<ResetKeyringRequest> | undefined, b: ResetKeyringRequest | PlainMessage<ResetKeyringRequest> | undefined): boolean {
+    return proto3.util.equals(ResetKeyringRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for ResetKeyring.
+ *
+ * @generated from message legion.ResetKeyringReply
+ */
+export class ResetKeyringReply extends Message<ResetKeyringReply> {
+  /**
+   * KV key paths whose values were deleted because nothing could decrypt them.
+   *
+   * @generated from field: repeated string deleted_values = 1;
+   */
+  deletedValues: string[] = [];
+
+  /**
+   * Data key ids dropped from the keyring.
+   *
+   * @generated from field: repeated string dropped_keys = 2;
+   */
+  droppedKeys: string[] = [];
+
+  /**
+   * The active data key after the reset.
+   *
+   * @generated from field: string active_key_id = 3;
+   */
+  activeKeyId = "";
+
+  constructor(data?: PartialMessage<ResetKeyringReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ResetKeyringReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "deleted_values", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+    { no: 2, name: "dropped_keys", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+    { no: 3, name: "active_key_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ResetKeyringReply {
+    return new ResetKeyringReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ResetKeyringReply {
+    return new ResetKeyringReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ResetKeyringReply {
+    return new ResetKeyringReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ResetKeyringReply | PlainMessage<ResetKeyringReply> | undefined, b: ResetKeyringReply | PlainMessage<ResetKeyringReply> | undefined): boolean {
+    return proto3.util.equals(ResetKeyringReply, a, b);
+  }
+}
+
+/**
+ * How a state backup's KV values are protected (see GetStateBackupReply).
+ *
+ * @generated from message legion.BackupEncryptionInfo
+ */
+export class BackupEncryptionInfo extends Message<BackupEncryptionInfo> {
+  /**
+   * `encryption.enabled` on the manager that wrote the backup.
+   *
+   * @generated from field: bool enabled = 1;
+   */
+  enabled = false;
+
+  /**
+   * Root key provider: `file`, `env`, or `exec`.
+   *
+   * @generated from field: string root_key_provider = 2;
+   */
+  rootKeyProvider = "";
+
+  /**
+   * Where the root key lives: the key file path, the variable name, or the
+   * provider command. Never the key itself.
+   *
+   * @generated from field: string root_key_location = 3;
+   */
+  rootKeyLocation = "";
+
+  /**
+   * Ids of the root keys the backup's data keys are wrapped under
+   * (`rk_…` fingerprints, or a KMS key id for `exec`). A restore needs
+   * every one of them available to read every value.
+   *
+   * @generated from field: repeated string root_key_ids = 4;
+   */
+  rootKeyIds: string[] = [];
+
+  /**
+   * Values still stored as plaintext rows (pre-encryption rows a rewrap has
+   * not converted). 0 once `legion keyring rewrap` has run to completion.
+   *
+   * @generated from field: int64 plaintext_rows = 5;
+   */
+  plaintextRows = protoInt64.zero;
+
+  constructor(data?: PartialMessage<BackupEncryptionInfo>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.BackupEncryptionInfo";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "enabled", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 2, name: "root_key_provider", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "root_key_location", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "root_key_ids", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+    { no: 5, name: "plaintext_rows", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): BackupEncryptionInfo {
+    return new BackupEncryptionInfo().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): BackupEncryptionInfo {
+    return new BackupEncryptionInfo().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): BackupEncryptionInfo {
+    return new BackupEncryptionInfo().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: BackupEncryptionInfo | PlainMessage<BackupEncryptionInfo> | undefined, b: BackupEncryptionInfo | PlainMessage<BackupEncryptionInfo> | undefined): boolean {
+    return proto3.util.equals(BackupEncryptionInfo, a, b);
   }
 }
 
@@ -10270,6 +11119,18 @@ export class KvEntry extends Message<KvEntry> {
    */
   updatedAt = "";
 
+  /**
+   * Whether the value is stored encrypted at rest (docs/kv-encryption.md).
+   *
+   * `value` is always the plaintext on the wire; this only reports how the
+   * row is held in the store. `false` for rows written before encryption
+   * was enabled (or with `encryption.enabled = false`) that no rewrap has
+   * converted yet — `legion keyring status` counts them.
+   *
+   * @generated from field: bool encrypted = 7;
+   */
+  encrypted = false;
+
   constructor(data?: PartialMessage<KvEntry>) {
     super();
     proto3.util.initPartial(data, this);
@@ -10284,6 +11145,7 @@ export class KvEntry extends Message<KvEntry> {
     { no: 4, name: "version", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
     { no: 5, name: "created_at", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 6, name: "updated_at", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 7, name: "encrypted", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): KvEntry {
@@ -18474,6 +19336,19 @@ export class JoinRaftClusterReply extends Message<JoinRaftClusterReply> {
    */
   groups: RaftGroupMembership[] = [];
 
+  /**
+   * The cluster's KV root key material for the joiner (docs/kv-encryption.md),
+   * so "join the cluster" is one command on a cluster whose root key lives
+   * in a file: AES-256-GCM under a key derived (HKDF-SHA256) from the
+   * cluster secret, bound to the cluster id. Empty when the leader's
+   * provider does not export material (`exec` — a KMS-held key never
+   * leaves the KMS) or has none. The joiner writes it to its own key file
+   * only if that file does not exist yet, never overwriting one.
+   *
+   * @generated from field: bytes root_key_bundle = 4;
+   */
+  rootKeyBundle = new Uint8Array(0);
+
   constructor(data?: PartialMessage<JoinRaftClusterReply>) {
     super();
     proto3.util.initPartial(data, this);
@@ -18485,6 +19360,7 @@ export class JoinRaftClusterReply extends Message<JoinRaftClusterReply> {
     { no: 1, name: "assigned_raft_id", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
     { no: 2, name: "cluster_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 3, name: "groups", kind: "message", T: RaftGroupMembership, repeated: true },
+    { no: 4, name: "root_key_bundle", kind: "scalar", T: 12 /* ScalarType.BYTES */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): JoinRaftClusterReply {

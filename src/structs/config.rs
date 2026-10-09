@@ -123,6 +123,214 @@ pub struct ManagerConfig {
     /// checkpoint (see docs/node-liveness.md).
     #[serde(default)]
     pub liveness: Option<LivenessConfig>,
+    /// KV encryption at rest (see docs/kv-encryption.md). ON by default:
+    /// omitting the block encrypts every KV value under a data key wrapped
+    /// by a root key the manager mints at `<storePath>/keys/root.key`.
+    #[serde(default)]
+    pub encryption: Option<EncryptionConfig>,
+}
+
+/// KV encryption at rest (docs/kv-encryption.md).
+///
+/// Omitting the whole block is the recommended configuration: encryption on,
+/// the `file` root-key provider, a root key minted on first start, data keys
+/// rotated every 30 days. The block exists for the two things an operator
+/// might actually want to change — where the root key lives (`env`, or an
+/// external KMS through `exec`) and whether encryption is on at all.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct EncryptionConfig {
+    /// Master switch. Default: true. With `false`, new KV writes are stored
+    /// as plaintext rows; existing ciphertext rows are still decrypted on
+    /// read while the root key is available (`legion keyring rewrap
+    /// --plaintext` converts them).
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    /// Where the root key lives. Default: the `file` provider at
+    /// `<storePath>/keys/root.key`.
+    #[serde(default)]
+    pub root_key: Option<RootKeyConfig>,
+    /// Age past which the active data key is rotated automatically (one
+    /// replicated write, followed by a background rewrap of every value).
+    /// Default `720h` (30 days).
+    #[serde(default)]
+    pub data_key_rotation_age: Option<String>,
+}
+
+/// The root key provider (`encryption.rootKey`).
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RootKeyConfig {
+    /// `file` (default) | `env` | `exec`.
+    #[serde(default)]
+    pub provider: Option<String>,
+    /// `file` only: path of the key file (one base64 32-byte key per line;
+    /// the first line wraps, every line unwraps). Default
+    /// `<storePath>/keys/root.key`.
+    #[serde(default)]
+    pub path: Option<String>,
+    /// `env` only: the variable holding the key text (same format as the
+    /// file; commas may separate keys). Default `LEGION_ROOT_KEY`.
+    #[serde(default)]
+    pub var: Option<String>,
+    /// `exec` only: the command (argv) that wraps and unwraps data keys
+    /// through a KMS — see docs/kv-encryption.md for the JSON contract and
+    /// the reference plugins under `plugins/keyring/`.
+    #[serde(default)]
+    pub command: Option<Vec<String>>,
+    /// `exec` only: how long one provider call may take. Default `10s`.
+    #[serde(default)]
+    pub timeout: Option<String>,
+}
+
+/// Resolved [`EncryptionConfig`].
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct EncryptionConfigFull {
+    pub enabled: bool,
+    pub root_key: RootKeyConfigFull,
+    pub data_key_rotation_age: String,
+}
+
+/// Resolved [`RootKeyConfig`].
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RootKeyConfigFull {
+    pub provider: String,
+    /// `None` means the provider's default location (`<storePath>/keys/root.key`).
+    pub path: Option<String>,
+    pub var: String,
+    pub command: Vec<String>,
+    pub timeout: String,
+}
+
+/// Default data-key rotation age (Nomad's `root_key_rotation_threshold`).
+pub const DEF_DATA_KEY_ROTATION_AGE: &str = "720h";
+/// Default timeout for one `exec` root-key provider call.
+pub const DEF_ROOT_KEY_EXEC_TIMEOUT: &str = "10s";
+
+impl Default for RootKeyConfigFull {
+    fn default() -> Self {
+        RootKeyConfigFull {
+            provider: "file".into(),
+            path: None,
+            var: "LEGION_ROOT_KEY".into(),
+            command: Vec::new(),
+            timeout: DEF_ROOT_KEY_EXEC_TIMEOUT.into(),
+        }
+    }
+}
+
+impl Default for EncryptionConfigFull {
+    fn default() -> Self {
+        EncryptionConfigFull {
+            enabled: true,
+            root_key: RootKeyConfigFull::default(),
+            data_key_rotation_age: DEF_DATA_KEY_ROTATION_AGE.into(),
+        }
+    }
+}
+
+impl RootKeyConfig {
+    pub fn with_defaults(&self) -> RootKeyConfigFull {
+        let defaults = RootKeyConfigFull::default();
+        RootKeyConfigFull {
+            provider: self
+                .provider
+                .clone()
+                .map(|provider| provider.trim().to_ascii_lowercase())
+                .filter(|provider| !provider.is_empty())
+                .unwrap_or(defaults.provider),
+            path: self.path.clone().filter(|path| !path.trim().is_empty()),
+            var: self
+                .var
+                .clone()
+                .filter(|var| !var.trim().is_empty())
+                .unwrap_or(defaults.var),
+            command: self.command.clone().unwrap_or_default(),
+            timeout: self
+                .timeout
+                .clone()
+                .filter(|timeout| !timeout.trim().is_empty())
+                .unwrap_or(defaults.timeout),
+        }
+    }
+}
+
+impl EncryptionConfig {
+    pub fn with_defaults(&self) -> EncryptionConfigFull {
+        let defaults = EncryptionConfigFull::default();
+        EncryptionConfigFull {
+            enabled: self.enabled.unwrap_or(defaults.enabled),
+            root_key: self
+                .root_key
+                .as_ref()
+                .map(RootKeyConfig::with_defaults)
+                .unwrap_or_default(),
+            data_key_rotation_age: self
+                .data_key_rotation_age
+                .clone()
+                .filter(|age| !age.trim().is_empty())
+                .unwrap_or(defaults.data_key_rotation_age),
+        }
+    }
+}
+
+impl EncryptionConfigFull {
+    /// Reject combinations that cannot work, naming the field — at startup,
+    /// not on the first KV write.
+    pub fn validate(&self) -> R<()> {
+        match self.root_key.provider.as_str() {
+            "file" | "env" => {}
+            "exec" => {
+                if self.root_key.command.is_empty() {
+                    bail!(
+                        "encryption.rootKey.provider = \"exec\" needs `command = [\"…\"]` (the \
+                         KMS helper to run; see docs/kv-encryption.md)"
+                    );
+                }
+                humantime::parse_duration(&self.root_key.timeout).with_context(|| {
+                    format!(
+                        "encryption.rootKey.timeout `{}` is not a duration (e.g. \"10s\")",
+                        self.root_key.timeout
+                    )
+                })?;
+            }
+            other => bail!(
+                "encryption.rootKey.provider `{other}` is not one of \"file\", \"env\", \"exec\""
+            ),
+        }
+        let age = humantime::parse_duration(&self.data_key_rotation_age).with_context(|| {
+            format!(
+                "encryption.dataKeyRotationAge `{}` is not a duration (e.g. \"720h\")",
+                self.data_key_rotation_age
+            )
+        })?;
+        if age < Duration::from_secs(60) {
+            bail!(
+                "encryption.dataKeyRotationAge `{}` is shorter than 1m; a rotation rewraps \
+                 every value, so rotating that often is a write storm, not a security gain",
+                self.data_key_rotation_age
+            );
+        }
+        Ok(())
+    }
+}
+
+impl From<EncryptionConfigFull> for EncryptionConfig {
+    fn from(val: EncryptionConfigFull) -> Self {
+        EncryptionConfig {
+            enabled: Some(val.enabled),
+            root_key: Some(RootKeyConfig {
+                provider: Some(val.root_key.provider),
+                path: val.root_key.path,
+                var: Some(val.root_key.var),
+                command: Some(val.root_key.command),
+                timeout: Some(val.root_key.timeout),
+            }),
+            data_key_rotation_age: Some(val.data_key_rotation_age),
+        }
+    }
 }
 
 /// Heartbeat cadence and node liveness windows
@@ -1404,6 +1612,8 @@ pub struct ManagerConfigFull {
     pub heartbeat: HeartbeatConfigFull,
     #[serde(default)]
     pub liveness: LivenessConfigFull,
+    #[serde(default)]
+    pub encryption: EncryptionConfigFull,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -1555,6 +1765,7 @@ impl From<ManagerConfigFull> for ManagerConfig {
             edge_boot: Some(val.edge_boot.into()),
             heartbeat: Some(val.heartbeat.into()),
             liveness: Some(val.liveness.into()),
+            encryption: Some(val.encryption.into()),
         }
     }
 }
@@ -1636,6 +1847,11 @@ impl ManagerConfig {
                 .as_ref()
                 .map(LivenessConfig::with_defaults)
                 .unwrap_or_default(),
+            encryption: self
+                .encryption
+                .as_ref()
+                .map(EncryptionConfig::with_defaults)
+                .unwrap_or_default(),
         }
     }
 }
@@ -1664,6 +1880,7 @@ impl Default for ManagerConfigFull {
             edge_boot: EdgeBootConfigFull::default(),
             heartbeat: HeartbeatConfigFull::default(),
             liveness: LivenessConfigFull::default(),
+            encryption: EncryptionConfigFull::default(),
         }
     }
 }

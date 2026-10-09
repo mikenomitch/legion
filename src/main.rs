@@ -25,6 +25,7 @@ fn cli() -> Command {
         .subcommand(cmd::ledger::config())
         .subcommand(cmd::events::config())
         .subcommand(cmd::kv::config())
+        .subcommand(cmd::keyring::config())
         .subcommand(cmd::service::config())
         .subcommand(cmd::net::config())
         .subcommand(cmd::guest_agent::config())
@@ -79,6 +80,7 @@ async fn main() -> R<()> {
         Some(("ledger", sub_matches)) => cmd::ledger::handle(sub_matches).await?,
         Some(("events", sub_matches)) => cmd::events::handle(sub_matches).await?,
         Some(("kv", sub_matches)) => cmd::kv::handle(sub_matches).await?,
+        Some(("keyring", sub_matches)) => cmd::keyring::handle(sub_matches).await?,
         Some(("service", sub_matches)) => cmd::service::handle(sub_matches).await?,
         Some(("net", sub_matches)) => cmd::net::handle(sub_matches).await?,
         Some(("guest-agent", sub_matches)) => cmd::guest_agent::handle(sub_matches).await?,

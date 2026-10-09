@@ -8,13 +8,29 @@ Primary objects:
 
 - `kv_entry`:
   - `key` (string, primary key)
-  - `value` (text)
+  - `value` (text) — stored **encrypted** by default; see below
   - `value_type` (`string`, `number`, `json`)
   - `version` (int64, optimistic concurrency)
+  - `enc_key_id` — the data key the value is encrypted under, `NULL` for a
+    plaintext row
   - timestamps
 - `kv_lock`:
   - `key`, `lock_id`, optional owner
   - acquired/expiry timestamps
+
+## Encryption at rest
+
+Values are encrypted before they reach the store — AES-256-GCM under a data
+key that is itself wrapped by a root key the manager keeps outside the
+database — so the state file, every backup, the streamed replica, and every
+raft snapshot hold ciphertext. It is on by default and needs nothing from
+you beyond keeping `<storePath>/keys/root.key` with your backups. The API
+and CLI are unchanged (`value` is always the plaintext on the wire;
+`KvEntry.encrypted` reports how the row is held), and raw state access
+(`legion state query`, `state:read`) sees ciphertext, so `kv` path policies
+are the only way to read a value. Everything else — providers, rotation,
+what a locked keyring looks like, backups and restores, recovery — is in
+[KV Encryption at Rest](kv-encryption.md).
 
 ## CRUD Operations
 

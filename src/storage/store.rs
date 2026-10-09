@@ -10,13 +10,19 @@ use crate::resources::{NodeUsage, ResourcePolicy, ResourcePool, ResourceRequest}
 use crate::scheduling_index::{IndexSet, IndexSettings};
 use crate::storage::errors::StorageError;
 use crate::storage::events::{drafts, EventDraft, SchedulerEventFilter, SchedulerEventRecord};
+use crate::storage::keyring::Keyring;
 use crate::storage::migrations::get_migrations;
+
+// KV encryption keyring operations (initialization, rotation, rewrap, reset)
+// live in their own file so the keyring's write paths read as one unit.
+mod keyring_ops;
 use crate::storage::persistence::{
     build_persistence_driver, PersistenceDriver, PersistenceRole, PersistenceStatus,
     RaftHistoryEvent, RaftStatus,
 };
 use crate::storage::raft::{capture, ReplicatedOp, ReplicationHandle};
 use crate::storage::Lane;
+pub use keyring_ops::{KeyringInit, KeyringReset, RewrapBatch, RewrapRun, RootKeyRewrap};
 
 use crate::storage::queries::{
     DELETE_SIGNING_KEY, GET_ALLOCATION_BY_ID, GET_ALLOCS, GET_ALLOCS_FOR_JOB,
@@ -52,7 +58,7 @@ use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{MutexGuard, OnceLock, RwLock};
+use std::sync::{MutexGuard, OnceLock, RwLock, Weak};
 use std::time::{Duration, Instant};
 use time::format_description::well_known::Rfc3339;
 use time::macros::format_description;
@@ -885,6 +891,13 @@ impl OwnAllocationUsage {
 pub struct Store {
     pub write_conn: MemSafeConn,
     pub read_conns: Arc<Vec<MemSafeConn>>,
+    /// The WAL checkpointer thread's own connection (see
+    /// [`Store::spawn_wal_checkpointer`]). Held here so
+    /// [`Store::install_state_db`] can close and reopen it with every other
+    /// connection when it swaps the database file: a connection left open on
+    /// the replaced inode would checkpoint the NEW file's WAL into the OLD
+    /// file and then truncate it, silently losing every write since the swap.
+    checkpoint_conn: MemSafeConn,
     // Filesystem path of the state database (`<storePath>/store.sqlite`).
     // Needed by snapshot install (atomic DB swap + connection reopen) and by
     // `state_backup`'s default destination (plan §A5).
@@ -987,6 +1000,25 @@ pub struct Store {
     // is repaired within one sweep of the fleet rather than never. Shared
     // across clones so the sweep is per-process, not per-clone.
     alloc_scrub_queue: Arc<std::sync::Mutex<Vec<String>>>,
+    // KV encryption at rest (docs/kv-encryption.md): the unwrapped data keys
+    // and the root-key provider. Shared across clones; every KV value read
+    // or written goes through it, and it is loaded from the replicated
+    // `keyring_key` table at start and on every change to that table.
+    keyring: Keyring,
+}
+
+/// Column list every `kv_entry` read uses, in the order
+/// [`Store::kv_raw_from_row`] expects. `enc_key_id` is last so the mapper's
+/// positional reads for the original columns never moved.
+const KV_ENTRY_SELECT: &str =
+    "SELECT key, value, value_type, version, created_at, updated_at, enc_key_id FROM kv_entry";
+
+/// A `kv_entry` row before decryption (docs/kv-encryption.md): `entry.value`
+/// is the stored form and `enc_key_id` names the data key it is under, or
+/// `None` for a plaintext row.
+pub(crate) struct KvRaw {
+    pub(crate) entry: KvEntry,
+    pub(crate) enc_key_id: Option<String>,
 }
 
 /// Result of [`Store::state_backup`]: where the backup landed, its size,
@@ -1415,9 +1447,15 @@ impl Store {
             persistence_driver.start()?;
         }
 
+        // KV encryption: a malformed `encryption` block stops the manager
+        // here, with the field named, rather than on the first KV write.
+        config.encryption.validate()?;
+        let keyring = Keyring::from_config(&config.encryption, &config.store_path)?;
+
         let write_conn = Store::create_write_conn(&db_path, raft_enabled)?;
         let _migrations = Store::create_initial_tables(&Arc::clone(&write_conn))?;
         let read_conns = Store::create_read_pool(&db_path, config.eval_threads)?;
+        let checkpoint_conn: MemSafeConn = Arc::new(Mutex::new(Connection::open(&db_path)?));
         let resource_policy = ResourcePolicy::from_manager_config(config)?;
         let index_settings = Arc::new(IndexSettings::from_scheduler_settings(
             config.scheduler_settings.as_ref(),
@@ -1428,6 +1466,7 @@ impl Store {
         let store = Store {
             write_conn,
             read_conns: Arc::new(read_conns),
+            checkpoint_conn,
             db_path: Arc::new(db_path.clone()),
             read_index: Arc::new(AtomicUsize::new(0)),
             scheduling_policy: config.scheduling_policy.clone(),
@@ -1470,10 +1509,16 @@ impl Store {
             liveness: Arc::new(crate::storage::liveness::LivenessTable::new()),
             missed_beats_before_lost: config.heartbeat.missed_beats_before_lost.max(1),
             alloc_scrub_queue: Arc::new(std::sync::Mutex::new(Vec::new())),
+            keyring,
         };
         store.liveness.configure(config.liveness.settings());
 
         store.refresh_read_model()?;
+
+        // Unwrap whatever data keys the (migrated) store already holds, so
+        // reads work from the first request. A root key that is missing here
+        // locks KV, loudly, and never stops the manager (docs/kv-encryption.md).
+        store.load_keyring_at_start();
 
         // Raft mode: start the engine AFTER migrations (the state machines
         // apply into the migrated DB) and BEFORE this store is handed to
@@ -1485,7 +1530,13 @@ impl Store {
             store.persistence_driver.clone().start_engine(&store)?;
         }
 
-        Store::spawn_wal_checkpointer(&db_path);
+        // First-start keyring initialization (mint the root key, write the
+        // first data key). Local stores do it right here; a raft node does it
+        // only when it leads and every voter can apply the new table (the
+        // upgrade gate), otherwise the daemon's keyring loop retries.
+        store.initialize_keyring_at_start();
+
+        Store::spawn_wal_checkpointer(Arc::downgrade(&store.checkpoint_conn));
 
         Ok(store)
     }
@@ -1501,21 +1552,24 @@ impl Store {
     /// threshold in `configure_connection` still bounds the WAL if this
     /// thread ever stalls.
     ///
-    /// The thread holds only its own connection and a path, so it never
-    /// keeps a `Store` alive; it exits when the checkpoint connection
-    /// errors hard (e.g. the file is gone after a test teardown).
-    fn spawn_wal_checkpointer(db_path: &Path) {
-        let path = db_path.to_path_buf();
+    /// The thread holds only a weak handle to the store's checkpoint
+    /// connection, so it never keeps a `Store` alive and exits once the last
+    /// store clone is gone. The connection itself lives in the store so a
+    /// state-db swap (`install_state_db`) reopens it along with every other
+    /// connection; the thread just borrows it for each checkpoint.
+    fn spawn_wal_checkpointer(conn: Weak<Mutex<Connection>>) {
         std::thread::Builder::new()
             .name("wal-checkpoint".into())
             .spawn(move || {
-                let conn = match Connection::open(&path) {
-                    Ok(conn) => conn,
-                    Err(_) => return,
-                };
                 let mut consecutive_failures = 0u32;
                 loop {
                     std::thread::sleep(std::time::Duration::from_millis(1000));
+                    let Some(conn) = conn.upgrade() else {
+                        return;
+                    };
+                    let Ok(conn) = conn.lock() else {
+                        return;
+                    };
                     match conn.query_row(
                         "PRAGMA wal_checkpoint(PASSIVE);",
                         [],
@@ -1984,6 +2038,10 @@ impl Store {
         migrations.to_latest(&mut conn)?;
         drop(conn);
         self.refresh_read_model()?;
+        // The keyring rows went with the tables: reload (now empty) and
+        // re-initialize so encrypted writes reference a key that exists.
+        self.keyring_rows_changed();
+        self.initialize_keyring_at_start();
 
         Ok(())
     }
@@ -2445,15 +2503,21 @@ impl Store {
         for conn in self.read_conns.iter() {
             read_guards.push(Self::lock_conn(conn, "install")?);
         }
+        let mut checkpoint_guard = Self::lock_conn(&self.checkpoint_conn, "install")?;
 
-        // Step 1: close the old connections (readers first; the write
-        // connection closes last so SQLite's last-close WAL checkpoint runs
-        // against the old file). The placeholder in-memory connections keep
-        // the mutexes valid if any later step fails.
+        // Step 1: close the old connections (readers and the checkpointer
+        // first; the write connection closes last so SQLite's last-close
+        // WAL checkpoint runs against the old file). The placeholder
+        // in-memory connections keep the mutexes valid if any later step
+        // fails. Every connection to the file must go, the checkpointer's
+        // included: one left open on the old inode would later checkpoint
+        // the new file's WAL (same name) into the old file and truncate it.
         for guard in read_guards.iter_mut() {
             let old = std::mem::replace(&mut **guard, Connection::open_in_memory()?);
             drop(old);
         }
+        let old = std::mem::replace(&mut *checkpoint_guard, Connection::open_in_memory()?);
+        drop(old);
         let old = std::mem::replace(&mut *write_guard, Connection::open_in_memory()?);
         drop(old);
         let wal = self.db_path.with_extension("sqlite-wal");
@@ -2488,12 +2552,17 @@ impl Store {
             conn.pragma_update(None, "query_only", "ON")?;
             **guard = conn;
         }
+        *checkpoint_guard = Connection::open(&*self.db_path)?;
+        drop(checkpoint_guard);
         drop(read_guards);
         drop(write_guard);
 
         // The read model caches rows from the replaced database; rebuild it
         // from the installed one.
         self.refresh_read_model()?;
+        // So does the keyring: the installed image carries the cluster's
+        // data keys, which a fresh joiner sees here for the first time.
+        self.keyring_rows_changed();
         info!(path = %self.db_path.display(), "Installed replacement state database");
         Ok(())
     }
@@ -5951,8 +6020,14 @@ impl Store {
         Ok(eval)
     }
 
-    fn kv_entry_from_row(&self, row: &Row<'_>) -> Result<KvEntry, rusqlite::Error> {
+    /// A `kv_entry` row as stored: `entry.value` is the on-disk form
+    /// (ciphertext when `enc_key_id` is set). Decrypt with
+    /// [`Store::kv_entry_from_raw`] before handing it to anyone; the raw form
+    /// exists so paths that never need the value (delete, version checks)
+    /// work even while the keyring is locked.
+    fn kv_raw_from_row(&self, row: &Row<'_>) -> Result<KvRaw, rusqlite::Error> {
         let value_type: i32 = row.get(2)?;
+        let enc_key_id: Option<String> = row.get(6)?;
         let entry = KvEntry {
             key: row.get(0)?,
             value: row.get(1)?,
@@ -5960,9 +6035,53 @@ impl Store {
             version: row.get(3)?,
             created_at: row.get(4)?,
             updated_at: row.get(5)?,
+            encrypted: enc_key_id.is_some(),
         };
 
-        Ok(entry)
+        Ok(KvRaw { entry, enc_key_id })
+    }
+
+    /// Decrypt a stored row into the entry callers see (the ONE place a KV
+    /// value is decrypted).
+    fn kv_entry_from_raw(&self, raw: KvRaw) -> R<KvEntry> {
+        let KvRaw {
+            mut entry,
+            enc_key_id,
+        } = raw;
+        let mut result = self
+            .keyring
+            .open(&entry.key, &entry.value, enc_key_id.as_deref());
+        // Self-healing read: a key this manager has not unwrapped yet (a
+        // rotation that just replicated, a root key file that just appeared)
+        // is one cheap reload away for the local providers, so retry once
+        // before failing the read. An `exec` provider is never called on a
+        // read path; the daemon's keyring loop reloads it.
+        if matches!(
+            result.as_ref().map_err(StorageError::from_anyhow),
+            Err(Some(StorageError::KeyringLocked { .. }))
+        ) && self.keyring.provider().kind() != crate::storage::keyring::PROVIDER_EXEC
+            && self.load_keyring().is_ok()
+        {
+            result = self
+                .keyring
+                .open(&entry.key, &entry.value, enc_key_id.as_deref());
+        }
+        match result {
+            Ok(value) => {
+                entry.value = value;
+                Ok(entry)
+            }
+            Err(err) => {
+                let reason = match StorageError::from_anyhow(&err) {
+                    Some(StorageError::KeyringLocked { .. }) => "locked",
+                    _ => "corrupt",
+                };
+                crate::manager::telemetry::metrics()
+                    .kv_decrypt_failures_total
+                    .inc(&[reason]);
+                Err(err)
+            }
+        }
     }
 
     fn kv_lock_from_row(&self, row: &Row<'_>) -> Result<KvLock, rusqlite::Error> {
@@ -9956,6 +10075,10 @@ impl Store {
         let mut task_reread_ids: HashSet<i64> = HashSet::new();
         let mut event_ids: Vec<i64> = Vec::new();
         let mut evals_made_claimable = 0usize;
+        // A replicated keyring change (a rotation, a rewrap of the root
+        // key, a reset): this replica must unwrap the new rows before it can
+        // read values written under them.
+        let mut keyring_changed = false;
 
         // Column positions come from the live schema (changeset records use
         // the table's declared column order), so this cannot drift from
@@ -9973,6 +10096,7 @@ impl Store {
             let table = op.table_name().to_string();
             let action = op.code();
             match table.as_str() {
+                "keyring_key" => keyring_changed = true,
                 "node" | "node_health" => {
                     // A node_health change patches the SAME cached Node —
                     // liveness hydrates from the node ⟕ node_health join
@@ -10223,6 +10347,10 @@ impl Store {
             }
         }
         drop(iter);
+
+        if keyring_changed {
+            self.keyring_rows_changed();
+        }
 
         // Resolve rows whose owning scope was not carried by the update
         // record. Only the full-reload path needs this: it reloads BY NODE,
@@ -15981,22 +16109,27 @@ impl Store {
         Self::ensure_kv_key(key)?;
         let normalized_value = Self::normalize_kv_value(value, value_type)?;
 
+        // Encrypt before the row is written, so the changeset that replicates
+        // this write (and every snapshot and backup after it) carries only
+        // ciphertext. Plaintext when encryption is off or the keyring has no
+        // key yet (docs/kv-encryption.md).
+        let (stored_value, enc_key_id) = self.keyring.seal(key, &normalized_value)?;
+
         let mut conn = self.write_connection()?;
         let tx = Self::write_tx(&mut conn)?;
         self.enforce_kv_lock(&tx, key, lock_id)?;
 
         let existing = tx
-            .query_row(
-                "SELECT key, value, value_type, version, created_at, updated_at FROM kv_entry WHERE key = ?;",
-                [key],
-                |row| self.kv_entry_from_row(row),
-            )
+            .query_row(&format!("{KV_ENTRY_SELECT} WHERE key = ?;"), [key], |row| {
+                self.kv_raw_from_row(row)
+            })
             .optional()?;
 
         let now = Self::now_rfc3339()?;
         let value_type_value = value_type as i32;
 
         let entry = if let Some(existing) = existing {
+            let existing = existing.entry;
             if let Some(expected) = expected_version {
                 if expected != existing.version {
                     return Err(anyhow::Error::new(StorageError::Conflict {
@@ -16010,12 +16143,13 @@ impl Store {
 
             let next_version = existing.version + 1;
             tx.execute(
-                "UPDATE kv_entry SET value = :value, value_type = :value_type, version = :version, updated_at = :updated_at WHERE key = :key;",
+                "UPDATE kv_entry SET value = :value, value_type = :value_type, version = :version, updated_at = :updated_at, enc_key_id = :enc_key_id WHERE key = :key;",
                 named_params! {
-                    ":value": normalized_value,
+                    ":value": stored_value,
                     ":value_type": value_type_value,
                     ":version": next_version,
                     ":updated_at": now,
+                    ":enc_key_id": enc_key_id,
                     ":key": key,
                 },
             )?;
@@ -16027,6 +16161,7 @@ impl Store {
                 version: next_version,
                 created_at: existing.created_at,
                 updated_at: now,
+                encrypted: enc_key_id.is_some(),
             }
         } else {
             if let Some(expected) = expected_version {
@@ -16038,14 +16173,15 @@ impl Store {
             }
 
             tx.execute(
-                "INSERT INTO kv_entry (key, value, value_type, version, created_at, updated_at) VALUES (:key, :value, :value_type, :version, :created_at, :updated_at);",
+                "INSERT INTO kv_entry (key, value, value_type, version, created_at, updated_at, enc_key_id) VALUES (:key, :value, :value_type, :version, :created_at, :updated_at, :enc_key_id);",
                 named_params! {
                     ":key": key,
-                    ":value": normalized_value,
+                    ":value": stored_value,
                     ":value_type": value_type_value,
                     ":version": 1_i64,
                     ":created_at": now,
                     ":updated_at": now,
+                    ":enc_key_id": enc_key_id,
                 },
             )?;
 
@@ -16056,6 +16192,7 @@ impl Store {
                 version: 1,
                 created_at: now.clone(),
                 updated_at: now,
+                encrypted: enc_key_id.is_some(),
             }
         };
 
@@ -16067,27 +16204,31 @@ impl Store {
     #[instrument(err, skip_all)]
     pub fn get_kv(&self, key: &str) -> R<Option<KvEntry>> {
         Self::ensure_kv_key(key)?;
-        let conn = self.read_connection()?;
-        let entry = conn
-            .query_row(
-                "SELECT key, value, value_type, version, created_at, updated_at FROM kv_entry WHERE key = ?;",
-                [key],
-                |row| self.kv_entry_from_row(row),
-            )
-            .optional()?;
+        let raw = {
+            let conn = self.read_connection()?;
+            conn.query_row(&format!("{KV_ENTRY_SELECT} WHERE key = ?;"), [key], |row| {
+                self.kv_raw_from_row(row)
+            })
+            .optional()?
+        };
 
-        Ok(entry)
+        raw.map(|raw| self.kv_entry_from_raw(raw)).transpose()
     }
 
     #[instrument(err, skip_all)]
     pub fn list_kv(&self, prefix: &str) -> R<Vec<KvEntry>> {
-        let conn = self.read_connection()?;
-        let pattern = format!("{prefix}%");
-        let mut stmt = conn.prepare(
-            "SELECT key, value, value_type, version, created_at, updated_at FROM kv_entry WHERE key LIKE ? ORDER BY key ASC;",
-        )?;
-        let rows = stmt.query_map([pattern], |row| self.kv_entry_from_row(row))?;
-        Self::collect_rows(rows)
+        let raws = {
+            let conn = self.read_connection()?;
+            let pattern = format!("{prefix}%");
+            let mut stmt = conn.prepare(&format!(
+                "{KV_ENTRY_SELECT} WHERE key LIKE ? ORDER BY key ASC;"
+            ))?;
+            let rows = stmt.query_map([pattern], |row| self.kv_raw_from_row(row))?;
+            Self::collect_rows(rows)?
+        };
+        raws.into_iter()
+            .map(|raw| self.kv_entry_from_raw(raw))
+            .collect()
     }
 
     #[instrument(err, skip_all)]
@@ -16115,13 +16256,14 @@ impl Store {
         let tx = Self::write_tx(&mut conn)?;
         self.enforce_kv_lock(&tx, key, lock_id)?;
 
+        // Raw on purpose: deleting a value must work even when this manager
+        // cannot decrypt it (a locked keyring is not a reason to keep a row).
         let existing = tx
-            .query_row(
-                "SELECT key, value, value_type, version, created_at, updated_at FROM kv_entry WHERE key = ?;",
-                [key],
-                |row| self.kv_entry_from_row(row),
-            )
-            .optional()?;
+            .query_row(&format!("{KV_ENTRY_SELECT} WHERE key = ?;"), [key], |row| {
+                self.kv_raw_from_row(row)
+            })
+            .optional()?
+            .map(|raw| raw.entry);
 
         let Some(existing) = existing else {
             return Err(anyhow::Error::new(StorageError::not_found("kv entry", key)));
@@ -16172,14 +16314,13 @@ impl Store {
         let tx = Self::write_tx(&mut conn)?;
         self.enforce_kv_lock(&tx, key, lock_id)?;
 
-        let mut entry = tx
-            .query_row(
-                "SELECT key, value, value_type, version, created_at, updated_at FROM kv_entry WHERE key = ?;",
-                [key],
-                |row| self.kv_entry_from_row(row),
-            )
+        let raw = tx
+            .query_row(&format!("{KV_ENTRY_SELECT} WHERE key = ?;"), [key], |row| {
+                self.kv_raw_from_row(row)
+            })
             .optional()?
             .ok_or_else(|| anyhow::Error::new(StorageError::not_found("kv entry", key)))?;
+        let mut entry = self.kv_entry_from_raw(raw)?;
 
         if entry.value_type != KvValueType::Json as i32 {
             return Err(anyhow::Error::new(StorageError::InvalidInput {
@@ -16217,13 +16358,15 @@ impl Store {
         let updated_value = current.to_string();
         let next_version = entry.version + 1;
         let now = Self::now_rfc3339()?;
+        let (stored_value, enc_key_id) = self.keyring.seal(key, &updated_value)?;
 
         tx.execute(
-            "UPDATE kv_entry SET value = :value, version = :version, updated_at = :updated_at WHERE key = :key;",
+            "UPDATE kv_entry SET value = :value, version = :version, updated_at = :updated_at, enc_key_id = :enc_key_id WHERE key = :key;",
             named_params! {
-                ":value": updated_value,
+                ":value": stored_value,
                 ":version": next_version,
                 ":updated_at": now,
+                ":enc_key_id": enc_key_id,
                 ":key": key,
             },
         )?;
@@ -16231,6 +16374,7 @@ impl Store {
         entry.value = updated_value;
         entry.version = next_version;
         entry.updated_at = now;
+        entry.encrypted = enc_key_id.is_some();
 
         tx.commit()?;
 
@@ -18300,13 +18444,17 @@ mod tests {
             .context("Error creating temp store directory")?
             .keep();
 
-        let store_config = ManagerConfigFull {
+        let mut store_config = ManagerConfigFull {
             store_path: store_dir
                 .to_str()
                 .context("Error parsing store path")?
                 .to_string(),
             ..Default::default()
         };
+        // Test stores stand in for replicas of one cluster (changesets and
+        // snapshots move between them), so they share one root key.
+        store_config.encryption.root_key.path =
+            Some(crate::storage::keyring::test_support::shared_root_key_path());
 
         let store = Store::start_storage(&store_config)?;
         store.reset_all_tables()?;
@@ -25966,6 +26114,9 @@ mod tests {
     fn capture_mutation_rolls_back_and_apply_reproduces_on_a_second_store() -> R<()> {
         let src = setup_store()?;
         let dst = setup_store()?;
+        // Replicas share the cluster's data keys (KV values replicate as
+        // ciphertext).
+        dst.adopt_keyring_from(&src)?;
 
         let (entry, changeset) = raft_capture::capture_mutation(&src, Lane::Control, |s| {
             s.put_kv("cfg/db", "postgres://one", KvValueType::String, None, None)
@@ -26010,6 +26161,7 @@ mod tests {
     fn nested_replicated_calls_compose_into_one_changeset() -> R<()> {
         let src = setup_store()?;
         let dst = setup_store()?;
+        dst.adopt_keyring_from(&src)?;
 
         // Both put_kv calls are public replicated methods; inside an active
         // capture they must run inline (JC-13) and land in ONE changeset.

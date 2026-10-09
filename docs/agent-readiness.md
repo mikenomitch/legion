@@ -64,6 +64,8 @@ Even with `--allow-write`, `legion_state_query` is forced to read-only.
 | `legion_volume_drivers` | no | Volume plugins installed across the cluster and which nodes can use them. Answers "why was my job rejected for plugin X". |
 | `legion_node_list` | no | List worker nodes. Each carries `heartbeat_source` — see the freshness note below. |
 | `legion_node_cadence` | no | Is the fleet sustaining its heartbeat cadence? Freshness ratio, lost window, sustainable fleet size, and the `heartbeatSeconds` to set if it is falling behind ([heartbeat-cadence-and-scale.md](heartbeat-cadence-and-scale.md)). |
+| `legion_keyring_status` | no | KV encryption at rest on the answering manager ([kv-encryption.md](kv-encryption.md)): `state` (`unlocked`, `locked`, `pending_upgrade`, …), the root key provider and location, each data key with how many values it protects, plaintext rows, rewrap progress, and a one-line `hint` with the next step when something needs doing. |
+| `legion_keyring_rotate` | yes | Rotate the KV data key now; values are re-encrypted in the background with no job restarts. Takes an optional `idempotency_key`. |
 | `legion_node_claims` | no | A node's live provisional (unratified) allocations — started-but-unconfirmed work ([edge-boot.md](edge-boot.md)). Tells "still booting" from "already confirmed". |
 | `legion_boot_ticket_list` | no | Outstanding boot tickets (metadata only; token bytes are never stored or returned). |
 | `legion_service_list` | no | List declared services with healthy/total endpoint counts — what a job can connect to. |

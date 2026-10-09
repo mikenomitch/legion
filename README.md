@@ -38,6 +38,7 @@ Full index: [docs/README.md](docs/README.md).
 - [Diagnosing Scheduler Performance](docs/diagnosing-scheduler-performance.md)
 - [UI Architecture](docs/ui-architecture.md)
 - [KV Store](docs/kv-store.md)
+- [KV Encryption at Rest](docs/kv-encryption.md)
 - [Auth & ACLs](docs/auth-and-acls.md)
 - [Exec & Actions (run commands in a workload, interactive PTY, actions)](docs/exec-and-actions.md)
 - [Workload Identity (OIDC)](docs/workload-identity.md)

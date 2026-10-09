@@ -681,6 +681,27 @@ fn backup_rpc_and_restore_on_start_round_trip() -> R<()> {
     );
     Store::restore_from_backup(&restored_config.store_path, &backup_path, true)?;
 
+    // The backup carries ciphertext plus the WRAPPED data keys, never the
+    // root key (docs/kv-encryption.md) — the reply says so, and a restore on
+    // a fresh host has to bring the key along exactly as the reply names it.
+    let encryption = reply
+        .encryption
+        .as_ref()
+        .expect("backup reply describes its encryption");
+    assert!(encryption.enabled, "encryption is on by default");
+    assert_eq!(encryption.root_key_provider, "file");
+    assert!(
+        !encryption.root_key_ids.is_empty(),
+        "reply names the root key(s) a restore needs"
+    );
+    let key_file = PathBuf::from(&encryption.root_key_location);
+    assert!(key_file.exists(), "reply names the leader's real key file");
+    let restored_key_file = PathBuf::from(&restored_config.store_path)
+        .join("keys")
+        .join("root.key");
+    std::fs::create_dir_all(restored_key_file.parent().unwrap())?;
+    std::fs::copy(&key_file, &restored_key_file)?;
+
     let mut restored = TestNode {
         name: "mgr-restored",
         config: restored_config.clone(),

@@ -4,16 +4,43 @@ use rusqlite::{ffi, Error as RusqliteError};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StorageError {
-    NotFound { entity: &'static str, id: String },
-    Conflict { message: String },
-    ForeignKey { message: String },
-    InvalidInput { message: String },
+    NotFound {
+        entity: &'static str,
+        id: String,
+    },
+    Conflict {
+        message: String,
+    },
+    ForeignKey {
+        message: String,
+    },
+    InvalidInput {
+        message: String,
+    },
     DatabaseBusy,
     DatabaseLocked,
     DatabaseReadOnly,
     DatabaseCorrupt,
-    DatabaseIo { message: String },
-    Sqlite { message: String },
+    DatabaseIo {
+        message: String,
+    },
+    Sqlite {
+        message: String,
+    },
+    /// A KV value (or a write) needs data key `key_id`, which this manager
+    /// cannot unwrap: the root key is missing or wrong here. `message` is
+    /// the full operator-facing explanation (docs/kv-encryption.md).
+    /// Retryable: it clears the moment the root key is placed.
+    KeyringLocked {
+        key_id: String,
+        message: String,
+    },
+    /// A stored KV ciphertext failed authentication: modified on disk,
+    /// transplanted from another key path, or decrypted with the wrong key.
+    KvCiphertextInvalid {
+        key: String,
+        message: String,
+    },
 }
 
 impl StorageError {
@@ -94,6 +121,14 @@ impl fmt::Display for StorageError {
             StorageError::DatabaseCorrupt => write!(f, "storage is corrupt"),
             StorageError::DatabaseIo { message } => write!(f, "storage I/O error: {message}"),
             StorageError::Sqlite { message } => write!(f, "storage error: {message}"),
+            StorageError::KeyringLocked { message, .. } => write!(f, "{message}"),
+            StorageError::KvCiphertextInvalid { key, message } => {
+                write!(
+                    f,
+                    "kv value at `{key}` failed authentication ({message}); the stored ciphertext \
+                     was modified, moved from another key, or written under a different root key"
+                )
+            }
         }
     }
 }

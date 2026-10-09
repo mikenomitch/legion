@@ -54,7 +54,10 @@ legion acl whoami
 
 Actions are `read` and `write` (`write` does not imply `read`; grant both).
 `state:read` is powerful — it can read every table in the state store —
-grant it sparingly.
+grant it sparingly. KV values are the one thing it cannot read: they are
+stored encrypted ([KV Encryption at Rest](kv-encryption.md)), so raw SQL
+sees ciphertext and a `kv` rule scoped by `paths` is the only way to a
+value.
 
 ### Policies
 
