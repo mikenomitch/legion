@@ -427,7 +427,8 @@ pub async fn run_manager_with(
         .with_authenticator(authenticator)
         .with_advertise_addr(full_config.server.advertised_address());
 
-    let addr = format!("{}:{}", full_config.server.host, full_config.server.port).parse()?;
+    let addr: std::net::SocketAddr =
+        format!("{}:{}", full_config.server.host, full_config.server.port).parse()?;
 
     // Exec WebSocket listener on the next port (browsers cannot do bidi
     // streaming over gRPC-Web; tonic's listener does not do HTTP upgrades).
@@ -568,16 +569,52 @@ pub async fn run_manager_with(
         Ok::<(), anyhow::Error>(())
     };
     let keyring_fut = start_keyring_maintenance(store_for_keyring);
-    let _res = join!(
-        start_server_fut,
-        node_checker_fut,
-        eval_loop_fut,
-        worker_fut,
-        rotation_fut,
-        keyring_fut
-    );
+    // The background loops run as one task the daemon can abort: without an
+    // API and raft transport they must not keep acting on the cluster.
+    let background = tokio::spawn(async move {
+        let (checker, evals, worker, rotation, keyring) = join!(
+            node_checker_fut,
+            eval_loop_fut,
+            worker_fut,
+            rotation_fut,
+            keyring_fut
+        );
+        for (name, result) in [
+            ("node status checker", checker),
+            ("eval loop", evals),
+            ("in-process worker", worker),
+            ("workload identity rotation", rotation),
+            ("keyring maintenance", keyring),
+        ] {
+            if let Err(err) = result {
+                error!(loop_name = name, error = ?err, "Manager background loop exited");
+            }
+        }
+    });
 
-    Ok(())
+    // The gRPC listener is the manager: it carries the API and, in raft mode,
+    // the raft transport. If it fails to bind (port taken, bad TLS material)
+    // or stops serving, exit non-zero so a supervisor restarts the process,
+    // rather than keep scheduling as a headless manager nobody can reach.
+    let serve_result = start_server_fut.await;
+    background.abort();
+    Err(manager_server_exit_error(&addr, serve_result))
+}
+
+/// The error `run_manager` returns when the gRPC server future resolves.
+/// Serving only ends on failure, so even `Ok` is an error here.
+fn manager_server_exit_error(
+    addr: &std::net::SocketAddr,
+    result: Result<(), tonic::transport::Error>,
+) -> anyhow::Error {
+    let err = match result {
+        Ok(()) => anyhow!("manager gRPC server on {addr} stopped unexpectedly"),
+        Err(err) => {
+            anyhow::Error::new(err).context(format!("manager gRPC server on {addr} failed"))
+        }
+    };
+    error!(error = ?err, "Manager API is down; exiting");
+    err
 }
 
 /// How often the keyring loop ticks when nothing wakes it earlier.
@@ -2343,6 +2380,39 @@ mod tests {
     use super::*;
     use crate::structs::ManagerConfigFull;
     use tempfile::Builder;
+
+    /// Isolated manager config on `port`: temp store, exec and telemetry
+    /// listeners off so only the gRPC port is in play.
+    fn isolated_manager_config(port: u16, store_dir: &std::path::Path) -> R<ManagerConfig> {
+        Ok(serde_json::from_value(serde_json::json!({
+            "server": { "host": "127.0.0.1", "port": port },
+            "storePath": store_dir.to_str().context("temp path is not UTF-8")?,
+            "exec": { "enabled": false },
+            "telemetry": { "enabled": false },
+        }))?)
+    }
+
+    /// M2 regression: a manager whose gRPC listener cannot bind must exit
+    /// with an error instead of running its eval loop and node checker
+    /// headless, with no API and no raft transport.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn manager_exits_with_error_when_grpc_bind_fails_test() -> R<()> {
+        let taken = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let port = taken.local_addr()?.port();
+        let store_dir = Builder::new().prefix("legion-bind-fail-").tempdir()?;
+        let config = isolated_manager_config(port, store_dir.path())?;
+
+        let result = tokio::time::timeout(Duration::from_secs(60), run_manager(config, false))
+            .await
+            .context("run_manager kept running after its gRPC bind failed")?;
+        let err = result.expect_err("a failed bind must fail run_manager");
+        assert!(
+            format!("{err:#}").contains("manager gRPC server on"),
+            "unexpected error: {err:#}"
+        );
+        drop(taken);
+        Ok(())
+    }
 
     /// Adversarial regression (leader-only startup writes): the recovery
     /// writes must re-run exactly on leadership ACQUISITION — a node that
