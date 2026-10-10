@@ -1801,3 +1801,138 @@ content-store budget error.
 ### Ignored tests
 
 None new.
+
+## Track 1
+
+The agent-sandbox use case: auto TAPs, idle detection from a guest's TAP,
+sandbox identity refresh through the identity disk, and the payload fix
+that carries `suspend` and `snapshots` to the worker. On macOS the TAP
+creation, counters, and identity disk rewrite ran against fakes and fixture
+trees, and the payload fix and Apple-container idle loop ran end to end
+(`cargo test --test apple_container_idle -- --ignored`). Nothing created a
+real TAP on a bridge, read real `/sys/class/net` counters, or rewrote a
+running VMM's identity disk.
+
+### Prereqs
+
+- Everything in [Phase 4 prereqs](#phase-4): KVM, Firecracker and
+  cloud-hypervisor, the guest kernel, and a glibc guest image with a DHCP
+  client (busybox `udhcpc` is enough) that runs it on `eth0` at boot.
+- A bridge with DHCP on it:
+
+  ```bash
+  ip link add br0 type bridge && ip addr add 10.77.0.1/24 dev br0 && ip link set br0 up
+  dnsmasq --interface=br0 --bind-interfaces --dhcp-range=10.77.0.10,10.77.0.200,12h
+  ```
+
+- A worker run as root (`CAP_NET_ADMIN`, `ip` on `PATH`) with
+  `resourceEnforcement.enabled = true` and the content store on.
+- A manager with `workloadIdentity.enabled = true` for T1.4.
+
+Save as `/tmp/t1.ncl`:
+
+```nickel
+{
+  name = "agents",
+  tasks = [{
+    name = "workspace",
+    runtime = "sandbox",
+    resources = { memory = 512, memoryMax = 1024, cpu = 500 },
+    stateful = { mode = "keyed", idSource = "caller" },
+    config = {
+      image = "<your glibc image>",
+      command = ["/bin/sh", "-c", "while true; do date; cat /legion/identity/platform 2>/dev/null | cut -c1-24; sleep 30; done"],
+      network = { mode = "tap", tap = "auto", bridge = "br0" },
+    },
+    suspend = {
+      checkpoint = "memory",
+      idle = { after = "1m", signals = ["network", "cpu"] },
+    },
+    identities = [{
+      name = "platform",
+      audience = ["api.example"],
+      ttl = "2m",
+      file = { path = "/legion/identity/platform" },
+    }],
+  }],
+}
+```
+
+### T1.1 Many auto-TAP sandboxes on one node
+
+```bash
+legion job run /tmp/t1.ncl
+for i in 1 2 3 4 5; do legion instance create agents --id user-$i; done
+ip -br link show master br0
+```
+
+Pass: five `lgf...` devices, all `UP`, all with `master br0`, and
+`dnsmasq`'s leases list five MACs starting `02:4c:`. Each allocation dir
+holds `.sandbox/tap-device` naming its device and `.sandbox/restored-tap`.
+Fail: a boot error naming `sandbox needs TAP device lgf...`, or a guest with
+no lease.
+
+### T1.2 Resume recreates the TAP on the bridge
+
+```bash
+legion instance suspend user-1 --wait
+ip link show "$(cat <old alloc dir>/.sandbox/tap-device)"   # gone: destroy deleted it
+legion instance start user-1 --wait
+ip -br link show master br0 | grep lgf
+```
+
+Pass: the same `lgf` name is back, on `br0`, and the guest keeps its
+address (`legion job logs` keeps printing). Fail: `restore needs TAP device
+lgf...`, or the device without `master br0`.
+
+### T1.3 Idle sees TAP traffic
+
+Let `user-2` sit idle, then from the host `ping -c 200 -i 0.2 <user-2's IP>`.
+
+```bash
+legion instance get user-2   # idle since resets during the ping
+cat /sys/class/net/<user-2's lgf>/statistics/rx_bytes   # rises while it replies
+```
+
+Pass: `idle since` moves forward while the guest replies, and the instance
+suspends about a minute after the ping stops with `suspend_reason idle`.
+Fail: it suspends during the ping, or never suspends while idle (broadcast
+noise on `br0` should not keep it awake: check `rx_bytes` holds still).
+
+### T1.4 A token refresh rewrites the guest file with no reboot
+
+With `ttl = "2m"`, the worker refreshes at about one minute.
+
+```bash
+legion job logs agents --follow   # the token prefix changes each minute; `date` lines never restart
+```
+
+Pass: the printed token prefix changes about every minute, the guest's
+uptime keeps growing (`legion job logs` shows no new boot), and the console
+shows `legion-guest-resume: refresh: wrote identity tokens`. Fail: the
+prefix never changes, or the guest reboots.
+
+Then set `changeMode = "restart"` on the identity and run `legion job
+validate /tmp/t1.ncl`: it prints the `reboots this sandbox's guest`
+warning.
+
+### T1.5 Forks of an auto-TAP sandbox
+
+```bash
+legion instance fork user-3 --count 2 --wait
+ip -br link show master br0 | grep lgf
+```
+
+Pass: two more `lgf` devices on `br0`, named for `user-3-f1` and
+`user-3-f2`, and each fork gets its own DHCP lease after `onResume` renews
+it. Fail: `restore needs TAP device lgf...`.
+
+### Ignored tests
+
+```bash
+cargo test --test apple_container_idle -- --ignored   # macOS only
+```
+
+The Linux paths above have no ignored tests of their own: the TAP calls are
+the Phase 3c/6 `HostTaps` calls, already covered by
+`cargo test -- --ignored sandbox` on a KVM host.

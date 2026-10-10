@@ -233,7 +233,7 @@ Optional:
 | `hypervisor` | `auto` | `auto`, `cloud-hypervisor`, `firecracker`, `dev`. |
 | `kernel` | `LEGION_SANDBOX_KERNEL`, then `/var/lib/legion/kernels/vmlinux` | Uncompressed guest kernel. `${artifact.<name>}` works here. |
 | `kernel_args` | none | Appended to Legion's kernel cmdline. |
-| `network` | `{ mode: 'none' }` | `{ mode: 'tap', tap: 'tap0', mac: … }` attaches the guest to a **pre-created** host TAP device. |
+| `network` | `{ mode: 'none' }` | `{ mode: 'tap', tap: 'tap0', mac: … }` attaches the guest to a **pre-created** host TAP device. `{ mode: 'tap', tap: 'auto', bridge: 'br0' }` has Legion create a TAP per instance on that bridge. See [Networking](#networking). |
 
 Persistent state is not part of the runtime config. Declare
 `stateful.storage` (or `volumes[]`) on the task with `mode = "block"`. See
@@ -304,19 +304,62 @@ A missing kernel fails at start. The error names all three options: the task's
 
 ## Networking
 
-Guest networking needs a host TAP device. That needs `CAP_NET_ADMIN` and a
-host addressing plan, so Legion does not create one. The default is
-`mode = "none"`, which gives the guest loopback only. That suits compute and
-agent sandboxes. With `mode = "tap"`, the operator (or a future network
-plugin) pre-creates the device and Legion attaches it. `LEGION_PORT_*` and
-`LEGION_ADDR_*` are still exported into the guest, but nothing maps host ports
-into the VM yet.
+Guest networking needs a host TAP device. The default is `mode = "none"`,
+which gives the guest loopback only. That suits compute sandboxes. With
+`mode = "tap"` there are two ways to get the device:
 
-A TAP device serves one guest, so a task with a fixed `tap` runs one instance
-per node. A boot on a TAP another VMM holds fails with `sandbox needs TAP
-device tap0 ..., but another process holds it`. Memory forks are the
-exception: each gets its own TAP device (see
-[Networking for forks](suspend-and-resume.md#networking-for-forks)).
+| `config.network` | Device | Instances per node | Memory checkpoints |
+| --- | --- | --- | --- |
+| `{ mode = "tap", tap = "tap0" }` | Pre-created by the operator (or a network plugin). Legion attaches it | One, since every instance names the same device | Yes |
+| `{ mode = "tap", tap = "auto", bridge = "br0" }` | Created by Legion per instance and attached to `bridge` | Any number | Yes |
+
+```nickel
+config = {
+  image = "ghcr.io/acme/agent-base:2026-10",
+  command = ["/usr/local/bin/harness"],
+  network = { mode = "tap", tap = "auto", bridge = "br0" },
+},
+```
+
+**Auto TAPs.** With `tap = "auto"`, the node creates a persistent TAP for
+each instance, enslaves it to `bridge`, brings it up, and deletes it when the
+allocation is destroyed. The device is named `lgf` plus 12 hex characters of
+the instance id's SHA-256 (the allocation id for a task without instances),
+which fits the kernel's 15-character limit. It is the same name a memory fork
+of that instance gets, so one instance always asks for one device:
+
+- A resume recreates the device under the name its checkpoint recorded, on
+  the same bridge (see [Networking](suspend-and-resume.md#networking)).
+- A fork gets its own `lgf` device on the bridge (see
+  [Networking for forks](suspend-and-resume.md#networking-for-forks)).
+- The guest's MAC defaults to a locally administered address derived from
+  the allocation id (`02:4c:...`), so guests on one bridge never collide. Set
+  `mac` to pin one.
+
+The bridge, its addressing, and DHCP on it are yours. Legion only attaches
+TAPs to it. Have the guest image use DHCP, since every instance boots from
+the same image. Creating TAPs needs `CAP_NET_ADMIN` and the `ip` tool on the
+worker. A device of that name that already exists and is free (left by a
+worker crash) is reused and re-attached to `bridge`. One that another process
+holds fails the boot by name: `sandbox needs TAP device lgf... (network.tap =
+"auto"): it exists and another process holds it`.
+
+`bridge` is required with `tap = "auto"` and refused with a fixed `tap`,
+because a fixed device is wired by whoever created it.
+
+**Fixed TAPs.** A device serves one guest, so a task with a fixed `tap` runs
+one instance per node. A boot on a TAP another VMM holds fails with `sandbox
+needs TAP device tap0 ..., but another process holds it`. Memory forks are
+the exception: each gets its own TAP device.
+
+`LEGION_PORT_*` and `LEGION_ADDR_*` are still exported into the guest, but
+nothing maps host ports into the VM yet.
+
+**Idle detection.** A TAP-wired guest's traffic never crosses the node
+datapath, so the idle policy's `network` signal reads the TAP's counters
+instead: bytes the guest sends (`/sys/class/net/<tap>/statistics/rx_bytes`)
+count as activity. See
+[what each signal sees on a sandbox](suspend-and-resume.md#what-each-signal-sees-on-a-sandbox).
 
 **Gated networking.** Set the task's `network.mode = "gated"` (the block next
 to `service` and `connect`, not `config.network`). The guest then boots with
@@ -361,7 +404,7 @@ isolated filesystem cannot see the host task dir at all.
 | --- | --- |
 | KV env injection | ✅ |
 | KV file injection | ❌ (baked in at disk-build time, so a change needs a restart) |
-| Identity env / file delivery | ✅ / ❌ |
+| Identity env / file delivery | ✅ / ✅ (under `/legion/identity`, refreshed with no restart) |
 | Signal delivery | ❌ (needs a guest agent) |
 | Memory / CPU limits, exclusive cores | ✅ with `resourceEnforcement.enabled` on Linux. The VMM runs in the allocation's worker cgroup, with `memory.max` = the [guest size](#guest-size) + the worker's `sandbox.vmmOverheadMiB` (default 64) and `memory.low` = `resources.memory`. `cpu` and `cores` govern the VMM's threads. See [resource-enforcement.md](resource-enforcement.md#sandbox-tasks). |
 | Measured usage | ✅ with enforcement on: memory, CPU, and idle time in `legion node usage` and `instance list` ([resource-enforcement.md](resource-enforcement.md#measuring-usage)). |
@@ -436,9 +479,12 @@ directory, so a sandbox that may be memory-checkpointed boots differently:
   drive `identity`, read-only. Its guest device is on the kernel cmdline as
   `legion.identity=/dev/vdX`. The host rewrites it on every restore with the
   new allocation id, instance id, hostname, a fresh workload-identity token
-  when the task has one, and fresh entropy. A restored Firecracker VM cannot
-  hotplug a disk, but it can repoint one it already has, which is why the
-  slot is reserved at boot.
+  when the task has one, and fresh entropy. Between restores it rewrites the
+  same disk in place whenever a workload-identity token is refreshed. A
+  restored Firecracker VM cannot hotplug a disk, but it can repoint one it
+  already has, which is why the slot is reserved at boot. A sandbox that is
+  not launched for checkpoints still gets this disk (attached directly, with
+  no device links) when it declares file-delivered identities.
 - **Firecracker gets an API socket.** It boots from `--config-file` as usual,
   plus `--api-sock <alloc>/.sandbox/vmm.sock`. A sandbox that is not launched
   for checkpoints (and has no balloon) keeps `--no-api` and has no control
@@ -497,6 +543,11 @@ env-delivered token under `/legion/identity/`, and finally runs
 does not stop the others. VMGenID, where the VMM exposes it, reseeds the
 kernel RNG on its own as well. See [suspend and
 resume](suspend-and-resume.md#identity-after-a-resume).
+
+When the disk names the same allocation with new tokens, that is a token
+refresh rather than a restore: the handler rewrites the token files and
+`/legion/resume.env` only. See
+[workload identity on sandboxes](workload-identity.md#sandboxes).
 
 ### Where a memory checkpoint can be restored
 

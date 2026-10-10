@@ -616,10 +616,10 @@ pub fn sandbox_usage_source(allocation_id: i64, instance: &TaskInstance) -> Sand
 ///
 /// This is the mechanism behind the `boot` gate (docs/edge-boot.md): a guest
 /// that has booted but is not yet ratified sits behind a shut link, and
-/// ratification is the only thing that raises it. The device itself is
-/// operator-precreated — Legion never creates or destroys TAP devices, it only
-/// changes their link state, so a failure here is an operator's capability
-/// problem (`CAP_NET_ADMIN`) rather than a missing device.
+/// ratification is the only thing that raises it. The device exists by now:
+/// an operator created a fixed one, and an auto TAP was created at boot. So a
+/// failure here is a capability problem (`CAP_NET_ADMIN`) rather than a
+/// missing device.
 ///
 /// Deliberately shells out to `ip` rather than talking netlink: it is the same
 /// tool an operator debugging the gate would reach for, its failure text is

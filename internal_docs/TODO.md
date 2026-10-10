@@ -2028,9 +2028,53 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
           reports. Without `resourceEnforcement.enabled`, only
           `onPressure = true` makes an instance eligible. Its cooldown
           (2 minutes) is a constant.
-    - [ ] Any `ListNodeUsage`-style reply built from `build_node_usage_reply`
-          should also call `fill_suspended_capacity`, or it shows held
-          amounts without the instance count, checkpoint bytes, and budget.
+    - [x] `ListNodeUsage` fills the suspended summary too: both RPCs build
+          their reply through one `node_usage_reply`, which calls
+          `fill_suspended_capacity`.
+  - [x] Track 1, the agent-sandbox use case
+        ([guide](../docs/guides/agent-sandboxes.md) ·
+        [Track 1 calls](calls/suspend-resume-and-oversubscription-plan_calls.md#track-1-the-agent-sandbox-use-case) ·
+        [Linux verification](suspend-resume-linux-verification.md#track-1)).
+    - [x] Auto TAPs: `config.network = { mode = "tap", tap = "auto", bridge
+          }` creates a TAP per instance with the fork naming, attaches it to
+          the bridge, recreates it on restore, and deletes it on destroy.
+          Many memory-checkpointable sandboxes with real networking per node.
+          [docs](../docs/task-runtime-sandbox.md#networking)
+    - [x] Idle detection on microVMs: bytes the guest sends on its TAP count
+          for `network`. `connections` is refused on sandboxes that are not
+          gated, `exec` is refused on a sandbox pinned to a VMM and warned
+          otherwise. [docs](../docs/suspend-and-resume.md#what-each-signal-sees-on-a-sandbox)
+    - [x] Sandbox identity refresh with no reboot: file delivery under
+          `/legion/identity` through the identity disk, env + `noop` on
+          memory-checkpointable sandboxes, a warning for `restart`.
+          [docs](../docs/workload-identity.md#sandboxes)
+    - [x] macOS idle suspend: `container stats` feeds the usage sampler, and
+          an ignored end-to-end test (`apple_container_idle`) suspends an idle
+          Apple-container sandbox and resumes it cold on its volume.
+          [docs](../docs/suspend-and-resume.md#macos-dev-loop)
+    - [x] Fixed on the way: the allocation payload never carried `suspend`
+          or `snapshots`, so no real node reported idle time, honored
+          `onPressure`, or launched a sandbox ready for memory checkpoints
+          (now `TaskAllocation.task_suspend`/`task_snapshots`). Apple dev
+          sandboxes could not start (`--` before the command) and two local
+          clusters removed each other's containers (names now carry the
+          node).
+    - [ ] Run [§ Track 1](suspend-resume-linux-verification.md#track-1) on a
+          KVM host: auto TAPs on a bridge, TAP counters, an in-place identity
+          disk refresh in a running guest, and forks of an auto-TAP sandbox.
+    - [ ] No signal keeps a TAP sandbox awake through a quiet outbound call
+          (a harness waiting on a model). `connections` is refused there.
+          The `hint` signal (Phase 8) is the real fix.
+    - [ ] Auto-TAP egress is whatever the operator enforces on the bridge.
+          Per-sandbox egress policy needs gated networking, which still
+          cannot take memory checkpoints (call 43).
+    - [ ] Dev mode (Apple `container`) does not mirror env-delivered tokens
+          into `/legion/identity`, so env tokens there keep their boot value.
+    - [ ] The `container stats` call runs synchronously on the heartbeat
+          path every 10s while a dev sandbox runs. Move it off the loop if it
+          ever shows up in heartbeat latency.
+    - [ ] Track 1's calls are appended with their intended ranks. Insert
+          them at rank and renumber when the tracks merge.
   - [ ] Phase 8: fast paths, each needing its own review (wake on connect,
         `hint` idle signal, UFFD lazy memory, diff snapshots). Deferred.
 - [ ] Split a task runtime's implementation into parts — isolation vs. runner vs.

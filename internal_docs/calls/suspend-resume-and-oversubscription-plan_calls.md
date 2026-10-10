@@ -2996,3 +2996,185 @@ from inside the start, and a restore failure follows `onRestoreFailure`. Both
 need the manager state the lock guards. Moving that across the unlocked
 handoff is a real change to restore's failure handling, not a merge fix, so
 it is a TODO item under the audit's W3 follow-up instead.
+
+## Track 1: the agent-sandbox use case
+
+*Track 1 ran in parallel with two other tracks that also add entries here.
+Renumbering 113 entries would conflict with both, so these are appended
+with their intended rank in the heading ("ranks after N"). Whoever merges
+the tracks inserts each one at that rank, renumbers, and fixes citations.*
+
+### T1-1 (ranks after 13). Suspend and snapshots ride the allocation payload, and the worker knows its instance
+
+**Call.** `TaskAllocation` carries the task's `suspend` and `snapshots`
+blocks as JSON (`task_suspend`, `task_snapshots`, proto fields 23 and 24 in
+a `// Track 1` block), and the worker sets `Allocation.instance_id` from the
+`LEGION_INSTANCE_ID` the manager already injects into the task env.
+
+**Alternatives.** (a) Leave the payload alone and have the worker ask the
+manager for the job spec. (b) Send one derived summary (idle policy, on
+pressure, checkpoint launch) instead of the blocks.
+
+**Trade-off.** Two more strings on every payload that declares the blocks,
+and a manager that predates them leaves them empty, so a mixed-version node
+still reports no idle time and launches no sandbox ready for checkpoints.
+
+**Why (correctness, simplicity).** The worker rebuilt its `TaskConfig` from
+the payload and never saw either block. So on a real cluster no node ever
+reported idle time, `onPressure` was always off, and no sandbox launched
+ready for memory checkpoints. Unit tests built the `TaskConfig` directly and
+never noticed. The macOS end-to-end test found it on its first run. Sending
+the declarations keeps the worker's single predicate
+(`memory_checkpoint_ask`, `IdlePolicy::for_task`) as the one decision,
+rather than a second copy of it in a summary. (a) would put a manager round
+trip on every launch.
+
+### T1-2 (ranks after 39). An auto TAP is `tap = "auto"` plus a required bridge, named like a fork's TAP
+
+**Call.** `config.network = { mode = "tap", tap = "auto", bridge = "br0" }`
+has the node create a TAP per instance, named `lgf` plus 12 hex of the
+instance id's SHA-256 (`fork::own_tap_name`, the fork naming), attach it to
+`bridge`, record it for destroy, and recreate it on the same bridge on
+restore. `bridge` is required with `auto` and refused with a fixed TAP. A
+free leftover `lgf` device is reused and re-attached. The guest MAC defaults
+to `fork_mac(allocation_id)`.
+
+**Alternatives.** (a) A new `mode = "bridge"` with `bridge` alone. (b)
+Make gated networking checkpointable instead. (c) Allow `auto` without a
+bridge (a standalone TAP the operator routes). (d) Name the device per
+allocation.
+
+**Trade-off.** Egress for these sandboxes is whatever the operator puts on
+the bridge, not Legion's per-sandbox policy. A cold boot gets a new MAC, so
+a guest's DHCP lease changes across cold boots.
+
+**Why (simplicity, extensibility).** The surface reads as "a TAP, but
+Legion makes it", next to the existing `tap = "tap0"`, and keeps
+`mode`'s two values. (a) would be a third mode meaning the same thing. (b)
+needs the vsock datapath to survive a restore, which is a project of its
+own. (c) gives a guest a NIC on nothing, which is a silent failure. (d)
+would give a resumed instance a different device than its checkpoint
+records, and a fork a different name than its later boots. One name per
+instance unifies boot, resume, and fork on one code path
+(`create_owned_tap`).
+
+```nickel
+config = { network = { mode = "tap", tap = "auto", bridge = "br0" } },
+```
+
+### T1-3 (ranks after 27). Sandbox tokens refresh through the identity disk, in place, and env with `noop` is allowed where that works
+
+**Call.** A sandbox supports file delivery under `/legion/identity`. The
+worker writes the token to `<task dir>/identity/` on the host and copies it
+onto the guest's identity disk, rewriting the disk in place on each refresh
+(same allocation and host time, new tokens). The guest's handler tells a
+token refresh from a restore by that and rewrites only the token files. On a
+memory-checkpointable, non-gated sandbox, env delivery also mirrors to
+`/legion/identity/<ENV>`, so env with `changeMode = "noop"` is accepted
+there. `changeMode = "restart"` on such a sandbox is a submit warning.
+
+**Alternatives.** (a) A vsock agent that writes files into the guest. (b) A
+virtio-fs or 9p share of the host token directory. (c) Keep env-only and
+document the reboot. (d) A new `changeMode = "guest"`.
+
+**Trade-off.** The env var still holds the boot token, so a process that
+read it once keeps a stale one. A guest whose libc cannot run the handler
+never sees a refresh. In dev mode, env tokens are not mirrored.
+
+**Why (simplicity).** The identity disk and its poller already exist on
+every memory-checkpointable sandbox for restores, so a refresh is one more
+writer of the same format. (a) and (b) are new guest plumbing on both VMMs.
+(c) reboots the guest every half TTL, which defeats a sandbox kept for its
+running state. (d) is a mode name for what `noop` already means for files.
+The rename-based writer could not be reused, because a running VMM keeps the
+old inode open.
+
+### T1-4 (ranks after 47). On a guest's own NIC, only bytes the guest sends count
+
+**Call.** The `network` signal on a TAP sandbox reads the TAP's `rx_bytes`
+(what the guest sent), and on an Apple container `networkTxBytes`. A rise
+between two samples is activity. What the guest receives does not count.
+
+**Alternatives.** Count both directions, as the brief first suggested, or
+both with a noise floor.
+
+**Trade-off.** A guest that only receives (a stream it never acknowledges)
+looks idle. Every real TCP exchange sends acknowledgements, so that is a
+non-TCP edge case.
+
+**Why (correctness).** Measured on this Mac, an idle Apple container's
+receive counter rose by about 1 KB a minute from broadcast noise on the
+vmnet bridge while its transmit counter held still. A Linux bridge carries
+the same ARP and multicast noise. Counting it would keep every sandbox awake
+forever, which is the failure the idle policy exists to avoid, and a floor
+would be a tuning knob nobody can pick well.
+
+### T1-5 (ranks after 47). `connections` on a sandbox that is not gated is refused, not implemented with conntrack
+
+**Call.** Submit refuses `suspend.idle.signals = [..., "connections"]` on a
+sandbox without gated networking, with a hint (raise `after`, or suspend
+from the platform).
+
+**Alternatives.** Count conntrack entries for the guest's IP.
+
+**Trade-off.** No signal keeps an auto-TAP sandbox awake through a quiet
+model call. Platforms raise `after` or suspend themselves.
+
+**Why (simplicity).** Legion does not know a TAP guest's IP (DHCP on the
+operator's bridge assigns it), conntrack only sees bridged traffic with
+`br_netfilter` loaded, and an outbound connection the guest holds open is
+the case that matters, which conntrack would count only while the entry
+lives. Accepting the signal and having it never fire is the silent failure
+the "fail loudly" rule forbids.
+
+### T1-6 (ranks after 47). `exec` on a sandbox is refused when pinned to a VMM, and a warning otherwise
+
+**Call.** An explicitly listed `exec` on a sandbox with `hypervisor =
+"firecracker"` or `"cloud-hypervisor"` is refused at submit. With `auto` (or
+from the default list) it is a warning on `job run` and `job validate`.
+
+**Alternatives.** Refuse it on every sandbox, or say nothing and document
+it.
+
+**Trade-off.** The default signal list on a sandbox warns on every submit
+until the author lists signals explicitly.
+
+**Why (simplicity).** With `auto`, the same spec runs on a Mac in dev mode,
+where `exec` works, so refusing it would break the macOS dev loop. Only a
+pinned VMM is certain never to fire it.
+
+### T1-7 (ranks after 15). On macOS, `resourceEnforcement.enabled` is the measuring switch, read through one `container stats` call
+
+**Call.** A macOS worker with `resourceEnforcement.enabled` confines
+nothing, but reports usage for Apple-container sandboxes from one
+`container stats --format json --no-stream` call per report (every running
+container, filtered by the name each sandbox recorded).
+
+**Alternatives.** (a) Measure Apple containers whenever they run, with no
+switch. (b) Call `container stats <name>` per sandbox.
+
+**Trade-off.** "Enforcement" on a Mac enforces nothing, which the worker's
+startup log now says. The call is a subprocess on the heartbeat path every
+10 seconds while any dev sandbox runs.
+
+**Why (simplicity).** One switch means "this node measures", on every OS, so
+`idle-unmeasured` keeps its one fix. (b) fails the whole call when any
+named container has stopped, which happens in every teardown window.
+
+### T1-8 (ranks after 73). Apple dev containers are named after their node, and run with no `--` before the command
+
+**Call.** A dev-mode sandbox on Apple `container` is named
+`legion-sbx-<node>-<allocation>`, and its launch passes the command right
+after the image.
+
+**Alternatives.** Keep `legion-sbx-<allocation>`, and keep the `--`
+separator.
+
+**Trade-off.** Names are longer, and a command whose first token looks like
+a flag is passed through as Apple `container` 1.1 parses it.
+
+**Why (correctness).** Two local clusters both number allocations from 1,
+and a launch removes any stale container with its name, so one cluster
+removed the other's running sandbox. Apple `container` 1.1 runs `--` as the
+executable ("failed to find target executable --"), so no dev sandbox could
+start at all. The container runtime's Apple launch already dropped it.

@@ -113,8 +113,10 @@ A full runnable example is at
 - `extraClaims` are static literals. Keys can't be a reserved JWT claim
   (`iss`/`sub`/`aud`/…) or use the `legion.io/*` namespace.
 - **Change mode and delivery must be compatible.** `env` with
-  `changeMode = "noop"` is rejected, because env can't refresh in place.
-  `signal` requires `changeSignal`.
+  `changeMode = "noop"` is rejected, because env can't refresh in place. The
+  exception is a memory-checkpointable sandbox, which keeps the token fresh
+  in `/legion/identity/<ENV>` (see [Sandboxes](#sandboxes)). `signal`
+  requires `changeSignal`.
 - The task runtime must support the requested delivery (see capability gating
   below).
 
@@ -135,7 +137,7 @@ When a token is re-issued before expiry, `changeMode` controls what happens:
 | --- | --- | --- | --- |
 | `exec` | ✅ | ✅ | ✅ |
 | `container` | ✅ | ✅ (paths under `/legion/task`) | ✅ |
-| `sandbox` | ✅ | ❌ | ❌ |
+| `sandbox` | ✅ | ✅ (paths under `/legion/identity`) | ❌ |
 | `noop` | ❌ | ❌ | ❌ |
 
 Specs that ask for an unsupported delivery are rejected at admission with an
@@ -312,6 +314,87 @@ is a single manager, and it is always primary.
    `FailedPrecondition`. The worker logs one warning, and the task starts
    without tokens. Job specs still validate, so you can declare identities
    before the cluster enables the feature.
+
+### Sandboxes
+
+A sandbox guest can't read the worker's files, and it can't take a signal,
+so neither the host token file nor `changeMode = "signal"` reaches it. Before
+file delivery, the only way to refresh a sandbox's token was `changeMode =
+"restart"`, which reboots the guest at about half the TTL and loses
+everything it had in memory. That defeats a sandbox kept for its running
+state.
+
+So a sandbox gets its tokens through its identity disk, the small raw disk
+the guest's resume handler (`legion guest-resume`) already polls for
+restores. On every refresh the worker rewrites that disk in place with the
+new tokens, and the handler rewrites the token files in the guest. Nothing
+restarts. Declare file delivery under `/legion/identity` (a relative path
+resolves there):
+
+```nickel
+identities = [{
+  name = "vault",
+  audience = ["vault.example.com"],
+  ttl = "15m",
+  file = { path = "/legion/identity/vault", mode = "0400" },
+  # changeMode defaults to "noop": the guest's file is rewritten in place.
+}],
+```
+
+On a memory-checkpointable sandbox (one with a `suspend` block that
+checkpoints memory, or `snapshots` with `memory` on, and no gated
+networking), env delivery works the same way. The env holds the token the
+guest booted with, and `/legion/identity/<ENV>` always holds the current one.
+There, env with the default `changeMode = "noop"` is accepted:
+
+```nickel
+identities = [{
+  name = "platform",
+  audience = ["api.acme.dev"],
+  env = "PLATFORM_TOKEN",   # boot value in env, current value in /legion/identity/PLATFORM_TOKEN
+}],
+```
+
+A long-lived process re-reads the file rather than its env, as it already
+must after a restore.
+
+A memory-checkpointable sandbox that asks for `changeMode = "restart"` is
+accepted with a warning on `job run` and `job validate`, since every refresh
+would reboot the guest:
+
+```text
+warning: task workspace: identity "platform" sets changeMode = "restart", which reboots this
+sandbox's guest on every token refresh (about every half TTL) and loses its running state. ...
+```
+
+How it works:
+
+- The worker writes a file-delivered token to `<task dir>/identity/<path>` on
+  the host, owner-only, and copies it onto the identity disk with its guest
+  path and mode. Env tokens ride the same disk by key.
+- On a refresh it rewrites the disk *in place*, so the running VMM sees the
+  new bytes. The disk keeps the same allocation id and host time, which is
+  how the handler tells a token refresh from a restore: it rewrites
+  `/legion/identity/`, `/legion/resume.env`, and each file token, and skips
+  the reseed, clock step, and `onResume`.
+- At boot the handler writes the disk's tokens right away, so the files exist
+  from the start.
+- A sandbox that is not launched for checkpoints still gets an identity disk
+  when it declares a file-delivered identity.
+- In dev mode (Apple `container` on macOS) the host's `<task dir>/identity`
+  is bind-mounted read-only at `/legion/identity`, so file tokens refresh the
+  same way. Env tokens there keep their boot value.
+
+Limits:
+
+- The handler polls the disk every 200 ms, so the guest's file trails the
+  worker's refresh by a fraction of a second. A token is refreshed at about
+  half its TTL, so that never leaves the guest an expired token.
+- A sandbox whose gating comes from a stored network policy launches without
+  checkpoint support, so its env tokens are not mirrored. Use file delivery.
+- The handler is the worker's own binary, so a guest whose libc cannot run it
+  never sees refreshed tokens (init says so on the console). Use `restart`
+  there, and accept the reboot.
 
 ### Suspended and restored instances
 

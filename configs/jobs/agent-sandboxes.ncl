@@ -47,9 +47,12 @@
     config = {
       image = "ghcr.io/acme/agent-base:2026-10",
       command = ["/usr/local/bin/harness"],
-      # No `network` block: the guest gets loopback only (`none`). A gated
-      # network cannot take memory checkpoints yet, and a `tap` device is a
-      # fixed name per task. See the guide's "Networking, today".
+      # A NIC per sandbox: the node creates a TAP device for each instance
+      # (`lgf` plus a hash of its id), attaches it to br0, recreates it on
+      # resume, and deletes it with the allocation. Any number of these fit
+      # on a node, and each can take memory checkpoints. br0 and DHCP on it
+      # are the operator's. See the guide's "Networking".
+      network = { mode = "tap", tap = "auto", bridge = "br0" },
       # Guest vCPUs. This is the VM's shape, not a reservation: the host
       # schedules and weights the VMM's threads by resources.cpu below.
       vcpus = 2,
@@ -86,11 +89,12 @@
       idle = {
         # Quiet this long, then suspend. Tuned for a human who stepped away.
         after = "3m",
-        # The defaults. For a microVM on `none` or `tap` networking, cpu is
-        # the signal that sees the guest: its traffic bypasses the node
-        # datapath, and microVMs take no exec sessions. See the guide's
-        # "An instance never goes idle, or goes idle too soon".
-        signals = ["network", "cpu", "exec"],
+        # What a TAP-wired microVM can show: bytes the guest sends on its
+        # TAP, and its CPU. `exec` would never fire (a microVM takes no exec
+        # sessions), and `connections` is refused (no datapath fronts the
+        # guest). See the guide's "An instance never goes idle, or goes idle
+        # too soon".
+        signals = ["network", "cpu"],
         cpuBelow = 0.02,
       },
       # Under memory pressure, suspend this sandbox (state kept) before the
@@ -106,6 +110,17 @@
       keep = 3,
       memory = true,
     },
+
+    # A platform token for the harness, kept fresh in the guest with no
+    # reboot: the worker rewrites the guest's identity disk on every refresh,
+    # and the guest's handler rewrites /legion/identity/platform. Inert until
+    # the manager enables workload identity. See the guide's "Security".
+    identities = [{
+      name = "platform",
+      audience = ["api.acme.dev"],
+      ttl = "15m",
+      file = { path = "/legion/identity/platform" },
+    }],
 
     constraints = {
       # Memory checkpoints need KVM and a real VMM.

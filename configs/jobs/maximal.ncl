@@ -732,10 +732,15 @@
                     after = "3m",
                     # What counts as activity. Default
                     # ["network", "cpu", "exec"]. "connections" also counts
-                    # an open ingress connection that sends nothing (an agent
-                    # harness waiting on a model call). "hint" (the
-                    # workload's own signal) is not available yet and is
-                    # refused.
+                    # an open ingress connection through the node datapath
+                    # that sends nothing (a client waiting on a slow
+                    # response). A sandbox that is not gated has no datapath
+                    # ingress, so "connections" is refused there, as is
+                    # "exec" on a sandbox pinned to a VMM (a microVM takes no
+                    # exec sessions). On a sandbox, "network" also counts
+                    # bytes the guest sends on its TAP or Apple container
+                    # NIC. "hint" (the workload's own signal) is not
+                    # available yet and is refused.
                     signals = ["network", "cpu", "exec", "connections"],
                     # The cpu signal's threshold, as a fraction of this
                     # task's cpu. Default 0.02.
@@ -804,10 +809,21 @@
                 kernel = "/var/lib/legion/kernels/vmlinux",
                 kernel_args = "quiet",
                 network = {
-                    # "none" (default, loopback only) or "tap" with a
-                    # pre-created host TAP device. Not used when the task's
-                    # own `network.mode` below is "gated".
+                    # "none" (default, loopback only) or "tap". Not used
+                    # when the task's own `network.mode` below is "gated".
                     mode = "none",
+                    # With mode = "tap": a pre-created host TAP device (one
+                    # guest per node), or "auto" for a TAP Legion creates
+                    # per instance (`lgf` + a hash of the instance id),
+                    # attaches to `bridge`, recreates on resume, and deletes
+                    # with the allocation:
+                    # tap = "auto",
+                    # The host bridge an auto TAP joins. Required with
+                    # tap = "auto", refused with a fixed tap.
+                    # bridge = "br0",
+                    # Guest MAC. An auto TAP defaults to one derived from
+                    # the allocation id.
+                    # mac = "02:00:00:00:00:01",
                 },
             },
             # The task-level network block applies to sandboxes too: "gated"
@@ -845,6 +861,21 @@
                 # response gives back first (docs/resource-enforcement.md).
                 memoryMax = 1024,
             },
+            # A sandbox takes file-delivered identities under
+            # /legion/identity (a relative path resolves there). The worker
+            # copies each refreshed token onto the guest's identity disk and
+            # the guest rewrites the file, with no restart (changeMode
+            # defaults to "noop"). On a memory-checkpointable sandbox, env
+            # delivery with "noop" works too: the current token is kept at
+            # /legion/identity/<ENV> (docs/workload-identity.md, "Sandboxes").
+            identities = [
+                {
+                    name = "pypi",
+                    audience = ["pypi.org"],
+                    ttl = "15m",
+                    file = { path = "/legion/identity/pypi", mode = "0400" },
+                },
+            ],
             constraints = {
                 # A microVM needs KVM, so keep these on a Linux pool. On macOS
                 # the kind falls back to Apple `container` dev mode.

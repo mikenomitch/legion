@@ -31,8 +31,8 @@ minutes, and `legion instance start user-42` brings it back where it left off.
 
 Memory checkpoints need Linux with KVM and Firecracker or cloud-hypervisor on
 the worker, so the spec places on Linux workers only. A Mac can validate it,
-but macOS workers can't take memory checkpoints or measure idleness. See
-[Limitations](#limitations).
+and runs a disk-checkpoint copy of it for development. See
+[The macOS dev loop](#the-macos-dev-loop).
 
 ## Set up the workers
 
@@ -182,6 +182,7 @@ registration.
     config = {
       image = "ghcr.io/acme/agent-base:2026-10",
       command = ["/usr/local/bin/harness"],
+      network = { mode = "tap", tap = "auto", bridge = "br0" },
       vcpus = 2,
     },
 
@@ -194,11 +195,18 @@ registration.
       resumeTimeout = "30s",
       onResume = ["/usr/local/bin/harness", "reconnect"],
       durability = "local",
-      idle = { after = "3m", signals = ["network", "cpu", "exec"], cpuBelow = 0.02 },
+      idle = { after = "3m", signals = ["network", "cpu"], cpuBelow = 0.02 },
       onPressure = true,
     },
 
     snapshots = { ttl = "14d", keep = 3, memory = true },
+
+    identities = [{
+      name = "platform",
+      audience = ["api.acme.dev"],
+      ttl = "15m",
+      file = { path = "/legion/identity/platform" },
+    }],
 
     constraints = { os = "linux" },
   }],
@@ -291,9 +299,12 @@ a resume runs there. It is the default, written out so a reader knows a node
 loss loses the checkpoint. See [Surviving a node loss](#surviving-a-node-loss).
 
 **`idle`** suspends the sandbox once it has been quiet for `after`. Three
-minutes suits a human who stepped away. Read
+minutes suits a human who stepped away. The signals are the two a TAP-wired
+microVM can show: bytes the guest sends on its TAP (`network`) and its CPU.
+`exec` is left out because a microVM takes no exec sessions, and
+`connections` is refused for a sandbox that isn't gated. Read
 [An instance never goes idle](#an-instance-never-goes-idle-or-goes-idle-too-soon)
-before you rely on the signals for a microVM. See
+before you tune them. See
 [idle policy](../suspend-and-resume.md#idle-policy).
 
 **`onPressure = true`** lets a node that runs short of memory suspend this
@@ -305,21 +316,39 @@ point before an agent rewrites the repository, or a warmed "golden" sandbox
 to start new users from. `ttl = "14d"` gives a weekly golden snapshot a week
 of overlap. See [snapshots](../suspend-and-resume.md#snapshots).
 
-**No `network` block.** The guest gets loopback only. That is a real
-constraint, and the next section explains it.
+**`identities`** gives the harness a platform token at
+`/legion/identity/platform`, refreshed at about half its 15-minute TTL with
+no reboot. See [Security](#security).
 
-### Networking, today
+**`config.network`** gives each sandbox a NIC of its own, and the next
+section explains it.
 
-A sandbox that suspends with a memory checkpoint has three networking options
-today, and none of them is what a large agent platform wants:
+### Networking
+
+`tap = "auto"` has the node create a TAP device for each instance and attach
+it to `br0`. The device is named `lgf` plus 12 hex characters of the
+instance id's hash, so `user-42` always asks for the same device. A resume
+recreates it under the name its checkpoint recorded, on the same bridge, and
+destroying the allocation deletes it. A fork of `user-42` gets its own `lgf`
+device on `br0`, the one it would boot on. Any number of auto-TAP sandboxes
+fit on a node, and every one can take memory checkpoints.
+
+The bridge is yours: create `br0` on each sandbox node, route or NAT it, and
+run DHCP on it, since every sandbox boots from the same image. Each guest
+gets a MAC derived from its allocation id, so guests on one bridge never
+collide. The worker needs `CAP_NET_ADMIN` and the `ip` tool. Whatever
+filtering you want between sandboxes and the outside goes on the bridge.
+
+The options, side by side:
 
 | `network` | Guest gets | Memory checkpoints | Sandboxes per node |
 | --- | --- | --- | --- |
 | none (`config.network.mode = "none"`, the default) | Loopback only | Yes | Any number |
+| `config.network = { mode = "tap", tap = "auto", bridge = "br0" }` | A NIC on a TAP Legion creates per instance, on your bridge | Yes | Any number |
 | `config.network = { mode = "tap", tap = "tap0" }` | A NIC on a host TAP device you create | Yes | One per task, since the device name is fixed in the spec |
 | `network = { mode = "gated", egress = { allow = [...] } }` | Egress through the node datapath, judged by policy | **No**, refused at submit | Any number |
 
-Gated networking is the scalable path, with per-sandbox egress policy, and it
+Gated networking is the one with per-sandbox egress policy in Legion, and it
 can't take a memory checkpoint yet because the guest's vsock datapath is part
 of its saved state. A gated sandbox can still suspend with
 `checkpoint = "disk"`, which keeps `/workspace` and boots fresh on resume. See
@@ -327,9 +356,9 @@ of its saved state. A gated sandbox can still suspend with
 [sandbox networking](../task-runtime-sandbox.md#networking).
 
 Pick by what the sandbox must keep. If a resumed sandbox must continue its
-running processes, run it on `none` and give the harness its work through
-`/workspace` or your platform's own channel. If it must reach the internet
-under policy, run it gated with disk checkpoints.
+running processes, use an auto TAP and enforce egress on the bridge. If
+egress must be judged per sandbox by Legion's policy, run it gated with disk
+checkpoints.
 
 ## The platform's lifecycle
 
@@ -445,9 +474,9 @@ $ legion instance fork user-42 --count 3 --wait -j --idempotency-key fork-7f2
 
 > **A static IP in the guest is copied to every fork.** Each fork gets its
 > own MAC and TAP device, but an address configured inside the guest comes
-> along, so three forks would answer on `user-42`'s IP on the same bridge.
-> Have the image use DHCP, or renew the address in `onResume`, before you
-> fork sandboxes with networking.
+> along, so three forks would answer on `user-42`'s IP on `br0`. Have the
+> image use DHCP, and renew the lease in `onResume`, before you fork
+> sandboxes with networking.
 
 The origin pauses while its memory is written (`pause_ms`, about 0.5 to 1
 second per GiB of guest memory on local NVMe), then keeps running. Each fork
@@ -707,14 +736,16 @@ by `onResume`. See
 A checkpoint taken less than one TTL ago holds a token that still works, for
 anyone who can read the checkpoint. Keep identity TTLs short on sandboxes.
 
-Workload identity on a sandbox has a cost today. A sandbox can only take
-identities by env, and env delivery on a sandbox refreshes with
-`changeMode = "restart"`, which reboots the guest at about half the TTL and
-loses its running state. A short TTL means frequent reboots, and a long one
-means a captured token stays valid longer. Many platforms skip identities on
-the sandbox and have `onResume` fetch short-lived credentials from their own
-API, keyed by `LEGION_ALLOC_ID` from `/legion/resume.env`. See
-[workload identity](../workload-identity.md#suspended-and-restored-instances).
+**Tokens refresh without a reboot.** The spec delivers its `platform` token
+as a file, `/legion/identity/platform`. At about half the TTL the worker
+re-issues it and rewrites the running guest's identity disk in place, and the
+guest's handler rewrites the file. Nothing restarts, and the sandbox keeps
+its running state, so a short TTL costs nothing. Have the harness read the
+file on each call rather than once at startup. An env-delivered identity
+works the same way on this sandbox: the env keeps the boot token, and
+`/legion/identity/<ENV>` the current one. `changeMode = "restart"` would
+reboot the guest on every refresh, so `job run` warns if you set it. See
+[workload identity on sandboxes](../workload-identity.md#sandboxes).
 
 **A restore never widens what the sandbox may do.** It always runs under the
 task's current config (network policy, mounts, identity), never values from
@@ -810,27 +841,35 @@ next candidate.
 An instance stays awake while any listed signal fires. What each one sees on
 a microVM matters:
 
-| Signal | What it sees | On a `none` or `tap` microVM |
+| Signal | What it sees | On an auto-TAP microVM |
 | --- | --- | --- |
-| `network` | Bytes through the node datapath | Nothing. The guest's traffic doesn't pass through it |
-| `connections` | Open ingress connections through the datapath | Nothing, for the same reason |
+| `network` | Bytes through the node datapath, plus bytes the guest sends on its own NIC | Bytes the guest sends on its TAP (`rx_bytes` of `/sys/class/net/lgf...`) |
+| `connections` | Open ingress connections through the datapath | Refused at submit. No datapath fronts the guest |
 | `cpu` | CPU at or above `cpuBelow` of the task's `cpu` | The VMM's CPU, which is the guest's |
-| `exec` | Open `exec` sessions and actions | Nothing. A microVM takes no exec sessions yet |
+| `exec` | Open `exec` sessions and actions | Never fires. A microVM takes no exec sessions, so `job run` warns when it is listed |
 
-So for the sandboxes in this guide, `cpu` decides. Two failure modes follow:
+Only bytes the guest sends count. What arrives on `br0` includes broadcast
+noise that would otherwise keep every sandbox awake. Any real exchange has
+the guest sending something, even if it is only acknowledgements. Three
+failure modes follow:
 
 - **It never suspends.** Something in the guest keeps the CPU above
-  `cpuBelow` (0.02 of `cpu`, never below 1% of a core): a file watcher, a
-  language server reindexing, a spinning harness. Compare `instance get`'s
-  idle window and `node usage`'s `CPU` column with what the guest runs, then
-  quiet the process or raise `cpuBelow`.
+  `cpuBelow` (0.02 of `cpu`, never below 1% of a core), such as a file
+  watcher, a language server reindexing, or a spinning harness. Or it keeps
+  sending: a heartbeat to your platform, an NTP client, frequent DHCP
+  renewals. Compare `instance get`'s idle window and `node usage`'s `CPU` and
+  `IDLE` columns with what the guest runs, then quiet the process, raise
+  `cpuBelow`, or drop `network` from `signals`.
 - **It suspends in the middle of a model call.** An agent harness waiting
-  40 seconds on a model holds a mostly quiet HTTPS connection and almost no
-  CPU. On a TAP NIC that traffic is invisible to the node, so the wait counts
-  as quiet. Adding `connections` does not help, because it counts ingress
-  through the datapath only. Set `after` longer than your longest model call,
-  or leave `idle` off and suspend from your platform, which knows when a call
-  is in flight.
+  40 seconds on a model holds a mostly quiet HTTPS connection, sends almost
+  nothing, and uses almost no CPU, so the wait counts as quiet. No signal sees
+  an idle open connection from the guest, and `connections` is refused for
+  that reason rather than accepted and ignored. Set `after` longer than your
+  longest model call, or leave `idle` off and suspend from your platform,
+  which knows when a call is in flight.
+- **It suspends while someone is in a shell.** Not on a microVM: `legion
+  exec` doesn't reach the guest. A shell your platform runs over the network
+  is traffic on the TAP, which keeps it awake while it sends.
 
 The `hint` signal, where the workload says it is parked, is not available,
 and a spec that lists it is refused:
@@ -839,7 +878,19 @@ and a spec that lists it is refused:
 Error: jobspec failed validation: task "workspace": suspend.idle.signals "hint" is not
 implemented yet: the workload's own busy/idle signal ships in suspend plan Phase 8
 (remove "hint". To keep an instance awake through a quiet call, add "connections"
-(any open ingress connection counts as activity)) [code=InvalidArgument]
+(any open ingress connection through the node datapath counts as activity; a sandbox
+sees it only on gated networking)) [code=InvalidArgument]
+```
+
+So does `connections` on this sandbox:
+
+```text
+Error: jobspec failed validation: task "workspace": suspend.idle.signals "connections" counts
+open ingress connections through the node datapath, and this sandbox's traffic never crosses it
+(it is not network.mode = "gated", so clients reach the guest directly or not at all)
+(remove "connections". To keep a sandbox awake through a quiet model call, set idle.after
+longer than the call, or suspend from your platform, which knows when a call is in flight)
+[code=InvalidArgument]
 ```
 
 **Nothing ever suspends on a node.** Read `detail` in `instance get`. A node
@@ -880,19 +931,89 @@ fresh on `/workspace`. When gating comes from a stored network policy rather
 than the spec, the sandbox launches without checkpoint support, and a memory
 suspend or snapshot fails with `FailedPrecondition` and the same hint.
 
+## The macOS dev loop
+
+A Mac runs sandboxes on Apple `container` (dev mode), and with
+`resourceEnforcement.enabled` its worker measures them through `container
+stats`: CPU, memory, and the bytes each container sends, plus `legion alloc
+exec` sessions. So the idle policy works on a Mac. It can't take memory
+checkpoints, so keep a dev copy of the spec that suspends to disk and boots
+cold on resume:
+
+```nickel
+# agents-dev.ncl
+{
+  name = "agents-dev",
+  tasks = [{
+    name = "workspace",
+    runtime = "sandbox",
+    stateful = {
+      mode = "keyed",
+      idSource = "caller",
+      # Dev mode bind-mounts volumes, so no `mode = "block"`.
+      storage = { path = "/workspace" },
+    },
+    config = {
+      image = "ghcr.io/acme/agent-base:2026-10",
+      command = ["/usr/local/bin/harness"],
+    },
+    resources = { cpu = 250, memory = 512 },
+    suspend = {
+      checkpoint = "disk",
+      # Short, so you can watch it happen. `exec` works here: dev mode
+      # takes `legion alloc exec` sessions.
+      idle = { after = "1m", signals = ["network", "cpu", "exec"] },
+    },
+  }],
+}
+```
+
+Give the Mac's worker type the measuring switch, in the manager's
+`workerConfigPath`:
+
+```nickel
+# workers/devsandbox.ncl
+{ workerType = "devsandbox", resourceEnforcement = { enabled = true } }
+```
+
+Then:
+
+```bash
+container system start                  # if the Apple container service is down
+legion join -a --type devsandbox
+legion job run agents-dev.ncl
+legion instance create agents-dev --id user-42
+legion instance get user-42             # "idle since ..." once the first report lands
+# about a minute and a half later: suspended, suspend_reason idle
+legion instance start user-42 --wait    # a cold boot on the same /workspace
+```
+
+If a long-running local cluster already holds `:4747` and `:4848`, run the
+dev cluster on its own ports: set `server.port` and `storePath` in a copy of
+`configs/manager.ncl`, and `LEGION_WORKER_PORT` and `LEGION_WORKER_STATE_PATH`
+for the worker. Each dev-mode container is named after its node and
+allocation, so two local clusters never remove each other's containers.
+
+What the Mac doesn't do: memory checkpoints, forks of running state, auto
+TAPs, the pressure response, and refreshing an env-delivered token (file
+tokens refresh through a read-only bind mount at `/legion/identity`). See
+[the macOS dev loop](../suspend-and-resume.md#macos-dev-loop).
+
 ## Limitations
 
 - **Memory checkpoints need Linux, KVM, and Firecracker or cloud-hypervisor.**
   On macOS (Apple `container`) and Linux dev mode, a sandbox suspends to disk
-  only.
+  only. See [The macOS dev loop](#the-macos-dev-loop).
 - **Linux verification is pending.** These features were built and tested
   on macOS, with the Linux-only parts (cgroups, the VMM checkpoint and restore
-  calls, the balloon, the guest's resume handler) unit-tested against
-  fixtures. Some of that code has not yet run against a real kernel and VMM,
+  calls, the balloon, the guest's resume handler, auto TAPs and their
+  counters) unit-tested against fixtures. Some of that code has not yet run against a real kernel and VMM,
   so expect rough edges on your first Linux hosts.
-- **Networking and memory checkpoints don't fit together yet.** See
-  [Networking, today](#networking-today).
-- **Idle detection on a microVM is CPU only**, for the reasons in
+- **Gated networking and memory checkpoints don't fit together yet.** An
+  auto TAP does, with egress enforced on your bridge rather than by Legion's
+  policy. See [Networking](#networking).
+- **Idle detection on a microVM sees CPU and the bytes the guest sends**,
+  never an idle open connection, for the reasons in
   [An instance never goes idle](#an-instance-never-goes-idle-or-goes-idle-too-soon).
   Activity is sampled every 10 seconds and swept every 15, so `after` is
   honored to within about 30 seconds.
@@ -901,8 +1022,8 @@ suspend or snapshot fails with `FailedPrecondition` and the same hint.
 - **Local checkpoints die with their node**, and `local-dir` volumes pin
   sandboxes to it. Cross-node resume needs `durability = "store"` and no
   node-local storage.
-- **Workload identity on a sandbox refreshes by rebooting the guest.** See
-  [Security](#security).
+- **A refreshed token lands in a file, not in the env.** A process that read
+  its token once at startup keeps the old one. See [Security](#security).
 - **No exec into a running microVM**, so `legion exec` and actions don't
   reach the guest.
 - **A pressure suspend can be lost if the worker restarts before reporting

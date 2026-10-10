@@ -587,10 +587,19 @@ fn parse_resource_enforcement(raw: &str) -> crate::structs::WorkerResourceEnforc
 
 fn apply_resource_enforcement_env(config: &crate::structs::WorkerResourceEnforcementConfig) {
     if config.enabled {
-        info!(
-            cgroup_parent = %config.cgroup_parent,
-            "Resource enforcement enabled: exec and sandbox tasks run in worker-owned cgroups"
-        );
+        if cfg!(target_os = "linux") {
+            info!(
+                cgroup_parent = %config.cgroup_parent,
+                "Resource enforcement enabled: exec and sandbox tasks run in worker-owned cgroups"
+            );
+        } else {
+            // No cgroups here: the switch measures (Apple container sandboxes,
+            // through `container stats`) and enforces nothing.
+            info!(
+                "Resource enforcement enabled: nothing is confined on this OS, but dev-mode \
+                 sandboxes are measured for usage reports and idle policies"
+            );
+        }
         std::env::set_var(crate::constants::ENV_RESOURCE_ENFORCEMENT, "1");
         std::env::set_var(crate::constants::ENV_CGROUP_PARENT, &config.cgroup_parent);
         let overhead = config

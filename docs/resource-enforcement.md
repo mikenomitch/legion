@@ -371,10 +371,22 @@ memory, and sends the sample on the heartbeat that falls due:
 | `cpu_usage_usec` | `cpu.stat` `usage_usec` | Total CPU time, monotonic. |
 | `cpu_millicores` | derived | Average CPU over the last interval, in thousandths of a core. |
 | `psi_memory_some_avg10` | `memory.pressure` | Percent of the last 10s some task in the allocation stalled on memory. |
-| `last_activity_unix` | derived | The last interval with at least 1% of a core of CPU, or traffic through the node datapath. |
+| `last_activity_unix` | derived | The last interval with at least 1% of a core of CPU, traffic through the node datapath, or bytes a sandbox guest sent on its own NIC. |
 
 The node-wide part is `MemTotal` and `MemAvailable` from `/proc/meminfo`, and
 `some avg10` from `/proc/pressure/memory`.
+
+A sandbox wired to a TAP device also has the device's `rx_bytes` read (the
+bytes the guest sent), since its traffic never crosses the datapath.
+
+**On macOS** there are no cgroups. With `resourceEnforcement.enabled` the
+worker confines nothing, but it measures dev-mode sandboxes on Apple
+`container` with one `container stats --format json --no-stream` call per
+report: `memory_current_bytes` and `cpu_usage_usec` come from it, the bytes
+each container sent count as activity, and peak, anon, and pressure stall are
+not reported. That is what the idle policy reads on a Mac (see
+[the macOS dev loop](suspend-and-resume.md#macos-dev-loop)). The memory
+pressure response does not run there.
 
 The manager keeps the **latest report per node in memory only**. Usage never
 goes into the state store: it changes every 10 seconds and is worthless after

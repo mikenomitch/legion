@@ -239,8 +239,8 @@ The signals:
 
 | Signal | Counts as activity |
 | --- | --- |
-| `network` | Bytes through the node datapath: connections the task dials, and ingress connections to its ports. |
-| `connections` | Any open ingress connection, even one that sends nothing. |
+| `network` | Bytes through the node datapath: connections the task dials, and ingress connections to its ports. On a sandbox, also bytes the guest sends on its own NIC (see below). |
+| `connections` | Any open ingress connection through the node datapath, even one that sends nothing. |
 | `cpu` | CPU use at or above `cpuBelow` of the task's `cpu`. |
 | `exec` | An open exec session (`legion alloc exec`, an action). Someone working in the instance keeps it awake. |
 
@@ -265,27 +265,149 @@ idle since: 2026-10-10T12:00:00Z (suspends after 3m0s)
 `instance list`'s IDLE column counts the same way for a task with an idle
 policy, so it matches what the sweep acts on.
 
-**Why the signals are a list.** An agent harness waiting 40 seconds on a
-model call holds an open, mostly quiet HTTPS connection. Counting only open
-connections would never suspend it. Counting only bytes would suspend it in
-the middle of the call and break the stream on resume. The default
-(`network`, `cpu`, `exec`, three minutes) is tuned for interactive sandboxes
-that wait on a human. A harness whose quiet calls must not be cut adds
-`connections`:
+**Why the signals are a list.** A service behind the datapath can hold an
+open, mostly quiet connection for a long time, such as a client waiting on a
+slow response. Counting only open connections would never suspend it.
+Counting only bytes would suspend it in the middle of the wait and break the
+stream on resume. The default (`network`, `cpu`, `exec`, three minutes) is
+tuned for interactive work that waits on a human. A workload whose quiet
+ingress connections must not be cut adds `connections`:
 
 ```nickel
 idle = { after = "5m", signals = ["network", "cpu", "exec", "connections"] },
 ```
 
+`connections` only sees ingress the node datapath fronts. It does not
+protect an agent harness in a sandbox that waits on a model call, because
+that call is an outbound connection from the guest, and a sandbox's traffic
+crosses the datapath only when it is gated. See the next section.
+
 Suspending *during* a model call, and waking when it returns, needs the
 workload to say it is parked. That is the `hint` signal, which is not
 available yet. A spec that lists it is refused with a hint.
+
+### What each signal sees on a sandbox
+
+A microVM's traffic leaves through its own NIC (a TAP device) or not at all,
+and Apple `container` runs the guest in its own VM. So the signals see a
+sandbox differently from an `exec` or `container` task:
+
+| Signal | microVM on `none` or `tap` | Gated microVM | Dev mode (Apple `container`) |
+| --- | --- | --- | --- |
+| `network` | Bytes the guest sends on its TAP device, read from `/sys/class/net/<tap>/statistics/rx_bytes`. Nothing on `none` | Bytes through the datapath | Bytes the container sends, from `container stats` |
+| `connections` | **Refused at submit.** No datapath sees the guest's connections | Ingress connections through the datapath | **Refused at submit** |
+| `cpu` | The VMM's CPU, which is the guest's | The same | The container VM's CPU, from `container stats` |
+| `exec` | Never fires: a microVM takes no exec sessions | The same | `legion alloc exec` sessions |
+
+Only bytes the guest *sends* count on a TAP or an Apple container. What
+arrives includes broadcast and multicast noise on the bridge, which a quiet
+guest never asked for and which would keep it awake forever. Any real
+exchange, inbound or outbound, has the guest sending something, even if it
+is only TCP acknowledgements.
+
+Two rules follow, both checked at submit:
+
+- `connections` on a sandbox that is not gated is refused, with what to do
+  instead (set `after` longer than the longest quiet call, or suspend from
+  your platform):
+
+  ```text
+  Error: jobspec failed validation: task "workspace": suspend.idle.signals "connections" counts
+  open ingress connections through the node datapath, and this sandbox's traffic never crosses it
+  (it is not network.mode = "gated", so clients reach the guest directly or not at all)
+  (remove "connections". To keep a sandbox awake through a quiet model call, set idle.after
+  longer than the call, or suspend from your platform, which knows when a call is in flight)
+  [code=InvalidArgument]
+  ```
+
+- `exec` listed explicitly on a sandbox pinned to a VMM (`hypervisor =
+  "firecracker"` or `"cloud-hypervisor"`) is refused, since it can never
+  fire. On `hypervisor = "auto"` the same sandbox may run in dev mode on a
+  Mac, where `exec` works, so `exec` (including the default list) is a
+  warning on `job run` and `job validate` instead:
+
+  ```text
+  warning: task workspace: suspend.idle counts "exec", which never fires while the sandbox runs
+  as a microVM (firecracker and cloud-hypervisor take no exec sessions). ...
+  List signals explicitly, such as ["network", "cpu"], to drop it
+  ```
+
+On a TAP-wired microVM, `network` and `cpu` decide. On `none`, only `cpu`
+does.
 
 The idle policy needs the node to measure activity, which it does only with
 `resourceEnforcement.enabled` on the worker type (see
 [resource enforcement](resource-enforcement.md#measuring-usage)). On a node
 without it the policy cannot act, and `instance get` says so in `detail`
 (`idle-unmeasured: ...`).
+
+### macOS dev loop
+
+A Mac has no cgroups, so it measures sandboxes another way. A `sandbox` task
+on a macOS worker runs on Apple `container` (dev mode), and with
+`resourceEnforcement.enabled` the worker reads each one's CPU, memory, and
+network from one `container stats --format json --no-stream` call per usage
+report. It confines nothing: on macOS the switch only turns measuring on.
+Legion exec sessions (`legion alloc exec`) count for `exec` too.
+
+That is enough for idle suspend in disk mode. A Mac cannot take memory
+checkpoints, so the sandbox suspends with `checkpoint = "disk"` and resumes
+with a cold boot on its retained volume:
+
+```nickel
+# workers/devsandbox.ncl, in the manager's workerConfigPath
+{ workerType = "devsandbox", resourceEnforcement = { enabled = true } }
+```
+
+```nickel
+# a dev copy of the sandbox job
+{
+  name = "agents-dev",
+  tasks = [{
+    name = "workspace",
+    runtime = "sandbox",
+    stateful = { mode = "keyed", idSource = "caller", storage = { path = "/workspace" } },
+    config = {
+      image = "alpine:latest",
+      command = ["/bin/sh", "-c", "echo boot >> /workspace/boots; exec sleep 100000"],
+    },
+    resources = { cpu = 100, memory = 256 },
+    suspend = {
+      checkpoint = "disk",
+      idle = { after = "30s", signals = ["network", "cpu", "exec"] },
+    },
+  }],
+}
+```
+
+```bash
+container system start                 # the Apple container service, if it is down
+legion join -a --type devsandbox
+legion job run agents-dev.ncl
+legion instance create agents-dev --id user-1
+legion instance get user-1             # "idle since ..." once a report lands
+# ...about after + 30s later: state suspended, suspend_reason idle
+legion instance start user-1 --wait    # boots cold on the same /workspace
+```
+
+What differs from Linux:
+
+- **Storage is filesystem mode.** Dev mode bind-mounts volumes, so drop
+  `mode = "block"` from `stateful.storage`.
+- **Disk checkpoints only.** Dev mode cannot capture memory, so a memory
+  suspend of a dev-mode sandbox fails and the sandbox keeps running. Keep the
+  memory spec for Linux and a disk copy for the Mac.
+- **No pressure response.** The node measures, but it has no cgroups to act
+  on, so `onPressure` and the pressure steps do nothing.
+- **A `container exec` you run by hand is invisible** to the `exec` signal,
+  since it bypasses the worker. Its CPU still counts.
+- **Two local clusters can share a Mac.** Each dev-mode container is named
+  `legion-sbx-<node>-<allocation>`, so one cluster's cleanup never removes
+  another's container.
+
+The end-to-end test for this loop is
+`cargo test --test apple_container_idle -- --ignored`. It needs the
+`container` CLI and starts its service when it is down.
 
 ### Under memory pressure
 
@@ -724,6 +846,14 @@ The handler logs each step to the guest console, so `legion job logs` shows
 what a restore refreshed and what failed. A failed step does not stop the
 others.
 
+The same disk refreshes tokens between restores. When the worker re-issues a
+workload-identity token (at about half its TTL), it rewrites the running
+guest's identity disk in place, with the same allocation and new tokens. The
+handler sees a token refresh, not a restore: it rewrites
+`/legion/identity/`, `/legion/resume.env`, and any file-delivered token, and
+does nothing else. No reseed, no clock step, no `onResume`, and no reboot.
+See [workload identity on sandboxes](workload-identity.md#sandboxes).
+
 ## Inspecting an instance
 
 `legion instance get <id> -j` (and `instance list -j`, the UI, and
@@ -949,7 +1079,9 @@ node makes sure that TAP device is there:
 - If it does not exist, the node creates it (a persistent TAP, brought up)
   and removes it again when the allocation is destroyed. A failure to create
   it fails the restore: `restore needs TAP device tap7: creating it failed:
-  ...`.
+  ...`. An auto TAP (`tap = "auto"`) is recreated under the same `lgf` name
+  and attached to the task's `bridge` again, so a resume lands back on the
+  same network segment.
 
 A restore never comes up without the network its guest was captured with.
 
@@ -1254,8 +1386,12 @@ TAP-wired sandbox gets a TAP device of its own:
 A fork's later checkpoints record its own TAP, so suspending and resuming a
 fork keeps it.
 
-A fresh boot always uses the task's configured TAP, so only one instance of a
-task with a fixed TAP device can run per node. That rules out two cases that
+A fork of an auto-TAP sandbox (`tap = "auto"`) gets the same `lgf` device
+name its instance would boot on, attached to the task's `bridge`. So a fork
+that later boots cold, or is suspended and resumed, keeps that device.
+
+A fresh boot of a fixed-TAP task always uses the task's configured TAP, so
+only one instance of it can run per node. That rules out two cases that
 would boot next to the origin on its TAP:
 
 - **A disk fork** of a TAP-wired sandbox is refused at the API, with the hint
@@ -1499,7 +1635,12 @@ See [metrics](metrics.md#suspend-and-resume).
 | `detail: idle-unmeasured: ...` | The node sends no usage reports, so nothing measures activity | Set `resourceEnforcement.enabled` on the worker type |
 | An idle instance never suspends | A listed signal keeps firing (an open `exec` session, a client holding a connection with `connections` listed, background CPU above `cpuBelow`) | Compare `instance get`'s idle since with what the task is doing, then adjust `signals` or `cpuBelow` |
 | `legion_idle_sweep_suspends_total{outcome="skipped"}` rising | The sweep found idle instances it could not suspend | The manager's debug log names why (a worker without the `checkpoint` capability, a memory checkpoint the node cannot take) |
-| Submit: `suspend.idle.signals "hint" is not implemented yet` | The workload's own idle signal is not available | Remove `hint`. Add `connections` to keep quiet calls awake |
+| Submit: `suspend.idle.signals "hint" is not implemented yet` | The workload's own idle signal is not available | Remove `hint`. Add `connections` to keep quiet ingress connections awake (gated sandboxes, `exec`, `container`) |
+| Submit: `"connections" counts open ingress connections through the node datapath, and this sandbox's traffic never crosses it` | A sandbox that is not gated has no datapath ingress | Remove `connections`. Raise `after` or suspend from your platform |
+| Submit: `lists "exec", but this sandbox always runs as a microVM` | A microVM takes no exec sessions | Remove `exec` |
+| Warning: `suspend.idle counts "exec", which never fires while the sandbox runs as a microVM` | The default signals on a sandbox that may run as a microVM | List signals explicitly, or ignore it for a dev-mode-only job |
+| A TAP-wired sandbox never suspends | The guest keeps sending on its TAP (DHCP, NTP, a chatty agent) | Compare `node usage`'s IDLE column with the guest's traffic, or drop `network` from `signals` |
+| Allocation fails: `sandbox needs TAP device lgf... (network.tap = "auto"): it exists and another process holds it` | The instance already runs a guest on this node | Stop the other allocation first |
 | Submit: `suspend.idle.after "5s" is shorter than 30s` | Reports every 10s and a 15s sweep cannot honor it | Use `30s` or longer |
 | `instance fork` refused | See [Refusals](#refusals) | Follow the hint in the message |
 | Forks stuck `pending (forking)` | The origin's node has not reported the capture yet (it is down, or busy writing memory) | Wait, or watch the checkpoint with `legion snapshot get <snapshot>` |
@@ -1582,9 +1723,10 @@ See [metrics](metrics.md#suspend-and-resume).
   happens next. `durability = "store"` lifts this once the upload finishes,
   except for a suspend the memory pressure response took, which stays local.
 - **The idle policy needs resource enforcement.** Activity is measured from
-  the allocation's cgroup and the node datapath, so a node without
-  `resourceEnforcement.enabled` (including every macOS worker) never
-  suspends for idleness.
+  the allocation's cgroup (on macOS, `container stats`) and the node
+  datapath, so a node without `resourceEnforcement.enabled` never suspends
+  for idleness. On macOS only dev-mode sandboxes are measured, and only
+  disk suspend works.
 - **Idle is coarse.** Activity is sampled every 10 seconds and swept every
   15, so `after` is honored to within about 30 seconds, and a burst shorter
   than a sample interval counts only through bytes or an open session, not
@@ -1592,7 +1734,11 @@ See [metrics](metrics.md#suspend-and-resume).
 - **Only ingress through the datapath counts as `connections`.** A port the
   task binds directly on the host (no `ingress` chain) is invisible to the
   node, so its connections and bytes do not keep the instance awake. CPU and
-  the egress datapath still do.
+  the egress datapath still do. A sandbox that is not gated has no datapath
+  ingress at all, so `connections` is refused there.
+- **A sandbox's NIC counts bytes, not connections.** A quiet outbound
+  connection from the guest (a harness waiting on a model) sends nothing, so
+  it looks idle. Set `after` longer than the longest quiet call.
 - **No `hint` signal yet.** A workload cannot say "parked until this call
   returns", so suspending during a model call is not possible.
 - **A pressure suspend is lost if the worker restarts before reporting it.**
