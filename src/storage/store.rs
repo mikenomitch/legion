@@ -15582,8 +15582,18 @@ impl Store {
         };
 
         let eval_id = eval.id.clone();
-        // Collapse only work this claim genuinely subsumes: same entity, same
-        // kind, and already claimable.
+        // Collapse only work this claim genuinely subsumes: same kind, same
+        // scope, and already claimable.
+        //
+        // "Same scope" means the whole (job, job config, node) triple, with
+        // NULL and '' treated alike. Matching on job OR node used to sweep
+        // unrelated work: reschedule evals for jobs A, B and C that shared a
+        // node collapsed into A's, leaving B and C under-count, and a stale
+        // v2 `rollout_tick` swept the v3 tick that was driving the new
+        // rollout. Node-scoped kinds (`node_drain`, `node_lost_reschedule`)
+        // carry no job, so they still collapse per node; job-scoped kinds
+        // collapse per job config (and per excluded node for reschedules,
+        // whose node is the one the replacement must avoid).
         //
         // Matching on kind matters because different kinds are not
         // interchangeable — dropping a job's `rollout_tick` because a
@@ -15600,17 +15610,18 @@ impl Store {
               AND id != :id
               AND type = :type
               AND ready_at <= :now
-              AND (
-                (:job_id IS NOT NULL AND :job_id != '' AND job_id = :job_id)
-                OR (:node_id IS NOT NULL AND :node_id != '' AND node_id = :node_id)
-              );",
+              AND (:job_id != '' OR :node_id != '')
+              AND COALESCE(job_id, '') = :job_id
+              AND COALESCE(job_config_id, '') = :job_config_id
+              AND COALESCE(node_id, '') = :node_id;",
         )?
         .execute(named_params! {
             ":id": eval_id,
             ":type": eval.kind,
             ":now": Self::sortable_now()?,
-            ":job_id": if eval.job_id.trim().is_empty() { None::<String> } else { Some(eval.job_id.clone()) },
-            ":node_id": if eval.node_name.trim().is_empty() { None::<String> } else { Some(eval.node_name.clone()) },
+            ":job_id": eval.job_id.trim(),
+            ":job_config_id": eval.job_config_id.trim(),
+            ":node_id": eval.node_name.trim(),
         })?;
 
         // Cheapest accurate point for the queue-depth gauge: the claim (and
@@ -21093,6 +21104,57 @@ mod tests {
             vec!["job_update".to_string()],
             "only the duplicate reschedule should have been collapsed"
         );
+
+        Ok(())
+    }
+
+    /// SC2: the claim sweep collapses only exact duplicates. Reschedules
+    /// for different jobs that share a node, and a rollout tick for a newer
+    /// config of the same job, are separate work and must survive.
+    #[test]
+    fn claim_eval_dedupe_spares_other_jobs_on_the_node_and_other_configs() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-1", "ready"))?;
+
+        for job in ["job-a", "job-b", "job-c"] {
+            store.enqueue_eval(
+                "job_reschedule",
+                Some(job),
+                Some(&format!("{job}:1")),
+                Some("node-1"),
+                Some(50),
+            )?;
+        }
+        // A stale v2 tick and the live v3 tick for one job.
+        store.enqueue_eval("rollout_tick", Some("job-r"), Some("job-r:2"), None, Some(40))?;
+        store.enqueue_eval("rollout_tick", Some("job-r"), Some("job-r:3"), None, Some(40))?;
+        // Node-scoped work still collapses per node.
+        store.enqueue_eval("node_lost_reschedule", None, None, Some("node-2"), Some(30))?;
+        store.enqueue_eval("node_lost_reschedule", None, None, Some("node-2"), Some(30))?;
+
+        let mut claimed = Vec::new();
+        while let Some(eval) = store.claim_eval()? {
+            store.complete_eval(&eval.id, true)?;
+            claimed.push((eval.kind, eval.job_id, eval.job_config_id, eval.node_name));
+        }
+
+        let reschedules: Vec<&str> = claimed
+            .iter()
+            .filter(|(kind, ..)| kind == "job_reschedule")
+            .map(|(_, job, ..)| job.as_str())
+            .collect();
+        assert_eq!(reschedules, vec!["job-a", "job-b", "job-c"]);
+        let ticks: Vec<&str> = claimed
+            .iter()
+            .filter(|(kind, ..)| kind == "rollout_tick")
+            .map(|(_, _, config, _)| config.as_str())
+            .collect();
+        assert_eq!(ticks, vec!["job-r:2", "job-r:3"]);
+        let lost: usize = claimed
+            .iter()
+            .filter(|(kind, ..)| kind == "node_lost_reschedule")
+            .count();
+        assert_eq!(lost, 1, "duplicate node-scoped evals still collapse");
 
         Ok(())
     }

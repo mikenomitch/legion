@@ -102,12 +102,17 @@ Dedup-on-claim behavior:
 
 After claiming an eval, other pending evals are deleted when all of these hold:
 
-- same `job_id` or same `node_id`,
 - same kind,
+- same scope: the same `job_id`, `job_config_id`, and `node_id` (an empty
+  field only matches another empty field),
 - already claimable (`ready_at <= now`).
 
 This keeps the queue from filling with redundant work for the same entity.
-It only discards work the claimed eval covers. A `job_reschedule` must not
+It only discards work the claimed eval covers. Node-scoped kinds
+(`node_drain`, `node_lost_reschedule`) carry no job, so they collapse per
+node. Job-scoped kinds collapse per job config, so reschedules for different
+jobs on the same node all run, and a stale tick for an older config never
+sweeps the tick driving a newer rollout. A `job_reschedule` must not
 drop a job's pending `rollout_tick` (ticks re-enqueue themselves, so nothing
 else would drive the rollout forward) or its `job_stop`. An immediate eval
 must not cancel a delayed one either, since a delayed eval is a timer and
@@ -609,9 +614,9 @@ patterns.
 
 ## Known Boundaries
 
-- Queue dedupe is scoped to job/node IDs plus kind, not full payload
-  equivalence. Two `job_reschedule` evals for the same job collapse even when
-  they were enqueued for different reasons.
+- Queue dedupe is scoped to the job, config, and node IDs plus kind, not full
+  payload equivalence. Two `job_reschedule` evals for the same job config and
+  node collapse even when they were enqueued for different reasons.
 - With a replicated (raft) store, the eval queue is replicated, but only the
   scheduler lane's leader claims and runs evals. Other managers do not share
   eval work.
