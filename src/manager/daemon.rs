@@ -233,6 +233,8 @@ pub async fn run_manager_with(
 
     let store_for_keyring = store.clone();
 
+    let store_for_shutdown = store.clone();
+
     // Workload identity (OIDC issuer): only constructed when enabled. The
     // signing keys are restored from (or first-boot persisted to) the store,
     // so tokens held by third parties stay verifiable across restarts. Built
@@ -522,6 +524,7 @@ pub async fn run_manager_with(
     // identity disabled it is a pure passthrough and mounts no routes.
     // The metrics layer sits innermost (after grpc-web translation) so the
     // method label reflects the real gRPC route for browser calls too.
+    let (stop_serving_tx, stop_serving_rx) = tokio::sync::oneshot::channel::<()>();
     let start_server_fut = server_builder
         .accept_http1(true)
         .layer(OidcHttpLayer::new(workload_identity_state.clone()))
@@ -533,7 +536,10 @@ pub async fn run_manager_with(
         .layer(crate::manager::telemetry::GrpcMetricsLayer)
         .add_service(manager_service)
         .add_service(raft_transport_service)
-        .serve(addr);
+        .serve_with_shutdown(addr, async move {
+            // A dropped sender also stops the server; both mean "shut down".
+            let _ = stop_serving_rx.await;
+        });
 
     println!("Manager node starting on {addr}");
 
@@ -596,9 +602,100 @@ pub async fn run_manager_with(
     // the raft transport. If it fails to bind (port taken, bad TLS material)
     // or stops serving, exit non-zero so a supervisor restarts the process,
     // rather than keep scheduling as a headless manager nobody can reach.
-    let serve_result = start_server_fut.await;
+    tokio::pin!(start_server_fut);
+    let signal = tokio::select! {
+        serve_result = &mut start_server_fut => {
+            background.abort();
+            let err = manager_server_exit_error(&addr, serve_result);
+            shutdown_persistence(&store_for_shutdown).await;
+            return Err(err);
+        }
+        signal = shutdown_signal() => signal,
+    };
+
+    // Graceful shutdown (SIGTERM/SIGINT). Each step is bounded, so a stuck
+    // stream or store can delay the exit but never prevent it. A second
+    // signal skips the rest.
+    info!(signal, "Manager shutdown requested; draining");
+    let _ = stop_serving_tx.send(());
+    tokio::select! {
+        drained = tokio::time::timeout(SHUTDOWN_DRAIN_TIMEOUT, &mut start_server_fut) => {
+            if drained.is_err() {
+                warn!(
+                    timeout_secs = SHUTDOWN_DRAIN_TIMEOUT.as_secs(),
+                    "Open RPCs and streams did not finish in time; closing them"
+                );
+            }
+        }
+        second = shutdown_signal() => {
+            warn!(signal = second, "Second shutdown signal; exiting now");
+            background.abort();
+            return Ok(());
+        }
+    }
+    // Leader-only loops stop before the store does, so nothing proposes
+    // writes into a raft core that is shutting down.
     background.abort();
-    Err(manager_server_exit_error(&addr, serve_result))
+    shutdown_persistence(&store_for_shutdown).await;
+    info!("Manager stopped");
+    Ok(())
+}
+
+/// How long a graceful shutdown waits for in-flight RPCs and open streams
+/// (event streams, worker connections) once the listener stops accepting.
+const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Budget for the persistence backend's orderly stop: the final streaming
+/// replica sync plus lease release, or the raft lane shutdown. Drain plus
+/// this stays under Kubernetes' default 30s termination grace period.
+const SHUTDOWN_PERSISTENCE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Resolves with the signal's name on SIGTERM or SIGINT (Ctrl-C).
+async fn shutdown_signal() -> &'static str {
+    let ctrl_c = async {
+        if let Err(err) = tokio::signal::ctrl_c().await {
+            // Without a handler this arm must never fire; SIGTERM still works.
+            warn!(error = ?err, "Failed installing the SIGINT handler");
+            std::future::pending::<()>().await;
+        }
+    };
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => tokio::select! {
+                _ = term.recv() => "SIGTERM",
+                _ = ctrl_c => "SIGINT",
+            },
+            Err(err) => {
+                warn!(error = ?err, "Failed installing the SIGTERM handler");
+                ctrl_c.await;
+                "SIGINT"
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        ctrl_c.await;
+        "SIGINT"
+    }
+}
+
+/// Runs the store's orderly persistence stop on the blocking pool, bounded
+/// by [`SHUTDOWN_PERSISTENCE_TIMEOUT`] (plus a little slack, since the
+/// backend's own bound is best-effort).
+async fn shutdown_persistence(store: &Store) {
+    let store = store.clone();
+    let stop = tokio::task::spawn_blocking(move || {
+        store.shutdown_persistence(SHUTDOWN_PERSISTENCE_TIMEOUT)
+    });
+    let slack = Duration::from_secs(2);
+    if tokio::time::timeout(SHUTDOWN_PERSISTENCE_TIMEOUT + slack, stop)
+        .await
+        .is_err()
+    {
+        warn!("Persistence shutdown did not finish in time; exiting anyway");
+    }
 }
 
 /// The error `run_manager` returns when the gRPC server future resolves.

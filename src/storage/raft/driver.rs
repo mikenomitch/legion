@@ -3126,6 +3126,59 @@ impl RaftJoinHandler for EngineJoinHandler {
 // ── PersistenceDriver ────────────────────────────────────────────────────
 
 impl PersistenceDriver for MultiRaftDriver {
+    /// Orderly raft stop: shuts every lane's raft core down so the log
+    /// stores are flushed and released before the process exits.
+    ///
+    /// No leadership transfer: openraft 0.9 has no API for it (see
+    /// `issue_raft_command`'s `transfer-leader` arm). Followers of a lane
+    /// this node led elect a new leader after their election timeout, the
+    /// same as after a crash, just without a torn log tail.
+    fn shutdown(&self, timeout: Duration) {
+        let Ok(engine) = self.engine() else {
+            return;
+        };
+        let mut lanes: Vec<(Lane, Raft)> = engine
+            .lanes
+            .iter()
+            .map(|(lane, raft)| (*lane, raft.clone()))
+            .collect();
+        lanes.sort_by_key(|(lane, _)| lane.wire_name());
+        let led: Vec<&str> = lanes
+            .iter()
+            .filter(|(_, raft)| leads(raft))
+            .map(|(lane, _)| lane.wire_name())
+            .collect();
+        if !led.is_empty() {
+            info!(
+                lanes = ?led,
+                "Raft shutdown: this node leads lanes; followers elect a new leader after \
+                 their election timeout (openraft 0.9 has no leadership transfer)"
+            );
+        }
+        let shutdown_all = async move {
+            let deadline = tokio::time::Instant::now() + timeout;
+            for (lane, raft) in lanes {
+                match tokio::time::timeout_at(deadline, raft.shutdown()).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => {
+                        warn!(lane = lane.wire_name(), error = ?err, "Raft lane shutdown failed")
+                    }
+                    Err(_) => {
+                        warn!(
+                            lane = lane.wire_name(),
+                            "Raft lane shutdown timed out; exiting anyway"
+                        );
+                        return;
+                    }
+                }
+            }
+            info!("Raft lanes shut down");
+        };
+        if let Err(err) = Self::block_on_engine(engine, shutdown_all) {
+            warn!(error = ?err, "Raft shutdown failed");
+        }
+    }
+
     fn start(&self) -> R<()> {
         // The raft engine needs the Store (migrated DB, state machines);
         // `Store::start_storage` calls `start_engine` after migrations

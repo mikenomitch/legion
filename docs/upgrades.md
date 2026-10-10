@@ -21,6 +21,39 @@ with every worker protocol version up to their own. They cannot promise to
 satisfy a contract newer than they know about, so a worker upgraded before
 its managers is rejected at registration.
 
+## Stopping a manager
+
+Restart managers with SIGTERM (or Ctrl-C, which sends SIGINT). That's what
+`systemctl stop` and Kubernetes send. The manager then stops in order:
+
+1. It stops accepting connections and gives in-flight RPCs and open streams
+   (event streams, worker connections) up to 10 seconds to finish.
+2. It stops its background loops (eval workers, node checker, keyring and
+   identity rotation, the in-process worker), so nothing writes to a store
+   that is shutting down.
+3. It stops persistence, with up to 15 seconds for this step. In `streaming`
+   mode it runs one final replica sync and then releases the object-storage
+   lease, so a standby that takes over finds every committed write. In
+   `raft` mode it shuts each lane's raft core down cleanly.
+4. It exits with status 0.
+
+The whole sequence fits in Kubernetes' default 30-second termination grace
+period. A second SIGTERM or SIGINT during the drain skips the rest and exits
+immediately.
+
+Raft leadership is not handed off before exit. openraft 0.9 has no
+leadership-transfer API, so the remaining managers elect a new leader after
+their election timeout, the same as after a crash. Writes to lanes the
+stopped manager led pause for that window, so restart managers one at a
+time and wait for `legion raft status` to show a leader before the next.
+
+A manager whose gRPC listener fails to bind (the port is taken, or the TLS
+certificate can't be loaded) or stops serving exits with a non-zero status
+and `manager gRPC server on <addr> failed`. Run managers under a supervisor
+that restarts them. The manager doesn't keep scheduling without an API,
+because nothing could reach it and, in raft mode, it would have no raft
+transport.
+
 ## The `protocol_version` contract
 
 Workers and managers exchange versions during registration

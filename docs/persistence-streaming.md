@@ -116,6 +116,12 @@ What a manager does depends on its role:
   or cannot renew it for a whole `ttlSeconds`, is **fenced**. It stops
   shipping, refuses writes, idles its writer loops, and does not compete for
   the lease again. Restart it to bring it back as a standby.
+- **Stopping cleanly.** On SIGTERM or SIGINT, a primary runs one final
+  capture/upload cycle before it releases the lease, so a clean stop leaves
+  the replica as current as the local database. A crash or SIGKILL skips that
+  step, and the replica can lag by up to one `syncInterval`. A fenced
+  manager never runs it, because the replica belongs to the new primary. See
+  [Stopping a manager](upgrades.md#stopping-a-manager).
 
 Known limitations:
 

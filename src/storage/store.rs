@@ -1836,6 +1836,13 @@ impl Store {
         clone
     }
 
+    /// Orderly persistence stop for process shutdown: final streaming
+    /// replica sync then lease release, or raft lane shutdown. Blocking;
+    /// bounded by roughly `timeout`. See [`PersistenceDriver::shutdown`].
+    pub fn shutdown_persistence(&self, timeout: std::time::Duration) {
+        self.persistence_driver.shutdown(timeout);
+    }
+
     /// The registry cell the `RaftTransport` tonic service dispatches
     /// through. For non-raft backends this is a fresh, never-populated cell:
     /// the mounted service then answers `Unavailable`, which peers treat as
