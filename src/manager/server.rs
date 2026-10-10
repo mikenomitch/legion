@@ -114,8 +114,8 @@ use tonic::{Request, Response, Status, Streaming};
 // Phase 6: ForkInstance, `from_snapshot` creates, and snapshot names.
 mod checkpoint_support;
 mod fork_rpcs;
-mod node_content_rpcs;
 mod make_room;
+mod node_content_rpcs;
 mod snapshot_rpcs;
 mod suspend_rpcs;
 pub use make_room::{make_room_sweep, MakeRoomOutcome, MakeRoomState, MAKE_ROOM_COOLDOWN};

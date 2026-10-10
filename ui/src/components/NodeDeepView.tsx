@@ -4,6 +4,7 @@ import { For, Show, createMemo, createResource, createSignal, type JSX, type Res
 import { Badge, CodeBlock, Icon, MonoBadge, Note, PageHeader, RelativeTime, SectionCard, Spinner, StatusBadge, TableShell, cx, tableClass, tdClass, thClass, theadClass, trHoverClass } from './ui'
 import NodeAvailabilityControls, { type AvailabilityOutcome } from './NodeAvailabilityControls'
 import { NodeContentCard } from './NodeContentCard'
+import { snapshotBudgets } from '../utils/usage'
 import { NodeUsageCard } from './NodeUsagePanel'
 import { PressureHistoryCard } from './PressureHistory'
 import { AllocationPorts } from './ServiceEndpoints'
@@ -778,7 +779,7 @@ export default function NodeDeepView(props: NodeDeepViewProps) {
                     <PressureHistoryCard events={pressureEvents() ?? []} scope="node" />
                   </Show>
 
-                  <Show when={nodeContent()}>{(content) => <NodeContentCard content={content()} />}</Show>
+                  <Show when={nodeContent()}>{(content) => <NodeContentCard content={content()} budgets={snapshotBudgets(nodeUsage())} />}</Show>
 
                   <Show when={!nodeUsage() || resourceUsage().length > 0}>
                     <SectionCard

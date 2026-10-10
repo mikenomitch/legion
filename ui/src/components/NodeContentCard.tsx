@@ -20,9 +20,8 @@ import { Badge, Meter, MonoBadge, SectionCard, TableShell, cx, tableClass, tdCla
 /**
  * The content store's per-class byte budget, when the manager reports it.
  * GetNodeContent does not carry budgets (the index has digests, not
- * classes). This slot is for the disk budget the parallel resume-guards
- * work adds to GetNodeUsage: the caller maps those fields here once they
- * exist, and the card shows nothing for it until then.
+ * classes), so the caller maps the `snapshots` budget from GetNodeUsage
+ * (`snapshotBudgets`). Nothing shows for a node that has not reported one.
  */
 export type ContentBudget = { name: string; usedBytes: number; budgetBytes: number }
 

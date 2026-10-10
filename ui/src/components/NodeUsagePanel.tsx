@@ -10,6 +10,7 @@ import {
   formatCores,
   formatIdle,
   formatMiB,
+  heldLabel,
   isBursting,
   percentOf,
   physicalCapacity,
@@ -21,6 +22,7 @@ import {
   stepTone,
   usedCoresLabel,
 } from '../utils/usage'
+import { formatBytes } from '../utils/format'
 import { Badge, Dot, Meter, MonoBadge, RelativeTime, SectionCard, TableShell, cx, tableClass, tdClass, thClass, theadClass, trHoverClass } from './ui'
 
 /*
@@ -165,6 +167,30 @@ export function NodeUsageCard(props: { usage: GetNodeUsageReply; class?: string 
         <Show when={props.usage.cpu}>{(cpu) => <ResourceRow name="cpu" resource={cpu()} reported={reported()} />}</Show>
       </div>
 
+      <Show when={props.usage.suspended}>
+        {(suspended) => (
+          <Show when={suspended().instances > 0 || suspended().suspendedReserve > 0}>
+            <p
+              class="border-t border-line px-4 py-2.5 text-xs text-muted"
+              title="Suspended instances can keep part of their reservation charged here (suspend.reserve, or the node's resourceEnforcement.suspendedReserve floor) so their resumes find room"
+            >
+              <span class="font-medium text-ink">{suspended().instances} suspended</span>
+              <Show when={suspended().holding > 0}>
+                {' · '}
+                {heldLabel(suspended().heldMemoryMib, suspended().heldCpuMhz)} by {suspended().holding}
+              </Show>
+              <Show when={Number(suspended().checkpointBytes) > 0}>
+                {' · '}
+                {formatBytes(Number(suspended().checkpointBytes))} of checkpoints
+              </Show>
+              <Show when={suspended().suspendedReserve > 0}>
+                {' · '}node floor {Math.round(suspended().suspendedReserve * 100)}%
+              </Show>
+            </p>
+          </Show>
+        )}
+      </Show>
+
       <Show when={!reported()}>
         <p class="border-t border-line px-4 py-2.5 text-xs text-muted">
           No usage reported. Likely causes: {UNREPORTED_REASONS.join('; ')}.
@@ -194,6 +220,11 @@ export function NodeUsageCard(props: { usage: GetNodeUsageReply; class?: string 
                   <tr class={trHoverClass}>
                     <td class={tdClass}>
                       <AllocationLink allocation={allocation} />
+                      <Show when={allocation.suspended}>
+                        <Badge tone="accent" class="ml-1.5" title="A suspended instance's share, kept charged to this node so its resume finds room">
+                          suspended, held
+                        </Badge>
+                      </Show>
                     </td>
                     <td class={tdClass}>
                       <Show when={allocation.instanceId} fallback={<span class="text-faint">-</span>}>

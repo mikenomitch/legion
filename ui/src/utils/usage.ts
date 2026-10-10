@@ -253,3 +253,20 @@ export const cpuCapacityLabel = (cpu: NodeResourceUsage): string | undefined => 
 
 /** Cores in use, from `used_millicores`, for nodes without a MHz figure. */
 export const usedCoresLabel = (cpu: NodeResourceUsage): string => `${(Number(cpu.usedMillicores) / 1000).toFixed(2)} cores`
+
+/**
+ * The `snapshots` content budget a worker reports on GetNodeUsage, shaped
+ * for the content card. Pinned bytes (live suspend checkpoints) are part of
+ * used. Empty when the node has not reported a budget.
+ */
+export function snapshotBudgets(usage: GetNodeUsageReply | null | undefined): { name: string; usedBytes: number; budgetBytes: number }[] {
+  const budget = usage?.suspended?.snapshotBudget
+  if (!budget || Number(budget.budgetBytes) <= 0) return []
+  return [{ name: 'snapshots', usedBytes: Number(budget.usedBytes), budgetBytes: Number(budget.budgetBytes) }]
+}
+
+/** "512 MiB and 250 MHz held", or undefined when nothing is held. */
+export function heldLabel(memoryMib: number | undefined, cpuMhz: number | undefined): string | undefined {
+  const parts = [memoryMib ? `${formatMiB(memoryMib)} MiB` : undefined, cpuMhz ? `${Math.round(cpuMhz)} MHz` : undefined].filter(Boolean)
+  return parts.length > 0 ? `${parts.join(' and ')} held` : undefined
+}

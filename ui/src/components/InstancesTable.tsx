@@ -13,7 +13,7 @@ import {
   suspendReasonLabel,
 } from '../utils/instances'
 import type { JobTask } from '../utils/jobspec'
-import { bytesToMiB, formatCores, formatIdle, formatMiB, idleSecondsFromUsage, reservationLabel } from '../utils/usage'
+import { bytesToMiB, formatCores, formatIdle, formatMiB, heldLabel, idleSecondsFromUsage, reservationLabel } from '../utils/usage'
 import { now } from '../utils/polling'
 import { Badge, MonoBadge, RelativeTime, StatusBadge, TableShell, cx, tableClass, tdClass, thClass, theadClass, trHoverClass } from './ui'
 
@@ -186,6 +186,13 @@ export function CheckpointCell(props: { instance: InstanceInfo }) {
               <RelativeTime value={instance().suspendedAt} />
             </Show>
           </div>
+          <Show when={heldLabel(instance().heldMemoryMib, instance().heldCpuMhz)}>
+            {(held) => (
+              <div class="text-2xs text-faint" title={`Kept charged to ${instance().checkpointNodeId ?? 'its node'} so the resume finds room`}>
+                {held()}
+              </div>
+            )}
+          </Show>
           <Show when={timings()}>
             <div class="text-2xs text-faint">{timings()}</div>
           </Show>

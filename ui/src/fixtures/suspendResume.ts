@@ -1,4 +1,6 @@
 import {
+  SnapshotBudget,
+  SuspendedCapacity,
   AllocationUsage,
   CheckpointSupport,
   GetNodeContentReply,
@@ -118,6 +120,15 @@ export const pressuredNode = new GetNodeUsageReply({
   nodeId: 'w-03',
   status: 'ready',
   usageReported: true,
+  suspended: new SuspendedCapacity({
+    instances: 2,
+    holding: 1,
+    heldMemoryMib: 512,
+    heldCpuMhz: 250,
+    checkpointBytes: 1100n * MIB,
+    suspendedReserve: 0.25,
+    snapshotBudget: new SnapshotBudget({ budgetBytes: 20n * 1024n * MIB, usedBytes: 6n * 1024n * MIB, pinnedBytes: 1100n * MIB }),
+  }),
   sampledAtUnixMs: BigInt(Date.now() - 4000),
   reportAgeSeconds: 4n,
   memory: new NodeResourceUsage({
@@ -343,6 +354,8 @@ export const instances: InstanceInfo[] = [
     checkpointState: 'local',
     checkpointNodeId: 'w-03',
     checkpointBytes: 1100n * MIB,
+    heldMemoryMib: 512,
+    heldCpuMhz: 250,
     suspendedAt: ago(4 * 60_000),
     suspendReason: 'idle',
     lastSuspendMs: 740n,
