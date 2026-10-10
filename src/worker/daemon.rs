@@ -515,7 +515,7 @@ fn parse_artifact_fetch_config(raw: &str) -> R<crate::structs::WorkerArtifactFet
 }
 
 fn resolve_worker_name(name_override: Option<&str>, name_prefix: Option<String>) -> R<String> {
-    let workers_dir = PathBuf::from(DEF_WORKER_STATE_DIR);
+    let workers_dir = worker_state_dir();
     if let Some(name) = name_override {
         ensure_dir(&workers_dir.join(name))?;
         return Ok(name.to_string());

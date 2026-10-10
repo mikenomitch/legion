@@ -68,17 +68,13 @@ impl WorkerStateStore {
     pub fn default_path() -> PathBuf {
         std::env::var("LEGION_WORKER_STATE_PATH")
             .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from(DEF_WORKER_STATE_PATH))
+            .unwrap_or_else(|_| Self::path_for_worker("default"))
     }
 
     pub fn path_for_worker(worker_id: &str) -> PathBuf {
         std::env::var("LEGION_WORKER_STATE_PATH")
             .map(PathBuf::from)
-            .unwrap_or_else(|_| {
-                PathBuf::from(DEF_WORKER_STATE_DIR)
-                    .join(worker_id)
-                    .join("worker_state.json")
-            })
+            .unwrap_or_else(|_| worker_state_dir().join(worker_id).join("worker_state.json"))
     }
 
     /// Base directory under which per-allocation log directories live.

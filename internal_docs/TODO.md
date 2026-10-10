@@ -2574,6 +2574,12 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
       one and truncated it, which reverted a fresh joiner to the seed image
       (`tests/raft_durability.rs` caught it once the KV encryption merge
       shifted the timing)
+- [x] `LEGION_DATA_DIR` moves every `.legion/*` default (store, raft, worker
+      state, identity tokens) for one process, so a second cluster can run
+      from the same checkout. The store default became the data dir itself,
+      with the old `.legion/store.sqlite/` layout still opened
+      ([plan](plans/data-dir-env-plan.md) ·
+      [docs](../docs/data-directory.md))
 
 ## Workload identity
 

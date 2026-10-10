@@ -5,7 +5,8 @@ This page describes how manager and worker processes persist state.
 ## Manager Store (SQLite)
 
 Manager state lives in SQLite under the manager's `store_path`.
-The default file path is `.legion/store.sqlite/store.sqlite`.
+The default file path is `<data dir>/store.sqlite`, where the data dir is
+`$LEGION_DATA_DIR` or `.legion` (see [data-directory.md](data-directory.md)).
 
 Startup (`Store::start_storage`):
 
@@ -137,7 +138,7 @@ The manager API maps these to gRPC status codes.
 
 Workers have a separate local JSON state file (`WorkerStateStore`):
 
-- default path root: `.legion/workers/<worker-id>/worker_state.json`
+- default path root: `<data dir>/workers/<worker-id>/worker_state.json`
 - stores allocation, task, and PID records
 - used for restart recovery when a tracked PID is still running
 

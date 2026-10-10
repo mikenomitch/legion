@@ -300,7 +300,8 @@ start:
   [Network Handlers](docs/network-handlers.md) · [KV Store](docs/kv-store.md) ·
   [Exec & Actions](docs/exec-and-actions.md)
 - **Operating a cluster:** [Running Raft](docs/raft-operations.md) ·
-  [Upgrades](docs/upgrades.md) · [Logging](docs/logging.md) ·
+  [Upgrades](docs/upgrades.md) · [Data Directory](docs/data-directory.md) ·
+  [Logging](docs/logging.md) ·
   [Metrics](docs/metrics.md) · [Observability](docs/observability.md)
 - **Extending Legion:** [Plugin System](docs/plugin-system.md) ·
   [Codebase Conventions](docs/codebase-conventions.md) ·

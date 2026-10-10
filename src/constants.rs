@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 // === Protocol ===
 // The worker<->manager wire-protocol version, exchanged during worker
 // registration (`WorkerRegister`). Bump this ONLY for breaking wire-contract
@@ -54,7 +56,6 @@ pub const DEF_CONFIG_PATH: &str = "./configs/manager.ncl";
 
 // Manager config file
 pub const DEF_WORKER_CONFIG_PATH: &str = "./configs/workers/";
-pub const DEF_STORE_PATH: &str = ".legion/store.sqlite";
 pub const DEF_MANAGER_HOSTNAME: &str = "127.0.0.1";
 pub const DEF_MANAGER_SERVER_PORT: u64 = 4747;
 pub const DEF_MANAGER_INSECURE_PORT: u64 = 4748;
@@ -145,8 +146,64 @@ pub const WORKER_HEARTBEAT_DURATION_SEC: u64 = 2;
 // How often the worker should update node to manager
 pub const WORKER_NODE_CHECK_DURATION_SEC: u64 = 30;
 pub const DEF_WORKER_SERVER_PORT: u64 = 4848;
-pub const DEF_WORKER_STATE_DIR: &str = ".legion/workers";
-pub const DEF_WORKER_STATE_PATH: &str = ".legion/workers/default/worker_state.json";
+
+/// Directory holding one subdirectory per worker ID on this host.
+pub fn worker_state_dir() -> PathBuf {
+    data_dir().join("workers")
+}
+
+// === Local state ===
+/// Env var that relocates every `.legion/*` default, so two Legion processes
+/// can share a working directory without sharing state. Explicit config
+/// (`storePath`, `raft.dataDir`, `LEGION_WORKER_STATE_PATH`) still wins. See
+/// docs/data-directory.md.
+pub const DATA_DIR_ENV: &str = "LEGION_DATA_DIR";
+pub const DEF_DATA_DIR: &str = ".legion";
+
+/// Root for this process's on-disk state: `$LEGION_DATA_DIR`, else `./.legion`.
+/// An empty value counts as unset.
+pub fn data_dir() -> PathBuf {
+    resolve_data_dir(std::env::var_os(DATA_DIR_ENV))
+}
+
+fn resolve_data_dir(var: Option<std::ffi::OsString>) -> PathBuf {
+    match var {
+        Some(dir) if !dir.is_empty() => dir.into(),
+        _ => DEF_DATA_DIR.into(),
+    }
+}
+
+/// Default manager `storePath`: the data dir itself, which then holds
+/// `store.sqlite`, `keys/` and `backups/`.
+///
+/// Earlier builds defaulted to `<data dir>/store.sqlite`, and since the store
+/// path is a directory, a manager that ran with no `storePath` has its db one
+/// level down at `.legion/store.sqlite/store.sqlite`. Keep opening that layout
+/// rather than silently starting an empty cluster beside it.
+pub fn default_store_path() -> String {
+    store_path_under(data_dir()).to_string_lossy().into_owned()
+}
+
+fn store_path_under(dir: PathBuf) -> PathBuf {
+    let legacy = dir.join("store.sqlite");
+    if legacy.is_dir() {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            tracing::warn!(
+                path = %legacy.display(),
+                "Using the legacy default state store location; set `storePath` to this path to keep using it"
+            );
+        });
+        legacy
+    } else {
+        dir
+    }
+}
+
+/// Default raft `dataDir`: `<data dir>/raft`.
+pub fn default_raft_data_dir() -> String {
+    data_dir().join("raft").to_string_lossy().into_owned()
+}
 
 // How long the manager keeps a stop notice (why an allocation was removed)
 // before pruning it. Notices are advisory metadata delivered on the next
@@ -172,3 +229,36 @@ pub const DEF_TASK_LOG_MAX_FILE_BYTES: u64 = 10 * 1024 * 1024; // 10 MiB per str
 pub const DEF_TASK_LOG_MAX_FILES: u32 = 5; // rotated generations kept per stream
 pub const DEF_TASK_LOG_RETENTION_DAYS: u64 = 7; // age-based prune of rotated files
 pub const DEF_TASK_LOG_MAINTENANCE_SEC: u64 = 10; // rotation/retention sweep cadence
+
+#[cfg(test)]
+mod data_dir_test {
+    use super::*;
+
+    #[test]
+    fn data_dir_defaults_to_dot_legion_when_unset_or_empty() {
+        assert_eq!(resolve_data_dir(None), PathBuf::from(".legion"));
+        assert_eq!(resolve_data_dir(Some("".into())), PathBuf::from(".legion"));
+        assert_eq!(
+            resolve_data_dir(Some("/tmp/x".into())),
+            PathBuf::from("/tmp/x")
+        );
+    }
+
+    #[test]
+    fn store_path_is_the_data_dir_unless_the_legacy_layout_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        assert_eq!(store_path_under(root.clone()), root);
+
+        // A db file at the new location is not mistaken for the legacy dir.
+        std::fs::write(root.join("store.sqlite"), b"").unwrap();
+        assert_eq!(store_path_under(root.clone()), root);
+
+        let legacy_root = dir.path().join("old");
+        std::fs::create_dir_all(legacy_root.join("store.sqlite")).unwrap();
+        assert_eq!(
+            store_path_under(legacy_root.clone()),
+            legacy_root.join("store.sqlite")
+        );
+    }
+}
