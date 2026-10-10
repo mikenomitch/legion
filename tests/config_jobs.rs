@@ -370,8 +370,8 @@ fn config_worker_files_parse() {
 ///
 /// This is the one example that goes through the manager's sandboxed
 /// template path rather than the client-side jobspec path.
-#[test]
-fn config_template_files_parse() {
+#[tokio::test]
+async fn config_template_files_parse() {
     let templates_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("configs")
         .join("templates");
@@ -387,7 +387,8 @@ fn config_template_files_parse() {
 
         let path_str = path.to_string_lossy();
         let source = std::fs::read_to_string(&path).expect("template source should read");
-        let manifest = legion::manager::job_templates::parse_manifest(&source)
+        let manifest = legion::manager::job_templates::parse_manifest_bounded(source.clone())
+            .await
             .unwrap_or_else(|e| panic!("{path_str} is not a valid template:\n{e:#}"));
 
         // Every declared variable has a default here, so the template renders
@@ -398,7 +399,8 @@ fn config_template_files_parse() {
             r#"{"scene": "demo"}"#,
         )
         .unwrap_or_else(|e| panic!("{path_str} defaults do not resolve: {e:#}"));
-        let rendered = legion::manager::job_templates::render_with_timeout(&source, &values)
+        let rendered = legion::manager::job_templates::render_bounded(&source, &values)
+            .await
             .unwrap_or_else(|e| panic!("{path_str} does not render:\n{e:#}"));
         let config: JobConfig = serde_json::from_str(&rendered)
             .unwrap_or_else(|e| panic!("{path_str} renders invalid json: {e}"));

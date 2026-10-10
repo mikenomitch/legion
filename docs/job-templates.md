@@ -106,10 +106,19 @@ Rendering runs on the manager, with limits:
   template is one file. The check is lexical (the source is tokenized), so
   the word "import" inside a string or a comment doesn't trigger it.
 - Source is capped at 512 KiB, and the variables payload at 64 KiB.
-- One render gets a 5-second wall-clock budget. Nickel can't be interrupted
-  mid-evaluation, so a runaway render is abandoned and the request fails with
-  `template rendering exceeded the 5s limit`. The abandoned thread keeps a
-  core busy until it finishes.
+- Every evaluation, both the manifest parse at publish time and each render,
+  gets a 5-second wall-clock budget. Nickel can't be interrupted
+  mid-evaluation, so a runaway evaluation is abandoned and the request fails
+  with `template rendering exceeded the 5s limit`. The abandoned thread keeps
+  a core busy until it finishes.
+- Evaluations run on dedicated threads, never on the manager's async
+  workers, and at most half the manager's cores (between 1 and 4) evaluate
+  templates at once. An abandoned evaluation keeps its slot until it really
+  finishes, so runaway templates can't take more than that share of the
+  manager away from raft and the API. When every slot stays busy for the
+  whole 5-second budget, the request fails with a retryable
+  `RESOURCE_EXHAUSTED: the manager is already evaluating N templates; retry
+  shortly`.
 
 ## Using templates
 
@@ -238,6 +247,7 @@ Other things to know:
 | `variable 'x' is required` / `variable 'x': expected a number …` at run | Missing or mistyped value. `unknown variable 'x'` means a typo'd key. |
 | `imports are not allowed here` | The template used the `import` keyword. Inline everything. |
 | `template rendering exceeded the 5s limit` | Runaway or extremely heavy Nickel. Simplify the template. |
+| `RESOURCE_EXHAUSTED: the manager is already evaluating N templates` | Every evaluation slot is busy, possibly with runaway templates that haven't finished. Retry. If it persists, find the template that times out. Restarting the manager clears abandoned evaluations. |
 | `FAILED_PRECONDITION: job 'x' already exists and was not created from template …` | The collision guard (see above). |
 | `PermissionDenied: job:write requires a policy granting it` on `template run` | The identity has neither plain `job:write` for the rendered name nor a `templates`-scoped job rule matching this template. |
 
@@ -249,6 +259,9 @@ Other things to know:
   so don't pass credentials as variables. Use [KV references](kv-store.md) in
   the template body instead.
 - `template render`/`run` evaluate author-controlled code on the manager.
-  The 5s timeout abandons the render thread but doesn't kill it.
+  The 5s timeout abandons the evaluation thread but doesn't kill it. The
+  concurrency cap bounds the damage, but a stream of runaway templates can
+  keep every slot busy, which blocks all template publishes and renders
+  until the threads finish or the manager restarts.
 - Templates are per-cluster. Remote or federated template registries are not
   planned for now.

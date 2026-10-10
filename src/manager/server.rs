@@ -3018,9 +3018,9 @@ impl Manager for ManagerDaemonService {
             &AclScope::template(&name),
         )?;
 
-        let manifest =
-            run_blocking_admission(|| job_templates::parse_manifest(&inner.source_nickel))
-                .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        let manifest = job_templates::parse_manifest_bounded(inner.source_nickel.clone())
+            .await
+            .map_err(template_eval_status)?;
 
         // When every variable has a default the template is fully renderable
         // right now — trial-render it so authoring mistakes surface at
@@ -3032,12 +3032,17 @@ impl Manager for ManagerDaemonService {
         {
             let values = job_templates::resolve_variable_values(&manifest.variables, "{}")
                 .map_err(|e| Status::invalid_argument(e.to_string()))?;
-            let rendered = run_blocking_admission(|| {
-                job_templates::render_with_timeout(&inner.source_nickel, &values)
-            })
-            .map_err(|e| {
-                Status::invalid_argument(format!("trial render with defaults failed: {e}"))
-            })?;
+            let rendered = job_templates::render_bounded(&inner.source_nickel, &values)
+                .await
+                .map_err(|e| match template_eval_status(e) {
+                    status if status.code() == tonic::Code::InvalidArgument => {
+                        Status::invalid_argument(format!(
+                            "trial render with defaults failed: {}",
+                            status.message()
+                        ))
+                    }
+                    status => status,
+                })?;
             let config: JobConfig = serde_json::from_str(&rendered).map_err(|e| {
                 Status::invalid_argument(format!(
                     "trial render with defaults did not produce a valid jobspec: {e}"
@@ -3198,10 +3203,9 @@ impl Manager for ManagerDaemonService {
         let values =
             job_templates::resolve_variable_values(&template.variables, &inner.variables_json)
                 .map_err(|e| Status::invalid_argument(e.to_string()))?;
-        let rendered = run_blocking_admission(|| {
-            job_templates::render_with_timeout(&template.source_nickel, &values)
-        })
-        .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        let rendered = job_templates::render_bounded(&template.source_nickel, &values)
+            .await
+            .map_err(template_eval_status)?;
 
         let (config, _kv_refs) = resolve_jobspec_kv_references(&self.store, &rendered)
             .map_err(|e| Status::invalid_argument(format!("rendered jobspec is invalid: {e}")))?;
@@ -3272,10 +3276,9 @@ impl Manager for ManagerDaemonService {
         let values =
             job_templates::resolve_variable_values(&template.variables, &inner.variables_json)
                 .map_err(|e| Status::invalid_argument(e.to_string()))?;
-        let rendered = run_blocking_admission(|| {
-            job_templates::render_with_timeout(&template.source_nickel, &values)
-        })
-        .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        let rendered = job_templates::render_bounded(&template.source_nickel, &values)
+            .await
+            .map_err(template_eval_status)?;
 
         // The template source is the primary submission so spec history
         // shows what was actually run; the resolved variable values ride
@@ -9031,6 +9034,17 @@ fn handle_failed_allocations(
     }
 
     Ok(())
+}
+
+/// Maps a template evaluation error to a gRPC status: a full evaluation
+/// budget is the manager's problem and retryable (`RESOURCE_EXHAUSTED`),
+/// anything else is the template's or the values' fault.
+fn template_eval_status(err: anyhow::Error) -> Status {
+    if err.is::<job_templates::EvalSlotsBusy>() {
+        Status::resource_exhausted(err.to_string())
+    } else {
+        Status::invalid_argument(err.to_string())
+    }
 }
 
 /// Runs blocking admission work (artifact pin resolution can reach

@@ -119,6 +119,10 @@ service Manager {
   // manifest. Invalid manifests are rejected here, not at run
   // time. When every declared variable has a default, the manager also
   // trial-renders the template and validates the resulting jobspec.
+  // Every Nickel evaluation here (and in RenderJobTemplate/RunJobTemplate)
+  // gets a 5-second budget (INVALID_ARGUMENT "exceeded the 5s limit" when
+  // it runs over) and a manager-wide concurrency cap (RESOURCE_EXHAUSTED,
+  // retryable, when every evaluation slot stays busy for the budget).
   // Requires `template:write` scoped to the template name.
   rpc UpsertJobTemplate (UpsertJobTemplateRequest) returns (UpsertJobTemplateReply);
 
