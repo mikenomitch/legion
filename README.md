@@ -30,13 +30,19 @@ replication when you need high availability.
 
 ## Quickstart
 
-Build from source. You need [Rust](https://rustup.rs) and `protoc`
-(`brew install protobuf` or `apt-get install protobuf-compiler`).
+Install from [crates.io](https://crates.io/crates/legion-rs). You need
+[Rust](https://rustup.rs) and `protoc` (`brew install protobuf` or
+`apt-get install protobuf-compiler`).
 
 ```bash
-cargo build --release
-export PATH="$PWD/target/release:$PATH"
+cargo install legion-rs
 ```
+
+The crate is named `legion-rs` because `legion` on crates.io is an unrelated
+library. It installs a binary called `legion`.
+
+To build from a clone instead, run `cargo build --release` and add
+`target/release` to your `PATH`.
 
 Start a manager with a worker running in the same process. The defaults work
 without a config file.

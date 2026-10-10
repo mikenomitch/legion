@@ -1,8 +1,27 @@
 [package]
-name = "legion"
+# "legion" on crates.io is an unrelated ECS crate. The [lib] and [[bin]]
+# targets below keep the library and the CLI named `legion`.
+name = "legion-rs"
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
+description = "A workload orchestrator that is quick to start and scales to thousands of nodes"
+repository = "https://github.com/mikenomitch/legion"
+readme = "README.md"
+keywords = ["orchestrator", "scheduler", "cluster", "containers", "raft"]
+categories = ["command-line-utilities", "virtualization"]
+# Publish only what `cargo install` needs to build the binary. Docs, the UI,
+# benchmarks, and the example plugins stay in the repo.
+include = [
+    "/src/**",
+    "/proto/**",
+    "/build.rs",
+    "/Cargo.toml",
+    "/Cargo.lock",
+    "/README.md",
+    "/LICENSE-MIT",
+    "/LICENSE-APACHE",
+]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -155,6 +174,13 @@ harness = false
 # the binary for a tool nobody but the rig runs. CI lints it via
 # `--all-features`; `benchmarks/aws/scripts/local-smoke.sh` and
 # `build-and-upload.sh` build it explicitly.
+[lib]
+name = "legion"
+
+[[bin]]
+name = "legion"
+path = "src/main.rs"
+
 [[bin]]
 name = "legion-loadgen"
 path = "benchmarks/loadgen/main.rs"
