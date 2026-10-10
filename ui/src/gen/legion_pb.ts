@@ -5849,6 +5849,27 @@ export class InstanceInfo extends Message<InstanceInfo> {
    */
   forkedFrom?: string;
 
+  /**
+   * MiB of memory a suspended instance keeps charged to its node, so a
+   * resume finds room: `max(suspend.reserve, the node's
+   * resourceEnforcement.suspendedReserve)` of its reservation, applied when
+   * the suspend landed. Unset when the instance holds nothing (the default)
+   * or is not suspended. With `reserve = true` this is the whole
+   * reservation.
+   *
+   * @generated from field: optional double held_memory_mib = 200;
+   */
+  heldMemoryMib?: number;
+
+  /**
+   * CPU (MHz) the suspended instance keeps charged to its node, the same
+   * way as `held_memory_mib`. Exclusive cores are held only with a full
+   * hold, and are not counted here.
+   *
+   * @generated from field: optional double held_cpu_mhz = 201;
+   */
+  heldCpuMhz?: number;
+
   constructor(data?: PartialMessage<InstanceInfo>) {
     super();
     proto3.util.initPartial(data, this);
@@ -5888,6 +5909,8 @@ export class InstanceInfo extends Message<InstanceInfo> {
     { no: 100, name: "last_stop", kind: "message", T: InstanceStop, opt: true },
     { no: 101, name: "checkpoint_support", kind: "message", T: CheckpointSupport, opt: true },
     { no: 102, name: "forked_from", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 200, name: "held_memory_mib", kind: "scalar", T: 1 /* ScalarType.DOUBLE */, opt: true },
+    { no: 201, name: "held_cpu_mhz", kind: "scalar", T: 1 /* ScalarType.DOUBLE */, opt: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): InstanceInfo {
@@ -9643,6 +9666,16 @@ export class ContentLocationReport extends Message<ContentLocationReport> {
    */
   removed: string[] = [];
 
+  /**
+   * Track 2: the store's `snapshots` budget class, sent on every report
+   * whatever its epoch outcome, so the manager can show checkpoint headroom
+   * and keep new memory-checkpoint instances off a node whose budget is
+   * full. Numbered from 200 so parallel work cannot collide.
+   *
+   * @generated from field: optional legion.SnapshotBudget snapshot_budget = 200;
+   */
+  snapshotBudget?: SnapshotBudget;
+
   constructor(data?: PartialMessage<ContentLocationReport>) {
     super();
     proto3.util.initPartial(data, this);
@@ -9656,6 +9689,7 @@ export class ContentLocationReport extends Message<ContentLocationReport> {
     { no: 3, name: "full", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
     { no: 4, name: "added", kind: "message", T: ContentLocation, repeated: true },
     { no: 5, name: "removed", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+    { no: 200, name: "snapshot_budget", kind: "message", T: SnapshotBudget, opt: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ContentLocationReport {
@@ -11579,6 +11613,16 @@ export class GetNodeUsageReply extends Message<GetNodeUsageReply> {
    */
   allocations: NodeAllocationUsage[] = [];
 
+  /**
+   * Track 2: capacity for resumes. Suspended instances whose checkpoint is
+   * on this node, what they keep charged, and the node's `snapshots`
+   * content budget their checkpoints fill. Field numbers start at 200 so
+   * parallel work on this message cannot collide.
+   *
+   * @generated from field: legion.SuspendedCapacity suspended = 200;
+   */
+  suspended?: SuspendedCapacity;
+
   constructor(data?: PartialMessage<GetNodeUsageReply>) {
     super();
     proto3.util.initPartial(data, this);
@@ -11595,6 +11639,7 @@ export class GetNodeUsageReply extends Message<GetNodeUsageReply> {
     { no: 6, name: "memory", kind: "message", T: NodeResourceUsage },
     { no: 7, name: "cpu", kind: "message", T: NodeResourceUsage },
     { no: 8, name: "allocations", kind: "message", T: NodeAllocationUsage, repeated: true },
+    { no: 200, name: "suspended", kind: "message", T: SuspendedCapacity },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetNodeUsageReply {
@@ -11611,6 +11656,172 @@ export class GetNodeUsageReply extends Message<GetNodeUsageReply> {
 
   static equals(a: GetNodeUsageReply | PlainMessage<GetNodeUsageReply> | undefined, b: GetNodeUsageReply | PlainMessage<GetNodeUsageReply> | undefined): boolean {
     return proto3.util.equals(GetNodeUsageReply, a, b);
+  }
+}
+
+/**
+ * Track 2. Suspended instances on one node, as `legion node usage` prints
+ * them: "suspended: 3 instances, 768 MiB held". A suspended instance counts
+ * here when its checkpoint is stored on this node, whether or not it holds
+ * any capacity (see docs/suspend-and-resume.md, "Capacity for resumes").
+ *
+ * @generated from message legion.SuspendedCapacity
+ */
+export class SuspendedCapacity extends Message<SuspendedCapacity> {
+  /**
+   * Suspended instances whose checkpoint is on this node.
+   *
+   * @generated from field: uint32 instances = 1;
+   */
+  instances = 0;
+
+  /**
+   * Of those, how many keep a charge on the node (a held allocation row,
+   * from `suspend.reserve` or the node's `suspendedReserve` floor). Their
+   * rows also appear in `GetNodeUsageReply.allocations` with
+   * `suspended = true`, and their held amounts are already part of the
+   * reply's `memory.reserved` and `cpu.reserved`.
+   *
+   * @generated from field: uint32 holding = 2;
+   */
+  holding = 0;
+
+  /**
+   * Memory (MiB) the holding instances keep charged.
+   *
+   * @generated from field: double held_memory_mib = 3;
+   */
+  heldMemoryMib = 0;
+
+  /**
+   * CPU (MHz) the holding instances keep charged.
+   *
+   * @generated from field: double held_cpu_mhz = 4;
+   */
+  heldCpuMhz = 0;
+
+  /**
+   * Bytes of those instances' checkpoints, from the manager's snapshot
+   * records. Memory checkpoints are stored in the node's content store
+   * under the `snapshots` budget. Disk checkpoints of node-local volumes
+   * are retained in place and report 0.
+   *
+   * @generated from field: uint64 checkpoint_bytes = 5;
+   */
+  checkpointBytes = protoInt64.zero;
+
+  /**
+   * The node's `resourceEnforcement.suspendedReserve` floor as it
+   * registered, 0 when unset.
+   *
+   * @generated from field: double suspended_reserve = 6;
+   */
+  suspendedReserve = 0;
+
+  /**
+   * The node's `snapshots` content budget as its worker last reported it.
+   * Unset when the worker has no content store, predates the report, or no
+   * heartbeat has reached this manager since it started.
+   *
+   * @generated from field: optional legion.SnapshotBudget snapshot_budget = 7;
+   */
+  snapshotBudget?: SnapshotBudget;
+
+  constructor(data?: PartialMessage<SuspendedCapacity>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.SuspendedCapacity";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "instances", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 2, name: "holding", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 3, name: "held_memory_mib", kind: "scalar", T: 1 /* ScalarType.DOUBLE */ },
+    { no: 4, name: "held_cpu_mhz", kind: "scalar", T: 1 /* ScalarType.DOUBLE */ },
+    { no: 5, name: "checkpoint_bytes", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 6, name: "suspended_reserve", kind: "scalar", T: 1 /* ScalarType.DOUBLE */ },
+    { no: 7, name: "snapshot_budget", kind: "message", T: SnapshotBudget, opt: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): SuspendedCapacity {
+    return new SuspendedCapacity().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): SuspendedCapacity {
+    return new SuspendedCapacity().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): SuspendedCapacity {
+    return new SuspendedCapacity().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: SuspendedCapacity | PlainMessage<SuspendedCapacity> | undefined, b: SuspendedCapacity | PlainMessage<SuspendedCapacity> | undefined): boolean {
+    return proto3.util.equals(SuspendedCapacity, a, b);
+  }
+}
+
+/**
+ * Track 2. A node content store's `snapshots` budget class
+ * (`content.budgets.snapshots`), which holds memory checkpoints. Workers
+ * report it on every heartbeat with a content report.
+ *
+ * @generated from message legion.SnapshotBudget
+ */
+export class SnapshotBudget extends Message<SnapshotBudget> {
+  /**
+   * The configured budget in bytes.
+   *
+   * @generated from field: uint64 budget_bytes = 1;
+   */
+  budgetBytes = protoInt64.zero;
+
+  /**
+   * Bytes the class holds now.
+   *
+   * @generated from field: uint64 used_bytes = 2;
+   */
+  usedBytes = protoInt64.zero;
+
+  /**
+   * Bytes pinned by a live owner (a suspended instance's or a snapshot's
+   * checkpoint). Pinned content cannot be evicted, so the room a new
+   * checkpoint can use is `budget_bytes - pinned_bytes`. When that is
+   * smaller than a task's expected checkpoint, the scheduler does not place
+   * new instances of that task (a memory-checkpoint `suspend` block) on the
+   * node.
+   *
+   * @generated from field: uint64 pinned_bytes = 3;
+   */
+  pinnedBytes = protoInt64.zero;
+
+  constructor(data?: PartialMessage<SnapshotBudget>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.SnapshotBudget";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "budget_bytes", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 2, name: "used_bytes", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 3, name: "pinned_bytes", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): SnapshotBudget {
+    return new SnapshotBudget().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): SnapshotBudget {
+    return new SnapshotBudget().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): SnapshotBudget {
+    return new SnapshotBudget().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: SnapshotBudget | PlainMessage<SnapshotBudget> | undefined, b: SnapshotBudget | PlainMessage<SnapshotBudget> | undefined): boolean {
+    return proto3.util.equals(SnapshotBudget, a, b);
   }
 }
 
@@ -11847,6 +12058,16 @@ export class NodeAllocationUsage extends Message<NodeAllocationUsage> {
    */
   pressureSteps: string[] = [];
 
+  /**
+   * Track 2: true when this row is a suspended instance's held charge
+   * (status `suspended`), not running work. Its `reserved_*` figures are
+   * the held share, and it has no `usage`. Numbered from 200 so parallel
+   * work on this message cannot collide.
+   *
+   * @generated from field: bool suspended = 200;
+   */
+  suspended = false;
+
   constructor(data?: PartialMessage<NodeAllocationUsage>) {
     super();
     proto3.util.initPartial(data, this);
@@ -11866,6 +12087,7 @@ export class NodeAllocationUsage extends Message<NodeAllocationUsage> {
     { no: 9, name: "band", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 10, name: "pressure_rank", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
     { no: 11, name: "pressure_steps", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+    { no: 200, name: "suspended", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): NodeAllocationUsage {

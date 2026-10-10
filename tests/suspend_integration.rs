@@ -14,13 +14,14 @@
 //! `suspend` pressure step reports.
 
 use legion::manager::server::{
-    idle_sweep, settle_stalled_resumes, IdleSweeper, ManagerDaemonService,
+    idle_sweep, make_room_sweep, settle_stalled_resumes, IdleSweeper, MakeRoomState,
+    ManagerDaemonService,
 };
 use legion::prelude::{json, Context, R};
 use legion::storage::events::SchedulerEventFilter;
 use legion::storage::store::Store;
 use legion::structs::manager_server::Manager;
-use legion::structs::suspend::{IdleConfig, SuspendConfig};
+use legion::structs::suspend::{IdleConfig, SuspendConfig, SuspendReserveConfig};
 use legion::structs::{
     config::ManagerConfigFull, job::JobConfig, job::StatefulConfig, job::StatefulStorageConfig,
     job::TaskConfig, AllocationUsage, CheckpointRequest, DestroyInstanceRequest,
@@ -62,6 +63,23 @@ impl Cluster {
     }
 
     fn add_node(&self, capabilities: Value) -> R<()> {
+        self.add_node_with(capabilities, json!({}))
+    }
+
+    /// `add_node` with extra registration attributes (for example a
+    /// `suspendedReserve` floor) merged into `config_attrs`.
+    fn add_node_with(&self, capabilities: Value, extra_attrs: Value) -> R<()> {
+        let mut config_attrs = json!({
+            "node_id": NODE,
+            "maxAllocations": 20,
+            "resources": { "memory": 65536, "cpu": 40000 },
+        });
+        if let (Some(attrs), Some(extra)) = (config_attrs.as_object_mut(), extra_attrs.as_object())
+        {
+            for (key, value) in extra {
+                attrs.insert(key.clone(), value.clone());
+            }
+        }
         self.store().insert_node(NodeMsg::from(Node {
             id: NODE.to_string(),
             pool: "default".into(),
@@ -69,11 +87,7 @@ impl Cluster {
             availability: "available".into(),
             last_heartbeat: "2023-01-01T00:00:00Z".into(),
             heartbeat_source: String::new(),
-            config_attrs: json!({
-                "node_id": NODE,
-                "maxAllocations": 20,
-                "resources": { "memory": 65536, "cpu": 40000 },
-            }),
+            config_attrs,
             fingerprint_attrs: json!({
                 "arch": "x86_64",
                 "memory_total": "68719476736",
@@ -112,9 +126,13 @@ impl Cluster {
     }
 
     fn reschedule(&self) -> R<()> {
-        let config_id = self.store().get_job_config(JOB)?.id();
+        self.reschedule_job(JOB)
+    }
+
+    fn reschedule_job(&self, job: &str) -> R<()> {
+        let config_id = self.store().get_job_config(job)?.id();
         self.store()
-            .enqueue_eval("job_reschedule", Some(JOB), Some(&config_id), None, None)?;
+            .enqueue_eval("job_reschedule", Some(job), Some(&config_id), None, None)?;
         while let Some(eval) = self.store().get_next_eval()? {
             let outcome = eval.handle(self.store());
             self.store().set_eval_status(
@@ -170,6 +188,16 @@ impl Cluster {
                     pressure: None,
                 }),
                 ..Default::default()
+            }))
+            .await?
+            .into_inner())
+    }
+
+    async fn node_usage(&self) -> R<legion::structs::GetNodeUsageReply> {
+        Ok(self
+            .svc
+            .get_node_usage(Request::new(legion::structs::GetNodeUsageRequest {
+                node_id: NODE.into(),
             }))
             .await?
             .into_inner())
@@ -724,7 +752,7 @@ async fn reserve_holds_the_allocation_row_until_resume() -> R<()> {
     cluster.submit(job(
         "exec",
         Some(SuspendConfig {
-            reserve: Some(true),
+            reserve: Some(SuspendReserveConfig::Flag(true)),
             ..Default::default()
         }),
     ))?;
@@ -1288,5 +1316,368 @@ async fn an_instance_records_its_last_stop_and_its_checkpoint_support() -> R<()>
     let stop = cluster.info().await?.last_stop.context("stop recorded")?;
     assert_eq!(stop.cause, "stop");
     assert!(stop.hint.is_empty());
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Capacity for resumes (Track 2): partial holds, the node floor, make-room.
+// ---------------------------------------------------------------------------
+
+/// `job` with explicit resources on its task.
+fn job_with(runtime: &str, suspend: Option<SuspendConfig>, resources: Value) -> JobConfig {
+    let mut config = job(runtime, suspend);
+    config.tasks[0].resources = resources;
+    config
+}
+
+fn held_row(cluster: &Cluster) -> R<Option<legion::structs::Allocation>> {
+    Ok(cluster
+        .store()
+        .allocs_for_node(NODE)?
+        .into_iter()
+        .find(|allocation| allocation.status == "suspended"))
+}
+
+/// `reserve = 0.25` keeps a quarter of memory and cpu charged to the node,
+/// shown on `instance get` and `node usage`, and the resume releases it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_partial_reserve_holds_its_share_and_the_resume_releases_it() -> R<()> {
+    let cluster = Cluster::new()?;
+    cluster.add_node(json!(["checkpoint"]))?;
+    cluster.submit(job_with(
+        "exec",
+        Some(SuspendConfig {
+            reserve: Some(SuspendReserveConfig::Ratio(0.25)),
+            ..Default::default()
+        }),
+        json!({ "memory": 2048, "cpu": 1000, "memoryMax": 4096 }),
+    ))?;
+    let first = cluster.active_instance()?;
+    cluster.suspended(first).await?;
+
+    let held = held_row(&cluster)?.context("a held row")?;
+    assert_eq!(held.id, first);
+    assert_eq!(held.resources["memory"], json!(512.0));
+    assert_eq!(held.resources["cpu"], json!(250.0));
+    assert_eq!(held.resources["allocations"], json!(0));
+    let info = cluster.info().await?;
+    assert_eq!(info.state, "suspended");
+    assert_eq!(info.held_memory_mib, Some(512.0));
+    assert_eq!(info.held_cpu_mhz, Some(250.0));
+
+    let usage = cluster.node_usage().await?;
+    let suspended = usage.suspended.context("suspended summary")?;
+    assert_eq!((suspended.instances, suspended.holding), (1, 1));
+    assert_eq!(suspended.held_memory_mib, 512.0);
+    assert_eq!(usage.memory.context("memory")?.reserved, 512.0);
+    assert!(usage.allocations.iter().any(|row| row.suspended));
+
+    // Not dispatched, and the scheduler neither culls nor re-places it.
+    assert!(cluster
+        .heartbeat(Vec::new())
+        .await?
+        .desired_allocations
+        .is_empty());
+    cluster.reschedule()?;
+    assert_eq!(cluster.store().allocs_for_node(NODE)?.len(), 1);
+
+    cluster.start(false).await?;
+    cluster.reschedule()?;
+    let allocs = cluster.store().allocs_for_node(NODE)?;
+    assert_eq!(allocs.len(), 1, "the share became the restore");
+    assert_eq!(allocs[0].status, "placed");
+    assert_eq!(allocs[0].resources["memory"], json!(2048));
+    let info = cluster.info().await?;
+    assert_eq!(info.held_memory_mib, None);
+    Ok(())
+}
+
+/// The node's `suspendedReserve` floor holds a share even for a job that
+/// reserves nothing, and loses to a larger job reserve.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_node_floor_holds_a_share_when_the_job_reserves_nothing() -> R<()> {
+    let cluster = Cluster::new()?;
+    cluster.add_node_with(json!(["checkpoint"]), json!({ "suspendedReserve": 0.5 }))?;
+    cluster.submit(job_with(
+        "exec",
+        Some(SuspendConfig::default()),
+        json!({ "memory": 2048, "cpu": 1000 }),
+    ))?;
+    let first = cluster.active_instance()?;
+    cluster.suspended(first).await?;
+    let held = held_row(&cluster)?.context("the floor holds a row")?;
+    assert_eq!(held.resources["memory"], json!(1024.0));
+    assert_eq!(held.resources["cpu"], json!(500.0));
+    let usage = cluster.node_usage().await?;
+    assert_eq!(usage.suspended.context("summary")?.suspended_reserve, 0.5);
+    Ok(())
+}
+
+/// A job's fixed amount beats a smaller floor, per dimension.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_amount_reserve_combines_with_the_floor_per_dimension() -> R<()> {
+    let cluster = Cluster::new()?;
+    cluster.add_node_with(json!(["checkpoint"]), json!({ "suspendedReserve": 0.25 }))?;
+    cluster.submit(job_with(
+        "exec",
+        Some(SuspendConfig {
+            reserve: Some(SuspendReserveConfig::Amount(
+                legion::structs::suspend::SuspendReserveAmount {
+                    memory: Some(json!("1GiB")),
+                    cpu: None,
+                },
+            )),
+            ..Default::default()
+        }),
+        json!({ "memory": 2048, "cpu": 1000 }),
+    ))?;
+    let first = cluster.active_instance()?;
+    cluster.suspended(first).await?;
+    let held = held_row(&cluster)?.context("held")?;
+    assert_eq!(held.resources["memory"], json!(1024.0), "the amount wins");
+    assert_eq!(held.resources["cpu"], json!(250.0), "the floor wins");
+    Ok(())
+}
+
+/// Three 800 MHz instances on a 2000 MHz node: `ID` suspends, `user-3`
+/// takes its room, and `ID`'s resume no longer fits. The make-room sweep
+/// suspends the quietest suspendable instance, and the resume is placed
+/// once that suspend lands.
+async fn full_node_with_a_waiting_resume(suspend: SuspendConfig) -> R<(Cluster, i64, i64)> {
+    let cluster = Cluster::new()?;
+    cluster.add_node(json!(["checkpoint"]))?;
+    cluster.submit(job_with(
+        "exec",
+        Some(suspend),
+        json!({ "memory": 256, "cpu": 800 }),
+    ))?;
+    let first = cluster.active_instance()?;
+    let second = cluster.active_instance_named("user-2")?;
+    cluster.suspended(first).await?;
+    let third = cluster.active_instance_named("user-3")?;
+    cluster.start(false).await?;
+    cluster.reschedule()?;
+    let info = cluster.info().await?;
+    assert_eq!(info.pending_op.as_deref(), Some("resuming"));
+    assert_eq!(info.current_alloc_id, None, "the node is full");
+    Ok((cluster, second, third))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_resume_on_a_full_node_makes_room_by_suspending_the_quietest() -> R<()> {
+    let (cluster, second, third) = full_node_with_a_waiting_resume(SuspendConfig {
+        on_pressure: Some(true),
+        ..Default::default()
+    })
+    .await?;
+    let now = chrono::Utc::now().timestamp();
+    cluster
+        .report_usage(vec![
+            idle_usage(second, now - 600, 0),
+            idle_usage(third, now - 30, 0),
+        ])
+        .await?;
+    let usage = cluster.svc.usage_handle();
+    let mut state = MakeRoomState::with_cooldown(std::time::Duration::ZERO);
+
+    let swept = make_room_sweep(cluster.store(), &usage, &mut state);
+    assert_eq!(swept.started.len(), 1, "{swept:?}");
+    assert_eq!(swept.started[0].0, ID);
+    assert_eq!(
+        swept.started[0].1, "user-2",
+        "quiet since 600s ago goes first"
+    );
+    let victim = cluster.info_of("user-2").await?;
+    assert_eq!(victim.pending_op.as_deref(), Some("suspending"));
+    assert_eq!(victim.suspend_reason.as_deref(), Some("make_room"));
+    let make_room = cluster.events("instance.make_room")?;
+    assert_eq!(make_room.len(), 1);
+    assert_eq!(make_room[0]["instanceId"], ID);
+
+    // Nothing more while that suspend is in flight.
+    let again = make_room_sweep(cluster.store(), &usage, &mut state);
+    assert!(again.started.is_empty(), "{again:?}");
+    assert!(
+        again
+            .waiting
+            .iter()
+            .any(|(_, why)| why.contains("already suspending")),
+        "{again:?}"
+    );
+
+    // The capture lands: the resume fits and is queued for placement.
+    cluster
+        .heartbeat(vec![capture_ok(&swept.started[0].2, second, "disk")])
+        .await?;
+    assert_eq!(cluster.info_of("user-2").await?.state, "suspended");
+    let suspended = cluster.events("instance.suspended")?;
+    assert!(suspended.iter().any(|meta| meta["reason"] == "make_room"));
+    let nudged = make_room_sweep(cluster.store(), &usage, &mut state);
+    assert_eq!(nudged.nudged, vec![ID.to_string()], "{nudged:?}");
+    cluster.reschedule()?;
+    let info = cluster.info().await?;
+    assert!(info.current_alloc_id.is_some(), "the resume was placed");
+    assert_eq!(cluster.info_of("user-3").await?.state, "active");
+    Ok(())
+}
+
+/// The anti-thrash and eligibility rules: instances that became active
+/// within the cooldown are never chosen, work without a `suspend` block is
+/// never touched, more important bands are never touched, and a round that
+/// cannot make enough room suspends nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn make_room_respects_the_cooldown_bands_and_never_does_a_useless_round() -> R<()> {
+    // Recently active instances are off limits under the real cooldown.
+    let (cluster, second, third) = full_node_with_a_waiting_resume(SuspendConfig {
+        on_pressure: Some(true),
+        ..Default::default()
+    })
+    .await?;
+    let usage = cluster.svc.usage_handle();
+    let now = chrono::Utc::now().timestamp();
+    cluster
+        .report_usage(vec![
+            idle_usage(second, now - 600, 0),
+            idle_usage(third, now - 600, 0),
+        ])
+        .await?;
+    let swept = make_room_sweep(cluster.store(), &usage, &mut MakeRoomState::default());
+    assert!(swept.started.is_empty(), "{swept:?}");
+    assert!(
+        swept
+            .waiting
+            .iter()
+            .any(|(_, why)| why.contains("would not make room")),
+        "{swept:?}"
+    );
+
+    // Not opted in (no onPressure, no idle policy): never suspended.
+    let (cluster, second, third) =
+        full_node_with_a_waiting_resume(SuspendConfig::default()).await?;
+    let usage = cluster.svc.usage_handle();
+    cluster
+        .report_usage(vec![
+            idle_usage(second, now - 600, 0),
+            idle_usage(third, now - 600, 0),
+        ])
+        .await?;
+    let mut state = MakeRoomState::with_cooldown(std::time::Duration::ZERO);
+    let swept = make_room_sweep(cluster.store(), &usage, &mut state);
+    assert!(swept.started.is_empty(), "{swept:?}");
+    assert_eq!(cluster.info_of("user-2").await?.state, "active");
+
+    // A more important band is never suspended for a normal-band resume:
+    // the only instances on the node are `high`, so nothing is eligible.
+    let cluster = Cluster::new()?;
+    cluster.add_node(json!(["checkpoint"]))?;
+    let on_pressure = SuspendConfig {
+        on_pressure: Some(true),
+        ..Default::default()
+    };
+    cluster.submit(job_with(
+        "exec",
+        Some(on_pressure.clone()),
+        json!({ "memory": 256, "cpu": 800 }),
+    ))?;
+    let first = cluster.active_instance()?;
+    cluster.suspended(first).await?;
+    let mut vip = job_with(
+        "exec",
+        Some(on_pressure),
+        json!({ "memory": 256, "cpu": 800 }),
+    );
+    vip.name = "vip".into();
+    vip.priority = legion::structs::Band::High;
+    cluster.submit(vip)?;
+    for id in ["v1", "v2"] {
+        cluster
+            .store()
+            .create_keyed_instance("vip", "default", TASK, Some(id))?;
+    }
+    cluster.reschedule_job("vip")?;
+    cluster.start(false).await?;
+    cluster.reschedule()?;
+    assert_eq!(cluster.info().await?.current_alloc_id, None, "full of vip");
+    let usage = cluster.svc.usage_handle();
+    let swept = make_room_sweep(cluster.store(), &usage, &mut state);
+    assert!(swept.started.is_empty(), "{swept:?}");
+    assert!(
+        swept
+            .waiting
+            .iter()
+            .any(|(_, why)| why.contains("all 0 eligible")),
+        "{swept:?}"
+    );
+    assert_eq!(cluster.info_of("v1").await?.state, "active");
+    Ok(())
+}
+
+/// A node whose `snapshots` budget cannot hold one more checkpoint takes no
+/// new instance of a task that suspends to memory, with a diagnostic that
+/// names the budget, and takes it again once the budget has room. A resume
+/// is never held back: its checkpoint already exists.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_full_snapshot_budget_keeps_new_memory_suspend_instances_off_the_node() -> R<()> {
+    use legion::structs::{ContentLocationReport, SnapshotBudget};
+    const GIB: u64 = 1024 * 1024 * 1024;
+    let cluster = Cluster::new()?;
+    cluster.add_node(json!(["checkpoint"]))?;
+    cluster.submit(job_with(
+        "sandbox",
+        Some(SuspendConfig {
+            checkpoint: Some("memory".into()),
+            ..Default::default()
+        }),
+        json!({ "memory": 1024 }),
+    ))?;
+    let report_budget = |pinned: u64| {
+        cluster.svc.heartbeat(Request::new(HeartbeatRequest {
+            id: NODE.into(),
+            content_locations: Some(ContentLocationReport {
+                epoch: 1,
+                base_epoch: 0,
+                full: true,
+                snapshot_budget: Some(SnapshotBudget {
+                    budget_bytes: 10 * GIB,
+                    used_bytes: pinned,
+                    pinned_bytes: pinned,
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }))
+    };
+    // 512 MiB of room, and the guest is 1 GiB.
+    report_budget(10 * GIB - GIB / 2).await?;
+    cluster
+        .store()
+        .create_keyed_instance(JOB, "default", TASK, Some(ID))?;
+    let config_id = cluster.store().get_job_config(JOB)?.id();
+    cluster
+        .store()
+        .enqueue_eval("job_reschedule", Some(JOB), Some(&config_id), None, None)?;
+    let eval = cluster.store().get_next_eval()?.context("eval")?;
+    let err = eval.handle(cluster.store()).expect_err("no node has room");
+    cluster.store().set_eval_status(&eval.id, "failed")?;
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("snapshots content budget is full")
+            && message.contains("less than 1024 MiB free")
+            && message.contains("content.budgets.snapshots"),
+        "{message}"
+    );
+    assert_eq!(cluster.info().await?.current_alloc_id, None);
+
+    let usage = cluster.node_usage().await?;
+    let budget = usage
+        .suspended
+        .and_then(|suspended| suspended.snapshot_budget)
+        .context("the budget is on node usage")?;
+    assert_eq!(budget.budget_bytes, 10 * GIB);
+
+    // Room again: it places.
+    report_budget(GIB).await?;
+    cluster.reschedule()?;
+    assert!(cluster.info().await?.current_alloc_id.is_some());
     Ok(())
 }

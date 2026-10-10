@@ -779,6 +779,9 @@ pub struct Metrics {
     /// `legion_idle_sweep_suspends_total{outcome}` (docs/metrics.md, "Suspend
     /// and resume")
     pub idle_sweep_suspends_total: Arc<CounterVec>,
+    /// `legion_make_room_suspends_total{outcome}` (docs/metrics.md, "Suspend
+    /// and resume")
+    pub make_room_suspends_total: Arc<CounterVec>,
     /// `legion_instance_resume_seconds{kind}` (docs/metrics.md, "Suspend and
     /// resume")
     pub instance_resume_seconds: Arc<HistogramVec>,
@@ -1088,6 +1091,14 @@ impl Metrics {
             meta: FamilyMeta {
                 name: "legion_idle_sweep_suspends_total",
                 help: "Suspends the idle sweep tried to start, by outcome: started, or skipped (the instance changed, an operation was in flight, or its node cannot checkpoint).",
+                labels: &["outcome"],
+            },
+            series: Series::new(),
+        });
+        let make_room_suspends_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_make_room_suspends_total",
+                help: "Suspends the manager started to make room for a resume waiting on its checkpoint's node, by outcome: started, failed (the suspend could not start), or no_room (suspending every eligible instance would not have made room, so none was suspended).",
                 labels: &["outcome"],
             },
             series: Series::new(),
@@ -1638,6 +1649,7 @@ impl Metrics {
             Arc::clone(&instance_suspend_seconds) as Arc<dyn RenderMetric>,
             Arc::clone(&instance_suspends_total) as Arc<dyn RenderMetric>,
             Arc::clone(&idle_sweep_suspends_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&make_room_suspends_total) as Arc<dyn RenderMetric>,
             Arc::clone(&instance_resume_seconds) as Arc<dyn RenderMetric>,
             Arc::clone(&checkpoint_bytes) as Arc<dyn RenderMetric>,
             Arc::clone(&checkpoint_publish_bytes) as Arc<dyn RenderMetric>,
@@ -1717,6 +1729,7 @@ impl Metrics {
             instance_suspend_seconds,
             instance_suspends_total,
             idle_sweep_suspends_total,
+            make_room_suspends_total,
             instance_resume_seconds,
             checkpoint_bytes,
             checkpoint_publish_bytes,

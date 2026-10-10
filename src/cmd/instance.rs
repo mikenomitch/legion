@@ -1079,6 +1079,15 @@ fn suspend_lines(instance: &InstanceInfo) -> Vec<String> {
             instance.checkpoint_durability.as_deref().unwrap_or("local"),
         ));
     }
+    // What it keeps charged to its node while suspended (docs/
+    // suspend-and-resume.md, "Capacity for resumes").
+    if let Some(memory) = instance.held_memory_mib {
+        lines.push(format!(
+            "held: {memory:.0} MiB and {:.0} MHz reserved on {} for the resume",
+            instance.held_cpu_mhz.unwrap_or_default(),
+            instance.checkpoint_node_id.as_deref().unwrap_or("its node"),
+        ));
+    }
     if let Some(at) = instance.suspended_at.as_deref() {
         lines.push(format!(
             "last suspend: {at} ({}) in {} ms",
@@ -1288,6 +1297,19 @@ mod tests {
         assert!(
             lines.contains(&"idle since: 2026-10-10T12:00:00Z (suspends after 3m0s)".to_string()),
             "{lines:?}"
+        );
+        let held = InstanceInfo {
+            state: "suspended".into(),
+            checkpoint_node_id: Some("w-03".into()),
+            held_memory_mib: Some(512.0),
+            held_cpu_mhz: Some(250.0),
+            ..Default::default()
+        };
+        assert!(
+            suspend_lines(&held)
+                .contains(&"held: 512 MiB and 250 MHz reserved on w-03 for the resume".to_string()),
+            "{:?}",
+            suspend_lines(&held)
         );
     }
 

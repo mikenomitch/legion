@@ -33,7 +33,7 @@ pub use snapshot_ops::{
     DeleteSnapshotOutcome, NewSnapshot, RestoreInstanceOutcome, RestorePin, SnapshotFilter,
     SnapshotReportOutcome, SnapshotReportRecord,
 };
-pub use suspend_ops::{AbandonedResume, ResumeOutcome};
+pub use suspend_ops::{AbandonedResume, ResumeOutcome, WaitingResume};
 
 use crate::storage::queries::{
     DELETE_SIGNING_KEY, GET_ALLOCATION_BY_ID, GET_ALLOCS, GET_ALLOCS_FOR_JOB,

@@ -268,6 +268,7 @@ impl Cluster {
                     })
                     .collect(),
                 removed: Vec::new(),
+                snapshot_budget: None,
             },
             std::time::Instant::now(),
         );

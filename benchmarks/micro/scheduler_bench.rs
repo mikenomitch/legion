@@ -908,6 +908,7 @@ fn seed_locality_index(store: &Store, node_count: usize) {
                 full: true,
                 added,
                 removed: Vec::new(),
+                snapshot_budget: None,
             },
             now,
         );
@@ -1093,6 +1094,7 @@ fn setup_restores(store: &Store, node_count: usize, published: bool) -> anyhow::
                         bytes: 512 * 1024 * 1024,
                     }],
                     removed: Vec::new(),
+                    snapshot_budget: None,
                 },
                 now,
             );
@@ -1120,6 +1122,105 @@ fn restore_benchmark(c: &mut Criterion) {
                             .plan_only(&job_config_id, PlanMode::Fresh)
                             .expect("plan");
                         assert_eq!(plan.len(), RESTORE_INSTANCES);
+                        plan
+                    })
+                },
+            );
+        }
+    }
+
+    group.finish();
+}
+
+// ---------------------------------------------------------------------------
+// Snapshot budget (capacity for resumes, Track 2)
+// ---------------------------------------------------------------------------
+//
+// The cost of the `snapshots` budget placement filter: new keyed instances of
+// a task with a memory-checkpoint `suspend` block skip nodes whose budget has
+// no room for one more checkpoint. `unreported` is the common case (no node
+// has reported a budget, so the filter reads the index and keeps every
+// node). `half_full` has every node reporting, with every other node full.
+
+const BUDGET_NODE_STEPS: &[usize] = &[1_000, 5_000];
+const BUDGET_INSTANCES: usize = 25;
+
+fn setup_budget_placements(
+    store: &Store,
+    node_count: usize,
+    half_full: bool,
+) -> anyhow::Result<String> {
+    use legion::structs::SnapshotBudget;
+    insert_restore_nodes(store, node_count)?;
+    let job = JobConfig {
+        priority: Default::default(),
+        name: "bench-budget".into(),
+        tasks: vec![TaskConfig {
+            stateful: Some(serde_json::from_value(json!({ "mode": "keyed" }))?),
+            suspend: Some(serde_json::from_value(json!({ "checkpoint": "memory" }))?),
+            resources: json!({ "memory": 512 }),
+            ..TaskConfig::new("workspace", "noop")
+        }],
+        rollout: None,
+        rollout_by_group: Default::default(),
+        version: None,
+    };
+    let job_config_id = submit_jobs(store, std::slice::from_ref(&job))?
+        .pop()
+        .expect("one id");
+    for idx in 0..BUDGET_INSTANCES {
+        store.create_keyed_instance(
+            "bench-budget",
+            "default",
+            "workspace",
+            Some(&format!("i-{idx}")),
+        )?;
+    }
+    if half_full {
+        let now = std::time::Instant::now();
+        const GIB: u64 = 1024 * 1024 * 1024;
+        for idx in 0..node_count {
+            store.content_locations().ingest(
+                &format!("node-{idx}"),
+                &ContentLocationReport {
+                    epoch: 1,
+                    base_epoch: 0,
+                    full: true,
+                    added: Vec::new(),
+                    removed: Vec::new(),
+                    snapshot_budget: Some(SnapshotBudget {
+                        budget_bytes: 50 * GIB,
+                        used_bytes: 50 * GIB,
+                        pinned_bytes: if idx % 2 == 0 { 50 * GIB } else { 10 * GIB },
+                    }),
+                },
+                now,
+            );
+        }
+    }
+    Ok(job_config_id)
+}
+
+fn snapshot_budget_benchmark(c: &mut Criterion) {
+    let mut group = c.benchmark_group("snapshot_budget");
+    group.warm_up_time(Duration::from_millis(500));
+    group.measurement_time(Duration::from_secs(5));
+    group.sample_size(20);
+
+    for &node_count in BUDGET_NODE_STEPS {
+        for (label, half_full) in [("unreported", false), ("half_full", true)] {
+            let (store, _dir) = setup_store("bin_pack").expect("store");
+            let job_config_id =
+                setup_budget_placements(&store, node_count, half_full).expect("placements");
+            group.bench_function(
+                BenchmarkId::new(label, format!("nodes_{node_count}")),
+                |b| {
+                    b.iter(|| {
+                        let scheduler = Scheduler::new(&store).expect("scheduler");
+                        let plan = scheduler
+                            .plan_only(&job_config_id, PlanMode::Fresh)
+                            .expect("plan");
+                        assert_eq!(plan.len(), BUDGET_INSTANCES);
                         plan
                     })
                 },
@@ -1164,6 +1265,7 @@ criterion_group!(
     plan_under_fill_benchmark,
     plan_fleet_scaling_benchmark,
     locality_benchmark,
-    restore_benchmark
+    restore_benchmark,
+    snapshot_budget_benchmark
 );
 criterion_main!(benches);

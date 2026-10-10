@@ -556,6 +556,7 @@ pub async fn run_manager_with(
             idle_sweep: Some(IdleSweepConfig {
                 usage: usage_for_idle_sweep,
                 interval: full_config.suspend.idle_sweep_interval(),
+                make_room: full_config.suspend.make_room,
             }),
         },
     );
@@ -1116,7 +1117,15 @@ pub struct LivenessCheckerConfig {
 pub struct IdleSweepConfig {
     pub usage: Arc<Mutex<crate::manager::usage::UsageTable>>,
     pub interval: Duration,
+    /// Also run the make-room sweep (manager `suspend.makeRoom`, docs/
+    /// suspend-and-resume.md "Capacity for resumes"), which reads the same
+    /// usage reports to find the quietest instances.
+    pub make_room: bool,
 }
+
+/// How often the make-room sweep looks for resumes waiting on a full node.
+/// One indexed read when nothing is resuming.
+const MAKE_ROOM_EVERY: Duration = Duration::from_secs(5);
 
 /// The interval this manager currently serves, and the ladder state behind it.
 ///
@@ -1175,6 +1184,8 @@ async fn start_node_status_checker(store: Store, config: LivenessCheckerConfig) 
     // status checker's, and its memory of what it already tried.
     let mut last_idle_sweep: Option<std::time::Instant> = None;
     let mut idle_sweeper = crate::manager::server::IdleSweeper::default();
+    let mut last_make_room: Option<std::time::Instant> = None;
+    let mut make_room_state = crate::manager::server::MakeRoomState::default();
     loop {
         // Leader-only actions (raft mode, per lane): only the STATUS-lane
         // leader may mark nodes lost / sweep health orphans; non-leaders
@@ -1585,6 +1596,13 @@ async fn start_node_status_checker(store: Store, config: LivenessCheckerConfig) 
             if last_idle_sweep.is_none_or(|at| at.elapsed() >= idle.interval) {
                 last_idle_sweep = Some(std::time::Instant::now());
                 crate::manager::server::idle_sweep(&store, &idle.usage, &mut idle_sweeper);
+            }
+            // Make room for resumes pinned to a full node. Not leader-gated
+            // for the same reason as the idle sweep: the usage lives here,
+            // and the suspends and evals it starts forward to the leader.
+            if idle.make_room && last_make_room.is_none_or(|at| at.elapsed() >= MAKE_ROOM_EVERY) {
+                last_make_room = Some(std::time::Instant::now());
+                crate::manager::server::make_room_sweep(&store, &idle.usage, &mut make_room_state);
             }
         }
 

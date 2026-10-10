@@ -1456,6 +1456,7 @@ pub mod drafts {
         let why = match reason {
             crate::structs::suspend::SUSPEND_REASON_IDLE => " (idle)",
             crate::structs::suspend::SUSPEND_REASON_PRESSURE => " (node memory pressure)",
+            crate::structs::suspend::SUSPEND_REASON_MAKE_ROOM => " (making room for a resume)",
             _ => "",
         };
         let mut draft = snapshot_draft(
@@ -1479,6 +1480,33 @@ pub mod drafts {
             meta.insert("reason".into(), json!(reason));
         }
         draft
+    }
+
+    /// `instance.make_room` — a resume waiting on its checkpoint's node did
+    /// not fit, so the manager started suspends of idle suspendable
+    /// instances there (manager `suspend.makeRoom`). Each suspend then lands
+    /// as `instance.suspended` with reason `make_room`.
+    pub fn instance_make_room(
+        job_id: &str,
+        instance_id: &str,
+        node_id: &str,
+        suspending: &[String],
+    ) -> EventDraft {
+        EventDraft::info(
+            "instance.make_room",
+            format!(
+                "Resume of instance {instance_id} does not fit on {node_id}; suspending {} to \
+                 make room: {}",
+                suspending.len(),
+                suspending.join(", ")
+            ),
+        )
+        .job(job_id)
+        .node(node_id)
+        .meta(json!({
+            "instanceId": instance_id,
+            "suspending": suspending,
+        }))
     }
 
     /// `instance.suspend_failed` — the node could not capture the instance.
@@ -2187,6 +2215,21 @@ impl EventRecorder<'_> {
             instance_id,
             reserved,
             reason,
+        ));
+    }
+
+    pub fn instance_make_room(
+        self,
+        job_id: &str,
+        instance_id: &str,
+        node_id: &str,
+        suspending: &[String],
+    ) {
+        self.emit(drafts::instance_make_room(
+            job_id,
+            instance_id,
+            node_id,
+            suspending,
         ));
     }
 

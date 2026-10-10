@@ -13,7 +13,7 @@
 use crate::resources::{NodeCapacity, OversubscribeRatios, ResourcePolicy, MEMORY_MAX_KEY};
 use crate::structs::{
     Allocation, AllocationUsage, Band, GetNodeUsageReply, Node, NodeAllocationUsage,
-    NodeResourceUsage, UsageReport,
+    NodeResourceUsage, SuspendedCapacity, UsageReport,
 };
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -265,10 +265,23 @@ pub fn build_node_usage_reply(
                     .to_string(),
                 pressure_rank,
                 pressure_steps,
+                suspended: allocation.status == crate::constants::ALLOCATION_STATUS_SUSPENDED,
             }
         })
         .collect();
     rows.sort_by_key(|row| row.allocation_id);
+    // Held charges of suspended instances: already inside the reserved sums
+    // below, summarized apart so the CLI can say how much of "reserved" is
+    // suspended work. The instance count, checkpoint bytes, and budget need
+    // the store, so `fill_suspended_capacity` adds them.
+    let held = rows.iter().filter(|row| row.suspended);
+    let suspended = SuspendedCapacity {
+        holding: held.clone().count() as u32,
+        held_memory_mib: held.clone().map(|row| row.reserved_memory_mib).sum(),
+        held_cpu_mhz: held.map(|row| row.reserved_cpu_mhz).sum(),
+        suspended_reserve: crate::resources::node_suspended_reserve(&node.config_attrs),
+        ..Default::default()
+    };
 
     let reserved_memory: f64 = rows.iter().map(|row| row.reserved_memory_mib).sum();
     let reserved_cpu: f64 = rows.iter().map(|row| row.reserved_cpu_mhz).sum();
@@ -313,7 +326,24 @@ pub fn build_node_usage_reply(
             ..Default::default()
         }),
         allocations: rows,
+        suspended: Some(suspended),
     }
+}
+
+/// Complete a reply's [`SuspendedCapacity`] with what only the store and the
+/// content index know: how many suspended instances keep their checkpoint
+/// on the node, those checkpoints' bytes, and the node's last reported
+/// `snapshots` budget. Separate from [`build_node_usage_reply`] so that
+/// function stays pure over its inputs.
+pub fn fill_suspended_capacity(
+    reply: &mut GetNodeUsageReply,
+    suspended_on_node: (u32, u64),
+    snapshot_budget: Option<crate::structs::SnapshotBudget>,
+) {
+    let capacity = reply.suspended.get_or_insert_with(Default::default);
+    capacity.instances = suspended_on_node.0.max(capacity.holding);
+    capacity.checkpoint_bytes = suspended_on_node.1;
+    capacity.snapshot_budget = snapshot_budget;
 }
 
 #[cfg(test)]

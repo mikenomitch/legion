@@ -10,10 +10,10 @@
 
 use std::collections::HashMap;
 
-use crate::content_store::ContentStore;
+use crate::content_store::{ContentClass, ContentStore};
 use crate::prelude::*;
 use crate::storage::content_index::MIN_ADVERTISED_BYTES;
-use crate::structs::{ContentLocation, ContentLocationReport};
+use crate::structs::{ContentLocation, ContentLocationReport, SnapshotBudget};
 
 /// What this node advertises right now: every store entry of at least
 /// [`MIN_ADVERTISED_BYTES`], with its size. No store means an empty set.
@@ -26,6 +26,22 @@ pub fn advertised_set(store: Option<&ContentStore>) -> R<HashMap<String, u64>> {
         .into_iter()
         .map(|(digest, size)| (digest.to_string(), size))
         .collect())
+}
+
+/// The store's `snapshots` budget class, for the report's
+/// `snapshot_budget` (docs/suspend-and-resume.md, "Capacity for resumes").
+/// `None` without a store, or when the store cannot be read: the manager
+/// then treats the node as having room rather than as full.
+pub fn snapshot_budget(store: Option<&ContentStore>) -> Option<SnapshotBudget> {
+    let usage = store?.usage().ok()?;
+    usage
+        .into_iter()
+        .find(|class| class.class == ContentClass::Snapshots)
+        .map(|class| SnapshotBudget {
+            budget_bytes: class.budget,
+            used_bytes: class.used_bytes,
+            pinned_bytes: class.pinned_bytes,
+        })
 }
 
 /// One report in flight, with the set it describes, so it can be
@@ -80,6 +96,7 @@ impl ContentAdvertiser {
                     full: true,
                     added,
                     removed: Vec::new(),
+                    snapshot_budget: None,
                 },
                 snapshot: current,
             };
@@ -113,6 +130,7 @@ impl ContentAdvertiser {
                 full: false,
                 added,
                 removed,
+                snapshot_budget: None,
             },
             snapshot: current,
         }
@@ -158,6 +176,48 @@ mod tests {
         let outcome = manager.ingest("n1", &pending.report, Instant::now());
         worker.acknowledge(pending, outcome == IngestOutcome::Resync);
         Some(outcome)
+    }
+
+    #[test]
+    fn the_snapshot_budget_reports_the_snapshots_class_and_what_is_pinned() -> R<()> {
+        use crate::content_store::{ContentBudgets, ContentStoreConfig, PinOwner, PutOptions};
+        assert_eq!(snapshot_budget(None), None, "no store, no budget");
+        let dir = tempfile::tempdir()?;
+        let store = ContentStore::open(
+            dir.path().join("content"),
+            ContentStoreConfig {
+                budgets: ContentBudgets {
+                    artifacts: 10 * MIB,
+                    snapshots: 8 * MIB,
+                },
+                ttl: None,
+                min_free_disk: 0,
+            },
+        )?;
+        store.put_bytes(
+            ContentClass::Snapshots,
+            &vec![1u8; MIB as usize],
+            PutOptions::default().pin(PinOwner::snapshot("s1")),
+        )?;
+        store.put_bytes(
+            ContentClass::Snapshots,
+            &vec![2u8; MIB as usize],
+            PutOptions::default(),
+        )?;
+        store.put_bytes(
+            ContentClass::Artifacts,
+            &vec![3u8; MIB as usize],
+            PutOptions::default(),
+        )?;
+        assert_eq!(
+            snapshot_budget(Some(&store)),
+            Some(SnapshotBudget {
+                budget_bytes: 8 * MIB,
+                used_bytes: 2 * MIB,
+                pinned_bytes: MIB,
+            })
+        );
+        Ok(())
     }
 
     #[test]

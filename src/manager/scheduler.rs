@@ -2858,6 +2858,21 @@ impl<'a> Scheduler<'a> {
         // (nfs) never count — their bytes live on the storage server, and
         // charging them to the node would block placements for no reason.
         let mut planned_local_bytes: HashMap<String, u64> = HashMap::new();
+        // Checkpoint headroom (docs/suspend-and-resume.md, "Capacity for
+        // resumes"): a new instance of a task that suspends to memory skips
+        // nodes whose `snapshots` content budget cannot hold one more of its
+        // checkpoints. Read once per task from the in-memory content index,
+        // and empty (no per-node work at all) unless a node is short.
+        let budget_short: Option<(u64, HashSet<String>)> =
+            crate::structs::suspend::expected_memory_checkpoint_bytes(task_config).and_then(
+                |needed| {
+                    let short = self
+                        .store
+                        .content_locations()
+                        .snapshot_budget_short_nodes(needed);
+                    (!short.is_empty()).then_some((needed, short))
+                },
+            );
         // Spread forks (`instance fork --spread`): per fork checkpoint, the
         // nodes its forks run on or were placed on in this plan. Loaded on
         // first use, so a plan with no spread fork never reads it.
@@ -3119,6 +3134,32 @@ impl<'a> Scheduler<'a> {
                     }
                     spread
                 }
+            };
+            // Only a fresh placement is constrained: a restore already has
+            // its checkpoint, and a volume-pinned instance has no other node.
+            let eligible = match budget_short.as_ref() {
+                Some((needed, short)) if pin.is_none() && floating.is_none() => {
+                    let before = eligible.len();
+                    let roomy: Vec<&Node> = eligible
+                        .into_iter()
+                        .filter(|node| !short.contains(node.id.as_str()))
+                        .collect();
+                    if roomy.is_empty() {
+                        bail!(
+                            "Failed to place task {}: {before} eligible node(s), but every one's \
+                             snapshots content budget is full: less than {} MiB free for this \
+                             task's memory checkpoint (suspend). Raise content.budgets.snapshots \
+                             on those workers, delete snapshots you no longer need (`legion \
+                             snapshot list`), or resume or destroy suspended instances to release \
+                             their checkpoints. `legion node usage <node>` shows each node's \
+                             budget",
+                            task_config.name,
+                            needed / (1024 * 1024)
+                        );
+                    }
+                    roomy
+                }
+                _ => eligible,
             };
             let eligible = match pin.as_ref() {
                 None => eligible,
@@ -5437,6 +5478,7 @@ mod tests {
                 full: true,
                 added,
                 removed: Vec::new(),
+                snapshot_budget: None,
             };
             let now = std::time::Instant::now();
             assert_eq!(

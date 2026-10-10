@@ -621,11 +621,28 @@ fn begin_idle_suspend(
     store: &Store,
     candidate: &crate::manager::usage::IdleDue,
 ) -> Result<(String, String), String> {
+    begin_automatic_suspend(
+        store,
+        candidate.allocation_id,
+        &candidate.node_id,
+        crate::structs::suspend::SUSPEND_REASON_IDLE,
+    )
+}
+
+/// Start a suspend the manager decided on itself (the idle sweep, or
+/// make-room), with the task's default checkpoint kind and durability, after
+/// the same checks SuspendInstance makes. `Err` names why it was skipped.
+pub(super) fn begin_automatic_suspend(
+    store: &Store,
+    allocation_id: i64,
+    node_id: &str,
+    reason: &str,
+) -> Result<(String, String), String> {
     let allocation = store
-        .get_allocation_by_id(candidate.allocation_id)
+        .get_allocation_by_id(allocation_id)
         .map_err(|err| format!("loading allocation: {err:#}"))?
         .ok_or("the allocation is gone")?;
-    if allocation.node_id != candidate.node_id {
+    if allocation.node_id != node_id {
         return Err(format!(
             "the allocation runs on {}, not on the reporting node",
             allocation.node_id
@@ -704,7 +721,7 @@ fn begin_idle_suspend(
             node_id: node.id.clone(),
             allocation_id: allocation.id,
             expires_at: None,
-            suspend_reason: Some(crate::structs::suspend::SUSPEND_REASON_IDLE.to_string()),
+            suspend_reason: Some(reason.to_string()),
             durability,
         })
         .map_err(|err| format!("{err:#}"))?;

@@ -169,14 +169,22 @@ impl ManagerDaemonService {
             }
         }
         let usage = self.usage.lock().unwrap_or_else(|p| p.into_inner());
-        Ok(crate::manager::usage::build_node_usage_reply(
+        let mut reply = crate::manager::usage::build_node_usage_reply(
             node,
             &allocations,
             &self.store.resource_policy,
             &bands,
             usage.node(&node.id),
             std::time::Instant::now(),
-        ))
+        );
+        // Suspended instances and checkpoint headroom. A failed count
+        // degrades to zero rather than failing the whole reply.
+        crate::manager::usage::fill_suspended_capacity(
+            &mut reply,
+            self.store.suspended_on_node(&node.id).unwrap_or_default(),
+            self.store.content_locations().snapshot_budget(&node.id),
+        );
+        Ok(reply)
     }
 
     #[instrument(skip_all, fields(nodes = request.get_ref().node_ids.len()))]

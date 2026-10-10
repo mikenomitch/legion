@@ -115,8 +115,10 @@ use tonic::{Request, Response, Status, Streaming};
 mod checkpoint_support;
 mod fork_rpcs;
 mod node_content_rpcs;
+mod make_room;
 mod snapshot_rpcs;
 mod suspend_rpcs;
+pub use make_room::{make_room_sweep, MakeRoomOutcome, MakeRoomState, MAKE_ROOM_COOLDOWN};
 pub use snapshot_rpcs::{expire_snapshots, CHECKPOINT_CAPABILITY};
 pub use suspend_rpcs::{idle_sweep, settle_stalled_resumes, IdleSweepOutcome, IdleSweeper};
 
@@ -668,10 +670,13 @@ fn map_instance_info(
         node_id: stop.node_id,
         preemptor_job: stop.preemptor_job,
     });
+    let (held_memory_mib, held_cpu_mhz) = suspended_hold_of(store, &instance);
     InstanceInfo {
         last_stop,
         checkpoint_support,
         forked_from: history.forked_from,
+        held_memory_mib,
+        held_cpu_mhz,
         usage,
         instance_id: instance.instance_id,
         job_id: instance.job_id,
@@ -711,6 +716,30 @@ fn map_instance_info(
         pending_op,
         idle_since,
         idle_after_seconds,
+    }
+}
+
+/// What a suspended instance keeps charged to its node, as `(memory MiB,
+/// cpu MHz)`, from its held allocation row (docs/suspend-and-resume.md,
+/// "Capacity for resumes"). `(None, None)` when it holds nothing or is not
+/// suspended. Lookups that fail degrade to nothing shown.
+fn suspended_hold_of(store: &Store, instance: &Instance) -> (Option<f64>, Option<f64>) {
+    if instance.state != InstanceState::Suspended {
+        return (None, None);
+    }
+    let Some(allocation) = instance
+        .current_alloc_id
+        .and_then(|id| store.get_allocation_by_id(id).ok().flatten())
+        .filter(|allocation| allocation.status == crate::constants::ALLOCATION_STATUS_SUSPENDED)
+    else {
+        return (None, None);
+    };
+    match store.resource_policy.usage_request(&allocation.resources) {
+        Ok(request) => (
+            Some(request.amount("memory").unwrap_or(0.0)),
+            Some(request.amount("cpu").unwrap_or(0.0)),
+        ),
+        Err(_) => (None, None),
     }
 }
 

@@ -223,6 +223,7 @@ fn setup_restores(store: &Store, node_count: usize, published: bool) -> anyhow::
                         bytes: 512 * 1024 * 1024,
                     }],
                     removed: Vec::new(),
+                    snapshot_budget: None,
                 },
                 now,
             );

@@ -131,6 +131,7 @@ async fn a_delta_the_manager_cannot_place_asks_for_a_full_report() -> R<()> {
                     bytes: 4 * MIB,
                 }],
                 removed: Vec::new(),
+                snapshot_budget: None,
             }),
             ..Default::default()
         }))

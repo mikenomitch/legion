@@ -372,6 +372,15 @@ async fn run_worker_with_manager(
              v2, or not Linux); registering at physical capacity"
         );
     }
+    // The suspended-instance floor (docs/suspend-and-resume.md, "Capacity
+    // for resumes"). Advertised whether or not the node enforces: it only
+    // changes what the scheduler keeps charged for suspended instances.
+    if enforcement_config.suspended_reserve() > 0.0 {
+        config_attrs.insert(
+            crate::resources::SUSPENDED_RESERVE_KEY.into(),
+            json!(enforcement_config.suspended_reserve()),
+        );
+    }
     config_attrs.insert(
         "workerAddress".into(),
         Value::String(format!("http://{}:{}", DEF_MANAGER_HOSTNAME, server_port)),
@@ -1167,12 +1176,18 @@ async fn heartbeat_tick(
         let content_report = {
             let store = task_manager.lock().expect("task manager").content_store();
             match crate::worker::content_report::advertised_set(store.as_deref()) {
-                Ok(current) => Some(
-                    CONTENT_ADVERTISER
+                Ok(current) => {
+                    let mut pending = CONTENT_ADVERTISER
                         .lock()
                         .unwrap_or_else(|p| p.into_inner())
-                        .prepare(current),
-                ),
+                        .prepare(current);
+                    // Checkpoint headroom rides every report (Track 2): the
+                    // manager shows it and keeps new memory-checkpoint
+                    // instances off a node whose budget is full.
+                    pending.report.snapshot_budget =
+                        crate::worker::content_report::snapshot_budget(store.as_deref());
+                    Some(pending)
+                }
                 Err(err) => {
                     warn!(error = ?err, "Failed to list the content store for advertisement");
                     None

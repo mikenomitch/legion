@@ -26,8 +26,8 @@
 //!   manager restart or failover): ignore it and answer `resync`, and the
 //!   worker sends a full report on its next heartbeat.
 
-use crate::structs::{ContentLocation, ContentLocationReport};
-use std::collections::HashMap;
+use crate::structs::{ContentLocation, ContentLocationReport, SnapshotBudget};
+use std::collections::{HashMap, HashSet};
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
@@ -58,6 +58,10 @@ struct IndexInner {
     nodes: HashMap<String, NodeContent>,
     /// The reverse map the scheduler reads: digest -> node -> bytes.
     by_digest: HashMap<String, HashMap<String, u64>>,
+    /// Each node's `snapshots` budget class as last reported (Track 2,
+    /// "Capacity for resumes"). Soft state like the rest: a node missing
+    /// here is treated as having room.
+    snapshot_budgets: HashMap<String, SnapshotBudget>,
     last_sweep: Option<Instant>,
 }
 
@@ -79,6 +83,7 @@ impl IndexInner {
     }
 
     fn forget(&mut self, node_id: &str) -> bool {
+        self.snapshot_budgets.remove(node_id);
         let Some(node) = self.nodes.remove(node_id) else {
             return false;
         };
@@ -234,8 +239,56 @@ impl ContentLocationIndex {
                 IngestOutcome::Applied
             }
         };
+        // The budget is a fresh reading, not a delta: take it whatever the
+        // epoch outcome, so a node needing a resync still reports headroom.
+        match report.snapshot_budget {
+            Some(budget) => {
+                inner.snapshot_budgets.insert(node_id.to_string(), budget);
+            }
+            None => {
+                inner.snapshot_budgets.remove(node_id);
+            }
+        }
         Self::sweep_locked(&mut inner, now);
         outcome
+    }
+
+    /// A node's `snapshots` budget class as it last reported it.
+    pub fn snapshot_budget(&self, node_id: &str) -> Option<SnapshotBudget> {
+        self.inner
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .snapshot_budgets
+            .get(node_id)
+            .copied()
+    }
+
+    /// Every node whose `snapshots` budget has less room than
+    /// `needed_bytes` (see [`Self::snapshot_budget_short`]), read once so the
+    /// scheduler filters a task's candidates with set lookups instead of a
+    /// lock per node. Empty, and so free to apply, when no node is short.
+    pub fn snapshot_budget_short_nodes(&self, needed_bytes: u64) -> HashSet<String> {
+        self.inner
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .snapshot_budgets
+            .iter()
+            .filter(|(_, budget)| {
+                budget.budget_bytes.saturating_sub(budget.pinned_bytes) < needed_bytes
+            })
+            .map(|(node_id, _)| node_id.clone())
+            .collect()
+    }
+
+    /// Whether a node's `snapshots` budget has less room than `needed_bytes`
+    /// for a new checkpoint: the budget minus what is pinned (pinned
+    /// content cannot be evicted to make room). A node that has not reported
+    /// a budget has room, because missing data is not evidence of a full
+    /// disk (the same rule the scheduler's disk fit uses).
+    pub fn snapshot_budget_short(&self, node_id: &str, needed_bytes: u64) -> bool {
+        self.snapshot_budget(node_id).is_some_and(|budget| {
+            budget.budget_bytes.saturating_sub(budget.pinned_bytes) < needed_bytes
+        })
     }
 
     /// Drop a node's entries (deregistered, or gone silent).
@@ -401,6 +454,7 @@ mod tests {
             full: true,
             added,
             removed: Vec::new(),
+            snapshot_budget: None,
         }
     }
 
@@ -416,6 +470,7 @@ mod tests {
             full: false,
             added,
             removed: removed.into_iter().map(str::to_string).collect(),
+            snapshot_budget: None,
         }
     }
 
@@ -446,6 +501,54 @@ mod tests {
         assert_eq!(held.get("w-1"), Some(&(2, 5 * MIB)));
         assert_eq!(held.get("w-2"), Some(&(1, 2 * MIB)));
         assert_eq!(held.len(), 2);
+    }
+
+    #[test]
+    fn the_snapshot_budget_is_taken_on_every_report_and_dropped_with_the_node() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let index = ContentLocationIndex::new();
+        let now = Instant::now();
+        let budget = SnapshotBudget {
+            budget_bytes: 10 * GIB,
+            used_bytes: 9 * GIB,
+            pinned_bytes: 8 * GIB,
+        };
+        let mut report = full(1, Vec::new());
+        report.snapshot_budget = Some(budget);
+        index.ingest("n1", &report, now);
+        assert_eq!(index.snapshot_budget("n1"), Some(budget));
+        assert!(
+            !index.snapshot_budget_short("n1", 2 * GIB),
+            "2 GiB fits in 2 GiB of room"
+        );
+        assert!(index.snapshot_budget_short("n1", 3 * GIB));
+        assert!(index.snapshot_budget_short_nodes(2 * GIB).is_empty());
+        assert_eq!(
+            index.snapshot_budget_short_nodes(3 * GIB),
+            HashSet::from(["n1".to_string()])
+        );
+        assert!(
+            !index.snapshot_budget_short("unreported", u64::MAX),
+            "no report is not a full budget"
+        );
+
+        // A delta this manager cannot apply still updates the budget.
+        let mut gap = delta(7, 8, Vec::new(), Vec::new());
+        gap.snapshot_budget = Some(SnapshotBudget {
+            pinned_bytes: 10 * GIB,
+            ..budget
+        });
+        assert_eq!(index.ingest("n1", &gap, now), IngestOutcome::Resync);
+        assert!(index.snapshot_budget_short("n1", 1));
+
+        // A report without one (the store was turned off) clears it.
+        index.ingest("n1", &full(2, Vec::new()), now);
+        assert_eq!(index.snapshot_budget("n1"), None);
+        let mut again = full(3, Vec::new());
+        again.snapshot_budget = Some(budget);
+        index.ingest("n1", &again, now);
+        assert!(index.forget_node("n1"));
+        assert_eq!(index.snapshot_budget("n1"), None);
     }
 
     #[test]

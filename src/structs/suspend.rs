@@ -4,7 +4,8 @@
 //! ```nickel
 //! suspend = {
 //!     checkpoint = "memory",        # "memory" | "disk"; default: the best the runtime can take
-//!     reserve = false,              # hold the reservation while suspended
+//!     reserve = 0.25,               # hold a share of the reservation while suspended
+//!                                   # (false | true | 0..1 | { memory = "1GiB", cpu = 100 })
 //!     onRestoreFailure = "cold",    # "cold" | "fail"
 //!     resumeTimeout = "30s",        # how long a resume waits for its node before booting cold
 //!     onResume = ["/usr/local/bin/reconnect"],  # run in the guest after every restore
@@ -182,6 +183,148 @@ impl IdleConfig {
     }
 }
 
+/// `suspend.reserve`, as written: a flag, a ratio, or fixed amounts.
+///
+/// ```nickel
+/// reserve = true,                            # 1.0: hold everything, cores included
+/// reserve = 0.25,                            # a quarter of memory and cpu MHz
+/// reserve = { memory = "1GiB", cpu = 100 },  # fixed amounts (MiB, MHz)
+/// ```
+///
+/// Deserialized by shape only, so a range or amount error surfaces from
+/// [`SuspendConfig::resolve`] with the field name and a hint, not as a
+/// generic "did not match any variant".
+#[derive(Debug, Clone, PartialEq)]
+pub enum SuspendReserveConfig {
+    Flag(bool),
+    Ratio(f64),
+    Amount(SuspendReserveAmount),
+}
+
+/// The fixed-amount form of `suspend.reserve`.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct SuspendReserveAmount {
+    /// A byte size (`"1GiB"`) or a number of MiB, like `resources.memory`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<serde_json::Value>,
+    /// MHz, like `resources.cpu`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu: Option<f64>,
+}
+
+impl Serialize for SuspendReserveConfig {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            SuspendReserveConfig::Flag(flag) => serializer.serialize_bool(*flag),
+            SuspendReserveConfig::Ratio(ratio) => serializer.serialize_f64(*ratio),
+            SuspendReserveConfig::Amount(amount) => amount.serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for SuspendReserveConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+        match serde_json::Value::deserialize(deserializer)? {
+            serde_json::Value::Bool(flag) => Ok(SuspendReserveConfig::Flag(flag)),
+            serde_json::Value::Number(number) => number
+                .as_f64()
+                .map(SuspendReserveConfig::Ratio)
+                .ok_or_else(|| D::Error::custom("suspend.reserve is not a usable number")),
+            object @ serde_json::Value::Object(_) => serde_json::from_value(object)
+                .map(SuspendReserveConfig::Amount)
+                .map_err(|err| {
+                    D::Error::custom(format!(
+                        "suspend.reserve {{ .. }} takes `memory` and `cpu` only: {err}"
+                    ))
+                }),
+            other => Err(D::Error::custom(format!(
+                "suspend.reserve must be true, false, a ratio between 0 and 1, or \
+                 {{ memory = \"1GiB\", cpu = 100 }}, got {other}"
+            ))),
+        }
+    }
+}
+
+/// [`SuspendReserveConfig`] resolved: what a suspended instance keeps
+/// charged to its node, before the node's `suspendedReserve` floor.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SuspendReserve {
+    /// A share of the reservation's memory and cpu MHz, `0.0..=1.0`. At
+    /// exactly 1.0 the whole reservation is held, exclusive `cores` and
+    /// devices included. Below it, those are released.
+    Ratio(f64),
+    /// Fixed amounts, never more than the task reserves. `cores` and devices
+    /// are released.
+    Amount { memory_mib: f64, cpu_mhz: f64 },
+}
+
+// Every value is finite (checked by `resolve`), so equality is total.
+impl Eq for SuspendReserve {}
+
+impl SuspendReserve {
+    /// `reserve = false`, the default: hold nothing.
+    pub const NONE: SuspendReserve = SuspendReserve::Ratio(0.0);
+    /// `reserve = true`: hold everything.
+    pub const FULL: SuspendReserve = SuspendReserve::Ratio(1.0);
+
+    /// Whether this holds the whole reservation.
+    pub fn is_full(&self) -> bool {
+        matches!(self, SuspendReserve::Ratio(ratio) if *ratio >= 1.0)
+    }
+}
+
+impl SuspendReserveConfig {
+    pub fn resolve(&self) -> Result<SuspendReserve, String> {
+        match self {
+            SuspendReserveConfig::Flag(true) => Ok(SuspendReserve::FULL),
+            SuspendReserveConfig::Flag(false) => Ok(SuspendReserve::NONE),
+            SuspendReserveConfig::Ratio(ratio) => {
+                if !(ratio.is_finite() && (0.0..=1.0).contains(ratio)) {
+                    return Err(format!(
+                        "suspend.reserve {ratio} is out of range: a ratio is between 0 and 1 \
+                         (0.25 holds a quarter of the instance's memory and cpu while it is \
+                         suspended)\nHint: use true to hold everything, or a fixed amount like \
+                         {{ memory = \"1GiB\", cpu = 100 }}"
+                    ));
+                }
+                Ok(SuspendReserve::Ratio(*ratio))
+            }
+            SuspendReserveConfig::Amount(amount) => {
+                let memory_mib = match amount.memory.as_ref() {
+                    None => 0.0,
+                    Some(serde_json::Value::Number(mib)) => mib.as_f64().unwrap_or(-1.0),
+                    Some(serde_json::Value::String(size)) => {
+                        crate::structs::config::parse_byte_size(size)
+                            .map_err(|err| format!("suspend.reserve.memory: {err:#}"))?
+                            as f64
+                            / (1024.0 * 1024.0)
+                    }
+                    Some(other) => {
+                        return Err(format!(
+                            "suspend.reserve.memory must be a size like \"1GiB\" or a number of \
+                             MiB, got {other}"
+                        ))
+                    }
+                };
+                let cpu_mhz = amount.cpu.unwrap_or(0.0);
+                for (field, value) in [("memory", memory_mib), ("cpu", cpu_mhz)] {
+                    if !(value.is_finite() && value >= 0.0) {
+                        return Err(format!(
+                            "suspend.reserve.{field} must be zero or more, got {value}"
+                        ));
+                    }
+                }
+                Ok(SuspendReserve::Amount {
+                    memory_mib,
+                    cpu_mhz,
+                })
+            }
+        }
+    }
+}
+
 /// What a resume does when it cannot restore its checkpoint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -211,10 +354,11 @@ pub struct SuspendConfig {
     /// every other runtime.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkpoint: Option<String>,
-    /// Keep the instance's reservation on its node while it is suspended.
-    /// Default false.
+    /// How much of the instance's reservation stays charged to its node
+    /// while it is suspended: `false` (default) or `true`, a ratio in
+    /// `0..=1`, or fixed amounts `{ memory = "1GiB", cpu = 100 }`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reserve: Option<bool>,
+    pub reserve: Option<SuspendReserveConfig>,
     /// `cold` (default) or `fail`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_restore_failure: Option<String>,
@@ -246,7 +390,7 @@ pub struct ResolvedSuspend {
     /// The declared checkpoint kind, `None` when the spec leaves it to the
     /// runtime.
     pub checkpoint: Option<SnapshotKind>,
-    pub reserve: bool,
+    pub reserve: SuspendReserve,
     pub on_restore_failure: OnRestoreFailure,
     pub resume_timeout: Duration,
     pub on_resume: Vec<String>,
@@ -261,7 +405,7 @@ impl Default for ResolvedSuspend {
     fn default() -> Self {
         ResolvedSuspend {
             checkpoint: None,
-            reserve: false,
+            reserve: SuspendReserve::NONE,
             on_restore_failure: OnRestoreFailure::Cold,
             resume_timeout: DEFAULT_RESUME_TIMEOUT,
             on_resume: Vec::new(),
@@ -277,6 +421,12 @@ impl SuspendConfig {
     /// the rest of the task live in [`validate_suspend`].
     pub fn resolve(&self) -> Result<ResolvedSuspend, String> {
         let idle = self.idle.as_ref().map(IdleConfig::resolve).transpose()?;
+        let reserve = self
+            .reserve
+            .as_ref()
+            .map(SuspendReserveConfig::resolve)
+            .transpose()?
+            .unwrap_or(SuspendReserve::NONE);
         let durability = self
             .durability
             .as_deref()
@@ -327,7 +477,7 @@ impl SuspendConfig {
         }
         Ok(ResolvedSuspend {
             checkpoint,
-            reserve: self.reserve.unwrap_or(false),
+            reserve,
             on_restore_failure,
             resume_timeout,
             on_resume,
@@ -350,6 +500,25 @@ pub fn default_checkpoint_kind(task: &crate::structs::TaskConfig) -> SnapshotKin
         } else {
             SnapshotKind::Disk
         })
+}
+
+/// The bytes a memory checkpoint of this task is expected to take, when its
+/// `suspend` block checkpoints memory: the guest's memory size
+/// (`config.memory_mib`, which submit pins for a sandbox, else
+/// `resources.memoryMax`, else `resources.memory`). An upper bound, since a
+/// checkpoint of a guest that never touched its memory can be smaller.
+/// `None` for every other task, which the snapshot budget never constrains.
+pub fn expected_memory_checkpoint_bytes(task: &crate::structs::TaskConfig) -> Option<u64> {
+    task.suspend.as_ref()?;
+    if default_checkpoint_kind(task) != SnapshotKind::Memory {
+        return None;
+    }
+    let number = |value: Option<&serde_json::Value>| value.and_then(serde_json::Value::as_f64);
+    let mib = number(task.config.get("memory_mib"))
+        .or_else(|| number(task.resources.get(crate::resources::MEMORY_MAX_KEY)))
+        .or_else(|| number(task.resources.get("memory")))
+        .unwrap_or(512.0);
+    Some((mib.max(0.0) * 1024.0 * 1024.0) as u64)
 }
 
 /// The error for a task that sets `suspend` without being a keyed stateful
@@ -394,6 +563,13 @@ pub fn validate_suspend(task: &crate::structs::TaskConfig) -> Result<(), String>
     let resolved = suspend
         .resolve()
         .map_err(|err| format!("task {:?}: {err}", task.name))?;
+    if let SuspendReserve::Amount {
+        memory_mib,
+        cpu_mhz,
+    } = resolved.reserve
+    {
+        validate_reserve_amount(task, memory_mib, cpu_mhz)?;
+    }
     if resolved.durability == SnapshotDurability::Store {
         crate::structs::snapshot::validate_store_durability_storage(task, "suspend.durability")?;
     }
@@ -423,6 +599,61 @@ pub fn validate_suspend(task: &crate::structs::TaskConfig) -> Result<(), String>
     Ok(())
 }
 
+/// A fixed `suspend.reserve` amount must not exceed what the task reserves,
+/// and it can only hold a dimension the task declares: the manager's
+/// `taskResourceDefaults` are not known at submit, so an amount checked
+/// against them could pass here and mean something else on the node.
+fn validate_reserve_amount(
+    task: &crate::structs::TaskConfig,
+    memory_mib: f64,
+    cpu_mhz: f64,
+) -> Result<(), String> {
+    let declared = |names: &[&str]| {
+        names.iter().find_map(|name| {
+            task.resources
+                .get(*name)
+                .and_then(serde_json::Value::as_f64)
+        })
+    };
+    for (field, held, names, unit) in [
+        ("memory", memory_mib, &["memory"][..], "MiB"),
+        ("cpu", cpu_mhz, &["cpu", "cpus"][..], "MHz"),
+    ] {
+        if held <= 0.0 {
+            continue;
+        }
+        match declared(names) {
+            Some(reserved) if held > reserved => {
+                return Err(format!(
+                    "task {:?}: suspend.reserve.{field} ({held:.0} {unit}) exceeds the task's \
+                     resources.{field} ({reserved:.0} {unit}); a suspended instance cannot hold \
+                     more than it reserves while running\nHint: lower suspend.reserve.{field}, \
+                     or use reserve = true to hold the whole reservation",
+                    task.name
+                ));
+            }
+            Some(_) => {}
+            None if field == "cpu" && task.resources.get("cores").is_some() => {
+                return Err(format!(
+                    "task {:?} reserves exclusive cores, not cpu MHz, so suspend.reserve.cpu has \
+                     nothing to hold\nHint: remove suspend.reserve.cpu (cores are released while \
+                     suspended unless reserve = true)",
+                    task.name
+                ));
+            }
+            None => {
+                return Err(format!(
+                    "task {:?} sets suspend.reserve.{field} but not resources.{field}, so the \
+                     amount cannot be checked against what the task reserves\nHint: set \
+                     resources.{field} explicitly, or use a ratio like reserve = 0.25",
+                    task.name
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Why an instance is (or was last) suspended: SuspendInstance.
 pub const SUSPEND_REASON_MANUAL: &str = "manual";
 /// The task's idle policy (`suspend.idle`) suspended it.
@@ -430,6 +661,9 @@ pub const SUSPEND_REASON_IDLE: &str = "idle";
 /// The node's memory pressure response took the `suspend` step
 /// (`suspend.onPressure`).
 pub const SUSPEND_REASON_PRESSURE: &str = "pressure";
+/// The manager suspended it to make room for a resume pinned to its node
+/// (manager `suspend.makeRoom`).
+pub const SUSPEND_REASON_MAKE_ROOM: &str = "make_room";
 
 /// `instance.pending_op` while a suspend capture is outstanding.
 pub const PENDING_SUSPEND: &str = "suspend";
@@ -444,8 +678,9 @@ pub struct InstanceSuspendState {
     /// The suspend snapshot a resume restores from. Set while `suspended`
     /// and while a resume is in flight.
     pub checkpoint_id: Option<String>,
-    /// `manual` (SuspendInstance), `idle` (the idle sweep), or `pressure`
-    /// (the node's `suspend` pressure step). Written when a suspend starts,
+    /// `manual` (SuspendInstance), `idle` (the idle sweep), `pressure`
+    /// (the node's `suspend` pressure step), or `make_room` (a resume
+    /// needed its node's capacity). Written when a suspend starts,
     /// so while one is in flight it names that suspend's reason.
     pub suspend_reason: Option<String>,
     /// Unix seconds of the last successful suspend.
@@ -678,6 +913,152 @@ mod tests {
             let err = validate_suspend(&task("sandbox", true, value)).unwrap_err();
             assert!(err.contains(needle), "{err}");
         }
+    }
+
+    fn with_resources(
+        mut task: crate::structs::TaskConfig,
+        resources: serde_json::Value,
+    ) -> crate::structs::TaskConfig {
+        task.resources = resources;
+        task
+    }
+
+    #[test]
+    fn reserve_accepts_a_flag_a_ratio_or_an_amount() {
+        let resolve = |value: serde_json::Value| {
+            serde_json::from_value::<SuspendConfig>(serde_json::json!({ "reserve": value }))
+                .map_err(|err| err.to_string())
+                .and_then(|config| config.resolve())
+                .map(|resolved| resolved.reserve)
+        };
+        assert_eq!(resolve(serde_json::json!(true)), Ok(SuspendReserve::FULL));
+        assert_eq!(resolve(serde_json::json!(false)), Ok(SuspendReserve::NONE));
+        assert_eq!(resolve(serde_json::json!(1)), Ok(SuspendReserve::FULL));
+        assert_eq!(
+            resolve(serde_json::json!(0.25)),
+            Ok(SuspendReserve::Ratio(0.25))
+        );
+        assert_eq!(
+            resolve(serde_json::json!({ "memory": "1GiB", "cpu": 100 })),
+            Ok(SuspendReserve::Amount {
+                memory_mib: 1024.0,
+                cpu_mhz: 100.0
+            })
+        );
+        assert_eq!(
+            resolve(serde_json::json!({ "memory": 512 })),
+            Ok(SuspendReserve::Amount {
+                memory_mib: 512.0,
+                cpu_mhz: 0.0
+            })
+        );
+        assert!(SuspendReserve::FULL.is_full() && !SuspendReserve::Ratio(0.99).is_full());
+        assert_eq!(
+            SuspendConfig::default().resolve().unwrap().reserve,
+            SuspendReserve::NONE
+        );
+
+        // Round-trips through the stored task config in every form.
+        for value in [
+            serde_json::json!(true),
+            serde_json::json!(0.5),
+            serde_json::json!({ "memory": "1GiB", "cpu": 100.0 }),
+        ] {
+            let config: SuspendConfig =
+                serde_json::from_value(serde_json::json!({ "reserve": value.clone() })).unwrap();
+            assert_eq!(serde_json::to_value(&config).unwrap()["reserve"], value);
+        }
+    }
+
+    #[test]
+    fn a_bad_reserve_fails_loudly_with_the_field_and_a_hint() {
+        for (value, needle) in [
+            (serde_json::json!(1.5), "out of range"),
+            (serde_json::json!(-0.1), "out of range"),
+            (
+                serde_json::json!({ "memory": "lots" }),
+                "suspend.reserve.memory",
+            ),
+            (serde_json::json!({ "cpu": -5 }), "suspend.reserve.cpu"),
+        ] {
+            let err = validate_suspend(&task(
+                "sandbox",
+                true,
+                serde_json::json!({ "reserve": value }),
+            ))
+            .unwrap_err();
+            assert!(err.contains(needle), "{err}");
+        }
+        let err = serde_json::from_value::<SuspendConfig>(
+            serde_json::json!({ "reserve": { "disk": 10 } }),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("`memory` and `cpu` only"), "{err}");
+        let err = serde_json::from_value::<SuspendConfig>(serde_json::json!({ "reserve": "half" }))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("a ratio between 0 and 1"), "{err}");
+    }
+
+    #[test]
+    fn a_reserve_amount_must_fit_inside_the_tasks_reservation() {
+        let amount = serde_json::json!({ "reserve": { "memory": "1GiB", "cpu": 100 } });
+        let fits = with_resources(
+            task("sandbox", true, amount.clone()),
+            serde_json::json!({ "memory": 2048, "cpu": 500 }),
+        );
+        assert!(validate_suspend(&fits).is_ok());
+
+        let too_much = with_resources(
+            task("sandbox", true, amount.clone()),
+            serde_json::json!({ "memory": 512, "cpu": 500 }),
+        );
+        let err = validate_suspend(&too_much).unwrap_err();
+        assert!(
+            err.contains("exceeds the task's resources.memory") && err.contains("Hint:"),
+            "{err}"
+        );
+
+        let undeclared = with_resources(
+            task("sandbox", true, amount.clone()),
+            serde_json::json!({ "memory": 2048 }),
+        );
+        let err = validate_suspend(&undeclared).unwrap_err();
+        assert!(err.contains("not resources.cpu"), "{err}");
+
+        let cores = with_resources(
+            task("sandbox", true, amount),
+            serde_json::json!({ "memory": 2048, "cores": 2 }),
+        );
+        let err = validate_suspend(&cores).unwrap_err();
+        assert!(err.contains("exclusive cores"), "{err}");
+    }
+
+    #[test]
+    fn the_expected_checkpoint_is_the_guest_memory_of_a_memory_suspend() {
+        let mut sandbox = task("sandbox", true, serde_json::json!({}));
+        sandbox.config["memory_mib"] = serde_json::json!(1024);
+        assert_eq!(
+            expected_memory_checkpoint_bytes(&sandbox),
+            Some(1024 * 1024 * 1024)
+        );
+        let sandbox = with_resources(
+            task("sandbox", true, serde_json::json!({})),
+            serde_json::json!({ "memory": 256, "memoryMax": 2048 }),
+        );
+        assert_eq!(
+            expected_memory_checkpoint_bytes(&sandbox),
+            Some(2048 * 1024 * 1024)
+        );
+        assert_eq!(
+            expected_memory_checkpoint_bytes(&task("exec", true, serde_json::json!({}))),
+            None,
+            "a disk suspend stores nothing in the snapshots budget"
+        );
+        let mut no_suspend = task("sandbox", true, serde_json::json!({}));
+        no_suspend.suspend = None;
+        assert_eq!(expected_memory_checkpoint_bytes(&no_suspend), None);
     }
 
     #[test]

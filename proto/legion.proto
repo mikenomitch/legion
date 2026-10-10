@@ -3274,6 +3274,23 @@ message InstanceInfo {
   // instance's lifetime so fork lineage survives the fork checkpoint being
   // reclaimed. Unset for instances not created by a fork.
   optional string forked_from = 102;
+
+  // Track 2: capacity for resumes (docs/suspend-and-resume.md, "Capacity
+  // for resumes"). Field numbers start at 200 so parallel work on this
+  // message cannot collide.
+
+  // MiB of memory a suspended instance keeps charged to its node, so a
+  // resume finds room: `max(suspend.reserve, the node's
+  // resourceEnforcement.suspendedReserve)` of its reservation, applied when
+  // the suspend landed. Unset when the instance holds nothing (the default)
+  // or is not suspended. With `reserve = true` this is the whole
+  // reservation.
+  optional double held_memory_mib = 200;
+
+  // CPU (MHz) the suspended instance keeps charged to its node, the same
+  // way as `held_memory_mib`. Exclusive cores are held only with a full
+  // hold, and are not counted here.
+  optional double held_cpu_mhz = 201;
 }
 
 // Request payload for ListInstances.
@@ -4416,6 +4433,12 @@ message ContentLocationReport {
   // Digests (`sha256:<hex>`) removed since `base_epoch`: evicted, expired,
   // or dropped as corrupt.
   repeated string removed = 5;
+
+  // Track 2: the store's `snapshots` budget class, sent on every report
+  // whatever its epoch outcome, so the manager can show checkpoint headroom
+  // and keep new memory-checkpoint instances off a node whose budget is
+  // full. Numbered from 200 so parallel work cannot collide.
+  optional SnapshotBudget snapshot_budget = 200;
 }
 
 // Content locality. One piece of content a node holds.
@@ -5161,6 +5184,68 @@ message GetNodeUsageReply {
   // One entry per allocation the scheduler has placed on the node, ordered
   // by allocation id.
   repeated NodeAllocationUsage allocations = 8;
+
+  // Track 2: capacity for resumes. Suspended instances whose checkpoint is
+  // on this node, what they keep charged, and the node's `snapshots`
+  // content budget their checkpoints fill. Field numbers start at 200 so
+  // parallel work on this message cannot collide.
+  SuspendedCapacity suspended = 200;
+}
+
+// Track 2. Suspended instances on one node, as `legion node usage` prints
+// them: "suspended: 3 instances, 768 MiB held". A suspended instance counts
+// here when its checkpoint is stored on this node, whether or not it holds
+// any capacity (see docs/suspend-and-resume.md, "Capacity for resumes").
+message SuspendedCapacity {
+  // Suspended instances whose checkpoint is on this node.
+  uint32 instances = 1;
+
+  // Of those, how many keep a charge on the node (a held allocation row,
+  // from `suspend.reserve` or the node's `suspendedReserve` floor). Their
+  // rows also appear in `GetNodeUsageReply.allocations` with
+  // `suspended = true`, and their held amounts are already part of the
+  // reply's `memory.reserved` and `cpu.reserved`.
+  uint32 holding = 2;
+
+  // Memory (MiB) the holding instances keep charged.
+  double held_memory_mib = 3;
+
+  // CPU (MHz) the holding instances keep charged.
+  double held_cpu_mhz = 4;
+
+  // Bytes of those instances' checkpoints, from the manager's snapshot
+  // records. Memory checkpoints are stored in the node's content store
+  // under the `snapshots` budget. Disk checkpoints of node-local volumes
+  // are retained in place and report 0.
+  uint64 checkpoint_bytes = 5;
+
+  // The node's `resourceEnforcement.suspendedReserve` floor as it
+  // registered, 0 when unset.
+  double suspended_reserve = 6;
+
+  // The node's `snapshots` content budget as its worker last reported it.
+  // Unset when the worker has no content store, predates the report, or no
+  // heartbeat has reached this manager since it started.
+  optional SnapshotBudget snapshot_budget = 7;
+}
+
+// Track 2. A node content store's `snapshots` budget class
+// (`content.budgets.snapshots`), which holds memory checkpoints. Workers
+// report it on every heartbeat with a content report.
+message SnapshotBudget {
+  // The configured budget in bytes.
+  uint64 budget_bytes = 1;
+
+  // Bytes the class holds now.
+  uint64 used_bytes = 2;
+
+  // Bytes pinned by a live owner (a suspended instance's or a snapshot's
+  // checkpoint). Pinned content cannot be evicted, so the room a new
+  // checkpoint can use is `budget_bytes - pinned_bytes`. When that is
+  // smaller than a task's expected checkpoint, the scheduler does not place
+  // new instances of that task (a memory-checkpoint `suspend` block) on the
+  // node.
+  uint64 pinned_bytes = 3;
 }
 
 // One resource on one node. Memory is in MiB and bytes, CPU in MHz, matching
@@ -5264,6 +5349,12 @@ message NodeAllocationUsage {
   // The steps that would act on it, in order, copied from
   // `usage.pressure_steps`.
   repeated string pressure_steps = 11;
+
+  // Track 2: true when this row is a suspended instance's held charge
+  // (status `suspended`), not running work. Its `reserved_*` figures are
+  // the held share, and it has no `usage`. Numbered from 200 so parallel
+  // work on this message cannot collide.
+  bool suspended = 200;
 }
 
 // Track 3 (suspend/resume UI) -------------------------------------------------

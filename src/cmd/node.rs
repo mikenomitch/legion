@@ -806,6 +806,7 @@ fn render_node_usage(reply: &GetNodeUsageReply, now_unix: i64) -> String {
     ];
     out.push_str(&Table::new(rows).with(Style::blank()).to_string());
     out.push('\n');
+    out.push_str(&render_suspended_capacity(reply));
 
     #[derive(Tabled)]
     struct AllocationRow {
@@ -835,10 +836,16 @@ fn render_node_usage(reply: &GetNodeUsageReply, now_unix: i64) -> String {
         .iter()
         .map(|row| {
             let (used, cpu, idle) = usage_display::columns(row.usage.as_ref(), now_unix);
+            let instance = row.instance_id.clone().unwrap_or_else(|| "-".into());
             AllocationRow {
                 allocation: row.allocation_id,
                 job: row.job_id.clone(),
-                instance: row.instance_id.clone().unwrap_or_else(|| "-".into()),
+                // A held charge of a suspended instance, not running work.
+                instance: if row.suspended {
+                    format!("{instance} (suspended, held)")
+                } else {
+                    instance
+                },
                 reserved: if row.memory_max_mib > 0.0 {
                     format!("{:.0}/{:.0}", row.reserved_memory_mib, row.memory_max_mib)
                 } else {
@@ -859,6 +866,58 @@ fn render_node_usage(reply: &GetNodeUsageReply, now_unix: i64) -> String {
     out.push_str(&Table::new(rows).with(Style::blank()).to_string());
     out.push('\n');
     out.push_str(&render_pressure_order(reply));
+    out
+}
+
+/// The suspended-instance summary under the resource table (docs/
+/// suspend-and-resume.md, "Capacity for resumes"): how many suspended
+/// instances keep their checkpoint here, what they hold of `reserved`, and
+/// the `snapshots` budget their checkpoints fill. Empty when the node has
+/// none and no budget report.
+fn render_suspended_capacity(reply: &GetNodeUsageReply) -> String {
+    use crate::worker::pressure::human_bytes;
+    let Some(suspended) = reply.suspended.as_ref() else {
+        return String::new();
+    };
+    let mut out = String::new();
+    if suspended.instances > 0 || suspended.holding > 0 {
+        let plural = if suspended.instances == 1 { "" } else { "s" };
+        let mut line = format!(
+            "\nsuspended: {} instance{plural}, {:.0} MiB held",
+            suspended.instances, suspended.held_memory_mib
+        );
+        if suspended.held_cpu_mhz > 0.0 {
+            line.push_str(&format!(" and {:.0} MHz", suspended.held_cpu_mhz));
+        }
+        if suspended.holding != suspended.instances {
+            line.push_str(&format!(" ({} holding)", suspended.holding));
+        }
+        if suspended.suspended_reserve > 0.0 {
+            line.push_str(&format!(", node floor {}", suspended.suspended_reserve));
+        }
+        out.push_str(&line);
+        out.push('\n');
+    }
+    if let Some(budget) = suspended.snapshot_budget.as_ref() {
+        let room = budget.budget_bytes.saturating_sub(budget.pinned_bytes);
+        out.push_str(&format!(
+            "checkpoints: {} suspended here, snapshots budget {} pinned of {} ({} free{})\n",
+            human_bytes(suspended.checkpoint_bytes),
+            human_bytes(budget.pinned_bytes),
+            human_bytes(budget.budget_bytes),
+            human_bytes(room),
+            if room == 0 {
+                ", FULL: no new memory-checkpoint instances placed here"
+            } else {
+                ""
+            },
+        ));
+    } else if suspended.checkpoint_bytes > 0 {
+        out.push_str(&format!(
+            "checkpoints: {} suspended here (no snapshots budget reported)\n",
+            human_bytes(suspended.checkpoint_bytes)
+        ));
+    }
     out
 }
 
@@ -1295,6 +1354,7 @@ mod tests {
                     band: "normal".into(),
                     pressure_rank: 1,
                     pressure_steps: vec!["reclaim".into(), "evict-bursting".into()],
+                    suspended: false,
                 },
                 NodeAllocationUsage {
                     allocation_id: 9,
@@ -1303,6 +1363,7 @@ mod tests {
                     ..Default::default()
                 },
             ],
+            suspended: None,
         };
         let out = render_node_usage(&reply, 1_000);
         assert!(out.contains("usage sampled 4s ago"), "{out}");
@@ -1339,5 +1400,69 @@ mod tests {
         let out = render_node_usage(&unreported, 1_000);
         assert!(out.contains("no usage reported"), "{out}");
         assert!(!out.contains("UNDER PRESSURE ("), "{out}");
+    }
+
+    #[test]
+    fn node_usage_renders_suspended_capacity_and_the_budget() {
+        use crate::structs::{NodeAllocationUsage, SnapshotBudget, SuspendedCapacity};
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let reply = GetNodeUsageReply {
+            node_id: "w-03".into(),
+            status: "ready".into(),
+            allocations: vec![NodeAllocationUsage {
+                allocation_id: 4,
+                job_id: "agents".into(),
+                instance_id: Some("user-17".into()),
+                reserved_memory_mib: 512.0,
+                suspended: true,
+                ..Default::default()
+            }],
+            suspended: Some(SuspendedCapacity {
+                instances: 3,
+                holding: 1,
+                held_memory_mib: 512.0,
+                held_cpu_mhz: 250.0,
+                checkpoint_bytes: 6 * GIB,
+                suspended_reserve: 0.25,
+                snapshot_budget: Some(SnapshotBudget {
+                    budget_bytes: 50 * GIB,
+                    used_bytes: 12 * GIB,
+                    pinned_bytes: 12 * GIB,
+                }),
+            }),
+            ..Default::default()
+        };
+        let out = render_node_usage(&reply, 1_000);
+        assert!(
+            out.contains(
+                "suspended: 3 instances, 512 MiB held and 250 MHz (1 holding), node floor 0.25"
+            ),
+            "{out}"
+        );
+        assert!(
+            out.contains("checkpoints: 6 GiB suspended here, snapshots budget 12 GiB pinned of 50 GiB (38 GiB free)"),
+            "{out}"
+        );
+        assert!(out.contains("user-17 (suspended, held)"), "{out}");
+
+        let mut full = reply.clone();
+        if let Some(budget) = full
+            .suspended
+            .as_mut()
+            .and_then(|suspended| suspended.snapshot_budget.as_mut())
+        {
+            budget.pinned_bytes = budget.budget_bytes;
+        }
+        let out = render_node_usage(&full, 1_000);
+        assert!(
+            out.contains("FULL: no new memory-checkpoint instances"),
+            "{out}"
+        );
+
+        let none = GetNodeUsageReply {
+            suspended: Some(SuspendedCapacity::default()),
+            ..Default::default()
+        };
+        assert!(!render_node_usage(&none, 1_000).contains("suspended:"));
     }
 }

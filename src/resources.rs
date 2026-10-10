@@ -172,6 +172,95 @@ pub(crate) fn validate_memory_max(resources: &Map<String, Value>) -> R<()> {
     Ok(())
 }
 
+/// What a suspended instance keeps charged to its node (docs/
+/// suspend-and-resume.md, "Capacity for resumes"). The charge rides the
+/// allocation row the suspend would otherwise delete, so the scheduler's fit
+/// check, the read model, and the plan-apply recheck all count it with no
+/// new code path.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SuspendedHold {
+    /// Nothing is held: the allocation row is deleted.
+    Nothing,
+    /// The whole reservation, exclusive cores and devices included: the row
+    /// stays exactly as it is.
+    Full,
+    /// A reduced charge: the row stays with these resources. Only `memory`
+    /// and `cpu` (MHz) are non-zero. Every other dimension (cores, devices,
+    /// custom resources, the `allocations` slot) is written as zero or empty,
+    /// explicitly, so `taskResourceDefaults` cannot fill it back in when the
+    /// row is normalized.
+    Partial(Value),
+}
+
+/// Config key a worker registers its `resourceEnforcement.suspendedReserve`
+/// floor under.
+pub const SUSPENDED_RESERVE_KEY: &str = "suspendedReserve";
+
+/// A node's `suspendedReserve` floor from its registration attributes,
+/// `0.0..=1.0`. Missing or malformed reads as 0.0, today's behavior.
+pub fn node_suspended_reserve(config_attrs: &Value) -> f64 {
+    config_attrs
+        .get(SUSPENDED_RESERVE_KEY)
+        .and_then(Value::as_f64)
+        .filter(|floor| floor.is_finite())
+        .map(|floor| floor.clamp(0.0, 1.0))
+        .unwrap_or(0.0)
+}
+
+impl ResourcePolicy {
+    /// The charge a suspended instance leaves on its node: `max(job reserve,
+    /// node floor)` per dimension. A ratio (and the floor) scale `memory` and
+    /// `cpu` MHz. A fixed amount is capped at what the task reserves. Exclusive
+    /// `cores` and devices are held only when either side is 1.0.
+    pub fn suspended_hold(
+        &self,
+        resources: &Value,
+        reserve: crate::structs::suspend::SuspendReserve,
+        node_floor: f64,
+    ) -> R<SuspendedHold> {
+        use crate::structs::suspend::SuspendReserve;
+        let floor = if node_floor.is_finite() {
+            node_floor.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        if reserve.is_full() || floor >= 1.0 {
+            return Ok(SuspendedHold::Full);
+        }
+        let normalized = self.normalize_task_resources(resources, false)?;
+        let map = normalized
+            .as_object()
+            .context("normalized resources must be an object")?;
+        let amount = |name: &str| map.get(name).and_then(Value::as_f64).unwrap_or(0.0);
+        let (memory, cpu) = (amount("memory"), amount("cpu"));
+        let (job_memory, job_cpu) = match reserve {
+            SuspendReserve::Ratio(ratio) => (memory * ratio, cpu * ratio),
+            SuspendReserve::Amount {
+                memory_mib,
+                cpu_mhz,
+            } => (memory_mib.min(memory), cpu_mhz.min(cpu)),
+        };
+        let held_memory = job_memory.max(memory * floor);
+        let held_cpu = job_cpu.max(cpu * floor);
+        if held_memory <= 0.0 && held_cpu <= 0.0 {
+            return Ok(SuspendedHold::Nothing);
+        }
+        let mut held = Map::new();
+        for (key, value) in map {
+            let value = match key.as_str() {
+                "memory" => json!(held_memory),
+                "cpu" => json!(held_cpu),
+                MEMORY_MAX_KEY => continue,
+                _ if value.is_number() => json!(0),
+                // Device lists and other item resources: release them all.
+                _ => json!([]),
+            };
+            held.insert(key.clone(), value);
+        }
+        Ok(SuspendedHold::Partial(Value::Object(held)))
+    }
+}
+
 fn default_task_resource_defaults() -> Map<String, Value> {
     let mut defaults = Map::new();
     defaults.insert("memory".to_string(), json!(DEFAULT_TASK_MEMORY_MIB));
@@ -230,6 +319,198 @@ fn parse_required_custom_resources(resources: Option<&Value>) -> R<HashSet<Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod suspended_hold_test {
+        use super::*;
+        use crate::structs::suspend::SuspendReserve;
+
+        fn policy() -> ResourcePolicy {
+            ResourcePolicy::from_manager_config(&ManagerConfigFull::default()).expect("policy")
+        }
+
+        fn partial(hold: SuspendedHold) -> Map<String, Value> {
+            match hold {
+                SuspendedHold::Partial(Value::Object(map)) => map,
+                other => panic!("expected a partial hold, got {other:?}"),
+            }
+        }
+
+        /// The held row through the scheduler's own normalization: what the
+        /// fit check will actually subtract.
+        fn charged(policy: &ResourcePolicy, map: Map<String, Value>) -> ResourceRequest {
+            policy
+                .usage_request(&Value::Object(map))
+                .expect("held row parses")
+        }
+
+        #[test]
+        fn a_ratio_scales_memory_and_cpu_and_releases_the_rest() {
+            let policy = policy();
+            let resources =
+                json!({ "memory": 2048, "memoryMax": 4096, "cpu": 1000, "gpu": ["g0"] });
+            let held = partial(
+                policy
+                    .suspended_hold(&resources, SuspendReserve::Ratio(0.25), 0.0)
+                    .unwrap(),
+            );
+            assert_eq!(held["memory"], json!(512.0));
+            assert_eq!(held["cpu"], json!(250.0));
+            assert_eq!(held["gpu"], json!([]), "devices are released below 1.0");
+            assert_eq!(held["allocations"], json!(0), "the slot is released");
+            assert!(!held.contains_key(MEMORY_MAX_KEY));
+            let request = charged(&policy, held);
+            assert_eq!(request.amount("memory"), Some(512.0));
+            assert_eq!(request.amount("cpu"), Some(250.0));
+            assert_eq!(request.amount("allocations"), Some(0.0));
+        }
+
+        #[test]
+        fn cores_are_held_only_at_one() {
+            let policy = policy();
+            let resources = json!({ "memory": 1024, "cores": 2 });
+            let held = partial(
+                policy
+                    .suspended_hold(&resources, SuspendReserve::Ratio(0.5), 0.0)
+                    .unwrap(),
+            );
+            assert_eq!(held["cores"], json!(0));
+            assert!(
+                !held.contains_key("cpu"),
+                "a cores task holds no cpu MHz, and the default must not return"
+            );
+            let request = charged(&policy, held);
+            assert_eq!(request.amount("cpu"), None);
+            assert_eq!(request.amount("cores"), Some(0.0));
+            assert_eq!(
+                policy
+                    .suspended_hold(&resources, SuspendReserve::FULL, 0.0)
+                    .unwrap(),
+                SuspendedHold::Full
+            );
+        }
+
+        #[test]
+        fn an_amount_is_capped_at_the_reservation() {
+            let policy = policy();
+            let resources = json!({ "memory": 2048, "cpu": 1000 });
+            let held = partial(
+                policy
+                    .suspended_hold(
+                        &resources,
+                        SuspendReserve::Amount {
+                            memory_mib: 1024.0,
+                            cpu_mhz: 5000.0,
+                        },
+                        0.0,
+                    )
+                    .unwrap(),
+            );
+            assert_eq!(held["memory"], json!(1024.0));
+            assert_eq!(held["cpu"], json!(1000.0));
+        }
+
+        #[test]
+        fn the_node_floor_wins_where_it_is_larger() {
+            let policy = policy();
+            let resources = json!({ "memory": 2048, "cpu": 1000 });
+            // reserve = false on a node with a 0.25 floor still holds a quarter.
+            let held = partial(
+                policy
+                    .suspended_hold(&resources, SuspendReserve::NONE, 0.25)
+                    .unwrap(),
+            );
+            assert_eq!(held["memory"], json!(512.0));
+            assert_eq!(held["cpu"], json!(250.0));
+            // Per dimension: the amount's memory beats the floor, the floor's
+            // cpu beats the amount.
+            let held = partial(
+                policy
+                    .suspended_hold(
+                        &resources,
+                        SuspendReserve::Amount {
+                            memory_mib: 1024.0,
+                            cpu_mhz: 0.0,
+                        },
+                        0.25,
+                    )
+                    .unwrap(),
+            );
+            assert_eq!(held["memory"], json!(1024.0));
+            assert_eq!(held["cpu"], json!(250.0));
+            assert_eq!(
+                policy
+                    .suspended_hold(&resources, SuspendReserve::NONE, 1.0)
+                    .unwrap(),
+                SuspendedHold::Full,
+                "a floor of 1.0 holds everything"
+            );
+            assert_eq!(
+                policy
+                    .suspended_hold(&resources, SuspendReserve::NONE, 0.0)
+                    .unwrap(),
+                SuspendedHold::Nothing
+            );
+        }
+
+        #[test]
+        fn the_floor_reads_from_registration_and_clamps() {
+            assert_eq!(node_suspended_reserve(&json!({})), 0.0);
+            assert_eq!(
+                node_suspended_reserve(&json!({ "suspendedReserve": 0.25 })),
+                0.25
+            );
+            assert_eq!(
+                node_suspended_reserve(&json!({ "suspendedReserve": 3 })),
+                1.0
+            );
+            assert_eq!(
+                node_suspended_reserve(&json!({ "suspendedReserve": "x" })),
+                0.0
+            );
+        }
+
+        /// The fit check, end to end on a pool: a node full of running work
+        /// with one instance suspended at 0.25 has three quarters of that
+        /// instance's reservation free again.
+        #[test]
+        fn a_partial_hold_frees_the_rest_in_the_pool() {
+            let policy = policy();
+            let mut pool = ResourcePool {
+                values: HashMap::from([
+                    ("memory".to_string(), ResourceValue::Amount(4096.0)),
+                    ("cpu".to_string(), ResourceValue::Amount(4000.0)),
+                    ("allocations".to_string(), ResourceValue::Amount(2.0)),
+                ]),
+            };
+            let running = policy
+                .usage_request(&json!({ "memory": 2048, "cpu": 2000 }))
+                .unwrap();
+            let held = partial(
+                policy
+                    .suspended_hold(
+                        &json!({ "memory": 2048, "cpu": 2000 }),
+                        SuspendReserve::Ratio(0.25),
+                        0.0,
+                    )
+                    .unwrap(),
+            );
+            pool.consume(&running);
+            pool.consume(&charged(&policy, held));
+            assert_eq!(pool.amount("memory"), Some(4096.0 - 2048.0 - 512.0));
+            assert_eq!(pool.amount("allocations"), Some(1.0));
+            let resume = policy
+                .usage_request(&json!({ "memory": 2048, "cpu": 2000 }))
+                .unwrap();
+            assert!(
+                !pool.can_fit(&resume),
+                "1536 MiB free: the resume needs 2048"
+            );
+            let small = policy
+                .usage_request(&json!({ "memory": 1536, "cpu": 1500 }))
+                .unwrap();
+            assert!(pool.can_fit(&small));
+        }
+    }
 
     #[test]
     fn resource_defaults_apply_with_aliases() -> R<()> {

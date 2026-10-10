@@ -155,6 +155,11 @@ pub struct SuspendManagerConfig {
     /// workers report every 10s, so going below that buys nothing.
     #[serde(default)]
     pub idle_sweep: Option<String>,
+    /// When a resume waits on its checkpoint's node because the node is
+    /// full, suspend the most idle suspendable instances there until it fits
+    /// (docs/suspend-and-resume.md, "Capacity for resumes"). Default true.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub make_room: Option<bool>,
 }
 
 /// Resolved [`SuspendManagerConfig`].
@@ -162,12 +167,19 @@ pub struct SuspendManagerConfig {
 #[serde(rename_all = "camelCase")]
 pub struct SuspendManagerConfigFull {
     pub idle_sweep: String,
+    #[serde(default = "default_make_room")]
+    pub make_room: bool,
+}
+
+fn default_make_room() -> bool {
+    true
 }
 
 impl Default for SuspendManagerConfigFull {
     fn default() -> Self {
         Self {
             idle_sweep: DEF_IDLE_SWEEP.to_string(),
+            make_room: true,
         }
     }
 }
@@ -198,6 +210,7 @@ impl SuspendManagerConfig {
                 .idle_sweep
                 .clone()
                 .unwrap_or_else(|| DEF_IDLE_SWEEP.to_string()),
+            make_room: self.make_room.unwrap_or(true),
         }
     }
 }
@@ -1868,6 +1881,7 @@ impl From<ManagerConfigFull> for ManagerConfig {
             encryption: Some(val.encryption.into()),
             suspend: Some(SuspendManagerConfig {
                 idle_sweep: Some(val.suspend.idle_sweep),
+                make_room: Some(val.suspend.make_room),
             }),
         }
     }
@@ -2292,9 +2306,23 @@ pub struct WorkerResourceEnforcementConfig {
     /// defaults that scale with the node, so this block is optional.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_pressure: Option<WorkerMemoryPressureConfig>,
+    /// The share of a suspended instance's reservation this node keeps
+    /// charged, whatever its job's `suspend.reserve` says (docs/
+    /// suspend-and-resume.md, "Capacity for resumes"). A ratio `0..=1`,
+    /// default 0.0. Each suspended instance is charged `max(job reserve,
+    /// this)`. It rides registration as `config_attrs.suspendedReserve`.
+    /// Unlike the other fields here it needs no cgroups: it changes only
+    /// what the scheduler counts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suspended_reserve: Option<f64>,
 }
 
 impl WorkerResourceEnforcementConfig {
+    /// The `suspendedReserve` floor, 0.0 when unset.
+    pub fn suspended_reserve(&self) -> f64 {
+        self.suspended_reserve.unwrap_or(0.0)
+    }
+
     /// The memory oversubscription ratio, 1.0 when unset.
     pub fn memory_ratio(&self) -> f64 {
         self.oversubscribe
@@ -2342,6 +2370,15 @@ impl WorkerResourceEnforcementConfig {
         }
         if let Some(pressure) = self.memory_pressure.as_ref() {
             pressure.validate()?;
+        }
+        if let Some(floor) = self.suspended_reserve {
+            if !(floor.is_finite() && (0.0..=1.0).contains(&floor)) {
+                bail!(
+                    "resourceEnforcement.suspendedReserve must be a ratio between 0 and 1, got \
+                     {floor}. 0.25 keeps a quarter of each suspended instance's memory and cpu \
+                     reserved on this node"
+                );
+            }
         }
         Ok(())
     }
@@ -2476,6 +2513,7 @@ impl Default for WorkerResourceEnforcementConfig {
             sandbox: None,
             oversubscribe: None,
             memory_pressure: None,
+            suspended_reserve: None,
         }
     }
 }
@@ -2732,10 +2770,25 @@ mod tests {
                 serde_json::json!({ "enabled": true, "memoryPressure": { "freeBelow": "lots" } }),
                 "freeBelow",
             ),
+            (
+                serde_json::json!({ "suspendedReserve": 1.5 }),
+                "suspendedReserve must be a ratio between 0 and 1",
+            ),
+            (
+                serde_json::json!({ "suspendedReserve": -0.1 }),
+                "suspendedReserve",
+            ),
         ] {
             let err = parse(bad).validate().expect_err("invalid");
             assert!(format!("{err:#}").contains(needle), "{err:#}");
         }
+        // The suspended floor needs no cgroups.
+        let floor = parse(serde_json::json!({ "enabled": false, "suspendedReserve": 0.25 }));
+        floor
+            .validate()
+            .expect("a floor without enforcement is valid");
+        assert_eq!(floor.suspended_reserve(), 0.25);
+        assert_eq!(parse(serde_json::json!({})).suspended_reserve(), 0.0);
         // Ratio 1.0 without enforcement is the default, not an error.
         parse(serde_json::json!({ "enabled": false, "oversubscribe": { "memory": 1.0 } }))
             .validate()

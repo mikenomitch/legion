@@ -67,6 +67,20 @@ pub struct AbandonedResume {
     pub reason: String,
 }
 
+/// A resume waiting to be placed on the one node holding its checkpoint
+/// (see [`Store::waiting_pinned_resumes`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WaitingResume {
+    pub instance_id: String,
+    pub job_id: String,
+    pub group: String,
+    pub task_name: String,
+    /// The node the checkpoint is on, which the resume is pinned to.
+    pub node_id: String,
+    /// Unix seconds when StartInstance asked for the resume.
+    pub requested_at: i64,
+}
+
 fn suspend_state_from_row(
     row: &Row<'_>,
     at: usize,
@@ -197,6 +211,78 @@ impl Store {
         )?;
         let rows = stmt.query_map([instance_id], |row| self.allocation_from_row(row))?;
         Self::collect_rows(rows)
+    }
+
+    /// Keep a suspended instance's allocation row as its node charge, when
+    /// it holds anything: `max(suspend.reserve, node suspendedReserve)`
+    /// (docs/suspend-and-resume.md, "Capacity for resumes"). The row turns
+    /// `suspended`, which keeps it out of every worker's desired set, and
+    /// below a full hold its resources shrink to the held share, so the fit
+    /// check, the read model, and the plan-apply recheck all count exactly
+    /// that share. Returns false when nothing is held and the caller deletes
+    /// the row as before.
+    ///
+    /// The floor is read from the node row now, once: a node that later
+    /// re-registers with a different floor does not re-charge instances
+    /// already suspended on it.
+    fn hold_for_suspend_tx(
+        &self,
+        tx: &Connection,
+        instance_id: &str,
+        reserve: crate::structs::suspend::SuspendReserve,
+        post: &mut ReportPostCommit,
+    ) -> R<bool> {
+        use crate::resources::SuspendedHold;
+        let allocations = self.instance_allocations_tx(tx, instance_id)?;
+        let Some(allocation) = allocations.first() else {
+            return Ok(false);
+        };
+        let floor: f64 = tx
+            .query_row(
+                "SELECT config_attrs FROM node WHERE id = ?1;",
+                [&allocation.node_id],
+                |row| row.get::<_, Value>(0),
+            )
+            .optional()?
+            .map(|attrs| crate::resources::node_suspended_reserve(&attrs))
+            .unwrap_or(0.0);
+        let hold = self
+            .resource_policy
+            .suspended_hold(&allocation.resources, reserve, floor)
+            .unwrap_or_else(|err| {
+                // A row whose resources do not parse cannot be scaled. Hold it
+                // whole rather than free capacity nobody can account for.
+                warn!(instance_id, error = %err, "Suspended hold fell back to the full reservation");
+                SuspendedHold::Full
+            });
+        match hold {
+            SuspendedHold::Nothing => return Ok(false),
+            SuspendedHold::Full => {
+                tx.execute(
+                    "UPDATE allocation SET status = ?2 WHERE instance_id = ?1;",
+                    params![instance_id, crate::constants::ALLOCATION_STATUS_SUSPENDED],
+                )?;
+            }
+            SuspendedHold::Partial(resources) => {
+                // Ports go with the share: a suspended instance serves
+                // nothing, and the resume is placed with fresh ones.
+                tx.execute(
+                    "UPDATE allocation SET status = ?2, resources = ?3, network = NULL \
+                     WHERE instance_id = ?1;",
+                    params![
+                        instance_id,
+                        crate::constants::ALLOCATION_STATUS_SUSPENDED,
+                        resources
+                    ],
+                )?;
+            }
+        }
+        // The resources (and so the node's usage aggregate) may have changed
+        // under the same row id: bump the epochs so the cached aggregate and
+        // any plan built on the old numbers are rejected.
+        self.bump_epochs_for_allocations_tx(tx, &allocations)?;
+        post.allocations.extend(allocations);
+        Ok(true)
     }
 
     /// Delete an instance's allocation rows as a suspend does: epochs bumped
@@ -411,16 +497,8 @@ impl Store {
             .unwrap_or_else(|| SUSPEND_REASON_MANUAL.to_string());
         let now = Self::now_rfc3339()?;
         let now_unix = OffsetDateTime::now_utc().unix_timestamp();
-        if settings.reserve {
-            // The row stays, so the node's capacity math keeps counting it;
-            // the status keeps it out of every worker's desired set.
-            tx.execute(
-                "UPDATE allocation SET status = ?2 WHERE instance_id = ?1;",
-                params![instance_id, crate::constants::ALLOCATION_STATUS_SUSPENDED],
-            )?;
-            post.allocations
-                .extend(self.instance_allocations_tx(tx, &instance_id)?);
-        } else {
+        let held = self.hold_for_suspend_tx(tx, &instance_id, settings.reserve, post)?;
+        if !held {
             self.remove_for_suspend_tx(tx, &instance_id, post)?;
         }
         tx.execute(
@@ -436,13 +514,13 @@ impl Store {
                 now_unix,
                 report.duration_ms as i64,
                 now,
-                settings.reserve
+                held
             ],
         )?;
         Ok(SnapshotReportOutcome::Suspended {
             snapshot,
             instance_id,
-            reserved: settings.reserve,
+            reserved: held,
             reason,
         })
     }
@@ -918,6 +996,49 @@ impl Store {
         }
         tx.commit()?;
         Ok(updated > 0)
+    }
+
+    /// Resumes waiting to be placed on their checkpoint's node: `pending_op
+    /// = resume` with no allocation yet, restoring from a `local`
+    /// checkpoint (a published one is not pinned, so it is never waiting on
+    /// one node). Oldest request first. One indexed read, and empty unless
+    /// something is resuming: the make-room sweep calls it every pass.
+    pub fn waiting_pinned_resumes(&self) -> R<Vec<WaitingResume>> {
+        let conn = self.read_connection()?;
+        let mut stmt = conn.prepare_cached(
+            "SELECT instance.instance_id, instance.job_id, instance.group_name, \
+             instance.task_name, snapshot.node_id, COALESCE(instance.resume_requested_at, 0) \
+             FROM instance INNER JOIN snapshot ON snapshot.snapshot_id = instance.restore_from \
+             WHERE instance.pending_op = 'resume' AND instance.current_alloc_id IS NULL \
+             AND snapshot.state = 'local' AND snapshot.node_id IS NOT NULL \
+             ORDER BY 6, instance.instance_id;",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(WaitingResume {
+                instance_id: row.get(0)?,
+                job_id: row.get(1)?,
+                group: row.get(2)?,
+                task_name: row.get(3)?,
+                node_id: row.get(4)?,
+                requested_at: row.get(5)?,
+            })
+        })?;
+        Self::collect_rows(rows)
+    }
+
+    /// Suspended instances whose checkpoint is stored on `node_id`, and
+    /// those checkpoints' bytes, for `GetNodeUsage`'s suspended line
+    /// (docs/suspend-and-resume.md, "Capacity for resumes").
+    pub fn suspended_on_node(&self, node_id: &str) -> R<(u32, u64)> {
+        let conn = self.read_connection()?;
+        let (count, bytes): (i64, i64) = conn.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(snapshot.total_bytes), 0) FROM instance \
+             INNER JOIN snapshot ON snapshot.snapshot_id = instance.checkpoint_id \
+             WHERE instance.state = 'suspended' AND snapshot.node_id = ?1;",
+            [node_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        Ok((count.max(0) as u32, bytes.max(0) as u64))
     }
 
     /// Count the keyed instances of a (job, group, task) the scheduler must
