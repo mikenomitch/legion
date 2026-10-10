@@ -1,6 +1,8 @@
 # KV Store
 
-This document explains manager KV behavior and job integration.
+The manager includes a key-value store. Use it to hold configuration and
+feature flags, and to feed values into jobs and tasks. This page covers the
+data model, the API, and how jobs react when a key changes.
 
 ## Data Model
 
@@ -8,10 +10,10 @@ Primary objects:
 
 - `kv_entry`:
   - `key` (string, primary key)
-  - `value` (text) — stored **encrypted** by default; see below
+  - `value` (text), stored encrypted by default (see below)
   - `value_type` (`string`, `number`, `json`)
   - `version` (int64, optimistic concurrency)
-  - `enc_key_id` — the data key the value is encrypted under, `NULL` for a
+  - `enc_key_id`: the data key the value is encrypted under, `NULL` for a
     plaintext row
   - timestamps
 - `kv_lock`:
@@ -20,17 +22,19 @@ Primary objects:
 
 ## Encryption at rest
 
-Values are encrypted before they reach the store — AES-256-GCM under a data
-key that is itself wrapped by a root key the manager keeps outside the
-database — so the state file, every backup, the streamed replica, and every
-raft snapshot hold ciphertext. It is on by default and needs nothing from
-you beyond keeping `<storePath>/keys/root.key` with your backups. The API
-and CLI are unchanged (`value` is always the plaintext on the wire;
-`KvEntry.encrypted` reports how the row is held), and raw state access
-(`legion state query`, `state:read`) sees ciphertext, so `kv` path policies
-are the only way to read a value. Everything else — providers, rotation,
-what a locked keyring looks like, backups and restores, recovery — is in
-[KV Encryption at Rest](kv-encryption.md).
+The manager encrypts values before they reach the store. It uses AES-256-GCM
+under a data key, and that data key is wrapped by a root key the manager keeps
+outside the database. The state file, backups, the streamed replica, and raft
+snapshots all hold ciphertext.
+
+Encryption is on by default. Keep `<storePath>/keys/root.key` with your
+backups and you need nothing else. The API and CLI work the same way: `value`
+is always plaintext on the wire, and `KvEntry.encrypted` reports how the row
+is stored. Raw state access (`legion state query`, `state:read`) sees only
+ciphertext, so `kv` path policies are the only way to read a value.
+
+For providers, rotation, locked keyrings, backups and restores, and recovery,
+see [KV Encryption at Rest](kv-encryption.md).
 
 ## CRUD Operations
 
@@ -86,8 +90,7 @@ Job submit path resolves KV references inside jobspec JSON:
 
 Legacy `$` references are implicitly watched and required:
 
-- A put to the key re-materializes the job config and rolls it out
-  (historical behavior, unchanged).
+- A put to the key re-materializes the job config and rolls it out.
 - A delete marks the job failed with reason `missing_kv_dependency`
   (the reference can no longer be rendered). See "Fail semantics" below.
 
@@ -127,15 +130,15 @@ task = {
 }
 ```
 
-Templates substitute `{{ kv "some/key" }}` (or bare `kv "some/key"`) with the
-current KV value. Rendering happens server-side at submit and on every
-reconciliation; the rendered result lands in the task config (`env` map /
-`files[]` array) the worker receives. A `templateKv` source tracks both the
-template key itself *and* every key the template text looks up (transitive
-dependencies), so changing either triggers the entry's policy.
+Templates replace `{{ kv "some/key" }}` (or bare `kv "some/key"`) with the
+current KV value. The manager renders templates at submit and on every
+reconciliation. The result lands in the task config the worker receives (the
+`env` map or the `files[]` array). A `templateKv` source tracks the template
+key itself and every key the template looks up, so a change to either triggers
+the entry's policy.
 
 If a required key is missing at submit time, the submit fails with
-`kv entry <key> not found` — jobs are never admitted with unresolvable
+`kv entry <key> not found`. Legion never admits a job with unresolvable
 references.
 
 ### Policy semantics
@@ -148,54 +151,54 @@ Per-reference policy fields (all optional):
 | `onChange` | `none`, `restart`, `rollout`, `fail`  | `none`       |
 | `onDelete` | `none`, `restart`, `rollout`, `fail`  | `fail`       |
 
-Precedence is field-by-field: an entry-level `kv` block overrides only the
-fields it sets; unset fields inherit the task-level `kv` defaults block, and
-fields unset in both places use the hard defaults above. (So an entry can,
-for example, override `onChange` while inheriting `watch = true` from the
-defaults — or set `watch = false` to opt out entirely.)
+Precedence is field by field. An entry-level `kv` block overrides only the
+fields it sets. Unset fields inherit from the task-level `kv` block, and fields
+unset in both places use the hard defaults above. For example, an entry can
+override `onChange` while inheriting `watch = true` from the task, or set
+`watch = false` to opt out entirely.
 
-Event handling: a put resolves through `onChange`, a delete through
-`onDelete`. Edges with `watch = false` (the default) never act — though a put
-still refreshes the rendered value in the stored desired config, which is
-picked up on the next natural restart/update. When one KV change matches
-several edges of a job, the strongest action wins:
-`none < restart < rollout < fail`.
+A put resolves through `onChange` and a delete through `onDelete`. Edges with
+`watch = false` (the default) never act. A put still refreshes the rendered
+value in the stored desired config, and the task picks it up on its next
+restart or update. When one KV change matches several edges of a job, the
+strongest action wins: `none < restart < rollout < fail`.
 
 Actions:
 
-- `none`: desired state is re-rendered and stored; nothing is scheduled.
-- `restart`: re-render, then enqueue a `job_update` eval. This re-evaluates the
-  **whole job's** allocations against the new config — not just the task that
-  owns the changed key. A watched-key restart therefore replaces every task's
-  allocations in the job (in place, without a staged rollout), so co-located
+- `none`: re-render and store the desired state. Nothing is scheduled.
+- `restart`: re-render, then enqueue a `job_update` eval. This re-evaluates
+  all of the job's allocations against the new config, including tasks that
+  don't use the changed key. A watched-key restart replaces every task's
+  allocations in the job in place, without a staged rollout, so co-located
   tasks pick up the change together. Use `rollout` if you need staged
-  progression instead.
+  progression.
 - `rollout`: re-render, then create a rollout for the new config revision
   (manual progression is honored) and enqueue `rollout_tick`.
 - `fail`: mark the job failed (see below). Typically used as `onDelete`.
 
-On delete, the deleted key obviously cannot be re-rendered: entries that
-depend on it keep their last rendered value, and `onDelete = "restart"` / `onDelete = "rollout"`
-still fires even though the rendered config is unchanged.
+A deleted key can't be re-rendered, so entries that depend on it keep their
+last rendered value. `onDelete = "restart"` and `onDelete = "rollout"` still
+fire even though the rendered config is unchanged.
 
 ### Debounce / coalescing
 
-Bursts of KV writes are coalesced so jobs do not see an eval/rollout storm.
-Controlled by `kvDebounceMs` in the manager config (default `500`, `0`
-disables debouncing and reconciles synchronously inside the KV RPC):
+The manager coalesces bursts of KV writes so jobs don't see a storm of evals
+or rollouts. Set the window with `kvDebounceMs` in the manager config. The
+default is `500`. Set it to `0` to disable debouncing and reconcile
+synchronously inside the KV RPC.
 
-- The first event opens a window; every KV event within the window joins the
-  pending batch. The window is not extended by later events, so
-  reconciliation latency is bounded by one window.
-- Within a batch the *last* event per key wins for policy selection: a put
-  followed by a delete resolves through `onDelete`; a delete followed by a
-  put resolves through `onChange`.
-- The flush re-renders from the KV state at flush time, so the final
-  materialized config always reflects the latest values, and at most one
-  action fires per job per window (the strongest across all matched edges).
-- Events are only ever coalesced, never dropped. With debouncing enabled,
-  reconciliation errors are logged on the manager (there is no RPC caller to
-  surface them to); with `kvDebounceMs = 0` they surface on the KV RPC.
+- The first event opens a window, and every KV event within the window joins
+  the pending batch. Later events don't extend the window, so reconciliation
+  waits at most one window.
+- Within a batch, the last event per key picks the policy. A put followed by a
+  delete resolves through `onDelete`. A delete followed by a put resolves
+  through `onChange`.
+- The flush re-renders from the KV state at flush time, so the final config
+  reflects the latest values. At most one action fires per job per window (the
+  strongest across all matched edges).
+- Events are coalesced, never dropped. With debouncing on, the manager logs
+  reconciliation errors because there is no RPC caller to return them to. With
+  `kvDebounceMs = 0`, errors return on the KV RPC.
 
 ### Fail semantics and recovery
 
@@ -203,66 +206,67 @@ When the resolved action is `fail` (usually `onDelete = "fail"` and the key was
 deleted):
 
 - The job status becomes `failed` (visible in `job list` / `job info`).
-- The **impacted** allocations have their status stamped
-  `failed:missing_kv_dependency` (visible in the ledger, the UI, and
-  state-store queries). Scope is precise: a missing *injection* key only stamps
-  the allocations of the task(s) that depend on it — sibling tasks in the same
-  job are left untouched. A missing *legacy `$key`* reference is not scoped to
-  one task (it makes the whole rendered config unresolvable), so it stamps
-  every allocation of the job. Either way the allocations are *not* torn down
-  and nothing is rescheduled — the job sits failed with the stale config; no
-  restart or rollout storm.
+- The affected allocations get the status `failed:missing_kv_dependency`
+  (visible in the ledger, the UI, and state-store queries). A missing
+  injection key only marks allocations of the tasks that depend on it. Sibling
+  tasks in the same job are left alone. A missing legacy `$key` reference
+  makes the whole rendered config unresolvable, so it marks every allocation
+  of the job.
+- In both cases Legion doesn't tear down allocations or reschedule anything.
+  The job stays failed with the stale config, with no restart or rollout
+  storm.
 - The KV dependency edges are retained.
 
 Recovery paths:
 
-- Put the missing key back: the put resolves through the edge's `onChange`;
-  a `restart` or `rollout` action re-renders the config, clears the
+- Put the missing key back. The put resolves through the edge's `onChange`.
+  A `restart` or `rollout` action re-renders the config, clears the
   `failed:missing_kv_dependency` stamps, flips the job status back to `done`,
   and replaces the failed allocations.
-- `onChange = "none"` does **not** auto-recover: a put re-renders and stores the
-  desired config but schedules nothing, so the job stays `failed` with its
-  stamped allocations until an explicit action.
-- A manual `job run` (resubmitting the jobspec) is the recovery path for the
-  `onChange = "none"` case — and works generally: it clears the failed status and
-  re-runs the job through the normal submit/eval flow with the latest KV state.
+- `onChange = "none"` doesn't recover on its own. A put re-renders and stores
+  the desired config but schedules nothing, so the job stays `failed` with its
+  marked allocations until you act.
+- Run `job run` to resubmit the jobspec. This is the recovery path for the
+  `onChange = "none"` case, and it works in every case. It clears the failed
+  status and re-runs the job through the normal submit and eval flow with the
+  latest KV state.
 
 ### Capability matrix
 
-Each task runtime reports whether it supports KV injections; submits that
-require an unsupported capability are rejected with an explicit error
-(`Task <name> runtime <runtime> does not support kv env/file injection`).
+Each task runtime reports whether it supports KV injections. Legion rejects
+a submit that needs an unsupported capability with this error:
+`Task <name> runtime <runtime> does not support kv env/file injection`.
 
 | Kind        | env injection | file injection |
 |-------------|---------------|----------------|
 | `exec`      | yes           | yes            |
-| `container` | yes           | yes — `path` must resolve under `/legion/task` |
+| `container` | yes           | yes (`path` must resolve under `/legion/task`) |
 | `noop`      | no            | no             |
 | plugins     | per `supports_kv_env_injection` / `supports_kv_file_injection` |
 
-**Container file paths.** A container task sees the allocation's task
-directory bind-mounted at `/legion/task` and nothing else of the host, so a
-rendered file's `path` must resolve under it (relative paths resolve against
-it). An out-of-range path is rejected at submit:
+Container file paths: a container task sees the allocation's task directory
+bind-mounted at `/legion/task` and nothing else from the host. A rendered
+file's `path` must resolve under that directory, and relative paths resolve
+against it. Legion rejects an out-of-range path at submit.
 
 ```nickel
-kvInjections = { files = [
+files = [
   { path = "config/app.toml", file = { template = "tenant={{ kv \"tenant/id\" }}\n" } },
   #  -> readable inside the container at /legion/task/config/app.toml
-] },
+],
 ```
 
-Because the *directory* is mounted rather than individual files, a re-render
-(an atomic rewrite-and-rename on the host) is visible to the running container
-without a restart — which is what makes `onChange` policies other than
-`restart` meaningful for container tasks. See
+Legion mounts the directory rather than individual files. A re-render is an
+atomic rewrite-and-rename on the host, so the running container sees it
+without a restart. This is why `onChange` policies other than `restart` are
+useful for container tasks. See
 [docs/task-runtime-container.md](task-runtime-container.md).
 
 ### Env precedence
 
-Injected env vars are rendered into the task config `env` map and **override
-a static `env` entry of the same name** declared in the task config. Prefer
-distinct names if you need both.
+Injected env vars are rendered into the task config `env` map. They override
+a static `env` entry of the same name in the task config. Use distinct names if
+you need both.
 
 ### Testing this locally in a basic way
 
@@ -272,7 +276,7 @@ Start a manager with an in-process worker:
 cargo run -- start manager -c configs/manager.ncl
 ```
 
-Seed the watched key, then run the demo job (one exec task; watched env +
+Seed the watched key, then run the demo job (one exec task with a watched env and
 file injection with `onChange = "restart"`, `onDelete = "fail"`):
 
 ```sh

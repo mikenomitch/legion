@@ -1,14 +1,14 @@
 # Preemption and eviction
 
-Legion has one importance axis — the job's **priority band** — and one thing
-it does when a cluster is full: the scheduler displaces lower-band work so
-higher-band work can run.
+Each Legion job has a priority band that says how important it is. When the
+cluster is full, the scheduler displaces lower-band work so higher-band work
+can run.
 
-Without this, a full cluster is first-come-first-kept. A batch backfill that
+Without preemption, whoever gets capacity first keeps it. A batch backfill that
 grabbed capacity an hour ago keeps it, and an urgent production deploy fails
-placement with "no available nodes"; the only remedies are manual. With it,
-importance wins contention by policy, and you can run the cluster hotter
-without hand-managing capacity.
+placement with "no available nodes". The only fixes are manual. With
+preemption, the more important job wins by policy, and you can run the cluster
+fuller without managing capacity by hand.
 
 ## Priority bands
 
@@ -29,26 +29,22 @@ without hand-managing capacity.
 | `low` | Work that may be displaced when the cluster is full: batch backfills, nightly reports, CI fleets. | 30 | everything above |
 | `background` | Fill-the-gaps work with no completion expectation: speculative jobs, opportunistic re-encodes, cache warmers. | 15 | everything above |
 
-Three rules follow from the vocabulary being closed, and they are what make
-preemption safe to reason about:
+The set of bands is fixed. Three rules make preemption predictable:
 
-- **Preemption is strictly cross-band.** An allocation is only ever a victim
-  of a job in a *strictly higher* band, never a peer. `critical` never
-  preempts `critical`; a displaced `low` job can cascade into `background` and
-  no further. Cascades are bounded by the band count and only ever run
-  downward.
-- **Choosing a band below `normal` is the consent to be displaced.** There is
-  no separate opt-in switch, because a field that usually means nothing is
-  worse than one that always means what it says.
-- **The band sets the eval-queue priority too.** One field, both meanings:
-  importance orders the queue *and* governs preemption. `legion job run
-  --priority N` and `--asap` still override the queue position for a single
-  submission; they do not change the band, and so they do not affect
-  preemption.
+- **Preemption only crosses bands.** An allocation can only be a victim of a
+  job in a strictly higher band, never a peer. `critical` never preempts
+  `critical`. A displaced `low` job can in turn displace `background` work
+  and nothing further. Cascades are bounded by the number of bands and only
+  run downward.
+- **Choosing a band below `normal` means you accept being displaced.** There
+  is no separate opt-in switch.
+- **The band also sets the eval-queue priority.** One field orders the queue
+  and governs preemption. `legion job run --priority N` and `--asap` still
+  override the queue position for a single submission. They do not change the
+  band, so they do not affect preemption.
 
-A typo'd band is a **submit error**, not a silent `normal`. A job its author
-marked `critical` quietly losing every contention fight is exactly the class
-of bug a closed vocabulary exists to prevent:
+A misspelled band is a submit error. Legion does not fall back to `normal`,
+because a job marked `critical` would then quietly lose every contention:
 
 ```console
 $ legion job run api.ncl
@@ -58,93 +54,94 @@ critical, high, elevated, normal, low, background
 
 ### Governing who may claim a band
 
-An ungoverned top band means nothing — everyone sets it. Which bands a caller
-may submit is a `bands` selector on `job` ACL rules, alongside the existing
-`namespaces` / `names` / `pools` / `templates` selectors:
+If anyone can use the top band, everyone will, and it stops meaning anything.
+Control which bands a caller may submit with a `bands` selector on `job` ACL
+rules. It sits alongside the existing `namespaces` / `names` / `pools` /
+`templates` selectors:
 
 ```json
-{"resources": ["job"], "actions": ["write"], "namespaces": ["prod"],
+{"resources": ["job"], "actions": ["write"], "names": ["prod-*"],
  "bands": ["critical", "high"]}
 ```
 
-Standard selector semantics apply, and they cut both ways:
+Standard selector semantics apply:
 
-- A rule that **omits** `bands` covers every band. Bands are open by default
-  and become a privilege exactly where a policy says so.
-- A rule that **names** `bands` grants only those. A submit outside them is
-  `PermissionDenied`, with the band named in the message.
-- An **unbanded** job is a `normal` job. The submit path defaults the band
+- A rule that omits `bands` covers every band. Bands are open by default and
+  are restricted only where a policy says so.
+- A rule that names `bands` grants only those. A submit outside them fails
+  with `PermissionDenied`, and the message names the band.
+- A job with no band is a `normal` job. The submit path sets the default band
   before enforcing, so a `bands` policy still matches ordinary submissions.
 
-The gate covers every write path that can put a spec into the cluster,
-including submitting **through a template** that renders a band — rendering is
-not a way around it. See [auth-and-acls.md](auth-and-acls.md).
+The check covers every write path that can put a spec into the cluster. That
+includes submitting through a template that renders a band, so templates
+can't be used to get around it. See [auth-and-acls.md](auth-and-acls.md).
 
 ## How preemption works
 
-When a task cannot be placed, the planner asks: would displacing lower-band
-work on any node this task is *allowed* on open a slot? The pass runs **only**
-after normal feasibility has already failed, so a cluster that never preempts
-pays nothing for the feature.
+When a task cannot be placed, the planner checks whether displacing lower-band
+work on any node the task is allowed on would open a slot. This pass runs only
+after normal placement has failed, so a cluster that never preempts pays
+nothing for it.
 
 ### Which allocations are eligible
 
 An allocation on a candidate node is a possible victim only if all of these
 hold:
 
-- its job's band is **strictly below** the preemptor's;
-- it is older than `preemption.victimExemptAge` (default `60s`);
-- it does **not** hold node-local storage (see
-  [Stateful workloads](#stateful-workloads));
-- evicting it would not take its task below its `disruption.minAvailable`
+- Its job's band is strictly below the preemptor's.
+- It is older than `preemption.victimExemptAge` (default `60s`).
+- It does not hold node-local storage (see
+  [Stateful workloads](#stateful-workloads)).
+- Evicting it would not take its task below its `disruption.minAvailable`
   floor, counting evictions already chosen in the same plan.
 
 ### Which of them are taken
 
-Per node: sort eligible allocations by band ascending (take from the least
-important work first), then by how closely each is sized to the outstanding
-ask, then by allocation id for determinism. Take greedily until the task fits,
-then run a **reprieve pass** that gives back any victim the placement turns
+On each node, the planner sorts eligible allocations by band, lowest first. It
+then sorts by how closely each one matches the outstanding request, then by
+allocation ID so the result is deterministic. It takes victims in order until
+the task fits. A reprieve pass then gives back any victim the placement turns
 out not to need.
 
-"Closely sized" matters: Legion will not kill a 32 GiB allocation to free
-1 GiB when a right-sized victim exists.
+Size matching means Legion won't kill a 32 GiB allocation to free 1 GiB when a
+right-sized victim exists.
 
-Between nodes: fewest victims wins, then the plan that takes the least
-important work, then the normal scoring policy decides among equally costly
-options — so preemption does not undo the cluster's packing strategy. A
-placement that needs no victims at all never reaches this pass.
+Across nodes, the plan with the fewest victims wins. Ties go to the plan that
+takes the least important work. Remaining ties go to the normal scoring policy,
+so preemption does not undo the cluster's packing strategy. A placement that
+needs no victims never reaches this pass.
 
 ### How it commits
 
-This is the central correctness property, and it is a property of
-*transactions*, not of scoring. Victims are chosen during planning and
-committed in the **same** epoch-compare-and-set transaction that inserts the
-preemptor's allocations. That one transaction:
+Victims are chosen during planning. They are committed in the same
+epoch-compare-and-set transaction that inserts the preemptor's allocations.
+That one transaction:
 
-- deletes the victim rows;
-- inserts the preemptor's allocations;
-- enqueues one `job_reschedule` eval per victim job, at the victim's own band
-  priority;
-- records each victim's stop notice with cause `preempted` and a preemptor
-  link;
-- stages the `allocation.preempted` and `allocation.stopping` events.
+- Deletes the victim rows.
+- Inserts the preemptor's allocations.
+- Enqueues one `job_reschedule` eval per victim job, at the victim's own band
+  priority.
+- Records each victim's stop notice with cause `preempted` and a link to the
+  preemptor.
+- Stages the `allocation.preempted` and `allocation.stopping` events.
 
-Consequences worth stating plainly:
+This has three consequences:
 
-- **There is no nomination race.** The freed capacity is occupied by the
-  preemptor's rows the instant it is freed. Kubernetes' `nominatedNodeName` is
-  not a reservation, which took three KEPs to partially fix; Legion's store
-  shape makes the reservation free.
-- **Evictions cannot outlive a failed placement.** They are the same write. A
-  plan that cannot complete commits nothing at all.
-- **No victim is forgotten.** Requeue is driven by the job's *desired count*,
-  not by remembering the eviction, so nothing has to survive a crash for a
-  victim to come back — and batch victims requeue exactly like service ones.
+- **No other job can grab the freed capacity.** The preemptor's rows occupy it
+  the moment it is freed. In Kubernetes, `nominatedNodeName` is not a
+  reservation, and it took three KEPs to partly fix that. In Legion, the
+  reservation comes from the single transaction.
+- **Evictions cannot outlive a failed placement.** They are part of the same
+  write. A plan that cannot complete commits nothing.
+- **No victim is forgotten.** Requeue is driven by the job's desired count,
+  not by remembering the eviction. Nothing has to survive a crash for a victim
+  to come back, and batch victims requeue the same way service victims do.
 
-The worker side is [graceful stop](graceful-stop.md): the victim's removal and
-the preemptor's placement arrive in the same heartbeat diff, and the worker
-stops victims with grace before starting the preemptor.
+On the worker side, victims go through [graceful stop](graceful-stop.md). The
+victim's removal and the preemptor's placement arrive in the same heartbeat
+diff. The worker stops the victims with grace before it starts the
+preemptor.
 
 ## Protecting a task: `disruption.minAvailable`
 
@@ -160,27 +157,28 @@ stops victims with grace before starting the preemptor.
 }
 ```
 
-Two deliberate properties:
+The floor has two properties:
 
-- **It binds only voluntary disruption** — preemption today, a future
-  rebalancer or scale-in policy tomorrow. Drain, node loss and `job stop`
-  ignore it. A floor that can block mandatory maintenance is the documented
-  cluster-wedge (`maxUnavailable = 0` blocking a Kubernetes upgrade is so
-  common it grew an escape hatch); a floor that only shrinks preemption's
-  options can never wedge anything — worst case the preemptor stays pending,
-  which is the status quo.
+- **It applies only to voluntary disruption.** Today that means preemption.
+  A future rebalancer or scale-in policy would respect it too. Drain, node
+  loss, and `job stop` ignore it. A floor that can block mandatory maintenance
+  can wedge a cluster. In Kubernetes, `maxUnavailable = 0` blocking an upgrade
+  is common enough that it got an escape hatch. A floor that only limits
+  preemption can't wedge anything. At worst, the preemptor stays pending,
+  which is what would happen without preemption.
 - **It is a hard rule, not a score.** The scheduler cannot cross it. Nomad's
-  penalty-not-limit budget is documented as violated in practice, including by
-  its own drainer, and a budget that can be outbid is not a budget.
+  budget is a penalty rather than a limit, and it is documented as being
+  violated in practice, including by Nomad's own drainer.
 
-Percentages round **up**: `minAvailable = "50%"` of 5 protects 3. The floor is
+Percentages round up: `minAvailable = "50%"` of 5 protects 3. The floor is
 measured against the task's live allocation count, and it holds across a whole
-plan — eight placements cannot each take "one below the floor" and together
-take eight.
+plan. Eight placements cannot each take one allocation below the floor and
+together take eight.
 
-**Understand what this does not protect you from:** an operator draining half
-the cluster can take your service below `minAvailable`. That is a real gap
-versus a Kubernetes PodDisruptionBudget, and it is the deliberate trade.
+**What this does not protect you from:** an operator draining half the
+cluster can take your service below `minAvailable`. A Kubernetes
+PodDisruptionBudget would block that. Legion accepts this gap so the floor can
+never block maintenance.
 
 ## Operator controls
 
@@ -198,29 +196,27 @@ versus a Kubernetes PodDisruptionBudget, and it is the deliberate trade.
 
 | Mode | Behavior |
 | --- | --- |
-| `enforce` | **Default.** Select victims, evict, and place — atomically. |
-| `observe` | Run the *identical* victim-selection pass, emit `allocation.preempt_planned` and the metric, commit nothing. The placement fails exactly as it does with preemption off. |
+| `enforce` | **Default.** Select victims, evict, and place, in one atomic step. |
+| `observe` | Run the same victim-selection pass, emit `allocation.preempt_planned` and the metric, and commit nothing. The placement fails the same way it does with preemption off. |
 | `off` | Never run the pass. Bands still order the eval queue. |
 
-`observe` is the cautious-adoption posture: the selection an operator sees is
-the selection `enforce` would make, so the evidence is real before the action
-is taken.
+Use `observe` to try preemption safely. The selection you see is the one
+`enforce` would make, so you can check it before turning eviction on.
 
-`disabledPools` exempts a pool wholesale, whatever the bands say — for a pool
-whose jobs each hold hours of un-checkpointed state.
+`disabledPools` exempts a whole pool, whatever the bands say. Use it for a
+pool whose jobs each hold hours of un-checkpointed state.
 
-`victimExemptAge` is the cheapest thrash guard there is: without it, one plan
-can undo the placement a previous plan made seconds earlier, and the
-follow-up eval can undo that. An allocation with no recorded placement time
-(written before this feature) is treated as old enough.
+`victimExemptAge` is a cheap guard against thrashing. Without it, one plan
+could undo the placement a previous plan made seconds earlier, and the
+follow-up eval could undo that. An allocation with no recorded placement time
+(written before this feature existed) counts as old enough.
 
-A mistyped `mode` is a **startup error**, not a silent `enforce`. Evicting
-production work an operator explicitly tried not to evict is not an acceptable
-failure mode for a typo.
+A misspelled `mode` is a startup error. Legion does not fall back to
+`enforce`, because a typo should not evict work you meant to protect.
 
 ## Previewing before you displace anyone
 
-`legion job plan` names the exact victims a submit would take:
+`legion job plan` names the victims a submit would take:
 
 ```console
 $ legion job plan api.ncl
@@ -234,16 +230,16 @@ Preemption: would preempt
   node-d: batch-transcode/worker (alloc 412, priority low) — 30s grace, requeued
 ```
 
-In `observe` mode the same command reports what `enforce` *would* do, labelled
-as such. When the cluster has preemption off, it says so rather than showing
-an empty list that reads as "nothing would be displaced".
+In `observe` mode, the same command reports what `enforce` would do and labels
+it that way. When preemption is off, the output says so, instead of showing an
+empty list that looks like "nothing would be displaced".
 
-This is a plan against a snapshot, not a reservation: the real submit
-re-plans, so the victims it takes may differ if the cluster moved in between.
+The plan runs against a snapshot and reserves nothing. The real submit plans
+again, so it may take different victims if the cluster changed in between.
 
 ## When preemption still cannot place
 
-The error says why, in band terms:
+The error explains why, in terms of bands:
 
 ```console
 error: Failed to place task "web": no available nodes matching constraints,
@@ -252,18 +248,17 @@ disruption.minAvailable, 1 below victimExemptAge). Job stays under its
 desired count.
 ```
 
-Other endings you may see, each naming the thing that actually bound:
+Other endings you may see, each naming the limit that applied:
 
 | Ending | Meaning |
 | --- | --- |
-| `This job is in the lowest priority band (background)…` | `background` is the floor; there is nothing below it to displace. |
+| `This job is in the lowest priority band (background)…` | `background` is the lowest band. There is nothing below it to displace. |
 | `Preemption is off for this cluster…` | `schedulerSettings.preemption.mode` is `off`. |
 | `Preemption is in observe mode: it identified N evictable allocation(s) but committed none…` | Switch to `enforce` to act on it. |
 | `every candidate node is in a pool where preemption is disabled…` | `disabledPools` covers every feasible node. |
-| `…3 holding node-local storage (never preemptible)` | A node hoarded by node-pinned stateful work is un-preemptible. |
+| `…3 holding node-local storage (never preemptible)` | A node full of node-pinned stateful work can't be preempted. |
 
-Submitting a job whose band cannot act also warns at submit time, so the
-expectation is corrected where it is formed:
+If a job's band can't displace anything, the submit also prints a warning:
 
 ```console
 $ legion job run api.ncl
@@ -301,21 +296,20 @@ $ legion events list --kind allocation.preempted -j
 }
 ```
 
-The bidirectional victim↔preemptor link is the point. "Preempted", on its own,
-is the complaint every batch platform eventually retrofits an answer to: a
-user who cannot tell *which* policy displaced them cannot act on it.
+The event links each victim to its preemptor and back. A user who only sees
+"preempted" can't tell which job displaced them, so they can't act on it.
 
 **Metrics** ([metrics.md](metrics.md)):
 
-- `legion_preemptions_total{pool,band}` — victims actually evicted, sliced by
-  the two axes an operator reasons about.
-- `legion_preemption_plans_total{outcome}` — preemption passes that reached a
-  decision: `placed` (victims evicted, preemptor placed), `observe` (the pass
-  ran under `observe` mode and committed nothing), or `no_victims` (preemption
-  is enabled and still could not help). The last one is the interesting alert:
-  it separates "preemption is not placing this" from "preemption never ran".
+- `legion_preemptions_total{pool,band}`: victims evicted, by pool and band.
+- `legion_preemption_plans_total{outcome}`: preemption passes that reached a
+  decision. Outcomes are `placed` (victims evicted, preemptor placed),
+  `observe` (the pass ran under `observe` mode and committed nothing), or
+  `no_victims` (preemption is enabled and still could not help). Alert on
+  `no_victims`. It separates "preemption is not placing this" from
+  "preemption never ran".
 
-**In the job list**, the band is a column, so contention outcomes are legible
+**In the job list**, the band is a column, so you can see contention outcomes
 without reading specs:
 
 ```console
@@ -330,88 +324,89 @@ $ legion job list
 
 ## Stateful workloads
 
-An allocation whose instance storage is **node-local** (`local-dir`) is
-**never** a victim, categorically. Evicting one either frees nothing — the
-instance can only be recreated on the same node, because that is where its
-data is — or abandons the data. Both are indefensible, so the rule is
-structural rather than a scoring penalty.
+An allocation whose instance storage is node-local (`local-dir`) is never a
+victim. Evicting one would either free nothing or abandon the data. It frees
+nothing if the instance is recreated on the same node, where its data lives.
+This is a fixed rule, not a scoring penalty.
 
 Stateful allocations on cluster-reachable storage (`nfs`, and future network
-drivers) **are** eligible. Preemption stops them the same clean way a rollout
+drivers) are eligible. Preemption stops them cleanly, the same way a rollout
 replacement does, and their replacement reattaches the same storage elsewhere.
 
-The consequence to plan around: a node filled with low-band, node-pinned
-stateful work is un-preemptible. The placement error says so explicitly rather
-than leaving you to work it out.
+Plan around this: a node filled with low-band, node-pinned stateful work can't
+be preempted. The placement error says so.
 
 ## Known limitations
 
-Stated as plainly as the features:
-
-- **No fair share, no hierarchical queues, no quota.** Bands answer "who
-  wins"; nothing here answers "who may enter". Per-namespace band caps are
-  expressible today through the `bands` ACL selector; a real quota economy is
-  not built.
-- **No intra-band ordering.** Two `high` jobs contending for one slot resolve
-  by timing. If you need "slightly more important than my other batch job",
-  the answer today is a different band, not a dial.
+- **No fair share, hierarchical queues, or quota.** Bands decide who wins a
+  contention. Nothing here decides who may enter. You can limit which
+  bands a caller may submit with the `bands` ACL selector, combined with
+  `names` or `pools`, but there is no quota system.
+- **No ordering within a band.** Two `high` jobs contending for one slot are
+  resolved by timing. If one job needs to beat another, put it in a different
+  band.
 - **`low` evals can starve behind sustained higher-band load.** The queue is
-  strict priority with no aging. Real queue depths make this theoretical
-  today; it is a known shape, not a fixed one.
+  strict priority with no aging. At typical queue depths this doesn't happen
+  today, but it is not fixed.
 - **No oversubscription and no node-pressure eviction.** Legion resources are
-  reservations with no request/limit split, so there is no platform-created
-  pressure to relieve.
+  reservations with no request/limit split, so the platform never creates
+  resource pressure that needs relieving.
 - **No suspend- or checkpoint-based preemption.** Victims are stopped with
-  grace and requeued. Suspend holds memory hostage; checkpoint-based schemes
-  have a poor survival record.
-- **No descheduler-style rebalancing.** Voluntary eviction to improve packing
-  is a separate risk class. The eviction primitive is built so a future
-  rebalancer can reuse it, and `disruption.minAvailable` is already worded as
-  the budget it would respect.
+  grace and requeued. Suspending keeps the victim's memory tied up, and
+  checkpoint-based schemes have a poor track record.
+- **No descheduler-style rebalancing.** Evicting work just to improve packing
+  carries different risks. The eviction code is built so a future rebalancer
+  can reuse it, and `disruption.minAvailable` is already defined as the budget
+  it would respect.
 - **Victim selection ignores network and devices.** Victims are selected on
-  the builtin resource vector (cpu / cores / memory / disk / allocations, plus
-  custom amounts). Device-aware victim selection is exactly where comparable
-  schedulers accumulated their bugs, and it is not attempted here.
-- **No preemption plugin seam.** `SchedulingPolicy` keeps its ABI; preemption
-  is built in. Victim selection is factored as a pure function so the seam can
-  open later around semantics that have proven out.
+  the built-in resource vector (cpu / cores / memory / disk / allocations,
+  plus custom amounts). Device-aware victim selection is where comparable
+  schedulers have had many bugs, so Legion does not attempt it.
+- **No preemption plugin interface.** `SchedulingPolicy` keeps its ABI, and
+  preemption is built in. Victim selection is written as a pure function so a
+  plugin interface can be added later.
 - **Preemption for multi-task groups is limited.** A group already assigned to
-  a node can preempt on that node; a group being placed fresh preempts for its
-  first member and, if a later member then cannot fit, the whole plan fails
-  and commits nothing. No partial group is ever left running.
-- **Preemption history is best-effort.** The event journal is bounded
-  (~10k events), so `allocation.preempted` is an observability surface, not an
-  audit log. Use the metrics for rates.
+  a node can preempt on that node. A group being placed fresh preempts for its
+  first member. If a later member then cannot fit, the whole plan fails and
+  commits nothing. No partial group is ever left running.
+- **Preemption history is best-effort.** The event journal is bounded (about
+  10k events), so treat `allocation.preempted` as an observability signal, not
+  an audit log. Use the metrics for rates.
 - **A victim's stop cause can be lost.** Stop notices are advisory (see
-  [graceful-stop.md](graceful-stop.md) § Delivery guarantees), so the
+  [graceful-stop.md](graceful-stop.md) § Delivery guarantees). The
   victim→preemptor link a task reads in its notice file is best-effort in the
   same way. The event journal's copy is not.
 
 ## Upgrading
 
-Everything here is additive and default-compatible:
+All of these changes are additive and keep existing defaults working:
 
-- Absent `priority` is `normal`; existing job configs migrate to `normal`,
-  which is what absent already meant.
-- Absent `disruption` is a floor of 0.
-- Absent `stop` is `SIGTERM` + `30s` — a behavior change from the previous
-  hard kill, deliberate and strictly gentler. See
+- A missing `priority` means `normal`. Existing job configs migrate to
+  `normal`, which is what a missing value already meant.
+- A missing `disruption` means a floor of 0.
+- A missing `stop` means `SIGTERM` + `30s`. Earlier releases hard-killed
+  tasks, so this is a gentler behavior change. See
   [graceful-stop.md](graceful-stop.md).
 
-**Version skew.** A new manager with old workers degrades cleanly: old workers
-ignore the ladder and hard-kill as before, so preemption still functions, just
-gracelessly. Because that means a node can briefly run victim and preemptor
-concurrently, upgrade workers before enabling `enforce` on a mixed fleet — or
-run `observe` until the fleet is uniform. New workers with an old manager
-receive no stop context and behave as before. See [upgrades.md](upgrades.md).
+**Version skew.** A new manager with old workers still works. Old workers
+ignore the stop ladder and hard-kill as before, so preemption still works
+without the grace period. This means a node can briefly run the victim and
+the preemptor at the same time. Preemption runs in `enforce` mode by
+default, and managers must be upgraded before workers (see
+[upgrades.md](upgrades.md)). So a newly upgraded manager starts preempting
+while old workers are still in the fleet. To avoid that window, set
+`schedulerSettings.preemption.mode = "observe"` in the manager config before
+you upgrade the managers. Switch it to `enforce` once every worker is
+upgraded. New workers with an old manager receive no stop context and behave
+as before.
 
 ## See also
 
-- [Graceful stop](graceful-stop.md) — the ladder every victim is stopped with.
-- [Scheduler and eval loop](scheduler-and-eval-loop.md) — where the preemption
+- [Graceful stop](graceful-stop.md): the ladder every victim is stopped with.
+- [Scheduler and eval loop](scheduler-and-eval-loop.md): where the preemption
   pass sits in planning.
-- [Auth and ACLs](auth-and-acls.md) — the `bands` selector.
-- [Stateful workloads](stateful-workloads.md) — instance storage and why
+- [Auth and ACLs](auth-and-acls.md): the `bands` selector.
+- [Stateful workloads](stateful-workloads.md): instance storage and why
   node-pinned allocations are exempt.
-- [Metrics](metrics.md), [Event stream](event-stream.md) — the observability
+- [Metrics](metrics.md), [Event stream](event-stream.md): the observability
   surfaces above.

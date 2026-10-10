@@ -82,7 +82,7 @@
     # image's own binary and no client install is needed on the operator's
     # machine:
     #   legion action run postgres psql --tty      # interactive shell
-    #   legion action run postgres sql -p query='SELECT 1'
+    #   legion action run postgres sql --param query='SELECT 1'
     #   legion action run postgres dump > backup.sql
     actions = [
       {
@@ -120,14 +120,14 @@
   #   group = "db",
   #   lifecycle = "batch",
   #   schedule = "0 3 * * *",            # 03:00 daily
+  #   # Reach the database through service discovery. The worker load-balances
+  #   # $LEGION_UPSTREAM_POSTGRES (127.0.0.1:<port>) to the healthy Postgres,
+  #   # since its host port is dynamic. In a real deployment, inject the
+  #   # password from KV instead of inlining it.
+  #   connect = { upstreams = [{ service = "postgres" }] },
   #   config = {
   #     image = "postgres:16-alpine",
-  #     command = ["sh", "-c", "pg_dump \"$DATABASE_URL\" | gzip > \"$LEGION_TASK_DIR/pg-$(date +%F).sql.gz\""],
-  #     env = {
-  #       # Resolve the running instance through service discovery; in a real
-  #       # deployment inject the password from KV instead of inlining it.
-  #       DATABASE_URL = "postgres://postgres:legion-demo@postgres.service.legion:5432/legion",
-  #     },
+  #     command = ["sh", "-c", "pg_dump \"postgres://postgres:legion-demo@$LEGION_UPSTREAM_POSTGRES/legion\" | gzip > \"$LEGION_TASK_DIR/pg-$(date +%F).sql.gz\""],
   #   },
   #   # Ship the dump off-cluster: swap the command above for `aws s3 cp -`
   #   # (plus credentials via workload identity) or mount a `host` volume of

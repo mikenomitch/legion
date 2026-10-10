@@ -4,59 +4,65 @@
 
 ## Purpose
 
-Run containerized workloads via host container runtime binaries.
+Run containerized workloads through the host's container runtime binaries.
 
 ## Runtime Selection
 
-The runtime is chosen by operating system — no Docker dependency:
+Legion picks the runtime by operating system. There is no Docker dependency.
 
 - **macOS: Apple `container`.** A high-level runtime that pulls and runs images
-  by reference (docker-compatible CLI surface). Install it with
+  by reference, with a docker-compatible CLI. Install it with
   `brew install container` and start its service with `container system start`
-  (it also runs as a login service via `brew services start container`). Each
-  container gets its own lightweight Linux VM. Launch is
+  (or run it as a login service with `brew services start container`). Each
+  container gets its own lightweight Linux VM. Legion launches it with
   `container run --rm --name legion-<alloc> --progress none [--memory …]
   [--cpus …] [--publish …] [--env K=V …] <image> <command…>`.
-- **Linux: a low-level OCI runtime.** `youki` by default; any OCI-spec runtime
-  (`runc`, `crun`) works via the `LEGION_OCI_RUNTIME` env override, since they
-  share the bundle interface. These runtimes neither pull nor understand image
-  references — they run a *bundle* (an extracted `rootfs/` + a `config.json`
-  runtime spec), which Legion builds from the image's OCI layout (see
-  [Linux: image → bundle](#linux-image--bundle)).
-- **Other OS:** the runtime is rejected as unsupported.
+- **Linux: a low-level OCI runtime.** Legion uses `youki` by default. Any
+  OCI-spec runtime (`runc`, `crun`) works through the `LEGION_OCI_RUNTIME` env
+  override, since they share the bundle interface. These runtimes can't pull
+  images or read image references. They run a *bundle* (an extracted `rootfs/`
+  plus a `config.json` runtime spec), which Legion builds from the image's OCI
+  layout (see [Linux: image → bundle](#linux-image--bundle)).
+- **Other operating systems:** the runtime is rejected as unsupported.
 
-Before every launch the runtime preflights its OCI backend and fails the allocation
-with an actionable message when the binary is missing or (macOS) the
-`container` service is not running. Nodes publish a `container: pass` readiness
-check when the runtime is usable; the key is **omitted** when it is not, since
-a node without a container runtime is still healthy for every other runtime.
+Before every launch, the runtime checks its OCI backend. If the binary is
+missing, or the `container` service isn't running on macOS, the allocation
+fails with a message that says how to fix it. Nodes publish a `container: pass`
+readiness check when the runtime is usable. The key is omitted when it isn't,
+since a node without a container runtime is still healthy for every other
+runtime.
 
 ### Linux: image → bundle
 
-A low-level OCI runtime cannot fetch an image, so the runtime sources and converts
-it (`src/task_plugins/oci_bundle.rs`):
+A low-level OCI runtime can't fetch an image, so Legion fetches and converts it
+(`src/task_plugins/oci_bundle.rs`):
 
-1. **Obtain the image's OCI layout.** If the image was staged through the
-   artifact pipeline (`artifacts.containerImageDesugar`), that layout is used;
-   otherwise the runtime pulls it anonymously through the shared `oci://` fetcher.
-   A layout pulled by an earlier start of the same allocation is reused, so
-   in-place restarts don't refetch from the registry.
-2. **Build a bundle.** Extract each image layer into `rootfs/` (honoring
-   overlayfs whiteouts; gzip or uncompressed layers — zstd is rejected with an
-   explicit error), and synthesize an OCI runtime `config.json`:
-   - the task `command`/`env` merged over the image config's env (task wins;
-     `PATH` is defaulted if absent),
-   - the image's working dir and user — named users/groups resolve against the
-     extracted rootfs's `/etc/passwd` / `/etc/group` (with `HOME` set from the
-     passwd entry when the env doesn't set it); unresolvable names fall back to
-     root with a warning,
-   - host networking (no private network namespace) with the host's
-     `/etc/resolv.conf` and `/etc/hosts` bind-mounted read-only so DNS works,
+1. **Get the image's OCI layout.** If the image was staged through the
+   artifact pipeline (`artifacts.containerImageDesugar`), Legion uses that
+   layout. Otherwise it pulls the image anonymously through the shared `oci://`
+   fetcher. A layout pulled by an earlier start of the same allocation is
+   reused, so in-place restarts don't refetch from the registry.
+2. **Build a bundle.** Extract each image layer into `rootfs/`, honoring
+   overlayfs whiteouts. Gzip and uncompressed layers work. Zstd layers are
+   rejected with an explicit error. Then generate an OCI runtime `config.json`
+   with:
+   - the task `command`/`env` merged over the image config's env (the task
+     wins, and `PATH` gets a default if it's missing),
+   - the image's working dir and user. Named users and groups resolve against
+     the extracted rootfs's `/etc/passwd` and `/etc/group`, and `HOME` comes
+     from the passwd entry when the env doesn't set it. Names that can't be
+     resolved fall back to root with a warning.
+   - host networking by default, with the host's `/etc/resolv.conf` and
+     `/etc/hosts` bind-mounted read-only so DNS works. When the allocation has
+     its own resolver, the bundle mounts a generated `resolv.conf` pointing at
+     it instead. With `network.mode = "gated"`, the bundle joins the
+     allocation's network namespace (see
+     [Networking: `host` and `gated`](#networking-host-and-gated)),
    - a writable root filesystem.
 3. **Run it:** `<runtime> run --bundle <dir> legion-<alloc>`.
 
-The image/bundle scratch lives under the allocation's private directory and is
-removed on destroy.
+The image and bundle scratch space lives under the allocation's private
+directory and is removed on destroy.
 
 ## Config Schema
 
@@ -68,82 +74,84 @@ Required:
 Optional:
 
 - `env`: map of string env vars.
-- `files`: files to materialize in the task directory before the container
+- `files`: files to write into the task directory before the container
   starts (`[{ path, mode, content }]`), readable inside at
-  `/legion/task/<path>`. This is the shape `kvInjections.files` renders into
-  — see [The task directory](#the-task-directory-legiontask).
+  `/legion/task/<path>`. This is the shape `kvInjections.files` renders into.
+  See [The task directory](#the-task-directory-legiontask).
 
-The task-level `stop` block (a sibling of `resources`, not runtime config)
-also applies here — see [Graceful stop](#graceful-stop).
+The task-level `stop` block also applies here. It sits next to `resources`,
+not inside the runtime config. See [Graceful stop](#graceful-stop).
 
-The command follows the image reference directly — flags and all. There is no
-`--` terminator: Apple's argument parser reads `--` as the target executable
+Put the command directly after the image reference, flags included. Don't add
+a `--` separator. Apple's argument parser reads `--` as the target executable,
 and the container fails to start with "failed to find target executable --".
 
 ## Resources and Ports
 
-Unlike the `exec` runtime, `container` isolates its workload, so the task's
-declared `resources` and assigned ports are applied to the runtime rather than
-being scheduling bookkeeping alone. Both ride the allocation payload
+The `container` runtime isolates its workload, unlike `exec`. So the task's
+declared `resources` and assigned ports are applied to the runtime, instead of
+only being used for scheduling. Both travel in the allocation payload
 (`TaskAllocation.task_resources` / `.network`).
 
 - **`resources.memory` (MiB) → `--memory`, `resources.cores` → `--cpus`
-  (macOS).** Apple `container` boots a VM per container; an unsized guest gets
-  the runtime's own default (1 GiB / 4 CPUs) regardless of what the scheduler
-  reserved on the node. Only *declared* values are applied — scheduler
-  defaults are deliberately not folded in, so a job that declares nothing keeps
-  the runtime's defaults. The guest reports one CPU more than requested (its
-  own housekeeping core) and rounds memory up.
-  On macOS `resources.cpu` (MHz) has no runtime analogue and stays
-  scheduling-only, and `cores` means guest size rather than exclusivity —
-  Apple `container` has no weight or pinning to map them onto.
+  (macOS).** Apple `container` boots a VM per container. A guest with no size
+  set gets the runtime's own default (1 GiB / 4 CPUs), no matter what the
+  scheduler reserved on the node. Only *declared* values are applied.
+  Scheduler defaults aren't folded in, so a job that declares nothing keeps the
+  runtime's defaults. The guest reports one more CPU than requested (its own
+  housekeeping core) and rounds memory up.
+  On macOS, `resources.cpu` (MHz) has no runtime equivalent and is used only
+  for scheduling. `cores` sets the guest size rather than reserving exclusive
+  cores, because Apple `container` has no CPU weight or pinning to map them
+  onto.
 - **Assigned ports → `--publish <host>:<container>` (macOS).** The container
-  has its own IP inside a VM, so a host port only reaches it when published —
-  by service consumers and by the worker's own health checks alike. A port
-  declaring `to` publishes to that container-side port; one without publishes
-  host-port to host-port, matching the `LEGION_PORT_<NAME>` value the task is
-  handed.
+  has its own IP inside a VM, so a host port only reaches it when published.
+  That applies to service consumers and to the worker's own health checks. A
+  port that declares `to` publishes to that container-side port. A port
+  without `to` publishes host port to the same host port, which matches the
+  `LEGION_PORT_<NAME>` value the task receives.
 - **Linux: declared resources become kernel limits** on a worker running with
-  `resourceEnforcement.enabled` — hard memory, exclusive pinned cores, and
-  proportional CPU weight, applied through the generated OCI spec's
+  `resourceEnforcement.enabled`. You get hard memory limits, exclusive pinned
+  cores, and proportional CPU weight, applied through the generated OCI spec's
   `linux.resources` and `cgroupsPath`. The container runtime is a
   `RuntimeApplied` consumer of the node-wide enforcement subsystem, so a core
-  it reserves is off-limits to `exec` tasks on the same node too. The model,
-  the requirements, and the failure modes are documented in
-  [docs/resource-enforcement.md](resource-enforcement.md).
+  it reserves is also off-limits to `exec` tasks on the same node. See
+  [docs/resource-enforcement.md](resource-enforcement.md) for the model,
+  requirements, and failure modes.
 
-  Two validation rules come with it, on Linux and macOS alike: `cores` must be
-  a **whole number** (a cpuset cannot hold a fraction of a CPU), and a task
+  Two validation rules apply on both Linux and macOS: `cores` must be a
+  **whole number** (a cpuset can't hold a fraction of a CPU), and a task
   declares `cores` **or** `cpu`, never both.
-- **Linux port mapping is not applied.** The bundle uses host networking, so
-  assigned ports reach the container without mapping; private network
-  namespaces are the networking plan's territory.
+- **Linux port mapping is not applied.** In the default `host` mode, assigned
+  ports reach the container directly. In `gated` mode, inbound traffic only
+  arrives through the datapath's ingress listeners
+  ([Network Handlers](network-handlers.md#gated-mode)).
 
 ## Runtime Behavior
 
 - `prepare`: logging only.
 - `start`:
-  - parse `ContainerTaskConfig`, detect and preflight the runtime,
+  - parse `ContainerTaskConfig`, then detect and check the runtime,
   - remove any container still holding this allocation's name (a worker crash
-    or a killed `--rm` run leaves one behind, and `run --name` fails on a
-    taken name),
-  - macOS: build Apple `container run` args; Linux: obtain the OCI layout,
-    build a bundle, and `run --bundle`,
-  - spawn child (stdout/stderr captured per allocation when the worker sets a
-    log dir; the runtime's own fetch progress is suppressed so it cannot be
-    interleaved into the task's stderr),
-  - track child and PID.
-- `stop`: tear the container down by name **first**, gracefully — see
-  [Graceful stop](#graceful-stop). Killing the foreground `run` alone does not
-  stop the container: Apple `container` is daemon-backed, and a Linux OCI
-  runtime reparents the container init when its supervisor is killed. Then the
-  child handle / PID is reaped.
+    or a killed `--rm` run can leave one behind, and `run --name` fails if the
+    name is taken),
+  - macOS: build the Apple `container run` args. Linux: get the OCI layout,
+    build a bundle, and `run --bundle`.
+  - spawn the child process. Stdout and stderr are captured per allocation
+    when the worker sets a log dir. The runtime's own fetch progress is
+    suppressed so it doesn't get mixed into the task's stderr.
+  - track the child and its PID.
+- `stop`: tear the container down by name **first**, gracefully (see
+  [Graceful stop](#graceful-stop)). Killing the foreground `run` process alone
+  doesn't stop the container. Apple `container` is daemon-backed, and a Linux
+  OCI runtime reparents the container's init process when its supervisor is
+  killed. After that, the child handle and PID are reaped.
 - `destroy` delegates to `stop`.
 
 ## Graceful stop
 
-Stopping a container delivers a signal, waits, and only then kills. Both
-halves are declarable per task, next to `resources`:
+Stopping a container sends a signal, waits, and only then kills it. You can
+set both the signal and the wait per task, next to `resources`:
 
 ```nickel
 task = {
@@ -154,51 +162,51 @@ task = {
 }
 ```
 
-The block itself — its vocabulary, its defaults, and the 5-minute cap — is
-documented in [Graceful stop](graceful-stop.md#the-ladder). What is specific
-to this runtime is **where the signal is delivered** and **what happens when
-the jobspec is silent**:
+The block's options, defaults, and 5-minute cap are covered in
+[Graceful stop](graceful-stop.md#the-ladder). Two things are specific to this
+runtime: where the signal goes, and what happens when the jobspec doesn't set
+one.
 
-- **The signal goes to the container's init**, not to the launching CLI.
-  Both platforms keep the container alive when the foreground process is
-  signalled, so signalling the tracked host process would notify nobody.
-- **The Linux default chain is docker's** — the jobspec's `stop.signal`, then
-  the image's own `STOPSIGNAL`, then `SIGTERM`. This is why an *undeclared*
-  `stop` block is a distinct state from one that declares `SIGTERM`: only the
-  silent case consults the image. An image declaring a signal outside
-  Legion's vocabulary is ignored rather than failing the stop — an
-  unstoppable container is worse than a `SIGTERM` the image did not ask for.
-- **Apple `container` applies the image's stop signal itself**, so the macOS
-  chain is jobspec-or-`SIGTERM`, and the runtime owns the ladder end to end:
-  it may SIGKILL on its own schedule if `killAfter` is longer than its
-  `--time` accepts.
+- **The signal goes to the container's init process**, not to the CLI that
+  launched it. On both platforms the container keeps running when the
+  foreground process gets a signal, so signaling the tracked host process
+  would reach nothing.
+- **On Linux, the default chain matches Docker:** the jobspec's `stop.signal`,
+  then the image's own `STOPSIGNAL`, then `SIGTERM`. So leaving out the `stop`
+  block isn't the same as declaring `SIGTERM`. Only the first case checks the
+  image. If the image declares a signal Legion doesn't support, Legion ignores
+  it instead of failing the stop. A container that can't be stopped is worse
+  than one that gets a `SIGTERM` the image didn't ask for.
+- **Apple `container` applies the image's stop signal itself**, so on macOS
+  the chain is the jobspec's signal or `SIGTERM`. The runtime handles the whole
+  stop sequence. It may send SIGKILL on its own schedule if `killAfter` is
+  longer than its `--time` flag accepts.
 
-The mechanism per platform:
+How each platform does it:
 
 - **Linux:** `<runtime> kill legion-<alloc> <signal>` ("not running" is
-  ignored — a finished batch container is already gone), then poll
-  `<runtime> state` until the container is stopped or absent, up to the grace
-  period, then `<runtime> delete --force` unconditionally: the reaper for a
-  stopped container and the killer for a hung one.
+  ignored, since a finished batch container is already gone). Then Legion
+  polls `<runtime> state` until the container is stopped or gone, up to the
+  grace period. Finally it always runs `<runtime> delete --force`, which
+  cleans up a stopped container and kills a hung one.
 - **macOS:** `container stop --signal <signal> --time <secs> legion-<alloc>`,
-  which runs the same ladder inside the daemon.
+  which runs the same sequence inside the daemon.
 
-A container that exits inside the window is never force-killed; one that
-ignores the signal is gone at the deadline. `stop` against an already-exited
-container stays error-free.
+A container that exits within the grace period is never force-killed. One
+that ignores the signal is killed at the deadline. Running `stop` on a
+container that already exited doesn't return an error.
 
 ## Signals
 
-The runtime delivers signals to the container's **init process**, through the
-runtime CLI (`container kill --signal` on macOS, `<runtime> kill` on Linux) —
-*not* to the tracked pid, which is the runtime supervisor and whose death
-would leave the workload running unsignaled.
+The runtime sends signals to the container's **init process** through the
+runtime CLI (`container kill --signal` on macOS, `<runtime> kill` on Linux).
+It doesn't signal the tracked PID. That PID is the runtime supervisor, and
+killing it would leave the workload running without ever getting the signal.
 
-That is what lets a container task declare an identity with
-`changeMode = "signal"`: on token rotation the worker rewrites the token file
-inside the mounted task directory and signals the container, and the workload
-re-reads it with no restart. See
-[docs/workload-identity.md](workload-identity.md).
+This lets a container task declare an identity with `changeMode = "signal"`.
+When the token rotates, the worker rewrites the token file inside the mounted
+task directory and signals the container. The workload then re-reads the file
+without a restart. See [docs/workload-identity.md](workload-identity.md).
 
 ## The task directory (`/legion/task`)
 
@@ -207,33 +215,33 @@ read-write at **`/legion/task`**. Everything the worker stages for the task is
 readable there: file and tree artifacts, KV-rendered files, and identity
 tokens.
 
-The *directory* is mounted, never individual files. That is the whole point:
-the worker replaces rendered files atomically by rename, which stays visible
-through a directory bind mount and silently breaks through a per-file one (the
-well-known docker pitfall, where the container keeps the stale inode). A KV
-re-render or a token rotation therefore reaches a running container with no
-restart and no projection machinery.
+Legion mounts the whole directory, never individual files. The worker
+replaces rendered files atomically by renaming them. A rename shows up through
+a directory bind mount, but a per-file bind mount silently keeps the old file
+(a well-known Docker pitfall, where the container holds on to the stale
+inode). Because of this, a KV re-render or token rotation reaches a running
+container without a restart or any extra projection machinery.
 
-The mount is added *before* declared `volumes[]`, so a job can deliberately
+The mount is added *before* declared `volumes[]`, so a job can intentionally
 shadow it with a volume at the same destination.
 
-**Env is translated to the in-container view**, extending the convention
-volumes already set:
+**Env vars are rewritten to the in-container paths**, following the same
+convention volumes already use:
 
 | Variable | Value inside the container |
 | --- | --- |
 | `LEGION_TASK_DIR` | `/legion/task` |
 | `LEGION_ARTIFACT_<NAME>` | the staged path, rebased onto `/legion/task` |
 | `LEGION_VOLUME_<NAME>`, `LEGION_STORAGE_DIR` | the declared mount destination |
-| `LEGION_ALLOC_DIR` | **not set** — the alloc dir is not mounted, and pointing env at an invisible path is the bug this exists to fix |
+| `LEGION_ALLOC_DIR` | **not set**. The alloc dir isn't mounted, so there is no in-container path to point it at |
 
 `${artifact.<name>}` interpolation in the runtime config uses the same
-translated paths.
+rewritten paths.
 
-**File destinations must resolve under `/legion/task`.** Nothing else is
-reachable from inside the container, so a destination outside the mount is
-rejected at submit rather than staged where the workload could never read it.
-Relative paths resolve against the mount:
+**File destinations must resolve under `/legion/task`.** Nothing else on the
+host is reachable from inside the container. A destination outside the mount
+is rejected at submit, instead of being staged somewhere the workload can never
+read. Relative paths resolve against the mount:
 
 ```nickel
 kvInjections = { files = [
@@ -246,7 +254,8 @@ identities = [{
 }],
 ```
 
-An out-of-range path fails at submit with the fix in the message:
+A path outside the mount fails at submit, and the message tells you how to fix
+it:
 
 ```
 task api identity "api": file.path "/var/run/legion/token" is outside the
@@ -254,66 +263,68 @@ container task directory; use a path under /legion/task (or a relative path),
 or switch to env delivery
 ```
 
-This is the one place a jobspec is **not** verbatim-portable between the
-`exec` and `container` runtimes: the exec runtime's filesystem *is* the
-host's, so its host-absolute destinations stay valid and are not translated.
+This is the one place a jobspec can't be copied unchanged between the `exec`
+and `container` runtimes. The exec runtime runs on the host's filesystem, so
+its host-absolute destinations stay valid and aren't rewritten.
 
 Only the allocation's own private task directory is exposed. The log directory
-is not mounted (captured stdout/stderr can carry secrets and stays
-owner-restricted on the host), and `noNewPrivileges`, masked paths, and the
+isn't mounted, because captured stdout and stderr can contain secrets and stay
+owner-restricted on the host. `noNewPrivileges`, masked paths, and the
 capability set are unchanged.
 
 ## Artifacts Support
 
-`container` reports `supports_artifacts()`, with consumption scoped to
-images (see [docs/artifacts.md](artifacts.md)):
+`container` reports `supports_artifacts()`, but it only consumes images
+directly (see [docs/artifacts.md](artifacts.md)):
 
 - **Image desugaring (behind a cluster flag):** when the manager config sets
-  `artifacts.containerImageDesugar = true`, the `image` field is desugared at
-  admission into an implicit `oci://` artifact named `image` (Docker Hub
-  shorthand expands, e.g. `alpine:latest` ->
-  `oci://docker.io/library/alpine:latest`). The worker pulls it through the
-  shared artifact pipeline — cluster auth matchers, digest pinning, status
-  rows — and the plugin's `consume_artifact` imports the staged OCI layout
+  `artifacts.containerImageDesugar = true`, the `image` field is converted at
+  admission into an implicit `oci://` artifact named `image`. Docker Hub
+  shorthand expands, so `alpine:latest` becomes
+  `oci://docker.io/library/alpine:latest`. The worker pulls it through the
+  shared artifact pipeline (cluster auth matchers, digest pinning, status
+  rows), and the plugin's `consume_artifact` imports the staged OCI layout
   into the runtime.
-  - macOS (Apple `container`): the layout is tarred and imported via
-    `container image load`, and the subsequent run uses the artifact's
-    **pinned digest reference** rather than the jobspec's tag — so the
-    container provably runs the image the pipeline resolved, with no registry
-    pull. (An allocation restored after a worker restart has no staged record
-    and falls back to the jobspec's reference.)
+  - macOS (Apple `container`): Legion tars the layout and imports it with
+    `container image load`. The run then uses the artifact's **pinned digest
+    reference** instead of the jobspec's tag. That guarantees the container
+    runs the exact image the pipeline resolved, with no registry pull. (An
+    allocation restored after a worker restart has no staged record and falls
+    back to the jobspec's reference.)
   - Linux (OCI runtime): the layout is converted to a runtime bundle (see
     [Linux: image → bundle](#linux-image--bundle)).
   - Container images are Linux guests on every host, so the `oci://` fetcher
-    resolves multi-platform indexes against `linux/<arch>` rather than the
-    host platform — on macOS the host platform (`darwin/arm64`) matches
-    nothing in an image index.
-  - The flag defaults to **off** until the artifact cache lands. With it off,
-    macOS lets Apple `container` pull the image itself, while Linux falls back
-    to an anonymous pull through the shared `oci://` fetcher (so the OCI runtime,
-    which cannot pull, still gets its rootfs). Private-registry auth and digest
+    resolves multi-platform indexes against `linux/<arch>` instead of the
+    host platform. On macOS the host platform (`darwin/arm64`) wouldn't match
+    anything in an image index.
+  - The flag defaults to **off**. Legion has no artifact cache, so with the
+    flag on, every allocation would re-download its image, a step backward
+    for runtimes that cache images themselves. With it off,
+    macOS lets Apple `container` pull the image itself. Linux falls back to an
+    anonymous pull through the shared `oci://` fetcher, so the OCI runtime
+    (which can't pull) still gets its rootfs. Private-registry auth and digest
     pinning require the artifact pipeline (flag on).
-- **File/tree artifacts work:** they stage into the host task directory, which
-  is mounted at `/legion/task`, and both `LEGION_ARTIFACT_<NAME>` and
-  `${artifact.<name>}` carry the in-container path. See
+- **File and tree artifacts work.** They're staged into the host task
+  directory, which is mounted at `/legion/task`. Both `LEGION_ARTIFACT_<NAME>`
+  and `${artifact.<name>}` hold the in-container path. See
   [The task directory](#the-task-directory-legiontask).
 
 ## Networking: `host` and `gated`
 
 By default a `container` task shares the host's network (`network.mode =
-"host"`): declared ports are host ports, `connect.upstreams` are loopback
-ports the node datapath owns, and egress policy applies to traffic that goes
-through those upstreams and to names resolved through the allocation's
-resolver (`LEGION_DNS`) — cooperatively.
+"host"`). Declared ports are host ports, and `connect.upstreams` are loopback
+ports owned by the node datapath. Egress policy applies to traffic through
+those upstreams and to names resolved through the allocation's resolver
+(`LEGION_DNS`). In this mode, enforcement depends on the workload using them.
 
-With `network.mode = "gated"` (Linux) the worker creates an empty network
-namespace for the allocation before it starts and the container joins it by path through an OCI `network` namespace entry. The namespace
-holds loopback and the datapath's listeners only — upstream ports, VIPs,
-the resolver, and an egress proxy at `127.0.0.1:1080` exported as
-`HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` — so egress policy is
-unbypassable: a tool that ignores the proxy has no route. The full model,
-the fail-closed rules, and the limits (no raw UDP, no ICMP, no inbound to
-undeclared ports, Linux only) are in
+With `network.mode = "gated"` (Linux), the worker creates an empty network
+namespace for the allocation before it starts. The container joins it by path
+through an OCI `network` namespace entry. The namespace holds only loopback and
+the datapath's listeners: upstream ports, VIPs, the resolver, and an egress
+proxy at `127.0.0.1:1080` exported as `HTTP_PROXY` / `HTTPS_PROXY` /
+`ALL_PROXY`. A tool that ignores the proxy has no route out, so it can't
+bypass egress policy. The full model, the fail-closed rules, and the limits
+(no raw UDP, no ICMP, no inbound to undeclared ports, Linux only) are in
 [Network Handlers](network-handlers.md#gated-mode).
 
 ## Capability Summary
@@ -321,40 +332,42 @@ undeclared ports, Linux only) are in
 | Capability | Supported |
 | --- | --- |
 | KV env injection | ✅ |
-| KV file injection | ✅ — destinations must resolve under `/legion/task` |
-| Identity env / file delivery | ✅ / ✅ — file destinations under `/legion/task` |
-| Signal delivery | ✅ — to the container init, both platforms |
+| KV file injection | ✅ (destinations must resolve under `/legion/task`) |
+| Identity env / file delivery | ✅ / ✅ (file destinations under `/legion/task`) |
+| Signal delivery | ✅ to the container init, both platforms |
 | Graceful stop (`stop { signal, killAfter }`) | ✅ both platforms |
-| Memory / CPU limits | ✅ macOS (guest sizing); ✅ Linux with `resourceEnforcement.enabled` (cgroup v2) — see [docs/resource-enforcement.md](resource-enforcement.md) |
-| Exclusive cores (`resources.cores`) | ✅ Linux (cpuset pinning); macOS sizes the guest instead |
-| Port publishing | ✅ macOS; n/a on Linux (host networking) |
-| Volumes (`volumes[]`, `stateful.storage`) | ✅ bind-mounted at the declared `path` — see [docs/volumes.md](volumes.md) |
+| Memory / CPU limits | ✅ macOS (guest sizing). ✅ Linux with `resourceEnforcement.enabled` (cgroup v2). See [docs/resource-enforcement.md](resource-enforcement.md) |
+| Exclusive cores (`resources.cores`) | ✅ Linux (cpuset pinning). macOS sizes the guest instead |
+| Port publishing | ✅ macOS. n/a on Linux (host networking, or ingress listeners in `gated` mode) |
+| Volumes (`volumes[]`, `stateful.storage`) | ✅ bind-mounted at the declared `path`. See [docs/volumes.md](volumes.md) |
 | Artifacts | ✅ image (staged via `containerImageDesugar`, or pulled by the runtime) and file/tree (readable under `/legion/task`) |
-| Exec / interactive PTY | ✅ / ✅ on both Apple `container` and the Linux OCI runtimes (sandboxed) — see [docs/exec-and-actions.md](exec-and-actions.md) |
+| Exec / interactive PTY | ✅ / ✅ on both Apple `container` and the Linux OCI runtimes (sandboxed). See [docs/exec-and-actions.md](exec-and-actions.md) |
 
 Container exec runs inside the container's namespaces, so it is sandboxed
-(`host = false`): an `exec:write` rule without `host` suffices.
+(`host = false`). An `exec:write` rule without `host` is enough.
 
 ## Examples
 
-- [`configs/jobs/mac-container.ncl`](../configs/jobs/mac-container.ncl)
-  — batch task: env, declared resources sizing the guest.
-- [`configs/jobs/mac-container-service.ncl`](../configs/jobs/mac-container-service.ncl)
-  — long-running service: dynamic port publishing, health checks, service
+- [`configs/jobs/mac-container.ncl`](../configs/jobs/mac-container.ncl):
+  batch task with env and declared resources that size the guest.
+- [`configs/jobs/mac-container-service.ncl`](../configs/jobs/mac-container-service.ncl):
+  long-running service with dynamic port publishing, health checks, service
   discovery, exec, and declared actions.
 
-Both are macOS-constrained because the Linux path needs an OCI runtime
-installed; the jobspecs themselves are portable apart from the `os` constraint.
+Both are written for Apple `container` and constrained to macOS. The service
+example also relies on publishing a dynamic host port to nginx's port 80
+inside the container, which Linux doesn't do. Apart from the `os` constraint,
+the batch jobspec is portable.
 
 ## Testing
 
-Unit tests cover launch-argv construction (no `--` separator, progress
+Unit tests cover launch argv construction (no `--` separator, progress
 suppression, resource mapping, port publishing, pinned-reference launch), the
-exec and signal argv dialects per runtime, the stop-signal default chain, the
+exec and signal argv formats per runtime, the stop-signal default chain, the
 generated `linux.resources`/`cgroupsPath`, the `/legion/task` mount ordering,
-env translation, and the runtime preflight. End-to-end tests are `#[ignore]`d
-because they need a runtime and network (and, for the limit tests, cgroup v2
-and root):
+env rewriting, and the runtime preflight check. End-to-end tests are marked
+`#[ignore]` because they need a runtime and network access. The limit tests
+also need cgroup v2 and root.
 
 ```bash
 # macOS, with Apple `container` installed and started
@@ -366,28 +379,32 @@ LEGION_OCI_RUNTIME=runc cargo test --lib oci_runtime -- --ignored --nocapture
 
 ## Current Scope and Limitations
 
-- Runtime integration is intentionally simple (shelling out to runtime binaries).
-- The root filesystem is writable. The host paths mounted in are the
-  allocation's own task directory at `/legion/task` and whatever the job
-  declares as volumes ([docs/volumes.md](volumes.md)) — the alloc directory
-  and the log directory are not mounted.
-- File-delivery destinations must resolve under `/legion/task`; per-file bind
-  mounts and K8s-style projected volumes are rejected designs, not pending
-  work (they break refresh atomicity).
-- Linux containers share host networking (with host DNS files bind-mounted
-  read-only); private network namespaces and port mapping are not implemented.
+- The runtime integration is simple: it shells out to runtime binaries.
+- The root filesystem is writable. The only host paths mounted in are the
+  allocation's own task directory at `/legion/task` and any volumes the job
+  declares ([docs/volumes.md](volumes.md)). The alloc directory and the log
+  directory aren't mounted.
+- File-delivery destinations must resolve under `/legion/task`. Per-file bind
+  mounts and K8s-style projected volumes were rejected as designs because they
+  break atomic refresh. They aren't planned.
+- Linux containers share host networking by default. A private network
+  namespace is available only through `network.mode = "gated"`, which has its
+  own limits ([Network Handlers](network-handlers.md#gated-mode)). Port
+  mapping is not implemented.
 - Linux resource enforcement requires the cgroup v2 unified hierarchy, a
   worker that can create the `legion/` subtree at the cgroup root, and
   `resourceEnforcement.enabled` in the worker config. Without it, `resources`
-  stay scheduling-only on Linux, exactly as before.
-- On macOS, `resources.cpu` (MHz) remains scheduling-only and `cores` means
-  guest size rather than exclusivity — Apple `container` has no weight or
-  pinning analogue.
-- There is no `legion alloc signal` verb: signals are delivered by declared
+  are used only for scheduling on Linux.
+- On macOS, `resources.cpu` (MHz) is used only for scheduling, and `cores`
+  sets the guest size instead of reserving exclusive cores. Apple `container`
+  has no CPU weight or pinning equivalent.
+- There is no `legion alloc signal` command. Signals are sent only by declared
   policy (`changeSignal` on refresh, `stop.signal` on teardown), not on demand.
 - Private-registry image auth and digest pinning require the artifact pipeline
-  (`containerImageDesugar`); the runtime's own fallback pull is anonymous.
-- zstd-compressed image layers are rejected (gzip and uncompressed supported).
-- No artifact cache yet, so an off-pipeline Linux pull fetches once per
-  allocation (in-place restarts reuse the pulled layout; moves refetch).
-- Health checks still run through worker health monitor.
+  (`containerImageDesugar`). The runtime's own fallback pull is anonymous.
+- Zstd-compressed image layers are rejected. Gzip and uncompressed layers are
+  supported.
+- There is no artifact cache, so a Linux pull outside the pipeline fetches
+  once per allocation. In-place restarts reuse the pulled layout, and moves
+  refetch.
+- Health checks still run through the worker health monitor.

@@ -1,13 +1,10 @@
 # Exec & Actions
 
-Legion can run a command **inside a running allocation** — a one-shot
-diagnostic, an interactive shell, or a pre-baked, parameterized *action* — from
-both the CLI and the web UI. Access is gated by two ACL resources (`exec` and
-`action`) so an on-call engineer can be given a curated set of actions without
-full shell access.
-
-Design rationale and the alternatives considered live in
-[internal_docs/plans/exec-and-actions-plan.md](../internal_docs/plans/exec-and-actions-plan.md).
+Legion can run a command inside a running allocation from the CLI or the web
+UI. You can run a one-shot diagnostic, open an interactive shell, or run a
+predefined, parameterized *action*. Two ACL resources (`exec` and `action`)
+gate access, so you can give an on-call engineer a curated set of actions
+without full shell access.
 
 - [Exec](#exec)
 - [Actions](#actions)
@@ -21,8 +18,8 @@ Design rationale and the alternatives considered live in
 
 ## Exec
 
-Run a command in a running allocation. One-shot prints output and exits with
-the remote exit code; `-t` allocates an interactive PTY.
+Run a command in a running allocation. A one-shot command prints its output and
+exits with the remote exit code. Pass `-t` to allocate an interactive PTY.
 
 ```bash
 # One-shot: prints output, exits with the remote exit code (scriptable).
@@ -39,19 +36,20 @@ legion exec 4217 --task api -it -- /bin/bash
 legion exec --job web -it -- /bin/sh
 ```
 
-Flags mirror docker/kubectl: `-i/--stdin` forwards local stdin, `-t/--tty`
+Flags match docker and kubectl: `-i/--stdin` forwards local stdin, `-t/--tty`
 allocates a pseudo-terminal, and everything after `--` is the remote argv.
 
-In the **UI**, open a task (Jobs → a job → a task) and use the **Exec &
-Actions** panel on any running allocation: type a command, toggle *Interactive
-(tty)*, and an embedded terminal (xterm.js) streams the session.
+In the UI, open a task (Jobs → a job → a task) and use the **Exec &
+Actions** panel on any running allocation. Type a command and toggle
+*Interactive (tty)* if you want a shell. An embedded terminal (xterm.js)
+streams the session.
 
 ## Actions
 
 An **action** is a named, parameterized command template declared on a task.
-It is rendered and validated **server-side** from the stored job spec — the
-caller sends an action name and parameters, never raw argv — so an action-only
-grant cannot be turned into an arbitrary shell.
+The server renders and validates it from the stored job spec. The caller sends
+only an action name and parameters, never raw argv. This means an action-only
+grant can't be turned into an arbitrary shell.
 
 ### Declaring actions
 
@@ -97,17 +95,17 @@ Parameter fields:
 | --- | --- |
 | `type` | `string` (default), `int`, `bool`, or `enum` |
 | `default` | value used when the param is omitted (makes it optional) |
-| `required` | force required/optional (defaults to required unless a `default` is set) |
+| `required` | force required or optional (defaults to required unless a `default` is set) |
 | `values` | allowed values for `enum` params |
 | `pattern` | anchored regex constraint for `string` params |
 | `min` / `max` | inclusive bounds for `int` params |
 | `sensitive` | redact the value (`***`) in audit events, CLI echo, and UI history |
 | `tty` | (action-level) allocate a PTY when the action runs |
 
-`${param.<name>}` placeholders are substituted **inside individual argv
-elements** — there is no shell evaluation and no word-splitting. Values are
-validated against their type/constraints at submission *and* again at
-invocation. Unknown or missing-required params are rejected.
+`${param.<name>}` placeholders are substituted inside individual argv
+elements. There is no shell evaluation and no word-splitting. Values are
+checked against their type and constraints at submission and again at
+invocation. Legion rejects unknown params and missing required params.
 
 ### Running actions
 
@@ -118,31 +116,31 @@ legion action run web tail-slowlog --alloc 4217 --param lines=500
 legion action run web debug-shell --alloc 4217 -it       # a tty action
 ```
 
-In the **UI**, the same **Exec & Actions** panel renders each action with a
-form generated from its parameter schema (enum → dropdown, int/string →
-validated input); *Run* streams output into the terminal with an exit code.
+In the UI, the same **Exec & Actions** panel shows each action with a form
+built from its parameter schema (enum → dropdown, int/string → validated
+input). *Run* streams output into the terminal and shows the exit code.
 
 ## Which task runtimes support exec
 
-Each task runtime declares its exec support; `legion exec` fails fast with a clear
-error against a runtime that does not support it.
+Each task runtime declares whether it supports exec. Against a runtime that
+doesn't, `legion exec` fails fast with a clear error.
 
 | Kind | Exec | Interactive (tty) | Notes |
 | --- | --- | --- | --- |
-| `exec` | ✅ | ✅ | Runs a sibling host process with the task's env/cwd. **Host-level** — requires the `host` ACL grant. |
+| `exec` | ✅ | ✅ | Runs a sibling host process with the task's env/cwd. Host-level, so it requires the `host` ACL grant. |
 | `container` (Apple `container`) | ✅ | ✅ | `container exec` inside the container's namespaces (sandboxed). |
-| `container` (youki / runc / crun) | ✅ | ✅ | `<runtime> exec` inside the container's namespaces (sandboxed). The process spec comes from the bundle Legion generated, so env, cwd, and user match the task exactly; argv is replaced and the exit status is the process's own. |
-| `sandbox` (microVM) | ❌ | ❌ | Deferred; exec into a guest needs a vsock agent. Reports unsupported rather than failing at session open. |
+| `container` (youki / runc / crun) | ✅ | ✅ | `<runtime> exec` inside the container's namespaces (sandboxed). The process spec comes from the bundle Legion generated, so env, cwd, and user match the task. Only argv is replaced, and the exit status is the process's own. |
+| `sandbox` (microVM) | ❌ | ❌ | Not yet supported, because exec into a guest needs a vsock agent. Reports unsupported up front instead of failing at session open. |
 | `sandbox` (macOS dev mode) | ✅ | ✅ | `container exec` into the sandbox's VM-backed container. |
 | `noop` / custom plugins | ❌ | ❌ | Opt in by implementing `exec_support()` + `exec()`. |
 
-> **Windows:** interactive PTY uses ConPTY via `portable-pty`. It is expected
-> to work but is **experimental** — there is no Windows CI coverage yet.
+> **Windows:** interactive PTY uses ConPTY via `portable-pty`. It should work
+> but is **experimental**, since there is no Windows CI coverage yet.
 
 ## ACLs
 
-Two resources extend the existing ACL vocabulary (both default-deny once ACLs
-are enabled):
+Exec adds two resources to the ACL vocabulary. Both are default-deny once ACLs
+are enabled.
 
 | Resource | `write` grants |
 | --- | --- |
@@ -151,9 +149,9 @@ are enabled):
 
 Rule selectors:
 
-- `names` — job names (glob), as elsewhere.
-- `action_names` — action names (glob), on `action` rules.
-- `host = true` — on `exec` rules, also permits exec into **host-level** runtimes
+- `names`: job names (glob), as elsewhere.
+- `action_names`: action names (glob), on `action` rules.
+- `host = true`: on `exec` rules, also allows exec into host-level runtimes
   (the `exec` runtime). Without it, an `exec` rule matches only sandboxed
   runtimes (`container`, `sandbox`).
 
@@ -170,30 +168,30 @@ Rule selectors:
 ]
 ```
 
-`exec:write` **implies** `action:write` for the same job (anyone who can open a
-shell can type the command anyway). The reverse never holds — that separation
-is the entire point of actions.
+`exec:write` implies `action:write` for the same job, since anyone who can open
+a shell can type the command anyway. The reverse never holds. Keeping action
+grants separate from shell access is why actions exist.
 
-Every session and action run is audited (tracing target `exec_audit`) with the
-principal, accessor id, allocation, task, command or action + parameters
-(sensitive values redacted), tty flag, and exit code.
+Every session and action run is audited under the tracing target `exec_audit`.
+Each audit record has the principal, accessor id, allocation, task, command or
+action plus parameters (sensitive values redacted), tty flag, and exit code.
 
 ## Agents (MCP)
 
 The MCP server (`legion mcp serve`) exposes exec/actions to agents:
 
-- `legion_action_list` (read-only) — list a job's declared actions and params.
-- `legion_action_run` (mutating, needs `--allow-write`) — run an action
-  one-shot and return combined output + exit code.
-- `legion_exec_run` (mutating, needs `--allow-write`) — run a one-shot command
+- `legion_action_list` (read-only): list a job's declared actions and params.
+- `legion_action_run` (mutating, needs `--allow-write`): run an action
+  one-shot and return combined output and exit code.
+- `legion_exec_run` (mutating, needs `--allow-write`): run a one-shot command
   and return stdout, stderr, and exit code.
 
-There is no interactive PTY over MCP — these tools are one-shot only.
+There is no interactive PTY over MCP. These tools are one-shot only.
 
 ## Disabling exec
 
-Exec is on by default (it is still per-caller default-deny once ACLs are
-enabled). A hardened deployment can turn it off entirely in the manager config:
+Exec is on by default, though once ACLs are enabled each caller is still
+denied unless granted. To turn it off entirely, set this in the manager config:
 
 ```nickel
 # configs/manager.ncl
@@ -212,14 +210,15 @@ UI   ──WebSocket /v1/exec/ws───────┘        (proxies frames)
 
 - One protobuf frame protocol (stdin / stdout / stderr / resize / in-band exit)
   runs on every leg. The CLI and manager↔worker legs use native gRPC bidi
-  streams; the browser uses a WebSocket because gRPC-Web cannot do
+  streams. The browser uses a WebSocket because gRPC-Web can't do
   bidirectional streaming.
-- The **manager is the trust boundary**: it authorizes the request, renders any
+- The manager is the trust boundary. It authorizes the request, renders any
   action's argv from the stored spec, and proxies the stream to the worker.
   Clients never learn worker addresses.
-- The WebSocket listener runs on the manager port **+ 1** (tonic's gRPC server
-  does not perform HTTP upgrades). Browsers authenticate with the bearer token
-  carried in the first frame, since they cannot set WebSocket request headers.
-- Interactive sessions use a real PTY on the worker (`portable-pty`: openpty on
-  Unix, ConPTY on Windows). Sessions die with the connection; there is no
-  detach/reattach.
+- The WebSocket listener runs on the manager port + 1, because tonic's gRPC
+  server doesn't perform HTTP upgrades. Browsers can't set WebSocket request
+  headers, so they authenticate with the bearer token carried in the first
+  frame.
+- Interactive sessions use a PTY on the worker (`portable-pty`: openpty on
+  Unix, ConPTY on Windows). Sessions end when the connection closes. There is
+  no detach/reattach.

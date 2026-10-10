@@ -1,14 +1,13 @@
 # Auth & ACLs
 
-Legion ships a token-based ACL system: callers present a bearer credential,
-the manager resolves it to a set of named **policies**, and policies contain
-scoped allow/deny **rules** over a small set of resources and actions.
-Evaluation is default-deny once enabled, and a matching deny rule always
-overrides an allow.
+Legion uses token-based ACLs to control who can do what in a cluster. Callers
+present a bearer credential, and the manager resolves it to a set of named
+**policies**. Each policy contains scoped allow/deny **rules** over a small
+set of resources and actions. Once ACLs are enabled, anything not allowed is
+denied, and a matching deny rule always overrides an allow.
 
-**ACLs are off by default.** With ACLs disabled every caller has full access
-and the UI shows a dismissable warning. Design rationale and roadmap live in
-[internal_docs/plans/auth-acl-plan.md](../internal_docs/plans/auth-acl-plan.md).
+**ACLs are off by default.** With ACLs disabled, every caller has full access
+and the UI shows a dismissable warning.
 
 ## Quick start
 
@@ -45,19 +44,18 @@ legion acl whoami
 | `state` | raw state store, saved queries | SQL reads, schema | SQL writes, saved queries |
 | `operator` | raft, manager configs, observability | status/history/logs | raft commands, raft join tokens |
 | `acl` | tokens, policies, users | list/get | create/update/delete |
-| `exec` | exec into a running allocation | — | open a session (`host = true` for host-level runtimes) |
-| `action` | run declared actions on an allocation | — | run an action (scope with `action_names`) |
+| `exec` | exec into a running allocation | n/a | open a session (`host = true` for host-level runtimes) |
+| `action` | run declared actions on an allocation | n/a | run an action (scope with `action_names`) |
 | `template` | job templates | list/inspect | publish versions, delete (scope with `templates`) |
-| `scale` | task count overrides ([Scaling Jobs](autoscaling.md)) | scale status | `job scale` / reset (scope by job name) — deliberately separate from `job:write`, so a principal can resize without redeploy rights |
-| `boot` | boot tickets ([Edge Boot](edge-boot.md)) | list outstanding tickets | mint a ticket (scope by job name) — separate from `job:write` for the same reason `scale` is: a platform's ticket minter authorizes individual starts without the right to redeploy the fleet |
-| `net` | network policy objects ([Network Handlers](network-handlers.md)) | list policies; show or test a job's effective policy (scope by job name) | apply or delete a policy — scope with `pools`, which is matched against the policy's own `selector.nodePools`, so a pool's admin can set posture for their pool without cluster-wide write |
+| `scale` | task count overrides ([Scaling Jobs](autoscaling.md)) | scale status | `job scale` / reset (scope by job name). Separate from `job:write`, so a principal can resize without redeploy rights. |
+| `boot` | boot tickets ([Edge Boot](edge-boot.md)) | list outstanding tickets | mint a ticket (scope by job name). Separate from `job:write` for the same reason as `scale`: a platform's ticket minter can authorize individual starts without the right to redeploy the fleet. |
+| `net` | network policy objects ([Network Handlers](network-handlers.md)) | list policies, show or test a job's effective policy (scope by job name) | apply or delete a policy. Scope with `pools`, which is matched against the policy's own `selector.nodePools`, so a pool's admin can set posture for their pool without cluster-wide write. |
 
-Actions are `read` and `write` (`write` does not imply `read`; grant both).
-`state:read` is powerful — it can read every table in the state store —
-grant it sparingly. KV values are the one thing it cannot read: they are
-stored encrypted ([KV Encryption at Rest](kv-encryption.md)), so raw SQL
-sees ciphertext and a `kv` rule scoped by `paths` is the only way to a
-value.
+Actions are `read` and `write`. `write` does not imply `read`, so grant both.
+Grant `state:read` sparingly, since it can read every table in the state
+store. The one thing it cannot read is KV values. Those are stored encrypted
+([KV Encryption at Rest](kv-encryption.md)), so raw SQL sees ciphertext. A
+`kv` rule scoped by `paths` is the only way to read a value.
 
 ### Policies
 
@@ -76,17 +74,18 @@ A policy is a named JSON array of rules:
 - `resources` / `actions` accept `*`.
 - `effect` is `allow` (default) or `deny`.
 - Scope selectors narrow a rule with `*`-globs: `names` (job names),
-  `namespaces` (jobs live in `default` until namespaces land), `pools`
+  `namespaces` (Legion has no user-defined namespaces, so every job is in
+  `default`), `pools`
   (node pools), `paths` (KV keys), `actionNames` (declared actions),
   `templates` (job-template names), and `bands` (job priority bands). A rule
   with a selector only matches requests carrying that attribute.
 - List endpoints filter to what the caller can read: a token scoped to
   `paths = ["team-a/*"]` sees only `team-a/` keys in `legion kv list`.
 
-**Restricting an account to specific job templates.** Because a rule with a
-selector never matches a request lacking that attribute, a `job` rule
-carrying `templates` grants submission *only through* those templates —
-raw `legion job run` stays denied:
+**Restricting an account to specific job templates.** A rule with a selector
+never matches a request that lacks that attribute. So a `job` rule carrying
+`templates` grants submission only through those templates, and raw
+`legion job run` stays denied:
 
 ```nickel
 [
@@ -102,14 +101,14 @@ collision guard and which endpoints carry the template attribute.
 
 **Restricting which priority bands an account may claim.** A job's
 `priority` band decides what it can displace
-([Preemption and Eviction](preemption-and-eviction.md)), so an ungoverned top
-band means nothing — everyone sets it. The `bands` selector on `job` rules is
-the gate:
+([Preemption and Eviction](preemption-and-eviction.md)). If anyone can use the
+top band, everyone will, and it stops meaning anything. Use the `bands`
+selector on `job` rules to control this:
 
 ```nickel
 [
-  # prod owners may claim anything, including the never-preempted top band
-  { resources = ["job"], actions = ["write"], namespaces = ["prod"],
+  # owners of prod-* jobs may claim anything, including the never-preempted top band
+  { resources = ["job"], actions = ["write"], names = ["prod-*"],
     bands = ["critical", "high", "elevated", "normal", "low", "background"] },
   # everyone else tops out at `high`
   { resources = ["job"], actions = ["read", "write"],
@@ -117,15 +116,15 @@ the gate:
 ]
 ```
 
-Three things worth knowing:
+Keep in mind:
 
 - A rule that **omits** `bands` covers every band. Bands are open by default
-  and become a privilege only where a policy says so.
-- An **unbanded** job is a `normal` job: the submit path defaults the band
-  before enforcing, so a `bands` policy still matches ordinary submissions
-  rather than silently granting nothing.
-- The gate covers submitting **through a template** that renders a band, not
-  just raw `legion job run`. Rendering is not a way around it.
+  and only become a privilege where a policy says so.
+- An **unbanded** job is a `normal` job. The submit path fills in the default
+  band before enforcing, so a `bands` policy still matches ordinary
+  submissions instead of silently granting nothing.
+- The check also applies to submitting **through a template** that renders a
+  band, so templates are not a way around it.
 
 A refused submit names the band:
 
@@ -136,27 +135,32 @@ in the `critical` priority band (see the `bands` selector in
 docs/auth-and-acls.md)
 ```
 
-Deliberately **not** `operator:write`: `operator` means raft, manager configs
-and observability, so gating bands on it would make everyone who may submit a
-critical job a raft administrator, and it could not express "team A may use
-`critical` in their namespace".
+Bands are not gated on `operator:write`. `operator` covers raft, manager
+configs, and observability. Gating bands on it would make everyone who may
+submit a critical job a raft administrator, and it could not express "team A
+may use `critical` for their jobs".
 
-Manage with `legion acl policy apply|list|get|delete`. A policy file is Nickel
-(`.ncl`) or JSON (`.json`), read by the same rules as every other Legion
-config — see [Configuration Language](configuration-language.md). Either shape
-works: a bare rules array, or `{description, rules}`.
+Manage policies with `legion acl policy apply|list|get|delete`. A policy file
+is Nickel (`.ncl`) or JSON (`.json`), read by the same rules as every other
+Legion config (see [Configuration Language](configuration-language.md)). It
+can be a bare rules array or `{description, rules}`.
 
 ### Tokens
 
-Opaque secrets (`lgn_…`); the manager stores only a SHA-256 hash. Each token
-has a public **accessor ID** (safe to log; used for revocation), a type
-(`management` = full access, `client` = policy-scoped, `worker` = node
-credential), attached policy names, and an optional expiry. Create/inspect/
-revoke with `legion acl token create|list|delete`. Only a management token
-can create another management token.
+Tokens are opaque secrets (`lgn_…`), and the manager stores only a SHA-256
+hash. Each token has:
 
-Lifetime bounds: set `acl = { tokenMaxTtl = "720h" }` to require every client
-token (created or login-minted) to expire within the bound; management
+- a public **accessor ID**, which is safe to log and used for revocation
+- a type: `management` (full access), `client` (policy-scoped), or `worker`
+  (node credential)
+- attached policy names
+- an optional expiry
+
+Create, inspect, and revoke tokens with `legion acl token create|list|delete`.
+Only a management token can create another management token.
+
+To bound token lifetimes, set `acl = { tokenMaxTtl = "720h" }`. Every client
+token (created or login-minted) must then expire within the bound. Management
 tokens are exempt. Expired ACL and join tokens are rejected at
 authentication time and pruned hourly.
 
@@ -164,48 +168,46 @@ For infrastructure-as-code, `legion acl bootstrap --secret <value>` (min 24
 chars) pre-seeds the initial management token instead of generating a random
 one.
 
-Clients send the secret as a bearer credential. Precedence for the CLI:
-`LEGION_TOKEN` env var, then `~/.legion/token` (written by `legion login`,
-override path with `LEGION_TOKEN_FILE`). The UI stores it in browser
-localStorage via the **Access** page.
+Clients send the secret as a bearer credential. The CLI checks the
+`LEGION_TOKEN` env var first, then `~/.legion/token` (written by
+`legion login`, override the path with `LEGION_TOKEN_FILE`). The UI stores it
+in browser localStorage via the **Access** page.
 
 ### Logging in (userpass, JWT, OIDC / SSO)
 
-Every identity source is an **auth method** — one implementation of the same
-internal interface (`AuthMethod` in `src/manager/auth_method.rs`): verify a
-credential, return a principal plus policy names. The authenticator then
-mints an ACL token named `<method>:<principal>` (for example
-`userpass:alice`), so audit logs always show how an identity was established.
-Built-in methods:
+Every identity source is an **auth method**. Each one verifies a credential
+and returns a principal plus policy names. The manager then mints an ACL
+token named `<method>:<principal>` (for example `userpass:alice`), so audit
+logs always show how an identity was established. Built-in methods:
 
-- **Username/password** (`userpass`, always available):
+- **Username/password** (`userpass`, always available): create a user with
   `legion acl user upsert alice --password ... --policy dev-team`
-  (argon2id-hashed), then `legion login -u alice -p ...` mints a token with
-  the user's policies (TTL: `acl.loginTtl`, default 24h). The UI Access page
-  has the same form.
-- **JWT / OIDC tokens**: configure an auth method in the manager config, then
+  (the password is argon2id-hashed). Then `legion login -u alice -p ...`
+  mints a token with the user's policies (TTL: `acl.loginTtl`, default 24h).
+  The UI Access page has the same form.
+- **JWT / OIDC tokens**: configure an auth method in the manager config. Then
   either present the externally issued JWT directly as the bearer credential
-  (validated on every request) or exchange it once:
+  (validated on every request) or exchange it once with
   `legion login --method corp-oidc --jwt-file token.jwt`.
 - **Single sign-on (browser flow)**: for `oidc` methods with an
   `oidcClientId` configured, `legion login --method corp-oidc` opens the
-  browser for the standard authorization-code + PKCE flow (loopback callback
-  on `127.0.0.1:4749`, override with `--callback-port`; register
-  `http://127.0.0.1:4749/oidc/callback` as a redirect URI at the IdP). The UI
-  Access page offers the same as a "Continue with <method>" button (redirect
-  URI `<ui origin>/oidc/callback`). Binding rules map verified claims (for
-  example `groups`) onto policies.
-- **Webhook**: `type = "webhook"` delegates verification to your own HTTP
-  endpoint — the recommended way to integrate LDAP, SAML bridges, or bespoke
-  identity systems in any language. Legion POSTs
+  browser for the standard authorization-code + PKCE flow. The loopback
+  callback listens on `127.0.0.1:4749` (override with `--callback-port`), so
+  register `http://127.0.0.1:4749/oidc/callback` as a redirect URI at the
+  IdP. The UI Access page offers the same flow as a "Continue with <method>"
+  button (redirect URI `<ui origin>/oidc/callback`). Binding rules map
+  verified claims (for example `groups`) onto policies.
+- **Webhook**: `type = "webhook"` hands verification to your own HTTP
+  endpoint. Use it to integrate LDAP, SAML bridges, or custom identity
+  systems in any language. Legion POSTs
   `{"method", "username", "password", "jwt"}` and expects
   `{"principal": "...", "policies": ["..."]}` on HTTP 200 (401 = bad
-  credentials, 403 = verified but denied). Login-only; webhooks are never on
-  the per-request hot path.
+  credentials, 403 = verified but denied). Webhooks are only called at login,
+  never on every request.
 
-Custom identity sources can also be registered programmatically through the
-same `AuthMethod` interface when embedding Legion as a library
-(`Authenticator::register_method`) — see [docs/plugin-system.md](plugin-system.md).
+When you embed Legion as a library, you can also register custom identity
+sources through the same `AuthMethod` interface
+(`Authenticator::register_method`). See [docs/plugin-system.md](plugin-system.md).
 
 ```nickel
 acl = {
@@ -229,19 +231,19 @@ acl = {
 
 ### Anonymous policy and audit mode (migration)
 
-Two ramps for enabling ACLs on a live cluster without breaking anyone:
+There are two ways to enable ACLs on a live cluster without breaking anyone:
 
-1. **Audit-only**: `acl = { enabled = true, auditOnly = true }` — every denial
-   is logged (tracing target `acl_audit`, with principal, accessor ID,
-   resource, action, and scope) but allowed. Watch the log, write policies,
-   then drop `auditOnly`.
-2. **Anonymous policy**: a policy literally named `anonymous` applies to
-   requests with no credential. Grant it temporary read access while tokens
-   are distributed, then delete it.
+1. **Audit-only**: with `acl = { enabled = true, auditOnly = true }`, every
+   denial is logged but allowed. Logs use the tracing target `acl_audit` and
+   include principal, accessor ID, resource, action, and scope. Watch the
+   log, write policies, then drop `auditOnly`.
+2. **Anonymous policy**: a policy named `anonymous` applies to requests with
+   no credential. Grant it temporary read access while you distribute
+   tokens, then delete it.
 
 ### Worker nodes: join tokens and node tokens
 
-Introducing a worker is two commands:
+Adding a worker takes two commands:
 
 ```bash
 # On the manager (or any host with node:write access):
@@ -250,16 +252,16 @@ legion join-token create --type default --ttl 24h
 legion join lgnjoin_...
 ```
 
-The join token is a self-describing composite — manager address, worker type,
-and a random secret — so the worker needs no other configuration. The manager
-stores only a hash of the secret; list and revoke with
+The join token bundles the manager address, the worker type, and a random
+secret, so the worker needs no other configuration. The manager stores only
+a hash of the secret. List and revoke join tokens with
 `legion join-token list|delete` or from the UI's Access → Worker Join tab.
 Set `server.advertiseAddr` when workers reach the manager at a different
 address than it binds.
 
-Workers declare their attributes through their worker type's template
-(pool, attributes, resources from `workerConfigPath`) plus worker-side
-fingerprinting; the join token pins which template applies.
+Workers get their attributes from their worker type's template (pool,
+attributes, and resources from `workerConfigPath`) plus worker-side
+fingerprinting. The join token pins which template applies.
 
 When ACLs are enforced:
 
@@ -267,14 +269,15 @@ When ACLs are enforced:
 - Registration mints a per-node **worker token** (returned in the reply) that
   the worker attaches to `Heartbeat`/`HealthCheck`. Node tokens grant nothing
   on the user-facing API.
-- Re-registering rotates the node token; on an `Unauthenticated` heartbeat a
-  worker automatically re-registers using its join secret.
-- In `auditOnly` mode, workers without join tokens are admitted but logged —
-  the migration ramp for fleets that predate ACLs: enable audit mode, restart
+- Re-registering rotates the node token. If a heartbeat comes back
+  `Unauthenticated`, the worker automatically re-registers using its join
+  secret.
+- In `auditOnly` mode, workers without join tokens are admitted but logged.
+  Use this to migrate fleets that predate ACLs: enable audit mode, restart
   workers onto join tokens at your own pace, then enforce.
 
-mTLS for the worker plane remains on the roadmap (the listener-level TLS
-below already covers transport encryption).
+The worker plane does not support mTLS yet. The listener-level TLS below
+already covers transport encryption.
 
 ### TLS
 
@@ -294,12 +297,12 @@ an `https://` address automatically.
 
 `legion acl whoami` (CLI), `WhoAmI` (gRPC), the UI Access page, and the
 `legion_acl_whoami` MCP tool all report whether ACLs are enabled, how the
-caller was authenticated, and which policies apply — the first stop when
+caller was authenticated, and which policies apply. Start here when
 debugging a `PermissionDenied`.
 
 ### Recovery
 
-Lost the only management token? Delete the management rows from the
-`acl_token` table in the manager's SQLite store (requires filesystem access
-to the manager host) and run `legion acl bootstrap` again — bootstrap is
-allowed whenever no management token exists.
+If you lose the only management token, delete the management rows from the
+`acl_token` table in the manager's SQLite store (this requires filesystem
+access to the manager host). Then run `legion acl bootstrap` again.
+Bootstrap is allowed whenever no management token exists.

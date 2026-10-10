@@ -1,15 +1,12 @@
 # Rollouts
 
-This document describes rollout behavior in Legion as implemented in the manager, scheduler, CLI, gRPC API, storage layer, and UI.
+A rollout replaces a job's running allocations with allocations from a new version of its config. You control how fast it moves, whether it waits for health checks, and what happens when it gets stuck. This page covers the jobspec fields, how each step is computed, and how to watch and advance a rollout from the CLI, gRPC API, and UI.
 
 ## What starts a rollout
 
-A rollout is created when a job update produces a new job config version.
+Legion creates a rollout when a job update produces a new job config version. This happens both on `job run` and on KV-driven job updates.
 
-- `job run` update path: `src/manager/server.rs`
-- KV-driven job update path: `src/manager/server.rs`
-
-On update, manager:
+On update, the manager:
 
 1. Persists a `rollout` row linking `from_job_config_id` to `to_job_config_id`.
 2. Persists rollout config and per-group overrides in `rollout.config_json`.
@@ -48,7 +45,7 @@ See a full example in `configs/jobs/maximal.ncl`.
 | `onHealthDeadline` | `rollback \| fail \| pause` | `rollback` | Action when `healthyDeadline` expires. |
 | `batchKillAfter` | `duration` | unset | For batch tasks, maximum wait before active old allocations are force-retired during rollout. |
 | `slots.order` | `parallel \| sequential` | `parallel` | Slot-mode stateful groups only. `sequential` replaces one slot per step, highest ordinal first, each step health-gated. |
-| `slots.updateFrom` | `u32` | unset | Slot-mode stateful groups only. Staged rollout floor: only slots `>= updateFrom` are updated; lower slots keep their current allocations. Requires `slots.order = "sequential"` and must be `< count.num`. |
+| `slots.updateFrom` | `u32` | unset | Slot-mode stateful groups only. Staged rollout floor: only slots `>= updateFrom` are updated, and lower slots keep their current allocations. Requires `slots.order = "sequential"` and must be `< count.num`. |
 
 ### Group override semantics
 
@@ -56,11 +53,11 @@ See a full example in `configs/jobs/maximal.ncl`.
 - Unknown groups are rejected by validation.
 - Group overrides are merged onto global rollout config.
 - If a group override sets any step mode, it replaces the global step mode selection (and clears a global sequential `slots` block).
-- If a group override sets a sequential `slots` block, it replaces the global step mode selection; a `slots` override always replaces the global `slots` block as a unit.
+- If a group override sets a sequential `slots` block, it replaces the global step mode selection. A `slots` override always replaces the global `slots` block as a whole.
 
 ## Validation rules
 
-Rollout validation runs in `JobConfig::validate_rollout` and `validate_job_config`.
+Legion validates rollout config when you submit the job.
 
 - You cannot define conflicting step modes at once.
 - Only one of these may be set:
@@ -72,11 +69,10 @@ Rollout validation runs in `JobConfig::validate_rollout` and `validate_job_confi
 - `capacityBlockTimeout` and `healthyDeadline` must be greater than zero when set.
 - `rollout.strategy` and each `rolloutByGroup.<group>.strategy` are validated at submit time.
 - `slots.order = "sequential"` cannot be combined with a step mode in the same scope.
-- `slots` is only valid for groups with a slot-mode stateful task; `slots.updateFrom` requires `slots.order = "sequential"` and must be less than the slot task's `count.num`.
+- `slots` is only valid for groups with a slot-mode stateful task.
+- `slots.updateFrom` requires `slots.order = "sequential"` and must be less than the slot task's `count.num`.
 
 ## Step semantics
-
-Step fractions are computed in `src/manager/rollout.rs`.
 
 - If no step mode is configured, rollout is one step (`100%`).
 - `percentEachStep = 10` yields `10,20,30,...,100`.
@@ -89,7 +85,7 @@ For each group, step fractions are applied to each task in that group:
 - Group base count for step math is the max desired count among tasks in the group.
 - Per-task target at each step is `ceil(task_desired * step_fraction)`.
 
-This keeps sidecars and primary tasks in the same group progressing together.
+This keeps sidecars and primary tasks in the same group moving together.
 
 ## Ordered and staged slot rollouts (stateful groups)
 
@@ -104,12 +100,12 @@ rollout = {
 }
 ```
 
-- `order = "sequential"` is the K8s StatefulSet `OrderedReady` update analog: one slot per step, `count-1 → 0`, the next slot only after the previous replacement passes the health gate. An unhealthy replacement halts the rollout at that slot (standard failure semantics apply: wait, or `onHealthDeadline` when `healthyDeadline` is set).
-- `updateFrom` is the K8s `partition` analog: the rollout completes with slots below the floor still running their previous config; resubmitting with a lower floor updates the remaining slots (canary-promote).
-- Each slot's replacement re-binds the same instance id and storage handle; replacement is always stop-then-start (`createFirst` is rejected for stateful groups).
-- Rollout events name the slot per step; `GetRolloutStatus` `total_steps` equals the number of slots being updated.
+- `order = "sequential"` works like the K8s StatefulSet `OrderedReady` update. It replaces one slot per step, from `count-1` down to `0`. The next slot starts only after the previous replacement passes the health gate. An unhealthy replacement halts the rollout at that slot. Standard failure behavior applies: the rollout waits, or follows `onHealthDeadline` when `healthyDeadline` is set.
+- `updateFrom` works like the K8s `partition` field. The rollout completes with slots below the floor still running their previous config. Resubmit with a lower floor to update the remaining slots (canary-promote).
+- Each slot's replacement re-binds the same instance id and storage handle. Replacement is always stop-then-start, and `createFirst` is rejected for stateful groups.
+- Rollout events name the slot for each step. `GetRolloutStatus` `total_steps` equals the number of slots being updated.
 
-Full semantics, the canary-promote walkthrough, and validation rules: [stateful-workloads.md](stateful-workloads.md) "Ordered rollouts for slot pools".
+For full semantics, the canary-promote walkthrough, and validation rules, see "Ordered rollouts for slot pools" in [stateful-workloads.md](stateful-workloads.md).
 
 ## Replacement behavior
 
@@ -122,7 +118,7 @@ Full semantics, the canary-promote walkthrough, and validation rules: [stateful-
 
 - Scheduler first attempts replacement placement constrained to retiree nodes.
 - If same-node placement cannot be satisfied, rollout falls back to regular cross-node placement.
-- `inPlace = false` does not forbid same-node placement; it only removes same-node preference.
+- `inPlace = false` still allows same-node placement. It only removes the preference for it.
 
 ## Manual vs auto progression
 
@@ -167,7 +163,7 @@ When replacements cannot place:
 `completeIncomplete` behavior:
 
 - Rollout ends with status `completed_incomplete` and `incomplete=true`.
-- Job remains `running`; rollout incompleteness is surfaced in rollout metadata.
+- Job remains `running`. The rollout metadata shows that it is incomplete.
 - Background reconciliation attempts continue when capacity becomes available again.
 
 Reconcile loop:
@@ -177,7 +173,7 @@ Reconcile loop:
 ## Lifecycle-specific behavior
 
 - `service` tasks: standard rollout behavior.
-- `batch` tasks: old batch allocations are not killed by default during rollout; rollout waits for them to finish.
+- `batch` tasks: old batch allocations are not killed by default during rollout. The rollout waits for them to finish.
 - `batchKillAfter`: if set, old batch allocations are force-retired after that elapsed time in-step.
 - `sidecar` tasks: rollout follows the group progression and updates in lockstep with the group.
 

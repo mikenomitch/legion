@@ -1,6 +1,8 @@
 # Rollout Strategy Plugins
 
-Rollout strategies now use a plugin contract in `src/manager/rollout_strategy.rs`.
+A rollout strategy decides how a job's instances are replaced during a rollout,
+for example how many go at each step. You can swap in your own strategy as a
+plugin. The plugin contract is defined in `src/manager/rollout_strategy.rs`.
 
 ## Contract
 
@@ -9,7 +11,8 @@ Rollout strategies now use a plugin contract in `src/manager/rollout_strategy.rs
 - Dynamic plugin path: `plugins/rollouts/<strategy>/target/release/lib<strategy>.<ext>`
 - Built-in strategy: `default`
 
-The strategy receives `(group, desired_count, RolloutConfig)` and returns an effective `RolloutConfig` used by the rollout engine.
+The strategy receives `(group, desired_count, RolloutConfig)` and returns the
+`RolloutConfig` that the rollout engine then uses.
 
 ## Example plugin
 
@@ -21,7 +24,7 @@ The strategy receives `(group, desired_count, RolloutConfig)` and returns an eff
 
 ## Example jobspec
 
-`configs/jobs/rollout-plugin-slow-start.ncl` demonstrates usage:
+`configs/jobs/rollout-plugin-slow-start.ncl` shows how to use it:
 
 ```nickel
 rollout = {

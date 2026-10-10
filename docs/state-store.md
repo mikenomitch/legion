@@ -1,11 +1,11 @@
 # State Store
 
-This document describes persistence used by manager and worker processes.
+This page describes how manager and worker processes persist state.
 
 ## Manager Store (SQLite)
 
-Manager state lives in SQLite under manager `store_path`.
-Default resulting file path: `.legion/store.sqlite/store.sqlite`.
+Manager state lives in SQLite under the manager's `store_path`.
+The default file path is `.legion/store.sqlite/store.sqlite`.
 
 Startup (`Store::start_storage`):
 
@@ -26,56 +26,56 @@ Startup (`Store::start_storage`):
 This reduces lock contention for read-heavy paths.
 
 The pool holds `evalThreads + 4` connections, capped at 16. Eval workers are
-the manager's concurrent readers, and the `+ 4` covers the readers that are
-not eval workers: worker heartbeats, the read-only gRPC and UI surface, the
-metrics scrape, and the background reconcilers. A reader takes any free
-connection before it queues on a busy one, so one slow query does not stall
-the readers behind it.
+the manager's main concurrent readers. The extra 4 cover the other readers:
+worker heartbeats, the read-only gRPC and UI surface, the metrics scrape, and
+the background reconcilers. A reader takes any free connection before it
+queues on a busy one, so one slow query does not stall the readers behind it.
 
-The cap exists for memory, not contention. Every connection carries its own
-SQLite page cache capped at 64 MiB (`cache_size = -65536`), and the caches do
-not share — 16 connections is a 1 GiB ceiling for a cluster whose working set
-is large enough to reach it. `cache_size` is a cap that SQLite fills lazily,
-so a small deployment holds only what it reads.
+The cap of 16 limits memory use. Every connection has its own SQLite page
+cache capped at 64 MiB (`cache_size = -65536`), and the caches are not
+shared. That makes 16 connections a 1 GiB ceiling for a cluster whose working
+set is large enough to reach it. SQLite fills the cache lazily, so a small
+deployment holds only what it reads.
 
-There is no separate configuration field for the pool size; raising
-`evalThreads` widens it. `legion_store_read_lock_wait_seconds`
-([metrics.md](metrics.md)) is how you tell whether it is short — its `le="0"`
-bucket against `_count` is how often a reader found a free connection at once.
+There is no separate configuration field for the pool size. Raise
+`evalThreads` to widen it. Use `legion_store_read_lock_wait_seconds`
+([metrics.md](metrics.md)) to tell whether the pool is too small. Its `le="0"`
+bucket compared to `_count` shows how often a reader found a free connection
+right away.
 
 ## Read Model Cache
 
-In-memory `SchedulingReadModel` cache stores:
+The in-memory `SchedulingReadModel` cache stores:
 
-- nodes (`Arc`'d, so a plan's node snapshot is refcount bumps rather than
+- nodes (`Arc`'d, so a plan's node snapshot costs refcount bumps instead of
   deep clones of every node's JSON attributes)
-- allocations by node (each node's vector `Arc`'d the same way; the few
-  writers copy-on-write)
+- allocations by node (each node's vector is `Arc`'d the same way, and the
+  few writers copy on write)
 - task configs by job config
 - per-node free resource pools (fingerprinted capacity minus current
   allocation usage, for available nodes)
 - the scheduling indexes ([scheduling-indexes.md](scheduling-indexes.md))
 
-Scheduler hot paths consume this cache (`available_node_arcs`,
-`plan_capacity_snapshot`, `cached_task_configs_for_job_config`; other
-callers use the deep-clone `cached_nodes`). Write operations update both DB
-and cache; the same write-locked pass re-derives the affected node's free
-pool and index projections, so derived state can never be observed out of
+Scheduler hot paths read this cache through `available_node_arcs`,
+`plan_capacity_snapshot`, and `cached_task_configs_for_job_config`. Other
+callers use the deep-clone `cached_nodes`. Write operations update both the
+DB and the cache. The same write-locked pass re-derives the affected node's
+free pool and index projections, so derived state is never visible out of
 step with the nodes and allocations it came from.
 
 ## Key Tables
 
 Main tables (see migrations):
 
-- `node` (identity/pool/attrs/availability), `node_health` (liveness:
-  status, last heartbeat, lost-at marker, this node's own lost window
-  `lost_after_seconds`, health checks — split out so the raft status lane is
-  the table's single writer; readers hydrate `Node` via a
-  `node ⟕ node_health` join, and a node that has not heartbeated yet
-  hydrates registration defaults). Note that `last_heartbeat` /
-  `last_heartbeat_unix` are **display state**: a steady-state heartbeat
-  writes nothing here, and the columns are refreshed by a periodic
-  checkpoint (see [node-liveness.md](node-liveness.md))
+- `node` (identity, pool, attributes, availability) and `node_health`
+  (liveness: status, last heartbeat, lost-at marker, the node's own lost
+  window `lost_after_seconds`, and health checks). `node_health` is a
+  separate table so the raft status lane is its only writer. Readers build
+  `Node` with a `node ⟕ node_health` join, and a node that has not sent a
+  heartbeat yet gets registration defaults. `last_heartbeat` and
+  `last_heartbeat_unix` are display state only. A steady-state heartbeat
+  writes nothing here, and a periodic checkpoint refreshes the columns (see
+  [node-liveness.md](node-liveness.md)).
 - `worker_type`
 - `job`, `job_config`, `task_config`, `task_status`, `job_update`
 - `allocation`
@@ -83,47 +83,44 @@ Main tables (see migrations):
 - `manager_config`
 - `kv_entry`, `kv_lock`, `job_kv_reference`
 - `allocation_epoch`, `plan_submission`
-- `node_alloc_usage` — a **cache**, not a source of truth: one row per node
-  holding the aggregated resource usage of that node's allocations, beside a
-  fingerprint of the rows it was derived from **and of the resource policy
-  that normalized them**. Read only by the plan-apply capacity recheck, and
-  only when both fingerprints still match — a row written under a different
-  `taskResourceDefaults`/`customResources` configuration is rebuilt, never
-  served
-  (see [scheduler-and-eval-loop.md](scheduler-and-eval-loop.md#the-per-node-usage-cache))
+- `node_alloc_usage`, a cache rather than a source of truth. It holds one
+  row per node with the aggregated resource usage of that node's
+  allocations. Each row also stores a fingerprint of the rows it was derived
+  from and of the resource policy that normalized them. Only the plan-apply
+  capacity recheck reads it, and only when both fingerprints still match. A
+  row written under a different `taskResourceDefaults`/`customResources`
+  configuration is rebuilt instead of served
+  (see [scheduler-and-eval-loop.md](scheduler-and-eval-loop.md#the-per-node-usage-cache)).
 - `rollout`, `allocation_health`, `rollout_event`
-- `instance` (stateful identity), `volume` (the storage its handle points at —
+- `instance` (stateful identity), `volume` (the storage its handle points at,
   see [volumes.md](volumes.md))
 
 ### Column Affinity
 
 JSON payload columns (`allocation.resources`, `plan_submission.placements`,
-`task_config.*`, node attributes, and the rest) are declared `TEXT`. They
-were originally declared `JSONB`, which SQLite's affinity rules silently
-map to NUMERIC affinity — meaning every insert first attempted to parse
-the whole JSON blob as a number before storing it as text (measurable CPU
-waste on the plan-apply and job-intake write paths, for a conversion that
-can never succeed on a JSON object). A migration rebuilds all affected
-tables in place; data, column order, indexes, and rowids are preserved
-exactly, so the change is invisible outside a profiler and a rolling
-manager upgrade across it is safe.
+`task_config.*`, node attributes, and the rest) are declared `TEXT`. Older
+releases declared them `JSONB`, which SQLite's affinity rules map to NUMERIC
+affinity. That made every insert try to parse the whole JSON blob as a
+number before storing it as text, which wasted CPU on the plan-apply and
+job-intake write paths. A migration rebuilds the affected tables in place.
+It preserves data, column order, indexes, and rowids, so a rolling manager
+upgrade across it is safe.
 
-`STRING` and `TIMESTAMP` columns intentionally keep NUMERIC affinity: for
-those, SQLite's numeric conversion can succeed (numeric-looking ids,
-unix-seconds timestamps), so re-typing them would change what is stored
-and break comparisons against existing rows. See the known-limitations
-entry in `internal_docs/TODO.md`.
+`STRING` and `TIMESTAMP` columns keep NUMERIC affinity on purpose. For those
+columns SQLite's numeric conversion can succeed (numeric-looking ids,
+unix-seconds timestamps), so changing their type would change what is stored
+and break comparisons against existing rows.
 
 ## Allocation Epoch and Plan Submission Safety
 
-Scheduler apply path uses compare-and-swap semantics:
+The scheduler's apply path uses compare-and-swap semantics:
 
 1. Read `allocation_epoch`.
 2. Record plan with `expected_epoch`.
 3. Apply only when epoch still matches.
-4. Reject stale plans (`PlanApplyOutcome::Rejected`) and retry at caller level.
+4. Reject stale plans (`PlanApplyOutcome::Rejected`) and retry at the caller.
 
-This avoids writing placements against stale cluster state.
+This prevents writing placements against stale cluster state.
 
 ## Error Model
 
@@ -134,67 +131,66 @@ Storage maps SQLite errors into `StorageError` categories:
 - `InvalidInput`
 - lock/busy/read-only/corrupt/io/sqlite
 
-Manager API maps these to gRPC status codes.
+The manager API maps these to gRPC status codes.
 
 ## Worker Local State Store
 
 Workers have a separate local JSON state file (`WorkerStateStore`):
 
 - default path root: `.legion/workers/<worker-id>/worker_state.json`
-- stores allocation + task + PID records
-- used for restart recovery if tracked PID is still running
+- stores allocation, task, and PID records
+- used for restart recovery when a tracked PID is still running
 
-This store is local worker runtime state, not shared cluster state.
+This store holds local worker runtime state. It is not shared cluster state.
 
 ## Persistence Modes
 
-Everything above describes the store in every mode; `persistence.type`
-selects how durable the writes are:
+Everything above applies in every mode. `persistence.type` selects how
+durable the writes are:
 
-- **`local_disk`** (default): local SQLite only, exactly as described above.
+- **`local_disk`** (default): local SQLite only, as described above.
 - **`streaming`**: Litestream-style WAL shipping to object storage with
-  lease-fenced failover — see `docs/persistence-streaming.md`.
-- **`raft`**: **real quorum-replicated writes.** Every mutating store
-  method routes through `Store::replicated()`: its row-level effects are
-  captured as a SQLite session changeset on the leader (and rolled back
-  locally), committed through openraft, and applied byte-identically on
-  every manager — replicas cannot diverge. The read-model cache and event
-  stream are projected from the committed changeset at apply time, so
-  followers get both for free and nothing is visible before quorum commit.
-  That projection is a **delta**: the changeset names exactly which
-  allocation rows moved, so the cache patches those rows instead of
-  reloading every touched node's allocation list, and the cost of a commit
-  follows the size of the change rather than how full the cluster is. A
-  delta cannot repair a cache entry that is already wrong, so three things
-  bound that: any node whose delta contradicts the cache is reloaded in
-  full, any changeset whose allocation records cannot be classified falls
-  back to the full reload wholesale, and one node per projected changeset is
-  reloaded in full on a round-robin sweep of the fleet. The fallbacks log at
-  `warn` naming the allocation ids or nodes involved; they are not expected
-  in a healthy cluster, and repeated occurrences mean the cache and
-  committed state are disagreeing.
-  In raft mode, `write_connection()` outside the capture/apply paths fails
-  loudly (a runtime bypass guard), so no code path can mutate state
-  without replicating it. Snapshots, log compaction, membership, and
-  backup/restore are all implemented — see `docs/multi-raft.md` and
-  `docs/raft-operations.md`.
+  lease-fenced failover. See `docs/persistence-streaming.md`.
+- **`raft`**: quorum-replicated writes. Every mutating store method routes
+  through `Store::replicated()`. Its row-level effects are captured as a
+  SQLite session changeset on the leader (and rolled back locally),
+  committed through openraft, and applied byte-identically on every
+  manager, so replicas cannot diverge. The read-model cache and event
+  stream are built from the committed changeset at apply time. Followers
+  get both without extra work, and nothing is visible before quorum commit.
+  The cache update is a delta. The changeset names which allocation rows
+  changed, so the cache patches those rows instead of reloading every
+  touched node's allocation list. The cost of a commit follows the size of
+  the change, not how full the cluster is.
+  A delta cannot repair a cache entry that is already wrong, so three
+  safeguards apply. Any node whose delta contradicts the cache is reloaded
+  in full. Any changeset whose allocation records cannot be classified
+  falls back to a full reload. And one node per changeset is reloaded in
+  full on a round-robin sweep of the fleet. The fallbacks log at `warn`
+  with the allocation ids or nodes involved. They should not happen in a
+  healthy cluster. Repeated occurrences mean the cache and committed state
+  disagree.
+  In raft mode, calling `write_connection()` outside the capture and apply
+  paths fails with an error (a runtime bypass guard), so no code path can
+  change state without replicating it. Snapshots, log compaction,
+  membership, and backup/restore are all implemented. See
+  `docs/multi-raft.md` and `docs/raft-operations.md`.
 
-Server-side backups exist in every mode: `legion state backup` (a
+Server-side backups work in every mode: `legion state backup` (a
 `VACUUM INTO` copy plus the raft applied index) and
-`legion start manager --restore-from <backup>` — see `docs/upgrades.md`.
+`legion start manager --restore-from <backup>`. See `docs/upgrades.md`.
 
 ## What Is Not Implemented Yet
 
-- Raft `topology = "lanes"` (independent per-domain raft groups) is
-  runnable and measured but stays **opt-in** — `single` remains the
-  recommended default. See `docs/multi-raft.md` § "Topology: `single` vs
-  `lanes`".
-- Non-leader **client** writes are rejected with a leader hint, not
-  auto-forwarded; worker-plane writes (heartbeats, reports) forward to the
+- Raft `topology = "lanes"` (independent per-domain raft groups) works but
+  is opt-in. `single` is the recommended default. See `docs/multi-raft.md`
+  § "Topology: `single` vs `lanes`".
+- Non-leader client writes are rejected with a leader hint instead of being
+  forwarded. Worker-plane writes (heartbeats, reports) do forward to the
   owning lane's leader (`docs/multi-raft.md` § "Non-leader write redirects
   and forwarding").
-- Raft transport auth is a shared cluster secret (mTLS pending); of the
-  `legion_raft_*` metrics series only the voters/quorum gauges are emitted,
-  the rest is reserved but not yet emitted.
+- Managers dial each other's raft transport over plaintext HTTP/2 and
+  authenticate with a shared cluster secret. There is no mTLS between
+  managers.
 - Key-range sharding, cross-region topologies, and parallel scheduler
-  planning across managers remain future work.
+  planning across managers are not implemented.

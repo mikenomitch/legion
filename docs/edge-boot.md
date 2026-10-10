@@ -1,26 +1,29 @@
 # Edge boot: starting work before the placement is durable
 
-Legion's normal start path is strictly commit-then-run. A submit becomes an
-eval, the eval plans, the plan applies — under `persistence.mode = "raft"` that
-means proposing on the scheduler lane and waiting for the entry to commit — and
-only then is the payload handed to a worker, which builds the root disk and
-boots.
+Edge boot lets a node start work before its placement is committed. Use it
+when start latency matters, such as a platform that boots a fresh sandbox for
+each user request.
 
-For a service that runs one long-lived job that ordering costs nothing. For a
-platform spawning a fresh sandbox per user request it is on the critical path
-of every request, and it is strictly serial: nothing on the node starts until
-every control-plane step has finished.
+Legion normally commits a placement and then runs it. A submit becomes an
+eval, the eval plans, and the plan applies. Under `persistence.type = "raft"`,
+applying means proposing on the scheduler lane and waiting for the entry to
+commit. Only then does a worker get the payload, build the root disk, and
+boot.
 
-**Edge boot lets a node reach a configured execution stage before its
-allocation is durable, while keeping the durable commit as the single point
-that decides who really owns an instance.** It also gives a node a way to
-authorize such a start on its own, from a short-lived capability, without
-talking to a manager at all.
+For a service that runs one long-lived job, that order costs nothing. For a
+platform that spawns a fresh sandbox per user request, it sits on the
+critical path of every request. It is also serial: nothing on the node starts
+until every control-plane step has finished.
 
-Everything here is **off by default**, three times over: `speculativeStart` is
-absent from every jobspec, `edgeBoot.enabled` is false on the manager, and
+**Edge boot lets a node reach a configured stage before its allocation is
+durable. The durable commit still decides who owns an instance.** It also
+lets a node authorize such a start on its own, from a short-lived capability,
+without talking to a manager at all.
+
+Edge boot is **off by default** in three places: `speculativeStart` is absent
+from every jobspec, `edgeBoot.enabled` is false on the manager, and
 `edgeBoot.acceptClaims` is false on every worker. A cluster that upgrades and
-changes nothing behaves exactly as it did, including its wire payloads.
+changes nothing behaves as it did before, including its wire payloads.
 
 - [The two shapes](#the-two-shapes)
 - [Gate levels](#gate-levels)
@@ -38,16 +41,16 @@ changes nothing behaves exactly as it did, including its wire payloads.
 
 ### Manager-side speculative dispatch
 
-The manager sends the payload *while* the apply is in flight rather than after
-it commits, and delivers the apply outcome as the ratification. This is a
-strictly internal reordering: the same manager, the same worker plane, the same
-`PostWork` RPC with a `provisional` block on the payload.
+The manager sends the payload while the apply is still in flight instead of
+after it commits. It then sends the apply outcome as the ratification. This
+is an internal reordering only. It uses the same manager, the same worker
+plane, and the same `PostWork` RPC, with a `provisional` block on the payload.
 
-It saves the raft commit, the read-model refresh, and the serialization of
-dispatch behind them — roughly 5–25 ms on a three-node raft cluster, more when
-the scheduler lane is busy. It does **not** save the client→manager round trip
-or the eval queue. It needs no new authorization surface, and it is what a job
-gets simply by declaring `speculativeStart`.
+It saves the raft commit, the read-model refresh, and the dispatch
+serialization behind them. That is roughly 5–25 ms on a three-node raft
+cluster, and more when the scheduler lane is busy. It does **not** save the
+client-to-manager round trip or the eval queue. It needs no new
+authorization, and a job gets it just by declaring `speculativeStart`.
 
 ### Edge-initiated starts
 
@@ -66,38 +69,40 @@ platform's own API ──(user auth)──► platform control plane
                               manager: RatifyClaim ──► store apply ──► verdict
 ```
 
-The saving is the entire control-plane round trip *including the client's* —
-for a cross-region edge, the dominant term — plus independence from
-control-plane availability for the length of a ticket's life.
+This saves the entire control-plane round trip, including the client's. For
+a cross-region edge, that round trip is the largest cost. It also keeps
+starts working while the control plane is unavailable, for as long as a
+ticket is valid.
 
 ## Gate levels
 
-A gate says how far a node may get on its own. They are ordered, and wherever
-two ceilings meet (a task's mode, a ticket's `gate`, a caller's request) **the
-lower always wins**. Neither a jobspec nor a ticket can raise the other's limit.
+A gate says how far a node may get on its own. Gates are ordered. Where two
+limits meet (a task's mode, a ticket's `gate`, a caller's request), **the
+lower one wins**. A jobspec cannot raise a ticket's limit, and a ticket
+cannot raise a jobspec's.
 
 | Mode | The node may, before ratification | It may not, until ratified |
 | --- | --- | --- |
-| `off` (default) | nothing | everything — today's behavior |
+| `off` (default) | nothing | everything (the normal start path) |
 | `stage` | fetch artifacts, pull the image, build the root disk, mount node-local storage | start the workload |
 | `boot` | all of `stage`, plus boot the guest and run the workload with its network held shut | open the network, register in service discovery, attach shared storage, obtain any Legion-issued identity |
-| `serve` | all of `boot`, plus open the network immediately | obtain any Legion-issued identity; attach shared storage |
+| `serve` | all of `boot`, plus open the network immediately | obtain any Legion-issued identity, attach shared storage |
 
-- **`stage`** — "pull the image but don't boot till it's the only one."
-  Nothing outside the node can observe it. The only cost of losing the race is
-  wasted local work.
-- **`boot`** — "boot it, but no ingress or egress until it's definitely the
-  only one." The workload runs and warms up; nothing it does reaches the
-  outside world, so a loser leaves no trace beyond its own disk.
-- **`serve`** — "boot all the way and allow networking; if the id turns out to
-  be claimed, kill it." Fastest, and **the only mode where a workload that
-  loses its race may already have produced externally visible side effects
-  before it is killed.** That is the deal. It only happens when two callers
-  genuinely race for one instance id, which for an id-affine router is a
-  routing bug worth knowing about.
+- **`stage`**: pull the image, but don't boot until the claim is confirmed.
+  Nothing outside the node can see it. Losing the race only wastes local
+  work.
+- **`boot`**: boot it, but allow no ingress or egress until the claim is
+  confirmed. The workload runs and warms up. Nothing it does reaches the
+  outside world, so a loser leaves nothing behind except its own disk.
+- **`serve`**: boot all the way and allow networking. If the id turns out to
+  be claimed already, kill it. This is the fastest mode, and **the only mode
+  where a workload that loses its race may have caused externally visible
+  side effects before it is killed.** Accept that trade-off before you use
+  it. It only happens when two callers race for one instance id, which for
+  an id-affine router points to a routing bug.
 
-Every mode is safe with respect to Legion's own invariants. The modes differ
-only in what an unratified workload can do to the outside world.
+Every mode preserves Legion's own invariants. The modes differ only in what
+an unratified workload can do to the outside world.
 
 ## The jobspec surface
 
@@ -120,30 +125,29 @@ only in what an unratified workload can do to the outside world.
 ```
 
 **Defaults.** `mode = "off"`, `ratifyTimeout = "5s"` (capped at `2m`),
-`onRefused = "kill"`. An absent block means `off` and costs nothing.
+`onRefused = "kill"`. Leaving out the block means `off` and costs nothing.
 
-The block is validated at **submit**, not at dispatch: an unrecognized `mode`
+The block is validated at **submit**, not at dispatch. An unrecognized `mode`
 or `onRefused`, or a `ratifyTimeout` of zero or over the cap, fails
-`legion job run` with the reason. A typo that was silently read as `off` would
-be discovered as a latency regression weeks later, by someone who was not there
-when it was written.
+`legion job run` with the reason. If a typo were silently read as `off`, you
+would only notice it later as a latency regression.
 
 ```console
 $ legion job run api.ncl
 error: task a: invalid speculativeStart mode "boott" (off|stage|boot|serve)
 ```
 
-`kill` is the default because the common refusal is "someone else owns this
-id", and a loser lingering is precisely what the at-most-one invariant forbids.
-`onRefused = "stop"` runs the task's normal graceful-stop ladder
-([`docs/graceful-stop.md`](graceful-stop.md)) instead, for workloads that want
-to flush before disappearing.
+`kill` is the default because the usual refusal is "someone else owns this
+id", and a losing workload that keeps running breaks the at-most-one
+guarantee. `onRefused = "stop"` runs the task's normal graceful stop
+([`docs/graceful-stop.md`](graceful-stop.md)) instead, for workloads that
+need to flush before they exit.
 
 ### Automatic downgrades
 
-Two things force a task down to `stage` no matter what it declares, because
-starting it earlier would need something the apply transaction has not produced
-yet. Both are reported by `legion job validate` before the deploy:
+Two things force a task down to `stage` whatever it declares, because
+starting earlier would need something the apply transaction has not produced
+yet. `legion job validate` reports both before you deploy:
 
 ```console
 $ legion job validate api.ncl
@@ -153,80 +157,77 @@ declares network ports, which are assigned when the placement commits; gates
 above `stage` would boot it without them
 ```
 
-With `--json` the same lines come back in a `warnings` array on the success
+With `--json`, the same lines come back in a `warnings` array on the success
 envelope.
 
 - **Declared ports.** `network.ports` and `connect.upstreams` are assigned
-  inside the apply, so a workload booted before it cannot know them. A
-  `stage`-gated task is unaffected: it adopts the committed payload — real
-  allocation id, assigned ports, resolved mounts — before it starts.
-- **Storage that cannot be fenced.** A volume a second node could attach
-  concurrently is mounted only after ratification. Node-local drivers
-  (`local-dir`, `host`, `tmpfs`) are exempt: the only possible racer is on the
-  same node, where the worker's claim table already allows one live claim per
-  instance.
+  inside the apply, so a workload booted before the apply cannot know them.
+  A `stage`-gated task is unaffected. It picks up the committed payload
+  (actual allocation id, assigned ports, resolved mounts) before it starts.
+- **Storage that cannot be fenced.** A volume that a second node could attach
+  at the same time is mounted only after ratification. Node-local drivers
+  (`local-dir`, `host`, `tmpfs`) are exempt. The only possible competitor is
+  on the same node, where the worker's claim table already allows one live
+  claim per instance.
 
 ## What is never speculative
 
-These are invariants, not settings, and they are the reason `serve` is
-defensible at all:
+These are fixed rules, not settings, and they are what make `serve` safe
+enough to offer:
 
 - **Legion-issued identity.** Workload identity tokens are scoped to an
-  allocation id, which does not exist until ratification. An unratified
-  workload therefore cannot authenticate to Legion, to a cloud provider, or to
-  anything else that trusts the cluster issuer. A losing sandbox cannot act as
-  the winner.
+  allocation id, which does not exist until ratification. So an unratified
+  workload cannot authenticate to Legion, to a cloud provider, or to anything
+  else that trusts the cluster issuer. A losing sandbox cannot act as the
+  winner.
 - **Shared writable storage.** Mounted only after ratification (see the
   downgrade rule above).
 - **Service discovery.** A provisional allocation is not registered, so no
-  other workload can route to something that may vanish.
+  other workload can route to something that may disappear.
 - **Instance binding.** Nothing about `user-42` changes in the store until
-  ratification. `legion instance get user-42` reports the live claim alongside
-  the instance — the node holding it, the gate, the stage it has reached, and
-  when its lease expires — so "started but not yet confirmed" is a state you
-  can see rather than an instance that inexplicably has no allocation.
+  ratification. `legion instance get user-42` shows the live claim next to the
+  instance: the node holding it, the gate, the stage it has reached, and when
+  its lease expires. "Started but not yet confirmed" is a state you can see,
+  instead of an instance that has no allocation for no clear reason.
 
-A provisionally started task also sees **no `LEGION_ALLOC_ID`** — it does not
-have one yet, and a placeholder would be a lie. It gets `LEGION_CLAIM_ID`
-instead, and `LEGION_INSTANCE_ID` is correct from the first millisecond, which
-is the identity a platform actually addresses a sandbox by.
+A provisionally started task also gets **no `LEGION_ALLOC_ID`**, because it
+does not have one yet and a placeholder would be wrong. It gets
+`LEGION_CLAIM_ID` instead. `LEGION_INSTANCE_ID` is correct from the start,
+and that is the identity a platform uses to address a sandbox.
 
 ## What the gate does and does not stop
 
-**The `boot` gate is a real network boundary for the `sandbox` runtime, and a
-weaker one for host runtimes.** This asymmetry is deliberate and worth stating
-plainly:
+**The `boot` gate is a strong network boundary for the `sandbox` runtime and
+a weaker one for host runtimes:**
 
-- **`sandbox` / microVM — enforced.** The guest reaches the outside world
-  through exactly one host TAP device (or, in `network.mode = "none"`, through
-  nothing at all). The device is attached at boot — Firecracker cannot hotplug
-  a NIC — and held administratively **down**; ratification brings it up. Both
-  operations need `CAP_NET_ADMIN`, which `network.mode = "tap"` already requires
-  of the operator.
-- **`container` / `exec` with `network.mode = "gated"` — enforced.** The
+- **`sandbox` / microVM: enforced.** The guest reaches the outside world
+  through one host TAP device (or, with `network.mode = "none"`, through
+  nothing). The device is attached at boot, because Firecracker cannot
+  hotplug a NIC, and held administratively **down**. Ratification brings it
+  up. Both operations need `CAP_NET_ADMIN`, which `network.mode = "tap"`
+  already requires.
+- **`container` / `exec` with `network.mode = "gated"`: enforced.** The
   workload runs in an empty network namespace whose only way out is the node
-  datapath ([Network Handlers](network-handlers.md#gated-mode)), and the
-  datapath holds the allocation's policy — every listener denies with source
-  `gate` — until ratification opens it. Unlike the TAP gate this is
-  per-destination: a policy with only the package registry lets a gated task
-  fetch dependencies *before* ratification and nothing else.
-- **`container` / `exec` in `host` mode — advisory.** Legion withholds what it
+  datapath ([Network Handlers](network-handlers.md#gated-mode)). Every
+  listener denies with source `gate` until ratification opens it, whatever
+  the allocation's policy allows. After ratification, the policy applies per
+  destination.
+- **`container` / `exec` in `host` mode: advisory.** Legion withholds what it
   controls: service registration and the node-local upstream forwarders,
-  neither of which is created until ratification. But the workload shares the
+  neither of which exists until ratification. But the workload shares the
   host's network stack and **can still reach the network through it.**
-  Host-level egress filtering for these runtimes is the operator's job. The
-  worker logs a warning every time it starts a `boot`-gated task on such a
+  Host-level egress filtering for these runtimes is up to the operator. The
+  worker logs a warning each time it starts a `boot`-gated task on such a
   runtime.
 
-Untrusted code belongs in a microVM, which is the same advice
-[`docs/task-runtime-sandbox.md`](task-runtime-sandbox.md) already gives.
+Run untrusted code in a microVM, as
+[`docs/task-runtime-sandbox.md`](task-runtime-sandbox.md) also advises.
 
 ## Boot tickets
 
 A boot ticket is a short-lived JWT signed by the cluster's workload-identity
-signer and verified by the worker against the published JWKS — the same key
-material, rotation, and `kid` discipline that already ships, with a new
-consumer.
+signer. The worker verifies it against the published JWKS. It uses the same
+key material, rotation, and `kid` handling as workload identity.
 
 ```jsonc
 {
@@ -260,18 +261,19 @@ Pinned to job config: agent-sandboxes-7
 Expires (unix): 1770000300
 ```
 
-Gated by the ACL resource **`boot`** (`boot:write`, scoped by job name), which
-is deliberately separate from `job:write`: a platform's ticket minter should be
-able to authorize individual starts without holding the right to redeploy the
-fleet. `boot:read` lists outstanding tickets.
+Minting requires the ACL resource **`boot`** (`boot:write`, scoped by job
+name). It is separate from `job:write` so a platform's ticket minter can
+authorize individual starts without the right to redeploy the fleet.
+`boot:read` lists outstanding tickets.
 
-A ticket must narrow to an instance or a **non-empty** prefix. A ticket naming
-neither would authorize every sandbox of the task, and Legion does not mint
-one. A prefix ticket is one mint per user cohort instead of one per request, at
-the cost of a wider capability if the node holding it is compromised.
+A ticket must name an instance or a **non-empty** prefix. A ticket with
+neither would authorize every sandbox of the task, so Legion does not mint
+one. With a prefix ticket, you mint once per user cohort instead of once per
+request. The cost is a wider capability if the node holding it is
+compromised.
 
-The manager stores only metadata — `jti`, scope, expiry, minting accessor. The
-token bytes are never written anywhere.
+The manager stores only metadata: `jti`, scope, expiry, and the minting
+accessor. The token itself is never written anywhere.
 
 ### Redeeming
 
@@ -283,48 +285,49 @@ booted
 ratified
 ```
 
-The stream reports each transition. A router may begin routing at `booted` and
-must be prepared for `refused` at any point until `ratified`. `--dry-run`
-verifies the ticket and local admission and reports what *would* happen without
+The stream reports each transition. A router may start routing at `booted`,
+but must handle `refused` at any point until `ratified`. `--dry-run` verifies
+the ticket and local admission and reports what would happen, without
 holding or booting anything.
 
 ### Verification on the worker is entirely offline
 
 1. signature against a cached JWKS (fetched on first use, refreshed on a `kid`
-   miss and on `edgeBoot.jwksRefresh`; **a fetch failure never invalidates
-   cached keys**);
-2. `iss`, `aud == legion:node`, `exp`/`nbf` with bounded clock skew;
-3. `legion.io/pool` against this node's own pool;
-4. `legion.io/gate` intersected with the task's `speculativeStart.mode` — the
-   lower wins;
-5. `jti` against a local single-use set;
-6. the local claim table — one live claim per instance id per node;
-7. the local resource ledger — the node must genuinely have room.
+   miss and on `edgeBoot.jwksRefresh`. **A fetch failure never invalidates
+   cached keys**)
+2. `iss`, `aud == legion:node`, `exp`/`nbf` with bounded clock skew
+3. `legion.io/pool` against this node's own pool
+4. `legion.io/gate` intersected with the task's `speculativeStart.mode` (the
+   lower wins)
+5. `jti` against a local single-use set
+6. the local claim table (one live claim per instance id per node)
+7. the local resource ledger (the node must have room)
 
 ### Replay and revocation
 
-**Replay across nodes is bounded by ratification, not by verification.** Two
-nodes presented the same ticket both boot; the second is refused with
-`instance_claimed` and kills its work. Globally-single-use is enforced *at the
-manager*, which spends the `jti` in one conditional update — so the second
-ratification is refused even if the first has since exited. Nodes are honest,
-but they are not trusted to be the only holder.
+**Ratification, not verification, limits replay across nodes.** If two nodes
+get the same ticket, both boot. The second is refused with
+`instance_claimed` and kills its work. The manager enforces global single
+use by spending the `jti` in one conditional update, so the second
+ratification is refused even if the first workload has since exited. Nodes
+are expected to behave correctly, but Legion does not trust any node to be
+the only holder of a ticket.
 
-**Revocation is by TTL only.** The fast path cannot consult a revocation list
-without becoming the round trip the ticket exists to avoid. Operators who need
-immediate revocation set short TTLs and re-mint; the manager can always refuse
-ratification, which caps any damage at the gate level.
+**Revocation is by TTL only.** The fast path cannot check a revocation list
+without adding the round trip the ticket exists to avoid. If you need fast
+revocation, set short TTLs and mint new tickets. The manager can always
+refuse ratification, which limits any damage to the gate level.
 
 ### The spec cache
 
-A ticket names a `job_config_id`; the node needs the matching task config to
-run anything. A node caches every task config it is *dispatched* — from an
-ordinary `PostWork`, from a heartbeat's desired set, or from a provisional
-start — so a config the node has already run an allocation of is redeemable
-without touching a manager.
+A ticket names a `job_config_id`, and the node needs the matching task
+config to run anything. A node caches every task config it is dispatched,
+whether from an ordinary `PostWork`, a heartbeat's desired set, or a
+provisional start. So the node can redeem a ticket for any config it has
+already run an allocation of, without contacting a manager.
 
 A `StartClaim` for a config the node has never seen is refused with
-`FailedPrecondition` naming it:
+`FailedPrecondition` and names the config:
 
 ```
 this node has no cached spec for job config agent-sandboxes-7; it caches a
@@ -332,36 +335,35 @@ config once it has been dispatched an allocation of it, and does not fetch
 specs on the start path
 ```
 
-**A node never fetches a spec on the start path** — doing so would reintroduce
-the round trip the ticket exists to avoid. The practical shape is therefore to
-keep at least one allocation of the job running in each edge pool, which is
-what a warm sandbox fleet looks like anyway. A dedicated pre-warm push is
-tracked as future work.
+**A node never fetches a spec on the start path**, because that would add
+back the round trip the ticket exists to avoid. In practice, keep at least
+one allocation of the job running in each edge pool, which a warm sandbox
+fleet does anyway. There is no dedicated pre-warm push.
 
 ## The kill path
 
-Every failure mode ends in the same place: the node kills the work.
+Every failure ends the same way: the node kills the work.
 
 | Trigger | Detected by | Latency |
 | --- | --- | --- |
 | Ratification refused | the ratify reply (or a heartbeat catch-up verdict) | one RPC |
 | Manager unreachable | the lease deadline | `ratifyTimeout` (default 5s) |
 | Node loses contact after ratification | the existing self-fence | `stateful.onLost.selfTerminateAfter` |
-| Worker restart with claims held | startup reconcile | immediate — provisional work is never resumed |
+| Worker restart with claims held | startup reconcile | immediate (provisional work is never resumed) |
 | Manager forgot about it | the existing heartbeat reconcile | one heartbeat after the lease |
 
-The last row matters: the worker already stops anything the manager does not
-list. Provisional work is **exempt from that sweep for the length of its
-lease** — the manager cannot list work it has not recorded, so an absence there
-is ignorance, not a decision — and after the lease it is stopped by the code
-that was already there. The failure mode of a bug in this feature is therefore
-"the sandbox dies", never "a duplicate survives".
+The last row matters because the worker already stops anything the manager
+does not list. Provisional work is **exempt from that sweep for the length of
+its lease**. The manager cannot list work it has not recorded yet, so a
+missing entry is not a decision. After the lease, the existing reconcile code
+stops it. So a bug in this feature makes the sandbox die. It never leaves a
+duplicate running.
 
 ### Refusal reasons
 
 | Reason | Meaning | Retried inside the lease? |
 | --- | --- | --- |
-| `instance_claimed` | another allocation already owns this instance id | no — a lost race is final |
+| `instance_claimed` | another allocation already owns this instance id | no (a lost race is final) |
 | `no_capacity` | the node no longer fits the placement, as re-validated on the fresh node row | no |
 | `ineligible` | constraints/permit fail, or the node is cordoned, draining, or lost | no |
 | `expired` | the lease ran out before a verdict arrived | no |
@@ -370,8 +372,8 @@ that was already there. The failure mode of a bug in this feature is therefore
 | `disabled` | edge boot is off on this manager | no |
 | `internal` | a store error or an election in progress | yes |
 
-A worker that sees a reason it does not recognize kills the work — fail-closed
-under skew.
+A worker that sees a reason it does not recognize kills the work, so version
+skew fails closed.
 
 ## Enabling it
 
@@ -389,14 +391,14 @@ under skew.
 }
 ```
 
-`enabled = false` refuses `IssueBootTicket` and any ticket-bearing
-`RatifyClaim`. **Manager-side speculative dispatch does not need this switch**
-— it opens no new authorization surface, and a job's own `speculativeStart`
+`enabled = false` refuses `IssueBootTicket` and any `RatifyClaim` that
+carries a ticket. **Manager-side speculative dispatch does not need this
+switch.** It adds no new authorization, and a job's own `speculativeStart`
 block is enough.
 
-**Enabling edge boot is an explicit security decision.** It grants nodes the
-ability to start work on a capability, and it grows a compromised node's blast
-radius from "runs what it was given" to "runs anything a live ticket names".
+**Enabling edge boot is a security decision.** It lets nodes start work on a
+capability. A compromised node can then run anything a live ticket names,
+not just what it was given.
 
 ### Worker
 
@@ -412,9 +414,9 @@ radius from "runs what it was given" to "runs anything a live ticket names".
 }
 ```
 
-`acceptClaims` is per node and independent of the manager's switch: an operator
-who turns the feature on cluster-wide still chooses which nodes are edges. A
-node with it off refuses `StartClaim` with `FailedPrecondition`.
+`acceptClaims` is set per node, separately from the manager's switch. An
+operator who turns the feature on cluster-wide still chooses which nodes act
+as edges. A node with it off refuses `StartClaim` with `FailedPrecondition`.
 
 ## Observability
 
@@ -422,22 +424,22 @@ node with it off refuses `StartClaim` with `FailedPrecondition`.
 
 | Kind | When |
 | --- | --- |
-| `alloc.provisional_started` | a node started work before the placement was durable; carries claim id, gate, origin, and the ticket `jti` for edge starts |
-| `alloc.ratified` | a provisional allocation became durable; carries the allocation id and the latency |
-| `alloc.refused` | a ratification was refused; carries the reason code and detail |
-| `boot_ticket.issued` | a ticket was minted; carries `jti`, scope, and the minting accessor id |
+| `alloc.provisional_started` | a node started work before the placement was durable. Carries claim id, gate, origin, and the ticket `jti` for edge starts |
+| `alloc.ratified` | a provisional allocation became durable. Carries the allocation id and the latency |
+| `alloc.refused` | a ratification was refused. Carries the reason code and detail |
+| `boot_ticket.issued` | a ticket was minted. Carries `jti`, scope, and the minting accessor id |
 
-No ticket material ever appears in an event, a log line, or a store row — only
-the `jti`.
+Ticket material never appears in an event, a log line, or a store row. Only
+the `jti` does.
 
 **Metrics** (see [`docs/metrics.md`](metrics.md)):
 
 - `legion_provisional_starts_total{origin,gate}`
 - `legion_provisional_refused_total{reason}`
-- `legion_provisional_killed_total{cause}` — `refused`, `expired`, `failed`
-- `legion_provisional_ratify_seconds` — admission to verdict
-- `legion_provisional_active` — unratified claims held right now, so
-  started-but-unconfirmed capacity is visible rather than invisible
+- `legion_provisional_killed_total{cause}`: `refused`, `expired`, `failed`
+- `legion_provisional_ratify_seconds`: time from admission to verdict
+- `legion_provisional_active`: unratified claims held right now, so you can
+  see capacity that is started but not yet confirmed
 
 **CLI:**
 
@@ -446,64 +448,62 @@ $ legion node claims node-a -j
 $ legion boot-ticket list --job agent-sandboxes
 ```
 
-`legion node claims` reads live state the manager holds in memory from the last
-heartbeat. After a manager failover it shows nothing until each node's next
-heartbeat — briefly incomplete, never wrong.
+`legion node claims` reads live state the manager holds in memory from the
+last heartbeat. After a manager failover, it shows nothing until each node's
+next heartbeat. The list can be briefly incomplete, but it is never wrong.
 
 ## Version skew
 
 `TaskAllocation.provisional` is a new optional field. An old worker would
-ignore it and run the allocation the moment it arrives — which, with pre-commit
-dispatch, means running it *before* the commit with no gate and no lease. That
-is the one genuinely dangerous skew case, and it is fenced at the dispatcher:
-speculative dispatch requires a minimum worker protocol version and falls back
-to post-commit dispatch, per node, below it.
+ignore it and run the allocation as soon as it arrives. With pre-commit
+dispatch, that means running it before the commit, with no gate and no
+lease. This is the one dangerous skew case, and the dispatcher blocks it.
+Speculative dispatch requires a minimum worker protocol version. Below it,
+the dispatcher falls back to post-commit dispatch for that node.
 
-`RatifyClaim` is a new RPC, so an old manager simply rejects it and workers
-fall back to their lease — that is, they kill the work. Fail-closed under skew.
+`RatifyClaim` is a new RPC, so an old manager rejects it and workers fall
+back to their lease, which means they kill the work. Skew fails closed.
 
-Manager upgrade order is the existing policy ([`docs/upgrades.md`](upgrades.md)).
+Upgrade managers in the usual order ([`docs/upgrades.md`](upgrades.md)).
 
 ## Known limitations
 
-Stated here rather than left for a bug report:
-
-- **No island mode.** An unratified start that cannot reach a manager dies when
-  its lease expires. Surviving a long control-plane outage is a separate design
-  with its own consistency argument.
+- **No island mode.** An unratified start that cannot reach a manager dies
+  when its lease expires. Edge boot does not keep work running through a long
+  control-plane outage.
 - **The `boot` gate is advisory for `container` and `exec` in `host` mode**
-  (see [What the gate does and does not stop](#what-the-gate-does-and-does-not-stop));
-  `network.mode = "gated"` makes it a real, per-destination boundary on Linux.
+  (see [What the gate does and does not stop](#what-the-gate-does-and-does-not-stop)).
+  On Linux, `network.mode = "gated"` makes it enforced.
 - **The `sandbox` network gate is link state only.** Legion holds the TAP
-  device down; it does not install a per-interface default-drop filter.
-  Operators who want belt-and-braces isolation should add one themselves.
-- **No per-destination policy for the gated state.** The gate is on/off at the
-  interface. A sandbox that may reach a package registry but not the internet
-  before ratification is a networking feature, not this one.
+  device down. It does not install a per-interface default-drop filter. If
+  you want a second layer of isolation, add one yourself.
+- **No per-destination policy for the gated state.** The gate is all or
+  nothing, for the TAP device and for `gated` mode. A task cannot reach a
+  package registry, or anything else, before ratification.
 - **Gates above `stage` are unavailable to tasks with declared ports, connect
   upstreams, or non-node-local storage** (see [Automatic
   downgrades](#automatic-downgrades)).
-- **No edge-side capacity arbitration.** A node admits against its own local
-  free resources and nothing else. It never negotiates, bids, or preempts. The
-  manager remains the only scheduler, and the node's ledger is advisory — the
-  apply's re-validation is the authority.
-- **Manager-side speculative dispatch does not name an instance.** Which keyed
-  instance a placement binds is decided inside the apply, so a payload sent
-  before it cannot know. Keyed starts that need to name their sandbox up front
-  use the edge path.
-- **A late-binding fallback costs the head start.** Under [late-binding plan
-  apply](late-binding-plan-apply.md) a placement carries ranked candidate
-  nodes and the apply walk binds the first one still valid. Speculative
-  dispatch goes to the planner's first choice, so when the walk falls back to
-  another candidate the workload starts on a node that staged nothing — it
-  starts by ordinary post-commit dispatch, and the claim on the first choice
-  expires at its `ratifyTimeout` without ever running. Nothing is placed
-  twice and nothing is lost but the head start. The `fallbacks` field on the
-  scheduler's `Completed scheduler plan_and_apply` log line counts how often
-  the walk fell back; if that is high for a job that opted into
-  `speculativeStart`, the speculation is mostly wasted work.
+- **No edge-side capacity arbitration.** A node admits work against its own
+  local free resources and nothing else. It never negotiates, bids, or
+  preempts. The manager is still the only scheduler. The node's ledger is
+  advisory, and the apply's re-validation has the final say.
+- **Manager-side speculative dispatch does not name an instance.** The apply
+  decides which keyed instance a placement binds, so a payload sent before
+  the apply cannot know it. Keyed starts that need to name their sandbox up
+  front should use the edge path.
+- **A late-binding fallback loses the head start.** Under [late-binding plan
+  apply](late-binding-plan-apply.md), a placement carries ranked candidate
+  nodes, and the apply binds the first one that is still valid. Speculative
+  dispatch goes to the planner's first choice. If the apply falls back to
+  another candidate, the workload starts there through ordinary post-commit
+  dispatch, on a node that staged nothing. The claim on the first choice
+  expires at its `ratifyTimeout` without running. Nothing is placed twice,
+  and only the head start is lost. The `fallbacks` field on the scheduler's
+  `Completed scheduler plan_and_apply` log line counts how often this
+  happens. If it is high for a job that uses `speculativeStart`, most of the
+  speculation is wasted work.
 - **No speculative attach for shared storage,** even for drivers that could
-  fence it. A driver-advertised fencing capability is future work.
-- **Not a snapshot/fast-start substitute.** This removes control-plane latency;
-  snapshots remove boot latency. A platform wanting sub-100 ms starts needs
-  both.
+  fence it. Drivers cannot yet advertise a fencing capability.
+- **Not a replacement for snapshots or fast start.** Edge boot removes
+  control-plane latency. Snapshots remove boot latency. A platform that
+  wants starts under 100 ms needs both.

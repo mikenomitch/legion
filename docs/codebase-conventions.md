@@ -1,6 +1,6 @@
 # Codebase Conventions
 
-This file captures current conventions used across Legion.
+This page lists the conventions used across the Legion codebase.
 
 ## Repository and Module Boundaries
 
@@ -24,7 +24,7 @@ This file captures current conventions used across Legion.
 
 - Use `anyhow::Result` (`R<T>` alias) for fallible flows.
 - Attach context on fallible boundaries with `Context`.
-- In manager gRPC server layer, map storage and domain errors to typed gRPC statuses (`map_store_error`).
+- In the manager gRPC server layer, map storage and domain errors to typed gRPC statuses (`map_store_error`).
 
 ## Tracing and Diagnostics
 
@@ -39,40 +39,31 @@ This file captures current conventions used across Legion.
 
 ## Scheduler and Eval Conventions
 
-- Use eval queue as reconciliation driver (`enqueue_eval*`) instead of ad-hoc orchestration loops where possible.
-- Keep scheduling side effects conflict-safe via allocation epoch + plan submission apply.
-- Keep constraint/permit behavior hard-filtered and affinity behavior soft-scored.
+- Use the eval queue (`enqueue_eval*`) to drive reconciliation instead of ad-hoc orchestration loops where possible.
+- Keep scheduling side effects conflict-safe through the allocation epoch and plan submission apply.
+- Constraints and permits are hard filters. Affinities are soft scores.
 
 ## Plugin Conventions
 
-- Plugin crates must export `get` symbol returning trait object.
+- Plugin crates must export a `get` symbol that returns a trait object.
 - Dynamic plugin paths follow `plugins/<kind>/<name>/target/release/lib<name>.<ext>`.
-- Built-in implementations may coexist with dynamic plugins of same category.
+- Built-in implementations can coexist with dynamic plugins of the same category.
 
 ## State and Persistence
 
 - Cluster manager state is SQLite-backed and migration-managed.
 - Worker runtime state is local JSON file state with PID recovery checks.
-- Update in-memory read model cache when mutating scheduler-relevant DB rows.
+- Update the in-memory read model cache when you mutate scheduler-relevant DB rows.
 
 ## Testing Conventions
 
 - Co-locate unit tests with implementation files.
 - Keep integration scenarios under `tests/`.
 - Prefer temp directories/databases per test for isolation.
-- Run full Rust test suite for Rust changes.
+- Run the full Rust test suite for Rust changes.
 
 ## Documentation Conventions
 
 - Keep architecture docs in `docs/`.
 - When behavior changes, update docs and examples in the same change.
 - Keep planned-but-not-implemented behavior clearly labeled.
-
-## (SUGGESTIONS - DELETE ME)
-
-1. Standardize node status vocabulary (`active` vs `ready`) to reduce state-machine ambiguity.
-2. Move remaining direct reconciliation paths to explicit eval kinds for one control-loop model.
-3. Add a dedicated docs index page in `docs/` to avoid scattered entry points.
-4. Define a strict schema for `config_attrs` keys (like `workerAddress`, `resources`) and validate centrally.
-5. Add explicit policy for when to add scheduler benchmarks alongside scheduler logic changes.
-

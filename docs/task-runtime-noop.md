@@ -4,40 +4,39 @@
 
 ## Purpose
 
-Provide a minimal task runtime for testing scheduler/task-manager integration without launching real workloads.
+`noop` is a minimal task runtime. Use it to test scheduler and task-manager integration without launching real workloads.
 
 ## Plugin Type
 
-- Dynamic plugin (`cdylib`), not hard-coded as a built-in branch.
-- Loaded via normal task plugin path resolution.
-- Worker startup attempts to load it if present.
+- Dynamic plugin (`cdylib`), not a hard-coded built-in.
+- Loaded through the normal task plugin path resolution.
+- The worker tries to load it at startup if it is present.
 
 ## Behavior
 
 - `schema`: accepts any object.
 - `validate_config`: always succeeds.
 - `prepare/start/stop/destroy`: log actions.
-- `start`: copies task config JSON into runtime `state`.
+- `start`: copies the task config JSON into the runtime `state`.
 
 ## Artifacts Support
 
-None. `noop` does not report `supports_artifacts()`, so a `noop` task that
+None. `noop` does not report `supports_artifacts()`. A `noop` task that
 declares `artifacts` is rejected with an actionable error at
 `legion job validate` and at admission (see
 [docs/artifacts.md](artifacts.md)).
 
 ## Stop and resource fields
 
-`noop` tracks no process and confines nothing, so the task-level `stop`
-block is **accepted and inert** on a `noop` task: there is nothing to signal,
-so the runtime declines the notice and the allocation is torn down
-immediately rather than waiting out a window nothing can use. Likewise its
-`resource_enforcement()` is `Unsupported`, so `resources` stay scheduling-only
-and the worker touches no cgroup for it (see
+`noop` tracks no process and confines nothing. A `noop` task accepts the
+task-level `stop` block, but the block has no effect. There is nothing to
+signal, so the runtime declines the notice and tears the allocation down
+immediately instead of waiting out the stop window. Its
+`resource_enforcement()` is `Unsupported`, so `resources` only affect
+scheduling and the worker touches no cgroup for it (see
 [docs/resource-enforcement.md](resource-enforcement.md)).
 
 ## Usage Notes
 
 - Useful in tests and lightweight demo jobs.
-- Because it does not spawn a real process, health checks that depend on external endpoints/process state may not make sense with this runtime.
-
+- It does not spawn a real process, so health checks that depend on external endpoints or process state may not make sense with this runtime.

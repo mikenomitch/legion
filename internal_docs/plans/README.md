@@ -68,7 +68,7 @@ is hard to write.
    surface as the user will actually type and read it (see below).
 7. **Proto, struct, config, and persistence changes.** The concrete diff
    surface, including migrations and every new job-config field (which also goes
-   into `configs/jobs/maximal.jsonnet`).
+   into `configs/jobs/maximal.ncl`).
 8. **Implementation phases.** Each phase independently shippable *and*
    independently valuable — if phase 2 is worthless without phase 5, the
    phasing is wrong.

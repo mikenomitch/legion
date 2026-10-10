@@ -1,53 +1,54 @@
 # Scheduling Indexes
 
-Declarable, ad-hoc indexes over worker nodes that make candidate selection
-scale: instead of testing every available node against every task's
-constraints on every plan, the scheduler asks a purpose-built structure for
-"the nodes this task could land on, best-fit first" and verifies only those.
-You declare an index in one line of manager config over *any* node attributes
-and resources you care about — including custom ones — and the scheduler
-picks the right index per task automatically.
+Scheduling indexes help candidate selection scale on large fleets. Without
+them, the scheduler tests every available node against every task's
+constraints on every plan. With an index, the scheduler asks for "the nodes
+this task could land on, best fit first" and verifies only those.
 
-Neither Kubernetes nor Nomad has an equivalent: both filter linearly and
-answer scale with sampling (`percentageOfNodesToScore`) or cluster
-partitioning. Legion's indexes keep placement quality *and* drop the scan.
+You declare an index in one line of manager config, over any node attributes
+and resources you care about, including custom ones. The scheduler picks the
+right index for each task automatically.
+
+Kubernetes and Nomad both filter nodes linearly. They handle scale with
+sampling (`percentageOfNodesToScore`) or by partitioning the cluster. Legion's
+indexes skip the scan while keeping placement quality.
 
 ## The model
 
 An index is two optional parts:
 
-- **`partition_by`** — a list of exact-match attribute keys. Every distinct
-  value-tuple is a shard; a task's equality constraints select exactly one
-  shard. Think region/zone/pool/tenant topology.
-- **`dims`** — up to six numeric dimensions bucketed into a sparse grid.
-  A dim reads either **free resource capacity** (`resources.<name>` —
-  fingerprinted capacity minus current allocation usage, for built-in *and*
-  custom resources) or any numeric node attribute. A task's resource request
-  maps to a grid cell, and candidates come back **nearest-fit first**: nodes
+- **`partition_by`**: a list of exact-match attribute keys. Every distinct
+  tuple of values is a shard. A task's equality constraints select one shard.
+  Use this for topology such as region, zone, pool, or tenant.
+- **`dims`**: up to six numeric dimensions, bucketed into a sparse grid. A dim
+  reads either free resource capacity or any numeric node attribute. Free
+  capacity (`resources.<name>`) is fingerprinted capacity minus current
+  allocation usage, for both built-in and custom resources. A task's resource
+  request maps to a grid cell. Candidates come back nearest fit first: nodes
   whose free capacity covers the request, closest match first (or most
-  headroom first — see `order`), then everything else.
+  headroom first, see `order`), then everything else.
 
-Partition-only gives a pure inverted index; dims-only gives a pure fit
-index; together they give a sharded fit index.
+Partition-only gives a pure inverted index. Dims-only gives a pure fit index.
+Both together give a sharded fit index.
 
-Two invariants make this safe to leave on:
+Two rules make indexes safe to leave on:
 
-1. **The index proposes; the ledger disposes.** Every candidate an index
-   returns is re-verified through the ordinary constraint / permit /
-   resource-ledger chain, and the full scan remains the permanent fallback.
-   A stale or wrong index can cost a refill or a slightly worse pick —
-   never an invalid placement.
-2. **Ordering, not filtering.** An untruncated query returns the *whole*
-   shard, fit-informed only in its ordering, so index-served planning sees
-   exactly the candidate set the scan would have produced (this is pinned
-   by tests, and by shadow mode at runtime). Only explicit truncation — the
-   per-task candidate budget — narrows what placement sees, and it keeps
+1. **The index proposes, the ledger decides.** Every candidate an index
+   returns is re-verified through the ordinary constraint, permit, and
+   resource-ledger checks. The full scan is always available as a fallback. A
+   stale or wrong index can cost a refill or a slightly worse pick, but never
+   an invalid placement.
+2. **Indexes order candidates, they don't filter them.** An untruncated query
+   returns the whole shard, with fit only affecting the order. Index-served
+   planning sees the same candidate set the scan would have produced. Tests
+   check this, and so does shadow mode at runtime. Only explicit truncation
+   (the per-task candidate budget) narrows what placement sees, and it keeps
    the best-fitting candidates.
 
 ## Declaring indexes
 
-Everything lives under `schedulerSettings` in the manager config; changes
-take effect at manager restart. The minimal declaration is one line:
+All settings live under `schedulerSettings` in the manager config. Changes
+take effect when you restart the manager. The minimal declaration is one line:
 
 ```nickel
 {
@@ -77,27 +78,28 @@ take effect at manager restart. The minimal declaration is one line:
 }
 ```
 
-Defaults do the work:
+Defaults:
 
 - Dim entries given as plain strings get `weight = 1` and `scale = "log"`.
-- `scale = "log"` buckets by `floor(log2(value + 1))` — unit-independent and
-  monotone, the right choice for capacities spanning orders of magnitude.
-  `scale = "linear"` with `step` suits small discrete ranges (GPU counts).
+- `scale = "log"` buckets by `floor(log2(value + 1))`. It is unit-independent
+  and monotone, so it suits capacities that span orders of magnitude.
+  `scale = "linear"` with `step` suits small discrete ranges, such as GPU
+  counts.
 - `order` defaults from the scheduling policy: `bin_pack` → `tight`
   (smallest sufficient fit first), `spread` → `loose` (most headroom
-  first). This orders *candidate generation*; the policy still scores and
-  makes the final choice.
+  first). This only orders candidate generation. The policy still scores
+  candidates and makes the final choice.
 - `mode` defaults to `"on"`. `"shadow"` runs the index alongside the
-  authoritative scan and reports disagreements (metrics + warnings) without
-  affecting placement — use it to build trust in a new index on a live
-  cluster before flipping it on.
-- `pool` as a partition key always reads the node's **pool**, the same
-  special case permits use — never a node attribute named "pool".
+  authoritative scan and reports disagreements (metrics and warnings) without
+  affecting placement. Use it to try a new index on a live cluster before you
+  turn it on.
+- `pool` as a partition key always reads the node's pool, the same special
+  case permits use. It never reads a node attribute named "pool".
 
-Malformed declarations (unknown fields, more than 6 dims, non-positive
-`step`, `true` for anything but `fit`) fail the manager at startup with a
-pointed error — a silently-ignored index is the failure mode the explain
-surface below exists to prevent.
+Malformed declarations fail the manager at startup with a specific error.
+These include unknown fields, more than 6 dims, a non-positive `step`, and
+`true` for anything but `fit`. Legion rejects them so an index is never
+silently ignored.
 
 ## The built-in `fit` index
 
@@ -110,64 +112,68 @@ fit = {
 }
 ```
 
-— nearest-fit over free cpu, memory, and disk within the task's pool.
-Nodes that don't declare a resource (disk, most commonly — workers do not
-fingerprint a schedulable disk resource today, so it exists only where the
-operator declares `config_attrs.resources.disk`) project into that dim's
-**zero-free bucket**: they match every request that doesn't ask for it and
-sort last for requests that do, which is exactly the conclusion the
-resource ledger would reach anyway. `allocations` is deliberately not a
-dim — its default capacity is unlimited, which buckets uselessly.
+This index ranks nodes by nearest fit over free cpu, memory, and disk, within
+the task's pool.
+
+Nodes that don't declare a resource project into that dim's zero-free bucket.
+They match every request that doesn't ask for the resource, and sort last for
+requests that do. The resource ledger would reach the same conclusion. Disk is
+the most common case. Workers do not fingerprint a schedulable disk resource
+today, so disk exists only where the operator declares
+`config_attrs.resources.disk`. `allocations` is not a dim because its default
+capacity is unlimited, which does not bucket usefully.
 
 Disable it with `indexes = { fit = false }`, or redefine it by declaring your
 own index named `fit`.
 
 ## Arming: small clusters pay nothing
 
-Indexes participate in planning only when the plan's candidate fleet has at
-least `index_min_nodes` available nodes (default **128**). Below the
-threshold the scheduler uses the plain scan and the only cost is index
-bookkeeping on node/allocation changes — O(1) hash-map work per event, and
-none at all if you set `index_min_nodes = 0`, which disables indexing
-entirely. Edge clusters never see this feature unless they ask for it.
+Indexes take part in planning only when the plan's candidate fleet has at
+least `index_min_nodes` available nodes (default 128). Below the threshold,
+the scheduler uses the plain scan. The only cost is index bookkeeping on node
+and allocation changes, which is O(1) hash-map work per event.
+
+`index_min_nodes = 0` is a special value that turns index queries off, so
+every plan uses the scan. It does not stop the bookkeeping. To remove that
+cost too, declare no indexes at all (`indexes = { fit = false }` with nothing
+else). Small and edge clusters don't use indexes unless you opt in.
 
 ## Automatic index selection
 
 Per task, the scheduler:
 
-1. Collects the task's **equality bindings**: every `=` constraint, plus
-   the pool its permit pins (permits always pin one — `pool=default` by
+1. Collects the task's equality bindings: every `=` constraint, plus the
+   pool its permit pins. Permits always pin one pool (`pool=default` by
    default).
-2. Keeps indexes whose **every `partition_by` key is bound**. A regex,
-   range, or `distinct` rule does not bind a key — such tasks fall back to
-   the scan rather than guess.
-3. Scores the survivors by how many of the task's **requested resources**
-   their dims cover; highest coverage wins, then more partition keys, then
-   declaration order. Deterministic, and cheap (runs once per task).
-4. Queries the chosen index's shard and re-verifies every candidate with
-   the full constraint/permit/driver predicate.
+2. Keeps indexes where every `partition_by` key is bound. A regex, range, or
+   `distinct` rule does not bind a key. Those tasks fall back to the scan
+   instead of guessing.
+3. Scores the remaining indexes by how many of the task's requested resources
+   their dims cover. Highest coverage wins, then more partition keys, then
+   declaration order. This is deterministic and cheap, and runs once per task.
+4. Queries the chosen index's shard and re-verifies every candidate with the
+   full constraint, permit, and driver checks.
 
-Candidate lists are **truncated** to a budget (`max(64, 8 × remaining
-count)`, nearest-fit first) only when nothing downstream needs the full
-set — a task with `count.per`, `distinct` constraints, volumes (which can
-pin placements), or membership in a multi-task group always gets the whole
-shard. If placement exhausts a truncated list while the fleet still has
-room, the scheduler widens back to the full scan mid-task and keeps going
+The scheduler truncates candidate lists to a budget (`max(64, 8 × remaining
+count)`, nearest fit first) only when nothing downstream needs the full set.
+A task always gets the whole shard if it has `count.per`, `distinct`
+constraints, volumes (which can pin placements), or belongs to a multi-task
+group. If placement exhausts a truncated list while the fleet still has room,
+the scheduler widens back to the full scan mid-task and keeps going
 (`refills` in the explain output).
 
-Truncation walks cells best-first and includes every cell it reaches
-whole; when the budget runs out *inside* a cell, the remainder is a
-**uniform random sample of that cell**, not its lowest node ids. Nodes in
-one cell are indistinguishable to the index, and a fixed prefix would hand
-every plan the same few nodes: on a fleet of identically-shaped nodes that
-is one failure domain packed to its cap while the rest sit idle, with
-`spread` scoring only ever choosing among the prefix. Expect a truncated
-candidate list to differ between two otherwise identical `job plan` runs;
-the untruncated set never does.
+Truncation walks cells best first and includes every cell it reaches in full.
+When the budget runs out inside a cell, the rest is a uniform random sample of
+that cell, not its lowest node IDs. Nodes in one cell look the same to the
+index. A fixed prefix would hand every plan the same few nodes. On a fleet of
+identically shaped nodes, that would pack one failure domain to its cap while
+the rest sit idle, and `spread` scoring would only ever choose among the
+prefix. Expect a truncated candidate list to differ between two otherwise
+identical `job plan` runs. The untruncated set never does.
 
 ## Seeing what happened: `job plan`
 
-`legion job plan` reports, per task, exactly how candidates were generated:
+`legion job plan` reports how candidates were generated for each task:
 
 ```
 Scheduling index:
@@ -176,66 +182,67 @@ Scheduling index:
   canary: index fit (shadow mode, 41 candidates; shadow agrees)
 ```
 
-The same records ride the `--json` envelope (`index_usage`: name, mode,
+The same records appear in the `--json` envelope (`index_usage`: name, mode,
 candidate count, truncation, refills, fallbacks, shadow agreement, and the
-reason when no index served). If you declared an index and a task isn't
-using it, the `reason` string says which partition key the task fails to
-bind. Prometheus counters cover the same ground fleet-wide — see
+reason when no index served). If you declared an index and a task isn't using
+it, the `reason` string names the partition key the task fails to bind.
+Prometheus counters report the same data across the fleet. See
 [metrics.md](metrics.md#scheduling-indexes).
 
 ## Performance expectations
 
-Indexes remove the **per-task constraint scan** — the component that scales
-with tasks × nodes. The per-plan snapshot they sit beside is cheap too
-(the read model hands plans `Arc`'d nodes and cached free-capacity pools —
-see [state-store.md](state-store.md)), so the index's win is visible in
-whole-plan wall-clock: on a 5,000-node fleet a 12-task plan runs ~21%
-faster with the default partition index than with the scan (numbers and
-method: `benchmarks/scheduler/README.md`). Expect wins to grow with task
-count, constraint count, and shard selectivity — and expect none on small
-fleets, where indexes intentionally never arm.
+Indexes remove the per-task constraint scan, which is the part of planning
+that scales with tasks × nodes. The per-plan snapshot is also cheap, because
+the read model hands plans `Arc`'d nodes and cached free-capacity pools (see
+[state-store.md](state-store.md)). So the index's gain shows up in whole-plan
+wall-clock time. On a 5,000-node fleet, a 12-task plan runs about 21% faster
+with the default partition index than with the scan (numbers and method:
+`benchmarks/scheduler/README.md`). Expect larger gains with more tasks, more
+constraints, and more selective shards. Expect none on small fleets, where
+indexes never arm.
 
 ## Maintenance and consistency
 
-Indexes live inside the scheduler's read model and are maintained by the
-same write path that mutates nodes and allocations — node joins, heartbeat
-attribute changes, availability flips (cordon/drain/uncordon), node
-removal, and allocation apply/remove all re-project the affected node in
-the same lock. They hold exactly the nodes the scheduler considers
-(availability `"available"`), are **never persisted**, and are rebuilt from
-the nodes table at startup and on raft failover. Re-projection skips shard
-surgery when nothing indexed actually changed, so heartbeat noise on
-unindexed attributes costs one comparison.
+Indexes live inside the scheduler's read model. The same write path that
+changes nodes and allocations keeps them up to date. Node joins, heartbeat
+attribute changes, availability changes (cordon, drain, uncordon), node
+removal, and allocation apply or remove all re-project the affected node under
+the same lock.
+
+Indexes hold the same nodes the scheduler considers (availability
+`"available"`). They are never persisted. The manager rebuilds them from the
+nodes table at startup and on raft failover. Re-projection skips shard updates
+when nothing indexed changed, so heartbeat changes to unindexed attributes
+cost one comparison.
 
 ## Failure modes and diagnostics
 
-- **"My index isn't being used."** `legion job plan` → the task's `reason`
-  line. Usual causes: the fleet is below `index_min_nodes`; the task lacks
-  an `=` constraint for one of the index's `partition_by` keys; the index
-  is `mode = "off"`.
+- **"My index isn't being used."** Check the task's `reason` line in
+  `legion job plan`. Common causes: the fleet is below `index_min_nodes`, the
+  task lacks an `=` constraint for one of the index's `partition_by` keys, or
+  the index has `mode = "off"`.
 - **Manager refuses to start after editing `indexes`.** The parse error
-  names the index and field; fix the declaration — validation is strict on
-  purpose.
+  names the index and field. Fix the declaration.
 - **Shadow disagreements** (`legion_scheduler_index_shadow_total{result="disagree"}`
   or `shadow DISAGREES` in `job plan`). The scan stayed authoritative, so
-  placements were unaffected — but the index missed eligible nodes and the
-  warning log carries a sample of them; please file it.
-- **A placement that used to succeed now fails.** Indexes cannot cause
-  this: an index-served empty candidate set is always cross-checked against
-  the scan before failing, and the scan's verdict wins. If you want to rule
-  the feature out anyway, `index_min_nodes = 0` restores pre-index behavior
-  byte for byte.
+  placements were unaffected. The index did miss eligible nodes, though, and
+  the warning log includes a sample of them. Please file a bug.
+- **A placement that used to succeed now fails.** Indexes cannot cause this.
+  An empty index-served candidate set is always cross-checked against the scan
+  before the placement fails, and the scan's result wins. To rule the feature
+  out anyway, set `index_min_nodes = 0`, which gives the same behavior as
+  having no indexes at all.
 
 ## Known limitations
 
-- **Multi-task group candidate sets** (co-placed groups) are still built by
-  scanning; only single-task placement (the overwhelmingly common case) is
-  index-served today.
-- **Device-set resources** (per-item resources like explicit GPU device
-  lists) cannot be dims; the ledger still enforces them on every candidate.
-- Selection considers only **equality** constraints for partition binding —
-  a range or regex over `region` falls back to the scan even if only one
-  region could match.
-- Settings changes require a **manager restart**.
-- There is no per-task index override in the job spec; selection is always
+- Candidate sets for multi-task (co-placed) groups are still built by
+  scanning. Only single-task placement, the most common case, uses indexes
+  today.
+- Device-set resources (per-item resources such as explicit GPU device lists)
+  cannot be dims. The ledger still enforces them on every candidate.
+- Selection considers only equality constraints for partition binding. A
+  range or regex over `region` falls back to the scan, even if only one region
+  could match.
+- Settings changes require a manager restart.
+- There is no per-task index override in the job spec. Selection is always
   automatic.

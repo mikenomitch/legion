@@ -36,7 +36,7 @@
 //!
 //! The dispatch is by file extension ([`format_for`]) and nothing else — no
 //! content sniffing, so a file's name always tells you how it will be read.
-//! JSON is *not* a subset of Nickel the way it was of Jsonnet: records are
+//! JSON is *not* a subset of Nickel: records are
 //! `key = value`, and a JSON object fed to the Nickel parser fails obscurely
 //! (`:` is Nickel's type-annotation operator, so `{"a": 1}` reads as a field
 //! annotated with the contract `1`). Dispatching on the extension is what

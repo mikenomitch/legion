@@ -84,10 +84,10 @@ submit: the worker self-terminates stateful tasks `selfTerminateAfter` (default
 allocations until `replaceAfter` (default 2×). Validation rejects
 `replaceAfter <= selfTerminateAfter`.
 
-```jsonnet
-stateful: {
-  mode: 'slot',
-  onLost: { selfTerminateAfter: '90s', replaceAfter: '180s' },  // or 'never'
+```nickel
+stateful = {
+  mode = "slot",
+  onLost = { selfTerminateAfter = "90s", replaceAfter = "180s" },  # or "never"
 }
 ```
 

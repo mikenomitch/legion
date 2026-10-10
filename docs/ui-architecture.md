@@ -1,34 +1,34 @@
 # UI Architecture
 
-The UI is a SolidJS single-page app in `ui/` and talks directly to manager gRPC APIs over gRPC-Web.
+The UI is a SolidJS single-page app in `ui/`. It talks directly to the manager's gRPC APIs over gRPC-Web.
 
 ## Stack
 
 - SolidJS + Solid Router
 - ConnectRPC (`@connectrpc/connect-web`) generated from `proto/legion.proto`
 - TailwindCSS
-- Vite build, split by route: the API Explorer (which embeds the generated
+- Vite build, split by route. The API Explorer (which embeds the generated
   proto sources as text for its field docs), the State Explorer, the
   Observability page and the xterm.js terminal load on first use, so the
   first page load carries none of them.
 - Self-hosted fonts via `@fontsource-variable` (Space Grotesk for display,
-  Inter for text, Fira Code for data) — no CDN requests. The `font-mono`
-  utility disables Fira Code's `liga`/`calt` ligatures so IDs, hashes and log
-  lines render literally.
+  Inter for text, Fira Code for data), so there are no CDN requests. The
+  `font-mono` utility disables Fira Code's `liga`/`calt` ligatures so IDs,
+  hashes and log lines render literally.
 
 ## Design System
 
 The visual language ("Legion command post": warm stone neutrals, brass
-accent, dark-first with a full light theme) is centralized:
+accent, dark-first with a full light theme) lives in a few central places:
 
 - **Tokens**: theme colors are CSS variables in `ui/src/index.css`
   (`--c-canvas`, `--c-surface`, `--c-line`, `--c-ink`, `--c-muted`,
   `--c-brass`, …) mapped into Tailwind color names in
   `ui/tailwind.config.js` (`bg-surface`, `text-muted`, `border-line`,
-  `text-brass`, …). Light/dark switch by swapping variables on `.dark`;
-  pages never write `dark:` variants for theme colors.
+  `text-brass`, …). Light and dark themes switch by swapping variables on
+  `.dark`. Pages never write `dark:` variants for theme colors.
 - **Primitives**: `ui/src/components/ui.tsx` exports the shared components
-  every page composes — `Icon`, `Badge`/`StatusBadge`/`MonoBadge`,
+  every page builds on: `Icon`, `Badge`/`StatusBadge`/`MonoBadge`,
   `Card`/`SectionCard`/`PageHeader`/`StatCard`, `Tabs`, `Note`,
   `EmptyState`, `Spinner`/`LoadingRows`/`PageSkeleton`,
   `Button`/`ConfirmButton` (two-step destructive confirm)/`CopyButton`,
@@ -38,12 +38,12 @@ accent, dark-first with a full light theme) is centralized:
   `thClass`, `tdClass`, …). Add new UI here first.
 - **Status vocabulary**: `ui/src/utils/status.ts` maps every status string
   the manager emits to one of six tones (`ok`/`warn`/`danger`/`info`/
-  `neutral`/`accent`) and exposes the badge/dot/text classes for each, so
-  the same word gets the same color everywhere. `StatusBadge` uses it
+  `neutral`/`accent`) and exposes the badge, dot and text classes for each.
+  The same word gets the same color everywhere. `StatusBadge` uses it
   automatically.
-- **Favicon and tab title**: `ui/public/favicon.svg` is the brand mark;
-  `document.title` reads innermost-first (`web · api · Jobs · Legion`) so
-  open tabs are tellable apart by their first word.
+- **Favicon and tab title**: `ui/public/favicon.svg` is the brand mark.
+  `document.title` reads innermost-first (`web · api · Jobs · Legion`), so
+  you can tell open tabs apart by their first word.
 
 ## Entry Points
 
@@ -65,32 +65,31 @@ Routes in `App.tsx`:
 - `/jobs` (+ `/jobs/:id`, `/jobs/:id/tasks/:taskName`, `/jobs/:id/specs/:configId`)
 - `/templates` (+ `/templates/:name`)
 - `/services` (+ `/services/:name`)
-- `/rollouts` (+ `/rollouts/:id`); `/deployments` redirects here
+- `/rollouts` (+ `/rollouts/:id`). `/deployments` redirects here.
 - `/nodes` (+ `/nodes/:id`)
 - `/manager` (+ `/manager/:id`)
 - `/raft`, `/events`, `/kv`, `/access`, `/api`, `/state-explorer`,
   `/observability` (shown only when the manager reports o11y enabled),
   `/testing`
-- anything else renders a not-found card naming the path (it used to land
-  silently on the overview)
+- anything else renders a not-found card naming the path
 
 A shared layout provides the grouped sidebar nav, a slim topbar
 (breadcrumbs, ⌘K search, the shortcut sheet, theme toggle), and page headers
-for top-level routes; detail pages render their own `PageHeader`. The sidebar
+for top-level routes. Detail pages render their own `PageHeader`. The sidebar
 footer shows the current identity (principal and source, or "ACLs off" / "Not
-logged in") linking to Access, and the manager address with a dot that
-pulses red while contact is lost.
+logged in") with a link to Access. It also shows the manager address with a
+dot that pulses red while contact is lost.
 
-Heavy routes are loaded through `lazyPage()` in
-`ui/src/components/LazyPage.tsx` — a resource-backed loader rather than
-Solid's `lazy()`, because a `Suspense` boundary around a page also catches
-every resource *inside* it, and a polled page under Suspense would flash its
-fallback on every refetch. `lazyComponent()` does the same for the terminal.
+Heavy routes load through `lazyPage()` in `ui/src/components/LazyPage.tsx`.
+This is a resource-backed loader used instead of Solid's `lazy()`. A
+`Suspense` boundary around a page also catches every resource inside it, so a
+polled page under Suspense would flash its fallback on every refetch.
+`lazyComponent()` does the same for the terminal.
 
 ## Keyboard Navigation
 
-The UI is usable without a mouse. Everything below is global — no setting, no
-mode to enter. Press `?` anywhere for the sheet that lists all of it.
+You can use the UI without a mouse. Everything below is global, with no
+setting or mode to turn on. Press `?` anywhere for a sheet that lists it all.
 
 | Keys | What it does |
 | --- | --- |
@@ -99,18 +98,19 @@ mode to enter. Press `?` anywhere for the sheet that lists all of it.
 | `j` / `k`, `↑` / `↓` | Move the selection down/up the current index |
 | `o` / `Enter` | Open the selected row |
 | `u` | Go up one level (`/jobs/api/tasks/web` → `/jobs/api`) |
-| *hold* `⌘` / `Ctrl` | **Jump hints** — label the rows and the sidebar with the key that opens them |
+| *hold* `⌘` / `Ctrl` | **Jump hints**: label the rows and the sidebar with the key that opens them |
 | `⌘1` … `⌘9`, `⌘0` | Open the 1st … 10th row of the index |
 | `⌘⇧` + letter | Open the labelled sidebar item |
 | `⌘↵` / `Ctrl+Enter` | Run the query in the State Explorer |
 
 `j`/`k`/`o`, `u` and `?` are ignored while you are typing in a field, and
-while a link or button has keyboard focus — Tab focus wins over the virtual
-selection. A dialog (the palette, the sheet) owns the keyboard while open.
+while a link or button has keyboard focus. Tab focus takes priority over the
+virtual selection. A dialog (the palette, the sheet) owns the keyboard while
+it is open.
 
-The palette's **Recent** group is the last eight detail pages this browser
-opened, recorded from the URL in the layout (`ui/src/utils/recents.ts`,
-localStorage); "Clear recent pages" is one of its actions.
+The palette's Recent group shows the last eight detail pages this browser
+opened. The layout records them from the URL (`ui/src/utils/recents.ts`,
+localStorage). "Clear recent pages" is one of the palette's actions.
 
 ### Jump hints
 
@@ -127,63 +127,63 @@ Services                    ⇧S          ⌘⇧S  → Services
 2  svc-web      DONE                    ⌘2   → svc-web
 ```
 
-Sidebar hints carry `⇧` because plain `⌘`+letter belongs to the browser and the
-OS (`⌘S`, `⌘W`, `⌘R`). The badge always spells the full chord, so what you read
-is what you press.
+Sidebar hints include `⇧` because plain `⌘`+letter belongs to the browser and
+the OS (`⌘S`, `⌘W`, `⌘R`). The badge always spells out the full chord, so what
+you read is what you press.
 
 Known limitations:
 
-- **Ten rows.** Digits run out after the tenth row; on a 20- or 50-row page the
-  rest carry no hints. Use `⌘K` or the search box for those.
+- **Ten rows.** Digits run out after the tenth row. On a 20- or 50-row page
+  the rest have no hints. Use `⌘K` or the search box for those.
 - **Index pages only.** Jobs, Workers, Rollouts, Managers, Services and Volumes
   label their rows. The Overview dashboard and the tables inside detail pages
   do not, and neither do secondary tables (the driver table on Volumes).
 - **Sidebar letters are positional.** They are assigned from the sidebar as
-  rendered, so an item's letter can change when the nav does — most visibly when
-  the manager has observability enabled and an extra item appears.
+  rendered, so an item's letter can change when the nav does. This is most
+  visible when the manager has observability enabled and an extra item appears.
 - **Collapsed sidebar shows no letters** (there is no room for the badge), but
   the chords still work.
 - **A browser may keep a chord.** The letters skip the combinations browsers
-  reserve for tabs, windows and devtools, but a browser or extension with its
-  own bindings can still win one; that chord will do the browser's thing
+  reserve for tabs, windows and devtools. A browser or extension with its own
+  bindings can still claim one, and that chord will do the browser's action
   instead.
 
 Implementation: `ui/src/utils/jumpHints.ts` holds the visibility signal, the
-letter assignment, and the registry of the current index's rows;
-`ui/src/App.tsx` owns the key handling; pages opt in with `useIndexJumpTargets`
-and the `<JumpHint>` primitive. The sheet's rows in
+letter assignment, and the registry of the current index's rows.
+`ui/src/App.tsx` owns the key handling. Pages opt in with
+`useIndexJumpTargets` and the `<JumpHint>` primitive. The sheet's rows in
 `ui/src/components/ShortcutsHelp.tsx` are written by hand from these
-bindings; change both together.
+bindings, so change both together.
 
 ## Data Fetch Pattern
 
 Every page is live. The pattern is `createResource` fed by a poll tick from
 `ui/src/utils/polling.ts`:
 
-- `usePoll(intervalMs)` returns a counter that advances on a timer **while the
-  tab is visible**; ticks stop when the tab is hidden and resume (with an
-  immediate tick) when it is looked at again. Two cadences:
-  `POLL_INTERVAL_MS` (2s) for things being watched — allocations, health, a
-  rollout in progress — and `INDEX_POLL_INTERVAL_MS` (5s) for index pages and
+- `usePoll(intervalMs)` returns a counter that advances on a timer while the
+  tab is visible. Ticks stop when the tab is hidden and resume (with an
+  immediate tick) when it is visible again. There are two cadences:
+  `POLL_INTERVAL_MS` (2s) for things being watched (allocations, health, a
+  rollout in progress) and `INDEX_POLL_INTERVAL_MS` (5s) for index pages and
   the detail pages that fan out into many RPCs per refresh.
 - Solid keeps a resource's previous value on screen while the next fetch is in
-  flight, so nothing flashes on a poll. Detail pages guard on "this is the
-  entity in the URL" (`data()?.name === jobName()`), never on `loading`, so a
-  job→job navigation shows a spinner instead of the previous job.
-- `retainOnError(fetcher, key)` wraps a polled fetcher so that once it has
-  succeeded for a source, a later failure for the *same* source returns the
-  last good value instead of rejecting. A restarting manager does not turn a
-  page into an error card; the connection banner (below) is what reports the
-  outage. The first fetch, and the first after the source changes to a
-  different entity, still reject, so a missing job is still reported as
-  missing. **Known limitation:** a single RPC that starts failing permanently
-  while the manager is otherwise up leaves that page showing its last data
-  with no local hint.
-- Garnish that may be denied (the ledger on job pages, the o11y probe in the
-  layout, the overview stats, the scale panel) swallows its own rejection and
-  degrades to empty.
-- Lists whose rows carry inputs use `<Index>` rather than `<For>`, because
-  each poll returns fresh objects and a keyed list would remount every row.
+  flight, so nothing flashes on a poll. Detail pages check that the data
+  matches the entity in the URL (`data()?.name === jobName()`), never
+  `loading`. That way, navigating from one job to another shows a spinner
+  instead of the previous job.
+- `retainOnError(fetcher, key)` wraps a polled fetcher. Once it has succeeded
+  for a source, a later failure for the same source returns the last good
+  value instead of rejecting. A restarting manager does not turn a page into
+  an error card, and the connection banner (below) reports the outage. The
+  first fetch, and the first after the source changes to a different entity,
+  still reject, so a missing job is still reported as missing. **Known
+  limitation:** if a single RPC starts failing permanently while the manager
+  is otherwise up, that page keeps showing its last data with no local hint.
+- Secondary data that may be denied (the ledger on job pages, the o11y probe
+  in the layout, the overview stats, the scale panel) swallows its own
+  rejection and degrades to empty.
+- Lists whose rows carry inputs use `<Index>` instead of `<For>`. Each poll
+  returns fresh objects, so a keyed list would remount every row.
 
 Exception: the Events page (`Events.tsx`) consumes the `StreamEvents`
 server-streaming RPC over gRPC-Web (an async iterable from ConnectRPC) instead
@@ -193,93 +193,97 @@ an `afterId` cursor so no events are missed across disconnects.
 ## Connection Watchdog
 
 `ui/src/utils/connection.ts` probes `WhoAmI` once to gate the app
-(`ConnectionGate`: a wrong address or a manager that is down gets a card with
-the address and the error, which retries on its own every 5 seconds and has a
-button for an immediate retry). After that first success a watchdog keeps
-probing —
-every 10s, every 3s once contact is lost, never while the tab is hidden. Loss
-shows a red banner under the ACL banner with the address, how long ago, and a
-Retry button; pages keep their last data and say nothing themselves. Recovery
-clears the banner and re-reads the identity, in case ACLs changed across the
-restart. A manager that answers but refuses the call (a stale token) is not a
-connection problem and is reported on the Access page instead.
+(`ConnectionGate`). A wrong address or a manager that is down gets a card
+with the address and the error. The card retries on its own every 5 seconds
+and has a button for an immediate retry. After that first success, a
+watchdog keeps probing: every 10s, every 3s once contact is lost, and never
+while the tab is hidden.
+
+When contact is lost, a red banner appears under the ACL banner with the
+address, how long ago contact was lost, and a Retry button. Pages keep their
+last data and say nothing themselves. Recovery clears the banner and re-reads
+the identity, in case ACLs changed across the restart. A manager that
+answers but refuses the call (a stale token) is not a connection problem, and
+the Access page reports it instead.
 
 ## Page Responsibilities
 
 - `Homepage.tsx`: stat cards, active rollouts, the worker table (status,
-  health, availability), the last eight scheduler events (operator:read
-  garnish — hidden when denied), and the allocation table.
+  health, availability), the last eight scheduler events (needs
+  `operator:read`, hidden when denied), and the allocation table.
 - `Nodes.tsx`: the worker index. Status is the node's liveness
-  (`active`/`lost`/…); the health-check summary is its own column, a badge
+  (`active`/`lost`/…). The health-check summary has its own column, a badge
   marks any availability other than `available`, and the last column is
-  labelled **Heartbeat** because that is what it shows.
-- `Jobs.tsx`: job list + on-demand spec retrieval, with **status chips**
-  above the table. The chips come from `ListJobsReply.status_counts` — counted
-  server-side over the whole query-matched set before the status filter — so
-  the other chips keep their numbers while one is selected; picking one sends
-  `ListJobsRequest.status` (exact, case-insensitive). The shared "Updated"
-  column shows `Job.updated_at` — the job record's mtime, which moves on spec
-  submissions and status transitions but *not* on allocation churn (see
+  labelled Heartbeat because that is what it shows.
+- `Jobs.tsx`: job list and on-demand spec retrieval, with status chips above
+  the table. The chips come from `ListJobsReply.status_counts`, which the
+  server counts over the whole query-matched set before the status filter.
+  That way the other chips keep their numbers while one is selected. Picking
+  a chip sends `ListJobsRequest.status` (exact, case-insensitive). The shared
+  "Updated" column shows `Job.updated_at`, the job record's mtime. It moves
+  on spec submissions and status transitions but not on allocation churn (see
   [Job Timestamps](jobs-tasks-and-scheduling.md#job-timestamps-created_at-and-updated_at)).
-  Sorted newest-change-first by default, matching Rollouts, Templates, and
-  Manager. The job detail view (`pages/details/JobDetail.tsx`):
+  The list is sorted newest-change-first by default, matching Rollouts,
+  Templates, and Manager. The job detail view (`pages/details/JobDetail.tsx`):
   - shows created/updated under the title, and a tooltip on the `done`
-    badge explaining that `done` is the manager's word for an accepted,
-    scheduled job rather than a finished one;
+    badge. The tooltip explains that `done` is the manager's word for an
+    accepted, scheduled job, not a finished one.
   - offers **Stop job** (two-step confirm, hidden once the job is stopped,
-    failed or destroyed) beside **Delete job**, both gated by `job:write` —
-    destroy needs a stopped job first, which is why Stop lives there;
-  - carries a **Scale** card (`components/ScalePanel.tsx`): per task the spec
-    count, the override with its source and age, the effective count and any
-    pending scale-in, plus a Desired field with Scale / Reset — the same
-    `ScaleTask` behind `legion job scale` ([Scaling Jobs](autoscaling.md)).
-    Gated by `scale:write`; keyed stateful tasks are read-only with the reason
-    in the tooltip; the whole card is hidden when `GetJobScaleStatus` is
-    denied;
+    failed or destroyed) beside **Delete job**, both gated by `job:write`.
+    Destroy needs a stopped job first, which is why Stop lives there.
+  - has a **Scale** card (`components/ScalePanel.tsx`). Per task, it shows
+    the spec count, the override with its source and age, the effective count
+    and any pending scale-in. It also has a Desired field with Scale / Reset,
+    backed by the same `ScaleTask` RPC as `legion job scale`
+    ([Scaling Jobs](autoscaling.md)). The card is gated by `scale:write`.
+    Keyed stateful tasks are read-only, with the reason in the tooltip. The
+    whole card is hidden when `GetJobScaleStatus` is denied.
   - marks stateful tasks with a "stateful · slot/keyed" badge (plus storage
-    path) and, for jobs with stateful tasks or live `ListInstances` rows,
+    path). For jobs with stateful tasks or live `ListInstances` rows, it
     renders a polled read-only Instances panel (id, mode, color-coded state,
     slot, current allocation, storage handle, created). Keyed instance
-    create/destroy is CLI-only (`legion instance ...`); the UI does not
+    create/destroy is CLI-only (`legion instance ...`). The UI does not
     mutate instances.
 - `pages/details/TaskDetail.tsx`: definition, volumes, artifacts, discovery,
   health, runtime allocations, exec, logs. The header badge is the same live
   per-task status the job page's task cards show
   (`utils/allocations.ts` `fetchTaskStatusByName`), so the two pages agree.
 - `pages/details/NodeDetail.tsx` → `components/NodeDeepView.tsx`: the worker
-  page, polled. The header carries **Cordon** / **Drain** (two-step confirm)
-  while the node is available and **Uncordon** while it is drained — the
-  `SetNodeAvailability` RPC behind `legion node cordon|drain|uncordon`
-  ([node availability](jobs-tasks-and-scheduling.md)) — gated by
-  `node:write` on the node's pool, with the RPC's reply shown under the
-  header and a note explaining a drained node.
+  page, polled. The header has **Cordon** / **Drain** (two-step confirm)
+  while the node is available and **Uncordon** while it is drained. These
+  call the `SetNodeAvailability` RPC behind `legion node cordon|drain|uncordon`
+  ([node availability](jobs-tasks-and-scheduling.md)) and are gated by
+  `node:write` on the node's pool. The RPC's reply shows under the header,
+  along with a note explaining a drained node.
 - `Services.tsx`: the discovery catalog (`ListServices`) with healthy/total
-  counts; `pages/details/ServiceDetail.tsx` resolves endpoints
+  counts. `pages/details/ServiceDetail.tsx` resolves endpoints
   (`ResolveService`, unhealthy included) and renders the same layered
   diagnosis as `legion service doctor` (`utils/services.ts`). Endpoint
   addresses link out when the service's `meta.protocol` is web-reachable.
 - `Volumes.tsx`: the volume index (`ListVolumes`) plus a plugin table
-  (`ListVolumeDrivers`). Node-local volumes are marked with `*` because that is
-  the property deciding whether a stateful workload can move at all;
+  (`ListVolumeDrivers`). Node-local volumes are marked with `*`, because that
+  property decides whether a stateful workload can move at all.
   `pages/details/VolumeDetail.tsx` shows one volume's plugin params, driver
   metadata, node pin, and last driver error. Deletion is CLI-only
-  (`legion volume delete`) — it destroys data, and a two-click confirm in a
-  dashboard is not the right gate for that.
+  (`legion volume delete`). It destroys data, and a two-click confirm in a
+  dashboard is not a strong enough gate for that.
 - `Rollouts.tsx`: rollout list, per-group status, event logs, manual advance
-  action; the detail page polls at the live cadence.
-- `Events.tsx`: live scheduler event feed with filtering and pause/resume;
-  the job and node chips on each row link to their pages.
+  action. The detail page polls at the live cadence.
+- `Events.tsx`: live scheduler event feed with filtering and pause/resume.
+  The job and node chips on each row link to their pages.
 - `KeyValue.tsx`: key tree browser and CRUD/patch editor.
 - `Manager.tsx`: manager config snapshots.
-- `Raft.tsx`: polled consensus status, operator commands, history.
+- `Raft.tsx`: under Cluster navigation. Polled consensus status, recent raft
+  history, and operator commands (election, failover, membership, and join
+  tokens).
 - `components/LogViewer.tsx`: the live task log tail, with stream and
   allocation filters and **Find in logs** (case-insensitive, hits
   highlighted, "N of M lines match").
-- `TestingUtils.tsx`: placeholder (not implemented yet).
+- `TestingUtils.tsx`: an empty placeholder page with no features.
 
 ## Service Discovery
 
-Discovery is surfaced in three places, all reading the same projection:
+Discovery shows up in three places, all reading the same projection:
 
 - **Services** (`/services`, `/services/:name`): the catalog, per-endpoint
   health, and the doctor-style diagnosis.
@@ -290,61 +294,62 @@ Discovery is surfaced in three places, all reading the same projection:
   per-allocation health snapshot.
 
 Allocation ports and health come from the state store
-(`utils/allocations.ts`): the ledger carries the assigned `network` blob but
-not the owning task name or the health snapshot, so one SQL query joins
-`allocation` → `task_config` → `allocation_health` per job.
+(`utils/allocations.ts`). The ledger carries the assigned `network` blob but
+not the owning task name or the health snapshot. So one SQL query per job
+joins `allocation` → `task_config` → `allocation_health`.
 
 ## Volumes
 
-Storage is surfaced wherever the question "where is my data" gets asked
+Storage shows up wherever you'd ask "where is my data"
 (`utils/volumes.ts` holds the shared state/scope vocabulary):
 
 - **Volumes** (`/volumes`, `/volumes/:id`): the index, with counts for pinned,
-  reclaiming, and driver-erroring volumes, plus a warning banner when a plugin
-  is installed but unusable everywhere (the reason jobs get rejected at submit).
-  Destroyed tombstones are filtered out by default.
+  reclaiming, and driver-erroring volumes. A warning banner appears when a
+  plugin is installed but unusable everywhere, which is why jobs get rejected
+  at submit. Destroyed tombstones are filtered out by default.
 - **Job detail**: each instance's storage handle links to the volume holding
   that replica's data.
 - **Task detail**: a Volumes card listing this task's live volumes with state,
   owning instance, and node.
-- **Worker detail**: volumes materialized on that host, with an explicit note
-  that draining or losing the node strands the node-local ones.
+- **Worker detail**: volumes materialized on that host, with a note that
+  draining or losing the node strands the node-local ones.
 
 ## Job Templates
 
-`/templates` lists the cluster's [job templates](job-templates.md);
-`/templates/:name` is where a template is actually used:
+`/templates` lists the cluster's [job templates](job-templates.md).
+`/templates/:name` is where you use a template:
 
-- The **run form is generated from the template's declared variables** —
-  text inputs, textareas, number fields, toggles, `<select>`s, option chips
-  for `multi_select`, and a JSON editor for `json` variables. Form state is
-  a single `Record<string, unknown>` seeded from the declared defaults, and
-  it is converted to typed JSON only at submit.
-- **Preview rendered spec** calls `RenderJobTemplate` — the same render the
-  submit would do, so what the user sees is what gets submitted. Editing any
-  value invalidates a stale preview.
-- Submitting links straight to the created job; that job's page shows a
-  `template: <name> v<N>` badge back to the template version that made it.
+- The run form is generated from the template's declared variables: text
+  inputs, textareas, number fields, toggles, `<select>`s, option chips for
+  `multi_select`, and a JSON editor for `json` variables. Form state is a
+  single `Record<string, unknown>` seeded from the declared defaults. It is
+  converted to typed JSON only at submit.
+- **Preview rendered spec** calls `RenderJobTemplate`, the same render the
+  submit does, so what you see is what gets submitted. Editing any value
+  invalidates a stale preview.
+- Submitting links straight to the created job. That job's page shows a
+  `template: <name> v<N>` badge linking back to the template version that
+  made it.
 - The source editor (new template, new version) renders only for identities
   holding `template:write`.
 
 ## ACL-Aware Rendering
 
-`WhoAmI` returns the caller's effective rules (`rulesJson`), and
-`utils/acl.ts` mirrors the manager's evaluation — same globbing, same
-default-deny, same "a rule with a selector never matches a request without
-that attribute" — behind `allows(resource, action, scope)`.
+`WhoAmI` returns the caller's effective rules (`rulesJson`).
+`utils/acl.ts` mirrors the manager's evaluation behind
+`allows(resource, action, scope)`: same globbing, same default-deny, and the
+same rule that a selector never matches a request without that attribute.
 
 - **Nav**: an authenticated identity only sees destinations it can read
   (`ROUTE_RESOURCE` in `utils/acl.ts` maps each top-level route to the
-  resource it needs). An **anonymous** caller keeps the full sidebar — they
-  have not had a chance to authenticate, and an app that hides everything
-  looks broken rather than locked.
+  resource it needs). An anonymous caller keeps the full sidebar. They have
+  not had a chance to authenticate yet, and an app that hides everything
+  looks broken instead of locked.
 - **Denied pages**: every protected page wraps its own content in
-  `AccessGate`, which swaps in a card naming the missing permission with a
+  `AccessGate`. It swaps in a card naming the missing permission, with a
   login link (anonymous) or a switch-identity link (authenticated). The gate
-  lives at the page level on purpose: wrapping the router's *outlet* in any
-  conditional captures it once and freezes navigation while the URL keeps
+  lives at the page level because wrapping the router's outlet in any
+  conditional captures it once, which freezes navigation while the URL keeps
   changing.
 - **Mutating controls** (stop/destroy job, scale, cordon/drain/uncordon,
   rollout advance/stop, KV save/delete/patch, raft commands, saved-query
@@ -353,27 +358,27 @@ that attribute" — behind `allows(resource, action, scope)`.
 - **Access page** shows admin tabs only with `acl:read` (worker join needs
   `node:read`).
 
-Two hard-won rules keep restricted identities from breaking the app:
+Two rules keep restricted identities from breaking the app:
 
 - **A resource that may be denied must swallow its own rejection.** Reading
-  an errored Solid resource *throws at the read site*; one unguarded
-  `operator:read` probe in the layout used to kill the whole reactive graph
-  — URL changing, page frozen. Garnish RPCs (the ledger on job pages, the
-  o11y probe in the layout, the overview stats) degrade to empty on denial.
-- **`RouteErrorBoundary`** wraps the page area as a last line of defense: a
+  an errored Solid resource throws at the read site. A single unguarded
+  `operator:read` probe in the layout once killed the whole reactive graph,
+  leaving the URL changing and the page frozen. Secondary RPCs (the ledger on
+  job pages, the o11y probe in the layout, the overview stats) degrade to
+  empty on denial.
+- **`RouteErrorBoundary`** wraps the page area as a last line of defense. A
   page that still throws gets an error card and a retry, and navigating
-  elsewhere resets it. It renders children unconditionally — it is not a
+  elsewhere resets it. It always renders its children and is not a
   conditional around the outlet.
 
-As everywhere else in the UI, all of this is cosmetic; the manager is the
-only enforcement point.
+All of this is cosmetic. The manager is the only enforcement point.
 
 ## Stateful Workloads
 
 Allocation views (node detail allocation summaries, Homepage ledger cards,
 job detail allocation table) show a compact mono instance-id pill when
-`LedgerAllocation.instance_id` is set, so a rescheduled stateful allocation
-is visibly the same instance. Stateless allocations are unchanged.
+`LedgerAllocation.instance_id` is set. This makes a rescheduled stateful
+allocation visibly the same instance. Stateless allocations are unchanged.
 
 ## Backend Compatibility Requirements
 
@@ -384,54 +389,52 @@ Manager server enables:
 
 Without these, browser gRPC-Web calls would fail.
 
-The UI tolerates a manager older than its own client: `ListJobsRequest.status`
-is only sent when a chip other than All is selected (an older manager returns
-every status — visible, not wrong), and a missing `status_counts` collapses
-the chip row to All.
+The UI tolerates a manager older than its own client. It sends
+`ListJobsRequest.status` only when a chip other than All is selected. An
+older manager then returns every status, which is visible but not wrong. A
+missing `status_counts` collapses the chip row to All.
 
 ## Generated API Clients
 
 The generated client stubs in `ui/src/gen/` come from `npm run gen` (the
-protoc invocation in `ui/README.md`; needs `protoc` on the PATH). CI's
+protoc invocation in `ui/README.md`, which needs `protoc` on the PATH). CI's
 `ui-build` job regenerates them on every UI or proto change and fails when the
 committed files differ, so a proto change cannot merge without its client.
-
-## Raft page
-
-The UI includes a dedicated **Raft** page under Cluster navigation for manager raft status, recent raft history, and operator commands (election/failover/membership/join-token flows).
 
 ## Exec & Actions (interactive terminal)
 
 The task detail page (`pages/details/JobDetail.tsx` → `TaskDetail.tsx`) has an
-**Exec & Actions** section listing **this task's** running allocations: the
-job's allocations from `GetLedger`, narrowed to the ones whose task is the page's
-task. The ledger carries only `task_config_id`, so the task name comes from the
-state-store lookup that also carries allocation health; a token without
-`state:read` cannot make that mapping, and the section then falls back to listing
+**Exec & Actions** section listing this task's running allocations. These are
+the job's allocations from `GetLedger`, narrowed to the ones that run the
+page's task. The ledger carries only `task_config_id`, so the task name comes
+from the state-store lookup that also carries allocation health. A token
+without `state:read` cannot make that mapping. In that case the section lists
 every running allocation of the job (the manager still rejects an exec whose
 allocation runs a different task). Each listed allocation gets an
-`AllocationExecPanel` with a command launcher (interactive-tty toggle) and, for
-tasks that declare them, action forms generated from the parameter schema
-(`ListJobActions`, filtered to this task).
+`AllocationExecPanel` with a command launcher (interactive-tty toggle). For
+tasks that declare actions, it also shows action forms generated from the
+parameter schema (`ListJobActions`, filtered to this task).
 
-Unlike the rest of the UI, exec does **not** use gRPC-Web — browsers cannot do
-bidirectional streaming over it. `src/lib/execSocket.ts` opens a **WebSocket**
-to the manager's exec bridge (`ws://<host>:<port+1>/v1/exec/ws`), exchanging
-protobuf `ExecClientFrame`/`ExecServerFrame` messages (the same frames the CLI
-uses) one per binary WS frame; the bearer token rides in the first frame.
-`components/ExecTerminal.tsx` binds those frames to an **xterm.js** terminal
-(`@xterm/xterm` + `@xterm/addon-fit`), driving resize frames on container
-resize; it is loaded on the first session rather than with the app. The
-`<Terminal>` contract (open/write/onData/resize) is kept to the xterm.js
-surface so the renderer can later be swapped for a libghostty-vt wrapper
-without touching the transport (see the plan's Q5).
+Exec is the one part of the UI that does not use gRPC-Web, because browsers
+cannot do bidirectional streaming over it. `ui/src/lib/execSocket.ts` opens a
+WebSocket to the manager's exec bridge (`ws://<host>:<port+1>/v1/exec/ws`).
+It exchanges protobuf `ExecClientFrame`/`ExecServerFrame` messages (the same
+frames the CLI uses), one per binary WS frame. The bearer token rides in the
+first frame.
+
+`components/ExecTerminal.tsx` binds those frames to an xterm.js terminal
+(`@xterm/xterm` + `@xterm/addon-fit`) and sends resize frames when the
+container resizes. It loads on the first session instead of with the app.
+The `<Terminal>` contract (open/write/onData/resize) sticks to the xterm.js
+surface, so the renderer can later be swapped for a libghostty-vt wrapper
+without touching the transport.
 
 ## Development
 
-- `npm run dev` — the Vite dev server (see `ui/README.md` for the seeded
+- `npm run dev`: the Vite dev server (see `ui/README.md` for the seeded
   preview mode and the same-origin proxy).
-- `npm run typecheck` — `tsc --noEmit`; `npm run build` typechecks and
+- `npm run typecheck`: `tsc --noEmit`. `npm run build` typechecks and
   bundles.
-- `npm run gen` — regenerate `src/gen` from `proto/legion.proto`.
+- `npm run gen`: regenerate `src/gen` from `proto/legion.proto`.
 - CI (`.github/workflows/ci.yml`, job `ui-build`) runs the drift check, the
   typecheck and the build whenever `ui/**` or the proto changes.

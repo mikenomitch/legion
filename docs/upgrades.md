@@ -1,7 +1,8 @@
 # Upgrades
 
-How to upgrade a Legion cluster safely: the order to upgrade in, what the
-version handshake enforces, and how to observe version skew across the fleet.
+This page covers how to upgrade a Legion cluster safely: the order to upgrade
+in, what the version handshake enforces, and how to see version skew across
+the fleet.
 
 ## Upgrade order: managers first, then workers
 
@@ -10,14 +11,13 @@ Always upgrade in this order:
 1. **Managers.** Upgrade every manager to the new release (rolling, one at a
    time in an HA deployment).
 2. **Workers.** Once all managers run the new release, upgrade workers at
-   whatever pace suits the workloads (drain + replace, or restart in place —
-   see `legion node drain`).
+   whatever pace suits the workloads (drain and replace, or restart in place.
+   See `legion node drain`).
 
-This order is what the protocol handshake (below) enforces: managers are
-built to stay compatible with all *older* worker protocol versions up to
-their own, but they cannot guarantee they satisfy a contract *newer* than
-they know about. A worker that is upgraded before its managers is rejected
-at registration.
+The protocol handshake (below) enforces this order. Managers stay compatible
+with every worker protocol version up to their own. They cannot promise to
+satisfy a contract newer than they know about, so a worker upgraded before
+its managers is rejected at registration.
 
 ## The `protocol_version` contract
 
@@ -30,110 +30,110 @@ Workers and managers exchange versions during registration
 - The manager replies with `manager_build_version` and
   `manager_protocol_version`.
 
-`protocol_version` is bumped **only** for breaking wire-contract changes to
-worker-plane RPCs (registration, heartbeats, health checks, work dispatch):
-removed/renamed fields, changed field semantics, or new required behavior an
-old peer cannot satisfy. Additive, backwards-compatible fields do not bump
-it.
+`protocol_version` changes only for breaking wire-contract changes to
+worker-plane RPCs (registration, heartbeats, health checks, work dispatch).
+That means removed or renamed fields, changed field semantics, or new
+required behavior an old peer cannot satisfy. Additive, backward-compatible
+fields do not change it.
 
-The manager's admission decision at registration:
+The manager decides whether to admit a worker at registration:
 
 | Worker `protocol_version`     | Manager decision                                        |
 | ----------------------------- | ------------------------------------------------------- |
-| `0` (pre-versioning build)    | Accepted, with a warning log — upgrade this worker      |
+| `0` (pre-versioning build)    | Accepted, with a warning log to upgrade this worker     |
 | `1 ..= manager's version`     | Accepted                                                |
 | `> manager's version`         | Rejected with `FAILED_PRECONDITION`                     |
 
-A `0` arises because proto3 decodes a missing field as the zero value:
-workers built before the handshake existed simply do not send the field.
-They are admitted so a rolling upgrade *from* the current release works —
-the warning is the nudge to finish the rollout.
+A `0` appears because proto3 decodes a missing field as the zero value.
+Workers built before the handshake existed do not send the field. They are
+admitted so a rolling upgrade from the current release works, and the
+warning reminds you to finish the rollout.
 
-A rejection means the upgrade order was inverted: the worker was upgraded
-before the manager. The error message says exactly that — upgrade all
-managers first, then re-join the worker. Heartbeats are deliberately left
-out of the handshake to keep that hot path lean; the check runs once per
-registration.
+A rejection means the upgrade order was reversed: the worker was upgraded
+before the manager. The error message says so and tells you to upgrade all
+managers first, then re-join the worker. Heartbeats skip the handshake to
+keep that hot path lean. The check runs once per registration.
 
 ## What each protocol version added
 
 | Version | Added | Behavior with an older worker |
 | --- | --- | --- |
-| 2 | Workers report task-process exits (`terminated_allocations` on the heartbeat), which is what makes a batch task's `Success` come from an exit code — see [Task Supervision](task-supervision.md) | The manager sees the node's advertised `protocolVersion` and keeps the pre-2 behavior for batch tasks placed there: the task is marked `Success` at placement, as it always was. Nothing stalls mid-rollout; new placements get the honest behavior once the worker is upgraded. |
+| 2 | Workers report task-process exits (`terminated_allocations` on the heartbeat), so a batch task's `Success` comes from its exit code. See [Task Supervision](task-supervision.md) | The manager reads the node's advertised `protocolVersion` and keeps the pre-2 behavior for batch tasks placed there: the task is marked `Success` at placement, as before. Nothing stalls mid-rollout. New placements get exit-code-based status once the worker is upgraded. |
 | 1 | The versioned handshake itself | Workers reporting `0` are pre-versioning builds and are accepted with a warning |
 
 ## Graceful stop and preemption under skew
 
-Neither feature bumps `protocol_version`, and both degrade rather than fail —
-but the degradation is worth knowing before you enable `enforce`:
+Neither feature changes `protocol_version`, and both degrade instead of
+failing. Know how they degrade on a mixed fleet:
 
-- **An old worker ignores the stop ladder** and hard-kills as it always did.
-  Its tasks get no signal, no grace, and no
-  `LEGION_STOP_NOTICE_PATH` file. Preemption still works; victims are just
+- **An old worker ignores the stop sequence** and hard-kills as it always
+  did. Its tasks get no signal, no grace period, and no
+  `LEGION_STOP_NOTICE_PATH` file. Preemption still works, but victims are
   killed abruptly ([graceful-stop.md](graceful-stop.md)).
 - **An old worker does not order stops before starts**, so a new manager can
-  place a preemptor there while the victim is still running. That is a
-  transient oversubscription, not merely a graceless stop — a container task
-  can briefly hold memory the preemptor was placed against.
+  place a preemptor there while the victim is still running. This causes
+  brief oversubscription. A container task can briefly hold memory the
+  preemptor was placed against.
 
-Both are reasons to **upgrade workers before enabling
-`schedulerSettings.preemption.mode = "enforce"`** on a mixed fleet, or to run
-`observe` until the fleet is uniform
-([preemption-and-eviction.md](preemption-and-eviction.md)). Preemption is
-deliberately not gated on a minimum worker protocol version: a gate would make
-it silently inert on any fleet with one stale worker, which is worse than a
-documented window.
+`enforce` is the default, so a new manager preempts as soon as it starts. To
+avoid both problems, set `schedulerSettings.preemption.mode = "observe"` in
+the manager config before you upgrade the managers. Switch it back to
+`enforce` once every worker is upgraded
+([preemption-and-eviction.md](preemption-and-eviction.md)). Preemption is not
+gated on a minimum worker protocol version. A gate would make it silently
+inactive on any fleet with one stale worker, which is worse than a documented
+window.
 
-Priority bands need nothing from the worker at all — they live entirely in the
-manager's planner and eval queue — so they are unaffected by worker skew.
+Priority bands need nothing from the worker. They live entirely in the
+manager's planner and eval queue, so worker skew does not affect them.
 
 ## Edge boot under skew
 
 [Edge boot](edge-boot.md) is the one feature that **is** gated on a minimum
-worker protocol version, and for a specific reason:
-`TaskAllocation.provisional` is a new optional field, so an old worker would
-ignore it and run the payload the moment it arrives — which, with pre-commit
-dispatch, means running it *before* the commit, with no gate and no lease.
+worker protocol version. `TaskAllocation.provisional` is a new optional
+field, so an old worker would ignore it and run the payload as soon as it
+arrives. With pre-commit dispatch, that means running it before the commit,
+with no gate and no lease.
 
-That is not a graceful degradation, so it is fenced at the dispatcher: a node
-advertising `protocolVersion` below 2 silently falls back to post-commit
-dispatch and simply does not get the speedup. Nothing stalls, and no
-allocation runs ungated.
+That is not a safe degradation, so the dispatcher blocks it. A node that
+advertises `protocolVersion` below 2 silently falls back to post-commit
+dispatch and does not get the speedup. Nothing stalls, and no allocation
+runs ungated.
 
-The other direction fails closed on its own. `RatifyClaim` is a new RPC, so an
-old manager rejects it and the worker kills the claim at its lease — a wasted
-boot, never a duplicate.
+The other direction fails closed on its own. `RatifyClaim` is a new RPC, so
+an old manager rejects it and the worker kills the claim when its lease
+expires. The result is a wasted boot, never a duplicate.
 
 Neither the `boot` ACL resource nor the `edgeBoot` config blocks need a
-coordinated upgrade: both are off by default, and a manager that does not know
-them ignores them.
+coordinated upgrade. Both are off by default, and a manager that does not
+know them ignores them.
 
 ## Task-plugin ABI
 
 Task runtimes loaded from `plugins/tasks/<name>/` are **not** covered by
-`protocol_version`; they are dynamically linked into the worker and must be
-rebuilt against the Legion version they run under. Each declares the vtable
-generation it was compiled against, and a mismatch (or a missing declaration)
-is refused at load with a message naming the rebuild. See
-[task-runtime-plugins.md](task-runtime-plugins.md). Rebuild out-of-tree task
-plugins as part of any worker upgrade.
+`protocol_version`. They are dynamically linked into the worker and must be
+rebuilt against the Legion version they run under. Each plugin declares the
+vtable generation it was compiled against. A mismatch (or a missing
+declaration) is refused at load with a message that tells you to rebuild.
+See [task-runtime-plugins.md](task-runtime-plugins.md). Rebuild out-of-tree
+task plugins as part of any worker upgrade.
 
 ## Build-version skew expectations
 
-`build_version` is informational and never causes rejection — only
-`protocol_version` gates admission. Expectations:
+`build_version` is informational and never causes rejection. Only
+`protocol_version` gates admission. What to expect:
 
 - **Same minor version** (e.g. managers `0.4.2`, workers `0.4.1`): fine.
   This is the normal state mid-rollout.
-- **Different minor/major versions**: works as long as the protocol version
-  is compatible, but the worker logs a warning at registration when its
-  build version differs from the manager's. Treat a fleet that warns for
-  more than the duration of a rollout as a signal to finish the upgrade.
+- **Different minor or major versions**: works as long as the protocol
+  version is compatible, but the worker logs a warning at registration when
+  its build version differs from the manager's. If the fleet keeps warning
+  after a rollout should have finished, finish the upgrade.
 
 ## Observing fleet versions
 
-Registration stores each worker's versions into the node's dynamic
-attributes, so skew is visible from the control plane:
+Registration stores each worker's versions in the node's dynamic
+attributes, so you can see skew from the control plane:
 
 ```sh
 legion node list -j | jq '.data[] | {id, dynamicAttrs}'
@@ -142,143 +142,145 @@ legion node list -j | jq '.data[] | {id, dynamicAttrs}'
 Each node carries `buildVersion` (the worker's build version, or
 `"unknown"` for pre-versioning workers) and `protocolVersion` (`0` for
 pre-versioning workers) in `dynamic_attrs`. The same attributes appear in
-the node ledger and the UI's node views. Workers additionally log the
-manager's build/protocol version after every successful registration.
+the node ledger and the UI's node views. Workers also log the manager's
+build and protocol version after every successful registration.
 
 ## Manager-plane skew (raft clusters)
 
-Managers in one raft cluster speak the `RaftTransport` service to each
-other. During a rolling manager upgrade the plane tolerates skew:
+Managers in one raft cluster talk to each other over the `RaftTransport`
+service. During a rolling manager upgrade, the plane tolerates skew:
 
 - The lane-write forwarding RPC (`ForwardLaneWrite`, added 2026-07-28)
-  degrades cleanly against an older manager: the forward fails with the
-  older side's "unimplemented" status and the caller surfaces the same
-  typed leader-hint rejection it would have produced before forwarding
-  existed. Upgrade managers first (the standard order below) and the
-  window closes.
+  degrades cleanly against an older manager. The forward fails with the
+  older side's "unimplemented" status, and the caller returns the same
+  typed leader-hint rejection it returned before forwarding existed.
+  Upgrade all managers (the standard order above) and the window closes.
 - The liveness digest RPC (`ReportNodeLiveness`, added 2026-08-03) degrades
-  the same way and with the same remedy: an older manager answers
-  `Unimplemented`, the sender counts
-  `legion_liveness_digest_rpcs_total{outcome="unimplemented"}` and falls back
-  to forwarding each heartbeat as a replicated write — correct, just slower.
-  It clears the moment status-lane leadership lands on an upgraded manager.
-  **Downgrade all managers together**: a partial downgrade that leaves an old
-  manager leading the status lane while a new one holds the display
-  checkpoint is the one unsafe combination, and it resolves within one lost
+  the same way, with the same fix. An older manager answers
+  `Unimplemented`, and the sender counts
+  `legion_liveness_digest_rpcs_total{outcome="unimplemented"}` and falls
+  back to forwarding each heartbeat as a replicated write. That is correct
+  but slower. It clears as soon as status-lane leadership moves to an
+  upgraded manager.
+  **Downgrade all managers together.** A partial downgrade that leaves an
+  old manager leading the status lane while a new one holds the display
+  checkpoint is the one unsafe combination. It resolves within one lost
   window. See [node-liveness.md](node-liveness.md).
-- Payloads inside the transport are versioned by `PROTOCOL_VERSION`;
-  undecodable payloads name mixed manager protocol versions in their
-  error.
+- Payloads inside the transport are versioned by `PROTOCOL_VERSION`.
+  Payloads that cannot be decoded produce an error that names mixed
+  manager protocol versions.
 - Plan submissions carry ranked candidate lists as a format-2 row
   ([late-binding-plan-apply.md](late-binding-plan-apply.md)) that
-  pre-candidate managers cannot parse. The standard same-version upgrade
-  order covers this; for a mixed-version manager fleet held longer than
-  an upgrade window, set `schedulerSettings.plan_candidates = 0` until
-  every peer is level — it holds format-2 emission off entirely.
+  pre-candidate managers cannot parse. The standard upgrade order covers
+  this. If you keep a mixed-version manager fleet longer than an upgrade
+  window, set `schedulerSettings.plan_candidates = 0` until every peer is
+  on the same version. That turns off format-2 emission entirely.
 - The KV encryption keyring ([kv-encryption.md](kv-encryption.md)) adds a
-  table and a column that a pre-keyring manager cannot apply — and, unlike
-  other schema additions, would be written to *by the leader on its own* at
-  startup. So the leader gates itself: every transport reply carries the
-  answering manager's schema version, and the keyring is not initialized
-  (no encrypted row is ever written) until every voter advertises a build
-  that has it. `legion keyring status` reports `pending upgrade` naming the
-  managers still to upgrade; KV values are stored exactly as before until
-  then. Nothing to set, nothing to run — finish the rolling upgrade.
-  **Downgrading** past this release afterwards means a database ahead of
-  the binary (refused at open): run `legion keyring rewrap --plaintext`
-  first, then restore a pre-upgrade backup.
+  table and a column that a pre-keyring manager cannot apply. Unlike other
+  schema additions, the leader would write to them on its own at startup.
+  So the leader gates itself. Every transport reply carries the answering
+  manager's schema version, and the keyring is not initialized (no
+  encrypted row is written) until every voter runs a build that has it.
+  `legion keyring status` reports `pending upgrade` and names the managers
+  still to upgrade. KV values are stored as before until then. There is
+  nothing to set or run. Finish the rolling upgrade.
+  **Downgrading** past this release afterward leaves a database ahead of
+  the binary, which the manager refuses to open. Run
+  `legion keyring rewrap --plaintext` first, then restore a pre-upgrade
+  backup.
 
 ## Raft persistence upgrades
 
 ### Enabling raft on an existing manager (local_disk → raft)
 
-On the **first** raft start — no raft data dir yet — with an existing,
-non-empty `store.sqlite`, the existing database simply **becomes the
-initial state machine content**. No import step, no seed tooling: set
+On the **first** raft start (no raft data dir yet) with an existing,
+non-empty `store.sqlite`, the existing database becomes the initial state
+machine content. There is no import step or seed tooling. Set
 `persistence.type = "raft"` with `raft.bootstrap = true` on the existing
 manager and start it. It elects itself leader of a single-voter cluster,
-and every subsequent mutation is a replicated raft entry applied on top of
-the adopted state. Jobs, allocations, KV, ACLs — everything the manager
-had — carries over untouched.
+and every later change is a replicated raft entry applied on top of the
+adopted state. Jobs, allocations, KV, ACLs, and everything else the manager
+had carry over unchanged.
 
-The same applies when upgrading from the old simulated raft backend: it
+The same applies when you upgrade from the old simulated raft backend. It
 was leader-election bookkeeping over a local SQLite store, so there is no
-replicated state to migrate — only the local DB, which bootstrap adopts.
-Mixed clusters (simulated raft + real raft managers) are not supported;
-bring the cluster up fresh from the bootstrap node.
+replicated state to migrate, only the local DB, which bootstrap adopts.
+Mixed clusters (simulated raft and real raft managers) are not supported.
+Bring the cluster up fresh from the bootstrap node.
 
 ### Growing the cluster
 
-Additional managers join with a token (`legion raft join-token`; see
-`docs/raft-operations.md`). A joiner catches up from the leader via **log
-replay** when the needed entries are still in the leader's log, and via
-**snapshot install** otherwise: the leader ships a whole-database snapshot
-image (a `VACUUM INTO` copy of its state DB, which includes any pre-raft
-adopted baseline), the joiner atomically swaps it in as its state DB, and
-replication resumes from the snapshot's applied index. No manual DB
-copying is needed at any history length.
+Additional managers join with a token (`legion raft join-token`, see
+`docs/raft-operations.md`). A joiner catches up from the leader through
+**log replay** when the needed entries are still in the leader's log, and
+through **snapshot install** otherwise. For a snapshot install, the leader
+ships a whole-database snapshot image (a `VACUUM INTO` copy of its state
+DB, which includes any adopted pre-raft baseline). The joiner atomically
+swaps it in as its state DB, and replication resumes from the snapshot's
+applied index. You never need to copy a DB by hand, at any history length.
 
-Snapshots are taken every `raft.snapshotEntries` applied entries (default
-10 000) in the default `single` topology, and the raft log is compacted
-behind each snapshot (a tail of recent entries is retained so
-slightly-behind followers catch up by replay). Bootstrap additionally
-builds a **seed snapshot** of the existing database and compacts the log
-up to it, so a joiner always receives any pre-raft adopted baseline via
-snapshot install rather than incomplete log replay. Under the `lanes` topology
-the same policy applies **per lane**, with per-lane table-scoped
-snapshots; the topology is fixed at first engine start per data dir, and
-switching (`single` ↔ `lanes`) takes the backup → fresh cluster →
-restore path below (see `docs/multi-raft.md`).
+In the default `single` topology, snapshots are taken every
+`raft.snapshotEntries` applied entries (default 10 000), and the raft log
+is compacted behind each snapshot. A tail of recent entries is kept so
+slightly-behind followers can catch up by replay. Bootstrap also builds a
+**seed snapshot** of the existing database and compacts the log up to it,
+so a joiner always receives any adopted pre-raft baseline through snapshot
+install instead of incomplete log replay. Under the `lanes` topology the
+same policy applies **per lane**, with per-lane table-scoped snapshots. The
+topology is fixed at first engine start per data dir. To switch (`single` ↔
+`lanes`), take the backup → fresh cluster → restore path below (see
+`docs/multi-raft.md`).
 
 ### Backup and restore
 
 **Backup** (`legion state backup [--out <path>]`, or the
 `Manager/GetStateBackup` RPC, `operator:write`): the manager writes a
-consistent point-in-time copy of its state store to a **server-side**
-path via `VACUUM INTO` (default: a timestamped file under
-`<storePath>/backups/`) and reports the path, size, and the raft applied
-index the backup captures. Works in every persistence mode; in raft mode
-it is leader-only (a non-leader answers `FAILED_PRECONDITION` naming the
-leader). The backup is a plain SQLite database — copy it off-host with
-ordinary tooling. **KV values in it are encrypted** and the root key is
-deliberately not in it: the reply (and the CLI's last line) name the root
-key's provider and location, and `--restore-from` on a host without it
-refuses to serve until it is copied into place. Keep the key with the
-backup. See [KV Encryption at Rest](kv-encryption.md).
+consistent point-in-time copy of its state store to a **server-side** path
+with `VACUUM INTO`. The default is a timestamped file under
+`<storePath>/backups/`. The manager reports the path, size, and the raft
+applied index the backup captures. Backups work in every persistence mode.
+In raft mode, only the leader takes them, and a non-leader answers
+`FAILED_PRECONDITION` with the leader's name. The backup is a plain SQLite
+database, so copy it off-host with ordinary tools.
+
+**KV values in a backup are encrypted, and the root key is not in it.**
+The reply (and the CLI's last line) name the root key's provider and
+location. `--restore-from` on a host without the key refuses to serve until
+you copy the key into place. Keep the key with the backup. See
+[KV Encryption at Rest](kv-encryption.md).
 
 **Restore** (`legion start manager --restore-from <backup>`): before the
 store (and any raft engine) starts, the backup is copied into place as
 `<storePath>/store.sqlite`. By default this only happens when no state DB
-exists yet; pass `--force-restore` to overwrite an existing one. The
+exists yet. Pass `--force-restore` to overwrite an existing one. The
 restored database's raft bookkeeping (`raft_applied` and the
 `raft_cluster` identity stamp) is cleared, so:
 
-- in `local_disk` mode the manager simply starts from the backup's state;
-- in raft mode the restored state becomes the **adopted baseline of a
-  fresh cluster** — restore onto the bootstrap node (`raft.bootstrap = true`, a fresh `raft.dataDir`), start it, then join the other managers,
-  which receive the restored state via snapshot install. Do not restore a
-  backup into an existing cluster's member: seed a fresh cluster instead
-  (the fresh-bootstrap rule above).
+- in `local_disk` mode, the manager starts from the backup's state.
+- in raft mode, the restored state becomes the **adopted baseline of a
+  fresh cluster**. Restore onto the bootstrap node (`raft.bootstrap = true`, a fresh `raft.dataDir`), start it, then join the other managers,
+  which receive the restored state through snapshot install. Do not restore
+  a backup into a member of an existing cluster. Seed a fresh cluster
+  instead (the fresh-bootstrap rule above).
 
 ### Cluster identity guard (`forceNewCluster`)
 
-At first raft engine start the state DB is stamped with the cluster's
-identity (derived from the cluster secret). A later start whose identity
-does not match — typically a wiped `raft.dataDir` (cluster secret
-included) plus `bootstrap = true` minting a fresh secret — is **refused**:
-bootstrapping a new cluster over an existing cluster's data would
-split-brain against any surviving members. Restore the original
+At first raft engine start, the state DB is stamped with the cluster's
+identity (derived from the cluster secret). A later start with a different
+identity is **refused**. This usually happens when `raft.dataDir` was wiped
+(cluster secret included) and `bootstrap = true` minted a fresh secret.
+Bootstrapping a new cluster over an existing cluster's data would cause
+split-brain with any surviving members. Restore the original
 `raft.dataDir`/`clusterSecret`, or set
-`persistence.raft.forceNewCluster = true` to deliberately re-stamp the DB
-once the old cluster is fully retired. (`--restore-from` clears the stamp
-along with `raft_applied` — a restore *is* an explicit "seed a fresh
-cluster" action — so the fresh-bootstrap restore flow above needs no
-override.)
+`persistence.raft.forceNewCluster = true` to re-stamp the DB once the old
+cluster is fully retired. `--restore-from` clears the stamp along with
+`raft_applied`, because a restore is an explicit "seed a fresh cluster"
+action. The fresh-bootstrap restore flow above needs no override.
 
 ### Rollback
 
-To leave raft mode, stop the managers, keep one node's `store.sqlite`
-(any converged replica — or a `legion state backup` file), set
-`persistence.type = "local_disk"` on that node, and delete/ignore
+To leave raft mode, stop the managers and keep one node's `store.sqlite`
+(any converged replica, or a `legion state backup` file). Set
+`persistence.type = "local_disk"` on that node, and delete or ignore
 `raft.dataDir`. Committed state is a plain SQLite database at every point
 in time.
