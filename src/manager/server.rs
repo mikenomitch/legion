@@ -1774,19 +1774,31 @@ impl ManagerDaemonService {
     }
 
     /// Join gate for worker registration: when ACLs are enforced, callers
-    /// prove membership with a join token secret unless they already hold a
-    /// worker or management credential. Audit-only mode logs failures but
-    /// lets registration proceed (the migration ramp for existing fleets).
+    /// prove membership with a join token secret unless they hold a
+    /// management credential or the node token of the node they register as.
+    /// Audit-only mode logs failures but lets registration proceed (the
+    /// migration ramp for existing fleets).
+    ///
+    /// The returned grant says what the caller may register as: a join token
+    /// pins its worker type (and so its pool), and a node token pins its node.
     fn verify_join_for_registration(
         &self,
         identity: &AclIdentity,
         join_token: Option<&str>,
-    ) -> Result<(), Status> {
-        if !self.auth.enabled || identity.is_management || identity.is_worker {
-            return Ok(());
+    ) -> Result<RegistrationGrant, Status> {
+        if !self.auth.enabled || identity.is_management {
+            return Ok(RegistrationGrant::Unrestricted);
+        }
+        // A node token proves only its own node. Without a join secret it
+        // cannot introduce any other node (that was a takeover path: register
+        // as a peer, rotate away the peer's token, mint its credentials).
+        if let Some(node_id) = acl::worker_node_id(identity) {
+            if join_token.is_none_or(|secret| secret.trim().is_empty()) {
+                return Ok(RegistrationGrant::Node(node_id.to_string()));
+            }
         }
         match self.auth.verify_join_secret(&self.store, join_token) {
-            Ok(_) => Ok(()),
+            Ok(record) => Ok(RegistrationGrant::JoinToken(record)),
             Err(status) if self.auth.audit_only => {
                 warn!(
                     target: "acl_audit",
@@ -1796,10 +1808,76 @@ impl ManagerDaemonService {
                     "join token verification failed (audit-only): {}",
                     status.message()
                 );
-                Ok(())
+                Ok(RegistrationGrant::Unrestricted)
             }
             Err(status) => Err(status),
         }
+    }
+
+    /// Enforces a registration grant against the requested worker type
+    /// (pre-registration) or node name and pool (registration). Audit-only
+    /// mode logs the mismatch and allows it, like every other worker-plane
+    /// check.
+    fn enforce_registration_grant(
+        &self,
+        grant: &RegistrationGrant,
+        worker_type: Option<&str>,
+        node: Option<(&str, &str)>,
+    ) -> Result<(), Status> {
+        let refusal = match grant {
+            RegistrationGrant::Unrestricted => None,
+            RegistrationGrant::JoinToken(record) => {
+                if let Some(requested) = worker_type.filter(|t| *t != record.worker_type) {
+                    Some(format!(
+                        "this join token is pinned to worker type {:?}, not {requested:?}",
+                        record.worker_type
+                    ))
+                } else if let Some((_, pool)) = node {
+                    let pinned = self
+                        .store
+                        .get_worker_type(record.worker_type.clone())
+                        .map_err(|e| map_store_error("Error loading worker type", e))?;
+                    (pool != pinned.pool).then(|| {
+                        format!(
+                            "this join token is pinned to worker type {:?}, whose pool is \
+                             {:?}, not {pool:?}",
+                            record.worker_type, pinned.pool
+                        )
+                    })
+                } else {
+                    None
+                }
+            }
+            RegistrationGrant::Node(own) => match node {
+                Some((name, _)) if name != own => Some(format!(
+                    "the node token for {own:?} may not register node {name:?}; \
+                     present a join token instead"
+                )),
+                Some((name, pool)) => match self.store.get_node(name) {
+                    Ok(existing) if existing.pool != pool => Some(format!(
+                        "node {name:?} is registered in pool {:?}; a node token may not \
+                         move it to {pool:?}",
+                        existing.pool
+                    )),
+                    _ => None,
+                },
+                None => None,
+            },
+        };
+        let Some(message) = refusal else {
+            return Ok(());
+        };
+        if self.auth.audit_only {
+            warn!(
+                target: "acl_audit",
+                resource = "worker-plane",
+                action = "register",
+                enforced = false,
+                "registration outside its grant (audit-only): {message}"
+            );
+            return Ok(());
+        }
+        Err(Status::permission_denied(message))
     }
 
     /// Scope check against a rollout's job, used by rollout endpoints that
@@ -5492,6 +5570,7 @@ impl Manager for ManagerDaemonService {
         crate::manager::telemetry::metrics().heartbeats_total.inc();
         let req = request.into_inner();
         let id = req.id;
+        acl::enforce_node_binding(&identity, &id)?;
         let provisional_claims = req.provisional_claims;
 
         // Offloaded, not called inline. In steady state this is now cheap —
@@ -5708,6 +5787,7 @@ impl Manager for ManagerDaemonService {
         acl::enforce_worker_plane(&identity)?;
         let req = request.into_inner();
         let id = req.id;
+        acl::enforce_node_binding(&identity, &id)?;
 
         self.store
             .update_node_health_checks(&id, &req.health_checks)
@@ -5731,9 +5811,11 @@ impl Manager for ManagerDaemonService {
         // membership with a join token secret (or an already-issued worker /
         // management bearer credential).
         let identity = self.authenticate_acl(&request)?;
-        self.verify_join_for_registration(&identity, request.get_ref().join_token.as_deref())?;
+        let grant =
+            self.verify_join_for_registration(&identity, request.get_ref().join_token.as_deref())?;
         let request = request.into_inner();
         let worker_type = request.worker_type;
+        self.enforce_registration_grant(&grant, Some(&worker_type), None)?;
 
         let worker_config = self
             .store
@@ -5771,9 +5853,11 @@ impl Manager for ManagerDaemonService {
         // ACL: worker-plane endpoint (see `worker_pre_register`). Successful
         // registration mints (or rotates) the node token used for heartbeats.
         let identity = self.authenticate_acl(&request)?;
-        self.verify_join_for_registration(&identity, request.get_ref().join_token.as_deref())?;
+        let grant =
+            self.verify_join_for_registration(&identity, request.get_ref().join_token.as_deref())?;
         let request = request.into_inner();
         let node_id = request.name.clone();
+        self.enforce_registration_grant(&grant, None, Some((&node_id, &request.pool)))?;
 
         // Protocol-version handshake (see docs/upgrades.md): accept workers
         // at or below our protocol version, warn on pre-versioning workers
@@ -7036,6 +7120,7 @@ impl Manager for ManagerDaemonService {
         let identity = self.authenticate_acl(&request)?;
         acl::enforce_worker_plane(&identity)?;
         let req = request.into_inner();
+        acl::enforce_node_binding(&identity, &req.node_id)?;
         if req.hash.trim().is_empty() {
             return Err(Status::invalid_argument("hash is required"));
         }
@@ -7352,6 +7437,7 @@ impl Manager for ManagerDaemonService {
         let identity = self.authenticate_acl(&request)?;
         acl::enforce_worker_plane(&identity)?;
         let req = request.into_inner();
+        acl::enforce_node_binding(&identity, &req.node_id)?;
         let entry = self
             .store
             .get_kv(&req.kv_path)
@@ -8372,6 +8458,7 @@ impl Manager for ManagerDaemonService {
         let req = request.into_inner();
         tracing::Span::current().record("node_id", req.node_id.as_str());
         tracing::Span::current().record("claim_id", req.claim_id.as_str());
+        acl::enforce_node_binding(&identity, &req.node_id)?;
 
         let refuse = |reason: crate::structs::edge_boot::RefusalReason, detail: String| {
             crate::manager::telemetry::worker_metrics()
@@ -8501,6 +8588,18 @@ struct MintedTicketRecord {
     jti: String,
     job_config_id: String,
     expires_at_unix: i64,
+}
+
+/// What a worker-registration caller may register as, decided by
+/// `verify_join_for_registration` from the credential it presented.
+#[derive(Debug)]
+enum RegistrationGrant {
+    /// ACLs off, a management credential, or an audit-only pass.
+    Unrestricted,
+    /// A verified join token: pins the worker type, and through it the pool.
+    JoinToken(crate::storage::acl_store::JoinTokenRecord),
+    /// A node token: may only re-register its own node, in its current pool.
+    Node(String),
 }
 
 fn worker_address_for_node(node: &Node) -> Option<String> {

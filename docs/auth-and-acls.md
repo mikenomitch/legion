@@ -269,10 +269,24 @@ When ACLs are enforced:
 - Registration mints a per-node **worker token** (returned in the reply) that
   the worker attaches to `Heartbeat`/`HealthCheck`. Node tokens grant nothing
   on the user-facing API.
+- A join token only admits its own worker type. Pre-registering as another
+  type, or registering into a pool other than that type's pool, fails with
+  `PermissionDenied`.
+- A node token only speaks for its own node. Every worker-plane RPC that names
+  a node (`Heartbeat`, `HealthCheck`, `FetchNetPolicy`,
+  `GetArtifactCredential`, `RatifyClaim`, and the identity and certificate
+  issuers) refuses a node id that does not match the token with
+  `PermissionDenied`. A node token can re-register its own node in its current
+  pool, but not any other node. Management tokens act for any node.
 - Re-registering rotates the node token. If a heartbeat comes back
   `Unauthenticated`, the worker automatically re-registers using its join
   secret.
-- In `auditOnly` mode, workers without join tokens are admitted but logged.
+- A join token admits any node name, including the name of a node that is
+  already registered. Treat join secrets like node credentials: give them
+  short TTLs and revoke them once the fleet has joined.
+- In `auditOnly` mode, workers without join tokens are admitted but logged,
+  and so are the worker-type, pool, and node-id mismatches above. The two
+  identity-token issuers refuse a foreign node id even in audit-only mode.
   Use this to migrate fleets that predate ACLs: enable audit mode, restart
   workers onto join tokens at your own pace, then enforce.
 

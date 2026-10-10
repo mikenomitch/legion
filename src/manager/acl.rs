@@ -579,6 +579,47 @@ pub fn enforce_worker_plane(identity: &AclIdentity) -> Result<(), Status> {
     ))
 }
 
+/// The node a worker credential speaks for: `Some(id)` for a per-node worker
+/// token (principal `node:<id>`), `None` for every other identity.
+pub fn worker_node_id(identity: &AclIdentity) -> Option<&str> {
+    if !identity.is_worker {
+        return None;
+    }
+    identity.principal.strip_prefix("node:")
+}
+
+/// Binds a worker-plane request's node id to the caller. A worker token may
+/// only act as its own node: without this, any node could heartbeat, report
+/// health, or ratify claims as a peer. Management identities (and disabled
+/// ACLs) act for any node. Audit-only mode logs the mismatch and allows it,
+/// matching `enforce_worker_plane`.
+pub fn enforce_node_binding(identity: &AclIdentity, node_id: &str) -> Result<(), Status> {
+    if identity.is_management || worker_node_id(identity) == Some(node_id) {
+        return Ok(());
+    }
+
+    warn!(
+        target: "acl_audit",
+        principal = %identity.principal,
+        accessor_id = identity.accessor_id.as_deref().unwrap_or("-"),
+        source = identity.source.as_str(),
+        resource = "worker-plane",
+        action = "call",
+        node_id = %node_id,
+        enforced = !identity.audit_only,
+        "ACL denial: node id does not match the caller's node token"
+    );
+
+    if identity.audit_only {
+        return Ok(());
+    }
+
+    Err(Status::permission_denied(format!(
+        "{:?} may not act as node {node_id:?}; a node token only speaks for its own node",
+        identity.principal
+    )))
+}
+
 /// Pulls a bearer credential from `authorization` or `x-legion-token`.
 fn extract_bearer(metadata: &MetadataMap) -> Option<String> {
     if let Some(value) = metadata.get("authorization").and_then(|v| v.to_str().ok()) {
@@ -944,6 +985,35 @@ mod authenticator_test {
             enforce_worker_plane(&anonymous).unwrap_err().code(),
             tonic::Code::Unauthenticated
         );
+        Ok(())
+    }
+
+    #[test]
+    fn node_binding_limits_worker_tokens_to_their_own_node() -> R<()> {
+        let store = setup_store()?;
+        let auth = enabled_authenticator();
+        let secret = auth
+            .mint_node_token(&store, "worker-a")
+            .map_err(|s| anyhow!(s.to_string()))?;
+        let worker = auth.authenticate(&metadata_with_token(&secret), &store)?;
+        assert_eq!(worker_node_id(&worker), Some("worker-a"));
+        assert!(enforce_node_binding(&worker, "worker-a").is_ok());
+        assert_eq!(
+            enforce_node_binding(&worker, "worker-b")
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+
+        // Management (and ACLs-off) identities act for any node.
+        assert!(enforce_node_binding(&AclIdentity::acl_disabled(), "worker-b").is_ok());
+
+        // Audit-only mode logs the mismatch but lets it through.
+        let audit_worker = AclIdentity {
+            audit_only: true,
+            ..worker
+        };
+        assert!(enforce_node_binding(&audit_worker, "worker-b").is_ok());
         Ok(())
     }
 

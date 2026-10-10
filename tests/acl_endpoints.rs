@@ -1181,6 +1181,14 @@ fn setup_store() -> R<Store> {
 /// Seeds a node, job, KV entries, and ACL fixtures so fetch-then-authorize
 /// endpoints reach their ACL checks instead of returning NotFound.
 fn seed_fixtures(store: &Store) -> R<Fixtures> {
+    // Worker types pin a pool; join tokens pin a worker type.
+    for (name, pool) in [("default", "default"), ("gpu", "gpu")] {
+        store.insert_worker_type(&WorkerConfig {
+            name: name.into(),
+            pool: pool.into(),
+            ..Default::default()
+        })?;
+    }
     store.insert_node(NodeMsg {
         id: NODE_ID.into(),
         pool: "default".into(),
@@ -1427,9 +1435,7 @@ async fn worker_join_flow_with_acls_enabled() -> R<()> {
     let join_token = legion::structs::token::JoinToken::decode(&created.token)?;
     assert!(!join_token.secret.is_empty());
 
-    // Pre-register fails without the secret, succeeds with it. (The fixture
-    // store has no worker types, so success here is "passed the join gate"
-    // and failed later with NotFound rather than Unauthenticated.)
+    // Pre-register fails without the secret, succeeds with it.
     let denied = svc
         .worker_pre_register(req(
             WorkerPreRegisterRequest {
@@ -1575,6 +1581,136 @@ async fn worker_join_flow_with_acls_enabled() -> R<()> {
         .await
         .expect_err("revoked join token must be rejected");
     assert_eq!(closed.code(), Code::Unauthenticated);
+    Ok(())
+}
+
+/// A worker credential only speaks for its own node, and a join token only
+/// admits its pinned worker type and pool. Without this, one compromised node
+/// could re-register as a peer (rotating away the peer's token) or heartbeat,
+/// report health, and ratify claims in its name.
+#[tokio::test]
+async fn worker_plane_binds_node_ids_to_the_caller() -> R<()> {
+    let (svc, fixtures, management_secret) = setup_enabled()?;
+    let created = svc
+        .create_join_token(req(
+            CreateJoinTokenRequest {
+                worker_type: "default".into(),
+                ttl: Some("1h".into()),
+                description: "binding test".into(),
+            },
+            Some(&management_secret),
+        ))
+        .await?
+        .into_inner();
+    let secret = legion::structs::token::JoinToken::decode(&created.token)?.secret;
+
+    // The join token is pinned to `default`: no other worker type or pool.
+    let status = svc
+        .worker_pre_register(req(
+            WorkerPreRegisterRequest {
+                worker_type: "gpu".into(),
+                join_token: Some(secret.clone()),
+            },
+            None,
+        ))
+        .await
+        .expect_err("a join token must not pre-register another worker type");
+    assert_eq!(
+        status.code(),
+        Code::PermissionDenied,
+        "{}",
+        status.message()
+    );
+    let register = |name: &str, pool: &str, join: Option<String>, token: Option<&str>| {
+        req(
+            WorkerRegisterRequest {
+                name: name.into(),
+                pool: pool.into(),
+                config_attrs: "{}".into(),
+                fingerprint_attrs: "{}".into(),
+                health_checks: "[]".into(),
+                join_token: join,
+                ..Default::default()
+            },
+            token,
+        )
+    };
+    let status = svc
+        .worker_register(register("intruder", "gpu", Some(secret.clone()), None))
+        .await
+        .expect_err("a join token must not register into another pool");
+    assert_eq!(
+        status.code(),
+        Code::PermissionDenied,
+        "{}",
+        status.message()
+    );
+
+    let intruder = svc
+        .worker_register(register("intruder", "default", Some(secret.clone()), None))
+        .await?
+        .into_inner()
+        .node_token
+        .expect("registration mints a node token");
+
+    // The intruder's node token cannot register, heartbeat, or act as the
+    // fixture node.
+    for method in [
+        "WorkerRegister",
+        "Heartbeat",
+        "HealthCheck",
+        "FetchNetPolicy",
+        "GetArtifactCredential",
+        "RatifyClaim",
+    ] {
+        let status = call_endpoint(&svc, &fixtures, method, Some(&intruder))
+            .await
+            .expect_err(&format!("{method} must refuse a foreign node token"));
+        assert_eq!(
+            status.code(),
+            Code::PermissionDenied,
+            "{method}: {}",
+            status.message()
+        );
+    }
+    let status = svc
+        .worker_register(register(NODE_ID, "default", None, Some(&intruder)))
+        .await
+        .expect_err("a node token must not take over another node");
+    assert_eq!(
+        status.code(),
+        Code::PermissionDenied,
+        "{}",
+        status.message()
+    );
+
+    // Its own node: re-registering with the node token alone works, but it
+    // cannot move itself into another pool.
+    let status = svc
+        .worker_register(register("intruder", "gpu", None, Some(&intruder)))
+        .await
+        .expect_err("a node token must not change its node's pool");
+    assert_eq!(
+        status.code(),
+        Code::PermissionDenied,
+        "{}",
+        status.message()
+    );
+    let rotated = svc
+        .worker_register(register("intruder", "default", None, Some(&intruder)))
+        .await?
+        .into_inner()
+        .node_token
+        .expect("re-registration rotates the node token");
+    svc.heartbeat(req(
+        HeartbeatRequest {
+            id: "intruder".into(),
+            ..Default::default()
+        },
+        Some(&rotated),
+    ))
+    .await
+    .expect("a node token heartbeats for its own node");
     Ok(())
 }
 

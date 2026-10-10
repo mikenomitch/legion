@@ -1003,6 +1003,10 @@ message WorkerPreRegisterRequest {
   //
   // This selects the worker template stored on the manager.
   // No manager-side default is applied by this RPC.
+  //
+  // When the caller authenticates with a join token, this must equal the
+  // worker type the token was minted for; anything else is refused with
+  // `PERMISSION_DENIED` (audit-only mode logs and allows it).
   string worker_type = 1;
 
   // Join token secret (the `secret` field of a decoded join token).
@@ -1125,9 +1129,18 @@ message WorkerPreRegisterReply {
 // Request payload for WorkerRegister.
 message WorkerRegisterRequest {
   // Worker/node ID to register.
+  //
+  // With ACLs enforced, a caller authenticated by a node token (and no join
+  // token) may only re-register its own node; any other name is refused with
+  // `PERMISSION_DENIED`. A join token admits any name.
   string name = 1;
 
   // Pool assigned to this worker.
+  //
+  // With ACLs enforced this must match what the credential pins: the pool of
+  // the join token's worker type, or (for a node-token re-registration) the
+  // node's current pool. A mismatch is refused with `PERMISSION_DENIED`.
+  // Audit-only mode logs the mismatch and allows it.
   string pool = 2;
 
   // JSON object string of node configuration attributes.
@@ -2860,6 +2873,10 @@ message IssueNodeCertificateReply {
 // Request payload for Heartbeat.
 message HeartbeatRequest {
   // Worker/node ID sending heartbeat.
+  //
+  // With ACLs enforced it must match the node token on the request (a
+  // management token may heartbeat for any node); a mismatch is refused with
+  // `PERMISSION_DENIED`.
   string id = 1;
 
   // Allocation IDs currently known/running on worker.
@@ -3313,6 +3330,9 @@ message AllocationHealth {
 // Request payload for HealthCheck.
 message HealthCheckRequest {
   // Worker/node ID submitting health checks.
+  //
+  // With ACLs enforced it must match the node token on the request (see
+  // `HeartbeatRequest.id`).
   string id = 1;
 
   // JSON-encoded node health-check payload.
@@ -4648,7 +4668,8 @@ message ResolveServiceReply {
 message GetArtifactCredentialRequest {
   // Worker/node ID requesting the credential.
   //
-  // Used for audit logging only; the credential value itself is never logged.
+  // With ACLs enforced it must match the node token on the request (see
+  // `HeartbeatRequest.id`). The credential value itself is never logged.
   string node_id = 1;
 
   // KV path holding the credential value (for example: "secrets/ghcr-pull").
@@ -6810,7 +6831,8 @@ message TestNetPolicyReply {
 
 // Request payload for FetchNetPolicy (worker plane).
 message FetchNetPolicyRequest {
-  // Node id of the caller.
+  // Node id of the caller. With ACLs enforced it must match the node token
+  // on the request (see `HeartbeatRequest.id`).
   string node_id = 1;
 
   // Content hash from `HeartbeatReply.net_policies`.
