@@ -53,9 +53,20 @@ legion acl whoami
 
 Actions are `read` and `write`. `write` does not imply `read`, so grant both.
 Grant `state:read` sparingly, since it can read every table in the state
-store. The one thing it cannot read is KV values. Those are stored encrypted
-([KV Encryption at Rest](kv-encryption.md)), so raw SQL sees ciphertext. A
-`kv` rule scoped by `paths` is the only way to read a value.
+store, including ACL metadata. What it cannot read:
+
+- KV values. Those are stored encrypted
+  ([KV Encryption at Rest](kv-encryption.md)), so raw SQL sees ciphertext. A
+  `kv` rule scoped by `paths` is the only way to read a value.
+- Private keys and password hashes. `signing_key.private_key_pem` (the
+  workload-identity and boot-ticket signing keys), `net_mesh_ca.key_pem` (the
+  mesh CA key), and `acl_user.password_hash` always read as `NULL` through
+  raw SQL, however the query reaches them. A `WHERE` clause on them matches
+  nothing, and `INSERT ... SELECT` copies `NULL`.
+
+`state:write` is still equivalent to full control of the cluster: it can
+rewrite any row, including ACL tokens and policies. State backups
+(`GetStateBackup`, `operator:write`) are the whole database, keys included.
 
 ### Policies
 

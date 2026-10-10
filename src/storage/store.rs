@@ -1578,6 +1578,57 @@ const SEED_TASK_STATUSES_SQL: &str =
 const EVENT_ID_SEQ_BITS: u32 = 18;
 
 // NOTE: This will become a general interface for all storage backends
+
+/// Columns `QueryStateStore` reads as NULL: private key material and password
+/// hashes. Raw SQL is a `state:read` capability, and a holder of these could
+/// forge workload-identity JWTs and boot tickets (`signing_key`), mint mesh
+/// certificates (`net_mesh_ca`), or crack user passwords offline (`acl_user`).
+/// The manager reads these through its own code paths, never through
+/// `query_state_store`.
+pub const STATE_QUERY_REDACTED_COLUMNS: &[(&str, &str)] = &[
+    ("signing_key", "private_key_pem"),
+    ("net_mesh_ca", "key_pem"),
+    ("acl_user", "password_hash"),
+];
+
+/// Installs a SQLite authorizer that reads every redacted column as NULL for
+/// statements prepared while it is held, and removes it on drop. The
+/// authorizer sees the real table and column behind every read (`SELECT *`,
+/// aliases, subqueries, views, CTEs, `WHERE` clauses), so a query cannot route
+/// around it, and an ignored column cannot be probed through a predicate.
+struct RedactSecretColumns<'c> {
+    conn: &'c rusqlite::Connection,
+}
+
+impl<'c> RedactSecretColumns<'c> {
+    fn install(conn: &'c rusqlite::Connection) -> Self {
+        conn.authorizer(Some(
+            |context: rusqlite::hooks::AuthContext<'_>| match context.action {
+                rusqlite::hooks::AuthAction::Read {
+                    table_name,
+                    column_name,
+                } if STATE_QUERY_REDACTED_COLUMNS.iter().any(|(table, column)| {
+                    table.eq_ignore_ascii_case(table_name)
+                        && column.eq_ignore_ascii_case(column_name)
+                }) =>
+                {
+                    rusqlite::hooks::Authorization::Ignore
+                }
+                _ => rusqlite::hooks::Authorization::Allow,
+            },
+        ));
+        RedactSecretColumns { conn }
+    }
+}
+
+impl Drop for RedactSecretColumns<'_> {
+    fn drop(&mut self) {
+        self.conn.authorizer(
+            None::<fn(rusqlite::hooks::AuthContext<'_>) -> rusqlite::hooks::Authorization>,
+        );
+    }
+}
+
 impl Store {
     #[instrument(err, skip_all)]
     pub fn start_storage(config: &ManagerConfigFull) -> R<Store> {
@@ -17018,6 +17069,7 @@ impl Store {
             } else {
                 self.read_connection()?
             };
+            let redaction = RedactSecretColumns::install(&conn);
             let mut stmt = conn.prepare(trimmed)?;
             let columns: Vec<String> = stmt
                 .column_names()
@@ -17050,6 +17102,9 @@ impl Store {
                     json: Value::Object(map).to_string(),
                 });
             }
+            drop(rows);
+            drop(stmt);
+            drop(redaction);
 
             return Ok(StateStoreQueryResult {
                 statement_type,
@@ -17090,7 +17145,11 @@ impl Store {
 
     fn query_state_store_apply(&self, sql: &str, statement_type: &str) -> R<StateStoreQueryResult> {
         let conn = self.write_connection()?;
+        // Redacted here too, so `INSERT ... SELECT key_pem ...` cannot copy a
+        // secret into a table the caller can read.
+        let redaction = RedactSecretColumns::install(&conn);
         let affected_rows = conn.execute(sql, [])? as u64;
+        drop(redaction);
 
         Ok(StateStoreQueryResult {
             statement_type: statement_type.to_owned(),

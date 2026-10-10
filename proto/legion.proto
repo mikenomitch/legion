@@ -826,6 +826,13 @@ service Manager {
   //
   // Read-only mode is the default safety behavior and rejects write statements
   // unless explicitly enabled in the request.
+  //
+  // Private key material and password hashes always read as NULL, in any
+  // statement and however the query reaches them: `signing_key.private_key_pem`,
+  // `net_mesh_ca.key_pem`, and `acl_user.password_hash`. Predicates on those
+  // columns match nothing, and `INSERT ... SELECT` copies NULL.
+  //
+  // ACL: `state:read`, or `state:write` when `allow_write` is set.
   rpc QueryStateStore (QueryStateStoreRequest) returns (QueryStateStoreReply);
 
   // Returns a structured schema snapshot for the manager SQLite state store.
