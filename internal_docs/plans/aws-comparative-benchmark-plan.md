@@ -1,49 +1,32 @@
 # AWS Comparative Benchmark: Legion vs Nomad vs Kubernetes
 
-**Status: IN EXECUTION** — phase 2 is blocked on the scheduler, not on
-the rig. The second campaign (2026-08-04,
-[findings](../aws-phase2-findings.md)) ran Legion A across 1k/2k/5k
-nodes and found that **74% of plan applies are rejected and re-planned**,
-with throughput *falling* as eval threads are added. No comparative
-number should be published from this state: it would measure a defect
-that is being fixed, and the Nomad/K8s campaigns would be compared
-against Legion's worst configuration. Phases 3-5 wait for
-[plan-apply-conflict-reduction-plan.md](plan-apply-conflict-reduction-plan.md).
-The rig itself is now sound — every failure of that campaign was a rig
-bug, all fixed, recorded in calls entries 21-22 and 25-27.
+**Status: IN EXECUTION — phases 3 and 4 started 2026-10-09.** The
+blockers that held phase 2 are gone: plan-apply conflicts went to 0%
+(phase 3), the CLI submission ceiling was replaced by native submitters
+(phase 5), and the one-slice candidate truncation was fixed (2026-09-21).
+The cross-system campaign below is the current work. Its first session
+also fixed two defects that would have voided every competitor cell: the
+translator asked Nomad for a `mock` driver no node offers (it is
+`mock_driver`), and nodesim ran with no node classes, so every
+class-constrained job was infeasible. See
+[§ Cross-system campaign](#cross-system-campaign-2026-10) and calls
+entries 5-8.
 
-**The load generator was the last of those (2026-08-05).** Submission
-was one `legion job run` process per job and ceilinged at ~36-103
-jobs/sec, which several cells reported as Legion's throughput while the
-control plane idled; `legion-loadgen` (`benchmarks/loadgen/`) replaces it
-for Legion with one process and concurrent `RunJob` calls, measured at
-5-7x the CLI loop (1,107-1,492 jobs/sec locally). It is **Legion-only**,
-so phases 3-5 must run
-every system on the shared CLI loop (`LEGION_SUBMITTER=cli`) or grow
-native submitters for Nomad and K8s first — calls entries 23-24.
-
-Phase 0 shipped
+History: phase 0 shipped
 ([worker-simulation-plan.md](worker-simulation-plan.md), 2026-07-30).
-**Phase 1 is complete** — its exit criterion passed on real AWS
-2026-08-02/03 ([findings](../aws-phase1-findings.md)), though that
-night's numbers measured the heartbeat ceiling rather than the scheduler
-and must not be quoted. **Phase 2 ran 2026-08-04** and is the source of
-the blocker above. Phases 3-5 (Nomad, K8s, analysis) not started; their
-install scripts and driver adapters remain TO-VERIFY until they run.
+Phase 1 passed 2026-08-02/03 ([findings](../aws-phase1-findings.md)).
+Phase 2 ran 2026-08-04 ([findings](../aws-phase2-findings.md)) and found
+74% of plan applies rejected, fixed by
+[plan-apply-conflict-reduction-plan.md](plan-apply-conflict-reduction-plan.md).
+Phases 3-5 of the *findings* series
+([3](../aws-phase3-findings.md), [4](../aws-phase4-findings.md),
+[5](../aws-phase5-findings.md)) were Legion-only optimization sessions;
+none of their numbers is a cross-system result.
 
 Packing density is **measured at 4,000 nodes/instance** (99% cadence, 1%
-CPU, 3% memory on a `c7i.2xlarge`), retiring the plan's 1,250 estimate
-and the contaminated 125 from phase 1. Every scale step therefore needs
-far fewer spot instances than the topology table below assumes: 10k
-nodes is 3 instances, and the 20k validation burst is 5 — comfortably
-inside both the ASG's 20-instance cap and the 256 vCPU spot quota, so the
-quota increase phase 1 called for is **not needed**.
-
-Campaigns can be run unattended since 2026-08-02:
-`scripts/remote-campaign.sh` drives them from the loadgen box so a run
-does not depend on the operator's machine staying awake or holding one
-IP, and the spot fleet is released whenever a campaign exits. Also
-TO-VERIFY until phase 1 runs on a real account. See calls entries 11-13.
+CPU, 3% memory on a `c7i.2xlarge`). The campaign still slices at 1,250
+nodes per instance because the storm drill kills one instance, and 1,250
+of 10,000 is the plan's ~10% fault.
 
 > **Judgement calls:** [`../calls/aws-comparative-benchmark-plan_calls.md`](../calls/aws-comparative-benchmark-plan_calls.md)
 
@@ -259,6 +242,60 @@ architecture-review items D1/D4).
 Each phase leaves a working rig; 2-4 are independently re-runnable as the
 scheduler improves (re-run Legion-only campaigns cheaply after each
 optimization lands).
+
+## Cross-system campaign (2026-10)
+
+The concrete run matrix for phases 3-5. Every row runs on all three
+systems, same rig, same fleet shape, same cell sizing, unless it says
+otherwise.
+
+| # | Dimension | Scenario | Steps / points | What it shows |
+| --- | --- | --- | --- | --- |
+| 1 | Placement throughput and latency vs fleet size | `web_fleet`, 5 allocs/node | 1k / 2k / 5k / 10k nodes | The scaling curve and its fit |
+| 2 | Saturation | `dense_fleet` | 5k nodes, 5 / 10 / 20 / 40 allocs/node | Where each system stops keeping up |
+| 3 | Batch drain | `batch_burst`, 5 allocs/node | 5k nodes | Queue drain rate on large fan-out jobs |
+| 4 | Recovery (storm) | resident `web_fleet` | 10k nodes, kill one 1,250-node slice | Time to replace, placement gap, replacement rate |
+| 5 | Submitter control | `web_fleet` | 5k nodes, `--submitter cli` | That the ordering does not depend on the submitter |
+| 6 | Control-plane memory | every cell | — | `memory.json`, upper bound per box |
+
+**Submission.** Every system submits through its own API over pooled,
+long-lived connections: `legion-loadgen` (gRPC) for Legion, `POST
+/v1/jobs` for Nomad, and `POST .../deployments` for K8s, all at the same
+concurrency. This supersedes the rule that a cross-system table must use
+the CLI loop: that rule existed because only Legion had a native path.
+Row 5 keeps the CLI loop as a control. The remaining asymmetry is
+language (Rust vs Python threads), so every cell's
+`submission.driver_bound` is checked before its number is read.
+
+**Versions.** Nomad 2.0.5 with nomad-nodesim `702a0d9`, K8s 1.36.5 with
+KWOK 0.8.0, Legion at the campaign's git revision. All pinned in
+`benchmarks/aws/scripts/versions.env` and archived per cell.
+
+**Tuning record.** Defaults everywhere, except:
+
+- Nomad: per-IP connection caps lifted, because ~1,250 simulated clients
+  share each worker IP. A simulation artifact, not tuning.
+- K8s: scheduler and controller-manager API client QPS raised to 1,000,
+  and ReplicaSet/Deployment sync workers to 50. At defaults the scheduler
+  binds at most ~50 pods/sec regardless of how fast it schedules, so the
+  column would measure a client-side rate limiter. Eviction and
+  toleration timers stay stock, which is why row 4 for K8s is capped at
+  30 minutes and reported as a replaced fraction.
+- Scheduler algorithms stay at each system's default (Legion's, Nomad
+  binpack, K8s LeastAllocated scoring) and are named in the report.
+
+**Known gaps.** `mixed_heterogeneous` cannot run on Nomad, because
+nodesim sets node class but not node meta, so its region and GPU
+constraints would be infeasible. The translator refuses it for Nomad
+rather than producing a cell that times out. Failover drills (leader
+kill under load) are Legion and Nomad only for now. KWOK's scheduler
+leader is a lease on the apiserver, and the drill has no K8s fault
+command yet.
+
+**Order of runs.** Legion first (the rig's known-good path), then Nomad,
+then K8s, each one campaign per scenario with a control-plane reset in
+between. The Nomad and K8s install paths are new and expected to need
+fixes on first contact, so each starts with a `--smoke` cell.
 
 ## Testing plan
 

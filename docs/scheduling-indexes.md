@@ -171,6 +171,14 @@ the rest sit idle, and `spread` scoring would only ever choose among the
 prefix. Expect a truncated candidate list to differ between two otherwise
 identical `job plan` runs. The untruncated set never does.
 
+Candidates are verified (constraints, permit, volume drivers) during the walk.
+The walk stops one eligible node past the budget. A truncated query therefore
+costs about `budget ÷ selectivity` checks, where selectivity is the fraction
+of the shard that passes. For ordinary constraints, that cost does not depend
+on fleet size. A very selective constraint that is not a partition key of any
+index can still cost up to the whole shard. Declare an index partitioned by
+that attribute to make it cheap again.
+
 ## Seeing what happened: `job plan`
 
 `legion job plan` reports how candidates were generated for each task:

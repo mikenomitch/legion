@@ -110,7 +110,9 @@ pub struct LivenessTable {
     /// liveness table because that is the one object both already hold; a
     /// second channel between the same two places would be a second thing to
     /// keep in sync. `0` means "serve nothing" — adaptive cadence is off and
-    /// workers keep their worker-type `heartbeatSeconds`.
+    /// workers keep their worker-type `heartbeatSeconds`. On a manager that
+    /// does not lead the status lane it is the leader's value, relayed on
+    /// the liveness digest reply.
     served_interval_seconds: std::sync::atomic::AtomicU64,
 }
 
@@ -131,7 +133,7 @@ impl LivenessTable {
     }
 
     /// The interval this manager tells workers to use, or `None` when it
-    /// dictates nothing (adaptive cadence off — the default).
+    /// dictates nothing (adaptive cadence off).
     pub fn served_interval(&self) -> Option<Duration> {
         let seconds = self
             .served_interval_seconds
@@ -374,8 +376,11 @@ impl LivenessTable {
 /// What one liveness digest attempt did (liveness plan §6.3, §10).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DigestOutcome {
-    /// The status-lane leader merged it.
-    Accepted,
+    /// The status-lane leader merged it, and named the heartbeat interval it
+    /// serves (`None` when it runs no adaptive cadence or predates the field).
+    Accepted {
+        served_interval: Option<Duration>,
+    },
     /// The peer we asked does not lead the status lane; it named who does.
     NotLeader {
         leader_hint: String,
@@ -395,7 +400,7 @@ impl DigestOutcome {
     /// The `outcome` label on `legion_liveness_digest_rpcs_total`.
     pub fn metric_label(&self) -> &'static str {
         match self {
-            DigestOutcome::Accepted => "ok",
+            DigestOutcome::Accepted { .. } => "ok",
             DigestOutcome::NotLeader { .. } | DigestOutcome::NoLeader => "not_leader",
             DigestOutcome::Unimplemented => "unimplemented",
             DigestOutcome::NoEngine | DigestOutcome::Error(_) => "error",

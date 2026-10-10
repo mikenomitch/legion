@@ -224,10 +224,26 @@ fn worker_address_host(config_attrs: &Value) -> Option<String> {
     }
 }
 
-/// Allocations per node, each node's vector shared by refcount: a plan's
-/// snapshot bumps refcounts instead of deep-cloning every allocation, and
-/// the few writers copy-on-write via `Arc::make_mut`.
-pub type SharedNodeAllocations = HashMap<String, Arc<Vec<Allocation>>>;
+/// Allocations per node, each node's vector shared by refcount: the few
+/// writers copy-on-write via `Arc::make_mut`.
+///
+/// A persistent (HAMT) map, not a `std` one: a plan's snapshot is a clone
+/// of the whole map, and a persistent clone is one root-pointer copy, O(1)
+/// in fleet size. A `std` clone was one `String` allocation and refcount
+/// bump per node, per plan, under the read-model lock, which the
+/// 2026-10-09 AWS campaign measured growing 3.1x for 2x nodes
+/// (plan-path-fleet-scaling-plan.md § 5.3). Writers path-copy only the
+/// entries they touch while a snapshot is outstanding.
+pub type SharedNodeAllocations = imbl::HashMap<String, Arc<Vec<Allocation>>>;
+
+/// Free resource pools per available node; persistent for the same reason
+/// as [`SharedNodeAllocations`].
+pub(crate) type SharedNodePools = imbl::HashMap<String, Arc<ResourcePool>>;
+
+/// The scope-epoch mirror (see [`SchedulingReadModel::scope_epochs`]);
+/// persistent so a plan can carry the epochs of exactly the state it
+/// planned against at O(1) cost.
+pub type ScopeEpochs = imbl::HashMap<String, i64>;
 
 /// One allocation as the read model's job index carries it: enough for a
 /// plan to know which of its own rows sit on a node without touching the
@@ -249,6 +265,75 @@ impl AllocationRef {
     }
 }
 
+/// Every available node, sorted by id, with an id → node lookup over the
+/// same list: the scheduler's per-plan node set
+/// ([`Store::available_nodes`]).
+///
+/// Shared between plans as one `Arc` and rebuilt only when a node changes,
+/// so taking it costs a refcount bump instead of the O(fleet) map build
+/// and list clone every plan used to pay. Immutable once built: a plan
+/// that must exclude nodes builds a filtered copy ([`Self::without`]).
+#[derive(Debug, Default)]
+pub struct AvailableNodes {
+    sorted: Vec<Arc<Node>>,
+    by_id: HashMap<String, usize>,
+}
+
+impl AvailableNodes {
+    /// Sorts `nodes` by id and indexes them. The caller supplies only
+    /// available nodes.
+    pub fn new(mut nodes: Vec<Arc<Node>>) -> Self {
+        nodes.sort_by(|a, b| a.id.cmp(&b.id));
+        let by_id = nodes
+            .iter()
+            .enumerate()
+            .map(|(position, node)| (node.id.clone(), position))
+            .collect();
+        AvailableNodes {
+            sorted: nodes,
+            by_id,
+        }
+    }
+
+    /// The nodes, sorted by id.
+    pub fn as_slice(&self) -> &[Arc<Node>] {
+        &self.sorted
+    }
+
+    pub fn get(&self, id: &str) -> Option<&Node> {
+        self.by_id.get(id).map(|position| &*self.sorted[*position])
+    }
+
+    pub fn contains(&self, id: &str) -> bool {
+        self.by_id.contains_key(id)
+    }
+
+    pub fn len(&self) -> usize {
+        self.sorted.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.sorted.is_empty()
+    }
+
+    /// A copy without `excluded`, or `None` when none of them is in the
+    /// set (the common case: a reschedule usually excludes a node that is
+    /// already unavailable), so the caller keeps sharing the original.
+    /// O(|excluded|) to decide, O(fleet) only when a copy is needed.
+    pub fn without(&self, excluded: &HashSet<String>) -> Option<Self> {
+        if !excluded.iter().any(|id| self.contains(id)) {
+            return None;
+        }
+        Some(Self::new(
+            self.sorted
+                .iter()
+                .filter(|node| !excluded.contains(&node.id))
+                .cloned()
+                .collect(),
+        ))
+    }
+}
+
 /// A job's allocations by node — the shape
 /// [`Store::plan_capacity_snapshot`] hands the scheduler for the job it
 /// plans.
@@ -262,7 +347,9 @@ pub struct SchedulingReadModel {
     /// old snapshot).
     pub nodes: HashMap<String, Arc<Node>>,
     pub allocations_by_node: SharedNodeAllocations,
-    pub task_configs: HashMap<String, Vec<(i64, TaskConfig)>>,
+    /// `Arc`'d so a hot reader ([`Store::shared_task_configs_for_job_config`])
+    /// takes a refcount bump instead of deep-cloning every task's JSON.
+    pub task_configs: HashMap<String, Arc<Vec<(i64, TaskConfig)>>>,
     /// Declared scheduling indexes over `nodes` (docs/scheduling-indexes.md).
     /// Maintained by the same write path that mutates `nodes` and
     /// `allocations_by_node`, so it cannot drift from them; derived state
@@ -275,7 +362,7 @@ pub struct SchedulingReadModel {
     /// refcount bump per node instead of a deep `ResourcePool` copy; the
     /// plan-time `ResourceLedger` copies-on-write only the pools it
     /// actually debits.
-    pub(crate) node_pools: HashMap<String, Arc<ResourcePool>>,
+    pub(crate) node_pools: SharedNodePools,
     /// Mirror of `allocation_epoch_partition`, keyed by
     /// `Store::scope_vector_key`, kept COHERENT with `allocations_by_node`
     /// (adversarial finding, 2026-07-28 — the plan-fence gap): an epoch
@@ -289,7 +376,7 @@ pub struct SchedulingReadModel {
     /// allocations were read from` (epochs are READ before allocations and
     /// PUBLISHED after them), so a torn view can only make the CAS
     /// conservative (a spurious reject + retry), never permissive.
-    pub scope_epochs: HashMap<String, i64>,
+    pub scope_epochs: ScopeEpochs,
     /// Publish counter for allocation-visible state: bumped (under the same
     /// write lock) every time `allocations_by_node`/`scope_epochs` are
     /// published — the per-scope refresh funnel, node removal, and full
@@ -306,12 +393,20 @@ pub struct SchedulingReadModel {
     /// the eager whole-fleet sample.
     pub generation: u64,
     /// The availability-filtered, id-sorted node list every plan starts
-    /// from, cached so a plan is a `Vec<Arc<Node>>` clone (refcount bumps)
-    /// instead of an O(fleet log fleet) filter + sort. Invalidated (set to
-    /// `None`) by every `nodes` mutation and rebuilt lazily on the next
-    /// plan, so churny fleets pay at most what they paid before this cache
-    /// existed.
-    pub(crate) available_nodes_cache: Option<Arc<Vec<Arc<Node>>>>,
+    /// from, plus its by-id lookup ([`AvailableNodes`]), cached so a plan
+    /// takes one `Arc` instead of rebuilding either. Before this cache held
+    /// the lookup too, every plan built a `HashMap` over every available
+    /// node and cloned the list, which was the last per-plan cost that grew
+    /// with the fleet (plan-path-fleet-scaling plan, Phase 4). Invalidated
+    /// (set to `None`) by every `nodes` mutation through
+    /// [`Self::nodes_changed`] and rebuilt lazily on the next plan.
+    pub(crate) available_nodes_cache: Option<Arc<AvailableNodes>>,
+    /// Bumped by every `nodes` mutation ([`Self::nodes_changed`]) and
+    /// carried forward (+1) across full rebuilds. What lets
+    /// [`Store::available_nodes`] build the cache outside the write lock:
+    /// it installs the result only if no node changed while it was
+    /// building.
+    pub(crate) nodes_epoch: u64,
     /// Per-node aggregated allocation usage ([`NodeUsage`]) — the memo that
     /// makes reprojection O(resource dims) instead of O(allocations on the
     /// node). Strictly derived from `allocations_by_node`: the delta path
@@ -345,6 +440,33 @@ pub struct SchedulingReadModel {
 }
 
 impl SchedulingReadModel {
+    /// Record a mutation of `nodes`: drop the cached available-node list
+    /// and move the epoch a concurrent off-lock rebuild checks before
+    /// installing. Every writer of `nodes` must call this.
+    pub(crate) fn nodes_changed(&mut self) {
+        self.available_nodes_cache = None;
+        self.nodes_epoch = self.nodes_epoch.wrapping_add(1);
+    }
+
+    /// Install an available-node set built off-lock from the node map as of
+    /// `epoch`, and return the set the caller should plan against. Installs
+    /// only if no node changed since (`nodes_epoch == epoch`), and prefers a
+    /// copy another rebuilder installed for the same epoch. A stale build is
+    /// returned uninstalled: it is still a consistent view of a moment ago.
+    pub(crate) fn install_available_nodes(
+        &mut self,
+        epoch: u64,
+        built: Arc<AvailableNodes>,
+    ) -> Arc<AvailableNodes> {
+        if self.nodes_epoch != epoch {
+            return built;
+        }
+        Arc::clone(
+            self.available_nodes_cache
+                .get_or_insert_with(|| Arc::clone(&built)),
+        )
+    }
+
     /// Rebuild the job index from `allocations_by_node`. The full model
     /// load uses this; every incremental path maintains the index in
     /// place.
@@ -548,9 +670,10 @@ pub struct DeclaredConsumer {
 /// [`SchedulingReadModel::allocations_by_job`]).
 pub(crate) type PlanCapacityParts = (
     SharedNodeAllocations,
-    HashMap<String, Arc<ResourcePool>>,
+    SharedNodePools,
     u64,
     JobAllocationsByNode,
+    ScopeEpochs,
 );
 
 #[derive(Debug, Clone)]
@@ -1234,6 +1357,28 @@ impl JobSubmitOutcome {
 }
 
 pub const CONN_LOCK_ERROR: &str = "Error locking database connection";
+
+// Test seam for `reconcile_job_config_allocations`: a plan conflict is a
+// race between evals and cannot be staged deterministically, so tests make
+// the next N reconcile attempts lose one.
+#[cfg(test)]
+thread_local! {
+    static FORCED_RECONCILE_CONFLICTS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn reconcile_conflict_forced() -> bool {
+    FORCED_RECONCILE_CONFLICTS.with(|left| {
+        let n = left.get();
+        left.set(n.saturating_sub(1));
+        n > 0
+    })
+}
+
+#[cfg(not(test))]
+fn reconcile_conflict_forced() -> bool {
+    false
+}
 
 /// SQL fragment: the id of the newest `job_config` for the job aliased `j`
 /// in the enclosing query. Shared by the standing-split reconcilers (plan
@@ -2595,16 +2740,46 @@ impl Store {
         Self::lock_conn(&pool[start % pool.len()], "read")
     }
 
+    // Both accessors record their wait in
+    // `legion_store_read_model_lock_wait_seconds{mode}`: an uncontended
+    // acquisition records 0 without reading the clock, so the histogram's
+    // mean is the real average wait and its count the acquisition rate.
     fn read_model_reader(&self) -> R<std::sync::RwLockReadGuard<'_, SchedulingReadModel>> {
-        self.read_model
+        let wait = &crate::manager::telemetry::metrics().store_read_model_lock_wait_seconds;
+        match self.read_model.try_read() {
+            Ok(guard) => {
+                wait.observe(&["read"], 0.0);
+                return Ok(guard);
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => bail!(READ_MODEL_LOCK_ERROR),
+            Err(std::sync::TryLockError::WouldBlock) => {}
+        }
+        let started = Instant::now();
+        let guard = self
+            .read_model
             .read()
-            .map_err(|_| anyhow!(READ_MODEL_LOCK_ERROR))
+            .map_err(|_| anyhow!(READ_MODEL_LOCK_ERROR))?;
+        wait.observe(&["read"], started.elapsed().as_secs_f64());
+        Ok(guard)
     }
 
     fn read_model_writer(&self) -> R<std::sync::RwLockWriteGuard<'_, SchedulingReadModel>> {
-        self.read_model
+        let wait = &crate::manager::telemetry::metrics().store_read_model_lock_wait_seconds;
+        match self.read_model.try_write() {
+            Ok(guard) => {
+                wait.observe(&["write"], 0.0);
+                return Ok(guard);
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => bail!(READ_MODEL_LOCK_ERROR),
+            Err(std::sync::TryLockError::WouldBlock) => {}
+        }
+        let started = Instant::now();
+        let guard = self
+            .read_model
             .write()
-            .map_err(|_| anyhow!(READ_MODEL_LOCK_ERROR))
+            .map_err(|_| anyhow!(READ_MODEL_LOCK_ERROR))?;
+        wait.observe(&["write"], started.elapsed().as_secs_f64());
+        Ok(guard)
     }
 
     fn load_read_model(&self) -> R<SchedulingReadModel> {
@@ -2614,7 +2789,7 @@ impl Store {
         // commit landing between the two queries then leaves the mirror
         // BEHIND the allocations, which the plan-apply CAS resolves as a
         // conservative reject, never as phantom capacity.
-        let scope_epochs: HashMap<String, i64> = {
+        let scope_epochs: ScopeEpochs = {
             let mut stmt = conn
                 .prepare("SELECT scope_type, scope_id, epoch FROM allocation_epoch_partition;")?;
             let rows = stmt.query_map([], |row| {
@@ -2624,7 +2799,7 @@ impl Store {
                     row.get::<_, i64>(2)?,
                 ))
             })?;
-            let mut epochs = HashMap::new();
+            let mut epochs = ScopeEpochs::new();
             for row in rows {
                 let (scope_type, scope_id, epoch) = row?;
                 epochs.insert(Self::scope_vector_key(&scope_type, &scope_id), epoch);
@@ -2715,14 +2890,20 @@ impl Store {
                 .map(|node| (node.id.clone(), Arc::new(node)))
                 .collect(),
             allocations_by_node,
-            task_configs,
+            task_configs: task_configs
+                .into_iter()
+                .map(|(job_config_id, tasks)| (job_config_id, Arc::new(tasks)))
+                .collect(),
             indexes: IndexSet::new(Arc::clone(&self.index_settings)),
-            node_pools: HashMap::new(),
+            node_pools: SharedNodePools::new(),
             scope_epochs,
             // Placeholder: `refresh_read_model` overwrites this with the
             // previous model's counter + 1 when it publishes the rebuild.
             generation: 0,
             available_nodes_cache: None,
+            // Placeholder, carried forward by `refresh_read_model` like
+            // `generation`.
+            nodes_epoch: 0,
             // Populated by the reprojection below, node by node, while the
             // model is still private to this builder.
             node_usage: HashMap::new(),
@@ -2827,8 +3008,12 @@ impl Store {
         // counter forward (+1) so a plan spanning the rebuild falls back to
         // the eager sample instead of trusting a pre-rebuild capacity read.
         let next_generation = guard.generation.wrapping_add(1);
+        // Same for the node epoch: an off-lock available-node rebuild that
+        // read the previous model must not install its list into this one.
+        let next_nodes_epoch = guard.nodes_epoch.wrapping_add(1);
         *guard = model;
         guard.generation = next_generation;
+        guard.nodes_epoch = next_nodes_epoch;
         Ok(())
     }
 
@@ -2848,7 +3033,7 @@ impl Store {
         let mut guard = self.read_model_writer()?;
         let node_id = node.id.clone();
         guard.nodes.insert(node_id.clone(), Arc::new(node));
-        guard.available_nodes_cache = None;
+        guard.nodes_changed();
         Self::reproject_model_nodes(&mut guard, &self.resource_policy, &[node_id.as_str()]);
         Ok(())
     }
@@ -2863,7 +3048,7 @@ impl Store {
             .get_mut(node_id)
             .with_context(|| format!("Missing cached node {node_id}"))?;
         Arc::make_mut(cached).dynamic_attrs = dynamic_attrs;
-        guard.available_nodes_cache = None;
+        guard.nodes_changed();
         Self::reproject_model_nodes(&mut guard, &self.resource_policy, &[node_id]);
         Ok(())
     }
@@ -2880,7 +3065,7 @@ impl Store {
                 node.availability = "unavailable".to_string();
             }
         }
-        guard.available_nodes_cache = None;
+        guard.nodes_changed();
         let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
         Self::reproject_model_nodes(&mut guard, &self.resource_policy, &id_refs);
         Ok(())
@@ -2896,7 +3081,7 @@ impl Store {
         guard.indexes.remove_node(id);
         guard.node_pools.remove(id);
         guard.node_usage.remove(id);
-        guard.available_nodes_cache = None;
+        guard.nodes_changed();
         // Removing a node removes its allocations from the capacity view.
         guard.generation = guard.generation.wrapping_add(1);
         Ok(())
@@ -3426,7 +3611,9 @@ impl Store {
             return Ok(());
         }
         let mut guard = self.read_model_writer()?;
-        guard.task_configs.insert(job_config_id.to_string(), tasks);
+        guard
+            .task_configs
+            .insert(job_config_id.to_string(), Arc::new(tasks));
         Ok(())
     }
 
@@ -3434,16 +3621,27 @@ impl Store {
         &self,
         job_config_id: &str,
     ) -> R<Vec<(i64, TaskConfig)>> {
+        Ok(self
+            .shared_task_configs_for_job_config(job_config_id)?
+            .to_vec())
+    }
+
+    /// [`Self::cached_task_configs_for_job_config`] without the deep clone:
+    /// the read model's shared list. For per-eval readers that only look.
+    pub fn shared_task_configs_for_job_config(
+        &self,
+        job_config_id: &str,
+    ) -> R<Arc<Vec<(i64, TaskConfig)>>> {
         {
             let guard = self.read_model_reader()?;
             if let Some(tasks) = guard.task_configs.get(job_config_id) {
-                return Ok(tasks.clone());
+                return Ok(Arc::clone(tasks));
             }
         }
 
         let tasks = self.get_task_configs_for_job_config(job_config_id)?;
         self.cache_set_task_configs_for_job_config(job_config_id, tasks.clone())?;
-        Ok(tasks)
+        Ok(Arc::new(tasks))
     }
 
     /// Deep-cloned allocations map, for callers that need owned vectors.
@@ -3469,6 +3667,12 @@ impl Store {
             .values()
             .map(|node| Node::clone(node))
             .collect())
+    }
+
+    /// One node from the read model, as the shared `Arc`. `None` when the
+    /// read model does not hold it (callers fall back to [`Self::get_node`]).
+    pub fn cached_node(&self, id: &str) -> R<Option<Arc<Node>>> {
+        Ok(self.read_model_reader()?.nodes.get(id).cloned())
     }
 
     /// Node counts as the scheduler's read model sees them: every cached
@@ -3500,36 +3704,45 @@ impl Store {
             .collect())
     }
 
-    /// The scheduler's per-plan node snapshot: every available node, sorted
-    /// by id, as `Arc`s. Served from the read model's cached list when the
-    /// node set is unchanged since the last plan (the overwhelmingly common
-    /// case — one `Vec` of refcount bumps); rebuilt lazily after any node
-    /// mutation invalidates it.
-    pub fn available_node_arcs(&self) -> R<Vec<Arc<Node>>> {
-        {
+    /// The scheduler's per-plan node set: every available node, sorted by
+    /// id, with its by-id lookup. Served from the read model's cache as one
+    /// `Arc` when no node changed since the last plan (the overwhelmingly
+    /// common case); rebuilt lazily after a node mutation invalidates it.
+    ///
+    /// The rebuild (a filter, a sort, and a map over the fleet) runs
+    /// OUTSIDE the read-model write lock: the list is collected under the
+    /// read guard, built unlocked, and installed only if `nodes_epoch` has
+    /// not moved, so a rebuild never stalls heartbeats and planners for
+    /// O(fleet log fleet). A rebuild that lost a race to a node mutation
+    /// still returns its list, which is the node set as of the moment it
+    /// was read, exactly what a plan that started a moment earlier saw.
+    pub fn available_nodes(&self) -> R<Arc<AvailableNodes>> {
+        let (candidates, epoch) = {
             let guard = self.read_model_reader()?;
             if let Some(cache) = guard.available_nodes_cache.as_ref() {
-                return Ok(Vec::clone(cache));
+                return Ok(Arc::clone(cache));
             }
-        }
-        let mut guard = self.read_model_writer()?;
-        // Re-check: another plan may have rebuilt it while we waited.
-        if guard.available_nodes_cache.is_none() {
-            let mut nodes: Vec<Arc<Node>> = guard
+            let candidates: Vec<Arc<Node>> = guard
                 .nodes
                 .values()
                 .filter(|node| node.availability == "available")
                 .cloned()
                 .collect();
-            nodes.sort_by(|a, b| a.id.cmp(&b.id));
-            guard.available_nodes_cache = Some(Arc::new(nodes));
-        }
-        Ok(Vec::clone(
-            guard
-                .available_nodes_cache
-                .as_ref()
-                .expect("cache rebuilt above"),
-        ))
+            (candidates, guard.nodes_epoch)
+        };
+        let built = Arc::new(AvailableNodes::new(candidates));
+        crate::manager::telemetry::metrics()
+            .scheduler_node_list_rebuilds_total
+            .inc();
+        Ok(self
+            .read_model_writer()?
+            .install_available_nodes(epoch, built))
+    }
+
+    /// [`Self::available_nodes`] as an owned list, for callers that need a
+    /// `Vec`. The scheduler takes the shared [`AvailableNodes`] instead.
+    pub fn available_node_arcs(&self) -> R<Vec<Arc<Node>>> {
+        Ok(self.available_nodes()?.as_slice().to_vec())
     }
 
     /// The scheduler's per-plan capacity snapshot: current allocations and
@@ -3544,6 +3757,13 @@ impl Store {
     /// the late sample equals a pre-capacity one).
     pub(crate) fn plan_capacity_snapshot(&self, job_id: &str) -> R<PlanCapacityParts> {
         let guard = self.read_model_reader()?;
+        // Every map clone here is O(1) (persistent maps), so the read guard
+        // is held for constant time regardless of fleet size. The epoch
+        // mirror rides along under the SAME guard: those are the epochs of
+        // exactly the allocations and pools the plan will be built
+        // against, which is the fence's "sample no later than the capacity
+        // read" rule satisfied at the capacity read itself — see
+        // `Store::expected_versions_from_snapshot`.
         Ok((
             guard.allocations_by_node.clone(),
             guard.node_pools.clone(),
@@ -3553,7 +3773,39 @@ impl Store {
                 .get(job_id)
                 .cloned()
                 .unwrap_or_default(),
+            guard.scope_epochs.clone(),
         ))
+    }
+
+    /// The plan-apply fence sample for a finished plan, taken from the
+    /// epochs captured WITH its capacity snapshot
+    /// ([`Self::plan_capacity_snapshot`]): the job config's scope plus every
+    /// affected node.
+    ///
+    /// This is the eager sample's guarantee (no later than the capacity
+    /// read — here, *at* it) at the lazy sample's cost (O(affected)), and
+    /// it never has to re-plan: whatever publishes after the snapshot is
+    /// invisible to it, so the CAS rejects exactly the plans whose scopes
+    /// moved. The mirror invariant (`mirror epoch ≤ epoch of the state the
+    /// cached allocations came from`, see
+    /// [`SchedulingReadModel::scope_epochs`]) holds for any published state,
+    /// so a torn view can still only make the CAS conservative. Missing
+    /// entries sample `0`, matching `ensure_scope_epoch_tx`'s seed.
+    pub(crate) fn expected_versions_from_snapshot(
+        epochs: &ScopeEpochs,
+        job_config_id: &str,
+        affected_nodes: &HashSet<String>,
+    ) -> BTreeMap<String, i64> {
+        let mut versions = BTreeMap::new();
+        let job_key = Self::scope_vector_key("job_config", job_config_id);
+        let job_epoch = epochs.get(&job_key).copied().unwrap_or(0);
+        versions.insert(job_key, job_epoch);
+        for node_id in affected_nodes {
+            let key = Self::scope_vector_key("node", node_id);
+            let epoch = epochs.get(&key).copied().unwrap_or(0);
+            versions.insert(key, epoch);
+        }
+        versions
     }
 
     /// The owning job name and priority band of a job config.
@@ -3647,6 +3899,24 @@ impl Store {
             .read_model_reader()?
             .indexes
             .query_with_order(bindings, request, budget, ordered))
+    }
+
+    /// [`crate::scheduling_index::IndexSet::walk_verified`] under the
+    /// read-model read guard. `verify` runs with the guard held, so it must
+    /// not touch the store; the guard is held for O(budget ÷ selectivity)
+    /// checks instead of the whole shard's id clone.
+    pub fn scheduling_index_walk<T>(
+        &self,
+        bindings: &HashMap<String, Value>,
+        request: &HashMap<String, f64>,
+        budget: usize,
+        verify: impl FnMut(&str) -> Option<T>,
+    ) -> R<Result<crate::scheduling_index::IndexWalk<T>, crate::scheduling_index::IndexQueryOutcome>>
+    {
+        Ok(self
+            .read_model_reader()?
+            .indexes
+            .walk_verified(bindings, request, budget, verify))
     }
 
     pub fn allocation_epoch_for_job_config(&self, job_config_id: &str) -> R<i64> {
@@ -5729,21 +5999,15 @@ impl Store {
         job_config_id: Option<&str>,
     ) -> Option<i64> {
         let band: Option<String> = if let Some(job_config_id) = job_config_id {
-            tx.query_row(
-                "SELECT priority FROM job_config WHERE id = ?;",
-                [job_config_id],
-                |row| row.get(0),
-            )
-            .optional()
-            .ok()
-            .flatten()
+            tx.prepare_cached("SELECT priority FROM job_config WHERE id = ?;")
+                .and_then(|mut stmt| stmt.query_row([job_config_id], |row| row.get(0)).optional())
+                .ok()
+                .flatten()
         } else if let Some(job_id) = job_id {
-            tx.query_row(
+            tx.prepare_cached(
                 "SELECT priority FROM job_config WHERE job_id = ? ORDER BY version DESC LIMIT 1;",
-                [job_id],
-                |row| row.get(0),
             )
-            .optional()
+            .and_then(|mut stmt| stmt.query_row([job_id], |row| row.get(0)).optional())
             .ok()
             .flatten()
         } else {
@@ -5776,7 +6040,7 @@ impl Store {
             ":priority": priority,
             ":ready_at": Self::sortable_now()?,
         };
-        tx.execute(&INSERT_EVAL, params)?;
+        tx.prepare_cached(&INSERT_EVAL)?.execute(params)?;
         Ok(())
     }
 
@@ -6506,7 +6770,8 @@ impl Store {
     pub fn get_node(&self, id: &str) -> R<Node> {
         let conn = self.read_connection()?;
         let node = conn
-            .query_row(&GET_NODE, [id], |row| self.node_from_row(row))
+            .prepare_cached(&GET_NODE)?
+            .query_row([id], |row| self.node_from_row(row))
             .map_err(|error| match error {
                 RusqliteError::QueryReturnedNoRows => {
                     anyhow::Error::new(StorageError::not_found("node", id))
@@ -8636,7 +8901,7 @@ impl Store {
             return Ok(None);
         };
 
-        let mut stmt = conn.prepare(&GET_TASK_FOR_JOB_CONIFG)?;
+        let mut stmt = conn.prepare_cached(&GET_TASK_FOR_JOB_CONIFG)?;
         let tasks =
             Self::collect_rows(stmt.query_map([jc_id], |row| self.task_config_from_row(row))?)?;
 
@@ -8673,7 +8938,7 @@ impl Store {
             return Ok(None);
         };
 
-        let mut stmt = conn.prepare(&GET_TASK_FOR_JOB_CONIFG)?;
+        let mut stmt = conn.prepare_cached(&GET_TASK_FOR_JOB_CONIFG)?;
         let tasks =
             Self::collect_rows(stmt.query_map([jc_id], |row| self.task_config_from_row(row))?)?;
 
@@ -9590,9 +9855,8 @@ impl Store {
     pub fn previous_job_config_id(&self, job_config_id: &str) -> R<Option<String>> {
         let conn = self.read_connection()?;
         let previous = conn
-            .query_row(&GET_JOB_UPDATE_FOR_CONFIG, [job_config_id], |row| {
-                row.get::<_, Option<String>>(4)
-            })
+            .prepare_cached(&GET_JOB_UPDATE_FOR_CONFIG)?
+            .query_row([job_config_id], |row| row.get::<_, Option<String>>(4))
             .optional()?;
         Ok(previous.flatten())
     }
@@ -10366,11 +10630,8 @@ impl Store {
         for id in task_reread_ids {
             let conn = self.read_connection()?;
             let jc: Option<String> = conn
-                .query_row(
-                    "SELECT job_config_id FROM task_config WHERE id = ?;",
-                    [id],
-                    |row| row.get(0),
-                )
+                .prepare_cached("SELECT job_config_id FROM task_config WHERE id = ?;")?
+                .query_row([id], |row| row.get(0))
                 .optional()?;
             drop(conn);
             if let Some(jc) = jc {
@@ -10382,8 +10643,11 @@ impl Store {
         for id in node_ids {
             let node = {
                 let conn = self.read_connection()?;
-                conn.query_row(&GET_NODE, [id.as_str()], |row| self.node_from_row(row))
-                    .optional()?
+                let node = conn
+                    .prepare_cached(&GET_NODE)?
+                    .query_row([id.as_str()], |row| self.node_from_row(row))
+                    .optional()?;
+                node
             };
             match node {
                 Some(node) => self.cache_node(node)?,
@@ -10425,14 +10689,15 @@ impl Store {
         for &id in &event_ids {
             let record = {
                 let conn = self.read_connection()?;
-                conn.query_row(
-                    "SELECT id, kind, level, job_id, node_id, eval_id, allocation_id, \
+                let record = conn
+                    .prepare_cached(
+                        "SELECT id, kind, level, job_id, node_id, eval_id, allocation_id, \
                      rollout_id, message, metadata_json, created_at \
                      FROM scheduler_event WHERE id = ?;",
-                    [id],
-                    |row| self.scheduler_event_from_row(row),
-                )
-                .optional()?
+                    )?
+                    .query_row([id], |row| self.scheduler_event_from_row(row))
+                    .optional()?;
+                record
             };
             self.publish_staged(record);
         }
@@ -10635,25 +10900,28 @@ impl Store {
         let mut id = Self::next_scheduler_event_id();
         let mut attempts = 0u32;
         loop {
-            let inserted = conn.execute(
-                "INSERT INTO scheduler_event (
+            let inserted = conn
+                .prepare_cached(
+                    "INSERT INTO scheduler_event (
                     id, kind, level, job_id, node_id, eval_id, allocation_id, rollout_id,
                     message, metadata_json, created_at
                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11);",
-                params![
-                    id,
-                    draft.kind,
-                    draft.level,
-                    draft.job_id,
-                    draft.node_id,
-                    draft.eval_id,
-                    draft.allocation_id,
-                    draft.rollout_id,
-                    draft.message,
-                    metadata_json,
-                    created_at
-                ],
-            );
+                )
+                .and_then(|mut stmt| {
+                    stmt.execute(params![
+                        id,
+                        draft.kind,
+                        draft.level,
+                        draft.job_id,
+                        draft.node_id,
+                        draft.eval_id,
+                        draft.allocation_id,
+                        draft.rollout_id,
+                        draft.message,
+                        metadata_json,
+                        created_at
+                    ])
+                });
             match inserted {
                 Ok(_) => break,
                 Err(RusqliteError::SqliteFailure(e, _))
@@ -11016,7 +11284,7 @@ impl Store {
         job_config_id: &str,
     ) -> R<Vec<(i64, TaskConfig)>> {
         let conn = self.read_connection()?;
-        let mut stmt = conn.prepare(&GET_TASK_FOR_JOB_CONIFG)?;
+        let mut stmt = conn.prepare_cached(&GET_TASK_FOR_JOB_CONIFG)?;
         let rows = stmt.query_map([job_config_id], |row| {
             let id = row.get(0)?;
             let task = self.task_config_from_row(row)?;
@@ -12135,7 +12403,8 @@ impl Store {
         let cutoff = OffsetDateTime::now_utc().unix_timestamp() - STOP_NOTICE_RETENTION_SECS;
 
         let conn = self.read_connection()?;
-        let mut stmt = conn.prepare(
+        // Cached for the same reason as `allocs_for_node`: once per heartbeat.
+        let mut stmt = conn.prepare_cached(
             "SELECT allocation_id, cause, preemptor_job, preemptor_band
              FROM allocation_stop_notice
              WHERE node_id = ?1 AND created_at_unix >= ?2;",
@@ -12473,7 +12742,7 @@ impl Store {
     #[instrument(err, skip_all)]
     pub fn allocs_for_job_config(&self, job_config_id: &str) -> R<Vec<Allocation>> {
         let conn = self.read_connection()?;
-        let mut stmt = conn.prepare(GET_ALLOCS_FOR_JOB_CONFIG.as_str())?;
+        let mut stmt = conn.prepare_cached(GET_ALLOCS_FOR_JOB_CONFIG.as_str())?;
         let alloc_iter = stmt.query_map([job_config_id], |row| self.allocation_from_row(row))?;
 
         let mut allocs = Vec::new();
@@ -12487,7 +12756,10 @@ impl Store {
     #[instrument(err, skip_all)]
     pub fn allocs_for_node(&self, node_id: &str) -> R<Vec<Allocation>> {
         let conn = self.read_connection()?;
-        let mut stmt = conn.prepare(GET_ALLOCS_FOR_NODE.as_str())?;
+        // Cached: every worker heartbeat runs this (20k nodes at a 2s
+        // cadence is ~10k/s), and re-parsing the join each time was a
+        // measurable slice of the leader's CPU.
+        let mut stmt = conn.prepare_cached(GET_ALLOCS_FOR_NODE.as_str())?;
         let alloc_iter = stmt.query_map([node_id], |row| self.allocation_from_row(row))?;
 
         let mut allocs = Vec::new();
@@ -12501,7 +12773,7 @@ impl Store {
     #[instrument(err, skip_all)]
     pub fn get_allocation_by_id(&self, allocation_id: i64) -> R<Option<Allocation>> {
         let conn = self.read_connection()?;
-        let mut stmt = conn.prepare(GET_ALLOCATION_BY_ID.as_str())?;
+        let mut stmt = conn.prepare_cached(GET_ALLOCATION_BY_ID.as_str())?;
         let allocation = stmt
             .query_row([allocation_id], |row| self.allocation_from_row(row))
             .optional()?;
@@ -13612,20 +13884,68 @@ impl Store {
             return Ok(());
         }
 
-        let scheduler = crate::manager::scheduler::Scheduler::new(self)?;
-        let outcome = scheduler.plan_and_apply(
-            job_config_id,
-            crate::manager::scheduler::PlanMode::Reschedule,
-        )?;
-        if !outcome.allocations.is_empty() {
-            debug!(
-                %job_config_id,
-                placed = outcome.allocations.len(),
-                "Reconciled job config allocations"
-            );
+        // Callers have usually just COMMITTED a removal (lost node, drain),
+        // so this replan is the only thing standing between that removal
+        // and an under-count job. It must not give up on a plan conflict:
+        // when one node's loss fans out into several reschedule evals that
+        // touch the same job, they race on that job's epoch, and the loser
+        // used to surface the conflict, get requeued, and come back to a
+        // node with no allocations left to remove — a no-op that left the
+        // job short for good (AWS 10k storm drill, 2026-10-10: 22 of 6,343
+        // replacements never placed). So: retry in place on a fresh
+        // snapshot, and if the race keeps being lost, hand the job to a
+        // durable `job_reschedule` eval, whose conflict retries and
+        // requeue backstop converge it.
+        const ATTEMPTS: u32 = 5;
+        for attempt in 1..=ATTEMPTS {
+            let scheduler = crate::manager::scheduler::Scheduler::new(self)?;
+            let planned = if reconcile_conflict_forced() {
+                Err(anyhow::Error::new(StorageError::Conflict {
+                    message: "forced by test".to_string(),
+                }))
+            } else {
+                scheduler.plan_and_apply(
+                    job_config_id,
+                    crate::manager::scheduler::PlanMode::Reschedule,
+                )
+            };
+            match planned {
+                Ok(outcome) => {
+                    if !outcome.allocations.is_empty() {
+                        debug!(
+                            %job_config_id,
+                            placed = outcome.allocations.len(),
+                            "Reconciled job config allocations"
+                        );
+                    }
+                    return Ok(());
+                }
+                Err(err) if Eval::error_is_plan_conflict(&err) => {
+                    if attempt < ATTEMPTS {
+                        std::thread::sleep(Duration::from_millis(25 << (attempt - 1)));
+                        continue;
+                    }
+                    let Some(job_id) = self.job_id_for_job_config(job_config_id)? else {
+                        // The job is gone; there is nothing left to converge.
+                        return Ok(());
+                    };
+                    warn!(
+                        %job_config_id,
+                        attempts = ATTEMPTS,
+                        error = %err,
+                        "Reconcile kept losing plan races; handing off to a job_reschedule eval"
+                    );
+                    self.enqueue_evals(vec![EvalRequest::for_job(
+                        "job_reschedule",
+                        &job_id,
+                        job_config_id,
+                    )])?;
+                    return Ok(());
+                }
+                Err(err) => return Err(err),
+            }
         }
-
-        Ok(())
+        unreachable!("the last attempt always returns")
     }
 
     /// Free a lost node's allocations for replacement — gated for stateful
@@ -16033,7 +16353,7 @@ impl Store {
             ":ready_at": ready_at,
         };
 
-        tx.execute(&INSERT_EVAL, params)?;
+        tx.prepare_cached(&INSERT_EVAL)?.execute(params)?;
         let next_id = tx.last_insert_rowid();
 
         let eval = Eval {
@@ -17774,7 +18094,8 @@ impl Store {
     #[instrument(err, skip_all)]
     pub fn volumes_to_destroy_for_node(&self, node_id: &str) -> R<Vec<Volume>> {
         let conn = self.read_connection()?;
-        let mut stmt = conn.prepare(&format!(
+        // Once per heartbeat, so cached (the formatted SQL is constant).
+        let mut stmt = conn.prepare_cached(&format!(
             "{} WHERE state = 'destroying' \
              AND (node_id = ?1 OR node_id IS NULL OR node_local = 0) \
              ORDER BY updated_at ASC;",
@@ -18658,6 +18979,171 @@ mod tests {
         assert!(store.available_node_arcs()?.is_empty());
 
         Ok(())
+    }
+
+    /// The cached node set (sorted list + by-id lookup) is shared between
+    /// plans and invalidated by every kind of node change: registration,
+    /// attribute update, drain, loss, and removal.
+    #[test]
+    fn available_node_set_is_shared_and_invalidated_by_every_node_change() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("set-b", "active"))?;
+        store.insert_node(make_node_msg("set-a", "active"))?;
+        let ids = |set: &AvailableNodes| {
+            set.as_slice()
+                .iter()
+                .map(|node| node.id.clone())
+                .collect::<Vec<_>>()
+        };
+
+        let first = store.available_nodes()?;
+        assert_eq!(ids(&first), vec!["set-a", "set-b"]);
+        assert_eq!(
+            first.get("set-b").map(|node| node.id.as_str()),
+            Some("set-b")
+        );
+        assert!(first.get("missing").is_none());
+        assert!(
+            Arc::ptr_eq(&first, &store.available_nodes()?),
+            "an unchanged fleet shares one set"
+        );
+
+        // Registration.
+        store.insert_node(make_node_msg("set-c", "active"))?;
+        let registered = store.available_nodes()?;
+        assert!(!Arc::ptr_eq(&first, &registered));
+        assert_eq!(ids(&registered), vec!["set-a", "set-b", "set-c"]);
+        // The old set is untouched: a plan holding it keeps a stable view.
+        assert_eq!(ids(&first), vec!["set-a", "set-b"]);
+
+        // Attribute change: the lookup serves the new node value.
+        let mut diff = Map::new();
+        diff.insert("rack".to_string(), json!("r9"));
+        store.update_node_dyamic("set-c", &diff)?;
+        let updated = store.available_nodes()?;
+        assert_eq!(
+            updated
+                .get("set-c")
+                .map(|node| node.dynamic_attrs["rack"].clone()),
+            Some(json!("r9"))
+        );
+
+        // Drain (operator availability change).
+        store.set_node_availability("set-a", "drained")?;
+        let drained = store.available_nodes()?;
+        assert_eq!(ids(&drained), vec!["set-b", "set-c"]);
+        assert!(drained.get("set-a").is_none(), "lookup follows the list");
+
+        // Loss, then removal.
+        store.mark_nodes_as_lost(&["set-b".to_string()])?;
+        assert_eq!(ids(&*store.available_nodes()?), vec!["set-c"]);
+        store.remove_node("set-c")?;
+        assert!(store.available_nodes()?.is_empty());
+        Ok(())
+    }
+
+    /// A rebuild that read the node map before a node changed must not
+    /// install its (now stale) list, and a full read-model reload moves the
+    /// epoch so a rebuild that straddles it cannot install either.
+    #[test]
+    fn stale_available_node_rebuild_is_not_installed() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("epoch-a", "active"))?;
+        let mut model = store.scheduling_read_model()?;
+        model.available_nodes_cache = None;
+        let epoch = model.nodes_epoch;
+        let stale = Arc::new(AvailableNodes::new(Vec::new()));
+
+        model.nodes_changed();
+        let returned = model.install_available_nodes(epoch, Arc::clone(&stale));
+        assert!(
+            Arc::ptr_eq(&returned, &stale),
+            "the caller still gets its build"
+        );
+        assert!(
+            model.available_nodes_cache.is_none(),
+            "but it is not cached"
+        );
+
+        // Same epoch: installed, and a second builder shares the first copy.
+        let epoch = model.nodes_epoch;
+        let fresh = Arc::new(AvailableNodes::new(Vec::new()));
+        let installed = model.install_available_nodes(epoch, Arc::clone(&fresh));
+        assert!(Arc::ptr_eq(&installed, &fresh));
+        let other = Arc::new(AvailableNodes::new(Vec::new()));
+        assert!(Arc::ptr_eq(
+            &model.install_available_nodes(epoch, other),
+            &fresh
+        ));
+
+        // A full reload carries the epoch forward.
+        let before = store.scheduling_read_model()?.nodes_epoch;
+        store.refresh_read_model()?;
+        assert!(store.scheduling_read_model()?.nodes_epoch != before);
+        Ok(())
+    }
+
+    /// A state-db swap (snapshot install / restore) replaces the cached
+    /// node set with the restored fleet.
+    #[test]
+    fn available_node_set_follows_a_state_db_swap() -> R<()> {
+        let source = setup_store()?;
+        source.insert_node(make_node_msg("restored-a", "active"))?;
+        source.insert_node(make_node_msg("restored-b", "active"))?;
+        let dir = tempfile::tempdir()?;
+        let copy = dir.path().join("snapshot.sqlite");
+        source
+            .write_connection()?
+            .execute("VACUUM INTO ?1;", [copy.to_str().context("utf-8 path")?])?;
+
+        let target = setup_store()?;
+        target.insert_node(make_node_msg("old-node", "active"))?;
+        assert_eq!(target.available_nodes()?.len(), 1, "cache warmed");
+        target.install_state_db(&copy)?;
+        let after = target.available_nodes()?;
+        assert!(after.get("old-node").is_none());
+        assert_eq!(
+            after
+                .as_slice()
+                .iter()
+                .map(|node| node.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["restored-a", "restored-b"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn available_nodes_without_shares_when_nothing_is_excluded() {
+        let node = |id: &str| {
+            Arc::new(Node {
+                id: id.into(),
+                status: "active".into(),
+                pool: "default".into(),
+                availability: "available".into(),
+                last_heartbeat: String::new(),
+                heartbeat_source: String::new(),
+                config_attrs: json!({}),
+                fingerprint_attrs: json!({}),
+                dynamic_attrs: json!({}),
+                health_checks: json!({}),
+            })
+        };
+        let set = AvailableNodes::new(vec![node("n2"), node("n1"), node("n3")]);
+        let absent: HashSet<String> = ["gone".to_string()].into();
+        assert!(set.without(&absent).is_none(), "nothing to drop: share");
+        let present: HashSet<String> = ["n2".to_string(), "gone".to_string()].into();
+        let filtered = set.without(&present).expect("n2 is present");
+        assert_eq!(
+            filtered
+                .as_slice()
+                .iter()
+                .map(|node| node.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["n1", "n3"]
+        );
+        assert!(filtered.get("n2").is_none());
+        assert_eq!(filtered.get("n3").map(|node| node.id.as_str()), Some("n3"));
     }
 
     #[test]
@@ -19635,6 +20121,39 @@ mod tests {
         let replaced = store.allocs_for_node("node-two")?;
         assert_eq!(replaced.len(), 1);
         assert_eq!(replaced[0].task_config_id, web_task);
+        Ok(())
+    }
+
+    /// A lost node's stateless allocation must be replaced even when the
+    /// reconcile loses plan races: first in place (a couple of conflicts),
+    /// then via a durable `job_reschedule` hand-off (every in-place attempt
+    /// lost). Before this, one lost race left the job short for good — the
+    /// requeued eval found the node already emptied and did nothing.
+    #[test]
+    fn lost_node_replacement_survives_plan_conflicts() -> R<()> {
+        for forced in [2, 5] {
+            let store = setup_store()?;
+            store.insert_node(make_node_msg("node-one", "active"))?;
+            store.insert_node(make_node_msg("node-two", "active"))?;
+            let job_id = format!("conflicted-{forced}");
+            submit_job(&store, &job_id, vec![task("web")])?;
+            let web_task = task_id_for(&store, "web", &job_id)?;
+            store.place_alloc("node-one", web_task)?;
+
+            store.mark_nodes_as_lost(&["node-one".to_string()])?;
+            FORCED_RECONCILE_CONFLICTS.with(|left| left.set(forced));
+            run_pending_evals(&store)?;
+            FORCED_RECONCILE_CONFLICTS.with(|left| left.set(0));
+
+            assert!(store.allocs_for_node("node-one")?.is_empty());
+            let replaced = store.allocs_for_node("node-two")?;
+            assert_eq!(
+                replaced.len(),
+                1,
+                "{forced} forced conflicts left the job short"
+            );
+            assert_eq!(replaced[0].task_config_id, web_task);
+        }
         Ok(())
     }
 
@@ -21631,6 +22150,127 @@ mod tests {
             }
         }
 
+        Ok(())
+    }
+
+    /// The fence sample a plan takes from its capacity snapshot
+    /// (`expected_versions_from_snapshot`) must be the epochs AT the
+    /// capacity read, never later ones: a commit that lands after the
+    /// snapshot has to make the plan's CAS fail. Two plans snapshot the
+    /// same state; the first applies, which bumps the job config's epoch;
+    /// the second, still carrying its snapshot's epochs, must be rejected.
+    #[test]
+    fn snapshot_fence_sample_rejects_a_plan_overtaken_after_its_snapshot() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "ready"))?;
+        let job = JobConfig {
+            priority: Default::default(),
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "job-snap".into(),
+            tasks: vec![TaskConfig::new("task", "noop")],
+            version: None,
+        };
+        store.handle_job_submit(
+            &job,
+            &[Submission {
+                path: "job.ncl".into(),
+                content: "job".into(),
+                is_primary: true,
+            }],
+        )?;
+        let job_config_id = store.get_job_config("job-snap")?.id();
+        let task_id = task_id_for(&store, "task", "job-snap")?;
+        let affected = HashSet::from(["node-a".to_string()]);
+
+        // Both planners snapshot BEFORE either commits.
+        let (_, _, _, _, epochs_first) = store.plan_capacity_snapshot("job-snap")?;
+        let (_, _, _, _, epochs_second) = store.plan_capacity_snapshot("job-snap")?;
+        let expected_first =
+            Store::expected_versions_from_snapshot(&epochs_first, &job_config_id, &affected);
+        let expected_second =
+            Store::expected_versions_from_snapshot(&epochs_second, &job_config_id, &affected);
+        assert_eq!(
+            expected_first,
+            store.allocation_version_vector(&job_config_id, &affected)?,
+            "a snapshot's sample is the live mirror at the moment it was taken"
+        );
+
+        let first = store.insert_plan_submission(
+            &job_config_id,
+            "fresh",
+            &[("node-a".to_string(), task_id)],
+            &expected_first,
+        )?;
+        assert!(matches!(
+            store.apply_plan_submission(&first)?,
+            PlanApplyOutcome::Applied(_)
+        ));
+
+        // The second snapshot predates that commit and must not have seen it.
+        let live = store.allocation_version_vector(&job_config_id, &affected)?;
+        let job_key = format!("job_config:{job_config_id}");
+        assert!(expected_second[&job_key] < live[&job_key]);
+        let second = store.insert_plan_submission(
+            &job_config_id,
+            "fresh",
+            &[("node-a".to_string(), task_id)],
+            &expected_second,
+        )?;
+        assert!(
+            matches!(
+                store.apply_plan_submission(&second)?,
+                PlanApplyOutcome::Rejected { .. }
+            ),
+            "a plan overtaken after its snapshot must be rejected by the fence"
+        );
+        Ok(())
+    }
+
+    /// Snapshot isolation of the persistent read-model maps: a write after
+    /// a snapshot is visible to the model and to later snapshots, and
+    /// invisible to the earlier one — allocations and epochs alike.
+    #[test]
+    fn plan_capacity_snapshot_is_isolated_from_later_writes() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "ready"))?;
+        let job = JobConfig {
+            priority: Default::default(),
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "job-iso".into(),
+            tasks: vec![TaskConfig::new("task", "noop")],
+            version: None,
+        };
+        store.handle_job_submit(
+            &job,
+            &[Submission {
+                path: "job.ncl".into(),
+                content: "job".into(),
+                is_primary: true,
+            }],
+        )?;
+        let task_id = task_id_for(&store, "task", "job-iso")?;
+
+        let (before_allocations, before_pools, _, _, before_epochs) =
+            store.plan_capacity_snapshot("job-iso")?;
+        store.apply_allocation_plan(&[("node-a".to_string(), task_id)])?;
+        let (after_allocations, _, _, _, after_epochs) = store.plan_capacity_snapshot("job-iso")?;
+
+        let count = |map: &SharedNodeAllocations| map.get("node-a").map(|v| v.len()).unwrap_or(0);
+        assert_eq!(
+            count(&before_allocations),
+            0,
+            "the old snapshot must not see the write"
+        );
+        assert_eq!(count(&after_allocations), 1, "the model must see the write");
+        assert!(before_pools.contains_key("node-a"));
+        let node_key = "node:node-a".to_string();
+        assert!(
+            before_epochs.get(&node_key).copied().unwrap_or(0)
+                < after_epochs.get(&node_key).copied().unwrap_or(0),
+            "the write bumped the node epoch in the model, not in the old snapshot"
+        );
         Ok(())
     }
 

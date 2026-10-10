@@ -1183,7 +1183,12 @@ impl MultiRaftDriver {
             Ok(reply) => {
                 let reply = reply.into_inner();
                 if reply.accepted {
-                    DigestOutcome::Accepted
+                    DigestOutcome::Accepted {
+                        served_interval: reply
+                            .served_interval_seconds
+                            .filter(|seconds| *seconds > 0)
+                            .map(|seconds| std::time::Duration::from_secs(u64::from(seconds))),
+                    }
                 } else {
                     DigestOutcome::NotLeader {
                         leader_hint: reply.leader_hint,

@@ -178,21 +178,42 @@ def nickel(value, indent=0):
 # --- Nomad ------------------------------------------------------------
 
 
+# The mock driver's registered plugin name. It is NOT "mock": Nomad's
+# drivers/mock registers as "mock_driver", which is what nodesim's plugin
+# catalog advertises, and a job asking for "mock" is infeasible on every
+# node — every Nomad cell would have placed nothing.
+NOMAD_DRIVER = "mock_driver"
+
+
+def nomad_supported(constraints):
+    """nomad-nodesim can set a node's class but not its meta, so a
+    constraint on any other key would be unplaceable rather than measured.
+    Refuse it up front with the reason, instead of a cell that times out."""
+    unsupported = sorted(key for key in constraints if key != "class")
+    if unsupported:
+        raise ValueError(
+            f"Nomad cells cannot constrain on {unsupported}: nomad-nodesim sets "
+            "node_class but not node meta, so those jobs would never place. "
+            "Use a class-only scenario (web_fleet, batch_burst, dense_fleet)."
+        )
+
+
 def nomad_constraint(key, value):
-    attribute = "${node.class}" if key == "class" else "${meta.%s}" % key
     return (
         "    constraint {\n"
-        f'      attribute = "{attribute}"\n'
+        '      attribute = "${node.class}"\n'
         f'      value     = "{value}"\n'
         "    }\n"
     )
 
 
 def nomad_job(job_name, job_type):
+    """HCL, for the CLI loop (`nomad job run`)."""
     resources = job_type.get("resources") or {}
     cpu = int(resources.get("cpu", 100))
     memory = int(resources.get("memory", 64))
     constraints = job_type.get("constraints") or {}
+    nomad_supported(constraints)
 
     groups = []
     for task_idx in range(job_type["tasks_per_job"]):
@@ -204,7 +225,7 @@ def nomad_job(job_name, job_type):
             f"    count = {job_type['task_count_per_task']}\n"
             f"{constraint_blocks}"
             f'    task "t" {{\n'
-            f'      driver = "mock"\n'
+            f'      driver = "{NOMAD_DRIVER}"\n'
             f"      config {{}}\n"
             f"      resources {{\n"
             f"        cpu    = {cpu}\n"
@@ -223,6 +244,48 @@ def nomad_job(job_name, job_type):
     )
 
 
+def nomad_api_job(job_name, job_type):
+    """The same job as nomad_job, in the HTTP API's JSON shape, for the
+    native submitter (POST /v1/jobs). Emitted by the translator rather than
+    converted at submit time so no parsing lands inside the measured window
+    — the same reason Legion's jobspecs are pre-rendered."""
+    resources = job_type.get("resources") or {}
+    constraints = job_type.get("constraints") or {}
+    nomad_supported(constraints)
+    groups = []
+    for task_idx in range(job_type["tasks_per_job"]):
+        groups.append(
+            {
+                "Name": f"g{task_idx}",
+                "Count": job_type["task_count_per_task"],
+                "Constraints": [
+                    {"LTarget": "${node.class}", "RTarget": str(value), "Operand": "="}
+                    for _, value in sorted(constraints.items())
+                ],
+                "Tasks": [
+                    {
+                        "Name": "t",
+                        "Driver": NOMAD_DRIVER,
+                        "Config": {},
+                        "Resources": {
+                            "CPU": int(resources.get("cpu", 100)),
+                            "MemoryMB": int(resources.get("memory", 64)),
+                        },
+                    }
+                ],
+            }
+        )
+    return {
+        "Job": {
+            "ID": job_name,
+            "Name": job_name,
+            "Type": "service",
+            "Datacenters": ["dc1"],
+            "TaskGroups": groups,
+        }
+    }
+
+
 # --- Kubernetes -------------------------------------------------------
 
 
@@ -239,7 +302,13 @@ def k8s_deployment(job_name, job_type, task_idx):
     return {
         "apiVersion": "apps/v1",
         "kind": "Deployment",
-        "metadata": {"name": name, "labels": {"bench": "1", "bench-job": job_name}},
+        # The driver's dedicated namespace (driver.K8S_NAMESPACE): a cell's
+        # cleanup is one server-side namespace delete.
+        "metadata": {
+            "name": name,
+            "namespace": "bench",
+            "labels": {"bench": "1", "bench-job": job_name},
+        },
         "spec": {
             "replicas": job_type["task_count_per_task"],
             "selector": {"matchLabels": {"app": name}},
@@ -315,6 +384,11 @@ def translate(scenario, system, out_dir, multiplier, jobspec_format="json"):
             filename = f"{job_name}.nomad.hcl"
             with open(os.path.join(out_dir, filename), "w") as f:
                 f.write(nomad_job(job_name, job_type))
+            # The native submitter's artifact sits next to the HCL; the
+            # driver derives its name, so the manifest shape is unchanged.
+            with open(os.path.join(out_dir, f"{job_name}.nomad.json"), "w") as f:
+                json.dump(nomad_api_job(job_name, job_type), f)
+                f.write("\n")
         elif system == "k8s":
             filename = f"{job_name}.json"
             manifests = [

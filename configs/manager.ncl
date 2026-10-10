@@ -80,7 +80,8 @@
     #
     # Plan-path scale levers (docs/scheduler-and-eval-loop.md). Both are on
     # by default; the flags exist as escape hatches.
-    # lazy_version_sample = true,   # false = eager O(fleet) epoch sample per plan
+    # lazy_version_sample: RETIRED (no effect, warns once). Plans now take
+    # their fence epochs from their own capacity snapshot.
     # plan_apply_coalescing = true, # false = one commit/raft propose per plan
     # plan_apply_batch_max = 16,    # max plans per group commit (1-128)
     # Job-intake group commit (docs/scheduler-and-eval-loop.md): concurrent
@@ -216,22 +217,29 @@
     },
   },
   # Heartbeat cadence and the lost-node window derived from it
-  # (docs/heartbeat-cadence-and-scale.md). Omitting the whole block
-  # reproduces Legion's historical behavior exactly: workers keep their
-  # worker-type `heartbeatSeconds`, nothing adapts, and 5 x 2s is the
-  # historical fixed 10s lost window.
+  # (docs/heartbeat-cadence-and-scale.md). Omitting the whole block gives
+  # adaptive cadence at 2,500 beats/s: every fleet up to 2,500 nodes keeps
+  # the 2s floor and the historical 10s lost window (5 x 2s), and larger
+  # fleets back off along the ladder instead of flooding the leader.
   heartbeat = {
     # Missed beats before a node is lost. The lost window is ALWAYS this
     # times THAT node's own interval, so a 2s pool and a 60s pool get
     # 10s and 300s windows from one setting.
     missedBeatsBeforeLost = 5,
 
-    # Aggregate heartbeat rate this control plane will accept. When set, the
-    # manager computes each worker's interval from FLEET SIZE and serves it
-    # on the heartbeat reply, so cadence backs off as the fleet grows
-    # instead of healthy nodes being marked lost. Unset (the default) means
-    # nothing adapts — measure yours with `legion node cadence` first.
-    # targetRatePerSecond = 80,
+    # Adaptive cadence: the manager computes each worker's interval from
+    # FLEET SIZE and serves it on the heartbeat reply, so cadence backs off
+    # as the fleet grows instead of healthy nodes being marked lost. The
+    # served interval is a floor: a worker type with a slower
+    # `heartbeatSeconds` keeps its own cadence. `false` turns it off, and
+    # workers then keep their worker-type `heartbeatSeconds` at any size.
+    adaptive = true,
+
+    # Aggregate heartbeat rate the served interval is sized for:
+    # interval = ceil(headroom x nodes / rate), snapped to the ladder
+    # [2, 3, 5, 8, 13, 21, 34, 55, 89, 120]s. Lower it on a smaller
+    # control plane; measure yours with `legion node cadence`.
+    targetRatePerSecond = 2500,
 
     # Floor and ceiling on a served interval. Past the ceiling the manager
     # stops backing off and warns instead: the answer is more control plane.

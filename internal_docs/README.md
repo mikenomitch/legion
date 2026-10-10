@@ -109,6 +109,7 @@ When one is required and what goes in it:
 | [scheduler-performance-plan.md](plans/scheduler-performance-plan.md) | in execution |
 | [scheduler-architecture-review-plan.md](plans/scheduler-architecture-review-plan.md) | proposals accepted; D1/D4/D5/D6 graduated into the two plans below, D8's local slice into the heartbeat plan |
 | [plan-path-scale-levers-plan.md](plans/plan-path-scale-levers-plan.md) | shipped (D4/D5/D6, 2026-07-30; batch-as-a-transaction, 2026-08-03) |
+| [plan-path-fleet-scaling-plan.md](plans/plan-path-fleet-scaling-plan.md) | in execution (per-eval cost that grows with node count, from the 2026-10-09 campaign: 99 ms/eval at 10k vs 36 at 5k; Phases 1-3 done; Phase 4 removed the per-eval node lookup and O(jobs) SQL scans and instruments the whole eval, AWS re-run pending) |
 | [plan-apply-conflict-reduction-plan.md](plans/plan-apply-conflict-reduction-plan.md) | in execution (two-pass bind + candidate-list restoration + decorrelated tails landed; **measured on AWS 2026-08-04: rejections 31.9% -> 0%**, but throughput unchanged — see [aws-phase3-findings.md](aws-phase3-findings.md); the throughput half of that cell is retracted by [aws-phase4-findings.md](aws-phase4-findings.md), which found the rig measuring its own submission rate) |
 | [eval-path-raft-cost-plan.md](plans/eval-path-raft-cost-plan.md) | in execution (claim/complete fusion + batched enqueue + eval-loop batching landed; phase 5 — in-memory reprojection memo + audit hardening — landed 2026-08-06; the AWS re-measurement is not run) |
 | [jsonb-text-affinity-plan.md](plans/jsonb-text-affinity-plan.md) | shipped 2026-08-06 (every JSON column rebuilt to TEXT affinity; `STRING`/`TIMESTAMP` columns deliberately left NUMERIC — see the calls doc) |
@@ -116,7 +117,7 @@ When one is required and what goes in it:
 | [eval-thread-default-plan.md](plans/eval-thread-default-plan.md) | planned; **deliberately picks no number** (the 2026-08-05 sweep rose monotonically 177.27 → 251.68 alloc/s from 4 to 32 eval threads and its 64-thread cell was driver-bound, so `available_parallelism()` is wrong but the knee is unmeasured; Phase 0a is load-generator work and gates everything) |
 | [bounded-candidate-scoring-plan.md](plans/bounded-candidate-scoring-plan.md) | shipped (opt-in `score_sample`, 2026-07-30) |
 | [heartbeat-scale-plan.md](plans/heartbeat-scale-plan.md) | shipped (benchmark + batching + liveness + cadence, 2026-07-30) |
-| [heartbeat-cadence-at-scale-plan.md](plans/heartbeat-cadence-at-scale-plan.md) | **shipped** 2026-08-03 (sizing + freshness warning + per-node lost windows + opt-in adaptive cadence); the AWS reproduction is not run |
+| [heartbeat-cadence-at-scale-plan.md](plans/heartbeat-cadence-at-scale-plan.md) | **shipped** 2026-08-03 (sizing + freshness warning + per-node lost windows + adaptive cadence); phase 5, adaptive cadence **on by default** at 2,500 beats/s, shipped 2026-10-09; the AWS reproduction is not run |
 | [liveness-off-the-raft-path-plan.md](plans/liveness-off-the-raft-path-plan.md) | **shipped** 2026-08-03 (D8: heartbeats leave raft — leader-memory liveness, transitions-only replication, failover grace, digest, display checkpoint); phase 1's AWS measurement is not run |
 | [aws-comparative-benchmark-plan.md](plans/aws-comparative-benchmark-plan.md) | in execution (phases 0-2 run on real AWS; phases 3-5 blocked on the scheduler, not the rig — see [aws-phase2-findings.md](aws-phase2-findings.md)) |
 | [worker-simulation-plan.md](plans/worker-simulation-plan.md) | shipped (2026-07-30) |
@@ -183,6 +184,7 @@ by project impact. The full template and a worked example:
 - [nickel-config-language-plan_calls.md](calls/nickel-config-language-plan_calls.md)
 - [persistence-plan_calls.md](calls/persistence-plan_calls.md)
 - [plan-apply-conflict-reduction-plan_calls.md](calls/plan-apply-conflict-reduction-plan_calls.md)
+- [plan-path-fleet-scaling-plan_calls.md](calls/plan-path-fleet-scaling-plan_calls.md)
 - [plan-path-scale-levers-plan_calls.md](calls/plan-path-scale-levers-plan_calls.md)
 - [pre-benchmark-hardening_calls.md](calls/pre-benchmark-hardening_calls.md)
 - [preemption-and-eviction-plan_calls.md](calls/preemption-and-eviction-plan_calls.md)

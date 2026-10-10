@@ -79,7 +79,8 @@ flapping fleet shows both counters climbing.
 When many nodes go lost in one tick, Legion marks them in batches. Each tick
 uses one status-lane commit to record the losses, one control-lane commit to
 flip their availability, and one scheduler-lane commit to enqueue the
-reschedule evals, however many nodes dropped. Two more things limit the load:
+reschedule evals, however many nodes dropped. Three more things keep recovery
+cheap and complete:
 
 - **Only nodes that hold allocations get a reschedule eval.** A lost node with
   nothing on it costs nothing until something lands on it (re-checked every
@@ -89,6 +90,14 @@ reschedule evals, however many nodes dropped. Two more things limit the load:
   instead of queueing behind it. Recovery still proceeds, since the monitor
   re-drives it every tick, but it doesn't block submissions while it runs. An
   explicit `--priority` on a submission behaves as before.
+- **A replacement that loses a race is not dropped.** One lost node often
+  holds allocations from many jobs, and a fleet-wide loss fans out into
+  several reschedule evals that touch the same job. When two of them race,
+  one plan is rejected on the job's version fence. The losing replan retries
+  on a fresh snapshot, and if it keeps losing it hands the job to a
+  `job_reschedule` eval, which converges it like any other job-level eval.
+  Look for `Reconcile kept losing plan races; handing off to a
+  job_reschedule eval` in the manager log.
 
 ---
 

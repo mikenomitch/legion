@@ -3047,10 +3047,20 @@ message HeartbeatReply {
 
   // The interval, in seconds, the manager wants this worker to heartbeat at.
   //
-  // Present only when the manager runs adaptive cadence
-  // (`heartbeat.targetRatePerSecond` in the manager config); absent means
-  // "keep using your worker-type `heartbeatSeconds`", which is the default and
-  // reproduces Legion's historical behavior exactly.
+  // Present whenever the manager runs adaptive cadence, which is the default
+  // (`heartbeat.adaptive`, `heartbeat.targetRatePerSecond` in the manager
+  // config). The manager derives it from fleet size alone; at the defaults
+  // every fleet up to 2,500 nodes is served the 2s floor. Absent when the
+  // operator turned adaptive cadence off (`heartbeat.adaptive = false`) or
+  // the manager predates it, and absent means "use your worker-type
+  // `heartbeatSeconds`".
+  //
+  // The value is a FLOOR, not an override: a worker beats at the larger of
+  // this and its worker-type `heartbeatSeconds`, so a slow batch pool keeps
+  // its own cadence until the fleet grows past it. A manager that does not
+  // lead the status lane relays the interval it last learned from the leader
+  // in its liveness digest reply, so a worker gets the same answer from any
+  // manager.
   //
   // The manager derives this node's lost-node window from the SAME value
   // (`missedBeatsBeforeLost x interval`), so a worker that honors a slower
@@ -3426,8 +3436,9 @@ message GetHeartbeatCadenceReply {
   // left as a formula for the operator to evaluate mid-incident.
   uint32 suggested_heartbeat_seconds = 7;
 
-  // Whether `heartbeat.targetRatePerSecond` is set, i.e. whether the manager
-  // dictates cadence at all. Off by default.
+  // Whether the manager dictates cadence at all (`heartbeat.adaptive`). On by
+  // default; false when the operator set `heartbeat.adaptive = false`, in
+  // which case workers keep their worker-type `heartbeatSeconds`.
   bool adaptive_enabled = 8;
 
   // True when the controller wanted to back off further but hit
@@ -6491,6 +6502,14 @@ message NodeLivenessDigestReply {
   // The receiver's own view of who leads the status lane, as "host:port".
   // Empty when it does not know (mid-election).
   string leader_hint = 3;
+
+  // The heartbeat interval, in seconds, the status-lane leader is serving its
+  // workers. Set only on an accepted digest from a leader running adaptive
+  // cadence (the default). The sender serves the same value on its own
+  // heartbeat replies, so every worker gets one cadence whichever manager it
+  // talks to. Absent when the leader has adaptive cadence off or predates
+  // this field, and the sender then serves no interval either.
+  optional uint32 served_interval_seconds = 4;
 }
 
 // Request envelope for the three openraft protocol RPCs (AppendEntries,

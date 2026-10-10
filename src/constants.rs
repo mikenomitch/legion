@@ -99,6 +99,15 @@ pub const DEF_HEARTBEAT_MIN_INTERVAL_SEC: u64 = 2;
 /// Ceiling on a manager-served interval: past this the manager stops backing
 /// off and warns instead, because the answer is more control plane.
 pub const DEF_HEARTBEAT_MAX_INTERVAL_SEC: u64 = 120;
+/// Default aggregate heartbeat rate the manager sizes adaptive cadence for
+/// (`heartbeat.targetRatePerSecond`). With the default headroom of 2 the
+/// interval is `ceil(N / 1250)` seconds, so every fleet up to 2,500 nodes
+/// stays on the 2s floor and its historical 10s lost window, and the
+/// steady-state load never exceeds `rate / headroom` = 1,250 beats/s. That is
+/// about an eighth of the ~10,000 beats/s that took more than a core of a
+/// 4-vCPU leader on the AWS rig at 20k nodes, so the budget is deliberately
+/// small. See docs/heartbeat-cadence-and-scale.md.
+pub const DEF_HEARTBEAT_TARGET_RATE_PER_SECOND: f64 = 2500.0;
 /// Headroom factor in the sizing formula `heartbeatSeconds >= H x N / R`.
 /// 2 means "run at half the measured ceiling so a burst is not an outage".
 pub const DEF_HEARTBEAT_HEADROOM: f64 = 2.0;

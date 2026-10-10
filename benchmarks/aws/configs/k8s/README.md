@@ -11,20 +11,27 @@ Install flow (`scripts/install-k8s.sh`, phase 4 of the plan):
    the `.tpl` here), then `kubeadm join --control-plane` on cp-1/cp-2
    with the printed certificate key. CNI: none — no real pods run, and
    KWOK fakes pod IPs; the control plane itself runs with hostNetwork.
-2. Deploy the KWOK controller (release manifest, version pinned in
-   `scripts/versions.env`) onto the control plane (tolerating the
-   control-plane taint), then apply `kwok-stages.yaml`.
+2. Install kubectl on the loadgen box and copy the admin kubeconfig
+   there. KWOK is **not** deployed in-cluster: without a CNI the
+   control-plane nodes never go Ready, so a controller pod would never
+   schedule.
 3. Create fake nodes: `scripts/start-sim-fleet.sh k8s <total>` renders
    one Node object per fake node from `kwok-node.yaml.tpl`, shaped from
-   the same `node_profiles` file every system uses, labeled
-   `type=kwok` and tainted `kwok.x-k8s.io/node=fake:NoSchedule`. The
-   translated Deployments carry the matching nodeSelector + toleration,
-   so campaign pods land only on fake nodes.
+   the same `node_profiles` file every system uses, labeled `type=kwok`
+   and `bench-slice=<i>`, and tainted `kwok.x-k8s.io/node=fake:NoSchedule`.
+   It then runs one KWOK controller per worker instance
+   (`kwok-slice.service`), each managing only its own slice, so the storm
+   drill can kill a slice by stopping one unit. The controllers run the
+   release's `stage-fast.yaml` (KWOK 0.8 has no built-in stages): pods go
+   Running immediately and node leases are heartbeated.
+   `kwok-stages.yaml` here is the older equivalent, kept for reference
+   and not applied.
 4. Scrape metrics: the install script creates a `bench-metrics`
    ServiceAccount with the `system:monitoring` clusterrole, extracts a
    token, and appends an HTTPS scrape job for the scheduler (:10259),
    apiserver (:6443), and etcd to the loadgen Prometheus.
 
-The fairness record captures: kubeadm/K8s version, KWOK version, the
-rendered kubeadm config, and the explicit note that
-`percentageOfNodesToScore` (and every other scheduler knob) is default.
+The fairness record captures the kubeadm/K8s version, the KWOK version,
+and the rendered kubeadm config. That config raises the scheduler's and
+controller-manager's API client QPS (see its header for why) and leaves
+every scheduling and eviction knob at its default.

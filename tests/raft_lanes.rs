@@ -1926,13 +1926,20 @@ fn worker_liveness_reaches_the_status_leader_by_digest() -> R<()> {
     );
 
     // One RPC carries every id mgr-a heard from to the status-lane leader.
+    // The reply carries the leader's served heartbeat interval, so mgr-a can
+    // serve the same adaptive cadence to the workers attached to it.
+    b.store()
+        .liveness()
+        .set_served_interval(Some(Duration::from_secs(21)));
     let seen = a.store().liveness().drain_pending_digest();
     assert_eq!(seen, vec!["digest-node".to_string()]);
     let outcome = rt.block_on(a.store().report_node_liveness("mgr-a", seen));
     assert_eq!(
         outcome,
-        legion::storage::liveness::DigestOutcome::Accepted,
-        "the status-lane leader must accept a peer's liveness digest"
+        legion::storage::liveness::DigestOutcome::Accepted {
+            served_interval: Some(Duration::from_secs(21)),
+        },
+        "the status-lane leader must accept a peer's liveness digest and relay its cadence"
     );
     assert!(
         b.store().liveness().last_beat("digest-node").is_some(),

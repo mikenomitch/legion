@@ -174,6 +174,23 @@ still be happy with at ten thousand nodes.
 
 ### Fast
 
+In initial benchmarking on AWS, against Nomad and Kubernetes on the same
+three control-plane boxes, Legion placed several times as many allocations
+per second and kept most of that rate out to 20,000 nodes:
+
+| Nodes  | Legion  | Nomad 2.0.5    | Kubernetes 1.36.5 |
+| ------ | ------- | -------------- | ----------------- |
+| 1,000  | **829** | 122            | 117               |
+| 5,000  | **905** | failed         | 53                |
+| 20,000 | **553** | -              | -                 |
+
+Allocations placed per second, `web_fleet` workload on simulated nodes.
+Legion also finished a 250,000-allocation burst on 50,000 nodes. Below
+saturation, a job's allocations land in about 20ms at the median, even on
+20,000 nodes. When a quarter of a 5,000-node fleet died at once, Legion
+replaced every orphaned allocation in 27 seconds, against 111 for Nomad.
+See [Benchmarks](docs/benchmarks.md) for the full tables and methodology.
+
 - **No etcd bottleneck.** The scheduler plans against in-memory state and
   writes to SQLite (or Raft), so throughput is not capped by a separate
   key-value store.
@@ -183,10 +200,10 @@ still be happy with at ten thousand nodes.
   task on its own. [Late-binding plan apply](docs/late-binding-plan-apply.md)
   stops concurrent submits from fighting over the same node.
 - **Heartbeats that adapt to the fleet.** With
-  [adaptive cadence](docs/heartbeat-cadence-and-scale.md), the manager
-  stretches each worker's check-in interval as the fleet grows, so a busy
-  control plane doesn't mistake healthy nodes for dead ones. A circuit
-  breaker refuses to mark half the fleet lost in one tick.
+  [adaptive cadence](docs/heartbeat-cadence-and-scale.md), on by default,
+  the manager stretches each worker's check-in interval as the fleet grows,
+  so a busy control plane doesn't mistake healthy nodes for dead ones. A
+  circuit breaker refuses to mark half the fleet lost in one tick.
 - **Start work before consensus.** [Edge boot](docs/edge-boot.md) lets a
   worker boot a workload before its placement is durable, or authorize the
   start on its own from a short-lived ticket. The durable commit still
@@ -305,7 +322,8 @@ start:
   [Metrics](docs/metrics.md) · [Observability](docs/observability.md)
 - **Extending Legion:** [Plugin System](docs/plugin-system.md) ·
   [Codebase Conventions](docs/codebase-conventions.md) ·
-  [Testing and Benchmarks](docs/testing-and-benchmarks.md)
+  [Testing and Benchmarks](docs/testing-and-benchmarks.md) ·
+  [Benchmarks](docs/benchmarks.md)
 
 More example job specs live in [`configs/jobs/`](configs/jobs/).
 

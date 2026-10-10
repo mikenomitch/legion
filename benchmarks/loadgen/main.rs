@@ -46,7 +46,7 @@
 //!
 //! ```text
 //! legion-loadgen --workload-dir <dir> --out <submits.json> \
-//!     [--manager http://host:4747] [--concurrency 128] [--connections 4] \
+//!     [--manager http://host:4747] [--concurrency 128] [--connections 4] [--rate 0] \
 //!     [--gap-ms 0] [--clock-offset-ms 0]
 //! ```
 //!
@@ -204,6 +204,19 @@ fn cli() -> Command {
                 .help("Sleep this long in each slot after a submit (paced runs)"),
         )
         .arg(
+            Arg::new("rate")
+                .long("rate")
+                .value_parser(clap::value_parser!(f64))
+                .default_value("0")
+                .help(
+                    "Open-loop arrival rate in jobs/sec. Job i is sent at \
+                     start + i/rate whatever the manager's latency, so a cell \
+                     paced below capacity measures submit-to-placed latency \
+                     instead of queue drain. 0 (the default) sends as fast \
+                     as --concurrency allows.",
+                ),
+        )
+        .arg(
             Arg::new("clock-offset-ms")
                 .long("clock-offset-ms")
                 .allow_hyphen_values(true)
@@ -237,10 +250,14 @@ async fn run(matches: &clap::ArgMatches) -> Result<()> {
     let connections = *matches.get_one::<usize>("connections").unwrap();
     let gap_ms = *matches.get_one::<u64>("gap-ms").unwrap();
     let clock_offset_ms = *matches.get_one::<i64>("clock-offset-ms").unwrap();
+    let rate = *matches.get_one::<f64>("rate").unwrap();
     let quiet = matches.get_flag("quiet");
 
     if concurrency == 0 || connections == 0 {
         bail!("--concurrency and --connections must both be at least 1");
+    }
+    if !rate.is_finite() || rate < 0.0 {
+        bail!("--rate must be a non-negative number of jobs/sec");
     }
 
     let jobs = prepare_jobs(&workload_dir)?;
@@ -304,6 +321,13 @@ async fn run(matches: &clap::ArgMatches) -> Result<()> {
             let mut client = clients[index % clients.len()].clone();
             let submitted = Arc::clone(&submitted);
             async move {
+                // Open-loop pacing: wait for this job's scheduled send time.
+                // The schedule is fixed up front, so a slow reply delays
+                // nothing else as long as --concurrency covers rate x latency.
+                if rate > 0.0 {
+                    let due = started + std::time::Duration::from_secs_f64(index as f64 / rate);
+                    tokio::time::sleep_until(tokio::time::Instant::from_std(due)).await;
+                }
                 // Stamped immediately before the call, inside the slot, so the
                 // submit -> placed latency does not absorb this stream's own
                 // queueing. Same rule as the driver's `record_submit`.
@@ -364,6 +388,7 @@ async fn run(matches: &clap::ArgMatches) -> Result<()> {
         "elapsed_secs": round3(seconds),
         "rate_per_sec": if seconds > 0.0 { round2(records.len() as f64 / seconds) } else { 0.0 },
         "concurrency": concurrency,
+        "target_rate_per_sec": rate,
         "connections": connections,
         "deduplicated": deduplicated,
         // Replies that said the job config was already current. Each one is an

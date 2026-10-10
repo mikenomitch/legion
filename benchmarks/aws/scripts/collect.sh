@@ -105,6 +105,28 @@ snapshot raft_propose_apply_mean 'sum by (lane) (rate(legion_raft_propose_apply_
 snapshot store_write_lock_wait_p99 'histogram_quantile(0.99, sum by (le) (rate(legion_store_write_lock_wait_seconds_bucket[1m])))'
 snapshot store_read_lock_wait_p99 'histogram_quantile(0.99, sum by (le) (rate(legion_store_read_lock_wait_seconds_bucket[1m])))'
 snapshot evals_processed 'sum by (kind, outcome) (legion_evals_processed_total)'
+# Plans thrown away because the read model moved mid-plan, then re-run
+# with the eager O(fleet) sample. Measured after the fact at 27% of plans
+# at 5,000 nodes and 55% at 10,000 (plan-path-fleet-scaling-plan.md § 5.1);
+# archived per cell so that number never again has to be recovered by hand.
+snapshot lazy_sample_fallback 'sum(legion_scheduler_lazy_sample_fallback_total)'
+# Whole-eval time, not just planning. The plan-phase histogram covers
+# planning only, so before this the time an eval spent outside planning
+# (dispatch, follow-ups, settling the batch) could only be inferred from
+# throughput (plan-path-fleet-scaling-plan.md § 5.6).
+snapshot eval_handle_mean 'sum by (kind) (rate(legion_eval_handle_seconds_sum[1m])) / sum by (kind) (rate(legion_eval_handle_seconds_count[1m]))'
+snapshot eval_handle_p99 'histogram_quantile(0.99, sum by (kind, le) (rate(legion_eval_handle_seconds_bucket[1m])))'
+snapshot index_queries 'sum by (index, outcome) (rate(legion_scheduler_index_queries_total[1m]))'
+# Where an eval's wall time goes outside plan() (plan-path-fleet-scaling
+# plan, Phase 4): handler phases including the blocking-pool queue wait and
+# conflict backoff, the claim/settle queue rounds, the read-model lock, and
+# how often the cached node set is rebuilt.
+snapshot eval_phase_mean 'sum by (kind, phase) (rate(legion_eval_phase_seconds_sum[1m])) / sum by (kind, phase) (rate(legion_eval_phase_seconds_count[1m]))'
+snapshot eval_phase_rate 'sum by (kind, phase) (rate(legion_eval_phase_seconds_count[1m]))'
+snapshot eval_queue_round_mean 'sum by (op) (rate(legion_eval_queue_round_seconds_sum[1m])) / sum by (op) (rate(legion_eval_queue_round_seconds_count[1m]))'
+snapshot read_model_lock_wait_mean 'sum by (mode) (rate(legion_store_read_model_lock_wait_seconds_sum[1m])) / sum by (mode) (rate(legion_store_read_model_lock_wait_seconds_count[1m]))'
+snapshot read_model_lock_wait_p99 'histogram_quantile(0.99, sum by (mode, le) (rate(legion_store_read_model_lock_wait_seconds_bucket[1m])))'
+snapshot node_list_rebuilds 'rate(legion_scheduler_node_list_rebuilds_total[1m])'
 # The group commit, which is the difference between paying plan-apply cost
 # per plan and per batch. It only engages when a second eval thread reaches
 # the coalescer while a commit is in flight, so the expected batch size is
@@ -132,6 +154,13 @@ snapshot nodes 'legion_nodes'
 # defaults), and the suppression counters say whether the manager was
 # declining to act on losses it saw. Read these before quoting a cell.
 snapshot heartbeat_freshness 'legion_heartbeat_freshness_ratio'
+# The cadence the cell actually ran at. Adaptive cadence is on by default,
+# so the served interval moves with fleet size (2s up to 2,500 nodes, 21s
+# at 20k at the default 2,500/s target), and a throughput number is not
+# quotable without it (docs/heartbeat-cadence-and-scale.md, "Benchmark
+# fairness"). Reported by the status-lane leader only; others read zero.
+snapshot heartbeat_served_interval 'max(legion_heartbeat_served_interval_seconds)'
+snapshot heartbeat_lost_window 'max(legion_heartbeat_lost_window_seconds)'
 snapshot liveness_tracked_nodes 'legion_liveness_tracked_nodes'
 snapshot liveness_loss_suppressed 'sum by (reason) (rate(legion_liveness_loss_suppressed_total[1m]))'
 snapshot grpc_p99 'histogram_quantile(0.99, sum by (method, le) (rate(legion_grpc_request_duration_seconds_bucket[1m])))'

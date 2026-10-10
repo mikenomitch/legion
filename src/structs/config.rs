@@ -9,11 +9,12 @@ pub const DEF_SCHEDULER_AUTO_ANTI_AFFINITY_WEIGHT: f64 = 0.2;
 use crate::prelude::{
     bail, default_raft_data_dir, default_store_path, Context, DEF_EVAL_PRIORITY,
     DEF_HEARTBEAT_HEADROOM, DEF_HEARTBEAT_MAX_INTERVAL_SEC, DEF_HEARTBEAT_MIN_INTERVAL_SEC,
-    DEF_KV_DEBOUNCE_MS, DEF_LIVENESS_CHECKPOINT_INTERVAL_SEC, DEF_LIVENESS_DIGEST_INTERVAL_SEC,
-    DEF_LIVENESS_FAILOVER_GRACE_SEC, DEF_LIVENESS_PEER_DIGEST_GRACE_SEC, DEF_MANAGER_HOSTNAME,
-    DEF_MANAGER_INSECURE_PORT, DEF_MANAGER_SERVER_PORT, DEF_MISSED_BEATS_BEFORE_LOST,
-    DEF_ROLLOUT_RETENTION_DAYS, DEF_SCHEDULING_POLICY, DEF_WORKER_CHECK_SEC,
-    DEF_WORKER_CONFIG_PATH, MIN_LIVENESS_CHECKPOINT_INTERVAL_SEC, R,
+    DEF_HEARTBEAT_TARGET_RATE_PER_SECOND, DEF_KV_DEBOUNCE_MS, DEF_LIVENESS_CHECKPOINT_INTERVAL_SEC,
+    DEF_LIVENESS_DIGEST_INTERVAL_SEC, DEF_LIVENESS_FAILOVER_GRACE_SEC,
+    DEF_LIVENESS_PEER_DIGEST_GRACE_SEC, DEF_MANAGER_HOSTNAME, DEF_MANAGER_INSECURE_PORT,
+    DEF_MANAGER_SERVER_PORT, DEF_MISSED_BEATS_BEFORE_LOST, DEF_ROLLOUT_RETENTION_DAYS,
+    DEF_SCHEDULING_POLICY, DEF_WORKER_CHECK_SEC, DEF_WORKER_CONFIG_PATH,
+    MIN_LIVENESS_CHECKPOINT_INTERVAL_SEC, R,
 };
 use crate::structs::workload_identity::NodeIdentityConfig;
 
@@ -336,24 +337,29 @@ impl From<EncryptionConfigFull> for EncryptionConfig {
 /// Heartbeat cadence and node liveness windows
 /// (docs/heartbeat-cadence-and-scale.md).
 ///
-/// Omitting the whole block reproduces Legion's historical behavior exactly:
-/// workers keep their worker-type `heartbeatSeconds`, nothing adapts, and
-/// `missedBeatsBeforeLost: 5` x the 2s default is the historical fixed 10s
-/// lost window.
+/// Omitting the whole block gives adaptive cadence at the default
+/// `targetRatePerSecond` (2,500/s): fleets up to 2,500 nodes keep the 2s
+/// floor and the historical 10s lost window, and larger fleets back off
+/// along the ladder. `adaptive: false` restores the old fixed behavior,
+/// where workers keep their worker-type `heartbeatSeconds` and nothing
+/// adapts.
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct HeartbeatConfig {
+    /// Whether the manager sizes the heartbeat interval from fleet size and
+    /// serves it to workers. Default `true`. `false` is the explicit opt-out:
+    /// workers keep their worker-type `heartbeatSeconds`, nothing adapts, and
+    /// `targetRatePerSecond` is ignored.
+    #[serde(default)]
+    pub adaptive: Option<bool>,
     /// Aggregate heartbeat rate this control plane will accept, per second.
     ///
-    /// When set, the manager computes each worker's interval from FLEET SIZE
+    /// The manager computes each worker's interval from FLEET SIZE
     /// (`headroom x nodes / rate`) and serves it on the heartbeat reply, so
     /// cadence backs off as the fleet grows instead of healthy nodes being
-    /// marked lost. Unset (the default) means workers keep their worker-type
-    /// `heartbeatSeconds` and nothing adapts.
-    ///
-    /// Off by default on purpose: a system that quietly slows its own
-    /// heartbeats to score better on a throughput benchmark is cheating.
-    /// Measure yours with `legion node cadence`.
+    /// marked lost. Default 2,500, which keeps every fleet up to 2,500 nodes
+    /// on the 2s floor. Lower it for a smaller control plane; measure yours
+    /// with `legion node cadence`.
     #[serde(default)]
     pub target_rate_per_second: Option<f64>,
     /// Floor on the served interval, never crossed however small the fleet.
@@ -375,11 +381,22 @@ pub struct HeartbeatConfig {
     pub headroom: Option<f64>,
 }
 
+fn default_heartbeat_adaptive() -> bool {
+    true
+}
+
+fn default_heartbeat_target_rate() -> f64 {
+    DEF_HEARTBEAT_TARGET_RATE_PER_SECOND
+}
+
 /// Resolved [`HeartbeatConfig`].
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct HeartbeatConfigFull {
-    pub target_rate_per_second: Option<f64>,
+    #[serde(default = "default_heartbeat_adaptive")]
+    pub adaptive: bool,
+    #[serde(default = "default_heartbeat_target_rate")]
+    pub target_rate_per_second: f64,
     pub min_interval: String,
     pub max_interval: String,
     pub missed_beats_before_lost: u32,
@@ -389,7 +406,8 @@ pub struct HeartbeatConfigFull {
 impl Default for HeartbeatConfigFull {
     fn default() -> Self {
         HeartbeatConfigFull {
-            target_rate_per_second: None,
+            adaptive: true,
+            target_rate_per_second: DEF_HEARTBEAT_TARGET_RATE_PER_SECOND,
             min_interval: format!("{DEF_HEARTBEAT_MIN_INTERVAL_SEC}s"),
             max_interval: format!("{DEF_HEARTBEAT_MAX_INTERVAL_SEC}s"),
             missed_beats_before_lost: DEF_MISSED_BEATS_BEFORE_LOST,
@@ -402,7 +420,10 @@ impl HeartbeatConfig {
     pub fn with_defaults(&self) -> HeartbeatConfigFull {
         let defaults = HeartbeatConfigFull::default();
         HeartbeatConfigFull {
-            target_rate_per_second: self.target_rate_per_second,
+            adaptive: self.adaptive.unwrap_or(defaults.adaptive),
+            target_rate_per_second: self
+                .target_rate_per_second
+                .unwrap_or(defaults.target_rate_per_second),
             min_interval: self.min_interval.clone().unwrap_or(defaults.min_interval),
             max_interval: self.max_interval.clone().unwrap_or(defaults.max_interval),
             missed_beats_before_lost: self
@@ -416,7 +437,8 @@ impl HeartbeatConfig {
 impl From<HeartbeatConfigFull> for HeartbeatConfig {
     fn from(val: HeartbeatConfigFull) -> Self {
         HeartbeatConfig {
-            target_rate_per_second: val.target_rate_per_second,
+            adaptive: Some(val.adaptive),
+            target_rate_per_second: Some(val.target_rate_per_second),
             min_interval: Some(val.min_interval),
             max_interval: Some(val.max_interval),
             missed_beats_before_lost: Some(val.missed_beats_before_lost),
@@ -440,22 +462,24 @@ impl HeartbeatConfigFull {
         )
     }
 
-    /// Whether the manager dictates cadence at all.
+    /// Whether the manager dictates cadence at all. On by default;
+    /// `heartbeat.adaptive = false` turns it off.
     pub fn adaptive_enabled(&self) -> bool {
-        self.target_rate_per_second.is_some_and(|rate| rate > 0.0)
+        self.adaptive
     }
 
     /// Reject configurations whose numbers cannot hold together, naming the
     /// offending values. Checked at manager startup, not discovered later as
     /// a fleet that will not converge.
     pub fn validate(&self) -> R<()> {
-        if let Some(rate) = self.target_rate_per_second {
-            if !(rate.is_finite() && rate > 0.0) {
-                bail!(
-                    "heartbeat.targetRatePerSecond must be a positive number (got {rate}); \
-                     omit it entirely to disable adaptive cadence"
-                );
-            }
+        // Checked even with `adaptive = false`, so flipping adaptive back on
+        // can never surface a latent bad rate at the next restart.
+        let rate = self.target_rate_per_second;
+        if !(rate.is_finite() && rate > 0.0) {
+            bail!(
+                "heartbeat.targetRatePerSecond must be a positive number (got {rate}); \
+                 set heartbeat.adaptive = false to turn adaptive cadence off"
+            );
         }
         if self.missed_beats_before_lost == 0 {
             bail!(
@@ -2298,6 +2322,86 @@ mod tests {
         assert_eq!(parse_byte_size("1.5KiB")?, 1536);
         assert!(parse_byte_size("10XB").is_err());
         assert!(parse_byte_size("abc").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn adaptive_heartbeat_cadence_is_on_by_default_test() {
+        // A cluster that sets nothing, an empty block, and an absent block
+        // all resolve to adaptive cadence at the default rate
+        // (docs/heartbeat-cadence-and-scale.md).
+        let full = ManagerConfigFull::default().heartbeat;
+        assert!(full.adaptive_enabled());
+        assert_eq!(
+            full.target_rate_per_second,
+            DEF_HEARTBEAT_TARGET_RATE_PER_SECOND
+        );
+        assert_eq!(full.target_rate_per_second, 2500.0);
+        assert_eq!(HeartbeatConfig::default().with_defaults(), full);
+        let empty: ManagerConfig =
+            serde_json::from_value(serde_json::json!({})).expect("an empty manager config parses");
+        assert_eq!(empty.with_defaults().heartbeat, full);
+        assert!(full.validate().is_ok());
+    }
+
+    #[test]
+    fn shipped_manager_config_resolves_to_the_default_cadence_test() -> R<()> {
+        // configs/manager.ncl spells the heartbeat defaults out; they must
+        // be the same defaults an absent block gets.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("configs/manager.ncl");
+        let json = crate::config_lang::eval_file(path)?;
+        let config: ManagerConfig = serde_json::from_str(&json)?;
+        assert_eq!(
+            config.with_defaults().heartbeat,
+            HeartbeatConfigFull::default()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn heartbeat_adaptive_false_is_the_explicit_opt_out_test() -> R<()> {
+        let config: HeartbeatConfig = serde_json::from_value(serde_json::json!({
+            "adaptive": false,
+        }))?;
+        let full = config.with_defaults();
+        assert!(!full.adaptive_enabled());
+        assert!(full.validate().is_ok());
+
+        // Turning adaptive off while leaving a rate in place is legal, so the
+        // switch is a one-line edit in both directions.
+        let config: HeartbeatConfig = serde_json::from_value(serde_json::json!({
+            "adaptive": false,
+            "targetRatePerSecond": 80,
+        }))?;
+        let full = config.with_defaults();
+        assert!(!full.adaptive_enabled());
+        assert_eq!(full.target_rate_per_second, 80.0);
+        Ok(())
+    }
+
+    #[test]
+    fn heartbeat_target_rate_parses_and_rejects_non_positive_values_test() -> R<()> {
+        let config: HeartbeatConfig = serde_json::from_value(serde_json::json!({
+            "targetRatePerSecond": 80,
+        }))?;
+        let full = config.with_defaults();
+        assert!(full.adaptive_enabled());
+        assert_eq!(full.target_rate_per_second, 80.0);
+
+        // Zero is not an off switch: the error names the one that is.
+        let zero: HeartbeatConfig =
+            serde_json::from_value(serde_json::json!({ "targetRatePerSecond": 0 }))?;
+        let message = format!("{:#}", zero.with_defaults().validate().expect_err("zero"));
+        assert!(message.contains("adaptive = false"), "{message}");
+
+        // The wire form `GetManagerConfigs` serves round-trips the switch.
+        let off = HeartbeatConfig {
+            adaptive: Some(false),
+            ..HeartbeatConfig::default()
+        }
+        .with_defaults();
+        let round_tripped: HeartbeatConfig = off.clone().into();
+        assert_eq!(round_tripped.with_defaults(), off);
         Ok(())
     }
 

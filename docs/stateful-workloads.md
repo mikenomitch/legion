@@ -161,6 +161,15 @@ Validation rules (enforced at `job validate` and submit time):
   60-second batch cadence would need `selfTerminateAfter` raised well past its
   300-second window.
 
+  Adaptive cadence (on by default) is not covered by that startup check. At
+  the default `targetRatePerSecond`, a fleet past about 16,250 nodes is
+  served 21s, so its window (105s) passes the 90s fence. A healthy worker
+  still beats every 21s and only fences after about 70 seconds of failed
+  retries, but the margin shrinks with every rung, and past about 68,750
+  nodes the served interval itself nears the fence. See the known
+  limitations in
+  [heartbeat-cadence-and-scale.md](heartbeat-cadence-and-scale.md#known-limitations).
+
 ### Seed list (`initialInstances`) semantics
 
 `stateful.initialInstances` (keyed mode only) is a **seed list**. It is not a

@@ -166,6 +166,15 @@ service. During a rolling manager upgrade, the plane tolerates skew:
   old manager leading the status lane while a new one holds the display
   checkpoint is the one unsafe combination. It resolves within one lost
   window. See [node-liveness.md](node-liveness.md).
+- Adaptive heartbeat cadence is on by default, and the leader relays its
+  served interval to the other managers on the liveness digest reply. An
+  older manager neither relays nor serves an interval, so workers attached
+  to it keep their worker-type `heartbeatSeconds` until it is upgraded. The
+  leader still widens their lost windows, so nobody is marked lost for it.
+  A cluster that upgrades from a release where adaptive cadence was off
+  sees no change up to 2,500 nodes. Set `heartbeat = { adaptive = false }`
+  before upgrading to keep the fixed cadence at any size. See
+  [heartbeat-cadence-and-scale.md](heartbeat-cadence-and-scale.md#upgrading-to-adaptive-by-default).
 - Payloads inside the transport are versioned by `PROTOCOL_VERSION`.
   Payloads that cannot be decoded produce an error that names mixed
   manager protocol versions.

@@ -59,8 +59,8 @@ pub fn dispatch_allocations(store: &Store, allocations: &[Allocation]) -> R<()> 
         return Ok(());
     }
 
-    let mut task_cache: HashMap<String, HashMap<i64, TaskConfig>> = HashMap::new();
-    let mut node_cache: HashMap<String, crate::structs::Node> = HashMap::new();
+    let mut task_cache: HashMap<String, Arc<Vec<(i64, TaskConfig)>>> = HashMap::new();
+    let mut node_cache: HashMap<String, Arc<crate::structs::Node>> = HashMap::new();
 
     // Requests are built first, synchronously: it is all local store reads,
     // a build failure is a real error that must fail the eval, and the
@@ -70,21 +70,31 @@ pub fn dispatch_allocations(store: &Store, allocations: &[Allocation]) -> R<()> 
     let mut clients: HashMap<String, WorkerClient<Channel>> = HashMap::new();
 
     for allocation in allocations {
-        let tasks = task_cache
-            .entry(allocation.job_config_id.clone())
-            .or_default();
-        if tasks.is_empty() {
-            let task_configs = store.get_task_configs_for_job_config(&allocation.job_config_id)?;
-            for (id, config) in task_configs {
-                tasks.insert(id, config);
-            }
+        if !task_cache.contains_key(&allocation.job_config_id) {
+            // The read model's shared list: task configs are immutable per
+            // `job_config_id`, and this used to be a SQL query (plus row
+            // parsing) per eval on the leader's read pool.
+            let task_configs =
+                store.shared_task_configs_for_job_config(&allocation.job_config_id)?;
+            task_cache.insert(allocation.job_config_id.clone(), task_configs);
         }
-        let task = tasks
-            .get(&allocation.task_config_id)
+        let task = task_cache
+            .get(&allocation.job_config_id)
+            .and_then(|tasks| {
+                tasks
+                    .iter()
+                    .find(|(id, _)| *id == allocation.task_config_id)
+                    .map(|(_, task)| task)
+            })
             .with_context(|| format!("Missing task config {}", allocation.task_config_id))?;
 
         if !node_cache.contains_key(&allocation.node_id) {
-            let node = store.get_node(&allocation.node_id)?;
+            // The read model's `Arc` (a refcount bump) instead of a SQL row
+            // read and a JSON parse of every attribute bag per placed node.
+            let node = match store.cached_node(&allocation.node_id)? {
+                Some(node) => node,
+                None => Arc::new(store.get_node(&allocation.node_id)?),
+            };
             node_cache.insert(allocation.node_id.clone(), node);
         }
         let node = node_cache
@@ -247,7 +257,7 @@ pub fn dispatch_speculative(
     // before touching anything else when no task opted in. That early return
     // is what keeps `mode: 'off'` — every job today — free on the plan path:
     // a non-speculative plan does one cache lookup and nothing more.
-    let tasks = match store.cached_task_configs_for_job_config(job_config_id) {
+    let tasks = match store.shared_task_configs_for_job_config(job_config_id) {
         Ok(tasks) => tasks,
         Err(err) => {
             debug!(%job_config_id, error = ?err, "Speculative dispatch skipped; task configs unavailable");

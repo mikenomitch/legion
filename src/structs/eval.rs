@@ -1,6 +1,6 @@
 use rand::Rng;
 use std::collections::HashSet;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::{cmp, thread};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
@@ -25,6 +25,16 @@ use super::job::{JobConfig, TaskConfig, TaskCount};
 use super::ledger::LedgerEntry;
 #[cfg(test)]
 use super::Submission;
+
+/// Record one handler phase into `legion_eval_phase_seconds{kind, phase}`
+/// (docs/metrics.md). The phases of a placing eval partition
+/// `legion_eval_handle_seconds`, so the time an eval spends outside its
+/// plan is attributable instead of a derived remainder.
+fn observe_phase(kind: &str, phase: &str, elapsed: Duration) {
+    crate::manager::telemetry::metrics()
+        .eval_phase_seconds
+        .observe(&[kind, phase], elapsed.as_secs_f64());
+}
 
 impl Eval {
     pub fn handle(&self, store: &Store) -> R<String> {
@@ -52,9 +62,22 @@ impl Eval {
 
         let node_id = node_id.to_owned();
         let last_heartbeat = Self::current_timestamp();
-        let nodes = store.get_nodes()?;
+        // One keyed lookup, not a read of every node row: this eval used to
+        // load the whole fleet to answer "does this node exist".
+        let exists = match store.get_node(&node_id) {
+            Ok(_) => true,
+            Err(error)
+                if matches!(
+                    StorageError::from_anyhow(&error),
+                    Some(StorageError::NotFound { .. })
+                ) =>
+            {
+                false
+            }
+            Err(error) => return Err(error),
+        };
 
-        if nodes.iter().any(|node| node.id == node_id) {
+        if exists {
             store.mark_node_ready(&node_id, &last_heartbeat)?;
         } else {
             let node = Node {
@@ -129,25 +152,30 @@ impl Eval {
     }
 
     fn handle_job_submit(&self, store: &Store) -> R<String> {
+        let prepare_started = Instant::now();
         let previous_config_id = store.previous_job_config_id(&self.job_config_id)?;
         if let Some(prev_id) = previous_config_id.as_ref() {
             if store.job_configs_schedule_equivalent(prev_id, &self.job_config_id)? {
                 store.migrate_allocations_to_job_config(prev_id, &self.job_config_id)?;
                 self.schedule_batch_follow_up(store)?;
+                observe_phase(&self.kind, "prepare", prepare_started.elapsed());
                 return Ok(format!("Job {} submitted with 0 placements", self.job_id));
             }
         }
+        observe_phase(&self.kind, "prepare", prepare_started.elapsed());
 
         let outcome = self.schedule_job_allocations(store, PlanMode::Fresh)?;
         if !outcome.deltas.is_empty() {
             info!(?outcome.deltas, "Job submit allocation deltas");
         }
 
+        let finish_started = Instant::now();
         if let Some(prev_id) = previous_config_id {
             store.remove_allocs_for_job_config(&prev_id)?;
         }
 
         self.schedule_batch_follow_up(store)?;
+        observe_phase(&self.kind, "finish", finish_started.elapsed());
 
         Ok(format!(
             "Job {} submitted with {} placements",
@@ -167,15 +195,19 @@ impl Eval {
         // rejected (foreign-lane leader under `lanes`), the eval fails
         // before any churn and is released for retry. Clearing an unset
         // marker is a no-op (this eval also runs for batch re-schedules).
+        let prepare_started = Instant::now();
         store.clear_job_restart_request(&self.job_id)?;
 
         store.remove_allocs_for_job(&self.job_id)?;
+        observe_phase(&self.kind, "prepare", prepare_started.elapsed());
         let outcome = self.schedule_job_allocations(store, PlanMode::Fresh)?;
         if !outcome.deltas.is_empty() {
             info!(?outcome.deltas, "Job update allocation deltas");
         }
 
+        let finish_started = Instant::now();
         self.schedule_batch_follow_up(store)?;
+        observe_phase(&self.kind, "finish", finish_started.elapsed());
 
         Ok(format!(
             "Job {} updated with {} placements",
@@ -261,7 +293,9 @@ impl Eval {
             info!(?outcome.deltas, "Job reschedule allocation deltas");
         }
 
+        let finish_started = Instant::now();
         self.schedule_batch_follow_up(store)?;
+        observe_phase(&self.kind, "finish", finish_started.elapsed());
 
         Ok(format!(
             "Job {} rescheduled with {} placements",
@@ -283,7 +317,9 @@ impl Eval {
             bail!("Eval job_scale missing identifiers");
         }
 
+        let prepare_started = Instant::now();
         let retired = store.retire_surplus_allocations(&self.job_config_id)?;
+        observe_phase(&self.kind, "prepare", prepare_started.elapsed());
         let outcome = self.schedule_job_allocations(store, PlanMode::Reschedule)?;
         if !outcome.deltas.is_empty() {
             info!(?outcome.deltas, "Job scale allocation deltas");
@@ -302,12 +338,16 @@ impl Eval {
             bail!("Eval missing job config id");
         }
 
+        let init_started = Instant::now();
         let scheduler = Scheduler::new(store)?;
+        observe_phase(&self.kind, "scheduler_init", init_started.elapsed());
         let excluded = self.excluded_nodes_for_mode(&mode);
         let outcome =
             self.plan_with_conflict_retries(store, &scheduler, mode, excluded.as_ref())?;
 
+        let dispatch_started = Instant::now();
         dispatch_allocations(store, &outcome.allocations)?;
+        observe_phase(&self.kind, "dispatch", dispatch_started.elapsed());
         Ok(outcome)
     }
 
@@ -330,6 +370,17 @@ impl Eval {
         let backoff = Self::plan_conflict_backoff_settings(store);
         let mut conflict_count = 0usize;
         let mut total_backoff_delay = Duration::from_millis(0);
+        // Every attempt counts toward `plan`, rejected ones included; the
+        // sleeps between attempts are `conflict_backoff`. Before this split
+        // a rejected attempt and its backoff were visible nowhere but the
+        // handler's total.
+        let started = Instant::now();
+        let observe = |slept: Duration| {
+            observe_phase(&self.kind, "plan", started.elapsed().saturating_sub(slept));
+            if !slept.is_zero() {
+                observe_phase(&self.kind, "conflict_backoff", slept);
+            }
+        };
 
         for attempt in 1..=max_plan_retries {
             match scheduler.plan_and_apply_with_exclusions(
@@ -337,9 +388,13 @@ impl Eval {
                 mode.clone(),
                 excluded,
             ) {
-                Ok(outcome) => return Ok(outcome),
+                Ok(outcome) => {
+                    observe(total_backoff_delay);
+                    return Ok(outcome);
+                }
                 Err(error) => {
                     if !Self::is_conflict_error(&error) {
+                        observe(total_backoff_delay);
                         return Err(error);
                     }
                     conflict_count += 1;
@@ -359,6 +414,7 @@ impl Eval {
                         continue;
                     }
 
+                    observe(total_backoff_delay);
                     warn!(
                         attempts = max_plan_retries,
                         conflict_count,
@@ -481,9 +537,11 @@ impl Eval {
             return Ok(());
         }
 
-        let tasks = store.get_task_configs_for_job_config(&self.job_config_id)?;
+        // The read model's copy (immutable per config id), not a SQL query
+        // per placing eval.
+        let tasks = store.shared_task_configs_for_job_config(&self.job_config_id)?;
         let mut min_delay: Option<std::time::Duration> = None;
-        for (_, task) in tasks {
+        for (_, task) in tasks.iter() {
             if task.lifecycle != super::job::TaskLifecycle::Batch {
                 continue;
             }
@@ -1232,6 +1290,19 @@ mod tests {
         Ok(())
     }
 
+    /// Observation count of one `legion_eval_phase_seconds` series, read
+    /// from the exposition (the registry is process-global, so tests compare
+    /// before and after rather than absolute values).
+    fn phase_count(kind: &str, phase: &str) -> u64 {
+        let prefix =
+            format!("legion_eval_phase_seconds_count{{kind=\"{kind}\",phase=\"{phase}\"}} ");
+        crate::manager::telemetry::render()
+            .lines()
+            .find_map(|line| line.strip_prefix(&prefix))
+            .and_then(|value| value.trim().parse().ok())
+            .unwrap_or(0)
+    }
+
     #[test]
     fn job_reschedule_excludes_failed_node() -> R<()> {
         let store = setup_store()?;
@@ -1269,7 +1340,20 @@ mod tests {
             node_name: String::new(),
             priority: 50,
         };
+        let phases = ["prepare", "scheduler_init", "plan", "dispatch", "finish"];
+        let before: Vec<u64> = phases
+            .iter()
+            .map(|phase| phase_count("job_submit", phase))
+            .collect();
         submit_eval.handle(&store)?;
+        // Every handler phase of a placing eval is observed, so the eval's
+        // wall time is attributable (legion_eval_phase_seconds).
+        for (phase, before) in phases.iter().zip(before) {
+            assert!(
+                phase_count("job_submit", phase) > before,
+                "phase {phase} was not observed"
+            );
+        }
 
         store.mark_node_lost("node-a")?;
         store.remove_allocs_for_node("node-a")?;

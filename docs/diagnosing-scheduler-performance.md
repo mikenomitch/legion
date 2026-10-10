@@ -335,7 +335,7 @@ which grew the least in relative terms.
 | Phase | Growing means | Do |
 | --- | --- | --- |
 | `available_nodes` | The node snapshot is being rebuilt instead of shared by reference. Some change is invalidating the cached list on every plan. | Look for constant node churn: registrations, cordons, availability flapping. |
-| `version_sample` | The lazy epoch sample is falling back to the eager whole-fleet sample. | Check `legion_scheduler_lazy_sample_fallback_total`. A high rate means heavy concurrent churn. See [rejection storm](#symptom-throughput-fell-when-i-scaled-up). |
+| `version_sample` | Reading the fence epochs from the plan's own snapshot is taking longer than it should. It is a small, fixed cost per plan. | Capture the numbers and file a bug. See [rejection storm](#symptom-throughput-fell-when-i-scaled-up) if rejections are also climbing. |
 | `task_fetch` | Task-config loading is scaling with something it shouldn't. Superlinear growth here points to a bug, not a capacity limit. | Capture the numbers and file a bug. No config knob fixes this. |
 | `capacity_snapshot` | Allocation count per plan is growing. Expected as the cluster fills. | Nothing to tune. This is necessary work. |
 | `build_plan` | Candidate construction and scoring are growing with fleet size. This is expected, and it's the one phase with a direct knob. | Set `schedulerSettings.score_sample` to bound scoring cost, declare a [scheduling index](scheduling-indexes.md), or both. |
@@ -485,22 +485,23 @@ measured the heartbeat ceiling, so they can't be used as scheduler numbers.
 1. **Use the value `legion node cadence` suggests.** It computes
    `heartbeatSeconds` for this fleet size on this control plane at the
    configured headroom. Set it on the worker type.
-2. **Or turn on adaptive cadence** so it moves on its own:
+2. **Or lower the adaptive target** so cadence backs off sooner. Adaptive
+   cadence is on by default at 2,500 beats/s, which keeps fleets up to 2,500
+   nodes at 2s. A control plane that falls behind below that needs a lower
+   target:
 
    ```nickel
    # configs/manager.ncl
    heartbeat = {
-     targetRatePerSecond = 80,   # measure yours; off by default
-     minInterval = "2s",
-     maxInterval = "120s",
-     missedBeatsBeforeLost = 5,
-     headroom = 2,
+     targetRatePerSecond = 80,   # measure yours; default 2500
    }
    ```
 
    The lost window always moves with the cadence
    (`missedBeatsBeforeLost x interval`), so backing off keeps the same
-   detection margin.
+   detection margin. If `legion node cadence` says `workers use their
+   worker-type heartbeatSeconds`, someone set `heartbeat.adaptive = false`,
+   and nothing adapts.
 3. **Accept the cost.** Detection slows down in proportion to the back-off. At
    1,000 nodes and R=80, Legion takes up to 125 seconds instead of 10 to notice
    a dead machine.
@@ -597,7 +598,8 @@ allocations, instead of on the counter.
 | `schedulerSettings.plan_apply_batch_max` | manager config | Group commit is engaging and you want fewer commits (default `16`, max `128`). | `coalesce_batch_size`'s `le="1"` bucket is near `_count`. Batching isn't engaging, so the cap isn't the constraint. |
 | `schedulerSettings.job_intake_coalescing` | manager config | Only to turn off job-intake group commit (default `true`) while diagnosing a submit-path incident. It's an on/off switch with nothing to tune. | You're chasing submit throughput. Turning it off always means more quorum rounds per job. |
 | `schedulerSettings.score_sample` | manager config | `build_plan` grows with fleet size and you accept approximate score ranking. | Any other phase is the one that grew. |
-| `heartbeat.targetRatePerSecond` | manager config | Freshness ratio is falling and you want cadence to track fleet size. Off by default. | You're running a published benchmark without recording the served interval and freshness ratio alongside throughput. |
+| `heartbeat.targetRatePerSecond` | manager config | Freshness ratio is falling below 2,500 nodes, so cadence must back off sooner (lower it), or you need faster detection on a large fleet and have measured the headroom (raise it). Default `2500`. | You're running a published benchmark without recording the served interval and freshness ratio alongside throughput. |
+| `heartbeat.adaptive` | manager config | Only to pin every worker to its worker-type `heartbeatSeconds` (default `true`), for example in a run whose subject is a fixed cadence. | You want less heartbeat load. Adaptive cadence is what reduces it. |
 | `heartbeat.missedBeatsBeforeLost` | manager config | Rarely. It multiplies the lost window (default `5`). | You want to reduce manager load. Change the cadence for that instead. |
 | `liveness.failoverGrace` | manager config | A manager taking over liveness marks nodes lost too eagerly (default `60s`). | Nodes are actually gone. |
 | `topology = "lanes"` | manager config | The scheduler lane is queued behind status/control work under `single`. | You have one manager and no raft. |

@@ -163,25 +163,67 @@ neighbor rules a cause in or out, and which knob to turn), see
   place and the scheduler has already run out of displacement options.
 - **`legion_scheduler_plan_phase_seconds{phase}`** (histogram): per-phase
   wall-clock time of every `plan_and_apply`. Phases, in execution order:
-  - `available_nodes`: node snapshot fetch.
-  - `version_sample`: the optimistic-concurrency epoch sample.
+  - `job_lookup`: the plan's job and priority-band lookups.
+  - `available_nodes`: the cached node set, or its rebuild after a node
+    change.
   - `task_fetch`: task-config load.
   - `capacity_snapshot`: allocations and free pools.
   - `build_plan`: candidate construction, scoring, and placement.
+  - `version_sample`: the optimistic-concurrency epoch sample.
+  - `speculative_dispatch`: early payloads for tasks that opt into
+    `speculativeStart`. Near zero otherwise.
   - `apply`: plan-submission insert, epoch compare-and-set, and the candidate
     walk's allocation writes, as one replicated op. On raft this includes
     propose → quorum-commit → apply.
+  - `post_apply`: ratification dispatch and the ledger deltas.
   - `total`: the whole call.
 
-  Look here first when scheduling latency moves. Compare the phase that grew
-  against the others before profiling. The benchmark runners aggregate the
-  same phases ([testing-and-benchmarks.md](testing-and-benchmarks.md)).
-- **`legion_scheduler_lazy_sample_fallback_total`** (counter): plans that
-  re-ran with the eager (whole-fleet) optimistic-concurrency sample because
-  the read model changed while the plan was being built (see the lazy epoch
-  sample in [scheduler-and-eval-loop.md](scheduler-and-eval-loop.md)). A
-  steadily high rate relative to plan volume means heavy concurrent churn.
-  Correctness is unaffected either way.
+  The phases are disjoint, so `total` minus their sum is glue and should stay
+  small. Rejected plans are observed too, up to `apply`. Look here first when
+  scheduling latency moves. Compare the phase that grew against the others
+  before profiling. The benchmark runners aggregate the same phases
+  ([testing-and-benchmarks.md](testing-and-benchmarks.md)).
+- **`legion_eval_handle_seconds{kind}`** (histogram): wall time to handle one
+  claimed eval, from handing it to the blocking pool to its outcome.
+  Throughput is roughly `evalThreads` divided by this. The difference from
+  the plan's `total` is everything an eval does outside `plan_and_apply`,
+  which `legion_eval_phase_seconds` breaks down.
+- **`legion_eval_phase_seconds{kind, phase}`** (histogram): where one eval's
+  handler time goes.
+  - `queue_wait`: the wait for a blocking-pool thread, recorded for every
+    kind. Heartbeats share the pool, so a saturated pool shows here and not
+    as a slow handler.
+
+  For the kinds that place work (`job_submit`, `job_update`,
+  `job_reschedule`, `job_scale`), the remaining phases partition the handler:
+  - `scheduler_init`: scheduler construction.
+  - `prepare`: the kind's own pre-plan work, such as a submit's
+    previous-config lookup.
+  - `plan`: every `plan_and_apply` attempt, rejected ones included.
+  - `conflict_backoff`: sleeps between attempts after a fence rejection.
+    Absent when nothing conflicted.
+  - `dispatch`: building and handing off the workers' payloads. The sends
+    are detached and show in `legion_dispatch_send_seconds`.
+  - `finish`: post-plan bookkeeping, such as removing a replaced config's
+    allocations and scheduling batch follow-ups.
+- **`legion_eval_queue_round_seconds{op}`** (histogram): one eval-queue round
+  on the scheduler lane. `claim` is a standalone claim. `settle` writes a
+  batch's outcomes and claims the next batch in one replicated op. Both run
+  between handlers, outside `legion_eval_handle_seconds`.
+- **`legion_scheduler_node_list_rebuilds_total`** (counter): rebuilds of the
+  scheduler's cached available-node set (the sorted list and its by-ID
+  lookup). A plan rebuilds it only when a node changed since the last plan,
+  so it sits near zero while the fleet is stable. A rate that tracks the plan
+  rate means nodes are changing under every plan, and each plan pays an
+  O(fleet) rebuild.
+- **`legion_scheduler_lazy_sample_fallback_total`** (counter):
+  **retired, always 0.** It counted plans that re-ran with the eager
+  whole-fleet epoch sample because the read model changed mid-plan.
+  Plans now take their fence epochs from their own capacity snapshot and
+  never re-run (see "The epoch sample comes from the plan's own snapshot"
+  in [scheduler-and-eval-loop.md](scheduler-and-eval-loop.md)). Nothing
+  increments it anymore. It is still exported so dashboards that graph it
+  don't break.
 
 ### Scheduling indexes
 
@@ -246,7 +288,11 @@ Reported on the status-lane leader (the manager that owns node liveness), and
   `0` on a fleet under 20 nodes, where the ratio is noise. Check
   `legion_heartbeat_sustainable_nodes` to see whether it is measurable at all.
 - **`legion_heartbeat_served_interval_seconds`** (gauge): the interval this
-  manager is telling workers to use.
+  manager is telling workers to use. Adaptive cadence is on by default, so
+  this grows with fleet size: 2 up to 2,500 nodes, 21 at 20,000 at the
+  default `targetRatePerSecond`. With `heartbeat.adaptive = false` it reads
+  `minInterval`, the interval freshness is measured against. Record it with
+  every benchmark result.
 - **`legion_heartbeat_lost_window_seconds`** (gauge): the window derived
   from it (`missedBeatsBeforeLost x interval`).
 - **`legion_heartbeat_sustainable_nodes`** (gauge): nodes this control plane
@@ -309,6 +355,15 @@ reason.
 - **`legion_store_write_lock_wait_seconds`** (histogram): time spent
   waiting to acquire the store's SQLite write-connection lock. Sustained high
   buckets indicate write contention on the state store.
+- **`legion_store_read_model_lock_wait_seconds{mode}`** (histogram): time
+  spent acquiring the scheduler read model's lock, by `mode` (`read` or
+  `write`). Planners and heartbeats take it to read. Every allocation publish
+  and node change takes it to write. An uncontended acquisition is recorded
+  as 0, so the mean is the true average wait and `_count` is the acquisition
+  rate. A rising `read` tail means writers hold the lock long or often. A
+  rising `write` tail means readers do. Either one lands inside whichever
+  plan phase was running, so read it next to
+  `legion_scheduler_plan_phase_seconds`.
 - **`legion_store_read_lock_wait_seconds`** (histogram): time spent waiting
   for one of the store's read-only SQLite connections. A reader takes any free
   connection before queueing on a busy one, so a read that found one

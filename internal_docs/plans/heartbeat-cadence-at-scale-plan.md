@@ -1,8 +1,9 @@
 # Heartbeat Cadence at Scale
 
-**Status: SHIPPED** (2026-08-03) — all four phases are built. The public page
-is [`docs/heartbeat-cadence-and-scale.md`](../../docs/heartbeat-cadence-and-scale.md);
-this plan stays as history.
+**Status: SHIPPED** (2026-08-03) — all four phases are built. **Phase 5,
+adaptive cadence on by default, SHIPPED 2026-10-09** (§13): it supersedes
+the "opt-in" posture of §6.4, §6.5, and §10 below, which stay as history. The
+public page is [`docs/heartbeat-cadence-and-scale.md`](../../docs/heartbeat-cadence-and-scale.md).
 
 **Deliberately not done, and open:** the phase-4 AWS reproduction (1000
 simulated nodes against a control plane measured at `R ~= 80`, adaptive on
@@ -964,9 +965,11 @@ Every phase is additive and default-inert.
 
 ## 11. Open questions
 
-1. **Should adaptive cadence eventually default on?** *Lean: yes, after
-   the AWS campaign, with `targetRatePerSecond` auto-derived from measured
-   `R` rather than configured.* Off-by-default is right for the first
+1. **Should adaptive cadence eventually default on?** *Resolved
+   2026-10-09: yes, at a fixed default rate rather than an auto-derived one,
+   and before the criterion below was met. See §13.* Original lean: *yes,
+   after the AWS campaign, with `targetRatePerSecond` auto-derived from
+   measured `R` rather than configured.* Off-by-default is right for the first
    release because the benchmark-fairness argument is strongest while the
    comparative numbers are being produced. The criterion for flipping: a
    campaign run showing a cluster past its ceiling surviving with adaptive
@@ -1020,3 +1023,103 @@ to 80, **zero nodes are marked lost**, the served interval settles on the
 and the benchmark result JSON carries the served interval and freshness
 alongside throughput. Scheduler throughput on the same run is within noise
 of the phase-3 baseline.
+
+---
+
+## 13. Phase 5 — adaptive cadence on by default
+
+**Status: SHIPPED 2026-10-09.** Judgement calls 2, 3, 5, 9, 11, and 14 in
+the calls doc.
+
+**Problem.** Opt-in adaptive cadence protected nobody who needed it. On the
+AWS rig at 20k simulated nodes, the fixed 2s cadence meant ~10,000 heartbeat
+RPCs/s into a 4-vCPU leader. That took more than a core and slowed
+scheduling, so the large campaign cells were measuring heartbeat load. Nomad
+scales its TTL to ~50 beats/s by default. Kubernetes renews leases every 10s
+with a 40s grace at any size.
+
+**Prior art.** Nomad's `max_heartbeats_per_second` (default 50,
+`min_heartbeat_ttl` 10s) is on by default and has no off switch. Kubernetes
+has no adaptation, but its fixed 10s lease renewal is already 5x slower than
+Legion's 2s floor. Both make the slower cadence the default rather than the
+exception.
+
+**Jobs to be done.**
+
+- *Operator of a small or medium cluster:* when I upgrade, nothing about
+  detection changes. The default keeps every fleet up to 2,500 nodes on 2s
+  and a 10s window.
+- *Operator of a large cluster:* when the fleet grows past what the leader
+  should spend on heartbeats, I want cadence to back off without my having
+  read this page, and I want to see what it chose (`legion node cadence`,
+  `legion_heartbeat_served_interval_seconds`).
+- *Operator who needs fixed timing:* I want one obvious switch back to the
+  old behavior: `heartbeat = { adaptive = false }`.
+- *Benchmark author:* I want the default to be what I benchmark, and I want
+  the served interval and lost window recorded next to every number.
+
+**Goals.** On by default. No change at or below 2,500 nodes. An explicit
+off switch. Cadence reaches workers attached to any manager. Windows stay
+safe for late registrants, heterogeneous pools, and older workers.
+
+**Non-goals.** Auto-deriving the rate from measured `R` (open question 1's
+original lean). A per-pool rate. Clamping the served interval against the
+stateful self-fence (deferred, see below).
+
+**Surface.**
+
+```nickel
+heartbeat = {
+  adaptive = true,             # new; false = the old fixed behavior
+  targetRatePerSecond = 2500,  # was unset = off; now defaults to 2500
+  minInterval = "2s",
+  maxInterval = "120s",
+  missedBeatsBeforeLost = 5,
+  headroom = 2,
+}
+```
+
+`NodeLivenessDigestReply.served_interval_seconds` (new, optional) carries
+the leader's served interval to the other managers.
+
+**Design.**
+
+- **Default rate 2,500/s, headroom 2.** `interval = ceil(N / 1250)`:
+  2s through 2,500 nodes, 5s at 5k, 8s at 10k, 21s at 20k, 55s at 50k. Steady
+  load is capped at 1,250 beats/s.
+- **Served interval is a floor.** A worker beats at `max(heartbeatSeconds,
+  served)`, and an absent interval means its own value. Phase 4's override
+  would have sped every slow pool up to 2s on every small cluster.
+- **Followers relay the leader's interval** from the digest reply. Phase 4
+  set it on the status leader only.
+- **Widening every tick, widen-only.** A node that registers after a step up,
+  or a worker type faster than the floor, is raised to `5 x served` on the
+  next tick. A slower pool's wider window is never lowered. Narrowing stops at
+  the cadence a node was observed beating at.
+
+**Phases.** One. It ships alone, and `adaptive = false` reverts it per
+cluster without a binary change.
+
+**Testing.** Config: default resolves to adaptive at 2,500, `adaptive =
+false` parses and disables, `targetRatePerSecond = 0` is rejected naming the
+switch, the shipped `configs/manager.ncl` resolves to the defaults.
+Controller: the table above, rung by rung. Status checker: the default config
+serves 2s to a small fleet with 10s windows, and `adaptive = false` serves
+nothing. Windows: widening raises a 1s pool and leaves a 60s pool alone,
+narrowing respects the observed cadence. Worker: the floor semantics. The
+AWS reproduction (entry 21) is still not run.
+
+**Rollout.** Existing clusters get adaptive cadence on upgrade. Up to 2,500
+nodes nothing observable changes. Mixed versions are covered in
+`docs/heartbeat-cadence-and-scale.md` ("Upgrading to adaptive-by-default")
+and `docs/upgrades.md`: old workers ignore the interval and are covered by
+widening, and old managers neither serve nor relay one.
+
+**Deferred.**
+
+- **The served interval is not checked against `selfTerminateAfter`.** At the
+  default rate the 89s rung arrives past ~68,750 nodes, where a healthy
+  worker can fence between beats (calls entry 14, `internal_docs/TODO.md`).
+- **The AWS adaptive-on reproduction**, now against the default rather than
+  `R = 80`: served interval, freshness, and scheduler throughput at 10k and
+  20k nodes, before and after.

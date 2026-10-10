@@ -424,6 +424,414 @@ fn plan_under_fill_benchmark(c: &mut Criterion) {
     group.finish();
 }
 
+// --- plan_fleet_scaling (plan-path-fleet-scaling-plan.md § 6.4) ---------
+//
+// Reproduces the per-eval cost growth the 2026-10-09 AWS campaign measured
+// between 5,000 and 10,000 nodes, with node count and fill varied
+// independently (the campaign doubled both at once). The fleet is the
+// `web_fleet` mix: 5 of every 6 nodes `class = web`, the rest `class =
+// util`, one pool, so the default `fit` index and the per-node constraint
+// re-verification run exactly as on the rig. The planned job is the
+// `web_fleet` api shape: two single-task groups of 4, cpu 500, memory
+// 1024, constrained to `class = web`.
+//
+// The concurrent cells are the ones that matter: four planners (the
+// 4-core default) plus a background writer publishing to the read model,
+// which is what makes the lazy version sample fall back on the rig. Single
+// threaded, no plan ever falls back.
+const SCALING_NODES: &[usize] = &[1_000, 2_000, 5_000, 10_000, 20_000, 50_000];
+const SCALING_FILL: &[usize] = &[0, 5];
+/// Evals each `eval_cycle` cell runs (single-threaded, fill 5 only).
+const SCALING_EVAL_CYCLES: usize = 150;
+
+/// The node counts to run, overridable because the 50k cells take minutes
+/// to set up: `LEGION_BENCH_SCALING_NODES=20000,50000 cargo bench ...`.
+fn scaling_nodes() -> Vec<usize> {
+    std::env::var("LEGION_BENCH_SCALING_NODES")
+        .ok()
+        .map(|raw| {
+            raw.split(',')
+                .filter_map(|part| part.trim().parse().ok())
+                .collect::<Vec<usize>>()
+        })
+        .filter(|nodes| !nodes.is_empty())
+        .unwrap_or_else(|| SCALING_NODES.to_vec())
+}
+const SCALING_PLANNERS: usize = 4;
+const SCALING_CONCURRENT_SECS: u64 = 4;
+
+fn scaling_node_resources() -> serde_json::Value {
+    // 8 cores x 3000 MHz, 32 GiB: the rig's `web` profile.
+    let cpus: serde_json::Map<String, serde_json::Value> = (1..=8)
+        .map(|idx| (format!("cpu-{idx}"), json!({ "frequency": "3000" })))
+        .collect();
+    json!({ "memory_total": (32u64 << 30).to_string(), "cpus": cpus })
+}
+
+fn insert_web_fleet(store: &Store, node_count: usize) -> anyhow::Result<()> {
+    for idx in 0..node_count {
+        let class = if idx % 6 == 5 { "util" } else { "web" };
+        let mut node = make_node_msg(&format!("node-{idx}"), json!({ "class": class }));
+        node.fingerprint_attrs = scaling_node_resources().to_string();
+        store.insert_node(node)?;
+    }
+    Ok(())
+}
+
+fn make_api_job(name: &str) -> JobConfig {
+    let task = |idx: usize| TaskConfig {
+        count: TaskCount::new(4),
+        group: format!("g{idx}"),
+        resources: json!({ "cpu": 500, "memory": 1024 }),
+        constraints: json!({ "class": "web" }),
+        ..TaskConfig::new(format!("t{idx}"), "noop")
+    };
+    JobConfig {
+        priority: Default::default(),
+        name: name.to_string(),
+        tasks: vec![task(0), task(1)],
+        rollout: None,
+        rollout_by_group: Default::default(),
+        version: None,
+    }
+}
+
+fn plan_fleet_scaling_benchmark(c: &mut Criterion) {
+    let mut group = c.benchmark_group("plan_fleet_scaling");
+    group.warm_up_time(Duration::from_millis(500));
+    group.measurement_time(Duration::from_secs(4));
+    group.sample_size(15);
+
+    for nodes in scaling_nodes() {
+        for &fill in SCALING_FILL {
+            let (store, _dir) = setup_store("bin_pack").expect("store");
+            insert_web_fleet(&store, nodes).expect("nodes");
+            fill_fleet(&store, nodes, fill).expect("fill");
+            let cell = format!("nodes_{nodes}/fill_{fill}");
+
+            // Single-threaded plan_and_apply: a fresh api job per iteration.
+            // The previous iteration's 8 allocations are removed in the
+            // untimed setup, so the fleet stays at its configured fill
+            // instead of filling up over a few thousand iterations.
+            let mut next_job = 0usize;
+            let timings: RefCell<Vec<PlanTimings>> = RefCell::new(Vec::new());
+            let placed: RefCell<Vec<i64>> = RefCell::new(Vec::new());
+            group.bench_function(BenchmarkId::new("plan_and_apply", &cell), |b| {
+                b.iter_batched(
+                    || {
+                        for id in placed.borrow_mut().drain(..) {
+                            store.remove_allocation_by_id(id).expect("cleanup");
+                        }
+                        next_job += 1;
+                        let job = make_api_job(&format!("api-{next_job}"));
+                        submit_jobs(&store, std::slice::from_ref(&job))
+                            .expect("job")
+                            .pop()
+                            .expect("one id")
+                    },
+                    |job_config_id| {
+                        let scheduler = Scheduler::new(&store).expect("scheduler");
+                        let outcome = scheduler
+                            .plan_and_apply(&job_config_id, PlanMode::Fresh)
+                            .expect("plan");
+                        assert_eq!(outcome.allocations.len(), 8);
+                        timings.borrow_mut().push(outcome.timings.clone());
+                        placed
+                            .borrow_mut()
+                            .extend(outcome.allocations.iter().map(|a| a.id));
+                        outcome
+                    },
+                    criterion::BatchSize::PerIteration,
+                );
+            });
+            print_phase_means(
+                &format!("plan_fleet_scaling/plan_and_apply/{cell}"),
+                &timings.borrow(),
+            );
+
+            if fill > 0 {
+                eval_cycle_cell(&store, &cell);
+            }
+            // `LEGION_BENCH_SKIP_CONCURRENT=1` skips these cells: at 20k+
+            // nodes their 12,000 job submissions dominate the setup.
+            if fill > 0
+                && nodes >= 5_000
+                && std::env::var_os("LEGION_BENCH_SKIP_CONCURRENT").is_none()
+            {
+                concurrent_scaling_cell(&store, &cell);
+            }
+        }
+    }
+    group.finish();
+}
+
+/// Four planners racing `plan_and_apply` on distinct jobs while a
+/// background writer places and removes a filler allocation every few
+/// milliseconds. Not a Criterion measurement (the interesting output is the
+/// per-phase breakdown and the fallback count, not one duration), so it
+/// prints its own summary line.
+fn concurrent_scaling_cell(store: &Store, cell: &str) {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    // Enough that no planner runs out before the deadline, so plans/s is
+    // a measurement rather than the job count divided by the window.
+    let jobs_per_planner = 3_000;
+    let mut job_ids: Vec<Vec<String>> = Vec::new();
+    for planner in 0..SCALING_PLANNERS {
+        let jobs: Vec<JobConfig> = (0..jobs_per_planner)
+            .map(|idx| make_api_job(&format!("conc-{cell}-{planner}-{idx}")))
+            .collect();
+        job_ids.push(submit_jobs(store, &jobs).expect("jobs"));
+    }
+    // The background writer's own job: one filler allocation placed and
+    // removed on a rotating node, so every iteration publishes to the read
+    // model the way unrelated applies do on the rig.
+    let churn_id = submit_jobs(store, &[make_fill_job("churn")])
+        .expect("churn job")
+        .pop()
+        .expect("one id");
+    let churn_task = store
+        .cached_task_configs_for_job_config(&churn_id)
+        .expect("task")[0]
+        .0;
+
+    let metrics = legion::manager::telemetry::metrics();
+    let fallback_before = metrics.scheduler_lazy_sample_fallback_total.get();
+    let stop = Arc::new(AtomicBool::new(false));
+    let planned = Arc::new(AtomicUsize::new(0));
+    let samples: Arc<Mutex<Vec<PlanTimings>>> = Arc::new(Mutex::new(Vec::new()));
+    let deadline = std::time::Instant::now() + Duration::from_secs(SCALING_CONCURRENT_SECS);
+
+    std::thread::scope(|scope| {
+        {
+            let store = store.clone();
+            let stop = stop.clone();
+            scope.spawn(move || {
+                let mut node = 0usize;
+                while !stop.load(Ordering::Relaxed) {
+                    let placed = store
+                        .apply_allocation_plan(&[(format!("node-{node}"), churn_task)])
+                        .expect("churn place");
+                    for allocation in placed {
+                        store
+                            .remove_allocation_by_id(allocation.id)
+                            .expect("churn remove");
+                    }
+                    node = (node + 7) % 1_000;
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            });
+        }
+        for ids in &job_ids {
+            let store = store.clone();
+            let planned = planned.clone();
+            let samples = samples.clone();
+            scope.spawn(move || {
+                for id in ids {
+                    if std::time::Instant::now() >= deadline {
+                        break;
+                    }
+                    let scheduler = Scheduler::new(&store).expect("scheduler");
+                    // A fenced reject is a correct outcome under contention
+                    // (the eval would retry); count only successes.
+                    if let Ok(outcome) = scheduler.plan_and_apply(id, PlanMode::Fresh) {
+                        samples.lock().unwrap().push(outcome.timings.clone());
+                        planned.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            });
+        }
+        while std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // Planners stop at the deadline on their own; then the writer.
+        std::thread::sleep(Duration::from_millis(200));
+        stop.store(true, Ordering::Relaxed);
+    });
+
+    let samples = samples.lock().unwrap();
+    let fallbacks = metrics.scheduler_lazy_sample_fallback_total.get() - fallback_before;
+    let plans = planned.load(Ordering::Relaxed);
+    eprintln!(
+        "plan_fleet_scaling/concurrent/{cell}: {plans} plans in {SCALING_CONCURRENT_SECS}s \
+         ({:.1}/s), {fallbacks} lazy-sample fallbacks ({:.0}%)",
+        plans as f64 / SCALING_CONCURRENT_SECS as f64,
+        if plans > 0 {
+            100.0 * fallbacks as f64 / plans as f64
+        } else {
+            0.0
+        },
+    );
+    print_phase_means(&format!("plan_fleet_scaling/concurrent/{cell}"), &samples);
+}
+
+/// The whole per-eval cycle an eval worker runs on the leader, not just the
+/// plan: claim the eval, run its handler (`resolve_claimed_eval`: scheduler
+/// construction, previous-config lookup, plan with conflict retries,
+/// dispatch, follow-ups), and settle it. `plan_and_apply` alone misses
+/// everything the handler does around the plan, which is where the AWS
+/// 20k-node cell spent most of each eval. Single-threaded, so it measures
+/// cost rather than contention. Prints wall-time means per step and the
+/// eval-phase breakdown the handler records.
+fn eval_cycle_cell(store: &Store, cell: &str) {
+    use legion::manager::daemon::resolve_claimed_eval;
+    use legion::storage::store::{EvalBatchLimits, EvalCompletion};
+
+    let limits = EvalBatchLimits { max: 1, workers: 1 };
+    // Drain whatever the setup's job submissions enqueued (the filler jobs
+    // and the plan_and_apply cell's api jobs), so every claim below takes
+    // exactly the eval this cell enqueued.
+    while let Some(eval) = store.claim_eval().expect("drain claim") {
+        store.complete_eval(&eval.id, true).expect("drain complete");
+    }
+
+    let mut placed: Vec<i64> = Vec::new();
+    let (mut claim_us, mut handle_us, mut settle_us) = (0u128, 0u128, 0u128);
+    // The per-plan `node_lookup` map every plan built before the
+    // available-node set cached its own by-id lookup, timed on its own so
+    // its share of a plan is a measurement rather than a subtraction.
+    {
+        let nodes = store.available_node_arcs().expect("nodes");
+        let rounds = 50u32;
+        let started = std::time::Instant::now();
+        for _ in 0..rounds {
+            let lookup: std::collections::HashMap<&str, &legion::structs::Node> = nodes
+                .iter()
+                .map(|node| (node.id.as_str(), &**node))
+                .collect();
+            std::hint::black_box(lookup);
+        }
+        eprintln!(
+            "plan_fleet_scaling/eval_cycle/{cell}: per-plan node_lookup map build (pre-Phase-4 shape) {:.0} us, node list clone {:.0} us",
+            started.elapsed().as_micros() as f64 / rounds as f64,
+            {
+                let started = std::time::Instant::now();
+                for _ in 0..rounds {
+                    std::hint::black_box(store.available_node_arcs().expect("nodes"));
+                }
+                started.elapsed().as_micros() as f64 / rounds as f64
+            }
+        );
+    }
+    let eval_phases_before = histogram_sums("legion_eval_phase_seconds");
+    let plan_phases_before = histogram_sums("legion_scheduler_plan_phase_seconds");
+    for idx in 0..SCALING_EVAL_CYCLES {
+        // Untimed: keep the fleet at its configured fill, and enqueue the
+        // eval (a job submit, as the RunJob RPC does).
+        for id in placed.drain(..) {
+            store.remove_allocation_by_id(id).expect("cleanup");
+        }
+        let job_name = format!("eval-{cell}-{idx}");
+        let job_config_id = submit_jobs(store, &[make_api_job(&job_name)])
+            .expect("job")
+            .pop()
+            .expect("one id");
+        store
+            .enqueue_eval(
+                "job_submit",
+                Some(&job_name),
+                Some(&job_config_id),
+                None,
+                None,
+            )
+            .expect("enqueue");
+
+        let started = std::time::Instant::now();
+        let batch = store.claim_evals(limits).expect("claim");
+        claim_us += started.elapsed().as_micros();
+        assert_eq!(batch.len(), 1, "exactly the eval this cycle enqueued");
+        let eval = &batch[0];
+        assert_eq!(eval.kind, "job_submit");
+
+        let started = std::time::Instant::now();
+        let completion = resolve_claimed_eval(store, 0, eval);
+        handle_us += started.elapsed().as_micros();
+        assert!(
+            matches!(
+                completion,
+                EvalCompletion::Finished {
+                    succeeded: true,
+                    ..
+                }
+            ),
+            "eval failed: {completion:?}"
+        );
+
+        let started = std::time::Instant::now();
+        let next = store
+            .complete_evals_and_claim_next(vec![(eval.id.clone(), completion)], limits)
+            .expect("settle");
+        settle_us += started.elapsed().as_micros();
+        assert!(next.is_empty());
+
+        placed.extend(
+            store
+                .allocs_for_job_config(&job_config_id)
+                .expect("allocations")
+                .iter()
+                .map(|allocation| allocation.id),
+        );
+    }
+    let n = SCALING_EVAL_CYCLES as f64;
+    eprintln!(
+        "plan_fleet_scaling/eval_cycle/{cell}: {SCALING_EVAL_CYCLES} evals, mean us: \
+         claim {:.0}, handle {:.0}, settle {:.0}, cycle {:.0}",
+        claim_us as f64 / n,
+        handle_us as f64 / n,
+        settle_us as f64 / n,
+        (claim_us + handle_us + settle_us) as f64 / n,
+    );
+    // Where the handler's time went, from the metrics the eval path records
+    // (`legion_eval_phase_seconds`, `legion_scheduler_plan_phase_seconds`).
+    for (family, before) in [
+        ("legion_eval_phase_seconds", eval_phases_before),
+        ("legion_scheduler_plan_phase_seconds", plan_phases_before),
+    ] {
+        let after = histogram_sums(family);
+        let mut phases: Vec<String> = after
+            .iter()
+            .map(|(labels, (sum, count))| {
+                let (sum0, count0) = before.get(labels).copied().unwrap_or((0.0, 0));
+                let evals = (count - count0).max(1) as f64;
+                (labels, (sum - sum0) * 1e6 / evals, count - count0)
+            })
+            .filter(|(_, _, count)| *count > 0)
+            .map(|(labels, mean_us, _)| format!("{labels} {mean_us:.0}"))
+            .collect();
+        phases.sort();
+        eprintln!(
+            "plan_fleet_scaling/eval_cycle/{cell}: {family} mean us: {}",
+            phases.join(", ")
+        );
+    }
+}
+
+/// `(sum seconds, count)` per label set of one histogram family, read from
+/// the process's metrics exposition.
+fn histogram_sums(family: &str) -> std::collections::HashMap<String, (f64, u64)> {
+    let text = legion::manager::telemetry::render();
+    let mut out: std::collections::HashMap<String, (f64, u64)> = Default::default();
+    for line in text.lines() {
+        for (suffix, is_sum) in [("_sum", true), ("_count", false)] {
+            let Some(rest) = line.strip_prefix(&format!("{family}{suffix}")) else {
+                continue;
+            };
+            let Some((labels, value)) = rest.rsplit_once(' ') else {
+                continue;
+            };
+            let labels = labels.trim_start_matches('{').trim_end_matches('}');
+            let entry = out.entry(labels.to_string()).or_default();
+            if is_sum {
+                entry.0 = value.parse().unwrap_or(0.0);
+            } else {
+                entry.1 = value.parse().unwrap_or(0);
+            }
+        }
+    }
+    out
+}
+
 /// Mean per-phase microseconds over every plan a cell measured, in the
 /// order the phases run.
 fn print_phase_means(cell: &str, samples: &[PlanTimings]) {
@@ -434,15 +842,19 @@ fn print_phase_means(cell: &str, samples: &[PlanTimings]) {
         samples.iter().map(pick).sum::<u64>() as f64 / samples.len() as f64
     };
     eprintln!(
-        "{cell} phase means over {} plans (us): nodes {:.0}, versions {:.0}, tasks {:.0}, \
-         capacity {:.0}, build {:.0}, apply {:.0}, total {:.0}",
+        "{cell} phase means over {} plans (us): job {:.0}, nodes {:.0}, tasks {:.0}, \
+         capacity {:.0}, build {:.0}, versions {:.0}, speculative {:.0}, apply {:.0}, \
+         post {:.0}, total {:.0}",
         samples.len(),
+        mean(|t| t.job_lookup_us),
         mean(|t| t.available_nodes_us),
-        mean(|t| t.version_sample_us),
         mean(|t| t.task_fetch_us),
         mean(|t| t.capacity_snapshot_us),
         mean(|t| t.build_plan_us),
+        mean(|t| t.version_sample_us),
+        mean(|t| t.speculative_dispatch_us),
         mean(|t| t.apply_us),
+        mean(|t| t.post_apply_us),
         mean(|t| t.total_us),
     );
 }
@@ -451,6 +863,7 @@ criterion_group!(
     benches,
     scheduler_speed_benchmark,
     candidate_construction_benchmark,
-    plan_under_fill_benchmark
+    plan_under_fill_benchmark,
+    plan_fleet_scaling_benchmark
 );
 criterion_main!(benches);

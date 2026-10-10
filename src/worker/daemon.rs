@@ -656,16 +656,29 @@ pub(crate) fn rephase_sleep(new_interval: Duration) -> Duration {
     new_interval.mul_f64(rand::thread_rng().gen_range(0.0..1.0))
 }
 
-/// Adopt a manager-served interval, if there is one and it differs.
+/// The interval to beat at after a reply, when it differs from `current`.
 ///
-/// A worker that receives nothing (adaptive cadence off, or an older manager)
-/// keeps its worker-type value — exactly today's behavior. A worker that
-/// receives one is never penalized for honoring it: the manager derives that
-/// node's lost window from the same number, and widens before it tells anyone.
-pub(crate) fn adopt_served_interval(current: Duration, served: Option<u32>) -> Option<Duration> {
-    let served =
-        Duration::from_secs(u64::from(served?).clamp(1, u64::from(MAX_WORKER_HEARTBEAT_SECONDS)));
-    (served != current).then_some(served)
+/// A served interval is a FLOOR over the worker-type `configured` cadence,
+/// not an override: a 60s batch pool keeps beating every 60s while the
+/// manager serves 2s to a small fleet, and only slows further once the fleet
+/// grows past 60s. A reply with no interval (adaptive cadence off, or an
+/// older manager) means "use your own", so turning adaptive cadence off
+/// returns every worker to its worker-type value without a restart. A worker
+/// is never penalized for honoring the served value: the manager derives the
+/// node's lost window from the same number, and widens before it tells
+/// anyone.
+pub(crate) fn adopt_served_interval(
+    current: Duration,
+    configured: Duration,
+    served: Option<u32>,
+) -> Option<Duration> {
+    let target = match served {
+        Some(served) => configured.max(Duration::from_secs(
+            u64::from(served).clamp(1, u64::from(MAX_WORKER_HEARTBEAT_SECONDS)),
+        )),
+        None => configured,
+    };
+    (target != current).then_some(target)
 }
 
 /// The heartbeat sleep, jittered ±10% so a fleet that (re)started together
@@ -703,7 +716,7 @@ async fn start_heartbeats(
     registration: RegistrationPayload,
     forwarder: Arc<UpstreamForwarder>,
     // The worker-type cadence this worker starts at. Mutable because the
-    // manager may serve a different one on the reply (adaptive cadence,
+    // manager may serve a slower one on the reply (adaptive cadence,
     // docs/heartbeat-cadence-and-scale.md).
     mut heartbeat_interval: Duration,
     // Edge-boot spec cache to keep warm from the desired set; `None` on a
@@ -711,6 +724,7 @@ async fn start_heartbeats(
     spec_cache: Option<crate::worker::edge::SpecCache>,
 ) -> R<()> {
     let mut backoff = HEARTBEAT_RETRY_MIN;
+    let configured_interval = heartbeat_interval;
 
     loop {
         let tick_started = std::time::Instant::now();
@@ -756,7 +770,7 @@ async fn start_heartbeats(
                 // re-phase so a fleet that all learns the new value within one
                 // old interval spreads across the new period instead of
                 // re-phasing onto the same boundary.
-                match adopt_served_interval(heartbeat_interval, served) {
+                match adopt_served_interval(heartbeat_interval, configured_interval, served) {
                     Some(next) => {
                         info!(
                             worker = %name,
@@ -2413,6 +2427,44 @@ mod tests {
             .to_string(),
             ..TaskAllocation::default()
         }
+    }
+
+    #[test]
+    fn served_interval_is_a_floor_over_the_worker_type_cadence_test() {
+        let secs = Duration::from_secs;
+        // A 2s worker type follows the manager up the ladder...
+        assert_eq!(
+            adopt_served_interval(secs(2), secs(2), Some(21)),
+            Some(secs(21))
+        );
+        // ...and an unchanged serve is not a re-phase.
+        assert_eq!(adopt_served_interval(secs(21), secs(2), Some(21)), None);
+        // The 2s floor a small fleet is served changes nothing for it.
+        assert_eq!(adopt_served_interval(secs(2), secs(2), Some(2)), None);
+        // A 60s batch pool keeps its own cadence until the served interval
+        // passes it, rather than being sped up to the floor.
+        assert_eq!(adopt_served_interval(secs(60), secs(60), Some(2)), None);
+        assert_eq!(
+            adopt_served_interval(secs(60), secs(60), Some(89)),
+            Some(secs(89))
+        );
+        // A worker type faster than the floor is slowed to it.
+        assert_eq!(
+            adopt_served_interval(secs(1), secs(1), Some(2)),
+            Some(secs(2))
+        );
+        // No served interval (adaptive off, or an older manager) means "use
+        // your own": an adopted interval reverts without a restart.
+        assert_eq!(
+            adopt_served_interval(secs(21), secs(2), None),
+            Some(secs(2))
+        );
+        assert_eq!(adopt_served_interval(secs(2), secs(2), None), None);
+        // Clamped to the legal worker range like any other cadence.
+        assert_eq!(
+            adopt_served_interval(secs(2), secs(2), Some(10_000)),
+            Some(secs(u64::from(MAX_WORKER_HEARTBEAT_SECONDS)))
+        );
     }
 
     #[test]

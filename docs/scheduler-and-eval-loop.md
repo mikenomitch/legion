@@ -177,26 +177,31 @@ Coupled placements (shared `distinct` keys, multi-task groups) keep exact
 all-or-nothing semantics. Overlapping candidate lists are not coupling.
 Candidate lists are on by default (`schedulerSettings.plan_candidates = 8`),
 and `0` disables them and restores single-node submissions. The epoch
-sample (lazy or eager, below) covers the union of every placement's candidate list, and
+sample (below) covers the union of every placement's candidate list, and
 candidate submissions take the same group commit as single-node ones.
 
-### The epoch sample is lazy by default
+### The epoch sample comes from the plan's own snapshot
 
 The fence rule is that epochs must be sampled no later than the capacity
-snapshot the plan is built against. Sampling every candidate node up front
-always satisfies that, but costs O(fleet) per plan. By default the scheduler
-instead plans first, then samples epochs for only the scopes the plan touches
-(the job config plus the union of every placement's candidate list).
+snapshot the plan is built against. The scheduler meets it by taking the
+epochs with that snapshot. The read model keeps its allocations, free
+pools, and scope epochs in persistent maps, so one read-lock acquisition
+captures all three at O(1) cost, whatever the fleet size.
 
-It accepts that late sample only when the read model's **generation
-counter**, which is bumped on every allocation publish, proves nothing changed
-since the capacity read. If something did change mid-plan, the scheduler
-re-plans once with the eager whole-fleet sample, which is always safe. The
-`legion_scheduler_lazy_sample_fallback_total` metric counts these re-plans.
+After planning, the scheduler reads the epochs of only the scopes the plan
+touches (the job config plus the union of every placement's candidate list)
+from that captured copy. Anything that commits after the snapshot is
+invisible to it, so the plan-apply compare-and-set rejects only the plans
+whose scopes moved. A plan never re-runs because something unrelated
+committed.
 
-`schedulerSettings.lazy_version_sample = false` restores the eager sample on
-every plan. Correctness never depends on this setting, because the lazy path
-falls back on its own whenever it cannot prove equivalence.
+`schedulerSettings.lazy_version_sample` is **retired**. It still parses,
+so existing configs keep loading, but it has no effect, and the manager
+logs one warning when it is set:
+
+```text
+WARN schedulerSettings.lazy_version_sample is retired and has no effect: plans now sample the fence epochs from their own snapshot
+```
 
 ### Group commit
 
@@ -301,12 +306,23 @@ there is nothing to tune.
 ### Observing where plan time goes
 
 Every `plan_and_apply` records a per-phase wall-clock breakdown
-(`PlanTimings` on the outcome): node snapshot, epoch sample, task fetch,
-capacity snapshot, `build_plan`, and the fused apply. It is logged per
-plan at debug, exported as the `legion_scheduler_plan_phase_seconds{phase}`
-histogram ([metrics.md](metrics.md)), and aggregated by the benchmark
-runners ([testing-and-benchmarks.md](testing-and-benchmarks.md)). When
-scheduling latency changes, find the phase that moved first.
+(`PlanTimings` on the outcome): job lookups, node set, task fetch, capacity
+snapshot, `build_plan`, epoch sample, speculative dispatch, the fused apply,
+and the post-apply bookkeeping. It is logged per plan at debug, exported as
+the `legion_scheduler_plan_phase_seconds{phase}` histogram
+([metrics.md](metrics.md)), and aggregated by the benchmark runners
+([testing-and-benchmarks.md](testing-and-benchmarks.md)). Rejected plans are
+observed too, so a plan that loses the fence still shows up. When scheduling
+latency changes, find the phase that moved first.
+
+A plan is only part of an eval. `legion_eval_phase_seconds{kind, phase}`
+splits each eval's handler time into the wait for a blocking-pool thread
+(`queue_wait`), scheduler construction, the kind's own pre-plan work
+(`prepare`), every plan attempt (`plan`), the sleeps between conflicted
+attempts (`conflict_backoff`), building the workers' payloads (`dispatch`),
+and post-plan bookkeeping (`finish`). `legion_eval_queue_round_seconds{op}`
+times the claim and settle rounds between handlers. Together they account
+for the gap between `legion_eval_handle_seconds` and the plan's `total`.
 
 ### Apply-time re-validation
 
@@ -437,11 +453,25 @@ tuning here (see
 
 - `node.availability == "available"`
 
-Nodes are sorted by ID before planning. The sorted list and each node's
-free-capacity pool are cached in the scheduler read model and shared by
-reference. A plan's snapshot costs refcount bumps instead of a fleet-sized
-filter, sort, and copy. Any node mutation invalidates the cached list, and
-the next plan rebuilds it.
+Nodes are sorted by ID before planning. The sorted list, a by-ID lookup over
+it, and each node's free-capacity pool are cached in the scheduler read model
+and shared by reference. Taking the node set is one `Arc` clone, so a plan's
+node set costs the same at 1,000 nodes as at 50,000. Before the lookup was
+cached, every plan built a hash map over every available node and copied the
+list, which was the last per-plan cost that grew with the fleet.
+
+Any node mutation (registration, attribute change, drain, loss, removal, or a
+state-store swap such as a snapshot install) invalidates the cached set, and
+the next plan rebuilds it. The rebuild runs outside the read-model write lock,
+so it never stalls heartbeats or other planners, and it is installed only if no
+node changed while it was being built. `legion_scheduler_node_list_rebuilds_total`
+counts rebuilds ([metrics.md](metrics.md)). It should sit near zero while the
+fleet is stable.
+
+A plan that excludes nodes (a reschedule away from a failed node) shares the
+cached set unless an excluded node is actually in it. Only then does it build a
+filtered copy, which costs O(fleet). In practice the excluded node is usually
+already unavailable.
 
 The read model also keeps a per-job index of allocations by node,
 maintained by the same writes that maintain the per-node allocation lists.

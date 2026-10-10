@@ -105,6 +105,8 @@ Plans, roadmaps, to-do lists, and development notes live in
   the trade-offs.
 - [Codebase Conventions](codebase-conventions.md)
 - [Testing and Benchmarks](testing-and-benchmarks.md)
+- [Benchmarks](benchmarks.md): placement throughput, latency, and recovery
+  on AWS from 1k to 50k nodes, with Nomad and Kubernetes on the same rig.
 - [Worker Simulation](worker-simulation.md): `--simulate N` runs thousands of
   simulated nodes, speaking the real wire protocol, from one process. Use it
   for benchmarking and load testing.
