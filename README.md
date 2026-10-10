@@ -195,6 +195,15 @@ wide margin ([benchmarks](docs/benchmarks.md)):
 - **42x** the densely packed services placed per second
 - **Much faster recovery** when a large share of nodes die at once
 
+Services placed per second as the fleet grows:
+
+| Nodes  | Legion  | Nomad 2.0.5 | Kubernetes 1.36.5 |
+| ------ | ------- | ----------- | ----------------- |
+| 1,000  | **829** | 122         | 117               |
+| 2,000  | **789** | 110         | 78                |
+| 5,000  | **905** | -           | 53                |
+| 10,000 | **738** | -           | -                 |
+
 How it gets there:
 
 - **No etcd bottleneck.** The scheduler plans against in-memory state and
