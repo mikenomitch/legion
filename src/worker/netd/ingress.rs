@@ -779,6 +779,127 @@ mod tests {
         assert!(!plain.contains("task saw"), "{plain}");
     }
 
+    /// `certFrom = { kv }`: the listener serves the certificate the node
+    /// fetched from KV, a newer version is presented to the next connection
+    /// with no listener restart, and a failed renewal keeps serving the last
+    /// good certificate while reporting the problem.
+    #[tokio::test]
+    async fn kv_backed_ingress_serves_and_hot_swaps_the_certificate_test() {
+        use crate::manager::mesh_ca::{generate_ca, issue_node_cert, node_dns_name};
+        use crate::worker::netd::tls::{certs_from_pem, server_name, KvCertificate};
+
+        let private = free_port().await;
+        task_on(private).await;
+        let host_port = free_port().await;
+        let (ca_pem, ca_key) = generate_ca().unwrap();
+        let (cert_1, key_1, _) = issue_node_cert(&ca_pem, &ca_key, "edge").unwrap();
+        let (cert_2, key_2, _) = issue_node_cert(&ca_pem, &ca_key, "edge").unwrap();
+
+        let cache = Arc::new(NetPolicyCache::new());
+        let effective = policy(json!({
+            "tls": { "mode": "server", "certFrom": { "kv": "certs/edge" } }
+        }));
+        let hash = effective.hash.clone();
+        cache.apply_assignments(&[AllocNetPolicy {
+            allocation_id: 31,
+            policy_hash: hash.clone(),
+        }]);
+        cache.insert_body(&hash, effective).unwrap();
+        let context = Arc::new(ForwarderContext::new(cache, Arc::new(Denials::new())));
+        let ingress = IngressListeners::new(context.clone());
+        ingress
+            .sync(&[IngressSpec {
+                allocation_id: 31,
+                label: "https".into(),
+                host_port,
+                private_port: private,
+                netns: None,
+                bind: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            }])
+            .await;
+
+        // A client that trusts the CA: returns the leaf it was shown and
+        // what the task answered.
+        let dial = || {
+            let ca_pem = ca_pem.clone();
+            async move {
+                let mut roots = rustls::RootCertStore::empty();
+                for cert in certs_from_pem(ca_pem.as_bytes()).unwrap() {
+                    roots.add(cert).unwrap();
+                }
+                let config = rustls::ClientConfig::builder()
+                    .with_root_certificates(roots)
+                    .with_no_client_auth();
+                let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+                let stream = TcpStream::connect(("127.0.0.1", host_port)).await.unwrap();
+                let mut tls = connector
+                    .connect(server_name(&node_dns_name("edge")).unwrap(), stream)
+                    .await
+                    .unwrap();
+                let leaf = tls.get_ref().1.peer_certificates().unwrap()[0].clone();
+                tls.write_all(b"GET /hello HTTP/1.1\r\nHost: svc\r\nConnection: close\r\n\r\n")
+                    .await
+                    .unwrap();
+                let mut out = Vec::new();
+                let _ =
+                    tokio::time::timeout(Duration::from_secs(3), tls.read_to_end(&mut out)).await;
+                (leaf, String::from_utf8_lossy(&out).to_string())
+            }
+        };
+        let leaf_of = |pem: &str| certs_from_pem(pem.as_bytes()).unwrap()[0].clone();
+
+        context.set_kv_cert(
+            31,
+            KvCertificate::from_bundle("certs/edge", 1, &format!("{cert_1}{key_1}")).unwrap(),
+        );
+        let (leaf, body) = dial().await;
+        assert_eq!(leaf, leaf_of(&cert_1));
+        assert!(body.contains("task saw GET /hello"), "{body}");
+
+        context.set_kv_cert(
+            31,
+            KvCertificate::from_bundle("certs/edge", 2, &format!("{cert_2}{key_2}")).unwrap(),
+        );
+        assert_eq!(context.kv_cert_version(31), 2);
+        let (leaf, _) = dial().await;
+        assert_eq!(
+            leaf,
+            leaf_of(&cert_2),
+            "the next connection gets the new version"
+        );
+
+        context.set_kv_cert_error(31, "kv certs/edge holds no private key".into());
+        assert_eq!(
+            context.ingress_tls_status(31),
+            (true, "kv certs/edge holds no private key".to_string())
+        );
+        let (leaf, _) = dial().await;
+        assert_eq!(
+            leaf,
+            leaf_of(&cert_2),
+            "a failed renewal keeps the last good cert"
+        );
+    }
+
+    #[test]
+    fn kv_bundles_are_validated_test() {
+        use crate::manager::mesh_ca::{generate_ca, issue_node_cert};
+        use crate::worker::netd::tls::validate_bundle;
+        let (ca_pem, ca_key) = generate_ca().unwrap();
+        let (cert, key, _) = issue_node_cert(&ca_pem, &ca_key, "edge").unwrap();
+        let (_, other_key, _) = issue_node_cert(&ca_pem, &ca_key, "edge").unwrap();
+
+        validate_bundle(&format!("{cert}{key}")).unwrap();
+        let no_key = validate_bundle(&cert).unwrap_err().to_string();
+        assert!(no_key.contains("no private key"), "{no_key}");
+        let no_cert = validate_bundle(&key).unwrap_err().to_string();
+        assert!(no_cert.contains("no certificate"), "{no_cert}");
+        let mismatch = validate_bundle(&format!("{cert}{other_key}"))
+            .unwrap_err()
+            .to_string();
+        assert!(mismatch.contains("do not match"), "{mismatch}");
+    }
+
     #[tokio::test]
     async fn l4_ingress_denies_by_peer_cidr() {
         let private = free_port().await;

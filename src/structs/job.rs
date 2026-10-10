@@ -1910,6 +1910,9 @@ fn substitute_params(
 #[serde(rename_all = "camelCase")]
 pub enum KvInjectionAction {
     None,
+    /// Rewrite a KV `files` entry under the running task, then apply the
+    /// entry's `changeMode`. Files only: a live process's env cannot change.
+    Update,
     Restart,
     Rollout,
     Fail,
@@ -1986,6 +1989,31 @@ pub struct TaskKvFileInjection {
     pub file: KvTemplateSource,
     #[serde(default)]
     pub kv: KvInjectionPolicy,
+    /// What the running task receives after an `onChange = "update"`
+    /// rewrite: nothing (default), `changeSignal`, or an in-place restart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change_mode: Option<crate::structs::workload_identity::ChangeMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change_signal: Option<String>,
+    /// Random delay of up to this long before acting, so a fleet does not
+    /// reload at once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub splay: Option<String>,
+}
+
+/// The `liveUpdate` marker on a rendered `config.files` entry, written by the
+/// manager for `onChange = "update"` files. Its presence is what lets the
+/// worker rewrite the file under a running task; the fields say what the task
+/// receives afterwards.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct LiveFileUpdate {
+    #[serde(default)]
+    pub change_mode: crate::structs::workload_identity::ChangeMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change_signal: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub splay: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
@@ -3031,14 +3059,25 @@ impl TaskConfig {
             return Ok(());
         };
 
+        let defaults = injections.kv.clone().unwrap_or_default();
         for env in &injections.env {
             if env.name.trim().is_empty() {
                 bail!("task {} kv_injections.env name cannot be empty", self.name);
             }
-            validate_template_source(
-                &format!("task {} kv_injections.env {}", self.name, env.name),
-                &env.value,
-            )?;
+            let scope = format!("task {} env {}", self.name, env.name);
+            validate_template_source(&scope, &env.value)?;
+            let policy = env.kv.resolve_with_defaults(&defaults);
+            if policy.on_change == KvInjectionAction::Update {
+                bail!(
+                    "{scope}: onChange = \"update\" cannot change a running process's \
+                     environment; use \"restart\" or \"rollout\""
+                );
+            }
+            if policy.on_delete == KvInjectionAction::Update {
+                bail!(
+                    "{scope}: onDelete cannot be \"update\"; a deleted key has nothing to render"
+                );
+            }
         }
 
         for file in &injections.files {
@@ -3048,10 +3087,38 @@ impl TaskConfig {
                     self.name
                 );
             }
-            validate_template_source(
-                &format!("task {} kv_injections.files {}", self.name, file.path),
-                &file.file,
-            )?;
+            let scope = format!("task {} file {}", self.name, file.path);
+            validate_template_source(&scope, &file.file)?;
+            let policy = file.kv.resolve_with_defaults(&defaults);
+            if policy.on_delete == KvInjectionAction::Update {
+                bail!(
+                    "{scope}: onDelete cannot be \"update\"; a deleted key has nothing to render"
+                );
+            }
+            let live = policy.on_change == KvInjectionAction::Update;
+            for (field, set) in [
+                ("changeMode", file.change_mode.is_some()),
+                ("changeSignal", file.change_signal.is_some()),
+                ("splay", file.splay.is_some()),
+            ] {
+                if set && !live {
+                    bail!("{scope}: {field} only applies with kv.onChange = \"update\"");
+                }
+            }
+            if file.change_mode == Some(crate::structs::workload_identity::ChangeMode::Signal) {
+                let signal = file.change_signal.as_deref().unwrap_or("").trim();
+                if signal.is_empty() {
+                    bail!("{scope}: changeMode = \"signal\" needs changeSignal");
+                }
+                crate::structs::workload_identity::normalize_change_signal(signal)
+                    .map_err(|err| anyhow!("{scope}: {err}"))?;
+            } else if file.change_signal.is_some() {
+                bail!("{scope}: changeSignal needs changeMode = \"signal\"");
+            }
+            if let Some(splay) = file.splay.as_deref() {
+                crate::structs::netpolicy::parse_duration(splay)
+                    .map_err(|err| anyhow!("{scope}: splay: {err}"))?;
+            }
         }
 
         Ok(())

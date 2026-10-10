@@ -148,7 +148,7 @@ Per-reference policy fields (all optional):
 | Field      | Values                                | Hard default |
 |------------|---------------------------------------|--------------|
 | `watch`    | `true` / `false`                      | `false`      |
-| `onChange` | `none`, `restart`, `rollout`, `fail`  | `none`       |
+| `onChange` | `none`, `update` (files only), `restart`, `rollout`, `fail` | `none` |
 | `onDelete` | `none`, `restart`, `rollout`, `fail`  | `fail`       |
 
 Precedence is field by field. An entry-level `kv` block overrides only the
@@ -161,11 +161,14 @@ A put resolves through `onChange` and a delete through `onDelete`. Edges with
 `watch = false` (the default) never act. A put still refreshes the rendered
 value in the stored desired config, and the task picks it up on its next
 restart or update. When one KV change matches several edges of a job, the
-strongest action wins: `none < restart < rollout < fail`.
+strongest action wins: `none < update < restart < rollout < fail`.
 
 Actions:
 
 - `none`: re-render and store the desired state. Nothing is scheduled.
+- `update` (files only): re-render, then rewrite the file under the running
+  task and apply its `changeMode`. The allocation is not replaced. See
+  [Live file updates](#live-file-updates).
 - `restart`: re-render, then enqueue a `job_update` eval. This re-evaluates
   all of the job's allocations against the new config, including tasks that
   don't use the changed key. A watched-key restart replaces every task's
@@ -179,6 +182,75 @@ Actions:
 A deleted key can't be re-rendered, so entries that depend on it keep their
 last rendered value. `onDelete = "restart"` and `onDelete = "rollout"` still
 fire even though the rendered config is unchanged.
+
+### Live file updates
+
+`onChange = "update"` rewrites a rendered file under the running task when its
+KV value changes, instead of replacing the allocation. Use it for anything a
+process can reload: a TLS certificate, a config file, a feature-flag list.
+
+```nickel
+files = [
+  {
+    path = "tls/bundle.pem",
+    mode = "0400",
+    file = { template = "{{ kv \"certs/app.example.com\" }}" },
+    kv = { watch = true, onChange = "update" },
+    changeMode = "signal",       # noop (default) | signal | restart
+    changeSignal = "SIGHUP",     # required by signal
+    splay = "10s",               # optional random delay before acting
+  },
+],
+```
+
+What happens on a `kv put`:
+
+1. The manager re-renders the job config and moves the job's running
+   allocations to it in place. Nothing is stopped or rescheduled, and no
+   rollout is created.
+2. On its next heartbeat, each worker compares the file's new content and
+   mode with what the allocation has. When either changed, it rewrites the
+   file atomically (temp file created with the declared mode, fsync, rename),
+   so a reader never sees a torn file and a key is never readable at a
+   broader mode.
+3. The worker applies `changeMode`:
+   - `noop`: nothing more. Use it for clients that re-read the file.
+   - `signal`: send `changeSignal` (for example `SIGHUP` for nginx or
+     HAProxy). The runtime must support signals (`exec` and `container` do).
+   - `restart`: restart the task in place, on the same node.
+
+   When several files of one allocation change together, the strongest mode
+   wins: one restart, or each distinct signal once. `splay` delays the action
+   by a random amount up to the largest `splay` among them, so a fleet does
+   not reload at once.
+
+The new content is also recorded in the worker's copy of the task config, so a
+later restart launches with it.
+
+Rules, checked at submit:
+
+- `update` is rejected for env entries, including when it comes from the
+  task-level default. A running process's environment cannot change:
+  `task api env FLAGS: onChange = "update" cannot change a running process's
+  environment; use "restart" or "rollout"`.
+- `update` is rejected for `onDelete`. A deleted key has nothing to render.
+- `changeMode`, `changeSignal`, and `splay` are rejected unless the file's
+  `onChange` resolves to `update`.
+- `changeMode = "signal"` needs `changeSignal`, from the same signal set as
+  workload identities.
+
+Limitations:
+
+- The rewrite reaches the task on the worker's next heartbeat, so expect up
+  to one heartbeat interval of delay after the debounce window.
+- A job that is `failed` from a missing KV dependency recovers through
+  `restart` even when the edge says `update`. Only replacing the allocations
+  clears their failure stamps.
+- A put that changes both an `update` file and an env entry watched with
+  `restart` or `rollout` takes the stronger action. The file arrives with the
+  replacement.
+- Only files carrying `onChange = "update"` are rewritten live. Any other
+  rendered file, and every env value, still waits for the next start.
 
 ### Debounce / coalescing
 
@@ -272,10 +344,12 @@ files = [
 ],
 ```
 
-Legion mounts the directory rather than individual files. A re-render is an
-atomic rewrite-and-rename on the host, so the running container sees it
-without a restart. This is why `onChange` policies other than `restart` are
-useful for container tasks. See
+Legion mounts the directory rather than individual files, so a file rewritten
+on the host is visible inside the running container. Files are written
+atomically at start, and with `onChange = "update"` they are rewritten the
+same way while the container runs (see
+[Live file updates](#live-file-updates)). Without `update`, a re-render only
+reaches the container when the allocation restarts or is replaced. See
 [docs/task-runtime-container.md](task-runtime-container.md).
 
 ### Env precedence

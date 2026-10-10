@@ -20,9 +20,6 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 #[cfg(unix)]
 use std::ffi::CString;
-use std::fs;
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 #[cfg(unix)]
@@ -471,18 +468,15 @@ impl TaskPlugin for ExecTaskPlugin {
                 .read_write_paths
                 .push(task_dir.display().to_string());
         }
+        // Atomic (temp file, mode, fsync, rename), the same writer a live
+        // `onChange = "update"` rewrite uses, so a reader never sees a torn
+        // file and a key is never briefly readable at the umask.
         for file in &config.files {
-            let path = std::path::PathBuf::from(&file.path);
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            fs::write(&path, file.content.as_bytes())?;
-            #[cfg(unix)]
-            if let Some(mode) = file.mode.as_deref() {
-                if let Ok(mode_bits) = u32::from_str_radix(mode.trim_start_matches('0'), 8) {
-                    fs::set_permissions(&path, fs::Permissions::from_mode(mode_bits))?;
-                }
-            }
+            crate::worker::identity::write_token_file(
+                std::path::Path::new(&file.path),
+                &file.content,
+                crate::task_plugins::injected_file_mode(file.mode.as_deref()),
+            )?;
         }
 
         info!(

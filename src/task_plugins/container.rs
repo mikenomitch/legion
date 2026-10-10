@@ -237,20 +237,12 @@ fn materialize_task_files(files: &[ContainerInjectedFile], instance: &TaskInstan
             crate::task_plugins::resolve_task_dir_destination(TASK_DIR_MOUNT, &file.path)
                 .map_err(|err| anyhow!("declared file path {err}"))?;
         let destination = task_dir.join(relative);
-        if let Some(parent) = destination.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("create {}", parent.display()))?;
-        }
-        std::fs::write(&destination, file.content.as_bytes())
-            .with_context(|| format!("write {}", destination.display()))?;
-        #[cfg(unix)]
-        if let Some(mode) = file.mode.as_deref() {
-            use std::os::unix::fs::PermissionsExt;
-            if let Ok(bits) = u32::from_str_radix(mode.trim().trim_start_matches('0'), 8) {
-                std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(bits))
-                    .with_context(|| format!("chmod {}", destination.display()))?;
-            }
-        }
+        crate::worker::identity::write_token_file(
+            &destination,
+            &file.content,
+            crate::task_plugins::injected_file_mode(file.mode.as_deref()),
+        )
+        .with_context(|| format!("write {}", destination.display()))?;
     }
     Ok(())
 }

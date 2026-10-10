@@ -627,6 +627,106 @@ impl WorkerTaskManager {
         Ok(())
     }
 
+    /// Rewrite the `onChange = "update"` KV files of a running allocation
+    /// whose rendered content or mode changed (docs/kv-store.md, "Live file
+    /// updates"), and record them in the stored task config so a later
+    /// restart launches with the same content. Returns the marker of each
+    /// rewritten file, for the caller to apply `changeMode`.
+    ///
+    /// Only entries carrying the manager's `liveUpdate` marker are touched;
+    /// any other difference waits for the next (re)start, as before. Paths
+    /// resolve exactly as the runtime's start path resolves them. The
+    /// content may be a secret (a private key): it is never logged.
+    pub fn apply_live_files(
+        &mut self,
+        allocation_id: i64,
+        incoming: &[Value],
+    ) -> Vec<crate::structs::LiveFileUpdate> {
+        let local = self.local_key(allocation_id);
+        let Some(task) = self.task_configs.get(&local) else {
+            return Vec::new();
+        };
+        if !self.instances.contains_key(&local) {
+            return Vec::new();
+        }
+        let (task_name, runtime) = (task.name.clone(), task.runtime.clone());
+        let mut stored: Vec<Value> = task
+            .config
+            .get("files")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let root = self
+            .registry
+            .plugin(&runtime)
+            .and_then(|plugin| plugin.file_delivery_root());
+        let task_dir = self
+            .instances
+            .get(&local)
+            .and_then(|instance| instance.task_dir.clone())
+            .unwrap_or_else(|| self.task_dir_for(local, &task_name));
+
+        let mut applied = Vec::new();
+        for entry in incoming {
+            let Some(marker) = entry.get("liveUpdate") else {
+                continue;
+            };
+            let Ok(marker) =
+                serde_json::from_value::<crate::structs::LiveFileUpdate>(marker.clone())
+            else {
+                continue;
+            };
+            let Some(path) = entry.get("path").and_then(Value::as_str) else {
+                continue;
+            };
+            let content = entry.get("content").and_then(Value::as_str).unwrap_or("");
+            let mode = entry.get("mode").and_then(Value::as_str);
+            let position = stored
+                .iter()
+                .position(|existing| existing.get("path").and_then(Value::as_str) == Some(path));
+            if let Some(existing) = position.map(|index| &stored[index]) {
+                if existing.get("content").and_then(Value::as_str) == Some(content)
+                    && existing.get("mode").and_then(Value::as_str) == mode
+                {
+                    continue;
+                }
+            }
+            let host_path = match root {
+                Some(root) => match crate::task_plugins::resolve_task_dir_destination(root, path) {
+                    Ok(relative) => task_dir.join(relative),
+                    Err(err) => {
+                        warn!(allocation_id, path, error = %err, "Skipping live KV file");
+                        continue;
+                    }
+                },
+                None => PathBuf::from(path),
+            };
+            let bits = crate::task_plugins::injected_file_mode(mode);
+            if let Err(err) = crate::worker::identity::write_token_file(&host_path, content, bits) {
+                warn!(allocation_id, path, error = ?err, "Failed to rewrite live KV file");
+                continue;
+            }
+            match position {
+                Some(index) => stored[index] = entry.clone(),
+                None => stored.push(entry.clone()),
+            }
+            info!(allocation_id, path, "Rewrote live KV file");
+            applied.push(marker);
+        }
+
+        if !applied.is_empty() {
+            if let Some(config) = self
+                .task_configs
+                .get_mut(&local)
+                .and_then(|task| task.config.as_object_mut())
+            {
+                config.insert("files".into(), Value::Array(stored));
+            }
+            self.persist_state();
+        }
+        applied
+    }
+
     /// Deliver a Unix signal (e.g. "SIGHUP") to the allocation — the
     /// `changeMode: signal` pathway for refreshed identity tokens.
     ///

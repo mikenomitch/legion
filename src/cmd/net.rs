@@ -1139,20 +1139,43 @@ pub(crate) fn diagnose_network(
         }
         // TLS material: an ingress chain that terminates TLS needs its
         // files (or the mesh certificate) before it accepts anything.
+        let kv_cert = effective
+            .ingress
+            .as_ref()
+            .and_then(|c| c.tls.as_ref())
+            .and_then(|t| t.cert_kv_path())
+            .map(str::to_string);
         if !status.tls_ready {
+            let hint = match &kv_cert {
+                Some(path) => format!("put the chain followed by the private key, as one PEM value: legion kv put {path} \"$(cat fullchain.pem privkey.pem)\""),
+                None => "for certPath/keyPath, put the files on the node (or stage them as artifacts); for certFrom = \"legion\", the node issues its certificate on its next heartbeat".into(),
+            };
             steps.push(DoctorStep {
                 layer: "tls",
                 status: "fail",
-                detail: format!("allocation {alloc}: ingress TLS is not ready — {}", status.tls_error),
-                hint: Some("for certPath/keyPath, put the files on the node (or stage them as artifacts); for certFrom = \"legion\", the node issues its certificate on its next heartbeat".into()),
+                detail: format!(
+                    "allocation {alloc}: ingress TLS is not ready — {}",
+                    status.tls_error
+                ),
+                hint: Some(hint),
             });
             return steps;
+        }
+        // Ready, with an error: a KV renewal was rejected and the previous
+        // certificate is still being served.
+        if let (Some(path), false) = (&kv_cert, status.tls_error.is_empty()) {
+            steps.push(DoctorStep {
+                layer: "tls",
+                status: "warn",
+                detail: format!("allocation {alloc}: serving the previous certificate; the current kv {path} value was rejected — {}", status.tls_error),
+                hint: Some(format!("fix the value at {path}; the node picks it up on its next heartbeat")),
+            });
         }
         let wants_mesh = effective
             .ingress
             .as_ref()
             .and_then(|c| c.tls.as_ref())
-            .is_some_and(|t| t.cert_from.as_deref() == Some("legion"));
+            .is_some_and(|t| t.cert_from_mesh());
         if wants_mesh && !status.mesh_identity {
             steps.push(DoctorStep {
                 layer: "tls",

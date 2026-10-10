@@ -6964,6 +6964,233 @@ export class IssueNodeCertificateReply extends Message<IssueNodeCertificateReply
 }
 
 /**
+ * One allocation in a GetIngressCertificates request.
+ *
+ * @generated from message legion.IngressCertificateKnown
+ */
+export class IngressCertificateKnown extends Message<IngressCertificateKnown> {
+  /**
+   * The allocation (manager-facing id) whose ingress certificate to fetch.
+   *
+   * @generated from field: int64 allocation_id = 1;
+   */
+  allocationId = protoInt64.zero;
+
+  /**
+   * The KV version of the certificate the worker already holds, or 0 for
+   * none. When it matches the current version the reply is `unchanged`.
+   *
+   * @generated from field: int64 version = 2;
+   */
+  version = protoInt64.zero;
+
+  constructor(data?: PartialMessage<IngressCertificateKnown>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.IngressCertificateKnown";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "allocation_id", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 2, name: "version", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): IngressCertificateKnown {
+    return new IngressCertificateKnown().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): IngressCertificateKnown {
+    return new IngressCertificateKnown().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): IngressCertificateKnown {
+    return new IngressCertificateKnown().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: IngressCertificateKnown | PlainMessage<IngressCertificateKnown> | undefined, b: IngressCertificateKnown | PlainMessage<IngressCertificateKnown> | undefined): boolean {
+    return proto3.util.equals(IngressCertificateKnown, a, b);
+  }
+}
+
+/**
+ * Request payload for GetIngressCertificates.
+ *
+ * @generated from message legion.GetIngressCertificatesRequest
+ */
+export class GetIngressCertificatesRequest extends Message<GetIngressCertificatesRequest> {
+  /**
+   * The worker node asking. Must match the caller's authenticated per-node
+   * credential.
+   *
+   * @generated from field: string node_id = 1;
+   */
+  nodeId = "";
+
+  /**
+   * The allocations on this node with a `certFrom = { kv }` ingress chain.
+   *
+   * @generated from field: repeated legion.IngressCertificateKnown known = 2;
+   */
+  known: IngressCertificateKnown[] = [];
+
+  constructor(data?: PartialMessage<GetIngressCertificatesRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetIngressCertificatesRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "node_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "known", kind: "message", T: IngressCertificateKnown, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetIngressCertificatesRequest {
+    return new GetIngressCertificatesRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetIngressCertificatesRequest {
+    return new GetIngressCertificatesRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetIngressCertificatesRequest {
+    return new GetIngressCertificatesRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetIngressCertificatesRequest | PlainMessage<GetIngressCertificatesRequest> | undefined, b: GetIngressCertificatesRequest | PlainMessage<GetIngressCertificatesRequest> | undefined): boolean {
+    return proto3.util.equals(GetIngressCertificatesRequest, a, b);
+  }
+}
+
+/**
+ * One allocation's certificate in a GetIngressCertificates reply.
+ *
+ * @generated from message legion.IngressCertificate
+ */
+export class IngressCertificate extends Message<IngressCertificate> {
+  /**
+   * The allocation this certificate is for.
+   *
+   * @generated from field: int64 allocation_id = 1;
+   */
+  allocationId = protoInt64.zero;
+
+  /**
+   * The KV path the allocation's effective ingress chain names. Set even
+   * when `error` is, so the worker can report which key is at fault.
+   *
+   * @generated from field: string kv_path = 2;
+   */
+  kvPath = "";
+
+  /**
+   * The KV entry's version. The worker re-fetches when it moves.
+   *
+   * @generated from field: int64 version = 3;
+   */
+  version = protoInt64.zero;
+
+  /**
+   * True when `version` equals the version the worker sent. No material is
+   * returned.
+   *
+   * @generated from field: bool unchanged = 4;
+   */
+  unchanged = false;
+
+  /**
+   * The PEM bundle: the certificate chain, leaf first, then the private
+   * key. Validated by the manager before it is sent. Treat as a secret:
+   * never log it, never write it to disk.
+   *
+   * @generated from field: string bundle_pem = 5;
+   */
+  bundlePem = "";
+
+  /**
+   * Why no certificate was returned, e.g. "kv certs/app not found" or
+   * "kv certs/app holds no private key". Empty on success.
+   *
+   * @generated from field: string error = 6;
+   */
+  error = "";
+
+  constructor(data?: PartialMessage<IngressCertificate>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.IngressCertificate";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "allocation_id", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 2, name: "kv_path", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "version", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 4, name: "unchanged", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 5, name: "bundle_pem", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 6, name: "error", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): IngressCertificate {
+    return new IngressCertificate().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): IngressCertificate {
+    return new IngressCertificate().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): IngressCertificate {
+    return new IngressCertificate().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: IngressCertificate | PlainMessage<IngressCertificate> | undefined, b: IngressCertificate | PlainMessage<IngressCertificate> | undefined): boolean {
+    return proto3.util.equals(IngressCertificate, a, b);
+  }
+}
+
+/**
+ * Reply payload for GetIngressCertificates.
+ *
+ * @generated from message legion.GetIngressCertificatesReply
+ */
+export class GetIngressCertificatesReply extends Message<GetIngressCertificatesReply> {
+  /**
+   * One entry per requested allocation, in request order.
+   *
+   * @generated from field: repeated legion.IngressCertificate certificates = 1;
+   */
+  certificates: IngressCertificate[] = [];
+
+  constructor(data?: PartialMessage<GetIngressCertificatesReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetIngressCertificatesReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "certificates", kind: "message", T: IngressCertificate, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetIngressCertificatesReply {
+    return new GetIngressCertificatesReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetIngressCertificatesReply {
+    return new GetIngressCertificatesReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetIngressCertificatesReply {
+    return new GetIngressCertificatesReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetIngressCertificatesReply | PlainMessage<GetIngressCertificatesReply> | undefined, b: GetIngressCertificatesReply | PlainMessage<GetIngressCertificatesReply> | undefined): boolean {
+    return proto3.util.equals(GetIngressCertificatesReply, a, b);
+  }
+}
+
+/**
  * Request payload for Heartbeat.
  *
  * @generated from message legion.HeartbeatRequest

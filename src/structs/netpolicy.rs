@@ -414,9 +414,10 @@ pub struct HandlerConfig {
 #[serde(rename_all = "camelCase")]
 pub struct TlsConfig {
     pub mode: String,
-    /// `legion` (a cluster-issued cert) or absent (use `certPath`/`keyPath`).
+    /// `"legion"` (the node's mesh certificate), `{ kv = "<path>" }` (a PEM
+    /// bundle held in KV), or absent (use `certPath`/`keyPath`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cert_from: Option<String>,
+    pub cert_from: Option<CertFrom>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cert_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -431,6 +432,41 @@ pub struct TlsConfig {
     /// (default) or this bundle.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ca_path: Option<String>,
+}
+
+/// Where a chain's certificate comes from. The string form is the original
+/// `certFrom = "legion"` and serializes exactly as before, so existing policy
+/// hashes do not move.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum CertFrom {
+    /// `"legion"`: the node's mesh certificate.
+    Named(String),
+    /// `{ kv = "certs/app.example.com" }`: one PEM bundle (certificate chain,
+    /// then private key) held in KV, fetched by the node and hot-swapped
+    /// when the key's version moves.
+    Kv(KvCertSource),
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct KvCertSource {
+    pub kv: String,
+}
+
+impl TlsConfig {
+    /// Whether the chain presents the node's mesh certificate.
+    pub fn cert_from_mesh(&self) -> bool {
+        matches!(&self.cert_from, Some(CertFrom::Named(name)) if name == "legion")
+    }
+
+    /// The KV path of a `certFrom = { kv = ... }` chain.
+    pub fn cert_kv_path(&self) -> Option<&str> {
+        match &self.cert_from {
+            Some(CertFrom::Kv(source)) => Some(source.kv.as_str()),
+            _ => None,
+        }
+    }
 }
 
 impl ChainConfig {
@@ -586,11 +622,32 @@ impl ChainConfig {
                     tls.mode
                 );
             }
-            if let Some(from) = tls.cert_from.as_mut() {
-                *from = from.trim().to_ascii_lowercase();
-                if from != "legion" {
-                    bail!("{what}.tls.certFrom must be \"legion\" (or omit it and set certPath/keyPath)");
+            match tls.cert_from.as_mut() {
+                Some(CertFrom::Named(from)) => {
+                    *from = from.trim().to_ascii_lowercase();
+                    if from != "legion" {
+                        bail!(
+                            "{what}.tls.certFrom must be \"legion\" or {{ kv = \"<path>\" }} \
+                             (or omit it and set certPath/keyPath)"
+                        );
+                    }
                 }
+                Some(CertFrom::Kv(source)) => {
+                    source.kv = source.kv.trim().to_string();
+                    if source.kv.is_empty() {
+                        bail!("{what}.tls.certFrom.kv cannot be empty");
+                    }
+                    if !matches!(direction, Direction::Ingress) {
+                        bail!("{what}.tls.certFrom = {{ kv }} is only supported on ingress");
+                    }
+                    if tls.cert_path.is_some() || tls.key_path.is_some() {
+                        bail!(
+                            "{what}.tls.certFrom = {{ kv }} replaces certPath/keyPath; set one or \
+                             the other"
+                        );
+                    }
+                }
+                None => {}
             }
             let needs_cert = matches!(tls.mode.as_str(), TLS_SERVER | TLS_MUTUAL);
             if needs_cert
@@ -598,7 +655,8 @@ impl ChainConfig {
                 && (tls.cert_path.is_none() || tls.key_path.is_none())
             {
                 bail!(
-                    "{what}.tls.mode = \"{}\" needs certFrom = \"legion\" or both certPath and keyPath",
+                    "{what}.tls.mode = \"{}\" needs certFrom (\"legion\" or {{ kv = \"<path>\" }}) \
+                     or both certPath and keyPath",
                     tls.mode
                 );
             }
@@ -1640,6 +1698,68 @@ mod tests {
         .unwrap();
         c.normalize_and_validate("ingress", Direction::Ingress)
             .unwrap();
+    }
+
+    #[test]
+    fn cert_from_kv_is_ingress_only_and_keeps_the_legion_spelling_test() {
+        let validate = |tls: Value, direction: Direction| {
+            let mut c: ChainConfig = serde_json::from_value(json!({ "tls": tls }))?;
+            c.normalize_and_validate("chain", direction)?;
+            Ok::<_, anyhow::Error>(c)
+        };
+
+        let c = validate(
+            json!({ "mode": "server", "certFrom": { "kv": " certs/app " } }),
+            Direction::Ingress,
+        )
+        .unwrap();
+        let tls = c.tls.unwrap();
+        assert_eq!(tls.cert_kv_path(), Some("certs/app"));
+        assert!(!tls.cert_from_mesh());
+
+        // The original string form serializes exactly as before, so stored
+        // policy hashes do not move.
+        let c = validate(
+            json!({ "mode": "server", "certFrom": "legion" }),
+            Direction::Ingress,
+        )
+        .unwrap();
+        assert!(c.tls.as_ref().unwrap().cert_from_mesh());
+        assert_eq!(
+            serde_json::to_value(c.tls.unwrap()).unwrap(),
+            json!({ "mode": "server", "certFrom": "legion" })
+        );
+
+        for (tls, direction, expected) in [
+            (
+                json!({ "mode": "originate", "certFrom": { "kv": "certs/app" } }),
+                Direction::Egress,
+                "only supported on ingress",
+            ),
+            (
+                json!({ "mode": "server", "certFrom": { "kv": "" } }),
+                Direction::Ingress,
+                "cannot be empty",
+            ),
+            (
+                json!({ "mode": "server", "certFrom": { "kv": "certs/app" }, "certPath": "/x" }),
+                Direction::Ingress,
+                "replaces certPath/keyPath",
+            ),
+            (
+                json!({ "mode": "server", "certFrom": "vault" }),
+                Direction::Ingress,
+                "must be \"legion\" or { kv",
+            ),
+        ] {
+            let err = validate(tls, direction).unwrap_err().to_string();
+            assert!(err.contains(expected), "{err}");
+        }
+        // A typo inside the object is a parse error, not a silent miss.
+        assert!(serde_json::from_value::<ChainConfig>(
+            json!({ "tls": { "mode": "server", "certFrom": { "kvv": "certs/app" } } })
+        )
+        .is_err());
     }
 
     #[test]

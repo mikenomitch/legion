@@ -1785,6 +1785,12 @@ Still unplanned, and not covered by the plan:
 - [ ] Port forwarding
 - [ ] Cluster-edge ingress load balancer. The plan's ingress is node-local,
       in front of one allocation; a cluster edge is separate work
+- [ ] `clientCa = { kv = "<path>" }` for `mutual` ingress, so a private client
+      CA can live in KV like the server certificate. Not in
+      [kv-cert-delivery-plan.md](plans/kv-cert-delivery-plan.md).
+- [ ] A built-in ACME client (answering HTTP-01 from the ingress datapath).
+      Only worth it once the cluster edge above exists. Until then, the
+      renewer job in `configs/jobs/cert-renewer.ncl` covers it.
 
 ## Persistence & cluster operations
 
@@ -2014,6 +2020,19 @@ Plan: [kv-encryption-plan.md](plans/kv-encryption-plan.md) · docs: [kv-encrypti
       rendered value. Closing it needs a replicated marker (a schema change).
       There's also a residual window between `handle_job_submit` and
       `request_job_restart` inside `reconcile_kv_changes`. [calls #15](calls/architecture-audit-2026-10-09_calls.md).
+- [ ] **`onChange = "none"` probably turns into a rollout.** A watched put
+      with `none` stores a new job config but leaves the allocations on the
+      old one. That is exactly the signature `reconcile_missing_rollouts`
+      repairs, so its next pass likely rolls the job out anyway. Found while
+      building `onChange = "update"`, which moves allocations synchronously to
+      avoid it ([calls #3](calls/kv-cert-delivery-plan_calls.md)). Confirm
+      with a test, then decide: migrate in place (and keep files unmarked), or
+      document `none` as "on the next replacement".
+- [ ] **Relative KV file paths on `exec` land in the worker's directory.**
+      Start and live rewrites resolve `path` as given, so `tls/bundle.pem` is
+      written relative to the worker's cwd, not the task directory. Identity
+      files share the rule. Fix both together
+      ([calls #10](calls/kv-cert-delivery-plan_calls.md)).
 
 ## Auth, TLS & security
 
@@ -2835,6 +2854,24 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
 - [x] A value can be used in the job definition
 - [x] Reactive updates: injection into env and files, watch/on_change/on_delete
       policy, dependency graph, debounce, per-runtime capability gating
+
+[plan](plans/kv-cert-delivery-plan.md) · [calls](calls/kv-cert-delivery-plan_calls.md) ·
+[kv docs](../docs/kv-store.md#live-file-updates) ·
+[net docs](../docs/network-handlers.md#certificates-from-kv) ·
+[guide](../docs/guides/tls-certificates.md)
+
+- [x] **Live KV file updates** (2026-10-10): `onChange = "update"` on a KV
+      `files` entry rewrites it under the running task (atomic, with its mode)
+      and applies `changeMode` (`noop`/`signal`/`restart`, plus `splay`). The
+      manager moves allocations to the new config in place, with no rollout.
+      Start-time file writes became atomic too.
+- [x] **KV-backed ingress certificates** (2026-10-10): `tls.certFrom = { kv }`
+      on ingress chains. A worker-plane `GetIngressCertificates` RPC derives
+      the path from each allocation's chain, validates the bundle, and sends
+      it once per version. Nodes hot-swap with fail-static status. Naming a
+      path needs `kv:read` on it.
+- [x] Example renewer and consumer jobs: `configs/jobs/cert-renewer.ncl`
+      (lego, DNS-01, KV as the only state) and `configs/jobs/tls-edge.ncl`.
 
 [encryption plan](plans/kv-encryption-plan.md) · [docs](../docs/kv-encryption.md)
 

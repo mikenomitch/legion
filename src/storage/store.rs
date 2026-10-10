@@ -11912,7 +11912,7 @@ impl Store {
                 )
             })
             .map(|tls| {
-                if tls.cert_from.as_deref() == Some("legion") {
+                if tls.cert_from_mesh() {
                     "legion".to_string()
                 } else {
                     "byo".to_string()

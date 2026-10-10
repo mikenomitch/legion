@@ -418,7 +418,8 @@ also available as an MCP tool (`legion_net_handler_test`).
 ## mTLS
 
 Legion terminates and originates TLS, so a handler never sees it. You choose
-one of two kinds of certificate material per chain:
+one of three kinds of certificate material per chain: the mesh certificate,
+a certificate held in KV, or files on the node.
 
 ```nickel
 ingress = {
@@ -435,6 +436,7 @@ ingress = {
 | --- | --- |
 | `mode` | `server` presents a certificate. `mutual` also verifies the client's. Egress: `passthrough` (default, opaque) or `originate` (external upstreams, with TLS from the node and plaintext from the task). |
 | `certFrom = "legion"` | the node's mesh certificate (below). Omit it and give `certPath`/`keyPath` for bring-your-own files on the node (or staged artifacts). |
+| `certFrom = { kv = "<path>" }` | a certificate held in KV, swapped live when the key changes. Ingress only. See [Certificates from KV](#certificates-from-kv). |
 | `clientCa` | `"legion"` (the mesh CA) or a CA bundle path. Required for `mutual`. |
 | `requireIdentity` | identity globs. A verified peer outside them is refused with `Legion-Denied-By: tls/requireIdentity` and a `net.denied` event. Empty = any verified peer. |
 | `caPath` | egress `originate`: verify the destination against this bundle instead of the system roots. |
@@ -474,10 +476,73 @@ Then:
 its next heartbeat, and until then, peers on different CAs refuse each other.
 They never fall back to plaintext.
 
+### Certificates from KV
+
+A public certificate (from Let's Encrypt or your own CA) can live in KV
+instead of on node disks. The node serves it on the advertised port and swaps
+it when the key changes, so renewal is a single `kv put`:
+
+```nickel
+network = {
+    ports = [{ name = "https", static = 443 }],
+    ingress = {
+        tls = { mode = "server", certFrom = { kv = "certs/app.example.com" } },
+    },
+},
+```
+
+```bash
+legion kv put certs/app.example.com "$(cat fullchain.pem privkey.pem)"
+```
+
+- **One value, one bundle.** The KV value is PEM: the certificate chain, leaf
+  first, then the private key. Keeping both in one key means a reader never
+  pairs a new certificate with an old key.
+- **The task never holds the key.** The task speaks plain HTTP (or any TCP)
+  on its private port. The node terminates TLS.
+- **Swaps are live.** Each heartbeat, a node with KV-backed chains asks the
+  manager for certificates newer than the version it holds
+  (`GetIngressCertificates`). New connections get the new certificate, and
+  connections already open keep theirs. Nothing restarts.
+- **Fail-static.** The manager checks a bundle before sending it: it must hold
+  a certificate and a private key, and the key must match the leaf. A bad
+  value, a deleted key, or an unreachable manager leaves the node serving the
+  last good certificate. The allocation reports the problem: `tls_error`
+  names the key, and `problems` reads
+  `ingress TLS: serving the previous certificate; kv certs/app.example.com holds no private key`.
+  An allocation that has never had a good certificate is not ready, and its
+  handshakes fail.
+- **Access.** Naming a key in `certFrom` hands its value to the datapath, so
+  it needs the right to read it. `RunJob` (and template runs) and
+  `UpsertNetPolicy` require `kv:read` on the path in addition to their own
+  permissions. Without it the submit fails with `PermissionDenied`, naming
+  the key. A node can only fetch the key that an allocation placed on it
+  declares. It names allocations, and the manager derives each path itself.
+- **Where it works.** Inline ingress chains and policy objects. `mode` may be
+  `server` or `mutual`, with `clientCa = "legion"` or a CA bundle path for
+  `mutual`. Not on egress.
+- **In memory only.** The node never writes the material to disk, including
+  its `netd_state.json`. After a worker restart it fetches the certificate
+  again on its first heartbeat.
+
+To renew automatically, run a scheduled batch job that puts the new bundle.
+[`configs/jobs/cert-renewer.ncl`](../configs/jobs/cert-renewer.ncl) does it
+with lego and DNS-01, and
+[`configs/jobs/tls-edge.ncl`](../configs/jobs/tls-edge.ncl) serves the result.
+For a task that terminates TLS itself, such as nginx, deliver the same key as
+a file with `onChange = "update"` instead
+([Live file updates](kv-store.md#live-file-updates)).
+
+Limits: a renewal reaches the node on its next heartbeat, so expect up to
+one heartbeat interval of delay. There is no `clientCa = { kv }` yet: a
+client CA bundle comes from the mesh or a path. Legion does not run an ACME
+client itself.
+
 **Doctor.** `legion net doctor` reports `tls` as a layer. It flags BYO files
 that do not parse, and a mesh certificate the node has not received yet.
 Until it arrives, mesh peers are refused, and the allocation's `problems`
-say so.
+say so. For a KV-backed chain, it names the key and shows the
+`legion kv put` that fixes it.
 
 Limits: there is no kTLS/`splice` fast path, so a terminated mesh connection
 is copied in user space. TLS 1.2 and 1.3 are supported. There is no
@@ -846,8 +911,10 @@ This section lists what that covers and what it does not.
   advertised port and the task binds a private twin, on every runtime and
   platform. TCP only. The task sees the datapath as the peer, not the
   original client.
-- **TLS**: ingress chains terminate `server`/`mutual` TLS with your files or
-  the mesh certificate. The mesh is node-to-node mTLS with attributed
+- **TLS**: ingress chains terminate `server`/`mutual` TLS with your files, a
+  certificate held in KV (swapped live on renewal), or the mesh certificate.
+  Legion stores and serves certificates but does not issue public ones: a
+  renewal job (or any ACME client) writes them to KV. The mesh is node-to-node mTLS with attributed
   workload identity, never per-workload certificates. There is no kTLS fast
   path (a terminated connection is copied in user space), no revocation
   beyond the 24-hour lifetime, and an ingress `proxy` hop cannot reach a
