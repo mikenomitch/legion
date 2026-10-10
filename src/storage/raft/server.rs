@@ -32,8 +32,8 @@ use crate::storage::raft::types::TypeConfig;
 use crate::storage::raft::{RaftTransportRegistry, RAFT_CLUSTER_SECRET_METADATA_KEY};
 use crate::structs::raft_transport_server::RaftTransport;
 use crate::structs::{
-    JoinRaftClusterReply, JoinRaftClusterRequest, NodeLivenessDigestReply,
-    NodeLivenessDigestRequest, RaftLaneReply, RaftLaneRequest,
+    FetchRootKeyReply, FetchRootKeyRequest, JoinRaftClusterReply, JoinRaftClusterRequest,
+    NodeLivenessDigestReply, NodeLivenessDigestRequest, RaftLaneReply, RaftLaneRequest,
 };
 
 /// Constant-time byte comparison for the cluster secret, so the check does
@@ -204,6 +204,20 @@ impl RaftTransport for RaftTransportService {
             Status::unimplemented("raft join is not available on this manager")
         })?;
         handler.join(request.into_inner()).await.map(Response::new)
+    }
+
+    async fn fetch_root_key(
+        &self,
+        request: Request<FetchRootKeyRequest>,
+    ) -> Result<Response<FetchRootKeyReply>, Status> {
+        let registry = self.authenticate(&request)?;
+        let handler = registry.join_handler.clone().ok_or_else(|| {
+            Status::unimplemented("root key delivery is not available on this manager")
+        })?;
+        handler
+            .fetch_root_key(request.into_inner())
+            .await
+            .map(Response::new)
     }
 
     async fn forward_lane_write(

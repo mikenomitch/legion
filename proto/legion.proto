@@ -6464,6 +6464,49 @@ service RaftTransport {
   // it. See docs/node-liveness.md.
   rpc ReportNodeLiveness (NodeLivenessDigestRequest)
     returns (NodeLivenessDigestReply);
+
+  // Hands the cluster's KV root key to an existing member that lacks it
+  // (docs/kv-encryption.md).
+  //
+  // A joiner receives the root key in its `Join` reply, but a member that
+  // was already in the cluster when KV encryption arrived (a rolling
+  // upgrade to the first release with encryption) never joins again. Each
+  // manager whose `file` provider has no key calls this on the control-lane
+  // leader, then on the other members, until one answers with a bundle, and
+  // writes the key to its own key file. Any member that holds the key
+  // answers. A member without a key, or whose provider keeps the key to
+  // itself (`exec`), answers with an empty bundle; the answering member
+  // never mints a key for this call.
+  //
+  // The answer is sealed exactly like `JoinRaftClusterReply.root_key_bundle`
+  // (AES-256-GCM under a key derived from the cluster secret, bound to the
+  // cluster id). The caller must be a current member of the control lane.
+  // An older manager answers `Unimplemented`; the caller retries on its next
+  // keyring tick.
+  //
+  // ACL: manager-plane internal, authenticated by cluster secret metadata.
+  // It is not a `Manager` RPC, so it takes no ACL row.
+  rpc FetchRootKey (FetchRootKeyRequest) returns (FetchRootKeyReply);
+}
+
+// Request payload for RaftTransport.FetchRootKey.
+message FetchRootKeyRequest {
+  // The calling manager's string identity (its raft `nodeId`). The answering
+  // member refuses a caller whose derived raft id is not in the control
+  // lane's membership.
+  string node_id = 1;
+}
+
+// Reply payload for RaftTransport.FetchRootKey.
+message FetchRootKeyReply {
+  // The cluster id the bundle is bound to. The caller refuses a bundle for
+  // any cluster but its own.
+  string cluster_id = 1;
+
+  // The root key material, sealed as in `JoinRaftClusterReply`. Empty when
+  // the answering member has no exportable key (none yet, or `exec`). The
+  // caller writes it to its key file only if that file does not exist yet.
+  bytes root_key_bundle = 2;
 }
 
 // One manager's report of the nodes it is hearing from.

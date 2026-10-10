@@ -30,7 +30,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::prelude::*;
 use crate::storage::store::Store;
-use crate::structs::{JoinRaftClusterReply, JoinRaftClusterRequest};
+use crate::structs::{
+    FetchRootKeyReply, FetchRootKeyRequest, JoinRaftClusterReply, JoinRaftClusterRequest,
+};
 
 /// Raft group ("lane") a replicated store operation belongs to.
 ///
@@ -128,6 +130,13 @@ pub(crate) trait RaftJoinHandler: Send + Sync + 'static {
         &self,
         request: JoinRaftClusterRequest,
     ) -> Result<JoinRaftClusterReply, tonic::Status>;
+
+    /// Answers `RaftTransport.FetchRootKey`: the sealed KV root key for an
+    /// existing member that lacks it (R3, docs/kv-encryption.md).
+    async fn fetch_root_key(
+        &self,
+        request: FetchRootKeyRequest,
+    ) -> Result<FetchRootKeyReply, tonic::Status>;
 }
 
 /// Everything the `RaftTransport` tonic service needs to route an inbound

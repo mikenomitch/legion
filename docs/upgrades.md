@@ -168,6 +168,12 @@ service. During a rolling manager upgrade, the plane tolerates skew:
   old manager leading the status lane while a new one holds the display
   checkpoint is the one unsafe combination. It resolves within one lost
   window. See [node-liveness.md](node-liveness.md).
+- The root key fetch (`FetchRootKey`, see
+  [kv-encryption.md](kv-encryption.md#multi-manager-raft-clusters)) asks the
+  leader first, then the other members. An older manager answers
+  `Unimplemented` and the caller moves on to the next member, or retries on
+  its next keyring tick. It succeeds as soon as any upgraded member holds
+  the key.
 - Adaptive heartbeat cadence is on by default, and the leader relays its
   served interval to the other managers on the liveness digest reply. An
   older manager neither relays nor serves an interval, so workers attached

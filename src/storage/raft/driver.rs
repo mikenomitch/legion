@@ -72,8 +72,8 @@ use crate::storage::raft::{
 };
 use crate::storage::store::Store;
 use crate::structs::{
-    JoinRaftClusterReply, JoinRaftClusterRequest, RaftGroupMembership, RaftMemberInfo,
-    RaftPersistenceConfigFull,
+    FetchRootKeyReply, FetchRootKeyRequest, JoinRaftClusterReply, JoinRaftClusterRequest,
+    RaftGroupMembership, RaftMemberInfo, RaftPersistenceConfigFull,
 };
 
 type NodeId = u64;
@@ -1214,6 +1214,80 @@ impl MultiRaftDriver {
             }
             Err(status) => DigestOutcome::Error(status.to_string()),
         }
+    }
+
+    /// Fetch the cluster's KV root key from another member and store it
+    /// with `keyring`'s provider (R3). Tries the control-lane leader first,
+    /// then every other member, and stops at the first one that delivers a
+    /// key. Returns the name of the member it came from, or `None` when no
+    /// member had one to give (the caller retries on its next tick).
+    pub(crate) fn fetch_root_key_from_members(
+        &self,
+        keyring: &crate::storage::keyring::Keyring,
+    ) -> R<Option<String>> {
+        let engine = self.engine()?;
+        let metrics = Self::control_metrics(engine).context("control lane not started")?;
+        let mut members: Vec<(NodeId, String, String)> = metrics
+            .membership_config
+            .membership()
+            .nodes()
+            .filter(|(id, _)| **id != self.raft_id)
+            .map(|(id, node)| {
+                (
+                    *id,
+                    member_name(&metrics, *id),
+                    node_addr_host_port(&node.addr).to_string(),
+                )
+            })
+            .collect();
+        // Leader first: it is the member most likely to hold the key.
+        members.sort_by_key(|(id, _, _)| Some(*id) != metrics.current_leader);
+        let secret: tonic::metadata::MetadataValue<tonic::metadata::Ascii> = engine
+            .cluster_secret
+            .parse()
+            .context("cluster secret is not valid ascii")?;
+        for (_, name, host_port) in members {
+            let mut request = tonic::Request::new(FetchRootKeyRequest {
+                node_id: self.node_id.clone(),
+            });
+            request.set_timeout(FORWARD_LANE_WRITE_TIMEOUT);
+            request
+                .metadata_mut()
+                .insert(RAFT_CLUSTER_SECRET_METADATA_KEY, secret.clone());
+            // Dialing needs the engine runtime (lazy channels register with
+            // its reactor), so the whole call runs on it.
+            let pool = engine.pool.clone();
+            let reply = Self::block_on_engine(engine, async move {
+                let channel = pool.get(&host_port).map_err(|err| err.to_string())?;
+                crate::structs::raft_transport_client::RaftTransportClient::new(channel)
+                    .fetch_root_key(request)
+                    .await
+                    .map_err(|status| format!("{:?}: {}", status.code(), status.message()))
+            })?;
+            let reply = match reply {
+                Ok(reply) => reply.into_inner(),
+                Err(err) => {
+                    debug!(member = %name, "Root key fetch failed: {err}");
+                    continue;
+                }
+            };
+            if reply.root_key_bundle.is_empty() {
+                continue;
+            }
+            if reply.cluster_id != engine.cluster_id {
+                warn!(member = %name, "Ignoring a root key bundle for a different cluster");
+                continue;
+            }
+            let material = crate::storage::keyring::open_root_bundle(
+                &engine.cluster_secret,
+                &engine.cluster_id,
+                &reply.root_key_bundle,
+            )
+            .with_context(|| format!("failed opening the root key bundle from {name}"))?;
+            keyring.provider().import_material(&material)?;
+            return Ok(Some(name));
+        }
+        Ok(None)
     }
 
     /// Partition test hook: block/unblock every outbound raft transport RPC
@@ -2565,14 +2639,20 @@ impl EngineJoinHandler {
                 material
             }
         };
+        self.seal_root_key(&material)
+    }
+
+    /// Seal root key material for transit to another member (empty when it
+    /// cannot be sealed, which the receiver treats as "no key here").
+    fn seal_root_key(&self, material: &[u8]) -> Vec<u8> {
         match crate::storage::keyring::seal_root_bundle(
             &self.cluster_secret,
             &self.cluster_id,
-            &material,
+            material,
         ) {
             Ok(bundle) => bundle,
             Err(err) => {
-                warn!(error = ?err, "Could not seal the KV root key for a joining manager");
+                warn!(error = ?err, "Could not seal the KV root key for another manager");
                 Vec::new()
             }
         }
@@ -2994,6 +3074,51 @@ impl RaftJoinHandler for EngineJoinHandler {
             cluster_id: self.cluster_id.clone(),
             groups: self.group_memberships(),
             root_key_bundle: self.root_key_bundle(),
+        })
+    }
+
+    async fn fetch_root_key(
+        &self,
+        request: FetchRootKeyRequest,
+    ) -> Result<FetchRootKeyReply, tonic::Status> {
+        // Only a current member gets the key. The cluster secret already
+        // authenticated the call, and a member already replicates the whole
+        // database, so this widens nothing (kv-encryption calls #18).
+        let caller = fnv1a64(&request.node_id);
+        let is_member = self.lanes.get(&Lane::Control).is_some_and(|raft| {
+            raft.metrics()
+                .borrow()
+                .membership_config
+                .membership()
+                .get_node(&caller)
+                .is_some()
+        });
+        if !is_member {
+            return Err(tonic::Status::permission_denied(format!(
+                "manager {} is not a member of this raft cluster",
+                request.node_id
+            )));
+        }
+        // Export only. Minting here would hand out a key that wraps none of
+        // the cluster's data keys, and the caller never replaces a key file
+        // once it has one.
+        let root_key_bundle = if self.keyring.enabled() {
+            self.keyring
+                .provider()
+                .export_material()
+                .map(|material| self.seal_root_key(&material))
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        debug!(
+            caller = %request.node_id,
+            delivered = !root_key_bundle.is_empty(),
+            "Answered a KV root key fetch"
+        );
+        Ok(FetchRootKeyReply {
+            cluster_id: self.cluster_id.clone(),
+            root_key_bundle,
         })
     }
 }

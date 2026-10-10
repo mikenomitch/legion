@@ -566,6 +566,14 @@ pub fn keyring_tick(store: &Store) -> R<()> {
     let keyring = store.keyring();
     let before = keyring.snapshot();
 
+    // A raft member without the root key (it was in the cluster before KV
+    // encryption arrived, so no join reply ever carried it) fetches it from
+    // another member. Before the reload below, so a fetched key unlocks
+    // this same tick.
+    if let Err(err) = store.fetch_root_key_if_missing() {
+        warn!(error = ?err, "Failed fetching the KV root key from another manager");
+    }
+
     // Anything locked, a provider error, or an exec provider (whose reload
     // is deferred to this loop): try to unwrap again.
     let needs_reload = !before.locked.is_empty()
