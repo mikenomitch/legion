@@ -2376,8 +2376,10 @@ impl ManagerDaemonService {
     /// never dropped: everything recorded before the flush drains the map is
     /// part of the flushed batch, and anything arriving after the drain
     /// opens the next window. Flush errors are logged (there is no caller to
-    /// surface them to); the next KV write retriggers reconciliation from
-    /// current state.
+    /// surface them to). Events lost to a flush error, a crash, or a
+    /// leadership change inside the window are recovered from replicated
+    /// state by the control-lane leader's periodic
+    /// [`sweep_missed_kv_changes`].
     fn queue_kv_change(&self, key: &str, is_delete: bool) -> bool {
         if self.kv_debounce.is_zero() {
             return false;
@@ -2405,7 +2407,7 @@ impl ManagerDaemonService {
                 error!(
                     error = %status.message(),
                     keys = changes.len(),
-                    "Debounced KV reconciliation failed"
+                    "Debounced KV reconciliation failed; the leader's KV sweep will retry"
                 );
             }
         });
@@ -2904,6 +2906,82 @@ fn reconcile_kv_changes(store: &Store, changes: &[(String, bool)]) -> Result<(),
     }
 
     Ok(())
+}
+
+/// Safety net for KV-driven reconciliation: finds jobs whose stored config
+/// no longer matches what their KV references render to now, or whose
+/// `onDelete = "fail"` key is gone while the job is not failed, and
+/// reconciles them as if the KV events had just arrived. Returns how many
+/// jobs it reconciled.
+///
+/// Debounced KV events are held in memory on the manager that took the
+/// write, so a flush error, a crash, or a leadership change inside the
+/// window drops them. Everything this sweep compares is replicated, so the
+/// control-lane leader recovers those changes on its next tick. A job that is
+/// already up to date compares equal and costs one re-render.
+///
+/// What it cannot see: a missed delete whose policy is `restart` or
+/// `rollout`. A deleted key keeps its last rendered value, so the stored
+/// config looks current, and nothing replicated records that the delete
+/// was never acted on.
+pub(crate) fn sweep_missed_kv_changes(store: &Store) -> anyhow::Result<usize> {
+    let mut reconciled = 0;
+    for job_id in store.job_ids_with_kv_references()? {
+        let refs = store.job_kv_references_for_job(&job_id)?;
+        let Some(job_config_id) = refs.first().map(|r| r.job_config_id.clone()) else {
+            continue;
+        };
+        // Same skip as reconcile_kv_changes: a stopped job acts on nothing.
+        let status = store.job_status_by_id(&job_id)?;
+        if status.as_deref() == Some("stopped") {
+            continue;
+        }
+        let current = store.get_job_config_by_id(&job_config_id)?;
+
+        let mut keys: Vec<String> = refs.iter().map(|r| r.kv_key.clone()).collect();
+        keys.sort();
+        keys.dedup();
+        let mut present = Vec::new();
+        let mut missing = Vec::new();
+        for key in keys {
+            if store.get_kv(&key)?.is_some() {
+                present.push(key);
+            } else {
+                missing.push(key);
+            }
+        }
+
+        let mut missed: Vec<(String, bool)> = Vec::new();
+        // Missed put: re-render exactly as a reconcile would and compare the
+        // way submit does, so "different" here means the reconcile would
+        // store a new config rather than return Unchanged.
+        let (rendered, _) =
+            apply_kv_references_to_config(store, &current, &refs, MissingKvBehavior::KeepExisting)?;
+        if !current.is_same_as(&store.normalize_job_config(&rendered)?) {
+            missed.extend(present.iter().map(|key| (key.clone(), false)));
+        }
+        // Missed fail-on-delete: the key is gone but the job never failed.
+        if !missing.is_empty() && status.as_deref() != Some("failed") {
+            let deleted: HashMap<String, bool> =
+                missing.iter().map(|key| (key.clone(), true)).collect();
+            let (action, _, _) = resolve_job_kv_action(store, &current, &refs, &deleted)?;
+            if action == KvInjectionAction::Fail {
+                missed.extend(missing.iter().map(|key| (key.clone(), true)));
+            }
+        }
+        if missed.is_empty() {
+            continue;
+        }
+        warn!(
+            job_id = %job_id,
+            keys = missed.len(),
+            "Job missed a KV-driven reconciliation; reconciling now"
+        );
+        reconcile_kv_changes(store, &missed)
+            .map_err(|status| anyhow!("reconciling job {job_id}: {}", status.message()))?;
+        reconciled += 1;
+    }
+    Ok(reconciled)
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
@@ -12224,6 +12302,62 @@ mod tests {
 
         assert_eq!(store.get_job("kv-burst-del")?.status, "failed");
         assert_eq!(evals_of_kind(&store, "kv-burst-del", "job_update")?, 0);
+        Ok(())
+    }
+
+    /// M4: a KV put whose debounced reconciliation never ran (here: the
+    /// write bypasses the RPC, as if the flush were lost to a crash) is
+    /// recovered by the leader sweep, and a job that is up to date is left
+    /// alone.
+    #[tokio::test]
+    async fn kv_sweep_recovers_a_missed_put_and_is_quiet_otherwise_test() -> R<()> {
+        let store = setup_store()?;
+        store.put_kv("sweep/key", "v0", KvValueType::String, None, None)?;
+        let manager = ManagerDaemonService::new(store.clone());
+        run_jobspec(
+            &manager,
+            watched_env_jobspec("kv-sweep", "sweep/key", "restart", "fail"),
+        )
+        .await?;
+
+        // Up to date: nothing to do, no writes, no evals.
+        assert_eq!(sweep_missed_kv_changes(&store)?, 0);
+        // A reconciled put (the normal path) leaves nothing for the sweep.
+        put_kv_entry(&manager, "sweep/key", "v1").await?;
+        assert_eq!(evals_of_kind(&store, "kv-sweep", "job_update")?, 1);
+        assert_eq!(sweep_missed_kv_changes(&store)?, 0);
+
+        // The lost event: the value changes with no reconciliation.
+        store.put_kv("sweep/key", "v2", KvValueType::String, None, None)?;
+        assert_eq!(task_env_value(&store, "kv-sweep", 0, "WATCHED")?, "v1");
+
+        assert_eq!(sweep_missed_kv_changes(&store)?, 1);
+        assert_eq!(task_env_value(&store, "kv-sweep", 0, "WATCHED")?, "v2");
+        assert_eq!(evals_of_kind(&store, "kv-sweep", "job_update")?, 2);
+        // Converged: the next sweep is a no-op.
+        assert_eq!(sweep_missed_kv_changes(&store)?, 0);
+        Ok(())
+    }
+
+    /// M4: a missed delete of an `onDelete = "fail"` key is recovered too.
+    #[tokio::test]
+    async fn kv_sweep_recovers_a_missed_fail_on_delete_test() -> R<()> {
+        let store = setup_store()?;
+        store.put_kv("sweep/del", "v0", KvValueType::String, None, None)?;
+        let manager = ManagerDaemonService::new(store.clone());
+        run_jobspec(
+            &manager,
+            watched_env_jobspec("kv-sweep-del", "sweep/del", "restart", "fail"),
+        )
+        .await?;
+
+        store.delete_kv("sweep/del", None, None)?;
+        assert_ne!(store.get_job("kv-sweep-del")?.status, "failed");
+
+        assert_eq!(sweep_missed_kv_changes(&store)?, 1);
+        assert_eq!(store.get_job("kv-sweep-del")?.status, "failed");
+        // Already failed: the sweep does not re-fail it every tick.
+        assert_eq!(sweep_missed_kv_changes(&store)?, 0);
         Ok(())
     }
 

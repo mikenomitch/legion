@@ -17970,6 +17970,17 @@ impl Store {
         Self::collect_rows(rows)
     }
 
+    /// Every job with at least one KV dependency edge, for the leader's
+    /// missed-KV-change sweep.
+    #[instrument(err, skip_all)]
+    pub fn job_ids_with_kv_references(&self) -> R<Vec<String>> {
+        let conn = self.read_connection()?;
+        let mut stmt =
+            conn.prepare("SELECT DISTINCT job_id FROM job_kv_reference ORDER BY job_id;")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        Self::collect_rows(rows)
+    }
+
     #[instrument(err, skip_all)]
     pub fn job_kv_references_for_job(&self, job_id: &str) -> R<Vec<JobKvReference>> {
         let conn = self.read_connection()?;

@@ -714,6 +714,12 @@ fn manager_server_exit_error(
     err
 }
 
+/// How often the control-lane leader sweeps for KV changes whose debounced
+/// reconciliation was lost (docs/kv-store.md, "Debounce / coalescing"). Far
+/// above the debounce window, so the sweep almost never races a live flush
+/// (and a race is harmless: reconciliation is idempotent).
+const KV_RECONCILE_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
+
 /// How often the keyring loop ticks when nothing wakes it earlier.
 const KEYRING_TICK_INTERVAL: Duration = Duration::from_secs(15);
 
@@ -1146,6 +1152,7 @@ async fn start_node_status_checker(store: Store, config: LivenessCheckerConfig) 
     // leads all lanes — which, with JC-40 convergence running in the
     // engine, is the steady state.
     let mut last_divergent_regen: Option<std::time::Instant> = None;
+    let mut last_kv_sweep: Option<std::time::Instant> = None;
     loop {
         // Leader-only actions (raft mode, per lane): only the STATUS-lane
         // leader may mark nodes lost / sweep health orphans; non-leaders
@@ -1448,6 +1455,22 @@ async fn start_node_status_checker(store: Store, config: LivenessCheckerConfig) 
                     "Synced volume claims a deferred submit half was missing"
                 ),
                 Err(err) => warn!(error = ?err, "Failed syncing missing task volume claims"),
+            }
+        }
+
+        // KV-driven reconciliation safety net: debounced KV events live in
+        // memory on the node that took the write, so a flush error, a crash,
+        // or a leadership change inside the window would otherwise lose
+        // them. The control-lane leader re-derives missed changes from
+        // replicated state (`sweep_missed_kv_changes`).
+        if store.is_raft_leader(crate::storage::Lane::Control)
+            && last_kv_sweep.is_none_or(|at| at.elapsed() >= KV_RECONCILE_SWEEP_INTERVAL)
+        {
+            last_kv_sweep = Some(std::time::Instant::now());
+            match crate::manager::server::sweep_missed_kv_changes(&store) {
+                Ok(0) => {}
+                Ok(jobs) => warn!(jobs, "Reconciled KV changes a debounced flush had missed"),
+                Err(err) => warn!(error = ?err, "Failed sweeping for missed KV changes"),
             }
         }
 

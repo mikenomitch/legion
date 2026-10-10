@@ -196,9 +196,25 @@ synchronously inside the KV RPC.
 - The flush re-renders from the KV state at flush time, so the final config
   reflects the latest values. At most one action fires per job per window (the
   strongest across all matched edges).
-- Events are coalesced, never dropped. With debouncing on, the manager logs
-  reconciliation errors because there is no RPC caller to return them to. With
-  `kvDebounceMs = 0`, errors return on the KV RPC.
+- Pending events live in memory on the manager that took the KV write. With
+  debouncing on, the manager logs reconciliation errors because there is no
+  RPC caller to return them to. With `kvDebounceMs = 0`, errors return on the
+  KV RPC.
+- A flush can still be lost: it can fail, the manager can crash inside the
+  window, or it can lose raft leadership. To recover, the control-lane leader
+  sweeps every 30 seconds. It re-renders each job with KV references from the
+  current KV state, and reconciles any job whose stored config no longer
+  matches, as if the put had just arrived. It also fails any job whose
+  `onDelete = "fail"` key is gone while the job is not failed. The manager
+  logs `Job missed a KV-driven reconciliation; reconciling now` when the sweep
+  acts.
+- The sweep can't recover a missed delete whose policy is `restart` or
+  `rollout`. A deleted key keeps its last rendered value, so the job's config
+  still looks current and nothing records that the delete went unhandled. If
+  the manager crashes inside the debounce window right after such a delete,
+  the job keeps running on the last rendered value until its next update.
+- A recovered put applies the strongest `onChange` among the job's present
+  keys, because the sweep can't tell which key changed.
 
 ### Fail semantics and recovery
 
