@@ -1,0 +1,11 @@
+# Config for CI's proto breaking-change check (see the proto-breaking job in
+# .github/workflows/ci.yml). Code generation still runs through build.rs and
+# the UI's own generator, not buf.
+version: v2
+breaking:
+  use:
+    # Wire compatibility: what lets mixed-version managers, workers, and CLIs
+    # talk during a rolling upgrade. Catches renumbered, retyped, or deleted
+    # fields (a deleted field must be `reserved`) and removed RPCs. Renaming a
+    # field is allowed, since its number is what goes on the wire.
+    - WIRE

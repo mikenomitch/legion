@@ -71,6 +71,14 @@ That means removed or renamed fields, changed field semantics, or new
 required behavior an old peer cannot satisfy. Additive, backward-compatible
 fields do not change it.
 
+CI guards the wire contract. Every pull request runs
+[`buf breaking`](https://buf.build/docs/breaking/) with the `WIRE` rules in
+`proto/buf.yaml`, comparing `proto/legion.proto` against the base branch. It
+fails on renumbered, retyped, or deleted fields (a removed field's number
+must be `reserved`) and on removed RPCs. Renaming a field passes, since only
+its number goes on the wire. For a deliberate break, bump `PROTOCOL_VERSION`
+and label the PR `proto-breaking-ok`.
+
 The manager decides whether to admit a worker at registration:
 
 | Worker `protocol_version`     | Manager decision                                        |
