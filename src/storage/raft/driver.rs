@@ -49,7 +49,7 @@ use std::time::{Duration, Instant};
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
-use openraft::error::{ClientWriteError, InitializeError, RaftError};
+use openraft::error::{CheckIsLeaderError, ClientWriteError, InitializeError, RaftError};
 use openraft::{BasicNode, RaftMetrics, ServerState, SnapshotPolicy};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
@@ -741,6 +741,9 @@ pub(crate) struct MultiRaftDriver {
     /// lanes battery can assert the bound on term inflation directly rather
     /// than inferring it from raft terms.
     lane_campaigns: Arc<StdMutex<HashMap<Lane, u64>>>,
+    /// Test hook shared with every lane's state machine: while set, applies
+    /// wait (see `Store::raft_set_apply_paused`).
+    apply_paused: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl std::fmt::Debug for MultiRaftDriver {
@@ -777,6 +780,7 @@ impl MultiRaftDriver {
             election_epoch_ms: Arc::new(AtomicI64::new(0)),
             lane_convergence: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             lane_campaigns: Arc::new(StdMutex::new(HashMap::new())),
+            apply_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -1258,6 +1262,13 @@ impl MultiRaftDriver {
         })
     }
 
+    /// Test hook (see `Store::raft_set_apply_paused`): hold every lane's
+    /// state-machine apply on this node while `paused`.
+    pub(crate) fn set_apply_paused(&self, paused: bool) {
+        self.apply_paused
+            .store(paused, std::sync::atomic::Ordering::SeqCst);
+    }
+
     /// Voters (by name) whose advertised schema version is unknown or below
     /// `required` — the KV keyring's upgrade gate (docs/kv-encryption.md,
     /// docs/upgrades.md). Peers advertise their version on every transport
@@ -1462,6 +1473,7 @@ fn not_leader_from_metrics(metrics: &RaftMetrics<NodeId, BasicNode>) -> NotRaftL
 /// capture (rolled back locally) → propose → wait for quorum commit +
 /// local apply (`client_write` resolves only after this node's state
 /// machine applied the entry, so the caller gets read-your-writes).
+#[allow(clippy::too_many_arguments)]
 fn execute_replicated(
     store: &Store,
     raft: &Raft,
@@ -1469,6 +1481,7 @@ fn execute_replicated(
     lane: Lane,
     op: &'static str,
     single_topology: bool,
+    caught_up_term: &mut Option<u64>,
     f: ReplicatedOp,
 ) -> R<Box<dyn Any + Send>> {
     // Reject non-leader proposals BEFORE opening a capture: `client_write`
@@ -1488,7 +1501,7 @@ fn execute_replicated(
         lane.wire_name()
     };
     let telemetry = crate::manager::telemetry::metrics();
-    {
+    let term = {
         let metrics = raft.metrics().borrow().clone();
         if metrics.state != ServerState::Leader {
             telemetry
@@ -1504,6 +1517,47 @@ fn execute_replicated(
             })
             .context(context));
         }
+        metrics.current_term
+    };
+    // A new leader must not capture until its state machine has applied
+    // every entry from earlier terms (R1). Entries the previous leader
+    // logged but whose commit this node had not yet heard about are still
+    // unapplied when it wins. A capture against that stale state would
+    // record an INSERT for a row an earlier entry already inserted, and the
+    // apply of the new entry would then conflict-abort on every replica.
+    // `ensure_linearizable` confirms leadership with a quorum and waits for
+    // `last_applied` to reach this term's first (blank) entry, which commits
+    // only after everything before it. Once per term: later captures in the
+    // same term are already ordered after it by this pipeline thread.
+    if *caught_up_term != Some(term) {
+        if let Err(err) = handle.block_on(raft.ensure_linearizable()) {
+            let not_leader = matches!(
+                err,
+                RaftError::APIError(CheckIsLeaderError::ForwardToLeader(_))
+            );
+            telemetry.raft_ops_total.inc(&[
+                metric_lane,
+                op,
+                if not_leader { "not_leader" } else { "error" },
+            ]);
+            if not_leader {
+                let context = match lane_label {
+                    Some(lane) => format!("raft op {op} must run on the {lane} lane's leader"),
+                    None => format!("raft op {op} must run on the leader"),
+                };
+                let metrics = raft.metrics().borrow().clone();
+                return Err(anyhow::Error::new(NotRaftLeader {
+                    lane: lane_label.map(str::to_owned),
+                    ..not_leader_from_metrics(&metrics)
+                })
+                .context(context));
+            }
+            return Err(anyhow!(
+                "raft op {op}: this leader could not confirm its leadership or catch up on \
+                 earlier terms before capturing ({err}); retry shortly"
+            ));
+        }
+        *caught_up_term = Some(term);
     }
     let capture_started = std::time::Instant::now();
     let captured = capture::capture_mutation(store, lane, f);
@@ -1578,6 +1632,9 @@ fn pipeline_loop(
 ) {
     let group_label = group.wire_name();
     let telemetry = crate::manager::telemetry::metrics();
+    // The last term in which this node's state machine was confirmed caught
+    // up on every earlier term (see `execute_replicated`).
+    let mut caught_up_term: Option<u64> = None;
     while let Ok(job) = jobs.recv() {
         let PipelineJob {
             lane,
@@ -1597,7 +1654,16 @@ fn pipeline_loop(
         // serving (a dead pipeline thread would silently fail every later
         // write on this lane).
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            execute_replicated(&store, &raft, &handle, lane, op, single_topology, f)
+            execute_replicated(
+                &store,
+                &raft,
+                &handle,
+                lane,
+                op,
+                single_topology,
+                &mut caught_up_term,
+                f,
+            )
         }))
         .unwrap_or_else(|panic| {
             let message = panic
@@ -2992,7 +3058,8 @@ impl PersistenceDriver for MultiRaftDriver {
                     engine_store.clone(),
                     data_dir.join(lane.wire_name()).join("snapshots"),
                     snapshot_scope,
-                );
+                )
+                .with_apply_pause(self.apply_paused.clone());
                 let network =
                     RaftTransportNetworkFactory::new(lane, cluster_secret.clone(), pool.clone());
                 let raft = Raft::new(

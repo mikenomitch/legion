@@ -869,3 +869,104 @@ fn acked_write_survives_any_single_node_loss() -> R<()> {
     }
     Ok(())
 }
+
+// ── 5. a new leader catches up before it captures (R1) ───────────────────
+
+/// A follower can win an election while entries from the previous term sit
+/// in its log unapplied (it had not yet heard they committed). If it
+/// captured a write against that stale state, the captured changeset would
+/// conflict with the earlier entry on apply and halt the lane on every
+/// replica. The new leader must first apply everything before its own term.
+///
+/// Holds both followers' applies (the apply-pause test hook) so whichever
+/// wins is behind, writes on the old leader, isolates it, and writes the
+/// same key on the new leader while its apply is still held.
+#[test]
+fn new_leader_applies_earlier_terms_before_capturing() -> R<()> {
+    let _serial = serial_guard();
+    let dir = tempfile::tempdir()?;
+    let mut nodes = start_cluster(dir.path())?;
+    let leader_idx = nodes
+        .iter()
+        .position(is_leader)
+        .expect("cluster must have a leader");
+    {
+        let all: Vec<&TestNode> = nodes.iter().collect();
+        wait_for(Duration::from_secs(150), "initial convergence", || {
+            converged(&all)
+        });
+    }
+    let followers: Vec<usize> = (0..nodes.len()).filter(|i| *i != leader_idx).collect();
+    for i in &followers {
+        nodes[*i].store().raft_set_apply_paused(true)?;
+    }
+
+    // The old leader commits `r1/key` (both followers append it; neither
+    // applies it).
+    nodes[leader_idx]
+        .store()
+        .put_kv("r1/key", "old", KvValueType::String, None, None)?;
+    let committed = nodes[leader_idx]
+        .store()
+        .raft_status()
+        .map(|s| s.applied_index)
+        .unwrap_or(0);
+    for i in &followers {
+        let store = nodes[*i].store().clone();
+        wait_for(
+            Duration::from_secs(60),
+            "follower log holds the old leader's entry",
+            move || {
+                store
+                    .raft_status()
+                    .is_some_and(|s| s.commit_index >= committed)
+            },
+        );
+        assert_eq!(kv_value(nodes[*i].store(), "r1/key"), None);
+    }
+
+    // Kill the old leader; a held-back follower takes over.
+    nodes[leader_idx].partition()?;
+    let survivors: Vec<&TestNode> = followers.iter().map(|i| &nodes[*i]).collect();
+    let mut new_leader: Option<&TestNode> = None;
+    let deadline = Instant::now() + Duration::from_secs(150);
+    while Instant::now() < deadline && new_leader.is_none() {
+        new_leader = find_leader(&survivors);
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let new_leader = new_leader.expect("a survivor must take over leadership");
+    assert_eq!(kv_value(new_leader.store(), "r1/key"), None);
+
+    // Write the same key on the new leader while its apply is still held.
+    // Before the fix this captured an INSERT and the lane halted on apply.
+    let writer_store = new_leader.store().clone();
+    let writer = std::thread::spawn(move || {
+        with_leadership_retry(RETRY_PATIENCE, || {
+            writer_store.put_kv("r1/key", "new", KvValueType::String, None, None)
+        })
+    });
+    std::thread::sleep(Duration::from_millis(500));
+    for survivor in &survivors {
+        survivor.store().raft_set_apply_paused(false)?;
+    }
+    writer
+        .join()
+        .expect("writer thread panicked")
+        .context("the new leader's write must commit once it has caught up")?;
+
+    // Both survivors agree, and the old leader converges after healing.
+    for survivor in &survivors {
+        let store = survivor.store().clone();
+        wait_for(
+            Duration::from_secs(60),
+            "survivor applies the write",
+            move || kv_value(&store, "r1/key").as_deref() == Some("new"),
+        );
+    }
+    nodes[leader_idx].heal()?;
+    let all: Vec<&TestNode> = nodes.iter().collect();
+    wait_for(Duration::from_secs(150), "all replicas converge", || {
+        kv_value(nodes[leader_idx].store(), "r1/key").as_deref() == Some("new") && converged(&all)
+    });
+    Ok(())
+}

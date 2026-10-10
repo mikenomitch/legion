@@ -141,6 +141,11 @@ pub(crate) struct StoreStateMachine {
     snapshots_dir: PathBuf,
     /// Whole-DB image (`single`) or lane-table dump (`lanes`) — module docs.
     scope: SnapshotScope,
+    /// Test hook (`Store::raft_set_apply_paused`): while set, `apply` waits
+    /// before touching the state DB, so a test can hold a replica's applied
+    /// index behind its log (the R1 failover regression). Never set in
+    /// production.
+    apply_paused: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl std::fmt::Debug for StoreStateMachine {
@@ -165,7 +170,14 @@ impl StoreStateMachine {
             store,
             snapshots_dir,
             scope,
+            apply_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    /// Share the driver's apply-pause test hook (see the field docs).
+    pub(crate) fn with_apply_pause(mut self, paused: Arc<std::sync::atomic::AtomicBool>) -> Self {
+        self.apply_paused = paused;
+        self
     }
 
     /// A second handle to the same lane/state DB, owned and `'static`, for
@@ -179,6 +191,7 @@ impl StoreStateMachine {
             store: self.store.clone(),
             snapshots_dir: self.snapshots_dir.clone(),
             scope: self.scope,
+            apply_paused: self.apply_paused.clone(),
         }
     }
 
@@ -652,6 +665,9 @@ impl RaftStateMachine<TypeConfig> for StoreStateMachine {
         I: IntoIterator<Item = Entry<TypeConfig>> + OptionalSend,
         I::IntoIter: OptionalSend,
     {
+        while self.apply_paused.load(std::sync::atomic::Ordering::SeqCst) {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
         // Apply-side index-skip guard: entries at or below the recorded
         // applied index were already applied (typically re-delivered around
         // a snapshot install or a restart replay); re-applying a changeset

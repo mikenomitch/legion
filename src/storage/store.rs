@@ -1894,6 +1894,20 @@ impl Store {
             .set_outbound_blocked(blocked)
     }
 
+    /// Apply-pause test hook (in-process raft tests only, not an operator
+    /// surface): while paused, this node's raft state machines append
+    /// entries to the log but do not apply them, which holds its applied
+    /// index behind its log the way a slow or freshly elected node's would.
+    /// Errors on non-raft backends.
+    pub fn raft_set_apply_paused(&self, paused: bool) -> R<()> {
+        self.persistence_driver
+            .as_any()
+            .downcast_ref::<crate::storage::raft::driver::MultiRaftDriver>()
+            .context("raft_set_apply_paused requires the raft persistence backend")?
+            .set_apply_paused(paused);
+        Ok(())
+    }
+
     /// Deterministic fingerprint of this replica's replicated state: every
     /// user table except the ones that legitimately differ between healthy
     /// replicas (plan §7-C2):
