@@ -132,7 +132,7 @@ pub(super) fn suspend_memory_precondition(
 /// The checkpoint kind a suspend takes when the caller does not say: the
 /// task's `suspend.checkpoint`, else memory when the sandbox was launched for
 /// memory checkpoints and its node can take one, else disk.
-fn default_suspend_kind(
+pub(super) fn default_suspend_kind(
     task: &TaskConfig,
     instance: &Instance,
     allocation: &crate::structs::Allocation,

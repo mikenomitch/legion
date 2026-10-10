@@ -1173,6 +1173,9 @@ pub(crate) struct NodeCapacity {
     pub cpu_mhz: Option<f64>,
     /// Average clock per core, for turning measured cores into MHz.
     pub mhz_per_core: Option<f64>,
+    /// Fingerprinted core count, which every platform reports even when it
+    /// reports no usable clock speed (Apple Silicon).
+    pub cpu_cores: Option<f64>,
     /// The ratios already folded into the two amounts above.
     pub ratios: OversubscribeRatios,
 }
@@ -1187,6 +1190,7 @@ impl NodeCapacity {
             memory_mib: finite(pool.amount("memory")),
             cpu_mhz: finite(pool.amount("cpu")),
             mhz_per_core: finite(Some(cpu.mhz / cpu.cores)).filter(|mhz| *mhz > 0.0),
+            cpu_cores: finite(Some(cpu.cores)).filter(|cores| *cores > 0.0),
             ratios: OversubscribeRatios::of(&config_attrs),
         })
     }

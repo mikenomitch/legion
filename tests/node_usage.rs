@@ -12,7 +12,7 @@ use legion::storage::store::Store;
 use legion::structs::manager_server::Manager;
 use legion::structs::{
     config::ManagerConfigFull, AllocationUsage, GetNodeUsageRequest, HeartbeatRequest,
-    NodeMemoryUsage, NodeMsg, UsageReport,
+    ListNodeUsageRequest, NodeMemoryUsage, NodeMsg, UsageReport,
 };
 use tonic::{Code, Request};
 
@@ -137,5 +137,56 @@ async fn an_unknown_node_is_not_found() -> R<()> {
         .await
         .expect_err("no such node");
     assert_eq!(status.code(), Code::NotFound);
+    Ok(())
+}
+
+/// ListNodeUsage answers with exactly the GetNodeUsage reply per node,
+/// skips unknown ids, drops per-allocation rows unless asked, and refuses
+/// an oversized id list.
+#[tokio::test(flavor = "multi_thread")]
+async fn list_node_usage_matches_get_node_usage_per_node() -> R<()> {
+    let dir = tempfile::Builder::new()
+        .prefix("legion-node-usage-")
+        .tempdir()?;
+    let svc = ManagerDaemonService::new(start_store(dir.path())?);
+    insert_node(&svc.store)?;
+    svc.heartbeat(Request::new(HeartbeatRequest {
+        id: NODE_ID.into(),
+        usage: Some(report()),
+        ..Default::default()
+    }))
+    .await?;
+    let single = node_usage(&svc).await?;
+
+    let all = svc
+        .list_node_usage(Request::new(ListNodeUsageRequest::default()))
+        .await?
+        .into_inner();
+    assert!(!all.truncated);
+    assert_eq!(all.nodes.len(), 1);
+    let listed = &all.nodes[0];
+    assert_eq!(listed.node_id, NODE_ID);
+    assert!(listed.usage_reported);
+    assert_eq!(listed.memory, single.memory, "same totals as GetNodeUsage");
+    assert!(listed.allocations.is_empty(), "rows omitted by default");
+
+    let named = svc
+        .list_node_usage(Request::new(ListNodeUsageRequest {
+            node_ids: vec!["nope".into(), NODE_ID.into()],
+            include_allocations: true,
+        }))
+        .await?
+        .into_inner();
+    assert_eq!(named.nodes.len(), 1, "unknown ids are left out");
+    assert_eq!(named.nodes[0].allocations, single.allocations);
+
+    let status = svc
+        .list_node_usage(Request::new(ListNodeUsageRequest {
+            node_ids: (0..501).map(|n| format!("n-{n}")).collect(),
+            include_allocations: false,
+        }))
+        .await
+        .expect_err("too many ids");
+    assert_eq!(status.code(), Code::InvalidArgument);
     Ok(())
 }

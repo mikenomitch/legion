@@ -347,7 +347,10 @@ async fn three_forks_wait_for_the_checkpoint_then_run_as_new_instances() -> R<()
             info.restore_snapshot_id.as_deref(),
             Some(reply.snapshot.as_str())
         );
+        // Lineage outlives the fork checkpoint (InstanceInfo.forked_from).
+        assert_eq!(info.forked_from.as_deref(), Some(ORIGIN));
     }
+    assert!(cluster.info(ORIGIN).await?.forked_from.is_none());
     cluster.reschedule()?;
     assert_eq!(
         cluster.store().allocs_for_node(NODE)?.len(),

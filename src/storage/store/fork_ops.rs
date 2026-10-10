@@ -158,8 +158,9 @@ impl Store {
                 }
             };
             tx.execute(
-                "UPDATE instance SET restore_from = ?2, pending_op = ?3 WHERE instance_id = ?1;",
-                params![id, snapshot.snapshot_id, PENDING_FORK],
+                "UPDATE instance SET restore_from = ?2, pending_op = ?3, forked_from = ?4 \
+                 WHERE instance_id = ?1;",
+                params![id, snapshot.snapshot_id, PENDING_FORK, new.instance_id],
             )?;
             instances.push(id);
         }

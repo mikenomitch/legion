@@ -3,7 +3,7 @@
 /* eslint-disable */
 // @ts-nocheck
 
-import { AcquireKvLockReply, AcquireKvLockRequest, AdvanceRolloutReply, AdvanceRolloutRequest, BootstrapAclReply, BootstrapAclRequest, CreateAclTokenReply, CreateAclTokenRequest, CreateInstanceReply, CreateInstanceRequest, CreateInstancesReply, CreateInstancesRequest, CreateJoinTokenReply, CreateJoinTokenRequest, CreateSnapshotReply, CreateSnapshotRequest, DeleteAclPolicyReply, DeleteAclPolicyRequest, DeleteAclTokenReply, DeleteAclTokenRequest, DeleteAclUserReply, DeleteAclUserRequest, DeleteJobTemplateReply, DeleteJobTemplateRequest, DeleteJoinTokenReply, DeleteJoinTokenRequest, DeleteKvReply, DeleteKvRequest, DeleteNetPolicyReply, DeleteNetPolicyRequest, DeleteSavedStateQueryReply, DeleteSavedStateQueryRequest, DeleteSnapshotAliasReply, DeleteSnapshotAliasRequest, DeleteSnapshotReply, DeleteSnapshotRequest, DeleteVolumeReply, DeleteVolumeRequest, DestroyInstanceReply, DestroyInstanceRequest, DestroyJobReply, DestroyJobRequest, ExecClientFrame, ExecServerFrame, FetchNetPolicyReply, FetchNetPolicyRequest, FetchRootKeyReply, FetchRootKeyRequest, ForkInstanceReply, ForkInstanceRequest, GetAclPolicyReply, GetAclPolicyRequest, GetAllocationLogsReply, GetAllocationLogsRequest, GetArtifactCredentialReply, GetArtifactCredentialRequest, GetAuthMethodsReply, GetAuthMethodsRequest, GetHeartbeatCadenceReply, GetHeartbeatCadenceRequest, GetIngressCertificatesReply, GetIngressCertificatesRequest, GetInstanceReply, GetInstanceRequest, GetJobInfoReply, GetJobInfoRequest, GetJobScaleStatusReply, GetJobScaleStatusRequest, GetJobSpecByConfigRequest, GetJobSpecReply, GetJobSpecRequest, GetJobTemplateReply, GetJobTemplateRequest, GetKeyringStatusReply, GetKeyringStatusRequest, GetKvLockReply, GetKvLockRequest, GetKvReply, GetKvRequest, GetLedgerReply, GetLedgerRequest, GetManagerConfigsReply, GetManagerConfigsRequest, GetMeshCaReply, GetMeshCaRequest, GetNetPolicyObjectReply, GetNetPolicyObjectRequest, GetNodeReply, GetNodeRequest, GetNodesReply, GetNodesRequest, GetNodeUsageReply, GetNodeUsageRequest, GetObservabilityReply, GetObservabilityRequest, GetRaftJoinTokenReply, GetRaftJoinTokenRequest, GetRaftStatusReply, GetRaftStatusRequest, GetRolloutReply, GetRolloutRequest, GetRolloutStatusReply, GetRolloutStatusRequest, GetSnapshotReply, GetSnapshotRequest, GetStateBackupReply, GetStateBackupRequest, GetStateStoreSchemaReply, GetStateStoreSchemaRequest, GetTaskLogsReply, GetTaskLogsRequest, GetVolumeReply, GetVolumeRequest, HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, IssueBootTicketReply, IssueBootTicketRequest, IssueNodeCertificateReply, IssueNodeCertificateRequest, IssueNodeIdentityTokenReply, IssueNodeIdentityTokenRequest, IssueRaftCommandReply, IssueRaftCommandRequest, IssueWorkloadIdentityTokenReply, IssueWorkloadIdentityTokenRequest, JoinRaftClusterReply, JoinRaftClusterRequest, ListAclPoliciesReply, ListAclPoliciesRequest, ListAclTokensReply, ListAclTokensRequest, ListAclUsersReply, ListAclUsersRequest, ListBootTicketsReply, ListBootTicketsRequest, ListEventsReply, ListEventsRequest, ListInstancesReply, ListInstancesRequest, ListJobActionsReply, ListJobActionsRequest, ListJobSpecHistoryReply, ListJobSpecHistoryRequest, ListJobsReply, ListJobsRequest, ListJobTemplatesReply, ListJobTemplatesRequest, ListJoinTokensReply, ListJoinTokensRequest, ListKvReply, ListKvRequest, ListNetPoliciesReply, ListNetPoliciesRequest, ListRaftHistoryReply, ListRaftHistoryRequest, ListRolloutEventsReply, ListRolloutEventsRequest, ListRolloutsReply, ListRolloutsRequest, ListSavedStateQueriesReply, ListSavedStateQueriesRequest, ListServiceEdgesReply, ListServiceEdgesRequest, ListServicesReply, ListServicesRequest, ListSnapshotsReply, ListSnapshotsRequest, ListVolumeDriversReply, ListVolumeDriversRequest, ListVolumesReply, ListVolumesRequest, LoginReply, LoginRequest, NodeLivenessDigestReply, NodeLivenessDigestRequest, PatchKvReply, PatchKvRequest, PlanJobReply, PlanJobRequest, PostWorkReply, PostWorkRequest, PutKvReply, PutKvRequest, QueryStateStoreReply, QueryStateStoreRequest, RaftLaneReply, RaftLaneRequest, RatifyClaimReply, RatifyClaimRequest, ReleaseKvLockReply, ReleaseKvLockRequest, RenderJobTemplateReply, RenderJobTemplateRequest, RenewKvLockReply, RenewKvLockRequest, ReplaceInstanceReply, ReplaceInstanceRequest, ResetKeyringReply, ResetKeyringRequest, ResolveServiceReply, ResolveServiceRequest, RestartWorkerReply, RestartWorkerRequest, RestoreInstanceReply, RestoreInstanceRequest, RewrapKvReply, RewrapKvRequest, RewrapRootKeyReply, RewrapRootKeyRequest, RotateDataKeyReply, RotateDataKeyRequest, RotateMeshCaReply, RotateMeshCaRequest, RunJobReply, RunJobRequest, RunJobTemplateReply, RunJobTemplateRequest, ScaleTaskReply, ScaleTaskRequest, SchedulerEvent, SetNodeAvailabilityReply, SetNodeAvailabilityRequest, SetSnapshotAliasReply, SetSnapshotAliasRequest, ShowNetPolicyReply, ShowNetPolicyRequest, StartClaimReply, StartClaimRequest, StartInstanceReply, StartInstanceRequest, StopInstanceReply, StopInstanceRequest, StopJobReply, StopJobRequest, StopRolloutReply, StopRolloutRequest, StreamEventsRequest, SuspendInstanceReply, SuspendInstanceRequest, TestNetPolicyReply, TestNetPolicyRequest, UpdateNodeDynamicReply, UpdateNodeDynamicRequest, UpsertAclPolicyReply, UpsertAclPolicyRequest, UpsertAclUserReply, UpsertAclUserRequest, UpsertJobTemplateReply, UpsertJobTemplateRequest, UpsertNetPolicyReply, UpsertNetPolicyRequest, UpsertSavedStateQueryReply, UpsertSavedStateQueryRequest, WarmSnapshotReply, WarmSnapshotRequest, WhoAmIReply, WhoAmIRequest, WorkerPreRegisterReply, WorkerPreRegisterRequest, WorkerRegisterReply, WorkerRegisterRequest } from "./legion_pb.js";
+import { AcquireKvLockReply, AcquireKvLockRequest, AdvanceRolloutReply, AdvanceRolloutRequest, BootstrapAclReply, BootstrapAclRequest, CreateAclTokenReply, CreateAclTokenRequest, CreateInstanceReply, CreateInstanceRequest, CreateInstancesReply, CreateInstancesRequest, CreateJoinTokenReply, CreateJoinTokenRequest, CreateSnapshotReply, CreateSnapshotRequest, DeleteAclPolicyReply, DeleteAclPolicyRequest, DeleteAclTokenReply, DeleteAclTokenRequest, DeleteAclUserReply, DeleteAclUserRequest, DeleteJobTemplateReply, DeleteJobTemplateRequest, DeleteJoinTokenReply, DeleteJoinTokenRequest, DeleteKvReply, DeleteKvRequest, DeleteNetPolicyReply, DeleteNetPolicyRequest, DeleteSavedStateQueryReply, DeleteSavedStateQueryRequest, DeleteSnapshotAliasReply, DeleteSnapshotAliasRequest, DeleteSnapshotReply, DeleteSnapshotRequest, DeleteVolumeReply, DeleteVolumeRequest, DestroyInstanceReply, DestroyInstanceRequest, DestroyJobReply, DestroyJobRequest, ExecClientFrame, ExecServerFrame, FetchNetPolicyReply, FetchNetPolicyRequest, FetchRootKeyReply, FetchRootKeyRequest, ForkInstanceReply, ForkInstanceRequest, GetAclPolicyReply, GetAclPolicyRequest, GetAllocationLogsReply, GetAllocationLogsRequest, GetArtifactCredentialReply, GetArtifactCredentialRequest, GetAuthMethodsReply, GetAuthMethodsRequest, GetHeartbeatCadenceReply, GetHeartbeatCadenceRequest, GetIngressCertificatesReply, GetIngressCertificatesRequest, GetInstanceReply, GetInstanceRequest, GetJobInfoReply, GetJobInfoRequest, GetJobScaleStatusReply, GetJobScaleStatusRequest, GetJobSpecByConfigRequest, GetJobSpecReply, GetJobSpecRequest, GetJobTemplateReply, GetJobTemplateRequest, GetKeyringStatusReply, GetKeyringStatusRequest, GetKvLockReply, GetKvLockRequest, GetKvReply, GetKvRequest, GetLedgerReply, GetLedgerRequest, GetManagerConfigsReply, GetManagerConfigsRequest, GetMeshCaReply, GetMeshCaRequest, GetNetPolicyObjectReply, GetNetPolicyObjectRequest, GetNodeContentReply, GetNodeContentRequest, GetNodeReply, GetNodeRequest, GetNodesReply, GetNodesRequest, GetNodeUsageReply, GetNodeUsageRequest, GetObservabilityReply, GetObservabilityRequest, GetRaftJoinTokenReply, GetRaftJoinTokenRequest, GetRaftStatusReply, GetRaftStatusRequest, GetRolloutReply, GetRolloutRequest, GetRolloutStatusReply, GetRolloutStatusRequest, GetSnapshotReply, GetSnapshotRequest, GetStateBackupReply, GetStateBackupRequest, GetStateStoreSchemaReply, GetStateStoreSchemaRequest, GetTaskLogsReply, GetTaskLogsRequest, GetVolumeReply, GetVolumeRequest, HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, IssueBootTicketReply, IssueBootTicketRequest, IssueNodeCertificateReply, IssueNodeCertificateRequest, IssueNodeIdentityTokenReply, IssueNodeIdentityTokenRequest, IssueRaftCommandReply, IssueRaftCommandRequest, IssueWorkloadIdentityTokenReply, IssueWorkloadIdentityTokenRequest, JoinRaftClusterReply, JoinRaftClusterRequest, ListAclPoliciesReply, ListAclPoliciesRequest, ListAclTokensReply, ListAclTokensRequest, ListAclUsersReply, ListAclUsersRequest, ListBootTicketsReply, ListBootTicketsRequest, ListEventsReply, ListEventsRequest, ListInstancesReply, ListInstancesRequest, ListJobActionsReply, ListJobActionsRequest, ListJobSpecHistoryReply, ListJobSpecHistoryRequest, ListJobsReply, ListJobsRequest, ListJobTemplatesReply, ListJobTemplatesRequest, ListJoinTokensReply, ListJoinTokensRequest, ListKvReply, ListKvRequest, ListNetPoliciesReply, ListNetPoliciesRequest, ListNodeUsageReply, ListNodeUsageRequest, ListRaftHistoryReply, ListRaftHistoryRequest, ListRolloutEventsReply, ListRolloutEventsRequest, ListRolloutsReply, ListRolloutsRequest, ListSavedStateQueriesReply, ListSavedStateQueriesRequest, ListServiceEdgesReply, ListServiceEdgesRequest, ListServicesReply, ListServicesRequest, ListSnapshotsReply, ListSnapshotsRequest, ListVolumeDriversReply, ListVolumeDriversRequest, ListVolumesReply, ListVolumesRequest, LoginReply, LoginRequest, NodeLivenessDigestReply, NodeLivenessDigestRequest, PatchKvReply, PatchKvRequest, PlanJobReply, PlanJobRequest, PostWorkReply, PostWorkRequest, PutKvReply, PutKvRequest, QueryStateStoreReply, QueryStateStoreRequest, RaftLaneReply, RaftLaneRequest, RatifyClaimReply, RatifyClaimRequest, ReleaseKvLockReply, ReleaseKvLockRequest, RenderJobTemplateReply, RenderJobTemplateRequest, RenewKvLockReply, RenewKvLockRequest, ReplaceInstanceReply, ReplaceInstanceRequest, ResetKeyringReply, ResetKeyringRequest, ResolveServiceReply, ResolveServiceRequest, RestartWorkerReply, RestartWorkerRequest, RestoreInstanceReply, RestoreInstanceRequest, RewrapKvReply, RewrapKvRequest, RewrapRootKeyReply, RewrapRootKeyRequest, RotateDataKeyReply, RotateDataKeyRequest, RotateMeshCaReply, RotateMeshCaRequest, RunJobReply, RunJobRequest, RunJobTemplateReply, RunJobTemplateRequest, ScaleTaskReply, ScaleTaskRequest, SchedulerEvent, SetNodeAvailabilityReply, SetNodeAvailabilityRequest, SetSnapshotAliasReply, SetSnapshotAliasRequest, ShowNetPolicyReply, ShowNetPolicyRequest, StartClaimReply, StartClaimRequest, StartInstanceReply, StartInstanceRequest, StopInstanceReply, StopInstanceRequest, StopJobReply, StopJobRequest, StopRolloutReply, StopRolloutRequest, StreamEventsRequest, SuspendInstanceReply, SuspendInstanceRequest, TestNetPolicyReply, TestNetPolicyRequest, UpdateNodeDynamicReply, UpdateNodeDynamicRequest, UpsertAclPolicyReply, UpsertAclPolicyRequest, UpsertAclUserReply, UpsertAclUserRequest, UpsertJobTemplateReply, UpsertJobTemplateRequest, UpsertNetPolicyReply, UpsertNetPolicyRequest, UpsertSavedStateQueryReply, UpsertSavedStateQueryRequest, WarmSnapshotReply, WarmSnapshotRequest, WhoAmIReply, WhoAmIRequest, WorkerPreRegisterReply, WorkerPreRegisterRequest, WorkerRegisterReply, WorkerRegisterRequest } from "./legion_pb.js";
 import { MethodKind } from "@bufbuild/protobuf";
 
 /**
@@ -1424,6 +1424,80 @@ export const Manager = {
       name: "GetNodeUsage",
       I: GetNodeUsageRequest,
       O: GetNodeUsageReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Reports capacity, reservations, and measured usage for many nodes in one
+     * call: the batch form of GetNodeUsage, for fleet views such as the
+     * workers index and `legion node usage` with no node.
+     *
+     * Each entry is exactly the GetNodeUsage reply for that node, built from
+     * the same state and the same in-memory usage table, so the two never
+     * disagree. Per-allocation rows are left out unless `include_allocations`
+     * is set, which keeps a 100-node reply small: a fleet view needs the
+     * per-node totals (`memory`, `cpu`, `usage_reported`, the pressure
+     * response), not every allocation.
+     *
+     * `node_ids` empty means every registered node, ordered by node id, capped
+     * at 500 nodes (the reply's `truncated` says when the cap cut it short).
+     * Unknown ids are left out of the reply rather than failing the call, so
+     * a list built from a page that has since changed still answers.
+     *
+     * Usage is held in the memory of the manager that received each node's
+     * heartbeats: a node whose heartbeats go to another manager, or that has
+     * not reported since this manager started, has `usage_reported = false`,
+     * exactly as in GetNodeUsage.
+     *
+     * ACL: node:read. Gated unscoped first (`AclScope::any()`), then each node
+     * is filtered by its pool, so a pool-scoped token sees only its pools'
+     * nodes and never learns that others exist.
+     *
+     * Errors:
+     * - InvalidArgument: more than 500 `node_ids`.
+     * - PermissionDenied: the caller has no node:read at all.
+     *
+     * @generated from rpc legion.Manager.ListNodeUsage
+     */
+    listNodeUsage: {
+      name: "ListNodeUsage",
+      I: ListNodeUsageRequest,
+      O: ListNodeUsageReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Reports what one node holds for content locality: the content its worker
+     * advertises to the manager's location index (digest and bytes per entry),
+     * which snapshot each entry belongs to when the manager knows, and the
+     * node's snapshots with their published state and how many of their parts
+     * the node holds right now.
+     *
+     * This is the read side of the location index the scheduler's `locality`
+     * score uses (docs/artifacts.md, "Content locality"): the same data, so an
+     * operator can see why a placement preferred a node. It is leader-local
+     * soft state, never persisted or replicated: a manager that just started,
+     * took over, or does not receive this node's heartbeats has no entries for
+     * it, and says so with `index_reported = false`. Only entries of at least
+     * 1 MiB are advertised, so small artifacts never appear.
+     *
+     * The content store's byte budgets and per-class totals are not part of
+     * this reply: the index carries digests, not classes.
+     *
+     * ACL: node:read, scoped to the node's pool (checked unscoped before the
+     * lookup, so a caller with no node access cannot probe which nodes exist).
+     * Snapshot rows are filtered by `snapshot:read` on their job and left out
+     * when the caller lacks it; content entries that belong to a snapshot the
+     * caller cannot read keep their digest and bytes but lose the snapshot id.
+     *
+     * Errors:
+     * - NotFound: no node with `node_id` is registered.
+     * - PermissionDenied: the caller lacks node:read on the node's pool.
+     *
+     * @generated from rpc legion.Manager.GetNodeContent
+     */
+    getNodeContent: {
+      name: "GetNodeContent",
+      I: GetNodeContentRequest,
+      O: GetNodeContentReply,
       kind: MethodKind.Unary,
     },
     /**

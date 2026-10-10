@@ -1071,7 +1071,11 @@ pub mod drafts {
     /// the eviction steps, info for `reclaim`, which stops nothing. The
     /// message is the worker's detail sentence, which names the step and the
     /// numbers.
-    pub fn node_pressure(node_id: &str, action: &crate::structs::PressureAction) -> EventDraft {
+    pub fn node_pressure(
+        node_id: &str,
+        action: &crate::structs::PressureAction,
+        instance_id: Option<&str>,
+    ) -> EventDraft {
         let message = if action.detail.is_empty() {
             format!(
                 "{} acted on allocation {} on node {node_id}",
@@ -1112,6 +1116,11 @@ pub mod drafts {
         }
         if !action.hint.is_empty() {
             meta["hint"] = json!(action.hint);
+        }
+        // The stateful instance acted on, so a reader can tie the event to an
+        // instance row after its allocation row is gone.
+        if let Some(instance_id) = instance_id {
+            meta["instance_id"] = json!(instance_id);
         }
         draft.meta(meta)
     }
@@ -2077,8 +2086,13 @@ impl EventRecorder<'_> {
         self.emit(drafts::net_denied(node_id, denial));
     }
 
-    pub fn node_pressure(self, node_id: &str, action: &crate::structs::PressureAction) {
-        self.emit(drafts::node_pressure(node_id, action));
+    pub fn node_pressure(
+        self,
+        node_id: &str,
+        action: &crate::structs::PressureAction,
+        instance_id: Option<&str>,
+    ) {
+        self.emit(drafts::node_pressure(node_id, action, instance_id));
     }
 
     pub fn net_policy_applied(self, name: &str, enforcement: &str, priority: i64, affected: usize) {

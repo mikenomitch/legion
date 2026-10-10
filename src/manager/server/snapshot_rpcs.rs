@@ -59,6 +59,7 @@ pub(crate) fn snapshot_info(snapshot: SnapshotRecord, with_manifest: bool) -> Sn
         expires_at: snapshot.expires_at.map(unix_to_rfc3339).unwrap_or_default(),
         pause_ms: snapshot.pause_ms,
         aliases: Vec::new(),
+        holders: Vec::new(),
         manifest_json: if with_manifest {
             snapshot.manifest_json
         } else {
@@ -474,8 +475,10 @@ impl ManagerDaemonService {
             .store
             .snapshot_aliases(std::slice::from_ref(&snapshot.snapshot_id))
             .map_err(|e| map_store_error("Error loading snapshot names", e))?;
+        let holders = super::node_content_rpcs::snapshot_holders(&self.store, &snapshot);
         let mut info = snapshot_info(snapshot, true);
         info.aliases = aliases.remove(&info.snapshot_id).unwrap_or_default();
+        info.holders = holders;
         Ok(Response::new(GetSnapshotReply {
             snapshot: Some(info),
         }))

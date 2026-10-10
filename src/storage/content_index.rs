@@ -292,6 +292,45 @@ impl ContentLocationIndex {
             .copied()
     }
 
+    /// Everything one node advertises, with its epoch, when this manager
+    /// holds its report (GetNodeContent). Unordered.
+    pub fn node_entries(&self, node_id: &str) -> Option<(u64, Vec<(String, u64)>)> {
+        let inner = self.inner.read().unwrap_or_else(|p| p.into_inner());
+        let node = inner.nodes.get(node_id)?;
+        Some((
+            node.epoch,
+            node.digests
+                .iter()
+                .map(|(digest, bytes)| (digest.clone(), *bytes))
+                .collect(),
+        ))
+    }
+
+    /// How many nodes advertise `digest`.
+    pub fn holder_count(&self, digest: &str) -> usize {
+        self.inner
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .by_digest
+            .get(digest)
+            .map_or(0, HashMap::len)
+    }
+
+    /// For a set of digests (one snapshot's parts), the nodes holding any of
+    /// them: `node -> (parts held, bytes held)`.
+    pub fn holders_of(&self, digests: &[&str]) -> HashMap<String, (u32, u64)> {
+        let inner = self.inner.read().unwrap_or_else(|p| p.into_inner());
+        let mut held: HashMap<String, (u32, u64)> = HashMap::new();
+        for digest in digests {
+            for (node_id, bytes) in inner.by_digest.get(*digest).into_iter().flatten() {
+                let entry = held.entry(node_id.clone()).or_default();
+                entry.0 += 1;
+                entry.1 = entry.1.saturating_add(*bytes);
+            }
+        }
+        held
+    }
+
     /// Nodes in the index, and distinct digests across them.
     pub fn size(&self) -> (usize, usize) {
         let inner = self.inner.read().unwrap_or_else(|p| p.into_inner());
@@ -378,6 +417,35 @@ mod tests {
             added,
             removed: removed.into_iter().map(str::to_string).collect(),
         }
+    }
+
+    /// The read side GetNodeContent and GetSnapshot use: one node's entries
+    /// with its epoch, holder counts, and per-node part totals for a set.
+    #[test]
+    fn node_entries_and_holders_read_back_what_was_ingested() {
+        let index = ContentLocationIndex::new();
+        let now = Instant::now();
+        index.ingest(
+            "w-1",
+            &full(1, vec![loc("a", 2 * MIB), loc("b", 3 * MIB)]),
+            now,
+        );
+        index.ingest("w-2", &full(1, vec![loc("a", 2 * MIB)]), now);
+
+        let (epoch, mut entries) = index.node_entries("w-1").expect("w-1 reported");
+        entries.sort();
+        assert_eq!(epoch, 1);
+        assert_eq!(entries, vec![("a".into(), 2 * MIB), ("b".into(), 3 * MIB)]);
+        assert!(index.node_entries("w-9").is_none());
+
+        assert_eq!(index.holder_count("a"), 2);
+        assert_eq!(index.holder_count("b"), 1);
+        assert_eq!(index.holder_count("z"), 0);
+
+        let held = index.holders_of(&["a", "b", "z"]);
+        assert_eq!(held.get("w-1"), Some(&(2, 5 * MIB)));
+        assert_eq!(held.get("w-2"), Some(&(1, 2 * MIB)));
+        assert_eq!(held.len(), 2);
     }
 
     #[test]

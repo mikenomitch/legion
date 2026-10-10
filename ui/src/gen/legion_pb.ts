@@ -5811,6 +5811,44 @@ export class InstanceInfo extends Message<InstanceInfo> {
    */
   checkpointState?: string;
 
+  /**
+   * Why the instance's last allocation stopped: the cause, a detail
+   * sentence, a hint when there is something to change, and when. Recorded
+   * by the manager in the same transaction that removes the allocation, so
+   * it survives the allocation row and needs no `operator:read` on events
+   * (job:read on the instance is enough). For a memory pressure eviction it
+   * carries the worker's detail and hint, the same text as the
+   * `node.pressure` event. Unset for an instance whose allocation has never
+   * stopped, and for stops recorded by a manager that predates the field.
+   * Replaced by each later stop, so a rollout after a pressure eviction
+   * shows `update`.
+   *
+   * @generated from field: optional legion.InstanceStop last_stop = 100;
+   */
+  lastStop?: InstanceStop;
+
+  /**
+   * Which checkpoints the instance can take right now: memory, disk,
+   * published, and spread, each with the reason when not. Computed by the
+   * manager from the running allocation, its node, and the task, with the
+   * same checks CreateSnapshot, SuspendInstance, and ForkInstance apply
+   * (including a stored network policy that gates the task, which the job
+   * spec cannot show). Set only while the instance is `active` with a
+   * running allocation; unset otherwise, since nothing can be checkpointed.
+   *
+   * @generated from field: optional legion.CheckpointSupport checkpoint_support = 101;
+   */
+  checkpointSupport?: CheckpointSupport;
+
+  /**
+   * The instance this one was forked from (ForkInstance), kept for the
+   * instance's lifetime so fork lineage survives the fork checkpoint being
+   * reclaimed. Unset for instances not created by a fork.
+   *
+   * @generated from field: optional string forked_from = 102;
+   */
+  forkedFrom?: string;
+
   constructor(data?: PartialMessage<InstanceInfo>) {
     super();
     proto3.util.initPartial(data, this);
@@ -5847,6 +5885,9 @@ export class InstanceInfo extends Message<InstanceInfo> {
     { no: 26, name: "idle_since", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
     { no: 27, name: "idle_after_seconds", kind: "scalar", T: 4 /* ScalarType.UINT64 */, opt: true },
     { no: 28, name: "checkpoint_state", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 100, name: "last_stop", kind: "message", T: InstanceStop, opt: true },
+    { no: 101, name: "checkpoint_support", kind: "message", T: CheckpointSupport, opt: true },
+    { no: 102, name: "forked_from", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): InstanceInfo {
@@ -6244,6 +6285,19 @@ export class SnapshotInfo extends Message<SnapshotInfo> {
    */
   publishedAt = "";
 
+  /**
+   * Which nodes hold the snapshot's memory parts right now, from this
+   * manager's content location index: the capturing node while it keeps
+   * them, plus every node that fetched or warmed a `published` snapshot.
+   * Returned by GetSnapshot only (ListSnapshots leaves it empty), and empty
+   * for a disk snapshot, whose volume copy lives in the volume driver, and
+   * on a manager that holds no content reports (it just started or took
+   * over). Best effort: the index is soft state, refreshed every heartbeat.
+   *
+   * @generated from field: repeated legion.SnapshotHolder holders = 100;
+   */
+  holders: SnapshotHolder[] = [];
+
   constructor(data?: PartialMessage<SnapshotInfo>) {
     super();
     proto3.util.initPartial(data, this);
@@ -6272,6 +6326,7 @@ export class SnapshotInfo extends Message<SnapshotInfo> {
     { no: 18, name: "aliases", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
     { no: 19, name: "durability", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 20, name: "published_at", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 100, name: "holders", kind: "message", T: SnapshotHolder, repeated: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): SnapshotInfo {
@@ -11643,6 +11698,25 @@ export class NodeResourceUsage extends Message<NodeResourceUsage> {
    */
   pressureResponse?: MemoryPressureStatus;
 
+  /**
+   * CPU only: the node's fingerprinted core count, 0 when unknown. Set even
+   * when the platform reports no usable clock speed (Apple Silicon), where
+   * `capacity` in MHz is 0 and cores are the only honest figure.
+   *
+   * @generated from field: double cores = 100;
+   */
+  cores = 0;
+
+  /**
+   * CPU only: measured use in thousandths of a core, summed over governed
+   * allocations (1000 = one full core). Unlike `used`, this needs no
+   * MHz-per-core figure, so it is filled on nodes that report no clock
+   * speed. Zero when no usage has been reported.
+   *
+   * @generated from field: uint64 used_millicores = 101;
+   */
+  usedMillicores = protoInt64.zero;
+
   constructor(data?: PartialMessage<NodeResourceUsage>) {
     super();
     proto3.util.initPartial(data, this);
@@ -11660,6 +11734,8 @@ export class NodeResourceUsage extends Message<NodeResourceUsage> {
     { no: 7, name: "pressure_available", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
     { no: 8, name: "oversubscribe_ratio", kind: "scalar", T: 1 /* ScalarType.DOUBLE */ },
     { no: 9, name: "pressure_response", kind: "message", T: MemoryPressureStatus, opt: true },
+    { no: 100, name: "cores", kind: "scalar", T: 1 /* ScalarType.DOUBLE */ },
+    { no: 101, name: "used_millicores", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): NodeResourceUsage {
@@ -11806,6 +11882,749 @@ export class NodeAllocationUsage extends Message<NodeAllocationUsage> {
 
   static equals(a: NodeAllocationUsage | PlainMessage<NodeAllocationUsage> | undefined, b: NodeAllocationUsage | PlainMessage<NodeAllocationUsage> | undefined): boolean {
     return proto3.util.equals(NodeAllocationUsage, a, b);
+  }
+}
+
+/**
+ * Request payload for ListNodeUsage.
+ *
+ * @generated from message legion.ListNodeUsageRequest
+ */
+export class ListNodeUsageRequest extends Message<ListNodeUsageRequest> {
+  /**
+   * The nodes to report on. Empty means every registered node (up to 500,
+   * ordered by node id). At most 500 ids. Unknown ids, and nodes in pools
+   * the caller cannot read, are left out of the reply.
+   *
+   * @generated from field: repeated string node_ids = 1;
+   */
+  nodeIds: string[] = [];
+
+  /**
+   * Also fill each entry's per-allocation rows (`allocations`). Default
+   * false: fleet views need the per-node totals only.
+   *
+   * @generated from field: bool include_allocations = 2;
+   */
+  includeAllocations = false;
+
+  constructor(data?: PartialMessage<ListNodeUsageRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ListNodeUsageRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "node_ids", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+    { no: 2, name: "include_allocations", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListNodeUsageRequest {
+    return new ListNodeUsageRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ListNodeUsageRequest {
+    return new ListNodeUsageRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ListNodeUsageRequest {
+    return new ListNodeUsageRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ListNodeUsageRequest | PlainMessage<ListNodeUsageRequest> | undefined, b: ListNodeUsageRequest | PlainMessage<ListNodeUsageRequest> | undefined): boolean {
+    return proto3.util.equals(ListNodeUsageRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for ListNodeUsage.
+ *
+ * @generated from message legion.ListNodeUsageReply
+ */
+export class ListNodeUsageReply extends Message<ListNodeUsageReply> {
+  /**
+   * One GetNodeUsage reply per node, in the order of `node_ids` (or by node
+   * id when it was empty). `allocations` is empty unless
+   * `include_allocations` was set; the totals in `memory` and `cpu` always
+   * count every allocation.
+   *
+   * @generated from field: repeated legion.GetNodeUsageReply nodes = 1;
+   */
+  nodes: GetNodeUsageReply[] = [];
+
+  /**
+   * True when `node_ids` was empty and the fleet has more than 500 nodes, so
+   * the reply stops at the first 500 by node id. Ask for the rest by id.
+   *
+   * @generated from field: bool truncated = 2;
+   */
+  truncated = false;
+
+  constructor(data?: PartialMessage<ListNodeUsageReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ListNodeUsageReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "nodes", kind: "message", T: GetNodeUsageReply, repeated: true },
+    { no: 2, name: "truncated", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListNodeUsageReply {
+    return new ListNodeUsageReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ListNodeUsageReply {
+    return new ListNodeUsageReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ListNodeUsageReply {
+    return new ListNodeUsageReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ListNodeUsageReply | PlainMessage<ListNodeUsageReply> | undefined, b: ListNodeUsageReply | PlainMessage<ListNodeUsageReply> | undefined): boolean {
+    return proto3.util.equals(ListNodeUsageReply, a, b);
+  }
+}
+
+/**
+ * Request payload for GetNodeContent.
+ *
+ * @generated from message legion.GetNodeContentRequest
+ */
+export class GetNodeContentRequest extends Message<GetNodeContentRequest> {
+  /**
+   * The node to report on.
+   *
+   * @generated from field: string node_id = 1;
+   */
+  nodeId = "";
+
+  constructor(data?: PartialMessage<GetNodeContentRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetNodeContentRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "node_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetNodeContentRequest {
+    return new GetNodeContentRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetNodeContentRequest {
+    return new GetNodeContentRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetNodeContentRequest {
+    return new GetNodeContentRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetNodeContentRequest | PlainMessage<GetNodeContentRequest> | undefined, b: GetNodeContentRequest | PlainMessage<GetNodeContentRequest> | undefined): boolean {
+    return proto3.util.equals(GetNodeContentRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for GetNodeContent: what one node holds, as this manager's
+ * content location index and snapshot table know it.
+ *
+ * @generated from message legion.GetNodeContentReply
+ */
+export class GetNodeContentReply extends Message<GetNodeContentReply> {
+  /**
+   * The node reported on.
+   *
+   * @generated from field: string node_id = 1;
+   */
+  nodeId = "";
+
+  /**
+   * Whether this manager holds a content report for the node. False when the
+   * node's worker has no content store, predates content reports, has not
+   * reported since this manager started (the next heartbeat asks it for a
+   * full report), or sends its heartbeats to another manager. `entries` is
+   * empty when false, and the scheduler scores the node 0 on locality.
+   *
+   * @generated from field: bool index_reported = 2;
+   */
+  indexReported = false;
+
+  /**
+   * The worker's content epoch this manager last applied. It moves by one
+   * every time the node's advertised set changes. 0 when not reported.
+   *
+   * @generated from field: uint64 epoch = 3;
+   */
+  epoch = protoInt64.zero;
+
+  /**
+   * Every piece of content the node advertises, largest first. Only entries
+   * of at least 1 MiB are advertised.
+   *
+   * @generated from field: repeated legion.NodeContentEntry entries = 4;
+   */
+  entries: NodeContentEntry[] = [];
+
+  /**
+   * Sum of `entries[].bytes`.
+   *
+   * @generated from field: uint64 advertised_bytes = 5;
+   */
+  advertisedBytes = protoInt64.zero;
+
+  /**
+   * Whether the node's worker can publish snapshots to a shared store (it
+   * advertises the `content-publish` capability, because its worker type
+   * sets `contentStore { url }`). Without it, a `durability = "store"`
+   * suspend, a spread fork, or `snapshot create --publish` refuses this
+   * node.
+   *
+   * @generated from field: bool can_publish = 6;
+   */
+  canPublish = false;
+
+  /**
+   * Whether the node's worker can capture snapshots at all (the
+   * `checkpoint` capability).
+   *
+   * @generated from field: bool can_checkpoint = 7;
+   */
+  canCheckpoint = false;
+
+  /**
+   * Snapshots related to this node, newest first: every snapshot captured
+   * here that still exists (any state but `lost`), plus every `published`
+   * snapshot captured elsewhere that this node holds at least one part of
+   * (fetched for a restore or a fork, or warmed by WarmSnapshot). Rows on
+   * jobs the caller has no `snapshot:read` on are left out.
+   *
+   * @generated from field: repeated legion.NodeSnapshotContent snapshots = 8;
+   */
+  snapshots: NodeSnapshotContent[] = [];
+
+  constructor(data?: PartialMessage<GetNodeContentReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetNodeContentReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "node_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "index_reported", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 3, name: "epoch", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 4, name: "entries", kind: "message", T: NodeContentEntry, repeated: true },
+    { no: 5, name: "advertised_bytes", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 6, name: "can_publish", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 7, name: "can_checkpoint", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 8, name: "snapshots", kind: "message", T: NodeSnapshotContent, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetNodeContentReply {
+    return new GetNodeContentReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetNodeContentReply {
+    return new GetNodeContentReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetNodeContentReply {
+    return new GetNodeContentReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetNodeContentReply | PlainMessage<GetNodeContentReply> | undefined, b: GetNodeContentReply | PlainMessage<GetNodeContentReply> | undefined): boolean {
+    return proto3.util.equals(GetNodeContentReply, a, b);
+  }
+}
+
+/**
+ * One piece of content a node advertises.
+ *
+ * @generated from message legion.NodeContentEntry
+ */
+export class NodeContentEntry extends Message<NodeContentEntry> {
+  /**
+   * Content digest, `sha256:<hex>`.
+   *
+   * @generated from field: string digest = 1;
+   */
+  digest = "";
+
+  /**
+   * Size in bytes.
+   *
+   * @generated from field: uint64 bytes = 2;
+   */
+  bytes = protoInt64.zero;
+
+  /**
+   * The snapshot this digest is a part of, when it is a memory part of a
+   * snapshot this manager knows (and the caller may read). Empty for
+   * artifacts and for parts of snapshots that no longer exist.
+   *
+   * @generated from field: string snapshot_id = 3;
+   */
+  snapshotId = "";
+
+  /**
+   * The part's role in that snapshot (`memory`, `vm-state`, `rootfs`, ...).
+   * Empty when `snapshot_id` is.
+   *
+   * @generated from field: string role = 4;
+   */
+  role = "";
+
+  /**
+   * How many nodes in the index advertise this digest, this one included.
+   *
+   * @generated from field: uint32 holders = 5;
+   */
+  holders = 0;
+
+  constructor(data?: PartialMessage<NodeContentEntry>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.NodeContentEntry";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "digest", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "bytes", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 3, name: "snapshot_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "role", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 5, name: "holders", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): NodeContentEntry {
+    return new NodeContentEntry().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): NodeContentEntry {
+    return new NodeContentEntry().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): NodeContentEntry {
+    return new NodeContentEntry().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: NodeContentEntry | PlainMessage<NodeContentEntry> | undefined, b: NodeContentEntry | PlainMessage<NodeContentEntry> | undefined): boolean {
+    return proto3.util.equals(NodeContentEntry, a, b);
+  }
+}
+
+/**
+ * One snapshot, as it relates to one node.
+ *
+ * @generated from message legion.NodeSnapshotContent
+ */
+export class NodeSnapshotContent extends Message<NodeSnapshotContent> {
+  /**
+   * The snapshot (as ListSnapshots returns it: no manifest).
+   *
+   * @generated from field: legion.SnapshotInfo snapshot = 1;
+   */
+  snapshot?: SnapshotInfo;
+
+  /**
+   * True when this node captured the snapshot (`snapshot.node_id`). A
+   * `local` snapshot lives only on its capturing node.
+   *
+   * @generated from field: bool captured_here = 2;
+   */
+  capturedHere = false;
+
+  /**
+   * How many of the snapshot's memory parts this node advertises right now.
+   * A disk snapshot has no memory parts (its volume copy lives in the volume
+   * driver, not the content store), so both counts are 0.
+   *
+   * @generated from field: uint32 parts_here = 3;
+   */
+  partsHere = 0;
+
+  /**
+   * How many memory parts the snapshot has.
+   *
+   * @generated from field: uint32 parts_total = 4;
+   */
+  partsTotal = 0;
+
+  /**
+   * Bytes of those parts this node holds.
+   *
+   * @generated from field: uint64 bytes_here = 5;
+   */
+  bytesHere = protoInt64.zero;
+
+  constructor(data?: PartialMessage<NodeSnapshotContent>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.NodeSnapshotContent";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "snapshot", kind: "message", T: SnapshotInfo },
+    { no: 2, name: "captured_here", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 3, name: "parts_here", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 4, name: "parts_total", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 5, name: "bytes_here", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): NodeSnapshotContent {
+    return new NodeSnapshotContent().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): NodeSnapshotContent {
+    return new NodeSnapshotContent().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): NodeSnapshotContent {
+    return new NodeSnapshotContent().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: NodeSnapshotContent | PlainMessage<NodeSnapshotContent> | undefined, b: NodeSnapshotContent | PlainMessage<NodeSnapshotContent> | undefined): boolean {
+    return proto3.util.equals(NodeSnapshotContent, a, b);
+  }
+}
+
+/**
+ * One node holding a snapshot's parts (SnapshotInfo.holders).
+ *
+ * @generated from message legion.SnapshotHolder
+ */
+export class SnapshotHolder extends Message<SnapshotHolder> {
+  /**
+   * The node.
+   *
+   * @generated from field: string node_id = 1;
+   */
+  nodeId = "";
+
+  /**
+   * How many of the snapshot's memory parts the node advertises.
+   *
+   * @generated from field: uint32 parts_here = 2;
+   */
+  partsHere = 0;
+
+  /**
+   * How many memory parts the snapshot has.
+   *
+   * @generated from field: uint32 parts_total = 3;
+   */
+  partsTotal = 0;
+
+  /**
+   * Bytes of those parts the node holds.
+   *
+   * @generated from field: uint64 bytes_here = 4;
+   */
+  bytesHere = protoInt64.zero;
+
+  /**
+   * True for the node that captured the snapshot.
+   *
+   * @generated from field: bool captured_here = 5;
+   */
+  capturedHere = false;
+
+  constructor(data?: PartialMessage<SnapshotHolder>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.SnapshotHolder";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "node_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "parts_here", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 3, name: "parts_total", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 4, name: "bytes_here", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 5, name: "captured_here", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): SnapshotHolder {
+    return new SnapshotHolder().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): SnapshotHolder {
+    return new SnapshotHolder().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): SnapshotHolder {
+    return new SnapshotHolder().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: SnapshotHolder | PlainMessage<SnapshotHolder> | undefined, b: SnapshotHolder | PlainMessage<SnapshotHolder> | undefined): boolean {
+    return proto3.util.equals(SnapshotHolder, a, b);
+  }
+}
+
+/**
+ * Why an instance's last allocation stopped (InstanceInfo.last_stop).
+ *
+ * @generated from message legion.InstanceStop
+ */
+export class InstanceStop extends Message<InstanceStop> {
+  /**
+   * The stop cause, in the vocabulary of stop notices
+   * (docs/graceful-stop.md): `stop`, `update`, `drain`, `reschedule`,
+   * `destroy`, `node_lost`, `scale_in`, `preempted`, `node_pressure`,
+   * `restore`, `suspended`.
+   *
+   * @generated from field: string cause = 1;
+   */
+  cause = "";
+
+  /**
+   * A sentence saying what happened. For `node_pressure` this is the
+   * worker's own detail sentence, with the step and the numbers (the same
+   * text as the `node.pressure` event). Otherwise a sentence built from the
+   * cause.
+   *
+   * @generated from field: string detail = 2;
+   */
+  detail = "";
+
+  /**
+   * What the reader can change, when there is something: for
+   * `node_pressure`, the worker's hint (for example "raise
+   * resources.memory toward real usage"). Empty otherwise.
+   *
+   * @generated from field: string hint = 3;
+   */
+  hint = "";
+
+  /**
+   * RFC 3339 time the manager recorded the stop.
+   *
+   * @generated from field: string at = 4;
+   */
+  at = "";
+
+  /**
+   * The allocation that stopped.
+   *
+   * @generated from field: int64 allocation_id = 5;
+   */
+  allocationId = protoInt64.zero;
+
+  /**
+   * The node it ran on.
+   *
+   * @generated from field: string node_id = 6;
+   */
+  nodeId = "";
+
+  /**
+   * For `preempted`: the job that took the capacity.
+   *
+   * @generated from field: string preemptor_job = 7;
+   */
+  preemptorJob = "";
+
+  constructor(data?: PartialMessage<InstanceStop>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.InstanceStop";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "cause", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "detail", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "hint", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "at", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 5, name: "allocation_id", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 6, name: "node_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 7, name: "preemptor_job", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): InstanceStop {
+    return new InstanceStop().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): InstanceStop {
+    return new InstanceStop().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): InstanceStop {
+    return new InstanceStop().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: InstanceStop | PlainMessage<InstanceStop> | undefined, b: InstanceStop | PlainMessage<InstanceStop> | undefined): boolean {
+    return proto3.util.equals(InstanceStop, a, b);
+  }
+}
+
+/**
+ * Which checkpoints a running instance can take right now
+ * (InstanceInfo.checkpoint_support), computed by the manager with the same
+ * checks CreateSnapshot, SuspendInstance, and ForkInstance apply, including
+ * what the job spec cannot show: the node's worker version and VMM, its
+ * volume driver's ops, and a stored network policy that gates the task.
+ * Each `*_blocker` is the FailedPrecondition message that RPC would return
+ * (with its `Hint:` line), so a client can show it without calling. The
+ * checks are the ones that depend on the instance, its node, and its task;
+ * ACLs are not part of it.
+ *
+ * @generated from message legion.CheckpointSupport
+ */
+export class CheckpointSupport extends Message<CheckpointSupport> {
+  /**
+   * CreateSnapshot `kind = memory` would be accepted.
+   *
+   * @generated from field: bool snapshot_memory = 1;
+   */
+  snapshotMemory = false;
+
+  /**
+   * @generated from field: string snapshot_memory_blocker = 2;
+   */
+  snapshotMemoryBlocker = "";
+
+  /**
+   * CreateSnapshot `kind = disk` would be accepted.
+   *
+   * @generated from field: bool snapshot_disk = 3;
+   */
+  snapshotDisk = false;
+
+  /**
+   * @generated from field: string snapshot_disk_blocker = 4;
+   */
+  snapshotDiskBlocker = "";
+
+  /**
+   * SuspendInstance `checkpoint = memory` would be accepted. A disk suspend
+   * leaves the volume in place and needs nothing beyond a keyed instance on
+   * a worker that can checkpoint, so it has no field of its own: see
+   * `suspend_default`.
+   *
+   * @generated from field: bool suspend_memory = 5;
+   */
+  suspendMemory = false;
+
+  /**
+   * @generated from field: string suspend_memory_blocker = 6;
+   */
+  suspendMemoryBlocker = "";
+
+  /**
+   * The kind SuspendInstance takes with no `checkpoint`: the task's
+   * `suspend.checkpoint`, else memory when possible, else disk. Empty when
+   * the instance cannot be suspended at all (slot mode, or a worker without
+   * the `checkpoint` capability); `suspend_blocker` says why.
+   *
+   * @generated from field: string suspend_default = 7;
+   */
+  suspendDefault = "";
+
+  /**
+   * @generated from field: string suspend_blocker = 8;
+   */
+  suspendBlocker = "";
+
+  /**
+   * ForkInstance `checkpoint = memory` would be accepted.
+   *
+   * @generated from field: bool fork_memory = 9;
+   */
+  forkMemory = false;
+
+  /**
+   * @generated from field: string fork_memory_blocker = 10;
+   */
+  forkMemoryBlocker = "";
+
+  /**
+   * ForkInstance `checkpoint = disk` would be accepted.
+   *
+   * @generated from field: bool fork_disk = 11;
+   */
+  forkDisk = false;
+
+  /**
+   * @generated from field: string fork_disk_blocker = 12;
+   */
+  forkDiskBlocker = "";
+
+  /**
+   * ForkInstance `spread = true` would be accepted: a memory fork whose
+   * checkpoint can be published (no node-local volume, and a worker with a
+   * `contentStore`).
+   *
+   * @generated from field: bool spread = 13;
+   */
+  spread = false;
+
+  /**
+   * @generated from field: string spread_blocker = 14;
+   */
+  spreadBlocker = "";
+
+  /**
+   * CreateSnapshot `publish = true` with a memory snapshot would be
+   * accepted.
+   *
+   * @generated from field: bool publish = 15;
+   */
+  publish = false;
+
+  /**
+   * @generated from field: string publish_blocker = 16;
+   */
+  publishBlocker = "";
+
+  constructor(data?: PartialMessage<CheckpointSupport>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.CheckpointSupport";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "snapshot_memory", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 2, name: "snapshot_memory_blocker", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "snapshot_disk", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 4, name: "snapshot_disk_blocker", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 5, name: "suspend_memory", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 6, name: "suspend_memory_blocker", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 7, name: "suspend_default", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 8, name: "suspend_blocker", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 9, name: "fork_memory", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 10, name: "fork_memory_blocker", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 11, name: "fork_disk", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 12, name: "fork_disk_blocker", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 13, name: "spread", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 14, name: "spread_blocker", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 15, name: "publish", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 16, name: "publish_blocker", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): CheckpointSupport {
+    return new CheckpointSupport().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): CheckpointSupport {
+    return new CheckpointSupport().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): CheckpointSupport {
+    return new CheckpointSupport().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: CheckpointSupport | PlainMessage<CheckpointSupport> | undefined, b: CheckpointSupport | PlainMessage<CheckpointSupport> | undefined): boolean {
+    return proto3.util.equals(CheckpointSupport, a, b);
   }
 }
 

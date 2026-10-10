@@ -475,6 +475,26 @@ pub fn catalog() -> Vec<Capability> {
             read_only_safe: true,
         },
         Capability {
+            name: "node.usage.list",
+            cli: "legion node usage",
+            grpc: Some("Manager/ListNodeUsage"),
+            summary: "Show memory and CPU capacity, reservations, measured use, and memory \
+                 pressure status for every node in one call (the batch form of node.usage, \
+                 per-node totals only unless include_allocations is set).",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "node.content",
+            cli: "legion node content <ID>",
+            grpc: Some("Manager/GetNodeContent"),
+            summary: "Show what a node holds for content locality: the content it advertises to \
+                 the manager's location index, which snapshot each entry belongs to, and its \
+                 snapshots with how many of their parts it holds.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
             name: "node.cordon",
             cli: "legion node cordon <ID>",
             grpc: Some("Manager/SetNodeAvailability"),

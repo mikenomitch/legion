@@ -396,6 +396,32 @@ fn tool_defs() -> Vec<ToolDef> {
             mutates: false,
         },
         ToolDef {
+            name: "legion_node_usage_list",
+            description: "Show memory and CPU for many nodes in one call: per node, schedulable capacity (with `oversubscribe_ratio`), the sum of reservations, measured use, `usage_reported`, and `memory.pressure_response` (whether the node is under memory pressure now). CPU carries `cores` and `used_millicores`, which are filled even on nodes that report no clock speed. Per-allocation rows are omitted unless `include_allocations` is true. Empty `node_ids` means every node (up to 500; `truncated` says when there were more). Use it to find tight or pressured nodes before drilling in with legion_node_usage (docs/resource-enforcement.md).",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "node_ids": { "type": "array", "items": { "type": "string" }, "description": "Nodes to report on; omit for every node." },
+                    "include_allocations": { "type": "boolean", "description": "Also return each node's per-allocation rows. Default false." }
+                },
+                "additionalProperties": false
+            }),
+            mutates: false,
+        },
+        ToolDef {
+            name: "legion_node_content",
+            description: "Show what one node holds for content locality: the content its worker advertises to the manager's location index (digest, bytes, how many nodes hold it, and the snapshot and part role it belongs to when known), whether the worker can publish and checkpoint, and the node's snapshots (captured there, or published elsewhere with parts fetched or warmed there) with `parts_here`/`parts_total`. `index_reported: false` means no content report reached this manager. Use it to see why placement preferred a node, or whether a node is warm for a snapshot before a resume or fork (docs/artifacts.md, \"Content locality\").",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "node_id": { "type": "string", "description": "Node to inspect." }
+                },
+                "required": ["node_id"],
+                "additionalProperties": false
+            }),
+            mutates: false,
+        },
+        ToolDef {
             name: "legion_boot_ticket_create",
             description: "Mint a boot ticket: a short-lived capability that lets one edge node start one workload without calling a manager (docs/edge-boot.md). Names an exact job config, one task, one instance (or a non-empty instance prefix), one node pool, and a gate ceiling. Single-use by default and revocable only by expiry, so prefer short TTLs. The token is returned ONCE. Mutating.",
             input_schema: || json!({
@@ -1145,6 +1171,39 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
                 .to_string();
             let mut client = connect().await?;
             grpc(client.get_node_usage(crate::structs::GetNodeUsageRequest { node_id })).await
+        }
+        "legion_node_usage_list" => {
+            let node_ids = args
+                .get("node_ids")
+                .and_then(Value::as_array)
+                .map(|ids| {
+                    ids.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let include_allocations = args
+                .get("include_allocations")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let mut client = connect().await?;
+            grpc(
+                client.list_node_usage(crate::structs::ListNodeUsageRequest {
+                    node_ids,
+                    include_allocations,
+                }),
+            )
+            .await
+        }
+        "legion_node_content" => {
+            let node_id = args
+                .get("node_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "missing string argument: node_id".to_string())?
+                .to_string();
+            let mut client = connect().await?;
+            grpc(client.get_node_content(crate::structs::GetNodeContentRequest { node_id })).await
         }
         "legion_keyring_status" => {
             let mut client = connect().await?;

@@ -992,6 +992,67 @@ service Manager {
   // See docs/resource-enforcement.md, "Measuring usage".
   rpc GetNodeUsage (GetNodeUsageRequest) returns (GetNodeUsageReply);
 
+  // Track 3 (suspend/resume UI, internal_docs/plans/suspend-resume-ui-plan.md
+  // §7.3) -------------------------------------------------------------------
+
+  // Reports capacity, reservations, and measured usage for many nodes in one
+  // call: the batch form of GetNodeUsage, for fleet views such as the
+  // workers index and `legion node usage` with no node.
+  //
+  // Each entry is exactly the GetNodeUsage reply for that node, built from
+  // the same state and the same in-memory usage table, so the two never
+  // disagree. Per-allocation rows are left out unless `include_allocations`
+  // is set, which keeps a 100-node reply small: a fleet view needs the
+  // per-node totals (`memory`, `cpu`, `usage_reported`, the pressure
+  // response), not every allocation.
+  //
+  // `node_ids` empty means every registered node, ordered by node id, capped
+  // at 500 nodes (the reply's `truncated` says when the cap cut it short).
+  // Unknown ids are left out of the reply rather than failing the call, so
+  // a list built from a page that has since changed still answers.
+  //
+  // Usage is held in the memory of the manager that received each node's
+  // heartbeats: a node whose heartbeats go to another manager, or that has
+  // not reported since this manager started, has `usage_reported = false`,
+  // exactly as in GetNodeUsage.
+  //
+  // ACL: node:read. Gated unscoped first (`AclScope::any()`), then each node
+  // is filtered by its pool, so a pool-scoped token sees only its pools'
+  // nodes and never learns that others exist.
+  //
+  // Errors:
+  // - InvalidArgument: more than 500 `node_ids`.
+  // - PermissionDenied: the caller has no node:read at all.
+  rpc ListNodeUsage (ListNodeUsageRequest) returns (ListNodeUsageReply);
+
+  // Reports what one node holds for content locality: the content its worker
+  // advertises to the manager's location index (digest and bytes per entry),
+  // which snapshot each entry belongs to when the manager knows, and the
+  // node's snapshots with their published state and how many of their parts
+  // the node holds right now.
+  //
+  // This is the read side of the location index the scheduler's `locality`
+  // score uses (docs/artifacts.md, "Content locality"): the same data, so an
+  // operator can see why a placement preferred a node. It is leader-local
+  // soft state, never persisted or replicated: a manager that just started,
+  // took over, or does not receive this node's heartbeats has no entries for
+  // it, and says so with `index_reported = false`. Only entries of at least
+  // 1 MiB are advertised, so small artifacts never appear.
+  //
+  // The content store's byte budgets and per-class totals are not part of
+  // this reply: the index carries digests, not classes.
+  //
+  // ACL: node:read, scoped to the node's pool (checked unscoped before the
+  // lookup, so a caller with no node access cannot probe which nodes exist).
+  // Snapshot rows are filtered by `snapshot:read` on their job and left out
+  // when the caller lacks it; content entries that belong to a snapshot the
+  // caller cannot read keep their digest and bytes but lose the snapshot id.
+  //
+  // Errors:
+  // - NotFound: no node with `node_id` is registered.
+  // - PermissionDenied: the caller lacks node:read on the node's pool.
+  rpc GetNodeContent (GetNodeContentRequest) returns (GetNodeContentReply);
+
   // Proxies a restart request to a worker node.
   rpc RestartWorker (RestartWorkerRequest) returns (RestartWorkerReply);
 
@@ -3184,6 +3245,35 @@ message InstanceInfo {
   // resume goes to any compatible node). A `store`-durability checkpoint is
   // `local` until its upload finishes. See `checkpoint_durability`.
   optional string checkpoint_state = 28;
+
+  // Track 3 (suspend/resume UI, internal_docs/plans/suspend-resume-ui-plan.md
+  // §7.3). Numbered from 100 so concurrent additions never collide.
+
+  // Why the instance's last allocation stopped: the cause, a detail
+  // sentence, a hint when there is something to change, and when. Recorded
+  // by the manager in the same transaction that removes the allocation, so
+  // it survives the allocation row and needs no `operator:read` on events
+  // (job:read on the instance is enough). For a memory pressure eviction it
+  // carries the worker's detail and hint, the same text as the
+  // `node.pressure` event. Unset for an instance whose allocation has never
+  // stopped, and for stops recorded by a manager that predates the field.
+  // Replaced by each later stop, so a rollout after a pressure eviction
+  // shows `update`.
+  optional InstanceStop last_stop = 100;
+
+  // Which checkpoints the instance can take right now: memory, disk,
+  // published, and spread, each with the reason when not. Computed by the
+  // manager from the running allocation, its node, and the task, with the
+  // same checks CreateSnapshot, SuspendInstance, and ForkInstance apply
+  // (including a stored network policy that gates the task, which the job
+  // spec cannot show). Set only while the instance is `active` with a
+  // running allocation; unset otherwise, since nothing can be checkpointed.
+  optional CheckpointSupport checkpoint_support = 101;
+
+  // The instance this one was forked from (ForkInstance), kept for the
+  // instance's lifetime so fork lineage survives the fork checkpoint being
+  // reclaimed. Unset for instances not created by a fork.
+  optional string forked_from = 102;
 }
 
 // Request payload for ListInstances.
@@ -3324,6 +3414,18 @@ message SnapshotInfo {
 
   // RFC3339 time the upload finished. Empty unless `published`.
   string published_at = 20;
+
+  // Track 3 (suspend/resume UI). Numbered from 100 so concurrent additions
+  // never collide.
+
+  // Which nodes hold the snapshot's memory parts right now, from this
+  // manager's content location index: the capturing node while it keeps
+  // them, plus every node that fetched or warmed a `published` snapshot.
+  // Returned by GetSnapshot only (ListSnapshots leaves it empty), and empty
+  // for a disk snapshot, whose volume copy lives in the volume driver, and
+  // on a manager that holds no content reports (it just started or took
+  // over). Best effort: the index is soft state, refreshed every heartbeat.
+  repeated SnapshotHolder holders = 100;
 }
 
 // Request payload for CreateSnapshot.
@@ -5104,6 +5206,19 @@ message NodeResourceUsage {
   // report. Absent for CPU, for unreported nodes, and from workers that
   // predate the response.
   optional MemoryPressureStatus pressure_response = 9;
+
+  // Track 3 (suspend/resume UI) ---------------------------------------------
+
+  // CPU only: the node's fingerprinted core count, 0 when unknown. Set even
+  // when the platform reports no usable clock speed (Apple Silicon), where
+  // `capacity` in MHz is 0 and cores are the only honest figure.
+  double cores = 100;
+
+  // CPU only: measured use in thousandths of a core, summed over governed
+  // allocations (1000 = one full core). Unlike `used`, this needs no
+  // MHz-per-core figure, so it is filled on nodes that report no clock
+  // speed. Zero when no usage has been reported.
+  uint64 used_millicores = 101;
 }
 
 // One allocation on a node, with its reservation and measured usage.
@@ -5149,6 +5264,226 @@ message NodeAllocationUsage {
   // The steps that would act on it, in order, copied from
   // `usage.pressure_steps`.
   repeated string pressure_steps = 11;
+}
+
+// Track 3 (suspend/resume UI) -------------------------------------------------
+
+// Request payload for ListNodeUsage.
+message ListNodeUsageRequest {
+  // The nodes to report on. Empty means every registered node (up to 500,
+  // ordered by node id). At most 500 ids. Unknown ids, and nodes in pools
+  // the caller cannot read, are left out of the reply.
+  repeated string node_ids = 1;
+
+  // Also fill each entry's per-allocation rows (`allocations`). Default
+  // false: fleet views need the per-node totals only.
+  bool include_allocations = 2;
+}
+
+// Reply payload for ListNodeUsage.
+message ListNodeUsageReply {
+  // One GetNodeUsage reply per node, in the order of `node_ids` (or by node
+  // id when it was empty). `allocations` is empty unless
+  // `include_allocations` was set; the totals in `memory` and `cpu` always
+  // count every allocation.
+  repeated GetNodeUsageReply nodes = 1;
+
+  // True when `node_ids` was empty and the fleet has more than 500 nodes, so
+  // the reply stops at the first 500 by node id. Ask for the rest by id.
+  bool truncated = 2;
+}
+
+// Request payload for GetNodeContent.
+message GetNodeContentRequest {
+  // The node to report on.
+  string node_id = 1;
+}
+
+// Reply payload for GetNodeContent: what one node holds, as this manager's
+// content location index and snapshot table know it.
+message GetNodeContentReply {
+  // The node reported on.
+  string node_id = 1;
+
+  // Whether this manager holds a content report for the node. False when the
+  // node's worker has no content store, predates content reports, has not
+  // reported since this manager started (the next heartbeat asks it for a
+  // full report), or sends its heartbeats to another manager. `entries` is
+  // empty when false, and the scheduler scores the node 0 on locality.
+  bool index_reported = 2;
+
+  // The worker's content epoch this manager last applied. It moves by one
+  // every time the node's advertised set changes. 0 when not reported.
+  uint64 epoch = 3;
+
+  // Every piece of content the node advertises, largest first. Only entries
+  // of at least 1 MiB are advertised.
+  repeated NodeContentEntry entries = 4;
+
+  // Sum of `entries[].bytes`.
+  uint64 advertised_bytes = 5;
+
+  // Whether the node's worker can publish snapshots to a shared store (it
+  // advertises the `content-publish` capability, because its worker type
+  // sets `contentStore { url }`). Without it, a `durability = "store"`
+  // suspend, a spread fork, or `snapshot create --publish` refuses this
+  // node.
+  bool can_publish = 6;
+
+  // Whether the node's worker can capture snapshots at all (the
+  // `checkpoint` capability).
+  bool can_checkpoint = 7;
+
+  // Snapshots related to this node, newest first: every snapshot captured
+  // here that still exists (any state but `lost`), plus every `published`
+  // snapshot captured elsewhere that this node holds at least one part of
+  // (fetched for a restore or a fork, or warmed by WarmSnapshot). Rows on
+  // jobs the caller has no `snapshot:read` on are left out.
+  repeated NodeSnapshotContent snapshots = 8;
+}
+
+// One piece of content a node advertises.
+message NodeContentEntry {
+  // Content digest, `sha256:<hex>`.
+  string digest = 1;
+
+  // Size in bytes.
+  uint64 bytes = 2;
+
+  // The snapshot this digest is a part of, when it is a memory part of a
+  // snapshot this manager knows (and the caller may read). Empty for
+  // artifacts and for parts of snapshots that no longer exist.
+  string snapshot_id = 3;
+
+  // The part's role in that snapshot (`memory`, `vm-state`, `rootfs`, ...).
+  // Empty when `snapshot_id` is.
+  string role = 4;
+
+  // How many nodes in the index advertise this digest, this one included.
+  uint32 holders = 5;
+}
+
+// One snapshot, as it relates to one node.
+message NodeSnapshotContent {
+  // The snapshot (as ListSnapshots returns it: no manifest).
+  SnapshotInfo snapshot = 1;
+
+  // True when this node captured the snapshot (`snapshot.node_id`). A
+  // `local` snapshot lives only on its capturing node.
+  bool captured_here = 2;
+
+  // How many of the snapshot's memory parts this node advertises right now.
+  // A disk snapshot has no memory parts (its volume copy lives in the volume
+  // driver, not the content store), so both counts are 0.
+  uint32 parts_here = 3;
+
+  // How many memory parts the snapshot has.
+  uint32 parts_total = 4;
+
+  // Bytes of those parts this node holds.
+  uint64 bytes_here = 5;
+}
+
+// One node holding a snapshot's parts (SnapshotInfo.holders).
+message SnapshotHolder {
+  // The node.
+  string node_id = 1;
+
+  // How many of the snapshot's memory parts the node advertises.
+  uint32 parts_here = 2;
+
+  // How many memory parts the snapshot has.
+  uint32 parts_total = 3;
+
+  // Bytes of those parts the node holds.
+  uint64 bytes_here = 4;
+
+  // True for the node that captured the snapshot.
+  bool captured_here = 5;
+}
+
+// Why an instance's last allocation stopped (InstanceInfo.last_stop).
+message InstanceStop {
+  // The stop cause, in the vocabulary of stop notices
+  // (docs/graceful-stop.md): `stop`, `update`, `drain`, `reschedule`,
+  // `destroy`, `node_lost`, `scale_in`, `preempted`, `node_pressure`,
+  // `restore`, `suspended`.
+  string cause = 1;
+
+  // A sentence saying what happened. For `node_pressure` this is the
+  // worker's own detail sentence, with the step and the numbers (the same
+  // text as the `node.pressure` event). Otherwise a sentence built from the
+  // cause.
+  string detail = 2;
+
+  // What the reader can change, when there is something: for
+  // `node_pressure`, the worker's hint (for example "raise
+  // resources.memory toward real usage"). Empty otherwise.
+  string hint = 3;
+
+  // RFC 3339 time the manager recorded the stop.
+  string at = 4;
+
+  // The allocation that stopped.
+  int64 allocation_id = 5;
+
+  // The node it ran on.
+  string node_id = 6;
+
+  // For `preempted`: the job that took the capacity.
+  string preemptor_job = 7;
+}
+
+// Which checkpoints a running instance can take right now
+// (InstanceInfo.checkpoint_support), computed by the manager with the same
+// checks CreateSnapshot, SuspendInstance, and ForkInstance apply, including
+// what the job spec cannot show: the node's worker version and VMM, its
+// volume driver's ops, and a stored network policy that gates the task.
+// Each `*_blocker` is the FailedPrecondition message that RPC would return
+// (with its `Hint:` line), so a client can show it without calling. The
+// checks are the ones that depend on the instance, its node, and its task;
+// ACLs are not part of it.
+message CheckpointSupport {
+  // CreateSnapshot `kind = memory` would be accepted.
+  bool snapshot_memory = 1;
+  string snapshot_memory_blocker = 2;
+
+  // CreateSnapshot `kind = disk` would be accepted.
+  bool snapshot_disk = 3;
+  string snapshot_disk_blocker = 4;
+
+  // SuspendInstance `checkpoint = memory` would be accepted. A disk suspend
+  // leaves the volume in place and needs nothing beyond a keyed instance on
+  // a worker that can checkpoint, so it has no field of its own: see
+  // `suspend_default`.
+  bool suspend_memory = 5;
+  string suspend_memory_blocker = 6;
+
+  // The kind SuspendInstance takes with no `checkpoint`: the task's
+  // `suspend.checkpoint`, else memory when possible, else disk. Empty when
+  // the instance cannot be suspended at all (slot mode, or a worker without
+  // the `checkpoint` capability); `suspend_blocker` says why.
+  string suspend_default = 7;
+  string suspend_blocker = 8;
+
+  // ForkInstance `checkpoint = memory` would be accepted.
+  bool fork_memory = 9;
+  string fork_memory_blocker = 10;
+
+  // ForkInstance `checkpoint = disk` would be accepted.
+  bool fork_disk = 11;
+  string fork_disk_blocker = 12;
+
+  // ForkInstance `spread = true` would be accepted: a memory fork whose
+  // checkpoint can be published (no node-local volume, and a worker with a
+  // `contentStore`).
+  bool spread = 13;
+  string spread_blocker = 14;
+
+  // CreateSnapshot `publish = true` with a memory snapshot would be
+  // accepted.
+  bool publish = 15;
+  string publish_blocker = 16;
 }
 
 // Request payload for GetHeartbeatCadence. No parameters: the report is

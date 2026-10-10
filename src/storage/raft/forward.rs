@@ -84,6 +84,11 @@ pub(crate) enum ForwardableLaneWrite {
         allocation_id: i64,
         #[serde(default)]
         cause: StopCause,
+        /// The `last_stop` detail and hint (the memory pressure path). Absent
+        /// from a manager that predates it, which records the generic
+        /// sentence for `cause` instead.
+        #[serde(default)]
+        explanation: Option<crate::storage::store::StopExplanation>,
     },
     /// `Store::enqueue_eval_after_delay` — scheduler lane. Returns the
     /// enqueued eval.
@@ -243,7 +248,8 @@ pub(crate) fn execute(store: &Store, op: ForwardableLaneWrite) -> ForwardOutcome
         ForwardableLaneWrite::RemoveAllocationById {
             allocation_id,
             cause,
-        } => done(store.remove_allocation_by_id_local(allocation_id, cause)),
+            explanation,
+        } => done(store.remove_allocation_by_id_local(allocation_id, cause, explanation)),
         ForwardableLaneWrite::EnqueueEval {
             kind,
             job_id,
@@ -330,6 +336,7 @@ mod tests {
             ForwardableLaneWrite::RemoveAllocationById {
                 allocation_id: 7,
                 cause: StopCause::Unknown,
+                explanation: None,
             },
             ForwardableLaneWrite::EnqueueEval {
                 kind: "job_reschedule".into(),

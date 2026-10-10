@@ -107,6 +107,8 @@ fn endpoint_table() -> Vec<(&'static str, Plane)> {
         ("GetNodes", Plane::Protected("node:read")),
         ("GetHeartbeatCadence", Plane::Protected("node:read")),
         ("GetNodeUsage", Plane::Protected("node:read")),
+        ("ListNodeUsage", Plane::Protected("node:read")),
+        ("GetNodeContent", Plane::Protected("node:read")),
         ("GetNode", Plane::Protected("node:read")),
         ("RestartWorker", Plane::Protected("node:write")),
         ("SetNodeAvailability", Plane::Protected("node:write")),
@@ -619,6 +621,19 @@ async fn call_endpoint(
         "GetNodeUsage" => svc
             .get_node_usage(req(
                 GetNodeUsageRequest {
+                    node_id: NODE_ID.into(),
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "ListNodeUsage" => svc
+            .list_node_usage(req(ListNodeUsageRequest::default(), token))
+            .await
+            .map(|_| ()),
+        "GetNodeContent" => svc
+            .get_node_content(req(
+                GetNodeContentRequest {
                     node_id: NODE_ID.into(),
                 },
                 token,

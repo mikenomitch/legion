@@ -163,6 +163,71 @@ pub struct Instance {
     pub restore_from: Option<String>,
 }
 
+/// Why an instance's last allocation stopped (`instance.last_stop`, JSON).
+/// Served as `InstanceInfo.last_stop`, so "stopped by node pressure" reads
+/// on the instance row without `operator:read` on events (suspend/resume UI
+/// plan §7.3).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct InstanceLastStop {
+    /// Stop-cause wire form ([`crate::structs::stop::StopCause::as_str`]).
+    pub cause: String,
+    pub detail: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub hint: String,
+    /// Unix seconds.
+    pub at: i64,
+    pub allocation_id: i64,
+    pub node_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub preemptor_job: String,
+}
+
+impl InstanceLastStop {
+    /// The record for a stop the manager decided, with a sentence built from
+    /// the cause. The pressure path replaces `detail` and `hint` with the
+    /// worker's own words.
+    pub fn from_cause(
+        cause: crate::structs::stop::StopCause,
+        allocation_id: i64,
+        node_id: &str,
+        preemptor_job: Option<&str>,
+        at: i64,
+    ) -> Self {
+        use crate::structs::stop::StopCause;
+        let detail = match cause {
+            StopCause::Stop => "Stopped by a user (instance stop or job stop).".to_string(),
+            StopCause::Update => "Replaced by a newer job config.".to_string(),
+            StopCause::Drain => format!("Moved off node {node_id}, which is draining."),
+            StopCause::Reschedule => "Rescheduled by the manager.".to_string(),
+            StopCause::Destroy => "Destroyed.".to_string(),
+            StopCause::NodeLost => format!("Node {node_id} was lost or removed."),
+            StopCause::ScaleIn => "Removed by a scale-in.".to_string(),
+            StopCause::Preempted => match preemptor_job {
+                Some(job) if !job.is_empty() => {
+                    format!("Preempted to make room for higher-priority job {job}.")
+                }
+                _ => "Preempted to make room for higher-priority work.".to_string(),
+            },
+            StopCause::NodePressure => {
+                format!("Stopped by node {node_id}'s memory pressure response.")
+            }
+            StopCause::Restore => "Replaced to roll back to a snapshot.".to_string(),
+            StopCause::Suspended => "Suspended with its state checkpointed.".to_string(),
+            StopCause::Unknown => "Stopped.".to_string(),
+        };
+        Self {
+            cause: cause.as_str().to_string(),
+            detail,
+            hint: String::new(),
+            at,
+            allocation_id,
+            node_id: node_id.to_string(),
+            preemptor_job: preemptor_job.unwrap_or_default().to_string(),
+        }
+    }
+}
+
 /// Deterministic slot-mode instance id: `{job_id}-{group}-{slot}`.
 ///
 /// Recomputable and human-legible so replica N's identity (and its storage

@@ -207,6 +207,7 @@ pub fn build_node_usage_reply(
         memory_mib: None,
         cpu_mhz: None,
         mhz_per_core: None,
+        cpu_cores: None,
         ratios: OversubscribeRatios::default(),
     });
     let report = entry.map(|entry| &entry.report);
@@ -298,6 +299,7 @@ pub fn build_node_usage_reply(
             pressure_available: node_memory.is_some_and(|memory| memory.psi_available),
             oversubscribe_ratio: capacity.ratios.memory,
             pressure_response: report.and_then(|report| report.pressure.clone()),
+            ..Default::default()
         }),
         cpu: Some(NodeResourceUsage {
             capacity: capacity.cpu_mhz.unwrap_or(0.0),
@@ -306,6 +308,8 @@ pub fn build_node_usage_reply(
                 .mhz_per_core
                 .map_or(0.0, |mhz| used_millicores as f64 / 1000.0 * mhz),
             oversubscribe_ratio: capacity.ratios.cpu,
+            cores: capacity.cpu_cores.unwrap_or(0.0),
+            used_millicores,
             ..Default::default()
         }),
         allocations: rows,

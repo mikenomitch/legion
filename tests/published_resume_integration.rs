@@ -906,3 +906,54 @@ async fn a_published_restore_skips_workers_that_cannot_fetch() -> R<()> {
     assert_eq!(cluster.node_of_instance()?.as_deref(), Some(NODE_C));
     Ok(())
 }
+
+/// Track 3 (suspend/resume UI plan §6.7): GetSnapshot names the nodes that
+/// hold a published checkpoint's parts, and GetNodeContent shows the same
+/// fact from the node's side, with the entry labeled by its snapshot.
+#[tokio::test(flavor = "multi_thread")]
+async fn snapshot_holders_and_node_content_read_the_location_index() -> R<()> {
+    let cluster = Cluster::new()?;
+    let checkpoint = cluster.suspended_on_a("store").await?;
+    cluster.published_by_a(&checkpoint).await?;
+    cluster.add_node(NODE_B, CPU_MODEL, "us-west", false)?;
+    cluster.advertise(NODE_B, &[&digest()]);
+
+    let snapshot = cluster
+        .svc
+        .get_snapshot(Request::new(legion::structs::GetSnapshotRequest {
+            snapshot: checkpoint.clone(),
+            job_id: None,
+        }))
+        .await?
+        .into_inner()
+        .snapshot
+        .context("snapshot")?;
+    let holder = snapshot
+        .holders
+        .iter()
+        .find(|holder| holder.node_id == NODE_B)
+        .context("node-b holds the part")?;
+    assert_eq!((holder.parts_here, holder.parts_total), (1, 1));
+    assert!(!holder.captured_here);
+
+    let content = cluster
+        .svc
+        .get_node_content(Request::new(legion::structs::GetNodeContentRequest {
+            node_id: NODE_B.into(),
+        }))
+        .await?
+        .into_inner();
+    assert!(content.index_reported);
+    assert_eq!(content.entries.len(), 1);
+    assert_eq!(content.entries[0].snapshot_id, checkpoint);
+    let row = content
+        .snapshots
+        .iter()
+        .find(|row| {
+            row.snapshot.as_ref().map(|s| s.snapshot_id.as_str()) == Some(checkpoint.as_str())
+        })
+        .context("the checkpoint is listed for node-b")?;
+    assert!(!row.captured_here);
+    assert_eq!(row.parts_here, 1);
+    Ok(())
+}

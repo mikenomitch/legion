@@ -2,8 +2,9 @@ use crate::cmd::helpers::{connect_manager_client, json_flag, print_table};
 use crate::cmd::output::{self, OutputFormat};
 use crate::prelude::*;
 use crate::structs::{
-    GetHeartbeatCadenceRequest, GetNodeRequest, GetNodeUsageReply, GetNodeUsageRequest,
-    GetNodesRequest, Node, NodePrint, RestartWorkerRequest, SetNodeAvailabilityRequest,
+    GetHeartbeatCadenceRequest, GetNodeContentReply, GetNodeContentRequest, GetNodeRequest,
+    GetNodeUsageReply, GetNodeUsageRequest, GetNodesRequest, ListNodeUsageReply,
+    ListNodeUsageRequest, Node, NodePrint, RestartWorkerRequest, SetNodeAvailabilityRequest,
     UpdateNodeDynamicRequest,
 };
 
@@ -37,7 +38,30 @@ pub fn config() -> Command {
         \n\
         Capacity and reservations come from the state store; measured usage\n\
         comes from the node's cgroups, reported every 10 seconds by workers\n\
-        with resourceEnforcement.enabled. See docs/resource-enforcement.md.\
+        with resourceEnforcement.enabled. See docs/resource-enforcement.md.\n\
+        \n\
+        Without a node, show one summary line per node (ListNodeUsage).\
+        ",
+        )
+        .arg(
+            Arg::new("id")
+                .value_name("ID")
+                .help("Identifier of the node to inspect; omit for every node")
+                .required(false),
+        )
+        .arg(json_flag());
+
+    let node_content_cmd = Command::new("content")
+        .about("Show what a node holds for content locality: advertised content and snapshots")
+        .long_about(
+            "\
+        Show what a node holds for content locality\n\
+        \n\
+        Lists the content the node's worker advertises to this manager's\n\
+        location index (1 MiB and up), which snapshot each entry belongs to,\n\
+        and the node's snapshots with how many of their parts it holds. The\n\
+        index is soft state held by the manager that receives the node's\n\
+        heartbeats. See docs/artifacts.md, \"Content locality\".\
         ",
         )
         .arg(
@@ -157,6 +181,7 @@ pub fn config() -> Command {
         .subcommand(update_node_cmd)
         .subcommand(node_info_cmd)
         .subcommand(node_usage_cmd)
+        .subcommand(node_content_cmd)
         .subcommand(node_claims_cmd)
         .subcommand(restart_node_cmd)
         .subcommand(cordon_node_cmd)
@@ -228,11 +253,18 @@ pub async fn handle(sub_matches: &ArgMatches) -> R<()> {
             get_node_info(id.to_string(), format).await
         }
         Some(("usage", arg_matches)) => {
+            let format = OutputFormat::from_matches(arg_matches);
+            match arg_matches.get_one::<String>("id") {
+                Some(id) => get_node_usage(id.to_string(), format).await,
+                None => list_node_usage(format).await,
+            }
+        }
+        Some(("content", arg_matches)) => {
             let id = arg_matches
                 .get_one::<String>("id")
                 .context("Must provide id")?;
             let format = OutputFormat::from_matches(arg_matches);
-            get_node_usage(id.to_string(), format).await
+            get_node_content(id.to_string(), format).await
         }
         Some(("restart", arg_matches)) => {
             let id = arg_matches
@@ -408,6 +440,249 @@ async fn get_node_usage(node_id: String, format: OutputFormat) -> R<()> {
     Ok(())
 }
 
+/// `legion node usage` with no node — one summary line per node, from
+/// ListNodeUsage.
+#[instrument(err, skip_all)]
+async fn list_node_usage(format: OutputFormat) -> R<()> {
+    let mut client = connect_manager_client().await?;
+    let reply = output::resolve(
+        format,
+        "failed to list node usage",
+        client
+            .list_node_usage(tonic::Request::new(ListNodeUsageRequest::default()))
+            .await,
+    )?
+    .into_inner();
+    if format.is_json() {
+        output::print_success(&reply);
+    } else {
+        print!("{}", render_node_usage_list(&reply));
+    }
+    Ok(())
+}
+
+/// Human rendering of a `ListNodeUsage` reply.
+fn render_node_usage_list(reply: &ListNodeUsageReply) -> String {
+    use tabled::{settings::Style, Table, Tabled};
+
+    #[derive(Tabled)]
+    struct Row {
+        #[tabled(rename = "NODE")]
+        node: String,
+        #[tabled(rename = "STATUS")]
+        status: String,
+        #[tabled(rename = "MEMORY")]
+        capacity: String,
+        #[tabled(rename = "RESERVED")]
+        reserved: String,
+        #[tabled(rename = "USED")]
+        used: String,
+        #[tabled(rename = "CPU")]
+        cpu: String,
+        #[tabled(rename = "PRESSURE")]
+        pressure: String,
+    }
+    if reply.nodes.is_empty() {
+        return "No nodes.\n".to_string();
+    }
+    let percent = |part: f64, whole: f64| {
+        if whole > 0.0 {
+            format!("{:.0}%", part / whole * 100.0)
+        } else {
+            "-".to_string()
+        }
+    };
+    let rows: Vec<Row> = reply
+        .nodes
+        .iter()
+        .map(|node| {
+            let memory = node.memory.clone().unwrap_or_default();
+            let cpu = node.cpu.clone().unwrap_or_default();
+            let ratio = memory.oversubscribe_ratio;
+            let physical = if ratio > 0.0 {
+                memory.capacity / ratio
+            } else {
+                memory.capacity
+            };
+            Row {
+                node: node.node_id.clone(),
+                status: node.status.clone(),
+                capacity: if memory.capacity <= 0.0 {
+                    "-".to_string()
+                } else if ratio > 1.0 {
+                    format!("{physical:.0} MiB ×{ratio}")
+                } else {
+                    format!("{:.0} MiB", memory.capacity)
+                },
+                reserved: percent(memory.reserved, memory.capacity),
+                used: if node.usage_reported {
+                    percent(memory.used, physical)
+                } else {
+                    "-".to_string()
+                },
+                cpu: cpu_capacity_label(&cpu),
+                pressure: match memory.pressure_response.as_ref() {
+                    _ if !node.usage_reported => "-".to_string(),
+                    Some(status) if !status.enabled => "off".to_string(),
+                    Some(status) if status.under_pressure => "UNDER PRESSURE".to_string(),
+                    Some(_) => "ok".to_string(),
+                    None => "unknown".to_string(),
+                },
+            }
+        })
+        .collect();
+    let mut out = Table::new(rows).with(Style::blank()).to_string();
+    out.push('\n');
+    if reply.truncated {
+        out.push_str("Showing the first 500 nodes by id.\n");
+    }
+    out
+}
+
+/// CPU capacity as MHz, or as a core count on a node that reports no usable
+/// clock speed (Apple Silicon), or `-`.
+fn cpu_capacity_label(cpu: &crate::structs::NodeResourceUsage) -> String {
+    if cpu.capacity > 0.0 {
+        format!("{:.0} MHz", cpu.capacity)
+    } else if cpu.cores > 0.0 {
+        format!("{:.0} cores", cpu.cores)
+    } else {
+        "-".to_string()
+    }
+}
+
+/// `legion node content <NODE>` — the node's advertised content and the
+/// snapshots it holds.
+#[instrument(err, skip_all)]
+async fn get_node_content(node_id: String, format: OutputFormat) -> R<()> {
+    let mut client = connect_manager_client().await?;
+    let reply = output::resolve(
+        format,
+        "failed to fetch node content",
+        client
+            .get_node_content(tonic::Request::new(GetNodeContentRequest { node_id }))
+            .await,
+    )?
+    .into_inner();
+    if format.is_json() {
+        output::print_success(&reply);
+    } else {
+        print!("{}", render_node_content(&reply));
+    }
+    Ok(())
+}
+
+/// Human rendering of a `GetNodeContent` reply.
+fn render_node_content(reply: &GetNodeContentReply) -> String {
+    use crate::cmd::helpers::usage_display;
+    use tabled::{settings::Style, Table, Tabled};
+
+    let mut out = format!(
+        "Node {}  publish: {}  checkpoint: {}\n",
+        reply.node_id,
+        if reply.can_publish { "yes" } else { "no" },
+        if reply.can_checkpoint { "yes" } else { "no" },
+    );
+    if !reply.index_reported {
+        out.push_str(
+            "No content report from this node reached this manager (no content store, an \
+             older worker, a manager that just started, or heartbeats sent elsewhere).\n",
+        );
+    } else {
+        out.push_str(&format!(
+            "Advertises {} entries, {} MiB (epoch {})\n",
+            reply.entries.len(),
+            usage_display::mib(reply.advertised_bytes),
+            reply.epoch
+        ));
+    }
+
+    #[derive(Tabled)]
+    struct EntryRow {
+        #[tabled(rename = "DIGEST")]
+        digest: String,
+        #[tabled(rename = "MiB")]
+        mib: String,
+        #[tabled(rename = "SNAPSHOT")]
+        snapshot: String,
+        #[tabled(rename = "ROLE")]
+        role: String,
+        #[tabled(rename = "HOLDERS")]
+        holders: u32,
+    }
+    if !reply.entries.is_empty() {
+        let rows: Vec<EntryRow> = reply
+            .entries
+            .iter()
+            .map(|entry| EntryRow {
+                digest: entry.digest.chars().take(19).collect(),
+                mib: usage_display::mib(entry.bytes),
+                snapshot: or_dash(&entry.snapshot_id),
+                role: or_dash(&entry.role),
+                holders: entry.holders,
+            })
+            .collect();
+        out.push('\n');
+        out.push_str(&Table::new(rows).with(Style::blank()).to_string());
+        out.push('\n');
+    }
+
+    #[derive(Tabled)]
+    struct SnapshotRow {
+        #[tabled(rename = "SNAPSHOT")]
+        snapshot: String,
+        #[tabled(rename = "JOB")]
+        job: String,
+        #[tabled(rename = "KIND")]
+        kind: String,
+        #[tabled(rename = "STATE")]
+        state: String,
+        #[tabled(rename = "CAPTURED HERE")]
+        captured: &'static str,
+        #[tabled(rename = "PARTS HERE")]
+        parts: String,
+    }
+    if reply.snapshots.is_empty() {
+        out.push_str("\nNo snapshots on this node.\n");
+        return out;
+    }
+    let rows: Vec<SnapshotRow> = reply
+        .snapshots
+        .iter()
+        .filter_map(|row| {
+            let snapshot = row.snapshot.as_ref()?;
+            Some(SnapshotRow {
+                snapshot: if snapshot.name.is_empty() {
+                    snapshot.snapshot_id.clone()
+                } else {
+                    format!("{} ({})", snapshot.name, snapshot.snapshot_id)
+                },
+                job: snapshot.job_id.clone(),
+                kind: snapshot.kind.clone(),
+                state: snapshot.state.clone(),
+                captured: if row.captured_here { "yes" } else { "no" },
+                parts: if row.parts_total == 0 {
+                    "-".to_string()
+                } else {
+                    format!("{}/{}", row.parts_here, row.parts_total)
+                },
+            })
+        })
+        .collect();
+    out.push('\n');
+    out.push_str(&Table::new(rows).with(Style::blank()).to_string());
+    out.push('\n');
+    out
+}
+
+fn or_dash(value: &str) -> String {
+    if value.is_empty() {
+        "-".to_string()
+    } else {
+        value.to_string()
+    }
+}
+
 /// Human rendering of a `GetNodeUsage` reply. Split out so the layout is
 /// tested without a cluster.
 fn render_node_usage(reply: &GetNodeUsageReply, now_unix: i64) -> String {
@@ -515,7 +790,11 @@ fn render_node_usage(reply: &GetNodeUsageReply, now_unix: i64) -> String {
         },
         ResourceRow {
             resource: "cpu",
-            capacity: capacity(&cpu, "MHz"),
+            capacity: if cpu.capacity > 0.0 {
+                capacity(&cpu, "MHz")
+            } else {
+                cpu_capacity_label(&cpu)
+            },
             reserved: format!(
                 "{}{}",
                 amount(cpu.reserved, "MHz"),
@@ -842,6 +1121,116 @@ mod tests {
     }
 
     #[test]
+    fn node_usage_without_a_node_and_node_content_parse() -> R<()> {
+        let matches = config().try_get_matches_from(["node", "usage", "-j"])?;
+        let (subcommand, args) = matches.subcommand().context("Missing subcommand")?;
+        assert_eq!(subcommand, "usage");
+        assert!(args.get_one::<String>("id").is_none());
+
+        let matches = config().try_get_matches_from(["node", "content", "w-03"])?;
+        let (subcommand, args) = matches.subcommand().context("Missing subcommand")?;
+        assert_eq!(subcommand, "content");
+        assert_eq!(
+            args.get_one::<String>("id").map(String::as_str),
+            Some("w-03")
+        );
+        Ok(())
+    }
+
+    /// The fleet table shows the physical memory with its ratio, used against
+    /// physical, cores where MHz is unknown, and the pressure verdict.
+    #[test]
+    fn node_usage_list_renders_one_line_per_node() {
+        use crate::structs::{MemoryPressureStatus, NodeResourceUsage};
+        let reply = ListNodeUsageReply {
+            nodes: vec![
+                GetNodeUsageReply {
+                    node_id: "w-03".into(),
+                    status: "ready".into(),
+                    usage_reported: true,
+                    memory: Some(NodeResourceUsage {
+                        capacity: 1536.0,
+                        reserved: 768.0,
+                        used: 512.0,
+                        oversubscribe_ratio: 1.5,
+                        pressure_response: Some(MemoryPressureStatus {
+                            enabled: true,
+                            under_pressure: true,
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    cpu: Some(NodeResourceUsage {
+                        capacity: 0.0,
+                        cores: 10.0,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                GetNodeUsageReply {
+                    node_id: "mac".into(),
+                    status: "ready".into(),
+                    ..Default::default()
+                },
+            ],
+            truncated: true,
+        };
+        let out = render_node_usage_list(&reply);
+        assert!(out.contains("1024 MiB ×1.5"), "{out}");
+        assert!(out.contains("50%"), "{out}");
+        assert!(out.contains("10 cores"), "{out}");
+        assert!(out.contains("UNDER PRESSURE"), "{out}");
+        assert!(out.contains("first 500 nodes"), "{out}");
+    }
+
+    #[test]
+    fn node_content_renders_entries_and_snapshots() {
+        use crate::structs::{NodeContentEntry, NodeSnapshotContent, SnapshotInfo};
+        let reply = GetNodeContentReply {
+            node_id: "w-2".into(),
+            index_reported: true,
+            epoch: 3,
+            entries: vec![NodeContentEntry {
+                digest: "sha256:0123456789abcdef0123".into(),
+                bytes: 512 * 1024 * 1024,
+                snapshot_id: "snap-a".into(),
+                role: "memory".into(),
+                holders: 2,
+            }],
+            advertised_bytes: 512 * 1024 * 1024,
+            can_publish: true,
+            can_checkpoint: true,
+            snapshots: vec![NodeSnapshotContent {
+                snapshot: Some(SnapshotInfo {
+                    snapshot_id: "snap-a".into(),
+                    job_id: "web".into(),
+                    kind: "memory".into(),
+                    state: "published".into(),
+                    ..Default::default()
+                }),
+                captured_here: false,
+                parts_here: 1,
+                parts_total: 2,
+                bytes_here: 512 * 1024 * 1024,
+            }],
+        };
+        let out = render_node_content(&reply);
+        assert!(
+            out.contains("Advertises 1 entries, 512 MiB (epoch 3)"),
+            "{out}"
+        );
+        assert!(out.contains("snap-a"), "{out}");
+        assert!(out.contains("1/2"), "{out}");
+
+        let empty = render_node_content(&GetNodeContentReply {
+            node_id: "w-9".into(),
+            ..Default::default()
+        });
+        assert!(empty.contains("No content report"), "{empty}");
+        assert!(empty.contains("No snapshots on this node."), "{empty}");
+    }
+
+    #[test]
     fn node_usage_command_parses() -> R<()> {
         let matches = config().try_get_matches_from(["node", "usage", "w-03", "-j"])?;
         let (subcommand, args) = matches.subcommand().context("Missing subcommand")?;
@@ -878,6 +1267,7 @@ mod tests {
                     free_below_bytes: 400 * MIB,
                     ..Default::default()
                 }),
+                ..Default::default()
             }),
             cpu: Some(NodeResourceUsage {
                 capacity: 8000.0,

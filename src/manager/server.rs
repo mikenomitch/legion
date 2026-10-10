@@ -41,23 +41,24 @@ use crate::structs::{
     GetJobSpecReply, GetJobSpecRequest, GetJobTemplateReply, GetJobTemplateRequest, GetKvLockReply,
     GetKvLockRequest, GetKvReply, GetKvRequest, GetLedgerReply, GetLedgerRequest,
     GetManagerConfigsReply, GetManagerConfigsRequest, GetMeshCaReply, GetMeshCaRequest,
-    GetNodeReply, GetNodeRequest, GetNodeUsageReply, GetNodeUsageRequest, GetNodesReply,
-    GetNodesRequest, GetObservabilityReply, GetObservabilityRequest, GetRaftJoinTokenReply,
-    GetRaftJoinTokenRequest, GetRaftStatusReply, GetRaftStatusRequest, GetRolloutReply,
-    GetRolloutRequest, GetRolloutStatusReply, GetRolloutStatusRequest, GetStateBackupReply,
-    GetStateBackupRequest, GetStateStoreSchemaReply, GetStateStoreSchemaRequest,
-    GetTaskLogsRequest, GetVolumeReply, GetVolumeRequest, HealthCheckReply, HealthCheckRequest,
-    HeartbeatReply, HeartbeatRequest, IngressCertificate, Instance, InstanceInfo, InstanceMode,
-    InstanceState, IssueBootTicketReply, IssueBootTicketRequest, IssueNodeCertificateReply,
-    IssueNodeCertificateRequest, IssueNodeIdentityTokenReply, IssueNodeIdentityTokenRequest,
-    IssueRaftCommandReply, IssueRaftCommandRequest, IssueWorkloadIdentityTokenReply,
-    IssueWorkloadIdentityTokenRequest, JobConfig, JobSpecHistoryItem, JobTemplate,
-    JobTemplateProvenance, JobTemplateSummary, JobTemplateVariable, JobTemplateVersionInfo,
-    KvEntry, KvInjectionAction, KvValueType, LedgerNode, ListBootTicketsReply,
-    ListBootTicketsRequest, ListEventsReply, ListEventsRequest, ListInstancesReply,
-    ListInstancesRequest, ListJobActionsReply, ListJobActionsRequest, ListJobSpecHistoryReply,
-    ListJobSpecHistoryRequest, ListJobTemplatesReply, ListJobTemplatesRequest, ListJobsReply,
-    ListJobsRequest, ListKvReply, ListKvRequest, ListRaftHistoryReply, ListRaftHistoryRequest,
+    GetNodeContentReply, GetNodeContentRequest, GetNodeReply, GetNodeRequest, GetNodeUsageReply,
+    GetNodeUsageRequest, GetNodesReply, GetNodesRequest, GetObservabilityReply,
+    GetObservabilityRequest, GetRaftJoinTokenReply, GetRaftJoinTokenRequest, GetRaftStatusReply,
+    GetRaftStatusRequest, GetRolloutReply, GetRolloutRequest, GetRolloutStatusReply,
+    GetRolloutStatusRequest, GetStateBackupReply, GetStateBackupRequest, GetStateStoreSchemaReply,
+    GetStateStoreSchemaRequest, GetTaskLogsRequest, GetVolumeReply, GetVolumeRequest,
+    HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, IngressCertificate,
+    Instance, InstanceInfo, InstanceMode, InstanceState, IssueBootTicketReply,
+    IssueBootTicketRequest, IssueNodeCertificateReply, IssueNodeCertificateRequest,
+    IssueNodeIdentityTokenReply, IssueNodeIdentityTokenRequest, IssueRaftCommandReply,
+    IssueRaftCommandRequest, IssueWorkloadIdentityTokenReply, IssueWorkloadIdentityTokenRequest,
+    JobConfig, JobSpecHistoryItem, JobTemplate, JobTemplateProvenance, JobTemplateSummary,
+    JobTemplateVariable, JobTemplateVersionInfo, KvEntry, KvInjectionAction, KvValueType,
+    LedgerNode, ListBootTicketsReply, ListBootTicketsRequest, ListEventsReply, ListEventsRequest,
+    ListInstancesReply, ListInstancesRequest, ListJobActionsReply, ListJobActionsRequest,
+    ListJobSpecHistoryReply, ListJobSpecHistoryRequest, ListJobTemplatesReply,
+    ListJobTemplatesRequest, ListJobsReply, ListJobsRequest, ListKvReply, ListKvRequest,
+    ListNodeUsageReply, ListNodeUsageRequest, ListRaftHistoryReply, ListRaftHistoryRequest,
     ListRolloutEventsReply, ListRolloutEventsRequest, ListRolloutsReply, ListRolloutsRequest,
     ListSavedStateQueriesReply, ListSavedStateQueriesRequest, ListServiceEdgesReply,
     ListServiceEdgesRequest, ListServicesReply, ListServicesRequest, ListVolumeDriversReply,
@@ -111,7 +112,9 @@ use tonic::transport::{Channel, Endpoint};
 use tonic::{Request, Response, Status, Streaming};
 
 // Phase 6: ForkInstance, `from_snapshot` creates, and snapshot names.
+mod checkpoint_support;
 mod fork_rpcs;
+mod node_content_rpcs;
 mod snapshot_rpcs;
 mod suspend_rpcs;
 pub use snapshot_rpcs::{expire_snapshots, CHECKPOINT_CAPABILITY};
@@ -618,6 +621,7 @@ fn map_instance_info(
     usage: &crate::manager::usage::UsageTable,
     instance: Instance,
     suspend: crate::structs::suspend::InstanceSuspendState,
+    history: crate::storage::store::InstanceHistory,
 ) -> InstanceInfo {
     // Loss confirmation first: it explains an instance that is bound but
     // waiting. A volume pin explains one that is UNBOUND and waiting — the two
@@ -652,7 +656,22 @@ fn map_instance_info(
             .map(|time| time.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
     });
     let idle_after_seconds = idle.map(|usage| usage.idle_after_seconds);
+    let checkpoint_support = checkpoint_support::load_checkpoint_support(store, &instance);
+    let last_stop = history.last_stop.map(|stop| crate::structs::InstanceStop {
+        cause: stop.cause,
+        detail: stop.detail,
+        hint: stop.hint,
+        at: chrono::DateTime::<chrono::Utc>::from_timestamp(stop.at, 0)
+            .map(|time| time.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+            .unwrap_or_default(),
+        allocation_id: stop.allocation_id,
+        node_id: stop.node_id,
+        preemptor_job: stop.preemptor_job,
+    });
     InstanceInfo {
+        last_stop,
+        checkpoint_support,
+        forked_from: history.forked_from,
         usage,
         instance_id: instance.instance_id,
         job_id: instance.job_id,
@@ -5546,6 +5565,10 @@ impl Manager for ManagerDaemonService {
             .store
             .instance_suspend_states_for_job(&inner.job_id)
             .map_err(|e| map_store_error("Error listing instances", e))?;
+        let mut history = self
+            .store
+            .instance_lineage_for_job(&inner.job_id)
+            .map_err(|e| map_store_error("Error listing instances", e))?;
         let usage = self.usage.lock().unwrap_or_else(|p| p.into_inner());
         let instances = self
             .store
@@ -5555,7 +5578,8 @@ impl Manager for ManagerDaemonService {
             .filter(|instance| group.as_deref().is_none_or(|group| instance.group == group))
             .map(|instance| {
                 let state = suspend.remove(&instance.instance_id).unwrap_or_default();
-                map_instance_info(&self.store, &usage, instance, state)
+                let history = history.remove(&instance.instance_id).unwrap_or_default();
+                map_instance_info(&self.store, &usage, instance, state, history)
             })
             .collect();
 
@@ -5593,10 +5617,14 @@ impl Manager for ManagerDaemonService {
             .store
             .instance_suspend_state(&inner.instance_id)
             .map_err(|e| map_store_error("Error loading instance", e))?;
+        let history = self
+            .store
+            .instance_history(&inner.instance_id)
+            .map_err(|e| map_store_error("Error loading instance", e))?;
 
         let usage = self.usage.lock().unwrap_or_else(|p| p.into_inner());
         let idle_unmeasured = idle_policy_unmeasured_detail(&self.store, &usage, &instance);
-        let mut info = map_instance_info(&self.store, &usage, instance, suspend);
+        let mut info = map_instance_info(&self.store, &usage, instance, suspend, history);
         drop(usage);
         if info.detail.is_none() {
             info.detail = idle_unmeasured;
@@ -6427,30 +6455,21 @@ impl Manager for ManagerDaemonService {
             AclAction::Read,
             &AclScope::pool(&node.pool),
         )?;
-        let allocations = self
-            .store
-            .allocs_for_node(&node_id)
-            .map_err(|e| map_store_error("Error listing node allocations", e))?;
-        let mut bands = HashMap::new();
-        for allocation in &allocations {
-            if !bands.contains_key(&allocation.job_config_id) {
-                let band = self
-                    .store
-                    .cached_band_for_job_config(&allocation.job_config_id)
-                    .unwrap_or_default();
-                bands.insert(allocation.job_config_id.clone(), band);
-            }
-        }
-        let usage = self.usage.lock().unwrap_or_else(|p| p.into_inner());
-        let reply = crate::manager::usage::build_node_usage_reply(
-            &node,
-            &allocations,
-            &self.store.resource_policy,
-            &bands,
-            usage.node(&node_id),
-            std::time::Instant::now(),
-        );
-        Ok(Response::new(reply))
+        Ok(Response::new(self.node_usage_reply(&node)?))
+    }
+
+    async fn list_node_usage(
+        &self,
+        request: Request<ListNodeUsageRequest>,
+    ) -> Result<Response<ListNodeUsageReply>, Status> {
+        self.list_node_usage_rpc(request).await
+    }
+
+    async fn get_node_content(
+        &self,
+        request: Request<GetNodeContentRequest>,
+    ) -> Result<Response<GetNodeContentReply>, Status> {
+        self.get_node_content_rpc(request).await
     }
 
     #[instrument(skip_all)]
@@ -9634,14 +9653,20 @@ fn handle_pressure_actions(
             .node_pressure_actions_total
             .inc(&[node_id, action.step.as_str()]);
         if action.step == "reclaim" {
-            store.events().node_pressure(node_id, action);
+            let instance_id = pressure_instance_id(store, action);
+            store
+                .events()
+                .node_pressure(node_id, action, instance_id.as_deref());
             continue;
         }
         if action.step == "suspend" {
             // The state change rides the local suspension's snapshot report
             // (applied earlier in this heartbeat): the instance is
             // `suspended`, not evicted, and nothing is rescheduled.
-            store.events().node_pressure(node_id, action);
+            let instance_id = pressure_instance_id(store, action);
+            store
+                .events()
+                .node_pressure(node_id, action, instance_id.as_deref());
             continue;
         }
         let Some(existing) = store.get_allocation_by_id(action.allocation_id)? else {
@@ -9660,9 +9685,20 @@ fn handle_pressure_actions(
             );
             continue;
         }
-        store.events().node_pressure(node_id, action);
-        let Some(removed) =
-            store.remove_allocation_by_id_because(action.allocation_id, StopCause::NodePressure)?
+        store
+            .events()
+            .node_pressure(node_id, action, existing.instance_id.as_deref());
+        // The worker's own sentence and hint become the instance's
+        // `last_stop`, so the row explains itself without the event.
+        let explanation = crate::storage::store::StopExplanation {
+            detail: action.detail.clone(),
+            hint: action.hint.clone(),
+        };
+        let Some(removed) = store.remove_allocation_by_id_explained(
+            action.allocation_id,
+            StopCause::NodePressure,
+            Some(explanation),
+        )?
         else {
             continue;
         };
@@ -9686,6 +9722,27 @@ fn handle_pressure_actions(
         );
     }
     Ok(())
+}
+
+/// The instance a pressure action touched, for the `node.pressure` event:
+/// the allocation's instance while its row exists, else (a pressure suspend,
+/// whose allocation the snapshot report already removed) the instance its
+/// checkpoint was taken from. Lookup failures read as none: the field is
+/// advisory.
+fn pressure_instance_id(store: &Store, action: &crate::structs::PressureAction) -> Option<String> {
+    if let Ok(Some(allocation)) = store.get_allocation_by_id(action.allocation_id) {
+        if allocation.instance_id.is_some() {
+            return allocation.instance_id;
+        }
+    }
+    if action.snapshot_id.is_empty() {
+        return None;
+    }
+    store
+        .get_snapshot(&action.snapshot_id)
+        .ok()
+        .flatten()
+        .and_then(|snapshot| snapshot.instance_id)
 }
 
 fn handle_terminated_allocations(

@@ -818,6 +818,23 @@ pub struct StoredStopNotice {
     pub preemptor_band: String,
 }
 
+/// The words an instance's `last_stop` carries in place of the generic
+/// sentence for its cause: the memory pressure response's detail and hint.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StopExplanation {
+    pub detail: String,
+    #[serde(default)]
+    pub hint: String,
+}
+
+/// An instance's stop history and fork lineage (`instance.last_stop`,
+/// `instance.forked_from`), read beside the instance for `InstanceInfo`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InstanceHistory {
+    pub last_stop: Option<crate::structs::instance::InstanceLastStop>,
+    pub forked_from: Option<String>,
+}
+
 /// One task's count override (`legion job scale`, docs/autoscaling.md),
 /// keyed by the version-stable task tuple so it survives resubmits.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -12662,8 +12679,81 @@ impl Store {
                     preemptor_band
                 ],
             )?;
+            // The instance keeps the cause after the allocation row and the
+            // short-lived notice are gone (`InstanceInfo.last_stop`).
+            if let Some(instance_id) = alloc.instance_id.as_deref() {
+                let record = crate::structs::instance::InstanceLastStop::from_cause(
+                    cause,
+                    alloc.id,
+                    &alloc.node_id,
+                    preemptor_job.as_deref(),
+                    now_unix,
+                );
+                Self::write_instance_last_stop_tx(tx, instance_id, &record)?;
+            }
         }
         Ok(())
+    }
+
+    /// Write an instance's `last_stop` record. A no-op for an instance id
+    /// with no row.
+    fn write_instance_last_stop_tx(
+        tx: &Connection,
+        instance_id: &str,
+        record: &crate::structs::instance::InstanceLastStop,
+    ) -> R<()> {
+        tx.execute(
+            "UPDATE instance SET last_stop = ?2 WHERE instance_id = ?1;",
+            params![instance_id, serde_json::to_string(record)?],
+        )?;
+        Ok(())
+    }
+
+    /// `last_stop` and `forked_from` for every instance of a job that has
+    /// either, keyed by instance id. One query for `instance list`.
+    pub fn instance_lineage_for_job(&self, job_id: &str) -> R<HashMap<String, InstanceHistory>> {
+        let conn = self.read_connection()?;
+        let mut stmt = conn.prepare(
+            "SELECT instance_id, last_stop, forked_from FROM instance WHERE job_id = ?1 \
+             AND (last_stop IS NOT NULL OR forked_from IS NOT NULL);",
+        )?;
+        let rows = stmt.query_map([job_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })?;
+        Ok(Self::collect_rows(rows)?
+            .into_iter()
+            .map(|(id, last_stop, forked_from)| {
+                (
+                    id,
+                    InstanceHistory {
+                        last_stop: last_stop.and_then(|raw| serde_json::from_str(&raw).ok()),
+                        forked_from,
+                    },
+                )
+            })
+            .collect())
+    }
+
+    /// [`Self::instance_lineage_for_job`] for one instance.
+    pub fn instance_history(&self, instance_id: &str) -> R<InstanceHistory> {
+        let conn = self.read_connection()?;
+        let row: Option<(Option<String>, Option<String>)> = conn
+            .query_row(
+                "SELECT last_stop, forked_from FROM instance WHERE instance_id = ?1;",
+                [instance_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        Ok(row
+            .map(|(last_stop, forked_from)| InstanceHistory {
+                last_stop: last_stop.and_then(|raw| serde_json::from_str(&raw).ok()),
+                forked_from,
+            })
+            .unwrap_or_default())
     }
 
     /// Stage the `allocation.stopping` event for a set of removals.
@@ -13604,12 +13694,25 @@ impl Store {
         allocation_id: i64,
         cause: StopCause,
     ) -> R<Option<Allocation>> {
-        match self.remove_allocation_by_id_local(allocation_id, cause) {
+        self.remove_allocation_by_id_explained(allocation_id, cause, None)
+    }
+
+    /// [`Self::remove_allocation_by_id_because`], with the sentence and hint
+    /// the instance's `last_stop` should carry instead of the generic one
+    /// built from `cause` (the memory pressure path passes the worker's).
+    pub fn remove_allocation_by_id_explained(
+        &self,
+        allocation_id: i64,
+        cause: StopCause,
+        explanation: Option<StopExplanation>,
+    ) -> R<Option<Allocation>> {
+        match self.remove_allocation_by_id_local(allocation_id, cause, explanation.clone()) {
             Err(err) if crate::storage::raft::driver::NotRaftLeader::in_chain(&err) => self
                 .forward_after_rejection(
                     crate::storage::raft::forward::ForwardableLaneWrite::RemoveAllocationById {
                         allocation_id,
                         cause,
+                        explanation,
                     },
                     err,
                 ),
@@ -13621,9 +13724,10 @@ impl Store {
         &self,
         allocation_id: i64,
         cause: StopCause,
+        explanation: Option<StopExplanation>,
     ) -> R<Option<Allocation>> {
         self.replicated(Lane::Scheduler, "remove_allocation_by_id", move |s| {
-            s.remove_allocation_by_id_apply(allocation_id, cause)
+            s.remove_allocation_by_id_apply(allocation_id, cause, explanation.as_ref())
         })
     }
 
@@ -13631,6 +13735,7 @@ impl Store {
         &self,
         allocation_id: i64,
         cause: StopCause,
+        explanation: Option<&StopExplanation>,
     ) -> R<Option<Allocation>> {
         let allocation = self.get_allocation_by_id(allocation_id)?;
         let Some(allocation) = allocation else {
@@ -13644,6 +13749,22 @@ impl Store {
         self.bump_job_config_epoch_tx(&tx, &allocation.job_config_id)?;
         let stopping_event =
             self.record_stop_notices_tx(&tx, std::slice::from_ref(&allocation), cause)?;
+        if let (Some(explanation), Some(instance_id)) =
+            (explanation, allocation.instance_id.as_deref())
+        {
+            let mut record = crate::structs::instance::InstanceLastStop::from_cause(
+                cause,
+                allocation.id,
+                &allocation.node_id,
+                None,
+                OffsetDateTime::now_utc().unix_timestamp(),
+            );
+            if !explanation.detail.is_empty() {
+                record.detail = explanation.detail.clone();
+            }
+            record.hint = explanation.hint.clone();
+            Self::write_instance_last_stop_tx(&tx, instance_id, &record)?;
+        }
         tx.commit()?;
         self.publish_staged(stopping_event);
 

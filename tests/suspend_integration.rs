@@ -1189,3 +1189,104 @@ async fn a_local_suspension_overtakes_a_pending_requested_suspend() -> R<()> {
         .is_none());
     Ok(())
 }
+
+/// Track 3 (suspend/resume UI plan §7.3): a pressure eviction leaves the
+/// worker's detail and hint on the instance as `last_stop`, names the
+/// instance in the `node.pressure` event, and a running instance reports
+/// which checkpoints it can take with the RPCs' own refusals.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_instance_records_its_last_stop_and_its_checkpoint_support() -> R<()> {
+    let cluster = Cluster::new()?;
+    cluster.add_node(json!(["checkpoint"]))?;
+    cluster.submit(job("exec", None))?;
+    let alloc = cluster.active_instance()?;
+
+    // An exec task with a local-dir volume: disk everything, memory nothing,
+    // and no publish (node-local volume, no contentStore).
+    let info = cluster.info().await?;
+    assert!(info.last_stop.is_none(), "nothing has stopped yet");
+    let support = info
+        .checkpoint_support
+        .context("an active instance reports checkpoint support")?;
+    assert!(support.snapshot_disk && support.fork_disk, "{support:?}");
+    assert!(!support.snapshot_memory && !support.suspend_memory && !support.fork_memory);
+    assert!(
+        support
+            .snapshot_memory_blocker
+            .contains("disk snapshots only"),
+        "{}",
+        support.snapshot_memory_blocker
+    );
+    assert_eq!(support.suspend_default, "disk");
+    assert!(!support.publish && !support.spread);
+    assert!(!support.spread_blocker.is_empty());
+
+    cluster
+        .svc
+        .heartbeat(Request::new(HeartbeatRequest {
+            id: NODE.into(),
+            pressure_actions: vec![PressureAction {
+                allocation_id: alloc,
+                job_id: JOB.into(),
+                step: "evict-bursting".into(),
+                used_bytes: 900 << 20,
+                reserved_bytes: 512 << 20,
+                detail: "evicted by evict-bursting on suspend-node: using 900 MiB of a 512 MiB \
+                         reservation"
+                    .into(),
+                hint: "raise resources.memory toward real usage".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }))
+        .await?;
+
+    let info = cluster.info().await?;
+    let stop = info.last_stop.context("the eviction is recorded")?;
+    assert_eq!(stop.cause, "node_pressure");
+    assert!(stop.detail.contains("900 MiB"), "{}", stop.detail);
+    assert_eq!(stop.hint, "raise resources.memory toward real usage");
+    assert_eq!(stop.allocation_id, alloc);
+    assert_eq!(stop.node_id, NODE);
+    assert!(!stop.at.is_empty());
+    assert!(
+        info.checkpoint_support.is_none(),
+        "nothing to checkpoint without a running allocation"
+    );
+    let pressure = cluster.events("node.pressure")?;
+    assert_eq!(pressure.len(), 1);
+    assert_eq!(pressure[0]["instance_id"], ID);
+
+    // ListInstances carries the same record.
+    let listed = cluster
+        .svc
+        .list_instances(Request::new(legion::structs::ListInstancesRequest {
+            job_id: JOB.into(),
+            group: None,
+        }))
+        .await?
+        .into_inner()
+        .instances;
+    let row = listed
+        .iter()
+        .find(|instance| instance.instance_id == ID)
+        .context("listed")?;
+    assert_eq!(
+        row.last_stop.as_ref().map(|stop| stop.cause.as_str()),
+        Some("node_pressure")
+    );
+
+    // A later stop replaces it with the generic sentence for its cause.
+    cluster.reschedule()?;
+    cluster
+        .svc
+        .stop_instance(Request::new(StopInstanceRequest {
+            instance_id: ID.into(),
+            idempotency_key: None,
+        }))
+        .await?;
+    let stop = cluster.info().await?.last_stop.context("stop recorded")?;
+    assert_eq!(stop.cause, "stop");
+    assert!(stop.hint.is_empty());
+    Ok(())
+}
