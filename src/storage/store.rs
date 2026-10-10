@@ -1368,6 +1368,11 @@ impl JobSubmitOutcome {
 
 pub const CONN_LOCK_ERROR: &str = "Error locking database connection";
 
+/// How long a failed inline reconcile waits before its `job_reschedule`
+/// retry runs (see `Store::reconcile_job_configs_or_requeue`). Long enough
+/// that a transient conflict has cleared, short enough that a replacement
+/// is not noticeably late.
+const RECONCILE_RETRY_DELAY: Duration = Duration::from_secs(5);
 // Test seam for `reconcile_job_config_allocations`: a plan conflict is a
 // race between evals and cannot be staged deterministically, so tests make
 // the next N reconcile attempts lose one.
@@ -7227,8 +7232,12 @@ impl Store {
     /// capture as the eviction could not observe the eviction and placed
     /// nothing (latent raft-mode bug, exposed by
     /// tests/raft_ownership_guard.rs). Sequencing the ops lets each read
-    /// its predecessor's committed effects; a crash mid-sequence is healed
-    /// by the idempotent drain eval re-running the pass.
+    /// its predecessor's committed effects. A failed reconcile queues its
+    /// own `job_reschedule` retry
+    /// ([`Self::reconcile_job_configs_or_requeue`]), because a re-run of
+    /// this pass finds the evicted allocations already gone; a crash
+    /// between the ops is healed by the next leader's
+    /// [`Self::regenerate_scheduling_evals`].
     #[instrument(err, skip_all)]
     pub fn reschedule_allocations_for_drained_node(&self, node_id: &str) -> R<()> {
         let allocs = self.allocs_for_node(node_id)?;
@@ -7256,11 +7265,10 @@ impl Store {
 
         let evicted = removable.len();
         let affected_job_configs = self.remove_allocations(&removable, StopCause::Drain)?;
-        for job_config_id in affected_job_configs {
-            self.reconcile_job_config_allocations(&job_config_id)?;
-        }
+        let reconciled = self.reconcile_job_configs_or_requeue(affected_job_configs);
 
         self.events().node_drained(node_id, evicted, held);
+        reconciled?;
 
         Ok(())
     }
@@ -14094,6 +14102,58 @@ impl Store {
         unreachable!("the last attempt always returns")
     }
 
+    /// Reconcile several job configs, isolating failures.
+    ///
+    /// The node-loss, drain, and new-node passes call this AFTER they have
+    /// already removed the allocations being replaced, so a reconcile that
+    /// fails with nothing queued behind it leaves the job under-count with
+    /// no retry: the node holds no allocations any more, so the lost-node
+    /// monitor and the drain eval have nothing left to re-drive. Each config
+    /// is therefore reconciled independently (one failure must not abort
+    /// the rest), and a failed one gets a delayed `job_reschedule`, which
+    /// carries the plan-conflict retries and requeue backstop this inline
+    /// pass lacks. The first error is returned only when that retry could
+    /// not be queued either (for example, this node lost the scheduler
+    /// lane, in which case the new leader's regeneration pass re-derives
+    /// the work).
+    pub(crate) fn reconcile_job_configs_or_requeue(
+        &self,
+        job_config_ids: impl IntoIterator<Item = String>,
+    ) -> R<()> {
+        let mut unqueued_error = None;
+        for job_config_id in job_config_ids {
+            let Err(error) = self.reconcile_job_config_allocations(&job_config_id) else {
+                continue;
+            };
+            // A destroyed config has nothing left to converge.
+            let Some(job_id) = self.job_id_for_job_config(&job_config_id)? else {
+                continue;
+            };
+            warn!(
+                %job_id,
+                %job_config_id,
+                retry_after_ms = RECONCILE_RETRY_DELAY.as_millis() as u64,
+                error = %format!("{error:#}"),
+                "Reconcile failed; queueing a job_reschedule retry"
+            );
+            if let Err(enqueue_error) = self.enqueue_eval_after_delay(
+                "job_reschedule",
+                Some(&job_id),
+                Some(&job_config_id),
+                None,
+                None,
+                RECONCILE_RETRY_DELAY,
+            ) {
+                warn!(%job_id, %job_config_id, error = %enqueue_error, "Could not queue reconcile retry");
+                unqueued_error.get_or_insert(error);
+            }
+        }
+        match unqueued_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
     /// Free a lost node's allocations for replacement — gated for stateful
     /// tasks (the at-most-one fencing guarantee, see
     /// docs/stateful-workloads.md "Node loss and fencing"):
@@ -14117,9 +14177,11 @@ impl Store {
     /// Since C-2 this is a wrapper-level composition of single-purpose
     /// scheduler-lane ops (see
     /// [`Self::reschedule_allocations_for_drained_node`] for why the
-    /// removal and the reconcile must not share one capture). A crash
-    /// between them is healed by the node monitor re-enqueueing the
-    /// `node_lost_reschedule` eval every tick.
+    /// removal and the reconcile must not share one capture). Once the
+    /// removal commits the node holds nothing, so the monitor stops
+    /// re-enqueueing this pass: a config whose reconcile fails gets its own
+    /// delayed `job_reschedule` instead
+    /// ([`Self::reconcile_job_configs_or_requeue`]).
     #[instrument(err, skip_all)]
     pub fn reschedule_allocations_for_lost_node(&self, node_id: &str) -> R<()> {
         let allocs = self.allocs_for_node(node_id)?;
@@ -14147,11 +14209,7 @@ impl Store {
         }
 
         let affected_job_configs = self.remove_allocations(&removable, StopCause::NodeLost)?;
-        for job_config_id in affected_job_configs {
-            self.reconcile_job_config_allocations(&job_config_id)?;
-        }
-
-        Ok(())
+        self.reconcile_job_configs_or_requeue(affected_job_configs)
     }
 
     /// How long the node has been lost, when known. `None` means the node is
@@ -14283,10 +14341,7 @@ impl Store {
                 job_config_ids.push(job_config_id);
             }
         }
-        for job_config_id in job_config_ids {
-            self.reconcile_job_config_allocations(&job_config_id)?;
-        }
-        Ok(())
+        self.reconcile_job_configs_or_requeue(job_config_ids)
     }
 
     #[instrument(err, skip_all)]
@@ -20333,6 +20388,48 @@ mod tests {
         let replaced = store.allocs_for_node("node-two")?;
         assert_eq!(replaced.len(), 1);
         assert_eq!(replaced[0].task_config_id, web_task);
+        Ok(())
+    }
+
+    /// SC3: one config whose replacement cannot be placed must neither
+    /// abort the reconcile of the others nor be left with nothing retrying
+    /// it (the lost node holds no allocations any more, so the monitor
+    /// stops re-driving the pass).
+    #[test]
+    fn lost_node_reschedule_isolates_a_failing_config_and_queues_its_retry() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-one", "active"))?;
+
+        let pinned_task = {
+            let mut task = task("pinned");
+            task.constraints = json!({ "node_id": "node-one" });
+            task
+        };
+        submit_job(&store, "pinned-job", vec![pinned_task])?;
+        submit_job(&store, "free-job", vec![task("free")])?;
+        store.place_alloc("node-one", task_id_for(&store, "pinned", "pinned-job")?)?;
+        store.place_alloc("node-one", task_id_for(&store, "free", "free-job")?)?;
+        store.insert_node(make_node_msg("node-two", "active"))?;
+
+        store.mark_node_lost("node-one")?;
+        store.reschedule_allocations_for_lost_node("node-one")?;
+
+        let replaced = store.allocs_for_node("node-two")?;
+        assert_eq!(replaced.len(), 1, "the placeable job is still replaced");
+        assert_eq!(replaced[0].job_id, "free-job");
+
+        let pinned_config = store.get_job_config("pinned-job")?.id();
+        let retry = store
+            .get_evals()?
+            .into_iter()
+            .find(|eval| eval.kind == "job_reschedule" && eval.job_id == "pinned-job")
+            .context("the failing config must get a retry eval")?;
+        assert_eq!(retry.status, "pending");
+        assert_eq!(retry.job_config_id, pinned_config);
+        assert!(
+            store.claim_eval()?.is_none(),
+            "the retry is delayed, not immediately claimable"
+        );
         Ok(())
     }
 

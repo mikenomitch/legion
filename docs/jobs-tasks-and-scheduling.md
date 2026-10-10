@@ -193,8 +193,12 @@ Two paths exist:
 - Allocations on the lost node are removed and the affected job configs reconciled.
 - Reconciliation runs the scheduler in `Reschedule` mode, so replacements
   respect node capacity, constraints, group co-location, and the configured
-  policy like any other placement. A job with nowhere to go is logged and
-  retried on the next tick instead of force-placed.
+  policy like any other placement. Each affected job config is reconciled on
+  its own, so one job that cannot be placed does not block the others.
+- A job whose replacement fails is never force-placed. It gets a
+  `job_reschedule` eval delayed by 5 seconds, because the lost node no longer
+  holds its allocations and the node monitor will not re-drive it. Drain
+  evictions follow the same rule.
 - The `node_drop` eval path does the same reconciliation.
 
 ## Cordon and Drain
