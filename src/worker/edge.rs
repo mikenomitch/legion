@@ -253,6 +253,8 @@ mod worker_edge_test {
             provisional: None,
             priority_band: String::new(),
             restore: None,
+            task_suspend: String::new(),
+            task_snapshots: String::new(),
         }
     }
 

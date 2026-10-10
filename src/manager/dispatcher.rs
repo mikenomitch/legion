@@ -611,6 +611,19 @@ pub fn build_task_allocation_with(
         }
         _ => String::new(),
     };
+    // Suspend and snapshots: the node acts on both itself (idle reports,
+    // pressure suspends, a checkpoint-ready launch). Empty when undeclared,
+    // so jobs without them stay byte-identical on the wire.
+    let task_suspend = match task.suspend.as_ref() {
+        Some(suspend) => serde_json::to_string(suspend).context("Failed to serialize suspend")?,
+        None => String::new(),
+    };
+    let task_snapshots = match task.snapshots.as_ref() {
+        Some(snapshots) => {
+            serde_json::to_string(snapshots).context("Failed to serialize snapshots")?
+        }
+        None => String::new(),
+    };
     Ok(TaskAllocation {
         allocation_id: allocation.id,
         job_id: allocation.job_id.clone(),
@@ -638,6 +651,8 @@ pub fn build_task_allocation_with(
         // Attached by the heartbeat builder, which knows the instance's
         // restore source (see `snapshot_restore_payload`).
         restore: None,
+        task_suspend,
+        task_snapshots,
     })
 }
 
@@ -916,6 +931,46 @@ mod tests {
         assert_eq!(env["LEGION_INSTANCE_ID"], json!("job-default-1"));
         assert_eq!(env["LEGION_INSTANCE_MODE"], json!("slot"));
         assert_eq!(env["LEGION_INSTANCE_SLOT"], json!("1"));
+        Ok(())
+    }
+
+    /// The node acts on `suspend` and `snapshots` itself (idle reports,
+    /// pressure suspends, a checkpoint-ready sandbox launch), so both ride
+    /// the payload, and the worker rebuilds them with the instance it
+    /// serves. Undeclared, they stay off the wire.
+    #[test]
+    fn suspend_and_snapshots_reach_the_worker() -> R<()> {
+        let instance = Instance {
+            mode: InstanceMode::Keyed,
+            slot_index: None,
+            instance_id: "user-42".into(),
+            ..slot_instance()
+        };
+        let task: TaskConfig = serde_json::from_value(json!({
+            "name": "workspace",
+            "runtime": "sandbox",
+            "config": { "image": "alpine", "command": ["sleep", "1"] },
+            "stateful": { "mode": "keyed" },
+            "suspend": { "checkpoint": "memory", "idle": { "after": "3m" }, "onPressure": true },
+            "snapshots": { "keep": 3 },
+        }))?;
+        let built =
+            build_task_allocation(&task, &allocation(Some("user-42")), Some(&instance), &[])?;
+        assert!(!built.task_suspend.is_empty());
+        assert!(!built.task_snapshots.is_empty());
+
+        let (worker_alloc, worker_task) = crate::worker::task_manager::task_and_allocation(&built)?;
+        assert_eq!(worker_task.suspend, task.suspend);
+        assert_eq!(worker_task.snapshots, task.snapshots);
+        assert_eq!(worker_alloc.instance_id.as_deref(), Some("user-42"));
+        assert!(crate::structs::snapshot::memory_checkpoint_ask(&worker_task).is_some());
+
+        let plain = TaskConfig {
+            config: json!({ "command": ["true"] }),
+            ..TaskConfig::new("web", "exec")
+        };
+        let built = build_task_allocation(&plain, &allocation(None), None, &[])?;
+        assert!(built.task_suspend.is_empty() && built.task_snapshots.is_empty());
         Ok(())
     }
 

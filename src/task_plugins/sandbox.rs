@@ -532,6 +532,31 @@ fn sandbox_name(allocation: &Allocation) -> String {
     format!("legion-sbx-{}", allocation.id)
 }
 
+/// The Apple `container` name of a macOS dev-mode sandbox. Container names
+/// are global to the Mac, and two local clusters both number allocations
+/// from 1, so the name carries the node too: otherwise one cluster's
+/// stale-container cleanup (`container rm --force`) would remove the other's
+/// running sandbox.
+fn apple_container_name(allocation: &Allocation) -> String {
+    let node: String = allocation
+        .node_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let node = node.trim_matches('-');
+    if node.is_empty() {
+        sandbox_name(allocation)
+    } else {
+        format!("legion-sbx-{node}-{}", allocation.id)
+    }
+}
+
 /// The host-side vsock socket base of a gated sandbox: the VMM multiplexes
 /// guest ports onto `<base>_<port>`, which is where the node datapath
 /// listens. Derived from the allocation directory alone so the worker can
@@ -909,7 +934,10 @@ fn build_apple_launch(
         args.push(format!("{key}={value}"));
     }
     args.push(config.image.clone());
-    args.push("--".to_string());
+    // No `--` before the command: Apple `container` 1.1 passes everything
+    // after the image through verbatim, and takes a `--` there as the
+    // executable to run ("failed to find target executable --"). The
+    // container runtime's Apple launch does the same.
     args.extend(config.command.clone());
     args
 }
@@ -1212,7 +1240,7 @@ impl SandboxTaskPlugin {
         backend: &Backend,
     ) -> R<Command> {
         reject_block_volumes_in_dev_mode(&instance.volumes, backend)?;
-        let name = sandbox_name(allocation);
+        let name = apple_container_name(allocation);
         remove_stale_dev_sandbox(backend, &name);
         // Named for the usage sampler: `container stats` is how an idle
         // policy sees this sandbox on macOS, where there is no cgroup.
@@ -1549,7 +1577,11 @@ impl TaskPlugin for SandboxTaskPlugin {
                 hypervisor.label()
             );
         }
-        opts.command = build_exec_command(&sandbox_name(allocation), opts.tty, &opts.command);
+        let name = match hypervisor {
+            Backend::AppleContainer => apple_container_name(allocation),
+            _ => sandbox_name(allocation),
+        };
+        opts.command = build_exec_command(&name, opts.tty, &opts.command);
 
         info!(
             allocation_id = allocation.id,
@@ -1777,9 +1809,10 @@ impl TaskPlugin for SandboxTaskPlugin {
         if let Ok(hypervisor) = Backend::detect(configured_backend(task).as_deref()) {
             let name = sandbox_name(allocation);
             let teardown: Option<(String, Vec<String>)> = match &hypervisor {
-                Backend::AppleContainer => {
-                    Some(("container".to_string(), vec!["stop".into(), name.clone()]))
-                }
+                Backend::AppleContainer => Some((
+                    "container".to_string(),
+                    vec!["stop".into(), apple_container_name(allocation)],
+                )),
                 Backend::OciRuntime { binary } => Some((
                     binary.clone(),
                     vec!["delete".into(), "--force".into(), name.clone()],
@@ -2312,6 +2345,21 @@ mod tests {
     }
 
     #[test]
+    fn apple_container_names_carry_the_node() {
+        let mut allocation = Allocation {
+            id: 7,
+            node_id: "Mike's Mac.local".into(),
+            ..alloc()
+        };
+        assert_eq!(
+            apple_container_name(&allocation),
+            "legion-sbx-mike-s-mac-local-7"
+        );
+        allocation.node_id.clear();
+        assert_eq!(apple_container_name(&allocation), "legion-sbx-7");
+    }
+
+    #[test]
     fn apple_launch_mounts_the_identity_dir_read_only() -> R<()> {
         let config = SandboxTaskConfig::from_value(&json!({"image": "a", "command": ["x"]}))?;
         let args = build_apple_launch(
@@ -2733,7 +2781,7 @@ mod tests {
     // --- dev mode (macOS) launch surface ---
 
     #[test]
-    fn apple_launch_binds_volumes_and_terminates_args() -> R<()> {
+    fn apple_launch_binds_volumes_and_passes_the_command_through() -> R<()> {
         let config = SandboxTaskConfig::from_value(&json!({
             "image": "alpine",
             "command": ["-l", "ls"],
@@ -2765,11 +2813,11 @@ mod tests {
             "read-only volumes bind read-only"
         );
         assert!(args.contains(&"MODE=test".to_string()));
-        // `--` guards a command whose first token looks like a flag.
-        let sep = args.iter().position(|a| a == "--").expect("separator");
+        // The command follows the image verbatim, with no `--` separator,
+        // which Apple `container` would run as the executable.
+        assert!(!args.contains(&"--".to_string()), "no separator: {args:?}");
         let image = args.iter().position(|a| a == "alpine").expect("image");
-        assert_eq!(sep, image + 1);
-        assert_eq!(args[sep + 1], "-l");
+        assert_eq!(args[image + 1], "-l");
         Ok(())
     }
 

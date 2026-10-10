@@ -20471,6 +20471,33 @@ export class TaskAllocation extends Message<TaskAllocation> {
    */
   restore?: SnapshotRestore;
 
+  /**
+   * Track 1: the task's suspend and snapshot declarations, which the node
+   * acts on itself.
+   *
+   * The task's `suspend` block as JSON (docs/suspend-and-resume.md). The
+   * worker reads its idle policy (`suspend.idle`) to report idle-since with
+   * usage, `suspend.onPressure` to let its memory pressure response suspend
+   * the instance, and whether it asks for memory checkpoints, which decides
+   * how a sandbox launches (an identity disk, device links, a VMM API
+   * socket). Empty when the task declares no `suspend`, so jobs without one
+   * stay byte-identical on the wire. A worker that predates the field
+   * ignores it, and a manager that predates it leaves it empty: such a node
+   * reports no idle time and launches no sandbox ready for checkpoints.
+   *
+   * @generated from field: string task_suspend = 23;
+   */
+  taskSuspend = "";
+
+  /**
+   * The task's `snapshots` block as JSON (docs/suspend-and-resume.md,
+   * "Snapshots"). A sandbox that opts into memory snapshots launches ready
+   * for them. Empty when the task declares no `snapshots`.
+   *
+   * @generated from field: string task_snapshots = 24;
+   */
+  taskSnapshots = "";
+
   constructor(data?: PartialMessage<TaskAllocation>) {
     super();
     proto3.util.initPartial(data, this);
@@ -20501,6 +20528,8 @@ export class TaskAllocation extends Message<TaskAllocation> {
     { no: 20, name: "task_network", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 21, name: "priority_band", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 22, name: "restore", kind: "message", T: SnapshotRestore, opt: true },
+    { no: 23, name: "task_suspend", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 24, name: "task_snapshots", kind: "scalar", T: 9 /* ScalarType.STRING */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): TaskAllocation {

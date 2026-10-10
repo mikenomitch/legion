@@ -4280,6 +4280,32 @@ fn task_from_allocation(allocation: &TaskAllocation) -> R<(Allocation, TaskConfi
         Some(serde_json::from_str(&allocation.task_stop).context("Invalid task stop JSON")?)
     };
 
+    // Suspend and snapshots decide how a sandbox launches (ready for memory
+    // checkpoints or not), the idle policy the usage reports carry, and
+    // whether the pressure response may suspend the instance.
+    let suspend = if allocation.task_suspend.trim().is_empty() {
+        None
+    } else {
+        Some(serde_json::from_str(&allocation.task_suspend).context("Invalid task suspend JSON")?)
+    };
+    let snapshots = if allocation.task_snapshots.trim().is_empty() {
+        None
+    } else {
+        Some(
+            serde_json::from_str(&allocation.task_snapshots)
+                .context("Invalid task snapshots JSON")?,
+        )
+    };
+    // The instance this allocation serves, from the env the manager
+    // injected at dispatch: the pressure response only suspends instances,
+    // and a sandbox's identity disk names its instance.
+    let instance_id = task_config
+        .get("env")
+        .and_then(|env| env.get("LEGION_INSTANCE_ID"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string);
+
     let task = TaskConfig {
         config: task_config,
         checks,
@@ -4289,6 +4315,8 @@ fn task_from_allocation(allocation: &TaskAllocation) -> R<(Allocation, TaskConfi
         connect,
         resources,
         stop,
+        suspend,
+        snapshots,
         ..TaskConfig::new(&allocation.task_name, &allocation.task_runtime)
     };
     let alloc = Allocation {
@@ -4300,9 +4328,7 @@ fn task_from_allocation(allocation: &TaskAllocation) -> R<(Allocation, TaskConfi
         task_config_id: allocation.task_config_id,
         job_id: allocation.job_id.clone(),
         network,
-        // The worker never needs the instance binding: instance env vars are
-        // already injected into task_config by the manager at dispatch time.
-        instance_id: None,
+        instance_id,
     };
 
     Ok((alloc, task))
@@ -4386,6 +4412,8 @@ mod tests {
             provisional: None,
             priority_band: String::new(),
             restore: None,
+            task_suspend: String::new(),
+            task_snapshots: String::new(),
         }
     }
 
