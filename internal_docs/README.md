@@ -133,7 +133,8 @@ When one is required and what goes in it:
 | [ui-holistic-polish-plan.md](plans/ui-holistic-polish-plan.md) | shipped (2026-09-02; embedding the UI in the binary deliberately left open) |
 | [workload-identity-oidc-plan.md](plans/workload-identity-oidc-plan.md) | shipped (task identities) |
 | [volume-plugin-system-plan.md](plans/volume-plugin-system-plan.md) | shipped (v1; CSI bridge + snapshot/clone deferred) |
-| [sandbox-snapshots-and-fast-start-plan.md](plans/sandbox-snapshots-and-fast-start-plan.md) | planned (§0 convergence shipped with the sandbox kind) |
+| [sandbox-snapshots-and-fast-start-plan.md](plans/sandbox-snapshots-and-fast-start-plan.md) | superseded in part by suspend-resume-and-oversubscription (§0 convergence shipped; mechanics still the reference) |
+| [suspend-resume-and-oversubscription-plan.md](plans/suspend-resume-and-oversubscription-plan.md) | planned |
 | [shared-alloc-dir-proposal.md](plans/shared-alloc-dir-proposal.md) | proposal |
 | [data-dir-env-plan.md](plans/data-dir-env-plan.md) | shipped (`LEGION_DATA_DIR`; no config-file field, by design) |
 
@@ -188,6 +189,7 @@ by project impact. The full template and a worked example:
 - [service-discovery-final-plan_calls.md](calls/service-discovery-final-plan_calls.md)
 - [shared-alloc-dir-proposal_calls.md](calls/shared-alloc-dir-proposal_calls.md)
 - [stateful-workloads-and-instance-identity-plan_calls.md](calls/stateful-workloads-and-instance-identity-plan_calls.md)
+- [suspend-resume-and-oversubscription-plan_calls.md](calls/suspend-resume-and-oversubscription-plan_calls.md)
 - [volume-plugin-system-plan_calls.md](calls/volume-plugin-system-plan_calls.md)
 - [worker-simulation-plan_calls.md](calls/worker-simulation-plan_calls.md)
 - [workload-identity-oidc-plan_calls.md](calls/workload-identity-oidc-plan_calls.md)
