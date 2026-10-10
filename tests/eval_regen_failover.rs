@@ -296,6 +296,112 @@ fn live_rollouts_regenerate_ticks_not_blanket_reschedules() -> R<()> {
     Ok(())
 }
 
+/// SC1: a rolled-back rollout must stay rolled back. The latest config
+/// (the bad v2) has no allocations, which used to read as a lost submit, so
+/// the hook enqueued `job_submit` and brought v2 back at full count with no
+/// canary or health gating. It must converge v1 instead, here topping up a
+/// v1 allocation lost after the rollback.
+#[test]
+fn rolled_back_rollout_is_not_undone_by_reconciliation() -> R<()> {
+    let store = setup_store()?;
+    store.insert_node(NodeMsg::from(test_node("w1")))?;
+
+    store.handle_job_submit(&job("rollback", "v1", 2), &[submission("rollback")])?;
+    let v1 = store.get_job_config("rollback")?.id();
+    store.enqueue_eval("job_submit", Some("rollback"), Some(&v1), None, None)?;
+    process_queue(&store)?;
+
+    let mut v2_job = job("rollback", "v2", 2);
+    v2_job.tasks[0].resources = json!({ "memory": 96 });
+    store.handle_job_submit(&v2_job, &[submission("rollback-v2")])?;
+    let v2 = store.get_job_config("rollback")?.id();
+    // The rollout ran, failed its health deadline, and rolled back: v2's
+    // allocations are gone and the rollout is terminal.
+    let rollout = store.create_rollout(
+        "rollback",
+        Some(&v1),
+        &v2,
+        "running",
+        Some("linear"),
+        None,
+        None,
+        None,
+        "{}",
+    )?;
+    store.update_rollout_status(rollout.id, "failed", false, Some("rolled back"))?;
+    let lost = store.allocs_for_job("rollback")?;
+    store.remove_allocation_by_id(lost[0].id)?;
+    clear_eval_queue(&store)?;
+
+    acquisition_hook(&store)?;
+    let pending: Vec<(String, String)> = store
+        .get_evals()?
+        .into_iter()
+        .filter(|e| e.status == "pending")
+        .map(|e| (e.kind, e.job_config_id))
+        .collect();
+    assert_eq!(pending, vec![("job_reschedule".to_string(), v1.clone())]);
+    process_queue(&store)?;
+
+    let allocs = store.allocs_for_job("rollback")?;
+    let v1_count = allocs.iter().filter(|a| a.job_config_id == v1).count();
+    let v2_count = allocs.iter().filter(|a| a.job_config_id == v2).count();
+    assert_eq!((v1_count, v2_count), (2, 0), "the job must stay on v1");
+    // Idempotent: nothing more to do.
+    assert_eq!(acquisition_hook(&store)?, 1);
+    process_queue(&store)?;
+    assert_eq!(store.allocs_for_job("rollback")?.len(), 2);
+    Ok(())
+}
+
+/// SC1: a rollout stopped part way without a revert leaves an old/new mix
+/// on purpose. Reconciliation used to remove the old allocations and top up
+/// the new version, force-completing the rollout with no gating. It must
+/// leave the mix alone.
+#[test]
+fn rollout_stopped_without_revert_keeps_its_mix() -> R<()> {
+    let store = setup_store()?;
+    store.insert_node(NodeMsg::from(test_node("w1")))?;
+
+    store.handle_job_submit(&job("halfway", "v1", 2), &[submission("halfway")])?;
+    let v1 = store.get_job_config("halfway")?.id();
+    store.enqueue_eval("job_submit", Some("halfway"), Some(&v1), None, None)?;
+    process_queue(&store)?;
+
+    let mut v2_job = job("halfway", "v2", 2);
+    v2_job.tasks[0].resources = json!({ "memory": 96 });
+    store.handle_job_submit(&v2_job, &[submission("halfway-v2")])?;
+    let v2 = store.get_job_config("halfway")?.id();
+    let rollout = store.create_rollout(
+        "halfway",
+        Some(&v1),
+        &v2,
+        "running",
+        Some("linear"),
+        None,
+        None,
+        None,
+        "{}",
+    )?;
+    // One step done: one v1 replaced by one v2. Then the operator stops it.
+    let old = store.allocs_for_job("halfway")?;
+    store.remove_allocation_by_id(old[0].id)?;
+    let (v2_task, _) = *store
+        .get_task_configs_for_job_config(&v2)?
+        .first()
+        .context("task config")?;
+    store.place_alloc("w1", v2_task)?;
+    store.update_rollout_status(rollout.id, "cancelled", false, Some("Rollout stopped"))?;
+    clear_eval_queue(&store)?;
+
+    assert_eq!(acquisition_hook(&store)?, 0, "nothing to regenerate");
+    let allocs = store.allocs_for_job("halfway")?;
+    let v1_count = allocs.iter().filter(|a| a.job_config_id == v1).count();
+    let v2_count = allocs.iter().filter(|a| a.job_config_id == v2).count();
+    assert_eq!((v1_count, v2_count), (1, 1), "the mix must survive");
+    Ok(())
+}
+
 /// A KV-triggered restart of an unchanged config is recoverable from the
 /// replicated restart marker even with no queued eval: the hook regenerates
 /// job_update, the eval consumes the marker, and a second pass regenerates

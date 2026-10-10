@@ -387,9 +387,9 @@ pub fn load_policy(name: &str) -> R<(Option<Library>, Box<dyn SchedulingPolicy>)
             let paths = plugin_paths("scheduling", other, &plugin_root);
             validate_manifest("scheduling", other, &paths.root)
                 .with_context(|| format!("invalid scheduling plugin manifest for {}", other))?;
-            let path = paths.dylib.to_string_lossy().into_owned();
             unsafe {
-                let lib = Library::new(&path)?;
+                let lib =
+                    crate::plugin_runtime::open_plugin_library("scheduling", other, &paths.dylib)?;
                 let policy = {
                     let func: Symbol<unsafe extern "C" fn() -> Box<dyn SchedulingPolicy>> =
                         lib.get(b"get")?;

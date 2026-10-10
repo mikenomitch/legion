@@ -39,8 +39,10 @@ When the platform stops a task:
 1. The worker writes the **stop notice** into the task directory.
 2. It sends `stop.signal` to the task's process group.
 3. It waits up to `stop.killAfter` for the process to exit.
-4. If the process is still alive at the deadline, it is SIGKILLed and torn
-   down.
+4. If the process is still alive at the deadline, its whole process group is
+   SIGKILLed and torn down. The kill reaches the same group the signal did, so
+   a shell-wrapped task (`sh -c server`) can't leave the server running after
+   its shell is gone.
 
 Storage is released and the allocation directory removed only **after** the
 process is gone, never at the same time as the signal. Unmounting a volume
@@ -268,7 +270,17 @@ INFO Stopping allocation allocation_id=412 task_name=web cause=drain
    so a node never runs victim and preemptor past the grace window. A new
    allocation that lands next to slow-stopping allocations waits for their
    grace period before it starts, up to the 5-minute `killAfter` cap.
-6. **Expiry.** Notices older than 10 minutes are deleted. The delete runs in
+6. **Worker restarts.** Stopping allocations are persisted in the worker's
+   state file with where they are on the ladder. A worker that restarts
+   mid-stop finishes the job. An allocation inside its grace window keeps
+   its original deadline (stored as wall-clock time) and is hard-killed when
+   it passes. An allocation that was still draining is signalled right
+   away, because the restart already used up the time the drain was meant
+   to buy. Either way, its volumes stay recorded as in use, and new starts
+   on the node stay held, until its process is gone. The restarted worker
+   recognizes the task by pid and process start time, the same check it
+   uses for running tasks.
+7. **Expiry.** Notices older than 10 minutes are deleted. The delete runs in
    the next removal's transaction instead of on the heartbeat path. Reading
    notices never writes, and a cluster with no removals does not build up
    rows to prune.

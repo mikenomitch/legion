@@ -1368,6 +1368,16 @@ impl JobSubmitOutcome {
 
 pub const CONN_LOCK_ERROR: &str = "Error locking database connection";
 
+/// Prefix of a plan rejection that means "this config is no longer wanted"
+/// (stopped job, superseded config). Unlike an epoch conflict, retrying it
+/// cannot succeed, so the planner treats it as an empty plan instead.
+pub(crate) const PLAN_NOT_WANTED_PREFIX: &str = "plan no longer wanted: ";
+
+/// How long a failed inline reconcile waits before its `job_reschedule`
+/// retry runs (see `Store::reconcile_job_configs_or_requeue`). Long enough
+/// that a transient conflict has cleared, short enough that a replacement
+/// is not noticeably late.
+const RECONCILE_RETRY_DELAY: Duration = Duration::from_secs(5);
 // Test seam for `reconcile_job_config_allocations`: a plan conflict is a
 // race between evals and cannot be staged deterministically, so tests make
 // the next N reconcile attempts lose one.
@@ -1578,6 +1588,57 @@ const SEED_TASK_STATUSES_SQL: &str =
 const EVENT_ID_SEQ_BITS: u32 = 18;
 
 // NOTE: This will become a general interface for all storage backends
+
+/// Columns `QueryStateStore` reads as NULL: private key material and password
+/// hashes. Raw SQL is a `state:read` capability, and a holder of these could
+/// forge workload-identity JWTs and boot tickets (`signing_key`), mint mesh
+/// certificates (`net_mesh_ca`), or crack user passwords offline (`acl_user`).
+/// The manager reads these through its own code paths, never through
+/// `query_state_store`.
+pub const STATE_QUERY_REDACTED_COLUMNS: &[(&str, &str)] = &[
+    ("signing_key", "private_key_pem"),
+    ("net_mesh_ca", "key_pem"),
+    ("acl_user", "password_hash"),
+];
+
+/// Installs a SQLite authorizer that reads every redacted column as NULL for
+/// statements prepared while it is held, and removes it on drop. The
+/// authorizer sees the real table and column behind every read (`SELECT *`,
+/// aliases, subqueries, views, CTEs, `WHERE` clauses), so a query cannot route
+/// around it, and an ignored column cannot be probed through a predicate.
+struct RedactSecretColumns<'c> {
+    conn: &'c rusqlite::Connection,
+}
+
+impl<'c> RedactSecretColumns<'c> {
+    fn install(conn: &'c rusqlite::Connection) -> Self {
+        conn.authorizer(Some(
+            |context: rusqlite::hooks::AuthContext<'_>| match context.action {
+                rusqlite::hooks::AuthAction::Read {
+                    table_name,
+                    column_name,
+                } if STATE_QUERY_REDACTED_COLUMNS.iter().any(|(table, column)| {
+                    table.eq_ignore_ascii_case(table_name)
+                        && column.eq_ignore_ascii_case(column_name)
+                }) =>
+                {
+                    rusqlite::hooks::Authorization::Ignore
+                }
+                _ => rusqlite::hooks::Authorization::Allow,
+            },
+        ));
+        RedactSecretColumns { conn }
+    }
+}
+
+impl Drop for RedactSecretColumns<'_> {
+    fn drop(&mut self) {
+        self.conn.authorizer(
+            None::<fn(rusqlite::hooks::AuthContext<'_>) -> rusqlite::hooks::Authorization>,
+        );
+    }
+}
+
 impl Store {
     #[instrument(err, skip_all)]
     pub fn start_storage(config: &ManagerConfigFull) -> R<Store> {
@@ -1595,13 +1656,6 @@ impl Store {
         if raft_enabled {
             crate::storage::raft::quorum::validate_raft_config(&config.persistence.raft)?;
         }
-        // The raft engine needs the migrated store (its state machines apply
-        // into it), so its start is deferred to `start_engine` below;
-        // local_disk/streaming start exactly where they always did.
-        if !raft_enabled {
-            persistence_driver.start()?;
-        }
-
         // KV encryption: a malformed `encryption` block stops the manager
         // here, with the field named, rather than on the first KV write.
         config.encryption.validate()?;
@@ -1683,9 +1737,9 @@ impl Store {
         // pipeline and arms the raft-mode write guard; startup-time writes
         // that follow (requeue, manager-config upsert, seeds) run through
         // replication and are gated to the leader by the daemon.
-        if raft_enabled {
-            store.persistence_driver.clone().start_engine(&store)?;
-        }
+        // Streaming needs the store too: a standby that takes the lease
+        // restores the replica into it before it serves as primary.
+        store.persistence_driver.clone().start_engine(&store)?;
 
         // First-start keyring initialization (mint the root key, write the
         // first data key). Local stores do it right here; a raft node does it
@@ -1782,6 +1836,13 @@ impl Store {
         clone
     }
 
+    /// Orderly persistence stop for process shutdown: final streaming
+    /// replica sync then lease release, or raft lane shutdown. Blocking;
+    /// bounded by roughly `timeout`. See [`PersistenceDriver::shutdown`].
+    pub fn shutdown_persistence(&self, timeout: std::time::Duration) {
+        self.persistence_driver.shutdown(timeout);
+    }
+
     /// The registry cell the `RaftTransport` tonic service dispatches
     /// through. For non-raft backends this is a fresh, never-populated cell:
     /// the mounted service then answers `Unavailable`, which peers treat as
@@ -1810,8 +1871,9 @@ impl Store {
 
     /// Whether this manager may ACT for `lane` right now: in raft mode, true
     /// only while this node leads the raft group carrying the lane (a cheap
-    /// metrics-watch probe, no I/O); in every other persistence mode, always
-    /// true. The daemon's scheduling loops (eval workers, node status
+    /// metrics-watch probe, no I/O); in streaming mode, only while this node
+    /// is the primary (a standby or fenced ex-primary idles, R4); in
+    /// local_disk mode, always true. The daemon's scheduling loops (eval workers, node status
     /// checker) poll this so followers idle and take over within a poll
     /// interval of a leadership change (plan JC-15).
     pub(crate) fn is_raft_leader(&self, lane: Lane) -> bool {
@@ -1821,7 +1883,7 @@ impl Store {
             .downcast_ref::<crate::storage::raft::driver::MultiRaftDriver>()
         {
             Some(driver) => driver.is_leader(lane),
-            None => true,
+            None => self.persistence_role() == PersistenceRole::Primary,
         }
     }
 
@@ -1892,6 +1954,33 @@ impl Store {
             .downcast_ref::<crate::storage::raft::driver::MultiRaftDriver>()
             .context("raft_set_outbound_blocked requires the raft persistence backend")?
             .set_outbound_blocked(blocked)
+    }
+
+    /// Apply-pause test hook (in-process raft tests only, not an operator
+    /// surface): while paused, this node's raft state machines append
+    /// entries to the log but do not apply them, which holds its applied
+    /// index behind its log the way a slow or freshly elected node's would.
+    /// Errors on non-raft backends.
+    pub fn raft_set_apply_paused(&self, paused: bool) -> R<()> {
+        self.persistence_driver
+            .as_any()
+            .downcast_ref::<crate::storage::raft::driver::MultiRaftDriver>()
+            .context("raft_set_apply_paused requires the raft persistence backend")?
+            .set_apply_paused(paused);
+        Ok(())
+    }
+
+    /// Mixed-version test hook (in-process raft tests only, not an
+    /// operator surface): advertise `version` to raft peers as this node's
+    /// schema version, standing in for an older build, or the real version
+    /// again with `None`. Errors on non-raft backends.
+    pub fn raft_set_advertised_schema_version(&self, version: Option<u32>) -> R<()> {
+        self.persistence_driver
+            .as_any()
+            .downcast_ref::<crate::storage::raft::driver::MultiRaftDriver>()
+            .context("raft_set_advertised_schema_version requires the raft persistence backend")?
+            .set_advertised_schema_version(version);
+        Ok(())
     }
 
     /// Deterministic fingerprint of this replica's replicated state: every
@@ -2310,6 +2399,11 @@ impl Store {
             return f(self);
         }
         if !self.raft_mode() {
+            // A streaming standby must not write: its database is not the
+            // one being shipped, and the primary's would overwrite it.
+            if let Some(reason) = self.persistence_driver.write_refusal() {
+                return Err(anyhow!("store op {op} refused: {reason}"));
+            }
             // `local_disk`: commit for real, then project the read model
             // from what was committed (read-model-coherence plan § 5.4).
             // A nested call composes into the outer body's session.
@@ -5057,6 +5151,13 @@ impl Store {
             return reject(tx, reason, None);
         }
 
+        // A stop or a newer config does not bump this config's epoch, so the
+        // check above cannot see either. Re-check here, inside the write
+        // transaction, that the plan is still for something the job wants.
+        if let Some(reason) = Self::job_config_unwanted_reason_on(tx, &submission.job_config_id)? {
+            return reject(tx, format!("{PLAN_NOT_WANTED_PREFIX}{reason}"), None);
+        }
+
         let (placements_json, plan_mode, evictions_json, target_instance): (
             String,
             String,
@@ -6839,15 +6940,6 @@ impl Store {
         Ok(nodes)
     }
 
-    pub fn job_config_ids_with_count_per(&self) -> R<Vec<String>> {
-        let conn = self.read_connection()?;
-        let mut stmt = conn.prepare(
-            "SELECT DISTINCT job_config_id FROM task_config WHERE count_per IS NOT NULL AND count_per != '';",
-        )?;
-        let rows = stmt.query_map([], |row| row.get(0))?;
-        Self::collect_rows(rows)
-    }
-
     /// Mark a node's liveness ready. Composite across the lane boundary of
     /// the node/node_health split (plan §7-C2, C-2): the STATUS lane upserts
     /// the `node_health` liveness row, then the CONTROL lane flips the
@@ -7150,8 +7242,12 @@ impl Store {
     /// capture as the eviction could not observe the eviction and placed
     /// nothing (latent raft-mode bug, exposed by
     /// tests/raft_ownership_guard.rs). Sequencing the ops lets each read
-    /// its predecessor's committed effects; a crash mid-sequence is healed
-    /// by the idempotent drain eval re-running the pass.
+    /// its predecessor's committed effects. A failed reconcile queues its
+    /// own `job_reschedule` retry
+    /// ([`Self::reconcile_job_configs_or_requeue`]), because a re-run of
+    /// this pass finds the evicted allocations already gone; a crash
+    /// between the ops is healed by the next leader's
+    /// [`Self::regenerate_scheduling_evals`].
     #[instrument(err, skip_all)]
     pub fn reschedule_allocations_for_drained_node(&self, node_id: &str) -> R<()> {
         let allocs = self.allocs_for_node(node_id)?;
@@ -7179,11 +7275,10 @@ impl Store {
 
         let evicted = removable.len();
         let affected_job_configs = self.remove_allocations(&removable, StopCause::Drain)?;
-        for job_config_id in affected_job_configs {
-            self.reconcile_job_config_allocations(&job_config_id)?;
-        }
+        let reconciled = self.reconcile_job_configs_or_requeue(affected_job_configs);
 
         self.events().node_drained(node_id, evicted, held);
+        reconciled?;
 
         Ok(())
     }
@@ -9020,6 +9115,83 @@ impl Store {
             .query_row([job_config_id], |row| row.get(0))
             .optional()?;
         Ok(job_id)
+    }
+
+    /// Why a plan for `job_config_id` should no longer place anything, or
+    /// `None` when the config is still wanted.
+    ///
+    /// Evals are queued work, and the world moves while they wait: a
+    /// delayed reschedule can fire after `job stop`, and a reschedule for
+    /// v1 can run after the v2 rollout has finished replacing it. Planning
+    /// such an eval as if nothing changed placed the full count for a
+    /// stopped job or a superseded version. A config is wanted when its job
+    /// exists and is not stopped, and the config is one of:
+    ///
+    /// - the job's latest config;
+    /// - a superseded config that still has allocations of its own (a
+    ///   staged rollout's floor, or a rollout stopped part way), so a lost
+    ///   node can still be replaced in kind;
+    /// - the source of a rollout to the latest config that has not
+    ///   completed: a live rollout's rollback re-places it, and a failed or
+    ///   cancelled one left it as the version the job runs.
+    ///
+    /// Checked by the planner before it plans and again inside the apply
+    /// transaction, which is what makes it a fence rather than a hint.
+    pub(crate) fn job_config_unwanted_reason_on(
+        conn: &Connection,
+        job_config_id: &str,
+    ) -> R<Option<String>> {
+        let row: Option<(String, String, Option<String>)> = conn
+            .prepare_cached(
+                "SELECT j.id, j.status, (
+                     SELECT latest.id FROM job_config latest
+                     WHERE latest.job_id = j.id
+                     ORDER BY latest.created_at DESC LIMIT 1
+                 )
+                 FROM job_config jc
+                 INNER JOIN job j ON j.id = jc.job_id
+                 WHERE jc.id = ?1;",
+            )?
+            .query_row([job_config_id], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .optional()?;
+        let Some((job_id, status, latest)) = row else {
+            return Ok(Some(format!(
+                "job config {job_config_id} or its job no longer exists"
+            )));
+        };
+        if status == "stopped" {
+            return Ok(Some(format!("job {job_id} is stopped")));
+        }
+        let Some(latest) = latest else {
+            return Ok(None);
+        };
+        if latest == job_config_id {
+            return Ok(None);
+        }
+        let still_wanted: bool = conn
+            .prepare_cached(
+                "SELECT EXISTS (SELECT 1 FROM allocation WHERE job_config_id = ?1)
+                     OR EXISTS (
+                         SELECT 1 FROM rollout
+                         WHERE from_job_config_id = ?1 AND to_job_config_id = ?2
+                           AND status NOT IN ('completed', 'completed_incomplete')
+                     );",
+            )?
+            .query_row(params![job_config_id, latest], |row| row.get(0))?;
+        if still_wanted {
+            return Ok(None);
+        }
+        Ok(Some(format!(
+            "job config {job_config_id} was superseded by {latest}"
+        )))
+    }
+
+    /// [`Self::job_config_unwanted_reason_on`] against committed state.
+    pub fn job_config_unwanted_reason(&self, job_config_id: &str) -> R<Option<String>> {
+        let conn = self.read_connection()?;
+        Self::job_config_unwanted_reason_on(&conn, job_config_id)
     }
 
     pub fn list_job_spec_history(&self, name: &str) -> R<Vec<JobSpecHistoryRow>> {
@@ -14017,6 +14189,218 @@ impl Store {
         unreachable!("the last attempt always returns")
     }
 
+    /// Reconcile several job configs, isolating failures.
+    ///
+    /// The node-loss, drain, and new-node passes call this AFTER they have
+    /// already removed the allocations being replaced, so a reconcile that
+    /// fails with nothing queued behind it leaves the job under-count with
+    /// no retry: the node holds no allocations any more, so the lost-node
+    /// monitor and the drain eval have nothing left to re-drive. Each config
+    /// is therefore reconciled independently (one failure must not abort
+    /// the rest), and a failed one gets a delayed `job_reschedule`, which
+    /// carries the plan-conflict retries and requeue backstop this inline
+    /// pass lacks. The first error is returned only when that retry could
+    /// not be queued either (for example, this node lost the scheduler
+    /// lane, in which case the new leader's regeneration pass re-derives
+    /// the work).
+    pub(crate) fn reconcile_job_configs_or_requeue(
+        &self,
+        job_config_ids: impl IntoIterator<Item = String>,
+    ) -> R<()> {
+        let mut unqueued_error = None;
+        for job_config_id in job_config_ids {
+            let Err(error) = self.reconcile_job_config_allocations(&job_config_id) else {
+                continue;
+            };
+            // A destroyed config has nothing left to converge.
+            let Some(job_id) = self.job_id_for_job_config(&job_config_id)? else {
+                continue;
+            };
+            if self
+                .queue_reschedule_retry(&job_id, &job_config_id, &error)
+                .is_err()
+            {
+                unqueued_error.get_or_insert(error);
+            }
+        }
+        match unqueued_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    /// Queue a delayed `job_reschedule` for a config whose placement just
+    /// failed AFTER its old allocations were removed: a lost node's or
+    /// drained node's reconcile, a `job_update` restart, a rollout's
+    /// rollback. Each of those already deleted what was running, so a
+    /// terminal failure with nothing queued behind it leaves the job short
+    /// with no retry. If the retry fails too, the capacity pass
+    /// ([`Self::reschedule_allocations_for_new_node`]) picks the job up
+    /// when capacity appears.
+    pub(crate) fn queue_reschedule_retry(
+        &self,
+        job_id: &str,
+        job_config_id: &str,
+        cause: &anyhow::Error,
+    ) -> R<()> {
+        warn!(
+            %job_id,
+            %job_config_id,
+            retry_after_ms = RECONCILE_RETRY_DELAY.as_millis() as u64,
+            error = %format!("{cause:#}"),
+            "Placement failed after removing allocations; queueing a job_reschedule retry"
+        );
+        self.enqueue_eval_after_delay(
+            "job_reschedule",
+            Some(job_id),
+            Some(job_config_id),
+            None,
+            None,
+            RECONCILE_RETRY_DELAY,
+        )
+        .inspect_err(|error| {
+            warn!(%job_id, %job_config_id, %error, "Could not queue the job_reschedule retry");
+        })?;
+        Ok(())
+    }
+
+    /// The config an active job with no live rollout should converge to,
+    /// or `None` to leave it alone.
+    ///
+    /// Normally that is the latest config. A rollout to the latest config
+    /// that failed or was cancelled settles the job elsewhere (SC1):
+    ///
+    /// - the latest config has no allocations (rolled back, or failed
+    ///   before placing anything): the rollout's source config, which is
+    ///   what runs. No source (a first deploy) leaves nothing to converge;
+    /// - only the latest config has allocations (failed after replacing
+    ///   everything): the latest config;
+    /// - both have allocations (stopped part way without a revert): `None`.
+    ///   The mix is the operator's call, and no single-config reschedule
+    ///   can converge it without picking a side.
+    pub(crate) fn settled_convergence_config(
+        &self,
+        job_id: &str,
+        latest_config: &str,
+    ) -> R<Option<String>> {
+        let aborted = self
+            .latest_rollout_for_job_config(latest_config)?
+            .filter(|rollout| matches!(rollout.status.as_str(), "failed" | "cancelled"));
+        let Some(rollout) = aborted else {
+            return Ok(Some(latest_config.to_owned()));
+        };
+        let conn = self.read_connection()?;
+        let (latest_running, others_running): (bool, bool) = conn.query_row(
+            "SELECT
+                 EXISTS (SELECT 1 FROM allocation WHERE job_config_id = ?2),
+                 EXISTS (
+                     SELECT 1 FROM allocation a
+                     INNER JOIN job_config jc ON jc.id = a.job_config_id
+                     WHERE jc.job_id = ?1 AND a.job_config_id != ?2
+                 );",
+            params![job_id, latest_config],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        Ok(match (latest_running, others_running) {
+            (false, _) => rollout.from_job_config_id,
+            (true, false) => Some(latest_config.to_owned()),
+            (true, true) => None,
+        })
+    }
+
+    /// Job configs that new capacity could help: for every active job with
+    /// no live rollout and nothing queued, its convergence config
+    /// ([`Self::settled_convergence_config`]) when that config has a
+    /// `count.per` task (one more node may want one more replica) or a
+    /// service task with fewer allocations than its effective count.
+    ///
+    /// The count check is deliberately loose: keyed and staged-slot tasks
+    /// can read short when they are not, and that only costs a no-op
+    /// reschedule plan. Batch tasks are skipped: one that ran to
+    /// completion must not run again, and its allocation count cannot tell
+    /// finished from never placed. Jobs with a queued
+    /// eval are skipped too, which is what keeps a burst of registrations
+    /// from piling up reschedules: whatever is queued runs against the new
+    /// capacity anyway.
+    pub(crate) fn job_configs_waiting_on_capacity(&self) -> R<Vec<String>> {
+        const WANTS_CAPACITY: &str = "EXISTS (
+            SELECT 1 FROM task_config tc
+            LEFT JOIN task_scale ts
+              ON ts.job_id = tc.job_id AND ts.task_group = tc.group_name
+             AND ts.task_name = tc.name AND ts.base_count = tc.count
+            WHERE tc.job_config_id = ?1
+              AND (
+                (tc.count_per IS NOT NULL AND tc.count_per != '')
+                OR (
+                  tc.lifecycle != 'batch'
+                  AND (SELECT COUNT(*) FROM allocation a WHERE a.task_config_id = tc.id)
+                      < COALESCE(ts.count, tc.count)
+                )
+              )
+        )";
+        let candidates: Vec<(String, String)> = {
+            let conn = self.read_connection()?;
+            let mut stmt = conn.prepare(&format!(
+                "SELECT j.id, latest.id
+                 FROM job j
+                 INNER JOIN job_config latest ON latest.id = {LATEST_CONFIG_FOR_JOB}
+                 WHERE j.status NOT IN ('stopped', 'failed')
+                   AND NOT EXISTS (
+                     SELECT 1 FROM eval e
+                     WHERE e.status IN ('pending', 'in_flight') AND e.job_id = j.id
+                   )
+                   AND NOT EXISTS (
+                     SELECT 1 FROM rollout r
+                     WHERE r.job_id = j.id
+                       AND r.status NOT IN ('completed', 'failed', 'cancelled', 'completed_incomplete')
+                   );"
+            ))?;
+            let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            Self::collect_rows(rows)?
+        };
+        let mut waiting = Vec::new();
+        for (job_id, latest_config) in candidates {
+            let Some(target) = self.settled_convergence_config(&job_id, &latest_config)? else {
+                continue;
+            };
+            let conn = self.read_connection()?;
+            let wants: bool =
+                conn.query_row(&format!("SELECT {WANTS_CAPACITY};"), [&target], |row| {
+                    row.get(0)
+                })?;
+            if wants {
+                waiting.push(target);
+            }
+        }
+        Ok(waiting)
+    }
+
+    /// Queue the capacity pass ([`Self::reschedule_allocations_for_new_node`])
+    /// after a node registers or is uncordoned, as a `node_join` eval with no
+    /// node: the pass is cluster-wide, so one queued pass covers any number
+    /// of joins. Skipped while one is already pending (a burst of
+    /// registrations queues one pass, not one per node), and the claim
+    /// sweep collapses any duplicate that races past this check.
+    pub fn request_capacity_reconcile(&self) -> R<()> {
+        let pending: bool = {
+            let conn = self.read_connection()?;
+            conn.query_row(
+                "SELECT EXISTS (
+                     SELECT 1 FROM eval
+                     WHERE type = 'node_join' AND status = 'pending'
+                       AND COALESCE(node_id, '') = '' AND COALESCE(job_id, '') = ''
+                 );",
+                [],
+                |row| row.get(0),
+            )?
+        };
+        if pending {
+            return Ok(());
+        }
+        self.enqueue_eval("node_join", None, None, None, None)?;
+        Ok(())
+    }
+
     /// Free a lost node's allocations for replacement — gated for stateful
     /// tasks (the at-most-one fencing guarantee, see
     /// docs/stateful-workloads.md "Node loss and fencing"):
@@ -14040,9 +14424,11 @@ impl Store {
     /// Since C-2 this is a wrapper-level composition of single-purpose
     /// scheduler-lane ops (see
     /// [`Self::reschedule_allocations_for_drained_node`] for why the
-    /// removal and the reconcile must not share one capture). A crash
-    /// between them is healed by the node monitor re-enqueueing the
-    /// `node_lost_reschedule` eval every tick.
+    /// removal and the reconcile must not share one capture). Once the
+    /// removal commits the node holds nothing, so the monitor stops
+    /// re-enqueueing this pass: a config whose reconcile fails gets its own
+    /// delayed `job_reschedule` instead
+    /// ([`Self::reconcile_job_configs_or_requeue`]).
     #[instrument(err, skip_all)]
     pub fn reschedule_allocations_for_lost_node(&self, node_id: &str) -> R<()> {
         let allocs = self.allocs_for_node(node_id)?;
@@ -14070,11 +14456,7 @@ impl Store {
         }
 
         let affected_job_configs = self.remove_allocations(&removable, StopCause::NodeLost)?;
-        for job_config_id in affected_job_configs {
-            self.reconcile_job_config_allocations(&job_config_id)?;
-        }
-
-        Ok(())
+        self.reconcile_job_configs_or_requeue(affected_job_configs)
     }
 
     /// How long the node has been lost, when known. `None` means the node is
@@ -14194,22 +14576,28 @@ impl Store {
             .collect())
     }
 
+    /// Re-evaluate the jobs that new capacity can help: the `node_join`
+    /// eval's pass, run when a worker registers or a node is uncordoned.
+    ///
+    /// A plan that finds no capacity fails its eval terminally, so without
+    /// this pass a job left short of its count stayed short as nodes
+    /// joined, and a `count.per` task never reached a new node. The set is
+    /// [`Self::job_configs_waiting_on_capacity`] plus the targets of
+    /// rollouts that completed incomplete.
+    ///
     /// Since C-2 each per-config reconcile is its own scheduler-lane op
     /// (see [`Self::reschedule_allocations_for_drained_node`] for the
     /// capture-visibility rationale); every pass is an idempotent
     /// convergence step, so no cross-op atomicity is needed.
     #[instrument(err, skip_all)]
     pub fn reschedule_allocations_for_new_node(&self) -> R<()> {
-        let mut job_config_ids = self.job_config_ids_with_count_per()?;
+        let mut job_config_ids = self.job_configs_waiting_on_capacity()?;
         for job_config_id in self.job_config_ids_with_incomplete_rollouts()? {
             if !job_config_ids.contains(&job_config_id) {
                 job_config_ids.push(job_config_id);
             }
         }
-        for job_config_id in job_config_ids {
-            self.reconcile_job_config_allocations(&job_config_id)?;
-        }
-        Ok(())
+        self.reconcile_job_configs_or_requeue(job_config_ids)
     }
 
     #[instrument(err, skip_all)]
@@ -15505,8 +15893,20 @@ impl Store {
         };
 
         let eval_id = eval.id.clone();
-        // Collapse only work this claim genuinely subsumes: same entity, same
-        // kind, and already claimable.
+        // Collapse only work this claim genuinely subsumes: same kind, same
+        // scope, and already claimable.
+        //
+        // "Same scope" means the whole (job, job config, node) triple, with
+        // NULL and '' treated alike. Matching on job OR node used to sweep
+        // unrelated work: reschedule evals for jobs A, B and C that shared a
+        // node collapsed into A's, leaving B and C under-count, and a stale
+        // v2 `rollout_tick` swept the v3 tick that was driving the new
+        // rollout. Node-scoped kinds (`node_drain`, `node_lost_reschedule`)
+        // carry no job, so they still collapse per node; job-scoped kinds
+        // collapse per job config (and per excluded node for reschedules,
+        // whose node is the one the replacement must avoid); the
+        // cluster-wide capacity pass (a `node_join` with neither) collapses
+        // with its own kind.
         //
         // Matching on kind matters because different kinds are not
         // interchangeable — dropping a job's `rollout_tick` because a
@@ -15523,17 +15923,17 @@ impl Store {
               AND id != :id
               AND type = :type
               AND ready_at <= :now
-              AND (
-                (:job_id IS NOT NULL AND :job_id != '' AND job_id = :job_id)
-                OR (:node_id IS NOT NULL AND :node_id != '' AND node_id = :node_id)
-              );",
+              AND COALESCE(job_id, '') = :job_id
+              AND COALESCE(job_config_id, '') = :job_config_id
+              AND COALESCE(node_id, '') = :node_id;",
         )?
         .execute(named_params! {
             ":id": eval_id,
             ":type": eval.kind,
             ":now": Self::sortable_now()?,
-            ":job_id": if eval.job_id.trim().is_empty() { None::<String> } else { Some(eval.job_id.clone()) },
-            ":node_id": if eval.node_name.trim().is_empty() { None::<String> } else { Some(eval.node_name.clone()) },
+            ":job_id": eval.job_id.trim(),
+            ":job_config_id": eval.job_config_id.trim(),
+            ":node_id": eval.node_name.trim(),
         })?;
 
         // Cheapest accurate point for the queue-depth gauge: the claim (and
@@ -15692,6 +16092,12 @@ impl Store {
     ///   reschedule below — a plain `job_reschedule` would place the
     ///   rollout's to_config at full desired count, bypassing canary/staged
     ///   gating;
+    /// - for an active job whose latest config's rollout FAILED or was
+    ///   CANCELLED (no restart marker): a `job_reschedule` for what that
+    ///   rollout left running — the source config when the latest has no
+    ///   allocations (rolled back), the latest when nothing else runs, and
+    ///   nothing for a part-way mix of both. Treating a rolled-back job like
+    ///   a lost submit re-placed the bad version at full count, ungated;
     /// - for every other active job: `job_update` when a replicated restart
     ///   marker is set ([`Self::request_job_restart`]); `job_submit` when a
     ///   superseded config still has live allocations and the latest has
@@ -15787,6 +16193,24 @@ impl Store {
             let Some(latest_config) = latest_config else {
                 continue;
             };
+            // A rollout to the latest config that failed or was cancelled
+            // settled the job somewhere other than "latest at full count",
+            // and the passes below would undo that: "latest has no
+            // allocations" reads as a lost submit, so a rolled-back job got
+            // a `job_submit` that brought the bad version back at full
+            // count with no gating, and a rollout stopped part way had its
+            // old allocations removed and the new version topped up.
+            // Converge whatever the rollout left running instead (SC1).
+            if !restart_requested {
+                match self.settled_convergence_config(&job_id, &latest_config)? {
+                    None => continue,
+                    Some(target) if target != latest_config => {
+                        job_requests.push(EvalRequest::for_job("job_reschedule", &job_id, &target));
+                        continue;
+                    }
+                    Some(_) => {}
+                }
+            }
             let kind = if restart_requested {
                 // A KV-triggered restart was acknowledged but its
                 // leader-local job_update eval died: regenerate it (the
@@ -16992,6 +17416,7 @@ impl Store {
             } else {
                 self.read_connection()?
             };
+            let redaction = RedactSecretColumns::install(&conn);
             let mut stmt = conn.prepare(trimmed)?;
             let columns: Vec<String> = stmt
                 .column_names()
@@ -17024,6 +17449,9 @@ impl Store {
                     json: Value::Object(map).to_string(),
                 });
             }
+            drop(rows);
+            drop(stmt);
+            drop(redaction);
 
             return Ok(StateStoreQueryResult {
                 statement_type,
@@ -17064,7 +17492,11 @@ impl Store {
 
     fn query_state_store_apply(&self, sql: &str, statement_type: &str) -> R<StateStoreQueryResult> {
         let conn = self.write_connection()?;
+        // Redacted here too, so `INSERT ... SELECT key_pem ...` cannot copy a
+        // secret into a table the caller can read.
+        let redaction = RedactSecretColumns::install(&conn);
         let affected_rows = conn.execute(sql, [])? as u64;
+        drop(redaction);
 
         Ok(StateStoreQueryResult {
             statement_type: statement_type.to_owned(),
@@ -17211,6 +17643,30 @@ impl Store {
         self.replicated(Lane::Control, "idempotency_record", move |s| {
             s.idempotency_record_apply(&key, &operation, &message)
         })
+    }
+
+    /// Delete idempotency records created before `cutoff`. Without this the
+    /// table grew forever: every keyed mutation left a row behind. A retry
+    /// that arrives after its record is pruned runs again, so the cutoff must
+    /// sit well past any realistic retry window (`IDEMPOTENCY_KEY_TTL`).
+    #[instrument(err, skip_all)]
+    pub fn prune_idempotency_records(&self, cutoff: OffsetDateTime) -> R<usize> {
+        // Formatted once here, not in the apply step, so every replica
+        // deletes exactly the same rows.
+        let cutoff = cutoff.format(&Rfc3339)?;
+        self.replicated(Lane::Control, "prune_idempotency_records", move |s| {
+            s.prune_idempotency_records_apply(&cutoff)
+        })
+    }
+
+    fn prune_idempotency_records_apply(&self, cutoff: &str) -> R<usize> {
+        let conn = self.write_connection()?;
+        // `created_at` is RFC 3339 UTC, so text order is time order at
+        // second granularity, which is all a day-long TTL needs.
+        Ok(conn.execute(
+            "DELETE FROM idempotency_record WHERE created_at < ?;",
+            [cutoff],
+        )?)
     }
 
     fn idempotency_record_apply(&self, key: &str, operation: &str, message: &str) -> R<bool> {
@@ -17511,6 +17967,17 @@ impl Store {
             "SELECT job_id, job_config_id, kv_key, json_pointer FROM job_kv_reference WHERE kv_key = ?;",
         )?;
         let rows = stmt.query_map([key], |row| self.job_kv_reference_from_row(row))?;
+        Self::collect_rows(rows)
+    }
+
+    /// Every job with at least one KV dependency edge, for the leader's
+    /// missed-KV-change sweep.
+    #[instrument(err, skip_all)]
+    pub fn job_ids_with_kv_references(&self) -> R<Vec<String>> {
+        let conn = self.read_connection()?;
+        let mut stmt =
+            conn.prepare("SELECT DISTINCT job_id FROM job_kv_reference ORDER BY job_id;")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
         Self::collect_rows(rows)
     }
 
@@ -18881,6 +19348,26 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn prune_idempotency_records_drops_only_expired_rows() -> R<()> {
+        let store = setup_store()?;
+        assert!(store.idempotency_record("old", "run_job", "old reply")?);
+        store.query_state_store(
+            "UPDATE idempotency_record SET created_at = '2020-01-01T00:00:00Z' WHERE key = 'old'",
+            true,
+        )?;
+        assert!(store.idempotency_record("fresh", "run_job", "fresh reply")?);
+
+        let cutoff = OffsetDateTime::now_utc() - time::Duration::hours(24);
+        assert_eq!(store.prune_idempotency_records(cutoff)?, 1);
+        assert_eq!(store.idempotency_lookup("old")?, None);
+        assert_eq!(
+            store.idempotency_lookup("fresh")?.as_deref(),
+            Some("fresh reply")
+        );
+        Ok(())
+    }
+
     fn make_node(id: &str) -> Node {
         Node {
             id: id.to_string(),
@@ -20196,6 +20683,117 @@ mod tests {
         Ok(())
     }
 
+    /// SC3: one config whose replacement cannot be placed must neither
+    /// abort the reconcile of the others nor be left with nothing retrying
+    /// it (the lost node holds no allocations any more, so the monitor
+    /// stops re-driving the pass).
+    #[test]
+    fn lost_node_reschedule_isolates_a_failing_config_and_queues_its_retry() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-one", "active"))?;
+
+        let pinned_task = {
+            let mut task = task("pinned");
+            task.constraints = json!({ "node_id": "node-one" });
+            task
+        };
+        submit_job(&store, "pinned-job", vec![pinned_task])?;
+        submit_job(&store, "free-job", vec![task("free")])?;
+        store.place_alloc("node-one", task_id_for(&store, "pinned", "pinned-job")?)?;
+        store.place_alloc("node-one", task_id_for(&store, "free", "free-job")?)?;
+        store.insert_node(make_node_msg("node-two", "active"))?;
+
+        store.mark_node_lost("node-one")?;
+        store.reschedule_allocations_for_lost_node("node-one")?;
+
+        let replaced = store.allocs_for_node("node-two")?;
+        assert_eq!(replaced.len(), 1, "the placeable job is still replaced");
+        assert_eq!(replaced[0].job_id, "free-job");
+
+        let pinned_config = store.get_job_config("pinned-job")?.id();
+        let retry = store
+            .get_evals()?
+            .into_iter()
+            .find(|eval| eval.kind == "job_reschedule" && eval.job_id == "pinned-job")
+            .context("the failing config must get a retry eval")?;
+        assert_eq!(retry.status, "pending");
+        assert_eq!(retry.job_config_id, pinned_config);
+        assert!(
+            store.claim_eval()?.is_none(),
+            "the retry is delayed, not immediately claimable"
+        );
+        Ok(())
+    }
+
+    /// SC4: a job that could not place for lack of nodes converges once a
+    /// node registers, through one cluster-wide capacity pass however many
+    /// times it is requested.
+    #[test]
+    fn capacity_pass_places_jobs_left_short_when_a_node_joins() -> R<()> {
+        let store = setup_store()?;
+        let job_config_id = submit_job(&store, "waiting", vec![task("web")])?;
+        store.enqueue_eval(
+            "job_submit",
+            Some("waiting"),
+            Some(&job_config_id),
+            None,
+            None,
+        )?;
+        let submit = store.claim_eval()?.context("submit eval")?;
+        assert!(submit.handle(&store).is_err(), "no nodes yet");
+        store.complete_eval(&submit.id, false)?;
+        assert_eq!(
+            store.job_configs_waiting_on_capacity()?,
+            vec![job_config_id.clone()]
+        );
+
+        store.insert_node(make_node_msg("node-one", "active"))?;
+        store.request_capacity_reconcile()?;
+        store.request_capacity_reconcile()?;
+        let queued: Vec<_> = store
+            .get_evals()?
+            .into_iter()
+            .filter(|eval| eval.status == "pending")
+            .collect();
+        assert_eq!(queued.len(), 1, "a burst of joins queues one pass");
+        assert_eq!(queued[0].kind, "node_join");
+        assert!(queued[0].node_name.is_empty());
+
+        run_pending_evals(&store)?;
+        assert_eq!(store.allocs_for_job_config(&job_config_id)?.len(), 1);
+        assert!(store.job_configs_waiting_on_capacity()?.is_empty());
+        Ok(())
+    }
+
+    /// SC4 x SC1: the capacity pass converges what a failed rollout left
+    /// running, never the rolled-back latest config.
+    #[test]
+    fn capacity_pass_targets_the_rolled_back_source_config() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-one", "active"))?;
+        let mut two = task("web");
+        two.count = TaskCount::new(2);
+        let v1 = submit_job(&store, "rolled", vec![two.clone()])?;
+        store.place_alloc("node-one", task_id_for(&store, "web", "rolled")?)?;
+        two.config = json!({ "version": 2 });
+        let v2 = submit_job(&store, "rolled", vec![two])?;
+        let rollout = store.create_rollout(
+            "rolled",
+            Some(&v1),
+            &v2,
+            "running",
+            None,
+            None,
+            None,
+            None,
+            "{}",
+        )?;
+        store.update_rollout_status(rollout.id, "failed", false, None)?;
+
+        assert_eq!(store.job_configs_waiting_on_capacity()?, vec![v1]);
+        Ok(())
+    }
+
     /// A lost node's stateless allocation must be replaced even when the
     /// reconcile loses plan races: first in place (a couple of conflicts),
     /// then via a durable `job_reschedule` hand-off (every in-place attempt
@@ -20964,6 +21562,69 @@ mod tests {
             vec!["job_update".to_string()],
             "only the duplicate reschedule should have been collapsed"
         );
+
+        Ok(())
+    }
+
+    /// SC2: the claim sweep collapses only exact duplicates. Reschedules
+    /// for different jobs that share a node, and a rollout tick for a newer
+    /// config of the same job, are separate work and must survive.
+    #[test]
+    fn claim_eval_dedupe_spares_other_jobs_on_the_node_and_other_configs() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-1", "ready"))?;
+
+        for job in ["job-a", "job-b", "job-c"] {
+            store.enqueue_eval(
+                "job_reschedule",
+                Some(job),
+                Some(&format!("{job}:1")),
+                Some("node-1"),
+                Some(50),
+            )?;
+        }
+        // A stale v2 tick and the live v3 tick for one job.
+        store.enqueue_eval(
+            "rollout_tick",
+            Some("job-r"),
+            Some("job-r:2"),
+            None,
+            Some(40),
+        )?;
+        store.enqueue_eval(
+            "rollout_tick",
+            Some("job-r"),
+            Some("job-r:3"),
+            None,
+            Some(40),
+        )?;
+        // Node-scoped work still collapses per node.
+        store.enqueue_eval("node_lost_reschedule", None, None, Some("node-2"), Some(30))?;
+        store.enqueue_eval("node_lost_reschedule", None, None, Some("node-2"), Some(30))?;
+
+        let mut claimed = Vec::new();
+        while let Some(eval) = store.claim_eval()? {
+            store.complete_eval(&eval.id, true)?;
+            claimed.push((eval.kind, eval.job_id, eval.job_config_id, eval.node_name));
+        }
+
+        let reschedules: Vec<&str> = claimed
+            .iter()
+            .filter(|(kind, ..)| kind == "job_reschedule")
+            .map(|(_, job, ..)| job.as_str())
+            .collect();
+        assert_eq!(reschedules, vec!["job-a", "job-b", "job-c"]);
+        let ticks: Vec<&str> = claimed
+            .iter()
+            .filter(|(kind, ..)| kind == "rollout_tick")
+            .map(|(_, _, config, _)| config.as_str())
+            .collect();
+        assert_eq!(ticks, vec!["job-r:2", "job-r:3"]);
+        let lost: usize = claimed
+            .iter()
+            .filter(|(kind, ..)| kind == "node_lost_reschedule")
+            .count();
+        assert_eq!(lost, 1, "duplicate node-scoped evals still collapse");
 
         Ok(())
     }
@@ -22496,6 +23157,66 @@ mod tests {
             }
         }
 
+        Ok(())
+    }
+
+    /// SC5: a queued plan for a stopped job places nothing, at plan time
+    /// and at apply time.
+    #[test]
+    fn plans_for_a_stopped_job_place_nothing() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "ready"))?;
+        let job_config_id = submit_job(&store, "stop-me", vec![task("web")])?;
+        let task_id = task_id_for(&store, "web", "stop-me")?;
+        let expected_versions = store
+            .allocation_version_vector(&job_config_id, &HashSet::from(["node-a".to_string()]))?;
+        // Planned before the stop, applied after it.
+        let submission = store.insert_plan_submission(
+            &job_config_id,
+            "reschedule",
+            &[("node-a".to_string(), task_id)],
+            &expected_versions,
+        )?;
+
+        store.stop_job("stop-me")?;
+
+        let outcome =
+            Scheduler::new(&store)?.plan_and_apply(&job_config_id, PlanMode::Reschedule)?;
+        assert!(outcome.allocations.is_empty());
+        match store.apply_plan_submission(&submission)? {
+            PlanApplyOutcome::Rejected { reason, .. } => {
+                assert!(reason.starts_with(PLAN_NOT_WANTED_PREFIX), "{reason}");
+            }
+            PlanApplyOutcome::Applied(_) => bail!("a stopped job's plan must not apply"),
+        }
+        assert!(store.allocs_for_job_config(&job_config_id)?.is_empty());
+        Ok(())
+    }
+
+    /// SC5: once v2 has replaced v1, a late reschedule for v1 places
+    /// nothing. A superseded config that still runs somewhere (a staged
+    /// floor) may still top itself up.
+    #[test]
+    fn plans_for_a_superseded_config_place_only_while_it_still_runs() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "ready"))?;
+        let v1 = submit_job(&store, "versions", vec![task("web")])?;
+        let v1_task = task_id_for(&store, "web", "versions")?;
+        let v2 = submit_job(&store, "versions", vec![task("web"), task("sidecar")])?;
+        assert_ne!(v1, v2);
+        let scheduler = Scheduler::new(&store)?;
+
+        let outcome = scheduler.plan_and_apply(&v1, PlanMode::Reschedule)?;
+        assert!(outcome.allocations.is_empty(), "v1 was fully replaced");
+        assert_eq!(
+            store.job_config_unwanted_reason(&v1)?,
+            Some(format!("job config {v1} was superseded by {v2}"))
+        );
+
+        // A v1 allocation still running keeps v1 wanted.
+        store.place_alloc("node-a", v1_task)?;
+        assert_eq!(store.job_config_unwanted_reason(&v1)?, None);
+        assert_eq!(store.job_config_unwanted_reason(&v2)?, None);
         Ok(())
     }
 

@@ -184,8 +184,32 @@ When a job group contains multiple tasks:
 
 Two paths exist:
 
-- Worker registration at runtime inserts the node directly (`worker_register`) and enqueues no eval.
-- The `node_join` eval path (used in eval-driven flows and tests) marks or inserts the node and reconciles count-per and incomplete rollout allocations.
+A plan that finds no capacity fails its eval, and nothing retries it on a
+timer. New capacity is what retries it:
+
+- Worker registration (`worker_register`) inserts the node, then queues a
+  capacity pass: one `node_join` eval with no node. Uncordoning a node
+  (`legion node uncordon`) queues the same pass.
+- The pass re-evaluates, with a `Reschedule` plan, every active job that has
+  no live rollout and nothing already queued, when its config has a
+  `count.per` task or a service or sidecar task with fewer allocations than
+  its effective count. It also tops up rollouts that completed incomplete.
+  After a failed or cancelled rollout it converges what the rollout left
+  running, never the rolled-back version (see
+  [rollouts.md](rollouts.md#after-a-rollout-fails-rolls-back-or-is-stopped)).
+- One pass covers any number of joins. While a pass is pending, further
+  registrations queue nothing, so a burst of new workers costs one pass.
+- The `node_join` eval with a node (used in eval-driven flows and tests) marks
+  or inserts the node and then runs the same pass.
+
+Known limitations:
+
+- Batch tasks are not re-evaluated, because a batch task that already ran
+  to completion looks the same as one that never placed.
+- Capacity freed by stopping or scaling in another job, or by a lost node
+  heartbeating again, does not queue the pass. The next registration or
+  uncordon does, and so does a manager leadership change, whose
+  reconciliation reschedules every active job.
 
 ### Node Lost
 
@@ -193,8 +217,12 @@ Two paths exist:
 - Allocations on the lost node are removed and the affected job configs reconciled.
 - Reconciliation runs the scheduler in `Reschedule` mode, so replacements
   respect node capacity, constraints, group co-location, and the configured
-  policy like any other placement. A job with nowhere to go is logged and
-  retried on the next tick instead of force-placed.
+  policy like any other placement. Each affected job config is reconciled on
+  its own, so one job that cannot be placed does not block the others.
+- A job whose replacement fails is never force-placed. It gets a
+  `job_reschedule` eval delayed by 5 seconds, because the lost node no longer
+  holds its allocations and the node monitor will not re-drive it. Drain
+  evictions follow the same rule.
 - The `node_drop` eval path does the same reconciliation.
 
 ## Cordon and Drain

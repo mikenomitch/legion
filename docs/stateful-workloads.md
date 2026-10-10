@@ -266,6 +266,22 @@ together, one on each side of the partition.
    the time since the last successful heartbeat. The fenced allocation is
    recorded as failed, so the first heartbeat after reconnecting reports it
    as failed or stopped rather than running.
+
+   The window survives worker restarts. Tasks keep running when the worker
+   process exits, so the worker persists the wall-clock time of its last
+   successful heartbeat (`last_manager_contact`, beside
+   `worker_state.json`). A restarted worker that can't reach the manager
+   yet, whether it is waiting in its connect loop or crash-looping, fences
+   restored stateful tasks against that time instead of starting a fresh
+   window. Once the manager answers and the worker re-registers, the normal
+   watchdog takes over. Registration resets the node's loss on the manager
+   too, so both clocks restart together.
+
+   Because this record is a wall clock, a large clock step on the worker
+   host while the worker is down moves the restart-time fence. A step
+   forward fences early, which is safe. A step backward delays the fence by
+   the size of the step. The in-process watchdog uses a monotonic clock and
+   is unaffected.
 2. **Manager confirmation gate** (`onLost.replaceAfter`, default
    `2 x selfTerminateAfter`). A stateful allocation on a lost node is **not**
    freed for replacement until the node has been lost longer than this. The

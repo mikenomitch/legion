@@ -78,6 +78,7 @@ const CLASSIFIED_MUTATIONS: &[&str] = &[
     "mark_job_failed_for_kv",
     "patch_kv",
     "prune_expired_credentials",
+    "prune_idempotency_records",
     "put_kv",
     "query_state_store",
     "release_kv_lock",
@@ -288,6 +289,7 @@ fn lane_for(method: &str) -> Lane {
         | "mark_job_failed_for_kv"
         | "patch_kv"
         | "prune_expired_credentials"
+        | "prune_idempotency_records"
         | "put_kv"
         | "query_state_store"
         | "release_kv_lock"

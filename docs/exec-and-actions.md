@@ -218,7 +218,12 @@ UI   ──WebSocket /v1/exec/ws───────┘        (proxies frames)
 - The WebSocket listener runs on the manager port + 1, because tonic's gRPC
   server doesn't perform HTTP upgrades. Browsers can't set WebSocket request
   headers, so they authenticate with the bearer token carried in the first
-  frame.
+  frame. The handshake's `Origin` must be loopback or listed in
+  `server.allowedOrigins` ([UI Architecture](ui-architecture.md#allowed-browser-origins)),
+  so a web page cannot open a session.
 - Interactive sessions use a PTY on the worker (`portable-pty`: openpty on
   Unix, ConPTY on Windows). Sessions end when the connection closes. There is
   no detach/reattach.
+- Sessions re-check their credential every 30 seconds. A revoked or expired
+  token, or a policy that no longer grants the session, ends it with an auth
+  error and cancels the process on the worker.

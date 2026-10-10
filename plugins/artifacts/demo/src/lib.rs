@@ -54,6 +54,10 @@ impl ArtifactFetcher for DemoFetcher {
     }
 }
 
+// Lets the host refuse this dylib if it was built with a different rustc or
+// legion version (Rust has no stable ABI).
+legion::declare_plugin_abi!();
+
 #[no_mangle]
 pub extern "C" fn get() -> Box<dyn ArtifactFetcher> {
     Box::new(DemoFetcher)

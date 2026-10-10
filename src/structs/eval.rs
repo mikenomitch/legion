@@ -57,7 +57,12 @@ impl Eval {
         let node_id = self.node_name.trim();
 
         if node_id.is_empty() {
-            bail!("Eval node_join missing node name");
+            // The capacity pass a worker registration or an uncordon queues
+            // (`Store::request_capacity_reconcile`). The node is already
+            // registered and live; only the jobs waiting on capacity need
+            // another look.
+            store.reschedule_allocations_for_new_node()?;
+            return Ok("Re-evaluated jobs waiting on capacity".to_string());
         }
 
         let node_id = node_id.to_owned();
@@ -153,6 +158,12 @@ impl Eval {
 
     fn handle_job_submit(&self, store: &Store) -> R<String> {
         let prepare_started = Instant::now();
+        // A submit that waited behind a newer submit or a stop has nothing
+        // left to do; migrating or placing for it would resurrect a config
+        // the job moved past (the plan itself would place nothing either).
+        if let Some(reason) = store.job_config_unwanted_reason(&self.job_config_id)? {
+            return Ok(format!("Job {} submit skipped: {reason}", self.job_id));
+        }
         let previous_config_id = store.previous_job_config_id(&self.job_config_id)?;
         if let Some(prev_id) = previous_config_id.as_ref() {
             if store.job_configs_schedule_equivalent(prev_id, &self.job_config_id)? {
@@ -189,18 +200,41 @@ impl Eval {
             bail!("Eval job_update missing job id");
         }
 
+        let prepare_started = Instant::now();
+        // Checked first: the removal below takes EVERY allocation of the
+        // job, so an update for a config the job moved past (a stale batch
+        // follow-up) or for a stopped job would remove the live version and
+        // then place nothing. Skipping leaves the restart marker for the
+        // update that is still wanted.
+        if let Some(reason) = store.job_config_unwanted_reason(&self.job_config_id)? {
+            return Ok(format!("Job {} update skipped: {reason}", self.job_id));
+        }
+
         // Consume the replicated restart marker BEFORE executing the
         // restart (see `Store::request_job_restart`): once cleared, a later
         // failover will not regenerate this restart; if clearing is
         // rejected (foreign-lane leader under `lanes`), the eval fails
         // before any churn and is released for retry. Clearing an unset
         // marker is a no-op (this eval also runs for batch re-schedules).
-        let prepare_started = Instant::now();
         store.clear_job_restart_request(&self.job_id)?;
 
         store.remove_allocs_for_job(&self.job_id)?;
         observe_phase(&self.kind, "prepare", prepare_started.elapsed());
-        let outcome = self.schedule_job_allocations(store, PlanMode::Fresh)?;
+        let outcome = match self.schedule_job_allocations(store, PlanMode::Fresh) {
+            Ok(outcome) => outcome,
+            // The job's allocations are already gone. A transient failure
+            // re-runs this eval (`handle_claimed_eval` releases it); any
+            // other leaves the job at zero, so queue a reschedule before
+            // failing.
+            Err(error) => {
+                if !Self::is_conflict_error(&error)
+                    && !crate::storage::raft::driver::NotRaftLeader::in_chain(&error)
+                {
+                    let _ = store.queue_reschedule_retry(&self.job_id, &self.job_config_id, &error);
+                }
+                return Err(error);
+            }
+        };
         if !outcome.deltas.is_empty() {
             info!(?outcome.deltas, "Job update allocation deltas");
         }
@@ -1515,6 +1549,148 @@ mod tests {
 
         assert!(store.allocs_for_job("update-job")?.is_empty());
 
+        Ok(())
+    }
+
+    fn single_task_job(name: &str, version: u32) -> JobConfig {
+        JobConfig {
+            priority: Default::default(),
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: name.into(),
+            tasks: vec![TaskConfig {
+                config: json!({ "version": version }),
+                ..TaskConfig::new("web", "noop")
+            }],
+            version: None,
+        }
+    }
+
+    fn job_eval(kind: &str, job_id: &str, job_config_id: &str) -> Eval {
+        Eval {
+            id: format!("{kind}-{job_config_id}"),
+            status: "pending".into(),
+            kind: kind.into(),
+            job_id: job_id.into(),
+            job_config_id: job_config_id.into(),
+            node_name: String::new(),
+            priority: 50,
+        }
+    }
+
+    fn pending_reschedules(store: &Store, job_config_id: &str) -> R<usize> {
+        Ok(store
+            .get_evals()?
+            .iter()
+            .filter(|eval| {
+                eval.status == "pending"
+                    && eval.kind == "job_reschedule"
+                    && eval.job_config_id == job_config_id
+            })
+            .count())
+    }
+
+    /// SC6: a restart (`job_update`) removes every allocation before it
+    /// places. When the placement then fails, a retry must be queued, or the
+    /// job sits at zero with nothing re-deriving it.
+    #[test]
+    fn job_update_that_cannot_place_queues_a_retry() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node("node-1", "a").into())?;
+        let subs = [Submission {
+            path: "job.ncl".into(),
+            content: "{}".into(),
+            is_primary: true,
+        }];
+        store.handle_job_submit(&single_task_job("restart", 1), &subs)?;
+        let config_id = store.get_job_config("restart")?.id();
+        job_eval("job_submit", "restart", &config_id).handle(&store)?;
+        assert_eq!(store.allocs_for_job("restart")?.len(), 1);
+
+        // The only node is cordoned, so the restart cannot place.
+        store.set_node_availability("node-1", "drained")?;
+        assert!(job_eval("job_update", "restart", &config_id)
+            .handle(&store)
+            .is_err());
+        assert!(store.allocs_for_job("restart")?.is_empty());
+        assert_eq!(pending_reschedules(&store, &config_id)?, 1);
+        Ok(())
+    }
+
+    /// SC6 x SC5: an update for a config the job has moved past must not
+    /// remove the live version and then place nothing.
+    #[test]
+    fn stale_job_update_leaves_the_live_version_alone() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node("node-1", "a").into())?;
+        let subs = [Submission {
+            path: "job.ncl".into(),
+            content: "{}".into(),
+            is_primary: true,
+        }];
+        store.handle_job_submit(&single_task_job("stale", 1), &subs)?;
+        let v1 = store.get_job_config("stale")?.id();
+        job_eval("job_submit", "stale", &v1).handle(&store)?;
+        store.handle_job_submit(&single_task_job("stale", 2), &subs)?;
+        let v2 = store.get_job_config("stale")?.id();
+        job_eval("job_submit", "stale", &v2).handle(&store)?;
+        let live: Vec<i64> = store
+            .allocs_for_job("stale")?
+            .iter()
+            .map(|a| a.id)
+            .collect();
+        assert_eq!(live.len(), 1);
+
+        job_eval("job_update", "stale", &v1).handle(&store)?;
+        let after: Vec<i64> = store
+            .allocs_for_job("stale")?
+            .iter()
+            .map(|a| a.id)
+            .collect();
+        assert_eq!(
+            after, live,
+            "the v2 allocation must survive a stale v1 update"
+        );
+        Ok(())
+    }
+
+    /// SC6: a rollback removes the new version, then places the old one.
+    /// When that placement fails, the old version must get a retry.
+    #[test]
+    fn rollback_that_cannot_place_queues_a_retry_of_the_old_version() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node("node-1", "a").into())?;
+        let subs = [Submission {
+            path: "job.ncl".into(),
+            content: "{}".into(),
+            is_primary: true,
+        }];
+        store.handle_job_submit(&single_task_job("revert", 1), &subs)?;
+        let v1 = store.get_job_config("revert")?.id();
+        job_eval("job_submit", "revert", &v1).handle(&store)?;
+        store.handle_job_submit(&single_task_job("revert", 2), &subs)?;
+        let v2 = store.get_job_config("revert")?.id();
+        let rollout = store.create_rollout(
+            "revert",
+            Some(&v1),
+            &v2,
+            "running",
+            None,
+            None,
+            None,
+            None,
+            "{}",
+        )?;
+        // The rollout replaced v1 with v2, and then the node was cordoned.
+        let v1_alloc = store.allocs_for_job_config(&v1)?[0].id;
+        store.remove_allocation_by_id(v1_alloc)?;
+        let v2_task = store.get_task_configs_for_job_config(&v2)?[0].0;
+        store.place_alloc("node-1", v2_task)?;
+        store.set_node_availability("node-1", "drained")?;
+
+        assert!(crate::manager::rollout::stop_rollout(&store, rollout.id, true, 50).is_err());
+        assert!(store.allocs_for_job("revert")?.is_empty());
+        assert_eq!(pending_reschedules(&store, &v1)?, 1);
         Ok(())
     }
 }

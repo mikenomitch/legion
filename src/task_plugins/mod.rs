@@ -74,6 +74,8 @@ macro_rules! declare_task_plugin_abi {
         pub extern "C" fn legion_task_plugin_abi_version() -> u32 {
             $crate::task_plugins::TASK_PLUGIN_ABI_VERSION
         }
+
+        $crate::declare_plugin_abi!();
     };
 }
 
@@ -306,6 +308,23 @@ pub(crate) fn reap_task_process(
     instance: &mut TaskInstance,
     runtime: &str,
 ) {
+    // Kill the whole process group first, matching the notice signal in
+    // `signal_task_process`. A shell-wrapped task (`sh -c server`) is tracked
+    // by the shell's pid, so SIGKILLing only that pid would orphan the server
+    // that ignored its SIGTERM, still holding its ports and volume.
+    #[cfg(unix)]
+    if let Some(pid) = instance
+        .child
+        .as_ref()
+        .map(|child| child.id())
+        .or(instance.pid)
+    {
+        // Every runtime that reaps here spawned its task with
+        // `spawn_task_process`, which makes the task a group leader
+        // (`setsid`). ESRCH (no such group) is fine: the group is gone, or
+        // this pid never led one, and the per-pid kill below still runs.
+        let _ = unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+    }
     if let Some(mut child) = instance.child.take() {
         info!(allocation_id, task_name, runtime, "Stopping task process");
         let _ = child.kill();
@@ -316,9 +335,10 @@ pub(crate) fn reap_task_process(
             allocation_id,
             task_name, runtime, pid, "Stopping task process by pid"
         );
+        let pid = sysinfo::Pid::from_u32(pid);
         let mut system = sysinfo::System::new();
-        system.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
-        if let Some(process) = system.process(sysinfo::Pid::from_u32(pid)) {
+        system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
+        if let Some(process) = system.process(pid) {
             process.kill();
         }
     }
@@ -784,11 +804,17 @@ impl LoadedTaskPlugin {
     fn new(plugin: Box<dyn TaskPlugin>, lib: Option<Library>) -> Self {
         Self { plugin, _lib: lib }
     }
+
+    pub fn task_plugin(&self) -> &dyn TaskPlugin {
+        self.plugin.as_ref()
+    }
 }
 
 #[derive(Default)]
 pub struct TaskPluginRegistry {
-    plugins: HashMap<String, LoadedTaskPlugin>,
+    // `Arc` so a caller can hold a plugin (and, through it, the dylib that
+    // backs it) while it works without the registry's owner locked.
+    plugins: HashMap<String, Arc<LoadedTaskPlugin>>,
 }
 
 impl TaskPluginRegistry {
@@ -805,12 +831,18 @@ impl TaskPluginRegistry {
         if run_setup {
             plugin.plugin.setup()?;
         }
-        self.plugins.insert(runtime.to_string(), plugin);
+        self.plugins.insert(runtime.to_string(), Arc::new(plugin));
         Ok(())
     }
 
     pub fn plugin(&self, runtime: &str) -> Option<&dyn TaskPlugin> {
         self.plugins.get(runtime).map(|entry| entry.plugin.as_ref())
+    }
+
+    /// A shared handle to a loaded plugin, for slow runtime calls (`prepare`,
+    /// `start`) made after the registry's owner has been unlocked.
+    pub fn plugin_handle(&self, runtime: &str) -> Option<Arc<LoadedTaskPlugin>> {
+        self.plugins.get(runtime).cloned()
     }
 
     pub fn readiness_checks(&self) -> Map<String, Value> {
@@ -1312,9 +1344,8 @@ fn load_task_plugin(name: &str) -> R<LoadedTaskPlugin> {
             let paths = plugin_paths("tasks", other, &plugin_root);
             validate_manifest("tasks", other, &paths.root)
                 .with_context(|| format!("invalid task plugin manifest for {}", other))?;
-            let path = paths.dylib.to_string_lossy().into_owned();
             unsafe {
-                let lib = Library::new(&path)?;
+                let lib = crate::plugin_runtime::open_plugin_library("tasks", other, &paths.dylib)?;
                 check_task_plugin_abi(&lib, other)?;
                 let plugin = {
                     let func: Symbol<unsafe extern "C" fn() -> Box<dyn TaskPlugin>> =

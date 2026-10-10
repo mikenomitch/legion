@@ -12,7 +12,8 @@
 //!
 //! Rendering runs on the manager, so it is sandboxed: imports are rejected
 //! before evaluation starts, source and variable payloads are size-capped,
-//! and evaluation runs on its own thread under a wall-clock timeout. See
+//! and every evaluation (manifest parse and render) runs on its own thread
+//! under a wall-clock timeout and a concurrency cap. See
 //! docs/job-templates.md.
 
 use crate::config_lang;
@@ -79,7 +80,8 @@ fn check_source_size(source: &str) -> R<()> {
     Ok(())
 }
 
-/// Evaluates the manifest half of a template document.
+/// Evaluates the manifest half of a template document, unbounded. Request
+/// handlers use [`parse_manifest_bounded`]; this form backs the unit tests.
 ///
 /// The wrapper treats the whole source as one expression (a Nickel file is an
 /// expression, possibly preceded by `let` bindings, so parenthesizing it is
@@ -87,9 +89,17 @@ fn check_source_size(source: &str) -> R<()> {
 /// `job` through record access rather than exporting the template directly,
 /// so the `not_exported` annotation that hides `job` from the manifest does
 /// not hide it from these checks.
+#[cfg(test)]
 pub fn parse_manifest(source: &str) -> R<TemplateManifest> {
     check_source_size(source)?;
-    let snippet = format!(
+    let manifest_json =
+        config_lang::eval_sandboxed("template-manifest", &manifest_snippet(source), None)
+            .map_err(|err| anyhow!("invalid template source: {err}"))?;
+    manifest_from_json(&manifest_json)
+}
+
+fn manifest_snippet(source: &str) -> String {
+    format!(
         r#"let template = (
 {source}
 ) in
@@ -103,10 +113,11 @@ else {{
   jobIsFunction =
     std.record.has_field "job" template && std.is_function template.job,
 }}"#
-    );
-    let manifest_json = config_lang::eval_sandboxed("template-manifest", &snippet, None)
-        .map_err(|err| anyhow!("invalid template source: {err}"))?;
+    )
+}
 
+/// Turns the manifest wrapper's JSON output into a validated manifest.
+fn manifest_from_json(manifest_json: &str) -> R<TemplateManifest> {
     #[derive(serde::Deserialize)]
     #[serde(rename_all = "camelCase")]
     struct RawManifest {
@@ -115,7 +126,7 @@ else {{
         has_job: bool,
         job_is_function: bool,
     }
-    let raw: RawManifest = serde_json::from_str(&manifest_json)
+    let raw: RawManifest = serde_json::from_str(manifest_json)
         .map_err(|err| anyhow!("invalid template manifest: {err}"))?;
 
     if !raw.has_job {
@@ -330,35 +341,133 @@ template.job vars"#
         .map_err(|err| anyhow!("template rendering failed: {err}"))
 }
 
-/// Renders on a dedicated thread under `RENDER_TIMEOUT`.
+/// Returned (inside the `anyhow::Error`) when every evaluation slot stayed
+/// busy for the whole `RENDER_TIMEOUT`. Callers map it to a retryable
+/// `RESOURCE_EXHAUSTED` rather than blaming the caller's template.
+#[derive(Debug)]
+pub struct EvalSlotsBusy;
+
+impl std::fmt::Display for EvalSlotsBusy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the manager is already evaluating {} templates; retry shortly",
+            max_concurrent_evals()
+        )
+    }
+}
+
+impl std::error::Error for EvalSlotsBusy {}
+
+/// How many template evaluations may occupy a thread at once: half the
+/// cores, between 1 and 4.
 ///
-/// Nickel is Turing-complete and its evaluator cannot be interrupted, so on
-/// timeout the render thread is abandoned (it keeps a core busy until the
-/// evaluation finishes or the process exits) and the caller gets an error.
-/// Call from sync/blocking context.
-pub fn render_with_timeout(source: &str, vars: &Map<String, Value>) -> R<String> {
-    let source = source.to_string();
-    let vars = vars.clone();
-    let (sender, receiver) = std::sync::mpsc::channel();
+/// Nickel's evaluator has no step limit or cancellation hook (checked
+/// against nickel-lang-core 0.18), so a timed-out evaluation cannot be
+/// stopped — its thread keeps spinning until the program finishes or the
+/// process exits. The slot is held by the evaluation thread itself, not by
+/// the request, so abandoned evaluations keep counting against this budget.
+/// That caps what hostile or runaway templates can take from the manager at
+/// half its cores, leaving the rest for raft heartbeats and RPCs.
+fn max_concurrent_evals() -> usize {
+    std::thread::available_parallelism()
+        .map(|cores| cores.get() / 2)
+        .unwrap_or(1)
+        .clamp(1, 4)
+}
+
+fn eval_slots() -> std::sync::Arc<tokio::sync::Semaphore> {
+    static SLOTS: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
+        std::sync::OnceLock::new();
+    SLOTS
+        .get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(max_concurrent_evals())))
+        .clone()
+}
+
+/// Runs one Nickel evaluation on a dedicated OS thread, bounded in time and
+/// in concurrency (see [`max_concurrent_evals`]).
+///
+/// Awaiting never blocks a tokio worker: the evaluation runs on its own
+/// thread and the caller waits on a oneshot under `RENDER_TIMEOUT`. Waiting
+/// for a free slot shares the same budget, so a request never takes longer
+/// than `RENDER_TIMEOUT` to get an answer.
+async fn eval_bounded<F>(label: &'static str, eval: F) -> R<String>
+where
+    F: FnOnce() -> R<String> + Send + 'static,
+{
+    eval_bounded_with(eval_slots(), RENDER_TIMEOUT, label, eval).await
+}
+
+/// [`eval_bounded`] with the slot pool and budget injected, for tests.
+async fn eval_bounded_with<F>(
+    slots: std::sync::Arc<tokio::sync::Semaphore>,
+    budget: Duration,
+    label: &'static str,
+    eval: F,
+) -> R<String>
+where
+    F: FnOnce() -> R<String> + Send + 'static,
+{
+    let deadline = tokio::time::Instant::now() + budget;
+    let permit = match tokio::time::timeout_at(deadline, slots.acquire_owned()).await {
+        Ok(Ok(permit)) => permit,
+        Ok(Err(_closed)) => bail!("template evaluation is unavailable"),
+        Err(_elapsed) => {
+            warn!(label, "template evaluation slots busy; rejecting request");
+            return Err(anyhow::Error::new(EvalSlotsBusy));
+        }
+    };
+    let (sender, receiver) = tokio::sync::oneshot::channel();
     std::thread::Builder::new()
-        .name("template-render".into())
+        .name(label.into())
         .spawn(move || {
-            let _ = sender.send(render(&source, &vars));
+            // Held until evaluation really ends, even after the caller gave up.
+            let _permit = permit;
+            let _ = sender.send(eval());
         })
-        .map_err(|err| anyhow!("failed to spawn render thread: {err}"))?;
-    match receiver.recv_timeout(RENDER_TIMEOUT) {
-        Ok(result) => result,
-        Err(_) => {
+        .map_err(|err| anyhow!("failed to spawn {label} thread: {err}"))?;
+    match tokio::time::timeout_at(deadline, receiver).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => bail!("{label} thread exited without a result"),
+        Err(_elapsed) => {
             warn!(
-                timeout_secs = RENDER_TIMEOUT.as_secs(),
-                "template render timed out; abandoning render thread"
+                label,
+                timeout_secs = budget.as_secs(),
+                "template evaluation timed out; abandoning its thread"
             );
             bail!(
                 "template rendering exceeded the {}s limit",
-                RENDER_TIMEOUT.as_secs()
+                budget.as_secs()
             )
         }
     }
+}
+
+/// [`parse_manifest`] under the evaluation time and concurrency bounds.
+/// Use this from request handlers: the manifest is author-controlled code.
+pub async fn parse_manifest_bounded(source: String) -> R<TemplateManifest> {
+    // Only the Nickel evaluation needs the bounded thread. Validating its
+    // JSON output is cheap and deterministic, so it runs here.
+    check_source_size(&source)?;
+    let manifest_json = eval_bounded("template-manifest", move || {
+        config_lang::eval_sandboxed("template-manifest", &manifest_snippet(&source), None)
+    })
+    .await
+    .map_err(|err| {
+        if err.is::<EvalSlotsBusy>() {
+            err
+        } else {
+            anyhow!("invalid template source: {err}")
+        }
+    })?;
+    manifest_from_json(&manifest_json)
+}
+
+/// [`render`] under the evaluation time and concurrency bounds.
+pub async fn render_bounded(source: &str, vars: &Map<String, Value>) -> R<String> {
+    let source = source.to_string();
+    let vars = vars.clone();
+    eval_bounded("template-render", move || render(&source, &vars)).await
 }
 
 #[cfg(test)]
@@ -496,6 +605,46 @@ mod job_templates_test {
         // Rejected at definition time too, not only at render time.
         let err = parse_manifest(importing).unwrap_err();
         assert!(err.to_string().contains("imports are not allowed"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn bounded_parse_matches_unbounded_parse_test() {
+        let manifest = parse_manifest_bounded(VALID_TEMPLATE.to_string())
+            .await
+            .expect("valid template");
+        assert_eq!(manifest.variables.len(), 6);
+        let err = parse_manifest_bounded(r#"{ description = "x" }"#.to_string())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("job"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn runaway_evaluation_times_out_and_keeps_its_slot_test() {
+        let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let budget = Duration::from_millis(50);
+        // Stands in for a Nickel program that will not finish in budget.
+        let err = eval_bounded_with(slots.clone(), budget, "test-eval", || {
+            std::thread::sleep(Duration::from_millis(600));
+            Ok("late".into())
+        })
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("exceeded"), "{err}");
+
+        // The abandoned evaluation still holds the only slot, so the next
+        // request is refused as busy instead of spawning another thread.
+        let err = eval_bounded_with(slots.clone(), budget, "test-eval", || Ok("ok".into()))
+            .await
+            .unwrap_err();
+        assert!(err.is::<EvalSlotsBusy>(), "{err}");
+
+        // Once the runaway finishes, the slot comes back.
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        let ok = eval_bounded_with(slots, budget, "test-eval", || Ok("ok".into()))
+            .await
+            .expect("slot released");
+        assert_eq!(ok, "ok");
     }
 
     #[test]

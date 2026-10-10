@@ -1281,6 +1281,9 @@ pub struct ManagerDaemonService {
     /// is at most one heartbeat stale and a failover shows nothing until
     /// the next beat, never a wrong answer.
     net_status: Arc<Mutex<HashMap<String, Vec<crate::structs::NetAllocStatus>>>>,
+    /// How often `StreamEvents` and exec sessions re-check their caller's
+    /// credential (`acl::STREAM_REAUTH_INTERVAL`; tests shorten it).
+    stream_reauth_interval: Duration,
 }
 
 /// Distinct merged policy bodies kept in memory.
@@ -1319,7 +1322,21 @@ impl ManagerDaemonService {
             net_policy_generation: Arc::new(Mutex::new(None)),
             net_status: Arc::new(Mutex::new(HashMap::new())),
             net_edges: Arc::new(Mutex::new(HashMap::new())),
+            stream_reauth_interval: acl::STREAM_REAUTH_INTERVAL,
         }
+    }
+
+    /// Overrides how often long-lived streams re-check their credential.
+    /// Production uses `acl::STREAM_REAUTH_INTERVAL`; tests shorten it.
+    pub fn with_stream_reauth_interval(mut self, interval: Duration) -> Self {
+        self.stream_reauth_interval = interval;
+        self
+    }
+
+    /// The caller's credential, kept so a long-lived stream can re-check it.
+    fn stream_credential<T>(&self, request: &Request<T>) -> acl::StreamCredential {
+        acl::StreamCredential::new(self.auth.clone(), request.metadata())
+            .with_interval(self.stream_reauth_interval)
     }
 
     /// The store's network-policy generation, cached for
@@ -1774,19 +1791,31 @@ impl ManagerDaemonService {
     }
 
     /// Join gate for worker registration: when ACLs are enforced, callers
-    /// prove membership with a join token secret unless they already hold a
-    /// worker or management credential. Audit-only mode logs failures but
-    /// lets registration proceed (the migration ramp for existing fleets).
+    /// prove membership with a join token secret unless they hold a
+    /// management credential or the node token of the node they register as.
+    /// Audit-only mode logs failures but lets registration proceed (the
+    /// migration ramp for existing fleets).
+    ///
+    /// The returned grant says what the caller may register as: a join token
+    /// pins its worker type (and so its pool), and a node token pins its node.
     fn verify_join_for_registration(
         &self,
         identity: &AclIdentity,
         join_token: Option<&str>,
-    ) -> Result<(), Status> {
-        if !self.auth.enabled || identity.is_management || identity.is_worker {
-            return Ok(());
+    ) -> Result<RegistrationGrant, Status> {
+        if !self.auth.enabled || identity.is_management {
+            return Ok(RegistrationGrant::Unrestricted);
+        }
+        // A node token proves only its own node. Without a join secret it
+        // cannot introduce any other node (that was a takeover path: register
+        // as a peer, rotate away the peer's token, mint its credentials).
+        if let Some(node_id) = acl::worker_node_id(identity) {
+            if join_token.is_none_or(|secret| secret.trim().is_empty()) {
+                return Ok(RegistrationGrant::Node(node_id.to_string()));
+            }
         }
         match self.auth.verify_join_secret(&self.store, join_token) {
-            Ok(_) => Ok(()),
+            Ok(record) => Ok(RegistrationGrant::JoinToken(record)),
             Err(status) if self.auth.audit_only => {
                 warn!(
                     target: "acl_audit",
@@ -1796,10 +1825,76 @@ impl ManagerDaemonService {
                     "join token verification failed (audit-only): {}",
                     status.message()
                 );
-                Ok(())
+                Ok(RegistrationGrant::Unrestricted)
             }
             Err(status) => Err(status),
         }
+    }
+
+    /// Enforces a registration grant against the requested worker type
+    /// (pre-registration) or node name and pool (registration). Audit-only
+    /// mode logs the mismatch and allows it, like every other worker-plane
+    /// check.
+    fn enforce_registration_grant(
+        &self,
+        grant: &RegistrationGrant,
+        worker_type: Option<&str>,
+        node: Option<(&str, &str)>,
+    ) -> Result<(), Status> {
+        let refusal = match grant {
+            RegistrationGrant::Unrestricted => None,
+            RegistrationGrant::JoinToken(record) => {
+                if let Some(requested) = worker_type.filter(|t| *t != record.worker_type) {
+                    Some(format!(
+                        "this join token is pinned to worker type {:?}, not {requested:?}",
+                        record.worker_type
+                    ))
+                } else if let Some((_, pool)) = node {
+                    let pinned = self
+                        .store
+                        .get_worker_type(record.worker_type.clone())
+                        .map_err(|e| map_store_error("Error loading worker type", e))?;
+                    (pool != pinned.pool).then(|| {
+                        format!(
+                            "this join token is pinned to worker type {:?}, whose pool is \
+                             {:?}, not {pool:?}",
+                            record.worker_type, pinned.pool
+                        )
+                    })
+                } else {
+                    None
+                }
+            }
+            RegistrationGrant::Node(own) => match node {
+                Some((name, _)) if name != own => Some(format!(
+                    "the node token for {own:?} may not register node {name:?}; \
+                     present a join token instead"
+                )),
+                Some((name, pool)) => match self.store.get_node(name) {
+                    Ok(existing) if existing.pool != pool => Some(format!(
+                        "node {name:?} is registered in pool {:?}; a node token may not \
+                         move it to {pool:?}",
+                        existing.pool
+                    )),
+                    _ => None,
+                },
+                None => None,
+            },
+        };
+        let Some(message) = refusal else {
+            return Ok(());
+        };
+        if self.auth.audit_only {
+            warn!(
+                target: "acl_audit",
+                resource = "worker-plane",
+                action = "register",
+                enforced = false,
+                "registration outside its grant (audit-only): {message}"
+            );
+            return Ok(());
+        }
+        Err(Status::permission_denied(message))
     }
 
     /// Scope check against a rollout's job, used by rollout endpoints that
@@ -2281,8 +2376,10 @@ impl ManagerDaemonService {
     /// never dropped: everything recorded before the flush drains the map is
     /// part of the flushed batch, and anything arriving after the drain
     /// opens the next window. Flush errors are logged (there is no caller to
-    /// surface them to); the next KV write retriggers reconciliation from
-    /// current state.
+    /// surface them to). Events lost to a flush error, a crash, or a
+    /// leadership change inside the window are recovered from replicated
+    /// state by the control-lane leader's periodic
+    /// [`sweep_missed_kv_changes`].
     fn queue_kv_change(&self, key: &str, is_delete: bool) -> bool {
         if self.kv_debounce.is_zero() {
             return false;
@@ -2310,7 +2407,7 @@ impl ManagerDaemonService {
                 error!(
                     error = %status.message(),
                     keys = changes.len(),
-                    "Debounced KV reconciliation failed"
+                    "Debounced KV reconciliation failed; the leader's KV sweep will retry"
                 );
             }
         });
@@ -2811,6 +2908,82 @@ fn reconcile_kv_changes(store: &Store, changes: &[(String, bool)]) -> Result<(),
     Ok(())
 }
 
+/// Safety net for KV-driven reconciliation: finds jobs whose stored config
+/// no longer matches what their KV references render to now, or whose
+/// `onDelete = "fail"` key is gone while the job is not failed, and
+/// reconciles them as if the KV events had just arrived. Returns how many
+/// jobs it reconciled.
+///
+/// Debounced KV events are held in memory on the manager that took the
+/// write, so a flush error, a crash, or a leadership change inside the
+/// window drops them. Everything this sweep compares is replicated, so the
+/// control-lane leader recovers those changes on its next tick. A job that is
+/// already up to date compares equal and costs one re-render.
+///
+/// What it cannot see: a missed delete whose policy is `restart` or
+/// `rollout`. A deleted key keeps its last rendered value, so the stored
+/// config looks current, and nothing replicated records that the delete
+/// was never acted on.
+pub(crate) fn sweep_missed_kv_changes(store: &Store) -> anyhow::Result<usize> {
+    let mut reconciled = 0;
+    for job_id in store.job_ids_with_kv_references()? {
+        let refs = store.job_kv_references_for_job(&job_id)?;
+        let Some(job_config_id) = refs.first().map(|r| r.job_config_id.clone()) else {
+            continue;
+        };
+        // Same skip as reconcile_kv_changes: a stopped job acts on nothing.
+        let status = store.job_status_by_id(&job_id)?;
+        if status.as_deref() == Some("stopped") {
+            continue;
+        }
+        let current = store.get_job_config_by_id(&job_config_id)?;
+
+        let mut keys: Vec<String> = refs.iter().map(|r| r.kv_key.clone()).collect();
+        keys.sort();
+        keys.dedup();
+        let mut present = Vec::new();
+        let mut missing = Vec::new();
+        for key in keys {
+            if store.get_kv(&key)?.is_some() {
+                present.push(key);
+            } else {
+                missing.push(key);
+            }
+        }
+
+        let mut missed: Vec<(String, bool)> = Vec::new();
+        // Missed put: re-render exactly as a reconcile would and compare the
+        // way submit does, so "different" here means the reconcile would
+        // store a new config rather than return Unchanged.
+        let (rendered, _) =
+            apply_kv_references_to_config(store, &current, &refs, MissingKvBehavior::KeepExisting)?;
+        if !current.is_same_as(&store.normalize_job_config(&rendered)?) {
+            missed.extend(present.iter().map(|key| (key.clone(), false)));
+        }
+        // Missed fail-on-delete: the key is gone but the job never failed.
+        if !missing.is_empty() && status.as_deref() != Some("failed") {
+            let deleted: HashMap<String, bool> =
+                missing.iter().map(|key| (key.clone(), true)).collect();
+            let (action, _, _) = resolve_job_kv_action(store, &current, &refs, &deleted)?;
+            if action == KvInjectionAction::Fail {
+                missed.extend(missing.iter().map(|key| (key.clone(), true)));
+            }
+        }
+        if missed.is_empty() {
+            continue;
+        }
+        warn!(
+            job_id = %job_id,
+            keys = missed.len(),
+            "Job missed a KV-driven reconciliation; reconciling now"
+        );
+        reconcile_kv_changes(store, &missed)
+            .map_err(|status| anyhow!("reconciling job {job_id}: {}", status.message()))?;
+        reconciled += 1;
+    }
+    Ok(reconciled)
+}
+
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 struct TaskKey {
     job_config_id: String,
@@ -2851,7 +3024,8 @@ impl Manager for ManagerDaemonService {
         let js = inner.parsed_jobspec;
         let subs = inner.submissions;
         let priority = inner.priority;
-        let idempotency_key = inner.idempotency_key.unwrap_or_default();
+        let idempotency_key =
+            scoped_idempotency_key(&identity, "run_job", inner.idempotency_key.as_deref());
 
         if let Some(message) = self
             .store
@@ -2922,9 +3096,9 @@ impl Manager for ManagerDaemonService {
             &AclScope::template(&name),
         )?;
 
-        let manifest =
-            run_blocking_admission(|| job_templates::parse_manifest(&inner.source_nickel))
-                .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        let manifest = job_templates::parse_manifest_bounded(inner.source_nickel.clone())
+            .await
+            .map_err(template_eval_status)?;
 
         // When every variable has a default the template is fully renderable
         // right now — trial-render it so authoring mistakes surface at
@@ -2936,12 +3110,17 @@ impl Manager for ManagerDaemonService {
         {
             let values = job_templates::resolve_variable_values(&manifest.variables, "{}")
                 .map_err(|e| Status::invalid_argument(e.to_string()))?;
-            let rendered = run_blocking_admission(|| {
-                job_templates::render_with_timeout(&inner.source_nickel, &values)
-            })
-            .map_err(|e| {
-                Status::invalid_argument(format!("trial render with defaults failed: {e}"))
-            })?;
+            let rendered = job_templates::render_bounded(&inner.source_nickel, &values)
+                .await
+                .map_err(|e| match template_eval_status(e) {
+                    status if status.code() == tonic::Code::InvalidArgument => {
+                        Status::invalid_argument(format!(
+                            "trial render with defaults failed: {}",
+                            status.message()
+                        ))
+                    }
+                    status => status,
+                })?;
             let config: JobConfig = serde_json::from_str(&rendered).map_err(|e| {
                 Status::invalid_argument(format!(
                     "trial render with defaults did not produce a valid jobspec: {e}"
@@ -3102,10 +3281,9 @@ impl Manager for ManagerDaemonService {
         let values =
             job_templates::resolve_variable_values(&template.variables, &inner.variables_json)
                 .map_err(|e| Status::invalid_argument(e.to_string()))?;
-        let rendered = run_blocking_admission(|| {
-            job_templates::render_with_timeout(&template.source_nickel, &values)
-        })
-        .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        let rendered = job_templates::render_bounded(&template.source_nickel, &values)
+            .await
+            .map_err(template_eval_status)?;
 
         let (config, _kv_refs) = resolve_jobspec_kv_references(&self.store, &rendered)
             .map_err(|e| Status::invalid_argument(format!("rendered jobspec is invalid: {e}")))?;
@@ -3144,7 +3322,11 @@ impl Manager for ManagerDaemonService {
         )?;
         let inner = request.into_inner();
         let priority = inner.priority;
-        let idempotency_key = inner.idempotency_key.unwrap_or_default();
+        let idempotency_key = scoped_idempotency_key(
+            &identity,
+            "run_job_template",
+            inner.idempotency_key.as_deref(),
+        );
 
         if let Some(recorded) = self
             .store
@@ -3172,10 +3354,9 @@ impl Manager for ManagerDaemonService {
         let values =
             job_templates::resolve_variable_values(&template.variables, &inner.variables_json)
                 .map_err(|e| Status::invalid_argument(e.to_string()))?;
-        let rendered = run_blocking_admission(|| {
-            job_templates::render_with_timeout(&template.source_nickel, &values)
-        })
-        .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        let rendered = job_templates::render_bounded(&template.source_nickel, &values)
+            .await
+            .map_err(template_eval_status)?;
 
         // The template source is the primary submission so spec history
         // shows what was actually run; the resolved variable values ride
@@ -3474,6 +3655,7 @@ impl Manager for ManagerDaemonService {
                 &AclScope::any(),
             )?;
         }
+        let credential = self.stream_credential(&request);
         let mut inbound = request.into_inner();
         let first = inbound
             .message()
@@ -3499,8 +3681,14 @@ impl Manager for ManagerDaemonService {
             }
         });
 
-        let out_rx =
-            crate::manager::exec::run_exec_session(&self.store, &identity, start, in_rx).await?;
+        let out_rx = crate::manager::exec::run_exec_session(
+            &self.store,
+            &identity,
+            start,
+            in_rx,
+            credential,
+        )
+        .await?;
         Ok(Response::new(ReceiverStream::new(out_rx)))
     }
 
@@ -3533,6 +3721,7 @@ impl Manager for ManagerDaemonService {
             AclAction::Read,
             AclScope::none(),
         )?;
+        let credential = self.stream_credential(&request);
         let request = request.into_inner();
         let filter = scheduler_event_filter(
             request.after_id,
@@ -3562,8 +3751,31 @@ impl Manager for ManagerDaemonService {
                 None => 0,
             };
 
+            // Re-check the credential while the stream runs, so a revoked or
+            // expired token (or a revoked policy) closes the feed.
+            let mut reauth = tokio::time::interval(credential.interval);
+            reauth.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            reauth.tick().await; // the first tick fires immediately
             loop {
-                match live.recv().await {
+                let received = tokio::select! {
+                    received = live.recv() => received,
+                    _ = reauth.tick() => {
+                        let still_allowed = credential.reauthenticate(&store).and_then(|identity| {
+                            acl::enforce(
+                                &identity,
+                                AclResource::Operator,
+                                AclAction::Read,
+                                &AclScope::none(),
+                            )
+                        });
+                        if let Err(status) = still_allowed {
+                            let _ = tx.send(Err(status)).await;
+                            return;
+                        }
+                        continue;
+                    }
+                };
+                match received {
                     Ok(event) => {
                         if event.id <= last_sent || !filter.matches(&event) {
                             continue;
@@ -4018,7 +4230,7 @@ impl Manager for ManagerDaemonService {
         // Lifecycle write: provenance-aware scope, so template-scoped
         // identities can stop the jobs their templates created (they cannot
         // change specs this way — RunJob never carries provenance).
-        self.check_acl(
+        let identity = self.check_acl(
             &request,
             AclResource::Job,
             AclAction::Write,
@@ -4027,7 +4239,8 @@ impl Manager for ManagerDaemonService {
         let inner = request.into_inner();
         let name = inner.name;
         let priority = inner.priority.unwrap_or(self.store.default_eval_priority);
-        let idempotency_key = inner.idempotency_key.unwrap_or_default();
+        let idempotency_key =
+            scoped_idempotency_key(&identity, "stop_job", inner.idempotency_key.as_deref());
 
         if let Some(message) = self
             .store
@@ -4088,7 +4301,8 @@ impl Manager for ManagerDaemonService {
         )?;
         let inner = request.into_inner();
         let name = inner.name;
-        let idempotency_key = inner.idempotency_key.unwrap_or_default();
+        let idempotency_key =
+            scoped_idempotency_key(&ident, "scale_task", inner.idempotency_key.as_deref());
 
         if let Some(message) = self
             .store
@@ -4302,7 +4516,7 @@ impl Manager for ManagerDaemonService {
         request: Request<DestroyJobRequest>,
     ) -> Result<Response<DestroyJobReply>, Status> {
         // Lifecycle write: provenance-aware scope (see stop_job).
-        self.check_acl(
+        let identity = self.check_acl(
             &request,
             AclResource::Job,
             AclAction::Write,
@@ -4310,7 +4524,8 @@ impl Manager for ManagerDaemonService {
         )?;
         let inner = request.into_inner();
         let name = inner.name;
-        let idempotency_key = inner.idempotency_key.unwrap_or_default();
+        let idempotency_key =
+            scoped_idempotency_key(&identity, "destroy_job", inner.idempotency_key.as_deref());
 
         if let Some(message) = self
             .store
@@ -4349,14 +4564,18 @@ impl Manager for ManagerDaemonService {
         &self,
         request: Request<CreateInstanceRequest>,
     ) -> Result<Response<CreateInstanceReply>, Status> {
-        self.check_acl(
+        let identity = self.check_acl(
             &request,
             AclResource::Job,
             AclAction::Write,
             AclScope::job(&request.get_ref().job_id),
         )?;
         let inner = request.into_inner();
-        let idempotency_key = inner.idempotency_key.unwrap_or_default();
+        let idempotency_key = scoped_idempotency_key(
+            &identity,
+            "create_instance",
+            inner.idempotency_key.as_deref(),
+        );
 
         if let Some(instance_id) = self
             .store
@@ -4434,14 +4653,18 @@ impl Manager for ManagerDaemonService {
         &self,
         request: Request<CreateInstancesRequest>,
     ) -> Result<Response<CreateInstancesReply>, Status> {
-        self.check_acl(
+        let identity = self.check_acl(
             &request,
             AclResource::Job,
             AclAction::Write,
             AclScope::job(&request.get_ref().job_id),
         )?;
         let inner = request.into_inner();
-        let idempotency_key = inner.idempotency_key.unwrap_or_default();
+        let idempotency_key = scoped_idempotency_key(
+            &identity,
+            "create_instances",
+            inner.idempotency_key.as_deref(),
+        );
 
         if let Some(recorded) = self
             .store
@@ -4543,7 +4766,8 @@ impl Manager for ManagerDaemonService {
             AclScope::any(),
         )?;
         let inner = request.into_inner();
-        let idempotency_key = inner.idempotency_key.unwrap_or_default();
+        let idempotency_key =
+            scoped_idempotency_key(&identity, "stop_instance", inner.idempotency_key.as_deref());
 
         if let Some(message) = self
             .store
@@ -4637,7 +4861,11 @@ impl Manager for ManagerDaemonService {
             AclScope::any(),
         )?;
         let inner = request.into_inner();
-        let idempotency_key = inner.idempotency_key.unwrap_or_default();
+        let idempotency_key = scoped_idempotency_key(
+            &identity,
+            "start_instance",
+            inner.idempotency_key.as_deref(),
+        );
 
         if let Some(message) = self
             .store
@@ -4746,7 +4974,11 @@ impl Manager for ManagerDaemonService {
             AclScope::any(),
         )?;
         let inner = request.into_inner();
-        let idempotency_key = inner.idempotency_key.unwrap_or_default();
+        let idempotency_key = scoped_idempotency_key(
+            &identity,
+            "destroy_instance",
+            inner.idempotency_key.as_deref(),
+        );
 
         if let Some(message) = self
             .store
@@ -4828,7 +5060,11 @@ impl Manager for ManagerDaemonService {
             AclScope::any(),
         )?;
         let inner = request.into_inner();
-        let idempotency_key = inner.idempotency_key.unwrap_or_default();
+        let idempotency_key = scoped_idempotency_key(
+            &identity,
+            "replace_instance",
+            inner.idempotency_key.as_deref(),
+        );
 
         if let Some(message) = self
             .store
@@ -5081,7 +5317,8 @@ impl Manager for ManagerDaemonService {
             AclScope::any(),
         )?;
         let inner = request.into_inner();
-        let idempotency_key = inner.idempotency_key.unwrap_or_default();
+        let idempotency_key =
+            scoped_idempotency_key(&identity, "DeleteVolume", inner.idempotency_key.as_deref());
 
         if let Some(message) = self
             .store
@@ -5092,6 +5329,16 @@ impl Manager for ManagerDaemonService {
                 .store
                 .get_volume(&inner.volume_id)
                 .map_err(|e| map_store_error("Error loading volume", e))?;
+            // A replay must not hand out a volume the caller could not
+            // delete. (The record is usually gone by now.)
+            if let Some(volume) = volume.as_ref() {
+                acl::enforce(
+                    &identity,
+                    AclResource::Job,
+                    AclAction::Write,
+                    &volume_write_scope(volume),
+                )?;
+            }
             return Ok(Response::new(DeleteVolumeReply {
                 volume: volume.map(volume_info),
                 message,
@@ -5104,14 +5351,12 @@ impl Manager for ManagerDaemonService {
             .get_volume(&inner.volume_id)
             .map_err(|e| map_store_error("Error loading volume", e))?
             .ok_or_else(|| Status::not_found(format!("volume {} not found", inner.volume_id)))?;
-        if let Some(job_id) = existing.job_id.as_deref() {
-            acl::enforce(
-                &identity,
-                AclResource::Job,
-                AclAction::Write,
-                &AclScope::job(job_id),
-            )?;
-        }
+        acl::enforce(
+            &identity,
+            AclResource::Job,
+            AclAction::Write,
+            &volume_write_scope(&existing),
+        )?;
 
         // In-use protection: deleting a volume a live workload is writing to
         // would detach the handle and then reclaim storage under it. Stop the
@@ -5337,11 +5582,15 @@ impl Manager for ManagerDaemonService {
         &self,
         request: Request<RotateMeshCaRequest>,
     ) -> Result<Response<RotateMeshCaReply>, Status> {
+        // The mesh CA signs every node's certificate, so rotating it is a
+        // cluster-wide write. `AclScope::none()` carries no pool, so only an
+        // unscoped `net:write` rule matches; `any()` (list gating) would let a
+        // pool-scoped net admin rotate trust for every pool.
         let identity = self.check_acl(
             &request,
             AclResource::Net,
             AclAction::Write,
-            AclScope::any(),
+            AclScope::none(),
         )?;
         let ca = self
             .store
@@ -5492,6 +5741,7 @@ impl Manager for ManagerDaemonService {
         crate::manager::telemetry::metrics().heartbeats_total.inc();
         let req = request.into_inner();
         let id = req.id;
+        acl::enforce_node_binding(&identity, &id)?;
         let provisional_claims = req.provisional_claims;
 
         // Offloaded, not called inline. In steady state this is now cheap —
@@ -5708,6 +5958,7 @@ impl Manager for ManagerDaemonService {
         acl::enforce_worker_plane(&identity)?;
         let req = request.into_inner();
         let id = req.id;
+        acl::enforce_node_binding(&identity, &id)?;
 
         self.store
             .update_node_health_checks(&id, &req.health_checks)
@@ -5731,9 +5982,11 @@ impl Manager for ManagerDaemonService {
         // membership with a join token secret (or an already-issued worker /
         // management bearer credential).
         let identity = self.authenticate_acl(&request)?;
-        self.verify_join_for_registration(&identity, request.get_ref().join_token.as_deref())?;
+        let grant =
+            self.verify_join_for_registration(&identity, request.get_ref().join_token.as_deref())?;
         let request = request.into_inner();
         let worker_type = request.worker_type;
+        self.enforce_registration_grant(&grant, Some(&worker_type), None)?;
 
         let worker_config = self
             .store
@@ -5771,9 +6024,11 @@ impl Manager for ManagerDaemonService {
         // ACL: worker-plane endpoint (see `worker_pre_register`). Successful
         // registration mints (or rotates) the node token used for heartbeats.
         let identity = self.authenticate_acl(&request)?;
-        self.verify_join_for_registration(&identity, request.get_ref().join_token.as_deref())?;
+        let grant =
+            self.verify_join_for_registration(&identity, request.get_ref().join_token.as_deref())?;
         let request = request.into_inner();
         let node_id = request.name.clone();
+        self.enforce_registration_grant(&grant, None, Some((&node_id, &request.pool)))?;
 
         // Protocol-version handshake (see docs/upgrades.md): accept workers
         // at or below our protocol version, warn on pre-versioning workers
@@ -5813,13 +6068,31 @@ impl Manager for ManagerDaemonService {
         })
         .to_string();
 
+        // Re-registration (a worker restart, or a token rotation) keeps the
+        // operator's availability: a drained or ineligible node must not
+        // silently become schedulable again. Only a new node starts
+        // `available`. The value is resolved here, not in the store's apply
+        // step, so every replica applies the same explicit value.
+        let availability = match self.store.get_node(&node_id) {
+            Ok(existing) => existing.availability,
+            Err(err)
+                if matches!(
+                    StorageError::from_anyhow(&err),
+                    Some(StorageError::NotFound { .. })
+                ) =>
+            {
+                "available".to_string()
+            }
+            Err(err) => return Err(map_store_error("Error loading node", err)),
+        };
+
         let node_msg = NodeMsg {
             id: request.name,
             fingerprint_attrs: request.fingerprint_attrs,
             config_attrs: request.config_attrs,
             dynamic_attrs,
             status: "active".to_string(),
-            availability: "available".to_string(),
+            availability,
             pool: request.pool,
             last_heartbeat: String::new(),
             heartbeat_source: String::new(),
@@ -5829,6 +6102,12 @@ impl Manager for ManagerDaemonService {
         self.store
             .insert_node(node_msg)
             .map_err(|e| map_store_error("Error registering worker", e))?;
+        // New capacity: let jobs that are short of their count (or have a
+        // `count.per` task) try again. Not fatal to the registration; the
+        // next leader's regeneration pass reschedules every active job.
+        if let Err(err) = self.store.request_capacity_reconcile() {
+            warn!(node_id = %node_id, error = %err, "Failed to queue the capacity pass after registration");
+        }
 
         let node_token = if self.auth.enabled {
             let secret = self.auth.mint_node_token(&self.store, &node_id)?;
@@ -5928,7 +6207,15 @@ impl Manager for ManagerDaemonService {
         &self,
         request: Request<GetNodeRequest>,
     ) -> Result<Response<GetNodeReply>, Status> {
-        let identity = self.authenticate_acl(&request)?;
+        // Coarse gate before the node lookup ("check before you fetch"), so
+        // a caller with no node access cannot probe which node ids exist;
+        // the precise pool scope is enforced after the node is loaded.
+        let identity = self.check_acl(
+            &request,
+            AclResource::Node,
+            AclAction::Read,
+            AclScope::any(),
+        )?;
         let id = request.into_inner().id;
         let node = self
             .store
@@ -5958,7 +6245,13 @@ impl Manager for ManagerDaemonService {
         &self,
         request: Request<RestartWorkerRequest>,
     ) -> Result<Response<RestartWorkerReply>, Status> {
-        let identity = self.authenticate_acl(&request)?;
+        // Coarse gate before the node lookup (see `get_node`).
+        let identity = self.check_acl(
+            &request,
+            AclResource::Node,
+            AclAction::Write,
+            AclScope::any(),
+        )?;
         let node_id = request.into_inner().node_id;
         let node = self.store.get_node(&node_id).map_err(|e| {
             error!(error = ?e, node_id = %node_id, "Failed to get node for restart");
@@ -6010,7 +6303,11 @@ impl Manager for ManagerDaemonService {
         let node_id = inner.node_id;
         let availability = inner.availability;
         let evict = inner.evict;
-        let idempotency_key = inner.idempotency_key.unwrap_or_default();
+        let idempotency_key = scoped_idempotency_key(
+            &identity,
+            "set_node_availability",
+            inner.idempotency_key.as_deref(),
+        );
 
         if availability != "available" && availability != "drained" {
             return Err(Status::invalid_argument(format!(
@@ -6054,6 +6351,14 @@ impl Manager for ManagerDaemonService {
             self.store
                 .enqueue_eval("node_drain", None, None, Some(&node_id), None)
                 .map_err(|e| map_store_error("Error enqueueing drain eval", e))?;
+        }
+        if availability == "available" {
+            // An uncordoned node is new capacity, like a registration. The
+            // uncordon itself already committed, so a failed enqueue is
+            // logged rather than reported as a failed request.
+            if let Err(err) = self.store.request_capacity_reconcile() {
+                warn!(%node_id, error = %err, "Failed to queue the capacity pass after uncordon");
+            }
         }
 
         let message = if availability == "available" {
@@ -6180,7 +6485,13 @@ impl Manager for ManagerDaemonService {
         &self,
         request: Request<UpdateNodeDynamicRequest>,
     ) -> Result<Response<UpdateNodeDynamicReply>, Status> {
-        let identity = self.authenticate_acl(&request)?;
+        // Coarse gate before the node lookup (see `get_node`).
+        let identity = self.check_acl(
+            &request,
+            AclResource::Node,
+            AclAction::Write,
+            AclScope::any(),
+        )?;
         let r = request.into_inner();
         let id = r.id;
         // Enforce against the node's pool before mutating it.
@@ -6511,14 +6822,15 @@ impl Manager for ManagerDaemonService {
         &self,
         request: Request<RotateDataKeyRequest>,
     ) -> Result<Response<RotateDataKeyReply>, Status> {
-        self.check_acl(
+        let identity = self.check_acl(
             &request,
             AclResource::Operator,
             AclAction::Write,
             AclScope::none(),
         )?;
         let req = request.into_inner();
-        let idempotency_key = req.idempotency_key.unwrap_or_default();
+        let idempotency_key =
+            scoped_idempotency_key(&identity, "rotate_data_key", req.idempotency_key.as_deref());
         if let Some(message) = self
             .store
             .idempotency_lookup(&idempotency_key)
@@ -6562,14 +6874,15 @@ impl Manager for ManagerDaemonService {
         &self,
         request: Request<RewrapKvRequest>,
     ) -> Result<Response<RewrapKvReply>, Status> {
-        self.check_acl(
+        let identity = self.check_acl(
             &request,
             AclResource::Operator,
             AclAction::Write,
             AclScope::none(),
         )?;
         let req = request.into_inner();
-        let idempotency_key = req.idempotency_key.unwrap_or_default();
+        let idempotency_key =
+            scoped_idempotency_key(&identity, "rewrap_kv", req.idempotency_key.as_deref());
         if let Some(message) = self
             .store
             .idempotency_lookup(&idempotency_key)
@@ -6604,14 +6917,15 @@ impl Manager for ManagerDaemonService {
         &self,
         request: Request<RewrapRootKeyRequest>,
     ) -> Result<Response<RewrapRootKeyReply>, Status> {
-        self.check_acl(
+        let identity = self.check_acl(
             &request,
             AclResource::Operator,
             AclAction::Write,
             AclScope::none(),
         )?;
         let req = request.into_inner();
-        let idempotency_key = req.idempotency_key.unwrap_or_default();
+        let idempotency_key =
+            scoped_idempotency_key(&identity, "rewrap_root_key", req.idempotency_key.as_deref());
         if let Some(message) = self
             .store
             .idempotency_lookup(&idempotency_key)
@@ -7036,6 +7350,7 @@ impl Manager for ManagerDaemonService {
         let identity = self.authenticate_acl(&request)?;
         acl::enforce_worker_plane(&identity)?;
         let req = request.into_inner();
+        acl::enforce_node_binding(&identity, &req.node_id)?;
         if req.hash.trim().is_empty() {
             return Err(Status::invalid_argument("hash is required"));
         }
@@ -7352,6 +7667,7 @@ impl Manager for ManagerDaemonService {
         let identity = self.authenticate_acl(&request)?;
         acl::enforce_worker_plane(&identity)?;
         let req = request.into_inner();
+        acl::enforce_node_binding(&identity, &req.node_id)?;
         let entry = self
             .store
             .get_kv(&req.kv_path)
@@ -8192,7 +8508,11 @@ impl Manager for ManagerDaemonService {
             ));
         };
 
-        let idempotency_key = req.idempotency_key.clone().unwrap_or_default();
+        let idempotency_key = scoped_idempotency_key(
+            &identity,
+            "issue_boot_ticket",
+            req.idempotency_key.as_deref(),
+        );
         if let Some(recorded) = self
             .store
             .idempotency_lookup(&idempotency_key)
@@ -8372,6 +8692,7 @@ impl Manager for ManagerDaemonService {
         let req = request.into_inner();
         tracing::Span::current().record("node_id", req.node_id.as_str());
         tracing::Span::current().record("claim_id", req.claim_id.as_str());
+        acl::enforce_node_binding(&identity, &req.node_id)?;
 
         let refuse = |reason: crate::structs::edge_boot::RefusalReason, detail: String| {
             crate::manager::telemetry::worker_metrics()
@@ -8501,6 +8822,50 @@ struct MintedTicketRecord {
     jti: String,
     job_config_id: String,
     expires_at_unix: i64,
+}
+
+/// The stored form of a client-chosen idempotency key, scoped to one
+/// operation and one caller. Keys used to be a single global namespace: a
+/// `job run` key replayed on `job destroy` silently skipped the destroy and
+/// reported `deduplicated`, and a second caller presenting someone else's key
+/// read back their recorded reply. The caller is the token's accessor id
+/// (stable across a token's lifetime and safe to store), falling back to the
+/// principal for JWT and anonymous callers. A missing or blank key stays
+/// empty, which disables deduplication. Length prefixes keep the encoding
+/// unambiguous whatever the parts contain.
+fn scoped_idempotency_key(identity: &AclIdentity, operation: &str, key: Option<&str>) -> String {
+    let key = key.map(str::trim).unwrap_or_default();
+    if key.is_empty() {
+        return String::new();
+    }
+    let caller = identity
+        .accessor_id
+        .as_deref()
+        .unwrap_or(identity.principal.as_str());
+    format!("{operation}/{}:{caller}/{key}", caller.len())
+}
+
+/// The scope a volume write is checked against. A job's volume belongs to
+/// that job. A volume no job owns belongs to no job's scope, so deleting it
+/// takes cluster-wide `job:write`: `AclScope::none()` carries no job name, so
+/// only a rule without `names`/`namespaces` selectors matches it.
+fn volume_write_scope(volume: &crate::structs::volume::Volume) -> AclScope {
+    match volume.job_id.as_deref() {
+        Some(job_id) => AclScope::job(job_id),
+        None => AclScope::none(),
+    }
+}
+
+/// What a worker-registration caller may register as, decided by
+/// `verify_join_for_registration` from the credential it presented.
+#[derive(Debug)]
+enum RegistrationGrant {
+    /// ACLs off, a management credential, or an audit-only pass.
+    Unrestricted,
+    /// A verified join token: pins the worker type, and through it the pool.
+    JoinToken(crate::storage::acl_store::JoinTokenRecord),
+    /// A node token: may only re-register its own node, in its current pool.
+    Node(String),
 }
 
 fn worker_address_for_node(node: &Node) -> Option<String> {
@@ -8747,6 +9112,17 @@ fn handle_failed_allocations(
     }
 
     Ok(())
+}
+
+/// Maps a template evaluation error to a gRPC status: a full evaluation
+/// budget is the manager's problem and retryable (`RESOURCE_EXHAUSTED`),
+/// anything else is the template's or the values' fault.
+fn template_eval_status(err: anyhow::Error) -> Status {
+    if err.is::<job_templates::EvalSlotsBusy>() {
+        Status::resource_exhausted(err.to_string())
+    } else {
+        Status::invalid_argument(err.to_string())
+    }
 }
 
 /// Runs blocking admission work (artifact pin resolution can reach
@@ -10703,6 +11079,31 @@ mod tests {
         Ok(())
     }
 
+    /// A worker restart re-registers the node; that must not undo an
+    /// operator's drain (S6 in the 2026-10-09 architecture audit).
+    #[tokio::test]
+    async fn re_registration_keeps_node_availability() -> R<()> {
+        let store = setup_store()?;
+        let manager = ManagerDaemonService::new(store.clone());
+        let register = || {
+            tonic::Request::new(WorkerRegisterRequest {
+                name: "drained-node".into(),
+                pool: "default".into(),
+                config_attrs: "{}".into(),
+                fingerprint_attrs: "{}".into(),
+                health_checks: "[]".into(),
+                ..Default::default()
+            })
+        };
+        manager.worker_register(register()).await?;
+        assert_eq!(store.get_node("drained-node")?.availability, "available");
+
+        store.set_node_availability("drained-node", "drained")?;
+        manager.worker_register(register()).await?;
+        assert_eq!(store.get_node("drained-node")?.availability, "drained");
+        Ok(())
+    }
+
     #[tokio::test]
     async fn replace_instance_rejects_allocations_on_healthy_nodes() -> R<()> {
         let store = setup_store()?;
@@ -11901,6 +12302,62 @@ mod tests {
 
         assert_eq!(store.get_job("kv-burst-del")?.status, "failed");
         assert_eq!(evals_of_kind(&store, "kv-burst-del", "job_update")?, 0);
+        Ok(())
+    }
+
+    /// M4: a KV put whose debounced reconciliation never ran (here: the
+    /// write bypasses the RPC, as if the flush were lost to a crash) is
+    /// recovered by the leader sweep, and a job that is up to date is left
+    /// alone.
+    #[tokio::test]
+    async fn kv_sweep_recovers_a_missed_put_and_is_quiet_otherwise_test() -> R<()> {
+        let store = setup_store()?;
+        store.put_kv("sweep/key", "v0", KvValueType::String, None, None)?;
+        let manager = ManagerDaemonService::new(store.clone());
+        run_jobspec(
+            &manager,
+            watched_env_jobspec("kv-sweep", "sweep/key", "restart", "fail"),
+        )
+        .await?;
+
+        // Up to date: nothing to do, no writes, no evals.
+        assert_eq!(sweep_missed_kv_changes(&store)?, 0);
+        // A reconciled put (the normal path) leaves nothing for the sweep.
+        put_kv_entry(&manager, "sweep/key", "v1").await?;
+        assert_eq!(evals_of_kind(&store, "kv-sweep", "job_update")?, 1);
+        assert_eq!(sweep_missed_kv_changes(&store)?, 0);
+
+        // The lost event: the value changes with no reconciliation.
+        store.put_kv("sweep/key", "v2", KvValueType::String, None, None)?;
+        assert_eq!(task_env_value(&store, "kv-sweep", 0, "WATCHED")?, "v1");
+
+        assert_eq!(sweep_missed_kv_changes(&store)?, 1);
+        assert_eq!(task_env_value(&store, "kv-sweep", 0, "WATCHED")?, "v2");
+        assert_eq!(evals_of_kind(&store, "kv-sweep", "job_update")?, 2);
+        // Converged: the next sweep is a no-op.
+        assert_eq!(sweep_missed_kv_changes(&store)?, 0);
+        Ok(())
+    }
+
+    /// M4: a missed delete of an `onDelete = "fail"` key is recovered too.
+    #[tokio::test]
+    async fn kv_sweep_recovers_a_missed_fail_on_delete_test() -> R<()> {
+        let store = setup_store()?;
+        store.put_kv("sweep/del", "v0", KvValueType::String, None, None)?;
+        let manager = ManagerDaemonService::new(store.clone());
+        run_jobspec(
+            &manager,
+            watched_env_jobspec("kv-sweep-del", "sweep/del", "restart", "fail"),
+        )
+        .await?;
+
+        store.delete_kv("sweep/del", None, None)?;
+        assert_ne!(store.get_job("kv-sweep-del")?.status, "failed");
+
+        assert_eq!(sweep_missed_kv_changes(&store)?, 1);
+        assert_eq!(store.get_job("kv-sweep-del")?.status, "failed");
+        // Already failed: the sweep does not re-fail it every tick.
+        assert_eq!(sweep_missed_kv_changes(&store)?, 0);
         Ok(())
     }
 

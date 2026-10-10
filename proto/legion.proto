@@ -25,6 +25,12 @@ service Manager {
   // Registers or upserts a worker node in manager state.
   //
   // A worker should call this after pre-registration and after local fingerprinting.
+  //
+  // A registration is new capacity, so it also queues a capacity pass (a
+  // `node_join` evaluation with no node) that re-evaluates jobs short of
+  // their count and jobs with `count.per` tasks. While one pass is pending,
+  // further registrations queue nothing. Failing to queue the pass does not
+  // fail the registration.
   rpc WorkerRegister (WorkerRegisterRequest) returns (WorkerRegisterReply);
 
   // Submits or updates a job from a fully rendered jobspec.
@@ -113,6 +119,10 @@ service Manager {
   // manifest. Invalid manifests are rejected here, not at run
   // time. When every declared variable has a default, the manager also
   // trial-renders the template and validates the resulting jobspec.
+  // Every Nickel evaluation here (and in RenderJobTemplate/RunJobTemplate)
+  // gets a 5-second budget (INVALID_ARGUMENT "exceeded the 5s limit" when
+  // it runs over) and a manager-wide concurrency cap (RESOURCE_EXHAUSTED,
+  // retryable, when every evaluation slot stays busy for the budget).
   // Requires `template:write` scoped to the template name.
   rpc UpsertJobTemplate (UpsertJobTemplateRequest) returns (UpsertJobTemplateReply);
 
@@ -376,6 +386,9 @@ service Manager {
   // Deleting an already-`destroyed` volume succeeds as a no-op, so the call is
   // safe to retry.
   //
+  // ACL: `job:write` on the volume's job. A volume no job owns needs
+  // cluster-wide `job:write` (a rule with no `names` or `namespaces`).
+  //
   // Errors:
   // - NotFound: no volume row with this id exists.
   // - FailedPrecondition: a live allocation is running against the volume and
@@ -529,7 +542,8 @@ service Manager {
   //   force-moved by a drain (use ReplaceInstance for an operator override).
   // - Uncordon: `availability = "available"`. The node re-enters the
   //   scheduling pool; existing allocations elsewhere are not moved back
-  //   automatically.
+  //   automatically. Like a worker registration, it queues a capacity pass
+  //   that re-evaluates jobs short of their count.
   //
   // The call is level-triggered and idempotent: setting the value a node
   // already has is a no-op besides the emitted event, and eviction works by
@@ -559,6 +573,11 @@ service Manager {
   // `exec:write` (with `host: true` for host-level runtimes); action runs
   // require `action:write` (or `exec:write`) and are rendered server-side
   // from the stored job spec.
+  //
+  // The session re-checks its credential every 30 seconds. Once the token is
+  // revoked or expired, or its policies no longer grant the session, the
+  // stream ends with that auth error (`UNAUTHENTICATED` or
+  // `PERMISSION_DENIED`) and the worker-side process is cancelled.
   rpc ExecAllocation (stream ExecClientFrame) returns (stream ExecServerFrame);
 
   // Lists the actions declared on a job's tasks (for CLI + UI discovery).
@@ -818,6 +837,13 @@ service Manager {
   //
   // Read-only mode is the default safety behavior and rejects write statements
   // unless explicitly enabled in the request.
+  //
+  // Private key material and password hashes always read as NULL, in any
+  // statement and however the query reaches them: `signing_key.private_key_pem`,
+  // `net_mesh_ca.key_pem`, and `acl_user.password_hash`. Predicates on those
+  // columns match nothing, and `INSERT ... SELECT` copies NULL.
+  //
+  // ACL: `state:read`, or `state:write` when `allow_write` is set.
   rpc QueryStateStore (QueryStateStoreRequest) returns (QueryStateStoreReply);
 
   // Returns a structured schema snapshot for the manager SQLite state store.
@@ -837,6 +863,10 @@ service Manager {
   // When `after_id` is set, persisted events with `id > after_id` are
   // replayed first, then the live feed continues seamlessly. Clients that
   // disconnect can resume without gaps by passing the last event ID they saw.
+  //
+  // ACL: `operator:read`, re-checked every 30 seconds while the stream runs.
+  // Once the token is revoked or expired, or its policies no longer grant
+  // `operator:read`, the stream ends with that auth error.
   rpc StreamEvents (StreamEventsRequest) returns (stream SchedulerEvent);
 
   // Lists user-saved State Explorer query snippets.
@@ -1003,6 +1033,10 @@ message WorkerPreRegisterRequest {
   //
   // This selects the worker template stored on the manager.
   // No manager-side default is applied by this RPC.
+  //
+  // When the caller authenticates with a join token, this must equal the
+  // worker type the token was minted for; anything else is refused with
+  // `PERMISSION_DENIED` (audit-only mode logs and allows it).
   string worker_type = 1;
 
   // Join token secret (the `secret` field of a decoded join token).
@@ -1125,9 +1159,18 @@ message WorkerPreRegisterReply {
 // Request payload for WorkerRegister.
 message WorkerRegisterRequest {
   // Worker/node ID to register.
+  //
+  // With ACLs enforced, a caller authenticated by a node token (and no join
+  // token) may only re-register its own node; any other name is refused with
+  // `PERMISSION_DENIED`. A join token admits any name.
   string name = 1;
 
   // Pool assigned to this worker.
+  //
+  // With ACLs enforced this must match what the credential pins: the pool of
+  // the join token's worker type, or (for a node-token re-registration) the
+  // node's current pool. A mismatch is refused with `PERMISSION_DENIED`.
+  // Audit-only mode logs the mismatch and allows it.
   string pool = 2;
 
   // JSON object string of node configuration attributes.
@@ -1141,7 +1184,8 @@ message WorkerRegisterRequest {
 
   // Manager-populated defaults on registration (not client-provided):
   // - `status = "active"`
-  // - `availability = "available"`
+  // - `availability = "available"` for a new node; re-registration keeps the
+  //   node's existing availability (a drained node stays drained)
   // - `dynamic_attrs = {}`
   // - `last_heartbeat = ""` until first heartbeat
 
@@ -1253,6 +1297,13 @@ message RunJobRequest {
   // re-applying. This lets clients (especially automated agents) safely retry
   // after a timeout without risking a double submission. Unset disables
   // deduplication.
+  //
+  // Keys are scoped to the RPC and to the caller (the ACL token's accessor
+  // ID, or the principal for JWT and anonymous callers): the same key on a
+  // different RPC, or from a different caller, is a new request and never
+  // replays another caller's reply. The key does not cover the request body.
+  // Records are kept for 24 hours, then pruned; a retry after that is applied
+  // again. Every other RPC's `idempotency_key` follows these rules.
   optional string idempotency_key = 5;
 }
 
@@ -2860,6 +2911,10 @@ message IssueNodeCertificateReply {
 // Request payload for Heartbeat.
 message HeartbeatRequest {
   // Worker/node ID sending heartbeat.
+  //
+  // With ACLs enforced it must match the node token on the request (a
+  // management token may heartbeat for any node); a mismatch is refused with
+  // `PERMISSION_DENIED`.
   string id = 1;
 
   // Allocation IDs currently known/running on worker.
@@ -3313,6 +3368,9 @@ message AllocationHealth {
 // Request payload for HealthCheck.
 message HealthCheckRequest {
   // Worker/node ID submitting health checks.
+  //
+  // With ACLs enforced it must match the node token on the request (see
+  // `HeartbeatRequest.id`).
   string id = 1;
 
   // JSON-encoded node health-check payload.
@@ -4648,7 +4706,8 @@ message ResolveServiceReply {
 message GetArtifactCredentialRequest {
   // Worker/node ID requesting the credential.
   //
-  // Used for audit logging only; the credential value itself is never logged.
+  // With ACLs enforced it must match the node token on the request (see
+  // `HeartbeatRequest.id`). The credential value itself is never logged.
   string node_id = 1;
 
   // KV path holding the credential value (for example: "secrets/ghcr-pull").
@@ -6464,6 +6523,49 @@ service RaftTransport {
   // it. See docs/node-liveness.md.
   rpc ReportNodeLiveness (NodeLivenessDigestRequest)
     returns (NodeLivenessDigestReply);
+
+  // Hands the cluster's KV root key to an existing member that lacks it
+  // (docs/kv-encryption.md).
+  //
+  // A joiner receives the root key in its `Join` reply, but a member that
+  // was already in the cluster when KV encryption arrived (a rolling
+  // upgrade to the first release with encryption) never joins again. Each
+  // manager whose `file` provider has no key calls this on the control-lane
+  // leader, then on the other members, until one answers with a bundle, and
+  // writes the key to its own key file. Any member that holds the key
+  // answers. A member without a key, or whose provider keeps the key to
+  // itself (`exec`), answers with an empty bundle; the answering member
+  // never mints a key for this call.
+  //
+  // The answer is sealed exactly like `JoinRaftClusterReply.root_key_bundle`
+  // (AES-256-GCM under a key derived from the cluster secret, bound to the
+  // cluster id). The caller must be a current member of the control lane.
+  // An older manager answers `Unimplemented`; the caller retries on its next
+  // keyring tick.
+  //
+  // ACL: manager-plane internal, authenticated by cluster secret metadata.
+  // It is not a `Manager` RPC, so it takes no ACL row.
+  rpc FetchRootKey (FetchRootKeyRequest) returns (FetchRootKeyReply);
+}
+
+// Request payload for RaftTransport.FetchRootKey.
+message FetchRootKeyRequest {
+  // The calling manager's string identity (its raft `nodeId`). The answering
+  // member refuses a caller whose derived raft id is not in the control
+  // lane's membership.
+  string node_id = 1;
+}
+
+// Reply payload for RaftTransport.FetchRootKey.
+message FetchRootKeyReply {
+  // The cluster id the bundle is bound to. The caller refuses a bundle for
+  // any cluster but its own.
+  string cluster_id = 1;
+
+  // The root key material, sealed as in `JoinRaftClusterReply`. Empty when
+  // the answering member has no exportable key (none yet, or `exec`). The
+  // caller writes it to its key file only if that file does not exist yet.
+  bytes root_key_bundle = 2;
 }
 
 // One manager's report of the nodes it is hearing from.
@@ -6767,7 +6869,8 @@ message TestNetPolicyReply {
 
 // Request payload for FetchNetPolicy (worker plane).
 message FetchNetPolicyRequest {
-  // Node id of the caller.
+  // Node id of the caller. With ACLs enforced it must match the node token
+  // on the request (see `HeartbeatRequest.id`).
   string node_id = 1;
 
   // Content hash from `HeartbeatReply.net_policies`.

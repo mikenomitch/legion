@@ -1099,6 +1099,68 @@ mod tests {
         Ok(())
     }
 
+    /// Regression (audit W5): the deadline SIGKILL went to the tracked pid
+    /// alone, so a shell-wrapped workload that ignored SIGTERM outlived its
+    /// `sh -c` parent. The hard kill must take the whole process group.
+    #[cfg(unix)]
+    #[test]
+    fn stop_hard_kills_the_whole_process_group() -> R<()> {
+        let temp_dir = tempfile::TempDir::new()?;
+        let pid_file = temp_dir.path().join("server.pid");
+        let plugin = ExecTaskPlugin;
+        let allocation = crate::structs::Allocation {
+            id: 4244,
+            status: "running".into(),
+            resources: json!({}),
+            node_id: "node-1".into(),
+            job_config_id: "job-1".into(),
+            task_config_id: 1,
+            job_id: "job".into(),
+            instance_id: None,
+            network: None,
+        };
+        let task = TaskConfig {
+            config: json!({
+                // The ignored TERM is inherited, so the "server" (sleep)
+                // survives the notice exactly like the shell does.
+                "command": [
+                    "/bin/sh", "-c",
+                    format!("trap '' TERM; sleep 300 & echo $! > {}; wait", pid_file.display()),
+                ],
+            }),
+            ..TaskConfig::new("wrapped", "exec")
+        };
+
+        let mut instance = TaskInstance::default();
+        plugin.start(&allocation, &task, &mut instance)?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let server_pid: u32 = loop {
+            if let Some(pid) = std::fs::read_to_string(&pid_file)
+                .ok()
+                .and_then(|raw| raw.trim().parse().ok())
+            {
+                break pid;
+            }
+            assert!(std::time::Instant::now() < deadline, "server never started");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+
+        plugin.stop(&allocation, &task, &mut instance)?;
+
+        // The orphan, if any, is reparented and reaped asynchronously; a
+        // zombie does not count as alive.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while crate::worker::state::pid_is_running(server_pid) {
+            if std::time::Instant::now() >= deadline {
+                // Do not leak the sleep into the test host.
+                unsafe { libc::kill(server_pid as i32, libc::SIGKILL) };
+                panic!("the shell's child survived the hard kill");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        Ok(())
+    }
+
     /// The `WorkerCgroup` adoption, asserted at the seam a unit test can
     /// reach: the assignment becomes the cgroup the child is spawned into,
     /// and an explicit `config.cgroup` still wins (back-compat).

@@ -69,6 +69,43 @@ jobs:
       - name: Run cargo clippy
         run: cargo clippy --all --all-features --locked -- -D warnings -A dead_code -A unused_variables
 
+  # Mixed-version managers, workers, and CLIs exchange proto messages during a
+  # rolling upgrade (docs/upgrades.md), so a wire-incompatible change to
+  # proto/legion.proto must be deliberate. This compares the PR's proto with the
+  # base branch's using `buf breaking` and the WIRE rules in proto/buf.yaml.
+  # For an intentional break, bump PROTOCOL_VERSION and label the PR
+  # `proto-breaking-ok` to skip the check.
+  proto-breaking:
+    name: Proto Breaking Changes
+    runs-on: ubuntu-latest
+    if: ${{ !contains(github.event.pull_request.labels.*.name, 'proto-breaking-ok') }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Pinned release, verified against its published checksum.
+      - name: Install buf
+        env:
+          BUF_VERSION: 1.50.0
+          BUF_SHA256: 154ea883ce098eac4fa106ff9ee4e4964bb97f809dd8ec9c34a432b466ce1494
+        run: |
+          curl -sSL -o "$RUNNER_TEMP/buf" \
+            "https://github.com/bufbuild/buf/releases/download/v${BUF_VERSION}/buf-Linux-x86_64"
+          echo "${BUF_SHA256}  $RUNNER_TEMP/buf" | sha256sum -c -
+          chmod +x "$RUNNER_TEMP/buf"
+
+      # Extract the base branch's proto into a plain directory rather than
+      # use buf's git input, which needs the base ref cloneable locally.
+      - name: Check against the base branch
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          git fetch --no-tags --depth=1 origin "$BASE_SHA"
+          mkdir -p "$RUNNER_TEMP/base-proto"
+          git show "$BASE_SHA:proto/legion.proto" > "$RUNNER_TEMP/base-proto/legion.proto"
+          "$RUNNER_TEMP/buf" breaking proto --against "$RUNNER_TEMP/base-proto"
+
   ui-build:
     name: UI Build
     runs-on: ubuntu-latest

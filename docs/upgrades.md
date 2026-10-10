@@ -9,7 +9,9 @@ the fleet.
 Always upgrade in this order:
 
 1. **Managers.** Upgrade every manager to the new release (rolling, one at a
-   time in an HA deployment).
+   time in an HA deployment). In a raft cluster, upgrade the followers first
+   and the leader last. See
+   [Rolling upgrades across a schema change](#rolling-upgrades-across-a-schema-change).
 2. **Workers.** Once all managers run the new release, upgrade workers at
    whatever pace suits the workloads (drain and replace, or restart in place.
    See `legion node drain`).
@@ -18,6 +20,39 @@ The protocol handshake (below) enforces this order. Managers stay compatible
 with every worker protocol version up to their own. They cannot promise to
 satisfy a contract newer than they know about, so a worker upgraded before
 its managers is rejected at registration.
+
+## Stopping a manager
+
+Restart managers with SIGTERM (or Ctrl-C, which sends SIGINT). That's what
+`systemctl stop` and Kubernetes send. The manager then stops in order:
+
+1. It stops accepting connections and gives in-flight RPCs and open streams
+   (event streams, worker connections) up to 10 seconds to finish.
+2. It stops its background loops (eval workers, node checker, keyring and
+   identity rotation, the in-process worker), so nothing writes to a store
+   that is shutting down.
+3. It stops persistence, with up to 15 seconds for this step. In `streaming`
+   mode it runs one final replica sync and then releases the object-storage
+   lease, so a standby that takes over finds every committed write. In
+   `raft` mode it shuts each lane's raft core down cleanly.
+4. It exits with status 0.
+
+The whole sequence fits in Kubernetes' default 30-second termination grace
+period. A second SIGTERM or SIGINT during the drain skips the rest and exits
+immediately.
+
+Raft leadership is not handed off before exit. openraft 0.9 has no
+leadership-transfer API, so the remaining managers elect a new leader after
+their election timeout, the same as after a crash. Writes to lanes the
+stopped manager led pause for that window, so restart managers one at a
+time and wait for `legion raft status` to show a leader before the next.
+
+A manager whose gRPC listener fails to bind (the port is taken, or the TLS
+certificate can't be loaded) or stops serving exits with a non-zero status
+and `manager gRPC server on <addr> failed`. Run managers under a supervisor
+that restarts them. The manager doesn't keep scheduling without an API,
+because nothing could reach it and, in raft mode, it would have no raft
+transport.
 
 ## The `protocol_version` contract
 
@@ -35,6 +70,14 @@ worker-plane RPCs (registration, heartbeats, health checks, work dispatch).
 That means removed or renamed fields, changed field semantics, or new
 required behavior an old peer cannot satisfy. Additive, backward-compatible
 fields do not change it.
+
+CI guards the wire contract. Every pull request runs
+[`buf breaking`](https://buf.build/docs/breaking/) with the `WIRE` rules in
+`proto/buf.yaml`, comparing `proto/legion.proto` against the base branch. It
+fails on renumbered, retyped, or deleted fields (a removed field's number
+must be `reserved`) and on removed RPCs. Renaming a field passes, since only
+its number goes on the wire. For a deliberate break, bump `PROTOCOL_VERSION`
+and label the PR `proto-breaking-ok`.
 
 The manager decides whether to admit a worker at registration:
 
@@ -118,6 +161,15 @@ declaration) is refused at load with a message that tells you to rebuild.
 See [task-runtime-plugins.md](task-runtime-plugins.md). Rebuild out-of-tree
 task plugins as part of any worker upgrade.
 
+Every dylib plugin kind (tasks, scheduling, rollouts, node checks, artifact
+fetchers) also carries a build fingerprint: the `rustc` version, the `legion`
+version, and the layout of the types it shares with the host. Any upgrade that
+changes the `legion` version or the toolchain changes the fingerprint, so
+rebuild every dylib plugin with the new binary, managers included (rollout
+and scheduling plugins load there). A stale plugin is refused at load instead
+of crashing the process. See
+[plugin-system.md](plugin-system.md#build-fingerprint-required-for-dynamic-plugins).
+
 ## Build-version skew expectations
 
 `build_version` is informational and never causes rejection. Only
@@ -166,6 +218,12 @@ service. During a rolling manager upgrade, the plane tolerates skew:
   old manager leading the status lane while a new one holds the display
   checkpoint is the one unsafe combination. It resolves within one lost
   window. See [node-liveness.md](node-liveness.md).
+- The root key fetch (`FetchRootKey`, see
+  [kv-encryption.md](kv-encryption.md#multi-manager-raft-clusters)) asks the
+  leader first, then the other members. An older manager answers
+  `Unimplemented` and the caller moves on to the next member, or retries on
+  its next keyring tick. It succeeds as soon as any upgraded member holds
+  the key.
 - Adaptive heartbeat cadence is on by default, and the leader relays its
   served interval to the other managers on the liveness digest reply. An
   older manager neither relays nor serves an interval, so workers attached
@@ -197,6 +255,52 @@ service. During a rolling manager upgrade, the plane tolerates skew:
   the binary, which the manager refuses to open. Run
   `legion keyring rewrap --plaintext` first, then restore a pre-upgrade
   backup.
+
+### Rolling upgrades across a schema change
+
+Raft entries are SQLite changesets: the exact rows a write changed, with
+the columns the leader's schema has. A manager on an older release cannot
+hold rows for a column or table its schema does not have yet. SQLite itself
+does not fail on that. It skips the rows and reports success, so without a
+guard an older manager would fall silently out of step with the cluster.
+Legion refuses instead, in two places:
+
+- **The leader refuses the write.** Every transport reply carries the
+  answering manager's schema version (`x-legion-schema-version`). Before it
+  proposes a write, a leader checks it against the schema of every member
+  that reports an older version. A write that member could not apply fails
+  on the leader, nothing is committed, and the error names the member:
+
+  ```
+  raft op put_kv needs a schema that manager mgr-c does not have yet (table
+  `kv_entry` has 6 columns where the change has 7 on schema version 127;
+  this leader runs schema version 129). The write was not applied anywhere.
+  Finish the rolling manager upgrade (docs/upgrades.md), or move leadership
+  to a manager on the older release until then
+  ```
+
+  Writes that only touch tables the release did not change go through. A
+  member that runs a build from before the schema-version header counts as
+  behind on every table, so a newer leader refuses every write until it is
+  upgraded.
+- **An older manager refuses the entry.** If an entry it cannot apply
+  reaches it anyway (for example, it was down when the leader checked), the
+  older manager stops that raft lane with an error that says to upgrade it.
+  The entry is not applied, so after the upgrade and restart the lane
+  resumes from it with nothing lost. A member stopped this way does not
+  count toward quorum until it is upgraded.
+
+An older leader's writes always apply on newer managers, because a newer
+schema only adds columns and tables. That gives the safe order:
+
+1. Upgrade the followers one at a time. Wait for each to rejoin and catch
+   up (`legion raft status`) before the next.
+2. Upgrade the leader last. Leadership moves to an upgraded manager, and by
+   then every member runs the new schema.
+
+If an upgraded manager takes leadership while an older one is still
+running, writes that need the new schema fail with the error above until
+you finish the upgrade. Nothing diverges in the meantime.
 
 ## Raft persistence upgrades
 

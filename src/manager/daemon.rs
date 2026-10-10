@@ -23,7 +23,7 @@ use tokio::sync::Notify;
 use tokio::task::JoinSet;
 use tonic::transport::{Identity, Server, ServerTlsConfig};
 use tonic_web::GrpcWebLayer;
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 
 // Fallback poll interval used only when delay calculation fails.
 const IDLE_POLL_INTERVAL: Duration = Duration::from_secs(30);
@@ -36,6 +36,15 @@ const ERROR_BACKOFF_MAX: Duration = Duration::from_secs(30);
 // (eval workers, node status checker). Bounds the takeover delay after a
 // leadership change to "a few seconds" (plan JC-15).
 const LEADER_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+/// How long a keyed mutation's idempotency record is kept. Retries within
+/// this window are deduplicated; after it, the same key runs again. A day
+/// covers any client retry loop, matching common API practice.
+pub const IDEMPOTENCY_KEY_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// How often the control-lane leader prunes idempotency records older than
+/// `IDEMPOTENCY_KEY_TTL`, so records live between 24 and 25 hours.
+const IDEMPOTENCY_PRUNE_INTERVAL: Duration = Duration::from_secs(60 * 60);
 // Base delay before re-running an eval whose handler hit a foreign-lane
 // NotRaftLeader rejection (divergent lane leadership) — long enough for the
 // engine's JC-40 lane-convergence loop (or an election) to move leadership,
@@ -173,7 +182,8 @@ pub async fn run_manager_with(
     // manager config row would go stale. Re-run them on every leadership
     // ACQUISITION — tracked independently per lane, because control and
     // scheduler leadership can move separately under `lanes` topology.
-    if store.raft_status().is_some() {
+    // Streaming standbys take over the same way when they win the lease.
+    if store.raft_status().is_some() || store.persistence_status().backend == "streaming" {
         let watch_store = store.clone();
         let watch_config = config.clone();
         let watch_full_config = full_config.clone();
@@ -222,6 +232,8 @@ pub async fn run_manager_with(
     let store_copy_b = store.clone();
 
     let store_for_keyring = store.clone();
+
+    let store_for_shutdown = store.clone();
 
     // Workload identity (OIDC issuer): only constructed when enabled. The
     // signing keys are restored from (or first-boot persisted to) the store,
@@ -315,6 +327,26 @@ pub async fn run_manager_with(
         warn!("ACLs are disabled; every API caller has full access (set acl.enabled to true to enforce)");
     }
 
+    // Idempotency records only need to outlive a client's retry window;
+    // without this the table grows by one row per keyed mutation forever.
+    // Control-lane leader only (always true outside raft mode): the delete
+    // is a replicated write.
+    let idempotency_store = store.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(IDEMPOTENCY_PRUNE_INTERVAL).await;
+            if !idempotency_store.is_raft_leader(crate::storage::Lane::Control) {
+                continue;
+            }
+            let cutoff = OffsetDateTime::now_utc() - IDEMPOTENCY_KEY_TTL;
+            match idempotency_store.prune_idempotency_records(cutoff) {
+                Ok(0) => {}
+                Ok(pruned) => info!(pruned, "Pruned expired idempotency records"),
+                Err(err) => warn!(error = ?err, "Failed pruning idempotency records"),
+            }
+        }
+    });
+
     // The in-process worker (--run-worker) registers like any external
     // worker; with ACLs enforced the manager self-issues its join token.
     let local_worker_join_secret = if run_worker && authenticator.enabled {
@@ -369,6 +401,9 @@ pub async fn run_manager_with(
     let exec_ws_state = crate::manager::exec_ws::ExecWsState {
         store: store.clone(),
         auth: authenticator.clone(),
+        origins: Arc::new(crate::manager::origin::OriginPolicy::new(
+            &full_config.server.allowed_origins,
+        )),
     };
 
     // Manager-plane raft transport shares this tonic listener. The service
@@ -394,7 +429,8 @@ pub async fn run_manager_with(
         .with_authenticator(authenticator)
         .with_advertise_addr(full_config.server.advertised_address());
 
-    let addr = format!("{}:{}", full_config.server.host, full_config.server.port).parse()?;
+    let addr: std::net::SocketAddr =
+        format!("{}:{}", full_config.server.host, full_config.server.port).parse()?;
 
     // Exec WebSocket listener on the next port (browsers cannot do bidi
     // streaming over gRPC-Web; tonic's listener does not do HTTP upgrades).
@@ -462,8 +498,19 @@ pub async fn run_manager_with(
     };
 
     let manager_service = ManagerServer::new(manager_node);
+    // Browser origins (docs/ui-architecture.md): loopback plus
+    // `server.allowedOrigins`. The guard refuses everything else before any
+    // handler runs; CORS only echoes the allowed origin back.
+    let origin_policy = Arc::new(crate::manager::origin::OriginPolicy::new(
+        &full_config.server.allowed_origins,
+    ));
+    let cors_policy = origin_policy.clone();
     let cors = CorsLayer::new()
-        .allow_origin(Any)
+        .allow_origin(AllowOrigin::predicate(move |origin, _| {
+            origin
+                .to_str()
+                .is_ok_and(|origin| cors_policy.allows(origin))
+        }))
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
         .allow_headers(Any)
         .expose_headers([
@@ -477,15 +524,22 @@ pub async fn run_manager_with(
     // identity disabled it is a pure passthrough and mounts no routes.
     // The metrics layer sits innermost (after grpc-web translation) so the
     // method label reflects the real gRPC route for browser calls too.
+    let (stop_serving_tx, stop_serving_rx) = tokio::sync::oneshot::channel::<()>();
     let start_server_fut = server_builder
         .accept_http1(true)
         .layer(OidcHttpLayer::new(workload_identity_state.clone()))
+        .layer(crate::manager::origin::OriginGuardLayer::new(
+            origin_policy.clone(),
+        ))
         .layer(cors)
         .layer(GrpcWebLayer::new())
         .layer(crate::manager::telemetry::GrpcMetricsLayer)
         .add_service(manager_service)
         .add_service(raft_transport_service)
-        .serve(addr);
+        .serve_with_shutdown(addr, async move {
+            // A dropped sender also stops the server; both mean "shut down".
+            let _ = stop_serving_rx.await;
+        });
 
     println!("Manager node starting on {addr}");
 
@@ -521,17 +575,150 @@ pub async fn run_manager_with(
         Ok::<(), anyhow::Error>(())
     };
     let keyring_fut = start_keyring_maintenance(store_for_keyring);
-    let _res = join!(
-        start_server_fut,
-        node_checker_fut,
-        eval_loop_fut,
-        worker_fut,
-        rotation_fut,
-        keyring_fut
-    );
+    // The background loops run as one task the daemon can abort: without an
+    // API and raft transport they must not keep acting on the cluster.
+    let background = tokio::spawn(async move {
+        let (checker, evals, worker, rotation, keyring) = join!(
+            node_checker_fut,
+            eval_loop_fut,
+            worker_fut,
+            rotation_fut,
+            keyring_fut
+        );
+        for (name, result) in [
+            ("node status checker", checker),
+            ("eval loop", evals),
+            ("in-process worker", worker),
+            ("workload identity rotation", rotation),
+            ("keyring maintenance", keyring),
+        ] {
+            if let Err(err) = result {
+                error!(loop_name = name, error = ?err, "Manager background loop exited");
+            }
+        }
+    });
 
+    // The gRPC listener is the manager: it carries the API and, in raft mode,
+    // the raft transport. If it fails to bind (port taken, bad TLS material)
+    // or stops serving, exit non-zero so a supervisor restarts the process,
+    // rather than keep scheduling as a headless manager nobody can reach.
+    tokio::pin!(start_server_fut);
+    let signal = tokio::select! {
+        serve_result = &mut start_server_fut => {
+            background.abort();
+            let err = manager_server_exit_error(&addr, serve_result);
+            shutdown_persistence(&store_for_shutdown).await;
+            return Err(err);
+        }
+        signal = shutdown_signal() => signal,
+    };
+
+    // Graceful shutdown (SIGTERM/SIGINT). Each step is bounded, so a stuck
+    // stream or store can delay the exit but never prevent it. A second
+    // signal skips the rest.
+    info!(signal, "Manager shutdown requested; draining");
+    let _ = stop_serving_tx.send(());
+    tokio::select! {
+        drained = tokio::time::timeout(SHUTDOWN_DRAIN_TIMEOUT, &mut start_server_fut) => {
+            if drained.is_err() {
+                warn!(
+                    timeout_secs = SHUTDOWN_DRAIN_TIMEOUT.as_secs(),
+                    "Open RPCs and streams did not finish in time; closing them"
+                );
+            }
+        }
+        second = shutdown_signal() => {
+            warn!(signal = second, "Second shutdown signal; exiting now");
+            background.abort();
+            return Ok(());
+        }
+    }
+    // Leader-only loops stop before the store does, so nothing proposes
+    // writes into a raft core that is shutting down.
+    background.abort();
+    shutdown_persistence(&store_for_shutdown).await;
+    info!("Manager stopped");
     Ok(())
 }
+
+/// How long a graceful shutdown waits for in-flight RPCs and open streams
+/// (event streams, worker connections) once the listener stops accepting.
+const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Budget for the persistence backend's orderly stop: the final streaming
+/// replica sync plus lease release, or the raft lane shutdown. Drain plus
+/// this stays under Kubernetes' default 30s termination grace period.
+const SHUTDOWN_PERSISTENCE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Resolves with the signal's name on SIGTERM or SIGINT (Ctrl-C).
+async fn shutdown_signal() -> &'static str {
+    let ctrl_c = async {
+        if let Err(err) = tokio::signal::ctrl_c().await {
+            // Without a handler this arm must never fire; SIGTERM still works.
+            warn!(error = ?err, "Failed installing the SIGINT handler");
+            std::future::pending::<()>().await;
+        }
+    };
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => tokio::select! {
+                _ = term.recv() => "SIGTERM",
+                _ = ctrl_c => "SIGINT",
+            },
+            Err(err) => {
+                warn!(error = ?err, "Failed installing the SIGTERM handler");
+                ctrl_c.await;
+                "SIGINT"
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        ctrl_c.await;
+        "SIGINT"
+    }
+}
+
+/// Runs the store's orderly persistence stop on the blocking pool, bounded
+/// by [`SHUTDOWN_PERSISTENCE_TIMEOUT`] (plus a little slack, since the
+/// backend's own bound is best-effort).
+async fn shutdown_persistence(store: &Store) {
+    let store = store.clone();
+    let stop = tokio::task::spawn_blocking(move || {
+        store.shutdown_persistence(SHUTDOWN_PERSISTENCE_TIMEOUT)
+    });
+    let slack = Duration::from_secs(2);
+    if tokio::time::timeout(SHUTDOWN_PERSISTENCE_TIMEOUT + slack, stop)
+        .await
+        .is_err()
+    {
+        warn!("Persistence shutdown did not finish in time; exiting anyway");
+    }
+}
+
+/// The error `run_manager` returns when the gRPC server future resolves.
+/// Serving only ends on failure, so even `Ok` is an error here.
+fn manager_server_exit_error(
+    addr: &std::net::SocketAddr,
+    result: Result<(), tonic::transport::Error>,
+) -> anyhow::Error {
+    let err = match result {
+        Ok(()) => anyhow!("manager gRPC server on {addr} stopped unexpectedly"),
+        Err(err) => {
+            anyhow::Error::new(err).context(format!("manager gRPC server on {addr} failed"))
+        }
+    };
+    error!(error = ?err, "Manager API is down; exiting");
+    err
+}
+
+/// How often the control-lane leader sweeps for KV changes whose debounced
+/// reconciliation was lost (docs/kv-store.md, "Debounce / coalescing"). Far
+/// above the debounce window, so the sweep almost never races a live flush
+/// (and a race is harmless: reconciliation is idempotent).
+const KV_RECONCILE_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 
 /// How often the keyring loop ticks when nothing wakes it earlier.
 const KEYRING_TICK_INTERVAL: Duration = Duration::from_secs(15);
@@ -565,6 +752,14 @@ async fn start_keyring_maintenance(store: Store) -> R<()> {
 pub fn keyring_tick(store: &Store) -> R<()> {
     let keyring = store.keyring();
     let before = keyring.snapshot();
+
+    // A raft member without the root key (it was in the cluster before KV
+    // encryption arrived, so no join reply ever carried it) fetches it from
+    // another member. Before the reload below, so a fetched key unlocks
+    // this same tick.
+    if let Err(err) = store.fetch_root_key_if_missing() {
+        warn!(error = ?err, "Failed fetching the KV root key from another manager");
+    }
 
     // Anything locked, a provider error, or an exec provider (whose reload
     // is deferred to this loop): try to unwrap again.
@@ -957,6 +1152,7 @@ async fn start_node_status_checker(store: Store, config: LivenessCheckerConfig) 
     // leads all lanes — which, with JC-40 convergence running in the
     // engine, is the steady state.
     let mut last_divergent_regen: Option<std::time::Instant> = None;
+    let mut last_kv_sweep: Option<std::time::Instant> = None;
     loop {
         // Leader-only actions (raft mode, per lane): only the STATUS-lane
         // leader may mark nodes lost / sweep health orphans; non-leaders
@@ -1259,6 +1455,22 @@ async fn start_node_status_checker(store: Store, config: LivenessCheckerConfig) 
                     "Synced volume claims a deferred submit half was missing"
                 ),
                 Err(err) => warn!(error = ?err, "Failed syncing missing task volume claims"),
+            }
+        }
+
+        // KV-driven reconciliation safety net: debounced KV events live in
+        // memory on the node that took the write, so a flush error, a crash,
+        // or a leadership change inside the window would otherwise lose
+        // them. The control-lane leader re-derives missed changes from
+        // replicated state (`sweep_missed_kv_changes`).
+        if store.is_raft_leader(crate::storage::Lane::Control)
+            && last_kv_sweep.is_none_or(|at| at.elapsed() >= KV_RECONCILE_SWEEP_INTERVAL)
+        {
+            last_kv_sweep = Some(std::time::Instant::now());
+            match crate::manager::server::sweep_missed_kv_changes(&store) {
+                Ok(0) => {}
+                Ok(jobs) => warn!(jobs, "Reconciled KV changes a debounced flush had missed"),
+                Err(err) => warn!(error = ?err, "Failed sweeping for missed KV changes"),
             }
         }
 
@@ -2288,6 +2500,39 @@ mod tests {
     use super::*;
     use crate::structs::ManagerConfigFull;
     use tempfile::Builder;
+
+    /// Isolated manager config on `port`: temp store, exec and telemetry
+    /// listeners off so only the gRPC port is in play.
+    fn isolated_manager_config(port: u16, store_dir: &std::path::Path) -> R<ManagerConfig> {
+        Ok(serde_json::from_value(serde_json::json!({
+            "server": { "host": "127.0.0.1", "port": port },
+            "storePath": store_dir.to_str().context("temp path is not UTF-8")?,
+            "exec": { "enabled": false },
+            "telemetry": { "enabled": false },
+        }))?)
+    }
+
+    /// M2 regression: a manager whose gRPC listener cannot bind must exit
+    /// with an error instead of running its eval loop and node checker
+    /// headless, with no API and no raft transport.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn manager_exits_with_error_when_grpc_bind_fails_test() -> R<()> {
+        let taken = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let port = taken.local_addr()?.port();
+        let store_dir = Builder::new().prefix("legion-bind-fail-").tempdir()?;
+        let config = isolated_manager_config(port, store_dir.path())?;
+
+        let result = tokio::time::timeout(Duration::from_secs(60), run_manager(config, false))
+            .await
+            .context("run_manager kept running after its gRPC bind failed")?;
+        let err = result.expect_err("a failed bind must fail run_manager");
+        assert!(
+            format!("{err:#}").contains("manager gRPC server on"),
+            "unexpected error: {err:#}"
+        );
+        drop(taken);
+        Ok(())
+    }
 
     /// Adversarial regression (leader-only startup writes): the recovery
     /// writes must re-run exactly on leadership ACQUISITION — a node that

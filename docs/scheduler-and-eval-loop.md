@@ -102,12 +102,17 @@ Dedup-on-claim behavior:
 
 After claiming an eval, other pending evals are deleted when all of these hold:
 
-- same `job_id` or same `node_id`,
 - same kind,
+- same scope: the same `job_id`, `job_config_id`, and `node_id` (an empty
+  field only matches another empty field),
 - already claimable (`ready_at <= now`).
 
 This keeps the queue from filling with redundant work for the same entity.
-It only discards work the claimed eval covers. A `job_reschedule` must not
+It only discards work the claimed eval covers. Node-scoped kinds
+(`node_drain`, `node_lost_reschedule`) carry no job, so they collapse per
+node. Job-scoped kinds collapse per job config, so reschedules for different
+jobs on the same node all run, and a stale tick for an older config never
+sweeps the tick driving a newer rollout. A `job_reschedule` must not
 drop a job's pending `rollout_tick` (ticks re-enqueue themselves, so nothing
 else would drive the rollout forward) or its `job_stop`. An immediate eval
 must not cancel a delayed one either, since a delayed eval is a timer and
@@ -118,7 +123,8 @@ not a queued duplicate (for example, a batch task's next scheduled
 
 `Eval::handle()` supports:
 
-- `node_join`
+- `node_join` (with no node, the capacity pass queued by a worker
+  registration or an uncordon)
 - `node_drop`
 - `job_submit`
 - `job_update`
@@ -127,6 +133,19 @@ not a queued duplicate (for example, a batch task's next scheduled
 - `rollout_tick`
 
 Unsupported kinds fail immediately.
+
+`job_update` (a restart: KV `restart`, `job run --force-reschedule`, a batch
+task's next run) removes all of the job's allocations and then places the
+config fresh. Two guards keep that from leaving a job at zero:
+
+- An update for a stopped job, or for a config the job has moved past (a
+  stale batch follow-up after a resubmit), is skipped before anything is
+  removed. A stale `job_submit` is skipped the same way.
+- When the placement fails for any reason other than a plan conflict or a
+  raft leadership change (both re-run the eval), a `job_reschedule` for the
+  config is queued 5 seconds out, so the eval's failure is not the end of
+  it. A rollback that cannot place the previous version back queues the same
+  retry for that version.
 
 ## Scheduler Entry Points
 
@@ -156,6 +175,28 @@ Legion maintains an epoch per `job_config_id` in `allocation_epoch_partition`.
 5. On successful allocation changes, only that job config epoch is bumped.
 
 This keeps conflicts local, so unrelated jobs can schedule in parallel without invalidating each other's plans.
+
+### Stale plans place nothing
+
+Evals wait in a queue, and a job can change while its eval waits. A
+`job stop` or a newer config does not move the planned config's epoch, so
+the planner checks separately that the config is still wanted, once before
+planning and again inside the apply transaction. A config is wanted when its
+job exists and is not stopped, and the config is one of these:
+
+- the job's latest config,
+- an older config that still has allocations of its own (a staged rollout's
+  floor, or a rollout stopped part way), so a lost node is still replaced in
+  kind,
+- the source of a rollout to the latest config that has not completed. A
+  live rollout's rollback re-places it, and a failed or cancelled rollout
+  left it running.
+
+A plan that fails the check places nothing and the eval completes normally.
+The apply-time rejection is recorded as an `allocation.plan_rejected` event with a
+reason starting `plan no longer wanted:`. For example, a delayed reschedule
+that fires after `legion job stop`, or a reschedule for v1 that runs after
+the v2 rollout finished, is a no-op instead of placing the full count.
 
 The plan submission and its apply run as **one replicated store op**
 (`Store::submit_and_apply_plan` / `submit_and_apply_plan_with_candidates`).
@@ -609,9 +650,9 @@ patterns.
 
 ## Known Boundaries
 
-- Queue dedupe is scoped to job/node IDs plus kind, not full payload
-  equivalence. Two `job_reschedule` evals for the same job collapse even when
-  they were enqueued for different reasons.
+- Queue dedupe is scoped to the job, config, and node IDs plus kind, not full
+  payload equivalence. Two `job_reschedule` evals for the same job config and
+  node collapse even when they were enqueued for different reasons.
 - With a replicated (raft) store, the eval queue is replicated, but only the
   scheduler lane's leader claims and runs evals. Other managers do not share
   eval work.

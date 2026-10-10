@@ -392,10 +392,17 @@ In `single` topology:
 
 - Every `snapshotEntries` (default 10 000) applied entries, the engine
   builds a snapshot. It is a `VACUUM INTO` image of the whole state DB,
-  taken under an exclusive hold that blocks captures and applies. The image
-  is transactionally consistent **and contains its own applied-index
-  marker** (the `raft_applied` table is inside the image). Metadata goes in
-  a `.meta.json` sidecar. The two newest snapshots are kept.
+  read on its own connection, so writes keep committing while it is built.
+  The image is one read of committed state, so it is transactionally
+  consistent **and contains its own applied-index marker** (the
+  `raft_applied` table is inside the image). Metadata goes in a
+  `.meta.json` sidecar. The two newest snapshots are kept.
+- **Snapshots are held in memory.** The engine's snapshot API passes the
+  image as one in-memory buffer, so building, serving, and installing a
+  snapshot each hold a full copy of the image in the manager's memory (and
+  a catching-up follower receives it in chunks into memory). Budget
+  manager memory for at least two copies of `store.sqlite`. Install also
+  blocks writes on the installing follower while it replaces its state DB.
 - The raft log is purged behind each snapshot, keeping a tail
   (`snapshotEntries / 2`, capped at 1000). A slightly-behind follower
   catches up by cheap log replay. Anything older is served by snapshot
@@ -418,7 +425,8 @@ In `single` topology:
 In `lanes` topology, the policy, compaction, retention, and recovery are the
 same **per lane**, but the snapshot's scope differs. A whole-DB image would
 overwrite the sibling lanes' tables on install. So a lane's snapshot is a
-logical dump of only the tables that lane owns. The control lane also
+logical dump of only the tables that lane owns, read in one read
+transaction alongside the lane's applied marker. The control lane also
 carries the shared insert-only tables. Install is one transaction that
 replaces those tables' rows and writes the lane's applied marker. Tables
 owned by other lanes are never touched, and the dump's manifest is checked

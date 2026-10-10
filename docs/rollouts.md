@@ -152,6 +152,35 @@ Manual progression health visibility:
 - CLI `job rollout status --id <id>` prints group and allocation health/status.
 - UI Rollouts detail page shows per-allocation state and health.
 
+## After a rollout fails, rolls back, or is stopped
+
+A rollout that ends in `failed` or `cancelled` leaves the job's latest config
+pointing at the new version, whatever is actually running. The manager's
+background reconciliation (the pass a new raft leader runs, see
+[scheduler-and-eval-loop.md](scheduler-and-eval-loop.md)) converges what the
+rollout left behind instead of the latest config:
+
+- **Rolled back** (or failed before placing anything): the new version has no
+  allocations, so the previous version is what runs. A rollback removes the
+  new version first. If the previous version then cannot be placed back (no
+  capacity, a lost conflict race), a `job_reschedule` for the previous
+  version is queued 5 seconds out. An automatic rollback still ends the
+  rollout `failed`. A `StopRollout` with `revert` returns the error and
+  leaves the rollout in its current status, so retry the stop. Reconciliation tops up
+  the previous version, for example after a node loss. It never re-places the
+  rolled-back version.
+- **Failed after replacing everything**: only the new version runs, and
+  reconciliation keeps it at count.
+- **Stopped part way without a revert** (`stop` with `revert = false`): the
+  mix of old and new allocations stays as it is. Reconciliation does not
+  pick a side. Resubmit the job or start a new rollout to move it.
+
+Known limitation: a rollback does not create a new job version. Paths that
+act on the job's latest config still target the rolled-back version. A forced
+reschedule of an unchanged spec (`job run --force-reschedule`), a KV-triggered
+restart, and `legion job scale` all place the latest config. To move a
+rolled-back job forward, submit a corrected spec.
+
 ## Capacity blocking and incomplete completion
 
 When replacements cannot place:

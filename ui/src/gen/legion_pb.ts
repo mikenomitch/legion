@@ -214,6 +214,10 @@ export class WorkerPreRegisterRequest extends Message<WorkerPreRegisterRequest> 
    * This selects the worker template stored on the manager.
    * No manager-side default is applied by this RPC.
    *
+   * When the caller authenticates with a join token, this must equal the
+   * worker type the token was minted for; anything else is refused with
+   * `PERMISSION_DENIED` (audit-only mode logs and allows it).
+   *
    * @generated from field: string worker_type = 1;
    */
   workerType = "";
@@ -506,12 +510,21 @@ export class WorkerRegisterRequest extends Message<WorkerRegisterRequest> {
   /**
    * Worker/node ID to register.
    *
+   * With ACLs enforced, a caller authenticated by a node token (and no join
+   * token) may only re-register its own node; any other name is refused with
+   * `PERMISSION_DENIED`. A join token admits any name.
+   *
    * @generated from field: string name = 1;
    */
   name = "";
 
   /**
    * Pool assigned to this worker.
+   *
+   * With ACLs enforced this must match what the credential pins: the pool of
+   * the join token's worker type, or (for a node-token re-registration) the
+   * node's current pool. A mismatch is refused with `PERMISSION_DENIED`.
+   * Audit-only mode logs the mismatch and allows it.
    *
    * @generated from field: string pool = 2;
    */
@@ -808,6 +821,13 @@ export class RunJobRequest extends Message<RunJobRequest> {
    * re-applying. This lets clients (especially automated agents) safely retry
    * after a timeout without risking a double submission. Unset disables
    * deduplication.
+   *
+   * Keys are scoped to the RPC and to the caller (the ACL token's accessor
+   * ID, or the principal for JWT and anonymous callers): the same key on a
+   * different RPC, or from a different caller, is a new request and never
+   * replays another caller's reply. The key does not cover the request body.
+   * Records are kept for 24 hours, then pruned; a retry after that is applied
+   * again. Every other RPC's `idempotency_key` follows these rules.
    *
    * @generated from field: optional string idempotency_key = 5;
    */
@@ -6952,6 +6972,10 @@ export class HeartbeatRequest extends Message<HeartbeatRequest> {
   /**
    * Worker/node ID sending heartbeat.
    *
+   * With ACLs enforced it must match the node token on the request (a
+   * management token may heartbeat for any node); a mismatch is refused with
+   * `PERMISSION_DENIED`.
+   *
    * @generated from field: string id = 1;
    */
   id = "";
@@ -8019,6 +8043,9 @@ export class AllocationHealth extends Message<AllocationHealth> {
 export class HealthCheckRequest extends Message<HealthCheckRequest> {
   /**
    * Worker/node ID submitting health checks.
+   *
+   * With ACLs enforced it must match the node token on the request (see
+   * `HeartbeatRequest.id`).
    *
    * @generated from field: string id = 1;
    */
@@ -12877,7 +12904,8 @@ export class GetArtifactCredentialRequest extends Message<GetArtifactCredentialR
   /**
    * Worker/node ID requesting the credential.
    *
-   * Used for audit logging only; the credential value itself is never logged.
+   * With ACLs enforced it must match the node token on the request (see
+   * `HeartbeatRequest.id`). The credential value itself is never logged.
    *
    * @generated from field: string node_id = 1;
    */
@@ -19009,6 +19037,101 @@ export class StartClaimReply extends Message<StartClaimReply> {
 }
 
 /**
+ * Request payload for RaftTransport.FetchRootKey.
+ *
+ * @generated from message legion.FetchRootKeyRequest
+ */
+export class FetchRootKeyRequest extends Message<FetchRootKeyRequest> {
+  /**
+   * The calling manager's string identity (its raft `nodeId`). The answering
+   * member refuses a caller whose derived raft id is not in the control
+   * lane's membership.
+   *
+   * @generated from field: string node_id = 1;
+   */
+  nodeId = "";
+
+  constructor(data?: PartialMessage<FetchRootKeyRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.FetchRootKeyRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "node_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): FetchRootKeyRequest {
+    return new FetchRootKeyRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): FetchRootKeyRequest {
+    return new FetchRootKeyRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): FetchRootKeyRequest {
+    return new FetchRootKeyRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: FetchRootKeyRequest | PlainMessage<FetchRootKeyRequest> | undefined, b: FetchRootKeyRequest | PlainMessage<FetchRootKeyRequest> | undefined): boolean {
+    return proto3.util.equals(FetchRootKeyRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for RaftTransport.FetchRootKey.
+ *
+ * @generated from message legion.FetchRootKeyReply
+ */
+export class FetchRootKeyReply extends Message<FetchRootKeyReply> {
+  /**
+   * The cluster id the bundle is bound to. The caller refuses a bundle for
+   * any cluster but its own.
+   *
+   * @generated from field: string cluster_id = 1;
+   */
+  clusterId = "";
+
+  /**
+   * The root key material, sealed as in `JoinRaftClusterReply`. Empty when
+   * the answering member has no exportable key (none yet, or `exec`). The
+   * caller writes it to its key file only if that file does not exist yet.
+   *
+   * @generated from field: bytes root_key_bundle = 2;
+   */
+  rootKeyBundle = new Uint8Array(0);
+
+  constructor(data?: PartialMessage<FetchRootKeyReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.FetchRootKeyReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "cluster_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "root_key_bundle", kind: "scalar", T: 12 /* ScalarType.BYTES */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): FetchRootKeyReply {
+    return new FetchRootKeyReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): FetchRootKeyReply {
+    return new FetchRootKeyReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): FetchRootKeyReply {
+    return new FetchRootKeyReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: FetchRootKeyReply | PlainMessage<FetchRootKeyReply> | undefined, b: FetchRootKeyReply | PlainMessage<FetchRootKeyReply> | undefined): boolean {
+    return proto3.util.equals(FetchRootKeyReply, a, b);
+  }
+}
+
+/**
  * One manager's report of the nodes it is hearing from.
  *
  * @generated from message legion.NodeLivenessDigestRequest
@@ -20249,7 +20372,8 @@ export class TestNetPolicyReply extends Message<TestNetPolicyReply> {
  */
 export class FetchNetPolicyRequest extends Message<FetchNetPolicyRequest> {
   /**
-   * Node id of the caller.
+   * Node id of the caller. With ACLs enforced it must match the node token
+   * on the request (see `HeartbeatRequest.id`).
    *
    * @generated from field: string node_id = 1;
    */

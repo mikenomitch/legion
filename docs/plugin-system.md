@@ -21,7 +21,9 @@ The main trade-off of in-process plugins is weaker reliability and isolation:
 - **Memory safety and ABI mistakes are dangerous** because dynamic loading requires unsafe FFI boundaries.
 - **Version drift can break loading** if plugin and host disagree on API expectations.
 
-To reduce this risk, Legion validates plugin manifests (kind, name, API version) before loading.
+To reduce this risk, Legion validates plugin manifests (kind, name, API version)
+and checks each library's [build fingerprint](#build-fingerprint-required-for-dynamic-plugins)
+before it calls any plugin code.
 
 ## How Plugin Loading Works
 
@@ -82,7 +84,63 @@ catch a library built against an older version whose manifest claims the
 current one. A struct-layout mismatch across the `dylib` boundary is undefined
 behavior. In practice you get a `SIGBUS` at first use instead of a clean error.
 For this reason the version changes for layout changes as well as signature
-changes.
+changes. The build fingerprint below catches what this hand-bumped number
+can't.
+
+### Build fingerprint (required for dynamic plugins)
+
+Plugins return `Box<dyn Trait>` and pass Rust types such as `serde_json::Value`
+across the boundary. Rust has no stable ABI, so a plugin is only sound when it
+was built by the same `rustc`, against the same `legion` crate version, with
+the same layout for every shared type. A plugin built with a different
+toolchain, or whose own `Cargo.lock` resolves `serde_json` to a different
+version or turns on `serde_json/preserve_order`, would otherwise load fine and
+then corrupt memory.
+
+Every plugin exports a fingerprint of the build it came from, next to its `get`
+constructor:
+
+```rust
+legion::declare_plugin_abi!();
+
+#[no_mangle]
+pub extern "C" fn get() -> Box<dyn SchedulingPolicy> { Box::new(MyPolicy) }
+```
+
+Task plugins call `legion::declare_task_plugin_abi!()` instead, which includes
+it. Before it calls `get`, the host compares the plugin's fingerprint with its
+own and refuses the plugin when they differ:
+
+```text
+scheduling plugin random was built differently from this legion binary and cannot be
+loaded safely: Rust plugins have no stable ABI. Plugin: rustc 1.96.0 (...) [...];
+legion-rs 0.1.0; target aarch64-apple-darwin; panic=unwind (fingerprint ...). Host: ...
+```
+
+A plugin that exports no fingerprint is refused too, with an error naming the
+macro to add. The fingerprint hashes:
+
+- the `rustc` version and commit hash,
+- the `legion` crate name and version,
+- the target triple and panic strategy,
+- the size and alignment of the types that cross the boundary (`Value`,
+  `Map`, `anyhow::Error`, `Allocation`, `TaskConfig`, `JobConfig`,
+  `TaskInstance`, `StopContext`, and a few std types), which catches
+  dependency versions or features that change their layout.
+
+The build profile is not part of it, so a debug `legion` loads release
+plugins. To fix a mismatch, rebuild the plugin with the host's `rustc` against
+the same `legion` source, and keep its `Cargo.lock` in step with the host's.
+The `LEGION_BUILD_PLUGINS=1` build does the first two for you.
+
+Known limitations:
+
+- This is a guard, not a stable ABI. Two builds with equal fingerprints are
+  trusted to agree on layout. That holds for the same compiler, crate
+  versions, and features, but a dependency change that keeps every probed
+  type's size and alignment while reordering fields would get past it.
+- Plugins still run in-process. Rollout strategy plugins run inside the
+  manager, so a buggy one can crash it.
 
 ## Plugin Types Implemented Today
 
@@ -243,6 +301,10 @@ collide on a host that runs both:
   under `target/plugin-build/...`.
 - At runtime, dynamic loading still looks in plugin crate-local paths such as
   `plugins/<kind>/<name>/target/release/lib<name>.<ext>`.
+- `build.rs` also records the `rustc` version, crate version, target, and
+  panic strategy for the [build fingerprint](#build-fingerprint-required-for-dynamic-plugins).
+  It runs in both the host and plugin builds, since plugins depend on the
+  `legion` crate.
 
 This lets normal core builds skip the cost of building plugins.
 

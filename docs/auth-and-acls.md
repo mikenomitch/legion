@@ -53,9 +53,20 @@ legion acl whoami
 
 Actions are `read` and `write`. `write` does not imply `read`, so grant both.
 Grant `state:read` sparingly, since it can read every table in the state
-store. The one thing it cannot read is KV values. Those are stored encrypted
-([KV Encryption at Rest](kv-encryption.md)), so raw SQL sees ciphertext. A
-`kv` rule scoped by `paths` is the only way to read a value.
+store, including ACL metadata. What it cannot read:
+
+- KV values. Those are stored encrypted
+  ([KV Encryption at Rest](kv-encryption.md)), so raw SQL sees ciphertext. A
+  `kv` rule scoped by `paths` is the only way to read a value.
+- Private keys and password hashes. `signing_key.private_key_pem` (the
+  workload-identity and boot-ticket signing keys), `net_mesh_ca.key_pem` (the
+  mesh CA key), and `acl_user.password_hash` always read as `NULL` through
+  raw SQL, however the query reaches them. A `WHERE` clause on them matches
+  nothing, and `INSERT ... SELECT` copies `NULL`.
+
+`state:write` is still equivalent to full control of the cluster: it can
+rewrite any row, including ACL tokens and policies. State backups
+(`GetStateBackup`, `operator:write`) are the whole database, keys included.
 
 ### Policies
 
@@ -164,6 +175,12 @@ token (created or login-minted) must then expire within the bound. Management
 tokens are exempt. Expired ACL and join tokens are rejected at
 authentication time and pruned hourly.
 
+Long-lived streams (`StreamEvents` and exec sessions, including the UI's exec
+WebSocket) re-check their credential every 30 seconds. Revoking or expiring a
+token, or removing the policy that granted the stream, closes the stream
+within that interval with the same `Unauthenticated` or `PermissionDenied`
+error a new request would get.
+
 For infrastructure-as-code, `legion acl bootstrap --secret <value>` (min 24
 chars) pre-seeds the initial management token instead of generating a random
 one.
@@ -269,12 +286,32 @@ When ACLs are enforced:
 - Registration mints a per-node **worker token** (returned in the reply) that
   the worker attaches to `Heartbeat`/`HealthCheck`. Node tokens grant nothing
   on the user-facing API.
+- A join token only admits its own worker type. Pre-registering as another
+  type, or registering into a pool other than that type's pool, fails with
+  `PermissionDenied`.
+- A node token only speaks for its own node. Every worker-plane RPC that names
+  a node (`Heartbeat`, `HealthCheck`, `FetchNetPolicy`,
+  `GetArtifactCredential`, `RatifyClaim`, and the identity and certificate
+  issuers) refuses a node id that does not match the token with
+  `PermissionDenied`. A node token can re-register its own node in its current
+  pool, but not any other node. Management tokens act for any node.
 - Re-registering rotates the node token. If a heartbeat comes back
   `Unauthenticated`, the worker automatically re-registers using its join
   secret.
-- In `auditOnly` mode, workers without join tokens are admitted but logged.
+- A join token admits any node name, including the name of a node that is
+  already registered. Treat join secrets like node credentials: give them
+  short TTLs and revoke them once the fleet has joined.
+- In `auditOnly` mode, workers without join tokens are admitted but logged,
+  and so are the worker-type, pool, and node-id mismatches above. The two
+  identity-token issuers refuse a foreign node id even in audit-only mode.
   Use this to migrate fleets that predate ACLs: enable audit mode, restart
   workers onto join tokens at your own pace, then enforce.
+
+Browsers are also limited by origin, with or without ACLs: the gRPC-Web API
+and the exec WebSocket only answer loopback origins and those listed in
+`server.allowedOrigins` (see
+[UI Architecture](ui-architecture.md#allowed-browser-origins)). With ACLs off
+this is the only thing that stops a web page from driving a local manager.
 
 The worker plane does not support mTLS yet. The listener-level TLS below
 already covers transport encryption.

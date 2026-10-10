@@ -73,7 +73,9 @@ Worker startup (`run_worker`) flow:
    carries a per-node token that the worker attaches to all later
    worker-plane calls. Re-registering rotates the token. If a heartbeat comes
    back Unauthenticated, the worker re-registers with its join secret
-   automatically.
+   automatically. Re-registration keeps the node's availability, so a
+   drained node stays drained across a worker restart. Only a new node
+   starts `available`.
 9. Enter steady-state loops:
    - Heartbeats every `heartbeatSeconds` (worker-type config, default 2s,
      clamped to 1–300s). Each beat gets ±10% jitter so a fleet that started
@@ -147,6 +149,11 @@ how to measure), see
 - Worker reports current allocations in heartbeat.
 - Manager returns desired allocations for that node.
 - Worker reconciles by stopping undesired tasks and starting missing ones.
+- An empty desired set is authoritative. It means "run nothing here," so the
+  worker stops everything it has, including the last allocation on a node that
+  was drained or had its work stopped or preempted. A failed heartbeat is never
+  read this way: the worker reconciles only against a reply the manager
+  actually sent.
 
 ## Node Loss and Recovery Behavior
 
@@ -169,8 +176,12 @@ Two code paths exist:
     be marked lost in a single tick, none of them are, and the manager logs at
     `error`. Losing half the fleet at once almost always points at a
     control-plane problem rather than at the workers.
+- Capacity pass: a worker registration or an uncordon queues one `node_join`
+  eval with no node. It re-evaluates jobs short of their count and jobs with
+  `count.per` tasks (see
+  [jobs-tasks-and-scheduling.md](jobs-tasks-and-scheduling.md#node-added)).
 - Eval path (used in tests/manual eval insertion):
-  - `node_drop` / `node_join` eval kinds call equivalent store reconciliation logic.
+  - `node_drop` / `node_join` eval kinds with a node call equivalent store reconciliation logic.
 
 ## What Is Not Implemented Yet
 

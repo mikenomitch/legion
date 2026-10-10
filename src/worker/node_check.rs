@@ -104,8 +104,7 @@ fn call_dynamic(name: &str) -> R<(Library, Box<dyn NodeChecker>)> {
         .with_context(|| format!("invalid node_check plugin manifest for {}", name))?;
 
     unsafe {
-        let lib = Library::new(&paths.dylib)
-            .with_context(|| format!("load node_check plugin {}", paths.dylib.display()))?;
+        let lib = crate::plugin_runtime::open_plugin_library("node_checks", name, &paths.dylib)?;
         let fp = {
             let func: Symbol<unsafe extern "C" fn() -> Box<dyn NodeChecker>> = lib.get(b"get")?;
             func()

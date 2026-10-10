@@ -1181,6 +1181,14 @@ fn setup_store() -> R<Store> {
 /// Seeds a node, job, KV entries, and ACL fixtures so fetch-then-authorize
 /// endpoints reach their ACL checks instead of returning NotFound.
 fn seed_fixtures(store: &Store) -> R<Fixtures> {
+    // Worker types pin a pool; join tokens pin a worker type.
+    for (name, pool) in [("default", "default"), ("gpu", "gpu")] {
+        store.insert_worker_type(&WorkerConfig {
+            name: name.into(),
+            pool: pool.into(),
+            ..Default::default()
+        })?;
+    }
     store.insert_node(NodeMsg {
         id: NODE_ID.into(),
         pool: "default".into(),
@@ -1427,9 +1435,7 @@ async fn worker_join_flow_with_acls_enabled() -> R<()> {
     let join_token = legion::structs::token::JoinToken::decode(&created.token)?;
     assert!(!join_token.secret.is_empty());
 
-    // Pre-register fails without the secret, succeeds with it. (The fixture
-    // store has no worker types, so success here is "passed the join gate"
-    // and failed later with NotFound rather than Unauthenticated.)
+    // Pre-register fails without the secret, succeeds with it.
     let denied = svc
         .worker_pre_register(req(
             WorkerPreRegisterRequest {
@@ -1575,6 +1581,136 @@ async fn worker_join_flow_with_acls_enabled() -> R<()> {
         .await
         .expect_err("revoked join token must be rejected");
     assert_eq!(closed.code(), Code::Unauthenticated);
+    Ok(())
+}
+
+/// A worker credential only speaks for its own node, and a join token only
+/// admits its pinned worker type and pool. Without this, one compromised node
+/// could re-register as a peer (rotating away the peer's token) or heartbeat,
+/// report health, and ratify claims in its name.
+#[tokio::test]
+async fn worker_plane_binds_node_ids_to_the_caller() -> R<()> {
+    let (svc, fixtures, management_secret) = setup_enabled()?;
+    let created = svc
+        .create_join_token(req(
+            CreateJoinTokenRequest {
+                worker_type: "default".into(),
+                ttl: Some("1h".into()),
+                description: "binding test".into(),
+            },
+            Some(&management_secret),
+        ))
+        .await?
+        .into_inner();
+    let secret = legion::structs::token::JoinToken::decode(&created.token)?.secret;
+
+    // The join token is pinned to `default`: no other worker type or pool.
+    let status = svc
+        .worker_pre_register(req(
+            WorkerPreRegisterRequest {
+                worker_type: "gpu".into(),
+                join_token: Some(secret.clone()),
+            },
+            None,
+        ))
+        .await
+        .expect_err("a join token must not pre-register another worker type");
+    assert_eq!(
+        status.code(),
+        Code::PermissionDenied,
+        "{}",
+        status.message()
+    );
+    let register = |name: &str, pool: &str, join: Option<String>, token: Option<&str>| {
+        req(
+            WorkerRegisterRequest {
+                name: name.into(),
+                pool: pool.into(),
+                config_attrs: "{}".into(),
+                fingerprint_attrs: "{}".into(),
+                health_checks: "[]".into(),
+                join_token: join,
+                ..Default::default()
+            },
+            token,
+        )
+    };
+    let status = svc
+        .worker_register(register("intruder", "gpu", Some(secret.clone()), None))
+        .await
+        .expect_err("a join token must not register into another pool");
+    assert_eq!(
+        status.code(),
+        Code::PermissionDenied,
+        "{}",
+        status.message()
+    );
+
+    let intruder = svc
+        .worker_register(register("intruder", "default", Some(secret.clone()), None))
+        .await?
+        .into_inner()
+        .node_token
+        .expect("registration mints a node token");
+
+    // The intruder's node token cannot register, heartbeat, or act as the
+    // fixture node.
+    for method in [
+        "WorkerRegister",
+        "Heartbeat",
+        "HealthCheck",
+        "FetchNetPolicy",
+        "GetArtifactCredential",
+        "RatifyClaim",
+    ] {
+        let status = call_endpoint(&svc, &fixtures, method, Some(&intruder))
+            .await
+            .expect_err(&format!("{method} must refuse a foreign node token"));
+        assert_eq!(
+            status.code(),
+            Code::PermissionDenied,
+            "{method}: {}",
+            status.message()
+        );
+    }
+    let status = svc
+        .worker_register(register(NODE_ID, "default", None, Some(&intruder)))
+        .await
+        .expect_err("a node token must not take over another node");
+    assert_eq!(
+        status.code(),
+        Code::PermissionDenied,
+        "{}",
+        status.message()
+    );
+
+    // Its own node: re-registering with the node token alone works, but it
+    // cannot move itself into another pool.
+    let status = svc
+        .worker_register(register("intruder", "gpu", None, Some(&intruder)))
+        .await
+        .expect_err("a node token must not change its node's pool");
+    assert_eq!(
+        status.code(),
+        Code::PermissionDenied,
+        "{}",
+        status.message()
+    );
+    let rotated = svc
+        .worker_register(register("intruder", "default", None, Some(&intruder)))
+        .await?
+        .into_inner()
+        .node_token
+        .expect("re-registration rotates the node token");
+    svc.heartbeat(req(
+        HeartbeatRequest {
+            id: "intruder".into(),
+            ..Default::default()
+        },
+        Some(&rotated),
+    ))
+    .await
+    .expect("a node token heartbeats for its own node");
     Ok(())
 }
 
@@ -2062,6 +2198,242 @@ async fn kv_path_scoped_policy_limits_kv_access() -> R<()> {
             .map(|entry| &entry.key)
             .collect::<Vec<_>>(),
     );
+    Ok(())
+}
+
+/// The mesh CA signs every node's certificate, so rotating it needs
+/// cluster-wide `net:write`. A pool-scoped net admin may not rotate it.
+#[tokio::test]
+async fn rotate_mesh_ca_requires_cluster_wide_net_write() -> R<()> {
+    let (svc, fixtures, _) = setup_enabled()?;
+    let authenticator = svc.auth.clone();
+    let mut secrets = Vec::new();
+    for (name, rules) in [
+        (
+            "net-pool-admin",
+            r#"[{"resources": ["net"], "actions": ["write"], "pools": ["gpu"]}]"#,
+        ),
+        (
+            "net-cluster-admin",
+            r#"[{"resources": ["net"], "actions": ["write"]}]"#,
+        ),
+    ] {
+        svc.store.upsert_acl_policy(name, "", rules)?;
+        let (_, secret) = authenticator
+            .mint_token(&svc.store, name, "client", &[name.into()], None)
+            .map_err(|s| anyhow!(s.to_string()))?;
+        secrets.push(secret);
+    }
+
+    let status = call_endpoint(&svc, &fixtures, "RotateMeshCa", Some(&secrets[0]))
+        .await
+        .expect_err("a pool-scoped net admin must not rotate the mesh CA");
+    assert_eq!(status.code(), Code::PermissionDenied);
+    call_endpoint(&svc, &fixtures, "RotateMeshCa", Some(&secrets[1]))
+        .await
+        .map_err(|s| anyhow!(s.to_string()))?;
+    Ok(())
+}
+
+/// Mints a client token carrying one fresh policy with the given rules.
+fn token_with_rules(svc: &ManagerDaemonService, name: &str, rules: &str) -> R<(String, String)> {
+    svc.store.upsert_acl_policy(name, "", rules)?;
+    let (info, secret) = svc
+        .auth
+        .mint_token(&svc.store, name, "client", &[name.into()], None)
+        .map_err(|s| anyhow!(s.to_string()))?;
+    Ok((info.accessor_id, secret))
+}
+
+/// Node lookups gate before they fetch: a caller with no node access gets
+/// PermissionDenied for a node that does not exist, not NotFound, so it
+/// cannot probe which node ids exist.
+#[tokio::test]
+async fn node_lookups_check_before_fetch() -> R<()> {
+    let (svc, _, _) = setup_enabled()?;
+    let (_, secret) = token_with_rules(
+        &svc,
+        "jobs-only",
+        r#"[{"resources": ["job"], "actions": ["read", "write"]}]"#,
+    )?;
+    let missing = "no-such-node".to_string();
+    let results = [
+        (
+            "GetNode",
+            svc.get_node(req(
+                GetNodeRequest {
+                    id: missing.clone(),
+                },
+                Some(&secret),
+            ))
+            .await
+            .map(|_| ()),
+        ),
+        (
+            "RestartWorker",
+            svc.restart_worker(req(
+                RestartWorkerRequest {
+                    node_id: missing.clone(),
+                },
+                Some(&secret),
+            ))
+            .await
+            .map(|_| ()),
+        ),
+        (
+            "UpdateNodeDynamic",
+            svc.update_node_dynamic(req(
+                UpdateNodeDynamicRequest {
+                    id: missing.clone(),
+                    dynamic_diff: "{}".into(),
+                },
+                Some(&secret),
+            ))
+            .await
+            .map(|_| ()),
+        ),
+    ];
+    for (method, result) in results {
+        let status = result.expect_err(&format!("{method} must deny"));
+        assert_eq!(
+            status.code(),
+            Code::PermissionDenied,
+            "{method}: {}",
+            status.message()
+        );
+    }
+    Ok(())
+}
+
+/// A volume no job owns takes cluster-wide `job:write` to delete; a
+/// name-scoped job writer may not delete it.
+#[tokio::test]
+async fn jobless_volume_delete_requires_cluster_wide_job_write() -> R<()> {
+    let (svc, _, management_secret) = setup_enabled()?;
+    svc.query_state_store(req(
+        QueryStateStoreRequest {
+            sql: "INSERT INTO volume (volume_id, driver, state, created_at, updated_at) \
+                  VALUES ('vol-orphan', 'host', 'pending', '2026-01-01T00:00:00Z', \
+                  '2026-01-01T00:00:00Z')"
+                .into(),
+            allow_write: true,
+        },
+        Some(&management_secret),
+    ))
+    .await?;
+    let delete = |secret: &str| {
+        req(
+            DeleteVolumeRequest {
+                volume_id: "vol-orphan".into(),
+                force: true,
+                idempotency_key: None,
+            },
+            Some(secret),
+        )
+    };
+
+    let (_, scoped) = token_with_rules(
+        &svc,
+        "acl-jobs-writer",
+        r#"[{"resources": ["job"], "actions": ["write"], "names": ["acl-*"]}]"#,
+    )?;
+    let status = svc
+        .delete_volume(delete(&scoped))
+        .await
+        .expect_err("a name-scoped job writer must not delete a jobless volume");
+    assert_eq!(
+        status.code(),
+        Code::PermissionDenied,
+        "{}",
+        status.message()
+    );
+
+    let (_, cluster) = token_with_rules(
+        &svc,
+        "all-jobs-writer",
+        r#"[{"resources": ["job"], "actions": ["write"]}]"#,
+    )?;
+    svc.delete_volume(delete(&cluster)).await?;
+    Ok(())
+}
+
+/// A stream outlives no credential: revoking the token closes `StreamEvents`
+/// within one re-check interval.
+#[tokio::test]
+async fn stream_events_closes_when_its_token_is_revoked() -> R<()> {
+    use futures::StreamExt;
+    let (svc, _, management_secret) = setup_enabled()?;
+    let svc = svc.with_stream_reauth_interval(std::time::Duration::from_millis(50));
+    let (accessor, secret) = token_with_rules(
+        &svc,
+        "event-reader",
+        r#"[{"resources": ["operator"], "actions": ["read"]}]"#,
+    )?;
+    let mut stream = svc
+        .stream_events(req(StreamEventsRequest::default(), Some(&secret)))
+        .await?
+        .into_inner();
+
+    svc.delete_acl_token(req(
+        DeleteAclTokenRequest {
+            accessor_id: accessor,
+        },
+        Some(&management_secret),
+    ))
+    .await?;
+
+    let next = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+        .await
+        .context("stream must close after revocation")?;
+    let status = next
+        .context("stream ended without a status")?
+        .expect_err("a revoked token must end the stream with an error");
+    assert_eq!(status.code(), Code::Unauthenticated, "{}", status.message());
+    Ok(())
+}
+
+/// Idempotency keys are scoped to one operation and one caller. A key
+/// reused on a different operation must not skip it, and another caller's
+/// key must not replay their reply.
+#[tokio::test]
+async fn idempotency_keys_are_scoped_to_operation_and_caller() -> R<()> {
+    let (svc, _, _) = setup_enabled()?;
+    let rules = r#"[{"resources": ["job"], "actions": ["read", "write"]}]"#;
+    let (_, alice) = token_with_rules(&svc, "alice-jobs", rules)?;
+    let (_, bob) = token_with_rules(&svc, "bob-jobs", rules)?;
+    let stop = |secret: &str| {
+        req(
+            StopJobRequest {
+                name: JOB_NAME.into(),
+                idempotency_key: Some("shared-key".into()),
+                ..Default::default()
+            },
+            Some(secret),
+        )
+    };
+    let destroy = |secret: &str| {
+        req(
+            DestroyJobRequest {
+                name: JOB_NAME.into(),
+                idempotency_key: Some("shared-key".into()),
+                ..Default::default()
+            },
+            Some(secret),
+        )
+    };
+
+    let first = svc.stop_job(stop(&alice)).await?.into_inner();
+    assert!(!first.deduplicated);
+    // Same caller, same operation, same key: replayed.
+    let replay = svc.stop_job(stop(&alice)).await?.into_inner();
+    assert!(replay.deduplicated);
+    assert_eq!(replay.message, first.message);
+    // Another caller with the same key is a new request.
+    let other = svc.stop_job(stop(&bob)).await?.into_inner();
+    assert!(!other.deduplicated);
+    // The same key on another operation runs it.
+    let destroyed = svc.destroy_job(destroy(&alice)).await?.into_inner();
+    assert!(!destroyed.deduplicated);
     Ok(())
 }
 

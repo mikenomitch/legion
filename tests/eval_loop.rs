@@ -179,7 +179,9 @@ fn eval_loop_reconciles_ledger_and_evals() -> R<()> {
         .flat_map(|entry| entry.allocations.iter())
         .filter(|alloc| alloc.job_config_id == job_config_v1_id)
         .collect();
-    assert_eq!(job_one_allocations.len(), 1);
+    // v2 was submitted before this v1 eval ran, so v1 is superseded and
+    // has nothing running: a stale submit for it places nothing.
+    assert!(job_one_allocations.is_empty());
     assert_eq!(eval_status(&store, "3")?, "complete");
 
     process_next_eval(&store)?.context("expected job update eval")?;

@@ -92,10 +92,9 @@ pub fn load_rollout_strategy(name: &str) -> R<LoadedRolloutStrategy> {
             validate_manifest("rollouts", other, &paths.root).with_context(|| {
                 format!("invalid rollout strategy plugin manifest for {}", other)
             })?;
-            let path = paths.dylib.to_string_lossy().into_owned();
             unsafe {
-                let lib = Library::new(&path)
-                    .with_context(|| format!("failed opening rollout strategy plugin {}", path))?;
+                let lib =
+                    crate::plugin_runtime::open_plugin_library("rollouts", other, &paths.dylib)?;
                 let strategy = {
                     let func: Symbol<unsafe extern "C" fn() -> Box<dyn RolloutStrategyPlugin>> =
                         lib.get(b"get").with_context(|| {

@@ -15,6 +15,14 @@ How to use it:
 
 ---
 
+- [ ] **Architecture audit (2026-10-09).** Design-level findings across the
+      store, scheduler, manager API, worker, and lifecycle, each with an ID and
+      a status line: [architecture-audit-2026-10-09.md](architecture-audit-2026-10-09.md),
+      calls in [architecture-audit-2026-10-09_calls.md](calls/architecture-audit-2026-10-09_calls.md). The fix PR
+      ([#6](https://github.com/mikenomitch/legion/pull/6)) fixes 25 of 31 in full, 5 in part, and leaves SC7 as
+      deliberate. What it left open is listed under each area below, tagged
+      "(audit <ID>)". Check this off once the PR merges.
+
 - [ ] **The `fit` index does not see `maxAllocations`.** A node at its
       allocation cap still projects into a fitting (cpu, memory, disk)
       cell, so under `bin_pack` (tight order: fullest fitting cell first)
@@ -65,6 +73,7 @@ How to use it:
 | PR | What it lands | Notes |
 | --- | --- | --- |
 | [#7](https://github.com/mikenomitch/legion/pull/7) | Read model follows SQLite in every mode: shadow check, `local_disk` changeset projection, outside-write guard, timed scrub | Bench needs a quiet-machine rerun; [plan](plans/read-model-coherence-plan.md) |
+| [#6](https://github.com/mikenomitch/legion/pull/6) | Fixes from the 2026-10-09 architecture audit | [audit](architecture-audit-2026-10-09.md); scheduler bench numbers pending |
 | [#4](https://github.com/mikenomitch/legion/pull/4) | Rename crate to `legion-rs`, crates.io metadata, `cargo install` docs | Not published yet; follow-ups under Templates, registry & packaging |
 | [#162](https://github.com/mikenomitch/legion/pull/162) | Lanes hardening: worker-write forwarding, split-tolerant submits, adversarial fixes | Plan §8 + calls doc in [durability-and-ops-execution-plan.md](plans/durability-and-ops-execution-plan.md) |
 | [#143](https://github.com/mikenomitch/legion/pull/143) | Note the node-level builtin resource override gap | Docs only; the fix itself is a todo below |
@@ -1376,6 +1385,22 @@ How to use it:
       ceiling, and how it composes with `reservedResources`. Whichever way it
       lands, an ignored key should warn or fail validation instead of passing
       silently.
+- [ ] **Fresh plans overcommit while the old config still runs (audit SC7).**
+      Apply counts the replaced job's allocations as free, and the old config
+      is removed only after apply. Deliberate today (resubmitting a job that
+      uses more than half a node would fail otherwise). Fix shape: remove the
+      replaced allocations inside the same apply transaction, using the
+      node-epoch self-conflict handling evictions already have, with care for
+      stateful release and rebind ordering. [calls #17](calls/architecture-audit-2026-10-09_calls.md).
+- [ ] **The capacity pass has triggers it doesn't listen to yet (audit SC4).**
+      Registration and uncordon queue a nodeless `node_join`. Allocations freed
+      by a stop or scale-in, and a lost node recovering through heartbeats, do
+      not, and batch tasks are never woken. Full blocked evals stay with the
+      gang-scheduling plan. [calls #10](calls/architecture-audit-2026-10-09_calls.md).
+- [ ] **Single-node (non-raft) mode doesn't heal a crash mid-reschedule.**
+      A crash between removing allocations and reconciling them is healed only
+      by regeneration, which runs on raft leadership acquisition. Found while
+      fixing audit SC3.
 
 ## Task runtimes
 
@@ -1491,6 +1516,20 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
       [proposal](plans/shared-alloc-dir-proposal.md), unimplemented, and blocked
       on allocations holding more than one task
 - [ ] Use a virtual filesystem for the alloc directory (idea)
+- [ ] **Finish moving worker blocking work off the task-manager lock (audit
+      W3).** Launches are off it. Still under it, on async threads:
+      `reap_terminating`, `record_failure` and the self-fence path (destroy and
+      volume unmount), plus `prepare`/`start` for `ratify_claim`,
+      `restart_allocation`, and edge-boot provisional starts. `heartbeat_tick`
+      also locks a std mutex from async code. Teardown needs a "tearing down"
+      state so starts still wait behind stops. [calls #11](calls/architecture-audit-2026-10-09_calls.md).
+- [ ] **The worker boot fence is silent (audit W6).** A task fenced at boot is
+      never reported as self-fenced, so the manager learns only from its
+      absence. A volume left mounted by a boot-fenced task, or by any task
+      that died while the worker was down, stays mounted until a later dispatch
+      or reclaim. [calls #12](calls/architecture-audit-2026-10-09_calls.md).
+- [ ] **Worker graceful shutdown.** The manager now handles SIGTERM (audit M3),
+      the worker does not.
 
 ## Rollouts
 
@@ -1498,6 +1537,15 @@ Plan: [rollout-strategy-plugins](../docs/rollout-strategy-plugins.md) · docs: [
 
 - [ ] A **blue-green** strategy
 - [ ] A **canary** strategy
+- [ ] **Rollback as a new job version (audit SC1).** Rollback stays a terminal
+      rollout state, so a forced reschedule, a KV-driven restart, or `job scale`
+      after a rollback still targets the rolled-back config. Nomad re-submits the
+      old spec as a new version. Needs a plan (job history and unchanged-resubmit
+      detection change). [calls #5](calls/architecture-audit-2026-10-09_calls.md).
+- [ ] **`StopRollout` with `revert` can leave the rollout non-terminal.** If the
+      re-placement fails, the RPC errors and the rollout's ticks may re-place
+      the new version. Pre-existing, documented in
+      [rollouts.md](../docs/rollouts.md).
 
 ## Artifacts
 
@@ -1906,6 +1954,29 @@ Plans: [persistence-plan.md](plans/persistence-plan.md), [multi-raft-persistence
         implies nodes store a reference to their type
 - [ ] Root-privilege split: run networking and volume setup as root while the
       task itself doesn't
+- [ ] **Stream raft snapshots as files (audit R5).** Builds no longer block
+      writes, but a snapshot is still held fully in memory on build, serve and
+      install. Switch openraft's `SnapshotData` from `Cursor<Vec<u8>>` to
+      `tokio::fs::File`. [calls #26](calls/architecture-audit-2026-10-09_calls.md).
+- [ ] **`Store::state_backup` still runs `VACUUM INTO` under the capture
+      lock.** The same read-connection approach R5 used for snapshots would
+      stop backups from stalling writes.
+- [ ] **An older-schema manager halted on an entry can be sent a newer
+      whole-database snapshot (audit R2).** It then refuses to start until it
+      is upgraded. Loud, not graceful.
+- [ ] **Streaming mode: the WAL checkpointer fights rustyriver.**
+      `Store::spawn_wal_checkpointer` runs PASSIVE checkpoints in streaming
+      mode, where rustyriver expects to own checkpointing. Pre-existing, found
+      during audit R4.
+- [ ] **Streaming fencing is time-based (audit R4).** A primary paused past
+      its lease TTL can accept a write and ship one more cycle before it
+      notices. Documented in
+      [persistence-streaming.md](../docs/persistence-streaming.md).
+- [ ] **No raft leadership transfer on manager shutdown (audit M3).** openraft
+      0.9 has no API for it, so stopping a leader costs an election timeout
+      per lane. Revisit on an openraft upgrade. [calls #16](calls/architecture-audit-2026-10-09_calls.md).
+- [ ] **The exec-ws and telemetry listeners only log a bind failure.** The
+      gRPC listener now ends the process (audit M2). These two don't.
 
 ## Job types
 
@@ -1938,6 +2009,11 @@ Plan: [kv-encryption-plan.md](plans/kv-encryption-plan.md) · docs: [kv-encrypti
       locked data key.** Simple and loud, but a partial listing with a
       per-row "locked" marker might serve an incident better; needs
       `KvEntry` to carry an unavailability reason.
+- [ ] **Missed KV deletes under `restart`/`rollout` policies are undetectable
+      (audit M4).** The leader sweep can't tell a deleted key from its last
+      rendered value. Closing it needs a replicated marker (a schema change).
+      There's also a residual window between `handle_job_submit` and
+      `request_job_restart` inside `reconcile_kv_changes`. [calls #15](calls/architecture-audit-2026-10-09_calls.md).
 
 ## Auth, TLS & security
 
@@ -1970,11 +2046,6 @@ Plan: [auth-acl-plan.md](plans/auth-acl-plan.md) · docs: [auth-and-acls.md](../
   - [ ] Phase 5 — governance on the namespace object: quota,
         `allowedPools`, `allowedRuntimes`, default band. Enforcement point for
         quota is open (plan § 14).
-- [ ] **Cross-tenant leak: idempotency keys are globally scoped.**
-      `Store::idempotency_lookup` keys on the caller-supplied key alone
-      (`src/storage/store.rs:13087`), so two callers using `deploy-1` share a
-      record and the second gets the first's reply. Harmless while there is one
-      tenant; closed by namespaces Phase 1.
 - [ ] **KV ACLs on `GetArtifactCredential`.** Artifact auth (`auth.kv`) lets any
       job read any KV credential path today. The enforcement point exists and is
       marked — see the SECURITY BOUNDARY comment on `get_artifact_credential` in
@@ -1996,6 +2067,20 @@ Plan: [auth-acl-plan.md](plans/auth-acl-plan.md) · docs: [auth-and-acls.md](../
         shouldn't need to be supplied, since it's in the JWT
 - [ ] **Cert manager built in**, with public-CA routes, usable by workloads and
       not just the control plane
+- [ ] **A join secret can still claim an existing node's name (audit S1).**
+      Node tokens are now bound to their node, but a compromised worker still
+      holds its join secret. Fix shape: per-node join tokens, or workers
+      persisting their node token. Mitigation today: short join-token TTLs,
+      revoked after the fleet joins. [calls #3](calls/architecture-audit-2026-10-09_calls.md).
+- [ ] **`GetArtifactCredential` is bound to the node but not to its
+      allocations.** Any node can read any credential-shaped KV path. Its proto
+      comment ("KV ACLs do not exist yet") is stale. Found during audit S1.
+- [ ] **Idempotency keys don't cover the request body (audit S4).** The same
+      key with different arguments replays the first reply. Documented in
+      [agent-readiness.md](../docs/agent-readiness.md).
+- [ ] **`prune_expired_boot_tickets` is never called outside tests.**
+- [ ] **The ACL credential pruner runs only with ACLs enabled and isn't gated
+      to the raft leader.**
 
 ## Observability
 
@@ -2101,6 +2186,13 @@ artifacts, volumes, node checks. Still to build:
       break out into a job (this is roughly how the autoscaler would work)
 - [ ] Pluggable node statuses for degradation (disk pressure, network pressure, …)
 - [ ] Pluggable configuration language?
+- [ ] **A stable plugin ABI (audit M6).** Loads are now refused on a build
+      fingerprint mismatch, but plugins still pass Rust trait objects across a
+      dylib boundary, and rollout plugins run inside the manager. Options:
+      `abi_stable`, a C ABI, or out-of-process plugins. [calls #8](calls/architecture-audit-2026-10-09_calls.md).
+- [ ] **Plugin lockfiles are stale.** `plugins/tasks/noop/Cargo.lock` still
+      names `legion` instead of `legion-rs` and lacks `ring`. The other plugin
+      lockfiles probably do too.
 
 ## Agent surfaces
 
@@ -2316,6 +2408,16 @@ Deferred from [ui-holistic-polish-plan.md](plans/ui-holistic-polish-plan.md):
       a UI.
 
 ---
+- [ ] **`cargo clippy --all-targets` fails on existing code**
+      (`daemon.rs` items-after-test-module, `tests/node_drain.rs`
+      needless_borrow). The project's standard `cargo clippy --all` passes.
+- [ ] **Flaky timing tests under load.** `worker::forwarder`
+      (`sync_stops_a_listener_that_is_no_longer_desired`,
+      `failover_skips_a_dead_endpoint_and_still_serves`) and
+      `manager::daemon::tests::wait_for_next_eval_does_not_busy_loop_when_only_future_work_exists`
+      each failed once in full parallel runs and pass on rerun.
+- [ ] **Create the `proto-breaking-ok` label** that skips the new
+      `proto-breaking` CI job (audit M5).
 
 ## Long term
 
@@ -2861,6 +2963,16 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
 - [x] Phase 3 — worker-plane hardening (join tokens from the authenticated
       `CreateJoinToken` RPC; the insecure `:4748` bootstrap listener is gone)
 - [x] Phase 4 — operations at scale
+- [x] Idempotency keys are scoped to operation and caller, and pruned after
+      24 hours (audit S4, [calls #6](calls/architecture-audit-2026-10-09_calls.md),
+      [docs](../docs/agent-readiness.md)).
+- [x] Worker-plane identity binding: join tokens pin worker type and pool,
+      node tokens re-register only their own node, and node ids on worker RPCs
+      are bound to the caller (audit S1). Browser origin allow-list (S2),
+      private keys redacted from state queries (S3), cluster-wide
+      `RotateMeshCa` (S5), stream re-auth (S7). See the
+      [audit](architecture-audit-2026-10-09.md) and
+      [auth-and-acls.md](../docs/auth-and-acls.md).
 
 ## Exec & actions
 
@@ -2994,3 +3106,24 @@ now does about them so nobody re-derives it at 02:00.
   6x-470-crate rebuild from every campaign, but it is a cache, not a fix:
   the first build on a fresh box and any change under `plugins/` still pays
   in full, so the shared-target-dir item above stands.
+
+## Architecture audit (2026-10-09)
+
+[audit](architecture-audit-2026-10-09.md) · [calls](calls/architecture-audit-2026-10-09_calls.md)
+
+- [x] Worker: an empty desired set stops the last allocation (W1), re-adoption
+      checks process start time (W2), launches run outside the task-manager
+      lock (W3, partial), stopping allocations survive a restart (W4), the hard
+      kill hits the process group (W5), and a boot fence covers restarts (W6).
+- [x] Raft and store: a new leader catches up before capturing (R1), schema
+      mismatches are refused instead of silently skipped (R2), members fetch
+      the KV root key (R3), streaming standbys are fenced and restore on
+      takeover (R4), snapshot builds don't block writes (R5, partial).
+- [x] Scheduler: rollbacks survive failover (SC1), the claim sweep stops
+      deleting unrelated evals (SC2), failed reconciles retry (SC3, SC6), a
+      capacity pass runs on registration and uncordon (SC4, partial), and
+      stale plans place nothing (SC5).
+- [x] Manager lifecycle: bounded template evaluation (M1), exit on gRPC
+      failure (M2), graceful SIGTERM (M3), a KV reconciliation sweep (M4), a
+      proto breaking-change check in CI (M5), plugin build fingerprints (M6,
+      partial).

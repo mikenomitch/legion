@@ -177,6 +177,15 @@ their own replica and decrypt locally.
   one before answering the join, so the joiner always gets a key. A manager
   that already has a key file keeps it. You can also place the file by hand
   before starting the joiner.
+- **`file`, existing members:** a manager that was already in the cluster
+  when encryption arrived never joins again, so no join reply reaches it.
+  Its keyring loop notices it has no key file and **fetches the root key
+  from another member** (the leader first) over the same authenticated
+  manager channel, sealed the same way. This runs within seconds of the
+  first data key replicating, and every 15 seconds while the key is still
+  missing. A member only hands over a key it already holds, never mints one
+  for this, and only to a current member of the cluster. A manager that
+  lost its key file recovers the same way.
 - **`env` / `exec`:** set the variable, or install the helper and its
   credentials, on every manager. Nothing is delivered on join.
 
@@ -187,7 +196,13 @@ voter** runs a build that can apply the keyring's schema. Until then,
 still to upgrade, and KV values are stored as before. A mixed-version
 cluster can run like this for weeks. It is unencrypted, but it still works.
 The standard rolling manager upgrade ([Upgrades](upgrades.md)) turns
-encryption on by itself, with no extra command.
+encryption on by itself, with no extra command. Once the last manager is
+upgraded, the leader mints the root key and the first data key, and every
+other manager fetches the root key from it (above). Check that every
+manager reports `unlocked` in `legion keyring status` before you rely on
+losing the original leader's disk: until the others have fetched it, the
+root key exists only there. With `env` or `exec`, put the key on every
+manager before the upgrade.
 
 ## The keyring commands
 

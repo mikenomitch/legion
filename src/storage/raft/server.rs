@@ -32,8 +32,8 @@ use crate::storage::raft::types::TypeConfig;
 use crate::storage::raft::{RaftTransportRegistry, RAFT_CLUSTER_SECRET_METADATA_KEY};
 use crate::structs::raft_transport_server::RaftTransport;
 use crate::structs::{
-    JoinRaftClusterReply, JoinRaftClusterRequest, NodeLivenessDigestReply,
-    NodeLivenessDigestRequest, RaftLaneReply, RaftLaneRequest,
+    FetchRootKeyReply, FetchRootKeyRequest, JoinRaftClusterReply, JoinRaftClusterRequest,
+    NodeLivenessDigestReply, NodeLivenessDigestRequest, RaftLaneReply, RaftLaneRequest,
 };
 
 /// Constant-time byte comparison for the cluster secret, so the check does
@@ -125,9 +125,13 @@ impl RaftTransportService {
         let result = call(raft, rpc).await;
         let payload = serde_json::to_vec(&result)
             .map_err(|e| Status::internal(format!("failed encoding {rpc_name} reply: {e}")))?;
-        Ok(stamp_schema_version(Response::new(RaftLaneReply {
-            payload,
-        })))
+        let version = registry
+            .schema_version
+            .load(std::sync::atomic::Ordering::Relaxed);
+        Ok(stamp_schema_version(
+            Response::new(RaftLaneReply { payload }),
+            version,
+        ))
     }
 }
 
@@ -136,11 +140,8 @@ impl RaftTransportService {
 /// AppendEntries round — learns which schema every voter can apply. Read by
 /// version-gated features such as the KV keyring's upgrade gate
 /// (docs/kv-encryption.md, docs/upgrades.md).
-pub(crate) fn stamp_schema_version<T>(mut response: Response<T>) -> Response<T> {
-    if let Ok(value) = crate::storage::migrations::schema_version()
-        .to_string()
-        .parse()
-    {
+pub(crate) fn stamp_schema_version<T>(mut response: Response<T>, version: u32) -> Response<T> {
+    if let Ok(value) = version.to_string().parse() {
         response.metadata_mut().insert(
             crate::storage::raft::RAFT_SCHEMA_VERSION_METADATA_KEY,
             value,
@@ -203,6 +204,20 @@ impl RaftTransport for RaftTransportService {
             Status::unimplemented("raft join is not available on this manager")
         })?;
         handler.join(request.into_inner()).await.map(Response::new)
+    }
+
+    async fn fetch_root_key(
+        &self,
+        request: Request<FetchRootKeyRequest>,
+    ) -> Result<Response<FetchRootKeyReply>, Status> {
+        let registry = self.authenticate(&request)?;
+        let handler = registry.join_handler.clone().ok_or_else(|| {
+            Status::unimplemented("root key delivery is not available on this manager")
+        })?;
+        handler
+            .fetch_root_key(request.into_inner())
+            .await
+            .map(Response::new)
     }
 
     async fn forward_lane_write(

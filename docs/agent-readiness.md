@@ -317,6 +317,23 @@ result was replayed. Results are stored in the `idempotency_record` table
 [`src/storage/store.rs`](../src/storage/store.rs)). An empty or absent key
 disables deduplication.
 
+A key is scoped to one operation and one caller:
+
+- The same key on a different operation is a new request. Reusing a
+  `job stop` key on `job destroy` runs the destroy.
+- The same key from a different caller is a new request. The caller is the
+  ACL token (by accessor ID), or the principal for JWT and anonymous callers.
+  One caller can never read another's recorded reply. With ACLs disabled,
+  every caller is the same caller.
+- The key does not cover the request body. Retrying a key with different
+  arguments (another job name, say) replays the first reply. Use a fresh key
+  per intended change.
+
+Records are kept for 24 hours, then pruned by the manager (the control-lane
+leader in raft mode) within the following hour. A retry after that runs the
+operation again. Keys recorded by a manager older than this scoping no longer
+match after an upgrade, so a retry that spans the upgrade runs again.
+
 Concurrent requests with the same key are a different case from a retry. Both
 miss the recorded result, so the record decides which one wins. `job run`
 handles this: one caller is told it was first, and the other gets the winner's

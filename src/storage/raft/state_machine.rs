@@ -24,13 +24,15 @@
 //! ([`SnapshotScope`]):
 //!
 //! **`WholeDb` (topology `single`).** A snapshot is a whole-database
-//! image: `VACUUM INTO` a file under `<data_dir>/<lane>/snapshots/`, taken
-//! via [`capture::exclusive_state_access`] — the global capture mutex plus
-//! the held write-connection guard guarantee no capture savepoint is open
-//! and no committed-changeset apply interleaves, so the image is a
-//! transactionally consistent snapshot **that already contains its own
-//! `raft_applied` row** (the applied marker travels inside the snapshot;
-//! see `verify` in [`StoreStateMachine::install_snapshot`]). Install
+//! image: `VACUUM INTO` a file under `<data_dir>/<lane>/snapshots/`, run on
+//! a dedicated read-only connection. In WAL mode that is one read
+//! transaction over committed state only: an apply commits its rows and
+//! its `raft_applied` marker together, and a capture's savepoint never
+//! commits, so the image is a transactionally consistent snapshot **that
+//! already contains its own `raft_applied` row** (the applied marker
+//! travels inside the snapshot and the build reads the meta back from the
+//! image; see `verify` in [`StoreStateMachine::install_snapshot`]). Writes
+//! keep flowing while it is built (R5). Install
 //! replaces the state DB wholesale: the received bytes are staged to a
 //! temp file, the snapshot's meta is written into the staged file's
 //! `raft_applied` table, and [`Store::install_state_db`] atomically swaps
@@ -48,9 +50,9 @@
 //! small standalone SQLite database (row values round-trip exactly —
 //! SQLite storage classes, no text encoding ambiguity) holding one table
 //! per dumped table plus a manifest (`legion_lane_snapshot` /
-//! `legion_lane_snapshot_tables`), built under the same
-//! [`capture::exclusive_state_access`] guard as the vacuum path so it is
-//! transactionally consistent. Install is **one transaction** on the live
+//! `legion_lane_snapshot_tables`), read in one read transaction together
+//! with the lane's `raft_applied` marker, so it is transactionally
+//! consistent without blocking writers. Install is **one transaction** on the live
 //! state DB with the apply guard set: delete every LANE-OWNED dumped
 //! table's rows and insert the dump's rows (commutative tables are instead
 //! applied additively with `INSERT OR IGNORE` — sibling lanes' already-
@@ -74,11 +76,11 @@
 //! worker task per lane, so at most one worker thread per lane is inside an
 //! apply at any moment — see the runtime sizing in `driver::start_engine`).
 //!
-//! Snapshot BUILD and INSTALL are the exception: they hold the global
-//! capture mutex ([`capture::exclusive_state_access`] / the install
-//! transaction) while they `VACUUM INTO`, dump, or bulk-replace whole
-//! tables, i.e. for seconds on a large state DB — and every lane's snapshot
-//! work serializes on that one mutex. Left inline they would pin async
+//! Snapshot BUILD and INSTALL are the exception: they `VACUUM INTO`, dump,
+//! or bulk-replace whole tables, i.e. for seconds on a large state DB.
+//! Install also holds the global capture mutex for its transaction, so
+//! every lane's writes wait for it. Build reads on its own connection and
+//! holds no lock. Left inline they would pin async
 //! worker threads (adversarial finding, 2026-07-25: with three lanes, two
 //! concurrent multi-second snapshot operations starved a 2-thread runtime
 //! of heartbeat/election/replication progress). Both therefore run on
@@ -141,6 +143,11 @@ pub(crate) struct StoreStateMachine {
     snapshots_dir: PathBuf,
     /// Whole-DB image (`single`) or lane-table dump (`lanes`) — module docs.
     scope: SnapshotScope,
+    /// Test hook (`Store::raft_set_apply_paused`): while set, `apply` waits
+    /// before touching the state DB, so a test can hold a replica's applied
+    /// index behind its log (the R1 failover regression). Never set in
+    /// production.
+    apply_paused: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl std::fmt::Debug for StoreStateMachine {
@@ -165,7 +172,14 @@ impl StoreStateMachine {
             store,
             snapshots_dir,
             scope,
+            apply_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    /// Share the driver's apply-pause test hook (see the field docs).
+    pub(crate) fn with_apply_pause(mut self, paused: Arc<std::sync::atomic::AtomicBool>) -> Self {
+        self.apply_paused = paused;
+        self
     }
 
     /// A second handle to the same lane/state DB, owned and `'static`, for
@@ -179,6 +193,7 @@ impl StoreStateMachine {
             store: self.store.clone(),
             snapshots_dir: self.snapshots_dir.clone(),
             scope: self.scope,
+            apply_paused: self.apply_paused.clone(),
         }
     }
 
@@ -652,6 +667,9 @@ impl RaftStateMachine<TypeConfig> for StoreStateMachine {
         I: IntoIterator<Item = Entry<TypeConfig>> + OptionalSend,
         I::IntoIter: OptionalSend,
     {
+        while self.apply_paused.load(std::sync::atomic::Ordering::SeqCst) {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
         // Apply-side index-skip guard: entries at or below the recorded
         // applied index were already applied (typically re-delivered around
         // a snapshot install or a restart replay); re-applying a changeset
@@ -778,8 +796,8 @@ pub(crate) struct StoreSnapshotBuilder {
 
 impl StoreSnapshotBuilder {
     /// Dump the lane's owned tables (plus manifest) into a standalone
-    /// SQLite database at `tmp`. Runs inside the caller-held exclusive
-    /// state access, so the row reads are transactionally consistent with
+    /// SQLite database at `tmp`. Runs inside the caller's read
+    /// transaction, so the row reads are transactionally consistent with
     /// the `raft_applied` row the caller reads as the snapshot meta.
     fn dump_lane_tables(conn: &Connection, lane: Lane, tmp: &Path) -> R<()> {
         let snap = Connection::open(tmp)
@@ -847,30 +865,46 @@ impl StoreSnapshotBuilder {
             .context("snapshot temp path is not utf-8")?
             .to_string();
 
-        // Meta and image are taken under ONE exclusive hold of the write
-        // connection (captures excluded, applies serialized out): the image
-        // corresponds exactly to the `raft_applied` row we read as its meta.
-        // For `WholeDb` the applied marker additionally travels inside the
-        // image itself; for `LaneTables` it travels only in the meta and is
-        // written into the live DB by install.
+        // The image and its meta come from ONE consistent read of the state
+        // DB on a dedicated read-only connection, so writes keep flowing
+        // while a large image is built (R5). In WAL mode a reader sees only
+        // committed transactions: every apply commits its rows and the
+        // lane's `raft_applied` marker together, and a capture's savepoint
+        // never commits at all, so the image always matches the marker read
+        // with it. For `WholeDb` the marker travels inside the image and is
+        // read back from it; for `LaneTables` the marker and the dump share
+        // one read transaction, and install writes the marker into the live
+        // DB from the meta.
         let lane = self.lane;
         let scope = self.scope;
-        let (last_log_id, last_membership) =
-            capture::exclusive_state_access(&self.store, |conn| {
-                let applied = StoreStateMachine::read_applied_row(conn, lane)?;
-                match scope {
-                    SnapshotScope::WholeDb => {
-                        conn.execute("VACUUM INTO ?1;", [&tmp_str])
-                            .with_context(|| {
-                                format!("failed running VACUUM INTO {}", tmp.display())
-                            })?;
-                    }
-                    SnapshotScope::LaneTables => {
-                        Self::dump_lane_tables(conn, lane, &tmp)?;
-                    }
-                }
-                Ok(applied)
-            })?;
+        let source = Connection::open_with_flags(
+            self.store.state_db_path(),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .context("failed opening the state db for a snapshot build")?;
+        let (last_log_id, last_membership) = match scope {
+            SnapshotScope::WholeDb => {
+                // VACUUM INTO is itself one read transaction.
+                source
+                    .execute("VACUUM INTO ?1;", [&tmp_str])
+                    .with_context(|| format!("failed running VACUUM INTO {}", tmp.display()))?;
+                drop(source);
+                let image =
+                    Connection::open_with_flags(&tmp, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                        .with_context(|| format!("failed opening snapshot {}", tmp.display()))?;
+                StoreStateMachine::read_applied_row(&image, lane)?
+            }
+            SnapshotScope::LaneTables => {
+                source.execute_batch("BEGIN;")?;
+                let dumped =
+                    StoreStateMachine::read_applied_row(&source, lane).and_then(|applied| {
+                        Self::dump_lane_tables(&source, lane, &tmp)?;
+                        Ok(applied)
+                    });
+                let _ = source.execute_batch("COMMIT;");
+                dumped?
+            }
+        };
         fsync_file(&tmp)?;
 
         let id = format!(
@@ -915,7 +949,7 @@ impl StoreSnapshotBuilder {
 impl RaftSnapshotBuilder<TypeConfig> for StoreSnapshotBuilder {
     async fn build_snapshot(&mut self) -> Result<Snapshot<TypeConfig>, StorageError<NodeId>> {
         // Off the async worker threads (module docs "sync-inside-async"): a
-        // build holds the global capture mutex for the whole VACUUM/dump.
+        // build is a multi-second VACUUM/dump on a large state DB.
         // openraft already runs this in a detached task; putting it on the
         // blocking pool keeps that task from occupying a worker thread.
         let builder = self.clone();
@@ -1273,6 +1307,50 @@ mod tests {
     /// The A-3 headline: build a real `VACUUM INTO` snapshot on one node,
     /// install it on another, and the receiver's state + applied marker
     /// match the snapshot exactly (the marker travels inside the image).
+    /// A snapshot build reads on its own connection and takes no lock that
+    /// writes need (R5): it completes while the capture mutex is held, and
+    /// its meta still matches the applied marker inside the image.
+    #[tokio::test]
+    async fn snapshot_build_does_not_block_writes() -> R<()> {
+        for lane_scoped in [false, true] {
+            let store = setup_store()?;
+            let mut sm = if lane_scoped {
+                lane_state_machine(Lane::Control, store.clone())
+            } else {
+                state_machine(Lane::Control, store.clone())
+            };
+            let ((), changeset) = capture::capture_mutation(&store, Lane::Control, |s| {
+                s.put_kv("r5/key", "v", KvValueType::String, None, None)?;
+                Ok(())
+            })?;
+            sm.apply([Entry {
+                log_id: log_id(1, 1),
+                payload: EntryPayload::Normal(crate::storage::raft::StoreCommand {
+                    lane: Lane::Control,
+                    op: "put_kv".to_string(),
+                    changeset,
+                }),
+            }])
+            .await
+            .unwrap();
+
+            // Hold the lock every capture and apply takes, as a long write
+            // would, and build on another thread.
+            let held = capture::capture_exclusion()?;
+            let builder = sm.get_snapshot_builder().await;
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(builder.build().map(|snapshot| snapshot.meta));
+            });
+            let meta = rx
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .expect("a snapshot build must not wait on the capture mutex")?;
+            drop(held);
+            assert_eq!(meta.last_log_id, Some(log_id(1, 1)));
+        }
+        Ok(())
+    }
+
     #[tokio::test]
     async fn snapshot_build_and_install_round_trip() -> R<()> {
         let leader = setup_store()?;

@@ -49,7 +49,7 @@ use std::time::{Duration, Instant};
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
-use openraft::error::{ClientWriteError, InitializeError, RaftError};
+use openraft::error::{CheckIsLeaderError, ClientWriteError, InitializeError, RaftError};
 use openraft::{BasicNode, RaftMetrics, ServerState, SnapshotPolicy};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
@@ -72,8 +72,8 @@ use crate::storage::raft::{
 };
 use crate::storage::store::Store;
 use crate::structs::{
-    JoinRaftClusterReply, JoinRaftClusterRequest, RaftGroupMembership, RaftMemberInfo,
-    RaftPersistenceConfigFull,
+    FetchRootKeyReply, FetchRootKeyRequest, JoinRaftClusterReply, JoinRaftClusterRequest,
+    RaftGroupMembership, RaftMemberInfo, RaftPersistenceConfigFull,
 };
 
 type NodeId = u64;
@@ -741,6 +741,12 @@ pub(crate) struct MultiRaftDriver {
     /// lanes battery can assert the bound on term inflation directly rather
     /// than inferring it from raft terms.
     lane_campaigns: Arc<StdMutex<HashMap<Lane, u64>>>,
+    /// Test hook shared with every lane's state machine: while set, applies
+    /// wait (see `Store::raft_set_apply_paused`).
+    apply_paused: Arc<std::sync::atomic::AtomicBool>,
+    /// The schema version this node advertises to peers (shared with the
+    /// transport registry). Lowered only by the mixed-version test hook.
+    advertised_schema_version: Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl std::fmt::Debug for MultiRaftDriver {
@@ -777,6 +783,10 @@ impl MultiRaftDriver {
             election_epoch_ms: Arc::new(AtomicI64::new(0)),
             lane_convergence: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             lane_campaigns: Arc::new(StdMutex::new(HashMap::new())),
+            apply_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            advertised_schema_version: Arc::new(std::sync::atomic::AtomicU32::new(
+                crate::storage::migrations::schema_version(),
+            )),
         }
     }
 
@@ -1206,6 +1216,80 @@ impl MultiRaftDriver {
         }
     }
 
+    /// Fetch the cluster's KV root key from another member and store it
+    /// with `keyring`'s provider (R3). Tries the control-lane leader first,
+    /// then every other member, and stops at the first one that delivers a
+    /// key. Returns the name of the member it came from, or `None` when no
+    /// member had one to give (the caller retries on its next tick).
+    pub(crate) fn fetch_root_key_from_members(
+        &self,
+        keyring: &crate::storage::keyring::Keyring,
+    ) -> R<Option<String>> {
+        let engine = self.engine()?;
+        let metrics = Self::control_metrics(engine).context("control lane not started")?;
+        let mut members: Vec<(NodeId, String, String)> = metrics
+            .membership_config
+            .membership()
+            .nodes()
+            .filter(|(id, _)| **id != self.raft_id)
+            .map(|(id, node)| {
+                (
+                    *id,
+                    member_name(&metrics, *id),
+                    node_addr_host_port(&node.addr).to_string(),
+                )
+            })
+            .collect();
+        // Leader first: it is the member most likely to hold the key.
+        members.sort_by_key(|(id, _, _)| Some(*id) != metrics.current_leader);
+        let secret: tonic::metadata::MetadataValue<tonic::metadata::Ascii> = engine
+            .cluster_secret
+            .parse()
+            .context("cluster secret is not valid ascii")?;
+        for (_, name, host_port) in members {
+            let mut request = tonic::Request::new(FetchRootKeyRequest {
+                node_id: self.node_id.clone(),
+            });
+            request.set_timeout(FORWARD_LANE_WRITE_TIMEOUT);
+            request
+                .metadata_mut()
+                .insert(RAFT_CLUSTER_SECRET_METADATA_KEY, secret.clone());
+            // Dialing needs the engine runtime (lazy channels register with
+            // its reactor), so the whole call runs on it.
+            let pool = engine.pool.clone();
+            let reply = Self::block_on_engine(engine, async move {
+                let channel = pool.get(&host_port).map_err(|err| err.to_string())?;
+                crate::structs::raft_transport_client::RaftTransportClient::new(channel)
+                    .fetch_root_key(request)
+                    .await
+                    .map_err(|status| format!("{:?}: {}", status.code(), status.message()))
+            })?;
+            let reply = match reply {
+                Ok(reply) => reply.into_inner(),
+                Err(err) => {
+                    debug!(member = %name, "Root key fetch failed: {err}");
+                    continue;
+                }
+            };
+            if reply.root_key_bundle.is_empty() {
+                continue;
+            }
+            if reply.cluster_id != engine.cluster_id {
+                warn!(member = %name, "Ignoring a root key bundle for a different cluster");
+                continue;
+            }
+            let material = crate::storage::keyring::open_root_bundle(
+                &engine.cluster_secret,
+                &engine.cluster_id,
+                &reply.root_key_bundle,
+            )
+            .with_context(|| format!("failed opening the root key bundle from {name}"))?;
+            keyring.provider().import_material(&material)?;
+            return Ok(Some(name));
+        }
+        Ok(None)
+    }
+
     /// Partition test hook: block/unblock every outbound raft transport RPC
     /// from this node (see `Store::raft_set_outbound_blocked` and
     /// `ChannelPool::set_outbound_blocked`). Errors before engine start.
@@ -1256,6 +1340,23 @@ impl MultiRaftDriver {
                 lane.wire_name()
             )
         })
+    }
+
+    /// Test hook (see `Store::raft_set_apply_paused`): hold every lane's
+    /// state-machine apply on this node while `paused`.
+    pub(crate) fn set_apply_paused(&self, paused: bool) {
+        self.apply_paused
+            .store(paused, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Test hook (see `Store::raft_set_advertised_schema_version`): make
+    /// this node report `version` to its peers instead of its build's, or
+    /// restore the real one with `None`.
+    pub(crate) fn set_advertised_schema_version(&self, version: Option<u32>) {
+        self.advertised_schema_version.store(
+            version.unwrap_or_else(crate::storage::migrations::schema_version),
+            std::sync::atomic::Ordering::SeqCst,
+        );
     }
 
     /// Voters (by name) whose advertised schema version is unknown or below
@@ -1462,6 +1563,7 @@ fn not_leader_from_metrics(metrics: &RaftMetrics<NodeId, BasicNode>) -> NotRaftL
 /// capture (rolled back locally) → propose → wait for quorum commit +
 /// local apply (`client_write` resolves only after this node's state
 /// machine applied the entry, so the caller gets read-your-writes).
+#[allow(clippy::too_many_arguments)]
 fn execute_replicated(
     store: &Store,
     raft: &Raft,
@@ -1469,6 +1571,8 @@ fn execute_replicated(
     lane: Lane,
     op: &'static str,
     single_topology: bool,
+    pool: &ChannelPool,
+    caught_up_term: &mut Option<u64>,
     f: ReplicatedOp,
 ) -> R<Box<dyn Any + Send>> {
     // Reject non-leader proposals BEFORE opening a capture: `client_write`
@@ -1488,7 +1592,7 @@ fn execute_replicated(
         lane.wire_name()
     };
     let telemetry = crate::manager::telemetry::metrics();
-    {
+    let term = {
         let metrics = raft.metrics().borrow().clone();
         if metrics.state != ServerState::Leader {
             telemetry
@@ -1504,6 +1608,47 @@ fn execute_replicated(
             })
             .context(context));
         }
+        metrics.current_term
+    };
+    // A new leader must not capture until its state machine has applied
+    // every entry from earlier terms (R1). Entries the previous leader
+    // logged but whose commit this node had not yet heard about are still
+    // unapplied when it wins. A capture against that stale state would
+    // record an INSERT for a row an earlier entry already inserted, and the
+    // apply of the new entry would then conflict-abort on every replica.
+    // `ensure_linearizable` confirms leadership with a quorum and waits for
+    // `last_applied` to reach this term's first (blank) entry, which commits
+    // only after everything before it. Once per term: later captures in the
+    // same term are already ordered after it by this pipeline thread.
+    if *caught_up_term != Some(term) {
+        if let Err(err) = handle.block_on(raft.ensure_linearizable()) {
+            let not_leader = matches!(
+                err,
+                RaftError::APIError(CheckIsLeaderError::ForwardToLeader(_))
+            );
+            telemetry.raft_ops_total.inc(&[
+                metric_lane,
+                op,
+                if not_leader { "not_leader" } else { "error" },
+            ]);
+            if not_leader {
+                let context = match lane_label {
+                    Some(lane) => format!("raft op {op} must run on the {lane} lane's leader"),
+                    None => format!("raft op {op} must run on the leader"),
+                };
+                let metrics = raft.metrics().borrow().clone();
+                return Err(anyhow::Error::new(NotRaftLeader {
+                    lane: lane_label.map(str::to_owned),
+                    ..not_leader_from_metrics(&metrics)
+                })
+                .context(context));
+            }
+            return Err(anyhow!(
+                "raft op {op}: this leader could not confirm its leadership or catch up on \
+                 earlier terms before capturing ({err}); retry shortly"
+            ));
+        }
+        *caught_up_term = Some(term);
     }
     let capture_started = std::time::Instant::now();
     let captured = capture::capture_mutation(store, lane, f);
@@ -1536,6 +1681,12 @@ fn execute_replicated(
         single_topology,
         &changeset,
     )?;
+    // Mixed-version guard (R2): refuse a write that a member on an older
+    // schema could not apply, instead of letting it skip the rows silently.
+    if let Err(err) = check_members_can_apply(raft, pool, op, &changeset) {
+        telemetry.raft_ops_total.inc(&[metric_lane, op, "error"]);
+        return Err(err);
+    }
     let command = StoreCommand {
         lane,
         op: op.to_string(),
@@ -1568,16 +1719,79 @@ fn execute_replicated(
     Ok(value)
 }
 
+/// Fail when a raft member that advertises an older schema version than
+/// this build could not apply `changeset` (R2).
+///
+/// Raft entries are SQLite changesets, and SQLite skips every change for a
+/// table whose local layout is narrower than the changeset's (a column added
+/// by a newer migration) while still reporting success. An older member
+/// would advance its applied index past rows it never wrote, and upgrading
+/// it later would not replay them. The apply path also refuses such an
+/// entry ([`capture::apply_changeset_with`]), which stops the older member
+/// loudly; refusing here, before proposing, keeps every member healthy and
+/// only fails the writes that actually depend on the new schema.
+///
+/// Peers report their version on every transport reply. A peer that has not
+/// answered under this leadership yet is not checked (the apply-side check
+/// covers it); one running a build that predates the header is treated as
+/// version 0, so every write is refused until it is upgraded.
+fn check_members_can_apply(raft: &Raft, pool: &ChannelPool, op: &str, changeset: &[u8]) -> R<()> {
+    let ours = crate::storage::migrations::schema_version();
+    let metrics = raft.metrics().borrow().clone();
+    let mut behind: Vec<(String, u32)> = metrics
+        .membership_config
+        .membership()
+        .nodes()
+        .filter(|(id, _)| **id != metrics.id)
+        .filter_map(|(id, _)| {
+            pool.schema_version_of(*id)
+                .filter(|version| *version < ours)
+                .map(|version| (member_name(&metrics, *id), version))
+        })
+        .collect();
+    if behind.is_empty() {
+        return Ok(());
+    }
+    behind.sort();
+    let shapes = capture::changeset_table_shapes(changeset)?;
+    for (member, version) in behind {
+        let theirs = crate::storage::migrations::table_shapes_at(version)?;
+        for (table, pk) in &shapes {
+            let local = theirs.get(table).map(Vec::as_slice);
+            if let Some(reason) = capture::table_shape_mismatch(table, pk, local) {
+                let version_label = if version == 0 {
+                    "a build that predates schema-version reporting".to_string()
+                } else {
+                    format!("schema version {version}")
+                };
+                bail!(
+                    "raft op {op} needs a schema that manager {member} does not have yet \
+                     ({reason} on {version_label}; this leader runs schema version {ours}). \
+                     The write was not applied anywhere. Finish the rolling manager upgrade \
+                     (docs/upgrades.md), or move leadership to a manager on the older release \
+                     until then"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 fn pipeline_loop(
     store: Store,
     raft: Raft,
     handle: tokio::runtime::Handle,
     group: Lane,
     single_topology: bool,
+    pool: Arc<ChannelPool>,
     jobs: std_mpsc::Receiver<PipelineJob>,
 ) {
     let group_label = group.wire_name();
     let telemetry = crate::manager::telemetry::metrics();
+    // The last term in which this node's state machine was confirmed caught
+    // up on every earlier term (see `execute_replicated`).
+    let mut caught_up_term: Option<u64> = None;
     while let Ok(job) = jobs.recv() {
         let PipelineJob {
             lane,
@@ -1597,7 +1811,17 @@ fn pipeline_loop(
         // serving (a dead pipeline thread would silently fail every later
         // write on this lane).
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            execute_replicated(&store, &raft, &handle, lane, op, single_topology, f)
+            execute_replicated(
+                &store,
+                &raft,
+                &handle,
+                lane,
+                op,
+                single_topology,
+                &pool,
+                &mut caught_up_term,
+                f,
+            )
         }))
         .unwrap_or_else(|panic| {
             let message = panic
@@ -2415,14 +2639,20 @@ impl EngineJoinHandler {
                 material
             }
         };
+        self.seal_root_key(&material)
+    }
+
+    /// Seal root key material for transit to another member (empty when it
+    /// cannot be sealed, which the receiver treats as "no key here").
+    fn seal_root_key(&self, material: &[u8]) -> Vec<u8> {
         match crate::storage::keyring::seal_root_bundle(
             &self.cluster_secret,
             &self.cluster_id,
-            &material,
+            material,
         ) {
             Ok(bundle) => bundle,
             Err(err) => {
-                warn!(error = ?err, "Could not seal the KV root key for a joining manager");
+                warn!(error = ?err, "Could not seal the KV root key for another manager");
                 Vec::new()
             }
         }
@@ -2846,11 +3076,109 @@ impl RaftJoinHandler for EngineJoinHandler {
             root_key_bundle: self.root_key_bundle(),
         })
     }
+
+    async fn fetch_root_key(
+        &self,
+        request: FetchRootKeyRequest,
+    ) -> Result<FetchRootKeyReply, tonic::Status> {
+        // Only a current member gets the key. The cluster secret already
+        // authenticated the call, and a member already replicates the whole
+        // database, so this widens nothing (kv-encryption calls #18).
+        let caller = fnv1a64(&request.node_id);
+        let is_member = self.lanes.get(&Lane::Control).is_some_and(|raft| {
+            raft.metrics()
+                .borrow()
+                .membership_config
+                .membership()
+                .get_node(&caller)
+                .is_some()
+        });
+        if !is_member {
+            return Err(tonic::Status::permission_denied(format!(
+                "manager {} is not a member of this raft cluster",
+                request.node_id
+            )));
+        }
+        // Export only. Minting here would hand out a key that wraps none of
+        // the cluster's data keys, and the caller never replaces a key file
+        // once it has one.
+        let root_key_bundle = if self.keyring.enabled() {
+            self.keyring
+                .provider()
+                .export_material()
+                .map(|material| self.seal_root_key(&material))
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        debug!(
+            caller = %request.node_id,
+            delivered = !root_key_bundle.is_empty(),
+            "Answered a KV root key fetch"
+        );
+        Ok(FetchRootKeyReply {
+            cluster_id: self.cluster_id.clone(),
+            root_key_bundle,
+        })
+    }
 }
 
 // ── PersistenceDriver ────────────────────────────────────────────────────
 
 impl PersistenceDriver for MultiRaftDriver {
+    /// Orderly raft stop: shuts every lane's raft core down so the log
+    /// stores are flushed and released before the process exits.
+    ///
+    /// No leadership transfer: openraft 0.9 has no API for it (see
+    /// `issue_raft_command`'s `transfer-leader` arm). Followers of a lane
+    /// this node led elect a new leader after their election timeout, the
+    /// same as after a crash, just without a torn log tail.
+    fn shutdown(&self, timeout: Duration) {
+        let Ok(engine) = self.engine() else {
+            return;
+        };
+        let mut lanes: Vec<(Lane, Raft)> = engine
+            .lanes
+            .iter()
+            .map(|(lane, raft)| (*lane, raft.clone()))
+            .collect();
+        lanes.sort_by_key(|(lane, _)| lane.wire_name());
+        let led: Vec<&str> = lanes
+            .iter()
+            .filter(|(_, raft)| leads(raft))
+            .map(|(lane, _)| lane.wire_name())
+            .collect();
+        if !led.is_empty() {
+            info!(
+                lanes = ?led,
+                "Raft shutdown: this node leads lanes; followers elect a new leader after \
+                 their election timeout (openraft 0.9 has no leadership transfer)"
+            );
+        }
+        let shutdown_all = async move {
+            let deadline = tokio::time::Instant::now() + timeout;
+            for (lane, raft) in lanes {
+                match tokio::time::timeout_at(deadline, raft.shutdown()).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => {
+                        warn!(lane = lane.wire_name(), error = ?err, "Raft lane shutdown failed")
+                    }
+                    Err(_) => {
+                        warn!(
+                            lane = lane.wire_name(),
+                            "Raft lane shutdown timed out; exiting anyway"
+                        );
+                        return;
+                    }
+                }
+            }
+            info!("Raft lanes shut down");
+        };
+        if let Err(err) = Self::block_on_engine(engine, shutdown_all) {
+            warn!(error = ?err, "Raft shutdown failed");
+        }
+    }
+
     fn start(&self) -> R<()> {
         // The raft engine needs the Store (migrated DB, state machines);
         // `Store::start_storage` calls `start_engine` after migrations
@@ -2992,7 +3320,8 @@ impl PersistenceDriver for MultiRaftDriver {
                     engine_store.clone(),
                     data_dir.join(lane.wire_name()).join("snapshots"),
                     snapshot_scope,
-                );
+                )
+                .with_apply_pause(self.apply_paused.clone());
                 let network =
                     RaftTransportNetworkFactory::new(lane, cluster_secret.clone(), pool.clone());
                 let raft = Raft::new(
@@ -3201,6 +3530,7 @@ impl PersistenceDriver for MultiRaftDriver {
                 lanes: lanes.clone(),
                 join_handler: Some(join_handler),
                 forward_store: Some(store.forward_executor_clone()),
+                schema_version: self.advertised_schema_version.clone(),
             })
             .map_err(|_| anyhow!("raft transport registry already populated"))?;
 
@@ -3236,6 +3566,7 @@ impl PersistenceDriver for MultiRaftDriver {
             let thread_store = store.raft_engine_clone();
             let thread_raft = raft.clone();
             let thread_handle = handle.clone();
+            let thread_pool = pool.clone();
             let group = *lane;
             std::thread::Builder::new()
                 .name(format!("raft-pipeline-{}", group.wire_name()))
@@ -3246,6 +3577,7 @@ impl PersistenceDriver for MultiRaftDriver {
                         thread_handle,
                         group,
                         single_topology,
+                        thread_pool,
                         rx,
                     )
                 })

@@ -238,6 +238,42 @@ impl Store {
         }
     }
 
+    /// Fetch the cluster's KV root key from another raft member when this
+    /// manager's `file` provider has none (R3). Members that were in the
+    /// cluster before KV encryption arrived never re-join, so the join
+    /// reply never reached them. Returns the member the key came from, or
+    /// `None` when nothing was needed or no member had a key to give. A
+    /// no-op outside raft mode, with encryption off, and for `env`/`exec`
+    /// providers, whose key the operator places on every manager.
+    pub fn fetch_root_key_if_missing(&self) -> R<Option<String>> {
+        if !self.raft_mode() || !self.keyring.enabled() {
+            return Ok(None);
+        }
+        let provider = self.keyring.provider();
+        if provider.kind() != crate::storage::keyring::PROVIDER_FILE
+            || provider.export_material().is_some()
+        {
+            return Ok(None);
+        }
+        let Some(driver) = self
+            .persistence_driver
+            .as_any()
+            .downcast_ref::<crate::storage::raft::driver::MultiRaftDriver>()
+        else {
+            return Ok(None);
+        };
+        let Some(from) = driver.fetch_root_key_from_members(&self.keyring)? else {
+            return Ok(None);
+        };
+        info!(
+            from = %from,
+            location = %provider.location(),
+            "Received the cluster's KV root key from another manager and stored it"
+        );
+        self.keyring_rows_changed();
+        Ok(Some(from))
+    }
+
     /// Test hook for the upgrade gate: forget the schema version manager
     /// `peer` (by name) advertised, as if it ran a build without the header.
     /// Errors outside raft mode.
@@ -286,7 +322,8 @@ impl Store {
             self.keyring.set_pending_upgrade(None);
             return Ok(KeyringInit::AlreadyInitialized);
         }
-        if self.raft_mode() && !self.is_raft_leader(Lane::Control) {
+        // Raft followers and streaming standbys leave this to the writer.
+        if !self.is_raft_leader(Lane::Control) {
             return Ok(KeyringInit::NotLeader);
         }
         if let Some(reason) = self.keyring_upgrade_gate() {

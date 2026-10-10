@@ -296,12 +296,11 @@ impl FetcherRegistry {
         let paths = plugin_paths("artifacts", scheme, &plugin_root);
         validate_manifest("artifacts", scheme, &paths.root)
             .with_context(|| format!("invalid artifact fetcher plugin manifest for {scheme}"))?;
-        let path = paths.dylib.to_string_lossy().into_owned();
         // SAFETY: identical dylib-loading contract as task-runtime plugins; the
         // plugin must export `get() -> Box<dyn ArtifactFetcher>`.
         unsafe {
-            let lib = Library::new(&path)
-                .with_context(|| format!("load artifact fetcher plugin {path}"))?;
+            let lib =
+                crate::plugin_runtime::open_plugin_library("artifacts", scheme, &paths.dylib)?;
             let fetcher: Arc<dyn ArtifactFetcher> = {
                 let func: Symbol<unsafe extern "C" fn() -> Box<dyn ArtifactFetcher>> =
                     lib.get(b"get")?;

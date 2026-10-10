@@ -34,6 +34,13 @@ pub struct ServerConfig {
     /// TLS for the manager listener. Off unless `enabled` is true.
     #[serde(default)]
     pub tls: Option<TlsConfig>,
+    /// Browser origins (`scheme://host[:port]`) allowed to call the gRPC-Web
+    /// API and the exec WebSocket, in addition to loopback origins, which are
+    /// always allowed. `["*"]` allows every origin. Requests without an
+    /// `Origin` header (CLI, workers, SDKs) are never affected.
+    /// Default: empty (loopback origins only).
+    #[serde(default)]
+    pub allowed_origins: Option<Vec<String>>,
 }
 
 /// TLS settings for the manager's gRPC listener.
@@ -1541,6 +1548,8 @@ pub struct ServerConfigFull {
     pub advertise_addr: Option<String>,
     #[serde(default)]
     pub tls: TlsConfigFull,
+    #[serde(default)]
+    pub allowed_origins: Vec<String>,
 }
 
 impl ServerConfigFull {
@@ -1567,6 +1576,7 @@ impl From<ServerConfigFull> for ServerConfig {
             host: Some(val.host),
             advertise_addr: val.advertise_addr,
             tls: Some(val.tls.into()),
+            allowed_origins: Some(val.allowed_origins),
         }
     }
 }
@@ -1586,6 +1596,7 @@ impl ServerConfig {
                 .as_ref()
                 .map(TlsConfig::with_defaults)
                 .unwrap_or_default(),
+            allowed_origins: self.allowed_origins.clone().unwrap_or_default(),
         }
     }
 
@@ -1596,6 +1607,7 @@ impl ServerConfig {
             host: DEF_MANAGER_HOSTNAME.to_string(),
             advertise_addr: None,
             tls: TlsConfigFull::default(),
+            allowed_origins: Vec::new(),
         }
     }
 }

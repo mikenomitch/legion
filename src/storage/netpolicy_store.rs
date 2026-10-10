@@ -350,4 +350,48 @@ mod tests {
         store.upsert_net_policy(policy("c", "require", 5))?;
         Ok(())
     }
+
+    /// Private keys never come back through raw SQL (`state:read`), however
+    /// the query reaches them, and the manager's own reads are unaffected.
+    #[test]
+    fn query_state_store_reads_private_keys_as_null() -> R<()> {
+        let store = setup_store()?;
+        let ca = store.ensure_mesh_ca()?;
+        assert!(!ca.key_pem.is_empty());
+        store.query_state_store(
+            "INSERT INTO signing_key (kid, alg, private_key_pem, public_jwk_x, public_jwk_y, \
+             created_at, state) VALUES ('k1', 'ES256', 'PRIVATE', 'x', 'y', 0, 'active')",
+            true,
+        )?;
+
+        let first_row = |sql: &str| -> R<serde_json::Value> {
+            let result = store.query_state_store(sql, false)?;
+            let row = result.rows.first().context("expected a row")?;
+            Ok(serde_json::from_str(&row.json)?)
+        };
+        let row = first_row("SELECT * FROM net_mesh_ca")?;
+        assert_eq!(row["key_pem"], serde_json::Value::Null);
+        assert_eq!(row["cert_pem"], json!(ca.cert_pem));
+        let row = first_row("SELECT k.key_pem AS x FROM net_mesh_ca AS k")?;
+        assert_eq!(row["x"], serde_json::Value::Null);
+        let row =
+            first_row("WITH c AS (SELECT private_key_pem AS p FROM signing_key) SELECT p FROM c")?;
+        assert_eq!(row["p"], serde_json::Value::Null);
+        // A predicate cannot probe the value either.
+        let probe = store.query_state_store(
+            "SELECT kid FROM signing_key WHERE private_key_pem = 'PRIVATE'",
+            false,
+        )?;
+        assert!(probe.rows.is_empty());
+
+        // Copying the key into a readable table copies NULL.
+        store.query_state_store("CREATE TABLE leak (v TEXT)", true)?;
+        store.query_state_store("INSERT INTO leak SELECT key_pem FROM net_mesh_ca", true)?;
+        let row = first_row("SELECT v FROM leak")?;
+        assert_eq!(row["v"], serde_json::Value::Null);
+
+        // The authorizer is removed afterwards: the manager still signs.
+        assert_eq!(store.mesh_ca()?.context("mesh CA")?.key_pem, ca.key_pem);
+        Ok(())
+    }
 }

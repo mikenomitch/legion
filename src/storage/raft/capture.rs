@@ -641,6 +641,95 @@ pub(crate) fn local_projected_mutation<T>(
     Ok(value)
 }
 
+/// Primary-key flags per column for every table a changeset touches, as the
+/// changeset recorded them (R2). Its length is the table's column count on
+/// the node that captured it. Tables the apply filter skips
+/// ([`ownership::table_applies_from_changeset`]) are left out.
+pub(crate) fn changeset_table_shapes(
+    changeset: &[u8],
+) -> R<std::collections::BTreeMap<String, Vec<bool>>> {
+    use fallible_streaming_iterator::FallibleStreamingIterator;
+    use rusqlite::session::ChangesetIter;
+
+    let mut shapes = std::collections::BTreeMap::new();
+    if changeset.is_empty() {
+        return Ok(shapes);
+    }
+    let reader: &mut dyn std::io::Read = &mut &*changeset;
+    let mut iter = ChangesetIter::start_strm(&reader)
+        .context("failed opening changeset iterator for the schema check")?;
+    while let Some(item) = iter
+        .next()
+        .context("failed iterating changeset for the schema check")?
+    {
+        let table = item.op()?.table_name().to_string();
+        if shapes.contains_key(&table) || !ownership::table_applies_from_changeset(&table) {
+            continue;
+        }
+        let pk: Vec<bool> = item.pk()?.iter().map(|flag| *flag != 0).collect();
+        shapes.insert(table, pk);
+    }
+    Ok(shapes)
+}
+
+/// Primary-key flags per column of `table` on `conn`, or `None` when the
+/// table does not exist.
+pub(crate) fn table_pk_flags(conn: &Connection, table: &str) -> R<Option<Vec<bool>>> {
+    let mut stmt = conn.prepare_cached("SELECT pk FROM pragma_table_info(?1) ORDER BY cid;")?;
+    let flags: Vec<bool> = stmt
+        .query_map([table], |row| row.get::<_, i64>(0))?
+        .map(|pk| pk.map(|pk| pk != 0))
+        .collect::<Result<_, _>>()?;
+    Ok((!flags.is_empty()).then_some(flags))
+}
+
+/// Why a changeset's rows for `table` cannot apply to a table with the
+/// `local` layout, or `None` when they can. Mirrors SQLite's own
+/// compatibility rule for `sqlite3changeset_apply`: the table must exist,
+/// have at least as many columns as the changeset, and have its primary key
+/// in the same positions. SQLite does not fail on an incompatible table. It
+/// skips every change for it, logs a warning, and reports success, which
+/// would let a replica advance its applied index past rows it never wrote.
+pub(crate) fn table_shape_mismatch(
+    table: &str,
+    changeset_pk: &[bool],
+    local: Option<&[bool]>,
+) -> Option<String> {
+    match local {
+        None => Some(format!("table `{table}` does not exist")),
+        Some(local) if local.len() < changeset_pk.len() => Some(format!(
+            "table `{table}` has {} columns where the change has {}",
+            local.len(),
+            changeset_pk.len()
+        )),
+        Some(local) if local[..changeset_pk.len()] != *changeset_pk => Some(format!(
+            "table `{table}` has a different primary key than the change"
+        )),
+        Some(_) => None,
+    }
+}
+
+/// Fail when any table in `changeset` cannot apply to `conn`'s schema (see
+/// [`table_shape_mismatch`]). The apply path runs this before applying, so
+/// a manager running an older schema than the leader stops on the entry
+/// with an error naming the fix instead of silently dropping the rows.
+fn check_changeset_fits_schema(conn: &Connection, changeset: &[u8]) -> R<()> {
+    for (table, pk) in changeset_table_shapes(changeset)? {
+        let local = table_pk_flags(conn, &table)?;
+        if let Some(reason) = table_shape_mismatch(&table, &pk, local.as_deref()) {
+            bail!(
+                "this manager's schema cannot apply a replicated change: {reason}. This \
+                 manager runs an older build (schema version {}) than the leader that wrote \
+                 the entry. Upgrade it to the leader's release and restart it; the entry was \
+                 not applied and this lane resumes from it after the upgrade \
+                 (docs/upgrades.md)",
+                crate::storage::migrations::schema_version()
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Apply a committed changeset to this node's database inside a transaction,
 /// then project its read-model/event/notify side effects. Any conflict means
 /// the replica diverged from the leader — impossible by construction under
@@ -698,6 +787,7 @@ pub(crate) fn apply_changeset_with(
             // (there is nothing to iterate) but still run `within_tx` so the
             // applied-log marker advances.
             if !bytes.is_empty() {
+                check_changeset_fits_schema(&sp, bytes)?;
                 let mut input: &[u8] = bytes;
                 // Table filter: LocalOnly/Internal tables never apply from a
                 // changeset — their rows are node-local raft bookkeeping or
@@ -1190,6 +1280,63 @@ mod tests {
             format!("{err:#}").contains("failed applying replicated changeset"),
             "{err:#}"
         );
+        Ok(())
+    }
+
+    /// SQLite's changeset apply silently skips every change for a table
+    /// narrower than the changeset (a column a newer migration added) and
+    /// reports success. That is how an older replica would drop a newer
+    /// leader's rows while advancing its applied index (R2). The apply path
+    /// must refuse such an entry instead.
+    #[test]
+    fn a_change_for_a_wider_table_is_refused_not_silently_skipped() -> R<()> {
+        // The raw SQLite behavior the check exists for.
+        let wide = Connection::open_in_memory()?;
+        wide.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT, b TEXT);")?;
+        let narrow = Connection::open_in_memory()?;
+        narrow.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT);")?;
+        let mut changeset = Vec::new();
+        {
+            let mut session = Session::new(&wide)?;
+            session.attach(None)?;
+            wide.execute("INSERT INTO t VALUES (1, 'x', 'y');", [])?;
+            session.changeset_strm(&mut changeset)?;
+        }
+        let mut input: &[u8] = &changeset;
+        narrow.apply_strm(&mut input, None::<fn(&str) -> bool>, |_, _| {
+            rusqlite::session::ConflictAction::SQLITE_CHANGESET_ABORT
+        })?;
+        let rows: i64 = narrow.query_row("SELECT count(*) FROM t;", [], |row| row.get(0))?;
+        assert_eq!(rows, 0, "SQLite skips the change and still reports success");
+        let err = check_changeset_fits_schema(&narrow, &changeset)
+            .expect_err("a narrower table must fail the schema check");
+        assert!(
+            format!("{err:#}").contains("has 2 columns where the change has 3"),
+            "{err:#}"
+        );
+        assert!(check_changeset_fits_schema(&wide, &changeset).is_ok());
+
+        // End to end through the store's apply path: a replica missing a
+        // column the leader's schema has refuses the entry and applies
+        // nothing.
+        let src = setup_store()?;
+        let dst = setup_store()?;
+        let (_, changeset) = capture_mutation(&src, Lane::Control, |s| {
+            s.put_kv("skew/key", "v", KvValueType::String, None, None)
+        })?;
+        dst.write_connection()?
+            .execute_batch("ALTER TABLE kv_entry DROP COLUMN enc_key_id;")?;
+        let err = apply_changeset(&dst, &changeset)
+            .expect_err("an entry this schema cannot hold must not apply");
+        let rendered = format!("{err:#}");
+        assert!(rendered.contains("table `kv_entry` has"), "{rendered}");
+        assert!(rendered.contains("older build"), "{rendered}");
+        let rows: i64 = dst.read_connection()?.query_row(
+            "SELECT count(*) FROM kv_entry WHERE key = 'skew/key';",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(rows, 0);
         Ok(())
     }
 

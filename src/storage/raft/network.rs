@@ -124,9 +124,10 @@ pub(crate) struct ChannelPool {
     /// Schema version each peer last advertised on a transport reply
     /// (`x-legion-schema-version`, see `migrations::schema_version`). The
     /// leader hears from every follower on each AppendEntries round, so this
-    /// is fresh within a heartbeat interval; a peer that has never answered,
-    /// or runs a build that predates the header, is simply absent. Read by
-    /// version-gated features (the KV keyring's upgrade gate).
+    /// is fresh within a heartbeat interval. A peer that has never answered
+    /// is absent; one that runs a build that predates the header is
+    /// recorded as 0. Read by version-gated features (the KV keyring's
+    /// upgrade gate, the mixed-version write guard).
     schema_versions: Mutex<HashMap<NodeId, u32>>,
     /// Partition test hook (`Store::raft_set_outbound_blocked`): while set,
     /// every outbound raft RPC from this node fails as [`Unreachable`]
@@ -324,15 +325,17 @@ impl RaftTransportNetwork {
             status_to_rpc_error(&status)
         })?;
         // The peer stamps every reply with the schema version its build
-        // migrates to; remember it for version-gated features.
-        if let Some(version) = reply
+        // migrates to; remember it for version-gated features. A successful
+        // lane reply without the header comes from a build that predates
+        // it, recorded as 0 so the mixed-version write guard treats that
+        // peer as behind every schema (driver::check_members_can_apply).
+        let version = reply
             .metadata()
             .get(crate::storage::raft::RAFT_SCHEMA_VERSION_METADATA_KEY)
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.parse::<u32>().ok())
-        {
-            self.pool.record_schema_version(self.target, version);
-        }
+            .unwrap_or(0);
+        self.pool.record_schema_version(self.target, version);
         let reply = reply.into_inner();
 
         let result: Result<Reply, RemoteErr> = serde_json::from_slice(&reply.payload)

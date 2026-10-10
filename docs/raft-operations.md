@@ -245,6 +245,11 @@ backed by the same engine state as the CLI.
 - **Restart without deadlock:** a restarted member may briefly log that no
   leader is known and continue without one. It catches up as soon as its
   listener is up and peers reconnect.
+- **Stopping a member:** send SIGTERM. The manager drains its API and shuts
+  each lane's raft core down cleanly. Leadership is not transferred first
+  (openraft 0.9 has no API for it), so stopping a leader pauses writes on its
+  lanes until the others elect a new leader. Restart one member at a time.
+  See [Stopping a manager](upgrades.md#stopping-a-manager).
 - **Observability:** `legion raft status` and `history`, the UI Raft page,
   and `/readyz` all report raft state. In raft mode, `/readyz` requires a
   known leader. While the voter count is even, it also includes the

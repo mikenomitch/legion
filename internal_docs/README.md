@@ -24,6 +24,9 @@ architecture and behavior docs are public.
 - [TODO.md](TODO.md) — the higher-level To Do list. Open work at the top grouped
   by area, shipped work in the Done section at the bottom. Check things off as
   you finish them.
+- [architecture-audit-2026-10-09.md](architecture-audit-2026-10-09.md) — the
+  2026-10-09 whole-codebase review for design-level errors, with per-finding
+  fix status.
 - [differentiators.md](differentiators.md) — the running list of what makes
   Legion different from K8s and Nomad (part idea list, part roadmap).
 - [stateful-vs-nomad-k8s.md](stateful-vs-nomad-k8s.md) — honest gap analysis of
@@ -153,6 +156,7 @@ header. Entries give the call, the alternatives, the trade-off, and why — rank
 by project impact. The full template and a worked example:
 [`calls/README.md`](calls/README.md).
 
+- [architecture-audit-2026-10-09_calls.md](calls/architecture-audit-2026-10-09_calls.md)
 - [artifact-system-plan_calls.md](calls/artifact-system-plan_calls.md)
 - [artifact-cache-and-prewarm-plan_calls.md](calls/artifact-cache-and-prewarm-plan_calls.md)
 - [autoscaler-plan_calls.md](calls/autoscaler-plan_calls.md)

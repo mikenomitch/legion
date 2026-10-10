@@ -133,6 +133,21 @@ pub trait PersistenceDriver: Send + Sync + Debug {
 
     fn status(&self) -> PersistenceStatus;
 
+    /// Why this manager must not write right now, or `None` when it may.
+    /// `Store::replicated` refuses every non-raft write while this is set.
+    /// Only a streaming standby (or a fenced ex-primary) refuses; raft
+    /// enforces leadership in its own pipeline.
+    fn write_refusal(&self) -> Option<String> {
+        None
+    }
+
+    /// Orderly stop on process shutdown (SIGTERM/SIGINT): flush what must be
+    /// durable and release what peers are waiting on, so a clean stop loses
+    /// nothing a crash would not. Blocks, so call it from a blocking
+    /// context, and returns within roughly `timeout`. The default has
+    /// nothing to do (local disk is durable on every commit).
+    fn shutdown(&self, _timeout: StdDuration) {}
+
     /// Concrete-type escape hatch (e.g. to reach the raft driver's transport
     /// registry from the daemon wiring).
     fn as_any(&self) -> &dyn std::any::Any;
@@ -188,13 +203,39 @@ impl PersistenceDriver for LocalDiskPersistenceDriver {
 /// in-process embedding API: a managed [`Db`] takes over SQLite checkpointing
 /// and ships each WAL segment to object storage through a [`Replica`], while an
 /// optional [`S3Leaser`] provides single-primary fencing.
+///
+/// Only the primary writes and ships WAL (R4). With the object-storage lease
+/// a manager starts as a standby: its leader-only loops idle
+/// (`Store::is_raft_leader` reads the role) and the store refuses writes
+/// ([`PersistenceDriver::write_refusal`]). When it acquires the lease it
+/// first restores the store from the replica, then starts shipping, and only
+/// then reports itself primary. A primary that loses the lease (or cannot
+/// renew it for a whole TTL) is fenced for the rest of the process: it stops
+/// shipping, refuses writes, and does not compete for the lease again until
+/// it is restarted.
 #[derive(Debug)]
 pub struct StreamingPersistenceDriver {
     db_path: std::path::PathBuf,
     cfg: StreamingPersistenceConfigFull,
     role_primary: Arc<AtomicBool>,
     lease_held: Arc<AtomicBool>,
+    /// Stops the object-storage lease loop (which releases the lease).
     shutdown: Arc<AtomicBool>,
+    /// Stops the replica sync loop, which runs one final sync on the way out.
+    /// Separate from `shutdown` so an orderly stop can finish the final sync
+    /// before giving up the lease: a standby that takes over must find every
+    /// committed write in the replica.
+    replica_shutdown: Arc<AtomicBool>,
+    /// Fires when the replica sync thread has exited (final sync done). Shared
+    /// with the promotion, which is what starts that thread under a lease.
+    replica_exited: ExitSlot,
+    /// Fires when the lease loop thread has exited (lease released).
+    lease_exited: ExitSlot,
+    /// Set once this process lost the lease after holding it. Never cleared.
+    fenced: Arc<AtomicBool>,
+    /// The store a promotion restores into. A clone with a placeholder
+    /// driver, so it holds no reference back to this driver.
+    store: Arc<std::sync::OnceLock<Store>>,
 }
 
 impl StreamingPersistenceDriver {
@@ -205,6 +246,11 @@ impl StreamingPersistenceDriver {
             role_primary: Arc::new(AtomicBool::new(false)),
             lease_held: Arc::new(AtomicBool::new(false)),
             shutdown: Arc::new(AtomicBool::new(false)),
+            replica_shutdown: Arc::new(AtomicBool::new(false)),
+            replica_exited: ExitSlot::default(),
+            lease_exited: ExitSlot::default(),
+            fenced: Arc::new(AtomicBool::new(false)),
+            store: Arc::new(std::sync::OnceLock::new()),
         }
     }
 
@@ -212,54 +258,17 @@ impl StreamingPersistenceDriver {
         std::env::var("HOSTNAME").unwrap_or_else(|_| "legion-manager".to_string())
     }
 
-    /// Open the managed database and drive the rustyriver WAL→object-storage
-    /// sync loop on a dedicated thread (the in-process replacement for the old
-    /// `litestream replicate` subprocess).
-    fn start_replication(&self) -> R<()> {
-        if self.cfg.replica_url.trim().is_empty() {
-            info!(
-                "Streaming persistence enabled without replica URL; skipping rustyriver replication"
-            );
-            return Ok(());
+    fn promotion(&self) -> Promotion {
+        Promotion {
+            db_path: self.db_path.clone(),
+            replica_url: self.cfg.replica_url.clone(),
+            interval: parse_sync_interval(&self.cfg.sync_interval),
+            store: Arc::clone(&self.store),
+            shutdown: Arc::clone(&self.shutdown),
+            replica_shutdown: Arc::clone(&self.replica_shutdown),
+            replica_exited: Arc::clone(&self.replica_exited),
+            fenced: Arc::clone(&self.fenced),
         }
-
-        // Open synchronously so the long-running read lock that takes over
-        // checkpointing is held before `start()` returns. The `Db` is `!Sync`,
-        // so it is moved onto — and stays on — the worker thread from here.
-        let db = Db::open(&self.db_path).with_context(|| {
-            format!(
-                "rustyriver failed to open managed database at {}",
-                self.db_path.display()
-            )
-        })?;
-
-        let replica_url = self.cfg.replica_url.clone();
-        let interval = parse_sync_interval(&self.cfg.sync_interval);
-        let shutdown = Arc::clone(&self.shutdown);
-
-        std::thread::Builder::new()
-            .name("persistence-replica-sync".to_string())
-            .spawn(move || {
-                let rt = match build_loop_runtime() {
-                    Ok(rt) => rt,
-                    Err(err) => {
-                        error!(error = ?err, "failed to build runtime for rustyriver replication");
-                        return;
-                    }
-                };
-                rt.block_on(async move {
-                    if let Err(err) = run_replica_loop(db, replica_url, interval, shutdown).await {
-                        error!(error = ?err, "rustyriver replication loop exited");
-                    }
-                });
-            })
-            .context("failed to spawn rustyriver replication thread")?;
-
-        info!(
-            interval_secs = interval.as_secs_f64(),
-            "Started rustyriver streaming replication"
-        );
-        Ok(())
     }
 
     fn start_object_storage_lease_loop(&self) -> R<()> {
@@ -267,8 +276,12 @@ impl StreamingPersistenceDriver {
         let object_cfg = lease_cfg.object_storage.clone();
         let role_primary = Arc::clone(&self.role_primary);
         let lease_held = Arc::clone(&self.lease_held);
-        let shutdown = Arc::clone(&self.shutdown);
+        let promotion = self.promotion();
         let owner = Self::host_identity();
+        let (exited_tx, exited_rx) = std::sync::mpsc::channel();
+        if let Ok(mut slot) = self.lease_exited.lock() {
+            *slot = Some(exited_rx);
+        }
 
         std::thread::Builder::new()
             .name("persistence-object-lease".to_string())
@@ -289,13 +302,14 @@ impl StreamingPersistenceDriver {
                         lease_cfg.renew_interval_seconds,
                         role_primary,
                         lease_held,
-                        shutdown,
+                        promotion,
                     )
                     .await
                     {
-                        error!(error = ?err, "Object-storage lease loop exited");
+                        error!(error = ?err, "Object-storage lease loop exited; this manager stays a standby");
                     }
                 });
+                let _ = exited_tx.send(());
             })
             .context("failed to spawn object-storage lease loop thread")?;
 
@@ -308,25 +322,58 @@ impl Drop for StreamingPersistenceDriver {
         // Signal the replication + lease loops to wind down. Best-effort: the
         // detached worker threads observe this flag on their next cycle and
         // release the WAL read lock / object-storage lease as they exit.
+        self.replica_shutdown.store(true, Ordering::Relaxed);
         self.shutdown.store(true, Ordering::Relaxed);
     }
 }
 
+/// Where a loop thread reports that it has exited. Empty until the thread
+/// starts, so a loop that never ran counts as exited.
+type ExitSlot = Arc<std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>>;
+
+/// Waits for a loop thread's exit signal until `deadline`. A thread that
+/// never started (no receiver) counts as exited.
+fn wait_for_exit(slot: &ExitSlot, deadline: std::time::Instant) -> bool {
+    let Some(receiver) = slot.lock().ok().and_then(|mut r| r.take()) else {
+        return true;
+    };
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    // A closed channel means the thread is gone too.
+    !matches!(
+        receiver.recv_timeout(remaining),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+    )
+}
+
 impl PersistenceDriver for StreamingPersistenceDriver {
     fn start(&self) -> R<()> {
-        self.start_replication()?;
-
         match self.cfg.lease.provider {
+            // Manual failover: this manager is the primary from the start,
+            // and the operator keeps it the only one.
             StreamingLeaseProvider::None => {
+                start_replication(
+                    &self.db_path,
+                    &self.cfg.replica_url,
+                    parse_sync_interval(&self.cfg.sync_interval),
+                    Arc::clone(&self.replica_shutdown),
+                    Arc::clone(&self.fenced),
+                    &self.replica_exited,
+                )?;
                 self.role_primary.store(true, Ordering::Relaxed);
                 self.lease_held.store(true, Ordering::Relaxed);
             }
+            // Standby until the lease loop acquires the lease and promotes.
             StreamingLeaseProvider::ObjectStorage => {
                 self.start_object_storage_lease_loop()?;
             }
         }
 
         Ok(())
+    }
+
+    fn start_engine(&self, store: &Store) -> R<()> {
+        let _ = self.store.set(store.raft_engine_clone());
+        self.start()
     }
 
     fn status(&self) -> PersistenceStatus {
@@ -343,9 +390,213 @@ impl PersistenceDriver for StreamingPersistenceDriver {
         }
     }
 
+    fn write_refusal(&self) -> Option<String> {
+        if self.role_primary.load(Ordering::Relaxed) {
+            return None;
+        }
+        Some(if self.fenced.load(Ordering::Relaxed) {
+            "this streaming manager lost the persistence lease and is fenced: it no longer \
+             writes. Send writes to the current primary, and restart this manager to rejoin \
+             as a standby (docs/persistence-streaming.md)"
+                .to_string()
+        } else {
+            "this streaming manager is a standby (it does not hold the persistence lease) and \
+             does not accept writes. Send writes to the primary (docs/persistence-streaming.md)"
+                .to_string()
+        })
+    }
+
+    /// Final replica sync first, then lease release, so a standby that wins
+    /// the lease restores every write this primary committed.
+    fn shutdown(&self, timeout: StdDuration) {
+        let deadline = std::time::Instant::now() + timeout;
+        self.replica_shutdown.store(true, Ordering::Relaxed);
+        if wait_for_exit(&self.replica_exited, deadline) {
+            info!("Streaming persistence: final replica sync finished");
+        } else {
+            warn!(
+                timeout_secs = timeout.as_secs(),
+                "Streaming persistence: final replica sync did not finish in time; \
+                 the newest writes may be missing from the replica"
+            );
+        }
+        self.shutdown.store(true, Ordering::Relaxed);
+        if !wait_for_exit(&self.lease_exited, deadline) {
+            warn!("Streaming persistence: lease release did not finish in time; a standby takes over once the lease TTL expires");
+        }
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
+}
+
+/// Everything a lease holder needs to turn into the primary (R4).
+#[derive(Debug, Clone)]
+struct Promotion {
+    db_path: std::path::PathBuf,
+    replica_url: String,
+    interval: StdDuration,
+    store: Arc<std::sync::OnceLock<Store>>,
+    /// The lease loop's stop flag.
+    shutdown: Arc<AtomicBool>,
+    /// The replica sync loop's stop flag (see the driver's field).
+    replica_shutdown: Arc<AtomicBool>,
+    replica_exited: ExitSlot,
+    fenced: Arc<AtomicBool>,
+}
+
+impl Promotion {
+    /// Bring this manager's store up to the replica, then start shipping.
+    ///
+    /// A standby's local database is whatever it had when it last ran, which
+    /// can be far behind what the previous primary shipped. Serving or
+    /// shipping from it would put stale state in front of clients and
+    /// overwrite newer history in the replica. So a new primary first
+    /// restores the replica's latest state into its store, migrates it to
+    /// this build's schema, and swaps it in. An empty replica (a brand-new
+    /// deployment) leaves the local database as it is. rustyriver's local
+    /// tracking state is reset either way, so shipping starts with a fresh
+    /// snapshot that continues the replica's history.
+    async fn run(&self) -> R<()> {
+        let store = self
+            .store
+            .get()
+            .context("streaming store is not started yet")?;
+        if !self.replica_url.trim().is_empty() {
+            let staged = staged_restore_path(&self.db_path);
+            for path in [&staged, &staged.with_extension("tmp")] {
+                let _ = std::fs::remove_file(path);
+            }
+            if restore_replica_to(&self.replica_url, &staged).await? {
+                {
+                    let mut conn = rusqlite::Connection::open(&staged).with_context(|| {
+                        format!("failed opening restored store {}", staged.display())
+                    })?;
+                    crate::storage::migrations::get_migrations()
+                        .to_latest(&mut conn)
+                        .context("failed migrating the restored store")?;
+                }
+                store.install_state_db(&staged)?;
+                info!(path = %self.db_path.display(), "Restored the store from the streaming replica before taking over as primary");
+            } else {
+                info!("Streaming replica is empty; the new primary keeps its local store");
+            }
+        }
+        match std::fs::remove_dir_all(Db::meta_path_for_path(&self.db_path)) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err).context("failed resetting rustyriver's local state"),
+        }
+        start_replication(
+            &self.db_path,
+            &self.replica_url,
+            self.interval,
+            Arc::clone(&self.replica_shutdown),
+            Arc::clone(&self.fenced),
+            &self.replica_exited,
+        )
+    }
+}
+
+/// Where a promotion stages the restored database: next to the store, so
+/// the swap is a same-filesystem rename.
+fn staged_restore_path(db_path: &std::path::Path) -> std::path::PathBuf {
+    let mut name = db_path.file_name().unwrap_or_default().to_os_string();
+    name.push(".promote-restore");
+    db_path.with_file_name(name)
+}
+
+/// Restore the replica's latest state to `output`. `Ok(false)` when the
+/// replica holds nothing yet.
+async fn restore_replica_to(replica_url: &str, output: &std::path::Path) -> R<bool> {
+    async fn restore_with<C: ReplicaClient>(client: C, output: &std::path::Path) -> R<bool> {
+        if client
+            .ltx_files(0, rustyriver::TXID(0), false)
+            .await
+            .context("failed listing the streaming replica")?
+            .is_empty()
+        {
+            return Ok(false);
+        }
+        rustyriver::restore(&client, output, rustyriver::TXID(0))
+            .await
+            .context("failed restoring the streaming replica")?;
+        Ok(true)
+    }
+    if is_object_store_url(replica_url) {
+        let parsed = parse_replica_url_with_query(replica_url)
+            .with_context(|| format!("invalid streaming replica URL: {replica_url}"))?;
+        let config = ObjectStoreConfig::from_url(&parsed)
+            .with_context(|| format!("invalid streaming replica URL: {replica_url}"))?;
+        restore_with(ObjectStoreClient::new(config), output).await
+    } else {
+        restore_with(
+            FileReplicaClient::new(file_replica_path(replica_url)),
+            output,
+        )
+        .await
+    }
+}
+
+/// Open the managed database and drive the rustyriver WAL→object-storage
+/// sync loop on a dedicated thread (the in-process replacement for the old
+/// `litestream replicate` subprocess). Only the primary calls this. The loop
+/// stops at shutdown or when this manager is fenced.
+fn start_replication(
+    db_path: &std::path::Path,
+    replica_url: &str,
+    interval: StdDuration,
+    shutdown: Arc<AtomicBool>,
+    fenced: Arc<AtomicBool>,
+    exited: &ExitSlot,
+) -> R<()> {
+    if replica_url.trim().is_empty() {
+        info!("Streaming persistence enabled without replica URL; skipping rustyriver replication");
+        return Ok(());
+    }
+
+    // Open synchronously so the long-running read lock that takes over
+    // checkpointing is held before this returns. The `Db` is `!Sync`, so it
+    // is moved onto — and stays on — the worker thread from here.
+    let db = Db::open(db_path).with_context(|| {
+        format!(
+            "rustyriver failed to open managed database at {}",
+            db_path.display()
+        )
+    })?;
+
+    let replica_url = replica_url.to_string();
+    let (exited_tx, exited_rx) = std::sync::mpsc::channel();
+    if let Ok(mut slot) = exited.lock() {
+        *slot = Some(exited_rx);
+    }
+    std::thread::Builder::new()
+        .name("persistence-replica-sync".to_string())
+        .spawn(move || {
+            let rt = match build_loop_runtime() {
+                Ok(rt) => rt,
+                Err(err) => {
+                    error!(error = ?err, "failed to build runtime for rustyriver replication");
+                    return;
+                }
+            };
+            rt.block_on(async move {
+                if let Err(err) =
+                    run_replica_loop(db, replica_url, interval, shutdown, fenced).await
+                {
+                    error!(error = ?err, "rustyriver replication loop exited");
+                }
+            });
+            let _ = exited_tx.send(());
+        })
+        .context("failed to spawn rustyriver replication thread")?;
+
+    info!(
+        interval_secs = interval.as_secs_f64(),
+        "Started rustyriver streaming replication"
+    );
+    Ok(())
 }
 
 // ── rustyriver replication helpers ────────────────────────────────────────────
@@ -385,16 +636,18 @@ async fn run_replica_loop(
     replica_url: String,
     interval: StdDuration,
     shutdown: Arc<AtomicBool>,
+    fenced: Arc<AtomicBool>,
 ) -> R<()> {
     if is_object_store_url(&replica_url) {
         let parsed = parse_replica_url_with_query(&replica_url)
             .with_context(|| format!("invalid streaming replica URL: {replica_url}"))?;
         let config = ObjectStoreConfig::from_url(&parsed)
             .with_context(|| format!("invalid streaming replica URL: {replica_url}"))?;
-        replica_sync_loop(db, ObjectStoreClient::new(config), interval, shutdown).await
+        let client = ObjectStoreClient::new(config);
+        replica_sync_loop(db, client, interval, shutdown, fenced).await
     } else {
         let client = FileReplicaClient::new(file_replica_path(&replica_url));
-        replica_sync_loop(db, client, interval, shutdown).await
+        replica_sync_loop(db, client, interval, shutdown, fenced).await
     }
 }
 
@@ -405,13 +658,29 @@ async fn replica_sync_loop<C: ReplicaClient>(
     client: C,
     interval: StdDuration,
     shutdown: Arc<AtomicBool>,
+    fenced: Arc<AtomicBool>,
 ) -> R<()> {
     let mut replica = Replica::new(db, client);
-    while !shutdown.load(Ordering::Relaxed) {
+    // Continue the replica's history when the local database is behind it
+    // (a fresh primary that just restored from it).
+    if let Err(err) = replica.check_database_behind_replica().await {
+        warn!(error = ?err, "rustyriver could not compare the database with the replica");
+    }
+    // A fenced ex-primary must never ship again: another primary owns the
+    // replica now.
+    while !shutdown.load(Ordering::Relaxed) && !fenced.load(Ordering::Relaxed) {
         if let Err(err) = sync_once(&mut replica).await {
             warn!(error = ?err, "rustyriver replica sync cycle failed");
         }
-        tokio::time::sleep(interval).await;
+        sleep_unless_shutdown(interval, &shutdown).await;
+    }
+    // Final sync: ship whatever was committed since the last cycle, so an
+    // orderly stop leaves the replica as current as the local database. Never
+    // when fenced: another primary owns the replica now.
+    if !fenced.load(Ordering::Relaxed) {
+        if let Err(err) = sync_once(&mut replica).await {
+            warn!(error = ?err, "rustyriver final replica sync failed during shutdown");
+        }
     }
     // Release the long-running read lock so SQLite can checkpoint freely again.
     if let Some(db) = replica.into_db() {
@@ -523,7 +792,7 @@ async fn object_storage_lease_loop(
     renew_interval_seconds: u64,
     role_primary: Arc<AtomicBool>,
     lease_held: Arc<AtomicBool>,
-    shutdown: Arc<AtomicBool>,
+    promotion: Promotion,
 ) -> R<()> {
     if object_cfg.bucket.trim().is_empty() {
         bail!("streaming.objectStorage lease requires bucket");
@@ -536,28 +805,77 @@ async fn object_storage_lease_loop(
         .with_path(lease_path_prefix(&key))
         .with_ttl(ttl)
         .with_owner(owner);
+    lease_loop(&leaser, ttl, renew, role_primary, lease_held, promotion).await;
+    Ok(())
+}
 
+/// Acquire, renew, promote, and fence (see [`StreamingPersistenceDriver`]).
+/// Returns at shutdown, or once this manager is fenced.
+async fn lease_loop<L: Leaser>(
+    leaser: &L,
+    ttl: StdDuration,
+    renew: StdDuration,
+    role_primary: Arc<AtomicBool>,
+    lease_held: Arc<AtomicBool>,
+    promotion: Promotion,
+) {
     let mut held: Option<Lease> = None;
+    let mut last_renewed = std::time::Instant::now();
+    let fence = |reason: &str| {
+        promotion.fenced.store(true, Ordering::Relaxed);
+        role_primary.store(false, Ordering::Relaxed);
+        lease_held.store(false, Ordering::Relaxed);
+        error!(
+            "Streaming primary fenced: {reason}. This manager stopped shipping WAL and refuses \
+             writes; restart it to rejoin as a standby"
+        );
+    };
 
     loop {
-        if shutdown.load(Ordering::Relaxed) {
+        if promotion.shutdown.load(Ordering::Relaxed) {
             if let Some(lease) = held.take() {
                 let _ = leaser.release_lease(&lease).await;
             }
             role_primary.store(false, Ordering::Relaxed);
             lease_held.store(false, Ordering::Relaxed);
-            break;
+            return;
         }
 
-        match lease_step(&leaser, held.take()).await {
-            LeaseTransition::Held(lease) => {
+        let was_primary = role_primary.load(Ordering::Relaxed);
+        match lease_step(leaser, held.take()).await {
+            LeaseTransition::Held(lease) if was_primary => {
                 held = Some(lease);
-                role_primary.store(true, Ordering::Relaxed);
-                lease_held.store(true, Ordering::Relaxed);
+                last_renewed = std::time::Instant::now();
+            }
+            LeaseTransition::Held(lease) => {
+                match promotion.run().await {
+                    Ok(()) => {
+                        held = Some(lease);
+                        last_renewed = std::time::Instant::now();
+                        lease_held.store(true, Ordering::Relaxed);
+                        role_primary.store(true, Ordering::Relaxed);
+                        info!("Acquired the persistence lease; this manager is now the streaming primary");
+                    }
+                    Err(err) => {
+                        // Give the lease back so another standby can try.
+                        error!(error = ?err, "Could not take over as streaming primary; staying a standby");
+                        let _ = leaser.release_lease(&lease).await;
+                    }
+                }
             }
             LeaseTransition::Retain(lease) => {
-                // Keep the lease and our current role; retry on the next cycle.
+                // A renewal failed but the lease may still be ours. Past one
+                // TTL without a renewal another manager may hold it, so stop
+                // acting as primary.
+                if was_primary && last_renewed.elapsed() >= ttl {
+                    fence("the lease could not be renewed within its TTL");
+                    return;
+                }
                 held = Some(lease);
+            }
+            LeaseTransition::Lost if was_primary => {
+                fence("another manager took over the lease");
+                return;
             }
             LeaseTransition::Blocked | LeaseTransition::Lost => {
                 role_primary.store(false, Ordering::Relaxed);
@@ -565,10 +883,22 @@ async fn object_storage_lease_loop(
             }
         }
 
-        tokio::time::sleep(renew).await;
+        sleep_unless_shutdown(renew, &promotion.shutdown).await;
     }
+}
 
-    Ok(())
+/// Sleeps for `duration`, waking early (within ~100ms) once `shutdown` is
+/// set, so an orderly stop is not held up by a long sync or renew interval.
+async fn sleep_unless_shutdown(duration: StdDuration, shutdown: &AtomicBool) {
+    const STEP: StdDuration = StdDuration::from_millis(100);
+    let deadline = tokio::time::Instant::now() + duration;
+    while !shutdown.load(Ordering::Relaxed) {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return;
+        }
+        tokio::time::sleep(STEP.min(deadline - now)).await;
+    }
 }
 
 /// Builds the persistence driver for the configured backend. The raft
@@ -759,6 +1089,122 @@ mod tests {
         assert_eq!(names, vec!["alpha".to_string(), "beta".to_string()]);
     }
 
+    fn local_store(dir: &std::path::Path) -> Store {
+        let config = crate::structs::ManagerConfigFull {
+            store_path: dir.to_str().unwrap().to_string(),
+            ..Default::default()
+        };
+        Store::start_storage(&config).unwrap()
+    }
+
+    // A streaming standby (lease provider set, lease not held) neither acts
+    // as the writer nor accepts writes (R4). The lease loop here can never
+    // acquire (no bucket), so the manager stays a standby for good.
+    #[test]
+    fn streaming_standby_idles_and_refuses_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = crate::structs::ManagerConfigFull {
+            store_path: dir.path().to_str().unwrap().to_string(),
+            ..Default::default()
+        };
+        config.persistence.r#type = PersistenceType::Streaming;
+        config.persistence.streaming.lease.provider = StreamingLeaseProvider::ObjectStorage;
+        let store = Store::start_storage(&config).unwrap();
+
+        assert_eq!(store.persistence_role(), PersistenceRole::Standby);
+        assert!(!store.is_raft_leader(crate::storage::Lane::Control));
+        assert!(!store.is_raft_leader(crate::storage::Lane::Scheduler));
+        let err = store
+            .put_kv(
+                "standby/key",
+                "v",
+                crate::structs::KvValueType::String,
+                None,
+                None,
+            )
+            .expect_err("a standby must refuse writes");
+        assert!(format!("{err:#}").contains("standby"), "{err:#}");
+
+        // local_disk is always the writer.
+        let local = local_store(&dir.path().join("local"));
+        assert!(local.is_raft_leader(crate::storage::Lane::Control));
+    }
+
+    // A manager that takes the lease restores the replica into its store
+    // before it reports itself primary (R4): its stale local database never
+    // serves or ships.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn taking_the_lease_restores_the_replica_before_serving() {
+        let tmp = tempfile::tempdir().unwrap();
+        let replica_dir = tmp.path().join("replica");
+
+        // The old primary writes and ships.
+        let old = local_store(&tmp.path().join("old"));
+        old.put_kv(
+            "ha/key",
+            "shipped",
+            crate::structs::KvValueType::String,
+            None,
+            None,
+        )
+        .unwrap();
+        let db = Db::open(old.state_db_path()).unwrap();
+        let mut replica = Replica::new(
+            db,
+            FileReplicaClient::new(replica_dir.to_string_lossy().into_owned()),
+        );
+        sync_once(&mut replica).await.unwrap();
+        replica.into_db().unwrap().close().unwrap();
+        let shipped = old.kv_stored_form("ha/key").unwrap();
+        assert!(shipped.is_some());
+
+        // A standby with an unrelated local store takes the lease.
+        let standby = local_store(&tmp.path().join("standby"));
+        assert_eq!(standby.kv_stored_form("ha/key").unwrap(), None);
+        let cell = Arc::new(std::sync::OnceLock::new());
+        let _ = cell.set(standby.raft_engine_clone());
+        let promotion = Promotion {
+            db_path: standby.state_db_path().to_path_buf(),
+            replica_url: replica_dir.to_string_lossy().into_owned(),
+            interval: StdDuration::from_millis(200),
+            store: cell,
+            shutdown: Arc::new(AtomicBool::new(false)),
+            replica_shutdown: Arc::new(AtomicBool::new(false)),
+            replica_exited: ExitSlot::default(),
+            fenced: Arc::new(AtomicBool::new(false)),
+        };
+        let role_primary = Arc::new(AtomicBool::new(false));
+        let lease_held = Arc::new(AtomicBool::new(false));
+        let objects: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let leaser = S3Leaser::new(objects)
+            .with_owner("standby")
+            .with_ttl(StdDuration::from_secs(30));
+        let shutdown = Arc::clone(&promotion.shutdown);
+        let primary_flag = Arc::clone(&role_primary);
+        let task = tokio::spawn(async move {
+            lease_loop(
+                &leaser,
+                StdDuration::from_secs(30),
+                StdDuration::from_millis(100),
+                primary_flag,
+                lease_held,
+                promotion,
+            )
+            .await;
+        });
+        let deadline = std::time::Instant::now() + StdDuration::from_secs(30);
+        while !role_primary.load(Ordering::Relaxed) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "standby never promoted"
+            );
+            tokio::time::sleep(StdDuration::from_millis(50)).await;
+        }
+        assert_eq!(standby.kv_stored_form("ha/key").unwrap(), shipped);
+        shutdown.store(true, Ordering::Relaxed);
+        task.await.unwrap();
+    }
+
     // The lease state machine: one owner acquires + renews, a second owner is
     // fenced out while the first holds a live lease.
     #[tokio::test]
@@ -788,5 +1234,92 @@ mod tests {
             LeaseTransition::Held(_) => {}
             other => panic!("expected node-a to renew, got {other:?}"),
         }
+    }
+
+    // M3: the raft orderly stop shuts every lane's core down within its
+    // budget, after which the node no longer accepts replicated writes.
+    #[test]
+    fn raft_shutdown_stops_the_lanes() {
+        use crate::structs::KvValueType;
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = crate::structs::ManagerConfigFull {
+            store_path: dir.path().join("store").to_str().unwrap().to_string(),
+            ..Default::default()
+        };
+        config.persistence.r#type = PersistenceType::Raft;
+        config.persistence.raft.bootstrap = true;
+        config.persistence.raft.node_id = "mgr-a".to_string();
+        config.persistence.raft.data_dir = dir.path().join("raft").to_str().unwrap().to_string();
+
+        let store = Store::start_storage(&config).unwrap();
+        store
+            .put_kv("before", "1", KvValueType::String, None, None)
+            .expect("write before shutdown");
+
+        let started = std::time::Instant::now();
+        store.shutdown_persistence(StdDuration::from_secs(10));
+        assert!(started.elapsed() < StdDuration::from_secs(10));
+        assert!(
+            store
+                .put_kv("after", "1", KvValueType::String, None, None)
+                .is_err(),
+            "a shut-down raft node must not accept writes"
+        );
+    }
+
+    // M3 regression: an orderly shutdown ships writes made since the last
+    // sync cycle (the final sync), and returns promptly even with a long
+    // sync interval instead of waiting out the sleep.
+    #[tokio::test]
+    async fn streaming_shutdown_runs_a_final_sync() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("store.sqlite");
+        let replica_dir = tmp.path().join("replica");
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "PRAGMA journal_mode=WAL;
+                 CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL);
+                 INSERT INTO events (name) VALUES ('alpha');",
+            )
+            .unwrap();
+        }
+        let cfg = StreamingPersistenceConfigFull {
+            replica_url: replica_dir.to_string_lossy().into_owned(),
+            // Long enough that only the first cycle and the final sync run.
+            sync_interval: "1h".to_string(),
+            ..StreamingPersistenceConfigFull::default()
+        };
+        let driver = StreamingPersistenceDriver::new(db_path.clone(), cfg);
+        driver.start().unwrap();
+        // Let the first cycle ship `alpha`, then commit after it.
+        tokio::time::sleep(StdDuration::from_millis(500)).await;
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute("INSERT INTO events (name) VALUES (?1)", ["beta"])
+                .unwrap();
+        }
+
+        let started = std::time::Instant::now();
+        driver.shutdown(StdDuration::from_secs(10));
+        assert!(
+            started.elapsed() < StdDuration::from_secs(5),
+            "shutdown waited out the sync interval: {:?}",
+            started.elapsed()
+        );
+
+        let restored = tmp.path().join("restored.sqlite");
+        let restore_client = FileReplicaClient::new(replica_dir.to_string_lossy().into_owned());
+        rustyriver::restore(&restore_client, &restored, rustyriver::TXID(0))
+            .await
+            .unwrap();
+        let conn = rusqlite::Connection::open(&restored).unwrap();
+        let mut stmt = conn.prepare("SELECT name FROM events ORDER BY id").unwrap();
+        let names: Vec<String> = stmt
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(names, vec!["alpha".to_string(), "beta".to_string()]);
     }
 }

@@ -565,3 +565,130 @@ fn joiners_receive_the_root_key_and_the_upgrade_gate_tracks_voters() -> R<()> {
     assert_eq!(rows[0].state, "active");
     Ok(())
 }
+
+/// Rolling upgrades across a schema change (R2): raft entries are SQLite
+/// changesets, and a manager on an older schema would silently skip a
+/// newer leader's rows for a table that gained a column. The leader refuses
+/// such a write while any member advertises an older schema, names that
+/// member, and writes resume once it reports the new version.
+#[test]
+fn leader_refuses_writes_an_older_member_cannot_apply() -> R<()> {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()?;
+    let dir = tempfile::tempdir()?;
+    let root = dir.path();
+    let a = start_node(&rt, root, "mgr-a", true, None)?;
+    let (token, _expires) = a.store().issue_raft_join_token("test")?;
+    let b = start_node(&rt, root, "mgr-b", false, Some(token))?;
+    wait_for(Duration::from_secs(120), "joiner promoted to voter", || {
+        a.store()
+            .raft_status()
+            .map(|s| s.voters.contains(&"mgr-b".to_string()))
+            .unwrap_or(false)
+    });
+    a.store()
+        .put_kv("skew/before", "1", KvValueType::String, None, None)?;
+
+    // mgr-b now reports the schema from before `kv_entry.enc_key_id`.
+    let old = legion::storage::migrations::KEYRING_SCHEMA_VERSION - 2;
+    b.store().raft_set_advertised_schema_version(Some(old))?;
+    let mut refused = None;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline && refused.is_none() {
+        match a
+            .store()
+            .put_kv("skew/during", "2", KvValueType::String, None, None)
+        {
+            Ok(_) => std::thread::sleep(Duration::from_millis(200)),
+            Err(err) => refused = Some(format!("{err:#}")),
+        }
+    }
+    let refused = refused.expect("the leader must refuse once mgr-b reports the older schema");
+    assert!(
+        refused.contains("manager mgr-b does not have yet"),
+        "{refused}"
+    );
+    assert!(refused.contains("kv_entry"), "{refused}");
+
+    // Back on the current schema: writes resume and replicate.
+    b.store().raft_set_advertised_schema_version(None)?;
+    wait_for(
+        Duration::from_secs(30),
+        "writes resume once mgr-b reports the current schema",
+        || {
+            a.store()
+                .put_kv("skew/after", "3", KvValueType::String, None, None)
+                .is_ok()
+        },
+    );
+    let store = b.store().clone();
+    wait_for(Duration::from_secs(60), "mgr-b applies the write", || {
+        kv_value(&store, "skew/after").as_deref() == Some("3")
+    });
+    Ok(())
+}
+
+/// Existing members get the root key too (R3). A manager that was already
+/// in the cluster when KV encryption arrived never re-joins, so no join
+/// reply carries the key to it. Its keyring tick fetches the key from
+/// another member instead. Simulated here by a member that lost its key
+/// file and restarted, which leaves it in the same state.
+#[test]
+fn a_member_without_the_root_key_fetches_it_from_the_cluster() -> R<()> {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()?;
+    let dir = tempfile::tempdir()?;
+    let root = dir.path();
+    let key_file = |name: &str| root.join(name).join("store").join("keys").join("root.key");
+
+    let a = start_node(&rt, root, "mgr-a", true, None)?;
+    a.store()
+        .put_kv("secrets/db", "hunter2", KvValueType::String, None, None)?;
+    let (token, _expires) = a.store().issue_raft_join_token("test")?;
+    let mut b = start_node(&rt, root, "mgr-b", false, Some(token))?;
+    wait_for(Duration::from_secs(120), "joiner promoted to voter", || {
+        a.store()
+            .raft_status()
+            .map(|s| s.voters.contains(&"mgr-b".to_string()))
+            .unwrap_or(false)
+    });
+    {
+        let store = b.store().clone();
+        wait_for(
+            Duration::from_secs(90),
+            "the joiner reads the value",
+            || kv_value(&store, "secrets/db").as_deref() == Some("hunter2"),
+        );
+    }
+
+    // mgr-b loses its key and restarts: locked.
+    b.kill();
+    std::fs::remove_file(key_file("mgr-b"))?;
+    b.restart(&rt)?;
+    assert_eq!(b.store().keyring().snapshot().state, "locked");
+
+    // One keyring tick fetches the key from mgr-a and unlocks.
+    let store = b.store().clone();
+    wait_for(
+        Duration::from_secs(60),
+        "the member fetches the root key and unlocks",
+        || {
+            let _ = legion::manager::daemon::keyring_tick(&store);
+            store.keyring().snapshot().state == "unlocked"
+        },
+    );
+    assert_eq!(
+        std::fs::read_to_string(key_file("mgr-a"))?,
+        std::fs::read_to_string(key_file("mgr-b"))?,
+        "the fetched key file is byte-identical to the leader's"
+    );
+    assert_eq!(
+        kv_value(b.store(), "secrets/db").as_deref(),
+        Some("hunter2")
+    );
+    Ok(())
+}

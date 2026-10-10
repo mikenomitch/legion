@@ -30,7 +30,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::prelude::*;
 use crate::storage::store::Store;
-use crate::structs::{JoinRaftClusterReply, JoinRaftClusterRequest};
+use crate::structs::{
+    FetchRootKeyReply, FetchRootKeyRequest, JoinRaftClusterReply, JoinRaftClusterRequest,
+};
 
 /// Raft group ("lane") a replicated store operation belongs to.
 ///
@@ -128,6 +130,13 @@ pub(crate) trait RaftJoinHandler: Send + Sync + 'static {
         &self,
         request: JoinRaftClusterRequest,
     ) -> Result<JoinRaftClusterReply, tonic::Status>;
+
+    /// Answers `RaftTransport.FetchRootKey`: the sealed KV root key for an
+    /// existing member that lacks it (R3, docs/kv-encryption.md).
+    async fn fetch_root_key(
+        &self,
+        request: FetchRootKeyRequest,
+    ) -> Result<FetchRootKeyReply, tonic::Status>;
 }
 
 /// Everything the `RaftTransport` tonic service needs to route an inbound
@@ -146,6 +155,12 @@ pub(crate) struct RaftTransportRegistry {
     /// (`ForwardLaneWrite`, plan §8 D2). `None` in transport-only bring-ups
     /// (tests), where forwarding answers `Unimplemented`.
     pub(crate) forward_store: Option<Store>,
+    /// The schema version this node advertises on every lane reply
+    /// (`x-legion-schema-version`). Always `migrations::schema_version()`
+    /// outside tests; the in-process mixed-version tests lower it through
+    /// `Store::raft_set_advertised_schema_version` to stand in for an older
+    /// build.
+    pub(crate) schema_version: Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl RaftTransportRegistry {

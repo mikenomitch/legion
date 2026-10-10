@@ -579,6 +579,92 @@ pub fn enforce_worker_plane(identity: &AclIdentity) -> Result<(), Status> {
     ))
 }
 
+/// The node a worker credential speaks for: `Some(id)` for a per-node worker
+/// token (principal `node:<id>`), `None` for every other identity.
+pub fn worker_node_id(identity: &AclIdentity) -> Option<&str> {
+    if !identity.is_worker {
+        return None;
+    }
+    identity.principal.strip_prefix("node:")
+}
+
+/// Binds a worker-plane request's node id to the caller. A worker token may
+/// only act as its own node: without this, any node could heartbeat, report
+/// health, or ratify claims as a peer. Management identities (and disabled
+/// ACLs) act for any node. Audit-only mode logs the mismatch and allows it,
+/// matching `enforce_worker_plane`.
+pub fn enforce_node_binding(identity: &AclIdentity, node_id: &str) -> Result<(), Status> {
+    if identity.is_management || worker_node_id(identity) == Some(node_id) {
+        return Ok(());
+    }
+
+    warn!(
+        target: "acl_audit",
+        principal = %identity.principal,
+        accessor_id = identity.accessor_id.as_deref().unwrap_or("-"),
+        source = identity.source.as_str(),
+        resource = "worker-plane",
+        action = "call",
+        node_id = %node_id,
+        enforced = !identity.audit_only,
+        "ACL denial: node id does not match the caller's node token"
+    );
+
+    if identity.audit_only {
+        return Ok(());
+    }
+
+    Err(Status::permission_denied(format!(
+        "{:?} may not act as node {node_id:?}; a node token only speaks for its own node",
+        identity.principal
+    )))
+}
+
+/// How often a long-lived stream (`StreamEvents`, exec sessions) re-checks
+/// its caller's credential. A revoked or expired token, or a policy that no
+/// longer grants the stream, ends the stream within one interval.
+pub const STREAM_REAUTH_INTERVAL: Duration = Duration::from_secs(30);
+
+/// The credential a long-lived stream was opened with, kept so the stream can
+/// re-authenticate while it runs. Authorization is checked once when a stream
+/// opens; without this, a stream outlives its token's revocation or expiry.
+#[derive(Clone)]
+pub struct StreamCredential {
+    auth: std::sync::Arc<Authenticator>,
+    /// Only the credential headers, not the whole request metadata.
+    metadata: MetadataMap,
+    /// How often to re-check (`STREAM_REAUTH_INTERVAL` outside tests).
+    pub interval: Duration,
+}
+
+impl StreamCredential {
+    pub fn new(auth: std::sync::Arc<Authenticator>, metadata: &MetadataMap) -> Self {
+        let mut kept = MetadataMap::new();
+        for header in ["authorization", "x-legion-token"] {
+            if let Some(value) = metadata.get(header) {
+                kept.insert(header, value.clone());
+            }
+        }
+        StreamCredential {
+            auth,
+            metadata: kept,
+            interval: STREAM_REAUTH_INTERVAL,
+        }
+    }
+
+    pub fn with_interval(mut self, interval: Duration) -> Self {
+        self.interval = interval;
+        self
+    }
+
+    /// Resolves the credential again, as if the caller had sent a new
+    /// request. Fails with `Unauthenticated` once the token is revoked or
+    /// expired.
+    pub fn reauthenticate(&self, store: &Store) -> Result<AclIdentity, Status> {
+        self.auth.authenticate(&self.metadata, store)
+    }
+}
+
 /// Pulls a bearer credential from `authorization` or `x-legion-token`.
 fn extract_bearer(metadata: &MetadataMap) -> Option<String> {
     if let Some(value) = metadata.get("authorization").and_then(|v| v.to_str().ok()) {
@@ -942,6 +1028,54 @@ mod authenticator_test {
         let anonymous = auth.authenticate(&MetadataMap::new(), &store)?;
         assert_eq!(
             enforce_worker_plane(&anonymous).unwrap_err().code(),
+            tonic::Code::Unauthenticated
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn node_binding_limits_worker_tokens_to_their_own_node() -> R<()> {
+        let store = setup_store()?;
+        let auth = enabled_authenticator();
+        let secret = auth
+            .mint_node_token(&store, "worker-a")
+            .map_err(|s| anyhow!(s.to_string()))?;
+        let worker = auth.authenticate(&metadata_with_token(&secret), &store)?;
+        assert_eq!(worker_node_id(&worker), Some("worker-a"));
+        assert!(enforce_node_binding(&worker, "worker-a").is_ok());
+        assert_eq!(
+            enforce_node_binding(&worker, "worker-b")
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+
+        // Management (and ACLs-off) identities act for any node.
+        assert!(enforce_node_binding(&AclIdentity::acl_disabled(), "worker-b").is_ok());
+
+        // Audit-only mode logs the mismatch but lets it through.
+        let audit_worker = AclIdentity {
+            audit_only: true,
+            ..worker
+        };
+        assert!(enforce_node_binding(&audit_worker, "worker-b").is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn stream_credentials_fail_once_the_token_is_revoked() -> R<()> {
+        let store = setup_store()?;
+        let auth = std::sync::Arc::new(enabled_authenticator());
+        let (info, secret) = auth
+            .mint_token(&store, "streamer", "client", &[], None)
+            .map_err(|s| anyhow!(s.to_string()))?;
+        let credential = StreamCredential::new(auth.clone(), &metadata_with_token(&secret));
+        assert_eq!(credential.interval, STREAM_REAUTH_INTERVAL);
+        assert!(credential.reauthenticate(&store).is_ok());
+
+        store.delete_acl_token(&info.accessor_id)?;
+        assert_eq!(
+            credential.reauthenticate(&store).unwrap_err().code(),
             tonic::Code::Unauthenticated
         );
         Ok(())

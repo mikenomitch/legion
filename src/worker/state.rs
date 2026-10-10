@@ -11,6 +11,15 @@ pub struct PersistedAllocation {
     pub allocation: Allocation,
     pub task: TaskConfig,
     pub pid: Option<u32>,
+    /// Start time of `pid` (seconds since the Unix epoch) when it was
+    /// persisted. A restarted worker re-adopts `pid` only when the live
+    /// process with that pid started at this same time, so a recycled pid
+    /// (after a host reboot, say) is never mistaken for the task.
+    ///
+    /// Absent in records written before this field existed; those fall back
+    /// to a plain liveness check for the one restart that upgrades them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid_start_time: Option<u64>,
     /// Self-fence window in seconds (`TaskAllocation.self_terminate_after_seconds`):
     /// kill this allocation after losing manager contact for this long.
     /// Persisted so the watchdog keeps protecting restored allocations after
@@ -47,6 +56,30 @@ pub struct PersistedAllocation {
     /// record on a worker that does not enforce — both load unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resource_assignment: Option<crate::task_plugins::ResourceAssignment>,
+    /// Set while the allocation is stopping: out of the manager's desired
+    /// set, but its process may still be alive and its volumes mounted
+    /// (draining, or inside its stop grace window; see docs/graceful-stop.md).
+    ///
+    /// Persisted so a restarted worker finishes the stop instead of losing
+    /// track of a task that ignored its signal, and keeps that task's volume
+    /// mounts recorded as in use until the process is really gone. `None`
+    /// for running work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stopping: Option<PersistedStop>,
+}
+
+/// Where a stopping allocation was in the stop ladder when it was persisted.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PersistedStop {
+    pub cause: crate::structs::StopCause,
+    /// Whether teardown removes the allocation directory.
+    pub remove_dirs: bool,
+    /// When the grace window closes and the task is hard-killed, in Unix
+    /// seconds. `None` while it is still draining and has not been
+    /// signalled yet; a restarted worker signals it straight away.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kill_deadline_unix: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -117,15 +150,64 @@ impl WorkerStateStore {
             }
         }
         let contents = serde_json::to_string_pretty(allocations)?;
-        write_owner_only(&self.path, contents.as_bytes())?;
+        write_owner_only(&self.path, contents.as_bytes(), true)?;
         Ok(())
+    }
+
+    /// File holding the wall-clock time of this worker's last successful
+    /// manager contact (registration or heartbeat), beside the state file.
+    pub fn last_contact_path(&self) -> PathBuf {
+        self.path.with_file_name("last_manager_contact")
+    }
+
+    /// Record a successful manager contact at `at`.
+    ///
+    /// Written on every successful heartbeat, so it skips the fsync: losing
+    /// the last few writes to a host crash only makes the recorded contact
+    /// older, which fences earlier, never later.
+    pub fn record_manager_contact(&self, at: std::time::SystemTime) -> R<()> {
+        let secs = at
+            .duration_since(std::time::UNIX_EPOCH)
+            .context("system clock is before the Unix epoch")?
+            .as_secs();
+        write_owner_only(
+            &self.last_contact_path(),
+            secs.to_string().as_bytes(),
+            false,
+        )
+    }
+
+    /// The last successful manager contact a previous worker process
+    /// recorded, or `None` when none was (a fresh node, or state written by
+    /// a worker that predates the record).
+    pub fn last_manager_contact(&self) -> Option<std::time::SystemTime> {
+        let raw = fs::read_to_string(self.last_contact_path()).ok()?;
+        let secs = raw.trim().parse::<u64>().ok()?;
+        Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs))
+    }
+
+    /// How long ago, as of `now`, the recorded last contact was.
+    ///
+    /// A wall clock is the only clock that survives a restart, so this is
+    /// exposed to clock jumps. A clock stepped backwards past the record
+    /// reads as zero (no time lost: the fence waits longer, as if the worker
+    /// had just heard from its manager); a clock stepped forwards reads as
+    /// more silence than really passed and fences early. Early is the safe
+    /// side of the at-most-one guarantee.
+    pub fn since_last_manager_contact(
+        &self,
+        now: std::time::SystemTime,
+    ) -> Option<std::time::Duration> {
+        let last = self.last_manager_contact()?;
+        Some(now.duration_since(last).unwrap_or_default())
     }
 }
 
 /// Atomically write `contents` to `path` with mode 0600 (temp file created at
 /// that mode from the start, then renamed), so token bytes in the worker state
 /// are never observable at the process umask. Off Unix this is a plain write.
-fn write_owner_only(path: &Path, contents: &[u8]) -> R<()> {
+/// `sync` fsyncs the bytes before the rename.
+fn write_owner_only(path: &Path, contents: &[u8], sync: bool) -> R<()> {
     use std::io::Write;
 
     let tmp = path.with_file_name(format!(
@@ -150,8 +232,10 @@ fn write_owner_only(path: &Path, contents: &[u8]) -> R<()> {
             .with_context(|| format!("failed to create worker state temp file {tmp:?}"))?;
         file.write_all(contents)
             .with_context(|| format!("failed to write worker state {tmp:?}"))?;
-        file.sync_all()
-            .with_context(|| format!("failed to fsync worker state {tmp:?}"))?;
+        if sync {
+            file.sync_all()
+                .with_context(|| format!("failed to fsync worker state {tmp:?}"))?;
+        }
         Ok(())
     })();
     if let Err(err) = write_result {
@@ -167,10 +251,35 @@ fn write_owner_only(path: &Path, contents: &[u8]) -> R<()> {
     Ok(())
 }
 
+/// Whether `pid` names a live (non-zombie) process.
+///
+/// Called once per restored allocation per supervisor tick, under the
+/// task-manager mutex, so it reads only this one pid rather than rescanning
+/// the whole process table.
 pub fn pid_is_running(pid: u32) -> bool {
+    process_start_time(pid).is_some()
+}
+
+/// When the live process `pid` started, in seconds since the Unix epoch, or
+/// `None` when no such process is running (a zombie counts as gone: it will
+/// never run again).
+///
+/// Paired with the pid in [`PersistedAllocation::pid_start_time`] it names
+/// one process rather than a number the kernel recycles: after a host reboot
+/// or enough churn the same pid belongs to something else, which starts at a
+/// different time.
+pub fn process_start_time(pid: u32) -> Option<u64> {
+    let pid = Pid::from_u32(pid);
     let mut system = System::new();
-    system.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
-    system.process(Pid::from_u32(pid)).is_some()
+    system.refresh_processes_specifics(
+        sysinfo::ProcessesToUpdate::Some(&[pid]),
+        true,
+        sysinfo::ProcessRefreshKind::new(),
+    );
+    system
+        .process(pid)
+        .filter(|process| process.status() != sysinfo::ProcessStatus::Zombie)
+        .map(|process| process.start_time())
 }
 
 fn ensure_dir(path: &Path) -> R<()> {
@@ -188,6 +297,28 @@ mod tests {
     use std::thread;
     use std::time::Duration;
     use tempfile::TempDir;
+
+    #[test]
+    fn last_manager_contact_round_trips_and_ignores_backward_clocks() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let store = WorkerStateStore::new(temp_dir.path().join("worker_state.json"));
+        let now = std::time::SystemTime::now();
+        assert!(
+            store.since_last_manager_contact(now).is_none(),
+            "no record, nothing to measure from"
+        );
+
+        store.record_manager_contact(now - Duration::from_secs(90))?;
+        let since = store.since_last_manager_contact(now).expect("recorded");
+        assert!((89..=91).contains(&since.as_secs()), "{since:?}");
+
+        // A clock stepped back past the record reads as no silence at all.
+        assert_eq!(
+            store.since_last_manager_contact(now - Duration::from_secs(600)),
+            Some(Duration::ZERO)
+        );
+        Ok(())
+    }
 
     #[test]
     fn child_survives_parent_kill() -> R<()> {
