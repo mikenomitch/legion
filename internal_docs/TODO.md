@@ -72,6 +72,7 @@ How to use it:
 
 | PR | What it lands | Notes |
 | --- | --- | --- |
+| [#14](https://github.com/mikenomitch/legion/pull/14) | Live KV file updates (`onChange = "update"`) and KV-backed ingress certificates (`certFrom = { kv }`) | [plan](plans/kv-cert-delivery-plan.md) · [calls](calls/kv-cert-delivery-plan_calls.md) |
 | [#7](https://github.com/mikenomitch/legion/pull/7) | Read model follows SQLite in every mode: shadow check, `local_disk` changeset projection, outside-write guard, timed scrub | Bench needs a quiet-machine rerun; [plan](plans/read-model-coherence-plan.md) |
 | [#6](https://github.com/mikenomitch/legion/pull/6) | Fixes from the 2026-10-09 architecture audit | [audit](architecture-audit-2026-10-09.md); scheduler bench numbers pending |
 | [#4](https://github.com/mikenomitch/legion/pull/4) | Rename crate to `legion-rs`, crates.io metadata, `cargo install` docs | Not published yet; follow-ups under Templates, registry & packaging |
