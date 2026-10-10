@@ -118,18 +118,31 @@ it to a network.
 A few from [`configs/jobs/`](configs/jobs/), roughly simplest first:
 
 - [`min.ncl`](configs/jobs/min.ncl): the smallest valid job, one container.
+- [`container-service.ncl`](configs/jobs/container-service.ncl): nginx in a
+  container on a dynamic port, with an HTTP health check.
+- [`exec-service.ncl`](configs/jobs/exec-service.ncl): a host process run
+  directly, no image, restarted on exit.
+- [`batch-job.ncl`](configs/jobs/batch-job.ncl): a run-to-completion task
+  with a retry policy.
+- [`per-node.ncl`](configs/jobs/per-node.ncl): one instance on every node,
+  like a DaemonSet or a Nomad system job.
 - [`service-demo.ncl`](configs/jobs/service-demo.ncl): a web service on a
   dynamic port, registered for discovery.
-- [`vars.ncl`](configs/jobs/vars.ncl): one spec parameterized with `--var`
-  flags.
-- [`dag-separate-groups.ncl`](configs/jobs/dag-separate-groups.ncl): a batch
-  task that gates a service in another group.
+- [`nickel-showcase.ncl`](configs/jobs/nickel-showcase.ncl): functions, an
+  import, contracts, and `--var` variables with defaults, all in one spec.
+- [`dag-separate-groups.ncl`](configs/jobs/dag-separate-groups.ncl): batch
+  prep tasks that fan out and back in before the services in other groups
+  start.
 - [`kv-reactive-demo.ncl`](configs/jobs/kv-reactive-demo.ncl): a task that
-  restarts when a KV value changes.
+  reads a value from KV, encrypted at rest by default, and restarts when it
+  changes.
 - [`connect-demo.ncl`](configs/jobs/connect-demo.ncl): a client
   load-balancing across two backends through the service mesh.
 - [`postgres.ncl`](configs/jobs/postgres.ncl): a stateful database with a
   persistent volume.
+- [`fullstack.ncl`](configs/jobs/fullstack.ncl): an nginx frontend, a
+  Python API, and Postgres, wired together through the service mesh, with
+  each tier scaling on its own.
 - [`sandbox-egress-demo.ncl`](configs/jobs/sandbox-egress-demo.ncl): an agent
   task that can reach only allowlisted upstreams.
 - [`sandbox-edge-boot.ncl`](configs/jobs/sandbox-edge-boot.ncl): per-user
@@ -239,19 +252,6 @@ for the architecture behind the gap.
   [`noop` example](plugins/tasks/noop/src/lib.rs) is under 100 lines.
 - **Runs on macOS and Linux**, with Windows support in progress.
 
-### Built for humans and agents
-
-- **MCP server built in.** `legion mcp serve` exposes the cluster to any MCP
-  client, read-only unless you pass `--allow-write`.
-- **Structured output everywhere.** Every CLI command emits a typed JSON
-  envelope with `--json`, with error codes, hints, and a retryable flag.
-- **A self-documenting CLI.** `legion capabilities` lists every operation,
-  and `legion job schema` emits the job spec as JSON Schema.
-- **Safe to retry.** Mutating RPCs accept idempotency keys, and
-  `legion job plan` previews a change before anything runs.
-
-See [Agent Readiness](docs/agent-readiness.md) for the full picture.
-
 ### Built to run agents
 
 Agent sandboxes need to start fast, stay contained, and talk only to what
@@ -264,7 +264,21 @@ they should. Legion handles all three.
   lets a worker start a sandbox before its placement is durable. You can hold
   its network shut until the manager confirms it is the only instance.
 - **Per-job egress control.** [Network handlers](docs/network-handlers.md)
-  give each task its own egress allowlist and proxy middleware.
+  give each task its own egress allowlist and proxy middleware, so a sandbox
+  reaches `pypi.org` and nothing else.
+
+### DevEx for humans and agents
+
+- **MCP server built in.** `legion mcp serve` exposes the cluster to any MCP
+  client, read-only unless you pass `--allow-write`.
+- **Structured output everywhere.** Every CLI command emits a typed JSON
+  envelope with `--json`, with error codes, hints, and a retryable flag.
+- **A self-documenting CLI.** `legion capabilities` lists every operation,
+  and `legion job schema` emits the job spec as JSON Schema.
+- **Safe to retry.** Mutating RPCs accept idempotency keys, and
+  `legion job plan` previews a change before anything runs.
+
+See [Agent Readiness](docs/agent-readiness.md) for the full picture.
 
 ## Status
 
@@ -296,6 +310,7 @@ add:
   a more omakase starting experience.
 - **Something akin to Kubernetes controllers**, so you can extend Legion with
   your own reconcile loops.
+- **Resource registry for sharing and pulling jobs, templates, and plugins.**
 - **More runtimes**, such as WASM or remote serverless workloads.
 - **Namespaces, multi-cluster federation, and Windows support.**
 

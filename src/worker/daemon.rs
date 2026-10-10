@@ -337,6 +337,8 @@ async fn run_worker_with_manager(
     register_self(client.clone(), &registration, &credentials).await?;
     info!(worker_name = %name, "Worker registered with manager");
     record_manager_contact(task_manager.lock().expect("task manager").state_store());
+    // Easter egg, mirrored by the manager's log line for the same join.
+    info!(worker_name = %name, "We are Legion. {name} has joined");
     crate::worker::balance::set_local_node(&name);
 
     start_worker_telemetry();
