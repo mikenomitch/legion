@@ -23,7 +23,7 @@ use tokio::sync::Notify;
 use tokio::task::JoinSet;
 use tonic::transport::{Identity, Server, ServerTlsConfig};
 use tonic_web::GrpcWebLayer;
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 
 // Fallback poll interval used only when delay calculation fails.
 const IDLE_POLL_INTERVAL: Duration = Duration::from_secs(30);
@@ -399,6 +399,9 @@ pub async fn run_manager_with(
     let exec_ws_state = crate::manager::exec_ws::ExecWsState {
         store: store.clone(),
         auth: authenticator.clone(),
+        origins: Arc::new(crate::manager::origin::OriginPolicy::new(
+            &full_config.server.allowed_origins,
+        )),
     };
 
     // Manager-plane raft transport shares this tonic listener. The service
@@ -492,8 +495,19 @@ pub async fn run_manager_with(
     };
 
     let manager_service = ManagerServer::new(manager_node);
+    // Browser origins (docs/ui-architecture.md): loopback plus
+    // `server.allowedOrigins`. The guard refuses everything else before any
+    // handler runs; CORS only echoes the allowed origin back.
+    let origin_policy = Arc::new(crate::manager::origin::OriginPolicy::new(
+        &full_config.server.allowed_origins,
+    ));
+    let cors_policy = origin_policy.clone();
     let cors = CorsLayer::new()
-        .allow_origin(Any)
+        .allow_origin(AllowOrigin::predicate(move |origin, _| {
+            origin
+                .to_str()
+                .is_ok_and(|origin| cors_policy.allows(origin))
+        }))
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
         .allow_headers(Any)
         .expose_headers([
@@ -510,6 +524,9 @@ pub async fn run_manager_with(
     let start_server_fut = server_builder
         .accept_http1(true)
         .layer(OidcHttpLayer::new(workload_identity_state.clone()))
+        .layer(crate::manager::origin::OriginGuardLayer::new(
+            origin_policy.clone(),
+        ))
         .layer(cors)
         .layer(GrpcWebLayer::new())
         .layer(crate::manager::telemetry::GrpcMetricsLayer)

@@ -4,6 +4,10 @@
     host = "127.0.0.1",
     # advertiseAddr = "http://10.0.0.5:4747",  # address embedded in join tokens
     # tls = { enabled = true, certPath = "/etc/legion/server.pem", keyPath = "/etc/legion/server.key" },
+    # Browser origins allowed to call the gRPC-Web API and the exec WebSocket
+    # (docs/ui-architecture.md). Loopback origins (localhost, 127.0.0.1, [::1],
+    # any port) are always allowed; list a hosted UI here. "*" allows any.
+    # allowedOrigins = ["https://legion-ui.example.com"],
   },
   # State store dir (store.sqlite, keys/, backups/). Defaults to
   # $LEGION_DATA_DIR, else ./.legion (docs/data-directory.md).

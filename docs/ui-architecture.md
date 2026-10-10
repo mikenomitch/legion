@@ -385,9 +385,40 @@ allocation visibly the same instance. Stateless allocations are unchanged.
 Manager server enables:
 
 - gRPC-Web layer (`tonic_web::GrpcWebLayer`)
-- CORS allow-all setup
+- CORS for allowed browser origins
 
 Without these, browser gRPC-Web calls would fail.
+
+### Allowed browser origins
+
+The manager only answers browsers from allowed origins. Any web page can send
+requests to `127.0.0.1:4747`, and with ACLs off every caller has full access,
+so an allow-all policy would let any website you visit run jobs on your
+cluster. The same applies to DNS rebinding, where a page reaches the manager
+under its own hostname.
+
+- Loopback origins are always allowed: `localhost`, `127.0.0.0/8`, and
+  `[::1]`, on any port and scheme. This covers `npm run dev` on
+  `http://localhost:5173`, with or without the Vite proxy.
+- `server.allowedOrigins` in the manager config adds more. Entries are exact
+  origins (`scheme://host[:port]`, no path). `["*"]` allows every origin.
+
+  ```nickel
+  server = {
+    port = 4747,
+    allowedOrigins = ["https://legion-ui.example.com"],
+  },
+  ```
+
+- Requests with no `Origin` header are unaffected. The CLI, workers, SDKs, and
+  `curl` never send one.
+
+A request from any other origin gets HTTP 403 before it reaches a handler,
+and the manager logs `Refused a browser request from a disallowed origin`.
+In the browser this shows up as a failed fetch or a CORS error on every call.
+The exec WebSocket applies the same check to its handshake. A UI served from
+a tunnel or forwarded-port domain (even through the Vite proxy, which forwards
+the browser's `Origin`) needs that domain in `allowedOrigins`.
 
 The UI tolerates a manager older than its own client. It sends
 `ListJobsRequest.status` only when a chip other than All is selected. An

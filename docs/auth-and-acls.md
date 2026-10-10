@@ -307,6 +307,12 @@ When ACLs are enforced:
   Use this to migrate fleets that predate ACLs: enable audit mode, restart
   workers onto join tokens at your own pace, then enforce.
 
+Browsers are also limited by origin, with or without ACLs: the gRPC-Web API
+and the exec WebSocket only answer loopback origins and those listed in
+`server.allowedOrigins` (see
+[UI Architecture](ui-architecture.md#allowed-browser-origins)). With ACLs off
+this is the only thing that stops a web page from driving a local manager.
+
 The worker plane does not support mTLS yet. The listener-level TLS below
 already covers transport encryption.
 

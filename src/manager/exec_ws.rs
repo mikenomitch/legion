@@ -12,6 +12,10 @@
 //! (manager → client) — the identical frames the native path uses. The first
 //! client message must carry an `ExecStart`; its `bearer_token` field
 //! authenticates the session (browsers cannot set WebSocket request headers).
+//!
+//! WebSockets are exempt from CORS, so the `Origin` header is checked here
+//! against the same policy as gRPC-Web (`crate::manager::origin`): any page
+//! could otherwise open a session, and with ACLs off it would be management.
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
@@ -29,6 +33,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 use crate::manager::acl::{Authenticator, StreamCredential};
 use crate::manager::exec::run_exec_session;
+use crate::manager::origin::OriginPolicy;
 use crate::prelude::*;
 use crate::storage::store::Store;
 use crate::structs::{exec_client_frame, ExecClientFrame, ExecServerFrame};
@@ -38,6 +43,8 @@ use crate::structs::{exec_client_frame, ExecClientFrame, ExecServerFrame};
 pub struct ExecWsState {
     pub store: Store,
     pub auth: Arc<Authenticator>,
+    /// Browser origins allowed to open a session (`server.allowedOrigins`).
+    pub origins: Arc<OriginPolicy>,
 }
 
 /// The path the UI connects to.
@@ -74,9 +81,17 @@ pub async fn serve_exec_ws(addr: SocketAddr, state: ExecWsState) -> R<()> {
     }
 }
 
-fn cors_headers(mut resp: Response<Full<Bytes>>) -> Response<Full<Bytes>> {
+/// CORS headers for an allowed request: the request's own origin is echoed
+/// (never `*`), and nothing is added when it carried none.
+fn cors_headers(
+    mut resp: Response<Full<Bytes>>,
+    origin: Option<&hyper::header::HeaderValue>,
+) -> Response<Full<Bytes>> {
     let headers = resp.headers_mut();
-    headers.insert("access-control-allow-origin", "*".parse().unwrap());
+    if let Some(origin) = origin {
+        headers.insert("access-control-allow-origin", origin.clone());
+        headers.insert("vary", "origin".parse().unwrap());
+    }
     headers.insert(
         "access-control-allow-methods",
         "GET, OPTIONS".parse().unwrap(),
@@ -85,12 +100,17 @@ fn cors_headers(mut resp: Response<Full<Bytes>>) -> Response<Full<Bytes>> {
     resp
 }
 
-fn simple(status: StatusCode, body: &str) -> Response<Full<Bytes>> {
+fn simple(
+    status: StatusCode,
+    body: &str,
+    origin: Option<&hyper::header::HeaderValue>,
+) -> Response<Full<Bytes>> {
     cors_headers(
         Response::builder()
             .status(status)
             .body(Full::new(Bytes::from(body.to_string())))
             .expect("static response is valid"),
+        origin,
     )
 }
 
@@ -98,16 +118,34 @@ async fn handle(
     mut req: Request<Incoming>,
     state: ExecWsState,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
+    let origin = req.headers().get(hyper::header::ORIGIN).cloned();
+    if !state.origins.allows_request(req.headers()) {
+        warn!(
+            origin = origin
+                .as_ref()
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("-"),
+            "Refused an exec WebSocket from a disallowed origin \
+             (add it to server.allowedOrigins to allow it)"
+        );
+        return Ok(simple(
+            StatusCode::FORBIDDEN,
+            "origin not allowed; add it to server.allowedOrigins",
+            None,
+        ));
+    }
+    let origin = origin.as_ref();
     if req.method() == hyper::Method::OPTIONS {
-        return Ok(simple(StatusCode::NO_CONTENT, ""));
+        return Ok(simple(StatusCode::NO_CONTENT, "", origin));
     }
     if req.uri().path() != EXEC_WS_PATH {
-        return Ok(simple(StatusCode::NOT_FOUND, "not found"));
+        return Ok(simple(StatusCode::NOT_FOUND, "not found", origin));
     }
     if !hyper_tungstenite::is_upgrade_request(&req) {
         return Ok(simple(
             StatusCode::BAD_REQUEST,
             "expected a websocket upgrade",
+            origin,
         ));
     }
 
@@ -119,11 +157,12 @@ async fn handle(
                 }
             });
             // hyper-tungstenite hands back a 101 response with the accept key.
-            Ok(cors_headers(response))
+            Ok(cors_headers(response, origin))
         }
         Err(err) => Ok(simple(
             StatusCode::BAD_REQUEST,
             &format!("websocket upgrade failed: {err}"),
+            origin,
         )),
     }
 }

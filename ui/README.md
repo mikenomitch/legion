@@ -15,6 +15,11 @@ The UI defaults to talking to the manager at `http://127.0.0.1:4747`. Set `VITE_
 VITE_MANAGER_ENDPOINT="http://192.168.1.25:4747" npm run dev
 ```
 
+The manager only answers browsers from loopback origins (`localhost`,
+`127.0.0.1`, `[::1]`) unless you list the UI's origin in the manager config's
+`server.allowedOrigins`. If you open the UI from another host or a tunnel
+domain, add that origin there. See `docs/ui-architecture.md`.
+
 
 ### Seeded preview mode (for frontend work)
 
