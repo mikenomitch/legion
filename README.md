@@ -239,8 +239,7 @@ they should. Legion handles all three.
   lets a worker start a sandbox before its placement is durable. You can hold
   its network shut until the manager confirms it is the only instance.
 - **Per-job egress control.** [Network handlers](docs/network-handlers.md)
-  give each task its own egress allowlist and proxy middleware, so a sandbox
-  reaches `pypi.org` and nothing else.
+  give each task its own egress allowlist and proxy middleware.
 
 ## Status
 
