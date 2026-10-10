@@ -1,0 +1,15 @@
+{
+  "method": "WhoAmI",
+  "recordedAt": "2026-10-10T23:46:06.220Z",
+  "entries": [
+    {
+      "request": {},
+      "response": {
+        "source": "disabled",
+        "principal": "acl-disabled",
+        "tokenType": "none",
+        "rulesJson": "[{\"resources\":[\"*\"],\"actions\":[\"*\"]}]"
+      }
+    }
+  ]
+}

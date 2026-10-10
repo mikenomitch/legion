@@ -1,0 +1,192 @@
+{
+  "method": "QueryStateStore",
+  "recordedAt": "2026-10-10T23:45:54.600Z",
+  "entries": [
+    {
+      "request": {
+        "sql": "SELECT a.id AS allocation_id, tc.name AS task_name, ah.healthy AS healthy, ah.status AS status FROM allocation a JOIN task_config tc ON tc.id = a.task_config_id LEFT JOIN allocation_health ah ON ah.allocation_id = a.id WHERE tc.job_id = 'edge-proxy'"
+      },
+      "response": {
+        "statementType": "SELECT",
+        "columns": [
+          "allocation_id",
+          "task_name",
+          "healthy",
+          "status"
+        ],
+        "rows": [
+          {
+            "json": "{\"allocation_id\":25,\"healthy\":1,\"status\":\"TCP Check http passed\",\"task_name\":\"proxy\"}"
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "sql": "SELECT tc.name AS task_name, COALESCE(ts.status, a.status) AS status FROM allocation a JOIN task_config tc ON tc.id = a.task_config_id LEFT JOIN task_status ts ON ts.task_config_id = a.task_config_id WHERE tc.job_id = 'edge-proxy'"
+      },
+      "response": {
+        "statementType": "SELECT",
+        "columns": [
+          "task_name",
+          "status"
+        ],
+        "rows": [
+          {
+            "json": "{\"status\":\"running\",\"task_name\":\"proxy\"}"
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "sql": "SELECT tc.name AS task_name, COALESCE(ts.status, a.status) AS status FROM allocation a JOIN task_config tc ON tc.id = a.task_config_id LEFT JOIN task_status ts ON ts.task_config_id = a.task_config_id WHERE tc.job_id = 'checkout'"
+      },
+      "response": {
+        "statementType": "SELECT",
+        "columns": [
+          "task_name",
+          "status"
+        ],
+        "rows": [
+          {
+            "json": "{\"status\":\"running\",\"task_name\":\"api\"}"
+          },
+          {
+            "json": "{\"status\":\"running\",\"task_name\":\"api\"}"
+          },
+          {
+            "json": "{\"status\":\"running\",\"task_name\":\"api\"}"
+          },
+          {
+            "json": "{\"status\":\"running\",\"task_name\":\"queue-worker\"}"
+          },
+          {
+            "json": "{\"status\":\"running\",\"task_name\":\"queue-worker\"}"
+          },
+          {
+            "json": "{\"status\":\"running\",\"task_name\":\"cache-warmer\"}"
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "sql": "SELECT a.id AS allocation_id, tc.name AS task_name, ah.healthy AS healthy, ah.status AS status FROM allocation a JOIN task_config tc ON tc.id = a.task_config_id LEFT JOIN allocation_health ah ON ah.allocation_id = a.id WHERE tc.job_id = 'checkout'"
+      },
+      "response": {
+        "statementType": "SELECT",
+        "columns": [
+          "allocation_id",
+          "task_name",
+          "healthy",
+          "status"
+        ],
+        "rows": [
+          {
+            "json": "{\"allocation_id\":50,\"healthy\":1,\"status\":\"HTTP Check / passed\",\"task_name\":\"api\"}"
+          },
+          {
+            "json": "{\"allocation_id\":51,\"healthy\":1,\"status\":\"HTTP Check / passed\",\"task_name\":\"api\"}"
+          },
+          {
+            "json": "{\"allocation_id\":52,\"healthy\":1,\"status\":\"HTTP Check / passed\",\"task_name\":\"api\"}"
+          },
+          {
+            "json": "{\"allocation_id\":53,\"healthy\":1,\"status\":\"healthy (no checks configured)\",\"task_name\":\"queue-worker\"}"
+          },
+          {
+            "json": "{\"allocation_id\":54,\"healthy\":1,\"status\":\"healthy (no checks configured)\",\"task_name\":\"queue-worker\"}"
+          },
+          {
+            "json": "{\"allocation_id\":55,\"healthy\":1,\"status\":\"healthy (no checks configured)\",\"task_name\":\"cache-warmer\"}"
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "sql": "SELECT tc.name AS task_name, COALESCE(ts.status, a.status) AS status FROM allocation a JOIN task_config tc ON tc.id = a.task_config_id LEFT JOIN task_status ts ON ts.task_config_id = a.task_config_id WHERE tc.job_id = 'nightly-report'"
+      },
+      "response": {
+        "statementType": "SELECT",
+        "columns": [
+          "task_name",
+          "status"
+        ],
+        "rows": [
+          {
+            "json": "{\"status\":\"running\",\"task_name\":\"report\"}"
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "sql": "SELECT a.id AS allocation_id, tc.name AS task_name, ah.healthy AS healthy, ah.status AS status FROM allocation a JOIN task_config tc ON tc.id = a.task_config_id LEFT JOIN allocation_health ah ON ah.allocation_id = a.id WHERE tc.job_id = 'nightly-report'"
+      },
+      "response": {
+        "statementType": "SELECT",
+        "columns": [
+          "allocation_id",
+          "task_name",
+          "healthy",
+          "status"
+        ],
+        "rows": [
+          {
+            "json": "{\"allocation_id\":64,\"healthy\":0,\"status\":\"exited with status 0; restarting\",\"task_name\":\"report\"}"
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "sql": "SELECT tc.name AS task_name, COALESCE(ts.status, a.status) AS status FROM allocation a JOIN task_config tc ON tc.id = a.task_config_id LEFT JOIN task_status ts ON ts.task_config_id = a.task_config_id WHERE tc.job_id = 'search-indexer'"
+      },
+      "response": {
+        "statementType": "SELECT",
+        "columns": [
+          "task_name",
+          "status"
+        ],
+        "rows": [
+          {
+            "json": "{\"status\":\"running\",\"task_name\":\"indexer\"}"
+          },
+          {
+            "json": "{\"status\":\"running\",\"task_name\":\"indexer\"}"
+          },
+          {
+            "json": "{\"status\":\"running\",\"task_name\":\"compactor\"}"
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "sql": "SELECT a.id AS allocation_id, tc.name AS task_name, ah.healthy AS healthy, ah.status AS status FROM allocation a JOIN task_config tc ON tc.id = a.task_config_id LEFT JOIN allocation_health ah ON ah.allocation_id = a.id WHERE tc.job_id = 'search-indexer'"
+      },
+      "response": {
+        "statementType": "SELECT",
+        "columns": [
+          "allocation_id",
+          "task_name",
+          "healthy",
+          "status"
+        ],
+        "rows": [
+          {
+            "json": "{\"allocation_id\":7,\"healthy\":0,\"status\":\"restarting\",\"task_name\":\"indexer\"}"
+          },
+          {
+            "json": "{\"allocation_id\":8,\"healthy\":0,\"status\":\"restarting\",\"task_name\":\"indexer\"}"
+          },
+          {
+            "json": "{\"allocation_id\":63,\"healthy\":0,\"status\":\"restarting\",\"task_name\":\"compactor\"}"
+          }
+        ]
+      }
+    }
+  ]
+}

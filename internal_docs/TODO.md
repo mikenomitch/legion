@@ -2257,6 +2257,25 @@ Deferred from [ui-holistic-polish-plan.md](plans/ui-holistic-polish-plan.md):
 - [ ] A toast primitive, should a feature need feedback away from the control
       that caused it; every message so far is an inline `Note`
 
+From [ui-theme-lab-plan.md](plans/ui-theme-lab-plan.md):
+
+- [ ] Pick a theme from the lab and ship it as the default (plan phase 3):
+      paste its tokens into `index.css`, fold its `themes.css` rules into the
+      components, design its second mode, re-run `npm run lab:contrast`, and
+      update the Design System section of `docs/ui-architecture.md`. Then
+      decide whether the lab stays.
+- [ ] The shipped light theme's faint text (`--c-faint` #807a6e) is 4.26:1 on
+      surfaces and 3.94:1 on the canvas, under WCAG AA's 4.5:1. It carries
+      timestamps, hints and descriptions. Darken it (or fold it into the phase
+      3 pick); `npm run lab:contrast` reports it.
+- [ ] Lab fixtures (`ui/dev/fixtures/`) are one recording; re-record with
+      `npm run lab:record` + `lab:crawl` after proto changes, or new fields
+      will be missing from fake data.
+- [ ] `tsconfig.node.json` (vite.config.ts and `ui/dev/`) is never
+      typechecked: it has no Node types or `lib`, and neither `npm run
+      typecheck` nor CI builds the reference. Add `@types/node` and a
+      `tsc -p tsconfig.node.json` step.
+
 ## Cross-cutting
 
 - [ ] **Ship a Nickel contract library for the jobspec.** `legion job schema`
@@ -3074,6 +3093,17 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
       deferrals (created/updated on the job header, per-page last-column
       label) and the stale "gen has drifted" item — the client was already
       current, and CI now keeps it so.
+
+- [x] Theme lab (2026-10-10): fonts, radius, shadows and status palettes
+      became CSS variables (no visual change) with `data-ui` structure hooks;
+      twenty candidate themes; a dev-only theme studio (`npm run lab`) with
+      presets, live contrast, CSS/JSON export and saved presets; recorded
+      fake data (`lab:record`, `lab:crawl`) served when no manager answers;
+      `lab:shots` and `lab:contrast`
+      ([plan](plans/ui-theme-lab-plan.md),
+      [calls](calls/ui-theme-lab-plan_calls.md),
+      [docs](../docs/ui-architecture.md#design-lab-and-theme-studio-dev-server-only)).
+      Shipping the pick is open above.
 
 ## AWS rig: mitigations in place for the node-deregistration and plugin-build gaps
 

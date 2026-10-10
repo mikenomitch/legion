@@ -1,0 +1,17 @@
+{
+  "method": "GetAuthMethods",
+  "recordedAt": "2026-10-10T23:45:11.881Z",
+  "entries": [
+    {
+      "request": {},
+      "response": {
+        "methods": [
+          {
+            "name": "userpass",
+            "kind": "userpass"
+          }
+        ]
+      }
+    }
+  ]
+}

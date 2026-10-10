@@ -1,0 +1,57 @@
+{
+  "method": "ListJobs",
+  "recordedAt": "2026-10-10T23:44:21.483Z",
+  "entries": [
+    {
+      "request": {
+        "query": "",
+        "sortBy": "updated_at",
+        "sortOrder": "desc",
+        "page": 1,
+        "pageSize": 20
+      },
+      "response": {
+        "jobs": [
+          {
+            "id": "checkout",
+            "name": "checkout",
+            "status": "done",
+            "createdAt": "1791674980",
+            "updatedAt": "1791675283",
+            "priority": "normal"
+          },
+          {
+            "id": "edge-proxy",
+            "name": "edge-proxy",
+            "status": "done",
+            "createdAt": "1791672869",
+            "updatedAt": "1791673757",
+            "priority": "normal"
+          },
+          {
+            "id": "nightly-report",
+            "name": "nightly-report",
+            "status": "done",
+            "createdAt": "1791672869",
+            "updatedAt": "1791672894",
+            "priority": "normal"
+          },
+          {
+            "id": "search-indexer",
+            "name": "search-indexer",
+            "status": "done",
+            "createdAt": "1791672869",
+            "updatedAt": "1791672894",
+            "priority": "normal"
+          }
+        ],
+        "totalCount": 4,
+        "page": 1,
+        "pageSize": 20,
+        "statusCounts": {
+          "done": 4
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,663 @@
+/*
+ * Design-lab flourishes: the structural part of each candidate theme that
+ * tokens alone cannot express (title treatment, card construction, nav
+ * states, backgrounds). Colors, type, radius and depth come from catalog.ts
+ * as CSS variables; everything here hangs off the `data-ui` hooks in
+ * components/ui.tsx and App.tsx, so no component knows themes exist.
+ */
+
+/* ===== Obsidian ========================================================= */
+:root[data-design='obsidian'] [data-ui='page-title'] {
+  font-weight: 600;
+  letter-spacing: -0.025em;
+}
+:root[data-design='obsidian'] [data-ui='card-title'] {
+  text-transform: none;
+  letter-spacing: -0.005em;
+  font-size: 0.8125rem;
+  font-weight: 600;
+  color: rgb(var(--c-ink)) !important;
+}
+:root[data-design='obsidian'] thead th {
+  text-transform: none;
+  letter-spacing: 0;
+  font-weight: 500;
+  font-size: 0.75rem;
+}
+:root[data-design='obsidian'] [data-ui='nav-item'][data-active] {
+  background: rgb(var(--c-ink) / 0.07);
+}
+
+/* ===== Phosphor ========================================================= */
+:root[data-design='phosphor'] body::after {
+  content: '';
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  pointer-events: none;
+  background: repeating-linear-gradient(to bottom, rgb(0 0 0 / 0.22) 0 1px, transparent 1px 3px);
+}
+:root[data-design='phosphor'] body {
+  background-image: radial-gradient(ellipse 90% 70% at 50% 40%, rgb(57 255 136 / 0.05), transparent);
+}
+:root[data-design='phosphor'] [data-ui='page-title'] {
+  font-size: 2.75rem;
+  font-weight: 400;
+  line-height: 1;
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+  color: rgb(var(--c-brass));
+  text-shadow: 0 0 10px rgb(57 255 136 / 0.55);
+}
+:root[data-design='phosphor'] [data-ui='brand'] {
+  color: rgb(var(--c-brass));
+  text-shadow: 0 0 8px rgb(57 255 136 / 0.6);
+}
+:root[data-design='phosphor'] [data-ui='card-title'] {
+  color: rgb(var(--c-brass)) !important;
+  font-family: var(--font-mono);
+}
+:root[data-design='phosphor'] [data-ui='card-title']::before {
+  content: '> ';
+}
+:root[data-design='phosphor'] [data-ui='badge'] {
+  background: transparent;
+  box-shadow: inset 0 0 0 1px currentColor;
+}
+:root[data-design='phosphor'] [data-ui='nav-item'][data-active] {
+  background: rgb(var(--c-brass));
+  color: rgb(var(--c-canvas));
+}
+:root[data-design='phosphor'] [data-ui='nav-item'][data-active] svg {
+  color: rgb(var(--c-canvas));
+}
+:root[data-design='phosphor'] .eyebrow {
+  font-family: var(--font-mono);
+}
+
+/* ===== Mission Control ================================================== */
+:root[data-design='mission-control'] body {
+  background-image: radial-gradient(rgb(var(--c-line) / 0.9) 1px, transparent 1px);
+  background-size: 24px 24px;
+}
+:root[data-design='mission-control'] [data-ui='page-title'] {
+  font-size: 2rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+:root[data-design='mission-control'] [data-ui='card-header'] {
+  background: rgb(var(--c-surface2) / 0.7);
+  box-shadow: inset 3px 0 0 rgb(var(--c-brass));
+}
+:root[data-design='mission-control'] [data-ui='card-title'] {
+  color: rgb(var(--c-brass-strong)) !important;
+  font-size: 0.8125rem;
+  letter-spacing: 0.16em;
+}
+:root[data-design='mission-control'] thead th,
+:root[data-design='mission-control'] .eyebrow {
+  font-family: var(--font-display);
+  font-size: 0.75rem;
+  letter-spacing: 0.12em;
+}
+:root[data-design='mission-control'] [data-ui='nav-heading'] {
+  color: rgb(var(--c-brass) / 0.85);
+}
+:root[data-design='mission-control'] [data-ui='topbar'] {
+  border-bottom-color: rgb(var(--c-brass) / 0.3);
+}
+
+/* ===== Neon Dusk ======================================================== */
+:root[data-design='neon-dusk'] #app-sidebar {
+  background: linear-gradient(180deg, #1d1033 0%, #140c24 60%, #110a1e 100%);
+}
+:root[data-design='neon-dusk'] [data-ui='page-title'] {
+  font-size: 2.1rem;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  background: linear-gradient(90deg, #ff4fd8, #b86bff 55%, #4dd7ff);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+:root[data-design='neon-dusk'] [data-ui='brand'] {
+  background: linear-gradient(90deg, #ff4fd8, #4dd7ff);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+:root[data-design='neon-dusk'] [data-ui='topbar'] {
+  border-bottom: 1px solid transparent;
+  border-image: linear-gradient(90deg, rgb(255 79 216 / 0.6), rgb(77 215 255 / 0.4), transparent) 1;
+}
+:root[data-design='neon-dusk'] [data-ui='card-title'] {
+  color: rgb(var(--c-brass-strong)) !important;
+}
+:root[data-design='neon-dusk'] [data-ui='nav-item'][data-active] {
+  background: rgb(var(--c-brass) / 0.16);
+  box-shadow: 0 0 0 1px rgb(var(--c-brass) / 0.35), 0 0 18px -6px rgb(var(--c-brass) / 0.7);
+}
+:root[data-design='neon-dusk'] [data-ui='button'][data-variant='primary'] {
+  background: linear-gradient(90deg, #ff4fd8, #c86bff);
+}
+
+/* ===== Forge ============================================================ */
+:root[data-design='forge'] [data-ui='page-title'],
+:root[data-design='forge'] [data-ui='brand'] {
+  font-stretch: 72%;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: 0.01em;
+}
+:root[data-design='forge'] [data-ui='page-title'] {
+  font-size: 2.3rem;
+  line-height: 1;
+}
+:root[data-design='forge'] [data-ui='page-header'] {
+  border-bottom: 3px solid rgb(var(--c-brass));
+  padding-bottom: 1rem;
+}
+:root[data-design='forge'] [data-ui='card-header'] {
+  background: rgb(var(--c-surface2));
+}
+:root[data-design='forge'] [data-ui='card-title'] {
+  font-family: var(--font-sans);
+  font-stretch: 80%;
+  font-size: 0.8125rem;
+  font-weight: 700;
+  color: rgb(var(--c-ink)) !important;
+  letter-spacing: 0.1em;
+}
+:root[data-design='forge'] thead th,
+:root[data-design='forge'] .eyebrow {
+  font-stretch: 85%;
+}
+
+/* ===== Nord ============================================================= */
+:root[data-design='nord'] [data-ui='page-title'] {
+  font-weight: 700;
+  letter-spacing: -0.02em;
+}
+:root[data-design='nord'] [data-ui='card-title'] {
+  color: rgb(var(--c-brass)) !important;
+}
+:root[data-design='nord'] [data-ui='nav-item'][data-active] {
+  background: rgb(var(--c-brass) / 0.14);
+}
+
+/* ===== Carbon =========================================================== */
+:root[data-design='carbon'] [data-ui='page-title'] {
+  font-size: 2.25rem;
+  font-weight: 300;
+  letter-spacing: 0;
+}
+:root[data-design='carbon'] [data-ui='card-title'] {
+  text-transform: none;
+  letter-spacing: 0.01em;
+  font-size: 0.875rem;
+  font-weight: 600;
+  color: rgb(var(--c-ink)) !important;
+}
+:root[data-design='carbon'] [data-ui='nav-heading'],
+:root[data-design='carbon'] thead th {
+  text-transform: none;
+  letter-spacing: 0.01em;
+  font-size: 0.75rem;
+}
+:root[data-design='carbon'] thead th {
+  color: rgb(var(--c-ink));
+  font-size: 0.8125rem;
+}
+:root[data-design='carbon'] [data-ui='nav-item'][data-active] {
+  background: rgb(var(--c-surface2));
+}
+:root[data-design='carbon'] [data-ui='button'][data-variant='primary'] {
+  background: #0f62fe;
+  color: #ffffff;
+}
+
+/* ===== Imperium ========================================================= */
+:root[data-design='imperium'] [data-ui='page-title'] {
+  font-size: 2.1rem;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  color: rgb(var(--c-brass-strong));
+}
+:root[data-design='imperium'] [data-ui='page-header'] {
+  border-bottom: 3px double rgb(var(--c-brass) / 0.45);
+  padding-bottom: 1rem;
+}
+:root[data-design='imperium'] [data-ui='card-title'],
+:root[data-design='imperium'] [data-ui='nav-heading'],
+:root[data-design='imperium'] [data-ui='brand'] {
+  font-family: var(--font-display);
+  color: rgb(var(--c-brass)) !important;
+}
+:root[data-design='imperium'] [data-ui='card-title'] {
+  font-size: 0.75rem;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+}
+:root[data-design='imperium'] [data-ui='card'] {
+  box-shadow: inset 0 1px 0 rgb(var(--c-brass) / 0.3), var(--shadow-card);
+}
+:root[data-design='imperium'] #app-sidebar {
+  border-right-color: rgb(var(--c-brass) / 0.3);
+}
+
+/* ===== Graphite AAA ===================================================== */
+:root[data-design='graphite'] {
+  font-size: 106.25%;
+}
+:root[data-design='graphite'] :focus-visible {
+  outline: 3px solid rgb(var(--c-brass));
+  outline-offset: 2px;
+}
+:root[data-design='graphite'] [data-ui='main'] a {
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  text-decoration-thickness: 1px;
+}
+/* Whole-card links (task tiles) are already obviously clickable. */
+:root[data-design='graphite'] [data-ui='main'] a:has(p, div) {
+  text-decoration: none;
+}
+:root[data-design='graphite'] [data-ui='nav-item'][data-active] {
+  background: rgb(var(--c-brass));
+  color: #000;
+}
+:root[data-design='graphite'] [data-ui='nav-item'][data-active] svg {
+  color: #000;
+}
+:root[data-design='graphite'] [data-ui='badge'] {
+  box-shadow: inset 0 0 0 1px currentColor;
+  font-weight: 700;
+}
+:root[data-design='graphite'] [data-ui='card-title'],
+:root[data-design='graphite'] thead th {
+  color: rgb(var(--c-ink)) !important;
+  font-weight: 700;
+}
+:root[data-design='graphite'] [data-ui='page-title'] {
+  font-weight: 700;
+}
+
+/* ===== Verdigris ======================================================== */
+:root[data-design='verdigris'] [data-ui='page-title'] {
+  font-size: 2.2rem;
+  font-weight: 700;
+  letter-spacing: -0.03em;
+}
+:root[data-design='verdigris'] [data-ui='card-title'],
+:root[data-design='verdigris'] [data-ui='nav-heading'],
+:root[data-design='verdigris'] [data-ui='page-header'] .eyebrow {
+  color: #cf9f62 !important;
+}
+:root[data-design='verdigris'] [data-ui='nav-item'][data-active] {
+  background: rgb(var(--c-brass) / 0.12);
+}
+
+/* ===== Blueprint ======================================================== */
+:root[data-design='blueprint'] body {
+  background-color: rgb(var(--c-canvas));
+  background-image:
+    linear-gradient(rgb(255 255 255 / 0.07) 1px, transparent 1px),
+    linear-gradient(90deg, rgb(255 255 255 / 0.07) 1px, transparent 1px),
+    linear-gradient(rgb(255 255 255 / 0.035) 1px, transparent 1px),
+    linear-gradient(90deg, rgb(255 255 255 / 0.035) 1px, transparent 1px);
+  background-size: 120px 120px, 120px 120px, 24px 24px, 24px 24px;
+}
+:root[data-design='blueprint'] [data-ui='card'] {
+  background: rgb(var(--c-surface) / 0.82);
+  border-color: rgb(255 255 255 / 0.5);
+}
+:root[data-design='blueprint'] [data-ui='card-header'] {
+  border-bottom-style: dashed;
+  border-bottom-color: rgb(255 255 255 / 0.4);
+}
+:root[data-design='blueprint'] tr {
+  border-style: dashed;
+}
+:root[data-design='blueprint'] [data-ui='page-header'] {
+  border: 1px solid rgb(255 255 255 / 0.55);
+  background: rgb(var(--c-surface) / 0.7);
+  padding: 0.9rem 1.1rem;
+}
+:root[data-design='blueprint'] [data-ui='page-title'] {
+  font-size: 1.6rem;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+:root[data-design='blueprint'] [data-ui='card-title'] {
+  font-family: var(--font-mono);
+  color: rgb(var(--c-brass)) !important;
+  letter-spacing: 0.08em;
+}
+:root[data-design='blueprint'] #app-sidebar {
+  background: rgb(8 46 86 / 0.92);
+  border-right-style: dashed;
+  border-right-color: rgb(255 255 255 / 0.35);
+}
+
+/* ===== Field Manual ===================================================== */
+:root[data-design='field-manual'] body {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='200' height='200'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='3' stitchTiles='stitch'/%3E%3CfeColorMatrix values='0 0 0 0 0.35 0 0 0 0 0.3 0 0 0 0 0.2 0 0 0 0.06 0'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+}
+:root[data-design='field-manual'] [data-ui='main'] {
+  counter-reset: manual-section;
+}
+:root[data-design='field-manual'] [data-ui='page-title'] {
+  font-size: 2.4rem;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+:root[data-design='field-manual'] [data-ui='page-header'] {
+  border-bottom: 3px double rgb(var(--c-ink));
+  padding-bottom: 0.9rem;
+}
+:root[data-design='field-manual'] [data-ui='card-title'] {
+  color: rgb(var(--c-ink)) !important;
+  font-family: var(--font-sans);
+  font-weight: 700;
+}
+:root[data-design='field-manual'] [data-ui='card-title']::before {
+  counter-increment: manual-section;
+  content: counter(manual-section, decimal-leading-zero) ' \2014 ';
+  color: rgb(var(--c-brass));
+}
+:root[data-design='field-manual'] [data-ui='card'] {
+  border-color: rgb(var(--c-line-strong));
+}
+
+/* ===== Swiss ============================================================ */
+:root[data-design='swiss'] [data-ui='page-title'] {
+  font-size: 3rem;
+  font-weight: 700;
+  letter-spacing: -0.04em;
+  line-height: 1.05;
+}
+:root[data-design='swiss'] [data-ui='page-header'] .eyebrow {
+  color: rgb(var(--c-ink));
+  font-weight: 700;
+}
+:root[data-design='swiss'] [data-ui='page-header'] .eyebrow::before {
+  content: '';
+  display: inline-block;
+  width: 0.6rem;
+  height: 0.6rem;
+  margin-right: 0.5rem;
+  background: #e10600;
+}
+:root[data-design='swiss'] [data-ui='card'] {
+  border-width: 2px 0 0;
+  border-color: #0a0a0a;
+  box-shadow: none;
+  background: transparent;
+}
+:root[data-design='swiss'] [data-ui='card-header'] {
+  padding-left: 0;
+  padding-right: 0;
+}
+:root[data-design='swiss'] [data-ui='card-title'] {
+  text-transform: none;
+  letter-spacing: -0.01em;
+  font-size: 1rem;
+  font-weight: 700;
+  color: rgb(var(--c-ink)) !important;
+}
+:root[data-design='swiss'] thead th {
+  color: rgb(var(--c-ink));
+  font-weight: 700;
+}
+:root[data-design='swiss'] [data-ui='nav-item'][data-active] {
+  background: #0a0a0a;
+  color: #ffffff;
+}
+:root[data-design='swiss'] [data-ui='nav-item'][data-active] svg {
+  color: #ffffff;
+}
+:root[data-design='swiss'] [data-ui='nav-item'] > span:first-child {
+  background: #e10600;
+}
+:root[data-design='swiss'] [data-ui='nav-heading'] {
+  color: rgb(var(--c-ink));
+  font-weight: 700;
+}
+
+/* ===== Neo-Brutalist ==================================================== */
+:root[data-design='brutalist'] [data-ui='card'],
+:root[data-design='brutalist'] [data-ui='stat'] {
+  border-width: 2px;
+}
+:root[data-design='brutalist'] [data-ui='card-header'] {
+  background: #ffe14d;
+  border-bottom-width: 2px;
+}
+:root[data-design='brutalist'] [data-ui='card-title'] {
+  color: #111 !important;
+  font-weight: 700;
+}
+:root[data-design='brutalist'] [data-ui='page-title'] {
+  font-size: 2.5rem;
+  font-weight: 700;
+  letter-spacing: -0.03em;
+  background: linear-gradient(transparent 58%, #ffe14d 58%, #ffe14d 92%, transparent 92%);
+  padding: 0 0.15em;
+}
+:root[data-design='brutalist'] [data-ui='button'] {
+  border: 2px solid #111;
+  box-shadow: 2px 2px 0 0 #111;
+  font-weight: 700;
+}
+:root[data-design='brutalist'] [data-ui='button']:active {
+  transform: translate(2px, 2px);
+  box-shadow: none;
+}
+:root[data-design='brutalist'] [data-ui='badge'] {
+  box-shadow: inset 0 0 0 1.5px #111;
+  color: #111;
+  font-weight: 700;
+}
+:root[data-design='brutalist'] [data-ui='badge'][data-tone='ok'] { background: rgb(var(--c-ok-300)); }
+:root[data-design='brutalist'] [data-ui='badge'][data-tone='warn'] { background: rgb(var(--c-warn-300)); }
+:root[data-design='brutalist'] [data-ui='badge'][data-tone='danger'] { background: rgb(var(--c-danger-300)); }
+:root[data-design='brutalist'] [data-ui='badge'][data-tone='info'] { background: rgb(var(--c-info-200)); }
+:root[data-design='brutalist'] [data-ui='badge'] > span {
+  background: #111;
+}
+:root[data-design='brutalist'] [data-ui='nav-item'][data-active] {
+  background: #ffe14d;
+  box-shadow: inset 0 0 0 2px #111, 2px 2px 0 0 #111;
+  color: #111;
+}
+:root[data-design='brutalist'] [data-ui='nav-item'][data-active] svg {
+  color: #111;
+}
+:root[data-design='brutalist'] #app-sidebar,
+:root[data-design='brutalist'] [data-ui='topbar'] {
+  border-width: 0 2px 0 0;
+}
+:root[data-design='brutalist'] [data-ui='topbar'] {
+  border-width: 0 0 2px;
+}
+:root[data-design='brutalist'] [data-ui='main'] input,
+:root[data-design='brutalist'] [data-ui='main'] select {
+  border-width: 2px;
+}
+:root[data-design='brutalist'] tbody tr {
+  border-color: rgb(17 17 17 / 0.25);
+}
+
+/* ===== Porcelain ======================================================== */
+:root[data-design='porcelain'] [data-ui='page-title'] {
+  font-size: 1.9rem;
+  font-weight: 700;
+  letter-spacing: -0.025em;
+}
+:root[data-design='porcelain'] [data-ui='card'] {
+  border-color: rgb(var(--c-line) / 0.8);
+}
+:root[data-design='porcelain'] [data-ui='card-header'] {
+  border-bottom-color: rgb(var(--c-line) / 0.7);
+}
+:root[data-design='porcelain'] [data-ui='card-title'] {
+  text-transform: none;
+  letter-spacing: -0.005em;
+  font-size: 0.875rem;
+  font-weight: 650;
+  color: rgb(var(--c-ink)) !important;
+}
+:root[data-design='porcelain'] thead th {
+  text-transform: none;
+  letter-spacing: 0;
+  font-size: 0.75rem;
+  font-weight: 600;
+}
+:root[data-design='porcelain'] [data-ui='nav-item'][data-active] {
+  background: rgb(var(--c-brass) / 0.1);
+  color: rgb(var(--c-brass-strong));
+}
+:root[data-design='porcelain'] [data-ui='nav-item'] > span:first-child {
+  display: none;
+}
+:root[data-design='porcelain'] [data-ui='button'][data-variant='primary'] {
+  background: linear-gradient(180deg, #6159f0, #4f46e5);
+  box-shadow: 0 1px 2px rgb(79 70 229 / 0.35), inset 0 1px 0 rgb(255 255 255 / 0.18);
+}
+
+/* ===== Terracotta ======================================================= */
+:root[data-design='terracotta'] [data-ui='page-title'] {
+  font-size: 2.25rem;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+}
+:root[data-design='terracotta'] [data-ui='card-title'],
+:root[data-design='terracotta'] [data-ui='nav-heading'],
+:root[data-design='terracotta'] [data-ui='page-header'] .eyebrow {
+  color: rgb(var(--c-brass-strong)) !important;
+}
+:root[data-design='terracotta'] #app-sidebar {
+  background: #f1e7da;
+}
+:root[data-design='terracotta'] [data-ui='nav-item'][data-active] {
+  background: rgb(var(--c-surface));
+  box-shadow: 0 1px 2px rgb(80 40 10 / 0.08);
+}
+
+/* ===== Sage ============================================================= */
+:root[data-design='sage'] [data-ui='page-title'] {
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  font-size: 1.9rem;
+}
+:root[data-design='sage'] [data-ui='card-title'] {
+  color: rgb(var(--c-brass-strong)) !important;
+}
+:root[data-design='sage'] [data-ui='nav-item'][data-active] {
+  background: rgb(var(--c-brass) / 0.16);
+}
+
+/* ===== Solar ============================================================ */
+:root[data-design='solar'] .font-mono,
+:root[data-design='solar'] code,
+:root[data-design='solar'] pre,
+:root[data-design='solar'] kbd {
+  font-variation-settings: 'MONO' 1;
+}
+:root[data-design='solar'] [data-ui='page-title'] {
+  font-variation-settings: 'CASL' 0.7;
+  font-weight: 700;
+  font-size: 1.9rem;
+}
+:root[data-design='solar'] [data-ui='card-title'] {
+  color: #9a5b10 !important;
+}
+
+/* ===== Quiet ============================================================ */
+:root[data-design='quiet'] [data-ui='page-title'] {
+  font-size: 2.9rem;
+  font-weight: 400;
+  letter-spacing: -0.01em;
+  line-height: 1.05;
+}
+:root[data-design='quiet'] [data-ui='card-header'] {
+  border-bottom-color: transparent;
+}
+:root[data-design='quiet'] [data-ui='card-title'] {
+  text-transform: none;
+  letter-spacing: 0;
+  font-size: 0.875rem;
+  font-weight: 600;
+  color: rgb(var(--c-ink)) !important;
+}
+:root[data-design='quiet'] thead {
+  background: transparent;
+}
+:root[data-design='quiet'] thead th {
+  text-transform: none;
+  letter-spacing: 0;
+  font-size: 0.75rem;
+  font-weight: 500;
+  color: rgb(var(--c-faint));
+}
+:root[data-design='quiet'] [data-ui='badge'] {
+  background: transparent;
+  padding-left: 0;
+  text-transform: none;
+  letter-spacing: 0;
+  font-size: 0.75rem;
+}
+:root[data-design='quiet'] [data-ui='nav-item'][data-active] {
+  background: rgb(var(--c-surface2));
+}
+:root[data-design='quiet'] [data-ui='nav-item'] > span:first-child {
+  display: none;
+}
+
+/* ===== Hi-Vis =========================================================== */
+:root[data-design='hi-vis'] [data-ui='page-header'] {
+  border-style: solid;
+  border-width: 8px 0 0;
+  border-image: repeating-linear-gradient(-45deg, #121212 0 10px, #ffc400 10px 20px) 8;
+  padding-top: 1rem;
+}
+:root[data-design='hi-vis'] [data-ui='page-title'],
+:root[data-design='hi-vis'] [data-ui='brand'] {
+  font-stretch: 70%;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: 0.01em;
+}
+:root[data-design='hi-vis'] [data-ui='page-title'] {
+  font-size: 2.5rem;
+  line-height: 1;
+}
+:root[data-design='hi-vis'] [data-ui='card-header'] {
+  --c-ink: 245 245 240;
+  --c-muted: 196 196 188;
+  --c-faint: 176 176 168;
+  --c-brass-strong: 255 140 74;
+  --c-surface: 34 34 34;
+  --c-surface2: 50 50 50;
+  --c-line: 70 70 70;
+  background: #1c1c1c;
+}
+:root[data-design='hi-vis'] [data-ui='card-title'] {
+  font-family: var(--font-display);
+  font-stretch: 75%;
+  font-size: 0.875rem;
+  font-weight: 700;
+  color: #ffffff !important;
+}
+:root[data-design='hi-vis'] [data-ui='button'][data-variant='primary'] {
+  color: #121212;
+}
+:root[data-design='hi-vis'] [data-ui='nav-item'][data-active] {
+  background: rgb(var(--c-brass));
+  color: #121212;
+}
+:root[data-design='hi-vis'] [data-ui='nav-item'][data-active] svg {
+  color: #121212;
+}

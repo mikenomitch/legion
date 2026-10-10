@@ -1,0 +1,369 @@
+{
+  "method": "ListRolloutEvents",
+  "recordedAt": "2026-10-10T23:46:04.193Z",
+  "entries": [
+    {
+      "request": {
+        "rolloutId": "3",
+        "limit": 1000
+      },
+      "response": {
+        "events": [
+          {
+            "id": "8",
+            "rolloutId": "3",
+            "jobId": "search-indexer",
+            "level": "info",
+            "message": "Rollout started",
+            "metadataJson": "{\"progression\":null,\"status\":\"pending\"}",
+            "createdAt": "2026-10-10T22:54:54.859882853Z"
+          },
+          {
+            "id": "9",
+            "rolloutId": "3",
+            "jobId": "search-indexer",
+            "groupName": "default",
+            "level": "info",
+            "message": "Group default placed 3 replacement allocations",
+            "metadataJson": "{\"incomplete\":false,\"nextDelayMs\":0,\"status\":\"running\"}",
+            "createdAt": "2026-10-10T22:54:54.870135471Z"
+          },
+          {
+            "id": "10",
+            "rolloutId": "3",
+            "jobId": "search-indexer",
+            "level": "info",
+            "message": "Group default waiting for healthy window",
+            "metadataJson": "{\"incomplete\":false,\"nextDelayMs\":2000,\"status\":\"running\"}",
+            "createdAt": "2026-10-10T22:54:54.882272944Z"
+          },
+          {
+            "id": "16",
+            "rolloutId": "3",
+            "jobId": "search-indexer",
+            "groupName": "default",
+            "level": "info",
+            "message": "Group default advanced to step 1",
+            "metadataJson": "{\"incomplete\":false,\"nextDelayMs\":0,\"status\":\"running\"}",
+            "createdAt": "2026-10-10T22:54:56.887796985Z"
+          },
+          {
+            "id": "17",
+            "rolloutId": "3",
+            "jobId": "search-indexer",
+            "level": "info",
+            "message": "Rollout completed",
+            "metadataJson": "{\"incomplete\":false,\"nextDelayMs\":null,\"status\":\"completed\"}",
+            "createdAt": "2026-10-10T22:54:56.892322185Z"
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "rolloutId": "2",
+        "limit": 1000
+      },
+      "response": {
+        "events": [
+          {
+            "id": "5",
+            "rolloutId": "2",
+            "jobId": "edge-proxy",
+            "level": "info",
+            "message": "Rollout started",
+            "metadataJson": "{\"progression\":null,\"status\":\"pending\"}",
+            "createdAt": "2026-10-10T22:54:54.703127971Z"
+          },
+          {
+            "id": "6",
+            "rolloutId": "2",
+            "jobId": "edge-proxy",
+            "groupName": "default",
+            "level": "info",
+            "message": "Group default placed 1 replacement allocations",
+            "metadataJson": "{\"incomplete\":false,\"nextDelayMs\":0,\"status\":\"running\"}",
+            "createdAt": "2026-10-10T22:54:54.721498181Z"
+          },
+          {
+            "id": "7",
+            "rolloutId": "2",
+            "jobId": "edge-proxy",
+            "level": "info",
+            "message": "Group default waiting for healthy window",
+            "metadataJson": "{\"incomplete\":false,\"nextDelayMs\":2000,\"status\":\"running\"}",
+            "createdAt": "2026-10-10T22:54:54.727634964Z"
+          },
+          {
+            "id": "18",
+            "rolloutId": "2",
+            "jobId": "edge-proxy",
+            "groupName": "default",
+            "level": "info",
+            "message": "Group default advanced to step 1",
+            "metadataJson": "{\"incomplete\":false,\"nextDelayMs\":0,\"status\":\"running\"}",
+            "createdAt": "2026-10-10T22:55:00.751553807Z"
+          },
+          {
+            "id": "19",
+            "rolloutId": "2",
+            "jobId": "edge-proxy",
+            "level": "info",
+            "message": "Rollout completed",
+            "metadataJson": "{\"incomplete\":false,\"nextDelayMs\":null,\"status\":\"completed\"}",
+            "createdAt": "2026-10-10T22:55:00.759691197Z"
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "rolloutId": "4",
+        "limit": 1000
+      },
+      "response": {
+        "events": [
+          {
+            "id": "11",
+            "rolloutId": "4",
+            "jobId": "nightly-report",
+            "level": "info",
+            "message": "Rollout started",
+            "metadataJson": "{\"progression\":null,\"status\":\"pending\"}",
+            "createdAt": "2026-10-10T22:54:54.995061474Z"
+          },
+          {
+            "id": "12",
+            "rolloutId": "4",
+            "jobId": "nightly-report",
+            "groupName": "default",
+            "level": "info",
+            "message": "Group default placed 1 replacement allocations",
+            "metadataJson": "{\"incomplete\":false,\"nextDelayMs\":0,\"status\":\"running\"}",
+            "createdAt": "2026-10-10T22:54:55.003468127Z"
+          },
+          {
+            "id": "13",
+            "rolloutId": "4",
+            "jobId": "nightly-report",
+            "level": "info",
+            "message": "Group default waiting for healthy window",
+            "metadataJson": "{\"incomplete\":false,\"nextDelayMs\":2000,\"status\":\"running\"}",
+            "createdAt": "2026-10-10T22:54:55.007587884Z"
+          },
+          {
+            "id": "22",
+            "rolloutId": "4",
+            "jobId": "nightly-report",
+            "groupName": "default",
+            "level": "info",
+            "message": "Group default placed 1 replacement allocations",
+            "metadataJson": "{\"incomplete\":false,\"nextDelayMs\":0,\"status\":\"running\"}",
+            "createdAt": "2026-10-10T22:56:33.346891181Z"
+          },
+          {
+            "id": "23",
+            "rolloutId": "4",
+            "jobId": "nightly-report",
+            "level": "info",
+            "message": "Group default waiting for healthy window",
+            "metadataJson": "{\"incomplete\":false,\"nextDelayMs\":2000,\"status\":\"running\"}",
+            "createdAt": "2026-10-10T22:56:33.356039451Z"
+          },
+          {
+            "id": "24",
+            "rolloutId": "4",
+            "jobId": "nightly-report",
+            "groupName": "default",
+            "level": "info",
+            "message": "Group default advanced to step 1",
+            "metadataJson": "{\"incomplete\":false,\"nextDelayMs\":0,\"status\":\"running\"}",
+            "createdAt": "2026-10-10T22:56:35.363377655Z"
+          },
+          {
+            "id": "25",
+            "rolloutId": "4",
+            "jobId": "nightly-report",
+            "level": "info",
+            "message": "Rollout completed",
+            "metadataJson": "{\"incomplete\":false,\"nextDelayMs\":null,\"status\":\"completed\"}",
+            "createdAt": "2026-10-10T22:56:35.368102991Z"
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "rolloutId": "5",
+        "limit": 1000
+      },
+      "response": {
+        "events": [
+          {
+            "id": "26",
+            "rolloutId": "5",
+            "jobId": "edge-proxy",
+            "level": "info",
+            "message": "Rollout started",
+            "metadataJson": "{\"progression\":null,\"status\":\"pending\"}",
+            "createdAt": "2026-10-10T23:09:17.722752068Z"
+          },
+          {
+            "id": "27",
+            "rolloutId": "5",
+            "jobId": "edge-proxy",
+            "groupName": "default",
+            "level": "info",
+            "message": "Group default retired 1 old allocations",
+            "metadataJson": "{\"incomplete\":false,\"nextDelayMs\":0,\"status\":\"running\"}",
+            "createdAt": "2026-10-10T23:09:17.728305184Z"
+          },
+          {
+            "id": "28",
+            "rolloutId": "5",
+            "jobId": "edge-proxy",
+            "groupName": "default",
+            "level": "info",
+            "message": "Group default placed 1 replacement allocations",
+            "metadataJson": "{\"incomplete\":false,\"nextDelayMs\":0,\"status\":\"running\"}",
+            "createdAt": "2026-10-10T23:09:17.736814082Z"
+          },
+          {
+            "id": "29",
+            "rolloutId": "5",
+            "jobId": "edge-proxy",
+            "level": "info",
+            "message": "Group default waiting for healthy window",
+            "metadataJson": "{\"incomplete\":false,\"nextDelayMs\":2000,\"status\":\"running\"}",
+            "createdAt": "2026-10-10T23:09:17.740409661Z"
+          },
+          {
+            "id": "30",
+            "rolloutId": "5",
+            "jobId": "edge-proxy",
+            "groupName": "default",
+            "level": "info",
+            "message": "Group default advanced to step 1",
+            "metadataJson": "{\"incomplete\":false,\"nextDelayMs\":0,\"status\":\"running\"}",
+            "createdAt": "2026-10-10T23:09:23.762474476Z"
+          },
+          {
+            "id": "31",
+            "rolloutId": "5",
+            "jobId": "edge-proxy",
+            "level": "info",
+            "message": "Rollout completed",
+            "metadataJson": "{\"incomplete\":false,\"nextDelayMs\":null,\"status\":\"completed\"}",
+            "createdAt": "2026-10-10T23:09:23.768066246Z"
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "rolloutId": "9",
+        "limit": 1000
+      },
+      "response": {
+        "events": [
+          {
+            "id": "73",
+            "rolloutId": "9",
+            "jobId": "checkout",
+            "level": "info",
+            "message": "Rollout started",
+            "metadataJson": "{\"progression\":null,\"status\":\"pending\"}",
+            "createdAt": "2026-10-10T23:34:43.910797493Z"
+          },
+          {
+            "id": "74",
+            "rolloutId": "9",
+            "jobId": "checkout",
+            "groupName": "api",
+            "level": "info",
+            "message": "Group api retired 3 old allocations",
+            "metadataJson": "{\"incomplete\":false,\"nextDelayMs\":0,\"status\":\"running\"}",
+            "createdAt": "2026-10-10T23:34:43.920102538Z"
+          },
+          {
+            "id": "75",
+            "rolloutId": "9",
+            "jobId": "checkout",
+            "groupName": "api",
+            "level": "info",
+            "message": "Group api placed 3 replacement allocations",
+            "metadataJson": "{\"incomplete\":false,\"nextDelayMs\":0,\"status\":\"running\"}",
+            "createdAt": "2026-10-10T23:34:43.93227035Z"
+          },
+          {
+            "id": "76",
+            "rolloutId": "9",
+            "jobId": "checkout",
+            "groupName": "workers",
+            "level": "info",
+            "message": "Group workers retired 3 old allocations",
+            "metadataJson": "{\"incomplete\":false,\"nextDelayMs\":0,\"status\":\"running\"}",
+            "createdAt": "2026-10-10T23:34:43.94021897Z"
+          },
+          {
+            "id": "77",
+            "rolloutId": "9",
+            "jobId": "checkout",
+            "groupName": "workers",
+            "level": "info",
+            "message": "Group workers placed 3 replacement allocations",
+            "metadataJson": "{\"incomplete\":false,\"nextDelayMs\":0,\"status\":\"running\"}",
+            "createdAt": "2026-10-10T23:34:43.96072839Z"
+          },
+          {
+            "id": "78",
+            "rolloutId": "9",
+            "jobId": "checkout",
+            "level": "info",
+            "message": "Group workers waiting for healthy window",
+            "metadataJson": "{\"incomplete\":false,\"nextDelayMs\":2000,\"status\":\"running\"}",
+            "createdAt": "2026-10-10T23:34:43.968648412Z"
+          },
+          {
+            "id": "79",
+            "rolloutId": "9",
+            "jobId": "checkout",
+            "groupName": "workers",
+            "level": "info",
+            "message": "Group workers advanced to step 1",
+            "metadataJson": "{\"incomplete\":false,\"nextDelayMs\":0,\"status\":\"running\"}",
+            "createdAt": "2026-10-10T23:34:45.974951236Z"
+          },
+          {
+            "id": "80",
+            "rolloutId": "9",
+            "jobId": "checkout",
+            "level": "info",
+            "message": "Group api waiting for healthy window",
+            "metadataJson": "{\"incomplete\":false,\"nextDelayMs\":2000,\"status\":\"running\"}",
+            "createdAt": "2026-10-10T23:34:45.980302793Z"
+          },
+          {
+            "id": "81",
+            "rolloutId": "9",
+            "jobId": "checkout",
+            "groupName": "api",
+            "level": "info",
+            "message": "Group api advanced to step 1",
+            "metadataJson": "{\"incomplete\":false,\"nextDelayMs\":0,\"status\":\"running\"}",
+            "createdAt": "2026-10-10T23:35:26.118329262Z"
+          },
+          {
+            "id": "82",
+            "rolloutId": "9",
+            "jobId": "checkout",
+            "level": "info",
+            "message": "Rollout completed",
+            "metadataJson": "{\"incomplete\":false,\"nextDelayMs\":null,\"status\":\"completed\"}",
+            "createdAt": "2026-10-10T23:35:26.129059622Z"
+          }
+        ]
+      }
+    }
+  ]
+}

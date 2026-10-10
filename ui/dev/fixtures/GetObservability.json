@@ -1,0 +1,26 @@
+{
+  "method": "GetObservability",
+  "recordedAt": "2026-10-10T23:46:06.259Z",
+  "entries": [
+    {
+      "request": {
+        "maxLines": 200
+      },
+      "response": {
+        "persistenceBackend": "local_disk",
+        "persistenceRole": "primary",
+        "persistenceLeaseHeld": true
+      }
+    },
+    {
+      "request": {
+        "maxLines": 1
+      },
+      "response": {
+        "persistenceBackend": "local_disk",
+        "persistenceRole": "primary",
+        "persistenceLeaseHeld": true
+      }
+    }
+  ]
+}

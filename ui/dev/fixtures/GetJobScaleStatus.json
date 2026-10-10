@@ -1,0 +1,84 @@
+{
+  "method": "GetJobScaleStatus",
+  "recordedAt": "2026-10-10T23:45:44.856Z",
+  "entries": [
+    {
+      "request": {
+        "name": "edge-proxy"
+      },
+      "response": {
+        "tasks": [
+          {
+            "taskGroup": "default",
+            "taskName": "proxy",
+            "specCount": 1,
+            "effectiveCount": 1
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "name": "checkout"
+      },
+      "response": {
+        "tasks": [
+          {
+            "taskGroup": "api",
+            "taskName": "api",
+            "specCount": 3,
+            "effectiveCount": 3
+          },
+          {
+            "taskGroup": "workers",
+            "taskName": "queue-worker",
+            "specCount": 2,
+            "effectiveCount": 2
+          },
+          {
+            "taskGroup": "workers",
+            "taskName": "cache-warmer",
+            "specCount": 1,
+            "effectiveCount": 1
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "name": "nightly-report"
+      },
+      "response": {
+        "tasks": [
+          {
+            "taskGroup": "default",
+            "taskName": "report",
+            "specCount": 1,
+            "effectiveCount": 1
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "name": "search-indexer"
+      },
+      "response": {
+        "tasks": [
+          {
+            "taskGroup": "default",
+            "taskName": "indexer",
+            "specCount": 2,
+            "effectiveCount": 2
+          },
+          {
+            "taskGroup": "default",
+            "taskName": "compactor",
+            "specCount": 1,
+            "effectiveCount": 1
+          }
+        ]
+      }
+    }
+  ]
+}

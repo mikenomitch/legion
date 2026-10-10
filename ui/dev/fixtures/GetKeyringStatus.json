@@ -1,0 +1,30 @@
+{
+  "method": "GetKeyringStatus",
+  "recordedAt": "2026-10-10T23:44:34.856Z",
+  "entries": [
+    {
+      "request": {},
+      "response": {
+        "enabled": true,
+        "state": "unlocked",
+        "rootKeyProvider": "file",
+        "rootKeyLocation": "/var/lib/legion/keys/root.key",
+        "keys": [
+          {
+            "keyId": "dk_e2ccbbc6be466e20",
+            "state": "active",
+            "algorithm": "aes-256-gcm",
+            "createdAt": "1791672826",
+            "rootKeyId": "rk_d1b2a58f6dee07ad",
+            "rootProvider": "file",
+            "unwrapped": true
+          }
+        ],
+        "rewrap": {},
+        "dataKeyRotationAge": "30days",
+        "activeKeyAgeSeconds": "3048",
+        "manager": "http://127.0.0.1:4747"
+      }
+    }
+  ]
+}

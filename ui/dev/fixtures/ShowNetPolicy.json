@@ -1,0 +1,83 @@
+{
+  "method": "ShowNetPolicy",
+  "recordedAt": "2026-10-10T23:45:54.625Z",
+  "entries": [
+    {
+      "request": {
+        "jobId": "edge-proxy",
+        "taskName": "proxy"
+      },
+      "response": {
+        "effectiveJson": "{\"hash\":\"44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a\"}",
+        "declaredMode": "auto",
+        "effectiveMode": "auto"
+      }
+    },
+    {
+      "request": {
+        "jobId": "checkout",
+        "taskName": "api"
+      },
+      "response": {
+        "effectiveJson": "{\"hash\":\"44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a\"}",
+        "declaredMode": "auto",
+        "effectiveMode": "auto"
+      }
+    },
+    {
+      "request": {
+        "jobId": "checkout",
+        "taskName": "cache-warmer"
+      },
+      "response": {
+        "effectiveJson": "{\"hash\":\"44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a\"}",
+        "declaredMode": "auto",
+        "effectiveMode": "auto"
+      }
+    },
+    {
+      "request": {
+        "jobId": "checkout",
+        "taskName": "queue-worker"
+      },
+      "response": {
+        "effectiveJson": "{\"hash\":\"44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a\"}",
+        "declaredMode": "auto",
+        "effectiveMode": "auto"
+      }
+    },
+    {
+      "request": {
+        "jobId": "nightly-report",
+        "taskName": "report"
+      },
+      "response": {
+        "effectiveJson": "{\"hash\":\"44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a\"}",
+        "declaredMode": "auto",
+        "effectiveMode": "auto"
+      }
+    },
+    {
+      "request": {
+        "jobId": "search-indexer",
+        "taskName": "compactor"
+      },
+      "response": {
+        "effectiveJson": "{\"hash\":\"44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a\"}",
+        "declaredMode": "auto",
+        "effectiveMode": "auto"
+      }
+    },
+    {
+      "request": {
+        "jobId": "search-indexer",
+        "taskName": "indexer"
+      },
+      "response": {
+        "effectiveJson": "{\"hash\":\"44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a\"}",
+        "declaredMode": "auto",
+        "effectiveMode": "auto"
+      }
+    }
+  ]
+}

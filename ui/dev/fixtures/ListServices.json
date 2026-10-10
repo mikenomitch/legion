@@ -1,0 +1,37 @@
+{
+  "method": "ListServices",
+  "recordedAt": "2026-10-10T23:45:52.686Z",
+  "entries": [
+    {
+      "request": {},
+      "response": {
+        "services": [
+          {
+            "service": "checkout-api",
+            "jobId": "checkout",
+            "taskName": "api",
+            "healthyCount": 3,
+            "totalCount": 3,
+            "tags": [
+              "v2",
+              "public"
+            ],
+            "meta": {
+              "protocol": "http"
+            }
+          },
+          {
+            "service": "edge",
+            "jobId": "edge-proxy",
+            "taskName": "proxy",
+            "healthyCount": 1,
+            "totalCount": 1,
+            "tags": [
+              "edge"
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

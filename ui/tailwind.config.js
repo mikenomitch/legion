@@ -1,6 +1,14 @@
 import forms from '@tailwindcss/forms'
 import typography from '@tailwindcss/typography'
 
+// Status palettes (emerald = ok, amber = warn, red = danger, sky = info) read
+// CSS variables too, so a theme can retune status colors without touching a
+// component. Only the shades the UI uses are routed; the defaults in
+// index.css are Tailwind's own values.
+const STATUS_SHADES = [200, 300, 400, 500, 600, 700, 800]
+const statusScale = (name) =>
+  Object.fromEntries(STATUS_SHADES.map((shade) => [shade, `rgb(var(--c-${name}-${shade}) / <alpha-value>)`]))
+
 /** @type {import('tailwindcss').Config} */
 export default {
   darkMode: 'class',
@@ -25,24 +33,36 @@ export default {
           DEFAULT: 'rgb(var(--c-brass) / <alpha-value>)',
           strong: 'rgb(var(--c-brass-strong) / <alpha-value>)',
         },
+        emerald: statusScale('ok'),
+        amber: statusScale('warn'),
+        red: statusScale('danger'),
+        sky: statusScale('info'),
       },
+      // Families are CSS variables (set in index.css) so a theme swaps type
+      // without a rebuild.
       fontFamily: {
-        sans: ['"Inter Variable"', 'Inter', 'system-ui', '-apple-system', 'sans-serif'],
-        display: ['"Space Grotesk Variable"', '"Space Grotesk"', '"Inter Variable"', 'system-ui', 'sans-serif'],
+        sans: ['var(--font-sans)'],
+        display: ['var(--font-display)'],
         // Fira Code ships programming ligatures on by default; IDs, hashes and
         // log lines read better without them, so `font-mono` turns off both the
         // standard (liga) and contextual (calt) ligature features.
-        mono: [
-          ['"Fira Code Variable"', '"Fira Code"', 'ui-monospace', 'SFMono-Regular', 'Menlo', 'monospace'],
-          { fontFeatureSettings: '"liga" 0, "calt" 0' },
-        ],
+        mono: ['var(--font-mono)', { fontFeatureSettings: '"liga" 0, "calt" 0' }],
       },
       fontSize: {
         '2xs': ['0.6875rem', { lineHeight: '1rem' }],
       },
+      borderRadius: {
+        sm: 'var(--r-sm)',
+        DEFAULT: 'var(--r)',
+        md: 'var(--r-md)',
+        lg: 'var(--r-lg)',
+        xl: 'var(--r-xl)',
+        '2xl': 'var(--r-2xl)',
+        full: 'var(--r-full)',
+      },
       boxShadow: {
-        card: '0 1px 2px 0 rgb(0 0 0 / 0.04)',
-        pop: '0 12px 32px -12px rgb(0 0 0 / 0.35)',
+        card: 'var(--shadow-card)',
+        pop: 'var(--shadow-pop)',
       },
     },
   },

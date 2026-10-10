@@ -27,6 +27,21 @@ accent, dark-first with a full light theme) lives in a few central places:
   `ui/tailwind.config.js` (`bg-surface`, `text-muted`, `border-line`,
   `text-brass`, …). Light and dark themes switch by swapping variables on
   `.dark`. Pages never write `dark:` variants for theme colors.
+  Type, shape and depth are variables too: `--font-sans`, `--font-display`
+  and `--font-mono` back `font-sans`/`font-display`/`font-mono`; `--r-sm`
+  through `--r-2xl` and `--r-full` back the `rounded-*` scale; and
+  `--shadow-card`/`--shadow-pop` back `shadow-card`/`shadow-pop`. The status
+  palettes Tailwind calls `emerald`, `amber`, `red` and `sky` (shades
+  200–800) read `--c-ok-*`, `--c-warn-*`, `--c-danger-*` and `--c-info-*`.
+  The defaults are the shipped values, so a theme is just a different set
+  of variables.
+- **Structure hooks**: the primitives carry stable `data-ui` attributes
+  (`page-header`, `page-title`, `card`, `card-header`, `card-title`, `stat`,
+  `badge` with `data-tone`, `button` with `data-variant`, `tabs`, `nav-item`
+  with `data-active`, `nav-heading`, `brand`, `topbar`, `main`; the sidebar is
+  `#app-sidebar`). Theme CSS that needs more than variables (a title
+  treatment, a card-header band) targets these instead of utility classes.
+  Keep them when refactoring a primitive.
 - **Primitives**: `ui/src/components/ui.tsx` exports the shared components
   every page builds on: `Icon`, `Badge`/`StatusBadge`/`MonoBadge`,
   `Card`/`SectionCard`/`PageHeader`/`StatCard`, `Tabs`, `Note`,
@@ -469,3 +484,51 @@ without touching the transport.
 - `npm run gen`: regenerate `src/gen` from `proto/legion.proto`.
 - CI (`.github/workflows/ci.yml`, job `ui-build`) runs the drift check, the
   typecheck and the build whenever `ui/**` or the proto changes.
+
+### Design lab and theme studio (dev server only)
+
+`ui/src/themes/` holds candidate themes and a **theme studio** for trying
+them on the real UI. It loads only on the dev server — in `npm run lab`, with
+`?design=` in the URL, or in a browser that has used the studio before (plain
+`npm run dev` is otherwise unchanged) — and `index.tsx` imports it behind
+`import.meta.env.DEV`, so a production build carries none of its code, theme
+data or fonts. **Hide** collapses the panel to a button; it opens docked by
+default only in `npm run lab`.
+
+- `npm run lab` starts the dev server with the studio docked on the right.
+  Pick any catalog theme (or the shipped look) as a preset and change its
+  colors, status hues, sidebar, fonts, base and title size, corners, shadow,
+  card border, and which preset's structural CSS applies. Each text color
+  shows its WCAG contrast live. Edits persist in the browser; **Save preset**
+  keeps named variants; **Copy CSS tokens** produces the `:root`/`.dark`
+  block to paste into `index.css`; **Copy theme JSON** produces a catalog
+  entry.
+- `?design=<id>` opens a preset (`?design=current` is the shipped look);
+  `&shot=1` hides the studio for screenshots.
+- **Data.** In `npm run lab` the dev server answers the UI's manager calls
+  itself. **Auto** (the default) proxies to the manager when it accepts a
+  connection and serves recorded responses when it does not; **Live** and
+  **Fake** force one or the other. The switch is a `legion-data` cookie, set
+  from the studio. Recorded responses live in `ui/dev/fixtures/<Method>.json`
+  as proto3 JSON keyed by request, so they can be edited by hand. Replay
+  shifts every timestamp by the time since recording, so relative times stay
+  as they were. Fake data is read-only: a mutating call that was not
+  recorded fails with a message saying so. Live streams (the event stream)
+  are passed through but never recorded; in fake mode they stay open and
+  silent.
+- `npm run lab:record` proxies to a live manager and saves every unary
+  response; `npm run lab:crawl` (Playwright) visits every page so one run
+  covers the whole UI. `LEGION_MANAGER_PROXY` picks the manager,
+  `LEGION_UI_FIXTURES` the fixture directory, and `LEGION_UI_DATA=fake|live`
+  the default when no cookie is set.
+- `npm run lab:shots` screenshots the Workers, Job and Task pages for every
+  preset; `npm run lab:contrast` audits every preset (body and secondary
+  text, links, status badges, sidebar) and exits non-zero if a candidate
+  fails AA.
+
+Limits: each candidate theme is designed for one mode (light or dark) — the
+studio's mode switch flips the app's light/dark status shades but does not
+invent the other palette. The app's own sun/moon toggle still flips the
+`dark` class under a lab theme, which mismatches its colors; use the studio's
+mode control instead. The recording reflects one cluster at one moment, and
+it does not learn new proto fields until it is re-recorded.

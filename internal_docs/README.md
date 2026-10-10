@@ -136,6 +136,7 @@ When one is required and what goes in it:
 | [task-runtime-rename-plan.md](plans/task-runtime-rename-plan.md) | shipped |
 | [ui-jump-hints-plan.md](plans/ui-jump-hints-plan.md) | shipped |
 | [ui-holistic-polish-plan.md](plans/ui-holistic-polish-plan.md) | shipped (2026-09-02; embedding the UI in the binary deliberately left open) |
+| [ui-theme-lab-plan.md](plans/ui-theme-lab-plan.md) | in execution (tokenized design system, twenty candidate themes, dev-only theme studio + recorded fake data built; shipping the chosen theme waits on a pick) |
 | [workload-identity-oidc-plan.md](plans/workload-identity-oidc-plan.md) | shipped (task identities) |
 | [volume-plugin-system-plan.md](plans/volume-plugin-system-plan.md) | shipped (v1; CSI bridge + snapshot/clone deferred) |
 | [sandbox-snapshots-and-fast-start-plan.md](plans/sandbox-snapshots-and-fast-start-plan.md) | superseded in part by suspend-resume-and-oversubscription (§0 convergence shipped; mechanics still the reference) |
@@ -178,6 +179,7 @@ by project impact. The full template and a worked example:
 - [job-updated-at-plan_calls.md](calls/job-updated-at-plan_calls.md)
 - [read-model-coherence-plan_calls.md](calls/read-model-coherence-plan_calls.md)
 - [ui-holistic-polish-plan_calls.md](calls/ui-holistic-polish-plan_calls.md)
+- [ui-theme-lab-plan_calls.md](calls/ui-theme-lab-plan_calls.md)
 - [kv-encryption-plan_calls.md](calls/kv-encryption-plan_calls.md)
 - [kv-reactive-task-updates-plan_calls.md](calls/kv-reactive-task-updates-plan_calls.md)
 - [liveness-off-the-raft-path-plan_calls.md](calls/liveness-off-the-raft-path-plan_calls.md)

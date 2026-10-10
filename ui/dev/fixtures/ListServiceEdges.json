@@ -1,0 +1,32 @@
+{
+  "method": "ListServiceEdges",
+  "recordedAt": "2026-10-10T23:45:52.687Z",
+  "entries": [
+    {
+      "request": {
+        "service": "edge",
+        "windowSecs": 300
+      },
+      "response": {
+        "windowSecs": 300
+      }
+    },
+    {
+      "request": {
+        "service": "checkout-api",
+        "windowSecs": 300
+      },
+      "response": {
+        "windowSecs": 300
+      }
+    },
+    {
+      "request": {
+        "windowSecs": 300
+      },
+      "response": {
+        "windowSecs": 300
+      }
+    }
+  ]
+}
