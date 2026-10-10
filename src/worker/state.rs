@@ -56,6 +56,30 @@ pub struct PersistedAllocation {
     /// record on a worker that does not enforce — both load unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resource_assignment: Option<crate::task_plugins::ResourceAssignment>,
+    /// Set while the allocation is stopping: out of the manager's desired
+    /// set, but its process may still be alive and its volumes mounted
+    /// (draining, or inside its stop grace window; see docs/graceful-stop.md).
+    ///
+    /// Persisted so a restarted worker finishes the stop instead of losing
+    /// track of a task that ignored its signal, and keeps that task's volume
+    /// mounts recorded as in use until the process is really gone. `None`
+    /// for running work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stopping: Option<PersistedStop>,
+}
+
+/// Where a stopping allocation was in the stop ladder when it was persisted.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PersistedStop {
+    pub cause: crate::structs::StopCause,
+    /// Whether teardown removes the allocation directory.
+    pub remove_dirs: bool,
+    /// When the grace window closes and the task is hard-killed, in Unix
+    /// seconds. `None` while it is still draining and has not been
+    /// signalled yet; a restarted worker signals it straight away.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kill_deadline_unix: Option<u64>,
 }
 
 #[derive(Debug, Clone)]

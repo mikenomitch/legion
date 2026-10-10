@@ -14,7 +14,7 @@ use crate::worker::log_sink::{default_sinks, LogResource, LogSink};
 use crate::worker::logs::{read_allocation_logs, CapturedStream};
 use crate::worker::resources::NodeResourceGovernor;
 use crate::worker::state::{
-    pid_is_running, process_start_time, PersistedAllocation, WorkerStateStore,
+    pid_is_running, process_start_time, PersistedAllocation, PersistedStop, WorkerStateStore,
 };
 use crate::worker::task_health::{spawn_health_monitor, HealthMonitorHandle};
 use crate::worker::volumes::{volume_env, WorkerVolumeManager};
@@ -1189,6 +1189,7 @@ impl WorkerTaskManager {
                     until: std::time::Instant::now() + drain,
                 },
             );
+            self.persist_state();
             return Ok(());
         }
         self.signal_and_terminate(
@@ -2285,6 +2286,7 @@ impl WorkerTaskManager {
         let mut active = Vec::new();
         let mut restored = Vec::new();
         let mut restored_claims: Vec<(i64, i64, TaskConfig)> = Vec::new();
+        let mut resumed_stops = Vec::new();
 
         for mut record in persisted {
             let Some(pid) = record.pid else {
@@ -2340,6 +2342,38 @@ impl WorkerTaskManager {
             if let Some(assignment) = record.resource_assignment.as_ref() {
                 self.resources.restore(record.allocation.id, assignment);
                 instance.resource_assignment = Some(assignment.clone());
+            }
+            if let Some(stop) = record.stopping.clone() {
+                // Mid-stop when the old worker exited: keep it out of the
+                // live set (the manager no longer wants it) and finish the
+                // stop. Its volumes are re-recorded as in use first, so
+                // nothing reclaims storage under a task that is still alive.
+                self.volume_specs
+                    .insert(record.allocation.id, record.volumes.clone());
+                let volume_instance = crate::worker::volumes::instance_ref_from_task(
+                    &record.allocation,
+                    &record.task,
+                );
+                if let Err(err) = self.volumes.mount_for_allocation(
+                    &record.allocation,
+                    volume_instance.as_ref(),
+                    &record.volumes,
+                ) {
+                    warn!(
+                        allocation_id = record.allocation.id,
+                        error = ?err,
+                        "Failed to re-establish volume mounts for a stopping allocation"
+                    );
+                }
+                info!(
+                    allocation_id = record.allocation.id,
+                    task_name = %record.task.name,
+                    cause = %stop.cause,
+                    "Resuming the stop of an allocation the previous worker left mid-stop"
+                );
+                active.push(record.clone());
+                resumed_stops.push((record.allocation, record.task, instance, stop));
+                continue;
             }
             self.instances.insert(record.allocation.id, instance);
             self.allocations
@@ -2413,6 +2447,38 @@ impl WorkerTaskManager {
         self.resources.resync_masks();
         self.persist_state_with(&active);
 
+        // After the whole set is persisted, because these persist again as
+        // they move along the ladder.
+        for (allocation, task, instance, stop) in resumed_stops {
+            let allocation_id = allocation.id;
+            match stop.kill_deadline_unix {
+                // Already signalled: wait out what is left of the window.
+                Some(deadline_unix) => {
+                    self.terminating.insert(
+                        allocation_id,
+                        TerminatingAllocation {
+                            allocation,
+                            task,
+                            instance,
+                            cause: stop.cause,
+                            deadline: instant_from_unix(deadline_unix),
+                            remove_dirs: stop.remove_dirs,
+                        },
+                    );
+                }
+                // Still draining: the drain bought consumers time to notice
+                // the endpoint was gone, and the restart already spent it.
+                None => self.signal_and_terminate(
+                    allocation_id,
+                    allocation,
+                    task,
+                    instance,
+                    stop.cause,
+                    stop.remove_dirs,
+                ),
+            }
+        }
+
         Ok(restored)
     }
 
@@ -2472,6 +2538,52 @@ impl WorkerTaskManager {
                     .claims
                     .by_local_key(*allocation_id)
                     .and_then(|claim| claim.allocation_id),
+                stopping: None,
+            });
+        }
+
+        // Stopping work is persisted too: a task inside its drain or grace
+        // window is still alive and may still hold a volume, and a restarted
+        // worker must finish stopping it rather than forget it.
+        let stopping = self
+            .draining
+            .iter()
+            .map(|(id, entry)| {
+                let stop = PersistedStop {
+                    cause: entry.cause,
+                    remove_dirs: entry.remove_dirs,
+                    kill_deadline_unix: None,
+                };
+                (*id, &entry.allocation, &entry.task, &entry.instance, stop)
+            })
+            .chain(self.terminating.iter().map(|(id, entry)| {
+                let stop = PersistedStop {
+                    cause: entry.cause,
+                    remove_dirs: entry.remove_dirs,
+                    kill_deadline_unix: Some(unix_from_instant(entry.deadline)),
+                };
+                (*id, &entry.allocation, &entry.task, &entry.instance, stop)
+            }));
+        for (allocation_id, allocation, task, instance, stop) in stopping {
+            // No pid: the process is already gone (or never existed), so
+            // there is nothing for a restarted worker to finish.
+            let Some(pid) = instance.pid else {
+                continue;
+            };
+            records.push(PersistedAllocation {
+                allocation: allocation.clone(),
+                task: task.clone(),
+                pid: Some(pid),
+                pid_start_time: process_start_time(pid),
+                resource_assignment: instance.resource_assignment.clone(),
+                self_terminate_after_secs: None,
+                volumes: self
+                    .volume_specs
+                    .get(&allocation_id)
+                    .cloned()
+                    .unwrap_or_default(),
+                external_id: None,
+                stopping: Some(stop),
             });
         }
 
@@ -2483,6 +2595,24 @@ impl WorkerTaskManager {
             warn!(error = ?err, "Failed to persist worker allocation state");
         }
     }
+}
+
+/// A monotonic deadline as wall-clock Unix seconds, rounded up so a
+/// restarted worker never kills before the real deadline.
+fn unix_from_instant(deadline: std::time::Instant) -> u64 {
+    let at = std::time::SystemTime::now()
+        + deadline.saturating_duration_since(std::time::Instant::now());
+    let since_epoch = at.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+    since_epoch.as_secs() + u64::from(since_epoch.subsec_nanos() > 0)
+}
+
+/// The inverse of [`unix_from_instant`]. A deadline already in the past
+/// (or a clock stepped forward past it) is "now".
+fn instant_from_unix(deadline_unix: u64) -> std::time::Instant {
+    let remaining = (std::time::UNIX_EPOCH + std::time::Duration::from_secs(deadline_unix))
+        .duration_since(std::time::SystemTime::now())
+        .unwrap_or_default();
+    std::time::Instant::now() + remaining
 }
 
 fn load_builtin_plugins_into(registry: &mut TaskPluginRegistry) {
@@ -3553,6 +3683,98 @@ mod tests {
         Ok(())
     }
 
+    /// Regression (audit W4): an allocation inside its grace window was
+    /// dropped from durable state, so a worker restart forgot a task that
+    /// ignored its signal (and its volume's in-use guard). The restarted
+    /// worker must finish the stop.
+    #[test]
+    fn a_restart_finishes_stopping_an_allocation_inside_its_grace_window() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let mut manager = manager_in(&temp_dir);
+        let trapped = temp_dir.path().join("trapped");
+        let task = TaskConfig {
+            config: json!({
+                "command": [
+                    "sh",
+                    "-c",
+                    format!("trap '' TERM; : > '{}'; sleep 30", trapped.display()),
+                ],
+            }),
+            stop: Some(crate::structs::StopConfig {
+                signal: "SIGTERM".into(),
+                kill_after: Duration::from_secs(1),
+                drain: None,
+            }),
+            ..TaskConfig::new("stubborn", "exec")
+        };
+        manager.run_allocation(&alloc(), &task)?;
+        wait_for_marker(&trapped);
+        let pid = manager.allocation_pid(alloc().id).expect("pid");
+        let _ = manager.reconcile_allocations(&[]);
+        assert_eq!(manager.terminating_ids(), vec![alloc().id]);
+
+        // The worker restarts mid-grace.
+        let mut restarted = manager_in(&temp_dir);
+        assert!(
+            restarted.restore_allocations()?.is_empty(),
+            "a stopping allocation is not restored as running work"
+        );
+        assert!(!restarted.has_allocation(alloc().id));
+        assert_eq!(restarted.terminating_ids(), vec![alloc().id]);
+        assert!(restarted.has_terminating(), "new starts stay held back");
+
+        // The deadline carried over, so the reaper kills it when it passes.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let reaped = loop {
+            let reaped = restarted.reap_terminating();
+            if !reaped.is_empty() {
+                break reaped;
+            }
+            assert!(std::time::Instant::now() < deadline, "never reaped");
+            thread::sleep(Duration::from_millis(50));
+        };
+        assert_eq!(reaped, vec![(alloc().id, ReapOutcome::Killed)]);
+        // A zombie (the old manager still holds the `Child`) counts as gone.
+        assert!(!pid_is_running(pid), "the stubborn task is gone");
+        assert!(
+            WorkerStateStore::new(temp_dir.path().join("worker_state.json"))
+                .load()?
+                .is_empty(),
+            "a finished stop leaves nothing persisted"
+        );
+        Ok(())
+    }
+
+    /// A drain interrupted by a restart is not resumed: the restart already
+    /// spent the time it bought, so the restarted worker signals at once.
+    #[test]
+    fn a_restart_signals_an_allocation_that_was_draining() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let mut manager = manager_in(&temp_dir);
+        manager.set_drain_window(Duration::from_secs(3600));
+        let task = TaskConfig {
+            config: json!({"command": ["sleep", "30"]}),
+            service: Some(serde_json::from_value(json!({"port": 8080}))?),
+            ..TaskConfig::new("web", "exec")
+        };
+        manager.run_allocation(&alloc(), &task)?;
+        let _ = manager.reconcile_allocations(&[]);
+        assert_eq!(manager.draining_ids(), vec![alloc().id]);
+
+        let mut restarted = manager_in(&temp_dir);
+        assert!(restarted.restore_allocations()?.is_empty());
+        assert!(restarted.draining_ids().is_empty());
+        assert_eq!(restarted.terminating_ids(), vec![alloc().id]);
+        // `sleep` exits on SIGTERM well inside its default window.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while restarted.has_terminating() {
+            restarted.reap_terminating();
+            assert!(std::time::Instant::now() < deadline, "never reaped");
+            thread::sleep(Duration::from_millis(50));
+        }
+        Ok(())
+    }
+
     #[test]
     fn stops_order_before_starts_on_a_node_with_draining_work() -> R<()> {
         let temp_dir = TempDir::new()?;
@@ -4506,6 +4728,7 @@ mod tests {
             volumes: Vec::new(),
             external_id: None,
             resource_assignment: None,
+            stopping: None,
         };
         let store = WorkerStateStore::new(state_path.clone());
         store.save(&[
