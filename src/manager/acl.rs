@@ -620,6 +620,51 @@ pub fn enforce_node_binding(identity: &AclIdentity, node_id: &str) -> Result<(),
     )))
 }
 
+/// How often a long-lived stream (`StreamEvents`, exec sessions) re-checks
+/// its caller's credential. A revoked or expired token, or a policy that no
+/// longer grants the stream, ends the stream within one interval.
+pub const STREAM_REAUTH_INTERVAL: Duration = Duration::from_secs(30);
+
+/// The credential a long-lived stream was opened with, kept so the stream can
+/// re-authenticate while it runs. Authorization is checked once when a stream
+/// opens; without this, a stream outlives its token's revocation or expiry.
+#[derive(Clone)]
+pub struct StreamCredential {
+    auth: std::sync::Arc<Authenticator>,
+    /// Only the credential headers, not the whole request metadata.
+    metadata: MetadataMap,
+    /// How often to re-check (`STREAM_REAUTH_INTERVAL` outside tests).
+    pub interval: Duration,
+}
+
+impl StreamCredential {
+    pub fn new(auth: std::sync::Arc<Authenticator>, metadata: &MetadataMap) -> Self {
+        let mut kept = MetadataMap::new();
+        for header in ["authorization", "x-legion-token"] {
+            if let Some(value) = metadata.get(header) {
+                kept.insert(header, value.clone());
+            }
+        }
+        StreamCredential {
+            auth,
+            metadata: kept,
+            interval: STREAM_REAUTH_INTERVAL,
+        }
+    }
+
+    pub fn with_interval(mut self, interval: Duration) -> Self {
+        self.interval = interval;
+        self
+    }
+
+    /// Resolves the credential again, as if the caller had sent a new
+    /// request. Fails with `Unauthenticated` once the token is revoked or
+    /// expired.
+    pub fn reauthenticate(&self, store: &Store) -> Result<AclIdentity, Status> {
+        self.auth.authenticate(&self.metadata, store)
+    }
+}
+
 /// Pulls a bearer credential from `authorization` or `x-legion-token`.
 fn extract_bearer(metadata: &MetadataMap) -> Option<String> {
     if let Some(value) = metadata.get("authorization").and_then(|v| v.to_str().ok()) {
@@ -1014,6 +1059,25 @@ mod authenticator_test {
             ..worker
         };
         assert!(enforce_node_binding(&audit_worker, "worker-b").is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn stream_credentials_fail_once_the_token_is_revoked() -> R<()> {
+        let store = setup_store()?;
+        let auth = std::sync::Arc::new(enabled_authenticator());
+        let (info, secret) = auth
+            .mint_token(&store, "streamer", "client", &[], None)
+            .map_err(|s| anyhow!(s.to_string()))?;
+        let credential = StreamCredential::new(auth.clone(), &metadata_with_token(&secret));
+        assert_eq!(credential.interval, STREAM_REAUTH_INTERVAL);
+        assert!(credential.reauthenticate(&store).is_ok());
+
+        store.delete_acl_token(&info.accessor_id)?;
+        assert_eq!(
+            credential.reauthenticate(&store).unwrap_err().code(),
+            tonic::Code::Unauthenticated
+        );
         Ok(())
     }
 

@@ -376,6 +376,9 @@ service Manager {
   // Deleting an already-`destroyed` volume succeeds as a no-op, so the call is
   // safe to retry.
   //
+  // ACL: `job:write` on the volume's job. A volume no job owns needs
+  // cluster-wide `job:write` (a rule with no `names` or `namespaces`).
+  //
   // Errors:
   // - NotFound: no volume row with this id exists.
   // - FailedPrecondition: a live allocation is running against the volume and
@@ -559,6 +562,11 @@ service Manager {
   // `exec:write` (with `host: true` for host-level runtimes); action runs
   // require `action:write` (or `exec:write`) and are rendered server-side
   // from the stored job spec.
+  //
+  // The session re-checks its credential every 30 seconds. Once the token is
+  // revoked or expired, or its policies no longer grant the session, the
+  // stream ends with that auth error (`UNAUTHENTICATED` or
+  // `PERMISSION_DENIED`) and the worker-side process is cancelled.
   rpc ExecAllocation (stream ExecClientFrame) returns (stream ExecServerFrame);
 
   // Lists the actions declared on a job's tasks (for CLI + UI discovery).
@@ -837,6 +845,10 @@ service Manager {
   // When `after_id` is set, persisted events with `id > after_id` are
   // replayed first, then the live feed continues seamlessly. Clients that
   // disconnect can resume without gaps by passing the last event ID they saw.
+  //
+  // ACL: `operator:read`, re-checked every 30 seconds while the stream runs.
+  // Once the token is revoked or expired, or its policies no longer grant
+  // `operator:read`, the stream ends with that auth error.
   rpc StreamEvents (StreamEventsRequest) returns (stream SchedulerEvent);
 
   // Lists user-saved State Explorer query snippets.

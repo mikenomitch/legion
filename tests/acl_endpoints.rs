@@ -2235,6 +2235,163 @@ async fn rotate_mesh_ca_requires_cluster_wide_net_write() -> R<()> {
     Ok(())
 }
 
+/// Mints a client token carrying one fresh policy with the given rules.
+fn token_with_rules(svc: &ManagerDaemonService, name: &str, rules: &str) -> R<(String, String)> {
+    svc.store.upsert_acl_policy(name, "", rules)?;
+    let (info, secret) = svc
+        .auth
+        .mint_token(&svc.store, name, "client", &[name.into()], None)
+        .map_err(|s| anyhow!(s.to_string()))?;
+    Ok((info.accessor_id, secret))
+}
+
+/// Node lookups gate before they fetch: a caller with no node access gets
+/// PermissionDenied for a node that does not exist, not NotFound, so it
+/// cannot probe which node ids exist.
+#[tokio::test]
+async fn node_lookups_check_before_fetch() -> R<()> {
+    let (svc, _, _) = setup_enabled()?;
+    let (_, secret) = token_with_rules(
+        &svc,
+        "jobs-only",
+        r#"[{"resources": ["job"], "actions": ["read", "write"]}]"#,
+    )?;
+    let missing = "no-such-node".to_string();
+    let results = [
+        (
+            "GetNode",
+            svc.get_node(req(
+                GetNodeRequest {
+                    id: missing.clone(),
+                },
+                Some(&secret),
+            ))
+            .await
+            .map(|_| ()),
+        ),
+        (
+            "RestartWorker",
+            svc.restart_worker(req(
+                RestartWorkerRequest {
+                    node_id: missing.clone(),
+                },
+                Some(&secret),
+            ))
+            .await
+            .map(|_| ()),
+        ),
+        (
+            "UpdateNodeDynamic",
+            svc.update_node_dynamic(req(
+                UpdateNodeDynamicRequest {
+                    id: missing.clone(),
+                    dynamic_diff: "{}".into(),
+                },
+                Some(&secret),
+            ))
+            .await
+            .map(|_| ()),
+        ),
+    ];
+    for (method, result) in results {
+        let status = result.expect_err(&format!("{method} must deny"));
+        assert_eq!(
+            status.code(),
+            Code::PermissionDenied,
+            "{method}: {}",
+            status.message()
+        );
+    }
+    Ok(())
+}
+
+/// A volume no job owns takes cluster-wide `job:write` to delete; a
+/// name-scoped job writer may not delete it.
+#[tokio::test]
+async fn jobless_volume_delete_requires_cluster_wide_job_write() -> R<()> {
+    let (svc, _, management_secret) = setup_enabled()?;
+    svc.query_state_store(req(
+        QueryStateStoreRequest {
+            sql: "INSERT INTO volume (volume_id, driver, state, created_at, updated_at) \
+                  VALUES ('vol-orphan', 'host', 'pending', '2026-01-01T00:00:00Z', \
+                  '2026-01-01T00:00:00Z')"
+                .into(),
+            allow_write: true,
+        },
+        Some(&management_secret),
+    ))
+    .await?;
+    let delete = |secret: &str| {
+        req(
+            DeleteVolumeRequest {
+                volume_id: "vol-orphan".into(),
+                force: true,
+                idempotency_key: None,
+            },
+            Some(secret),
+        )
+    };
+
+    let (_, scoped) = token_with_rules(
+        &svc,
+        "acl-jobs-writer",
+        r#"[{"resources": ["job"], "actions": ["write"], "names": ["acl-*"]}]"#,
+    )?;
+    let status = svc
+        .delete_volume(delete(&scoped))
+        .await
+        .expect_err("a name-scoped job writer must not delete a jobless volume");
+    assert_eq!(
+        status.code(),
+        Code::PermissionDenied,
+        "{}",
+        status.message()
+    );
+
+    let (_, cluster) = token_with_rules(
+        &svc,
+        "all-jobs-writer",
+        r#"[{"resources": ["job"], "actions": ["write"]}]"#,
+    )?;
+    svc.delete_volume(delete(&cluster)).await?;
+    Ok(())
+}
+
+/// A stream outlives no credential: revoking the token closes `StreamEvents`
+/// within one re-check interval.
+#[tokio::test]
+async fn stream_events_closes_when_its_token_is_revoked() -> R<()> {
+    use futures::StreamExt;
+    let (svc, _, management_secret) = setup_enabled()?;
+    let svc = svc.with_stream_reauth_interval(std::time::Duration::from_millis(50));
+    let (accessor, secret) = token_with_rules(
+        &svc,
+        "event-reader",
+        r#"[{"resources": ["operator"], "actions": ["read"]}]"#,
+    )?;
+    let mut stream = svc
+        .stream_events(req(StreamEventsRequest::default(), Some(&secret)))
+        .await?
+        .into_inner();
+
+    svc.delete_acl_token(req(
+        DeleteAclTokenRequest {
+            accessor_id: accessor,
+        },
+        Some(&management_secret),
+    ))
+    .await?;
+
+    let next = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+        .await
+        .context("stream must close after revocation")?;
+    let status = next
+        .context("stream ended without a status")?
+        .expect_err("a revoked token must end the stream with an error");
+    assert_eq!(status.code(), Code::Unauthenticated, "{}", status.message());
+    Ok(())
+}
+
 /// Node-pool scoping: a token limited to one pool cannot read or restart
 /// nodes in other pools, and GetNodes filters.
 #[tokio::test]

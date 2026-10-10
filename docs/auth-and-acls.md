@@ -164,6 +164,12 @@ token (created or login-minted) must then expire within the bound. Management
 tokens are exempt. Expired ACL and join tokens are rejected at
 authentication time and pruned hourly.
 
+Long-lived streams (`StreamEvents` and exec sessions, including the UI's exec
+WebSocket) re-check their credential every 30 seconds. Revoking or expiring a
+token, or removing the policy that granted the stream, closes the stream
+within that interval with the same `Unauthenticated` or `PermissionDenied`
+error a new request would get.
+
 For infrastructure-as-code, `legion acl bootstrap --secret <value>` (min 24
 chars) pre-seeds the initial management token instead of generating a random
 one.

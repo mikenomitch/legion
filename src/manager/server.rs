@@ -1281,6 +1281,9 @@ pub struct ManagerDaemonService {
     /// is at most one heartbeat stale and a failover shows nothing until
     /// the next beat, never a wrong answer.
     net_status: Arc<Mutex<HashMap<String, Vec<crate::structs::NetAllocStatus>>>>,
+    /// How often `StreamEvents` and exec sessions re-check their caller's
+    /// credential (`acl::STREAM_REAUTH_INTERVAL`; tests shorten it).
+    stream_reauth_interval: Duration,
 }
 
 /// Distinct merged policy bodies kept in memory.
@@ -1319,7 +1322,21 @@ impl ManagerDaemonService {
             net_policy_generation: Arc::new(Mutex::new(None)),
             net_status: Arc::new(Mutex::new(HashMap::new())),
             net_edges: Arc::new(Mutex::new(HashMap::new())),
+            stream_reauth_interval: acl::STREAM_REAUTH_INTERVAL,
         }
+    }
+
+    /// Overrides how often long-lived streams re-check their credential.
+    /// Production uses `acl::STREAM_REAUTH_INTERVAL`; tests shorten it.
+    pub fn with_stream_reauth_interval(mut self, interval: Duration) -> Self {
+        self.stream_reauth_interval = interval;
+        self
+    }
+
+    /// The caller's credential, kept so a long-lived stream can re-check it.
+    fn stream_credential<T>(&self, request: &Request<T>) -> acl::StreamCredential {
+        acl::StreamCredential::new(self.auth.clone(), request.metadata())
+            .with_interval(self.stream_reauth_interval)
     }
 
     /// The store's network-policy generation, cached for
@@ -3552,6 +3569,7 @@ impl Manager for ManagerDaemonService {
                 &AclScope::any(),
             )?;
         }
+        let credential = self.stream_credential(&request);
         let mut inbound = request.into_inner();
         let first = inbound
             .message()
@@ -3577,8 +3595,14 @@ impl Manager for ManagerDaemonService {
             }
         });
 
-        let out_rx =
-            crate::manager::exec::run_exec_session(&self.store, &identity, start, in_rx).await?;
+        let out_rx = crate::manager::exec::run_exec_session(
+            &self.store,
+            &identity,
+            start,
+            in_rx,
+            credential,
+        )
+        .await?;
         Ok(Response::new(ReceiverStream::new(out_rx)))
     }
 
@@ -3611,6 +3635,7 @@ impl Manager for ManagerDaemonService {
             AclAction::Read,
             AclScope::none(),
         )?;
+        let credential = self.stream_credential(&request);
         let request = request.into_inner();
         let filter = scheduler_event_filter(
             request.after_id,
@@ -3640,8 +3665,31 @@ impl Manager for ManagerDaemonService {
                 None => 0,
             };
 
+            // Re-check the credential while the stream runs, so a revoked or
+            // expired token (or a revoked policy) closes the feed.
+            let mut reauth = tokio::time::interval(credential.interval);
+            reauth.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            reauth.tick().await; // the first tick fires immediately
             loop {
-                match live.recv().await {
+                let received = tokio::select! {
+                    received = live.recv() => received,
+                    _ = reauth.tick() => {
+                        let still_allowed = credential.reauthenticate(&store).and_then(|identity| {
+                            acl::enforce(
+                                &identity,
+                                AclResource::Operator,
+                                AclAction::Read,
+                                &AclScope::none(),
+                            )
+                        });
+                        if let Err(status) = still_allowed {
+                            let _ = tx.send(Err(status)).await;
+                            return;
+                        }
+                        continue;
+                    }
+                };
+                match received {
                     Ok(event) => {
                         if event.id <= last_sent || !filter.matches(&event) {
                             continue;
@@ -5170,6 +5218,16 @@ impl Manager for ManagerDaemonService {
                 .store
                 .get_volume(&inner.volume_id)
                 .map_err(|e| map_store_error("Error loading volume", e))?;
+            // A replay must not hand out a volume the caller could not
+            // delete. (The record is usually gone by now.)
+            if let Some(volume) = volume.as_ref() {
+                acl::enforce(
+                    &identity,
+                    AclResource::Job,
+                    AclAction::Write,
+                    &volume_write_scope(volume),
+                )?;
+            }
             return Ok(Response::new(DeleteVolumeReply {
                 volume: volume.map(volume_info),
                 message,
@@ -5182,14 +5240,12 @@ impl Manager for ManagerDaemonService {
             .get_volume(&inner.volume_id)
             .map_err(|e| map_store_error("Error loading volume", e))?
             .ok_or_else(|| Status::not_found(format!("volume {} not found", inner.volume_id)))?;
-        if let Some(job_id) = existing.job_id.as_deref() {
-            acl::enforce(
-                &identity,
-                AclResource::Job,
-                AclAction::Write,
-                &AclScope::job(job_id),
-            )?;
-        }
+        acl::enforce(
+            &identity,
+            AclResource::Job,
+            AclAction::Write,
+            &volume_write_scope(&existing),
+        )?;
 
         // In-use protection: deleting a volume a live workload is writing to
         // would detach the handle and then reclaim storage under it. Stop the
@@ -6034,7 +6090,15 @@ impl Manager for ManagerDaemonService {
         &self,
         request: Request<GetNodeRequest>,
     ) -> Result<Response<GetNodeReply>, Status> {
-        let identity = self.authenticate_acl(&request)?;
+        // Coarse gate before the node lookup ("check before you fetch"), so
+        // a caller with no node access cannot probe which node ids exist;
+        // the precise pool scope is enforced after the node is loaded.
+        let identity = self.check_acl(
+            &request,
+            AclResource::Node,
+            AclAction::Read,
+            AclScope::any(),
+        )?;
         let id = request.into_inner().id;
         let node = self
             .store
@@ -6064,7 +6128,13 @@ impl Manager for ManagerDaemonService {
         &self,
         request: Request<RestartWorkerRequest>,
     ) -> Result<Response<RestartWorkerReply>, Status> {
-        let identity = self.authenticate_acl(&request)?;
+        // Coarse gate before the node lookup (see `get_node`).
+        let identity = self.check_acl(
+            &request,
+            AclResource::Node,
+            AclAction::Write,
+            AclScope::any(),
+        )?;
         let node_id = request.into_inner().node_id;
         let node = self.store.get_node(&node_id).map_err(|e| {
             error!(error = ?e, node_id = %node_id, "Failed to get node for restart");
@@ -6286,7 +6356,13 @@ impl Manager for ManagerDaemonService {
         &self,
         request: Request<UpdateNodeDynamicRequest>,
     ) -> Result<Response<UpdateNodeDynamicReply>, Status> {
-        let identity = self.authenticate_acl(&request)?;
+        // Coarse gate before the node lookup (see `get_node`).
+        let identity = self.check_acl(
+            &request,
+            AclResource::Node,
+            AclAction::Write,
+            AclScope::any(),
+        )?;
         let r = request.into_inner();
         let id = r.id;
         // Enforce against the node's pool before mutating it.
@@ -8610,6 +8686,17 @@ struct MintedTicketRecord {
     jti: String,
     job_config_id: String,
     expires_at_unix: i64,
+}
+
+/// The scope a volume write is checked against. A job's volume belongs to
+/// that job. A volume no job owns belongs to no job's scope, so deleting it
+/// takes cluster-wide `job:write`: `AclScope::none()` carries no job name, so
+/// only a rule without `names`/`namespaces` selectors matches it.
+fn volume_write_scope(volume: &crate::structs::volume::Volume) -> AclScope {
+    match volume.job_id.as_deref() {
+        Some(job_id) => AclScope::job(job_id),
+        None => AclScope::none(),
+    }
 }
 
 /// What a worker-registration caller may register as, decided by

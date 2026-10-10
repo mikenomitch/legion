@@ -226,11 +226,17 @@ fn worker_address_for_node(node: &Node) -> Option<String> {
 /// client frames *after* the opening `ExecStart` (which is passed separately),
 /// so this core is shared by the gRPC handler and the WebSocket bridge. Returns
 /// a receiver of server frames to write back to the caller.
+///
+/// `credential` is what the session was opened with. Every
+/// `credential.interval` the session re-authenticates and re-runs the same
+/// authorization it opened with, and ends with the auth error once the token
+/// is revoked or expired or its policy no longer grants the session.
 pub async fn run_exec_session(
     store: &Store,
     identity: &AclIdentity,
     start: ExecStart,
     mut inbound: mpsc::Receiver<ExecClientFrame>,
+    credential: acl::StreamCredential,
 ) -> Result<mpsc::Receiver<Result<ExecServerFrame, Status>>, Status> {
     let resolved = resolve_exec_start(store, identity, &start)?;
 
@@ -299,10 +305,37 @@ pub async fn run_exec_session(
     let audit_alloc = resolved.allocation_id;
     let audit_subject = resolved.audit_subject.clone();
     let principal = identity.principal.clone();
+    let reauth_store = store.clone();
     tokio::spawn(async move {
         let mut worker_stream = worker_stream;
+        let mut reauth = tokio::time::interval(credential.interval);
+        reauth.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        reauth.tick().await; // the first tick fires immediately
         loop {
-            match worker_stream.message().await {
+            let message = tokio::select! {
+                message = worker_stream.message() => message,
+                _ = reauth.tick() => {
+                    let still_allowed = credential
+                        .reauthenticate(&reauth_store)
+                        .and_then(|identity| resolve_exec_start(&reauth_store, &identity, &start));
+                    if let Err(status) = still_allowed {
+                        info!(
+                            target: "exec_audit",
+                            principal = %principal,
+                            allocation_id = audit_alloc,
+                            subject = %audit_subject,
+                            reason = %status.message(),
+                            "exec session closed: credential no longer authorizes it"
+                        );
+                        // Dropping the worker stream cancels the worker-side
+                        // session.
+                        let _ = out_tx.send(Err(status)).await;
+                        break;
+                    }
+                    continue;
+                }
+            };
+            match message {
                 Ok(Some(frame)) => {
                     if let Some(crate::structs::exec_server_frame::Frame::Exit(exit)) = &frame.frame
                     {

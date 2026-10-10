@@ -27,7 +27,7 @@ use prost::Message as _;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 
-use crate::manager::acl::Authenticator;
+use crate::manager::acl::{Authenticator, StreamCredential};
 use crate::manager::exec::run_exec_session;
 use crate::prelude::*;
 use crate::storage::store::Store;
@@ -170,7 +170,8 @@ async fn bridge(websocket: hyper_tungstenite::HyperWebsocket, state: ExecWsState
 
     // Channel of subsequent client frames feeding the shared core.
     let (in_tx, in_rx) = mpsc::channel::<ExecClientFrame>(128);
-    let out_rx = match run_exec_session(&state.store, &identity, start, in_rx).await {
+    let credential = StreamCredential::new(state.auth.clone(), &metadata);
+    let out_rx = match run_exec_session(&state.store, &identity, start, in_rx, credential).await {
         Ok(rx) => rx,
         Err(status) => {
             send_ws_error(&mut ws_out, status.message()).await;

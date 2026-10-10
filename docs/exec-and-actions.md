@@ -222,3 +222,6 @@ UI   ──WebSocket /v1/exec/ws───────┘        (proxies frames)
 - Interactive sessions use a PTY on the worker (`portable-pty`: openpty on
   Unix, ConPTY on Windows). Sessions end when the connection closes. There is
   no detach/reattach.
+- Sessions re-check their credential every 30 seconds. A revoked or expired
+  token, or a policy that no longer grants the session, ends it with an auth
+  error and cancels the process on the worker.
