@@ -125,9 +125,13 @@ impl RaftTransportService {
         let result = call(raft, rpc).await;
         let payload = serde_json::to_vec(&result)
             .map_err(|e| Status::internal(format!("failed encoding {rpc_name} reply: {e}")))?;
-        Ok(stamp_schema_version(Response::new(RaftLaneReply {
-            payload,
-        })))
+        let version = registry
+            .schema_version
+            .load(std::sync::atomic::Ordering::Relaxed);
+        Ok(stamp_schema_version(
+            Response::new(RaftLaneReply { payload }),
+            version,
+        ))
     }
 }
 
@@ -136,11 +140,8 @@ impl RaftTransportService {
 /// AppendEntries round — learns which schema every voter can apply. Read by
 /// version-gated features such as the KV keyring's upgrade gate
 /// (docs/kv-encryption.md, docs/upgrades.md).
-pub(crate) fn stamp_schema_version<T>(mut response: Response<T>) -> Response<T> {
-    if let Ok(value) = crate::storage::migrations::schema_version()
-        .to_string()
-        .parse()
-    {
+pub(crate) fn stamp_schema_version<T>(mut response: Response<T>, version: u32) -> Response<T> {
+    if let Ok(value) = version.to_string().parse() {
         response.metadata_mut().insert(
             crate::storage::raft::RAFT_SCHEMA_VERSION_METADATA_KEY,
             value,

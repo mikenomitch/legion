@@ -744,6 +744,9 @@ pub(crate) struct MultiRaftDriver {
     /// Test hook shared with every lane's state machine: while set, applies
     /// wait (see `Store::raft_set_apply_paused`).
     apply_paused: Arc<std::sync::atomic::AtomicBool>,
+    /// The schema version this node advertises to peers (shared with the
+    /// transport registry). Lowered only by the mixed-version test hook.
+    advertised_schema_version: Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl std::fmt::Debug for MultiRaftDriver {
@@ -781,6 +784,9 @@ impl MultiRaftDriver {
             lane_convergence: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             lane_campaigns: Arc::new(StdMutex::new(HashMap::new())),
             apply_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            advertised_schema_version: Arc::new(std::sync::atomic::AtomicU32::new(
+                crate::storage::migrations::schema_version(),
+            )),
         }
     }
 
@@ -1269,6 +1275,16 @@ impl MultiRaftDriver {
             .store(paused, std::sync::atomic::Ordering::SeqCst);
     }
 
+    /// Test hook (see `Store::raft_set_advertised_schema_version`): make
+    /// this node report `version` to its peers instead of its build's, or
+    /// restore the real one with `None`.
+    pub(crate) fn set_advertised_schema_version(&self, version: Option<u32>) {
+        self.advertised_schema_version.store(
+            version.unwrap_or_else(crate::storage::migrations::schema_version),
+            std::sync::atomic::Ordering::SeqCst,
+        );
+    }
+
     /// Voters (by name) whose advertised schema version is unknown or below
     /// `required` — the KV keyring's upgrade gate (docs/kv-encryption.md,
     /// docs/upgrades.md). Peers advertise their version on every transport
@@ -1481,6 +1497,7 @@ fn execute_replicated(
     lane: Lane,
     op: &'static str,
     single_topology: bool,
+    pool: &ChannelPool,
     caught_up_term: &mut Option<u64>,
     f: ReplicatedOp,
 ) -> R<Box<dyn Any + Send>> {
@@ -1590,6 +1607,12 @@ fn execute_replicated(
         single_topology,
         &changeset,
     )?;
+    // Mixed-version guard (R2): refuse a write that a member on an older
+    // schema could not apply, instead of letting it skip the rows silently.
+    if let Err(err) = check_members_can_apply(raft, pool, op, &changeset) {
+        telemetry.raft_ops_total.inc(&[metric_lane, op, "error"]);
+        return Err(err);
+    }
     let command = StoreCommand {
         lane,
         op: op.to_string(),
@@ -1622,12 +1645,72 @@ fn execute_replicated(
     Ok(value)
 }
 
+/// Fail when a raft member that advertises an older schema version than
+/// this build could not apply `changeset` (R2).
+///
+/// Raft entries are SQLite changesets, and SQLite skips every change for a
+/// table whose local layout is narrower than the changeset's (a column added
+/// by a newer migration) while still reporting success. An older member
+/// would advance its applied index past rows it never wrote, and upgrading
+/// it later would not replay them. The apply path also refuses such an
+/// entry ([`capture::apply_changeset_with`]), which stops the older member
+/// loudly; refusing here, before proposing, keeps every member healthy and
+/// only fails the writes that actually depend on the new schema.
+///
+/// Peers report their version on every transport reply. A peer that has not
+/// answered under this leadership yet is not checked (the apply-side check
+/// covers it); one running a build that predates the header is treated as
+/// version 0, so every write is refused until it is upgraded.
+fn check_members_can_apply(raft: &Raft, pool: &ChannelPool, op: &str, changeset: &[u8]) -> R<()> {
+    let ours = crate::storage::migrations::schema_version();
+    let metrics = raft.metrics().borrow().clone();
+    let mut behind: Vec<(String, u32)> = metrics
+        .membership_config
+        .membership()
+        .nodes()
+        .filter(|(id, _)| **id != metrics.id)
+        .filter_map(|(id, _)| {
+            pool.schema_version_of(*id)
+                .filter(|version| *version < ours)
+                .map(|version| (member_name(&metrics, *id), version))
+        })
+        .collect();
+    if behind.is_empty() {
+        return Ok(());
+    }
+    behind.sort();
+    let shapes = capture::changeset_table_shapes(changeset)?;
+    for (member, version) in behind {
+        let theirs = crate::storage::migrations::table_shapes_at(version)?;
+        for (table, pk) in &shapes {
+            let local = theirs.get(table).map(Vec::as_slice);
+            if let Some(reason) = capture::table_shape_mismatch(table, pk, local) {
+                let version_label = if version == 0 {
+                    "a build that predates schema-version reporting".to_string()
+                } else {
+                    format!("schema version {version}")
+                };
+                bail!(
+                    "raft op {op} needs a schema that manager {member} does not have yet \
+                     ({reason} on {version_label}; this leader runs schema version {ours}). \
+                     The write was not applied anywhere. Finish the rolling manager upgrade \
+                     (docs/upgrades.md), or move leadership to a manager on the older release \
+                     until then"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 fn pipeline_loop(
     store: Store,
     raft: Raft,
     handle: tokio::runtime::Handle,
     group: Lane,
     single_topology: bool,
+    pool: Arc<ChannelPool>,
     jobs: std_mpsc::Receiver<PipelineJob>,
 ) {
     let group_label = group.wire_name();
@@ -1661,6 +1744,7 @@ fn pipeline_loop(
                 lane,
                 op,
                 single_topology,
+                &pool,
                 &mut caught_up_term,
                 f,
             )
@@ -3268,6 +3352,7 @@ impl PersistenceDriver for MultiRaftDriver {
                 lanes: lanes.clone(),
                 join_handler: Some(join_handler),
                 forward_store: Some(store.forward_executor_clone()),
+                schema_version: self.advertised_schema_version.clone(),
             })
             .map_err(|_| anyhow!("raft transport registry already populated"))?;
 
@@ -3303,6 +3388,7 @@ impl PersistenceDriver for MultiRaftDriver {
             let thread_store = store.raft_engine_clone();
             let thread_raft = raft.clone();
             let thread_handle = handle.clone();
+            let thread_pool = pool.clone();
             let group = *lane;
             std::thread::Builder::new()
                 .name(format!("raft-pipeline-{}", group.wire_name()))
@@ -3313,6 +3399,7 @@ impl PersistenceDriver for MultiRaftDriver {
                         thread_handle,
                         group,
                         single_topology,
+                        thread_pool,
                         rx,
                     )
                 })

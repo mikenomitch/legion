@@ -1,3 +1,5 @@
+use std::sync::{Arc, Mutex};
+
 use rusqlite_migration::{Migrations, M};
 
 /// The schema version (migration count) at which the KV encryption keyring
@@ -15,6 +17,48 @@ pub const KEYRING_SCHEMA_VERSION: u32 = 129;
 pub fn schema_version() -> u32 {
     static VERSION: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *VERSION.get_or_init(|| migration_list().len() as u32)
+}
+
+/// Primary-key flags per column of every table, as a store migrated to
+/// `version` lays them out. The raft leader checks a captured changeset
+/// against the schema of each peer that advertises an older version, so it
+/// refuses a write that peer could not apply (R2, docs/upgrades.md). Built
+/// once per version by migrating an in-memory database, then cached.
+pub(crate) fn table_shapes_at(
+    version: u32,
+) -> anyhow::Result<Arc<std::collections::BTreeMap<String, Vec<bool>>>> {
+    type Shapes = Arc<std::collections::BTreeMap<String, Vec<bool>>>;
+    static CACHE: std::sync::OnceLock<Mutex<std::collections::HashMap<u32, Shapes>>> =
+        std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    if let Some(shapes) = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&version)
+    {
+        return Ok(shapes.clone());
+    }
+    let mut conn = rusqlite::Connection::open_in_memory()?;
+    // Version 0 (a peer that predates the version header) has no tables.
+    if version > 0 {
+        get_migrations().to_version(&mut conn, version.min(schema_version()) as usize)?;
+    }
+    let tables: Vec<String> = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table';")?
+        .query_map([], |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+    let mut shapes = std::collections::BTreeMap::new();
+    for table in tables {
+        if let Some(flags) = crate::storage::raft::capture::table_pk_flags(&conn, &table)? {
+            shapes.insert(table, flags);
+        }
+    }
+    let shapes = Arc::new(shapes);
+    cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(version, shapes.clone());
+    Ok(shapes)
 }
 
 pub fn get_migrations() -> Migrations<'static> {
@@ -1712,6 +1756,21 @@ mod migrations_test {
             "KEYRING_SCHEMA_VERSION must be the migration that creates keyring_key \
              (the column migration directly precedes it)"
         );
+        Ok(())
+    }
+
+    /// The mixed-version write guard reads an older peer's table layout
+    /// from here, so it must match what migrating to that version produces.
+    #[test]
+    fn table_shapes_at_reflects_the_schema_of_that_version() -> anyhow::Result<()> {
+        let latest = table_shapes_at(schema_version())?;
+        let before_keyring = table_shapes_at(KEYRING_SCHEMA_VERSION - 2)?;
+        assert!(latest.contains_key("keyring_key"));
+        assert!(!before_keyring.contains_key("keyring_key"));
+        let kv_now = latest.get("kv_entry").expect("kv_entry exists");
+        let kv_then = before_keyring.get("kv_entry").expect("kv_entry existed");
+        assert!(kv_now.len() > kv_then.len(), "kv_entry gained enc_key_id");
+        assert!(table_shapes_at(0)?.is_empty());
         Ok(())
     }
 

@@ -9,7 +9,9 @@ the fleet.
 Always upgrade in this order:
 
 1. **Managers.** Upgrade every manager to the new release (rolling, one at a
-   time in an HA deployment).
+   time in an HA deployment). In a raft cluster, upgrade the followers first
+   and the leader last. See
+   [Rolling upgrades across a schema change](#rolling-upgrades-across-a-schema-change).
 2. **Workers.** Once all managers run the new release, upgrade workers at
    whatever pace suits the workloads (drain and replace, or restart in place.
    See `legion node drain`).
@@ -197,6 +199,52 @@ service. During a rolling manager upgrade, the plane tolerates skew:
   the binary, which the manager refuses to open. Run
   `legion keyring rewrap --plaintext` first, then restore a pre-upgrade
   backup.
+
+### Rolling upgrades across a schema change
+
+Raft entries are SQLite changesets: the exact rows a write changed, with
+the columns the leader's schema has. A manager on an older release cannot
+hold rows for a column or table its schema does not have yet. SQLite itself
+does not fail on that. It skips the rows and reports success, so without a
+guard an older manager would fall silently out of step with the cluster.
+Legion refuses instead, in two places:
+
+- **The leader refuses the write.** Every transport reply carries the
+  answering manager's schema version (`x-legion-schema-version`). Before it
+  proposes a write, a leader checks it against the schema of every member
+  that reports an older version. A write that member could not apply fails
+  on the leader, nothing is committed, and the error names the member:
+
+  ```
+  raft op put_kv needs a schema that manager mgr-c does not have yet (table
+  `kv_entry` has 6 columns where the change has 7 on schema version 127;
+  this leader runs schema version 129). The write was not applied anywhere.
+  Finish the rolling manager upgrade (docs/upgrades.md), or move leadership
+  to a manager on the older release until then
+  ```
+
+  Writes that only touch tables the release did not change go through. A
+  member that runs a build from before the schema-version header counts as
+  behind on every table, so a newer leader refuses every write until it is
+  upgraded.
+- **An older manager refuses the entry.** If an entry it cannot apply
+  reaches it anyway (for example, it was down when the leader checked), the
+  older manager stops that raft lane with an error that says to upgrade it.
+  The entry is not applied, so after the upgrade and restart the lane
+  resumes from it with nothing lost. A member stopped this way does not
+  count toward quorum until it is upgraded.
+
+An older leader's writes always apply on newer managers, because a newer
+schema only adds columns and tables. That gives the safe order:
+
+1. Upgrade the followers one at a time. Wait for each to rejoin and catch
+   up (`legion raft status`) before the next.
+2. Upgrade the leader last. Leadership moves to an upgraded manager, and by
+   then every member runs the new schema.
+
+If an upgraded manager takes leadership while an older one is still
+running, writes that need the new schema fail with the error above until
+you finish the upgrade. Nothing diverges in the meantime.
 
 ## Raft persistence upgrades
 
