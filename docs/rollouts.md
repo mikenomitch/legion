@@ -161,7 +161,12 @@ background reconciliation (the pass a new raft leader runs, see
 rollout left behind instead of the latest config:
 
 - **Rolled back** (or failed before placing anything): the new version has no
-  allocations, so the previous version is what runs. Reconciliation tops up
+  allocations, so the previous version is what runs. A rollback removes the
+  new version first. If the previous version then cannot be placed back (no
+  capacity, a lost conflict race), a `job_reschedule` for the previous
+  version is queued 5 seconds out. An automatic rollback still ends the
+  rollout `failed`. A `StopRollout` with `revert` returns the error and
+  leaves the rollout in its current status, so retry the stop. Reconciliation tops up
   the previous version, for example after a node loss. It never re-places the
   rolled-back version.
 - **Failed after replacing everything**: only the new version runs, and

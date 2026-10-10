@@ -134,6 +134,19 @@ not a queued duplicate (for example, a batch task's next scheduled
 
 Unsupported kinds fail immediately.
 
+`job_update` (a restart: KV `restart`, `job run --force-reschedule`, a batch
+task's next run) removes all of the job's allocations and then places the
+config fresh. Two guards keep that from leaving a job at zero:
+
+- An update for a stopped job, or for a config the job has moved past (a
+  stale batch follow-up after a resubmit), is skipped before anything is
+  removed. A stale `job_submit` is skipped the same way.
+- When the placement fails for any reason other than a plan conflict or a
+  raft leadership change (both re-run the eval), a `job_reschedule` for the
+  config is queued 5 seconds out, so the eval's failure is not the end of
+  it. A rollback that cannot place the previous version back queues the same
+  retry for that version.
+
 ## Scheduler Entry Points
 
 Main paths in `Scheduler`:

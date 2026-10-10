@@ -1465,7 +1465,18 @@ fn rollback_rollout(
     let _ = store.remove_allocs_for_job_config(&to_config.id())?;
 
     if let Some(from_config_id) = rollout.from_job_config_id.as_ref() {
-        let outcome = scheduler.plan_and_apply(from_config_id, PlanMode::Reschedule)?;
+        // The new version is already gone. If the old one cannot be placed
+        // back (no capacity, a lost conflict race), the failed tick marks
+        // the rollout terminal and nothing would retry it, so queue a
+        // reschedule of the old version first. A NotRaftLeader rejection is
+        // the exception: the tick is released and re-runs this rollback.
+        let outcome = scheduler
+            .plan_and_apply(from_config_id, PlanMode::Reschedule)
+            .inspect_err(|error| {
+                if !crate::storage::raft::driver::NotRaftLeader::in_chain(error) {
+                    let _ = store.queue_reschedule_retry(&rollout.job_id, from_config_id, error);
+                }
+            })?;
         if !outcome.allocations.is_empty() {
             dispatch_allocations(store, &outcome.allocations)?;
         }

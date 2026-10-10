@@ -14209,22 +14209,10 @@ impl Store {
             let Some(job_id) = self.job_id_for_job_config(&job_config_id)? else {
                 continue;
             };
-            warn!(
-                %job_id,
-                %job_config_id,
-                retry_after_ms = RECONCILE_RETRY_DELAY.as_millis() as u64,
-                error = %format!("{error:#}"),
-                "Reconcile failed; queueing a job_reschedule retry"
-            );
-            if let Err(enqueue_error) = self.enqueue_eval_after_delay(
-                "job_reschedule",
-                Some(&job_id),
-                Some(&job_config_id),
-                None,
-                None,
-                RECONCILE_RETRY_DELAY,
-            ) {
-                warn!(%job_id, %job_config_id, error = %enqueue_error, "Could not queue reconcile retry");
+            if self
+                .queue_reschedule_retry(&job_id, &job_config_id, &error)
+                .is_err()
+            {
                 unqueued_error.get_or_insert(error);
             }
         }
@@ -14232,6 +14220,41 @@ impl Store {
             Some(error) => Err(error),
             None => Ok(()),
         }
+    }
+
+    /// Queue a delayed `job_reschedule` for a config whose placement just
+    /// failed AFTER its old allocations were removed: a lost node's or
+    /// drained node's reconcile, a `job_update` restart, a rollout's
+    /// rollback. Each of those already deleted what was running, so a
+    /// terminal failure with nothing queued behind it leaves the job short
+    /// with no retry. If the retry fails too, the capacity pass
+    /// ([`Self::reschedule_allocations_for_new_node`]) picks the job up
+    /// when capacity appears.
+    pub(crate) fn queue_reschedule_retry(
+        &self,
+        job_id: &str,
+        job_config_id: &str,
+        cause: &anyhow::Error,
+    ) -> R<()> {
+        warn!(
+            %job_id,
+            %job_config_id,
+            retry_after_ms = RECONCILE_RETRY_DELAY.as_millis() as u64,
+            error = %format!("{cause:#}"),
+            "Placement failed after removing allocations; queueing a job_reschedule retry"
+        );
+        self.enqueue_eval_after_delay(
+            "job_reschedule",
+            Some(job_id),
+            Some(job_config_id),
+            None,
+            None,
+            RECONCILE_RETRY_DELAY,
+        )
+        .inspect_err(|error| {
+            warn!(%job_id, %job_config_id, %error, "Could not queue the job_reschedule retry");
+        })?;
+        Ok(())
     }
 
     /// The config an active job with no live rollout should converge to,
