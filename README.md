@@ -118,14 +118,24 @@ it to a network.
 A few from [`configs/jobs/`](configs/jobs/), roughly simplest first:
 
 - [`min.ncl`](configs/jobs/min.ncl): the smallest valid job, one container.
+- [`container-service.ncl`](configs/jobs/container-service.ncl): nginx in a
+  container on a dynamic port, with an HTTP health check.
+- [`exec-service.ncl`](configs/jobs/exec-service.ncl): a host process run
+  directly, no image, restarted on exit.
+- [`batch-job.ncl`](configs/jobs/batch-job.ncl): a run-to-completion task
+  with a retry policy.
+- [`per-node.ncl`](configs/jobs/per-node.ncl): one instance on every node,
+  like a DaemonSet or a Nomad system job.
 - [`service-demo.ncl`](configs/jobs/service-demo.ncl): a web service on a
   dynamic port, registered for discovery.
-- [`vars.ncl`](configs/jobs/vars.ncl): one spec parameterized with `--var`
-  flags.
-- [`dag-separate-groups.ncl`](configs/jobs/dag-separate-groups.ncl): a batch
-  task that gates a service in another group.
+- [`nickel-showcase.ncl`](configs/jobs/nickel-showcase.ncl): functions, an
+  import, contracts, and `--var` variables with defaults, all in one spec.
+- [`dag-separate-groups.ncl`](configs/jobs/dag-separate-groups.ncl): batch
+  prep tasks that fan out and back in before the services in other groups
+  start.
 - [`kv-reactive-demo.ncl`](configs/jobs/kv-reactive-demo.ncl): a task that
-  restarts when a KV value changes.
+  reads a value from KV, encrypted at rest by default, and restarts when it
+  changes.
 - [`connect-demo.ncl`](configs/jobs/connect-demo.ncl): a client
   load-balancing across two backends through the service mesh.
 - [`postgres.ncl`](configs/jobs/postgres.ncl): a stateful database with a
@@ -174,24 +184,46 @@ still be happy with at ten thousand nodes.
 
 ### Fast
 
-In initial benchmarking on AWS, against Nomad and Kubernetes on the same
-three control-plane boxes, Legion placed several times as many allocations
-per second and kept most of that rate out to 20,000 nodes:
+In initial benchmarking on AWS, we ran Legion, Nomad, and Kubernetes on the
+same three control-plane boxes, each driving its own simulated fleet through
+its native API. At 5,000 nodes:
 
-| Nodes  | Legion  | Nomad 2.0.5    | Kubernetes 1.36.5 |
-| ------ | ------- | -------------- | ----------------- |
-| 1,000  | **829** | 122            | 117               |
-| 5,000  | **905** | failed         | 53                |
-| 20,000 | **553** | -              | -                 |
+|                                                   | Legion    | Nomad 2.0.5 | Kubernetes 1.36.5 |
+| ------------------------------------------------- | --------- | ----------- | ----------------- |
+| Services placed per second                        | **905**   | failed[^1]  | 53                |
+| Batch allocations placed per second               | **1,879** | 83          | 66                |
+| Dense services placed per second (5 per node)     | **3,166** | 76          | 76                |
+| Time to place 99% of a batch burst                | **8.0s**  | 312s        | 364s              |
+| Time to replace work after a quarter of nodes die | **27s**   | 111s        | ~3.5 hours[^2]    |
+| Services per second, one CLI call each            | **311**   | 59          | 53                |
 
-Allocations placed per second, `web_fleet` workload on simulated nodes.
-Legion also finished a 250,000-allocation burst on 50,000 nodes. Below
-saturation, a job's allocations land in about 20ms at the median, even on
-20,000 nodes. When a quarter of a 5,000-node fleet died at once, Legion
-replaced every orphaned allocation in 27 seconds, against 111 for Nomad.
-See [Benchmarks](docs/benchmarks.md) for the full tables and methodology,
+Legion keeps that rate as the fleet grows. Services placed per second, by
+fleet size:
+
+| Nodes  | Legion  | Nomad 2.0.5 | Kubernetes 1.36.5 |
+| ------ | ------- | ----------- | ----------------- |
+| 1,000  | **829** | 122         | 117               |
+| 2,000  | **789** | 110         | 78                |
+| 5,000  | **905** | failed[^1]  | 53                |
+| 10,000 | **738** | -           | -                 |
+| 20,000 | **553** | -           | -                 |
+| 50,000 | **327** | -           | -                 |
+
+Below saturation, a job's allocations land in about 20ms at the median,
+and that barely moves from 5,000 to 20,000 nodes.
+
+These are single runs on simulated nodes, so they measure the control plane
+and not container start times. A dash means we haven't run the cell yet.
+See [Benchmarks](docs/benchmarks.md) for every table and the methodology,
 and [Why Legion is faster than Kubernetes](docs/benchmarks.md#why-legion-is-faster-than-kubernetes)
 for the architecture behind the gap.
+
+[^1]: Nomad's leader lost leadership partway through the burst and rejected
+    the remaining submissions.
+
+[^2]: Projected. By default Kubernetes waits 300 seconds before evicting
+    from a NotReady node, then evicts at 0.1 nodes/sec. It had replaced 146
+    of 1,251 allocations when the 30-minute drill ended.
 
 - **No etcd bottleneck.** The scheduler plans against in-memory state and
   writes to SQLite (or Raft), so throughput is not capped by a separate
@@ -239,19 +271,6 @@ for the architecture behind the gap.
   [`noop` example](plugins/tasks/noop/src/lib.rs) is under 100 lines.
 - **Runs on macOS and Linux**, with Windows support in progress.
 
-### Built for humans and agents
-
-- **MCP server built in.** `legion mcp serve` exposes the cluster to any MCP
-  client, read-only unless you pass `--allow-write`.
-- **Structured output everywhere.** Every CLI command emits a typed JSON
-  envelope with `--json`, with error codes, hints, and a retryable flag.
-- **A self-documenting CLI.** `legion capabilities` lists every operation,
-  and `legion job schema` emits the job spec as JSON Schema.
-- **Safe to retry.** Mutating RPCs accept idempotency keys, and
-  `legion job plan` previews a change before anything runs.
-
-See [Agent Readiness](docs/agent-readiness.md) for the full picture.
-
 ### Built to run agents
 
 Agent sandboxes need to start fast, stay contained, and talk only to what
@@ -265,6 +284,19 @@ they should. Legion handles all three.
   its network shut until the manager confirms it is the only instance.
 - **Per-job egress control.** [Network handlers](docs/network-handlers.md)
   give each task its own egress allowlist and proxy middleware.
+
+### DevEx for humans and agents
+
+- **MCP server built in.** `legion mcp serve` exposes the cluster to any MCP
+  client, read-only unless you pass `--allow-write`.
+- **Structured output everywhere.** Every CLI command emits a typed JSON
+  envelope with `--json`, with error codes, hints, and a retryable flag.
+- **A self-documenting CLI.** `legion capabilities` lists every operation,
+  and `legion job schema` emits the job spec as JSON Schema.
+- **Safe to retry.** Mutating RPCs accept idempotency keys, and
+  `legion job plan` previews a change before anything runs.
+
+See [Agent Readiness](docs/agent-readiness.md) for the full picture.
 
 ## Status
 
@@ -296,6 +328,7 @@ add:
   a more omakase starting experience.
 - **Something akin to Kubernetes controllers**, so you can extend Legion with
   your own reconcile loops.
+- **Resource registry for sharing and pulling jobs, templates, and plugins.**
 - **More runtimes**, such as WASM or remote serverless workloads.
 - **Namespaces, multi-cluster federation, and Windows support.**
 

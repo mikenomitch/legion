@@ -34,6 +34,11 @@ wrong. Nickel gives Legion three things plain JSON doesn't:
 Error messages include source snippets, so a mistake points at the line that
 caused it instead of at the JSON output.
 
+[`configs/jobs/nickel-showcase.ncl`](../configs/jobs/nickel-showcase.ncl)
+puts these together in one spec: a custom contract, `--var` variables with
+defaults, an imported task-builder function, `std` helpers, and record
+merging.
+
 ## Syntax essentials
 
 If you know JSON, three differences cover almost everything:

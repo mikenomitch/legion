@@ -1,6 +1,8 @@
 # Minimal demo of KV-driven task updates (see docs/kv-store.md,
 # "Reactive updates"). One exec task with a watched env injection and a
-# watched file injection on the same key:
+# watched file injection on the same key. KV values are encrypted at rest
+# by default (docs/kv-encryption.md), so this is also how a task takes a
+# secret without putting it in the jobspec:
 #
 #   legion kv put demo/banner hello     # seed before running the job
 #   legion job run configs/jobs/kv-reactive-demo.ncl

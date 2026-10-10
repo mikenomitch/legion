@@ -6123,6 +6123,8 @@ impl Manager for ManagerDaemonService {
             worker_protocol_version = request.protocol_version,
             "Worker registered"
         );
+        // Easter egg: every join is announced the same way on both sides.
+        info!(node_id = %node_id, "We are Legion. {node_id} has joined");
 
         let reply = WorkerRegisterReply {
             message: "Worker registered".into(),
