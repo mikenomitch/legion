@@ -1368,6 +1368,11 @@ impl JobSubmitOutcome {
 
 pub const CONN_LOCK_ERROR: &str = "Error locking database connection";
 
+/// Prefix of a plan rejection that means "this config is no longer wanted"
+/// (stopped job, superseded config). Unlike an epoch conflict, retrying it
+/// cannot succeed, so the planner treats it as an empty plan instead.
+pub(crate) const PLAN_NOT_WANTED_PREFIX: &str = "plan no longer wanted: ";
+
 /// How long a failed inline reconcile waits before its `job_reschedule`
 /// retry runs (see `Store::reconcile_job_configs_or_requeue`). Long enough
 /// that a transient conflict has cleared, short enough that a replacement
@@ -5137,6 +5142,13 @@ impl Store {
                 submission.job_config_id, expected_job_epoch, latest_job_epoch
             );
             return reject(tx, reason, None);
+        }
+
+        // A stop or a newer config does not bump this config's epoch, so the
+        // check above cannot see either. Re-check here, inside the write
+        // transaction, that the plan is still for something the job wants.
+        if let Some(reason) = Self::job_config_unwanted_reason_on(tx, &submission.job_config_id)? {
+            return reject(tx, format!("{PLAN_NOT_WANTED_PREFIX}{reason}"), None);
         }
 
         let (placements_json, plan_mode, evictions_json, target_instance): (
@@ -9105,6 +9117,83 @@ impl Store {
             .query_row([job_config_id], |row| row.get(0))
             .optional()?;
         Ok(job_id)
+    }
+
+    /// Why a plan for `job_config_id` should no longer place anything, or
+    /// `None` when the config is still wanted.
+    ///
+    /// Evals are queued work, and the world moves while they wait: a
+    /// delayed reschedule can fire after `job stop`, and a reschedule for
+    /// v1 can run after the v2 rollout has finished replacing it. Planning
+    /// such an eval as if nothing changed placed the full count for a
+    /// stopped job or a superseded version. A config is wanted when its job
+    /// exists and is not stopped, and the config is one of:
+    ///
+    /// - the job's latest config;
+    /// - a superseded config that still has allocations of its own (a
+    ///   staged rollout's floor, or a rollout stopped part way), so a lost
+    ///   node can still be replaced in kind;
+    /// - the source of a rollout to the latest config that has not
+    ///   completed: a live rollout's rollback re-places it, and a failed or
+    ///   cancelled one left it as the version the job runs.
+    ///
+    /// Checked by the planner before it plans and again inside the apply
+    /// transaction, which is what makes it a fence rather than a hint.
+    pub(crate) fn job_config_unwanted_reason_on(
+        conn: &Connection,
+        job_config_id: &str,
+    ) -> R<Option<String>> {
+        let row: Option<(String, String, Option<String>)> = conn
+            .prepare_cached(
+                "SELECT j.id, j.status, (
+                     SELECT latest.id FROM job_config latest
+                     WHERE latest.job_id = j.id
+                     ORDER BY latest.created_at DESC LIMIT 1
+                 )
+                 FROM job_config jc
+                 INNER JOIN job j ON j.id = jc.job_id
+                 WHERE jc.id = ?1;",
+            )?
+            .query_row([job_config_id], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .optional()?;
+        let Some((job_id, status, latest)) = row else {
+            return Ok(Some(format!(
+                "job config {job_config_id} or its job no longer exists"
+            )));
+        };
+        if status == "stopped" {
+            return Ok(Some(format!("job {job_id} is stopped")));
+        }
+        let Some(latest) = latest else {
+            return Ok(None);
+        };
+        if latest == job_config_id {
+            return Ok(None);
+        }
+        let still_wanted: bool = conn
+            .prepare_cached(
+                "SELECT EXISTS (SELECT 1 FROM allocation WHERE job_config_id = ?1)
+                     OR EXISTS (
+                         SELECT 1 FROM rollout
+                         WHERE from_job_config_id = ?1 AND to_job_config_id = ?2
+                           AND status NOT IN ('completed', 'completed_incomplete')
+                     );",
+            )?
+            .query_row(params![job_config_id, latest], |row| row.get(0))?;
+        if still_wanted {
+            return Ok(None);
+        }
+        Ok(Some(format!(
+            "job config {job_config_id} was superseded by {latest}"
+        )))
+    }
+
+    /// [`Self::job_config_unwanted_reason_on`] against committed state.
+    pub fn job_config_unwanted_reason(&self, job_config_id: &str) -> R<Option<String>> {
+        let conn = self.read_connection()?;
+        Self::job_config_unwanted_reason_on(&conn, job_config_id)
     }
 
     pub fn list_job_spec_history(&self, name: &str) -> R<Vec<JobSpecHistoryRow>> {
@@ -21223,8 +21312,20 @@ mod tests {
             )?;
         }
         // A stale v2 tick and the live v3 tick for one job.
-        store.enqueue_eval("rollout_tick", Some("job-r"), Some("job-r:2"), None, Some(40))?;
-        store.enqueue_eval("rollout_tick", Some("job-r"), Some("job-r:3"), None, Some(40))?;
+        store.enqueue_eval(
+            "rollout_tick",
+            Some("job-r"),
+            Some("job-r:2"),
+            None,
+            Some(40),
+        )?;
+        store.enqueue_eval(
+            "rollout_tick",
+            Some("job-r"),
+            Some("job-r:3"),
+            None,
+            Some(40),
+        )?;
         // Node-scoped work still collapses per node.
         store.enqueue_eval("node_lost_reschedule", None, None, Some("node-2"), Some(30))?;
         store.enqueue_eval("node_lost_reschedule", None, None, Some("node-2"), Some(30))?;
@@ -22784,6 +22885,66 @@ mod tests {
             }
         }
 
+        Ok(())
+    }
+
+    /// SC5: a queued plan for a stopped job places nothing, at plan time
+    /// and at apply time.
+    #[test]
+    fn plans_for_a_stopped_job_place_nothing() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "ready"))?;
+        let job_config_id = submit_job(&store, "stop-me", vec![task("web")])?;
+        let task_id = task_id_for(&store, "web", "stop-me")?;
+        let expected_versions = store
+            .allocation_version_vector(&job_config_id, &HashSet::from(["node-a".to_string()]))?;
+        // Planned before the stop, applied after it.
+        let submission = store.insert_plan_submission(
+            &job_config_id,
+            "reschedule",
+            &[("node-a".to_string(), task_id)],
+            &expected_versions,
+        )?;
+
+        store.stop_job("stop-me")?;
+
+        let outcome =
+            Scheduler::new(&store)?.plan_and_apply(&job_config_id, PlanMode::Reschedule)?;
+        assert!(outcome.allocations.is_empty());
+        match store.apply_plan_submission(&submission)? {
+            PlanApplyOutcome::Rejected { reason, .. } => {
+                assert!(reason.starts_with(PLAN_NOT_WANTED_PREFIX), "{reason}");
+            }
+            PlanApplyOutcome::Applied(_) => bail!("a stopped job's plan must not apply"),
+        }
+        assert!(store.allocs_for_job_config(&job_config_id)?.is_empty());
+        Ok(())
+    }
+
+    /// SC5: once v2 has replaced v1, a late reschedule for v1 places
+    /// nothing. A superseded config that still runs somewhere (a staged
+    /// floor) may still top itself up.
+    #[test]
+    fn plans_for_a_superseded_config_place_only_while_it_still_runs() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "ready"))?;
+        let v1 = submit_job(&store, "versions", vec![task("web")])?;
+        let v1_task = task_id_for(&store, "web", "versions")?;
+        let v2 = submit_job(&store, "versions", vec![task("web"), task("sidecar")])?;
+        assert_ne!(v1, v2);
+        let scheduler = Scheduler::new(&store)?;
+
+        let outcome = scheduler.plan_and_apply(&v1, PlanMode::Reschedule)?;
+        assert!(outcome.allocations.is_empty(), "v1 was fully replaced");
+        assert_eq!(
+            store.job_config_unwanted_reason(&v1)?,
+            Some(format!("job config {v1} was superseded by {v2}"))
+        );
+
+        // A v1 allocation still running keeps v1 wanted.
+        store.place_alloc("node-a", v1_task)?;
+        assert_eq!(store.job_config_unwanted_reason(&v1)?, None);
+        assert_eq!(store.job_config_unwanted_reason(&v2)?, None);
         Ok(())
     }
 

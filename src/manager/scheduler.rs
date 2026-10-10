@@ -112,6 +112,18 @@ pub struct PlanOutcome {
     pub timings: PlanTimings,
 }
 
+impl PlanOutcome {
+    /// A plan that placed and evicted nothing.
+    fn empty(timings: PlanTimings) -> Self {
+        Self {
+            allocations: Vec::new(),
+            deltas: Vec::new(),
+            evictions: Vec::new(),
+            timings,
+        }
+    }
+}
+
 /// Per-phase wall-clock breakdown of one `plan_and_apply`, in microseconds.
 /// Phases are disjoint; `total_us` covers the whole call, so `total_us -
 /// sum(phases)` is glue (mode bookkeeping, logging) and should stay small.
@@ -1412,6 +1424,14 @@ impl<'a> Scheduler<'a> {
         let started = std::time::Instant::now();
         let mut timings = PlanTimings::default();
         info!(%job_config_id, mode = mode.as_str(), target_override = task_targets.is_some(), "Starting scheduler plan_and_apply");
+        // Evals wait in a queue, and the job can be stopped or move on to a
+        // newer config meanwhile. Planning for either would place the full
+        // count of something nobody wants, so bail before doing the work.
+        // The apply transaction re-checks this, so it is a fence, not a hint.
+        if let Some(reason) = self.store.job_config_unwanted_reason(job_config_id)? {
+            info!(%job_config_id, %reason, "Skipping plan for a config that is no longer wanted");
+            return Ok(PlanOutcome::empty(timings));
+        }
         // The band governs whether this plan may preempt at all, and names
         // the preemptor in every victim's stop notice and event.
         let job_lookup_started = std::time::Instant::now();
@@ -1646,6 +1666,13 @@ impl<'a> Scheduler<'a> {
         };
         let applied = match apply_outcome {
             PlanApplyOutcome::Applied(applied) => applied,
+            PlanApplyOutcome::Rejected { reason, .. }
+                if reason.starts_with(crate::storage::store::PLAN_NOT_WANTED_PREFIX) =>
+            {
+                info!(%job_config_id, %reason, "Plan rejected at apply: config no longer wanted");
+                timings.total_us = started.elapsed().as_micros() as u64;
+                return Ok(PlanOutcome::empty(timings));
+            }
             PlanApplyOutcome::Rejected {
                 reason,
                 latest_versions,

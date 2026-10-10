@@ -162,6 +162,28 @@ Legion maintains an epoch per `job_config_id` in `allocation_epoch_partition`.
 
 This keeps conflicts local, so unrelated jobs can schedule in parallel without invalidating each other's plans.
 
+### Stale plans place nothing
+
+Evals wait in a queue, and a job can change while its eval waits. A
+`job stop` or a newer config does not move the planned config's epoch, so
+the planner checks separately that the config is still wanted, once before
+planning and again inside the apply transaction. A config is wanted when its
+job exists and is not stopped, and the config is one of these:
+
+- the job's latest config,
+- an older config that still has allocations of its own (a staged rollout's
+  floor, or a rollout stopped part way), so a lost node is still replaced in
+  kind,
+- the source of a rollout to the latest config that has not completed. A
+  live rollout's rollback re-places it, and a failed or cancelled rollout
+  left it running.
+
+A plan that fails the check places nothing and the eval completes normally.
+The apply-time rejection is recorded as an `allocation.plan_rejected` event with a
+reason starting `plan no longer wanted:`. For example, a delayed reschedule
+that fires after `legion job stop`, or a reschedule for v1 that runs after
+the v2 rollout finished, is a no-op instead of placing the full count.
+
 The plan submission and its apply run as **one replicated store op**
 (`Store::submit_and_apply_plan` / `submit_and_apply_plan_with_candidates`).
 That means one write-transaction boundary, and on raft one
