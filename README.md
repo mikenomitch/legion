@@ -138,6 +138,10 @@ A few from [`configs/jobs/`](configs/jobs/), roughly simplest first:
   changes.
 - [`connect-demo.ncl`](configs/jobs/connect-demo.ncl): a client
   load-balancing across two backends through the service mesh.
+- [`cert-renewer.ncl`](configs/jobs/cert-renewer.ncl) and
+  [`tls-edge.ncl`](configs/jobs/tls-edge.ncl): a scheduled job that renews a
+  Let's Encrypt certificate into KV, and services that serve it and swap it
+  live on renewal, with no restarts.
 - [`postgres.ncl`](configs/jobs/postgres.ncl): a stateful database with a
   persistent volume.
 - [`fullstack.ncl`](configs/jobs/fullstack.ncl): an nginx frontend, a
@@ -329,7 +333,8 @@ start:
   [Task Supervision](docs/task-supervision.md) ·
   [Resource Enforcement](docs/resource-enforcement.md)
 - **Guides:** [Running Postgres](docs/guides/postgres.md) ·
-  [Running Redis](docs/guides/redis.md)
+  [Running Redis](docs/guides/redis.md) ·
+  [Serving TLS Certificates from KV](docs/guides/tls-certificates.md)
 - **Platform services:** [Service Discovery](docs/service-discovery.md) ·
   [Network Handlers](docs/network-handlers.md) · [KV Store](docs/kv-store.md) ·
   [Exec & Actions](docs/exec-and-actions.md)

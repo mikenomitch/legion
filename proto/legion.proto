@@ -487,6 +487,37 @@ service Manager {
   rpc IssueNodeCertificate (IssueNodeCertificateRequest)
       returns (IssueNodeCertificateReply);
 
+  // Fetch the KV-held certificates behind `certFrom = { kv = "<path>" }`
+  // ingress chains (docs/network-handlers.md, "Certificates from KV").
+  //
+  // The worker names allocations, never KV paths. For each allocation the
+  // manager checks that it is placed on the calling node, recomputes its
+  // effective ingress chain (inline chain merged with any policy objects),
+  // takes the KV path from that chain, and reads the entry. So a node can
+  // only ever read a certificate that a job or policy on it declares, and a
+  // job can only declare one its submitter could read (RunJob and
+  // UpsertNetPolicy require `kv:read` on the path).
+  //
+  // Workers call it on their heartbeat loop, only while some allocation on
+  // the node has a KV-backed chain, passing the KV version they already
+  // hold so an unchanged certificate costs no material on the wire. The
+  // worker keeps the material in memory only.
+  //
+  // Per-allocation problems (not placed here, no KV-backed chain, key
+  // missing, bundle invalid) come back in that allocation's `error` rather
+  // than failing the call, so one broken certificate never blocks the
+  // others.
+  //
+  // Called by the worker for its own node: the caller's authenticated
+  // per-node principal (`node:<node_id>`) must match the request's
+  // `node_id`.
+  //
+  // Errors:
+  // - PermissionDenied: `node_id` does not match the caller's credential.
+  // - Internal: the node's allocations could not be loaded.
+  rpc GetIngressCertificates (GetIngressCertificatesRequest)
+      returns (GetIngressCertificatesReply);
+
   // Worker heartbeat endpoint.
   //
   // Workers send runtime state, failures, and allocation health snapshots.
@@ -2906,6 +2937,58 @@ message IssueNodeCertificateReply {
 
   // Certificate expiry as Unix seconds.
   int64 expires_at = 4;
+}
+
+// One allocation in a GetIngressCertificates request.
+message IngressCertificateKnown {
+  // The allocation (manager-facing id) whose ingress certificate to fetch.
+  int64 allocation_id = 1;
+
+  // The KV version of the certificate the worker already holds, or 0 for
+  // none. When it matches the current version the reply is `unchanged`.
+  int64 version = 2;
+}
+
+// Request payload for GetIngressCertificates.
+message GetIngressCertificatesRequest {
+  // The worker node asking. Must match the caller's authenticated per-node
+  // credential.
+  string node_id = 1;
+
+  // The allocations on this node with a `certFrom = { kv }` ingress chain.
+  repeated IngressCertificateKnown known = 2;
+}
+
+// One allocation's certificate in a GetIngressCertificates reply.
+message IngressCertificate {
+  // The allocation this certificate is for.
+  int64 allocation_id = 1;
+
+  // The KV path the allocation's effective ingress chain names. Set even
+  // when `error` is, so the worker can report which key is at fault.
+  string kv_path = 2;
+
+  // The KV entry's version. The worker re-fetches when it moves.
+  int64 version = 3;
+
+  // True when `version` equals the version the worker sent. No material is
+  // returned.
+  bool unchanged = 4;
+
+  // The PEM bundle: the certificate chain, leaf first, then the private
+  // key. Validated by the manager before it is sent. Treat as a secret:
+  // never log it, never write it to disk.
+  string bundle_pem = 5;
+
+  // Why no certificate was returned, e.g. "kv certs/app not found" or
+  // "kv certs/app holds no private key". Empty on success.
+  string error = 6;
+}
+
+// Reply payload for GetIngressCertificates.
+message GetIngressCertificatesReply {
+  // One entry per requested allocation, in request order.
+  repeated IngressCertificate certificates = 1;
 }
 
 // Request payload for Heartbeat.

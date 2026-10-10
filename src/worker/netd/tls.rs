@@ -122,6 +122,93 @@ impl MeshIdentity {
     }
 }
 
+/// A certificate held in KV (`certFrom = { kv = "<path>" }`), as one PEM
+/// bundle: the chain, leaf first, then the private key. Kept in memory only;
+/// the key is redacted from `Debug`.
+pub struct KvCertificate {
+    pub kv_path: String,
+    pub version: i64,
+    pub cert_chain: Vec<CertificateDer<'static>>,
+    key_pem: String,
+}
+
+impl std::fmt::Debug for KvCertificate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KvCertificate")
+            .field("kv_path", &self.kv_path)
+            .field("version", &self.version)
+            .finish_non_exhaustive()
+    }
+}
+
+impl KvCertificate {
+    pub fn from_bundle(kv_path: &str, version: i64, bundle_pem: &str) -> R<Self> {
+        validate_bundle(bundle_pem)?;
+        Ok(KvCertificate {
+            kv_path: kv_path.to_string(),
+            version,
+            cert_chain: certs_from_pem(bundle_pem.as_bytes())?,
+            key_pem: bundle_pem.to_string(),
+        })
+    }
+
+    /// Terminate with this certificate. `mutual` verifies clients against
+    /// `clientCa`: the mesh CA for `"legion"`, otherwise a bundle on disk.
+    pub fn server_config(
+        &self,
+        tls: &TlsConfig,
+        mesh: Option<&MeshIdentity>,
+    ) -> R<Arc<ServerConfig>> {
+        let key = key_from_pem(self.key_pem.as_bytes())?;
+        let builder = ServerConfig::builder();
+        let config = if tls.mode == TLS_MUTUAL {
+            let roots = match tls.client_ca.as_deref() {
+                Some("legion") => mesh
+                    .ok_or_else(|| anyhow::anyhow!("mesh certificate not issued yet"))?
+                    .roots(),
+                Some(path) => {
+                    let mut roots = RootCertStore::empty();
+                    for cert in certs_from_pem(&read(path)?)? {
+                        roots.add(cert)?;
+                    }
+                    roots
+                }
+                None => bail!("tls.clientCa is required for mutual"),
+            };
+            let verifier = WebPkiClientVerifier::builder(Arc::new(roots))
+                .build()
+                .map_err(|err| anyhow::anyhow!("client verifier: {err}"))?;
+            builder
+                .with_client_cert_verifier(verifier)
+                .with_single_cert(self.cert_chain.clone(), key)?
+        } else {
+            builder
+                .with_no_client_auth()
+                .with_single_cert(self.cert_chain.clone(), key)?
+        };
+        Ok(Arc::new(config))
+    }
+}
+
+/// Check a `certFrom = { kv }` bundle: at least one certificate, a private
+/// key, and a key that belongs to the leaf. The manager runs this before
+/// sending a bundle, so a bad `kv put` names the key in the allocation's
+/// status instead of failing every handshake.
+pub fn validate_bundle(bundle_pem: &str) -> R<()> {
+    let chain = certs_from_pem(bundle_pem.as_bytes())?;
+    if chain.is_empty() {
+        bail!("holds no certificate (expected the chain, then the private key, as PEM)");
+    }
+    let key = key_from_pem(bundle_pem.as_bytes())
+        .map_err(|_| anyhow::anyhow!("holds no private key (append it after the chain)"))?;
+    // Building a config checks that the key matches the leaf.
+    ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(chain, key)
+        .map_err(|err| anyhow::anyhow!("certificate and key do not match: {err}"))?;
+    Ok(())
+}
+
 pub fn certs_from_pem(pem: &[u8]) -> R<Vec<CertificateDer<'static>>> {
     let mut reader = std::io::BufReader::new(pem);
     rustls_pemfile::certs(&mut reader)

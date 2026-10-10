@@ -133,6 +133,15 @@ type HandlerEndpoints = HashMap<(i64, String), Vec<Endpoint>>;
 /// built each, and the result.
 type IngressTlsConfigs =
     HashMap<(i64, String), (String, Result<Arc<rustls::ServerConfig>, String>)>;
+/// An allocation's KV-held ingress certificate: the last good one (kept when
+/// a later fetch fails, so a bad `kv put` never takes a listener down) and
+/// the latest fetch problem.
+#[derive(Debug, Default, Clone)]
+pub struct KvCertState {
+    pub cert: Option<Arc<crate::worker::netd::tls::KvCertificate>>,
+    pub error: Option<String>,
+}
+
 /// `authz` verdicts by cache key: (allowed, reason, expires).
 type AuthzCache = HashMap<String, (bool, Option<String>, Instant)>;
 
@@ -168,6 +177,9 @@ pub struct ForwarderContext {
     /// Ingress TLS configs per (allocation, port label): the fingerprint of
     /// what built it, and the result (an error is reported as `tls_error`).
     ingress_tls: Mutex<IngressTlsConfigs>,
+    /// `certFrom = { kv }` material per allocation, from
+    /// `GetIngressCertificates`. In memory only.
+    kv_certs: Mutex<HashMap<i64, KvCertState>>,
     /// Service-graph samples since the last heartbeat.
     edges: Arc<crate::worker::netd::graph::EdgeLedger>,
 }
@@ -212,6 +224,7 @@ impl ForwarderContext {
             mesh: RwLock::new(None),
             mesh_wanted: AtomicBool::new(false),
             ingress_tls: Mutex::new(HashMap::new()),
+            kv_certs: Mutex::new(HashMap::new()),
             edges: Arc::new(crate::worker::netd::graph::EdgeLedger::new()),
         }
     }
@@ -260,6 +273,41 @@ impl ForwarderContext {
         lock(&self.handler_endpoints).retain(|(id, _), _| live.contains(id));
         lock(&self.handler_health).retain(|(id, _), _| live.contains(id));
         lock(&self.ingress_tls).retain(|(id, _), _| live.contains(id));
+        lock(&self.kv_certs).retain(|id, _| live.contains(id));
+    }
+
+    /// The KV version of the certificate held for an allocation (0 for none),
+    /// what `GetIngressCertificates` compares against.
+    pub fn kv_cert_version(&self, allocation_id: i64) -> i64 {
+        lock(&self.kv_certs)
+            .get(&allocation_id)
+            .and_then(|state| state.cert.as_ref())
+            .map(|cert| cert.version)
+            .unwrap_or(0)
+    }
+
+    /// Install a freshly fetched certificate. New connections pick it up via
+    /// the version in the server-config fingerprint; open ones keep theirs.
+    pub fn set_kv_cert(&self, allocation_id: i64, cert: crate::worker::netd::tls::KvCertificate) {
+        lock(&self.kv_certs).insert(
+            allocation_id,
+            KvCertState {
+                cert: Some(Arc::new(cert)),
+                error: None,
+            },
+        );
+    }
+
+    /// Record a fetch problem, keeping whatever certificate is held.
+    pub fn set_kv_cert_error(&self, allocation_id: i64, error: String) {
+        lock(&self.kv_certs).entry(allocation_id).or_default().error = Some(error);
+    }
+
+    /// Clear a fetch problem after an `unchanged` reply.
+    pub fn clear_kv_cert_error(&self, allocation_id: i64) {
+        if let Some(state) = lock(&self.kv_certs).get_mut(&allocation_id) {
+            state.error = None;
+        }
     }
 
     pub fn next_handler_pick(&self) -> usize {
@@ -433,10 +481,21 @@ impl ForwarderContext {
         tls: &crate::structs::netpolicy::TlsConfig,
     ) -> Result<Arc<rustls::ServerConfig>, String> {
         let mesh = self.mesh_identity();
+        let kv_cert = tls.cert_kv_path().map(|_| {
+            lock(&self.kv_certs)
+                .get(&allocation_id)
+                .cloned()
+                .unwrap_or_default()
+        });
         let fingerprint = format!(
-            "{}|{}",
+            "{}|{}|{}",
             serde_json::to_string(tls).unwrap_or_default(),
-            mesh.as_ref().map(|m| m.expires_at).unwrap_or(0)
+            mesh.as_ref().map(|m| m.expires_at).unwrap_or(0),
+            kv_cert
+                .as_ref()
+                .and_then(|state| state.cert.as_ref())
+                .map(|cert| cert.version)
+                .unwrap_or(0)
         );
         let key = (allocation_id, label.to_string());
         {
@@ -449,7 +508,17 @@ impl ForwarderContext {
         }
         let mutual = tls.mode == crate::structs::netpolicy::TLS_MUTUAL;
         let result: Result<Arc<rustls::ServerConfig>, String> =
-            if tls.cert_from.as_deref() == Some("legion") {
+            if let Some(path) = tls.cert_kv_path() {
+                let state = kv_cert.unwrap_or_default();
+                match state.cert {
+                    Some(cert) => cert
+                        .server_config(tls, mesh.as_deref())
+                        .map_err(|err| format!("kv {path}: {err:#}")),
+                    None => Err(state
+                        .error
+                        .unwrap_or_else(|| format!("kv {path}: certificate not fetched yet"))),
+                }
+            } else if tls.cert_from_mesh() {
                 match mesh {
                     Some(identity) => identity
                         .server_config(mutual)
@@ -482,6 +551,15 @@ impl ForwarderContext {
 
     /// (ready, error) for the allocation's ingress TLS material.
     pub fn ingress_tls_status(&self, allocation_id: i64) -> (bool, String) {
+        // KV certificates are reported eagerly, from the fetch, rather than
+        // waiting for the first connection to build a config: a missing key
+        // is not ready, and a failed renewal while an older certificate
+        // still serves is ready with the error attached.
+        if let Some(state) = lock(&self.kv_certs).get(&allocation_id) {
+            if let Some(error) = &state.error {
+                return (state.cert.is_some(), error.clone());
+            }
+        }
         let cache = lock(&self.ingress_tls);
         for ((id, _), (_, result)) in cache.iter() {
             if *id == allocation_id {

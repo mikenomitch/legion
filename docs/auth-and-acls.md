@@ -57,7 +57,11 @@ store, including ACL metadata. What it cannot read:
 
 - KV values. Those are stored encrypted
   ([KV Encryption at Rest](kv-encryption.md)), so raw SQL sees ciphertext. A
-  `kv` rule scoped by `paths` is the only way to read a value.
+  `kv` rule scoped by `paths` is the only way to read a value. That includes
+  handing a value to the datapath: a job or net policy whose ingress chain
+  sets `tls.certFrom = { kv = "<path>" }` needs `kv:read` on that path, on top
+  of `job:write` or `net:write`
+  ([Certificates from KV](network-handlers.md#certificates-from-kv)).
 - Private keys and password hashes. `signing_key.private_key_pem` (the
   workload-identity and boot-ticket signing keys), `net_mesh_ca.key_pem` (the
   mesh CA key), and `acl_user.password_hash` always read as `NULL` through

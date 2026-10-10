@@ -35,17 +35,18 @@ use crate::structs::{
     DeleteVolumeRequest, DestroyInstanceReply, DestroyInstanceRequest, DestroyJobReply,
     DestroyJobRequest, ExecClientFrame, FailedAllocation, GetAllocationLogsReply,
     GetAllocationLogsRequest, GetArtifactCredentialReply, GetArtifactCredentialRequest,
-    GetHeartbeatCadenceReply, GetHeartbeatCadenceRequest, GetInstanceReply, GetInstanceRequest,
-    GetJobInfoReply, GetJobInfoRequest, GetJobScaleStatusReply, GetJobScaleStatusRequest,
-    GetJobSpecByConfigRequest, GetJobSpecReply, GetJobSpecRequest, GetJobTemplateReply,
-    GetJobTemplateRequest, GetKvLockReply, GetKvLockRequest, GetKvReply, GetKvRequest,
-    GetLedgerReply, GetLedgerRequest, GetManagerConfigsReply, GetManagerConfigsRequest,
-    GetMeshCaReply, GetMeshCaRequest, GetNodeReply, GetNodeRequest, GetNodesReply, GetNodesRequest,
-    GetObservabilityReply, GetObservabilityRequest, GetRaftJoinTokenReply, GetRaftJoinTokenRequest,
-    GetRaftStatusReply, GetRaftStatusRequest, GetRolloutReply, GetRolloutRequest,
-    GetRolloutStatusReply, GetRolloutStatusRequest, GetStateBackupReply, GetStateBackupRequest,
-    GetStateStoreSchemaReply, GetStateStoreSchemaRequest, GetTaskLogsRequest, GetVolumeReply,
-    GetVolumeRequest, HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest,
+    GetHeartbeatCadenceReply, GetHeartbeatCadenceRequest, GetIngressCertificatesReply,
+    GetIngressCertificatesRequest, GetInstanceReply, GetInstanceRequest, GetJobInfoReply,
+    GetJobInfoRequest, GetJobScaleStatusReply, GetJobScaleStatusRequest, GetJobSpecByConfigRequest,
+    GetJobSpecReply, GetJobSpecRequest, GetJobTemplateReply, GetJobTemplateRequest, GetKvLockReply,
+    GetKvLockRequest, GetKvReply, GetKvRequest, GetLedgerReply, GetLedgerRequest,
+    GetManagerConfigsReply, GetManagerConfigsRequest, GetMeshCaReply, GetMeshCaRequest,
+    GetNodeReply, GetNodeRequest, GetNodesReply, GetNodesRequest, GetObservabilityReply,
+    GetObservabilityRequest, GetRaftJoinTokenReply, GetRaftJoinTokenRequest, GetRaftStatusReply,
+    GetRaftStatusRequest, GetRolloutReply, GetRolloutRequest, GetRolloutStatusReply,
+    GetRolloutStatusRequest, GetStateBackupReply, GetStateBackupRequest, GetStateStoreSchemaReply,
+    GetStateStoreSchemaRequest, GetTaskLogsRequest, GetVolumeReply, GetVolumeRequest,
+    HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, IngressCertificate,
     Instance, InstanceInfo, InstanceMode, InstanceState, IssueBootTicketReply,
     IssueBootTicketRequest, IssueNodeCertificateReply, IssueNodeCertificateRequest,
     IssueNodeIdentityTokenReply, IssueNodeIdentityTokenRequest, IssueRaftCommandReply,
@@ -1077,6 +1078,7 @@ fn apply_task_kv_injections(
         }
     }
 
+    let defaults = injections.kv.clone().unwrap_or_default();
     for file in &injections.files {
         let deps = template_source_deps(store, &file.file)?;
         match render_template_source(store, &file.file)? {
@@ -1089,11 +1091,22 @@ fn apply_task_kv_injections(
                 let files = files_value
                     .as_array_mut()
                     .context("task config files must be an array")?;
-                let entry = json!({
+                let mut entry = json!({
                     "path": file.path,
                     "mode": file.mode,
                     "content": rendered
                 });
+                // `onChange = "update"` entries carry what the worker needs to
+                // rewrite them under a running task. The marker is what opts
+                // the file in: the worker never rewrites an unmarked file.
+                if file.kv.resolve_with_defaults(&defaults).on_change == KvInjectionAction::Update {
+                    let live = crate::structs::LiveFileUpdate {
+                        change_mode: file.change_mode.unwrap_or_default(),
+                        change_signal: file.change_signal.clone(),
+                        splay: file.splay.clone(),
+                    };
+                    entry["liveUpdate"] = serde_json::to_value(live)?;
+                }
                 // Upsert by path so re-materialization replaces the previous
                 // render instead of appending a duplicate file entry.
                 if let Some(existing) = files.iter_mut().find(|value| {
@@ -1134,9 +1147,10 @@ fn apply_job_kv_injections(
 fn strongest_action(a: KvInjectionAction, b: KvInjectionAction) -> KvInjectionAction {
     let rank = |value: &KvInjectionAction| match value {
         KvInjectionAction::None => 0,
-        KvInjectionAction::Restart => 1,
-        KvInjectionAction::Rollout => 2,
-        KvInjectionAction::Fail => 3,
+        KvInjectionAction::Update => 1,
+        KvInjectionAction::Restart => 2,
+        KvInjectionAction::Rollout => 3,
+        KvInjectionAction::Fail => 4,
     };
     if rank(&a) >= rank(&b) {
         a
@@ -1499,6 +1513,12 @@ impl ManagerDaemonService {
             error!("Error validating task configs: {:?}", e);
             Status::invalid_argument(format!("Error validating task configs: {e}"))
         })?;
+        let ingress_chains: Vec<_> = config
+            .tasks
+            .iter()
+            .map(|task| task.network.as_ref().and_then(|n| n.ingress.as_ref()))
+            .collect();
+        enforce_kv_cert_read(identity, &ingress_chains)?;
         self.validate_job_volumes(&config).map_err(|e| {
             error!("Error validating volumes: {:?}", e);
             Status::invalid_argument(format!("Error validating volumes: {e:#}"))
@@ -2848,8 +2868,82 @@ fn reconcile_kv_changes(store: &Store, changes: &[(String, bool)]) -> Result<(),
             continue;
         }
 
+        // `update` cannot clear a KV failure: the stamps on the failed
+        // allocations only go away when they are replaced. Recover the way
+        // `restart` does.
+        let action =
+            if action == KvInjectionAction::Update && job_status.as_deref() == Some("failed") {
+                KvInjectionAction::Restart
+            } else {
+                action
+            };
+
         match action {
             KvInjectionAction::None => {}
+            KvInjectionAction::Update => {
+                // Repoint the running allocations at the re-rendered config
+                // without stopping them; their workers rewrite the marked
+                // files on the next heartbeat. Done here, synchronously,
+                // rather than through a `job_submit` eval: until the
+                // allocations move, the job matches the signature
+                // `reconcile_missing_rollouts` repairs (a newest config
+                // with no allocations and no rollout), and that pass would
+                // turn this update into a rollout.
+                let previous = store
+                    .previous_job_config_id(&new_job_config_id)
+                    .map_err(|e| map_store_error("Error loading previous job config", e))?;
+                let in_place = match previous.as_deref() {
+                    Some(previous) => store
+                        .job_configs_schedule_equivalent(previous, &new_job_config_id)
+                        .map_err(|e| map_store_error("Error comparing job configs", e))?,
+                    None => false,
+                };
+                match previous {
+                    Some(previous) if in_place => {
+                        let moved = store
+                            .migrate_allocations_to_job_config(&previous, &new_job_config_id)
+                            .map_err(|e| {
+                                map_store_error("Error updating allocations in place", e)
+                            })?;
+                        info!(
+                            job_id = %job_id,
+                            job_config_id = %new_job_config_id,
+                            allocations = moved.len(),
+                            "KV update applied in place"
+                        );
+                    }
+                    // Defensive: a files-only re-render is always
+                    // schedule-equivalent. If it ever is not, fall back to a
+                    // rollout rather than strand the allocations.
+                    _ => {
+                        warn!(
+                            job_id = %job_id,
+                            "KV update changed scheduling inputs; rolling out instead"
+                        );
+                        let is_manual = create_rollout_for_update(
+                            store,
+                            &job_id,
+                            previous.as_deref(),
+                            &new_job_config_id,
+                            &updated_config,
+                            "Error creating rollout for kv update",
+                        )?;
+                        if !is_manual {
+                            store
+                                .enqueue_eval(
+                                    "rollout_tick",
+                                    Some(&job_id),
+                                    Some(&new_job_config_id),
+                                    None,
+                                    Some(store.default_eval_priority),
+                                )
+                                .map_err(|e| {
+                                    map_store_error("Error scheduling kv update rollout", e)
+                                })?;
+                        }
+                    }
+                }
+            }
             KvInjectionAction::Restart => {
                 store
                     .clear_job_failed_status(&job_id)
@@ -7072,6 +7166,7 @@ impl Manager for ManagerDaemonService {
             .normalize_and_validate()
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
         enforce_net_policy_scope(&identity, AclAction::Write, &object)?;
+        enforce_kv_cert_read(&identity, &[object.ingress.as_ref()])?;
 
         let affected = self.affected_allocations_for_policy(&object);
         if req.dry_run {
@@ -7383,6 +7478,83 @@ impl Manager for ManagerDaemonService {
         Ok(Response::new(FetchNetPolicyReply {
             effective_json: serde_json::to_string(&policy).unwrap_or_default(),
         }))
+    }
+
+    #[instrument(skip_all, fields(node_id = %request.get_ref().node_id, allocations = request.get_ref().known.len()))]
+    async fn get_ingress_certificates(
+        &self,
+        request: Request<GetIngressCertificatesRequest>,
+    ) -> Result<Response<GetIngressCertificatesReply>, Status> {
+        // ACL: worker-plane endpoint (nodes fetch the KV certificates behind
+        // `certFrom = { kv }` ingress chains of allocations placed on them).
+        // The node never names a KV path: each one is derived below from the
+        // allocation's effective chain, which only a submitter holding
+        // `kv:read` on the path could have declared.
+        let identity = self.authenticate_acl(&request)?;
+        acl::enforce_worker_plane(&identity)?;
+        let req = request.into_inner();
+        acl::enforce_node_binding(&identity, &req.node_id)?;
+
+        let desired = build_desired_allocations(&self.store, &req.node_id, &[])
+            .map_err(|e| map_store_error("Error building desired allocations", e))?;
+        // The same merge the heartbeat ran; it leaves each body in the cache.
+        let hashes: HashMap<i64, String> = self
+            .build_net_policies(&req.node_id, &desired)
+            .into_iter()
+            .map(|assignment| (assignment.allocation_id, assignment.policy_hash))
+            .collect();
+
+        let certificates = req
+            .known
+            .iter()
+            .map(|known| {
+                let mut out = IngressCertificate {
+                    allocation_id: known.allocation_id,
+                    ..Default::default()
+                };
+                let policy = hashes.get(&known.allocation_id).and_then(|hash| {
+                    self.net_policy_cache
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .get(hash)
+                        .cloned()
+                });
+                let Some(path) = policy
+                    .as_ref()
+                    .and_then(|policy| policy.ingress.as_ref())
+                    .and_then(|chain| chain.tls.as_ref())
+                    .and_then(|tls| tls.cert_kv_path())
+                    .map(str::to_string)
+                else {
+                    out.error =
+                        "allocation is not placed on this node or has no certFrom = { kv } chain"
+                            .into();
+                    return out;
+                };
+                out.kv_path = path.clone();
+                match self.store.get_kv(&path) {
+                    Ok(Some(entry)) => {
+                        out.version = entry.version;
+                        if entry.version == known.version {
+                            out.unchanged = true;
+                        } else if let Err(err) =
+                            crate::worker::netd::tls::validate_bundle(&entry.value)
+                        {
+                            out.error = format!("kv {path} {err:#}");
+                        } else {
+                            out.bundle_pem = entry.value;
+                        }
+                    }
+                    Ok(None) => out.error = format!("kv {path} not found"),
+                    Err(err) => {
+                        warn!(kv_path = %path, error = ?err, "Failed reading ingress certificate");
+                        out.error = format!("kv {path} could not be read");
+                    }
+                }
+                out
+            })
+            .collect();
+        Ok(Response::new(GetIngressCertificatesReply { certificates }))
     }
 
     #[instrument(skip_all)]
@@ -10041,6 +10213,37 @@ fn merge_net_policies(
 /// Per-pool scope enforcement for a policy object: a caller must hold the
 /// action on every pool the selector names (or on any pool when it names
 /// none, i.e. a cluster-wide policy).
+/// `certFrom = { kv }` hands a KV value to the datapath, so naming one needs
+/// the same right as reading it: `kv:read` on the path. Without this, job
+/// submit (or policy write) access would be a way to read any private key in
+/// KV. Applied to RunJob, template runs, and UpsertNetPolicy.
+fn enforce_kv_cert_read(
+    identity: &crate::structs::AclIdentity,
+    chains: &[Option<&crate::structs::netpolicy::ChainConfig>],
+) -> Result<(), Status> {
+    for chain in chains.iter().flatten() {
+        if let Some(path) = chain.tls.as_ref().and_then(|tls| tls.cert_kv_path()) {
+            acl::enforce(
+                identity,
+                AclResource::Kv,
+                AclAction::Read,
+                &AclScope::path(path),
+            )
+            .map_err(|status| {
+                Status::new(
+                    status.code(),
+                    format!(
+                        "{} (ingress tls.certFrom names kv {path}; the submitter needs kv \
+                             read on it)",
+                        status.message()
+                    ),
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
 fn enforce_net_policy_scope(
     identity: &crate::structs::AclIdentity,
     action: AclAction,
@@ -12249,6 +12452,226 @@ mod tests {
             files[0].get("content").and_then(Value::as_str),
             Some("value=v2")
         );
+        Ok(())
+    }
+
+    fn live_file_jobspec(job: &str, key: &str) -> Value {
+        json!({
+            "name": job,
+            "task": {
+                "runtime": "exec",
+                "kv": { "watch": true, "onDelete": "fail" },
+                "files": [
+                    {
+                        "path": "/tmp/legion-live.pem",
+                        "mode": "0400",
+                        "file": { "template": format!("{{{{ kv \"{key}\" }}}}") },
+                        "kv": { "onChange": "update" },
+                        "changeMode": "signal",
+                        "changeSignal": "SIGHUP",
+                        "splay": "5s"
+                    }
+                ],
+                "config": { "command": ["echo", "hi"] }
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn kv_file_update_moves_allocations_in_place_without_a_rollout_test() -> R<()> {
+        let store = setup_store()?;
+        let manager = ManagerDaemonService::new(store.clone());
+
+        put_kv_entry(&manager, "certs/live", "pem-1").await?;
+        run_jobspec(&manager, live_file_jobspec("kv-live", "certs/live")).await?;
+        insert_node(&store, "node-1")?;
+        let first_config = store.get_job_config("kv-live")?.id();
+        let (task_id, _) = store
+            .get_task_configs_for_job_config(&first_config)?
+            .into_iter()
+            .next()
+            .context("task config")?;
+        let alloc = store.place_alloc("node-1", task_id)?;
+
+        put_kv_entry(&manager, "certs/live", "pem-2").await?;
+
+        // The same allocation now points at the re-rendered config.
+        let latest = store.get_job_config("kv-live")?;
+        assert_ne!(latest.id(), first_config);
+        let moved = store
+            .allocs_for_job("kv-live")?
+            .into_iter()
+            .find(|candidate| candidate.id == alloc.id)
+            .context("allocation must survive an update")?;
+        assert_eq!(moved.job_config_id, latest.id());
+
+        // Nothing replaces it: no restart, no rollout, and the failover pass
+        // sees nothing to repair.
+        assert_eq!(evals_of_kind(&store, "kv-live", "job_update")?, 0);
+        assert_eq!(evals_of_kind(&store, "kv-live", "rollout_tick")?, 0);
+        assert!(store.list_rollouts(Some("kv-live"), false)?.is_empty());
+        assert_eq!(reconcile_missing_rollouts(&store)?, 0);
+
+        // The rendered entry carries what the worker needs.
+        let files = latest.tasks[0]
+            .config
+            .get("files")
+            .and_then(Value::as_array)
+            .context("files")?;
+        assert_eq!(files[0]["content"], "pem-2");
+        assert_eq!(
+            files[0]["liveUpdate"],
+            json!({ "changeMode": "signal", "changeSignal": "SIGHUP", "splay": "5s" })
+        );
+        Ok(())
+    }
+
+    /// The node names allocations, never paths: the manager derives the KV
+    /// path from the allocation's chain, sends the bundle once per version,
+    /// and reports per-allocation problems without failing the call.
+    #[tokio::test]
+    async fn get_ingress_certificates_derives_the_path_and_skips_unchanged_test() -> R<()> {
+        use crate::manager::mesh_ca::{generate_ca, issue_node_cert};
+        let store = setup_store()?;
+        let manager = ManagerDaemonService::new(store.clone());
+        let (ca_pem, ca_key) = generate_ca()?;
+        let (cert, key, _) = issue_node_cert(&ca_pem, &ca_key, "edge")?;
+        let bundle = format!("{cert}{key}");
+        put_kv_entry(&manager, "certs/edge", &bundle).await?;
+        run_jobspec(
+            &manager,
+            json!({
+                "name": "edge",
+                "task": {
+                    "runtime": "exec",
+                    "config": { "command": ["sleep", "30"] },
+                    "network": {
+                        "ports": [{ "name": "https", "static": 8443 }],
+                        "ingress": { "tls": { "mode": "server", "certFrom": { "kv": "certs/edge" } } },
+                    },
+                },
+            }),
+        )
+        .await?;
+        insert_node(&store, "node-1")?;
+        let job_config_id = store.get_job_config("edge")?.id();
+        let (task_id, _) = store
+            .get_task_configs_for_job_config(&job_config_id)?
+            .into_iter()
+            .next()
+            .context("task config")?;
+        let alloc = store.place_alloc("node-1", task_id)?;
+
+        let fetch = |known: Vec<(i64, i64)>| {
+            let manager = &manager;
+            async move {
+                manager
+                    .get_ingress_certificates(Request::new(GetIngressCertificatesRequest {
+                        node_id: "node-1".into(),
+                        known: known
+                            .into_iter()
+                            .map(|(allocation_id, version)| {
+                                crate::structs::IngressCertificateKnown {
+                                    allocation_id,
+                                    version,
+                                }
+                            })
+                            .collect(),
+                    }))
+                    .await
+                    .map(|reply| reply.into_inner().certificates)
+            }
+        };
+
+        let first = fetch(vec![(alloc.id, 0), (alloc.id + 999, 0)]).await?;
+        assert_eq!(first[0].kv_path, "certs/edge");
+        assert_eq!(first[0].bundle_pem, bundle);
+        assert!(first[0].error.is_empty(), "{}", first[0].error);
+        assert!(
+            first[1].error.contains("not placed on this node"),
+            "{}",
+            first[1].error
+        );
+
+        let again = fetch(vec![(alloc.id, first[0].version)]).await?;
+        assert!(again[0].unchanged);
+        assert!(
+            again[0].bundle_pem.is_empty(),
+            "no material for an unchanged version"
+        );
+
+        // A bad put is reported against the allocation, not sent.
+        put_kv_entry(&manager, "certs/edge", &cert).await?;
+        let bad = fetch(vec![(alloc.id, first[0].version)]).await?;
+        assert!(bad[0].bundle_pem.is_empty());
+        assert!(bad[0].error.contains("no private key"), "{}", bad[0].error);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn kv_file_update_on_a_failed_job_recovers_through_restart_test() -> R<()> {
+        let store = setup_store()?;
+        let manager = ManagerDaemonService::new(store.clone());
+
+        put_kv_entry(&manager, "certs/gone", "pem-1").await?;
+        run_jobspec(&manager, live_file_jobspec("kv-live-fail", "certs/gone")).await?;
+        delete_kv_entry(&manager, "certs/gone").await?;
+        assert_eq!(store.get_job("kv-live-fail")?.status, "failed");
+
+        // Only a replacement clears the failure stamps, so the put restarts.
+        put_kv_entry(&manager, "certs/gone", "pem-2").await?;
+        assert_eq!(store.get_job("kv-live-fail")?.status, "done");
+        assert_eq!(evals_of_kind(&store, "kv-live-fail", "job_update")?, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn kv_update_is_rejected_where_it_cannot_apply_test() -> R<()> {
+        let store = setup_store()?;
+        let manager = ManagerDaemonService::new(store.clone());
+        put_kv_entry(&manager, "flags/x", "1").await?;
+
+        let cases = [
+            (
+                // A task-level default reaches env entries too.
+                json!({ "kv": { "watch": true, "onChange": "update" },
+                        "env": [{ "name": "X", "value": { "template": "{{ kv \"flags/x\" }}" } }] }),
+                "cannot change a running process's environment",
+            ),
+            (
+                json!({ "files": [{ "path": "/tmp/x", "file": { "template": "{{ kv \"flags/x\" }}" },
+                                    "kv": { "watch": true, "onDelete": "update" } }] }),
+                "onDelete cannot be \"update\"",
+            ),
+            (
+                json!({ "files": [{ "path": "/tmp/x", "file": { "template": "{{ kv \"flags/x\" }}" },
+                                    "kv": { "watch": true, "onChange": "restart" },
+                                    "changeMode": "signal", "changeSignal": "SIGHUP" }] }),
+                "changeMode only applies with kv.onChange = \"update\"",
+            ),
+            (
+                json!({ "files": [{ "path": "/tmp/x", "file": { "template": "{{ kv \"flags/x\" }}" },
+                                    "kv": { "watch": true, "onChange": "update" },
+                                    "changeMode": "signal" }] }),
+                "changeMode = \"signal\" needs changeSignal",
+            ),
+        ];
+        for (index, (task, expected)) in cases.into_iter().enumerate() {
+            let mut task = task;
+            task["runtime"] = json!("exec");
+            task["config"] = json!({ "command": ["echo", "hi"] });
+            let status = run_jobspec(
+                &manager,
+                json!({ "name": format!("kv-reject-{index}"), "task": task }),
+            )
+            .await
+            .expect_err("submit must be rejected");
+            assert!(
+                status.message().contains(expected),
+                "case {index}: {:?} should mention {expected:?}",
+                status.message()
+            );
+        }
         Ok(())
     }
 

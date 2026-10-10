@@ -75,8 +75,13 @@ Plans, roadmaps, to-do lists, and development notes live in
   egress/ingress policy objects, HTTP mode with retries and canary splits,
   `<service>.svc.legion` names, `gated` networking (namespaces, and vsock for
   sandboxes), ingress chains, `authz`/`proxy` handlers, mTLS with the mesh
-  CA, the service graph, drain-before-stop, and `legion net`.
-- [KV Store](kv-store.md): CRUD, versioning, locks, and reactive task updates.
+  CA, certificates served from KV, the service graph, drain-before-stop, and
+  `legion net`.
+- [KV Store](kv-store.md): CRUD, versioning, locks, reactive task updates, and
+  live file updates (`onChange = "update"`).
+- [Serving TLS Certificates from KV](guides/tls-certificates.md): a guide to
+  renewing a Let's Encrypt certificate into KV and serving it from the node or
+  from nginx, with no restarts.
 - [KV Encryption at Rest](kv-encryption.md): on by default. Covers the root key
   outside the store, wrapped data keys inside it, rotation, backups, and
   what to do when a key is missing.

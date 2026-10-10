@@ -981,6 +981,19 @@ pub fn validate_job_config(config: &JobConfig) -> R<()> {
                     task.runtime
                 );
             }
+            for file in &injections.files {
+                if file.change_mode == Some(crate::structs::workload_identity::ChangeMode::Signal)
+                    && !plugin.supports_signal()
+                {
+                    bail!(
+                        "Task {} runtime {} does not support signaling required by file {} \
+                         changeMode signal",
+                        task.name,
+                        task.runtime,
+                        file.path
+                    );
+                }
+            }
         }
     }
     // Slot instance ids are derived from (job, group, slot), so two slot-mode
@@ -1095,6 +1108,14 @@ pub fn validate_job_config(config: &JobConfig) -> R<()> {
     }
     validate_task_dependencies(config)?;
     Ok(())
+}
+
+/// The permission bits for a KV-injected file: its declared octal `mode`, or
+/// `0644` (what the old plain write produced under the usual umask) when
+/// unset or unparseable.
+pub fn injected_file_mode(mode: Option<&str>) -> u32 {
+    mode.and_then(|mode| crate::structs::workload_identity::parse_file_mode(mode).ok())
+        .unwrap_or(0o644)
 }
 
 /// Resolve a declared file-delivery destination against an isolating

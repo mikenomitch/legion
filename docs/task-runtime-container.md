@@ -219,7 +219,9 @@ Legion mounts the whole directory, never individual files. The worker
 replaces rendered files atomically by renaming them. A rename shows up through
 a directory bind mount, but a per-file bind mount silently keeps the old file
 (a well-known Docker pitfall, where the container holds on to the stale
-inode). Because of this, a KV re-render or token rotation reaches a running
+inode). Because of this, a token rotation, or a KV file declared with
+`onChange = "update"` (see
+[Live file updates](kv-store.md#live-file-updates)), reaches a running
 container without a restart or any extra projection machinery.
 
 The mount is added *before* declared `volumes[]`, so a job can intentionally

@@ -1042,10 +1042,14 @@ async fn heartbeat_tick(
         // Config-file templates, rendered from the same feed; written before
         // any launch below so a task starts with its files in place.
         apply_templates(task_manager, &reply).await;
+        // KV files marked `onChange = "update"`, rewritten under running
+        // allocations whose rendered content moved.
+        apply_live_kv_files(task_manager, &reply);
         // Same authority for network policy: assignments from this reply,
         // bodies fetched by hash, last known good kept on any failure.
         apply_net_policies(forwarder, &mut client_clone, credentials, name, &reply).await;
         apply_mesh_identity(forwarder, &mut client_clone, credentials, name).await;
+        apply_ingress_certificates(forwarder, &mut client_clone, credentials, name, &reply).await;
         *LAST_DESIRED.lock().unwrap_or_else(|p| p.into_inner()) = reply.desired_allocations.clone();
         persist_datapath(forwarder, &reply);
         // Allocations whose launch was dispatched this tick. Their refresh
@@ -1405,6 +1409,78 @@ async fn restore_datapath_from(
     );
 }
 
+/// Rewrite the `onChange = "update"` KV files of running allocations
+/// (docs/kv-store.md, "Live file updates"), then apply each allocation's
+/// strongest `changeMode`: one in-place restart, or each distinct signal once,
+/// after a random delay of up to the largest `splay` among the changed files.
+/// Allocations that have not started yet are skipped: their start writes the
+/// files from the same payload.
+fn apply_live_kv_files(task_manager: &Arc<Mutex<WorkerTaskManager>>, reply: &HeartbeatReply) {
+    use crate::structs::workload_identity::ChangeMode;
+    for allocation in &reply.desired_allocations {
+        // Cheap filter: almost no task config carries the marker.
+        if !allocation.task_config.contains("\"liveUpdate\"") {
+            continue;
+        }
+        let Ok(config) = serde_json::from_str::<serde_json::Value>(&allocation.task_config) else {
+            continue;
+        };
+        let Some(files) = config.get("files").and_then(serde_json::Value::as_array) else {
+            continue;
+        };
+        let applied = task_manager
+            .lock()
+            .expect("task manager")
+            .apply_live_files(allocation.allocation_id, files);
+        if applied.is_empty() {
+            continue;
+        }
+        let splay = applied
+            .iter()
+            .filter_map(|marker| marker.splay.as_deref())
+            .filter_map(|splay| crate::structs::netpolicy::parse_duration(splay).ok())
+            .max()
+            .unwrap_or_default();
+        let restart = applied
+            .iter()
+            .any(|marker| marker.change_mode == ChangeMode::Restart);
+        let mut signals: Vec<String> = applied
+            .iter()
+            .filter(|marker| marker.change_mode == ChangeMode::Signal)
+            .filter_map(|marker| marker.change_signal.clone())
+            .collect();
+        signals.sort();
+        signals.dedup();
+        if !restart && signals.is_empty() {
+            continue;
+        }
+        let task_manager = task_manager.clone();
+        let allocation_id = allocation.allocation_id;
+        tokio::spawn(async move {
+            if !splay.is_zero() {
+                let jitter = rand::random::<u64>() % (splay.as_millis().max(1) as u64);
+                tokio::time::sleep(std::time::Duration::from_millis(jitter)).await;
+            }
+            let mut manager = task_manager.lock().expect("task manager");
+            let local = manager.local_key(allocation_id);
+            // A restart re-reads every file anyway, so it subsumes signals.
+            let results = if restart {
+                vec![manager.restart_allocation(local)]
+            } else {
+                signals
+                    .iter()
+                    .map(|signal| manager.signal_allocation(local, signal))
+                    .collect()
+            };
+            for result in results {
+                if let Err(err) = result {
+                    warn!(allocation_id, error = ?err, "Live KV file change action failed");
+                }
+            }
+        });
+    }
+}
+
 /// Templates rendered on this node (docs/service-discovery.md, "Templates").
 static TEMPLATES: LazyLock<crate::worker::templates::TemplateEngine> =
     LazyLock::new(crate::worker::templates::TemplateEngine::new);
@@ -1563,6 +1639,88 @@ async fn apply_mesh_identity(
             message = status.message(),
             "Failed to issue the mesh node certificate; keeping the current one"
         ),
+    }
+}
+
+/// Keep `certFrom = { kv }` ingress certificates current
+/// (docs/network-handlers.md, "Certificates from KV"): one
+/// `GetIngressCertificates` call per heartbeat, only while an allocation on
+/// the node has such a chain, carrying the KV version already held so an
+/// unchanged certificate costs no material. Fail-static: a failed call or a
+/// bad bundle keeps the certificate in hand and only records the problem.
+async fn apply_ingress_certificates(
+    forwarder: &UpstreamForwarder,
+    client: &mut ManagerClient<Channel>,
+    credentials: &Arc<WorkerCredentials>,
+    node_id: &str,
+    reply: &HeartbeatReply,
+) {
+    use crate::worker::netd::PolicyLookup;
+    let context = forwarder.context();
+    let Some(cache) = context.cache() else {
+        return;
+    };
+    let known: Vec<crate::structs::IngressCertificateKnown> = reply
+        .desired_allocations
+        .iter()
+        .filter(|allocation| {
+            cache
+                .policy_for(allocation.allocation_id)
+                .and_then(|policy| policy.ingress.as_ref()?.tls.clone())
+                .is_some_and(|tls| tls.cert_kv_path().is_some())
+        })
+        .map(|allocation| crate::structs::IngressCertificateKnown {
+            allocation_id: allocation.allocation_id,
+            version: context.kv_cert_version(allocation.allocation_id),
+        })
+        .collect();
+    if known.is_empty() {
+        return;
+    }
+    let request = credentials.attach(tonic::Request::new(
+        crate::structs::GetIngressCertificatesRequest {
+            node_id: node_id.to_string(),
+            known,
+        },
+    ));
+    let certificates = match client.get_ingress_certificates(request).await {
+        Ok(response) => response.into_inner().certificates,
+        Err(status) => {
+            warn!(
+                code = ?status.code(),
+                message = status.message(),
+                "Failed to fetch ingress certificates; keeping the current ones"
+            );
+            return;
+        }
+    };
+    for certificate in certificates {
+        let allocation_id = certificate.allocation_id;
+        if !certificate.error.is_empty() {
+            context.set_kv_cert_error(allocation_id, certificate.error);
+            continue;
+        }
+        if certificate.unchanged {
+            context.clear_kv_cert_error(allocation_id);
+            continue;
+        }
+        match crate::worker::netd::tls::KvCertificate::from_bundle(
+            &certificate.kv_path,
+            certificate.version,
+            &certificate.bundle_pem,
+        ) {
+            Ok(cert) => {
+                context.set_kv_cert(allocation_id, cert);
+                info!(
+                    allocation_id,
+                    kv_path = %certificate.kv_path,
+                    version = certificate.version,
+                    "Installed ingress certificate from KV"
+                );
+            }
+            Err(err) => context
+                .set_kv_cert_error(allocation_id, format!("kv {} {err:#}", certificate.kv_path)),
+        }
     }
 }
 
@@ -1894,6 +2052,11 @@ fn net_status(
         let (tls_ready, tls_error) = forwarder.context().ingress_tls_status(id);
         if !tls_ready {
             problems.push(format!("ingress TLS: {tls_error}"));
+        } else if !tls_error.is_empty() {
+            // A rejected KV renewal while the previous certificate serves.
+            problems.push(format!(
+                "ingress TLS: serving the previous certificate; {tls_error}"
+            ));
         }
         problems.extend(TEMPLATES.problems(id));
         if network.ingress_tls.as_deref() == Some("legion")
@@ -2266,6 +2429,112 @@ mod tests {
         // exact shape of a manager partition.
         let channel = Channel::from_static("http://127.0.0.1:1").connect_lazy();
         ManagerClient::new(channel)
+    }
+
+    /// A heartbeat whose `onChange = "update"` file content moved rewrites
+    /// the file under the running process with its mode, signals it, and
+    /// leaves the stored config holding the new content; an unmarked file
+    /// that changed is left for the next start.
+    #[tokio::test]
+    async fn live_kv_files_are_rewritten_and_signal_the_running_task_test() -> R<()> {
+        let dir = TempDir::new()?;
+        let task_manager = Arc::new(Mutex::new(WorkerTaskManager::with_state_store(
+            WorkerStateStore::new(dir.path().join("worker_state.json")),
+        )));
+        task_manager.lock().unwrap().load_builtin_plugins();
+        let pem = dir.path().join("tls/bundle.pem");
+        let other = dir.path().join("other.conf");
+        let hup = dir.path().join("got-hup");
+        let file = |path: &std::path::Path, content: &str, live: bool| {
+            let mut entry =
+                json!({ "path": path.display().to_string(), "mode": "0400", "content": content });
+            if live {
+                entry["liveUpdate"] = json!({ "changeMode": "signal", "changeSignal": "SIGHUP" });
+            }
+            entry
+        };
+        let config = |pem_content: &str, other_content: &str| {
+            json!({
+                "command": ["sh", "-c", format!(
+                    "trap 'touch {}' HUP; for i in $(seq 1 100); do sleep 0.1; done",
+                    hup.display()
+                )],
+                "files": [file(&pem, pem_content, true), file(&other, other_content, false)],
+            })
+        };
+        let allocation = crate::structs::Allocation {
+            id: 41,
+            status: "running".into(),
+            resources: json!({}),
+            node_id: "node-1".into(),
+            job_config_id: "job-1".into(),
+            task_config_id: 1,
+            job_id: "web".into(),
+            instance_id: None,
+            network: None,
+        };
+        let task = crate::structs::TaskConfig {
+            config: config("old", "old"),
+            ..crate::structs::TaskConfig::new("server", "exec")
+        };
+        task_manager
+            .lock()
+            .unwrap()
+            .run_allocation(&allocation, &task)?;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(std::fs::read_to_string(&pem)?, "old");
+
+        let reply = HeartbeatReply {
+            desired_allocations: vec![TaskAllocation {
+                allocation_id: 41,
+                job_id: "web".into(),
+                task_name: "server".into(),
+                task_runtime: "exec".into(),
+                task_config: config("new", "new").to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        apply_live_kv_files(&task_manager, &reply);
+
+        assert_eq!(std::fs::read_to_string(&pem)?, "new");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&pem)?.permissions().mode() & 0o777, 0o400);
+        }
+        assert_eq!(
+            std::fs::read_to_string(&other)?,
+            "old",
+            "unmarked files wait for a start"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !hup.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "task never observed SIGHUP"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        // A restart would re-materialize the stored config: it holds the
+        // new content for the live file, the old one for the other.
+        let stored = task_manager
+            .lock()
+            .unwrap()
+            .task_config(41)
+            .context("stored task config")?
+            .config["files"]
+            .clone();
+        assert_eq!(stored[0]["content"], "new");
+        assert_eq!(stored[1]["content"], "old");
+
+        // The same reply again is a no-op: nothing rewritten, no signal.
+        std::fs::remove_file(&hup)?;
+        apply_live_kv_files(&task_manager, &reply);
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(!hup.exists());
+        task_manager.lock().unwrap().reconcile_allocations(&[]);
+        Ok(())
     }
 
     /// Regression: heartbeat failures used to `?`-exit the loop, leaving

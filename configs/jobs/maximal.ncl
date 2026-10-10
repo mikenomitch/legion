@@ -218,11 +218,15 @@
                     ],
                     # TLS on the advertised port. server | mutual with
                     # certFrom = "legion" (the node's mesh certificate; peers
-                    # verified against the mesh CA with clientCa = "legion")
-                    # or certPath/keyPath (+ clientCa bundle) for your own PKI.
+                    # verified against the mesh CA with clientCa = "legion"),
+                    # certFrom = { kv = "<path>" } (a PEM bundle in KV: the
+                    # chain, then the key; swapped live on `kv put`, and the
+                    # submitter needs kv read on the path), or
+                    # certPath/keyPath (+ clientCa bundle) for your own PKI.
                     tls = {
                         mode = "off",          # off | server | mutual
                         # certFrom = "legion",
+                        # certFrom = { kv = "certs/web.example.com" },
                         # clientCa = "legion",
                         # requireIdentity = ["auto:web:*"],
                     },
@@ -362,6 +366,23 @@
                     file = {
                         template = "tenant={{ kv \"tenant/id\" }}\n",
                     },
+                },
+                # onChange = "update" (files only): rewrite the file under the
+                # running task instead of replacing the allocation, then apply
+                # changeMode: noop (default) | signal (+ changeSignal) |
+                # restart (in place). splay spreads a fleet's reloads.
+                {
+                    path = "/tmp/legion/tls/bundle.pem",
+                    mode = "0400",
+                    file = {
+                        template = "{{ kv \"certs/web.example.com\" }}",
+                    },
+                    kv = {
+                        onChange = "update",
+                    },
+                    changeMode = "signal",
+                    changeSignal = "SIGHUP",
+                    splay = "10s",
                 },
             ],
             resources = {

@@ -160,6 +160,7 @@ fn endpoint_table() -> Vec<(&'static str, Plane)> {
         ("ExecAllocation", Plane::Protected("exec:write")),
         ("ListJobActions", Plane::Protected("job:read")),
         ("GetArtifactCredential", Plane::Worker),
+        ("GetIngressCertificates", Plane::Worker),
         ("ListEvents", Plane::Protected("operator:read")),
         ("StreamEvents", Plane::Protected("operator:read")),
         ("WhoAmI", Plane::Open),
@@ -984,6 +985,16 @@ async fn call_endpoint(
             ))
             .await
             .map(|_| ()),
+        "GetIngressCertificates" => svc
+            .get_ingress_certificates(req(
+                GetIngressCertificatesRequest {
+                    node_id: NODE_ID.into(),
+                    known: Vec::new(),
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
         "ListEvents" => svc
             .list_events(req(ListEventsRequest::default(), token))
             .await
@@ -1661,6 +1672,7 @@ async fn worker_plane_binds_node_ids_to_the_caller() -> R<()> {
         "HealthCheck",
         "FetchNetPolicy",
         "GetArtifactCredential",
+        "GetIngressCertificates",
         "RatifyClaim",
     ] {
         let status = call_endpoint(&svc, &fixtures, method, Some(&intruder))
@@ -2198,6 +2210,79 @@ async fn kv_path_scoped_policy_limits_kv_access() -> R<()> {
             .map(|entry| &entry.key)
             .collect::<Vec<_>>(),
     );
+    Ok(())
+}
+
+/// `certFrom = { kv }` hands a KV value to the datapath, so naming one in a
+/// job needs `kv:read` on that path: job-write access alone must not be a way
+/// to read private keys.
+#[tokio::test]
+async fn kv_backed_ingress_cert_needs_kv_read_on_the_path() -> R<()> {
+    let (svc, _fixtures, _) = setup_enabled()?;
+    let authenticator = svc.auth.clone();
+    svc.store.upsert_acl_policy(
+        "deployer",
+        "",
+        r#"[{"resources": ["job"], "actions": ["read", "write"]}]"#,
+    )?;
+    svc.store.upsert_acl_policy(
+        "cert-reader",
+        "",
+        r#"[{"resources": ["kv"], "actions": ["read"], "paths": ["certs/*"]}]"#,
+    )?;
+    let (_, deployer) = authenticator
+        .mint_token(&svc.store, "deployer", "client", &["deployer".into()], None)
+        .map_err(|s| anyhow!(s.to_string()))?;
+    let (_, trusted) = authenticator
+        .mint_token(
+            &svc.store,
+            "trusted-deployer",
+            "client",
+            &["deployer".into(), "cert-reader".into()],
+            None,
+        )
+        .map_err(|s| anyhow!(s.to_string()))?;
+
+    let run = |token: String| {
+        let jobspec = serde_json::json!({
+            "name": "edge",
+            "task": {
+                "runtime": "exec",
+                "config": { "command": ["sleep", "30"] },
+                "network": {
+                    "ports": [{ "name": "https", "static": 8443 }],
+                    "ingress": { "tls": { "mode": "server", "certFrom": { "kv": "certs/edge" } } },
+                },
+            },
+        });
+        let svc = &svc;
+        async move {
+            svc.run_job(req(
+                RunJobRequest {
+                    parsed_jobspec: jobspec.to_string(),
+                    submissions: Vec::new(),
+                    priority: None,
+                    force_reschedule: false,
+                    idempotency_key: None,
+                },
+                Some(&token),
+            ))
+            .await
+        }
+    };
+
+    let status = run(deployer)
+        .await
+        .expect_err("job:write alone must not name a KV certificate");
+    assert_eq!(status.code(), Code::PermissionDenied);
+    assert!(
+        status.message().contains("certs/edge"),
+        "{}",
+        status.message()
+    );
+    run(trusted)
+        .await
+        .expect("kv:read on the path allows naming it");
     Ok(())
 }
 
