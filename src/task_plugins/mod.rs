@@ -802,11 +802,17 @@ impl LoadedTaskPlugin {
     fn new(plugin: Box<dyn TaskPlugin>, lib: Option<Library>) -> Self {
         Self { plugin, _lib: lib }
     }
+
+    pub fn task_plugin(&self) -> &dyn TaskPlugin {
+        self.plugin.as_ref()
+    }
 }
 
 #[derive(Default)]
 pub struct TaskPluginRegistry {
-    plugins: HashMap<String, LoadedTaskPlugin>,
+    // `Arc` so a caller can hold a plugin (and, through it, the dylib that
+    // backs it) while it works without the registry's owner locked.
+    plugins: HashMap<String, Arc<LoadedTaskPlugin>>,
 }
 
 impl TaskPluginRegistry {
@@ -823,12 +829,18 @@ impl TaskPluginRegistry {
         if run_setup {
             plugin.plugin.setup()?;
         }
-        self.plugins.insert(runtime.to_string(), plugin);
+        self.plugins.insert(runtime.to_string(), Arc::new(plugin));
         Ok(())
     }
 
     pub fn plugin(&self, runtime: &str) -> Option<&dyn TaskPlugin> {
         self.plugins.get(runtime).map(|entry| entry.plugin.as_ref())
+    }
+
+    /// A shared handle to a loaded plugin, for slow runtime calls (`prepare`,
+    /// `start`) made after the registry's owner has been unlocked.
+    pub fn plugin_handle(&self, runtime: &str) -> Option<Arc<LoadedTaskPlugin>> {
+        self.plugins.get(runtime).cloned()
     }
 
     pub fn readiness_checks(&self) -> Map<String, Value> {

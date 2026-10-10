@@ -158,6 +158,94 @@ pub enum BeginOutcome {
     /// `staging artifacts` and the caller must run the staging job on a
     /// blocking thread (see [`launch_task_allocation`]).
     Staging(Box<StagingJob>),
+    /// No artifacts, ordinary gate: the allocation is registered and the
+    /// caller must finish the launch with [`complete_unlocked_launch`], off
+    /// this lock (see [`launch_task_allocation`]).
+    Launching(Box<UnlockedLaunch>),
+    /// The same allocation is already being launched (or torn down after a
+    /// cancelled launch). Nothing to do: if the manager still wants it once
+    /// that settles, the next heartbeat's reconcile launches it.
+    InFlight,
+}
+
+/// A launch whose slow half (volume mounts, the runtime's `prepare` and
+/// `start`, which for some runtimes pulls an image) runs with the
+/// task-manager lock released.
+///
+/// The heartbeat loop and the self-fence watchdog both need that lock. A
+/// launch that held it through a slow pull or attach would stall heartbeats
+/// past the lost window, get the node marked lost, and have its stateless
+/// work replaced elsewhere while it kept running here.
+///
+/// The allocation is registered before the lock is released (a pid-less
+/// placeholder in `instances`, plus `launching`), so the reconcile treats it
+/// as present and never starts it twice. A stop or failure that lands
+/// meanwhile only cancels it; the launch thread tears it down once the
+/// runtime call returns.
+pub struct UnlockedLaunch {
+    generation: u64,
+    allocation: Allocation,
+    task: TaskConfig,
+    instance: TaskInstance,
+    plugin: Arc<crate::task_plugins::LoadedTaskPlugin>,
+    volumes: Arc<WorkerVolumeManager>,
+    volume_specs: Vec<VolumeMount>,
+}
+
+impl UnlockedLaunch {
+    /// The slow half: mount, consume artifacts, `prepare`, `start`. Called
+    /// with no lock held.
+    fn run(&mut self) -> R<()> {
+        let plugin = self.plugin.task_plugin();
+        // Storage first: a task must never observe a missing or empty data
+        // directory because its volume was still being mounted.
+        if !self.volume_specs.is_empty() {
+            self.volumes.unmount_for_allocation(self.allocation.id);
+            let volume_instance =
+                crate::worker::volumes::instance_ref_from_task(&self.allocation, &self.task);
+            let mounted = self.volumes.mount_for_allocation(
+                &self.allocation,
+                volume_instance.as_ref(),
+                &self.volume_specs,
+            )?;
+            apply_mounted_volumes(&mut self.instance, &self.task, &mounted);
+        }
+        let staged = self.instance.staged_artifacts.clone();
+        for artifact in &staged {
+            plugin
+                .consume_artifact(artifact, &mut self.instance)
+                .with_context(|| {
+                    format!(
+                        "consume artifact {} for task {}",
+                        artifact.name.as_deref().unwrap_or("<unnamed>"),
+                        self.task.name
+                    )
+                })?;
+        }
+        info!(
+            allocation_id = self.allocation.id,
+            task_name = %self.task.name,
+            "Preparing task allocation"
+        );
+        plugin.prepare(&self.allocation, &self.task, &mut self.instance)?;
+        info!(
+            allocation_id = self.allocation.id,
+            task_name = %self.task.name,
+            "Starting task allocation"
+        );
+        plugin.start(&self.allocation, &self.task, &mut self.instance)
+    }
+}
+
+/// How [`WorkerTaskManager::finish_unlocked_launch`] settled a launch.
+enum LaunchFinish {
+    Started(Box<(Allocation, TaskConfig)>),
+    /// The runtime failed; the failure is already recorded.
+    Failed(String),
+    /// Stopped or failed while the runtime worked; the caller must tear it
+    /// down without the lock, then call
+    /// [`WorkerTaskManager::finish_cancelled_launch`].
+    Cancelled(Box<UnlockedLaunch>),
 }
 
 pub struct WorkerTaskManager {
@@ -254,6 +342,16 @@ pub struct WorkerTaskManager {
     /// with `resourceEnforcement.enabled`, in which case it governs every
     /// runtime that opted into the enforcement interface.
     resources: NodeResourceGovernor,
+    /// Allocations whose runtime `prepare`/`start` is running on a launch
+    /// thread without this lock held, keyed to the launch's generation (see
+    /// [`UnlockedLaunch`]). While listed, the allocation sits in `instances`
+    /// as a pid-less placeholder, exactly like one that is staging artifacts.
+    launching: HashMap<i64, u64>,
+    /// Launches stopped or failed while their runtime was still working.
+    /// The launch thread tears them down when the runtime call returns, and
+    /// the id cannot be launched again until it has.
+    cancelled_launches: std::collections::HashSet<i64>,
+    next_launch_generation: u64,
 }
 
 impl Default for WorkerTaskManager {
@@ -314,6 +412,9 @@ impl WorkerTaskManager {
             claims: ClaimTable::new(),
             ledger: LocalLedger::default(),
             resources: NodeResourceGovernor::from_env(),
+            launching: HashMap::new(),
+            cancelled_launches: std::collections::HashSet::new(),
+            next_launch_generation: 0,
         }
     }
 
@@ -888,7 +989,13 @@ impl WorkerTaskManager {
         if let Some(monitor) = self.health_monitors.remove(&allocation_id) {
             monitor.shutdown();
         }
-        if let (Some(allocation), Some(task)) = (
+        // A launch still inside its runtime call is cancelled rather than
+        // destroyed here: its launch thread owns the real instance and tears
+        // it down (runtime, volumes, cores) once the call returns.
+        let launching = self.launching.remove(&allocation_id).is_some();
+        if launching {
+            self.cancelled_launches.insert(allocation_id);
+        } else if let (Some(allocation), Some(task)) = (
             self.allocations.get(&allocation_id),
             self.task_configs.get(&allocation_id),
         ) {
@@ -905,12 +1012,14 @@ impl WorkerTaskManager {
                 }
             }
         }
-        self.volumes.unmount_for_allocation(allocation_id);
-        let assignment = self
-            .instances
-            .get(&allocation_id)
-            .and_then(|instance| instance.resource_assignment.clone());
-        self.resources.release(allocation_id, assignment.as_ref());
+        if !launching {
+            self.volumes.unmount_for_allocation(allocation_id);
+            let assignment = self
+                .instances
+                .get(&allocation_id)
+                .and_then(|instance| instance.resource_assignment.clone());
+            self.resources.release(allocation_id, assignment.as_ref());
+        }
         self.volume_specs.remove(&allocation_id);
         self.instances.remove(&allocation_id);
         self.allocations.remove(&allocation_id);
@@ -1068,6 +1177,7 @@ impl WorkerTaskManager {
                 !self.instances.contains_key(&local)
                     && !self.terminating.contains_key(&local)
                     && !self.draining.contains_key(&local)
+                    && !self.cancelled_launches.contains(&local)
             })
             .cloned()
             .collect();
@@ -1154,6 +1264,21 @@ impl WorkerTaskManager {
         self.terminated.remove(&allocation_id);
         self.restart_history.remove(&allocation_id);
         self.artifact_status.remove(allocation_id);
+
+        if self.launching.remove(&allocation_id).is_some() {
+            // Its runtime is mid-`prepare`/`start` on a launch thread. Tearing
+            // down storage under it now would race that call, so leave the
+            // teardown to the launch thread, which sees the cancellation as
+            // soon as the runtime returns.
+            info!(
+                allocation_id,
+                cause = %cause,
+                "Cancelling allocation launch in progress"
+            );
+            self.cancelled_launches.insert(allocation_id);
+            self.persist_state();
+            return Ok(());
+        }
 
         let (Some(allocation), Some(task), Some(mut instance)) = (allocation, task, instance)
         else {
@@ -1637,7 +1762,7 @@ impl WorkerTaskManager {
         // directory because its volume was still being mounted. A failure here
         // fails the allocation, which is the honest outcome — the manager
         // reschedules and the operator sees the driver's error.
-        self.mount_allocation_volumes(allocation)?;
+        self.mount_allocation_volumes(allocation, task)?;
 
         // Resource placement next, and before `prepare()`: a task must never
         // observe its CPU/memory limits arriving after it started. Runtimes
@@ -2000,6 +2125,16 @@ impl WorkerTaskManager {
         gate: Gate,
     ) -> R<BeginOutcome> {
         let (alloc, task) = task_from_allocation(allocation)?;
+        // A duplicate dispatch (heartbeat and push racing) of an allocation
+        // whose launch is still in its runtime call. Launching it again would
+        // start it twice; tearing the first one down would waste the work.
+        if self.launching.contains_key(&alloc.id) || self.cancelled_launches.contains(&alloc.id) {
+            debug!(
+                allocation_id = alloc.id,
+                "Allocation launch already in flight; ignoring the duplicate dispatch"
+            );
+            return Ok(BeginOutcome::InFlight);
+        }
         // The manager resolved these against the volume table, so they carry
         // concrete ids and the driver attrs from previous mounts. Recorded
         // before any start path so both the direct and post-staging routes
@@ -2026,6 +2161,33 @@ impl WorkerTaskManager {
                     "Failed to stop previous instance of re-dispatched allocation"
                 );
             }
+        }
+        // Manager-dispatched work launches off the lock. Provisional starts
+        // keep the locked path: their failures settle the claim (see
+        // `launch_provisional_allocation`) rather than reaching the manager
+        // as a failed allocation, which `record_failure` would do.
+        let provisional = self.claims.by_local_key(alloc.id).is_some();
+        if task.artifacts.is_empty() && gate == Gate::Off && !provisional {
+            self.registry
+                .load_plugin(&task.runtime, true)
+                .with_context(|| format!("Failed to load task plugin {}", task.runtime))?;
+            info!(
+                allocation_id = alloc.id,
+                task_name = %task.name,
+                task_runtime = %task.runtime,
+                "Received task allocation"
+            );
+            let instance = self.prepare_instance(&alloc, &task)?;
+            let launch = self.begin_unlocked_launch(&alloc, &task, instance)?;
+            // Armed before the runtime call, like the staging path below:
+            // the at-most-one guarantee must hold for the whole launch.
+            if allocation.self_terminate_after_seconds > 0 {
+                self.set_self_fence_window(
+                    alloc.id,
+                    std::time::Duration::from_secs(allocation.self_terminate_after_seconds),
+                );
+            }
+            return Ok(BeginOutcome::Launching(Box::new(launch)));
         }
         if task.artifacts.is_empty() {
             self.run_allocation_gated(&alloc, &task, gate)?;
@@ -2115,6 +2277,43 @@ impl WorkerTaskManager {
         staged: Vec<StagedArtifact>,
         gate: Gate,
     ) -> R<()> {
+        let started_task = self.apply_staged_artifacts(allocation, task, staged)?;
+        if gate == Gate::Stage {
+            // The whole point of the `stage` gate: everything expensive is
+            // done and nothing is executing. `ratify_claim` runs the start.
+            self.prepare_registered_allocation(allocation, &started_task)?;
+            self.set_allocation_health(allocation.id, false, "staged (awaiting ratification)");
+            return Ok(());
+        }
+        self.prepare_registered_allocation(allocation, &started_task)?;
+        self.start_registered_allocation(allocation, &started_task, gate)
+    }
+
+    /// [`Self::start_staged_allocation`] for the ordinary gate, with the
+    /// runtime's `prepare`/`start` left to [`complete_unlocked_launch`] so
+    /// they run off this lock.
+    pub fn begin_staged_launch(
+        &mut self,
+        allocation: &Allocation,
+        task: &TaskConfig,
+        staged: Vec<StagedArtifact>,
+    ) -> R<UnlockedLaunch> {
+        let started_task = self.apply_staged_artifacts(allocation, task, staged)?;
+        let instance = self
+            .instances
+            .remove(&allocation.id)
+            .context("Task instance missing for staged allocation")?;
+        self.begin_unlocked_launch(allocation, &started_task, instance)
+    }
+
+    /// Hand staged artifacts to the instance: `LEGION_ARTIFACT_<NAME>` env and
+    /// `${artifact.<name>}` interpolation. Returns the task config to start.
+    fn apply_staged_artifacts(
+        &mut self,
+        allocation: &Allocation,
+        task: &TaskConfig,
+        staged: Vec<StagedArtifact>,
+    ) -> R<TaskConfig> {
         // A runtime that mounts the task dir sees staged artifacts at the
         // in-task path, not the host one — the same rule volume env already
         // follows. `${artifact.<name>}` interpolation must agree with
@@ -2158,16 +2357,125 @@ impl WorkerTaskManager {
         // names; admission already rejected unknown references.
         let mut started_task = task.clone();
         substitute_artifact_tokens(&mut started_task.config, &artifact_paths);
+        Ok(started_task)
+    }
 
-        if gate == Gate::Stage {
-            // The whole point of the `stage` gate: everything expensive is
-            // done and nothing is executing. `ratify_claim` runs the start.
-            self.prepare_registered_allocation(allocation, &started_task)?;
-            self.set_allocation_health(allocation.id, false, "staged (awaiting ratification)");
-            return Ok(());
+    /// The locked first half of an [`UnlockedLaunch`]: place the task's
+    /// CPU/memory, then register the allocation (a pid-less placeholder
+    /// instance) so nothing launches it again while its runtime works.
+    fn begin_unlocked_launch(
+        &mut self,
+        allocation: &Allocation,
+        task: &TaskConfig,
+        mut instance: TaskInstance,
+    ) -> R<UnlockedLaunch> {
+        let plugin = self
+            .registry
+            .plugin_handle(&task.runtime)
+            .context("Task plugin not loaded")?;
+        // Resource placement stays under the lock: the allocator and slice
+        // masks are this struct's, and it is quick (a cgroup mkdir and a few
+        // small writes). A task must never observe its limits arriving after
+        // it started, so it happens before `prepare`.
+        instance.resource_assignment = self
+            .resources
+            .assign(
+                allocation.id,
+                task,
+                plugin.task_plugin().resource_enforcement(),
+            )
+            .with_context(|| {
+                format!(
+                    "failed to place task {} within this node's resource limits",
+                    task.name
+                )
+            })?;
+        instance.log_dir = Some(self.state_store.allocation_log_dir(allocation.id));
+
+        self.next_launch_generation += 1;
+        let generation = self.next_launch_generation;
+        self.launching.insert(allocation.id, generation);
+        self.instances.insert(
+            allocation.id,
+            TaskInstance {
+                alloc_dir: instance.alloc_dir.clone(),
+                task_dir: instance.task_dir.clone(),
+                extra_env: instance.extra_env.clone(),
+                log_dir: instance.log_dir.clone(),
+                resource_assignment: instance.resource_assignment.clone(),
+                ..TaskInstance::default()
+            },
+        );
+        self.allocations.insert(allocation.id, allocation.clone());
+        self.task_configs.insert(allocation.id, task.clone());
+        self.set_allocation_health(allocation.id, false, "starting");
+
+        Ok(UnlockedLaunch {
+            generation,
+            allocation: allocation.clone(),
+            task: task.clone(),
+            instance,
+            plugin,
+            volumes: self.volumes.clone(),
+            volume_specs: self
+                .volume_specs
+                .get(&allocation.id)
+                .cloned()
+                .unwrap_or_default(),
+        })
+    }
+
+    /// The locked second half: install the started instance, or record why
+    /// it failed, or hand a launch that was cancelled meanwhile back for
+    /// teardown.
+    fn finish_unlocked_launch(
+        &mut self,
+        launch: UnlockedLaunch,
+        result: R<()>,
+        failure_prefix: &str,
+    ) -> LaunchFinish {
+        let allocation_id = launch.allocation.id;
+        if self.launching.get(&allocation_id) != Some(&launch.generation) {
+            return LaunchFinish::Cancelled(Box::new(launch));
         }
-        self.prepare_registered_allocation(allocation, &started_task)?;
-        self.start_registered_allocation(allocation, &started_task, gate)
+        self.launching.remove(&allocation_id);
+        let UnlockedLaunch {
+            allocation,
+            task,
+            instance,
+            plugin,
+            ..
+        } = launch;
+        // Replaces the placeholder. On failure too: `record_failure` tears
+        // down through the real instance (its mounts, cores, any process).
+        self.instances.insert(allocation_id, instance);
+        if let Err(err) = result {
+            let reason = format!("{failure_prefix}{err:#}");
+            self.record_failure(allocation_id, reason.clone());
+            return LaunchFinish::Failed(reason);
+        }
+        self.set_allocation_health(allocation_id, false, "starting");
+        self.notify_log_sinks_started(&allocation, &task);
+        self.persist_state();
+        // See `start_registered_allocation`: a batch task on a runtime that
+        // tracks no process reports its completion at start.
+        if !plugin.task_plugin().supervises_process()
+            && matches!(task.lifecycle, crate::structs::TaskLifecycle::Batch)
+        {
+            self.record_unsupervised_completion(allocation_id, &task.runtime);
+        }
+        LaunchFinish::Started(Box::new((allocation, task)))
+    }
+
+    /// Finish tearing down a cancelled launch, after its runtime instance
+    /// was destroyed without the lock held.
+    fn finish_cancelled_launch(
+        &mut self,
+        allocation_id: i64,
+        assignment: Option<&ResourceAssignment>,
+    ) {
+        self.cancelled_launches.remove(&allocation_id);
+        self.finish_teardown(allocation_id, true, assignment);
     }
 
     /// Mount the allocation's volumes and expose them to the task.
@@ -2179,7 +2487,7 @@ impl WorkerTaskManager {
     /// - `container` gets a real bind mount at the declared `path`, so its env
     ///   carries the **destination** path — the host path would be meaningless
     ///   inside the container.
-    fn mount_allocation_volumes(&mut self, allocation: &Allocation) -> R<()> {
+    fn mount_allocation_volumes(&mut self, allocation: &Allocation, task: &TaskConfig) -> R<()> {
         let Some(specs) = self.volume_specs.get(&allocation.id).cloned() else {
             return Ok(());
         };
@@ -2190,37 +2498,14 @@ impl WorkerTaskManager {
         // re-dispatch) would leak the old ones.
         self.volumes.unmount_for_allocation(allocation.id);
 
-        let task = self.task_configs.get(&allocation.id).cloned();
-        let instance = task
-            .as_ref()
-            .and_then(|task| crate::worker::volumes::instance_ref_from_task(allocation, task));
+        // The task is passed in rather than read from `task_configs`: on a
+        // first launch it is not registered there yet.
+        let instance = crate::worker::volumes::instance_ref_from_task(allocation, task);
         let mounted = self
             .volumes
             .mount_for_allocation(allocation, instance.as_ref(), &specs)?;
-
-        // Runtimes with an isolated filesystem view get volume env values that
-        // are in-task destinations (bind target / guest mount path), because
-        // the host path is unreachable from inside. Host-process runtimes
-        // (exec) get the real host path.
-        let in_task_view = task
-            .map(|task| matches!(task.runtime.as_str(), "container" | "sandbox"))
-            .unwrap_or(false);
         if let Some(instance) = self.instances.get_mut(&allocation.id) {
-            for (key, value) in volume_env(&mounted, in_task_view) {
-                instance.extra_env.insert(key, value);
-            }
-            instance.volumes = mounted
-                .iter()
-                .map(|mount| crate::task_plugins::MountedVolume {
-                    name: mount.name.clone(),
-                    mode: mount.mode,
-                    host_path: mount.host_path.clone(),
-                    path: mount.path.clone(),
-                    fs: mount.fs.clone(),
-                    fresh: mount.fresh,
-                    read_only: mount.read_only,
-                })
-                .collect();
+            apply_mounted_volumes(instance, task, &mounted);
         }
         Ok(())
     }
@@ -2387,7 +2672,7 @@ impl WorkerTaskManager {
             // re-record the ownership this process lost. A failure is logged,
             // not fatal: the process is already running, and the manager sees
             // the failed mount report and can act on it.
-            if let Err(err) = self.mount_allocation_volumes(&record.allocation) {
+            if let Err(err) = self.mount_allocation_volumes(&record.allocation, &record.task) {
                 warn!(
                     allocation_id = record.allocation.id,
                     error = ?err,
@@ -2507,7 +2792,9 @@ impl WorkerTaskManager {
             if pid.is_none() {
                 // Allocations mid-staging have no pid yet by design; anything
                 // else without a pid is worth a warning.
-                if self.artifact_status.snapshot(*allocation_id).is_none() {
+                if self.artifact_status.snapshot(*allocation_id).is_none()
+                    && !self.launching.contains_key(allocation_id)
+                {
                     warn!(
                         allocation_id = allocation_id,
                         task_name = %task.name,
@@ -2595,6 +2882,35 @@ impl WorkerTaskManager {
             warn!(error = ?err, "Failed to persist worker allocation state");
         }
     }
+}
+
+/// Expose mounted volumes to a task instance.
+///
+/// Runtimes with an isolated filesystem view get volume env values that are
+/// in-task destinations (bind target / guest mount path), because the host
+/// path is unreachable from inside. Host-process runtimes (exec) get the real
+/// host path.
+fn apply_mounted_volumes(
+    instance: &mut TaskInstance,
+    task: &TaskConfig,
+    mounted: &[crate::worker::volumes::MountedVolume],
+) {
+    let in_task_view = matches!(task.runtime.as_str(), "container" | "sandbox");
+    for (key, value) in volume_env(mounted, in_task_view) {
+        instance.extra_env.insert(key, value);
+    }
+    instance.volumes = mounted
+        .iter()
+        .map(|mount| crate::task_plugins::MountedVolume {
+            name: mount.name.clone(),
+            mode: mount.mode,
+            host_path: mount.host_path.clone(),
+            path: mount.path.clone(),
+            fs: mount.fs.clone(),
+            fresh: mount.fresh,
+            read_only: mount.read_only,
+        })
+        .collect();
 }
 
 /// A monotonic deadline as wall-clock Unix seconds, rounded up so a
@@ -2772,10 +3088,67 @@ pub fn launch_task_allocation(
             spawn_health_monitor(manager.clone(), alloc, task);
             Ok(())
         }
-        BeginOutcome::Staged(_) => Ok(()),
+        BeginOutcome::Launching(launch) => {
+            if let Some((alloc, task)) = complete_unlocked_launch(manager, *launch, "")? {
+                spawn_health_monitor(manager.clone(), alloc, task);
+            }
+            Ok(())
+        }
+        BeginOutcome::Staged(_) | BeginOutcome::InFlight => Ok(()),
         BeginOutcome::Staging(job) => {
             spawn_staging_thread(manager.clone(), *job);
             Ok(())
+        }
+    }
+}
+
+/// Run an [`UnlockedLaunch`]'s runtime calls with no lock held, then settle
+/// it under the lock. Returns the started allocation (for its health
+/// monitor), `None` when it was cancelled meanwhile, or the recorded failure.
+///
+/// Must run on a blocking thread: `prepare`/`start` shell out and may pull
+/// images.
+pub fn complete_unlocked_launch(
+    manager: &Arc<Mutex<WorkerTaskManager>>,
+    mut launch: UnlockedLaunch,
+    failure_prefix: &str,
+) -> R<Option<(Allocation, TaskConfig)>> {
+    let result = launch.run();
+    let finish = manager
+        .lock()
+        .expect("task manager")
+        .finish_unlocked_launch(launch, result, failure_prefix);
+    match finish {
+        LaunchFinish::Started(started) => Ok(Some(*started)),
+        LaunchFinish::Failed(reason) => Err(anyhow!(reason)),
+        LaunchFinish::Cancelled(mut launch) => {
+            let allocation_id = launch.allocation.id;
+            info!(
+                allocation_id,
+                task_name = %launch.task.name,
+                "Tearing down a launch that was cancelled while it started"
+            );
+            // Destroy off the lock (it shells out), then release storage and
+            // cores under it, in that order: never unmount under a live task.
+            if let Err(err) = launch.plugin.task_plugin().destroy(
+                &launch.allocation,
+                &launch.task,
+                &mut launch.instance,
+            ) {
+                warn!(
+                    allocation_id,
+                    error = ?err,
+                    "Failed to destroy a cancelled launch"
+                );
+            }
+            manager
+                .lock()
+                .expect("task manager")
+                .finish_cancelled_launch(
+                    allocation_id,
+                    launch.instance.resource_assignment.as_ref(),
+                );
+            Ok(None)
         }
     }
 }
@@ -2819,6 +3192,11 @@ pub fn launch_provisional_allocation(
                 .expect("task manager")
                 .set_claim_stage(claim_id, ClaimStage::Staged);
             Ok(())
+        }
+        // Neither is produced for a claim: its local key is fresh per
+        // admission (no duplicate), and claims keep the locked launch path.
+        BeginOutcome::InFlight | BeginOutcome::Launching(_) => {
+            bail!("provisional start {claim_id} took the unlocked launch path")
         }
         BeginOutcome::Staging(job) => {
             spawn_provisional_staging_thread(manager.clone(), *job, claim_id.to_string());
@@ -2909,7 +3287,8 @@ fn spawn_staging_thread(manager: Arc<Mutex<WorkerTaskManager>>, job: StagingJob)
                 &job.board,
             );
 
-            let started = {
+            const START_FAILED: &str = "start after artifact staging failed: ";
+            let launch = {
                 let mut guard = manager.lock().expect("task manager");
                 if !guard.is_allocation_active(allocation_id) {
                     // Stopped while staging; stop_allocation already cleaned
@@ -2917,37 +3296,45 @@ fn spawn_staging_thread(manager: Arc<Mutex<WorkerTaskManager>>, job: StagingJob)
                     debug!(allocation_id, "Allocation removed while staging artifacts");
                     return;
                 }
-                match result {
-                    Ok(staged) => {
-                        match guard.start_staged_allocation(
-                            &job.allocation,
-                            &job.task,
-                            staged,
-                            job.gate,
-                        ) {
-                            Ok(()) => true,
-                            Err(err) => {
-                                guard.record_failure(
-                                    allocation_id,
-                                    format!("start after artifact staging failed: {err:#}"),
-                                );
-                                false
-                            }
-                        }
-                    }
+                let staged = match result {
+                    Ok(staged) => staged,
                     Err(err) => {
                         guard.record_failure(
                             allocation_id,
                             format!("artifact staging failed: {err:#}"),
                         );
-                        false
+                        return;
+                    }
+                };
+                // Only the ordinary gate reaches this thread (provisional
+                // starts stage on their own), but a gated job keeps the
+                // locked path rather than silently skipping its gate.
+                if job.gate != Gate::Off {
+                    if let Err(err) =
+                        guard.start_staged_allocation(&job.allocation, &job.task, staged, job.gate)
+                    {
+                        guard.record_failure(allocation_id, format!("{START_FAILED}{err:#}"));
+                        return;
+                    }
+                    drop(guard);
+                    if job.gate != Gate::Stage {
+                        spawn_health_monitor(manager, job.allocation, job.task);
+                    }
+                    return;
+                }
+                match guard.begin_staged_launch(&job.allocation, &job.task, staged) {
+                    Ok(launch) => launch,
+                    Err(err) => {
+                        guard.record_failure(allocation_id, format!("{START_FAILED}{err:#}"));
+                        return;
                     }
                 }
             };
-            // A staged-but-not-started allocation has nothing to health
-            // check yet; the monitor starts when ratification does.
-            if started && job.gate != Gate::Stage {
-                spawn_health_monitor(manager, job.allocation, job.task);
+            // The runtime calls run here, with the lock released.
+            if let Ok(Some((allocation, task))) =
+                complete_unlocked_launch(&manager, launch, START_FAILED)
+            {
+                spawn_health_monitor(manager, allocation, task);
             }
         });
     if let Err(err) = spawned {
@@ -4298,6 +4685,150 @@ mod tests {
         Ok(())
     }
 
+    fn sleep_dispatch(allocation_id: i64) -> TaskAllocation {
+        TaskAllocation {
+            allocation_id,
+            job_id: "job".into(),
+            job_config_id: "job-1".into(),
+            node_id: "node-1".into(),
+            task_config_id: 1,
+            task_name: "exec-task".into(),
+            task_runtime: "exec".into(),
+            task_config: json!({"command": ["sleep", "30"]}).to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn take_launch(outcome: BeginOutcome) -> UnlockedLaunch {
+        match outcome {
+            BeginOutcome::Launching(launch) => *launch,
+            _ => panic!("an artifact-less dispatch must launch off the lock"),
+        }
+    }
+
+    /// Regression (audit W3): the runtime's `prepare`/`start` used to run
+    /// under the task-manager lock, starving heartbeats behind a slow image
+    /// pull or volume attach. The launch now registers the allocation, lets
+    /// the lock go for the runtime calls, and only then installs the process.
+    /// Holding the lock for the whole runtime call below proves the launch
+    /// never needs it in between.
+    #[test]
+    fn a_launch_runs_its_runtime_without_the_lock_and_never_twice() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let manager = Arc::new(Mutex::new(manager_in(&temp_dir)));
+        let dispatch = sleep_dispatch(21);
+        let launch = {
+            let mut guard = manager.lock().expect("task manager");
+            let mut launch = take_launch(guard.begin_task_allocation(&dispatch)?);
+            // Registered before the runtime runs: reported as this node's,
+            // and neither the reconcile nor a duplicate dispatch starts it.
+            assert!(guard.has_allocation(21));
+            assert_eq!(guard.allocations_snapshot(), vec![21]);
+            assert!(guard
+                .reconcile_allocations(std::slice::from_ref(&dispatch))
+                .is_empty());
+            assert!(matches!(
+                guard.begin_task_allocation(&dispatch)?,
+                BeginOutcome::InFlight
+            ));
+            // The runtime call, with the lock held by someone else.
+            let result = launch.run();
+            assert!(result.is_ok(), "{result:?}");
+            assert_eq!(guard.allocation_pid(21), None, "not installed yet");
+            drop(guard);
+            launch
+        };
+        let pid = launch.instance.pid.expect("started");
+        // Settle it the way `complete_unlocked_launch` does.
+        let finish = manager
+            .lock()
+            .expect("task manager")
+            .finish_unlocked_launch(launch, Ok(()), "");
+        assert!(matches!(finish, LaunchFinish::Started(_)));
+        let mut guard = manager.lock().expect("task manager");
+        assert_eq!(guard.allocation_pid(21), Some(pid));
+        let _ = guard.reconcile_allocations(&[]);
+        while guard.has_terminating() {
+            guard.reap_terminating();
+            thread::sleep(Duration::from_millis(20));
+        }
+        Ok(())
+    }
+
+    /// A stop that lands while the runtime is starting the task cancels the
+    /// launch: the launch thread destroys what the runtime started, and the
+    /// task is never installed as running.
+    #[test]
+    fn a_stop_during_launch_tears_the_started_task_down() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let manager = Arc::new(Mutex::new(manager_in(&temp_dir)));
+        let mut launch = take_launch(
+            manager
+                .lock()
+                .expect("task manager")
+                .begin_task_allocation(&sleep_dispatch(22))?,
+        );
+        launch.run()?;
+        let pid = launch.instance.pid.expect("started");
+        // The manager stops it before the launch settles.
+        {
+            let mut guard = manager.lock().expect("task manager");
+            let _ = guard.reconcile_allocations(&[]);
+            assert!(!guard.has_allocation(22));
+            // Held back until the teardown finishes, so it cannot be
+            // launched twice.
+            assert!(guard
+                .reconcile_allocations(&[sleep_dispatch(22)])
+                .is_empty());
+        }
+        let finish = manager
+            .lock()
+            .expect("task manager")
+            .finish_unlocked_launch(launch, Ok(()), "");
+        let LaunchFinish::Cancelled(mut cancelled) = finish else {
+            panic!("a stopped launch must come back cancelled");
+        };
+        // What `complete_unlocked_launch` does with it, minus the lock dance.
+        cancelled.plugin.task_plugin().destroy(
+            &cancelled.allocation,
+            &cancelled.task,
+            &mut cancelled.instance,
+        )?;
+        manager
+            .lock()
+            .expect("task manager")
+            .finish_cancelled_launch(22, None);
+        assert!(!pid_is_running(pid), "the started task was destroyed");
+        let mut guard = manager.lock().expect("task manager");
+        assert!(!guard.has_allocation(22));
+        assert_eq!(
+            guard.reconcile_allocations(&[sleep_dispatch(22)]).len(),
+            1,
+            "launchable again once the teardown finished"
+        );
+        Ok(())
+    }
+
+    /// The whole driver: a failed start is recorded as a failure, under the
+    /// launch's own message, and leaves nothing registered.
+    #[test]
+    fn a_failed_unlocked_launch_is_recorded_as_a_failure() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let manager = Arc::new(Mutex::new(manager_in(&temp_dir)));
+        let dispatch = TaskAllocation {
+            task_config: json!({"command": ["/nonexistent/legion-test-binary"]}).to_string(),
+            ..sleep_dispatch(23)
+        };
+        let result = launch_task_allocation(&manager, &dispatch);
+        assert!(result.is_err());
+        let mut guard = manager.lock().expect("task manager");
+        assert!(!guard.has_allocation(23));
+        let failures = guard.drain_failures();
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].allocation_id, 23);
+        Ok(())
+    }
+
     #[test]
     fn task_connect_round_trips_through_the_wire() -> R<()> {
         // The declared `connect` block and the loopback ports it was assigned
@@ -4424,6 +4955,8 @@ mod tests {
                 match other {
                     BeginOutcome::Started(..) => "started",
                     BeginOutcome::Staged(..) => "staged",
+                    BeginOutcome::Launching(..) => "launching",
+                    BeginOutcome::InFlight => "in flight",
                     BeginOutcome::Staging(..) => unreachable!(),
                 }
             ),

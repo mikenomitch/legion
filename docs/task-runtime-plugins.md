@@ -69,6 +69,26 @@ task-manager mutex. The heartbeat, the self-fence watchdog, health reporting,
 and log maintenance all need that mutex. Holding it for 30 seconds could let
 the manager declare the node lost and reschedule everything on it.
 
+`prepare()` and `start()` are different. For allocations the manager
+dispatches, the worker calls them on a launch thread with the task-manager
+mutex released, so a slow image pull or volume attach does not stall
+heartbeats. Volume mounts and `consume_artifact()` run on that thread too.
+The allocation is registered first, as a pid-less placeholder like one that
+is still staging artifacts, so the worker never launches it twice. If the
+manager stops it, or it is self-fenced, before `start()` returns, the launch
+is cancelled. The worker calls `destroy()` on whatever `start()` produced
+once it returns. Two consequences for plugin authors:
+
+- `prepare()` and `start()` may run at the same time as calls for other
+  allocations, including `stop_with()` and `destroy()`. Keep shared plugin
+  state behind your own synchronization.
+- A launch that is cancelled is destroyed without a stop notice or grace
+  window. It never reached the running set.
+
+Provisional starts ([edge boot](edge-boot.md)) and `stop_with()` /
+`destroy()` still run under the mutex. A runtime whose `destroy()` shells out
+should keep it short.
+
 The default implementation signals the tracked host process group. That works
 for any runtime that spawns one process. Override it when your runtime has its
 own shutdown protocol. For example, the `container` runtime signals the
