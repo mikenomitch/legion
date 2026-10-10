@@ -10846,7 +10846,7 @@ mod tests {
         let job = JobConfig {
             priority: Default::default(),
             name: job_name.into(),
-            tasks: vec![TaskConfig::new(&format!("{job_name}-task"), "service")],
+            tasks: vec![TaskConfig::new(format!("{job_name}-task"), "service")],
             rollout: None,
             rollout_by_group: Default::default(),
             version: None,

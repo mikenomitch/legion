@@ -765,10 +765,12 @@ mod tests {
 
         // Single topology enforces too (C-2 flipped the flag): the same
         // violation is rejected, not warned away.
-        assert!(
-            OWNERSHIP_GUARD_ENFORCES,
-            "phase C-2 flipped enforcement on everywhere; it must stay on"
-        );
+        const {
+            assert!(
+                OWNERSHIP_GUARD_ENFORCES,
+                "phase C-2 flipped enforcement on everywhere; it must stay on"
+            )
+        };
         let err = verify_changeset_ownership("guard_foreign", Lane::Control, true, &changeset)
             .expect_err("single topology must reject cross-lane writes since C-2");
         assert!(format!("{err:#}").contains("plan_submission"), "{err:#}");

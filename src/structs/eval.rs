@@ -828,7 +828,7 @@ mod tests {
             }],
             version: None,
         };
-        store.handle_job_submit(&job, &[submission.clone()])?;
+        store.handle_job_submit(&job, std::slice::from_ref(&submission))?;
         let job_config_id = store.get_job_config("web")?.id();
         let submit_eval = Eval {
             id: "e-submit".into(),
@@ -895,7 +895,7 @@ mod tests {
             }],
             ..job.clone()
         };
-        store.handle_job_submit(&v2, &[submission.clone()])?;
+        store.handle_job_submit(&v2, std::slice::from_ref(&submission))?;
         let scale = store
             .task_scale_for("web", "default", "api")?
             .context("override must survive a resubmit with unchanged count")?;

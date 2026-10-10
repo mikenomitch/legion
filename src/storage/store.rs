@@ -19035,13 +19035,15 @@ mod tests {
     #[test]
     fn a_repeated_health_check_does_not_take_the_write_path() -> R<()> {
         let store = setup_store()?;
-        let mut msg = crate::structs::NodeMsg::default();
-        msg.id = "hc-node".into();
-        msg.status = "ready".into();
-        msg.config_attrs = "{}".into();
-        msg.fingerprint_attrs = "{}".into();
-        msg.dynamic_attrs = "{}".into();
-        msg.health_checks = "{}".into();
+        let msg = crate::structs::NodeMsg {
+            id: "hc-node".into(),
+            status: "ready".into(),
+            config_attrs: "{}".into(),
+            fingerprint_attrs: "{}".into(),
+            dynamic_attrs: "{}".into(),
+            health_checks: "{}".into(),
+            ..Default::default()
+        };
         store.insert_node(msg)?;
 
         // First report is a real change and must be written.
@@ -22203,7 +22205,7 @@ mod tests {
         let job_config_id = store.get_job_config("job-candidates")?.id();
         let task_id = task_id_for(&store, "task", "job-candidates")?;
 
-        let candidates = vec!["node-a".to_string(), "node-b".to_string()];
+        let candidates = ["node-a".to_string(), "node-b".to_string()];
 
         // Nodes that have never held an allocation have no epoch row; the
         // batched read must report the same 0 the per-scope read does, because
@@ -27484,7 +27486,11 @@ mod tests {
             name: "tpl".into(),
             version: 1,
         };
-        store.handle_job_submit_from_template(&config, &[submission.clone()], &provenance)?;
+        store.handle_job_submit_from_template(
+            &config,
+            std::slice::from_ref(&submission),
+            &provenance,
+        )?;
 
         assert_eq!(
             store.job_template_provenance("tpl-job")?,
@@ -28024,7 +28030,7 @@ mod tests {
         assert!(
             src.cached_allocations_by_node()?
                 .get("node-a")
-                .map_or(true, |allocs| allocs.is_empty()),
+                .is_none_or(|allocs| allocs.is_empty()),
             "no allocation cached during capture"
         );
 
@@ -28271,7 +28277,7 @@ mod tests {
             store
                 .cached_allocations_by_node()?
                 .get("node-b")
-                .map_or(true, Vec::is_empty),
+                .is_none_or(Vec::is_empty),
             "node-b's only allocation was removed"
         );
 

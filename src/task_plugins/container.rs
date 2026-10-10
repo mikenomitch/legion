@@ -1180,7 +1180,7 @@ mod tests {
 
     #[test]
     fn container_plugin_validates_schema() -> R<()> {
-        let plugin = ContainerTaskPlugin::default();
+        let plugin = ContainerTaskPlugin;
         let config = json!({
             "image": "alpine",
             "command": ["echo", "ok"]
@@ -1392,7 +1392,7 @@ mod tests {
     #[test]
     #[ignore = "requires Apple `container` (macOS) + network"]
     fn apple_container_runs_and_captures_logs() -> R<()> {
-        let plugin = ContainerTaskPlugin::default();
+        let plugin = ContainerTaskPlugin;
         let allocation = alloc_with_id(9001);
         let mut task = container_task(
             "logtest",
@@ -1440,7 +1440,7 @@ mod tests {
     #[test]
     #[ignore = "requires Apple `container` (macOS) + network"]
     fn apple_container_stop_kills_running_container() -> R<()> {
-        let plugin = ContainerTaskPlugin::default();
+        let plugin = ContainerTaskPlugin;
         let allocation = alloc_with_id(9002);
         let name = container_name(&allocation);
         let task = container_task("stoptest", json!(["/bin/sleep", "120"]));
@@ -1485,7 +1485,7 @@ mod tests {
     #[test]
     #[ignore = "requires an OCI runtime (youki/runc/crun) + network"]
     fn oci_runtime_runs_container_and_captures_logs() -> R<()> {
-        let plugin = ContainerTaskPlugin::default();
+        let plugin = ContainerTaskPlugin;
         let allocation = alloc_with_id(9003);
         // Also proves the host's DNS files are bind-mounted in (host networking
         // is useless without resolver config) and that env reaches the task.
@@ -1534,7 +1534,7 @@ mod tests {
     #[ignore = "requires an OCI runtime (youki/runc/crun) + network"]
     fn oci_runtime_stop_kills_running_container() -> R<()> {
         let binary = std::env::var(OCI_RUNTIME_ENV).unwrap_or_else(|_| DEFAULT_OCI_RUNTIME.into());
-        let plugin = ContainerTaskPlugin::default();
+        let plugin = ContainerTaskPlugin;
         let allocation = alloc_with_id(9004);
         let name = container_name(&allocation);
         let task = container_task("stoptest", json!(["/bin/sleep", "60"]));
@@ -1649,7 +1649,7 @@ mod tests {
         }
         .supports_exec());
 
-        let support = ContainerTaskPlugin::default().exec_support();
+        let support = ContainerTaskPlugin.exec_support();
         // Detection succeeds on both supported operating systems; the report
         // is only false on an OS with no container runtime at all.
         let detected = ContainerRuntime::detect().is_ok();
@@ -1909,7 +1909,7 @@ mod tests {
     #[ignore = "requires an OCI runtime (youki/runc/crun) + network"]
     fn oci_runtime_stop_lets_a_trapping_container_drain() -> R<()> {
         let binary = std::env::var(OCI_RUNTIME_ENV).unwrap_or_else(|_| DEFAULT_OCI_RUNTIME.into());
-        let plugin = ContainerTaskPlugin::default();
+        let plugin = ContainerTaskPlugin;
         let allocation = alloc_with_id(9007);
         let name = container_name(&allocation);
         let mut task = container_task(
@@ -1963,7 +1963,7 @@ mod tests {
     #[ignore = "requires an OCI runtime (youki/runc/crun) + network"]
     fn oci_runtime_stop_force_kills_at_the_deadline() -> R<()> {
         let binary = std::env::var(OCI_RUNTIME_ENV).unwrap_or_else(|_| DEFAULT_OCI_RUNTIME.into());
-        let plugin = ContainerTaskPlugin::default();
+        let plugin = ContainerTaskPlugin;
         let allocation = alloc_with_id(9008);
         let name = container_name(&allocation);
         let mut task = container_task(
@@ -2016,7 +2016,7 @@ mod tests {
     fn oci_runtime_exec_runs_inside_the_container() -> R<()> {
         use std::io::Read;
 
-        let plugin = ContainerTaskPlugin::default();
+        let plugin = ContainerTaskPlugin;
         let allocation = alloc_with_id(9005);
         let mut task = container_task("exectest", json!(["/bin/sleep", "60"]));
         task.config["env"] = json!({ "TASK_MARKER": "from-task" });
@@ -2060,7 +2060,7 @@ mod tests {
     fn oci_runtime_exec_supports_a_tty_session() -> R<()> {
         use std::io::Read;
 
-        let plugin = ContainerTaskPlugin::default();
+        let plugin = ContainerTaskPlugin;
         let allocation = alloc_with_id(9006);
         let task = container_task("ttytest", json!(["/bin/sleep", "60"]));
 
@@ -2100,7 +2100,7 @@ mod tests {
     #[test]
     #[ignore = "requires an OCI runtime + cgroup v2 + root"]
     fn oci_runtime_enforces_a_declared_memory_limit() -> R<()> {
-        let plugin = ContainerTaskPlugin::default();
+        let plugin = ContainerTaskPlugin;
         let allocation = alloc_with_id(9009);
         let mut task = container_task(
             "oomtest",
@@ -2145,7 +2145,7 @@ mod tests {
     #[test]
     #[ignore = "requires an OCI runtime + cgroup v2 + root"]
     fn oci_runtime_pins_a_container_to_its_assigned_cores() -> R<()> {
-        let plugin = ContainerTaskPlugin::default();
+        let plugin = ContainerTaskPlugin;
         let allocation = alloc_with_id(9010);
         let mut task = container_task(
             "pintest",
@@ -2190,7 +2190,7 @@ mod tests {
     fn oci_runtime_sees_task_dir_files_and_their_rewrites() -> R<()> {
         use std::io::Read;
 
-        let plugin = ContainerTaskPlugin::default();
+        let plugin = ContainerTaskPlugin;
         let allocation = alloc_with_id(9011);
         let mut task = container_task("filetest", json!(["/bin/sleep", "60"]));
         task.config["files"] = json!([{

@@ -7536,7 +7536,7 @@ mod tests {
                 .map(|index| TaskConfig {
                     group: format!("group-{index}"),
                     resources: json!({ "memory": 1024 }),
-                    ..TaskConfig::new(&format!("task-{index}"), "noop")
+                    ..TaskConfig::new(format!("task-{index}"), "noop")
                 })
                 .collect();
             let job_config_id = submit_job(&store, "quality", tasks)?;

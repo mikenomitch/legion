@@ -4288,7 +4288,7 @@ mod tests {
             allocation_id: 6,
             ..Default::default()
         };
-        let launch = manager.reconcile_allocations(&[preemptor.clone()]);
+        let launch = manager.reconcile_allocations(std::slice::from_ref(&preemptor));
         assert!(
             launch.is_empty(),
             "the preemptor must not start while the victim is still running"
