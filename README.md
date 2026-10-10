@@ -189,7 +189,9 @@ Legion also finished a 250,000-allocation burst on 50,000 nodes. Below
 saturation, a job's allocations land in about 20ms at the median, even on
 20,000 nodes. When a quarter of a 5,000-node fleet died at once, Legion
 replaced every orphaned allocation in 27 seconds, against 111 for Nomad.
-See [Benchmarks](docs/benchmarks.md) for the full tables and methodology.
+See [Benchmarks](docs/benchmarks.md) for the full tables and methodology,
+and [Why Legion is faster than Kubernetes](docs/benchmarks.md#why-legion-is-faster-than-kubernetes)
+for the architecture behind the gap.
 
 - **No etcd bottleneck.** The scheduler plans against in-memory state and
   writes to SQLite (or Raft), so throughput is not capped by a separate

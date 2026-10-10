@@ -146,6 +146,77 @@ would lower the gauge, but read those two cells as about 2% uncertain.
 all three at the load generator's process-spawn rate, and the order holds:
 Legion 311 allocations/sec, Nomad 59, Kubernetes 53.
 
+## Why Legion is faster than Kubernetes
+
+Kubernetes and Legion both keep cluster state in a replicated store and
+run a scheduler against it. Most of the gap above comes from how many
+writes and round trips each placement costs, and from the limits
+Kubernetes ships with by default. The differences below are ranked by how
+much we think each one contributes. We have not measured them one at a
+time.
+
+1. **One evaluation places a whole job.** Legion's scheduler takes a job,
+   places all of its allocations in one pass, and submits them as a single
+   plan. Kubernetes splits that work across a chain of controllers: the
+   Deployment controller creates a ReplicaSet, the ReplicaSet controller
+   creates each Pod, and the scheduler binds Pods one at a time. A
+   50-replica service is one plan in Legion and more than 100 API writes in
+   Kubernetes.
+2. **Commits are batched, and each one is cheap.** Legion's plan applier
+   folds several concurrent plans into one replicated commit, written
+   straight to its own store. In Kubernetes, every Pod creation, binding,
+   and status update makes its own trip through the API server. The API
+   server decodes the object, runs admission and validation, encodes it
+   again, writes it to etcd as its own transaction, and then serializes it
+   out to every component watching that resource. Past 10,000 nodes,
+   committing is most of Legion's plan time too, but a batch shares that
+   cost where Kubernetes pays it per object.
+3. **No client rate limits in the hot path.** Kubernetes control-plane
+   components throttle their own calls to the API server. By default
+   kube-scheduler allows 50 requests/sec and kube-controller-manager 20.
+   That alone puts a ceiling near the 50 to 120 allocations/sec we
+   measured for Kubernetes at every fleet size. Legion's scheduler writes
+   to its own store and has no equivalent throttle.
+4. **Planning runs in parallel against cheap snapshots.** Legion's eval
+   workers each plan against an in-memory snapshot of the cluster built on
+   persistent data structures, so taking one is cheap and never blocks
+   writers. Several workers plan at once, and
+   [late-binding plan apply](late-binding-plan-apply.md) catches conflicts
+   at commit time. kube-scheduler also plans from an in-memory cache, but it
+   schedules one Pod per cycle.
+5. **Indexes narrow the candidate nodes.** Kubernetes filters nodes
+   linearly for every Pod and, on large clusters, scores only a sample of
+   them (`percentageOfNodesToScore`) to keep that scan affordable. Legion's
+   [scheduling indexes](scheduling-indexes.md) ask for the nodes a task
+   could land on, best fit first, and verify only those. A built-in index
+   over free cpu, memory, and disk is on by default once a fleet passes 128
+   nodes. On 5,000 nodes it makes a 12-task plan about 21% faster, with
+   larger gains for more selective constraints.
+6. **Replication can be split into lanes.** With the `lanes`
+   [raft topology](multi-raft.md), Legion replicates control-plane writes,
+   placements, and node status in separate raft groups, so they don't queue
+   behind each other. Kubernetes sends every kind of write through one etcd
+   cluster. The rig runs `lanes`, which is opt-in. The default is a single
+   raft group.
+7. **Heartbeat load stays flat as the fleet grows.**
+   [Adaptive cadence](heartbeat-cadence-and-scale.md) stretches each
+   node's check-in interval so the control plane handles about 2,500
+   check-ins/sec at any fleet size. Each Kubernetes node renews a Lease
+   object every 10 seconds, and those etcd writes grow with the node count.
+8. **Recovery starts sooner by default.** This one is policy rather than
+   architecture. Legion re-places the work from lost nodes as soon as they
+   are declared lost. Kubernetes waits 300 seconds before evicting Pods
+   from a NotReady node, then evicts at 0.1 nodes/sec. Both are tunable,
+   but the defaults explain most of the gap in the
+   [storm drill](#recovery-from-a-node-loss-storm).
+
+These choices cost something. Kubernetes' model, where every resource is
+an API object any controller can watch and act on, is a large part of what
+makes it so extensible, and Legion gives some of that up. Adaptive cadence
+also trades failure-detection time on very large fleets: at 20,000 nodes a
+node is declared lost after about 105 seconds unless you pin a shorter
+interval.
+
 ## Latency below saturation
 
 A burst tells you capacity. To see what one job experiences, we submit at
