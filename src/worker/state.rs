@@ -11,6 +11,15 @@ pub struct PersistedAllocation {
     pub allocation: Allocation,
     pub task: TaskConfig,
     pub pid: Option<u32>,
+    /// Start time of `pid` (seconds since the Unix epoch) when it was
+    /// persisted. A restarted worker re-adopts `pid` only when the live
+    /// process with that pid started at this same time, so a recycled pid
+    /// (after a host reboot, say) is never mistaken for the task.
+    ///
+    /// Absent in records written before this field existed; those fall back
+    /// to a plain liveness check for the one restart that upgrades them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid_start_time: Option<u64>,
     /// Self-fence window in seconds (`TaskAllocation.self_terminate_after_seconds`):
     /// kill this allocation after losing manager contact for this long.
     /// Persisted so the watchdog keeps protecting restored allocations after
@@ -167,10 +176,35 @@ fn write_owner_only(path: &Path, contents: &[u8]) -> R<()> {
     Ok(())
 }
 
+/// Whether `pid` names a live (non-zombie) process.
+///
+/// Called once per restored allocation per supervisor tick, under the
+/// task-manager mutex, so it reads only this one pid rather than rescanning
+/// the whole process table.
 pub fn pid_is_running(pid: u32) -> bool {
+    process_start_time(pid).is_some()
+}
+
+/// When the live process `pid` started, in seconds since the Unix epoch, or
+/// `None` when no such process is running (a zombie counts as gone: it will
+/// never run again).
+///
+/// Paired with the pid in [`PersistedAllocation::pid_start_time`] it names
+/// one process rather than a number the kernel recycles: after a host reboot
+/// or enough churn the same pid belongs to something else, which starts at a
+/// different time.
+pub fn process_start_time(pid: u32) -> Option<u64> {
+    let pid = Pid::from_u32(pid);
     let mut system = System::new();
-    system.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
-    system.process(Pid::from_u32(pid)).is_some()
+    system.refresh_processes_specifics(
+        sysinfo::ProcessesToUpdate::Some(&[pid]),
+        true,
+        sysinfo::ProcessRefreshKind::new(),
+    );
+    system
+        .process(pid)
+        .filter(|process| process.status() != sysinfo::ProcessStatus::Zombie)
+        .map(|process| process.start_time())
 }
 
 fn ensure_dir(path: &Path) -> R<()> {

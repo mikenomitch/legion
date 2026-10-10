@@ -254,6 +254,14 @@ config = {
   pid has no parent to reap it. When it later exits, the worker only sees that
   the process is gone. That never counts as a success, so a `never`-policy task
   in this state ends as a failure.
+- Re-adoption checks identity, not just liveness. The worker persists each
+  task's pid together with the process start time, and after a restart it
+  re-adopts a pid only when the live process with that pid started at the
+  recorded time. After a host reboot the old pids belong to unrelated
+  processes, so those allocations are dropped instead of adopted. The next
+  heartbeat's desired set still lists them, so the worker starts them fresh. State written
+  by an older worker has no start time, so its first restart after the upgrade
+  falls back to a liveness check.
 - A restart resets only the process. Health-check state and the restart budget
   are per allocation, not per process.
 - Enforcement is per worker, not per pool or per job. A cluster with mixed

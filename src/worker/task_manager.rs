@@ -13,7 +13,9 @@ use crate::worker::claims::{ClaimRecord, ClaimTable, LocalLedger};
 use crate::worker::log_sink::{default_sinks, LogResource, LogSink};
 use crate::worker::logs::{read_allocation_logs, CapturedStream};
 use crate::worker::resources::NodeResourceGovernor;
-use crate::worker::state::{pid_is_running, PersistedAllocation, WorkerStateStore};
+use crate::worker::state::{
+    pid_is_running, process_start_time, PersistedAllocation, WorkerStateStore,
+};
 use crate::worker::task_health::{spawn_health_monitor, HealthMonitorHandle};
 use crate::worker::volumes::{volume_env, WorkerVolumeManager};
 use std::collections::HashMap;
@@ -2290,7 +2292,7 @@ impl WorkerTaskManager {
         let mut restored = Vec::new();
         let mut restored_claims: Vec<(i64, i64, TaskConfig)> = Vec::new();
 
-        for record in persisted {
+        for mut record in persisted {
             let Some(pid) = record.pid else {
                 warn!(
                     allocation_id = record.allocation.id,
@@ -2299,7 +2301,7 @@ impl WorkerTaskManager {
                 );
                 continue;
             };
-            if !pid_is_running(pid) {
+            let Some(started) = process_start_time(pid) else {
                 warn!(
                     allocation_id = record.allocation.id,
                     task_name = %record.task.name,
@@ -2307,7 +2309,25 @@ impl WorkerTaskManager {
                     "Skipping persisted allocation with dead pid"
                 );
                 continue;
+            };
+            // A live pid is not proof it is still our task: after a host
+            // reboot (or enough process churn) the number belongs to some
+            // unrelated process, which we would report as running and later
+            // kill on stop. The start time pins the identity.
+            if record
+                .pid_start_time
+                .is_some_and(|recorded| recorded != started)
+            {
+                warn!(
+                    allocation_id = record.allocation.id,
+                    task_name = %record.task.name,
+                    pid,
+                    "Skipping persisted allocation whose pid now belongs to another process"
+                );
+                continue;
             }
+            // Backfills records written before start times were persisted.
+            record.pid_start_time = Some(started);
 
             let alloc_dir = self.alloc_dir(record.allocation.id);
             let task_dir = alloc_dir.join(&record.task.name);
@@ -2444,6 +2464,7 @@ impl WorkerTaskManager {
                 allocation: allocation.clone(),
                 task: task.clone(),
                 pid,
+                pid_start_time: pid.and_then(process_start_time),
                 resource_assignment: self
                     .instances
                     .get(allocation_id)
@@ -4358,6 +4379,51 @@ mod tests {
                 process.kill();
             }
         }
+        Ok(())
+    }
+
+    /// Regression (audit W2): restore used to adopt any live pid. A recycled
+    /// pid (here: the test process itself, which is alive but is not the
+    /// task) must be skipped when its start time does not match the record.
+    #[test]
+    fn restore_skips_a_live_pid_that_started_at_a_different_time() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let state_path = temp_dir.path().join("worker_state.json");
+        let pid = std::process::id();
+        let started = process_start_time(pid).context("test process start time")?;
+        let record = |id: i64, pid_start_time: Option<u64>| PersistedAllocation {
+            allocation: Allocation { id, ..alloc() },
+            task: TaskConfig::new("exec-task", "exec"),
+            pid: Some(pid),
+            pid_start_time,
+            self_terminate_after_secs: None,
+            volumes: Vec::new(),
+            external_id: None,
+            resource_assignment: None,
+        };
+        let store = WorkerStateStore::new(state_path.clone());
+        store.save(&[
+            // Same pid, different process: must not be adopted.
+            record(1, Some(started - 60)),
+            // Same pid, same start time: really is the task.
+            record(2, Some(started)),
+            // Written before start times were persisted: adopted once, on
+            // liveness alone, and backfilled.
+            record(3, None),
+        ])?;
+
+        let mut restarted = WorkerTaskManager::with_state_store(store.clone());
+        let mut restored = restarted
+            .restore_allocations()?
+            .into_iter()
+            .map(|(allocation, _)| allocation.id)
+            .collect::<Vec<_>>();
+        restored.sort_unstable();
+        assert_eq!(restored, vec![2, 3]);
+        assert!(store
+            .load()?
+            .iter()
+            .all(|record| record.pid_start_time == Some(started)));
         Ok(())
     }
 
