@@ -5,7 +5,7 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-legion = { path = "../../..", version = "0.1.0" }
+legion = { package = "legion-rs", path = "../../..", version = "0.1.0" }
 rand = "0.8"
 serde_json = "1.0"
 
