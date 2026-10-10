@@ -202,20 +202,20 @@ fleet size:
 
 | Nodes  | Legion  | Nomad 2.0.5 | Kubernetes 1.36.5 |
 | ------ | ------- | ----------- | ----------------- |
-| 1,000  | **829** | 122         | 117               |
-| 2,000  | **789** | 110         | 78                |
-| 5,000  | **905** | failed[^1]  | 53                |
-| 10,000 | **738** | -           | -                 |
-| 20,000 | **553** | -           | -                 |
-| 50,000 | **327** | -           | -                 |
+| 1,000  | **829** | 122 (182)   | 117 (100)         |
+| 2,000  | **789** | 110 (97)    | 78 (80)           |
+| 5,000  | **905** | failed[^1]  | 53 (45)           |
+| 10,000 | **738** | not run     | not measured      |
+
+Numbers in parentheses are a second run of the same cell. Legion also
+completed a 250,000-allocation burst on 50,000 nodes.
 
 Below saturation, a job's allocations land in about 20ms at the median,
 and that barely moves from 5,000 to 20,000 nodes.
 
-These are single runs on simulated nodes, so they measure the control plane
-and not container start times. A dash means we haven't run the cell yet.
-See [Benchmarks](docs/benchmarks.md) for every table and the methodology,
-and [Why Legion is faster than Kubernetes](docs/benchmarks.md#why-legion-is-faster-than-kubernetes)
+Most cells are single runs on simulated nodes, so they measure the control
+plane and not container start times. See [Benchmarks](docs/benchmarks.md)
+for every table and the methodology, and [Why Legion is faster than Kubernetes](docs/benchmarks.md#why-legion-is-faster-than-kubernetes)
 for the architecture behind the gap.
 
 [^1]: Nomad's leader lost leadership partway through the burst and rejected
