@@ -15,9 +15,13 @@ Legion supports a streaming persistence mode for manager state using:
 - **Write model:** single primary writer.
 - **Replication model:** asynchronous WAL shipping (small, non-zero RPO).
 - **Failover model:**
-  - `lease.provider = "none"`: manual failover only.
-  - `lease.provider = "object_storage"`: automatic primary election/fencing via an
-    S3-compatible lease object (ETag compare-and-swap).
+  - `lease.provider = "none"`: manual failover only. Every manager configured
+    this way acts as a primary, so you must run exactly one.
+  - `lease.provider = "object_storage"`: automatic takeover via an
+    S3-compatible lease object (ETag compare-and-swap). Only the lease holder
+    writes and ships WAL. A standby that takes the lease restores the replica
+    before it serves as primary. A primary that loses the lease is fenced
+    until it is restarted. See [Failover with the lease](#failover-with-the-lease).
 
 ## Configuration
 
@@ -73,23 +77,57 @@ If that history matters, rotate retention after enabling encryption.
 
 ## Runtime Behavior
 
-On manager startup in `streaming` mode:
+Shipping WAL works the same way on any primary. Legion opens the SQLite
+store as a rustyriver-managed `Db`. It uses WAL mode, disables
+auto-checkpoint, and holds a long-running read lock so it can take over
+checkpointing. It then runs the capture/upload loop every `syncInterval`.
+`Db::sync()` captures new WAL frames into a local LTX file, and
+`Replica::sync()` uploads new LTX files to `replicaUrl`. Legion skips this
+when `replicaUrl` is empty.
 
-1. Legion opens the SQLite store as a rustyriver-managed `Db`. It uses WAL
-   mode, disables auto-checkpoint, and holds a long-running read lock so it can
-   take over checkpointing. It then runs the capture/upload loop every
-   `syncInterval`. `Db::sync()` captures new WAL frames into a local LTX file,
-   and `Replica::sync()` uploads new LTX files to `replicaUrl`. Legion skips
-   this step when `replicaUrl` is empty.
-2. If `lease.provider = "none"`, the node is primary immediately.
-3. If `lease.provider = "object_storage"`, the node participates in an
-   `S3Leaser` loop:
-   - Acquires the lock object if no live lease exists.
-   - Renews the lease (ETag CAS) while it holds it.
-   - Stands by while another node holds a live lease.
+If `lease.provider = "none"`, the manager is primary from startup and ships
+immediately.
+
+If `lease.provider = "object_storage"`, the manager starts as a **standby**
+and runs an `S3Leaser` loop. It acquires the lock object if no live lease
+exists, renews it (ETag CAS) while it holds it, and stands by while another
+manager holds a live lease.
 
 The manager exposes persistence status through existing manager status APIs
 (`backend`, `role`, `leaseHeld`).
+
+## Failover with the lease
+
+What a manager does depends on its role:
+
+- **Standby.** It serves reads from its local database, which is whatever it
+  had when it last ran and can be far behind the primary. It does not run
+  the scheduler, the node checker, or any other writer loop. Every write is
+  refused with an error that says it is a standby, so send writes and point
+  workers at the primary. It does not ship WAL.
+- **Taking over.** When the standby acquires the lease, it first restores
+  the replica's latest state (`rustyriver::restore`), migrates it to its own
+  schema, and swaps it in as its store. Then it starts shipping, continuing
+  the replica's history, and only then reports itself `primary` and starts
+  its writer loops. An empty replica (a brand-new deployment) leaves the
+  local database as it is. If the restore fails, the manager gives the lease
+  back and stays a standby.
+- **Losing the lease.** A primary that sees another manager take the lease,
+  or cannot renew it for a whole `ttlSeconds`, is **fenced**. It stops
+  shipping, refuses writes, idles its writer loops, and does not compete for
+  the lease again. Restart it to bring it back as a standby.
+
+Known limitations:
+
+- Replication is asynchronous. Writes the old primary made in its last
+  `syncInterval` before it died, and had not shipped yet, are not in the
+  replica, so the new primary does not have them.
+- Fencing is time-based. An old primary that is paused (a long process
+  stall, a frozen VM) for longer than the lease TTL can still accept a write
+  and ship one more sync cycle before its lease loop notices. Keep
+  `ttlSeconds` well above `syncInterval` and `renewIntervalSeconds`.
+- A standby serves stale reads. Treat only the primary as the source of
+  truth.
 
 ## Operational Notes
 

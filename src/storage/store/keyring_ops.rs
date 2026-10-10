@@ -322,7 +322,8 @@ impl Store {
             self.keyring.set_pending_upgrade(None);
             return Ok(KeyringInit::AlreadyInitialized);
         }
-        if self.raft_mode() && !self.is_raft_leader(Lane::Control) {
+        // Raft followers and streaming standbys leave this to the writer.
+        if !self.is_raft_leader(Lane::Control) {
             return Ok(KeyringInit::NotLeader);
         }
         if let Some(reason) = self.keyring_upgrade_gate() {

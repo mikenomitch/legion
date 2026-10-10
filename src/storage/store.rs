@@ -1595,13 +1595,6 @@ impl Store {
         if raft_enabled {
             crate::storage::raft::quorum::validate_raft_config(&config.persistence.raft)?;
         }
-        // The raft engine needs the migrated store (its state machines apply
-        // into it), so its start is deferred to `start_engine` below;
-        // local_disk/streaming start exactly where they always did.
-        if !raft_enabled {
-            persistence_driver.start()?;
-        }
-
         // KV encryption: a malformed `encryption` block stops the manager
         // here, with the field named, rather than on the first KV write.
         config.encryption.validate()?;
@@ -1683,9 +1676,9 @@ impl Store {
         // pipeline and arms the raft-mode write guard; startup-time writes
         // that follow (requeue, manager-config upsert, seeds) run through
         // replication and are gated to the leader by the daemon.
-        if raft_enabled {
-            store.persistence_driver.clone().start_engine(&store)?;
-        }
+        // Streaming needs the store too: a standby that takes the lease
+        // restores the replica into it before it serves as primary.
+        store.persistence_driver.clone().start_engine(&store)?;
 
         // First-start keyring initialization (mint the root key, write the
         // first data key). Local stores do it right here; a raft node does it
@@ -1810,8 +1803,9 @@ impl Store {
 
     /// Whether this manager may ACT for `lane` right now: in raft mode, true
     /// only while this node leads the raft group carrying the lane (a cheap
-    /// metrics-watch probe, no I/O); in every other persistence mode, always
-    /// true. The daemon's scheduling loops (eval workers, node status
+    /// metrics-watch probe, no I/O); in streaming mode, only while this node
+    /// is the primary (a standby or fenced ex-primary idles, R4); in
+    /// local_disk mode, always true. The daemon's scheduling loops (eval workers, node status
     /// checker) poll this so followers idle and take over within a poll
     /// interval of a leadership change (plan JC-15).
     pub(crate) fn is_raft_leader(&self, lane: Lane) -> bool {
@@ -1821,7 +1815,7 @@ impl Store {
             .downcast_ref::<crate::storage::raft::driver::MultiRaftDriver>()
         {
             Some(driver) => driver.is_leader(lane),
-            None => true,
+            None => self.persistence_role() == PersistenceRole::Primary,
         }
     }
 
@@ -2337,6 +2331,11 @@ impl Store {
             return f(self);
         }
         if !self.raft_mode() {
+            // A streaming standby must not write: its database is not the
+            // one being shipped, and the primary's would overwrite it.
+            if let Some(reason) = self.persistence_driver.write_refusal() {
+                return Err(anyhow!("store op {op} refused: {reason}"));
+            }
             // `local_disk`: commit for real, then project the read model
             // from what was committed (read-model-coherence plan § 5.4).
             // A nested call composes into the outer body's session.

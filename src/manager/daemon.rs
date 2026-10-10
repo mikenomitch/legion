@@ -173,7 +173,8 @@ pub async fn run_manager_with(
     // manager config row would go stale. Re-run them on every leadership
     // ACQUISITION — tracked independently per lane, because control and
     // scheduler leadership can move separately under `lanes` topology.
-    if store.raft_status().is_some() {
+    // Streaming standbys take over the same way when they win the lease.
+    if store.raft_status().is_some() || store.persistence_status().backend == "streaming" {
         let watch_store = store.clone();
         let watch_config = config.clone();
         let watch_full_config = full_config.clone();
