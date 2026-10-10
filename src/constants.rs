@@ -75,6 +75,13 @@ pub const DEF_EVAL_PRIORITY: i64 = 50;
 // anything an operator explicitly deprioritized.
 pub const NODE_LOST_RESCHEDULE_PRIORITY_DROP: i64 = 10;
 pub const DEF_ROLLOUT_RETENTION_DAYS: u64 = 30;
+// Read-model maintenance (docs/state-store.md, "Read model coherence"):
+// every tick each manager checks for outside commits to its state database
+// and reloads a slice of nodes to repair any cache drift. 128 nodes every 5s
+// sweeps a 10,000-node fleet in about 6.5 minutes for ~26 indexed reads a
+// second.
+pub const READ_MODEL_MAINTENANCE_INTERVAL_SECS: u64 = 5;
+pub const READ_MODEL_SCRUB_NODES_PER_TICK: usize = 128;
 // Debounce window (ms) for KV-driven job reconciliation: rapid puts/deletes
 // to watched keys are coalesced and applied once per quiet window. 0 applies
 // every KV write synchronously (see docs/kv-store.md).

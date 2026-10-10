@@ -44,6 +44,10 @@ jobs:
         env:
           CARGO_PROFILE_DEV_DEBUG: 0
           CARGO_PROFILE_TEST_DEBUG: 0
+          # Compare the scheduler's read model with SQLite after every
+          # local_disk mutation in the integration tests too (unit tests
+          # always do). See docs/state-store.md, "Read model coherence".
+          LEGION_READ_MODEL_SHADOW_CHECK: 1
         run: cargo test --all --all-features --locked
 
   cargo-clippy:

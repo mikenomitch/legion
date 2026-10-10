@@ -334,6 +334,36 @@ pub async fn run_manager_with(
 
     let store_for_rotation = store.clone();
 
+    // Read-model maintenance on every manager (each holds its own cache):
+    // rebuild after an outside commit to the state database, and reload a
+    // rotating slice of nodes so drift from any source heals within one
+    // sweep (docs/state-store.md, "Read model coherence").
+    let maintenance_store = store.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(
+            crate::constants::READ_MODEL_MAINTENANCE_INTERVAL_SECS,
+        ));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            let store = maintenance_store.clone();
+            let outcome = tokio::task::spawn_blocking(move || -> R<()> {
+                if !store.check_external_writes()? {
+                    store.scrub_read_model_slice(
+                        crate::constants::READ_MODEL_SCRUB_NODES_PER_TICK,
+                    )?;
+                }
+                Ok(())
+            })
+            .await;
+            match outcome {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => warn!(error = ?err, "Read-model maintenance failed"),
+                Err(join_error) => warn!("Read-model maintenance task failed: {join_error:?}"),
+            }
+        }
+    });
+
     // Clone store + authenticator for the exec WebSocket listener before the
     // service takes ownership of them.
     let exec_ws_state = crate::manager::exec_ws::ExecWsState {

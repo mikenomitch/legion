@@ -387,6 +387,16 @@ reason.
   count. These reads are latency-bound, not CPU-bound, and a page-cache miss
   holds a connection through an I/O wait that uses no CPU.
 
+- **`legion_read_model_drift_repaired_total{source}`** (counter): nodes
+  whose cached scheduling state disagreed with the state database and was
+  reloaded. `source="scrub"` is the 5-second background sweep.
+  `source="delta"` is a committed change that contradicted the cache. Both
+  should stay at zero. See
+  [state-store.md § Read model coherence](state-store.md#read-model-coherence).
+- **`legion_read_model_external_writes_total`** (counter): times another
+  process or connection committed to the state database while the manager
+  was running, forcing a full rebuild of the cache.
+
 #### Group commit (the coalescer)
 
 Four write paths batch concurrent submitters into one commit:

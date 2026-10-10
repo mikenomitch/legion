@@ -16,6 +16,7 @@ use crate::storage::migrations::get_migrations;
 // KV encryption keyring operations (initialization, rotation, rewrap, reset)
 // live in their own file so the keyring's write paths read as one unit.
 mod keyring_ops;
+mod read_model_check;
 use crate::storage::persistence::{
     build_persistence_driver, PersistenceDriver, PersistenceRole, PersistenceStatus,
     RaftHistoryEvent, RaftStatus,
@@ -1123,6 +1124,15 @@ pub struct Store {
     // is repaired within one sweep of the fleet rather than never. Shared
     // across clones so the sweep is per-process, not per-clone.
     alloc_scrub_queue: Arc<std::sync::Mutex<Vec<String>>>,
+    // The timed read-model scrub's own rotation (`scrub_read_model_slice`):
+    // nodes still to visit this sweep, refilled from committed AND cached
+    // node ids so a node missing from either side is visited too.
+    read_model_scrub_queue: Arc<std::sync::Mutex<Vec<String>>>,
+    // `PRAGMA data_version` as the write connection last saw it
+    // (`check_external_writes`). `None` until the first check, and reset
+    // whenever the write connection is replaced, since the counter is per
+    // connection.
+    external_write_baseline: Arc<std::sync::Mutex<Option<i64>>>,
     // KV encryption at rest (docs/kv-encryption.md): the unwrapped data keys
     // and the root-key provider. Shared across clones; every KV value read
     // or written goes through it, and it is loaded from the replicated
@@ -1654,6 +1664,8 @@ impl Store {
             liveness: Arc::new(crate::storage::liveness::LivenessTable::new()),
             missed_beats_before_lost: config.heartbeat.missed_beats_before_lost.max(1),
             alloc_scrub_queue: Arc::new(std::sync::Mutex::new(Vec::new())),
+            read_model_scrub_queue: Arc::new(std::sync::Mutex::new(Vec::new())),
+            external_write_baseline: Arc::new(std::sync::Mutex::new(None)),
             keyring,
         };
         store.liveness.configure(config.liveness.settings());
@@ -2277,8 +2289,11 @@ impl Store {
     /// The replication seam every public mutating store method routes
     /// through (plan §2, JC-1/JC-12/JC-13):
     ///
-    /// - `local_disk`/`streaming` mode: run `f(self)` inline — semantics are
-    ///   byte-identical to the pre-raft store.
+    /// - `local_disk`/`streaming` mode: run `f(self)` on this thread under
+    ///   `capture::local_projected_mutation`. It commits as it always did,
+    ///   and the read model is projected from the changeset it committed,
+    ///   the same way raft replicas project theirs (read-model-coherence
+    ///   plan § 5.4). Nested calls compose into the outer body.
     /// - Inside an active capture on this thread: run `f(self)` inline, so
     ///   nested public-method calls compose into the outer capture and a
     ///   composite operation produces ONE atomic raft entry (JC-13).
@@ -2291,8 +2306,19 @@ impl Store {
         op: &'static str,
         f: impl FnOnce(&Store) -> R<T> + Send + 'static,
     ) -> R<T> {
-        if capture::in_capture() || !self.raft_mode() {
+        if capture::in_capture() {
             return f(self);
+        }
+        if !self.raft_mode() {
+            // `local_disk`: commit for real, then project the read model
+            // from what was committed (read-model-coherence plan § 5.4).
+            // A nested call composes into the outer body's session.
+            if capture::in_local_projection() {
+                return f(self);
+            }
+            return capture::local_projected_mutation(self, f, |store| {
+                store.shadow_check_read_model(op)
+            });
         }
 
         let Some(handle) = self.replication.get() else {
@@ -2690,6 +2716,11 @@ impl Store {
         let new_write = Connection::open(&*self.db_path)?;
         Self::configure_connection(&new_write, false, self.durable_sync)?;
         *write_guard = new_write;
+        // `data_version` is per connection: the new one starts its own count.
+        *self
+            .external_write_baseline
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         for guard in read_guards.iter_mut() {
             let conn =
                 Connection::open_with_flags(&*self.db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
@@ -2811,7 +2842,7 @@ impl Store {
 
         let mut task_stmt = conn.prepare(
             r#"
-            SELECT id, name, runtime, count, count_per, group_name, lifecycle, schedule, depends_on, config, resources, constraints, permit, affinities, checks, on_unhealthy, kv_injections, job_config_id, identities, stateful, artifacts, network, service, actions, volumes, connect, restart, stop, disruption
+            SELECT id, name, runtime, count, count_per, group_name, lifecycle, schedule, depends_on, config, resources, constraints, permit, affinities, checks, on_unhealthy, kv_injections, job_config_id, identities, stateful, artifacts, network, service, actions, volumes, connect, restart, stop, disruption, speculative_start
             FROM task_config;
             "#,
         )?;
@@ -2824,7 +2855,12 @@ impl Store {
             let schedule = self.parse_schedule_column(7, row.get(7)?)?;
             let depends_on = self.parse_depends_on_column(8, row.get(8)?)?;
             let task = TaskConfig {
-                speculative_start: None,
+                // Read like every other column. The full load used to
+                // hardcode `None`, so a restart, snapshot install, or
+                // outside-write rebuild dropped it from every cached task
+                // while the incremental path kept it (found by the
+                // read-model shadow check).
+                speculative_start: parse_json_column(29, row.get(29)?)?,
                 name: row.get(1)?,
                 runtime: row.get(2)?,
                 count: TaskCount {
@@ -2999,7 +3035,7 @@ impl Store {
         // During capture the mutation is uncommitted (and will be rolled
         // back); reloading would cache pre-mutation state and the apply-time
         // projection rebuilds the affected entries anyway (JC-11).
-        if capture::in_capture() {
+        if capture::read_model_deferred() {
             return Ok(());
         }
         let model = self.load_read_model()?;
@@ -3021,13 +3057,16 @@ impl Store {
         Ok(self.read_model_reader()?.clone())
     }
 
-    // NOTE on the `capture::in_capture()` early-returns below: read-model
-    // cache mutations are side effects of uncommitted state while a
-    // changeset capture is active, so they are suppressed during capture and
-    // re-projected from the committed changeset at apply time on every
-    // replica — see `project_changeset_side_effects` (JC-11).
+    // NOTE on the `capture::read_model_deferred()` early-returns below: the
+    // committed changeset is the only way into the read model, in both
+    // modes. Under a raft capture the mutation is uncommitted and is
+    // re-projected at apply time on every replica (JC-11); in `local_disk`
+    // mode the body commits and `capture::local_projected_mutation`
+    // projects its changeset when it returns (read-model-coherence plan
+    // § 5.4). Calls from inside a mutation body are therefore no-ops; the
+    // projection is what calls these for real.
     fn cache_node(&self, node: Node) -> R<()> {
-        if capture::in_capture() {
+        if capture::read_model_deferred() {
             return Ok(());
         }
         let mut guard = self.read_model_writer()?;
@@ -3039,7 +3078,7 @@ impl Store {
     }
 
     fn cache_node_dynamic_attrs(&self, node_id: &str, dynamic_attrs: Value) -> R<()> {
-        if capture::in_capture() {
+        if capture::read_model_deferred() {
             return Ok(());
         }
         let mut guard = self.read_model_writer()?;
@@ -3054,7 +3093,7 @@ impl Store {
     }
 
     fn cache_nodes_lost(&self, ids: &[String]) -> R<()> {
-        if capture::in_capture() {
+        if capture::read_model_deferred() {
             return Ok(());
         }
         let mut guard = self.read_model_writer()?;
@@ -3072,7 +3111,7 @@ impl Store {
     }
 
     fn cache_remove_node(&self, id: &str) -> R<()> {
-        if capture::in_capture() {
+        if capture::read_model_deferred() {
             return Ok(());
         }
         let mut guard = self.read_model_writer()?;
@@ -3103,7 +3142,7 @@ impl Store {
         node_ids: &BTreeSet<String>,
         job_config_ids: &BTreeSet<String>,
     ) -> R<()> {
-        if capture::in_capture() {
+        if capture::read_model_deferred() {
             return Ok(());
         }
         // 1. Epochs first.
@@ -3304,7 +3343,7 @@ impl Store {
         node_ids: &BTreeSet<String>,
         job_config_ids: &BTreeSet<String>,
     ) -> R<()> {
-        if capture::in_capture() {
+        if capture::read_model_deferred() {
             return Ok(());
         }
         // 1. Epochs first, exactly as the full path reads them.
@@ -3457,6 +3496,9 @@ impl Store {
         }
 
         if !drifted.is_empty() {
+            crate::manager::telemetry::metrics()
+                .read_model_drift_repaired_total
+                .inc_by(&["delta"], drifted.len() as u64);
             warn!(
                 nodes = ?drifted,
                 "Allocation delta contradicted the cached read model; reloading those nodes in full"
@@ -3607,13 +3649,20 @@ impl Store {
         job_config_id: &str,
         tasks: Vec<(i64, TaskConfig)>,
     ) -> R<()> {
-        if capture::in_capture() {
+        if capture::read_model_deferred() {
             return Ok(());
         }
         let mut guard = self.read_model_writer()?;
-        guard
-            .task_configs
-            .insert(job_config_id.to_string(), Arc::new(tasks));
+        // A config with no task rows left (destroyed, its rows removed by
+        // the job's FK cascade) leaves the cache instead of lingering as an
+        // empty list per destroyed config. A later lookup reads through.
+        if tasks.is_empty() {
+            guard.task_configs.remove(job_config_id);
+        } else {
+            guard
+                .task_configs
+                .insert(job_config_id.to_string(), Arc::new(tasks));
+        }
         Ok(())
     }
 
@@ -9117,7 +9166,7 @@ impl Store {
         // that capture (`replicated` short-circuits there); routing it
         // through the coalescer would wait on a leader that needs the very
         // lane pipeline the caller holds.
-        let outcome = if capture::in_capture()
+        let outcome = if capture::in_mutation_body()
             || capture::in_apply()
             || !self.job_intake_coalescing_enabled()
         {
@@ -9218,7 +9267,10 @@ impl Store {
         // Same reasoning as the eval enqueue: an in-capture caller must stay
         // in its own capture rather than wait on a leader that needs the
         // pipeline it is holding.
-        if capture::in_capture() || capture::in_apply() || !self.job_intake_coalescing_enabled() {
+        if capture::in_mutation_body()
+            || capture::in_apply()
+            || !self.job_intake_coalescing_enabled()
+        {
             return self.seed_task_statuses_replicated(job_config_id.to_owned());
         }
         let coalescer = Arc::clone(&self.task_status_seed_coalescer);
@@ -10309,6 +10361,19 @@ impl Store {
     /// decoding full rows out of the changeset.
     #[allow(dead_code)] // called from capture::apply_changeset (A-0 tests) and the A-1 state machine
     pub(crate) fn project_changeset_side_effects(&self, bytes: &[u8]) -> R<()> {
+        self.project_changeset(bytes, false)
+    }
+
+    /// The read-model half of [`Self::project_changeset_side_effects`], for
+    /// `local_disk` mutations (`capture::local_projected_mutation`): event
+    /// broadcast, journal pruning, keyring reloads, and eval wakes keep
+    /// their direct paths in that mode, so only the cache follows the
+    /// changeset (read-model-coherence plan § 5.4).
+    pub(crate) fn project_read_model_from_changeset(&self, bytes: &[u8]) -> R<()> {
+        self.project_changeset(bytes, true)
+    }
+
+    fn project_changeset(&self, bytes: &[u8], read_model_only: bool) -> R<()> {
         use fallible_streaming_iterator::FallibleStreamingIterator;
         use rusqlite::hooks::Action;
         use rusqlite::session::ChangesetIter;
@@ -10612,7 +10677,7 @@ impl Store {
         }
         drop(iter);
 
-        if keyring_changed {
+        if keyring_changed && !read_model_only {
             self.keyring_rows_changed();
         }
 
@@ -10682,6 +10747,10 @@ impl Store {
         for job_config_id in task_job_config_ids {
             let tasks = self.get_task_configs_for_job_config(&job_config_id)?;
             self.cache_set_task_configs_for_job_config(&job_config_id, tasks)?;
+        }
+
+        if read_model_only {
+            return Ok(());
         }
 
         // Publish committed scheduler events in id order.
@@ -16123,7 +16192,10 @@ impl Store {
         // composites fuse into one changeset). Routing it through the
         // coalescer would hand it to a leader that needs the very lane
         // pipeline this caller is holding — a deadlock, not a slow path.
-        if capture::in_capture() || capture::in_apply() || !self.job_intake_coalescing_enabled() {
+        if capture::in_mutation_body()
+            || capture::in_apply()
+            || !self.job_intake_coalescing_enabled()
+        {
             return self.enqueue_eval_forwarding(request);
         }
         let coalescer = Arc::clone(&self.eval_enqueue_coalescer);
