@@ -10,7 +10,7 @@ import { debounced } from '../utils/debounce'
 import { heartbeatFreshnessHint } from '../utils/format'
 import { summarizeHealthChecks } from '../utils/health'
 import { INDEX_POLL_INTERVAL_MS, retainOnError, usePoll } from '../utils/polling'
-import { fetchNodeUsage } from '../utils/usage'
+import { fetchNodeUsageBatch } from '../utils/usage'
 
 function NodesContent() {
   const [search, setSearch] = createSignal('')
@@ -59,17 +59,15 @@ function NodesContent() {
     ),
   )
 
-  // Memory used and reserved for the workers on this page, one GetNodeUsage
-  // per row at the index cadence. There is no batch RPC yet (see the suspend
-  // UI plan, §7.3), and the manager answers each from memory. A node that
-  // fails to answer shows a blank cell.
+  // Memory used and reserved for the workers on this page, in one
+  // ListNodeUsage call at the index cadence (one GetNodeUsage per row on an
+  // older manager). A node that is not in the reply shows a blank cell.
   const [usageByNode] = createResource(
     () => [(data()?.nodes ?? []).map((node) => node.id).join(','), tick()] as const,
-    async ([ids]) => {
-      const nodeIds = ids ? ids.split(',') : []
-      const replies = await Promise.all(nodeIds.map((id) => fetchNodeUsage(id).catch(() => null)))
-      return new Map(nodeIds.map((id, index) => [id, replies[index]]))
-    },
+    retainOnError(
+      async ([ids]: readonly [string, number]) => fetchNodeUsageBatch(ids ? ids.split(',') : []),
+      ([ids]) => ids,
+    ),
   )
 
   return (

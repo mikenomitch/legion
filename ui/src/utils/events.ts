@@ -23,6 +23,7 @@ const num = (value: unknown): number | undefined => (typeof value === 'number' &
 /** `node.pressure`: one action of a node's memory pressure response. */
 export type PressureEventMeta = {
   step?: string
+  instanceId?: string
   detail?: string
   hint?: string
   cause?: string
@@ -37,6 +38,7 @@ export const pressureMeta = (event: SchedulerEvent): PressureEventMeta => {
   const meta = parseEventMeta(event)
   return {
     step: str(meta.step),
+    instanceId: str(meta.instance_id),
     detail: str(meta.detail),
     hint: str(meta.hint),
     cause: str(meta.cause),
@@ -71,6 +73,36 @@ export const snapshotMeta = (event: SchedulerEvent): SnapshotEventMeta => {
     totalBytes: num(meta.totalBytes),
     durationMs: num(meta.durationMs),
     error: str(meta.error),
+  }
+}
+
+/**
+ * `instance.*`: suspended, suspend_failed, resumed, restore_failed, forked,
+ * fork_failed. Suspend and fork events carry the checkpoint's snapshot
+ * fields too.
+ */
+export type InstanceEventMeta = SnapshotEventMeta & {
+  reason?: string
+  reserved?: boolean
+  restoreMs?: number
+  pauseMs?: number
+  outcome?: string
+  origin?: string
+  instances: string[]
+}
+
+export const instanceMeta = (event: SchedulerEvent): InstanceEventMeta => {
+  const meta = parseEventMeta(event)
+  const instances = Array.isArray(meta.instances) ? meta.instances.filter((id): id is string => typeof id === 'string') : []
+  return {
+    ...snapshotMeta(event),
+    reason: str(meta.reason),
+    reserved: typeof meta.reserved === 'boolean' ? meta.reserved : undefined,
+    restoreMs: num(meta.restoreMs),
+    pauseMs: num(meta.pauseMs),
+    outcome: str(meta.outcome),
+    origin: str(meta.origin),
+    instances,
   }
 }
 

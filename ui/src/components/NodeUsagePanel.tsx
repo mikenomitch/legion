@@ -4,6 +4,7 @@ import type { GetNodeUsageReply, NodeAllocationUsage, NodeResourceUsage } from '
 import {
   UNREPORTED_REASONS,
   bytesToMiB,
+  cpuCapacityLabel,
   fillTone,
   formatAmount,
   formatCores,
@@ -18,6 +19,7 @@ import {
   reservationLabel,
   stepDescription,
   stepTone,
+  usedCoresLabel,
 } from '../utils/usage'
 import { Badge, Dot, Meter, MonoBadge, RelativeTime, SectionCard, TableShell, cx, tableClass, tdClass, thClass, theadClass, trHoverClass } from './ui'
 
@@ -56,19 +58,23 @@ function ResourceRow(props: { name: 'memory' | 'cpu'; resource: NodeResourceUsag
   // A node can fail to fingerprint a resource (CPU MHz on some macOS hosts).
   // Percentages of zero would read as "empty", so say so instead.
   const known = () => props.resource.capacity > 0
+  // Apple Silicon reports cores but no usable clock speed: say how many
+  // cores, and measure use in cores, rather than "capacity unknown".
+  const coresOnly = () => (props.name === 'cpu' ? cpuCapacityLabel(props.resource) : undefined)
   const ratio = () => ratioLabel(props.resource.oversubscribeRatio)
   const physical = () => physicalCapacity(props.resource)
   const reservedPercent = () => percentOf(props.resource.reserved, props.resource.capacity)
   // Used is compared to what the node physically has: an oversubscribed
   // node cannot use its ratio.
-  const usedPercent = () => percentOf(props.resource.used, physical())
+  const usedPercent = () =>
+    coresOnly() ? percentOf(Number(props.resource.usedMillicores) / 1000, props.resource.cores) : percentOf(props.resource.used, physical())
   return (
     <div>
       <div class="flex flex-wrap items-baseline justify-between gap-x-3 text-sm">
         <p class="font-medium text-ink">
           {props.name === 'memory' ? 'Memory' : 'CPU'}
           <span class="ml-2 font-mono text-xs font-normal text-muted">
-            {known() ? formatAmount(props.name, physical()) : 'capacity unknown'}
+            {known() ? formatAmount(props.name, physical()) : (coresOnly() ?? 'capacity unknown')}
             <Show when={ratio()}>
               {(label) => (
                 <span
@@ -98,8 +104,10 @@ function ResourceRow(props: { name: 'memory' | 'cpu'; resource: NodeResourceUsag
             <span>used</span>
             <span>
               <Show when={props.reported} fallback="not measured">
-                {formatAmount(props.name, props.resource.used)}
-                <Show when={known()}> · {usedPercent()}%</Show>
+                <Show when={coresOnly()} fallback={formatAmount(props.name, props.resource.used)}>
+                  {usedCoresLabel(props.resource)}
+                </Show>
+                <Show when={known() || coresOnly()}> · {usedPercent()}%</Show>
               </Show>
             </span>
           </div>

@@ -115,7 +115,7 @@ export const stepDescription = (step: string): string | undefined => {
     case 'reclaim':
       return 'Asks the kernel to reclaim memory above the reservation. Nothing stops.'
     case 'suspend':
-      return 'Suspends opted-in instances with their state intact.'
+      return 'Checkpoints and stops instances whose task sets suspend.onPressure, with their state intact. They resume later.'
     case 'evict-bursting':
       return 'Stops allocations using more than their reservation. They reschedule with cause node_pressure.'
     case 'evict-reserved':
@@ -215,3 +215,41 @@ export const fetchAllocationUsageByNode = async (nodeIds: readonly string[]): Pr
   }
   return byAllocation
 }
+
+/**
+ * Usage for a page of nodes in one call (ListNodeUsage), keyed by node id.
+ * Falls back to one GetNodeUsage per node on a manager that predates the
+ * batch RPC. A caller without `node:read` gets an empty map, and an outage
+ * still rejects so the page keeps its last good sample.
+ */
+export const fetchNodeUsageBatch = async (nodeIds: readonly string[]): Promise<Map<string, GetNodeUsageReply | null>> => {
+  if (nodeIds.length === 0) return new Map()
+  try {
+    const reply = await managerClient.listNodeUsage({ nodeIds: [...nodeIds] })
+    const byId = new Map(reply.nodes.map((node) => [node.nodeId, node]))
+    return new Map(nodeIds.map((id) => [id, byId.get(id) ?? null]))
+  } catch (error) {
+    if (error instanceof ConnectError && error.code === Code.Unimplemented) {
+      const replies = await Promise.all(nodeIds.map((id) => fetchNodeUsage(id).catch(() => null)))
+      return new Map(nodeIds.map((id, index) => [id, replies[index]]))
+    }
+    if (error instanceof ConnectError && [Code.PermissionDenied, Code.Unauthenticated].includes(error.code)) {
+      return new Map()
+    }
+    throw error
+  }
+}
+
+/**
+ * CPU capacity as the node can honestly state it: MHz when the platform
+ * reports a clock speed, else the core count (Apple Silicon reports cores
+ * but no usable MHz), else nothing.
+ */
+export const cpuCapacityLabel = (cpu: NodeResourceUsage): string | undefined => {
+  if (cpu.capacity > 0) return undefined
+  if (cpu.cores > 0) return `${Number(cpu.cores.toFixed(1))} cores`
+  return undefined
+}
+
+/** Cores in use, from `used_millicores`, for nodes without a MHz figure. */
+export const usedCoresLabel = (cpu: NodeResourceUsage): string => `${(Number(cpu.usedMillicores) / 1000).toFixed(2)} cores`

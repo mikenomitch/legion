@@ -4,7 +4,8 @@ import { For, Show, createMemo, createResource, createSignal } from 'solid-js'
 import { Badge, CodeBlock, ConfirmButton, EmptyState, MonoBadge, Note, PageHeader, RelativeTime, SectionCard, Spinner, StatusBadge, TableShell, Tabs, linkClass, tableClass, tdClass, thClass, theadClass, trHoverClass } from '../../components/ui'
 import DagVisualization from '../../components/DagVisualization'
 import ScalePanel from '../../components/ScalePanel'
-import InstancesTable from '../../components/InstancesTable'
+import InstancesPanel from '../../components/InstancesPanel'
+import type { InstanceRow } from '../../components/InstancesTable'
 import { PressureHistoryCard } from '../../components/PressureHistory'
 import SnapshotsPanel from '../../components/SnapshotsPanel'
 import { AllocationPorts, ServiceEndpointsTable, ServiceTags } from '../../components/ServiceEndpoints'
@@ -16,6 +17,7 @@ import { allocationHealthLabel, fetchAllocationRuntime, fetchTaskStatusByName, p
 import { formatDate, pluralize } from '../../utils/format'
 import { buildTaskInstancesByName, buildTaskInstancesFromStatuses, extractJobSpecData, topoSortTaskNames, type TaskInstanceSummary } from '../../utils/jobspec'
 import { INDEX_POLL_INTERVAL_MS, retainOnError, usePoll } from '../../utils/polling'
+import { stableList } from '../../utils/instances'
 import { bytesToMiB, fetchAllocationUsageByNode, formatIdle, formatMiB, reservationLabel } from '../../utils/usage'
 
 function JobDetailContent() {
@@ -140,20 +142,20 @@ function JobDetailContent() {
 
   // Stateful instances for this job, polled at the standard interval while the
   // page is mounted (scoped to this route; the interval is torn down on
-  // navigation). The fetcher returns the previous array when nothing changed
-  // so polling does not cause needless table rerenders.
+  // navigation). Unchanged instances keep their objects across polls, so a
+  // row with an armed Suspend or Resume is not re-rendered by a poll that
+  // changed some other row.
   const instanceTick = usePoll()
-
+  // Instance ids are unique cluster-wide, so one merge serves every job.
+  const mergeInstances = stableList<InstanceInfo>((instance) => instance.instanceId, (a, b) => InstanceInfo.equals(a, b))
   let lastInstances: InstanceInfo[] = []
   const [instances, { refetch: refetchInstances }] = createResource(
     () => [jobName(), instanceTick()] as const,
     async ([name]) => {
       try {
         const response = await managerClient.listInstances({ jobId: name })
-        const next = response.instances
-        const unchanged =
-          next.length === lastInstances.length &&
-          next.every((instance, index) => InstanceInfo.equals(instance, lastInstances[index]))
+        const next = mergeInstances(response.instances)
+        const unchanged = next.length === lastInstances.length && next.every((instance, index) => instance === lastInstances[index])
         if (!unchanged) lastInstances = next
         return lastInstances
       } catch {
@@ -162,7 +164,6 @@ function JobDetailContent() {
       }
     },
   )
-
   // Measured usage per allocation, from GetNodeUsage on each node this job
   // runs on. Needs node:read; without it (or on an older manager) the map is
   // empty and the usage columns fall back to the instances' own `usage`.
@@ -171,7 +172,7 @@ function JobDetailContent() {
     ([, nodeIds]) => fetchAllocationUsageByNode(nodeIds ? nodeIds.split(',') : []),
   )
 
-  const instanceRows = createMemo(() => {
+  const instanceRows = createMemo<InstanceRow[]>(() => {
     const tasks = new Map((jobData()?.taskSpec?.tasks ?? []).map((task) => [task.name, task]))
     const usage = allocationUsage()
     return (instances() ?? []).map((instance) => ({
@@ -179,6 +180,17 @@ function JobDetailContent() {
       task: tasks.get(instance.task),
       allocation: instance.currentAllocId !== undefined ? usage?.get(Number(instance.currentAllocId)) : undefined,
     }))
+  })
+
+  // The manager stores `done` for every accepted job, running or not. A job
+  // with live allocations or active instances reads as running, so a keyed
+  // job with active instances never says DONE beside them.
+  const displayStatus = createMemo(() => {
+    const status = jobData()?.job?.status || 'unknown'
+    if (status.toLowerCase() !== 'done') return status
+    const liveAllocation = (jobData()?.allocations ?? []).some((allocation) => !['complete', 'failed'].includes(allocation.status.toLowerCase()))
+    const liveInstance = (instances() ?? []).some((instance) => ['active', 'pending', 'rescheduling'].includes(instance.state))
+    return liveAllocation || liveInstance ? 'running' : status
   })
 
   // The instances panel appears for jobs that declare stateful tasks, or that
@@ -250,10 +262,12 @@ function JobDetailContent() {
             badges={
               <>
                 <StatusBadge
-                  status={jobData()!.job?.status || 'unknown'}
+                  status={displayStatus()}
                   title={
                     (jobData()!.job?.status ?? '').toLowerCase() === 'done'
-                      ? 'Submitted and scheduled. "done" is the manager\'s word for an accepted job, not a finished one — see the task cards for what is running.'
+                      ? displayStatus() === 'running'
+                        ? 'Allocations or instances of this job are running. The manager records the job itself as "done", its word for an accepted job.'
+                        : 'Submitted and scheduled. "done" is the manager\'s word for an accepted job, not a finished one — see the task cards for what is running.'
                       : undefined
                   }
                 />
@@ -453,27 +467,14 @@ function JobDetailContent() {
               </Show>
 
               <Show when={showInstancesPanel()}>
-                <SectionCard
-                  title="Instances"
-                  description="Stable identities for stateful tasks — instance ids and storage survive reschedules."
-                  flush
-                >
-                  <Show
-                    when={(instances() ?? []).length > 0}
-                    fallback={
-                      <p class="px-4 py-4 text-sm text-muted">
-                        {instances() === undefined ? 'Loading instances…' : 'No instances yet.'}
-                      </p>
-                    }
-                  >
-                    <InstancesTable rows={instanceRows()} />
-                    <Show when={hasKeyedTasks()}>
-                      <p class="border-t border-line px-4 py-2.5 text-xs text-faint">
-                        Keyed instances are managed from the CLI via <code class="rounded bg-surface2 px-1 font-mono">legion instance create/destroy</code> — read-only here.
-                      </p>
-                    </Show>
-                  </Show>
-                </SectionCard>
+                <Show when={instances() !== undefined} fallback={<SectionCard title="Instances"><p class="text-sm text-muted">Loading instances…</p></SectionCard>}>
+                  <InstancesPanel
+                    jobName={jobName()}
+                    rows={instanceRows()}
+                    keyed={hasKeyedTasks()}
+                    onChanged={() => void refetchInstances()}
+                  />
+                </Show>
                 <SnapshotsPanel
                   jobName={jobName()}
                   instances={instances() ?? []}

@@ -1,9 +1,25 @@
 import { For, type JSX } from 'solid-js'
 import { CompactNodeUsage, NodeUsageCard } from '../components/NodeUsagePanel'
-import { PressureExplanation, PressureHistoryCard, SnapshotEventSummary } from '../components/PressureHistory'
-import { SnapshotsTable } from '../components/SnapshotsPanel'
+import InstancesTable from '../components/InstancesTable'
+import { NodeContentCard } from '../components/NodeContentCard'
+import { InstanceEventSummary, PressureExplanation, PressureHistoryCard, SnapshotEventSummary } from '../components/PressureHistory'
+import { SnapshotHolders, SnapshotsTable } from '../components/SnapshotsPanel'
 import { Card, EmptyState, Note, PageHeader, SectionCard } from '../components/ui'
-import { emptyNode, olderWorkerNode, pressureEvents, pressuredNode, snapshotEvents, snapshots, unreportedNode } from '../fixtures/suspendResume'
+import {
+  emptyNode,
+  instanceEvents,
+  instances,
+  nodeContent,
+  olderWorkerNode,
+  pass2Snapshots,
+  pressureEvents,
+  pressuredNode,
+  snapshotEvents,
+  snapshots,
+  unreportedContent,
+  unreportedNode,
+} from '../fixtures/suspendResume'
+import { forkPlan, resumeBlocker, suspendPlan } from '../utils/instances'
 
 /*
  * Unlisted page (/testing) that renders components from fixture data, so a
@@ -45,7 +61,7 @@ export default function TestingUtils() {
         <NodeUsageCard usage={olderWorkerNode} />
       </Fixture>
 
-      <Fixture title="Worker usage: not reported" note="What a macOS worker, or one with enforcement off, looks like: capacity and reservations only.">
+      <Fixture title="Worker usage: not reported" note="What a macOS worker, or one with enforcement off, looks like: capacity and reservations only. CPU shows cores, since Apple Silicon reports no clock speed.">
         <NodeUsageCard usage={unreportedNode} />
       </Fixture>
 
@@ -72,17 +88,76 @@ export default function TestingUtils() {
         <PressureHistoryCard events={pressureEvents} scope="job" />
       </Fixture>
 
-      <Fixture title="Snapshots" note="Every state the manager sends today, plus a row with values a later manager will send (purpose suspend, state published). Actions are omitted.">
+      <Fixture title="Snapshots" note="Every snapshot state, plus a published suspend checkpoint. Actions are omitted.">
         <SectionCard title="Snapshots" flush>
           <SnapshotsTable snapshots={snapshots} />
         </SectionCard>
       </Fixture>
 
-      <Fixture title="Event summaries" note="What the Events page shows above the raw JSON for node.pressure and snapshot.* rows.">
+      <Fixture title="Event summaries" note="What the Events page shows above the raw JSON for node.pressure, snapshot.*, and instance.* rows.">
         <Card class="space-y-3 text-xs">
           <For each={pressureEvents}>{(event) => <PressureExplanation event={event} />}</For>
           <For each={snapshotEvents}>{(event) => <SnapshotEventSummary event={event} />}</For>
+          <For each={instanceEvents}>
+            {(event) => (
+              <div>
+                <p class="font-mono text-2xs text-faint">{event.kind}</p>
+                <InstanceEventSummary event={event} />
+              </div>
+            )}
+          </For>
         </Card>
+      </Fixture>
+
+      <Fixture
+        title="Instances: suspend, resume, fork"
+        note="Active with an idle countdown, restarted after a pressure eviction (last_stop), suspended to local memory, published memory, and a disk checkpoint, resuming, two forks with lineage, and a slot instance. The countdown ticks live."
+      >
+        <SectionCard title="Instances" flush>
+          <InstancesTable rows={instances.map((instance) => ({ instance }))} />
+        </SectionCard>
+      </Fixture>
+
+      <Fixture title="Instance actions" note="What each row's Suspend, Fork, and Resume would offer for the identity this page runs as. The manager's checkpoint_support decides memory and spread.">
+        <Card class="space-y-1 text-xs">
+          <For each={instances}>
+            {(instance) => {
+              const suspend = suspendPlan(instance, instance.jobId)
+              const fork = forkPlan(instance, instance.jobId)
+              return (
+                <p>
+                  <span class="mr-2 inline-block w-28 font-mono">{instance.instanceId}</span>
+                  <span class="text-muted">
+                    suspend: {suspend.blocker ?? `${suspend.defaultKind} (${suspend.choices.map((choice) => `${choice.kind} ${choice.blocker ? 'no' : 'yes'}`).join(', ')})`} · fork:{' '}
+                    {fork.blocker ?? `yes, spread ${fork.spreadBlocker ? 'no' : 'yes'}`}
+                    {instance.state === 'suspended' ? ` · resume: ${resumeBlocker(instance, instance.jobId) ?? 'yes'}` : ''}
+                  </span>
+                </p>
+              )
+            }}
+          </For>
+        </Card>
+      </Fixture>
+
+      <Fixture title="Snapshots: durability, names, fork and suspend checkpoints" note="Published with two names, a store snapshot whose publish is retrying, a fork checkpoint, a disk suspend checkpoint (size reads in place), and a manual disk snapshot.">
+        <SectionCard title="Snapshots" flush>
+          <SnapshotsTable snapshots={pass2Snapshots} onRemoveAlias={() => undefined} />
+        </SectionCard>
+        <Card class="text-xs">
+          <p class="eyebrow mb-1.5">Held on (golden)</p>
+          <SnapshotHolders snapshot={pass2Snapshots[0]} />
+        </Card>
+      </Fixture>
+
+      <Fixture title="Content and locality" note="The worker page's card from GetNodeContent: a node holding a warmed published snapshot, then one with no report. The budget bars show the slot the disk-budget fields fill once GetNodeUsage carries them.">
+        <NodeContentCard
+          content={nodeContent}
+          budgets={[
+            { name: 'artifacts', usedBytes: 6 * 1024 ** 3, budgetBytes: 20 * 1024 ** 3 },
+            { name: 'snapshots', usedBytes: 41 * 1024 ** 3, budgetBytes: 50 * 1024 ** 3 },
+          ]}
+        />
+        <NodeContentCard content={unreportedContent} />
       </Fixture>
 
       <Card pad={false}>

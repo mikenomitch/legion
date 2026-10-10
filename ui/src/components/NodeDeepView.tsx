@@ -1,7 +1,9 @@
+import { Code, ConnectError } from '@connectrpc/connect'
 import { A } from '@solidjs/router'
 import { For, Show, createMemo, createResource, createSignal, type JSX, type Resource } from 'solid-js'
 import { Badge, CodeBlock, Icon, MonoBadge, Note, PageHeader, RelativeTime, SectionCard, Spinner, StatusBadge, TableShell, cx, tableClass, tdClass, thClass, theadClass, trHoverClass } from './ui'
 import NodeAvailabilityControls, { type AvailabilityOutcome } from './NodeAvailabilityControls'
+import { NodeContentCard } from './NodeContentCard'
 import { NodeUsageCard } from './NodeUsagePanel'
 import { PressureHistoryCard } from './PressureHistory'
 import { AllocationPorts } from './ServiceEndpoints'
@@ -137,6 +139,15 @@ const accumulateUsage = (
       usage.items.set(name, set)
     }
   }
+}
+
+// An older manager (no GetNodeContent) or a caller without node:read reads
+// as "no card"; anything else is a real failure and rejects.
+const swallowUnavailable = (error: unknown): null => {
+  if (error instanceof ConnectError && [Code.Unimplemented, Code.PermissionDenied, Code.Unauthenticated, Code.NotFound].includes(error.code)) {
+    return null
+  }
+  throw error
 }
 
 const buildResourceUsage = (
@@ -537,6 +548,16 @@ export default function NodeDeepView(props: NodeDeepViewProps) {
       ([nodeId]) => nodeId ?? '',
     ),
   )
+  // What this node holds for content locality (GetNodeContent). `null` on a
+  // manager without the RPC or a caller without node:read: no card.
+  const [nodeContent] = createResource(
+    () => [props.nodes.latest?.[0]?.id, volumeTick()] as const,
+    retainOnError(
+      async ([nodeId]: readonly [string | undefined, number]) =>
+        nodeId ? managerClient.getNodeContent({ nodeId }).catch(swallowUnavailable) : null,
+      ([nodeId]) => nodeId ?? '',
+    ),
+  )
   // What this node's pressure response did lately. Needs operator:read, so a
   // denial just means no card.
   const eventTick = usePoll(INDEX_POLL_INTERVAL_MS)
@@ -756,6 +777,8 @@ export default function NodeDeepView(props: NodeDeepViewProps) {
                   <Show when={(pressureEvents() ?? []).length > 0}>
                     <PressureHistoryCard events={pressureEvents() ?? []} scope="node" />
                   </Show>
+
+                  <Show when={nodeContent()}>{(content) => <NodeContentCard content={content()} />}</Show>
 
                   <Show when={!nodeUsage() || resourceUsage().length > 0}>
                     <SectionCard

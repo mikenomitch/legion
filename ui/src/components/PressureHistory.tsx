@@ -1,7 +1,7 @@
 import { A } from '@solidjs/router'
-import { For, Show } from 'solid-js'
+import { For, Show, type JSX } from 'solid-js'
 import type { SchedulerEvent } from '../gen/legion_pb'
-import { newestFirst, pressureMeta, snapshotMeta } from '../utils/events'
+import { instanceMeta, newestFirst, pressureMeta, snapshotMeta } from '../utils/events'
 import { formatBytes } from '../utils/format'
 import { PressureSteps } from './NodeUsagePanel'
 import { RelativeTime, SectionCard } from './ui'
@@ -54,6 +54,9 @@ export function PressureHistoryCard(props: { events: readonly SchedulerEvent[]; 
                   <Show when={meta().step}>{(step) => <PressureSteps steps={[step()]} />}</Show>
                   <Show when={event.allocationId !== undefined}>
                     <span class="font-mono text-xs">#{String(event.allocationId)}</span>
+                  </Show>
+                  <Show when={meta().instanceId}>
+                    {(instance) => <span class="font-mono text-xs text-muted" title="Stateful instance">{instance()}</span>}
                   </Show>
                   <Show when={props.scope === 'node' && event.jobId}>
                     <A href={`/jobs/${encodeURIComponent(event.jobId!)}`} class="font-medium hover:text-brass-strong">
@@ -109,6 +112,39 @@ export function SnapshotEventSummary(props: { event: SchedulerEvent }) {
       </Show>
       <Show when={meta().error}>
         <span class="text-red-600 dark:text-red-400"><span class="font-semibold">error</span> {meta().error}</span>
+      </Show>
+    </p>
+  )
+}
+
+const field = (label: string, value: JSX.Element) => (
+  <span>
+    <span class="font-semibold text-faint">{label}</span> {value}
+  </span>
+)
+
+/** The fields of an `instance.*` event worth reading without opening the JSON. */
+export function InstanceEventSummary(props: { event: SchedulerEvent }) {
+  const meta = () => instanceMeta(props.event)
+  return (
+    <p class="flex flex-wrap gap-x-4 gap-y-1 text-muted">
+      <Show when={meta().instanceId ?? meta().origin}>{(instance) => field('instance', instance())}</Show>
+      <Show when={meta().reason}>{(reason) => field('reason', reason())}</Show>
+      <Show when={meta().snapshotId}>{(snapshot) => field(props.event.kind.startsWith('instance.fork') ? 'checkpoint' : 'snapshot', snapshot())}</Show>
+      <Show when={meta().kind}>{(kind) => field('kind', kind())}</Show>
+      <Show when={meta().totalBytes}>{(bytes) => field('size', formatBytes(bytes()))}</Show>
+      <Show when={meta().durationMs}>{(ms) => field('took', `${ms()} ms`)}</Show>
+      <Show when={meta().restoreMs}>{(ms) => field('restore', `${ms()} ms`)}</Show>
+      <Show when={meta().pauseMs}>{(ms) => field('paused', `${ms()} ms`)}</Show>
+      <Show when={meta().instances.length > 0}>{field('forks', meta().instances.join(', '))}</Show>
+      <Show when={meta().reserved}>{field('reservation', 'held')}</Show>
+      <Show when={meta().outcome}>{(outcome) => field('outcome', outcome())}</Show>
+      <Show when={meta().error}>
+        {(error) => (
+          <span class="text-red-600 dark:text-red-400">
+            <span class="font-semibold">error</span> {error()}
+          </span>
+        )}
       </Show>
     </p>
   )
