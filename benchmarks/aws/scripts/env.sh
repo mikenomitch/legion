@@ -66,8 +66,13 @@ fi
 # over ssh. install-loadgen.sh puts the key here; RSH_FROM_LOADGEN is the
 # prefix to use in any command string destined for that box, which has no
 # ssh agent to fall back on.
+#
+# It skips known_hosts on purpose. Spot workers come and go and reuse
+# private IPs, so a remembered host key goes stale between campaigns and
+# accept-new refuses the hop. On 2026-10-10 that silently cancelled a K8s
+# storm drill's kill. These hops stay inside the rig's VPC.
 RIG_KEY_ON_LOADGEN=/home/ubuntu/.ssh/bench_key
-RSH_FROM_LOADGEN="ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o IdentitiesOnly=yes -i $RIG_KEY_ON_LOADGEN"
+RSH_FROM_LOADGEN="ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10 -o IdentitiesOnly=yes -i $RIG_KEY_ON_LOADGEN"
 
 # On-rig the operator's ssh agent isn't there either, so use that key.
 if [ "$BENCH_ON_RIG" = 1 ]; then
@@ -186,9 +191,12 @@ worker_instances() {
         --output text)
     [ -n "$ids" ] || return 0
     # shellcheck disable=SC2086
+    # A just-InService instance can briefly describe with no private IP
+    # (the 10k K8s rerun on 2026-10-10 died ssh-ing to "None"). Leave it
+    # out until it has one, so wait_for_workers keeps waiting for it.
     aws ec2 describe-instances --region "$REGION" --instance-ids $ids \
         --query 'Reservations[].Instances[].[InstanceId,PublicIpAddress,PrivateIpAddress]' \
-        --output text
+        --output text | awk '$3 != "None"'
 }
 
 # worker_addr <public-ip> <private-ip> -> the one this mode can reach.
@@ -345,6 +353,58 @@ assert_fleet() { # assert_fleet <manager> <expected> <slices> [timeout]
             echo "fleet never reached an exact census in ${timeout}s: $(census_line "$census" "$want")" >&2
             echo "  Wanted $want rows, every one of them active AND available, every" >&2
             echo "  name from $SIM_NAME_PREFIX-<0..$((slices - 1))>-*." >&2
+            return 1
+        }
+        sleep 10
+    done
+}
+
+# Copy the driver, translator, and scenarios onto the loadgen box. Called
+# at every campaign start, not only at bringup: the loadgen box otherwise
+# keeps whatever was staged when the rig came up, and the first Nomad
+# smoke of 2026-10-09 ran a driver and translator from before that day's
+# fixes — the old `mock` driver name, no HTTP submitter — and placed
+# nothing while the repo on the operator box was already correct.
+stage_driver() {
+    local stage
+    stage=$(mktemp -d)
+    cp -r "$AWS_BENCH_ROOT/driver" "$AWS_BENCH_ROOT/workloads" "$stage/"
+    mkdir -p "$stage/scenarios"
+    cp "$SCENARIOS_DIR"/*.json "$stage/scenarios/"
+    find "$stage" -name __pycache__ -prune -exec rm -rf {} +
+    tar -C "$stage" -czf - . | rsh "$LOADGEN_ADDR" "tar -C /opt/bench -xzf -"
+    rm -rf "$stage"
+}
+
+# Ready-node count for the competitor systems, which have no node_census.
+ready_node_count() { # ready_node_count <nomad|k8s>
+    case "$1" in
+    nomad)
+        rsh "$LOADGEN_ADDR" "curl -fsS -m 20 http://${CP_PRIVATE_IPS[0]}:4646/v1/nodes" 2>/dev/null |
+            jq '[.[] | select(.Status == "ready" and .SchedulingEligibility == "eligible")] | length' 2>/dev/null
+        ;;
+    k8s)
+        rsh "$LOADGEN_ADDR" "kubectl get nodes -l type=kwok -o json" 2>/dev/null |
+            jq '[.items[] | select(any(.status.conditions[]?; .type == "Ready" and .status == "True"))] | length' 2>/dev/null
+        ;;
+    esac
+}
+
+# The competitor systems' equivalent of assert_fleet: exactly <want> ready
+# nodes, refusing a larger count rather than measuring a dirty cluster.
+wait_for_ready_nodes() { # wait_for_ready_nodes <nomad|k8s> <want> [timeout]
+    local system="$1" want="$2" timeout="${3:-600}" deadline ready
+    deadline=$(($(date +%s) + timeout))
+    while :; do
+        ready=$(ready_node_count "$system")
+        log "  $system ready nodes: ${ready:-?}/$want"
+        [ "${ready:-}" = "$want" ] && return 0
+        if [ -n "$ready" ] && [ "$ready" -gt "$want" ] 2>/dev/null; then
+            echo "$system has $ready ready nodes, more than the $want this cell asked for — reset the control plane" >&2
+            return 1
+        fi
+        (($(date +%s) < deadline)) || {
+            echo "$system never reached $want ready nodes in ${timeout}s (last: ${ready:-unknown})" >&2
             return 1
         }
         sleep 10

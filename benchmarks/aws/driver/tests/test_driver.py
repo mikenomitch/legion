@@ -9,6 +9,7 @@ plan's testing section. Stdlib unittest only; run with:
 on benchmark-file changes.)
 """
 
+import argparse
 import json
 import os
 import sys
@@ -26,6 +27,9 @@ from driver import (  # noqa: E402
     RunRecorder,
     compute_metrics,
     cross_check_counts,
+    http_submit_all,
+    iter_stream_lines,
+    make_adapter,
     monotonic_offset_ms,
     parse_legion_event,
     parse_prometheus_gauge,
@@ -302,11 +306,34 @@ class TranslatorShapes(unittest.TestCase):
         _, api, _ = next(iter(translate.iter_jobs(self.scenario, 1.0)))
         hcl = translate.nomad_job("bench-api-0", api)
         self.assertIn('job "bench-api-0"', hcl)
-        self.assertIn('driver = "mock"', hcl)
+        # "mock_driver" is the name Nomad's mock plugin registers under, and
+        # the one nodesim advertises. This assertion used to say "mock",
+        # which no node offers, so every Nomad job would have been
+        # infeasible.
+        self.assertIn('driver = "mock_driver"', hcl)
         self.assertIn("count = 4", hcl)
         self.assertIn('attribute = "${node.class}"', hcl)
         self.assertIn("cpu    = 500", hcl)
         self.assertEqual(hcl.count('group "'), 2)
+
+    def test_nomad_api_job_matches_the_hcl(self):
+        _, api, _ = next(iter(translate.iter_jobs(self.scenario, 1.0)))
+        job = translate.nomad_api_job("bench-api-0", api)["Job"]
+        self.assertEqual(job["ID"], "bench-api-0")
+        self.assertEqual(len(job["TaskGroups"]), 2)
+        group = job["TaskGroups"][0]
+        self.assertEqual(group["Count"], 4)
+        self.assertEqual(group["Tasks"][0]["Driver"], "mock_driver")
+        self.assertEqual(group["Tasks"][0]["Resources"], {"CPU": 500, "MemoryMB": 1024})
+        self.assertEqual(
+            group["Constraints"],
+            [{"LTarget": "${node.class}", "RTarget": "web", "Operand": "="}],
+        )
+
+    def test_nomad_refuses_constraints_nodesim_cannot_satisfy(self):
+        with self.assertRaises(ValueError):
+            translate.nomad_job("j", {"tasks_per_job": 1, "task_count_per_task": 1,
+                                      "constraints": {"gpu": "a100"}})
 
     def test_k8s_deployment_shape(self):
         _, api, _ = next(iter(translate.iter_jobs(self.scenario, 1.0)))
@@ -347,14 +374,105 @@ class NativeSubmitterWiring(unittest.TestCase):
                 resolve_loadgen_bin(os.path.join(tmp, "nope"), "/bin/echo")
             )
 
-    def test_nomad_and_k8s_never_take_a_native_path(self):
-        # The fairness rule, as an assertion: if either of these ever starts
-        # returning True without an equivalent submitter behind it, every
-        # cross-system comparison silently becomes invalid.
-        nomad = NomadAdapter("http://127.0.0.1:4646")
-        k8s = K8sAdapter()
-        self.assertFalse(nomad.submit_all("dir", [], None, 256))
-        self.assertFalse(k8s.submit_all("dir", [], None, 256))
+    def test_cli_mode_puts_every_system_on_the_shared_loop(self):
+        # The fairness rule, as an assertion: `--submitter cli` must force
+        # all three systems onto the process-per-job loop. If either
+        # competitor ever took its HTTP path under `cli`, a "CLI baseline"
+        # table would silently compare two different submitters.
+        args = argparse.Namespace(
+            system="nomad", manager="http://127.0.0.1:4646", nomad_bin="nomad",
+            kubeconfig=None, kubectl_bin="kubectl", submitter="cli",
+        )
+        self.assertFalse(make_adapter(args).submit_all("dir", [], None, 256))
+        args.system = "k8s"
+        self.assertFalse(make_adapter(args).submit_all("dir", [], None, 256))
+
+    def test_competitors_take_their_native_path_by_default(self):
+        args = argparse.Namespace(
+            system="nomad", manager="http://127.0.0.1:4646", nomad_bin="nomad",
+            kubeconfig=None, kubectl_bin="kubectl", submitter="auto",
+        )
+        self.assertTrue(make_adapter(args).native)
+        args.system = "k8s"
+        self.assertTrue(make_adapter(args).native)
+
+    def test_stream_lines_survive_frames_split_across_chunks(self):
+        # Watch frames arrive in arbitrary chunk boundaries; a frame split
+        # across two reads must come out whole, and only a real end of body
+        # (read1 -> b"") may end the stream.
+        class Chunks:
+            def __init__(self, parts):
+                self.parts = list(parts)
+
+            def read1(self, _n):
+                return self.parts.pop(0) if self.parts else b""
+
+        lines = list(iter_stream_lines(Chunks([b'{"a":1}\n{"b"', b':2}\n', b'{"c":3}'])))
+        self.assertEqual(lines, [b'{"a":1}', b'{"b":2}', b'{"c":3}'])
+
+    def test_http_submitter_retries_server_errors_and_counts_them(self):
+        statuses = [500, 503, 200]
+
+        class Response:
+            def __init__(self, status):
+                self.status = status
+
+            def read(self):
+                return b"leadership lost while committing log"
+
+        class Conn:
+            def request(self, *args, **kwargs):
+                pass
+
+            def getresponse(self):
+                return Response(statuses.pop(0))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            recorder = RunRecorder(tmp)
+            try:
+                retries = http_submit_all(
+                    [{"name": "bench-a-0"}],
+                    lambda job: [("POST", "/v1/jobs", b"{}")],
+                    Conn,
+                    recorder,
+                    1,
+                )
+            finally:
+                recorder.close()
+        self.assertEqual(retries, 2)
+        self.assertEqual(statuses, [])
+
+    def test_http_submitter_stamps_every_job_and_sends_every_request(self):
+        sent = []
+
+        class FakeResponse:
+            status = 200
+
+            def read(self):
+                return b"{}"
+
+        class FakeConn:
+            def request(self, method, path, body=None, headers=None):
+                sent.append((method, path, body))
+
+            def getresponse(self):
+                return FakeResponse()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            recorder = RunRecorder(tmp)
+            try:
+                jobs = [{"name": f"bench-a-{i}"} for i in range(5)]
+                http_submit_all(
+                    jobs,
+                    lambda job: [("POST", "/x", job["name"].encode())] * 2,
+                    FakeConn,
+                    recorder,
+                    3,
+                )
+                self.assertEqual(len(sent), 10)
+                self.assertEqual(set(recorder.submits), {j["name"] for j in jobs})
+            finally:
+                recorder.close()
 
     def test_legion_without_a_submitter_binary_falls_back(self):
         adapter = LegionAdapter("http://127.0.0.1:4747", loadgen_bin=None)

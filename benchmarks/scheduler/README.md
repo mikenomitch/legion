@@ -735,3 +735,102 @@ floor is above the +3% the changed cells moved, and every changed cell's
 interval overlaps zero. Read as: no detectable cost, on a host that
 cannot resolve one below ~5%. The 5k/10k `indexes_on` cells remain
 ~40-50% faster than the scan, unchanged from the baseline.
+
+## Per-plan cost flat in node count (fleet-scaling Phases 1-2) — 2026-10-09
+
+[plan-path-fleet-scaling-plan.md](../../internal_docs/plans/plan-path-fleet-scaling-plan.md):
+persistent read-model maps (O(1) capacity snapshot carrying the fence
+epochs, no lazy-sample re-plans) and a budgeted verify-as-you-walk index
+query. M-series laptop. "Before" is `main` @ `e77f3e8`, run from a
+worktree on the same host in the same session.
+
+New group `plan_fleet_scaling`, fill 5 allocations per node, per plan:
+
+| Cell | Before | After |
+| --- | --- | --- |
+| `plan_and_apply`, 5,000 nodes | 1.76 ms (build 1,084 µs, capacity 100 µs) | 0.86 ms (build 297 µs, capacity 0 µs) |
+| `plan_and_apply`, 10,000 nodes | 3.55 ms (build 2,592 µs, capacity 244 µs) | 1.04 ms (build 406 µs, capacity 0 µs) |
+| concurrent, 5,000 nodes | 5.9 ms/plan, 86% re-planned, ≥400 plans/s (capped by its job count) | 5.6 ms/plan, 0% re-planned, 711 plans/s |
+| concurrent, 10,000 nodes | 12.7 ms/plan, 96% re-planned, 315 plans/s | 5.7 ms/plan, 0% re-planned, 695 plans/s |
+
+The concurrent cells are four planners plus a background writer for 4 s.
+Before the change their per-plan cost doubled from 5k to 10k nodes, and
+after it is flat. What remains is `apply` (about 5.1 ms of the 5.7),
+the local SQLite commit under four writers, which this change does not
+touch. The "before" concurrent run gave each planner 400 jobs, which
+capped the 5k cell's rate; the 10k cell finished below the cap.
+
+Existing groups, before → after:
+
+| Cell | Before | After |
+| --- | --- | --- |
+| `plan_under_fill/plan_only/fill_0` | 525 µs | 145 µs |
+| `plan_under_fill/plan_only/fill_40` | 624 µs | 150 µs |
+| `plan_under_fill/plan_and_apply/fill_40` | 1.43 ms | 0.93 ms |
+| `candidate_construction/indexes_on/nodes_5000` | 2.46 ms | 1.89 ms |
+| `candidate_construction/indexes_on/nodes_10000` | 4.61 ms | 2.67 ms |
+| `candidate_construction/indexes_off/nodes_10000` | 8.13 ms | 8.15 ms |
+
+`indexes_off` is the control: it never takes the index walk and stays
+flat, which puts this run's noise floor at about 1%. No cell regressed.
+
+## The eval outside `plan()` (fleet-scaling Phase 4) — 2026-10-10
+
+[plan-path-fleet-scaling-plan.md § 13](../../internal_docs/plans/plan-path-fleet-scaling-plan.md):
+the cached available-node set (no per-plan `node_lookup` map or list
+clone), indexes for the eval path's O(jobs) scans, dispatch reading the
+read model, and `prepare_cached` on hot statements. M-series laptop.
+"Before" is the Phases 1-2 tree; both binaries ran back to back.
+
+`plan_fleet_scaling`, fill 5. `eval_cycle` (new) is claim + `job_submit`
+handler + settle, 150 evals:
+
+| Nodes | `plan_and_apply` before → after | `eval_cycle` before → after | Old per-plan `node_lookup` build alone |
+| --- | --- | --- | --- |
+| 1,000 | 0.70 → 0.62 ms | 1.39 → 1.13 ms | 25 µs |
+| 5,000 | 0.89 → 0.69 ms | 1.45 → 1.00 ms | 99 µs |
+| 10,000 | 0.97 → 0.77 ms | 1.78 → 1.34 ms | 208 µs |
+| 20,000 | 1.23 → 0.88 ms | 1.78 → 1.12 ms | 474 µs |
+| 50,000 | 3.01 → 1.01 ms | 4.90 → 1.63 ms | 1,756 µs |
+
+Concurrent cells (four planners plus a background writer, 4 s):
+
+| Cell | Before | After |
+| --- | --- | --- |
+| 5,000 nodes | 774 plans/s, 5.2 ms/plan (apply 4.7) | 1,262 plans/s, 3.2 ms/plan (apply 2.8) |
+| 10,000 nodes | 738 plans/s, 5.4 ms/plan (apply 4.8) | 1,253 plans/s, 3.2 ms/plan (apply 2.8) |
+
+Existing groups, before → after (second, quieter run):
+
+| Cell | Before | After |
+| --- | --- | --- |
+| `plan_under_fill/plan_only/fill_0` | 133 µs | 64 µs |
+| `plan_under_fill/plan_only/fill_40` | 142 µs | 65 µs |
+| `candidate_construction/indexes_on/nodes_10000` | 2.70 ms | 2.74 ms |
+| `candidate_construction/indexes_off/nodes_10000` | 8.51 ms | 8.12 ms |
+
+`candidate_construction` is flat within noise, as expected: it never built
+the per-plan lookup. The bench keeps the job count small, so it shows the
+node term only. A throwaway probe at the rig's shape (20k nodes, 16.7k
+jobs, 100k allocations) measured the jobs term: eval cycle 2.7 ms at 4,166
+jobs before the indexes, 1.3 ms after, and 1.4 ms at 16.7k jobs.
+
+## AWS `web_fleet` with Phase 4 and adaptive cadence — 2026-10-10
+
+End to end on the AWS rig (3 x `m6id.xlarge` legion-a raft, native
+submitter, burst cells), build `ac024750`. "Before" is the 2026-10-09
+comparison build. Public write-up in [docs/benchmarks.md](../../docs/benchmarks.md).
+
+| Nodes | Alloc/s before → after | p99, time to place 99% of the burst, before → after | Served heartbeat |
+| --- | --- | --- | --- |
+| 1,000 | 733 → 829 | 4.4 → 4.2 s | 2 s |
+| 2,000 | 669 → 789 | 8.4 → 7.0 s | 2 s |
+| 5,000 | 736 → 905 | 30 → 18.6 s | 2-5 s |
+| 10,000 | 322 → 738 | 112 → 43.6 s | 5-8 s |
+| 20,000 | ~85 → 553 | ~1,000 → 99.6 s | up to 21 s |
+| 50,000 | not run → 327 | → 427 s | 34-55 s |
+
+`batch_burst` at 5k: 1,463 → 1,879 alloc/s. Eval `queue_wait` averages
+~0.3 ms at every size, so the blocking-pool starvation is gone. The
+`plan` phase averages 26 ms per eval at 20k and 45 ms at 50k, far above
+`plan_and_apply` here, and is the open item in TODO.md.

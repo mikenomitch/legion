@@ -172,9 +172,15 @@ variable "worker_instance_types" {
     Spot capacity pool, in preference order. Diversified so a spot
     reclaim in one pool doesn't stall a campaign; all entries are
     8 vCPU / 16 GiB so sim-fleet capacity per instance stays uniform.
+
+    The AMD pools are there for capacity, not preference: on 2026-10-09
+    the three Intel pools alone scored 1/10 on spot placement in
+    us-east-1a and the ASG failed with InsufficientInstanceCapacity at
+    bringup; adding c7a/c6a lifted the same AZ to 9/10. Check with
+    `aws ec2 get-spot-placement-scores` before narrowing this list.
   EOT
   type        = list(string)
-  default     = ["c7i.2xlarge", "c6i.2xlarge", "c5.2xlarge"]
+  default     = ["c7i.2xlarge", "c6i.2xlarge", "c7a.2xlarge", "c6a.2xlarge", "c5.2xlarge"]
 }
 
 variable "worker_disk_gb" {

@@ -271,6 +271,7 @@ impl RaftTransport for RaftTransportService {
                 leader_hint: store
                     .lane_leader_hint(crate::storage::Lane::Status)
                     .unwrap_or_default(),
+                served_interval_seconds: None,
             }));
         }
         store
@@ -280,6 +281,12 @@ impl RaftTransport for RaftTransportService {
             accepted: true,
             not_status_leader: false,
             leader_hint: String::new(),
+            // The leader owns the cadence ladder; a follower relays this to
+            // its own workers so adaptive cadence is not leader-only.
+            served_interval_seconds: store
+                .liveness()
+                .served_interval()
+                .map(|interval| interval.as_secs() as u32),
         }))
     }
 }

@@ -74,6 +74,100 @@ How to use it:
 
 ## Scheduling & placement
 
+- [x] **Per-eval planning cost no longer grows with node count
+      (local; AWS retest pending).** Phases 1-2 of
+      [plan-path-fleet-scaling-plan.md](plans/plan-path-fleet-scaling-plan.md)
+      (2026-10-09, uncommitted on `bench/aws-comparison-refresh`): the
+      read model's snapshot maps are persistent (`imbl`), so the capacity
+      snapshot is O(1) and carries the fence epochs, which retires the
+      lazy/eager sample and its re-plans (86-96% of concurrent plans in
+      the bench); index-served candidates are verified during a budgeted
+      walk instead of across the whole shard. Concurrent per-plan cost in
+      `plan_fleet_scaling` is now flat from 5k to 10k nodes (5.9 → 3.8 ms
+      and 12.7 → 3.7 ms). Public docs: scheduler-and-eval-loop.md,
+      scheduling-indexes.md, metrics.md, testing-and-benchmarks.md.
+- [x] **Confirm the fleet-scaling fix on AWS** (plan Phase 3, 2026-10-09):
+      10k `web_fleet` 163 → 322 alloc/s, 5k 504 → 736, dense 5k
+      1,983-719 → 2,401-1,049 alloc/s across the sweep. Numbers in the plan.
+- [x] **Per-eval O(fleet) and O(jobs) residuals removed, and the whole
+      eval is instrumented** (plan Phase 4, 2026-10-10, uncommitted): the
+      available-node set and its by-id lookup are cached as one shared
+      `Arc` (no per-plan `node_lookup` map or list clone; rebuilt off the
+      write lock only after a node change); the eval path's O(jobs) SQL
+      scans got indexes (`job_update.to_job_config_id`,
+      `job_config(name, version)`; the plan apply's own-usage read rides
+      the `job_config(job_id, created_at)` index added alongside); dispatch
+      and batch follow-ups read nodes and task configs from the read model
+      instead of SQLite; hot eval-path statements are `prepare_cached`.
+      New metrics `legion_eval_phase_seconds` (incl. blocking-pool
+      `queue_wait` and `conflict_backoff`), `legion_eval_queue_round_seconds`,
+      `legion_store_read_model_lock_wait_seconds`,
+      `legion_scheduler_node_list_rebuilds_total`, plus plan phases
+      `job_lookup` / `speculative_dispatch` / `post_apply`; the AWS collector
+      scrapes them. `plan_fleet_scaling` covers 20k/50k nodes and an
+      `eval_cycle` cell. Numbers in the plan and
+      [benchmarks/scheduler/README.md](../benchmarks/scheduler/README.md).
+- [x] **Leader-side O(jobs²) scans and lost-node under-placement fixed**
+      (plan § 13.6, 2026-10-10, uncommitted): `job_config(job_id,
+      created_at)`, `job_config(job_id, version)`, and
+      `rollout(to_job_config_id)` indexes (the status checker's
+      `jobs_with_unrolled_latest_config` went 60 s → 31 ms at 16.7k jobs, and
+      10k `web_fleet` 322 → 537 alloc/s on AWS); cached heartbeat statements;
+      lost-node replans now retry plan conflicts and hand off to a
+      `job_reschedule` eval instead of leaving the job short
+      ([calls](calls/plan-path-fleet-scaling-plan_calls.md) #15).
+- [ ] **Heartbeats rebuild the node's whole desired set every beat.** Add a
+      desired-state version to the heartbeat so an unchanged node gets a
+      cheap "unchanged" reply (proto + worker change). Adaptive cadence
+      already caps the beat rate (calls #16).
+- [ ] **Job stop/destroy at scale drains at ~4 evals/s** (AWS 10k cleanup,
+      2026-10-10). Profile with `legion_eval_phase_seconds{kind="job_stop"}`.
+- [x] **Re-ran `web_fleet` on AWS with Phase 4 and adaptive cadence**
+      (2026-10-10, build `ac024750`): 829 / 789 / 905 / 738 / 553 / 327
+      alloc/s at 1k / 2k / 5k / 10k / 20k / 50k nodes, against 733 / 669 /
+      736 / 322 / ~85 before. Eval `queue_wait` is now ~0.3 ms, so the
+      blocking-pool contention is gone. Public numbers in
+      [docs/benchmarks.md](../docs/benchmarks.md).
+- [ ] **The rig's plan phase is ~25x the micro-bench.** On AWS
+      `legion_eval_phase_seconds{phase="plan"}` averages 26 ms per
+      `job_submit` eval at 20k nodes and 45 ms at 50k, against ~1 ms for
+      `plan_and_apply` in `plan_fleet_scaling`. The leader sits at ~2 of 4
+      cores, so this is now the throughput ceiling past 10k. Break it down
+      with the plan sub-phases (`job_lookup`, `speculative_dispatch`,
+      `post_apply`) and a perf profile at 50k before guessing (plan § 13).
+      First read of the 50k archive: `apply` is ~82% of plan time and
+      leader CPU is ~2 of 4 cores, so this is serial commit work, not a core
+      shortage. The two items below are the follow-ups.
+- [ ] **Make plan-commit cost flat in fleet size.** The slowest coalesced
+      commit lane grows 9.2 → 13.5 → 23.3 ms at 5k / 20k / 50k nodes for
+      the same size of plan, so something inside the commit transaction
+      scales with node count. Suspects, none verified: the free-pool
+      rebuild inside the apply commit, the read-model reprojection, or
+      heartbeat writes sharing the lane. Profile the commit path at 50k to
+      find out. This is the biggest throughput lever past 10k nodes, and it
+      likely explains most of the plan-phase item above.
+- [ ] **Batch more plans per commit.** Group commit averages ~1.75 plans
+      per commit at every fleet size, so there is room. The rig runs 4 eval
+      threads. Phase 2 found 16 threads cost ~11% because extra planners
+      collided, but plan conflicts are now zero, so re-measure with one
+      `run-campaign.sh --system legion-a --eval-threads 8` campaign at 20k
+      (50k cleanup takes ~2h) and compare plans per commit and throughput.
+- [ ] **`sync_missing_task_volume_claims` still runs one task-config query
+      per active job per checker tick** on the scheduler leader (86 ms at
+      16.7k jobs locally with the new index, 9.5 s without). Prefilter in
+      SQL to jobs whose latest config declares volumes. Left alone in
+      Phase 4 because the status-checker loop was being changed in parallel
+      (plan § 13).
+- [ ] **In-place rollout ticks build an O(fleet) exclusion set**
+      (`src/manager/rollout.rs` `available_node_ids` → "every available node
+      except the old ones"), which also forces the plan's filtered node-set
+      copy. Express it as an allow-list instead (plan § 13).
+- [ ] **Truncation-ineligible tasks still scan the fleet** (`count.per`,
+      `distinct`, volumes, multi-task groups): a deliberate non-goal of the
+      fleet-scaling plan, open as its own follow-up.
+- [ ] **Retire `legion_scheduler_lazy_sample_fallback_total`** and the
+      `lazy_version_sample` key one release after the fleet-scaling
+      change ships. Both are inert now (docs/metrics.md).
 - [ ] **Find what makes `apply` 27.9 ms/eval.** Phase 3 measured
       plan-apply conflicts at **0%** (from 31.9%) with throughput
       unchanged at 80.35/s, so the ceiling is the replicated write path,
@@ -553,6 +647,59 @@ How to use it:
         dispatch to the top *n* candidates and refuse the losers, or hand the
         apply walk the claim set so it prefers a node already holding one.
         Needs the fallback-rank metric to say how often it actually bites.
+  - [ ] **Ratification throughput at scale.** An edge start boots without a
+        manager, but every start still needs one durable ratification
+        (`ratify_claim` in `src/manager/server.rs` → `edge_boot::ratify`),
+        and that caps sustained sandboxes/sec. Nothing here is measured for
+        edge boot yet. The estimates come from the 2026-10-10 AWS scheduler
+        runs (3 × 4-vCPU managers), where the plan-commit lane took 9.2 /
+        13.5 / 23.3 ms per commit at 5k / 20k / 50k nodes. Do the load test
+        first so every later change has a before/after number. Broader than
+        the phase-5 "ratification batching" item above, which is per node.
+    - [ ] **Ratification load test (do first).** A `legion-loadgen` mode that
+          mints prefix tickets and drives `RatifyClaim` at a fixed open-loop
+          rate (reuse `--rate`) against `--simulate` nodes. Report ratify
+          p50/p99, confirmed vs refused by reason, coalescer batch size and
+          commit time on the lanes involved, and the rate where p99 crosses
+          `ratifyTimeout`. Numbers go in `benchmarks/scheduler/README.md`.
+    - [ ] **Stop the ticket spend from being its own raft commit.**
+          `verify_and_spend` → `Store::spend_boot_ticket`
+          (`src/storage/boot_ticket_store.rs`) is one unbatched
+          `replicated(Lane::Control, ..)` write per start, and the placement
+          then commits again on the plan path. That is two serial commits per
+          sandbox, and the unbatched one is likely the first ceiling
+          (hundreds to low thousands per second). Prefer folding the
+          conditional `UPDATE boot_ticket` into the ratification's plan-apply
+          transaction: one commit per start, and a refused placement stops
+          burning a ticket use. Fallback: a spend coalescer like
+          `heartbeat_coalescer`. Keep the cross-node double-spend refusal and
+          test it, plus expiry and refused-placement-leaves-`uses_spent`.
+    - [ ] **Let ratifications fill commit batches.** Ratifications go through
+          `submit_and_apply_plan_for_instance` → the plan coalescer, capped by
+          `plan_apply_batch_max` (default 16, clamped 1..=128). Evals fill
+          ~1.75 per batch, but ratifications arrive from thousands of nodes at
+          once, so 16 may be the cap: ~1,700 / 1,200 / 700 per sec at 5k / 20k
+          / 50k nodes, against ~14,000 / 9,500 / 5,500 at 128 if commit cost
+          held (it will not fully, since bigger batches commit slower).
+          Measure 16 / 64 / 128 and pick the default, or a separate
+          ratification cap, from data. Record the call.
+    - [ ] **Backpressure before lease expiry.** Unratified work is killed at
+          `ratifyTimeout` (default 5s, `DEFAULT_RATIFY_TIMEOUT` in
+          `src/structs/edge_boot.rs`). If ratify latency climbs past that,
+          booted sandboxes die and get retried, adding load at the worst
+          time, and nothing stops nodes admitting new edge starts meanwhile.
+          Refuse early instead: a typed, retryable `overloaded` refusal,
+          from the manager when ratify queue latency passes a fraction of the
+          lease, or from nodes tracking their own recent ratify latency. It
+          must reach `legion sandbox start` as `retryable: true`, with a
+          metric for overload refusals and a failure-mode section in
+          [edge-boot.md](../docs/edge-boot.md). Test that new claims are
+          refused before boot above the threshold, in-flight claims are not
+          killed early, and admission resumes when latency drops.
+    - [ ] Plan-commit cost growing with fleet size caps ratification the
+          same way it caps scheduling. Fix it once, under "Make plan-commit
+          cost flat in fleet size" in Scheduling & placement, and make the
+          load test show how much of ratify latency is commit time.
 - [ ] Worker groups + taint/toleration equivalent. Node pools exist as an ACL
       and config concept but nothing scheduling-side consumes them.
 - [ ] Preemption follow-ups — the feature shipped
@@ -742,7 +889,7 @@ How to use it:
         the ASG API under a narrow `orchestrator` IAM role; the spot
         fleet is released on any campaign exit (`--keep-fleet` opts
         out). See the README's "Unattended runs" and calls entries
-        12-14.
+        16-18.
   - [x] Quota headroom + durable results (2026-08-02):
         `var.worker_on_demand_percentage` splits the sim fleet across the
         spot and on-demand vCPU quotas (separate AWS limits) so neither
@@ -756,10 +903,10 @@ How to use it:
         with only HTTPS and credentials — no SSH, no repo, no terraform
         state — can check on an unattended campaign and tell "stalled"
         from "quiet". README "Watching from somewhere else" and "Keeping
-        results after the rig is gone"; calls entries 11 and 15-17.
+        results after the rig is gone"; calls entries 15 and 19-21.
   - [x] Bootstrap the operator box the campaign is driven from
         (`scripts/bootstrap-operator-box.sh`, `scripts/phase1.sh`; calls
-        entries 18-19). One command takes an AWS key to a running
+        entries 22-23). One command takes an AWS key to a running
         phase 1: builds an Ubuntu x86_64 box outside the rig's terraform
         (it *runs* that terraform, and must outlive `teardown.sh`, which
         destroys the state), gives it an Elastic IP so `admin_cidr` stays
@@ -1037,15 +1184,55 @@ How to use it:
         latency pool has two populations and one blended ratio, which can
         mask a problem in the fast pool. Named as a known limitation on
         [docs/heartbeat-cadence-and-scale.md](../docs/heartbeat-cadence-and-scale.md).
-  - [ ] **Should adaptive cadence default on?** Off by default today because
-        the benchmark-fairness argument is strongest while the comparative
-        numbers are being produced. The criterion for flipping: a campaign
-        run showing a cluster past its ceiling surviving with adaptive on,
-        detection latency inside the documented bound, and the same run
-        reproducing the collapse with it off — with
-        `targetRatePerSecond` auto-derived from measured `R` rather than
-        configured.
-        [cadence plan §11](plans/heartbeat-cadence-at-scale-plan.md).
+  - [ ] **Clamp the served heartbeat interval below the stateful
+        self-fence.** Adaptive cadence is on by default now, and nothing
+        checks the served interval against `selfTerminateAfter` (90s by
+        default). At the default 2,500 beats/s the 89s rung arrives past
+        ~68,750 nodes, where a healthy worker can fence its stateful tasks
+        between beats, and windows pass the fence from the 21s rung (~16,250
+        nodes). Fix shape: cap the served interval below the smallest
+        `selfTerminateAfter` among running stateful allocations, without
+        making the controller depend on more than `N` for everyone else.
+        Documented as a known limitation in
+        [heartbeat-cadence-and-scale.md](../docs/heartbeat-cadence-and-scale.md#known-limitations).
+        [cadence plan §13](plans/heartbeat-cadence-at-scale-plan.md),
+        [call 14](calls/heartbeat-cadence-at-scale-plan_calls.md).
+  - [ ] **Measure adaptive-by-default on the AWS rig.** The default flipped
+        on the cost evidence (~10,000 heartbeats/s took more than a core of
+        the leader at 20k nodes) without the plan's own criterion: a run
+        showing a fleet past its ceiling surviving with adaptive on. Owed: the
+        10k and 20k steps at the default rate, recording served interval,
+        lost window, freshness, leader CPU, and scheduler throughput against
+        a `heartbeat = { adaptive = false }` run of the same steps. The
+        adaptive half ran on 2026-10-10 (served 5-8s at 10k, up to 21s at
+        20k, 34-55s at 50k, all cells complete), so the `adaptive = false`
+        comparison is what is left.
+        [cadence plan §13](plans/heartbeat-cadence-at-scale-plan.md),
+        [call 2](calls/heartbeat-cadence-at-scale-plan_calls.md).
+  - [ ] **Tighten failure detection at large fleets.** At the default
+        2,500 beats/s target a 20k-node fleet is served 21s beats, so a dead
+        node is declared lost after ~105s, against 10s on small fleets. The
+        AWS 20k storm drill (2026-10-10) replaced all 7,017 allocations in
+        110s, nearly all of it detection, with an 84s placement gap. That is
+        still faster than Nomad (TTL ~nodes/50s, ~400s at 20k) and
+        Kubernetes (40-50s unreachable plus the 300s default eviction
+        toleration), but a 10x regression on Legion's own small-fleet
+        failover. Two steps:
+        - **Raise the default target.** 2,500/s was sized against the old
+          per-beat cost, before cached heartbeat SQL. At 10k nodes on the
+          new build, 5-8s intervals ran comfortably. Rerun 20k at
+          `targetRatePerSecond` 5000 (8s interval, 40s window) and 10000
+          (5s, 25s), then keep the highest rate that leaves placement
+          throughput flat.
+        - **Split liveness from state sync.** Every beat also rebuilds the
+          node's full desired state, which is what makes beats expensive
+          enough to throttle. A near-free liveness ping, like Kubernetes'
+          Lease renewal, with desired state sent only on change (see the
+          "unchanged" heartbeat item under Scheduling & placement), would
+          let 20k nodes beat every 2-3s and keep detection at ~10-15s at
+          any size. Needs a plan, since it is a wire change.
+        Until then, a latency-sensitive pool can pin a low `maxInterval`
+        and pay for it in manager load.
 
   - [ ] ~~Investigate: a 1k simulated fleet sustains ~59 heartbeat
         RPCs/sec where ~500/sec is expected, with nothing saturated.~~
@@ -1111,10 +1298,24 @@ How to use it:
         control-plane box. Deliberately not done mid-campaign: it changes
         the binary under test and invalidates the fairness record for
         every cell already collected. Do it before the phase-2 campaign.
-        See calls entry 20 and the Metrics section of the plan.
-  - [ ] Phases 2-5: Legion A/B campaigns, Nomad (verify nodesim `mock`
-        driver + install script), K8s (verify kubeadm/KWOK install +
-        watch parsing), 20k validation burst, analysis + REPORT.md.
+        See calls entry 24 and the Metrics section of the plan.
+  - [x] Rebuild the Nomad and K8s paths for the cross-system campaign
+        (2026-10-09, branch `bench/aws-comparison-refresh`): Nomad 2.0.5
+        + nodesim `702a0d9` with one process per node profile (the old
+        script registered every node as class `""`), the mock driver's
+        real name `mock_driver` (the translator asked for `mock`, which no
+        node offers), K8s 1.36.5 + KWOK 0.8.0 run out of cluster as one
+        controller per instance slice, native HTTP submitters for both,
+        and an apiserver watch replacing `kubectl get --watch`. Plan
+        § Cross-system campaign; calls entries 5-8.
+  - [ ] Run the cross-system matrix (plan § Cross-system campaign): rows
+        1-6 on all three systems, then analysis + `REPORT.md`.
+  - [ ] Legion B (streaming) campaign, and the 20k validation burst.
+  - [ ] Nomad cannot run `mixed_heterogeneous`: nodesim has no node meta.
+        Patch nodesim to accept a `meta` map (small, upstreamable) if the
+        report needs a heterogeneous row for Nomad.
+  - [ ] Failover drill for K8s: `experiments/failover-drill.sh` has no
+        fault command for the scheduler's lease holder yet.
 - [ ] Scheduling-index follow-ups deferred from
       [plan](plans/scheduling-index-plan.md) (see its calls doc):
       index-served candidates for multi-task **group** co-placement (v1
@@ -2203,6 +2404,17 @@ Deferred from [ui-holistic-polish-plan.md](plans/ui-holistic-polish-plan.md):
         .next_interval_seconds`, with widen-immediately / narrow-on-confirmation
         windows and a one-shot full-width re-phase in the worker sleep. The
         simulated fleet honors it through the same shared helpers.
+  - [x] **Adaptive cadence on by default** (2026-10-09, phase 5): default
+        `targetRatePerSecond` 2,500 (2s through 2,500 nodes, 21s at 20k), an
+        explicit `heartbeat.adaptive = false` opt-out, the served interval as
+        a floor over worker-type `heartbeatSeconds`, followers relaying the
+        leader's interval on the liveness digest reply, and per-tick
+        widen-only windows so late registrants and fast pools are covered.
+        The AWS rig's `collect.sh` archives the served interval and lost
+        window; `packing-density.sh` judges cadence against the served
+        interval. [cadence plan §13](plans/heartbeat-cadence-at-scale-plan.md) ·
+        [calls 2, 3, 5, 9, 11, 14](calls/heartbeat-cadence-at-scale-plan_calls.md) ·
+        [docs](../docs/heartbeat-cadence-and-scale.md#adaptive-cadence).
   - [x] **A returning node is schedulable again.** Node loss is a cross-lane
         composite (status lane `lost`, control lane `unavailable`), and the
         scheduler gates on `availability` — so recovery undoes both halves. A

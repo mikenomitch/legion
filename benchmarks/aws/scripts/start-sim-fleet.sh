@@ -162,6 +162,18 @@ UNIT
     ;;
 
 nomad)
+    # One nodesim process per (instance, node profile). nodesim shapes every
+    # client in a process identically — one node_class, one cpu/memory size —
+    # so the shared profile split (profile_split.py, the same rule Legion's
+    # --simulate and the KWOK branch use) becomes one process per profile.
+    # That is what makes `class = "web"` constraints mean the same thing on
+    # all three systems.
+    #
+    # nodesim cannot set node meta, only node_class, so scenarios that
+    # constrain on anything else (mixed_heterogeneous's region and gpu) are
+    # refused by translate.py for Nomad rather than silently unplaceable.
+    SERVERS=$(printf '"%s:4647",' "${CP_PRIVATE_IPS[@]}")
+    SERVERS="[${SERVERS%,}]"
     idx=0
     for line in "${WORKERS[@]}"; do
         read -r instance_id public private <<<"$line"
@@ -171,53 +183,169 @@ nomad)
         [ "$slice" -gt 0 ] || continue
         log "  $instance_id ($private): $slice nodesim nodes"
         wait_for_ssh "$addr" 120
+        rsh "$addr" "cloud-init status --wait >/dev/null 2>&1 || true"
+
+        CONFIGS=$(mktemp -d)
+        units=""
+        while read -r name cpus memory count attrs; do
+            [ "$count" -gt 0 ] || continue
+            class=$(tr ' ' '\n' <<<"$attrs" | sed -n 's/^class=//p')
+            # Same units as Legion's sim fingerprint (3000 MHz per core) and
+            # the translator's MHZ_PER_CORE, so a 500 MHz ask is the same
+            # fraction of a node on every system.
+            cat >"$CONFIGS/$name.hcl" <<HCL
+node_name_prefix = "nsim-$idx-$name"
+node_num         = $count
+server_addr      = $SERVERS
+work_dir         = "/var/lib/nodesim/$name"
+log {
+  level = "warn"
+}
+node {
+  datacenter = "dc1"
+  node_class = "${class}"
+  resources {
+    cpu_compute = $((cpus * 3000))
+    memory_mb   = $((memory * 1024))
+  }
+}
+HCL
+            units="$units nomad-nodesim@$name"
+        done < <(python3 "$AWS_BENCH_ROOT/workloads/profile_split.py" --profiles "$SCENARIO" --total "$slice")
+
+        rsh "$addr" "sudo rm -rf /tmp/nodesim-configs && mkdir -p /tmp/nodesim-configs"
+        for f in "$CONFIGS"/*.hcl; do rcp "$f" "$addr:/tmp/nodesim-configs/"; done
+        rm -rf "$CONFIGS"
         rsh "$addr" "
-            sudo aws s3 cp --only-show-errors --region $REGION s3://$BUCKET/bin/nomad-nodesim /opt/legion/bin/nomad-nodesim &&
-            sudo chmod +x /opt/legion/bin/nomad-nodesim &&
-            sudo mkdir -p /var/lib/nodesim &&
-            sudo tee /etc/systemd/system/nomad-nodesim.service >/dev/null <<UNIT
+            set -euo pipefail
+            sudo aws s3 cp --only-show-errors --region $REGION s3://$BUCKET/bin/nomad-nodesim /opt/legion/bin/nomad-nodesim
+            sudo chmod +x /opt/legion/bin/nomad-nodesim
+            sudo systemctl stop 'nomad-nodesim@*' 2>/dev/null || true
+            # Fresh client state every start: a stale state DB replays the
+            # previous fleet's allocations into this one.
+            sudo rm -rf /var/lib/nodesim /etc/nodesim
+            sudo mkdir -p /var/lib/nodesim /etc/nodesim
+            sudo mv /tmp/nodesim-configs/*.hcl /etc/nodesim/
+            sudo tee /etc/systemd/system/nomad-nodesim@.service >/dev/null <<'UNIT'
 [Unit]
-Description=nomad-nodesim fleet (benchmark)
+Description=nomad-nodesim fleet, profile %i (benchmark)
 After=network-online.target
 
 [Service]
-ExecStart=/opt/legion/bin/nomad-nodesim -server-addr ${CP_PRIVATE_IPS[0]}:4647 -node-num $slice -work-dir /var/lib/nodesim
+ExecStart=/opt/legion/bin/nomad-nodesim -config /etc/nodesim/%i.hcl
 Restart=on-failure
 LimitNOFILE=1048576
 
 [Install]
 WantedBy=multi-user.target
 UNIT
-            sudo systemctl daemon-reload &&
-            sudo systemctl restart nomad-nodesim
+            sudo systemctl daemon-reload
+            sudo systemctl restart $units
         "
         idx=$((idx + 1))
     done
-    log "nodesim units started; verify with: nomad node status (expect $TOTAL)"
+
+    # Exact count of READY nodes. Down nodes from earlier fleets linger in
+    # Nomad's node table until GC, so `ready` is the population that
+    # matters, and more ready nodes than asked for is a dirty cluster.
+    log "waiting for exactly $TOTAL ready nomad nodes across $idx slice(s)"
+    wait_for_ready_nodes nomad "$TOTAL" 900 || exit 1
+    write_fleet_state nomad "$(basename "$SCENARIO" .json)" "$TOTAL" "$idx" "http://${CP_PRIVATE_IPS[0]}:4646"
     ;;
 
 k8s)
-    # KWOK nodes are API objects — created once, from the loadgen box,
-    # shaped by the shared profile split. max pods per fake node is
-    # generous: bin-packing pressure comes from cpu/memory requests.
+    # KWOK node objects, plus one KWOK controller PER WORKER INSTANCE that
+    # manages only its own slice (label bench-slice=<i>). The controller is
+    # what heartbeats the node leases and moves pods to Running, so a slice
+    # is a process exactly as it is for Legion's --simulate and nodesim —
+    # and the storm drill kills one by stopping that process, the same
+    # fault on all three systems.
+    #
+    # The upstream in-cluster KWOK deployment cannot be used here anyway:
+    # the control plane runs without a CNI (no real pods exist), so its
+    # nodes never go Ready and a controller pod would never schedule.
+    KUBECONFIG_LOCAL=$(mktemp)
+    rsh "$LOADGEN_ADDR" "cat ~/.kube/config" >"$KUBECONFIG_LOCAL"
     rcp "$SCENARIO" "$LOADGEN_ADDR:/tmp/profiles.json"
     rcp "$AWS_BENCH_ROOT/workloads/profile_split.py" "$LOADGEN_ADDR:/tmp/profile_split.py"
     rcp "$AWS_BENCH_ROOT/configs/k8s/kwok-node.yaml.tpl" "$LOADGEN_ADDR:/tmp/kwok-node.yaml.tpl"
-    rsh "$LOADGEN_ADDR" "
-        set -euo pipefail
-        python3 /tmp/profile_split.py --profiles /tmp/profiles.json --total $TOTAL |
-        while read -r name cpus memory count attrs; do
-            class=\$(echo \"\$attrs\" | tr ' ' '\n' | sed -n 's/^class=//p')
-            region=\$(echo \"\$attrs\" | tr ' ' '\n' | sed -n 's/^region=//p')
-            for i in \$(seq 0 \$((count - 1))); do
-                NODE_NAME=\"kwok-\$name-\$i\" NODE_CLASS=\"\${class:-none}\" \
-                NODE_REGION=\"\${region:-none}\" CPUS=\"\$cpus\" MEMORY_GI=\"\$memory\" MAX_PODS=1000 \
-                envsubst < /tmp/kwok-node.yaml.tpl
-                echo '---'
-            done
-        done | kubectl apply -f -
-    "
-    log "created $TOTAL KWOK nodes; verify with: kubectl get nodes -l type=kwok"
+
+    idx=0
+    for line in "${WORKERS[@]}"; do
+        read -r instance_id public private <<<"$line"
+        addr=$(worker_addr "$public" "$private")
+        slice=$BASE
+        [ "$idx" -lt "$EXTRA" ] && slice=$((slice + 1))
+        [ "$slice" -gt 0 ] || continue
+        log "  $instance_id ($private): $slice KWOK nodes"
+
+        # Node objects first, so the controller finds them on start.
+        rsh "$LOADGEN_ADDR" "
+            set -euo pipefail
+            python3 /tmp/profile_split.py --profiles /tmp/profiles.json --total $slice |
+            while read -r name cpus memory count attrs; do
+                class=\$(echo \"\$attrs\" | tr ' ' '\n' | sed -n 's/^class=//p')
+                region=\$(echo \"\$attrs\" | tr ' ' '\n' | sed -n 's/^region=//p')
+                for i in \$(seq 0 \$((count - 1))); do
+                    NODE_NAME=\"kwok-$idx-\$name-\$i\" SLICE=$idx NODE_CLASS=\"\${class:-none}\" \
+                    NODE_REGION=\"\${region:-none}\" CPUS=\"\$cpus\" MEMORY_GI=\"\$memory\" MAX_PODS=1000 \
+                    envsubst < /tmp/kwok-node.yaml.tpl
+                    echo '---'
+                done
+            done | kubectl create -f - >/dev/null
+        "
+
+        wait_for_ssh "$addr" 120
+        rsh "$addr" "cloud-init status --wait >/dev/null 2>&1 || true"
+        rcp "$KUBECONFIG_LOCAL" "$addr:/tmp/kubeconfig"
+        # Pod IPs only have to be unique per slice; 10.64+i.0.0/16 keeps
+        # them out of the VPC range.
+        rsh "$addr" "
+            set -euo pipefail
+            if ! /opt/legion/bin/kwok --version 2>/dev/null | grep -q '$KWOK_VERSION'; then
+                sudo curl -fsSL -o /opt/legion/bin/kwok \
+                    https://github.com/kubernetes-sigs/kwok/releases/download/v${KWOK_VERSION}/kwok-linux-amd64
+                sudo chmod +x /opt/legion/bin/kwok
+            fi
+            # KWOK 0.8 ships no built-in stages: started without --config it
+            # exits with \"no stages found\". The release's fast stages are
+            # exactly the behavior we want — node leases heartbeated, pods
+            # Running immediately.
+            sudo mkdir -p /etc/kwok
+            sudo curl -fsSL -o /etc/kwok/stage-fast.yaml \
+                https://github.com/kubernetes-sigs/kwok/releases/download/v${KWOK_VERSION}/stage-fast.yaml
+            sudo mv /tmp/kubeconfig /etc/kwok/kubeconfig
+            sudo tee /etc/systemd/system/kwok-slice.service >/dev/null <<UNIT
+[Unit]
+Description=KWOK controller for node slice $idx (benchmark)
+After=network-online.target
+
+[Service]
+ExecStart=/opt/legion/bin/kwok \\\\
+    --kubeconfig=/etc/kwok/kubeconfig \\\\
+    --config=/etc/kwok/stage-fast.yaml \\\\
+    --manage-all-nodes=false \\\\
+    --manage-nodes-with-annotation-selector= \\\\
+    --manage-nodes-with-label-selector=bench-slice=$idx \\\\
+    --cidr=10.$((64 + idx)).0.0/16 \\\\
+    --node-ip=$private \\\\
+    --node-lease-duration-seconds=40
+Restart=on-failure
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+            sudo systemctl daemon-reload
+            sudo systemctl restart kwok-slice
+        "
+        idx=$((idx + 1))
+    done
+    rm -f "$KUBECONFIG_LOCAL"
+
+    log "waiting for exactly $TOTAL Ready KWOK nodes across $idx slice(s)"
+    wait_for_ready_nodes k8s "$TOTAL" 900 || exit 1
+    write_fleet_state k8s "$(basename "$SCENARIO" .json)" "$TOTAL" "$idx" "kubeconfig"
     ;;
 
 *)

@@ -2,15 +2,16 @@
 
 Plan: [`../plans/aws-comparative-benchmark-plan.md`](../plans/aws-comparative-benchmark-plan.md)
 
-Entries 1-4 are planning-stage calls; 5-10 were made while building the
-rig (phases 0-1, 2026-07-30); 11-13 came from making campaigns runnable
-unattended (2026-08-02); 18-19 came from making the rig startable at all
-from an arm64 macOS machine (2026-08-02); 20 came from adding memory to
-the measured results during the first real campaign (2026-08-02); 23-24
+Entries 1-4 are planning-stage calls; 9-14 were made while building the
+rig (phases 0-1, 2026-07-30); 15-17 came from making campaigns runnable
+unattended (2026-08-02); 22-23 came from making the rig startable at all
+from an arm64 macOS machine (2026-08-02); 24 came from adding memory to
+the measured results during the first real campaign (2026-08-02); 27-28
 came from replacing the rig's process-per-job submission with a native
 submitter, after three sessions of "throughput" numbers turned out to be
-the driver's own ceiling (2026-08-05). Ranked by project impact; the
-number is the rank.
+the driver's own ceiling (2026-08-05); 5-8 came from starting the
+cross-system campaign on current Nomad and K8s releases (2026-10-09).
+Ranked by project impact; the number is the rank.
 
 ## 1. Simulated workers everywhere, real control planes only
 
@@ -64,7 +65,136 @@ number is the rank.
   only the faster one would be the kind of benchmark selectivity the
   fairness record exists to prevent.
 
-## 5. Every latency timestamp is driver-side receive time
+## 5. Every system submits through its own API over pooled connections
+
+**The call.** Nomad and K8s get native submitters in the driver,
+`http_submit_all` in `driver.py`: one process, one keep-alive HTTP
+connection per worker thread, `POST /v1/jobs` for Nomad and `POST
+.../deployments` for K8s, at the same concurrency `legion-loadgen` uses.
+This retires the rule from entry 27 that a cross-system table must force
+all three systems onto the CLI loop. The CLI loop survives as a control
+row (`--submitter cli`), which still switches all three at once.
+
+```text
+# Cross-system table: the default. Each system's own API, pooled.
+scripts/run-campaign.sh --system nomad --scenarios web_fleet
+
+# Control row: all three on the process-per-job loop.
+LEGION_SUBMITTER=cli scripts/run-step.sh --system k8s --nodes 5000 ...
+```
+
+**Alternatives.** (a) Keep the CLI-loop rule and run all three through
+`nomad job run` / `kubectl apply` / `legion job run`. (b) Write Nomad and
+K8s submitters in Rust or Go, matching `legion-loadgen`'s language.
+(c) Use each system's batch path (none of the three has a true
+multi-job submit API, so this collapses to (b)).
+
+**Trade-off.** The submitters are no longer the same program, and
+Legion's is compiled while the others are Python threads. A Python
+submitter that cannot keep up would make Nomad or K8s look slower than
+they are. That is caught rather than assumed away:
+`submission.driver_bound` flags any cell whose placements finished with
+its submissions, and a flagged competitor cell is reported as a floor.
+Revisit with (b) if a competitor cell is ever driver-bound.
+
+**Why (honesty of the headline).** Option (a) caps every system at the
+loadgen box's process-spawn rate, ~36-103 jobs/sec measured. Phase 5
+showed Legion consumes everything that loop produces, and Nomad's C2M
+numbers suggest it can too, so the table would compare two copies of the
+same ceiling and call it a tie. A comparison that cannot tell the
+systems apart is not conservative, it is uninformative.
+
+## 6. K8s gets its API client limits raised; eviction timers stay stock
+
+**The call.** The kubeadm config raises the scheduler's and
+controller-manager's API client QPS and burst to 1,000 and their
+ReplicaSet/Deployment sync workers to 50. Everything that shapes
+*scheduling and recovery behavior* stays stock: scoring plugins,
+`percentageOfNodesToScore`, `node-eviction-rate`, and the 300-second
+default not-ready toleration.
+
+**Alternatives.** (a) Pure stock K8s. (b) Also tune recovery: raise
+`--node-eviction-rate` and drop `default-not-ready-toleration-seconds`.
+
+**Trade-off.** The K8s column is no longer "what kubeadm gives you".
+Anyone comparing against a stock cluster will see faster K8s numbers
+here than they would get, and the report must say so. In the other
+direction, the stock recovery timers make K8s's storm number look very
+slow: a 1,250-node slice taints at 0.1 nodes/sec, which is hours. The
+drill caps the watch at 30 minutes and reports a replaced fraction.
+
+**Why (measure the scheduler, not a token bucket).** The scheduler
+binds each pod with one API call, and its client defaults to 50 QPS. At
+defaults K8s cannot bind more than ~50 pods/sec however fast its
+scheduling cycle is, and the controller-manager's 20 QPS limits how fast
+pods even exist. That is a rate limiter on a client, and leaving it in
+would make the K8s placement column a constant. SIG-Scalability raises
+these for its own large-cluster tests. Recovery is different: the
+eviction rate and tolerations are deliberate product defaults that
+operators run with, so tuning them away would flatter K8s on exactly the
+dimension the storm row exists to measure. If a reader wants the tuned
+recovery number, that is a second, labeled row, not the default.
+
+## 7. Each competitor simulator runs one process per instance slice
+
+**The call.** nomad-nodesim runs one process per (instance, node profile)
+with a config that sets `node_class` and resources from the shared
+profile split. KWOK runs out of cluster, one controller per worker
+instance, each managing only the nodes labeled with its `bench-slice`.
+The storm drill kills a slice by stopping that instance's unit, which is
+the same fault it injects for Legion.
+
+**Alternatives.** (a) One nodesim process per instance with default
+node shape, as the previous script did. (b) KWOK deployed in-cluster as
+upstream documents, managing every fake node. (c) Kill KWOK nodes for
+the storm by deleting their leases or Node objects.
+
+**Trade-off.** More moving parts per instance: up to four nodesim units
+per worker, and a KWOK binary plus kubeconfig on every worker. nodesim
+still cannot set node meta, so `mixed_heterogeneous` cannot run on
+Nomad at all, and the translator refuses it.
+
+**Why (the same fleet and the same fault on all three).** (a) registered
+every node as class `""` with 10,000 MHz, so every class-constrained job
+was infeasible and no Nomad cell could have completed. (b) cannot run on
+this control plane: there is no CNI, so the control-plane nodes never go
+Ready and a KWOK pod would never schedule. It would also make the whole
+fleet one process, so a storm could only kill all of it. (c) is a
+different fault from "a host died": deleting a Node is an orderly
+removal that K8s handles without its not-ready path, which is the path
+real outages exercise.
+
+## 8. Competitor watches reconnect like real clients, and the restarts are counted
+
+**The call.** When a placement watch ends mid-cell, the driver resumes
+it rather than failing the cell. Nomad's event stream resumes from the
+last index it saw. K8s's watch is `kubectl get pods --watch` printing
+one custom-columns row per event, filtered to bound pods, and it is
+restarted when it exits; its opening list counts anything bound in the
+gap. Every cell records `watch_restarts` in `metrics.json`.
+
+**Alternatives.** (a) Fail the cell on any watch interruption, as the
+driver did. (b) A Python apiserver watch with a reader thread and a
+parse thread. (c) Measure K8s latency server-side from each pod's
+`PodScheduled` condition instead of a watch.
+
+**Trade-off.** A bind that lands while the watch is down is stamped when
+the relist delivers it, which is late, so a restart biases K8s latency
+*upward*. In the 1k-node smoke the watch restarted twice. The count is
+in every cell so a reader can discount a cell, and (c) remains the
+cross-check to build if restarts are frequent at scale. `PodScheduled`
+has one-second resolution, which is why it is not the primary clock.
+
+**Why (the apiserver does this on purpose).** The apiserver closes
+watchers that fall behind during a burst, and every K8s client,
+informers included, answers by relisting. Failing the cell, (a), would
+make K8s unmeasurable at exactly the rates the comparison is about. (b)
+was tried first: a Python consumer decoding full pod objects was closed
+as a slow watcher five times in one cell. kubectl decodes in Go, so the
+same arrangement Legion's watch already uses, a CLI follower in a
+subprocess, keeps the socket drained.
+
+## 9. Every latency timestamp is driver-side receive time
 
 **Call.** The driver takes the submit mark and the placed mark on its
 own monotonic clock, for every system: "placed" is when the placement
@@ -85,7 +215,7 @@ cross-host skew can enter a latency, and no system gets a
 differently-shaped correction. The methodology fits in one sentence in
 the report, which is what a fairness argument has to survive.
 
-## 6. `allocation.placed` events are the unit of counting, weighted by their `count`
+## 10. `allocation.placed` events are the unit of counting, weighted by their `count`
 
 **Call.** Legion emits one `allocation.placed` per plan apply with
 `metadata.count` allocations in it (`src/storage/events.rs:233`); the
@@ -106,7 +236,7 @@ fairness notes; revisit if per-allocation event granularity ever ships.
 stream actually says beats inferring per-allocation times that were
 never measured. The fixture suite (`driver/tests/`) pins this math.
 
-## 7. Terraform is system-agnostic; per-system installs are SSH scripts
+## 11. Terraform is system-agnostic; per-system installs are SSH scripts
 
 **Call.** `terraform/` builds only boxes, network, and bucket; Legion
 A/B, Nomad, and K8s are installed and wiped by `scripts/install-*.sh` +
@@ -127,7 +257,7 @@ instances per system (what per-system stacks naturally do) would reduce
 it to "statistically identical". Judgement call 3 decided serial reuse;
 this is its implementation consequence.
 
-## 8. The dry-run gate is a process-based local smoke, not the planned docker-compose stand-in
+## 12. The dry-run gate is a process-based local smoke, not the planned docker-compose stand-in
 
 **Call.** The plan's testing section named "a local docker-compose
 stand-in (1 manager + sim workers)". Shipped instead:
@@ -147,7 +277,7 @@ have added a Docker dependency to reach the same loop. The event-shape
 assumptions compose would have covered are pinned by the wire-real
 integration test (`tests/worker_simulation.rs`) instead.
 
-## 9. Batch workloads translate to K8s Deployments, not Jobs
+## 13. Batch workloads translate to K8s Deployments, not Jobs
 
 **Call.** Every scenario job type becomes a Deployment with
 `replicas = count` on KWOK nodes (`workloads/translate.py`), including
@@ -166,7 +296,7 @@ throughput. "Keep N running" is the one semantic all three systems
 express identically; per-system batch semantics would make the
 batch-burst row compare controllers, not schedulers.
 
-## 10. One bucket, one IAM role for the whole rig
+## 14. One bucket, one IAM role for the whole rig
 
 **Call.** A single S3 bucket carries binaries, campaign archives, and
 the Legion B streaming replica + lease, and one instance role with rw
@@ -186,11 +316,11 @@ something longer-lived.
 the failure modes of every install script for a rig whose entire threat
 model is "we delete it after the campaign".
 
-**Amended (entry 13).** Still one bucket, but now two roles: the loadgen
+**Amended (entry 17).** Still one bucket, but now two roles: the loadgen
 box takes an `orchestrator` role that adds `SetDesiredCapacity` on the
 sim-fleet ASG. Bucket access is unchanged and shared.
 
-## 11. Results are mirrored to a bucket terraform does not manage
+## 15. Results are mirrored to a bucket terraform does not manage
 
 **Call.** `var.archive_bucket` names an existing, externally-created S3
 bucket. `collect.sh` mirrors every cell into it as the cell lands, and
@@ -199,7 +329,7 @@ The rig's IAM role gets `GetObject`/`PutObject` on it and deliberately
 not `DeleteObject`. Unset is allowed, and teardown says loudly what that
 costs.
 
-**Alternatives.** (a) Keep the single bucket of entry 10 and rely on
+**Alternatives.** (a) Keep the single bucket of entry 14 and rely on
 teardown's pre-destroy sync to the operator's machine — the shipped
 behavior until now. (b) Have terraform create a second bucket with
 `prevent_destroy`. (c) Drop `force_destroy` from the rig bucket.
@@ -209,7 +339,7 @@ behavior until now. (b) Have terraform create a second bucket with
 teardown. It also splits "where are the results" into two answers.
 
 **Why (the campaign is the product).** (a) fails precisely when it
-matters: entry 12 moved the driver's seat onto the loadgen box so a run
+matters: entry 16 moved the driver's seat onto the loadgen box so a run
 survives the operator's laptop, which means the machine running teardown
 can itself be disposable — syncing results *to* it is syncing them to
 the thing you are about to lose. (b) and (c) both break `teardown.sh`:
@@ -222,7 +352,7 @@ what it does not own. Withholding delete follows from the same premise
 as the rig being disposable — nothing inside a short-lived,
 internet-facing environment should be able to erase the durable copy.
 
-## 12. Campaigns are driven from the loadgen box, not the operator's machine
+## 16. Campaigns are driven from the loadgen box, not the operator's machine
 
 **Call.** `scripts/remote-campaign.sh` stages the rig tree, a topology
 manifest, and the ssh key onto the loadgen box, then starts the campaign
@@ -256,7 +386,7 @@ addressed to another instance's *public* IP hairpins out through the
 internet gateway and arrives with the sender's public IP as its source,
 so the security group's intra-rig `self` rule does not match it.
 
-## 13. Scale steps move through the ASG API, not `terraform apply`
+## 17. Scale steps move through the ASG API, not `terraform apply`
 
 **Call.** `scale_workers` calls `autoscaling:SetDesiredCapacity`
 (`scripts/env.sh`), the ASG carries
@@ -281,7 +411,7 @@ one narrowly-scoped permission and no state at all. It also keeps
 `teardown.sh` the only thing that can destroy the rig, and keeps it on
 the operator's machine where the confirmation prompt is.
 
-## 14. The spot fleet is released on any campaign exit
+## 18. The spot fleet is released on any campaign exit
 
 **Call.** `run-campaign.sh` traps `EXIT` and scales the ASG to zero on
 success, failure, or a killed session. `--keep-fleet` opts out. The
@@ -303,7 +433,7 @@ is comparatively cheap, and because destroying the rig is a decision that
 belongs to a human running `teardown.sh`.
 
 
-## 15. Campaign state is published to S3, not only answerable over SSH
+## 19. Campaign state is published to S3, not only answerable over SSH
 
 **Call.** The unattended runner publishes `status.json` (phase, step,
 detail, timestamp) and a tail of its console log to
@@ -316,7 +446,7 @@ exit code: 0 running, 2 finished, 3 failed, 4 stale, 5 missing.
 scripts/campaign-status.sh show --bucket <bucket> --region us-east-1
 ```
 
-**Alternatives.** (a) `remote-campaign.sh status`, which entry 12
+**Alternatives.** (a) `remote-campaign.sh status`, which entry 16
 already provides, over SSH. (b) Push notifications (SNS/webhook) on
 transitions. (c) Expose the campaign log over HTTP from the loadgen box.
 
@@ -339,7 +469,7 @@ without a liveness stamp is indistinguishable from a scale step being
 quiet for ten minutes. Exit codes rather than parsed output so a watcher
 can branch without a JSON parser.
 
-## 16. Spot and on-demand are split by a knob, not a quota ticket
+## 20. Spot and on-demand are split by a knob, not a quota ticket
 
 **Call.** `var.worker_on_demand_percentage` (default 0, all spot) sets
 the share of the sim fleet launched on-demand, through the ASG's
@@ -366,7 +496,7 @@ outright for measured cells: cross-region heartbeat RTT inflates
 sim-side latency and delays ack visibility, corrupting the submit->placed
 number the campaign exists to produce.
 
-## 17. Nodes-per-instance is measured before it is trusted
+## 21. Nodes-per-instance is measured before it is trusted
 
 **Call.** `experiments/packing-density.sh` climbs an ascending ladder of
 densities on a single instance and reports the highest that stays
@@ -398,7 +528,7 @@ process the multiplexing itself becomes the variable. (c) would make
 density a per-cell variable, which is exactly the kind of thing a
 fairness record cannot explain away.
 
-## 18. A disposable operator box, outside the rig's terraform
+## 22. A disposable operator box, outside the rig's terraform
 
 **The call.** `scripts/bootstrap-operator-box.sh` builds a dedicated
 Ubuntu x86_64 EC2 instance to drive campaigns from, using plain AWS CLI
@@ -444,7 +574,7 @@ eight tools deep — protoc, a Rust toolchain, terraform, AWS CLI v2 — with
 a Rust build in the middle. Scripting it is the difference between
 starting a campaign and spending an evening on prerequisites.
 
-## 19. The operator box carries an IAM role, never a copied key
+## 23. The operator box carries an IAM role, never a copied key
 
 **The call.** Credentials passed to `bootstrap-operator-box.sh` are used
 only for the local AWS calls that build the box. The instance gets an
@@ -478,7 +608,7 @@ an internet-facing box is a full account takeover from a single SSH
 compromise, which the name-prefix condition prevents at no usability
 cost.
 
-## 20. Memory is measured whole-box, not as manager process RSS
+## 24. Memory is measured whole-box, not as manager process RSS
 
 **The call.** Memory vs load is reported from node_exporter's whole-box
 counters, split into `used` (`MemTotal - MemAvailable`) and `anon` (used
@@ -513,7 +643,7 @@ trap: `used` alone would have overstated resident cost by ~40% while
 looking like a clean measurement, and nothing in the output would have
 said so.
 
-## 21. Cells are sized by allocation target, not by a per-scenario multiplier
+## 25. Cells are sized by allocation target, not by a per-scenario multiplier
 
 **The call.** `run-campaign.sh` computes `TARGET = nodes x ALLOCS_PER_NODE`
 (default 5, so the steps are 5k/10k/25k/50k — the plan's stated band) and
@@ -539,7 +669,7 @@ which the fairness record cannot explain. (b) edits fixtures the local
 benchmarks depend on. (c) treats the symptom: a workload that drains in
 under a second has no steady state to find, whatever the warmup.
 
-## 22. The driver submits concurrently, because serially it measured itself
+## 26. The driver submits concurrently, because serially it measured itself
 
 **The call.** `driver.py --submit-concurrency` (default 4) submits through
 a thread pool. `1` restores the old serial loop.
@@ -563,20 +693,24 @@ number describes the scheduler. The same loop feeds the Nomad and K8s
 adapters, so lifting it lifts all three equally and the comparison stays
 fair. (b) is the better long-term answer for real users and is now a TODO,
 but it changes the product to fix the harness. (c) multiplies clock skew
-across processes, which entry 5 exists to avoid.
+across processes, which entry 9 exists to avoid.
 
 **Sized to the box, not to a round number.** The default is 4, not 16,
 because the loadgen box is an `m7i.large` — 2 vCPU. Each slot is a whole
 CLI process; oversubscribing starves the event-watcher thread and the cell
 measures the driver's own contention.
 
-**Superseded for Legion by entry 23 (2026-08-05).** Raising the pool moved
+**Superseded for Legion by entry 27 (2026-08-05).** Raising the pool moved
 the ceiling (4 → 32 on a 16-vCPU box took it from ~36 to ~103 jobs/sec) but
 never removed it, because the per-job cost is a whole process. This loop is
 now the *fairness baseline* rather than the fast path: it is what Nomad and
 K8s use, and what a cross-system comparison forces Legion back onto.
 
-## 23. Legion gets a native submitter, and that makes cross-system comparison conditional
+## 27. Legion gets a native submitter, and that makes cross-system comparison conditional
+
+**Superseded in part by entry 5 (2026-10-09).** The competitors now have
+native submitters too, so the cross-system rule below no longer forces
+the CLI loop; it survives as the control row.
 
 **The call.** A separate binary, `legion-loadgen`
 (`benchmarks/loadgen/main.rs`, `cargo build --features loadgen`), submits a
@@ -680,7 +814,7 @@ and is now an open TODO item; it is not a reason to keep Legion's own
 scaling curves unmeasurable in the meantime. (e) would delete the only
 thing that makes the three-system table valid.
 
-## 24. Cross-process submit stamps are epoch milliseconds, rebased by an offset the driver supplies
+## 28. Cross-process submit stamps are epoch milliseconds, rebased by an offset the driver supplies
 
 **The call.** `legion-loadgen` stamps each submission in UNIX epoch
 milliseconds and adds a `--clock-offset-ms` the driver passes it, computed
@@ -703,7 +837,7 @@ the resulting percentiles are plausible, which catches a mis-signed or
 un-applied offset immediately (a raw epoch stamp shows up as a latency
 about 55 years wide).
 
-**Why (entry 5's rule, kept across a process boundary).** Entry 5 makes
+**Why (entry 9's rule, kept across a process boundary).** Entry 9 makes
 every timestamp a driver-side reading on one clock, and that is what makes
 a submit→placed latency mean anything. A second process cannot join that
 clock: `time.monotonic()` and Rust's `Instant` are both deliberately
@@ -718,7 +852,7 @@ anyway. (b) is not the same clock on every platform — CPython uses
 what the submitter exists to remove. (d) would expose *every* cell,
 including the CLI ones, to clock steps to fix a problem only one path has.
 
-## 25. Each cell tears down its jobs, from an EXIT trap
+## 29. Each cell tears down its jobs, from an EXIT trap
 
 **The call.** `run-step.sh` stops then destroys every job after
 `collect.sh`, via `trap cleanup_jobs EXIT`.
@@ -750,7 +884,7 @@ allocations, and emitted no placement events — so the cell reported zero
 placements and looked for all the world like a broken event stream. Two
 runs were spent blaming the watcher.
 
-## 26. Cadence evidence is archived per cell, over the cell's own window
+## 30. Cadence evidence is archived per cell, over the cell's own window
 
 **The call.** `collect.sh` snapshots `legion_heartbeat_freshness_ratio`,
 `legion_liveness_tracked_nodes` and
@@ -775,7 +909,14 @@ archived `liveness_tracked_nodes` peaking at 4000 and a freshness ratio
 dipping to 0.009, neither of which happened during the cell. Evidence that
 cannot be attributed to a cell cannot certify it.
 
-## 27. Heartbeat cadence stays at the default; adaptive cadence is not measured
+## 31. Heartbeat cadence stays at the default; adaptive cadence is not measured
+
+> **Superseded (2026-10-09).** The default changed under this call: adaptive
+> cadence is now on by default (heartbeat-cadence plan §13), so the rig's
+> unset `heartbeat` block runs it. "Stay at the default" still holds, and now
+> means adaptive, which matches Nomad also adapting by default. `collect.sh`
+> archives the served interval and lost window per cell, and
+> `packing-density.sh` divides by the served interval rather than a fixed 2s.
 
 **The call.** The rig's `manager-a.ncl.tpl` sets no `heartbeat` block, so
 `targetRatePerSecond` stays unset, nothing adapts, and every worker holds
@@ -795,13 +936,13 @@ run their defaults too; `targetRatePerSecond` is a Legion-only knob with
 no counterpart in either. It would also serve a *varying* interval, which
 silently invalidates `packing-density.sh`'s achieved-cadence arithmetic
 (it divides by a fixed 2s) and makes "heartbeat cost at 10k nodes"
-incomparable across cells. With entry 26's evidence in every cell, a
+incomparable across cells. With entry 30's evidence in every cell, a
 cadence shortfall at 5k or 10k becomes a recorded finding rather than a
 contaminated number — which is the outcome the plan wants from a first
 campaign. (a) remains the right thing to measure in a follow-up whose
 stated subject is the cadence ladder itself.
 
-## 28. "Stopped converging" is a stall, not a wall-clock deadline
+## 32. "Stopped converging" is a stall, not a wall-clock deadline
 
 - **The call:** the driver ends a cell on a **stall timeout** — no
   placement at all for 120s — with the old fixed `--settle-timeout-secs`
@@ -828,7 +969,7 @@ stated subject is the cadence ladder itself.
   is a scheduler result, one that hit the cap is a rig result, and
   `complete: false` alone cannot tell a reader which they are holding.
 
-## 29. A second scenario for saturation, rather than pushing web_fleet harder
+## 33. A second scenario for saturation, rather than pushing web_fleet harder
 
 - **The call:** added `benchmarks/scheduler/scenarios/dense_fleet.json` —
   web_fleet's node profiles unchanged, but ~44 allocations per job
@@ -854,7 +995,7 @@ stated subject is the cadence ladder itself.
   pool is also precisely the shape `decouple_plan_components` used to
   collapse, so the scenario earns its place twice.
 
-## 30. `evalThreads` is rendered per campaign, and refused elsewhere
+## 34. `evalThreads` is rendered per campaign, and refused elsewhere
 
 - **The call:** `run-campaign.sh --eval-threads N` exports
   `LEGION_EVAL_THREADS`, which `install-legion-a.sh` renders into
@@ -874,9 +1015,9 @@ stated subject is the cadence ladder itself.
   dropped flag produces a cell archived as a 16-thread result whose
   rendered config — the fairness record — says 4. A run that fails loudly
   is strictly better than a number that lies quietly, which is the same
-  principle as entry 26.
+  principle as entry 30.
 
-## 31. The operator box's toolchain is baked into an AMI, and a stale image is refused rather than reused
+## 35. The operator box's toolchain is baked into an AMI, and a stale image is refused rather than reused
 
 - **The call:** `scripts/bake-operator-ami.sh` runs the toolchain install
   once on a throwaway instance and snapshots it into an AMI tagged
@@ -902,7 +1043,7 @@ stated subject is the cadence ladder itself.
   one in the bake script and one in the user-data heredoc.
 - **Trade-off.** A second artifact with its own lifecycle, in a repo whose
   standing complaint is already that the operator box is a second
-  lifecycle (entry 18). AMIs are regional, so a campaign in a new region
+  lifecycle (entry 22). AMIs are regional, so a campaign in a new region
   bakes again. And the strict fingerprint means a comment-only edit to
   `operator-toolchain.sh` invalidates a perfectly good image — `--ami
   <id>` exists for exactly that, and `--slow-bootstrap` for the reverse.
@@ -922,13 +1063,13 @@ stated subject is the cadence ladder itself.
   a far worse failure than a slow bootstrap. (b) has the same failure
   shape one step removed — the tag says "toolchain", the image says
   something older. (c) is the tempting strict answer and is wrong here for
-  the reason entry 18 exists: `bootstrap-operator-box.sh` is the *first*
+  the reason entry 22 exists: `bootstrap-operator-box.sh` is the *first*
   thing a new operator runs, and a step 0 that refuses to work until you
   have baked an image is exactly the prerequisite hunt that script was
   written to delete. The fallback is a correct box, only slow, and it says
   which path it took and why. (d) buys image-build features this needs
   none of, against a tool nobody here has installed; terraform is
-  circular for the same reason it is in entry 18 — this box runs the
+  circular for the same reason it is in entry 22 — this box runs the
   terraform, and must outlive `teardown.sh`.
 
   Two details are security calls rather than speed ones. The bake instance

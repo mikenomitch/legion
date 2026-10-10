@@ -21,6 +21,11 @@
 #                      [--system legion-a] [--heartbeat-secs 2]
 #                      [--campaign <id>] [--scenario <file>] [--no-reset]
 #
+# The cadence each step is judged against is the manager's served interval
+# (`legion_heartbeat_served_interval_seconds`; adaptive cadence is on by
+# default, so it grows with the fleet). --heartbeat-secs is only the
+# fallback when no manager reports one.
+#
 # Precondition: a Legion control plane installed and running. The probe
 # scales the spot fleet to a single instance itself and leaves it there
 # — run-campaign.sh sizes the fleet per step anyway, so the next campaign
@@ -160,6 +165,15 @@ for N in $STEPS; do
     P50=$(promq 'histogram_quantile(0.50, sum by (le) (rate(legion_worker_heartbeat_duration_seconds_bucket[1m])))')
     CPU=$(promq 'sum(rate(node_cpu_seconds_total{mode!="idle", role="sim-worker"}[1m])) / count(count by (cpu) (node_cpu_seconds_total{role="sim-worker", mode="idle"}))')
     MEM=$(promq '1 - (sum(node_memory_MemAvailable_bytes{role="sim-worker"}) / sum(node_memory_MemTotal_bytes{role="sim-worker"}))')
+    # Adaptive cadence (on by default) serves a fleet-size-derived interval,
+    # so the expected per-node rate is 1/served, not 1/--heartbeat-secs. The
+    # gauge is the status-lane leader's; fall back to the flag when no
+    # manager reports one.
+    SERVED=$(promq 'max(legion_heartbeat_served_interval_seconds)')
+    STEP_HB_SECS=$HEARTBEAT_SECS
+    if [ -n "$SERVED" ] && awk -v s="$SERVED" 'BEGIN { exit !(s + 0 > 0) }'; then
+        STEP_HB_SECS=$SERVED
+    fi
 
     ROW=$(jq -n \
         --argjson nodes "$N" \
@@ -172,7 +186,7 @@ for N in $STEPS; do
         --argjson p50 "$(num "$P50")" \
         --argjson cpu "$(num "$CPU")" \
         --argjson mem "$(num "$MEM")" \
-        --argjson hb_secs "$HEARTBEAT_SECS" \
+        --argjson hb_secs "$STEP_HB_SECS" \
         '{
             nodes: $nodes,
             registered: $registered,
@@ -184,6 +198,7 @@ for N in $STEPS; do
             heartbeat_p99_secs: $p99,
             cpu_utilization: $cpu,
             memory_utilization: $mem,
+            heartbeat_interval_secs: $hb_secs,
             # Each node should heartbeat once per interval; the fraction of
             # that cadence the fleet actually sustains is the clearest
             # single signal that the box is keeping up.

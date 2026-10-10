@@ -796,6 +796,14 @@ pub struct Metrics {
     pub scheduler_plan_phase_seconds: Arc<HistogramVec>,
     /// `legion_scheduler_lazy_sample_fallback_total`
     pub scheduler_lazy_sample_fallback_total: Arc<Counter>,
+    /// `legion_scheduler_node_list_rebuilds_total`
+    pub scheduler_node_list_rebuilds_total: Arc<Counter>,
+    /// `legion_eval_phase_seconds{kind,phase}`
+    pub eval_phase_seconds: Arc<HistogramVec>,
+    /// `legion_eval_queue_round_seconds{op}`
+    pub eval_queue_round_seconds: Arc<HistogramVec>,
+    /// `legion_store_read_model_lock_wait_seconds{mode}`
+    pub store_read_model_lock_wait_seconds: Arc<HistogramVec>,
     /// `legion_heartbeat_freshness_ratio` — **the number to alert on.**
     pub heartbeat_freshness_ratio: Arc<FloatGauge>,
     /// `legion_heartbeat_served_interval_seconds`
@@ -1230,7 +1238,7 @@ impl Metrics {
         let scheduler_plan_phase_seconds = Arc::new(HistogramVec {
             meta: FamilyMeta {
                 name: "legion_scheduler_plan_phase_seconds",
-                help: "Per-phase wall-clock of scheduler plan_and_apply (available_nodes|version_sample|task_fetch|capacity_snapshot|build_plan|apply|total).",
+                help: "Per-phase wall-clock of scheduler plan_and_apply (job_lookup|available_nodes|task_fetch|capacity_snapshot|build_plan|version_sample|speculative_dispatch|apply|post_apply|total). Rejected plans are observed too, up to apply.",
                 labels: &["phase"],
             },
             bounds: DURATION_BUCKETS,
@@ -1244,6 +1252,41 @@ impl Metrics {
                 labels: &[],
             },
             cell: CounterCell::default(),
+        });
+        let scheduler_node_list_rebuilds_total = Arc::new(Counter {
+            meta: FamilyMeta {
+                name: "legion_scheduler_node_list_rebuilds_total",
+                help: "Rebuilds of the scheduler's cached available-node set (the sorted list and its by-id lookup), one per plan that found the cache invalidated by a node change. Near zero in steady state; a rate tracking the plan rate means nodes are changing under every plan.",
+                labels: &[],
+            },
+            cell: CounterCell::default(),
+        });
+        let eval_phase_seconds = Arc::new(HistogramVec {
+            meta: FamilyMeta {
+                name: "legion_eval_phase_seconds",
+                help: "Per-phase wall-clock of one placing eval's handler (queue_wait|scheduler_init|prepare|plan|conflict_backoff|dispatch|finish), by eval kind. The phases partition legion_eval_handle_seconds for the kinds that place work; `plan` covers every plan attempt, including rejected ones, and `conflict_backoff` the sleeps between them.",
+                labels: &["kind", "phase"],
+            },
+            bounds: DURATION_BUCKETS,
+            series: Series::new(),
+        });
+        let eval_queue_round_seconds = Arc::new(HistogramVec {
+            meta: FamilyMeta {
+                name: "legion_eval_queue_round_seconds",
+                help: "Wall time of one eval-queue round on the scheduler lane, by op (claim|settle). `claim` is a standalone claim; `settle` writes a batch's outcomes and claims the next batch in one replicated op. Both happen outside legion_eval_handle_seconds.",
+                labels: &["op"],
+            },
+            bounds: DURATION_BUCKETS,
+            series: Series::new(),
+        });
+        let store_read_model_lock_wait_seconds = Arc::new(HistogramVec {
+            meta: FamilyMeta {
+                name: "legion_store_read_model_lock_wait_seconds",
+                help: "Time spent acquiring the scheduler read model's lock, by mode (read|write). Planners and heartbeats read it; every allocation publish and node change writes it. A rising read tail means writers hold it long or often; a rising write tail means readers do.",
+                labels: &["mode"],
+            },
+            bounds: DURATION_BUCKETS,
+            series: Series::new(),
         });
 
         // Heartbeat cadence (docs/heartbeat-cadence-and-scale.md). All on the
@@ -1415,6 +1458,10 @@ impl Metrics {
             Arc::clone(&scheduler_plan_bind_pass) as Arc<dyn RenderMetric>,
             Arc::clone(&scheduler_plan_candidate_rank) as Arc<dyn RenderMetric>,
             Arc::clone(&scheduler_lazy_sample_fallback_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&scheduler_node_list_rebuilds_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&eval_phase_seconds) as Arc<dyn RenderMetric>,
+            Arc::clone(&eval_queue_round_seconds) as Arc<dyn RenderMetric>,
+            Arc::clone(&store_read_model_lock_wait_seconds) as Arc<dyn RenderMetric>,
             Arc::clone(&scheduler_plan_phase_seconds) as Arc<dyn RenderMetric>,
             Arc::clone(&store_coalesce_batch_size) as Arc<dyn RenderMetric>,
             Arc::clone(&store_coalesce_commit_seconds) as Arc<dyn RenderMetric>,
@@ -1475,6 +1522,10 @@ impl Metrics {
             scheduler_index_maintenance_seconds,
             scheduler_plan_phase_seconds,
             scheduler_lazy_sample_fallback_total,
+            scheduler_node_list_rebuilds_total,
+            eval_phase_seconds,
+            eval_queue_round_seconds,
+            store_read_model_lock_wait_seconds,
             heartbeat_freshness_ratio,
             heartbeat_served_interval_seconds,
             heartbeat_lost_window_seconds,

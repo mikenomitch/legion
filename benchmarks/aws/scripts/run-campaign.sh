@@ -93,6 +93,7 @@ EVAL_THREADS=""
 # set it to `cli` for any campaign whose numbers will sit next to Nomad's or
 # K8s's, per the submission-path rule in README.md § Methodology.
 SUBMIT_CONCURRENCY=""
+SUBMIT_RATE=""
 # Threaded to run-step so a storm drill after the last cell finds a
 # workload still resident (see run-step.sh).
 KEEP_JOBS=false
@@ -159,6 +160,12 @@ while [ $# -gt 0 ]; do
         KEEP_JOBS=true
         shift
         ;;
+    --submit-rate)
+        # Open-loop jobs/sec (legion only). Paces every cell below capacity
+        # so its p50/p99 are submit-to-placed latency, not burst drain time.
+        SUBMIT_RATE="$2"
+        shift 2
+        ;;
     --submit-concurrency)
         # Jobs submitted in parallel. Raise it when a cell reports
         # submission.driver_bound: that means the driver, not the
@@ -174,6 +181,13 @@ while [ $# -gt 0 ]; do
         # campaign — it is a control-plane setting, so sweeping it means
         # one campaign per point.
         EVAL_THREADS="$2"
+        shift 2
+        ;;
+    --storm-step)
+        # Which node step runs the storm drill (default 10000). It must be
+        # one of --steps, and every system in a comparison must use the same
+        # one, or the recovery numbers are different fault sizes.
+        STORM_STEP="$2"
         shift 2
         ;;
     --nodes-per-instance)
@@ -257,6 +271,9 @@ log "=== campaign $CAMPAIGN: steps [$STEPS], scenarios [$SCENARIOS], allocs/node
 # inherited 3000 orphan rows. The per-cell census gate below now refuses
 # to run in that state, so without this reset the campaign would simply
 # stop; with it, every campaign begins the way its results claim.
+log "staging the driver and translator on the loadgen box"
+stage_driver
+
 if $RESET_CP; then
     "$(dirname "$0")/reset-control-plane.sh" --system "$SYSTEM"
 else
@@ -302,6 +319,16 @@ ensure_sim_fleet() { # ensure_sim_fleet <sim-system> <nodes> <scenario>
     "$(dirname "$0")/start-sim-fleet.sh" "$sim" "$nodes" \
         "$SCENARIOS_DIR/$scenario.json"
 }
+
+# The storm step keeps its last cell's jobs resident for the drill, and
+# nothing destroys them afterwards, so any step after it starts dirty: on
+# 2026-10-10 a 20k cell after a 10k storm got 8,334 "job config unchanged"
+# replies and could never reach its count. Refuse that ordering up front.
+LAST_STEP=$(echo $STEPS | awk '{print $NF}')
+if ! $SMOKE && echo " $STEPS " | grep -q " $STORM_STEP " && [ "$STORM_STEP" != "$LAST_STEP" ]; then
+    echo "--storm-step $STORM_STEP must be the last of --steps ($STEPS): the drill leaves its jobs resident" >&2
+    exit 1
+fi
 
 for NODES in $STEPS; do
     INSTANCES=$(((NODES + NODES_PER_INSTANCE - 1) / NODES_PER_INSTANCE))
@@ -357,14 +384,25 @@ for NODES in $STEPS; do
         # and at that size a step places out in under a second — entirely
         # inside the driver's warmup, so the cell reports zero throughput
         # and zero latency samples. Phase 1's smoke cell did exactly that.
+        LAST_ALLOCS=$(printf '%s\n' $ALLOC_POINTS | tail -1)
         for ALLOCS in $ALLOC_POINTS; do
             TARGET=$((NODES * ALLOCS))
+            # The storm drill measures replacement of RESIDENT work, so the
+            # storm step's last cell leaves its jobs in place for it. The
+            # 2026-08-06 drill ran after cleanup and killed 1,250 empty
+            # nodes; this is the fix applied by default rather than left to
+            # a --keep-jobs nobody passes.
+            CELL_KEEP_JOBS=$KEEP_JOBS
+            if [ "$NODES" -eq "$STORM_STEP" ] && ! $SMOKE && [ "$ALLOCS" = "$LAST_ALLOCS" ]; then
+                CELL_KEEP_JOBS=true
+            fi
             log "--- cell: $SCENARIO @ ${NODES}n x ${ALLOCS} allocs/node (~$TARGET allocations) ---"
             "$(dirname "$0")/run-step.sh" \
                 --system "$SYSTEM" --nodes "$NODES" --scenario "$SCENARIO" \
                 --target-allocations "$TARGET" --warmup "$WARMUP" --campaign "$CAMPAIGN" \
                 ${SUBMIT_CONCURRENCY:+--submit-concurrency "$SUBMIT_CONCURRENCY"} \
-                --keep-jobs "$KEEP_JOBS"
+                ${SUBMIT_RATE:+--submit-rate "$SUBMIT_RATE"} \
+                --keep-jobs "$CELL_KEEP_JOBS"
         done
     done
 

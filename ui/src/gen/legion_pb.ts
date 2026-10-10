@@ -7327,10 +7327,20 @@ export class HeartbeatReply extends Message<HeartbeatReply> {
   /**
    * The interval, in seconds, the manager wants this worker to heartbeat at.
    *
-   * Present only when the manager runs adaptive cadence
-   * (`heartbeat.targetRatePerSecond` in the manager config); absent means
-   * "keep using your worker-type `heartbeatSeconds`", which is the default and
-   * reproduces Legion's historical behavior exactly.
+   * Present whenever the manager runs adaptive cadence, which is the default
+   * (`heartbeat.adaptive`, `heartbeat.targetRatePerSecond` in the manager
+   * config). The manager derives it from fleet size alone; at the defaults
+   * every fleet up to 2,500 nodes is served the 2s floor. Absent when the
+   * operator turned adaptive cadence off (`heartbeat.adaptive = false`) or
+   * the manager predates it, and absent means "use your worker-type
+   * `heartbeatSeconds`".
+   *
+   * The value is a FLOOR, not an override: a worker beats at the larger of
+   * this and its worker-type `heartbeatSeconds`, so a slow batch pool keeps
+   * its own cadence until the fleet grows past it. A manager that does not
+   * lead the status lane relays the interval it last learned from the leader
+   * in its liveness digest reply, so a worker gets the same answer from any
+   * manager.
    *
    * The manager derives this node's lost-node window from the SAME value
    * (`missedBeatsBeforeLost x interval`), so a worker that honors a slower
@@ -8345,8 +8355,9 @@ export class GetHeartbeatCadenceReply extends Message<GetHeartbeatCadenceReply> 
   suggestedHeartbeatSeconds = 0;
 
   /**
-   * Whether `heartbeat.targetRatePerSecond` is set, i.e. whether the manager
-   * dictates cadence at all. Off by default.
+   * Whether the manager dictates cadence at all (`heartbeat.adaptive`). On by
+   * default; false when the operator set `heartbeat.adaptive = false`, in
+   * which case workers keep their worker-type `heartbeatSeconds`.
    *
    * @generated from field: bool adaptive_enabled = 8;
    */
@@ -19100,6 +19111,18 @@ export class NodeLivenessDigestReply extends Message<NodeLivenessDigestReply> {
    */
   leaderHint = "";
 
+  /**
+   * The heartbeat interval, in seconds, the status-lane leader is serving its
+   * workers. Set only on an accepted digest from a leader running adaptive
+   * cadence (the default). The sender serves the same value on its own
+   * heartbeat replies, so every worker gets one cadence whichever manager it
+   * talks to. Absent when the leader has adaptive cadence off or predates
+   * this field, and the sender then serves no interval either.
+   *
+   * @generated from field: optional uint32 served_interval_seconds = 4;
+   */
+  servedIntervalSeconds?: number;
+
   constructor(data?: PartialMessage<NodeLivenessDigestReply>) {
     super();
     proto3.util.initPartial(data, this);
@@ -19111,6 +19134,7 @@ export class NodeLivenessDigestReply extends Message<NodeLivenessDigestReply> {
     { no: 1, name: "accepted", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
     { no: 2, name: "not_status_leader", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
     { no: 3, name: "leader_hint", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "served_interval_seconds", kind: "scalar", T: 13 /* ScalarType.UINT32 */, opt: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): NodeLivenessDigestReply {

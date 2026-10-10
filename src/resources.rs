@@ -559,9 +559,13 @@ impl ResourcePool {
         values.insert("cpu".to_string(), ResourceValue::Amount(cpu.mhz));
         values.insert("cores".to_string(), ResourceValue::Amount(cpu.cores));
 
-        let config_attrs = node.config_attrs.as_object().cloned().unwrap_or_default();
+        // Borrowed, not cloned: this runs for every node a plan apply
+        // re-checks and every reprojected node, and cloning the whole
+        // attribute map each time showed up in the 20k-node leader profile.
+        let no_attrs = Map::new();
+        let config_attrs = node.config_attrs.as_object().unwrap_or(&no_attrs);
 
-        let max_allocations = config_value(&config_attrs, &["maxAllocations", "max_allocations"])
+        let max_allocations = config_value(config_attrs, &["maxAllocations", "max_allocations"])
             .and_then(|value| value.as_f64());
         let allocations = max_allocations.unwrap_or(f64::INFINITY);
         values.insert(
@@ -569,7 +573,7 @@ impl ResourcePool {
             ResourceValue::Amount(allocations),
         );
 
-        if let Some(custom) = config_value(&config_attrs, &["resources"]) {
+        if let Some(custom) = config_value(config_attrs, &["resources"]) {
             let custom = custom
                 .as_object()
                 .context("node resources must be an object")?;
@@ -585,7 +589,7 @@ impl ResourcePool {
         let mut pool = ResourcePool { values };
 
         if let Some(reserved) =
-            config_value(&config_attrs, &["reservedResources", "reserved_resources"])
+            config_value(config_attrs, &["reservedResources", "reserved_resources"])
         {
             let reserved = reserved
                 .as_object()

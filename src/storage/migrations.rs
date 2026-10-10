@@ -1636,6 +1636,39 @@ fn migration_list() -> Vec<M<'static>> {
         )",
         )
         .down("DROP TABLE IF EXISTS keyring_key;"),
+        // Per-job config lookups. "This job's latest config" is the most
+        // common job_config read (`LATEST_CONFIG_FOR_JOB` and every
+        // `WHERE job_id = ? ORDER BY created_at DESC` / `version DESC`), and
+        // without an index each one scanned the whole table. As a correlated
+        // subquery that made `jobs_with_unrolled_latest_config` O(jobs^2):
+        // ~60s per node-status-checker tick at 16.7k jobs, so the checker ran
+        // it back to back and held a core on the leader (AWS 20k-node run,
+        // 2026-10-10). `rollout.to_job_config_id` is the same pass's
+        // NOT EXISTS probe.
+        M::up(
+            "CREATE INDEX IF NOT EXISTS idx_job_config_job_id_created ON job_config(job_id, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_job_config_job_id_version ON job_config(job_id, version DESC);
+        CREATE INDEX IF NOT EXISTS idx_rollout_to_job_config_id ON rollout(to_job_config_id);",
+        )
+        .down(
+            "DROP INDEX IF EXISTS idx_job_config_job_id_created;
+        DROP INDEX IF EXISTS idx_job_config_job_id_version;
+        DROP INDEX IF EXISTS idx_rollout_to_job_config_id;",
+        ),
+        // Two more whole-table scans on the submit and eval paths
+        // (plan-path-fleet-scaling plan, Phase 4): `job_update` by
+        // `to_job_config_id` is how every job-submit eval (and every RunJob)
+        // finds the config it replaces (`Store::previous_job_config_id`),
+        // and `job_config` by `name` is how every RunJob loads the job's
+        // current config (`GET_JOB_CONFIG`). Each cost O(jobs) per use.
+        M::up(
+            "CREATE INDEX IF NOT EXISTS idx_job_update_to_job_config_id ON job_update(to_job_config_id);
+        CREATE INDEX IF NOT EXISTS idx_job_config_name_version ON job_config(name, version DESC);",
+        )
+        .down(
+            "DROP INDEX IF EXISTS idx_job_update_to_job_config_id;
+        DROP INDEX IF EXISTS idx_job_config_name_version;",
+        ),
     ]
 }
 
@@ -1865,7 +1898,9 @@ mod migrations_test {
             pre_indexes.push(index_names(&conn, table)?);
         }
 
-        migrations.to_latest(&mut conn)?;
+        // Exactly the rebuild, not `to_latest`: later migrations may add
+        // indexes to these tables, and that is not the rebuild changing them.
+        migrations.to_version(&mut conn, pre_version + 1)?;
 
         // No live table declares JSONB anymore — this is also the guard that
         // keeps future migrations from re-introducing a NUMERIC-affinity

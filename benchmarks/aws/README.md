@@ -7,10 +7,10 @@ identical AWS hardware with simulated worker fleets. The methodology is
 part of the claim — everything a campaign produces is reproducible from
 this directory.
 
-**Status: rig prepared, awaiting an AWS account.** Everything here is
-built and locally validated (`scripts/local-smoke.sh`, driver fixture
-tests, `terraform validate`); the Nomad/K8s install paths are complete
-but marked TO-VERIFY until their campaign phases run on real instances.
+**Status: Legion paths proven on AWS (phases 1-5, 2026-08); Nomad and
+K8s paths rebuilt 2026-10-09 for the cross-system campaign** (Nomad
+2.0.5 + nodesim, K8s 1.36.5 + KWOK 0.8.0). The campaign matrix is in the
+plan's "Cross-system campaign" section.
 The unattended path ("Unattended runs" below) is in the same state:
 written and syntax/unit-checked, unexercised against real AWS. So is
 `bootstrap-operator-box.sh` — its AWS calls and phase chain have been
@@ -215,6 +215,38 @@ actually ran. `legion-a` only; passing it to another system is an error
 rather than a silent no-op, because a cell archived as a 16-thread result
 whose config says 4 is worse than a failed run.
 
+### Heartbeat cadence (adaptive, the default)
+
+Run scale steps with Legion's default heartbeat cadence, which is adaptive.
+`configs/legion/manager-a.ncl.tpl` sets no `heartbeat` block on purpose, so
+the manager sizes the interval from fleet size at the default
+`targetRatePerSecond` of 2,500/s (headroom 2):
+
+| Fleet | Served interval | Lost window | Steady heartbeats/s |
+| ---: | ---: | ---: | ---: |
+| 1,000 | 2s | 10s | 500 |
+| 2,500 | 2s | 10s | 1,250 |
+| 5,000 | 5s | 25s | 1,000 |
+| 10,000 | 8s | 40s | 1,250 |
+| 20,000 | 21s | 105s | ~950 |
+| 50,000 | 55s | 275s | ~910 |
+
+The old fixed 2s cadence put ~10,000 heartbeat RPCs/s on the leader at 20k
+nodes, more than a core of a 4-vCPU box, and that load slowed scheduling
+enough to contaminate every large cell. Nomad adapts by default too (its
+`max_heartbeats_per_second` defaults to 50), so the comparison is
+default-against-default. Do not pin Legion to a fixed cadence for a
+comparative run unless the subject of the run is the cadence itself.
+
+What the rule costs is detection time, so every cell records it.
+`collect.sh` archives `heartbeat_served_interval` and
+`heartbeat_lost_window` next to `heartbeat_freshness`. Quote a throughput
+number with its served interval, and treat a freshness ratio below 0.95 as
+a cell that measured the heartbeat path rather than the scheduler.
+`packing-density.sh` judges cadence against the served interval, not
+against a fixed 2s. See
+[docs/heartbeat-cadence-and-scale.md](../../docs/heartbeat-cadence-and-scale.md).
+
 ### Every campaign resets the control plane first
 
 `run-campaign.sh` wipes and reinstalls the control plane before its first
@@ -361,28 +393,38 @@ and tear it down when the campaign is over.
   asserting it. The metrics are per sim *process* (~1,250 nodes), not per
   node — see docs/metrics.md § Worker. Nomad and K8s fleets are not
   scraped this way, so worker-side cost is only compared via instance CPU.
-- **Submission paths are not interchangeable — the one rule that
-  invalidates a comparison if you break it.** Legion has a native
-  submitter, `legion-loadgen` (`benchmarks/loadgen/main.rs`): one
-  process, a few long-lived gRPC connections, hundreds of concurrent
-  `RunJob` calls. Nomad and K8s do not; they still spawn a CLI process
-  per job, which is the shared loop that made the comparison fair in the
-  first place. **A cross-system comparison must therefore either run all
-  three with `--submitter cli` (`LEGION_SUBMITTER=cli` for
-  `run-step.sh`), or add equivalent native submitters for Nomad and K8s
-  first.** Anything else compares submitters, not schedulers, and it does
-  so in Legion's favour. Every cell archives the path it took as
-  `submitter` in both `metrics.json` and `fairness-record.json`, so this
-  is checkable after the fact rather than a thing to remember.
+- **Every system submits through its own API, pooled.** Legion uses
+  `legion-loadgen` (`benchmarks/loadgen/main.rs`): one process, a few
+  long-lived gRPC connections, hundreds of concurrent `RunJob` calls.
+  Nomad and K8s use the driver's `http_submit_all`: one process, one
+  keep-alive HTTP connection per worker thread, `POST /v1/jobs` and
+  `POST .../deployments`, at the same concurrency. This is the
+  cross-system default since 2026-10-09 (calls entry 5). Before then only
+  Legion had a native path and a comparison had to force all three onto
+  the CLI loop, which capped every system at the loadgen box's
+  process-spawn rate and made the table a tie by construction.
 
-  The submitter exists because the CLI loop was not fast enough to
-  measure Legion's weakest case. `web_fleet` is ~6 allocations per job,
-  so its ~36-103 jobs/sec ceiling is only ~600 alloc/sec of demand, and
-  Legion already served ≥336 alloc/sec while the driver was the
-  constraint — every such cell reported `submission.driver_bound: true`,
-  which is a floor and not a measurement. A Legion-vs-Legion sweep
-  (scaling, saturation, eval-thread) is what `native` is for; a
-  Legion-vs-Nomad-vs-K8s table is not.
+  `--submitter cli` (`LEGION_SUBMITTER=cli` for `run-step.sh`) still puts
+  all three on the process-per-job loop, and is the control row. The
+  remaining asymmetry is language: Legion's submitter is compiled and the
+  others are Python threads. So **read `submission.driver_bound` before
+  any competitor number**: `true` means the submitter, not the system,
+  set the rate, and the cell is a floor. Every cell archives its path as
+  `submitter` in `metrics.json` and `fairness-record.json`.
+
+  **Burst cells measure throughput, and paced cells measure latency.** A
+  burst cell's p99 is mostly drain time (`allocations / throughput`). For
+  a latency number, run `run-campaign.sh ... --submit-rate <jobs/sec>`
+  below capacity. It is Legion-only (`legion-loadgen --rate`, open loop)
+  and archives under `<run>-r<rate>`. Keep the storm step last in
+  `--steps`, or pass a storm step that is not in the list. The drill keeps
+  its jobs resident, and the campaign refuses any ordering that would
+  start a later step dirty.
+
+  The CLI loop's history is why this matters. `web_fleet` is ~6
+  allocations per job, so its ~36-103 jobs/sec ceiling is only ~600
+  alloc/sec of demand, and Legion already served ≥336 alloc/sec while the
+  driver was the constraint.
 - **The counting path is checked, not trusted.** The driver counts
   placements by parsing one `legion events follow` NDJSON stream on one
   Python thread. Coalescing (`allocation.placed` carries the plan's count)
@@ -417,7 +459,9 @@ and tear it down when the campaign is over.
   revision + binary hash, rendered configs, and instance types with
   every cell. Rule: default configs plus documented, defensible tuning
   only — every non-default is commented in `configs/` and lands in the
-  record.
+  record. Heartbeat cadence is a default too: Legion runs adaptive
+  cadence and Nomad its own `n/rate` scaling, and every Legion cell
+  archives the served interval and lost window it ran at.
 - **Projection honesty.** `fit_curves.py` publishes intervals and
   validation deltas, and flags superlinear fits instead of smoothing
   them.
@@ -427,10 +471,21 @@ and tear it down when the campaign is over.
 - Sim fleets share one dispatch address per instance, so per-node
   connection-establishment cost on the manager is understated at large
   N (same trade in nodesim/KWOK).
-- The Nomad/K8s driver adapters and install scripts are complete but
-  unexercised against real clusters until phases 3-4; the nodesim
-  `mock`-driver assumption and the K8s watch-parsing are the two
-  flagged verification points.
+- nomad-nodesim sets a node's class but not its meta, so Nomad can only
+  run class-constrained scenarios (`web_fleet`, `batch_burst`,
+  `dense_fleet`). `translate.py` refuses `mixed_heterogeneous` for Nomad
+  rather than producing jobs no node can take.
+- K8s runs with its API client QPS raised (scheduler and
+  controller-manager) but stock eviction timers, so its storm cell is
+  capped at 30 minutes and reported as a replaced fraction. See
+  `configs/k8s/kubeadm-config.yaml.tpl` and calls entry 6.
+- Competitor watches reconnect when the server ends them (the K8s
+  apiserver closes watchers that fall behind in a burst). Binds in the
+  gap are stamped late, which biases that system's latency upward, so
+  every cell records `watch_restarts`. Check it before quoting a K8s or
+  Nomad latency. See calls entry 8.
+- Nomad's down nodes stay in its node table until GC, so its fleet gate
+  counts *ready* nodes; a restarted nodesim fleet registers new node IDs.
 - Batch workloads translate to K8s Deployments (not Jobs) so all three
   systems schedule "keep N running" semantics; noted in the fairness
   record.

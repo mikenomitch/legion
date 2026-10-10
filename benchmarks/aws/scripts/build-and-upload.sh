@@ -96,6 +96,13 @@ fi
     exit 1
 }
 REV=$(git -C "$REPO_ROOT" rev-parse HEAD)
+# A build from uncommitted source must not be archived as the commit it
+# sits on: every cell's fairness record carries this revision. The suffix
+# is a hash of the uncommitted diff to the code that goes into the binary.
+CODE_PATHS=(src proto plugins benchmarks/loadgen Cargo.toml Cargo.lock build.rs)
+if ! git -C "$REPO_ROOT" diff --quiet HEAD -- "${CODE_PATHS[@]}"; then
+    REV="$REV-dirty-$(git -C "$REPO_ROOT" diff HEAD -- "${CODE_PATHS[@]}" | sha256sum | cut -c1-12)"
+fi
 SHA=$(sha256sum "$BIN" | cut -d' ' -f1)
 
 LOADGEN_SHA=$(sha256sum "$LOADGEN_BIN" | cut -d' ' -f1)

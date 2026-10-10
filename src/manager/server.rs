@@ -1258,8 +1258,8 @@ pub struct ManagerDaemonService {
     /// at most one interval of incompleteness and never a wrong answer.
     provisional_claims: Arc<Mutex<HashMap<String, Vec<crate::structs::ProvisionalClaimReport>>>>,
     /// Heartbeat cadence settings (`heartbeat`, docs/heartbeat-cadence-and-scale.md).
-    /// Adaptive cadence is off unless `targetRatePerSecond` is set, so by
-    /// default this only supplies `missedBeatsBeforeLost` to the cadence report.
+    /// Read by the cadence report; the served interval itself comes from the
+    /// status checker's ladder through the liveness table.
     heartbeat: crate::structs::HeartbeatConfigFull,
     /// Merged network policies by content hash (docs/network-handlers.md),
     /// filled by the heartbeat builder and served by `FetchNetPolicy`. In
@@ -5618,10 +5618,11 @@ impl Manager for ManagerDaemonService {
             }
         }
 
-        // The cadence this manager wants, when it dictates one at all. Absent
-        // by default: adaptive cadence is opt-in, and a worker that receives
-        // nothing keeps its worker-type `heartbeatSeconds`, which is exactly
-        // the historical behavior.
+        // The cadence this manager wants, when it dictates one at all. On by
+        // default (adaptive cadence); absent with `heartbeat.adaptive = false`,
+        // and a worker that receives nothing keeps its worker-type
+        // `heartbeatSeconds`. A non-leader serves the leader's value, relayed
+        // on its liveness digest reply.
         let next_interval_seconds = self
             .store
             .liveness()

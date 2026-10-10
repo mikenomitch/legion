@@ -56,6 +56,7 @@ A run directory contains:
 import argparse
 import re
 import concurrent.futures
+import http.client
 import json
 import os
 import shutil
@@ -63,6 +64,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.parse
 import urllib.request
 
 
@@ -507,6 +509,11 @@ class LegionAdapter:
             # that takes the placement marks.
             "--clock-offset-ms", str(monotonic_offset_ms()),
         ]
+        # Open-loop pacing (`--submit-rate`): the submitter sends job i at
+        # start + i/rate, so a cell paced below capacity reports how long a
+        # job waits rather than how long a burst takes to drain.
+        if getattr(self, "submit_rate", 0):
+            command += ["--rate", str(self.submit_rate)]
         result = subprocess.run(command, capture_output=True, env=self.env, text=True)
         if result.stderr:
             sys.stderr.write(result.stderr)
@@ -576,26 +583,127 @@ class LegionAdapter:
             self._stderr_file.close()
 
 
-class NomadAdapter:
-    """Nomad campaign (plan phase 3). Submits via the nomad CLI; watches
-    the allocation topic of the HTTP event stream. TO VERIFY against the
-    pinned Nomad release when phase 3 starts — the campaign gate is the
-    same fixture-replay math either way."""
+def iter_stream_lines(response, chunk=65536):
+    """Lines of a long-lived chunked HTTP response, until the server ends it.
 
-    def __init__(self, server_addr, nomad_bin="nomad"):
+    Not `for line in response`: iterating an http.client response reads
+    through readline(), which on a chunked stream can come back empty
+    between chunks and so end the loop while the connection is healthy.
+    Both competitor watchers died that way on 2026-10-09 (after 32 and 64
+    placements) with no exception at all. read1() returns b"" only at the
+    real end of the body.
+    """
+    buffer = b""
+    while True:
+        data = response.read1(chunk)
+        if not data:
+            break
+        buffer += data
+        *lines, buffer = buffer.split(b"\n")
+        yield from lines
+    if buffer:
+        yield buffer
+
+
+def http_submit_all(jobs, requests_for_job, connect, recorder, concurrency):
+    """Submit every job over pooled keep-alive HTTP connections.
+
+    The Nomad and K8s counterpart of `legion-loadgen`: one process, one
+    long-lived connection per worker thread, `concurrency` requests in
+    flight, nothing spawned or re-dialed per job. Each job is stamped
+    immediately before its first request, on this process's clock, so the
+    latency math is the same as the CLI loop's.
+
+    `requests_for_job(job)` returns [(method, path, body_bytes)], and every
+    one must return 2xx or the cell fails: a cell short of its expected
+    count must fail loudly, not average over the gap.
+    """
+    local = threading.local()
+    retries = {"count": 0}
+    retries_lock = threading.Lock()
+
+    def conn():
+        if getattr(local, "conn", None) is None:
+            local.conn = connect()
+        return local.conn
+
+    def send(method, path, body):
+        headers = {"Content-Type": "application/json"}
+        # Server errors are retried with backoff, as any real client would:
+        # Nomad answered "leadership lost while committing log" at 5,000
+        # nodes on 2026-10-09, and failing the cell on a leadership blip
+        # measures the driver's patience, not the system. The job keeps its
+        # FIRST submit stamp, so time lost to retries counts against the
+        # system's latency, and the retries are reported per cell.
+        attempts = 8
+        for attempt in range(1, attempts + 1):
+            try:
+                c = conn()
+                c.request(method, path, body=body, headers=headers)
+                response = c.getresponse()
+                payload = response.read()
+            except (OSError, http.client.HTTPException):
+                # A keep-alive connection the server closed: redial.
+                local.conn = None
+                if attempt == attempts:
+                    raise
+                continue
+            if response.status < 300:
+                return
+            if response.status >= 500 or response.status == 429:
+                if attempt < attempts:
+                    with retries_lock:
+                        retries["count"] += 1
+                    time.sleep(min(5.0, 0.25 * 2 ** (attempt - 1)))
+                    continue
+            raise RuntimeError(
+                f"{method} {path} -> {response.status}: {payload[:300]!r}"
+            )
+
+    def submit_one(job):
+        batch = requests_for_job(job)
+        recorder.record_submit(job["name"])
+        for method, path, body in batch:
+            send(method, path, body)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, concurrency)) as pool:
+        list(pool.map(submit_one, jobs))
+    return retries["count"]
+
+
+class NomadAdapter:
+    """Nomad campaign (plan phase 3). Submits through the HTTP API
+    (POST /v1/jobs) over pooled connections, or `nomad job run` on the CLI
+    loop; watches the Allocation topic of the event stream and counts an
+    allocation as placed the first time it carries a NodeID."""
+
+    def __init__(self, server_addr, nomad_bin="nomad", native=True):
         self.server_addr = server_addr.rstrip("/")
         self.env = dict(os.environ, NOMAD_ADDR=self.server_addr)
         self.nomad_bin = nomad_bin
+        self.native = native
         self._stop = threading.Event()
+        self._alive = True
+        parts = urllib.parse.urlsplit(self.server_addr)
+        self._host, self._port = parts.hostname, parts.port or 4646
+
+    def _get(self, path, timeout=60):
+        with urllib.request.urlopen(f"{self.server_addr}{path}", timeout=timeout) as r:
+            return r.headers.get("X-Nomad-Index"), json.loads(r.read() or b"null")
 
     def start_watch(self, recorder):
-        import urllib.request
+        # Start from the cluster's CURRENT index. The event stream otherwise
+        # replays its buffer, and the previous cell's jobs reuse this cell's
+        # names, so replayed allocations would count as this cell's
+        # placements.
+        index, _ = self._get("/v1/jobs?prefix=bench-")
+        start = {"index": int(index or 0) + 1}
+        seen = set()
 
-        def pump():
-            url = f"{self.server_addr}/v1/event/stream?topic=Allocation"
-            seen = set()
+        def stream_once():
+            url = f"{self.server_addr}/v1/event/stream?topic=Allocation&index={start['index']}"
             with urllib.request.urlopen(url) as stream:
-                for raw in stream:
+                for raw in iter_stream_lines(stream):
                     if self._stop.is_set():
                         return
                     line = raw.decode("utf-8", "replace").strip()
@@ -606,26 +714,60 @@ class NomadAdapter:
                         frame = json.loads(line)
                     except json.JSONDecodeError:
                         continue
-                    for event in frame.get("Events", []):
+                    if frame.get("Index"):
+                        start["index"] = int(frame["Index"]) + 1
+                    for event in frame.get("Events") or []:
                         allocation = (event.get("Payload") or {}).get("Allocation") or {}
                         alloc_id = allocation.get("ID")
-                        # First sighting of an allocation == placed (the
-                        # scheduler created it against a node).
                         if alloc_id and alloc_id not in seen and allocation.get("NodeID"):
                             seen.add(alloc_id)
                             recorder.record_placement(allocation.get("JobID", "?"), 1)
 
-        thread = threading.Thread(target=pump, daemon=True)
-        thread.start()
+        def pump():
+            # Resume from the last index on any disconnect. The first Nomad
+            # smoke cell of 2026-10-09 lost its stream after 32 placements
+            # and the driver ended the cell on the spot; a resumed stream
+            # replays nothing it already counted (`seen`) and misses nothing
+            # Nomad still buffers. Only repeated failures end the watch.
+            failures = 0
+            while not self._stop.is_set() and failures < 5:
+                try:
+                    stream_once()
+                except Exception as err:  # noqa: BLE001 — reported, then retried
+                    failures += 1
+                    self.watch_restarts = getattr(self, "watch_restarts", 0) + 1
+                    print(f"nomad event stream dropped ({err}); resuming at index "
+                          f"{start['index']} (attempt {failures})", file=sys.stderr)
+                    time.sleep(1.0)
+                else:
+                    if not self._stop.is_set():
+                        failures += 1
+                        self.watch_restarts = getattr(self, "watch_restarts", 0) + 1
+                        print(f"nomad event stream closed; resuming at index "
+                              f"{start['index']}", file=sys.stderr)
+                        time.sleep(1.0)
+            self._alive = self._stop.is_set()
+
+        threading.Thread(target=pump, daemon=True).start()
         time.sleep(1.0)
 
     def submit_all(self, workload_dir, jobs, recorder, concurrency):
-        # No native submitter for Nomad, so the shared CLI loop it is. This
-        # is the fairness baseline: giving Legion a native submitter and
-        # leaving Nomad on process-per-job would compare the submitters, not
-        # the schedulers. Adding one here (nomad's HTTP API from a
-        # long-lived session) is what a cross-system phase needs first.
-        return False
+        if not self.native:
+            return False
+
+        def requests_for_job(job):
+            path = os.path.join(workload_dir, job["name"] + ".nomad.json")
+            with open(path, "rb") as f:
+                return [("POST", "/v1/jobs", f.read())]
+
+        self.submit_retries = http_submit_all(
+            jobs,
+            requests_for_job,
+            lambda: http.client.HTTPConnection(self._host, self._port, timeout=120),
+            recorder,
+            concurrency,
+        )
+        return True
 
     def submit(self, path, job_name):
         result = subprocess.run(
@@ -638,78 +780,222 @@ class NomadAdapter:
             raise RuntimeError(f"nomad job run {job_name} failed: {result.stderr}")
 
     def watch_alive(self):
-        return not self._stop.is_set()
+        return self._alive
+
+    def snapshot_counters(self, timeout=60.0):
+        """Live bench allocations by the server's own count, for the same
+        counting cross-check the Legion cells get."""
+        try:
+            _, allocs = self._get("/v1/allocations?prefix=", timeout=timeout)
+        except Exception as err:  # noqa: BLE001 — advisory path
+            return {"error": f"{type(err).__name__}: {err}", "url": self.server_addr}
+        live = [
+            a for a in allocs or []
+            if a.get("JobID", "").startswith("bench-")
+            and a.get("DesiredStatus") == "run"
+        ]
+        return {"url": self.server_addr, "allocations": float(len(live))}
 
     def stop_watch(self):
         self._stop.set()
 
 
-class K8sAdapter:
-    """K8s campaign (plan phase 4). Submits manifests with kubectl;
-    watches bench-labeled pods and counts a pod as placed the first time
-    it carries spec.nodeName (the scheduler bound it). TO VERIFY against
-    the pinned K8s release when phase 4 starts."""
+# Every bench object lives in one namespace, so a cell's cleanup is one
+# server-side namespace delete. Deleting by label left 15,626 pods behind
+# at 5,000 nodes on 2026-10-09: the Deployments survived and kept
+# recreating them, and the next cell collided with their names.
+K8S_NAMESPACE = "bench"
+
+
+class K8sAPI:
+    """Just enough of a kube-apiserver client for the driver: admin
+    credentials from the loadgen kubeconfig, keep-alive HTTPS connections."""
 
     def __init__(self, kubeconfig=None, kubectl_bin="kubectl"):
+        env = dict(os.environ)
+        if kubeconfig:
+            env["KUBECONFIG"] = kubeconfig
+        raw = subprocess.run(
+            [kubectl_bin, "config", "view", "--raw", "--minify", "-o", "json"],
+            capture_output=True, text=True, env=env, check=True,
+        ).stdout
+        config = json.loads(raw)
+        cluster = config["clusters"][0]["cluster"]
+        user = config["users"][0]["user"]
+        parts = urllib.parse.urlsplit(cluster["server"])
+        self.host, self.port = parts.hostname, parts.port or 443
+        import base64
+        import ssl
+        import tempfile
+
+        self._dir = tempfile.mkdtemp(prefix="bench-kube-")
+        cert = os.path.join(self._dir, "client.crt")
+        key = os.path.join(self._dir, "client.key")
+        with open(cert, "wb") as f:
+            f.write(base64.b64decode(user["client-certificate-data"]))
+        with open(key, "wb") as f:
+            f.write(base64.b64decode(user["client-key-data"]))
+        os.chmod(key, 0o600)
+        self.context = ssl.create_default_context(
+            cadata=base64.b64decode(cluster["certificate-authority-data"]).decode()
+        )
+        self.context.load_cert_chain(cert, key)
+
+    def connect(self, timeout=120):
+        return http.client.HTTPSConnection(
+            self.host, self.port, context=self.context, timeout=timeout
+        )
+
+    def get_json(self, path, timeout=120):
+        c = self.connect(timeout)
+        try:
+            c.request("GET", path)
+            r = c.getresponse()
+            body = r.read()
+            if r.status != 200:
+                raise RuntimeError(f"GET {path} -> {r.status}: {body[:300]!r}")
+            return json.loads(body)
+        finally:
+            c.close()
+
+    def list_pods(self, selector="bench%3D1"):
+        """Every bench pod, paginated, plus the list's resourceVersion."""
+        items, cont = [], ""
+        while True:
+            page = self.get_json(
+                f"/api/v1/namespaces/{K8S_NAMESPACE}/pods?labelSelector={selector}&limit=1000"
+                + (f"&continue={urllib.parse.quote(cont)}" if cont else "")
+            )
+            items.extend(page.get("items") or [])
+            cont = (page.get("metadata") or {}).get("continue") or ""
+            if not cont:
+                return items, page["metadata"]["resourceVersion"]
+
+
+class K8sAdapter:
+    """K8s campaign (plan phase 4). Submits Deployments through the API
+    (POST .../deployments) over pooled connections, or `kubectl apply` on
+    the CLI loop; watches bench pods through the API and counts a pod as
+    placed the first time it carries spec.nodeName (the scheduler bound
+    it).
+
+    The watch is `kubectl get --watch` printing custom columns, one short
+    row per event. Not `-o json`, whose pretty-printed multi-line objects
+    had to be re-parsed from a growing buffer (quadratic per pod), and not
+    a Python apiserver watch, which decoded too slowly and was closed by
+    the apiserver as a slow watcher."""
+
+    def __init__(self, kubeconfig=None, kubectl_bin="kubectl", native=True):
         self.env = dict(os.environ)
         if kubeconfig:
             self.env["KUBECONFIG"] = kubeconfig
         self.kubectl_bin = kubectl_bin
-        self._watcher = None
+        self.kubeconfig = kubeconfig
+        self.native = native
+        self._api = None
+        self._stop = threading.Event()
+        self._alive = True
+
+    @property
+    def api(self):
+        # Built on first use: it reads the kubeconfig through kubectl, which
+        # an adapter constructed only to be inspected (tests) has no need of.
+        if self._api is None:
+            self._api = K8sAPI(self.kubeconfig, self.kubectl_bin)
+        return self._api
 
     def start_watch(self, recorder):
-        self._watcher = subprocess.Popen(
-            [
-                self.kubectl_bin,
-                "get",
-                "pods",
-                "-l",
-                "bench=1",
-                "--watch",
-                "--output-watch-events",
-                "-o",
-                "json",
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            env=self.env,
-            text=True,
+        # List first and watch from the list's resourceVersion, seeding
+        # `seen` with what already exists: a bare watch opens with a
+        # synthetic ADDED for every live pod, which would count resident
+        # pods as this cell's placements.
+        # Seed `seen` with what already exists, so resident pods (the storm
+        # drill's workload) are not counted as this watch's placements.
+        existing, _ = self.api.list_pods()
+        seen = {pod["metadata"]["uid"] for pod in existing}
+
+        # The watch runs in kubectl, printing one short row per event, and
+        # this process only splits rows. A Python consumer decoding full pod
+        # objects was too slow at a few hundred binds/sec: the apiserver
+        # closes watchers that fall behind, and on 2026-10-09 it closed this
+        # one five times in one 1k-node cell. kubectl decodes in Go and keeps
+        # the socket drained — the same arrangement as Legion's watch, which
+        # is `legion events follow` in a subprocess.
+        columns = (
+            "UID:.metadata.uid,NODE:.spec.nodeName,JOB:.metadata.labels.bench-job"
         )
+        command = [
+            self.kubectl_bin, "get", "pods", "-n", K8S_NAMESPACE, "-l", "bench=1",
+            # Bound pods only: a pod enters this watch at the moment it is
+            # bound, and the creation events of still-pending pods — a third
+            # of the stream — never reach kubectl at all.
+            "--field-selector", "spec.nodeName!=",
+            "--watch", "--no-headers", "-o", f"custom-columns={columns}",
+        ]
+        self._stderr_path = os.path.join(recorder.out_dir, "follower-stderr.log")
+        stderr_file = open(self._stderr_path, "a")
 
         def pump():
-            seen = set()
-            decoder = json.JSONDecoder()
-            buffer = ""
-            for line in self._watcher.stdout:
-                recorder.record_raw(line)
-                buffer += line
-                # kubectl pretty-prints one watch event over many lines;
-                # decode greedily as objects complete.
-                while buffer:
-                    try:
-                        obj, end = decoder.raw_decode(buffer.strip())
-                    except json.JSONDecodeError:
-                        break
-                    buffer = buffer.strip()[end:]
-                    pod = obj.get("object") or {}
-                    uid = (pod.get("metadata") or {}).get("uid")
-                    node = (pod.get("spec") or {}).get("nodeName")
-                    job = ((pod.get("metadata") or {}).get("labels") or {}).get(
-                        "bench-job", "?"
+            # kubectl exits when the server ends the watch (its request
+            # timeout is 30-60 min); restart it, and its opening list counts
+            # anything bound in the gap. Only repeated failures end the watch.
+            restarts = 0
+            try:
+                while not self._stop.is_set() and restarts < 20:
+                    self._watcher = subprocess.Popen(
+                        command, stdout=subprocess.PIPE, stderr=stderr_file,
+                        env=self.env, text=True,
                     )
-                    if uid and node and uid not in seen:
-                        seen.add(uid)
-                        recorder.record_placement(job, 1)
+                    for row in self._watcher.stdout:
+                        if self._stop.is_set():
+                            return
+                        recorder.record_raw(row)
+                        fields = row.split()
+                        if len(fields) < 3:
+                            continue
+                        uid, node, job = fields[0], fields[1], fields[2]
+                        if node != "<none>" and uid not in seen:
+                            seen.add(uid)
+                            recorder.record_placement(job, 1)
+                    self._watcher.wait()
+                    if not self._stop.is_set():
+                        # The apiserver ends watches that fall behind in a
+                        # burst; every K8s client relists and re-watches, and
+                        # so does this. Binds in the gap are stamped when the
+                        # relist delivers them — late, against K8s — so the
+                        # count lands in metrics.json as `watch_restarts`.
+                        restarts += 1
+                        self.watch_restarts = restarts
+                        print(f"kubectl pod watch exited ({self._watcher.returncode}); "
+                              f"restarting ({restarts})", file=sys.stderr)
+                        time.sleep(0.05)
+            finally:
+                self._alive = self._stop.is_set()
+                stderr_file.close()
 
-        thread = threading.Thread(target=pump, daemon=True)
-        thread.start()
+        threading.Thread(target=pump, daemon=True).start()
         time.sleep(1.0)
 
     def submit_all(self, workload_dir, jobs, recorder, concurrency):
-        # Same as Nomad: no native submitter, so the shared CLI loop keeps
-        # the comparison honest. The equivalent here would be the apiserver
-        # REST API over one keep-alive session rather than kubectl per job.
-        return False
+        if not self.native:
+            return False
+
+        def requests_for_job(job):
+            with open(os.path.join(workload_dir, job["file"])) as f:
+                items = json.load(f)["items"]
+            return [
+                (
+                    "POST",
+                    f"/apis/apps/v1/namespaces/{K8S_NAMESPACE}/deployments",
+                    json.dumps(item).encode(),
+                )
+                for item in items
+            ]
+
+        self.submit_retries = http_submit_all(
+            jobs, requests_for_job, self.api.connect, recorder, concurrency
+        )
+        return True
 
     def submit(self, path, job_name):
         result = subprocess.run(
@@ -722,11 +1008,21 @@ class K8sAdapter:
             raise RuntimeError(f"kubectl apply {job_name} failed: {result.stderr}")
 
     def watch_alive(self):
-        return self._watcher is not None and self._watcher.poll() is None
+        return self._alive
+
+    def snapshot_counters(self, timeout=120.0):
+        try:
+            pods, _ = self.api.list_pods()
+        except Exception as err:  # noqa: BLE001 — advisory path
+            return {"error": f"{type(err).__name__}: {err}", "url": self.api.host}
+        bound = [p for p in pods if (p.get("spec") or {}).get("nodeName")]
+        return {"url": self.api.host, "allocations": float(len(bound))}
 
     def stop_watch(self):
-        if self._watcher:
-            self._watcher.terminate()
+        self._stop.set()
+        watcher = getattr(self, "_watcher", None)
+        if watcher and watcher.poll() is None:
+            watcher.terminate()
 
 
 def make_adapter(args):
@@ -751,10 +1047,15 @@ def make_adapter(args):
         return LegionAdapter(
             args.manager, legion_bin=args.legion_bin, loadgen_bin=loadgen_bin
         )
+    # Same switch for the competitors: `cli` forces the process-per-job
+    # loop, anything else takes the HTTP submitter.
+    native = getattr(args, "submitter", "auto") != "cli"
     if args.system == "nomad":
-        return NomadAdapter(args.manager, nomad_bin=args.nomad_bin)
+        return NomadAdapter(args.manager, nomad_bin=args.nomad_bin, native=native)
     if args.system == "k8s":
-        return K8sAdapter(kubeconfig=args.kubeconfig, kubectl_bin=args.kubectl_bin)
+        return K8sAdapter(
+            kubeconfig=args.kubeconfig, kubectl_bin=args.kubectl_bin, native=native
+        )
     raise ValueError(args.system)
 
 
@@ -776,12 +1077,19 @@ def cmd_run(args):
             "Drop one."
         )
 
+    if args.submit_rate and (args.system != "legion" or args.submitter == "cli"):
+        raise SystemExit(
+            "--submit-rate is implemented by legion-loadgen only: use it with "
+            "--system legion and the native submitter."
+        )
+
     with open(os.path.join(args.workload_dir, "manifest.json")) as f:
         manifest = json.load(f)
     expected_total = manifest["total_expected_allocations"]
 
     recorder = RunRecorder(args.out)
     adapter = make_adapter(args)
+    adapter.submit_rate = args.submit_rate
     if getattr(args, "metrics_url", None) and hasattr(adapter, "metrics_url"):
         adapter._metrics_url = args.metrics_url
     adapter.start_watch(recorder)
@@ -966,6 +1274,17 @@ def cmd_run(args):
     # cell is comparable to another Legion cell and to nothing else. Recorded
     # per cell so an archive can be checked rather than trusted.
     metrics["submitter"] = submitter
+    # A paced cell's latency is the headline and its throughput is just the
+    # arrival rate, so the target is recorded next to both.
+    metrics["submit_rate_target"] = args.submit_rate or None
+    # How often the placement watch had to reconnect. Zero is the clean
+    # case; each restart can stamp the binds in its gap late, so a non-zero
+    # count is the first thing to check against a competitor's latency.
+    metrics["watch_restarts"] = getattr(adapter, "watch_restarts", 0)
+    # Submissions the system answered with a 5xx/429 and that succeeded on
+    # retry. Non-zero means the control plane shed or failed requests under
+    # this load — a result in its own right, reported next to the numbers.
+    metrics["submit_retries"] = getattr(adapter, "submit_retries", 0)
     if counters_before is not None:
         metrics["cross_check"] = cross_check_counts(
             counters_before, adapter.snapshot_counters, recorder.placed_total()
@@ -1108,6 +1427,15 @@ def main():
         default=0,
         help="Sleep this long after each submit. Pacing only makes sense on "
         "the CLI loop, so any non-zero value keeps the run on that path.",
+    )
+    run.add_argument(
+        "--submit-rate",
+        type=float,
+        default=0.0,
+        help="Open-loop arrival rate in jobs/sec for the native Legion "
+        "submitter. Pace a cell below capacity to measure submit-to-placed "
+        "latency; 0 (the default) submits as one burst, which measures "
+        "throughput and makes p99 a drain time.",
     )
     run.add_argument(
         "--submit-concurrency",

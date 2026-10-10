@@ -28,6 +28,7 @@ KEEP_JOBS=false
 # slot is one in-flight RPC, and the two want very different numbers). Set
 # LEGION_SUBMIT_CONCURRENCY or --submit-concurrency to pin it.
 SUBMIT_CONCURRENCY="${LEGION_SUBMIT_CONCURRENCY:-}"
+SUBMIT_RATE=""
 # How Legion jobs are submitted.
 #
 # `auto` takes the native submitter (legion-loadgen) when the loadgen box has
@@ -57,6 +58,8 @@ while [ $# -gt 0 ]; do
     # every argument.
     --keep-jobs) KEEP_JOBS="$2" ;;
     --submit-concurrency) SUBMIT_CONCURRENCY="$2" ;;
+    # Open-loop jobs/sec for the native Legion submitter (0 = burst).
+    --submit-rate) SUBMIT_RATE="$2" ;;
     --submitter) SUBMITTER="$2" ;;
     --campaign) CAMPAIGN="$2" ;;
     *)
@@ -106,6 +109,11 @@ if [ -n "$TARGET_ALLOCS" ]; then
 else
     RUN_ID="$SYSTEM-$SCENARIO-${NODES}n-x$MULTIPLIER"
 fi
+# A paced cell measures latency, not throughput, so it must never share an
+# id with (and overwrite) the burst cell at the same size.
+if [ -n "$SUBMIT_RATE" ]; then
+    RUN_ID="$RUN_ID-r$SUBMIT_RATE"
+fi
 REMOTE_OUT="/opt/bench/runs/$CAMPAIGN/$RUN_ID"
 log "cell $RUN_ID (campaign $CAMPAIGN, manager ${MANAGER:-kubeconfig})"
 
@@ -145,6 +153,10 @@ if [ "$DRIVER_SYSTEM" = legion ]; then
     # a contended queue. Waiting is cheap; a mis-attributed cell is not.
     log "waiting for the pre-cell eval backlog to drain"
     PRE_CELL_EVAL_DEPTH=$(wait_for_eval_drain "$MANAGER" 10 600)
+else
+    # The competitors' version of the same gate: exactly this cell's
+    # fleet, every node ready, or no cell.
+    wait_for_ready_nodes "$DRIVER_SYSTEM" "$NODES" 300 || exit 1
 fi
 
 # Leave the cluster as this cell found it. Cells run back to back -- three
@@ -162,7 +174,16 @@ fi
 # parallel for the same reason submission does -- 8k jobs at 25ms each is
 # minutes of rig time otherwise.
 cleanup_jobs() {
-    [ "$DRIVER_SYSTEM" = legion ] || return 0
+    case "$DRIVER_SYSTEM" in
+    nomad)
+        cleanup_nomad_jobs
+        return
+        ;;
+    k8s)
+        cleanup_k8s_jobs
+        return
+        ;;
+    esac
     log "destroying this cell's jobs"
     destroyed=$(rsh "$LOADGEN_ADDR" "
         export LEGION_ADDR=$MANAGER
@@ -185,6 +206,46 @@ cleanup_jobs() {
     # what it endangers, so say it loudly and let the campaign decide.
     [ "${destroyed:-0}" = 0 ] ||
         log "WARNING: $destroyed jobs survived teardown — the next cell starts dirty"
+}
+
+# Nomad: purge every bench job (stop + remove in one call), then GC, then
+# wait for the allocations to be gone so the next cell starts empty.
+cleanup_nomad_jobs() {
+    log "purging this cell's nomad jobs"
+    remaining=$(rsh "$LOADGEN_ADDR" "
+        export NOMAD_ADDR=$MANAGER
+        curl -fsS \$NOMAD_ADDR/v1/jobs?prefix=bench- | jq -r '.[].ID' |
+            xargs -r -P 16 -I{} curl -fsS -o /dev/null -X DELETE '$MANAGER/v1/job/{}?purge=true'
+        curl -fsS -o /dev/null -X PUT \$NOMAD_ADDR/v1/system/gc || true
+        for _ in \$(seq 1 60); do
+            n=\$(curl -fsS \$NOMAD_ADDR/v1/allocations | jq '[.[] | select((.JobID | startswith(\"bench-\")) and .DesiredStatus == \"run\")] | length')
+            [ \"\$n\" = 0 ] && break
+            sleep 5
+        done
+        curl -fsS \$NOMAD_ADDR/v1/jobs?prefix=bench- | jq length
+    ")
+    [ "${remaining:-0}" = 0 ] ||
+        log "WARNING: $remaining nomad jobs survived teardown — the next cell starts dirty"
+}
+
+# K8s: server-side deletecollection rather than `kubectl delete` per
+# object, which issues one sequential DELETE per Deployment — minutes at
+# 10k objects. Pods are collected too instead of waiting on the garbage
+# collector, and the cell is not over until none are left.
+cleanup_k8s_jobs() {
+    # One server-side delete of the bench namespace, then recreate it.
+    # Deleting by label (deletecollection on deployments, replicasets, and
+    # pods) left 15,626 pods behind at 5,000 nodes: the Deployments
+    # survived and kept recreating them. A namespace delete takes every
+    # object with it, and the cell is not over until the namespace is gone.
+    log "deleting the bench namespace"
+    remaining=$(rsh "$LOADGEN_ADDR" "
+        kubectl delete namespace bench --wait=true --timeout=20m >/dev/null 2>&1 || true
+        kubectl get namespace bench >/dev/null 2>&1 && echo stuck && exit 0
+        kubectl create namespace bench >/dev/null && echo 0
+    ")
+    [ "${remaining:-}" = 0 ] ||
+        log "WARNING: the bench namespace did not finish deleting — the next cell starts dirty"
 }
 
 # On EXIT, not inline. The driver exits non-zero whenever a cell is
@@ -240,6 +301,11 @@ rsh "$LOADGEN_ADDR" "mkdir -p '$REMOTE_OUT' && cat >'$REMOTE_OUT/pre-cell.json'"
           note: "eval_backlog_before_cell > 0 means this cell shared the eval workers with fleet churn"}'
 )"
 
+# K8s cells run in their own namespace (see cleanup_k8s_jobs).
+if [ "$DRIVER_SYSTEM" = k8s ]; then
+    rsh "$LOADGEN_ADDR" "kubectl get namespace bench >/dev/null 2>&1 || kubectl create namespace bench >/dev/null"
+fi
+
 rsh "$LOADGEN_ADDR" "
     set -euo pipefail
     mkdir -p '$REMOTE_OUT'
@@ -255,6 +321,7 @@ rsh "$LOADGEN_ADDR" "
         ${MANAGER:+--manager '$MANAGER'} \
         --warmup-secs '$WARMUP' \
         ${SUBMIT_CONCURRENCY:+--submit-concurrency '$SUBMIT_CONCURRENCY'} \
+        ${SUBMIT_RATE:+--submit-rate '$SUBMIT_RATE'} \
         --submitter '$SUBMITTER' \
         --legion-bin /usr/local/bin/legion \
         --legion-loadgen-bin /usr/local/bin/legion-loadgen \

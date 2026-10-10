@@ -469,7 +469,7 @@ mod tests {
     #[test]
     fn bin_pack_prefers_more_loaded_node() {
         let nodes = vec![node("node-a"), node("node-b")];
-        let allocations = SharedNodeAllocations::from([(
+        let allocations = SharedNodeAllocations::from_iter([(
             String::from("node-a"),
             Arc::new(vec![alloc("node-a", 1, "other-job")]),
         )]);
@@ -529,7 +529,7 @@ mod tests {
     #[test]
     fn bin_pack_counts_planned_and_active_allocations() {
         let nodes = vec![node("node-a"), node("node-b")];
-        let allocations = SharedNodeAllocations::from([
+        let allocations = SharedNodeAllocations::from_iter([
             (
                 String::from("node-a"),
                 Arc::new(vec![
@@ -595,7 +595,7 @@ mod tests {
     #[test]
     fn spread_picks_any_node_on_equal_load() {
         let nodes = vec![node("node-a"), node("node-b")];
-        let allocations = SharedNodeAllocations::from([(
+        let allocations = SharedNodeAllocations::from_iter([(
             String::from("node-a"),
             Arc::new(vec![alloc("node-a", 1, "other-job")]),
         )]);
@@ -655,7 +655,7 @@ mod tests {
     #[test]
     fn bin_pack_treats_near_equal_scores_as_tie() {
         let nodes = vec![node("node-a"), node("node-b")];
-        let allocations = SharedNodeAllocations::from([(
+        let allocations = SharedNodeAllocations::from_iter([(
             String::from("node-a"),
             Arc::new(vec![alloc("node-a", 1, "other-job")]),
         )]);
@@ -699,7 +699,7 @@ mod tests {
     #[test]
     fn spread_prefers_node_with_same_node_as_affinity() {
         let nodes = vec![node("node-a"), node("node-b")];
-        let allocations = SharedNodeAllocations::from([(
+        let allocations = SharedNodeAllocations::from_iter([(
             String::from("node-a"),
             Arc::new(vec![alloc_for_task("node-a", 1, "job", 1)]),
         )]);

@@ -877,10 +877,11 @@ pub struct LivenessCheckerConfig {
 
 /// The interval this manager currently serves, and the ladder state behind it.
 ///
-/// With adaptive cadence off (the default) the served interval is just the
-/// floor — the manager tells workers nothing and they keep their worker-type
-/// `heartbeatSeconds`. The value is still tracked because the freshness ratio
-/// and the sizing arithmetic need an interval to be "on time" relative to.
+/// With adaptive cadence off (`heartbeat.adaptive = false`) the served
+/// interval is just the floor — the manager tells workers nothing and they
+/// keep their worker-type `heartbeatSeconds`. The value is still tracked
+/// because the freshness ratio and the sizing arithmetic need an interval to
+/// be "on time" relative to.
 struct ServedCadence {
     ladder: crate::manager::cadence::LadderState,
     at_max: bool,
@@ -1055,7 +1056,7 @@ async fn start_node_status_checker(store: Store, config: LivenessCheckerConfig) 
             if adaptive {
                 let target = cadence::target_interval(
                     snapshot.len(),
-                    config.heartbeat.target_rate_per_second.unwrap_or(0.0),
+                    config.heartbeat.target_rate_per_second,
                     config.heartbeat.headroom,
                     min_interval,
                     max_interval,
@@ -1075,19 +1076,33 @@ async fn start_node_status_checker(store: Store, config: LivenessCheckerConfig) 
                         to_seconds = next.served.as_secs(),
                         "Serving a new heartbeat interval for this fleet size"
                     );
-                    apply_served_cadence(
-                        &store,
-                        &snapshot,
-                        cadence_state.ladder.served,
-                        next.served,
-                        missed_beats,
-                    );
+                    if next.served < cadence_state.ladder.served {
+                        narrow_windows_on_confirmation(
+                            &store,
+                            &snapshot,
+                            next.served,
+                            missed_beats,
+                        );
+                    }
                 }
                 cadence_state.ladder = next;
+                // Widening runs every tick, not only on a step up: a node
+                // that registered after the last step up (its window comes
+                // from its worker-type cadence), or whose worker type beats
+                // faster than the floor, would otherwise sit on a window
+                // narrower than the interval it is about to be served.
+                // Widen-only, so a slower pool's wider window is untouched,
+                // and a no-op once every window is wide enough.
+                widen_windows_to_served(
+                    &store,
+                    &snapshot,
+                    cadence_state.ladder.served,
+                    missed_beats,
+                );
                 // Only a manager running adaptive cadence puts an interval on
-                // the reply. With it off, workers keep their worker-type value
-                // and the wire field stays absent, which is what makes the
-                // default path bit-for-bit identical to before.
+                // the reply. With it off (`heartbeat.adaptive = false`),
+                // workers keep their worker-type value and the wire field
+                // stays absent, exactly as before adaptive cadence existed.
                 store
                     .liveness()
                     .set_served_interval(Some(cadence_state.ladder.served));
@@ -1448,8 +1463,13 @@ async fn send_liveness_digest(store: &Store, manager_node_id: &str) {
         .inc(&[outcome.metric_label()]);
     telemetry.liveness_digest_nodes.observe(count as f64);
     match &outcome {
-        DigestOutcome::Accepted => {
+        DigestOutcome::Accepted { served_interval } => {
             store.liveness().set_digest_fallback(false);
+            // Serve the leader's cadence to the workers talking to THIS
+            // manager. Without the relay, adaptive cadence only reached the
+            // leader's own workers, and a fleet spread over three managers
+            // kept two thirds of its beats at the floor.
+            store.liveness().set_served_interval(*served_interval);
             debug!(
                 nodes = count,
                 "Reported node liveness to the status-lane leader"
@@ -1605,43 +1625,67 @@ fn write_liveness_checkpoint(store: &Store, now: std::time::Instant) {
     }
 }
 
-/// Move every node's lost window when the served interval changes.
+/// Narrow lost windows when the served interval steps down.
 ///
 /// The asymmetry is the safety argument (heartbeat-cadence plan §6.4):
 ///
-/// - **Widening happens immediately**, the moment the manager DECIDES to slow
-///   down and before any worker has been told. A worker that never gets the
-///   message is protected.
+/// - **Widening happens immediately** ([`widen_windows_to_served`]), the
+///   moment the manager DECIDES to slow down and before any worker has been
+///   told. A worker that never gets the message is protected.
 /// - **Narrowing waits for confirmation** — a node keeps its wide window until
 ///   it is observed actually beating at the faster cadence. A worker that
 ///   missed the speed-up is never punished for obeying the last instruction it
 ///   received. This is Consul's session-TTL contract, per node.
-fn apply_served_cadence(
+fn narrow_windows_on_confirmation(
     store: &Store,
     snapshot: &[crate::manager::cadence::NodeLiveness],
-    previous: Duration,
     next: Duration,
     missed_beats: u32,
 ) {
-    let widening = next > previous;
-    let window = crate::manager::cadence::lost_window_for(next, missed_beats);
     let table = store.liveness();
     let updates: Vec<(String, i64)> = snapshot
         .iter()
-        .filter(|node| {
-            if widening {
-                return true;
-            }
+        .filter_map(|node| {
             // Narrowing: only nodes we have SEEN beat at the new, faster
             // cadence. `gap` is the interval between this node's last two
             // observed beats; 1.5x leaves room for jitter and one slow tick.
-            table
-                .last_beat(&node.id)
-                .and_then(|beat| beat.gap)
-                .is_some_and(|gap| gap <= next.mul_f64(1.5))
+            let gap = table.last_beat(&node.id).and_then(|beat| beat.gap)?;
+            if gap > next.mul_f64(1.5) {
+                return None;
+            }
+            // A worker type configured slower than `next` keeps its own
+            // cadence (the served interval is a floor), so the window
+            // follows the cadence it was actually seen beating at when that
+            // is the slower of the two.
+            let interval = next.max(Duration::from_secs(gap.as_secs_f64().ceil() as u64));
+            let window = crate::manager::cadence::lost_window_for(interval, missed_beats);
+            (window < node.window).then(|| (node.id.clone(), window.as_secs() as i64))
         })
+        .collect();
+    write_lost_windows(store, updates, false);
+}
+
+/// Raise every node whose lost window is narrower than `missedBeats x
+/// served` to that window. Never narrows: a pool whose worker type beats
+/// slower than the served interval already has the wider window it needs,
+/// and a worker on an older build that ignores the served interval is
+/// covered before it has been told anything.
+fn widen_windows_to_served(
+    store: &Store,
+    snapshot: &[crate::manager::cadence::NodeLiveness],
+    served: Duration,
+    missed_beats: u32,
+) {
+    let window = crate::manager::cadence::lost_window_for(served, missed_beats);
+    let updates: Vec<(String, i64)> = snapshot
+        .iter()
+        .filter(|node| node.window < window)
         .map(|node| (node.id.clone(), window.as_secs() as i64))
         .collect();
+    write_lost_windows(store, updates, true);
+}
+
+fn write_lost_windows(store: &Store, updates: Vec<(String, i64)>, widening: bool) {
     if updates.is_empty() {
         return;
     }
@@ -1649,9 +1693,7 @@ fn apply_served_cadence(
     match store.set_node_lost_windows(&updates) {
         Ok(()) => info!(
             nodes = count,
-            window_secs = window.as_secs(),
-            widening,
-            "Moved per-node lost windows with the served cadence"
+            widening, "Moved per-node lost windows with the served cadence"
         ),
         Err(err) => warn!(error = ?err, "Failed updating per-node lost windows; will retry"),
     }
@@ -1989,6 +2031,9 @@ async fn eval_worker_loop(
                     .unwrap_or_else(|join_error| {
                         Err(anyhow::anyhow!("eval claim task failed: {join_error:?}"))
                     });
+            crate::manager::telemetry::metrics()
+                .eval_queue_round_seconds
+                .observe(&["claim"], claim_started.elapsed().as_secs_f64());
             match claimed {
                 Ok(batch) => batch,
                 Err(e) => {
@@ -2082,6 +2127,16 @@ async fn eval_worker_loop(
             // kinds together and make the histogram unreadable.
             let handle_started = std::time::Instant::now();
             let handled = tokio::task::spawn_blocking(move || {
+                // The blocking pool is shared with every heartbeat's
+                // `spawn_blocking`, so the wait for a pool thread is its
+                // own phase: without it, a saturated pool reads as a slow
+                // handler.
+                crate::manager::telemetry::metrics()
+                    .eval_phase_seconds
+                    .observe(
+                        &[&eval_for_handler.kind, "queue_wait"],
+                        handle_started.elapsed().as_secs_f64(),
+                    );
                 resolve_claimed_eval(&store_for_handler, worker_id, &eval_for_handler)
             })
             .await;
@@ -2122,6 +2177,7 @@ async fn eval_worker_loop(
         loop {
             let store_for_settle = store.clone();
             let completions_for_attempt = completions.clone();
+            let settle_started = std::time::Instant::now();
             let outcome = tokio::task::spawn_blocking(move || {
                 store_for_settle
                     .complete_evals_and_claim_next(completions_for_attempt, batch_limits)
@@ -2130,6 +2186,9 @@ async fn eval_worker_loop(
             .unwrap_or_else(|join_error| {
                 Err(anyhow::anyhow!("eval settle task failed: {join_error:?}"))
             });
+            crate::manager::telemetry::metrics()
+                .eval_queue_round_seconds
+                .observe(&["settle"], settle_started.elapsed().as_secs_f64());
             match outcome {
                 Ok(next) => {
                     claimed_ahead = next;
@@ -2558,6 +2617,126 @@ mod tests {
             crate::manager::cadence::decide_lost_nodes(&snapshot, &settled).lost,
             vec!["fast-node".to_string()]
         );
+        Ok(())
+    }
+
+    fn windows_by_node(store: &Store) -> R<HashMap<String, Duration>> {
+        Ok(liveness_snapshot(store, std::time::Instant::now())?
+            .into_iter()
+            .map(|node| (node.id, node.window))
+            .collect())
+    }
+
+    fn insert_node_beating_every(store: &Store, id: &str, seconds: u64) -> R<()> {
+        let mut node = node_msg(id, rfc3339_seconds_ago(0)?);
+        node.config_attrs = json!({ "heartbeatSeconds": seconds }).to_string();
+        store.insert_node(node)?;
+        Ok(())
+    }
+
+    /// Widening only ever raises a window: a worker type faster than the
+    /// served interval (or one that registered before the manager told it
+    /// anything) is covered, and a slower pool's wider window is untouched.
+    #[test]
+    fn widening_raises_narrow_windows_and_never_lowers_wide_ones_test() -> R<()> {
+        let store = setup_store()?;
+        insert_node_beating_every(&store, "one-sec", 1)?;
+        insert_node_beating_every(&store, "two-sec", 2)?;
+        insert_node_beating_every(&store, "batch", 60)?;
+        let now = std::time::Instant::now();
+
+        // The 2s floor a small fleet is served under the default config.
+        let snapshot = liveness_snapshot(&store, now)?;
+        widen_windows_to_served(&store, &snapshot, Duration::from_secs(2), 5);
+        let windows = windows_by_node(&store)?;
+        assert_eq!(windows["one-sec"], Duration::from_secs(10));
+        assert_eq!(windows["two-sec"], Duration::from_secs(10));
+        assert_eq!(windows["batch"], Duration::from_secs(300));
+
+        // A 20k-node fleet's 21s rung at the default rate.
+        let snapshot = liveness_snapshot(&store, now)?;
+        widen_windows_to_served(&store, &snapshot, Duration::from_secs(21), 5);
+        let windows = windows_by_node(&store)?;
+        assert_eq!(windows["two-sec"], Duration::from_secs(105));
+        assert_eq!(windows["batch"], Duration::from_secs(300));
+        Ok(())
+    }
+
+    /// Narrowing waits for a beat at the faster cadence, and never narrows
+    /// below the cadence the node was actually seen beating at.
+    #[test]
+    fn narrowing_follows_the_observed_cadence_test() -> R<()> {
+        let store = setup_store()?;
+        for (id, seconds) in [("fast", 2), ("three", 3), ("slow", 2)] {
+            insert_node_beating_every(&store, id, seconds)?;
+        }
+        let now = std::time::Instant::now();
+        let snapshot = liveness_snapshot(&store, now)?;
+        widen_windows_to_served(&store, &snapshot, Duration::from_secs(8), 5);
+
+        let unix = OffsetDateTime::now_utc().unix_timestamp();
+        let table = store.liveness();
+        for (id, gap) in [("fast", 2), ("three", 3), ("slow", 8)] {
+            table.observe_at(id, now - Duration::from_secs(gap), unix - gap as i64);
+            table.observe_at(id, now, unix);
+        }
+        let snapshot = liveness_snapshot(&store, now)?;
+        narrow_windows_on_confirmation(&store, &snapshot, Duration::from_secs(2), 5);
+        let windows = windows_by_node(&store)?;
+        assert_eq!(windows["fast"], Duration::from_secs(10));
+        // Seen at 3s (a 3s worker type keeps its own cadence over a 2s
+        // floor): 5 x 3s, not 5 x 2s.
+        assert_eq!(windows["three"], Duration::from_secs(15));
+        // Not yet seen at the faster cadence: keeps the wide window.
+        assert_eq!(windows["slow"], Duration::from_secs(40));
+        Ok(())
+    }
+
+    async fn served_after_one_tick(
+        heartbeat: crate::structs::HeartbeatConfigFull,
+    ) -> R<Option<Duration>> {
+        let store = setup_store()?;
+        for index in 0..30 {
+            insert_node_beating_every(&store, &format!("node-{index}"), 2)?;
+        }
+        let checker = tokio::spawn(start_node_status_checker(
+            store.clone(),
+            LivenessCheckerConfig {
+                check_interval: Duration::from_millis(20),
+                heartbeat,
+                liveness: crate::structs::LivenessConfigFull::default(),
+                manager_node_id: "test-manager".into(),
+            },
+        ));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        checker.abort();
+        let served = store.liveness().served_interval();
+        let windows = windows_by_node(&store)?;
+        assert!(windows
+            .values()
+            .all(|window| *window == Duration::from_secs(10)));
+        Ok(served)
+    }
+
+    /// The default config runs adaptive cadence, and a small fleet is served
+    /// the 2s floor with the historical 10s window.
+    #[tokio::test]
+    async fn default_config_serves_the_floor_to_a_small_fleet_test() -> R<()> {
+        let served = served_after_one_tick(crate::structs::HeartbeatConfigFull::default()).await?;
+        assert_eq!(served, Some(Duration::from_secs(2)));
+        Ok(())
+    }
+
+    /// `heartbeat.adaptive = false` is the old fixed behavior: nothing on the
+    /// reply, workers keep their worker-type cadence, windows unchanged.
+    #[tokio::test]
+    async fn adaptive_false_serves_nothing_test() -> R<()> {
+        let served = served_after_one_tick(crate::structs::HeartbeatConfigFull {
+            adaptive: false,
+            ..Default::default()
+        })
+        .await?;
+        assert_eq!(served, None);
         Ok(())
     }
 

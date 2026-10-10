@@ -11,12 +11,17 @@ while read -r instance_id public private; do
     log "stopping sim units on $instance_id"
     rsh "$(worker_addr "$public" "$private")" "
         sudo systemctl disable --now legion-sim 2>/dev/null || true
-        sudo systemctl disable --now nomad-nodesim 2>/dev/null || true
+        sudo systemctl stop 'nomad-nodesim@*' 2>/dev/null || true
+        sudo systemctl disable --now kwok-slice 2>/dev/null || true
     " || true
 done < <(worker_instances)
 
+# One server-side deletecollection. `kubectl delete nodes -l type=kwok`
+# deletes one object per request and ran for over 30 minutes on a
+# 10,000-node fleet, stalling the campaign. Bounded by `timeout` because a
+# control plane that is already gone must not hang a teardown.
 rsh "$LOADGEN_ADDR" \
-    "command -v kubectl >/dev/null 2>&1 && kubectl delete nodes -l type=kwok --ignore-not-found" || true
+    "command -v kubectl >/dev/null 2>&1 && timeout 300 kubectl delete --raw '/api/v1/nodes?labelSelector=type%3Dkwok' >/dev/null" || true
 
 # Retract the sim-worker scrape targets published by start-sim-fleet.sh, so
 # a stopped fleet reads as "no targets" rather than a wall of `up == 0`.

@@ -595,6 +595,20 @@ pub enum IndexQueryOutcome {
     Disabled,
 }
 
+/// What [`IndexSet::walk_verified`] produced: at most `budget` verified
+/// candidates, best-first when `truncated`, in walk order otherwise (the
+/// caller re-sorts that case by node id).
+#[derive(Debug)]
+pub struct IndexWalk<T> {
+    pub index: String,
+    pub items: Vec<T>,
+    /// Shard population, verified or not.
+    pub partition_size: usize,
+    /// More eligible nodes existed than `budget` (the old
+    /// `verified.len() > budget`).
+    pub truncated: bool,
+}
+
 /// Every declared index's live state. Lives inside the scheduling read model
 /// and is maintained by the same write path that mutates nodes and
 /// allocations, so it cannot drift from them. Derived state only — rebuilt
@@ -672,19 +686,22 @@ impl IndexSet {
     /// `ordered: false` and skips the shard's cell sort entirely — under
     /// `budget: None` the sort's only effect was an ordering the caller
     /// threw away.
-    pub fn query_with_order(
-        &self,
+    /// The index this query uses and its shard's occupied cells, walked
+    /// best-first when `ordered` (the cell rank is the position here).
+    /// `Err` carries an outcome that needs no walk: indexing disabled, no
+    /// usable index, or an empty partition (an exact, empty answer).
+    fn select_cells<'s>(
+        &'s self,
         bindings: &HashMap<String, Value>,
         request: &HashMap<String, f64>,
-        budget: Option<usize>,
         ordered: bool,
-    ) -> IndexQueryOutcome {
+    ) -> Result<(&'s IndexSpec, Vec<&'s Vec<String>>), IndexQueryOutcome> {
         if self.settings.indexes.is_empty() || self.settings.min_nodes == 0 {
-            return IndexQueryOutcome::Disabled;
+            return Err(IndexQueryOutcome::Disabled);
         }
         let idx = match self.settings.select(bindings, request) {
             Ok(idx) => idx,
-            Err(reason) => return IndexQueryOutcome::Unusable { reason },
+            Err(reason) => return Err(IndexQueryOutcome::Unusable { reason }),
         };
         let spec = &self.settings.indexes[idx];
         let state = &self.states[idx];
@@ -706,14 +723,14 @@ impl IndexSet {
             // No node carries this exact attribute tuple. The scan would
             // reject every node on the same equality constraint, so an empty
             // candidate set is the *correct* answer, not a fallback case.
-            return IndexQueryOutcome::Candidates(IndexCandidates {
+            return Err(IndexQueryOutcome::Candidates(IndexCandidates {
                 index: spec.name.clone(),
                 mode: spec.mode,
                 node_ids: Vec::new(),
                 cell_ranks: Vec::new(),
                 partition_size: 0,
                 truncated: false,
-            });
+            }));
         };
 
         let request_cell: Vec<u16> = spec
@@ -776,7 +793,21 @@ impl IndexSet {
             cells = ranked_cells.into_iter().map(|(_, cell)| cell).collect();
         }
 
-        let partition_size: usize = cells.iter().map(|(_, ids)| ids.len()).sum();
+        Ok((spec, cells.into_iter().map(|(_, ids)| ids).collect()))
+    }
+
+    pub fn query_with_order(
+        &self,
+        bindings: &HashMap<String, Value>,
+        request: &HashMap<String, f64>,
+        budget: Option<usize>,
+        ordered: bool,
+    ) -> IndexQueryOutcome {
+        let (spec, cells) = match self.select_cells(bindings, request, ordered) {
+            Ok(selected) => selected,
+            Err(outcome) => return outcome,
+        };
+        let partition_size: usize = cells.iter().map(|ids| ids.len()).sum();
         // Tag every id with its cell's rank in the walk. Within a cell the
         // index has no opinion, so a budget cut that lands inside a cell
         // samples it (`truncate_within_boundary_cell`) — the sorted-id
@@ -785,7 +816,7 @@ impl IndexSet {
         // The scheduler asks for the whole shard and truncates AFTER
         // re-verification, so the ranks travel with the ids.
         let mut ranked: Vec<(String, u32)> = Vec::with_capacity(partition_size);
-        for (rank, (_, ids)) in cells.iter().enumerate() {
+        for (rank, ids) in cells.iter().enumerate() {
             ranked.extend(ids.iter().map(|id| (id.clone(), rank as u32)));
         }
         let (node_ids, cell_ranks): (Vec<String>, Vec<u32>) = match budget {
@@ -810,6 +841,99 @@ impl IndexSet {
             mode: spec.mode,
             node_ids,
             cell_ranks,
+            partition_size,
+            truncated,
+        })
+    }
+
+    /// Budgeted, verify-as-you-walk candidates (plan-path-fleet-scaling
+    /// plan § 6.2): the same output the scheduler used to get from
+    /// `query_with_order(.., None, true)` + verifying every id +
+    /// [`truncate_within_boundary_cell`], without materializing or verifying
+    /// the whole shard. The default `fit` index partitions by pool only, so
+    /// on a one-pool fleet the shard IS the fleet, and the old path cloned
+    /// and verified every node id per task — linear in fleet size under the
+    /// read-model lock.
+    ///
+    /// Cells are walked best-first. A cell that fits in the remaining
+    /// budget is verified whole and kept in order. The first cell that does
+    /// not fit is drawn in uniformly random order and verified one member
+    /// at a time: the first `remaining` verified members are a uniform
+    /// sample of the cell's verified members, which is exactly what
+    /// `truncate_within_boundary_cell` takes from the boundary rank, and
+    /// they are emitted in the cell's own order, as it emits them. If the
+    /// cell runs out first, all its verified members were kept and the walk
+    /// moves on.
+    ///
+    /// `truncated` mirrors the old `verified.len() > budget` exactly: after
+    /// the budget is full the walk keeps verifying until it finds ONE more
+    /// eligible node (usually immediately) or runs out. A caller must
+    /// re-sort an untruncated result by node id, as before.
+    ///
+    /// Returns `Err` with the plain query's outcome when the walk does not
+    /// apply: indexing disabled, no usable index, an empty partition, or an
+    /// index not in `on` mode (shadow mode compares the full candidate set
+    /// with the scan, so it keeps the full query).
+    pub fn walk_verified<T>(
+        &self,
+        bindings: &HashMap<String, Value>,
+        request: &HashMap<String, f64>,
+        budget: usize,
+        mut verify: impl FnMut(&str) -> Option<T>,
+    ) -> Result<IndexWalk<T>, IndexQueryOutcome> {
+        use rand::Rng;
+
+        let (spec, cells) = self.select_cells(bindings, request, true)?;
+        if spec.mode != IndexMode::On {
+            return Err(self.query_with_order(bindings, request, None, true));
+        }
+        let partition_size: usize = cells.iter().map(|ids| ids.len()).sum();
+        let mut rng = rand::thread_rng();
+        let mut out: Vec<T> = Vec::with_capacity(budget.min(partition_size));
+        let mut truncated = false;
+        for ids in cells {
+            let remaining = budget - out.len();
+            if remaining == 0 {
+                // Budget full: one more eligible node anywhere means the
+                // old path would have truncated (and kept exactly `out`).
+                if ids.iter().any(|id| verify(id).is_some()) {
+                    truncated = true;
+                    break;
+                }
+                continue;
+            }
+            if ids.len() <= remaining {
+                out.extend(ids.iter().filter_map(|id| verify(id)));
+                continue;
+            }
+            // The boundary candidate: a lazy Fisher-Yates over positions,
+            // stopping one verified member past `remaining`.
+            let mut order: Vec<u32> = (0..ids.len() as u32).collect();
+            let mut accepted: Vec<(u32, T)> = Vec::with_capacity(remaining);
+            let mut extra = false;
+            for i in 0..order.len() {
+                let j = rng.gen_range(i..order.len());
+                order.swap(i, j);
+                let position = order[i];
+                if let Some(item) = verify(&ids[position as usize]) {
+                    if accepted.len() < remaining {
+                        accepted.push((position, item));
+                    } else {
+                        extra = true;
+                        break;
+                    }
+                }
+            }
+            accepted.sort_unstable_by_key(|(position, _)| *position);
+            out.extend(accepted.into_iter().map(|(_, item)| item));
+            if extra {
+                truncated = true;
+                break;
+            }
+        }
+        Ok(IndexWalk {
+            index: spec.name.clone(),
+            items: out,
             partition_size,
             truncated,
         })
@@ -1313,6 +1437,134 @@ mod tests {
             "queries kept returning the same nodes: {}",
             seen.len()
         );
+    }
+
+    // --- walk_verified (plan-path-fleet-scaling plan § 6.2) -------------
+
+    /// Two vram cells (tight order puts the 1024 cell first), every third
+    /// node "ineligible" so verification really filters.
+    fn walk_fixture() -> (IndexSet, HashMap<String, Value>, HashMap<String, f64>) {
+        let mut nodes = Vec::new();
+        for n in 0..30 {
+            nodes.push(make_node(
+                &format!("a-{n:03}"),
+                "default",
+                json!({ "resources": { "vram": 1024 } }),
+            ));
+        }
+        for n in 0..300 {
+            nodes.push(make_node(
+                &format!("b-{n:03}"),
+                "default",
+                json!({ "resources": { "vram": 65536 } }),
+            ));
+        }
+        let (set, _) = set_for(
+            json!({ "indexes": { "fit": false, "vram": ["pool", "resources.vram"] } }),
+            nodes,
+        );
+        (
+            set,
+            HashMap::from([("pool".to_string(), json!("default"))]),
+            HashMap::from([("vram".to_string(), 512.0)]),
+        )
+    }
+
+    fn eligible(id: &str) -> Option<String> {
+        let n: u32 = id[2..].parse().expect("numbered id");
+        (n % 3 != 0).then(|| id.to_string())
+    }
+
+    fn walk(
+        set: &IndexSet,
+        b: &HashMap<String, Value>,
+        r: &HashMap<String, f64>,
+        budget: usize,
+    ) -> IndexWalk<String> {
+        set.walk_verified(b, r, budget, eligible).expect("walkable")
+    }
+
+    #[test]
+    fn walk_equals_query_then_verify_when_untruncated() {
+        let (set, bindings, request) = walk_fixture();
+        let IndexQueryOutcome::Candidates(full) = set.query(&bindings, &request, None) else {
+            panic!("expected candidates");
+        };
+        let mut expected: Vec<String> =
+            full.node_ids.iter().filter_map(|id| eligible(id)).collect();
+        let walked = walk(&set, &bindings, &request, 10_000);
+        assert!(!walked.truncated);
+        assert_eq!(walked.partition_size, 330);
+        let mut got = walked.items;
+        expected.sort();
+        got.sort();
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn walk_keeps_whole_ranks_first_and_samples_the_boundary_uniformly() {
+        let (set, bindings, request) = walk_fixture();
+        // 20 eligible in the 1024 cell (kept whole), 200 in the boundary
+        // cell, budget 40 -> 20 drawn from the boundary each time.
+        let whole: Vec<String> = (0..30)
+            .map(|n| format!("a-{n:03}"))
+            .filter_map(|id| eligible(&id))
+            .collect();
+        let mut hits: HashMap<String, u32> = HashMap::new();
+        let draws = 2_000;
+        for _ in 0..draws {
+            let walked = walk(&set, &bindings, &request, 40);
+            assert!(walked.truncated);
+            assert_eq!(walked.items.len(), 40);
+            assert_eq!(
+                &walked.items[..20],
+                whole.as_slice(),
+                "better rank whole, in order"
+            );
+            let boundary = &walked.items[20..];
+            assert!(boundary.windows(2).all(|w| w[0] < w[1]), "cell order kept");
+            for id in boundary {
+                assert!(id.starts_with("b-") && eligible(id).is_some());
+                *hits.entry(id.clone()).or_default() += 1;
+            }
+        }
+        // 2,000 x 20 picks over 200 eligible members: 200 expected each.
+        assert_eq!(
+            hits.len(),
+            200,
+            "every eligible boundary member is reachable"
+        );
+        let (lo, hi) = (hits.values().min().unwrap(), hits.values().max().unwrap());
+        assert!(*lo > 130 && *hi < 280, "not uniform: min {lo} max {hi}");
+    }
+
+    #[test]
+    fn walk_reports_truncation_only_when_another_eligible_node_exists() {
+        let (set, bindings, request) = walk_fixture();
+        // 220 eligible in total. Exactly 220: nothing left, not truncated.
+        let exact = walk(&set, &bindings, &request, 220);
+        assert!(!exact.truncated);
+        assert_eq!(exact.items.len(), 220);
+        // 20 fills the first cell exactly; the next cell has more, so the
+        // old path would have truncated and kept exactly the first cell.
+        let filled = walk(&set, &bindings, &request, 20);
+        assert!(filled.truncated);
+        assert!(filled.items.iter().all(|id| id.starts_with("a-")));
+        assert_eq!(filled.items.len(), 20);
+    }
+
+    #[test]
+    fn walk_fills_the_budget_under_a_selective_filter() {
+        let (set, bindings, request) = walk_fixture();
+        // Only ids ending in 7 pass (~10%): still a full budget of 25.
+        let walked = set
+            .walk_verified(&bindings, &request, 25, |id| {
+                id.ends_with('7').then(|| id.to_string())
+            })
+            .expect("walkable");
+        assert_eq!(walked.items.len(), 25);
+        assert!(walked.truncated);
+        assert!(walked.items.iter().all(|id| id.ends_with('7')));
     }
 
     /// The sample only touches the cell the cut lands in: better-ranked

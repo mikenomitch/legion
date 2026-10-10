@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # Install Kubernetes (kubeadm, 3 stacked-etcd control planes) + KWOK for
-# the phase-4 campaign. UNVALIDATED until phase 4 runs it — kept in
-# lockstep with configs/k8s/*; verify against the pinned versions in
-# versions.env before the campaign. See configs/k8s/README.md for the
+# the phase-4 campaign. Kept in lockstep with configs/k8s/* and the pins
+# in versions.env. See configs/k8s/README.md for the
 # design notes (no CNI on purpose; KWOK fakes the data plane).
 set -euo pipefail
 source "$(dirname "$0")/env.sh"
@@ -48,8 +47,10 @@ CP0_IP="${CP_PRIVATE_IPS[0]}" PRIVATE_IP="${CP_PRIVATE_IPS[0]}" K8S_VERSION="$K8
 rcp /tmp/kubeadm-config.yaml "${CP_ADDRS[0]}:/tmp/kubeadm-config.yaml"
 rm -f /tmp/kubeadm-config.yaml
 rsh "${CP_ADDRS[0]}" "
-    sudo cp /tmp/kubeadm-config.yaml /etc/kubernetes/kubeadm-config.yaml
     sudo kubeadm init --config /tmp/kubeadm-config.yaml --upload-certs | tee /tmp/kubeadm-init.log
+    # Copied after init, which is what creates /etc/kubernetes; collect.sh
+    # archives this file as the cell's rendered control-plane config.
+    sudo cp /tmp/kubeadm-config.yaml /etc/kubernetes/kubeadm-config.yaml
 "
 
 JOIN_CMD=$(rsh "${CP_ADDRS[0]}" "sudo kubeadm token create --print-join-command")
@@ -60,23 +61,26 @@ for idx in 1 2; do
     rsh "${CP_ADDRS[$idx]}" "sudo $JOIN_CMD --control-plane --certificate-key $CERT_KEY"
 done
 
-log "installing kubeconfig + KWOK $KWOK_VERSION via loadgen"
+log "installing the kubeconfig + kubectl $K8S_VERSION on loadgen"
 rsh "${CP_ADDRS[0]}" "sudo cat /etc/kubernetes/admin.conf" >/tmp/bench-kubeconfig
 rcp /tmp/bench-kubeconfig "$LOADGEN_ADDR:/tmp/kubeconfig"
 rm -f /tmp/bench-kubeconfig
 rsh "$LOADGEN_ADDR" "
     set -euo pipefail
-    mkdir -p ~/.kube && mv /tmp/kubeconfig ~/.kube/config
-    # kubectl for the driver + fleet scripts.
-    command -v kubectl >/dev/null 2>&1 || {
+    mkdir -p ~/.kube && mv /tmp/kubeconfig ~/.kube/config && chmod 600 ~/.kube/config
+    # Re-installed when the version differs: a kubectl left over from an
+    # older campaign is outside the supported skew for a 1.36 apiserver.
+    if ! kubectl version --client 2>/dev/null | grep -q 'v${K8S_VERSION}'; then
         curl -fsSL -o /tmp/kubectl https://dl.k8s.io/release/v${K8S_VERSION}/bin/linux/amd64/kubectl
         sudo install -m 0755 /tmp/kubectl /usr/local/bin/kubectl
-    }
-    kubectl apply -f https://github.com/kubernetes-sigs/kwok/releases/download/v${KWOK_VERSION}/kwok.yaml
-    kubectl apply -f https://github.com/kubernetes-sigs/kwok/releases/download/v${KWOK_VERSION}/stage-fast.yaml || true
+    fi
+    kubectl get --raw /readyz >/dev/null
 "
-rcp "$AWS_BENCH_ROOT/configs/k8s/kwok-stages.yaml" "$LOADGEN_ADDR:/tmp/kwok-stages.yaml"
-rsh "$LOADGEN_ADDR" "kubectl apply -f /tmp/kwok-stages.yaml"
+# KWOK is NOT deployed in-cluster: start-sim-fleet.sh runs one KWOK
+# controller per worker instance, each managing its own node slice, so the
+# storm drill can kill a slice the way it does for the other systems.
+# Each controller runs the release's stage-fast.yaml (pods Running
+# immediately, node leases heartbeated).
 
 log "wiring scheduler metrics scrape into Prometheus"
 TOKEN=$(rsh "$LOADGEN_ADDR" "
@@ -84,7 +88,12 @@ TOKEN=$(rsh "$LOADGEN_ADDR" "
     kubectl create clusterrolebinding bench-metrics --clusterrole=system:monitoring --serviceaccount=kube-system:bench-metrics --dry-run=client -o yaml | kubectl apply -f - >/dev/null
     kubectl create token bench-metrics -n kube-system --duration 48h
 ")
+# Replace, never stack: the block is always last in the file, so drop any
+# earlier copy before appending. A rerun used to append a second copy, and
+# Prometheus refuses a config with duplicate job names — which, with the
+# reload's curl under `set -e`, killed the whole campaign over metrics.
 rsh "$LOADGEN_ADDR" "
+    sed -i '/^  - job_name: kube-scheduler/,\$d' /opt/bench/observability/prometheus.yml
     cat >>/opt/bench/observability/prometheus.yml <<SCRAPE
 
   - job_name: kube-scheduler
@@ -100,7 +109,8 @@ rsh "$LOADGEN_ADDR" "
     static_configs:
       - targets: ['${CP_PRIVATE_IPS[0]}:6443']
 SCRAPE
-    curl -fsS -X POST http://localhost:9090/-/reload
+    curl -fsS -X POST http://localhost:9090/-/reload ||
+        echo 'WARNING: Prometheus rejected the K8s scrape config; this campaign will lack scheduler phase metrics' >&2
 "
 
 log "K8s control plane up. Next: start-sim-fleet.sh k8s <nodes>"

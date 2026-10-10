@@ -533,6 +533,39 @@ mod cadence_test {
     }
 
     #[test]
+    fn default_rate_keeps_small_fleets_on_the_floor_and_backs_off_large_ones_test() {
+        // The published table in docs/heartbeat-cadence-and-scale.md, at the
+        // shipped defaults: rate 2,500/s, headroom 2, 2s..120s, 5 missed beats.
+        let rate = DEF_HEARTBEAT_TARGET_RATE_PER_SECOND;
+        let headroom = DEF_HEARTBEAT_HEADROOM;
+        let min = Duration::from_secs(DEF_HEARTBEAT_MIN_INTERVAL_SEC);
+        let max = Duration::from_secs(DEF_HEARTBEAT_MAX_INTERVAL_SEC);
+        let missed = DEF_MISSED_BEATS_BEFORE_LOST;
+        // (nodes, served interval, lost window)
+        let table = [
+            (10, 2, 10),
+            (1_000, 2, 10),
+            (2_500, 2, 10),
+            (2_501, 3, 15),
+            (5_000, 5, 25),
+            (10_000, 8, 40),
+            (20_000, 21, 105),
+            (50_000, 55, 275),
+        ];
+        for (nodes, interval, window) in table {
+            let served = ladder_rung(target_interval(nodes, rate, headroom, min, max), min, max);
+            assert_eq!(served, Duration::from_secs(interval), "{nodes} nodes");
+            assert_eq!(
+                lost_window_for(served, missed),
+                Duration::from_secs(window),
+                "{nodes} nodes"
+            );
+            // Steady-state load never exceeds rate / headroom.
+            assert!(nodes as f64 / served.as_secs_f64() <= rate / headroom);
+        }
+    }
+
+    #[test]
     fn ladder_steps_up_at_once_and_down_only_after_its_dwell_test() {
         let min = Duration::from_secs(2);
         let max = Duration::from_secs(120);

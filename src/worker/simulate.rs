@@ -682,6 +682,7 @@ async fn run_sim_node(
     // honors it so a scale run measures the real controller rather than a
     // fleet that ignores it.
     let mut heartbeat_interval = fleet.heartbeat_interval;
+    let configured_interval = fleet.heartbeat_interval;
     let ticks_per_health_check = ((WORKER_NODE_CHECK_DURATION_SEC as f64
         / heartbeat_interval.as_secs_f64().max(0.001))
     .round() as u64)
@@ -719,7 +720,11 @@ async fn run_sim_node(
                     }
                 }
                 tick += 1;
-                match crate::worker::daemon::adopt_served_interval(heartbeat_interval, served) {
+                match crate::worker::daemon::adopt_served_interval(
+                    heartbeat_interval,
+                    configured_interval,
+                    served,
+                ) {
                     Some(next) => {
                         heartbeat_interval = next;
                         tokio::time::sleep(crate::worker::daemon::rephase_sleep(next)).await;

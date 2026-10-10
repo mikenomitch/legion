@@ -36,6 +36,18 @@ telemetry {
   collection_interval        = "5s"
 }
 
-# Everything else is stock. Scheduler config (e.g. spread vs binpack) is
-# set at runtime by the campaign scripts via
-# `nomad operator scheduler set-config` and recorded per run.
+# NON-DEFAULT (documented): no per-client connection caps. Nomad limits
+# each remote IP to 100 HTTP and 100 RPC connections by default, and the
+# rig puts ~1,250 simulated clients behind each worker instance's single
+# IP. With the caps on, registration stalls at 100 nodes per instance —
+# an artifact of simulating, not a property of Nomad. nomad-nodesim's own
+# README says the same ("Disable limits! Otherwise you won't scale far").
+# Legion and K8s have no equivalent per-IP cap to lift.
+limits {
+  http_max_conns_per_client = 0
+  rpc_max_conns_per_client  = 0
+}
+
+# Everything else is stock, including the scheduler algorithm (binpack).
+# Each system runs its own default placement policy; the fairness record
+# names it rather than tuning the three toward one another.

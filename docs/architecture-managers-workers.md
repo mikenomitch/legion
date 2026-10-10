@@ -77,16 +77,20 @@ Worker startup (`run_worker`) flow:
 9. Enter steady-state loops:
    - Heartbeats every `heartbeatSeconds` (worker-type config, default 2s,
      clamped to 1–300s). Each beat gets ±10% jitter so a fleet that started
-     together does not stay in lockstep. A manager running adaptive cadence
-     can serve a different interval on the heartbeat reply
-     ([heartbeat-cadence-and-scale.md](heartbeat-cadence-and-scale.md)).
+     together does not stay in lockstep. With adaptive cadence (on by
+     default), the manager serves an interval sized from fleet size on the
+     heartbeat reply, and the worker beats at the larger of that and its
+     own `heartbeatSeconds`. Up to 2,500 nodes the served interval is the
+     same 2s ([heartbeat-cadence-and-scale.md](heartbeat-cadence-and-scale.md)).
    - Node checks every `WORKER_NODE_CHECK_DURATION_SEC` (default 30s).
 
 ### Heartbeat cadence and scale
 
 The heartbeat interval is the main way to control manager load on large
-fleets. For example, 10k workers at the default 2s cadence send 5,000
-heartbeat RPCs per second.
+fleets. For example, 10k workers at a fixed 2s cadence would send 5,000
+heartbeat RPCs per second. Adaptive cadence, on by default, sizes the
+interval from fleet size so the steady load stays at or below 1,250 a second
+(8s at 10k nodes), and `heartbeat.adaptive = false` turns it off.
 
 - `heartbeatSeconds` in a worker-type config sets that worker type's
   cadence. Workers receive it at pre-registration. The lost-node window

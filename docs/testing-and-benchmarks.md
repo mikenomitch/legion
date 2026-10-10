@@ -111,6 +111,29 @@ What they measure:
     running). They vary more from run to run on a VM than the read-only
     cells. Use `plan_only` for planning cost and the phase means for apply
     time.
+  - `plan_fleet_scaling` group: measures how planning cost changes with
+    node count, with fill held fixed. It uses a `web_fleet`-shaped fleet
+    (5 of 6 nodes `class = web`, one pool) at 1k, 2k, 5k, 10k, 20k, and 50k
+    nodes with 0 or 5 allocations per node. It plans the `web_fleet` api job
+    (two groups of 4, `class = "web"`). The `plan_and_apply` cells print
+    per-phase means.
+
+    At fill 5, an `eval_cycle` cell runs 150 whole evals the way an eval
+    worker does: claim, the `job_submit` handler (`resolve_claimed_eval`),
+    and the settle round. It prints the mean of each step and the
+    `legion_eval_phase_seconds` and plan-phase breakdowns, so the time an
+    eval spends outside `plan_and_apply` is measured rather than inferred.
+
+    The 20k and 50k cells take minutes to set up. Pick node counts with
+    `LEGION_BENCH_SCALING_NODES=20000,50000`, and skip the concurrent cells
+    with `LEGION_BENCH_SKIP_CONCURRENT=1`.
+
+    At 5k and 10k nodes, a concurrent cell runs four planners for four
+    seconds against a background writer that keeps publishing to the read
+    model. It prints plans per second, per-phase means, and the lazy-sample
+    fallback count. This is the only local benchmark that reproduces
+    contention between planners. Watch for per-plan cost that grows from 5k
+    to 10k nodes at fixed fill. That is a regression.
 - `eval_critical_path_bench`: end-to-end enqueue -> claim -> apply -> complete
   latency under 1/4/8 concurrent eval workers (write-lock contention).
 - `plan_contention`: N concurrent single-allocation submits against one
@@ -177,13 +200,24 @@ measures the commit path instead. The two are not comparable. The gp3-to-NVMe
 ratio tells them apart: near 1.0 means liveness is off the raft path, and
 around 25x means it is on it.
 
-Report every throughput number with the cadence it was achieved at. A
-system could slow its own heartbeats to post a better score. To rule that
-out, every benchmark run records the served interval and
-`legion_heartbeat_freshness_ratio` alongside throughput. Comparative runs
-either pin all systems to the same interval or report each system's achieved
-cadence. This is also why adaptive cadence is off by default
-([heartbeat-cadence-and-scale.md](heartbeat-cadence-and-scale.md)).
+Run scale benchmarks with the default heartbeat cadence, which is adaptive:
+the manager serves an interval sized from fleet size (2s up to 2,500 nodes,
+21s at 20,000 at the default `targetRatePerSecond`). A fixed 2s cadence at
+20k nodes is 10,000 heartbeat RPCs a second into the leader, and that load
+shows up as slower scheduling rather than as a heartbeat problem.
+
+Report every throughput number with the cadence it was achieved at. A system
+could slow its own heartbeats to post a better score, so every benchmark run
+records `legion_heartbeat_served_interval_seconds`,
+`legion_heartbeat_lost_window_seconds`, and
+`legion_heartbeat_freshness_ratio` alongside throughput. The lost window is
+what the slower cadence costs, and it belongs next to the number it bought.
+Comparative runs compare defaults and say so: Nomad also adapts its
+heartbeat TTL by default (about 50 heartbeats a second), and Kubernetes
+renews node leases every 10 seconds. Either report each system's achieved
+cadence and detection window, or pin all of them to the same interval
+(`heartbeat.adaptive = false` on Legion) and state that you did. See
+[heartbeat-cadence-and-scale.md](heartbeat-cadence-and-scale.md).
 
 ### Measuring scheduler event-stream overhead
 
@@ -267,6 +301,21 @@ comparison, put all three on the shared loop
 (`driver.py run --submitter cli`) or add native submitters for the others
 first. Every cell records which path it took as `submitter` in its metrics.
 See `benchmarks/aws/README.md` § Methodology.
+
+By default a cell submits its whole workload as one burst. That measures
+throughput, and its p99 latency is mostly the time to drain the burst,
+because the last job waits behind every job ahead of it. To measure how
+long a job actually waits, pace the cell below capacity with an open-loop
+arrival rate:
+
+```bash
+# 50 jobs/sec, sent on a fixed schedule whatever the manager's latency
+benchmarks/aws/scripts/run-campaign.sh --system legion-a --scenarios web_fleet \
+    --steps "5000 10000 20000" --storm-step 1 --submit-rate 50
+```
+
+`--submit-rate` maps to `legion-loadgen --rate` and is Legion-only. A paced
+cell archives under `<run>-r<rate>` and records `submit_rate_target`.
 
 ## Plugin-Related Test Notes
 
