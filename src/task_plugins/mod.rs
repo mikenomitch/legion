@@ -306,6 +306,23 @@ pub(crate) fn reap_task_process(
     instance: &mut TaskInstance,
     runtime: &str,
 ) {
+    // Kill the whole process group first, matching the notice signal in
+    // `signal_task_process`. A shell-wrapped task (`sh -c server`) is tracked
+    // by the shell's pid, so SIGKILLing only that pid would orphan the server
+    // that ignored its SIGTERM, still holding its ports and volume.
+    #[cfg(unix)]
+    if let Some(pid) = instance
+        .child
+        .as_ref()
+        .map(|child| child.id())
+        .or(instance.pid)
+    {
+        // Every runtime that reaps here spawned its task with
+        // `spawn_task_process`, which makes the task a group leader
+        // (`setsid`). ESRCH (no such group) is fine: the group is gone, or
+        // this pid never led one, and the per-pid kill below still runs.
+        let _ = unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+    }
     if let Some(mut child) = instance.child.take() {
         info!(allocation_id, task_name, runtime, "Stopping task process");
         let _ = child.kill();
@@ -316,9 +333,10 @@ pub(crate) fn reap_task_process(
             allocation_id,
             task_name, runtime, pid, "Stopping task process by pid"
         );
+        let pid = sysinfo::Pid::from_u32(pid);
         let mut system = sysinfo::System::new();
-        system.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
-        if let Some(process) = system.process(sysinfo::Pid::from_u32(pid)) {
+        system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
+        if let Some(process) = system.process(pid) {
             process.kill();
         }
     }

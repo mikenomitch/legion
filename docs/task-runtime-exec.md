@@ -53,7 +53,10 @@ Optional:
   too. The worker holds the allocation until the process exits or its
   `stop.killAfter` window closes. See [Graceful stop](graceful-stop.md).
 - `stop` is the hard step the worker's reaper calls when that window closes.
-  It kills the tracked child handle, or falls back to a PID lookup. A process
+  It SIGKILLs the task's process group, then kills the tracked child handle, or
+  falls back to a PID lookup. Processes that left the group with their own
+  `setsid` escape this step; worker-owned enforcement's `cgroup.kill` (below)
+  catches them. A process
   that exited inside its window is already gone and is never force-killed.
 - Under worker-owned enforcement, that step also writes `cgroup.kill`. This
   reaps double-forked descendants that reparented away from the tracked PID.

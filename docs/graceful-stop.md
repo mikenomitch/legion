@@ -39,8 +39,10 @@ When the platform stops a task:
 1. The worker writes the **stop notice** into the task directory.
 2. It sends `stop.signal` to the task's process group.
 3. It waits up to `stop.killAfter` for the process to exit.
-4. If the process is still alive at the deadline, it is SIGKILLed and torn
-   down.
+4. If the process is still alive at the deadline, its whole process group is
+   SIGKILLed and torn down. The kill reaches the same group the signal did, so
+   a shell-wrapped task (`sh -c server`) can't leave the server running after
+   its shell is gone.
 
 Storage is released and the allocation directory removed only **after** the
 process is gone, never at the same time as the signal. Unmounting a volume
