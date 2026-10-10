@@ -15924,6 +15924,12 @@ impl Store {
     ///   reschedule below — a plain `job_reschedule` would place the
     ///   rollout's to_config at full desired count, bypassing canary/staged
     ///   gating;
+    /// - for an active job whose latest config's rollout FAILED or was
+    ///   CANCELLED (no restart marker): a `job_reschedule` for what that
+    ///   rollout left running — the source config when the latest has no
+    ///   allocations (rolled back), the latest when nothing else runs, and
+    ///   nothing for a part-way mix of both. Treating a rolled-back job like
+    ///   a lost submit re-placed the bad version at full count, ungated;
     /// - for every other active job: `job_update` when a replicated restart
     ///   marker is set ([`Self::request_job_restart`]); `job_submit` when a
     ///   superseded config still has live allocations and the latest has
@@ -16019,52 +16025,83 @@ impl Store {
             let Some(latest_config) = latest_config else {
                 continue;
             };
+            let stale_configs: Vec<String> = {
+                let conn = self.read_connection()?;
+                let mut stmt = conn.prepare(
+                    "SELECT DISTINCT a.job_config_id FROM allocation a
+                     INNER JOIN job_config jc ON jc.id = a.job_config_id
+                     WHERE jc.job_id = ?1 AND a.job_config_id != ?2;",
+                )?;
+                let rows = stmt.query_map(params![job_id, latest_config], |row| row.get(0))?;
+                Self::collect_rows(rows)?
+            };
+            let latest_count: i64 = {
+                let conn = self.read_connection()?;
+                conn.query_row(
+                    "SELECT COUNT(*) FROM allocation WHERE job_config_id = ?1;",
+                    [&latest_config],
+                    |row| row.get(0),
+                )?
+            };
+            // A rollout to the latest config that failed or was cancelled
+            // settled the job somewhere other than "latest at full count",
+            // and the passes below would undo that: "latest has no
+            // allocations" reads as a lost submit, so a rolled-back job got
+            // a `job_submit` that brought the bad version back at full
+            // count with no gating, and a rollout stopped part way had its
+            // old allocations removed and the new version topped up.
+            // Converge whatever the rollout left running instead.
+            let aborted_rollout = if restart_requested {
+                None
+            } else {
+                self.latest_rollout_for_job_config(&latest_config)?
+                    .filter(|rollout| matches!(rollout.status.as_str(), "failed" | "cancelled"))
+            };
+            if let Some(rollout) = aborted_rollout {
+                let target = if latest_count == 0 {
+                    // Rolled back, or failed before placing anything: the
+                    // source config is what runs. No source (a first
+                    // deploy) leaves nothing to converge.
+                    rollout.from_job_config_id
+                } else if stale_configs.is_empty() {
+                    // Failed after replacing everything: latest is all
+                    // there is.
+                    Some(latest_config.clone())
+                } else {
+                    // Stopped part way without a revert: the mix of old and
+                    // new is the operator's call, and no single-config
+                    // reschedule can converge it without picking a side.
+                    None
+                };
+                if let Some(target) = target {
+                    job_requests.push(EvalRequest::for_job("job_reschedule", &job_id, &target));
+                }
+                continue;
+            }
             let kind = if restart_requested {
                 // A KV-triggered restart was acknowledged but its
                 // leader-local job_update eval died: regenerate it (the
                 // handler clears the marker before restarting).
                 "job_update"
+            } else if stale_configs.is_empty() {
+                "job_reschedule"
+            } else if latest_count == 0 {
+                // The acknowledged submit's eval was lost whole:
+                // job_submit replays it (migrate-or-place, THEN
+                // remove the predecessor — no avoidable downtime).
+                "job_submit"
             } else {
-                let stale_configs: Vec<String> = {
-                    let conn = self.read_connection()?;
-                    let mut stmt = conn.prepare(
-                        "SELECT DISTINCT a.job_config_id FROM allocation a
-                         INNER JOIN job_config jc ON jc.id = a.job_config_id
-                         WHERE jc.job_id = ?1 AND a.job_config_id != ?2;",
-                    )?;
-                    let rows = stmt.query_map(params![job_id, latest_config], |row| row.get(0))?;
-                    Self::collect_rows(rows)?
-                };
-                if stale_configs.is_empty() {
-                    "job_reschedule"
-                } else {
-                    let latest_count: i64 = {
-                        let conn = self.read_connection()?;
-                        conn.query_row(
-                            "SELECT COUNT(*) FROM allocation WHERE job_config_id = ?1;",
-                            [&latest_config],
-                            |row| row.get(0),
-                        )?
-                    };
-                    if latest_count == 0 {
-                        // The acknowledged submit's eval was lost whole:
-                        // job_submit replays it (migrate-or-place, THEN
-                        // remove the predecessor — no avoidable downtime).
-                        "job_submit"
+                // The submit partially ran (latest placed, stale
+                // cleanup lost): finish the cleanup here, then
+                // converge counts.
+                for stale in &stale_configs {
+                    if self.job_configs_schedule_equivalent(stale, &latest_config)? {
+                        self.migrate_allocations_to_job_config(stale, &latest_config)?;
                     } else {
-                        // The submit partially ran (latest placed, stale
-                        // cleanup lost): finish the cleanup here, then
-                        // converge counts.
-                        for stale in &stale_configs {
-                            if self.job_configs_schedule_equivalent(stale, &latest_config)? {
-                                self.migrate_allocations_to_job_config(stale, &latest_config)?;
-                            } else {
-                                self.remove_allocs_for_job_config(stale)?;
-                            }
-                        }
-                        "job_reschedule"
+                        self.remove_allocs_for_job_config(stale)?;
                     }
                 }
+                "job_reschedule"
             };
             job_requests.push(EvalRequest::for_job(kind, &job_id, &latest_config));
         }
