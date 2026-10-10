@@ -73,7 +73,9 @@ Worker startup (`run_worker`) flow:
    carries a per-node token that the worker attaches to all later
    worker-plane calls. Re-registering rotates the token. If a heartbeat comes
    back Unauthenticated, the worker re-registers with its join secret
-   automatically.
+   automatically. Re-registration keeps the node's availability, so a
+   drained node stays drained across a worker restart. Only a new node
+   starts `available`.
 9. Enter steady-state loops:
    - Heartbeats every `heartbeatSeconds` (worker-type config, default 2s,
      clamped to 1–300s). Each beat gets ±10% jitter so a fleet that started

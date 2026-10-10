@@ -5897,13 +5897,31 @@ impl Manager for ManagerDaemonService {
         })
         .to_string();
 
+        // Re-registration (a worker restart, or a token rotation) keeps the
+        // operator's availability: a drained or ineligible node must not
+        // silently become schedulable again. Only a new node starts
+        // `available`. The value is resolved here, not in the store's apply
+        // step, so every replica applies the same explicit value.
+        let availability = match self.store.get_node(&node_id) {
+            Ok(existing) => existing.availability,
+            Err(err)
+                if matches!(
+                    StorageError::from_anyhow(&err),
+                    Some(StorageError::NotFound { .. })
+                ) =>
+            {
+                "available".to_string()
+            }
+            Err(err) => return Err(map_store_error("Error loading node", err)),
+        };
+
         let node_msg = NodeMsg {
             id: request.name,
             fingerprint_attrs: request.fingerprint_attrs,
             config_attrs: request.config_attrs,
             dynamic_attrs,
             status: "active".to_string(),
-            availability: "available".to_string(),
+            availability,
             pool: request.pool,
             last_heartbeat: String::new(),
             heartbeat_source: String::new(),
@@ -10799,6 +10817,31 @@ mod tests {
             .find(|eval| eval.kind == "job_reschedule")
             .context("reschedule eval queued")?;
         assert_eq!(reschedule.node_name, "node-1");
+        Ok(())
+    }
+
+    /// A worker restart re-registers the node; that must not undo an
+    /// operator's drain (S6 in the 2026-10-09 architecture audit).
+    #[tokio::test]
+    async fn re_registration_keeps_node_availability() -> R<()> {
+        let store = setup_store()?;
+        let manager = ManagerDaemonService::new(store.clone());
+        let register = || {
+            tonic::Request::new(WorkerRegisterRequest {
+                name: "drained-node".into(),
+                pool: "default".into(),
+                config_attrs: "{}".into(),
+                fingerprint_attrs: "{}".into(),
+                health_checks: "[]".into(),
+                ..Default::default()
+            })
+        };
+        manager.worker_register(register()).await?;
+        assert_eq!(store.get_node("drained-node")?.availability, "available");
+
+        store.set_node_availability("drained-node", "drained")?;
+        manager.worker_register(register()).await?;
+        assert_eq!(store.get_node("drained-node")?.availability, "drained");
         Ok(())
     }
 

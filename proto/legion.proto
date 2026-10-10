@@ -1154,7 +1154,8 @@ message WorkerRegisterRequest {
 
   // Manager-populated defaults on registration (not client-provided):
   // - `status = "active"`
-  // - `availability = "available"`
+  // - `availability = "available"` for a new node; re-registration keeps the
+  //   node's existing availability (a drained node stays drained)
   // - `dynamic_attrs = {}`
   // - `last_heartbeat = ""` until first heartbeat
 
