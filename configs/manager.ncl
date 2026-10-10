@@ -50,6 +50,10 @@
   # store state until it has something to suspend.
   # suspend = {
   #   idleSweep = "15s",
+  #   # When a resume waits on its checkpoint's node because the node is
+  #   # full, suspend the most idle suspendable instances there until it
+  #   # fits (docs/suspend-and-resume.md, "Capacity for resumes").
+  #   makeRoom = true,
   # },
   schedulerSettings = {
     plan_conflict_max_retries = 3,

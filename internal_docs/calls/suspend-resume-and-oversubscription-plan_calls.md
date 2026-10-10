@@ -110,7 +110,75 @@ win. A default that holds reservations would make suspend a slower `stop`
 with no benefit, and the plan's headline scenario (2,000 sandboxes on 20
 nodes) would not fit.
 
-## 5. Checkpoints are node-local by default, publishing is opt-in
+## 5. A resume on a full node makes room by suspending idle suspendable work there (Track 2)
+
+*Track 2 (resume guards), implementation.*
+
+**Call.** When a resume from a `local` checkpoint cannot fit on its node, the
+manager suspends instances on that node until it fits, in the `suspend`
+pressure step's order (band ascending, then quiet longest). Eligible: a
+running keyed instance whose task has a `suspend` block and that either sets
+`onPressure = true` or is quiet right now by its own idle policy (the node
+reports an idle-since), with a band that does not outrank the resume's. On by
+default, behind manager `suspend.makeRoom`.
+
+```nickel
+suspend = { makeRoom = true },   # manager config, the default
+```
+
+**Alternatives.** (a) Only the reservation knobs (`reserve`,
+`suspendedReserve`), so a full node simply waits. (b) Eligibility from
+`onPressure` alone. (c) Any instance with a `suspend` block, idle or not.
+(d) Use preemption: evict lower-band work for the resume.
+
+**Trade-off.** A returning user can push a quiet user's sandbox into
+`suspended`, which costs that user one restore later. An instance with an idle
+policy is eligible the moment it is quiet, well before its own `after`, so
+make-room suspends earlier than the idle sweep would. Same-band work is fair
+game.
+
+**Why (ease, performance).** Suspend is reversible and keeps state, so it is
+the cheapest way to turn "node full" into "room", and it keeps the density
+win of releasing reservations (entry 4) without making resumes wait out
+`resumeTimeout`. (b) would leave the agent guide's sandboxes, which all set
+`idle`, ineligible unless authors also opt into pressure. (c) would suspend
+an active user mid-command. (d) destroys state and needs a `stop` the user
+did not ask for. Excluding more important bands mirrors preemption, so an
+operator reasons about one rule.
+
+## 6. `suspend.reserve` takes a flag, a ratio, or fixed amounts, and only a full hold keeps cores (Track 2)
+
+*Track 2 (resume guards), implementation.*
+
+**Call.** `reserve` accepts `false`/`true`, a ratio in `0..=1`, or
+`{ memory = "1GiB", cpu = 100 }` (MiB or a size, and MHz). A ratio scales
+`memory` and `cpu` MHz. Exclusive `cores`, devices, custom resources, and the
+`allocations` slot are held only at exactly 1.0. An amount must fit inside the
+task's declared `resources` for that dimension, and naming an undeclared
+dimension is refused at submit.
+
+```text
+Error: task "workspace": suspend.reserve.memory (4096 MiB) exceeds the task's resources.memory (2048 MiB). A suspended instance cannot hold more than it reserves while running
+Hint: lower suspend.reserve.memory, or use reserve = true to hold the whole reservation
+```
+
+**Alternatives.** (a) A separate `reserveRatio` field next to the boolean.
+(b) Scale cores too (round down). (c) Check amounts against the manager's
+`taskResourceDefaults` when a dimension is undeclared.
+
+**Trade-off.** One field with three shapes is harder to describe in a schema,
+and an untagged parse gives worse errors, so the field is parsed by shape and
+range-checked in `resolve` to name the field and the fix. Requiring the
+dimension to be declared refuses some specs that would have worked.
+
+**Why (simplicity).** The common answers are "all", "none", and "about a
+quarter", and the existing boolean stays valid with no migration. A pinned
+core is exclusive by definition (entry 59), so a quarter of
+one cannot be held. Submit-time validation is offline and does not know the
+manager's defaults, so (c) could pass a spec that means something else on the
+node.
+
+## 7. Checkpoints are node-local by default, publishing is opt-in
 
 **Call.** `suspend.durability = "local"` (default) keeps the checkpoint only
 on the suspending node and pins resume there. `"store"` publishes it to the
@@ -129,7 +197,7 @@ object-store bandwidth and cost the bottleneck for a feature whose common
 case is "resume on the same node twenty minutes later." Fly made the same
 call. Platforms that need portability turn on `store` per job.
 
-## 6. A published checkpoint needs instance data that can move, so node-local volumes are refused rather than copied (Phase 7b)
+## 8. A published checkpoint needs instance data that can move, so node-local volumes are refused rather than copied (Phase 7b)
 
 *Phase 7b, implementation. Answers the plan's §6.8 "the node-local volume is
 a separate question".*
@@ -168,7 +236,7 @@ not there, which is the silent corruption the plan forbids. Refusing at
 submit is honest, and volume migration can arrive later as a driver op
 without changing this surface.
 
-## 7. The pressure ladder runs on the worker and reports afterward
+## 9. The pressure ladder runs on the worker and reports afterward
 
 **Call.** Under memory pressure the worker reclaims, suspends opted-in idle
 instances, and evicts, in a fixed order, without asking the manager. It
@@ -186,9 +254,38 @@ transaction.
 **Why (performance).** Memory pressure escalates in seconds and the kernel
 OOM killer doesn't wait for a heartbeat round trip, let alone a manager
 that may be unreachable. Kubernetes' kubelet eviction is node-local for the
-same reason. Idle suspend, which is not urgent, stays manager-driven (see 13).
+same reason. Idle suspend, which is not urgent, stays manager-driven (see 16).
 
-## 8. Memory pressure is configured as named steps under `resourceEnforcement`, with a previewable order
+## 10. Make-room avoids thrash with an age rule, one round at a time, and all-or-nothing rounds (Track 2)
+
+*Track 2 (resume guards), implementation.*
+
+**Call.** Three rules: an instance whose row changed state within the last
+two minutes (`MAKE_ROOM_COOLDOWN`, read from `instance.updated_at`) is never
+chosen. While any suspend is in flight on the node, make-room waits, and each
+resume gets at most one round per two minutes. A round starts suspends only
+when the chosen set is enough for the resume to fit, counting what each victim
+keeps held. Otherwise nothing is suspended and `no_room` is counted.
+
+**Alternatives.** (a) A per-node rate limit only. (b) Mark make-room victims
+and forbid them from triggering make-room themselves. (c) Suspend
+incrementally, one per pass, until it fits. (d) Make the cooldown a manager
+setting.
+
+**Trade-off.** A legitimately busy node can wait up to two minutes for a
+second round. `updated_at` moves on any state or binding change, so an
+instance can look younger than it is, which only ever makes it safer. The
+memory of rounds is in-process, so a manager restart grants one early round,
+which the age rule still bounds.
+
+**Why (simplicity).** The age rule alone breaks the A-suspends-B,
+B-suspends-A cycle, because the instance a round resumed is always younger
+than the cooldown when it could be chosen again. All-or-nothing keeps a node
+that can never fit the resume from losing anything. (b) needs new state on
+the instance. (c) would suspend work for a resume that may never fit. A
+constant keeps the surface to one toggle until someone needs to tune it.
+
+## 11. Memory pressure is configured as named steps under `resourceEnforcement`, with a previewable order
 
 *Execution-time revision of the plan's §6.4.*
 
@@ -236,7 +333,7 @@ warning into a config that cannot be written. Bands plus
 (how important, and can it be parked), so (b) adds surface without adding
 a decision.
 
-## 9. The content location index is in-memory soft state, off raft
+## 12. The content location index is in-memory soft state, off raft
 
 **Call.** Workers send content deltas in the heartbeat. The manager keeps
 `digest → nodes` in memory only, rebuilt from full reports after failover.
@@ -257,7 +354,7 @@ A table puts that churn on raft. Losing locality briefly costs placement
 quality, never correctness, which is the same argument that took liveness
 off raft.
 
-## 10. Locality is a score, except for local checkpoints
+## 13. Locality is a score, except for local checkpoints
 
 **Call.** The `locality` term is a weighted preference in the existing sum.
 The only hard placement rule is that a resume from a `durability = "local"`
@@ -274,7 +371,7 @@ to "require" is a cliff nobody will remember at 3am, and it would turn a
 slow placement into a stuck one when the warm nodes are full. The one hard
 case is hard because the bytes exist nowhere else.
 
-## 11. A published restore is unpinned and checked per candidate, for any instance with a restore source (Phase 7b)
+## 14. A published restore is unpinned and checked per candidate, for any instance with a restore source (Phase 7b)
 
 *Phase 7b, implementation. Lifts what 3c deferred: `compat` was only checked
 on the pinned node.*
@@ -302,13 +399,13 @@ put an instance on a node checked against another instance's manifest. The
 node's restore then fails with a named reason and `onRestoreFailure` applies.
 
 **Why (simplicity, extensibility).** "Prefer, never require" is the plan's
-locality rule (call 10), and a soft pin that flips on node health is a second
+locality rule (call 13), and a soft pin that flips on node health is a second
 mechanism for the same preference. Filtering per candidate is what makes the
 placement error useful ("no eligible node can run it", with the attribute
 per node) instead of failing on whichever node was picked. Keying on
 `restore_from` means fork needs no placement code of its own.
 
-## 12. A restore's placement names its instance, and the apply binds exactly that instance (integration)
+## 15. A restore's placement names its instance, and the apply binds exactly that instance (integration)
 
 *Phase 6 and 7b integration. A bug fix: the binder could cross restores.*
 
@@ -335,7 +432,7 @@ rule. (a) would duplicate the compat check in SQL, and (b) breaks as soon
 as preemption, fallback candidates, or a snapshot-node preference reorders
 anything. Naming the instance makes the binder's job a lookup.
 
-## 13. Idle is detected on the worker and acted on by the manager
+## 16. Idle is detected on the worker and acted on by the manager
 
 **Call.** The worker computes `idle_since` per allocation from signals it
 already sees. The manager runs a 15s sweep and issues suspends.
@@ -349,14 +446,14 @@ before suspend, and a manager-side loop.
 **Why (simplicity).** Suspend is an instance state transition, and the
 manager owns instance rows. Keeping non-urgent transitions manager-driven
 means exactly one component normally decides, and the worker-initiated path
-(entry 7) stays an exception reserved for emergencies.
+(entry 9) stays an exception reserved for emergencies.
 
-## 14. The `suspend` step acts first, reports a local suspension, and the desired set is its acknowledgment (Phase 5)
+## 17. The `suspend` step acts first, reports a local suspension, and the desired set is its acknowledgment (Phase 5)
 
 *Phase 5, implementation.*
 
 **Call.** Under memory pressure the worker suspends opted-in instances on its
-own, as entry 7 planned. It reuses the SuspendInstance capture (`capture_for_suspend`) with a
+own, as entry 9 planned. It reuses the SuspendInstance capture (`capture_for_suspend`) with a
 snapshot id it mints, holds the allocation out of relaunch, and reports a
 `SnapshotReport` with `local_suspension = true`. The manager has no row for
 that id, so it inserts one (`purpose = suspend`) and runs the same suspend
@@ -400,7 +497,7 @@ author opted in, so the band and pinning rules that protect against losing
 work do not apply to a step that loses none. (d) is a new persistence path for
 a narrow window, deferred until it shows up in practice.
 
-## 15. The idle policy needs resource enforcement, and says so on the instance rather than at submit (Phase 5)
+## 18. The idle policy needs resource enforcement, and says so on the instance rather than at submit (Phase 5)
 
 *Phase 5, implementation.*
 
@@ -431,7 +528,7 @@ cannot act, in the place they look, keeps the failure loud without inventing
 a new placement rule. macOS workers (no cgroups) fall here too, which is why
 the real-`exec` idle test could not run on the dev machine.
 
-## 16. Disk-only suspend for `exec` and `container`, no CRIU
+## 19. Disk-only suspend for `exec` and `container`, no CRIU
 
 **Call.** `exec` and `container` support `checkpoint = "disk"` only. They
 suspend (storage retained, resources released, auto-suspend and wake apply)
@@ -449,7 +546,7 @@ path after CVEs where restored processes kept the source's credentials. VM
 snapshots have a small, well-defined state surface. The `CheckpointSupport`
 seam leaves room for a CRIU runtime plugin later.
 
-## 17. Fork charges every fork its full reservation
+## 20. Fork charges every fork its full reservation
 
 **Call.** Forks on one node share unmodified memory pages through
 `MAP_PRIVATE`, but each is still charged its full `memory` reservation.
@@ -470,7 +567,7 @@ hard-links the content-store memory part into its own directory and loads it
 `MAP_PRIVATE`. cloud-hypervisor copies memory into the guest at restore, so
 its forks share nothing. The public doc says so.
 
-## 18. Forks wait as `pending` instances with `pending_op = fork`, not in a new state (Phase 6)
+## 21. Forks wait as `pending` instances with `pending_op = fork`, not in a new state (Phase 6)
 
 *Phase 6, implementation.*
 
@@ -505,7 +602,7 @@ exist yet, and would show forks as suspended. `pending_op` already exists for
 exactly this ("an operation is in flight"), and `instance get` shows it as
 `forking`.
 
-## 19. `--spread` publishes the fork checkpoint, and each fork goes to a node no sibling runs on (Phase 6, finished at integration)
+## 22. `--spread` publishes the fork checkpoint, and each fork goes to a node no sibling runs on (Phase 6, finished at integration)
 
 *Phase 6 shipped the flag refused with a hint. The Phase 6 and 7b integration
 made it work.*
@@ -547,7 +644,7 @@ is that the extra fork waits like a `distinct` placement. No fallback
 candidates keeps two siblings in one plan from both falling back to the
 same node.
 
-## 20. `instance start` resumes, with `--cold` to discard
+## 23. `instance start` resumes, with `--cold` to discard
 
 **Call.** No `resume` verb. `legion instance start` on a suspended instance
 restores from its checkpoint, and `--cold` discards it and boots fresh.
@@ -563,7 +660,7 @@ every platform and agent to check state first and branch, and gets a
 needless error when it guesses wrong. The response says what happened
 (`resumed_from`), so the difference is visible without being required.
 
-## 21. Sandbox guest size follows `resources`
+## 24. Sandbox guest size follows `resources`
 
 **Call.** Guest memory is `memoryMax` if set, else `memory`, and a sandbox
 task that declares no `memory` gets the runtime's own 512 MiB default, ahead
@@ -613,7 +710,7 @@ nobody asked for, the same silent change. Pinning at submit also keeps old
 and new workers in agreement, since both read `memory_mib`. The warning text comes from a new `TaskPlugin::check_resources` hook, so
 any runtime that sizes its own workload can do the same.
 
-## 22. `cpus` stays an alias for `cpu` in MHz, with a submit warning under 10 (integration)
+## 25. `cpus` stays an alias for `cpu` in MHz, with a submit warning under 10 (integration)
 
 *Found while writing the agent sandboxes guide.*
 
@@ -639,7 +736,7 @@ the wild that uses `cpus`, and (b) breaks them. A warning catches the
 mistake at the moment it is made and changes nothing that works. Deprecating
 the alias is a TODO.
 
-## 23. Allocation ids are never reused (Phase 4)
+## 26. Allocation ids are never reused (Phase 4)
 
 *Phase 4, implementation. Reverses what Phase 3c accepted.*
 
@@ -674,7 +771,7 @@ already use AUTOINCREMENT the same way. (c) still lets an ordinary stop then
 start collide. 3c's worker guard (`reconcile_allocations` stopping a reused
 id) stays as a defense for stores migrated mid-flight.
 
-## 24. `memory.low` protects every governed reservation, not only bursting ones (Phase 2)
+## 27. `memory.low` protects every governed reservation, not only bursting ones (Phase 2)
 
 **Call.** Every governed allocation that declares `memory` gets
 `memory.low = memory`, whether or not it sets `memoryMax`. The worker writes
@@ -699,7 +796,7 @@ only holds if tasks within their reservation are protected, including the
 ones that never burst. Protecting only bursting tasks would make a
 non-bursting neighbour the kernel's first target, exactly backwards.
 
-## 25. Sandboxes get a balloon for `reclaim`, plus free page reporting on cloud-hypervisor (Phase 5)
+## 28. Sandboxes get a balloon for `reclaim`, plus free page reporting on cloud-hypervisor (Phase 5)
 
 *Phase 5, implementation. Answers the plan's open question 3.*
 
@@ -736,7 +833,7 @@ blind would break older supported releases. Deflating at episode end (not d)
 gives the guest its burst room back as soon as the node can afford it, which
 is what `memoryMax` promises.
 
-## 26. A memory suspend kills the guest only after its checkpoint is stored (Phase 4)
+## 29. A memory suspend kills the guest only after its checkpoint is stored (Phase 4)
 
 *Phase 4, implementation.*
 
@@ -763,7 +860,7 @@ captured instant, so its disk moves on from the memory image and the restore
 resumes a page cache that no longer matches its disk. Hashing on ingest only
 once is a tracked follow-up that removes most of the cost.
 
-## 27. The resume handler is the worker's binary polling the identity disk (Phase 4)
+## 30. The resume handler is the worker's binary polling the identity disk (Phase 4)
 
 *Phase 4, implementation.*
 
@@ -792,7 +889,7 @@ identity JSON in shell is fragile. (c) only covers the RNG, and only on VMMs
 that expose it. The handler is a pure function over a `GuestHost` trait, so
 it is tested with a fake on any OS.
 
-## 28. The `snapshots` block opts a task in, with a `memory` switch
+## 31. The `snapshots` block opts a task in, with a `memory` switch
 
 *Phase 3c, implementation.*
 
@@ -816,10 +913,10 @@ after adding the block before its first memory snapshot.
 **Why (simplicity and security).** A checkpointable Firecracker sandbox has
 an API socket into its VMM, and a sandbox that never needs one should not
 have one. Gated sandboxes need a way to keep disk snapshots without asking
-for memory ones (entry 39).
+for memory ones (entry 44).
 Phase 4 extends the same predicate with `suspend.checkpoint = "memory"`.
 
-## 29. `SuspendInstance` works without a `suspend` block (Phase 4)
+## 32. `SuspendInstance` works without a `suspend` block (Phase 4)
 
 *Phase 4, implementation.*
 
@@ -840,7 +937,7 @@ jobspec change, and a platform driving suspend over the API should not need
 a spec edit and a restart of every instance first. Memory still needs the
 launch preparation, which is what the block (or `snapshots`) asks for.
 
-## 30. Published checkpoint parts are uploaded unencrypted (Phase 7b)
+## 33. Published checkpoint parts are uploaded unencrypted (Phase 7b)
 
 *Phase 7b, implementation. Plan open question 4 leaned toward encrypting
 with the KV keyring as a follow-up.*
@@ -862,7 +959,36 @@ manifest, and a rotation and rewrap story for objects that outlive keys,
 which is the plan's open question 4 and its own plan. Doing it halfway (no
 rewrap) would be worse than saying plainly that it is not done.
 
-## 31. The node content store is on by default
+## 34. The `suspendedReserve` floor lives under `resourceEnforcement`, needs no cgroups, and applies when a suspend lands (Track 2)
+
+*Track 2 (resume guards), implementation.*
+
+**Call.** `resourceEnforcement.suspendedReserve` (a ratio, default 0.0) rides
+registration as `config_attrs.suspendedReserve`, unlike the oversubscription
+ratio it is advertised whether or not the node can enforce, and the suspend
+transaction reads it from the node row once, when the suspend lands. Each
+instance is charged `max(job reserve, floor)` per dimension.
+
+```nickel
+resourceEnforcement = { suspendedReserve = 0.25 },   # worker config
+```
+
+**Alternatives.** (a) A top-level worker field, since it needs no cgroups.
+(b) Require `enabled = true` like the oversubscription ratio. (c) Recompute
+every held row when a node re-registers with a different floor.
+
+**Trade-off.** Changing the floor does not re-charge instances already
+suspended, so a node can run under an old floor until they resume. The field
+sits in a block named for cgroups even though it needs none, which the docs
+call out.
+
+**Why (simplicity).** It is a capacity knob next to the other capacity knob
+(`oversubscribe`), where an operator tuning density looks. Gating it on
+enforcement would refuse it on macOS and dev workers for no reason, since it
+only changes what the scheduler counts. Re-charging on registration would
+put a fleet-wide rewrite on a heartbeat-adjacent path for a rare change.
+
+## 35. The node content store is on by default
 
 *Phase 3a, implementation.*
 
@@ -876,12 +1002,12 @@ suggested.
 **Trade-off.** Upgraded workers start using up to 20 GiB of state-dir disk
 for artifacts nobody asked to cache.
 
-**Why (ease).** Only checksummed artifacts are stored (call 59), so a hit is
+**Why (ease).** Only checksummed artifacts are stored (call 65), so a hit is
 always the right bytes. The budget and free-disk floor bound the cost, and
 the snapshot class needs a store to exist on every node before checkpoints
 can write to it.
 
-## 32. `weights.locality` defaults to 1.0 the day Phase 7a ships
+## 36. `weights.locality` defaults to 1.0 the day Phase 7a ships
 
 *Phase 7a, implementation.*
 
@@ -908,7 +1034,7 @@ term is bounded to `0..=1`, so 1.0 means "all the bytes are here is worth
 one satisfied affinity", which is easy to reason about, and it is skipped
 entirely for tasks with no content set, so ordinary jobs see no change.
 
-## 33. Restore replaces the allocation through the scheduler
+## 37. Restore replaces the allocation through the scheduler
 
 *Phase 3c, implementation.*
 
@@ -932,7 +1058,7 @@ and restarts it under the same allocation id.
 local restart. The replacement was first handed the old allocation's id
 (ids were reused), which the worker had to recognize
 (`reconcile_allocations` stops the old task first). Phase 4 made ids
-monotonic (see entry 23).
+monotonic (see entry 26).
 
 **Why (extensibility and correctness).** Phase 4's resume is exactly this
 path from `suspended`, so it inherits the pinning, the compat check, and the
@@ -940,7 +1066,7 @@ payload. Compat belongs in placement, where it can fail with a diagnostic
 before anything runs, rather than inside a worker that has already stopped
 the task.
 
-## 34. A failed restore boots cold through the normal restart path
+## 38. A failed restore boots cold through the normal restart path
 
 *Phase 3c, implementation.*
 
@@ -960,7 +1086,7 @@ step failed.
 the knob, which Phase 4 adds. Retrying would loop forever on a deterministic
 failure such as a CPU mismatch.
 
-## 35. A failed publish is retried twice by the manager, then stays local (Phase 7b, revised at integration)
+## 39. A failed publish is retried twice by the manager, then stays local (Phase 7b, revised at integration)
 
 *Phase 7b shipped no manager retry. The integration added a bounded one.*
 
@@ -995,7 +1121,7 @@ first without the second, and the error text tells an agent which case it is
 in. The minute gap is longer than a heartbeat, so the worker has dropped the
 failed work and runs it fresh. (c) is a reasonable follow-up.
 
-## 36. A pressure suspend stays local whatever `durability` says, and an idle suspend that cannot publish is skipped (integration)
+## 40. A pressure suspend stays local whatever `durability` says, and an idle suspend that cannot publish is skipped (integration)
 
 *Phase 5 and 7b integration.*
 
@@ -1019,7 +1145,7 @@ gigabyte uploads, and the pressure step acts before the manager hears of
 it. (b) would silently hand a `store` task a checkpoint that dies with its
 node, which is the degrade the user ruled out.
 
-## 37. A resume that cannot restore is settled by the report or a manager sweep (Phase 4)
+## 41. A resume that cannot restore is settled by the report or a manager sweep (Phase 4)
 
 *Phase 4, implementation.*
 
@@ -1046,7 +1172,7 @@ reuses its tick. (b) would make a capacity wait look like a restore failure,
 which the plan's `fail` mode does not describe. (c) adds state that a
 failover loses, while the sweep reads it from the rows.
 
-## 38. A fork that cannot restore follows `onRestoreFailure`, and `fail` stops it (Phase 6)
+## 42. A fork that cannot restore follows `onRestoreFailure`, and `fail` stops it (Phase 6)
 
 *Phase 6, implementation.*
 
@@ -1058,7 +1184,7 @@ removes the allocation and stops the instance. `instance.restore_failed`
 says which (`outcome: cold` or `stopped`).
 
 **Alternatives.** (a) Always boot cold, like a failed in-place rollback
-(entry 34). (b) Terminate the fork.
+(entry 38). (b) Terminate the fork.
 
 **Trade-off.** `fail` here means `stopped`, not `suspended` as it does for a
 resume, so the knob reads slightly differently for forks. And a fork whose
@@ -1072,7 +1198,41 @@ checkpoint of its own to stay suspended on, so `stopped` is the nearest
 state that keeps the id and storage for a retry. (b) would throw the id
 away for what may be a transient TAP or disk problem.
 
-## 39. Memory checkpoints on gated sandboxes fail loudly, at submit where possible
+## 43. The checkpoint budget is a placement filter on soft state, for fresh placements of memory-suspend tasks only (Track 2)
+
+*Track 2 (resume guards), implementation.*
+
+**Call.** Workers report the content store's `snapshots` class (budget, used,
+pinned) on every content report, the manager keeps it in the in-memory
+content location index, and the scheduler skips a node for a new instance
+when `budget - pinned` is smaller than one checkpoint of the task (guest
+memory: `config.memory_mib`, else `memoryMax`, else `memory`). Only tasks
+whose `suspend` block checkpoints memory are filtered, and only placements
+with no restore source and no volume pin. A node with no report has room.
+The set of short nodes is read once per task, so a fleet with no full budget
+pays nothing per candidate.
+
+```text
+Failed to place task workspace: 4 eligible node(s), but every one's snapshots content budget is full: less than 1024 MiB free for this task's memory checkpoint (suspend). ...
+```
+
+**Alternatives.** (a) Persist the budget on the node row (replicated). (b) A
+score term instead of a filter. (c) Count checkpoints the plan itself will
+create (every new instance eventually suspends). (d) Filter on `used` rather
+than `pinned`.
+
+**Trade-off.** After a manager restart or failover the filter is open until
+nodes report again, and a plan placing many instances can overfill a budget
+that had room for one. The estimate is the guest's full memory, which
+overstates a sparse checkpoint.
+
+**Why (performance, simplicity).** Budget headroom changes with every
+checkpoint, so (a) would be a raft write per suspend per node for a
+best-effort guard. This is the same posture as the location index (entry 12). A filter, unlike a score, gives the explicit
+diagnostic the "fail loudly" rule asks for. Unpinned content is evictable LRU,
+so `used` would refuse nodes that have room.
+
+## 44. Memory checkpoints on gated sandboxes fail loudly, at submit where possible
 
 *Phase 3c, implementation.*
 
@@ -1088,7 +1248,7 @@ Hint: set snapshots.memory = false for disk-only snapshots, or drop network gati
 
 **Alternatives.** 3b's behavior alone: launch without checkpoint support and
 log a warning, so the failure appears only when someone asks for a memory
-snapshot (entry 43).
+snapshot (entry 48).
 
 **Trade-off.** A jobspec that validated before (a gated sandbox with a
 `snapshots` block) is now refused until it sets `memory = false`. The
@@ -1099,7 +1259,7 @@ at snapshot time, it costs the snapshot the user needed. Hints now ride the
 status message on a `Hint:` line, which the CLI lifts into the envelope's
 `hint` field.
 
-## 40. A store suspend on a worker without a `contentStore` is refused at call time, through a capability (Phase 7b)
+## 45. A store suspend on a worker without a `contentStore` is refused at call time, through a capability (Phase 7b)
 
 *Phase 7b, implementation. The brief asked to reject at submit where
 possible.*
@@ -1128,7 +1288,7 @@ not configured publishing yet, which is a worse surprise than a clear error
 on suspend. The capability check is also what keeps a mixed-version fleet
 safe: an old worker never advertises it.
 
-## 41. Published restores go only to workers that advertise `checkpoint-fetch` (integration)
+## 46. Published restores go only to workers that advertise `checkpoint-fetch` (integration)
 
 *Phase 7b follow-up, done at integration.*
 
@@ -1152,7 +1312,7 @@ place on it after an upgrade.
 (a) ties placement to version arithmetic. A capability says exactly what the
 manager needs to know, and matches how `content-publish` already works.
 
-## 42. Later-phase `suspend` fields are refused at submit (Phase 4)
+## 47. Later-phase `suspend` fields are refused at submit (Phase 4)
 
 *Phase 4, implementation. Phase 5 shipped `idle` and `onPressure` and kept
 the rule for what is still later: the `hint` idle signal (Phase 8).*
@@ -1183,14 +1343,14 @@ fields are removed.
 unknown-field error would tell the author the field does not exist, which is
 wrong. It is planned.
 
-## 43. Gated sandboxes are not memory-checkpointable yet
+## 48. Gated sandboxes are not memory-checkpointable yet
 
 *Phase 3b, implementation.*
 
 **Call.** A sandbox with `network.mode = "gated"` launches without
 checkpoint support even when asked, with a warning, and a checkpoint of one
 fails with an error naming the reason. (Phase 3c also refuses the combination
-at submit, entry 39.)
+at submit, entry 44.)
 
 **Alternatives.** Route the vsock socket through the device-link directory
 too.
@@ -1203,7 +1363,7 @@ datapath listens on per-port sockets derived from it. Relinking those is
 possible but deserves its own tests against a real guest agent, which the
 Phase 3b slice could not run.
 
-## 44. The response escalates one step at a time, each step once per allocation per episode (Phase 2)
+## 49. The response escalates one step at a time, each step once per allocation per episode (Phase 2)
 
 **Call.** The worker checks the node every second. Under pressure, and once
 `settle` has passed since its last action, it takes the first step in run
@@ -1230,7 +1390,7 @@ untouched. (b) would stop five tasks to free memory one would have freed.
 (c) loops forever on anonymous memory the kernel can never reclaim, so the
 response would never escalate.
 
-## 45. `evict-bursting` can stop a bursting `critical` task, `evict-reserved` never touches `critical` (Phase 2)
+## 50. `evict-bursting` can stop a bursting `critical` task, `evict-reserved` never touches `critical` (Phase 2)
 
 **Call.** Read the §6.4 table literally: `evict-bursting` acts on any
 allocation above its reservation, `critical` included (last, by band order),
@@ -1247,7 +1407,7 @@ reservation: within it you are left alone (at ratio 1.0, always). Exempting
 node to the OOM killer, which then picks a victim with no regard for bands.
 A critical task that needs more memory should reserve it.
 
-## 46. Evicted allocations are held out of relaunch, and their replacement may land on the same node (Phase 2)
+## 51. Evicted allocations are held out of relaunch, and their replacement may land on the same node (Phase 2)
 
 **Call.** The worker stops an evicted task through the ordinary graceful stop
 with `cause = node_pressure` written into its stop notice, and holds the
@@ -1266,11 +1426,11 @@ names it.
 **Why (simplicity).** (a) needs the scheduler to remember pressure, which is
 new state with its own expiry rules, and the plan's §4 keeps measured usage
 out of placement for now. (b) would wait on a round trip while the node runs
-out of memory (entry 7). Holding the id prevents the obvious race, where a
+out of memory (entry 9). Holding the id prevents the obvious race, where a
 heartbeat reply sent before the report arrived would restart the task the
 worker just stopped.
 
-## 47. Idle `network` and `connections` count what the datapath fronts (Phase 5)
+## 52. Idle `network` and `connections` count what the datapath fronts (Phase 5)
 
 *Phase 5, implementation.*
 
@@ -1295,9 +1455,38 @@ see inside a VM. The counter is one relaxed atomic store per read or write on
 a slot fetched once per connection, so the hot path takes no lock. (b) is a
 new kernel dependency for a signal the datapath gives for free.
 
-## 48. `reserve = true` keeps the allocation row with status `suspended` (Phase 4)
+## 53. A partial hold is the suspended allocation row with its resources cut to the share (Track 2)
 
-*Phase 4, implementation.*
+*Track 2 (resume guards), implementation. Generalizes the next entry.*
+
+**Call.** On suspend, the store computes `max(job reserve, node floor)` and
+either deletes the row (nothing held), keeps it as is with status `suspended`
+(a full hold, the Phase 4 behavior), or keeps it with status `suspended`, its
+`resources` rewritten to the held share, and `network` cleared. Every other
+dimension is written as an explicit zero (`allocations = 0`, `cores = 0`,
+device lists empty) so `taskResourceDefaults` cannot refill it. The node and
+job-config epochs are bumped because the row's usage changed under the same
+id.
+
+**Alternatives.** (a) A separate per-node suspended-charge aggregate in the
+usage cache. (b) A second "hold" row beside the allocation.
+
+**Trade-off.** The row no longer describes what the task asked for, so a
+reader of the allocation table sees reduced resources on a `suspended` row
+(the CLI marks it `(suspended, held)`). The held share is computed once and
+never re-derived, so later changes to the job's `reserve` or the node floor
+do not apply to it.
+
+**Why (simplicity, performance).** The fit check, the read model's per-node
+pools, the `node_alloc_usage` cache, and the plan-apply recheck all derive
+capacity from allocation rows, so a row with smaller numbers is honored
+everywhere with no new code on the scheduler hot path. (a) would need a
+second input threaded through every one of those paths and its own cache
+invalidation. Resume, job stop, and job update already delete held rows.
+
+## 54. `reserve = true` keeps the allocation row with status `suspended` (Phase 4)
+
+*Phase 4, implementation. Generalized to partial holds by entry 53.*
 
 **Call.** With `suspend.reserve`, the suspend transaction keeps the
 allocation row and sets its status to `suspended`. The heartbeat never
@@ -1321,7 +1510,7 @@ never-dispatched status the same way. (a) would touch the scheduler hot path
 and every capacity reader. (b) puts an instance lookup on the heartbeat path
 for every allocation.
 
-## 49. Legion never deletes published parts from the store (Phase 7b)
+## 55. Legion never deletes published parts from the store (Phase 7b)
 
 *Phase 7b, implementation.*
 
@@ -1343,7 +1532,7 @@ would break the other snapshot. A reference count would need to be exact
 across regions, buckets, and manager failovers to be safe to delete on,
 which is a garbage collector, not a publish feature.
 
-## 50. `snapshot` is its own ACL resource, and restore needs `snapshot:read` plus `job:write`
+## 56. `snapshot` is its own ACL resource, and restore needs `snapshot:read` plus `job:write`
 
 *Phase 3c, implementation.*
 
@@ -1360,7 +1549,7 @@ replaces an allocation.
 into a workload the caller can already redeploy, so it needs no more than
 read on the snapshot.
 
-## 51. Fork needs `snapshot:write` for either kind, and `from_snapshot` needs `snapshot:read`, both checked before any lookup (Phase 6)
+## 57. Fork needs `snapshot:write` for either kind, and `from_snapshot` needs `snapshot:read`, both checked before any lookup (Phase 6)
 
 *Phase 6, implementation.*
 
@@ -1382,7 +1571,7 @@ to a new instance, so it is a read of the origin in the sense the
 grant probe which snapshot names exist through NotFound versus
 PermissionDenied, which AGENTS.md's "check before you fetch" rule forbids.
 
-## 52. Sandbox VMMs join the worker cgroup, with a ceiling of guest plus overhead (Phase 1)
+## 58. Sandbox VMMs join the worker cgroup, with a ceiling of guest plus overhead (Phase 1)
 
 **Call.** `sandbox` returns `ResourceEnforcement::WorkerCgroup`. The VMM
 process joins the allocation's cgroup before it execs, and a new trait
@@ -1400,7 +1589,7 @@ proposed: size the guest from the assignment and pin vCPU threads, with no
 cgroup. (b) Use `resources.memory` as the cgroup ceiling now, ahead of
 Phase 2's guest-size derivation.
 
-**Trade-off.** Until Phase 2 (entry 21), the ceiling follows the guest size
+**Trade-off.** Until Phase 2 (entry 24), the ceiling follows the guest size
 and not the reservation, so a spec that reserves less than its guest still
 overcommits the node, now visibly in `node usage`. Sandbox tasks also pick
 up the governed-runtime submit checks (a fractional `cores`, or `cores` with
@@ -1412,7 +1601,7 @@ needs. (a) would limit nothing the host kernel can see. (b) would OOM-kill
 every existing sandbox whose guest is bigger than its reservation, which is
 most of them today.
 
-## 53. Oversubscription scales capacity at its source, and the aggregate cache keeps a format version instead of the ratio (Phase 2)
+## 59. Oversubscription scales capacity at its source, and the aggregate cache keeps a format version instead of the ratio (Phase 2)
 
 **Call.** The worker reports `oversubscribe` in its registration
 `config_attrs`, and `ResourcePool::from_node` multiplies memory and CPU MHz
@@ -1437,7 +1626,7 @@ version could not have keyed it anyway. The real staleness risk was
 `memoryMax` itself: before this phase it would have been summed as a custom
 resource dimension, so any aggregate cached with one must not be served.
 
-## 54. Only a node that can enforce advertises a ratio, and the manager rejects one without enforcement (Phase 2)
+## 60. Only a node that can enforce advertises a ratio, and the manager rejects one without enforcement (Phase 2)
 
 **Call.** `oversubscribe` and `memoryPressure` above defaults with
 `resourceEnforcement.enabled = false` fail when the manager loads the worker
@@ -1455,7 +1644,7 @@ misconfiguration is "impossible to write rather than a warning to ignore."
 The worker-side check covers the one case the manager cannot see: a node
 whose kernel cannot do what its worker type promises.
 
-## 55. The checkpoint channel re-sends work until applied, and the worker replays its reports
+## 61. The checkpoint channel re-sends work until applied, and the worker replays its reports
 
 *Phase 3c, implementation.*
 
@@ -1482,7 +1671,7 @@ destroys already prove: no new transport, no ack protocol, and every failure
 the same retry. Phase 4's suspend is the same request with `then = stop` and
 `purpose = suspend`, so it needs no second channel.
 
-## 56. Publishing is a checkpoint-channel op sent after the capture lands (Phase 7b)
+## 62. Publishing is a checkpoint-channel op sent after the capture lands (Phase 7b)
 
 *Phase 7b, implementation. Follows the plan's §6.8 "enters `suspended` when
 the local write finishes".*
@@ -1507,7 +1696,7 @@ worker-initiated upload would need its own durable "I owe a publish" record
 to survive a worker restart between capture and upload. Here, a restart
 simply gets the request again.
 
-## 57. Memory-checkpoint compat is exact match
+## 63. Memory-checkpoint compat is exact match
 
 *Phase 3b, implementation.*
 
@@ -1526,7 +1715,7 @@ probed at boot crashes or corrupts data, and both VMMs change their snapshot
 format between releases. Exact match is the safe floor, and widening it is
 an additive change to one function.
 
-## 58. A live memory snapshot keeps the guest paused across the volume snapshot
+## 64. A live memory snapshot keeps the guest paused across the volume snapshot
 
 *Phase 3c, implementation.*
 
@@ -1545,9 +1734,9 @@ method.
 **Why (correctness).** A restored guest's page cache and journal describe the
 disk at capture. A volume copied after the guest moved on is silent
 corruption on a block volume, the same reason 3b copies the root disk while
-paused (entry 84).
+paused (entry 90).
 
-## 59. The node content store caches only digest-pinned single files
+## 65. The node content store caches only digest-pinned single files
 
 *Phase 3a, implementation.*
 
@@ -1584,7 +1773,7 @@ This slice gives the acceptance case (a digest-pinned artifact on the second
 allocation) and the snapshot API, and leaves the semantics questions to a
 change that can settle them.
 
-## 60. The cross-node restore fetch rides the staging thread, through the artifact stager (Phase 7b)
+## 66. The cross-node restore fetch rides the staging thread, through the artifact stager (Phase 7b)
 
 *Phase 7b, implementation.*
 
@@ -1612,7 +1801,7 @@ node's heartbeats for the whole download. Staging into the task directory
 would copy every byte twice. Reusing the stager is what "through the normal
 stager" asked for, and keeps one fetch path to secure and tune.
 
-## 61. Suspend is keyed-only in v1
+## 67. Suspend is keyed-only in v1
 
 **Call.** The `suspend` block is rejected on anything but keyed stateful
 tasks.
@@ -1628,7 +1817,7 @@ replicas, and the feature reads narrower than "generic."
 replaced. Teaching them a third answer is real work with no concrete user
 yet. Keyed instances are where sandboxes live.
 
-## 62. Preemption does not suspend, even for tasks that set `onPressure` (Phase 5)
+## 68. Preemption does not suspend, even for tasks that set `onPressure` (Phase 5)
 
 *Phase 5, implementation.*
 
@@ -1647,7 +1836,7 @@ plan commits. Waiting on it would hold the preemptor's placement on a worker
 round trip, and a failed capture would have to undo a committed plan. The
 pressure response has no such coupling: the worker acts and reports.
 
-## 63. Restore is keyed-only, in place, from the instance's own snapshots
+## 69. Restore is keyed-only, in place, from the instance's own snapshots
 
 *Phase 3c, implementation.*
 
@@ -1667,7 +1856,7 @@ instance's snapshot is fork, which needs Phase 6's identity work.
 not a rollback: `instance fork` and `instance create --from-snapshot`.
 `RestoreInstance` stays in place and points at both in its error.
 
-## 64. Fork ids are `<origin>-f<n>` with the lowest never-used `n`, even under `idSource = "caller"` (Phase 6)
+## 70. Fork ids are `<origin>-f<n>` with the lowest never-used `n`, even under `idSource = "caller"` (Phase 6)
 
 *Phase 6, implementation.*
 
@@ -1700,7 +1889,7 @@ is derived from such an id, so it stays in the platform's namespace rather
 than inventing a random one. (a) is a reasonable follow-up if a platform
 asks.
 
-## 65. `snapshot create --publish` is only for snapshots made of content parts (Phase 7b)
+## 71. `snapshot create --publish` is only for snapshots made of content parts (Phase 7b)
 
 *Phase 7b, implementation. The brief asked for manual durability "if
 cheap".*
@@ -1720,7 +1909,7 @@ call it published while its volume half stays on the node.
 Publishing half a snapshot would let placement float a restore whose volume
 snapshot exists on one node only.
 
-## 66. A job stop leaves suspended instances suspended (Phase 4)
+## 72. A job stop leaves suspended instances suspended (Phase 4)
 
 *Phase 4, implementation.*
 
@@ -1739,7 +1928,7 @@ to release, and a stop, then a run, must not silently cost a user their
 parked workspace. An explicit `instance stop` is how to say "I don't want
 the checkpoint".
 
-## 67. A snapshot captures the instance volume only
+## 73. A snapshot captures the instance volume only
 
 *Phase 3c, implementation.*
 
@@ -1755,7 +1944,7 @@ snapshot with that claim's current contents (TODO.md tracks refusing it).
 often shared or read-only (`host` model directories). Rolling one back for one
 instance would roll it back under every other instance using it.
 
-## 68. A suspend leaves the instance volume in place (Phase 4)
+## 74. A suspend leaves the instance volume in place (Phase 4)
 
 *Phase 4, implementation. Applies the plan's §6.5 note.*
 
@@ -1776,7 +1965,7 @@ suspend for a state nobody else touches, and requiring the `snapshot` op
 would keep `exec` and `container` tasks on drivers without it from
 suspending at all.
 
-## 69. A fork checkpoint is spent once no instance restores from it (Phase 6)
+## 75. A fork checkpoint is spent once no instance restores from it (Phase 6)
 
 *Phase 6, implementation. Extended to published fork checkpoints at
 integration.*
@@ -1804,7 +1993,7 @@ Firecracker fork is running, it maps its own hard link to the memory part,
 so reclaiming the content-store entry does not disturb it. Manual snapshots
 already cover "keep a starting point".
 
-## 70. A new instance stopped before it restored keeps its restore source (integration)
+## 76. A new instance stopped before it restored keeps its restore source (integration)
 
 *Phase 6 follow-up, done at integration.*
 
@@ -1827,7 +2016,7 @@ instance. (a) turns a pause into a delete, (b) leaves an instance that can
 never start, and (c) silently boots an empty workspace, which the user ruled
 out.
 
-## 71. A restore recreates a missing TAP device and refuses a busy or different one
+## 77. A restore recreates a missing TAP device and refuses a busy or different one
 
 *Phase 3c, implementation.*
 
@@ -1851,7 +2040,7 @@ or attached to another VM's device, is worse than one that fails with the
 device's name. Recreating a missing device covers the common case of a node
 reboot between snapshot and restore.
 
-## 72. A fork gets its own TAP device, named from its instance id, on the origin TAP's bridge (Phase 6)
+## 78. A fork gets its own TAP device, named from its instance id, on the origin TAP's bridge (Phase 6)
 
 *Phase 6, implementation. The remote bridge rule was added at integration.*
 
@@ -1883,7 +2072,7 @@ adds jobspec surface for one feature. (c) would change the TAP on every
 resume of the fork. Joining the origin's bridge puts the fork where the
 operator already wired the origin, which is the least surprising segment.
 
-## 73. A disk fork of a TAP-wired sandbox is refused, and a fresh boot on a held TAP fails by name (integration)
+## 79. A disk fork of a TAP-wired sandbox is refused, and a fresh boot on a held TAP fails by name (integration)
 
 *Phase 6 follow-up, done at integration.*
 
@@ -1907,7 +2096,7 @@ case. The bug was the silent collision, and naming it at the API (where the
 origin is certainly on the node) and at boot (where the VMM's own error is
 opaque) fixes that without new surface.
 
-## 74. Stateful tasks never truncate index candidates (Phase 7b)
+## 80. Stateful tasks never truncate index candidates (Phase 7b)
 
 *Phase 7b, implementation. A bug fix found by the new `restore` benchmark
 group.*
@@ -1936,7 +2125,7 @@ store reads into candidate construction. Stateful tasks are a minority of
 placements, and their placements are already dominated by the pin and
 volume lookups.
 
-## 75. Usage is held per manager, in memory, and wrapped in one `UsageReport` (Phase 1)
+## 81. Usage is held per manager, in memory, and wrapped in one `UsageReport` (Phase 1)
 
 **Call.** The heartbeat carries `optional UsageReport usage` (sample time,
 per-allocation usage, node memory), sent every 10 seconds. The receiving
@@ -1959,7 +2148,7 @@ the CPU rate and idle math need. Usage is high-churn and worthless after a
 restart, the same reasoning that keeps heartbeat timestamps off raft. (b) is
 recorded in TODO.md if the limitation bites.
 
-## 76. The idle sweep runs wherever usage lands, and `begin_suspend` forwards to the lane leader (Phase 5)
+## 82. The idle sweep runs wherever usage lands, and `begin_suspend` forwards to the lane leader (Phase 5)
 
 *Phase 5, implementation.*
 
@@ -1983,7 +2172,7 @@ report to a follower, so their instances would never suspend. (b) puts
 high-churn data on raft, which Phase 1 refused. Forwarding the one write
 that matters keeps the sweep where its data is.
 
-## 77. Snapshot names point only at manual snapshots, local or published, and the `name` column follows them (Phase 6)
+## 83. Snapshot names point only at manual snapshots, local or published, and the `name` column follows them (Phase 6)
 
 *Phase 6, implementation.*
 
@@ -2009,7 +2198,7 @@ would dangle without warning. (b) would show `agent-golden` on last week's
 snapshot after the name moved, which is exactly the confusion a golden
 image workflow cannot afford.
 
-## 78. The location index is per manager, like usage
+## 84. The location index is per manager, like usage
 
 *Phase 7a, implementation.*
 
@@ -2025,11 +2214,11 @@ loses only the preference. The public doc states it, and TODO.md tracks the
 forwarding follow-up.
 
 **Why (simplicity).** It is the same rule usage and `net_status` follow
-(entry 75), so operators meet one rule. Forwarding is a protocol change on a
+(entry 81), so operators meet one rule. Forwarding is a protocol change on a
 channel Phase 3c is also extending, and the index is soft state whose loss
 is already designed to be harmless.
 
-## 79. The worker learns bands from the desired set and pinning from its own drivers (Phase 2)
+## 85. The worker learns bands from the desired set and pinning from its own drivers (Phase 2)
 
 **Call.** `TaskAllocation` gains `priority_band`, filled in the heartbeat's
 desired-set builder from a read-model cache keyed by job config id (bands
@@ -2047,13 +2236,13 @@ allocation). A worker talking to an older manager sees every band as
 `normal`, so its order falls back to "most memory first".
 
 **Why (simplicity, performance).** The worker must act without the manager
-(entry 7), so it needs the inputs, not a list computed elsewhere that could
+(entry 9), so it needs the inputs, not a list computed elsewhere that could
 be a heartbeat stale. The cache keeps the heartbeat path free of store reads,
 which is the property `cached_task_configs_for_job_config` was built for.
 Treating unknown as untouchable is the safe direction: the OOM killer is
 still the backstop.
 
-## 80. `contentStore.auth` is `kv` or ambient, and `nodeIdentity` is refused
+## 86. `contentStore.auth` is `kv` or ambient, and `nodeIdentity` is refused
 
 *Phase 7a, implementation.*
 
@@ -2076,7 +2265,7 @@ Legion yet: the `s3://` fetcher rejects bearer credentials for the same
 reason. Accepting the field and failing at the first upload would violate
 the rule that unsupported combinations fail loudly at submit.
 
-## 81. Content stores are configured per worker, not as a manager-side region map
+## 87. Content stores are configured per worker, not as a manager-side region map
 
 **Call.** Each worker config names its `contentStore` URL. Region locality
 falls out of giving each region's workers their own bucket. This replaces
@@ -2095,7 +2284,7 @@ artifact fetch settings already live in worker config. A manager-side map
 would need a region-to-worker resolution step that the worker config
 already encodes.
 
-## 82. Warms are an in-memory queue on the heartbeat, matched by node attributes (Phase 7b)
+## 88. Warms are an in-memory queue on the heartbeat, matched by node attributes (Phase 7b)
 
 *Phase 7b, implementation. The cache plan's `WarmArtifacts` design had a
 warm eval and a warm-state table.*
@@ -2125,7 +2314,7 @@ replicated write per node per warm for a hint. The ACL follows what warming
 does to the snapshot (reads it), and the MCP gate follows what it does to
 the fleet (downloads), so a read-only agent cannot trigger it.
 
-## 83. Workers advertise a `checkpoint` capability at registration
+## 89. Workers advertise a `checkpoint` capability at registration
 
 *Phase 3c, implementation.*
 
@@ -2143,7 +2332,7 @@ features that read it.
 other one. Capabilities let a fleet mix versions and let later phases (fork,
 locality) add their own names without coordinating.
 
-## 84. The guest root disk is a memory-checkpoint part
+## 90. The guest root disk is a memory-checkpoint part
 
 *Phase 3b, implementation.*
 
@@ -2161,7 +2350,7 @@ filesystems without reflinks the copy costs time while the guest is paused.
 open files all describe the disk as it was at capture. A rebuilt disk is a
 different filesystem under a running kernel, which is silent corruption.
 
-## 85. A checkpointable sandbox sees its disks through stable device links
+## 91. A checkpointable sandbox sees its disks through stable device links
 
 *Phase 3b, implementation.*
 
@@ -2189,7 +2378,7 @@ the load, before a PATCH can run (to confirm on real hardware, see the
 Linux verification doc). Links work on both VMMs, need no
 privileges, and survive fork unchanged.
 
-## 86. The pressure response runs on its own one-second tick (Phase 2)
+## 92. The pressure response runs on its own one-second tick (Phase 2)
 
 **Call.** A dedicated task on the worker checks `/proc/meminfo` and PSI every
 second and acts in a blocking thread. Actions queue for the next heartbeat.
@@ -2208,7 +2397,7 @@ would make a large fleet slower to defend its nodes for no reason.
 `memory.reclaim` reclaims synchronously, so it also must not block the
 heartbeat.
 
-## 87. A fixed 10-second report interval, and activity from CPU and traffic (Phase 1)
+## 93. A fixed 10-second report interval, and activity from CPU and traffic (Phase 1)
 
 **Call.** No knob for the report interval. An allocation is active in an
 interval if it used at least 1% of a core or moved traffic through the node
@@ -2223,7 +2412,7 @@ as idle. Phase 5's idle policy must add it before it suspends anything.
 idle time yet. A knob nobody needs is one more thing to document, and
 datapath counters were already on the heartbeat path at no extra cost.
 
-## 88. `cpuBelow` scales with the task's cpu, never below 1% of a core, and `after` is at least 30s (Phase 5)
+## 94. `cpuBelow` scales with the task's cpu, never below 1% of a core, and `after` is at least 30s (Phase 5)
 
 *Phase 5, implementation.*
 
@@ -2250,7 +2439,7 @@ depends on the worker's clock reading, which is coarse on some platforms.
 sandbox awake forever. A window shorter than the system can measure (c) is a
 promise it would break silently.
 
-## 89. A worker's first heartbeat carries the full set, and every heartbeat carries a report
+## 95. A worker's first heartbeat carries the full set, and every heartbeat carries a report
 
 *Phase 7a, implementation.*
 
@@ -2275,7 +2464,7 @@ workers. Diffing against the acknowledged set means a failed heartbeat needs
 no restore step, unlike every other report on the request. (a) would put the
 same logic in two RPCs and still need the resync path for failover.
 
-## 90. Locality is computed once per task and folded into the cached per-candidate state
+## 96. Locality is computed once per task and folded into the cached per-candidate state
 
 *Phase 7a, implementation.*
 
@@ -2293,7 +2482,7 @@ re-apply the scores (it does).
 placement. Locality adds no per-placement hashing, so tasks with a content
 set pay a per-task cost only.
 
-## 91. Content sizes come from the index, and unsizeable content is left out
+## 97. Content sizes come from the index, and unsizeable content is left out
 
 *Phase 7a, implementation.*
 
@@ -2318,7 +2507,7 @@ field for a soft score, and (c) invents a number. Restore manifests (Phase
 7b) know their part sizes and pass them, so the overstatement only affects
 artifacts.
 
-## 92. Tasks get a copy of a cached artifact, never a hardlink
+## 98. Tasks get a copy of a cached artifact, never a hardlink
 
 *Phase 3a, implementation.*
 
@@ -2338,7 +2527,7 @@ allocation. A per-allocation `mode` could not be applied without changing it
 for everyone. Copy-on-write clones give the disk saving where the
 filesystem supports it, without the shared-mutation hazard.
 
-## 93. Caching an artifact is best effort and holds no allocation pin
+## 99. Caching an artifact is best effort and holds no allocation pin
 
 *Phase 3a, implementation.*
 
@@ -2353,7 +2542,7 @@ with "cache budget exhausted by running allocations."
 
 **Trade-off.** A busy node can evict an artifact that a running allocation
 staged, so that allocation's next restart on a *new* task dir refetches. Its
-current task dir is unaffected because it holds a copy (call 92).
+current task dir is unaffected because it holds a copy (call 98).
 
 **Why (simplicity).** With copies instead of hardlinks, nothing a running
 task uses lives in the store, so an allocation pin protects nothing. Making
@@ -2361,7 +2550,7 @@ the cache able to fail an allocation that would have staged fine without it
 would be a regression. The no-new-release-hook design also means destroy
 paths need no new wiring.
 
-## 94. A store snapshot still waiting to publish is lost with its node (Phase 7b)
+## 100. A store snapshot still waiting to publish is lost with its node (Phase 7b)
 
 *Phase 7b, implementation.*
 
@@ -2379,7 +2568,26 @@ durability, and the doc says so.
 **Why (simplicity).** A removed node is gone by definition, and nothing else
 holds those bytes.
 
-## 95. Deleting waits for the node, except when there is nothing to reclaim
+## 101. Make-room queues the resume's evaluation once it fits (Track 2)
+
+*Track 2 (resume guards), implementation.*
+
+**Call.** The make-room pass (every 5 seconds) re-checks each waiting
+resume, and when it now fits it enqueues a `job_reschedule` eval for the
+resume's job, at most once per 10 seconds per resume.
+
+**Alternatives.** (a) Have the suspend transaction enqueue evals for every
+job with a resume waiting on that node. (b) Rely on the next unrelated eval.
+
+**Trade-off.** A resume can wait up to one pass after the room appears. Any
+room counts, so a resume also gets placed when capacity frees for other
+reasons, which changes behavior with `makeRoom = false` not at all.
+
+**Why (simplicity).** Nothing else re-evaluates a resume that failed to
+place. (a) puts a cross-job lookup inside the suspend transaction. The pass
+already computes the fit, so the nudge is free.
+
+## 102. Deleting waits for the node, except when there is nothing to reclaim
 
 *Phase 3c, implementation.*
 
@@ -2397,7 +2605,26 @@ node returns or is removed.
 **Why (correctness).** Pinned bytes are never evicted, so a row removed before
 the node released them would leak disk the store could never reclaim.
 
-## 96. The worker decides "launch for checkpoints", through `TaskInstance`
+## 103. Suspended checkpoint bytes come from the manager's snapshot rows, the budget from the worker (Track 2)
+
+*Track 2 (resume guards), implementation. Deviates from the brief.*
+
+**Call.** `GetNodeUsage.suspended.checkpoint_bytes` sums `total_bytes` of the
+checkpoints of suspended instances on the node from the manager's snapshot
+records. The worker reports only the `snapshots` class totals (budget, used,
+pinned).
+
+**Alternatives.** Have the worker report its suspended checkpoint bytes, as
+the brief proposed.
+
+**Trade-off.** Disk checkpoints report 0 bytes (their volume stays in place),
+and the figure is the capture size, not on-disk bytes after deduplication.
+
+**Why (simplicity).** The worker's content store pins by snapshot id and does
+not know which snapshots are suspends after a restart. The manager's rows are
+authoritative and survive worker restarts.
+
+## 104. The worker decides "launch for checkpoints", through `TaskInstance`
 
 *Phase 3b, implementation.*
 
@@ -2412,13 +2639,13 @@ runtime now.
 
 **Trade-off.** Until Phase 4 wires `suspend`, no jobspec turns it on, so the
 feature is reachable only from tests. (Phase 3c wired it to the `snapshots`
-block, entry 28.)
+block, entry 31.)
 
 **Why (simplicity).** The jobspec fields belong to the manager-side track,
 which was running in parallel. A bool on the instance keeps the runtime
 ignorant of job config shape and gives that track one line to wire.
 
-## 97. `restore` takes the checkpoint directory as an argument
+## 105. `restore` takes the checkpoint directory as an argument
 
 *Phase 3b, implementation.*
 
@@ -2438,7 +2665,7 @@ the store's API. With a directory in hand, the merge only changes the worker
 code that fills `source` (hardlink or reflink by digest), and runtimes never
 change.
 
-## 98. The restore payload says it is a fork, rather than the worker inferring it (Phase 6)
+## 106. The restore payload says it is a fork, rather than the worker inferring it (Phase 6)
 
 *Phase 6, implementation.*
 
@@ -2459,7 +2686,7 @@ manifest's `origin_instance` is empty for the same reason. Inference would
 need both plumbed anyway, and an explicit flag is easier to read in a
 heartbeat dump.
 
-## 99. `sandbox.vmmOverheadMiB` rides inside the enforcement payload (Phase 1)
+## 107. `sandbox.vmmOverheadMiB` rides inside the enforcement payload (Phase 1)
 
 **Call.** Operators write a top-level `sandbox { vmmOverheadMiB }` block in
 the worker config, as the plan names it. The manager folds it into the
@@ -2477,7 +2704,7 @@ top-level block.
 it belongs with enforcement on the wire. Folding it avoids a migration and a
 wire field for a single integer.
 
-## 100. Fork and `from_snapshot` creates are capped at 64 per call (Phase 6)
+## 108. Fork and `from_snapshot` creates are capped at 64 per call (Phase 6)
 
 *Phase 6, implementation.*
 
@@ -2496,7 +2723,7 @@ a large fan-out mostly queues pending placements there, and a typo
 derived cap would change between calls. 64 is far above what a node runs at
 once today.
 
-## 101. Store settings ride in the `artifacts` wire payload
+## 109. Store settings ride in the `artifacts` wire payload
 
 *Phase 3a, implementation.*
 
@@ -2517,7 +2744,7 @@ proto field number and a migration are the two edits most likely to collide
 on merge, and the artifacts payload is already the worker's artifact-staging
 config. Older workers ignore the extra key, so skew is free.
 
-## 102. The identity disk is a raw header plus JSON
+## 110. The identity disk is a raw header plus JSON
 
 *Phase 3b, implementation.*
 
@@ -2534,7 +2761,7 @@ read-only in the guest.
 on that path would be slow and need privileges. MMDS is Firecracker-only and
 rides in the snapshot, so it would carry the old identity.
 
-## 103. `local-dir` snapshots live beside volumes, and clone is idempotent by existence
+## 111. `local-dir` snapshots live beside volumes, and clone is idempotent by existence
 
 *Phase 3b, implementation.*
 
@@ -2554,7 +2781,7 @@ manager, and publication is by rename, so an existing directory can only be
 a finished clone of this request. A marker would have to live inside a
 filesystem-mode volume, where the workload can see and delete it.
 
-## 104. A small blocking HTTP client for the VMM APIs
+## 112. A small blocking HTTP client for the VMM APIs
 
 *Phase 3b, implementation.*
 
@@ -2571,7 +2798,7 @@ the worker's task-manager lock, so an async client would need a runtime
 bridge. Shelling out adds binaries to install. The fake-VMM tests exercise
 the exact bytes either way.
 
-## 105. The locality metric is a warm/partial/cold counter at plan time
+## 113. The locality metric is a warm/partial/cold counter at plan time
 
 *Phase 7a, implementation.*
 
@@ -2589,7 +2816,7 @@ the planned node, and `partial` hides how partial.
 warm", which one ratio answers. Counting at plan time keeps the metric next
 to the score that produced it, and fallbacks are rare outside contention.
 
-## 106. Published URLs are recorded in the content store index, apart from entries
+## 114. Published URLs are recorded in the content store index, apart from entries
 
 *Phase 7a, implementation.*
 
@@ -2607,7 +2834,7 @@ nothing, and the reader's fetch fails on a missing object.
 record to `entry` would forget it the moment LRU runs. Phase 7b records URLs
 in the snapshot manifest anyway, which is the authoritative copy, so this
 table is a cache that only saves a HEAD request.
-## 107. Suspend columns are read apart from the generic instance row (Phase 4)
+## 115. Suspend columns are read apart from the generic instance row (Phase 4)
 
 *Phase 4, implementation.*
 
@@ -2626,7 +2853,7 @@ places, and the generic upsert must never clear suspend state (the same
 reason 3c kept `restore_from` out of it). Keeping them apart means the
 existing paths cannot drop them by accident.
 
-## 108. `suspend_reason` is written when a suspend starts (Phase 5)
+## 116. `suspend_reason` is written when a suspend starts (Phase 5)
 
 *Phase 5, implementation.*
 
@@ -2646,7 +2873,7 @@ documents it as the reason of the current or last suspend.
 to the same tables. The value is what `instance get` shows while a suspend is
 in flight, which is useful in its own right.
 
-## 109. `instance fork --wait` is opt-in, like `suspend --wait` (Phase 6)
+## 117. `instance fork --wait` is opt-in, like `suspend --wait` (Phase 6)
 
 *Phase 6, implementation.*
 
@@ -2665,7 +2892,7 @@ create`, `snapshot restore`) returns at once and waits only on `--wait`.
 One rule for all of them is easier for an agent than one exception, and the
 ids, which are what a caller needs first, are in the immediate reply.
 
-## 110. The real cross-node test carries its part on a disk-kind manifest (Phase 7b)
+## 118. The real cross-node test carries its part on a disk-kind manifest (Phase 7b)
 
 *Phase 7b, testing.*
 
@@ -2685,7 +2912,7 @@ capture it. That is item 7b.3 of the Linux verification plan.
 restore report) is the new code, and it is runtime-independent. A fake
 runtime would test the fake.
 
-## 111. New proto fields take the next free number, renumbered at merge
+## 119. New proto fields take the next free number, renumbered at merge
 
 *Phase 3c, implementation; revised when Phases 2, 3, and 7a merged.*
 
@@ -2709,7 +2936,25 @@ Sequential numbers are what a reader of `legion.proto` expects, and a gap
 invites the next contributor to wonder what was deleted. After release the
 numbers are frozen like any other.
 
-## 112. This plan supersedes the snapshot plan's phasing, not its mechanics
+## 120. Track 2's proto fields start at 200 (Track 2)
+
+*Track 2 (resume guards), implementation.*
+
+**Call.** Fields this track adds to existing messages (`InstanceInfo`,
+`GetNodeUsageReply`, `NodeAllocationUsage`, `ContentLocationReport`) are
+numbered from 200 in a block marked `Track 2`. New messages
+(`SuspendedCapacity`, `SnapshotBudget`) number from 1.
+
+**Alternatives.** The next free number, as entry 119 prefers.
+
+**Trade-off.** Gaps in the numbering until the merge renumbers them, as
+entry 119 describes.
+
+**Why (simplicity).** Two other tracks add fields to `InstanceInfo` and the
+node usage messages in parallel. A distinct range keeps their branches from
+colliding on a number, and the merge renumbers once.
+
+## 121. This plan supersedes the snapshot plan's phasing, not its mechanics
 
 **Call.** `sandbox-snapshots-and-fast-start-plan.md` stays as the reference
 for capture mechanics, the manifest, quiesce hooks, identity collision, and
@@ -2725,7 +2970,7 @@ into this one.
 superseded plan. The old plan's mechanics are still right, and restating
 them here would create two copies to drift apart.
 
-## 113. Snapshot restores keep the locked launch path (rebase onto main)
+## 122. Snapshot restores keep the locked launch path (rebase onto main)
 
 *Rebase onto main, after the audit's W3 fix moved launches off the
 task-manager lock.*

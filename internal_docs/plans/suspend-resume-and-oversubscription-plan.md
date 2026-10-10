@@ -2,7 +2,7 @@
 
 > **Judgement calls:** [`calls/suspend-resume-and-oversubscription-plan_calls.md`](../calls/suspend-resume-and-oversubscription-plan_calls.md)
 
-Status: **IN EXECUTION** (written 2026-10-09, execution started 2026-10-10). Phases 1-7 shipped (3a content store, 3b runtime checkpoints, 3c snapshots API and restore, 4 suspend and resume, 5 automatic suspend, 6 fork, create from a snapshot, and named snapshots, 7a content publishing, the location index, and the `locality` score, 7b `durability = "store"`, cross-node resume, and `snapshot warm`). The integration of Phases 5, 6, and 7b finished their seams: `--spread` forks across nodes from a published checkpoint, published snapshots as named seeds, a bounded publish retry, and placement that binds each restore to its planned instance on a worker that can fetch. Phase 8 (fast paths: wake on connect, the `hint` idle signal, lazy memory restore, diff snapshots) is deferred. The Linux and KVM checks for Phases 1-7 are pending ([verification plan](../suspend-resume-linux-verification.md)).
+Status: **IN EXECUTION** (written 2026-10-09, execution started 2026-10-10). Phases 1-7 shipped (3a content store, 3b runtime checkpoints, 3c snapshots API and restore, 4 suspend and resume, 5 automatic suspend, 6 fork, create from a snapshot, and named snapshots, 7a content publishing, the location index, and the `locality` score, 7b `durability = "store"`, cross-node resume, and `snapshot warm`). The integration of Phases 5, 6, and 7b finished their seams: `--spread` forks across nodes from a published checkpoint, published snapshots as named seeds, a bounded publish retry, and placement that binds each restore to its planned instance on a worker that can fetch. Resume guards shipped after Phase 7 (Track 2): `suspend.reserve` as a ratio or fixed amounts, the worker's `suspendedReserve` floor, make-room suspends for a resume pinned to a full node, and the checkpoint disk budget as a placement constraint ([Capacity for resumes](../../docs/suspend-and-resume.md#capacity-for-resumes), calls entries 5, 6, 10, 34, 43, 53, 101, 103, 120). Phase 8 (fast paths: wake on connect, the `hint` idle signal, lazy memory restore, diff snapshots) is deferred. The Linux and KVM checks for Phases 1-7 are pending ([verification plan](../suspend-resume-linux-verification.md)).
 
 **Relationship to existing plans.** This plan supersedes the *phasing and
 scope* of
@@ -823,6 +823,12 @@ reservation on its node while suspended. Resume is then guaranteed capacity,
 at the cost of the entire density win. It exists for the "must resume in
 200 ms, always" tier. Default `false`.
 
+> **Revised (Track 2).** `reserve` also takes a ratio or fixed amounts, a
+> worker floor (`resourceEnforcement.suspendedReserve`) holds a share for
+> every suspended instance on a node, and the manager suspends idle
+> suspendable work to make room for a resume pinned to a full node. See the
+> public doc's [Capacity for resumes](../../docs/suspend-and-resume.md#capacity-for-resumes).
+
 **Capacity at resume.** When a suspended instance's node is full, resume is
 an ordinary pending placement: it waits, and the instance's band can
 preempt lower bands like any placement. A local-durability checkpoint cannot
@@ -1303,7 +1309,7 @@ block, the location index with epoch deltas on the heartbeat, and the
 which need Phases 3c and 4, and shipped too. Fork's cross-node placement is
 the generic rule for any instance with `restore_from`, so it applies once
 Phase 6 lands. A published checkpoint needs instance data that can move:
-node-local volumes are refused, not migrated (calls entry 6). Image layers join the content set once the
+node-local volumes are refused, not migrated (calls entry 8). Image layers join the content set once the
 content store holds OCI blobs. Calls 32, 78, 80, 89, 90, 91, 105, 106 record the 7a decisions.
 
 Phases 6 and 7 depend only on Phase 3 and 4, not on each other, and can run
@@ -1402,9 +1408,9 @@ and `a_suspend_that_cannot_capture_leaves_the_task_running` in the worker (a
 real `exec` task), `a_restored_guest_gets_a_token_naming_the_new_allocation`
 (the token chain), and `guest_resume` unit tests against a fake guest. The
 KVM latency target and the in-guest refresh are in the verification plan.
-Two deviations: allocation ids became monotonic (calls entry 23), and the
+Two deviations: allocation ids became monotonic (calls entry 26), and the
 memory suspend keeps the guest paused through the content-store ingest
-(calls entry 26).
+(calls entry 29).
 
 *Phase 4 scheduler results (2026-10-10, base f3ea60c, the 3c and 7a merge,
 vs. the Phase 4 commit, Apple Silicon dev machine, `--sample-size 10`,
@@ -1449,9 +1455,9 @@ task in the worker, and the balloon against fake Firecracker and
 cloud-hypervisor API servers. The idle "sandbox" is an `exec` task with fake
 usage: a real idle suspend needs cgroups, so it is in the verification plan.
 Phase 5 made no scheduler change, so it has no benchmark numbers. Open
-question 3 is answered by calls entry 25, and §7's
+question 3 is answered by calls entry 28, and §7's
 `local_suspensions` / `suspend_allocations` heartbeat fields were not needed
-(calls entry 14).
+(calls entry 17).
 
 **Phase 6**
 - Fork divergence: three forks have distinct instance ids, hostnames, MACs,
@@ -1510,7 +1516,7 @@ worker transport for real with the `file` publisher
 (`a_published_snapshot_restores_on_a_node_that_never_held_it`,
 `warm_fetches_published_parts_into_the_store_once` in
 `src/worker/task_manager.rs`), and `tests/restore_placement_indexed.rs` for
-the truncation fix (calls entry 74). It added a `restore` group to
+the truncation fix (calls entry 80). It added a `restore` group to
 `scheduler_bench`: 25 keyed instances restoring from their own `local`
 snapshots (`local_pinned`) or `published` ones (`published_floating`, compat
 on every candidate, parts seeded on a quarter of the fleet). One run
@@ -1526,7 +1532,7 @@ criterion medians):
 
 There is no "before" for `restore`: on the base commit the `local_pinned`
 cell fails at 1,000 nodes, because the armed index truncated the pinned node
-out of the candidate list (the bug calls entry 74 fixes). A floating restore
+out of the candidate list (the bug calls entry 80 fixes). A floating restore
 scores and compat-checks the whole fleet for each placement, about 1 ms per
 placement at 5,000 nodes. Restores are rare, so this is acceptable, but the
 coordinator's clean pass should rerun both groups.
@@ -1622,7 +1628,7 @@ to tune it on. Phase 1 starts collecting that history.
    where the guest kernel has it, balloon as the explicit pressure lever.
    Verify against the VMM versions we pin before Phase 5. *Answered in
    Phase 5:* both, with free page reporting on cloud-hypervisor only until
-   the pinned Firecracker is confirmed to accept it (calls entry 25).
+   the pinned Firecracker is confirmed to accept it (calls entry 28).
 4. **Encrypting published snapshot parts** with the KV keyring's data keys.
    *Lean:* yes, as a follow-up plan, because the keyring rotation and
    rewrap story would need to cover multi-GiB blobs.

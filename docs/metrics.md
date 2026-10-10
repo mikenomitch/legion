@@ -340,13 +340,21 @@ sum across them. See [suspend-and-resume.md](suspend-and-resume.md#metrics).
   not included. The memory target is under 300 ms for a 1 GiB guest on local
   NVMe.
 - **`legion_instance_suspends_total{reason}`** (counter): suspends applied,
-  by `reason`: `manual` (SuspendInstance), `idle` (a task's idle policy), or
-  `pressure` (a node's `suspend` pressure step).
+  by `reason`: `manual` (SuspendInstance), `idle` (a task's idle policy),
+  `pressure` (a node's `suspend` pressure step), or `make_room` (to make room
+  for a resume, see
+  [Capacity for resumes](suspend-and-resume.md#capacity-for-resumes)).
 - **`legion_idle_sweep_suspends_total{outcome}`** (counter): suspends the
   idle sweep tried to start, by `outcome`: `started`, or `skipped` (the
   instance changed under it, an operation was already in flight, or its node
   cannot checkpoint). Counted on the manager that ran the sweep, which is the
   one holding the node's usage reports.
+- **`legion_make_room_suspends_total{outcome}`** (counter): suspends the
+  manager started to make room for a resume waiting on its checkpoint's
+  node, by `outcome`: `started`, `failed` (the suspend could not start), or
+  `no_room` (suspending every eligible instance would not have been enough,
+  so none was suspended, counted once per round). A steady `no_room` means
+  resumes wait on nodes whose work cannot be suspended for them.
 - **`legion_checkpoint_bytes{kind}`** (histogram): size of each captured
   checkpoint, suspends and snapshots alike, from 1 MiB to 64 GiB. A disk
   suspend reports 0, because its volume stays in place uncopied.

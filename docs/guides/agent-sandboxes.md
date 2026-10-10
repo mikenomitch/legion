@@ -65,6 +65,9 @@ your databases.
       # state when the node runs short.
       steps = ["reclaim", "suspend", "evict-bursting", "evict-reserved"],
     },
+    # Keep a quarter of every suspended sandbox's reservation on its node,
+    # so most resumes find room without waiting. See "Room for resumes".
+    suspendedReserve = 0.25,
   },
 
   # The VMM's own memory on top of the guest's.
@@ -93,10 +96,39 @@ tune the trigger or check that `suspend` is in `steps`. The block above
 mostly restates the defaults. See
 [memory pressure](../resource-enforcement.md#memory-pressure).
 
+**`suspendedReserve = 0.25`** keeps a quarter of each suspended sandbox's
+memory and CPU charged to its node. See [Room for resumes](#room-for-resumes).
+
 **`content`** is on by default with a 50 GiB snapshot budget. That is enough
 to try the guide and too small for a node that parks hundreds of sandboxes.
 A suspend whose checkpoint would go over the budget fails, and the sandbox
-keeps running. See [the node content store](../artifacts.md#the-node-content-store).
+keeps running. Once a node's budget has no room for one more checkpoint, the
+scheduler places new sandboxes elsewhere, and `legion node usage` shows the
+budget under `checkpoints`. See
+[the checkpoint disk budget](../suspend-and-resume.md#the-checkpoint-disk-budget)
+and [the node content store](../artifacts.md#the-node-content-store).
+
+### Room for resumes
+
+A suspended sandbox's checkpoint lives on its node, so its resume has to run
+there. By default a suspended sandbox frees its whole reservation, new
+sandboxes pack into that room, and a returning user can find their node full.
+Two things keep that rare:
+
+- **Make-room** is on by default. When a resume waits on a full node, the
+  manager suspends the quietest sandboxes there (every sandbox in this guide
+  has an idle policy and `onPressure = true`) until it fits. The user waits
+  for one capture, usually under a second.
+- **`suspendedReserve`** keeps part of every suspended sandbox's reservation
+  in place, so the room is usually already there.
+
+For interactive fleets, start with `suspendedReserve = 0.25`. With 512 MiB
+reservations a suspended sandbox holds 128 MiB, so a node gives up a quarter
+of the density win in exchange for resumes that rarely need make-room. Lower
+it toward 0 if `node usage` shows held memory crowding out active sandboxes.
+Raise it, or set `suspend.reserve = true` on a premium tier's job, if users
+notice waits. See
+[Capacity for resumes](../suspend-and-resume.md#capacity-for-resumes).
 
 ### Picking a ratio
 
@@ -235,9 +267,12 @@ checkpoints, with a VMM API socket, stable device links, an identity disk,
 and a balloon. A sandbox started before you added the block can't be
 memory-checkpointed until it restarts.
 
-**`reserve = false`** frees the reservation while the sandbox is suspended.
-That is the density win. `true` keeps it so a resume always fits, which costs
-the whole point.
+**`reserve = false`** frees the job's claim on the reservation while the
+sandbox is suspended. That is the density win. The node's
+`suspendedReserve` still holds its floor. A ratio (`0.25`) or a fixed amount
+(`{ memory = "256MiB" }`) holds a share for this job alone, and `true` keeps
+everything so a resume always fits, which costs the whole point. See
+[Room for resumes](#room-for-resumes).
 
 **`onRestoreFailure = "cold"`** decides what happens when a checkpoint can't
 be restored. A user who comes back to a fresh boot on their own `/workspace`
@@ -347,7 +382,7 @@ $ legion instance get user-42 -j
  "last_suspend_ms":740, ...},"provisional":null}}
 ```
 
-`suspend_reason` says who did it: `manual`, `idle`, or `pressure`. To follow
+`suspend_reason` says who did it: `manual`, `idle`, `pressure`, or `make_room`. To follow
 it as events, tail `legion events list --kind instance.suspended`.
 
 Your platform can also suspend on its own signal, such as a closed browser

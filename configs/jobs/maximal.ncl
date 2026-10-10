@@ -691,9 +691,15 @@
                 # task stops, the volume stays in place, and a resume boots
                 # it fresh on that volume.
                 checkpoint = "disk",
-                # Keep the reservation on the node while suspended, so the
-                # resume always has room. Default false (the density win).
-                reserve = false,
+                # How much of the reservation stays charged to the node while
+                # suspended, so the resume finds room (docs/
+                # suspend-and-resume.md, "Capacity for resumes"). false
+                # (default, the density win), true (everything, exclusive
+                # cores included), a ratio of memory and cpu MHz between 0
+                # and 1, or fixed amounts { memory = "1GiB", cpu = 100 } no
+                # larger than `resources`. The node's
+                # resourceEnforcement.suspendedReserve is a floor under it.
+                reserve = 0.25,
                 # When a resume cannot restore (checkpoint lost with its
                 # node, compat drift, a failed restore): "cold" (default)
                 # boots fresh on the retained storage, "fail" leaves the

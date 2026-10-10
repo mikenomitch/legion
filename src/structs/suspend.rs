@@ -626,7 +626,7 @@ fn validate_reserve_amount(
             Some(reserved) if held > reserved => {
                 return Err(format!(
                     "task {:?}: suspend.reserve.{field} ({held:.0} {unit}) exceeds the task's \
-                     resources.{field} ({reserved:.0} {unit}); a suspended instance cannot hold \
+                     resources.{field} ({reserved:.0} {unit}). A suspended instance cannot hold \
                      more than it reserves while running\nHint: lower suspend.reserve.{field}, \
                      or use reserve = true to hold the whole reservation",
                     task.name

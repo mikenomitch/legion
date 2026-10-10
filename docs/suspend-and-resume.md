@@ -101,7 +101,7 @@ works without it, with the defaults below.
 ```nickel
 suspend = {
   checkpoint = "memory",          # "memory" | "disk"
-  reserve = false,                # hold the reservation while suspended
+  reserve = 0.25,                 # keep a share of the reservation while suspended
   onRestoreFailure = "cold",      # "cold" | "fail"
   resumeTimeout = "30s",          # how long a resume waits for its node
   onResume = ["/usr/local/bin/reconnect"],  # run in the guest after a restore
@@ -114,7 +114,7 @@ suspend = {
 | Field | Default | Meaning |
 | --- | --- | --- |
 | `checkpoint` | `memory` for a `sandbox`, `disk` otherwise | What a suspend captures. See [Memory or disk](#memory-or-disk). |
-| `reserve` | `false` | Keep the instance's reservation on its node while suspended, so a resume always has room. Costs the whole density win. |
+| `reserve` | `false` | How much of the instance's reservation stays charged to its node while suspended: `false`, `true`, a ratio between 0 and 1, or fixed amounts `{ memory = "1GiB", cpu = 100 }`. See [Capacity for resumes](#capacity-for-resumes). |
 | `onRestoreFailure` | `cold` | When a resume cannot restore: `cold` boots fresh on the retained storage, `fail` leaves the instance suspended with the reason in its `detail`. |
 | `resumeTimeout` | `30s` | How long a resume waits to be placed on its checkpoint's node before `onRestoreFailure = "cold"` boots it fresh. At least one second. |
 | `onResume` | none | argv the sandbox guest runs after every memory restore, once its identity is refreshed. |
@@ -133,6 +133,12 @@ Hint: set suspend.checkpoint = "disk", or run this task with runtime = "sandbox"
 
 Error: task "workspace" asks for memory checkpoints, but sandbox memory checkpoints don't support gated networking yet
 Hint: set suspend.checkpoint = "disk" to suspend with a disk checkpoint, or drop network gating for this task
+
+Error: task "workspace": suspend.reserve 1.5 is out of range: a ratio is between 0 and 1 (0.25 holds a quarter of the instance's memory and cpu while it is suspended)
+Hint: use true to hold everything, or a fixed amount like { memory = "1GiB", cpu = 100 }
+
+Error: task "workspace": suspend.reserve.memory (4096 MiB) exceeds the task's resources.memory (2048 MiB). A suspended instance cannot hold more than it reserves while running
+Hint: lower suspend.reserve.memory, or use reserve = true to hold the whole reservation
 ```
 
 `onResume` on a task that resumes with a cold boot (any runtime but `sandbox`,
@@ -365,14 +371,179 @@ checkpoint). Under `cold`, a resume that waits longer
 pinned to that node, so it keeps waiting for it, just no longer for the
 checkpoint. Under `fail`, a resume waits like any pending placement.
 
-### Holding the reservation
+## Capacity for resumes
 
-`suspend.reserve = true` keeps a suspended instance's allocation row in place
-with status `suspended`. The row is never sent to a worker, but it still
-counts against the node's capacity, so the resume always fits. The resume
-releases it and places the restore in the same transaction. A job update or
-a job stop removes held reservations like any other allocation, and the
-instance stays suspended, holding nothing.
+Think of a node's memory as a cache over its suspended instances. A
+suspended instance gives its reservation back by default, so new work packs
+into the room it left. That is the density win. The cost shows up at resume:
+a `local` checkpoint can only restore on its own node, and if new work filled
+that node, the resume waits.
+
+Legion gives you three controls, from cheapest to strongest guarantee:
+
+- **Make room** (on by default): when a resume is waiting on a full node, the
+  manager suspends idle instances there until it fits.
+- **Hold a share** (`suspend.reserve`, or the node's `suspendedReserve`): a
+  suspended instance keeps part of its reservation charged to its node, so
+  that much room is always waiting for it.
+- **Hold everything** (`reserve = true`): the resume always fits, at the cost
+  of the whole density win.
+
+`durability = "store"` sidesteps the question: a published checkpoint
+resumes on any compatible node. See
+[Durability](#durability-surviving-the-node).
+
+### Holding a share of the reservation
+
+```nickel
+suspend = {
+  reserve = 0.25,                          # a quarter of memory and cpu
+  # reserve = true,                        # all of it, exclusive cores included
+  # reserve = { memory = "1GiB", cpu = 100 },  # fixed amounts (MiB, MHz)
+},
+```
+
+| Form | Holds |
+| --- | --- |
+| `false` (default) or `0` | Nothing. The allocation row is deleted on suspend. |
+| A ratio, such as `0.25` | That share of `resources.memory` and `resources.cpu` (MHz). Exclusive `cores`, devices, and custom resources are released. |
+| `true` or `1` | The whole reservation, `cores` and devices included. |
+| `{ memory, cpu }` | Those amounts. `memory` is a size (`"1GiB"`) or MiB. `cpu` is MHz. Cores and devices are released. |
+
+An operator can set a floor for every suspended instance on a node in the
+worker config, whatever the job says:
+
+```nickel
+resourceEnforcement = {
+  suspendedReserve = 0.25,   # default 0.0
+},
+```
+
+Each suspended instance is charged `max(job reserve, node floor)`, per
+dimension. A floor of `1.0` holds everything. The floor needs no cgroups, so
+it works with `resourceEnforcement.enabled = false`. It rides the node's
+registration, and it applies when a suspend lands: changing it does not
+re-charge instances already suspended on the node.
+
+The charge is the instance's allocation row, kept with status `suspended`
+and its resources cut to the held share. The row is never sent to a worker,
+but the scheduler's fit check, its read model, and the plan-apply recheck all
+count it like any other row, so nothing new packs into the held room. Ports
+are released, and a held row does not count toward `maxAllocations`. The
+resume deletes the row and places the restore in the same transaction, so
+the held share is released at resume and the restore lands on room that
+includes it.
+
+A fixed amount must fit inside the task's own reservation, and the dimension
+must be declared in `resources`, so submit can check it. A ratio outside 0
+to 1 fails the same way. A job update or a job stop removes held rows like
+any other allocation, and the instance stays suspended, holding nothing.
+
+`instance get` shows the held share, and `node usage` sums it:
+
+```console
+$ legion instance get user-42
+...
+held: 512 MiB and 250 MHz reserved on w-03 for the resume
+
+$ legion node usage w-03
+RESOURCE   CAPACITY      RESERVED         USED            PRESSURE
+memory     65536 MiB     41472 MiB (63%)  30120 MiB (46%)  ok (free 33792 MiB, stall 0.2%)
+cpu        40000 MHz     21000 MHz (52%)  9300 MHz (23%)
+
+suspended: 12 instances, 3072 MiB held and 1500 MHz (6 holding), node floor 0.25
+checkpoints: 18.4 GiB suspended here, snapshots budget 19 GiB pinned of 50 GiB (31 GiB free)
+```
+
+The held rows also appear in the allocation table as
+`<instance> (suspended, held)`.
+
+Which to pick:
+
+- **Interactive fleets** (agent sandboxes, dev environments) where a resume
+  should usually be instant: `0.25` on the node, and let make-room cover the
+  rest. See the [agent sandboxes guide](guides/agent-sandboxes.md).
+- **Batch-like work** that tolerates a wait: leave it at `0`.
+- **A tier that must resume within its restore time, always**: `true`.
+
+### Making room for a resume
+
+When a resume from a `local` checkpoint cannot fit on its node, the manager
+suspends the most idle suspendable instances there until it does. It uses
+the same order the node's `suspend` pressure step uses: the least important
+band first, then the instance quiet the longest.
+
+An instance can be suspended to make room when all of these hold:
+
+- Its task has a `suspend` block.
+- It opted in to being suspended for someone else (`onPressure = true`), or
+  it is quiet right now by its own idle policy (`suspend.idle`, with the node
+  reporting it idle). An instance with an idle policy that is not quiet is
+  left alone.
+- Its band does not outrank the resume's band. Making room never displaces
+  more important work, the same rule preemption follows.
+- It became active (started or resumed) more than two minutes ago.
+
+Work without a `suspend` block is never touched. Suspends start only when
+suspending the chosen instances is enough for the resume to fit, counting
+what each one keeps held. If even every eligible instance would not be
+enough, nothing is suspended.
+
+Two rules stop it from thrashing:
+
+- The two-minute rule above means an instance suspended to make room, once
+  resumed, cannot immediately push out the instance it waited for.
+- While any suspend is in flight on the node, the manager waits for it to
+  land before choosing more. Each resume gets one round every two minutes.
+
+Each round emits `instance.make_room` naming the resume and the instances it
+is suspending. Each of those suspends lands as `instance.suspended` with
+`reason = make_room`, which `instance get` shows as the last suspend's
+reason. Once there is room, the resume is queued for placement right away
+rather than waiting for the next evaluation.
+
+The manager checks every 5 seconds. It is on by default. Turn it off in the
+manager config:
+
+```nickel
+suspend = {
+  makeRoom = false,
+},
+```
+
+Make-room does not change `resumeTimeout`. A resume that still cannot be
+placed in time (no eligible instances, or a node that is down) follows
+`onRestoreFailure` as before.
+
+### The checkpoint disk budget
+
+Memory checkpoints live in the node content store under the `snapshots`
+budget (`content.budgets.snapshots`, 50 GiB by default). Every suspended
+instance's checkpoint stays pinned there until it resumes or is destroyed, so
+a node full of suspended instances can run out of room for the next
+checkpoint, and a suspend that cannot store its checkpoint fails.
+
+Workers report the budget on every heartbeat: its size, what it holds, and
+what is pinned. `node usage` shows it under `checkpoints`, beside the bytes of
+the checkpoints suspended there. The manager computes those from its own
+records, so the figure survives a worker restart.
+
+When a node's budget has less room left (budget minus pinned bytes) than one
+more checkpoint of a task, the scheduler does not place **new** instances of
+that task on the node. This applies only to tasks whose `suspend` block
+checkpoints memory. A checkpoint's size is estimated as the guest's memory
+(`config.memory_mib`, else `resources.memoryMax`, else `resources.memory`).
+Resumes and other restores are never held back, since their checkpoint
+already exists. When no node has room, placement fails with:
+
+```text
+Failed to place task workspace: 4 eligible node(s), but every one's snapshots content budget is full: less than 1024 MiB free for this task's memory checkpoint (suspend). Raise content.budgets.snapshots on those workers, delete snapshots you no longer need (`legion snapshot list`), or resume or destroy suspended instances to release their checkpoints. `legion node usage <node>` shows each node's budget
+```
+
+A node that has not reported a budget (an older worker, or a manager that
+just started) is treated as having room. An instance that failed to place
+for a full budget stays `pending` until its job is evaluated again, like any
+placement that failed for capacity.
 
 ## Durability: surviving the node
 
@@ -1272,7 +1443,8 @@ entries.
 | `snapshot.publish_failed` | warn | A `durability = "store"` snapshot could not be uploaded and stays `local`. The metadata carries `error`, which says whether the manager will retry. |
 | `snapshot.warmed` | info | A node fetched a published snapshot's parts after `snapshot warm`. The metadata carries `fetchedBytes` and `durationMs`. |
 | `snapshot.warm_failed` | warn | A node could not warm a snapshot. The metadata carries `error`. |
-| `instance.suspended` | info | A suspend's capture landed. The instance is `suspended`. The metadata carries `kind`, `totalBytes`, `durationMs`, `reserved`, and `reason` (`manual`, `idle`, or `pressure`). |
+| `instance.suspended` | info | A suspend's capture landed. The instance is `suspended`. The metadata carries `kind`, `totalBytes`, `durationMs`, `reserved` (whether it holds a share of its reservation), and `reason` (`manual`, `idle`, `pressure`, or `make_room`). |
+| `instance.make_room` | info | A resume did not fit on its checkpoint's node, and the manager started suspends to make room. The metadata carries the resume's `instanceId` and the instances it is `suspending`. |
 | `instance.suspend_failed` | warn | A suspend's capture failed. The instance keeps running. The metadata carries `error`. |
 | `instance.resumed` | info | A resume restored as a new allocation. The metadata carries `restoreMs`. |
 | `instance.restore_failed` | warn | A resume, a fork, or a create from a snapshot could not restore. `outcome` is `cold` (booted fresh), `suspended` (a resume under `onRestoreFailure = "fail"`), or `stopped` (a fork or new instance under `"fail"`), and `error` says why. |
@@ -1292,7 +1464,8 @@ A suspend by the node's pressure response also emits `node.pressure` with
 | `legion_instance_suspend_seconds` | histogram | `kind` | How long each successful suspend's capture took on its node. |
 | `legion_instance_resume_seconds` | histogram | `kind` | How long each successful resume's restore took on its node. Placement time is not included. |
 | `legion_checkpoint_bytes` | histogram | `kind` | Size of each captured checkpoint (suspends and snapshots). A disk suspend reports 0, since its volume stays in place. |
-| `legion_instance_suspends_total` | counter | `reason` | Suspends applied, by `manual`, `idle`, or `pressure`. |
+| `legion_instance_suspends_total` | counter | `reason` | Suspends applied, by `manual`, `idle`, `pressure`, or `make_room`. |
+| `legion_make_room_suspends_total` | counter | `outcome` | Make-room suspends: `started`, `failed` (could not start), or `no_room` (a round that would not have made enough room, so nothing was suspended). |
 | `legion_idle_sweep_suspends_total` | counter | `outcome` | Suspends the idle sweep tried to start: `started`, or `skipped` (the instance changed, an operation was in flight, or the node cannot checkpoint). |
 | `legion_checkpoint_publish_bytes` | histogram | `kind` | Bytes a node uploaded to publish one checkpoint. 0 when the store already held every part. |
 | `legion_checkpoint_publish_seconds` | histogram | `kind` | How long each successful publish took on its node. |
@@ -1318,7 +1491,10 @@ See [metrics](metrics.md#suspend-and-resume).
 | `instance suspend --checkpoint memory`: `supports "disk" only` | The task is not a `sandbox` | Use `--checkpoint disk` |
 | `instance suspend`: `was not launched for memory checkpoints` | No `suspend` or `snapshots` block when the allocation started | Add the block and restart the instance, or use `--checkpoint disk` |
 | `instance.suspend_failed` | The capture failed on the node (content store disabled or full, the VMM API failed) | Read `detail` or the event's `error`. The instance keeps running |
-| Instance stuck `pending (resuming)` | The checkpoint's node is down or full | Wait, `instance start --cold`, or let `resumeTimeout` boot it cold |
+| Instance stuck `pending (resuming)` | The checkpoint's node is down or full, and nothing there can be suspended to make room | Wait, `instance start --cold`, or let `resumeTimeout` boot it cold. To keep room for resumes, see [Capacity for resumes](#capacity-for-resumes) |
+| `legion_make_room_suspends_total{outcome="no_room"}` rising | Resumes wait on nodes whose instances are not eligible to make room (no `suspend` block, not opted in, a more important band, or active under two minutes) | Set `onPressure = true` or an idle policy on the work sharing those nodes, or hold a share with `suspend.reserve` or `suspendedReserve` |
+| Placement fails: `every one's snapshots content budget is full` | Suspended checkpoints fill `content.budgets.snapshots` on every eligible node | Raise the budget, delete old snapshots, or resume or destroy suspended instances |
+| Submit: `suspend.reserve ... is out of range` or `exceeds the task's resources` | A ratio outside 0 to 1, or an amount larger than the reservation | Follow the hint |
 | `instance start`: `cannot resume: checkpoint ... is lost` | The node holding it was removed, and `onRestoreFailure = "fail"` | `legion instance start <id> --cold` |
 | `detail: idle-unmeasured: ...` | The node sends no usage reports, so nothing measures activity | Set `resourceEnforcement.enabled` on the worker type |
 | An idle instance never suspends | A listed signal keeps firing (an open `exec` session, a client holding a connection with `connections` listed, background CPU above `cpuBelow`) | Compare `instance get`'s idle since with what the task is doing, then adjust `signals` or `cpuBelow` |
@@ -1426,6 +1602,22 @@ See [metrics](metrics.md#suspend-and-resume).
   retained storage.
 - **`exec` and `container` suspend to disk only**: process memory is not
   kept.
+- **A held share is fixed when the suspend lands.** Changing a job's
+  `suspend.reserve` or a node's `suspendedReserve` does not re-charge
+  instances already suspended.
+- **Make-room reads usage held by one manager.** Like the idle sweep, it
+  sees only nodes that heartbeat to the manager running it, and it knows an
+  instance is quiet only from nodes that send usage reports
+  (`resourceEnforcement.enabled`). Without reports, only `onPressure = true`
+  makes an instance eligible.
+- **Make-room does not preempt.** It only suspends, so a resume on a node
+  full of work without a `suspend` block still waits.
+- **The checkpoint budget is soft state.** It lives in the manager's memory,
+  like the content location index. Right after a manager starts, and for a
+  node that never reports one, the scheduler assumes there is room. The
+  check is per placement and estimates a checkpoint at the guest's full
+  memory size, so a plan placing many instances at once can still overfill a
+  budget that had room for one.
 
 ## Reference
 

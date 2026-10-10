@@ -1687,3 +1687,117 @@ from Phase 3b still cover a memory restore on one node:
 ```bash
 LEGION_SANDBOX_KERNEL=/path/to/vmlinux cargo test --lib sandbox_memory_checkpoint_round_trip -- --ignored --nocapture
 ```
+
+## Track 2
+
+Resume guards: `suspend.reserve` as a ratio or fixed amounts, the worker's
+`resourceEnforcement.suspendedReserve` floor, make-room suspends for a resume
+pinned to a full node, and the `snapshots` content budget as a placement
+constraint (docs/suspend-and-resume.md, "Capacity for resumes"). Nothing here
+is Linux-only code: the hold math, make-room, and the budget filter all run on
+the manager, and the worker's budget report reads its content store on any
+OS. On macOS they ran end to end with the heartbeat standing in for the worker
+(`cargo test --test suspend_integration`). What has never run is the whole
+loop with real sandbox memory captures, whose timing (a capture takes about a
+second) is what make-room's "wait for the in-flight suspend" rule depends on,
+and a budget filled by real checkpoint files.
+
+### Prereqs
+
+- Everything in [Phase 4 prereqs](#phase-4), on **one** worker, with
+  `resourceEnforcement.enabled = true` so it sends usage reports (make-room
+  reads idle-since from them).
+- Make the node small so three 1 GiB sandboxes fill it. Set the worker's
+  `reservedResources.memory` to physical memory minus 3 GiB (in MiB), and
+  shrink the checkpoint budget so three checkpoints fill it:
+
+  ```nickel
+  reservedResources = { memory = <physical MiB - 3072> },
+  content = { budgets = { snapshots = "3GiB" } },
+  resourceEnforcement = { enabled = true, suspendedReserve = 0.0 },
+  ```
+
+- Use the Phase 4 jobspec (`/tmp/agents.ncl`) with this `suspend` block:
+
+  ```nickel
+  suspend = {
+    checkpoint = "memory",
+    idle = { after = "30m" },   # long, so the idle sweep stays out of the way
+    onPressure = true,
+  },
+  ```
+
+### T2.1 A partial hold, end to end
+
+Set `reserve = 0.25` in the jobspec, `job run` it, create `user-1`, and
+suspend it.
+
+```bash
+cargo run -q -- instance create agents --id user-1
+cargo run -q -- instance suspend user-1 --wait
+cargo run -q -- instance get user-1
+cargo run -q -- node usage <node>
+cargo run -q -- instance start user-1 --wait
+cargo run -q -- node usage <node>
+```
+
+Pass: `instance get` prints `held: 256 MiB and 250 MHz reserved on <node> for
+the resume`. `node usage` shows `suspended: 1 instance, 256 MiB held and 250
+MHz` and a row `user-1 (suspended, held)` reserving 256. After the start, the
+row is gone, `RESERVED` is back to 1024 for `user-1`, and the guest kept its
+processes (Phase 4.1). Fail: the held row reserves 1024, or remains after the
+resume.
+
+### T2.2 Make-room with real captures
+
+Back to `reserve = false`. Create `user-1`, `user-2`, `user-3` (the node is
+now full) and wait two minutes, so all three are past make-room's age rule.
+Suspend `user-1`, then create `user-4` into its room. Leave `user-2` idle and
+run a busy loop in `user-3`
+(`cargo run -q -- alloc exec <alloc> -- sh -c 'while :; do :; done' &`).
+Then resume `user-1`:
+
+```bash
+time cargo run -q -- instance start user-1 --wait --timeout 60
+cargo run -q -- events list --kind instance.make_room
+cargo run -q -- instance get user-2
+curl -s localhost:4747/metrics | grep legion_make_room_suspends_total
+```
+
+Pass: within about 5 seconds of the start, `instance.make_room` names
+`user-1` and `user-2` only. `user-2` is the quietest (`user-3` is eligible
+through `onPressure` but busy, so it sorts after, and `user-4` became active
+under two minutes ago). `user-2` is `suspended` with reason `make_room`, and
+`user-1` restores within `resumeTimeout` (30s) with its memory intact. The
+counter shows `outcome="started"` 1. Fail: `user-3` or `user-4` is
+suspended, more than one round runs, or `user-1` boots cold.
+
+Then resume `user-2` right away. Pass: `user-1` is never chosen (it resumed
+under two minutes ago), so the round suspends `user-3` or `user-4` (whichever
+is past two minutes and quieter), or none with `outcome="no_room"` if neither
+is. Fail: `user-1` is suspended again (thrash).
+
+### T2.3 A full checkpoint budget
+
+With the 3 GiB budget, suspend three running 1 GiB sandboxes so their
+checkpoints are pinned, then create one more instance.
+
+```bash
+cargo run -q -- node usage <node>
+cargo run -q -- instance create agents --id user-9
+cargo run -q -- job info agents
+```
+
+Pass: `node usage` shows `checkpoints: 3 GiB suspended here, snapshots budget
+3 GiB pinned of 3 GiB (0 MiB free, FULL: no new memory-checkpoint instances
+placed here)`, and `user-9` stays `pending` with the placement error `every
+one's snapshots content budget is full: less than 1024 MiB free`. Resume one
+of the three: its checkpoint is reclaimed, and the next evaluation of the job
+places `user-9` (re-run `job run /tmp/agents.ncl` to trigger one, since a
+capacity failure waits for the next evaluation like any other). Fail:
+`user-9` places while the budget is full, and its first suspend fails with a
+content-store budget error.
+
+### Ignored tests
+
+None new.
