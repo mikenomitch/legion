@@ -1286,6 +1286,13 @@ message RunJobRequest {
   // re-applying. This lets clients (especially automated agents) safely retry
   // after a timeout without risking a double submission. Unset disables
   // deduplication.
+  //
+  // Keys are scoped to the RPC and to the caller (the ACL token's accessor
+  // ID, or the principal for JWT and anonymous callers): the same key on a
+  // different RPC, or from a different caller, is a new request and never
+  // replays another caller's reply. The key does not cover the request body.
+  // Records are kept for 24 hours, then pruned; a retry after that is applied
+  // again. Every other RPC's `idempotency_key` follows these rules.
   optional string idempotency_key = 5;
 }
 

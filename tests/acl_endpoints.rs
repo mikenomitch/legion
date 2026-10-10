@@ -2392,6 +2392,51 @@ async fn stream_events_closes_when_its_token_is_revoked() -> R<()> {
     Ok(())
 }
 
+/// Idempotency keys are scoped to one operation and one caller. A key
+/// reused on a different operation must not skip it, and another caller's
+/// key must not replay their reply.
+#[tokio::test]
+async fn idempotency_keys_are_scoped_to_operation_and_caller() -> R<()> {
+    let (svc, _, _) = setup_enabled()?;
+    let rules = r#"[{"resources": ["job"], "actions": ["read", "write"]}]"#;
+    let (_, alice) = token_with_rules(&svc, "alice-jobs", rules)?;
+    let (_, bob) = token_with_rules(&svc, "bob-jobs", rules)?;
+    let stop = |secret: &str| {
+        req(
+            StopJobRequest {
+                name: JOB_NAME.into(),
+                idempotency_key: Some("shared-key".into()),
+                ..Default::default()
+            },
+            Some(secret),
+        )
+    };
+    let destroy = |secret: &str| {
+        req(
+            DestroyJobRequest {
+                name: JOB_NAME.into(),
+                idempotency_key: Some("shared-key".into()),
+                ..Default::default()
+            },
+            Some(secret),
+        )
+    };
+
+    let first = svc.stop_job(stop(&alice)).await?.into_inner();
+    assert!(!first.deduplicated);
+    // Same caller, same operation, same key: replayed.
+    let replay = svc.stop_job(stop(&alice)).await?.into_inner();
+    assert!(replay.deduplicated);
+    assert_eq!(replay.message, first.message);
+    // Another caller with the same key is a new request.
+    let other = svc.stop_job(stop(&bob)).await?.into_inner();
+    assert!(!other.deduplicated);
+    // The same key on another operation runs it.
+    let destroyed = svc.destroy_job(destroy(&alice)).await?.into_inner();
+    assert!(!destroyed.deduplicated);
+    Ok(())
+}
+
 /// Node-pool scoping: a token limited to one pool cannot read or restart
 /// nodes in other pools, and GetNodes filters.
 #[tokio::test]

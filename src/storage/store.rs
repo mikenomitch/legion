@@ -17298,6 +17298,30 @@ impl Store {
         })
     }
 
+    /// Delete idempotency records created before `cutoff`. Without this the
+    /// table grew forever: every keyed mutation left a row behind. A retry
+    /// that arrives after its record is pruned runs again, so the cutoff must
+    /// sit well past any realistic retry window (`IDEMPOTENCY_KEY_TTL`).
+    #[instrument(err, skip_all)]
+    pub fn prune_idempotency_records(&self, cutoff: OffsetDateTime) -> R<usize> {
+        // Formatted once here, not in the apply step, so every replica
+        // deletes exactly the same rows.
+        let cutoff = cutoff.format(&Rfc3339)?;
+        self.replicated(Lane::Control, "prune_idempotency_records", move |s| {
+            s.prune_idempotency_records_apply(&cutoff)
+        })
+    }
+
+    fn prune_idempotency_records_apply(&self, cutoff: &str) -> R<usize> {
+        let conn = self.write_connection()?;
+        // `created_at` is RFC 3339 UTC, so text order is time order at
+        // second granularity, which is all a day-long TTL needs.
+        Ok(conn.execute(
+            "DELETE FROM idempotency_record WHERE created_at < ?;",
+            [cutoff],
+        )?)
+    }
+
     fn idempotency_record_apply(&self, key: &str, operation: &str, message: &str) -> R<bool> {
         let key = key.trim();
         if key.is_empty() {
@@ -18963,6 +18987,26 @@ mod tests {
         // Empty key disables deduplication entirely.
         assert_eq!(store.idempotency_lookup("")?, None);
         assert!(store.idempotency_record("", "run_job", "ignored")?);
+        Ok(())
+    }
+
+    #[test]
+    fn prune_idempotency_records_drops_only_expired_rows() -> R<()> {
+        let store = setup_store()?;
+        assert!(store.idempotency_record("old", "run_job", "old reply")?);
+        store.query_state_store(
+            "UPDATE idempotency_record SET created_at = '2020-01-01T00:00:00Z' WHERE key = 'old'",
+            true,
+        )?;
+        assert!(store.idempotency_record("fresh", "run_job", "fresh reply")?);
+
+        let cutoff = OffsetDateTime::now_utc() - time::Duration::hours(24);
+        assert_eq!(store.prune_idempotency_records(cutoff)?, 1);
+        assert_eq!(store.idempotency_lookup("old")?, None);
+        assert_eq!(
+            store.idempotency_lookup("fresh")?.as_deref(),
+            Some("fresh reply")
+        );
         Ok(())
     }
 

@@ -2946,7 +2946,8 @@ impl Manager for ManagerDaemonService {
         let js = inner.parsed_jobspec;
         let subs = inner.submissions;
         let priority = inner.priority;
-        let idempotency_key = inner.idempotency_key.unwrap_or_default();
+        let idempotency_key =
+            scoped_idempotency_key(&identity, "run_job", inner.idempotency_key.as_deref());
 
         if let Some(message) = self
             .store
@@ -3239,7 +3240,11 @@ impl Manager for ManagerDaemonService {
         )?;
         let inner = request.into_inner();
         let priority = inner.priority;
-        let idempotency_key = inner.idempotency_key.unwrap_or_default();
+        let idempotency_key = scoped_idempotency_key(
+            &identity,
+            "run_job_template",
+            inner.idempotency_key.as_deref(),
+        );
 
         if let Some(recorded) = self
             .store
@@ -4144,7 +4149,7 @@ impl Manager for ManagerDaemonService {
         // Lifecycle write: provenance-aware scope, so template-scoped
         // identities can stop the jobs their templates created (they cannot
         // change specs this way — RunJob never carries provenance).
-        self.check_acl(
+        let identity = self.check_acl(
             &request,
             AclResource::Job,
             AclAction::Write,
@@ -4153,7 +4158,8 @@ impl Manager for ManagerDaemonService {
         let inner = request.into_inner();
         let name = inner.name;
         let priority = inner.priority.unwrap_or(self.store.default_eval_priority);
-        let idempotency_key = inner.idempotency_key.unwrap_or_default();
+        let idempotency_key =
+            scoped_idempotency_key(&identity, "stop_job", inner.idempotency_key.as_deref());
 
         if let Some(message) = self
             .store
@@ -4214,7 +4220,8 @@ impl Manager for ManagerDaemonService {
         )?;
         let inner = request.into_inner();
         let name = inner.name;
-        let idempotency_key = inner.idempotency_key.unwrap_or_default();
+        let idempotency_key =
+            scoped_idempotency_key(&ident, "scale_task", inner.idempotency_key.as_deref());
 
         if let Some(message) = self
             .store
@@ -4428,7 +4435,7 @@ impl Manager for ManagerDaemonService {
         request: Request<DestroyJobRequest>,
     ) -> Result<Response<DestroyJobReply>, Status> {
         // Lifecycle write: provenance-aware scope (see stop_job).
-        self.check_acl(
+        let identity = self.check_acl(
             &request,
             AclResource::Job,
             AclAction::Write,
@@ -4436,7 +4443,8 @@ impl Manager for ManagerDaemonService {
         )?;
         let inner = request.into_inner();
         let name = inner.name;
-        let idempotency_key = inner.idempotency_key.unwrap_or_default();
+        let idempotency_key =
+            scoped_idempotency_key(&identity, "destroy_job", inner.idempotency_key.as_deref());
 
         if let Some(message) = self
             .store
@@ -4475,14 +4483,18 @@ impl Manager for ManagerDaemonService {
         &self,
         request: Request<CreateInstanceRequest>,
     ) -> Result<Response<CreateInstanceReply>, Status> {
-        self.check_acl(
+        let identity = self.check_acl(
             &request,
             AclResource::Job,
             AclAction::Write,
             AclScope::job(&request.get_ref().job_id),
         )?;
         let inner = request.into_inner();
-        let idempotency_key = inner.idempotency_key.unwrap_or_default();
+        let idempotency_key = scoped_idempotency_key(
+            &identity,
+            "create_instance",
+            inner.idempotency_key.as_deref(),
+        );
 
         if let Some(instance_id) = self
             .store
@@ -4560,14 +4572,18 @@ impl Manager for ManagerDaemonService {
         &self,
         request: Request<CreateInstancesRequest>,
     ) -> Result<Response<CreateInstancesReply>, Status> {
-        self.check_acl(
+        let identity = self.check_acl(
             &request,
             AclResource::Job,
             AclAction::Write,
             AclScope::job(&request.get_ref().job_id),
         )?;
         let inner = request.into_inner();
-        let idempotency_key = inner.idempotency_key.unwrap_or_default();
+        let idempotency_key = scoped_idempotency_key(
+            &identity,
+            "create_instances",
+            inner.idempotency_key.as_deref(),
+        );
 
         if let Some(recorded) = self
             .store
@@ -4669,7 +4685,8 @@ impl Manager for ManagerDaemonService {
             AclScope::any(),
         )?;
         let inner = request.into_inner();
-        let idempotency_key = inner.idempotency_key.unwrap_or_default();
+        let idempotency_key =
+            scoped_idempotency_key(&identity, "stop_instance", inner.idempotency_key.as_deref());
 
         if let Some(message) = self
             .store
@@ -4763,7 +4780,11 @@ impl Manager for ManagerDaemonService {
             AclScope::any(),
         )?;
         let inner = request.into_inner();
-        let idempotency_key = inner.idempotency_key.unwrap_or_default();
+        let idempotency_key = scoped_idempotency_key(
+            &identity,
+            "start_instance",
+            inner.idempotency_key.as_deref(),
+        );
 
         if let Some(message) = self
             .store
@@ -4872,7 +4893,11 @@ impl Manager for ManagerDaemonService {
             AclScope::any(),
         )?;
         let inner = request.into_inner();
-        let idempotency_key = inner.idempotency_key.unwrap_or_default();
+        let idempotency_key = scoped_idempotency_key(
+            &identity,
+            "destroy_instance",
+            inner.idempotency_key.as_deref(),
+        );
 
         if let Some(message) = self
             .store
@@ -4954,7 +4979,11 @@ impl Manager for ManagerDaemonService {
             AclScope::any(),
         )?;
         let inner = request.into_inner();
-        let idempotency_key = inner.idempotency_key.unwrap_or_default();
+        let idempotency_key = scoped_idempotency_key(
+            &identity,
+            "replace_instance",
+            inner.idempotency_key.as_deref(),
+        );
 
         if let Some(message) = self
             .store
@@ -5207,7 +5236,8 @@ impl Manager for ManagerDaemonService {
             AclScope::any(),
         )?;
         let inner = request.into_inner();
-        let idempotency_key = inner.idempotency_key.unwrap_or_default();
+        let idempotency_key =
+            scoped_idempotency_key(&identity, "DeleteVolume", inner.idempotency_key.as_deref());
 
         if let Some(message) = self
             .store
@@ -6186,7 +6216,11 @@ impl Manager for ManagerDaemonService {
         let node_id = inner.node_id;
         let availability = inner.availability;
         let evict = inner.evict;
-        let idempotency_key = inner.idempotency_key.unwrap_or_default();
+        let idempotency_key = scoped_idempotency_key(
+            &identity,
+            "set_node_availability",
+            inner.idempotency_key.as_deref(),
+        );
 
         if availability != "available" && availability != "drained" {
             return Err(Status::invalid_argument(format!(
@@ -6693,14 +6727,15 @@ impl Manager for ManagerDaemonService {
         &self,
         request: Request<RotateDataKeyRequest>,
     ) -> Result<Response<RotateDataKeyReply>, Status> {
-        self.check_acl(
+        let identity = self.check_acl(
             &request,
             AclResource::Operator,
             AclAction::Write,
             AclScope::none(),
         )?;
         let req = request.into_inner();
-        let idempotency_key = req.idempotency_key.unwrap_or_default();
+        let idempotency_key =
+            scoped_idempotency_key(&identity, "rotate_data_key", req.idempotency_key.as_deref());
         if let Some(message) = self
             .store
             .idempotency_lookup(&idempotency_key)
@@ -6744,14 +6779,15 @@ impl Manager for ManagerDaemonService {
         &self,
         request: Request<RewrapKvRequest>,
     ) -> Result<Response<RewrapKvReply>, Status> {
-        self.check_acl(
+        let identity = self.check_acl(
             &request,
             AclResource::Operator,
             AclAction::Write,
             AclScope::none(),
         )?;
         let req = request.into_inner();
-        let idempotency_key = req.idempotency_key.unwrap_or_default();
+        let idempotency_key =
+            scoped_idempotency_key(&identity, "rewrap_kv", req.idempotency_key.as_deref());
         if let Some(message) = self
             .store
             .idempotency_lookup(&idempotency_key)
@@ -6786,14 +6822,15 @@ impl Manager for ManagerDaemonService {
         &self,
         request: Request<RewrapRootKeyRequest>,
     ) -> Result<Response<RewrapRootKeyReply>, Status> {
-        self.check_acl(
+        let identity = self.check_acl(
             &request,
             AclResource::Operator,
             AclAction::Write,
             AclScope::none(),
         )?;
         let req = request.into_inner();
-        let idempotency_key = req.idempotency_key.unwrap_or_default();
+        let idempotency_key =
+            scoped_idempotency_key(&identity, "rewrap_root_key", req.idempotency_key.as_deref());
         if let Some(message) = self
             .store
             .idempotency_lookup(&idempotency_key)
@@ -8376,7 +8413,11 @@ impl Manager for ManagerDaemonService {
             ));
         };
 
-        let idempotency_key = req.idempotency_key.clone().unwrap_or_default();
+        let idempotency_key = scoped_idempotency_key(
+            &identity,
+            "issue_boot_ticket",
+            req.idempotency_key.as_deref(),
+        );
         if let Some(recorded) = self
             .store
             .idempotency_lookup(&idempotency_key)
@@ -8686,6 +8727,27 @@ struct MintedTicketRecord {
     jti: String,
     job_config_id: String,
     expires_at_unix: i64,
+}
+
+/// The stored form of a client-chosen idempotency key, scoped to one
+/// operation and one caller. Keys used to be a single global namespace: a
+/// `job run` key replayed on `job destroy` silently skipped the destroy and
+/// reported `deduplicated`, and a second caller presenting someone else's key
+/// read back their recorded reply. The caller is the token's accessor id
+/// (stable across a token's lifetime and safe to store), falling back to the
+/// principal for JWT and anonymous callers. A missing or blank key stays
+/// empty, which disables deduplication. Length prefixes keep the encoding
+/// unambiguous whatever the parts contain.
+fn scoped_idempotency_key(identity: &AclIdentity, operation: &str, key: Option<&str>) -> String {
+    let key = key.map(str::trim).unwrap_or_default();
+    if key.is_empty() {
+        return String::new();
+    }
+    let caller = identity
+        .accessor_id
+        .as_deref()
+        .unwrap_or(identity.principal.as_str());
+    format!("{operation}/{}:{caller}/{key}", caller.len())
 }
 
 /// The scope a volume write is checked against. A job's volume belongs to

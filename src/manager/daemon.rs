@@ -36,6 +36,15 @@ const ERROR_BACKOFF_MAX: Duration = Duration::from_secs(30);
 // (eval workers, node status checker). Bounds the takeover delay after a
 // leadership change to "a few seconds" (plan JC-15).
 const LEADER_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+/// How long a keyed mutation's idempotency record is kept. Retries within
+/// this window are deduplicated; after it, the same key runs again. A day
+/// covers any client retry loop, matching common API practice.
+pub const IDEMPOTENCY_KEY_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// How often the control-lane leader prunes idempotency records older than
+/// `IDEMPOTENCY_KEY_TTL`, so records live between 24 and 25 hours.
+const IDEMPOTENCY_PRUNE_INTERVAL: Duration = Duration::from_secs(60 * 60);
 // Base delay before re-running an eval whose handler hit a foreign-lane
 // NotRaftLeader rejection (divergent lane leadership) — long enough for the
 // engine's JC-40 lane-convergence loop (or an election) to move leadership,
@@ -315,6 +324,26 @@ pub async fn run_manager_with(
     } else {
         warn!("ACLs are disabled; every API caller has full access (set acl.enabled to true to enforce)");
     }
+
+    // Idempotency records only need to outlive a client's retry window;
+    // without this the table grows by one row per keyed mutation forever.
+    // Control-lane leader only (always true outside raft mode): the delete
+    // is a replicated write.
+    let idempotency_store = store.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(IDEMPOTENCY_PRUNE_INTERVAL).await;
+            if !idempotency_store.is_raft_leader(crate::storage::Lane::Control) {
+                continue;
+            }
+            let cutoff = OffsetDateTime::now_utc() - IDEMPOTENCY_KEY_TTL;
+            match idempotency_store.prune_idempotency_records(cutoff) {
+                Ok(0) => {}
+                Ok(pruned) => info!(pruned, "Pruned expired idempotency records"),
+                Err(err) => warn!(error = ?err, "Failed pruning idempotency records"),
+            }
+        }
+    });
 
     // The in-process worker (--run-worker) registers like any external
     // worker; with ACLs enforced the manager self-issues its join token.
